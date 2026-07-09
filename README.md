@@ -433,29 +433,36 @@ Interactive clients talk to `octos serve` over **UI Protocol v1** — a JSON-RPC
 - **[octos-web](https://github.com/octos-org/octos-web)** — the browser client: chat, voice/video, studio, slides, and sites. A build is embedded in the server binary at `/app/`, so `octos serve` works with zero extra deploys. (The admin dashboard is a separate SPA, embedded at `/admin/`.)
 - **[octos-tui](https://github.com/octos-org/octos-tui)** — the terminal client. Connects to a running server over WebSocket, or spawns `octos serve --stdio` as its own private backend.
 - **`octos mcp-serve`** — the inverse direction: octos as an MCP server, callable as a sub-agent from outer orchestrators.
-- **`octos acp`** — the editor-facing direction: octos as an **[Agent Client Protocol](https://agentclientprotocol.com) (ACP)** agent over stdio, so ACP-speaking editors (Zed and others) run octos as their coding agent — it shows up in the editor's agent picker alongside Claude Code and Gemini CLI. See [Use octos in Zed](#use-octos-in-zed-acp).
+- **`octos acp`** — the editor-facing direction: octos as an **[Agent Client Protocol](https://agentclientprotocol.com) (ACP)** agent over stdio, so ACP-speaking editors (Zed and others) run octos as their coding agent — with the **same capabilities as `octos chat`** (your tools + sandbox, long-term memory + `MEMORY.md`, skills/plugins, MCP, hooks, context compaction, provider failover). It appears in the editor's agent picker alongside Claude Code and Gemini CLI. See [Use octos in Zed](#use-octos-in-zed-acp).
 
 ### Use octos in Zed (ACP)
 
-`octos acp` speaks [ACP](https://agentclientprotocol.com) — the same protocol Zed uses for external agents — so Zed can run octos as its coding agent, with the full agent loop (tools, memory, streaming).
+`octos acp` turns octos into an **ACP server** that [Zed](https://zed.dev) (and other ACP editors) drive as a first-class coding agent. You get the full octos agent loop — your tools + sandbox, long-term memory + `MEMORY.md` injection, bundled skills/plugins, MCP servers, hooks, and context compaction — exactly like `octos chat`, but inside the editor.
 
-1. **Give the agent a provider credential.** Easiest is `octos auth login --provider deepseek` — stored in `auth.json` and read regardless of environment; `octos acp` resolves its LLM exactly like `octos chat`. Note a Dock-launched Zed does **not** inherit your shell's env vars, so if you'd rather pass an API key by env var, put it in the `env` block below instead of relying on the shell.
-2. **Register octos** in Zed's settings (`~/.config/zed/settings.json`, or *zed: open settings* from the command palette). Use `"command": "octos"` if it's on your PATH, or the absolute path from `which octos` — a Dock-launched Zed has a minimal PATH and may not find a bare `octos`:
+**1. Give the agent a provider credential.** Easiest is `octos auth login --provider deepseek` — it's stored in `auth.json` and read regardless of environment (`octos acp` resolves its LLM exactly like `octos chat`). A Dock-launched Zed does **not** inherit your shell's env vars, so if you'd rather pass an API key by env var, put it in the `env` block below.
 
-   ```jsonc
-   {
-     "agent_servers": {
-       "Octos": {
-         "command": "octos",
-         "args": ["acp", "--provider", "deepseek", "--model", "deepseek-chat"],
-         "env": {}
-       }
-     }
-   }
-   ```
-3. **Start a thread.** Open a folder (external agents need a workspace), open the **Agent Panel**, click the **＋ New Thread** dropdown (`⌥⌘⇧N`), and choose **Octos**. Type a prompt — octos runs the loop and streams its work back into Zed.
+**2. Register octos as an agent server** in Zed's settings (`~/.config/zed/settings.json`, or run *zed: open settings*). Use `"command": "octos"` if it's on your `PATH`, or the absolute path from `which octos` — a Dock-launched Zed has a minimal `PATH` and may not find a bare `octos`:
 
-Flags mirror `octos chat`: `--provider`, `--model`, `--base-url`, `--config`, `--data-dir`, `--cwd`, `--profile`, and `--max-iterations` (default 20). Zed sends a per-session working directory with `session/new` that takes precedence over `--cwd`.
+```jsonc
+{
+  "agent_servers": {
+    "Octos": {
+      "command": "octos",
+      "args": ["acp", "--provider", "deepseek", "--model", "deepseek-chat"],
+      "env": {}
+    }
+  }
+}
+```
+
+**3. Play with it in Zed.**
+- **Open a folder** — external agents need a workspace (with none open, the Agent Panel just shows *"Open Project"*).
+- Open the **Agent Panel** (right dock), click the **＋ New Thread** dropdown (or press `⌥⌘⇧N`), and choose **Octos**.
+- Type a prompt. octos runs the agent loop and streams tools, thinking, and results back into Zed — and it remembers across turns via your `MEMORY.md`.
+
+> **Can't find Octos?** It lives in the **＋ New Thread** menu (external agents) — **not** the `⋯` → *MCP / Context Servers* list (that's a different feature). After editing `agent_servers`, fully quit and reopen Zed (`Cmd-Q`) so it reloads the config.
+
+Flags mirror `octos chat`: `--provider`, `--model`, `--base-url`, `--config`, `--data-dir`, `--cwd`, `--profile`, and `--max-iterations`. Zed sends a per-session working directory with `session/new`; that's where octos roots tools, skills, and the filesystem scope.
 
 ## Documentation
 
