@@ -503,7 +503,7 @@ Beyond one-shot chat, the graphical clients (octos-web, octos-tui) drive longer-
 A **goal** is a persistent objective attached to a session. Once set, the agent keeps working toward it — re-firing turns as long as the goal's policy allows — instead of stopping after a single answer. Goals survive across turns and are cleared explicitly.
 
 - Protocol: `session/goal/set`, `session/goal/get`, `session/goal/clear` (notifications `session/goal/updated`, `session/goal/cleared`). Feature flags: **both** `coding.autonomy.v1` **and** `coding.goal_runtime.v1` must be negotiated (advertising only the group flag yields `method_not_supported`).
-- Use it for "keep going until X is done" work; clear the goal to stop.
+- Use it for "keep going until X is done" work. Clearing the goal stops **future** re-fires, but does **not** abort a turn already in flight — call `turn/interrupt` to stop work that's currently running.
 
 ### Loops
 
@@ -518,7 +518,7 @@ A **loop** is a recurring agent run, in one of three modes: **fixed-interval** (
 
 ### Task & turn control
 
-- **Background tasks** (spawned work, deep-search, pipelines) can be listed, cancelled, and restarted: `task/list`, `task/cancel`, `task/restart_from_node`, with output/artifacts via `task/output/read` and `task/artifact/list`. Also reachable over REST at `POST /api/tasks/{id}/cancel` and `/restart-from-node`.
+- **Background tasks** (spawned work, deep-search, pipelines) can be listed and cancelled: `task/list`, `task/cancel`, with output/artifacts via `task/output/read` and `task/artifact/list`. Cancel is also reachable over REST at `POST /api/tasks/{id}/cancel`. `task/restart_from_node` is **accepted but not yet functional for re-execution** — the relaunch callback isn't wired into the production runtime, so it registers a successor task without re-running the work.
 - **A running turn** can be interrupted mid-flight with `turn/interrupt` (the in-flight LLM call and tools are aborted). Only lifecycle state (e.g. a `turn/error`) is persisted — **partial assistant content is not committed**, so a reconnecting client cannot recover the half-finished reply. `turn/start` and `turn/interrupt` are **not** capability-gated — they're always available. The separate **sub-agent** controls (`agent/list`, `agent/status/read`, `agent/interrupt`, `agent/close`) and task artifacts (`task/artifact/list|read`) require `coding.autonomy.v1` + `coding.agent_control.v1`.
 
 ### Capability negotiation

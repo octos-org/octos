@@ -503,7 +503,7 @@ Shell 命令在沙箱中运行以实现隔离。支持三种后端：
 **目标**是附加到会话上的持久化目标。一旦设定，agent 会持续朝其推进——只要目标策略允许就重新触发轮次——而不是在单次回答后停止。目标跨轮次存续，需显式清除。
 
 - 协议：`session/goal/set`、`session/goal/get`、`session/goal/clear`（通知 `session/goal/updated`、`session/goal/cleared`）。特性标志：必须**同时**协商 `coding.autonomy.v1` **和** `coding.goal_runtime.v1`（只声明组标志会得到 `method_not_supported`）。
-- 适用于「一直做到 X 完成」类工作；清除目标即停止。
+- 适用于「一直做到 X 完成」类工作。清除目标会停止**未来**的再次触发，但**不会**中止已在进行中的轮次——要停止正在运行的工作，请调用 `turn/interrupt`。
 
 ### 循环（Loops）
 
@@ -518,7 +518,7 @@ Shell 命令在沙箱中运行以实现隔离。支持三种后端：
 
 ### 任务与轮次控制
 
-- **后台任务**（派生工作、深度搜索、流水线）可被列出、取消与重启：`task/list`、`task/cancel`、`task/restart_from_node`，输出/产物通过 `task/output/read`、`task/artifact/list`。也可经 REST 的 `POST /api/tasks/{id}/cancel` 与 `/restart-from-node` 触达。
+- **后台任务**（派生工作、深度搜索、流水线）可被列出与取消：`task/list`、`task/cancel`，输出/产物通过 `task/output/read`、`task/artifact/list`。取消也可经 REST 的 `POST /api/tasks/{id}/cancel` 触达。`task/restart_from_node` **已被接受但尚不能真正重新执行**——生产运行时未接入 relaunch 回调，因此它只会登记一个后继任务，而不会重新运行工作。
 - **运行中的轮次**可用 `turn/interrupt` 中途打断（中止进行中的 LLM 调用与工具）。只有生命周期状态（如 `turn/error`）会被持久化——**部分助手内容不会被提交**，因此重连的客户端无法恢复未完成的回复。`turn/start` 与 `turn/interrupt` **不**受能力门控——始终可用。而独立的**子 agent** 控制（`agent/list`、`agent/status/read`、`agent/interrupt`、`agent/close`）与任务产物（`task/artifact/list|read`）需要 `coding.autonomy.v1` + `coding.agent_control.v1`。
 
 ### 能力协商
