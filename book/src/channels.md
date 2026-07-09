@@ -400,7 +400,7 @@ When `mode` is omitted the gateway falls back to **`appservice`** (which then re
 }
 ```
 
-Log in with an `access_token` (preferred), or with `user_id` + `password` (both are required for password login). `auto_join` (`off` / `allowlist` / `always`) controls invite auto-accept; under `allowlist`, `auto_join_allowlist` lists the **room IDs / aliases** (or `*`) whose invites are accepted — matched against rooms, not inviter user IDs — and falls back to `rooms` when empty. `OCTOS_MATRIX_BOT_USER_ID` and `MATRIX_APPROVER` may be supplied via the environment.
+Log in with an `access_token` (preferred), or with `user_id` + `password` (both are required for password login). These credentials are read as literal `settings` values — they are **not** expanded from environment variables. `auto_join` (`off` / `allowlist` / `always`) controls invite auto-accept; under `allowlist`, `auto_join_allowlist` lists the **room IDs / aliases** (or `*`) whose invites are accepted — matched against rooms, not inviter user IDs — and falls back to `rooms` when empty.
 
 ### Appservice mode
 
@@ -419,7 +419,7 @@ Log in with an `access_token` (preferred), or with `user_id` + `password` (both 
 }
 ```
 
-Build with the `matrix` feature flag. Matrix rooms render native Approve/Deny cards for [Human Approval Rules](./configuration.md) (via Robrix) and support the `/schedule`, `/schedules`, `/unschedule`, and `/allbots` chat commands (see [Cron Jobs](#cron-jobs) below).
+Build with the `matrix` feature flag. In **appservice / management-bot** rooms, Matrix renders native Approve/Deny cards for [Human Approval Rules](./configuration.md) (via Robrix) and handles the `/schedule`, `/schedules`, `/unschedule`, and `/allbots` chat commands (see [Cron Jobs](#cron-jobs) below). A plain `mode: "user"` account channel forwards all message text to the agent and does not itself interpret those management commands.
 
 ---
 

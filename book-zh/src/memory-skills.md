@@ -84,7 +84,7 @@ Octos 内置一套自动记忆流水线，从你的对话中读取持久化事�
 ```bash
 octos memory refresh          # 立即执行一次抽取 + 整合
 octos memory status           # 锁持有者、待处理积压、每日预算
-octos memory remember "..."   # 由宿主直接记住（完整权限，无 LLM）
+octos memory remember "..."   # 本地暂存一条事实（写入时不调用 LLM；整合时应用）
 octos memory forget "..."     # 自由文本遗忘 → 进入确认流程
 octos memory forget --id ^m4k2abq   # 硬删除某条精确的 MEMORY.md 条目
 ```

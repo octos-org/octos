@@ -84,7 +84,7 @@ Octos ships an automatic memory pipeline that reads durable facts out of your co
 ```bash
 octos memory refresh          # Run one extraction+consolidation pass now
 octos memory status           # Lock holder, staging backlog, daily budgets
-octos memory remember "..."   # Host-authored fact (full authority, no LLM)
+octos memory remember "..."   # Stage a fact locally (no LLM at write; consolidation applies it)
 octos memory forget "..."     # Free-text forget → confirm flow
 octos memory forget --id ^m4k2abq   # Hard-delete an exact MEMORY.md entry
 ```

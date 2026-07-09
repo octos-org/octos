@@ -400,7 +400,7 @@ Matrix 是一等公民频道，也是本章多处提到的「人工审批」与�
 }
 ```
 
-使用 `access_token`（推荐）登录，或使用 `user_id` + `password`（密码登录两者都必需）。`auto_join`（`off` / `allowlist` / `always`）控制邀请的自动接受；在 `allowlist` 下，`auto_join_allowlist` 列出被接受邀请的**房间 ID / 别名**（或 `*`）——按房间匹配，而非邀请者用户 ID——为空时回退到 `rooms`。`OCTOS_MATRIX_BOT_USER_ID` 与 `MATRIX_APPROVER` 也可通过环境变量提供。
+使用 `access_token`（推荐）登录，或使用 `user_id` + `password`（密码登录两者都必需）。这些凭据以字面 `settings` 值读取——**不会**从环境变量展开。`auto_join`（`off` / `allowlist` / `always`）控制邀请的自动接受；在 `allowlist` 下，`auto_join_allowlist` 列出被接受邀请的**房间 ID / 别名**（或 `*`）——按房间匹配，而非邀请者用户 ID——为空时回退到 `rooms`。
 
 ### appservice 模式
 
@@ -419,7 +419,7 @@ Matrix 是一等公民频道，也是本章多处提到的「人工审批」与�
 }
 ```
 
-使用 `matrix` 特性标志编译。Matrix 房间会为[人工审批规则](./configuration.md)渲染原生的 批准/拒绝 卡片（通过 Robrix），并支持 `/schedule`、`/schedules`、`/unschedule`、`/allbots` 聊天命令（见下文[定时任务](#定时任务)）。
+使用 `matrix` 特性标志编译。在 **appservice / 管理机器人**房间中，Matrix 会为[人工审批规则](./configuration.md)渲染原生的 批准/拒绝 卡片（通过 Robrix），并处理 `/schedule`、`/schedules`、`/unschedule`、`/allbots` 聊天命令（见下文[定时任务](#定时任务)）。而普通的 `mode: "user"` 账户渠道会把所有消息文本转发给 agent，本身并不解释这些管理命令。
 
 ---
 
