@@ -2,13 +2,14 @@
 
 ## 概述
 
-octos 是一个包含 15 个成员的 Rust 工作区（Edition 2024，rust-version 1.85.0），提供编码 Agent CLI 和多频道消息网关。通过 rustls 实现纯 Rust TLS（无 OpenSSL 依赖）。错误处理使用 `eyre`/`color-eyre`。
+octos 是一个包含 26 个成员的 Rust 工作区（Edition 2024，rust-version 1.85.0），提供编码 Agent CLI 和多频道消息网关。通过 rustls 实现纯 Rust TLS（无 OpenSSL 依赖）。错误处理使用 `eyre`/`color-eyre`。
 
-**工作区成员**：
-- **6 个核心 crate**：octos-core、octos-memory、octos-llm、octos-agent、octos-bus、octos-cli
-- **1 个流水线 crate**：octos-pipeline
-- **7 个应用技能 crate**：news、deep-search、deep-crawl、send-email、account-manager、time、weather
-- **1 个平台技能 crate**：asr
+**工作区成员**（取自 `Cargo.toml`）：
+- **分层核心**（7 个）：`octos-core`（共享类型）→ `octos-memory` + `octos-llm` → `octos-agent`（agent 循环、工具、沙箱、MCP、压缩）→ `octos-cli`（命令、配置、serve/API），外加 `octos-bus`（14 个渠道、会话、合并、cron）与 `octos-diagnostics`（支撑 `octos doctor`）。
+- **agent 周边**（5 个）：`octos-pipeline`（DOT 图工作流）、`octos-plugin`（插件/技能 SDK）、`octos-swarm`（多 agent 契约创作）、`octos-sandbox`、`octos-dora-mcp`。
+- **内置技能 crate**（14 个）：`crates/app-skills/` 下每个应用技能都是独立 crate——`news`、`deep-search`、`deep-crawl`、`send-email`、`account-manager`、`time`、`weather`、`wechat-bridge`、`skill-evolve`，以及 `harness-starter-{generic,report,audio,coding}` 模板——再加上 `platform-skills/voice`（ASR/TTS）。
+
+（Web SPA 与终端客户端分别位于独立的 `octos-web` 和 `octos-tui` 仓库，通过 UI Protocol 与 `octos serve` 通信。）
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
@@ -250,7 +251,7 @@ pub struct CreateParams {
 
 | 提供商 | 别名 | 基础 URL | 默认模型 | API 密钥环境变量 |
 |----------|---------|----------|---------------|-------------|
-| Z.AI | zai, z.ai | api.z.ai/api/anthropic | glm-5 | ZAI_API_KEY |
+| Z.AI | zai, z.ai | api.z.ai/api/anthropic | glm-5-turbo | ZAI_API_KEY |
 
 ### ModelHints（OpenAI 提供商）
 
@@ -1458,7 +1459,7 @@ Dashboard (octos serve)
 
 ## 测试
 
-全部 crate 共 1300+ 测试。完整清单和 CI 指南见 [TESTING.md](./TESTING.md)。
+整个工作区共 5,000+ 测试。完整清单和 CI 指南见 [TESTING.md](./TESTING.md)。
 
 - **单元测试**：类型 serde 往返、工具参数解析、配置验证、提供商检测、工具策略、压缩、合并、BM25 评分、L2 归一化、SSE 解析
 - **自适应路由**：Off/Hedge/Lane 模式、熔断器、故障转移、评分、指标、提供商竞速（19 个测试）

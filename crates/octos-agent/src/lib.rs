@@ -13,6 +13,7 @@ pub mod agents;
 pub mod approval;
 pub mod behaviour;
 pub mod bootstrap;
+pub mod bridge;
 pub mod builtin_skills;
 pub mod bundled_app_skills;
 pub mod bundled_pipelines;
@@ -29,6 +30,7 @@ pub mod hooks;
 pub mod loop_detect;
 pub mod mcp;
 pub mod mcp_server;
+pub mod memory_segment;
 pub mod permissions;
 pub mod plugins;
 pub mod policy;
@@ -50,6 +52,7 @@ pub mod subagent_summary;
 mod subprocess_env;
 pub use subprocess_env::register_secret_env_names;
 pub mod summarizer;
+pub mod swarm;
 pub mod task_supervisor;
 pub mod tools;
 pub mod turn;
@@ -70,17 +73,19 @@ pub use abi_schema::{
 };
 pub use agent::{
     Agent, AgentConfig, ConversationResponse, DEFAULT_SESSION_TIMEOUT_SECS,
-    DEFAULT_TOOL_TIMEOUT_SECS, DEFAULT_WORKER_PROMPT, MAX_TOOL_TIMEOUT_SECS, RealtimeController,
-    TASK_REPORTER, TokenTracker,
+    DEFAULT_TOOL_TIMEOUT_SECS, DEFAULT_WORKER_PROMPT, MAX_TOOL_TIMEOUT_SECS, PromptSegmentProvider,
+    RealtimeController, TASK_REPORTER, TokenTracker,
     loop_state::{
         LoopDecision, LoopRetryCounters, LoopRetryLimits, LoopRetryState, OCTOS_LOOP_RETRY_TOTAL,
         SHELL_SPIRAL_VARIANT,
     },
     memory::MIN_EPISODE_SIMILARITY,
+    normalize_tool_call_id,
     realtime::{
         AgentError, Heartbeat, HeartbeatState, RealtimeConfig, RealtimeHookEnricher,
         SensorContextInjector, SensorSnapshot, SensorSource,
     },
+    rich_output,
     verifier::{
         AgentVerifierConfig, ErrorClass, TURN_LEDGER_SCHEMA_VERSION, TurnLedgerEntry, TurnOutcome,
         VerifierVerdict,
@@ -127,6 +132,9 @@ pub use hooks::{
     HookConfig, HookContext, HookEvent, HookExecutor, HookPayload, HookPayloadEnricher, HookResult,
 };
 pub use mcp::{McpClient, McpServerConfig};
+pub use memory_segment::{
+    MEMORY_CAPTURE_POLICY, MEMORY_SEGMENT_NAME, MemorySegmentProvider, compose_memory_segment,
+};
 pub use permissions::{InvalidSafetyTier, SafetyTier};
 pub use plugins::{PluginLoadOptions, PluginLoadResult, PluginLoader, SynthesisConfig};
 pub use policy::{
@@ -158,6 +166,10 @@ pub use subagent_summary::{
     DEFAULT_SUBAGENT_SUMMARY_WINDOW, SubAgentSummaryRegistry, SubAgentSummaryWatcher,
 };
 pub use summarizer::{ExtractiveSummarizer, Summarizer};
+pub use swarm::{
+    FileMailbox, InProcessMailbox, MAILBOX_SCHEMA_VERSION, MailboxBackend, MailboxEnvelope,
+    MailboxMessage, MailboxRecovery,
+};
 pub use task_supervisor::{
     BackgroundTask, RelaunchOpts, RelaunchRequest, SpawnOnlyFailureSignal, TaskCancelError,
     TaskCancelToken, TaskLifecycleState, TaskRelaunchError, TaskRuntimeState, TaskStatus,
@@ -170,8 +182,9 @@ pub use tools::{
     DEFAULT_HTTP_READ_TIMEOUT_SECS, DELEGATED_DENY_GROUP, DELEGATION_METRIC, DeepSearchTool,
     DelegateTool, DelegationEvent, DelegationOutcome, DepthBudget, DiffEditTool,
     DispatchContextContract, DispatchOutcome, DispatchRequest, DispatchResponse, EditFileTool,
-    GlobTool, GrepTool, HttpMcpAgent, ListDirTool, MAX_DEPTH, ManageSkillsTool, McpAgentBackend,
-    McpAgentBackendConfig, MessageTool, PolicyDecision, ReadFileTool, ReadTaskOutputTool,
+    GlobTool, GrepTool, HttpMcpAgent, ListDirTool, MAX_DEPTH, MakeTypeEntry, ManageSkillsTool,
+    McpAgentBackend, McpAgentBackendConfig, MemoryNoteTool, MessageTool,
+    MofaDescribeContentTypeTool, MofaMakeTool, PolicyDecision, ReadFileTool, ReadTaskOutputTool,
     RecallMemoryTool, RobotToolRegistry, SaveMemoryTool, SendAppCardTool, SendFileTool,
     SharedBackend, ShellTool, SpawnTool, StdioMcpAgent, SynthesizeResearchTool, Tool,
     ToolApprovalDecision, ToolApprovalRequest, ToolApprovalRequester, ToolConfigStore, ToolPolicy,
@@ -179,7 +192,8 @@ pub use tools::{
     UserQuestionRequester, WebFetchTool, WebSearchTool, WriteFileTool,
     admin::{AdminApiContext, register_admin_api_tools},
     build_backend_from_config, build_delegated_child_policy, build_dispatch_event_payload,
-    dispatch_with_metrics, install_robot_registry, keep_tool_in_slides_session, record_dispatch,
+    dispatch_with_metrics, install_robot_registry, keep_tool_in_slides_session,
+    make_dispatcher_with_entries, record_dispatch,
 };
 pub use turn::{Turn, TurnKind, turns_to_messages};
 pub use validators::{

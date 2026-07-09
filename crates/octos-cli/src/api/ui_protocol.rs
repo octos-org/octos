@@ -28,32 +28,33 @@ use octos_core::ui_protocol::{
     AgentUpdatedEvent, ApprovalAutoResolvedEvent, ApprovalCancelledEvent, ApprovalCommandDetails,
     ApprovalDecidedEvent, ApprovalDecision, ApprovalId, ApprovalRenderHints,
     ApprovalRequestedEvent, ApprovalTypedDetails, ContentBulkDeleteParams, ContentDeleteParams,
-    ContentListParams, ContextCompactionCompletedEvent, ContextNormalizationReportedEvent,
-    EnvelopeTokenUsage, FileRef, HydratedMessage, HydratedTurn, InputItem, MessageDeltaEvent,
-    MessageMeta, MessagePersistedEvent, MessagePersistedSource, OutputCursor, Payload,
-    ReplayLossyEvent, RpcError, RpcErrorResponse, RpcRequest, RpcResponse,
+    ContentListParams, ContextCompactionCompletedEvent, ContextCompactionStartedEvent,
+    ContextNormalizationReportedEvent, EnvelopeTokenUsage, FileRef, HydratedMessage, HydratedTurn,
+    InputItem, MessageDeltaEvent, MessageMeta, MessagePersistedEvent, MessagePersistedSource,
+    OutputCursor, Payload, ReplayLossyEvent, RpcError, RpcErrorResponse, RpcRequest, RpcResponse,
     SESSION_HYDRATE_INCLUDE_MAX, SESSION_MESSAGES_PAGE_DEFAULT_LIMIT,
     SESSION_MESSAGES_PAGE_MAX_LIMIT, SESSION_MESSAGES_PAGE_MAX_OFFSET, SESSION_TITLE_SET_MAX_CHARS,
     SessionDeleteParams, SessionFilesListParams, SessionHydrateParams, SessionHydrateResult,
     SessionListParams, SessionMessagesPageParams, SessionOpenParams, SessionOpenResult,
-    SessionOpened, SessionOrchestrationEvent, SessionSnapshotParams, SessionStatusGetParams,
-    SessionTasksListParams, SessionTitleSetParams, SessionWorkspaceGetParams,
-    SystemStatusGetParams, TaskArtifactListParams, TaskArtifactListResult, TaskArtifactReadParams,
-    TaskArtifactReadResult, TaskArtifactRecord, TaskCancelParams, TaskCancelResult, TaskListEntry,
-    TaskListParams, TaskListResult, TaskOutputDeltaEvent, TaskRestartFromNodeParams,
-    TaskRestartFromNodeResult, TaskRuntimeState as UiTaskRuntimeState, TaskUpdatedEvent,
-    ThreadGraphEntry, ThreadGraphGetParams, ThreadGraphGetResult, ToolCompletedEvent,
-    ToolProgressEvent, ToolStartedEvent, TurnCompletedEvent, TurnErrorEvent, TurnId,
-    TurnInterruptParams, TurnInterruptResult, TurnLifecycleState, TurnSessionResult,
-    TurnSpawnCompleteEvent, TurnStartParams, TurnStateGetParams, TurnStateGetResult,
-    UI_PROTOCOL_FEATURE_APPROVAL_TYPED_V1, UI_PROTOCOL_FEATURE_AUXILIARY_REST_TO_WS_V1,
-    UI_PROTOCOL_FEATURE_CODING_AGENT_CONTROL_V1, UI_PROTOCOL_FEATURE_CODING_AUTONOMY_V1,
-    UI_PROTOCOL_FEATURE_CODING_GOAL_RUNTIME_V1, UI_PROTOCOL_FEATURE_CODING_LOOP_RUNTIME_V1,
-    UI_PROTOCOL_FEATURE_CONTEXT_LIFECYCLE_V1, UI_PROTOCOL_FEATURE_FILE_ATTACHED_V1,
-    UI_PROTOCOL_FEATURE_HARNESS_TASK_ARTIFACTS_V1, UI_PROTOCOL_FEATURE_HARNESS_TASK_CONTROL_V1,
-    UI_PROTOCOL_FEATURE_MESSAGE_PERSISTED_V1, UI_PROTOCOL_FEATURE_PANE_SNAPSHOTS_V1,
-    UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V1, UI_PROTOCOL_FEATURE_REVIEW_START_V1,
-    UI_PROTOCOL_FEATURE_SESSION_HYDRATE_V1, UI_PROTOCOL_FEATURE_SESSION_WORKSPACE_CWD_V1,
+    SessionOpened, SessionOrchestrationEvent, SessionRollbackParams, SessionRollbackResult,
+    SessionSnapshotParams, SessionStatusGetParams, SessionTasksListParams, SessionTitleSetParams,
+    SessionWorkspaceGetParams, SystemStatusGetParams, TaskArtifactListParams,
+    TaskArtifactListResult, TaskArtifactReadParams, TaskArtifactReadResult, TaskArtifactRecord,
+    TaskCancelParams, TaskCancelResult, TaskListEntry, TaskListParams, TaskListResult,
+    TaskOutputDeltaEvent, TaskRestartFromNodeParams, TaskRestartFromNodeResult,
+    TaskRuntimeState as UiTaskRuntimeState, TaskUpdatedEvent, ThreadGraphEntry,
+    ThreadGraphGetParams, ThreadGraphGetResult, ToolCompletedEvent, ToolProgressEvent,
+    ToolStartedEvent, TurnCompletedEvent, TurnErrorEvent, TurnId, TurnInterruptParams,
+    TurnInterruptResult, TurnLifecycleState, TurnSessionResult, TurnSpawnCompleteEvent,
+    TurnStartParams, TurnStateGetParams, TurnStateGetResult, UI_PROTOCOL_FEATURE_APPROVAL_TYPED_V1,
+    UI_PROTOCOL_FEATURE_AUXILIARY_REST_TO_WS_V1, UI_PROTOCOL_FEATURE_CODING_AGENT_CONTROL_V1,
+    UI_PROTOCOL_FEATURE_CODING_AUTONOMY_V1, UI_PROTOCOL_FEATURE_CODING_GOAL_RUNTIME_V1,
+    UI_PROTOCOL_FEATURE_CODING_LOOP_RUNTIME_V1, UI_PROTOCOL_FEATURE_CONTEXT_LIFECYCLE_V1,
+    UI_PROTOCOL_FEATURE_FILE_ATTACHED_V1, UI_PROTOCOL_FEATURE_HARNESS_TASK_ARTIFACTS_V1,
+    UI_PROTOCOL_FEATURE_HARNESS_TASK_CONTROL_V1, UI_PROTOCOL_FEATURE_MESSAGE_PERSISTED_V1,
+    UI_PROTOCOL_FEATURE_PANE_SNAPSHOTS_V1, UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V1,
+    UI_PROTOCOL_FEATURE_REVIEW_START_V1, UI_PROTOCOL_FEATURE_SESSION_HYDRATE_V1,
+    UI_PROTOCOL_FEATURE_SESSION_SANDBOX_V1, UI_PROTOCOL_FEATURE_SESSION_WORKSPACE_CWD_V1,
     UI_PROTOCOL_FEATURE_SPAWN_COMPLETE_V1, UI_PROTOCOL_FEATURE_THREAD_GRAPH_V1,
     UI_PROTOCOL_FEATURE_TURN_STATE_GET_V1, UI_PROTOCOL_FEATURE_USER_QUESTION_V1, UiAgentRecord,
     UiArtifactPaneItem, UiArtifactPaneSnapshot, UiCommand, UiContextCompactionRecord,
@@ -67,6 +68,7 @@ use octos_core::ui_protocol::{
 use octos_core::{
     AgentId, InboundMessage, MAIN_PROFILE_ID, Message, MessageRole, SessionKey, TaskId,
 };
+use octos_llm::pricing::model_pricing;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufWriter};
@@ -117,6 +119,8 @@ use crate::context_manager::{
     CompactContextPolicy, ContextCompactionRecord, ContextManager, ForkPolicy, PromptBuildPolicy,
     PromptFrame, load_or_rebuild_context_manager, persist_context_manager_snapshot,
 };
+use crate::usage_ledger::{PersistentUsageLedger, USAGE_LEDGER_FILE, UsageCostSource, UsageEvent};
+use crate::user_store::UserRole;
 
 const MAX_DIFF_PREVIEW_BYTES: usize = 256 * 1024;
 const PROGRESS_CHANNEL_CAPACITY: usize = 1024;
@@ -913,10 +917,12 @@ impl TerminalReason {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum M9ProtocolFixture {
     Basic,
+    M19StdioHappyPath,
     Slow,
     ToolEvents,
     Approval,
     ReplayLossy,
+    ReplayLossyForcedTerminalDrop,
     TaskOutput,
     M14CodexP0ToolParity,
     M15LiveSubagents,
@@ -936,13 +942,24 @@ fn m9_protocol_fixture_for_prompt(prompt: &str) -> Option<M9ProtocolFixture> {
         return None;
     }
 
-    if prompt_lower.contains("m9 approval fixture") || prompt_lower.contains("m9-approval-e2e") {
+    if prompt_lower.contains("m19_stdio_happy_path_final_line") {
+        Some(M9ProtocolFixture::M19StdioHappyPath)
+    } else if prompt_lower.contains("m9 approval fixture")
+        || prompt_lower.contains("m9-approval-e2e")
+    {
         Some(M9ProtocolFixture::Approval)
     } else if prompt_lower.contains("m14 codex p0 tool parity fixture")
         || prompt_lower.contains("codex p0 tool parity")
         || prompt_lower.contains("#969")
     {
         Some(M9ProtocolFixture::M14CodexP0ToolParity)
+    } else if (prompt_lower.contains("m9 replay-lossy fixture")
+        || prompt_lower.contains("replay-lossy"))
+        && (prompt_lower.contains("forced dropped turn/completed")
+            || prompt_lower.contains("force true dropped turn/completed")
+            || prompt_lower.contains("forced terminal drop"))
+    {
+        Some(M9ProtocolFixture::ReplayLossyForcedTerminalDrop)
     } else if prompt_lower.contains("m9 replay-lossy fixture")
         || prompt_lower.contains("replay-lossy")
     {
@@ -976,6 +993,7 @@ struct ConnectionUiFeatures {
     typed_approvals: bool,
     pane_snapshots: bool,
     session_workspace_cwd: bool,
+    session_sandbox: bool,
     harness_task_control: bool,
     harness_task_artifacts: bool,
     /// UPCR-2026-009 `state.session_hydrate.v1` negotiated.
@@ -1072,6 +1090,7 @@ impl ConnectionUiFeatures {
                 query,
                 UI_PROTOCOL_FEATURE_SESSION_WORKSPACE_CWD_V1,
             ),
+            session_sandbox: has_ui_feature(headers, query, UI_PROTOCOL_FEATURE_SESSION_SANDBOX_V1),
             harness_task_control: has_ui_feature(
                 headers,
                 query,
@@ -1139,6 +1158,7 @@ impl ConnectionUiFeatures {
             typed_approvals: true,
             pane_snapshots: true,
             session_workspace_cwd: true,
+            session_sandbox: true,
             harness_task_control: true,
             harness_task_artifacts: true,
             session_hydrate: true,
@@ -1190,6 +1210,7 @@ impl ConnectionUiFeatures {
             typed_approvals: has(UI_PROTOCOL_FEATURE_APPROVAL_TYPED_V1),
             pane_snapshots: has(UI_PROTOCOL_FEATURE_PANE_SNAPSHOTS_V1),
             session_workspace_cwd: has(UI_PROTOCOL_FEATURE_SESSION_WORKSPACE_CWD_V1),
+            session_sandbox: has(UI_PROTOCOL_FEATURE_SESSION_SANDBOX_V1),
             harness_task_control: has(UI_PROTOCOL_FEATURE_HARNESS_TASK_CONTROL_V1),
             harness_task_artifacts: has(UI_PROTOCOL_FEATURE_HARNESS_TASK_ARTIFACTS_V1),
             session_hydrate: has(UI_PROTOCOL_FEATURE_SESSION_HYDRATE_V1),
@@ -1234,6 +1255,9 @@ impl ConnectionUiFeatures {
         }
         if self.session_workspace_cwd {
             requested.push(UI_PROTOCOL_FEATURE_SESSION_WORKSPACE_CWD_V1);
+        }
+        if self.session_sandbox {
+            requested.push(UI_PROTOCOL_FEATURE_SESSION_SANDBOX_V1);
         }
         if self.harness_task_control {
             requested.push(UI_PROTOCOL_FEATURE_HARNESS_TASK_CONTROL_V1);
@@ -1972,6 +1996,17 @@ fn appui_context_history_for_agent(
     let policy = appui_context_prompt_policy(llm_provider);
     let state = manager.state();
     if state.token_estimate > threshold {
+        // UPCR-2026-026: the started event precedes the (synchronous) pass;
+        // clients render the in-progress state from it and must tolerate
+        // started/completed arriving in one delivery batch.
+        lifecycle_notifications.push(UiNotification::ContextCompactionStarted(
+            ContextCompactionStartedEvent {
+                session_id: session_id.clone(),
+                context_state: ui_context_state_for(session_id, &manager),
+                trigger: trigger.to_owned(),
+                threshold_tokens: threshold,
+            },
+        ));
         let before = manager.for_prompt(&policy);
         let summary_budget = threshold.clamp(256, 4096) as u32;
         let summary = octos_agent::compaction::compact_messages(&before.messages, summary_budget);
@@ -2283,27 +2318,29 @@ impl PromptContextManager for AppUiPromptContextBridge {
         if let Some(system) = runtime_system {
             // Re-apply the agent's runtime System prompt. Two cases:
             //
-            //   a) `frame.messages` leads with a System message
-            //      (e.g. a `[Conversation summary]` emitted by
-            //      `for_prompt`'s compaction path —
-            //      `context_manager.rs:1159`). Concatenate the runtime
-            //      System CONTENT into that existing System rather
-            //      than inserting a second one. We do this in-place to
-            //      avoid producing two consecutive `System` messages
-            //      because `normalize_system_messages` runs BEFORE
-            //      this bridge (`loop_compaction.rs:35`) — anything we
-            //      emit here goes straight to the provider, and
-            //      multi-System payloads are rejected by Anthropic
-            //      (single `system` field) and other providers.
+            //   a) `frame.messages` leads with a System message.
+            //      Concatenate the runtime System CONTENT into that
+            //      existing System rather than inserting a second one.
+            //      We do this in-place to avoid producing two
+            //      consecutive `System` messages because
+            //      `normalize_system_messages` runs BEFORE this bridge
+            //      (`loop_compaction.rs:35`) — anything we emit here
+            //      goes straight to the provider, and multi-System
+            //      payloads are rejected by Anthropic (single `system`
+            //      field) and other providers. Since compaction
+            //      summaries render as protected User rows (see
+            //      `for_prompt`'s CompactionSummary arm), this arm is
+            //      effectively a legacy guard.
             //
-            //   b) `frame.messages` does not lead with a System.
-            //      Insert the runtime System at index 0.
+            //   b) `frame.messages` does not lead with a System (the
+            //      normal case, including post-compaction where the
+            //      frame leads with the User-role summary). Insert the
+            //      runtime System at index 0.
             //
             // Safe to merge unconditionally because
             // `record_message_with_source_ref` early-returns for
             // `System` role (`context_manager.rs:752`) so the frame
-            // can only contain compaction summaries or no System at
-            // all — never the runtime System itself.
+            // never contains the runtime System itself.
             match messages.first_mut() {
                 Some(first) if first.role == MessageRole::System => {
                     let existing = std::mem::take(&mut first.content);
@@ -3808,24 +3845,102 @@ pub async fn ws_handler(
         ui_protocol_connection(
             socket,
             state,
-            connection_profile_id,
-            routed_profile_id,
-            features,
-            headers,
-            auth_identity,
+            UiProtocolConnectionOptions {
+                connection_profile_id,
+                routed_profile_id,
+                features,
+                headers,
+                identity: auth_identity,
+                session_ingress_scope: None,
+            },
         )
     })
+}
+
+#[derive(Clone)]
+pub(crate) struct SessionIngressScope {
+    session_id: SessionKey,
+    token: String,
+}
+
+/// Upgrade a work-secret authenticated socket into the UI Protocol dispatcher.
+///
+/// The route that calls this function has already validated the token for
+/// `session_id`. The dispatcher revalidates on every client frame and applies
+/// a session-scope gate before executing any RPC.
+pub(crate) async fn ws_handler_for_session_ingress(
+    state: Arc<AppState>,
+    session_id: SessionKey,
+    profile_id: Option<String>,
+    token: String,
+    headers: HeaderMap,
+    uri: Uri,
+    ws: Result<WebSocketUpgrade, axum::extract::ws::rejection::WebSocketUpgradeRejection>,
+) -> Response {
+    match decide_ws_origin_gate(&headers, state.base_domain.as_deref(), true) {
+        WsOriginDecision::Allow => {}
+        WsOriginDecision::RejectDisallowed { origin } => {
+            tracing::warn!(
+                target: "octos::ui_protocol::session_ingress",
+                origin = %origin,
+                "rejected session ingress WS upgrade from disallowed Origin"
+            );
+            return (axum::http::StatusCode::FORBIDDEN, "disallowed origin").into_response();
+        }
+        WsOriginDecision::RejectMalformed => {
+            return (axum::http::StatusCode::FORBIDDEN, "invalid origin").into_response();
+        }
+    }
+    let ws = match ws {
+        Ok(ws) => ws,
+        Err(rejection) => return rejection.into_response(),
+    };
+    let connection_profile_id =
+        profile_id.or_else(|| session_id.profile_id().map(ToOwned::to_owned));
+    let auth_identity = connection_profile_id.clone().map(|id| AuthIdentity::User {
+        id,
+        role: UserRole::User,
+    });
+    let features = ConnectionUiFeatures::from_headers_and_query(&headers, uri.query());
+    let scope = SessionIngressScope { session_id, token };
+    ws.on_upgrade(move |socket| {
+        ui_protocol_connection(
+            socket,
+            state,
+            UiProtocolConnectionOptions {
+                connection_profile_id,
+                routed_profile_id: None,
+                features,
+                headers,
+                identity: auth_identity,
+                session_ingress_scope: Some(scope),
+            },
+        )
+    })
+}
+
+struct UiProtocolConnectionOptions {
+    connection_profile_id: Option<String>,
+    routed_profile_id: Option<String>,
+    features: ConnectionUiFeatures,
+    headers: HeaderMap,
+    identity: Option<AuthIdentity>,
+    session_ingress_scope: Option<SessionIngressScope>,
 }
 
 async fn ui_protocol_connection(
     socket: WebSocket,
     state: Arc<AppState>,
-    connection_profile_id: Option<String>,
-    routed_profile_id: Option<String>,
-    mut features: ConnectionUiFeatures,
-    connection_headers: HeaderMap,
-    connection_identity: Option<AuthIdentity>,
+    options: UiProtocolConnectionOptions,
 ) {
+    let UiProtocolConnectionOptions {
+        connection_profile_id,
+        routed_profile_id,
+        mut features,
+        headers: connection_headers,
+        identity: connection_identity,
+        session_ingress_scope,
+    } = options;
     let (ws_sink, mut ws_rx) = socket.split();
     // Decouple the network sink from request handlers via a bounded channel
     // and a dedicated drainer task. No handler ever holds a lock across an
@@ -3946,6 +4061,16 @@ async fn ui_protocol_connection(
             WsMessage::Ping(_) => continue,
             _ => continue,
         };
+        if let Some(scope) = session_ingress_scope.as_ref() {
+            if state
+                .work_secret_store
+                .validate(&scope.session_id.0, &scope.token)
+                .is_err()
+            {
+                let _ = close_ws_with_code(&ws, 1008, "session_ingress_revoked");
+                break;
+            }
+        }
 
         let request = match parse_ws_text_frame(text.as_str()) {
             Ok(ParsedFrame::Request(request)) => request,
@@ -4005,6 +4130,13 @@ async fn ui_protocol_connection(
                 continue;
             }
         };
+        if let Some(scope) = session_ingress_scope.as_ref() {
+            if let Err(error) = validate_session_ingress_command_scope(&command, &scope.session_id)
+            {
+                let _ = send_rpc_error(&ws, Some(id), error);
+                continue;
+            }
+        }
 
         match command {
             UiCommand::ProfileLocalCreate(params) => {
@@ -4149,6 +4281,19 @@ async fn ui_protocol_connection(
                 )
                 .await;
             }
+            UiCommand::SessionRollback(params) => {
+                handle_session_rollback(
+                    &ws,
+                    &state,
+                    &ledger,
+                    &active_turns,
+                    connection_profile_id,
+                    routed_profile_id,
+                    id,
+                    params,
+                )
+                .await;
+            }
             UiCommand::ThreadGraphGet(params) => {
                 handle_thread_graph_get(
                     &ws,
@@ -4217,6 +4362,7 @@ async fn ui_protocol_connection(
                     &state,
                     &connection_headers,
                     connection_identity.as_ref(),
+                    connection_profile_id,
                     id,
                     params,
                 )
@@ -4353,10 +4499,26 @@ async fn ui_protocol_connection(
                 .await;
             }
             UiCommand::RouterSetMode(params) => {
-                handle_router_set_mode(&ws, &state, routed_profile_id, id, params).await;
+                handle_router_set_mode(
+                    &ws,
+                    &state,
+                    connection_profile_id,
+                    routed_profile_id,
+                    id,
+                    params,
+                )
+                .await;
             }
             UiCommand::RouterGetMetrics(params) => {
-                handle_router_get_metrics(&ws, &state, routed_profile_id, id, params).await;
+                handle_router_get_metrics(
+                    &ws,
+                    &state,
+                    connection_profile_id,
+                    routed_profile_id,
+                    id,
+                    params,
+                )
+                .await;
             }
         }
     }
@@ -4375,6 +4537,62 @@ async fn ui_protocol_connection(
     // is closed before we return.
     drop(ws);
     let _ = writer_handle.await;
+}
+
+/// Cap on how long stdio shutdown waits for in-flight turns to finalize.
+const STDIO_SHUTDOWN_TURN_DRAIN_MAX: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Wait (bounded by `max`) until none of THIS connection's turns is still
+/// live in the process-global `active_turns` registry.
+///
+/// Stdin EOF ends the stdio loop, and returning from `stdio_connection`
+/// exits the process — dropping the runtime and CANCELLING any in-flight
+/// turn task mid-finalization (assistant persistence, usage records, the
+/// terminal `turn/completed` ledger append). The client is already gone so
+/// nothing new can start; draining briefly turns "the answer and the turn's
+/// terminal state were lost" into "the next hydrate shows the completed
+/// turn". Scoped to `connection_turns` so turns owned by other connections
+/// never block this exit, and terminal-but-not-yet-cleaned entries do not
+/// hold shutdown open. Returns `false` on deadline.
+async fn drain_connection_turns_for_shutdown(
+    active_turns: &SharedActiveTurns,
+    connection_turns: &SharedConnectionTurns,
+    max: std::time::Duration,
+) -> bool {
+    let deadline = tokio::time::Instant::now() + max;
+    loop {
+        let owned = connection_turns.lock().await.clone();
+        let mut live: Vec<SessionKey> = Vec::new();
+        {
+            let active = active_turns.lock().await;
+            for (session_id, turn_id) in &owned {
+                let Some(turn) = active.get(session_id) else {
+                    continue;
+                };
+                if &turn.turn_id != turn_id {
+                    continue;
+                }
+                // Terminal entries stay registered until cleanup — the turn
+                // already finalized, so it must not hold shutdown open.
+                let state = turn.state.lock().await;
+                if !matches!(*state, TurnState::Terminal(_)) {
+                    live.push(session_id.clone());
+                }
+            }
+        }
+        if live.is_empty() {
+            return true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            tracing::warn!(
+                target: "octos::ui_protocol::stdio",
+                sessions = ?live,
+                "stdio shutdown: in-flight turns did not finalize before the drain deadline"
+            );
+            return false;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
 }
 
 pub(crate) async fn stdio_connection(state: Arc<AppState>) -> eyre::Result<()> {
@@ -4710,6 +4928,19 @@ where
                 )
                 .await;
             }
+            UiCommand::SessionRollback(params) => {
+                handle_session_rollback(
+                    &ws,
+                    &state,
+                    &ledger,
+                    &active_turns,
+                    connection_profile_id_owned.as_deref(),
+                    None,
+                    id,
+                    params,
+                )
+                .await;
+            }
             UiCommand::ThreadGraphGet(params) => {
                 handle_thread_graph_get(
                     &ws,
@@ -4764,7 +4995,16 @@ where
                 }
             }
             UiCommand::SessionList(params) => {
-                handle_session_list(&ws, &state, &connection_headers, None, id, params).await;
+                handle_session_list(
+                    &ws,
+                    &state,
+                    &connection_headers,
+                    None,
+                    connection_profile_id_owned.as_deref(),
+                    id,
+                    params,
+                )
+                .await;
             }
             UiCommand::SessionSnapshot(params) => {
                 handle_session_snapshot(&ws, &state, &connection_headers, None, id, params).await;
@@ -4827,9 +5067,16 @@ where
                 .await;
             }
             UiCommand::RouterSetMode(params) => {
+                // stdio is a local single-user transport with no authenticated
+                // tenant scope, so `connection_profile_id` is `None` (no
+                // cross-tenant enforcement); `connection_profile_id_owned`
+                // remains the resolution fallback. Only the hosted WS path,
+                // which carries an authenticated `connection_profile_id`,
+                // enforces the tenant gate.
                 handle_router_set_mode(
                     &ws,
                     &state,
+                    None,
                     connection_profile_id_owned.as_deref(),
                     id,
                     params,
@@ -4840,6 +5087,7 @@ where
                 handle_router_get_metrics(
                     &ws,
                     &state,
+                    None,
                     connection_profile_id_owned.as_deref(),
                     id,
                     params,
@@ -4849,6 +5097,14 @@ where
         }
     }
 
+    // Let in-flight turns finalize (persist + ledger terminal) before the
+    // process exit cancels their tasks — see drain_connection_turns_for_shutdown.
+    drain_connection_turns_for_shutdown(
+        &active_turns,
+        &connection_turns,
+        STDIO_SHUTDOWN_TURN_DRAIN_MAX,
+    )
+    .await;
     cleanup_stdio_connection_resources(
         &active_turns,
         &connection_turns,
@@ -5504,6 +5760,26 @@ pub(crate) fn supports_local_solo_profile_create(state: &AppState) -> bool {
         && state.user_store.is_some()
 }
 
+/// Whether this server is a genuine local single-user box that may opt into
+/// dangerous permission profiles ("yolo" / `danger_full_access`, approvals
+/// `never`, network `allow`).
+///
+/// SECURITY KEYSTONE (yolo GAP #1): this requires the explicit `--solo`
+/// opt-in (`solo_login_enabled`) IN ADDITION TO `deployment_mode == Local`.
+/// Bare Local mode is NOT sufficient — a hosted fleet daemon runs Local mode
+/// behind a Caddy reverse proxy, so mapping Local unconditionally onto the
+/// dangerous `RuntimeMode::Solo` would let a proxied client be talked into
+/// full host access even though the daemon's *solo login* is separately
+/// gated off. Tying the dangerous-profile relaxation to the SAME opt-in that
+/// gates `profile/local/create` (see [`supports_local_solo_profile_create`])
+/// removes that asymmetry: a fleet config that never sets `--solo` can reach
+/// neither surface. Unlike the solo-login predicate this does NOT require the
+/// profile/user stores, because a dangerous session runtime is bootstrapped
+/// independently of the no-password login primitive.
+fn local_solo_danger_allowed(state: &AppState) -> bool {
+    state.solo_login_enabled && state.deployment_mode == crate::config::DeploymentMode::Local
+}
+
 fn local_profile_error(kind: &str, message: impl Into<String>) -> RpcError {
     RpcError::invalid_params(message).with_data(json!({ "kind": kind }))
 }
@@ -5937,7 +6213,12 @@ fn permission_profile_supported_selections(
     // sessions get `permission_profile_disallowed` from `set`, so the
     // list must omit the dead option rather than render it as a
     // selectable profile.
-    let server_is_local = state.deployment_mode == crate::config::DeploymentMode::Local;
+    //
+    // SECURITY KEYSTONE (yolo GAP #1): additionally require the `--solo`
+    // opt-in — a Caddy-fronted fleet daemon runs Local mode but must NOT
+    // advertise `danger_full_access` as selectable, mirroring the same gate
+    // in `permission_selection_allowed` / `effective_permissions_for_session`.
+    let server_is_local = local_solo_danger_allowed(state);
     let session_is_non_solo_scoped = session_id_encodes_non_solo_scope(session_id);
     if server_is_local && !session_is_non_solo_scoped {
         profiles.push(Selection {
@@ -6148,6 +6429,7 @@ fn is_registered_channel_name(value: &str) -> bool {
         value,
         "api"
             | "cli"
+            | "dingtalk"
             | "discord"
             | "email"
             | "feishu"
@@ -6200,7 +6482,11 @@ fn permission_selection_allowed(
         Some("solo") => true,
         _ => false,
     };
-    let server_is_local = state.deployment_mode == crate::config::DeploymentMode::Local;
+    // SECURITY KEYSTONE (yolo GAP #1): the relax path requires the explicit
+    // `--solo` opt-in, NOT bare Local mode. A Caddy-fronted fleet daemon runs
+    // Local mode, so `deployment_mode == Local` alone is not a safe proxy for
+    // "single-user box" — see `local_solo_danger_allowed`.
+    let server_is_local = local_solo_danger_allowed(state);
     // #1162: defense-in-depth. A session whose key encodes a non-solo
     // tenant scope (e.g. `coding:tenant:m12-negative`) MUST tighten the
     // gate even when the client omitted the `runtime_mode` override.
@@ -6230,8 +6516,17 @@ fn effective_permissions_for_session(
         Mode::WorkspaceWrite => octos_agent::PermissionProfile::WorkspaceWrite,
         Mode::DangerFullAccess => octos_agent::PermissionProfile::DangerFullAccess,
     };
+    // SECURITY KEYSTONE (yolo GAP #1): map Local onto the dangerous-capable
+    // `RuntimeMode::Solo` ONLY when the operator opted in via `--solo`.
+    // Without the opt-in, a Local server resolves as `RuntimeMode::Local`, so
+    // `EffectivePermissions::for_runtime` rejects `danger_full_access` (a
+    // Caddy-fronted fleet daemon can never bootstrap a dangerous session
+    // runtime). See `local_solo_danger_allowed`.
     let runtime_mode = match state.deployment_mode {
-        crate::config::DeploymentMode::Local => octos_agent::RuntimeMode::Solo,
+        crate::config::DeploymentMode::Local if local_solo_danger_allowed(state) => {
+            octos_agent::RuntimeMode::Solo
+        }
+        crate::config::DeploymentMode::Local => octos_agent::RuntimeMode::Local,
         crate::config::DeploymentMode::Tenant => octos_agent::RuntimeMode::Tenant,
         crate::config::DeploymentMode::Cloud => octos_agent::RuntimeMode::Cloud,
     };
@@ -8042,6 +8337,85 @@ fn route_rpc_command(
     UiCommand::from_rpc_request(request)
 }
 
+fn string_session_with_optional_topic(session_id: &str, topic: Option<&str>) -> SessionKey {
+    session_key_with_optional_topic(&SessionKey(session_id.to_owned()), topic)
+}
+
+fn validate_session_ingress_command_scope(
+    command: &UiCommand,
+    allowed_session_id: &SessionKey,
+) -> Result<(), RpcError> {
+    let actual = match command {
+        UiCommand::ProfileLocalCreate(_)
+        | UiCommand::SessionList(_)
+        | UiCommand::SystemStatusGet(_)
+        | UiCommand::ContentList(_)
+        | UiCommand::ContentDelete(_)
+        | UiCommand::ContentBulkDelete(_) => {
+            return Err(RpcError::invalid_request(
+                "session ingress credentials may only call session-scoped methods",
+            ));
+        }
+        UiCommand::SessionOpen(params) => {
+            session_key_with_optional_topic(&params.session_id, params.topic.as_deref())
+        }
+        UiCommand::TurnStart(params) => {
+            session_key_with_optional_topic(&params.session_id, params.topic.as_deref())
+        }
+        UiCommand::TurnInterrupt(params) => params.session_id.clone(),
+        UiCommand::ApprovalRespond(params) => params.session_id.clone(),
+        UiCommand::UserQuestionRespond(params) => params.session_id.clone(),
+        UiCommand::ApprovalScopesList(params) => params.session_id.clone(),
+        UiCommand::PermissionProfileList(params) => params.session_id.clone(),
+        UiCommand::PermissionProfileSet(params) => params.session_id.clone(),
+        UiCommand::DiffPreviewGet(params) => params.session_id.clone(),
+        UiCommand::TaskList(params) => {
+            session_key_with_optional_topic(&params.session_id, params.topic.as_deref())
+        }
+        UiCommand::TaskCancel(params) => params.session_id.clone().ok_or_else(|| {
+            RpcError::invalid_params(
+                "session ingress task/cancel requires params.session_id to enforce scope",
+            )
+        })?,
+        UiCommand::TaskRestartFromNode(params) => params.session_id.clone().ok_or_else(|| {
+            RpcError::invalid_params(
+                "session ingress task/restart_from_node requires params.session_id to enforce scope",
+            )
+        })?,
+        UiCommand::TaskOutputRead(params) => params.session_id.clone(),
+        UiCommand::TaskArtifactList(params) => params.session_id.clone(),
+        UiCommand::TaskArtifactRead(params) => params.session_id.clone(),
+        UiCommand::SessionHydrate(params) => params.session_id.clone(),
+        UiCommand::SessionRollback(params) => params.session_id.clone(),
+        UiCommand::ThreadGraphGet(params) => params.session_id.clone(),
+        UiCommand::TurnStateGet(params) => params.session_id.clone(),
+        UiCommand::SessionSnapshot(params) => {
+            string_session_with_optional_topic(&params.session_id, params.topic.as_deref())
+        }
+        UiCommand::SessionMessagesPage(params) => SessionKey(params.session_id.clone()),
+        UiCommand::SessionStatusGet(params) => {
+            string_session_with_optional_topic(&params.session_id, params.topic.as_deref())
+        }
+        UiCommand::SessionFilesList(params) => SessionKey(params.session_id.clone()),
+        UiCommand::SessionTasksList(params) => {
+            string_session_with_optional_topic(&params.session_id, params.topic.as_deref())
+        }
+        UiCommand::SessionWorkspaceGet(params) => SessionKey(params.session_id.clone()),
+        UiCommand::SessionTitleSet(params) => SessionKey(params.session_id.clone()),
+        UiCommand::SessionDelete(params) => SessionKey(params.session_id.clone()),
+        UiCommand::RouterSetMode(params) => params.session_id.clone(),
+        UiCommand::RouterGetMetrics(params) => params.session_id.clone(),
+    };
+
+    if actual == *allowed_session_id {
+        Ok(())
+    } else {
+        Err(RpcError::invalid_request(
+            "session ingress credential is scoped to a different session",
+        ))
+    }
+}
+
 fn ui_protocol_server_supported_methods() -> Vec<&'static str> {
     let mut methods = octos_core::ui_protocol::UI_PROTOCOL_FIRST_SERVER_METHODS.to_vec();
     methods.extend(APPUI_EXTRA_METHODS.iter().copied());
@@ -8519,6 +8893,7 @@ fn live_event_passes_capability_filter(
     if !features.context_lifecycle_available() {
         if let UiProtocolLedgerEvent::Notification(
             UiNotification::ContextCompactionCompleted(_)
+            | UiNotification::ContextCompactionStarted(_)
             | UiNotification::ContextNormalizationReported(_),
         ) = event
         {
@@ -8577,6 +8952,7 @@ fn live_event_passes_capability_filter(
     //
     // Legacy events superseded by envelopes per spec § 14.7:
     //   - message/delta             → assistant_delta envelope
+    //   - message/reasoning_delta   → reasoning_delta envelope
     //   - message/persisted         → assistant_persisted or user_message envelope
     //   - tool/started              → tool_start envelope
     //   - tool/progress             → tool_progress envelope
@@ -8590,6 +8966,7 @@ fn live_event_passes_capability_filter(
     if features.projection_envelope {
         if let UiProtocolLedgerEvent::Notification(
             UiNotification::MessageDelta(_)
+            | UiNotification::ReasoningDelta(_)
             | UiNotification::MessagePersisted(_)
             | UiNotification::ToolStarted(_)
             | UiNotification::ToolProgress(_)
@@ -8651,6 +9028,7 @@ async fn open_session_result(
     ensure_session_profile_runtime(state, active_profile_id.as_deref()).await?;
     let requested_workspace =
         validate_requested_session_cwd(state, features, active_profile_id.as_deref(), &params)?;
+    validate_session_sandbox_feature_gate(features, &params)?;
     // M11-F deliverable D: re-introduce the
     // `appui.default_session_cwd` Tier-2 fallback that M11-E's
     // `clone_session_tools` deletion took out. Pre-resolution order:
@@ -8703,13 +9081,19 @@ async fn open_session_result(
     {
         let hint = effective_workspace_hint.clone();
         let permissions = effective_permissions_for_session(state, &params.session_id)?;
+        let sandbox_override = validate_requested_session_sandbox(
+            features,
+            &params,
+            &permissions.apply_to_sandbox(&profile_runtime.default_sandbox),
+        )?;
         match state
             .session_cache
-            .get_or_init_with_permissions(
+            .get_or_init_with_permissions_and_sandbox(
                 &profile_runtime,
                 params.session_id.clone(),
                 hint,
                 permissions,
+                sandbox_override,
             )
             .await
         {
@@ -8728,6 +9112,14 @@ async fn open_session_result(
                 )));
             }
         }
+    } else if params.sandbox.is_some() {
+        return Err(RpcError::invalid_params(
+            "session/open sandbox requires a configured profile runtime",
+        )
+        .with_data(json!({
+            "kind": "sandbox_runtime_unavailable",
+            "active_profile_id": active_profile_id,
+        })));
     } else if let Some(workspace_root) = effective_workspace_hint.as_ref() {
         // No profile registered (legacy single-agent serve). Stash the
         // effective hint in the read-through map so the legacy
@@ -8896,6 +9288,140 @@ fn validate_requested_session_cwd(
     let workspace_root = canonical_existing_dir(cwd)?;
     validate_session_workspace_allowed(state, active_profile_id, &workspace_root)?;
     Ok(Some(workspace_root))
+}
+
+fn validate_session_sandbox_feature_gate(
+    features: ConnectionUiFeatures,
+    params: &SessionOpenParams,
+) -> Result<(), RpcError> {
+    if params.sandbox.is_some() && !features.session_sandbox {
+        return Err(RpcError::invalid_params(
+            "session/open sandbox requires feature session.sandbox.v1",
+        )
+        .with_data(json!({
+            "kind": "feature_required",
+            "feature": UI_PROTOCOL_FEATURE_SESSION_SANDBOX_V1,
+        })));
+    }
+    Ok(())
+}
+
+fn validate_requested_session_sandbox(
+    features: ConnectionUiFeatures,
+    params: &SessionOpenParams,
+    inherited: &octos_agent::SandboxConfig,
+) -> Result<Option<octos_agent::SandboxConfig>, RpcError> {
+    validate_session_sandbox_feature_gate(features, params)?;
+    let Some(requested) = params.sandbox.as_ref() else {
+        return Ok(None);
+    };
+
+    let mut narrowed = inherited.clone();
+    if let Some(enabled) = requested.enabled {
+        if !enabled && inherited.enabled {
+            return Err(session_sandbox_widening_error(
+                "enabled",
+                json!(enabled),
+                json!(inherited.enabled),
+                "session sandbox cannot disable profile-level sandbox isolation",
+            ));
+        }
+        narrowed.enabled = enabled;
+    }
+
+    if let Some(network_access) = requested.network_access {
+        if network_access && !inherited.allow_network {
+            return Err(session_sandbox_widening_error(
+                "network_access",
+                json!(network_access),
+                json!(inherited.allow_network),
+                "session sandbox cannot enable network access denied by the profile",
+            ));
+        }
+        narrowed.allow_network = network_access;
+    }
+
+    if !requested.read_allow_paths.is_empty() {
+        let requested_paths =
+            canonical_session_sandbox_paths("read_allow_paths", &requested.read_allow_paths)?;
+        if !inherited.read_allow_paths.is_empty() {
+            let inherited_paths = canonical_session_sandbox_paths(
+                "inherited_read_allow_paths",
+                &inherited.read_allow_paths,
+            )?;
+            for requested_path in &requested_paths {
+                if !inherited_paths
+                    .iter()
+                    .any(|allowed| requested_path == allowed || requested_path.starts_with(allowed))
+                {
+                    return Err(session_sandbox_widening_error(
+                        "read_allow_paths",
+                        json!(requested_path.to_string_lossy()),
+                        json!(
+                            inherited_paths
+                                .iter()
+                                .map(|path| path.to_string_lossy().to_string())
+                                .collect::<Vec<_>>()
+                        ),
+                        "session sandbox read paths must stay within the profile allowlist",
+                    ));
+                }
+            }
+        }
+        narrowed.read_allow_paths = requested_paths
+            .into_iter()
+            .map(|path| path.to_string_lossy().to_string())
+            .collect();
+    }
+
+    Ok(Some(narrowed))
+}
+
+fn canonical_session_sandbox_paths(
+    field: &str,
+    paths: &[String],
+) -> Result<Vec<PathBuf>, RpcError> {
+    paths
+        .iter()
+        .map(|path| {
+            let trimmed = path.trim();
+            if trimmed.is_empty() {
+                return Err(RpcError::invalid_params(format!(
+                    "session/open sandbox {field} path must not be empty"
+                ))
+                .with_data(json!({
+                    "kind": "session_sandbox_path_empty",
+                    "field": field,
+                })));
+            }
+            let expanded = expand_home_path(trimmed);
+            std::fs::canonicalize(&expanded).map_err(|error| {
+                RpcError::invalid_params(format!(
+                    "session/open sandbox {field} path is not accessible: {path}"
+                ))
+                .with_data(json!({
+                    "kind": "session_sandbox_path_not_accessible",
+                    "field": field,
+                    "path": path,
+                    "error": error.to_string(),
+                }))
+            })
+        })
+        .collect()
+}
+
+fn session_sandbox_widening_error(
+    field: &'static str,
+    requested: Value,
+    inherited: Value,
+    message: &'static str,
+) -> RpcError {
+    RpcError::permission_denied(message).with_data(json!({
+        "kind": "session_sandbox_would_widen_profile",
+        "field": field,
+        "requested": requested,
+        "inherited": inherited,
+    }))
 }
 
 fn canonical_existing_dir(path: &str) -> Result<PathBuf, RpcError> {
@@ -9306,11 +9832,17 @@ async fn ensure_session_profile_runtime(
     }
 
     let profile_data_dir = store.resolve_data_dir(&profile);
-    let runtime = crate::runtime::ProfileRuntime::bootstrap(
+    // Lazily-created profiles must honour host-level policy too — without
+    // host_memory, a host opt-out of (default-on) memory refresh would not
+    // bind profiles created after startup.
+    let runtime = crate::runtime::ProfileRuntime::bootstrap_with_host_plugins(
         &profile,
         &profile_data_dir,
         Some(store.octos_home_dir()),
         crate::runtime::BootstrapRole::Serve,
+        None,
+        None,
+        state.host_memory.as_ref(),
     )
     .await
     .map_err(|error| {
@@ -10183,6 +10715,15 @@ async fn maybe_spawn_appui_master_continuation_runner(
         None => false,
     };
     if occupied {
+        return false;
+    }
+    // Cross-subsystem occupancy (#1529): a session actor draining a
+    // continuation turn for this session marks it in-flight but has no entry
+    // in this connection's `active_turns` map. Without this check the serve
+    // tick would drain + spawn a SECOND concurrent turn on the same session
+    // while the actor's turn runs. The actor clears the marker (RAII guard)
+    // when its turn ends, so the next tick re-dispatches normally.
+    if default_agent_orchestrator().is_goal_dispatch_in_flight(&session_id) {
         return false;
     }
 
@@ -11854,6 +12395,211 @@ async fn handle_session_hydrate(
     );
 }
 
+/// `session/rollback` — conversation-only rewind. Drops the last `num_turns`
+/// user turns from the session (persisted + in-memory), persists an idempotent
+/// append-only marker, and returns the trimmed thread projected exactly like
+/// `session/hydrate` (messages + threads + turns + cursor).
+///
+/// Scoped / resolved identically to [`handle_session_hydrate`]. Rejected when a
+/// turn is in progress for the session (rewinding under an active turn would
+/// race the writer). NOTHING outside the conversation transcript is touched —
+/// no git, worktree, or workspace file state.
+#[allow(clippy::too_many_arguments)]
+async fn handle_session_rollback(
+    ws: &WsConnection,
+    state: &Arc<AppState>,
+    ledger: &Arc<UiProtocolLedger>,
+    active_turns: &SharedActiveTurns,
+    connection_profile_id: Option<&str>,
+    routed_profile_id: Option<&str>,
+    id: String,
+    params: SessionRollbackParams,
+) {
+    let method = octos_core::ui_protocol::methods::SESSION_ROLLBACK;
+    if let Err(error) = validate_session_scope(&params.session_id, None, connection_profile_id) {
+        send_scope_error(ws, id, error);
+        return;
+    }
+    // `num_turns` must be >= 1 — a zero-turn rollback is a no-op the client
+    // should never send.
+    if params.num_turns < 1 {
+        let _ = send_rpc_error(
+            ws,
+            Some(id),
+            RpcError::invalid_params(format!("{method}: num_turns must be >= 1"))
+                .with_data(json!({ "kind": "invalid_num_turns" })),
+        );
+        return;
+    }
+
+    // Snapshot the ledger once for the trimmed-thread projection's cursor +
+    // turn overlay (mirrors the hydrate handler).
+    let (replayed, head_cursor) = match ledger.snapshot_with_cursor(&params.session_id, None) {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            let _ = send_rpc_error(ws, Some(id), error);
+            return;
+        }
+    };
+
+    let Some(sessions) = resolve_sessions_for_lookup(
+        state,
+        connection_profile_id,
+        routed_profile_id,
+        &params.session_id,
+    )
+    .await
+    else {
+        let _ = send_rpc_error(
+            ws,
+            Some(id),
+            runtime_unavailable_error("Sessions not available"),
+        );
+        return;
+    };
+
+    // Guard: refuse to rewind while a turn is in flight for this session.
+    // Detected via the same process-global active-turn registry the
+    // turn/hydrate handlers consult. Checked before taking the sessions lock so
+    // we never hold two locks at once.
+    if active_turn_sessions(active_turns)
+        .await
+        .contains(&params.session_id)
+    {
+        let _ = send_rpc_error(
+            ws,
+            Some(id),
+            RpcError::invalid_params(format!(
+                "{method}: a turn is in progress; interrupt it before rolling back"
+            ))
+            .with_data(json!({ "kind": "turn_in_progress" })),
+        );
+        return;
+    }
+
+    // Apply the rollback (marker + in-memory trim) and project the trimmed
+    // thread while holding the sessions lock, so the projection reflects the
+    // post-trim snapshot.
+    let (dropped_turns, messages, threads, orphans) = {
+        let mut sessions_guard = sessions.lock().await;
+        // Reject unknown sessions per the hydrate error model — we do NOT
+        // auto-create on rollback.
+        if !sessions_guard.session_known(&params.session_id) {
+            drop(sessions_guard);
+            let _ = send_rpc_error(
+                ws,
+                Some(id),
+                RpcError::unknown_session(params.session_id.0.clone()),
+            );
+            return;
+        }
+        let dropped_turns = match sessions_guard
+            .rollback_last_n_user_turns(&params.session_id, params.num_turns)
+            .await
+        {
+            Ok(dropped) => dropped,
+            Err(error) => {
+                drop(sessions_guard);
+                let _ = send_rpc_error(
+                    ws,
+                    Some(id),
+                    RpcError::internal_error(format!("{method}: {error}")),
+                );
+                return;
+            }
+        };
+        let data_dir = sessions_guard.data_dir();
+        let session = sessions_guard.get_or_create(&params.session_id).await;
+        // Rebuild + persist the context ledger from the trimmed history.
+        // The ledger coverage check (`context_ledger_covers_history`) is a
+        // high-watermark `>=` — deliberately tolerant of bounded history
+        // slices — so a pre-rollback snapshot still "covers" the shrunken
+        // history and would be Loaded verbatim on the next turn, feeding the
+        // rolled-back turns straight back into the model prompt. Mirrors
+        // `reset_context_manager_from_history` on the session-actor path.
+        let mut rebuilt_context = crate::context_manager::ContextManager::from_session_history(
+            params.session_id.to_string(),
+            None,
+            &session.messages,
+        );
+        rebuilt_context.set_recovery_state(crate::context_manager::ContextRecoveryState::Rebuilt);
+        if let Err(error) = crate::context_manager::persist_context_manager_snapshot(
+            &data_dir,
+            &params.session_id.to_string(),
+            &rebuilt_context,
+        ) {
+            warn!(
+                session = %params.session_id,
+                %error,
+                "session/rollback: failed to persist rebuilt context ledger"
+            );
+        }
+        publish_appui_context_status(&params.session_id, &rebuilt_context);
+        // Same message projection as `handle_session_hydrate` for a
+        // non-negotiated client: seqs are the trimmed transcript's indices.
+        let messages = session
+            .messages
+            .iter()
+            .enumerate()
+            .map(|(seq, msg)| HydratedMessage {
+                seq: seq as u64,
+                role: msg.role.as_str().to_owned(),
+                content: msg.content.clone(),
+                turn_id: None,
+                thread_id: msg.thread_id.clone(),
+                client_message_id: msg.client_message_id.clone(),
+                persisted_at: msg.timestamp,
+                message_id: None,
+                source: None,
+                media: msg.media.clone(),
+            })
+            .collect::<Vec<_>>();
+        let (threads, orphans) = build_thread_graph_entries(session);
+        (dropped_turns, messages, threads, orphans)
+    };
+    let _ = orphans;
+
+    // Turn projection reuses the exact hydrate helper over the trimmed threads.
+    // The `replayed` snapshot was taken PRE-trim, so it still carries lifecycle
+    // + `message/persisted` events for the just-rolled-back turns. Scope the
+    // projected turns to the SURVIVING threads (codex P2): a turn belongs to the
+    // trimmed thread iff its `thread_id` — surfaced from the ledger's
+    // `message/persisted` rows — is still present among the trimmed threads.
+    // Without this, `thread.turns` would leak lifecycle state for dropped turns
+    // even though `messages`/`threads` are trimmed.
+    let surviving_thread_ids: std::collections::HashSet<&str> = threads
+        .iter()
+        .map(|entry| entry.thread_id.as_str())
+        .collect();
+    let turns = collect_session_turns(&params.session_id, active_turns, &replayed, &threads)
+        .await
+        .into_iter()
+        .filter(|turn| {
+            turn.thread_id
+                .as_deref()
+                .is_some_and(|thread_id| surviving_thread_ids.contains(thread_id))
+        })
+        .collect::<Vec<_>>();
+
+    let thread = SessionHydrateResult {
+        session_id: params.session_id.clone(),
+        cursor: head_cursor,
+        context: None,
+        context_state: None,
+        messages: Some(messages),
+        threads: Some(threads),
+        turns: Some(turns),
+        pending_approvals: None,
+        pending_questions: None,
+        replayed_envelopes: None,
+    };
+    let result = SessionRollbackResult {
+        dropped_turns,
+        thread,
+    };
+    send_serialized_rpc_result(ws, id, method, result);
+}
+
 /// Per UPCR-2026-010: lift the in-memory thread partition onto the wire.
 async fn handle_thread_graph_get(
     ws: &WsConnection,
@@ -12535,12 +13281,18 @@ async fn handle_session_list(
     state: &Arc<AppState>,
     headers: &HeaderMap,
     identity: Option<&AuthIdentity>,
+    connection_profile_id: Option<&str>,
     id: String,
     _params: SessionListParams,
 ) {
     let identity_ext = identity.cloned().map(Extension);
-    let response =
-        super::handlers::list_sessions(State(state.clone()), headers.clone(), identity_ext).await;
+    let response = super::handlers::list_sessions(
+        State(state.clone()),
+        headers.clone(),
+        identity_ext,
+        connection_profile_id,
+    )
+    .await;
     let method = octos_core::ui_protocol::methods::SESSION_LIST;
     // Collection endpoint — no addressable session id. Treat any
     // (unexpected) 404 as a generic resource-not-found rather than
@@ -13771,14 +14523,68 @@ fn task_cancel_rpc_error(task_id: &TaskId, error: octos_agent::TaskCancelError) 
 fn resolve_router_for_session(
     state: &Arc<AppState>,
     session_id: &SessionKey,
+    connection_profile_id: Option<&str>,
     routed_profile_id: Option<&str>,
-) -> Option<Arc<octos_llm::AdaptiveRouter>> {
+) -> Result<Option<Arc<octos_llm::AdaptiveRouter>>, RpcError> {
+    // Tenant-scope gate (P1). Without it the `session_id.profile_id()`-first
+    // precedence below lets a tenant-B connection pass a `session_id` that
+    // embeds tenant-A's profile and resolve — then `set_mode` mutate /
+    // `get_metrics` read — tenant-A's `AdaptiveRouter`. Placing the check
+    // inside the shared resolver protects BOTH router handlers by
+    // construction.
+    authorize_router_session_scope(session_id, connection_profile_id, routed_profile_id)?;
     let active_profile_id = session_id
         .profile_id()
         .map(ToOwned::to_owned)
         .or_else(|| routed_profile_id.map(ToOwned::to_owned));
-    let profile_runtime = resolve_session_profile_runtime(state, active_profile_id.as_deref())?;
-    profile_runtime.adaptive_router.clone()
+    Ok(
+        resolve_session_profile_runtime(state, active_profile_id.as_deref())
+            .and_then(|profile_runtime| profile_runtime.adaptive_router.clone()),
+    )
+}
+
+/// Tenant-scope gate for the router RPCs.
+///
+/// A hosted WS connection is authorized for its own authenticated
+/// `connection_profile_id` AND — on a per-tenant subdomain — the
+/// `routed_profile_id` that `is_authorized_for_profile` already cleared at
+/// upgrade time (an admin / parent account operating a tenant it owns; a
+/// forged `Host` for an unauthorized tenant 403s before this point, so a
+/// present `routed_profile_id` is always trustworthy). A `session_id` whose
+/// embedded profile is EITHER is in scope; a different tenant is rejected.
+///
+/// - An unscoped connection (`connection_profile_id == None` — bootstrap
+///   admin token / local solo) is authorized for every profile.
+/// - A bare (profile-less) `session_id` is authorized under the connection's
+///   auth, matching `validate_authenticated_session_scope`'s `None` arm.
+///
+/// This is deliberately a touch more permissive than the bare
+/// `validate_session_scope(session_id, None, connection_profile_id)` other
+/// handlers use (it also honours `routed_profile_id`): a router RPC on a
+/// hosted subdomain must not regress the authorized admin/parent access that
+/// existed before this gate landed, while a genuine cross-tenant `session_id`
+/// (matching neither authorized profile) is still rejected. `authenticated_
+/// scope_mismatch_error` tags the rejection `auth_scope_violation` so the
+/// handler emits the same 1008 close the other scope checks do.
+fn authorize_router_session_scope(
+    session_id: &SessionKey,
+    connection_profile_id: Option<&str>,
+    routed_profile_id: Option<&str>,
+) -> Result<(), RpcError> {
+    let Some(connection_profile_id) = connection_profile_id else {
+        return Ok(());
+    };
+    let Some(session_profile) = session_id.profile_id() else {
+        return Ok(());
+    };
+    if session_profile == connection_profile_id || routed_profile_id == Some(session_profile) {
+        return Ok(());
+    }
+    Err(authenticated_scope_mismatch_error(
+        "session_id is outside the authorized profile scope",
+        connection_profile_id,
+        Some(session_profile),
+    ))
 }
 
 /// Wave4-A handler for `router/set_mode`. Parses `params.mode` into the
@@ -13791,6 +14597,7 @@ fn resolve_router_for_session(
 async fn handle_router_set_mode(
     ws: &WsConnection,
     state: &Arc<AppState>,
+    connection_profile_id: Option<&str>,
     routed_profile_id: Option<&str>,
     id: String,
     params: octos_core::ui_protocol::RouterSetModeParams,
@@ -13811,17 +14618,30 @@ async fn handle_router_set_mode(
             return;
         }
     };
-    let Some(router) = resolve_router_for_session(state, &params.session_id, routed_profile_id)
-    else {
-        let _ = send_rpc_error(
-            ws,
-            Some(id),
-            RpcError::invalid_params(format!(
-                "{method}: no adaptive router attached to this session"
-            ))
-            .with_data(json!({ "kind": "runtime_unavailable" })),
-        );
-        return;
+    let router = match resolve_router_for_session(
+        state,
+        &params.session_id,
+        connection_profile_id,
+        routed_profile_id,
+    ) {
+        Ok(Some(router)) => router,
+        Ok(None) => {
+            let _ = send_rpc_error(
+                ws,
+                Some(id),
+                RpcError::invalid_params(format!(
+                    "{method}: no adaptive router attached to this session"
+                ))
+                .with_data(json!({ "kind": "runtime_unavailable" })),
+            );
+            return;
+        }
+        // Cross-tenant session_id on a profile-scoped connection: reject
+        // before touching another tenant's router.
+        Err(error) => {
+            send_scope_error(ws, id, error);
+            return;
+        }
     };
     router.set_mode(mode);
     let result = octos_core::ui_protocol::RouterSetModeResult { mode: params.mode };
@@ -13845,22 +14665,36 @@ async fn handle_router_set_mode(
 async fn handle_router_get_metrics(
     ws: &WsConnection,
     state: &Arc<AppState>,
+    connection_profile_id: Option<&str>,
     routed_profile_id: Option<&str>,
     id: String,
     params: octos_core::ui_protocol::RouterGetMetricsParams,
 ) {
     let method = octos_core::ui_protocol::methods::ROUTER_GET_METRICS;
-    let Some(router) = resolve_router_for_session(state, &params.session_id, routed_profile_id)
-    else {
-        let _ = send_rpc_error(
-            ws,
-            Some(id),
-            RpcError::invalid_params(format!(
-                "{method}: no adaptive router attached to this session"
-            ))
-            .with_data(json!({ "kind": "runtime_unavailable" })),
-        );
-        return;
+    let router = match resolve_router_for_session(
+        state,
+        &params.session_id,
+        connection_profile_id,
+        routed_profile_id,
+    ) {
+        Ok(Some(router)) => router,
+        Ok(None) => {
+            let _ = send_rpc_error(
+                ws,
+                Some(id),
+                RpcError::invalid_params(format!(
+                    "{method}: no adaptive router attached to this session"
+                ))
+                .with_data(json!({ "kind": "runtime_unavailable" })),
+            );
+            return;
+        }
+        // Cross-tenant session_id on a profile-scoped connection: reject
+        // before reading another tenant's router metrics.
+        Err(error) => {
+            send_scope_error(ws, id, error);
+            return;
+        }
     };
     let status = router.adaptive_status();
     let result = octos_core::ui_protocol::RouterGetMetricsResult {
@@ -13959,6 +14793,28 @@ async fn run_m9_fixture_turn(
                     topic: None,
                     turn_id: turn_id.clone(),
                     text: "OK".to_owned(),
+                }),
+            );
+            if m9_fixture_delay_or_interrupt(
+                &mut interrupt_rx,
+                std::time::Duration::from_millis(20),
+            )
+            .await
+            {
+                M9FixtureOutcome::Interrupted
+            } else {
+                M9FixtureOutcome::Completed
+            }
+        }
+        M9ProtocolFixture::M19StdioHappyPath => {
+            let _ = send_notification_ephemeral(
+                &ws,
+                &ledger,
+                UiNotification::MessageDelta(MessageDeltaEvent {
+                    session_id: session_id.clone(),
+                    topic: None,
+                    turn_id: turn_id.clone(),
+                    text: "`M19_STDIO_HAPPY_PATH_FINAL_LINE`".to_owned(),
                 }),
             );
             if m9_fixture_delay_or_interrupt(
@@ -14118,15 +14974,15 @@ async fn run_m9_fixture_turn(
                 }
             }
         }
-        M9ProtocolFixture::ReplayLossy => {
+        M9ProtocolFixture::ReplayLossy | M9ProtocolFixture::ReplayLossyForcedTerminalDrop => {
             ws.metrics.dropped_count.fetch_add(1, Ordering::Relaxed);
             emit_replay_lossy_opportunistic(&ws, &ledger, &session_id.0);
-            if m9_fixture_delay_or_interrupt(
-                &mut interrupt_rx,
-                std::time::Duration::from_millis(20),
-            )
-            .await
-            {
+            let delay = if matches!(fixture, M9ProtocolFixture::ReplayLossyForcedTerminalDrop) {
+                std::time::Duration::from_millis(250)
+            } else {
+                std::time::Duration::from_millis(20)
+            };
+            if m9_fixture_delay_or_interrupt(&mut interrupt_rx, delay).await {
                 M9FixtureOutcome::Interrupted
             } else {
                 M9FixtureOutcome::Completed
@@ -14240,18 +15096,29 @@ async fn run_m9_fixture_turn(
 
     match outcome {
         M9FixtureOutcome::Completed => {
-            try_emit_terminal(
-                &turn_state,
-                TerminalReason::Completed,
-                &ws,
-                &ledger,
-                &session_id,
-                &turn_id,
-                None,
-                // M9 fixtures replay canned events; no live LLM token data.
-                None,
-            )
-            .await;
+            if matches!(fixture, M9ProtocolFixture::ReplayLossyForcedTerminalDrop) {
+                try_emit_completed_terminal_with_forced_backpressure(
+                    &turn_state,
+                    &ws,
+                    &ledger,
+                    &session_id,
+                    &turn_id,
+                )
+                .await;
+            } else {
+                try_emit_terminal(
+                    &turn_state,
+                    TerminalReason::Completed,
+                    &ws,
+                    &ledger,
+                    &session_id,
+                    &turn_id,
+                    None,
+                    // M9 fixtures replay canned events; no live LLM token data.
+                    None,
+                )
+                .await;
+            }
         }
         M9FixtureOutcome::Errored { code, message } => {
             try_emit_terminal(
@@ -15142,6 +16009,11 @@ async fn run_native_code_review_turn(
     let memory_store = session_runtime.profile.memory.clone();
     let tools = Arc::new(session_runtime.tools.snapshot_excluding(&[]));
     let agent_config = session_runtime.agent.agent_config();
+    // UPCR follow-up to #1561: refresh named prompt segments (memory) on
+    // the cached session agent BEFORE snapshotting — WS turns build a
+    // fresh request agent from this snapshot and never run the cached
+    // agent's own turn-start refresh.
+    session_runtime.agent.refresh_prompt_segments().await;
     let system_prompt_base = session_runtime.agent.system_prompt_snapshot();
     let review_dispatch_policy = Arc::new(octos_agent::DispatchPolicy::from_agent_gates(
         profile_runtime.tool_policy.clone(),
@@ -16478,7 +17350,14 @@ fn appui_loop_assistant_reply_for_self_paced(
     match captured_response_content {
         Some(content) if !content.is_empty() => Some(content.to_owned()),
         Some(_) => None,
-        None => history_fallback,
+        // No capture (interrupt / agent error before EndTurn): use the
+        // history reply if present, else `Some("")`. Returning `Some("")`
+        // for a true no-reply is deliberate — the empty reply carries no
+        // `<<loop-next-in: …>>` sentinel, so `apply_self_paced_response`
+        // stamps the DEFAULT delay. The old `None` here parked the loop at
+        // `next_run_at_ms: None`, which the due-scan never visits again —
+        // one interrupted turn silently killed the loop.
+        None => Some(history_fallback.unwrap_or_default()),
     }
 }
 
@@ -16494,6 +17373,28 @@ fn reasoning_effort_from_wire(
         L::High => E::High,
         L::Max => E::Max,
     }
+}
+
+/// Post-terminal `spawn_only` drain: which progress event types must NOT be
+/// forwarded to clients after the foreground turn has already emitted its
+/// terminal `turn/completed`.
+///
+/// - `done` / `error`: the agent main loop already emitted the terminal turn
+///   signal before the drain started; re-forwarding would double-emit.
+/// - `token`: a late assistant delta carries the *foreground* turn's id (the
+///   drain reuses the turn's `progress_context`). On legacy clients that arm
+///   `live_reply` from `message_delta`, a delta for an already-completed turn
+///   resurrects it and latches the input gate forever — the "queued N messages
+///   after active turn" TUI/web wedge. The background `spawn_only` task reports
+///   its real progress via `task_*` / `tool_*` / `file_*` events (all still
+///   forwarded), never via raw foreground tokens, so dropping these loses
+///   nothing user-facing. Pairs with the octos-tui client guard that ignores
+///   deltas for already-terminal turns (belt + suspenders).
+fn drain_should_skip_event(event_type: Option<&str>) -> bool {
+    matches!(
+        event_type,
+        Some("done") | Some("error") | Some("token") | Some("reasoning_chunk")
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -16632,6 +17533,23 @@ async fn run_standalone_turn(
             return;
         }
     };
+    let usage_profile_id = active_profile_id
+        .clone()
+        .or_else(|| session_id.profile_id().map(ToOwned::to_owned))
+        .unwrap_or_else(|| profile_runtime.profile_id.clone());
+    let usage_ledger = match PersistentUsageLedger::open(&session_runtime.profile.data_dir).await {
+        Ok(ledger) => Some(Arc::new(ledger)),
+        Err(error) => {
+            warn!(
+                session = %session_id.0,
+                profile_id = %usage_profile_id,
+                path = %session_runtime.profile.data_dir.join(USAGE_LEDGER_FILE).display(),
+                error = %error,
+                "usage ledger unavailable; continuing turn without durable usage record"
+            );
+            None
+        }
+    };
 
     // Source the per-session primitives from the SessionRuntime.
     //
@@ -16707,6 +17625,46 @@ async fn run_standalone_turn(
     if tool_registry.get("activate_tools").is_some() {
         tool_registry.register(octos_agent::ActivateToolsTool::new());
     }
+    // RFC-1 fixup (codex P2): apply the SAME freshness pattern to the
+    // `mofa_make` / `mofa_describe_content_type` dispatcher pair.
+    // `snapshot_excluding` clones `Arc<dyn Tool>` instances, so the
+    // dispatcher in the per-turn registry is the SAME object as the
+    // SessionRuntime's cached dispatcher. Calling
+    // `wire_mofa_make_registry_back_ref` further down (via
+    // `Agent::new_shared`'s central wire, see Fix #1) would mutate
+    // that shared dispatcher's `Mutex<Weak<ToolRegistry>>` to point
+    // at THIS turn's registry — and overlapping turns/background
+    // `mofa_make` runs on the cached session registry would then
+    // resolve through the WRONG registry (or, once the per-turn
+    // registry drops, an empty Weak → DISPATCHER_ERROR).
+    //
+    // Mint fresh `MofaMakeTool` + `MofaDescribeContentTypeTool`
+    // instances seeded from the existing dispatcher's catalog so the
+    // per-turn registry has its own dispatcher object whose Weak is
+    // safe to rewire. The SessionRuntime's cached dispatcher keeps
+    // its original Weak (set at SessionRuntime bootstrap), so other
+    // turns are unaffected.
+    if let Some(existing) = tool_registry.get("mofa_make").cloned() {
+        if let Some(dispatcher) = existing
+            .as_any()
+            .downcast_ref::<octos_agent::MofaMakeTool>()
+        {
+            let entries = dispatcher.entries();
+            let fresh_dispatcher = octos_agent::MofaMakeTool::new();
+            for entry in &entries {
+                fresh_dispatcher.register_or_replace(entry.clone());
+            }
+            tool_registry.register(fresh_dispatcher);
+
+            if tool_registry.get("mofa_describe_content_type").is_some() {
+                let fresh_describe = octos_agent::MofaDescribeContentTypeTool::new();
+                for entry in &entries {
+                    fresh_describe.register_or_replace(entry.clone());
+                }
+                tool_registry.register(fresh_describe);
+            }
+        }
+    }
 
     // Slides session structural guardrail — PR #1265 follow-up.
     //
@@ -16779,6 +17737,10 @@ async fn run_standalone_turn(
     // dynamic context — none of which the session prompt should
     // supplant. The session prompt is workflow-specific guidance that
     // augments rather than replaces.
+    // Same refresh-before-snapshot rule as the review path: the cached
+    // agent's memory segment must be current before the per-turn agent
+    // clones its prompt.
+    session_runtime.agent.refresh_prompt_segments().await;
     let agent_snapshot = session_runtime.agent.system_prompt_snapshot();
     let system_prompt_base = match session_id.topic().and_then(|topic| {
         crate::project_templates::read_session_prompt(&session_runtime.profile.data_dir, topic)
@@ -17413,6 +18375,10 @@ async fn run_standalone_turn(
             session_id.to_string(),
             task_state_path.clone(),
         )
+        // Embed-on-save + recall parity: spawn workers save episodes by
+        // default; without the profile's embedder those episodes are
+        // stored vectorless and worker episodic recall silently skips.
+        .with_optional_embedder(session_runtime.profile.embedder.clone())
         .with_plugin_dirs(
             session_runtime.profile.plugin_dirs.clone(),
             session_runtime.profile.plugin_env_template.clone(),
@@ -17799,6 +18765,8 @@ async fn run_standalone_turn(
     // (its internal `Weak<ToolRegistry>` is empty). Gateway does the
     // equivalent at `session_actor.rs:2500`.
     request_agent.wire_activate_tools();
+    // RFC-1: wire mofa_make at the same site.
+    request_agent.wire_mofa_make_dispatcher();
 
     let agent_session_id = session_id.clone();
     let approval_requester: Arc<dyn octos_agent::ToolApprovalRequester> =
@@ -17835,6 +18803,10 @@ async fn run_standalone_turn(
     let turn_thread_id_for_done = turn_thread_id_for_persist.clone();
     let context_manager_for_result = context_manager.clone();
     let context_data_dir_for_result = session_runtime.profile.data_dir.clone();
+    let usage_ledger_for_result = usage_ledger.clone();
+    let usage_profile_id_for_result = usage_profile_id.clone();
+    let usage_session_id_for_result = session_id.to_string();
+    let usage_run_id_for_result = turn_id.0.to_string();
     // UPCR-2026-015 (M9-β-1): pull the pre-uploaded media paths off
     // the params and feed them to the agent loop. `process_message`
     // already accepts a `Vec<String>` of paths (used by the
@@ -17912,7 +18884,21 @@ async fn run_standalone_turn(
         // ask for short, speakable answers. Text chat (had_audio_input == false)
         // keeps its normal detailed/formatted persona — this branch never runs there.
         prompt = format!(
-            "{prompt}\n\n[语音模式:用口语化中文、一两句话简短回答;不要使用 Markdown、列表、代码块或 emoji。]"
+            "{prompt}\n\n[语音模式:用口语化中文、一两句话简短回答;不要使用 Markdown、列表、代码块或 emoji。\
+             \n若(且仅若)可视化更能帮助用户理解——例如他想『看到/画出/演示/直观理解』某个结构性、空间性或图示性的东西(电路、波形、数学曲线、流程、UI 草图等)——\
+             在口播正文之后【另起一行】追加一个标记:[[VISUAL:kind|brief]]。\
+             按【用户的认知需求】选 kind:\
+             html=纯动态/可调交互、靠动手玩参数理解、不需要看实物的样子(电路、波形、数学曲线、流程、算法);\
+             illustrated=既要看清实物真实样子、又要交互讲解/标注的结构性内容(细胞、器官、动植物、解剖、天体、机械构造等)——系统会先生成写实插图再叠加交互标注;\
+             image=只要一张写实或艺术单图(某物长什么样、画作);\
+             infographic=多段并列要点/步骤的信息图。\
+             brief 是给生成器的一句话简述。\
+             普通问答/闲聊/事实回答【不要】加标记。\
+             示例1:用户说『我想直观看到负反馈电路如何负反馈』→ 口播『我给你画一个可调增益的负反馈电路,你可以拖滑块看输出怎么被拉回来。』,然后另起一行:[[VISUAL:html|可调增益的负反馈电路交互演示,滑块调增益,实时显示反馈如何稳定输出]]\
+             示例2:用户说『能结合图片讲讲人类细胞的结构吗』→ 口播『我给你画一张细胞结构图,点各个部分能看它们的作用。』,然后另起一行:[[VISUAL:illustrated|人类动物细胞结构写实插图,标注细胞核、线粒体、细胞膜、细胞质、内质网]]\
+             \n退出意图:当用户明确想结束对话/离开/不聊了/再见/拜拜/静音/退出语音助手时——先用一句简短自然的话告别(如『好的,再见啦!』),然后【另起一行】只追加一个标记:[[EXIT]]。\
+             仅在用户确实想退出时才加;普通问答/闲聊/继续提问【绝对不要】加。\
+             示例:用户说『再见』或『退出吧』→ 口播『好的,再见!』,然后另起一行:[[EXIT]]]"
         );
         // The audio is now in the prompt as text. Drop it from the
         // agent-visible media so the model answers the transcript directly
@@ -17976,6 +18962,19 @@ async fn run_standalone_turn(
     // most one final response and we only need it once in the post-turn
     // block.
     let (final_reply_tx, final_reply_rx) = tokio::sync::oneshot::channel::<Option<String>>();
+    // Voice rich output (#1477): the agent task lifts the trailing in-band
+    // `[[VISUAL:...]]` directive out of `response.content` (and strips it from
+    // every authoritative surface) and hands it here for the post-turn
+    // background dispatch. `None` for text turns or replies without a marker.
+    let (visual_directive_tx, visual_directive_rx) =
+        tokio::sync::oneshot::channel::<Option<crate::api::voice_turn::VisualDirective>>();
+    // Voice exit intent (UPCR-2026-025): the agent task lifts the trailing
+    // in-band `[[EXIT]]` marker out of `response.content` (stripping it from
+    // every authoritative surface) and signals here whether the user asked to
+    // leave. The post-turn block emits the typed `voice/exit` event so the
+    // client returns home after the farewell audio. `false` for text turns or
+    // replies without the marker.
+    let (exit_directive_tx, exit_directive_rx) = tokio::sync::oneshot::channel::<bool>();
     let agent_task = tokio::spawn(async move {
         let start = std::time::Instant::now();
         // RFC-3 (#1292): wrap the agent.process_message future in the
@@ -18036,7 +19035,30 @@ async fn run_standalone_turn(
         }
 
         match result {
-            Ok(response) => {
+            Ok(mut response) => {
+                // Voice control markers: lift the trailing in-band
+                // `[[VISUAL:...]]` (#1477) and `[[EXIT]]` (UPCR-2026-025)
+                // directives out of the reply and strip them from
+                // `response.content` AND every Assistant carrier in
+                // `response.messages` BEFORE capture / persist / done, so the
+                // internal control protocol never reaches the wire
+                // (`message/delta` from `done`, `message/persisted`) or storage
+                // (session JSONL). Stacked markers in either order are both
+                // peeled (review fix). The directives are dispatched post-turn
+                // from the oneshots below; the client learns a visual is coming
+                // from `visual/generating` and an exit from `voice/exit`. Gated
+                // on voice turns. No-op (returns `(None, false)`, mutates
+                // nothing) without a real trailing marker.
+                let (visual_directive, exit_requested) = if had_audio_input {
+                    crate::api::voice_turn::strip_control_directives(
+                        &mut response.content,
+                        &mut response.messages,
+                    )
+                } else {
+                    (None, false)
+                };
+                let _ = visual_directive_tx.send(visual_directive);
+                let _ = exit_directive_tx.send(exit_requested);
                 // #1134 — capture the LLM reply for the post-turn
                 // self-paced reschedule block. The receiver of this
                 // oneshot uses the captured content instead of
@@ -18507,6 +19529,59 @@ async fn run_standalone_turn(
                     None
                 };
                 let _ = final_reply_tx.send(final_send);
+                if let Some(usage_ledger) = usage_ledger_for_result.as_ref() {
+                    let provider_metadata = response.provider_metadata.clone();
+                    let provider = provider_metadata
+                        .as_ref()
+                        .map(|meta| meta.provider.clone())
+                        .or_else(|| {
+                            let provider = request_agent.provider_name();
+                            (!provider.is_empty()).then(|| provider.to_string())
+                        });
+                    let model = provider_metadata
+                        .as_ref()
+                        .map(|meta| meta.model.clone())
+                        .or_else(|| {
+                            let model = request_agent.model_id();
+                            (!model.is_empty()).then(|| model.to_string())
+                        });
+                    let estimated_cost_usd =
+                        model.as_deref().and_then(model_pricing).map(|pricing| {
+                            pricing.cost(
+                                response.token_usage.input_tokens,
+                                response.token_usage.output_tokens,
+                            )
+                        });
+                    let cost_source = if estimated_cost_usd.is_some() {
+                        UsageCostSource::CatalogEstimate
+                    } else {
+                        UsageCostSource::Unavailable
+                    };
+                    let event = UsageEvent::completed_run(
+                        usage_profile_id_for_result.clone(),
+                        usage_session_id_for_result.clone(),
+                        usage_run_id_for_result.clone(),
+                        provider,
+                        model,
+                        provider_metadata
+                            .as_ref()
+                            .and_then(|meta| meta.endpoint.clone()),
+                        u64::from(response.token_usage.input_tokens),
+                        u64::from(response.token_usage.output_tokens),
+                        estimated_cost_usd,
+                        cost_source,
+                        "appui",
+                        None,
+                    );
+                    if let Err(error) = usage_ledger.record(event).await {
+                        warn!(
+                            session = %usage_session_id_for_result,
+                            run = %usage_run_id_for_result,
+                            error = %error,
+                            "failed to record AppUI usage event"
+                        );
+                    }
+                }
                 // Issue #1332: include `message_id` so the consumer
                 // can build `TurnSessionResult` for the
                 // `turn/completed` lifecycle envelope. Absent when no
@@ -18537,6 +19612,8 @@ async fn run_standalone_turn(
                 // back to the session-history scan, matching the
                 // pre-#1134 behaviour.
                 let _ = final_reply_tx.send(None);
+                // No reply → no rich-output directive to dispatch.
+                let _ = visual_directive_tx.send(None);
                 // Codex round-2 MAJOR 2: prefer the typed user-actionable
                 // message over the raw LLM Display string. The agent
                 // loop's classifier (`HarnessError::classify_report` at
@@ -18580,38 +19657,26 @@ async fn run_standalone_turn(
     // streams `token` events, instead of waiting for the whole reply. A FIFO
     // worker keeps the emitted audio ordered without blocking this loop. All
     // gated on `had_audio_input`, so text chat is untouched.
-    fn drain_voice_sentences(buf: &mut String) -> Vec<String> {
-        // Strong boundaries always split; commas (soft) split once the segment is
-        // long enough (>=8 chars) so the first audio comes out fast. Now that
-        // few-shot synthesis keeps comma-fragments free of the "啊/哦" filler
-        // (that was zero-shot, not chunking), comma-splitting buys ~1s lower
-        // first-audio latency vs whole-sentence without the artifacts.
-        const STRONG: &[char] = &['。', '！', '？', '!', '?', '…', '；', ';', '\n'];
-        const SOFT: &[char] = &['，', ',', '、'];
-        const SOFT_MIN_CHARS: usize = 8;
-        let mut out = Vec::new();
-        loop {
-            let mut cut = None;
-            for (count, (i, c)) in buf.char_indices().enumerate() {
-                if STRONG.contains(&c) || (SOFT.contains(&c) && count + 1 >= SOFT_MIN_CHARS) {
-                    cut = Some(i + c.len_utf8());
-                    break;
-                }
-            }
-            match cut {
-                Some(idx) => {
-                    let sentence = buf[..idx].trim().to_string();
-                    *buf = buf[idx..].to_string();
-                    if !sentence.is_empty() {
-                        out.push(sentence);
-                    }
-                }
-                None => break,
-            }
-        }
-        out
-    }
-    let mut voice_buf = String::new();
+    // Voice turn: a `VoiceReplySplitter` feeds complete sentences to the TTS
+    // worker AS tokens stream, while holding back any trailing in-band
+    // `[[VISUAL:kind|brief]]` marker so it never reaches TTS. Sentence-splitting
+    // lives in `voice_turn::VoiceReplySplitter` (unit-tested). The rich-output
+    // directive is parsed later from the authoritative final reply (not the
+    // splitter), so it is robust whether or not the reply was streamed.
+    let mut voice_splitter = if had_audio_input {
+        Some(crate::api::voice_turn::VoiceReplySplitter::new())
+    } else {
+        None
+    };
+    // Voice turn: marker-aware UI delta filter (#1477). Streams the reply to the
+    // chat bubble token-by-token while holding back the trailing
+    // `[[VISUAL:...]]` marker, so the live `message/delta` wire never carries the
+    // internal control protocol (durable surfaces are stripped in the agent task).
+    let mut voice_delta_filter = if had_audio_input {
+        Some(crate::api::voice_turn::VisibleDeltaFilter::new())
+    } else {
+        None
+    };
     let mut voice_streamed_count: usize = 0;
     let (voice_tx, voice_handle) = if had_audio_input {
         let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(64);
@@ -18626,6 +19691,7 @@ async fn run_standalone_turn(
             &session_runtime.profile.voice.default_voice,
         );
         let w_provider = session_runtime.profile.voice.tts_provider.clone();
+        let w_cloud = session_runtime.profile.voice.cloud.clone();
         let handle = tokio::spawn(async move {
             let mut n: usize = 0;
             while let Some(sentence) = rx.recv().await {
@@ -18633,6 +19699,7 @@ async fn run_standalone_turn(
                     &sentence,
                     &w_voice,
                     &w_provider,
+                    w_cloud.as_ref(),
                     &w_dir,
                 )
                 .await
@@ -18783,19 +19850,44 @@ async fn run_standalone_turn(
                 break;
             }
             _ => {
-                // Voice turn: accumulate streamed `token` text and hand off
-                // each complete sentence to the FIFO TTS worker for immediate
-                // synthesis (overlaps with the rest of LLM generation).
-                if let Some(ref tx) = voice_tx {
+                // Voice turn: accumulate streamed `token` text and hand off each
+                // complete sentence to the FIFO TTS worker for immediate synthesis,
+                // AND emit the same text — minus the trailing `[[VISUAL:...]]`
+                // marker — as the UI `message/delta`, then SKIP the generic token
+                // forward so the raw marker never reaches the wire (#1477).
+                if let (Some(tx), Some(sp), Some(uf)) = (
+                    voice_tx.as_ref(),
+                    voice_splitter.as_mut(),
+                    voice_delta_filter.as_mut(),
+                ) {
                     if event.get("type").and_then(Value::as_str) == Some("token") {
                         if let Some(t) = event.get("text").and_then(Value::as_str) {
-                            voice_buf.push_str(t);
-                            for sentence in drain_voice_sentences(&mut voice_buf) {
+                            for sentence in sp.push(t) {
                                 if tx.try_send(sentence).is_ok() {
                                     voice_streamed_count += 1;
                                 }
                             }
+                            let visible = uf.push(t);
+                            if !visible.is_empty() {
+                                // #1477 P2: dual-emit the canonical envelope so
+                                // projection.envelope.v1 clients also receive the
+                                // voice delta — a bare ephemeral send is filtered
+                                // out for them. Mirrors forward_progress_event's
+                                // MessageDelta handling (emit envelope, then legacy).
+                                let delta = UiNotification::MessageDelta(MessageDeltaEvent {
+                                    session_id: session_id.clone(),
+                                    topic: None,
+                                    turn_id: turn_id.clone(),
+                                    text: visible,
+                                });
+                                emit_envelope_for_legacy_notification(&ledger, &session_id, &delta);
+                                let _ = send_notification_ephemeral(&ws, &ledger, delta);
+                                saw_delta = true;
+                            }
                         }
+                        // Token handled for this voice turn — do NOT forward the
+                        // raw token (it may carry the in-band marker).
+                        continue;
                     }
                 }
                 forward_progress_event(
@@ -18813,13 +19905,38 @@ async fn run_standalone_turn(
         }
     }
 
-    // Voice turn: flush the trailing partial sentence, close the channel, and
-    // wait for the FIFO TTS worker to finish emitting all sentence audio.
+    // Voice turn: flush the trailing partial sentence (marker already held back
+    // by the splitter), close the channel, and wait for the FIFO TTS worker.
     if let Some(tx) = voice_tx {
-        if !interrupt_observed {
-            let tail = voice_buf.trim().to_string();
-            if !tail.is_empty() && tx.try_send(tail).is_ok() {
-                voice_streamed_count += 1;
+        if let Some(sp) = voice_splitter.take() {
+            let (tail, _directive) = sp.finish();
+            if !interrupt_observed {
+                if let Some(t) = tail {
+                    if tx.try_send(t).is_ok() {
+                        voice_streamed_count += 1;
+                    }
+                }
+            }
+        }
+        // Flush any held UI text the marker-aware filter retained that turned out
+        // NOT to be a real trailing marker (rare mid-reply `[[VISUAL:`); a genuine
+        // trailing marker yields nothing so it never reaches the wire (#1477).
+        if let Some(uf) = voice_delta_filter.take() {
+            if !interrupt_observed {
+                let recovered = uf.finish();
+                if !recovered.is_empty() {
+                    // #1477 P2: dual-emit the envelope (see the streaming path
+                    // above) so projection.envelope.v1 clients also get the
+                    // recovered tail delta.
+                    let delta = UiNotification::MessageDelta(MessageDeltaEvent {
+                        session_id: session_id.clone(),
+                        topic: None,
+                        turn_id: turn_id.clone(),
+                        text: recovered,
+                    });
+                    emit_envelope_for_legacy_notification(&ledger, &session_id, &delta);
+                    let _ = send_notification_ephemeral(&ws, &ledger, delta);
+                }
             }
         }
         drop(tx);
@@ -18968,24 +20085,24 @@ async fn run_standalone_turn(
                     Ok(value) => value,
                     Err(_) => continue,
                 };
-                match event.get("type").and_then(Value::as_str) {
-                    // Already emitted by the agent's main-loop terminal
-                    // path. Skip silently in the drain.
-                    Some("done") | Some("error") => continue,
-                    _ => {
-                        forward_progress_event(
-                            &drain_ws,
-                            &drain_ledger,
-                            &drain_session_id,
-                            &drain_progress_context,
-                            drain_contracts.as_ref(),
-                            drain_workspace_root.as_deref(),
-                            &mut drain_tracker,
-                            &mut drain_saw_delta,
-                            &event,
-                        );
-                    }
+                // `done`/`error` were already emitted by the agent's
+                // main-loop terminal path; `token` would resurrect the
+                // now-completed foreground turn on legacy clients (the
+                // input-gate wedge). See `drain_should_skip_event`.
+                if drain_should_skip_event(event.get("type").and_then(Value::as_str)) {
+                    continue;
                 }
+                forward_progress_event(
+                    &drain_ws,
+                    &drain_ledger,
+                    &drain_session_id,
+                    &drain_progress_context,
+                    drain_contracts.as_ref(),
+                    drain_workspace_root.as_deref(),
+                    &mut drain_tracker,
+                    &mut drain_saw_delta,
+                    &event,
+                );
             }
             // `drain_saw_delta` only matters when callers want to backfill
             // the terminal `done`'s assistant content; the drain runs
@@ -19009,6 +20126,268 @@ async fn run_standalone_turn(
     // half is guaranteed to be either delivered or dropped — this
     // `await` will not block.
     let final_response_content: Option<String> = final_reply_rx.await.ok().flatten();
+    // Voice rich output (#1477): the directive was lifted + stripped inside the
+    // agent task; receive it here (`None` for text turns / replies with no
+    // marker). `final_response_content` is now the clean spoken reply (marker
+    // already gone), so it doubles as the HTML author's "spoken_reply" context.
+    let visual_directive = visual_directive_rx.await.ok().flatten();
+
+    // Voice exit intent (UPCR-2026-025): the agent task signalled whether the
+    // user asked to leave (the `[[EXIT]]` marker was lifted + stripped there).
+    // Receive the flag now, but DEFER emitting `voice/exit` until AFTER the
+    // farewell reply audio has been attached (the streamed path above, or the
+    // whole-reply fallback synth below) — review fix: emitting here would let a
+    // no-sentence-boundary reply's `voice/exit` reach the client before its
+    // farewell `file/attached`, so the client could navigate away before the
+    // goodbye is heard, violating the "farewell first" contract.
+    let exit_requested = exit_directive_rx.await.unwrap_or(false);
+
+    // Voice rich output: dispatch the in-band [[VISUAL]] directive.
+    // HTML → a focused tool-less LLM call (rich_output); image-class → a
+    // backend-orchestrated mofa skill. Fire-and-forget: the artifact arrives
+    // async via the same `files_attached` channel as the reply audio, so the
+    // turn completes while the client shows a "generating" state. The client is
+    // told a visual is coming by the typed `visual/generating` event below (no
+    // in-band marker is on the wire). The model emits no tool call, so the
+    // Gemini-3 thought_signature path never arises.
+    if had_audio_input && !interrupt_observed {
+        if let Some(directive) = visual_directive {
+            use crate::api::voice_turn::VisualKind;
+            // Tell the client a visual is generating (typed signal, replaces the
+            // old in-band-marker scrape). The lifecycle terminates on the typed
+            // `visual/succeeded` or `visual/failed` (below) — never on
+            // `file/attached`, which is a pure artifact-delivery signal.
+            super::ui_protocol_alpha9_bridge::emit_visual_generating_from_background(
+                &ledger,
+                &session_id,
+                &turn_id,
+                directive.kind.as_str(),
+            );
+            // #1477 P2: register the visual generation as a SUPERVISED background
+            // task (not a bare detached spawn) so it is observable in the admin
+            // dashboard, carries terminal status, and is cancelable — both via
+            // the session interrupt path (`cancel_session_spawn_only_tasks`) and
+            // its own cancel token, which the worker races below.
+            let r_supervisor = tool_registry.supervisor();
+            let r_task_call_id = format!("voice-visual-{}", uuid::Uuid::now_v7());
+            // Register under the FULL session key (incl. any `#topic` /
+            // profile dimension), NOT `base_key()`: the interrupt path queries
+            // `get_tasks_for_session(&session_id.to_string())` with an EXACT
+            // string match (`cancel_session_spawn_only_tasks`). A `base_key()`
+            // registration would file the task under `…web-123` while the
+            // interrupt of `…web-123#voice` looks for the full key and miss it.
+            // Using the full key also means an interrupt cancels only THIS
+            // topic's visual task, never a sibling topic's.
+            let r_task_id =
+                r_supervisor.register("voice_visual", &r_task_call_id, Some(session_id.0.as_str()));
+            let r_cancel = r_supervisor.cancel_token(&r_task_id);
+            let r_ledger = ledger.clone();
+            let r_session = session_id.clone();
+            let r_turn = turn_id.clone();
+            let r_dir = session_runtime.workspace_root.clone();
+            let r_provider = llm_provider.clone();
+            let r_registry = tool_registry.clone();
+            let r_transcript = voice_transcripts.join("\n");
+            let r_spoken = final_response_content.clone().unwrap_or_default();
+            // This turn's camera frame(s) → forwarded to the Illustrated path as
+            // reference images so the generated illustration depicts the real
+            // subject in front of the camera. Gated on the EXPLICIT live-video
+            // signal (#1478), consistent with the loop_runner video-call note —
+            // never inferred from "there's an image attached" (a voice note +
+            // uploaded image is not a live camera frame).
+            let r_ref_images: Vec<String> = if params.live_video {
+                asr_media
+                    .iter()
+                    .filter(|p| octos_bus::media::is_image(p))
+                    .cloned()
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            tracing::info!(
+                kind = ?directive.kind,
+                brief = %directive.brief,
+                // Diagnostics for camera-frame grounding: `live_video` is the
+                // explicit signal from the client; `ref_images` is how many
+                // camera frames are forwarded to the illustration generator.
+                // Both 0/false here means the generated image cannot be
+                // grounded on the real subject in front of the camera.
+                live_video = params.live_video,
+                ref_images = r_ref_images.len(),
+                "voice rich: dispatching visual directive"
+            );
+            tokio::spawn(async move {
+                r_supervisor.mark_running(&r_task_id);
+                // Capture the kind token before `produce` consumes `directive`
+                // (its `brief` is moved into the skill calls); needed for the
+                // typed `visual/succeeded` on the success branch.
+                let r_kind = directive.kind.as_str();
+                // #1477 P2: bound the background visual task. Image generation +
+                // HTML authoring are network/LLM calls with no other ceiling on
+                // this detached path, so cap them so a hung skill / provider
+                // cannot leak a task for the process lifetime. On timeout we
+                // deliver nothing (observable via the warn below), matching the
+                // other failure branches.
+                const VISUAL_DISPATCH_TIMEOUT: std::time::Duration =
+                    std::time::Duration::from_secs(180);
+                let produce = async {
+                    let rels: Vec<String> = match directive.kind {
+                        VisualKind::Html => {
+                            let ctx = octos_agent::rich_output::RichHtmlContext {
+                                transcript: r_transcript,
+                                spoken_reply: r_spoken,
+                                brief: directive.brief,
+                                illustration: false,
+                            };
+                            match octos_agent::rich_output::author_html(r_provider.as_ref(), &ctx)
+                                .await
+                            {
+                                Ok(html) => {
+                                    let name = format!("visual-{}.html", uuid::Uuid::now_v7());
+                                    match tokio::fs::write(r_dir.join(&name), html).await {
+                                        Ok(()) => vec![name],
+                                        Err(e) => {
+                                            tracing::warn!(error = %e, "voice rich: html write failed");
+                                            Vec::new()
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    tracing::warn!(error = %e, "voice rich: author_html failed");
+                                    Vec::new()
+                                }
+                            }
+                        }
+                        VisualKind::Illustrated => {
+                            // Stage 1: generate a realistic illustration PNG.
+                            let png_bytes = match crate::api::voice_turn::run_illustration_image(
+                                &r_registry,
+                                &directive.brief,
+                                &r_dir,
+                                &r_ref_images,
+                            )
+                            .await
+                            {
+                                Some(p) => tokio::fs::read(&p).await.ok(),
+                                None => None,
+                            };
+                            // Stage 2: author HTML that embeds it (model uses the
+                            // placeholder src), then inline the PNG as a data URI so
+                            // the artifact is a single self-contained file. If image
+                            // gen failed, fall back to a no-illustration document.
+                            let ctx = octos_agent::rich_output::RichHtmlContext {
+                                transcript: r_transcript,
+                                spoken_reply: r_spoken,
+                                brief: directive.brief,
+                                illustration: png_bytes.is_some(),
+                            };
+                            match octos_agent::rich_output::author_html(r_provider.as_ref(), &ctx)
+                                .await
+                            {
+                                Ok(html) => {
+                                    let html = match png_bytes {
+                                        Some(bytes) => {
+                                            octos_agent::rich_output::inline_illustration(
+                                                &html, &bytes,
+                                            )
+                                        }
+                                        None => html,
+                                    };
+                                    let name = format!("visual-{}.html", uuid::Uuid::now_v7());
+                                    match tokio::fs::write(r_dir.join(&name), html).await {
+                                        Ok(()) => vec![name],
+                                        Err(e) => {
+                                            tracing::warn!(error = %e, "voice rich: html write failed");
+                                            Vec::new()
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    tracing::warn!(error = %e, "voice rich: author_html (illustrated) failed");
+                                    Vec::new()
+                                }
+                            }
+                        }
+                        VisualKind::Image | VisualKind::Infographic => {
+                            crate::api::voice_turn::run_image_skill(&r_registry, &directive, &r_dir)
+                                .await
+                        }
+                    };
+                    rels
+                };
+                // Race the work against the task's cancel token (fired by the
+                // session interrupt path) and the timeout. Each terminal branch
+                // reports its OWN reason so the supervisor row + `visual/failed`
+                // distinguish cancellation, timeout, and a clean-but-empty
+                // result (rather than folding all three into one message).
+                let rels = tokio::select! {
+                    biased;
+                    _ = r_cancel.cancelled() => {
+                        tracing::info!("voice rich: visual dispatch cancelled");
+                        r_supervisor.mark_failed(&r_task_id, "cancelled".to_owned());
+                        super::ui_protocol_alpha9_bridge::emit_visual_failed_from_background(
+                            &r_ledger,
+                            &r_session,
+                            &r_turn,
+                            Some("cancelled".to_owned()),
+                        );
+                        return;
+                    }
+                    res = tokio::time::timeout(VISUAL_DISPATCH_TIMEOUT, produce) => match res {
+                        Ok(rels) => rels,
+                        Err(_) => {
+                            let reason =
+                                format!("timed out after {}s", VISUAL_DISPATCH_TIMEOUT.as_secs());
+                            tracing::warn!(
+                                timeout_s = VISUAL_DISPATCH_TIMEOUT.as_secs(),
+                                "voice rich: visual dispatch timed out, delivering nothing"
+                            );
+                            r_supervisor.mark_failed(&r_task_id, reason.clone());
+                            super::ui_protocol_alpha9_bridge::emit_visual_failed_from_background(
+                                &r_ledger,
+                                &r_session,
+                                &r_turn,
+                                Some(reason),
+                            );
+                            return;
+                        }
+                    }
+                };
+                if rels.is_empty() {
+                    tracing::warn!("voice rich: produced no artifact to deliver");
+                    r_supervisor.mark_failed(&r_task_id, "produced no artifact".to_owned());
+                    // Clear the client's "generating" placeholder (#1477).
+                    super::ui_protocol_alpha9_bridge::emit_visual_failed_from_background(
+                        &r_ledger,
+                        &r_session,
+                        &r_turn,
+                        Some("visual generation produced no artifact".to_owned()),
+                    );
+                } else {
+                    tracing::info!(files = ?rels, "voice rich: delivering artifact(s)");
+                    r_supervisor.mark_completed(&r_task_id, rels.clone());
+                    // Deliver the artifact(s) AND emit the typed success signal.
+                    // `file/attached` stays a pure artifact-delivery event; the
+                    // visual lifecycle terminates on `visual/succeeded` (#1477),
+                    // so the client never has to infer success from a file
+                    // extension — and the lifecycle survives a future
+                    // `projection.envelope.v1` cutover that supersedes
+                    // `file/attached`.
+                    super::ui_protocol_alpha9_bridge::emit_files_attached_from_background(
+                        &r_ledger,
+                        &r_session,
+                        &r_turn,
+                        &rels,
+                        &[],
+                        None,
+                    );
+                    super::ui_protocol_alpha9_bridge::emit_visual_succeeded_from_background(
+                        &r_ledger, &r_session, &r_turn, r_kind, &rels,
+                    );
+                }
+            });
+        }
+    }
 
     // ── 语音轮 TTS（serve 路径）────────────────────────────────────
     // 仅当本轮有音频输入（语音轮）时，把最终文本回复合成为音频并下发，
@@ -19023,16 +20402,26 @@ async fn run_standalone_turn(
     // path above produced no audio (e.g. a reply with no sentence boundaries).
     if had_audio_input && voice_streamed_count == 0 {
         if let Some(reply) = final_response_content.as_deref() {
+            // Strip any in-band [[VISUAL:...]] marker so the fallback synth does
+            // not read the marker aloud (the streamed path's splitter already
+            // does this; this is the no-sentence-boundary fallback).
+            let reply = crate::api::voice_turn::strip_visual_marker(reply);
             // Per-tenant reply voice: live override wins, else profile default.
             let voice = crate::api::voices::resolve_reply_voice(
                 &session_runtime.profile.profile_id,
                 &session_runtime.profile.voice.default_voice,
             );
             let provider = session_runtime.profile.voice.tts_provider.as_str();
+            let cloud = session_runtime.profile.voice.cloud.as_ref();
             let reply_audio_dir = session_runtime.workspace_root.as_path();
-            if let Some(audio_path) =
-                crate::api::voice_turn::synthesize_reply(reply, &voice, provider, reply_audio_dir)
-                    .await
+            if let Some(audio_path) = crate::api::voice_turn::synthesize_reply(
+                reply,
+                &voice,
+                provider,
+                cloud,
+                reply_audio_dir,
+            )
+            .await
             {
                 // Deliver via the EXISTING file/attached carrier. Emit the
                 // WORKSPACE-RELATIVE filename, NOT the absolute path:
@@ -19056,6 +20445,21 @@ async fn run_standalone_turn(
                 tracing::info!(audio = %audio_path.display(), "voice_turn: synthesized reply audio");
             }
         }
+    }
+
+    // Voice exit intent (UPCR-2026-025): NOW that the farewell reply audio has
+    // been attached (streamed sentences awaited above, or the whole-reply
+    // fallback synth just above), emit the typed `voice/exit`. Emitting here —
+    // strictly AFTER the farewell `file/attached` — guarantees the client has
+    // the goodbye audio queued before it sees the exit signal, so it plays the
+    // farewell before leaving /voice (the events share the ordered ledger live
+    // path). No in-band marker is on the wire.
+    if had_audio_input && !interrupt_observed && exit_requested {
+        super::ui_protocol_alpha9_bridge::emit_voice_exit_from_background(
+            &ledger,
+            &session_id,
+            &turn_id,
+        );
     }
 
     // #1128 codex P1 re-review #2 — apply self-paced rescheduling
@@ -19451,7 +20855,7 @@ async fn try_emit_terminal(
 }
 
 /// UPCR-2026-014 M9-γ dual-emit helper for `MessageDelta` /
-/// `ToolStarted` / `ToolProgress` / `ToolCompleted` (the legacy
+/// `ReasoningDelta` / `ToolStarted` / `ToolProgress` / `ToolCompleted` (the legacy
 /// notifications surfaced by `forward_progress_event`).
 ///
 /// For every legacy notification produced by the progress mapper, this
@@ -19488,6 +20892,13 @@ fn emit_envelope_for_legacy_notification(
             UiNotification::MessageDelta(event) => (
                 event.turn_id.0.to_string(),
                 Payload::AssistantDelta {
+                    text: event.text.clone(),
+                },
+                None,
+            ),
+            UiNotification::ReasoningDelta(event) => (
+                event.turn_id.0.to_string(),
+                Payload::ReasoningDelta {
                     text: event.text.clone(),
                 },
                 None,
@@ -19536,6 +20947,38 @@ fn emit_envelope_for_legacy_notification(
             _ => return,
         };
     let _ = ledger.emit_envelope(session_id, thread_id, payload, client_message_id);
+}
+
+async fn try_emit_completed_terminal_with_forced_backpressure(
+    turn_state: &TokioMutex<TurnState>,
+    ws: &WsConnection,
+    ledger: &UiProtocolLedger,
+    session_id: &SessionKey,
+    turn_id: &TurnId,
+) {
+    let Some(TerminalTransition { ack, .. }) =
+        transition_to_terminal(turn_state, TerminalReason::Completed).await
+    else {
+        return;
+    };
+
+    let _ = send_notification_lifecycle_forced_backpressure_fixture(
+        ws,
+        ledger,
+        UiNotification::TurnCompleted(TurnCompletedEvent {
+            session_id: session_id.clone(),
+            topic: None,
+            turn_id: turn_id.clone(),
+            cursor: None,
+            tokens_in: None,
+            tokens_out: None,
+            session_result: None,
+        }),
+    );
+
+    if let Some(ack) = ack {
+        let _ = ack.send(());
+    }
 }
 
 /// Dispatch a single non-terminal progress JSON value out to the WS / ledger.
@@ -19606,6 +21049,9 @@ fn forward_progress_event(
         match notification {
             UiNotification::MessageDelta(_) => {
                 *saw_delta = true;
+                let _ = send_notification_ephemeral(ws, ledger, notification);
+            }
+            UiNotification::ReasoningDelta(_) => {
                 let _ = send_notification_ephemeral(ws, ledger, notification);
             }
             UiNotification::ApprovalRequested(request) => {
@@ -21390,6 +22836,7 @@ fn send_raw_notification_ephemeral(
     if matches!(
         method,
         ui_methods::MESSAGE_DELTA
+            | ui_methods::MESSAGE_REASONING_DELTA
             | ui_methods::MESSAGE_PERSISTED
             | ui_methods::TOOL_STARTED
             | ui_methods::TOOL_PROGRESS
@@ -21811,6 +23258,38 @@ fn send_notification_lifecycle(
     }
 }
 
+fn send_notification_lifecycle_forced_backpressure_fixture(
+    ws: &WsConnection,
+    ledger: &UiProtocolLedger,
+    notification: UiNotification,
+) -> Result<(), SendError> {
+    let event = ledger.append_notification_from(notification, ws.connection_id);
+    let method = ledger_event_method(&event.event).to_string();
+    let _frame = frame_from_ledger(event.event)
+        .ok_or_else(|| SendError::LifecycleFailure(format!("serialize {method}")))?;
+    metrics::counter!("ws.send.error.lifecycle").increment(1);
+    ws.metrics.dropped_count.fetch_add(1, Ordering::Relaxed);
+    tracing::warn!(
+        target: "octos::ui_protocol::ws",
+        method = %method,
+        reason = "forced_backpressure",
+        "forced turn/completed writer channel full fixture; aborting connection"
+    );
+    eprintln!("forced turn/completed writer channel full fixture; aborting connection: {method}");
+    ws.mark_failed();
+    let reason = "writer channel full for lifecycle frame turn/completed";
+    tracing::warn!(
+        target: "octos::ui_protocol::ws",
+        method = %method,
+        reason = %reason,
+        "lifecycle notification not delivered; entry remains in ledger as delivery_failed"
+    );
+    eprintln!(
+        "lifecycle notification not delivered; entry remains in ledger as delivery_failed: {reason}"
+    );
+    Err(SendError::LifecycleFailure(reason.into()))
+}
+
 fn send_notification_durable(
     ws: &WsConnection,
     ledger: &UiProtocolLedger,
@@ -21982,6 +23461,11 @@ fn ledger_event_cursor(event: &UiProtocolLedgerEvent) -> Option<UiCursor> {
             // future addition forces an explicit decision here.
             UiNotification::TurnStarted(_)
             | UiNotification::MessageDelta(_)
+            | UiNotification::ReasoningDelta(_)
+            | UiNotification::VisualGenerating(_)
+            | UiNotification::VisualSucceeded(_)
+            | UiNotification::VisualFailed(_)
+            | UiNotification::VoiceExit(_)
             | UiNotification::ToolStarted(_)
             | UiNotification::ToolProgress(_)
             | UiNotification::ToolCompleted(_)
@@ -22025,6 +23509,7 @@ fn ledger_event_cursor(event: &UiProtocolLedgerEvent) -> Option<UiCursor> {
             // hashes, not replay cursors. The durable ledger cursor is on
             // the surrounding LedgeredUiProtocolEvent.
             | UiNotification::ContextCompactionCompleted(_)
+            | UiNotification::ContextCompactionStarted(_)
             | UiNotification::ContextNormalizationReported(_)
             // Whole-job orchestration status is a stateless lifecycle push
             // (no durable cursor of its own).
@@ -22111,8 +23596,113 @@ mod tests {
         ApprovalDecision, ApprovalId, ApprovalRespondParams, ApprovalRespondStatus, DiffPreview,
         DiffPreviewFile, DiffPreviewFileStatus, DiffPreviewGetParams, DiffPreviewGetStatus,
         DiffPreviewHunk, DiffPreviewLine, DiffPreviewLineKind, DiffPreviewSource, PreviewId,
-        QuestionId, approval_scopes, methods, rpc_error_codes,
+        QuestionId, ReasoningDeltaEvent, SessionSandboxParams, approval_scopes, methods,
+        rpc_error_codes,
     };
+
+    #[tokio::test]
+    async fn compaction_started_precedes_completed_in_lifecycle_batch() {
+        // UPCR-2026-026: when the threshold trips, the lifecycle batch must
+        // carry context/compaction_started BEFORE context/compaction_completed
+        // and the started event reports the pre-compaction estimate.
+        struct TinyContextProvider;
+        #[async_trait::async_trait]
+        impl octos_llm::LlmProvider for TinyContextProvider {
+            async fn chat(
+                &self,
+                _messages: &[octos_core::Message],
+                _tools: &[octos_llm::ToolSpec],
+                _config: &octos_llm::ChatConfig,
+            ) -> eyre::Result<octos_llm::ChatResponse> {
+                unreachable!("compaction never calls the provider")
+            }
+            fn model_id(&self) -> &str {
+                "tiny"
+            }
+            fn provider_name(&self) -> &str {
+                "tiny"
+            }
+            fn context_window(&self) -> u32 {
+                512
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let session: SessionKey = SessionKey("full:api:compact".to_string());
+        let mut history = Vec::new();
+        for i in 0..40 {
+            history.push(octos_core::Message {
+                role: octos_core::MessageRole::User,
+                content: format!("padding message {i}: {}", "x".repeat(400)),
+                media: vec![],
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning_content: None,
+                client_message_id: None,
+                thread_id: None,
+                timestamp: chrono::Utc::now(),
+            });
+        }
+
+        let provider = TinyContextProvider;
+        let (_messages, _manager, notifications) =
+            appui_context_history_for_agent(dir.path(), &session, &history, &provider, "preflight");
+
+        let started_pos = notifications
+            .iter()
+            .position(|n| matches!(n, UiNotification::ContextCompactionStarted(_)));
+        let completed_pos = notifications
+            .iter()
+            .position(|n| matches!(n, UiNotification::ContextCompactionCompleted(_)));
+        let (Some(started_pos), Some(completed_pos)) = (started_pos, completed_pos) else {
+            panic!("both compaction events must be emitted: {notifications:?}");
+        };
+        assert!(
+            started_pos < completed_pos,
+            "started must precede completed"
+        );
+        let UiNotification::ContextCompactionStarted(started) = &notifications[started_pos] else {
+            unreachable!()
+        };
+        assert!(started.context_state.token_estimate > started.threshold_tokens);
+        assert_eq!(started.trigger, "preflight");
+    }
+
+    #[test]
+    fn post_terminal_drain_skips_late_tokens_but_keeps_background_progress() {
+        // Regression for the "queued N messages after active turn" wedge: the
+        // post-terminal spawn_only drain must drop late assistant `token`
+        // deltas (they carry the already-completed foreground turn id and
+        // resurrect the client's input gate) alongside the already-emitted
+        // `done`/`error` terminal signals...
+        assert!(drain_should_skip_event(Some("done")));
+        assert!(drain_should_skip_event(Some("error")));
+        assert!(drain_should_skip_event(Some("token")));
+        assert!(drain_should_skip_event(Some("reasoning_chunk")));
+
+        // ...while still forwarding the background task's real progress, which
+        // is the entire point of the drain (#961). None of these produce a
+        // `MessageDelta`, so none can wedge the turn gate.
+        for keep in [
+            "task_started",
+            "task_updated",
+            "task_completed",
+            "task_interrupted",
+            "tool_start",
+            "tool_progress",
+            "tool_end",
+            "file_modified",
+            "file_written",
+            "cost_update",
+        ] {
+            assert!(
+                !drain_should_skip_event(Some(keep)),
+                "drain must forward background event `{keep}`"
+            );
+        }
+        // A typeless event is forwarded (the mapper warns on it downstream).
+        assert!(!drain_should_skip_event(None));
+    }
 
     fn local_profile_state(dir: &Path) -> AppState {
         AppState {
@@ -22297,6 +23887,7 @@ mod tests {
                 "node_id": "design",
             }),
             methods::SESSION_HYDRATE => json!({ "session_id": session_id }),
+            methods::SESSION_ROLLBACK => json!({ "session_id": session_id, "num_turns": 1 }),
             methods::THREAD_GRAPH_GET => json!({ "session_id": session_id }),
             methods::TURN_STATE_GET => json!({
                 "session_id": session_id,
@@ -22575,6 +24166,100 @@ mod tests {
         reset_stdio_dispatch_count_for_test();
     }
 
+    /// Shutdown must WAIT for this connection's in-flight turns to finalize
+    /// instead of letting process exit cancel their tasks mid-write.
+    #[tokio::test(start_paused = true)]
+    async fn stdio_shutdown_drain_waits_for_turn_finalization() {
+        let active_turns: SharedActiveTurns =
+            Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+        let connection_turns: SharedConnectionTurns =
+            Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+        let session = SessionKey("local:drain-wait".into());
+        let turn_id = TurnId::new();
+        let abort = tokio::spawn(async {}).abort_handle();
+        active_turns.lock().await.insert(
+            session.clone(),
+            ActiveTurn {
+                turn_id: turn_id.clone(),
+                state: Arc::new(TokioMutex::new(TurnState::Active)),
+                interrupt_tx: Arc::new(TokioMutex::new(None)),
+                abort,
+            },
+        );
+        connection_turns
+            .lock()
+            .await
+            .insert(session.clone(), turn_id);
+        let remover = active_turns.clone();
+        let session_for_removal = session.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            remover.lock().await.remove(&session_for_removal);
+        });
+
+        let drained = drain_connection_turns_for_shutdown(
+            &active_turns,
+            &connection_turns,
+            std::time::Duration::from_secs(5),
+        )
+        .await;
+
+        assert!(drained, "drain must return once the turn finalizes");
+    }
+
+    /// A turn that never finalizes must not hang shutdown forever, and turns
+    /// owned by OTHER connections (the registry is process-global) must not
+    /// block this exit at all.
+    #[tokio::test(start_paused = true)]
+    async fn stdio_shutdown_drain_gives_up_at_deadline_and_ignores_foreign_turns() {
+        let active_turns: SharedActiveTurns =
+            Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+        let connection_turns: SharedConnectionTurns =
+            Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+        let foreign_abort = tokio::spawn(async {}).abort_handle();
+        active_turns.lock().await.insert(
+            SessionKey("local:foreign".into()),
+            ActiveTurn {
+                turn_id: TurnId::new(),
+                state: Arc::new(TokioMutex::new(TurnState::Active)),
+                interrupt_tx: Arc::new(TokioMutex::new(None)),
+                abort: foreign_abort,
+            },
+        );
+        assert!(
+            drain_connection_turns_for_shutdown(
+                &active_turns,
+                &connection_turns,
+                std::time::Duration::from_secs(5),
+            )
+            .await,
+            "turns owned by other connections must not block shutdown"
+        );
+
+        let session = SessionKey("local:drain-stuck".into());
+        let turn_id = TurnId::new();
+        let abort = tokio::spawn(async {}).abort_handle();
+        active_turns.lock().await.insert(
+            session.clone(),
+            ActiveTurn {
+                turn_id: turn_id.clone(),
+                state: Arc::new(TokioMutex::new(TurnState::Active)),
+                interrupt_tx: Arc::new(TokioMutex::new(None)),
+                abort,
+            },
+        );
+        connection_turns.lock().await.insert(session, turn_id);
+
+        let drained = drain_connection_turns_for_shutdown(
+            &active_turns,
+            &connection_turns,
+            std::time::Duration::from_millis(200),
+        )
+        .await;
+
+        assert!(!drained, "drain must give up at the deadline");
+    }
+
     #[tokio::test]
     async fn stdio_ndjson_reader_accepts_max_size_frame_with_newline() {
         let mut input = vec![b'x'; MAX_TEXT_FRAME_BYTES];
@@ -22701,6 +24386,7 @@ mod tests {
             topic: None,
             profile_id: None,
             cwd: None,
+            sandbox: None,
             after: None,
         };
         assert_eq!(
@@ -22713,6 +24399,7 @@ mod tests {
             topic: None,
             profile_id: Some("explicit".into()),
             cwd: None,
+            sandbox: None,
             after: None,
         };
         assert_eq!(
@@ -22725,6 +24412,7 @@ mod tests {
             topic: None,
             profile_id: None,
             cwd: None,
+            sandbox: None,
             after: None,
         };
         assert_eq!(
@@ -22984,6 +24672,19 @@ mod tests {
         assert_eq!(
             blank_capture, None,
             "empty captured content must not stamp a default-delay reschedule via history fallback"
+        );
+
+        // A fire with NO capture and NO history reply (interrupt / agent
+        // error before anything persisted) must still reschedule: the
+        // picker yields an empty reply, which carries no sentinel, so the
+        // orchestrator stamps the DEFAULT delay. The old `None` here parked
+        // the loop at `next_run_at_ms: None` — permanently dead after one
+        // interrupted turn.
+        let reply_less = appui_loop_assistant_reply_for_self_paced(None, None);
+        assert_eq!(
+            reply_less.as_deref(),
+            Some(""),
+            "a reply-less fire must reschedule with the default delay, not kill the loop"
         );
     }
 
@@ -23437,7 +25138,15 @@ ignore = []
             PermissionProfileSetParams, PermissionProfileUpdate,
         };
 
-        let local = AppState::empty_for_tests();
+        // yolo GAP #1: Local + the explicit `--solo` opt-in is what permits
+        // danger; bare Local no longer does (see
+        // `danger_full_access_requires_solo_opt_in_on_local_server`). This
+        // test exercises the deployment-mode / runtime_mode-override gates on
+        // top of that opt-in, so enable it here.
+        let local = AppState {
+            solo_login_enabled: true,
+            ..AppState::empty_for_tests()
+        };
         let session_id = SessionKey("local:permission-profile-test".into());
         let listed = permission_profile_list_result(
             &local,
@@ -23538,6 +25247,147 @@ ignore = []
         );
     }
 
+    /// SECURITY KEYSTONE (yolo GAP #1): a Local-mode server WITHOUT the
+    /// `--solo` opt-in (`solo_login_enabled == false`) must reject
+    /// `danger_full_access` — a Caddy-fronted fleet daemon runs Local mode,
+    /// so bare `deployment_mode == Local` is NOT a safe proxy for a
+    /// single-user box. Mirrors `solo_create_403_when_opt_in_disabled` and
+    /// the agent-crate `dangerous_profile_requires_solo_runtime`. Once the
+    /// operator opts in, the same request succeeds.
+    #[test]
+    fn danger_full_access_requires_solo_opt_in_on_local_server() {
+        use octos_core::ui_protocol::{
+            PermissionNetworkPolicy as Network, PermissionProfileMode as Mode,
+            PermissionProfileSetParams, PermissionProfileUpdate,
+        };
+
+        // Local mode, NO --solo opt-in (empty_for_tests: solo_login_enabled=false).
+        let local_no_solo = AppState::empty_for_tests();
+        assert_eq!(
+            local_no_solo.deployment_mode,
+            crate::config::DeploymentMode::Local
+        );
+        assert!(!local_no_solo.solo_login_enabled);
+        let session_id = SessionKey("local:yolo-solo-gate".into());
+
+        let denied = permission_profile_set_result(
+            &local_no_solo,
+            PermissionProfileSetParams {
+                session_id: session_id.clone(),
+                update: PermissionProfileUpdate {
+                    mode: Some(Mode::DangerFullAccess),
+                    network: Some(Network::Allow),
+                    approval_policy: Some("never".into()),
+                },
+                runtime_mode: None,
+            },
+        )
+        .expect_err("danger must be refused on a Local server without the --solo opt-in");
+        assert_eq!(denied.code, rpc_error_codes::PERMISSION_DENIED);
+        assert_eq!(
+            denied.data.as_ref().and_then(|data| data.get("kind")),
+            Some(&json!("permission_profile_disallowed"))
+        );
+
+        // The list must not advertise a dead option either.
+        let listed = permission_profile_list_result(
+            &local_no_solo,
+            octos_core::ui_protocol::PermissionProfileListParams {
+                session_id: session_id.clone(),
+            },
+        );
+        assert!(
+            !listed
+                .profiles
+                .iter()
+                .any(|profile| profile.mode == Mode::DangerFullAccess),
+            "a Local server without --solo must NOT advertise danger_full_access",
+        );
+
+        // Same server WITH the opt-in enabled: danger is allowed.
+        let local_solo = AppState {
+            solo_login_enabled: true,
+            ..AppState::empty_for_tests()
+        };
+        let allowed = permission_profile_set_result(
+            &local_solo,
+            PermissionProfileSetParams {
+                session_id: session_id.clone(),
+                update: PermissionProfileUpdate {
+                    mode: Some(Mode::DangerFullAccess),
+                    network: Some(Network::Allow),
+                    approval_policy: Some("never".into()),
+                },
+                runtime_mode: None,
+            },
+        )
+        .expect("Local + --solo opt-in should allow danger_full_access");
+        assert_eq!(allowed.session_id, session_id);
+
+        let listed_solo = permission_profile_list_result(
+            &local_solo,
+            octos_core::ui_protocol::PermissionProfileListParams {
+                session_id: session_id.clone(),
+            },
+        );
+        assert!(
+            listed_solo
+                .profiles
+                .iter()
+                .any(|profile| profile.mode == Mode::DangerFullAccess),
+            "a Local server WITH --solo must advertise danger_full_access",
+        );
+    }
+
+    /// GAP #1 follow-through: `effective_permissions_for_session` must map
+    /// Local → Solo ONLY when the `--solo` opt-in is set. Without it, a
+    /// stored `danger_full_access` selection resolves through
+    /// `RuntimeMode::Local`, which `EffectivePermissions::for_runtime`
+    /// rejects — so a fleet daemon cannot bootstrap a dangerous session
+    /// runtime even if a selection was somehow persisted.
+    #[test]
+    fn effective_permissions_rejects_danger_without_solo_opt_in() {
+        use octos_core::ui_protocol::{
+            PermissionNetworkPolicy as Network, PermissionProfileMode as Mode,
+            PermissionProfileSelection,
+        };
+
+        let session_id = SessionKey("local:yolo-effective-gate".into());
+        // Persist a dangerous selection directly in the store (bypassing the
+        // set gate) to prove the resolution path is independently guarded.
+        session_permission_profiles().set(
+            session_id.clone(),
+            PermissionProfileSelection {
+                mode: Mode::DangerFullAccess,
+                network: Network::Allow,
+            },
+            Some(octos_agent::ApprovalPolicy::Never),
+        );
+
+        let local_no_solo = AppState::empty_for_tests();
+        let err = effective_permissions_for_session(&local_no_solo, &session_id)
+            .expect_err("no --solo opt-in ⇒ Local resolves as RuntimeMode::Local, danger rejected");
+        assert_eq!(err.code, rpc_error_codes::PERMISSION_DENIED);
+        assert_eq!(
+            err.data.as_ref().and_then(|data| data.get("kind")),
+            Some(&json!("permission_profile_disallowed"))
+        );
+
+        let local_solo = AppState {
+            solo_login_enabled: true,
+            ..AppState::empty_for_tests()
+        };
+        let permissions = effective_permissions_for_session(&local_solo, &session_id)
+            .expect("Local + --solo resolves danger_full_access");
+        assert!(permissions.is_dangerous());
+        assert_eq!(
+            permissions.approval_policy,
+            octos_agent::ApprovalPolicy::Never
+        );
+        // The session key is unique to this test, so the process-global store
+        // holds no cross-test state — no explicit cleanup needed.
+    }
+
     /// Codex P1 follow-up to #1086: when a Local server receives an
     /// explicit `runtime_mode: "local"` override, that value must NOT be
     /// treated as solo-relaxed. `local` is the multi-profile-but-local
@@ -23550,7 +25400,13 @@ ignore = []
             PermissionProfileSetParams, PermissionProfileUpdate,
         };
 
-        let local = AppState::empty_for_tests();
+        // yolo GAP #1: enable the `--solo` opt-in so this test isolates the
+        // runtime_mode-override tighten-only behaviour (the opt-in gate itself
+        // is covered by `danger_full_access_requires_solo_opt_in_on_local_server`).
+        let local = AppState {
+            solo_login_enabled: true,
+            ..AppState::empty_for_tests()
+        };
         let session_id = SessionKey("local:permission-profile-local-override".into());
 
         let local_override_denied = permission_profile_set_result(
@@ -23644,7 +25500,13 @@ ignore = []
             PermissionProfileSetParams, PermissionProfileUpdate,
         };
 
-        let local = AppState::empty_for_tests();
+        // yolo GAP #1: enable the `--solo` opt-in so the "solo override still
+        // relaxes" sanity assertions below reach the relaxed path; the stray
+        // overrides must still fail closed regardless.
+        let local = AppState {
+            solo_login_enabled: true,
+            ..AppState::empty_for_tests()
+        };
         let session_id = SessionKey("local:unrecognized-runtime-mode".into());
 
         for stray_override in [
@@ -23731,7 +25593,14 @@ ignore = []
             PermissionProfileSetParams, PermissionProfileUpdate,
         };
 
-        let local = AppState::empty_for_tests();
+        // yolo GAP #1: enable the `--solo` opt-in so a denial here is
+        // attributable to the tenant/cloud SCOPE marker rather than to the
+        // missing opt-in (which would deny every case trivially and hide the
+        // scope-gate regression this test guards).
+        let local = AppState {
+            solo_login_enabled: true,
+            ..AppState::empty_for_tests()
+        };
 
         for (label, session_id) in [
             // profile_id-slot markers (`with_profile` shape).
@@ -23834,7 +25703,12 @@ ignore = []
     fn danger_full_access_omitted_from_list_for_tenant_scoped_session_per_1162() {
         use octos_core::ui_protocol::{PermissionProfileListParams, PermissionProfileMode as Mode};
 
-        let local = AppState::empty_for_tests();
+        // yolo GAP #1: the "solo-scoped session keeps danger in the list"
+        // assertion requires the `--solo` opt-in to be on.
+        let local = AppState {
+            solo_login_enabled: true,
+            ..AppState::empty_for_tests()
+        };
 
         let tenant_session = SessionKey::with_profile("tenant-a", "api", "m12-negative");
         let tenant_listing = permission_profile_list_result(
@@ -23886,7 +25760,13 @@ ignore = []
             PermissionProfileSetParams, PermissionProfileUpdate,
         };
 
-        let local = AppState::empty_for_tests();
+        // yolo GAP #1: these cases assert danger is STILL allowed (chat-id
+        // text is not a structural scope signal), so the `--solo` opt-in must
+        // be on for the relaxed path to be reachable.
+        let local = AppState {
+            solo_login_enabled: true,
+            ..AppState::empty_for_tests()
+        };
 
         for raw_session_id in [
             // chat-id contains `cloud-migration` / `tenant-demo` — must NOT
@@ -23964,7 +25844,13 @@ ignore = []
             PermissionProfileSetParams, PermissionProfileUpdate,
         };
 
-        let local = AppState::empty_for_tests();
+        // yolo GAP #1: the "solo-scoped session keeps allowing danger" branch
+        // requires the `--solo` opt-in; the tenant-override rejection holds
+        // regardless.
+        let local = AppState {
+            solo_login_enabled: true,
+            ..AppState::empty_for_tests()
+        };
 
         // Solo-scoped session_id on Local + no override → existing relaxed
         // path keeps allowing danger_full_access. The new gate must not
@@ -24379,6 +26265,7 @@ ignore = []
             topic: None,
             profile_id: Some("missing".into()),
             cwd: None,
+            sandbox: None,
             after: None,
         };
         let candidate = stdio_session_open_candidate_profile(&missing_params, binding.as_deref());
@@ -24432,6 +26319,7 @@ ignore = []
             topic: None,
             profile_id: Some("grace".into()),
             cwd: None,
+            sandbox: None,
             after: None,
         };
         let candidate = stdio_session_open_candidate_profile(&grace_params, binding.as_deref());
@@ -24600,6 +26488,7 @@ ignore = []
                     topic: None,
                     profile_id: None,
                     cwd: None,
+                    sandbox: None,
                     after: None,
                 },
             )
@@ -25076,6 +26965,7 @@ ignore = []
             topic: None,
             profile_id: Some("ada".into()),
             cwd: Some(workspace.path().to_string_lossy().into_owned()),
+            sandbox: None,
             after: None,
         };
 
@@ -26430,6 +28320,7 @@ ignore = []
                 typed_approvals: true,
                 pane_snapshots: false,
                 session_workspace_cwd: false,
+                session_sandbox: false,
                 harness_task_control: false,
                 harness_task_artifacts: false,
                 session_hydrate: false,
@@ -26492,6 +28383,7 @@ ignore = []
                 typed_approvals: true,
                 pane_snapshots: false,
                 session_workspace_cwd: false,
+                session_sandbox: false,
                 harness_task_control: false,
                 harness_task_artifacts: false,
                 session_hydrate: false,
@@ -26599,6 +28491,7 @@ ignore = []
                 typed_approvals: true,
                 pane_snapshots: false,
                 session_workspace_cwd: false,
+                session_sandbox: false,
                 harness_task_control: false,
                 harness_task_artifacts: false,
                 session_hydrate: false,
@@ -26661,6 +28554,7 @@ ignore = []
                 typed_approvals: true,
                 pane_snapshots: false,
                 session_workspace_cwd: false,
+                session_sandbox: false,
                 harness_task_control: false,
                 harness_task_artifacts: false,
                 session_hydrate: false,
@@ -26716,6 +28610,7 @@ ignore = []
                 typed_approvals: true,
                 pane_snapshots: false,
                 session_workspace_cwd: false,
+                session_sandbox: false,
                 harness_task_control: false,
                 harness_task_artifacts: false,
                 session_hydrate: false,
@@ -26814,6 +28709,7 @@ ignore = []
                 typed_approvals: true,
                 pane_snapshots: false,
                 session_workspace_cwd: false,
+                session_sandbox: false,
                 harness_task_control: false,
                 harness_task_artifacts: false,
                 session_hydrate: false,
@@ -28129,6 +30025,87 @@ ignore = []
         assert!(rx.try_recv().is_err(), "no close frame expected");
     }
 
+    #[test]
+    fn resolve_router_for_session_rejects_cross_tenant_session_id() {
+        // P1: a profile-scoped (tenant-B) connection must not resolve — and so
+        // must not be able to `set_mode` / read metrics on — a router for a
+        // `session_id` that embeds tenant-A's profile. The tenant gate fires
+        // BEFORE any ProfileRuntime lookup, so an empty test state suffices to
+        // prove the rejection. Without the gate this returned `Ok(None)` (and
+        // the handler would go on to resolve tenant-A's runtime).
+        let state = Arc::new(AppState::empty_for_tests());
+        let session_a = SessionKey::with_profile("tenant-a", "api", "chat-1");
+        // `AdaptiveRouter` is not `Debug`, so `.expect_err` on the `Ok` type
+        // does not compile — match instead.
+        let error = match resolve_router_for_session(&state, &session_a, Some("tenant-b"), None) {
+            Err(error) => error,
+            Ok(_) => panic!("cross-tenant router access must be rejected"),
+        };
+        assert!(is_auth_scope_violation(&error));
+    }
+
+    #[test]
+    fn resolve_router_for_session_allows_same_tenant() {
+        // Same-tenant scope passes the gate; with no ProfileRuntime registered
+        // in the empty test state the router resolves to `None` (`Ok(None)`) —
+        // NOT an error. Proves the gate is scope-only, not a blanket denial.
+        let state = Arc::new(AppState::empty_for_tests());
+        let session_a = SessionKey::with_profile("tenant-a", "api", "chat-1");
+        let resolved = resolve_router_for_session(&state, &session_a, Some("tenant-a"), None)
+            .expect("same-tenant scope must pass the gate");
+        assert!(resolved.is_none());
+    }
+
+    #[test]
+    fn resolve_router_for_session_admin_connection_is_unscoped() {
+        // An unscoped (admin, `connection_profile_id == None`) connection is
+        // authorized for every profile — it passes the gate for any
+        // `session_id`, matching every other mutating RPC handler.
+        let state = Arc::new(AppState::empty_for_tests());
+        let session_a = SessionKey::with_profile("tenant-a", "api", "chat-1");
+        let resolved = resolve_router_for_session(&state, &session_a, None, None)
+            .expect("admin connection must pass the gate");
+        assert!(resolved.is_none());
+    }
+
+    #[test]
+    fn resolve_router_for_session_allows_authorized_routed_profile() {
+        // Codex P2: an OTP-admin / parent connection authorized for a tenant
+        // subdomain carries `connection_profile_id == <its own user id>` and
+        // `routed_profile_id == <tenant>` (is_authorized_for_profile cleared it
+        // at upgrade). The gate must NOT reject a session_id embedding the
+        // routed tenant — that access is authorized and predates the gate.
+        let state = Arc::new(AppState::empty_for_tests());
+        let tenant_session = SessionKey::with_profile("tenant-b", "api", "chat-1");
+        let resolved = resolve_router_for_session(
+            &state,
+            &tenant_session,
+            Some("admin-user"), // connection == the admin's own user id
+            Some("tenant-b"),   // routed == the authorized tenant subdomain
+        )
+        .expect("authorized routed profile must pass the gate");
+        assert!(resolved.is_none());
+    }
+
+    #[test]
+    fn resolve_router_for_session_rejects_tenant_outside_routed_and_connection() {
+        // Even WITH a routed profile present, a session_id embedding a third
+        // tenant (neither the connection's own id nor the authorized routed
+        // tenant) is still rejected — the union does not become allow-any.
+        let state = Arc::new(AppState::empty_for_tests());
+        let other = SessionKey::with_profile("tenant-c", "api", "chat-1");
+        let error = match resolve_router_for_session(
+            &state,
+            &other,
+            Some("admin-user"),
+            Some("tenant-b"),
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("a third-tenant session_id must be rejected"),
+        };
+        assert!(is_auth_scope_violation(&error));
+    }
+
     /// Codex BLOCK regression (2026-05-13): with the writer channel at
     /// capacity 2 and one slot already used, `send_scope_error` must use
     /// the remaining slot for the 1008 close — NOT the courtesy error
@@ -28269,6 +30246,7 @@ ignore = []
                 topic: None,
                 profile_id: None,
                 cwd: None,
+                sandbox: None,
                 after: Some(first.cursor),
             },
         )
@@ -28331,6 +30309,7 @@ ignore = []
                 topic: Some("alpha".into()),
                 profile_id: None,
                 cwd: None,
+                sandbox: None,
                 after: Some(UiCursor {
                     stream: alpha_session.0.clone(),
                     seq: 0,
@@ -28361,6 +30340,7 @@ ignore = []
                 topic: None,
                 profile_id: None,
                 cwd: None,
+                sandbox: None,
                 after: Some(UiCursor {
                     stream: base_session.0.clone(),
                     seq: 0,
@@ -28400,6 +30380,7 @@ ignore = []
                 topic: None,
                 profile_id: None,
                 cwd: None,
+                sandbox: None,
                 after: Some(UiCursor {
                     stream: "local:other".into(),
                     seq: 0,
@@ -28460,6 +30441,7 @@ ignore = []
                 topic: None,
                 profile_id: None,
                 cwd: None,
+                sandbox: None,
                 after: Some(UiCursor {
                     stream: session_id.0.clone(),
                     seq: 0,
@@ -28516,6 +30498,7 @@ ignore = []
                 topic: None,
                 profile_id: None,
                 cwd: None,
+                sandbox: None,
                 after: None,
             },
         )
@@ -28598,6 +30581,7 @@ ignore = []
                 topic: None,
                 profile_id: None,
                 cwd: None,
+                sandbox: None,
                 after: None,
             },
         )
@@ -28671,6 +30655,7 @@ ignore = []
                 topic: None,
                 profile_id: None,
                 cwd: None,
+                sandbox: None,
                 after: Some(UiCursor {
                     stream: session_id.0.clone(),
                     seq: 1,
@@ -28908,6 +30893,7 @@ ignore = []
                 topic: None,
                 profile_id: None,
                 cwd: None,
+                sandbox: None,
                 after: Some(UiCursor {
                     stream: session_id.0.clone(),
                     seq: 1,
@@ -28952,6 +30938,7 @@ ignore = []
                 typed_approvals: false,
                 pane_snapshots: true,
                 session_workspace_cwd: false,
+                session_sandbox: false,
                 harness_task_control: false,
                 harness_task_artifacts: false,
                 session_hydrate: false,
@@ -28977,6 +30964,7 @@ ignore = []
                 topic: None,
                 profile_id: None,
                 cwd: None,
+                sandbox: None,
                 after: None,
             },
         )
@@ -29028,6 +31016,7 @@ ignore = []
                 topic: None,
                 profile_id: None,
                 cwd: Some(temp.path().to_string_lossy().to_string()),
+                sandbox: None,
                 after: None,
             },
         )
@@ -29066,6 +31055,7 @@ ignore = []
                 topic: None,
                 profile_id: None,
                 cwd: None,
+                sandbox: None,
                 after: None,
             },
         )
@@ -29138,6 +31128,7 @@ ignore = []
                 topic: None,
                 profile_id: None,
                 cwd: None,
+                sandbox: None,
                 after: None,
             },
         )
@@ -30755,6 +32746,41 @@ ignore = []
         }
     }
 
+    #[test]
+    fn session_ingress_scope_accepts_matching_topic_folded_turn() {
+        let allowed = SessionKey("dspfac:local:tui#coding".into());
+        let command = UiCommand::TurnStart(TurnStartParams {
+            session_id: SessionKey("dspfac:local:tui".into()),
+            turn_id: TurnId::new(),
+            input: vec![InputItem::Text {
+                text: "hello".into(),
+            }],
+            media: Vec::new(),
+            topic: Some("coding".into()),
+            live_video: false,
+            reasoning_effort: None,
+            rewrite_for: None,
+        });
+        validate_session_ingress_command_scope(&command, &allowed).expect("scope matches");
+    }
+
+    #[test]
+    fn session_ingress_scope_rejects_global_methods_and_mismatched_sessions() {
+        let allowed = SessionKey("dspfac:local:tui".into());
+        let global = UiCommand::SystemStatusGet(SystemStatusGetParams {});
+        assert!(validate_session_ingress_command_scope(&global, &allowed).is_err());
+
+        let mismatched = UiCommand::SessionOpen(SessionOpenParams {
+            session_id: SessionKey("other:local:tui".into()),
+            topic: None,
+            profile_id: None,
+            cwd: None,
+            sandbox: None,
+            after: None,
+        });
+        assert!(validate_session_ingress_command_scope(&mismatched, &allowed).is_err());
+    }
+
     /// Codex review 2026-05-12 (BLOCK 1, companion): the legacy
     /// header-present gates (`session/hydrate`, `thread/graph/get`,
     /// `turn/state/get`, `task/list`, `task/cancel`,
@@ -31604,6 +33630,7 @@ ignore = []
                 topic: None,
                 profile_id: None,
                 cwd: None,
+                sandbox: None,
                 after: None,
             },
         )
@@ -31629,6 +33656,7 @@ ignore = []
                 topic: None,
                 profile_id: None,
                 cwd: None,
+                sandbox: None,
                 after: Some(UiCursor {
                     stream: session_id.0.clone(),
                     seq: 0,
@@ -32660,6 +34688,53 @@ ignore = []
     }
 
     #[tokio::test]
+    async fn forced_backpressure_fixture_ledgers_terminal_and_latches_failed() {
+        let (ws, mut rx) = ws_connection_for_test(8);
+        let ledger = UiProtocolLedger::new(16);
+        let session_id = SessionKey("local:test".into());
+        let turn_id = TurnId::new();
+
+        let result = send_notification_lifecycle_forced_backpressure_fixture(
+            &ws,
+            &ledger,
+            UiNotification::TurnCompleted(TurnCompletedEvent {
+                session_id: session_id.clone(),
+                topic: None,
+                turn_id: turn_id.clone(),
+                cursor: None,
+                tokens_in: None,
+                tokens_out: None,
+                session_result: None,
+            }),
+        );
+
+        assert!(matches!(result, Err(SendError::LifecycleFailure(_))));
+        assert!(
+            ws.is_failed(),
+            "forced lifecycle backpressure must close the socket"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "forced lifecycle backpressure should not live-send the terminal frame"
+        );
+
+        let replay = ledger
+            .replay_after(
+                &session_id,
+                Some(&UiCursor {
+                    stream: session_id.0.clone(),
+                    seq: 0,
+                }),
+            )
+            .expect("replay after start cursor");
+        assert!(replay.iter().any(|entry| matches!(
+            &entry.event,
+            UiProtocolLedgerEvent::Notification(UiNotification::TurnCompleted(event))
+                if event.turn_id == turn_id
+        )));
+    }
+
+    #[tokio::test]
     async fn send_error_logged_for_durable_notifications() {
         let (ws, _rx) = ws_connection_for_test(1);
         let ledger = UiProtocolLedger::new(16);
@@ -33545,6 +35620,7 @@ ignore = []
                 topic: None,
                 profile_id: None,
                 cwd: None,
+                sandbox: None,
                 after: Some(warmup.cursor.clone()),
             },
         )
@@ -34236,6 +36312,395 @@ ignore = []
             thread_id: Some("cmid-user-1".into()),
             timestamp: now + chrono::Duration::milliseconds(10),
         });
+    }
+
+    /// Open a disk-backed `SessionManager` and persist `turns` user turns
+    /// (user + assistant each, thread-grouped) so `session/rollback` has a real
+    /// JSONL to append its marker to and reload from. Returns the state plus the
+    /// live `TempDir` — the caller must keep it alive for the test's duration.
+    async fn prg_state_with_persisted_turns(
+        session_id: &SessionKey,
+        turns: usize,
+    ) -> (Arc<AppState>, tempfile::TempDir) {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let manager = octos_bus::SessionManager::open(tmp.path()).expect("session manager open");
+        let manager = Arc::new(tokio::sync::Mutex::new(manager));
+        {
+            let mut guard = manager.lock().await;
+            for n in 1..=turns {
+                let tid = format!("t{n}");
+                let now = Utc::now() + chrono::Duration::milliseconds((n as i64) * 2);
+                let user = Message {
+                    role: MessageRole::User,
+                    content: format!("turn {n}"),
+                    media: vec![],
+                    tool_calls: None,
+                    tool_call_id: None,
+                    reasoning_content: None,
+                    client_message_id: Some(tid.clone()),
+                    thread_id: Some(tid.clone()),
+                    timestamp: now,
+                };
+                guard
+                    .add_message(session_id, user)
+                    .await
+                    .expect("persist user");
+                let asst = Message {
+                    role: MessageRole::Assistant,
+                    content: format!("reply {n}"),
+                    media: vec![],
+                    tool_calls: None,
+                    tool_call_id: None,
+                    reasoning_content: None,
+                    client_message_id: None,
+                    thread_id: Some(tid.clone()),
+                    timestamp: now + chrono::Duration::milliseconds(1),
+                };
+                guard
+                    .add_message(session_id, asst)
+                    .await
+                    .expect("persist assistant");
+            }
+        }
+        let state = Arc::new(AppState {
+            sessions: Some(manager),
+            ..AppState::empty_for_tests()
+        });
+        (state, tmp)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn session_rollback_drops_last_turn_and_returns_trimmed_thread() {
+        let session_id = SessionKey("local:rollback-1".into());
+        let (state, _tmp) = prg_state_with_persisted_turns(&session_id, 3).await;
+        let active_turns = active_turns_registry();
+        let ledger = event_ledger(&state).await;
+        let (ws, mut rx) = ws_connection_for_test(8);
+
+        handle_session_rollback(
+            &ws,
+            &state,
+            &ledger,
+            &active_turns,
+            None,
+            None,
+            "rb1".into(),
+            SessionRollbackParams {
+                session_id: session_id.clone(),
+                num_turns: 1,
+            },
+        )
+        .await;
+
+        let frame = recv_rpc_json(&mut rx).await;
+        assert_eq!(frame["id"], "rb1");
+        let result = &frame["result"];
+        assert_eq!(result["dropped_turns"], 1);
+        let thread = &result["thread"];
+        assert_eq!(thread["session_id"], session_id.to_string());
+        assert!(thread["cursor"].is_object());
+        let messages = thread["messages"].as_array().expect("messages array");
+        assert_eq!(
+            messages.len(),
+            4,
+            "turns 1 & 2 remain after dropping turn 3"
+        );
+        assert!(messages.iter().all(|m| m["content"] != "turn 3"));
+        assert!(messages.iter().all(|m| m["content"] != "reply 3"));
+        let threads = thread["threads"].as_array().expect("threads array");
+        assert_eq!(threads.len(), 2);
+        assert!(thread["turns"].is_array());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn session_rollback_survives_reload_from_disk() {
+        let session_id = SessionKey("local:rollback-reload".into());
+        let (state, _tmp) = prg_state_with_persisted_turns(&session_id, 3).await;
+        let active_turns = active_turns_registry();
+        let ledger = event_ledger(&state).await;
+        let (ws, mut rx) = ws_connection_for_test(8);
+
+        handle_session_rollback(
+            &ws,
+            &state,
+            &ledger,
+            &active_turns,
+            None,
+            None,
+            "rb2".into(),
+            SessionRollbackParams {
+                session_id: session_id.clone(),
+                num_turns: 1,
+            },
+        )
+        .await;
+        let _ = recv_rpc_json(&mut rx).await;
+
+        // Evict the cache and reload from disk: the append-only marker replays
+        // the trim (it was persisted, not truncated).
+        {
+            let sessions = state.sessions.as_ref().expect("sessions store");
+            let mut guard = sessions.lock().await;
+            guard.invalidate_cache(&session_id);
+            let session = guard.get_or_create(&session_id).await;
+            assert_eq!(
+                session.messages.len(),
+                4,
+                "rollback marker must survive a disk reload"
+            );
+            assert!(session.messages.iter().all(|m| m.content != "turn 3"));
+        }
+    }
+
+    /// A stale context ledger must not resurrect rolled-back turns. The
+    /// ledger coverage check is a high-watermark `>=` (deliberately
+    /// slice-tolerant, because turn paths pass bounded history slices), so
+    /// after a rollback shrinks durable history a pre-rollback ledger still
+    /// "covers" it, gets Loaded verbatim, and the next model prompt would
+    /// contain the very turns the user rewound away. `session/rollback` must
+    /// rebuild + persist the context ledger from the trimmed history.
+    #[tokio::test(flavor = "current_thread")]
+    async fn session_rollback_rebuilds_context_ledger() {
+        let session_id = SessionKey("local:rollback-ctx-ledger".into());
+        let (state, _tmp) = prg_state_with_persisted_turns(&session_id, 3).await;
+        // Persist a pre-rollback context ledger exactly like a prior turn's
+        // prompt path would have.
+        let data_dir = {
+            let sessions = state.sessions.as_ref().expect("sessions store");
+            let mut guard = sessions.lock().await;
+            let data_dir = guard.data_dir();
+            let history = guard.get_or_create(&session_id).await.messages.clone();
+            let manager = crate::context_manager::ContextManager::from_session_history(
+                session_id.to_string(),
+                None,
+                &history,
+            );
+            crate::context_manager::persist_context_manager_snapshot(
+                &data_dir,
+                &session_id.to_string(),
+                &manager,
+            )
+            .expect("persist pre-rollback ledger");
+            data_dir
+        };
+        let active_turns = active_turns_registry();
+        let ledger = event_ledger(&state).await;
+        let (ws, mut rx) = ws_connection_for_test(8);
+
+        handle_session_rollback(
+            &ws,
+            &state,
+            &ledger,
+            &active_turns,
+            None,
+            None,
+            "rb-ctx".into(),
+            SessionRollbackParams {
+                session_id: session_id.clone(),
+                num_turns: 1,
+            },
+        )
+        .await;
+        let _ = recv_rpc_json(&mut rx).await;
+
+        // The next turn loads the ledger against the TRIMMED history; the
+        // dropped turn must not be visible in the resulting prompt frame.
+        let trimmed = {
+            let sessions = state.sessions.as_ref().expect("sessions store");
+            let mut guard = sessions.lock().await;
+            guard.get_or_create(&session_id).await.messages.clone()
+        };
+        assert!(trimmed.iter().all(|m| m.content != "turn 3"));
+        let (loaded, _status) = crate::context_manager::load_or_rebuild_context_manager(
+            &data_dir,
+            session_id.to_string(),
+            None,
+            &trimmed,
+        );
+        let frame = loaded.for_prompt(&crate::context_manager::PromptBuildPolicy::default());
+        assert!(
+            !frame
+                .messages
+                .iter()
+                .any(|m| m.content.contains("turn 3") || m.content.contains("reply 3")),
+            "rolled-back turns must not resurrect through a stale context ledger: {:#?}",
+            frame.messages
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn session_rollback_rejects_when_turn_in_progress() {
+        let session_id = SessionKey("local:rollback-busy".into());
+        let (state, _tmp) = prg_state_with_persisted_turns(&session_id, 3).await;
+        let active_turns = active_turns_registry();
+        // Insert a synthetic in-flight turn, exactly as handle_turn_start would.
+        let (interrupt_tx, _interrupt_rx) = mpsc::channel::<()>(1);
+        let dummy_handle = tokio::spawn(async {});
+        {
+            let mut guard = active_turns.lock().await;
+            guard.insert(
+                session_id.clone(),
+                ActiveTurn {
+                    turn_id: TurnId::new(),
+                    state: Arc::new(TokioMutex::new(TurnState::Active)),
+                    interrupt_tx: Arc::new(TokioMutex::new(Some(interrupt_tx))),
+                    abort: dummy_handle.abort_handle(),
+                },
+            );
+        }
+        let ledger = event_ledger(&state).await;
+        let (ws, mut rx) = ws_connection_for_test(8);
+
+        handle_session_rollback(
+            &ws,
+            &state,
+            &ledger,
+            &active_turns,
+            None,
+            None,
+            "rb3".into(),
+            SessionRollbackParams {
+                session_id: session_id.clone(),
+                num_turns: 1,
+            },
+        )
+        .await;
+
+        let frame = recv_rpc_json(&mut rx).await;
+        assert!(
+            frame.get("error").is_some(),
+            "rollback under an active turn must error: {frame}"
+        );
+        assert_eq!(frame["error"]["data"]["kind"], "turn_in_progress");
+        // The transcript must be untouched (6 messages = 3 turns).
+        {
+            let sessions = state.sessions.as_ref().expect("sessions store");
+            let mut guard = sessions.lock().await;
+            let session = guard.get_or_create(&session_id).await;
+            assert_eq!(session.messages.len(), 6, "no trim under an active turn");
+        }
+        active_turns.lock().await.remove(&session_id);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn session_rollback_rejects_zero_num_turns() {
+        let session_id = SessionKey("local:rollback-zero".into());
+        let (state, _tmp) = prg_state_with_persisted_turns(&session_id, 2).await;
+        let active_turns = active_turns_registry();
+        let ledger = event_ledger(&state).await;
+        let (ws, mut rx) = ws_connection_for_test(8);
+
+        handle_session_rollback(
+            &ws,
+            &state,
+            &ledger,
+            &active_turns,
+            None,
+            None,
+            "rb0".into(),
+            SessionRollbackParams {
+                session_id: session_id.clone(),
+                num_turns: 0,
+            },
+        )
+        .await;
+
+        let frame = recv_rpc_json(&mut rx).await;
+        assert!(frame.get("error").is_some(), "num_turns=0 must be rejected");
+        assert_eq!(frame["error"]["data"]["kind"], "invalid_num_turns");
+    }
+
+    /// Codex P2: the ledger snapshot handed to `collect_session_turns` is taken
+    /// BEFORE the trim, so it still carries lifecycle + `message/persisted`
+    /// events for the rolled-back turns. The returned `thread.turns` must scope
+    /// to the SURVIVING threads — a dropped turn must not linger in the turn
+    /// projection even though its ledger rows persist.
+    #[tokio::test(flavor = "current_thread")]
+    async fn session_rollback_excludes_dropped_turns_from_thread_turns() {
+        let session_id = SessionKey("local:rollback-turns-scope".into());
+        // Two persisted turns, thread-grouped under "t1" and "t2".
+        let (state, _tmp) = prg_state_with_persisted_turns(&session_id, 2).await;
+        let active_turns = active_turns_registry();
+        let ledger = event_ledger(&state).await;
+
+        // Full lifecycle for BOTH turns in the ledger, thread-linked to the
+        // persisted turns (thread_ids surfaced via `message/persisted.thread_id`
+        // are what `collect_session_turns` keys the projection on).
+        let turn_keep = TurnId::new(); // turn 1 -> thread "t1" (survives)
+        let turn_drop = TurnId::new(); // turn 2 -> thread "t2" (rolled back)
+        for (turn_id, thread_id, seq) in [(&turn_keep, "t1", 1_u64), (&turn_drop, "t2", 3_u64)] {
+            let _ = ledger.append_notification(UiNotification::TurnStarted(
+                octos_core::ui_protocol::TurnStartedEvent {
+                    session_id: session_id.clone(),
+                    turn_id: turn_id.clone(),
+                    timestamp: Utc::now(),
+                    topic: None,
+                },
+            ));
+            let _ = ledger.append_notification(UiNotification::MessagePersisted(
+                MessagePersistedEvent {
+                    session_id: session_id.clone(),
+                    topic: None,
+                    turn_id: Some(turn_id.clone()),
+                    thread_id: Some(thread_id.to_string()),
+                    seq,
+                    role: "user".into(),
+                    message_id: format!("{}:{seq}:0", session_id.0),
+                    client_message_id: None,
+                    source: MessagePersistedSource::User,
+                    cursor: UiCursor {
+                        stream: session_id.0.clone(),
+                        seq,
+                    },
+                    persisted_at: Utc::now(),
+                    media: vec![],
+                    content: None,
+                },
+            ));
+            let _ = ledger.append_notification(UiNotification::TurnCompleted(TurnCompletedEvent {
+                session_id: session_id.clone(),
+                topic: None,
+                turn_id: turn_id.clone(),
+                cursor: None,
+                tokens_in: None,
+                tokens_out: None,
+                session_result: None,
+            }));
+        }
+
+        let (ws, mut rx) = ws_connection_for_test(8);
+        handle_session_rollback(
+            &ws,
+            &state,
+            &ledger,
+            &active_turns,
+            None,
+            None,
+            "rb-scope".into(),
+            SessionRollbackParams {
+                session_id: session_id.clone(),
+                num_turns: 1,
+            },
+        )
+        .await;
+
+        let frame = recv_rpc_json(&mut rx).await;
+        assert_eq!(frame["result"]["dropped_turns"], 1);
+        let turns = frame["result"]["thread"]["turns"]
+            .as_array()
+            .expect("turns array");
+        let turn_ids: Vec<String> = turns
+            .iter()
+            .filter_map(|turn| turn["turn_id"].as_str().map(str::to_owned))
+            .collect();
+        assert!(
+            turn_ids.contains(&turn_keep.0.to_string()),
+            "surviving turn 1 must remain in thread.turns; got {turn_ids:?}"
+        );
+        assert!(
+            !turn_ids.contains(&turn_drop.0.to_string()),
+            "dropped turn 2 must be excluded from thread.turns; got {turn_ids:?}"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -36423,6 +38888,15 @@ ignore = []
                 "assistant_delta",
             ),
             (
+                UiNotification::ReasoningDelta(ReasoningDeltaEvent {
+                    session_id: session_id.clone(),
+                    topic: None,
+                    turn_id: turn_id.clone(),
+                    text: "reasoning".into(),
+                }),
+                "reasoning_delta",
+            ),
+            (
                 UiNotification::ToolStarted(ToolStartedEvent {
                     session_id: session_id.clone(),
                     topic: None,
@@ -36476,6 +38950,7 @@ ignore = []
                 UiProtocolLedgerEvent::Notification(UiNotification::Envelope(env)) => {
                     match &env.envelope.payload {
                         Payload::AssistantDelta { .. } => Some("assistant_delta".into()),
+                        Payload::ReasoningDelta { .. } => Some("reasoning_delta".into()),
                         Payload::ToolStart { .. } => Some("tool_start".into()),
                         Payload::ToolProgress { .. } => Some("tool_progress".into()),
                         Payload::ToolEnd { .. } => Some("tool_end".into()),
@@ -37804,17 +40279,11 @@ ignore = []
         }
     }
 
-    async fn make_m11e_profile(
-        profile_id: &str,
-        data_dir: &std::path::Path,
-    ) -> Arc<crate::runtime::ProfileRuntime> {
-        make_m11e_profile_with_llm(profile_id, data_dir, Arc::new(M11EStubLlm)).await
-    }
-
-    async fn make_m11e_profile_with_llm(
+    async fn make_m11e_profile_with_llm_and_sandbox(
         profile_id: &str,
         data_dir: &std::path::Path,
         llm: Arc<dyn octos_llm::LlmProvider>,
+        sandbox: octos_agent::SandboxConfig,
     ) -> Arc<crate::runtime::ProfileRuntime> {
         std::fs::create_dir_all(data_dir).expect("profile data dir");
         let memory = Arc::new(
@@ -37832,7 +40301,6 @@ ignore = []
                 .await
                 .expect("tool config store"),
         );
-        let sandbox = octos_agent::SandboxConfig::default();
         let base_tools = octos_agent::ToolRegistry::with_builtins_and_sandbox(
             data_dir,
             octos_agent::create_sandbox(&sandbox),
@@ -37859,8 +40327,16 @@ ignore = []
             review_config: None,
             human_approval_rules: None,
             system_prompt: "test-system-prompt".to_string(),
+            prompt_parts: crate::commands::gateway::prompt::GatewayPromptParts {
+                pre_memory: "test-system-prompt".to_string(),
+                post_memory: String::new(),
+            },
             memory,
             memory_store,
+            embedder: None,
+            memory_inject_tokens: 2500,
+            memory_refresh_enabled: false,
+            memory_refresh: None,
             tool_config,
             cron_service: None,
             pipeline_factory: None,
@@ -37888,6 +40364,21 @@ ignore = []
         profile_id: &str,
         llm: Arc<dyn octos_llm::LlmProvider>,
     ) -> (Arc<AppState>, Arc<crate::runtime::ProfileRuntime>) {
+        state_with_profile_llm_and_sandbox(
+            data_dir,
+            profile_id,
+            llm,
+            octos_agent::SandboxConfig::default(),
+        )
+        .await
+    }
+
+    async fn state_with_profile_llm_and_sandbox(
+        data_dir: &std::path::Path,
+        profile_id: &str,
+        llm: Arc<dyn octos_llm::LlmProvider>,
+        sandbox: octos_agent::SandboxConfig,
+    ) -> (Arc<AppState>, Arc<crate::runtime::ProfileRuntime>) {
         std::fs::create_dir_all(data_dir).expect("data dir");
 
         let sessions = Arc::new(tokio::sync::Mutex::new(
@@ -37895,7 +40386,9 @@ ignore = []
         ));
 
         let profile_data_dir = data_dir.join("profiles").join(profile_id).join("data");
-        let profile_runtime = make_m11e_profile_with_llm(profile_id, &profile_data_dir, llm).await;
+        let profile_runtime =
+            make_m11e_profile_with_llm_and_sandbox(profile_id, &profile_data_dir, llm, sandbox)
+                .await;
 
         let mut profiles = HashMap::new();
         profiles.insert(profile_id.to_string(), profile_runtime.clone());
@@ -38148,6 +40641,7 @@ ignore = []
         let session_id = SessionKey::with_profile("m11e-custom-cwd", "api", "custom-cwd-session");
         let features = ConnectionUiFeatures {
             session_workspace_cwd: true,
+            session_sandbox: false,
             header_present: true,
             ..ConnectionUiFeatures::default()
         };
@@ -38165,6 +40659,7 @@ ignore = []
                 topic: None,
                 profile_id: Some("m11e-custom-cwd".into()),
                 cwd: Some(supplied_cwd.to_string_lossy().into_owned()),
+                sandbox: None,
                 after: None,
             },
         )
@@ -38212,6 +40707,237 @@ ignore = []
         );
     }
 
+    #[test]
+    fn session_sandbox_requires_negotiated_feature() {
+        let params = SessionOpenParams {
+            session_id: SessionKey::new("api", "sandbox-feature-required"),
+            topic: None,
+            profile_id: None,
+            cwd: None,
+            sandbox: Some(SessionSandboxParams {
+                enabled: None,
+                network_access: Some(false),
+                read_allow_paths: Vec::new(),
+            }),
+            after: None,
+        };
+
+        let err = validate_requested_session_sandbox(
+            ConnectionUiFeatures::default(),
+            &params,
+            &octos_agent::SandboxConfig::default(),
+        )
+        .expect_err("sandbox override must require feature negotiation");
+        assert_eq!(
+            err.data.as_ref().and_then(|data| data.get("kind")),
+            Some(&json!("feature_required"))
+        );
+        assert_eq!(
+            err.data.as_ref().and_then(|data| data.get("feature")),
+            Some(&json!(UI_PROTOCOL_FEATURE_SESSION_SANDBOX_V1))
+        );
+    }
+
+    #[test]
+    fn session_sandbox_can_narrow_network_but_not_widen() {
+        let features = ConnectionUiFeatures {
+            session_sandbox: true,
+            header_present: true,
+            ..ConnectionUiFeatures::default()
+        };
+        let params = SessionOpenParams {
+            session_id: SessionKey::new("api", "sandbox-network-narrow"),
+            topic: None,
+            profile_id: None,
+            cwd: None,
+            sandbox: Some(SessionSandboxParams {
+                enabled: None,
+                network_access: Some(false),
+                read_allow_paths: Vec::new(),
+            }),
+            after: None,
+        };
+        let inherited = octos_agent::SandboxConfig {
+            allow_network: true,
+            ..octos_agent::SandboxConfig::default()
+        };
+
+        let narrowed = validate_requested_session_sandbox(features, &params, &inherited)
+            .expect("network:false narrows network-enabled profile")
+            .expect("override present");
+        assert!(!narrowed.allow_network);
+
+        let widening = SessionOpenParams {
+            session_id: SessionKey::new("api", "sandbox-network-widen"),
+            topic: None,
+            profile_id: None,
+            cwd: None,
+            sandbox: Some(SessionSandboxParams {
+                enabled: None,
+                network_access: Some(true),
+                read_allow_paths: Vec::new(),
+            }),
+            after: None,
+        };
+        let err = validate_requested_session_sandbox(
+            features,
+            &widening,
+            &octos_agent::SandboxConfig::default(),
+        )
+        .expect_err("network:true widens a network-denied profile");
+        assert_eq!(
+            err.data.as_ref().and_then(|data| data.get("kind")),
+            Some(&json!("session_sandbox_would_widen_profile"))
+        );
+        assert_eq!(
+            err.data.as_ref().and_then(|data| data.get("field")),
+            Some(&json!("network_access"))
+        );
+    }
+
+    #[test]
+    fn session_sandbox_read_paths_must_stay_within_profile_allowlist() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let allowed = temp.path().join("allowed");
+        let nested = allowed.join("nested");
+        let outside = temp.path().join("outside");
+        std::fs::create_dir_all(&nested).expect("nested dir");
+        std::fs::create_dir_all(&outside).expect("outside dir");
+        let features = ConnectionUiFeatures {
+            session_sandbox: true,
+            header_present: true,
+            ..ConnectionUiFeatures::default()
+        };
+        let inherited = octos_agent::SandboxConfig {
+            read_allow_paths: vec![allowed.to_string_lossy().into_owned()],
+            ..octos_agent::SandboxConfig::default()
+        };
+
+        let narrowed = SessionOpenParams {
+            session_id: SessionKey::new("api", "sandbox-read-narrow"),
+            topic: None,
+            profile_id: None,
+            cwd: None,
+            sandbox: Some(SessionSandboxParams {
+                enabled: None,
+                network_access: None,
+                read_allow_paths: vec![nested.to_string_lossy().into_owned()],
+            }),
+            after: None,
+        };
+        let sandbox = validate_requested_session_sandbox(features, &narrowed, &inherited)
+            .expect("nested read path narrows profile allowlist")
+            .expect("override present");
+        assert_eq!(sandbox.read_allow_paths.len(), 1);
+        assert!(Path::new(&sandbox.read_allow_paths[0]).ends_with("nested"));
+
+        let widening = SessionOpenParams {
+            session_id: SessionKey::new("api", "sandbox-read-widen"),
+            topic: None,
+            profile_id: None,
+            cwd: None,
+            sandbox: Some(SessionSandboxParams {
+                enabled: None,
+                network_access: None,
+                read_allow_paths: vec![outside.to_string_lossy().into_owned()],
+            }),
+            after: None,
+        };
+        let err = validate_requested_session_sandbox(features, &widening, &inherited)
+            .expect_err("outside read path widens profile allowlist");
+        assert_eq!(
+            err.data.as_ref().and_then(|data| data.get("kind")),
+            Some(&json!("session_sandbox_would_widen_profile"))
+        );
+        assert_eq!(
+            err.data.as_ref().and_then(|data| data.get("field")),
+            Some(&json!("read_allow_paths"))
+        );
+    }
+
+    #[tokio::test]
+    async fn session_sandbox_open_override_materializes_distinct_session_policies() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (state, profile_runtime) = state_with_profile_llm_and_sandbox(
+            temp.path(),
+            "m11-session-sandbox",
+            Arc::new(M11EStubLlm),
+            octos_agent::SandboxConfig {
+                allow_network: true,
+                ..octos_agent::SandboxConfig::default()
+            },
+        )
+        .await;
+        let ledger = UiProtocolLedger::new(16);
+        let approvals = PendingApprovalStore::default();
+        let features = ConnectionUiFeatures {
+            session_sandbox: true,
+            header_present: true,
+            ..ConnectionUiFeatures::default()
+        };
+        let gamma = SessionKey::with_profile("m11-session-sandbox", "api", "gamma");
+        let delta = SessionKey::with_profile("m11-session-sandbox", "api", "delta");
+
+        let _ = open_session_result(
+            &state,
+            &ledger,
+            &approvals,
+            &PendingQuestionStore::default(),
+            ConnectionId::next(),
+            Some("m11-session-sandbox"),
+            features,
+            SessionOpenParams {
+                session_id: gamma.clone(),
+                topic: None,
+                profile_id: Some("m11-session-sandbox".into()),
+                cwd: None,
+                sandbox: Some(SessionSandboxParams {
+                    enabled: None,
+                    network_access: Some(false),
+                    read_allow_paths: Vec::new(),
+                }),
+                after: None,
+            },
+        )
+        .await
+        .expect("gamma session/open with network false sandbox override");
+        let _ = open_session_result(
+            &state,
+            &ledger,
+            &approvals,
+            &PendingQuestionStore::default(),
+            ConnectionId::next(),
+            Some("m11-session-sandbox"),
+            features,
+            SessionOpenParams {
+                session_id: delta.clone(),
+                topic: None,
+                profile_id: Some("m11-session-sandbox".into()),
+                cwd: None,
+                sandbox: None,
+                after: None,
+            },
+        )
+        .await
+        .expect("delta session/open with default sandbox");
+
+        let gamma_runtime = state
+            .session_cache
+            .get_or_init(&profile_runtime, gamma, None)
+            .await
+            .expect("gamma runtime");
+        let delta_runtime = state
+            .session_cache
+            .get_or_init(&profile_runtime, delta, None)
+            .await
+            .expect("delta runtime");
+
+        assert!(profile_runtime.default_sandbox.allow_network);
+        assert!(!gamma_runtime.sandbox.allow_network);
+        assert!(delta_runtime.sandbox.allow_network);
+        assert_ne!(gamma_runtime.workspace_root, delta_runtime.workspace_root);
+    }
+
     /// M11-E acceptance §2: two AppUI sessions opened on the SAME profile
     /// with DIFFERENT cwds must not see each other's files. This is the
     /// multi-tenant scope invariant codex flagged on PR #868 — pre-M11
@@ -38238,6 +40964,7 @@ ignore = []
 
         let features = ConnectionUiFeatures {
             session_workspace_cwd: true,
+            session_sandbox: false,
             header_present: true,
             ..ConnectionUiFeatures::default()
         };
@@ -38256,6 +40983,7 @@ ignore = []
                 topic: None,
                 profile_id: Some("m11e-multi-cwd".into()),
                 cwd: Some(cwd_a.to_string_lossy().into_owned()),
+                sandbox: None,
                 after: None,
             },
         )
@@ -38276,6 +41004,7 @@ ignore = []
                 topic: None,
                 profile_id: Some("m11e-multi-cwd".into()),
                 cwd: Some(cwd_b.to_string_lossy().into_owned()),
+                sandbox: None,
                 after: None,
             },
         )
@@ -38408,6 +41137,7 @@ ignore = []
         let session_id = SessionKey::with_profile("m11e-rebind-attempt", "api", "single-key");
         let features = ConnectionUiFeatures {
             session_workspace_cwd: true,
+            session_sandbox: false,
             header_present: true,
             ..ConnectionUiFeatures::default()
         };
@@ -38425,6 +41155,7 @@ ignore = []
                 topic: None,
                 profile_id: Some("m11e-rebind-attempt".into()),
                 cwd: Some(first_cwd.to_string_lossy().into_owned()),
+                sandbox: None,
                 after: None,
             },
         )
@@ -38445,6 +41176,7 @@ ignore = []
                 profile_id: Some("m11e-rebind-attempt".into()),
                 // Different cwd — must NOT take effect; cache is sticky.
                 cwd: Some(second_cwd.to_string_lossy().into_owned()),
+                sandbox: None,
                 after: None,
             },
         )
@@ -38499,6 +41231,7 @@ ignore = []
         let session_id = SessionKey::with_profile("m11e-not-registered", "api", "x");
         let features = ConnectionUiFeatures {
             session_workspace_cwd: true,
+            session_sandbox: false,
             header_present: true,
             ..ConnectionUiFeatures::default()
         };
@@ -38518,6 +41251,7 @@ ignore = []
                 topic: None,
                 profile_id: None,
                 cwd: Some(cwd.to_string_lossy().into_owned()),
+                sandbox: None,
                 after: None,
             },
         )
@@ -38568,6 +41302,7 @@ ignore = []
         let session_a = SessionKey::with_profile("m11e-symlink", "api", "session-a");
         let features = ConnectionUiFeatures {
             session_workspace_cwd: true,
+            session_sandbox: false,
             header_present: true,
             ..ConnectionUiFeatures::default()
         };
@@ -38585,6 +41320,7 @@ ignore = []
                 topic: None,
                 profile_id: Some("m11e-symlink".into()),
                 cwd: Some(cwd_a.to_string_lossy().into_owned()),
+                sandbox: None,
                 after: None,
             },
         )
@@ -38693,6 +41429,7 @@ ignore = []
         // that the M11-E deletion of `clone_session_tools` broke.
         let features = ConnectionUiFeatures {
             session_workspace_cwd: false,
+            session_sandbox: false,
             header_present: true,
             ..ConnectionUiFeatures::default()
         };
@@ -38710,6 +41447,7 @@ ignore = []
                 topic: None,
                 profile_id: Some("m11f-tier2-default".into()),
                 cwd: None,
+                sandbox: None,
                 after: None,
             },
         )
@@ -40063,6 +42801,161 @@ ignore = []
         assert_eq!(
             text_frames, 0,
             "no text reply must be sent on the un-deliverable last-resort path"
+        );
+    }
+
+    /// RFC-1 fixup (codex P2): the per-turn `tool_registry.snapshot_excluding(&[])`
+    /// path in `process_chat_message_streaming` clones the
+    /// `Arc<dyn Tool>` instances. Without an explicit re-registration,
+    /// the per-turn dispatcher object is the SAME shared instance as
+    /// the cached session registry's dispatcher. Any subsequent
+    /// `wire_mofa_make_registry_back_ref` call would mutate the
+    /// shared object's `Mutex<Weak<ToolRegistry>>` and other
+    /// overlapping turns/background `mofa_make` runs would resolve
+    /// through the WRONG registry.
+    ///
+    /// This test simulates the snapshot pattern the production path
+    /// uses and asserts that after the per-turn re-registration
+    /// (which mirrors how `activate_tools` is re-registered just
+    /// above in the same file) the per-turn dispatcher is a SEPARATE
+    /// object from the cached one — so wiring one's Weak does NOT
+    /// touch the other's.
+    #[test]
+    fn per_turn_snapshot_creates_fresh_dispatcher() {
+        use octos_agent::tools::{MakeTypeEntry, Tool, ToolRegistry};
+        use octos_agent::{MofaDescribeContentTypeTool, MofaMakeTool};
+
+        // Build the parent session registry: register the dispatcher
+        // pair seeded with one entry. This mirrors what the loader
+        // does during `SessionRuntime::bootstrap`.
+        let mut parent = ToolRegistry::new();
+        let entry =
+            MakeTypeEntry::new("slides", "mofa-slides", "mofa_slides", "Slides description");
+
+        let parent_dispatcher = MofaMakeTool::new();
+        parent_dispatcher.register_or_replace(entry.clone());
+        let parent_describe = MofaDescribeContentTypeTool::new();
+        parent_describe.register_or_replace(entry.clone());
+
+        let parent_dispatcher_arc: Arc<dyn octos_agent::tools::Tool> = Arc::new(parent_dispatcher);
+        let parent_describe_arc: Arc<dyn octos_agent::tools::Tool> = Arc::new(parent_describe);
+        parent.register_arc(parent_dispatcher_arc.clone());
+        parent.register_arc(parent_describe_arc.clone());
+
+        // Wire the parent dispatcher's Weak to a parent-Arc registry —
+        // this represents the SessionRuntime's cached registry wiring.
+        let parent_arc = Arc::new(parent);
+        let parent_dispatcher_back = parent_arc
+            .get("mofa_make")
+            .and_then(|t| t.as_any().downcast_ref::<MofaMakeTool>())
+            .expect("parent mofa_make registered");
+        parent_dispatcher_back.set_registry(Arc::downgrade(&parent_arc));
+
+        // Capture identity (Arc data pointer) of the parent dispatcher.
+        let parent_disp_ptr =
+            Arc::as_ptr(&parent_arc.get("mofa_make").cloned().unwrap()) as *const ();
+
+        // Simulate the per-turn snapshot path. The cloned Arc points
+        // to the SAME dispatcher object as the parent's (this is the
+        // bug codex flagged).
+        let mut per_turn = parent_arc.snapshot_excluding(&[]);
+        let cloned_disp_ptr =
+            Arc::as_ptr(&per_turn.get("mofa_make").cloned().unwrap()) as *const ();
+        assert_eq!(
+            cloned_disp_ptr, parent_disp_ptr,
+            "snapshot_excluding clones Arc references — pre-fix sanity \
+             check that the per-turn arc IS the same object as the \
+             parent's (this is the share-mutate hazard)"
+        );
+
+        // Apply the production fixup: mint fresh dispatcher + describe
+        // instances seeded from the existing dispatcher's catalog, and
+        // re-register on the per-turn registry. This is what the
+        // production path in ui_protocol.rs does post-snapshot.
+        if let Some(existing) = per_turn.get("mofa_make").cloned() {
+            let dispatcher = existing
+                .as_any()
+                .downcast_ref::<MofaMakeTool>()
+                .expect("dispatcher downcast");
+            let entries = dispatcher.entries();
+            let fresh_dispatcher = MofaMakeTool::new();
+            for entry in &entries {
+                fresh_dispatcher.register_or_replace(entry.clone());
+            }
+            per_turn.register(fresh_dispatcher);
+
+            if per_turn.get("mofa_describe_content_type").is_some() {
+                let fresh_describe = MofaDescribeContentTypeTool::new();
+                for entry in &entries {
+                    fresh_describe.register_or_replace(entry.clone());
+                }
+                per_turn.register(fresh_describe);
+            }
+        }
+
+        // Post-fixup identity assertion: the per-turn dispatcher is a
+        // DIFFERENT Arc object than the parent's. So wiring the
+        // per-turn dispatcher's Weak no longer touches the parent's.
+        let new_disp_ptr = Arc::as_ptr(&per_turn.get("mofa_make").cloned().unwrap()) as *const ();
+        assert_ne!(
+            new_disp_ptr, parent_disp_ptr,
+            "post-fixup per-turn dispatcher must be a SEPARATE Arc \
+             object from the parent's — share-mutate hazard closed"
+        );
+
+        // And the catalog of the fresh dispatcher must mirror the
+        // parent's — the LLM still sees the same content_type enum.
+        let per_turn_dispatcher = per_turn
+            .get("mofa_make")
+            .and_then(|t| t.as_any().downcast_ref::<MofaMakeTool>())
+            .expect("per-turn mofa_make registered");
+        let entries = per_turn_dispatcher.entries();
+        assert_eq!(entries.len(), 1, "catalog must be propagated");
+        assert_eq!(entries[0].content_type, "slides");
+        assert_eq!(entries[0].target_tool, "mofa_slides");
+
+        // Critical: wire the per-turn dispatcher's Weak to the per-turn
+        // registry and confirm the parent's dispatcher's Weak still
+        // points at the parent registry (i.e. has NOT been mutated).
+        let per_turn_arc = Arc::new(per_turn);
+        let per_turn_dispatcher_back = per_turn_arc
+            .get("mofa_make")
+            .and_then(|t| t.as_any().downcast_ref::<MofaMakeTool>())
+            .expect("per-turn mofa_make registered");
+        per_turn_dispatcher_back.set_registry(Arc::downgrade(&per_turn_arc));
+
+        // The parent dispatcher's Weak must still upgrade to the
+        // parent registry. If the share-mutate hazard were live, this
+        // would now point at the per-turn registry or be dropped.
+        let parent_after = parent_arc
+            .get("mofa_make")
+            .and_then(|t| t.as_any().downcast_ref::<MofaMakeTool>())
+            .expect("parent mofa_make still registered");
+        // Use a dispatch call on the parent registry to verify
+        // end-to-end. The parent registry doesn't have `mofa_slides`
+        // registered (we didn't add it above) so the call surfaces a
+        // DISPATCHER_ERROR specifically mentioning the missing target —
+        // which proves the parent's Weak still resolves to the parent
+        // registry. If the per-turn registry's Weak had clobbered the
+        // parent's, the call would either (a) succeed by reaching some
+        // per-turn-only tool, (b) error with "tool registry is not
+        // available" (Weak dropped). Neither matches the expected
+        // parent-registry behaviour.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let result = rt.block_on(parent_after.execute(&serde_json::json!({
+            "content_type": "slides",
+            "args": {}
+        })));
+        let result = result.unwrap();
+        // The parent's registry has the dispatcher catalog but no
+        // mofa_slides target tool. The error message must mention
+        // mofa_slides (proving we routed through the parent's catalog +
+        // parent's get() lookup, not the per-turn's).
+        assert!(
+            result.output.contains("[DISPATCHER_ERROR]") && result.output.contains("mofa_slides"),
+            "parent dispatcher must still resolve via the parent registry's \
+             get() and report the parent-side missing target; got: {:?}",
+            result.output
         );
     }
 }

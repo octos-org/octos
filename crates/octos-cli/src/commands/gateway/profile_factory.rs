@@ -124,14 +124,24 @@ pub(crate) fn profile_plugin_env(profile: &crate::profiles::UserProfile) -> Vec<
 }
 
 fn discover_ominix_url() -> Option<String> {
-    std::env::var("OMINIX_API_URL").ok().or_else(|| {
-        let home = std::env::var_os("HOME")?;
-        let discovery = std::path::Path::new(&home).join(".ominix").join("api_url");
-        std::fs::read_to_string(discovery)
-            .ok()
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-    })
+    std::env::var("OMINIX_API_URL")
+        .ok()
+        .map(|s| s.trim().trim_end_matches('/').to_string())
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            let home = std::env::var_os("HOME")?;
+            for dir in [".ominix", ".OminiX"] {
+                let discovery = std::path::Path::new(&home).join(dir).join("api_url");
+                if let Some(url) = std::fs::read_to_string(discovery)
+                    .ok()
+                    .map(|s| s.trim().trim_end_matches('/').to_string())
+                    .filter(|s| !s.is_empty())
+                {
+                    return Some(url);
+                }
+            }
+            None
+        })
 }
 
 fn push_runtime_plugin_env(
@@ -530,6 +540,12 @@ pub(super) struct ProfileActorFactoryBuilder {
     /// can mandate strict signing even when individual profile JSONs omit
     /// the flag. Mirrors `ProfileRuntime::bootstrap_with_host_plugins`.
     pub(super) host_plugins: crate::config::PluginsConfig,
+    /// Host-level memory settings from the gateway's resolved config (which
+    /// already applied the config-beats-env precedence in
+    /// `Config::from_file`). Routed child profiles that omit `memory` fall
+    /// back to this, NOT to a re-read of the ambient env var, so they follow
+    /// the exact precedence of the main actor.
+    pub(super) host_memory: Option<crate::config::MemoryConfig>,
 }
 
 impl ProfileActorFactoryBuilder {
@@ -559,6 +575,12 @@ impl ProfileActorFactoryBuilder {
         if self.host_plugins.require_signed {
             profile_config.plugins.require_signed = true;
         }
+        // Host memory settings apply field-by-field when the child profile
+        // doesn't override them (same pattern as bootstrap_with_host_plugins).
+        crate::config::merge_host_memory_into_profile(
+            &mut profile_config.memory,
+            self.host_memory.as_ref(),
+        );
         let (llm, provider_name, adaptive_router, llm_strong) =
             build_llm_stack(&profile_config, self.no_retry)?;
         let llm_for_compaction = llm.clone();
@@ -570,18 +592,22 @@ impl ProfileActorFactoryBuilder {
         let mut child_plugin_prompt_fragments = Vec::new();
         let mut child_plugin_hooks: Vec<octos_agent::HookConfig> = Vec::new();
 
+        let max_inject_tokens = crate::config::MemoryConfig::effective_max_inject_tokens(
+            profile_config.memory.as_ref(),
+        );
+        let memory_refresh_enabled =
+            crate::config::MemoryConfig::refresh_enabled(profile_config.memory.as_ref());
         let mut system_prompt = build_system_prompt(
             effective_profile.config.gateway.system_prompt.as_deref(),
             &profile_data_dir,
             &self.project_dir,
-            &self.memory_store,
             &skills_loader,
             &self.tool_config,
         )
         .await;
         for fragment in &self.plugin_prompt_fragments {
-            system_prompt.push_str("\n\n");
-            system_prompt.push_str(fragment);
+            system_prompt.post_memory.push_str("\n\n");
+            system_prompt.post_memory.push_str(fragment);
         }
         let mut pipeline_factory = self.pipeline_factory.clone();
         let mut provider_policy = self.provider_policy.clone();
@@ -590,6 +616,13 @@ impl ProfileActorFactoryBuilder {
         // Collected for SpawnTool subagents (set inside the else branch below).
         let mut actor_plugin_dirs: Vec<PathBuf> = Vec::new();
         let mut actor_plugin_env: Vec<(String, String)> = Vec::new();
+
+        // Resolve the profile's embedding provider ONCE; the child
+        // pipeline factory and the ActorFactory below share this handle
+        // (codex P3: duplicate resolves broke the single-handle
+        // invariant and doubled keychain lookups).
+        let profile_embedder =
+            create_embedder(&profile_config).map(|e| e as Arc<dyn octos_llm::EmbeddingProvider>);
 
         // Child bots with admin_mode=true reuse the parent's tool registry snapshot
         // (which already has full tools + admin API). Child bots with admin_mode=false
@@ -710,6 +743,9 @@ impl ProfileActorFactoryBuilder {
                 self.memory_store.clone(),
             ));
             tools.register(octos_agent::SaveMemoryTool::new(self.memory_store.clone()));
+            if memory_refresh_enabled {
+                tools.register(octos_agent::MemoryNoteTool::new(self.memory_store.clone()));
+            }
             if let Some(ref policy) = profile_config.tool_policy {
                 tools.apply_policy(policy);
             }
@@ -875,11 +911,10 @@ impl ProfileActorFactoryBuilder {
             }
 
             // NEW-06 fix: the parent ActorFactory's session agent gets
-            // its embedder from `create_embedder(profile_config)`; mirror
-            // that here so child-profile pipeline workers run on the
-            // same contamination-safe hybrid memory path.
-            let child_pipeline_embedder = create_embedder(&profile_config)
-                .map(|e| e as Arc<dyn octos_llm::EmbeddingProvider>);
+            // its embedder from the shared single resolve below; hand the
+            // same handle here so child-profile pipeline workers run on
+            // the same contamination-safe hybrid memory path.
+            let child_pipeline_embedder = profile_embedder.clone();
 
             pipeline_factory = Some(Arc::new(ChildPipelineToolFactory {
                 llm: llm.clone(),
@@ -907,8 +942,8 @@ impl ProfileActorFactoryBuilder {
 
         if !child_plugin_prompt_fragments.is_empty() {
             for fragment in &child_plugin_prompt_fragments {
-                system_prompt.push_str("\n\n");
-                system_prompt.push_str(fragment);
+                system_prompt.post_memory.push_str("\n\n");
+                system_prompt.post_memory.push_str(fragment);
             }
         }
 
@@ -919,12 +954,18 @@ impl ProfileActorFactoryBuilder {
         } else {
             Some(Arc::new(HookExecutor::new(all_hooks)))
         };
+        let usage_ledger = Arc::new(
+            crate::usage_ledger::PersistentUsageLedger::open_sync(&profile_data_dir)
+                .wrap_err("failed to open profile usage ledger")?,
+        );
 
         Ok(ActorFactory {
             agent_config: self.agent_config.clone(),
             llm: llm.clone(),
             llm_for_compaction,
             memory: self.memory.clone(),
+            memory_inject_tokens: max_inject_tokens,
+            memory_refresh_enabled,
             system_prompt: Arc::new(std::sync::RwLock::new(system_prompt)),
             hooks,
             hook_context_template: Some(HookContext {
@@ -932,6 +973,7 @@ impl ProfileActorFactoryBuilder {
                 profile_id: Some(profile_id.to_string()),
             }),
             data_dir: profile_data_dir,
+            usage_ledger: Some(usage_ledger),
             session_mgr: self.session_mgr.clone(),
             out_tx: self.out_tx.clone(),
             spawn_inbound_tx: self.spawn_inbound_tx.clone(),
@@ -954,8 +996,7 @@ impl ProfileActorFactoryBuilder {
             tool_policy: profile_config.tool_policy.clone(),
             worker_prompt,
             provider_router,
-            embedder: create_embedder(&profile_config)
-                .map(|embedder| embedder as Arc<dyn octos_llm::EmbeddingProvider>),
+            embedder: profile_embedder,
             active_sessions: self.active_sessions.clone(),
             pending_messages: self.pending_messages.clone(),
             queue_mode: self.queue_mode,
@@ -1217,6 +1258,7 @@ mod tests {
                 effective_octos_home.join("subagent-out"),
             )),
             host_plugins: Default::default(),
+            host_memory: None,
         };
 
         // The child-profile pipeline root MUST be effective_octos_home — the

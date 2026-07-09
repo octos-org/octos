@@ -11,7 +11,8 @@ use chrono::Utc;
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 
-use super::AppState;
+use super::router::AuthIdentity;
+use super::{AppState, ominix_runtime};
 use crate::profiles::{ProfileConfig, UserProfile, mask_secrets};
 
 /// Basic email format validation.
@@ -27,6 +28,23 @@ pub(crate) fn validate_email(email: &str) -> Result<(), String> {
 }
 
 // ── Request / Response types ──────────────────────────────────────────
+
+const MODEL_BOOTSTRAP_TIMEOUT: Duration = Duration::from_secs(60 * 60 * 2);
+const MODEL_BOOTSTRAP_SPACE_MARGIN_BYTES: u64 = 1024 * 1024 * 1024;
+
+#[derive(Debug, Serialize)]
+struct OminixModelBootstrapResult {
+    id: String,
+    role: String,
+    ready: bool,
+    action: String,
+    status_before: String,
+    status_after: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    size: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    message: Option<String>,
+}
 
 #[derive(Deserialize)]
 pub struct CreateProfileRequest {
@@ -260,6 +278,7 @@ pub(crate) fn relocate_keychain_backed_secrets(
 
 /// POST /api/admin/profiles
 pub async fn create_profile(
+    identity: Option<axum::Extension<AuthIdentity>>,
     State(state): State<Arc<AppState>>,
     Json(req): Json<CreateProfileRequest>,
 ) -> Result<(StatusCode, Json<ProfileResponse>), (StatusCode, String)> {
@@ -313,18 +332,26 @@ pub async fn create_profile(
 
     tracing::info!(profile = %profile.id, name = %profile.name, "profile created");
     let status = pm.status(&profile.id).await;
-    Ok((
-        StatusCode::CREATED,
-        Json(ProfileResponse {
-            email: None,
-            profile: mask_secrets(&profile),
-            status,
-        }),
-    ))
+    let response = ProfileResponse {
+        email: None,
+        profile: mask_secrets(&profile),
+        status,
+    };
+    super::admin_audit::record_admin_action(
+        &state,
+        identity.as_ref().map(|identity| &identity.0),
+        "profile.create",
+        profile.id.clone(),
+        None,
+        super::admin_audit::summary_value(&response.profile),
+    )
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok((StatusCode::CREATED, Json(response)))
 }
 
 /// PUT /api/admin/profiles/:id
 pub async fn update_profile(
+    identity: Option<axum::Extension<AuthIdentity>>,
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
     body: String,
@@ -346,6 +373,7 @@ pub async fn update_profile(
         .get(&id)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
         .ok_or((StatusCode::NOT_FOUND, format!("profile '{id}' not found")))?;
+    let before_profile = profile.clone();
 
     if let Some(name) = req.name {
         profile.name = name;
@@ -425,15 +453,28 @@ pub async fn update_profile(
 
     tracing::info!(profile = %id, "profile updated");
     let status = pm.status(&id).await;
-    Ok(Json(ProfileResponse {
+    let response = ProfileResponse {
         email: None,
         profile: mask_secrets(&profile),
         status,
-    }))
+    };
+    let before_summary = super::admin_audit::summary_value(&mask_secrets(&before_profile));
+    let after_summary = super::admin_audit::summary_value(&response.profile);
+    super::admin_audit::record_admin_action(
+        &state,
+        identity.as_ref().map(|identity| &identity.0),
+        "profile.update",
+        id,
+        before_summary,
+        after_summary,
+    )
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(Json(response))
 }
 
 /// DELETE /api/admin/profiles/:id
 pub async fn delete_profile(
+    identity: Option<axum::Extension<AuthIdentity>>,
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Result<Json<ActionResponse>, (StatusCode, String)> {
@@ -477,6 +518,10 @@ pub async fn delete_profile(
         return Err((StatusCode::NOT_FOUND, format!("profile '{id}' not found")));
     }
 
+    let before_summary = profile
+        .as_ref()
+        .and_then(|profile| super::admin_audit::summary_value(&mask_secrets(profile)));
+
     // Clean up data directory
     if let Some(profile) = profile {
         let data_dir = store.resolve_data_dir(&profile);
@@ -488,6 +533,15 @@ pub async fn delete_profile(
     }
 
     tracing::info!(profile = %id, "profile deleted");
+    super::admin_audit::record_admin_action(
+        &state,
+        identity.as_ref().map(|identity| &identity.0),
+        "profile.delete",
+        id.clone(),
+        before_summary,
+        None,
+    )
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     Ok(Json(ActionResponse {
         ok: true,
         message: Some(format!("profile '{id}' deleted")),
@@ -1413,6 +1467,15 @@ pub(crate) fn validate_channel_credentials(
                     return Err("Feishu channel: app_id_env must be non-empty".into());
                 }
             }
+            ChannelCredentials::DingTalk {
+                webhook_url_env,
+                secret_env,
+                ..
+            } if webhook_url_env.is_empty() && secret_env.is_empty() => {
+                return Err(
+                    "DingTalk channel: webhook_url_env or secret_env must be non-empty".into(),
+                );
+            }
             _ => {}
         }
     }
@@ -1958,12 +2021,27 @@ pub struct ProfileMonitorUpdateRequest {
 
 /// POST /api/admin/monitor/watchdog — toggle watchdog.
 pub async fn toggle_watchdog(
+    identity: Option<axum::Extension<AuthIdentity>>,
     State(state): State<Arc<AppState>>,
     Json(req): Json<MonitorToggleRequest>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
+    let before = state
+        .watchdog_enabled
+        .as_ref()
+        .map(|flag| flag.load(std::sync::atomic::Ordering::Relaxed))
+        .unwrap_or(false);
     if let Some(ref flag) = state.watchdog_enabled {
         flag.store(req.enabled, std::sync::atomic::Ordering::Relaxed);
     }
+    super::admin_audit::record_admin_action(
+        &state,
+        identity.as_ref().map(|identity| &identity.0),
+        "monitor.watchdog.toggle",
+        "monitor.watchdog",
+        Some(serde_json::json!({ "enabled": before })),
+        Some(serde_json::json!({ "enabled": req.enabled })),
+    )
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok(Json(
         serde_json::json!({ "ok": true, "watchdog_enabled": req.enabled }),
     ))
@@ -1971,12 +2049,27 @@ pub async fn toggle_watchdog(
 
 /// POST /api/admin/monitor/alerts — toggle alerts.
 pub async fn toggle_alerts(
+    identity: Option<axum::Extension<AuthIdentity>>,
     State(state): State<Arc<AppState>>,
     Json(req): Json<MonitorToggleRequest>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
+    let before = state
+        .alerts_enabled
+        .as_ref()
+        .map(|flag| flag.load(std::sync::atomic::Ordering::Relaxed))
+        .unwrap_or(false);
     if let Some(ref flag) = state.alerts_enabled {
         flag.store(req.enabled, std::sync::atomic::Ordering::Relaxed);
     }
+    super::admin_audit::record_admin_action(
+        &state,
+        identity.as_ref().map(|identity| &identity.0),
+        "monitor.alerts.toggle",
+        "monitor.alerts",
+        Some(serde_json::json!({ "enabled": before })),
+        Some(serde_json::json!({ "enabled": req.enabled })),
+    )
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok(Json(
         serde_json::json!({ "ok": true, "alerts_enabled": req.enabled }),
     ))
@@ -2116,21 +2209,11 @@ pub async fn remove_profile_skill(
 // ── Platform Skills ──────────────────────────────────────────────────
 
 fn ominix_api_url() -> String {
-    std::env::var("OMINIX_API_URL").unwrap_or_else(|_| "http://localhost:8080".to_string())
+    ominix_runtime::configured_api_url()
 }
 
 fn models_dir() -> std::path::PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-    std::path::PathBuf::from(std::env::var("OMINIX_MODELS_DIR").unwrap_or_else(|_| {
-        // Try both common locations
-        let p1 = format!("{home}/.ominix/models");
-        let p2 = format!("{home}/.OminiX/models");
-        if std::path::Path::new(&p1).exists() {
-            p1
-        } else {
-            p2
-        }
-    }))
+    ominix_runtime::models_dir()
 }
 
 /// GET /api/admin/platform-skills — list platform skills and their status.
@@ -2141,30 +2224,17 @@ pub async fn list_platform_skills(
         StatusCode::SERVICE_UNAVAILABLE,
         "admin not configured".into(),
     ))?;
-    let skills_dir = store.octos_home_dir().join("skills");
+    let skills_dir = store
+        .octos_home_dir()
+        .join(octos_agent::bootstrap::PLATFORM_SKILLS_DIR);
 
     // List installed platform skills
     let installed = crate::commands::skills::list_skills(&skills_dir).unwrap_or_default();
 
-    // Check ominix-api health
-    let ominix_url = ominix_api_url();
-    let health_url = format!("{}/health", ominix_url.trim_end_matches('/'));
-    let ominix_healthy = state
-        .http_client
-        .get(&health_url)
-        .timeout(std::time::Duration::from_secs(3))
-        .send()
-        .await
-        .map(|r| r.status().is_success())
-        .unwrap_or(false);
-
-    // Check launchd service status
-    let service_status = tokio::process::Command::new("launchctl")
-        .args(["list", "io.ominix.ominix-api"])
-        .output()
-        .await
-        .map(|o| o.status.success())
-        .unwrap_or(false);
+    let ominix_runtime = ominix_runtime::runtime_status(&state.http_client).await;
+    let ominix_url = ominix_runtime.url.clone();
+    let ominix_healthy = ominix_runtime.health.healthy;
+    let service_status = ominix_runtime.service_registered;
 
     // Check models against platform allowlist
     let mdir = models_dir();
@@ -2200,12 +2270,142 @@ pub async fn list_platform_skills(
             "url": ominix_url,
             "healthy": ominix_healthy,
             "service_registered": service_status,
+            "runtime": ominix_runtime,
         },
         "models": {
             "dir": mdir.display().to_string(),
             "asr": asr_models,
             "tts": tts_models,
         }
+    })))
+}
+
+/// GET /api/admin/platform-skills/ominix-api/runtime — detailed runtime status.
+pub async fn platform_runtime_status(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let status = ominix_runtime::runtime_status(&state.http_client).await;
+    Ok(Json(serde_json::to_value(status).unwrap_or_default()))
+}
+
+/// POST /api/admin/platform-skills/ominix-api/repair — repair local OMiniX runtime.
+pub async fn platform_runtime_repair(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let response = ominix_runtime::repair_runtime(&state.http_client)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    Ok(Json(serde_json::to_value(response).unwrap_or_default()))
+}
+
+/// POST /api/admin/platform-skills/ominix-api/install — install or repair local OMiniX runtime.
+pub async fn platform_runtime_install(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let response = ominix_runtime::install_runtime(&state.http_client)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    Ok(Json(serde_json::to_value(response).unwrap_or_default()))
+}
+
+/// POST /api/admin/platform-skills/ominix-api/bootstrap — install API and prepare core voice models.
+pub async fn platform_runtime_bootstrap(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let store = state.profile_store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "admin not configured".into(),
+    ))?;
+    let octos_home = store.octos_home_dir();
+    let mut actions = Vec::new();
+
+    let mut allowlist = octos_llm::ominix::PlatformModels::load_or_create(octos_home);
+    for (model_id, role) in ominix_runtime::DEFAULT_VOICE_MODELS {
+        if allowlist.find(model_id).is_none() {
+            allowlist
+                .platform_models
+                .push(octos_llm::ominix::PlatformModel {
+                    id: (*model_id).to_string(),
+                    role: (*role).to_string(),
+                });
+            actions.push(format!("enabled {model_id} for {role}"));
+        }
+    }
+    allowlist.save(octos_home).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to save platform model allowlist: {e}"),
+        )
+    })?;
+
+    let install_response = ominix_runtime::install_runtime(&state.http_client)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    actions.extend(install_response.actions.iter().cloned());
+
+    if !install_response.status.health.healthy {
+        return Ok(Json(serde_json::json!({
+            "ok": false,
+            "message": "OMiniX API could not be started; voice models were not downloaded",
+            "status": install_response.status,
+            "runtime": install_response,
+            "actions": actions,
+            "models": [],
+        })));
+    }
+
+    let catalog = fetch_ominix_catalog()
+        .await
+        .map_err(|e| (StatusCode::BAD_GATEWAY, e))?;
+    let bytes_needed = missing_default_model_bytes(&catalog);
+    if bytes_needed > 0 {
+        if let Some(free) = available_space_bytes(&models_dir()) {
+            let required = bytes_needed.saturating_add(MODEL_BOOTSTRAP_SPACE_MARGIN_BYTES);
+            if free < required {
+                return Ok(Json(serde_json::json!({
+                    "ok": false,
+                    "message": format!(
+                        "Not enough disk space for core voice models: need about {}, available {}",
+                        human_bytes(required),
+                        human_bytes(free)
+                    ),
+                    "status": install_response.status,
+                    "runtime": install_response,
+                    "actions": actions,
+                    "models": [],
+                })));
+            }
+        }
+    }
+
+    let mut model_results = Vec::new();
+    for (model_id, role) in ominix_runtime::DEFAULT_VOICE_MODELS {
+        let result = bootstrap_voice_model(&state, model_id, role)
+            .await
+            .map_err(|e| (StatusCode::BAD_GATEWAY, e))?;
+        actions.push(format!(
+            "{} {} ({}) -> {}",
+            result.action, result.id, result.role, result.status_after
+        ));
+        model_results.push(result);
+    }
+
+    let final_status = ominix_runtime::runtime_status(&state.http_client).await;
+    let models_ready = model_results.iter().all(|model| model.ready);
+    let ok = final_status.health.healthy && models_ready;
+    let message = if ok {
+        "OMiniX API and core voice models are ready".to_string()
+    } else {
+        "OMiniX API bootstrap completed, but some voice models are not ready".to_string()
+    };
+
+    Ok(Json(serde_json::json!({
+        "ok": ok,
+        "message": message,
+        "actions": actions,
+        "status": final_status,
+        "models_ready": models_ready,
+        "models": model_results,
     })))
 }
 
@@ -2242,7 +2442,9 @@ pub async fn remove_platform_skill(
         StatusCode::SERVICE_UNAVAILABLE,
         "admin not configured".into(),
     ))?;
-    let skills_dir = store.octos_home_dir().join("skills");
+    let skills_dir = store
+        .octos_home_dir()
+        .join(octos_agent::bootstrap::PLATFORM_SKILLS_DIR);
 
     // Defer to spawn_blocking so remove_skill's internal current-thread
     // tokio runtime doesn't try to construct inside the axum runtime
@@ -2268,32 +2470,21 @@ pub async fn platform_skill_health(
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     match name.as_str() {
         "voice" | "asr" | "ominix-api" => {
-            let url = ominix_api_url();
-            let health_url = format!("{}/health", url.trim_end_matches('/'));
-            let result = state
-                .http_client
-                .get(&health_url)
-                .timeout(std::time::Duration::from_secs(5))
-                .send()
-                .await;
-
-            let (status, detail) = match result {
-                Ok(resp) if resp.status().is_success() => {
-                    let body: serde_json::Value = resp.json().await.unwrap_or_default();
-                    ("healthy", body)
-                }
-                Ok(resp) => (
-                    "error",
-                    serde_json::json!({"http_status": resp.status().as_u16()}),
-                ),
-                Err(e) => ("unreachable", serde_json::json!({"error": e.to_string()})),
+            let runtime = ominix_runtime::runtime_status(&state.http_client).await;
+            let status = if runtime.health.healthy {
+                "healthy"
+            } else if runtime.can_repair {
+                "repairable"
+            } else {
+                "unreachable"
             };
 
             Ok(Json(serde_json::json!({
                 "name": name,
                 "status": status,
-                "url": url,
-                "detail": detail,
+                "url": runtime.url,
+                "detail": runtime.health,
+                "runtime": runtime,
             })))
         }
         _ => Err((
@@ -2303,93 +2494,34 @@ pub async fn platform_skill_health(
     }
 }
 
-const OMINIX_PLIST: &str = "io.ominix.ominix-api";
-
 /// POST /api/admin/platform-skills/ominix-api/start
-pub async fn platform_service_start() -> Result<Json<ActionResponse>, (StatusCode, String)> {
-    let plist_path = format!(
-        "{}/Library/LaunchAgents/{OMINIX_PLIST}.plist",
-        std::env::var("HOME").unwrap_or_default()
-    );
-    let output = tokio::process::Command::new("launchctl")
-        .args(["load", &plist_path])
-        .output()
+pub async fn platform_service_start(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let response = ominix_runtime::service_start(&state.http_client)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-    if output.status.success() {
-        Ok(Json(ActionResponse {
-            ok: true,
-            message: Some("ominix-api service started".into()),
-        }))
-    } else {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        Ok(Json(ActionResponse {
-            ok: false,
-            message: Some(format!("launchctl load failed: {stderr}")),
-        }))
-    }
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    Ok(Json(serde_json::to_value(response).unwrap_or_default()))
 }
 
 /// POST /api/admin/platform-skills/ominix-api/stop
-pub async fn platform_service_stop() -> Result<Json<ActionResponse>, (StatusCode, String)> {
-    let plist_path = format!(
-        "{}/Library/LaunchAgents/{OMINIX_PLIST}.plist",
-        std::env::var("HOME").unwrap_or_default()
-    );
-    let output = tokio::process::Command::new("launchctl")
-        .args(["unload", &plist_path])
-        .output()
+pub async fn platform_service_stop(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let response = ominix_runtime::service_stop(&state.http_client)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-    if output.status.success() {
-        Ok(Json(ActionResponse {
-            ok: true,
-            message: Some("ominix-api service stopped".into()),
-        }))
-    } else {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        Ok(Json(ActionResponse {
-            ok: false,
-            message: Some(format!("launchctl unload failed: {stderr}")),
-        }))
-    }
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    Ok(Json(serde_json::to_value(response).unwrap_or_default()))
 }
 
 /// POST /api/admin/platform-skills/ominix-api/restart
-pub async fn platform_service_restart() -> Result<Json<ActionResponse>, (StatusCode, String)> {
-    let plist_path = format!(
-        "{}/Library/LaunchAgents/{OMINIX_PLIST}.plist",
-        std::env::var("HOME").unwrap_or_default()
-    );
-    // Unload
-    let _ = tokio::process::Command::new("launchctl")
-        .args(["unload", &plist_path])
-        .output()
-        .await;
-
-    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-
-    // Load
-    let output = tokio::process::Command::new("launchctl")
-        .args(["load", &plist_path])
-        .output()
+pub async fn platform_service_restart(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let response = ominix_runtime::service_restart(&state.http_client)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-    if output.status.success() {
-        Ok(Json(ActionResponse {
-            ok: true,
-            message: Some("ominix-api service restarted".into()),
-        }))
-    } else {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        Ok(Json(ActionResponse {
-            ok: false,
-            message: Some(format!("Restart failed: {stderr}")),
-        }))
-    }
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    Ok(Json(serde_json::to_value(response).unwrap_or_default()))
 }
 
 /// GET /api/admin/platform-skills/ominix-api/logs
@@ -2436,6 +2568,150 @@ pub async fn platform_service_logs(
 }
 
 // ── Model Management (proxy to ominix-api) ─────────────────────────
+
+async fn fetch_ominix_catalog() -> Result<Vec<octos_llm::ominix::CatalogModel>, String> {
+    octos_llm::ominix::OminixClient::new(&ominix_api_url())
+        .fetch_catalog()
+        .await
+        .map_err(|e| format!("Failed to fetch ominix-api catalog: {e}"))
+}
+
+fn catalog_model<'a>(
+    catalog: &'a [octos_llm::ominix::CatalogModel],
+    model_id: &str,
+) -> Option<&'a octos_llm::ominix::CatalogModel> {
+    catalog.iter().find(|model| model.id == model_id)
+}
+
+fn catalog_status(catalog: &[octos_llm::ominix::CatalogModel], model_id: &str) -> String {
+    catalog_model(catalog, model_id)
+        .map(|model| model.status.clone())
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+fn missing_default_model_bytes(catalog: &[octos_llm::ominix::CatalogModel]) -> u64 {
+    ominix_runtime::DEFAULT_VOICE_MODELS
+        .iter()
+        .filter_map(|(model_id, _)| {
+            let model = catalog_model(catalog, model_id)?;
+            if ominix_runtime::is_ready_model_status(&model.status) {
+                None
+            } else {
+                model.storage.total_size_bytes
+            }
+        })
+        .sum()
+}
+
+async fn bootstrap_voice_model(
+    state: &Arc<AppState>,
+    model_id: &str,
+    role: &str,
+) -> Result<OminixModelBootstrapResult, String> {
+    let catalog = fetch_ominix_catalog().await?;
+    let before_status = catalog_status(&catalog, model_id);
+    let size = catalog_model(&catalog, model_id)
+        .and_then(|model| model.storage.total_size_display.clone());
+
+    if ominix_runtime::is_ready_model_status(&before_status) {
+        return Ok(OminixModelBootstrapResult {
+            id: model_id.to_string(),
+            role: role.to_string(),
+            ready: true,
+            action: "kept".to_string(),
+            status_before: before_status.clone(),
+            status_after: before_status,
+            size,
+            message: Some("already ready".to_string()),
+        });
+    }
+
+    let url = format!(
+        "{}/v1/models/download",
+        ominix_api_url().trim_end_matches('/')
+    );
+    let response = state
+        .http_client
+        .post(&url)
+        .json(&serde_json::json!({ "model_id": model_id }))
+        .timeout(MODEL_BOOTSTRAP_TIMEOUT)
+        .send()
+        .await
+        .map_err(|e| format!("ominix-api download request failed for {model_id}: {e}"))?;
+
+    let status = response.status();
+    let response_text = response.text().await.unwrap_or_default();
+    let mut message = if response_text.trim().is_empty() {
+        None
+    } else {
+        Some(response_text.clone())
+    };
+    if !(status.is_success() || status == StatusCode::CONFLICT) {
+        return Ok(OminixModelBootstrapResult {
+            id: model_id.to_string(),
+            role: role.to_string(),
+            ready: false,
+            action: "download_failed".to_string(),
+            status_before: before_status,
+            status_after: "unknown".to_string(),
+            size,
+            message,
+        });
+    }
+    if status == StatusCode::CONFLICT && message.is_none() {
+        message = Some("already downloaded".to_string());
+    }
+
+    let refreshed = fetch_ominix_catalog().await?;
+    let after_status = catalog_status(&refreshed, model_id);
+    let ready = ominix_runtime::is_ready_model_status(&after_status);
+    Ok(OminixModelBootstrapResult {
+        id: model_id.to_string(),
+        role: role.to_string(),
+        ready,
+        action: if ready {
+            "downloaded".to_string()
+        } else {
+            "download_requested".to_string()
+        },
+        status_before: before_status,
+        status_after: after_status,
+        size,
+        message,
+    })
+}
+
+fn available_space_bytes(path: &std::path::Path) -> Option<u64> {
+    let target = if path.exists() {
+        path
+    } else {
+        path.parent().unwrap_or_else(|| std::path::Path::new("/"))
+    };
+    let output = std::process::Command::new("df")
+        .args(["-Pk", &target.display().to_string()])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let line = stdout.lines().nth(1)?;
+    let available_kib = line.split_whitespace().nth(3)?.parse::<u64>().ok()?;
+    Some(available_kib.saturating_mul(1024))
+}
+
+fn human_bytes(bytes: u64) -> String {
+    const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
+    const MIB: f64 = 1024.0 * 1024.0;
+    let bytes_f = bytes as f64;
+    if bytes_f >= GIB {
+        format!("{:.1} GiB", bytes_f / GIB)
+    } else if bytes_f >= MIB {
+        format!("{:.0} MiB", bytes_f / MIB)
+    } else {
+        format!("{bytes} B")
+    }
+}
 
 /// GET /api/admin/platform-skills/ominix-api/models — list platform models
 ///
@@ -2531,7 +2807,7 @@ pub async fn platform_models_download(
         .http_client
         .post(&url)
         .json(&download_body)
-        .timeout(std::time::Duration::from_secs(30))
+        .timeout(MODEL_BOOTSTRAP_TIMEOUT)
         .send()
         .await
         .map_err(|e| {
@@ -3190,6 +3466,7 @@ pub async fn config_check(
         .map(|c| match c {
             crate::profiles::ChannelCredentials::Telegram { .. } => "telegram",
             crate::profiles::ChannelCredentials::Discord { .. } => "discord",
+            crate::profiles::ChannelCredentials::DingTalk { .. } => "dingtalk",
             crate::profiles::ChannelCredentials::Slack { .. } => "slack",
             crate::profiles::ChannelCredentials::WhatsApp { .. } => "whatsapp",
             crate::profiles::ChannelCredentials::Feishu { .. } => "feishu",
@@ -3330,6 +3607,14 @@ fn collect_env_var_refs(config: &ProfileConfig) -> Vec<EnvVarReferenceStatus> {
             }
             crate::profiles::ChannelCredentials::Discord { token_env, .. } => {
                 insert_ref(token_env, "channels");
+            }
+            crate::profiles::ChannelCredentials::DingTalk {
+                webhook_url_env,
+                secret_env,
+                ..
+            } => {
+                insert_ref(webhook_url_env, "channels");
+                insert_ref(secret_env, "channels");
             }
             crate::profiles::ChannelCredentials::Slack {
                 bot_token_env,

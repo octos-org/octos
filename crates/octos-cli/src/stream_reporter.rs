@@ -94,6 +94,17 @@ impl ProgressReporter for ChannelStreamReporter {
             ProgressEvent::StreamChunk { text, iteration } => {
                 StreamProgressEvent::Chunk { text, iteration }
             }
+            ProgressEvent::ReasoningChunk { text, iteration } => {
+                let mut payload = serde_json::json!({
+                    "type": "reasoning_chunk",
+                    "text": text,
+                    "iteration": iteration,
+                });
+                inject_thread_id(&mut payload, thread_id);
+                StreamProgressEvent::RawSse {
+                    json: payload.to_string(),
+                }
+            }
             ProgressEvent::StreamDone { iteration } => {
                 StreamProgressEvent::StreamDone { iteration }
             }
@@ -177,6 +188,7 @@ impl ProgressReporter for ChannelStreamReporter {
                 session_output_tokens,
                 session_cost,
                 model,
+                context_window,
                 ..
             } => {
                 // Codex round-1 P2: every wire-shape mapper for
@@ -194,6 +206,12 @@ impl ProgressReporter for ChannelStreamReporter {
                 });
                 if let Some(model) = model.as_deref() {
                     payload["model"] = serde_json::Value::String(model.to_string());
+                }
+                // Carry the context window too so channel/web clients on this
+                // path render an honest ctx gauge, matching the BoundedChannel
+                // (`event_to_json`) path.
+                if let Some(window) = context_window {
+                    payload["context_window"] = serde_json::json!(window);
                 }
                 inject_thread_id(&mut payload, thread_id);
                 StreamProgressEvent::RawSse {
@@ -962,12 +980,17 @@ mod tests {
             content: "answer".into(),
             iteration: 1,
         });
+        reporter.report(ProgressEvent::ReasoningChunk {
+            text: "thinking".into(),
+            iteration: 1,
+        });
         reporter.report(ProgressEvent::CostUpdate {
             session_input_tokens: 10,
             session_output_tokens: 20,
             response_cost: None,
             session_cost: None,
             model: None,
+            context_window: None,
         });
 
         let mut raw_payloads: Vec<String> = Vec::new();
@@ -978,11 +1001,11 @@ mod tests {
         }
 
         // ToolStarted, ToolCompleted, ToolProgress emit RawSse + a typed
-        // mapped event each, so 6 reports → 6 RawSse JSON payloads.
+        // mapped event each, so 7 reports → 7 RawSse JSON payloads.
         assert_eq!(
             raw_payloads.len(),
-            6,
-            "expected 6 RawSse payloads, got {}: {:?}",
+            7,
+            "expected 7 RawSse payloads, got {}: {:?}",
             raw_payloads.len(),
             raw_payloads
         );
@@ -1016,6 +1039,7 @@ mod tests {
             response_cost: None,
             session_cost: None,
             model: Some("deepseek-v4-pro".into()),
+            context_window: None,
         });
 
         let StreamProgressEvent::RawSse { json } = rx.try_recv().unwrap() else {
@@ -1024,6 +1048,33 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed["type"], "cost_update");
         assert_eq!(parsed["model"], "deepseek-v4-pro");
+    }
+
+    /// The channel-stream path must also carry the model context window so
+    /// channel/web clients render an honest ctx gauge, matching the
+    /// BoundedChannel (`event_to_json`) path.
+    #[test]
+    fn cost_update_carries_context_window_into_raw_sse_payload() {
+        use octos_agent::progress::ProgressEvent;
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let reporter = ChannelStreamReporter::new(tx);
+
+        reporter.report(ProgressEvent::CostUpdate {
+            session_input_tokens: 12,
+            session_output_tokens: 7,
+            response_cost: None,
+            session_cost: None,
+            model: None,
+            context_window: Some(131_072),
+        });
+
+        let StreamProgressEvent::RawSse { json } = rx.try_recv().unwrap() else {
+            panic!("expected RawSse for CostUpdate");
+        };
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["type"], "cost_update");
+        assert_eq!(parsed["context_window"], 131_072);
     }
 
     /// Symmetric to the test above: a `CostUpdate` without `model`
@@ -1043,6 +1094,7 @@ mod tests {
             response_cost: None,
             session_cost: None,
             model: None,
+            context_window: None,
         });
 
         let StreamProgressEvent::RawSse { json } = rx.try_recv().unwrap() else {

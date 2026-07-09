@@ -96,6 +96,7 @@ test_a2.md
 !docs/OCTOS_HARNESS_ABI_VERSIONING.md
 !docs/OCTOS_HARNESS_M4_WORKSTREAMS_2026-04-21.md
 !docs/OCTOS_HARNESS_M4_1A_LIVE_GATE.md
+!docs/OCTOS_SWARM_M7_LIVE_GATE.md
 !docs/OCTOS_HARNESS_SKILL_COMPAT.md
 !docs/SANDBOX.md
 !docs/SECURITY_ARCHITECTURE.md
@@ -159,3 +160,10 @@ test_a2.md
 !e2e/fixtures/compat-test-skill/main
 tsconfig.tsbuildinfo
 .superpowers/
+.claude/scheduled_tasks.lock
+
+# Runtime data dirs accidentally committed once (#200) — never track
+.crew/
+**/.crew/
+# Stray Astro scaffold guard (no Astro project in this repo)
+.astro/

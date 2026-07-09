@@ -51,7 +51,7 @@ fn octos_server_spec() -> ProductSpec {
         "octos-bundle",            // asset prefix → octos-bundle-<triple>
     )
     .with_github_token_env("OCTOS_GITHUB_TOKEN")
-    .with_brew_formula("octos-org/tap/octos")
+    .with_brew_formula("octos-org/octos/octos")
     .with_npm_package("@octos-org/octos")
     .with_cargo_install("octos-cli")
     .with_cargo_dist_app("octos")
@@ -223,11 +223,11 @@ mod tests {
     #[test]
     fn defer_to_package_manager_exits_ten_and_prints_cmd() {
         let plan = UpdatePlan::DeferToPackageManager {
-            cmd: "brew upgrade octos-org/tap/octos".into(),
+            cmd: "brew upgrade octos-org/octos/octos".into(),
         };
         let (text, _json, code) = render_check(&plan, &InstallMethod::Homebrew, &spec());
         assert_eq!(code, EXIT_UPDATE_AVAILABLE);
-        assert!(text.contains("brew upgrade octos-org/tap/octos"));
+        assert!(text.contains("brew upgrade octos-org/octos/octos"));
     }
 
     #[test]

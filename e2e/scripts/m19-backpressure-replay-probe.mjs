@@ -55,6 +55,58 @@ function writeJson(file, value) {
   fs.writeFileSync(file, `${JSON.stringify(value, null, 2)}\n`, 'utf8');
 }
 
+function readOptionalText(file) {
+  try {
+    return { ok: true, text: fs.readFileSync(file, 'utf8') };
+  } catch (error) {
+    return { ok: false, error: error.message };
+  }
+}
+
+function forcedTerminalDropEvidence(artifactDir) {
+  const serverLog = readOptionalText(path.join(artifactDir, 'server.log'));
+  if (!serverLog.ok) {
+    return {
+      server_log_path: path.join(artifactDir, 'server.log'),
+      server_log_detected: false,
+      error: serverLog.error,
+    };
+  }
+  const text = serverLog.text;
+  const forcedFixture = /forced turn\/completed writer channel full fixture/.test(text);
+  const lifecycleFailure = /lifecycle notification not delivered/.test(text);
+  const writerFull = /writer channel full for lifecycle frame turn\/completed/.test(text);
+  return {
+    server_log_path: path.join(artifactDir, 'server.log'),
+    server_log_detected: forcedFixture && lifecycleFailure && writerFull,
+    forced_fixture_log: forcedFixture,
+    lifecycle_delivery_failed_log: lifecycleFailure,
+    writer_channel_terminal_drop_log: writerFull,
+  };
+}
+
+function isTurnCompletedEnvelope(frame, turnId) {
+  return frame?.method === 'projection/envelope'
+    && frame.params?.thread_id === turnId
+    && frame.params?.payload?.type === 'turn_completed';
+}
+
+function terminalReport(frame) {
+  if (frame?.method === 'projection/envelope') {
+    return {
+      method: 'projection/envelope',
+      legacy_equivalent: 'turn/completed',
+      payload_type: frame.params?.payload?.type,
+      thread_id: frame.params?.thread_id,
+      params: frame.params || {},
+    };
+  }
+  return {
+    method: frame?.method,
+    params: frame?.params || {},
+  };
+}
+
 class RpcFailure extends Error {
   constructor(message, error) {
     super(message);
@@ -295,18 +347,29 @@ async function main() {
     const terminal = await Promise.race([
       client.waitForNotification('turn/completed', (frame) => frame.params?.turn_id === turnId),
       client.waitForNotification('turn/error', (frame) => frame.params?.turn_id === turnId),
+      client.waitForNotification('projection/envelope', (frame) => isTurnCompletedEnvelope(frame, turnId)),
     ]);
     const snapshot = await client.request('session/snapshot', {
       session_id: sessionId,
       profile_id: profileId,
     });
     const notifications = client.notifications.slice(before);
+    const forcedTerminalDrop = forcedTerminalDropEvidence(artifactDir);
+    assert(
+      forcedTerminalDrop.server_log_detected,
+      'server.log did not prove a forced turn/completed writer-channel drop',
+    );
 
     writeJson(reportPath, {
       schema: 'octos.ux.backpressure_report.v1',
       generated_at: new Date().toISOString(),
       scenario_id: 'dropped-completion-backpressure',
-      coverage: 'fixture-backed protocol/replay_lossy recovery; does not force a real dropped turn/completed writer-channel failure',
+      coverage: {
+        true_dropped_turn_completed: true,
+        terminal_drop_forced: true,
+        writer_channel_turn_completed_drop: true,
+        protocol_replay_lossy_probe: true,
+      },
       endpoint,
       session_id: sessionId,
       profile_id: profileId,
@@ -329,10 +392,8 @@ async function main() {
         has_last_durable_cursor: Boolean(replayLossy.params?.last_durable_cursor),
         params: replayLossy.params || {},
       },
-      terminal: {
-        method: terminal.method,
-        params: terminal.params || {},
-      },
+      terminal: terminalReport(terminal),
+      forced_terminal_drop: forcedTerminalDrop,
       observed_methods: notifications.map((frame) => frame.method),
       snapshot,
     });

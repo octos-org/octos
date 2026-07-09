@@ -12,6 +12,7 @@ use tower_http::trace::TraceLayer;
 
 use super::AppState;
 use super::admin;
+use super::admin_audit;
 use super::admin_setup;
 use super::auth_handlers;
 use super::bilibili;
@@ -20,10 +21,12 @@ use super::frps_plugin;
 use super::handlers;
 use super::metrics;
 use super::purge;
+use super::session_ingress;
 use super::solo_auth;
 use super::static_files;
 use super::swarm as swarm_api;
 use super::ui_protocol;
+use super::usage;
 use super::user_admin;
 use super::webhook_proxy;
 use crate::user_store::UserRole;
@@ -206,6 +209,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
     let my_api = Router::new()
         .route("/api/my/profile", get(auth_handlers::my_profile))
         .route("/api/my/profile", put(auth_handlers::update_my_profile))
+        .route("/api/my/profile/qr", get(auth_handlers::my_profile_qr))
         // Reply-voice selection: list synthesizable voices + set this user's
         // sticky default. Both need the caller's identity, so they live in the
         // authenticated `my_api` group.
@@ -277,6 +281,11 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             "/api/my/profile/metrics",
             get(auth_handlers::my_provider_metrics),
         )
+        .route("/api/my/usage", get(usage::my_usage))
+        .route(
+            "/api/my/usage/sessions/{session_id}",
+            get(usage::my_session_usage),
+        )
         .route(
             "/api/my/profile/skills",
             get(auth_handlers::my_profile_skills),
@@ -346,6 +355,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
     let admin_api = Router::new()
         .layer(DefaultBodyLimit::max(1024 * 1024))
         .route("/api/admin/overview", get(admin::overview))
+        .route("/api/admin/audit", get(admin_audit::list_audit))
         .route("/api/admin/profiles", get(admin::list_profiles))
         .route("/api/admin/profiles", post(admin::create_profile))
         .route("/api/admin/profiles/{id}", get(admin::get_profile))
@@ -373,6 +383,15 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route(
             "/api/admin/profiles/{id}/metrics",
             get(admin::provider_metrics),
+        )
+        .route("/api/admin/usage", get(usage::admin_usage))
+        .route(
+            "/api/admin/profiles/{id}/usage",
+            get(usage::admin_profile_usage),
+        )
+        .route(
+            "/api/admin/profiles/{id}/usage/sessions/{session_id}",
+            get(usage::admin_profile_session_usage),
         )
         .route(
             "/api/admin/profiles/{id}/whatsapp/qr",
@@ -444,7 +463,10 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         )
         // User management
         .route("/api/admin/users", get(user_admin::list_users))
-        .route("/api/admin/users/{id}", delete(user_admin::delete_user))
+        .route(
+            "/api/admin/users/{id}",
+            delete(user_admin::delete_user).patch(user_admin::update_user),
+        )
         .route(
             "/api/admin/allowed-emails",
             get(user_admin::list_allowed_emails),
@@ -483,6 +505,25 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             "/api/admin/monitor/profiles/{id}",
             post(admin::update_profile_monitor),
         )
+        // OMiniX runtime installer/repair aliases. Kept outside the
+        // platform-skills dynamic segment so the repair UI has a stable
+        // orchestration endpoint.
+        .route(
+            "/api/admin/ominix/runtime",
+            get(admin::platform_runtime_status),
+        )
+        .route(
+            "/api/admin/ominix/repair",
+            post(admin::platform_runtime_repair),
+        )
+        .route(
+            "/api/admin/ominix/install",
+            post(admin::platform_runtime_install),
+        )
+        .route(
+            "/api/admin/ominix/bootstrap",
+            post(admin::platform_runtime_bootstrap),
+        )
         // Platform skills management
         .route(
             "/api/admin/platform-skills",
@@ -516,6 +557,22 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route(
             "/api/admin/platform-skills/ominix-api/logs",
             get(admin::platform_service_logs),
+        )
+        .route(
+            "/api/admin/platform-skills/ominix-api/runtime",
+            get(admin::platform_runtime_status),
+        )
+        .route(
+            "/api/admin/platform-skills/ominix-api/repair",
+            post(admin::platform_runtime_repair),
+        )
+        .route(
+            "/api/admin/platform-skills/ominix-api/install",
+            post(admin::platform_runtime_install),
+        )
+        .route(
+            "/api/admin/platform-skills/ominix-api/bootstrap",
+            post(admin::platform_runtime_bootstrap),
         )
         // Model management (proxy to ominix-api)
         .route(
@@ -617,6 +674,10 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             post(webhook_proxy::line_webhook_proxy),
         )
         .route(
+            "/webhook/dingtalk/{profile_id}",
+            post(webhook_proxy::dingtalk_webhook_proxy),
+        )
+        .route(
             "/webhook/twilio/{profile_id}",
             post(webhook_proxy::twilio_webhook_proxy),
         );
@@ -675,6 +736,10 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route(
             "/api/preview-signed/{token}/{*path}",
             get(handlers::serve_signed_preview),
+        )
+        .route(
+            "/v1/session_ingress/ws/{session_id}",
+            get(session_ingress::ws_handler),
         )
         .merge(webhook_routes)
         .merge(version_routes)

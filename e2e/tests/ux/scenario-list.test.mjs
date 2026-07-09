@@ -28,7 +28,7 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 const REPO_ROOT = resolve(__dirname, "..", "..", "..");
 const MANIFEST = resolve(REPO_ROOT, "e2e", "matrix", "octos-ux.toml");
-const CAPABILITY_GATE = resolve(REPO_ROOT, "e2e", "matrix", "ux-capabilities.json");
+const CAPABILITIES = resolve(REPO_ROOT, "e2e", "matrix", "ux-capabilities.json");
 const CLI = resolve(REPO_ROOT, "e2e", "scripts", "ux-scenario-list.mjs");
 
 const EXPECTED_IDS = [
@@ -66,8 +66,8 @@ function makeEnv({
   };
 }
 
-function loadCapabilityGate() {
-  const parsed = JSON.parse(readFileSync(CAPABILITY_GATE, "utf8"));
+function checkedInCapabilities() {
+  const parsed = JSON.parse(readFileSync(CAPABILITIES, "utf8"));
   assert.equal(parsed.schema, "octos.ux.capabilities.v1");
   assert.ok(Array.isArray(parsed.capabilities));
   return new Set(parsed.capabilities);
@@ -222,9 +222,44 @@ test("classifyRunnability reports blocked when capability missing", () => {
   assert.ok(r.reasons.length > 0);
 });
 
+test("checked-in capability gate makes validated M19 lanes runnable", () => {
+  const manifest = loadManifest({ path: MANIFEST });
+  const env = makeEnv({ capabilities: checkedInCapabilities() });
+  for (const id of [
+    "tui-solo-onboarding",
+    "provider-missing-recoverable",
+    "permission-selection",
+    "stdio-happy-path",
+    "websocket-happy-path",
+    "approval-denial",
+    "narrow-layout",
+    "restart-reconnect",
+  ]) {
+    const scenario = manifest.scenarios.find((s) => s.id === id);
+    assert.ok(scenario, `missing scenario ${id}`);
+    const r = classifyRunnability(scenario, env);
+    assert.equal(r.status, "runnable", `${id}: ${r.reasons.join("; ")}`);
+  }
+});
+
+test("checked-in capability gate leaves unproven M19 lanes blocked", () => {
+  const manifest = loadManifest({ path: MANIFEST });
+  const env = makeEnv({ capabilities: checkedInCapabilities() });
+  for (const id of [
+    "task-subagent-tree",
+    "dropped-completion-backpressure",
+  ]) {
+    const scenario = manifest.scenarios.find((s) => s.id === id);
+    assert.ok(scenario, `missing scenario ${id}`);
+    const r = classifyRunnability(scenario, env);
+    assert.equal(r.status, "blocked", `${id} should stay blocked until validated`);
+    assert.ok(r.reasons.length > 0);
+  }
+});
+
 test("capability gate promotes restart-reconnect without promoting task-subagent-tree", () => {
   const manifest = loadManifest({ path: MANIFEST });
-  const capabilities = loadCapabilityGate();
+  const capabilities = checkedInCapabilities();
   const restartReconnect = manifest.scenarios.find((s) => s.id === "restart-reconnect");
   const taskSubagentTree = manifest.scenarios.find((s) => s.id === "task-subagent-tree");
 

@@ -3,20 +3,51 @@
 use std::path::Path;
 
 use octos_agent::SkillsLoader;
-use octos_memory::MemoryStore;
 
 use crate::persona_service::PersonaService;
 
 /// Build the system prompt with bootstrap files, memory context, and skills.
 ///
+/// `max_inject_tokens` caps the injected memory block (long-term memory +
+/// daily notes + bank summary combined); use
+/// [`crate::config::MemoryConfig::effective_max_inject_tokens`] to resolve it
+/// from config.
+// These are the cohesive set of bootstrap inputs a system prompt is composed
+// from (persona base, data/project dirs, memory + skills sources, and the two
+// resolved memory knobs); they don't group into a smaller, meaningful sub-type,
+// so the arg count is expected here.
+#[allow(clippy::too_many_arguments)]
+/// The base system prompt split at the memory slot. Memory is injected as
+/// a NAMED per-agent prompt segment BETWEEN these halves (the pre-refactor
+/// order was `…bootstrap/soul → memory → skills/tool prefs`; keeping the
+/// slot preserves prompt precedence — persisted user memory must not
+/// override the skill/tool guidance that always followed it).
+#[derive(Debug, Clone, Default)]
+pub struct GatewayPromptParts {
+    /// Everything before the memory slot (base, date, platform, persona,
+    /// bootstrap files, soul).
+    pub pre_memory: String,
+    /// Everything after it (active skills, skills summary, tool prefs).
+    pub post_memory: String,
+}
+
+impl GatewayPromptParts {
+    /// The joined prompt WITHOUT a memory block — for read-only consumers
+    /// (length logging, tests) that don't build agents.
+    pub fn joined(&self) -> String {
+        let mut out = self.pre_memory.clone();
+        out.push_str(&self.post_memory);
+        out
+    }
+}
+
 pub async fn build_system_prompt(
     base: Option<&str>,
     data_dir: &Path,
     project_dir: &Path,
-    memory_store: &MemoryStore,
     skills_loader: &SkillsLoader,
     tool_config: &octos_agent::ToolConfigStore,
-) -> String {
+) -> GatewayPromptParts {
     let compiled = include_str!("../../prompts/gateway_default.txt");
     let runtime = super::super::load_prompt("gateway", compiled);
     let mut prompt = base.unwrap_or(&runtime).to_string();
@@ -58,19 +89,13 @@ pub async fn build_system_prompt(
         prompt.push_str(&user_soul);
     }
 
-    // Append memory context
-    let memory_ctx = memory_store.get_memory_context().await;
-    if !memory_ctx.is_empty() {
-        prompt.push_str("\n\n");
-        prompt.push_str(&memory_ctx);
-    }
-
-    // Append memory bank summary (entity abstracts)
-    let bank_summary = memory_store.get_bank_summary().await;
-    if !bank_summary.is_empty() {
-        prompt.push_str("\n\n");
-        prompt.push_str(&bank_summary);
-    }
+    // ---- memory slot ----------------------------------------------------
+    // Memory is NOT inlined here anymore: every model call flows through a
+    // per-session `octos_agent::Agent`, which owns the memory as a named
+    // prompt segment refreshed at each turn start (chat.rs pattern —
+    // fingerprint stat per turn). Inlining it in this base String froze it
+    // at build time. The split preserves the slot's POSITION.
+    let pre_memory = std::mem::take(&mut prompt);
 
     // Append always-on skills
     if let Ok(always_names) = skills_loader.get_always_skills().await {
@@ -99,13 +124,17 @@ pub async fn build_system_prompt(
         prompt.push_str(&config_summary);
     }
 
-    prompt
+    GatewayPromptParts {
+        pre_memory,
+        post_memory: prompt,
+    }
 }
 
 /// Extract a string value from channel settings JSON, with a default fallback.
 #[cfg(any(
     feature = "telegram",
     feature = "discord",
+    feature = "dingtalk",
     feature = "slack",
     feature = "whatsapp",
     feature = "email",

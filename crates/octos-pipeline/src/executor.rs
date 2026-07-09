@@ -12,7 +12,7 @@ use octos_agent::hooks::{HookContext, HookEvent, HookExecutor, HookPayload};
 use octos_agent::progress::ProgressEvent;
 use octos_agent::tools::TOOL_CTX;
 use octos_core::{Message, MessageRole, TokenUsage};
-use octos_llm::{ChatConfig, LlmProvider, ProviderRouter};
+use octos_llm::{ChatConfig, LlmProvider, ProviderRouter, SemaphoreThrottledProvider};
 use octos_memory::EpisodeStore;
 use serde::Deserialize;
 use tracing::{info, warn};
@@ -29,6 +29,7 @@ use crate::graph::{
     DeadlineAction, HandlerKind, NodeOutcome, NodeSummary, OutcomeStatus, PipelineEdge,
     PipelineGraph, PipelineNode,
 };
+use crate::guard::{GuardContext, GuardDecision, PipelineGuard};
 use crate::handler::{CodergenHandler, GateHandler, HandlerContext, HandlerRegistry, NoopHandler};
 use crate::parser::parse_dot;
 use crate::validate;
@@ -49,6 +50,9 @@ const DEFAULT_PIPELINE_PROJECTED_USD: f64 = 0.01;
 /// is empty. Chosen to match the operator rollup key used elsewhere in
 /// the harness for background pipelines.
 const DEFAULT_PIPELINE_CONTRACT_ID: &str = "pipeline";
+
+/// Default maximum number of concurrent LLM calls inside a single pipeline run.
+pub const DEFAULT_PIPELINE_MAX_CONCURRENT_LLM_CALLS: usize = 4;
 
 /// Cumulative cap on the total number of fan-out workers a single pipeline
 /// run may spawn across its lifetime. Each worker counted once at dispatch
@@ -369,6 +373,16 @@ pub struct ExecutorConfig {
     /// a small value to drive the cap path without waiting on real
     /// LLM-driven planning.
     pub max_pipeline_fanout_total: Option<usize>,
+    /// In-process hooks evaluated in registration order before each
+    /// dispatchable node. A `Skip` decision records a synthetic `Fail`
+    /// outcome for edge routing; an `Abort` decision returns the partial
+    /// pipeline result collected so far.
+    pub guards: Vec<Arc<dyn PipelineGuard>>,
+    /// Maximum number of concurrent LLM calls inside this pipeline run.
+    /// `None` defaults to [`DEFAULT_PIPELINE_MAX_CONCURRENT_LLM_CALLS`].
+    /// This pipeline-scoped semaphore prevents parallel worker retry storms
+    /// without changing global provider/router behavior.
+    pub max_concurrent_llm_calls: Option<usize>,
     /// Optional mission checkpoint store. When set, the executor:
     /// * loads the latest `PersistedCheckpoint` at the start of a run and
     ///   skips every node with id `<=` the recorded node in the pipeline's
@@ -1251,6 +1265,16 @@ fn cap_node_output_tokens_for_remaining_budget(
     );
 }
 
+fn collect_completed_files(completed: &HashMap<String, NodeOutcome>) -> Vec<PathBuf> {
+    let mut files: Vec<PathBuf> = completed
+        .values()
+        .flat_map(|outcome| outcome.files_modified.iter().cloned())
+        .collect();
+    files.sort();
+    files.dedup();
+    files
+}
+
 /// Process results from parallel worker execution, producing merged content and summaries.
 /// Aggregate outcome of a fan-out's worker futures.
 struct WorkerResults {
@@ -1536,6 +1560,22 @@ impl PipelineExecutor {
         &self.config.workspace_context
     }
 
+    fn max_concurrent_llm_calls(&self) -> usize {
+        self.config
+            .max_concurrent_llm_calls
+            .unwrap_or(DEFAULT_PIPELINE_MAX_CONCURRENT_LLM_CALLS)
+            .max(1)
+    }
+
+    fn pipeline_llm_semaphore(&self) -> Arc<tokio::sync::Semaphore> {
+        Arc::new(tokio::sync::Semaphore::new(self.max_concurrent_llm_calls()))
+    }
+
+    #[doc(hidden)]
+    pub fn max_concurrent_llm_calls_for_test(&self) -> usize {
+        self.max_concurrent_llm_calls()
+    }
+
     /// Run a pipeline from a DOT string.
     pub async fn run(
         &self,
@@ -1543,9 +1583,17 @@ impl PipelineExecutor {
         user_input: &str,
         variables: &serde_json::Map<String, serde_json::Value>,
     ) -> Result<PipelineResult> {
-        let handlers = self.build_handlers();
-        self.run_with_handlers(dot_content, user_input, variables, handlers)
-            .await
+        let llm_semaphore = self.pipeline_llm_semaphore();
+        let handlers = self.build_handlers(Some(llm_semaphore.clone()));
+        let graph = parse_dot(dot_content).wrap_err("failed to parse pipeline DOT")?;
+        self.run_graph_with_handlers_throttled(
+            graph,
+            user_input,
+            variables,
+            handlers,
+            llm_semaphore,
+        )
+        .await
     }
 
     /// Run an already-parsed [`PipelineGraph`] using the executor's default
@@ -1558,9 +1606,16 @@ impl PipelineExecutor {
         user_input: &str,
         variables: &serde_json::Map<String, serde_json::Value>,
     ) -> Result<PipelineResult> {
-        let handlers = self.build_handlers();
-        self.run_graph_with_handlers(graph, user_input, variables, handlers)
-            .await
+        let llm_semaphore = self.pipeline_llm_semaphore();
+        let handlers = self.build_handlers(Some(llm_semaphore.clone()));
+        self.run_graph_with_handlers_throttled(
+            graph,
+            user_input,
+            variables,
+            handlers,
+            llm_semaphore,
+        )
+        .await
     }
 
     /// Compile an L2 typed-IR program (see [`crate::compose`]) under `profile`
@@ -1577,9 +1632,16 @@ impl PipelineExecutor {
     ) -> Result<PipelineResult> {
         let graph = crate::compose::compose(ir_json, profile, variables)
             .map_err(|e| eyre::eyre!("IR compose failed: {e}"))?;
-        let handlers = self.build_handlers();
-        self.run_graph_with_handlers(graph, user_input, variables, handlers)
-            .await
+        let llm_semaphore = self.pipeline_llm_semaphore();
+        let handlers = self.build_handlers(Some(llm_semaphore.clone()));
+        self.run_graph_with_handlers_throttled(
+            graph,
+            user_input,
+            variables,
+            handlers,
+            llm_semaphore,
+        )
+        .await
     }
 
     /// Run a pipeline from a DOT string using a caller-supplied handler
@@ -1607,10 +1669,43 @@ impl PipelineExecutor {
     /// built, so a compiled-IR graph inherits identical gating to a DOT graph.
     pub async fn run_graph_with_handlers(
         &self,
+        graph: PipelineGraph,
+        user_input: &str,
+        variables: &serde_json::Map<String, serde_json::Value>,
+        handlers: HandlerRegistry,
+    ) -> Result<PipelineResult> {
+        // Caller supplied their own handlers (whose codergen may or may not be
+        // throttled). Mint a fresh pipeline-scoped semaphore for the planner /
+        // fan-out dispatch on the legacy `execute_graph` path so this entry
+        // still bounds concurrent LLM calls.
+        let llm_semaphore = self.pipeline_llm_semaphore();
+        self.run_graph_with_handlers_throttled(
+            graph,
+            user_input,
+            variables,
+            handlers,
+            llm_semaphore,
+        )
+        .await
+    }
+
+    /// Body of [`Self::run_graph_with_handlers`] with an explicit
+    /// pipeline-scoped LLM concurrency semaphore. The semaphore bounds the
+    /// planner / fan-out LLM dispatch on the legacy `execute_graph` path so a
+    /// parallel worker retry storm can't exceed `max_concurrent_llm_calls`
+    /// without changing global provider/router behavior. The DAG path
+    /// (`execute_graph_dag`) never runs the planner/fan-out dispatch, and its
+    /// codergen handler is already throttled via `build_codergen`. The public
+    /// [`Self::run`] / [`Self::run_graph`] / [`Self::run_ir`] entries thread
+    /// the SAME semaphore into both `build_handlers` and here so codergen and
+    /// planner LLM calls share one limit.
+    async fn run_graph_with_handlers_throttled(
+        &self,
         mut graph: PipelineGraph,
         user_input: &str,
         variables: &serde_json::Map<String, serde_json::Value>,
         handlers: HandlerRegistry,
+        llm_semaphore: Arc<tokio::sync::Semaphore>,
     ) -> Result<PipelineResult> {
         // Replace the historical pipeline-guard plugin's
         // before_tool_call hook with an in-process pass that fills
@@ -1740,6 +1835,11 @@ impl PipelineExecutor {
         // Checkpoint-backed runs stay on the legacy walk: the DAG path does not
         // build the resume skip-set or persist `node.checkpoints`, so a
         // checkpointed pipeline must not silently lose resume/persist parity.
+        //
+        // The pipeline-scoped LLM throttle is threaded into the legacy
+        // `execute_graph` (which owns the planner / fan-out dispatch). The DAG
+        // path has no planner/fan-out dispatch and reaches the LLM only through
+        // its already-throttled codergen handler, so it needs no semaphore arg.
         let dag_selected = self.dag_override.unwrap_or_else(dag_scheduler_enabled);
         let use_dag = dag_selected
             && graph_is_dag_schedulable(&graph)
@@ -1749,8 +1849,15 @@ impl PipelineExecutor {
             self.execute_graph_dag(&graph, &handlers, &start_node, user_input, variables)
                 .await
         } else {
-            self.execute_graph(&graph, &handlers, &start_node, user_input, variables)
-                .await
+            self.execute_graph(
+                &graph,
+                &handlers,
+                &start_node,
+                user_input,
+                variables,
+                llm_semaphore,
+            )
+            .await
         };
 
         // coding-blue FA-7: pipeline-terminal validators. The gate
@@ -2157,10 +2264,13 @@ impl PipelineExecutor {
     /// confirm the per-handler wiring (compaction policy + workspace).
     #[doc(hidden)]
     pub fn build_codergen_for_test(&self) -> CodergenHandler {
-        self.build_codergen()
+        self.build_codergen(Some(self.pipeline_llm_semaphore()))
     }
 
-    fn build_codergen(&self) -> CodergenHandler {
+    fn build_codergen(
+        &self,
+        llm_semaphore: Option<Arc<tokio::sync::Semaphore>>,
+    ) -> CodergenHandler {
         let mut codergen = CodergenHandler::new(
             self.config.default_provider.clone(),
             self.config.memory.clone(),
@@ -2188,6 +2298,9 @@ impl PipelineExecutor {
         if let Some(ref router) = self.config.provider_router {
             codergen = codergen.with_provider_router(router.clone());
         }
+        if let Some(semaphore) = llm_semaphore {
+            codergen = codergen.with_llm_semaphore(semaphore);
+        }
 
         let ws_ctx = &self.config.workspace_context;
         if let Some(policy) = ws_ctx.policy.as_ref() {
@@ -2201,7 +2314,10 @@ impl PipelineExecutor {
         codergen
     }
 
-    fn build_handlers(&self) -> HandlerRegistry {
+    fn build_handlers(
+        &self,
+        llm_semaphore: Option<Arc<tokio::sync::Semaphore>>,
+    ) -> HandlerRegistry {
         let mut registry = HandlerRegistry::new();
 
         // coding-blue FA-7: `build_codergen` reads the installed
@@ -2209,7 +2325,7 @@ impl PipelineExecutor {
         // onto every LLM-call node. When the context is empty (legacy
         // path) the setters are no-ops — behaviour is byte-for-byte
         // identical to pre-FA-7.
-        let codergen = self.build_codergen();
+        let codergen = self.build_codergen(llm_semaphore);
 
         registry.register(HandlerKind::Codergen, Arc::new(codergen));
         // The `shell` handler is intentionally NOT registered: shell is
@@ -2250,6 +2366,57 @@ impl PipelineExecutor {
             .with_known_tools(tool_names)
     }
 
+    fn evaluate_before_node_guards(
+        &self,
+        graph: &PipelineGraph,
+        node: &PipelineNode,
+        total_tokens: &TokenUsage,
+        pipeline_start: Instant,
+        completed_count: usize,
+        visit_counts: &HashMap<String, usize>,
+    ) -> Result<GuardDecision> {
+        if self.config.guards.is_empty() {
+            return Ok(GuardDecision::Allow);
+        }
+
+        let ctx = GuardContext {
+            graph,
+            node,
+            cumulative_tokens: total_pipeline_tokens(total_tokens),
+            elapsed: pipeline_start.elapsed(),
+            completed_count,
+            visit_counts,
+        };
+
+        for guard in &self.config.guards {
+            match guard.before_node(&ctx)? {
+                GuardDecision::Allow => {}
+                decision => return Ok(decision),
+            }
+        }
+
+        Ok(GuardDecision::Allow)
+    }
+
+    fn guard_aborted_result(
+        &self,
+        node_id: &str,
+        reason: impl std::fmt::Display,
+        total_tokens: TokenUsage,
+        summaries: Vec<NodeSummary>,
+        completed: &HashMap<String, NodeOutcome>,
+        node_costs: Vec<NodeCost>,
+    ) -> PipelineResult {
+        PipelineResult {
+            output: format!("Pipeline aborted by guard before node '{node_id}': {reason}"),
+            success: false,
+            token_usage: total_tokens,
+            node_summaries: summaries,
+            files_modified: collect_completed_files(completed),
+            node_costs,
+        }
+    }
+
     async fn execute_graph(
         &self,
         graph: &PipelineGraph,
@@ -2257,6 +2424,7 @@ impl PipelineExecutor {
         start_node: &str,
         user_input: &str,
         variables: &serde_json::Map<String, serde_json::Value>,
+        llm_semaphore: Arc<tokio::sync::Semaphore>,
     ) -> Result<PipelineResult> {
         let pipeline_start = Instant::now();
         let mut current_node_id = start_node.to_string();
@@ -2271,6 +2439,9 @@ impl PipelineExecutor {
         let mut node_task_ids: HashMap<String, String> = HashMap::new();
         // Nodes already executed by a parallel fan-out (skip in normal traversal)
         let mut parallel_executed: HashSet<String> = HashSet::new();
+        // Per-node visit counts surfaced to before-node guards. The current
+        // node is counted immediately before guard evaluation.
+        let mut visit_counts: HashMap<String, usize> = HashMap::new();
         // Guard B: cumulative fan-out worker counter. Incremented exactly
         // once per dispatched worker across both `Parallel` and
         // `DynamicParallel` branches. Once the counter equals
@@ -2388,6 +2559,89 @@ impl PipelineExecutor {
                             node_costs: node_costs.clone(),
                         });
                     }
+                }
+            }
+
+            let visit_count = visit_counts.entry(current_node_id.clone()).or_insert(0);
+            *visit_count = visit_count.saturating_add(1);
+
+            match self.evaluate_before_node_guards(
+                graph,
+                node,
+                &total_tokens,
+                pipeline_start,
+                completed.len(),
+                &visit_counts,
+            ) {
+                Ok(GuardDecision::Allow) => {}
+                Ok(GuardDecision::Skip(reason)) => {
+                    info!(
+                        node = %node.id,
+                        reason = %reason,
+                        "node skipped by pipeline guard"
+                    );
+                    let skipped = NodeOutcome {
+                        node_id: node.id.clone(),
+                        status: OutcomeStatus::Fail,
+                        content: format!("Node '{}' skipped by pipeline guard: {reason}", node.id),
+                        token_usage: TokenUsage::default(),
+                        files_modified: vec![],
+                    };
+                    summaries.push(NodeSummary {
+                        node_id: node.id.clone(),
+                        label: node.label.as_deref().unwrap_or(&node.id).to_string(),
+                        model: node.model.clone(),
+                        token_usage: TokenUsage::default(),
+                        duration_ms: 0,
+                        success: false,
+                    });
+                    completed.insert(current_node_id.clone(), skipped.clone());
+                    match self.select_next_edge(graph, &current_node_id, &skipped)? {
+                        Some(next_id) => {
+                            current_node_id = next_id;
+                            continue;
+                        }
+                        None => {
+                            return Ok(PipelineResult {
+                                output: skipped.content,
+                                success: false,
+                                token_usage: total_tokens,
+                                node_summaries: summaries,
+                                files_modified: collect_completed_files(&completed),
+                                node_costs: node_costs.clone(),
+                            });
+                        }
+                    }
+                }
+                Ok(GuardDecision::Abort(reason)) => {
+                    warn!(
+                        node = %node.id,
+                        reason = %reason,
+                        "pipeline guard aborted execution"
+                    );
+                    return Ok(self.guard_aborted_result(
+                        &node.id,
+                        reason,
+                        total_tokens,
+                        summaries,
+                        &completed,
+                        node_costs.clone(),
+                    ));
+                }
+                Err(error) => {
+                    warn!(
+                        node = %node.id,
+                        error = %error,
+                        "pipeline guard failed before node"
+                    );
+                    return Ok(self.guard_aborted_result(
+                        &node.id,
+                        format!("guard error: {error}"),
+                        total_tokens,
+                        summaries,
+                        &completed,
+                        node_costs.clone(),
+                    ));
                 }
             }
 
@@ -2808,6 +3062,9 @@ impl PipelineExecutor {
                         .or(node.model.as_deref())
                         .or(graph.default_model.as_deref()),
                 )?;
+                let planner_provider: Arc<dyn LlmProvider> = Arc::new(
+                    SemaphoreThrottledProvider::new(planner_provider, llm_semaphore.clone()),
+                );
 
                 // Default planning prompt, WITH runtime-variable substitution:
                 // the dynamic_parallel planner reads `node.prompt` directly
@@ -3017,9 +3274,17 @@ impl PipelineExecutor {
                     eyre::eyre!("codergen handler not found for dynamic_parallel workers")
                 })?;
 
-                // Execute all synthetic nodes concurrently
+                // Execute all synthetic nodes concurrently, capped by the
+                // same `max_parallel_workers` semaphore the static `Parallel`
+                // branch uses. The planner may yield more tasks than the
+                // limit; without this gate every synthetic worker would
+                // dispatch at once (the planner's `llm_semaphore` bounds
+                // concurrent LLM calls, not in-flight workers).
                 let total_workers = synthetic_nodes.len();
                 let completed_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                let semaphore = Arc::new(tokio::sync::Semaphore::new(
+                    self.config.max_parallel_workers,
+                ));
                 let mut futures = Vec::new();
                 // coding-blue FA-7: same fan-out reservation pattern as
                 // the static Parallel branch — reserve per-worker up
@@ -3083,6 +3348,7 @@ impl PipelineExecutor {
                     // PANICS (the future unwinds; `join_all` surfaces the panic).
                     let dp_node_index = worker_idx + 1;
 
+                    let sem = semaphore.clone();
                     let pipeline_id = graph.id.clone();
                     let guard_label = worker_label.clone();
                     let guard_tid = task_id.clone();
@@ -3094,8 +3360,10 @@ impl PipelineExecutor {
                     // attempt bounded by `MAX_FANOUT_WORKER_SECS`.
                     let hook_executor = self.config.hook_executor.clone();
                     futures.push(async move {
+                        let _permit = sem.acquire().await.expect("semaphore closed");
                         // Arm the guard HERE — only once the future is actually
-                        // polled, guaranteeing a started/completed pair.
+                        // polled AND holds a worker permit, guaranteeing a
+                        // started/completed pair for a worker that actually ran.
                         let guard = NodeProgressGuard::arm(
                             &pipeline_id,
                             &guard_tid,
@@ -5205,6 +5473,10 @@ fn dag_build_result(
 mod tests {
     use super::*;
     use crate::graph::{NodeOutcome, OutcomeStatus, PipelineNode};
+    use crate::guard::{TimeoutGuard, TokenBudgetGuard};
+    use crate::handler::Handler;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
     #[test]
     fn fanout_worker_deadline_priority_and_clamp() {
@@ -5408,6 +5680,8 @@ mod tests {
             shutdown: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             max_parallel_workers: 8,
             max_pipeline_fanout_total: None,
+            guards: Vec::new(),
+            max_concurrent_llm_calls: None,
             checkpoint_store: None,
             hook_executor: None,
             workspace_context: crate::context::PipelineContext::default(),
@@ -5521,6 +5795,46 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let dir = Box::leak(Box::new(dir));
         EpisodeStore::open(dir.path()).await.unwrap()
+    }
+
+    #[test]
+    fn defaults_pipeline_llm_throttle_to_four_permits() {
+        let executor = PipelineExecutor::new(make_test_config());
+        assert_eq!(
+            executor.max_concurrent_llm_calls_for_test(),
+            DEFAULT_PIPELINE_MAX_CONCURRENT_LLM_CALLS
+        );
+        assert_eq!(
+            executor
+                .build_codergen_for_test()
+                .llm_available_permits_for_test(),
+            Some(DEFAULT_PIPELINE_MAX_CONCURRENT_LLM_CALLS)
+        );
+    }
+
+    #[test]
+    fn honors_configured_pipeline_llm_throttle_and_clamps_zero() {
+        let mut config = make_test_config();
+        config.max_concurrent_llm_calls = Some(2);
+        let executor = PipelineExecutor::new(config);
+        assert_eq!(executor.max_concurrent_llm_calls_for_test(), 2);
+        assert_eq!(
+            executor
+                .build_codergen_for_test()
+                .llm_available_permits_for_test(),
+            Some(2)
+        );
+
+        let mut config = make_test_config();
+        config.max_concurrent_llm_calls = Some(0);
+        let executor = PipelineExecutor::new(config);
+        assert_eq!(executor.max_concurrent_llm_calls_for_test(), 1);
+        assert_eq!(
+            executor
+                .build_codergen_for_test()
+                .llm_available_permits_for_test(),
+            Some(1)
+        );
     }
 
     #[test]
@@ -5648,6 +5962,8 @@ mod tests {
             shutdown: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             max_parallel_workers: 8,
             max_pipeline_fanout_total: Some(cap),
+            guards: Vec::new(),
+            max_concurrent_llm_calls: None,
             checkpoint_store: None,
             hook_executor: None,
             workspace_context: crate::context::PipelineContext::default(),
@@ -5655,6 +5971,346 @@ mod tests {
             embedder: None,
             catalog_dir: None,
         }
+    }
+
+    struct TokenHandler {
+        calls: Arc<AtomicUsize>,
+        input_tokens: u32,
+        output_tokens: u32,
+    }
+
+    #[async_trait::async_trait]
+    impl Handler for TokenHandler {
+        async fn execute(&self, node: &PipelineNode, _ctx: &HandlerContext) -> Result<NodeOutcome> {
+            self.calls.fetch_add(1, AtomicOrdering::Relaxed);
+            Ok(NodeOutcome {
+                node_id: node.id.clone(),
+                status: OutcomeStatus::Pass,
+                content: format!("{} complete", node.id),
+                token_usage: TokenUsage {
+                    input_tokens: self.input_tokens,
+                    output_tokens: self.output_tokens,
+                    ..Default::default()
+                },
+                files_modified: vec![],
+            })
+        }
+    }
+
+    struct NodeRecordingGuard {
+        seen: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl PipelineGuard for NodeRecordingGuard {
+        fn before_node(&self, ctx: &GuardContext<'_>) -> Result<GuardDecision> {
+            self.seen.lock().unwrap().push(ctx.node.id.clone());
+            Ok(GuardDecision::Allow)
+        }
+    }
+
+    struct SelectiveGuard {
+        target: &'static str,
+        decision: GuardDecision,
+    }
+
+    impl PipelineGuard for SelectiveGuard {
+        fn before_node(&self, ctx: &GuardContext<'_>) -> Result<GuardDecision> {
+            if ctx.node.id == self.target {
+                Ok(self.decision.clone())
+            } else {
+                Ok(GuardDecision::Allow)
+            }
+        }
+    }
+
+    struct OrderedGuard {
+        name: &'static str,
+        seen: Arc<Mutex<Vec<String>>>,
+        decision: GuardDecision,
+    }
+
+    impl PipelineGuard for OrderedGuard {
+        fn before_node(&self, ctx: &GuardContext<'_>) -> Result<GuardDecision> {
+            self.seen.lock().unwrap().push(format!(
+                "{}:{}:{}:{}:{}",
+                self.name,
+                ctx.node.id,
+                ctx.cumulative_tokens,
+                ctx.completed_count,
+                ctx.visit_counts
+                    .get(&ctx.node.id)
+                    .copied()
+                    .unwrap_or_default()
+            ));
+            Ok(self.decision.clone())
+        }
+    }
+
+    struct ErrorGuard;
+
+    impl PipelineGuard for ErrorGuard {
+        fn before_node(&self, _ctx: &GuardContext<'_>) -> Result<GuardDecision> {
+            Err(eyre::eyre!("guard storage unavailable"))
+        }
+    }
+
+    #[tokio::test]
+    async fn token_budget_guard_aborts_before_next_node_with_partial_result() {
+        let mut config = make_capped_config(10).await;
+        config.guards = vec![Arc::new(TokenBudgetGuard::new(7)) as Arc<dyn PipelineGuard>];
+        let executor = PipelineExecutor::new(config);
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut handlers = HandlerRegistry::new();
+        handlers.register(
+            HandlerKind::Noop,
+            Arc::new(TokenHandler {
+                calls: calls.clone(),
+                input_tokens: 4,
+                output_tokens: 3,
+            }),
+        );
+
+        let dot = r#"
+            digraph t {
+                a [handler="noop"]
+                b [handler="noop"]
+                a -> b
+            }
+        "#;
+
+        let result = executor
+            .run_with_handlers(dot, "seed", &serde_json::Map::new(), handlers)
+            .await
+            .expect("pipeline should return a partial result");
+
+        assert!(!result.success);
+        assert!(
+            result
+                .output
+                .contains("token budget exhausted before node 'b'"),
+            "unexpected output: {}",
+            result.output
+        );
+        assert_eq!(calls.load(AtomicOrdering::Relaxed), 1);
+        assert_eq!(result.node_summaries.len(), 1);
+        assert_eq!(result.node_summaries[0].node_id, "a");
+        assert_eq!(result.token_usage.input_tokens, 4);
+        assert_eq!(result.token_usage.output_tokens, 3);
+    }
+
+    #[tokio::test]
+    async fn timeout_guard_aborts_before_dispatch() {
+        let mut config = make_capped_config(10).await;
+        config.guards = vec![Arc::new(TimeoutGuard::new(Duration::ZERO)) as Arc<dyn PipelineGuard>];
+        let executor = PipelineExecutor::new(config);
+
+        let result = executor
+            .run(
+                r#"digraph t { a [handler="noop"] }"#,
+                "seed",
+                &serde_json::Map::new(),
+            )
+            .await
+            .expect("timeout guard should return a partial result");
+
+        assert!(!result.success);
+        assert!(result.node_summaries.is_empty());
+        assert!(
+            result.output.contains("pipeline timeout before node 'a'"),
+            "unexpected output: {}",
+            result.output
+        );
+    }
+
+    #[tokio::test]
+    async fn guard_skip_records_fail_outcome_for_edge_routing() {
+        let mut config = make_capped_config(10).await;
+        config.guards = vec![Arc::new(SelectiveGuard {
+            target: "gate",
+            decision: GuardDecision::Skip("closed by policy".into()),
+        }) as Arc<dyn PipelineGuard>];
+        let executor = PipelineExecutor::new(config);
+
+        let dot = r#"
+            digraph t {
+                gate [handler="noop"]
+                fallback [handler="noop"]
+                bad [handler="noop"]
+                gate -> fallback [condition="outcome.status == \"fail\""]
+                gate -> bad [condition="outcome.status == \"pass\""]
+            }
+        "#;
+
+        let result = executor
+            .run(dot, "seed", &serde_json::Map::new())
+            .await
+            .expect("guard skip should route to fallback");
+
+        assert!(result.success, "fallback noop should recover the pipeline");
+        assert_eq!(result.node_summaries[0].node_id, "gate");
+        assert!(!result.node_summaries[0].success);
+        assert!(
+            result
+                .node_summaries
+                .iter()
+                .any(|s| s.node_id == "fallback")
+        );
+        assert!(!result.node_summaries.iter().any(|s| s.node_id == "bad"));
+        assert!(
+            result
+                .output
+                .contains("Node 'gate' skipped by pipeline guard: closed by policy"),
+            "unexpected output: {}",
+            result.output
+        );
+    }
+
+    #[tokio::test]
+    async fn guards_run_in_registration_order_and_short_circuit() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let mut config = make_capped_config(10).await;
+        config.guards = vec![
+            Arc::new(OrderedGuard {
+                name: "first",
+                seen: seen.clone(),
+                decision: GuardDecision::Allow,
+            }) as Arc<dyn PipelineGuard>,
+            Arc::new(OrderedGuard {
+                name: "second",
+                seen: seen.clone(),
+                decision: GuardDecision::Abort("stop here".into()),
+            }) as Arc<dyn PipelineGuard>,
+            Arc::new(OrderedGuard {
+                name: "third",
+                seen: seen.clone(),
+                decision: GuardDecision::Allow,
+            }) as Arc<dyn PipelineGuard>,
+        ];
+        let executor = PipelineExecutor::new(config);
+
+        let result = executor
+            .run(
+                r#"digraph t { a [handler="noop"] }"#,
+                "seed",
+                &serde_json::Map::new(),
+            )
+            .await
+            .expect("guard abort should return partial result");
+
+        assert!(!result.success);
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec!["first:a:0:0:1".to_string(), "second:a:0:0:1".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn guard_errors_abort_instead_of_allowing_dispatch() {
+        let mut config = make_capped_config(10).await;
+        config.guards = vec![Arc::new(ErrorGuard) as Arc<dyn PipelineGuard>];
+        let executor = PipelineExecutor::new(config);
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut handlers = HandlerRegistry::new();
+        handlers.register(
+            HandlerKind::Noop,
+            Arc::new(TokenHandler {
+                calls: calls.clone(),
+                input_tokens: 0,
+                output_tokens: 0,
+            }),
+        );
+
+        let result = executor
+            .run_with_handlers(
+                r#"digraph t { a [handler="noop"] }"#,
+                "seed",
+                &serde_json::Map::new(),
+                handlers,
+            )
+            .await
+            .expect("guard error should return partial result");
+
+        assert!(!result.success);
+        assert_eq!(calls.load(AtomicOrdering::Relaxed), 0);
+        assert!(
+            result
+                .output
+                .contains("guard error: guard storage unavailable"),
+            "unexpected output: {}",
+            result.output
+        );
+    }
+
+    #[tokio::test]
+    async fn guards_run_once_for_static_parallel_before_worker_spawn() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let mut config = make_capped_config(10).await;
+        config.guards =
+            vec![Arc::new(NodeRecordingGuard { seen: seen.clone() }) as Arc<dyn PipelineGuard>];
+        let executor = PipelineExecutor::new(config);
+
+        let dot = r#"
+            digraph t {
+                fan [handler="parallel", converge="merge"]
+                a [handler="noop"]
+                b [handler="noop"]
+                merge [handler="noop"]
+                fan -> a
+                fan -> b
+                a -> merge
+                b -> merge
+            }
+        "#;
+
+        let result = executor
+            .run(dot, "seed", &serde_json::Map::new())
+            .await
+            .expect("parallel pipeline should complete");
+        assert!(result.success);
+
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(seen.iter().filter(|node| node.as_str() == "fan").count(), 1);
+        assert!(!seen.iter().any(|node| node == "a"));
+        assert!(!seen.iter().any(|node| node == "b"));
+        assert!(seen.iter().any(|node| node == "merge"));
+    }
+
+    #[tokio::test]
+    async fn guards_run_once_for_dynamic_parallel_before_worker_spawn() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let mut config = make_capped_config(10).await;
+        config.guards =
+            vec![Arc::new(NodeRecordingGuard { seen: seen.clone() }) as Arc<dyn PipelineGuard>];
+        let executor = PipelineExecutor::new(config);
+
+        let mut handlers = HandlerRegistry::new();
+        handlers.register(HandlerKind::Codergen, Arc::new(NoopHandler));
+        handlers.register(HandlerKind::DynamicParallel, Arc::new(NoopHandler));
+        handlers.register(HandlerKind::Noop, Arc::new(NoopHandler));
+
+        let dot = r#"
+            digraph t {
+                plan [handler="dynamic_parallel", converge="merge", prompt="plan"]
+                merge [handler="noop"]
+                plan -> merge
+            }
+        "#;
+
+        let result = executor
+            .run_with_handlers(dot, "seed", &serde_json::Map::new(), handlers)
+            .await
+            .expect("dynamic parallel pipeline should complete");
+        assert!(result.success);
+
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(
+            seen.iter().filter(|node| node.as_str() == "plan").count(),
+            1
+        );
+        assert!(!seen.iter().any(|node| node.starts_with("plan_task_")));
+        assert!(seen.iter().any(|node| node == "merge"));
     }
 
     /// Guard B regression: a `dynamic_parallel` node whose worker count
@@ -5698,6 +6354,132 @@ mod tests {
                 assert_eq!(*count, 0, "no workers should dispatch before the cap fires");
             }
         }
+    }
+
+    /// Planner provider for the dynamic fan-out concurrency test: returns a
+    /// JSON array of exactly 6 tasks so the `dynamic_parallel` node plans
+    /// MORE workers than `max_parallel_workers`.
+    struct SixTaskPlanner;
+
+    #[async_trait::async_trait]
+    impl LlmProvider for SixTaskPlanner {
+        async fn chat(
+            &self,
+            _messages: &[octos_core::Message],
+            _tools: &[octos_llm::ToolSpec],
+            _config: &octos_llm::ChatConfig,
+        ) -> Result<octos_llm::ChatResponse> {
+            Ok(octos_llm::ChatResponse {
+                content: Some(
+                    r#"[{"task":"t1","label":"T1"},{"task":"t2","label":"T2"},
+                        {"task":"t3","label":"T3"},{"task":"t4","label":"T4"},
+                        {"task":"t5","label":"T5"},{"task":"t6","label":"T6"}]"#
+                        .to_string(),
+                ),
+                reasoning_content: None,
+                tool_calls: vec![],
+                stop_reason: octos_llm::StopReason::EndTurn,
+                usage: octos_llm::TokenUsage::default(),
+                provider_index: None,
+            })
+        }
+
+        fn model_id(&self) -> &str {
+            "mock-planner"
+        }
+
+        fn provider_name(&self) -> &str {
+            "mock"
+        }
+    }
+
+    /// Codergen stand-in that records the peak number of concurrently
+    /// executing fan-out workers: increment an in-flight counter on entry,
+    /// fold it into the running maximum, hold the slot across a real await,
+    /// decrement on exit.
+    struct ConcurrencyProbeHandler {
+        in_flight: Arc<AtomicUsize>,
+        max_in_flight: Arc<AtomicUsize>,
+        executed: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl Handler for ConcurrencyProbeHandler {
+        async fn execute(&self, node: &PipelineNode, _ctx: &HandlerContext) -> Result<NodeOutcome> {
+            let now = self.in_flight.fetch_add(1, AtomicOrdering::SeqCst) + 1;
+            self.max_in_flight.fetch_max(now, AtomicOrdering::SeqCst);
+            // Hold the slot across an await point. `join_all` polls every
+            // worker future once within microseconds, so 50ms guarantees all
+            // concurrently-dispatched workers pile up before the first exits
+            // — no racing needed for a deterministic peak.
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            self.in_flight.fetch_sub(1, AtomicOrdering::SeqCst);
+            self.executed.fetch_add(1, AtomicOrdering::SeqCst);
+            Ok(NodeOutcome {
+                node_id: node.id.clone(),
+                status: OutcomeStatus::Pass,
+                content: format!("{} done", node.id),
+                token_usage: TokenUsage::default(),
+                files_modified: vec![],
+            })
+        }
+    }
+
+    /// The dynamic fan-out must honor `max_parallel_workers` exactly like
+    /// the static `Parallel` branch. A planner that yields 6 tasks with
+    /// `max_parallel_workers = 2` may never have more than 2 workers
+    /// in flight at once.
+    #[tokio::test]
+    async fn should_cap_dynamic_parallel_worker_concurrency_when_planner_exceeds_limit() {
+        let mut config = make_capped_config(100).await;
+        config.default_provider = Arc::new(SixTaskPlanner);
+        config.max_parallel_workers = 2;
+        let executor = PipelineExecutor::new(config);
+
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let max_in_flight = Arc::new(AtomicUsize::new(0));
+        let executed = Arc::new(AtomicUsize::new(0));
+
+        let mut handlers = HandlerRegistry::new();
+        handlers.register(
+            HandlerKind::Codergen,
+            Arc::new(ConcurrencyProbeHandler {
+                in_flight: in_flight.clone(),
+                max_in_flight: max_in_flight.clone(),
+                executed: executed.clone(),
+            }),
+        );
+        handlers.register(HandlerKind::DynamicParallel, Arc::new(NoopHandler));
+        handlers.register(HandlerKind::Noop, Arc::new(NoopHandler));
+
+        let dot = r#"
+            digraph t {
+                plan [handler="dynamic_parallel", converge="merge", prompt="plan"]
+                merge [handler="noop"]
+                plan -> merge
+            }
+        "#;
+
+        let result = executor
+            .run_with_handlers(dot, "seed", &serde_json::Map::new(), handlers)
+            .await
+            .expect("dynamic parallel pipeline should complete");
+        assert!(result.success);
+
+        // The planner JSON must have driven the fan-out (6 workers), not the
+        // 3-task fallback — otherwise the concurrency assertion below tests
+        // a weaker shape than intended.
+        assert_eq!(
+            executed.load(AtomicOrdering::SeqCst),
+            6,
+            "expected all 6 planned workers to run"
+        );
+        let peak = max_in_flight.load(AtomicOrdering::SeqCst);
+        assert!(
+            peak <= 2,
+            "dynamic_parallel fan-out must gate workers to max_parallel_workers=2, \
+             but {peak} ran concurrently"
+        );
     }
 
     /// Guard B sanity check: when the fan-out is below the cap the
@@ -6212,6 +6994,8 @@ mod tests {
             shutdown: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             max_parallel_workers: 8,
             max_pipeline_fanout_total: None,
+            guards: Vec::new(),
+            max_concurrent_llm_calls: None,
             checkpoint_store: None,
             hook_executor: None,
             workspace_context: crate::context::PipelineContext::default(),
@@ -6266,6 +7050,8 @@ mod tests {
             shutdown: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             max_parallel_workers: 8,
             max_pipeline_fanout_total: None,
+            guards: Vec::new(),
+            max_concurrent_llm_calls: None,
             checkpoint_store: None,
             hook_executor: None,
             workspace_context: crate::context::PipelineContext::default(),
@@ -6314,6 +7100,8 @@ mod tests {
             shutdown: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             max_parallel_workers: 8,
             max_pipeline_fanout_total: None,
+            guards: Vec::new(),
+            max_concurrent_llm_calls: None,
             checkpoint_store: None,
             hook_executor: None,
             workspace_context: crate::context::PipelineContext::default(),

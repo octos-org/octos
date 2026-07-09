@@ -44,7 +44,14 @@ pub(crate) fn prepare_conversation_messages(
     if synthesize_missing_tool_results(messages) {
         turn.record_repair(LoopRepairReason::MissingToolResultsSynthesized);
     }
-    if truncate_old_tool_results(messages) {
+    // With a caller-owned ContextManager the bridge replaces the vector with
+    // its canonical frame before the model call, so this truncation cannot
+    // affect the final prompt — but it mutates frame-derived rows (the
+    // envelope's model-visible content is bounded at 4096 bytes, above the
+    // 800-char cut here) and breaks the bridge's contiguous coverage match,
+    // which then re-records the whole conversation as duplicates. Tool-output
+    // bounding is the ContextManager's job there (ToolOutputPolicy).
+    if agent.prompt_context_manager.is_none() && truncate_old_tool_results(messages) {
         turn.record_repair(LoopRepairReason::OldToolResultsTruncated);
     }
     if normalize_tool_call_ids(messages) {
@@ -311,6 +318,47 @@ mod tests {
                 .repair_reasons()
                 .contains(&LoopRepairReason::ContextTrimmed),
             "legacy ContextTrimmed repair should stay absent when ContextManager owns prompt compaction"
+        );
+    }
+
+    /// A caller-owned ContextManager bridge replaces the loop's prompt
+    /// vector with its canonical frame anyway, so the legacy 800-char
+    /// old-tool-result truncation has no effect on the final prompt — but it
+    /// DOES mutate the frame-derived vector before the bridge's coverage
+    /// matcher compares it against the frame (ToolOutputEnvelope emits up to
+    /// 4096 bytes), which broke the contiguous window match and re-recorded
+    /// the whole conversation as source-less duplicates every turn.
+    #[tokio::test]
+    async fn context_managed_agent_skips_old_tool_result_truncation() {
+        let (_dir, agent) = setup_agent(1_000_000).await;
+        let agent = agent.with_prompt_context_manager(Arc::new(NoopPromptContextManager));
+        let mut turn = LoopTurnState::new(Instant::now());
+        let old_tool_output = "z".repeat(2_000);
+        let mut messages = vec![
+            sys("prompt"),
+            user("old question"),
+            assistant_with_tools(&["call_old"]),
+            tool_result_msg("call_old", &old_tool_output),
+            assistant("old answer"),
+            user("current question"),
+        ];
+
+        prepare_conversation_messages(&agent, &mut messages, &mut turn);
+
+        let tool = messages
+            .iter()
+            .find(|m| m.tool_call_id.as_deref() == Some("call_old"))
+            .expect("old tool result still present");
+        assert_eq!(
+            tool.content, old_tool_output,
+            "ContextManager-owned sessions must not run the legacy old-tool-result \
+             truncation before the context bridge — it breaks bridge coverage matching"
+        );
+        assert!(
+            !turn
+                .repair_reasons()
+                .contains(&LoopRepairReason::OldToolResultsTruncated),
+            "OldToolResultsTruncated repair must stay absent when ContextManager owns prompt compaction"
         );
     }
 

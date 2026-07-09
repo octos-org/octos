@@ -2,15 +2,16 @@
 
 use std::sync::Arc;
 
-use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
+use axum::{Extension, Json};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 
 use super::AppState;
+use super::router::AuthIdentity;
 use crate::login_allowlist::AllowedLogin;
-use crate::user_store::User;
+use crate::user_store::{User, UserRole};
 
 #[derive(Serialize)]
 pub struct UsersListResponse {
@@ -22,6 +23,11 @@ pub struct AllowlistRequest {
     pub email: String,
     #[serde(default)]
     pub note: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub struct UpdateUserRequest {
+    pub role: UserRole,
 }
 
 #[derive(Serialize)]
@@ -87,6 +93,42 @@ pub async fn list_users(
     Ok(Json(UsersListResponse { users }))
 }
 
+/// PATCH /api/admin/users/{id}
+pub async fn update_user(
+    State(state): State<Arc<AppState>>,
+    Extension(identity): Extension<AuthIdentity>,
+    Path(id): Path<String>,
+    Json(req): Json<UpdateUserRequest>,
+) -> Result<Json<User>, StatusCode> {
+    if !matches!(identity, AuthIdentity::Admin) {
+        return Err(StatusCode::FORBIDDEN);
+    }
+
+    let us = state
+        .user_store
+        .as_ref()
+        .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+    let mut user = us
+        .get(&id)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .ok_or(StatusCode::NOT_FOUND)?;
+    let old_role = user.role.clone();
+    if old_role == req.role {
+        return Ok(Json(user));
+    }
+
+    user.role = req.role;
+    us.save(&user)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    tracing::info!(
+        user_id = %id,
+        old_role = ?old_role,
+        new_role = ?user.role,
+        "update_user: role changed"
+    );
+    Ok(Json(user))
+}
+
 /// GET /api/admin/allowed-emails
 pub async fn list_allowed_emails(
     State(state): State<Arc<AppState>>,
@@ -122,6 +164,7 @@ pub async fn list_allowed_emails(
 
 /// POST /api/admin/allowed-emails
 pub async fn add_allowed_email(
+    identity: Option<axum::Extension<AuthIdentity>>,
     State(state): State<Arc<AppState>>,
     Json(req): Json<AllowlistRequest>,
 ) -> Result<(StatusCode, Json<AllowlistEntryResponse>), (StatusCode, Json<ErrorBody>)> {
@@ -195,24 +238,39 @@ pub async fn add_allowed_email(
         )
     })?;
 
-    Ok((
-        StatusCode::CREATED,
-        Json(AllowlistEntryResponse {
-            email,
-            note: entry.note,
-            created_at: entry.created_at,
-            claimed_user_id: None,
-            claimed_at: None,
-            registered: false,
-            registered_user_id: None,
-            registered_name: None,
-            last_login_at: None,
-        }),
-    ))
+    let response = AllowlistEntryResponse {
+        email,
+        note: entry.note,
+        created_at: entry.created_at,
+        claimed_user_id: None,
+        claimed_at: None,
+        registered: false,
+        registered_user_id: None,
+        registered_name: None,
+        last_login_at: None,
+    };
+    super::admin_audit::record_admin_action(
+        &state,
+        identity.as_ref().map(|identity| &identity.0),
+        "allowlist.add",
+        response.email.clone(),
+        None,
+        super::admin_audit::summary_value(&response),
+    )
+    .map_err(|error| {
+        tracing::error!(error = %error, "failed to record admin audit entry");
+        error_body(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "admin_audit_failed",
+            "failed to record admin audit entry",
+        )
+    })?;
+    Ok((StatusCode::CREATED, Json(response)))
 }
 
 /// DELETE /api/admin/allowed-emails/{email}
 pub async fn delete_allowed_email(
+    identity: Option<axum::Extension<AuthIdentity>>,
     State(state): State<Arc<AppState>>,
     Path(email): Path<String>,
 ) -> Result<Json<ActionResponse>, StatusCode> {
@@ -220,20 +278,36 @@ pub async fn delete_allowed_email(
         .allowlist_store
         .as_ref()
         .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+    let before = allowlist
+        .get(&email)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     match allowlist
         .delete(&email)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
     {
-        true => Ok(Json(ActionResponse {
-            ok: true,
-            message: None,
-        })),
+        true => {
+            let normalized = crate::login_allowlist::normalize_email(&email);
+            super::admin_audit::record_admin_action(
+                &state,
+                identity.as_ref().map(|identity| &identity.0),
+                "allowlist.delete",
+                normalized,
+                before.as_ref().and_then(super::admin_audit::summary_value),
+                None,
+            )
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+            Ok(Json(ActionResponse {
+                ok: true,
+                message: None,
+            }))
+        }
         false => Err(StatusCode::NOT_FOUND),
     }
 }
 
 /// DELETE /api/admin/users/{id}
 pub async fn delete_user(
+    identity: Option<axum::Extension<AuthIdentity>>,
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Result<Json<ActionResponse>, StatusCode> {
@@ -241,6 +315,7 @@ pub async fn delete_user(
         .user_store
         .as_ref()
         .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+    let before_user = us.get(&id).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     if let Some(ref pm) = state.process_manager {
         let _ = pm.stop(&id).await;
@@ -253,6 +328,17 @@ pub async fn delete_user(
     match us.delete(&id) {
         Ok(true) => {
             tracing::info!(user_id = %id, "delete_user: user deleted");
+            super::admin_audit::record_admin_action(
+                &state,
+                identity.as_ref().map(|identity| &identity.0),
+                "user.delete",
+                id.clone(),
+                before_user
+                    .as_ref()
+                    .and_then(super::admin_audit::summary_value),
+                None,
+            )
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
             Ok(Json(ActionResponse {
                 ok: true,
                 message: None,
@@ -286,6 +372,28 @@ mod tests {
             user_store,
             ..AppState::empty_for_tests()
         })
+    }
+
+    fn test_user(id: &str, role: UserRole) -> User {
+        User {
+            id: id.to_string(),
+            email: format!("{id}@example.com"),
+            name: id.to_string(),
+            role,
+            created_at: Utc::now(),
+            last_login_at: None,
+        }
+    }
+
+    fn state_with_user(user: User) -> (Arc<AppState>, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(crate::user_store::UserStore::open(dir.path()).unwrap());
+        store.save(&user).unwrap();
+        let state = Arc::new(AppState {
+            user_store: Some(store),
+            ..AppState::empty_for_tests()
+        });
+        (state, dir)
     }
 
     #[test]
@@ -349,6 +457,7 @@ mod tests {
         let state = state_with_stores(allowlist, None);
 
         let result = add_allowed_email(
+            None,
             State(state),
             Json(AllowlistRequest {
                 email: "ALICE@example.com".into(),
@@ -386,6 +495,7 @@ mod tests {
         let state = state_with_stores(allowlist, Some(user_store));
 
         let result = add_allowed_email(
+            None,
             State(state),
             Json(AllowlistRequest {
                 email: "alice@example.com".into(),
@@ -403,5 +513,111 @@ mod tests {
             body.message,
             "email 'alice@example.com' is already registered"
         );
+    }
+
+    #[tokio::test]
+    async fn add_allowed_email_records_admin_audit_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let allowlist =
+            Arc::new(crate::login_allowlist::LoginAllowlistStore::open(dir.path()).unwrap());
+        let audit = Arc::new(crate::admin_audit_store::AdminAuditStore::open(dir.path()).unwrap());
+        let state = Arc::new(AppState {
+            allowlist_store: Some(allowlist),
+            admin_audit_store: Some(audit.clone()),
+            ..AppState::empty_for_tests()
+        });
+
+        let (status, Json(response)) = add_allowed_email(
+            Some(axum::Extension(AuthIdentity::Admin)),
+            State(state),
+            Json(AllowlistRequest {
+                email: "Ada@Example.com".into(),
+                note: Some("Pilot".into()),
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(response.email, "ada@example.com");
+        let page = audit
+            .list(crate::admin_audit_store::AdminAuditQuery::default())
+            .unwrap();
+        assert_eq!(page.total, 1);
+        assert_eq!(page.entries[0].action, "allowlist.add");
+        assert_eq!(page.entries[0].target_id, "ada@example.com");
+    }
+
+    #[tokio::test]
+    async fn update_user_role_promotes_with_global_admin_token() {
+        let (state, _dir) = state_with_user(test_user("alice", UserRole::User));
+
+        let Json(updated) = update_user(
+            State(state.clone()),
+            Extension(AuthIdentity::Admin),
+            Path("alice".to_string()),
+            Json(UpdateUserRequest {
+                role: UserRole::Admin,
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(updated.role, UserRole::Admin);
+        let persisted = state
+            .user_store
+            .as_ref()
+            .unwrap()
+            .get("alice")
+            .unwrap()
+            .unwrap();
+        assert_eq!(persisted.role, UserRole::Admin);
+    }
+
+    #[tokio::test]
+    async fn update_user_role_rejects_user_session_admins() {
+        let (state, _dir) = state_with_user(test_user("alice", UserRole::User));
+
+        let err = update_user(
+            State(state.clone()),
+            Extension(AuthIdentity::User {
+                id: "operator".to_string(),
+                role: UserRole::Admin,
+            }),
+            Path("alice".to_string()),
+            Json(UpdateUserRequest {
+                role: UserRole::Admin,
+            }),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(err, StatusCode::FORBIDDEN);
+        let persisted = state
+            .user_store
+            .as_ref()
+            .unwrap()
+            .get("alice")
+            .unwrap()
+            .unwrap();
+        assert_eq!(persisted.role, UserRole::User);
+    }
+
+    #[tokio::test]
+    async fn update_user_role_returns_not_found_for_missing_user() {
+        let (state, _dir) = state_with_user(test_user("alice", UserRole::User));
+
+        let err = update_user(
+            State(state),
+            Extension(AuthIdentity::Admin),
+            Path("bob".to_string()),
+            Json(UpdateUserRequest {
+                role: UserRole::Admin,
+            }),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(err, StatusCode::NOT_FOUND);
     }
 }

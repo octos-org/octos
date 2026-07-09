@@ -1137,6 +1137,7 @@ pub trait Channel: Send + Sync {
 | **API** | HTTP/SSE (axum) | (always) | Bearer token | seq number |
 | **Telegram** | teloxide long-poll | `telegram` | Bot token (env) | teloxide built-in |
 | **Discord** | serenity gateway | `discord` | Bot token (env) | serenity built-in |
+| **DingTalk** | custom robot send + outgoing robot webhook | `dingtalk` | Webhook URL + signing secret | msgId |
 | **Slack** | Socket Mode (tokio-tungstenite) | `slack` | Bot token + App token | message_ts |
 | **WhatsApp** | WebSocket bridge (ws://localhost:3001) | `whatsapp` | Baileys bridge | HashSet (10K cap, clear on overflow) |
 | **Matrix** | Matrix Application Service (MSC4357 finish_stream) | `matrix` | AS token + HS URL | event_id |

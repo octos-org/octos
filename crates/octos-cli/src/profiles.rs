@@ -11,7 +11,7 @@ use chrono::{DateTime, Utc};
 use eyre::{Result, WrapErr, bail};
 use serde::{Deserialize, Deserializer, Serialize};
 
-use crate::config::{ChannelEntry, Config, FallbackModel, GatewayConfig};
+use crate::config::{ChannelEntry, CloudTtsConfig, Config, FallbackModel, GatewayConfig};
 
 pub const MAX_SUB_ACCOUNTS_PER_PARENT: usize = 10;
 
@@ -61,12 +61,25 @@ pub struct ProfileConfig {
     /// serve default. Set by `PUT /api/my/voice`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub voice_default: Option<String>,
+    /// Per-profile TTS route override (`auto`/`local`/`cloud`). `None` →
+    /// inherit the serve-level `VoiceConfig.tts_provider`. Applied in
+    /// `runtime/profile.rs` via `VoiceConfig::with_tts_provider_override`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tts_provider: Option<String>,
+    /// Per-profile non-secret cloud (Volcano) TTS settings. The token rides
+    /// `env_vars["VOLC_TTS_TOKEN"]`. `None` → inherit serve / env defaults.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tts_cloud: Option<CloudTtsConfig>,
     /// Coding review specialist template. When omitted, `/review`
     /// uses the server's built-in default specialists. Operators may
     /// configure this per profile to change the native reviewer fanout
     /// without changing code.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub review: Option<ReviewConfig>,
+    /// Per-profile memory subsystem settings (e.g. the token budget for the
+    /// memory block injected into the system prompt). `None` → defaults.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory: Option<crate::config::MemoryConfig>,
     /// Search provider contract for product-level search behavior.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub search: Option<SearchConfig>,
@@ -877,6 +890,16 @@ pub enum ChannelCredentials {
         #[serde(default = "default_discord_env")]
         token_env: String,
     },
+    DingTalk {
+        #[serde(default = "default_dingtalk_webhook_env")]
+        webhook_url_env: String,
+        #[serde(default = "default_dingtalk_secret_env")]
+        secret_env: String,
+        #[serde(default)]
+        allowed_senders: String,
+        #[serde(default)]
+        webhook_port: Option<u16>,
+    },
     Slack {
         #[serde(default = "default_slack_bot_env")]
         bot_token_env: String,
@@ -1027,6 +1050,12 @@ fn default_telegram_env() -> String {
 }
 fn default_discord_env() -> String {
     "DISCORD_BOT_TOKEN".into()
+}
+fn default_dingtalk_webhook_env() -> String {
+    "DINGTALK_BOT_WEBHOOK".into()
+}
+fn default_dingtalk_secret_env() -> String {
+    "DINGTALK_BOT_SECRET".into()
 }
 fn default_slack_bot_env() -> String {
     "SLACK_BOT_TOKEN".into()
@@ -1744,7 +1773,9 @@ pub(crate) fn config_from_profile(
             // Override webhook_port if auto-assigned (Feishu webhook / LINE)
             if matches!(
                 ch,
-                ChannelCredentials::Feishu { .. } | ChannelCredentials::Line { .. }
+                ChannelCredentials::Feishu { .. }
+                    | ChannelCredentials::Line { .. }
+                    | ChannelCredentials::DingTalk { .. }
             ) {
                 if let Some(port) = feishu_port_override {
                     entry["settings"]["webhook_port"] = serde_json::json!(port);
@@ -1818,6 +1849,7 @@ pub(crate) fn config_from_profile(
         tool_policy: None,
         tool_policy_by_provider: Default::default(),
         embedding: None,
+        memory: profile.config.memory.clone(),
         hooks: profile.config.hooks.clone(),
         approval_policy: profile.config.approval_policy.clone(),
         context_filter: vec![],
@@ -1891,6 +1923,30 @@ fn channel_to_entry(cred: &ChannelCredentials) -> serde_json::Value {
             "type": "discord",
             "settings": { "token_env": token_env }
         }),
+        ChannelCredentials::DingTalk {
+            webhook_url_env,
+            secret_env,
+            allowed_senders,
+            webhook_port,
+        } => {
+            let senders: Vec<&str> = allowed_senders
+                .split(',')
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .collect();
+            let mut settings = serde_json::json!({
+                "webhook_url_env": webhook_url_env,
+                "secret_env": secret_env,
+            });
+            if let Some(port) = webhook_port {
+                settings["webhook_port"] = serde_json::json!(port);
+            }
+            serde_json::json!({
+                "type": "dingtalk",
+                "allowed_senders": senders,
+                "settings": settings,
+            })
+        }
         ChannelCredentials::Slack {
             bot_token_env,
             app_token_env,
@@ -2234,14 +2290,26 @@ pub fn line_webhook_port(profile: &UserProfile) -> Option<Option<u16>> {
     None
 }
 
+/// Check if a profile has a DingTalk channel and return its webhook port configuration.
+///
+/// Returns:
+/// - `Some(Some(port))` — DingTalk channel exists with explicit webhook port
+/// - `Some(None)` — DingTalk channel exists but needs an auto-assigned port
+/// - `None` — no DingTalk channel
+pub fn dingtalk_webhook_port(profile: &UserProfile) -> Option<Option<u16>> {
+    for ch in &profile.config.channels {
+        if let ChannelCredentials::DingTalk { webhook_port, .. } = ch {
+            return Some(*webhook_port);
+        }
+    }
+    None
+}
+
 /// Webhook port needed by any profile channel that listens for HTTP webhooks.
 pub fn profile_webhook_port(profile: &UserProfile) -> Option<Option<u16>> {
-    match (feishu_webhook_port(profile), line_webhook_port(profile)) {
-        (Some(f), Some(l)) => Some(f.or(l)),
-        (Some(f), None) => Some(f),
-        (None, Some(l)) => Some(l),
-        (None, None) => None,
-    }
+    feishu_webhook_port(profile)
+        .or_else(|| line_webhook_port(profile))
+        .or_else(|| dingtalk_webhook_port(profile))
 }
 
 /// Get the API channel port from a profile, if one is configured.
@@ -3971,6 +4039,12 @@ mod tests {
             ChannelCredentials::Discord {
                 token_env: "DC".into(),
             },
+            ChannelCredentials::DingTalk {
+                webhook_url_env: "DT_WEBHOOK".into(),
+                secret_env: "DT_SECRET".into(),
+                allowed_senders: "staff-1,staff-2".into(),
+                webhook_port: Some(8650),
+            },
             ChannelCredentials::Slack {
                 bot_token_env: "SB".into(),
                 app_token_env: "SA".into(),
@@ -3999,7 +4073,7 @@ mod tests {
 
         let json = serde_json::to_string(&channels).unwrap();
         let parsed: Vec<ChannelCredentials> = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed.len(), 6);
+        assert_eq!(parsed.len(), 7);
     }
 
     #[test]
@@ -4287,5 +4361,24 @@ mod tests {
         assert_eq!(settings["user_id"], "@bot:matrix.org");
         assert_eq!(settings["password"], "secret");
         assert_eq!(settings["device_name"], "octos-gw");
+    }
+
+    #[test]
+    fn should_roundtrip_tts_provider_and_cloud_on_profile_config() {
+        let json =
+            r#"{ "tts_provider": "cloud", "tts_cloud": { "appid": "999", "voice": "BV700" } }"#;
+        let cfg: ProfileConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.tts_provider.as_deref(), Some("cloud"));
+        assert_eq!(
+            cfg.tts_cloud.as_ref().unwrap().appid.as_deref(),
+            Some("999")
+        );
+    }
+
+    #[test]
+    fn should_default_tts_fields_to_none_when_absent() {
+        let cfg: ProfileConfig = serde_json::from_str("{}").unwrap();
+        assert!(cfg.tts_provider.is_none());
+        assert!(cfg.tts_cloud.is_none());
     }
 }

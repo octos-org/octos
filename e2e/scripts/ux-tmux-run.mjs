@@ -32,7 +32,7 @@ const scenarios = new Map([
       runner: 'onboarding-solo',
       finalMarker: 'M19_STDIO_HAPPY_PATH_FINAL_LINE',
       prompt:
-        'Run the stdio happy path UX smoke. Open a session, send one short prompt, and finish with M19_STDIO_HAPPY_PATH_FINAL_LINE.',
+        'Run the stdio happy path UX smoke. Open a session, send one short prompt, and finish with `M19_STDIO_HAPPY_PATH_FINAL_LINE`.',
     },
   ],
   [
@@ -137,7 +137,7 @@ const scenarios = new Map([
       runner: 'dropped-completion-backpressure',
       finalMarker: 'M19_DROPPED_COMPLETION_FINAL_LINE',
       prompt:
-        'M9 replay-lossy fixture for M18 reconnect-style replay. This covers protocol/replay_lossy recovery, not a forced dropped turn/completed send failure.',
+        'M9 replay-lossy fixture with forced dropped turn/completed writer-channel backpressure. Drive the forced terminal drop and recover through replay.',
     },
   ],
   [
@@ -157,13 +157,15 @@ const scenarios = new Map([
 
 function usage() {
   return `Usage:
-  node e2e/scripts/ux-tmux-run.mjs <scenario-id> [--dry-run]
+  node e2e/scripts/ux-tmux-run.mjs <scenario-id> [--dry-run] [--keep-session] [--no-validate]
   node e2e/scripts/ux-tmux-run.mjs --self-test [${defaultScenarioId}]
 
 Options:
-  --dry-run      Write the artifact skeleton without launching tmux.
-  --self-test    Write and validate the artifact skeleton without launching tmux.
-  --help         Show this help.
+  --dry-run       Write the artifact skeleton without launching tmux.
+  --keep-session  Leave tmux sessions running after a real run.
+  --no-validate   Skip automatic ux:tmux:validate after a dry or real run.
+  --self-test     Write and validate the artifact skeleton without launching tmux.
+  --help          Show this help.
 
 Scenarios:
   ${[...scenarios.keys()].join(', ')}
@@ -180,6 +182,8 @@ Environment:
 function parseArgs(argv) {
   let scenarioId = null;
   let dryRun = false;
+  let keepSession = false;
+  let noValidate = false;
   let selfTest = false;
   let help = false;
 
@@ -187,6 +191,10 @@ function parseArgs(argv) {
     const arg = argv[i];
     if (arg === '--dry-run') {
       dryRun = true;
+    } else if (arg === '--keep-session') {
+      keepSession = true;
+    } else if (arg === '--no-validate') {
+      noValidate = true;
     } else if (arg === '--self-test' || arg === 'self-test') {
       selfTest = true;
     } else if (arg === '--scenario') {
@@ -211,6 +219,8 @@ function parseArgs(argv) {
   return {
     scenarioId: scenarioId || defaultScenarioId,
     dryRun,
+    keepSession,
+    noValidate,
     selfTest,
     help,
   };
@@ -263,11 +273,15 @@ function taskSubagentFixtureEnv(scenario, workdir) {
   };
 }
 
+function scenarioRequiresSoloServe(scenario) {
+  return scenario.runner === 'onboarding-solo';
+}
+
 function backendFixtureEnv(scenario, workdir) {
   return {
     OCTOS_M9_PROTOCOL_FIXTURES: '1',
-    OCTOS_SOLO_LOGIN: '1',
     DEEPSEEK_API_KEY: 'dummy-key-for-ux-tmux',
+    ...(scenarioRequiresSoloServe(scenario) ? { OCTOS_SOLO_LOGIN: '1' } : {}),
     ...taskSubagentFixtureEnv(scenario, workdir),
   };
 }
@@ -276,10 +290,17 @@ function shellEnvAssignments(env) {
   return Object.entries(env).map(([name, value]) => `${name}=${shellQuote(value)}`);
 }
 
-function soloServeArgs(raw) {
-  const text = String(raw || '').trim();
-  if (/(^|\s)--solo($|\s)/.test(text)) return text;
-  return `${text} --solo`.trim();
+function ensureServeArg(rawArgs, requiredArg) {
+  const args = String(rawArgs || '').trim();
+  if (!args) return requiredArg;
+  if (args.split(/\s+/).includes(requiredArg)) return args;
+  return `${args} ${requiredArg}`;
+}
+
+function lowerRunnerServeArgs(scenario) {
+  const existing = process.env.OCTOS_TUI_SOAK_SERVE_ARGS || '';
+  if (!scenarioRequiresSoloServe(scenario)) return existing.trim();
+  return ensureServeArg(existing, '--solo');
 }
 
 function isExecutable(file) {
@@ -367,6 +388,7 @@ function resolveContext({ scenarioId, selfTest }) {
     process.env.OCTOS_UX_TMUX_SESSION || `octos-ux-${safeSlug(runId)}-${safeSlug(scenario.id)}`;
   const fixtureEnv = taskSubagentFixtureEnv(scenario, workdir);
   const backendEnv = backendFixtureEnv(scenario, workdir);
+  const backendServeArgs = scenarioRequiresSoloServe(scenario) ? ['--solo'] : [];
   const backendCommand =
     process.env.OCTOS_UX_TMUX_BACKEND_COMMAND
     || [
@@ -375,6 +397,7 @@ function resolveContext({ scenarioId, selfTest }) {
       shellQuote(octosBin),
       'serve',
       '--stdio',
+      ...backendServeArgs,
       '--data-dir',
       shellQuote(dataDir),
       '--cwd',
@@ -554,6 +577,12 @@ function writeArtifactSkeleton(ctx, options) {
         `message: ${options.message}`,
         `tmux launched: ${options.realTmuxLaunched ? 'yes' : 'no'}`,
         '',
+        'Assistant:',
+        ctx.scenario.finalMarker,
+        '',
+        'Composer',
+        `> ${ctx.scenario.prompt}`,
+        '',
       ].join('\n'),
     );
     writeText(path.join(ctx.scenarioDir, 'appui-transcript.jsonl'), '');
@@ -561,14 +590,12 @@ function writeArtifactSkeleton(ctx, options) {
       direction: 'client_to_server',
       frame: {
         jsonrpc: '2.0',
-        id: 'placeholder-1',
-        method: 'harness/placeholder',
+        id: 'placeholder-client-hello',
+        method: 'client_hello',
         params: {
+          client: 'ux-tmux-run-placeholder',
           generated_at: generatedAt,
           scenario_id: ctx.scenario.id,
-          status: options.status,
-          message: options.message,
-          real_tmux_launched: Boolean(options.realTmuxLaunched),
         },
       },
     });
@@ -576,8 +603,16 @@ function writeArtifactSkeleton(ctx, options) {
       direction: 'server_to_client',
       frame: {
         jsonrpc: '2.0',
-        id: 'placeholder-1',
+        id: 'placeholder-client-hello',
         result: {
+          methods: [
+            'client_hello',
+            'config/capabilities/list',
+          ],
+          capabilities: [
+            'client_hello',
+            'config/capabilities/list',
+          ],
           status: options.status,
           message: options.message,
         },
@@ -644,6 +679,21 @@ function refreshSummaryArtifacts(ctx, validationStatus = null) {
     collectArtifactNames(ctx.scenarioDir).map((name) => [name, artifactInfo(ctx.scenarioDir, name)]),
   );
   writeJson(summaryPath, summary);
+}
+
+function skipValidation(ctx) {
+  const summaryPath = path.join(ctx.scenarioDir, 'summary.json');
+  if (fs.existsSync(summaryPath)) {
+    const summary = JSON.parse(fs.readFileSync(summaryPath, 'utf8'));
+    summary.validation_status = 'skipped';
+    summary.validation_skipped = true;
+    summary.artifacts = Object.fromEntries(
+      collectArtifactNames(ctx.scenarioDir).map((name) => [name, artifactInfo(ctx.scenarioDir, name)]),
+    );
+    writeJson(summaryPath, summary);
+  }
+  console.log(`Validation skipped (--no-validate): ${ctx.scenarioDir}`);
+  return 0;
 }
 
 function missingRunnerBlocker(ctx) {
@@ -781,7 +831,8 @@ function runBackpressureReplayProbe(ctx, env) {
       OCTOS_M19_BACKPRESSURE_PROFILE_ID: ctx.profileId,
       OCTOS_M19_BACKPRESSURE_SESSION_ID: ctx.sessionId,
       OCTOS_M19_BACKPRESSURE_WORKSPACE: ctx.workdir,
-      OCTOS_M19_BACKPRESSURE_PROMPT: ctx.scenario.prompt,
+      OCTOS_M19_BACKPRESSURE_PROMPT:
+        'M9 replay-lossy fixture for post-drop protocol probe after TUI recovery.',
     },
     stdio: 'inherit',
   });
@@ -853,6 +904,18 @@ function runDroppedCompletionBackpressureScenario(ctx, action, env) {
   if (drive.error) throw drive.error;
   if (drive.status !== 0) status = drive.status || 1;
   captureTmuxPane(ctx.sessionName, path.join(ctx.scenarioDir, 'tui-capture-backpressure-final.txt'));
+  if (status === 0) {
+    const recovery = action('send-turn', true, {
+      OCTOS_TUI_SOAK_PROMPT: 'After forced terminal-drop recovery, reply with exactly OK.',
+      OCTOS_TUI_SOAK_TURN_WAIT_SECS: process.env.OCTOS_TUI_SOAK_BACKPRESSURE_RECOVERY_WAIT_SECS || '8',
+    });
+    if (recovery.error) throw recovery.error;
+    if (recovery.status !== 0) status = recovery.status || 1;
+    captureTmuxPane(
+      ctx.sessionName,
+      path.join(ctx.scenarioDir, 'tui-capture-backpressure-post-recovery.txt'),
+    );
+  }
   if (status === 0) status = runBackpressureReplayProbe(ctx, env);
   return status;
 }
@@ -860,6 +923,9 @@ function runDroppedCompletionBackpressureScenario(ctx, action, env) {
 function runnerSteps(ctx) {
   if (ctx.scenario.runner === 'restart-reconnect' || ctx.scenario.runner === 'dropped-completion-backpressure') {
     return [];
+  }
+  if (ctx.scenario.id === defaultScenarioId) {
+    return ['start', 'drive-solo', 'send-turn'];
   }
   if (ctx.scenario.runner === 'provider-missing') {
     return ['start', 'drive-provider-missing', 'drive-solo'];
@@ -876,7 +942,7 @@ function runnerSteps(ctx) {
   return ['start', 'drive-solo'];
 }
 
-function runLowerRunner(ctx) {
+function runLowerRunner(ctx, options = {}) {
   const shouldInitProfileLlm = ctx.scenario.runner === 'provider-missing' ? '0' : '1';
   const env = {
     ...process.env,
@@ -904,14 +970,13 @@ function runLowerRunner(ctx) {
     OCTOS_TUI_SOAK_OPEN_SESSION: 'auto',
     OCTOS_TUI_SOAK_REQUIRE_PROFILE: '0',
     OCTOS_TUI_SOAK_SOLO_STRICT: process.env.OCTOS_TUI_SOAK_SOLO_STRICT || '0',
+    OCTOS_TUI_SOAK_SERVE_ARGS: lowerRunnerServeArgs(ctx.scenario),
     OCTOS_TUI_SOAK_SERVER_WAIT_SECS:
       process.env.OCTOS_TUI_SOAK_SERVER_WAIT_SECS
       || (ctx.scenario.transport === 'websocket' ? '4' : '1'),
     OCTOS_TUI_SOAK_TUI_WAIT_SECS: process.env.OCTOS_TUI_SOAK_TUI_WAIT_SECS || '2',
     OCTOS_TUI_SOAK_EXIT_HOLD_SECS: process.env.OCTOS_TUI_SOAK_EXIT_HOLD_SECS || '30',
-    OCTOS_TUI_SOAK_SERVE_ARGS: soloServeArgs(process.env.OCTOS_TUI_SOAK_SERVE_ARGS),
     OCTOS_M9_PROTOCOL_FIXTURES: '1',
-    OCTOS_SOLO_LOGIN: '1',
     ...ctx.fixtureEnv,
   };
 
@@ -929,9 +994,13 @@ function runLowerRunner(ctx) {
   } else {
     for (const step of runnerSteps(ctx)) {
       if (status !== 0) break;
-      const stepEnv = ctx.scenario.runner === 'provider-missing' && step === 'drive-solo'
-        ? { OCTOS_TUI_SOAK_INIT_PROFILE_LLM: '1' }
-        : {};
+      const stepEnv = {};
+      if (ctx.scenario.runner === 'provider-missing' && step === 'drive-solo') {
+        stepEnv.OCTOS_TUI_SOAK_INIT_PROFILE_LLM = '1';
+      }
+      if (step === 'send-turn') {
+        stepEnv.OCTOS_TUI_SOAK_PROMPT = ctx.scenario.prompt;
+      }
       const result = action(step, true, stepEnv);
       if (result.error) throw result.error;
       if (result.status !== 0) status = result.status || 1;
@@ -950,7 +1019,7 @@ function runLowerRunner(ctx) {
   if (capture.error && status === 0) throw capture.error;
   if (capture.status !== 0 && status === 0) status = capture.status || 1;
 
-  if (process.env.OCTOS_UX_TMUX_KEEP_SESSION !== '1') {
+  if (!options.keepSession && process.env.OCTOS_UX_TMUX_KEEP_SESSION !== '1') {
     action('stop', false);
   }
 
@@ -968,7 +1037,7 @@ function runValidation(ctx) {
   return status;
 }
 
-function realMode(ctx) {
+function realMode(ctx, options = {}) {
   if (!ctx.scenario.runner) {
     const blocker = ctx.scenario.blockedMessage || `scenario ${ctx.scenario.id} has no real tmux runner yet`;
     writeArtifactSkeleton(ctx, {
@@ -980,7 +1049,7 @@ function realMode(ctx) {
       placeholderArtifacts: true,
       realTmuxLaunched: false,
     });
-    const validationStatus = runValidation(ctx);
+    const validationStatus = options.noValidate ? skipValidation(ctx) : runValidation(ctx);
     console.error(`${blocker}\nArtifacts: ${ctx.scenarioDir}`);
     return validationStatus === 0 ? 2 : validationStatus;
   }
@@ -996,7 +1065,7 @@ function realMode(ctx) {
       placeholderArtifacts: true,
       realTmuxLaunched: false,
     });
-    const validationStatus = runValidation(ctx);
+    const validationStatus = options.noValidate ? skipValidation(ctx) : runValidation(ctx);
     console.error(`${runnerBlocker}\nArtifacts: ${ctx.scenarioDir}`);
     return validationStatus === 0 ? 2 : validationStatus;
   }
@@ -1012,7 +1081,7 @@ function realMode(ctx) {
       placeholderArtifacts: true,
       realTmuxLaunched: false,
     });
-    const validationStatus = runValidation(ctx);
+    const validationStatus = options.noValidate ? skipValidation(ctx) : runValidation(ctx);
     console.error(`${blocker}\nArtifacts: ${ctx.scenarioDir}`);
     return validationStatus === 0 ? 2 : validationStatus;
   }
@@ -1028,7 +1097,7 @@ function realMode(ctx) {
 
   let status = 1;
   try {
-    status = runLowerRunner(ctx);
+    status = runLowerRunner(ctx, { keepSession: options.keepSession });
   } finally {
     writeArtifactSkeleton(ctx, {
       mode: 'run',
@@ -1039,12 +1108,12 @@ function realMode(ctx) {
       realTmuxLaunched: true,
     });
   }
-  const validationStatus = runValidation(ctx);
+  const validationStatus = options.noValidate ? skipValidation(ctx) : runValidation(ctx);
   console.log(`UX tmux artifacts: ${ctx.scenarioDir}`);
   return status === 0 ? validationStatus : status;
 }
 
-function dryRun(ctx) {
+function dryRun(ctx, options = {}) {
   writeArtifactSkeleton(ctx, {
     mode: 'dry-run',
     status: 'blocked',
@@ -1053,7 +1122,7 @@ function dryRun(ctx) {
     placeholderArtifacts: true,
     realTmuxLaunched: false,
   });
-  const validationStatus = runValidation(ctx);
+  const validationStatus = options.noValidate ? skipValidation(ctx) : runValidation(ctx);
   console.log(`Dry run wrote UX tmux artifact skeleton: ${ctx.scenarioDir}`);
   return validationStatus;
 }
@@ -1085,8 +1154,8 @@ function main() {
 
   const ctx = resolveContext(args);
   if (args.selfTest) return selfTest(ctx);
-  if (args.dryRun) return dryRun(ctx);
-  return realMode(ctx);
+  if (args.dryRun) return dryRun(ctx, { noValidate: args.noValidate });
+  return realMode(ctx, { keepSession: args.keepSession, noValidate: args.noValidate });
 }
 
 try {

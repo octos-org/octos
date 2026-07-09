@@ -55,7 +55,7 @@ pub struct ProductSpec {
     /// (Stage 2, `github` feature) reads it only when this is `Some` and the var
     /// is set & non-blank; a public repo never requires it.
     pub github_token_env: Option<String>,
-    /// Homebrew formula (tap-qualified), e.g. `octos-org/tap/octos`.
+    /// Homebrew formula (tap-qualified), e.g. `octos-org/octos/octos`.
     pub brew_formula: Option<String>,
     /// npm package name, e.g. `@octos-org/octos`.
     pub npm_package: Option<String>,
@@ -148,12 +148,12 @@ mod tests {
     #[test]
     fn builder_sets_optional_fields() {
         let spec = ProductSpec::new("octos", "octos", "1.2.3", "octos-org/octos", "octos-bundle")
-            .with_brew_formula("octos-org/tap/octos")
+            .with_brew_formula("octos-org/octos/octos")
             .with_npm_package("@octos-org/octos")
             .with_cargo_install("octos-cli")
             .with_cargo_dist_app("octos");
         assert_eq!(spec.current_version, "1.2.3");
-        assert_eq!(spec.brew_formula.as_deref(), Some("octos-org/tap/octos"));
+        assert_eq!(spec.brew_formula.as_deref(), Some("octos-org/octos/octos"));
         assert_eq!(spec.npm_package.as_deref(), Some("@octos-org/octos"));
         assert_eq!(spec.cargo_install.as_deref(), Some("octos-cli"));
         assert_eq!(spec.cargo_dist_app.as_deref(), Some("octos"));

@@ -21,6 +21,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use eyre::{Result, WrapErr, eyre};
+use futures::StreamExt;
 use octos_core::{InboundMessage, OutboundMessage};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -42,6 +43,7 @@ const MATRIX_INVITES_FILE: &str = "matrix-invites.json";
 /// Long-poll timeout for the `/sync` request (server holds the connection open
 /// until an event arrives or this elapses).
 const SYNC_TIMEOUT_MS: u64 = 30_000;
+const MATRIX_ERROR_BODY_MAX_BYTES: usize = 2048;
 const DEFAULT_DEVICE_NAME: &str = "octos";
 
 /// Matrix invite auto-join policy.
@@ -463,6 +465,79 @@ fn is_stable_join_target(target: &str) -> bool {
     trimmed == "*" || trimmed.starts_with('!') || trimmed.starts_with('#')
 }
 
+fn matrix_http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .expect("failed to build Matrix HTTP client")
+}
+
+async fn matrix_error_body(resp: reqwest::Response) -> String {
+    let mut buf = Vec::new();
+    let mut truncated = resp
+        .content_length()
+        .map(|len| len > MATRIX_ERROR_BODY_MAX_BYTES as u64)
+        .unwrap_or(false);
+    let mut stream = resp.bytes_stream();
+
+    while let Some(chunk) = stream.next().await {
+        match chunk {
+            Ok(chunk) => {
+                if buf.len() + chunk.len() > MATRIX_ERROR_BODY_MAX_BYTES {
+                    let remaining = MATRIX_ERROR_BODY_MAX_BYTES.saturating_sub(buf.len());
+                    buf.extend_from_slice(&chunk[..remaining]);
+                    truncated = true;
+                    break;
+                }
+                buf.extend_from_slice(&chunk);
+            }
+            Err(_) => {
+                truncated = true;
+                break;
+            }
+        }
+    }
+
+    sanitize_matrix_error_body(&String::from_utf8_lossy(&buf), truncated)
+}
+
+fn sanitize_matrix_error_body(raw: &str, truncated: bool) -> String {
+    let mut out = String::new();
+    let mut last_space = false;
+    for ch in raw.chars() {
+        let ch = if ch.is_control() { ' ' } else { ch };
+        if ch.is_whitespace() {
+            if !last_space {
+                out.push(' ');
+                last_space = true;
+            }
+        } else {
+            out.push(ch);
+            last_space = false;
+        }
+    }
+
+    let mut out = out.trim().to_string();
+    if truncated {
+        if out.is_empty() {
+            out.push_str("[truncated]");
+        } else {
+            out.push_str(" ... [truncated]");
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+fn initial_sync_retry_delay() -> Duration {
+    Duration::from_millis(10)
+}
+
+#[cfg(not(test))]
+fn initial_sync_retry_delay() -> Duration {
+    Duration::from_secs(1)
+}
+
 /// Build the JSON body for a `m.login.password` request.
 fn password_login_body(user_id: &str, password: &str, device_name: Option<&str>) -> Value {
     json!({
@@ -548,7 +623,7 @@ impl MatrixUserChannel {
                 .filter(|s| !s.is_empty())
                 .collect(),
             shutdown,
-            http: reqwest::Client::new(),
+            http: matrix_http_client(),
             dedup: Arc::new(MessageDedup::new()),
             resolved: Mutex::new(None),
         }
@@ -582,7 +657,7 @@ impl MatrixUserChannel {
                 .wrap_err("Matrix whoami request failed")?;
             if !resp.status().is_success() {
                 let status = resp.status();
-                let body = resp.text().await.unwrap_or_default();
+                let body = matrix_error_body(resp).await;
                 return Err(eyre!("Matrix whoami failed (status={status}): {body}"));
             }
             let payload: Value = resp.json().await.wrap_err("invalid whoami response")?;
@@ -618,7 +693,7 @@ impl MatrixUserChannel {
             .wrap_err("Matrix password login request failed")?;
         if !resp.status().is_success() {
             let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
+            let body = matrix_error_body(resp).await;
             return Err(eyre!(
                 "Matrix password login failed (status={status}): {body}"
             ));
@@ -659,7 +734,7 @@ impl MatrixUserChannel {
             .wrap_err("Matrix sync request failed")?;
         if !resp.status().is_success() {
             let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
+            let body = matrix_error_body(resp).await;
             return Err(eyre!("Matrix sync failed (status={status}): {body}"));
         }
         let payload: Value = resp.json().await.wrap_err("invalid sync response")?;
@@ -682,7 +757,7 @@ impl MatrixUserChannel {
             .wrap_err("Matrix join room request failed")?;
         if !resp.status().is_success() {
             let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
+            let body = matrix_error_body(resp).await;
             return Err(eyre!("Matrix join room failed (status={status}): {body}"));
         }
         Ok(())
@@ -705,7 +780,7 @@ impl MatrixUserChannel {
         }
         if !resp.status().is_success() {
             let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
+            let body = matrix_error_body(resp).await;
             return Err(eyre!(
                 "Matrix room alias lookup failed (status={status}): {body}"
             ));
@@ -816,6 +891,31 @@ impl MatrixUserChannel {
         }
     }
 
+    async fn initial_sync_cursor(&self, token: &str, self_user_id: &str) -> Result<Option<String>> {
+        let mut backoff = initial_sync_retry_delay();
+        while !self.shutdown.load(Ordering::Acquire) {
+            match self.sync_once(token, self_user_id, None, 0).await {
+                Ok(initial) => {
+                    self.join_allowed_invites(token, initial.invites).await;
+                    if let Some(next_batch) = initial.next_batch {
+                        return Ok(Some(next_batch));
+                    }
+                    warn!("initial Matrix sync response missing next_batch; retrying");
+                }
+                Err(e) => {
+                    warn!(error = %e, "initial Matrix sync failed; retrying");
+                }
+            }
+
+            if self.shutdown.load(Ordering::Acquire) {
+                break;
+            }
+            tokio::time::sleep(backoff).await;
+            backoff = (backoff * 2).min(Duration::from_secs(30));
+        }
+        Ok(None)
+    }
+
     /// Forward parsed messages to the bus, applying dedup and allowlists.
     async fn forward_messages(
         &self,
@@ -890,26 +990,19 @@ impl Channel for MatrixUserChannel {
 
         // Initial sync (timeout=0): pick up the latest position and any pending
         // invites without replaying historical messages.
-        let mut since = match self.sync_once(&token, &self_user_id, None, 0).await {
-            Ok(initial) => {
-                self.join_allowed_invites(&token, initial.invites).await;
-                initial.next_batch
-            }
-            Err(e) => {
-                warn!(error = %e, "initial Matrix sync failed; continuing");
-                None
-            }
+        let Some(mut since) = self.initial_sync_cursor(&token, &self_user_id).await? else {
+            return Ok(());
         };
 
         let mut backoff = Duration::from_secs(1);
         while !self.shutdown.load(Ordering::Acquire) {
             match self
-                .sync_once(&token, &self_user_id, since.as_deref(), SYNC_TIMEOUT_MS)
+                .sync_once(&token, &self_user_id, Some(&since), SYNC_TIMEOUT_MS)
                 .await
             {
                 Ok(parsed) => {
-                    if parsed.next_batch.is_some() {
-                        since = parsed.next_batch;
+                    if let Some(next_batch) = parsed.next_batch {
+                        since = next_batch;
                     }
                     self.join_allowed_invites(&token, parsed.invites).await;
                     self.forward_messages(parsed.messages, &inbound_tx).await?;
@@ -960,7 +1053,7 @@ impl Channel for MatrixUserChannel {
             .wrap_err("failed to send Matrix message")?;
         if !resp.status().is_success() {
             let status = resp.status();
-            let text = resp.text().await.unwrap_or_default();
+            let text = matrix_error_body(resp).await;
             return Err(eyre!("Matrix send failed (status={status}): {text}"));
         }
         Ok(())
@@ -1152,6 +1245,88 @@ mod tests {
             sync_path(Some("  "), 100),
             "/_matrix/client/v3/sync?timeout=100"
         );
+    }
+
+    #[tokio::test]
+    async fn initial_sync_retries_until_cursor_obtained() {
+        use std::sync::atomic::AtomicUsize;
+
+        use axum::Router;
+        use axum::http::StatusCode;
+        use axum::response::IntoResponse;
+        use axum::routing::get;
+
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let attempts_for_route = attempts.clone();
+        let app = Router::new().route(
+            "/_matrix/client/v3/sync",
+            get(move || {
+                let attempts = attempts_for_route.clone();
+                async move {
+                    let attempt = attempts.fetch_add(1, Ordering::SeqCst);
+                    if attempt == 0 {
+                        (StatusCode::BAD_GATEWAY, "temporary").into_response()
+                    } else {
+                        axum::Json(json!({ "next_batch": "s2" })).into_response()
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let ch = MatrixUserChannel::new(
+            &format!("http://{addr}"),
+            Some("@bot:example.org".into()),
+            Some("tok".into()),
+            None,
+            None,
+            vec![],
+            MatrixAutoJoin::Off,
+            vec![],
+            MatrixGroupPolicy::Open,
+            false,
+            vec![],
+            shutdown,
+        );
+
+        let cursor = ch
+            .initial_sync_cursor("tok", "@bot:example.org")
+            .await
+            .unwrap();
+
+        assert_eq!(cursor.as_deref(), Some("s2"));
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn matrix_runtime_http_client_does_not_follow_redirects() {
+        use axum::Router;
+        use axum::response::Redirect;
+        use axum::routing::get;
+
+        let app = Router::new()
+            .route(
+                "/redirect",
+                get(|| async { Redirect::temporary("/target") }),
+            )
+            .route("/target", get(|| async { "target" }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let resp = matrix_http_client()
+            .get(format!("http://{addr}/redirect"))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), reqwest::StatusCode::TEMPORARY_REDIRECT);
     }
 
     #[test]

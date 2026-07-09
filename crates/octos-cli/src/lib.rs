@@ -5,6 +5,8 @@
 //! the MCP server dispatch in [`commands::mcp_serve`]). Keep the public API
 //! narrow — only items that integration tests or sibling crates consume.
 
+#[cfg(feature = "api")]
+pub mod admin_audit_store;
 pub mod admin_token_store;
 #[cfg(feature = "api")]
 pub mod api;
@@ -24,6 +26,8 @@ pub mod cron_tool;
 pub mod gateway_dispatcher;
 #[cfg(feature = "api")]
 pub mod login_allowlist;
+pub mod memory_consolidate;
+pub mod memory_refresh;
 #[cfg(feature = "api")]
 pub mod monitor;
 #[cfg(feature = "api")]
@@ -31,6 +35,7 @@ pub mod otp;
 pub mod persona_service;
 #[cfg(feature = "api")]
 pub mod process_manager;
+pub mod profile_qr;
 pub mod profiles;
 pub mod project_templates;
 mod qos_catalog;
@@ -47,6 +52,7 @@ pub mod tenant;
 pub mod tools;
 #[cfg(feature = "api")]
 pub mod updater;
+pub mod usage_ledger;
 #[cfg(feature = "api")]
 pub mod user_store;
 pub mod workflow_runtime;

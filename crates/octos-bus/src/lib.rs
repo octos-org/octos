@@ -16,6 +16,8 @@ pub mod session;
 
 #[cfg(feature = "api")]
 pub mod api_channel;
+#[cfg(feature = "dingtalk")]
+pub mod dingtalk_channel;
 #[cfg(feature = "discord")]
 pub mod discord_channel;
 #[cfg(feature = "email")]
@@ -61,13 +63,15 @@ pub use resume_policy::{
     reconstruct_content_replacement_state,
 };
 pub use session::{
-    ActiveSessionStore, MessageCommitObserver, Session, SessionHandle, SessionListEntry,
-    SessionManager, persist_message_through_canonical_path, set_message_commit_observer,
-    validate_topic_name,
+    ActiveSessionStore, AnalysisFile, AnalysisSession, MessageCommitObserver, Session,
+    SessionHandle, SessionListEntry, SessionManager, persist_message_through_canonical_path,
+    set_message_commit_observer, validate_topic_name,
 };
 
 #[cfg(feature = "api")]
 pub use api_channel::{ApiChannel, TaskCancelOutcome, TaskRelaunchOutcome};
+#[cfg(feature = "dingtalk")]
+pub use dingtalk_channel::DingTalkChannel;
 #[cfg(feature = "discord")]
 pub use discord_channel::DiscordChannel;
 #[cfg(feature = "email")]
