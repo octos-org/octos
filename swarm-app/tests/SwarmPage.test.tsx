@@ -234,6 +234,9 @@ describe('SwarmPage', () => {
       }
     ).StubEventSource.instances
     const es = stubs[stubs.length - 1]
+    expect(es.url).toBe(
+      '/api/events/harness?kinds=swarm_dispatch%2Cswarm_review_decision%2Ccost_attribution%2Csub_agent_dispatch',
+    )
     act(() => {
       es.dispatch({
         kind: 'swarm_dispatch',

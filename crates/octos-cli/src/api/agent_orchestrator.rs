@@ -624,6 +624,22 @@ impl InProcessAgentOrchestrator {
     /// the operator resume explicitly (`/loop resume <id>`). The transition
     /// is persisted so the pause survives further restarts. Returns the
     /// paused `(loop_id, session_id)` pairs so the caller can log them.
+    ///
+    /// Parking also retires any boot-restored queued `LoopFire` belonging to
+    /// a loop parked here. Left queued, such a fire is a permanent zombie:
+    /// unschedulable at every drain (`pending_continuation_is_schedulable`
+    /// rejects non-active loops), deliberately spared by the drain path's
+    /// `stale_drop_should_tombstone` pause carve-out, and resurrected from
+    /// the ledger on every future boot. Unlike the drain path we DO write
+    /// the terminal ledger record here: the ledger's only consumer is boot
+    /// restore, and after a solo park the fire must not come back — while a
+    /// later `/loop resume` re-fires from the loop record's own persisted
+    /// schedule (`next_run_at_ms`), which never consults this ledger entry.
+    /// (The `Completed > Queued` upsert rank means a post-resume queued fire
+    /// won't re-persist under the same dedupe key, but that is already true
+    /// today after any loop's first drained fire completes — see
+    /// `mark_continuation_completed` — so parking loses no durability the
+    /// steady state ever had.)
     pub(crate) fn pause_restored_loops_for_solo_boot(&self) -> Vec<(String, SessionKey)> {
         let mut state = self.state();
         let state = &mut *state;
@@ -638,6 +654,42 @@ impl InProcessAgentOrchestrator {
             loop_record.updated_at_ms = now;
             persist_loop_state_with_store(supervisor_store, loop_record);
             paused.push((loop_record.loop_id.clone(), loop_record.session_id.clone()));
+        }
+        let parked: std::collections::HashSet<&str> =
+            paused.iter().map(|(loop_id, _)| loop_id.as_str()).collect();
+        let orphaned_fires: Vec<_> = state
+            .continuations
+            .pending_items()
+            .filter(|item| {
+                item.reason == MasterContinuationReason::LoopFire
+                    && item
+                        .loop_id
+                        .as_ref()
+                        .is_some_and(|loop_id| parked.contains(loop_id.as_str()))
+            })
+            .map(|item| {
+                (
+                    item.group_id.clone(),
+                    item.dedupe_key.clone(),
+                    item.loop_id.clone(),
+                )
+            })
+            .collect();
+        for (group_id, dedupe_key, loop_id) in orphaned_fires {
+            state.continuations.cancel(&dedupe_key);
+            if let Some(store) = supervisor_store {
+                let _ = store.record_continuation_completed(
+                    group_id.as_str(),
+                    dedupe_key.as_str(),
+                    now_ms_u64(),
+                    Some("discarded:solo_boot_parked_loop".into()),
+                );
+            }
+            tracing::info!(
+                loop_id = ?loop_id.as_ref().map(|id| id.as_str()),
+                dedupe_key = %dedupe_key.as_str(),
+                "solo boot: retired queued loop fire alongside its parked loop"
+            );
         }
         paused
     }
@@ -872,7 +924,6 @@ impl InProcessAgentOrchestrator {
         if let Some(system_prompt) = system_prompt {
             worker = worker.with_system_prompt(system_prompt);
         }
-        worker.wire_activate_tools();
         // RFC-1: wire mofa_make for spawned workers too — child
         // registries inherit a shared catalog so the dispatcher must
         // resolve through the right registry handle.
@@ -1930,8 +1981,15 @@ impl InProcessAgentOrchestrator {
     /// `session/orchestration` status — `active` is true when any of the three
     /// is non-zero, so the client's job indicator stays live across the
     /// sub-agent-complete → master-re-entry gap.
+    ///
+    /// Only continuations that pass `pending_continuation_is_schedulable`
+    /// count: an unschedulable item (e.g. a boot-restored `LoopFire` whose
+    /// owning loop is paused) is skipped by every scheduler drain and can
+    /// never become a turn, so counting it would pin the client's
+    /// "re-entering" indicator on forever with zero actual work.
     pub(crate) fn session_orchestration_counts(&self, session_id: &SessionKey) -> (u32, u32) {
         let state = self.state();
+        let state = &*state;
         let running_agents = state
             .agents
             .values()
@@ -1943,19 +2001,26 @@ impl InProcessAgentOrchestrator {
         let pending_continuations = state
             .continuations
             .pending_items()
-            .filter(|item| item.session_id.as_str() == session_str)
+            .filter(|item| {
+                item.session_id.as_str() == session_str
+                    && pending_continuation_is_schedulable(state, item)
+            })
             .count() as u32;
         (running_agents, pending_continuations)
     }
 
     /// Sessions that currently have active orchestration from the
     /// orchestrator's view: a non-terminal sub-agent OR a queued master
-    /// continuation. The AppUI tick unions this with its in-flight-turn set to
-    /// decide which sessions to emit `session/orchestration` for.
+    /// continuation that the scheduler would actually run (same
+    /// schedulability gate as `session_orchestration_counts` — unschedulable
+    /// zombies must not keep a session's job indicator alive). The AppUI tick
+    /// unions this with its in-flight-turn set to decide which sessions to
+    /// emit `session/orchestration` for.
     pub(crate) fn sessions_with_active_orchestration(
         &self,
     ) -> std::collections::HashSet<SessionKey> {
         let state = self.state();
+        let state = &*state;
         let mut sessions = std::collections::HashSet::new();
         for agent in state.agents.values() {
             if !is_agent_terminal_status(&agent.status) {
@@ -1963,6 +2028,9 @@ impl InProcessAgentOrchestrator {
             }
         }
         for item in state.continuations.pending_items() {
+            if !pending_continuation_is_schedulable(state, item) {
+                continue;
+            }
             sessions.insert(SessionKey(item.session_id.as_str().to_owned()));
         }
         sessions
@@ -6547,6 +6615,206 @@ mod tests {
         third
             .configure_supervisor_store(&store_dir)
             .expect("replay 2");
+        assert!(
+            third.pause_restored_loops_for_solo_boot().is_empty(),
+            "already-paused loops must not be re-parked"
+        );
+    }
+
+    /// Zombie "Re-entering" indicator, prong (a) — honest counts. A queued
+    /// `LoopFire` whose owning loop is paused fails
+    /// `pending_continuation_is_schedulable`, so every scheduler drain skips
+    /// it: it can never become a turn. If `session_orchestration_counts` /
+    /// `sessions_with_active_orchestration` still count it, the AppUI
+    /// `session/orchestration` tick reports `pending > 0` with no running
+    /// turn forever — a permanent "re-entering" spinner with zero actual
+    /// work. Pin that only schedulable continuations drive the indicator.
+    #[test]
+    fn should_not_count_pending_loop_fire_toward_orchestration_when_owning_loop_paused() {
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let session_id = SessionKey::with_profile("tenant-a", "api", "orch-count-paused-loop");
+        let created = orchestrator
+            .create_loop(LoopCreateRequest {
+                session_id: session_id.clone(),
+                profile_id: "tenant-a".into(),
+                prompt: Some("poll the build".into()),
+                command: None,
+                interval_seconds: Some(60),
+                mode: None,
+            })
+            .expect("create loop");
+        let loop_id = created["loop_id"].as_str().expect("loop_id").to_owned();
+
+        // Queue a fire exactly like the scheduled due-tick enqueue.
+        {
+            let mut state = orchestrator.state();
+            let fire = MasterContinuationRequest::new(
+                "coding-autonomy",
+                session_id.to_string(),
+                "tenant-a".to_owned(),
+                MasterContinuationReason::LoopFire,
+                SystemTime::now(),
+            )
+            .with_dedupe_key(loop_fire_dedupe_key(
+                "coding-autonomy",
+                "tenant-a",
+                &loop_id,
+            ))
+            .with_loop_id(loop_id.clone())
+            .with_metadata("prompt", "poll the build");
+            assert!(
+                enqueue_and_persist_continuation(&mut state, fire)
+                    .queued()
+                    .is_some(),
+                "loop fire must enqueue"
+            );
+        }
+
+        // Sanity: while the loop is active the queued fire is real pending
+        // work and must keep counting.
+        assert_eq!(
+            orchestrator.session_orchestration_counts(&session_id),
+            (0, 1),
+            "an active loop's queued fire must count as pending orchestration",
+        );
+        assert!(
+            orchestrator
+                .sessions_with_active_orchestration()
+                .contains(&session_id),
+            "an active loop's queued fire must keep the session in the active set",
+        );
+
+        // Park the loop (what solo boot does to restored loops; pause/clear
+        // control paths do not cancel queued items). The fire is now
+        // unschedulable and must stop driving the indicator.
+        orchestrator
+            .state()
+            .loops
+            .get_mut(&loop_id)
+            .expect("loop record")
+            .status = "paused".to_owned();
+
+        assert_eq!(
+            orchestrator.session_orchestration_counts(&session_id),
+            (0, 0),
+            "a paused loop's queued fire is unschedulable and must not count",
+        );
+        assert!(
+            !orchestrator
+                .sessions_with_active_orchestration()
+                .contains(&session_id),
+            "an unschedulable fire must not keep the session in the active-orchestration set",
+        );
+    }
+
+    /// Zombie "Re-entering" indicator, prong (b) — no zombie creation. A
+    /// loop fire queued+persisted when the process dies is resurrected by
+    /// `configure_supervisor_store` on the next boot; if that solo boot then
+    /// parks the restored loop as paused, the resurrected fire becomes a
+    /// permanent orphan: unschedulable at every drain, deliberately spared
+    /// by `stale_drop_should_tombstone`, and re-resurrected at every future
+    /// boot. Parking must retire the parked loop's queued fires — out of
+    /// the in-memory queue AND terminal in the supervisor ledger.
+    #[test]
+    fn should_retire_queued_loop_fire_when_solo_boot_parks_restored_loop() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store_dir = dir.path().join("supervisor");
+        let session_id = SessionKey::with_profile("tenant-a", "api", "solo-loop-fire-retire");
+        let loop_id;
+        {
+            let orchestrator = InProcessAgentOrchestrator::default();
+            orchestrator
+                .configure_supervisor_store(&store_dir)
+                .expect("store");
+            let created = orchestrator
+                .create_loop(LoopCreateRequest {
+                    session_id: session_id.clone(),
+                    profile_id: "tenant-a".into(),
+                    prompt: Some("keep poking".into()),
+                    command: None,
+                    interval_seconds: Some(60),
+                    mode: None,
+                })
+                .expect("create loop");
+            loop_id = created["loop_id"].as_str().expect("loop_id").to_owned();
+            // Queue + persist a due fire exactly like the scheduled tick,
+            // then "crash" with the fire still pending.
+            let mut state = orchestrator.state();
+            let fire = MasterContinuationRequest::new(
+                "coding-autonomy",
+                session_id.to_string(),
+                "tenant-a".to_owned(),
+                MasterContinuationReason::LoopFire,
+                SystemTime::now(),
+            )
+            .with_dedupe_key(loop_fire_dedupe_key(
+                "coding-autonomy",
+                "tenant-a",
+                &loop_id,
+            ))
+            .with_loop_id(loop_id.clone())
+            .with_metadata("prompt", "keep poking");
+            assert!(
+                enqueue_and_persist_continuation(&mut state, fire)
+                    .queued()
+                    .is_some(),
+                "loop fire must enqueue"
+            );
+        }
+
+        // Restart: boot restore resurrects the queued fire, then the solo
+        // boot parks the restored loop.
+        let restarted = InProcessAgentOrchestrator::default();
+        restarted
+            .configure_supervisor_store(&store_dir)
+            .expect("replay");
+        assert_eq!(
+            restarted.pending_continuation_count_for_test(),
+            1,
+            "boot restore must resurrect the queued fire (precondition)",
+        );
+        let paused = restarted.pause_restored_loops_for_solo_boot();
+        assert_eq!(paused.len(), 1, "the restored active loop must be parked");
+
+        // The parked loop's fire must be retired with it: gone from the
+        // in-memory queue (no zombie this boot)...
+        assert_eq!(
+            restarted.pending_continuation_count_for_test(),
+            0,
+            "parking must retire the parked loop's queued fire from the in-memory queue",
+        );
+        assert_eq!(
+            restarted.session_orchestration_counts(&session_id),
+            (0, 0),
+            "the parked loop's session must report no pending orchestration",
+        );
+
+        // ...terminal in the supervisor ledger...
+        let replayed = SupervisorStore::new(&store_dir)
+            .load_state()
+            .expect("ledger state");
+        let fire_key = loop_fire_dedupe_key("coding-autonomy", "tenant-a", &loop_id);
+        let record = replayed
+            .continuations
+            .values()
+            .find(|record| record.continuation_id == fire_key)
+            .expect("fire's ledger record");
+        assert_eq!(
+            record.status,
+            ContinuationStatus::Completed,
+            "parking must write the terminal continuation record",
+        );
+
+        // ...and never resurrected again (no zombie on any future boot).
+        let third = InProcessAgentOrchestrator::default();
+        third
+            .configure_supervisor_store(&store_dir)
+            .expect("replay 2");
+        assert_eq!(
+            third.pending_continuation_count_for_test(),
+            0,
+            "the next boot must not resurrect the retired fire",
+        );
         assert!(
             third.pause_restored_loops_for_solo_boot().is_empty(),
             "already-paused loops must not be re-parked"

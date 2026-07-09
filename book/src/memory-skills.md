@@ -65,9 +65,58 @@ When configured, the agent embeds each episode summary in a fire-and-forget back
 
 **Long-term memory** (`.octos/memory/MEMORY.md`) holds persistent facts and notes that survive across all sessions. Edit this file manually or via the `write_file` tool — it is injected verbatim into the system prompt on every turn.
 
-**Daily notes** (`.octos/memory/YYYY-MM-DD.md`) provide a rolling window of recent activity. The last **7 days** of daily notes are automatically included in the agent's context. These files can be created manually or via the `write_file` tool.
+**Daily notes** (`.octos/memory/YYYY-MM-DD.md`) provide a rolling window of recent activity. The last **7 days** of daily notes are automatically included in the agent's context. These files are created manually or via the `write_file` tool — the memory-refresh pipeline below consolidates into `MEMORY.md`, not the daily notes.
 
-> **Note:** Daily notes are read by the system prompt builder but are not auto-populated. You can populate them manually or instruct the agent to write to them using `write_file`.
+`MEMORY.md` can be edited by hand, but once the refresh pipeline has migrated it, every blank-line-separated block must keep its trailing `^m…` id. Adding an un-id'd block by hand makes the parser treat the file as mixed and fail closed, pausing consolidation until it's repaired — so for new facts prefer `octos memory remember`.
+
+### Automatic Memory Refresh (capture + consolidation)
+
+Octos ships an automatic memory pipeline that reads durable facts out of your conversations and consolidates them into `MEMORY.md` — so long-term memory grows without you hand-editing files. It is **on by default**.
+
+**Where it runs.** The background sweep runs only inside the long-running process that owns the profile's refresh lock — `octos serve` or `octos gateway`. Plain `octos chat` never runs background passes (it would contend the lock). The pipeline has three parts:
+
+1. **Capture** — during a turn, a lightweight `memory_note` tool + capture policy let the agent jot candidate facts.
+2. **Extraction sweep** — on a timer, idle sessions are scanned and durable facts are extracted (delta cursors mean each message is read at most once, so nothing is re-charged on later sweeps).
+3. **Consolidation** — extracted candidates are merged into `MEMORY.md` (each entry gets a stable id like `^m4k2abq`), stale entries are archived, and the file is kept under a size cap.
+
+**Manual control — `octos memory`:**
+
+```bash
+octos memory refresh          # Run one extraction+consolidation pass now
+octos memory status           # Lock holder, staging backlog, daily budgets
+octos memory remember "..."   # Stage a fact locally (no LLM at write; consolidation applies it)
+octos memory forget "..."     # Free-text forget → confirm flow
+octos memory forget --id ^m4k2abq   # Hard-delete an exact MEMORY.md entry
+```
+
+`refresh` works even when the background sweep is disabled, but refuses while a running service holds the lock (stop it first, or let it sweep).
+
+**Configuration** (all optional; sensible defaults apply) lives under `memory.refresh` in `config.json`:
+
+```json
+{
+  "memory": {
+    "max_inject_tokens": 2500,
+    "refresh": {
+      "enabled": true,
+      "extract_model": null,
+      "consolidate_model": null,
+      "min_idle_minutes": 30,
+      "max_session_age_days": 10,
+      "max_sessions_per_pass": 2,
+      "max_extractions_per_day": 20,
+      "max_consolidations_per_day": 12,
+      "max_daily_tokens": 200000,
+      "consolidate_interval_minutes": 30,
+      "max_memory_file_tokens": 8000
+    }
+  }
+}
+```
+
+- **`enabled`** is tri-state: **absent means ON** (the product default). Set `false` — or `OCTOS_MEMORY_REFRESH_ENABLED=0` — to opt out entirely (no capture tool, no per-turn re-read, no sweep). A host-level opt-out is inherited by sub-profiles.
+- **`extract_model` / `consolidate_model`** default to the profile's provider; point them at a cheap model to keep refresh costs low.
+- Daily budgets (`max_extractions_per_day`, `max_consolidations_per_day`, `max_daily_tokens`) are per-profile and reset on local-date rollover; durable state lives in `memory/refresh_state.json`.
 
 ### Layer 3: Entity Bank (tool-driven)
 
@@ -84,7 +133,7 @@ The entity bank is a structured knowledge store at `.octos/memory/bank/entities/
 - **`save_memory`** — Create or update an entity page. The agent is instructed to first `recall_memory` for existing content, then merge new information before saving (no data loss).
 - **`recall_memory`** — Load the full content of a named entity. If the entity doesn't exist, returns a list of all available entities.
 
-> **Auto-deferral:** When the total tool count exceeds 15, memory tools are moved to the `group:memory` deferred group. The agent must use `activate_tools` to enable them before saving or recalling.
+> **Availability:** memory tools (`save_memory`, `recall_memory`) are part of the full tool set sent to the model every turn — no activation step is needed. (Earlier versions deferred them behind an `activate_tools` meta-tool; that scheme was removed in RFC-0.)
 
 ## File Layout
 

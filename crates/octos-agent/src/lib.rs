@@ -53,6 +53,7 @@ pub mod subagent_summary;
 mod subprocess_env;
 pub use subprocess_env::register_secret_env_names;
 pub mod summarizer;
+pub mod swarm;
 pub mod task_supervisor;
 pub mod tools;
 pub mod turn;
@@ -166,13 +167,17 @@ pub use subagent_summary::{
     DEFAULT_SUBAGENT_SUMMARY_WINDOW, SubAgentSummaryRegistry, SubAgentSummaryWatcher,
 };
 pub use summarizer::{ExtractiveSummarizer, Summarizer};
+pub use swarm::{
+    FileMailbox, InProcessMailbox, MAILBOX_SCHEMA_VERSION, MailboxBackend, MailboxEnvelope,
+    MailboxMessage, MailboxRecovery,
+};
 pub use task_supervisor::{
     BackgroundTask, RelaunchOpts, RelaunchRequest, SpawnOnlyFailureSignal, TaskCancelError,
     TaskCancelToken, TaskLifecycleState, TaskRelaunchError, TaskRuntimeState, TaskStatus,
     TaskSupervisor, TerminalEvent, TerminalOutcome, parse_alternatives,
 };
 pub use tools::{
-    ActivateToolsTool, AskUserQuestionTool, BackgroundResultKind, BackgroundResultPayload,
+    AskUserQuestionTool, BackgroundResultKind, BackgroundResultPayload,
     BrowserTool, CheckBackgroundTasksTool, CheckWorkspaceContractTool, ConcurrencyClass,
     ConfigureToolTool, DEFAULT_DISPATCH_TIMEOUT_SECS, DEFAULT_HTTP_CONNECT_TIMEOUT_SECS,
     DEFAULT_HTTP_READ_TIMEOUT_SECS, DELEGATED_DENY_GROUP, DELEGATION_METRIC, DeepSearchTool,

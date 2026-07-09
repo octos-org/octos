@@ -36,9 +36,60 @@ const FIRST_PARTY_SKILL_ENV_VARS: &[&str] = &[
     "GEMINI_BASE_URL",
     "GOOGLE_API_KEY",
     "GOOGLE_BASE_URL",
+    "GOOGLE_CLOUD_PROJECT",
+    "GOOGLE_CLOUD_LOCATION",
+    "VERTEX_BASE_URL",
     "DASHSCOPE_API_KEY",
     "DASHSCOPE_BASE_URL",
 ];
+
+/// Google / Vertex credential material: the raw service-account JSON, the
+/// application-default-credentials path, and OAuth access tokens. Unlike
+/// [`FIRST_PARTY_SKILL_ENV_VARS`], these are forwarded to skill processes
+/// ONLY when the profile's own provider chain (primary or a fallback)
+/// resolves to a Google-family provider — a profile that merely has Vertex
+/// credentials configured but routes through a different provider must not
+/// hand its SA JSON to every skill subprocess.
+///
+/// The names are also force-registered via
+/// [`octos_agent::register_secret_env_names`]: `VERTEX_SA_JSON` in
+/// particular does not look secret to the `is_secret_env_name` heuristic,
+/// and the provider-build-time registration in `Config::resolve_api_key`
+/// only fires when Vertex is the ACTIVE provider.
+const GOOGLE_VERTEX_CREDENTIAL_ENV_VARS: &[&str] = &[
+    "GOOGLE_APPLICATION_CREDENTIALS",
+    "VERTEX_SA_JSON",
+    "VERTEX_ACCESS_TOKEN",
+    "GOOGLE_OAUTH_ACCESS_TOKEN",
+];
+
+/// Provider families that authenticate against Google Cloud credentials.
+/// Mirrors the provider-name spellings `build_plugin_env` special-cases.
+fn is_google_family_provider(provider: &str) -> bool {
+    matches!(
+        provider,
+        "gemini" | "google" | "vertex" | "vertex-ai" | "vertexai"
+    )
+}
+
+/// True when the profile's provider chain (primary or any fallback)
+/// resolves to a Google-family provider. Mirrors the runtime provider
+/// resolution: explicit `family_id` first, else `detect_provider` on the
+/// selection's model id.
+fn profile_uses_google_family_provider(profile: &crate::profiles::UserProfile) -> bool {
+    profile.config.llm.as_ref().is_some_and(|llm| {
+        llm.primary
+            .iter()
+            .chain(llm.fallbacks.iter())
+            .any(|selection| {
+                selection
+                    .family_id
+                    .as_deref()
+                    .or_else(|| selection.model_id.as_deref().and_then(detect_provider))
+                    .is_some_and(is_google_family_provider)
+            })
+    })
+}
 
 pub(crate) fn canonical_search_env(provider_id: &str) -> Option<&'static str> {
     match provider_id {
@@ -103,6 +154,26 @@ pub(crate) fn profile_plugin_env(profile: &crate::profiles::UserProfile) -> Vec<
             .or_else(|| std::env::var(key).ok())
         {
             push_env_once(&mut env, *key, value);
+        }
+    }
+
+    // Google / Vertex credentials: ALWAYS secret-register the names (their
+    // values may sit in the process env regardless of the active provider,
+    // and `VERTEX_SA_JSON` doesn't trip the secret-name heuristic), but
+    // forward them ONLY to skills of a profile whose provider chain actually
+    // uses a Google-family provider. This keeps the sanctioned path working —
+    // a Vertex-routed profile's skills still receive the SA JSON — without
+    // leaking it into every skill subprocess of unrelated profiles.
+    octos_agent::register_secret_env_names(GOOGLE_VERTEX_CREDENTIAL_ENV_VARS.iter().copied());
+    if profile_uses_google_family_provider(profile) {
+        for key in GOOGLE_VERTEX_CREDENTIAL_ENV_VARS {
+            if let Some(value) = resolved_env_vars
+                .get(*key)
+                .cloned()
+                .or_else(|| std::env::var(key).ok())
+            {
+                push_env_once(&mut env, *key, value);
+            }
         }
     }
 
@@ -617,6 +688,13 @@ impl ProfileActorFactoryBuilder {
         let mut actor_plugin_dirs: Vec<PathBuf> = Vec::new();
         let mut actor_plugin_env: Vec<(String, String)> = Vec::new();
 
+        // Resolve the profile's embedding provider ONCE; the child
+        // pipeline factory and the ActorFactory below share this handle
+        // (codex P3: duplicate resolves broke the single-handle
+        // invariant and doubled keychain lookups).
+        let profile_embedder =
+            create_embedder(&profile_config).map(|e| e as Arc<dyn octos_llm::EmbeddingProvider>);
+
         // Child bots with admin_mode=true reuse the parent's tool registry snapshot
         // (which already has full tools + admin API). Child bots with admin_mode=false
         // build their own fresh registry (full tools, no admin API).
@@ -819,47 +897,15 @@ impl ProfileActorFactoryBuilder {
             };
             provider_router = child_router.clone();
 
-            tools.set_base_tools([
-                "run_pipeline",
-                "search",
-                "deep_crawl",
-                "web_search",
-                "web_fetch",
-                "read_file",
-                "write_file",
-                "edit_file",
-                "shell",
-                "list_dir",
-                "glob",
-                "grep",
-                "message",
-                "send_file",
-                "spawn",
-                "activate_tools",
-            ]);
-            let visible = tools.specs().len();
-            if visible > 15 {
-                for group in &[
-                    "group:memory",
-                    "group:admin",
-                    "group:sessions",
-                    "group:web",
-                    "group:runtime",
-                    "group:media",
-                ] {
-                    tools.defer_group(group);
-                }
-            }
-            if tools.has_deferred() {
-                tools.register(octos_agent::ActivateToolsTool::new());
-            }
+            // RFC-0 (#1289): LRU tool deferral + the `activate_tools`
+            // meta-tool were removed. Every enabled tool is emitted every
+            // turn (full schema) — no base-tool pin list or auto-defer pass.
 
             // PR #688 follow-up — codex finding: re-apply tool_policy
             // AFTER all base-registry tools have been registered. The
-            // first pass at line ~648 ran before `ActivateToolsTool`
-            // (and any other late-registered base tools) existed, so a
-            // `tool_policy.deny` entry targeting them was bypassed at
-            // the base level. Per-session re-apply in
+            // first pass at line ~648 ran before some late-registered base
+            // tools existed, so a `tool_policy.deny` entry targeting them
+            // was bypassed at the base level. Per-session re-apply in
             // `ActorFactory::spawn` still covers `run_pipeline`.
             if let Some(ref policy) = profile_config.tool_policy {
                 tools.apply_policy(policy);
@@ -904,11 +950,10 @@ impl ProfileActorFactoryBuilder {
             }
 
             // NEW-06 fix: the parent ActorFactory's session agent gets
-            // its embedder from `create_embedder(profile_config)`; mirror
-            // that here so child-profile pipeline workers run on the
-            // same contamination-safe hybrid memory path.
-            let child_pipeline_embedder = create_embedder(&profile_config)
-                .map(|e| e as Arc<dyn octos_llm::EmbeddingProvider>);
+            // its embedder from the shared single resolve below; hand the
+            // same handle here so child-profile pipeline workers run on
+            // the same contamination-safe hybrid memory path.
+            let child_pipeline_embedder = profile_embedder.clone();
 
             pipeline_factory = Some(Arc::new(ChildPipelineToolFactory {
                 llm: llm.clone(),
@@ -990,8 +1035,7 @@ impl ProfileActorFactoryBuilder {
             tool_policy: profile_config.tool_policy.clone(),
             worker_prompt,
             provider_router,
-            embedder: create_embedder(&profile_config)
-                .map(|embedder| embedder as Arc<dyn octos_llm::EmbeddingProvider>),
+            embedder: profile_embedder,
             active_sessions: self.active_sessions.clone(),
             pending_messages: self.pending_messages.clone(),
             queue_mode: self.queue_mode,
@@ -1024,7 +1068,8 @@ impl ProfileActorFactoryBuilder {
 mod tests {
     use super::*;
     use crate::profiles::{
-        AppsConfig, ProfileConfig, SearchConfig, SearchProviderConfig, SlidesAppConfig, UserProfile,
+        AppsConfig, LlmModelSelectionConfig, LlmProfileConfig, ProfileConfig, SearchConfig,
+        SearchProviderConfig, SlidesAppConfig, UserProfile,
     };
     use chrono::Utc;
 
@@ -1083,6 +1128,177 @@ mod tests {
         assert!(env.contains(&("PPT_TEMPLATE_DIR".to_string(), "/templates".to_string())));
         assert!(env.contains(&("PPT_DEFAULT_THEME".to_string(), "nb-pro".to_string())));
         assert!(!env.iter().any(|(key, _)| key == "CUSTOM_SECRET_KEY"));
+    }
+
+    #[test]
+    #[allow(unsafe_code)]
+    fn profile_plugin_env_forwards_vertex_service_account_to_vertex_profile_by_its_own_name() {
+        let _guard = synthesis_env_lock().lock().unwrap();
+        let prev_google_credentials = std::env::var("GOOGLE_APPLICATION_CREDENTIALS").ok();
+        // SAFETY: serialized by `synthesis_env_lock`; this test verifies profile
+        // env forwarding without inheriting the developer/CI host's Google SDK env.
+        unsafe { std::env::remove_var("GOOGLE_APPLICATION_CREDENTIALS") };
+
+        let service_account = "{\"type\":\"service_account\",\"project_id\":\"mofa-test\"}";
+        let profile = UserProfile {
+            id: "dspfac".to_string(),
+            name: "DSPFAC".to_string(),
+            public_subdomain: None,
+            enabled: true,
+            data_dir: None,
+            parent_id: None,
+            config: ProfileConfig {
+                // Vertex is the profile's PRIMARY provider — the condition
+                // under which its skills are entitled to the SA JSON.
+                llm: Some(LlmProfileConfig {
+                    primary: Some(LlmModelSelectionConfig {
+                        family_id: Some("vertex".to_string()),
+                        model_id: Some("gemini-2.5-pro".to_string()),
+                        ..Default::default()
+                    }),
+                    fallbacks: vec![],
+                }),
+                env_vars: [
+                    ("VERTEX_SA_JSON".to_string(), service_account.to_string()),
+                    (
+                        "GOOGLE_CLOUD_LOCATION".to_string(),
+                        "us-central1".to_string(),
+                    ),
+                ]
+                .into(),
+                ..Default::default()
+            },
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+
+        let env = profile_plugin_env(&profile);
+
+        assert!(env.contains(&("VERTEX_SA_JSON".to_string(), service_account.to_string())));
+        assert!(env.contains(&(
+            "GOOGLE_CLOUD_LOCATION".to_string(),
+            "us-central1".to_string()
+        )));
+        assert!(
+            !env.iter()
+                .any(|(key, _)| key == "GOOGLE_APPLICATION_CREDENTIALS")
+        );
+
+        // SAFETY: serialized by `synthesis_env_lock`.
+        if let Some(value) = prev_google_credentials {
+            unsafe { std::env::set_var("GOOGLE_APPLICATION_CREDENTIALS", value) };
+        }
+    }
+
+    /// A profile with Vertex/Google credentials in `env_vars` but a
+    /// NON-Google provider chain must not leak them to its skill
+    /// subprocesses: the SA JSON is a private key, and nothing in a
+    /// deepseek-routed profile's skills is entitled to it.
+    #[test]
+    fn profile_plugin_env_does_not_leak_google_vertex_credentials_to_non_google_profiles() {
+        let profile = UserProfile {
+            id: "dspfac".to_string(),
+            name: "DSPFAC".to_string(),
+            public_subdomain: None,
+            enabled: true,
+            data_dir: None,
+            parent_id: None,
+            config: ProfileConfig {
+                llm: Some(LlmProfileConfig {
+                    primary: Some(LlmModelSelectionConfig {
+                        family_id: Some("deepseek".to_string()),
+                        model_id: Some("deepseek-chat".to_string()),
+                        ..Default::default()
+                    }),
+                    fallbacks: vec![LlmModelSelectionConfig {
+                        family_id: Some("openai".to_string()),
+                        model_id: Some("gpt-4o-mini".to_string()),
+                        ..Default::default()
+                    }],
+                }),
+                env_vars: [
+                    (
+                        "VERTEX_SA_JSON".to_string(),
+                        "{\"type\":\"service_account\",\"private_key\":\"x\"}".to_string(),
+                    ),
+                    (
+                        "GOOGLE_APPLICATION_CREDENTIALS".to_string(),
+                        "/secrets/sa.json".to_string(),
+                    ),
+                    ("VERTEX_ACCESS_TOKEN".to_string(), "ya29.t".to_string()),
+                    (
+                        "GOOGLE_OAUTH_ACCESS_TOKEN".to_string(),
+                        "ya29.o".to_string(),
+                    ),
+                    (
+                        "GOOGLE_CLOUD_LOCATION".to_string(),
+                        "us-central1".to_string(),
+                    ),
+                ]
+                .into(),
+                ..Default::default()
+            },
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+
+        let env = profile_plugin_env(&profile);
+
+        for credential in GOOGLE_VERTEX_CREDENTIAL_ENV_VARS {
+            assert!(
+                !env.iter().any(|(key, _)| key == credential),
+                "{credential} must not be forwarded to a non-Google profile's skills: {env:?}"
+            );
+        }
+        // Non-credential Google config still forwards (it is harmless and
+        // some skills use it for display/diagnostics).
+        assert!(env.contains(&(
+            "GOOGLE_CLOUD_LOCATION".to_string(),
+            "us-central1".to_string()
+        )));
+    }
+
+    /// A Google-family provider anywhere in the chain (here: a gemini
+    /// FALLBACK behind a non-Google primary) still entitles the profile's
+    /// skills to the Google credentials.
+    #[test]
+    fn profile_plugin_env_forwards_google_credentials_when_google_family_fallback_in_chain() {
+        let service_account = "{\"type\":\"service_account\",\"project_id\":\"mofa-test\"}";
+        let profile = UserProfile {
+            id: "dspfac".to_string(),
+            name: "DSPFAC".to_string(),
+            public_subdomain: None,
+            enabled: true,
+            data_dir: None,
+            parent_id: None,
+            config: ProfileConfig {
+                llm: Some(LlmProfileConfig {
+                    primary: Some(LlmModelSelectionConfig {
+                        family_id: Some("deepseek".to_string()),
+                        model_id: Some("deepseek-chat".to_string()),
+                        ..Default::default()
+                    }),
+                    fallbacks: vec![LlmModelSelectionConfig {
+                        // No explicit family_id: resolution falls back to
+                        // detect_provider on the model id, mirroring the
+                        // runtime provider resolution.
+                        model_id: Some("gemini-2.5-flash".to_string()),
+                        ..Default::default()
+                    }],
+                }),
+                env_vars: [("VERTEX_SA_JSON".to_string(), service_account.to_string())].into(),
+                ..Default::default()
+            },
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+
+        let env = profile_plugin_env(&profile);
+
+        assert!(
+            env.contains(&("VERTEX_SA_JSON".to_string(), service_account.to_string())),
+            "gemini fallback in the chain must keep the sanctioned forwarding path working: {env:?}"
+        );
     }
 
     /// Mutex serializing build_synthesis_config env tests in this module.

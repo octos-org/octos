@@ -1,4 +1,15 @@
-# Octos 🐙
+<div align="center">
+
+<pre>
+ ██████╗  ██████╗████████╗ ██████╗ ███████╗
+██╔═══██╗██╔════╝╚══██╔══╝██╔═══██╗██╔════╝
+██║   ██║██║        ██║   ██║   ██║███████╗
+██║   ██║██║        ██║   ██║   ██║╚════██║
+╚██████╔╝╚██████╗   ██║   ╚██████╔╝███████║
+ ╚═════╝  ╚═════╝   ╚═╝    ╚═════╝ ╚══════╝
+</pre>
+
+</div>
 
 > Like an octopus — 9 brains (1 central + 8 in the arms, one per arm). Every arm thinks independently, but they share one brain.
 
@@ -52,7 +63,7 @@ curl -fsSL https://github.com/octos-org/octos/releases/latest/download/install.s
 
 ---
 
-**Open Cognitive Tasks Orchestration System** — a Rust-native, API-first Agentic OS.
+A Rust-native, API-first Agentic OS.
 
 31MB static binary. 80+ REST endpoints + UI Protocol v1 over WebSocket/stdio. 15 LLM providers. 14 messaging channels. Multi-tenant. Zero external runtime services.
 
@@ -441,7 +452,14 @@ Interactive clients talk to `octos serve` over **UI Protocol v1** — a JSON-RPC
 
 > **One gap today:** interactive tool-approval prompts and `ask_user_question` aren't surfaced to the editor yet — octos runs tools under its own (non-interactive) approval policy rather than ACP `session/request_permission`, so a tool that would pause for approval in `octos chat` won't prompt you in Zed. Everything else matches.
 
-**1. Give the agent a provider credential.** Easiest is `octos auth login --provider deepseek` — it's stored in `auth.json` and read regardless of environment (`octos acp` resolves its LLM exactly like `octos chat`). A Dock-launched Zed does **not** inherit your shell's env vars, so if you'd rather pass an API key by env var, put it in the `env` block below.
+**1. Install octos and initialize it** (skip if you already have it — see [Start here](#start-here) for all install options):
+
+```bash
+npm install -g @octos-org/octos      # or Homebrew / build from source — see Start here
+octos init                           # pick a provider + model, then paste that provider's API key
+```
+
+`octos init` walks you through choosing a provider + model (this guide uses **DeepSeek**) and then prompts you to **paste that provider's API key** — stored securely in `auth.json` and read regardless of environment (`octos acp` resolves its LLM exactly like `octos chat`). Pressed Enter to skip it? Add the key later with `octos auth login --provider deepseek`. A Dock-launched Zed does **not** inherit your shell's env vars, so if you'd rather pass the key by an env var, put it in the `env` block below instead.
 
 **2. Register octos as an agent server** in Zed's settings (`~/.config/zed/settings.json`, or run *zed: open settings*). Use `"command": "octos"` if it's on your `PATH`, or the absolute path from `which octos` — a Dock-launched Zed has a minimal `PATH` and may not find a bare `octos`:
 
@@ -456,6 +474,8 @@ Interactive clients talk to `octos serve` over **UI Protocol v1** — a JSON-RPC
   }
 }
 ```
+
+> The `--provider`/`--model` in `args` must match the provider you set up in step 1 (this guide uses DeepSeek). `octos acp` inherits the rest — `base_url`, `api_type`, `api_key_env` — from your `octos init` config, so pointing `deepseek` args at a differently-configured provider sends the wrong key/endpoint and the session fails.
 
 **3. Play with it in Zed.**
 - **Open a folder** — external agents need a workspace (with none open, the Agent Panel just shows *"Open Project"*).
