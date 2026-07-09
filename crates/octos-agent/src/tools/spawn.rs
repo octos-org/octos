@@ -2899,6 +2899,7 @@ impl Tool for SpawnTool {
             let child_tool_factories = self.child_tool_factories.clone();
             let task_supervisor = self.task_supervisor.clone();
             let worker_config = self.worker_config.clone();
+            let worker_embedder = self.embedder.clone();
             let workflow_metadata = workflow.clone();
             let parent_session_key = self.session_key.clone();
             let worker_hooks = self.hooks.clone();
@@ -3170,6 +3171,13 @@ impl Tool for SpawnTool {
                 }
                 if let Some(ref summary_gen) = parent_subagent_summary_generator {
                     worker = worker.with_subagent_summary_generator(summary_gen.clone());
+                }
+                // Embed-on-save + recall parity (codex P1): the DEFAULT
+                // background mode builds its own worker inside this
+                // detached closure — mirror the sync-path propagation or
+                // background subagents keep storing vectorless episodes.
+                if let Some(ref embedder) = worker_embedder {
+                    worker = worker.with_embedder(embedder.clone());
                 }
                 if let Some(ref sink_path) = harness_event_sink_path {
                     worker = worker.with_harness_event_sink(sink_path.clone());
