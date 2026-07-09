@@ -255,6 +255,13 @@ pub struct ProfileRuntime {
     /// Long-lived [`MemoryStore`] (MEMORY.md + daily notes + recent
     /// memories window) for this profile.
     pub memory_store: Arc<MemoryStore>,
+
+    /// The profile's embedding provider (None when no `embedding`
+    /// config and no resolvable key). Sessions hand this to
+    /// SpawnTool / DelegateTool so worker agents embed the episodes
+    /// they save and run hybrid scored+filtered recall — without it
+    /// workers stored episodes vectorless and recall silently skipped.
+    pub embedder: Option<Arc<dyn octos_llm::EmbeddingProvider>>,
     /// Resolved `memory.max_inject_tokens` for per-session memory segments.
     pub memory_inject_tokens: usize,
     /// Resolved `memory.refresh.enabled` — gates the capture-policy text in
@@ -767,6 +774,13 @@ impl ProfileRuntime {
         // when adaptive is configured, so per-node calls still
         // fan out through the adaptive layer.
         //
+        // Resolve the profile's embedding provider ONCE. The same handle
+        // feeds the pipeline factory below AND rides on the returned
+        // ProfileRuntime so the serve spawn/delegate wiring hands every
+        // worker the exact same embed-on-save + hybrid-recall behaviour.
+        let embedder =
+            chat::create_embedder(&config).map(|e| e as Arc<dyn octos_llm::EmbeddingProvider>);
+
         // NEW-07: hoist the per-instance `RunPipelineTool` builder
         // into a [`crate::session_actor::PipelineToolFactory`] impl
         // so the WS / UI Protocol spawn-wiring site can hand a fresh
@@ -816,9 +830,6 @@ impl ProfileRuntime {
                 }
             }
 
-            let embedder =
-                chat::create_embedder(&config).map(|e| e as Arc<dyn octos_llm::EmbeddingProvider>);
-
             let factory: Arc<dyn crate::session_actor::PipelineToolFactory + Send + Sync> =
                 Arc::new(AppUiPipelineToolFactory {
                     llm: llm.clone(),
@@ -828,7 +839,7 @@ impl ProfileRuntime {
                     plugin_dirs: plugin_dirs.clone(),
                     octos_home: effective_octos_home.clone(),
                     plugin_require_signed: config.plugins.require_signed,
-                    embedder,
+                    embedder: embedder.clone(),
                 });
 
             // Register the parent `run_pipeline` via the same factory
@@ -1068,6 +1079,7 @@ impl ProfileRuntime {
             memory_refresh_enabled,
             memory,
             memory_store,
+            embedder,
             memory_refresh,
             tool_config,
             cron_service: Some(cron_service),
