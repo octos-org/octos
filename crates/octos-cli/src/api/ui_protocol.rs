@@ -38,10 +38,10 @@ use octos_core::ui_protocol::{
     SessionListParams, SessionMessagesPageParams, SessionOpenParams, SessionOpenResult,
     SessionOpened, SessionOrchestrationEvent, SessionRollbackParams, SessionRollbackResult,
     SessionSnapshotParams, SessionStatusGetParams, SessionTasksListParams, SessionTitleSetParams,
-    SessionWorkspaceGetParams, SystemStatusGetParams, TaskArtifactListParams,
-    TaskArtifactListResult, TaskArtifactReadParams, TaskArtifactReadResult, TaskArtifactRecord,
-    TaskCancelParams, TaskCancelResult, TaskListEntry, TaskListParams, TaskListResult,
-    TaskOutputDeltaEvent, TaskRestartFromNodeParams, TaskRestartFromNodeResult,
+    SessionWorkspaceGetParams, SkillActionJobUpdatedEvent, SystemStatusGetParams,
+    TaskArtifactListParams, TaskArtifactListResult, TaskArtifactReadParams, TaskArtifactReadResult,
+    TaskArtifactRecord, TaskCancelParams, TaskCancelResult, TaskListEntry, TaskListParams,
+    TaskListResult, TaskOutputDeltaEvent, TaskRestartFromNodeParams, TaskRestartFromNodeResult,
     TaskRuntimeState as UiTaskRuntimeState, TaskUpdatedEvent, ThreadGraphEntry,
     ThreadGraphGetParams, ThreadGraphGetResult, ToolCompletedEvent, ToolProgressEvent,
     ToolStartedEvent, TurnCompletedEvent, TurnErrorEvent, TurnId, TurnInterruptParams,
@@ -94,7 +94,7 @@ use super::master_continuation_scheduler::{
 };
 use super::metrics::MetricsReporter;
 use super::router::AuthIdentity;
-use super::skill_action_jobs::{SkillActionJobRecord, SkillActionJobStore};
+use super::skill_action_jobs::{SkillActionJobRecord, SkillActionJobStatus, SkillActionJobStore};
 use super::specialist_runner::{
     AppUiSupervisorEventSink, SpecialistArtifactSpec, SupervisedCliSpecialist,
     SupervisedMcpSpecialist, SupervisedSpecialistSpec, run_supervised_cli_specialist,
@@ -7195,6 +7195,7 @@ fn skill_action_record_to_value(record: SkillActionRecord) -> Value {
     object.insert("tags".into(), json!(record.action.tags));
     object.insert("surfaces".into(), json!(record.action.surfaces));
     object.insert("input_schema".into(), record.action.input_schema);
+    object.insert("execution".into(), json!(record.action.execution));
     if !record.action.ui_schema.is_null() {
         object.insert("ui_schema".into(), record.action.ui_schema);
     }
@@ -7236,26 +7237,69 @@ fn string_array_argument(value: Value, field: &str) -> Result<Vec<String>, RpcEr
     Ok(strings)
 }
 
-fn tool_result_to_action_value(result: octos_agent::ToolResult) -> Value {
-    json!({
-        "success": result.success,
-        "output": result.output,
-        "file_modified": result.file_modified.map(|path| path.to_string_lossy().into_owned()),
-        "files_to_send": result.files_to_send
-            .into_iter()
-            .map(|path| path.to_string_lossy().into_owned())
-            .collect::<Vec<_>>(),
-        "structured_metadata": result.structured_metadata,
-    })
+#[derive(Debug, Clone)]
+struct PreparedSkillActionCall {
+    input_path: Option<String>,
+    filename: Option<String>,
+    materialized_path: Option<String>,
+    args: Value,
 }
 
-async fn invoke_skill_action_tool_binding(
+#[derive(Debug, Clone)]
+struct PreparedSkillActionInvocation {
+    tool: String,
+    materialized_paths: Vec<String>,
+    calls: Vec<PreparedSkillActionCall>,
+}
+
+#[derive(Debug, Clone)]
+struct QueuedSkillActionJob {
+    tool: String,
+    args: Value,
+    job: SkillActionJobRecord,
+}
+
+fn filename_from_action_path(path: &str) -> Option<String> {
+    Path::new(path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_owned)
+}
+
+fn materialize_action_file_path(
+    workspace_root: &Path,
+    tenant_id: Option<&str>,
+    raw_path: &str,
+    materialization: octos_agent::plugins::SkillActionFileMaterialization,
+) -> Vec<String> {
+    match materialization {
+        octos_agent::plugins::SkillActionFileMaterialization::Raw => vec![raw_path.to_string()],
+        octos_agent::plugins::SkillActionFileMaterialization::WorkspaceRelative => {
+            octos_bus::file_handle::materialize_uploads_as_workspace_relative(
+                workspace_root,
+                tenant_id,
+                &[raw_path.to_string()],
+            )
+        }
+        octos_agent::plugins::SkillActionFileMaterialization::TurnMedia => {
+            octos_bus::file_handle::materialize_turn_uploads(
+                workspace_root,
+                tenant_id,
+                &[raw_path.to_string()],
+            )
+        }
+    }
+}
+
+fn prepare_skill_action_tool_invocation(
     action: &octos_agent::plugins::SkillActionDef,
     registry: &octos_agent::ToolRegistry,
     workspace_root: &Path,
     tenant_id: Option<&str>,
     arguments: Value,
-) -> Result<Value, RpcError> {
+) -> Result<PreparedSkillActionInvocation, RpcError> {
     let (tool, input_mode, file_argument, file_materialization) = match &action.binding {
         octos_agent::plugins::SkillActionBinding::Tool {
             tool,
@@ -7285,79 +7329,280 @@ async fn invoke_skill_action_tool_binding(
 
     let mut args = action_arguments_object(arguments)?;
     match input_mode {
-        octos_agent::plugins::SkillActionInputMode::Single => {
-            let result = registry
-                .execute(tool, &Value::Object(args))
-                .await
-                .map_err(|error| {
-                    RpcError::internal_error(format!(
-                        "skill action '{}' failed to invoke tool '{}': {error}",
-                        action.id, tool
-                    ))
-                })?;
-            let ok = result.success;
-            Ok(json!({
-                "action_id": action.id,
-                "ok": ok,
-                "results": [tool_result_to_action_value(result)],
-            }))
-        }
+        octos_agent::plugins::SkillActionInputMode::Single => Ok(PreparedSkillActionInvocation {
+            tool: tool.to_string(),
+            materialized_paths: Vec::new(),
+            calls: vec![PreparedSkillActionCall {
+                input_path: None,
+                filename: None,
+                materialized_path: None,
+                args: Value::Object(args),
+            }],
+        }),
         octos_agent::plugins::SkillActionInputMode::FileEach => {
             let paths = args.remove("paths").ok_or_else(|| {
                 RpcError::invalid_params("file_each skill action requires arguments.paths")
             })?;
             let raw_paths = string_array_argument(paths, "paths")?;
-            let materialized = match file_materialization {
-                octos_agent::plugins::SkillActionFileMaterialization::Raw => raw_paths,
-                octos_agent::plugins::SkillActionFileMaterialization::WorkspaceRelative => {
-                    octos_bus::file_handle::materialize_uploads_as_workspace_relative(
-                        workspace_root,
-                        tenant_id,
-                        &raw_paths,
-                    )
+            let file_argument = file_argument.unwrap_or("path");
+            let mut materialized_paths = Vec::new();
+            let mut calls = Vec::new();
+            for raw_path in raw_paths {
+                let prepared_paths = materialize_action_file_path(
+                    workspace_root,
+                    tenant_id,
+                    &raw_path,
+                    file_materialization,
+                );
+                for materialized_path in prepared_paths {
+                    let mut call_args = args.clone();
+                    call_args.insert(
+                        file_argument.to_string(),
+                        Value::String(materialized_path.clone()),
+                    );
+                    let filename = filename_from_action_path(&materialized_path)
+                        .or_else(|| filename_from_action_path(&raw_path));
+                    materialized_paths.push(materialized_path.clone());
+                    calls.push(PreparedSkillActionCall {
+                        input_path: Some(raw_path.clone()),
+                        filename,
+                        materialized_path: Some(materialized_path),
+                        args: Value::Object(call_args),
+                    });
                 }
-                octos_agent::plugins::SkillActionFileMaterialization::TurnMedia => {
-                    octos_bus::file_handle::materialize_turn_uploads(
-                        workspace_root,
-                        tenant_id,
-                        &raw_paths,
-                    )
-                }
-            };
-            if materialized.is_empty() {
+            }
+            if calls.is_empty() {
                 return Err(RpcError::invalid_params(
                     "no action input files could be materialized for this session",
                 ));
             }
-            let file_argument = file_argument.unwrap_or("path");
-            let mut ok = true;
-            let mut results = Vec::with_capacity(materialized.len());
-            for path in &materialized {
-                let mut call_args = args.clone();
-                call_args.insert(file_argument.to_string(), Value::String(path.clone()));
-                let result = registry
-                    .execute(tool, &Value::Object(call_args))
-                    .await
-                    .map_err(|error| {
-                        RpcError::internal_error(format!(
-                            "skill action '{}' failed to invoke tool '{}': {error}",
-                            action.id, tool
-                        ))
-                    })?;
-                ok &= result.success;
-                results.push(tool_result_to_action_value(result));
-                if !ok {
-                    break;
-                }
-            }
-            Ok(json!({
-                "action_id": action.id,
-                "ok": ok,
-                "materialized_paths": materialized,
-                "results": results,
-            }))
+            Ok(PreparedSkillActionInvocation {
+                tool: tool.to_string(),
+                materialized_paths,
+                calls,
+            })
         }
     }
+}
+
+fn tool_result_to_action_value(result: octos_agent::ToolResult) -> Value {
+    json!({
+        "success": result.success,
+        "output": result.output,
+        "file_modified": result.file_modified.map(|path| path.to_string_lossy().into_owned()),
+        "files_to_send": result.files_to_send
+            .into_iter()
+            .map(|path| path.to_string_lossy().into_owned())
+            .collect::<Vec<_>>(),
+        "structured_metadata": result.structured_metadata,
+    })
+}
+
+async fn execute_skill_action_tool_call(
+    action_id: &str,
+    tool: &str,
+    registry: &octos_agent::ToolRegistry,
+    args: &Value,
+) -> Result<octos_agent::ToolResult, RpcError> {
+    registry.execute(tool, args).await.map_err(|error| {
+        RpcError::internal_error(format!(
+            "skill action '{action_id}' failed to invoke tool '{tool}': {error}"
+        ))
+    })
+}
+
+async fn invoke_skill_action_tool_binding(
+    action: &octos_agent::plugins::SkillActionDef,
+    registry: &octos_agent::ToolRegistry,
+    workspace_root: &Path,
+    tenant_id: Option<&str>,
+    arguments: Value,
+) -> Result<Value, RpcError> {
+    let prepared = prepare_skill_action_tool_invocation(
+        action,
+        registry,
+        workspace_root,
+        tenant_id,
+        arguments,
+    )?;
+    let mut ok = true;
+    let mut results = Vec::with_capacity(prepared.calls.len());
+    for call in &prepared.calls {
+        let result =
+            execute_skill_action_tool_call(&action.id, &prepared.tool, registry, &call.args)
+                .await?;
+        ok &= result.success;
+        results.push(tool_result_to_action_value(result));
+        if !ok {
+            break;
+        }
+    }
+    let mut response = serde_json::Map::new();
+    response.insert("action_id".into(), Value::String(action.id.clone()));
+    response.insert("ok".into(), Value::Bool(ok));
+    if !prepared.materialized_paths.is_empty() {
+        response.insert(
+            "materialized_paths".into(),
+            json!(prepared.materialized_paths),
+        );
+    }
+    response.insert("results".into(), Value::Array(results));
+    Ok(Value::Object(response))
+}
+
+fn append_skill_action_job_snapshot(
+    store: &SkillActionJobStore,
+    ledger: Option<&Arc<UiProtocolLedger>>,
+    job: &SkillActionJobRecord,
+) -> Result<(), RpcError> {
+    store.append(job).map_err(|error| {
+        RpcError::internal_error(format!("failed to persist skill action job: {error}"))
+    })?;
+    if let Some(ledger) = ledger {
+        let job_value = skill_action_job_record_to_value(job.clone())?;
+        let _ = ledger.append_notification(UiNotification::SkillActionJobUpdated(
+            SkillActionJobUpdatedEvent {
+                profile_id: job.profile_id.clone(),
+                session_id: job.session_id.clone(),
+                job: job_value,
+            },
+        ));
+    }
+    Ok(())
+}
+
+fn enqueue_background_skill_action_jobs(
+    action: &octos_agent::plugins::SkillActionDef,
+    skill_id: &str,
+    registry: &octos_agent::ToolRegistry,
+    workspace_root: &Path,
+    tenant_id: Option<&str>,
+    profile_id: &str,
+    session_id: &SessionKey,
+    store: &SkillActionJobStore,
+    ledger: Option<&Arc<UiProtocolLedger>>,
+    arguments: Value,
+) -> Result<(Value, Vec<QueuedSkillActionJob>), RpcError> {
+    let prepared = prepare_skill_action_tool_invocation(
+        action,
+        registry,
+        workspace_root,
+        tenant_id,
+        arguments,
+    )?;
+    let batch_id = format!("skillbatch_{}", uuid::Uuid::now_v7().simple());
+    let mut queued_jobs = Vec::with_capacity(prepared.calls.len());
+    let mut job_values = Vec::with_capacity(prepared.calls.len());
+    for call in prepared.calls {
+        let now = Utc::now();
+        let job = SkillActionJobRecord {
+            job_id: format!("skilljob_{}", uuid::Uuid::now_v7().simple()),
+            batch_id: batch_id.clone(),
+            profile_id: profile_id.to_string(),
+            session_id: session_id.clone(),
+            action_id: action.id.clone(),
+            skill_id: skill_id.to_string(),
+            status: SkillActionJobStatus::Queued,
+            input_path: call.input_path,
+            filename: call.filename,
+            materialized_path: call.materialized_path,
+            output: None,
+            error: None,
+            result: None,
+            source_id: None,
+            source_path: None,
+            metadata_path: None,
+            created_at: now,
+            updated_at: now,
+        };
+        append_skill_action_job_snapshot(store, ledger, &job)?;
+        job_values.push(skill_action_job_record_to_value(job.clone())?);
+        queued_jobs.push(QueuedSkillActionJob {
+            tool: prepared.tool.clone(),
+            args: call.args,
+            job,
+        });
+    }
+
+    Ok((
+        json!({
+            "action_id": action.id.clone(),
+            "ok": true,
+            "execution": "background",
+            "batch_id": batch_id,
+            "queued": queued_jobs.len(),
+            "materialized_paths": prepared.materialized_paths,
+            "jobs": job_values,
+        }),
+        queued_jobs,
+    ))
+}
+
+fn skill_action_result_string_at(value: &Value, key: &str) -> Option<String> {
+    value
+        .get(key)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+}
+
+fn apply_skill_action_result_metadata(job: &mut SkillActionJobRecord, result: &Value) {
+    let Some(source) = result
+        .get("structured_metadata")
+        .and_then(|metadata| metadata.get("source"))
+    else {
+        return;
+    };
+    job.source_id = skill_action_result_string_at(source, "id");
+    job.source_path = skill_action_result_string_at(source, "source_path")
+        .or_else(|| skill_action_result_string_at(source, "path"));
+    job.metadata_path = skill_action_result_string_at(source, "metadata_path");
+}
+
+async fn run_background_skill_action_job(
+    registry: Arc<octos_agent::ToolRegistry>,
+    queued: QueuedSkillActionJob,
+    store: SkillActionJobStore,
+    ledger: Option<Arc<UiProtocolLedger>>,
+) -> Result<(), RpcError> {
+    let mut running = queued.job.clone();
+    running.status = SkillActionJobStatus::Running;
+    running.updated_at = Utc::now();
+    append_skill_action_job_snapshot(&store, ledger.as_ref(), &running)?;
+
+    let result =
+        execute_skill_action_tool_call(&running.action_id, &queued.tool, &registry, &queued.args)
+            .await;
+    let mut completed = running;
+    completed.updated_at = Utc::now();
+    match result {
+        Ok(tool_result) => {
+            let success = tool_result.success;
+            let output = tool_result.output.clone();
+            let result_value = tool_result_to_action_value(tool_result);
+            if !output.is_empty() {
+                completed.output = Some(output.clone());
+            }
+            completed.result = Some(result_value.clone());
+            apply_skill_action_result_metadata(&mut completed, &result_value);
+            if success {
+                completed.status = SkillActionJobStatus::Succeeded;
+            } else {
+                completed.status = SkillActionJobStatus::Failed;
+                completed.error = Some(if output.is_empty() {
+                    "skill action tool returned unsuccessful result".to_string()
+                } else {
+                    output
+                });
+            }
+        }
+        Err(error) => {
+            completed.status = SkillActionJobStatus::Failed;
+            completed.error = Some(error.message);
+        }
+    }
+    append_skill_action_job_snapshot(&store, ledger.as_ref(), &completed)
 }
 
 async fn skill_action_session_runtime(
@@ -7425,6 +7670,7 @@ async fn raw_skill_action_list(
 
 async fn raw_skill_action_invoke(
     state: &Arc<AppState>,
+    ledger: &Arc<UiProtocolLedger>,
     request: &RpcRequest<Value>,
     connection_profile_id: Option<&str>,
 ) -> Result<Value, RpcError> {
@@ -7455,14 +7701,51 @@ async fn raw_skill_action_invoke(
                 params.action_id
             ))
         })?;
-    invoke_skill_action_tool_binding(
-        &record.action,
-        &session_runtime.tools,
-        &session_runtime.workspace_root,
-        Some(session_runtime.profile.profile_id.as_str()),
-        params.arguments,
-    )
-    .await
+    match record.action.execution {
+        octos_agent::plugins::SkillActionExecution::Sync => {
+            invoke_skill_action_tool_binding(
+                &record.action,
+                &session_runtime.tools,
+                &session_runtime.workspace_root,
+                Some(session_runtime.profile.profile_id.as_str()),
+                params.arguments,
+            )
+            .await
+        }
+        octos_agent::plugins::SkillActionExecution::Background => {
+            let profile_id = session_runtime.profile.profile_id.clone();
+            let store = SkillActionJobStore::open(session_runtime.profile.data_dir.as_path());
+            let (response, queued_jobs) = enqueue_background_skill_action_jobs(
+                &record.action,
+                &record.skill_id,
+                &session_runtime.tools,
+                &session_runtime.workspace_root,
+                Some(profile_id.as_str()),
+                &profile_id,
+                &params.session_id,
+                &store,
+                Some(ledger),
+                params.arguments,
+            )?;
+            for queued_job in queued_jobs {
+                let registry = session_runtime.tools.clone();
+                let store = store.clone();
+                let ledger = Arc::clone(ledger);
+                tokio::spawn(async move {
+                    if let Err(error) =
+                        run_background_skill_action_job(registry, queued_job, store, Some(ledger))
+                            .await
+                    {
+                        warn!(
+                            error = %error.message,
+                            "background skill action job failed to persist status"
+                        );
+                    }
+                });
+            }
+            Ok(response)
+        }
+    }
 }
 
 fn skill_action_job_store_for_profile(
@@ -8531,7 +8814,7 @@ async fn handle_raw_appui_rpc(
             raw_skill_action_list(state, request, connection_profile_id).await
         }
         APPUI_METHOD_SKILL_ACTION_INVOKE => {
-            raw_skill_action_invoke(state, request, connection_profile_id).await
+            raw_skill_action_invoke(state, ledger, request, connection_profile_id).await
         }
         APPUI_METHOD_SKILL_ACTION_JOB_LIST => {
             raw_skill_action_job_list(state, request, connection_profile_id)
@@ -27085,6 +27368,41 @@ ignore = []
         }
     }
 
+    struct SourceMetadataActionTool {
+        calls: Arc<StdMutex<Vec<Value>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl octos_agent::Tool for SourceMetadataActionTool {
+        fn name(&self) -> &str {
+            "source_import"
+        }
+
+        fn description(&self) -> &str {
+            "capture source import calls"
+        }
+
+        fn input_schema(&self) -> Value {
+            json!({"type": "object"})
+        }
+
+        async fn execute(&self, args: &Value) -> eyre::Result<octos_agent::ToolResult> {
+            self.calls.lock().unwrap().push(args.clone());
+            Ok(octos_agent::ToolResult {
+                success: true,
+                output: "source imported".to_string(),
+                structured_metadata: Some(json!({
+                    "source": {
+                        "id": "src_report",
+                        "source_path": "sources/src_report.md",
+                        "metadata_path": "sources/src_report.json"
+                    }
+                })),
+                ..Default::default()
+            })
+        }
+    }
+
     #[test]
     fn skill_action_discovery_loads_manifest_actions_for_registered_tools() {
         let dir = tempfile::tempdir().unwrap();
@@ -27281,6 +27599,160 @@ ignore = []
         );
         let calls = calls.lock().unwrap();
         assert_eq!(calls[0]["path"], response["materialized_paths"][0]);
+    }
+
+    #[tokio::test]
+    async fn background_skill_action_file_each_returns_one_job_per_file() {
+        let workspace = tempfile::tempdir().unwrap();
+        let profile_data = tempfile::tempdir().unwrap();
+        let session_id = SessionKey("local:background-actions".into());
+        let action: octos_agent::plugins::SkillActionDef = serde_json::from_value(json!({
+            "id": "source.import",
+            "label": "Add source",
+            "execution": "background",
+            "binding": {
+                "type": "tool",
+                "tool": "source_import",
+                "input_mode": "file_each",
+                "file_argument": "path"
+            }
+        }))
+        .unwrap();
+        let calls = Arc::new(StdMutex::new(Vec::new()));
+        let mut registry = octos_agent::ToolRegistry::new();
+        registry.register(CaptureActionTool {
+            calls: calls.clone(),
+        });
+        let store = SkillActionJobStore::open(profile_data.path());
+
+        let (response, queued) = enqueue_background_skill_action_jobs(
+            &action,
+            "mofa-notebook-source",
+            &registry,
+            workspace.path(),
+            Some("tenant-a"),
+            "tenant-a",
+            &session_id,
+            &store,
+            None,
+            json!({
+                "paths": ["docs/a.pdf", "docs/b.jpg"],
+                "title": "Notebook imports"
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(response["action_id"], json!("source.import"));
+        assert_eq!(response["execution"], json!("background"));
+        assert_eq!(response["queued"], json!(2));
+        assert_eq!(response["jobs"].as_array().unwrap().len(), 2);
+        assert_eq!(queued.len(), 2);
+        assert_eq!(
+            calls.lock().unwrap().len(),
+            0,
+            "background invocation must return before executing bound tools"
+        );
+
+        let persisted = store.list(&session_id).unwrap();
+        assert_eq!(persisted.len(), 2);
+        assert!(persisted.iter().all(|job| {
+            job.status == SkillActionJobStatus::Queued
+                && job.batch_id == response["batch_id"].as_str().unwrap()
+                && job.action_id == "source.import"
+                && job.skill_id == "mofa-notebook-source"
+        }));
+    }
+
+    #[tokio::test]
+    async fn background_skill_action_job_records_success_result() {
+        let workspace = tempfile::tempdir().unwrap();
+        let profile_data = tempfile::tempdir().unwrap();
+        let session_id = SessionKey("local:background-action-result".into());
+        let action: octos_agent::plugins::SkillActionDef = serde_json::from_value(json!({
+            "id": "source.import",
+            "label": "Add source",
+            "execution": "background",
+            "binding": {
+                "type": "tool",
+                "tool": "source_import",
+                "input_mode": "file_each",
+                "file_argument": "path"
+            }
+        }))
+        .unwrap();
+        let calls = Arc::new(StdMutex::new(Vec::new()));
+        let mut registry = octos_agent::ToolRegistry::new();
+        registry.register(SourceMetadataActionTool {
+            calls: calls.clone(),
+        });
+        let registry = Arc::new(registry);
+        let store = SkillActionJobStore::open(profile_data.path());
+        let ledger = Arc::new(UiProtocolLedger::new(8));
+        let (_response, mut queued) = enqueue_background_skill_action_jobs(
+            &action,
+            "mofa-notebook-source",
+            registry.as_ref(),
+            workspace.path(),
+            Some("tenant-a"),
+            "tenant-a",
+            &session_id,
+            &store,
+            Some(&ledger),
+            json!({ "paths": ["uploads/report.pdf"] }),
+        )
+        .unwrap();
+
+        run_background_skill_action_job(
+            registry,
+            queued.remove(0),
+            store.clone(),
+            Some(ledger.clone()),
+        )
+        .await
+        .unwrap();
+
+        let persisted = store.list(&session_id).unwrap();
+        assert_eq!(persisted.len(), 1);
+        let job = &persisted[0];
+        assert_eq!(job.status, SkillActionJobStatus::Succeeded);
+        assert_eq!(job.output.as_deref(), Some("source imported"));
+        assert_eq!(job.source_id.as_deref(), Some("src_report"));
+        assert_eq!(job.source_path.as_deref(), Some("sources/src_report.md"));
+        assert_eq!(
+            job.metadata_path.as_deref(),
+            Some("sources/src_report.json")
+        );
+        assert_eq!(job.result.as_ref().unwrap()["success"], json!(true));
+
+        let snapshots = store.read_session_snapshots_for_test(&session_id).unwrap();
+        let statuses = snapshots
+            .iter()
+            .map(|job| job.status.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            statuses,
+            vec![
+                SkillActionJobStatus::Queued,
+                SkillActionJobStatus::Running,
+                SkillActionJobStatus::Succeeded
+            ]
+        );
+        assert_eq!(
+            calls.lock().unwrap()[0]["path"],
+            json!("uploads/report.pdf")
+        );
+
+        let (replayed, _cursor) = ledger.snapshot_with_cursor(&session_id, None).unwrap();
+        let update_statuses = replayed
+            .iter()
+            .filter_map(|entry| match &entry.event {
+                UiProtocolLedgerEvent::Notification(UiNotification::SkillActionJobUpdated(
+                    event,
+                )) => event.job.get("status").and_then(Value::as_str),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(update_statuses, vec!["queued", "running", "succeeded"]);
     }
 
     #[tokio::test]

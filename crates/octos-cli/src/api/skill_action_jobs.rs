@@ -152,6 +152,14 @@ impl SkillActionJobStore {
         self.read_snapshots_from_path(&self.session_path(session_id))
     }
 
+    #[cfg(test)]
+    pub(crate) fn read_session_snapshots_for_test(
+        &self,
+        session_id: &SessionKey,
+    ) -> Result<Vec<SkillActionJobRecord>> {
+        self.read_session_snapshots(session_id)
+    }
+
     fn read_snapshots_from_path(&self, path: &Path) -> Result<Vec<SkillActionJobRecord>> {
         let file = match File::open(path) {
             Ok(file) => file,
