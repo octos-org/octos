@@ -4,25 +4,16 @@ This chapter covers power-user features: tool management, queue modes, lifecycle
 
 ---
 
-## Tools & LRU Deferral
+## Tools
 
-Octos manages a large tool catalog by splitting tools into **active** and **deferred** sets. Active tools are sent to the LLM as callable tool specifications. Deferred tools are listed by name in the system prompt but not sent as full specs until needed.
+Octos sends the **full set of enabled tools** to the LLM as callable tool specifications on every turn. There is no recency-based deferral: which tools are available is controlled by [Tool Policies](#tool-policies) (allow/deny lists, named groups) and per-provider policy — not by how recently a tool was used.
 
-### How It Works
+Two categories are intentionally kept out of the per-turn tool list:
 
-- **Base tools** (never evicted): `read_file`, `write_file`, `shell`, `glob`, `grep`, `list_dir`, `run_pipeline`, `deep_search`, and others.
-- **Dynamic tools**: tools like `save_memory`, `web_search`, `recall_memory` that are activated on demand and evicted when idle.
-- **Deferred tools**: `browser`, `manage_skills`, `spawn`, `configure_tool`, `switch_model`, and others listed by name only.
+- **`spawn_only` tools** — background/fire-and-forget skills. They are auto-intercepted and run in a detached task rather than offered as normal callable specs in the main session (they surface to sub-agents).
+- **Internal-hidden tools** — dispatcher targets (e.g. `mofa_make`'s per-skill entry points) that a forwarding tool calls internally but that are hidden from the model to keep the surface clean.
 
-### Eviction Rules
-
-When the active tool count exceeds 15:
-- Tools idle for 5+ agent iterations that are not in the base set become candidates.
-- The stalest tool is moved to the deferred list first.
-
-### Re-activation
-
-When the LLM needs a deferred tool, it calls `activate_tools({"tools": [...]})`. This resolves the tool name to its group and activates the entire group.
+> **History:** earlier versions used an LRU-by-recency scheme (≈15 active, the rest deferred and re-promoted via an `activate_tools` meta-tool). This was removed in RFC-0 (#1289): modern LLMs handle the full ~40–50-tool set without quality degradation, and always sending the full list keeps the prompt cache stable and every tool discoverable.
 
 ### Tool Configuration
 
