@@ -1,6 +1,7 @@
 //! CLI commands for octos.
 
 mod account;
+mod acp;
 mod admin;
 mod auth;
 mod channels;
@@ -13,6 +14,7 @@ mod doctor;
 pub mod gateway;
 mod init;
 pub mod mcp_serve;
+mod memory;
 mod office;
 #[cfg(feature = "api")]
 mod serve;
@@ -26,6 +28,13 @@ use clap::{Parser, Subcommand};
 use eyre::Result;
 
 pub use account::AccountCommand;
+pub use acp::AcpCommand;
+// Test-support seam for the `octos acp` bridge: the end-to-end integration test
+// in `crates/octos-cli/tests/acp_integration.rs` drives the real ACP handler
+// wiring with a `MockLlm`-backed agent over an in-process transport. Hidden
+// from docs; not part of the stable surface.
+#[doc(hidden)]
+pub use acp::{OctosAcpAgentTransport, TestAgentFactory};
 pub use admin::AdminCommand;
 pub use auth::AuthCommand;
 pub use channels::ChannelsCommand;
@@ -38,6 +47,7 @@ pub use doctor::DoctorCommand;
 pub use gateway::GatewayCommand;
 pub use init::InitCommand;
 pub use mcp_serve::McpServeCommand;
+pub use memory::MemoryCommand;
 pub use office::OfficeCommand;
 #[cfg(feature = "api")]
 pub use serve::ServeCommand;
@@ -81,6 +91,8 @@ fn version_string() -> &'static str {
 pub enum Command {
     /// Manage sub-accounts under profiles.
     Account(AccountCommand),
+    /// Run as an Agent Client Protocol (ACP) agent over stdio (Zed, etc.).
+    Acp(AcpCommand),
     /// Admin commands for tenant and tunnel management.
     Admin(AdminCommand),
     /// Manage authentication for LLM providers.
@@ -97,6 +109,8 @@ pub enum Command {
     Docs(DocsCommand),
     /// Initialize a new .octos configuration.
     Init(InitCommand),
+    /// Inspect and drive the memory-refresh pipeline.
+    Memory(MemoryCommand),
     /// Run as an MCP server so outer orchestrators can invoke octos as a sub-agent.
     McpServe(McpServeCommand),
     /// Start the REST API server (requires --features api).
@@ -299,6 +313,7 @@ impl Executable for Command {
     fn execute(self) -> Result<()> {
         match self {
             Self::Account(cmd) => cmd.execute(),
+            Self::Acp(cmd) => cmd.execute(),
             Self::Admin(cmd) => cmd.execute(),
             Self::Auth(cmd) => cmd.execute(),
             Self::Channels(cmd) => cmd.execute(),
@@ -315,6 +330,7 @@ impl Executable for Command {
             Self::Update(cmd) => cmd.execute(),
             Self::Gateway(cmd) => cmd.execute(),
             Self::Clean(cmd) => cmd.execute(),
+            Self::Memory(cmd) => cmd.execute(),
             Self::Completions(cmd) => cmd.execute(),
             Self::Office(cmd) => cmd.execute(),
         }

@@ -13,8 +13,9 @@ use octos_agent::compaction::CompactionRunner;
 use octos_agent::{
     Agent, AgentConfig, CompactionSummarizerKind, ConsoleReporter, ConversationResponse,
     HookExecutor, ToolApprovalDecision, ToolApprovalRequest, ToolApprovalRequester, ToolRegistry,
-    read_workspace_policy,
+    UserQuestionOutcome, UserQuestionRequest, UserQuestionRequester, read_workspace_policy,
 };
+use octos_core::ui_protocol::UserQuestionAnswer;
 use octos_core::{AgentId, Message, MessageRole, SessionScope};
 use octos_llm::{
     AdaptiveConfig, AdaptiveRouter, EmbeddingProvider, LlmProvider, OpenAIEmbedder, ProviderChain,
@@ -82,24 +83,102 @@ pub struct ChatCommand {
 /// Exit commands.
 const EXIT_COMMANDS: &[&str] = &["exit", "quit", "/exit", "/quit", ":q"];
 
-struct CliApprovalRequester;
+/// Serializes ALL interactive stdin prompts (approvals AND user questions):
+/// if two prompt-raising tools run in the same turn, their stdin prints/reads
+/// must not interleave — otherwise a single `y` or a picked number could land
+/// on whichever request won the stdin race rather than the one the user
+/// meant. One module-level lock shared by both requesters — a function-local
+/// `static` would be a *distinct* mutex per function and not serialize an
+/// approval against a question (codex review).
+static CHAT_PROMPT_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// What the user answered at the CLI approval prompt. `ApproveSession`
+/// mirrors the TUI's `s` action / the serve `approval_scope: "session"`
+/// (`ApprovalScopeKind::ApproveForSession`): every later approval-gated
+/// request in this chat process auto-resolves without prompting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CliApprovalAnswer {
+    ApproveOnce,
+    ApproveSession,
+    Deny,
+}
+
+/// Parse the `[y/s/N]` answer line. Empty / unrecognized input denies —
+/// same fail-closed default as the old `[y/N]` prompt.
+fn parse_cli_approval_answer(line: &str) -> CliApprovalAnswer {
+    match line.trim().to_ascii_lowercase().as_str() {
+        "y" | "yes" => CliApprovalAnswer::ApproveOnce,
+        "s" | "session" => CliApprovalAnswer::ApproveSession,
+        _ => CliApprovalAnswer::Deny,
+    }
+}
+
+#[derive(Default)]
+struct CliApprovalRequester {
+    /// Set once the user answers `s` — the CLI-chat equivalent of the serve
+    /// scope table's `(ApproveForSession, MatchKey::Session)` entry, which
+    /// auto-resolves every subsequent approval in the session. Scope lifetime
+    /// is this chat process (serve evicts its entry on session close).
+    session_approved: std::sync::atomic::AtomicBool,
+}
+
+impl CliApprovalRequester {
+    fn session_approved(&self) -> bool {
+        self.session_approved
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+}
 
 #[async_trait::async_trait]
 impl ToolApprovalRequester for CliApprovalRequester {
     async fn request_approval(&self, request: ToolApprovalRequest) -> ToolApprovalDecision {
-        // Serialize prompts: if two approval-gated tools run in the same turn,
-        // their stdin prompts/reads must not interleave — otherwise a single
-        // `y` could approve whichever request won the stdin race rather than
-        // the one the user meant. One prompt at a time, process-wide.
-        static PROMPT_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-        let _guard = PROMPT_LOCK.lock().await;
-        tokio::task::spawn_blocking(move || prompt_for_cli_approval(request))
+        // Fast path: a prior `s` answer auto-resolves without prompting
+        // (mirrors serve's `approval_auto_resolved`). Print a note so the
+        // grant stays visible instead of commands silently running.
+        if self.session_approved() {
+            eprintln!(
+                "{} {}",
+                "Auto-approved (session scope):".dimmed(),
+                request
+                    .command
+                    .as_deref()
+                    .unwrap_or(&request.title)
+                    .dimmed()
+            );
+            return ToolApprovalDecision::Approve;
+        }
+        let _guard = CHAT_PROMPT_LOCK.lock().await;
+        // Re-check after acquiring the lock: a parallel tool batch can queue
+        // two prompts; if the first answer was `s`, the second must
+        // auto-resolve instead of prompting again.
+        if self.session_approved() {
+            eprintln!(
+                "{} {}",
+                "Auto-approved (session scope):".dimmed(),
+                request
+                    .command
+                    .as_deref()
+                    .unwrap_or(&request.title)
+                    .dimmed()
+            );
+            return ToolApprovalDecision::Approve;
+        }
+        let answer = tokio::task::spawn_blocking(move || prompt_for_cli_approval(request))
             .await
-            .unwrap_or(ToolApprovalDecision::Deny)
+            .unwrap_or(CliApprovalAnswer::Deny);
+        match answer {
+            CliApprovalAnswer::ApproveOnce => ToolApprovalDecision::Approve,
+            CliApprovalAnswer::ApproveSession => {
+                self.session_approved
+                    .store(true, std::sync::atomic::Ordering::Release);
+                ToolApprovalDecision::Approve
+            }
+            CliApprovalAnswer::Deny => ToolApprovalDecision::Deny,
+        }
     }
 }
 
-fn prompt_for_cli_approval(request: ToolApprovalRequest) -> ToolApprovalDecision {
+fn prompt_for_cli_approval(request: ToolApprovalRequest) -> CliApprovalAnswer {
     eprintln!();
     eprintln!("{}", "Approval required".yellow().bold());
     eprintln!("{}", request.title.bold());
@@ -110,18 +189,153 @@ fn prompt_for_cli_approval(request: ToolApprovalRequest) -> ToolApprovalDecision
 
     if !io::stdin().is_terminal() {
         eprintln!("No interactive terminal available; denying request.");
-        return ToolApprovalDecision::Deny;
+        return CliApprovalAnswer::Deny;
     }
 
-    eprint!("Approve once? [y/N] ");
+    eprint!("Approve? [y]es once / [s]ession / [N]o ");
     let _ = io::stderr().flush();
     let mut answer = String::new();
     match io::stdin().read_line(&mut answer) {
-        Ok(_) if matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes") => {
-            ToolApprovalDecision::Approve
-        }
-        _ => ToolApprovalDecision::Deny,
+        Ok(_) => parse_cli_approval_answer(&answer),
+        Err(_) => CliApprovalAnswer::Deny,
     }
+}
+
+struct CliUserQuestionRequester;
+
+#[async_trait::async_trait]
+impl UserQuestionRequester for CliUserQuestionRequester {
+    async fn request_user_question(&self, request: UserQuestionRequest) -> UserQuestionOutcome {
+        // Shared CHAT_PROMPT_LOCK: an approval and a question in the same
+        // turn must not interleave their stdin reads.
+        let _guard = CHAT_PROMPT_LOCK.lock().await;
+        tokio::task::spawn_blocking(move || prompt_for_cli_user_question(request))
+            .await
+            .unwrap_or(UserQuestionOutcome::Cancelled)
+    }
+}
+
+fn prompt_for_cli_user_question(request: UserQuestionRequest) -> UserQuestionOutcome {
+    // No terminal to prompt on → let the tool degrade to its structured
+    // fallback (the model re-asks in plain text) rather than block forever.
+    if !io::stdin().is_terminal() {
+        return UserQuestionOutcome::Unsupported;
+    }
+
+    eprintln!();
+    eprintln!("{}", "Agent needs your input".cyan().bold());
+    if !request.title.is_empty() {
+        eprintln!("{}", request.title.bold());
+    }
+    if !request.body.is_empty() {
+        eprintln!("{}", request.body);
+    }
+
+    let total = request.questions.len();
+    let mut answers: Vec<UserQuestionAnswer> = Vec::with_capacity(total);
+
+    for (qi, question) in request.questions.iter().enumerate() {
+        eprintln!();
+        if total > 1 {
+            eprintln!("{}", format!("Question {} of {}", qi + 1, total).dimmed());
+        }
+        eprintln!("{}", question.question.bold());
+
+        // Numbered options, then an "Other" row when free text is offered.
+        for (oi, opt) in question.options.iter().enumerate() {
+            if opt.description.is_empty() {
+                eprintln!("  {}. {}", oi + 1, opt.label);
+            } else {
+                eprintln!("  {}. {} — {}", oi + 1, opt.label, opt.description.dimmed());
+            }
+        }
+        let other_index = question.options.len() + 1;
+        if question.allow_free_text {
+            eprintln!("  {other_index}. {}", "Other (type your own)".dimmed());
+        }
+
+        if question.multi_select {
+            eprint!("Choose one or more, comma-separated [1]: ");
+        } else {
+            eprint!("Choose [1]: ");
+        }
+        let _ = io::stderr().flush();
+
+        let mut line = String::new();
+        if io::stdin().read_line(&mut line).unwrap_or(0) == 0 {
+            // EOF (Ctrl-D) — abandon the whole question.
+            return UserQuestionOutcome::Cancelled;
+        }
+        let (selected_labels, other_picked) = parse_question_selection(question, &line);
+
+        // Read the free-text answer only when "Other" was chosen.
+        let mut free_text: Option<String> = None;
+        if other_picked {
+            eprint!("Your answer: ");
+            let _ = io::stderr().flush();
+            let mut ft = String::new();
+            if io::stdin().read_line(&mut ft).unwrap_or(0) == 0 {
+                return UserQuestionOutcome::Cancelled;
+            }
+            let ft = ft.trim().to_string();
+            if !ft.is_empty() {
+                free_text = Some(ft);
+            }
+        }
+
+        answers.push(UserQuestionAnswer {
+            selected_labels,
+            free_text,
+        });
+    }
+
+    UserQuestionOutcome::Answered(answers)
+}
+
+/// Parse the numbered-selection `line` for one question into (option labels,
+/// was-"Other"-picked). Empty input defaults to option 1. Out-of-range and
+/// non-numeric tokens are dropped; a single-select question keeps only the
+/// first valid pick. The "Other" row is index `options.len() + 1` and is only
+/// honoured when the question allows free text. Pure so it can be unit-tested
+/// without stdin.
+fn parse_question_selection(
+    question: &octos_core::ui_protocol::UserQuestion,
+    line: &str,
+) -> (Vec<String>, bool) {
+    let other_index = question.options.len() + 1;
+    // The "Other" row is only selectable when the question allows free text.
+    let max_index = if question.allow_free_text {
+        other_index
+    } else {
+        question.options.len()
+    };
+    let trimmed = line.trim();
+    let mut picks: Vec<usize> = trimmed
+        .split(',')
+        .filter_map(|tok| tok.trim().parse::<usize>().ok())
+        .filter(|n| *n >= 1 && *n <= max_index)
+        .collect();
+    // Empty or all-invalid input falls back to the first option (the "[1]"
+    // default shown in the prompt) so a stray keystroke still yields an answer.
+    if picks.is_empty() {
+        picks.push(1);
+    }
+    if !question.multi_select {
+        picks.truncate(1);
+    }
+
+    let mut selected_labels = Vec::new();
+    let mut other_picked = false;
+    for n in picks {
+        // `n == other_index` is only reachable when free text is allowed
+        // (`max_index` excludes it otherwise), so it always means "Other".
+        if n == other_index {
+            other_picked = true;
+        } else if let Some(opt) = question.options.get(n - 1) {
+            selected_labels.push(opt.label.clone());
+        }
+    }
+    (selected_labels, other_picked)
 }
 
 async fn with_chat_approval<F, T>(
@@ -131,8 +345,15 @@ async fn with_chat_approval<F, T>(
 where
     F: Future<Output = T>,
 {
-    octos_agent::tools::TOOL_APPROVAL_CTX
-        .scope(approval_requester, future)
+    // Scope BOTH the approval and the user-question requesters for the turn,
+    // so `ask_user_question` renders the interactive numbered prompt instead
+    // of degrading to Unsupported (the model re-asking in plain text).
+    let uq_requester: Arc<dyn UserQuestionRequester> = Arc::new(CliUserQuestionRequester);
+    octos_agent::tools::USER_QUESTION_CTX
+        .scope(
+            uq_requester,
+            octos_agent::tools::TOOL_APPROVAL_CTX.scope(approval_requester, future),
+        )
         .await
 }
 
@@ -309,6 +530,11 @@ impl ChatCommand {
         );
         tools.register(octos_agent::RecallMemoryTool::new(memory_store.clone()));
         tools.register(octos_agent::SaveMemoryTool::new(memory_store.clone()));
+        let memory_refresh_enabled =
+            crate::config::MemoryConfig::refresh_enabled(config.memory.as_ref());
+        if memory_refresh_enabled {
+            tools.register(octos_agent::MemoryNoteTool::new(memory_store.clone()));
+        }
 
         // Register MCP tools
         if !config.mcp_servers.is_empty() {
@@ -605,16 +831,25 @@ impl ChatCommand {
             agent.append_system_prompt(&bootstrap);
         }
 
-        // Inject memory context (long-term + daily notes)
-        let memory_ctx = memory_store.get_memory_context().await;
-        if !memory_ctx.is_empty() {
-            agent.append_system_prompt(&memory_ctx);
-        }
-
-        // Inject memory bank summary (entity abstracts)
-        let bank_summary = memory_store.get_bank_summary().await;
-        if !bank_summary.is_empty() {
-            agent.append_system_prompt(&bank_summary);
+        // Inject the token-capped memory block (long-term memory + daily
+        // notes + bank summary; omissions are disclosed to the model) as a
+        // replaceable named segment between bootstrap and skill fragments.
+        // With memory refresh on, the capture policy rides the same segment
+        // and a provider re-renders it when MEMORY.md changes on disk or
+        // the date rolls over (one stat per turn otherwise).
+        let max_inject =
+            crate::config::MemoryConfig::effective_max_inject_tokens(config.memory.as_ref());
+        let memory_ctx = memory_store.get_injectable_context(max_inject).await;
+        agent.set_prompt_segment(
+            octos_agent::MEMORY_SEGMENT_NAME,
+            octos_agent::compose_memory_segment(&memory_ctx, memory_refresh_enabled),
+        );
+        if memory_refresh_enabled {
+            agent.add_prompt_segment_provider(Arc::new(octos_agent::MemorySegmentProvider::new(
+                memory_store.clone(),
+                max_inject,
+                true,
+            )));
         }
 
         // Inject skill prompt fragments
@@ -661,7 +896,8 @@ impl ChatCommand {
             }
         }
 
-        let approval_requester: Arc<dyn ToolApprovalRequester> = Arc::new(CliApprovalRequester);
+        let approval_requester: Arc<dyn ToolApprovalRequester> =
+            Arc::new(CliApprovalRequester::default());
 
         // Single-message mode: send one message and exit
         if let Some(msg) = self.message {
@@ -885,10 +1121,70 @@ pub(crate) fn resolve_provider_policy(
 /// Create an embedding provider from config, if configured.
 pub(crate) fn create_embedder(config: &Config) -> Option<Arc<dyn EmbeddingProvider>> {
     let cfg = config.embedding.as_ref()?;
-    let key = config.get_api_key(&cfg.provider).ok()?;
+    // `api_key_env` was declared on EmbeddingConfig but never honored —
+    // it wins over the provider-default var name, resolving through the
+    // SAME credential chain as every other key (auth store, env_vars +
+    // keychain, process env), so `octos auth login` / config-stored keys
+    // keep working (codex P2).
+    let key = config
+        .get_api_key_with_env(&cfg.provider, cfg.api_key_env.as_deref())
+        .ok()?;
     let mut e = OpenAIEmbedder::new(key);
     if let Some(ref url) = cfg.base_url {
         e = e.with_base_url(url);
+    } else if !cfg.provider.eq_ignore_ascii_case("openai") {
+        // A non-openai provider without an explicit base_url falls back to
+        // the registry's default endpoint — otherwise the request goes to
+        // api.openai.com with the other provider's key/model (codex R8).
+        if let Some(url) =
+            octos_llm::registry::lookup(&cfg.provider).and_then(|e| e.default_base_url)
+        {
+            e = e.with_base_url(url);
+        }
+    }
+    if let Some(ref model) = cfg.model {
+        e = e.with_model(model);
+    }
+    if let Some(dimensions) = cfg.dimensions {
+        if dimensions as usize != octos_memory::EPISODIC_INDEX_DIMENSION {
+            tracing::warn!(
+                dimensions,
+                index = octos_memory::EPISODIC_INDEX_DIMENSION,
+                "embedding.dimensions differs from the episodic index dimension — \
+                 vectors will be dropped to BM25-only"
+            );
+        }
+        e = e.with_dimensions(dimensions);
+    } else if let Some(model) = cfg.model.as_deref() {
+        // Auto-pin to the index dimension ONLY for families known to
+        // accept the OpenAI-standard `dimensions` field (OpenAI 3-series;
+        // DashScope text-embedding-v3/v4, natively 1024-d). Models that
+        // reject the field (ada-002) keep the legacy request shape; for
+        // families we can't classify, warn loudly instead of degrading
+        // silently — the native size is unknown and non-1536 vectors are
+        // dropped to BM25-only.
+        // Exactly the families verified to accept `dimensions: 1536`:
+        // OpenAI 3-series (native 1536/3072, truncation supported) and
+        // DashScope text-embedding-v4 (64–2048, verified live). v3 caps
+        // below 1536 and would error — it falls to the warn path.
+        let supports_dimensions =
+            model.starts_with("text-embedding-3") || model == "text-embedding-v4";
+        if supports_dimensions {
+            tracing::info!(
+                model = %e.model(),
+                pinned = octos_memory::EPISODIC_INDEX_DIMENSION,
+                "pinning custom embedding model to the episodic index dimension"
+            );
+            e = e.with_dimensions(octos_memory::EPISODIC_INDEX_DIMENSION as u32);
+        } else {
+            tracing::warn!(
+                model = %e.model(),
+                index = octos_memory::EPISODIC_INDEX_DIMENSION,
+                "custom embedding model without `dimensions`: native size unknown — \
+                 vectors that are not index-sized will be dropped to BM25-only; set \
+                 embedding.dimensions if the provider supports it"
+            );
+        }
     }
     Some(Arc::new(e))
 }
@@ -938,6 +1234,119 @@ pub(crate) fn build_run_pipeline_tool(
 #[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
+
+    fn q(multi: bool, allow_free_text: bool) -> octos_core::ui_protocol::UserQuestion {
+        use octos_core::ui_protocol::{UserQuestion, UserQuestionOption};
+        UserQuestion {
+            header: "H".into(),
+            question: "Which?".into(),
+            options: vec![
+                UserQuestionOption {
+                    label: "axum".into(),
+                    description: String::new(),
+                },
+                UserQuestionOption {
+                    label: "actix".into(),
+                    description: String::new(),
+                },
+                UserQuestionOption {
+                    label: "warp".into(),
+                    description: String::new(),
+                },
+            ],
+            multi_select: multi,
+            allow_free_text,
+        }
+    }
+
+    #[test]
+    fn parse_approval_answer_maps_y_s_and_default_deny() {
+        assert_eq!(
+            parse_cli_approval_answer("y\n"),
+            CliApprovalAnswer::ApproveOnce
+        );
+        assert_eq!(
+            parse_cli_approval_answer("  YES "),
+            CliApprovalAnswer::ApproveOnce
+        );
+        assert_eq!(
+            parse_cli_approval_answer("s"),
+            CliApprovalAnswer::ApproveSession
+        );
+        assert_eq!(
+            parse_cli_approval_answer("Session\n"),
+            CliApprovalAnswer::ApproveSession
+        );
+        // Fail-closed: empty and anything unrecognized deny.
+        assert_eq!(parse_cli_approval_answer(""), CliApprovalAnswer::Deny);
+        assert_eq!(parse_cli_approval_answer("n"), CliApprovalAnswer::Deny);
+        assert_eq!(parse_cli_approval_answer("wat"), CliApprovalAnswer::Deny);
+    }
+
+    #[tokio::test]
+    async fn session_scope_auto_resolves_later_requests_without_prompting() {
+        // With the session flag set, request_approval must return Approve on
+        // the fast path — before spawn_blocking would ever touch stdin (this
+        // test has no TTY; a prompt would deny, failing the assert).
+        let requester = CliApprovalRequester::default();
+        requester
+            .session_approved
+            .store(true, std::sync::atomic::Ordering::Release);
+        let request = ToolApprovalRequest {
+            tool_id: "t1".into(),
+            tool_name: "shell".into(),
+            title: "Approve command".into(),
+            body: "Run command: sudo echo hi".into(),
+            command: Some("sudo echo hi".into()),
+            cwd: None,
+        };
+        let decision = requester.request_approval(request).await;
+        assert_eq!(decision, ToolApprovalDecision::Approve);
+    }
+
+    #[test]
+    fn parse_selection_single_picks_the_numbered_option() {
+        let (labels, other) = parse_question_selection(&q(false, true), "2");
+        assert_eq!(labels, vec!["actix"]);
+        assert!(!other);
+    }
+
+    #[test]
+    fn parse_selection_empty_defaults_to_first_option() {
+        let (labels, other) = parse_question_selection(&q(false, true), "  \n");
+        assert_eq!(labels, vec!["axum"]);
+        assert!(!other);
+    }
+
+    #[test]
+    fn parse_selection_single_ignores_extra_picks() {
+        // Single-select keeps only the first valid pick.
+        let (labels, _) = parse_question_selection(&q(false, true), "3,1");
+        assert_eq!(labels, vec!["warp"]);
+    }
+
+    #[test]
+    fn parse_selection_multi_keeps_all_valid_and_drops_garbage() {
+        let (labels, other) = parse_question_selection(&q(true, true), "1, 3, 9, x");
+        assert_eq!(labels, vec!["axum", "warp"]); // 9 out-of-range, x non-numeric
+        assert!(!other);
+    }
+
+    #[test]
+    fn parse_selection_other_index_sets_free_text_flag() {
+        // Other is options.len()+1 = 4 here.
+        let (labels, other) = parse_question_selection(&q(false, true), "4");
+        assert!(labels.is_empty());
+        assert!(other);
+    }
+
+    #[test]
+    fn parse_selection_other_ignored_when_free_text_disallowed() {
+        // With free text off, index 4 is out of range → filtered → default(1).
+        let (labels, other) = parse_question_selection(&q(false, false), "4");
+        assert!(!other);
+        assert_eq!(labels, vec!["axum"]); // empty picks after filter → default
+    }
 
     #[test]
     fn test_resolve_provider_policy_model_id_match() {

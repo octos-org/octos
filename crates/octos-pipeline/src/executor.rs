@@ -3274,9 +3274,17 @@ impl PipelineExecutor {
                     eyre::eyre!("codergen handler not found for dynamic_parallel workers")
                 })?;
 
-                // Execute all synthetic nodes concurrently
+                // Execute all synthetic nodes concurrently, capped by the
+                // same `max_parallel_workers` semaphore the static `Parallel`
+                // branch uses. The planner may yield more tasks than the
+                // limit; without this gate every synthetic worker would
+                // dispatch at once (the planner's `llm_semaphore` bounds
+                // concurrent LLM calls, not in-flight workers).
                 let total_workers = synthetic_nodes.len();
                 let completed_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                let semaphore = Arc::new(tokio::sync::Semaphore::new(
+                    self.config.max_parallel_workers,
+                ));
                 let mut futures = Vec::new();
                 // coding-blue FA-7: same fan-out reservation pattern as
                 // the static Parallel branch — reserve per-worker up
@@ -3340,6 +3348,7 @@ impl PipelineExecutor {
                     // PANICS (the future unwinds; `join_all` surfaces the panic).
                     let dp_node_index = worker_idx + 1;
 
+                    let sem = semaphore.clone();
                     let pipeline_id = graph.id.clone();
                     let guard_label = worker_label.clone();
                     let guard_tid = task_id.clone();
@@ -3351,8 +3360,10 @@ impl PipelineExecutor {
                     // attempt bounded by `MAX_FANOUT_WORKER_SECS`.
                     let hook_executor = self.config.hook_executor.clone();
                     futures.push(async move {
+                        let _permit = sem.acquire().await.expect("semaphore closed");
                         // Arm the guard HERE — only once the future is actually
-                        // polled, guaranteeing a started/completed pair.
+                        // polled AND holds a worker permit, guaranteeing a
+                        // started/completed pair for a worker that actually ran.
                         let guard = NodeProgressGuard::arm(
                             &pipeline_id,
                             &guard_tid,
@@ -6343,6 +6354,132 @@ mod tests {
                 assert_eq!(*count, 0, "no workers should dispatch before the cap fires");
             }
         }
+    }
+
+    /// Planner provider for the dynamic fan-out concurrency test: returns a
+    /// JSON array of exactly 6 tasks so the `dynamic_parallel` node plans
+    /// MORE workers than `max_parallel_workers`.
+    struct SixTaskPlanner;
+
+    #[async_trait::async_trait]
+    impl LlmProvider for SixTaskPlanner {
+        async fn chat(
+            &self,
+            _messages: &[octos_core::Message],
+            _tools: &[octos_llm::ToolSpec],
+            _config: &octos_llm::ChatConfig,
+        ) -> Result<octos_llm::ChatResponse> {
+            Ok(octos_llm::ChatResponse {
+                content: Some(
+                    r#"[{"task":"t1","label":"T1"},{"task":"t2","label":"T2"},
+                        {"task":"t3","label":"T3"},{"task":"t4","label":"T4"},
+                        {"task":"t5","label":"T5"},{"task":"t6","label":"T6"}]"#
+                        .to_string(),
+                ),
+                reasoning_content: None,
+                tool_calls: vec![],
+                stop_reason: octos_llm::StopReason::EndTurn,
+                usage: octos_llm::TokenUsage::default(),
+                provider_index: None,
+            })
+        }
+
+        fn model_id(&self) -> &str {
+            "mock-planner"
+        }
+
+        fn provider_name(&self) -> &str {
+            "mock"
+        }
+    }
+
+    /// Codergen stand-in that records the peak number of concurrently
+    /// executing fan-out workers: increment an in-flight counter on entry,
+    /// fold it into the running maximum, hold the slot across a real await,
+    /// decrement on exit.
+    struct ConcurrencyProbeHandler {
+        in_flight: Arc<AtomicUsize>,
+        max_in_flight: Arc<AtomicUsize>,
+        executed: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl Handler for ConcurrencyProbeHandler {
+        async fn execute(&self, node: &PipelineNode, _ctx: &HandlerContext) -> Result<NodeOutcome> {
+            let now = self.in_flight.fetch_add(1, AtomicOrdering::SeqCst) + 1;
+            self.max_in_flight.fetch_max(now, AtomicOrdering::SeqCst);
+            // Hold the slot across an await point. `join_all` polls every
+            // worker future once within microseconds, so 50ms guarantees all
+            // concurrently-dispatched workers pile up before the first exits
+            // — no racing needed for a deterministic peak.
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            self.in_flight.fetch_sub(1, AtomicOrdering::SeqCst);
+            self.executed.fetch_add(1, AtomicOrdering::SeqCst);
+            Ok(NodeOutcome {
+                node_id: node.id.clone(),
+                status: OutcomeStatus::Pass,
+                content: format!("{} done", node.id),
+                token_usage: TokenUsage::default(),
+                files_modified: vec![],
+            })
+        }
+    }
+
+    /// The dynamic fan-out must honor `max_parallel_workers` exactly like
+    /// the static `Parallel` branch. A planner that yields 6 tasks with
+    /// `max_parallel_workers = 2` may never have more than 2 workers
+    /// in flight at once.
+    #[tokio::test]
+    async fn should_cap_dynamic_parallel_worker_concurrency_when_planner_exceeds_limit() {
+        let mut config = make_capped_config(100).await;
+        config.default_provider = Arc::new(SixTaskPlanner);
+        config.max_parallel_workers = 2;
+        let executor = PipelineExecutor::new(config);
+
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let max_in_flight = Arc::new(AtomicUsize::new(0));
+        let executed = Arc::new(AtomicUsize::new(0));
+
+        let mut handlers = HandlerRegistry::new();
+        handlers.register(
+            HandlerKind::Codergen,
+            Arc::new(ConcurrencyProbeHandler {
+                in_flight: in_flight.clone(),
+                max_in_flight: max_in_flight.clone(),
+                executed: executed.clone(),
+            }),
+        );
+        handlers.register(HandlerKind::DynamicParallel, Arc::new(NoopHandler));
+        handlers.register(HandlerKind::Noop, Arc::new(NoopHandler));
+
+        let dot = r#"
+            digraph t {
+                plan [handler="dynamic_parallel", converge="merge", prompt="plan"]
+                merge [handler="noop"]
+                plan -> merge
+            }
+        "#;
+
+        let result = executor
+            .run_with_handlers(dot, "seed", &serde_json::Map::new(), handlers)
+            .await
+            .expect("dynamic parallel pipeline should complete");
+        assert!(result.success);
+
+        // The planner JSON must have driven the fan-out (6 workers), not the
+        // 3-task fallback — otherwise the concurrency assertion below tests
+        // a weaker shape than intended.
+        assert_eq!(
+            executed.load(AtomicOrdering::SeqCst),
+            6,
+            "expected all 6 planned workers to run"
+        );
+        let peak = max_in_flight.load(AtomicOrdering::SeqCst);
+        assert!(
+            peak <= 2,
+            "dynamic_parallel fan-out must gate workers to max_parallel_workers=2, \
+             but {peak} ran concurrently"
+        );
     }
 
     /// Guard B sanity check: when the fan-out is below the cap the

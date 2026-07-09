@@ -361,7 +361,14 @@ fn prompt_custom_provider() -> Result<SelectedProvider> {
         }
     };
 
-    let model = prompt_model("auto", &fetched_models)?;
+    let model = if fetched_models.is_empty() {
+        // The /models probe found nothing — require an explicit name
+        // instead of the old invalid "auto" default (#1541 item 3).
+        let mut stdin = io::stdin().lock();
+        read_required_model(&mut stdin, "the custom provider")?
+    } else {
+        prompt_model(&fetched_models[0].clone(), &fetched_models)?
+    };
 
     Ok(SelectedProvider {
         provider: CUSTOM_PROVIDER_NAME.to_string(),
@@ -377,12 +384,147 @@ fn prompt_custom_provider() -> Result<SelectedProvider> {
 ///
 /// Shared by the preset path (config built via [`build_config`]) and the
 /// custom path (config built via [`SelectedProvider::to_json`]) so both flows
+/// Outcome of the init-time API-key capture offer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KeyCaptureOutcome {
+    /// The user pasted a key; it was saved to the global auth store.
+    Saved,
+    /// The user pressed Enter to skip.
+    Skipped,
+}
+
+/// Core of the init-time key capture: read one line from `reader`; empty
+/// input skips, anything else is trimmed and saved to `store` as a
+/// `paste_token` credential for `provider` — byte-for-byte the same
+/// credential shape `octos auth login --provider <name>` stores, so
+/// `Config::get_api_key` (auth store first, env second) resolves it for
+/// chat/serve/gateway without any exported env var.
+///
+/// Extracted from the interactive wrapper for testability (injected reader).
+fn capture_api_key_from_reader(
+    provider: &str,
+    store: &mut crate::auth::AuthStore,
+    reader: &mut dyn std::io::BufRead,
+) -> Result<KeyCaptureOutcome> {
+    let mut line = String::new();
+    reader.read_line(&mut line)?;
+    let token = line.trim();
+    if token.is_empty() {
+        return Ok(KeyCaptureOutcome::Skipped);
+    }
+    store.set(
+        provider,
+        crate::auth::AuthCredential {
+            access_token: token.to_string(),
+            refresh_token: None,
+            expires_at: None,
+            provider: provider.to_string(),
+            auth_method: "paste_token".to_string(),
+        },
+    )?;
+    Ok(KeyCaptureOutcome::Saved)
+}
+
+/// Preflight decision for the init-time credential offer, mirroring the
+/// runtime resolution order in `Config::get_api_key`: a set env var or a
+/// non-expired stored credential means the setup already works; anything
+/// else (nothing stored, or only an EXPIRED credential — which
+/// `get_api_key` rejects) warrants the capture offer. Extracted for
+/// testability (codex: an expired OAuth credential must not suppress the
+/// offer and then fail at runtime).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KeyCapturePreflight {
+    EnvSet,
+    ValidStoredCredential,
+    Offer,
+}
+
+fn key_capture_preflight(
+    env_set: bool,
+    stored: Option<&crate::auth::AuthCredential>,
+) -> KeyCapturePreflight {
+    if env_set {
+        return KeyCapturePreflight::EnvSet;
+    }
+    match stored {
+        Some(cred) if !cred.is_expired() => KeyCapturePreflight::ValidStoredCredential,
+        _ => KeyCapturePreflight::Offer,
+    }
+}
+
+/// Init-time credential offer, mirroring the runtime resolution order:
+/// env var set → done; global auth store already holds a NON-EXPIRED
+/// credential → done; otherwise, on an interactive TTY run, offer to
+/// paste the key now (Enter skips). Non-interactive runs (`--defaults`,
+/// flag-driven custom, no TTY) keep the old export hint — they must
+/// never block on a read (codex: `--defaults` is documented to skip
+/// interactive prompts).
+fn offer_api_key_capture(provider: &str, api_key_env: &str, interactive: bool) {
+    use std::io::IsTerminal as _;
+
+    let auth_home = crate::config_context::resolve_config_context(None).auth_home;
+    let store = crate::auth::AuthStore::at(&auth_home);
+    let stored = store.as_ref().ok().and_then(|s| s.get(provider));
+    match key_capture_preflight(std::env::var(api_key_env).is_ok(), stored) {
+        KeyCapturePreflight::EnvSet => {
+            println!("{} {} is set", "✓".green(), api_key_env);
+            return;
+        }
+        KeyCapturePreflight::ValidStoredCredential => {
+            println!(
+                "{} credential for {} already saved (octos auth login)",
+                "✓".green(),
+                provider
+            );
+            return;
+        }
+        KeyCapturePreflight::Offer => {}
+    }
+
+    println!("{} {} is not set", "Warning:".yellow(), api_key_env);
+
+    let captured = match store {
+        Ok(mut s) if interactive && std::io::stdin().is_terminal() && !provider.is_empty() => {
+            println!(
+                "Paste your {} API key now to save it securely (Enter to skip):",
+                provider
+            );
+            print!("> ");
+            use std::io::Write as _;
+            let _ = std::io::stdout().flush();
+            let mut stdin = std::io::stdin().lock();
+            capture_api_key_from_reader(provider, &mut s, &mut stdin)
+                .unwrap_or(KeyCaptureOutcome::Skipped)
+        }
+        _ => KeyCaptureOutcome::Skipped,
+    };
+
+    match captured {
+        KeyCaptureOutcome::Saved => {
+            println!(
+                "{} Key saved for {} — chat/serve will use it (auth store)",
+                "✓".green(),
+                provider
+            );
+            println!();
+        }
+        KeyCaptureOutcome::Skipped => {
+            println!();
+            println!("Set it later with:");
+            println!("  octos auth login --provider {provider}");
+            println!("  # or: export {}=your-api-key", api_key_env);
+            println!();
+        }
+    }
+}
+
 /// produce an identical, fully-bootstrapped octos home.
 fn write_init_files(
     config_dir: PathBuf,
     config_path: PathBuf,
     config: Value,
     api_key_env: String,
+    interactive: bool,
 ) -> Result<()> {
     // Create directory
     std::fs::create_dir_all(&config_dir)
@@ -402,16 +544,18 @@ fn write_init_files(
     println!("{}", config_str);
     println!();
 
-    // Check if API key is set
-    if std::env::var(&api_key_env).is_err() {
-        println!("{} {} is not set", "Warning:".yellow(), api_key_env);
-        println!();
-        println!("Set it with:");
-        println!("  export {}=your-api-key", api_key_env);
-        println!();
-    } else {
-        println!("{} {} is set", "✓".green(), api_key_env);
-    }
+    // Credential check. Resolution order at runtime is auth store first,
+    // then env var (`Config::get_api_key`), so mirror that here — and when
+    // NEITHER holds a credential, offer to capture the key on the spot
+    // through the same global auth store `octos auth login` writes (#1541:
+    // init used to stop at "export it yourself", leaving a fresh setup
+    // that cannot actually reach the provider).
+    let provider_name = config
+        .get("provider")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    offer_api_key_capture(&provider_name, &api_key_env, interactive);
 
     // Create .gitignore if it doesn't exist
     let gitignore_path = config_dir.join(".gitignore");
@@ -483,50 +627,105 @@ fn write_init_files(
     Ok(())
 }
 
-/// Load models from model_catalog.json, grouped by provider.
-fn load_catalog_models() -> BTreeMap<String, Vec<String>> {
-    let mut result = BTreeMap::new();
+/// The repo's model catalog, baked in at compile time so INSTALLED
+/// binaries (brew/npm/installer bundles ship no model_catalog.json on
+/// disk) still offer real model names in `octos init` — pre-fix, every
+/// provider fell into manual entry whose "auto" default is rejected by
+/// real APIs (#1541 item 3).
+const EMBEDDED_MODEL_CATALOG: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../model_catalog.json"
+));
 
-    // Try common locations for model_catalog.json
+/// Parse a model_catalog.json payload into provider → model-name lists.
+fn parse_catalog_content(content: &str) -> BTreeMap<String, Vec<String>> {
+    let mut result: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    if let Ok(catalog) = serde_json::from_str::<serde_json::Value>(content) {
+        if let Some(models) = catalog.get("models").and_then(|m| m.as_array()) {
+            for model in models {
+                if let Some(provider_model) = model.get("provider").and_then(|p| p.as_str()) {
+                    let parts: Vec<&str> = provider_model.splitn(2, '/').collect();
+                    if parts.len() == 2 {
+                        result
+                            .entry(parts[0].to_string())
+                            .or_default()
+                            .push(parts[1].to_string());
+                    }
+                }
+            }
+        }
+    }
+    result
+}
+
+/// The embedded catalog, parsed (compile-time fallback for installs).
+fn embedded_catalog_models() -> BTreeMap<String, Vec<String>> {
+    parse_catalog_content(EMBEDDED_MODEL_CATALOG)
+}
+
+/// Read a model name, re-prompting until non-empty — there is NO silent
+/// default: "auto" is not a real model on any current provider API and
+/// writing it produced a config that 400s on the first turn.
+fn read_required_model(
+    reader: &mut dyn std::io::BufRead,
+    provider_display: &str,
+) -> Result<String> {
+    for _ in 0..16 {
+        print!("Model (e.g. the provider's current model name): ");
+        let _ = io::stdout().flush();
+        let mut line = String::new();
+        if reader.read_line(&mut line)? == 0 {
+            break; // EOF
+        }
+        let trimmed = line.trim();
+        if !trimmed.is_empty() {
+            return Ok(trimmed.to_string());
+        }
+    }
+    eyre::bail!(
+        "a model name is required for {provider_display} — check the provider's docs for current model names"
+    )
+}
+
+/// Resolve the non-interactive (`--defaults`) model for a provider:
+/// hardcoded knowns, then the catalog's first entry. Anything else is an
+/// error — `--defaults` must never silently write "auto".
+fn default_model_for(provider: &str, catalog: &BTreeMap<String, Vec<String>>) -> Result<String> {
+    match provider {
+        "openai" => return Ok("gpt-4.1-mini".to_string()),
+        "anthropic" => return Ok("claude-sonnet-4-20250514".to_string()),
+        _ => {}
+    }
+    if let Some(first) = catalog.get(provider).and_then(|m| m.first()) {
+        return Ok(first.clone());
+    }
+    eyre::bail!(
+        "no known default model for provider '{provider}' — run `octos init` interactively and enter a model name"
+    )
+}
+
+/// Load models from model_catalog.json, grouped by provider — from the
+/// usual disk locations first (repo/dev flows), else the embedded
+/// compile-time copy (installed binaries ship no catalog file).
+fn load_catalog_models() -> BTreeMap<String, Vec<String>> {
     let candidates = [
-        // Next to the binary
         std::env::current_exe()
             .ok()
             .and_then(|p| p.parent().map(|d| d.join("model_catalog.json"))),
-        // Workspace root (for development)
-        std::env::current_exe().ok().and_then(|p| {
-            p.parent()?
-                .parent()?
-                .parent()
-                .map(|d| d.join("model_catalog.json"))
-        }),
-        // Current directory
+        dirs::home_dir().map(|d| d.join(".octos").join("model_catalog.json")),
         Some(PathBuf::from("model_catalog.json")),
     ];
 
     for candidate in candidates.into_iter().flatten() {
         if let Ok(content) = std::fs::read_to_string(&candidate) {
-            if let Ok(catalog) = serde_json::from_str::<serde_json::Value>(&content) {
-                if let Some(models) = catalog.get("models").and_then(|m| m.as_array()) {
-                    for model in models {
-                        if let Some(provider_model) = model.get("provider").and_then(|p| p.as_str())
-                        {
-                            let parts: Vec<&str> = provider_model.splitn(2, '/').collect();
-                            if parts.len() == 2 {
-                                result
-                                    .entry(parts[0].to_string())
-                                    .or_insert_with(Vec::new)
-                                    .push(parts[1].to_string());
-                            }
-                        }
-                    }
-                    break;
-                }
+            let parsed = parse_catalog_content(&content);
+            if !parsed.is_empty() {
+                return parsed;
             }
         }
     }
 
-    result
+    embedded_catalog_models()
 }
 
 /// Auto-detect provider from available environment variables.
@@ -632,7 +831,14 @@ impl Executable for InitCommand {
         // selection flow entirely.
         if let Some(custom) = custom_flag_selection {
             let api_key_env = custom.api_key_env.clone();
-            return write_init_files(config_dir, config_path, custom.to_json(), api_key_env);
+            // Flag-driven: documented to run without prompts.
+            return write_init_files(
+                config_dir,
+                config_path,
+                custom.to_json(),
+                api_key_env,
+                false,
+            );
         }
 
         // Load model catalog for hints
@@ -642,14 +848,7 @@ impl Executable for InitCommand {
             // Auto-detect from env vars, or prompt if none found
             let idx = detect_from_env().unwrap_or(0); // fallback to first (openai)
             let info = &PROVIDERS[idx];
-            let default_model = catalog
-                .get(info.name)
-                .and_then(|m| m.first().cloned())
-                .unwrap_or_else(|| match info.name {
-                    "openai" => "gpt-4.1-mini".to_string(),
-                    "anthropic" => "claude-sonnet-4-20250514".to_string(),
-                    _ => "auto".to_string(),
-                });
+            let default_model = default_model_for(info.name, &catalog)?;
             (
                 idx,
                 default_model,
@@ -705,6 +904,7 @@ impl Executable for InitCommand {
                             config_path,
                             custom.to_json(),
                             api_key_env,
+                            true,
                         );
                     }
                     _ => {
@@ -752,35 +952,43 @@ impl Executable for InitCommand {
                 selection
             };
 
-            // Model selection — show from catalog if available
-            let catalog_models = catalog.get(info.name);
-            let default_model = catalog_models
-                .and_then(|m| m.first().cloned())
-                .unwrap_or_else(|| "auto".to_string());
+            // Model selection — show from catalog if available (disk or the
+            // embedded compile-time copy). Without catalog entries there is
+            // NO default: "auto" is not a real model on any provider API
+            // (#1541 item 3), so manual entry requires an explicit name and
+            // is FINAL — no second confirm prompt after it (codex: a
+            // fall-through re-prompt consumed the next piped stdin answer,
+            // writing e.g. the env-var reply as the model).
+            let model = match catalog.get(info.name).filter(|m| !m.is_empty()) {
+                Some(models) => {
+                    println!();
+                    println!("Available models for {} (from catalog):", info.display);
+                    for (i, m) in models.iter().enumerate() {
+                        let rec = if i == 0 { " (recommended)" } else { "" };
+                        println!("  - {}{}", m, rec);
+                    }
+                    let default_model = models[0].clone();
+                    println!();
+                    print!("Model [{}]: ", default_model);
+                    io::stdout().flush()?;
 
-            println!();
-            if let Some(models) = catalog_models {
-                println!("Available models for {} (from catalog):", info.display);
-                for (i, m) in models.iter().enumerate() {
-                    let rec = if i == 0 { " (recommended)" } else { "" };
-                    println!("  - {}{}", m, rec);
+                    let mut input = String::new();
+                    io::stdin().read_line(&mut input)?;
+                    if input.trim().is_empty() {
+                        default_model
+                    } else {
+                        input.trim().to_string()
+                    }
                 }
-            } else {
-                println!(
-                    "No catalog models found for {}. Enter model name manually:",
-                    info.display
-                );
-            }
-            println!();
-            print!("Model [{}]: ", default_model);
-            io::stdout().flush()?;
-
-            let mut input = String::new();
-            io::stdin().read_line(&mut input)?;
-            let model = if input.trim().is_empty() {
-                default_model
-            } else {
-                input.trim().to_string()
+                None => {
+                    println!();
+                    println!(
+                        "No catalog models found for {}. Enter model name manually:",
+                        info.display
+                    );
+                    let mut stdin = io::stdin().lock();
+                    read_required_model(&mut stdin, info.display)?
+                }
             };
 
             // API key env var
@@ -806,7 +1014,9 @@ impl Executable for InitCommand {
 
         let config = build_config(info, &model, &api_key_env, api_selection);
 
-        write_init_files(config_dir, config_path, config, api_key_env)
+        // `--defaults` is documented to skip interactive prompts — the
+        // credential-capture offer must not block on a read there.
+        write_init_files(config_dir, config_path, config, api_key_env, !self.defaults)
     }
 }
 
@@ -856,6 +1066,144 @@ mod tests {
             .iter()
             .find(|provider| provider.name == name)
             .unwrap_or_else(|| panic!("missing provider: {name}"))
+    }
+
+    // #1541: `octos init` offers to capture the API key right after the
+    // provider choice, storing it through the SAME global auth store that
+    // `octos auth login` writes and `Config::get_api_key` reads first —
+    // instead of stopping at "Warning: X is not set, export it yourself".
+
+    #[test]
+    fn should_save_pasted_key_to_auth_store_when_input_nonempty() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut store = crate::auth::AuthStore::at(tmp.path()).unwrap();
+        let mut input = std::io::Cursor::new(b"sk-test-abc123\n".to_vec());
+
+        let outcome = capture_api_key_from_reader("deepseek", &mut store, &mut input).unwrap();
+
+        assert_eq!(outcome, KeyCaptureOutcome::Saved);
+        let cred = store.get("deepseek").expect("credential saved");
+        assert_eq!(cred.access_token, "sk-test-abc123");
+        assert_eq!(cred.auth_method, "paste_token");
+        // Durable: a fresh store handle at the same auth_home sees it (the
+        // whole point — chat/serve resolve the GLOBAL store, not process env).
+        let reopened = crate::auth::AuthStore::at(tmp.path()).unwrap();
+        assert_eq!(
+            reopened.get("deepseek").map(|c| c.access_token.as_str()),
+            Some("sk-test-abc123")
+        );
+    }
+
+    #[test]
+    fn should_skip_without_writing_when_input_empty() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut store = crate::auth::AuthStore::at(tmp.path()).unwrap();
+        let mut input = std::io::Cursor::new(b"\n".to_vec());
+
+        let outcome = capture_api_key_from_reader("deepseek", &mut store, &mut input).unwrap();
+
+        assert_eq!(outcome, KeyCaptureOutcome::Skipped);
+        assert!(store.get("deepseek").is_none());
+        assert!(
+            !tmp.path().join("auth.json").exists(),
+            "an empty paste must not create/touch auth.json"
+        );
+    }
+
+    // #1541 item 3: installed binaries ship no model_catalog.json on disk,
+    // so every provider fell into manual entry whose default — "auto" — is
+    // rejected by real APIs (DeepSeek 400s on it). The catalog is now
+    // embedded as a compile-time fallback, manual entry requires an explicit
+    // model name, and --defaults errors instead of silently writing "auto".
+
+    #[test]
+    fn should_resolve_models_from_embedded_catalog_when_no_disk_file() {
+        let models = embedded_catalog_models();
+        let deepseek = models
+            .get("deepseek")
+            .expect("deepseek in embedded catalog");
+        assert!(
+            deepseek.iter().any(|m| m.starts_with("deepseek-")),
+            "embedded catalog offers a real deepseek model, got {deepseek:?}"
+        );
+        assert!(models.contains_key("openai"), "openai present too");
+    }
+
+    #[test]
+    fn should_require_nonempty_model_when_no_catalog_default() {
+        // skips blank lines until a real name is typed…
+        let mut input = std::io::Cursor::new(b"\n\n  deepseek-v4-flash \n".to_vec());
+        let model = read_required_model(&mut input, "DeepSeek").unwrap();
+        assert_eq!(model, "deepseek-v4-flash");
+        // …and EOF without a name is an error, never a silent "auto".
+        let mut empty = std::io::Cursor::new(b"\n\n".to_vec());
+        let err = read_required_model(&mut empty, "DeepSeek").unwrap_err();
+        assert!(
+            err.to_string().contains("model"),
+            "err names the model: {err}"
+        );
+    }
+
+    #[test]
+    fn should_error_defaults_when_provider_has_no_known_model() {
+        // --defaults must never write "auto": known hardcoded + catalog
+        // providers resolve; anything else errors with guidance.
+        let catalog = embedded_catalog_models();
+        assert!(default_model_for("anthropic", &catalog).is_ok());
+        assert!(default_model_for("deepseek", &catalog).is_ok());
+        let err = default_model_for("no-such-provider", &BTreeMap::new()).unwrap_err();
+        assert!(err.to_string().contains("model"), "guidance in {err}");
+    }
+
+    #[test]
+    fn should_offer_capture_when_stored_credential_is_expired() {
+        // codex fold: an expired OAuth credential must NOT suppress the
+        // offer — Config::get_api_key rejects expired credentials, so
+        // treating one as "configured" reports a working setup that
+        // fails at runtime.
+        let expired = crate::auth::AuthCredential {
+            access_token: "stale".into(),
+            refresh_token: None,
+            expires_at: Some(chrono::DateTime::from_timestamp(1, 0).unwrap()), // long expired
+            provider: "openai".into(),
+            auth_method: "oauth".into(),
+        };
+        assert_eq!(
+            key_capture_preflight(false, Some(&expired)),
+            KeyCapturePreflight::Offer
+        );
+
+        let valid = crate::auth::AuthCredential {
+            access_token: "fresh".into(),
+            refresh_token: None,
+            expires_at: None, // paste tokens never expire
+            provider: "deepseek".into(),
+            auth_method: "paste_token".into(),
+        };
+        assert_eq!(
+            key_capture_preflight(false, Some(&valid)),
+            KeyCapturePreflight::ValidStoredCredential
+        );
+        assert_eq!(
+            key_capture_preflight(true, None),
+            KeyCapturePreflight::EnvSet
+        );
+        assert_eq!(
+            key_capture_preflight(false, None),
+            KeyCapturePreflight::Offer
+        );
+    }
+
+    #[test]
+    fn should_trim_whitespace_when_key_pasted_with_newline_or_spaces() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut store = crate::auth::AuthStore::at(tmp.path()).unwrap();
+        let mut input = std::io::Cursor::new(b"  sk-padded-key  \n".to_vec());
+
+        let outcome = capture_api_key_from_reader("kimi", &mut store, &mut input).unwrap();
+
+        assert_eq!(outcome, KeyCaptureOutcome::Saved);
+        assert_eq!(store.get("kimi").unwrap().access_token, "sk-padded-key");
     }
 
     #[test]
