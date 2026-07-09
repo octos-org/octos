@@ -502,14 +502,14 @@ Shell 命令在沙箱中运行以实现隔离。支持三种后端：
 
 **目标**是附加到会话上的持久化目标。一旦设定，agent 会持续朝其推进——只要目标策略允许就重新触发轮次——而不是在单次回答后停止。目标跨轮次存续，需显式清除。
 
-- 协议：`session/goal/set`、`session/goal/get`、`session/goal/clear`（通知 `session/goal/updated`、`session/goal/cleared`）。特性标志：`coding.goal_runtime.v1`。
+- 协议：`session/goal/set`、`session/goal/get`、`session/goal/clear`（通知 `session/goal/updated`、`session/goal/cleared`）。特性标志：必须**同时**协商 `coding.autonomy.v1` **和** `coding.goal_runtime.v1`（只声明组标志会得到 `method_not_supported`）。
 - 适用于「一直做到 X 完成」类工作；清除目标即停止。
 
 ### 循环（Loops）
 
 **循环**是周期性的 agent 运行。循环分为**固定间隔**（每 N 秒触发）或**自定步调**——模型通过发出 `<<loop-next-in: …>>` 提示自行决定下次节奏（未指定时默认 15 分钟）。循环持续触发，直到被暂停、删除或达到触发上限（10,000 次）。
 
-- 协议：`loop/create`、`loop/list`、`loop/pause`、`loop/resume`、`loop/delete`（通知 `loop/fired`、`loop/completed`、`loop/updated`）。特性标志：`coding.loop_runtime.v1`。
+- 协议：`loop/create`、`loop/list`、`loop/pause`、`loop/resume`、`loop/delete`（通知 `loop/fired`、`loop/completed`、`loop/updated`）。特性标志：必须**同时**协商 `coding.autonomy.v1` **和** `coding.loop_runtime.v1`。
 - 适用于轮询、监控和自定步调的后台 agent。
 
 ### 回退（Rewind）
@@ -527,9 +527,9 @@ Shell 命令在沙箱中运行以实现隔离。支持三种后端：
 
 | 标志 | 解锁 |
 |------|------|
-| `coding.goal_runtime.v1` | 目标（`session/goal/*`） |
-| `coding.loop_runtime.v1` | 循环（`loop/*`） |
-| `coding.autonomy.v1` | 自主循环/目标编排 |
+| `coding.autonomy.v1` | 自主运行根标志——须*与*下方目标/循环标志一起协商（`turn/*` 控制还需 `coding.agent_control.v1`） |
+| `coding.goal_runtime.v1` | 目标（`session/goal/*`）——还需 `coding.autonomy.v1` |
+| `coding.loop_runtime.v1` | 循环（`loop/*`）——还需 `coding.autonomy.v1` |
 | `harness.task_control.v1` | 任务 列出/取消/重启 |
 | `harness.task_artifacts.v1` | 任务产物 |
 | `state.session_hydrate.v1` | `session/hydrate` 恢复 |

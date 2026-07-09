@@ -1166,8 +1166,7 @@ JSON 持久化位于 `.octos/cron.json`。
 
 | 路由 | 方法 | 说明 |
 |---|---|---|
-| `/api/chat` | POST | 发送消息 → 获取响应（同步；流式内容走 WS） |
-| `/api/ui-protocol/ws` | WS | JSON-RPC 2.0 UI Protocol v1——唯一的聊天传输通道与控制平面（见下） |
+| `/api/ui-protocol/ws` | WS | JSON-RPC 2.0 UI Protocol v1——**唯一**的聊天传输通道与控制平面（旧的 `POST /api/chat` 处理器已下线；见下） |
 | `/health` | GET | 存活探针（原 `/api/status`；结构化状态已迁移到 WS `system/status.get`） |
 | `/metrics` | GET | Prometheus 文本指标（无需认证） |
 | `/*`（回退） | GET | 内嵌 Web UI（通过 rust-embed 提供静态文件） |

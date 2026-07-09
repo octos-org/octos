@@ -1167,8 +1167,7 @@ Polls every 5 seconds. SHA-256 hash comparison of file contents.
 
 | Route | Method | Description |
 |---|---|---|
-| `/api/chat` | POST | Send message → response (sync; streaming runs over WS) |
-| `/api/ui-protocol/ws` | WS | JSON-RPC 2.0 UI Protocol v1 — the sole chat transport and control plane (see below) |
+| `/api/ui-protocol/ws` | WS | JSON-RPC 2.0 UI Protocol v1 — the **sole** chat transport and control plane (the legacy `POST /api/chat` handler has been retired; see below) |
 | `/health` | GET | Liveness probe (was `/api/status`; data plane moved to WS `system/status.get` in M12 Phase D-5) |
 | `/metrics` | GET | Prometheus text exposition format (unauthenticated) |
 | `/*` (fallback) | GET | Embedded web UI (static files via rust-embed) |

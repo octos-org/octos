@@ -502,14 +502,14 @@ Beyond one-shot chat, the graphical clients (octos-web, octos-tui) drive longer-
 
 A **goal** is a persistent objective attached to a session. Once set, the agent keeps working toward it — re-firing turns as long as the goal's policy allows — instead of stopping after a single answer. Goals survive across turns and are cleared explicitly.
 
-- Protocol: `session/goal/set`, `session/goal/get`, `session/goal/clear` (notifications `session/goal/updated`, `session/goal/cleared`). Feature flag: `coding.goal_runtime.v1`.
+- Protocol: `session/goal/set`, `session/goal/get`, `session/goal/clear` (notifications `session/goal/updated`, `session/goal/cleared`). Feature flags: **both** `coding.autonomy.v1` **and** `coding.goal_runtime.v1` must be negotiated (advertising only the group flag yields `method_not_supported`).
 - Use it for "keep going until X is done" work; clear the goal to stop.
 
 ### Loops
 
 A **loop** is a recurring agent run. Loops are either **fixed-interval** (fire every N seconds) or **self-paced** — the model decides its own next cadence by emitting a `<<loop-next-in: …>>` hint (default 15 minutes when it doesn't). A loop keeps firing until paused, deleted, or the fire cap (10,000) is reached.
 
-- Protocol: `loop/create`, `loop/list`, `loop/pause`, `loop/resume`, `loop/delete` (notifications `loop/fired`, `loop/completed`, `loop/updated`). Feature flag: `coding.loop_runtime.v1`.
+- Protocol: `loop/create`, `loop/list`, `loop/pause`, `loop/resume`, `loop/delete` (notifications `loop/fired`, `loop/completed`, `loop/updated`). Feature flags: **both** `coding.autonomy.v1` **and** `coding.loop_runtime.v1`.
 - Use it for polling, monitoring, and self-paced background agents.
 
 ### Rewind
@@ -527,9 +527,9 @@ A client advertises which protocol features it supports when it connects (the `u
 
 | Flag | Unlocks |
 |------|---------|
-| `coding.goal_runtime.v1` | Goals (`session/goal/*`) |
-| `coding.loop_runtime.v1` | Loops (`loop/*`) |
-| `coding.autonomy.v1` | Autonomy loop/goal orchestration |
+| `coding.autonomy.v1` | Autonomy root — required *together with* the goal/loop flags below (and, for `turn/*` control, `coding.agent_control.v1`) |
+| `coding.goal_runtime.v1` | Goals (`session/goal/*`) — needs `coding.autonomy.v1` too |
+| `coding.loop_runtime.v1` | Loops (`loop/*`) — needs `coding.autonomy.v1` too |
 | `harness.task_control.v1` | Task list/cancel/restart |
 | `harness.task_artifacts.v1` | Task artifacts |
 | `state.session_hydrate.v1` | `session/hydrate` resume |
