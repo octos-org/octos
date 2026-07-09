@@ -1705,9 +1705,27 @@ impl Config {
     /// process env — instead of a bare `std::env::var` read.
     pub fn get_api_key_with_env(&self, provider: &str, env_var: Option<&str>) -> Result<String> {
         match env_var {
-            Some(var) => self.resolve_api_key(provider, var.to_string()),
+            // An EXPLICIT var means "use this variable": the provider-
+            // scoped auth store must not win, or a stored `octos auth
+            // login -p openai` token would be sent to a custom
+            // OpenAI-compatible endpoint that the override targets.
+            Some(var) => self.resolve_env_var_only(var),
             None => self.get_api_key(provider),
         }
+    }
+
+    /// Resolve a key from an explicit env-var name WITHOUT provider-scoped
+    /// auth-store lookup: secret registration → `env_vars` map (keychain-
+    /// resolved) → process env.
+    fn resolve_env_var_only(&self, env_var: &str) -> Result<String> {
+        octos_agent::register_secret_env_names([env_var]);
+        if let Some(value) = self.env_vars.get(env_var).and_then(|value| {
+            crate::auth::keychain::resolve_value(env_var, value).filter(|value| !value.is_empty())
+        }) {
+            return Ok(value);
+        }
+        std::env::var(env_var)
+            .wrap_err_with(|| format!("{env_var} not set (explicit embedding api_key_env)"))
     }
 
     pub fn get_api_key(&self, provider: &str) -> Result<String> {
@@ -2908,6 +2926,31 @@ mod tests {
         assert_eq!(
             MemoryConfig::effective_max_inject_tokens(Some(&on)),
             octos_memory::DEFAULT_MAX_INJECT_TOKENS
+        );
+    }
+
+    #[test]
+    fn explicit_env_var_skips_provider_auth_store() {
+        // Even with provider-default resolution available, the explicit
+        // override must come from ITS variable only — never the
+        // provider-scoped auth store (codex R2: an OpenAI OAuth token
+        // must not be sent to a custom-endpoint embedder).
+        let mut config = Config::default();
+        config
+            .env_vars
+            .insert("DASH_EMBED_KEY".to_string(), "dash-key".to_string());
+        // Provider-default path would resolve something else entirely;
+        // the explicit var wins regardless.
+        let key = config
+            .get_api_key_with_env("openai", Some("DASH_EMBED_KEY"))
+            .expect("explicit var resolves");
+        assert_eq!(key, "dash-key");
+        // And a MISSING explicit var is an error — no silent fallback to
+        // the provider chain.
+        assert!(
+            config
+                .get_api_key_with_env("openai", Some("NOPE_MISSING_VAR"))
+                .is_err()
         );
     }
 
