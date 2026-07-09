@@ -11,6 +11,7 @@ mod loop_runner;
 pub mod loop_state;
 pub mod memory;
 mod message_repair;
+pub mod prompt_segments;
 pub mod realtime;
 pub mod rich_output;
 mod streaming;
@@ -26,6 +27,8 @@ use octos_core::{AgentId, Message, SessionScope, TokenUsage};
 use octos_llm::{EmbeddingProvider, LlmProvider, ProviderMetadata};
 use octos_memory::EpisodeStore;
 
+pub use prompt_segments::PromptSegmentProvider;
+
 use crate::file_state_cache::FileStateCache;
 use crate::hooks::{HookContext, HookExecutor};
 use crate::progress::{ProgressReporter, SilentReporter};
@@ -34,6 +37,7 @@ use crate::session::{SessionLimits, SessionUsage};
 use crate::tools::ToolRegistry;
 use verifier::AgentVerifierConfig;
 
+pub use message_repair::normalize_tool_call_id;
 pub use realtime::RealtimeController;
 
 tokio::task_local! {
@@ -280,8 +284,12 @@ pub struct Agent {
     pub(super) memory: Arc<EpisodeStore>,
     /// Embedding provider for hybrid memory search.
     pub(super) embedder: Option<Arc<dyn EmbeddingProvider>>,
-    /// System prompt for this agent (RwLock for hot-reload support).
-    pub(super) system_prompt: RwLock<String>,
+    /// System prompt for this agent, as ordered segments (RwLock for
+    /// hot-reload support). See [`prompt_segments::PromptSegments`].
+    pub(super) system_prompt: RwLock<prompt_segments::PromptSegments>,
+    /// Providers that refresh named prompt segments between turns
+    /// (e.g. the memory block). Run by [`Agent::refresh_prompt_segments`].
+    pub(super) segment_providers: RwLock<Vec<Arc<dyn PromptSegmentProvider>>>,
     /// Agent configuration.
     pub(super) config: AgentConfig,
     /// Progress reporter (RwLock for interior-mutable swap without &mut self).
@@ -457,7 +465,8 @@ impl Agent {
             tools,
             memory,
             embedder: None,
-            system_prompt: RwLock::new(system_prompt),
+            system_prompt: RwLock::new(prompt_segments::PromptSegments::from_base(system_prompt)),
+            segment_providers: RwLock::new(Vec::new()),
             config: AgentConfig::default(),
             reporter: RwLock::new(Arc::new(SilentReporter)),
             hooks: None,
@@ -529,7 +538,8 @@ impl Agent {
             tools,
             memory,
             embedder: None,
-            system_prompt: RwLock::new(system_prompt),
+            system_prompt: RwLock::new(prompt_segments::PromptSegments::from_base(system_prompt)),
+            segment_providers: RwLock::new(Vec::new()),
             config: AgentConfig::default(),
             reporter: RwLock::new(Arc::new(SilentReporter)),
             hooks: None,
@@ -674,10 +684,10 @@ impl Agent {
         // A poisoned lock means a prior holder panicked, but the String
         // data itself is still valid and overwritten here.
         if let Some(ref wp) = config.worker_prompt {
-            *self
-                .system_prompt
+            self.system_prompt
                 .write()
-                .unwrap_or_else(|e| e.into_inner()) = wp.clone();
+                .unwrap_or_else(|e| e.into_inner())
+                .replace_all(wp.clone());
         }
         self.config = config;
         self
@@ -1052,30 +1062,97 @@ impl Agent {
     }
 
     /// Override the system prompt (e.g. for gateway mode).
+    ///
+    /// Full replace: drops any named segments (re-set them afterwards if
+    /// still wanted).
     pub fn with_system_prompt(self, prompt: String) -> Self {
-        *self.system_prompt.write().unwrap_or_else(|e| {
-            tracing::warn!("system prompt lock was poisoned, recovering");
-            e.into_inner()
-        }) = prompt;
+        self.system_prompt
+            .write()
+            .unwrap_or_else(|e| {
+                tracing::warn!("system prompt lock was poisoned, recovering");
+                e.into_inner()
+            })
+            .replace_all(prompt);
         self
     }
 
     /// Append additional content to the current system prompt (e.g. bootstrap files).
     pub fn append_system_prompt(&self, extra: &str) {
+        self.system_prompt
+            .write()
+            .unwrap_or_else(|e| {
+                tracing::warn!("system prompt lock was poisoned, recovering");
+                e.into_inner()
+            })
+            .append(extra);
+    }
+
+    /// Insert (first call) or replace in place (later calls) a named prompt
+    /// segment such as the memory block. The segment keeps its insertion
+    /// position across replacements, so bootstrap-before / skills-after
+    /// ordering is preserved when the content refreshes.
+    pub fn set_prompt_segment(&self, name: &str, content: String) {
+        self.system_prompt
+            .write()
+            .unwrap_or_else(|e| {
+                tracing::warn!("system prompt lock was poisoned, recovering");
+                e.into_inner()
+            })
+            .set_named(name, content);
+    }
+
+    /// Register a provider that refreshes a named segment between turns.
+    pub fn add_prompt_segment_provider(&self, provider: Arc<dyn PromptSegmentProvider>) {
+        self.segment_providers
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(provider);
+    }
+
+    /// Run all registered segment providers, applying any changed content.
+    ///
+    /// Called by the conversation loop at turn start; a no-op when no
+    /// providers are registered, and providers keep the unchanged path
+    /// cheap (typically one stat).
+    pub async fn refresh_prompt_segments(&self) {
+        let providers: Vec<Arc<dyn PromptSegmentProvider>> = self
+            .segment_providers
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        if providers.is_empty() {
+            return;
+        }
+        let mut updates = Vec::new();
+        for provider in providers {
+            if let Some(content) = provider.refresh().await {
+                updates.push((provider.segment_name().to_string(), content));
+            }
+        }
+        if updates.is_empty() {
+            return;
+        }
         let mut guard = self.system_prompt.write().unwrap_or_else(|e| {
             tracing::warn!("system prompt lock was poisoned, recovering");
             e.into_inner()
         });
-        guard.push_str("\n\n");
-        guard.push_str(extra);
+        for (name, content) in updates {
+            guard.set_named(&name, content);
+        }
     }
 
     /// Update the system prompt at runtime (hot-reload).
+    ///
+    /// Full replace: drops any named segments (re-set them afterwards if
+    /// still wanted).
     pub fn set_system_prompt(&self, prompt: String) {
-        *self.system_prompt.write().unwrap_or_else(|e| {
-            tracing::warn!("system prompt lock was poisoned, recovering");
-            e.into_inner()
-        }) = prompt;
+        self.system_prompt
+            .write()
+            .unwrap_or_else(|e| {
+                tracing::warn!("system prompt lock was poisoned, recovering");
+                e.into_inner()
+            })
+            .replace_all(prompt);
     }
 
     /// The LLM model ID in use.
@@ -1177,7 +1254,7 @@ impl Agent {
         self.system_prompt
             .read()
             .unwrap_or_else(|e| e.into_inner())
-            .clone()
+            .render()
     }
 
     /// Whether the loop-detector warning has fired since the last reset.

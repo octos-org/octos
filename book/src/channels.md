@@ -99,10 +99,13 @@ export DINGTALK_BOT_SECRET="SEC..."
 }
 ```
 
-For inbound events, configure the DingTalk outgoing robot callback URL as:
+For inbound events, configure the DingTalk outgoing robot callback URL. Behind `octos serve`, use the proxy route; in standalone `octos gateway` mode, point at the channel's own webhook server on `webhook_port`:
 
 ```text
+# behind octos serve (proxy)
 https://YOUR_OCTOS_HOST/webhook/dingtalk/<profile_id>
+# standalone octos gateway
+http://YOUR_OCTOS_HOST:<webhook_port>/dingtalk/webhook
 ```
 
 Build with the `dingtalk` feature flag:
@@ -370,14 +373,115 @@ The `wecom-bot` channel uses an outbound WebSocket connection -- no public URL o
 
 ---
 
+## Matrix
+
+Matrix is a first-class channel and the transport behind the human-approval and management-bot features referenced throughout this chapter. Feature-gated behind `matrix`. Two modes are supported via the `mode` setting:
+
+- **`user`** — logs in as an ordinary Matrix account via the Client-Server API and `/sync`. Works with any account on any homeserver; no server-side registration needed.
+- **`appservice`** — registers as an application service against a homeserver you control (Conduit/conduwuit/Synapse), enabling per-user bot puppets.
+
+When `mode` is omitted the gateway falls back to **`appservice`** (which then requires `as_token`/`hs_token`), so set `"mode": "user"` explicitly for ordinary account login.
+
+### User mode
+
+```json
+{
+  "type": "matrix",
+  "settings": {
+    "mode": "user",
+    "homeserver": "https://matrix.org",
+    "user_id": "@mybot:matrix.org",
+    "access_token": "syt_...",
+    "device_name": "octos",
+    "rooms": ["!roomid:matrix.org"],
+    "auto_join": "allowlist",
+    "auto_join_allowlist": ["!roomid:matrix.org", "#alias:matrix.org"]
+  }
+}
+```
+
+Log in with an `access_token` (preferred), or with `user_id` + `password` (both are required for password login). These credentials are read as literal `settings` values — they are **not** expanded from environment variables. `auto_join` (`off` / `allowlist` / `always`) controls invite auto-accept; under `allowlist`, `auto_join_allowlist` lists the **room IDs / aliases** (or `*`) whose invites are accepted — matched against rooms, not inviter user IDs — and falls back to `rooms` when empty.
+
+### Appservice mode
+
+```json
+{
+  "type": "matrix",
+  "settings": {
+    "mode": "appservice",
+    "homeserver": "http://localhost:6167",
+    "server_name": "localhost",
+    "as_token": "...",
+    "hs_token": "...",
+    "sender_localpart": "bot",
+    "user_prefix": "bot_"
+  }
+}
+```
+
+Build with the `matrix` feature flag. In **appservice / management-bot** rooms, Matrix renders native Approve/Deny cards for [Human Approval Rules](./configuration.md) (via Robrix) and handles the `/schedule`, `/schedules`, `/unschedule`, and `/allbots` chat commands (see [Cron Jobs](#cron-jobs) below). A plain `mode: "user"` account channel does not interpret those management commands; it forwards message text to the agent, but **by default only when the bot is mentioned** (`require_mention` defaults to `true` — set `"require_mention": false` in its settings to forward every message).
+
+---
+
+## LINE
+
+Inbound webhook + outbound Messaging API. Feature-gated behind `line`.
+
+```bash
+export LINE_CHANNEL_SECRET="..."
+export LINE_CHANNEL_ACCESS_TOKEN="..."
+```
+
+```json
+{
+  "type": "line",
+  "settings": {
+    "channel_secret_env": "LINE_CHANNEL_SECRET",
+    "channel_access_token_env": "LINE_CHANNEL_ACCESS_TOKEN",
+    "webhook_port": 9323,
+    "bot_user_id": "U...",
+    "require_mention": false
+  }
+}
+```
+
+In standalone `octos gateway` mode, LINE pushes events to the channel's own webhook server at `http://YOUR_OCTOS_HOST:<webhook_port>/line/webhook`; behind `octos serve`, use the proxy route `https://YOUR_OCTOS_HOST/webhook/line/<profile_id>` instead. Inbound signatures are verified over the request **body** with the channel secret (HMAC-SHA256), so either URL works. Build with the `line` feature flag.
+
+---
+
+## Twilio (SMS)
+
+Two-way SMS via Twilio's Programmable Messaging webhook. Feature-gated behind `twilio`.
+
+```bash
+export TWILIO_ACCOUNT_SID="AC..."
+export TWILIO_AUTH_TOKEN="..."
+```
+
+```json
+{
+  "type": "twilio",
+  "settings": {
+    "account_sid_env": "TWILIO_ACCOUNT_SID",
+    "auth_token_env": "TWILIO_AUTH_TOKEN",
+    "from_number": "+15551234567",
+    "webhook_port": 9324
+  }
+}
+```
+
+Point your Twilio number's inbound webhook at the channel's own webhook server: `http://YOUR_OCTOS_HOST:<webhook_port>/twilio/webhook`. Twilio's `X-Twilio-Signature` is verified against the full reconstructed URL, which the channel builds from the request's `Host` and `X-Forwarded-Proto` headers (scheme defaults to `http`). Behind an HTTPS reverse proxy, the proxy must preserve the `/twilio/webhook` path and forward both the public host and `X-Forwarded-Proto: https` — otherwise the reconstructed URL is `http://…` and signature verification fails (403). Build with the `twilio` feature flag.
+
+---
+
 ## Session Control Commands
 
 In any gateway channel, the following commands manage conversation sessions:
 
 | Command | Description |
 |---------|-------------|
-| `/new` | Create a new session (forks the last 10 messages from the current conversation) |
-| `/new <name>` | Create a named session |
+| `/new` | Clear the current session (bare `/new` wipes history, like `/clear`) |
+| `/new <name>` | Switch to (or create) a named session |
 | `/s <name>` | Switch to a named session |
 | `/s` | Switch to the default session |
 | `/sessions` | List all sessions for this chat |

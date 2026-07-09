@@ -216,8 +216,8 @@ impl RetryProvider {
 
     /// Extract a longer delay for rate-limit (429 TPM) errors.
     /// OpenAI errors include "Please try again in 29.159s" — parse that.
-    /// Falls back to 30s if unparseable.
-    fn rate_limit_delay(error: &eyre::Report) -> Option<Duration> {
+    /// Falls back to 30s if unparseable. Always clamped to `max_delay`.
+    fn rate_limit_delay(&self, error: &eyre::Report) -> Option<Duration> {
         let msg = error.to_string();
         // Only apply to rate-limit / TPM errors
         let msg_lower = msg.to_lowercase();
@@ -229,20 +229,36 @@ impl RetryProvider {
         {
             return None;
         }
-        // Try to parse "try again in Xs" or "try again in X.XXXs"
+        // Try to parse "try again in Xs" / "X.XXXs" / "Xms". The numeric run
+        // stops at the first unit letter; the UNIT that follows decides the
+        // scale. Consuming only the digits and assuming seconds turned a
+        // sub-second "try again in 906ms" hint into a ~15-minute sleep.
         if let Some(idx) = msg.find("try again in ") {
             let after = &msg[idx + "try again in ".len()..];
             let num_str: String = after
                 .chars()
                 .take_while(|c| c.is_ascii_digit() || *c == '.')
                 .collect();
-            if let Ok(secs) = num_str.parse::<f64>() {
-                // Add 1s buffer
-                return Some(Duration::from_secs_f64(secs + 1.0));
+            if let Ok(value) = num_str.parse::<f64>() {
+                // `num_str` is ASCII digits/'.', so its char len == byte len.
+                let unit = after[num_str.len()..].trim_start();
+                let base = if unit.starts_with("ms") {
+                    Duration::from_secs_f64(value / 1000.0)
+                } else {
+                    // "s", "sec", or a bare number → seconds (OpenAI/Anthropic
+                    // spell sub-second hints in ms, so a unit-less value is a
+                    // whole-second count).
+                    Duration::from_secs_f64(value)
+                };
+                // Add a 1s buffer, then clamp to `max_delay` so a large or
+                // malformed hint ("try again in 1800s") can't park the whole
+                // provider on a multi-minute sleep past the configured ceiling.
+                let delay = base.saturating_add(Duration::from_secs(1));
+                return Some(delay.min(self.config.max_delay));
             }
         }
-        // Fallback: wait 30s for TPM to reset
-        Some(Duration::from_secs(30))
+        // Fallback: wait 30s for TPM to reset (still clamped to max_delay).
+        Some(Duration::from_secs(30).min(self.config.max_delay))
     }
 }
 
@@ -269,7 +285,8 @@ impl LlmProvider for RetryProvider {
                         && attempt < self.config.max_retries
                         && Self::is_retryable_error(&e)
                     {
-                        let delay = Self::rate_limit_delay(&e)
+                        let delay = self
+                            .rate_limit_delay(&e)
                             .unwrap_or_else(|| self.calculate_delay(attempt));
                         warn!(
                             attempt = attempt + 1,
@@ -312,7 +329,8 @@ impl LlmProvider for RetryProvider {
                         && attempt < self.config.max_retries
                         && Self::is_retryable_error(&e)
                     {
-                        let delay = Self::rate_limit_delay(&e)
+                        let delay = self
+                            .rate_limit_delay(&e)
                             .unwrap_or_else(|| self.calculate_delay(attempt));
                         warn!(
                             attempt = attempt + 1,
@@ -527,28 +545,69 @@ mod tests {
         assert!(RetryProvider::should_failover(&err));
     }
 
+    /// A retry provider with a generous `max_delay` so the clamp does not
+    /// interfere with parse-scale assertions.
+    fn retry_provider_uncapped() -> RetryProvider {
+        RetryProvider {
+            inner: Arc::new(MockProvider),
+            config: RetryConfig {
+                max_delay: Duration::from_secs(3600),
+                ..RetryConfig::default()
+            },
+        }
+    }
+
     #[test]
     fn test_rate_limit_delay_parses_seconds() {
         let err = eyre::eyre!(
             "OpenAI API error: 429 Too Many Requests - Rate limit reached. Please try again in 29.159s"
         );
-        let delay = RetryProvider::rate_limit_delay(&err).unwrap();
+        let delay = retry_provider_uncapped().rate_limit_delay(&err).unwrap();
         // 29.159 + 1.0 buffer = ~30.159s
         assert!(delay.as_secs_f64() > 29.0 && delay.as_secs_f64() < 32.0);
+    }
+
+    #[test]
+    fn test_rate_limit_delay_parses_milliseconds() {
+        // "906ms" must be read as 0.906s, NOT 906s — the unit suffix decides
+        // the scale (the +1s buffer dominates the sub-second value).
+        let err =
+            eyre::eyre!("OpenAI API error: 429 Too Many Requests - Please try again in 906ms");
+        let delay = retry_provider_uncapped().rate_limit_delay(&err).unwrap();
+        assert!(
+            delay.as_secs_f64() > 1.0 && delay.as_secs_f64() < 2.5,
+            "906ms + 1s buffer must be ~1.9s, got {delay:?}"
+        );
+    }
+
+    #[test]
+    fn test_rate_limit_delay_clamps_to_max_delay() {
+        // A large (or malformed) hint cannot exceed the configured ceiling.
+        let provider = RetryProvider {
+            inner: Arc::new(MockProvider),
+            config: RetryConfig {
+                max_delay: Duration::from_secs(60),
+                ..RetryConfig::default()
+            },
+        };
+        let err =
+            eyre::eyre!("OpenAI API error: 429 Too Many Requests - Please try again in 1800s");
+        let delay = provider.rate_limit_delay(&err).unwrap();
+        assert_eq!(delay, Duration::from_secs(60), "must clamp to max_delay");
     }
 
     #[test]
     fn test_rate_limit_delay_fallback() {
         let err =
             eyre::eyre!("OpenAI API error: 429 Too Many Requests - tokens per min limit exceeded");
-        let delay = RetryProvider::rate_limit_delay(&err).unwrap();
+        let delay = retry_provider_uncapped().rate_limit_delay(&err).unwrap();
         assert_eq!(delay, Duration::from_secs(30));
     }
 
     #[test]
     fn test_rate_limit_delay_not_429() {
         let err = eyre::eyre!("OpenAI API error: 500 Internal Server Error");
-        assert!(RetryProvider::rate_limit_delay(&err).is_none());
+        assert!(retry_provider_uncapped().rate_limit_delay(&err).is_none());
     }
 
     #[test]

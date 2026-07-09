@@ -561,6 +561,19 @@ pub struct SessionInfo {
     /// the client should fall back to deriving a title from message content.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
+    /// Recency timestamp (RFC3339) — `SessionMeta.updated_at`, or the JSONL
+    /// file mtime as a cheap fallback. Lets the TUI sort the session list by
+    /// most-recently-touched. None when neither source is available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<String>,
+    /// Preview of the session's MOST RECENT user prompt, truncated (~100 bytes,
+    /// UTF-8 safe). Sourced by scanning the tail of the session JSONL for the
+    /// last user-role message (see
+    /// `octos_bus::SessionManager::list_top_level_sessions_with_meta`). Lets the
+    /// `/resume` picker show what each session was about. None for sessions with
+    /// no user message.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_prompt: Option<String>,
 }
 
 fn is_internal_api_session_id(id: &str) -> bool {
@@ -579,6 +592,7 @@ pub async fn list_sessions(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     identity: Option<Extension<AuthIdentity>>,
+    connection_profile_id: Option<&str>,
 ) -> Response {
     // Collect sessions from both the standalone store and gateway profiles.
     let mut all: Vec<SessionInfo> = Vec::new();
@@ -613,7 +627,38 @@ pub async fn list_sessions(
     // ids are already chat-bare. The process-wide walk below remains
     // as an admin / legacy fallback (still strips `<profile>:api:`
     // for legacy entries).
-    if let Ok(profile_data_dir) = resolve_profile_data_dir(&state, &headers, identity_ref).await {
+    //
+    // Resolve the profile data dir. The solo/stdio connection carries no
+    // HTTP routing header, so the header/identity + gateway resolver
+    // (`resolve_profile_data_dir`) returns `Err` there — pre-fix the
+    // per-profile `sessions/` dir was never scanned and the TUI
+    // `/resume` picker showed "No prior sessions" even with sessions on
+    // disk. When there is NO routing header we instead resolve from the
+    // connection's own frozen profile scope (`connection_profile_id`),
+    // mirroring how `session/hydrate` resolves its store for the same
+    // connection (`resolve_sessions_for_lookup` keys on
+    // `connection_profile_id`), so `session/list` scans the SAME
+    // directory the running session writes turns to.
+    //
+    // SECURITY / multi-tenant: `connection_profile_id` is the
+    // connection's frozen scope (authenticated identity / `session/open`),
+    // never a client-supplied per-request value — so this lists the
+    // connection's OWN sessions, not another tenant's. Whenever a
+    // `Host` / `X-Profile-Id` routing header IS present (hosted
+    // multi-tenant WS / gateway), or the connection is admin/unscoped, we
+    // keep the existing header + identity authorized resolution unchanged
+    // — Layer-2 authorization still applies, and a parent viewing a
+    // sub-account subdomain still lists the routed profile's sessions.
+    let routed_profile_id = routed_profile_id_from_headers(&state, &headers);
+    let profile_data_dir = match connection_profile_id {
+        Some(pid) if routed_profile_id.is_none() => {
+            resolve_profile_data_dir_by_id(&state, pid).ok()
+        }
+        _ => resolve_profile_data_dir(&state, &headers, identity_ref)
+            .await
+            .ok(),
+    };
+    if let Some(profile_data_dir) = profile_data_dir {
         let profile_sessions = list_profile_sessions(&profile_data_dir);
         let existing: std::collections::HashSet<String> =
             all.iter().map(|s| s.id.clone()).collect();
@@ -636,9 +681,9 @@ pub async fn list_sessions(
         let existing: std::collections::HashSet<String> =
             all.iter().map(|s| s.id.clone()).collect();
         all.extend(
-            sess.list_top_level_sessions_with_title()
+            sess.list_top_level_sessions_with_meta()
                 .into_iter()
-                .filter_map(|(id, count, title)| {
+                .filter_map(|(id, count, title, updated_at, last_prompt)| {
                     let chat_id = id.strip_prefix(&prefix)?;
                     if is_internal_api_session_id(chat_id) {
                         return None;
@@ -650,6 +695,8 @@ pub async fn list_sessions(
                         id: chat_id.to_string(),
                         message_count: count,
                         title,
+                        updated_at: updated_at.map(|dt| dt.to_rfc3339()),
+                        last_prompt,
                     })
                 }),
         );
@@ -715,9 +762,9 @@ fn list_profile_sessions(profile_data_dir: &std::path::Path) -> Vec<SessionInfo>
     let Ok(mgr) = octos_bus::SessionManager::open(profile_data_dir) else {
         return Vec::new();
     };
-    mgr.list_top_level_sessions_with_title()
+    mgr.list_top_level_sessions_with_meta()
         .into_iter()
-        .filter_map(|(id, count, title)| {
+        .filter_map(|(id, count, title, updated_at, last_prompt)| {
             if is_internal_api_session_id(&id) {
                 return None;
             }
@@ -725,6 +772,8 @@ fn list_profile_sessions(profile_data_dir: &std::path::Path) -> Vec<SessionInfo>
                 id,
                 message_count: count,
                 title,
+                updated_at: updated_at.map(|dt| dt.to_rfc3339()),
+                last_prompt,
             })
         })
         .collect()
@@ -933,6 +982,7 @@ pub async fn session_messages(
                         role: m.role.to_string(),
                         content: m.content.clone(),
                         timestamp: m.timestamp.to_rfc3339(),
+                        media: m.media.clone(),
                         thread_id: m.thread_id.clone(),
                     })
                     .collect();
@@ -976,6 +1026,11 @@ pub struct MessageInfo {
     pub role: String,
     pub content: String,
     pub timestamp: String,
+    /// File attachments stored with this row. Kept additive and omitted when
+    /// empty so legacy clients that only read text continue to see the same
+    /// shape, while reload paths can restore user-uploaded image/video bubbles.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub media: Vec<String>,
     /// M8.10 PR #1 thread grouping key. Lets the web client render chat
     /// history as `Vec<Thread>` rather than a flat message list. Omitted
     /// from the JSON when `None` so legacy clients that don't read the
@@ -1965,6 +2020,39 @@ pub async fn serve_file(
     .await
 }
 
+/// Read a file's bytes through an `O_NOFOLLOW` open (Unix) so a symlink leaf
+/// swapped in after a path was validated cannot redirect the read. On
+/// non-Unix, re-checks `symlink_metadata` before reading (best-effort, still
+/// racy but matches the platform's capabilities). The blocking I/O runs on a
+/// blocking thread.
+async fn read_file_no_follow(path: std::path::PathBuf) -> std::io::Result<Vec<u8>> {
+    tokio::task::spawn_blocking(move || {
+        use std::io::Read;
+        let mut opts = std::fs::OpenOptions::new();
+        opts.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.custom_flags(libc::O_NOFOLLOW);
+        }
+        #[cfg(not(unix))]
+        {
+            if path.symlink_metadata().is_ok_and(|m| m.is_symlink()) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "symlink rejected",
+                ));
+            }
+        }
+        let mut file = opts.open(&path)?;
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)?;
+        Ok(bytes)
+    })
+    .await
+    .unwrap_or_else(|e| Err(std::io::Error::other(e)))
+}
+
 async fn serve_file_impl(
     data_dir: &std::path::Path,
     filename: &str,
@@ -1977,7 +2065,14 @@ async fn serve_file_impl(
         return (StatusCode::FORBIDDEN, "access denied").into_response();
     };
 
-    let data = match tokio::fs::read(&path).await {
+    // Read through an O_NOFOLLOW open rather than `tokio::fs::read(&path)`:
+    // `resolve_scoped_download_path` canonicalizes + containment-checks the
+    // path, but the final read still races that check — a leaf swapped to a
+    // symlink after resolution (time-of-check) would be followed by a plain
+    // read (time-of-use), serving an off-tenant / out-of-workspace file
+    // (e.g. a symlink to /etc/passwd). O_NOFOLLOW makes the open fail closed
+    // on a symlink leaf.
+    let data = match read_file_no_follow(path.clone()).await {
         Ok(d) => d,
         Err(_) => return StatusCode::NOT_FOUND.into_response(),
     };
@@ -2065,6 +2160,7 @@ async fn read_profile_session_messages(
                 role: m.role.to_string(),
                 content: m.content.clone(),
                 timestamp: m.timestamp.to_rfc3339(),
+                media: m.media.clone(),
                 thread_id: m.thread_id.clone(),
             })
             .collect();
@@ -3936,6 +4032,42 @@ fn extract_bearer_from_request(headers: &HeaderMap) -> Option<String> {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn read_file_no_follow_reads_regular_file_bytes() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let file = dir.path().join("doc.pdf");
+        std::fs::write(&file, b"%PDF-1.7 body bytes").unwrap();
+        let bytes = read_file_no_follow(file).await.unwrap();
+        assert_eq!(bytes, b"%PDF-1.7 body bytes");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn read_file_no_follow_rejects_a_symlink_leaf() {
+        // P2 (tri-repo #1529): a served path whose leaf is a symlink (e.g.
+        // swapped in after resolve_scoped_download_path canonicalized it)
+        // must NOT be followed — O_NOFOLLOW fails the open closed instead of
+        // serving the off-tenant target.
+        let dir = tempfile::TempDir::new().unwrap();
+        let target = dir.path().join("secret.txt");
+        std::fs::write(&target, "off-tenant secret").unwrap();
+        let link = dir.path().join("served.pdf");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let err = read_file_no_follow(link).await.unwrap_err();
+        assert_ne!(
+            err.kind(),
+            std::io::ErrorKind::NotFound,
+            "the symlink leaf must be rejected at open, not silently followed"
+        );
+        // The target's content must never be returned.
+        assert!(
+            read_file_no_follow(dir.path().join("served.pdf"))
+                .await
+                .is_err()
+        );
+    }
+
     // Legacy `POST /api/chat` REST tests (chat_request_*, chat_response_*)
     // were retired with the handler in the cleanup follow-up to PR #908.
     // Wire-level chat coverage now lives in
@@ -3949,6 +4081,8 @@ mod tests {
             id: "test-session".into(),
             message_count: 42,
             title: None,
+            updated_at: None,
+            last_prompt: None,
         };
         let json = serde_json::to_value(&info).unwrap();
         assert_eq!(json["id"], "test-session");
@@ -3956,6 +4090,14 @@ mod tests {
         assert!(
             json.get("title").is_none(),
             "None title must be omitted from JSON"
+        );
+        assert!(
+            json.get("updated_at").is_none(),
+            "None updated_at must be omitted from JSON"
+        );
+        assert!(
+            json.get("last_prompt").is_none(),
+            "None last_prompt must be omitted from JSON"
         );
     }
 
@@ -3965,9 +4107,37 @@ mod tests {
             id: "test-session".into(),
             message_count: 7,
             title: Some("My Pinned Chat".into()),
+            updated_at: None,
+            last_prompt: None,
         };
         let json = serde_json::to_value(&info).unwrap();
         assert_eq!(json["title"], "My Pinned Chat");
+    }
+
+    #[test]
+    fn session_info_serialize_includes_updated_at() {
+        let info = SessionInfo {
+            id: "test-session".into(),
+            message_count: 3,
+            title: None,
+            updated_at: Some("2026-07-02T12:00:00+00:00".into()),
+            last_prompt: None,
+        };
+        let json = serde_json::to_value(&info).unwrap();
+        assert_eq!(json["updated_at"], "2026-07-02T12:00:00+00:00");
+    }
+
+    #[test]
+    fn session_info_serialize_includes_last_prompt() {
+        let info = SessionInfo {
+            id: "test-session".into(),
+            message_count: 5,
+            title: None,
+            updated_at: None,
+            last_prompt: Some("what is the capital of France?".into()),
+        };
+        let json = serde_json::to_value(&info).unwrap();
+        assert_eq!(json["last_prompt"], "what is the capital of France?");
     }
 
     #[test]
@@ -3976,6 +4146,7 @@ mod tests {
             role: "user".into(),
             content: "hello".into(),
             timestamp: "2025-01-01T00:00:00Z".into(),
+            media: Vec::new(),
             thread_id: None,
         };
         let json = serde_json::to_value(&info).unwrap();
@@ -3984,6 +4155,8 @@ mod tests {
         assert_eq!(json["timestamp"], "2025-01-01T00:00:00Z");
         // None thread_id must be omitted so legacy clients keep round-tripping.
         assert!(json.get("thread_id").is_none());
+        // Empty media must be omitted for the same legacy wire-shape reason.
+        assert!(json.get("media").is_none());
     }
 
     #[test]
@@ -3995,6 +4168,7 @@ mod tests {
             role: "assistant".into(),
             content: "answer".into(),
             timestamp: "2026-04-26T00:00:00Z".into(),
+            media: Vec::new(),
             thread_id: Some("thread-cmid-1".into()),
         };
         let json = serde_json::to_value(&info).unwrap();
@@ -4205,9 +4379,9 @@ mod tests {
             SessionKey("slides-1779130130502-th18yr#slides untitled-deck-th18yr".to_string());
         {
             let mut mgr = octos_bus::SessionManager::open(profile_data_dir).unwrap();
-            mgr.add_message(&bare_key, octos_core::Message::user("hello"))
-                .await
-                .unwrap();
+            let mut user = octos_core::Message::user("hello");
+            user.media = vec!["uploads/photo.png".to_string()];
+            mgr.add_message(&bare_key, user).await.unwrap();
             // PR F (M8.10 thread-binding): assistant persists require a
             // caller-supplied thread_id.
             let mut assistant = octos_core::Message::assistant("hi back");
@@ -4228,6 +4402,8 @@ mod tests {
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[0].role, "user");
         assert_eq!(messages[0].content, "hello");
+        let first = serde_json::to_value(&messages[0]).unwrap();
+        assert_eq!(first["media"], serde_json::json!(["uploads/photo.png"]));
         assert_eq!(messages[1].role, "assistant");
         assert_eq!(messages[1].content, "hi back");
     }
@@ -4306,6 +4482,50 @@ mod tests {
         assert!(
             !sessions.iter().any(|s| s.id.starts_with("web-303")),
             "child-* fanouts must be filtered: {ids:?}"
+        );
+    }
+
+    /// The `/resume` picker previews each session by its most recent user
+    /// prompt. `list_profile_sessions` must surface `last_prompt` as the LAST
+    /// user message (not the first) for a session with ≥2 user turns — the
+    /// regression guard for the `session/list` `last_prompt` enrichment.
+    #[tokio::test]
+    async fn list_profile_sessions_surfaces_last_user_prompt() {
+        let tmp = tempfile::tempdir().unwrap();
+        let profile_data_dir = tmp.path();
+
+        {
+            let mut mgr = octos_bus::SessionManager::open(profile_data_dir).unwrap();
+            // First user turn + assistant reply.
+            mgr.add_message(
+                &SessionKey("web-501".to_string()),
+                octos_core::Message::user("first question"),
+            )
+            .await
+            .unwrap();
+            let mut a1 = octos_core::Message::assistant("first answer");
+            a1.thread_id = Some("turn-1".to_string());
+            mgr.add_message(&SessionKey("web-501".to_string()), a1)
+                .await
+                .unwrap();
+            // Second (most recent) user turn — this is the expected preview.
+            mgr.add_message(
+                &SessionKey("web-501".to_string()),
+                octos_core::Message::user("second question"),
+            )
+            .await
+            .unwrap();
+        }
+
+        let sessions = list_profile_sessions(profile_data_dir);
+        let session = sessions
+            .iter()
+            .find(|s| s.id == "web-501")
+            .expect("web-501 present");
+        assert_eq!(
+            session.last_prompt.as_deref(),
+            Some("second question"),
+            "last_prompt must be the MOST RECENT user message, not the first"
         );
     }
 
@@ -4413,6 +4633,7 @@ mod tests {
             State(state),
             HeaderMap::new(),
             Some(Extension(AuthIdentity::Admin)),
+            None,
         )
         .await;
         assert_eq!(response.status(), StatusCode::OK);
@@ -4424,6 +4645,88 @@ mod tests {
         assert!(
             list.iter().any(|s| s.id == "web-legacy-1"),
             "admin legacy path must still surface profiled sessions: {ids:?}"
+        );
+    }
+
+    /// Regression: `session/list` over a solo/stdio connection (no HTTP
+    /// headers, no gateway / `process_manager`) must resolve the profile
+    /// data dir from the connection's own `connection_profile_id` — the
+    /// same scope `session/hydrate` uses — and surface the sessions the
+    /// running session persists under `<profile>/data/sessions/`.
+    ///
+    /// Pre-fix, `list_sessions` only resolved the profile via HTTP
+    /// headers / identity (`resolve_profile_data_dir`), which returns
+    /// `Err` over stdio (no `resolve_api_port`), so the per-profile scan
+    /// was skipped and the TUI `/resume` picker showed "No prior
+    /// sessions" even with sessions on disk. With `state.sessions` also
+    /// `None` (the solo/stdio shape) the handler returned `503` instead
+    /// of the session list.
+    #[tokio::test]
+    async fn list_sessions_solo_connection_profile_surfaces_profile_sessions() {
+        use crate::profiles::{ProfileStore, UserProfile};
+
+        let home = tempfile::tempdir().unwrap();
+        let store = ProfileStore::open(home.path()).unwrap();
+
+        // A profile whose sessions live at an explicit data dir — the
+        // directory the running solo/stdio session persists turns to.
+        let sessions_dir = home.path().join("dev-data");
+        let profile = UserProfile {
+            id: "dev".into(),
+            name: "dev".into(),
+            enabled: true,
+            data_dir: Some(sessions_dir.to_string_lossy().into_owned()),
+            parent_id: None,
+            public_subdomain: None,
+            config: Default::default(),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        store.save(&profile).unwrap();
+
+        // Seed one chat session the way the WS / stdio turn handler writes
+        // it (bare `web-<id>` key under the per-profile data dir).
+        {
+            let mut mgr = octos_bus::SessionManager::open(&sessions_dir).unwrap();
+            mgr.add_message(
+                &SessionKey("web-solo-1".to_string()),
+                Message::user("hi from solo"),
+            )
+            .await
+            .unwrap();
+            let mut reply = Message::assistant("hello from solo");
+            reply.thread_id = Some("turn-solo-1".to_string());
+            mgr.add_message(&SessionKey("web-solo-1".to_string()), reply)
+                .await
+                .unwrap();
+        }
+
+        // Exactly the solo/stdio shape: profile_store wired, but no
+        // process_manager (gateway) and no process-wide `sessions` store.
+        let state = std::sync::Arc::new(AppState {
+            profile_store: Some(Arc::new(store)),
+            ..AppState::empty_for_tests()
+        });
+
+        // connection_profile_id = "dev", empty headers, no identity — the
+        // frozen scope a solo stdio connection carries.
+        let response = list_sessions(State(state), HeaderMap::new(), None, Some("dev")).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let list: Vec<SessionInfo> = serde_json::from_slice(&body).unwrap();
+        let ids: Vec<&str> = list.iter().map(|s| s.id.as_str()).collect();
+        let session = list
+            .iter()
+            .find(|s| s.id == "web-solo-1")
+            .unwrap_or_else(|| panic!("solo profile session must be surfaced; got {ids:?}"));
+        // 1 meta line + 2 message lines = 3, matching the count contract
+        // the process-wide walk emits.
+        assert_eq!(session.message_count, 3);
+        assert!(
+            session.title.is_some(),
+            "resumable session must carry a title for the /resume picker"
         );
     }
 
@@ -5197,7 +5500,7 @@ mod tests {
             ..AppState::empty_for_tests()
         });
 
-        let response = list_sessions(State(state), HeaderMap::new(), None).await;
+        let response = list_sessions(State(state), HeaderMap::new(), None, None).await;
         assert_eq!(response.status(), StatusCode::OK);
         let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
             .await
@@ -5255,7 +5558,7 @@ mod tests {
         });
 
         let start = std::time::Instant::now();
-        let response = list_sessions(State(state), HeaderMap::new(), None).await;
+        let response = list_sessions(State(state), HeaderMap::new(), None, None).await;
         let elapsed = start.elapsed();
 
         assert_eq!(response.status(), StatusCode::OK);

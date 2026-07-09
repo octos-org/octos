@@ -43,6 +43,9 @@ class Octos < Formula
       #!/bin/bash
       exec "#{libexec}/octos" "$@"
     SH
+    # `Pathname#write` does not set the executable bit, so the wrapper — the only
+    # `octos` on PATH — must be chmod'd or `octos` fails with permission denied.
+    (bin/"octos").chmod 0755
   end
 
   test do

@@ -378,6 +378,17 @@ type OnFailureCallback = Box<dyn Fn(&SpawnOnlyFailureSignal) + Send + Sync>;
 /// Terminal outcome carried by a [`TerminalEvent`]. Distinguishes the
 /// success path (→ `ChildCompleted` re-entry) from the failure path
 /// (→ recovery re-entry, prompt-selected on `synth_ack_emitted`).
+//
+// `large_enum_variant`: the `Failed` variant carries a
+// [`SpawnOnlyFailureSignal`], which holds a `serde_json::Value`
+// (`tool_input`). When any workspace crate enables serde_json's
+// `preserve_order` feature (the `octos acp` bridge's `agent-client-protocol`
+// dependency requires it, and Cargo unifies features workspace-wide),
+// `Value::Object` switches from `BTreeMap` to `IndexMap` and the struct grows
+// past the lint's threshold. Boxing the payload here would ripple through the
+// `pub` API and every match site for a terminal (cold) event; the size
+// difference is immaterial on this non-hot path, so we allow it instead.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TerminalOutcome {
     /// Task reached `Completed`. Drives the autonomous `ChildCompleted`
@@ -1938,12 +1949,18 @@ impl TaskSupervisor {
                 .unwrap_or_else(|e| e.into_inner())
                 .contains(parent_session_key);
             if already_poisoned {
+                // Diagnostic count for the error payload — live children
+                // (status-active OR worker-still-running), matching the
+                // semantics of the gating count below.
                 let count = self
                     .tasks
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .values()
-                    .filter(|task| task.parent_session_key.as_deref() == Some(parent_session_key))
+                    .filter(|task| {
+                        task.parent_session_key.as_deref() == Some(parent_session_key)
+                            && (task.status.is_active() || is_task_live(&task.id))
+                    })
                     .count();
                 let error = RegisterTaskError::ChildFanoutExceeded {
                     parent_session_key: parent_session_key.to_string(),
@@ -1971,9 +1988,27 @@ impl TaskSupervisor {
             // continue to hit the cap path as before.
             let (current_count, parent_terminal_status) = {
                 let tasks = self.tasks.lock().unwrap_or_else(|e| e.into_inner());
+                // Count LIVE children only. `tasks` is never pruned, so an
+                // unfiltered count is the session's lifetime total — a
+                // long-lived session that merely completed `cap` tasks over
+                // its life would trip the cap, poison the key forever, and
+                // force-fail its active work. The cap's job is to bound
+                // runaway CONCURRENT fan-out; terminal children are done and
+                // hold no resources this cap protects.
+                //
+                // "Live" is status-active OR worker-still-running (codex P2):
+                // `cancel` flips the STATUS to Cancelled immediately, but the
+                // detached worker keeps executing until it observes the token
+                // — status alone would let a spawn→cancel-all→spawn cycle run
+                // 2× the cap concurrently. The process-global live-set
+                // (armed by `TaskTerminalGuard::new`, cleared on its Drop at
+                // every worker exit path) tracks actual worker liveness.
                 let count = tasks
                     .values()
-                    .filter(|task| task.parent_session_key.as_deref() == Some(parent_session_key))
+                    .filter(|task| {
+                        task.parent_session_key.as_deref() == Some(parent_session_key)
+                            && (task.status.is_active() || is_task_live(&task.id))
+                    })
                     .count();
                 let terminal = parent_terminal_check_tool_call_id
                     .filter(|tcid| !tcid.is_empty())
@@ -2942,7 +2977,7 @@ impl TaskSupervisor {
             Err(error) => return Err(error),
         };
 
-        let mut restored = HashMap::new();
+        let mut restored: HashMap<String, BackgroundTask> = HashMap::new();
         for line in BufReader::new(file).lines() {
             let Ok(line) = line else {
                 continue;
@@ -2956,9 +2991,96 @@ impl TaskSupervisor {
             if record.schema_version > CURRENT_TASK_LEDGER_SCHEMA {
                 continue;
             }
-            restored.insert(record.task.id.clone(), record.task);
+            // Keep the freshest snapshot per id by `updated_at`, not blindly
+            // the last JSONL row: SUP1 and a later per-turn supervisor both
+            // append to the SAME per-session ledger, so rows can interleave
+            // such that an older snapshot lands after a newer one. (codex P2.)
+            match restored.get(&record.task.id) {
+                Some(existing) if existing.updated_at >= record.task.updated_at => {}
+                _ => {
+                    restored.insert(record.task.id.clone(), record.task);
+                }
+            }
         }
         Ok(restored)
+    }
+
+    /// Re-read the persistence ledger and merge any snapshot newer (by
+    /// `updated_at`) than the in-memory copy into `self.tasks`. Unlike
+    /// [`Self::enable_persistence`] this does NOT run the orphan sweep, persist
+    /// snapshots, or fire callbacks — it only freshens stale in-memory rows.
+    ///
+    /// Per-turn supervisors share a per-session ledger: a later turn's
+    /// supervisor restores a copy of an earlier turn's still-running task but
+    /// never receives that task's later status updates (those go to the owning
+    /// supervisor). Calling this before projecting/acting on tasks lets the
+    /// later supervisor pick up the owner's terminal write, so a finished
+    /// cross-turn task can't surface as `running` or accept a stale cancel.
+    /// Returns the number of rows refreshed; `Ok(0)` if persistence is off.
+    pub fn refresh_from_persistence(&self) -> std::io::Result<usize> {
+        let path = {
+            let guard = self
+                .persistence_path
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            match guard.as_ref() {
+                Some(path) => path.clone(),
+                None => return Ok(0),
+            }
+        };
+        let restored = Self::load_persisted_tasks(&path)?;
+        let mut refreshed = 0;
+        let mut tasks = self.tasks.lock().unwrap_or_else(|e| e.into_inner());
+        for (task_id, task) in restored {
+            // Only freshen tasks THIS supervisor already owns — never import a
+            // row absent here. Importing would let an older supervisor
+            // accumulate copies of a later supervisor's tasks, and
+            // `cancel_task`/`relaunch_task` (oldest-first) would then fire the
+            // wrong supervisor's token while the real worker runs on (codex P1).
+            if let Some(existing) = tasks.get(&task_id) {
+                if task.updated_at > existing.updated_at {
+                    tasks.insert(task_id, task);
+                    refreshed += 1;
+                }
+            }
+        }
+        Ok(refreshed)
+    }
+
+    /// Like [`Self::refresh_from_persistence`] but only for `task_id`. Returns
+    /// the freshened task (newer of ledger vs in-memory), or `None` if absent
+    /// in both. Used before cancel/relaunch act on a task so a stale in-memory
+    /// `Running` copy in a later supervisor can't accept a doomed cancel.
+    pub fn refresh_task_from_persistence(
+        &self,
+        task_id: &str,
+    ) -> std::io::Result<Option<BackgroundTask>> {
+        let path = {
+            let guard = self
+                .persistence_path
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            guard.as_ref().cloned()
+        };
+        if let Some(path) = path {
+            let restored = Self::load_persisted_tasks(&path)?;
+            if let Some(task) = restored.get(task_id) {
+                let mut tasks = self.tasks.lock().unwrap_or_else(|e| e.into_inner());
+                // Update only if this supervisor already owns the task — never
+                // import an absent row (codex P1; see `refresh_from_persistence`).
+                if let Some(existing) = tasks.get(task_id) {
+                    if task.updated_at > existing.updated_at {
+                        tasks.insert(task_id.to_string(), task.clone());
+                    }
+                }
+            }
+        }
+        Ok(self
+            .tasks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(task_id)
+            .cloned())
     }
 
     /// Fire the on_change callback (if set) with a task snapshot.
@@ -5498,6 +5620,71 @@ mod tests {
             .try_register_with_input("tts", "call-other-1", Some("api:other-parent"), None)
             .expect("other parents stay unaffected by a poisoned peer");
         assert!(!other.is_empty());
+    }
+
+    /// The fan-out cap bounds LIVE children, not the session's lifetime
+    /// total. Regression: the cap count had no `is_active()` filter and
+    /// `tasks` is never pruned, so a long-lived session that merely
+    /// COMPLETED `MAX_CHILDREN_PER_PARENT` background tasks over its life
+    /// (tts / podcast / pipeline nodes) tripped the cap on the next
+    /// register — poisoning the session key forever and force-failing
+    /// every currently-active legitimate task.
+    #[test]
+    fn completed_children_do_not_count_toward_fanout_cap() {
+        let parent_session = "api:long-lived-parent";
+        let supervisor = TaskSupervisor::new();
+        for i in 0..MAX_CHILDREN_PER_PARENT {
+            let id = supervisor
+                .try_register_with_input("tts", &format!("call-{i}"), Some(parent_session), None)
+                .unwrap_or_else(|err| panic!("register #{i} should succeed; got {err}"));
+            // Every child finishes cleanly — the session is long-lived,
+            // not runaway.
+            supervisor.mark_completed(&id, Vec::new());
+        }
+
+        let id = supervisor
+            .try_register_with_input("tts", "call-after-long-life", Some(parent_session), None)
+            .expect("a session with only COMPLETED children must not trip the fan-out cap");
+        assert!(!id.is_empty());
+
+        // And the session must not have been poisoned or had work
+        // force-failed by the register above.
+        let tasks = supervisor.get_tasks_for_session(parent_session);
+        assert!(
+            tasks
+                .iter()
+                .all(|t| t.error.as_deref().is_none_or(|e| !e.contains("fanout"))),
+            "no child may be force-failed with a fan-out reason on a healthy session"
+        );
+    }
+
+    /// codex P2 on the active-only cap count: `cancel` flips a task's STATUS
+    /// to Cancelled immediately, but the detached worker keeps running until
+    /// it observes the token — a status-only count would let a session spawn
+    /// the cap, cancel everything, and spawn another cap while the first
+    /// workers still execute. A child whose worker is still LIVE (in the
+    /// process-global live-set armed by [`TaskTerminalGuard::new`]) must keep
+    /// counting toward the cap until the guard drops.
+    #[test]
+    fn cancelled_but_still_live_children_still_count_toward_cap() {
+        let parent_session = "api:cancel-bypass-parent";
+        let supervisor = Arc::new(TaskSupervisor::new());
+        let mut guards = Vec::new();
+        for i in 0..MAX_CHILDREN_PER_PARENT {
+            let id = supervisor
+                .try_register_with_input("busy", &format!("call-{i}"), Some(parent_session), None)
+                .unwrap_or_else(|err| panic!("register #{i} should succeed; got {err}"));
+            // Arm the production liveness guard (worker "running"), then
+            // cancel: status flips Cancelled but the worker is still live.
+            guards.push(TaskTerminalGuard::new(supervisor.clone(), id.clone()));
+            let _ = supervisor.cancel(&id);
+        }
+
+        let err = supervisor
+            .try_register_with_input("busy", "call-bypass", Some(parent_session), None)
+            .expect_err("cancelled-but-still-LIVE workers must still bound the fan-out cap");
+        assert!(matches!(err, RegisterTaskError::ChildFanoutExceeded { .. }));
+        drop(guards);
     }
 
     /// The legacy `register_with_input` entry point keeps returning a

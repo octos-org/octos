@@ -330,23 +330,32 @@ impl OpenAIProvider {
                         })
                         .collect()
                 });
-                // Kimi-k2 (and similar thinking models) require reasoning_content
-                // to be present (even empty) on ALL assistant messages when thinking
-                // is enabled. When omitted, the API returns 400 "reasoning_content
-                // is missing in assistant tool call message".
-                // Only synthesize a stub for models that actually need it (detected
-                // via fixed_temperature + model name containing "kimi-k2").
-                // NOTE: deepseek-v4's official API was verified NOT to enforce this
-                // (multi-round-with-tools returns 200 without reasoning_content), and
-                // a "." stub could break non-official deepseek-v4 endpoints
-                // (nvidia/vllm) that don't expect the field — so it is NOT stubbed.
-                // Real reasoning_content the model returns is still round-tripped below.
+                // We do NOT re-send prior assistant reasoning_content for ordinary
+                // openai-compat models. Reasoning models re-derive their chain of
+                // thought each turn, so round-tripping the full verbose reasoning is
+                // pure context bloat (and grows unboundedly across a tool loop) —
+                // OpenAI's own API and codex both drop it.
+                //
+                // kimi-k2 is the exception. With thinking enabled it (a) returns 400
+                // "reasoning_content is missing in assistant tool call message" if the
+                // field is absent, AND (b) per kimi's docs preserves historical
+                // assistant reasoning for multi-step tool-use continuity. So for
+                // kimi-k2 we keep the REAL reasoning when present, and fall back to a
+                // minimal "." stub only to satisfy the presence check when it's absent.
+                //
+                // kimi-k2 is detected via fixed_temperature + model name containing
+                // "kimi-k2". Other models (e.g. deepseek-v4, verified live to return
+                // 200 without the field, and non-official nvidia/vllm endpoints that
+                // don't expect it) get no reasoning_content at all.
                 let needs_reasoning_stub =
                     self.hints.fixed_temperature && self.model.to_lowercase().contains("kimi-k2");
-                let reasoning = match m.reasoning_content.as_deref() {
-                    Some(r) if !r.is_empty() => Some(r),
-                    _ if role == "assistant" && needs_reasoning_stub => Some("."),
-                    _ => None,
+                let reasoning = if role == "assistant" && needs_reasoning_stub {
+                    match m.reasoning_content.as_deref() {
+                        Some(r) if !r.is_empty() => Some(r),
+                        _ => Some("."),
+                    }
+                } else {
+                    None
                 };
 
                 OpenAIMessage {
@@ -1366,8 +1375,7 @@ mod tests {
         // deepseek-v4's official API was verified live NOT to require
         // reasoning_content on assistant tool-call messages (multi-round returns
         // 200 without it), and a "." stub could break non-official endpoints
-        // (nvidia/vllm). So no stub — only kimi-k2 gets one. Real
-        // reasoning_content the model returns is still round-tripped.
+        // (nvidia/vllm). So no stub — only kimi-k2 gets one.
         let p = OpenAIProvider::new("key", "deepseek-v4-pro");
         let mut assistant = msg("the answer");
         assistant.role = MessageRole::Assistant;
@@ -1383,6 +1391,82 @@ mod tests {
         assert!(
             a.get("reasoning_content").is_none(),
             "deepseek-v4 assistant message must not get a reasoning_content stub"
+        );
+    }
+
+    #[test]
+    fn build_request_drops_prior_reasoning_content_for_non_kimi_model() {
+        // (a) A non-kimi reasoning model must NOT have prior verbose
+        // reasoning_content round-tripped back into the request — reasoning
+        // models re-derive their chain of thought each turn, so re-sending it
+        // is pure context bloat. The field must be absent entirely.
+        let p = OpenAIProvider::new("key", "deepseek-v4-pro");
+        let mut assistant = msg("the final answer");
+        assistant.role = MessageRole::Assistant;
+        assistant.reasoning_content =
+            Some("a very long prior chain of thought that should not be re-sent".to_string());
+        let msgs = [assistant];
+        let v = serde_json::to_value(p.build_request(&msgs, &[], &ChatConfig::default(), false))
+            .unwrap();
+        let a = v["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["role"] == "assistant")
+            .expect("assistant message present");
+        assert!(
+            a.get("reasoning_content").is_none(),
+            "non-kimi model must drop prior reasoning_content, got: {:?}",
+            a.get("reasoning_content")
+        );
+    }
+
+    #[test]
+    fn build_request_preserves_reasoning_for_kimi_k2() {
+        // kimi-k2 (a) returns 400 "reasoning_content is missing in assistant tool
+        // call message" if the field is absent, AND (b) per kimi's docs preserves
+        // historical reasoning for multi-step tool-use continuity. So kimi keeps the
+        // REAL reasoning when present, and falls back to a "." stub only when absent.
+        let p = OpenAIProvider::new("key", "moonshotai/kimi-k2").with_hints(ModelHints {
+            fixed_temperature: true,
+            ..Default::default()
+        });
+        // (a) real reasoning present -> preserved verbatim (tool-use continuity)
+        let mut assistant = msg("the answer");
+        assistant.role = MessageRole::Assistant;
+        assistant.reasoning_content =
+            Some("real prior reasoning kept for tool continuity".to_string());
+        let msgs = [assistant];
+        let v = serde_json::to_value(p.build_request(&msgs, &[], &ChatConfig::default(), false))
+            .unwrap();
+        let a = v["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["role"] == "assistant")
+            .expect("assistant message present");
+        assert_eq!(
+            a.get("reasoning_content").and_then(|r| r.as_str()),
+            Some("real prior reasoning kept for tool continuity"),
+            "kimi-k2 must preserve real prior reasoning_content for tool-use continuity"
+        );
+        // (b) no reasoning present -> "." stub to satisfy the 400 presence check
+        let mut assistant2 = msg("the answer");
+        assistant2.role = MessageRole::Assistant;
+        assistant2.reasoning_content = None;
+        let msgs2 = [assistant2];
+        let v2 = serde_json::to_value(p.build_request(&msgs2, &[], &ChatConfig::default(), false))
+            .unwrap();
+        let a2 = v2["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["role"] == "assistant")
+            .expect("assistant message present");
+        assert_eq!(
+            a2.get("reasoning_content").and_then(|r| r.as_str()),
+            Some("."),
+            "kimi-k2 must get the \".\" stub when reasoning_content is absent"
         );
     }
 
