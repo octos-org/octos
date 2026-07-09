@@ -445,7 +445,7 @@ Interactive clients talk to `octos serve` over **UI Protocol v1** — a JSON-RPC
 
 ```bash
 npm install -g @octos-org/octos      # or Homebrew / build from source — see Start here
-octos init                           # interactive: pick a provider + model
+octos init                           # pick a provider + model — this guide uses DeepSeek
 ```
 
 **2. Provide your DeepSeek API key.** Run `octos auth login --provider deepseek` and **paste your key when prompted** (get one from the DeepSeek platform). It's stored securely in `auth.json` and read regardless of environment (`octos acp` resolves its LLM exactly like `octos chat`). A Dock-launched Zed does **not** inherit your shell's env vars, so if you'd rather pass the key by env var, put it in the `env` block below instead.
@@ -463,6 +463,8 @@ octos init                           # interactive: pick a provider + model
   }
 }
 ```
+
+> The `--provider`/`--model` in `args` must match the provider you set up in steps 1–2 (this guide uses DeepSeek). `octos acp` inherits the rest — `base_url`, `api_type`, `api_key_env` — from your `octos init` config, so pointing `deepseek` args at a differently-configured provider sends the wrong key/endpoint and the session fails.
 
 **4. Play with it in Zed.**
 - **Open a folder** — external agents need a workspace (with none open, the Agent Panel just shows *"Open Project"*).
