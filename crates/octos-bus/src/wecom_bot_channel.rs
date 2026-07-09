@@ -216,6 +216,7 @@ impl WeComBotChannel {
                 }
             }),
             message_id: Some(msg_id.to_string()),
+            origin: octos_core::MessageOrigin::ExternalUser,
         })
     }
 

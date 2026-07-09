@@ -1,5 +1,7 @@
 //! Chat command: interactive multi-turn conversation with an agent.
 
+use std::future::Future;
+use std::io::{self, IsTerminal, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -9,9 +11,11 @@ use colored::Colorize;
 use eyre::{Result, WrapErr};
 use octos_agent::compaction::CompactionRunner;
 use octos_agent::{
-    Agent, AgentConfig, CompactionSummarizerKind, ConsoleReporter, HookExecutor, ToolRegistry,
-    read_workspace_policy,
+    Agent, AgentConfig, CompactionSummarizerKind, ConsoleReporter, ConversationResponse,
+    HookExecutor, ToolApprovalDecision, ToolApprovalRequest, ToolApprovalRequester, ToolRegistry,
+    UserQuestionOutcome, UserQuestionRequest, UserQuestionRequester, read_workspace_policy,
 };
+use octos_core::ui_protocol::UserQuestionAnswer;
 use octos_core::{AgentId, Message, MessageRole, SessionScope};
 use octos_llm::{
     AdaptiveConfig, AdaptiveRouter, EmbeddingProvider, LlmProvider, OpenAIEmbedder, ProviderChain,
@@ -79,6 +83,293 @@ pub struct ChatCommand {
 /// Exit commands.
 const EXIT_COMMANDS: &[&str] = &["exit", "quit", "/exit", "/quit", ":q"];
 
+/// Serializes ALL interactive stdin prompts (approvals AND user questions):
+/// if two prompt-raising tools run in the same turn, their stdin prints/reads
+/// must not interleave — otherwise a single `y` or a picked number could land
+/// on whichever request won the stdin race rather than the one the user
+/// meant. One module-level lock shared by both requesters — a function-local
+/// `static` would be a *distinct* mutex per function and not serialize an
+/// approval against a question (codex review).
+static CHAT_PROMPT_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// What the user answered at the CLI approval prompt. `ApproveSession`
+/// mirrors the TUI's `s` action / the serve `approval_scope: "session"`
+/// (`ApprovalScopeKind::ApproveForSession`): every later approval-gated
+/// request in this chat process auto-resolves without prompting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CliApprovalAnswer {
+    ApproveOnce,
+    ApproveSession,
+    Deny,
+}
+
+/// Parse the `[y/s/N]` answer line. Empty / unrecognized input denies —
+/// same fail-closed default as the old `[y/N]` prompt.
+fn parse_cli_approval_answer(line: &str) -> CliApprovalAnswer {
+    match line.trim().to_ascii_lowercase().as_str() {
+        "y" | "yes" => CliApprovalAnswer::ApproveOnce,
+        "s" | "session" => CliApprovalAnswer::ApproveSession,
+        _ => CliApprovalAnswer::Deny,
+    }
+}
+
+#[derive(Default)]
+struct CliApprovalRequester {
+    /// Set once the user answers `s` — the CLI-chat equivalent of the serve
+    /// scope table's `(ApproveForSession, MatchKey::Session)` entry, which
+    /// auto-resolves every subsequent approval in the session. Scope lifetime
+    /// is this chat process (serve evicts its entry on session close).
+    session_approved: std::sync::atomic::AtomicBool,
+}
+
+impl CliApprovalRequester {
+    fn session_approved(&self) -> bool {
+        self.session_approved
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+}
+
+#[async_trait::async_trait]
+impl ToolApprovalRequester for CliApprovalRequester {
+    async fn request_approval(&self, request: ToolApprovalRequest) -> ToolApprovalDecision {
+        // Fast path: a prior `s` answer auto-resolves without prompting
+        // (mirrors serve's `approval_auto_resolved`). Print a note so the
+        // grant stays visible instead of commands silently running.
+        if self.session_approved() {
+            eprintln!(
+                "{} {}",
+                "Auto-approved (session scope):".dimmed(),
+                request
+                    .command
+                    .as_deref()
+                    .unwrap_or(&request.title)
+                    .dimmed()
+            );
+            return ToolApprovalDecision::Approve;
+        }
+        let _guard = CHAT_PROMPT_LOCK.lock().await;
+        // Re-check after acquiring the lock: a parallel tool batch can queue
+        // two prompts; if the first answer was `s`, the second must
+        // auto-resolve instead of prompting again.
+        if self.session_approved() {
+            eprintln!(
+                "{} {}",
+                "Auto-approved (session scope):".dimmed(),
+                request
+                    .command
+                    .as_deref()
+                    .unwrap_or(&request.title)
+                    .dimmed()
+            );
+            return ToolApprovalDecision::Approve;
+        }
+        let answer = tokio::task::spawn_blocking(move || prompt_for_cli_approval(request))
+            .await
+            .unwrap_or(CliApprovalAnswer::Deny);
+        match answer {
+            CliApprovalAnswer::ApproveOnce => ToolApprovalDecision::Approve,
+            CliApprovalAnswer::ApproveSession => {
+                self.session_approved
+                    .store(true, std::sync::atomic::Ordering::Release);
+                ToolApprovalDecision::Approve
+            }
+            CliApprovalAnswer::Deny => ToolApprovalDecision::Deny,
+        }
+    }
+}
+
+fn prompt_for_cli_approval(request: ToolApprovalRequest) -> CliApprovalAnswer {
+    eprintln!();
+    eprintln!("{}", "Approval required".yellow().bold());
+    eprintln!("{}", request.title.bold());
+    eprintln!("{}", request.body);
+    if let Some(cwd) = request.cwd.as_deref() {
+        eprintln!("cwd: {cwd}");
+    }
+
+    if !io::stdin().is_terminal() {
+        eprintln!("No interactive terminal available; denying request.");
+        return CliApprovalAnswer::Deny;
+    }
+
+    eprint!("Approve? [y]es once / [s]ession / [N]o ");
+    let _ = io::stderr().flush();
+    let mut answer = String::new();
+    match io::stdin().read_line(&mut answer) {
+        Ok(_) => parse_cli_approval_answer(&answer),
+        Err(_) => CliApprovalAnswer::Deny,
+    }
+}
+
+struct CliUserQuestionRequester;
+
+#[async_trait::async_trait]
+impl UserQuestionRequester for CliUserQuestionRequester {
+    async fn request_user_question(&self, request: UserQuestionRequest) -> UserQuestionOutcome {
+        // Shared CHAT_PROMPT_LOCK: an approval and a question in the same
+        // turn must not interleave their stdin reads.
+        let _guard = CHAT_PROMPT_LOCK.lock().await;
+        tokio::task::spawn_blocking(move || prompt_for_cli_user_question(request))
+            .await
+            .unwrap_or(UserQuestionOutcome::Cancelled)
+    }
+}
+
+fn prompt_for_cli_user_question(request: UserQuestionRequest) -> UserQuestionOutcome {
+    // No terminal to prompt on → let the tool degrade to its structured
+    // fallback (the model re-asks in plain text) rather than block forever.
+    if !io::stdin().is_terminal() {
+        return UserQuestionOutcome::Unsupported;
+    }
+
+    eprintln!();
+    eprintln!("{}", "Agent needs your input".cyan().bold());
+    if !request.title.is_empty() {
+        eprintln!("{}", request.title.bold());
+    }
+    if !request.body.is_empty() {
+        eprintln!("{}", request.body);
+    }
+
+    let total = request.questions.len();
+    let mut answers: Vec<UserQuestionAnswer> = Vec::with_capacity(total);
+
+    for (qi, question) in request.questions.iter().enumerate() {
+        eprintln!();
+        if total > 1 {
+            eprintln!("{}", format!("Question {} of {}", qi + 1, total).dimmed());
+        }
+        eprintln!("{}", question.question.bold());
+
+        // Numbered options, then an "Other" row when free text is offered.
+        for (oi, opt) in question.options.iter().enumerate() {
+            if opt.description.is_empty() {
+                eprintln!("  {}. {}", oi + 1, opt.label);
+            } else {
+                eprintln!("  {}. {} — {}", oi + 1, opt.label, opt.description.dimmed());
+            }
+        }
+        let other_index = question.options.len() + 1;
+        if question.allow_free_text {
+            eprintln!("  {other_index}. {}", "Other (type your own)".dimmed());
+        }
+
+        if question.multi_select {
+            eprint!("Choose one or more, comma-separated [1]: ");
+        } else {
+            eprint!("Choose [1]: ");
+        }
+        let _ = io::stderr().flush();
+
+        let mut line = String::new();
+        if io::stdin().read_line(&mut line).unwrap_or(0) == 0 {
+            // EOF (Ctrl-D) — abandon the whole question.
+            return UserQuestionOutcome::Cancelled;
+        }
+        let (selected_labels, other_picked) = parse_question_selection(question, &line);
+
+        // Read the free-text answer only when "Other" was chosen.
+        let mut free_text: Option<String> = None;
+        if other_picked {
+            eprint!("Your answer: ");
+            let _ = io::stderr().flush();
+            let mut ft = String::new();
+            if io::stdin().read_line(&mut ft).unwrap_or(0) == 0 {
+                return UserQuestionOutcome::Cancelled;
+            }
+            let ft = ft.trim().to_string();
+            if !ft.is_empty() {
+                free_text = Some(ft);
+            }
+        }
+
+        answers.push(UserQuestionAnswer {
+            selected_labels,
+            free_text,
+        });
+    }
+
+    UserQuestionOutcome::Answered(answers)
+}
+
+/// Parse the numbered-selection `line` for one question into (option labels,
+/// was-"Other"-picked). Empty input defaults to option 1. Out-of-range and
+/// non-numeric tokens are dropped; a single-select question keeps only the
+/// first valid pick. The "Other" row is index `options.len() + 1` and is only
+/// honoured when the question allows free text. Pure so it can be unit-tested
+/// without stdin.
+fn parse_question_selection(
+    question: &octos_core::ui_protocol::UserQuestion,
+    line: &str,
+) -> (Vec<String>, bool) {
+    let other_index = question.options.len() + 1;
+    // The "Other" row is only selectable when the question allows free text.
+    let max_index = if question.allow_free_text {
+        other_index
+    } else {
+        question.options.len()
+    };
+    let trimmed = line.trim();
+    let mut picks: Vec<usize> = trimmed
+        .split(',')
+        .filter_map(|tok| tok.trim().parse::<usize>().ok())
+        .filter(|n| *n >= 1 && *n <= max_index)
+        .collect();
+    // Empty or all-invalid input falls back to the first option (the "[1]"
+    // default shown in the prompt) so a stray keystroke still yields an answer.
+    if picks.is_empty() {
+        picks.push(1);
+    }
+    if !question.multi_select {
+        picks.truncate(1);
+    }
+
+    let mut selected_labels = Vec::new();
+    let mut other_picked = false;
+    for n in picks {
+        // `n == other_index` is only reachable when free text is allowed
+        // (`max_index` excludes it otherwise), so it always means "Other".
+        if n == other_index {
+            other_picked = true;
+        } else if let Some(opt) = question.options.get(n - 1) {
+            selected_labels.push(opt.label.clone());
+        }
+    }
+    (selected_labels, other_picked)
+}
+
+async fn with_chat_approval<F, T>(
+    approval_requester: Arc<dyn ToolApprovalRequester>,
+    future: F,
+) -> T
+where
+    F: Future<Output = T>,
+{
+    // Scope BOTH the approval and the user-question requesters for the turn,
+    // so `ask_user_question` renders the interactive numbered prompt instead
+    // of degrading to Unsupported (the model re-asking in plain text).
+    let uq_requester: Arc<dyn UserQuestionRequester> = Arc::new(CliUserQuestionRequester);
+    octos_agent::tools::USER_QUESTION_CTX
+        .scope(
+            uq_requester,
+            octos_agent::tools::TOOL_APPROVAL_CTX.scope(approval_requester, future),
+        )
+        .await
+}
+
+async fn process_chat_turn(
+    agent: &Agent,
+    input: &str,
+    history: &[Message],
+    approval_requester: Arc<dyn ToolApprovalRequester>,
+) -> Result<ConversationResponse> {
+    with_chat_approval(
+        approval_requester,
+        agent.process_message(input, history, vec![]),
+    )
+    .await
+}
+
 impl Executable for ChatCommand {
     fn execute(self) -> Result<()> {
         tokio::runtime::Builder::new_multi_thread()
@@ -97,14 +388,16 @@ impl ChatCommand {
             None => std::env::current_dir().wrap_err("failed to get current directory")?,
         };
 
-        // Resolve data directory (--data-dir > $OCTOS_HOME > ~/.octos)
-        let data_dir = super::resolve_data_dir(self.data_dir)?;
+        // Resolve the canonical config context (data_dir, config_home,
+        // auth_home, is_default) once and run migrations.
+        let ctx = super::resolve_command_context(self.data_dir)?;
+        let data_dir = ctx.data_dir.clone();
 
         // Load config
         let config = if let Some(config_path) = &self.config {
             Config::from_file(config_path)?
         } else {
-            Config::load(&cwd, &data_dir)?
+            Config::load_with_context(&cwd, &ctx)?
         };
 
         let model = self.model.or(config.model.clone());
@@ -237,6 +530,11 @@ impl ChatCommand {
         );
         tools.register(octos_agent::RecallMemoryTool::new(memory_store.clone()));
         tools.register(octos_agent::SaveMemoryTool::new(memory_store.clone()));
+        let memory_refresh_enabled =
+            crate::config::MemoryConfig::refresh_enabled(config.memory.as_ref());
+        if memory_refresh_enabled {
+            tools.register(octos_agent::MemoryNoteTool::new(memory_store.clone()));
+        }
 
         // Register MCP tools
         if !config.mcp_servers.is_empty() {
@@ -256,6 +554,17 @@ impl ChatCommand {
         let n = octos_agent::bootstrap::bootstrap_platform_skills(&project_dir);
         if n > 0 {
             eprintln!("Bootstrapped {n} platform skills");
+        }
+        // Gap 4.1: bundle generic pipelines (deep_research) into the
+        // dedicated `<data_dir>/bundled-pipelines` dir so `run_pipeline` can
+        // always discover them, independent of per-profile skill deployment.
+        // The chat `RunPipelineTool` registers that dir as the LOWEST-
+        // precedence search path via `with_bundled_pipelines_root(data_dir)`
+        // (bootstrap-dir == search-dir); installed pipelines of the same name
+        // always win.
+        let n = octos_agent::bootstrap::bootstrap_bundled_pipelines(&data_dir);
+        if n > 0 {
+            eprintln!("Bootstrapped {n} bundled pipelines");
         }
 
         // Load plugins (includes app-skills from .octos/skills/).
@@ -382,6 +691,7 @@ impl ChatCommand {
             max_iterations: self.max_iterations,
             save_episodes: true,
             chat_max_tokens: config.gateway.as_ref().and_then(|g| g.max_output_tokens),
+            reasoning_effort: config.gateway.as_ref().and_then(|g| g.reasoning_effort),
             ..Default::default()
         };
         // M8.2: load sub-agent manifests from `<cwd>/agents/` layered on
@@ -521,16 +831,25 @@ impl ChatCommand {
             agent.append_system_prompt(&bootstrap);
         }
 
-        // Inject memory context (long-term + daily notes)
-        let memory_ctx = memory_store.get_memory_context().await;
-        if !memory_ctx.is_empty() {
-            agent.append_system_prompt(&memory_ctx);
-        }
-
-        // Inject memory bank summary (entity abstracts)
-        let bank_summary = memory_store.get_bank_summary().await;
-        if !bank_summary.is_empty() {
-            agent.append_system_prompt(&bank_summary);
+        // Inject the token-capped memory block (long-term memory + daily
+        // notes + bank summary; omissions are disclosed to the model) as a
+        // replaceable named segment between bootstrap and skill fragments.
+        // With memory refresh on, the capture policy rides the same segment
+        // and a provider re-renders it when MEMORY.md changes on disk or
+        // the date rolls over (one stat per turn otherwise).
+        let max_inject =
+            crate::config::MemoryConfig::effective_max_inject_tokens(config.memory.as_ref());
+        let memory_ctx = memory_store.get_injectable_context(max_inject).await;
+        agent.set_prompt_segment(
+            octos_agent::MEMORY_SEGMENT_NAME,
+            octos_agent::compose_memory_segment(&memory_ctx, memory_refresh_enabled),
+        );
+        if memory_refresh_enabled {
+            agent.add_prompt_segment_provider(Arc::new(octos_agent::MemorySegmentProvider::new(
+                memory_store.clone(),
+                max_inject,
+                true,
+            )));
         }
 
         // Inject skill prompt fragments
@@ -577,9 +896,13 @@ impl ChatCommand {
             }
         }
 
+        let approval_requester: Arc<dyn ToolApprovalRequester> =
+            Arc::new(CliApprovalRequester::default());
+
         // Single-message mode: send one message and exit
         if let Some(msg) = self.message {
-            let response = agent.process_message(&msg, &[], vec![]).await?;
+            let response =
+                process_chat_turn(&agent, &msg, &[], Arc::clone(&approval_requester)).await?;
             if !response.streamed {
                 println!("{}", response.content);
             }
@@ -661,13 +984,16 @@ impl ChatCommand {
             }
 
             // Process message
-            let response = match agent.process_message(input, &history, vec![]).await {
-                Ok(r) => r,
-                Err(e) => {
-                    eprintln!("{}: {e}", "Error".red().bold());
-                    continue;
-                }
-            };
+            let response =
+                match process_chat_turn(&agent, input, &history, Arc::clone(&approval_requester))
+                    .await
+                {
+                    Ok(r) => r,
+                    Err(e) => {
+                        eprintln!("{}: {e}", "Error".red().bold());
+                        continue;
+                    }
+                };
 
             // Append to history
             history.push(Message {
@@ -795,10 +1121,70 @@ pub(crate) fn resolve_provider_policy(
 /// Create an embedding provider from config, if configured.
 pub(crate) fn create_embedder(config: &Config) -> Option<Arc<dyn EmbeddingProvider>> {
     let cfg = config.embedding.as_ref()?;
-    let key = config.get_api_key(&cfg.provider).ok()?;
+    // `api_key_env` was declared on EmbeddingConfig but never honored —
+    // it wins over the provider-default var name, resolving through the
+    // SAME credential chain as every other key (auth store, env_vars +
+    // keychain, process env), so `octos auth login` / config-stored keys
+    // keep working (codex P2).
+    let key = config
+        .get_api_key_with_env(&cfg.provider, cfg.api_key_env.as_deref())
+        .ok()?;
     let mut e = OpenAIEmbedder::new(key);
     if let Some(ref url) = cfg.base_url {
         e = e.with_base_url(url);
+    } else if !cfg.provider.eq_ignore_ascii_case("openai") {
+        // A non-openai provider without an explicit base_url falls back to
+        // the registry's default endpoint — otherwise the request goes to
+        // api.openai.com with the other provider's key/model (codex R8).
+        if let Some(url) =
+            octos_llm::registry::lookup(&cfg.provider).and_then(|e| e.default_base_url)
+        {
+            e = e.with_base_url(url);
+        }
+    }
+    if let Some(ref model) = cfg.model {
+        e = e.with_model(model);
+    }
+    if let Some(dimensions) = cfg.dimensions {
+        if dimensions as usize != octos_memory::EPISODIC_INDEX_DIMENSION {
+            tracing::warn!(
+                dimensions,
+                index = octos_memory::EPISODIC_INDEX_DIMENSION,
+                "embedding.dimensions differs from the episodic index dimension — \
+                 vectors will be dropped to BM25-only"
+            );
+        }
+        e = e.with_dimensions(dimensions);
+    } else if let Some(model) = cfg.model.as_deref() {
+        // Auto-pin to the index dimension ONLY for families known to
+        // accept the OpenAI-standard `dimensions` field (OpenAI 3-series;
+        // DashScope text-embedding-v3/v4, natively 1024-d). Models that
+        // reject the field (ada-002) keep the legacy request shape; for
+        // families we can't classify, warn loudly instead of degrading
+        // silently — the native size is unknown and non-1536 vectors are
+        // dropped to BM25-only.
+        // Exactly the families verified to accept `dimensions: 1536`:
+        // OpenAI 3-series (native 1536/3072, truncation supported) and
+        // DashScope text-embedding-v4 (64–2048, verified live). v3 caps
+        // below 1536 and would error — it falls to the warn path.
+        let supports_dimensions =
+            model.starts_with("text-embedding-3") || model == "text-embedding-v4";
+        if supports_dimensions {
+            tracing::info!(
+                model = %e.model(),
+                pinned = octos_memory::EPISODIC_INDEX_DIMENSION,
+                "pinning custom embedding model to the episodic index dimension"
+            );
+            e = e.with_dimensions(octos_memory::EPISODIC_INDEX_DIMENSION as u32);
+        } else {
+            tracing::warn!(
+                model = %e.model(),
+                index = octos_memory::EPISODIC_INDEX_DIMENSION,
+                "custom embedding model without `dimensions`: native size unknown — \
+                 vectors that are not index-sized will be dropped to BM25-only; set \
+                 embedding.dimensions if the provider supports it"
+            );
+        }
     }
     Some(Arc::new(e))
 }
@@ -826,10 +1212,18 @@ pub(crate) fn build_run_pipeline_tool(
     plugin_require_signed: bool,
     embedder: Option<Arc<dyn EmbeddingProvider>>,
 ) -> octos_pipeline::RunPipelineTool {
-    let mut pipeline_tool = octos_pipeline::RunPipelineTool::new(llm, memory, cwd, data_dir)
-        .with_provider_policy(provider_policy)
-        .with_plugin_dirs(plugin_dirs)
-        .with_plugin_require_signed(plugin_require_signed);
+    let mut pipeline_tool =
+        octos_pipeline::RunPipelineTool::new(llm, memory, cwd, data_dir.clone())
+            .with_provider_policy(provider_policy)
+            .with_plugin_dirs(plugin_dirs)
+            .with_plugin_require_signed(plugin_require_signed)
+            // Gap 4.1 BLOCKER 2/3: `octos chat` bootstraps the bundle into
+            // `<data_dir>/bundled-pipelines` (see chat.rs above). Register that
+            // exact dir as the LOWEST-precedence discovery path so the bundled
+            // `deep_research` is discoverable (bootstrap-dir == search-dir) yet
+            // any installed `deep_research.dot` in `<data_dir>/{pipelines,skills}`
+            // still wins.
+            .with_bundled_pipelines_root(data_dir);
     if let Some(embedder) = embedder {
         pipeline_tool = pipeline_tool.with_embedder(embedder);
     }
@@ -840,6 +1234,119 @@ pub(crate) fn build_run_pipeline_tool(
 #[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
+
+    fn q(multi: bool, allow_free_text: bool) -> octos_core::ui_protocol::UserQuestion {
+        use octos_core::ui_protocol::{UserQuestion, UserQuestionOption};
+        UserQuestion {
+            header: "H".into(),
+            question: "Which?".into(),
+            options: vec![
+                UserQuestionOption {
+                    label: "axum".into(),
+                    description: String::new(),
+                },
+                UserQuestionOption {
+                    label: "actix".into(),
+                    description: String::new(),
+                },
+                UserQuestionOption {
+                    label: "warp".into(),
+                    description: String::new(),
+                },
+            ],
+            multi_select: multi,
+            allow_free_text,
+        }
+    }
+
+    #[test]
+    fn parse_approval_answer_maps_y_s_and_default_deny() {
+        assert_eq!(
+            parse_cli_approval_answer("y\n"),
+            CliApprovalAnswer::ApproveOnce
+        );
+        assert_eq!(
+            parse_cli_approval_answer("  YES "),
+            CliApprovalAnswer::ApproveOnce
+        );
+        assert_eq!(
+            parse_cli_approval_answer("s"),
+            CliApprovalAnswer::ApproveSession
+        );
+        assert_eq!(
+            parse_cli_approval_answer("Session\n"),
+            CliApprovalAnswer::ApproveSession
+        );
+        // Fail-closed: empty and anything unrecognized deny.
+        assert_eq!(parse_cli_approval_answer(""), CliApprovalAnswer::Deny);
+        assert_eq!(parse_cli_approval_answer("n"), CliApprovalAnswer::Deny);
+        assert_eq!(parse_cli_approval_answer("wat"), CliApprovalAnswer::Deny);
+    }
+
+    #[tokio::test]
+    async fn session_scope_auto_resolves_later_requests_without_prompting() {
+        // With the session flag set, request_approval must return Approve on
+        // the fast path — before spawn_blocking would ever touch stdin (this
+        // test has no TTY; a prompt would deny, failing the assert).
+        let requester = CliApprovalRequester::default();
+        requester
+            .session_approved
+            .store(true, std::sync::atomic::Ordering::Release);
+        let request = ToolApprovalRequest {
+            tool_id: "t1".into(),
+            tool_name: "shell".into(),
+            title: "Approve command".into(),
+            body: "Run command: sudo echo hi".into(),
+            command: Some("sudo echo hi".into()),
+            cwd: None,
+        };
+        let decision = requester.request_approval(request).await;
+        assert_eq!(decision, ToolApprovalDecision::Approve);
+    }
+
+    #[test]
+    fn parse_selection_single_picks_the_numbered_option() {
+        let (labels, other) = parse_question_selection(&q(false, true), "2");
+        assert_eq!(labels, vec!["actix"]);
+        assert!(!other);
+    }
+
+    #[test]
+    fn parse_selection_empty_defaults_to_first_option() {
+        let (labels, other) = parse_question_selection(&q(false, true), "  \n");
+        assert_eq!(labels, vec!["axum"]);
+        assert!(!other);
+    }
+
+    #[test]
+    fn parse_selection_single_ignores_extra_picks() {
+        // Single-select keeps only the first valid pick.
+        let (labels, _) = parse_question_selection(&q(false, true), "3,1");
+        assert_eq!(labels, vec!["warp"]);
+    }
+
+    #[test]
+    fn parse_selection_multi_keeps_all_valid_and_drops_garbage() {
+        let (labels, other) = parse_question_selection(&q(true, true), "1, 3, 9, x");
+        assert_eq!(labels, vec!["axum", "warp"]); // 9 out-of-range, x non-numeric
+        assert!(!other);
+    }
+
+    #[test]
+    fn parse_selection_other_index_sets_free_text_flag() {
+        // Other is options.len()+1 = 4 here.
+        let (labels, other) = parse_question_selection(&q(false, true), "4");
+        assert!(labels.is_empty());
+        assert!(other);
+    }
+
+    #[test]
+    fn parse_selection_other_ignored_when_free_text_disallowed() {
+        // With free text off, index 4 is out of range → filtered → default(1).
+        let (labels, other) = parse_question_selection(&q(false, false), "4");
+        assert!(!other);
+        assert_eq!(labels, vec!["axum"]); // empty picks after filter → default
+    }
 
     #[test]
     fn test_resolve_provider_policy_model_id_match() {
@@ -1064,6 +1571,89 @@ mod tests {
              an embedder would observe a behaviour change."
         );
     }
+
+    #[cfg(unix)]
+    struct AlwaysAskPolicy;
+
+    #[cfg(unix)]
+    impl octos_agent::policy::CommandPolicy for AlwaysAskPolicy {
+        fn check(&self, _command: &str, _cwd: &std::path::Path) -> octos_agent::policy::Decision {
+            octos_agent::policy::Decision::Ask
+        }
+    }
+
+    #[cfg(unix)]
+    struct RecordingApprovalRequester {
+        decision: ToolApprovalDecision,
+        requests: Arc<std::sync::Mutex<Vec<ToolApprovalRequest>>>,
+    }
+
+    #[cfg(unix)]
+    #[async_trait::async_trait]
+    impl ToolApprovalRequester for RecordingApprovalRequester {
+        async fn request_approval(&self, request: ToolApprovalRequest) -> ToolApprovalDecision {
+            self.requests.lock().expect("requests lock").push(request);
+            self.decision
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn chat_approval_scope_resumes_ask_gated_shell_tool_once() {
+        use octos_agent::{ShellTool, Tool};
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let requester: Arc<dyn ToolApprovalRequester> = Arc::new(RecordingApprovalRequester {
+            decision: ToolApprovalDecision::Approve,
+            requests: Arc::clone(&requests),
+        });
+        let tool = ShellTool::new(tmp.path()).with_policy(Arc::new(AlwaysAskPolicy));
+
+        let result = with_chat_approval(
+            requester,
+            tool.execute(&serde_json::json!({"command": "printf approved"})),
+        )
+        .await
+        .expect("shell execution should return");
+
+        assert!(
+            result.success,
+            "approved command should run: {}",
+            result.output
+        );
+        assert!(result.output.contains("approved"), "{}", result.output);
+        let recorded = requests.lock().expect("requests lock");
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].tool_name, "shell");
+        assert_eq!(recorded[0].command.as_deref(), Some("printf approved"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn chat_approval_scope_denies_ask_gated_shell_tool_once() {
+        use octos_agent::{ShellTool, Tool};
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let requester: Arc<dyn ToolApprovalRequester> = Arc::new(RecordingApprovalRequester {
+            decision: ToolApprovalDecision::Deny,
+            requests: Arc::clone(&requests),
+        });
+        let tool = ShellTool::new(tmp.path()).with_policy(Arc::new(AlwaysAskPolicy));
+
+        let result = with_chat_approval(
+            requester,
+            tool.execute(&serde_json::json!({"command": "printf denied"})),
+        )
+        .await
+        .expect("shell execution should return");
+
+        assert!(!result.success, "denied command must not run");
+        assert!(!result.output.contains("denied\n"), "{}", result.output);
+        assert!(result.output.contains("Command denied by user approval"));
+        assert_eq!(requests.lock().expect("requests lock").len(), 1);
+    }
 }
 
 /// Create an LLM provider from name and config.
@@ -1093,6 +1683,10 @@ pub(crate) fn create_provider_with_api_type(
     base_url: Option<String>,
     api_type: Option<&str>,
 ) -> Result<Arc<dyn LlmProvider>> {
+    if name == "custom" {
+        return create_custom_provider(config, model, base_url, api_type);
+    }
+
     let entry = octos_llm::registry::lookup(name).ok_or_else(|| {
         eyre::eyre!(
             "unknown provider: {name}. Valid: {}",
@@ -1173,4 +1767,113 @@ pub(crate) fn create_provider_with_api_type(
 
     let provider = (entry.create)(params)?;
     Ok(provider)
+}
+
+fn create_custom_provider(
+    config: &Config,
+    model: Option<String>,
+    base_url: Option<String>,
+    api_type: Option<&str>,
+) -> Result<Arc<dyn LlmProvider>> {
+    let key = config.get_api_key("custom")?;
+    let model = model.ok_or_else(|| eyre::eyre!("custom provider requires model"))?;
+    let base_url = base_url.ok_or_else(|| eyre::eyre!("custom provider requires base_url"))?;
+
+    // Extract timeout overrides from gateway config (if any).
+    let llm_timeout_secs = config.gateway.as_ref().and_then(|g| g.llm_timeout_secs);
+    let llm_connect_timeout_secs = config
+        .gateway
+        .as_ref()
+        .and_then(|g| g.llm_connect_timeout_secs);
+
+    match api_type.unwrap_or("openai") {
+        "openai" => {
+            let mut provider = octos_llm::openai::OpenAIProvider::new(key, model)
+                .with_base_url(&base_url)
+                .with_provider_label("custom");
+            if let Some(t) = llm_timeout_secs {
+                let c =
+                    llm_connect_timeout_secs.unwrap_or(octos_llm::DEFAULT_LLM_CONNECT_TIMEOUT_SECS);
+                provider = provider.with_http_timeout(t, c);
+            }
+            Ok(Arc::new(provider))
+        }
+        "anthropic" => {
+            let mut provider = octos_llm::anthropic::AnthropicProvider::new(key, model)
+                .with_base_url(&base_url)
+                .with_provider_label("custom");
+            if let Some(t) = llm_timeout_secs {
+                let c =
+                    llm_connect_timeout_secs.unwrap_or(octos_llm::DEFAULT_LLM_CONNECT_TIMEOUT_SECS);
+                provider = provider.with_http_timeout(t, c);
+            }
+            Ok(Arc::new(provider))
+        }
+        other => eyre::bail!("unsupported custom api_type '{other}'; use openai or anthropic"),
+    }
+}
+
+#[cfg(test)]
+mod custom_provider_tests {
+    use super::*;
+
+    fn custom_config() -> Config {
+        let mut config = Config {
+            api_key_env: Some("CUSTOM_API_KEY".to_string()),
+            ..Default::default()
+        };
+        config
+            .env_vars
+            .insert("CUSTOM_API_KEY".to_string(), "test-key".to_string());
+        config
+    }
+
+    #[test]
+    fn creates_custom_openai_compatible_provider() {
+        let provider = create_provider_with_api_type(
+            "custom",
+            &custom_config(),
+            Some("llama-3.1-70b-instruct".to_string()),
+            Some("http://127.0.0.1:11434/v1".to_string()),
+            Some("openai"),
+        )
+        .unwrap();
+
+        assert_eq!(provider.provider_name(), "custom");
+        assert_eq!(provider.model_id(), "llama-3.1-70b-instruct");
+    }
+
+    #[test]
+    fn creates_custom_anthropic_compatible_provider() {
+        let provider = create_provider_with_api_type(
+            "custom",
+            &custom_config(),
+            Some("claude-compatible".to_string()),
+            Some("https://proxy.example.com/anthropic".to_string()),
+            Some("anthropic"),
+        )
+        .unwrap();
+
+        assert_eq!(provider.provider_name(), "custom");
+        assert_eq!(provider.model_id(), "claude-compatible");
+    }
+
+    #[test]
+    fn rejects_custom_provider_without_base_url() {
+        let result = create_provider_with_api_type(
+            "custom",
+            &custom_config(),
+            Some("llama".to_string()),
+            None,
+            Some("openai"),
+        );
+
+        match result {
+            Ok(provider) => panic!(
+                "expected missing base_url error, got provider {}",
+                provider.provider_name()
+            ),
+            Err(err) => assert!(err.to_string().contains("requires base_url")),
+        }
+    }
 }

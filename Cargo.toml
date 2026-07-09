@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/octos-core",
+    "crates/octos-diagnostics",
     "crates/octos-memory",
     "crates/octos-llm",
     "crates/octos-agent",
@@ -29,7 +30,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.1"
+version = "1.1.0"
 edition = "2024"
 rust-version = "1.85.0"
 authors = ["octos team"]
@@ -42,6 +43,7 @@ unsafe_code = "deny"
 [workspace.dependencies]
 # Internal crates
 octos-core = { path = "crates/octos-core" }
+octos-diagnostics = { path = "crates/octos-diagnostics" }
 octos-memory = { path = "crates/octos-memory" }
 octos-llm = { path = "crates/octos-llm" }
 octos-agent = { path = "crates/octos-agent" }
@@ -70,11 +72,15 @@ base64 = "0.22"
 # Crypto
 md-5 = "0.10"
 sha2 = "0.10"
+fs2 = "0.4"
 aes = "0.8"
 cbc = { version = "0.1", features = ["alloc"] }
 rand = "0.8"
 secrecy = { version = "0.10", features = ["serde"] }
 subtle = "2"
+# JWT signing for Google service-account (Vertex AI) auth. Uses `ring`
+# (already in tree via rustls) for RS256 — no OpenSSL.
+jsonwebtoken = "9"
 
 # Error handling (dora-rs pattern)
 eyre = "0.6"
@@ -150,6 +156,7 @@ cron = "0.15"
 # Time and IDs
 chrono = { version = "0.4", features = ["serde"] }
 chrono-tz = "0.10"
+iana-time-zone = "0.1"
 uuid = { version = "1", features = ["v4", "v7", "serde"] }
 
 # Async utilities

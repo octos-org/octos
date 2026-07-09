@@ -20,7 +20,7 @@ mod utils;
 
 pub use abort::{abort_response, is_abort_trigger};
 pub use error::{Error, ErrorKind, Result};
-pub use gateway::{InboundMessage, METADATA_SENDER_USER_ID, OutboundMessage};
+pub use gateway::{InboundMessage, METADATA_SENDER_USER_ID, MessageOrigin, OutboundMessage};
 pub use message::AgentMessage;
 pub use session_scope::{
     DEFAULT_MULTI_TENANT_SHARED_ZONE_NAMES, MULTI_TENANT_USERS_DIR_NAME,
@@ -38,4 +38,7 @@ pub use types::{
     MessageRole, SessionKey, TaskId, ThreadId, ToolCall, TurnId,
 };
 pub use ui_protocol::{EventEnvelope, TurnContext};
-pub use utils::{tool_output_limit, truncate_head_tail, truncate_utf8, truncated_utf8};
+pub use utils::{
+    SAFE_FILENAME_MAX_BYTES, safe_filename, tool_output_limit, truncate_head_tail, truncate_utf8,
+    truncated_utf8,
+};

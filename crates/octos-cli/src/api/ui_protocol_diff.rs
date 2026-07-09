@@ -69,7 +69,7 @@ use octos_core::ui_protocol::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 /// A pending diff-preview entry. Carries both the parsed `DiffPreview` that
 /// is shipped to clients and a raw snapshot of the underlying diff bytes
@@ -220,6 +220,11 @@ struct StoreInner {
     dropped_count: u64,
     evicted_count: u64,
     recovery_loaded_count: u64,
+    /// Total diff-preview records skipped during recovery (unknown
+    /// version + genuinely-malformed + session-id mismatch). Surfaced so
+    /// operators/tests can observe the aggregated per-file skip volume
+    /// deterministically without depending on the tracing subscriber.
+    recovery_skipped_count: u64,
 }
 
 impl StoreInner {
@@ -233,6 +238,7 @@ impl StoreInner {
             dropped_count: 0,
             evicted_count: 0,
             recovery_loaded_count: 0,
+            recovery_skipped_count: 0,
         }
     }
 
@@ -378,6 +384,7 @@ impl PendingDiffPreviewStore {
         // re-inserts collapse: the latest write wins (matches the live
         // semantics of `insert_with_snapshot`).
         let mut loaded = 0usize;
+        let mut skipped_total = 0u64;
         let mut seen_ids: HashSet<PreviewId> = HashSet::new();
         for path in &log_files {
             let file = match File::open(path) {
@@ -393,6 +400,14 @@ impl PendingDiffPreviewStore {
                 }
             };
             let reader = BufReader::new(file);
+            // Aggregate skip counts per file: emit ONE summary `warn!`
+            // after the inner loop instead of one line per record per
+            // rescan. Recovery re-reads every log from byte 0, so
+            // per-record warnings multiply into log spam on corrupted or
+            // legacy logs. Per-record detail stays at `debug!`.
+            let mut skipped_unknown_version = 0u64;
+            let mut skipped_malformed = 0u64;
+            let mut skipped_session_mismatch = 0u64;
             for line_result in reader.lines() {
                 let line = match line_result {
                     Ok(line) => line,
@@ -413,7 +428,8 @@ impl PendingDiffPreviewStore {
                 let record = match serde_json::from_str::<DiffPreviewDiskRecord>(&line) {
                     Ok(record) if record.v == DIFF_PREVIEW_DISK_VERSION => record,
                     Ok(record) => {
-                        warn!(
+                        skipped_unknown_version += 1;
+                        debug!(
                             target = "octos::diff_preview",
                             version = record.v,
                             path = %path.display(),
@@ -422,7 +438,8 @@ impl PendingDiffPreviewStore {
                         continue;
                     }
                     Err(error) => {
-                        warn!(
+                        skipped_malformed += 1;
+                        debug!(
                             target = "octos::diff_preview",
                             ?error,
                             session_id = %session_id.0,
@@ -433,7 +450,8 @@ impl PendingDiffPreviewStore {
                     }
                 };
                 if record.preview.session_id != *session_id {
-                    warn!(
+                    skipped_session_mismatch += 1;
+                    debug!(
                         target = "octos::diff_preview",
                         record_session_id = %record.preview.session_id.0,
                         dir_session_id = %session_id.0,
@@ -452,12 +470,31 @@ impl PendingDiffPreviewStore {
                     loaded += 1;
                 }
             }
+            let skipped_in_file =
+                skipped_unknown_version + skipped_malformed + skipped_session_mismatch;
+            if skipped_in_file > 0 {
+                skipped_total = skipped_total.saturating_add(skipped_in_file);
+                warn!(
+                    target = "octos::diff_preview",
+                    session_id = %session_id.0,
+                    path = %path.display(),
+                    skipped = skipped_in_file,
+                    skipped_unknown_version,
+                    skipped_malformed,
+                    skipped_session_mismatch,
+                    "skipped diff-preview records during scan (aggregated)"
+                );
+            }
         }
 
-        if loaded > 0 {
+        if loaded > 0 || skipped_total > 0 {
             let mut inner = self.inner.lock().expect("diff preview store poisoned");
-            inner.on_disk_bytes = inner.on_disk_bytes.saturating_add(total_disk_bytes);
-            inner.touch_lru(session_id);
+            if loaded > 0 {
+                inner.on_disk_bytes = inner.on_disk_bytes.saturating_add(total_disk_bytes);
+                inner.touch_lru(session_id);
+            }
+            inner.recovery_skipped_count =
+                inner.recovery_skipped_count.saturating_add(skipped_total);
         }
         Ok(loaded)
     }
@@ -768,6 +805,7 @@ impl PendingDiffPreviewStore {
             sessions_evicted: inner.evicted_count,
             entries_dropped: inner.dropped_count,
             recovery_entries_loaded: inner.recovery_loaded_count,
+            recovery_records_skipped: inner.recovery_skipped_count,
             bytes_in_memory: in_memory_bytes,
             bytes_on_disk: inner.on_disk_bytes,
         }
@@ -820,6 +858,7 @@ pub(super) struct DiffPreviewMetrics {
     pub(super) sessions_evicted: u64,
     pub(super) entries_dropped: u64,
     pub(super) recovery_entries_loaded: u64,
+    pub(super) recovery_records_skipped: u64,
     pub(super) bytes_in_memory: usize,
     pub(super) bytes_on_disk: u64,
 }
@@ -1341,6 +1380,51 @@ diff --git a/src/lib.rs b/src/lib.rs
             })
             .expect("valid preview survives corruption");
         assert_eq!(result.status, DiffPreviewGetStatus::Ready);
+    }
+
+    #[test]
+    fn recover_aggregates_skipped_records_per_file() {
+        // Several malformed lines in one log file plus one valid record:
+        // recovery loads the valid one and counts every skipped record so
+        // the read loop can emit ONE aggregated `warn!` per file (guarded
+        // by `skipped > 0`) rather than one line per record per rescan.
+        // Asserting on the surfaced count is deterministic regardless of
+        // the process-global tracing max-level filter.
+        let temp = tempfile::tempdir().expect("tempdir");
+        let session_id = SessionKey("local:agg-diff-skip".into());
+        let valid_id = PreviewId::new();
+
+        {
+            let store = PendingDiffPreviewStore::with_config(DiffPreviewConfig::durable(
+                temp.path().into(),
+            ));
+            store.insert_with_snapshot(sample_preview(&session_id, valid_id.clone()), None);
+        }
+
+        let session_dir = temp
+            .path()
+            .join("ui-protocol")
+            .join(encode_session_dir_name(&session_id));
+        let log_files = list_log_files(&session_dir).expect("list logs");
+        let log_path = log_files.first().expect("log file").clone();
+        {
+            let mut f = OpenOptions::new()
+                .append(true)
+                .open(&log_path)
+                .expect("open log for append");
+            f.write_all(b"not json at all\n").expect("junk 1");
+            f.write_all(b"{\"v\":1}\n").expect("junk 2"); // missing fields
+            f.write_all(b"another bad line\n").expect("junk 3");
+        }
+
+        let outcome =
+            PendingDiffPreviewStore::recover(DiffPreviewConfig::durable(temp.path().into()));
+        assert_eq!(outcome.entries_recovered, 1, "the valid record is loaded");
+        let m = outcome.store.metrics();
+        assert_eq!(
+            m.recovery_records_skipped, 3,
+            "all 3 malformed records counted (aggregated into one per-file warn)"
+        );
     }
 
     #[test]

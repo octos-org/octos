@@ -66,6 +66,7 @@ fn test_init_help() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("Initialize"));
     assert!(stdout.contains("--defaults"));
+    assert!(stdout.contains("--force"));
 }
 
 #[test]
@@ -205,6 +206,58 @@ fn test_init_defaults_uses_octos_home_when_cwd_not_provided() {
     let content = std::fs::read_to_string(&home_config).unwrap();
     assert!(content.contains("openai"));
     assert!(content.contains("gpt-4.1-mini"));
+}
+
+#[test]
+fn test_init_defaults_refuses_to_overwrite_existing_config() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let octos_dir = temp_dir.path().join(".octos");
+    std::fs::create_dir_all(&octos_dir).unwrap();
+    let config_path = octos_dir.join("config.json");
+    let original = r#"{"provider":"sentinel","model":"keep-me"}"#;
+    std::fs::write(&config_path, original).unwrap();
+
+    let mut cmd = Command::new(octos_binary());
+    clear_provider_env(&mut cmd);
+    let output = cmd
+        .env("OPENAI_API_KEY", "test-openai-key")
+        .args(["init", "--defaults", "--cwd"])
+        .arg(temp_dir.path())
+        .output()
+        .expect("Failed to execute command");
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("Config already exists"));
+    assert_eq!(std::fs::read_to_string(&config_path).unwrap(), original);
+}
+
+#[test]
+fn test_init_defaults_force_overwrites_existing_config() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let octos_dir = temp_dir.path().join(".octos");
+    std::fs::create_dir_all(&octos_dir).unwrap();
+    let config_path = octos_dir.join("config.json");
+    std::fs::write(
+        &config_path,
+        r#"{"provider":"sentinel","model":"replace-me"}"#,
+    )
+    .unwrap();
+
+    let mut cmd = Command::new(octos_binary());
+    clear_provider_env(&mut cmd);
+    let output = cmd
+        .env("OPENAI_API_KEY", "test-openai-key")
+        .args(["init", "--defaults", "--force", "--cwd"])
+        .arg(temp_dir.path())
+        .output()
+        .expect("Failed to execute command");
+
+    assert!(output.status.success());
+    let content = std::fs::read_to_string(&config_path).unwrap();
+    assert!(content.contains("openai"));
+    assert!(content.contains("gpt-4.1-mini"));
+    assert!(!content.contains("sentinel"));
 }
 
 #[test]

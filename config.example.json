@@ -1,7 +1,26 @@
 {
   "provider": "anthropic",
   "model": "claude-sonnet-4-20250514",
-
+  "memory": {
+    "max_inject_tokens": 2500,
+    "refresh": {
+      "enabled": true,
+      "extract_model": null,
+      "min_idle_minutes": 30,
+      "max_session_age_days": 10,
+      "max_sessions_per_pass": 2,
+      "max_extractions_per_day": 20,
+      "max_daily_tokens": 200000,
+      "consolidate_interval_minutes": 30,
+      "max_extract_input_tokens": 24000,
+      "consolidate_model": null,
+      "max_consolidations_per_day": 12,
+      "debounce_seconds": 90,
+      "unused_days": 30,
+      "max_memory_file_tokens": 8000,
+      "pending_confirm_days": 7
+    }
+  },
   "sub_providers": [
     {
       "key": "cheap",
@@ -21,17 +40,18 @@
     {
       "key": "deepseek",
       "provider": "deepseek",
-      "model": "deepseek-chat",
+      "model": "deepseek-v4-pro",
       "api_key_env": "DEEPSEEK_API_KEY",
-      "description": "Cost-effective coding model. Good for code generation and technical tasks.",
-      "default_context_window": 32000
+      "description": "DeepSeek V4 Pro. Strong general-purpose model for code generation and technical tasks.",
+      "default_context_window": 1048576
     },
     {
-      "key": "reasoner",
+      "key": "deepseek-flash",
       "provider": "deepseek",
-      "model": "deepseek-reasoner",
+      "model": "deepseek-v4-flash",
       "api_key_env": "DEEPSEEK_API_KEY",
-      "description": "Deep reasoning model (chain-of-thought). Use for math, logic, and complex analysis."
+      "description": "DeepSeek V4 Flash. Fast, low-cost variant for high-throughput coding and chat.",
+      "default_context_window": 1048576
     },
     {
       "key": "qwen",
@@ -56,11 +76,11 @@
       "description": "Llama 3.3 70B via NVIDIA NIM. Strong open-source model for general tasks."
     },
     {
-      "key": "nvidia-deepseek-r1",
+      "key": "nvidia-deepseek-v4",
       "provider": "nvidia",
-      "model": "deepseek-ai/deepseek-r1",
+      "model": "deepseek-ai/deepseek-v4-pro",
       "api_key_env": "NVIDIA_API_KEY",
-      "description": "DeepSeek R1 via NVIDIA NIM. State-of-the-art reasoning for math and coding."
+      "description": "DeepSeek V4 Pro via NVIDIA NIM. State-of-the-art reasoning for math and coding."
     },
     {
       "key": "nvidia-qwen-coder",
@@ -86,9 +106,10 @@
     {
       "key": "minimax",
       "provider": "minimax",
-      "model": "MiniMax-M1",
+      "model": "MiniMax-M3",
       "api_key_env": "MINIMAX_API_KEY",
-      "description": "MiniMax M1 reasoning model. Strong at math, coding, and multi-step reasoning with extended thinking."
+      "description": "MiniMax M3. 1M-context multimodal model, strong at math, coding, and agentic tasks.",
+      "default_context_window": 1048576
     },
     {
       "key": "glm",

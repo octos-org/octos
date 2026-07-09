@@ -55,6 +55,14 @@ hound = { workspace = true }
 symphonia = { workspace = true, optional = true }
 
 [features]
+# `browser` is ON by default: it gates the headless-Chrome (CDP) search
+# provider that `web_search` uses as a last-resort fallback (after every HTTP
+# provider yields nothing). The underlying `chromiumoxide` dependency and the
+# `browser` tool itself are always compiled; this feature only toggles the new
+# CDP-backed `web_search` fallback so `--no-default-features` builds keep the
+# pre-existing HTTP-only `web_search` behaviour byte-for-byte.
+default = ["browser"]
+browser = []
 git = ["dep:gix", "dep:similar"]
 ast = ["dep:tree-sitter", "dep:tree-sitter-rust", "dep:tree-sitter-python", "dep:tree-sitter-javascript", "dep:tree-sitter-typescript"]
 # Enable MP3 decoding for the `AudioNonSilent` workspace-policy validator.

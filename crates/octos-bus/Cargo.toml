@@ -11,6 +11,7 @@ default = []
 api = ["axum"]
 telegram = ["teloxide"]
 discord = ["serenity"]
+dingtalk = ["axum"]
 slack = ["tokio-tungstenite"]
 whatsapp = ["tokio-tungstenite"]
 feishu = ["tokio-tungstenite", "axum", "rustls", "rustls-native-certs"]
@@ -65,6 +66,7 @@ mailparse = { workspace = true, optional = true }
 workspace = true
 
 [dev-dependencies]
+axum = { workspace = true }
 tokio-test = { workspace = true }
 tempfile = { workspace = true }
 tower = { workspace = true }

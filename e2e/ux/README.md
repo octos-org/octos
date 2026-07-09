@@ -139,10 +139,12 @@ The command:
 | `blocked`      | A required capability is not advertised in `e2e/matrix/ux-capabilities.json` |
 | `runnable`     | All gates green                                            |
 
-The capability gate file `e2e/matrix/ux-capabilities.json` is optional in
-M19-A — if absent, every scenario with capability requirements is `blocked`.
-That file is populated by `#1066` once the validator registry can derive the
-real AppUI capability advertisement.
+The capability gate file `e2e/matrix/ux-capabilities.json` records the
+provider-free M19 capabilities that have validated real-tmux evidence. If the
+file is absent, every scenario with capability requirements is `blocked`.
+Scenarios that still require unproven backend or harness behavior should keep
+their capabilities out of that file so `ux:scenario:list` reports an explicit
+blocked reason instead of marking them runnable too early.
 
 ## Adding a new scenario
 

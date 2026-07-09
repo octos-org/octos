@@ -339,6 +339,7 @@ impl Channel for SlackChannel {
                         }
                     }),
                     message_id: None,
+                    origin: octos_core::MessageOrigin::ExternalUser,
                 };
 
                 if inbound_tx.send(inbound).await.is_err() {

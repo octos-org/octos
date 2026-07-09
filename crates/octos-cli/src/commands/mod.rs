@@ -1,6 +1,7 @@
 //! CLI commands for octos.
 
 mod account;
+mod acp;
 mod admin;
 mod auth;
 mod channels;
@@ -9,14 +10,17 @@ mod clean;
 mod completions;
 mod cron;
 mod docs;
+mod doctor;
 pub mod gateway;
 mod init;
 pub mod mcp_serve;
+mod memory;
 mod office;
 #[cfg(feature = "api")]
 mod serve;
 pub mod skills;
 mod status;
+mod update;
 
 use std::path::PathBuf;
 
@@ -24,6 +28,13 @@ use clap::{Parser, Subcommand};
 use eyre::Result;
 
 pub use account::AccountCommand;
+pub use acp::AcpCommand;
+// Test-support seam for the `octos acp` bridge: the end-to-end integration test
+// in `crates/octos-cli/tests/acp_integration.rs` drives the real ACP handler
+// wiring with a `MockLlm`-backed agent over an in-process transport. Hidden
+// from docs; not part of the stable surface.
+#[doc(hidden)]
+pub use acp::{OctosAcpAgentTransport, TestAgentFactory};
 pub use admin::AdminCommand;
 pub use auth::AuthCommand;
 pub use channels::ChannelsCommand;
@@ -32,14 +43,17 @@ pub use clean::CleanCommand;
 pub use completions::CompletionsCommand;
 pub use cron::CronCommand;
 pub use docs::DocsCommand;
+pub use doctor::DoctorCommand;
 pub use gateway::GatewayCommand;
 pub use init::InitCommand;
 pub use mcp_serve::McpServeCommand;
+pub use memory::MemoryCommand;
 pub use office::OfficeCommand;
 #[cfg(feature = "api")]
 pub use serve::ServeCommand;
 pub use skills::SkillsCommand;
 pub use status::StatusCommand;
+pub use update::UpdateCommand;
 
 /// octos: Rust-native coding agent orchestration.
 #[derive(Debug, Parser)]
@@ -77,6 +91,8 @@ fn version_string() -> &'static str {
 pub enum Command {
     /// Manage sub-accounts under profiles.
     Account(AccountCommand),
+    /// Run as an Agent Client Protocol (ACP) agent over stdio (Zed, etc.).
+    Acp(AcpCommand),
     /// Admin commands for tenant and tunnel management.
     Admin(AdminCommand),
     /// Manage authentication for LLM providers.
@@ -87,10 +103,14 @@ pub enum Command {
     Chat(ChatCommand),
     /// Manage scheduled cron jobs.
     Cron(CronCommand),
+    /// Run local environment diagnostics (flutter-doctor style).
+    Doctor(DoctorCommand),
     /// Generate documentation for tools and providers.
     Docs(DocsCommand),
     /// Initialize a new .octos configuration.
     Init(InitCommand),
+    /// Inspect and drive the memory-refresh pipeline.
+    Memory(MemoryCommand),
     /// Run as an MCP server so outer orchestrators can invoke octos as a sub-agent.
     McpServe(McpServeCommand),
     /// Start the REST API server (requires --features api).
@@ -100,6 +120,8 @@ pub enum Command {
     Skills(SkillsCommand),
     /// Show system status.
     Status(StatusCommand),
+    /// Check for a newer octos release (`--check`); self-update is Stage 3.
+    Update(UpdateCommand),
     /// Run as a persistent messaging gateway.
     Gateway(GatewayCommand),
     /// Clean up stale state and cache files.
@@ -118,18 +140,28 @@ pub trait Executable {
 /// Resolve the data directory for episodes, memory, sessions, etc.
 ///
 /// Priority: `--data-dir` CLI flag > `OCTOS_HOME` env var > `~/.octos` default.
+/// Delegates to the canonical [`resolve_config_context`] so the `data_dir`
+/// computation (including empty-string env handling) never diverges from
+/// config/auth resolution.
 pub fn resolve_data_dir(cli_override: Option<PathBuf>) -> eyre::Result<PathBuf> {
-    let dir = if let Some(d) = cli_override {
-        d
-    } else if let Ok(env_dir) = std::env::var("OCTOS_HOME") {
-        PathBuf::from(env_dir)
-    } else {
-        dirs::home_dir()
-            .ok_or_else(|| eyre::eyre!("cannot determine home directory"))?
-            .join(".octos")
-    };
-    std::fs::create_dir_all(&dir).ok();
-    Ok(dir)
+    let ctx = crate::config_context::resolve_config_context(cli_override.as_deref());
+    std::fs::create_dir_all(&ctx.data_dir).ok();
+    Ok(ctx.data_dir)
+}
+
+/// Resolve the canonical [`ConfigContext`](crate::config_context::ConfigContext)
+/// for a command, create the data dir, and run the (idempotent, best-effort)
+/// config + auth migrations exactly once.
+///
+/// Every command that loads config should go through this so the resolver runs
+/// at a single shared entrypoint per invocation.
+pub fn resolve_command_context(
+    cli_override: Option<PathBuf>,
+) -> eyre::Result<crate::config_context::ConfigContext> {
+    let ctx = crate::config_context::resolve_config_context(cli_override.as_deref());
+    std::fs::create_dir_all(&ctx.data_dir).ok();
+    crate::config_context::run_migrations(&ctx);
+    Ok(ctx)
 }
 
 /// Load a prompt from `~/.octos/prompts/{name}.md` at runtime.
@@ -281,11 +313,13 @@ impl Executable for Command {
     fn execute(self) -> Result<()> {
         match self {
             Self::Account(cmd) => cmd.execute(),
+            Self::Acp(cmd) => cmd.execute(),
             Self::Admin(cmd) => cmd.execute(),
             Self::Auth(cmd) => cmd.execute(),
             Self::Channels(cmd) => cmd.execute(),
             Self::Chat(cmd) => cmd.execute(),
             Self::Cron(cmd) => cmd.execute(),
+            Self::Doctor(cmd) => cmd.execute(),
             Self::Docs(cmd) => cmd.execute(),
             Self::Init(cmd) => cmd.execute(),
             Self::McpServe(cmd) => cmd.execute(),
@@ -293,8 +327,10 @@ impl Executable for Command {
             Self::Serve(cmd) => cmd.execute(),
             Self::Skills(cmd) => cmd.execute(),
             Self::Status(cmd) => cmd.execute(),
+            Self::Update(cmd) => cmd.execute(),
             Self::Gateway(cmd) => cmd.execute(),
             Self::Clean(cmd) => cmd.execute(),
+            Self::Memory(cmd) => cmd.execute(),
             Self::Completions(cmd) => cmd.execute(),
             Self::Office(cmd) => cmd.execute(),
         }
