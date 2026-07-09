@@ -27,6 +27,7 @@ pub mod preview_tokens;
 pub mod purge;
 mod router;
 pub(crate) mod session_ingress;
+pub(crate) mod skill_action_jobs;
 pub(crate) mod solo_auth;
 pub(crate) mod specialist_runner;
 mod static_files;
