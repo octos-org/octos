@@ -2975,10 +2975,29 @@ mod tests {
     }
 
     #[test]
+    #[allow(unsafe_code)]
     fn default_name_override_ignores_top_level_api_key_env() {
         // Mixed-provider config: primary provider pins the top-level
         // api_key_env to ITS key; the embedding override naming the
         // embedding provider's default var must still read THAT var.
+        // Auth-home isolated (codex R5): the default-name path consults
+        // the GLOBAL auth store first, so an ambient `octos auth login
+        // -p openai` on a dev/CI machine would shadow the env_vars
+        // assertion nondeterministically.
+        let _g = HOME_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let original_home = std::env::var_os("HOME");
+        let original_octos_home = std::env::var_os("OCTOS_HOME");
+        let original_octos_config = std::env::var_os("OCTOS_CONFIG_DIR");
+        let original_xdg = std::env::var_os("XDG_CONFIG_HOME");
+        // SAFETY: serialized by HOME_ENV_LOCK; restored below.
+        unsafe {
+            std::env::set_var("HOME", tmp.path());
+            std::env::remove_var("OCTOS_HOME");
+            std::env::remove_var("OCTOS_CONFIG_DIR");
+            std::env::remove_var("XDG_CONFIG_HOME");
+        }
+
         let mut config = Config::default();
         config.api_key_env = Some("ANTHROPIC_API_KEY".to_string());
         config
@@ -2987,11 +3006,31 @@ mod tests {
         config
             .env_vars
             .insert("OPENAI_API_KEY".to_string(), "openai-key".to_string());
-        let key = config
-            .get_api_key_with_env("openai", Some("OPENAI_API_KEY"))
-            .expect("resolves");
+        let key = config.get_api_key_with_env("openai", Some("OPENAI_API_KEY"));
+
+        // SAFETY: still inside HOME_ENV_LOCK.
+        unsafe {
+            match original_home {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+            match original_octos_home {
+                Some(v) => std::env::set_var("OCTOS_HOME", v),
+                None => std::env::remove_var("OCTOS_HOME"),
+            }
+            match original_octos_config {
+                Some(v) => std::env::set_var("OCTOS_CONFIG_DIR", v),
+                None => std::env::remove_var("OCTOS_CONFIG_DIR"),
+            }
+            match original_xdg {
+                Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
+                None => std::env::remove_var("XDG_CONFIG_HOME"),
+            }
+        }
+
         assert_eq!(
-            key, "openai-key",
+            key.expect("resolves"),
+            "openai-key",
             "must not read the primary provider's var"
         );
     }
