@@ -699,6 +699,12 @@ fn sanitize_schema_recursive(value: &mut serde_json::Value, depth: usize) {
             }
         }
 
+        if obj.get("enum").and_then(|v| v.as_array()).is_some_and(|values| {
+            values.iter().any(|value| !value.is_string())
+        }) {
+            obj.remove("enum");
+        }
+
         // Recurse into nested objects
         let keys: Vec<String> = obj.keys().cloned().collect();
         for key in keys {
@@ -1039,6 +1045,36 @@ mod tests {
         });
         sanitize_schema_for_gemini(&mut schema);
         assert_eq!(schema["items"]["type"], "integer");
+    }
+
+    #[test]
+    fn test_sanitize_removes_non_string_enum_values() {
+        let mut schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "video_duration_seconds": {
+                    "type": "integer",
+                    "enum": [4, 6, 8],
+                    "default": 8
+                },
+                "aspect_ratio": {
+                    "type": "string",
+                    "enum": ["16:9", "9:16"]
+                }
+            }
+        });
+
+        sanitize_schema_for_gemini(&mut schema);
+
+        assert!(
+            schema["properties"]["video_duration_seconds"]
+                .get("enum")
+                .is_none()
+        );
+        assert_eq!(
+            schema["properties"]["aspect_ratio"]["enum"],
+            serde_json::json!(["16:9", "9:16"])
+        );
     }
 
     #[test]
