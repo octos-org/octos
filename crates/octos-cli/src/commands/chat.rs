@@ -1081,8 +1081,12 @@ pub(crate) fn create_embedder(config: &Config) -> Option<Arc<dyn EmbeddingProvid
         // families we can't classify, warn loudly instead of degrading
         // silently — the native size is unknown and non-1536 vectors are
         // dropped to BM25-only.
+        // Exactly the families verified to accept `dimensions: 1536`:
+        // OpenAI 3-series (native 1536/3072, truncation supported) and
+        // DashScope text-embedding-v4 (64–2048, verified live). v3 caps
+        // below 1536 and would error — it falls to the warn path.
         let supports_dimensions =
-            model.starts_with("text-embedding-3") || model.starts_with("text-embedding-v");
+            model.starts_with("text-embedding-3") || model == "text-embedding-v4";
         if supports_dimensions {
             tracing::info!(
                 model = %e.model(),
