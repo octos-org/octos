@@ -1182,7 +1182,7 @@ JSON 持久化位于 `.octos/cron.json`。
 - **配置/profile**：`profile/llm/*`、`profile/skills/*`、`permission/profile/*`、`content/list`、`config/capabilities/list`。
 - **通知**（服务器→客户端）：`message/delta`、`message/persisted`、`tool/*`、`turn/spawn_complete`、`session/goal/updated`、`loop/fired`、`context/compaction_started` 等。
 
-许多方法/通知由一个**协商的能力标志**（约 22 个 `*.v1` token，如 `coding.goal_runtime.v1`、`harness.task_control.v1`、`auxiliary.rest_to_ws.v1`）门控；客户端在连接时通过 `ui_feature`/`X-Octos-Ui-Features` 声明。**不**发送任何特性头的连接会获得旧版首个服务器能力切片——这些方法仍可调用（向后兼容）。只有当客户端**确实**声明了某个特性集但省略了某个具体标志时，门控才生效，被省略的方法返回 `method_not_supported`。核心方法（聊天/轮次）始终可用；受标志门控的是自主运行、任务产物与辅助方法组。
+许多方法/通知由一个**协商的能力标志**（约 22 个 `*.v1` token，如 `coding.goal_runtime.v1`、`harness.task_control.v1`、`auxiliary.rest_to_ws.v1`）门控；客户端在连接时通过 `ui_feature`/`X-Octos-Ui-Features` 声明。**不**发送任何特性头的连接会获得旧版首个服务器能力切片，因此*旧版门控*的分组（任务控制、自主运行）为向后兼容仍可调用。有两组是**严格按需（strict opt-in）**、从不进入无头切片、始终需要各自标志：13 个 `auxiliary.rest_to_ws.v1` 方法（`session/list`、`content/list`、`session/snapshot` 等）与 `user_question/respond`。当客户端声明了某个特性集但省略了必需标志时，被省略的方法返回 `method_not_supported`。核心的聊天/轮次方法始终可用。
 
 **认证**：可选的 bearer token，常量时间比较（仅 API 路由；`/metrics` 和静态文件为公开）。**CORS**：localhost 开发源加已配置的 base domain。**最大消息**：1MB。
 

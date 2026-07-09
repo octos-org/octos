@@ -507,19 +507,19 @@ Shell 命令在沙箱中运行以实现隔离。支持三种后端：
 
 ### 循环（Loops）
 
-**循环**是周期性的 agent 运行。循环分为**固定间隔**（每 N 秒触发）或**自定步调**——模型通过发出 `<<loop-next-in: …>>` 提示自行决定下次节奏（未指定时默认 15 分钟）。循环持续触发，直到被暂停、删除或达到触发上限（10,000 次）。
+**循环**是周期性的 agent 运行，有三种模式：**固定间隔**（每 N 秒触发）、**自定步调**（模型通过发出 `<<loop-next-in: …>>` 提示自行决定下次节奏；未指定时默认 15 分钟）或**维护**（内置的维护提示）。循环持续触发，直到被暂停、删除、达到 10,000 次触发上限——**或到期**：每个循环都会被打上 `expires_at_ms = now + 7 天`，一旦过期，即使未达触发上限，到期扫描也会跳过它。
 
-- 协议：`loop/create`、`loop/list`、`loop/pause`、`loop/resume`、`loop/delete`、`loop/fire_now`（立即触发一次）——通知 `loop/fired`、`loop/completed`、`loop/updated`。特性标志：必须**同时**协商 `coding.autonomy.v1` **和** `coding.loop_runtime.v1`。
+- 协议：`loop/create`、`loop/list`、`loop/pause`、`loop/resume`、`loop/delete`、`loop/fire_now`（**请求**立即触发——它会经过循环的触发策略，若循环已暂停/耗尽可能被拒绝或去重，因此应检查返回的 `fire.queued`/错误结果，而非假定一定触发了一次）——通知 `loop/fired`、`loop/completed`、`loop/updated`。特性标志：必须**同时**协商 `coding.autonomy.v1` **和** `coding.loop_runtime.v1`。
 - 适用于轮询、监控和自定步调的后台 agent。
 
 ### 回退（Rewind）
 
-`session/rollback` 将会话回退到较早的点（丢弃最近 N 个用户轮次），`session/snapshot` 捕获当前会话状态（文件、任务、状态）。这支撑了客户端的「回退」/检查点 UI。
+`session/rollback` 将**对话**回退到较早的点——它追加一个回退标记，并通过丢弃最近 N 个用户轮次来重建聊天/上下文历史。它**不会**回滚工作区文件或任务状态。`session/snapshot` 是当前状态、文件与任务的**只读**聚合——是一个视图，而非可恢复的检查点。二者仅在对话层面支撑客户端的「回退」UI。
 
 ### 任务与轮次控制
 
 - **后台任务**（派生工作、深度搜索、流水线）可被列出、取消与重启：`task/list`、`task/cancel`、`task/restart_from_node`，输出/产物通过 `task/output/read`、`task/artifact/list`。也可经 REST 的 `POST /api/tasks/{id}/cancel` 与 `/restart-from-node` 触达。
-- **运行中的轮次**可用 `turn/interrupt` 中途打断（取消进行中的 LLM 调用与工具，并持久化部分轮次）。`turn/start` 与 `turn/interrupt` **不**受能力门控——始终可用。而独立的**子 agent** 控制（`agent/list`、`agent/status/read`、`agent/interrupt`、`agent/close`）与任务产物（`task/artifact/list|read`）需要 `coding.autonomy.v1` + `coding.agent_control.v1`。
+- **运行中的轮次**可用 `turn/interrupt` 中途打断（中止进行中的 LLM 调用与工具）。只有生命周期状态（如 `turn/error`）会被持久化——**部分助手内容不会被提交**，因此重连的客户端无法恢复未完成的回复。`turn/start` 与 `turn/interrupt` **不**受能力门控——始终可用。而独立的**子 agent** 控制（`agent/list`、`agent/status/read`、`agent/interrupt`、`agent/close`）与任务产物（`task/artifact/list|read`）需要 `coding.autonomy.v1` + `coding.agent_control.v1`。
 
 ### 能力协商
 

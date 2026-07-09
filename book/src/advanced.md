@@ -507,19 +507,19 @@ A **goal** is a persistent objective attached to a session. Once set, the agent 
 
 ### Loops
 
-A **loop** is a recurring agent run. Loops are either **fixed-interval** (fire every N seconds) or **self-paced** — the model decides its own next cadence by emitting a `<<loop-next-in: …>>` hint (default 15 minutes when it doesn't). A loop keeps firing until paused, deleted, or the fire cap (10,000) is reached.
+A **loop** is a recurring agent run, in one of three modes: **fixed-interval** (fire every N seconds), **self-paced** (the model sets its own next cadence by emitting a `<<loop-next-in: …>>` hint; default 15 minutes when it doesn't), or **maintenance** (a built-in upkeep prompt). A loop keeps firing until paused, deleted, the 10,000-fire cap — **or its 7-day expiry**: every loop is stamped with `expires_at_ms = now + 7 days` and the due-scan skips it once expired, even below the fire cap.
 
-- Protocol: `loop/create`, `loop/list`, `loop/pause`, `loop/resume`, `loop/delete`, `loop/fire_now` (fire once immediately) — notifications `loop/fired`, `loop/completed`, `loop/updated`. Feature flags: **both** `coding.autonomy.v1` **and** `coding.loop_runtime.v1`.
+- Protocol: `loop/create`, `loop/list`, `loop/pause`, `loop/resume`, `loop/delete`, `loop/fire_now` (**request** an immediate fire — it runs through the loop's fire policy and can be rejected if the loop is paused/exhausted or deduplicated, so inspect the returned `fire.queued`/error result rather than assuming a run happened). Notifications `loop/fired`, `loop/completed`, `loop/updated`. Feature flags: **both** `coding.autonomy.v1` **and** `coding.loop_runtime.v1`.
 - Use it for polling, monitoring, and self-paced background agents.
 
 ### Rewind
 
-`session/rollback` rewinds a session to an earlier point (dropping the last N user turns), and `session/snapshot` captures the current session state (files, tasks, status). This backs the "rewind" / checkpoint UI in the clients.
+`session/rollback` rewinds the **conversation** to an earlier point — it appends a rollback marker and rebuilds the chat/context history by dropping the last N user turns. It does **not** revert workspace files or task state. `session/snapshot` is a **read-only** aggregation of the current status, files, and tasks — a view, not a restorable checkpoint. Together they back the clients' "rewind" UI at the conversation level only.
 
 ### Task & turn control
 
 - **Background tasks** (spawned work, deep-search, pipelines) can be listed, cancelled, and restarted: `task/list`, `task/cancel`, `task/restart_from_node`, with output/artifacts via `task/output/read` and `task/artifact/list`. Also reachable over REST at `POST /api/tasks/{id}/cancel` and `/restart-from-node`.
-- **A running turn** can be interrupted mid-flight with `turn/interrupt` (the in-flight LLM call and tools are cancelled and the partial turn is persisted). `turn/start` and `turn/interrupt` are **not** capability-gated — they're always available. The separate **sub-agent** controls (`agent/list`, `agent/status/read`, `agent/interrupt`, `agent/close`) and task artifacts (`task/artifact/list|read`) require `coding.autonomy.v1` + `coding.agent_control.v1`.
+- **A running turn** can be interrupted mid-flight with `turn/interrupt` (the in-flight LLM call and tools are aborted). Only lifecycle state (e.g. a `turn/error`) is persisted — **partial assistant content is not committed**, so a reconnecting client cannot recover the half-finished reply. `turn/start` and `turn/interrupt` are **not** capability-gated — they're always available. The separate **sub-agent** controls (`agent/list`, `agent/status/read`, `agent/interrupt`, `agent/close`) and task artifacts (`task/artifact/list|read`) require `coding.autonomy.v1` + `coding.agent_control.v1`.
 
 ### Capability negotiation
 
@@ -532,7 +532,7 @@ A client advertises which protocol features it supports when it connects (the `u
 | `coding.loop_runtime.v1` | Loops (`loop/*`) — needs `coding.autonomy.v1` too |
 | `coding.agent_control.v1` | Sub-agent controls (`agent/*`) and task artifacts (`task/artifact/*`) — needs `coding.autonomy.v1` too |
 | `harness.task_control.v1` | Task list/cancel/restart |
-| `harness.task_artifacts.v1` | Task artifacts |
+| `harness.task_artifacts.v1` | Advertises `task/artifact/*`, but the dispatcher also requires `coding.autonomy.v1` + `coding.agent_control.v1` to actually call them |
 | `state.session_hydrate.v1` | `session/hydrate` resume |
 | `state.thread_graph.v1` | Thread/turn graph |
 | `context.lifecycle.v1` | Context-compaction events |
