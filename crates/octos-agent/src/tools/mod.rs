@@ -575,7 +575,7 @@ pub trait Tool: Send + Sync {
         Ok(())
     }
 
-    /// Downcast support for concrete tool access (e.g. wiring ActivateToolsTool).
+    /// Downcast support for concrete tool access (e.g. mofa-make dispatcher wiring).
     fn as_any(&self) -> &dyn std::any::Any {
         // Default: no downcasting. Override in tools that need it.
         &()

@@ -582,9 +582,8 @@ impl Agent {
     /// can look up the forwarding target by name.
     ///
     /// Idempotent and silent on agents whose registry has no mofa-*
-    /// skills (no dispatcher registered → no-op). Hosts that call
-    /// `wire_activate_tools` after agent construction should call
-    /// this in the same site.
+    /// skills (no dispatcher registered → no-op). Hosts should call
+    /// this after agent construction.
     pub fn wire_mofa_make_dispatcher(&self) {
         crate::plugins::PluginLoader::wire_mofa_make_registry_back_ref(&self.tools);
     }
