@@ -548,14 +548,21 @@ async fn should_block_shell_write_outside_workspace_via_sandbox() {
         );
         return;
     }
+    let workspace = TempDir::new().unwrap();
+    let ws_path = workspace.path().to_path_buf();
+
     // The backend binary exists, but on some hosts it is present yet unusable
     // (`sandbox-exec` denied, `bwrap` without user namespaces, Docker with no
     // daemon). Trusting the wrapper name alone would let the test proceed and
     // then fail its own positive control. Actually run a harmless command
-    // through the wrapper; if it can't execute, OS confinement can't be
-    // exercised here, so skip rather than fail.
+    // through the wrapper — using the SAME absolute workspace the real run
+    // uses: bwrap binds the cwd (`--bind <cwd> <cwd> --chdir <cwd>`), and a
+    // relative "." would bind at the sandbox root and hide `/bin`, failing the
+    // probe (and silently skipping this regression) on an otherwise-working
+    // Linux backend. If it can't execute, OS confinement can't be exercised
+    // here, so skip rather than fail.
     let probe_ok = sandbox
-        .wrap_command("true", std::path::Path::new("."))
+        .wrap_command("true", &ws_path)
         .status()
         .await
         .map(|status| status.success())
@@ -567,9 +574,6 @@ async fn should_block_shell_write_outside_workspace_via_sandbox() {
         );
         return;
     }
-
-    let workspace = TempDir::new().unwrap();
-    let ws_path = workspace.path().to_path_buf();
     // A sibling temp dir that is NOT under the workspace cwd. The sandbox
     // allows writes only under cwd, so a write here must be denied.
     let escape_dir = TempDir::new().unwrap();

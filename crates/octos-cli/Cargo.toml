@@ -85,7 +85,7 @@ argon2 = { workspace = true }
 tar = { workspace = true }
 # Optional deps gated by feature flags (api, admin-bot)
 axum = { workspace = true, optional = true }
-tower-http = { workspace = true, optional = true, features = ["limit"] }
+tower-http = { workspace = true, optional = true }
 # CancellationToken shared with the rmcp streamable-HTTP service so Ctrl+C tears
 # down live SSE sessions instead of blocking graceful shutdown.
 tokio-util = { version = "0.7", optional = true }

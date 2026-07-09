@@ -31,6 +31,7 @@
 //! 6. Zero new `unsafe`.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use eyre::Result;
@@ -62,6 +63,15 @@ pub const RUN_OCTOS_SESSION_TOOL: &str = "run_octos_session";
 
 /// Environment variable name that the HTTP transport reads for its bearer token.
 pub const OCTOS_MCP_SERVER_TOKEN_ENV: &str = "OCTOS_MCP_SERVER_TOKEN";
+
+/// Idle keep-alive for HTTP Streamable sessions. rmcp's 300s default reaps a
+/// session mid-call for a long synchronous `run_octos_session` (which emits no
+/// intermediate protocol traffic to reset the timer); this widens it to a bound
+/// comfortably above a realistic session (the dispatch caps at 20 agent
+/// iterations) while still finite, so a session a client abandons without a
+/// `DELETE` is reaped instead of leaked. Deployments needing longer single
+/// calls can raise this.
+const HTTP_SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(4 * 60 * 60);
 
 /// Typed error kinds surfaced by the session-level dispatch flow.
 #[derive(Debug, Clone)]
@@ -218,12 +228,14 @@ impl McpServer {
     /// long-lived SSE connections instead of hanging until they idle out. The
     /// caller must cancel it in its shutdown path.
     ///
-    /// The session manager's idle keep-alive is disabled: `run_octos_session` is
-    /// a single long-running synchronous tool call that emits no intermediate
-    /// MCP traffic, so rmcp's default 300s idle timer would reap the session
-    /// mid-call and drop the result before the client received it. Sessions are
-    /// instead torn down by the returned token on shutdown (and a client
-    /// disconnect cancels its own in-flight request).
+    /// The session manager's idle keep-alive is widened from rmcp's 300s default
+    /// to [`HTTP_SESSION_IDLE_TIMEOUT`]: `run_octos_session` is a single
+    /// long-running synchronous tool call that emits no intermediate MCP
+    /// traffic, so the 300s timer would reap the session mid-call and drop the
+    /// result before the client received it. The timer stays finite (not
+    /// disabled) so a session a client abandoned without a `DELETE` is still
+    /// reaped rather than leaked; the returned token additionally tears every
+    /// session down on shutdown.
     pub fn streamable_http_service(
         self,
         allow_non_loopback: bool,
@@ -242,10 +254,11 @@ impl McpServer {
             config = config.disable_allowed_hosts();
         }
 
-        // Disable idle reaping (see the doc comment): a long tool call is not a
-        // dead session.
+        // A long tool call is not a dead session, but a fully-disabled timer
+        // leaks abandoned sessions — so widen it to a finite bound instead of
+        // clearing it (see the doc comment).
         let mut session_manager = LocalSessionManager::default();
-        session_manager.session_config.keep_alive = None;
+        session_manager.session_config.keep_alive = Some(HTTP_SESSION_IDLE_TIMEOUT);
 
         let service = StreamableHttpService::new(
             move || {

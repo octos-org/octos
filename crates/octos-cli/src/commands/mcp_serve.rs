@@ -168,9 +168,9 @@ impl McpServeCommand {
 }
 
 /// Maximum accepted HTTP request body for the MCP transport (1 MiB), restoring
-/// the explicit cap the hand-rolled endpoint enforced. The rmcp tower service
-/// otherwise buffers the whole body, so without this a bearer-holding client
-/// could exhaust memory with an arbitrarily large or chunked POST.
+/// the explicit cap the hand-rolled endpoint enforced. The auth middleware
+/// bounds every body before rmcp reads it, so a bearer-holding client cannot
+/// exhaust memory with a large or chunked POST.
 #[cfg(feature = "api")]
 const MAX_HTTP_BODY_BYTES: usize = 1_048_576;
 
@@ -188,41 +188,42 @@ fn mcp_http_router(
 ) -> (axum::Router, tokio_util::sync::CancellationToken) {
     use std::sync::Arc;
 
-    use axum::Router;
     use axum::extract::{Request, State};
     use axum::http::{StatusCode, header::AUTHORIZATION};
     use axum::middleware::{self, Next};
     use axum::response::{IntoResponse, Response};
-    use tower_http::limit::RequestBodyLimit;
+    use axum::{Router, body::Body};
 
-    /// Reject any request whose bearer token is missing or wrong before it
-    /// reaches the MCP service, using the same parser + constant-time compare
-    /// the hand-rolled transport used.
-    async fn bearer_gate(
-        State(token): State<Arc<String>>,
-        request: Request,
-        next: Next,
-    ) -> Response {
+    /// Single gate in front of the rmcp service: reject a missing/wrong bearer
+    /// token (401) before touching the body, then bound the body (413) before
+    /// rmcp reads it. Buffering the body here — rather than via a tower
+    /// body-limit layer — makes an over-limit *chunked* body (no
+    /// `Content-Length`) also surface as 413 instead of the 500 rmcp maps a
+    /// mid-read length-limit error to.
+    async fn gate(State(token): State<Arc<String>>, request: Request, next: Next) -> Response {
         let provided = request
             .headers()
             .get(AUTHORIZATION)
             .and_then(|value| value.to_str().ok());
-        match octos_agent::mcp_server::parse_bearer_token(provided) {
-            Some(candidate) if octos_agent::mcp_server::constant_time_eq(&candidate, &token) => {
-                next.run(request).await
+        let authorized = octos_agent::mcp_server::parse_bearer_token(provided)
+            .is_some_and(|candidate| octos_agent::mcp_server::constant_time_eq(&candidate, &token));
+        if !authorized {
+            return (StatusCode::UNAUTHORIZED, "authentication required").into_response();
+        }
+        let (parts, body) = request.into_parts();
+        match axum::body::to_bytes(body, MAX_HTTP_BODY_BYTES).await {
+            Ok(bytes) => {
+                next.run(Request::from_parts(parts, Body::from(bytes)))
+                    .await
             }
-            _ => (StatusCode::UNAUTHORIZED, "authentication required").into_response(),
+            Err(_) => (StatusCode::PAYLOAD_TOO_LARGE, "request body too large").into_response(),
         }
     }
 
     let (service, cancel) = server.streamable_http_service(allow_non_loopback);
-    // Bound the request body on the fallback service (inner) so rmcp never
-    // buffers an unbounded POST, and keep the bearer gate as the sole router
-    // layer (outermost) so unauthenticated requests are still rejected first.
-    let limited = RequestBodyLimit::new(service, MAX_HTTP_BODY_BYTES);
     let router = Router::new()
-        .fallback_service(limited)
-        .layer(middleware::from_fn_with_state(Arc::new(token), bearer_gate));
+        .fallback_service(service)
+        .layer(middleware::from_fn_with_state(Arc::new(token), gate));
     (router, cancel)
 }
 
