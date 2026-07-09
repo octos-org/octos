@@ -327,6 +327,11 @@ mod tests {
         assert!(!is_allowed_ws_endpoint(
             "wss://openspeech.bytedance.com.evil.example/api/v1/tts/ws_binary"
         ));
+        // Userinfo trick: the allowlisted name in the userinfo position must
+        // not fool the check — the parsed host is evil.example.
+        assert!(!is_allowed_ws_endpoint(
+            "wss://openspeech.bytedance.com@evil.example/api/v1/tts/ws_binary"
+        ));
     }
 
     #[test]
