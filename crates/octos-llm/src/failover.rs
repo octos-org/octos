@@ -182,7 +182,9 @@ impl ProviderChain {
                     let retryable = RetryProvider::should_failover(&e);
                     self.record_failure(idx);
 
-                    if retryable && offset + 1 < self.slots.len() {
+                    let fail_fast =
+                        crate::current_llm_call_policy() == crate::LlmCallPolicy::FailFast;
+                    if !fail_fast && retryable && offset + 1 < self.slots.len() {
                         warn!(
                             provider = slot.provider.provider_name(),
                             error = %e,
@@ -269,7 +271,9 @@ impl LlmProvider for ProviderChain {
                     let retryable = RetryProvider::should_failover(&e);
                     self.record_failure(idx);
 
-                    if retryable && offset + 1 < self.slots.len() {
+                    let fail_fast =
+                        crate::current_llm_call_policy() == crate::LlmCallPolicy::FailFast;
+                    if !fail_fast && retryable && offset + 1 < self.slots.len() {
                         warn!(
                             provider = slot.provider.provider_name(),
                             error = %e,
@@ -488,6 +492,102 @@ mod tests {
     #[should_panic(expected = "at least one provider")]
     fn test_empty_chain_panics() {
         let _ = ProviderChain::new(vec![]);
+    }
+
+    #[tokio::test]
+    async fn should_not_switch_lane_when_failfast() {
+        use crate::{LlmCallPolicy, with_llm_call_policy};
+
+        // Primary fails with a failover-eligible 500; secondary would succeed.
+        // Under FailFast the chain must return the primary error immediately
+        // without calling the secondary provider.
+        let secondary = SuccessProvider { name: "secondary" };
+        // We can't count calls on SuccessProvider directly, so we use a
+        // FailingProvider that would fail if called and check the error kind.
+        let chain = ProviderChain::new(vec![
+            Arc::new(FailingProvider {
+                name: "primary",
+                error: "P1 API error: 500 - server error",
+            }),
+            Arc::new(secondary),
+        ])
+        .with_max_request_duration(None);
+
+        let result = with_llm_call_policy(LlmCallPolicy::FailFast, async {
+            chain.chat(&[], &[], &ChatConfig::default()).await
+        })
+        .await;
+
+        // Must fail (primary failed, no failover), and the error must come
+        // from the primary (failure count on secondary slot stays 0).
+        assert!(
+            result.is_err(),
+            "FailFast should not switch to secondary lane"
+        );
+        assert_eq!(
+            chain.slots[1].failures.load(Ordering::Relaxed),
+            0,
+            "secondary slot must not be called under FailFast"
+        );
+    }
+
+    #[tokio::test]
+    async fn should_not_switch_lane_stream_when_failfast() {
+        use crate::{LlmCallPolicy, with_llm_call_policy};
+
+        struct FailingStreamProvider500 {
+            name: &'static str,
+        }
+
+        #[async_trait]
+        impl LlmProvider for FailingStreamProvider500 {
+            async fn chat(
+                &self,
+                _messages: &[Message],
+                _tools: &[ToolSpec],
+                _config: &ChatConfig,
+            ) -> Result<ChatResponse> {
+                eyre::bail!("{} API error: 500 - server error", self.name)
+            }
+
+            async fn chat_stream(
+                &self,
+                _messages: &[Message],
+                _tools: &[ToolSpec],
+                _config: &ChatConfig,
+            ) -> Result<ChatStream> {
+                eyre::bail!("{} API error: 500 - server error", self.name)
+            }
+
+            fn model_id(&self) -> &str {
+                "fail-stream-model"
+            }
+
+            fn provider_name(&self) -> &str {
+                self.name
+            }
+        }
+
+        let chain = ProviderChain::new(vec![
+            Arc::new(FailingStreamProvider500 { name: "primary" }),
+            Arc::new(SuccessProvider { name: "secondary" }),
+        ])
+        .with_max_request_duration(None);
+
+        let result = with_llm_call_policy(LlmCallPolicy::FailFast, async {
+            chain.chat_stream(&[], &[], &ChatConfig::default()).await
+        })
+        .await;
+
+        assert!(
+            result.is_err(),
+            "FailFast stream should not switch to secondary lane"
+        );
+        assert_eq!(
+            chain.slots[1].failures.load(Ordering::Relaxed),
+            0,
+            "secondary slot must not be called under FailFast stream"
+        );
     }
 
     #[tokio::test]

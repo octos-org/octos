@@ -44,22 +44,22 @@ const VIDEO_CALL_NOTE: &str =
 ///   prepends [`VIDEO_CALL_NOTE`] so a real-time camera frame isn't mistaken
 ///   for an uploaded file — applied whether or not the spoken turn was
 ///   transcribed into non-empty text.
-/// - With empty `user_content` and media present (but not a video call), the
-///   legacy `[User sent an image]` placeholder is kept.
+/// - With empty `user_content` and image media present (but not a video call),
+///   the legacy `[User sent an image]` placeholder is kept.
 /// - Any per-turn `prompt_summary` is appended, mirroring the previous
 ///   behaviour.
 ///
 /// Pure (no task-locals) so it is unit-testable in isolation.
 fn compose_turn_user_content(
     user_content: &str,
-    has_media: bool,
+    has_image: bool,
     is_video_call: bool,
     prompt_summary: Option<&str>,
 ) -> String {
     let base_content = if user_content.is_empty() {
         if is_video_call {
             VIDEO_CALL_NOTE.to_string()
-        } else if has_media {
+        } else if has_image {
             "[User sent an image]".to_string()
         } else {
             String::new()
@@ -531,6 +531,47 @@ impl Agent {
         }
     }
 
+    /// Task 8 — FailFast foreground-LLM-call failure handling.
+    ///
+    /// Called ONLY from the foreground LLM call sites (not from tool/verifier
+    /// dispatch). When the loop runs under
+    /// [`octos_llm::LlmCallPolicy::FailFast`] and a foreground LLM call fails,
+    /// this:
+    ///   1. Excludes hook-deny errors (`"LLM call denied by hook"`): returns
+    ///      `false` WITHOUT emitting a [`crate::TurnFailure`] so the caller
+    ///      falls through to the existing dispatch path and the permission
+    ///      behaviour is preserved byte-for-byte.
+    ///   2. Otherwise runs [`Self::classify_loop_error`] EXACTLY ONCE (records
+    ///      the metric + harness event; honours the "all escaping Reports go
+    ///      through the classifier" invariant), emits a single
+    ///      [`crate::TurnFailure::LlmError`] on the voice failure sink (if one
+    ///      is attached), and returns `true` so the caller bails with the
+    ///      ORIGINAL `report` (NOT through `handle_loop_error_with_dispatch`).
+    ///
+    /// Returns `false` under Normal policy so non-FailFast behaviour — and the
+    /// entire `handle_loop_error_with_dispatch` path — is unchanged.
+    fn failfast_llm_bail(&self, report: &eyre::Report) -> bool {
+        if octos_llm::current_llm_call_policy() != octos_llm::LlmCallPolicy::FailFast {
+            return false;
+        }
+        // Exclude hook-deny: preserve existing permission behaviour (no
+        // TurnFailure, fall through to the caller's dispatch path).
+        if report.to_string().starts_with("LLM call denied by hook") {
+            return false;
+        }
+        // Classify exactly once (keeps metric + harness-event side effects and
+        // the #488 invariant). The classified error is carried by the voice
+        // projection; the original `report` still bubbles out to the caller.
+        let classified = self.classify_loop_error(report, None);
+        if let Some(sink) = &self.voice_failure_sink {
+            let _ = sink.send(crate::TurnFailure::LlmError {
+                error: classified,
+                raw_detail: report.to_string(),
+            });
+        }
+        true
+    }
+
     /// Budget grace-call dispatch (M6.2). When the loop hits a hard iteration
     /// or token budget, this asks the retry state machine whether to grant
     /// one free iteration past budget. Only `MaxIterations` and `MaxTokens`
@@ -797,7 +838,7 @@ impl Agent {
                     .flatten();
                 let content = compose_turn_user_content(
                     user_content,
-                    !media.is_empty(),
+                    has_image,
                     live_video && has_image,
                     summary.as_deref(),
                 );
@@ -900,17 +941,8 @@ impl Agent {
                     self.reporter()
                         .report(ProgressEvent::Thinking { iteration });
 
-                    // LRU tool management: tick iteration counter and auto-evict idle tools
-                    self.tools.tick();
-                    let evicted = self.tools.auto_evict();
-                    if !evicted.is_empty() {
-                        tracing::info!(
-                            evicted = %evicted.join(", "),
-                            count = evicted.len(),
-                            "auto-evicted idle tools"
-                        );
-                    }
-
+                    // RFC-0 (#1289): LRU tool deferral removed — every enabled
+                    // tool is emitted every turn (full schema).
                     let tools_spec = self.tools.specs();
                     // Harness M6.3: run preflight compaction before the first
                     // LLM call when a compaction policy is wired and the
@@ -974,6 +1006,18 @@ impl Agent {
                     {
                         Ok(r) => r,
                         Err(e) if e.to_string().contains("empty response after") => {
+                            // Task 8: under FailFast an empty response is
+                            // TERMINAL — do NOT make the adaptive 2nd call.
+                            // Emit the voice EmptyResponse projection once and
+                            // bail with the original error.
+                            if octos_llm::current_llm_call_policy()
+                                == octos_llm::LlmCallPolicy::FailFast
+                            {
+                                if let Some(sink) = &self.voice_failure_sink {
+                                    let _ = sink.send(crate::TurnFailure::EmptyResponse);
+                                }
+                                return Err(e);
+                            }
                             // Empty response after retries -- try once more (adaptive router
                             // may select a different provider on this second attempt).
                             turn.record_retry(LoopRetryReason::ProviderFailover {
@@ -997,6 +1041,9 @@ impl Agent {
                             {
                                 Ok(r) => r,
                                 Err(e) => {
+                                    if self.failfast_llm_bail(&e) {
+                                        return Err(e);
+                                    }
                                     match self.handle_loop_error_with_dispatch(
                                         &e,
                                         &mut retry_state,
@@ -1010,6 +1057,9 @@ impl Agent {
                             }
                         }
                         Err(e) => {
+                            if self.failfast_llm_bail(&e) {
+                                return Err(e);
+                            }
                             match self.handle_loop_error_with_dispatch(
                                 &e,
                                 &mut retry_state,
@@ -1727,16 +1777,8 @@ impl Agent {
                 self.reporter()
                     .report(ProgressEvent::Thinking { iteration });
 
-                // LRU tool management
-                self.tools.tick();
-                let evicted = self.tools.auto_evict();
-                if !evicted.is_empty() {
-                    tracing::info!(
-                        evicted = %evicted.join(", "),
-                        "auto-evicted idle tools in task"
-                    );
-                }
-
+                // RFC-0 (#1289): LRU tool deferral removed — every enabled
+                // tool is emitted every turn (full schema).
                 let tools_spec = self.tools.specs();
                 // M8.5 tier 1: also runs in task mode so background workers
                 // benefit from the same cheap shrinkage before their LLM call.
@@ -1769,6 +1811,9 @@ impl Agent {
                 {
                     Ok(pair) => pair,
                     Err(e) => {
+                        if self.failfast_llm_bail(&e) {
+                            return Err(e);
+                        }
                         match self.handle_loop_error_with_dispatch(
                             &e,
                             &mut retry_state,
@@ -3147,6 +3192,12 @@ mod tests {
         // No image and not flagged → plain transcript passes through.
         let out = compose_turn_user_content("hello there", false, false, None);
         assert_eq!(out, "hello there");
+    }
+
+    #[test]
+    fn should_not_call_empty_non_image_media_an_image() {
+        let out = compose_turn_user_content("", false, false, None);
+        assert_eq!(out, "");
     }
 
     #[test]
@@ -8049,6 +8100,208 @@ printf '{"output":"voice saved","success":true}\n'
                 .revalidate_pending_approval(&pending, "@alice:example.org")
                 .await
                 .is_ok()
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Task 8 — FailFast LLM bail: no empty-response 2nd call, classify-once
+    // TurnFailure projection, hook-deny exclusion.
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// Provider that always returns an empty (retriable) response and counts
+    /// how many times `chat` is invoked. The default `chat_stream` routes to
+    /// `chat`, so the counter equals the number of LLM call attempts.
+    struct AlwaysEmptyProvider {
+        chat_calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl LlmProvider for AlwaysEmptyProvider {
+        async fn chat(
+            &self,
+            _messages: &[Message],
+            _tools: &[octos_llm::ToolSpec],
+            _config: &ChatConfig,
+        ) -> Result<ChatResponse> {
+            self.chat_calls.fetch_add(1, AtomicOrdering::SeqCst);
+            Ok(ChatResponse {
+                content: Some(String::new()),
+                reasoning_content: None,
+                tool_calls: vec![],
+                stop_reason: StopReason::EndTurn,
+                usage: LlmTokenUsage::default(),
+                provider_index: None,
+            })
+        }
+
+        fn model_id(&self) -> &str {
+            "mock-empty"
+        }
+
+        fn provider_name(&self) -> &str {
+            "mock-empty"
+        }
+    }
+
+    /// Provider that always fails with a (typed) server-side error. A 5xx
+    /// ServerError classifies as a retriable LLM error without tripping the
+    /// agent's `1 << attempt` backoff under FailFast (retry_max = 0).
+    struct AlwaysErrorProvider {
+        chat_calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl LlmProvider for AlwaysErrorProvider {
+        async fn chat(
+            &self,
+            _messages: &[Message],
+            _tools: &[octos_llm::ToolSpec],
+            _config: &ChatConfig,
+        ) -> Result<ChatResponse> {
+            self.chat_calls.fetch_add(1, AtomicOrdering::SeqCst);
+            Err(LlmError::new(
+                LlmErrorKind::ServerError { status: 503 },
+                "provider unavailable",
+            )
+            .into())
+        }
+
+        fn model_id(&self) -> &str {
+            "mock-error"
+        }
+
+        fn provider_name(&self) -> &str {
+            "mock-error"
+        }
+    }
+
+    fn task_for(instruction: &str, dir: &std::path::Path) -> Task {
+        Task::new(
+            TaskKind::Code {
+                instruction: instruction.to_string(),
+                files: vec![],
+            },
+            TaskContext {
+                working_dir: dir.to_path_buf(),
+                ..Default::default()
+            },
+        )
+    }
+
+    #[tokio::test]
+    async fn should_not_retry_empty_response_when_failfast() {
+        use octos_llm::{LlmCallPolicy, with_llm_call_policy};
+
+        let dir = tempfile::tempdir().unwrap();
+        let chat_calls = Arc::new(AtomicUsize::new(0));
+        let provider: Arc<dyn LlmProvider> = Arc::new(AlwaysEmptyProvider {
+            chat_calls: chat_calls.clone(),
+        });
+        let tools = ToolRegistry::with_builtins(dir.path());
+        let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+        let mut agent = Agent::new(AgentId::new("ff-empty"), provider, tools, memory);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        agent.set_voice_failure_sink(tx);
+
+        let _ = with_llm_call_policy(LlmCallPolicy::FailFast, async {
+            agent.process_message("hi", &[], vec![]).await
+        })
+        .await;
+
+        assert_eq!(
+            chat_calls.load(AtomicOrdering::SeqCst),
+            1,
+            "FailFast empty response must NOT make an adaptive 2nd call"
+        );
+        let failure = rx.try_recv().expect("one TurnFailure emitted");
+        assert!(
+            matches!(failure, crate::TurnFailure::EmptyResponse),
+            "expected EmptyResponse projection, got {failure:?}"
+        );
+        assert!(rx.try_recv().is_err(), "exactly one TurnFailure");
+    }
+
+    #[tokio::test]
+    async fn should_classify_once_and_emit_turn_failure_when_failfast_llm_error() {
+        use octos_llm::{LlmCallPolicy, with_llm_call_policy};
+
+        let dir = tempfile::tempdir().unwrap();
+        let chat_calls = Arc::new(AtomicUsize::new(0));
+        let provider: Arc<dyn LlmProvider> = Arc::new(AlwaysErrorProvider {
+            chat_calls: chat_calls.clone(),
+        });
+        let tools = ToolRegistry::with_builtins(dir.path());
+        let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+        let mut agent = Agent::new(AgentId::new("ff-error"), provider, tools, memory);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        agent.set_voice_failure_sink(tx);
+
+        let result = with_llm_call_policy(LlmCallPolicy::FailFast, async {
+            agent.run_task(&task_for("hi", dir.path())).await
+        })
+        .await;
+
+        // The ORIGINAL eyre::Report still bubbles out of the loop unchanged.
+        assert!(result.is_err(), "FailFast LLM error must bail with Err");
+        // Single foreground attempt — no adaptive/dispatch retry under FailFast.
+        assert_eq!(
+            chat_calls.load(AtomicOrdering::SeqCst),
+            1,
+            "FailFast LLM error must not retry"
+        );
+        // Exactly one TurnFailure::LlmError emitted (classify-once side effect
+        // produced the classified HarnessError carried by the projection).
+        let failure = rx.try_recv().expect("one TurnFailure emitted");
+        assert!(
+            matches!(failure, crate::TurnFailure::LlmError { .. }),
+            "expected LlmError projection, got {failure:?}"
+        );
+        assert!(rx.try_recv().is_err(), "exactly one TurnFailure");
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn should_not_emit_turn_failure_when_hook_denies_llm_call_under_failfast() {
+        use crate::hooks::{HookConfig, HookEvent, HookExecutor};
+        use octos_llm::{LlmCallPolicy, with_llm_call_policy};
+
+        let dir = tempfile::tempdir().unwrap();
+        let chat_calls = Arc::new(AtomicUsize::new(0));
+        // Provider would error if reached, but the before_llm hook denies first.
+        let provider: Arc<dyn LlmProvider> = Arc::new(AlwaysErrorProvider {
+            chat_calls: chat_calls.clone(),
+        });
+        let tools = ToolRegistry::with_builtins(dir.path());
+        let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+        // `false` exits with code 1 → hook Deny → llm_call.rs bails with
+        // "LLM call denied by hook: ..".
+        let hooks = Arc::new(HookExecutor::new(vec![HookConfig {
+            event: HookEvent::BeforeLlmCall,
+            command: vec!["false".into()],
+            timeout_ms: 5000,
+            tool_filter: vec![],
+            path_filter: vec![],
+            requires_bin: None,
+        }]));
+        let mut agent =
+            Agent::new(AgentId::new("ff-hookdeny"), provider, tools, memory).with_hooks(hooks);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        agent.set_voice_failure_sink(tx);
+
+        let result = with_llm_call_policy(LlmCallPolicy::FailFast, async {
+            agent.run_task(&task_for("hi", dir.path())).await
+        })
+        .await;
+
+        assert!(result.is_err(), "hook-deny must still bail with Err");
+        assert_eq!(
+            chat_calls.load(AtomicOrdering::SeqCst),
+            0,
+            "hook denied the call before the provider was reached"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "hook-deny must NOT emit a TurnFailure (preserve permission behaviour)"
         );
     }
 }

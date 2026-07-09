@@ -489,7 +489,9 @@ impl LlmProvider for OpenAIProvider {
         // `is_image_modality_error` / `ModelHints::detect`.
         if response.status().as_u16() == 400 && request_has_user_images(messages, &self.hints) {
             let body = response.text().await.unwrap_or_default();
-            if is_image_modality_error(&body) {
+            if is_image_modality_error(&body)
+                && crate::current_llm_call_policy() != crate::LlmCallPolicy::FailFast
+            {
                 tracing::warn!(
                     provider = %self.provider_label,
                     model = %self.model,
@@ -610,7 +612,9 @@ impl LlmProvider for OpenAIProvider {
         // text-only if the endpoint rejected the image content parts.
         if response.status().as_u16() == 400 && request_has_user_images(messages, &self.hints) {
             let text = response.text().await.unwrap_or_default();
-            if is_image_modality_error(&text) {
+            if is_image_modality_error(&text)
+                && crate::current_llm_call_policy() != crate::LlmCallPolicy::FailFast
+            {
                 tracing::warn!(
                     provider = %self.provider_label,
                     model = %self.model,
@@ -1520,6 +1524,101 @@ mod tests {
         assert_eq!(metadata.model, "kimi-k2.5");
         assert_eq!(metadata.endpoint.as_deref(), Some("autodl.art"));
         assert_eq!(metadata.display_label(), "moonshot/kimi-k2.5 @ autodl.art");
+    }
+
+    // ── FailFast image-modality retry guard ───────────────────────────────────
+
+    /// Build a User message that carries a `.png` image attachment so that
+    /// `request_has_user_images` returns `true` (the path must end in a
+    /// recognised image extension — checked by `vision::is_image`).
+    fn msg_with_user_image() -> Message {
+        Message {
+            role: MessageRole::User,
+            content: "look at this image".to_string(),
+            media: vec!["/tmp/test_image.png".to_string()],
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+            client_message_id: None,
+            thread_id: None,
+            timestamp: chrono::Utc::now(),
+        }
+    }
+
+    /// The body string that `is_image_modality_error` recognises as an image-
+    /// modality 400 (matches the `"does not support image"` arm).
+    const IMAGE_MODALITY_400_BODY: &str = r#"{"error":{"message":"This model does not support image input","type":"invalid_request_error"}}"#;
+
+    #[tokio::test]
+    async fn should_not_retry_text_only_when_failfast_on_image_modality_400_stream() {
+        use crate::{LlmCallPolicy, with_llm_call_policy};
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(400)
+                    .set_body_string(IMAGE_MODALITY_400_BODY)
+                    .append_header("Content-Type", "application/json"),
+            )
+            .mount(&server)
+            .await;
+
+        let provider = OpenAIProvider::new("test-key", "gpt-4o").with_base_url(server.uri());
+        let messages = vec![msg_with_user_image()];
+
+        let result = with_llm_call_policy(LlmCallPolicy::FailFast, async {
+            provider
+                .chat_stream(&messages, &[], &ChatConfig::default())
+                .await
+        })
+        .await;
+
+        assert!(result.is_err(), "expected Err on 400, got Ok");
+        let reqs = server.received_requests().await.unwrap_or_default();
+        assert_eq!(
+            reqs.len(),
+            1,
+            "FailFast must skip text-only retry; got {} request(s)",
+            reqs.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn should_not_retry_text_only_when_failfast_on_image_modality_400_chat() {
+        use crate::{LlmCallPolicy, with_llm_call_policy};
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(400)
+                    .set_body_string(IMAGE_MODALITY_400_BODY)
+                    .append_header("Content-Type", "application/json"),
+            )
+            .mount(&server)
+            .await;
+
+        let provider = OpenAIProvider::new("test-key", "gpt-4o").with_base_url(server.uri());
+        let messages = vec![msg_with_user_image()];
+
+        let result = with_llm_call_policy(LlmCallPolicy::FailFast, async {
+            provider.chat(&messages, &[], &ChatConfig::default()).await
+        })
+        .await;
+
+        assert!(result.is_err(), "expected Err on 400, got Ok");
+        let reqs = server.received_requests().await.unwrap_or_default();
+        assert_eq!(
+            reqs.len(),
+            1,
+            "FailFast must skip text-only retry; got {} request(s)",
+            reqs.len()
+        );
     }
 
     /// Real API test: NVIDIA NIM with Llama 3.3 70B.
