@@ -279,7 +279,15 @@ fn format_relevant_experiences(scored: &[(Episode, HybridScore)]) -> Option<Stri
     if filtered.is_empty() {
         return None;
     }
-    Some(render_relevant_experiences_iter(filtered.into_iter()))
+    // Episodic summaries are HISTORICAL records — spawn/pipeline workers
+    // receive them with no other memory context, so the staleness
+    // etiquette must ride along here too (#1589 codex P2: the similarity
+    // floor checks relevance, not freshness).
+    Some(format!(
+        "{}\n{}",
+        render_relevant_experiences_iter(filtered.into_iter()),
+        crate::memory_segment::MEMORY_USE_GUIDANCE
+    ))
 }
 
 fn render_relevant_experiences_iter<'a, I>(iter: I) -> String
@@ -359,6 +367,13 @@ mod tests {
         let rendered =
             format_relevant_experiences(&scored).expect("at least one episode above threshold");
         assert!(rendered.contains("## Relevant Past Experiences"));
+        // #1589: episodic summaries are historical — the staleness
+        // etiquette must ride with them (workers get no other memory
+        // context).
+        assert!(
+            rendered.contains("## Memory Use"),
+            "episodic recall message must carry the use-guidance"
+        );
         assert!(
             rendered.contains("HIGH RELEVANCE rust ownership"),
             "expected the above-threshold episode to be present"
