@@ -1157,6 +1157,7 @@ pub mod methods {
     pub const LOOP_COMPLETED: &str = "loop/completed";
     /// M16 `context.lifecycle.v1`: compact-context lifecycle notification.
     pub const CONTEXT_COMPACTION_COMPLETED: &str = "context/compaction_completed";
+    pub const CONTEXT_COMPACTION_STARTED: &str = "context/compaction_started";
     /// M16 `context.lifecycle.v1`: prompt normalization report notification.
     pub const CONTEXT_NORMALIZATION_REPORTED: &str = "context/normalization_reported";
     /// Session-level whole-job orchestration status notification.
@@ -1268,6 +1269,7 @@ pub const UI_PROTOCOL_NOTIFICATION_METHODS: &[&str] = &[
     methods::LOOP_FIRED,
     methods::LOOP_COMPLETED,
     methods::CONTEXT_COMPACTION_COMPLETED,
+    methods::CONTEXT_COMPACTION_STARTED,
     methods::CONTEXT_NORMALIZATION_REPORTED,
 ];
 
@@ -5422,6 +5424,23 @@ pub struct ContextCompactionCompletedEvent {
     pub compaction: UiContextCompactionRecord,
 }
 
+/// UPCR-2026-026: emitted immediately BEFORE a context compaction pass so
+/// clients can show an in-progress state (spinner/bar). Always followed by
+/// `context/compaction_completed` for the same generation — today's serve
+/// compaction is synchronous, so both may arrive in one delivery batch;
+/// clients must tolerate a zero-duration window.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextCompactionStartedEvent {
+    pub session_id: SessionKey,
+    /// Pre-compaction context state (token_estimate = the "before" size).
+    pub context_state: UiContextState,
+    /// Trigger label, mirrors the eventual completed record's trigger.
+    pub trigger: String,
+    /// The token threshold that tripped this compaction (context-window
+    /// derived) — lets clients render an honest fullness percentage.
+    pub threshold_tokens: usize,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UiContextNormalizationReport {
     pub generation: u64,
@@ -5687,6 +5706,7 @@ pub enum UiNotification {
     LoopCompleted(LoopCompletedEvent),
     /// M16: compact-context lifecycle event.
     ContextCompactionCompleted(ContextCompactionCompletedEvent),
+    ContextCompactionStarted(ContextCompactionStartedEvent),
     /// M16: prompt normalization lifecycle event.
     ContextNormalizationReported(ContextNormalizationReportedEvent),
     /// Session-level whole-job orchestration status. Emitted when the session's
@@ -5757,6 +5777,7 @@ impl UiNotification {
             Self::LoopFired(_) => methods::LOOP_FIRED,
             Self::LoopCompleted(_) => methods::LOOP_COMPLETED,
             Self::ContextCompactionCompleted(_) => methods::CONTEXT_COMPACTION_COMPLETED,
+            Self::ContextCompactionStarted(_) => methods::CONTEXT_COMPACTION_STARTED,
             Self::ContextNormalizationReported(_) => methods::CONTEXT_NORMALIZATION_REPORTED,
             Self::SessionOrchestration(_) => methods::SESSION_ORCHESTRATION,
             Self::Envelope(_) => methods::PROJECTION_ENVELOPE,
@@ -5804,6 +5825,7 @@ impl UiNotification {
             Self::LoopFired(event) => &event.session_id,
             Self::LoopCompleted(event) => &event.session_id,
             Self::ContextCompactionCompleted(event) => &event.session_id,
+            Self::ContextCompactionStarted(event) => &event.session_id,
             Self::ContextNormalizationReported(event) => &event.session_id,
             Self::SessionOrchestration(event) => &event.session_id,
             Self::Envelope(event) => &event.session_id,
@@ -5952,6 +5974,7 @@ impl UiNotification {
             Self::LoopFired(params) => serde_json::to_value(params),
             Self::LoopCompleted(params) => serde_json::to_value(params),
             Self::ContextCompactionCompleted(params) => serde_json::to_value(params),
+            Self::ContextCompactionStarted(params) => serde_json::to_value(params),
             Self::ContextNormalizationReported(params) => serde_json::to_value(params),
             Self::SessionOrchestration(params) => serde_json::to_value(params),
             // UPCR-2026-014 (M9-γ) + feat(envelope-wire-routing): the wire
@@ -6075,6 +6098,9 @@ impl UiNotification {
             methods::LOOP_UPDATED => Ok(Self::LoopUpdated(decode_params(method, params)?)),
             methods::LOOP_FIRED => Ok(Self::LoopFired(decode_params(method, params)?)),
             methods::LOOP_COMPLETED => Ok(Self::LoopCompleted(decode_params(method, params)?)),
+            methods::CONTEXT_COMPACTION_STARTED => Ok(Self::ContextCompactionStarted(
+                decode_params(method, params)?,
+            )),
             methods::CONTEXT_COMPACTION_COMPLETED => Ok(Self::ContextCompactionCompleted(
                 decode_params(method, params)?,
             )),
@@ -6861,6 +6887,7 @@ mod tests {
                 "loop/fired",
                 "loop/completed",
                 "context/compaction_completed",
+                "context/compaction_started",
                 "context/normalization_reported",
             ]
         );
@@ -7034,6 +7061,7 @@ mod tests {
                     "loop/fired",
                     "loop/completed",
                     "context/compaction_completed",
+                    "context/compaction_started",
                     "context/normalization_reported"
                 ],
                 "supported_features": [

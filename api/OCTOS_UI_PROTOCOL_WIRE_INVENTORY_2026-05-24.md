@@ -131,6 +131,7 @@ spec and UPCR documents. The authoritative source remains code:
 | `loop/fired` | shipped, UPCR-2026-021 |
 | `loop/completed` | shipped, UPCR-2026-021 |
 | `context/compaction_completed` | shipped M16 context lifecycle notification |
+| `context/compaction_started` | shipped M16 context lifecycle notification |
 | `context/normalization_reported` | shipped M16 context lifecycle notification |
 
 ## Reconciliation Decisions

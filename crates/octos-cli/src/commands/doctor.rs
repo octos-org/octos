@@ -64,7 +64,7 @@ fn octos_server_spec() -> ProductSpec {
         "octos-bundle",            // asset prefix → octos-bundle-<triple>
     )
     .with_github_token_env("OCTOS_GITHUB_TOKEN")
-    .with_brew_formula("octos-org/tap/octos")
+    .with_brew_formula("octos-org/octos/octos")
     .with_npm_package("@octos-org/octos")
     .with_cargo_install("octos-cli")
     .with_cargo_dist_app("octos")

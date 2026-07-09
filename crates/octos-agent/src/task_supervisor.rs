@@ -378,6 +378,17 @@ type OnFailureCallback = Box<dyn Fn(&SpawnOnlyFailureSignal) + Send + Sync>;
 /// Terminal outcome carried by a [`TerminalEvent`]. Distinguishes the
 /// success path (→ `ChildCompleted` re-entry) from the failure path
 /// (→ recovery re-entry, prompt-selected on `synth_ack_emitted`).
+//
+// `large_enum_variant`: the `Failed` variant carries a
+// [`SpawnOnlyFailureSignal`], which holds a `serde_json::Value`
+// (`tool_input`). When any workspace crate enables serde_json's
+// `preserve_order` feature (the `octos acp` bridge's `agent-client-protocol`
+// dependency requires it, and Cargo unifies features workspace-wide),
+// `Value::Object` switches from `BTreeMap` to `IndexMap` and the struct grows
+// past the lint's threshold. Boxing the payload here would ripple through the
+// `pub` API and every match site for a terminal (cold) event; the size
+// difference is immaterial on this non-hot path, so we allow it instead.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TerminalOutcome {
     /// Task reached `Completed`. Drives the autonomous `ChildCompleted`
