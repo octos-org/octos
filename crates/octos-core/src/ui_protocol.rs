@@ -978,6 +978,9 @@ pub mod methods {
     pub const THREAD_GRAPH_GET: &str = "thread/graph/get";
     /// UPCR-2026-011 `turn/state/get` — turn lifecycle introspection.
     pub const TURN_STATE_GET: &str = "turn/state/get";
+    /// `session/btw` — quick aside question answered out-of-band (no tools)
+    /// while the session's live turn, if any, keeps running.
+    pub const SESSION_BTW: &str = "session/btw";
 
     /// UPCR-2026-021 M15 agent inspection/control surface.
     pub const AGENT_LIST: &str = "agent/list";
@@ -1191,6 +1194,7 @@ pub const UI_PROTOCOL_COMMAND_METHODS: &[&str] = &[
     methods::TURN_INTERRUPT,
     methods::APPROVAL_RESPOND,
     methods::APPROVAL_SCOPES_LIST,
+    methods::SESSION_BTW,
     methods::USER_QUESTION_RESPOND,
     methods::PERMISSION_PROFILE_LIST,
     methods::PERMISSION_PROFILE_SET,
@@ -1293,6 +1297,7 @@ pub const UI_PROTOCOL_FIRST_SERVER_METHODS: &[&str] = &[
     methods::TURN_INTERRUPT,
     methods::APPROVAL_RESPOND,
     methods::APPROVAL_SCOPES_LIST,
+    methods::SESSION_BTW,
     methods::USER_QUESTION_RESPOND,
     methods::PERMISSION_PROFILE_LIST,
     methods::PERMISSION_PROFILE_SET,
@@ -1699,6 +1704,7 @@ pub enum UiResultKind {
     SessionRollback,
     ThreadGraphGet,
     TurnStateGet,
+    SessionBtw,
     UnsupportedCapability,
 }
 
@@ -1723,6 +1729,7 @@ pub fn first_server_result_kind_for_method(method: &str) -> Option<UiResultKind>
         methods::SESSION_ROLLBACK => Some(UiResultKind::SessionRollback),
         methods::THREAD_GRAPH_GET => Some(UiResultKind::ThreadGraphGet),
         methods::TURN_STATE_GET => Some(UiResultKind::TurnStateGet),
+        methods::SESSION_BTW => Some(UiResultKind::SessionBtw),
         _ => None,
     }
 }
@@ -2813,6 +2820,30 @@ impl TurnLifecycleState {
     }
 }
 
+/// Params for `session/btw` — a quick aside question ("btw, what are you
+/// working on?") answered out-of-band while the session's live turn, if any,
+/// keeps running. The server answers with ONE restricted LLM call over a
+/// snapshot of the session's recent context: no tools, capped output, and the
+/// exchange is ephemeral — it is never appended to the session history, so the
+/// live turn never sees it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionBtwParams {
+    pub session_id: SessionKey,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub topic: Option<String>,
+    pub question: String,
+}
+
+/// Result for `session/btw`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionBtwResult {
+    pub session_id: SessionKey,
+    pub answer: String,
+    /// Model that produced the answer, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+}
+
 /// Params for `turn/state/get` (UPCR-2026-011).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TurnStateGetParams {
@@ -3670,6 +3701,7 @@ pub enum UiCommand {
     SessionRollback(SessionRollbackParams),
     ThreadGraphGet(ThreadGraphGetParams),
     TurnStateGet(TurnStateGetParams),
+    SessionBtw(SessionBtwParams),
     // ---- M12 Phase D-1 auxiliary REST → WS frames ----
     SessionList(SessionListParams),
     SessionSnapshot(SessionSnapshotParams),
@@ -3712,6 +3744,7 @@ impl UiCommand {
             Self::SessionRollback(_) => methods::SESSION_ROLLBACK,
             Self::ThreadGraphGet(_) => methods::THREAD_GRAPH_GET,
             Self::TurnStateGet(_) => methods::TURN_STATE_GET,
+            Self::SessionBtw(_) => methods::SESSION_BTW,
             Self::SessionList(_) => methods::SESSION_LIST,
             Self::SessionSnapshot(_) => methods::SESSION_SNAPSHOT,
             Self::SessionMessagesPage(_) => methods::SESSION_MESSAGES_PAGE,
@@ -3756,6 +3789,7 @@ impl UiCommand {
             Self::SessionRollback(params) => serde_json::to_value(params),
             Self::ThreadGraphGet(params) => serde_json::to_value(params),
             Self::TurnStateGet(params) => serde_json::to_value(params),
+            Self::SessionBtw(params) => serde_json::to_value(params),
             Self::SessionList(params) => serde_json::to_value(params),
             Self::SessionSnapshot(params) => serde_json::to_value(params),
             Self::SessionMessagesPage(params) => serde_json::to_value(params),
@@ -3826,6 +3860,7 @@ impl UiCommand {
             methods::SESSION_ROLLBACK => Ok(Self::SessionRollback(decode_params(method, params)?)),
             methods::THREAD_GRAPH_GET => Ok(Self::ThreadGraphGet(decode_params(method, params)?)),
             methods::TURN_STATE_GET => Ok(Self::TurnStateGet(decode_params(method, params)?)),
+            methods::SESSION_BTW => Ok(Self::SessionBtw(decode_params(method, params)?)),
             methods::SESSION_LIST => Ok(Self::SessionList(decode_optional_params(method, params)?)),
             methods::SESSION_SNAPSHOT => Ok(Self::SessionSnapshot(decode_params(method, params)?)),
             methods::SESSION_MESSAGES_PAGE => {
@@ -4170,6 +4205,7 @@ pub enum UiRpcResult {
     SessionRollback(SessionRollbackResult),
     ThreadGraphGet(ThreadGraphGetResult),
     TurnStateGet(TurnStateGetResult),
+    SessionBtw(SessionBtwResult),
     UnsupportedCapability(UnsupportedCapabilityResult),
 }
 
@@ -4195,6 +4231,7 @@ impl UiRpcResult {
             Self::SessionRollback(_) => UiResultKind::SessionRollback,
             Self::ThreadGraphGet(_) => UiResultKind::ThreadGraphGet,
             Self::TurnStateGet(_) => UiResultKind::TurnStateGet,
+            Self::SessionBtw(_) => UiResultKind::SessionBtw,
             Self::UnsupportedCapability(_) => UiResultKind::UnsupportedCapability,
         }
     }
@@ -4220,6 +4257,7 @@ impl UiRpcResult {
             Self::SessionRollback(_) => Some(methods::SESSION_ROLLBACK),
             Self::ThreadGraphGet(_) => Some(methods::THREAD_GRAPH_GET),
             Self::TurnStateGet(_) => Some(methods::TURN_STATE_GET),
+            Self::SessionBtw(_) => Some(methods::SESSION_BTW),
             Self::UnsupportedCapability(result) => Some(result.unsupported.method.as_str()),
         }
     }
@@ -4245,6 +4283,7 @@ impl UiRpcResult {
             Self::SessionRollback(result) => serde_json::to_value(result),
             Self::ThreadGraphGet(result) => serde_json::to_value(result),
             Self::TurnStateGet(result) => serde_json::to_value(result),
+            Self::SessionBtw(result) => serde_json::to_value(result),
             Self::UnsupportedCapability(result) => serde_json::to_value(result),
         }
     }
@@ -4301,6 +4340,7 @@ impl UiRpcResult {
             methods::SESSION_ROLLBACK => Ok(Self::SessionRollback(decode_result(method, result)?)),
             methods::THREAD_GRAPH_GET => Ok(Self::ThreadGraphGet(decode_result(method, result)?)),
             methods::TURN_STATE_GET => Ok(Self::TurnStateGet(decode_result(method, result)?)),
+            methods::SESSION_BTW => Ok(Self::SessionBtw(decode_result(method, result)?)),
             _ => Err(RpcError::method_not_found(method)),
         }
     }
@@ -6884,6 +6924,7 @@ mod tests {
                 "turn/interrupt",
                 "approval/respond",
                 "approval/scopes/list",
+                "session/btw",
                 "user_question/respond",
                 "permission/profile/list",
                 "permission/profile/set",
@@ -6988,6 +7029,7 @@ mod tests {
                 "turn/interrupt",
                 "approval/respond",
                 "approval/scopes/list",
+                "session/btw",
                 "user_question/respond",
                 "permission/profile/list",
                 "permission/profile/set",
@@ -7062,6 +7104,7 @@ mod tests {
                     "turn/interrupt",
                     "approval/respond",
                     "approval/scopes/list",
+                    "session/btw",
                     "user_question/respond",
                     "permission/profile/list",
                     "permission/profile/set",
