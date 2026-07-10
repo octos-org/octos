@@ -989,7 +989,17 @@ impl Agent {
                     // runner sees the final shape of the conversation (after
                     // tool-pair repair + system-message normalization). This
                     // also feeds the validator rail on subsequent iterations.
-                    self.maybe_run_turn_compaction(&mut messages, iteration)?;
+                    if let Some(summary) =
+                        self.maybe_run_turn_compaction(&mut messages, iteration)?
+                    {
+                        // #1587 write side: a conversation that compacts is
+                        // substantial enough to be worth recalling later.
+                        // Persist the compaction summary as an embedded
+                        // episode so a future conversation's session-start
+                        // recall can surface it. No-op without an embedder
+                        // or when episodes are disabled.
+                        self.save_conversation_episode(summary).await;
+                    }
                     self.prepare_prompt_with_context_manager(
                         &mut messages,
                         if iteration == 1 {

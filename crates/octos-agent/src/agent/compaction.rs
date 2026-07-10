@@ -175,21 +175,26 @@ impl Agent {
     /// active when a [`crate::compaction::CompactionRunner`] is wired; a
     /// no-op otherwise so every caller that does not wire the contract keeps
     /// the existing behaviour byte-for-byte.
+    /// Run the per-turn declarative compaction pass. Returns the summary
+    /// text a pass folded in (when any), so the conversational loop can
+    /// persist it as a searchable episode (#1587 write side). `None` when
+    /// no pass ran (context-manager-owned prompt, no runner, iteration 1,
+    /// or nothing to compact).
     pub(super) fn maybe_run_turn_compaction(
         &self,
         messages: &mut Vec<Message>,
         iteration: u32,
-    ) -> eyre::Result<()> {
+    ) -> eyre::Result<Option<String>> {
         if self.prompt_context_manager.is_some() {
-            return Ok(());
+            return Ok(None);
         }
         let Some(runner) = self.compaction_runner.as_ref() else {
-            return Ok(());
+            return Ok(None);
         };
         // Skip the very first iteration when the preflight path already ran
         // — preflight emits its own events and enforces preservation.
         if iteration == 1 {
-            return Ok(());
+            return Ok(None);
         }
         let outcome = runner.run(messages, CompactionPhase::TurnEnd);
         if outcome.performed {
@@ -204,8 +209,9 @@ impl Agent {
                 "harness M6.3 compaction per-turn pass"
             );
             self.enforce_preservation(messages, CompactionPhase::TurnEnd)?;
+            return Ok(outcome.summary);
         }
-        Ok(())
+        Ok(None)
     }
 
     /// Ask the caller-owned context bridge to prepare the final model prompt.

@@ -155,6 +155,68 @@ impl Agent {
         })
     }
 
+    /// Persist a conversation's compaction summary as a searchable episode
+    /// (#1587 write side): store it and — fire-and-forget so the turn isn't
+    /// blocked — embed it, so a future conversation's session-start recall
+    /// ([`Self::recall_relevant_episodes`]) can surface it. No-op unless
+    /// episodes are enabled AND an embedder is present: an unembedded
+    /// episode is invisible to every (embedder-gated) recall path, so
+    /// storing it would only bloat the index.
+    pub(super) async fn save_conversation_episode(&self, summary: String) {
+        if !self.config.save_episodes || self.embedder.is_none() {
+            return;
+        }
+        let summary_truncated = octos_core::truncated_utf8(&summary, 500, "...");
+        if summary_truncated.trim().is_empty() {
+            return;
+        }
+        let cwd = self
+            .tools
+            .workspace_root()
+            .map(std::path::Path::to_path_buf)
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
+
+        let episode = octos_memory::Episode::new(
+            octos_core::TaskId::new(),
+            self.id.clone(),
+            cwd,
+            summary_truncated.clone(),
+            octos_memory::EpisodeOutcome::Success,
+        );
+        let ep_id = episode.id.clone();
+        if let Err(e) = self.memory.store(episode).await {
+            warn!(error = %e, "failed to save conversation episode");
+            return;
+        }
+        info!(
+            episode_id = %ep_id,
+            summary_len = summary_truncated.len(),
+            "saved conversation episode (#1587 write side)"
+        );
+
+        // Fire-and-forget embed (mirrors the task-loop pattern): compaction
+        // already ran mid-turn, so don't add an embed round-trip to the
+        // turn's latency.
+        if let Some(ref embedder) = self.embedder {
+            let embedder = embedder.clone();
+            let memory = self.memory.clone();
+            tokio::spawn(async move {
+                match embedder.embed(&[summary_truncated.as_str()]).await {
+                    Ok(vecs) => {
+                        if let Some(vec) = vecs.into_iter().next() {
+                            if let Err(e) = memory.store_embedding(&ep_id, vec).await {
+                                warn!(error = %e, "failed to store conversation-episode embedding");
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        warn!(error = %e, episode_id = %ep_id, "failed to embed conversation episode");
+                    }
+                }
+            });
+        }
+    }
+
     pub(super) async fn build_initial_messages(&self, task: &Task) -> Vec<Message> {
         let mut messages = vec![Message {
             role: MessageRole::System,
@@ -713,6 +775,65 @@ mod tests {
             .expect("embedder present + vector match must recall");
         assert!(msg.content.contains("Relevant Past Experiences"));
         assert!(msg.content.contains("keepalive"));
+    }
+
+    #[tokio::test]
+    async fn save_conversation_episode_stores_recallable_episode() {
+        use crate::{Agent, tools::ToolRegistry};
+        use octos_memory::EpisodeStore;
+        use std::sync::Arc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().to_path_buf();
+        let memory = Arc::new(EpisodeStore::open(workspace.join("memory")).await.unwrap());
+
+        let provider: Arc<dyn octos_llm::LlmProvider> = Arc::new(EndTurnProvider);
+        let tools = ToolRegistry::with_builtins(&workspace);
+        let agent = Agent::new(AgentId::new("chat"), provider, tools, memory.clone())
+            .with_embedder(Arc::new(ConstEmbedder));
+
+        agent
+            .save_conversation_episode(
+                "We diagnosed the websocket gateway keepalive dropping clients".to_string(),
+            )
+            .await;
+
+        // The store write is awaited (the embed is fire-and-forget); the
+        // episode is BM25-findable in its cwd immediately.
+        let hits = memory
+            .find_relevant(&workspace, "websocket gateway keepalive", 5)
+            .await
+            .unwrap();
+        assert!(
+            hits.iter().any(|e| e.summary.contains("keepalive")),
+            "conversation episode must be stored + recallable"
+        );
+    }
+
+    #[tokio::test]
+    async fn save_conversation_episode_is_noop_without_embedder() {
+        use crate::{Agent, tools::ToolRegistry};
+        use octos_memory::EpisodeStore;
+        use std::sync::Arc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().to_path_buf();
+        let memory = Arc::new(EpisodeStore::open(workspace.join("memory")).await.unwrap());
+        let provider: Arc<dyn octos_llm::LlmProvider> = Arc::new(EndTurnProvider);
+        let tools = ToolRegistry::with_builtins(&workspace);
+        // No embedder: an unembedded conversation episode is invisible to
+        // recall, so we must not store it at all.
+        let agent = Agent::new(AgentId::new("chat"), provider, tools, memory.clone());
+
+        agent
+            .save_conversation_episode("some conversation summary".to_string())
+            .await;
+
+        let hits = memory
+            .find_relevant(&workspace, "conversation summary", 5)
+            .await
+            .unwrap();
+        assert!(hits.is_empty(), "no episode without an embedder");
     }
 
     #[tokio::test]
