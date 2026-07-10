@@ -29,8 +29,9 @@ use octos_core::ui_protocol::{
     ApprovalDecidedEvent, ApprovalDecision, ApprovalId, ApprovalRenderHints,
     ApprovalRequestedEvent, ApprovalTypedDetails, ContentBulkDeleteParams, ContentDeleteParams,
     ContentListParams, ContextCompactionCompletedEvent, ContextCompactionStartedEvent,
-    ContextNormalizationReportedEvent, Envelope, EnvelopeTokenUsage, FileRef, HydratedMessage,
-    HydratedTurn, InputItem, MessageDeltaEvent, MessageMeta, MessagePersistedEvent,
+    ContextNormalizationReportedEvent, CronListParams, CronToggleParams, Envelope,
+    EnvelopeTokenUsage, FileRef, HydratedMessage, HydratedTurn, InputItem, MemoryEntityParams,
+    MemoryOverviewParams, MessageDeltaEvent, MessageMeta, MessagePersistedEvent,
     MessagePersistedSource, OutputCursor, Payload, ReplayLossyEvent, RpcError, RpcErrorResponse,
     RpcRequest, RpcResponse, SESSION_HYDRATE_INCLUDE_MAX, SESSION_MESSAGES_PAGE_DEFAULT_LIMIT,
     SESSION_MESSAGES_PAGE_MAX_LIMIT, SESSION_MESSAGES_PAGE_MAX_OFFSET, SESSION_TITLE_SET_MAX_CHARS,
@@ -250,6 +251,10 @@ const APPUI_STDIO_AUTH_BOUND_UNAVAILABLE_METHODS: &[&str] = &[
     octos_core::ui_protocol::methods::CONTENT_LIST,
     octos_core::ui_protocol::methods::CONTENT_DELETE,
     octos_core::ui_protocol::methods::CONTENT_BULK_DELETE,
+    octos_core::ui_protocol::methods::MEMORY_OVERVIEW,
+    octos_core::ui_protocol::methods::MEMORY_ENTITY,
+    octos_core::ui_protocol::methods::CRON_LIST,
+    octos_core::ui_protocol::methods::CRON_TOGGLE,
 ];
 type WsSink = futures::stream::SplitSink<WebSocket, WsMessage>;
 type SharedActiveTurns = Arc<tokio::sync::Mutex<HashMap<SessionKey, ActiveTurn>>>;
@@ -4645,6 +4650,54 @@ async fn ui_protocol_connection(
                 )
                 .await;
             }
+            UiCommand::MemoryOverview(params) => {
+                handle_memory_overview(
+                    &ws,
+                    &state,
+                    &connection_headers,
+                    connection_identity.as_ref(),
+                    true,
+                    id,
+                    params,
+                )
+                .await;
+            }
+            UiCommand::MemoryEntity(params) => {
+                handle_memory_entity(
+                    &ws,
+                    &state,
+                    &connection_headers,
+                    connection_identity.as_ref(),
+                    true,
+                    id,
+                    params,
+                )
+                .await;
+            }
+            UiCommand::CronList(params) => {
+                handle_cron_list(
+                    &ws,
+                    &state,
+                    &connection_headers,
+                    connection_identity.as_ref(),
+                    true,
+                    id,
+                    params,
+                )
+                .await;
+            }
+            UiCommand::CronToggle(params) => {
+                handle_cron_toggle(
+                    &ws,
+                    &state,
+                    &connection_headers,
+                    connection_identity.as_ref(),
+                    true,
+                    id,
+                    params,
+                )
+                .await;
+            }
             UiCommand::RouterSetMode(params) => {
                 handle_router_set_mode(
                     &ws,
@@ -5246,6 +5299,20 @@ where
                     params,
                 )
                 .await;
+            }
+            UiCommand::MemoryOverview(params) => {
+                handle_memory_overview(&ws, &state, &connection_headers, None, false, id, params)
+                    .await;
+            }
+            UiCommand::MemoryEntity(params) => {
+                handle_memory_entity(&ws, &state, &connection_headers, None, false, id, params)
+                    .await;
+            }
+            UiCommand::CronList(params) => {
+                handle_cron_list(&ws, &state, &connection_headers, None, false, id, params).await;
+            }
+            UiCommand::CronToggle(params) => {
+                handle_cron_toggle(&ws, &state, &connection_headers, None, false, id, params).await;
             }
             UiCommand::RouterSetMode(params) => {
                 // stdio is a local single-user transport with no authenticated
@@ -8518,9 +8585,11 @@ fn route_rpc_command(
         | octos_core::ui_protocol::methods::SYSTEM_STATUS_GET
         | octos_core::ui_protocol::methods::CONTENT_LIST
         | octos_core::ui_protocol::methods::CONTENT_DELETE
-        | octos_core::ui_protocol::methods::CONTENT_BULK_DELETE => {
-            Some(features.auxiliary_rest_to_ws_v1)
-        }
+        | octos_core::ui_protocol::methods::CONTENT_BULK_DELETE
+        | octos_core::ui_protocol::methods::MEMORY_OVERVIEW
+        | octos_core::ui_protocol::methods::MEMORY_ENTITY
+        | octos_core::ui_protocol::methods::CRON_LIST
+        | octos_core::ui_protocol::methods::CRON_TOGGLE => Some(features.auxiliary_rest_to_ws_v1),
         // UPCR-2026-023: `user_question/respond` is strict opt-in. A client
         // that did not negotiate `user_question.v1` never received a
         // `user_question/requested`, so it has nothing to answer; reject the
@@ -8637,6 +8706,10 @@ fn session_ingress_callable_method(method: &str) -> bool {
             | octos_core::ui_protocol::methods::CONTENT_LIST
             | octos_core::ui_protocol::methods::CONTENT_DELETE
             | octos_core::ui_protocol::methods::CONTENT_BULK_DELETE
+            | octos_core::ui_protocol::methods::MEMORY_OVERVIEW
+            | octos_core::ui_protocol::methods::MEMORY_ENTITY
+            | octos_core::ui_protocol::methods::CRON_LIST
+            | octos_core::ui_protocol::methods::CRON_TOGGLE
             | octos_core::ui_protocol::methods::SESSION_FORK
     )
 }
@@ -8661,6 +8734,10 @@ fn validate_session_ingress_command_scope(
         | UiCommand::ContentList(_)
         | UiCommand::ContentDelete(_)
         | UiCommand::ContentBulkDelete(_)
+        | UiCommand::MemoryOverview(_)
+        | UiCommand::MemoryEntity(_)
+        | UiCommand::CronList(_)
+        | UiCommand::CronToggle(_)
         | UiCommand::SessionFork(_) => {
             return Err(RpcError::invalid_request(
                 "session ingress credentials may only call session-scoped methods",
@@ -15127,6 +15204,338 @@ async fn handle_content_bulk_delete(
                 ws,
                 Some(id),
                 rest_status_to_rpc_error(method, status, Some(message), &context),
+            );
+        }
+    }
+}
+
+/// Per-field JSON-ESCAPED byte budgets for the memory RPC results
+/// (codex #1621 r1 P1, tightened r2 P1). The REST panel intentionally
+/// serves files up to `memory_panel::MAX_PANEL_FILE_BYTES` (2 MiB), but
+/// an RPC result must fit ONE ~1 MiB WS text frame
+/// (`MAX_TEXT_FRAME_BYTES`) — without a handler-level bound the
+/// outbound framing guard (`preview_oversized_frame`) would splice a
+/// head+tail preview into the largest string while the envelope still
+/// reports success: silent corruption for a document viewer.
+///
+/// Budgets are measured in ESCAPED bytes (r2 P1: a flat raw-byte cap
+/// under-counts — `serde_json` emits SIX bytes (`\u0001`) for a C0
+/// control byte, so a control-heavy file capped by raw length would
+/// still serialize past the frame and re-reach the silent preview).
+/// `cap_index_by_escaped_len` walks the field with serde_json's actual
+/// escaping table, so plain markdown keeps ~the full budget while
+/// pathological content is cut exactly where its wire cost hits it.
+/// Worst-case wire size is therefore the PLAIN SUM of the budgets:
+///   96 (long_term) + 48 (today) + 7×24 (recent) + ~543 (entities —
+///   bounded upstream at ≤ MAX_PANEL_ENTITIES=256 rows: summaries
+///   ≤ 100 raw bytes (`octos_memory::extract_abstract`) → ≤ 600
+///   escaped, names ≤ 255 raw → ≤ 1530 escaped (Unix filenames may
+///   carry C0 controls at 6 wire bytes each), + per-row JSON
+///   overhead) ≈ 855 KiB, under the frame cap with ~169 KiB margin.
+/// Truncation is EXPLICIT: `<field>_truncated` + `<field>_total_bytes`
+/// ride beside every capped field; the content itself is a clean UTF-8
+/// prefix with NO in-band marker.
+const MEMORY_RPC_LONG_TERM_BUDGET: usize = 96 * 1024;
+const MEMORY_RPC_TODAY_BUDGET: usize = 48 * 1024;
+const MEMORY_RPC_RECENT_NOTE_BUDGET: usize = 24 * 1024;
+/// `memory/entity` is a single-document result — it gets the largest
+/// budget that still clears the frame cap.
+const MEMORY_RPC_ENTITY_CONTENT_BUDGET: usize = 384 * 1024;
+
+/// Wire cost of one char in a JSON string per `serde_json`'s escaper:
+/// `"` / `\` and the short control escapes (`\b \f \n \r \t`)
+/// emit 2 bytes; every other C0 control emits 6 (`\u00XX`); everything
+/// else passes through at its UTF-8 length.
+fn json_escaped_len(c: char) -> usize {
+    match c {
+        '"' | '\\' | '\x08' | '\x0c' | '\n' | '\r' | '\t' => 2,
+        c if (c as u32) < 0x20 => 6,
+        c => c.len_utf8(),
+    }
+}
+
+/// Largest raw prefix of `s` whose JSON-ESCAPED length fits
+/// `escaped_budget`. Always a char boundary (walks `char_indices`).
+fn cap_index_by_escaped_len(s: &str, escaped_budget: usize) -> usize {
+    let mut used = 0usize;
+    for (i, c) in s.char_indices() {
+        let cost = json_escaped_len(c);
+        if used + cost > escaped_budget {
+            return i;
+        }
+        used += cost;
+    }
+    s.len()
+}
+
+/// Cap the string at `obj[field]` to `budget` ESCAPED bytes (UTF-8
+/// boundary, clean prefix — no in-band marker) and record the truth
+/// beside it as `<field>_truncated` + `<field>_total_bytes` (always
+/// written, false/full-length when the field fit).
+fn cap_memory_value_field(obj: &mut Value, field: &str, budget: usize) {
+    let Some(Value::String(s)) = obj.get_mut(field) else {
+        return;
+    };
+    let total = s.len();
+    let cut = cap_index_by_escaped_len(s, budget);
+    let truncated = cut < s.len();
+    if truncated {
+        s.truncate(cut);
+    }
+    if let Some(map) = obj.as_object_mut() {
+        map.insert(format!("{field}_truncated"), json!(truncated));
+        map.insert(format!("{field}_total_bytes"), json!(total));
+    }
+}
+
+/// Apply the per-field budgets to a serialized `MemoryOverviewResponse`.
+fn apply_memory_overview_budgets(overview: &mut Value) {
+    cap_memory_value_field(overview, "long_term", MEMORY_RPC_LONG_TERM_BUDGET);
+    cap_memory_value_field(overview, "today", MEMORY_RPC_TODAY_BUDGET);
+    if let Some(recent) = overview.get_mut("recent").and_then(Value::as_array_mut) {
+        for note in recent {
+            cap_memory_value_field(note, "content", MEMORY_RPC_RECENT_NOTE_BUDGET);
+        }
+    }
+}
+
+async fn handle_memory_overview(
+    ws: &WsConnection,
+    state: &Arc<AppState>,
+    headers: &HeaderMap,
+    identity: Option<&AuthIdentity>,
+    close_on_auth_unavailable: bool,
+    id: String,
+    _params: MemoryOverviewParams,
+) {
+    let method = octos_core::ui_protocol::methods::MEMORY_OVERVIEW;
+    let Some(identity) = identity.cloned() else {
+        // Web PR #114 contract: see `close_ws_with_code` doc-comment. Codex
+        // BLOCK (2026-05-13): close before error so it survives writer
+        // backpressure when the channel has just one free slot.
+        if close_on_auth_unavailable {
+            let _ = close_ws_with_code(ws, 1008, "auth_expired");
+        }
+        let _ = send_rpc_error(ws, Some(id), auth_unavailable_error(method));
+        return;
+    };
+    let result =
+        super::memory_panel::my_memory(State(state.clone()), headers.clone(), Extension(identity))
+            .await;
+    match result {
+        Ok(axum::Json(overview)) => match serde_json::to_value(&overview) {
+            // The REST body is forwarded whole under `overview` (the
+            // `system/status.get` wrap pattern) so the WS shape cannot
+            // drift from `MemoryOverviewResponse` field by field — then
+            // capped per document field so the result fits one WS frame
+            // with EXPLICIT flags instead of the framing guard's silent
+            // head+tail preview (codex #1621 r1 P1).
+            Ok(mut value) => {
+                apply_memory_overview_budgets(&mut value);
+                send_aux_rpc_result(ws, id, method, json!({ "overview": value }))
+            }
+            Err(error) => {
+                let _ = send_rpc_error(
+                    ws,
+                    Some(id),
+                    RpcError::internal_error(format!(
+                        "{method}: serialize memory overview failed: {error}"
+                    )),
+                );
+            }
+        },
+        Err(status) => {
+            // Collection-style endpoint — no addressable id. The REST
+            // handler returns bare `StatusCode`s (no body), so there is
+            // no detail string to forward.
+            let context = RestResourceContext::resource("memory", "");
+            let _ = send_rpc_error(
+                ws,
+                Some(id),
+                rest_status_to_rpc_error(method, status, None, &context),
+            );
+        }
+    }
+}
+
+async fn handle_memory_entity(
+    ws: &WsConnection,
+    state: &Arc<AppState>,
+    headers: &HeaderMap,
+    identity: Option<&AuthIdentity>,
+    close_on_auth_unavailable: bool,
+    id: String,
+    params: MemoryEntityParams,
+) {
+    let method = octos_core::ui_protocol::methods::MEMORY_ENTITY;
+    let Some(identity) = identity.cloned() else {
+        // Web PR #114 contract: see `close_ws_with_code` doc-comment. Codex
+        // BLOCK (2026-05-13): close before error so it survives writer
+        // backpressure when the channel has just one free slot.
+        if close_on_auth_unavailable {
+            let _ = close_ws_with_code(ws, 1008, "auth_expired");
+        }
+        let _ = send_rpc_error(ws, Some(id), auth_unavailable_error(method));
+        return;
+    };
+    let entity_name = params.name.clone();
+    let result = super::memory_panel::my_memory_entity(
+        State(state.clone()),
+        headers.clone(),
+        Extension(identity),
+        axum_path(params.name),
+    )
+    .await;
+    match result {
+        Ok(axum::Json(entity)) => {
+            // `ok` is dropped — RPC success is carried by the envelope.
+            // Content is capped with an EXPLICIT flag so an over-frame
+            // page degrades to a declared prefix, never the framing
+            // guard's silent in-band preview (codex #1621 r1 P1).
+            let mut content = entity.content;
+            let content_total_bytes = content.len();
+            let cut = cap_index_by_escaped_len(&content, MEMORY_RPC_ENTITY_CONTENT_BUDGET);
+            let content_truncated = cut < content.len();
+            if content_truncated {
+                content.truncate(cut);
+            }
+            send_aux_rpc_result(
+                ws,
+                id,
+                method,
+                json!({
+                    "name": entity.name,
+                    "content": content,
+                    "content_truncated": content_truncated,
+                    "content_total_bytes": content_total_bytes,
+                }),
+            );
+        }
+        Err(status) => {
+            // Entity page miss → `RESOURCE_NOT_FOUND` with the page name
+            // echoed in `data.identifier` (the REST 404 carries no body).
+            let context = RestResourceContext::resource("memory_entity", entity_name);
+            let _ = send_rpc_error(
+                ws,
+                Some(id),
+                rest_status_to_rpc_error(method, status, None, &context),
+            );
+        }
+    }
+}
+
+async fn handle_cron_list(
+    ws: &WsConnection,
+    state: &Arc<AppState>,
+    headers: &HeaderMap,
+    identity: Option<&AuthIdentity>,
+    close_on_auth_unavailable: bool,
+    id: String,
+    _params: CronListParams,
+) {
+    let method = octos_core::ui_protocol::methods::CRON_LIST;
+    let Some(identity) = identity.cloned() else {
+        // Web PR #114 contract: see `close_ws_with_code` doc-comment. Codex
+        // BLOCK (2026-05-13): close before error so it survives writer
+        // backpressure when the channel has just one free slot.
+        if close_on_auth_unavailable {
+            let _ = close_ws_with_code(ws, 1008, "auth_expired");
+        }
+        let _ = send_rpc_error(ws, Some(id), auth_unavailable_error(method));
+        return;
+    };
+    let result =
+        super::cron_panel::my_cron(State(state.clone()), headers.clone(), Extension(identity))
+            .await;
+    match result {
+        Ok(axum::Json(body)) => {
+            // The REST body is `{ ok, count, jobs, gateway_running }`;
+            // `ok` is dropped (envelope carries success), the rest is
+            // forwarded field-for-field per `CronListResult`.
+            let jobs = body.get("jobs").cloned().unwrap_or_else(|| json!([]));
+            let count = body.get("count").and_then(Value::as_u64).unwrap_or(0) as usize;
+            let gateway_running = body
+                .get("gateway_running")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            send_aux_rpc_result(
+                ws,
+                id,
+                method,
+                json!({
+                    "jobs": jobs,
+                    "count": count,
+                    "gateway_running": gateway_running,
+                }),
+            );
+        }
+        Err(status) => {
+            // Collection-style endpoint — no addressable id, no REST body.
+            let context = RestResourceContext::resource("cron", "");
+            let _ = send_rpc_error(
+                ws,
+                Some(id),
+                rest_status_to_rpc_error(method, status, None, &context),
+            );
+        }
+    }
+}
+
+async fn handle_cron_toggle(
+    ws: &WsConnection,
+    state: &Arc<AppState>,
+    headers: &HeaderMap,
+    identity: Option<&AuthIdentity>,
+    close_on_auth_unavailable: bool,
+    id: String,
+    params: CronToggleParams,
+) {
+    let method = octos_core::ui_protocol::methods::CRON_TOGGLE;
+    let Some(identity) = identity.cloned() else {
+        // Web PR #114 contract: see `close_ws_with_code` doc-comment. Codex
+        // BLOCK (2026-05-13): close before error so it survives writer
+        // backpressure when the channel has just one free slot.
+        if close_on_auth_unavailable {
+            let _ = close_ws_with_code(ws, 1008, "auth_expired");
+        }
+        let _ = send_rpc_error(ws, Some(id), auth_unavailable_error(method));
+        return;
+    };
+    let job_id = params.job_id.clone();
+    let result = super::cron_panel::set_my_cron_enabled(
+        State(state.clone()),
+        headers.clone(),
+        Extension(identity),
+        axum_path(params.job_id),
+        axum::Json(super::cron_panel::ToggleBody {
+            enabled: params.enabled,
+        }),
+    )
+    .await;
+    match result {
+        Ok(axum::Json(body)) => {
+            // REST success body is `{ ok: true, job }`; forward the job
+            // (rendered exactly as a `cron/list` entry) per
+            // `CronToggleResult`.
+            let job = body.get("job").cloned().unwrap_or_else(|| json!(null));
+            send_aux_rpc_result(ws, id, method, json!({ "job": job }));
+        }
+        Err((status, axum::Json(body))) => {
+            // The REST error body is `{ ok: false, reason }`. Forward
+            // `reason` as the error detail so clients can tell the
+            // gateway-owns-the-store refusal (`detail:
+            // "gateway_running"`, `rest_status: 409`) from a plain miss
+            // without string-matching messages.
+            let detail = body
+                .get("reason")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+                .unwrap_or_else(|| body.to_string());
+            let context = RestResourceContext::resource("cron_job", job_id);
+            let _ = send_rpc_error(
+                ws,
+                Some(id),
+                rest_status_to_rpc_error(method, status, Some(detail), &context),
             );
         }
     }
@@ -25403,7 +25812,11 @@ mod tests {
                 "session_id": session_id,
                 "question": "what are you working on?",
             }),
-            methods::SESSION_LIST | methods::SYSTEM_STATUS_GET | methods::CONTENT_LIST => {
+            methods::SESSION_LIST
+            | methods::SYSTEM_STATUS_GET
+            | methods::CONTENT_LIST
+            | methods::MEMORY_OVERVIEW
+            | methods::CRON_LIST => {
                 json!({})
             }
             methods::SESSION_SNAPSHOT
@@ -25423,6 +25836,8 @@ mod tests {
             }),
             methods::CONTENT_DELETE => json!({ "id": "content-1" }),
             methods::CONTENT_BULK_DELETE => json!({ "ids": ["content-1"] }),
+            methods::MEMORY_ENTITY => json!({ "name": "probe-entity" }),
+            methods::CRON_TOGGLE => json!({ "job_id": "probe-job", "enabled": false }),
             methods::ROUTER_SET_MODE => json!({
                 "session_id": session_id,
                 "mode": "off",
@@ -28127,6 +28542,65 @@ ignore = []
         assert_eq!(frame["id"], json!("content-bulk-delete-unauth"));
         assert_eq!(frame["error"]["data"]["kind"], json!("auth_unavailable"));
 
+        handle_memory_overview(
+            &ws,
+            &state,
+            &headers,
+            None,
+            false,
+            "memory-overview-unauth".into(),
+            MemoryOverviewParams::default(),
+        )
+        .await;
+        let frame = recv_rpc_json(&mut rx).await;
+        assert_eq!(frame["id"], json!("memory-overview-unauth"));
+        assert_eq!(frame["error"]["data"]["kind"], json!("auth_unavailable"));
+
+        handle_memory_entity(
+            &ws,
+            &state,
+            &headers,
+            None,
+            false,
+            "memory-entity-unauth".into(),
+            MemoryEntityParams { name: "e-1".into() },
+        )
+        .await;
+        let frame = recv_rpc_json(&mut rx).await;
+        assert_eq!(frame["id"], json!("memory-entity-unauth"));
+        assert_eq!(frame["error"]["data"]["kind"], json!("auth_unavailable"));
+
+        handle_cron_list(
+            &ws,
+            &state,
+            &headers,
+            None,
+            false,
+            "cron-list-unauth".into(),
+            CronListParams::default(),
+        )
+        .await;
+        let frame = recv_rpc_json(&mut rx).await;
+        assert_eq!(frame["id"], json!("cron-list-unauth"));
+        assert_eq!(frame["error"]["data"]["kind"], json!("auth_unavailable"));
+
+        handle_cron_toggle(
+            &ws,
+            &state,
+            &headers,
+            None,
+            false,
+            "cron-toggle-unauth".into(),
+            CronToggleParams {
+                job_id: "job-1".into(),
+                enabled: true,
+            },
+        )
+        .await;
+        let frame = recv_rpc_json(&mut rx).await;
+        assert_eq!(frame["id"], json!("cron-toggle-unauth"));
+        assert_eq!(frame["error"]["data"]["kind"], json!("auth_unavailable"));
+
         let contracts = Arc::new(UiProtocolContractStores::default());
         let ledger = Arc::new(UiProtocolLedger::new(16));
         let active_turns: SharedActiveTurns = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
@@ -28170,6 +28644,437 @@ ignore = []
         let frame = recv_rpc_json(&mut rx).await;
         assert_eq!(frame["id"], json!("auth-logout-unauth"));
         assert_eq!(frame["error"]["data"]["kind"], json!("auth_unavailable"));
+    }
+
+    fn panel_user_profile(id: &str) -> crate::profiles::UserProfile {
+        crate::profiles::UserProfile {
+            id: id.into(),
+            name: id.into(),
+            enabled: true,
+            data_dir: None,
+            parent_id: None,
+            public_subdomain: None,
+            config: crate::profiles::ProfileConfig::default(),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        }
+    }
+
+    fn panel_cron_job(id: &str, enabled: bool) -> octos_bus::CronJob {
+        octos_bus::CronJob {
+            id: id.into(),
+            name: format!("job {id}"),
+            enabled,
+            schedule: octos_bus::CronSchedule::Every {
+                every_ms: 1_800_000,
+            },
+            payload: octos_bus::CronPayload {
+                message: "check the queue".into(),
+                deliver: false,
+                channel: Some("system".into()),
+                chat_id: None,
+            },
+            state: Default::default(),
+            created_at_ms: 1,
+            delete_after_run: false,
+            timezone: None,
+        }
+    }
+
+    /// `memory/overview`, `memory/entity`, `cron/list`, and `cron/toggle`
+    /// are thin WS wrappers over the REST panel handlers
+    /// (`memory_panel::my_memory`/`my_memory_entity`,
+    /// `cron_panel::my_cron`/`set_my_cron_enabled`). This pins the wire
+    /// shapes the wrappers rebuild (`MemoryOverviewResult` /
+    /// `MemoryEntityResult` / `CronListResult` / `CronToggleResult`) and
+    /// the typed 404s (`RESOURCE_NOT_FOUND` with the REST `reason`
+    /// forwarded as `data.detail` on the cron side).
+    #[tokio::test]
+    async fn memory_and_cron_rpc_methods_forward_rest_panel_bodies() {
+        let dir = tempfile::tempdir().unwrap();
+        let profile_store = Arc::new(crate::profiles::ProfileStore::open(dir.path()).unwrap());
+        let profile = panel_user_profile("tenant");
+        profile_store.save(&profile).unwrap();
+        let data_dir = profile_store.resolve_data_dir(&profile);
+
+        let mem = octos_memory::MemoryStore::open(&data_dir).await.unwrap();
+        mem.write_long_term("# MEMORY\n\n- remembers things\n")
+            .await
+            .unwrap();
+        mem.write_entity("fleet", "# fleet\n\nAbstract: five minis\n")
+            .await
+            .unwrap();
+
+        tokio::fs::create_dir_all(&data_dir).await.unwrap();
+        let cron_store = octos_bus::CronStore {
+            version: 1,
+            jobs: vec![panel_cron_job("job-1", false)],
+        };
+        tokio::fs::write(
+            data_dir.join("cron.json"),
+            serde_json::to_string_pretty(&cron_store).unwrap(),
+        )
+        .await
+        .unwrap();
+
+        let state = Arc::new(AppState {
+            profile_store: Some(profile_store),
+            ..AppState::empty_for_tests()
+        });
+        let headers = HeaderMap::new();
+        let identity = AuthIdentity::User {
+            id: "tenant".into(),
+            role: crate::user_store::UserRole::User,
+        };
+        let (ws, mut rx) = ws_connection_for_test(16);
+
+        // memory/overview — REST body forwarded whole under `overview`.
+        handle_memory_overview(
+            &ws,
+            &state,
+            &headers,
+            Some(&identity),
+            true,
+            "mem-overview".into(),
+            MemoryOverviewParams::default(),
+        )
+        .await;
+        let frame = recv_rpc_json(&mut rx).await;
+        assert_eq!(frame["id"], json!("mem-overview"));
+        let overview = &frame["result"]["overview"];
+        assert_eq!(overview["ok"], json!(true));
+        assert!(
+            overview["long_term"]
+                .as_str()
+                .unwrap()
+                .contains("remembers things")
+        );
+        assert_eq!(overview["entities"][0]["name"], json!("fleet"));
+        // Truncation metadata is ALWAYS present (false/full when whole).
+        assert_eq!(overview["long_term_truncated"], json!(false));
+        assert_eq!(overview["today_truncated"], json!(false));
+
+        // memory/entity — `{ name, content }`, no `ok` flag.
+        handle_memory_entity(
+            &ws,
+            &state,
+            &headers,
+            Some(&identity),
+            true,
+            "mem-entity".into(),
+            MemoryEntityParams {
+                name: "fleet".into(),
+            },
+        )
+        .await;
+        let frame = recv_rpc_json(&mut rx).await;
+        assert_eq!(frame["id"], json!("mem-entity"));
+        assert_eq!(frame["result"]["name"], json!("fleet"));
+        let content = frame["result"]["content"].as_str().unwrap();
+        assert!(content.contains("five minis"));
+        // Truncation metadata is ALWAYS present (false/full when whole).
+        assert_eq!(frame["result"]["content_truncated"], json!(false));
+        assert_eq!(frame["result"]["content_total_bytes"], json!(content.len()));
+        assert!(frame["result"].get("ok").is_none());
+
+        // memory/entity miss — typed RESOURCE_NOT_FOUND with the page
+        // name in `identifier`, not UNKNOWN_SESSION.
+        handle_memory_entity(
+            &ws,
+            &state,
+            &headers,
+            Some(&identity),
+            true,
+            "mem-entity-miss".into(),
+            MemoryEntityParams {
+                name: "missing".into(),
+            },
+        )
+        .await;
+        let frame = recv_rpc_json(&mut rx).await;
+        assert_eq!(frame["id"], json!("mem-entity-miss"));
+        assert_eq!(frame["error"]["data"]["kind"], json!("not_found"));
+        assert_eq!(
+            frame["error"]["data"]["resource_type"],
+            json!("memory_entity")
+        );
+        assert_eq!(frame["error"]["data"]["identifier"], json!("missing"));
+        assert_eq!(frame["error"]["data"]["rest_status"], json!(404));
+
+        // cron/list — `{ jobs, count, gateway_running }`, no `ok` flag.
+        handle_cron_list(
+            &ws,
+            &state,
+            &headers,
+            Some(&identity),
+            true,
+            "cron-list".into(),
+            CronListParams::default(),
+        )
+        .await;
+        let frame = recv_rpc_json(&mut rx).await;
+        assert_eq!(frame["id"], json!("cron-list"));
+        assert_eq!(frame["result"]["count"], json!(1));
+        assert_eq!(frame["result"]["gateway_running"], json!(false));
+        assert_eq!(frame["result"]["jobs"][0]["id"], json!("job-1"));
+        assert_eq!(frame["result"]["jobs"][0]["enabled"], json!(false));
+        assert!(frame["result"].get("ok").is_none());
+
+        // cron/toggle — updated job forwarded under `job`.
+        handle_cron_toggle(
+            &ws,
+            &state,
+            &headers,
+            Some(&identity),
+            true,
+            "cron-toggle".into(),
+            CronToggleParams {
+                job_id: "job-1".into(),
+                enabled: true,
+            },
+        )
+        .await;
+        let frame = recv_rpc_json(&mut rx).await;
+        assert_eq!(frame["id"], json!("cron-toggle"));
+        assert_eq!(frame["result"]["job"]["id"], json!("job-1"));
+        assert_eq!(frame["result"]["job"]["enabled"], json!(true));
+
+        // cron/toggle miss — the REST `{ ok: false, reason }` body's
+        // reason is forwarded as `data.detail` so clients can branch on
+        // refusal kinds (`job_not_found` here, `gateway_running` when a
+        // spawned gateway owns the store) without parsing messages.
+        handle_cron_toggle(
+            &ws,
+            &state,
+            &headers,
+            Some(&identity),
+            true,
+            "cron-toggle-miss".into(),
+            CronToggleParams {
+                job_id: "nope".into(),
+                enabled: true,
+            },
+        )
+        .await;
+        let frame = recv_rpc_json(&mut rx).await;
+        assert_eq!(frame["id"], json!("cron-toggle-miss"));
+        assert_eq!(frame["error"]["data"]["kind"], json!("not_found"));
+        assert_eq!(frame["error"]["data"]["resource_type"], json!("cron_job"));
+        assert_eq!(frame["error"]["data"]["identifier"], json!("nope"));
+        assert_eq!(frame["error"]["data"]["rest_status"], json!(404));
+        assert_eq!(frame["error"]["data"]["detail"], json!("job_not_found"));
+    }
+
+    /// codex #1621 r1 P1: a memory file the panel legitimately serves
+    /// (≤ 2 MiB) can exceed the ~1 MiB WS frame cap; without a
+    /// handler-level budget the outbound framing guard would splice a
+    /// head+tail preview INTO the markdown while the envelope still
+    /// reports success. The RPC layer instead caps each document field
+    /// to a per-field budget and DECLARES it: clean UTF-8 prefix +
+    /// `<field>_truncated` / `<field>_total_bytes`.
+    #[tokio::test]
+    async fn memory_rpc_methods_declare_truncation_when_over_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let profile_store = Arc::new(crate::profiles::ProfileStore::open(dir.path()).unwrap());
+        let profile = panel_user_profile("tenant");
+        profile_store.save(&profile).unwrap();
+        let data_dir = profile_store.resolve_data_dir(&profile);
+
+        let long_term = format!(
+            "# MEMORY\n{}",
+            "m".repeat(MEMORY_RPC_LONG_TERM_BUDGET + 4096)
+        );
+        let entity_page = format!(
+            "# whale\n{}",
+            "e".repeat(MEMORY_RPC_ENTITY_CONTENT_BUDGET + 4096)
+        );
+        let mem = octos_memory::MemoryStore::open(&data_dir).await.unwrap();
+        mem.write_long_term(&long_term).await.unwrap();
+        mem.write_entity("whale", &entity_page).await.unwrap();
+
+        let state = Arc::new(AppState {
+            profile_store: Some(profile_store),
+            ..AppState::empty_for_tests()
+        });
+        let headers = HeaderMap::new();
+        let identity = AuthIdentity::User {
+            id: "tenant".into(),
+            role: crate::user_store::UserRole::User,
+        };
+        let (ws, mut rx) = ws_connection_for_test(16);
+
+        handle_memory_overview(
+            &ws,
+            &state,
+            &headers,
+            Some(&identity),
+            true,
+            "mem-overview-cap".into(),
+            MemoryOverviewParams::default(),
+        )
+        .await;
+        let frame = recv_rpc_json(&mut rx).await;
+        let overview = &frame["result"]["overview"];
+        let served = overview["long_term"].as_str().unwrap();
+        // Budgets are ESCAPED-byte budgets: the raw cut lands within
+        // the budget and the SERIALIZED field provably fits it.
+        assert!(served.len() <= MEMORY_RPC_LONG_TERM_BUDGET);
+        assert!(served.len() > MEMORY_RPC_LONG_TERM_BUDGET - 8);
+        let wire = serde_json::to_string(served).expect("serialize");
+        assert!(wire.len() - 2 <= MEMORY_RPC_LONG_TERM_BUDGET);
+        assert_eq!(overview["long_term_truncated"], json!(true));
+        assert_eq!(
+            overview["long_term_total_bytes"],
+            json!(long_term.len()),
+            "total reports the FULL pre-cap size",
+        );
+        // Clean prefix — the cap never splices a marker into content.
+        assert_eq!(served, &long_term[..served.len()]);
+        assert_eq!(overview["today_truncated"], json!(false));
+
+        handle_memory_entity(
+            &ws,
+            &state,
+            &headers,
+            Some(&identity),
+            true,
+            "mem-entity-cap".into(),
+            MemoryEntityParams {
+                name: "whale".into(),
+            },
+        )
+        .await;
+        let frame = recv_rpc_json(&mut rx).await;
+        let served = frame["result"]["content"].as_str().unwrap();
+        assert!(served.len() <= MEMORY_RPC_ENTITY_CONTENT_BUDGET);
+        assert!(served.len() > MEMORY_RPC_ENTITY_CONTENT_BUDGET - 8);
+        let wire = serde_json::to_string(served).expect("serialize");
+        assert!(wire.len() - 2 <= MEMORY_RPC_ENTITY_CONTENT_BUDGET);
+        assert_eq!(frame["result"]["content_truncated"], json!(true));
+        assert_eq!(
+            frame["result"]["content_total_bytes"],
+            json!(entity_page.len())
+        );
+        assert_eq!(served, &entity_page[..served.len()]);
+    }
+
+    /// The budget helper must cut on a UTF-8 char boundary (a capped
+    /// multibyte document ends short of the budget rather than mid
+    /// codepoint) and must no-op on absent / non-string fields.
+    #[test]
+    fn cap_memory_value_field_is_utf8_safe_and_typed() {
+        // 3-byte codepoints; budget of 8 lands mid-codepoint → cut at 6.
+        let mut obj = json!({ "content": "€€€" });
+        cap_memory_value_field(&mut obj, "content", 8);
+        assert_eq!(obj["content"], json!("€€"));
+        assert_eq!(obj["content_truncated"], json!(true));
+        assert_eq!(obj["content_total_bytes"], json!(9));
+
+        // Under budget: flags present, false/full.
+        let mut obj = json!({ "content": "abc" });
+        cap_memory_value_field(&mut obj, "content", 8);
+        assert_eq!(obj["content"], json!("abc"));
+        assert_eq!(obj["content_truncated"], json!(false));
+        assert_eq!(obj["content_total_bytes"], json!(3));
+
+        // Absent / non-string fields: untouched, no flags invented.
+        let mut obj = json!({ "count": 7 });
+        cap_memory_value_field(&mut obj, "content", 8);
+        assert_eq!(obj, json!({ "count": 7 }));
+        cap_memory_value_field(&mut obj, "count", 8);
+        assert_eq!(obj, json!({ "count": 7 }));
+    }
+
+    /// Budget arithmetic guard: budgets are ESCAPED-byte budgets (codex
+    /// r2 P1 — C0 controls cost 6 wire bytes each, so raw-byte caps
+    /// under-count), which makes the worst-case wire size the PLAIN sum
+    /// of the budgets plus the bounded entities and envelope. That sum
+    /// must clear the frame cap — otherwise the framing guard's silent
+    /// preview becomes reachable again.
+    #[test]
+    fn memory_rpc_budgets_fit_one_ws_frame_at_escape_worst_case() {
+        // Entities bound (escaped): MAX_PANEL_ENTITIES × (100-raw-byte
+        // summary → ≤ 600 escaped + 255-raw-byte name → ≤ 1530 escaped
+        // (codex r3 P3: Unix filenames may carry non-short C0 controls,
+        // which serialize at 6 bytes per char — not just the 2-byte
+        // quote/backslash class) + ~40 bytes JSON overhead).
+        let entities_bound = 256 * (600 + 255 * 6 + 40);
+        let overview_escaped = MEMORY_RPC_LONG_TERM_BUDGET
+            + MEMORY_RPC_TODAY_BUDGET
+            + 7 * MEMORY_RPC_RECENT_NOTE_BUDGET
+            + entities_bound;
+        let envelope_overhead = 4 * 1024;
+        assert!(
+            overview_escaped + envelope_overhead < MAX_TEXT_FRAME_BYTES,
+            "overview budgets ({overview_escaped} escaped) must fit the {MAX_TEXT_FRAME_BYTES}-byte frame",
+        );
+        assert!(
+            MEMORY_RPC_ENTITY_CONTENT_BUDGET + envelope_overhead < MAX_TEXT_FRAME_BYTES,
+            "entity budget must fit the frame",
+        );
+    }
+
+    /// codex #1621 r2 P1 regression: C0 control bytes cost SIX wire
+    /// bytes each (`\u0001`), so the cap must count escaped length —
+    /// a control-heavy document must be cut to budget/6 raw bytes and
+    /// the SERIALIZED field must stay within budget.
+    #[test]
+    fn cap_memory_value_field_counts_six_byte_control_escapes() {
+        let raw = "\u{0001}".repeat(1000); // 6000 escaped bytes
+        let mut obj = json!({ "content": raw });
+        cap_memory_value_field(&mut obj, "content", 600);
+        let served = obj["content"].as_str().unwrap();
+        assert_eq!(served.chars().count(), 100, "600 budget / 6 per control");
+        assert_eq!(obj["content_truncated"], json!(true));
+        assert_eq!(obj["content_total_bytes"], json!(1000));
+        // The PROOF: the serialized field fits the escaped budget.
+        let wire = serde_json::to_string(&obj["content"]).expect("serialize");
+        assert!(
+            wire.len() <= 600 + 2, // + surrounding quotes
+            "serialized capped field ({} bytes) must fit the escaped budget",
+            wire.len(),
+        );
+
+        // Quotes/backslashes cost 2; multibyte costs its UTF-8 length.
+        let mut obj = json!({ "content": "\"\\€x" }); // 2+2+3+1 = 8 escaped
+        cap_memory_value_field(&mut obj, "content", 7);
+        assert_eq!(obj["content"], json!("\"\\€"));
+        assert_eq!(obj["content_truncated"], json!(true));
+    }
+
+    /// WS-transport auth expiry: the close-code 1008 frame must precede
+    /// the error envelope (codex BLOCK 2026-05-13 — the close is the
+    /// load-bearing signal for the SPA `crew:auth_expired` listener and
+    /// must survive writer backpressure). Representative check on
+    /// `memory/overview`; all four panel wrappers share the shape.
+    #[tokio::test]
+    async fn memory_overview_ws_auth_expiry_closes_1008_before_error() {
+        let state = Arc::new(AppState::empty_for_tests());
+        let headers = HeaderMap::new();
+        let (ws, mut rx) = ws_connection_for_test(16);
+
+        handle_memory_overview(
+            &ws,
+            &state,
+            &headers,
+            None,
+            true,
+            "mem-overview-expired".into(),
+            MemoryOverviewParams::default(),
+        )
+        .await;
+
+        let first = rx.recv().await.expect("close frame");
+        match first {
+            axum::extract::ws::Message::Close(Some(frame)) => {
+                assert_eq!(frame.code, 1008);
+                assert_eq!(frame.reason.as_str(), "auth_expired");
+            }
+            other => panic!("expected close frame with 1008, got {other:?}"),
+        }
+        let second = recv_rpc_json(&mut rx).await;
+        assert_eq!(second["id"], json!("mem-overview-expired"));
+        assert_eq!(second["error"]["data"]["kind"], json!("auth_unavailable"));
     }
 
     #[tokio::test]
@@ -34823,6 +35728,10 @@ ignore = []
             octos_core::ui_protocol::methods::CONTENT_LIST,
             octos_core::ui_protocol::methods::CONTENT_DELETE,
             octos_core::ui_protocol::methods::CONTENT_BULK_DELETE,
+            octos_core::ui_protocol::methods::MEMORY_OVERVIEW,
+            octos_core::ui_protocol::methods::MEMORY_ENTITY,
+            octos_core::ui_protocol::methods::CRON_LIST,
+            octos_core::ui_protocol::methods::CRON_TOGGLE,
             octos_core::ui_protocol::methods::SESSION_FORK,
         ] {
             assert!(

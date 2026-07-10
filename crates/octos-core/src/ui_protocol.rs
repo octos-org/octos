@@ -319,7 +319,11 @@ fn method_capability_gate(method: &str) -> Option<&'static str> {
         | methods::SYSTEM_STATUS_GET
         | methods::CONTENT_LIST
         | methods::CONTENT_DELETE
-        | methods::CONTENT_BULK_DELETE => Some(UI_PROTOCOL_FEATURE_AUXILIARY_REST_TO_WS_V1),
+        | methods::CONTENT_BULK_DELETE
+        | methods::MEMORY_OVERVIEW
+        | methods::MEMORY_ENTITY
+        | methods::CRON_LIST
+        | methods::CRON_TOGGLE => Some(UI_PROTOCOL_FEATURE_AUXILIARY_REST_TO_WS_V1),
         methods::AGENT_LIST
         | methods::AGENT_STATUS_READ
         | methods::AGENT_OUTPUT_READ
@@ -1152,6 +1156,15 @@ pub mod methods {
     pub const CONTENT_DELETE: &str = "content/delete";
     /// Replaces `POST /api/my/content/bulk-delete` — bulk-content deletion.
     pub const CONTENT_BULK_DELETE: &str = "content/bulk_delete";
+    /// Replaces `GET /api/my/memory` — memory panel overview (long-term
+    /// memory, daily notes, entity bank summaries, staging count).
+    pub const MEMORY_OVERVIEW: &str = "memory/overview";
+    /// Replaces `GET /api/my/memory/entities/{name}` — full entity page.
+    pub const MEMORY_ENTITY: &str = "memory/entity";
+    /// Replaces `GET /api/my/cron` — cron panel job listing.
+    pub const CRON_LIST: &str = "cron/list";
+    /// Replaces `PUT /api/my/cron/{job_id}/enabled` — cron job toggle.
+    pub const CRON_TOGGLE: &str = "cron/toggle";
 
     // ---- Wave4-A: adaptive routing + queue state ----
 
@@ -1255,6 +1268,10 @@ pub const UI_PROTOCOL_COMMAND_METHODS: &[&str] = &[
     methods::CONTENT_LIST,
     methods::CONTENT_DELETE,
     methods::CONTENT_BULK_DELETE,
+    methods::MEMORY_OVERVIEW,
+    methods::MEMORY_ENTITY,
+    methods::CRON_LIST,
+    methods::CRON_TOGGLE,
     methods::ROUTER_SET_MODE,
     methods::ROUTER_GET_METRICS,
 ];
@@ -1360,6 +1377,10 @@ pub const UI_PROTOCOL_FIRST_SERVER_METHODS: &[&str] = &[
     methods::CONTENT_LIST,
     methods::CONTENT_DELETE,
     methods::CONTENT_BULK_DELETE,
+    methods::MEMORY_OVERVIEW,
+    methods::MEMORY_ENTITY,
+    methods::CRON_LIST,
+    methods::CRON_TOGGLE,
     methods::ROUTER_SET_MODE,
     methods::ROUTER_GET_METRICS,
 ];
@@ -3165,6 +3186,89 @@ pub struct ContentBulkDeleteResult {
     pub deleted: usize,
 }
 
+/// Params for `memory/overview`. Empty today; the struct exists so
+/// `{}` / `null` params decode uniformly (mirrors
+/// [`SystemStatusGetParams`]; the wire `params` MEMBER must still be
+/// present — the frame parser rejects requests without one).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemoryOverviewParams {}
+
+/// Result for `memory/overview`. `overview` is the JSON body of the
+/// existing `GET /api/my/memory` handler (`MemoryOverviewResponse` —
+/// `crates/octos-cli/src/api/memory_panel.rs`), forwarded whole so the
+/// wire shape and the REST shape cannot drift apart — PLUS RPC-layer
+/// truncation metadata: the panel serves files up to 2 MiB but an RPC
+/// result must fit one ~1 MiB WS text frame, so the dispatcher caps
+/// each document field to a per-field byte budget and records the
+/// truth beside it (`long_term_truncated` + `long_term_total_bytes`,
+/// `today_truncated` + `today_total_bytes`, and per `recent[]` note
+/// `content_truncated` + `content_total_bytes`; always present on the
+/// WS wire). Capped fields are clean UTF-8 prefixes — no in-band
+/// marker is ever spliced into the markdown.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MemoryOverviewResult {
+    pub overview: Value,
+}
+
+/// Params for `memory/entity`. `name` is the entity page stem — the
+/// same value the REST route took as its `{name}` path segment and the
+/// same string `memory/overview` returns in each entity summary.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemoryEntityParams {
+    pub name: String,
+}
+
+/// Result for `memory/entity`. Mirrors the JSON body of
+/// `GET /api/my/memory/entities/{name}` minus the redundant `ok` flag
+/// (RPC success is carried by the envelope), plus RPC-layer truncation
+/// metadata (the panel serves files up to 2 MiB; an RPC result must
+/// fit one ~1 MiB WS text frame).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemoryEntityResult {
+    pub name: String,
+    /// Page markdown. When `content_truncated` is true this is a clean
+    /// UTF-8 PREFIX of the page capped at the RPC-layer byte budget —
+    /// no in-band marker is spliced into it.
+    pub content: String,
+    /// True when `content` was capped to fit the WS frame.
+    pub content_truncated: bool,
+    /// Raw byte length of the FULL page before any RPC-layer cap.
+    pub content_total_bytes: usize,
+}
+
+/// Params for `cron/list`. Empty today; the struct exists so `{}` /
+/// `null` params decode uniformly (mirrors [`SystemStatusGetParams`];
+/// the wire `params` MEMBER must still be present).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CronListParams {}
+
+/// Result for `cron/list`. Mirrors the JSON body of `GET /api/my/cron`:
+/// `jobs` is the rendered job array, `count` its length, and
+/// `gateway_running` reports whether a spawned gateway child owns
+/// `cron.json` (toggles are refused while it does).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CronListResult {
+    pub jobs: Value,
+    pub count: usize,
+    pub gateway_running: bool,
+}
+
+/// Params for `cron/toggle`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CronToggleParams {
+    pub job_id: String,
+    pub enabled: bool,
+}
+
+/// Result for `cron/toggle`. `job` is the updated job rendered exactly
+/// as a `cron/list` entry. Refusals (spawned gateway owns the store)
+/// surface as an RPC error whose `data.detail` is `"gateway_running"`
+/// with `data.rest_status = 409`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CronToggleResult {
+    pub job: Value,
+}
+
 // ----- Wave4-A `router/*` + `queue/state` -----
 
 /// Wave4-A `router/set_mode` params. `mode` is the lowercase string
@@ -3768,6 +3872,10 @@ pub enum UiCommand {
     ContentList(ContentListParams),
     ContentDelete(ContentDeleteParams),
     ContentBulkDelete(ContentBulkDeleteParams),
+    MemoryOverview(MemoryOverviewParams),
+    MemoryEntity(MemoryEntityParams),
+    CronList(CronListParams),
+    CronToggle(CronToggleParams),
     // ---- Wave4-A: adaptive router controls ----
     RouterSetMode(RouterSetModeParams),
     RouterGetMetrics(RouterGetMetricsParams),
@@ -3811,6 +3919,10 @@ impl UiCommand {
             Self::ContentList(_) => methods::CONTENT_LIST,
             Self::ContentDelete(_) => methods::CONTENT_DELETE,
             Self::ContentBulkDelete(_) => methods::CONTENT_BULK_DELETE,
+            Self::MemoryOverview(_) => methods::MEMORY_OVERVIEW,
+            Self::MemoryEntity(_) => methods::MEMORY_ENTITY,
+            Self::CronList(_) => methods::CRON_LIST,
+            Self::CronToggle(_) => methods::CRON_TOGGLE,
             Self::RouterSetMode(_) => methods::ROUTER_SET_MODE,
             Self::RouterGetMetrics(_) => methods::ROUTER_GET_METRICS,
         }
@@ -3857,6 +3969,10 @@ impl UiCommand {
             Self::ContentList(params) => serde_json::to_value(params),
             Self::ContentDelete(params) => serde_json::to_value(params),
             Self::ContentBulkDelete(params) => serde_json::to_value(params),
+            Self::MemoryOverview(params) => serde_json::to_value(params),
+            Self::MemoryEntity(params) => serde_json::to_value(params),
+            Self::CronList(params) => serde_json::to_value(params),
+            Self::CronToggle(params) => serde_json::to_value(params),
             Self::RouterSetMode(params) => serde_json::to_value(params),
             Self::RouterGetMetrics(params) => serde_json::to_value(params),
         }?;
@@ -3943,6 +4059,12 @@ impl UiCommand {
             methods::CONTENT_BULK_DELETE => {
                 Ok(Self::ContentBulkDelete(decode_params(method, params)?))
             }
+            methods::MEMORY_OVERVIEW => Ok(Self::MemoryOverview(decode_optional_params(
+                method, params,
+            )?)),
+            methods::MEMORY_ENTITY => Ok(Self::MemoryEntity(decode_params(method, params)?)),
+            methods::CRON_LIST => Ok(Self::CronList(decode_optional_params(method, params)?)),
+            methods::CRON_TOGGLE => Ok(Self::CronToggle(decode_params(method, params)?)),
             methods::ROUTER_SET_MODE => Ok(Self::RouterSetMode(decode_params(method, params)?)),
             methods::ROUTER_GET_METRICS => {
                 Ok(Self::RouterGetMetrics(decode_params(method, params)?))
@@ -7089,6 +7211,10 @@ mod tests {
                 "content/list",
                 "content/delete",
                 "content/bulk_delete",
+                "memory/overview",
+                "memory/entity",
+                "cron/list",
+                "cron/toggle",
                 "router/set_mode",
                 "router/get_metrics",
             ]
@@ -7196,6 +7322,10 @@ mod tests {
                 "content/list",
                 "content/delete",
                 "content/bulk_delete",
+                "memory/overview",
+                "memory/entity",
+                "cron/list",
+                "cron/toggle",
                 "router/set_mode",
                 "router/get_metrics",
             ]
@@ -7272,6 +7402,10 @@ mod tests {
                     "content/list",
                     "content/delete",
                     "content/bulk_delete",
+                    "memory/overview",
+                    "memory/entity",
+                    "cron/list",
+                    "cron/toggle",
                     "router/set_mode",
                     "router/get_metrics"
                 ],
@@ -10839,17 +10973,39 @@ mod tests {
                 }),
                 methods::CONTENT_BULK_DELETE,
             ),
+            (
+                UiCommand::MemoryOverview(MemoryOverviewParams::default()),
+                methods::MEMORY_OVERVIEW,
+            ),
+            (
+                UiCommand::MemoryEntity(MemoryEntityParams {
+                    name: "acme-corp".into(),
+                }),
+                methods::MEMORY_ENTITY,
+            ),
+            (
+                UiCommand::CronList(CronListParams::default()),
+                methods::CRON_LIST,
+            ),
+            (
+                UiCommand::CronToggle(CronToggleParams {
+                    job_id: "job-1".into(),
+                    enabled: false,
+                }),
+                methods::CRON_TOGGLE,
+            ),
         ];
         assert_eq!(
             cases.len(),
-            13,
-            "13 UiCommand arms cover the 13 auxiliary methods \
+            17,
+            "17 UiCommand arms cover the 17 auxiliary methods \
              (`session/list`, `session/snapshot`, `session/messages_page`, \
              `session/status.get`, `session/files.list`, `session/tasks.list`, \
              `session/workspace.get`, `session/title.set`, `session/delete`, \
              `system/status.get`, `content/list`, `content/delete`, \
-             `content/bulk_delete`) — `content/delete` and `content/bulk_delete` \
-             are distinct methods"
+             `content/bulk_delete`, `memory/overview`, `memory/entity`, \
+             `cron/list`, `cron/toggle`) — `content/delete` and \
+             `content/bulk_delete` are distinct methods"
         );
         for (command, expected_method) in cases {
             let rpc = command
@@ -10881,6 +11037,15 @@ mod tests {
             UiCommand::from_method_and_params(methods::CONTENT_LIST, Value::Null)
                 .expect("content/list with null params");
         assert!(matches!(content_list_null, UiCommand::ContentList(_)));
+
+        let memory_overview_null =
+            UiCommand::from_method_and_params(methods::MEMORY_OVERVIEW, Value::Null)
+                .expect("memory/overview with null params");
+        assert!(matches!(memory_overview_null, UiCommand::MemoryOverview(_)));
+
+        let cron_list_null = UiCommand::from_method_and_params(methods::CRON_LIST, Value::Null)
+            .expect("cron/list with null params");
+        assert!(matches!(cron_list_null, UiCommand::CronList(_)));
     }
 
     #[test]
@@ -10944,6 +11109,41 @@ mod tests {
         let value = serde_json::to_value(&bulk).expect("serialize");
         let decoded: ContentBulkDeleteResult = serde_json::from_value(value).expect("deserialize");
         assert_eq!(decoded, bulk);
+
+        let overview = MemoryOverviewResult {
+            overview: serde_json::json!({ "ok": true, "long_term": "# MEMORY" }),
+        };
+        let value = serde_json::to_value(&overview).expect("serialize");
+        let decoded: MemoryOverviewResult = serde_json::from_value(value).expect("deserialize");
+        assert_eq!(decoded.overview, overview.overview);
+
+        let entity = MemoryEntityResult {
+            name: "acme-corp".into(),
+            content: "# acme".into(),
+            content_truncated: false,
+            content_total_bytes: 6,
+        };
+        let value = serde_json::to_value(&entity).expect("serialize");
+        let decoded: MemoryEntityResult = serde_json::from_value(value).expect("deserialize");
+        assert_eq!(decoded, entity);
+
+        let cron = CronListResult {
+            jobs: serde_json::json!([{ "id": "job-1" }]),
+            count: 1,
+            gateway_running: false,
+        };
+        let value = serde_json::to_value(&cron).expect("serialize");
+        let decoded: CronListResult = serde_json::from_value(value).expect("deserialize");
+        assert_eq!(decoded.jobs, cron.jobs);
+        assert_eq!(decoded.count, cron.count);
+        assert!(!decoded.gateway_running);
+
+        let toggle = CronToggleResult {
+            job: serde_json::json!({ "id": "job-1", "enabled": false }),
+        };
+        let value = serde_json::to_value(&toggle).expect("serialize");
+        let decoded: CronToggleResult = serde_json::from_value(value).expect("deserialize");
+        assert_eq!(decoded.job, toggle.job);
     }
 
     #[test]
@@ -10967,6 +11167,10 @@ mod tests {
             methods::CONTENT_LIST,
             methods::CONTENT_DELETE,
             methods::CONTENT_BULK_DELETE,
+            methods::MEMORY_OVERVIEW,
+            methods::MEMORY_ENTITY,
+            methods::CRON_LIST,
+            methods::CRON_TOGGLE,
         ] {
             assert!(
                 !none.supports_method(method),
@@ -10991,6 +11195,10 @@ mod tests {
             methods::CONTENT_LIST,
             methods::CONTENT_DELETE,
             methods::CONTENT_BULK_DELETE,
+            methods::MEMORY_OVERVIEW,
+            methods::MEMORY_ENTITY,
+            methods::CRON_LIST,
+            methods::CRON_TOGGLE,
         ] {
             assert!(
                 with_feature.supports_method(method),
@@ -11170,6 +11378,37 @@ mod tests {
             .expect("serialize"),
             serde_json::json!({ "ids": ["c-1", "c-2"] }),
         );
+
+        // memory/overview — empty
+        assert_eq!(
+            serde_json::to_value(MemoryOverviewParams::default()).expect("serialize"),
+            serde_json::json!({}),
+        );
+
+        // memory/entity
+        assert_eq!(
+            serde_json::to_value(MemoryEntityParams {
+                name: "acme-corp".into(),
+            })
+            .expect("serialize"),
+            serde_json::json!({ "name": "acme-corp" }),
+        );
+
+        // cron/list — empty
+        assert_eq!(
+            serde_json::to_value(CronListParams::default()).expect("serialize"),
+            serde_json::json!({}),
+        );
+
+        // cron/toggle
+        assert_eq!(
+            serde_json::to_value(CronToggleParams {
+                job_id: "job-1".into(),
+                enabled: true,
+            })
+            .expect("serialize"),
+            serde_json::json!({ "job_id": "job-1", "enabled": true }),
+        );
     }
 
     /// Codex review 2026-05-12 (MEDIUM 2): JSON golden assertions for
@@ -11302,6 +11541,58 @@ mod tests {
         assert_eq!(
             serde_json::to_value(ContentBulkDeleteResult { deleted: 12 }).expect("serialize"),
             serde_json::json!({ "deleted": 12 }),
+        );
+
+        // memory/overview — `{ overview: <opaque REST body> }`
+        assert_eq!(
+            serde_json::to_value(MemoryOverviewResult {
+                overview: serde_json::json!({ "ok": true, "staging_notes": 2 }),
+            })
+            .expect("serialize"),
+            serde_json::json!({ "overview": { "ok": true, "staging_notes": 2 } }),
+        );
+
+        // memory/entity — `{ name, content, content_truncated,
+        // content_total_bytes }` (truncation metadata is part of the
+        // wire contract: capped fields must be DECLARED, never silent).
+        assert_eq!(
+            serde_json::to_value(MemoryEntityResult {
+                name: "acme-corp".into(),
+                content: "# acme".into(),
+                content_truncated: false,
+                content_total_bytes: 6,
+            })
+            .expect("serialize"),
+            serde_json::json!({
+                "name": "acme-corp",
+                "content": "# acme",
+                "content_truncated": false,
+                "content_total_bytes": 6,
+            }),
+        );
+
+        // cron/list — `{ jobs, count, gateway_running }`
+        assert_eq!(
+            serde_json::to_value(CronListResult {
+                jobs: serde_json::json!([{ "id": "job-1" }]),
+                count: 1,
+                gateway_running: true,
+            })
+            .expect("serialize"),
+            serde_json::json!({
+                "jobs": [{ "id": "job-1" }],
+                "count": 1,
+                "gateway_running": true,
+            }),
+        );
+
+        // cron/toggle — `{ job: <opaque cron/list entry> }`
+        assert_eq!(
+            serde_json::to_value(CronToggleResult {
+                job: serde_json::json!({ "id": "job-1", "enabled": false }),
+            })
+            .expect("serialize"),
+            serde_json::json!({ "job": { "id": "job-1", "enabled": false } }),
         );
     }
 
