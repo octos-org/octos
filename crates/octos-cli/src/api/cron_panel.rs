@@ -202,24 +202,16 @@ pub(crate) async fn apply_cron_toggle(
     }
     let updated = job.clone();
     let json = serde_json::to_string_pretty(&store).map_err(|_| ToggleError::Io)?;
-    // Unique per-write temp name: a concurrent writer using a shared
-    // `cron.tmp` could rename OUR content away (or fail on a vanished
-    // temp file). The mutation lock already serializes serve-side
-    // writers; the unique name additionally keeps any out-of-process
-    // writer from colliding on the temp path itself.
-    static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let tmp_path = cron_path.with_extension(format!(
-        "tmp-{}-{}",
-        std::process::id(),
-        TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-    ));
-    if tokio::fs::write(&tmp_path, &json).await.is_err() {
-        return Err(ToggleError::Io);
-    }
-    if tokio::fs::rename(&tmp_path, cron_path).await.is_err() {
-        let _ = tokio::fs::remove_file(&tmp_path).await;
-        return Err(ToggleError::Io);
-    }
+    // Route through the SAME atomic writer CronService uses — one
+    // shared process-global temp-name sequence, so this file path and
+    // a live service can never pick the same cron.tmp-<pid>-<seq> and
+    // consume each other's temp file (codex #1612 r4 P2). Runs on the
+    // blocking pool (it is synchronous fs I/O).
+    let cron_path = cron_path.to_path_buf();
+    tokio::task::spawn_blocking(move || octos_bus::write_cron_json_atomic(&cron_path, &json))
+        .await
+        .map_err(|_| ToggleError::Io)?
+        .map_err(|_| ToggleError::Io)?;
     Ok(updated)
 }
 

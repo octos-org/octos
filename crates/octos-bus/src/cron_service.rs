@@ -485,8 +485,17 @@ impl CronService {
         // re-fired and its next occurrence stays scheduled — cron
         // semantics reserve the NEXT slot regardless of this fire's
         // outcome.
-        let due_jobs: Vec<CronJob> = {
-            let mut store = self.store.lock().unwrap_or_else(|e| e.into_inner());
+        // The reserve+advance+persist critical section is SYNCHRONOUS
+        // (std Mutex + std::fs write) and must stay atomic to keep the
+        // persistence invariant (persist under the same lock hold that
+        // reserved — codex #1612 r3). Run the WHOLE section on the
+        // blocking pool so its fs write never occupies a tokio worker,
+        // even on a slow/full/network FS or a one-worker runtime
+        // (codex #1612 r4 P1). The blocking task self-holds an Arc, so
+        // it completes even if this on_timer future is aborted mid-tick.
+        let this = std::sync::Arc::clone(self);
+        let due_jobs: Vec<CronJob> = tokio::task::spawn_blocking(move || {
+            let mut store = this.store.lock().unwrap_or_else(|e| e.into_inner());
             let mut due = Vec::new();
             let mut to_delete = Vec::new();
 
@@ -507,20 +516,16 @@ impl CronService {
             }
 
             store.jobs.retain(|j| !to_delete.contains(&j.id));
-            // Persist the advance in the SAME critical section that
-            // reserved it (persistence invariant): the old post-fire
-            // async save left a window where memory was ahead of the
-            // file, and any concurrent reload-based reconciliation
-            // could revert the advance and re-arm a past-due fire
-            // (codex #1612 r3). A failed write is logged and the tick
-            // proceeds — next_run stays advanced in memory, so no
-            // double-fire; the file catches up on the next successful
-            // persist.
-            if let Err(e) = persist_store_locked(&self.store_path, &store) {
+            // A failed write is logged and the tick proceeds — next_run
+            // stays advanced in memory, so no double-fire; the file
+            // catches up on the next successful persist.
+            if let Err(e) = persist_store_locked(&this.store_path, &store) {
                 tracing::warn!("failed to save cron store: {e}");
             }
             due
-        };
+        })
+        .await
+        .unwrap_or_default();
 
         for job in &due_jobs {
             self.execute_job(job).await;
@@ -562,14 +567,31 @@ impl CronService {
 /// stale snapshot (codex #1612 r3). Unique temp names keep
 /// out-of-process writers from colliding on a shared `cron.tmp`.
 fn persist_store_locked(store_path: &Path, store: &CronStore) -> Result<()> {
-    static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let json = serde_json::to_string_pretty(store).wrap_err("failed to serialize cron store")?;
+    write_cron_json_atomic(store_path, &json)
+}
+
+/// Process-global temp-name sequence, shared by EVERY cron writer
+/// (`CronService::persist_store_locked` AND the serve-side file toggle
+/// in `cron_panel.rs`), so no two writers can pick the same
+/// `cron.tmp-<pid>-<seq>` path and consume each other's temp file
+/// (codex #1612 r4 P2).
+static CRON_TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Serialize-free atomic replace of `cron.json`: write to a unique temp
+/// then rename. The ONLY cron writer primitive — every mutation path
+/// and the serve-side file toggle route through it (shared temp
+/// sequence, consistent cleanup). Partial temp files are removed on
+/// BOTH the write and rename error paths so repeated failures cannot
+/// accumulate orphans (codex #1612 r4 P2).
+pub fn write_cron_json_atomic(store_path: &Path, json: &str) -> Result<()> {
     let tmp_path = store_path.with_extension(format!(
         "tmp-{}-{}",
         std::process::id(),
-        TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        CRON_TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     ));
-    if let Err(error) = std::fs::write(&tmp_path, &json) {
+    if let Err(error) = std::fs::write(&tmp_path, json) {
+        let _ = std::fs::remove_file(&tmp_path);
         return Err(eyre::Report::new(error).wrap_err("failed to write cron store temp"));
     }
     if let Err(error) = std::fs::rename(&tmp_path, store_path) {
