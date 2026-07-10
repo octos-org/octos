@@ -2174,6 +2174,11 @@ struct AppUiLoopPromptScratch {
 /// Override via `OCTOS_VOICE_MAX_PROMPT_TOKENS`.
 const VOICE_TURN_MAX_PROMPT_TOKENS: usize = 8000;
 
+/// Delivery hook for mid-turn (in-loop) compaction lifecycle notifications.
+/// Captures the turn's `WsConnection` + ledger + negotiated features so the
+/// (sync) bridge can reach the client without owning connection state.
+type ContextLifecycleNotify = Arc<dyn Fn(UiNotification) + Send + Sync>;
+
 struct AppUiPromptContextBridge {
     session_id: SessionKey,
     data_dir: PathBuf,
@@ -2182,6 +2187,14 @@ struct AppUiPromptContextBridge {
     /// When true, the outgoing model prompt is capped at
     /// [`VOICE_TURN_MAX_PROMPT_TOKENS`] (see [`Self::outgoing_prompt_policy`]).
     voice_turn: bool,
+    /// UPCR-2026-026 follow-up: the in-loop compaction pass previously ran
+    /// SILENTLY (tracing + passive status store only), so a session whose
+    /// context fills mid-turn never surfaced any compaction UX — and the
+    /// compacted snapshot it persisted then starved the pre-turn (emitting)
+    /// site forever. When set, the threshold block in
+    /// [`Self::prepare_prompt`] emits `ContextCompactionStarted`/`Completed`
+    /// through this hook. `None` in tests and paths without a client.
+    context_lifecycle_notify: Option<ContextLifecycleNotify>,
 }
 
 impl AppUiPromptContextBridge {
@@ -2197,7 +2210,13 @@ impl AppUiPromptContextBridge {
             context_manager,
             scratch: StdMutex::new(None),
             voice_turn,
+            context_lifecycle_notify: None,
         }
+    }
+
+    fn with_context_lifecycle_notify(mut self, notify: ContextLifecycleNotify) -> Self {
+        self.context_lifecycle_notify = Some(notify);
+        self
     }
 
     /// Voice-turn history budget (tokens), env-overridable.
@@ -2292,6 +2311,23 @@ impl PromptContextManager for AppUiPromptContextBridge {
         let threshold = Self::threshold_tokens(&request);
         let mut compaction_performed = false;
         if scratch.manager.state().token_estimate > threshold {
+            let trigger = format!("agent_loop:{}", request.phase.as_str());
+            // UPCR-2026-026 follow-up: surface the MID-TURN pass to the
+            // client. This is where compaction actually happens for a session
+            // whose context fills during a long (multi-agent) turn — and the
+            // compacted snapshot persisted below starves the pre-turn
+            // (emitting) site, so without these events the user never sees
+            // any compaction UX at all.
+            if let Some(notify) = self.context_lifecycle_notify.as_ref() {
+                notify(UiNotification::ContextCompactionStarted(
+                    ContextCompactionStartedEvent {
+                        session_id: self.session_id.clone(),
+                        context_state: ui_context_state_for(&self.session_id, &scratch.manager),
+                        trigger: trigger.clone(),
+                        threshold_tokens: threshold,
+                    },
+                ));
+            }
             let before = scratch.manager.for_prompt(&policy);
             let summary_budget = threshold.clamp(256, 4096) as u32;
             let summary =
@@ -2299,12 +2335,19 @@ impl PromptContextManager for AppUiPromptContextBridge {
             let record = scratch.manager.compact_context(
                 summary,
                 CompactContextPolicy {
-                    trigger: format!("agent_loop:{}", request.phase.as_str()),
+                    trigger,
                     keep_recent_items: Self::keep_items(),
                     ..CompactContextPolicy::default()
                 },
             );
             compaction_performed = true;
+            if let Some(notify) = self.context_lifecycle_notify.as_ref() {
+                notify(appui_context_compaction_notification(
+                    &self.session_id,
+                    &scratch.manager,
+                    &record,
+                ));
+            }
             info!(
                 session = %self.session_id.0,
                 phase = request.phase.as_str(),
@@ -19597,6 +19640,14 @@ async fn run_standalone_turn(
                         "failed to persist forked child context manager snapshot"
                     );
                 }
+                // NB: no `with_context_lifecycle_notify` here (child bridges
+                // stay silent, unlike the parent turn bridge). A child's
+                // forked context is SEPARATE from the parent's; emitting its
+                // compaction events under the parent key would overwrite the
+                // client's per-session context gauge with the child's
+                // numbers, and under the child key (`…#spawn-…`) no client
+                // ever opens the session. Surfacing child compactions needs
+                // a dedicated child-attributed event — follow-up.
                 Some(Arc::new(AppUiPromptContextBridge::new(
                     child_session_id,
                     child_context_data_dir.clone(),
@@ -19819,13 +19870,32 @@ async fn run_standalone_turn(
         workspace_root.as_deref(),
     ))
     .with_reporter(reporter);
-    let prompt_context_bridge: Arc<dyn PromptContextManager> =
-        Arc::new(AppUiPromptContextBridge::new(
+    // In-loop compaction delivery (UPCR-2026-026 follow-up): mirror the
+    // pre-turn lifecycle delivery — durable direct send for clients that
+    // negotiated `context.lifecycle.v1`, ledger-only otherwise — so the
+    // MID-TURN compaction pass (the one that actually fires when context
+    // fills during a long turn) is visible to the client, not silent.
+    let context_lifecycle_notify: ContextLifecycleNotify = {
+        let ws = ws.clone();
+        let ledger = ledger.clone();
+        // `features` is Copy — the move closure captures its own copy.
+        Arc::new(move |notification: UiNotification| {
+            if features.context_lifecycle_available() {
+                let _ = send_notification_durable(&ws, &ledger, notification);
+            } else {
+                let _ = ledger.append_notification_from(notification, ws.connection_id);
+            }
+        })
+    };
+    let prompt_context_bridge: Arc<dyn PromptContextManager> = Arc::new(
+        AppUiPromptContextBridge::new(
             session_id.clone(),
             session_runtime.profile.data_dir.clone(),
             context_manager.clone(),
             voice_turn_hint,
-        ));
+        )
+        .with_context_lifecycle_notify(context_lifecycle_notify),
+    );
     request_agent = request_agent.with_prompt_context_manager(prompt_context_bridge);
     if let Some(hooks) = session_runtime.profile.hook_executor.clone() {
         request_agent = request_agent.with_hooks(hooks);
@@ -26002,6 +26072,98 @@ mod tests {
                 .exists(),
             "AppUI prompt-context preparation should persist the canonical context ledger"
         );
+    }
+
+    /// UPCR-2026-026 follow-up: the in-loop (mid-turn) compaction pass must
+    /// emit `ContextCompactionStarted` → `ContextCompactionCompleted` through
+    /// the bridge's notify hook. It previously compacted SILENTLY — the only
+    /// emitting site (the pre-turn bridge) was then starved forever by the
+    /// persisted post-compaction snapshot, so a session whose context filled
+    /// mid-turn never showed any compaction UX.
+    #[test]
+    fn in_loop_compaction_emits_lifecycle_notifications() {
+        let session_id = SessionKey::new("api", "context-inloop-events");
+        // Enough history that the items estimate dwarfs 70% of a tiny window.
+        let history: Vec<Message> = (0..10)
+            .flat_map(|idx| {
+                vec![
+                    test_message(
+                        MessageRole::User,
+                        &format!("req {idx}: {}", "x".repeat(400)),
+                    ),
+                    test_message(
+                        MessageRole::Assistant,
+                        &format!("ans {idx}: {}", "y".repeat(400)),
+                    ),
+                ]
+            })
+            .collect();
+        let manager = Arc::new(StdMutex::new(ContextManager::from_session_history(
+            session_id.to_string(),
+            None,
+            &history,
+        )));
+        let dir = tempfile::tempdir().unwrap();
+        let captured: Arc<StdMutex<Vec<UiNotification>>> = Arc::new(StdMutex::new(Vec::new()));
+        let sink = captured.clone();
+        let bridge = AppUiPromptContextBridge::new(
+            session_id.clone(),
+            dir.path().to_path_buf(),
+            manager,
+            false,
+        )
+        .with_context_lifecycle_notify(Arc::new(move |notification| {
+            sink.lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .push(notification);
+        }));
+
+        let mut prompt = vec![test_message(MessageRole::System, "runtime system")];
+        prompt.extend(history);
+        prompt.push(test_message(MessageRole::User, "current request"));
+
+        let report = bridge
+            .prepare_prompt(
+                PromptContextRequest {
+                    phase: PromptContextPhase::TurnStart,
+                    iteration: 1,
+                    provider_name: "test".to_string(),
+                    model_id: "tiny-context".to_string(),
+                    // threshold = 70% of 300 = 210 tokens — trivially exceeded.
+                    context_window: 300,
+                },
+                &mut prompt,
+            )
+            .expect("context manager bridge should prepare prompt");
+        assert!(
+            report.compaction_performed,
+            "the tiny window must force an in-loop compaction"
+        );
+
+        let events = captured.lock().unwrap_or_else(|error| error.into_inner());
+        let started = events
+            .iter()
+            .position(|n| matches!(n, UiNotification::ContextCompactionStarted(_)))
+            .expect("in-loop compaction must emit ContextCompactionStarted");
+        let completed = events
+            .iter()
+            .position(|n| matches!(n, UiNotification::ContextCompactionCompleted(_)))
+            .expect("in-loop compaction must emit ContextCompactionCompleted");
+        assert!(
+            started < completed,
+            "started must precede completed in the emitted order"
+        );
+        let UiNotification::ContextCompactionStarted(event) = &events[started] else {
+            unreachable!()
+        };
+        assert_eq!(event.session_id, session_id);
+        assert_eq!(event.trigger, "agent_loop:turn_start");
+        assert_eq!(event.threshold_tokens, 210);
+        let UiNotification::ContextCompactionCompleted(done) = &events[completed] else {
+            unreachable!()
+        };
+        assert_eq!(done.session_id, session_id);
+        assert_eq!(done.compaction.trigger, "agent_loop:turn_start");
     }
 
     #[test]
