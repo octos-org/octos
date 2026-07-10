@@ -4041,6 +4041,11 @@ async fn ui_protocol_connection(
     // forces the session to that profile); it only fills the gap left by
     // None-scoped (admin) connections, which are authorized for every profile.
     let mut session_open_profile_id: Option<String> = None;
+    // Detached `session/btw` aside tasks spawned by this connection. Aborted
+    // at teardown: an aside holds a WsConnection clone (writer sender), so an
+    // orphaned one would keep paid provider work running — and hold the stdio
+    // writer open past EOF — for up to its 30s timeout after the client left.
+    let mut btw_aside_tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();
     // Last-emitted whole-job orchestration status per session (dedup so only
     // changes hit the wire). Drives the client's composer top-border indicator.
     let mut last_orchestration: HashMap<SessionKey, SessionOrchestrationEvent> = HashMap::new();
@@ -4415,7 +4420,7 @@ async fn ui_protocol_connection(
                 .await;
             }
             UiCommand::SessionBtw(params) => {
-                handle_session_btw(
+                let aside = handle_session_btw(
                     &ws,
                     &state,
                     &ledger,
@@ -4429,6 +4434,10 @@ async fn ui_protocol_connection(
                     params,
                 )
                 .await;
+                if let Some(task) = aside {
+                    btw_aside_tasks.retain(|task| !task.is_finished());
+                    btw_aside_tasks.push(task);
+                }
             }
             UiCommand::PermissionProfileList(params) => {
                 let result = permission_profile_list_result(&state, params);
@@ -4642,6 +4651,7 @@ async fn ui_protocol_connection(
     )
     .await;
     abort_live_forwarders(&live_forwarders, &ledger).await;
+    abort_btw_aside_tasks(&mut btw_aside_tasks).await;
     // Dropping `ws` lets the writer task drain & exit; await it so the socket
     // is closed before we return.
     drop(ws);
@@ -4736,6 +4746,9 @@ where
     let ledger = event_ledger(&state).await;
     let _ = diff_preview_store(&state, contracts.as_ref()).await;
     let mut features = ConnectionUiFeatures::stdio_defaults();
+    // See the ws loop's twin: detached asides must not outlive this stdio
+    // connection (they hold the writer sender → EOF shutdown would block).
+    let mut btw_aside_tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();
     let connection_headers = HeaderMap::new();
     let mut connection_profile_id_owned: Option<String> = None;
     let mut last_orchestration: HashMap<SessionKey, SessionOrchestrationEvent> = HashMap::new();
@@ -5080,7 +5093,7 @@ where
                 .await;
             }
             UiCommand::SessionBtw(params) => {
-                handle_session_btw(
+                let aside = handle_session_btw(
                     &ws,
                     &state,
                     &ledger,
@@ -5090,6 +5103,10 @@ where
                     params,
                 )
                 .await;
+                if let Some(task) = aside {
+                    btw_aside_tasks.retain(|task| !task.is_finished());
+                    btw_aside_tasks.push(task);
+                }
             }
             UiCommand::PermissionProfileList(params) => {
                 let result = permission_profile_list_result(&state, params);
@@ -5228,6 +5245,7 @@ where
         STDIO_SHUTDOWN_TURN_DRAIN_MAX,
     )
     .await;
+    abort_btw_aside_tasks(&mut btw_aside_tasks).await;
     cleanup_stdio_connection_resources(
         &active_turns,
         &connection_turns,
@@ -5438,6 +5456,16 @@ where
         }
         WsMessage::Close(_) => Ok(false),
         WsMessage::Ping(_) | WsMessage::Pong(_) | WsMessage::Binary(_) => Ok(true),
+    }
+}
+
+/// Abort every detached `session/btw` aside this connection spawned and await
+/// each JoinHandle (abort → future dropped → the in-flight guard's Drop frees
+/// the busy slot, and the task's WsConnection clone releases the writer).
+async fn abort_btw_aside_tasks(tasks: &mut Vec<tokio::task::JoinHandle<()>>) {
+    for task in tasks.drain(..) {
+        task.abort();
+        let _ = task.await;
     }
 }
 
@@ -13167,10 +13195,63 @@ fn btw_test_provider() -> Option<Arc<dyn octos_llm::LlmProvider>> {
     None
 }
 
+/// Live in-flight assistant draft per session, fed by the `message/delta`
+/// ephemeral choke point (deltas are non-durable per spec § 9, so the ledger
+/// can never replay them) and reset at every turn lifecycle edge. `session/btw`
+/// reads the tail so "what are you working on?" reflects the answer being
+/// written RIGHT NOW, not just the committed transcript.
+fn btw_live_draft_store() -> &'static StdMutex<HashMap<SessionKey, String>> {
+    static DRAFTS: OnceLock<StdMutex<HashMap<SessionKey, String>>> = OnceLock::new();
+    DRAFTS.get_or_init(|| StdMutex::new(HashMap::new()))
+}
+
+const BTW_LIVE_DRAFT_STORE_MAX_SESSIONS: usize = 128;
+
+fn btw_live_draft_append(session_id: &SessionKey, text: &str) {
+    let Ok(mut drafts) = btw_live_draft_store().lock() else {
+        return;
+    };
+    if !drafts.contains_key(session_id) && drafts.len() >= BTW_LIVE_DRAFT_STORE_MAX_SESSIONS {
+        // Terminal events clear entries; this cap only guards sessions whose
+        // terminal never arrived (crash paths). Arbitrary eviction is fine —
+        // a lost draft only degrades one aside's context.
+        let evict = drafts.keys().next().cloned();
+        if let Some(evict) = evict {
+            drafts.remove(&evict);
+        }
+    }
+    let draft = drafts.entry(session_id.clone()).or_default();
+    draft.push_str(text);
+    if draft.len() > BTW_LIVE_DRAFT_TAIL_CHARS {
+        let cut = draft.len() - BTW_LIVE_DRAFT_TAIL_CHARS;
+        let cut = draft
+            .char_indices()
+            .map(|(index, _)| index)
+            .find(|index| *index >= cut)
+            .unwrap_or(0);
+        *draft = draft.split_off(cut);
+    }
+}
+
+fn btw_live_draft_reset(session_id: &SessionKey) {
+    if let Ok(mut drafts) = btw_live_draft_store().lock() {
+        drafts.remove(session_id);
+    }
+}
+
+fn btw_live_draft_tail(session_id: &SessionKey) -> String {
+    btw_live_draft_store()
+        .lock()
+        .ok()
+        .and_then(|drafts| drafts.get(session_id).cloned())
+        .unwrap_or_default()
+}
+
 const BTW_TRANSCRIPT_TAIL_MESSAGES: usize = 20;
 const BTW_TRANSCRIPT_MESSAGE_CHARS: usize = 1_200;
 const BTW_TRANSCRIPT_CHAR_BUDGET: usize = 16_000;
 const BTW_ACTIVITY_TAIL_EVENTS: usize = 12;
+const BTW_LIVE_DRAFT_TAIL_CHARS: usize = 1_200;
 const BTW_ANSWER_MAX_TOKENS: u32 = 700;
 const BTW_TIMEOUT_SECS: u64 = 30;
 
@@ -13181,6 +13262,7 @@ const BTW_TIMEOUT_SECS: u64 = 30;
 fn build_btw_messages(
     transcript_tail: &[Message],
     activity_lines: &[String],
+    live_draft_tail: &str,
     question: &str,
 ) -> Vec<Message> {
     let mut transcript = String::new();
@@ -13213,8 +13295,13 @@ fn build_btw_messages(
             .collect::<Vec<_>>()
             .join("\n")
     };
+    let draft = if live_draft_tail.trim().is_empty() {
+        String::new()
+    } else {
+        format!("\n## In-flight answer you are writing right now (tail)\n…{live_draft_tail}\n")
+    };
     let prompt = format!(
-        "## Recent conversation\n{transcript}\n## Current activity\n{activity}\n\n## Aside question\n{question}\n"
+        "## Recent conversation\n{transcript}\n## Current activity\n{activity}\n{draft}\n## Aside question\n{question}\n"
     );
     vec![
         Message {
@@ -13292,7 +13379,7 @@ async fn handle_session_btw(
     routed_profile_id: Option<&str>,
     id: String,
     params: SessionBtwParams,
-) {
+) -> Option<tokio::task::JoinHandle<()>> {
     // Fold the topic into the canonical session key FIRST (codex round-1 P1):
     // the ingress gate scopes `session#topic`, so every lookup/guard below
     // must use the same folded key or a topic-scoped credential could read a
@@ -13300,7 +13387,7 @@ async fn handle_session_btw(
     let session_id = session_key_with_optional_topic(&params.session_id, params.topic.as_deref());
     if let Err(error) = validate_session_scope(&session_id, None, connection_profile_id) {
         send_scope_error(ws, id, error);
-        return;
+        return None;
     }
     let question = params.question.trim().to_owned();
     if question.is_empty() {
@@ -13309,7 +13396,7 @@ async fn handle_session_btw(
             Some(id),
             RpcError::invalid_params("session/btw requires a non-empty question"),
         );
-        return;
+        return None;
     }
 
     // ONE profile resolution shared by transcript AND provider, with
@@ -13339,7 +13426,7 @@ async fn handle_session_btw(
                 Some(id),
                 RpcError::unknown_session(session_id.0.clone()),
             );
-            return;
+            return None;
         };
         let mut sessions_guard = sessions.lock().await;
         if !sessions_guard.session_known(&session_id) {
@@ -13348,7 +13435,7 @@ async fn handle_session_btw(
                 Some(id),
                 RpcError::unknown_session(session_id.0.clone()),
             );
-            return;
+            return None;
         }
         let session = sessions_guard.get_or_create(&session_id).await;
         session
@@ -13363,8 +13450,14 @@ async fn handle_session_btw(
 
     // One aside per (profile, session) at a time — a second `/btw` while the
     // first is still answering is rejected, not queued.
+    // Canonical default-profile key: absent profile means MAIN_PROFILE_ID
+    // everywhere else (sessions lookup, runtime resolution) — the busy gate
+    // must agree or an unscoped and a _main-routed aside race the same
+    // effective session.
     let busy_key = (
-        active_profile_id.clone().unwrap_or_default(),
+        active_profile_id
+            .clone()
+            .unwrap_or_else(|| MAIN_PROFILE_ID.to_owned()),
         session_id.clone(),
     );
     {
@@ -13374,7 +13467,7 @@ async fn handle_session_btw(
                 Some(id),
                 RpcError::internal_error("btw in-flight registry poisoned"),
             );
-            return;
+            return None;
         };
         if !in_flight.insert(busy_key.clone()) {
             let _ = send_rpc_error(
@@ -13383,7 +13476,7 @@ async fn handle_session_btw(
                 RpcError::invalid_request("a btw aside is already answering for this session")
                     .with_data(json!({ "kind": "btw_busy" })),
             );
-            return;
+            return None;
         }
     }
     let in_flight_guard = BtwInFlightGuard(busy_key);
@@ -13393,7 +13486,7 @@ async fn handle_session_btw(
     let ws = ws.clone();
     let state = state.clone();
     let ledger = ledger.clone();
-    tokio::spawn(async move {
+    let task = tokio::spawn(async move {
         let _in_flight_guard = in_flight_guard;
 
         // Live-activity digest from the ledger replay window's tail.
@@ -13418,6 +13511,12 @@ async fn handle_session_btw(
             .rev()
             .cloned()
             .collect::<Vec<_>>();
+
+        // The transcript tail only holds COMMITTED messages; a "what are you
+        // working on?" mid-turn needs the answer being written right now.
+        // `message/delta` is ephemeral (never ledgered), so the draft tail is
+        // fed at the ephemeral send choke point into `btw_live_draft_store`.
+        let live_draft_tail = btw_live_draft_tail(&session_id);
 
         // The profile's shared provider chain — same profile the transcript
         // came from. `profile_runtime` also carries the data dir for the
@@ -13448,7 +13547,12 @@ async fn handle_session_btw(
             }
         };
 
-        let messages = build_btw_messages(&transcript_tail, &activity_tail, &question);
+        let messages = build_btw_messages(
+            &transcript_tail,
+            &activity_tail,
+            &live_draft_tail,
+            &question,
+        );
         let config = octos_llm::ChatConfig {
             max_tokens: Some(BTW_ANSWER_MAX_TOKENS),
             temperature: Some(0.2),
@@ -13563,6 +13667,7 @@ async fn handle_session_btw(
             result,
         );
     });
+    Some(task)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -24171,6 +24276,14 @@ fn send_notification_durable(
     ledger: &UiProtocolLedger,
     notification: UiNotification,
 ) -> Result<(), SendError> {
+    // `session/btw` live-draft lifecycle: a new turn starts a fresh draft and
+    // a terminal clears it (the committed transcript owns finished answers).
+    match &notification {
+        UiNotification::TurnStarted(event) => btw_live_draft_reset(&event.session_id),
+        UiNotification::TurnCompleted(event) => btw_live_draft_reset(&event.session_id),
+        UiNotification::TurnError(event) => btw_live_draft_reset(&event.session_id),
+        _ => {}
+    }
     // M15-F5 (#44): mirror production supervised-task lifecycle updates into
     // the `task-ledger.jsonl` evidence ledger. NO-OP unless the live tmux soak
     // set `OCTOS_TUI_M15_UX_OUTPUT_DIR`, so this is free in normal production.
@@ -24219,6 +24332,11 @@ fn send_notification_ephemeral(
 ) -> Result<(), SendError> {
     // Ephemeral frames are NOT appended to the ledger — they are explicitly
     // non-durable per spec § 9. Drops never need a `replay_lossy` summary.
+    // Deltas DO feed the `session/btw` live-draft tail here (the one choke
+    // point every legacy `message/delta` send funnels through).
+    if let UiNotification::MessageDelta(delta) = &notification {
+        btw_live_draft_append(&delta.session_id, &delta.text);
+    }
     let method = notification.method().to_string();
     // Codex #1336 round-2 BLOCKER 1: apply the per-connection
     // capability filter to ephemeral direct sends too. `MessageDelta`
@@ -33515,7 +33633,12 @@ ignore = []
             mk(MessageRole::Assistant, "starting on it"),
         ];
         let activity = vec!["tool `shell` running".to_owned()];
-        let messages = build_btw_messages(&transcript, &activity, "btw what are you working on?");
+        let messages = build_btw_messages(
+            &transcript,
+            &activity,
+            "…drafting the cwnd table",
+            "btw what are you working on?",
+        );
 
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[0].role, MessageRole::System);
@@ -33531,6 +33654,10 @@ ignore = []
             "empty-content messages are skipped"
         );
         assert!(prompt.contains("- tool `shell` running"));
+        assert!(
+            prompt.contains("…drafting the cwnd table"),
+            "the in-flight draft tail must reach the provider; got {prompt}"
+        );
         assert!(prompt.contains("btw what are you working on?"));
     }
 
@@ -33602,7 +33729,7 @@ ignore = []
         btw_in_flight_sessions()
             .lock()
             .expect("in-flight registry")
-            .insert((String::new(), session_id.clone()));
+            .insert((MAIN_PROFILE_ID.to_owned(), session_id.clone()));
 
         handle_session_btw(
             &ws,
@@ -33622,7 +33749,7 @@ ignore = []
         btw_in_flight_sessions()
             .lock()
             .expect("in-flight registry")
-            .remove(&(String::new(), session_id.clone()));
+            .remove(&(MAIN_PROFILE_ID.to_owned(), session_id.clone()));
 
         let frame = recv_rpc_json(&mut rx).await;
         assert_eq!(frame["id"], "b3");
@@ -33705,7 +33832,7 @@ ignore = []
         assert_eq!(frame["result"]["model"], "btw-stub-model");
         assert_eq!(frame["result"]["session_id"], session_id.to_string());
         // The aside runs detached; give its guard drop a beat before asserting.
-        let busy_key = (String::new(), session_id.clone());
+        let busy_key = (MAIN_PROFILE_ID.to_owned(), session_id.clone());
         for _ in 0..100 {
             if !btw_in_flight_sessions()
                 .lock()
