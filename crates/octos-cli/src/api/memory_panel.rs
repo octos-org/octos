@@ -85,6 +85,19 @@ pub struct MemoryEntityResponse {
     pub content: String,
 }
 
+/// Caps CONCURRENT panel scans on the shared blocking pool. The walk
+/// reads tenant-controlled files; without a bound, parallel overview
+/// requests could occupy blocking threads wholesale and starve every
+/// other spawn_blocking/tokio::fs user in the process (codex #1611 r5
+/// P1). Waiters queue as plain futures — cheap — while at most
+/// PANEL_SCAN_PERMITS scans touch disk at once.
+static PANEL_SCAN_PERMITS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(4);
+
+/// Per-file read cap. Panel files are KB-scale markdown; a planted
+/// multi-GB "MEMORY.md" must not be slurped into memory. Over-cap
+/// files render as absent.
+const MAX_PANEL_FILE_BYTES: u64 = 2 * 1024 * 1024;
+
 /// A directory handle every panel read is anchored to.
 ///
 /// Unix: an `OwnedFd` opened `O_NOFOLLOW|O_DIRECTORY`; children are
@@ -191,7 +204,8 @@ mod imp {
         let meta = file.metadata().ok()?;
         // Regular files only: FIFOs, sockets and devices don't belong
         // in a memory dir and read()s on them can block or misbehave.
-        if !meta.is_file() {
+        // Size-capped: panel files are KB-scale markdown.
+        if !meta.is_file() || meta.len() > super::MAX_PANEL_FILE_BYTES {
             return None;
         }
         let mtime = meta.modified().ok();
@@ -246,7 +260,10 @@ mod imp {
         // Leaf symlink check + read. TOCTOU window documented on
         // `AnchoredDir` — dev-only platforms.
         let meta = std::fs::symlink_metadata(&path).ok()?;
-        if meta.file_type().is_symlink() || !meta.is_file() {
+        if meta.file_type().is_symlink()
+            || !meta.is_file()
+            || meta.len() > super::MAX_PANEL_FILE_BYTES
+        {
             return None;
         }
         let mtime = meta.modified().ok();
@@ -339,6 +356,8 @@ pub async fn my_memory(
     };
     let rel_bank = rel_under(&memory_dir_path, &store.bank_entities_dir());
     let walk_root = data_dir.clone();
+    // Bounded blocking-pool usage; waiters park as futures.
+    let _scan_permit = PANEL_SCAN_PERMITS.acquire().await.ok();
     let walked = tokio::task::spawn_blocking(move || {
         let root = AnchoredDir::open_root(&walk_root)?;
         let mem = root.open_beneath(&rel_mem)?;
@@ -431,7 +450,9 @@ pub async fn my_memory_entity(
     // ancestor is a plain 404.
     let safe_name = name.replace(['/', '\\', '\0', '~', '.'], "_");
     let rel_bank = rel_under(&data_dir, &store.bank_entities_dir()).ok_or(StatusCode::NOT_FOUND)?;
-    // Blocking pool: synchronous walk + read (codex #1611 r3 P1).
+    // Blocking pool: synchronous walk + read (codex #1611 r3 P1),
+    // bounded like the overview scan.
+    let _scan_permit = PANEL_SCAN_PERMITS.acquire().await.ok();
     let content = tokio::task::spawn_blocking(move || {
         AnchoredDir::open_root(&data_dir)
             .and_then(|root| root.open_beneath(&rel_bank))
