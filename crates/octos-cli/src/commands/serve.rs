@@ -571,7 +571,16 @@ impl ServeCommand {
             };
             let mut mgr = crate::otp::AuthManager::new(auth_config.clone(), user_store.clone())
                 .with_sessions_path(data_dir.join("auth_sessions.json"))
-                .with_data_dir(data_dir.clone());
+                .with_data_dir(data_dir.clone())
+                // Registration id generation must treat an existing
+                // PROFILE file as taken, or a generated id claims an
+                // admin-created-but-unclaimed profile (codex #1613 r6).
+                // Raw path probe, not get(): corrupt or quarantined
+                // profile json still counts as occupied.
+                .with_id_taken_probe({
+                    let ps = profile_store.clone();
+                    std::sync::Arc::new(move |id: &str| ps.profile_path(id).exists())
+                });
 
             if let Some(password) = derived_profile_password {
                 mgr = mgr.with_smtp_password(password);

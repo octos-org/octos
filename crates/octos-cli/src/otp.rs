@@ -112,6 +112,13 @@ pub struct AuthManager {
     /// Static tokens that bypass OTP (for E2E testing).
     pub static_tokens: Vec<String>,
     user_store: Arc<UserStore>,
+    /// Optional probe for registration ids that are taken OUTSIDE the
+    /// user store. The serve bootstrap wires this to profile-file
+    /// existence so a generated id can never claim an admin-created
+    /// (but unclaimed) profile: /api/auth/verify treats an existing
+    /// profile under the new user's id as that user's own (codex
+    /// #1613 r6). `None` (tests, solo) checks the user store only.
+    id_taken_probe: Option<Arc<dyn Fn(&str) -> bool + Send + Sync>>,
     /// Path to persist sessions. `None` = in-memory only (tests).
     sessions_path: Option<PathBuf>,
     /// Data directory used to load the SMTP password from `smtp_secret.json`.
@@ -143,6 +150,7 @@ impl AuthManager {
             user_store,
             sessions_path: None,
             data_dir: None,
+            id_taken_probe: None,
             #[cfg(test)]
             sent_emails: RwLock::new(Vec::new()),
         }
@@ -152,6 +160,13 @@ impl AuthManager {
     /// from `{data_dir}/smtp_secret.json` in preference to the env var.
     pub fn with_data_dir(mut self, data_dir: PathBuf) -> Self {
         self.data_dir = Some(data_dir);
+        self
+    }
+
+    /// Attach the external id-taken probe used by registration id
+    /// generation (see the field docs — codex #1613 r6).
+    pub fn with_id_taken_probe(mut self, probe: Arc<dyn Fn(&str) -> bool + Send + Sync>) -> Self {
+        self.id_taken_probe = Some(probe);
         self
     }
 
@@ -462,7 +477,23 @@ impl AuthManager {
                 let id = crate::user_store::email_to_user_id(&email_lower);
                 let mut final_id = id.clone();
                 let mut suffix = 1u32;
-                while self.user_store.get(&final_id)?.is_some() {
+                // A candidate is taken when a user row exists OR the
+                // bootstrap probe says the id is occupied elsewhere
+                // (a profile file on disk). Anonymous self-registration
+                // must never claim an admin-created-but-unclaimed
+                // profile — /api/auth/verify would hand the existing
+                // profile to the new user (codex #1613 r6). Explicitly
+                // provisioned flows (allowlist / registered users)
+                // authorize their claim and don't pass through here.
+                loop {
+                    let user_taken = self.user_store.get(&final_id)?.is_some();
+                    let probe_taken = self
+                        .id_taken_probe
+                        .as_ref()
+                        .is_some_and(|probe| probe(&final_id));
+                    if !user_taken && !probe_taken {
+                        break;
+                    }
                     final_id = format!("{id}-{suffix}");
                     suffix += 1;
                 }
@@ -1078,6 +1109,41 @@ mod tests {
         let user = user_store.get_by_email("newuser@example.com").unwrap();
         assert!(user.is_some());
         assert_eq!(user.unwrap().id, "newuser");
+    }
+
+    #[tokio::test]
+    async fn should_skip_probe_taken_ids_when_generating_registration_ids() {
+        // codex #1613 r6: the collision loop only consulted the USER
+        // store, so a generated id could claim an admin-created (but
+        // unclaimed) PROFILE: with self-registration on, api@… became
+        // user `api-user` (reserved-name disambiguation), and
+        // /api/auth/verify then treated the existing api-user profile
+        // as that user's own — granting an anonymous registrant an
+        // admin-provisioned profile. The serve bootstrap now wires a
+        // probe (profile-file existence); a probe-taken candidate
+        // advances to the next suffix.
+        let dir = tempfile::tempdir().unwrap();
+        let user_store = Arc::new(UserStore::open(dir.path()).unwrap());
+        let mgr = AuthManager::new(None, user_store.clone())
+            .with_id_taken_probe(Arc::new(|id: &str| id == "api-user"));
+        mgr.set_allow_self_registration(true);
+        mgr.send_otp("api@example.com").await.unwrap();
+        let code = {
+            let otps = mgr.pending_otps.read().await;
+            otps.get("api@example.com").unwrap().code.clone()
+        };
+
+        let token = mgr.verify_otp("api@example.com", &code).await.unwrap();
+        assert!(token.is_some());
+
+        let user = user_store
+            .get_by_email("api@example.com")
+            .unwrap()
+            .expect("registration must create a user");
+        assert_eq!(
+            user.id, "api-user-1",
+            "a probe-taken id (existing profile) must not be claimed"
+        );
     }
 
     #[tokio::test]
