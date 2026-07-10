@@ -24971,7 +24971,10 @@ mod tests {
     /// completeness (`check-ui-protocol-upcr.sh` only checks that a protocol
     /// edit ships with *a* UPCR doc). This test keeps §6 a superset of
     /// `UI_PROTOCOL_COMMAND_METHODS ∪ UI_PROTOCOL_NOTIFICATION_METHODS ∪
-    /// APPUI_EXTRA_METHODS`, so the catalog can no longer silently fall behind.
+    /// UI_PROTOCOL_FIRST_SERVER_METHODS ∪ APPUI_EXTRA_METHODS` — the full set the
+    /// server advertises (`ui_protocol_server_supported_methods` builds from
+    /// `FIRST_SERVER ∪ APPUI_EXTRA`) — so the catalog can no longer silently
+    /// fall behind, even for a future server-only method.
     #[test]
     fn spec_section6_catalog_lists_every_advertised_method() {
         fn is_method_char(c: char) -> bool {
@@ -25073,6 +25076,7 @@ mod tests {
         let missing: Vec<&str> = octos_core::ui_protocol::UI_PROTOCOL_COMMAND_METHODS
             .iter()
             .chain(octos_core::ui_protocol::UI_PROTOCOL_NOTIFICATION_METHODS.iter())
+            .chain(octos_core::ui_protocol::UI_PROTOCOL_FIRST_SERVER_METHODS.iter())
             .chain(APPUI_EXTRA_METHODS.iter())
             .copied()
             .filter(|method| !catalog_lists(section6, method))
@@ -25085,7 +25089,7 @@ mod tests {
              api/OCTOS_UI_PROTOCOL_V1_SPEC_2026-04-24.md — the catalog is a \
              hand-maintained mirror and must stay a superset of \
              UI_PROTOCOL_COMMAND_METHODS / UI_PROTOCOL_NOTIFICATION_METHODS / \
-             APPUI_EXTRA_METHODS."
+             UI_PROTOCOL_FIRST_SERVER_METHODS / APPUI_EXTRA_METHODS."
         );
     }
 
