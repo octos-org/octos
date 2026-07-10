@@ -418,6 +418,7 @@ M12 Phase-D auxiliary REST→WS surface (all gated `auxiliary.rest_to_ws.v1`):
   `session/workspace.get`, `session/title.set`, `session/delete`
 - `system/status.get`
 - `content/list`, `content/delete`, `content/bulk_delete`
+- `memory/overview`, `memory/entity`, `cron/list`, `cron/toggle`
 
 Runtime, auth, profile, and onboarding inspection (server-handled
 `APPUI_EXTRA_METHODS`):
@@ -1548,6 +1549,67 @@ Request/response Rust types live in `crates/octos-core/src/ui_protocol.rs`
 - Errors: `auth_unavailable` with WS close code `1008 auth_expired`;
   `invalid_params` on the over-cap guard; `resource_not_found` with
   `data.resource_type = "content"` on REST 404 (collection endpoint).
+
+#### `memory/overview`
+
+- Gate: `auxiliary.rest_to_ws.v1`
+- Replaces: `GET /api/my/memory`
+- Params type: `MemoryOverviewParams` — `{}` (accepts `{}` or omitted
+  params).
+- Result type: `MemoryOverviewResult` — `{ overview: MemoryOverviewResponse }`.
+  `overview` carries the REST panel body whole (`memory_panel.rs`), plus
+  RPC-layer truncation metadata: each document field is capped to a
+  per-field JSON-ESCAPED byte budget (`long_term` 96 KiB, `today`
+  48 KiB, each `recent[]` note 24 KiB) so the result fits one WS text
+  frame; capped fields are clean UTF-8 prefixes DECLARED via
+  `<field>_truncated` + `<field>_total_bytes` beside them (always
+  present) — never spliced with an in-band marker.
+- Errors: `auth_unavailable` (`-32120`) with WS close code
+  `1008 auth_expired` if the connection has no usable identity;
+  `resource_not_found` with `data.resource_type = "memory"` on REST 404
+  (collection-style endpoint — id is empty).
+
+#### `memory/entity`
+
+- Gate: `auxiliary.rest_to_ws.v1`
+- Replaces: `GET /api/my/memory/entities/{name}`
+- Params type: `MemoryEntityParams` — `{ name: string }` (the entity
+  page stem, as returned in each overview entity summary).
+- Result type: `MemoryEntityResult` — `{ name: string, content: string,
+  content_truncated: bool, content_total_bytes: number }`. `content` is
+  capped at a 384 KiB JSON-ESCAPED budget; when capped it is a clean
+  UTF-8 prefix with the truth declared in the two metadata fields.
+- Errors: `auth_unavailable` with WS close code `1008 auth_expired`;
+  `resource_not_found` with `data.resource_type = "memory_entity"` and
+  `data.identifier = <name>` on REST 404.
+
+#### `cron/list`
+
+- Gate: `auxiliary.rest_to_ws.v1`
+- Replaces: `GET /api/my/cron`
+- Params type: `CronListParams` — `{}` (accepts `{}` or omitted params).
+- Result type: `CronListResult` — `{ jobs: CronJobRow[], count: number,
+  gateway_running: bool }`. Mirrors the REST body minus the redundant
+  `ok` flag; `gateway_running` reports whether a spawned gateway child
+  owns `cron.json` (toggles are refused while it does).
+- Errors: `auth_unavailable` with WS close code `1008 auth_expired`;
+  `resource_not_found` with `data.resource_type = "cron"` on REST 404
+  (collection-style endpoint — id is empty).
+
+#### `cron/toggle`
+
+- Gate: `auxiliary.rest_to_ws.v1`
+- Replaces: `PUT /api/my/cron/{job_id}/enabled`
+- Params type: `CronToggleParams` — `{ job_id: string, enabled: bool }`.
+- Result type: `CronToggleResult` — `{ job: CronJobRow }`, rendered
+  exactly as a `cron/list` entry.
+- Errors: `auth_unavailable` with WS close code `1008 auth_expired`.
+  Refusals forward the REST error body's `reason` as `data.detail` so
+  clients branch on typed fields, not message strings:
+  `data.detail = "gateway_running"` with `data.rest_status = 409` when a
+  spawned gateway owns the store, `resource_not_found` with
+  `data.resource_type = "cron_job"`, `data.identifier = <job_id>`, and
+  `data.detail = "job_not_found"` on a stale row.
 
 ## 8. Event Semantics
 
