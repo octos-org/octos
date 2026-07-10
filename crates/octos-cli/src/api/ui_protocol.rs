@@ -981,6 +981,12 @@ fn m9_protocol_fixture_for_prompt(prompt: &str) -> Option<M9ProtocolFixture> {
 
 struct ActiveTurn {
     turn_id: TurnId,
+    /// Resolved profile the turn was admitted under (canonical: absent maps
+    /// to `MAIN_PROFILE_ID`). `session/btw` verifies it before injecting the
+    /// turn's live draft into an aside — the registry is process-global and
+    /// keyed by bare `SessionKey`, so two profiles' same-named sessions would
+    /// otherwise cross-read each other's stream.
+    profile_id: String,
     /// Per-turn state guard; held by both the registry entry and by the turn
     /// task so interrupt + natural-completion races serialize on a single lock.
     state: Arc<TokioMutex<TurnState>>,
@@ -10692,6 +10698,12 @@ async fn handle_review_start(
     let contracts_for_turn = contracts.clone();
     let turn_state_for_task = turn_state.clone();
     let profile_for_turn = active_profile_id.clone();
+    // Stamp for the ActiveTurn registry — see the generic admission's twin.
+    let profile_for_stamp = session_id
+        .profile_id()
+        .map(ToOwned::to_owned)
+        .or_else(|| active_profile_id.clone())
+        .unwrap_or_else(|| MAIN_PROFILE_ID.to_owned());
     let turn_id_for_task = turn_id.clone();
 
     let handle = tokio::spawn(async move {
@@ -10725,10 +10737,14 @@ async fn handle_review_start(
         if occupied {
             false
         } else {
+            // Client-supplied turn ids carry no uniqueness guarantee — a
+            // reused id must not inherit a prior turn's `session/btw` draft.
+            btw_live_draft_clear(&session_id, &turn_id);
             active.insert(
                 session_id.clone(),
                 ActiveTurn {
                     turn_id: turn_id.clone(),
+                    profile_id: profile_for_stamp.clone(),
                     state: turn_state,
                     interrupt_tx,
                     abort: handle.abort_handle(),
@@ -10894,6 +10910,14 @@ async fn handle_turn_start(
     let resolved_profile_id = connection_profile_id
         .or(routed_profile_id)
         .map(ToOwned::to_owned);
+    // Stamp for the ActiveTurn registry: mirror `session/btw`'s resolution
+    // (session key first) so the aside's profile check compares like with
+    // like; canonical `_main` when nothing resolves.
+    let profile_for_stamp = session_id
+        .profile_id()
+        .map(ToOwned::to_owned)
+        .or_else(|| resolved_profile_id.clone())
+        .unwrap_or_else(|| MAIN_PROFILE_ID.to_owned());
     let handle = tokio::spawn(async move {
         if start_rx.await.is_err() {
             return;
@@ -10950,10 +10974,14 @@ async fn handle_turn_start(
         if occupied {
             false
         } else {
+            // Client-supplied turn ids carry no uniqueness guarantee — a
+            // reused id must not inherit a prior turn's `session/btw` draft.
+            btw_live_draft_clear(&session_id, &turn_id);
             active.insert(
                 session_id.clone(),
                 ActiveTurn {
                     turn_id: turn_id.clone(),
+                    profile_id: profile_for_stamp.clone(),
                     state: turn_state.clone(),
                     interrupt_tx,
                     abort: handle.abort_handle(),
@@ -11164,10 +11192,12 @@ async fn maybe_spawn_appui_master_continuation_runner(
         );
     });
 
+    btw_live_draft_clear(&session_id, &turn_id);
     active.insert(
         session_id.clone(),
         ActiveTurn {
             turn_id: turn_id.clone(),
+            profile_id: profile_id.clone(),
             state: turn_state,
             interrupt_tx,
             abort: handle.abort_handle(),
@@ -13205,18 +13235,29 @@ fn btw_test_provider() -> Option<Arc<dyn octos_llm::LlmProvider>> {
 /// a new turn is a new key, and stale keys are unreadable (the aside resolves
 /// the CURRENT non-terminal turn id through the active-turns registry before
 /// reading). Bounded by arbitrary eviction past the cap.
-fn btw_live_draft_store() -> &'static StdMutex<HashMap<TurnId, String>> {
-    static DRAFTS: OnceLock<StdMutex<HashMap<TurnId, String>>> = OnceLock::new();
+fn btw_live_draft_store() -> &'static StdMutex<HashMap<(SessionKey, TurnId), String>> {
+    static DRAFTS: OnceLock<StdMutex<HashMap<(SessionKey, TurnId), String>>> = OnceLock::new();
     DRAFTS.get_or_init(|| StdMutex::new(HashMap::new()))
+}
+
+/// Clear a turn's draft slot at ADMISSION (synchronously, before the turn task
+/// can stream): `turn_id` is client-supplied with no global uniqueness check,
+/// so a reused id must start from a clean slate instead of inheriting the
+/// prior turn's tail.
+fn btw_live_draft_clear(session_id: &SessionKey, turn_id: &TurnId) {
+    if let Ok(mut drafts) = btw_live_draft_store().lock() {
+        drafts.remove(&(session_id.clone(), turn_id.clone()));
+    }
 }
 
 const BTW_LIVE_DRAFT_STORE_MAX_TURNS: usize = 64;
 
-fn btw_live_draft_append(turn_id: &TurnId, text: &str) {
+fn btw_live_draft_append(session_id: &SessionKey, turn_id: &TurnId, text: &str) {
     let Ok(mut drafts) = btw_live_draft_store().lock() else {
         return;
     };
-    if !drafts.contains_key(turn_id) && drafts.len() >= BTW_LIVE_DRAFT_STORE_MAX_TURNS {
+    let key = (session_id.clone(), turn_id.clone());
+    if !drafts.contains_key(&key) && drafts.len() >= BTW_LIVE_DRAFT_STORE_MAX_TURNS {
         // Arbitrary eviction is fine — a lost draft only degrades one aside's
         // context, and terminal turns' entries are dead weight anyway
         // (unreadable through the non-terminal gate).
@@ -13225,7 +13266,7 @@ fn btw_live_draft_append(turn_id: &TurnId, text: &str) {
             drafts.remove(&evict);
         }
     }
-    let draft = drafts.entry(turn_id.clone()).or_default();
+    let draft = drafts.entry(key).or_default();
     draft.push_str(text);
     if draft.len() > BTW_LIVE_DRAFT_TAIL_CHARS {
         let cut = draft.len() - BTW_LIVE_DRAFT_TAIL_CHARS;
@@ -13238,11 +13279,11 @@ fn btw_live_draft_append(turn_id: &TurnId, text: &str) {
     }
 }
 
-fn btw_live_draft_tail(turn_id: &TurnId) -> String {
+fn btw_live_draft_tail(session_id: &SessionKey, turn_id: &TurnId) -> String {
     btw_live_draft_store()
         .lock()
         .ok()
-        .and_then(|drafts| drafts.get(turn_id).cloned())
+        .and_then(|drafts| drafts.get(&(session_id.clone(), turn_id.clone())).cloned())
         .unwrap_or_default()
 }
 
@@ -13487,6 +13528,7 @@ async fn handle_session_btw(
     let state = state.clone();
     let ledger = ledger.clone();
     let active_turns = active_turns.clone();
+    let aside_profile_id = in_flight_guard.0.0.clone();
     let task = tokio::spawn(async move {
         let _in_flight_guard = in_flight_guard;
 
@@ -13527,11 +13569,19 @@ async fn handle_session_btw(
             let registry = active_turns.lock().await;
             match registry.get(&session_id) {
                 Some(entry) => {
-                    let state = entry.state.lock().await;
-                    if matches!(*state, TurnState::Terminal(_)) {
+                    // Profile check: the registry is process-global and keyed
+                    // by bare SessionKey — two profiles' same-named sessions
+                    // (supported for bare `web-*` ids) must never cross-read
+                    // each other's stream.
+                    if entry.profile_id != aside_profile_id {
                         None
                     } else {
-                        Some(entry.turn_id.clone())
+                        let state = entry.state.lock().await;
+                        if matches!(*state, TurnState::Terminal(_)) {
+                            None
+                        } else {
+                            Some(entry.turn_id.clone())
+                        }
                     }
                 }
                 None => None,
@@ -13539,7 +13589,7 @@ async fn handle_session_btw(
         };
         let live_draft_tail = live_turn_id
             .as_ref()
-            .map(btw_live_draft_tail)
+            .map(|turn_id| btw_live_draft_tail(&session_id, turn_id))
             .unwrap_or_default();
 
         // The profile's shared provider chain — same profile the transcript
@@ -24353,7 +24403,7 @@ fn send_notification_ephemeral(
     // live-draft tail BEFORE the capability filter so envelope-negotiated
     // connections still record it. TurnId keying isolates streams.
     if let UiNotification::MessageDelta(delta) = &notification {
-        btw_live_draft_append(&delta.turn_id, &delta.text);
+        btw_live_draft_append(&delta.session_id, &delta.turn_id, &delta.text);
     }
     let method = notification.method().to_string();
     // Codex #1336 round-2 BLOCKER 1: apply the per-connection
@@ -25199,6 +25249,7 @@ mod tests {
         active_turns.lock().await.insert(
             session.clone(),
             ActiveTurn {
+                profile_id: MAIN_PROFILE_ID.to_owned(),
                 turn_id: turn_id.clone(),
                 state: Arc::new(TokioMutex::new(TurnState::Active)),
                 interrupt_tx: Arc::new(TokioMutex::new(None)),
@@ -25239,6 +25290,7 @@ mod tests {
         active_turns.lock().await.insert(
             SessionKey("local:foreign".into()),
             ActiveTurn {
+                profile_id: MAIN_PROFILE_ID.to_owned(),
                 turn_id: TurnId::new(),
                 state: Arc::new(TokioMutex::new(TurnState::Active)),
                 interrupt_tx: Arc::new(TokioMutex::new(None)),
@@ -25261,6 +25313,7 @@ mod tests {
         active_turns.lock().await.insert(
             session.clone(),
             ActiveTurn {
+                profile_id: MAIN_PROFILE_ID.to_owned(),
                 turn_id: turn_id.clone(),
                 state: Arc::new(TokioMutex::new(TurnState::Active)),
                 interrupt_tx: Arc::new(TokioMutex::new(None)),
@@ -31058,6 +31111,7 @@ ignore = []
         let (tx, _rx) = mpsc::channel::<()>(1);
         ActiveTurn {
             turn_id,
+            profile_id: MAIN_PROFILE_ID.to_owned(),
             state: Arc::new(TokioMutex::new(TurnState::Active)),
             interrupt_tx: Arc::new(TokioMutex::new(Some(tx))),
             abort,
@@ -33876,15 +33930,20 @@ ignore = []
 
     #[test]
     fn btw_live_draft_is_turn_scoped() {
+        let session_a = SessionKey("local:btw-draft-a".into());
+        let session_b = SessionKey("local:btw-draft-b".into());
         let turn_a = TurnId::new();
         let turn_b = TurnId::new();
-        btw_live_draft_append(&turn_a, "alpha stream");
-        btw_live_draft_append(&turn_b, "beta stream");
+        btw_live_draft_append(&session_a, &turn_a, "alpha stream");
+        btw_live_draft_append(&session_b, &turn_b, "beta stream");
 
-        // TurnId keying: streams can never mix, whatever session/profile the
-        // turns belong to.
-        assert_eq!(btw_live_draft_tail(&turn_a), "alpha stream");
-        assert_eq!(btw_live_draft_tail(&turn_b), "beta stream");
+        // (session, turn) keying: streams can never mix, and a reused turn id
+        // starts clean after its admission-time clear.
+        assert_eq!(btw_live_draft_tail(&session_a, &turn_a), "alpha stream");
+        assert_eq!(btw_live_draft_tail(&session_b, &turn_b), "beta stream");
+        btw_live_draft_clear(&session_a, &turn_a);
+        assert_eq!(btw_live_draft_tail(&session_a, &turn_a), "");
+        assert_eq!(btw_live_draft_tail(&session_b, &turn_b), "beta stream");
     }
 
     /// The aside reads the live draft ONLY through the registry's CURRENT
@@ -33927,7 +33986,7 @@ ignore = []
         let state = prg_state_with_session(&session_id, prg_seed_user_assistant);
         let ledger = event_ledger(&state).await;
         let turn_id = TurnId::new();
-        btw_live_draft_append(&turn_id, "PAXOS-DRAFT-TAIL");
+        btw_live_draft_append(&session_id, &turn_id, "PAXOS-DRAFT-TAIL");
 
         let _serial = btw_test_slot_serial().lock().await;
         *btw_test_provider_slot().lock().expect("slot") = Some(Arc::new(DraftProbeProvider));
@@ -33938,6 +33997,7 @@ ignore = []
         active_turns_registry().lock().await.insert(
             session_id.clone(),
             ActiveTurn {
+                profile_id: MAIN_PROFILE_ID.to_owned(),
                 turn_id: turn_id.clone(),
                 state: Arc::new(TokioMutex::new(TurnState::Terminal(
                     TerminalReason::Completed,
@@ -33965,11 +34025,47 @@ ignore = []
         let frame = recv_rpc_json(&mut rx).await;
         assert_eq!(frame["result"]["answer"], "no-draft", "got {frame}");
 
-        // The same turn ACTIVE → its draft rides the prompt.
+        // A live turn admitted under ANOTHER profile (bare session-id
+        // collision) must not leak its draft into this profile's aside.
         let abort = tokio::spawn(async {}).abort_handle();
         active_turns_registry().lock().await.insert(
             session_id.clone(),
             ActiveTurn {
+                profile_id: "someone-else".to_owned(),
+                turn_id: turn_id.clone(),
+                state: Arc::new(TokioMutex::new(TurnState::Active)),
+                interrupt_tx: Arc::new(TokioMutex::new(None)),
+                abort,
+            },
+        );
+        let (ws, mut rx) = ws_connection_for_test(4);
+        handle_session_btw(
+            &ws,
+            &state,
+            &ledger,
+            &active_turns_registry(),
+            None,
+            None,
+            "b6b".into(),
+            SessionBtwParams {
+                session_id: session_id.clone(),
+                topic: None,
+                question: "what are you drafting?".into(),
+            },
+        )
+        .await;
+        let frame = recv_rpc_json(&mut rx).await;
+        assert_eq!(
+            frame["result"]["answer"], "no-draft",
+            "another profile's live draft must not leak; got {frame}"
+        );
+
+        // The same turn ACTIVE under OUR profile → its draft rides the prompt.
+        let abort = tokio::spawn(async {}).abort_handle();
+        active_turns_registry().lock().await.insert(
+            session_id.clone(),
+            ActiveTurn {
+                profile_id: MAIN_PROFILE_ID.to_owned(),
                 turn_id: turn_id.clone(),
                 state: Arc::new(TokioMutex::new(TurnState::Active)),
                 interrupt_tx: Arc::new(TokioMutex::new(None)),
@@ -38071,6 +38167,7 @@ ignore = []
                 session_id.clone(),
                 ActiveTurn {
                     turn_id: TurnId::new(),
+                    profile_id: MAIN_PROFILE_ID.to_owned(),
                     state: Arc::new(TokioMutex::new(TurnState::Active)),
                     interrupt_tx: Arc::new(TokioMutex::new(Some(interrupt_tx))),
                     abort: dummy_handle.abort_handle(),
@@ -38524,6 +38621,7 @@ ignore = []
                 session_id.clone(),
                 ActiveTurn {
                     turn_id: turn_id.clone(),
+                    profile_id: MAIN_PROFILE_ID.to_owned(),
                     state: Arc::new(TokioMutex::new(TurnState::Active)),
                     interrupt_tx: Arc::new(TokioMutex::new(Some(interrupt_tx))),
                     abort: dummy_handle.abort_handle(),
