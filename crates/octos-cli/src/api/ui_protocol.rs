@@ -7891,9 +7891,6 @@ fn enqueue_background_skill_action_jobs(
             output: None,
             error: None,
             result: None,
-            source_id: None,
-            source_path: None,
-            metadata_path: None,
             created_at: now,
             updated_at: now,
         };
@@ -7918,28 +7915,6 @@ fn enqueue_background_skill_action_jobs(
         }),
         queued_jobs,
     ))
-}
-
-fn skill_action_result_string_at(value: &Value, key: &str) -> Option<String> {
-    value
-        .get(key)
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_owned)
-}
-
-fn apply_skill_action_result_metadata(job: &mut SkillActionJobRecord, result: &Value) {
-    let Some(source) = result
-        .get("structured_metadata")
-        .and_then(|metadata| metadata.get("source"))
-    else {
-        return;
-    };
-    job.source_id = skill_action_result_string_at(source, "id");
-    job.source_path = skill_action_result_string_at(source, "source_path")
-        .or_else(|| skill_action_result_string_at(source, "path"));
-    job.metadata_path = skill_action_result_string_at(source, "metadata_path");
 }
 
 async fn run_background_skill_action_job(
@@ -7967,7 +7942,6 @@ async fn run_background_skill_action_job(
                 completed.output = Some(output.clone());
             }
             completed.result = Some(result_value.clone());
-            apply_skill_action_result_metadata(&mut completed, &result_value);
             if success {
                 completed.status = SkillActionJobStatus::Succeeded;
             } else {
@@ -29428,13 +29402,16 @@ ignore = []
         let job = &persisted[0];
         assert_eq!(job.status, SkillActionJobStatus::Succeeded);
         assert_eq!(job.output.as_deref(), Some("source imported"));
-        assert_eq!(job.source_id.as_deref(), Some("src_report"));
-        assert_eq!(job.source_path.as_deref(), Some("sources/src_report.md"));
-        assert_eq!(
-            job.metadata_path.as_deref(),
-            Some("sources/src_report.json")
-        );
         assert_eq!(job.result.as_ref().unwrap()["success"], json!(true));
+        assert_eq!(
+            job.result.as_ref().unwrap()["structured_metadata"]["source"]["id"],
+            json!("src_report"),
+            "skill-owned metadata must remain in the generic result envelope"
+        );
+        let wire_job = skill_action_job_record_to_value(job.clone()).unwrap();
+        assert!(wire_job.get("source_id").is_none());
+        assert!(wire_job.get("source_path").is_none());
+        assert!(wire_job.get("metadata_path").is_none());
 
         let snapshots = store.read_session_snapshots_for_test(&session_id).unwrap();
         let statuses = snapshots

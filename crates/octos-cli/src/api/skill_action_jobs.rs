@@ -46,12 +46,6 @@ pub(crate) struct SkillActionJobRecord {
     pub error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub result: Option<Value>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub source_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub source_path: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub metadata_path: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -277,9 +271,6 @@ mod tests {
             output: None,
             error: None,
             result: None,
-            source_id: None,
-            source_path: None,
-            metadata_path: None,
             created_at: now,
             updated_at: now + Duration::seconds(updated_offset_secs),
         }
@@ -343,14 +334,13 @@ mod tests {
         let mut succeeded = record(&session_id, "job-a", SkillActionJobStatus::Succeeded, 2);
         succeeded.output = Some("done".to_string());
         succeeded.result = Some(json!({"source": {"id": "src-1"}}));
-        succeeded.source_id = Some("src-1".to_string());
         store.append(&succeeded).unwrap();
 
         let job = store.read(&session_id, "job-a").unwrap().unwrap();
 
         assert_eq!(job.status, SkillActionJobStatus::Succeeded);
         assert_eq!(job.output.as_deref(), Some("done"));
-        assert_eq!(job.source_id.as_deref(), Some("src-1"));
+        assert_eq!(job.result.as_ref().unwrap()["source"]["id"], "src-1");
         assert!(store.read(&session_id, "missing").unwrap().is_none());
     }
 
