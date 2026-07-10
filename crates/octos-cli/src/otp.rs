@@ -93,6 +93,10 @@ pub struct TestEmail {
     pub html: String,
 }
 
+/// `(candidate_id, authorized_for_candidate) -> taken`. See
+/// [`AuthManager::with_id_taken_probe`].
+pub type IdTakenProbe = Arc<dyn Fn(&str, bool) -> bool + Send + Sync>;
+
 /// OTP and session manager with optional disk persistence.
 pub struct AuthManager {
     pending_otps: RwLock<HashMap<String, PendingOtp>>,
@@ -113,12 +117,18 @@ pub struct AuthManager {
     pub static_tokens: Vec<String>,
     user_store: Arc<UserStore>,
     /// Optional probe for registration ids that are taken OUTSIDE the
-    /// user store. The serve bootstrap wires this to profile-file
-    /// existence so a generated id can never claim an admin-created
-    /// (but unclaimed) profile: /api/auth/verify treats an existing
-    /// profile under the new user's id as that user's own (codex
-    /// #1613 r6). `None` (tests, solo) checks the user store only.
-    id_taken_probe: Option<Arc<dyn Fn(&str) -> bool + Send + Sync>>,
+    /// user store — `(candidate, authorized_for_candidate) -> taken`.
+    /// The serve bootstrap wires this to
+    /// `ProfileStore::id_reserved_for_registration`, so a generated id
+    /// can never claim an admin-created (but unclaimed) profile:
+    /// /api/auth/verify treats an existing profile under the new
+    /// user's id as that user's own (codex #1613 r6). The `authorized`
+    /// flag is true ONLY for the exact allowlist-derived id (suffix
+    /// candidates from collisions carry no authorization — r8 P1),
+    /// and even then the store keeps unloadable records reserved so a
+    /// claim can't clobber a corrupt profile file (r8 P2). `None`
+    /// (tests, solo) checks the user store only.
+    id_taken_probe: Option<IdTakenProbe>,
     /// Path to persist sessions. `None` = in-memory only (tests).
     sessions_path: Option<PathBuf>,
     /// Data directory used to load the SMTP password from `smtp_secret.json`.
@@ -164,8 +174,8 @@ impl AuthManager {
     }
 
     /// Attach the external id-taken probe used by registration id
-    /// generation (see the field docs — codex #1613 r6).
-    pub fn with_id_taken_probe(mut self, probe: Arc<dyn Fn(&str) -> bool + Send + Sync>) -> Self {
+    /// generation (see the field docs — codex #1613 r6/r8).
+    pub fn with_id_taken_probe(mut self, probe: IdTakenProbe) -> Self {
         self.id_taken_probe = Some(probe);
         self
     }
@@ -507,23 +517,27 @@ impl AuthManager {
                 let id = crate::user_store::email_to_user_id(&email_lower);
                 let mut final_id = id.clone();
                 let mut suffix = 1u32;
-                // A candidate is taken when a user row exists OR — for
-                // ANONYMOUS registration only — the bootstrap probe
-                // says the id is occupied elsewhere (a profile file on
-                // disk): self-registration must never claim an
-                // admin-created-but-unclaimed profile, or
+                // A candidate is taken when a user row exists OR the
+                // bootstrap probe says the id is occupied elsewhere (a
+                // profile file on disk): self-registration must never
+                // claim an admin-created-but-unclaimed profile, or
                 // /api/auth/verify hands the existing profile to the
-                // new user (codex #1613 r6). Authorized claims
-                // (allowlist provenance) skip the probe so an invitee
-                // KEEPS their pre-provisioned profile instead of being
-                // bumped to `<id>-1` (codex #1613 r7 P1).
+                // new user (codex #1613 r6). Allowlist provenance
+                // authorizes claiming ONLY the exact derived id — an
+                // invitee keeps their pre-provisioned profile (r7 P1)
+                // — but a suffix candidate minted after a collision
+                // carries no such authorization, or the invitee would
+                // silently absorb some OTHER unclaimed profile
+                // (`alice-1`, r8 P1). The probe itself still reserves
+                // unloadable records even for authorized claims
+                // (r8 P2 — see id_reserved_for_registration).
                 loop {
                     let user_taken = self.user_store.get(&final_id)?.is_some();
-                    let probe_taken = !authorized_claim
-                        && self
-                            .id_taken_probe
-                            .as_ref()
-                            .is_some_and(|probe| probe(&final_id));
+                    let candidate_authorized = authorized_claim && final_id == id;
+                    let probe_taken = self
+                        .id_taken_probe
+                        .as_ref()
+                        .is_some_and(|probe| probe(&final_id, candidate_authorized));
                     if !user_taken && !probe_taken {
                         break;
                     }
@@ -1169,7 +1183,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let user_store = Arc::new(UserStore::open(dir.path()).unwrap());
         let mgr = AuthManager::new(None, user_store.clone())
-            .with_id_taken_probe(Arc::new(|id: &str| id == "api-user"));
+            .with_id_taken_probe(Arc::new(|id: &str, _authorized: bool| id == "api-user"));
         mgr.set_allow_self_registration(true);
         mgr.send_otp("api@example.com").await.unwrap();
         let code = {
@@ -1201,8 +1215,14 @@ mod tests {
         // self-registration only.
         let dir = tempfile::tempdir().unwrap();
         let user_store = Arc::new(UserStore::open(dir.path()).unwrap());
-        let mgr = AuthManager::new(None, user_store.clone())
-            .with_id_taken_probe(Arc::new(|id: &str| id == "alice"));
+        let mgr = AuthManager::new(None, user_store.clone()).with_id_taken_probe(Arc::new(
+            |id: &str, authorized: bool| {
+                // Loadable pre-provisioned profile: reserved from
+                // anonymous registration, claimable with allowlist
+                // authorization (mirrors id_reserved_for_registration).
+                id == "alice" && !authorized
+            },
+        ));
         mgr.send_otp_with_registration("alice@example.com", true)
             .await
             .unwrap();
@@ -1227,6 +1247,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn should_probe_suffix_candidates_even_for_authorized_claims() {
+        // codex #1613 r8 P1: allowlist authorization covers the exact
+        // DERIVED id only. When that id collides with another account's
+        // user row, the suffix candidates are ordinary generated ids —
+        // an unclaimed `alice-1` profile must not be silently absorbed
+        // by the invitee.
+        let dir = tempfile::tempdir().unwrap();
+        let user_store = Arc::new(UserStore::open(dir.path()).unwrap());
+        // `alice` belongs to a DIFFERENT account.
+        user_store
+            .save(&crate::user_store::User {
+                id: "alice".into(),
+                email: "other-alice@corp.example".into(),
+                name: "Other Alice".into(),
+                role: UserRole::User,
+                created_at: Utc::now(),
+                last_login_at: None,
+            })
+            .unwrap();
+        let mgr = AuthManager::new(None, user_store.clone()).with_id_taken_probe(Arc::new(
+            |id: &str, authorized: bool| match id {
+                // Pre-provisioned loadable profile for the derived id —
+                // claimable only WITH authorization (moot here: the
+                // user-row collision advances first)…
+                "alice" => !authorized,
+                // …and an unrelated unclaimed profile on the first
+                // suffix, which carries NO authorization.
+                "alice-1" => true,
+                _ => false,
+            },
+        ));
+        mgr.send_otp_with_registration("alice@new.example", true)
+            .await
+            .unwrap();
+        let code = {
+            let otps = mgr.pending_otps.read().await;
+            otps.get("alice@new.example").unwrap().code.clone()
+        };
+
+        let token = mgr
+            .verify_otp_with_authorized_claim("alice@new.example", &code)
+            .await
+            .unwrap();
+        assert!(token.is_some());
+        let user = user_store
+            .get_by_email("alice@new.example")
+            .unwrap()
+            .expect("registration must create a user");
+        assert_eq!(
+            user.id, "alice-2",
+            "suffix candidates must be probed even under an authorized claim"
+        );
+    }
+
+    #[tokio::test]
     async fn should_keep_suffixed_ids_within_the_slug_limit() {
         // codex #1613 r7 P2: a 63-char local part maps to a 63-char id;
         // appending `-1` produced a 65-char candidate that
@@ -1239,8 +1314,9 @@ mod tests {
         let user_store = Arc::new(UserStore::open(dir.path()).unwrap());
         let base_id = crate::user_store::email_to_user_id(&email);
         assert_eq!(base_id.len(), 63, "fixture must sit at the slug limit");
-        let mgr = AuthManager::new(None, user_store.clone())
-            .with_id_taken_probe(Arc::new(move |id: &str| id == "a".repeat(63)));
+        let mgr = AuthManager::new(None, user_store.clone()).with_id_taken_probe(Arc::new(
+            move |id: &str, _authorized: bool| id == "a".repeat(63),
+        ));
         mgr.set_allow_self_registration(true);
         mgr.send_otp(&email).await.unwrap();
         let code = {

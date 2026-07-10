@@ -1356,6 +1356,29 @@ impl ProfileStore {
         self.profiles_dir.join(format!("{id}.json"))
     }
 
+    /// Registration-id reservation policy (codex #1613 r6/r8), wired
+    /// into `AuthManager::with_id_taken_probe` by the serve bootstrap:
+    /// `(candidate, authorized) -> taken`.
+    ///
+    /// - No profile file → free for anyone.
+    /// - File exists, ANONYMOUS registration → taken: a generated id
+    ///   must never claim an admin-created-but-unclaimed profile (r6).
+    /// - File exists, AUTHORIZED claim (allowlist provenance for this
+    ///   exact derived id) → claimable ONLY when the record loads
+    ///   cleanly. An unloadable file (corrupt json, quarantined
+    ///   channel-name id) stays reserved: the verify path's
+    ///   auto-create treats a `get` error as "no profile" and would
+    ///   OVERWRITE the file with a default profile (r8 P2).
+    pub(crate) fn id_reserved_for_registration(&self, id: &str, authorized: bool) -> bool {
+        if !self.profile_path(id).exists() {
+            return false;
+        }
+        if !authorized {
+            return true;
+        }
+        !matches!(self.get(id), Ok(Some(_)))
+    }
+
     /// Return the parent directory of the profiles dir (i.e. the octos home dir).
     pub fn octos_home_dir(&self) -> &Path {
         self.profiles_dir.parent().unwrap_or(&self.profiles_dir)
@@ -2445,6 +2468,44 @@ mod tests {
         // Shape checks still shared with profile ids.
         assert!(validate_public_subdomain("-bad").is_err());
         assert!(validate_public_subdomain("UPPER").is_err());
+    }
+
+    #[test]
+    fn registration_reservation_tracks_loadability() {
+        // codex #1613 r6/r8: the probe behind AuthManager's generated-
+        // id loop. Anonymous registration never claims an existing
+        // file; an authorized (allowlist) claim passes only a
+        // cleanly-loadable record — a corrupt file stays reserved, or
+        // the verify path's auto-create (get error → None → save)
+        // would overwrite it with a default profile (r8 P2).
+        let dir = tempfile::tempdir().unwrap();
+        let store = ProfileStore::open(dir.path()).unwrap();
+
+        // Absent: free for anyone.
+        assert!(!store.id_reserved_for_registration("ghost", false));
+        assert!(!store.id_reserved_for_registration("ghost", true));
+
+        // Loadable pre-provisioned profile: reserved from anonymous,
+        // claimable with authorization.
+        let invitee = UserProfile {
+            id: "invitee".into(),
+            name: "Invitee".into(),
+            enabled: true,
+            data_dir: None,
+            parent_id: None,
+            public_subdomain: None,
+            config: ProfileConfig::default(),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        store.save(&invitee).unwrap();
+        assert!(store.id_reserved_for_registration("invitee", false));
+        assert!(!store.id_reserved_for_registration("invitee", true));
+
+        // Corrupt record: reserved from EVERYONE.
+        std::fs::write(store.profile_path("mangled"), "{not json").unwrap();
+        assert!(store.id_reserved_for_registration("mangled", false));
+        assert!(store.id_reserved_for_registration("mangled", true));
     }
 
     #[test]
