@@ -666,12 +666,22 @@ pub async fn run_consolidation(
         }
     }
 
+    // Usage feedback (#1586): recently-used entries are kept alive against
+    // age-based auto-archive. Advisory — a missing/corrupt sidecar reads as
+    // empty and consolidation proceeds exactly as before.
+    let usage: octos_memory::UsageMap = tokio::fs::read_to_string(memory_dir.join("usage.json"))
+        .await
+        .ok()
+        .and_then(|raw| serde_json::from_str(&raw).ok())
+        .unwrap_or_default();
+
     let ctx = ValidationCtx {
         entries: &entries,
         interim: &interim,
         frozen: &frozen,
         notes: &notes_map,
         items: &items_map,
+        usage: &usage.entries,
         init_mode,
         today: params.today,
         unused_days: params.unused_days,

@@ -182,6 +182,7 @@ fn register_memory_bank(
 ) {
     tools.register(octos_agent::RecallMemoryTool::new(memory_store.clone()));
     tools.register(octos_agent::SaveMemoryTool::new(memory_store.clone()));
+    tools.register(octos_agent::RecordMemoryUseTool::new(memory_store.clone()));
     if refresh_enabled {
         tools.register(octos_agent::MemoryNoteTool::new(memory_store.clone()));
     }

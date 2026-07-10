@@ -18,9 +18,30 @@ use eyre::{Result, WrapErr};
 /// [`MemoryStore::get_injectable_context`].
 pub const DEFAULT_MAX_INJECT_TOKENS: usize = 2500;
 
+/// Usage statistics for one memory entry (`^m…` id or bank slug).
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct UsageStat {
+    /// Times the entry was cited via `record_memory_use`.
+    pub count: u64,
+    /// Last-cited local date (`YYYY-MM-DD`), empty if never.
+    #[serde(default)]
+    pub last_used: String,
+}
+
+/// The `usage.json` sidecar: id/slug -> [`UsageStat`]. Advisory input to
+/// consolidation aging (#1586); never load-bearing for correctness.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct UsageMap {
+    #[serde(default)]
+    pub entries: std::collections::BTreeMap<String, UsageStat>,
+}
+
 /// Persistent memory store backed by markdown files.
 pub struct MemoryStore {
     memory_dir: PathBuf,
+    /// Serializes read-modify-write on the usage sidecar so concurrent
+    /// `record_memory_use` calls don't lose updates.
+    usage_lock: tokio::sync::Mutex<()>,
 }
 
 /// Raw markdown sections loaded from disk, before prompt formatting.
@@ -150,12 +171,66 @@ impl MemoryStore {
         tokio::fs::create_dir_all(&memory_dir)
             .await
             .wrap_err("failed to create memory directory")?;
-        Ok(Self { memory_dir })
+        Ok(Self {
+            memory_dir,
+            usage_lock: tokio::sync::Mutex::new(()),
+        })
     }
 
     /// Path to `MEMORY.md` (for cheap change detection by callers).
     pub fn memory_md_path(&self) -> PathBuf {
         self.memory_dir.join("MEMORY.md")
+    }
+
+    /// Path to the memory-usage sidecar (`usage.json`).
+    fn usage_path(&self) -> PathBuf {
+        self.memory_dir.join("usage.json")
+    }
+
+    /// Load the usage sidecar: entry id (`^m…`) or bank slug -> stats.
+    /// Missing/corrupt file reads as empty — usage is advisory, never fatal.
+    pub async fn load_usage(&self) -> UsageMap {
+        match tokio::fs::read_to_string(self.usage_path()).await {
+            Ok(raw) => serde_json::from_str(&raw).unwrap_or_default(),
+            Err(_) => UsageMap::default(),
+        }
+    }
+
+    /// Record that `ids` (MEMORY.md entry ids and/or bank slugs) informed an
+    /// answer today: bump each count and stamp `last_used`. Best-effort and
+    /// self-serializing via read-modify-write under the store; a failure is
+    /// logged, never propagated (usage feeds ranking, not correctness).
+    /// #1586.
+    pub async fn record_memory_use<I, S>(&self, ids: I, today: chrono::NaiveDate)
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        let _guard = self.usage_lock.lock().await;
+        let mut usage = self.load_usage().await;
+        let stamp = today.format("%Y-%m-%d").to_string();
+        let mut changed = false;
+        for id in ids {
+            let id = id.as_ref().trim();
+            if id.is_empty() {
+                continue;
+            }
+            let entry = usage.entries.entry(id.to_string()).or_default();
+            entry.count = entry.count.saturating_add(1);
+            entry.last_used = stamp.clone();
+            changed = true;
+        }
+        if !changed {
+            return;
+        }
+        match serde_json::to_string_pretty(&usage) {
+            Ok(body) => {
+                if let Err(e) = write_atomic_with_backup(self.usage_path(), body, None).await {
+                    tracing::warn!(error = %e, "failed to persist memory usage");
+                }
+            }
+            Err(e) => tracing::warn!(error = %e, "failed to serialize memory usage"),
+        }
     }
 
     /// Path to today's daily-note file (for cheap change detection).
@@ -1012,6 +1087,30 @@ fn strip_frontmatter(content: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn should_accumulate_and_persist_memory_usage() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MemoryStore::open(dir.path()).await.unwrap();
+        let d1 = chrono::NaiveDate::from_ymd_opt(2026, 7, 9).unwrap();
+        let d2 = chrono::NaiveDate::from_ymd_opt(2026, 7, 10).unwrap();
+
+        store.record_memory_use(["^maaaaaa", "octos"], d1).await;
+        store.record_memory_use(["^maaaaaa"], d2).await;
+        // blank ids are ignored, and a no-op call writes nothing new
+        store.record_memory_use(["", "  "], d2).await;
+
+        let usage = store.load_usage().await;
+        assert_eq!(usage.entries["^maaaaaa"].count, 2);
+        assert_eq!(usage.entries["^maaaaaa"].last_used, "2026-07-10");
+        assert_eq!(usage.entries["octos"].count, 1);
+        assert_eq!(usage.entries["octos"].last_used, "2026-07-09");
+        assert!(!usage.entries.contains_key(""));
+
+        // Survives reopen (persisted, not in-memory).
+        let reopened = MemoryStore::open(dir.path()).await.unwrap();
+        assert_eq!(reopened.load_usage().await.entries["^maaaaaa"].count, 2);
+    }
 
     #[tokio::test]
     async fn test_empty_state() {

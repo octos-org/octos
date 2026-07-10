@@ -36,7 +36,11 @@ conflict.\n\
 budget-truncated registry. Load the full detail on demand with \
 `recall_memory` — an entity name for its page, or \"MEMORY\" for the \
 complete long-term registry — instead of guessing when a needed detail \
-is not in the summary.";
+is not in the summary.\n\
+- When remembered content genuinely shaped your answer, call \
+`record_memory_use` once with the `^m…` ids and/or bank names you relied \
+on. This keeps useful memories alive and lets unused ones age out — skip \
+it when memory did not inform the answer.";
 
 /// Capture-policy block appended to the memory segment when the
 /// memory-refresh feature is enabled. Shared by the chat path (via
