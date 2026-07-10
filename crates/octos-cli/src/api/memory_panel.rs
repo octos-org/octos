@@ -209,9 +209,19 @@ mod imp {
             return None;
         }
         let mtime = meta.modified().ok();
-        let mut file = file;
+        // Bound the ACTUAL read, not just the fstat snapshot: a tenant
+        // can append past the cap between stat and read (codex #1611 r6
+        // P1). `take(cap+1)` lets us DETECT an over-cap file (a full
+        // cap+1 bytes) and reject it rather than serving a truncated
+        // prefix.
+        let cap = super::MAX_PANEL_FILE_BYTES;
         let mut content = String::new();
-        file.read_to_string(&mut content).ok()?;
+        let read = std::io::Read::take(file, cap + 1)
+            .read_to_string(&mut content)
+            .ok()?;
+        if read as u64 > cap {
+            return None;
+        }
         Some((content, mtime))
     }
 
@@ -236,6 +246,7 @@ mod imp {
 
 #[cfg(not(unix))]
 mod imp {
+    use std::io::Read;
     use std::path::{Path, PathBuf};
     use std::time::SystemTime;
 
@@ -267,7 +278,17 @@ mod imp {
             return None;
         }
         let mtime = meta.modified().ok();
-        std::fs::read_to_string(&path).ok().map(|c| (c, mtime))
+        // Bound the actual read (codex #1611 r6 P1) — see the Unix arm.
+        let cap = super::MAX_PANEL_FILE_BYTES;
+        let file = std::fs::File::open(&path).ok()?;
+        let mut content = String::new();
+        let read = std::io::Read::take(file, cap + 1)
+            .read_to_string(&mut content)
+            .ok()?;
+        if read as u64 > cap {
+            return None;
+        }
+        Some((content, mtime))
     }
 
     pub(super) fn list_md_stems(handle: &Handle) -> Vec<String> {
@@ -356,9 +377,16 @@ pub async fn my_memory(
     };
     let rel_bank = rel_under(&memory_dir_path, &store.bank_entities_dir());
     let walk_root = data_dir.clone();
-    // Bounded blocking-pool usage; waiters park as futures.
-    let _scan_permit = PANEL_SCAN_PERMITS.acquire().await.ok();
+    // Bounded blocking-pool usage; waiters park as futures. The permit
+    // is MOVED INTO the spawned task and dropped only when the blocking
+    // work finishes: if the request is cancelled, dropping the
+    // JoinHandle does NOT stop the already-running blocking task, so a
+    // permit released with the handle would let a tenant pile up more
+    // than PANEL_SCAN_PERMITS live scans via repeated cancels (codex
+    // #1611 r6 P1).
+    let scan_permit = PANEL_SCAN_PERMITS.acquire().await.ok();
     let walked = tokio::task::spawn_blocking(move || {
+        let _scan_permit = scan_permit;
         let root = AnchoredDir::open_root(&walk_root)?;
         let mem = root.open_beneath(&rel_mem)?;
 
@@ -451,9 +479,12 @@ pub async fn my_memory_entity(
     let safe_name = name.replace(['/', '\\', '\0', '~', '.'], "_");
     let rel_bank = rel_under(&data_dir, &store.bank_entities_dir()).ok_or(StatusCode::NOT_FOUND)?;
     // Blocking pool: synchronous walk + read (codex #1611 r3 P1),
-    // bounded like the overview scan.
-    let _scan_permit = PANEL_SCAN_PERMITS.acquire().await.ok();
+    // bounded like the overview scan. Permit MOVED into the task so a
+    // cancelled request cannot orphan the running scan while freeing
+    // its permit (codex #1611 r6 P1).
+    let scan_permit = PANEL_SCAN_PERMITS.acquire().await.ok();
     let content = tokio::task::spawn_blocking(move || {
+        let _scan_permit = scan_permit;
         AnchoredDir::open_root(&data_dir)
             .and_then(|root| root.open_beneath(&rel_bank))
             .and_then(|bank| bank.read_file(&format!("{safe_name}.md")))
@@ -775,6 +806,31 @@ mod tests {
         .unwrap();
         assert_eq!(resp.0.long_term, "", "FIFO content must not be served");
         assert!(resp.0.long_term_updated_at.is_none());
+    }
+
+    #[tokio::test]
+    async fn oversized_memory_md_is_refused_not_truncated() {
+        // codex #1611 r6 P1: a file past MAX_PANEL_FILE_BYTES must
+        // render as absent, not as a 2MB truncated prefix.
+        let (_dir, state, ps) = temp_state();
+        let profile = make_user_profile("big", "Big");
+        ps.save(&profile).unwrap();
+        let data_dir = ps.resolve_data_dir(&profile);
+        tokio::fs::create_dir_all(data_dir.join("memory"))
+            .await
+            .unwrap();
+        let oversized = "x".repeat((MAX_PANEL_FILE_BYTES as usize) + 1024);
+        tokio::fs::write(data_dir.join("memory/MEMORY.md"), &oversized)
+            .await
+            .unwrap();
+
+        let Json(resp) = my_memory(State(state), HeaderMap::new(), user_identity("big"))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.long_term, "",
+            "an over-cap MEMORY.md must be refused, not truncated"
+        );
     }
 
     #[tokio::test]
