@@ -12883,25 +12883,31 @@ async fn handle_session_rollback(
 /// from DIFFERENT parents resolve different per-session
 /// `SessionManager`s, so a manager-local existence check cannot see
 /// the other fork mid-write — the later rewrite would silently
-/// overwrite the earlier child (codex #1613 P2). One serve process
-/// owns a profile's sessions dir, so a process-global set suffices.
-fn fork_reservations() -> &'static std::sync::Mutex<std::collections::HashSet<String>> {
-    static RESERVATIONS: OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+/// overwrite the earlier child (codex #1613 P2). Keyed by
+/// `(sessions_dir, child key)`: the sessions DIR is the on-disk
+/// collision domain — same-profile managers share it and must
+/// mutually exclude, while different profiles' identical child keys
+/// name different files and must NOT reject each other (codex #1613
+/// r2). One serve process owns a profile's sessions dir, so a
+/// process-global set suffices.
+fn fork_reservations() -> &'static std::sync::Mutex<std::collections::HashSet<(PathBuf, String)>> {
+    static RESERVATIONS: OnceLock<std::sync::Mutex<std::collections::HashSet<(PathBuf, String)>>> =
         OnceLock::new();
     RESERVATIONS.get_or_init(Default::default)
 }
 
 /// RAII reservation on a fork child key — released on every exit path.
-struct ForkReservation(String);
+struct ForkReservation((PathBuf, String));
 
 impl ForkReservation {
-    /// `None` when another fork to the same child key is in flight.
-    fn try_acquire(child_key: &SessionKey) -> Option<Self> {
+    /// `None` when another fork to the same child key in the same
+    /// sessions dir is in flight.
+    fn try_acquire(sessions_dir: &Path, child_key: &SessionKey) -> Option<Self> {
+        let key = (sessions_dir.to_path_buf(), child_key.0.clone());
         let mut set = fork_reservations()
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        set.insert(child_key.0.clone())
-            .then(|| Self(child_key.0.clone()))
+        set.insert(key.clone()).then(|| Self(key))
     }
 }
 
@@ -12960,24 +12966,28 @@ async fn handle_session_fork(
         return;
     };
 
-    // Reserve the child key across the whole check-then-write: the
-    // durable `session_known` check below cannot see a concurrent
-    // fork's child until its write lands (RAII — released on return).
-    let candidate_key = params.session_id.fork_child(&params.new_chat_id);
-    let Some(_reservation) = ForkReservation::try_acquire(&candidate_key) else {
-        let _ = send_rpc_error(
-            ws,
-            Some(id),
-            RpcError::invalid_params(format!(
-                "{method}: a fork to '{candidate_key}' is already in flight"
-            ))
-            .with_data(json!({ "kind": "child_exists" })),
-        );
-        return;
-    };
-
     let (new_key, copied) = {
         let mut sessions_guard = sessions.lock().await;
+        // Reserve the child key across the whole check-then-write: the
+        // durable `session_known` check below cannot see a concurrent
+        // fork's child (a DIFFERENT parent's manager) until its write
+        // lands. Scoped to this manager's sessions dir — the on-disk
+        // collision domain (RAII — released on return).
+        let candidate_key = params.session_id.fork_child(&params.new_chat_id);
+        let Some(_reservation) =
+            ForkReservation::try_acquire(sessions_guard.sessions_dir(), &candidate_key)
+        else {
+            drop(sessions_guard);
+            let _ = send_rpc_error(
+                ws,
+                Some(id),
+                RpcError::invalid_params(format!(
+                    "{method}: a fork to '{candidate_key}' is already in flight"
+                ))
+                .with_data(json!({ "kind": "child_exists" })),
+            );
+            return;
+        };
         // Mirror rollback's error model: fork of an unknown session is
         // an error, not an auto-create.
         if !sessions_guard.session_known(&params.session_id) {
@@ -37507,6 +37517,29 @@ ignore = []
 
         let frame = recv_rpc_json(&mut rx).await;
         assert_eq!(frame["error"]["data"]["kind"], "invalid_new_chat_id");
+    }
+
+    #[test]
+    fn fork_reservations_scope_by_sessions_dir() {
+        // codex #1613 r2: identical child keys in DIFFERENT profiles'
+        // sessions dirs name different files — they must not exclude
+        // each other. Same dir + same key must.
+        let child = SessionKey("local:contested".into());
+        let dir_a = std::path::Path::new("/tmp/profile-a/sessions");
+        let dir_b = std::path::Path::new("/tmp/profile-b/sessions");
+
+        let a = ForkReservation::try_acquire(dir_a, &child).expect("dir A reserves");
+        let b = ForkReservation::try_acquire(dir_b, &child);
+        assert!(b.is_some(), "different sessions dir must not collide");
+        assert!(
+            ForkReservation::try_acquire(dir_a, &child).is_none(),
+            "same dir + same child key must exclude"
+        );
+        drop(a);
+        assert!(
+            ForkReservation::try_acquire(dir_a, &child).is_some(),
+            "released reservation must be reacquirable"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]

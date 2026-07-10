@@ -1903,6 +1903,14 @@ impl SessionManager {
     /// Serialises on the per-key persist lock so the whole-file rewrite
     /// cannot interleave with (and erase) a canonical locked append or a
     /// concurrent `SessionHandle` rewrite of the same key.
+    /// The directory session files persist under — the on-disk
+    /// collision domain for fork child keys (serve scopes its fork
+    /// reservations by it; two managers over the same dir CAN collide,
+    /// two different profiles' dirs cannot).
+    pub fn sessions_dir(&self) -> &std::path::Path {
+        &self.sessions_dir
+    }
+
     pub async fn rewrite(&self, key: &SessionKey) -> Result<()> {
         let lock = persist_lock_for(key);
         let _guard = lock.lock().await;
@@ -3977,11 +3985,8 @@ mod tests {
         assert_eq!(child.messages[2].content, "msg4");
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn test_fork_failed_write_leaves_no_ghost_child() {
-        use std::os::unix::fs::PermissionsExt;
-
         let tmp = TempDir::new().unwrap();
         let mut mgr = SessionManager::open(tmp.path()).unwrap();
         let parent = SessionKey::new("cli", "ghost-parent");
@@ -3989,15 +3994,18 @@ mod tests {
             .await
             .unwrap();
 
-        // Make the sessions dir unwritable so the child rewrite fails.
+        // Replace the sessions DIR with a regular FILE: creating the
+        // child's jsonl under it fails with ENOTDIR for EVERY euid —
+        // unlike a 0o555 mode, which root bypasses (codex #1613 r2).
         let sessions_dir = tmp.path().join("sessions");
-        let live = std::fs::metadata(&sessions_dir).unwrap().permissions();
-        std::fs::set_permissions(&sessions_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+        std::fs::remove_dir_all(&sessions_dir).unwrap();
+        std::fs::write(&sessions_dir, b"not a directory").unwrap();
 
         let result = mgr.fork(&parent, "ghost-child", 1).await;
-        // Restore before asserting so the tempdir can clean up even on
-        // a failed assertion.
-        std::fs::set_permissions(&sessions_dir, live).unwrap();
+        // Restore the real directory before asserting so the retry leg
+        // below can succeed.
+        std::fs::remove_file(&sessions_dir).unwrap();
+        std::fs::create_dir_all(&sessions_dir).unwrap();
 
         assert!(result.is_err(), "fork must surface the failed write");
         assert!(
