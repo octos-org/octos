@@ -2320,6 +2320,7 @@ fn notification_session_id(notification: &UiNotification) -> &SessionKey {
     match notification {
         UiNotification::SessionOpened(event) => &event.session_id,
         UiNotification::TurnStarted(event) => &event.session_id,
+        UiNotification::PlanUpdated(event) => &event.session_id,
         UiNotification::MessageDelta(event) => &event.session_id,
         UiNotification::ReasoningDelta(event) => &event.session_id,
         UiNotification::VisualGenerating(event) => &event.session_id,
