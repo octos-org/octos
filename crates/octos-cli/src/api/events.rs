@@ -187,6 +187,9 @@ pub(crate) fn event_to_json(event: &ProgressEvent, thread_id: Option<&str>) -> s
         ProgressEvent::FileModified { path } => {
             serde_json::json!({"type": "file_modified", "path": path})
         }
+        ProgressEvent::PlanUpdated { plan } => {
+            serde_json::json!({"type": "plan_updated", "plan": plan})
+        }
         ProgressEvent::TokenUsage {
             input_tokens,
             output_tokens,
