@@ -668,12 +668,18 @@ pub async fn run_consolidation(
 
     // Usage feedback (#1586): recently-used entries are kept alive against
     // age-based auto-archive. Advisory — a missing/corrupt sidecar reads as
-    // empty and consolidation proceeds exactly as before.
-    let usage: octos_memory::UsageMap = tokio::fs::read_to_string(memory_dir.join("usage.json"))
-        .await
-        .ok()
-        .and_then(|raw| serde_json::from_str(&raw).ok())
-        .unwrap_or_default();
+    // empty and consolidation proceeds exactly as before. First PRUNE the
+    // sidecar to live ids (current entries + bank slugs) so it can't grow
+    // unbounded as entries are archived/deleted (codex #1614 P2); entries
+    // archived in THIS run are pruned next cycle (bounded steady state).
+    let usage_store = octos_memory::MemoryStore::at_memory_dir(memory_dir);
+    let mut live: std::collections::HashSet<String> =
+        entries.iter().map(|e| e.id.clone()).collect();
+    if let Ok(bank) = usage_store.list_entities().await {
+        live.extend(bank.into_iter().map(|(slug, _)| slug));
+    }
+    usage_store.prune_usage(&live).await;
+    let usage = usage_store.load_usage().await;
 
     let ctx = ValidationCtx {
         entries: &entries,

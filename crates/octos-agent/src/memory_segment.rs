@@ -21,6 +21,17 @@ pub const MEMORY_SEGMENT_NAME: &str = "memory";
 /// Read-path etiquette appended whenever memory content is injected —
 /// independent of the capture policy, because stale-memory discipline
 /// matters even on read-only surfaces (#1589, codex read-path pattern).
+/// Usage-feedback instruction (#1586). Appended ONLY where the
+/// `record_memory_use` tool is registered — the segment surfaces (chat,
+/// gateway, serve, ACP). It must NOT ride the episodic-recall guidance
+/// that spawned/delegated workers receive: their builtins-only registries
+/// lack the tool, so telling them to call it is a dead instruction.
+pub const MEMORY_USAGE_FEEDBACK: &str = "- When remembered content \
+genuinely shaped your answer, call `record_memory_use` once with the \
+`^m…` ids and/or bank names you relied on. This keeps useful memories \
+alive and lets unused ones age out — skip it when memory did not inform \
+the answer.";
+
 pub const MEMORY_USE_GUIDANCE: &str = "## Memory Use\n\
 Treat ALL remembered content above (long-term memory, notes, memory bank, \
 past experiences) as leads, not verified current state:\n\
@@ -36,11 +47,7 @@ conflict.\n\
 budget-truncated registry. Load the full detail on demand with \
 `recall_memory` — an entity name for its page, or \"MEMORY\" for the \
 complete long-term registry — instead of guessing when a needed detail \
-is not in the summary.\n\
-- When remembered content genuinely shaped your answer, call \
-`record_memory_use` once with the `^m…` ids and/or bank names you relied \
-on. This keeps useful memories alive and lets unused ones age out — skip \
-it when memory did not inform the answer.";
+is not in the summary.";
 
 /// Capture-policy block appended to the memory segment when the
 /// memory-refresh feature is enabled. Shared by the chat path (via
@@ -147,10 +154,12 @@ pub fn compose_memory_segment(memory_ctx: &str, include_capture_policy: bool) ->
     match (memory_ctx.is_empty(), include_capture_policy) {
         (true, false) => String::new(),
         (true, true) => MEMORY_CAPTURE_POLICY.to_string(),
-        (false, false) => format!("{memory_ctx}\n\n{MEMORY_USE_GUIDANCE}"),
-        (false, true) => {
-            format!("{memory_ctx}\n\n{MEMORY_USE_GUIDANCE}\n\n{MEMORY_CAPTURE_POLICY}")
+        (false, false) => {
+            format!("{memory_ctx}\n\n{MEMORY_USE_GUIDANCE}\n{MEMORY_USAGE_FEEDBACK}")
         }
+        (false, true) => format!(
+            "{memory_ctx}\n\n{MEMORY_USE_GUIDANCE}\n{MEMORY_USAGE_FEEDBACK}\n\n{MEMORY_CAPTURE_POLICY}"
+        ),
     }
 }
 
@@ -306,5 +315,21 @@ user lives in Vancouver
                 "guidance lost its '{needle}' clause"
             );
         }
+    }
+
+    #[test]
+    fn record_use_instruction_only_in_segment_not_worker_guidance() {
+        // #1586 codex P2: MEMORY_USE_GUIDANCE reaches spawned workers whose
+        // registries lack record_memory_use — it must NOT tell them to call
+        // it. The segment (where the tool IS registered) does.
+        assert!(
+            !MEMORY_USE_GUIDANCE.contains("record_memory_use"),
+            "worker-reachable guidance must not name the tool"
+        );
+        let seg = compose_memory_segment("mem", false);
+        assert!(
+            seg.contains("record_memory_use"),
+            "segment carries the instruction"
+        );
     }
 }

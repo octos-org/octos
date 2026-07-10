@@ -39,9 +39,26 @@ pub struct UsageMap {
 /// Persistent memory store backed by markdown files.
 pub struct MemoryStore {
     memory_dir: PathBuf,
-    /// Serializes read-modify-write on the usage sidecar so concurrent
-    /// `record_memory_use` calls don't lose updates.
-    usage_lock: tokio::sync::Mutex<()>,
+}
+
+/// Process-global usage-file locks keyed by path. A per-INSTANCE lock only
+/// serializes calls on ONE `MemoryStore`; two instances opened on the same
+/// data dir (e.g. a gateway session + an in-process consolidation) would
+/// otherwise both read-modify-rename and lose an update (codex #1614 P2).
+/// Keyed by path so every instance on a given usage.json shares one lock.
+/// (Cross-PROCESS writers still race — acceptable for advisory usage data;
+/// they would already contend the redb lock.)
+static USAGE_LOCKS: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<PathBuf, std::sync::Arc<tokio::sync::Mutex<()>>>>,
+> = std::sync::OnceLock::new();
+
+fn usage_lock_for(path: &Path) -> std::sync::Arc<tokio::sync::Mutex<()>> {
+    let map = USAGE_LOCKS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    let mut guard = map.lock().expect("usage-lock registry poisoned");
+    guard
+        .entry(path.to_path_buf())
+        .or_insert_with(|| std::sync::Arc::new(tokio::sync::Mutex::new(())))
+        .clone()
 }
 
 /// Raw markdown sections loaded from disk, before prompt formatting.
@@ -171,10 +188,17 @@ impl MemoryStore {
         tokio::fs::create_dir_all(&memory_dir)
             .await
             .wrap_err("failed to create memory directory")?;
-        Ok(Self {
-            memory_dir,
-            usage_lock: tokio::sync::Mutex::new(()),
-        })
+        Ok(Self { memory_dir })
+    }
+
+    /// Construct a store at an ALREADY-resolved memory dir (the `…/memory`
+    /// directory itself, not its parent). For callers like consolidation
+    /// that hold the memory_dir directly and want the usage sidecar helpers
+    /// without re-deriving the path.
+    pub fn at_memory_dir(memory_dir: impl Into<PathBuf>) -> Self {
+        Self {
+            memory_dir: memory_dir.into(),
+        }
     }
 
     /// Path to `MEMORY.md` (for cheap change detection by callers).
@@ -185,6 +209,26 @@ impl MemoryStore {
     /// Path to the memory-usage sidecar (`usage.json`).
     fn usage_path(&self) -> PathBuf {
         self.memory_dir.join("usage.json")
+    }
+
+    /// Drop usage entries whose id/slug is no longer live, keeping the
+    /// sidecar bounded as entries are archived/deleted (codex #1614 P2).
+    /// `live` is the set of surviving MEMORY.md entry ids and bank slugs.
+    pub async fn prune_usage(&self, live: &std::collections::HashSet<String>) {
+        let path = self.usage_path();
+        let lock = usage_lock_for(&path);
+        let _guard = lock.lock().await;
+        let mut usage = self.load_usage().await;
+        let before = usage.entries.len();
+        usage.entries.retain(|k, _| live.contains(k));
+        if usage.entries.len() == before {
+            return;
+        }
+        if let Ok(body) = serde_json::to_string_pretty(&usage) {
+            if let Err(e) = write_atomic_with_backup(path, body, None).await {
+                tracing::warn!(error = %e, "failed to prune memory usage");
+            }
+        }
     }
 
     /// Load the usage sidecar: entry id (`^m…`) or bank slug -> stats.
@@ -206,13 +250,20 @@ impl MemoryStore {
         I: IntoIterator<Item = S>,
         S: AsRef<str>,
     {
-        let _guard = self.usage_lock.lock().await;
+        // Cap per-call ids and skip absurd ones so a runaway/hostile call
+        // can't bloat usage.json (codex #1614 P2).
+        const MAX_IDS_PER_CALL: usize = 64;
+        const MAX_ID_LEN: usize = 128;
+
+        let path = self.usage_path();
+        let lock = usage_lock_for(&path);
+        let _guard = lock.lock().await;
         let mut usage = self.load_usage().await;
         let stamp = today.format("%Y-%m-%d").to_string();
         let mut changed = false;
-        for id in ids {
+        for id in ids.into_iter().take(MAX_IDS_PER_CALL) {
             let id = id.as_ref().trim();
-            if id.is_empty() {
+            if id.is_empty() || id.len() > MAX_ID_LEN {
                 continue;
             }
             let entry = usage.entries.entry(id.to_string()).or_default();
@@ -1110,6 +1161,41 @@ mod tests {
         // Survives reopen (persisted, not in-memory).
         let reopened = MemoryStore::open(dir.path()).await.unwrap();
         assert_eq!(reopened.load_usage().await.entries["^maaaaaa"].count, 2);
+    }
+
+    #[tokio::test]
+    async fn should_prune_orphaned_usage_ids() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MemoryStore::open(dir.path()).await.unwrap();
+        let d = chrono::NaiveDate::from_ymd_opt(2026, 7, 10).unwrap();
+        store
+            .record_memory_use(["^malive0", "^mdead00", "octos"], d)
+            .await;
+
+        let mut live = std::collections::HashSet::new();
+        live.insert("^malive0".to_string());
+        live.insert("octos".to_string());
+        store.prune_usage(&live).await;
+
+        let usage = store.load_usage().await;
+        assert!(usage.entries.contains_key("^malive0"));
+        assert!(usage.entries.contains_key("octos"));
+        assert!(!usage.entries.contains_key("^mdead00"), "orphan pruned");
+    }
+
+    #[tokio::test]
+    async fn should_cap_ids_per_call_and_skip_oversized() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MemoryStore::open(dir.path()).await.unwrap();
+        let d = chrono::NaiveDate::from_ymd_opt(2026, 7, 10).unwrap();
+        let many: Vec<String> = (0..100).map(|i| format!("^mid{i:04}")).collect();
+        store.record_memory_use(&many, d).await;
+        let over = "x".repeat(200);
+        store.record_memory_use([over.clone()], d).await;
+
+        let usage = store.load_usage().await;
+        assert!(usage.entries.len() <= 64, "per-call id cap enforced");
+        assert!(!usage.entries.contains_key(&over), "oversized id skipped");
     }
 
     #[tokio::test]
