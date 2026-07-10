@@ -247,6 +247,13 @@ pub const UI_PROTOCOL_FEATURE_USER_QUESTION_V1: &str = "user_question.v1";
 /// turn keeps emitting whole-file `file/attached` audio.
 pub const UI_PROTOCOL_FEATURE_VOICE_AUDIO_V1: &str = "event.voice_audio.v1";
 
+/// Feature flag for the model-authored plan/todo checklist. When negotiated,
+/// the server pushes `plan/updated` notifications carrying the agent's current
+/// ordered checklist (the `update_plan` tool's live state), and replays the
+/// latest snapshot on `session/open`. Not negotiated → the plan rides out only
+/// on the legacy `tool/completed` `structured_metadata` path.
+pub const UI_PROTOCOL_FEATURE_PLAN_TODOS_V1: &str = "plan.todos.v1";
+
 /// Server-known feature registry. Used by
 /// [`UiProtocolCapabilities::for_negotiated_features`] (UPCR-2026-007) to
 /// intersect a client's `X-Octos-Ui-Features` request with the names the
@@ -276,6 +283,7 @@ pub const UI_PROTOCOL_KNOWN_FEATURES: &[&str] = &[
     UI_PROTOCOL_FEATURE_HARNESS_TASK_ARTIFACTS_V1,
     UI_PROTOCOL_FEATURE_USER_QUESTION_V1,
     UI_PROTOCOL_FEATURE_VOICE_AUDIO_V1,
+    UI_PROTOCOL_FEATURE_PLAN_TODOS_V1,
 ];
 
 /// Returns the feature flag that gates `method` per spec § 7 capability
@@ -1038,6 +1046,9 @@ pub mod methods {
     /// `approval/requested`). Gated by `user_question.v1`.
     pub const USER_QUESTION_REQUESTED: &str = "user_question/requested";
     pub const TASK_UPDATED: &str = "task/updated";
+    /// Model-authored plan/todo checklist snapshot (the `update_plan` tool).
+    /// Gated by `plan.todos.v1`. Replaces any prior plan wholesale.
+    pub const PLAN_UPDATED: &str = "plan/updated";
     pub const TASK_OUTPUT_DELTA: &str = "task/output/delta";
     pub const PROGRESS_UPDATED: &str = "progress/updated";
     pub const WARNING: &str = "warning";
@@ -1265,6 +1276,7 @@ pub const UI_PROTOCOL_NOTIFICATION_METHODS: &[&str] = &[
     methods::APPROVAL_CANCELLED,
     methods::USER_QUESTION_REQUESTED,
     methods::TASK_UPDATED,
+    methods::PLAN_UPDATED,
     methods::TASK_OUTPUT_DELTA,
     methods::PROGRESS_UPDATED,
     methods::WARNING,
@@ -1429,6 +1441,7 @@ impl UiProtocolCapabilities {
             UI_PROTOCOL_FEATURE_REVIEW_START_V1,
             UI_PROTOCOL_FEATURE_CONTEXT_LIFECYCLE_V1,
             UI_PROTOCOL_FEATURE_USER_QUESTION_V1,
+            UI_PROTOCOL_FEATURE_PLAN_TODOS_V1,
         ])
     }
 
@@ -5294,6 +5307,57 @@ pub struct TaskOutputDeltaEvent {
     pub text: String,
 }
 
+/// Status of one model-authored plan item. Wire form is snake_case
+/// (`"pending"`, `"in_progress"`, `"completed"`) so clients map it to a glyph
+/// without matching free-form strings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlanItemStatus {
+    Pending,
+    InProgress,
+    Completed,
+}
+
+/// One entry in the agent's live checklist (`plan/updated`). `id` is stable
+/// across updates so a client can re-render in place without losing selection
+/// or scroll position when the plan mutates.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UiPlanItem {
+    pub id: String,
+    pub title: String,
+    pub status: PlanItemStatus,
+    /// Optional priority/label tag (e.g. `"P3"`), rendered as a chip.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub priority: Option<String>,
+}
+
+/// Snapshot of the agent's plan for a session. The `update_plan` tool sends the
+/// full ordered list on every call, so a `plan/updated` REPLACES any prior
+/// plan wholesale rather than diffing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UiPlanRecord {
+    pub items: Vec<UiPlanItem>,
+    /// Overall activity label for the header line (e.g. `"Building memory
+    /// panel…"`). `None` → the client derives one from the in-progress item.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    pub updated_at_ms: i64,
+}
+
+/// `plan/updated` notification payload. Template: [`TaskUpdatedEvent`]. Gated by
+/// `plan.todos.v1`; replayed as an ephemeral snapshot on `session/open`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PlanUpdatedEvent {
+    pub session_id: SessionKey,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub topic: Option<String>,
+    /// The turn that authored this plan, when known. Lets the client scope the
+    /// panel to the active turn and drop it on turn completion.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_id: Option<TurnId>,
+    pub plan: UiPlanRecord,
+}
+
 /// Runtime policy details attached to M15 agent records. The policy stamp is
 /// backend-owned and intentionally open so future autonomy policy fields round
 /// trip without forcing clients back to raw JSON.
@@ -5822,6 +5886,8 @@ pub enum UiNotification {
     /// `ApprovalRequested`; pauses the turn at the blocking-tool boundary.
     UserQuestionRequested(UserQuestionRequestedEvent),
     TaskUpdated(TaskUpdatedEvent),
+    /// Model-authored plan/todo checklist snapshot (gated by `plan.todos.v1`).
+    PlanUpdated(PlanUpdatedEvent),
     TaskOutputDelta(TaskOutputDeltaEvent),
     ProgressUpdated(ProgressUpdatedEvent),
     Warning(WarningEvent),
@@ -5922,6 +5988,7 @@ impl UiNotification {
             Self::ApprovalCancelled(_) => methods::APPROVAL_CANCELLED,
             Self::UserQuestionRequested(_) => methods::USER_QUESTION_REQUESTED,
             Self::TaskUpdated(_) => methods::TASK_UPDATED,
+            Self::PlanUpdated(_) => methods::PLAN_UPDATED,
             Self::TaskOutputDelta(_) => methods::TASK_OUTPUT_DELTA,
             Self::ProgressUpdated(_) => methods::PROGRESS_UPDATED,
             Self::Warning(_) => methods::WARNING,
@@ -5971,6 +6038,7 @@ impl UiNotification {
             Self::ApprovalCancelled(event) => &event.session_id,
             Self::UserQuestionRequested(event) => &event.session_id,
             Self::TaskUpdated(event) => &event.session_id,
+            Self::PlanUpdated(event) => &event.session_id,
             Self::TaskOutputDelta(event) => &event.session_id,
             Self::ProgressUpdated(event) => &event.session_id,
             Self::Warning(event) => &event.session_id,
@@ -6043,6 +6111,7 @@ impl UiNotification {
                 event.topic.as_deref().or_else(|| event.session_id.topic())
             }
             Self::TaskUpdated(event) => event.topic.as_deref().or_else(|| event.session_id.topic()),
+            Self::PlanUpdated(event) => event.topic.as_deref().or_else(|| event.session_id.topic()),
             Self::TaskOutputDelta(event) => {
                 event.topic.as_deref().or_else(|| event.session_id.topic())
             }
@@ -6091,6 +6160,7 @@ impl UiNotification {
             Self::ApprovalCancelled(event) => set_topic_if_absent(&mut event.topic, &topic),
             Self::UserQuestionRequested(event) => set_topic_if_absent(&mut event.topic, &topic),
             Self::TaskUpdated(event) => set_topic_if_absent(&mut event.topic, &topic),
+            Self::PlanUpdated(event) => set_topic_if_absent(&mut event.topic, &topic),
             Self::TaskOutputDelta(event) => set_topic_if_absent(&mut event.topic, &topic),
             Self::TurnCompleted(event) => set_topic_if_absent(&mut event.topic, &topic),
             Self::TurnError(event) => set_topic_if_absent(&mut event.topic, &topic),
@@ -6125,6 +6195,7 @@ impl UiNotification {
             Self::ApprovalCancelled(params) => serde_json::to_value(params),
             Self::UserQuestionRequested(params) => serde_json::to_value(params),
             Self::TaskUpdated(params) => serde_json::to_value(params),
+            Self::PlanUpdated(params) => serde_json::to_value(params),
             Self::TaskOutputDelta(params) => serde_json::to_value(params),
             Self::ProgressUpdated(params) => serde_json::to_value(params),
             Self::Warning(params) => serde_json::to_value(params),
@@ -6239,6 +6310,7 @@ impl UiNotification {
                 Ok(Self::UserQuestionRequested(decode_params(method, params)?))
             }
             methods::TASK_UPDATED => Ok(Self::TaskUpdated(decode_params(method, params)?)),
+            methods::PLAN_UPDATED => Ok(Self::PlanUpdated(decode_params(method, params)?)),
             methods::TASK_OUTPUT_DELTA => Ok(Self::TaskOutputDelta(decode_params(method, params)?)),
             methods::PROGRESS_UPDATED => Ok(Self::ProgressUpdated(decode_params(method, params)?)),
             methods::WARNING => Ok(Self::Warning(decode_params(method, params)?)),
@@ -7039,6 +7111,7 @@ mod tests {
                 "approval/cancelled",
                 "user_question/requested",
                 "task/updated",
+                "plan/updated",
                 "task/output/delta",
                 "progress/updated",
                 "warning",
@@ -7218,6 +7291,7 @@ mod tests {
                     "approval/cancelled",
                     "user_question/requested",
                     "task/updated",
+                    "plan/updated",
                     "task/output/delta",
                     "progress/updated",
                     "warning",
@@ -7270,7 +7344,8 @@ mod tests {
                     "harness.task_supervision_inspection.v1",
                     "harness.task_artifacts.v1",
                     "user_question.v1",
-                    "event.voice_audio.v1"
+                    "event.voice_audio.v1",
+                    "plan.todos.v1"
                 ]
             })
         );
@@ -9823,6 +9898,53 @@ mod tests {
         let decoded =
             UiNotification::from_rpc_notification(rpc).expect("deserialize task/updated cancelled");
         assert_eq!(decoded, event);
+    }
+
+    #[test]
+    fn plan_updated_event_round_trips_and_advertises() {
+        let event = UiNotification::PlanUpdated(PlanUpdatedEvent {
+            // No topic in the key → `stamp_topic_from_session` is a no-op, so the
+            // absent-`topic` assertion below holds and the round-trip is exact.
+            session_id: SessionKey("acct:web:tui".into()),
+            topic: None,
+            turn_id: None,
+            plan: UiPlanRecord {
+                items: vec![
+                    UiPlanItem {
+                        id: "1".into(),
+                        title: "web P3: PWA manifest + bridge hygiene".into(),
+                        status: PlanItemStatus::Completed,
+                        priority: Some("P3".into()),
+                    },
+                    UiPlanItem {
+                        id: "2".into(),
+                        title: "memory panel (octos endpoints + web UI)".into(),
+                        status: PlanItemStatus::InProgress,
+                        priority: None,
+                    },
+                ],
+                title: Some("Building memory panel…".into()),
+                updated_at_ms: 1_700_000_000_000,
+            },
+        });
+        assert_eq!(event.method(), methods::PLAN_UPDATED);
+
+        let rpc = event
+            .clone()
+            .into_rpc_notification()
+            .expect("serialize plan/updated");
+        // Status is snake_case on the wire; an absent `priority`/`topic` stays
+        // absent (no `null` leakage that would clobber a cached value).
+        assert_eq!(rpc.params["plan"]["items"][1]["status"], "in_progress");
+        assert!(rpc.params["plan"]["items"][1].get("priority").is_none());
+        assert!(rpc.params.get("topic").is_none());
+
+        let decoded = UiNotification::from_rpc_notification(rpc).expect("deserialize plan/updated");
+        assert_eq!(decoded, event);
+
+        // Advertised in both the notification and feature registries.
+        assert!(UI_PROTOCOL_NOTIFICATION_METHODS.contains(&methods::PLAN_UPDATED));
+        assert!(UI_PROTOCOL_KNOWN_FEATURES.contains(&UI_PROTOCOL_FEATURE_PLAN_TODOS_V1));
     }
 
     /// #1123 codex P2 follow-up to #1113: pin that the new M13-B

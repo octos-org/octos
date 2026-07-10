@@ -24815,6 +24815,9 @@ fn ledger_event_cursor(event: &UiProtocolLedgerEvent) -> Option<UiCursor> {
             // surrounding LedgeredUiProtocolEvent is authoritative for replay.
             | UiNotification::UserQuestionRequested(_)
             | UiNotification::TaskUpdated(_)
+            // Plan snapshots are non-cursor-bearing; the surrounding
+            // LedgeredUiProtocolEvent cursor is authoritative for replay.
+            | UiNotification::PlanUpdated(_)
             // TaskOutputDelta carries an `OutputCursor`, not a `UiCursor`.
             | UiNotification::TaskOutputDelta(_)
             | UiNotification::ProgressUpdated(_)
