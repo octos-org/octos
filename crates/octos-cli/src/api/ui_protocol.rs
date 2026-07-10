@@ -21277,6 +21277,28 @@ async fn try_emit_terminal(
 ///
 /// `Skipped` and `Aborted` variants require future signal sources
 /// (deadline-skip plumbing, interrupt propagation) and are NOT
+/// Compact preview of a tool call's arguments for envelope display, bounded
+/// to [`octos_core::ui_protocol::ENVELOPE_TOOL_ARGUMENTS_PREVIEW_MAX`].
+/// Object arguments render as `key: value` pairs (`command: "cargo test",
+/// timeout: 30`) — the human `shell(…)` reading, not raw JSON braces. This is
+/// display fidelity only; the full arguments stay on the live
+/// `ToolStarted` notification and in the agent transcript.
+fn envelope_tool_arguments_preview(arguments: &Value) -> String {
+    let rendered = match arguments {
+        Value::Object(map) => map
+            .iter()
+            .map(|(key, value)| format!("{key}: {value}"))
+            .collect::<Vec<_>>()
+            .join(", "),
+        other => other.to_string(),
+    };
+    octos_core::truncated_utf8(
+        &rendered,
+        octos_core::ui_protocol::ENVELOPE_TOOL_ARGUMENTS_PREVIEW_MAX,
+        "…",
+    )
+}
+
 /// reachable through `ToolCompleted` today.
 fn emit_envelope_for_legacy_notification(
     ledger: &UiProtocolLedger,
@@ -21305,6 +21327,13 @@ fn emit_envelope_for_legacy_notification(
                 Payload::ToolStart {
                     tool_call_id: event.tool_call_id.clone(),
                     name: event.tool_name.clone(),
+                    // Display fidelity for the tool card (`shell(cd … && …)`),
+                    // bounded so a 1MB tool-arg blob never lands in every
+                    // persisted envelope + hydrate replay.
+                    arguments_preview: event
+                        .arguments
+                        .as_ref()
+                        .map(envelope_tool_arguments_preview),
                 },
                 None,
             ),
@@ -21337,6 +21366,18 @@ fn emit_envelope_for_legacy_notification(
                         status,
                         error,
                         reason: None,
+                        // Result excerpt for the `⎿ …` line under the card.
+                        // `ToolCompletedEvent.output_preview` is already a
+                        // preview upstream; re-bound defensively so ledger
+                        // growth is capped no matter what the emitter sent.
+                        output_preview: event.output_preview.as_deref().map(|preview| {
+                            octos_core::truncated_utf8(
+                                preview,
+                                octos_core::ui_protocol::ENVELOPE_TOOL_OUTPUT_PREVIEW_MAX,
+                                "…",
+                            )
+                        }),
+                        duration_ms: event.duration_ms,
                     },
                     None,
                 )
@@ -37707,6 +37748,7 @@ ignore = []
             Payload::ToolStart {
                 tool_call_id: "tc-shell-1".into(),
                 name: "shell".into(),
+                arguments_preview: None,
             },
             None,
         );
@@ -39408,6 +39450,90 @@ ignore = []
     /// the helper that wires the dual-emit
     /// (`emit_envelope_for_legacy_notification`) so a future refactor
     /// can't silently drop a variant from the dual surface.
+    #[test]
+    fn emit_envelope_carries_tool_fidelity_previews() {
+        // The tool-card fidelity lane: ToolStarted.arguments →
+        // ToolStart.arguments_preview (key: value rendering, bounded) and
+        // ToolCompleted.output_preview/duration_ms → ToolEnd (re-bounded).
+        let ledger = UiProtocolLedger::new(32);
+        let session_id = SessionKey("local:fidelity-emit".into());
+        let turn_id = TurnId::new();
+
+        let giant = "æ".repeat(9000);
+        emit_envelope_for_legacy_notification(
+            &ledger,
+            &session_id,
+            &UiNotification::ToolStarted(ToolStartedEvent {
+                session_id: session_id.clone(),
+                topic: None,
+                turn_id: turn_id.clone(),
+                tool_call_id: "tc-fid".into(),
+                tool_name: "shell".into(),
+                arguments: Some(serde_json::json!({
+                    "command": "cargo test",
+                    "blob": giant,
+                })),
+            }),
+        );
+        emit_envelope_for_legacy_notification(
+            &ledger,
+            &session_id,
+            &UiNotification::ToolCompleted(ToolCompletedEvent {
+                session_id: session_id.clone(),
+                topic: None,
+                turn_id: turn_id.clone(),
+                tool_call_id: "tc-fid".into(),
+                tool_name: "shell".into(),
+                success: Some(true),
+                output_preview: Some("test result: ok. 815 passed".into()),
+                duration_ms: Some(4321),
+            }),
+        );
+
+        let baseline = UiCursor {
+            stream: session_id.0.clone(),
+            seq: 0,
+        };
+        let replay = ledger.replay_after(&session_id, Some(&baseline)).unwrap();
+        let payloads: Vec<&Payload> = replay
+            .iter()
+            .filter_map(|e| match &e.event {
+                UiProtocolLedgerEvent::Notification(UiNotification::Envelope(env)) => {
+                    Some(&env.envelope.payload)
+                }
+                _ => None,
+            })
+            .collect();
+
+        let Some(Payload::ToolStart {
+            arguments_preview: Some(preview),
+            ..
+        }) = payloads.first()
+        else {
+            panic!("expected enriched ToolStart, got {payloads:?}");
+        };
+        assert!(
+            preview.contains("command: \"cargo test\""),
+            "object args render as key: value pairs, got {preview}"
+        );
+        assert!(
+            preview.chars().count()
+                <= octos_core::ui_protocol::ENVELOPE_TOOL_ARGUMENTS_PREVIEW_MAX + 1,
+            "arguments preview must be bounded (UTF-8-safe), got {} chars",
+            preview.chars().count()
+        );
+        let Some(Payload::ToolEnd {
+            output_preview: Some(output),
+            duration_ms: Some(duration),
+            ..
+        }) = payloads.get(1)
+        else {
+            panic!("expected enriched ToolEnd, got {payloads:?}");
+        };
+        assert_eq!(output, "test result: ok. 815 passed");
+        assert_eq!(*duration, 4321);
+    }
+
     #[test]
     fn emit_envelope_for_legacy_notification_covers_every_progress_variant() {
         let ledger = UiProtocolLedger::new(32);
