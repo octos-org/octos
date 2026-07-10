@@ -347,10 +347,11 @@ impl MemoryStore {
                 budget = 0;
                 if kept.is_empty() {
                     sections.long_term = String::new();
-                    omitted.push("long-term memory".to_string());
+                    omitted
+                        .push("long-term memory (load with recall_memory(\"MEMORY\"))".to_string());
                 } else {
                     sections.long_term = format!(
-                        "{kept}\n\n_[long-term memory truncated to fit the context budget — full MEMORY.md on disk]_"
+                        "{kept}\n\n_[long-term memory truncated to fit the context budget — load the complete registry on demand with recall_memory(\"MEMORY\")]_"
                     );
                 }
             }
@@ -1453,6 +1454,12 @@ mod tests {
         assert!(ctx.contains("first entry"));
         assert!(!ctx.contains(&big_para));
         assert!(ctx.contains("long-term memory truncated"));
+        // #1588 two-tier: the truncation marker must point the model at the
+        // tool that loads the full registry, not just say it's "on disk".
+        assert!(
+            ctx.contains("recall_memory(\"MEMORY\")"),
+            "truncation marker must name the registry-load affordance: {ctx}"
+        );
     }
 
     #[tokio::test]

@@ -30,6 +30,17 @@ fn to_slug(name: &str) -> String {
     name.trim().to_lowercase().replace(' ', "-")
 }
 
+/// Reserved names that resolve to the whole long-term MEMORY.md registry
+/// rather than a memory-bank entity page (#1588 two-tier: the injected
+/// registry is budget-truncated, so the model must be able to pull the
+/// full thing on demand). Matched case-insensitively after trim.
+fn is_registry_alias(name: &str) -> bool {
+    matches!(
+        name.trim().to_lowercase().as_str(),
+        "memory" | "memory.md" | "registry" | "long-term memory" | "long-term-memory"
+    )
+}
+
 #[async_trait]
 impl Tool for RecallMemoryTool {
     fn name(&self) -> &str {
@@ -37,8 +48,10 @@ impl Tool for RecallMemoryTool {
     }
 
     fn description(&self) -> &str {
-        "Load the full content of a memory bank entity by name. \
-         Use the entity names shown in the Memory Bank section of the system prompt."
+        "Load full memory detail on demand. Pass a memory-bank entity name \
+         (as shown in the Memory Bank section) for its page, or \"MEMORY\" \
+         for the complete long-term registry when the injected memory is a \
+         budget-truncated summary and you need an entry that isn't shown."
     }
 
     fn input_schema(&self) -> serde_json::Value {
@@ -47,7 +60,7 @@ impl Tool for RecallMemoryTool {
             "properties": {
                 "name": {
                     "type": "string",
-                    "description": "Entity name (e.g. 'octos', 'yuechen')"
+                    "description": "Entity name (e.g. 'octos', 'yuechen'), or 'MEMORY' for the full long-term registry"
                 }
             },
             "required": ["name"]
@@ -57,6 +70,21 @@ impl Tool for RecallMemoryTool {
     async fn execute(&self, args: &serde_json::Value) -> Result<ToolResult> {
         let input: Input =
             serde_json::from_value(args.clone()).wrap_err("invalid recall_memory input")?;
+
+        // Tier-2 registry load: the injected long-term memory is capped to a
+        // token budget, so "MEMORY" (and aliases) returns the full MEMORY.md.
+        if is_registry_alias(&input.name) {
+            let registry = self.store.read_long_term().await?;
+            return Ok(ToolResult {
+                output: if registry.trim().is_empty() {
+                    "The long-term memory registry (MEMORY.md) is empty.".to_string()
+                } else {
+                    registry
+                },
+                success: true,
+                ..Default::default()
+            });
+        }
 
         let slug = to_slug(&input.name);
 
@@ -150,5 +178,60 @@ mod tests {
         let props = schema["properties"].as_object().unwrap();
         assert!(props.contains_key("name"));
         assert_eq!(props["name"]["type"], "string");
+    }
+
+    #[test]
+    fn registry_aliases_match_case_and_form_insensitively() {
+        for name in [
+            "MEMORY",
+            "memory",
+            " Memory.md ",
+            "registry",
+            "long-term memory",
+        ] {
+            assert!(
+                is_registry_alias(name),
+                "{name:?} should be a registry alias"
+            );
+        }
+        for name in ["octos", "yuechen", "memories", "mem"] {
+            assert!(
+                !is_registry_alias(name),
+                "{name:?} is a bank entity, not the registry"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn should_load_full_registry_when_name_is_memory() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(MemoryStore::open(dir.path()).await.unwrap());
+        store
+            .write_long_term("Fact one. ^maaaaaa\nFact two. ^mbbbbbb")
+            .await
+            .unwrap();
+        let tool = RecallMemoryTool::new(store);
+
+        let result = tool
+            .execute(&serde_json::json!({ "name": "MEMORY" }))
+            .await
+            .unwrap();
+        assert!(result.success);
+        assert!(result.output.contains("Fact one."));
+        assert!(result.output.contains("Fact two."));
+    }
+
+    #[tokio::test]
+    async fn should_report_empty_registry_gracefully() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(MemoryStore::open(dir.path()).await.unwrap());
+        let tool = RecallMemoryTool::new(store);
+
+        let result = tool
+            .execute(&serde_json::json!({ "name": "registry" }))
+            .await
+            .unwrap();
+        assert!(result.success, "empty registry is not an error");
+        assert!(result.output.contains("empty"));
     }
 }
