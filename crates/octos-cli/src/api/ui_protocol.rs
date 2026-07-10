@@ -52,19 +52,19 @@ use octos_core::ui_protocol::{
     UI_PROTOCOL_FEATURE_CODING_LOOP_RUNTIME_V1, UI_PROTOCOL_FEATURE_CONTEXT_LIFECYCLE_V1,
     UI_PROTOCOL_FEATURE_FILE_ATTACHED_V1, UI_PROTOCOL_FEATURE_HARNESS_TASK_ARTIFACTS_V1,
     UI_PROTOCOL_FEATURE_HARNESS_TASK_CONTROL_V1, UI_PROTOCOL_FEATURE_MESSAGE_PERSISTED_V1,
-    UI_PROTOCOL_FEATURE_PANE_SNAPSHOTS_V1, UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V1,
-    UI_PROTOCOL_FEATURE_REVIEW_START_V1, UI_PROTOCOL_FEATURE_SESSION_HYDRATE_V1,
-    UI_PROTOCOL_FEATURE_SESSION_SANDBOX_V1, UI_PROTOCOL_FEATURE_SESSION_WORKSPACE_CWD_V1,
-    UI_PROTOCOL_FEATURE_SPAWN_COMPLETE_V1, UI_PROTOCOL_FEATURE_THREAD_GRAPH_V1,
-    UI_PROTOCOL_FEATURE_TURN_STATE_GET_V1, UI_PROTOCOL_FEATURE_USER_QUESTION_V1,
-    UI_PROTOCOL_FEATURE_VOICE_AUDIO_V1, UiAgentRecord, UiArtifactPaneItem, UiArtifactPaneSnapshot,
-    UiCommand, UiContextCompactionRecord, UiContextNormalizationReport, UiContextState, UiCursor,
-    UiFileMutationNotice, UiGitHistoryItem, UiGitPaneSnapshot, UiGitStatusItem, UiNotification,
-    UiPaneSnapshot, UiPaneSnapshotLimitation, UiProgressEvent, UiProgressMetadata,
-    UiProtocolCapabilities, UiRpcResult, UiWorkspacePaneEntry, UiWorkspacePaneSnapshot,
-    UnsupportedCapabilityReport, UserQuestionRequestedEvent, UserQuestionRespondParams,
-    VoiceAudioChunkEvent, approval_cancelled_reasons, approval_kinds, hydrate_sections,
-    progress_kinds, thread_status,
+    UI_PROTOCOL_FEATURE_PANE_SNAPSHOTS_V1, UI_PROTOCOL_FEATURE_PLAN_TODOS_V1,
+    UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V1, UI_PROTOCOL_FEATURE_REVIEW_START_V1,
+    UI_PROTOCOL_FEATURE_SESSION_HYDRATE_V1, UI_PROTOCOL_FEATURE_SESSION_SANDBOX_V1,
+    UI_PROTOCOL_FEATURE_SESSION_WORKSPACE_CWD_V1, UI_PROTOCOL_FEATURE_SPAWN_COMPLETE_V1,
+    UI_PROTOCOL_FEATURE_THREAD_GRAPH_V1, UI_PROTOCOL_FEATURE_TURN_STATE_GET_V1,
+    UI_PROTOCOL_FEATURE_USER_QUESTION_V1, UI_PROTOCOL_FEATURE_VOICE_AUDIO_V1, UiAgentRecord,
+    UiArtifactPaneItem, UiArtifactPaneSnapshot, UiCommand, UiContextCompactionRecord,
+    UiContextNormalizationReport, UiContextState, UiCursor, UiFileMutationNotice, UiGitHistoryItem,
+    UiGitPaneSnapshot, UiGitStatusItem, UiNotification, UiPaneSnapshot, UiPaneSnapshotLimitation,
+    UiProgressEvent, UiProgressMetadata, UiProtocolCapabilities, UiRpcResult, UiWorkspacePaneEntry,
+    UiWorkspacePaneSnapshot, UnsupportedCapabilityReport, UserQuestionRequestedEvent,
+    UserQuestionRespondParams, VoiceAudioChunkEvent, approval_cancelled_reasons, approval_kinds,
+    hydrate_sections, progress_kinds, thread_status,
 };
 use octos_core::{
     AgentId, InboundMessage, MAIN_PROFILE_ID, Message, MessageRole, SessionKey, TaskId,
@@ -1034,6 +1034,11 @@ struct ConnectionUiFeatures {
     /// progressive MSE playback; otherwise it falls back to whole-file
     /// `file/attached` audio.
     voice_audio: bool,
+    /// `plan.todos.v1` negotiated. When set, the server streams the
+    /// `update_plan` tool's checklist as `plan/updated` notifications and
+    /// replays the latest snapshot on `session/open`. Otherwise the plan rides
+    /// out only on the legacy `tool/completed` `structured_metadata` path.
+    plan_todos: bool,
     /// UPCR-2026-014 M9-γ `projection.envelope.v1` negotiated. When set,
     /// the client opts in to the canonical [`Envelope`] shape (spec
     /// § 14) for projected events. γ-1 wires capability negotiation
@@ -1125,6 +1130,7 @@ impl ConnectionUiFeatures {
             spawn_complete: has_ui_feature(headers, query, UI_PROTOCOL_FEATURE_SPAWN_COMPLETE_V1),
             file_attached: has_ui_feature(headers, query, UI_PROTOCOL_FEATURE_FILE_ATTACHED_V1),
             voice_audio: has_ui_feature(headers, query, UI_PROTOCOL_FEATURE_VOICE_AUDIO_V1),
+            plan_todos: has_ui_feature(headers, query, UI_PROTOCOL_FEATURE_PLAN_TODOS_V1),
             projection_envelope: has_ui_feature(
                 headers,
                 query,
@@ -1182,6 +1188,7 @@ impl ConnectionUiFeatures {
             spawn_complete: true,
             file_attached: true,
             voice_audio: true,
+            plan_todos: true,
             // Do NOT auto-enable `projection.envelope.v1` for stdio
             // connections. Legacy `turn/completed` is the turn-lifecycle
             // source for clients that do not consume `projection/envelope`
@@ -1235,6 +1242,7 @@ impl ConnectionUiFeatures {
             spawn_complete: has(UI_PROTOCOL_FEATURE_SPAWN_COMPLETE_V1),
             file_attached: has(UI_PROTOCOL_FEATURE_FILE_ATTACHED_V1),
             voice_audio: has(UI_PROTOCOL_FEATURE_VOICE_AUDIO_V1),
+            plan_todos: has(UI_PROTOCOL_FEATURE_PLAN_TODOS_V1),
             projection_envelope: has(UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V1),
             auxiliary_rest_to_ws_v1: has(UI_PROTOCOL_FEATURE_AUXILIARY_REST_TO_WS_V1),
             coding_autonomy_v1: has(UI_PROTOCOL_FEATURE_CODING_AUTONOMY_V1),
@@ -1301,6 +1309,9 @@ impl ConnectionUiFeatures {
         }
         if self.voice_audio {
             requested.push(UI_PROTOCOL_FEATURE_VOICE_AUDIO_V1);
+        }
+        if self.plan_todos {
+            requested.push(UI_PROTOCOL_FEATURE_PLAN_TODOS_V1);
         }
         if self.projection_envelope {
             requested.push(UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V1);
@@ -9256,6 +9267,15 @@ fn live_event_passes_capability_filter(
     // whole-file `file/attached` audio path.
     if !features.voice_audio {
         if let UiProtocolLedgerEvent::Notification(UiNotification::VoiceAudioChunk(_)) = event {
+            return false;
+        }
+    }
+    // `plan.todos.v1` gate: the model-authored plan checklist only reaches
+    // connections that negotiated it (and know how to render `plan/updated`).
+    // Applies on both the live broadcast and reconnect replay, since both
+    // routes call this filter.
+    if !features.plan_todos {
+        if let UiProtocolLedgerEvent::Notification(UiNotification::PlanUpdated(_)) = event {
             return false;
         }
     }
@@ -29531,6 +29551,7 @@ ignore = []
                 spawn_complete: false,
                 file_attached: false,
                 voice_audio: false,
+                plan_todos: false,
                 projection_envelope: false,
                 auxiliary_rest_to_ws_v1: false,
                 coding_autonomy_v1: false,
@@ -29595,6 +29616,7 @@ ignore = []
                 spawn_complete: false,
                 file_attached: false,
                 voice_audio: false,
+                plan_todos: false,
                 projection_envelope: false,
                 auxiliary_rest_to_ws_v1: false,
                 coding_autonomy_v1: false,
@@ -29704,6 +29726,7 @@ ignore = []
                 spawn_complete: false,
                 file_attached: false,
                 voice_audio: false,
+                plan_todos: false,
                 projection_envelope: false,
                 auxiliary_rest_to_ws_v1: false,
                 coding_autonomy_v1: false,
@@ -29768,6 +29791,7 @@ ignore = []
                 spawn_complete: false,
                 file_attached: false,
                 voice_audio: false,
+                plan_todos: false,
                 projection_envelope: false,
                 auxiliary_rest_to_ws_v1: false,
                 coding_autonomy_v1: false,
@@ -29825,6 +29849,7 @@ ignore = []
                 spawn_complete: false,
                 file_attached: false,
                 voice_audio: false,
+                plan_todos: false,
                 projection_envelope: false,
                 auxiliary_rest_to_ws_v1: false,
                 coding_autonomy_v1: false,
@@ -29925,6 +29950,7 @@ ignore = []
                 spawn_complete: false,
                 file_attached: false,
                 voice_audio: false,
+                plan_todos: false,
                 projection_envelope: false,
                 auxiliary_rest_to_ws_v1: false,
                 coding_autonomy_v1: false,
@@ -31828,6 +31854,33 @@ ignore = []
         );
     }
 
+    #[test]
+    fn plan_updated_gated_by_plan_todos_capability() {
+        use octos_core::ui_protocol::{PlanUpdatedEvent, UiPlanRecord};
+        let event =
+            UiProtocolLedgerEvent::Notification(UiNotification::PlanUpdated(PlanUpdatedEvent {
+                session_id: SessionKey("local:test".into()),
+                topic: None,
+                turn_id: None,
+                plan: UiPlanRecord {
+                    items: Vec::new(),
+                    title: None,
+                    updated_at_ms: 0,
+                },
+            }));
+        // A connection that did not negotiate plan.todos.v1 never receives it —
+        // on the live broadcast OR reconnect replay (both call this filter).
+        assert!(!live_event_passes_capability_filter(
+            &event,
+            ConnectionUiFeatures::default()
+        ));
+        let negotiated = ConnectionUiFeatures {
+            plan_todos: true,
+            ..Default::default()
+        };
+        assert!(live_event_passes_capability_filter(&event, negotiated));
+    }
+
     #[tokio::test]
     async fn session_open_does_not_duplicate_pending_question_already_in_cursor_replay() {
         // #3: a question already carried by the cursor replay window must not
@@ -32156,6 +32209,7 @@ ignore = []
                 spawn_complete: false,
                 file_attached: false,
                 voice_audio: false,
+                plan_todos: false,
                 projection_envelope: false,
                 auxiliary_rest_to_ws_v1: false,
                 coding_autonomy_v1: false,
