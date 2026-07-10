@@ -161,7 +161,11 @@ mod imp {
             let next = openat(
                 parent,
                 name,
-                OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::DIRECTORY | OFlags::CLOEXEC,
+                OFlags::RDONLY
+                    | OFlags::NOFOLLOW
+                    | OFlags::DIRECTORY
+                    | OFlags::CLOEXEC
+                    | OFlags::NONBLOCK,
                 Mode::empty(),
             )
             .ok()?;
@@ -171,16 +175,27 @@ mod imp {
     }
 
     pub(super) fn read_file(dir: &OwnedFd, name: &str) -> Option<(String, Option<SystemTime>)> {
+        // NONBLOCK: opening a FIFO with plain O_RDONLY blocks until a
+        // writer appears — a tenant-planted FIFO must not park a
+        // request thread (codex #1611 r3 P1). Harmless for the regular
+        // files we actually serve.
         let fd = openat(
             dir,
             name,
-            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK,
             Mode::empty(),
         )
         .ok()?;
-        let mut file: std::fs::File = fd.into();
+        let file: std::fs::File = fd.into();
         // fstat on the OPENED handle — no separate stat-by-path race.
-        let mtime = file.metadata().ok().and_then(|m| m.modified().ok());
+        let meta = file.metadata().ok()?;
+        // Regular files only: FIFOs, sockets and devices don't belong
+        // in a memory dir and read()s on them can block or misbehave.
+        if !meta.is_file() {
+            return None;
+        }
+        let mtime = meta.modified().ok();
+        let mut file = file;
         let mut content = String::new();
         file.read_to_string(&mut content).ok()?;
         Some((content, mtime))
@@ -231,7 +246,7 @@ mod imp {
         // Leaf symlink check + read. TOCTOU window documented on
         // `AnchoredDir` — dev-only platforms.
         let meta = std::fs::symlink_metadata(&path).ok()?;
-        if meta.file_type().is_symlink() {
+        if meta.file_type().is_symlink() || !meta.is_file() {
             return None;
         }
         let mtime = meta.modified().ok();
@@ -406,11 +421,17 @@ pub async fn my_memory_entity(
     // ancestor is a plain 404.
     let safe_name = name.replace(['/', '\\', '\0', '~', '.'], "_");
     let rel_bank = rel_under(&data_dir, &store.bank_entities_dir()).ok_or(StatusCode::NOT_FOUND)?;
-    let content = AnchoredDir::open_root(&data_dir)
-        .and_then(|root| root.open_beneath(&rel_bank))
-        .and_then(|bank| bank.read_file(&format!("{safe_name}.md")))
-        .map(|(content, _)| content)
-        .ok_or(StatusCode::NOT_FOUND)?;
+    // Blocking pool: synchronous walk + read (codex #1611 r3 P1).
+    let content = tokio::task::spawn_blocking(move || {
+        AnchoredDir::open_root(&data_dir)
+            .and_then(|root| root.open_beneath(&rel_bank))
+            .and_then(|bank| bank.read_file(&format!("{safe_name}.md")))
+            .map(|(content, _)| content)
+    })
+    .await
+    .ok()
+    .flatten()
+    .ok_or(StatusCode::NOT_FOUND)?;
     Ok(Json(MemoryEntityResponse {
         ok: true,
         name,
@@ -693,6 +714,36 @@ mod tests {
             .unwrap();
         assert_eq!(resp2.long_term, "");
         assert!(resp2.entities.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fifo_planted_as_memory_md_does_not_hang_the_request() {
+        // codex #1611 r3 P1: opening a FIFO with O_RDONLY blocks until
+        // a writer appears — a tenant-planted FIFO must neither hang
+        // the request (NONBLOCK) nor be served (regular-files-only).
+        let (_dir, state, ps) = temp_state();
+        let profile = make_user_profile("fifo", "Fifo");
+        ps.save(&profile).unwrap();
+        let data_dir = ps.resolve_data_dir(&profile);
+        tokio::fs::create_dir_all(data_dir.join("memory"))
+            .await
+            .unwrap();
+        let status = std::process::Command::new("mkfifo")
+            .arg(data_dir.join("memory/MEMORY.md"))
+            .status()
+            .expect("mkfifo");
+        assert!(status.success());
+
+        let resp = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            my_memory(State(state), HeaderMap::new(), user_identity("fifo")),
+        )
+        .await
+        .expect("request must not block on the FIFO")
+        .unwrap();
+        assert_eq!(resp.0.long_term, "", "FIFO content must not be served");
+        assert!(resp.0.long_term_updated_at.is_none());
     }
 
     #[tokio::test]
