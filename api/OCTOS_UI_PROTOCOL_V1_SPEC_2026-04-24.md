@@ -373,6 +373,10 @@ Session, turn, and approval core:
 
 - `session/open`
 - `session/hydrate` (gate `state.session_hydrate.v1`, accepted `UPCR-2026-009`)
+- `session/rollback` (conversation-only rewind; drops the last N user turns and
+  re-projects the trimmed thread exactly like `session/hydrate`; #1516)
+- `session/fork` (branch a session into a new one with copied history; #1613)
+- `session/btw` (quick aside question answered while the current turn runs; #1609)
 - `turn/start`
 - `turn/interrupt`
 - `turn/state/get` (gate `state.turn_state_get.v1`, accepted `UPCR-2026-011`)
@@ -446,6 +450,8 @@ Turn, message, and tool lifecycle:
 
 - `turn/started`, `turn/completed`, `turn/error`
 - `message/delta`
+- `message/reasoning_delta` (live LLM reasoning/thinking stream, sibling of
+  `message/delta`; #1502)
 - `message/persisted` (accepted `UPCR-2026-012`)
 - `turn/spawn_complete` (gate `event.spawn_complete.v1`; M10 background-tool completion envelope)
 - `tool/started`, `tool/progress`, `tool/completed`
@@ -463,6 +469,8 @@ Structured user-question lifecycle (gate `user_question.v1`, proposed
 Task and progress:
 
 - `task/updated`
+- `plan/updated` (gate `plan.todos.v1`; model-authored plan/todo checklist
+  snapshot that replaces any prior plan wholesale; #1622)
 - `task/output/delta`
 - `progress/updated`
 - `warning`
@@ -487,6 +495,15 @@ Voice rich-output visual lifecycle (#1477, ungated; accepted
   `file/attached` stays a pure artifact-delivery signal while these carry
   the placeholder lifecycle, so the split survives a future
   `projection.envelope.v1` cutover. See § 8.
+
+Voice reply-audio streaming (gate `event.voice_audio.v1`; #1504):
+
+- `voice/audio_chunk` — streamed reply-audio frames (base64) for a voice turn.
+  Delivery is gated by the `event.voice_audio.v1` capability: a client that did
+  not negotiate it is filtered off the chunk stream and instead receives the
+  whole-file audio as a `file/attached` envelope, which is itself gated by
+  `event.file_attached.v1` (the reply audio has no other carrier — a client
+  that negotiated neither capability receives no playable reply audio).
 
 Voice exit intent (ungated; accepted `UPCR-2026-025`):
 
