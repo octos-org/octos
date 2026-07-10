@@ -585,6 +585,14 @@ impl CronService {
         // service Arc. Dropping the delivery on shutdown matches the
         // old abort semantics: the reservation stays advanced, so the
         // occurrence is skipped, never double-fired.
+        //
+        // `biased` with the notify arm FIRST (codex #1612 r6 P2): when
+        // shutdown lands between the `running` check and the select's
+        // first poll, BOTH arms are ready (the bus may have capacity).
+        // An unbiased select! randomizes the winner, so the send could
+        // deliver a cron message after the service stopped — the old
+        // abort semantics never allowed that. Biased polling makes
+        // cancellation take precedence deterministically.
         let notified = self.shutdown_notify.notified();
         tokio::pin!(notified);
         notified.as_mut().enable();
@@ -593,13 +601,14 @@ impl CronService {
             return;
         }
         tokio::select! {
+            biased;
+            _ = &mut notified => {
+                warn!(job_id = %job.id, "cron service shut down during delivery; dropping cron message");
+            }
             res = self.inbound_tx.send(msg) => {
                 if let Err(e) = res {
                     warn!(error = %e, job_id = %job.id, "failed to send cron message to bus");
                 }
-            }
-            _ = &mut notified => {
-                warn!(job_id = %job.id, "cron service shut down during delivery; dropping cron message");
             }
         }
     }
