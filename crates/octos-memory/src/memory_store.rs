@@ -751,6 +751,20 @@ pub fn is_valid_entry_id(s: &str) -> bool {
     rest.len() == 6 && rest.chars().all(|c| matches!(c, 'a'..='z' | '2'..='7'))
 }
 
+/// Names reserved for `recall_memory`'s long-term-registry load (#1588).
+/// `recall_memory` resolves these to the whole `MEMORY.md` instead of a
+/// bank entity, so `save_memory` must REFUSE them — otherwise a bank
+/// entity named "memory" is created but forever shadowed by the alias
+/// and can never be recalled (codex #1608 P2). Matched on the trimmed,
+/// lowercased name; the space and hyphen forms are both listed so the
+/// check works on raw names and slugs alike.
+pub fn is_reserved_memory_name(name: &str) -> bool {
+    matches!(
+        name.trim().to_lowercase().as_str(),
+        "memory" | "memory.md" | "registry" | "long-term memory" | "long-term-memory"
+    )
+}
+
 /// A capture-layer staging note awaiting consolidation.
 #[derive(Debug, Clone)]
 pub struct StagingNote {

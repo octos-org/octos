@@ -30,14 +30,25 @@ fn to_slug(name: &str) -> String {
     name.trim().to_lowercase().replace(' ', "-")
 }
 
-/// Reserved names that resolve to the whole long-term MEMORY.md registry
-/// rather than a memory-bank entity page (#1588 two-tier: the injected
-/// registry is budget-truncated, so the model must be able to pull the
-/// full thing on demand). Matched case-insensitively after trim.
-fn is_registry_alias(name: &str) -> bool {
-    matches!(
-        name.trim().to_lowercase().as_str(),
-        "memory" | "memory.md" | "registry" | "long-term memory" | "long-term-memory"
+/// Cap the registry to just under the tool-output limit at an ENTRY
+/// (line) boundary, appending a visible disclosure. The generic tool
+/// truncation (`truncate_head_tail`, 0.7) would otherwise drop the
+/// MIDDLE of a large `MEMORY.md` SILENTLY, recreating the very
+/// unrecoverable-tail problem this tool exists to solve (codex #1608 P2).
+fn cap_registry(registry: &str) -> String {
+    let limit = octos_core::tool_output_limit("recall_memory");
+    // Leave headroom for the marker so our output stays under the outer cap.
+    let budget = limit.saturating_sub(160);
+    if registry.len() <= budget {
+        return registry.to_string();
+    }
+    let cut = registry[..budget].rfind('\n').unwrap_or(budget);
+    let omitted = registry.len() - cut;
+    format!(
+        "{}\n\n_[registry truncated to fit the tool-output limit — {omitted} more \
+         bytes on disk; ask for a specific entry by its ^m id or narrow your \
+         query]_",
+        &registry[..cut]
     )
 }
 
@@ -73,14 +84,15 @@ impl Tool for RecallMemoryTool {
 
         // Tier-2 registry load: the injected long-term memory is capped to a
         // token budget, so "MEMORY" (and aliases) returns the full MEMORY.md.
-        if is_registry_alias(&input.name) {
+        if octos_memory::is_reserved_memory_name(&input.name) {
             let registry = self.store.read_long_term().await?;
+            let output = if registry.trim().is_empty() {
+                "The long-term memory registry (MEMORY.md) is empty.".to_string()
+            } else {
+                cap_registry(&registry)
+            };
             return Ok(ToolResult {
-                output: if registry.trim().is_empty() {
-                    "The long-term memory registry (MEMORY.md) is empty.".to_string()
-                } else {
-                    registry
-                },
+                output,
                 success: true,
                 ..Default::default()
             });
@@ -190,13 +202,13 @@ mod tests {
             "long-term memory",
         ] {
             assert!(
-                is_registry_alias(name),
+                octos_memory::is_reserved_memory_name(name),
                 "{name:?} should be a registry alias"
             );
         }
         for name in ["octos", "yuechen", "memories", "mem"] {
             assert!(
-                !is_registry_alias(name),
+                !octos_memory::is_reserved_memory_name(name),
                 "{name:?} is a bank entity, not the registry"
             );
         }
@@ -219,6 +231,31 @@ mod tests {
         assert!(result.success);
         assert!(result.output.contains("Fact one."));
         assert!(result.output.contains("Fact two."));
+    }
+
+    #[tokio::test]
+    async fn should_disclose_truncation_when_registry_exceeds_tool_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(MemoryStore::open(dir.path()).await.unwrap());
+        // Build a registry larger than the recall_memory output limit.
+        let limit = octos_core::tool_output_limit("recall_memory");
+        let big = "Fact line that is reasonably long. ^maaaaaa\n".repeat(limit / 20);
+        store.write_long_term(&big).await.unwrap();
+        let tool = RecallMemoryTool::new(store);
+
+        let result = tool
+            .execute(&serde_json::json!({ "name": "MEMORY" }))
+            .await
+            .unwrap();
+        assert!(result.success);
+        assert!(
+            result.output.len() <= limit,
+            "output must stay under the tool cap so the outer truncation is a no-op"
+        );
+        assert!(
+            result.output.contains("registry truncated to fit"),
+            "truncation must be disclosed, not silent"
+        );
     }
 
     #[tokio::test]
