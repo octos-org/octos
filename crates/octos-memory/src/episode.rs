@@ -17,6 +17,18 @@ fn default_schema_version() -> u32 {
     CURRENT_SCHEMA_VERSION
 }
 
+/// What produced an episode: a task run, or a conversation's compaction
+/// summary (#1587 write side). Task recall filters to `Task` so a task's
+/// generic query (e.g. the fixed "code review") can't BM25-admit an
+/// unrelated conversation summary past the similarity floor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EpisodeSource {
+    #[default]
+    Task,
+    Conversation,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Episode {
     /// Schema version for forward-compatible deserialization.
@@ -34,6 +46,10 @@ pub struct Episode {
     pub summary: String,
     /// Outcome of the task.
     pub outcome: EpisodeOutcome,
+    /// Producer of this episode (#1587). Defaults to `Task` so episodes
+    /// written before this field existed deserialize unchanged.
+    #[serde(default)]
+    pub source: EpisodeSource,
     /// Key decisions made during execution.
     pub key_decisions: Vec<String>,
     /// Files that were modified.
@@ -59,6 +75,7 @@ impl Episode {
             working_dir,
             summary,
             outcome,
+            source: EpisodeSource::Task,
             key_decisions: Vec::new(),
             files_modified: Vec::new(),
             created_at: Utc::now(),

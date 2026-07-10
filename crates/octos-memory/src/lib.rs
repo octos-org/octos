@@ -11,7 +11,7 @@ mod hybrid_search;
 mod memory_store;
 mod store;
 
-pub use episode::{Episode, EpisodeOutcome};
+pub use episode::{Episode, EpisodeOutcome, EpisodeSource};
 pub use hybrid_search::{HybridIndex, HybridScore};
 pub use memory_store::{
     DEFAULT_MAX_INJECT_TOKENS, ExtractionItem, MemoryStore, NoteKind, NoteOrigin, StagingNote,

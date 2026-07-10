@@ -7,7 +7,7 @@ use eyre::{Result, WrapErr};
 use redb::{Database, ReadableTable, TableDefinition};
 use tracing::{debug, warn};
 
-use crate::episode::Episode;
+use crate::episode::{Episode, EpisodeSource};
 use crate::hybrid_search::{HybridIndex, HybridScore};
 
 /// Table for episodes: key = episode_id, value = JSON
@@ -393,7 +393,13 @@ impl EpisodeStore {
                 limit * 4
             };
             let candidates = self
-                .find_relevant_hybrid_scored_filtered(query, None, inner_limit, min_best_modality)
+                .find_relevant_hybrid_scored_filtered(
+                    query,
+                    None,
+                    inner_limit,
+                    min_best_modality,
+                    false,
+                )
                 .await?;
             let filtered: Vec<Episode> = candidates
                 .into_iter()
@@ -677,7 +683,7 @@ impl EpisodeStore {
         query_embedding: Option<Vec<f32>>,
         limit: usize,
     ) -> Result<Vec<(Episode, HybridScore)>> {
-        self.find_relevant_hybrid_scored_filtered(query, query_embedding, limit, None)
+        self.find_relevant_hybrid_scored_filtered(query, query_embedding, limit, None, false)
             .await
     }
 
@@ -704,14 +710,34 @@ impl EpisodeStore {
         query_embedding: Option<Vec<f32>>,
         limit: usize,
         min_best_modality: Option<f32>,
+        exclude_conversation: bool,
     ) -> Result<Vec<(Episode, HybridScore)>> {
+        // When excluding conversation episodes (task recall, #1587), the
+        // index has no source field, so over-fetch and filter AFTER
+        // resolving episodes, then truncate to `limit`. Excluding is a
+        // SAFETY guarantee (a conversation episode can never enter task
+        // recall regardless of over-fetch size); the over-fetch only
+        // improves COMPLETENESS — under extreme conversation-episode
+        // density task recall may still return fewer than `limit`, which is
+        // safe (less recall, never contamination).
+        const FILTER_OVERFETCH: usize = 8;
+        let search_limit = if exclude_conversation {
+            limit.saturating_mul(FILTER_OVERFETCH).max(limit)
+        } else {
+            limit
+        };
         // Search the in-memory index
         let matches = {
             let idx = self
                 .index
                 .read()
                 .map_err(|e| eyre::eyre!("index lock poisoned: {e}"))?;
-            idx.search_scored_filtered(query, query_embedding.as_deref(), limit, min_best_modality)
+            idx.search_scored_filtered(
+                query,
+                query_embedding.as_deref(),
+                search_limit,
+                min_best_modality,
+            )
         };
 
         // Fetch full episodes from DB. Preserve (id, score) pairing so
@@ -761,6 +787,10 @@ impl EpisodeStore {
             // Preserve the ranking order from hybrid search
             scored.sort_by_key(|(e, _)| id_order.get(e.id.as_str()).copied().unwrap_or(usize::MAX));
 
+            if exclude_conversation {
+                scored.retain(|(e, _)| e.source != EpisodeSource::Conversation);
+            }
+            scored.truncate(limit);
             Ok(scored)
         })
         .await?
