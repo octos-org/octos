@@ -593,6 +593,17 @@ impl SessionKey {
     }
 }
 
+/// Whether `value` is a registered session-key channel name (the
+/// middle segment of a `{channel}:{chat}` or `{profile}:{channel}:{chat}`
+/// key). Exposed so profile-ID validation can REJECT ids that collide
+/// with a channel name: such an id makes `profile:channel:chat`
+/// indistinguishable from `channel:chat_with_colons`, which
+/// `split_base_key` (and thus `profile_id`/`channel`/`fork_child`)
+/// would misparse (codex #1613 r4).
+pub fn is_reserved_channel_name(value: &str) -> bool {
+    is_channel_name(value)
+}
+
 fn is_channel_name(value: &str) -> bool {
     matches!(
         value,

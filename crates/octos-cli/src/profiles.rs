@@ -1737,6 +1737,15 @@ fn validate_profile_id(id: &str) -> Result<()> {
     if id.starts_with('-') || id.ends_with('-') {
         bail!("profile ID must not start or end with a hyphen");
     }
+    // Reserve session-key channel names: a profile id equal to a
+    // channel (`api`, `slack`, `line`, …) makes the profiled key
+    // `{id}:{channel}:{chat}` indistinguishable from a bare
+    // `{channel}:{chat}` under `split_base_key`, mis-scoping the
+    // session everywhere (profile_id/channel/chat_id) — and forking it
+    // would persist a wrongly-scoped child (codex #1613 r4).
+    if octos_core::is_reserved_channel_name(id) {
+        bail!("profile ID must not be a reserved channel name (e.g. api, slack, line)");
+    }
     Ok(())
 }
 
@@ -2363,6 +2372,11 @@ mod tests {
         assert!(validate_profile_id("user123").is_ok());
         assert!(validate_profile_id("").is_err());
         assert!(validate_profile_id("-bad").is_err());
+        // Channel names are reserved (codex #1613 r4): a profile named
+        // after a channel makes profiled session keys ambiguous.
+        assert!(validate_profile_id("api").is_err());
+        assert!(validate_profile_id("slack").is_err());
+        assert!(validate_profile_id("line").is_err());
         assert!(validate_profile_id("bad-").is_err());
         assert!(validate_profile_id("UPPER").is_err());
         assert!(validate_profile_id("has space").is_err());
@@ -2375,7 +2389,8 @@ mod tests {
         let store = ProfileStore::open(dir.path()).unwrap();
 
         let profile = UserProfile {
-            id: "test".into(),
+            // Not "test" — a reserved channel name (codex #1613 r4).
+            id: "test-bot".into(),
             name: "Test Bot".into(),
             enabled: true,
             data_dir: None,
@@ -2406,16 +2421,16 @@ mod tests {
         };
 
         store.save(&profile).unwrap();
-        let loaded = store.get("test").unwrap().unwrap();
-        assert_eq!(loaded.id, "test");
+        let loaded = store.get("test-bot").unwrap().unwrap();
+        assert_eq!(loaded.id, "test-bot");
         assert_eq!(loaded.name, "Test Bot");
         assert!(loaded.enabled);
 
         let profiles = store.list().unwrap();
         assert_eq!(profiles.len(), 1);
 
-        assert!(store.delete("test").unwrap());
-        assert!(store.get("test").unwrap().is_none());
+        assert!(store.delete("test-bot").unwrap());
+        assert!(store.get("test-bot").unwrap().is_none());
     }
 
     #[test]
