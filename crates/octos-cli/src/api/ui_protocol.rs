@@ -11145,11 +11145,21 @@ async fn ensure_session_profile_runtime(
     let Some(profile) = profile else {
         return Ok(None);
     };
+    let profile_data_dir = store.resolve_data_dir(&profile);
+    if let Err(error) = super::skill_action_jobs::recover_skill_action_jobs_for_profile_start(
+        profile_id,
+        &profile_data_dir,
+    ) {
+        warn!(
+            profile_id,
+            %error,
+            "failed to recover active skill action jobs before dynamic profile bootstrap"
+        );
+    }
     if !profile.enabled || profile.parent_id.is_some() || !profile.config.has_llm_selection() {
         return Ok(None);
     }
 
-    let profile_data_dir = store.resolve_data_dir(&profile);
     // Lazily-created profiles must honour host-level policy too — without
     // host_memory, a host opt-out of (default-on) memory refresh would not
     // bind profiles created after startup.
@@ -11168,17 +11178,6 @@ async fn ensure_session_profile_runtime(
             "failed to bootstrap ProfileRuntime for profile '{profile_id}': {error}"
         ))
     })?;
-    if let Err(error) = super::skill_action_jobs::recover_skill_action_jobs_for_profile_start(
-        profile_id,
-        &profile_data_dir,
-    ) {
-        warn!(
-            profile_id,
-            %error,
-            "failed to recover active skill action jobs after dynamic profile bootstrap"
-        );
-    }
-
     let mut runtimes = dynamic_profile_runtimes()
         .write()
         .unwrap_or_else(|poisoned| poisoned.into_inner());

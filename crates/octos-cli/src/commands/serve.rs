@@ -468,6 +468,19 @@ impl ServeCommand {
             HashMap::new();
         let all_profiles = profile_store.list().unwrap_or_default();
         for profile in &all_profiles {
+            let profile_data_dir = profile_store.resolve_data_dir(profile);
+            if let Err(error) =
+                crate::api::skill_action_jobs::recover_skill_action_jobs_for_profile_start(
+                    &profile.id,
+                    &profile_data_dir,
+                )
+            {
+                tracing::warn!(
+                    profile_id = %profile.id,
+                    %error,
+                    "failed to recover active skill action jobs before profile bootstrap",
+                );
+            }
             if !profile.enabled || profile.parent_id.is_some() {
                 continue;
             }
@@ -478,7 +491,6 @@ impl ServeCommand {
                 );
                 continue;
             }
-            let profile_data_dir = profile_store.resolve_data_dir(profile);
             // Section B (codex review round-3): thread the host's
             // strict-signing policy so the per-profile plugin load honors
             // `plugins.require_signed = true` from the top-level config
@@ -495,18 +507,6 @@ impl ServeCommand {
             .await
             {
                 Ok(rt) => {
-                    if let Err(error) =
-                        crate::api::skill_action_jobs::recover_skill_action_jobs_for_profile_start(
-                            &profile.id,
-                            &profile_data_dir,
-                        )
-                    {
-                        tracing::warn!(
-                            profile_id = %profile.id,
-                            %error,
-                            "failed to recover active skill action jobs after profile bootstrap",
-                        );
-                    }
                     tracing::info!(
                         profile_id = %profile.id,
                         provider = %rt.provider_name,
