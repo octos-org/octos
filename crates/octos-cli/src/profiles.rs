@@ -1369,6 +1369,9 @@ impl ProfileStore {
     ///   channel-name id) stays reserved: the verify path's
     ///   auto-create treats a `get` error as "no profile" and would
     ///   OVERWRITE the file with a default profile (r8 P2).
+    // The only non-test caller (the serve bootstrap) is api-gated; the
+    // policy itself stays unconditional next to the store it guards.
+    #[cfg_attr(not(feature = "api"), allow(dead_code))]
     pub(crate) fn id_reserved_for_registration(&self, id: &str, authorized: bool) -> bool {
         if !self.profile_path(id).exists() {
             return false;
