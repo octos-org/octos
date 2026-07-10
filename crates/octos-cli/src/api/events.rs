@@ -79,25 +79,44 @@ pub(crate) fn event_to_json(event: &ProgressEvent, thread_id: Option<&str>) -> s
                 "task_id": task_id,
             })
         }
-        ProgressEvent::ToolStarted { name, tool_id } => {
-            serde_json::json!({
+        ProgressEvent::ToolStarted {
+            name,
+            tool_id,
+            arguments,
+        } => {
+            let mut value = serde_json::json!({
                 "type": "tool_start",
                 "tool": name,
                 "tool_call_id": tool_id,
-            })
+            });
+            // Additive: carried so the UI-protocol mapper (`map_tool_start`)
+            // and the envelope `arguments_preview` can echo the call.
+            if let Some(arguments) = arguments {
+                value["arguments"] = arguments.clone();
+            }
+            value
         }
         ProgressEvent::ToolCompleted {
             name,
             tool_id,
             success,
-            ..
+            output_preview,
+            duration,
         } => {
-            serde_json::json!({
+            let mut value = serde_json::json!({
                 "type": "tool_end",
                 "tool": name,
                 "tool_call_id": tool_id,
                 "success": success,
-            })
+                "duration_ms": duration.as_millis() as u64,
+            });
+            // Additive: the mapper (`map_tool_end`) lifts these onto
+            // `ToolCompletedEvent` so tool cards and envelope previews can
+            // show the result excerpt.
+            if !output_preview.is_empty() {
+                value["output_preview"] = serde_json::json!(output_preview);
+            }
+            value
         }
         ProgressEvent::ToolProgress {
             name,
@@ -243,11 +262,28 @@ mod tests {
         let event = ProgressEvent::ToolStarted {
             name: "shell".into(),
             tool_id: "t1".into(),
+            arguments: None,
         };
         let json = event_to_json(&event, None);
         assert_eq!(json["type"], "tool_start");
         assert_eq!(json["tool"], "shell");
         assert_eq!(json["tool_call_id"], "t1");
+        // No-args calls omit the field entirely (additive wire).
+        assert!(json.get("arguments").is_none());
+    }
+
+    #[test]
+    fn event_to_json_tool_started_carries_arguments() {
+        // The fidelity route: arguments must survive Progress→JSON so the
+        // UI-protocol mapper (`map_tool_start`) and the envelope
+        // `arguments_preview` can echo the call.
+        let event = ProgressEvent::ToolStarted {
+            name: "shell".into(),
+            tool_id: "t1".into(),
+            arguments: Some(serde_json::json!({"command": "cargo test"})),
+        };
+        let json = event_to_json(&event, None);
+        assert_eq!(json["arguments"]["command"], "cargo test");
     }
 
     #[test]
@@ -264,6 +300,10 @@ mod tests {
         assert_eq!(json["tool"], "read_file");
         assert_eq!(json["tool_call_id"], "t2");
         assert_eq!(json["success"], true);
+        // Fidelity route: preview + duration survive Progress→JSON for the
+        // mapper (`map_tool_end`) and the envelope `output_preview`.
+        assert_eq!(json["output_preview"], "contents");
+        assert_eq!(json["duration_ms"], 42);
     }
 
     #[test]
@@ -433,6 +473,7 @@ mod tests {
                 ProgressEvent::ToolStarted {
                     name: "shell".into(),
                     tool_id: "t1".into(),
+                    arguments: None,
                 },
                 "tool_start",
             ),

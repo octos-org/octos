@@ -21356,7 +21356,16 @@ fn emit_envelope_for_legacy_notification(
                     Some(false) => EnvelopeToolEndStatus::Error,
                 };
                 let error = match status {
-                    EnvelopeToolEndStatus::Error => event.output_preview.clone(),
+                    // Bounded like `output_preview`: the error source can be
+                    // arbitrary-length tool output, and this string lands in
+                    // the durable ledger + every hydrate replay.
+                    EnvelopeToolEndStatus::Error => event.output_preview.as_deref().map(|s| {
+                        octos_core::truncated_utf8(
+                            s,
+                            octos_core::ui_protocol::ENVELOPE_TOOL_OUTPUT_PREVIEW_MAX,
+                            "…",
+                        )
+                    }),
                     _ => None,
                 };
                 (
