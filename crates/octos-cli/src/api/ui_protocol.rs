@@ -6027,6 +6027,18 @@ fn normalize_local_username(username: &str) -> Result<String, RpcError> {
             "normalized username must be 1-64 characters",
         ));
     }
+    // The username becomes BOTH the user id and the profile id.
+    // Profile ids reject reserved channel names (ambiguous session
+    // keys — see profiles::validate_profile_id), so reject here BEFORE
+    // any record persists: previously the user record was saved first
+    // and only the later profile save failed, leaving a valid user
+    // with no usable profile (codex #1613 r5).
+    if octos_core::is_reserved_channel_name(&normalized) {
+        return Err(local_profile_error(
+            "profile_local_invalid_username",
+            "username must not be a reserved channel name (e.g. api, slack, line)",
+        ));
+    }
     Ok(normalized)
 }
 
@@ -25404,6 +25416,26 @@ mod tests {
         assert_eq!(
             invalid.data.as_ref().and_then(|data| data.get("kind")),
             Some(&json!("profile_local_invalid_username"))
+        );
+
+        // codex #1613 r5: a reserved channel-name username must be
+        // rejected BEFORE any record persists. Previously the user
+        // record was saved and only the later profile save failed,
+        // leaving a valid user with no usable profile.
+        let reserved = create_or_get_local_solo_profile(
+            &state,
+            local_profile_params("Ada Lovelace", "api", "api@example.com"),
+        )
+        .expect_err("reserved channel-name username");
+        assert_eq!(reserved.code, rpc_error_codes::INVALID_PARAMS);
+        assert_eq!(
+            reserved.data.as_ref().and_then(|data| data.get("kind")),
+            Some(&json!("profile_local_invalid_username"))
+        );
+        let users = state.user_store.as_ref().expect("user store");
+        assert!(
+            users.get("api").unwrap().is_none(),
+            "no user record may persist for a rejected reserved username"
         );
 
         let tenant_state = AppState {
