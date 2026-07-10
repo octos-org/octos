@@ -707,18 +707,32 @@ impl ValidatorRunner {
             }
         }
 
-        // Only shell-wrap the validator through the sandbox when it provides real
-        // confinement *and* the platform's sandbox shell is POSIX `sh -c`, where
-        // the `shlex` quoting below is correct. A no-op sandbox (e.g. NoSandbox,
-        // or a backend whose helper is unavailable) has nothing to escape, and on
-        // Windows the backends shell out via `cmd /C` — which ignores the POSIX
-        // single quotes `shlex` emits, leaving metacharacters in an argument
-        // active. Both cases fall through to running the argv directly, where
-        // `Command` passes each element as a distinct token so a caller-influenced
-        // argument cannot inject shell metacharacters.
-        let sandbox_shell_is_posix = cfg!(not(windows));
-        let mut command = match &self.sandbox {
-            Some(sandbox) if sandbox_shell_is_posix && !sandbox.is_noop() => {
+        // A configured, real (non-no-op) sandbox means the validator MUST run
+        // inside it. On POSIX the backend runs via `sh -c`, so we shell-quote the
+        // argv with `shlex`. On Windows the backends shell out via `cmd /C`, for
+        // which there is no safe POSIX argv wrapping here — and a workspace policy
+        // can name an arbitrary executable, not merely inject an argument — so
+        // running the argv directly would *bypass* the sandbox. Fail closed there
+        // rather than escape it. A no-op sandbox (NoSandbox, or a backend whose
+        // helper is unavailable) and the no-sandbox case have nothing to escape,
+        // so they run the argv directly, where `Command` passes each element as a
+        // distinct token (injection-safe).
+        let real_sandbox = self.sandbox.as_ref().filter(|s| !s.is_noop());
+        let sandbox_is_windows = cfg!(windows);
+        if real_sandbox.is_some() && sandbox_is_windows {
+            return error_outcome(
+                invocation,
+                validator,
+                started_at,
+                started,
+                format!(
+                    "command validator not supported under the Windows sandbox \
+                     (would bypass AppContainer): {command_string}"
+                ),
+            );
+        }
+        let mut command = match real_sandbox {
+            Some(sandbox) => {
                 // wrap_command runs the string via `sh -c`, so shell-quote each
                 // argv element (build_command_string above is unquoted — it's
                 // only for the SafePolicy display/check). Otherwise `sh -c "sh -c
@@ -740,7 +754,7 @@ impl ValidatorRunner {
                 };
                 sandbox.wrap_command(&quoted, &invocation.workspace_root)
             }
-            _ => {
+            None => {
                 let mut c = Command::new(&resolved_cmd);
                 c.args(&resolved_args)
                     .current_dir(&invocation.workspace_root);
