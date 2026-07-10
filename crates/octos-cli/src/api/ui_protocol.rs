@@ -12879,6 +12879,41 @@ async fn handle_session_rollback(
     send_serialized_rpc_result(ws, id, method, result);
 }
 
+/// Process-global in-flight fork child-key reservations. Two forks
+/// from DIFFERENT parents resolve different per-session
+/// `SessionManager`s, so a manager-local existence check cannot see
+/// the other fork mid-write — the later rewrite would silently
+/// overwrite the earlier child (codex #1613 P2). One serve process
+/// owns a profile's sessions dir, so a process-global set suffices.
+fn fork_reservations() -> &'static std::sync::Mutex<std::collections::HashSet<String>> {
+    static RESERVATIONS: OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+        OnceLock::new();
+    RESERVATIONS.get_or_init(Default::default)
+}
+
+/// RAII reservation on a fork child key — released on every exit path.
+struct ForkReservation(String);
+
+impl ForkReservation {
+    /// `None` when another fork to the same child key is in flight.
+    fn try_acquire(child_key: &SessionKey) -> Option<Self> {
+        let mut set = fork_reservations()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        set.insert(child_key.0.clone())
+            .then(|| Self(child_key.0.clone()))
+    }
+}
+
+impl Drop for ForkReservation {
+    fn drop(&mut self) {
+        let mut set = fork_reservations()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        set.remove(&self.0);
+    }
+}
+
 /// `session/fork` — branch a NEW session off an existing one, copying
 /// the tail of its history (web parity P3: the book's documented fork
 /// affordance had no wire surface for the SPA; `SessionManager::fork`
@@ -12925,6 +12960,22 @@ async fn handle_session_fork(
         return;
     };
 
+    // Reserve the child key across the whole check-then-write: the
+    // durable `session_known` check below cannot see a concurrent
+    // fork's child until its write lands (RAII — released on return).
+    let candidate_key = params.session_id.fork_child(&params.new_chat_id);
+    let Some(_reservation) = ForkReservation::try_acquire(&candidate_key) else {
+        let _ = send_rpc_error(
+            ws,
+            Some(id),
+            RpcError::invalid_params(format!(
+                "{method}: a fork to '{candidate_key}' is already in flight"
+            ))
+            .with_data(json!({ "kind": "child_exists" })),
+        );
+        return;
+    };
+
     let (new_key, copied) = {
         let mut sessions_guard = sessions.lock().await;
         // Mirror rollback's error model: fork of an unknown session is
@@ -12938,12 +12989,10 @@ async fn handle_session_fork(
             );
             return;
         }
-        // Refuse to clobber an existing session under the child key. The
-        // candidate key MUST be derived exactly as `SessionManager::fork`
-        // derives it (naive first-segment split), or the pre-check would
-        // guard a different key than the one fork writes.
-        let channel = params.session_id.0.split(':').next().unwrap_or("cli");
-        let candidate = SessionKey::new(channel, &params.new_chat_id);
+        // Refuse to clobber an existing session under the child key.
+        // `SessionKey::fork_child` is the SAME rule `SessionManager::fork`
+        // applies, so the pre-check guards exactly the key fork writes.
+        let candidate = params.session_id.fork_child(&params.new_chat_id);
         if sessions_guard.session_known(&candidate) {
             drop(sessions_guard);
             let _ = send_rpc_error(
@@ -37458,6 +37507,108 @@ ignore = []
 
         let frame = recv_rpc_json(&mut rx).await;
         assert_eq!(frame["error"]["data"]["kind"], "invalid_new_chat_id");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn session_fork_raw_spa_parent_yields_raw_child() {
+        // codex #1613 P1: a raw SPA handle ("web-123") must NOT be
+        // treated as a channel — the child is a raw handle too, not
+        // "web-123:kid" (excluded from the raw REST fallbacks).
+        let session_id = SessionKey("web-123".into());
+        let (state, _tmp) = prg_state_with_persisted_turns(&session_id, 1).await;
+        let (ws, mut rx) = ws_connection_for_test(8);
+
+        handle_session_fork(
+            &ws,
+            &state,
+            None,
+            None,
+            "fk-raw".into(),
+            octos_core::ui_protocol::SessionForkParams {
+                session_id: session_id.clone(),
+                new_chat_id: "web-456".into(),
+                copy_messages: None,
+            },
+        )
+        .await;
+
+        let frame = recv_rpc_json(&mut rx).await;
+        assert_eq!(frame["result"]["new_session_id"], "web-456");
+        let sessions = state.sessions.as_ref().expect("sessions");
+        let mut guard = sessions.lock().await;
+        assert!(guard.session_known(&SessionKey("web-456".into())));
+        assert!(
+            !guard.session_known(&SessionKey("web-123:web-456".into())),
+            "the naive channel-split key must not exist"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn session_fork_concurrent_same_child_one_wins() {
+        // codex #1613 P2: two forks from DIFFERENT parents racing to
+        // the same child key — exactly one may win; the loser must not
+        // silently overwrite the winner's copied history.
+        let parent_a = SessionKey("local:race-a".into());
+        let parent_b = SessionKey("local:race-b".into());
+        let (state, _tmp) = prg_state_with_persisted_turns(&parent_a, 1).await;
+        {
+            // Seed the second parent on the same manager.
+            let sessions = state.sessions.as_ref().expect("sessions");
+            let mut guard = sessions.lock().await;
+            let now = Utc::now();
+            let msg = Message {
+                role: MessageRole::User,
+                content: "b says".into(),
+                media: vec![],
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning_content: None,
+                client_message_id: None,
+                thread_id: None,
+                timestamp: now,
+            };
+            guard.add_message(&parent_b, msg).await.expect("seed b");
+        }
+        let (ws, mut rx) = ws_connection_for_test(8);
+
+        let fork = |parent: SessionKey, id: &str| {
+            let ws = &ws;
+            let state = &state;
+            let id = id.to_string();
+            async move {
+                handle_session_fork(
+                    ws,
+                    state,
+                    None,
+                    None,
+                    id,
+                    octos_core::ui_protocol::SessionForkParams {
+                        session_id: parent,
+                        new_chat_id: "contested".into(),
+                        copy_messages: None,
+                    },
+                )
+                .await;
+            }
+        };
+        tokio::join!(
+            fork(parent_a.clone(), "fk-a"),
+            fork(parent_b.clone(), "fk-b")
+        );
+
+        let first = recv_rpc_json(&mut rx).await;
+        let second = recv_rpc_json(&mut rx).await;
+        let oks = [&first, &second]
+            .iter()
+            .filter(|f| f.get("result").is_some())
+            .count();
+        assert_eq!(oks, 1, "exactly one fork wins: {first} / {second}");
+        let loser = if first.get("error").is_some() {
+            &first
+        } else {
+            &second
+        };
+        assert_eq!(loser["error"]["data"]["kind"], "child_exists");
     }
 
     #[tokio::test(flavor = "current_thread")]

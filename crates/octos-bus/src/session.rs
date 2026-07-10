@@ -1969,9 +1969,9 @@ impl SessionManager {
     ) -> Result<SessionKey> {
         let parent = self.get_or_create(parent_key).await;
         let messages: Vec<Message> = parent.get_history(copy_messages).to_vec();
-        // Derive channel from parent key (format: "channel:chat_id")
-        let channel = parent_key.0.split(':').next().unwrap_or("cli");
-        let new_key = SessionKey::new(channel, new_chat_id);
+        // Shared derivation rule (SessionKey::fork_child): profile +
+        // channel preserved, raw SPA parents yield raw children.
+        let new_key = parent_key.fork_child(new_chat_id);
 
         let now = Utc::now();
         let session = Session {
@@ -1987,7 +1987,14 @@ impl SessionManager {
             updated_at: now,
         };
         self.cache.put(new_key.0.clone(), session);
-        self.rewrite(&new_key).await?;
+        if let Err(error) = self.rewrite(&new_key).await {
+            // A failed write must not leave a cache-resident ghost:
+            // `session_known` would keep answering true for a child
+            // that was never durably created, wedging retries on
+            // `child_exists` (codex #1613 P2).
+            self.cache.pop(&new_key.0);
+            return Err(error);
+        }
 
         debug!(
             parent = %parent_key,
@@ -3968,6 +3975,38 @@ mod tests {
         assert_eq!(child.messages.len(), 3);
         assert_eq!(child.messages[0].content, "msg2");
         assert_eq!(child.messages[2].content, "msg4");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_fork_failed_write_leaves_no_ghost_child() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = TempDir::new().unwrap();
+        let mut mgr = SessionManager::open(tmp.path()).unwrap();
+        let parent = SessionKey::new("cli", "ghost-parent");
+        mgr.add_message(&parent, make_message(MessageRole::User, "hello"))
+            .await
+            .unwrap();
+
+        // Make the sessions dir unwritable so the child rewrite fails.
+        let sessions_dir = tmp.path().join("sessions");
+        let live = std::fs::metadata(&sessions_dir).unwrap().permissions();
+        std::fs::set_permissions(&sessions_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        let result = mgr.fork(&parent, "ghost-child", 1).await;
+        // Restore before asserting so the tempdir can clean up even on
+        // a failed assertion.
+        std::fs::set_permissions(&sessions_dir, live).unwrap();
+
+        assert!(result.is_err(), "fork must surface the failed write");
+        assert!(
+            !mgr.session_known(&SessionKey::new("cli", "ghost-child")),
+            "failed fork must not leave a cache-resident ghost child"
+        );
+        // And a retry once storage recovers succeeds.
+        let retried = mgr.fork(&parent, "ghost-child", 1).await.unwrap();
+        assert_eq!(retried, SessionKey::new("cli", "ghost-child"));
     }
 
     #[tokio::test]
