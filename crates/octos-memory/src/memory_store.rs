@@ -431,16 +431,6 @@ impl MemoryStore {
             .wrap_err("failed to create memory bank directory")
     }
 
-    /// Write an entity file directly, bypassing every `write_entity` gate.
-    /// For tests/migration fixtures that must seed data the normal path now
-    /// refuses (e.g. a pre-upgrade entity under a reserved registry name).
-    #[doc(hidden)]
-    pub async fn write_entity_raw(&self, slug: &str, content: &str) {
-        self.ensure_bank_dir().await.expect("bank dir");
-        let path = self.bank_dir().join(format!("{slug}.md"));
-        tokio::fs::write(&path, content).await.expect("seed entity");
-    }
-
     /// List all entity files, returning `(slug, abstract_line)` pairs sorted by name.
     pub async fn list_entities(&self) -> Result<Vec<(String, String)>> {
         let dir = self.bank_dir();

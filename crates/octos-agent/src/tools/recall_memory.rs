@@ -44,8 +44,13 @@ fn to_slug(name: &str) -> String {
 /// targeted retrieval the schema never offered (codex #1608 P2). Paging
 /// makes the whole registry reachable page by page.
 fn render_registry_page(registry: &str, page: usize) -> String {
+    // Headroom covers the pager marker appended after slicing (~75 bytes)
+    // with generous slack, so every rendered page stays STRICTLY under the
+    // outer truncate_head_tail limit — a too-tight margin let a full page +
+    // marker + disclosure exceed it and re-trigger the silent middle-loss
+    // (codex #1608 round-3 P1).
     let limit = octos_core::tool_output_limit("recall_memory");
-    let budget = limit.saturating_sub(200).max(1);
+    let budget = limit.saturating_sub(512).max(1);
 
     // Build page ranges at newline boundaries (always char-safe), each
     // <= budget bytes. A pathological newline-free run is cut at a char
@@ -117,6 +122,11 @@ impl Tool for RecallMemoryTool {
                 "name": {
                     "type": "string",
                     "description": "Entity name (e.g. 'octos', 'yuechen'), or 'MEMORY' for the full long-term registry"
+                },
+                "page": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": "0-based page for a large 'MEMORY' registry load; follow the 'page=N' hint in the page marker. Ignored for entity names."
                 }
             },
             "required": ["name"]
@@ -130,23 +140,33 @@ impl Tool for RecallMemoryTool {
         // Tier-2 registry load: the injected long-term memory is capped to a
         // token budget, so "MEMORY" (and aliases) returns the full MEMORY.md.
         if octos_memory::is_reserved_memory_name(&input.name) {
-            let registry = self.store.read_long_term().await?;
-            let mut output = if registry.trim().is_empty() {
+            // Prepend any PRE-UPGRADE bank entity whose name is now reserved:
+            // new writes under these names are refused, but legacy files
+            // would otherwise be shadowed by the alias and unreadable. Folding
+            // their content into the paged text makes it reachable, size-safe
+            // (the pager bounds it), and case/space-variant-aware since
+            // list_entities returns the actual on-disk stems (codex #1608 P2).
+            let mut full = String::new();
+            if let Ok(entities) = self.store.list_entities().await {
+                for (name, _) in entities
+                    .iter()
+                    .filter(|(n, _)| octos_memory::is_reserved_memory_name(n))
+                {
+                    if let Ok(Some(content)) = self.store.read_entity(name).await {
+                        full.push_str(&format!(
+                            "## Legacy bank entity \"{name}\" (shadowed by the registry \
+                             alias; rename via save_memory to address it directly)\n{content}\n\n"
+                        ));
+                    }
+                }
+            }
+            full.push_str(&self.store.read_long_term().await?);
+
+            let output = if full.trim().is_empty() {
                 "The long-term memory registry (MEMORY.md) is empty.".to_string()
             } else {
-                render_registry_page(&registry, input.page.unwrap_or(0))
+                render_registry_page(&full, input.page.unwrap_or(0))
             };
-            // Legacy-collision disclosure: new writes under a reserved name
-            // are refused, but a pre-upgrade bank entity may still exist and
-            // is now shadowed by this alias — point the model at it rather
-            // than losing it silently (codex #1608 P2).
-            if let Ok(Some(_)) = self.store.read_entity(&to_slug(&input.name)).await {
-                output.push_str(&format!(
-                    "\n\n_[note: a legacy bank entity named \"{}\" is shadowed by the \
-                     registry alias; rename it via save_memory to read it]_",
-                    to_slug(&input.name)
-                ));
-            }
             return Ok(ToolResult {
                 output,
                 success: true,
@@ -350,20 +370,35 @@ mod tests {
     async fn should_disclose_legacy_entity_shadowed_by_registry_alias() {
         let dir = tempfile::tempdir().unwrap();
         let store = Arc::new(MemoryStore::open(dir.path()).await.unwrap());
-        store.write_long_term("A fact. ^maaaaaa").await.unwrap();
-        // Simulate a pre-upgrade entity literally named "memory" (writes are
-        // refused now, so seed it at the store to mimic legacy data).
         store
-            .write_entity_raw("memory", "# memory\nlegacy page")
-            .await;
+            .write_long_term("A registry fact. ^maaaaaa")
+            .await
+            .unwrap();
+        // Simulate a pre-upgrade entity literally named "memory" (writes are
+        // refused now) by seeding the bank file directly on disk. Layout:
+        // <data_dir>/memory/bank/entities/<name>.md.
+        let bank = dir.path().join("memory").join("bank").join("entities");
+        std::fs::create_dir_all(&bank).unwrap();
+        std::fs::write(bank.join("memory.md"), "# memory\nlegacy page body").unwrap();
         let tool = RecallMemoryTool::new(store);
 
         let result = tool
             .execute(&serde_json::json!({ "name": "MEMORY" }))
             .await
             .unwrap();
+        // The legacy entity's CONTENT is folded in and reachable, not noted.
         assert!(
-            result.output.contains("legacy bank entity"),
+            result.output.contains("Legacy bank entity"),
+            "{}",
+            result.output
+        );
+        assert!(
+            result.output.contains("legacy page body"),
+            "{}",
+            result.output
+        );
+        assert!(
+            result.output.contains("A registry fact."),
             "{}",
             result.output
         );
