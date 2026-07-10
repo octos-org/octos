@@ -74,9 +74,16 @@ pub struct MemoryOverviewResponse {
     /// True when the bank held more than [`MAX_PANEL_ENTITIES`] pages
     /// and the list was cut off (codex #1611 r8 P2).
     pub entities_truncated: bool,
-    /// Staged capture notes waiting for the next refresh sweep.
-    /// Saturates at [`MAX_STAGING_NOTE_COUNT`].
+    /// Staged capture notes OBSERVED waiting for the next refresh
+    /// sweep. Exact when `staging_truncated` is false; a lower bound
+    /// when true.
     pub staging_notes: usize,
+    /// True when the staging scan stopped early — at
+    /// [`MAX_STAGING_NOTE_COUNT`] matches or the raw directory budget
+    /// — so `staging_notes` is a lower bound, not an exact count
+    /// (codex #1611 r10+r11 P2: never fabricate, never understate as
+    /// exact).
+    pub staging_truncated: bool,
     /// Effective `memory.refresh.enabled` for this profile (host-level
     /// policy merged in — same semantics the runtime bootstrap uses).
     pub refresh_enabled: bool,
@@ -111,10 +118,12 @@ const MAX_PANEL_FILE_BYTES: u64 = 2 * 1024 * 1024;
 /// `entities_truncated`.
 const MAX_PANEL_ENTITIES: usize = 256;
 
-/// Staging-note count saturation (codex #1611 r8 P1). The count is
-/// status surfacing ("notes waiting for the next sweep"), not an
-/// inventory — the anchored walk stops counting here so a planted
-/// million-entry staging tree costs bounded readdir work.
+/// Staging-note count cap (codex #1611 r8 P1). The count is status
+/// surfacing ("notes waiting for the next sweep"), not an inventory —
+/// the anchored walk stops counting here so a planted million-entry
+/// staging tree costs bounded readdir work. A scan stopped early (this
+/// cap or the raw budget) reports the OBSERVED count plus
+/// `staging_truncated` (r10+r11 P2).
 const MAX_STAGING_NOTE_COUNT: usize = 1000;
 
 /// Raw readdir budget per directory scan (codex #1611 r9 P1). The
@@ -165,15 +174,17 @@ impl AnchoredDir {
         imp::list_md_stems(&self.0, cap)
     }
 
-    /// Count `*.md` direct children, saturating at `cap`. Same
-    /// no-follow anchoring as every other panel read — used for the
-    /// staging-note count so it can never follow a symlinked staging
-    /// tree into another profile (codex #1611 r8 P1). Contract:
-    /// `< cap` is an exact count; `== cap` means "at least cap" —
-    /// including when the RAW scan budget exhausts first, which
-    /// saturates instead of returning a partial tally that would read
-    /// as exact (codex #1611 r10 P2).
-    fn count_md_entries(&self, cap: usize) -> usize {
+    /// Count `*.md` direct children, stopping at `cap` matches or the
+    /// raw scan budget. Same no-follow anchoring as every other panel
+    /// read — used for the staging-note count so it can never follow a
+    /// symlinked staging tree into another profile (codex #1611 r8
+    /// P1). Returns `(observed, truncated)`: the count is EXACT when
+    /// `truncated` is false, and a lower bound when true (scan stopped
+    /// at the match cap or the raw budget). The two dimensions stay
+    /// separate because neither fabricating notes (saturating a
+    /// junk-flooded dir to `cap` — r11 P2) nor silently undercounting
+    /// (returning a partial tally as exact — r10 P2) is acceptable.
+    fn count_md_entries(&self, cap: usize) -> (usize, bool) {
         imp::count_md_entries(&self.0, cap)
     }
 }
@@ -299,21 +310,20 @@ mod imp {
         (names, false)
     }
 
-    pub(super) fn count_md_entries(dir: &OwnedFd, cap: usize) -> usize {
+    pub(super) fn count_md_entries(dir: &OwnedFd, cap: usize) -> (usize, bool) {
         let Ok(mut entries) = rustix::fs::Dir::read_from(dir) else {
-            return 0;
+            return (0, false);
         };
         let mut count = 0;
         let mut raw_seen = 0usize;
         while let Some(Ok(entry)) = entries.next() {
-            // Same raw budget as list_md_stems (codex #1611 r9 P1) —
-            // but exhausting it SATURATES the count instead of
-            // returning a partial tally: a partial count would read as
-            // exact and understate pending notes (codex #1611 r10 P2).
-            // The contract stays "< cap ⇒ exact, == cap ⇒ at least".
+            // Same raw budget as list_md_stems (codex #1611 r9 P1).
+            // Exhaustion reports (observed, truncated=true) — never a
+            // fabricated `cap` (r11 P2) and never a partial tally
+            // masquerading as exact (r10 P2).
             raw_seen += 1;
             if raw_seen > super::MAX_DIR_SCAN_ENTRIES {
-                return cap;
+                return (count, true);
             }
             let Ok(name) = entry.file_name().to_str() else {
                 continue;
@@ -321,11 +331,11 @@ mod imp {
             if name.len() > ".md".len() && name.ends_with(".md") {
                 count += 1;
                 if count >= cap {
-                    break;
+                    return (count, true);
                 }
             }
         }
-        count
+        (count, false)
     }
 }
 
@@ -408,19 +418,19 @@ mod imp {
         (names, false)
     }
 
-    pub(super) fn count_md_entries(handle: &Handle, cap: usize) -> usize {
+    pub(super) fn count_md_entries(handle: &Handle, cap: usize) -> (usize, bool) {
         let Ok(entries) = std::fs::read_dir(&handle.1) else {
-            return 0;
+            return (0, false);
         };
         let mut count = 0;
         let mut raw_seen = 0usize;
         for entry in entries.flatten() {
             // Same raw budget as list_md_stems (codex #1611 r9 P1);
-            // exhaustion SATURATES rather than undercounts (codex
-            // #1611 r10 P2) — see the Unix arm.
+            // exhaustion reports (observed, truncated) — see the Unix
+            // arm (r10/r11 P2).
             raw_seen += 1;
             if raw_seen > super::MAX_DIR_SCAN_ENTRIES {
-                return cap;
+                return (count, true);
             }
             let is_md = entry
                 .file_name()
@@ -429,11 +439,11 @@ mod imp {
             if is_md {
                 count += 1;
                 if count >= cap {
-                    break;
+                    return (count, true);
                 }
             }
         }
-        count
+        (count, false)
     }
 }
 
@@ -491,6 +501,7 @@ pub async fn my_memory(
             entities: Vec::new(),
             entities_truncated: false,
             staging_notes: 0,
+            staging_truncated: false,
             refresh_enabled: effective_refresh_enabled(state, profile),
         })
     };
@@ -571,11 +582,14 @@ pub async fn my_memory(
         // other profiles' data (pending-note count disclosure) and ran
         // AFTER the permit-owning task, so repeated requests could pile
         // unpermitted, unbounded scans onto the runtime. An absent or
-        // symlinked staging tree counts as zero; the count saturates.
-        let staging_notes = rel_staging
+        // symlinked staging tree counts as zero. The observed count and
+        // the truncation state travel SEPARATELY (r10+r11 P2): a scan
+        // stopped early must neither fabricate notes nor pass a partial
+        // tally off as exact.
+        let (staging_notes, staging_truncated) = rel_staging
             .and_then(|rel| mem.open_beneath(&rel))
             .map(|staging| staging.count_md_entries(MAX_STAGING_NOTE_COUNT))
-            .unwrap_or(0);
+            .unwrap_or((0, false));
         Some((
             long_term,
             today,
@@ -583,12 +597,21 @@ pub async fn my_memory(
             entities,
             entities_truncated,
             staging_notes,
+            staging_truncated,
         ))
     })
     .await
     .ok()
     .flatten();
-    let Some((long_term_read, today, recent, entities, entities_truncated, staging_notes)) = walked
+    let Some((
+        long_term_read,
+        today,
+        recent,
+        entities,
+        entities_truncated,
+        staging_notes,
+        staging_truncated,
+    )) = walked
     else {
         return Ok(empty(&state, &profile));
     };
@@ -608,6 +631,7 @@ pub async fn my_memory(
         entities,
         entities_truncated,
         staging_notes,
+        staging_truncated,
         refresh_enabled: effective_refresh_enabled(&state, &profile),
     }))
 }
@@ -976,6 +1000,10 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(own.staging_notes, 2, "own notes count through the walk");
+        assert!(
+            !own.staging_truncated,
+            "a fully-enumerated staging tree reports an exact count"
+        );
 
         let Json(stolen) = my_memory(State(state), HeaderMap::new(), user_identity("attacker"))
             .await
@@ -1052,11 +1080,17 @@ mod tests {
             resp.0.entities.len() <= MAX_PANEL_ENTITIES,
             "matching cap still holds under junk flooding"
         );
-        assert_eq!(
-            resp.0.staging_notes, MAX_STAGING_NOTE_COUNT,
-            "raw-budget exhaustion must SATURATE the staging count — a \
-             partial tally would read as exact and understate pending \
-             notes (codex #1611 r10 P2)"
+        // r11 P2: junk-flooded staging holds ≤1 real note — the count
+        // must report what was OBSERVED (never a fabricated cap), with
+        // the truncation flag carrying the uncertainty.
+        assert!(
+            resp.0.staging_notes <= 1,
+            "raw-budget exhaustion must not fabricate notes, got {}",
+            resp.0.staging_notes
+        );
+        assert!(
+            resp.0.staging_truncated,
+            "an early-stopped staging scan must be flagged truncated"
         );
     }
 
