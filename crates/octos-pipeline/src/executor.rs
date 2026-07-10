@@ -431,6 +431,18 @@ pub struct ExecutorConfig {
     /// split, scoped runs silently lost strong/fast model defaults +
     /// cost projections.
     pub catalog_dir: Option<PathBuf>,
+    /// #1607 (codex-review follow-up): the session sandbox threaded from the
+    /// `RunPipelineTool` construction site. `run_terminal_validators` /
+    /// `run_node_validators` build a workspace-scoped `ToolRegistry` for the
+    /// declared-validator pass; without this they stored `NoSandbox`, so an
+    /// untrusted `workspace_policy.toml` `Command` validator could execute
+    /// directly on the host from a sandboxed pipeline. Building that registry
+    /// via `with_builtins_and_sandbox(&working_dir, create_sandbox(&sandbox))`
+    /// confines command validators to the same backend the pipeline's shell/
+    /// exec tools use. Default (`SandboxConfig::default()` → `NoSandbox` on a
+    /// host without a backend) runs command validators directly — byte-for-byte
+    /// identical to the pre-#1607 path.
+    pub sandbox: octos_agent::SandboxConfig,
 }
 
 /// A single planned sub-task from the LLM planner.
@@ -2080,7 +2092,16 @@ impl PipelineExecutor {
             // runner — it only needs the workspace root for file
             // existence + the registered tools for tool_call
             // validators. Matches the spawn-agent-mcp pattern.
-            let registry = octos_agent::ToolRegistry::with_builtins(&self.config.working_dir);
+            //
+            // #1607 (codex-review follow-up): carry the session sandbox so
+            // `build_validator_runner` confines `ValidatorSpec::Command`
+            // validators to it. `with_builtins` would store `NoSandbox`,
+            // letting a workspace-declared command validator escape to the
+            // host from a sandboxed pipeline.
+            let registry = octos_agent::ToolRegistry::with_builtins_and_sandbox(
+                &self.config.working_dir,
+                octos_agent::create_sandbox(&self.config.sandbox),
+            );
             run_declared_validators(
                 &registry,
                 &self.config.working_dir,
@@ -2157,7 +2178,13 @@ impl PipelineExecutor {
         // separate turn-end phase isn't meaningful inside pipeline
         // execution.
         let scoped: Vec<WorkspaceValidator> = validators.to_vec();
-        let registry = octos_agent::ToolRegistry::with_builtins(&self.config.working_dir);
+        // #1607 (codex-review follow-up): carry the session sandbox so
+        // per-node command validators run confined (see
+        // `run_terminal_validators`).
+        let registry = octos_agent::ToolRegistry::with_builtins_and_sandbox(
+            &self.config.working_dir,
+            octos_agent::create_sandbox(&self.config.sandbox),
+        );
         run_declared_validators(
             &registry,
             &self.config.working_dir,
@@ -5688,7 +5715,64 @@ mod tests {
             host_context: crate::host_context::PipelineHostContext::default(),
             embedder: None,
             catalog_dir: None,
+            sandbox: octos_agent::SandboxConfig::default(),
         }
+    }
+
+    /// #1607 (codex-review follow-up): `run_terminal_validators` /
+    /// `run_node_validators` build their workspace-scoped validator registry
+    /// with `with_builtins_and_sandbox(&self.config.working_dir,
+    /// create_sandbox(&self.config.sandbox))`. Lock in that the sandbox
+    /// threaded onto `ExecutorConfig` reaches that registry (i.e. NOT the
+    /// pre-fix hardcoded `with_builtins` / `NoSandbox`). Docker mode is chosen
+    /// because `create_sandbox` returns a `DockerSandbox` unconditionally
+    /// (no docker binary required), so the assertion is host-independent.
+    #[test]
+    fn pipeline_threads_configured_sandbox_into_validator_registry() {
+        let mut config = make_test_config();
+        config.sandbox = octos_agent::SandboxConfig {
+            mode: octos_agent::SandboxMode::Docker,
+            ..octos_agent::SandboxConfig::default()
+        };
+        // Reconstruct exactly what the two validator blocks build.
+        let registry = octos_agent::ToolRegistry::with_builtins_and_sandbox(
+            &config.working_dir,
+            octos_agent::create_sandbox(&config.sandbox),
+        );
+        let sandbox = registry.sandbox();
+        assert!(
+            sandbox.is_docker(),
+            "pipeline validator registry must inherit the ExecutorConfig \
+             sandbox (Docker here), not the pre-#1607 hardcoded NoSandbox"
+        );
+        assert!(
+            !sandbox.is_noop(),
+            "a real backend threaded onto ExecutorConfig must not be a no-op"
+        );
+    }
+
+    /// #1607: an explicit `SandboxMode::None` on `ExecutorConfig` resolves to a
+    /// no-op backend, so command validators run the argv directly (pre-#1607
+    /// behaviour on a host without a configured backend). Note: the STRUCT
+    /// default is `SandboxMode::Auto`, which resolves to a REAL backend on
+    /// macOS/Linux — so this test pins `None` explicitly to stay
+    /// host-independent (mirrors `spawn_none_sandbox_registry_is_noop`).
+    #[test]
+    fn pipeline_none_sandbox_registry_is_noop() {
+        let mut config = make_test_config();
+        config.sandbox = octos_agent::SandboxConfig {
+            mode: octos_agent::SandboxMode::None,
+            ..octos_agent::SandboxConfig::default()
+        };
+        let registry = octos_agent::ToolRegistry::with_builtins_and_sandbox(
+            &config.working_dir,
+            octos_agent::create_sandbox(&config.sandbox),
+        );
+        assert!(
+            registry.sandbox().is_noop(),
+            "SandboxMode::None must resolve to a no-op backend so command \
+             validators run directly (host-independent)"
+        );
     }
 
     struct MockProvider;
@@ -5970,6 +6054,7 @@ mod tests {
             host_context: crate::host_context::PipelineHostContext::default(),
             embedder: None,
             catalog_dir: None,
+            sandbox: octos_agent::SandboxConfig::default(),
         }
     }
 
@@ -7002,6 +7087,7 @@ mod tests {
             host_context: crate::host_context::PipelineHostContext::default(),
             embedder: None,
             catalog_dir: None,
+            sandbox: octos_agent::SandboxConfig::default(),
         };
         config.working_dir = custom_wd.path().to_path_buf();
         let executor = PipelineExecutor::new(config);
@@ -7059,6 +7145,7 @@ mod tests {
             embedder: None,
             // catalog reads must hit the PROFILE root, not the worker CWD.
             catalog_dir: Some(profile_root.path().to_path_buf()),
+            sandbox: octos_agent::SandboxConfig::default(),
         };
 
         // Pin the helper that the executor uses for catalog lookup:
@@ -7108,6 +7195,7 @@ mod tests {
             host_context: crate::host_context::PipelineHostContext::default(),
             embedder: None,
             catalog_dir: None,
+            sandbox: octos_agent::SandboxConfig::default(),
         };
         config.working_dir = only_dir.path().to_path_buf();
         let executor = PipelineExecutor::new(config);

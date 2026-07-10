@@ -3058,7 +3058,21 @@ impl Tool for SpawnTool {
 
         if is_sync {
             // Sync mode: run subagent inline and return the result directly
-            let mut tools = ToolRegistry::with_builtins(&child_working_dir);
+            //
+            // #1607 (codex-review follow-up): build the child registry with the
+            // SESSION sandbox, not the hardcoded `NoSandbox` that
+            // `with_builtins` stores. The child's `child_tools_handle` feeds
+            // `run_declared_validators` / `run_project_root_validators` below,
+            // and `build_validator_runner` confines `ValidatorSpec::Command`
+            // validators to `tools.sandbox()`. A `NoSandbox` registry there
+            // would let an untrusted `workspace_policy.toml` command validator
+            // execute directly on the host from a sandboxed session. On hosts
+            // without a real backend `create_sandbox` yields `NoSandbox` and
+            // the validator runs the argv directly (unchanged).
+            let mut tools = ToolRegistry::with_builtins_and_sandbox(
+                &child_working_dir,
+                create_sandbox(&self.sandbox),
+            );
             // Load plugin tools so subagents can use fm_tts, etc.
             // Section B (codex review P1.1): honour the parent's
             // require_signed policy so unsigned plugins are rejected here
@@ -3406,6 +3420,12 @@ impl Tool for SpawnTool {
                 .take()
                 .map(WorkerWorktreeGuard::disarm);
             let provider_policy = self.provider_policy.clone();
+            // #1607 (codex-review follow-up): capture the session sandbox so the
+            // detached background child registry can be built with it (see the
+            // `with_builtins_and_sandbox` call inside the closure). Without this
+            // the background child's validator registry stored `NoSandbox`, so a
+            // workspace-declared command validator could escape to the host.
+            let child_sandbox = self.sandbox.clone();
             let additional_instructions = input.additional_instructions;
             let default_worker_prompt = self.worker_prompt.clone();
             let bg_sender = self.background_result_sender.clone();
@@ -3592,7 +3612,17 @@ impl Tool for SpawnTool {
                 };
                 let harness_event_sink_path = harness_event_sink.as_ref().map(|sink| sink.uri());
 
-                let mut tools = ToolRegistry::with_builtins(&working_dir);
+                // #1607 (codex-review follow-up): build the detached child
+                // registry with the SESSION sandbox rather than the hardcoded
+                // `NoSandbox` `with_builtins` stores. Its `child_tools_handle`
+                // feeds `run_declared_validators` / `run_project_root_validators`
+                // below, and `build_validator_runner` confines command
+                // validators to `tools.sandbox()`. On hosts without a real
+                // backend `create_sandbox` yields `NoSandbox` (unchanged).
+                let mut tools = ToolRegistry::with_builtins_and_sandbox(
+                    &working_dir,
+                    create_sandbox(&child_sandbox),
+                );
                 // Load plugin tools so subagents can use fm_tts, etc.
                 // Section B (codex review P1.1): inherit the parent's
                 // require_signed gate.

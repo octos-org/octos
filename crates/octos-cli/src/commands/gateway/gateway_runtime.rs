@@ -1061,6 +1061,10 @@ impl GatewayRuntime {
                     /// filtered memory recall instead of the cwd-only
                     /// unfiltered fallback.
                     embedder: Option<Arc<dyn octos_llm::EmbeddingProvider>>,
+                    /// #1607: session sandbox forwarded onto the pipeline
+                    /// executor so terminal / per-node command validators
+                    /// run confined instead of on the host.
+                    sandbox_config: octos_agent::SandboxConfig,
                 }
 
                 impl crate::session_actor::PipelineToolFactory for DefaultPipelineToolFactory {
@@ -1074,6 +1078,9 @@ impl GatewayRuntime {
                         .with_provider_policy(self.policy.clone())
                         .with_plugin_dirs(self.plugin_dirs.clone())
                         .with_plugin_require_signed(self.plugin_require_signed)
+                        // #1607: confine pipeline command validators to the
+                        // session sandbox.
+                        .with_sandbox(self.sandbox_config.clone())
                         // BLOCKER 2: unconditional — registers
                         // <octos_home>/{skills,pipelines} (installed) and
                         // <octos_home>/bundled-pipelines (bundled, last).
@@ -1106,6 +1113,10 @@ impl GatewayRuntime {
                     octos_home: octos_home_c,
                     plugin_require_signed: plugin_require_signed_c,
                     embedder: embedder_c,
+                    // #1607: thread the gateway session sandbox onto the
+                    // pipeline factory (mirrors `sandbox_config.clone()` used
+                    // for the actor factory below).
+                    sandbox_config: sandbox_config.clone(),
                 })
                     as Arc<dyn crate::session_actor::PipelineToolFactory + Send + Sync>);
             }

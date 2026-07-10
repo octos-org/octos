@@ -781,6 +781,10 @@ impl ProfileRuntime {
                 /// agents inherit the contamination-safe hybrid scored
                 /// + filtered memory recall path.
                 embedder: Option<Arc<dyn octos_llm::EmbeddingProvider>>,
+                /// #1607: session sandbox forwarded onto the pipeline
+                /// executor so terminal / per-node command validators run
+                /// confined instead of on the host.
+                sandbox_config: SandboxConfig,
             }
 
             impl crate::session_actor::PipelineToolFactory for AppUiPipelineToolFactory {
@@ -794,6 +798,9 @@ impl ProfileRuntime {
                     .with_provider_policy(self.policy.clone())
                     .with_plugin_dirs(self.plugin_dirs.clone())
                     .with_plugin_require_signed(self.plugin_require_signed)
+                    // #1607: confine pipeline command validators to the
+                    // session sandbox.
+                    .with_sandbox(self.sandbox_config.clone())
                     .with_octos_home(self.octos_home.clone());
                     if let Some(ref embedder) = self.embedder {
                         pt = pt.with_embedder(embedder.clone());
@@ -812,6 +819,9 @@ impl ProfileRuntime {
                     octos_home: effective_octos_home.clone(),
                     plugin_require_signed: config.plugins.require_signed,
                     embedder: embedder.clone(),
+                    // #1607: thread the AppUI session sandbox onto the
+                    // pipeline factory so command validators run confined.
+                    sandbox_config: sandbox_config.clone(),
                 });
 
             // Register the parent `run_pipeline` via the same factory

@@ -3500,6 +3500,11 @@ impl ActorFactory {
                 .with_agent_config(self.agent_config.clone())
                 .with_optional_embedder(self.embedder.clone())
                 .with_task_supervisor(supervisor.clone(), session_key.to_string())
+                // #1607: thread the session sandbox onto delegated children so
+                // their completion-phase command validators run confined —
+                // mirrors the SpawnTool `.with_sandbox(self.sandbox_config...)`
+                // wiring above.
+                .with_sandbox(self.sandbox_config.clone())
                 .with_child_prompt_context_manager_factory(delegate_factory);
         if let Some(ref prompt) = self.worker_prompt {
             delegate_tool = delegate_tool.with_worker_prompt(prompt.clone());

@@ -146,6 +146,11 @@ pub struct RunPipelineTool {
     /// may pass an `ir` program which is compiled (capability-locked via the
     /// closed palette + [`crate::profile::ValidationProfile`]) and executed.
     ir_enabled: bool,
+    /// #1607 (codex-review follow-up): the session sandbox forwarded onto the
+    /// [`ExecutorConfig`] so the pipeline's terminal / per-node command
+    /// validators run confined instead of on the host. Defaults to
+    /// `SandboxConfig::default()` (no-op on a host without a backend).
+    sandbox: octos_agent::SandboxConfig,
 }
 
 impl RunPipelineTool {
@@ -173,7 +178,16 @@ impl RunPipelineTool {
             contract_id: None,
             embedder: None,
             ir_enabled: ir_authoring_default(),
+            sandbox: octos_agent::SandboxConfig::default(),
         }
+    }
+
+    /// #1607: thread the session sandbox onto the pipeline executor so
+    /// terminal / per-node `Command` validators run confined. Mirrors
+    /// `SpawnTool::with_sandbox` / `DelegateTool::with_sandbox`.
+    pub fn with_sandbox(mut self, sandbox: octos_agent::SandboxConfig) -> Self {
+        self.sandbox = sandbox;
+        self
     }
 
     /// S1-5: enable the typed-IR authoring path (opt-in; default off). The
@@ -1023,6 +1037,9 @@ impl Tool for RunPipelineTool {
             // runs silently lose strong/fast model defaults and cost
             // projections fall back to the minimum estimate.
             catalog_dir: Some(self.working_dir.clone()),
+            // #1607 (codex-review follow-up): forward the session sandbox so
+            // the terminal / per-node command validators run confined.
+            sandbox: self.sandbox.clone(),
         };
 
         // Pipeline-level timeout resolution (NEW-15):

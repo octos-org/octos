@@ -462,6 +462,10 @@ impl AcpBootstrap {
             plugin_dirs.clone(),
             config.plugins.require_signed,
             shared.embedder.clone(),
+            // #1607: same sandbox the ACP agent registry uses (built at
+            // `build_acp_tool_registry` / the `create_sandbox(&sandbox)` above),
+            // so pipeline command validators run under the identical backend.
+            sandbox.clone(),
         );
         tools.register(pipeline_tool);
         tools.mark_spawn_only(
