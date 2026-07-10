@@ -919,8 +919,10 @@ mod tests {
     fn should_reject_update_when_content_guard_flags_new_text() {
         // A qualifying host note grants edit authority, so the failure below
         // can only come from the CONTENT gate — not the authority gate.
-        let mut fx = Fixture::default();
-        fx.notes = vec![note("n1", "host", "user_request", "tabs pref changed")];
+        let fx = Fixture {
+            notes: vec![note("n1", "host", "user_request", "tabs pref changed")],
+            ..Default::default()
+        };
         let err = fx
             .validate(&output(
                 vec![Op::Update {
