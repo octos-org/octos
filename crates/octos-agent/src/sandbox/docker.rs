@@ -34,6 +34,10 @@ pub struct DockerSandbox {
 }
 
 impl Sandbox for DockerSandbox {
+    fn is_docker(&self) -> bool {
+        true
+    }
+
     fn wrap_command(&self, shell_command: &str, cwd: &Path) -> Command {
         let mut cmd = Command::new("docker");
         cmd.arg("run").arg("--rm");

@@ -19513,6 +19513,12 @@ async fn run_standalone_turn(
             session_id.to_string(),
         )
         .with_provider_policy(tool_registry.provider_policy().cloned())
+        // #1607 (codex-review follow-up): inherit the session's effective
+        // sandbox (the same `SandboxConfig` the parent `tool_registry` was
+        // built from) so the spawn/agent_mcp child completion path confines
+        // workspace-declared `Command` validators rather than running them on
+        // the host.
+        .with_sandbox(session_runtime.sandbox.clone())
         .with_agent_config(agent_config.clone())
         .with_task_supervisor(
             task_supervisor.clone(),
@@ -19639,8 +19645,15 @@ async fn run_standalone_turn(
         // clone the `Arc` here for every spawn-tool child closure
         // invocation.
         if let Some(pipeline_factory) = session_runtime.profile.pipeline_factory.clone() {
-            spawn_tool =
-                spawn_tool.with_child_tool_factory(Arc::new(move || pipeline_factory.create()));
+            // #1607 (codex round 4): bind spawn-child `run_pipeline` instances to
+            // the SESSION-effective sandbox (`session_runtime.sandbox`, set by
+            // `bootstrap_with_permissions_and_sandbox`), NOT the profile-time
+            // default the factory was built with — otherwise a read-only
+            // session's spawned pipeline validators regain removed
+            // writes/network.
+            let child_sandbox = session_runtime.sandbox.clone();
+            spawn_tool = spawn_tool
+                .with_child_tool_factory(Arc::new(move || pipeline_factory.create(&child_sandbox)));
         }
         tool_registry.register(spawn_tool);
         // RFC-0 (#1289): LRU deferral removed — no base-tool pin needed.

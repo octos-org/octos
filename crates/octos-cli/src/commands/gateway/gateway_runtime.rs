@@ -1064,7 +1064,10 @@ impl GatewayRuntime {
                 }
 
                 impl crate::session_actor::PipelineToolFactory for DefaultPipelineToolFactory {
-                    fn create(&self) -> Arc<dyn octos_agent::Tool> {
+                    fn create(
+                        &self,
+                        sandbox: &octos_agent::SandboxConfig,
+                    ) -> Arc<dyn octos_agent::Tool> {
                         let mut pt = octos_pipeline::RunPipelineTool::new(
                             self.llm.clone(),
                             self.memory.clone(),
@@ -1074,6 +1077,10 @@ impl GatewayRuntime {
                         .with_provider_policy(self.policy.clone())
                         .with_plugin_dirs(self.plugin_dirs.clone())
                         .with_plugin_require_signed(self.plugin_require_signed)
+                        // #1607 (codex round 4): confine pipeline command
+                        // validators to the SESSION-effective sandbox handed in
+                        // by the actor factory.
+                        .with_sandbox(sandbox.clone())
                         // BLOCKER 2: unconditional — registers
                         // <octos_home>/{skills,pipelines} (installed) and
                         // <octos_home>/bundled-pipelines (bundled, last).
@@ -1106,6 +1113,9 @@ impl GatewayRuntime {
                     octos_home: octos_home_c,
                     plugin_require_signed: plugin_require_signed_c,
                     embedder: embedder_c,
+                    // #1607 (codex round 4): the session sandbox is now handed to
+                    // `create()` by the actor factory (`self.sandbox_config`), so
+                    // no per-factory field is needed.
                 })
                     as Arc<dyn crate::session_actor::PipelineToolFactory + Send + Sync>);
             }

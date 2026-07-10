@@ -7,6 +7,7 @@ use glob::glob;
 use crate::behaviour::{
     ActionContext, ActionResult, evaluate_actions_with_context, run_action_with_context,
 };
+use crate::sandbox::Sandbox;
 use crate::task_supervisor::{TaskRuntimeState, TaskSupervisor};
 use crate::tools::ToolRegistry;
 use crate::validators::{
@@ -48,6 +49,7 @@ pub async fn enforce_spawn_task_contract(
     files_to_send: &[PathBuf],
     task_started_at: SystemTime,
     supervisor: Option<(&TaskSupervisor, &str)>,
+    sandbox: Arc<dyn Sandbox>,
 ) -> SpawnTaskContractResult {
     enforce_spawn_task_contract_with_args_and_output(
         tools,
@@ -58,6 +60,7 @@ pub async fn enforce_spawn_task_contract(
         supervisor,
         None,
         None,
+        sandbox,
     )
     .await
 }
@@ -71,6 +74,7 @@ pub async fn enforce_spawn_task_contract(
 /// the tool's `named_outputs` for `${output.<key>}` interpolation). This
 /// entry point exists for callers that have args but no tool output to
 /// forward.
+#[allow(clippy::too_many_arguments)]
 pub async fn enforce_spawn_task_contract_with_args(
     tools: &ToolRegistry,
     tool_name: &str,
@@ -79,6 +83,7 @@ pub async fn enforce_spawn_task_contract_with_args(
     task_started_at: SystemTime,
     supervisor: Option<(&TaskSupervisor, &str)>,
     input_args: Option<&serde_json::Value>,
+    sandbox: Arc<dyn Sandbox>,
 ) -> SpawnTaskContractResult {
     enforce_spawn_task_contract_with_args_and_output(
         tools,
@@ -89,6 +94,7 @@ pub async fn enforce_spawn_task_contract_with_args(
         supervisor,
         input_args,
         None,
+        sandbox,
     )
     .await
 }
@@ -112,6 +118,7 @@ pub async fn enforce_spawn_task_contract_with_args_and_output(
     supervisor: Option<(&TaskSupervisor, &str)>,
     input_args: Option<&serde_json::Value>,
     tool_named_outputs: Option<&serde_json::Value>,
+    sandbox: Arc<dyn Sandbox>,
 ) -> SpawnTaskContractResult {
     let required_by_default = default_session_policy_requires_contract(tool_name);
     let Some(workspace_root) = tools.workspace_root() else {
@@ -211,6 +218,7 @@ pub async fn enforce_spawn_task_contract_with_args_and_output(
         // `PerFileNonSilent`) declaring `source = "spawn_only_files"`
         // can consume the authoritative path set the skill emitted.
         Some(files_to_send.to_vec()),
+        sandbox,
     )
     .await
     {
@@ -552,6 +560,15 @@ fn default_session_policy_requires_contract(tool_name: &str) -> bool {
 ///
 /// Thin wrapper for non-spawn-only callers that have no tool output to
 /// forward. Spawn-only callers should use [`run_declared_validators_with_output`].
+///
+/// #1607: `sandbox` is the session sandbox under which `ValidatorSpec::Command`
+/// validators (which a project's `workspace_policy.toml` can declare) execute.
+/// It is threaded EXPLICITLY — the compiler enforces that every call site names
+/// the sandbox it means to confine command validators to, so an untrusted
+/// workspace validator can never run unsandboxed on the host from a sandboxed
+/// session. Pass `Arc::new(crate::sandbox::NoSandbox)` for host-independent
+/// contexts (a no-op sandbox runs the argv directly, matching pre-#1607
+/// behaviour).
 pub async fn run_declared_validators(
     tools: &ToolRegistry,
     workspace_root: &Path,
@@ -559,6 +576,7 @@ pub async fn run_declared_validators(
     repo_label_hint: &str,
     phase: ValidatorPhase,
     input_args: Option<serde_json::Value>,
+    sandbox: Arc<dyn Sandbox>,
 ) -> Result<Vec<ValidatorOutcome>, String> {
     run_declared_validators_with_output(
         tools,
@@ -569,6 +587,7 @@ pub async fn run_declared_validators(
         input_args,
         None,
         None,
+        sandbox,
     )
     .await
 }
@@ -595,6 +614,7 @@ pub async fn run_declared_validators_with_output(
     input_args: Option<serde_json::Value>,
     tool_output: Option<serde_json::Value>,
     spawn_only_files: Option<Vec<PathBuf>>,
+    sandbox: Arc<dyn Sandbox>,
 ) -> Result<Vec<ValidatorOutcome>, String> {
     if validators.is_empty() {
         return Ok(Vec::new());
@@ -624,7 +644,7 @@ pub async fn run_declared_validators_with_output(
         }
     };
 
-    let runner = build_validator_runner(tools, workspace_root);
+    let runner = build_validator_runner(tools, workspace_root, sandbox);
     let runner = match ledger {
         Some(ledger) => runner.with_ledger(ledger),
         None => runner,
@@ -715,6 +735,7 @@ pub async fn run_project_root_validators(
     working_dir: &Path,
     expected_kind: Option<WorkspaceProjectKind>,
     files_to_send: &[PathBuf],
+    sandbox: Arc<dyn Sandbox>,
 ) -> ProjectRootValidatorReport {
     let mut report = ProjectRootValidatorReport::default();
     let repos = match list_workspace_repos(working_dir) {
@@ -775,6 +796,7 @@ pub async fn run_project_root_validators(
             None,
             None,
             Some(project_files),
+            sandbox.clone(),
         )
         .await
         {
@@ -816,12 +838,28 @@ fn filter_files_for_project(
         .collect()
 }
 
-fn build_validator_runner(tools: &ToolRegistry, workspace_root: &Path) -> ValidatorRunner {
+fn build_validator_runner(
+    tools: &ToolRegistry,
+    workspace_root: &Path,
+    sandbox: Arc<dyn Sandbox>,
+) -> ValidatorRunner {
     // Capture a lightweight snapshot of tool handles for the validator runner.
     // Avoids cloning the full registry and its LRU bookkeeping.
     let dispatcher: Arc<dyn crate::validators::ValidatorToolDispatcher> =
         Arc::new(crate::validators::MapToolDispatcher::from_registry(tools));
-    ValidatorRunner::with_dispatcher(dispatcher, workspace_root)
+    // #1607: confine `ValidatorSpec::Command` validators (which a project's
+    // `workspace_policy.toml` can declare) to the session sandbox the caller
+    // hands in EXPLICITLY, so the automatic project-root validator pass at the
+    // end of `run_task` can't be turned into a host-level sandbox escape. The
+    // sandbox is an explicit entry-point argument (not `tools.sandbox()`) so
+    // the compiler enumerates and enforces every call site: each caller must
+    // name the sandbox it means to confine command validators to.
+    // `ValidatorRunner::run_command` runs the argv directly when the sandbox is
+    // a no-op (`NoSandbox`, or a backend whose helper is unavailable), so hosts
+    // without a real backend are unaffected; on POSIX with a real backend the
+    // command is shell-quoted and wrapped; the Windows real-sandbox case fails
+    // closed.
+    ValidatorRunner::with_dispatcher(dispatcher, workspace_root).with_sandbox(sandbox)
 }
 
 #[cfg(test)]
@@ -896,6 +934,7 @@ mod tests {
             &[],
             UNIX_EPOCH,
             None,
+            Arc::new(crate::sandbox::NoSandbox),
         )
         .await;
 
@@ -919,6 +958,7 @@ mod tests {
             &[],
             UNIX_EPOCH,
             None,
+            Arc::new(crate::sandbox::NoSandbox),
         )
         .await;
 
@@ -958,6 +998,7 @@ mod tests {
             std::slice::from_ref(&output),
             UNIX_EPOCH,
             None,
+            Arc::new(crate::sandbox::NoSandbox),
         )
         .await;
 
@@ -1054,6 +1095,7 @@ mod tests {
             std::slice::from_ref(&output),
             UNIX_EPOCH,
             None,
+            Arc::new(crate::sandbox::NoSandbox),
         )
         .await;
 
@@ -1133,6 +1175,7 @@ mod tests {
             &[],
             UNIX_EPOCH,
             None,
+            Arc::new(crate::sandbox::NoSandbox),
         )
         .await;
 
@@ -1182,6 +1225,7 @@ mod tests {
             &[],
             UNIX_EPOCH,
             None,
+            Arc::new(crate::sandbox::NoSandbox),
         )
         .await;
 
@@ -1240,6 +1284,7 @@ mod tests {
             &[report.clone(), audio.clone()],
             UNIX_EPOCH,
             None,
+            Arc::new(crate::sandbox::NoSandbox),
         )
         .await;
 
@@ -1301,6 +1346,7 @@ mod tests {
             std::slice::from_ref(&report),
             UNIX_EPOCH,
             None,
+            Arc::new(crate::sandbox::NoSandbox),
         )
         .await;
 
@@ -1323,6 +1369,7 @@ mod tests {
             &[],
             UNIX_EPOCH,
             None,
+            Arc::new(crate::sandbox::NoSandbox),
         )
         .await;
 
@@ -1346,6 +1393,7 @@ mod tests {
             &[],
             UNIX_EPOCH,
             None,
+            Arc::new(crate::sandbox::NoSandbox),
         )
         .await;
 
@@ -1420,6 +1468,7 @@ mod tests {
             UNIX_EPOCH,
             None,
             Some(&json!({"out": "output/deck.pptx"})),
+            Arc::new(crate::sandbox::NoSandbox),
         )
         .await;
 
@@ -1452,6 +1501,7 @@ mod tests {
             UNIX_EPOCH,
             None,
             Some(&json!({"out": "output/deck.pptx"})),
+            Arc::new(crate::sandbox::NoSandbox),
         )
         .await;
 
@@ -1488,6 +1538,7 @@ mod tests {
             UNIX_EPOCH,
             None,
             Some(&json!({"card_dir": "skill-output/cards/abc/deep/layout"})),
+            Arc::new(crate::sandbox::NoSandbox),
         )
         .await;
 
@@ -1521,6 +1572,7 @@ mod tests {
             UNIX_EPOCH,
             None,
             Some(&json!({"card_dir": "cards/abc"})),
+            Arc::new(crate::sandbox::NoSandbox),
         )
         .await;
 
@@ -1560,6 +1612,7 @@ mod tests {
             UNIX_EPOCH,
             None,
             Some(&json!({"out": "comic.png"})),
+            Arc::new(crate::sandbox::NoSandbox),
         )
         .await;
 
@@ -1595,6 +1648,7 @@ mod tests {
             UNIX_EPOCH,
             None,
             Some(&json!({"out": "comic.png"})),
+            Arc::new(crate::sandbox::NoSandbox),
         )
         .await;
 
@@ -1644,6 +1698,7 @@ mod tests {
             // `out_path` is optional. Pass none so the dormant-contract
             // mode is what we exercise.
             Some(&json!({})),
+            Arc::new(crate::sandbox::NoSandbox),
         )
         .await;
 
@@ -1687,6 +1742,7 @@ mod tests {
             UNIX_EPOCH,
             None,
             Some(&json!({"out": "comic.png"})),
+            Arc::new(crate::sandbox::NoSandbox),
         )
         .await;
 
@@ -1741,6 +1797,7 @@ mod tests {
             UNIX_EPOCH,
             None,
             Some(&json!({"name": "yangmi", "audio_path": "/tmp/in.wav"})),
+            Arc::new(crate::sandbox::NoSandbox),
         )
         .await;
 
@@ -1775,6 +1832,7 @@ mod tests {
             UNIX_EPOCH,
             None,
             Some(&json!({"name": "no_such_voice"})),
+            Arc::new(crate::sandbox::NoSandbox),
         )
         .await;
 
@@ -1866,6 +1924,7 @@ mod tests {
             None,
             None,
             Some(&json!({"deploy_url": format!("http://{addr}/site")})),
+            Arc::new(crate::sandbox::NoSandbox),
         )
         .await;
 
@@ -1927,6 +1986,7 @@ mod tests {
             UNIX_EPOCH,
             None,
             Some(&json!({"expected_sha256": expected_hex.clone()})),
+            Arc::new(crate::sandbox::NoSandbox),
         )
         .await;
 
@@ -1958,6 +2018,7 @@ mod tests {
             None,
             None,
             Some(&json!({"deploy_url": format!("http://{addr}/missing")})),
+            Arc::new(crate::sandbox::NoSandbox),
         )
         .await;
 
@@ -2009,6 +2070,7 @@ mod tests {
             UNIX_EPOCH,
             None,
             Some(&json!({"expected_sha256": wrong_hex})),
+            Arc::new(crate::sandbox::NoSandbox),
         )
         .await;
 
@@ -2047,6 +2109,7 @@ mod tests {
             // tool_output absent — emulates the current mofa_publish
             // skill (before the mofa-skills repo follow-up).
             None,
+            Arc::new(crate::sandbox::NoSandbox),
         )
         .await;
 
@@ -2080,6 +2143,7 @@ mod tests {
             None,
             // No named_outputs from the skill (current state).
             None,
+            Arc::new(crate::sandbox::NoSandbox),
         )
         .await;
 
@@ -2141,6 +2205,7 @@ mod tests {
             None,
             None,
             Some(&json!({"target_path": "artifact.txt"})),
+            Arc::new(crate::sandbox::NoSandbox),
         )
         .await;
 
@@ -2211,6 +2276,7 @@ mod tests {
             UNIX_EPOCH,
             None,
             None,
+            Arc::new(crate::sandbox::NoSandbox),
         )
         .await;
 

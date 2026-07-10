@@ -41,6 +41,7 @@ use super::{Tool, ToolContext, ToolPolicy, ToolRegistry, ToolResult};
 use crate::compaction::CompactionRunner;
 use crate::harness_errors::HarnessError;
 use crate::harness_events::HARNESS_EVENT_SCHEMA_V1;
+use crate::sandbox::{SandboxConfig, create_sandbox};
 use crate::task_supervisor::{TaskLifecycleState, TaskSupervisor};
 use crate::validators::ValidatorPhase;
 use crate::workspace_contract::run_declared_validators;
@@ -262,6 +263,14 @@ pub struct DelegateTool {
     embedder: Option<Arc<dyn octos_llm::EmbeddingProvider>>,
     /// Caller-owned context-manager factory for delegated child agents.
     child_prompt_context_manager_factory: Option<ChildPromptContextManagerFactory>,
+    /// #1607 (codex-review follow-up): the session sandbox threaded from the
+    /// runtime construction site (`session_actor::spawn`). The child registry
+    /// built for a delegated worker carries this so its completion-phase
+    /// `run_declared_validators` pass confines `ValidatorSpec::Command`
+    /// validators to the same sandbox as the shell/exec tools. Defaults to
+    /// `SandboxConfig::default()` (resolves to `NoSandbox` on a host without a
+    /// backend, running command validators directly — unchanged behaviour).
+    sandbox: SandboxConfig,
 }
 
 impl DelegateTool {
@@ -282,7 +291,16 @@ impl DelegateTool {
             worker_config: None,
             embedder: None,
             child_prompt_context_manager_factory: None,
+            sandbox: SandboxConfig::default(),
         }
+    }
+
+    /// #1607: thread the session sandbox onto delegated child registries so
+    /// their completion-phase command validators are confined to it. Mirrors
+    /// `SpawnTool::with_sandbox`.
+    pub fn with_sandbox(mut self, sandbox: SandboxConfig) -> Self {
+        self.sandbox = sandbox;
+        self
     }
 
     /// Use a custom depth budget (primarily for constructing a child tool
@@ -331,6 +349,15 @@ impl DelegateTool {
     /// Test-only visibility: whether an embedder was threaded through.
     pub fn embedder_for_test(&self) -> Option<&Arc<dyn octos_llm::EmbeddingProvider>> {
         self.embedder.as_ref()
+    }
+
+    /// Test-only visibility: the sandbox threaded onto the child registry.
+    /// #1607: lets a unit test reconstruct the exact registry `execute`
+    /// builds (`with_builtins_and_sandbox(&working_dir, create_sandbox(&sandbox))`)
+    /// and assert the configured backend actually reaches the validator path.
+    #[cfg(test)]
+    pub(crate) fn sandbox_for_test(&self) -> &SandboxConfig {
+        &self.sandbox
     }
 
     /// Like [`Self::with_embedder`] but tolerates `None` — call-site
@@ -382,6 +409,8 @@ impl DelegateTool {
             worker_config: self.worker_config.clone(),
             embedder: self.embedder.clone(),
             child_prompt_context_manager_factory: self.child_prompt_context_manager_factory.clone(),
+            // #1607: a deeper delegate level inherits the same session sandbox.
+            sandbox: self.sandbox.clone(),
         })
     }
 }
@@ -596,7 +625,20 @@ impl Tool for DelegateTool {
         // its own DelegateTool with the incremented budget so a leaf child
         // (depth == max) can still emit a typed DepthExceeded error via
         // evaluate/run, and so a depth-1 child can delegate one more level.
-        let mut tools = ToolRegistry::with_builtins(&self.working_dir);
+        //
+        // #1607 (codex-review follow-up): build the child registry with the
+        // SESSION sandbox rather than the hardcoded `NoSandbox` `with_builtins`
+        // stores. The child's `child_tools_handle` feeds `run_declared_validators`
+        // (Step 6 below), and `build_validator_runner` confines
+        // `ValidatorSpec::Command` validators to `tools.sandbox()`. Without the
+        // real backend here, a workspace-declared command validator could
+        // escape the sandbox and execute on the host. On hosts without a real
+        // backend `create_sandbox` yields `NoSandbox` and the validator runs the
+        // argv directly (unchanged).
+        let mut tools = ToolRegistry::with_builtins_and_sandbox(
+            &self.working_dir,
+            create_sandbox(&self.sandbox),
+        );
         tools.clear_spawn_only();
 
         let child_delegate = Self {
@@ -616,6 +658,8 @@ impl Tool for DelegateTool {
             worker_config: self.worker_config.clone(),
             embedder: self.embedder.clone(),
             child_prompt_context_manager_factory: self.child_prompt_context_manager_factory.clone(),
+            // #1607: the re-registered child delegate inherits the same sandbox.
+            sandbox: self.sandbox.clone(),
         };
         tools.register_arc(Arc::new(child_delegate));
 
@@ -753,6 +797,7 @@ impl Tool for DelegateTool {
                             "delegate",
                             ValidatorPhase::Completion,
                             None,
+                            std::sync::Arc::from(create_sandbox(&self.sandbox)),
                         )
                         .await
                         .err()
@@ -905,6 +950,66 @@ mod tests {
     async fn should_default_to_no_embedder_when_not_provided() {
         let tool = embedder_probe_tool().await;
         assert!(tool.embedder_for_test().is_none());
+    }
+
+    /// #1607 (codex-review follow-up): the delegated-child completion path
+    /// builds its validator registry with `with_builtins_and_sandbox(
+    /// &self.working_dir, create_sandbox(&self.sandbox))`. Lock in that the
+    /// sandbox threaded via `with_sandbox` reaches that registry (i.e. it is
+    /// NOT the pre-fix hardcoded `with_builtins` / `NoSandbox`). Docker mode is
+    /// chosen because `create_sandbox` returns a `DockerSandbox` unconditionally
+    /// (no docker binary required), so a hardcoded `NoSandbox` would report
+    /// `is_docker() == false` and fail here — host-independent.
+    #[tokio::test]
+    async fn delegate_threads_configured_sandbox_into_validator_registry() {
+        let tool = embedder_probe_tool().await.with_sandbox(SandboxConfig {
+            mode: crate::sandbox::SandboxMode::Docker,
+            ..SandboxConfig::default()
+        });
+        // Reconstruct exactly what `execute` builds for the child registry.
+        let registry = ToolRegistry::with_builtins_and_sandbox(
+            &tool.working_dir,
+            create_sandbox(tool.sandbox_for_test()),
+        );
+        let sandbox = registry.sandbox();
+        assert!(
+            sandbox.is_docker(),
+            "delegate child validator registry must inherit the DelegateTool \
+             sandbox (Docker here), not the pre-#1607 hardcoded NoSandbox"
+        );
+        assert!(
+            !sandbox.is_noop(),
+            "a real backend threaded via with_sandbox must not be a no-op"
+        );
+
+        // The re-registered deeper-level child must inherit the same sandbox.
+        let child = tool.child_tool().expect("depth budget allows a child");
+        assert_eq!(
+            child.sandbox_for_test().mode,
+            crate::sandbox::SandboxMode::Docker,
+            "child_tool() must fork the sandbox so grandchild validators stay \
+             confined"
+        );
+    }
+
+    /// #1607: the default (unconfigured) DelegateTool keeps a
+    /// `SandboxConfig::default()` and stays host-independent — an explicit
+    /// no-op backend runs command validators directly (pre-#1607 behaviour).
+    #[tokio::test]
+    async fn delegate_none_sandbox_registry_is_noop() {
+        let tool = embedder_probe_tool().await.with_sandbox(SandboxConfig {
+            mode: crate::sandbox::SandboxMode::None,
+            ..SandboxConfig::default()
+        });
+        let registry = ToolRegistry::with_builtins_and_sandbox(
+            &tool.working_dir,
+            create_sandbox(tool.sandbox_for_test()),
+        );
+        assert!(
+            registry.sandbox().is_noop(),
+            "SandboxMode::None must resolve to a no-op backend so command \
+             validators run directly (host-independent)"
+        );
     }
 
     #[test]

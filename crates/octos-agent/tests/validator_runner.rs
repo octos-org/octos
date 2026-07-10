@@ -575,6 +575,7 @@ async fn should_block_spawn_task_contract_when_required_validator_fails() {
         &[],
         UNIX_EPOCH,
         None,
+        Arc::new(octos_agent::sandbox::NoSandbox),
     )
     .await;
 
@@ -653,6 +654,7 @@ async fn should_not_block_spawn_task_contract_when_optional_validator_fails() {
         &[],
         UNIX_EPOCH,
         None,
+        Arc::new(octos_agent::sandbox::NoSandbox),
     )
     .await;
 
@@ -830,6 +832,7 @@ async fn should_bind_files_to_send_to_artifact_for_mofa_slides_contract() {
         &files_to_send,
         UNIX_EPOCH,
         None,
+        Arc::new(octos_agent::sandbox::NoSandbox),
     )
     .await;
 

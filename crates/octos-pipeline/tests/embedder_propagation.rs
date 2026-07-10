@@ -179,6 +179,9 @@ async fn build_codergen_propagates_embedder_from_executor_config() {
         host_context: octos_pipeline::PipelineHostContext::default(),
         embedder: Some(embedder),
         catalog_dir: None,
+        // #1607: pipeline validators run under a no-op sandbox in tests
+        // (host-independent — command validators run the argv directly).
+        sandbox: octos_agent::SandboxConfig::default(),
     };
 
     let executor = PipelineExecutor::new(config);
@@ -222,6 +225,9 @@ async fn build_codergen_omits_embedder_when_executor_config_has_none() {
         host_context: octos_pipeline::PipelineHostContext::default(),
         embedder: None,
         catalog_dir: None,
+        // #1607: pipeline validators run under a no-op sandbox in tests
+        // (host-independent — command validators run the argv directly).
+        sandbox: octos_agent::SandboxConfig::default(),
     };
 
     let executor = PipelineExecutor::new(config);

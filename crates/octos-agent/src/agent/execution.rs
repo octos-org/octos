@@ -1119,6 +1119,12 @@ impl Agent {
                                 Some((&bg_supervisor, &task_id)),
                                 Some(&bg_args),
                                 named_outputs_value.as_ref(),
+                                // #1607: the Agent's own registry is built
+                                // sandboxed (session_actor
+                                // `create_registry_for_workspace` ->
+                                // `rebind_cwd(create_sandbox(&sandbox_config))`),
+                                // so its stored sandbox IS the session backend.
+                                bg_tools.sandbox(),
                             )
                             .await
                             {
@@ -1153,6 +1159,7 @@ impl Agent {
                                                 workspace_root,
                                                 None,
                                                 &r.files_to_send,
+                                                bg_tools.sandbox(),
                                             )
                                             .await;
                                     }

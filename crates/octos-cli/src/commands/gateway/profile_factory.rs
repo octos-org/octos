@@ -931,7 +931,10 @@ impl ProfileActorFactoryBuilder {
             }
 
             impl crate::session_actor::PipelineToolFactory for ChildPipelineToolFactory {
-                fn create(&self) -> Arc<dyn octos_agent::Tool> {
+                fn create(
+                    &self,
+                    sandbox: &octos_agent::SandboxConfig,
+                ) -> Arc<dyn octos_agent::Tool> {
                     let mut pt = octos_pipeline::RunPipelineTool::new(
                         self.llm.clone(),
                         self.memory.clone(),
@@ -941,6 +944,10 @@ impl ProfileActorFactoryBuilder {
                     .with_provider_policy(self.policy.clone())
                     .with_plugin_dirs(self.plugin_dirs.clone())
                     .with_plugin_require_signed(self.plugin_require_signed)
+                    // #1607 (codex round 4): confine pipeline command validators
+                    // to the SESSION-effective sandbox handed in by the actor
+                    // factory.
+                    .with_sandbox(sandbox.clone())
                     .with_octos_home(self.octos_home.clone());
                     if let Some(ref router) = self.router {
                         pt = pt.with_provider_router(router.clone());
@@ -976,6 +983,9 @@ impl ProfileActorFactoryBuilder {
                 // profile's strict-signing policy.
                 plugin_require_signed: profile_config.plugins.require_signed,
                 embedder: child_pipeline_embedder,
+                // #1607 (codex round 4): the session sandbox is now handed to
+                // `create()` by the actor factory (`self.sandbox_config`), so no
+                // per-factory field is needed.
             })
                 as Arc<dyn crate::session_actor::PipelineToolFactory + Send + Sync>);
 

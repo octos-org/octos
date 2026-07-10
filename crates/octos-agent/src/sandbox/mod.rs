@@ -229,6 +229,21 @@ pub trait Sandbox: Send + Sync {
     fn is_noop(&self) -> bool {
         false
     }
+
+    /// Whether this backend is the Docker container sandbox.
+    ///
+    /// #1607 (codex-review follow-up): Docker bind-mounts the workspace at a
+    /// fixed in-container path (`/workspace`), but `Command` validators
+    /// interpolate absolute *host* paths (e.g. `${output.patch_path}` ->
+    /// `/host/ws/.../foo.patch`) which don't exist inside the container, so a
+    /// previously-passing required validator would start failing. Before
+    /// #1607, command validators ran on the host and worked. `ValidatorRunner`
+    /// uses this to keep Docker-mode command validators on the pre-#1607 direct
+    /// (host) path rather than silently breaking them. Full in-container path
+    /// translation is a known follow-up. Non-Docker backends inherit `false`.
+    fn is_docker(&self) -> bool {
+        false
+    }
 }
 
 /// No-op sandbox: executes commands directly.

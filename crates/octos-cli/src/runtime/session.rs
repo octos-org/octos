@@ -275,6 +275,34 @@ impl SessionRuntime {
         );
         tools.set_output_dir_hint(plugin_work_dir.to_string_lossy().into_owned());
         tools.rebind_plugin_work_dirs(&plugin_work_dir);
+        // #1607 (codex round 4): `run_pipeline` is NOT a CWD-bound tool, so the
+        // `rebind_cwd_with_permissions` snapshot above carried the PROFILE-time
+        // `run_pipeline` instance — which baked in the profile default sandbox.
+        // Re-register it from the profile's pipeline factory with the
+        // SESSION-effective `sandbox` so a read-only (or otherwise overridden)
+        // session's pipeline command validators run under the session sandbox
+        // instead of regaining the profile default's writes/network. The
+        // spawn_only marker persists across `register_arc` (it is registry
+        // metadata carried by the snapshot), and re-marking is idempotent.
+        // Only REPLACE `run_pipeline` (with the session-sandbox instance) when
+        // the profile policy actually left it in the rebound registry. A profile
+        // that denies `run_pipeline` (or an allow-list excluding it) removed it
+        // during `ProfileRuntime::bootstrap` (`apply_policy` → `retain`), so it's
+        // absent here; re-adding it unconditionally would make a policy-disabled
+        // pipeline visible + callable, bypassing the tool policy (#1607 codex
+        // round 5). `register_arc` replaces the existing entry by name.
+        if let Some(ref pf) = profile.pipeline_factory {
+            if tools.get_tool("run_pipeline").is_some() {
+                tools.register_arc(pf.create(&sandbox));
+                tools.mark_spawn_only(
+                    "run_pipeline",
+                    Some(
+                        "Pipeline started in background. The final result and any artifacts will be sent here when complete. You can keep chatting in the meantime."
+                            .to_string(),
+                    ),
+                );
+            }
+        }
         // RFC-0 (#1289): the `activate_tools` meta-tool was removed — every
         // enabled tool is emitted every turn, so there is no per-session
         // meta-tool to re-register or wire.
@@ -1577,6 +1605,7 @@ mod tests {
             &[],
             SystemTime::now(),
             None,
+            Arc::new(octos_agent::sandbox::NoSandbox),
         )
         .await;
 

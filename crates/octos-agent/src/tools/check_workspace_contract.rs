@@ -182,6 +182,7 @@ mod tests {
             workspace_root,
             Some(WorkspaceProjectKind::Slides),
             files_to_send,
+            Arc::new(crate::sandbox::NoSandbox),
         )
         .await;
     }

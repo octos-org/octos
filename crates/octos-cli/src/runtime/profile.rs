@@ -784,7 +784,7 @@ impl ProfileRuntime {
             }
 
             impl crate::session_actor::PipelineToolFactory for AppUiPipelineToolFactory {
-                fn create(&self) -> Arc<dyn octos_agent::tools::Tool> {
+                fn create(&self, sandbox: &SandboxConfig) -> Arc<dyn octos_agent::tools::Tool> {
                     let mut pt = octos_pipeline::RunPipelineTool::new(
                         self.llm.clone(),
                         self.memory.clone(),
@@ -794,6 +794,13 @@ impl ProfileRuntime {
                     .with_provider_policy(self.policy.clone())
                     .with_plugin_dirs(self.plugin_dirs.clone())
                     .with_plugin_require_signed(self.plugin_require_signed)
+                    // #1607 (codex round 4): confine pipeline command
+                    // validators to the SESSION-effective sandbox passed in by
+                    // the caller (`SessionRuntime`/`ActorFactory`), NOT a
+                    // profile-time default captured at factory-build time — a
+                    // read-only session's validators must not regain removed
+                    // writes/network.
+                    .with_sandbox(sandbox.clone())
                     .with_octos_home(self.octos_home.clone());
                     if let Some(ref embedder) = self.embedder {
                         pt = pt.with_embedder(embedder.clone());
@@ -814,10 +821,13 @@ impl ProfileRuntime {
                     embedder: embedder.clone(),
                 });
 
-            // Register the parent `run_pipeline` via the same factory
-            // so the parent registry and every spawn-child registry
-            // observe byte-identical config.
-            tools.register_arc(factory.create());
+            // Register the parent `run_pipeline` via the same factory so the
+            // parent registry and every spawn-child registry observe
+            // byte-identical config. This profile-scope registration uses the
+            // profile default sandbox; `SessionRuntime::bootstrap_*` re-registers
+            // it with the SESSION-effective sandbox (which `rebind_cwd` does not
+            // touch, since `run_pipeline` is not a CWD-bound tool).
+            tools.register_arc(factory.create(&sandbox_config));
             tools.mark_spawn_only(
                 "run_pipeline",
                 Some(
@@ -1854,7 +1864,7 @@ mod tests {
             .pipeline_factory
             .as_ref()
             .expect("pipeline_factory must be Some after a successful bootstrap");
-        let pt = factory.create();
+        let pt = factory.create(&octos_agent::SandboxConfig::default());
         assert_eq!(
             pt.name(),
             "run_pipeline",
@@ -1869,7 +1879,7 @@ mod tests {
         // `ensure_subagent_tools_available` preflight will pass for
         // `allowed_tools=["run_pipeline"]`.
         let mut child_registry = octos_agent::ToolRegistry::with_builtins(&data_dir);
-        child_registry.register_arc(factory.create());
+        child_registry.register_arc(factory.create(&octos_agent::SandboxConfig::default()));
         assert!(
             child_registry.get("run_pipeline").is_some(),
             "spawned child registry must carry `run_pipeline` so the spawn preflight succeeds",
