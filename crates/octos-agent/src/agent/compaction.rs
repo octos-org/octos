@@ -96,15 +96,15 @@ impl Agent {
     pub(super) fn maybe_run_preflight_compaction(
         &self,
         messages: &mut Vec<Message>,
-    ) -> eyre::Result<()> {
+    ) -> eyre::Result<Option<String>> {
         if self.prompt_context_manager.is_some() {
-            return Ok(());
+            return Ok(None);
         }
         let Some(runner) = self.compaction_runner.as_ref() else {
-            return Ok(());
+            return Ok(None);
         };
         if runner.needs_preflight(messages).is_none() {
-            return Ok(());
+            return Ok(None);
         }
         let outcome = runner.run(messages, CompactionPhase::Preflight);
         info!(
@@ -117,7 +117,12 @@ impl Agent {
             summarizer = outcome.summarizer_kind,
             "harness M6.3 compaction preflight fired"
         );
-        self.enforce_preservation(messages, CompactionPhase::Preflight)
+        self.enforce_preservation(messages, CompactionPhase::Preflight)?;
+        // A large/resumed conversation compacts on ENTRY (iteration 1),
+        // where maybe_run_turn_compaction returns None — surface the
+        // preflight summary too so that conversation is still saved
+        // (codex #1618 P2).
+        Ok(outcome.summary)
     }
 
     /// M8.5 tier 1: cheap per-turn micro-compaction.  Runs the

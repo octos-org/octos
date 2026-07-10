@@ -833,7 +833,7 @@ impl Agent {
                     let default_cwd = std::path::PathBuf::from(".");
                     let cwd = self.tools.workspace_root().unwrap_or(default_cwd.as_path());
                     if let Some(recall) =
-                        self.recall_relevant_episodes(user_content, cwd).await
+                        self.recall_relevant_episodes(user_content, cwd, true).await
                     {
                         messages.push(recall);
                     }
@@ -976,7 +976,14 @@ impl Agent {
                     // LLM call when a compaction policy is wired and the
                     // context already exceeds the declared threshold.
                     if iteration == 1 {
-                        self.maybe_run_preflight_compaction(&mut messages)?;
+                        if let Some(summary) =
+                            self.maybe_run_preflight_compaction(&mut messages)?
+                        {
+                            // #1587 write side: a conversation large enough to
+                            // compact on entry is worth recalling later. Upserts
+                            // the per-session episode (see save_conversation_episode).
+                            self.save_conversation_episode(summary).await;
+                        }
                     }
                     // Harness M8.5 tier 1: cheap in-place stale/oversized
                     // tool-result pruning. Runs every iteration (including
