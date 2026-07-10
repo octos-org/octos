@@ -168,7 +168,11 @@ impl AnchoredDir {
     /// Count `*.md` direct children, saturating at `cap`. Same
     /// no-follow anchoring as every other panel read — used for the
     /// staging-note count so it can never follow a symlinked staging
-    /// tree into another profile (codex #1611 r8 P1).
+    /// tree into another profile (codex #1611 r8 P1). Contract:
+    /// `< cap` is an exact count; `== cap` means "at least cap" —
+    /// including when the RAW scan budget exhausts first, which
+    /// saturates instead of returning a partial tally that would read
+    /// as exact (codex #1611 r10 P2).
     fn count_md_entries(&self, cap: usize) -> usize {
         imp::count_md_entries(&self.0, cap)
     }
@@ -302,10 +306,14 @@ mod imp {
         let mut count = 0;
         let mut raw_seen = 0usize;
         while let Some(Ok(entry)) = entries.next() {
-            // Same raw budget as list_md_stems (codex #1611 r9 P1).
+            // Same raw budget as list_md_stems (codex #1611 r9 P1) —
+            // but exhausting it SATURATES the count instead of
+            // returning a partial tally: a partial count would read as
+            // exact and understate pending notes (codex #1611 r10 P2).
+            // The contract stays "< cap ⇒ exact, == cap ⇒ at least".
             raw_seen += 1;
             if raw_seen > super::MAX_DIR_SCAN_ENTRIES {
-                break;
+                return cap;
             }
             let Ok(name) = entry.file_name().to_str() else {
                 continue;
@@ -407,10 +415,12 @@ mod imp {
         let mut count = 0;
         let mut raw_seen = 0usize;
         for entry in entries.flatten() {
-            // Same raw budget as list_md_stems (codex #1611 r9 P1).
+            // Same raw budget as list_md_stems (codex #1611 r9 P1);
+            // exhaustion SATURATES rather than undercounts (codex
+            // #1611 r10 P2) — see the Unix arm.
             raw_seen += 1;
             if raw_seen > super::MAX_DIR_SCAN_ENTRIES {
-                break;
+                return cap;
             }
             let is_md = entry
                 .file_name()
@@ -1042,9 +1052,11 @@ mod tests {
             resp.0.entities.len() <= MAX_PANEL_ENTITIES,
             "matching cap still holds under junk flooding"
         );
-        assert!(
-            resp.0.staging_notes <= MAX_STAGING_NOTE_COUNT,
-            "staging saturation still holds under junk flooding"
+        assert_eq!(
+            resp.0.staging_notes, MAX_STAGING_NOTE_COUNT,
+            "raw-budget exhaustion must SATURATE the staging count — a \
+             partial tally would read as exact and understate pending \
+             notes (codex #1611 r10 P2)"
         );
     }
 
