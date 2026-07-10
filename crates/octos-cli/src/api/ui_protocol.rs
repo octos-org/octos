@@ -4420,7 +4420,11 @@ async fn ui_protocol_connection(
                     &state,
                     &ledger,
                     connection_profile_id,
-                    routed_profile_id,
+                    // gap #2: fall back to the session-open profile when the
+                    // connection supplied no routing profile (admin / unscoped)
+                    // so the aside reads and bills the SAME profile the open
+                    // resolved to.
+                    routed_profile_id.or(session_open_profile_id.as_deref()),
                     id,
                     params,
                 )
@@ -13114,19 +13118,20 @@ async fn handle_turn_state_get(
     );
 }
 
-/// In-flight `session/btw` asides, keyed by session — one at a time per
-/// session so a client cannot stack concurrent aside LLM calls (each is a
-/// paid provider request). `std::sync::Mutex` on purpose: the critical
+/// In-flight `session/btw` asides, keyed by (profile, session) — session
+/// runtimes are isolated per profile and bare session ids can repeat across
+/// profiles, so a bare-session key would let one profile's aside starve
+/// another's. One at a time per key: each aside is a paid provider request. `std::sync::Mutex` on purpose: the critical
 /// sections never await, and the release must run in a `Drop` guard (which
 /// cannot lock a tokio mutex).
-fn btw_in_flight_sessions() -> &'static StdMutex<HashSet<SessionKey>> {
-    static BTW_IN_FLIGHT: OnceLock<StdMutex<HashSet<SessionKey>>> = OnceLock::new();
+fn btw_in_flight_sessions() -> &'static StdMutex<HashSet<(String, SessionKey)>> {
+    static BTW_IN_FLIGHT: OnceLock<StdMutex<HashSet<(String, SessionKey)>>> = OnceLock::new();
     BTW_IN_FLIGHT.get_or_init(|| StdMutex::new(HashSet::new()))
 }
 
-/// Releases the per-session `session/btw` slot on every exit path (including
-/// panics/cancellation) so an error can never wedge the session's aside.
-struct BtwInFlightGuard(SessionKey);
+/// Releases the per-(profile, session) `session/btw` slot on every exit path
+/// (including panics/cancellation) so an error can never wedge the aside.
+struct BtwInFlightGuard((String, SessionKey));
 
 impl Drop for BtwInFlightGuard {
     fn drop(&mut self) {
@@ -13134,6 +13139,14 @@ impl Drop for BtwInFlightGuard {
             in_flight.remove(&self.0);
         }
     }
+}
+
+/// Serializes tests that use the global provider slot — two slot users
+/// running in parallel would clear each other's stub mid-flight.
+#[cfg(test)]
+fn btw_test_slot_serial() -> &'static tokio::sync::Mutex<()> {
+    static SERIAL: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+    SERIAL.get_or_init(|| tokio::sync::Mutex::new(()))
 }
 
 /// Test-only provider override so handler tests can exercise the full
@@ -13266,6 +13279,11 @@ fn btw_activity_line(notification: &UiNotification) -> Option<String> {
 /// tools, capped output, hard timeout. The exchange is ephemeral — nothing
 /// is appended to the session history and no notification is emitted, so
 /// the live turn never sees it; the answer rides only on this RPC result.
+///
+/// The provider call runs DETACHED (codex round-1 P1): this fn returns as
+/// soon as the aside is validated and snapshotted, so the connection's read
+/// loop keeps serving interrupts/approvals — and the busy gate actually
+/// gates — while the answer (up to 30s) is produced.
 async fn handle_session_btw(
     ws: &WsConnection,
     state: &Arc<AppState>,
@@ -13275,7 +13293,12 @@ async fn handle_session_btw(
     id: String,
     params: SessionBtwParams,
 ) {
-    if let Err(error) = validate_session_scope(&params.session_id, None, connection_profile_id) {
+    // Fold the topic into the canonical session key FIRST (codex round-1 P1):
+    // the ingress gate scopes `session#topic`, so every lookup/guard below
+    // must use the same folded key or a topic-scoped credential could read a
+    // differently-scoped session's transcript.
+    let session_id = session_key_with_optional_topic(&params.session_id, params.topic.as_deref());
+    if let Err(error) = validate_session_scope(&session_id, None, connection_profile_id) {
         send_scope_error(ws, id, error);
         return;
     }
@@ -13289,6 +13312,17 @@ async fn handle_session_btw(
         return;
     }
 
+    // ONE profile resolution shared by transcript AND provider, with
+    // `resolve_sessions_for_lookup`'s exact precedence (session key →
+    // connection → routed; the ws arm threads its session-open fallback in
+    // through `routed_profile_id`) — a divergent pair would read one
+    // profile's transcript and bill another profile's provider.
+    let active_profile_id = session_id
+        .profile_id()
+        .or(connection_profile_id)
+        .or(routed_profile_id)
+        .map(ToOwned::to_owned);
+
     // Transcript tail from the same store turn persistence writes to
     // (#919.1 routing) — clone under the lock, drop it before the LLM call.
     let transcript_tail = {
@@ -13296,27 +13330,27 @@ async fn handle_session_btw(
             state,
             connection_profile_id,
             routed_profile_id,
-            &params.session_id,
+            &session_id,
         )
         .await
         else {
             let _ = send_rpc_error(
                 ws,
                 Some(id),
-                RpcError::unknown_session(params.session_id.0.clone()),
+                RpcError::unknown_session(session_id.0.clone()),
             );
             return;
         };
         let mut sessions_guard = sessions.lock().await;
-        if !sessions_guard.session_known(&params.session_id) {
+        if !sessions_guard.session_known(&session_id) {
             let _ = send_rpc_error(
                 ws,
                 Some(id),
-                RpcError::unknown_session(params.session_id.0.clone()),
+                RpcError::unknown_session(session_id.0.clone()),
             );
             return;
         }
-        let session = sessions_guard.get_or_create(&params.session_id).await;
+        let session = sessions_guard.get_or_create(&session_id).await;
         session
             .messages
             .iter()
@@ -13327,8 +13361,12 @@ async fn handle_session_btw(
             .collect::<Vec<_>>()
     };
 
-    // One aside per session at a time — a second `/btw` while the first is
-    // still answering is rejected, not queued.
+    // One aside per (profile, session) at a time — a second `/btw` while the
+    // first is still answering is rejected, not queued.
+    let busy_key = (
+        active_profile_id.clone().unwrap_or_default(),
+        session_id.clone(),
+    );
     {
         let Ok(mut in_flight) = btw_in_flight_sessions().lock() else {
             let _ = send_rpc_error(
@@ -13338,7 +13376,7 @@ async fn handle_session_btw(
             );
             return;
         };
-        if !in_flight.insert(params.session_id.clone()) {
+        if !in_flight.insert(busy_key.clone()) {
             let _ = send_rpc_error(
                 ws,
                 Some(id),
@@ -13348,116 +13386,183 @@ async fn handle_session_btw(
             return;
         }
     }
-    let _in_flight_guard = BtwInFlightGuard(params.session_id.clone());
+    let in_flight_guard = BtwInFlightGuard(busy_key);
 
-    // Live-activity digest from the ledger replay window's tail.
-    let activity_lines = ledger
-        .snapshot_with_cursor(&params.session_id, None)
-        .map(|(replayed, _)| {
-            replayed
-                .iter()
-                .filter_map(|event| match &event.event {
-                    UiProtocolLedgerEvent::Notification(notification) => {
-                        btw_activity_line(notification)
+    // Everything past validation runs detached — the read loop must not wait
+    // out a 30s provider call.
+    let ws = ws.clone();
+    let state = state.clone();
+    let ledger = ledger.clone();
+    tokio::spawn(async move {
+        let _in_flight_guard = in_flight_guard;
+
+        // Live-activity digest from the ledger replay window's tail.
+        let activity_lines = ledger
+            .snapshot_with_cursor(&session_id, None)
+            .map(|(replayed, _)| {
+                replayed
+                    .iter()
+                    .filter_map(|event| match &event.event {
+                        UiProtocolLedgerEvent::Notification(notification) => {
+                            btw_activity_line(notification)
+                        }
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let activity_tail = activity_lines
+            .iter()
+            .rev()
+            .take(BTW_ACTIVITY_TAIL_EVENTS)
+            .rev()
+            .cloned()
+            .collect::<Vec<_>>();
+
+        // The profile's shared provider chain — same profile the transcript
+        // came from. `profile_runtime` also carries the data dir for the
+        // usage ledger; the test override provides a bare provider only.
+        let (llm, profile_runtime): (
+            Arc<dyn octos_llm::LlmProvider>,
+            Option<Arc<crate::runtime::ProfileRuntime>>,
+        ) = match btw_test_provider() {
+            Some(llm) => (llm, None),
+            None => {
+                match ensure_session_profile_runtime(&state, active_profile_id.as_deref()).await {
+                    Ok(Some(runtime)) => (runtime.llm.clone(), Some(runtime)),
+                    Ok(None) => {
+                        let _ = send_rpc_error(
+                            &ws,
+                            Some(id),
+                            RpcError::runtime_not_ready(
+                                "no LLM provider available for this session",
+                            ),
+                        );
+                        return;
                     }
-                    _ => None,
-                })
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-    let activity_tail = activity_lines
-        .iter()
-        .rev()
-        .take(BTW_ACTIVITY_TAIL_EVENTS)
-        .rev()
-        .cloned()
-        .collect::<Vec<_>>();
+                    Err(error) => {
+                        let _ = send_rpc_error(&ws, Some(id), error);
+                        return;
+                    }
+                }
+            }
+        };
 
-    // The profile's shared provider chain — same one the live turn uses.
-    let profile_id = params
-        .session_id
-        .profile_id()
-        .or(routed_profile_id)
-        .or(connection_profile_id)
-        .map(ToOwned::to_owned);
-    let llm = match btw_test_provider() {
-        Some(llm) => Ok(Some(llm)),
-        None => ensure_session_profile_runtime(state, profile_id.as_deref())
-            .await
-            .map(|runtime| runtime.map(|runtime| runtime.llm.clone())),
-    };
-    let llm = match llm {
-        Ok(Some(llm)) => llm,
-        Ok(None) => {
-            let _ = send_rpc_error(
-                ws,
-                Some(id),
-                RpcError::runtime_not_ready("no LLM provider available for this session"),
-            );
-            return;
-        }
-        Err(error) => {
-            let _ = send_rpc_error(ws, Some(id), error);
-            return;
-        }
-    };
+        let messages = build_btw_messages(&transcript_tail, &activity_tail, &question);
+        let config = octos_llm::ChatConfig {
+            max_tokens: Some(BTW_ANSWER_MAX_TOKENS),
+            temperature: Some(0.2),
+            tool_choice: octos_llm::ToolChoice::None,
+            ..Default::default()
+        };
+        // `&[]` tool specs IS the "no tools" restriction — the model cannot
+        // call what it is never offered.
+        let response = match tokio::time::timeout(
+            std::time::Duration::from_secs(BTW_TIMEOUT_SECS),
+            llm.chat(&messages, &[], &config),
+        )
+        .await
+        {
+            Ok(Ok(response)) => response,
+            Ok(Err(error)) => {
+                let _ = send_rpc_error(
+                    &ws,
+                    Some(id),
+                    RpcError::internal_error(format!("btw aside failed: {error}")),
+                );
+                return;
+            }
+            Err(_elapsed) => {
+                let _ = send_rpc_error(
+                    &ws,
+                    Some(id),
+                    RpcError::internal_error(format!(
+                        "btw aside timed out after {BTW_TIMEOUT_SECS}s"
+                    )),
+                );
+                return;
+            }
+        };
 
-    let messages = build_btw_messages(&transcript_tail, &activity_tail, &question);
-    let config = octos_llm::ChatConfig {
-        max_tokens: Some(BTW_ANSWER_MAX_TOKENS),
-        temperature: Some(0.2),
-        tool_choice: octos_llm::ToolChoice::None,
-        ..Default::default()
-    };
-    // `&[]` tool specs IS the "no tools" restriction — the model cannot call
-    // what it is never offered.
-    let answer = match tokio::time::timeout(
-        std::time::Duration::from_secs(BTW_TIMEOUT_SECS),
-        llm.chat(&messages, &[], &config),
-    )
-    .await
-    {
-        Ok(Ok(response)) => response
+        // The answering SLOT's metadata (codex round-1 P2): `llm` is a
+        // retry/failover chain, so re-asking `model_id()` after the fact can
+        // name the primary lane rather than the fallback that answered.
+        let metadata = llm.provider_metadata_for_index(response.provider_index);
+
+        // Paid aside → usage ledger (codex round-1 P2), same shape as AppUI
+        // turns but on an aside-specific channel so analytics can split them.
+        if let Some(runtime) = profile_runtime.as_ref() {
+            match PersistentUsageLedger::open(&runtime.data_dir).await {
+                Ok(usage_ledger) => {
+                    let model = (!metadata.model.is_empty()).then(|| metadata.model.clone());
+                    let estimated_cost_usd =
+                        model.as_deref().and_then(model_pricing).map(|pricing| {
+                            pricing.cost(response.usage.input_tokens, response.usage.output_tokens)
+                        });
+                    let cost_source = if estimated_cost_usd.is_some() {
+                        UsageCostSource::CatalogEstimate
+                    } else {
+                        UsageCostSource::Unavailable
+                    };
+                    let event = UsageEvent::completed_run(
+                        active_profile_id
+                            .clone()
+                            .unwrap_or_else(|| MAIN_PROFILE_ID.to_owned()),
+                        session_id.0.clone(),
+                        format!("btw-{id}"),
+                        (!metadata.provider.is_empty()).then(|| metadata.provider.clone()),
+                        model,
+                        metadata.endpoint.clone(),
+                        u64::from(response.usage.input_tokens),
+                        u64::from(response.usage.output_tokens),
+                        estimated_cost_usd,
+                        cost_source,
+                        "appui_btw",
+                        None,
+                    );
+                    if let Err(error) = usage_ledger.record(event).await {
+                        warn!(
+                            session = %session_id.0,
+                            error = %error,
+                            "failed to record btw aside usage event"
+                        );
+                    }
+                }
+                Err(error) => {
+                    warn!(
+                        session = %session_id.0,
+                        error = %error,
+                        "usage ledger unavailable; btw aside not recorded"
+                    );
+                }
+            }
+        }
+
+        let answer = response
             .content
             .map(|content| content.trim().to_owned())
-            .filter(|content| !content.is_empty()),
-        Ok(Err(error)) => {
+            .filter(|content| !content.is_empty());
+        let Some(answer) = answer else {
             let _ = send_rpc_error(
-                ws,
+                &ws,
                 Some(id),
-                RpcError::internal_error(format!("btw aside failed: {error}")),
+                RpcError::internal_error("btw aside returned an empty answer"),
             );
             return;
-        }
-        Err(_elapsed) => {
-            let _ = send_rpc_error(
-                ws,
-                Some(id),
-                RpcError::internal_error(format!("btw aside timed out after {BTW_TIMEOUT_SECS}s")),
-            );
-            return;
-        }
-    };
-    let Some(answer) = answer else {
-        let _ = send_rpc_error(
-            ws,
-            Some(id),
-            RpcError::internal_error("btw aside returned an empty answer"),
-        );
-        return;
-    };
+        };
 
-    let result = octos_core::ui_protocol::SessionBtwResult {
-        session_id: params.session_id,
-        answer,
-        model: Some(llm.model_id().to_string()),
-    };
-    send_serialized_rpc_result(
-        ws,
-        id,
-        octos_core::ui_protocol::methods::SESSION_BTW,
-        result,
-    );
+        let result = octos_core::ui_protocol::SessionBtwResult {
+            session_id,
+            answer,
+            model: Some(metadata.model.clone()),
+        };
+        send_serialized_rpc_result(
+            &ws,
+            id,
+            octos_core::ui_protocol::methods::SESSION_BTW,
+            result,
+        );
+    });
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -33497,7 +33602,7 @@ ignore = []
         btw_in_flight_sessions()
             .lock()
             .expect("in-flight registry")
-            .insert(session_id.clone());
+            .insert((String::new(), session_id.clone()));
 
         handle_session_btw(
             &ws,
@@ -33517,7 +33622,7 @@ ignore = []
         btw_in_flight_sessions()
             .lock()
             .expect("in-flight registry")
-            .remove(&session_id);
+            .remove(&(String::new(), session_id.clone()));
 
         let frame = recv_rpc_json(&mut rx).await;
         assert_eq!(frame["id"], "b3");
@@ -33571,6 +33676,7 @@ ignore = []
         let ledger = event_ledger(&state).await;
         let (ws, mut rx) = ws_connection_for_test(4);
 
+        let _serial = btw_test_slot_serial().lock().await;
         *btw_test_provider_slot().lock().expect("slot") = Some(Arc::new(BtwStubProvider));
         handle_session_btw(
             &ws,
@@ -33586,9 +33692,11 @@ ignore = []
             },
         )
         .await;
-        *btw_test_provider_slot().lock().expect("slot") = None;
 
+        // The aside runs detached — only clear the provider slot once the
+        // result frame proves the spawned task has consumed it.
         let frame = recv_rpc_json(&mut rx).await;
+        *btw_test_provider_slot().lock().expect("slot") = None;
         assert_eq!(frame["id"], "b4", "got {frame}");
         assert_eq!(
             frame["result"]["answer"],
@@ -33596,12 +33704,87 @@ ignore = []
         );
         assert_eq!(frame["result"]["model"], "btw-stub-model");
         assert_eq!(frame["result"]["session_id"], session_id.to_string());
+        // The aside runs detached; give its guard drop a beat before asserting.
+        let busy_key = (String::new(), session_id.clone());
+        for _ in 0..100 {
+            if !btw_in_flight_sessions()
+                .lock()
+                .expect("in-flight registry")
+                .contains(&busy_key)
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
         assert!(
             !btw_in_flight_sessions()
                 .lock()
                 .expect("in-flight registry")
-                .contains(&session_id),
+                .contains(&busy_key),
             "the in-flight slot must be released after the answer"
+        );
+    }
+
+    /// The ingress gate scopes `session#topic`; the handler must fold the
+    /// topic into the canonical key before ANY lookup — a topic-scoped aside
+    /// answers from the topic-scoped session, never the bare one.
+    #[tokio::test]
+    async fn session_btw_folds_topic_into_the_session_key() {
+        struct TopicStubProvider;
+        #[async_trait::async_trait]
+        impl octos_llm::LlmProvider for TopicStubProvider {
+            async fn chat(
+                &self,
+                _messages: &[octos_core::Message],
+                _tools: &[octos_llm::ToolSpec],
+                _config: &octos_llm::ChatConfig,
+            ) -> eyre::Result<octos_llm::ChatResponse> {
+                Ok(octos_llm::ChatResponse {
+                    content: Some("scoped answer".into()),
+                    reasoning_content: None,
+                    tool_calls: vec![],
+                    stop_reason: octos_llm::StopReason::EndTurn,
+                    usage: octos_llm::TokenUsage::default(),
+                    provider_index: None,
+                })
+            }
+            fn model_id(&self) -> &str {
+                "topic-stub"
+            }
+            fn provider_name(&self) -> &str {
+                "stub"
+            }
+        }
+
+        let folded = SessionKey("local:btw-topic#coding".into());
+        let state = prg_state_with_session(&folded, prg_seed_user_assistant);
+        let ledger = event_ledger(&state).await;
+        let (ws, mut rx) = ws_connection_for_test(4);
+
+        let _serial = btw_test_slot_serial().lock().await;
+        *btw_test_provider_slot().lock().expect("slot") = Some(Arc::new(TopicStubProvider));
+        handle_session_btw(
+            &ws,
+            &state,
+            &ledger,
+            None,
+            None,
+            "b5".into(),
+            SessionBtwParams {
+                session_id: SessionKey("local:btw-topic".into()),
+                topic: Some("coding".into()),
+                question: "which scope answered?".into(),
+            },
+        )
+        .await;
+        let frame = recv_rpc_json(&mut rx).await;
+        *btw_test_provider_slot().lock().expect("slot") = None;
+        assert_eq!(frame["id"], "b5", "got {frame}");
+        assert!(frame["error"].is_null(), "got {frame}");
+        assert_eq!(
+            frame["result"]["session_id"],
+            folded.to_string(),
+            "the result must carry the topic-folded session key"
         );
     }
 
