@@ -16,6 +16,7 @@ use super::admin_audit;
 use super::admin_setup;
 use super::auth_handlers;
 use super::bilibili;
+use super::cron_panel;
 use super::events_harness;
 use super::frps_plugin;
 use super::handlers;
@@ -217,6 +218,13 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/my/voice", put(auth_handlers::set_my_voice))
         // Per-tenant voice-assistant pre-flight: ASR + LLM + (route-aware) TTS.
         .route("/api/voice/readiness", get(auth_handlers::voice_readiness))
+        // Cron panel (web parity P3): user-scoped schedule list + the
+        // enable toggle (409 while the profile gateway owns cron.json).
+        .route("/api/my/cron", get(cron_panel::my_cron))
+        .route(
+            "/api/my/cron/{job_id}/enabled",
+            put(cron_panel::set_my_cron_enabled),
+        )
         .route("/api/my/soul", get(auth_handlers::my_soul))
         .route("/api/my/soul", put(auth_handlers::update_my_soul))
         .route("/api/my/soul", delete(auth_handlers::delete_my_soul))
