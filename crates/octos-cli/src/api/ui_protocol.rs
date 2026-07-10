@@ -15226,11 +15226,12 @@ async fn handle_content_bulk_delete(
 /// escaping table, so plain markdown keeps ~the full budget while
 /// pathological content is cut exactly where its wire cost hits it.
 /// Worst-case wire size is therefore the PLAIN SUM of the budgets:
-///   96 (long_term) + 48 (today) + 7×24 (recent) + ~294 (entities —
+///   96 (long_term) + 48 (today) + 7×24 (recent) + ~543 (entities —
 ///   bounded upstream at ≤ MAX_PANEL_ENTITIES=256 rows: summaries
 ///   ≤ 100 raw bytes (`octos_memory::extract_abstract`) → ≤ 600
-///   escaped, names ≤ 255 raw → ≤ 510 escaped, + per-row JSON
-///   overhead) ≈ 606 KiB, well under the frame cap.
+///   escaped, names ≤ 255 raw → ≤ 1530 escaped (Unix filenames may
+///   carry C0 controls at 6 wire bytes each), + per-row JSON
+///   overhead) ≈ 855 KiB, under the frame cap with ~169 KiB margin.
 /// Truncation is EXPLICIT: `<field>_truncated` + `<field>_total_bytes`
 /// ride beside every capped field; the content itself is a clean UTF-8
 /// prefix with NO in-band marker.
@@ -28993,9 +28994,11 @@ ignore = []
     #[test]
     fn memory_rpc_budgets_fit_one_ws_frame_at_escape_worst_case() {
         // Entities bound (escaped): MAX_PANEL_ENTITIES × (100-raw-byte
-        // summary → ≤ 600 escaped + 255-raw-byte name → ≤ 510 escaped +
-        // ~40 bytes JSON overhead).
-        let entities_bound = 256 * (600 + 510 + 40);
+        // summary → ≤ 600 escaped + 255-raw-byte name → ≤ 1530 escaped
+        // (codex r3 P3: Unix filenames may carry non-short C0 controls,
+        // which serialize at 6 bytes per char — not just the 2-byte
+        // quote/backslash class) + ~40 bytes JSON overhead).
+        let entities_bound = 256 * (600 + 255 * 6 + 40);
         let overview_escaped = MEMORY_RPC_LONG_TERM_BUDGET
             + MEMORY_RPC_TODAY_BUDGET
             + 7 * MEMORY_RPC_RECENT_NOTE_BUDGET
