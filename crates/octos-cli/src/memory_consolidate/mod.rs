@@ -460,6 +460,35 @@ pub async fn run_consolidation(
     // (Also the stop line when the caller disallowed the merge: every
     // no-provider phase — INIT persist, expiry, satisfied consumption,
     // recovery re-hide — has already run by this point.)
+    // Prune orphaned usage BEFORE any early return so it runs on every
+    // invocation, including quiet ones (codex #1614 round-2 P2): an entry
+    // archived by a PRIOR run is absent from the freshly-loaded `entries`
+    // here and gets dropped now regardless of whether this run does work.
+    // The live set is CONSERVATIVE — entries (post-INIT/expiry, so restored
+    // candidates are already back in), bank slugs, and every pending-note
+    // candidate id — so nothing that is or could be restored is dropped. A
+    // bank-listing error skips pruning entirely rather than risk dropping
+    // live bank usage.
+    {
+        let usage_store = octos_memory::MemoryStore::at_memory_dir(memory_dir);
+        match usage_store.list_entities().await {
+            Ok(bank) => {
+                let mut live: std::collections::HashSet<String> =
+                    entries.iter().map(|e| e.id.clone()).collect();
+                live.extend(bank.into_iter().map(|(slug, _)| slug));
+                for note in &waiting {
+                    for cand in note.candidates.as_deref().unwrap_or_default() {
+                        live.insert(cand.entry_id.clone());
+                    }
+                }
+                usage_store.prune_usage(&live).await;
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "skipping usage prune: bank listing failed");
+            }
+        }
+    }
+
     let has_batch =
         params.allow_merge && (!batch.notes.is_empty() || !batch.extractions.is_empty());
     if !has_batch {
@@ -668,18 +697,12 @@ pub async fn run_consolidation(
 
     // Usage feedback (#1586): recently-used entries are kept alive against
     // age-based auto-archive. Advisory — a missing/corrupt sidecar reads as
-    // empty and consolidation proceeds exactly as before. First PRUNE the
-    // sidecar to live ids (current entries + bank slugs) so it can't grow
-    // unbounded as entries are archived/deleted (codex #1614 P2); entries
-    // archived in THIS run are pruned next cycle (bounded steady state).
-    let usage_store = octos_memory::MemoryStore::at_memory_dir(memory_dir);
-    let mut live: std::collections::HashSet<String> =
-        entries.iter().map(|e| e.id.clone()).collect();
-    if let Ok(bank) = usage_store.list_entities().await {
-        live.extend(bank.into_iter().map(|(slug, _)| slug));
-    }
-    usage_store.prune_usage(&live).await;
-    let usage = usage_store.load_usage().await;
+    // empty and consolidation proceeds exactly as before. (Pruning runs
+    // near the top, before the quiet-run early return, so it happens on
+    // EVERY invocation.)
+    let usage = octos_memory::MemoryStore::at_memory_dir(memory_dir)
+        .load_usage()
+        .await;
 
     let ctx = ValidationCtx {
         entries: &entries,
@@ -1767,6 +1790,31 @@ mod tests {
     }
 
     // --- tests ---------------------------------------------------------------
+
+    #[tokio::test]
+    async fn should_prune_orphaned_usage_even_on_a_quiet_run() {
+        // #1614 round-2 P2: pruning runs before the quiet-run early return,
+        // so an id with no live entry/bank/pending backing is dropped even
+        // when the run does no merge work.
+        let dir = tempfile::tempdir().unwrap();
+        write_memory(dir.path(), &["Fact. (updated: 2026-06-01) ^maaaaaa"]);
+        let store = octos_memory::MemoryStore::at_memory_dir(dir.path());
+        let today = NaiveDate::parse_from_str(TODAY, "%Y-%m-%d").unwrap();
+        store
+            .record_memory_use(["^maaaaaa", "^mzzzzzz"], today)
+            .await;
+
+        let provider = ScriptedProvider::new(&[]);
+        let outcome = run(&provider, &params(dir.path())).await;
+        assert!(outcome.skipped_clean, "this is a quiet run");
+
+        let usage = store.load_usage().await;
+        assert!(usage.entries.contains_key("^maaaaaa"), "live id kept");
+        assert!(
+            !usage.entries.contains_key("^mzzzzzz"),
+            "orphan pruned despite the quiet run"
+        );
+    }
 
     #[tokio::test]
     async fn should_skip_with_zero_provider_calls_when_clean() {

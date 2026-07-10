@@ -195,6 +195,11 @@ impl MemoryStore {
     /// directory itself, not its parent). For callers like consolidation
     /// that hold the memory_dir directly and want the usage sidecar helpers
     /// without re-deriving the path.
+    ///
+    /// Does NOT itself enforce profile containment — like [`Self::open`] it
+    /// trusts the caller's path. Pass only an internally-derived memory dir,
+    /// never a request-derived one (#1614 P3).
+    #[doc(hidden)]
     pub fn at_memory_dir(memory_dir: impl Into<PathBuf>) -> Self {
         Self {
             memory_dir: memory_dir.into(),
