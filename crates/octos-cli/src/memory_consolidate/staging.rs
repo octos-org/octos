@@ -174,7 +174,10 @@ pub struct ExtractionItem {
 /// A parsed extraction file (`memory/staging/extract/`).
 #[derive(Debug, Clone)]
 pub struct ExtractionFile {
-    /// File id = filename stem.
+    /// File id = filename stem, normalized to its uuid prefix — legacy
+    /// stems carry a sanitized SESSION KEY (untrusted channel metadata)
+    /// after the first `-`, and item ids derived from this render in the
+    /// merge prompt. Deletion uses `path`, never this id.
     pub id: String,
     pub path: PathBuf,
     pub session_key: Option<String>,
@@ -356,7 +359,16 @@ struct RawExtractItem {
 
 /// Parse one extraction file.
 pub fn parse_extraction(path: &Path, content: &str) -> Result<ExtractionFile> {
+    // Item ids derive from the stem and are rendered into the merge
+    // prompt. New artifacts are opaque UUIDs, but PENDING pre-upgrade
+    // artifacts still carry a sanitized session key after the first `-`
+    // (email sender/topic — untrusted). Normalize to the uuid prefix
+    // (codex round-4 P2).
     let id = file_stem(path)?;
+    let id = match id.split_once('-') {
+        Some((uuid, _legacy_slug)) => uuid.to_string(),
+        None => id,
+    };
     let (fm_lines, body_raw) = split_frontmatter(content)?;
 
     let mut session_key = None;
@@ -626,14 +638,17 @@ mod tests {
     fn should_parse_extraction_when_fixed_format_given() {
         let path = PathBuf::from("/staging/extract/0198b-session.md");
         let extract = parse_extraction(&path, EXTRACT).unwrap();
-        assert_eq!(extract.id, "0198b-session");
+        // Legacy stems ("uuid-sessionslug") normalize to the uuid prefix:
+        // the slug is untrusted channel metadata and item ids render in
+        // the merge prompt (codex round-4 P2).
+        assert_eq!(extract.id, "0198b");
         assert_eq!(extract.model, "gpt-x");
         assert_eq!(extract.session_key.as_deref(), Some("web:9"));
         assert_eq!(extract.items.len(), 2);
-        assert_eq!(extract.items[0].id, "0198b-session#0");
+        assert_eq!(extract.items[0].id, "0198b#0");
         assert_eq!(extract.items[0].evidence_kind, EvidenceKind::UserSaid);
         assert_eq!(extract.items[0].evidence_idx, [3, 7]);
-        assert_eq!(extract.items[1].id, "0198b-session#1");
+        assert_eq!(extract.items[1].id, "0198b#1");
         assert_eq!(
             extract.items[1].evidence_kind,
             EvidenceKind::AssistantClaimed

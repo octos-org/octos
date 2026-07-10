@@ -4498,6 +4498,7 @@ dependencies = [
  "hnsw_rs",
  "octos-core",
  "redb",
+ "regex",
  "serde",
  "serde_json",
  "tempfile",
