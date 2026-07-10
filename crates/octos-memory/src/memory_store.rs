@@ -939,7 +939,12 @@ fn bank_summary_row(name: &str, abstract_line: &str) -> String {
     format!("- **{name}**: {abstract_line}\n")
 }
 
-fn extract_abstract(content: &str) -> String {
+/// First abstract line of an entity page: frontmatter stripped, first
+/// non-empty non-heading line, 100-char truncated. `pub` because the
+/// serve-side memory panel (`/api/my/memory`) must render EXACTLY the
+/// summary string `list_entities` feeds the agent prompt — a second
+/// parser drifted (codex octos#1611 round-2 P2).
+pub fn extract_abstract(content: &str) -> String {
     let body = strip_frontmatter(content);
     let first_line = body
         .lines()

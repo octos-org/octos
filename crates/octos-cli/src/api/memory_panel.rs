@@ -9,9 +9,25 @@
 //! scoping mirror `/api/my/soul`: `resolve_my_profile_id` (admin token
 //! → admin profile, user session → own profile, host-scope enforced),
 //! then everything is read from that profile's own data dir.
+//!
+//! Symlink posture (codex #1611 rounds 1–2): a tenant controls the
+//! CONTENT of its memory directory (agent shell in a workspace-cwd
+//! session), so any component under the data dir — `memory/`, the bank
+//! dir, a page — can be (or be swapped for) a symlink at another
+//! profile's data. The store's own readers follow symlinks (fine
+//! agent-side, where the sandbox owns policy); this daemon-privileged
+//! HTTP path must not. Canonicalize-then-open is NOT enough: the check
+//! and the open are separate syscalls, and a directory swapped in
+//! between hands us the victim's tree (round-2 P1). On Unix every read
+//! therefore walks component-by-component with `openat(O_NOFOLLOW)`
+//! anchored to the parent FD — the same structure as
+//! `preview.rs::open_no_follow_walk` (issue #996) — so a mid-walk swap
+//! cannot redirect resolution. Symlinked anything renders as the empty
+//! state / 404.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::SystemTime;
 
 use axum::Json;
 use axum::extract::{Path as AxumPath, State};
@@ -33,9 +49,9 @@ pub struct DailyNote {
 #[derive(Debug, Serialize)]
 pub struct EntitySummary {
     pub name: String,
-    /// First abstract/summary line of the page (the store's own
-    /// `extract_abstract` — same string `list_entities` feeds the
-    /// agent prompt).
+    /// First abstract/summary line of the page — the store's OWN
+    /// `extract_abstract`, so the panel shows byte-identical strings to
+    /// what `list_entities` feeds the agent prompt.
     pub summary: String,
 }
 
@@ -44,7 +60,9 @@ pub struct MemoryOverviewResponse {
     pub ok: bool,
     /// Full `MEMORY.md` content ("" when absent).
     pub long_term: String,
-    /// RFC 3339 mtime of `MEMORY.md`, when it exists.
+    /// RFC 3339 mtime of `MEMORY.md`, whenever the file exists — an
+    /// EMPTY long-term memory (e.g. after consolidation hard-deletes
+    /// the last entry) still reports when it last changed.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub long_term_updated_at: Option<String>,
     /// Today's daily note ("" when absent).
@@ -67,48 +85,180 @@ pub struct MemoryEntityResponse {
     pub content: String,
 }
 
-/// Canonicalize `dir` and require it to stay under the profile's
-/// canonicalized data dir. A tenant controls the CONTENT of its memory
-/// directory (agent shell in a workspace-cwd session), so `memory/`,
-/// the bank dir — or any ancestor a page lives under — could be a
-/// symlink pointing at another profile's data; `read_no_follow` only
-/// rejects a symlinked FINAL component (codex #1611 P1). `None` when
-/// absent or escaping.
-async fn anchored_dir(data_dir: &Path, dir: &Path) -> Option<PathBuf> {
-    let canon_root = tokio::fs::canonicalize(data_dir).await.ok()?;
-    let canon = tokio::fs::canonicalize(dir).await.ok()?;
-    canon.starts_with(&canon_root).then_some(canon)
-}
+/// A directory handle every panel read is anchored to.
+///
+/// Unix: an `OwnedFd` opened `O_NOFOLLOW|O_DIRECTORY`; children are
+/// resolved with `openat` relative to it, so no path is ever re-walked
+/// (TOCTOU-free — a rename/swap after the open cannot redirect us).
+///
+/// Non-Unix: falls back to canonicalize-anchored paths with a leaf
+/// `symlink_metadata` check. This keeps the multi-syscall TOCTOU
+/// window `preview.rs` documents for the same fallback — Windows
+/// serve deployments are dev-only today (matching #996's posture).
+struct AnchoredDir(imp::Handle);
 
-/// Symlink-refusing read: `octos_agent::tools::read_no_follow`
-/// (O_NOFOLLOW on Unix — atomic, no TOCTOU on the final component).
-/// Any error (absent, symlink, non-UTF-8) renders as "no content".
-async fn panel_read(path: &std::path::Path) -> Option<String> {
-    octos_agent::tools::read_no_follow(path).await.ok()
-}
-
-/// First non-heading line, truncated — mirrors the (private)
-/// `octos_memory::memory_store::extract_abstract` the agent prompt
-/// uses, so the panel shows the same summary strings.
-fn first_summary_line(content: &str) -> String {
-    let body = content
-        .strip_prefix("---")
-        .and_then(|rest| rest.split_once("\n---").map(|(_, b)| b))
-        .unwrap_or(content);
-    let line = body
-        .lines()
-        .map(str::trim)
-        .find(|l| !l.is_empty() && !l.starts_with('#'))
-        .unwrap_or("");
-    if line.len() > 100 {
-        let mut end = 97;
-        while end > 0 && !line.is_char_boundary(end) {
-            end -= 1;
-        }
-        format!("{}…", &line[..end])
-    } else {
-        line.to_string()
+impl AnchoredDir {
+    /// Open the profile data-dir root. `None` if it cannot be opened
+    /// (or is itself a symlink, on Unix).
+    fn open_root(dir: &Path) -> Option<Self> {
+        imp::open_root(dir).map(Self)
     }
+
+    /// Walk `rel` (Normal components only) strictly beneath this
+    /// handle, refusing symlinks at every component.
+    fn open_beneath(&self, rel: &Path) -> Option<Self> {
+        imp::open_beneath(&self.0, rel).map(Self)
+    }
+
+    /// Read a direct child file (symlink-refusing). Returns the
+    /// content and the file's mtime (fstat on the opened handle).
+    fn read_file(&self, name: &str) -> Option<(String, Option<SystemTime>)> {
+        imp::read_file(&self.0, name)
+    }
+
+    /// Names (stems) of `*.md` direct children.
+    fn list_md_stems(&self) -> Vec<String> {
+        imp::list_md_stems(&self.0)
+    }
+}
+
+#[cfg(unix)]
+mod imp {
+    use std::io::Read;
+    use std::os::fd::OwnedFd;
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::path::Path;
+    use std::time::SystemTime;
+
+    use rustix::fs::{Mode, OFlags, openat};
+
+    pub(super) type Handle = OwnedFd;
+
+    pub(super) fn open_root(dir: &Path) -> Option<OwnedFd> {
+        // O_NOFOLLOW on the root too: the data dir itself is
+        // daemon-resolved (not tenant-writable), but refusing a
+        // symlinked root is free belt-and-braces.
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY)
+            .open(dir)
+            .ok()
+            .map(Into::into)
+    }
+
+    pub(super) fn open_beneath(root: &OwnedFd, rel: &Path) -> Option<OwnedFd> {
+        let mut current: Option<OwnedFd> = None;
+        for comp in rel.components() {
+            let std::path::Component::Normal(name) = comp else {
+                // `.`/`..`/absolute never appear in the store-derived
+                // relative paths we pass; refuse rather than resolve.
+                return None;
+            };
+            let parent = current.as_ref().unwrap_or(root);
+            // Anchored to the parent FD, not the path string — a
+            // mid-walk swap of any on-disk name leaves the resolution
+            // chain intact. NOFOLLOW makes a symlink component ELOOP.
+            let next = openat(
+                parent,
+                name,
+                OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::DIRECTORY | OFlags::CLOEXEC,
+                Mode::empty(),
+            )
+            .ok()?;
+            current = Some(next);
+        }
+        current
+    }
+
+    pub(super) fn read_file(dir: &OwnedFd, name: &str) -> Option<(String, Option<SystemTime>)> {
+        let fd = openat(
+            dir,
+            name,
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .ok()?;
+        let mut file: std::fs::File = fd.into();
+        // fstat on the OPENED handle — no separate stat-by-path race.
+        let mtime = file.metadata().ok().and_then(|m| m.modified().ok());
+        let mut content = String::new();
+        file.read_to_string(&mut content).ok()?;
+        Some((content, mtime))
+    }
+
+    pub(super) fn list_md_stems(dir: &OwnedFd) -> Vec<String> {
+        let Ok(mut entries) = rustix::fs::Dir::read_from(dir) else {
+            return Vec::new();
+        };
+        let mut names = Vec::new();
+        while let Some(Ok(entry)) = entries.next() {
+            let Ok(name) = entry.file_name().to_str() else {
+                continue;
+            };
+            if let Some(stem) = name.strip_suffix(".md")
+                && !stem.is_empty()
+            {
+                names.push(stem.to_string());
+            }
+        }
+        names
+    }
+}
+
+#[cfg(not(unix))]
+mod imp {
+    use std::path::{Path, PathBuf};
+    use std::time::SystemTime;
+
+    /// (canonical root, current dir). The root is carried so every
+    /// descend re-anchors, mirroring the Unix walk's guarantee as
+    /// closely as path-based checks allow.
+    pub(super) type Handle = (PathBuf, PathBuf);
+
+    pub(super) fn open_root(dir: &Path) -> Option<Handle> {
+        let canon = std::fs::canonicalize(dir).ok()?;
+        Some((canon.clone(), canon))
+    }
+
+    pub(super) fn open_beneath(handle: &Handle, rel: &Path) -> Option<Handle> {
+        let (root, dir) = handle;
+        let canon = std::fs::canonicalize(dir.join(rel)).ok()?;
+        canon.starts_with(root).then(|| (root.clone(), canon))
+    }
+
+    pub(super) fn read_file(handle: &Handle, name: &str) -> Option<(String, Option<SystemTime>)> {
+        let path = handle.1.join(name);
+        // Leaf symlink check + read. TOCTOU window documented on
+        // `AnchoredDir` — dev-only platforms.
+        let meta = std::fs::symlink_metadata(&path).ok()?;
+        if meta.file_type().is_symlink() {
+            return None;
+        }
+        let mtime = meta.modified().ok();
+        std::fs::read_to_string(&path).ok().map(|c| (c, mtime))
+    }
+
+    pub(super) fn list_md_stems(handle: &Handle) -> Vec<String> {
+        let Ok(entries) = std::fs::read_dir(&handle.1) else {
+            return Vec::new();
+        };
+        entries
+            .flatten()
+            .filter_map(|e| {
+                e.file_name()
+                    .to_str()
+                    .and_then(|n| n.strip_suffix(".md"))
+                    .filter(|stem| !stem.is_empty())
+                    .map(str::to_string)
+            })
+            .collect()
+    }
+}
+
+/// Relative path of `child` under `base` — both are store-derived
+/// (constructed by joins, no fs access), so this never touches disk.
+fn rel_under(base: &Path, child: &Path) -> Option<PathBuf> {
+    child.strip_prefix(base).ok().map(Path::to_path_buf)
 }
 
 /// Effective refresh flag for a profile under host policy. Mirrors the
@@ -118,6 +268,10 @@ fn effective_refresh_enabled(state: &AppState, profile: &crate::profiles::UserPr
     let mut memory = profile.config.memory.clone();
     crate::config::merge_host_memory_into_profile(&mut memory, state.host_memory.as_ref());
     crate::config::MemoryConfig::refresh_enabled(memory.as_ref())
+}
+
+fn rfc3339(mtime: SystemTime) -> String {
+    chrono::DateTime::<chrono::Utc>::from(mtime).to_rfc3339()
 }
 
 /// GET /api/my/memory
@@ -141,77 +295,73 @@ pub async fn my_memory(
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    // The store's own readers FOLLOW symlinks (fine agent-side, where
-    // the sandbox owns policy) — this daemon-privileged HTTP path must
-    // not (codex #1611 P1). All reads are anchored + no-follow; a
-    // symlinked memory dir renders as the empty state.
-    let memory_dir = match anchored_dir(
-        &data_dir,
-        store.memory_md_path().parent().unwrap_or(&data_dir),
-    )
-    .await
-    {
-        Some(dir) => dir,
-        None => {
-            return Ok(Json(MemoryOverviewResponse {
-                ok: true,
-                long_term: String::new(),
-                long_term_updated_at: None,
-                today: String::new(),
-                recent: Vec::new(),
-                entities: Vec::new(),
-                staging_notes: 0,
-                refresh_enabled: effective_refresh_enabled(&state, &profile),
-            }));
-        }
+    let empty = |state: &AppState, profile| {
+        Json(MemoryOverviewResponse {
+            ok: true,
+            long_term: String::new(),
+            long_term_updated_at: None,
+            today: String::new(),
+            recent: Vec::new(),
+            entities: Vec::new(),
+            staging_notes: 0,
+            refresh_enabled: effective_refresh_enabled(state, profile),
+        })
     };
 
-    let memory_md = memory_dir.join("MEMORY.md");
-    let long_term = panel_read(&memory_md).await.unwrap_or_default();
-    let long_term_updated_at = if long_term.is_empty() {
-        None
-    } else {
-        tokio::fs::symlink_metadata(&memory_md)
-            .await
-            .ok()
-            .and_then(|meta| meta.modified().ok())
-            .map(|mtime| chrono::DateTime::<chrono::Utc>::from(mtime).to_rfc3339())
+    // FD-anchored walk to the memory dir (see module doc). A missing
+    // or symlinked memory dir renders as the empty state.
+    let memory_dir_path = store
+        .memory_md_path()
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| data_dir.clone());
+    let Some(rel_mem) = rel_under(&data_dir, &memory_dir_path) else {
+        return Ok(empty(&state, &profile));
+    };
+    let Some(root) = AnchoredDir::open_root(&data_dir) else {
+        return Ok(empty(&state, &profile));
+    };
+    let Some(mem) = root.open_beneath(&rel_mem) else {
+        return Ok(empty(&state, &profile));
+    };
+
+    let (long_term, long_term_updated_at) = match mem.read_file("MEMORY.md") {
+        // mtime whenever the file EXISTS — an empty long-term memory
+        // still reports when it last changed (codex #1611 r2 P2).
+        Some((content, mtime)) => (content, mtime.map(rfc3339)),
+        None => (String::new(), None),
     };
     let local_today = chrono::Local::now().date_naive();
-    let today = panel_read(&memory_dir.join(format!("{local_today}.md")))
-        .await
+    let today = mem
+        .read_file(&format!("{local_today}.md"))
+        .map(|(content, _)| content)
         .unwrap_or_default();
     // Last 7 days, newest first — mirrors `MemoryStore::read_recent`.
     let mut recent = Vec::new();
     for i in 1..=7 {
         let date = local_today - chrono::Duration::days(i);
         let date_str = date.format("%Y-%m-%d").to_string();
-        if let Some(content) = panel_read(&memory_dir.join(format!("{date_str}.md"))).await {
+        if let Some((content, _)) = mem.read_file(&format!("{date_str}.md")) {
             recent.push(DailyNote {
                 date: date_str,
                 content,
             });
         }
     }
-    // Entity bank — the bank dir gets its own anchor (it nests under
-    // memory/ and can be a symlink independently).
+    // Entity bank — walked from the memory-dir FD (its components can
+    // be symlinks independently of memory/ itself).
     let mut entities = Vec::new();
-    if let Some(bank_dir) = anchored_dir(&data_dir, &store.bank_entities_dir()).await {
-        if let Ok(mut dir_entries) = tokio::fs::read_dir(&bank_dir).await {
-            while let Ok(Some(entry)) = dir_entries.next_entry().await {
-                let path = entry.path();
-                if path.extension().is_none_or(|ext| ext != "md") {
-                    continue;
-                }
-                let Some(name) = path.file_stem().and_then(|s| s.to_str()) else {
-                    continue;
-                };
-                if let Some(content) = panel_read(&path).await {
-                    entities.push(EntitySummary {
-                        name: name.to_string(),
-                        summary: first_summary_line(&content),
-                    });
-                }
+    if let Some(rel_bank) = rel_under(&memory_dir_path, &store.bank_entities_dir())
+        && let Some(bank) = mem.open_beneath(&rel_bank)
+    {
+        for name in bank.list_md_stems() {
+            if let Some((content, _)) = bank.read_file(&format!("{name}.md")) {
+                entities.push(EntitySummary {
+                    // The store's own parser — byte-identical to the
+                    // agent-prompt summaries (codex #1611 r2 P2).
+                    summary: octos_memory::extract_abstract(&content),
+                    name,
+                });
             }
         }
         entities.sort_by(|a, b| a.name.cmp(&b.name));
@@ -251,15 +401,15 @@ pub async fn my_memory_entity(
     let store = octos_memory::MemoryStore::open(&data_dir)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    // Same traversal-character sanitization `read_entity` applies, but
-    // through the anchored no-follow read path (codex #1611 P1) — a
-    // symlinked page or bank dir is a plain 404.
+    // Same traversal-character sanitization `read_entity` applies, on
+    // top of the FD-anchored walk — a symlinked page, bank dir or any
+    // ancestor is a plain 404.
     let safe_name = name.replace(['/', '\\', '\0', '~', '.'], "_");
-    let bank_dir = anchored_dir(&data_dir, &store.bank_entities_dir())
-        .await
-        .ok_or(StatusCode::NOT_FOUND)?;
-    let content = panel_read(&bank_dir.join(format!("{safe_name}.md")))
-        .await
+    let rel_bank = rel_under(&data_dir, &store.bank_entities_dir()).ok_or(StatusCode::NOT_FOUND)?;
+    let content = AnchoredDir::open_root(&data_dir)
+        .and_then(|root| root.open_beneath(&rel_bank))
+        .and_then(|bank| bank.read_file(&format!("{safe_name}.md")))
+        .map(|(content, _)| content)
         .ok_or(StatusCode::NOT_FOUND)?;
     Ok(Json(MemoryEntityResponse {
         ok: true,
@@ -353,9 +503,62 @@ mod tests {
             .unwrap();
         assert!(resp.ok);
         assert_eq!(resp.long_term, "");
-        assert!(resp.long_term_updated_at.is_none());
         assert_eq!(resp.recent.len(), 0);
         assert_eq!(resp.entities.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn empty_memory_md_still_reports_mtime() {
+        // Consolidation can hard-delete the last entry, leaving an
+        // EMPTY MEMORY.md — the panel must still say when it changed
+        // (codex #1611 r2 P2: mtime derives from existence, not
+        // content).
+        let (_dir, state, ps) = temp_state();
+        let profile = make_user_profile("emptied", "Emptied");
+        ps.save(&profile).unwrap();
+        let data_dir = ps.resolve_data_dir(&profile);
+        tokio::fs::create_dir_all(data_dir.join("memory"))
+            .await
+            .unwrap();
+        tokio::fs::write(data_dir.join("memory/MEMORY.md"), "")
+            .await
+            .unwrap();
+
+        let Json(resp) = my_memory(State(state), HeaderMap::new(), user_identity("emptied"))
+            .await
+            .unwrap();
+        assert_eq!(resp.long_term, "");
+        assert!(
+            resp.long_term_updated_at.is_some(),
+            "existing-but-empty MEMORY.md must keep its mtime"
+        );
+    }
+
+    #[tokio::test]
+    async fn entity_summary_matches_store_parser_exactly() {
+        // codex #1611 r2 P2: a second frontmatter parser drifted from
+        // `MemoryStore::strip_frontmatter` (`---abc` is NOT an opener
+        // for the store). The panel now calls the store's own
+        // `extract_abstract` — hold it to byte-equality on the shape
+        // that diverged.
+        let (_dir, state, ps) = temp_state();
+        let profile = make_user_profile("parity", "Parity");
+        ps.save(&profile).unwrap();
+        let data_dir = ps.resolve_data_dir(&profile);
+        let store = octos_memory::MemoryStore::open(&data_dir).await.unwrap();
+        let tricky = "---abc\nnote\n---\nBody\n";
+        store.write_entity("tricky", tricky).await.unwrap();
+
+        let Json(resp) = my_memory(State(state), HeaderMap::new(), user_identity("parity"))
+            .await
+            .unwrap();
+        let entity = resp
+            .entities
+            .iter()
+            .find(|e| e.name == "tricky")
+            .expect("tricky entity listed");
+        assert_eq!(entity.summary, octos_memory::extract_abstract(tricky));
+        assert_eq!(entity.summary, "---abc", "not-a-frontmatter-opener stays");
     }
 
     #[tokio::test]
@@ -427,6 +630,9 @@ mod tests {
         // codex #1611 P1: a tenant can place symlinks inside its own
         // memory dir (workspace-cwd session + shell); the daemon-
         // privileged panel must not follow them into foreign files.
+        // (The round-2 swap RACE is closed structurally by the
+        // FD-anchored walk; these assert the static shapes through
+        // the same code path.)
         let (_dir, state, ps) = temp_state();
         let victim = make_user_profile("victim", "Victim");
         let attacker = make_user_profile("attacker", "Attacker");
