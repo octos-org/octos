@@ -117,6 +117,17 @@ const MAX_PANEL_ENTITIES: usize = 256;
 /// million-entry staging tree costs bounded readdir work.
 const MAX_STAGING_NOTE_COUNT: usize = 1000;
 
+/// Raw readdir budget per directory scan (codex #1611 r9 P1). The
+/// `.md` caps above bound MATCHING entries only — a tenant-planted
+/// directory of millions of non-Markdown entries (or junk after the
+/// last matching name) would still be scanned to EOF while holding a
+/// global scan permit, stalling other profiles' panel reads. Every
+/// directory iteration stops after this many RAW entries regardless of
+/// filtering; exhaustion reports truncation (listing) or the count so
+/// far (staging saturation). Generous headroom over the legitimate
+/// maxima (256 entities / 1000 staging notes plus stray dotfiles).
+const MAX_DIR_SCAN_ENTRIES: usize = 10_000;
+
 /// A directory handle every panel read is anchored to.
 ///
 /// Unix: an `OwnedFd` opened `O_NOFOLLOW|O_DIRECTORY`; children are
@@ -258,7 +269,15 @@ mod imp {
             return (Vec::new(), false);
         };
         let mut names = Vec::new();
+        let mut raw_seen = 0usize;
         while let Some(Ok(entry)) = entries.next() {
+            // RAW budget BEFORE any filtering (codex #1611 r9 P1): a
+            // planted directory of millions of non-.md entries must not
+            // be scanned to EOF while a global permit is held.
+            raw_seen += 1;
+            if raw_seen > super::MAX_DIR_SCAN_ENTRIES {
+                return (names, true);
+            }
             let Ok(name) = entry.file_name().to_str() else {
                 continue;
             };
@@ -281,7 +300,13 @@ mod imp {
             return 0;
         };
         let mut count = 0;
+        let mut raw_seen = 0usize;
         while let Some(Ok(entry)) = entries.next() {
+            // Same raw budget as list_md_stems (codex #1611 r9 P1).
+            raw_seen += 1;
+            if raw_seen > super::MAX_DIR_SCAN_ENTRIES {
+                break;
+            }
             let Ok(name) = entry.file_name().to_str() else {
                 continue;
             };
@@ -348,7 +373,14 @@ mod imp {
             return (Vec::new(), false);
         };
         let mut names = Vec::new();
+        let mut raw_seen = 0usize;
         for entry in entries.flatten() {
+            // RAW budget BEFORE any filtering (codex #1611 r9 P1) —
+            // see the Unix arm.
+            raw_seen += 1;
+            if raw_seen > super::MAX_DIR_SCAN_ENTRIES {
+                return (names, true);
+            }
             let Some(stem) = entry
                 .file_name()
                 .to_str()
@@ -373,7 +405,13 @@ mod imp {
             return 0;
         };
         let mut count = 0;
+        let mut raw_seen = 0usize;
         for entry in entries.flatten() {
+            // Same raw budget as list_md_stems (codex #1611 r9 P1).
+            raw_seen += 1;
+            if raw_seen > super::MAX_DIR_SCAN_ENTRIES {
+                break;
+            }
             let is_md = entry
                 .file_name()
                 .to_str()
@@ -962,6 +1000,52 @@ mod tests {
             "enumeration must stop at the cap"
         );
         assert!(resp.entities_truncated, "over-cap bank must be flagged");
+    }
+
+    #[tokio::test]
+    async fn raw_dir_budget_bounds_scans_of_non_md_junk() {
+        // codex #1611 r9 P1: the .md caps bound MATCHING entries only —
+        // a directory flooded with non-Markdown junk was still scanned
+        // to EOF while holding a global permit. The raw readdir budget
+        // must stop the scan regardless of what the filter matches.
+        let (_dir, state, ps) = temp_state();
+        let profile = make_user_profile("junkyard", "Junkyard");
+        ps.save(&profile).unwrap();
+        let data_dir = ps.resolve_data_dir(&profile);
+        let bank = data_dir.join("memory/bank/entities");
+        let staging = data_dir.join("memory/staging/notes");
+        tokio::fs::create_dir_all(&bank).await.unwrap();
+        tokio::fs::create_dir_all(&staging).await.unwrap();
+        // Junk past the raw budget in BOTH scanned directories, plus a
+        // handful of real .md entries whose visibility is readdir-order
+        // dependent — the deterministic assertions are the truncation
+        // flag and prompt completion, not which entries surfaced.
+        for i in 0..(MAX_DIR_SCAN_ENTRIES + 50) {
+            std::fs::write(bank.join(format!("j{i:05}.txt")), "").unwrap();
+            std::fs::write(staging.join(format!("j{i:05}.txt")), "").unwrap();
+        }
+        std::fs::write(bank.join("real.md"), "Abstract: x\n").unwrap();
+        std::fs::write(staging.join("real.md"), "note").unwrap();
+
+        let resp = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            my_memory(State(state), HeaderMap::new(), user_identity("junkyard")),
+        )
+        .await
+        .expect("junk-flooded directories must not stall the scan")
+        .unwrap();
+        assert!(
+            resp.0.entities_truncated,
+            "exhausting the raw budget must report truncation"
+        );
+        assert!(
+            resp.0.entities.len() <= MAX_PANEL_ENTITIES,
+            "matching cap still holds under junk flooding"
+        );
+        assert!(
+            resp.0.staging_notes <= MAX_STAGING_NOTE_COUNT,
+            "staging saturation still holds under junk flooding"
+        );
     }
 
     #[cfg(unix)]
