@@ -555,26 +555,30 @@ impl SessionKey {
         self.split_base_key().0
     }
 
-    /// Child key for a fork: the parent's ENTIRE key prefix with a new
+    /// Child key for a fork: the parent's profile + channel with a new
     /// chat id (topic dropped — the child is a fresh conversation). A
     /// raw colon-less parent — the SPA's opaque per-tab handles
     /// (`web-123`) — yields a raw child: treating the whole raw id as a
     /// channel would mint `web-123:<id>` keys, which the raw REST
     /// resume/title/delete fallbacks intentionally exclude.
     ///
-    /// Deliberately NOT built on `split_base_key`: its channel
-    /// allowlist omits feature-gated channels (`wechat`, `line`, …),
-    /// which would silently drop the channel from
-    /// `tenant:wechat:parent` (codex #1613 r2). Replacing the last
-    /// `:`-segment preserves whatever profile/channel shape the parent
-    /// has, unambiguously. (Chat ids are colon-free by construction —
-    /// `validate_topic_name` enforces the child's, and every channel
-    /// mints colon-free parents.) Single source of truth for
+    /// Built on `split_base_key`, the same profile/channel boundary the
+    /// rest of the key parsing uses. A last-segment replacement is NOT
+    /// equivalent: chat ids can contain colons (Matrix rooms —
+    /// `matrix:!room:localhost`), so only the registry-backed parse
+    /// places the boundary correctly for both colon chat ids and
+    /// `{profile}:{channel}:{chat}` keys (codex #1613 r2+r3; the
+    /// registry gap for feature-gated channels is fixed in
+    /// `is_channel_name`). Single source of truth for
     /// `SessionManager::fork` AND the serve-side pre-checks.
     pub fn fork_child(&self, new_chat_id: &str) -> SessionKey {
-        match self.base_key().rsplit_once(':') {
-            None => SessionKey(new_chat_id.to_string()),
-            Some((prefix, _chat_id)) => SessionKey(format!("{prefix}:{new_chat_id}")),
+        if !self.base_key().contains(':') {
+            return SessionKey(new_chat_id.to_string());
+        }
+        let (profile, channel, _chat) = self.split_base_key();
+        match profile {
+            Some(profile) => SessionKey(format!("{profile}:{channel}:{new_chat_id}")),
+            None => SessionKey(format!("{channel}:{new_chat_id}")),
         }
     }
 
@@ -598,6 +602,7 @@ fn is_channel_name(value: &str) -> bool {
             | "discord"
             | "email"
             | "feishu"
+            | "line"
             | "local"
             | "matrix"
             | "qq-bot"
@@ -606,6 +611,7 @@ fn is_channel_name(value: &str) -> bool {
             | "telegram"
             | "test"
             | "twilio"
+            | "wechat"
             | "wecom"
             | "wecom-bot"
             | "whatsapp"
@@ -634,13 +640,21 @@ mod tests {
             SessionKey("tenant:api:parent".into()).fork_child("kid").0,
             "tenant:api:kid"
         );
-        // feature-gated channels (outside is_channel_name's allowlist)
-        // keep their shape too — the derivation is registry-independent
+        // feature-gated channels parse correctly now that the registry
+        // includes them (wechat/line were missing pre-#1613)
         assert_eq!(
             SessionKey("tenant:wechat:parent".into())
                 .fork_child("kid")
                 .0,
             "tenant:wechat:kid"
+        );
+        // colon-bearing chat ids (Matrix rooms) must be REPLACED whole,
+        // not treated as extra prefix segments
+        assert_eq!(
+            SessionKey("matrix:!room:localhost".into())
+                .fork_child("kid")
+                .0,
+            "matrix:kid"
         );
         // raw SPA handle (no colon) yields a raw child — NOT
         // "web-123:kid", which the raw REST fallbacks exclude

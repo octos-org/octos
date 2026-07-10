@@ -12903,7 +12903,14 @@ impl ForkReservation {
     /// `None` when another fork to the same child key in the same
     /// sessions dir is in flight.
     fn try_acquire(sessions_dir: &Path, child_key: &SessionKey) -> Option<Self> {
-        let key = (sessions_dir.to_path_buf(), child_key.0.clone());
+        // Canonicalized: two managers can reach one on-disk dir through
+        // different spellings (`..` segments, symlinked data_dir
+        // overrides) — distinct PathBufs would defeat the reservation
+        // (codex #1613 r3). The dir exists (the manager created it), so
+        // canonicalize only fails on races — fall back to the raw path.
+        let dir =
+            std::fs::canonicalize(sessions_dir).unwrap_or_else(|_| sessions_dir.to_path_buf());
+        let key = (dir, child_key.0.clone());
         let mut set = fork_reservations()
             .lock()
             .unwrap_or_else(|e| e.into_inner());
