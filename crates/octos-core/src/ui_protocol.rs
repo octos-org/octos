@@ -3195,7 +3195,15 @@ pub struct MemoryOverviewParams {}
 /// Result for `memory/overview`. `overview` is the JSON body of the
 /// existing `GET /api/my/memory` handler (`MemoryOverviewResponse` —
 /// `crates/octos-cli/src/api/memory_panel.rs`), forwarded whole so the
-/// wire shape and the REST shape cannot drift apart.
+/// wire shape and the REST shape cannot drift apart — PLUS RPC-layer
+/// truncation metadata: the panel serves files up to 2 MiB but an RPC
+/// result must fit one ~1 MiB WS text frame, so the dispatcher caps
+/// each document field to a per-field byte budget and records the
+/// truth beside it (`long_term_truncated` + `long_term_total_bytes`,
+/// `today_truncated` + `today_total_bytes`, and per `recent[]` note
+/// `content_truncated` + `content_total_bytes`; always present on the
+/// WS wire). Capped fields are clean UTF-8 prefixes — no in-band
+/// marker is ever spliced into the markdown.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MemoryOverviewResult {
     pub overview: Value,
@@ -3211,11 +3219,20 @@ pub struct MemoryEntityParams {
 
 /// Result for `memory/entity`. Mirrors the JSON body of
 /// `GET /api/my/memory/entities/{name}` minus the redundant `ok` flag
-/// (RPC success is carried by the envelope).
+/// (RPC success is carried by the envelope), plus RPC-layer truncation
+/// metadata (the panel serves files up to 2 MiB; an RPC result must
+/// fit one ~1 MiB WS text frame).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MemoryEntityResult {
     pub name: String,
+    /// Page markdown. When `content_truncated` is true this is a clean
+    /// UTF-8 PREFIX of the page capped at the RPC-layer byte budget —
+    /// no in-band marker is spliced into it.
     pub content: String,
+    /// True when `content` was capped to fit the WS frame.
+    pub content_truncated: bool,
+    /// Raw byte length of the FULL page before any RPC-layer cap.
+    pub content_total_bytes: usize,
 }
 
 /// Params for `cron/list`. Empty today; the struct exists so `{}` /
@@ -11101,6 +11118,8 @@ mod tests {
         let entity = MemoryEntityResult {
             name: "acme-corp".into(),
             content: "# acme".into(),
+            content_truncated: false,
+            content_total_bytes: 6,
         };
         let value = serde_json::to_value(&entity).expect("serialize");
         let decoded: MemoryEntityResult = serde_json::from_value(value).expect("deserialize");
@@ -11531,14 +11550,23 @@ mod tests {
             serde_json::json!({ "overview": { "ok": true, "staging_notes": 2 } }),
         );
 
-        // memory/entity — `{ name, content }`
+        // memory/entity — `{ name, content, content_truncated,
+        // content_total_bytes }` (truncation metadata is part of the
+        // wire contract: capped fields must be DECLARED, never silent).
         assert_eq!(
             serde_json::to_value(MemoryEntityResult {
                 name: "acme-corp".into(),
                 content: "# acme".into(),
+                content_truncated: false,
+                content_total_bytes: 6,
             })
             .expect("serialize"),
-            serde_json::json!({ "name": "acme-corp", "content": "# acme" }),
+            serde_json::json!({
+                "name": "acme-corp",
+                "content": "# acme",
+                "content_truncated": false,
+                "content_total_bytes": 6,
+            }),
         );
 
         // cron/list — `{ jobs, count, gateway_running }`

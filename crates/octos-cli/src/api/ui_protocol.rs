@@ -15209,6 +15209,60 @@ async fn handle_content_bulk_delete(
     }
 }
 
+/// Per-field RAW byte budgets for the memory RPC results (codex #1621
+/// r1 P1). The REST panel intentionally serves files up to
+/// `memory_panel::MAX_PANEL_FILE_BYTES` (2 MiB), but an RPC result must
+/// fit ONE ~1 MiB WS text frame (`MAX_TEXT_FRAME_BYTES`) — without a
+/// handler-level bound the outbound framing guard
+/// (`preview_oversized_frame`) would splice a head+tail preview into
+/// the largest string while the envelope still reports success: silent
+/// corruption for a document viewer. Budgets keep the WHOLE serialized
+/// result under the frame cap even at the JSON-escaping worst case
+/// (×2 per byte) plus envelope overhead:
+///   96 (long_term) + 48 (today) + 7×24 (recent) + ~90 (entities —
+///   bounded upstream: ≤ MAX_PANEL_ENTITIES=256 summaries, each capped
+///   at 100 bytes by `octos_memory::extract_abstract`, names ≤ 255)
+///   ≈ 402 KiB raw → ≤ ~810 KiB escaped.
+/// Truncation is EXPLICIT: `<field>_truncated` + `<field>_total_bytes`
+/// ride beside every capped field; the content itself is a clean UTF-8
+/// prefix with NO in-band marker.
+const MEMORY_RPC_LONG_TERM_BUDGET: usize = 96 * 1024;
+const MEMORY_RPC_TODAY_BUDGET: usize = 48 * 1024;
+const MEMORY_RPC_RECENT_NOTE_BUDGET: usize = 24 * 1024;
+/// `memory/entity` is a single-document result — it gets the largest
+/// budget that still clears the frame cap at escape worst case.
+const MEMORY_RPC_ENTITY_CONTENT_BUDGET: usize = 384 * 1024;
+
+/// Cap the string at `obj[field]` to `budget` RAW bytes (UTF-8
+/// boundary, clean prefix — no in-band marker) and record the truth
+/// beside it as `<field>_truncated` + `<field>_total_bytes` (always
+/// written, false/full-length when the field fit).
+fn cap_memory_value_field(obj: &mut Value, field: &str, budget: usize) {
+    let Some(Value::String(s)) = obj.get_mut(field) else {
+        return;
+    };
+    let total = s.len();
+    let truncated = total > budget;
+    if truncated {
+        octos_core::truncate_utf8(s, budget, "");
+    }
+    if let Some(map) = obj.as_object_mut() {
+        map.insert(format!("{field}_truncated"), json!(truncated));
+        map.insert(format!("{field}_total_bytes"), json!(total));
+    }
+}
+
+/// Apply the per-field budgets to a serialized `MemoryOverviewResponse`.
+fn apply_memory_overview_budgets(overview: &mut Value) {
+    cap_memory_value_field(overview, "long_term", MEMORY_RPC_LONG_TERM_BUDGET);
+    cap_memory_value_field(overview, "today", MEMORY_RPC_TODAY_BUDGET);
+    if let Some(recent) = overview.get_mut("recent").and_then(Value::as_array_mut) {
+        for note in recent {
+            cap_memory_value_field(note, "content", MEMORY_RPC_RECENT_NOTE_BUDGET);
+        }
+    }
+}
+
 async fn handle_memory_overview(
     ws: &WsConnection,
     state: &Arc<AppState>,
@@ -15236,8 +15290,14 @@ async fn handle_memory_overview(
         Ok(axum::Json(overview)) => match serde_json::to_value(&overview) {
             // The REST body is forwarded whole under `overview` (the
             // `system/status.get` wrap pattern) so the WS shape cannot
-            // drift from `MemoryOverviewResponse` field by field.
-            Ok(value) => send_aux_rpc_result(ws, id, method, json!({ "overview": value })),
+            // drift from `MemoryOverviewResponse` field by field — then
+            // capped per document field so the result fits one WS frame
+            // with EXPLICIT flags instead of the framing guard's silent
+            // head+tail preview (codex #1621 r1 P1).
+            Ok(mut value) => {
+                apply_memory_overview_budgets(&mut value);
+                send_aux_rpc_result(ws, id, method, json!({ "overview": value }))
+            }
             Err(error) => {
                 let _ = send_rpc_error(
                     ws,
@@ -15293,13 +15353,24 @@ async fn handle_memory_entity(
     match result {
         Ok(axum::Json(entity)) => {
             // `ok` is dropped — RPC success is carried by the envelope.
+            // Content is capped with an EXPLICIT flag so an over-frame
+            // page degrades to a declared prefix, never the framing
+            // guard's silent in-band preview (codex #1621 r1 P1).
+            let mut content = entity.content;
+            let content_total_bytes = content.len();
+            let content_truncated = content_total_bytes > MEMORY_RPC_ENTITY_CONTENT_BUDGET;
+            if content_truncated {
+                octos_core::truncate_utf8(&mut content, MEMORY_RPC_ENTITY_CONTENT_BUDGET, "");
+            }
             send_aux_rpc_result(
                 ws,
                 id,
                 method,
                 json!({
                     "name": entity.name,
-                    "content": entity.content,
+                    "content": content,
+                    "content_truncated": content_truncated,
+                    "content_total_bytes": content_total_bytes,
                 }),
             );
         }
@@ -28642,6 +28713,9 @@ ignore = []
                 .contains("remembers things")
         );
         assert_eq!(overview["entities"][0]["name"], json!("fleet"));
+        // Truncation metadata is ALWAYS present (false/full when whole).
+        assert_eq!(overview["long_term_truncated"], json!(false));
+        assert_eq!(overview["today_truncated"], json!(false));
 
         // memory/entity — `{ name, content }`, no `ok` flag.
         handle_memory_entity(
@@ -28659,12 +28733,11 @@ ignore = []
         let frame = recv_rpc_json(&mut rx).await;
         assert_eq!(frame["id"], json!("mem-entity"));
         assert_eq!(frame["result"]["name"], json!("fleet"));
-        assert!(
-            frame["result"]["content"]
-                .as_str()
-                .unwrap()
-                .contains("five minis")
-        );
+        let content = frame["result"]["content"].as_str().unwrap();
+        assert!(content.contains("five minis"));
+        // Truncation metadata is ALWAYS present (false/full when whole).
+        assert_eq!(frame["result"]["content_truncated"], json!(false));
+        assert_eq!(frame["result"]["content_total_bytes"], json!(content.len()));
         assert!(frame["result"].get("ok").is_none());
 
         // memory/entity miss — typed RESOURCE_NOT_FOUND with the page
@@ -28753,6 +28826,143 @@ ignore = []
         assert_eq!(frame["error"]["data"]["identifier"], json!("nope"));
         assert_eq!(frame["error"]["data"]["rest_status"], json!(404));
         assert_eq!(frame["error"]["data"]["detail"], json!("job_not_found"));
+    }
+
+    /// codex #1621 r1 P1: a memory file the panel legitimately serves
+    /// (≤ 2 MiB) can exceed the ~1 MiB WS frame cap; without a
+    /// handler-level budget the outbound framing guard would splice a
+    /// head+tail preview INTO the markdown while the envelope still
+    /// reports success. The RPC layer instead caps each document field
+    /// to a per-field budget and DECLARES it: clean UTF-8 prefix +
+    /// `<field>_truncated` / `<field>_total_bytes`.
+    #[tokio::test]
+    async fn memory_rpc_methods_declare_truncation_when_over_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let profile_store = Arc::new(crate::profiles::ProfileStore::open(dir.path()).unwrap());
+        let profile = panel_user_profile("tenant");
+        profile_store.save(&profile).unwrap();
+        let data_dir = profile_store.resolve_data_dir(&profile);
+
+        let long_term = format!(
+            "# MEMORY\n{}",
+            "m".repeat(MEMORY_RPC_LONG_TERM_BUDGET + 4096)
+        );
+        let entity_page = format!(
+            "# whale\n{}",
+            "e".repeat(MEMORY_RPC_ENTITY_CONTENT_BUDGET + 4096)
+        );
+        let mem = octos_memory::MemoryStore::open(&data_dir).await.unwrap();
+        mem.write_long_term(&long_term).await.unwrap();
+        mem.write_entity("whale", &entity_page).await.unwrap();
+
+        let state = Arc::new(AppState {
+            profile_store: Some(profile_store),
+            ..AppState::empty_for_tests()
+        });
+        let headers = HeaderMap::new();
+        let identity = AuthIdentity::User {
+            id: "tenant".into(),
+            role: crate::user_store::UserRole::User,
+        };
+        let (ws, mut rx) = ws_connection_for_test(16);
+
+        handle_memory_overview(
+            &ws,
+            &state,
+            &headers,
+            Some(&identity),
+            true,
+            "mem-overview-cap".into(),
+            MemoryOverviewParams::default(),
+        )
+        .await;
+        let frame = recv_rpc_json(&mut rx).await;
+        let overview = &frame["result"]["overview"];
+        let served = overview["long_term"].as_str().unwrap();
+        assert_eq!(served.len(), MEMORY_RPC_LONG_TERM_BUDGET);
+        assert_eq!(overview["long_term_truncated"], json!(true));
+        assert_eq!(
+            overview["long_term_total_bytes"],
+            json!(long_term.len()),
+            "total reports the FULL pre-cap size",
+        );
+        // Clean prefix — the cap never splices a marker into content.
+        assert_eq!(served, &long_term[..MEMORY_RPC_LONG_TERM_BUDGET]);
+        assert_eq!(overview["today_truncated"], json!(false));
+
+        handle_memory_entity(
+            &ws,
+            &state,
+            &headers,
+            Some(&identity),
+            true,
+            "mem-entity-cap".into(),
+            MemoryEntityParams {
+                name: "whale".into(),
+            },
+        )
+        .await;
+        let frame = recv_rpc_json(&mut rx).await;
+        let served = frame["result"]["content"].as_str().unwrap();
+        assert_eq!(served.len(), MEMORY_RPC_ENTITY_CONTENT_BUDGET);
+        assert_eq!(frame["result"]["content_truncated"], json!(true));
+        assert_eq!(
+            frame["result"]["content_total_bytes"],
+            json!(entity_page.len())
+        );
+        assert_eq!(served, &entity_page[..MEMORY_RPC_ENTITY_CONTENT_BUDGET]);
+    }
+
+    /// The budget helper must cut on a UTF-8 char boundary (a capped
+    /// multibyte document ends short of the budget rather than mid
+    /// codepoint) and must no-op on absent / non-string fields.
+    #[test]
+    fn cap_memory_value_field_is_utf8_safe_and_typed() {
+        // 3-byte codepoints; budget of 8 lands mid-codepoint → cut at 6.
+        let mut obj = json!({ "content": "€€€" });
+        cap_memory_value_field(&mut obj, "content", 8);
+        assert_eq!(obj["content"], json!("€€"));
+        assert_eq!(obj["content_truncated"], json!(true));
+        assert_eq!(obj["content_total_bytes"], json!(9));
+
+        // Under budget: flags present, false/full.
+        let mut obj = json!({ "content": "abc" });
+        cap_memory_value_field(&mut obj, "content", 8);
+        assert_eq!(obj["content"], json!("abc"));
+        assert_eq!(obj["content_truncated"], json!(false));
+        assert_eq!(obj["content_total_bytes"], json!(3));
+
+        // Absent / non-string fields: untouched, no flags invented.
+        let mut obj = json!({ "count": 7 });
+        cap_memory_value_field(&mut obj, "content", 8);
+        assert_eq!(obj, json!({ "count": 7 }));
+        cap_memory_value_field(&mut obj, "count", 8);
+        assert_eq!(obj, json!({ "count": 7 }));
+    }
+
+    /// Budget arithmetic guard: the overview's worst-case serialized
+    /// size (all budgets spent + bounded entities + envelope) must stay
+    /// under the WS frame cap even at the JSON-escape worst case (×2),
+    /// and the entity budget likewise — otherwise the framing guard's
+    /// silent preview becomes reachable again.
+    #[test]
+    fn memory_rpc_budgets_fit_one_ws_frame_at_escape_worst_case() {
+        // Entities bound: MAX_PANEL_ENTITIES × (100-byte summary +
+        // 255-byte name + ~40 bytes JSON overhead).
+        let entities_bound = 256 * (100 + 255 + 40);
+        let overview_raw = MEMORY_RPC_LONG_TERM_BUDGET
+            + MEMORY_RPC_TODAY_BUDGET
+            + 7 * MEMORY_RPC_RECENT_NOTE_BUDGET
+            + entities_bound;
+        let envelope_overhead = 4 * 1024;
+        assert!(
+            overview_raw * 2 + envelope_overhead < MAX_TEXT_FRAME_BYTES,
+            "overview budgets ({overview_raw} raw) must fit the {MAX_TEXT_FRAME_BYTES}-byte frame at escape worst case",
+        );
+        assert!(
+            MEMORY_RPC_ENTITY_CONTENT_BUDGET * 2 + envelope_overhead < MAX_TEXT_FRAME_BYTES,
+            "entity budget must fit the frame at escape worst case",
+        );
     }
 
     /// WS-transport auth expiry: the close-code 1008 frame must precede
