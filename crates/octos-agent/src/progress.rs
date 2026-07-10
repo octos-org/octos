@@ -95,6 +95,12 @@ pub enum ProgressEvent {
     /// File was modified.
     FileModified { path: String },
 
+    /// Model-authored plan/todo checklist snapshot from the `update_plan`
+    /// tool. Carried as the serialized `UiPlanRecord` JSON so this low-level
+    /// event stays decoupled from the octos-core wire structs; the serve
+    /// mapper deserializes it into a `plan/updated` notification.
+    PlanUpdated { plan: serde_json::Value },
+
     /// Token usage update.
     TokenUsage {
         input_tokens: u32,
@@ -366,6 +372,22 @@ impl ProgressReporter for ConsoleReporter {
             }
             ProgressEvent::FileModified { path } => {
                 println!("{} {} {}", self.green("📝"), self.dim("Modified:"), path);
+            }
+            ProgressEvent::PlanUpdated { plan } => {
+                if self.verbose {
+                    if let Some(items) = plan.get("items").and_then(|v| v.as_array()) {
+                        println!("{}", self.dim("Plan:"));
+                        for item in items {
+                            let title = item.get("title").and_then(|v| v.as_str()).unwrap_or("");
+                            let glyph = match item.get("status").and_then(|v| v.as_str()) {
+                                Some("completed") => self.green("✔"),
+                                Some("in_progress") => self.dim("▸"),
+                                _ => self.dim("◼"),
+                            };
+                            println!("  {} {}", glyph, title);
+                        }
+                    }
+                }
             }
             ProgressEvent::TokenUsage {
                 input_tokens,

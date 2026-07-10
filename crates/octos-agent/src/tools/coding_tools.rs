@@ -904,7 +904,73 @@ macro_rules! simple_codex_tool {
     };
 }
 
-async fn update_plan_body(_: &dyn Tool, args: &Value, _: &ToolContext) -> Result<ToolResult> {
+/// Normalize the (permissive, Codex-shaped) `update_plan` arguments into a
+/// typed [`UiPlanRecord`]. Accepts item text under `step` / `title` / `content`
+/// and tolerates a few status spellings; assigns a stable 1-based `id` when the
+/// caller doesn't supply one so downstream clients can re-render in place.
+fn normalize_plan(args: &Value, now_ms: i64) -> octos_core::ui_protocol::UiPlanRecord {
+    use octos_core::ui_protocol::{PlanItemStatus, UiPlanItem, UiPlanRecord};
+    let items = args
+        .get("plan")
+        .or_else(|| args.get("items"))
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .enumerate()
+                .map(|(i, item)| {
+                    let title = ["step", "title", "content", "text"]
+                        .iter()
+                        .find_map(|k| item.get(*k).and_then(|v| v.as_str()))
+                        .unwrap_or_default()
+                        .to_string();
+                    let status = match item.get("status").and_then(|v| v.as_str()) {
+                        Some("in_progress" | "in-progress" | "active" | "running") => {
+                            PlanItemStatus::InProgress
+                        }
+                        Some("completed" | "complete" | "done") => PlanItemStatus::Completed,
+                        _ => PlanItemStatus::Pending,
+                    };
+                    let id = item
+                        .get("id")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string)
+                        .unwrap_or_else(|| (i + 1).to_string());
+                    let priority = item
+                        .get("priority")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string);
+                    UiPlanItem {
+                        id,
+                        title,
+                        status,
+                        priority,
+                    }
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let title = ["explanation", "title"]
+        .iter()
+        .find_map(|k| args.get(*k).and_then(|v| v.as_str()))
+        .map(str::to_string);
+    UiPlanRecord {
+        items,
+        title,
+        updated_at_ms: now_ms,
+    }
+}
+
+async fn update_plan_body(_: &dyn Tool, args: &Value, ctx: &ToolContext) -> Result<ToolResult> {
+    // Live path: stream the checklist as a `plan/updated` notification (gated
+    // by `plan.todos.v1` on the serve side). `ToolContext::zero()` carries a
+    // `SilentReporter`, so the `execute()` entry point is a safe no-op.
+    let record = normalize_plan(args, chrono::Utc::now().timestamp_millis());
+    if let Ok(plan_value) = serde_json::to_value(&record) {
+        ctx.reporter
+            .report(crate::progress::ProgressEvent::PlanUpdated { plan: plan_value });
+    }
+    // Legacy path preserved for Codex/ACP surfaces that read the plan off the
+    // `tool/completed` structured_metadata.
     Ok(ToolResult {
         output: json!({"ok": true, "plan": args}).to_string(),
         success: true,
@@ -3403,6 +3469,72 @@ fn catalog_score(entry: &ToolCatalogEntry, query: &str, tokens: &[String]) -> i3
 mod tests {
     use super::*;
     use crate::tools::ToolRegistry;
+
+    #[test]
+    fn normalize_plan_maps_codex_shape_and_assigns_ids() {
+        use octos_core::ui_protocol::PlanItemStatus;
+        let args = json!({
+            "explanation": "Building memory panel…",
+            "plan": [
+                { "step": "web P3: PWA manifest", "status": "completed" },
+                { "step": "memory panel", "status": "in_progress" },
+                { "step": "cron toggle", "status": "pending", "priority": "P3" },
+                { "step": "no status → pending" }
+            ]
+        });
+        let record = normalize_plan(&args, 42);
+        assert_eq!(record.title.as_deref(), Some("Building memory panel…"));
+        assert_eq!(record.updated_at_ms, 42);
+        assert_eq!(record.items.len(), 4);
+        // 1-based ids assigned when the caller omits them.
+        assert_eq!(record.items[0].id, "1");
+        assert_eq!(record.items[3].id, "4");
+        assert_eq!(record.items[0].status, PlanItemStatus::Completed);
+        assert_eq!(record.items[1].status, PlanItemStatus::InProgress);
+        assert_eq!(record.items[2].status, PlanItemStatus::Pending);
+        assert_eq!(record.items[2].priority.as_deref(), Some("P3"));
+        // Unknown/absent status defaults to Pending.
+        assert_eq!(record.items[3].status, PlanItemStatus::Pending);
+        assert_eq!(record.items[0].title, "web P3: PWA manifest");
+    }
+
+    struct CapturingReporter {
+        events: Arc<std::sync::Mutex<Vec<crate::progress::ProgressEvent>>>,
+    }
+    impl crate::progress::ProgressReporter for CapturingReporter {
+        fn report(&self, event: crate::progress::ProgressEvent) {
+            self.events.lock().unwrap().push(event);
+        }
+    }
+
+    #[tokio::test]
+    async fn update_plan_tool_emits_plan_updated_event() {
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut ctx = ToolContext::zero();
+        ctx.reporter = Arc::new(CapturingReporter {
+            events: Arc::clone(&events),
+        });
+        let args = json!({ "plan": [{ "step": "do a thing", "status": "in_progress" }] });
+
+        let result = UpdatePlanTool
+            .execute_with_context(&ctx, &args)
+            .await
+            .expect("update_plan executes");
+        assert!(result.success);
+        // Back-compat: the legacy structured_metadata path is preserved.
+        assert!(result.structured_metadata.is_some());
+
+        let captured = events.lock().unwrap();
+        let plan = captured
+            .iter()
+            .find_map(|e| match e {
+                crate::progress::ProgressEvent::PlanUpdated { plan } => Some(plan.clone()),
+                _ => None,
+            })
+            .expect("a PlanUpdated event was emitted");
+        assert_eq!(plan["items"][0]["title"], "do a thing");
+        assert_eq!(plan["items"][0]["status"], "in_progress");
+    }
 
     #[test]
     fn truncate_capture_does_not_panic_on_multibyte_boundary() {
