@@ -2580,6 +2580,14 @@ pub struct HydratedMessage {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client_message_id: Option<String>,
     pub persisted_at: DateTime<Utc>,
+    /// Reasoning/thinking text captured for this message (#1502), when the
+    /// provider emitted it. Surfaced on hydrate so the "· reasoning" block
+    /// survives a client restart instead of silently vanishing — the store
+    /// has persisted it all along. Gated on `event.spawn_complete.v1` like
+    /// `message_id`/`source`, so non-negotiated clients keep the pre-fix
+    /// wire byte-identical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
     /// Stable per-row identity, derived from `(session_id, seq,
     /// timestamp_nanos)` — identical to what
     /// [`MessagePersistedEvent::message_id`] and
@@ -9917,6 +9925,7 @@ mod tests {
                 message_id: Some("local:demo:17:1700000000000000000".into()),
                 source: Some("user".into()),
                 media: vec![],
+                reasoning_content: None,
             }]),
             threads: Some(vec![ThreadGraphEntry {
                 thread_id: "thread-1".into(),

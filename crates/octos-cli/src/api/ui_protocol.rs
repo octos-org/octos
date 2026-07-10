@@ -12555,6 +12555,14 @@ async fn handle_session_hydrate(
                             persisted_at: msg.timestamp,
                             message_id,
                             source,
+                            // The store persists reasoning; without this the
+                            // "· reasoning" block vanishes on every client
+                            // restart. Same gate as message_id/source.
+                            reasoning_content: if expose_message_id {
+                                msg.reasoning_content.clone()
+                            } else {
+                                None
+                            },
                             // P1.3 fix: surface canonical-ledger media so a
                             // client reconnecting after a disconnect can
                             // re-render the same `.md` / `.mp3` / `.pptx`
@@ -12805,6 +12813,7 @@ async fn handle_session_rollback(
                 persisted_at: msg.timestamp,
                 message_id: None,
                 source: None,
+                reasoning_content: None,
                 media: msg.media.clone(),
             })
             .collect::<Vec<_>>();
@@ -37679,7 +37688,10 @@ ignore = []
                 media: vec!["research/_report.md".into()],
                 tool_calls: None,
                 tool_call_id: None,
-                reasoning_content: None,
+                // Persisted thinking text — must survive into the hydrated
+                // row for negotiated clients (the "· reasoning" block used
+                // to vanish on every client restart).
+                reasoning_content: Some("I should summarize the findings.".into()),
                 client_message_id: None,
                 thread_id: Some("cmid-user-1".into()),
                 timestamp: spawn_ack_ts,
@@ -37820,6 +37832,19 @@ ignore = []
             .expect("seq=1 companion row");
         assert_eq!(companion_row["source"], "background");
         assert_eq!(spawn_ack_row["source"], "background");
+        // Negotiated hydrate carries the persisted reasoning so the
+        // "· reasoning" block survives a client restart.
+        assert_eq!(
+            spawn_ack_row["reasoning_content"], "I should summarize the findings.",
+            "hydrated row must surface persisted reasoning_content"
+        );
+        assert!(
+            companion_row
+                .get("reasoning_content")
+                .map(|v| v.is_null())
+                .unwrap_or(true),
+            "rows without reasoning omit the field"
+        );
         let user_row = messages_new
             .iter()
             .find(|m| m["seq"] == 0)
