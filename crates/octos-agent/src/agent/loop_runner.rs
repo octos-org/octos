@@ -811,6 +811,22 @@ impl Agent {
                     timestamp: chrono::Utc::now(),
                 }];
 
+                // #1587: session-start conversational episodic recall. On
+                // the FIRST turn of a conversation (empty history), surface
+                // relevant past episodes ONCE — bounded to turn 1 so there
+                // is no per-turn embed latency, and inheriting the
+                // contamination guard from the shared helper (embedder-only,
+                // 0.55 floor). No-op without an embedder or on empty input.
+                if history.is_empty() && !user_content.trim().is_empty() {
+                    let default_cwd = std::path::PathBuf::from(".");
+                    let cwd = self.tools.workspace_root().unwrap_or(default_cwd.as_path());
+                    if let Some(recall) =
+                        self.recall_relevant_episodes(user_content, cwd).await
+                    {
+                        messages.push(recall);
+                    }
+                }
+
                 messages.extend_from_slice(history);
 
                 // A turn carrying BOTH an audio attachment (a spoken/voice turn)
