@@ -194,32 +194,28 @@ impl Agent {
         );
         episode.source = octos_memory::EpisodeSource::Conversation;
         let ep_id = episode.id.clone();
-        // SUPERSEDE the session's prior conversation episode. Preflight
-        // compaction fires on every turn once the conversation is large, so
-        // a fresh-id-per-compaction append would grow PER TURN (codex #1618
-        // round-3 P2). Instead each compaction stores the new (latest,
-        // cumulative) summary and then DELETES the prior one — the store's
-        // delete_by_id removes it from redb + BM25 + HNSW + embeddings — so
-        // a session keeps exactly ONE conversation episode. (A repeated-id
-        // "upsert" cannot work: the hybrid index ignores a repeated id.)
-        // Snapshot the prior id WITHOUT holding the lock across an await.
-        let prior_id = self
-            .conversation_episode_id
-            .lock()
-            .ok()
-            .and_then(|g| g.clone());
-        if let Err(e) = self.memory.store(episode).await {
-            warn!(error = %e, "failed to save conversation episode");
+        // Save ONCE per session, at the first compaction. Preflight
+        // compaction fires on iteration 1 of EVERY turn once the
+        // conversation is large, so saving on each would grow per-turn
+        // (codex #1618 round-3). Supersede-via-delete was rejected: the
+        // hybrid index only TOMBSTONES on delete (never reclaims), so it
+        // would churn the index per compaction (round-4). One episode
+        // captures the conversation's first substantial summary — enough
+        // for "was there a conversation about X"; durable facts are handled
+        // separately by the memory-refresh pipeline. The swap makes
+        // concurrent saves collapse to exactly one.
+        if self
+            .conversation_episode_saved
+            .swap(true, std::sync::atomic::Ordering::AcqRel)
+        {
             return;
         }
-        // Delete AFTER the new one is stored, so recall never sees zero.
-        if let Some(old) = prior_id {
-            if old != ep_id {
-                let _ = self.memory.delete_by_id(&old).await;
-            }
-        }
-        if let Ok(mut g) = self.conversation_episode_id.lock() {
-            *g = Some(ep_id.clone());
+        if let Err(e) = self.memory.store(episode).await {
+            warn!(error = %e, "failed to save conversation episode");
+            // Allow a retry on the next compaction — the save didn't land.
+            self.conversation_episode_saved
+                .store(false, std::sync::atomic::Ordering::Release);
+            return;
         }
         info!(
             episode_id = %ep_id,
@@ -893,7 +889,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn save_conversation_episode_supersedes_prior_per_session() {
+    async fn save_conversation_episode_saves_once_per_session() {
         use crate::{Agent, tools::ToolRegistry};
         use octos_memory::EpisodeStore;
         use std::sync::Arc;
@@ -906,8 +902,8 @@ mod tests {
         let agent = Agent::new(AgentId::new("chat"), provider, tools, memory.clone())
             .with_embedder(Arc::new(ConstEmbedder));
 
-        // Each compaction SUPERSEDES the prior conversation episode, so a
-        // session keeps exactly ONE — the latest summary, fully indexed.
+        // Save-once per session: the first compaction's summary is kept;
+        // later compactions are no-ops. Exactly one conversation episode.
         agent
             .save_conversation_episode("first chunk about widgets".to_string())
             .await;
@@ -927,8 +923,8 @@ mod tests {
             conv.len()
         );
         assert!(
-            conv[0].summary.contains("gadgets"),
-            "the surviving episode carries the LATEST summary, not the superseded one"
+            conv[0].summary.contains("widgets"),
+            "the first compaction's summary is the one kept"
         );
     }
 
