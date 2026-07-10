@@ -33,6 +33,7 @@ use tokio::time::timeout;
 use tracing::{debug, warn};
 
 use crate::policy::{CommandPolicy, Decision, SafePolicy};
+use crate::sandbox::Sandbox;
 use crate::subprocess_env::{EnvAllowlist, sanitize_command_env};
 use crate::tools::{ToolRegistry, ToolResult};
 use crate::workspace_policy::{
@@ -430,6 +431,12 @@ pub struct ValidatorRunner {
     evidence_root: PathBuf,
     policy: Arc<dyn CommandPolicy>,
     ledger: Option<ValidatorLedger>,
+    /// Optional sandbox for **command** validators (which shell out). When set,
+    /// each command validator is wrapped via [`Sandbox::wrap_command`] so an
+    /// untrusted workspace `.octos-workspace.toml` can't run unsandboxed host
+    /// commands post-turn. `None` = run directly (current default; trusted
+    /// callers). Opted into on the `mcp-serve` path.
+    sandbox: Option<Arc<dyn Sandbox>>,
 }
 
 impl std::fmt::Debug for ValidatorRunner {
@@ -460,12 +467,21 @@ impl ValidatorRunner {
             evidence_root,
             policy: Arc::new(SafePolicy::default()),
             ledger: None,
+            sandbox: None,
         }
     }
 
     /// Override the directory where evidence files are written.
     pub fn with_evidence_root(mut self, path: impl Into<PathBuf>) -> Self {
         self.evidence_root = path.into();
+        self
+    }
+
+    /// Run **command** validators under `sandbox` (wraps each via
+    /// [`Sandbox::wrap_command`]). Used by callers that must confine
+    /// workspace-declared command validators (e.g. `mcp-serve`).
+    pub fn with_sandbox(mut self, sandbox: Arc<dyn Sandbox>) -> Self {
+        self.sandbox = Some(sandbox);
         self
     }
 
@@ -691,10 +707,61 @@ impl ValidatorRunner {
             }
         }
 
-        let mut command = Command::new(&resolved_cmd);
+        // A configured, real (non-no-op) sandbox means the validator MUST run
+        // inside it. On POSIX the backend runs via `sh -c`, so we shell-quote the
+        // argv with `shlex`. On Windows the backends shell out via `cmd /C`, for
+        // which there is no safe POSIX argv wrapping here — and a workspace policy
+        // can name an arbitrary executable, not merely inject an argument — so
+        // running the argv directly would *bypass* the sandbox. Fail closed there
+        // rather than escape it. A no-op sandbox (NoSandbox, or a backend whose
+        // helper is unavailable) and the no-sandbox case have nothing to escape,
+        // so they run the argv directly, where `Command` passes each element as a
+        // distinct token (injection-safe).
+        let real_sandbox = self.sandbox.as_ref().filter(|s| !s.is_noop());
+        let sandbox_is_windows = cfg!(windows);
+        if real_sandbox.is_some() && sandbox_is_windows {
+            return error_outcome(
+                invocation,
+                validator,
+                started_at,
+                started,
+                format!(
+                    "command validator not supported under the Windows sandbox \
+                     (would bypass AppContainer): {command_string}"
+                ),
+            );
+        }
+        let mut command = match real_sandbox {
+            Some(sandbox) => {
+                // wrap_command runs the string via `sh -c`, so shell-quote each
+                // argv element (build_command_string above is unquoted — it's
+                // only for the SafePolicy display/check). Otherwise `sh -c "sh -c
+                // exit 1"`-style validators would word-split and mis-report.
+                let quoted = match shlex::try_join(
+                    std::iter::once(resolved_cmd.as_str())
+                        .chain(resolved_args.iter().map(String::as_str)),
+                ) {
+                    Ok(q) => q,
+                    Err(_) => {
+                        return error_outcome(
+                            invocation,
+                            validator,
+                            started_at,
+                            started,
+                            format!("command validator contains a NUL byte: {command_string}"),
+                        );
+                    }
+                };
+                sandbox.wrap_command(&quoted, &invocation.workspace_root)
+            }
+            None => {
+                let mut c = Command::new(&resolved_cmd);
+                c.args(&resolved_args)
+                    .current_dir(&invocation.workspace_root);
+                c
+            }
+        };
         command
-            .args(&resolved_args)
-            .current_dir(&invocation.workspace_root)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .stdin(Stdio::null());

@@ -248,6 +248,9 @@ pub struct ValidationCtx<'a> {
     pub notes: &'a HashMap<String, &'a NoteFile>,
     /// Extraction items by item id (`<stem>#<idx>`).
     pub items: &'a HashMap<String, &'a ExtractionItem>,
+    /// Usage stats by entry id / bank slug (#1586). A recently-used entry
+    /// is kept alive against age-based auto-archive.
+    pub usage: &'a std::collections::BTreeMap<String, octos_memory::UsageStat>,
     /// This run performed INIT — only `add` ops are allowed (0-loss).
     pub init_mode: bool,
     pub today: NaiveDate,
@@ -320,9 +323,26 @@ impl<'a> ValidationCtx<'a> {
         self.notes.contains_key(source) || self.items.contains_key(source)
     }
 
+    /// Whether `entry` was cited via `record_memory_use` within the
+    /// `unused_days` window — a keep-alive signal (#1586).
+    fn recently_used(&self, entry: &Entry) -> bool {
+        self.usage
+            .get(&entry.id)
+            .filter(|stat| !stat.last_used.is_empty())
+            .and_then(|stat| NaiveDate::parse_from_str(&stat.last_used, "%Y-%m-%d").ok())
+            .is_some_and(|used| (self.today - used).num_days() <= i64::from(self.unused_days))
+    }
+
     /// Age-based auto-archive eligibility: REAL `(updated:)` stamp strictly
     /// older than `unused_days`; `unknown` NEVER auto-archives.
     fn age_qualifies(&self, entry: &Entry) -> bool {
+        // A recently-USED entry is kept alive even when its `(updated:)`
+        // stamp is old — usage feedback extends the life of memories that
+        // keep proving useful (#1586). Explicit source-cited archive is
+        // unaffected; only the age path is gated.
+        if self.recently_used(entry) {
+            return false;
+        }
         match entry.updated_stamp() {
             Some(UpdatedStamp::Real(date)) => {
                 (self.today - date).num_days() > i64::from(self.unused_days)
@@ -852,6 +872,7 @@ mod tests {
         frozen: HashSet<String>,
         notes: Vec<NoteFile>,
         items: Vec<ExtractionItem>,
+        usage: std::collections::BTreeMap<String, octos_memory::UsageStat>,
         init_mode: bool,
     }
 
@@ -863,6 +884,7 @@ mod tests {
                 frozen: HashSet::new(),
                 notes: Vec::new(),
                 items: Vec::new(),
+                usage: std::collections::BTreeMap::new(),
                 init_mode: false,
             }
         }
@@ -880,6 +902,7 @@ mod tests {
                 frozen: &self.frozen,
                 notes: &notes,
                 items: &items,
+                usage: &self.usage,
                 init_mode: self.init_mode,
                 today: NaiveDate::from_ymd_opt(2026, 7, 7).unwrap(),
                 unused_days: 30,
@@ -919,8 +942,10 @@ mod tests {
     fn should_reject_update_when_content_guard_flags_new_text() {
         // A qualifying host note grants edit authority, so the failure below
         // can only come from the CONTENT gate — not the authority gate.
-        let mut fx = Fixture::default();
-        fx.notes = vec![note("n1", "host", "user_request", "tabs pref changed")];
+        let fx = Fixture {
+            notes: vec![note("n1", "host", "user_request", "tabs pref changed")],
+            ..Default::default()
+        };
         let err = fx
             .validate(&output(
                 vec![Op::Update {
@@ -1204,6 +1229,54 @@ mod tests {
             &[],
         );
         assert!(fx.validate(&out).is_ok());
+    }
+
+    #[test]
+    fn should_keep_alive_recently_used_entry_against_age_archive() {
+        // #1586: ^mbbbbbb is age-eligible (stamp 2026-01-01), but it was
+        // USED 2026-07-01 — within unused_days(30) of today(2026-07-07) —
+        // so the age-based auto-archive must be refused.
+        let mut fx = Fixture::default();
+        fx.usage.insert(
+            "^mbbbbbb".into(),
+            octos_memory::UsageStat {
+                count: 3,
+                last_used: "2026-07-01".into(),
+            },
+        );
+        let out = output(
+            vec![Op::Archive {
+                id: "^mbbbbbb".into(),
+                reason: "stale".into(),
+                sources: vec![],
+            }],
+            &[],
+        );
+        let err = fx.validate(&out).unwrap_err();
+        assert!(err.contains("lacks authority"), "got: {err}");
+    }
+
+    #[test]
+    fn should_still_age_archive_when_last_use_is_itself_stale() {
+        // A used-but-LONG-AGO entry is not kept alive: last_used 2026-01-01
+        // is outside the window, so age archive proceeds as normal.
+        let mut fx = Fixture::default();
+        fx.usage.insert(
+            "^mbbbbbb".into(),
+            octos_memory::UsageStat {
+                count: 9,
+                last_used: "2026-01-01".into(),
+            },
+        );
+        let out = output(
+            vec![Op::Archive {
+                id: "^mbbbbbb".into(),
+                reason: "stale".into(),
+                sources: vec![],
+            }],
+            &[],
+        );
+        assert!(fx.validate(&out).is_ok(), "stale last-use must not protect");
     }
 
     #[test]
