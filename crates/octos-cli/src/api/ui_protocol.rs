@@ -7236,17 +7236,30 @@ async fn raw_session_status_result(
     } else {
         (None, None)
     };
-    Ok(json!({
+    // Emit the `model` object only when the policy actually resolved a
+    // model AND provider. Clients (octos-tui) decode it into a struct whose
+    // `model`/`provider` are non-optional strings, so
+    // `{"model": null, "provider": null, "selected": true}` fails the whole
+    // session/status/read decode and the composer footer degrades to a
+    // placeholder. A missing key is handled fine by their
+    // `Option<ModelStatus>` + `#[serde(default)]` — including in shipped
+    // octos-tui 0.1.5 binaries.
+    let resolved_model = policy.get("model").filter(|value| !value.is_null());
+    let resolved_provider = policy.get("provider").filter(|value| !value.is_null());
+    let model = match (resolved_model, resolved_provider) {
+        (Some(model), Some(provider)) => Some(json!({
+            "model": model,
+            "provider": provider,
+            "selected": true
+        })),
+        _ => None,
+    };
+    let mut result = json!({
         "session_id": session_id,
         "profile_id": profile_id,
         "runtime_policy_stamp": policy,
         "context": context,
         "context_state": context_state,
-        "model": {
-            "model": policy.get("model").cloned().unwrap_or(Value::Null),
-            "provider": policy.get("provider").cloned().unwrap_or(Value::Null),
-            "selected": true
-        },
         "permission_profile": policy.get("permission_profile").cloned().unwrap_or(Value::Null),
         "sandbox": policy.get("sandbox_mode").cloned().unwrap_or(Value::Null),
         "health": { "status": "ok" },
@@ -7255,7 +7268,11 @@ async fn raw_session_status_result(
         "usage": {},
         "cursor": { "healthy": true, "replay_supported": true },
         "capabilities": features.advertised_capabilities(state),
-    }))
+    });
+    if let Some(model) = model {
+        result["model"] = model;
+    }
+    Ok(result)
 }
 
 fn add_autonomy_policy_stamp(policy: &mut Value, features: ConnectionUiFeatures) {
@@ -28582,6 +28599,75 @@ ignore = []
         assert_eq!(
             error.data.as_ref().and_then(|data| data.get("profile_id")),
             Some(&json!("missing"))
+        );
+    }
+
+    #[tokio::test]
+    async fn raw_session_status_read_omits_model_object_when_no_model_resolved() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = Arc::new(local_profile_state(dir.path()));
+        create_or_get_local_solo_profile(
+            &state,
+            local_profile_params("Ada Lovelace", "ada", "ada@example.com"),
+        )
+        .expect("create ada profile");
+
+        let status = raw_session_status_result(
+            &state,
+            &RpcRequest::<Value>::new(
+                "status-no-model",
+                APPUI_METHOD_SESSION_STATUS_READ,
+                json!({ "session_id": "local:tui#coding" }),
+            ),
+            ConnectionUiFeatures::stdio_defaults(),
+            Some("ada"),
+        )
+        .await
+        .expect("status for a profile without a configured model");
+
+        // Guard the setup assumption: this profile really has no resolved
+        // model/provider in its runtime policy stamp.
+        assert_eq!(status["runtime_policy_stamp"]["model"], Value::Null);
+        assert_eq!(status["runtime_policy_stamp"]["provider"], Value::Null);
+        // The contract under test: no resolved model => NO `model` key at
+        // all. Emitting `{"model": null, "provider": null, "selected": true}`
+        // breaks shipped octos-tui decoders whose ModelStatus requires
+        // non-null `model`/`provider` strings — the whole
+        // session/status/read result fails to decode and the composer
+        // footer degrades to the `<server authenticated profile>`
+        // placeholder.
+        assert!(
+            status.get("model").is_none(),
+            "session/status/read must omit the model object when no model is resolved, got: {status}"
+        );
+    }
+
+    #[tokio::test]
+    async fn raw_session_status_read_includes_model_object_when_model_resolved() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, _runtime) = state_with_profile(dir.path(), "coding").await;
+
+        let status = raw_session_status_result(
+            &state,
+            &RpcRequest::<Value>::new(
+                "status-with-model",
+                APPUI_METHOD_SESSION_STATUS_READ,
+                json!({ "session_id": "local:tui#coding" }),
+            ),
+            ConnectionUiFeatures::stdio_defaults(),
+            Some("coding"),
+        )
+        .await
+        .expect("status for a profile with a configured model");
+
+        assert_eq!(
+            status["model"],
+            json!({
+                "model": "m11e-stub",
+                "provider": "stub",
+                "selected": true
+            }),
+            "a resolved model must keep emitting the full model object"
         );
     }
 
