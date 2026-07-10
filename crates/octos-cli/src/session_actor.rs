@@ -6716,22 +6716,40 @@ impl SessionActor {
                 .to_lowercase();
             let slug = slug.trim_matches('-').to_string();
 
-            if let Some(ref ms) = self.memory_store {
+            let mut banked = false;
+            // A punctuation/emoji-only task label slugs to "" and would
+            // persist as bank/entities/.md — unlisted and unrecallable
+            // while the reply claims it was saved (codex round-3 P3).
+            if !slug.is_empty()
+                && let Some(ref ms) = self.memory_store
+            {
                 let report_md = format!(
                     "# {task_label}\n\n_Generated: {}_\n\n{content}",
                     chrono::Utc::now().format("%Y-%m-%d %H:%M UTC"),
                 );
-                if let Err(e) = ms.write_entity(&slug, &report_md).await {
-                    warn!(session = %self.session_key, error = %e, "failed to save report to memory bank");
-                } else {
-                    info!(session = %self.session_key, slug = %slug, len = content.len(), "saved report to memory bank");
+                match ms.write_entity(&slug, &report_md).await {
+                    Err(e) => {
+                        warn!(session = %self.session_key, error = %e, "failed to save report to memory bank");
+                    }
+                    Ok(()) => {
+                        banked = true;
+                        info!(session = %self.session_key, slug = %slug, len = content.len(), "saved report to memory bank");
+                    }
                 }
             }
 
             let preview: String = content.chars().take(300).collect();
-            format!(
-                "✅ **{task_label}** completed.\n\n{preview}...\n\n_Full report saved. Ask me to recall it for details._",
-            )
+            if banked {
+                format!(
+                    "✅ **{task_label}** completed.\n\n{preview}...\n\n_Full report saved. Ask me to recall it for details._",
+                )
+            } else {
+                // Claiming "saved" after a guarded/failed write sends a
+                // later recall to nothing (codex round-2 P2).
+                format!(
+                    "✅ **{task_label}** completed.\n\n{preview}...\n\n_Report could NOT be saved to the memory bank; this preview is all that was kept._",
+                )
+            }
         } else {
             format!("✅ **{task_label}** completed.\n\n{content}")
         }

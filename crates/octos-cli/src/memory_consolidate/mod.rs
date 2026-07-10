@@ -1783,7 +1783,7 @@ mod tests {
         );
 
         let provider = ScriptedProvider::new(&[
-            r#"{"ops":[{"op":"update","id":"^maaaaaa","new_text":"Lives in Seattle. (updated: 2026-07-06)","sources":["01ex-sess#0"]}],"consumed_ids":["01ex-sess#0"],"dropped":[]}"#,
+            r#"{"ops":[{"op":"update","id":"^maaaaaa","new_text":"Lives in Seattle. (updated: 2026-07-06)","sources":["01ex#0"]}],"consumed_ids":["01ex#0"],"dropped":[]}"#,
         ]);
         let outcome = run(&provider, &params(dir.path())).await;
 
