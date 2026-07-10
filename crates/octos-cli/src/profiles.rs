@@ -1185,6 +1185,23 @@ impl ProfileStore {
                 match std::fs::read_to_string(&path) {
                     Ok(content) => match serde_json::from_str::<UserProfile>(&content) {
                         Ok(mut profile) => {
+                            // Quarantine legacy records that predate the
+                            // channel-name reservation (codex #1613 r5):
+                            // a profile id equal to a channel produces
+                            // ambiguous session keys, so it must not
+                            // handle sessions. Skipping (same precedent
+                            // as unparsable JSON above) keeps one legacy
+                            // record from bricking the deployment; the
+                            // warning tells the operator to rename it.
+                            if octos_core::is_reserved_channel_name(&profile.id) {
+                                tracing::warn!(
+                                    path = %path.display(),
+                                    id = %profile.id,
+                                    "skipping profile whose id is a reserved channel name; \
+                                     rename the profile (its session keys are ambiguous)"
+                                );
+                                continue;
+                            }
                             profile.config.normalize_llm_contract();
                             profiles.push(profile);
                         }
@@ -1212,6 +1229,20 @@ impl ProfileStore {
             .wrap_err_with(|| format!("failed to read profile: {id}"))?;
         let mut profile: UserProfile = serde_json::from_str(&content)
             .wrap_err_with(|| format!("failed to parse profile: {id}"))?;
+        // Fail fast on legacy records that predate the channel-name
+        // reservation (codex #1613 r5): a channel-named profile
+        // produces ambiguous session keys (`api:telegram:123` parses as
+        // a bare channel key), so it must not handle sessions. The
+        // error names the fix instead of letting the record limp along.
+        if octos_core::is_reserved_channel_name(&profile.id) {
+            bail!(
+                "profile '{}' uses a reserved channel name as its id and cannot be loaded; \
+                 rename the profile file and its `id` field (e.g. `{}-bot`) — channel-named \
+                 profiles produce ambiguous session keys",
+                profile.id,
+                profile.id
+            );
+        }
         profile.config.normalize_llm_contract();
         Ok(Some(profile))
     }
@@ -1323,6 +1354,32 @@ impl ProfileStore {
 
     pub(crate) fn profile_path(&self, id: &str) -> PathBuf {
         self.profiles_dir.join(format!("{id}.json"))
+    }
+
+    /// Registration-id reservation policy (codex #1613 r6/r8), wired
+    /// into `AuthManager::with_id_taken_probe` by the serve bootstrap:
+    /// `(candidate, authorized) -> taken`.
+    ///
+    /// - No profile file → free for anyone.
+    /// - File exists, ANONYMOUS registration → taken: a generated id
+    ///   must never claim an admin-created-but-unclaimed profile (r6).
+    /// - File exists, AUTHORIZED claim (allowlist provenance for this
+    ///   exact derived id) → claimable ONLY when the record loads
+    ///   cleanly. An unloadable file (corrupt json, quarantined
+    ///   channel-name id) stays reserved: the verify path's
+    ///   auto-create treats a `get` error as "no profile" and would
+    ///   OVERWRITE the file with a default profile (r8 P2).
+    // The only non-test caller (the serve bootstrap) is api-gated; the
+    // policy itself stays unconditional next to the store it guards.
+    #[cfg_attr(not(feature = "api"), allow(dead_code))]
+    pub(crate) fn id_reserved_for_registration(&self, id: &str, authorized: bool) -> bool {
+        if !self.profile_path(id).exists() {
+            return false;
+        }
+        if !authorized {
+            return true;
+        }
+        !matches!(self.get(id), Ok(Some(_)))
     }
 
     /// Return the parent directory of the profiles dir (i.e. the octos home dir).
@@ -1526,7 +1583,13 @@ pub fn resolve_effective_profile(
 }
 
 fn validate_public_subdomain(slug: &str) -> Result<()> {
-    validate_profile_id(slug)?;
+    // Only the SHAPE is shared with profile ids. The channel-name
+    // reservation does NOT apply here: a public subdomain never
+    // occupies the SessionKey profile segment (it resolves to the
+    // owning profile's real id), so `slack`/`telegram`/`line` remain
+    // valid slugs (codex #1613 r5 P2). The subdomain namespace keeps
+    // its own reserved list below.
+    validate_slug_shape(slug, "public subdomain")?;
     if matches!(slug, "www" | "app" | "admin" | "api" | "crew" | "octos") {
         bail!("public subdomain '{slug}' is reserved");
     }
@@ -1723,19 +1786,37 @@ fn restore_masked_optional_secret(new_value: &mut Option<String>, old_value: &Op
     }
 }
 
-/// Validate a profile ID (slug format).
-fn validate_profile_id(id: &str) -> Result<()> {
-    if id.is_empty() || id.len() > 64 {
-        bail!("profile ID must be 1-64 characters");
+/// Shared slug shape check for profile IDs and public subdomains:
+/// 1-64 chars, lowercase alphanumerics and hyphens, no edge hyphens.
+fn validate_slug_shape(value: &str, what: &str) -> Result<()> {
+    if value.is_empty() || value.len() > 64 {
+        bail!("{what} must be 1-64 characters");
     }
-    if !id
+    if !value
         .bytes()
         .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
     {
-        bail!("profile ID must contain only lowercase letters, digits, and hyphens");
+        bail!("{what} must contain only lowercase letters, digits, and hyphens");
     }
-    if id.starts_with('-') || id.ends_with('-') {
-        bail!("profile ID must not start or end with a hyphen");
+    if value.starts_with('-') || value.ends_with('-') {
+        bail!("{what} must not start or end with a hyphen");
+    }
+    Ok(())
+}
+
+/// Validate a profile ID (slug format).
+fn validate_profile_id(id: &str) -> Result<()> {
+    validate_slug_shape(id, "profile ID")?;
+    // Reserve session-key channel names: a profile id equal to a
+    // channel (`api`, `slack`, `line`, …) makes the profiled key
+    // `{id}:{channel}:{chat}` indistinguishable from a bare
+    // `{channel}:{chat}` under `split_base_key`, mis-scoping the
+    // session everywhere (profile_id/channel/chat_id) — and forking it
+    // would persist a wrongly-scoped child (codex #1613 r4). This
+    // reservation applies ONLY to profile ids — see
+    // validate_public_subdomain (codex #1613 r5 P2).
+    if octos_core::is_reserved_channel_name(id) {
+        bail!("profile ID must not be a reserved channel name (e.g. api, slack, line)");
     }
     Ok(())
 }
@@ -2363,10 +2444,132 @@ mod tests {
         assert!(validate_profile_id("user123").is_ok());
         assert!(validate_profile_id("").is_err());
         assert!(validate_profile_id("-bad").is_err());
+        // Channel names are reserved (codex #1613 r4): a profile named
+        // after a channel makes profiled session keys ambiguous.
+        assert!(validate_profile_id("api").is_err());
+        assert!(validate_profile_id("slack").is_err());
+        assert!(validate_profile_id("line").is_err());
         assert!(validate_profile_id("bad-").is_err());
         assert!(validate_profile_id("UPPER").is_err());
         assert!(validate_profile_id("has space").is_err());
         assert!(validate_profile_id("a".repeat(65).as_str()).is_err());
+    }
+
+    #[test]
+    fn should_allow_channel_named_public_subdomains() {
+        // codex #1613 r5 P2: the channel-name reservation exists to keep
+        // the SessionKey PROFILE segment unambiguous. A public subdomain
+        // never occupies that segment (it resolves to the owning
+        // profile's real id), so channel names stay valid slugs here.
+        assert!(validate_public_subdomain("slack").is_ok());
+        assert!(validate_public_subdomain("telegram").is_ok());
+        assert!(validate_public_subdomain("line").is_ok());
+        // The subdomain namespace keeps its OWN reserved list.
+        assert!(validate_public_subdomain("api").is_err());
+        assert!(validate_public_subdomain("www").is_err());
+        assert!(validate_public_subdomain("admin").is_err());
+        // Shape checks still shared with profile ids.
+        assert!(validate_public_subdomain("-bad").is_err());
+        assert!(validate_public_subdomain("UPPER").is_err());
+    }
+
+    #[test]
+    fn registration_reservation_tracks_loadability() {
+        // codex #1613 r6/r8: the probe behind AuthManager's generated-
+        // id loop. Anonymous registration never claims an existing
+        // file; an authorized (allowlist) claim passes only a
+        // cleanly-loadable record — a corrupt file stays reserved, or
+        // the verify path's auto-create (get error → None → save)
+        // would overwrite it with a default profile (r8 P2).
+        let dir = tempfile::tempdir().unwrap();
+        let store = ProfileStore::open(dir.path()).unwrap();
+
+        // Absent: free for anyone.
+        assert!(!store.id_reserved_for_registration("ghost", false));
+        assert!(!store.id_reserved_for_registration("ghost", true));
+
+        // Loadable pre-provisioned profile: reserved from anonymous,
+        // claimable with authorization.
+        let invitee = UserProfile {
+            id: "invitee".into(),
+            name: "Invitee".into(),
+            enabled: true,
+            data_dir: None,
+            parent_id: None,
+            public_subdomain: None,
+            config: ProfileConfig::default(),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        store.save(&invitee).unwrap();
+        assert!(store.id_reserved_for_registration("invitee", false));
+        assert!(!store.id_reserved_for_registration("invitee", true));
+
+        // Corrupt record: reserved from EVERYONE.
+        std::fs::write(store.profile_path("mangled"), "{not json").unwrap();
+        assert!(store.id_reserved_for_registration("mangled", false));
+        assert!(store.id_reserved_for_registration("mangled", true));
+    }
+
+    #[test]
+    fn should_quarantine_legacy_channel_named_profiles_on_load() {
+        // codex #1613 r5 P1: profiles created BEFORE the channel-name
+        // reservation bypass save-time validation forever — an existing
+        // `profiles/api.json` would keep producing `api:<channel>:<chat>`
+        // keys that `split_base_key` mis-parses (profile dropped,
+        // mis-scoped forks). Loading must fail fast instead: `get`
+        // errors with rename guidance, `list` skips the record (same
+        // precedent as unparsable profile JSON) so one legacy record
+        // cannot brick a multi-profile deployment.
+        let dir = tempfile::tempdir().unwrap();
+        let store = ProfileStore::open(dir.path()).unwrap();
+
+        // Plant the legacy record directly on disk, bypassing save().
+        let legacy = serde_json::json!({
+            "id": "api",
+            "name": "Legacy Api",
+            "enabled": true,
+            "created_at": "2025-01-01T00:00:00Z",
+            "updated_at": "2025-01-01T00:00:00Z",
+            "config": {}
+        });
+        std::fs::write(
+            store.profile_path("api"),
+            serde_json::to_string_pretty(&legacy).unwrap(),
+        )
+        .unwrap();
+
+        // A healthy profile sits alongside it.
+        let healthy = UserProfile {
+            id: "alice".into(),
+            name: "Alice".into(),
+            enabled: true,
+            data_dir: None,
+            parent_id: None,
+            public_subdomain: None,
+            config: ProfileConfig::default(),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        store.save(&healthy).unwrap();
+
+        let err = store
+            .get("api")
+            .expect_err("channel-named legacy profile must fail fast on get");
+        assert!(
+            err.to_string().contains("reserved channel name"),
+            "error must explain the rename requirement, got: {err}"
+        );
+
+        let listed = store.list().unwrap();
+        assert!(
+            listed.iter().any(|p| p.id == "alice"),
+            "healthy profiles must survive a legacy record"
+        );
+        assert!(
+            !listed.iter().any(|p| p.id == "api"),
+            "channel-named legacy profile must be skipped from list()"
+        );
     }
 
     #[test]
@@ -2375,7 +2578,8 @@ mod tests {
         let store = ProfileStore::open(dir.path()).unwrap();
 
         let profile = UserProfile {
-            id: "test".into(),
+            // Not "test" — a reserved channel name (codex #1613 r4).
+            id: "test-bot".into(),
             name: "Test Bot".into(),
             enabled: true,
             data_dir: None,
@@ -2406,16 +2610,16 @@ mod tests {
         };
 
         store.save(&profile).unwrap();
-        let loaded = store.get("test").unwrap().unwrap();
-        assert_eq!(loaded.id, "test");
+        let loaded = store.get("test-bot").unwrap().unwrap();
+        assert_eq!(loaded.id, "test-bot");
         assert_eq!(loaded.name, "Test Bot");
         assert!(loaded.enabled);
 
         let profiles = store.list().unwrap();
         assert_eq!(profiles.len(), 1);
 
-        assert!(store.delete("test").unwrap());
-        assert!(store.get("test").unwrap().is_none());
+        assert!(store.delete("test-bot").unwrap());
+        assert!(store.get("test-bot").unwrap().is_none());
     }
 
     #[test]

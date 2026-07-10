@@ -555,6 +555,33 @@ impl SessionKey {
         self.split_base_key().0
     }
 
+    /// Child key for a fork: the parent's profile + channel with a new
+    /// chat id (topic dropped — the child is a fresh conversation). A
+    /// raw colon-less parent — the SPA's opaque per-tab handles
+    /// (`web-123`) — yields a raw child: treating the whole raw id as a
+    /// channel would mint `web-123:<id>` keys, which the raw REST
+    /// resume/title/delete fallbacks intentionally exclude.
+    ///
+    /// Built on `split_base_key`, the same profile/channel boundary the
+    /// rest of the key parsing uses. A last-segment replacement is NOT
+    /// equivalent: chat ids can contain colons (Matrix rooms —
+    /// `matrix:!room:localhost`), so only the registry-backed parse
+    /// places the boundary correctly for both colon chat ids and
+    /// `{profile}:{channel}:{chat}` keys (codex #1613 r2+r3; the
+    /// registry gap for feature-gated channels is fixed in
+    /// `is_channel_name`). Single source of truth for
+    /// `SessionManager::fork` AND the serve-side pre-checks.
+    pub fn fork_child(&self, new_chat_id: &str) -> SessionKey {
+        if !self.base_key().contains(':') {
+            return SessionKey(new_chat_id.to_string());
+        }
+        let (profile, channel, _chat) = self.split_base_key();
+        match profile {
+            Some(profile) => SessionKey(format!("{profile}:{channel}:{new_chat_id}")),
+            None => SessionKey(format!("{channel}:{new_chat_id}")),
+        }
+    }
+
     /// Channel name: `"telegram:12345#foo"` → `"telegram"`.
     pub fn channel(&self) -> &str {
         self.split_base_key().1
@@ -566,6 +593,17 @@ impl SessionKey {
     }
 }
 
+/// Whether `value` is a registered session-key channel name (the
+/// middle segment of a `{channel}:{chat}` or `{profile}:{channel}:{chat}`
+/// key). Exposed so profile-ID validation can REJECT ids that collide
+/// with a channel name: such an id makes `profile:channel:chat`
+/// indistinguishable from `channel:chat_with_colons`, which
+/// `split_base_key` (and thus `profile_id`/`channel`/`fork_child`)
+/// would misparse (codex #1613 r4).
+pub fn is_reserved_channel_name(value: &str) -> bool {
+    is_channel_name(value)
+}
+
 fn is_channel_name(value: &str) -> bool {
     matches!(
         value,
@@ -575,6 +613,7 @@ fn is_channel_name(value: &str) -> bool {
             | "discord"
             | "email"
             | "feishu"
+            | "line"
             | "local"
             | "matrix"
             | "qq-bot"
@@ -583,6 +622,7 @@ fn is_channel_name(value: &str) -> bool {
             | "telegram"
             | "test"
             | "twilio"
+            | "wechat"
             | "wecom"
             | "wecom-bot"
             | "whatsapp"
@@ -598,6 +638,55 @@ impl std::fmt::Display for SessionKey {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fork_child_preserves_profile_and_channel() {
+        // channel:chat parent
+        assert_eq!(
+            SessionKey("local:parent".into()).fork_child("kid").0,
+            "local:kid"
+        );
+        // profile:channel:chat parent keeps BOTH prefixes
+        assert_eq!(
+            SessionKey("tenant:api:parent".into()).fork_child("kid").0,
+            "tenant:api:kid"
+        );
+        // feature-gated channels parse correctly now that the registry
+        // includes them (wechat/line were missing pre-#1613)
+        assert_eq!(
+            SessionKey("tenant:wechat:parent".into())
+                .fork_child("kid")
+                .0,
+            "tenant:wechat:kid"
+        );
+        // colon-bearing chat ids (Matrix rooms) must be REPLACED whole,
+        // not treated as extra prefix segments
+        assert_eq!(
+            SessionKey("matrix:!room:localhost".into())
+                .fork_child("kid")
+                .0,
+            "matrix:kid"
+        );
+        // raw SPA handle (no colon) yields a raw child — NOT
+        // "web-123:kid", which the raw REST fallbacks exclude
+        assert_eq!(
+            SessionKey("web-123".into()).fork_child("web-456").0,
+            "web-456"
+        );
+        // topic parents fork off the base conversation, topic dropped
+        assert_eq!(
+            SessionKey("local:parent#research".into())
+                .fork_child("kid")
+                .0,
+            "local:kid"
+        );
+        assert_eq!(
+            SessionKey("web-123#research".into())
+                .fork_child("web-456")
+                .0,
+            "web-456"
+        );
+    }
 
     #[test]
     fn test_task_id_unique() {

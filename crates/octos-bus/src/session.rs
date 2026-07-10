@@ -1903,6 +1903,14 @@ impl SessionManager {
     /// Serialises on the per-key persist lock so the whole-file rewrite
     /// cannot interleave with (and erase) a canonical locked append or a
     /// concurrent `SessionHandle` rewrite of the same key.
+    /// The directory session files persist under — the on-disk
+    /// collision domain for fork child keys (serve scopes its fork
+    /// reservations by it; two managers over the same dir CAN collide,
+    /// two different profiles' dirs cannot).
+    pub fn sessions_dir(&self) -> &std::path::Path {
+        &self.sessions_dir
+    }
+
     pub async fn rewrite(&self, key: &SessionKey) -> Result<()> {
         let lock = persist_lock_for(key);
         let _guard = lock.lock().await;
@@ -1969,9 +1977,9 @@ impl SessionManager {
     ) -> Result<SessionKey> {
         let parent = self.get_or_create(parent_key).await;
         let messages: Vec<Message> = parent.get_history(copy_messages).to_vec();
-        // Derive channel from parent key (format: "channel:chat_id")
-        let channel = parent_key.0.split(':').next().unwrap_or("cli");
-        let new_key = SessionKey::new(channel, new_chat_id);
+        // Shared derivation rule (SessionKey::fork_child): profile +
+        // channel preserved, raw SPA parents yield raw children.
+        let new_key = parent_key.fork_child(new_chat_id);
 
         let now = Utc::now();
         let session = Session {
@@ -1987,7 +1995,14 @@ impl SessionManager {
             updated_at: now,
         };
         self.cache.put(new_key.0.clone(), session);
-        self.rewrite(&new_key).await?;
+        if let Err(error) = self.rewrite(&new_key).await {
+            // A failed write must not leave a cache-resident ghost:
+            // `session_known` would keep answering true for a child
+            // that was never durably created, wedging retries on
+            // `child_exists` (codex #1613 P2).
+            self.cache.pop(&new_key.0);
+            return Err(error);
+        }
 
         debug!(
             parent = %parent_key,
@@ -3968,6 +3983,38 @@ mod tests {
         assert_eq!(child.messages.len(), 3);
         assert_eq!(child.messages[0].content, "msg2");
         assert_eq!(child.messages[2].content, "msg4");
+    }
+
+    #[tokio::test]
+    async fn test_fork_failed_write_leaves_no_ghost_child() {
+        let tmp = TempDir::new().unwrap();
+        let mut mgr = SessionManager::open(tmp.path()).unwrap();
+        let parent = SessionKey::new("cli", "ghost-parent");
+        mgr.add_message(&parent, make_message(MessageRole::User, "hello"))
+            .await
+            .unwrap();
+
+        // Replace the sessions DIR with a regular FILE: creating the
+        // child's jsonl under it fails with ENOTDIR for EVERY euid —
+        // unlike a 0o555 mode, which root bypasses (codex #1613 r2).
+        let sessions_dir = tmp.path().join("sessions");
+        std::fs::remove_dir_all(&sessions_dir).unwrap();
+        std::fs::write(&sessions_dir, b"not a directory").unwrap();
+
+        let result = mgr.fork(&parent, "ghost-child", 1).await;
+        // Restore the real directory before asserting so the retry leg
+        // below can succeed.
+        std::fs::remove_file(&sessions_dir).unwrap();
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+
+        assert!(result.is_err(), "fork must surface the failed write");
+        assert!(
+            !mgr.session_known(&SessionKey::new("cli", "ghost-child")),
+            "failed fork must not leave a cache-resident ghost child"
+        );
+        // And a retry once storage recovers succeeds.
+        let retried = mgr.fork(&parent, "ghost-child", 1).await.unwrap();
+        assert_eq!(retried, SessionKey::new("cli", "ghost-child"));
     }
 
     #[tokio::test]

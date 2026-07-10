@@ -184,13 +184,26 @@ pub fn email_to_user_id(email: &str) -> String {
     while result.ends_with('-') {
         result.pop();
     }
-    if result.is_empty() {
+    let id = if result.is_empty() {
         "user".into()
     } else if !result.starts_with(|c: char| c.is_ascii_alphanumeric()) {
         // Ensure the slug starts with an alphanumeric character
         format!("u{result}")
     } else {
         result
+    };
+    // The user id doubles as the auto-created profile id, and profile
+    // ids reject reserved channel names (they make profiled session
+    // keys ambiguous — see validate_profile_id). Disambiguate at the
+    // mint so provisioning never persists a user whose profile can't
+    // be created (codex #1613 r5): `api@…` → `api-user`. Reserved
+    // names are short registry words, so the suffix stays within the
+    // 64-char slug limit; the registration collision loop appends
+    // `-N` if `api-user` is taken.
+    if octos_core::is_reserved_channel_name(&id) {
+        format!("{id}-user")
+    } else {
+        id
     }
 }
 
@@ -234,6 +247,23 @@ mod tests {
         assert_eq!(email_to_user_id("Bob.Smith@corp.co"), "bob-smith");
         assert_eq!(email_to_user_id("user+tag@test.com"), "user-tag");
         assert_eq!(email_to_user_id("...@test.com"), "user");
+    }
+
+    #[test]
+    fn should_disambiguate_reserved_channel_names_when_minting_user_ids() {
+        // codex #1613 r5: the user id doubles as the auto-created
+        // profile id, and profile ids reject reserved channel names
+        // (ambiguous session keys). Provisioning must therefore never
+        // MINT one: `api@example.com` used to become user `api`, get
+        // persisted, and then dead-end when the profile save was
+        // rejected — a valid login with no usable profile.
+        assert_eq!(email_to_user_id("api@example.com"), "api-user");
+        assert_eq!(email_to_user_id("slack@corp.co"), "slack-user");
+        assert_eq!(email_to_user_id("line@corp.co"), "line-user");
+        // Non-reserved local parts are untouched.
+        assert_eq!(email_to_user_id("apiteam@example.com"), "apiteam");
+        // The disambiguated id passes user-id validation.
+        assert!(validate_user_id("api-user").is_ok());
     }
 
     #[test]

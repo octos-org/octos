@@ -974,6 +974,10 @@ pub mod methods {
     /// rewind), persist an idempotent append-only marker, and return the
     /// trimmed hydrated thread. MUTATING: changes persisted session state.
     pub const SESSION_ROLLBACK: &str = "session/rollback";
+    /// `session/fork` — create a NEW session copying the tail of an
+    /// existing one (`SessionManager::fork`; parent tracked via
+    /// `parent_key`). MUTATING: writes the child session to disk.
+    pub const SESSION_FORK: &str = "session/fork";
     /// UPCR-2026-010 `thread/graph/get` — thread partition for the session.
     pub const THREAD_GRAPH_GET: &str = "thread/graph/get";
     /// UPCR-2026-011 `turn/state/get` — turn lifecycle introspection.
@@ -1205,6 +1209,7 @@ pub const UI_PROTOCOL_COMMAND_METHODS: &[&str] = &[
     methods::TASK_OUTPUT_READ,
     methods::SESSION_HYDRATE,
     methods::SESSION_ROLLBACK,
+    methods::SESSION_FORK,
     methods::THREAD_GRAPH_GET,
     methods::TURN_STATE_GET,
     methods::AGENT_LIST,
@@ -1308,6 +1313,7 @@ pub const UI_PROTOCOL_FIRST_SERVER_METHODS: &[&str] = &[
     methods::TASK_OUTPUT_READ,
     methods::SESSION_HYDRATE,
     methods::SESSION_ROLLBACK,
+    methods::SESSION_FORK,
     methods::THREAD_GRAPH_GET,
     methods::TURN_STATE_GET,
     methods::AGENT_LIST,
@@ -1702,6 +1708,7 @@ pub enum UiResultKind {
     TaskArtifactRead,
     SessionHydrate,
     SessionRollback,
+    SessionFork,
     ThreadGraphGet,
     TurnStateGet,
     SessionBtw,
@@ -1727,6 +1734,7 @@ pub fn first_server_result_kind_for_method(method: &str) -> Option<UiResultKind>
         methods::TASK_ARTIFACT_READ => Some(UiResultKind::TaskArtifactRead),
         methods::SESSION_HYDRATE => Some(UiResultKind::SessionHydrate),
         methods::SESSION_ROLLBACK => Some(UiResultKind::SessionRollback),
+        methods::SESSION_FORK => Some(UiResultKind::SessionFork),
         methods::THREAD_GRAPH_GET => Some(UiResultKind::ThreadGraphGet),
         methods::TURN_STATE_GET => Some(UiResultKind::TurnStateGet),
         methods::SESSION_BTW => Some(UiResultKind::SessionBtw),
@@ -2775,6 +2783,28 @@ pub struct SessionRollbackResult {
     pub thread: SessionHydrateResult,
 }
 
+/// Params for `session/fork`: branch a new session off `session_id`,
+/// copying the last `copy_messages` messages (absent → the FULL
+/// history). `new_chat_id` becomes the child's chat id; the channel is
+/// derived from the parent key (`channel:chat_id`), matching
+/// `SessionManager::fork`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionForkParams {
+    pub session_id: SessionKey,
+    pub new_chat_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub copy_messages: Option<u32>,
+}
+
+/// Result for `session/fork`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionForkResult {
+    pub new_session_id: SessionKey,
+    pub parent_session_id: SessionKey,
+    /// Messages actually copied into the child.
+    pub copied_messages: u32,
+}
+
 // ----- UPCR-2026-010 `thread/graph/get` -----
 
 /// Params for `thread/graph/get` (UPCR-2026-010).
@@ -3707,6 +3737,7 @@ pub enum UiCommand {
     TaskArtifactRead(TaskArtifactReadParams),
     SessionHydrate(SessionHydrateParams),
     SessionRollback(SessionRollbackParams),
+    SessionFork(SessionForkParams),
     ThreadGraphGet(ThreadGraphGetParams),
     TurnStateGet(TurnStateGetParams),
     SessionBtw(SessionBtwParams),
@@ -3750,6 +3781,7 @@ impl UiCommand {
             Self::TaskArtifactRead(_) => methods::TASK_ARTIFACT_READ,
             Self::SessionHydrate(_) => methods::SESSION_HYDRATE,
             Self::SessionRollback(_) => methods::SESSION_ROLLBACK,
+            Self::SessionFork(_) => methods::SESSION_FORK,
             Self::ThreadGraphGet(_) => methods::THREAD_GRAPH_GET,
             Self::TurnStateGet(_) => methods::TURN_STATE_GET,
             Self::SessionBtw(_) => methods::SESSION_BTW,
@@ -3795,6 +3827,7 @@ impl UiCommand {
             Self::TaskArtifactRead(params) => serde_json::to_value(params),
             Self::SessionHydrate(params) => serde_json::to_value(params),
             Self::SessionRollback(params) => serde_json::to_value(params),
+            Self::SessionFork(params) => serde_json::to_value(params),
             Self::ThreadGraphGet(params) => serde_json::to_value(params),
             Self::TurnStateGet(params) => serde_json::to_value(params),
             Self::SessionBtw(params) => serde_json::to_value(params),
@@ -3866,6 +3899,7 @@ impl UiCommand {
             }
             methods::SESSION_HYDRATE => Ok(Self::SessionHydrate(decode_params(method, params)?)),
             methods::SESSION_ROLLBACK => Ok(Self::SessionRollback(decode_params(method, params)?)),
+            methods::SESSION_FORK => Ok(Self::SessionFork(decode_params(method, params)?)),
             methods::THREAD_GRAPH_GET => Ok(Self::ThreadGraphGet(decode_params(method, params)?)),
             methods::TURN_STATE_GET => Ok(Self::TurnStateGet(decode_params(method, params)?)),
             methods::SESSION_BTW => Ok(Self::SessionBtw(decode_params(method, params)?)),
@@ -4211,6 +4245,7 @@ pub enum UiRpcResult {
     TaskArtifactRead(TaskArtifactReadResult),
     SessionHydrate(SessionHydrateResult),
     SessionRollback(SessionRollbackResult),
+    SessionFork(SessionForkResult),
     ThreadGraphGet(ThreadGraphGetResult),
     TurnStateGet(TurnStateGetResult),
     SessionBtw(SessionBtwResult),
@@ -4237,6 +4272,7 @@ impl UiRpcResult {
             Self::TaskArtifactRead(_) => UiResultKind::TaskArtifactRead,
             Self::SessionHydrate(_) => UiResultKind::SessionHydrate,
             Self::SessionRollback(_) => UiResultKind::SessionRollback,
+            Self::SessionFork(_) => UiResultKind::SessionFork,
             Self::ThreadGraphGet(_) => UiResultKind::ThreadGraphGet,
             Self::TurnStateGet(_) => UiResultKind::TurnStateGet,
             Self::SessionBtw(_) => UiResultKind::SessionBtw,
@@ -4263,6 +4299,7 @@ impl UiRpcResult {
             Self::TaskArtifactRead(_) => Some(methods::TASK_ARTIFACT_READ),
             Self::SessionHydrate(_) => Some(methods::SESSION_HYDRATE),
             Self::SessionRollback(_) => Some(methods::SESSION_ROLLBACK),
+            Self::SessionFork(_) => Some(methods::SESSION_FORK),
             Self::ThreadGraphGet(_) => Some(methods::THREAD_GRAPH_GET),
             Self::TurnStateGet(_) => Some(methods::TURN_STATE_GET),
             Self::SessionBtw(_) => Some(methods::SESSION_BTW),
@@ -4289,6 +4326,7 @@ impl UiRpcResult {
             Self::TaskArtifactRead(result) => serde_json::to_value(result),
             Self::SessionHydrate(result) => serde_json::to_value(result),
             Self::SessionRollback(result) => serde_json::to_value(result),
+            Self::SessionFork(result) => serde_json::to_value(result),
             Self::ThreadGraphGet(result) => serde_json::to_value(result),
             Self::TurnStateGet(result) => serde_json::to_value(result),
             Self::SessionBtw(result) => serde_json::to_value(result),
@@ -4346,6 +4384,7 @@ impl UiRpcResult {
             }
             methods::SESSION_HYDRATE => Ok(Self::SessionHydrate(decode_result(method, result)?)),
             methods::SESSION_ROLLBACK => Ok(Self::SessionRollback(decode_result(method, result)?)),
+            methods::SESSION_FORK => Ok(Self::SessionFork(decode_result(method, result)?)),
             methods::THREAD_GRAPH_GET => Ok(Self::ThreadGraphGet(decode_result(method, result)?)),
             methods::TURN_STATE_GET => Ok(Self::TurnStateGet(decode_result(method, result)?)),
             methods::SESSION_BTW => Ok(Self::SessionBtw(decode_result(method, result)?)),
@@ -6943,6 +6982,7 @@ mod tests {
                 "task/output/read",
                 "session/hydrate",
                 "session/rollback",
+                "session/fork",
                 "thread/graph/get",
                 "turn/state/get",
                 "agent/list",
@@ -7048,6 +7088,7 @@ mod tests {
                 "task/output/read",
                 "session/hydrate",
                 "session/rollback",
+                "session/fork",
                 "thread/graph/get",
                 "turn/state/get",
                 "agent/list",
@@ -7123,6 +7164,7 @@ mod tests {
                     "task/output/read",
                     "session/hydrate",
                     "session/rollback",
+                    "session/fork",
                     "thread/graph/get",
                     "turn/state/get",
                     "agent/list",
