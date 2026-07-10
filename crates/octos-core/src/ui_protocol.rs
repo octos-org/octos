@@ -3187,8 +3187,9 @@ pub struct ContentBulkDeleteResult {
 }
 
 /// Params for `memory/overview`. Empty today; the struct exists so
-/// `{}` / omitted params decode uniformly (mirrors
-/// [`SystemStatusGetParams`]).
+/// `{}` / `null` params decode uniformly (mirrors
+/// [`SystemStatusGetParams`]; the wire `params` MEMBER must still be
+/// present — the frame parser rejects requests without one).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MemoryOverviewParams {}
 
@@ -3236,7 +3237,8 @@ pub struct MemoryEntityResult {
 }
 
 /// Params for `cron/list`. Empty today; the struct exists so `{}` /
-/// omitted params decode uniformly (mirrors [`SystemStatusGetParams`]).
+/// `null` params decode uniformly (mirrors [`SystemStatusGetParams`];
+/// the wire `params` MEMBER must still be present).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CronListParams {}
 

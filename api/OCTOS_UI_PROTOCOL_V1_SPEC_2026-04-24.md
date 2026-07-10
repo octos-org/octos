@@ -1554,8 +1554,9 @@ Request/response Rust types live in `crates/octos-core/src/ui_protocol.rs`
 
 - Gate: `auxiliary.rest_to_ws.v1`
 - Replaces: `GET /api/my/memory`
-- Params type: `MemoryOverviewParams` — `{}` (accepts `{}` or omitted
-  params).
+- Params type: `MemoryOverviewParams` — `{}` (accepts `params: {}` or
+  `params: null`; the `params` member itself must be present — the
+  shared frame parser rejects a request without one, codex #1621 r5).
 - Result type: `MemoryOverviewResult` — `{ overview: MemoryOverviewResponse }`.
   `overview` carries the REST panel body whole (`memory_panel.rs`), plus
   RPC-layer truncation metadata: each document field is capped to a
@@ -1587,7 +1588,8 @@ Request/response Rust types live in `crates/octos-core/src/ui_protocol.rs`
 
 - Gate: `auxiliary.rest_to_ws.v1`
 - Replaces: `GET /api/my/cron`
-- Params type: `CronListParams` — `{}` (accepts `{}` or omitted params).
+- Params type: `CronListParams` — `{}` (accepts `params: {}` or
+  `params: null`; the `params` member itself must be present, as above).
 - Result type: `CronListResult` — `{ jobs: CronJobRow[], count: number,
   gateway_running: bool }`. Mirrors the REST body minus the redundant
   `ok` flag; `gateway_running` reports whether a spawned gateway child
