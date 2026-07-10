@@ -284,6 +284,12 @@ pub struct Agent {
     pub(super) memory: Arc<EpisodeStore>,
     /// Embedding provider for hybrid memory search.
     pub(super) embedder: Option<Arc<dyn EmbeddingProvider>>,
+    /// Id of THIS conversation's current saved episode (#1587 write side).
+    /// Each compaction SUPERSEDES it — store the new summary, then delete
+    /// the prior episode — so a session keeps exactly one conversation
+    /// episode carrying the latest cumulative summary (bounded growth;
+    /// per-agent = per-session). Empty until the first compaction.
+    pub(super) conversation_episode_id: std::sync::Mutex<Option<String>>,
     /// System prompt for this agent, as ordered segments (RwLock for
     /// hot-reload support). See [`prompt_segments::PromptSegments`].
     pub(super) system_prompt: RwLock<prompt_segments::PromptSegments>,
@@ -465,6 +471,7 @@ impl Agent {
             tools,
             memory,
             embedder: None,
+            conversation_episode_id: std::sync::Mutex::new(None),
             system_prompt: RwLock::new(prompt_segments::PromptSegments::from_base(system_prompt)),
             segment_providers: RwLock::new(Vec::new()),
             config: AgentConfig::default(),
@@ -538,6 +545,7 @@ impl Agent {
             tools,
             memory,
             embedder: None,
+            conversation_episode_id: std::sync::Mutex::new(None),
             system_prompt: RwLock::new(prompt_segments::PromptSegments::from_base(system_prompt)),
             segment_providers: RwLock::new(Vec::new()),
             config: AgentConfig::default(),

@@ -193,19 +193,33 @@ impl Agent {
             octos_memory::EpisodeOutcome::Success,
         );
         episode.source = octos_memory::EpisodeSource::Conversation;
-        // Fresh id per compaction. An earlier design reused one id per
-        // session to "upsert", but the hybrid index ignores a repeated id
-        // and HNSW vectors never replace (codex #1618 P2) — so recall would
-        // rank on the FIRST summary forever. A fresh id keeps every episode
-        // fully + correctly indexed. Growth is bounded: compaction is rare
-        // (only when context fills), so a session yields a few episodes —
-        // its substantive chunks. Later summaries subsume earlier ones
-        // (cumulative), so the latest, most complete episode ranks highest;
-        // the earlier partials are minor redundancy.
         let ep_id = episode.id.clone();
+        // SUPERSEDE the session's prior conversation episode. Preflight
+        // compaction fires on every turn once the conversation is large, so
+        // a fresh-id-per-compaction append would grow PER TURN (codex #1618
+        // round-3 P2). Instead each compaction stores the new (latest,
+        // cumulative) summary and then DELETES the prior one — the store's
+        // delete_by_id removes it from redb + BM25 + HNSW + embeddings — so
+        // a session keeps exactly ONE conversation episode. (A repeated-id
+        // "upsert" cannot work: the hybrid index ignores a repeated id.)
+        // Snapshot the prior id WITHOUT holding the lock across an await.
+        let prior_id = self
+            .conversation_episode_id
+            .lock()
+            .ok()
+            .and_then(|g| g.clone());
         if let Err(e) = self.memory.store(episode).await {
             warn!(error = %e, "failed to save conversation episode");
             return;
+        }
+        // Delete AFTER the new one is stored, so recall never sees zero.
+        if let Some(old) = prior_id {
+            if old != ep_id {
+                let _ = self.memory.delete_by_id(&old).await;
+            }
+        }
+        if let Ok(mut g) = self.conversation_episode_id.lock() {
+            *g = Some(ep_id.clone());
         }
         info!(
             episode_id = %ep_id,
@@ -879,7 +893,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn save_conversation_episode_appends_per_compaction() {
+    async fn save_conversation_episode_supersedes_prior_per_session() {
         use crate::{Agent, tools::ToolRegistry};
         use octos_memory::EpisodeStore;
         use std::sync::Arc;
@@ -892,8 +906,8 @@ mod tests {
         let agent = Agent::new(AgentId::new("chat"), provider, tools, memory.clone())
             .with_embedder(Arc::new(ConstEmbedder));
 
-        // Each compaction appends a fresh, fully-indexed episode (HNSW
-        // can't upsert; growth is bounded per session).
+        // Each compaction SUPERSEDES the prior conversation episode, so a
+        // session keeps exactly ONE — the latest summary, fully indexed.
         agent
             .save_conversation_episode("first chunk about widgets".to_string())
             .await;
@@ -902,13 +916,19 @@ mod tests {
             .await;
 
         let all = memory.find_relevant(&workspace, "chunk", 10).await.unwrap();
-        assert!(
-            all.iter().any(|e| e.summary.contains("widgets")),
-            "first compaction episode present + indexed"
+        let conv: Vec<_> = all
+            .iter()
+            .filter(|e| e.summary.contains("chunk about"))
+            .collect();
+        assert_eq!(
+            conv.len(),
+            1,
+            "one conversation episode per session, got {}",
+            conv.len()
         );
         assert!(
-            all.iter().any(|e| e.summary.contains("gadgets")),
-            "second compaction episode present + indexed"
+            conv[0].summary.contains("gadgets"),
+            "the surviving episode carries the LATEST summary, not the superseded one"
         );
     }
 
