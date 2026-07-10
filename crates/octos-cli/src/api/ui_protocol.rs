@@ -7101,7 +7101,7 @@ fn model_list_result(
     json!({ "session_id": session_id, "models": models })
 }
 
-fn raw_catalog_result(state: &AppState) -> Result<Value, RpcError> {
+fn raw_catalog_result(state: &AppState, profile_id: Option<&str>) -> Result<Value, RpcError> {
     let mut families = serde_json::from_str::<Value>(DASHBOARD_PROVIDERS_JSON).map_err(|err| {
         RpcError::internal_error(format!("dashboard provider catalog was not JSON: {err}"))
     })?;
@@ -7110,12 +7110,22 @@ fn raw_catalog_result(state: &AppState) -> Result<Value, RpcError> {
     // dashboard catalog is hand-maintained and lags. Only models are merged —
     // a family absent from the bundled catalog has no key-env/route metadata,
     // so it cannot be onboarded and is skipped.
-    let data_dir = state
-        .profile_store
-        .as_ref()
-        .map(|store| store.octos_home_dir().to_path_buf())
-        .unwrap_or_default();
-    if let Some(qos) = crate::qos_catalog::load_seed_qos_catalog(&data_dir) {
+    // Per-profile QoS catalogs live under `profiles/<id>/data`
+    // (`ProfileRuntime::bootstrap` exports them there); the octos-home file
+    // is the shared seed. Merge the requesting profile's catalog first, then
+    // the home seed (`load_seed_qos_catalog` also falls back to `~/.octos`).
+    let mut sources = Vec::new();
+    if let Some(store) = state.profile_store.as_ref() {
+        let home = store.octos_home_dir().to_path_buf();
+        if let Some(profile_id) = profile_id {
+            sources.push(home.join("profiles").join(profile_id).join("data"));
+        }
+        sources.push(home);
+    }
+    for qos in sources
+        .iter()
+        .filter_map(|dir| crate::qos_catalog::load_seed_qos_catalog(dir))
+    {
         if let Some(families_map) = families.as_object_mut() {
             for entry in &qos.models {
                 let Some((family_id, model_id)) = entry.provider.split_once('/') else {
@@ -7438,17 +7448,15 @@ async fn raw_profile_llm_select(
     connection_profile_id: Option<&str>,
 ) -> Result<Value, RpcError> {
     let params: RawProfileLlmSelectParams = parse_raw_params(request)?;
-    let profile_id = raw_profile_id(
-        &RawProfileParams {
-            profile_id: params.profile_id.clone(),
-            session_id: params.session_id.clone(),
-        },
+    let profile_id = raw_scoped_llm_profile_id(
+        params.profile_id.clone(),
+        params.session_id.as_ref(),
         connection_profile_id,
-    );
+    )?;
     let model_id = nonempty(params.model_id)
         .ok_or_else(|| RpcError::invalid_params("model_id is required"))?;
     let family_id = nonempty(params.family_id);
-    let route_id = nonempty(params.route_id).filter(|route| route != "official");
+    let route_id = nonempty(params.route_id);
 
     let store = profile_store(state)?;
     let mut profile = store
@@ -7457,32 +7465,81 @@ async fn raw_profile_llm_select(
         .ok_or_else(|| RpcError::not_found("profile", profile_id.clone()))?;
 
     let mut llm = profile.config.llm.take().unwrap_or_default();
-    let matches_selection = |selection: &crate::profiles::LlmModelSelectionConfig| {
+    let matches_family_model = |selection: &crate::profiles::LlmModelSelectionConfig| {
         selection.model_id.as_deref() == Some(model_id.as_str())
             && family_id
                 .as_deref()
                 .is_none_or(|family| selection.family_id.as_deref() == Some(family))
-            && route_id.as_deref().is_none_or(|route| {
-                selection
-                    .route
-                    .as_ref()
-                    .and_then(|selection_route| selection_route.route_id.as_deref())
-                    == Some(route)
-            })
     };
-
-    let already_primary = llm.primary.as_ref().is_some_and(&matches_selection);
+    let matches_route = |selection: &crate::profiles::LlmModelSelectionConfig| {
+        route_id.as_deref().is_none_or(|route| {
+            selection
+                .route
+                .as_ref()
+                .and_then(|selection_route| selection_route.route_id.as_deref())
+                == Some(route)
+        })
+    };
+    let matches_exact = |selection: &crate::profiles::LlmModelSelectionConfig| {
+        matches_family_model(selection) && matches_route(selection)
+    };
+    // The route is a REAL discriminator: the same family/model can be
+    // configured on two routes with different endpoints and credentials.
+    // An exact route match always wins; the TUI's synthetic default
+    // ("official" when a configured entry carries no route) may fall back
+    // to a family/model match ONLY when that match is unambiguous.
+    let route_is_synthetic_default = route_id.as_deref() == Some("official");
+    let exact_primary = llm.primary.as_ref().is_some_and(matches_exact);
+    let exact_fallback = llm.fallbacks.iter().position(matches_exact);
+    let target = if exact_primary {
+        None
+    } else if let Some(index) = exact_fallback {
+        Some(index)
+    } else if route_is_synthetic_default {
+        let primary_matches = llm.primary.as_ref().is_some_and(matches_family_model);
+        let fallback_matches = llm
+            .fallbacks
+            .iter()
+            .enumerate()
+            .filter(|(_, selection)| matches_family_model(selection))
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        match (primary_matches, fallback_matches.as_slice()) {
+            (true, []) => None,
+            (false, [index]) => Some(*index),
+            (false, []) => {
+                profile.config.llm = Some(llm);
+                return Err(RpcError::not_found(
+                    "configured model",
+                    format!(
+                        "{model_id} (not configured on profile '{profile_id}' — save it \
+                         first via profile/llm/upsert / the onboarding provider step)"
+                    ),
+                ));
+            }
+            _ => {
+                profile.config.llm = Some(llm);
+                return Err(RpcError::invalid_params(format!(
+                    "model '{model_id}' is configured on multiple routes — pass the \
+                     route_id to disambiguate"
+                )));
+            }
+        }
+    } else {
+        profile.config.llm = Some(llm);
+        return Err(RpcError::not_found(
+            "configured model",
+            format!(
+                "{model_id} (not configured on profile '{profile_id}' — save it first \
+                 via profile/llm/upsert / the onboarding provider step)"
+            ),
+        ));
+    };
+    let already_primary = target.is_none();
     let mut applied = already_primary;
     if !already_primary {
-        let Some(index) = llm.fallbacks.iter().position(&matches_selection) else {
-            profile.config.llm = Some(llm);
-            return Err(RpcError::not_found(
-                "configured model",
-                format!(
-                    "{model_id} (not configured on profile '{profile_id}' — save it first \
-                     via profile/llm/upsert / the onboarding provider step)"
-                ),
-            ));
+        let Some(index) = target else {
+            unreachable!("already_primary guarantees a fallback target index");
         };
         let promoted = llm.fallbacks.remove(index);
         if let Some(demoted) = llm.primary.take() {
@@ -7556,19 +7613,45 @@ async fn raw_profile_llm_select(
     }))
 }
 
+/// Resolve the target profile for the profile-LLM raw methods, rejecting
+/// cross-profile targets on authenticated (profile-scoped) connections —
+/// profile A's credential must never rewire, probe, or spend against
+/// profile B's configured providers.
+fn raw_scoped_llm_profile_id(
+    requested_profile_id: Option<String>,
+    requested_session_id: Option<&SessionKey>,
+    connection_profile_id: Option<&str>,
+) -> Result<String, RpcError> {
+    let requested = nonempty(requested_profile_id).or_else(|| {
+        requested_session_id.and_then(|session_id| session_id.profile_id().map(ToOwned::to_owned))
+    });
+    if let Some(connection_profile_id) = connection_profile_id {
+        if requested
+            .as_deref()
+            .is_some_and(|requested| requested != connection_profile_id)
+        {
+            return Err(RpcError::permission_denied(
+                "profile_id is outside the authenticated profile",
+            )
+            .with_data(json!({
+                "kind": "auth_scope_violation",
+                "connection_profile_id": connection_profile_id,
+                "requested_profile_id": requested,
+            })));
+        }
+        return Ok(connection_profile_id.to_owned());
+    }
+    Ok(requested.unwrap_or_else(|| MAIN_PROFILE_ID.to_string()))
+}
+
 async fn raw_profile_llm_upsert(
     state: &Arc<AppState>,
     request: &RpcRequest<Value>,
     connection_profile_id: Option<&str>,
 ) -> Result<Value, RpcError> {
     let params: RawProfileLlmUpsertParams = parse_raw_params(request)?;
-    let profile_id = raw_profile_id(
-        &RawProfileParams {
-            profile_id: params.profile_id.clone(),
-            session_id: None,
-        },
-        connection_profile_id,
-    );
+    let profile_id =
+        raw_scoped_llm_profile_id(params.profile_id.clone(), None, connection_profile_id)?;
     let store = profile_store(state)?;
     let mut profile = store
         .get(&profile_id)
@@ -7676,13 +7759,8 @@ async fn raw_profile_llm_test(
     connection_profile_id: Option<&str>,
 ) -> Result<Value, RpcError> {
     let params: RawProfileLlmUpsertParams = parse_raw_params(request)?;
-    let profile_id = raw_profile_id(
-        &RawProfileParams {
-            profile_id: params.profile_id.clone(),
-            session_id: None,
-        },
-        connection_profile_id,
-    );
+    let profile_id =
+        raw_scoped_llm_profile_id(params.profile_id.clone(), None, connection_profile_id)?;
     let profile = state
         .profile_store
         .as_ref()
@@ -7813,13 +7891,8 @@ async fn raw_profile_llm_fetch_models(
     connection_profile_id: Option<&str>,
 ) -> Result<Value, RpcError> {
     let params: RawProfileLlmUpsertParams = parse_raw_params(request)?;
-    let profile_id = raw_profile_id(
-        &RawProfileParams {
-            profile_id: params.profile_id.clone(),
-            session_id: None,
-        },
-        connection_profile_id,
-    );
+    let profile_id =
+        raw_scoped_llm_profile_id(params.profile_id.clone(), None, connection_profile_id)?;
     let profile = state
         .profile_store
         .as_ref()
@@ -8321,7 +8394,7 @@ async fn handle_raw_appui_rpc(
         APPUI_METHOD_SESSION_STATUS_READ => {
             raw_session_status_result(state, request, features, connection_profile_id).await
         }
-        APPUI_METHOD_PROFILE_LLM_CATALOG => raw_catalog_result(state),
+        APPUI_METHOD_PROFILE_LLM_CATALOG => raw_catalog_result(state, connection_profile_id),
         APPUI_METHOD_PROFILE_LLM_LIST => {
             let params: RawProfileParams = match parse_raw_params(request) {
                 Ok(params) => params,
@@ -25468,6 +25541,94 @@ mod tests {
         assert_eq!(error.code, rpc_error_codes::RESOURCE_NOT_FOUND);
     }
 
+    /// A profile-scoped connection must not rewire another profile's models
+    /// (codex P1) — and an ambiguous route wildcard must reject rather than
+    /// promote an arbitrary route (codex P2).
+    #[tokio::test]
+    async fn llm_select_enforces_scope_and_route_discrimination() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = Arc::new(local_profile_state(dir.path()));
+
+        // Cross-profile mutation from a profile-scoped connection: denied.
+        let request = RpcRequest::new(
+            "sx".to_string(),
+            APPUI_METHOD_PROFILE_LLM_SELECT.to_string(),
+            json!({ "profile_id": "victim", "model_id": "deepseek-chat" }),
+        );
+        let error = raw_profile_llm_select(&state, &request, Some("attacker"))
+            .await
+            .expect_err("cross-profile select must be denied");
+        assert_eq!(
+            error.data.as_ref().and_then(|data| data.get("kind")),
+            Some(&json!("auth_scope_violation")),
+            "got {error:?}"
+        );
+
+        // Same family/model on two routes: the synthetic "official" wildcard
+        // must reject as ambiguous; an exact route selects that route.
+        for (route, set_primary) in [("autodl", true), ("proxy", false)] {
+            let request = RpcRequest::new(
+                format!("u-{route}"),
+                APPUI_METHOD_PROFILE_LLM_UPSERT.to_string(),
+                json!({
+                    "profile_id": "dev",
+                    "selection": {
+                        "family_id": "zai",
+                        "model_id": "glm-5.2",
+                        "route": { "route_id": route },
+                    },
+                    "set_primary": set_primary,
+                }),
+            );
+            raw_profile_llm_upsert(&state, &request, None)
+                .await
+                .expect("upsert");
+        }
+        let request = RpcRequest::new(
+            "amb".to_string(),
+            APPUI_METHOD_PROFILE_LLM_SELECT.to_string(),
+            json!({
+                "profile_id": "dev",
+                "model_id": "glm-5.2",
+                "route_id": "official",
+            }),
+        );
+        let error = raw_profile_llm_select(&state, &request, None)
+            .await
+            .expect_err("ambiguous route wildcard must reject");
+        assert!(error.message.contains("multiple routes"), "got {error:?}");
+
+        let request = RpcRequest::new(
+            "exact".to_string(),
+            APPUI_METHOD_PROFILE_LLM_SELECT.to_string(),
+            json!({
+                "profile_id": "dev",
+                "model_id": "glm-5.2",
+                "route_id": "proxy",
+            }),
+        );
+        let result = raw_profile_llm_select(&state, &request, None)
+            .await
+            .expect("exact route selects");
+        assert_eq!(result["applied"], true);
+        let profile = state
+            .profile_store
+            .as_ref()
+            .unwrap()
+            .get("dev")
+            .unwrap()
+            .unwrap();
+        let llm = profile.config.llm.as_ref().unwrap();
+        assert_eq!(
+            llm.primary
+                .as_ref()
+                .and_then(|primary| primary.route.as_ref())
+                .and_then(|route| route.route_id.as_deref()),
+            Some("proxy"),
+            "the EXACT route was promoted"
+        );
+    }
+
     /// The onboarding catalog unions the QoS model catalog into the bundled
     /// families — new provider releases (e.g. zai GLM updates) appear without
     /// waiting for the hand-maintained dashboard list; families with no
@@ -25513,7 +25674,7 @@ mod tests {
         .unwrap();
         let state = local_profile_state(dir.path());
 
-        let catalog = raw_catalog_result(&state).expect("catalog");
+        let catalog = raw_catalog_result(&state, None).expect("catalog");
         let families = &catalog["families"];
         let zai_models = families["zai"]["models"].as_array().unwrap();
         assert!(

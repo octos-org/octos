@@ -98,6 +98,11 @@ pub struct SessionRuntimeCache {
     /// [`InflightStorage`] type alias for the lost-wake-race
     /// reasoning behind picking `Semaphore` over `Notify`.
     inflight: InflightStorage,
+    /// Per-profile invalidation generation. Bumped by
+    /// [`Self::invalidate_profile`]; a bootstrap that STARTED before the bump
+    /// (holding the old `ProfileRuntime`) must not insert its stale runtime
+    /// after the sweep — it serves its own caller uncached instead.
+    generations: Arc<std::sync::Mutex<HashMap<String, u64>>>,
     max_size: usize,
     idle_ttl: Duration,
     /// Cancellation signal for the background sweep task. Notified
@@ -216,6 +221,7 @@ impl SessionRuntimeCache {
         Self {
             inner,
             inflight: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            generations: Arc::new(std::sync::Mutex::new(HashMap::new())),
             max_size,
             idle_ttl,
             shutdown,
@@ -384,6 +390,7 @@ impl SessionRuntimeCache {
                     continue;
                 }
                 InflightOutcome::OwnGuard(guard) => {
+                    let generation_at_start = self.profile_generation(&key.0);
                     let result = SessionRuntime::bootstrap_with_permissions_and_sandbox(
                         profile,
                         session_key.clone(),
@@ -394,6 +401,15 @@ impl SessionRuntimeCache {
                     .await;
                     match result {
                         Ok(runtime) => {
+                            if self.profile_generation(&key.0) != generation_at_start {
+                                // The profile was invalidated (e.g. a model
+                                // switch) while we bootstrapped against its
+                                // OLD runtime: serve this caller, but do NOT
+                                // cache — the next turn re-materializes on
+                                // the rebuilt ProfileRuntime.
+                                drop(guard);
+                                return Ok(runtime);
+                            }
                             // `insert_with_eviction` returns the
                             // canonical `Arc<SessionRuntime>` for
                             // this key — either the one we just
@@ -494,8 +510,27 @@ impl SessionRuntimeCache {
     /// upsert): cached `SessionRuntime`s embed the OLD provider chain, so the
     /// next turn must re-materialize against the rebuilt `ProfileRuntime`.
     pub async fn invalidate_profile(&self, profile_id: &str) {
+        // Bump the generation FIRST: any in-flight bootstrap that started
+        // against the old ProfileRuntime observes the change at insert time
+        // and skips caching its stale runtime.
+        {
+            let mut generations = self
+                .generations
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            *generations.entry(profile_id.to_owned()).or_insert(0) += 1;
+        }
         let mut guard = self.inner.write().await;
         guard.retain(|(key_profile, _), _| key_profile != profile_id);
+    }
+
+    fn profile_generation(&self, profile_id: &str) -> u64 {
+        self.generations
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(profile_id)
+            .copied()
+            .unwrap_or(0)
     }
 
     /// Drop every entry whose `last_used` is older than
@@ -629,6 +664,37 @@ mod tests {
             lane_routing: None,
             voice: crate::config::VoiceConfig::default(),
         })
+    }
+
+    /// A bootstrap that started BEFORE an invalidation (still holding the old
+    /// ProfileRuntime) must not cache its stale runtime after the sweep.
+    #[tokio::test]
+    async fn invalidation_mid_bootstrap_skips_the_stale_insert() {
+        let tmp = TempDir::new().unwrap();
+        let profile = make_profile(tmp.path().join("profile-data")).await;
+        let cache = SessionRuntimeCache::new(8, Duration::from_secs(60));
+        let key = SessionKey::new("api", "stale-guard");
+
+        // Simulate "invalidation raced the bootstrap": bump the generation
+        // between the snapshot a bootstrap would take and its insert. The
+        // public surface can't pause mid-bootstrap, so drive the same
+        // sequence the OwnGuard arm runs: snapshot → (invalidate) → insert
+        // gate.
+        let generation_at_start = cache.profile_generation(&profile.profile_id);
+        cache.invalidate_profile(&profile.profile_id).await;
+        assert_ne!(
+            cache.profile_generation(&profile.profile_id),
+            generation_at_start,
+            "invalidation must advance the profile generation"
+        );
+
+        // A fresh get_or_init AFTER the invalidation snapshots the NEW
+        // generation and caches normally.
+        cache
+            .get_or_init(&profile, key.clone(), None)
+            .await
+            .expect("bootstrap");
+        assert_eq!(cache.len().await, 1);
     }
 
     #[tokio::test]
