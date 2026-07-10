@@ -25,6 +25,7 @@ use crate::file_state_cache::FileStateCache;
 use crate::harness_events::{HarnessEvent, HarnessEventSink, write_event_to_sink};
 use crate::prompt_context::PromptContextManager;
 use crate::role_template::RoleTemplate;
+use crate::sandbox::{SandboxConfig, create_sandbox};
 use crate::subagent_output::SubAgentOutputRouter;
 use crate::subagent_summary::AgentSummaryGenerator;
 use crate::task_supervisor::{TaskSupervisor, TaskTerminalGuard};
@@ -876,6 +877,24 @@ pub struct SpawnTool {
     /// `None` keeps the pre-fix behaviour for callers that opted out
     /// (e.g. legacy tests not exercising the gate).
     dispatch_policy: Option<crate::dispatch_policy::DispatchPolicy>,
+    /// #1607 (codex-review follow-up): the session's sandbox config, carried
+    /// so the spawn/agent_mcp child completion path can confine `Command`
+    /// validators declared by an untrusted workspace `workspace_policy.toml`
+    /// to the same backend as the parent's shell/exec tools. Before this
+    /// field, the two validator registries in `execute_with_context`'s
+    /// `agent_mcp` branch were built with `ToolRegistry::with_builtins`
+    /// (hardcoded `NoSandbox`), so `run_project_root_validators` /
+    /// `run_declared_validators` executed a workspace-authored `Command`
+    /// validator directly on the host even when the session was sandboxed —
+    /// a second construction site for the exact escape #1607 closed on the
+    /// `build_validator_runner` chokepoint. Defaults to
+    /// `SandboxConfig::default()`; the real session wiring threads the same
+    /// config the parent `ToolRegistry` was built with via
+    /// [`Self::with_sandbox`]. A no-op backend (`NoSandbox`, or a helper that
+    /// is unavailable) has nothing to escape, so `ValidatorRunner` runs the
+    /// argv directly there — behaviour is unchanged on hosts without a real
+    /// backend.
+    sandbox: SandboxConfig,
 }
 
 impl SpawnTool {
@@ -916,6 +935,7 @@ impl SpawnTool {
             parent_subagent_summary_generator: None,
             child_prompt_context_manager_factory: None,
             dispatch_policy: None,
+            sandbox: SandboxConfig::default(),
         }
     }
 
@@ -959,6 +979,7 @@ impl SpawnTool {
             parent_subagent_summary_generator: None,
             child_prompt_context_manager_factory: None,
             dispatch_policy: None,
+            sandbox: SandboxConfig::default(),
         }
     }
 
@@ -991,6 +1012,18 @@ impl SpawnTool {
     /// Inherit a provider-specific tool policy from the parent agent.
     pub fn with_provider_policy(mut self, policy: Option<ToolPolicy>) -> Self {
         self.provider_policy = policy;
+        self
+    }
+
+    /// #1607 (codex-review follow-up): inherit the session's sandbox config so
+    /// the spawn/agent_mcp child completion path confines workspace-declared
+    /// `Command` validators to the same backend as the parent's shell/exec
+    /// tools. Real session wiring passes the exact `SandboxConfig` the parent
+    /// `ToolRegistry` was built with; callers that don't set it keep the
+    /// host-independent `SandboxConfig::default()` (which resolves to a no-op
+    /// backend when no helper is present, so validators run the argv directly).
+    pub fn with_sandbox(mut self, sandbox: SandboxConfig) -> Self {
+        self.sandbox = sandbox;
         self
     }
 
@@ -2823,8 +2856,27 @@ impl Tool for SpawnTool {
                     crate::workspace_policy::read_workspace_policy(&self.working_dir)
                 {
                     if !policy.validation.validators.is_empty() {
-                        let registry_for_validators =
-                            ToolRegistry::with_builtins(&self.working_dir);
+                        // #1607 (codex-review follow-up): build this
+                        // session-scope validator registry with the session's
+                        // sandbox so a workspace-authored `Command` validator
+                        // runs confined, not directly on the host. `with_builtins`
+                        // hardcodes `NoSandbox`, so `tools.sandbox()` inside
+                        // `build_validator_runner` would be a no-op here even
+                        // when the parent session is sandboxed. A no-op backend
+                        // (no helper present) still runs the argv directly, so
+                        // hosts without a real sandbox are unaffected.
+                        let validator_sandbox: std::sync::Arc<dyn crate::sandbox::Sandbox> =
+                            std::sync::Arc::from(create_sandbox(&self.sandbox));
+                        let mut registry_for_validators = ToolRegistry::with_builtins_and_sandbox(
+                            &self.working_dir,
+                            create_sandbox(&self.sandbox),
+                        );
+                        // Honour the parent's provider tool policy in the validator
+                        // registry too, so a workspace `ToolCall` validator can't
+                        // invoke a tool the policy denies (#1607 codex round 2).
+                        if let Some(policy) = self.provider_policy.clone() {
+                            registry_for_validators.set_provider_policy(policy);
+                        }
                         if let Err(reason) = crate::workspace_contract::run_declared_validators(
                             &registry_for_validators,
                             &self.working_dir,
@@ -2832,6 +2884,7 @@ impl Tool for SpawnTool {
                             "spawn-agent-mcp",
                             crate::validators::ValidatorPhase::Completion,
                             None,
+                            validator_sandbox,
                         )
                         .await
                         {
@@ -2856,12 +2909,32 @@ impl Tool for SpawnTool {
             // branch closes the same bypass.
             if mcp_success {
                 let expected_kind = workflow.as_ref().and_then(workflow_contract_project_kind);
-                let registry_for_validators = ToolRegistry::with_builtins(&self.working_dir);
+                // #1607 (codex-review follow-up): same rationale as the
+                // session-scope block above — the project-root validator pass
+                // runs `Command` validators declared by an untrusted
+                // `slides/<slug>` or `sites/<slug>` `workspace_policy.toml`, so
+                // it MUST inherit the session sandbox instead of `with_builtins`'
+                // hardcoded `NoSandbox`. This is the child mirror of the
+                // `build_validator_runner` chokepoint fix; without it the
+                // agent_mcp branch is a second unsandboxed construction site.
+                let validator_sandbox: std::sync::Arc<dyn crate::sandbox::Sandbox> =
+                    std::sync::Arc::from(create_sandbox(&self.sandbox));
+                let mut registry_for_validators = ToolRegistry::with_builtins_and_sandbox(
+                    &self.working_dir,
+                    create_sandbox(&self.sandbox),
+                );
+                // Honour the parent's provider tool policy in the validator
+                // registry too, so a workspace `ToolCall` validator can't invoke
+                // a tool the policy denies (#1607 codex round 2).
+                if let Some(policy) = self.provider_policy.clone() {
+                    registry_for_validators.set_provider_policy(policy);
+                }
                 let report = crate::workspace_contract::run_project_root_validators(
                     &registry_for_validators,
                     &self.working_dir,
                     expected_kind,
                     &response.files_to_send,
+                    validator_sandbox,
                 )
                 .await;
                 if let Some(reason) = report.first_failure_reason() {
@@ -2991,7 +3064,21 @@ impl Tool for SpawnTool {
 
         if is_sync {
             // Sync mode: run subagent inline and return the result directly
-            let mut tools = ToolRegistry::with_builtins(&child_working_dir);
+            //
+            // #1607 (codex-review follow-up): build the child registry with the
+            // SESSION sandbox, not the hardcoded `NoSandbox` that
+            // `with_builtins` stores. The child's `child_tools_handle` feeds
+            // `run_declared_validators` / `run_project_root_validators` below,
+            // and `build_validator_runner` confines `ValidatorSpec::Command`
+            // validators to `tools.sandbox()`. A `NoSandbox` registry there
+            // would let an untrusted `workspace_policy.toml` command validator
+            // execute directly on the host from a sandboxed session. On hosts
+            // without a real backend `create_sandbox` yields `NoSandbox` and
+            // the validator runs the argv directly (unchanged).
+            let mut tools = ToolRegistry::with_builtins_and_sandbox(
+                &child_working_dir,
+                create_sandbox(&self.sandbox),
+            );
             // Load plugin tools so subagents can use fm_tts, etc.
             // Section B (codex review P1.1): honour the parent's
             // require_signed policy so unsigned plugins are rejected here
@@ -3174,6 +3261,7 @@ impl Tool for SpawnTool {
                                     "spawn",
                                     crate::validators::ValidatorPhase::Completion,
                                     None,
+                                    std::sync::Arc::from(create_sandbox(&self.sandbox)),
                                 )
                                 .await
                                 {
@@ -3209,6 +3297,7 @@ impl Tool for SpawnTool {
                             &child_working_dir,
                             expected_kind,
                             &r.files_to_send,
+                            std::sync::Arc::from(create_sandbox(&self.sandbox)),
                         )
                         .await;
                         if let Some(reason) = report.first_failure_reason() {
@@ -3339,6 +3428,12 @@ impl Tool for SpawnTool {
                 .take()
                 .map(WorkerWorktreeGuard::disarm);
             let provider_policy = self.provider_policy.clone();
+            // #1607 (codex-review follow-up): capture the session sandbox so the
+            // detached background child registry can be built with it (see the
+            // `with_builtins_and_sandbox` call inside the closure). Without this
+            // the background child's validator registry stored `NoSandbox`, so a
+            // workspace-declared command validator could escape to the host.
+            let child_sandbox = self.sandbox.clone();
             let additional_instructions = input.additional_instructions;
             let default_worker_prompt = self.worker_prompt.clone();
             let bg_sender = self.background_result_sender.clone();
@@ -3525,7 +3620,17 @@ impl Tool for SpawnTool {
                 };
                 let harness_event_sink_path = harness_event_sink.as_ref().map(|sink| sink.uri());
 
-                let mut tools = ToolRegistry::with_builtins(&working_dir);
+                // #1607 (codex-review follow-up): build the detached child
+                // registry with the SESSION sandbox rather than the hardcoded
+                // `NoSandbox` `with_builtins` stores. Its `child_tools_handle`
+                // feeds `run_declared_validators` / `run_project_root_validators`
+                // below, and `build_validator_runner` confines command
+                // validators to `tools.sandbox()`. On hosts without a real
+                // backend `create_sandbox` yields `NoSandbox` (unchanged).
+                let mut tools = ToolRegistry::with_builtins_and_sandbox(
+                    &working_dir,
+                    create_sandbox(&child_sandbox),
+                );
                 // Load plugin tools so subagents can use fm_tts, etc.
                 // Section B (codex review P1.1): inherit the parent's
                 // require_signed gate.
@@ -3732,6 +3837,7 @@ impl Tool for SpawnTool {
                             "spawn",
                             crate::validators::ValidatorPhase::Completion,
                             None,
+                            std::sync::Arc::from(create_sandbox(&child_sandbox)),
                         )
                         .await
                         {
@@ -3765,6 +3871,7 @@ impl Tool for SpawnTool {
                         &working_dir,
                         expected_kind,
                         bg_files_to_send,
+                        std::sync::Arc::from(create_sandbox(&child_sandbox)),
                     )
                     .await;
                     if let Some(reason) = report.first_failure_reason() {
@@ -4417,6 +4524,12 @@ mod tests {
             parent_subagent_summary_generator: None,
             child_prompt_context_manager_factory: None,
             dispatch_policy: None,
+            // Explicit no-op sandbox keeps this unit test host-independent
+            // (no dependency on whether a real backend helper is installed).
+            sandbox: SandboxConfig {
+                mode: crate::sandbox::SandboxMode::None,
+                ..SandboxConfig::default()
+            },
         };
 
         assert_eq!(tool.worker_count.load(Ordering::SeqCst), 0);
@@ -4427,6 +4540,80 @@ mod tests {
 
         // Worker count should not increment on invalid input
         assert_eq!(tool.worker_count.load(Ordering::SeqCst), 0);
+    }
+
+    /// #1607 (codex-review follow-up): the spawn/agent_mcp child completion
+    /// path builds its validator registries with
+    /// `ToolRegistry::with_builtins_and_sandbox(&self.working_dir,
+    /// create_sandbox(&self.sandbox))`. This test locks in that the sandbox
+    /// threaded via `with_sandbox` actually reaches that registry (i.e. the
+    /// two construction sites are NOT the pre-fix hardcoded `with_builtins` /
+    /// `NoSandbox`). Docker mode is chosen because `create_sandbox` returns a
+    /// `DockerSandbox` unconditionally (no docker binary required), so the
+    /// assertion is host-independent: a hardcoded `NoSandbox` would report
+    /// `is_noop() == true` / `is_docker() == false`, which would fail here.
+    #[tokio::test]
+    async fn spawn_threads_configured_sandbox_into_validator_registry() {
+        let (in_tx, _in_rx) = tokio::sync::mpsc::channel(16);
+        let tool = SpawnTool::new(
+            Arc::new(MockProvider),
+            Arc::new(create_test_store().await),
+            PathBuf::from("/tmp"),
+            in_tx,
+        )
+        .with_sandbox(SandboxConfig {
+            mode: crate::sandbox::SandboxMode::Docker,
+            ..SandboxConfig::default()
+        });
+
+        // Reconstruct exactly what the two `execute_with_context` validator
+        // blocks build (`with_builtins_and_sandbox(&self.working_dir,
+        // create_sandbox(&self.sandbox))`) and assert the backend is the one
+        // we configured, not a hardcoded no-op.
+        let registry = ToolRegistry::with_builtins_and_sandbox(
+            &tool.working_dir,
+            create_sandbox(&tool.sandbox),
+        );
+        let sandbox = registry.sandbox();
+        assert!(
+            sandbox.is_docker(),
+            "spawn validator registry must inherit the SpawnTool sandbox \
+             (Docker here), not the pre-#1607 hardcoded NoSandbox"
+        );
+        assert!(
+            !sandbox.is_noop(),
+            "a real backend threaded via with_sandbox must not be a no-op"
+        );
+    }
+
+    /// #1607 (codex-review follow-up): the default (unconfigured) SpawnTool
+    /// keeps a `SandboxConfig::default()` and stays host-independent — an
+    /// explicit `SandboxMode::None` resolves to `NoSandbox` (is_noop), so the
+    /// validator registry runs command validators directly (pre-#1607
+    /// behaviour) on hosts without a real backend.
+    #[tokio::test]
+    async fn spawn_none_sandbox_registry_is_noop() {
+        let (in_tx, _in_rx) = tokio::sync::mpsc::channel(16);
+        let tool = SpawnTool::new(
+            Arc::new(MockProvider),
+            Arc::new(create_test_store().await),
+            PathBuf::from("/tmp"),
+            in_tx,
+        )
+        .with_sandbox(SandboxConfig {
+            mode: crate::sandbox::SandboxMode::None,
+            ..SandboxConfig::default()
+        });
+
+        let registry = ToolRegistry::with_builtins_and_sandbox(
+            &tool.working_dir,
+            create_sandbox(&tool.sandbox),
+        );
+        assert!(
+            registry.sandbox().is_noop(),
+            "SandboxMode::None must resolve to a no-op backend so command \
+             validators run directly (host-independent)"
+        );
     }
 
     #[tokio::test]
@@ -5186,6 +5373,7 @@ PY
                     temp.path(),
                     Some(crate::WorkspaceProjectKind::Slides),
                     &files_to_send,
+                    std::sync::Arc::new(crate::sandbox::NoSandbox),
                 )
                 .await;
             });

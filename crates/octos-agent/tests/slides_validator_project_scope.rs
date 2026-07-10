@@ -112,6 +112,7 @@ async fn html_pptx_fails_slides_kind_project_scope_validator_gate() {
         None,
         None,
         Some(vec![deck_path.clone()]),
+        Arc::new(octos_agent::sandbox::NoSandbox),
     )
     .await;
 
@@ -163,6 +164,7 @@ async fn valid_pptx_passes_slides_kind_project_scope_validator_gate() {
         None,
         None,
         Some(vec![deck_path.clone()]),
+        Arc::new(octos_agent::sandbox::NoSandbox),
     )
     .await
     .expect("genuine PPTX must pass the slides project-scope validator gate");
@@ -274,6 +276,7 @@ async fn project_root_validators_write_to_project_ledger_without_manual_seeding(
         session_root,
         Some(WorkspaceProjectKind::Slides),
         &files_to_send,
+        Arc::new(octos_agent::sandbox::NoSandbox),
     )
     .await;
 

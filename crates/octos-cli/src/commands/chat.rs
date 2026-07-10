@@ -686,7 +686,12 @@ impl ChatCommand {
         let worker_prompt = super::load_prompt("worker", octos_agent::DEFAULT_WORKER_PROMPT);
         let mut spawn_tool =
             octos_agent::SpawnTool::new(llm.clone(), memory.clone(), cwd.clone(), spawn_tx)
-                .with_worker_prompt(worker_prompt);
+                .with_worker_prompt(worker_prompt)
+                // #1607 (codex-review follow-up): thread the same sandbox the
+                // parent registry was built from so the spawn/agent_mcp child
+                // completion path confines workspace-declared `Command`
+                // validators instead of running them on the host.
+                .with_sandbox(effective_sandbox_config.clone());
         if let Some(ref embedder) = embedder {
             // Workers save episodes by default; without the embedder those
             // episodes are stored vectorless and worker recall skips.
@@ -820,6 +825,10 @@ impl ChatCommand {
             plugin_dirs.clone(),
             config.plugins.require_signed,
             embedder.clone(),
+            // #1607: same sandbox `octos chat` builds for its shell/exec tools
+            // (see `effective_sandbox_config` above), so pipeline command
+            // validators run under the identical backend.
+            effective_sandbox_config.clone(),
         );
         tools.register(pipeline_tool);
         tools.mark_spawn_only(
@@ -1426,12 +1435,18 @@ pub(crate) fn build_run_pipeline_tool(
     plugin_dirs: Vec<PathBuf>,
     plugin_require_signed: bool,
     embedder: Option<Arc<dyn EmbeddingProvider>>,
+    // #1607: session sandbox forwarded onto the pipeline executor so its
+    // terminal / per-node command validators run confined instead of on the
+    // host.
+    sandbox: octos_agent::SandboxConfig,
 ) -> octos_pipeline::RunPipelineTool {
     let mut pipeline_tool =
         octos_pipeline::RunPipelineTool::new(llm, memory, cwd, data_dir.clone())
             .with_provider_policy(provider_policy)
             .with_plugin_dirs(plugin_dirs)
             .with_plugin_require_signed(plugin_require_signed)
+            // #1607: confine pipeline command validators to the session sandbox.
+            .with_sandbox(sandbox)
             // Gap 4.1 BLOCKER 2/3: `octos chat` bootstraps the bundle into
             // `<data_dir>/bundled-pipelines` (see chat.rs above). Register that
             // exact dir as the LOWEST-precedence discovery path so the bundled
@@ -1847,6 +1862,7 @@ mod tests {
             vec![],
             false,
             Some(embedder),
+            octos_agent::SandboxConfig::default(),
         );
 
         assert!(
@@ -1905,6 +1921,7 @@ mod tests {
             vec![],
             false,
             None,
+            octos_agent::SandboxConfig::default(),
         );
 
         assert!(

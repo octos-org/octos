@@ -378,6 +378,11 @@ impl AcpBootstrap {
         tools.register(
             octos_agent::SpawnTool::new(llm.clone(), memory.clone(), cwd.clone(), spawn_tx)
                 .with_worker_prompt(worker_prompt)
+                // #1607 (codex-review follow-up): thread the same sandbox the
+                // parent registry was built from so the spawn/agent_mcp child
+                // completion path confines workspace-declared `Command`
+                // validators instead of running them on the host.
+                .with_sandbox(sandbox.clone())
                 // Embed-on-save + recall parity: ACP spawn subagents save
                 // episodes; without the shared embedder they store them
                 // vectorless and their episodic recall silently skips.
@@ -457,6 +462,10 @@ impl AcpBootstrap {
             plugin_dirs.clone(),
             config.plugins.require_signed,
             shared.embedder.clone(),
+            // #1607: same sandbox the ACP agent registry uses (built at
+            // `build_acp_tool_registry` / the `create_sandbox(&sandbox)` above),
+            // so pipeline command validators run under the identical backend.
+            sandbox.clone(),
         );
         tools.register(pipeline_tool);
         tools.mark_spawn_only(

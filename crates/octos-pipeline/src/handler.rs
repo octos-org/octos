@@ -345,6 +345,15 @@ pub struct CodergenHandler {
     /// per-process tempdir (`cfg(test)` inside octos-agent). Tests
     /// pass a tempdir here to isolate from the user's cache.
     plugin_verified_cache_dir: Option<PathBuf>,
+    /// #1607 (codex round 4): the session sandbox threaded from
+    /// `ExecutorConfig.sandbox` via [`PipelineExecutor::build_codergen`].
+    /// Each per-node worker registry is built with
+    /// `with_builtins_and_sandbox(&working_dir, create_sandbox(&sandbox))`
+    /// so the worker Agent's own project-root validator pass confines a
+    /// workspace-declared `ValidatorSpec::Command` to this sandbox instead of
+    /// running it directly on the host from a sandboxed pipeline. Defaults to
+    /// `SandboxConfig::default()`; a no-op backend runs the argv directly.
+    sandbox: octos_agent::SandboxConfig,
 }
 
 impl CodergenHandler {
@@ -371,7 +380,18 @@ impl CodergenHandler {
             plugin_cache: Arc::new(OnceLock::new()),
             embedder: None,
             plugin_verified_cache_dir: None,
+            sandbox: octos_agent::SandboxConfig::default(),
         }
+    }
+
+    /// #1607 (codex round 4): thread the session sandbox onto every per-node
+    /// worker registry this handler builds, so a workspace-declared `Command`
+    /// validator run by the worker Agent's project-root validator pass is
+    /// confined to the session sandbox instead of executing on the host.
+    /// `PipelineExecutor::build_codergen` calls this with `ExecutorConfig.sandbox`.
+    pub fn with_sandbox(mut self, sandbox: octos_agent::SandboxConfig) -> Self {
+        self.sandbox = sandbox;
+        self
     }
 
     /// Override where plugin verified-exe copies live. Production
@@ -627,7 +647,17 @@ impl Handler for CodergenHandler {
         };
 
         // Build tool registry (same pattern as SpawnTool sync, spawn.rs:269-278)
-        let mut tools = octos_agent::ToolRegistry::with_builtins(&self.working_dir);
+        //
+        // #1607 (codex round 4): carry the session sandbox so the worker
+        // Agent's own project-root validator pass confines a workspace-declared
+        // `ValidatorSpec::Command` to it (the Agent-internal validator path
+        // reads `self.tools.sandbox()`). `with_builtins` would store `NoSandbox`,
+        // letting such a command validator escape to the host from a sandboxed
+        // pipeline. A no-op backend runs the argv directly (unchanged).
+        let mut tools = octos_agent::ToolRegistry::with_builtins_and_sandbox(
+            &self.working_dir,
+            octos_agent::create_sandbox(&self.sandbox),
+        );
 
         // Backend bug #1: load plugin tools from a process-shared cache.
         // The cache is populated on the first node's execute() call (or
