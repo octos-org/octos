@@ -247,6 +247,65 @@ impl CronService {
         found
     }
 
+    /// Enable/disable a job with RECONCILIATION + durable persistence:
+    /// under one store-lock hold, re-read `cron.json` into memory
+    /// (adopting writes from other owners — a gateway child that ran
+    /// and exited, CLI edits), apply the toggle with `enable_job`'s
+    /// next-run semantics, and persist — propagating save failures
+    /// instead of logging them away.
+    ///
+    /// This exists for the serve-side `/api/my/cron` toggle: the
+    /// long-lived ProfileRuntime service's in-memory store can be
+    /// arbitrarily stale w.r.t. the file, and blindly persisting the
+    /// stale store would erase other owners' jobs (codex #1612 r2).
+    /// `Ok(None)` = job not found; `Err` = persistence failed (the
+    /// in-memory store keeps the reloaded + toggled state either way —
+    /// strictly fresher than what it held before).
+    pub fn toggle_job_reconciling(
+        self: &std::sync::Arc<Self>,
+        id: &str,
+        enabled: bool,
+    ) -> Result<Option<CronJob>> {
+        let (found, json) = {
+            let now_ms = Utc::now().timestamp_millis();
+            let mut store = self.store.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(fresh) = load_store(&self.store_path) {
+                *store = fresh;
+            }
+            let found = if let Some(job) = store.jobs.iter_mut().find(|j| j.id == id) {
+                job.enabled = enabled;
+                if enabled {
+                    job.compute_next_run(now_ms);
+                } else {
+                    job.state.next_run_at_ms = None;
+                }
+                Some(job.clone())
+            } else {
+                None
+            };
+            let json = if found.is_some() {
+                Some(
+                    serde_json::to_string_pretty(&*store)
+                        .wrap_err("failed to serialize cron store")?,
+                )
+            } else {
+                None
+            };
+            (found, json)
+        };
+
+        if let Some(json) = json {
+            // Same tmp+rename pattern as save_store, but serialized
+            // under the caller's coordination (the serve mutation lock).
+            let tmp_path = self.store_path.with_extension("tmp");
+            std::fs::write(&tmp_path, &json).wrap_err("failed to write cron store temp")?;
+            std::fs::rename(&tmp_path, &self.store_path).wrap_err("failed to rename cron store")?;
+            self.arm_timer();
+        }
+
+        Ok(found)
+    }
+
     /// Arm a timer for the earliest due job.
     fn arm_timer(self: &std::sync::Arc<Self>) {
         if !self.running.load(Ordering::Relaxed) {

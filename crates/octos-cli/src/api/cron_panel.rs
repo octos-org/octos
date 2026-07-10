@@ -9,19 +9,28 @@
 //! events):
 //!
 //! 1. **The serve-side `ProfileRuntime`'s own `CronService`** (started
-//!    for enabled profiles with an LLM). When one is live we route the
-//!    toggle THROUGH it (`CronService::enable_job` — mutates the
-//!    in-memory store, persists, recomputes `next_run_at_ms`, re-arms
-//!    the timer), so there is no drift by construction.
+//!    for enabled profiles with an LLM). Its in-memory store can be
+//!    ARBITRARILY STALE w.r.t. the file (a gateway child may have run
+//!    and written since it loaded), so the toggle routes through
+//!    `CronService::toggle_job_reconciling`: reload-from-disk +
+//!    toggle + persist under ONE store-lock hold — adopting other
+//!    owners' writes instead of erasing them, and propagating
+//!    persistence failures (codex #1612 r2).
 //! 2. **A spawned gateway child process.** Its `CronService` lives in
 //!    another process we cannot call into — the toggle REFUSES with
-//!    `409 {reason: "gateway_running"}` and the SPA routes the user
-//!    through the existing stop/start controls.
+//!    `409 {reason: "gateway_running"}` (re-checked INSIDE the
+//!    mutation lock) and the SPA routes the user through the existing
+//!    stop/start controls.
 //! 3. **Nobody** — the file is the source of truth and the toggle
 //!    applies atomically (unique tmp + rename), mirroring
 //!    `enable_job`'s next-run semantics so a later `CronService::start`
 //!    (which only recomputes jobs whose next run is `None`) does not
 //!    fire a stale deadline.
+//!
+//! Reads (`GET /api/my/cron`) always come from the FILE: every owner
+//! persists synchronously after each mutation, so the file is the one
+//! view that is never staler than its most recent writer — unlike the
+//! parent service's memory (codex #1612 r2 P1).
 //!
 //! All serve-side mutations are serialized behind a process-wide lock
 //! (concurrent PUTs would otherwise race the read-modify-write and drop
@@ -129,16 +138,13 @@ pub async fn my_cron(
     let cron_path = cron_path_for(&ps.resolve_data_dir(&profile));
 
     let running = gateway_running(&state, &profile_id).await;
-    // Prefer the live service's view — it is what the toggle path will
-    // mutate, and it is fresher than the file between persists.
-    let jobs = if let Some(svc) = live_cron_service(&state, &profile_id) {
-        svc.list_all_jobs()
-    } else {
-        match read_cron_store(&cron_path).await {
-            Ok(Some(store)) => store.jobs,
-            Ok(None) => Vec::new(),
-            Err(status) => return Err(status),
-        }
+    // The FILE is the freshest honest view: every owner persists
+    // synchronously after each mutation, while the parent service's
+    // memory can predate a gateway child's whole lifetime.
+    let jobs = match read_cron_store(&cron_path).await {
+        Ok(Some(store)) => store.jobs,
+        Ok(None) => Vec::new(),
+        Err(status) => return Err(status),
     };
 
     let now_ms = Utc::now().timestamp_millis();
@@ -217,24 +223,22 @@ pub(crate) async fn apply_cron_toggle(
     Ok(updated)
 }
 
-/// Route the toggle through a live `CronService` (it owns the store:
-/// persists, recomputes next-run, re-arms its timer). Split from the
-/// handler so the service path is unit-testable without a
-/// `ProfileRuntime`.
+/// Route the toggle through a live `CronService` with reconciliation:
+/// reload-from-disk + toggle + persist under one store-lock hold, so a
+/// stale parent service ADOPTS other owners' writes instead of erasing
+/// them, and save failures surface as errors instead of `ok: true`
+/// (codex #1612 r2). Split from the handler so the service path is
+/// unit-testable without a `ProfileRuntime`.
 pub(crate) fn toggle_via_service(
     svc: &Arc<CronService>,
     job_id: &str,
     enabled: bool,
 ) -> Result<octos_bus::CronJob, ToggleError> {
-    if !svc.enable_job(job_id, enabled) {
-        return Err(ToggleError::NotFound);
+    match svc.toggle_job_reconciling(job_id, enabled) {
+        Ok(Some(job)) => Ok(job),
+        Ok(None) => Err(ToggleError::NotFound),
+        Err(_) => Err(ToggleError::Io),
     }
-    svc.list_all_jobs()
-        .into_iter()
-        .find(|j| j.id == job_id)
-        // Present a beat ago under the store lock; racing deletion is
-        // the only way to lose it. Treat as gone.
-        .ok_or(ToggleError::NotFound)
 }
 
 /// PUT /api/my/cron/{job_id}/enabled
@@ -263,16 +267,16 @@ pub async fn set_my_cron_enabled(
         .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "profile_read_failed"))?
         .ok_or_else(|| err(StatusCode::NOT_FOUND, "profile_not_found"))?;
 
-    // A spawned gateway child owns cron.json from another process; we
-    // can neither call into it nor safely edit under it. Refuse and let
+    let _mutation = CRON_MUTATION_LOCK.lock().await;
+    // Ownership checked INSIDE the lock: a gateway child (or a
+    // ProfileRuntime) that came up while we queued behind another
+    // toggle must be respected, not written under (codex #1612 r2 P2).
+    // A spawned child owns cron.json from another process; we can
+    // neither call into it nor safely edit under it — refuse and let
     // the SPA route the user through the stop/start controls.
     if gateway_running(&state, &profile_id).await {
         return Err(err(StatusCode::CONFLICT, "gateway_running"));
     }
-
-    let _mutation = CRON_MUTATION_LOCK.lock().await;
-    // Resolved INSIDE the lock: a runtime that came up while we waited
-    // must be routed through, not written under.
     let outcome = if let Some(svc) = live_cron_service(&state, &profile_id) {
         toggle_via_service(&svc, &job_id, body.enabled)
     } else {
@@ -524,6 +528,79 @@ mod tests {
         assert!(
             next > now_ms,
             "every-30m job must be scheduled in the future, got {next} vs now {now_ms}"
+        );
+    }
+
+    #[tokio::test]
+    async fn toggle_via_service_adopts_external_writes_instead_of_erasing_them() {
+        // codex #1612 r2 P1: the parent service's memory can predate a
+        // gateway child's whole lifetime. A toggle routed through it
+        // must ADOPT the file's current jobs, not persist its stale
+        // memory over them.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cron.json");
+        let store = octos_bus::CronStore {
+            version: 1,
+            jobs: vec![make_job("old", true)],
+        };
+        tokio::fs::write(&path, serde_json::to_string(&store).unwrap())
+            .await
+            .unwrap();
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        // Service loads {old} into memory…
+        let svc = Arc::new(CronService::new(&path, tx));
+        // …then an external owner (gateway child / CLI) rewrites the
+        // file with an ADDITIONAL job.
+        let external = octos_bus::CronStore {
+            version: 1,
+            jobs: vec![make_job("old", true), make_job("child-added", true)],
+        };
+        tokio::fs::write(&path, serde_json::to_string(&external).unwrap())
+            .await
+            .unwrap();
+
+        // Toggling through the service must see child-added AND keep it.
+        let toggled = toggle_via_service(&svc, "child-added", false).unwrap();
+        assert!(!toggled.enabled);
+        let reread: octos_bus::CronStore =
+            serde_json::from_str(&tokio::fs::read_to_string(&path).await.unwrap()).unwrap();
+        assert_eq!(reread.jobs.len(), 2, "child-added must survive: {reread:?}");
+        assert!(reread.jobs.iter().any(|j| j.id == "old" && j.enabled));
+        assert!(
+            reread
+                .jobs
+                .iter()
+                .any(|j| j.id == "child-added" && !j.enabled)
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn toggle_via_service_surfaces_persistence_failures() {
+        // codex #1612 r2 P2: enable_job swallowed save errors and
+        // reported ok. The reconciling path must propagate them.
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cron.json");
+        let store = octos_bus::CronStore {
+            version: 1,
+            jobs: vec![make_job("one", true)],
+        };
+        tokio::fs::write(&path, serde_json::to_string(&store).unwrap())
+            .await
+            .unwrap();
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let svc = Arc::new(CronService::new(&path, tx));
+
+        let live = std::fs::metadata(dir.path()).unwrap().permissions();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o555)).unwrap();
+        let outcome = toggle_via_service(&svc, "one", false);
+        std::fs::set_permissions(dir.path(), live).unwrap();
+
+        assert!(
+            matches!(outcome, Err(ToggleError::Io)),
+            "failed persistence must not report ok: {outcome:?}"
         );
     }
 
