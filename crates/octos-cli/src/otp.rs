@@ -447,11 +447,41 @@ impl AuthManager {
             .await
     }
 
+    /// Verify with ANONYMOUS registration semantics: a generated id
+    /// must not claim an existing-but-unclaimed profile (the
+    /// `id_taken_probe` applies — codex #1613 r6).
     pub async fn verify_otp_with_registration(
         &self,
         email: &str,
         code: &str,
         allow_registration: bool,
+    ) -> Result<Option<String>> {
+        self.verify_otp_registration_inner(email, code, allow_registration, false)
+            .await
+    }
+
+    /// Verify with AUTHORIZED-CLAIM semantics (codex #1613 r7 P1): the
+    /// caller has explicit provenance — an allowlist entry — that this
+    /// email is entitled to its derived id, so an existing unclaimed
+    /// profile under that id is the invitee's pre-provisioned profile,
+    /// not a squat target. The profile probe is skipped; user-row
+    /// collisions still advance the suffix (a user row means the id
+    /// belongs to a DIFFERENT account).
+    pub async fn verify_otp_with_authorized_claim(
+        &self,
+        email: &str,
+        code: &str,
+    ) -> Result<Option<String>> {
+        self.verify_otp_registration_inner(email, code, true, true)
+            .await
+    }
+
+    async fn verify_otp_registration_inner(
+        &self,
+        email: &str,
+        code: &str,
+        allow_registration: bool,
+        authorized_claim: bool,
     ) -> Result<Option<String>> {
         let email_lower = email.to_lowercase();
         let now = Utc::now();
@@ -477,24 +507,38 @@ impl AuthManager {
                 let id = crate::user_store::email_to_user_id(&email_lower);
                 let mut final_id = id.clone();
                 let mut suffix = 1u32;
-                // A candidate is taken when a user row exists OR the
-                // bootstrap probe says the id is occupied elsewhere
-                // (a profile file on disk). Anonymous self-registration
-                // must never claim an admin-created-but-unclaimed
-                // profile — /api/auth/verify would hand the existing
-                // profile to the new user (codex #1613 r6). Explicitly
-                // provisioned flows (allowlist / registered users)
-                // authorize their claim and don't pass through here.
+                // A candidate is taken when a user row exists OR — for
+                // ANONYMOUS registration only — the bootstrap probe
+                // says the id is occupied elsewhere (a profile file on
+                // disk): self-registration must never claim an
+                // admin-created-but-unclaimed profile, or
+                // /api/auth/verify hands the existing profile to the
+                // new user (codex #1613 r6). Authorized claims
+                // (allowlist provenance) skip the probe so an invitee
+                // KEEPS their pre-provisioned profile instead of being
+                // bumped to `<id>-1` (codex #1613 r7 P1).
                 loop {
                     let user_taken = self.user_store.get(&final_id)?.is_some();
-                    let probe_taken = self
-                        .id_taken_probe
-                        .as_ref()
-                        .is_some_and(|probe| probe(&final_id));
+                    let probe_taken = !authorized_claim
+                        && self
+                            .id_taken_probe
+                            .as_ref()
+                            .is_some_and(|probe| probe(&final_id));
                     if !user_taken && !probe_taken {
                         break;
                     }
-                    final_id = format!("{id}-{suffix}");
+                    // Reserve room for `-N` within the 63-char slug
+                    // budget (matching email_to_user_id's own cap): a
+                    // 63-char base id would otherwise mint a 65-char
+                    // candidate that validate_user_id rejects, failing
+                    // a VALID OTP with a generic error (codex #1613
+                    // r7 P2). Trailing hyphens from the cut are
+                    // trimmed so the candidate stays slug-shaped.
+                    let suffix_str = suffix.to_string();
+                    let max_base = 63usize.saturating_sub(suffix_str.len() + 1);
+                    let base: String = id.chars().take(max_base).collect();
+                    let base = base.trim_end_matches('-');
+                    final_id = format!("{base}-{suffix_str}");
                     suffix += 1;
                 }
                 let new_user = crate::user_store::User {
@@ -1143,6 +1187,85 @@ mod tests {
         assert_eq!(
             user.id, "api-user-1",
             "a probe-taken id (existing profile) must not be claimed"
+        );
+    }
+
+    #[tokio::test]
+    async fn should_let_authorized_claims_take_probe_taken_ids() {
+        // codex #1613 r7 P1: an admin pre-creates profile `alice` and
+        // allowlists alice@example.com. That flow routes through the
+        // registration path with ALLOWLIST provenance — the profile
+        // probe must NOT bump the invitee to `alice-1` (which would
+        // strand the pre-provisioned profile and record the allowlist
+        // claim under the wrong id). The probe guards ANONYMOUS
+        // self-registration only.
+        let dir = tempfile::tempdir().unwrap();
+        let user_store = Arc::new(UserStore::open(dir.path()).unwrap());
+        let mgr = AuthManager::new(None, user_store.clone())
+            .with_id_taken_probe(Arc::new(|id: &str| id == "alice"));
+        mgr.send_otp_with_registration("alice@example.com", true)
+            .await
+            .unwrap();
+        let code = {
+            let otps = mgr.pending_otps.read().await;
+            otps.get("alice@example.com").unwrap().code.clone()
+        };
+
+        let token = mgr
+            .verify_otp_with_authorized_claim("alice@example.com", &code)
+            .await
+            .unwrap();
+        assert!(token.is_some());
+        let user = user_store
+            .get_by_email("alice@example.com")
+            .unwrap()
+            .expect("allowlisted registration must create the user");
+        assert_eq!(
+            user.id, "alice",
+            "an authorized claim must keep the pre-provisioned id"
+        );
+    }
+
+    #[tokio::test]
+    async fn should_keep_suffixed_ids_within_the_slug_limit() {
+        // codex #1613 r7 P2: a 63-char local part maps to a 63-char id;
+        // appending `-1` produced a 65-char candidate that
+        // validate_user_id rejects, so a VALID OTP failed with a
+        // generic error instead of registering. Suffixed candidates
+        // must reserve space for `-N`.
+        let long_local = "a".repeat(63);
+        let email = format!("{long_local}@example.com");
+        let dir = tempfile::tempdir().unwrap();
+        let user_store = Arc::new(UserStore::open(dir.path()).unwrap());
+        let base_id = crate::user_store::email_to_user_id(&email);
+        assert_eq!(base_id.len(), 63, "fixture must sit at the slug limit");
+        let mgr = AuthManager::new(None, user_store.clone())
+            .with_id_taken_probe(Arc::new(move |id: &str| id == "a".repeat(63)));
+        mgr.set_allow_self_registration(true);
+        mgr.send_otp(&email).await.unwrap();
+        let code = {
+            let otps = mgr.pending_otps.read().await;
+            otps.get(&email).unwrap().code.clone()
+        };
+
+        let token = mgr
+            .verify_otp(&email, &code)
+            .await
+            .expect("suffixing at the limit must not error");
+        assert!(token.is_some());
+        let user = user_store
+            .get_by_email(&email)
+            .unwrap()
+            .expect("registration must create a user");
+        assert!(
+            user.id.len() <= 63,
+            "suffixed id must stay within the slug limit, got {} chars",
+            user.id.len()
+        );
+        assert!(
+            user.id.ends_with("-1"),
+            "collision must advance to the -1 suffix, got {}",
+            user.id
         );
     }
 
