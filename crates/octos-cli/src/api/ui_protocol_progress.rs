@@ -19,10 +19,6 @@ use serde_json::{Value, json};
 pub(crate) struct ProgressMappingContext {
     pub session_id: SessionKey,
     pub turn_id: TurnId,
-    /// Resolved profile the turn runs under — attribution for the
-    /// `session/btw` live-draft store (two profiles may share a bare
-    /// session id; their draft streams must never mix).
-    pub btw_draft_profile: String,
 }
 
 impl ProgressMappingContext {
@@ -30,13 +26,7 @@ impl ProgressMappingContext {
         Self {
             session_id,
             turn_id,
-            btw_draft_profile: octos_core::MAIN_PROFILE_ID.to_owned(),
         }
-    }
-
-    pub(crate) fn with_draft_profile(mut self, profile_id: impl Into<String>) -> Self {
-        self.btw_draft_profile = profile_id.into();
-        self
     }
 }
 

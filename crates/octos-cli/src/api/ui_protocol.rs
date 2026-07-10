@@ -13197,33 +13197,35 @@ fn btw_test_provider() -> Option<Arc<dyn octos_llm::LlmProvider>> {
     None
 }
 
-/// Live in-flight assistant draft per session, fed by the `message/delta`
-/// ephemeral choke point (deltas are non-durable per spec § 9, so the ledger
-/// can never replay them) and reset at every turn lifecycle edge. `session/btw`
-/// reads the tail so "what are you working on?" reflects the answer being
-/// written RIGHT NOW, not just the committed transcript.
-fn btw_live_draft_store() -> &'static StdMutex<HashMap<(String, SessionKey), String>> {
-    static DRAFTS: OnceLock<StdMutex<HashMap<(String, SessionKey), String>>> = OnceLock::new();
+/// Live in-flight assistant draft per TURN, fed at the ephemeral send choke
+/// point (`message/delta` is non-durable per spec § 9 — the ledger can never
+/// replay it) so `session/btw` can describe the answer being written RIGHT
+/// NOW. Keyed by [`TurnId`] — globally unique per turn — so no cross-profile
+/// or cross-session stream can ever mix and no lifecycle resets are needed:
+/// a new turn is a new key, and stale keys are unreadable (the aside resolves
+/// the CURRENT non-terminal turn id through the active-turns registry before
+/// reading). Bounded by arbitrary eviction past the cap.
+fn btw_live_draft_store() -> &'static StdMutex<HashMap<TurnId, String>> {
+    static DRAFTS: OnceLock<StdMutex<HashMap<TurnId, String>>> = OnceLock::new();
     DRAFTS.get_or_init(|| StdMutex::new(HashMap::new()))
 }
 
-const BTW_LIVE_DRAFT_STORE_MAX_SESSIONS: usize = 128;
+const BTW_LIVE_DRAFT_STORE_MAX_TURNS: usize = 64;
 
-fn btw_live_draft_append(profile_id: &str, session_id: &SessionKey, text: &str) {
+fn btw_live_draft_append(turn_id: &TurnId, text: &str) {
     let Ok(mut drafts) = btw_live_draft_store().lock() else {
         return;
     };
-    let key = (profile_id.to_owned(), session_id.clone());
-    if !drafts.contains_key(&key) && drafts.len() >= BTW_LIVE_DRAFT_STORE_MAX_SESSIONS {
-        // Turn starts reset their own slot; this cap only guards runaway
-        // session cardinality. Arbitrary eviction is fine — a lost draft only
-        // degrades one aside's context.
+    if !drafts.contains_key(turn_id) && drafts.len() >= BTW_LIVE_DRAFT_STORE_MAX_TURNS {
+        // Arbitrary eviction is fine — a lost draft only degrades one aside's
+        // context, and terminal turns' entries are dead weight anyway
+        // (unreadable through the non-terminal gate).
         let evict = drafts.keys().next().cloned();
         if let Some(evict) = evict {
             drafts.remove(&evict);
         }
     }
-    let draft = drafts.entry(key).or_default();
+    let draft = drafts.entry(turn_id.clone()).or_default();
     draft.push_str(text);
     if draft.len() > BTW_LIVE_DRAFT_TAIL_CHARS {
         let cut = draft.len() - BTW_LIVE_DRAFT_TAIL_CHARS;
@@ -13236,21 +13238,11 @@ fn btw_live_draft_append(profile_id: &str, session_id: &SessionKey, text: &str) 
     }
 }
 
-fn btw_live_draft_reset(profile_id: &str, session_id: &SessionKey) {
-    if let Ok(mut drafts) = btw_live_draft_store().lock() {
-        drafts.remove(&(profile_id.to_owned(), session_id.clone()));
-    }
-}
-
-fn btw_live_draft_tail(profile_id: &str, session_id: &SessionKey) -> String {
+fn btw_live_draft_tail(turn_id: &TurnId) -> String {
     btw_live_draft_store()
         .lock()
         .ok()
-        .and_then(|drafts| {
-            drafts
-                .get(&(profile_id.to_owned(), session_id.clone()))
-                .cloned()
-        })
+        .and_then(|drafts| drafts.get(turn_id).cloned())
         .unwrap_or_default()
 }
 
@@ -13495,7 +13487,6 @@ async fn handle_session_btw(
     let state = state.clone();
     let ledger = ledger.clone();
     let active_turns = active_turns.clone();
-    let busy_profile_for_draft = in_flight_guard.0.0.clone();
     let task = tokio::spawn(async move {
         let _in_flight_guard = in_flight_guard;
 
@@ -13524,17 +13515,32 @@ async fn handle_session_btw(
 
         // The transcript tail only holds COMMITTED messages; a "what are you
         // working on?" mid-turn needs the answer being written right now.
-        // `message/delta` is ephemeral (never ledgered), so the draft tail is
-        // fed by the mapped-progress path with profile attribution. Read it
-        // ONLY while a turn is actually live for this session — a finished
+        // Resolve the session's CURRENT turn through the registry and require
+        // a NON-TERMINAL state — `ActiveTurn` entries are deliberately
+        // retained in `Terminal(_)` for idempotent interrupts, and a finished
         // turn's leftover tail must not masquerade as in-flight (its text is
-        // already in the committed transcript above).
-        let turn_live = active_turns.lock().await.get(&session_id).is_some();
-        let live_draft_tail = if turn_live {
-            btw_live_draft_tail(busy_profile_for_draft.as_str(), &session_id)
-        } else {
-            String::new()
+        // already in the committed transcript above). TurnId keying then
+        // guarantees the tail belongs to exactly that turn — including turns
+        // admitted a moment ago whose task has not streamed yet (their fresh
+        // TurnId simply has no draft).
+        let live_turn_id = {
+            let registry = active_turns.lock().await;
+            match registry.get(&session_id) {
+                Some(entry) => {
+                    let state = entry.state.lock().await;
+                    if matches!(*state, TurnState::Terminal(_)) {
+                        None
+                    } else {
+                        Some(entry.turn_id.clone())
+                    }
+                }
+                None => None,
+            }
         };
+        let live_draft_tail = live_turn_id
+            .as_ref()
+            .map(btw_live_draft_tail)
+            .unwrap_or_default();
 
         // The profile's shared provider chain — same profile the transcript
         // came from. `profile_runtime` also carries the data dir for the
@@ -20570,12 +20576,7 @@ async fn run_standalone_turn(
 
     let mut saw_delta = false;
     let mut task_output_delta_tracker = TaskOutputDeltaTracker::default();
-    let progress_context = ProgressMappingContext::new(session_id.clone(), turn_id.clone())
-        .with_draft_profile(usage_profile_id.clone());
-    // A fresh turn starts a fresh `session/btw` live draft for this
-    // (profile, session) — the prior turn's tail must never masquerade as
-    // the in-flight answer.
-    btw_live_draft_reset(&usage_profile_id, &session_id);
+    let progress_context = ProgressMappingContext::new(session_id.clone(), turn_id.clone());
     let mut interrupt_observed = false;
     // #1133 — fold the `done` event's `tokens_in + tokens_out` into a
     // running total so the post-turn goal accountant can call
@@ -22051,21 +22052,9 @@ fn forward_progress_event(
         // see only the envelope.
         emit_envelope_for_legacy_notification(ledger, session_id, &notification);
         match notification {
-            UiNotification::MessageDelta(delta) => {
+            UiNotification::MessageDelta(_) => {
                 *saw_delta = true;
-                // Feed the `session/btw` live-draft tail with FULL profile
-                // attribution (codex round-3 P1): two profiles may run the
-                // same bare session id concurrently through separate session
-                // managers, and an aside in one must never read the other's
-                // stream. `message/delta` is ephemeral (never ledgered), so
-                // this mapped-progress path is the draft's only source.
-                btw_live_draft_append(
-                    &progress_context.btw_draft_profile,
-                    &delta.session_id,
-                    &delta.text,
-                );
-                let _ =
-                    send_notification_ephemeral(ws, ledger, UiNotification::MessageDelta(delta));
+                let _ = send_notification_ephemeral(ws, ledger, notification);
             }
             UiNotification::ReasoningDelta(_) => {
                 let _ = send_notification_ephemeral(ws, ledger, notification);
@@ -24359,6 +24348,13 @@ fn send_notification_ephemeral(
 ) -> Result<(), SendError> {
     // Ephemeral frames are NOT appended to the ledger — they are explicitly
     // non-durable per spec § 9. Drops never need a `replay_lossy` summary.
+    // Every legacy `message/delta` send funnels through here exactly once
+    // (the producing turn task's direct send) — feed the `session/btw`
+    // live-draft tail BEFORE the capability filter so envelope-negotiated
+    // connections still record it. TurnId keying isolates streams.
+    if let UiNotification::MessageDelta(delta) = &notification {
+        btw_live_draft_append(&delta.turn_id, &delta.text);
+    }
     let method = notification.method().to_string();
     // Codex #1336 round-2 BLOCKER 1: apply the per-connection
     // capability filter to ephemeral direct sends too. `MessageDelta`
@@ -33879,27 +33875,23 @@ ignore = []
     }
 
     #[test]
-    fn btw_live_draft_is_profile_scoped() {
-        let session = SessionKey("local:btw-draft".into());
-        btw_live_draft_append("prof-a", &session, "alpha stream");
-        btw_live_draft_append("prof-b", &session, "beta stream");
+    fn btw_live_draft_is_turn_scoped() {
+        let turn_a = TurnId::new();
+        let turn_b = TurnId::new();
+        btw_live_draft_append(&turn_a, "alpha stream");
+        btw_live_draft_append(&turn_b, "beta stream");
 
-        assert_eq!(btw_live_draft_tail("prof-a", &session), "alpha stream");
-        assert_eq!(btw_live_draft_tail("prof-b", &session), "beta stream");
-
-        // One profile's reset must not erase the other's draft.
-        btw_live_draft_reset("prof-a", &session);
-        assert_eq!(btw_live_draft_tail("prof-a", &session), "");
-        assert_eq!(btw_live_draft_tail("prof-b", &session), "beta stream");
-        btw_live_draft_reset("prof-b", &session);
+        // TurnId keying: streams can never mix, whatever session/profile the
+        // turns belong to.
+        assert_eq!(btw_live_draft_tail(&turn_a), "alpha stream");
+        assert_eq!(btw_live_draft_tail(&turn_b), "beta stream");
     }
 
-    /// The aside reads the live draft ONLY while a turn is actually live for
-    /// the session — a finished turn's leftover tail must not masquerade as
-    /// the in-flight answer (its text already sits in the committed
-    /// transcript).
+    /// The aside reads the live draft ONLY through the registry's CURRENT
+    /// NON-TERMINAL turn — a finished turn's entry is retained for idempotent
+    /// interrupts, and its leftover tail must not masquerade as in-flight.
     #[tokio::test]
-    async fn session_btw_reads_draft_only_while_turn_is_live() {
+    async fn session_btw_reads_draft_only_for_a_non_terminal_turn() {
         struct DraftProbeProvider;
         #[async_trait::async_trait]
         impl octos_llm::LlmProvider for DraftProbeProvider {
@@ -33934,12 +33926,26 @@ ignore = []
         let session_id = SessionKey("local:btw-draftgate".into());
         let state = prg_state_with_session(&session_id, prg_seed_user_assistant);
         let ledger = event_ledger(&state).await;
-        btw_live_draft_append(MAIN_PROFILE_ID, &session_id, "PAXOS-DRAFT-TAIL");
+        let turn_id = TurnId::new();
+        btw_live_draft_append(&turn_id, "PAXOS-DRAFT-TAIL");
 
         let _serial = btw_test_slot_serial().lock().await;
         *btw_test_provider_slot().lock().expect("slot") = Some(Arc::new(DraftProbeProvider));
 
-        // No active turn → the leftover draft must NOT reach the provider.
+        // The registry retains the turn as TERMINAL → the leftover draft must
+        // NOT reach the provider.
+        let abort = tokio::spawn(async {}).abort_handle();
+        active_turns_registry().lock().await.insert(
+            session_id.clone(),
+            ActiveTurn {
+                turn_id: turn_id.clone(),
+                state: Arc::new(TokioMutex::new(TurnState::Terminal(
+                    TerminalReason::Completed,
+                ))),
+                interrupt_tx: Arc::new(TokioMutex::new(None)),
+                abort,
+            },
+        );
         let (ws, mut rx) = ws_connection_for_test(4);
         handle_session_btw(
             &ws,
@@ -33959,12 +33965,12 @@ ignore = []
         let frame = recv_rpc_json(&mut rx).await;
         assert_eq!(frame["result"]["answer"], "no-draft", "got {frame}");
 
-        // With a live turn registered → the draft rides the prompt.
+        // The same turn ACTIVE → its draft rides the prompt.
         let abort = tokio::spawn(async {}).abort_handle();
         active_turns_registry().lock().await.insert(
             session_id.clone(),
             ActiveTurn {
-                turn_id: TurnId::new(),
+                turn_id: turn_id.clone(),
                 state: Arc::new(TokioMutex::new(TurnState::Active)),
                 interrupt_tx: Arc::new(TokioMutex::new(None)),
                 abort,
@@ -33989,7 +33995,6 @@ ignore = []
         let frame = recv_rpc_json(&mut rx).await;
         active_turns_registry().lock().await.remove(&session_id);
         *btw_test_provider_slot().lock().expect("slot") = None;
-        btw_live_draft_reset(MAIN_PROFILE_ID, &session_id);
         assert_eq!(frame["result"]["answer"], "saw-draft", "got {frame}");
     }
 
