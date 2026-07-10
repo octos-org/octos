@@ -21333,7 +21333,10 @@ fn emit_envelope_for_legacy_notification(
                     arguments_preview: event
                         .arguments
                         .as_ref()
-                        .map(envelope_tool_arguments_preview),
+                        .map(envelope_tool_arguments_preview)
+                        // `{}` args render as "" — the spec says omit, not
+                        // empty-string.
+                        .filter(|preview| !preview.is_empty()),
                 },
                 None,
             ),
@@ -39541,6 +39544,39 @@ ignore = []
         };
         assert_eq!(output, "test result: ok. 815 passed");
         assert_eq!(*duration, 4321);
+
+        // `{}` arguments render empty — spec says OMIT, not empty-string.
+        emit_envelope_for_legacy_notification(
+            &ledger,
+            &session_id,
+            &UiNotification::ToolStarted(ToolStartedEvent {
+                session_id: session_id.clone(),
+                topic: None,
+                turn_id: turn_id.clone(),
+                tool_call_id: "tc-empty".into(),
+                tool_name: "noop".into(),
+                arguments: Some(serde_json::json!({})),
+            }),
+        );
+        let replay = ledger.replay_after(&session_id, Some(&baseline)).unwrap();
+        let empty_start = replay
+            .iter()
+            .filter_map(|e| match &e.event {
+                UiProtocolLedgerEvent::Notification(UiNotification::Envelope(env)) => {
+                    match &env.envelope.payload {
+                        Payload::ToolStart {
+                            tool_call_id,
+                            arguments_preview,
+                            ..
+                        } if tool_call_id == "tc-empty" => Some(arguments_preview.clone()),
+                        _ => None,
+                    }
+                }
+                _ => None,
+            })
+            .next()
+            .expect("tc-empty envelope present");
+        assert_eq!(empty_start, None, "empty args must omit the preview");
     }
 
     #[test]

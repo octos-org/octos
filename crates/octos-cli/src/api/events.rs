@@ -112,9 +112,16 @@ pub(crate) fn event_to_json(event: &ProgressEvent, thread_id: Option<&str>) -> s
             });
             // Additive: the mapper (`map_tool_end`) lifts these onto
             // `ToolCompletedEvent` so tool cards and envelope previews can
-            // show the result excerpt.
+            // show the result excerpt. Bounded HERE — the chokepoint feeding
+            // both the durable notification ledger and the envelope lane —
+            // because producers are not trustworthy about size (a failing
+            // tool emits unbounded `e.to_string()`).
             if !output_preview.is_empty() {
-                value["output_preview"] = serde_json::json!(output_preview);
+                value["output_preview"] = serde_json::json!(octos_core::truncated_utf8(
+                    output_preview,
+                    octos_core::ui_protocol::ENVELOPE_TOOL_OUTPUT_PREVIEW_MAX,
+                    "…",
+                ));
             }
             value
         }
@@ -304,6 +311,27 @@ mod tests {
         // mapper (`map_tool_end`) and the envelope `output_preview`.
         assert_eq!(json["output_preview"], "contents");
         assert_eq!(json["duration_ms"], 42);
+    }
+
+    #[test]
+    fn event_to_json_bounds_giant_output_preview() {
+        // A failing tool emits unbounded `e.to_string()` — this serializer is
+        // the chokepoint before the durable ledger + envelope lane.
+        let event = ProgressEvent::ToolCompleted {
+            name: "shell".into(),
+            tool_id: "t9".into(),
+            success: false,
+            output_preview: "é".repeat(9000),
+            duration: Duration::from_millis(1),
+        };
+        let json = event_to_json(&event, None);
+        let preview = json["output_preview"].as_str().expect("preview");
+        assert!(
+            preview.chars().count()
+                <= octos_core::ui_protocol::ENVELOPE_TOOL_OUTPUT_PREVIEW_MAX + 1,
+            "preview must be bounded, got {} chars",
+            preview.chars().count()
+        );
     }
 
     #[test]
