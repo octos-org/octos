@@ -431,6 +431,16 @@ impl MemoryStore {
             .wrap_err("failed to create memory bank directory")
     }
 
+    /// Write an entity file directly, bypassing every `write_entity` gate.
+    /// For tests/migration fixtures that must seed data the normal path now
+    /// refuses (e.g. a pre-upgrade entity under a reserved registry name).
+    #[doc(hidden)]
+    pub async fn write_entity_raw(&self, slug: &str, content: &str) {
+        self.ensure_bank_dir().await.expect("bank dir");
+        let path = self.bank_dir().join(format!("{slug}.md"));
+        tokio::fs::write(&path, content).await.expect("seed entity");
+    }
+
     /// List all entity files, returning `(slug, abstract_line)` pairs sorted by name.
     pub async fn list_entities(&self) -> Result<Vec<(String, String)>> {
         let dir = self.bank_dir();
@@ -495,6 +505,14 @@ impl MemoryStore {
         // unlisted, unrecallable, yet reported as saved (codex round-3 P3).
         if name.trim_matches(['-', '_', ' ']).is_empty() {
             eyre::bail!("memory entity name must not be empty");
+        }
+        // Reserved registry names are refused at the BOUNDARY, not just in
+        // the save_memory tool: session_actor banks background reports via
+        // write_entity with a task-label slug, so a task named "Memory"
+        // would otherwise create an entity that recall_memory permanently
+        // shadows with the registry (#1608 P2).
+        if is_reserved_memory_name(name) {
+            eyre::bail!("memory entity name '{name}' is reserved for the long-term registry");
         }
         // Scan the SANITIZED name+abstract row exactly as it will render in
         // the bank index: name and content pass separately, but the row
@@ -1707,6 +1725,25 @@ mod tests {
                 "{name:?} must be refused"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn should_reject_reserved_registry_names_at_the_write_boundary() {
+        // #1608 P2: session_actor banks reports via write_entity with a
+        // task-label slug, bypassing the save_memory tool check — the
+        // boundary must refuse the reserved names too.
+        let dir = tempfile::tempdir().unwrap();
+        let store = MemoryStore::open(dir.path()).await.unwrap();
+        for name in ["memory", "registry", "long-term-memory"] {
+            assert!(
+                store.write_entity(name, "# x\nbody").await.is_err(),
+                "{name:?} must be refused at the boundary"
+            );
+        }
+        store
+            .write_entity("weekly-report", "# x\nbody")
+            .await
+            .expect("a normal report name still banks");
     }
 
     #[tokio::test]
