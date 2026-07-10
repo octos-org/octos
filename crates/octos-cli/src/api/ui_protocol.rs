@@ -2310,16 +2310,20 @@ impl PromptContextManager for AppUiPromptContextBridge {
 
         let threshold = Self::threshold_tokens(&request);
         let mut compaction_performed = false;
+        // UPCR-2026-026 follow-up: surface the MID-TURN pass to the client.
+        // This is where compaction actually happens for a session whose
+        // context fills during a long (multi-agent) turn — and the compacted
+        // snapshot persisted below starves the pre-turn (emitting) site, so
+        // without these events the user never sees any compaction UX at all.
+        // Events are COLLECTED here and emitted only after `scratch_guard`
+        // drops (codex round-2): on the stdio transport the delivery path can
+        // block on a bounded SyncSender under backpressure, and a blocking
+        // send while holding the scratch mutex would stall the bridge.
+        let mut lifecycle_events: Vec<UiNotification> = Vec::new();
         if scratch.manager.state().token_estimate > threshold {
             let trigger = format!("agent_loop:{}", request.phase.as_str());
-            // UPCR-2026-026 follow-up: surface the MID-TURN pass to the
-            // client. This is where compaction actually happens for a session
-            // whose context fills during a long (multi-agent) turn — and the
-            // compacted snapshot persisted below starves the pre-turn
-            // (emitting) site, so without these events the user never sees
-            // any compaction UX at all.
-            if let Some(notify) = self.context_lifecycle_notify.as_ref() {
-                notify(UiNotification::ContextCompactionStarted(
+            if self.context_lifecycle_notify.is_some() {
+                lifecycle_events.push(UiNotification::ContextCompactionStarted(
                     ContextCompactionStartedEvent {
                         session_id: self.session_id.clone(),
                         context_state: ui_context_state_for(&self.session_id, &scratch.manager),
@@ -2341,8 +2345,8 @@ impl PromptContextManager for AppUiPromptContextBridge {
                 },
             );
             compaction_performed = true;
-            if let Some(notify) = self.context_lifecycle_notify.as_ref() {
-                notify(appui_context_compaction_notification(
+            if self.context_lifecycle_notify.is_some() {
+                lifecycle_events.push(appui_context_compaction_notification(
                     &self.session_id,
                     &scratch.manager,
                     &record,
@@ -2446,14 +2450,26 @@ impl PromptContextManager for AppUiPromptContextBridge {
                 );
             }
         }
-        Ok(PromptContextReport {
+        let report = PromptContextReport {
             prompt_replaced,
             compaction_performed,
             messages_before,
             messages_after: messages.len(),
             token_estimate: Some(frame.report.token_estimate),
             generation: Some(frame.context_state.generation),
-        })
+        };
+        // Emit AFTER releasing the scratch lock (see the collection comment
+        // above): a blocking stdio send while holding `scratch` would stall
+        // any concurrent bridge user. Wire order (started → completed, one
+        // delivery batch) matches the pre-turn site, which also returns both
+        // events together.
+        drop(scratch_guard);
+        if let Some(notify) = self.context_lifecycle_notify.as_ref() {
+            for event in lifecycle_events {
+                notify(event);
+            }
+        }
+        Ok(report)
     }
 }
 
