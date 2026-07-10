@@ -7116,11 +7116,14 @@ fn raw_catalog_result(state: &AppState, profile_id: Option<&str>) -> Result<Valu
     // the home seed (`load_seed_qos_catalog` also falls back to `~/.octos`).
     let mut sources = Vec::new();
     if let Some(store) = state.profile_store.as_ref() {
-        let home = store.octos_home_dir().to_path_buf();
-        if let Some(profile_id) = profile_id {
-            sources.push(home.join("profiles").join(profile_id).join("data"));
+        if let Some(profile) =
+            profile_id.and_then(|profile_id| store.get(profile_id).ok().flatten())
+        {
+            // Honors `UserProfile.data_dir` overrides — the same resolution
+            // `ProfileRuntime::bootstrap` uses when it exports the catalog.
+            sources.push(store.resolve_data_dir(&profile));
         }
-        sources.push(home);
+        sources.push(store.octos_home_dir().to_path_buf());
     }
     for qos in sources
         .iter()

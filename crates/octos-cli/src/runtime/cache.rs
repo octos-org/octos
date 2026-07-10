@@ -401,15 +401,6 @@ impl SessionRuntimeCache {
                     .await;
                     match result {
                         Ok(runtime) => {
-                            if self.profile_generation(&key.0) != generation_at_start {
-                                // The profile was invalidated (e.g. a model
-                                // switch) while we bootstrapped against its
-                                // OLD runtime: serve this caller, but do NOT
-                                // cache — the next turn re-materializes on
-                                // the rebuilt ProfileRuntime.
-                                drop(guard);
-                                return Ok(runtime);
-                            }
                             // `insert_with_eviction` returns the
                             // canonical `Arc<SessionRuntime>` for
                             // this key — either the one we just
@@ -424,7 +415,9 @@ impl SessionRuntimeCache {
                             // runtime per key" invariant rather
                             // than a "one bootstrap per inflight
                             // era" invariant.
-                            let canonical = self.insert_with_eviction(key.clone(), runtime).await;
+                            let canonical = self
+                                .insert_with_eviction(key.clone(), runtime, generation_at_start)
+                                .await;
                             drop(guard);
                             return Ok(canonical);
                         }
@@ -457,8 +450,17 @@ impl SessionRuntimeCache {
         &self,
         key: CacheKey,
         runtime: Arc<SessionRuntime>,
+        generation_at_start: u64,
     ) -> Arc<SessionRuntime> {
         let mut guard = self.inner.write().await;
+        // Re-check the profile generation UNDER the map lock: the sweep in
+        // `invalidate_profile` serializes on this same lock and its bump
+        // happens-before its sweep, so either we observe the bump here (and
+        // skip caching the stale runtime) or our insert lands first and the
+        // sweep removes it — a stale runtime can never survive a switch.
+        if self.profile_generation(&key.0) != generation_at_start {
+            return runtime;
+        }
 
         // If a runtime is already present (e.g. another task
         // bootstrapped in a prior single-flight era and inserted
@@ -917,7 +919,11 @@ mod tests {
         );
 
         let canonical = cache
-            .insert_with_eviction((profile.profile_id.clone(), key.clone()), redundant)
+            .insert_with_eviction(
+                (profile.profile_id.clone(), key.clone()),
+                redundant,
+                cache.profile_generation(&profile.profile_id),
+            )
             .await;
         assert!(
             Arc::ptr_eq(&canonical, &original),
