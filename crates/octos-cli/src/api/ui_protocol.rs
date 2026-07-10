@@ -1084,6 +1084,10 @@ struct ConnectionUiFeatures {
     /// the requester is not installed and the tool degrades to its
     /// structured-metadata fallback.
     user_question_v1: bool,
+    /// Generic UI-callable skill action discovery and invocation.
+    skill_actions_v1: bool,
+    /// Persisted background skill action jobs and their update events.
+    skill_action_jobs_v1: bool,
     /// `true` when the client sent at least one feature token via the
     /// `X-Octos-Ui-Features` header or the `ui_feature` / `ui_features`
     /// query parameter (UPCR-2026-007). Distinguishes "no header at all"
@@ -1166,6 +1170,12 @@ impl ConnectionUiFeatures {
                 UI_PROTOCOL_FEATURE_CONTEXT_LIFECYCLE_V1,
             ),
             user_question_v1: has_ui_feature(headers, query, UI_PROTOCOL_FEATURE_USER_QUESTION_V1),
+            skill_actions_v1: has_ui_feature(headers, query, APPUI_FEATURE_SKILL_ACTIONS_V1),
+            skill_action_jobs_v1: has_ui_feature(
+                headers,
+                query,
+                APPUI_FEATURE_SKILL_ACTION_JOBS_V1,
+            ),
             header_present: has_any_ui_feature_token(headers, query),
             stdio_transport: false,
         }
@@ -1209,6 +1219,8 @@ impl ConnectionUiFeatures {
             review_start_v1: true,
             context_lifecycle_v1: true,
             user_question_v1: true,
+            skill_actions_v1: true,
+            skill_action_jobs_v1: true,
             header_present: true,
             stdio_transport: true,
         }
@@ -1248,6 +1260,8 @@ impl ConnectionUiFeatures {
             review_start_v1: has(UI_PROTOCOL_FEATURE_REVIEW_START_V1),
             context_lifecycle_v1: has(UI_PROTOCOL_FEATURE_CONTEXT_LIFECYCLE_V1),
             user_question_v1: has(UI_PROTOCOL_FEATURE_USER_QUESTION_V1),
+            skill_actions_v1: has(APPUI_FEATURE_SKILL_ACTIONS_V1),
+            skill_action_jobs_v1: has(APPUI_FEATURE_SKILL_ACTION_JOBS_V1),
             header_present: true,
             stdio_transport,
         }
@@ -1333,6 +1347,12 @@ impl ConnectionUiFeatures {
         if self.user_question_v1 {
             requested.push(UI_PROTOCOL_FEATURE_USER_QUESTION_V1);
         }
+        if self.skill_actions_v1 {
+            requested.push(APPUI_FEATURE_SKILL_ACTIONS_V1);
+        }
+        if self.skill_action_jobs_v1 {
+            requested.push(APPUI_FEATURE_SKILL_ACTION_JOBS_V1);
+        }
         UiProtocolCapabilities::for_negotiated_features(requested)
     }
 
@@ -1364,6 +1384,14 @@ impl ConnectionUiFeatures {
         !self.header_present || self.context_lifecycle_v1
     }
 
+    fn skill_actions_available(self) -> bool {
+        !self.header_present || self.skill_actions_v1
+    }
+
+    fn skill_action_jobs_available(self) -> bool {
+        !self.header_present || self.skill_action_jobs_v1
+    }
+
     fn advertised_capabilities(self, state: &AppState) -> UiProtocolCapabilities {
         let mut capabilities = self.negotiated_capabilities();
         for method in APPUI_EXTRA_METHODS {
@@ -1382,6 +1410,20 @@ impl ConnectionUiFeatures {
                 continue;
             }
             if is_profile_skill_appui_method(*method) && state.profile_store.is_none() {
+                continue;
+            }
+            if matches!(
+                *method,
+                APPUI_METHOD_SKILL_ACTION_LIST | APPUI_METHOD_SKILL_ACTION_INVOKE
+            ) && !self.skill_actions_available()
+            {
+                continue;
+            }
+            if matches!(
+                *method,
+                APPUI_METHOD_SKILL_ACTION_JOB_LIST | APPUI_METHOD_SKILL_ACTION_JOB_READ
+            ) && !self.skill_action_jobs_available()
+            {
                 continue;
             }
             if !capabilities
@@ -1442,11 +1484,13 @@ impl ConnectionUiFeatures {
                 APPUI_FEATURE_CONTEXT_LIFECYCLE_V1,
             );
         }
-        if state.profile_store.is_some() {
+        if state.profile_store.is_some() && self.skill_actions_available() {
             push_capability_feature(
                 &mut capabilities.supported_features,
                 APPUI_FEATURE_SKILL_ACTIONS_V1,
             );
+        }
+        if state.profile_store.is_some() && self.skill_action_jobs_available() {
             push_capability_feature(
                 &mut capabilities.supported_features,
                 APPUI_FEATURE_SKILL_ACTION_JOBS_V1,
@@ -1515,6 +1559,18 @@ fn is_profile_skill_appui_method(method: &str) -> bool {
             | APPUI_METHOD_SKILL_ACTION_JOB_LIST
             | APPUI_METHOD_SKILL_ACTION_JOB_READ
     )
+}
+
+fn skill_action_method_available(method: &str, features: ConnectionUiFeatures) -> Option<bool> {
+    match method {
+        APPUI_METHOD_SKILL_ACTION_LIST | APPUI_METHOD_SKILL_ACTION_INVOKE => {
+            Some(features.skill_actions_available())
+        }
+        APPUI_METHOD_SKILL_ACTION_JOB_LIST | APPUI_METHOD_SKILL_ACTION_JOB_READ => {
+            Some(features.skill_action_jobs_available())
+        }
+        _ => None,
+    }
 }
 
 fn push_capability_feature(features: &mut Vec<String>, feature: &str) {
@@ -9058,6 +9114,14 @@ async fn handle_raw_appui_rpc(
     if !raw_method_is_dispatched(request.method.as_str(), features.stdio_transport) {
         return false;
     }
+    if skill_action_method_available(request.method.as_str(), features) == Some(false) {
+        let _ = send_rpc_error(
+            ws,
+            Some(id),
+            RpcError::method_not_supported(request.method.as_str()),
+        );
+        return true;
+    }
 
     if request.method == APPUI_METHOD_REVIEW_START {
         handle_review_start(
@@ -9564,6 +9628,10 @@ fn raw_method_is_dispatched(method: &str, stdio_transport: bool) -> bool {
             | APPUI_METHOD_PROFILE_SKILLS_REGISTRY_SEARCH
             | APPUI_METHOD_PROFILE_SKILLS_INSTALL
             | APPUI_METHOD_PROFILE_SKILLS_REMOVE
+            | APPUI_METHOD_SKILL_ACTION_LIST
+            | APPUI_METHOD_SKILL_ACTION_INVOKE
+            | APPUI_METHOD_SKILL_ACTION_JOB_LIST
+            | APPUI_METHOD_SKILL_ACTION_JOB_READ
             | APPUI_METHOD_AUTH_STATUS
             | APPUI_METHOD_AUTH_ME
             | APPUI_METHOD_AUTH_SEND_CODE
@@ -10248,6 +10316,12 @@ fn live_event_passes_capability_filter(
     // that can act on it.
     if !features.user_question_v1 {
         if let UiProtocolLedgerEvent::Notification(UiNotification::UserQuestionRequested(_)) = event
+        {
+            return false;
+        }
+    }
+    if !features.skill_action_jobs_available() {
+        if let UiProtocolLedgerEvent::Notification(UiNotification::SkillActionJobUpdated(_)) = event
         {
             return false;
         }
@@ -27530,6 +27604,71 @@ ignore = []
     }
 
     #[test]
+    fn skill_action_methods_require_their_feature_when_client_negotiates() {
+        let unrelated = ConnectionUiFeatures::from_requested_feature_tokens(
+            [UI_PROTOCOL_FEATURE_PANE_SNAPSHOTS_V1],
+            false,
+        );
+        for method in [
+            APPUI_METHOD_SKILL_ACTION_LIST,
+            APPUI_METHOD_SKILL_ACTION_INVOKE,
+            APPUI_METHOD_SKILL_ACTION_JOB_LIST,
+            APPUI_METHOD_SKILL_ACTION_JOB_READ,
+        ] {
+            assert_eq!(
+                skill_action_method_available(method, unrelated),
+                Some(false)
+            );
+            assert!(raw_method_is_dispatched(method, false));
+        }
+
+        let negotiated = ConnectionUiFeatures::from_requested_feature_tokens(
+            [
+                APPUI_FEATURE_SKILL_ACTIONS_V1,
+                APPUI_FEATURE_SKILL_ACTION_JOBS_V1,
+            ],
+            false,
+        );
+        for method in [
+            APPUI_METHOD_SKILL_ACTION_LIST,
+            APPUI_METHOD_SKILL_ACTION_INVOKE,
+            APPUI_METHOD_SKILL_ACTION_JOB_LIST,
+            APPUI_METHOD_SKILL_ACTION_JOB_READ,
+        ] {
+            assert_eq!(
+                skill_action_method_available(method, negotiated),
+                Some(true)
+            );
+        }
+    }
+
+    #[test]
+    fn skill_action_job_updates_require_negotiated_job_feature() {
+        let event = UiProtocolLedgerEvent::Notification(UiNotification::SkillActionJobUpdated(
+            SkillActionJobUpdatedEvent {
+                profile_id: "profile-a".to_string(),
+                session_id: SessionKey("web-a".to_string()),
+                job: json!({"job_id": "job-a", "status": "queued"}),
+            },
+        ));
+        let unrelated = ConnectionUiFeatures::from_requested_feature_tokens(
+            [UI_PROTOCOL_FEATURE_PANE_SNAPSHOTS_V1],
+            false,
+        );
+        assert!(!live_event_passes_capability_filter(&event, unrelated));
+
+        let negotiated = ConnectionUiFeatures::from_requested_feature_tokens(
+            [APPUI_FEATURE_SKILL_ACTION_JOBS_V1],
+            false,
+        );
+        assert!(live_event_passes_capability_filter(&event, negotiated));
+        assert!(live_event_passes_capability_filter(
+            &event,
+            ConnectionUiFeatures::default()
+        ));
+    }
+
+    #[test]
     fn skill_action_job_list_requires_session_id() {
         let dir = tempfile::tempdir().unwrap();
         let state = Arc::new(local_profile_state(dir.path()));
@@ -30892,6 +31031,8 @@ ignore = []
                 review_start_v1: false,
                 context_lifecycle_v1: false,
                 user_question_v1: false,
+                skill_actions_v1: false,
+                skill_action_jobs_v1: false,
                 header_present: true,
                 stdio_transport: false,
             },
@@ -30956,6 +31097,8 @@ ignore = []
                 review_start_v1: false,
                 context_lifecycle_v1: false,
                 user_question_v1: false,
+                skill_actions_v1: false,
+                skill_action_jobs_v1: false,
                 header_present: true,
                 stdio_transport: false,
             },
@@ -31065,6 +31208,8 @@ ignore = []
                 review_start_v1: false,
                 context_lifecycle_v1: false,
                 user_question_v1: false,
+                skill_actions_v1: false,
+                skill_action_jobs_v1: false,
                 header_present: true,
                 stdio_transport: false,
             },
@@ -31129,6 +31274,8 @@ ignore = []
                 review_start_v1: false,
                 context_lifecycle_v1: false,
                 user_question_v1: false,
+                skill_actions_v1: false,
+                skill_action_jobs_v1: false,
                 header_present: true,
                 stdio_transport: false,
             },
@@ -31186,6 +31333,8 @@ ignore = []
                 review_start_v1: false,
                 context_lifecycle_v1: false,
                 user_question_v1: false,
+                skill_actions_v1: false,
+                skill_action_jobs_v1: false,
                 header_present: true,
                 stdio_transport: false,
             },
@@ -31286,6 +31435,8 @@ ignore = []
                 review_start_v1: false,
                 context_lifecycle_v1: false,
                 user_question_v1: false,
+                skill_actions_v1: false,
+                skill_action_jobs_v1: false,
                 header_present: true,
                 stdio_transport: false,
             },
@@ -33516,6 +33667,8 @@ ignore = []
                 review_start_v1: false,
                 context_lifecycle_v1: false,
                 user_question_v1: false,
+                skill_actions_v1: false,
+                skill_action_jobs_v1: false,
                 header_present: true,
                 stdio_transport: false,
             },
