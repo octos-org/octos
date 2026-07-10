@@ -33,6 +33,7 @@
 //! `contract_failed:`, `artifact_missing:`, `session_failed:`) so outer
 //! orchestrators can branch on category without scraping English text.
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -48,7 +49,10 @@ use octos_agent::task_supervisor::{TaskLifecycleState, TaskSupervisor};
 use octos_agent::validators::{
     ValidatorInvocation, ValidatorPhase, ValidatorRunner, run_workspace_validators,
 };
-use octos_agent::{Agent, AgentConfig, HarnessEvent, SandboxConfig, ToolRegistry, create_sandbox};
+use octos_agent::{
+    Agent, AgentConfig, ApprovalPolicy, EffectivePermissions, HarnessEvent, SandboxConfig,
+    SandboxMode, ToolPolicy, ToolRegistry, create_sandbox,
+};
 use octos_core::{AgentId, Task, TaskContext, TaskKind};
 use octos_llm::LlmProvider;
 use octos_memory::EpisodeStore;
@@ -118,11 +122,28 @@ impl McpServeCommand {
             Config::load_with_context(&cwd, &ctx)?
         };
 
-        // Capture the sandbox policy before `config` is moved into the LLM
-        // factory. The per-session tool registry uses it to confine
-        // shell/exec/file tools to the workspace (see the security note on
-        // `RealSessionDispatch`).
+        // Capture the sandbox + tool-policy config before `config` is moved into
+        // the LLM factory. The per-session tool registry uses the sandbox to
+        // confine shell/exec/file tools to the workspace and the policies so an
+        // external caller gets no looser a tool surface than local chat (see the
+        // security note on `RealSessionDispatch`).
         let sandbox = config.sandbox.clone();
+        let tool_policy = config.tool_policy.clone();
+        let tool_policy_by_provider = config.tool_policy_by_provider.clone();
+        // Resolved for the per-provider policy fallback (model id wins at
+        // session time). Matches chat: explicit `provider`, else inferred from
+        // the configured model.
+        let provider_name = config
+            .provider
+            .clone()
+            .or_else(|| {
+                config
+                    .model
+                    .as_deref()
+                    .and_then(crate::config::detect_provider)
+                    .map(str::to_string)
+            })
+            .unwrap_or_default();
         let factory = AgentLlmFactory::from_config(config)
             .wrap_err("failed to build LLM factory from config")?;
         let dispatch_config = SessionDispatchConfig {
@@ -130,6 +151,9 @@ impl McpServeCommand {
             data_dir: data_dir.clone(),
             max_iterations: 20,
             sandbox,
+            tool_policy,
+            tool_policy_by_provider,
+            provider_name,
         };
         let dispatch: Arc<dyn McpSessionDispatch> =
             Arc::new(RealSessionDispatch::new(dispatch_config, factory));
@@ -310,15 +334,41 @@ pub struct SessionDispatchConfig {
     /// [`SandboxMode::Auto`](octos_agent::SandboxMode) via
     /// [`SandboxConfig::default`].
     pub sandbox: SandboxConfig,
+    /// Operator-configured global tool deny/allow policy. Applied to the
+    /// MCP-served registry so a server that denies e.g. `shell`/`bash` locally
+    /// doesn't re-expose those tools to an external caller (parity with chat).
+    pub tool_policy: Option<ToolPolicy>,
+    /// Full per-provider tool-policy map (config `tool_policy_by_provider`),
+    /// resolved per session against the built provider's `model_id()` — with a
+    /// fallback to [`Self::provider_name`] — so a model-scoped deny is honoured
+    /// even when the config relies on a provider default model.
+    pub tool_policy_by_provider: HashMap<String, ToolPolicy>,
+    /// Configured provider name, the fallback key when resolving the
+    /// per-provider tool policy (model id wins over provider name).
+    pub provider_name: String,
 }
 
 impl SessionDispatchConfig {
-    /// Build the sandbox backend for this session's tool registry. Auto mode
-    /// resolves to `sandbox-exec` on macOS / `bwrap` on Linux and falls back
-    /// to `NoSandbox` only when no backend is available (matching chat and
-    /// gateway).
-    fn sandbox_backend(&self) -> Box<dyn octos_agent::Sandbox> {
-        create_sandbox(&self.sandbox)
+    /// Build the sandbox backend for this session's tool registry, applying the
+    /// MCP approval posture first. Returns the effective [`SandboxConfig`] and
+    /// the constructed backend so the caller can fail closed when a sandbox was
+    /// requested but no backend is available on this host.
+    ///
+    /// The MCP-served agent runs under [`ApprovalPolicy::Never`]: there is no
+    /// interactive approver in server mode, so any tool call that would prompt
+    /// fails at the tool boundary rather than silently proceeding. Auto mode
+    /// resolves to `sandbox-exec` on macOS / `bwrap` on Linux.
+    fn sandbox_backend(&self) -> (SandboxConfig, Box<dyn octos_agent::Sandbox>) {
+        let permissions = self.permissions();
+        let effective = permissions.apply_to_sandbox(&self.sandbox);
+        let backend = create_sandbox(&effective);
+        (effective, backend)
+    }
+
+    /// The MCP-served agent's effective permissions: workspace-write, but with
+    /// a fail-closed approval policy (no interactive approver exists server-side).
+    fn permissions(&self) -> EffectivePermissions {
+        EffectivePermissions::workspace_write().with_approval_policy(ApprovalPolicy::Never)
     }
 }
 
@@ -467,10 +517,49 @@ impl McpSessionDispatch for RealSessionDispatch {
         // `shell`/`exec_command` to read, write, or execute anywhere the octos
         // process could (the M7.2 session-dispatch RCE). The OS sandbox
         // restricts writes to `cwd`.
-        let tools = Arc::new(ToolRegistry::with_builtins_and_sandbox(
-            &self.config.cwd,
-            self.config.sandbox_backend(),
-        ));
+        let permissions = self.config.permissions();
+        let (effective_sandbox_config, sandbox) = self.config.sandbox_backend();
+        // Fail closed: unlike local chat/gateway (where the human runs their own
+        // commands), the mcp-serve caller is only parent-trusted (stdio) or
+        // bearer-token authenticated (http). If the operator wanted a sandbox but
+        // this host has no backend (Auto → NoSandbox), refuse the session rather
+        // than silently running an external caller's tools unsandboxed. An
+        // explicit `sandbox.mode = "none"` opt-out is respected.
+        if effective_sandbox_config.enabled
+            && effective_sandbox_config.mode != SandboxMode::None
+            && sandbox.is_noop()
+        {
+            return Err(McpServerError::SessionFailed(
+                "session_failed: no sandbox backend available on this host; refusing to run \
+                 tools unsandboxed on the mcp-serve path (set sandbox.mode = \"none\" to opt out)"
+                    .to_string(),
+            ));
+        }
+        let mut registry =
+            ToolRegistry::with_builtins_and_permissions(&self.config.cwd, sandbox, permissions);
+        // Apply the operator's global tool deny/allow policy (parity with chat)
+        // so a server that denies command tools doesn't re-expose them, then the
+        // model-scoped policy resolved against the provider we actually built
+        // (`llm.model_id()` — not the raw config model, which is empty when only
+        // a provider is configured, so a policy keyed to the provider default
+        // model would otherwise be skipped).
+        if let Some(policy) = &self.config.tool_policy {
+            registry.apply_policy(policy);
+        }
+        let provider_policy = self
+            .config
+            .tool_policy_by_provider
+            .get(llm.model_id())
+            .or_else(|| {
+                self.config
+                    .tool_policy_by_provider
+                    .get(&self.config.provider_name)
+            })
+            .cloned();
+        if let Some(policy) = provider_policy {
+            registry.set_provider_policy(policy);
+        }
+        let tools = Arc::new(registry);
         let agent_config = AgentConfig {
             max_iterations: self.config.max_iterations,
             // Skip episode persistence — MCP sessions are short-lived and
@@ -556,7 +645,13 @@ impl McpSessionDispatch for RealSessionDispatch {
         // defined. Results are surfaced via `validator_results` so MCP
         // callers see the same typed outcomes the local spawn pipeline
         // records in its ledger. Missing policy → empty vec (not an error).
-        let validator_results = run_completion_validators(&self.config.cwd, contract, &tools).await;
+        let validator_results = run_completion_validators(
+            &self.config.cwd,
+            contract,
+            &tools,
+            &effective_sandbox_config,
+        )
+        .await;
 
         // Resolve the contract artifact. Precedence:
         //   1. Explicit `expected_artifact` from the MCP input.
@@ -669,6 +764,7 @@ async fn run_completion_validators(
     workspace_root: &std::path::Path,
     contract: &str,
     tools: &Arc<ToolRegistry>,
+    sandbox: &SandboxConfig,
 ) -> Vec<Value> {
     let Ok(Some(policy)) = octos_agent::read_workspace_policy(workspace_root) else {
         return Vec::new();
@@ -676,7 +772,12 @@ async fn run_completion_validators(
     if policy.validation.validators.is_empty() {
         return Vec::new();
     }
-    let runner = ValidatorRunner::new(tools.clone(), workspace_root);
+    // Run workspace command validators *through* the same sandbox the agent's
+    // tools use — otherwise a workspace-declared completion command would be an
+    // unsandboxed host-exec escape on the mcp-serve path (the validator runner
+    // routes no-op sandboxes to a direct, injection-safe argv exec).
+    let runner = ValidatorRunner::new(tools.clone(), workspace_root)
+        .with_sandbox(Arc::from(create_sandbox(sandbox)));
     let invocation = ValidatorInvocation {
         phase: ValidatorPhase::Completion,
         workspace_root: workspace_root.to_path_buf(),
@@ -766,6 +867,9 @@ mod tests {
             data_dir: std::env::temp_dir(),
             max_iterations: 4,
             sandbox,
+            tool_policy: None,
+            tool_policy_by_provider: HashMap::new(),
+            provider_name: String::new(),
         };
 
         // A disabled policy must produce a pass-through backend, proving the
@@ -776,6 +880,7 @@ mod tests {
         });
         let program = disabled
             .sandbox_backend()
+            .1
             .wrap_command("true", std::path::Path::new("."))
             .as_std()
             .get_program()

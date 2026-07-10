@@ -23,9 +23,9 @@
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use octos_agent::SandboxConfig;
 use octos_agent::mcp_server::{McpSessionDispatch, SessionLifecycleObserver};
 use octos_agent::task_supervisor::TaskLifecycleState;
+use octos_agent::{SandboxConfig, SandboxMode};
 use octos_cli::commands::mcp_serve::{AgentLlmFactory, RealSessionDispatch, SessionDispatchConfig};
 use octos_core::{Message, ToolCall};
 use octos_llm::{ChatConfig, ChatResponse, LlmProvider, StopReason, TokenUsage, ToolSpec};
@@ -139,7 +139,19 @@ struct DispatchHarness {
 
 impl DispatchHarness {
     fn build(provider: Arc<dyn LlmProvider>, workspace: TempDir) -> Self {
-        Self::build_with_sandbox(provider, workspace, SandboxConfig::default())
+        // Opt out of the sandbox for the scripted success/lifecycle paths so the
+        // mcp-serve fail-closed no-backend check is host-independent (CI runners
+        // have no bwrap/sandbox-exec). Confinement is exercised separately by
+        // `should_block_shell_write_outside_workspace_via_sandbox`, which opts
+        // into a real backend and self-skips when none is available.
+        Self::build_with_sandbox(
+            provider,
+            workspace,
+            SandboxConfig {
+                mode: SandboxMode::None,
+                ..SandboxConfig::default()
+            },
+        )
     }
 
     fn build_with_sandbox(
@@ -155,6 +167,9 @@ impl DispatchHarness {
             data_dir,
             max_iterations: 4,
             sandbox,
+            tool_policy: None,
+            tool_policy_by_provider: Default::default(),
+            provider_name: String::new(),
         };
         Self {
             dispatch: RealSessionDispatch::new_for_test(config, factory),
@@ -597,7 +612,10 @@ async fn should_block_shell_write_outside_workspace_via_sandbox() {
         }),
         end_turn("attempted the writes"),
     ]);
-    let harness = DispatchHarness::build(provider, workspace);
+    // Opt into a real backend (Auto) — this test asserts OS-level confinement,
+    // and self-skipped above when Auto resolves to NoSandbox on this host.
+    let harness =
+        DispatchHarness::build_with_sandbox(provider, workspace, SandboxConfig::default());
     let observer = RecordingObserver::new();
 
     // Outcome may be Ready or Failed depending on artifact resolution; the

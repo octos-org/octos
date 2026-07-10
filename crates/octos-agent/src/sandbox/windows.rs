@@ -45,6 +45,18 @@ const WINDOWS_READ_ALLOW_PATHS: &[&str] = &[
 ];
 
 impl Sandbox for AppContainerSandbox {
+    /// Report no-op enforcement when the `octos-sandbox` helper is unavailable.
+    ///
+    /// Without the helper, [`Self::wrap_command`] falls back to an unsandboxed
+    /// `cmd /C`, so the AppContainer provides no confinement. Surfacing that as
+    /// `is_noop() == true` lets fail-closed callers (e.g. the `mcp-serve` path)
+    /// refuse to run tools rather than silently executing host commands under a
+    /// configured-but-inert sandbox — matching how the Linux Landlock backend
+    /// refuses when its helper is missing.
+    fn is_noop(&self) -> bool {
+        find_sandbox_helper().is_none()
+    }
+
     fn wrap_command(&self, shell_command: &str, cwd: &Path) -> Command {
         // Find the helper binary next to our own executable
         let helper = find_sandbox_helper();

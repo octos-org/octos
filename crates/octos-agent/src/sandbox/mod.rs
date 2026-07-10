@@ -221,12 +221,24 @@ pub enum SandboxMode {
 pub trait Sandbox: Send + Sync {
     /// Wrap a shell command string into a sandboxed `Command`.
     fn wrap_command(&self, shell_command: &str, cwd: &Path) -> Command;
+
+    /// Whether this sandbox provides no confinement (runs commands directly).
+    /// Lets callers that require confinement (e.g. the `mcp-serve` server path)
+    /// fail closed when `SandboxMode::Auto` resolves to no backend. Real
+    /// backends inherit the default `false`.
+    fn is_noop(&self) -> bool {
+        false
+    }
 }
 
 /// No-op sandbox: executes commands directly.
 pub struct NoSandbox;
 
 impl Sandbox for NoSandbox {
+    fn is_noop(&self) -> bool {
+        true
+    }
+
     fn wrap_command(&self, shell_command: &str, cwd: &Path) -> Command {
         #[cfg(windows)]
         {
@@ -632,5 +644,42 @@ mod tests {
         assert_eq!(prog, "cmd");
         #[cfg(not(windows))]
         assert_eq!(prog, "sh");
+    }
+
+    // --- is_noop contract (fail-closed callers depend on this) ---
+
+    #[test]
+    fn no_sandbox_reports_noop() {
+        // The `mcp-serve` fail-closed check and the validator direct-argv path
+        // both key off `is_noop()`. NoSandbox provides zero confinement, so it
+        // must report `true`; the trait default (real backends) is `false`.
+        assert!(
+            NoSandbox.is_noop(),
+            "NoSandbox must report is_noop() == true"
+        );
+    }
+
+    #[test]
+    fn disabled_and_none_modes_yield_noop_sandbox() {
+        // Both an explicitly-disabled sandbox and `mode = none` must resolve to
+        // a no-op backend, so a fail-closed caller can distinguish "operator
+        // opted out" (respect it) from "wanted a sandbox, none available"
+        // (refuse). This is host-independent.
+        for config in [
+            SandboxConfig {
+                enabled: false,
+                ..SandboxConfig::default()
+            },
+            SandboxConfig {
+                enabled: true,
+                mode: SandboxMode::None,
+                ..SandboxConfig::default()
+            },
+        ] {
+            assert!(
+                create_sandbox(&config).is_noop(),
+                "config {config:?} must produce a no-op sandbox"
+            );
+        }
     }
 }
