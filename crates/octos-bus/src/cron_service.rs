@@ -171,11 +171,17 @@ impl CronService {
         let result = job.clone();
 
         {
+            // Mutate + persist under ONE lock hold (persistence
+            // invariant — see persist_store_locked). Roll the push back
+            // on a failed write so memory never diverges from the file.
             let mut store = self.store.lock().unwrap_or_else(|e| e.into_inner());
             store.jobs.push(job);
+            if let Err(error) = persist_store_locked(&self.store_path, &store) {
+                store.jobs.retain(|j| j.id != id);
+                return Err(error);
+            }
         }
 
-        self.save_store()?;
         self.arm_timer();
 
         debug!(id = %id, "added cron job");
@@ -186,15 +192,30 @@ impl CronService {
     pub fn remove_job(self: &std::sync::Arc<Self>, id: &str) -> bool {
         let removed = {
             let mut store = self.store.lock().unwrap_or_else(|e| e.into_inner());
-            let before = store.jobs.len();
-            store.jobs.retain(|j| j.id != id);
-            store.jobs.len() < before
+            let mut extracted = Vec::new();
+            let mut kept = Vec::with_capacity(store.jobs.len());
+            for job in store.jobs.drain(..) {
+                if job.id == id {
+                    extracted.push(job);
+                } else {
+                    kept.push(job);
+                }
+            }
+            store.jobs = kept;
+            if extracted.is_empty() {
+                false
+            } else if let Err(e) = persist_store_locked(&self.store_path, &store) {
+                // Failed write: put the job back so memory matches the
+                // file (persistence invariant), and report not-removed.
+                store.jobs.extend(extracted);
+                tracing::warn!("failed to save cron store: {e}");
+                false
+            } else {
+                true
+            }
         };
 
         if removed {
-            if let Err(e) = self.save_store() {
-                tracing::warn!("failed to save cron store: {e}");
-            }
             self.arm_timer();
             debug!(id = %id, "removed cron job");
         }
@@ -224,22 +245,29 @@ impl CronService {
             let now_ms = Utc::now().timestamp_millis();
             let mut store = self.store.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(job) = store.jobs.iter_mut().find(|j| j.id == id) {
+                let prior = job.clone();
                 job.enabled = enabled;
                 if enabled {
                     job.compute_next_run(now_ms);
                 } else {
                     job.state.next_run_at_ms = None;
                 }
-                true
+                if let Err(e) = persist_store_locked(&self.store_path, &store) {
+                    // Failed write: revert so memory matches the file.
+                    if let Some(job) = store.jobs.iter_mut().find(|j| j.id == id) {
+                        *job = prior;
+                    }
+                    tracing::warn!("failed to save cron store: {e}");
+                    false
+                } else {
+                    true
+                }
             } else {
                 false
             }
         };
 
         if found {
-            if let Err(e) = self.save_store() {
-                tracing::warn!("failed to save cron store: {e}");
-            }
             self.arm_timer();
             debug!(id = %id, enabled = %enabled, "toggled cron job");
         }
@@ -266,12 +294,19 @@ impl CronService {
         id: &str,
         enabled: bool,
     ) -> Result<Option<CronJob>> {
-        let (found, json) = {
+        let found = {
             let now_ms = Utc::now().timestamp_millis();
+            // Reload + toggle + persist under ONE lock hold. Every other
+            // mutation persists before releasing this lock (persistence
+            // invariant — see persist_store_locked), so the file we
+            // reload is never behind unflushed memory, and nothing can
+            // interleave between our reload and our write (codex #1612
+            // r3 — both P1s).
             let mut store = self.store.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(fresh) = load_store(&self.store_path) {
                 *store = fresh;
             }
+            let prior = store.jobs.clone();
             let found = if let Some(job) = store.jobs.iter_mut().find(|j| j.id == id) {
                 job.enabled = enabled;
                 if enabled {
@@ -283,26 +318,19 @@ impl CronService {
             } else {
                 None
             };
-            let json = if found.is_some() {
-                Some(
-                    serde_json::to_string_pretty(&*store)
-                        .wrap_err("failed to serialize cron store")?,
-                )
-            } else {
-                None
-            };
-            (found, json)
+            if found.is_some()
+                && let Err(error) = persist_store_locked(&self.store_path, &store)
+            {
+                // Failed write: revert so memory matches the file.
+                store.jobs = prior;
+                return Err(error);
+            }
+            found
         };
 
-        if let Some(json) = json {
-            // Same tmp+rename pattern as save_store, but serialized
-            // under the caller's coordination (the serve mutation lock).
-            let tmp_path = self.store_path.with_extension("tmp");
-            std::fs::write(&tmp_path, &json).wrap_err("failed to write cron store temp")?;
-            std::fs::rename(&tmp_path, &self.store_path).wrap_err("failed to rename cron store")?;
+        if found.is_some() {
             self.arm_timer();
         }
-
         Ok(found)
     }
 
@@ -479,6 +507,18 @@ impl CronService {
             }
 
             store.jobs.retain(|j| !to_delete.contains(&j.id));
+            // Persist the advance in the SAME critical section that
+            // reserved it (persistence invariant): the old post-fire
+            // async save left a window where memory was ahead of the
+            // file, and any concurrent reload-based reconciliation
+            // could revert the advance and re-arm a past-due fire
+            // (codex #1612 r3). A failed write is logged and the tick
+            // proceeds — next_run stays advanced in memory, so no
+            // double-fire; the file catches up on the next successful
+            // persist.
+            if let Err(e) = persist_store_locked(&self.store_path, &store) {
+                tracing::warn!("failed to save cron store: {e}");
+            }
             due
         };
 
@@ -486,9 +526,6 @@ impl CronService {
             self.execute_job(job).await;
         }
 
-        if let Err(e) = self.save_store_async().await {
-            tracing::warn!("failed to save cron store: {e}");
-        }
         self.arm_timer();
     }
 
@@ -516,37 +553,30 @@ impl CronService {
             warn!(error = %e, job_id = %job.id, "failed to send cron message to bus");
         }
     }
+}
 
-    fn save_store(&self) -> Result<()> {
-        let store = self.store.lock().unwrap_or_else(|e| e.into_inner());
-        let json =
-            serde_json::to_string_pretty(&*store).wrap_err("failed to serialize cron store")?;
-        let tmp_path = self.store_path.with_extension("tmp");
-        std::fs::write(&tmp_path, &json).wrap_err("failed to write cron store temp")?;
-        std::fs::rename(&tmp_path, &self.store_path).wrap_err("failed to rename cron store")?;
-        Ok(())
+/// Serialize + atomically replace `cron.json`. The caller MUST hold the
+/// store lock for the whole call — that is the service's persistence
+/// invariant (every mutation persists before releasing the lock), which
+/// keeps memory and file in lockstep so no writer can interleave a
+/// stale snapshot (codex #1612 r3). Unique temp names keep
+/// out-of-process writers from colliding on a shared `cron.tmp`.
+fn persist_store_locked(store_path: &Path, store: &CronStore) -> Result<()> {
+    static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let json = serde_json::to_string_pretty(store).wrap_err("failed to serialize cron store")?;
+    let tmp_path = store_path.with_extension(format!(
+        "tmp-{}-{}",
+        std::process::id(),
+        TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    if let Err(error) = std::fs::write(&tmp_path, &json) {
+        return Err(eyre::Report::new(error).wrap_err("failed to write cron store temp"));
     }
-
-    /// Async version of save_store that uses spawn_blocking to avoid blocking
-    /// the tokio runtime thread.
-    async fn save_store_async(&self) -> Result<()> {
-        let json = {
-            let store = self.store.lock().unwrap_or_else(|e| e.into_inner());
-            serde_json::to_string_pretty(&*store).wrap_err("failed to serialize cron store")?
-        };
-        let tmp_path = self.store_path.with_extension("tmp");
-        let store_path = self.store_path.clone();
-
-        tokio::task::spawn_blocking(move || {
-            std::fs::write(&tmp_path, &json).wrap_err("failed to write cron store temp")?;
-            std::fs::rename(&tmp_path, &store_path).wrap_err("failed to rename cron store")?;
-            Ok::<_, eyre::Report>(())
-        })
-        .await
-        .map_err(|e| eyre::eyre!("spawn_blocking join error: {e}"))??;
-
-        Ok(())
+    if let Err(error) = std::fs::rename(&tmp_path, store_path) {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(eyre::Report::new(error).wrap_err("failed to rename cron store"));
     }
+    Ok(())
 }
 
 fn load_store(path: &Path) -> Option<CronStore> {
@@ -599,6 +629,70 @@ mod tests {
         let (tx, rx) = mpsc::channel(64);
         let service = std::sync::Arc::new(CronService::new(dir.join("cron.json"), tx));
         (service, rx)
+    }
+
+    #[test]
+    fn concurrent_adds_and_reconciling_toggles_lose_nothing() {
+        // codex #1612 r3: every mutation persists before releasing the
+        // store lock, so a reload-based reconcile can never revert an
+        // unflushed add, and no writer can interleave a stale snapshot
+        // between another's serialize and rename. 8 adds racing 8
+        // reconciling toggles must land ALL adds in the file.
+        let dir = tempfile::tempdir().unwrap();
+        let (tx, _rx) = mpsc::channel(64);
+        let service = std::sync::Arc::new(CronService::new(dir.path().join("cron.json"), tx));
+        let seeded = service
+            .add_job(
+                "seed".into(),
+                CronSchedule::Every { every_ms: 60_000 },
+                CronPayload {
+                    message: "m".into(),
+                    deliver: false,
+                    channel: None,
+                    chat_id: None,
+                },
+            )
+            .unwrap();
+
+        let mut handles = Vec::new();
+        for i in 0..8 {
+            let svc = std::sync::Arc::clone(&service);
+            handles.push(std::thread::spawn(move || {
+                svc.add_job(
+                    format!("racer-{i}"),
+                    CronSchedule::Every { every_ms: 60_000 },
+                    CronPayload {
+                        message: "m".into(),
+                        deliver: false,
+                        channel: None,
+                        chat_id: None,
+                    },
+                )
+                .unwrap();
+            }));
+            let svc = std::sync::Arc::clone(&service);
+            let seed_id = seeded.id.clone();
+            handles.push(std::thread::spawn(move || {
+                svc.toggle_job_reconciling(&seed_id, i % 2 == 0)
+                    .unwrap()
+                    .expect("seed job present");
+            }));
+        }
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        let file: CronStore =
+            serde_json::from_str(&std::fs::read_to_string(dir.path().join("cron.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            file.jobs.len(),
+            9,
+            "all 8 racing adds + the seed must survive: {:?}",
+            file.jobs.iter().map(|j| j.name.clone()).collect::<Vec<_>>()
+        );
+        // And memory agrees with the file (persistence invariant).
+        assert_eq!(service.list_all_jobs().len(), 9);
     }
 
     #[tokio::test]
