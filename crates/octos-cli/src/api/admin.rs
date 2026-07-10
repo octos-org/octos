@@ -3646,7 +3646,7 @@ pub async fn read_session(
 
 /// Truncate a string to max_len chars, appending "..." if truncated.
 /// Safe for multi-byte UTF-8 (truncates at char boundary).
-fn truncate_str(s: &str, max_len: usize) -> String {
+pub(crate) fn truncate_str(s: &str, max_len: usize) -> String {
     if s.chars().count() <= max_len {
         s.to_string()
     } else {
