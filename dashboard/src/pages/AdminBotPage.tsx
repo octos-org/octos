@@ -1,7 +1,9 @@
 import { useState, useEffect, useCallback } from 'react'
+import { Link } from 'react-router-dom'
 import { api } from '../api'
+import StatusBadge from '../components/StatusBadge'
 import { useToast } from '../components/Toast'
-import type { MonitorProfileStatus, MonitorStatus } from '../types'
+import type { MonitorProfileStatus, MonitorStatus, ProfileResponse } from '../types'
 
 type MonitorOverride = 'inherit' | 'enabled' | 'disabled'
 
@@ -16,11 +18,18 @@ export default function AdminBotPage() {
   const [loading, setLoading] = useState(true)
   const [savingProfileId, setSavingProfileId] = useState<string | null>(null)
   const [monitorStatus, setMonitorStatus] = useState<MonitorStatus>(EMPTY_MONITOR_STATUS)
+  const [profiles, setProfiles] = useState<ProfileResponse[]>([])
 
   const loadData = useCallback(async () => {
     try {
-      const monitor = await api.monitorStatus().catch(() => EMPTY_MONITOR_STATUS)
+      const [monitor, profileList] = await Promise.all([
+        api.monitorStatus().catch(() => EMPTY_MONITOR_STATUS),
+        // All pages — admin profiles past the first page (limit=100)
+        // must not silently vanish from this list.
+        api.listAllProfiles(),
+      ])
       setMonitorStatus({ ...EMPTY_MONITOR_STATUS, ...monitor, profiles: monitor.profiles ?? [] })
+      setProfiles(profileList)
     } catch (e: any) {
       toast(e.message, 'error')
     } finally {
@@ -79,6 +88,9 @@ export default function AdminBotPage() {
       </div>
     )
   }
+
+  const adminProfiles = profiles.filter((profile) => profile.config.admin_mode)
+  const activeAdminProfile = adminProfiles.find((profile) => profile.status.running)
 
   return (
     <div className="max-w-5xl">
@@ -159,12 +171,51 @@ export default function AdminBotPage() {
       </div>
 
       <div className="bg-surface rounded-xl border border-gray-700/50 p-5">
-        <h2 className="text-sm font-semibold text-white mb-2">Admin Bot Profile</h2>
-        <p className="text-sm text-gray-400">
-          To set up an admin bot, create a regular profile and enable <strong className="text-white">Admin Mode</strong> in
-          its settings. Admin mode restricts the gateway to admin-only tools (profile management,
-          monitoring, logs) and uses a built-in admin system prompt.
-        </p>
+        <div className="flex items-center justify-between gap-3 mb-4">
+          <div>
+            <h2 className="text-sm font-semibold text-white">Admin Bot Profile</h2>
+            <p className="text-xs text-gray-500 mt-1">
+              Active admin bot:{' '}
+              <span className={activeAdminProfile ? 'text-green-400' : 'text-gray-400'}>
+                {activeAdminProfile ? activeAdminProfile.name : 'None running'}
+              </span>
+            </p>
+          </div>
+          <Link
+            to="/profiles/new?adminMode=true"
+            className="shrink-0 px-3 py-2 text-xs font-medium rounded-lg bg-accent text-white hover:bg-accent-light transition"
+          >
+            Create admin profile
+          </Link>
+        </div>
+
+        {adminProfiles.length > 0 ? (
+          <div className="divide-y divide-gray-700/50">
+            {adminProfiles.map((profile) => (
+              <div key={profile.id} className="flex items-center justify-between gap-3 py-3 first:pt-0 last:pb-0">
+                <div className="min-w-0">
+                  <Link
+                    to={`/profile/${profile.id}`}
+                    className="text-sm font-medium text-white hover:text-accent transition"
+                  >
+                    {profile.name}
+                  </Link>
+                  <p className="text-xs text-gray-500 font-mono mt-1 truncate">{profile.id}</p>
+                </div>
+                <StatusBadge
+                  className="shrink-0"
+                  running={profile.status.running}
+                  status={profile.status.status}
+                  error={profile.status.error ?? null}
+                />
+              </div>
+            ))}
+          </div>
+        ) : (
+          <div className="rounded-lg border border-dashed border-gray-700/70 px-4 py-5 text-sm text-gray-400">
+            No admin-mode profiles found.
+          </div>
+        )}
       </div>
     </div>
   )

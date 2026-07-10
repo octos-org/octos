@@ -233,6 +233,7 @@ test("checked-in capability gate makes validated M19 lanes runnable", () => {
     "websocket-happy-path",
     "approval-denial",
     "narrow-layout",
+    "restart-reconnect",
   ]) {
     const scenario = manifest.scenarios.find((s) => s.id === id);
     assert.ok(scenario, `missing scenario ${id}`);
@@ -246,7 +247,6 @@ test("checked-in capability gate leaves unproven M19 lanes blocked", () => {
   const env = makeEnv({ capabilities: checkedInCapabilities() });
   for (const id of [
     "task-subagent-tree",
-    "restart-reconnect",
     "dropped-completion-backpressure",
   ]) {
     const scenario = manifest.scenarios.find((s) => s.id === id);
@@ -254,6 +254,56 @@ test("checked-in capability gate leaves unproven M19 lanes blocked", () => {
     const r = classifyRunnability(scenario, env);
     assert.equal(r.status, "blocked", `${id} should stay blocked until validated`);
     assert.ok(r.reasons.length > 0);
+  }
+});
+
+test("capability gate promotes restart-reconnect without promoting task-subagent-tree", () => {
+  const manifest = loadManifest({ path: MANIFEST });
+  const capabilities = checkedInCapabilities();
+  const restartReconnect = manifest.scenarios.find((s) => s.id === "restart-reconnect");
+  const taskSubagentTree = manifest.scenarios.find((s) => s.id === "task-subagent-tree");
+
+  for (const cap of restartReconnect.requiredCapabilities) {
+    assert.ok(capabilities.has(cap), `capability gate missing ${cap}`);
+  }
+
+  const restartStatus = classifyRunnability(
+    restartReconnect,
+    makeEnv({ capabilities }),
+  );
+  assert.equal(restartStatus.status, "runnable");
+  assert.deepEqual(restartStatus.reasons, []);
+
+  const taskStatus = classifyRunnability(
+    taskSubagentTree,
+    makeEnv({ capabilities }),
+  );
+  assert.equal(taskStatus.status, "blocked");
+  assert.ok(
+    taskStatus.reasons.some((reason) => reason.includes("task/spawn")),
+    "task-subagent-tree should remain blocked until task capabilities land",
+  );
+});
+
+test("restart-reconnect manifest declares the validated reconnect evidence artifacts", () => {
+  // The runnable lane's artifact contract must stay in sync with what the
+  // in-repo runner/probe emit and ux-tmux-validate.mjs checks in
+  // restart_reconnect_visible_contract.
+  const manifest = loadManifest({ path: MANIFEST });
+  const scenario = manifest.scenarios.find((s) => s.id === "restart-reconnect");
+  assert.ok(scenario, "missing scenario restart-reconnect");
+  for (const artifact of [
+    "reconnect-events.jsonl",
+    "tui-capture-pre-restart.txt",
+    "tui-capture-post-reconnect.txt",
+    "pre-restart-snapshot.json",
+    "post-reconnect-snapshot.json",
+    "websocket-transcript.jsonl",
+  ]) {
+    assert.ok(
+      scenario.expectedArtifacts.includes(artifact),
+      `restart-reconnect manifest missing validated artifact ${artifact}`,
+    );
   }
 });
 

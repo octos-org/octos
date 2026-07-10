@@ -30,9 +30,8 @@
 //!    and increments the `octos_mcp_server_call_total{tool,outcome}` counter.
 //! 6. Zero new `unsafe`.
 
-use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use eyre::Result;
@@ -40,11 +39,17 @@ use metrics::counter;
 use octos_core::{TASK_RESULT_SCHEMA_VERSION, TaskId};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
-use tokio::net::TcpListener;
 use tokio::sync::{Mutex, RwLock};
-use tokio::task::JoinHandle;
-use tracing::{info, warn};
+
+use rmcp::model::{
+    CallToolRequestParams, CallToolResult, Content, Implementation, ListToolsResult,
+    PaginatedRequestParams, ProtocolVersion, ServerCapabilities, ServerInfo, Tool,
+};
+use rmcp::service::RequestContext;
+use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
+use rmcp::transport::{StreamableHttpServerConfig, StreamableHttpService};
+use rmcp::{ErrorData, RoleServer, ServerHandler, serve_server};
+use tokio_util::sync::CancellationToken;
 
 use crate::harness_events::HarnessEvent;
 use crate::task_supervisor::{TaskLifecycleState, TaskSupervisor};
@@ -59,8 +64,14 @@ pub const RUN_OCTOS_SESSION_TOOL: &str = "run_octos_session";
 /// Environment variable name that the HTTP transport reads for its bearer token.
 pub const OCTOS_MCP_SERVER_TOKEN_ENV: &str = "OCTOS_MCP_SERVER_TOKEN";
 
-/// Maximum JSON-RPC request body size (1 MB), matching the MCP client.
-const MAX_REQUEST_BYTES: usize = 1_048_576;
+/// Idle keep-alive for HTTP Streamable sessions. rmcp's 300s default reaps a
+/// session mid-call for a long synchronous `run_octos_session` (which emits no
+/// intermediate protocol traffic to reset the timer); this widens it to a bound
+/// comfortably above a realistic session (the dispatch caps at 20 agent
+/// iterations) while still finite, so a session a client abandons without a
+/// `DELETE` is reaped instead of leaked. Deployments needing longer single
+/// calls can raise this.
+const HTTP_SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(4 * 60 * 60);
 
 /// Typed error kinds surfaced by the session-level dispatch flow.
 #[derive(Debug, Clone)]
@@ -129,7 +140,9 @@ type EventSink = Arc<dyn Fn(HarnessEvent) + Send + Sync>;
 pub struct McpServer {
     dispatch: Arc<dyn McpSessionDispatch>,
     supervisor: Arc<TaskSupervisor>,
-    event_sink: RwLock<Option<EventSink>>,
+    // `Arc` so the rmcp `OctosMcpHandler` (which must be `Clone` for the
+    // per-session HTTP service factory) can share the same installed sink.
+    event_sink: Arc<RwLock<Option<EventSink>>>,
 }
 
 impl McpServer {
@@ -137,7 +150,7 @@ impl McpServer {
         Self {
             dispatch,
             supervisor,
-            event_sink: RwLock::new(None),
+            event_sink: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -188,181 +201,300 @@ impl McpServer {
             return render_mcp_error(id, McpServerError::UnknownTool(tool_name.to_string()));
         }
 
-        match dispatch_run_octos_session(&*self.dispatch, &self.supervisor, params).await {
-            Ok(result) => {
-                // Extract the outcome so we can emit the matching harness event.
-                let (outcome_label, contract_label, error_message) =
-                    extract_outcome_from_result(&result);
-                self.emit_mcp_event(
-                    transport,
-                    &outcome_label,
-                    contract_label.as_deref(),
-                    error_message.as_deref(),
-                );
-                counter!(
-                    "octos_mcp_server_call_total",
-                    "tool" => RUN_OCTOS_SESSION_TOOL.to_string(),
-                    "outcome" => outcome_label,
-                )
-                .increment(1);
-                json_rpc_result(id, result)
-            }
-            Err(err) => {
-                self.emit_mcp_event(transport, "error", None, Some(&err.to_string()));
-                counter!(
-                    "octos_mcp_server_call_total",
-                    "tool" => RUN_OCTOS_SESSION_TOOL.to_string(),
-                    "outcome" => "error".to_string(),
-                )
-                .increment(1);
-                render_mcp_error(id, err)
-            }
+        let result = dispatch_run_octos_session(&*self.dispatch, &self.supervisor, params).await;
+        let sink = self.event_sink.read().await.clone();
+        emit_call_outcome(&sink, transport, &result);
+        match result {
+            Ok(value) => json_rpc_result(id, value),
+            Err(err) => render_mcp_error(id, err),
         }
     }
 
-    fn emit_mcp_event(
-        &self,
-        transport: &str,
-        outcome: &str,
-        contract: Option<&str>,
-        error: Option<&str>,
+    /// Build the rmcp Streamable HTTP tower service for this server.
+    ///
+    /// The service factory clones a fresh [`OctosMcpHandler`] (tagged `http`)
+    /// per MCP session. When `allow_non_loopback` is `false`, rmcp's default
+    /// config restricts requests to loopback `Host` values — a built-in
+    /// DNS-rebinding guard appropriate for a `127.0.0.1` bind. Pass `true` when
+    /// binding a non-loopback interface for cross-host orchestration; the guard
+    /// is then disabled and the bearer token is the sole authenticator.
+    ///
+    /// The caller (the CLI, which owns axum) mounts this into a router behind a
+    /// bearer-token layer and binds it — bearer authentication and TLS are the
+    /// caller's responsibility, not this service's.
+    ///
+    /// Returns the service together with a [`CancellationToken`]: cancelling it
+    /// terminates all live sessions so an `axum` graceful shutdown can drain the
+    /// long-lived SSE connections instead of hanging until they idle out. The
+    /// caller must cancel it in its shutdown path.
+    ///
+    /// The session manager's idle keep-alive is widened from rmcp's 300s default
+    /// to [`HTTP_SESSION_IDLE_TIMEOUT`]: `run_octos_session` is a single
+    /// long-running synchronous tool call that emits no intermediate MCP
+    /// traffic, so the 300s timer would reap the session mid-call and drop the
+    /// result before the client received it. The timer stays finite (not
+    /// disabled) so a session a client abandoned without a `DELETE` is still
+    /// reaped rather than leaked; the returned token additionally tears every
+    /// session down on shutdown.
+    pub fn streamable_http_service(
+        self,
+        allow_non_loopback: bool,
+    ) -> (
+        StreamableHttpService<OctosMcpHandler, LocalSessionManager>,
+        CancellationToken,
     ) {
-        let Some(sink) = self.event_sink.try_read().ok().and_then(|g| g.clone()) else {
-            return;
+        let dispatch = self.dispatch;
+        let supervisor = self.supervisor;
+        let event_sink = self.event_sink;
+
+        let cancel = CancellationToken::new();
+        let mut config =
+            StreamableHttpServerConfig::default().with_cancellation_token(cancel.clone());
+        if allow_non_loopback {
+            config = config.disable_allowed_hosts();
+        }
+
+        // A long tool call is not a dead session, but a fully-disabled timer
+        // leaks abandoned sessions — so widen it to a finite bound instead of
+        // clearing it (see the doc comment).
+        let mut session_manager = LocalSessionManager::default();
+        session_manager.session_config.keep_alive = Some(HTTP_SESSION_IDLE_TIMEOUT);
+
+        let service = StreamableHttpService::new(
+            move || {
+                Ok(OctosMcpHandler {
+                    dispatch: dispatch.clone(),
+                    supervisor: supervisor.clone(),
+                    event_sink: event_sink.clone(),
+                    transport_label: "http",
+                })
+            },
+            Arc::new(session_manager),
+            config,
+        );
+        (service, cancel)
+    }
+
+    /// Serve the single `run_octos_session` tool over the rmcp SDK on an
+    /// arbitrary byte transport (`read`/`write` pair). [`serve_stdio`] is the
+    /// production wrapper over the process's stdin/stdout; tests drive it over
+    /// an in-memory duplex. Returns when the peer closes the stream or the
+    /// service is cancelled.
+    pub async fn serve_io<R, W>(self, read: R, write: W) -> Result<()>
+    where
+        R: tokio::io::AsyncRead + Send + Unpin + 'static,
+        W: tokio::io::AsyncWrite + Send + Unpin + 'static,
+    {
+        let handler = OctosMcpHandler {
+            dispatch: self.dispatch,
+            supervisor: self.supervisor,
+            event_sink: self.event_sink,
+            transport_label: "stdio",
         };
-        let caller_id = caller_id_for_transport(transport);
+        let running = serve_server(handler, (read, write))
+            .await
+            .map_err(|err| eyre::eyre!("mcp-serve stdio handshake failed: {err}"))?;
+        running
+            .waiting()
+            .await
+            .map_err(|err| eyre::eyre!("mcp-serve stdio service failed: {err}"))?;
+        Ok(())
+    }
+
+    /// Production entry point for the stdio transport (parent-trust auth — the
+    /// parent process spawned us). Serves the single `run_octos_session` tool
+    /// over the rmcp SDK on the process's stdin/stdout.
+    pub async fn serve_stdio(self) -> Result<()> {
+        let (stdin, stdout) = rmcp::transport::stdio();
+        self.serve_io(stdin, stdout).await
+    }
+}
+
+/// rmcp [`ServerHandler`] exposing octos as a single-tool MCP server.
+///
+/// Every transport (`serve_stdio` today, the streamable-HTTP service next)
+/// routes through this handler, which reuses the same
+/// [`dispatch_run_octos_session`] business logic, harness-event emission, and
+/// `octos_mcp_server_call_total` metric as the legacy JSON-RPC path.
+#[derive(Clone)]
+pub struct OctosMcpHandler {
+    dispatch: Arc<dyn McpSessionDispatch>,
+    supervisor: Arc<TaskSupervisor>,
+    event_sink: Arc<RwLock<Option<EventSink>>>,
+    transport_label: &'static str,
+}
+
+impl ServerHandler for OctosMcpHandler {
+    fn get_info(&self) -> ServerInfo {
+        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+            .with_protocol_version(ProtocolVersion::LATEST)
+            .with_server_info(Implementation::new("octos", env!("CARGO_PKG_VERSION")))
+            .with_instructions(
+                "Exposes a single tool, `run_octos_session`, that runs a complete octos \
+                 session (workspace contract + input to artifact) to completion, including \
+                 workspace-contract enforcement. Internal tool calls and progress events \
+                 are not streamed to the caller.",
+            )
+    }
+
+    async fn list_tools(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ListToolsResult, ErrorData> {
+        Ok(ListToolsResult {
+            tools: vec![run_octos_session_tool()],
+            ..Default::default()
+        })
+    }
+
+    async fn call_tool(
+        &self,
+        request: CallToolRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, ErrorData> {
+        if request.name.as_ref() != RUN_OCTOS_SESSION_TOOL {
+            return Err(ErrorData::invalid_params(
+                format!(
+                    "unknown tool '{}'; this server exposes only '{RUN_OCTOS_SESSION_TOOL}'",
+                    request.name
+                ),
+                None,
+            ));
+        }
+
+        // Adapt the typed rmcp request into the `{name, arguments}` shape the
+        // shared dispatch helper expects, so all transports run identical
+        // supervisor / contract / artifact logic.
+        let arguments = request
+            .arguments
+            .map(Value::Object)
+            .unwrap_or_else(|| Value::Object(Default::default()));
+        let params = json!({ "name": RUN_OCTOS_SESSION_TOOL, "arguments": arguments });
+
+        // Run the session, but abort it if rmcp cancels this request: a client
+        // `notifications/cancelled`, a disconnect, or session teardown (e.g. the
+        // idle-timeout reaper firing on a pathological multi-hour call). Without
+        // this the dispatched agent would keep running with no client to receive
+        // its result. `context.ct` descends from the serve-loop token, so it
+        // fires on all three; dropping the dispatch future cancels the agent.
+        let result = tokio::select! {
+            result = dispatch_run_octos_session(&*self.dispatch, &self.supervisor, &params) => result,
+            _ = context.ct.cancelled() => Err(McpServerError::SessionFailed(
+                "run_octos_session cancelled by the client or session teardown".to_string(),
+            )),
+        };
+
+        let sink = self.event_sink.read().await.clone();
+        emit_call_outcome(&sink, self.transport_label, &result);
+
+        match result {
+            Ok(value) => Ok(value_to_call_tool_result(value)),
+            Err(err) => Err(mcp_error_to_error_data(err)),
+        }
+    }
+}
+
+/// The single MCP tool advertised by the server, as a typed rmcp [`Tool`].
+fn run_octos_session_tool() -> Tool {
+    let schema = json!({
+        "type": "object",
+        "properties": {
+            "contract": {
+                "type": "string",
+                "description": "Workspace contract name (e.g. 'slides_delivery', 'site_delivery', 'coding')."
+            },
+            "input": {
+                "type": "object",
+                "description": "Opaque input payload forwarded to the session. Shape is contract-specific."
+            }
+        },
+        "required": ["contract", "input"]
+    });
+    let input_schema = schema.as_object().cloned().unwrap_or_default();
+    Tool::new(
+        RUN_OCTOS_SESSION_TOOL,
+        "Run a complete octos session. The caller supplies a workspace contract name and an \
+         input payload; octos runs its normal loop to completion (including workspace-contract \
+         enforcement) and returns the resulting artifact. Internal tool calls and progress \
+         events are not streamed to the caller.",
+        input_schema,
+    )
+}
+
+/// Convert the shared dispatch result (`{content:[{text}], isError}`) into a
+/// typed rmcp [`CallToolResult`], preserving the tool-level error flag so the
+/// caller's MCP client renders failures with their recovery hints.
+fn value_to_call_tool_result(value: Value) -> CallToolResult {
+    let text = value
+        .get("content")
+        .and_then(Value::as_array)
+        .and_then(|arr| arr.first())
+        .and_then(|entry| entry.get("text"))
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let is_error = value
+        .get("isError")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let content = vec![Content::text(text)];
+    if is_error {
+        CallToolResult::error(content)
+    } else {
+        CallToolResult::success(content)
+    }
+}
+
+/// Map a typed [`McpServerError`] onto an rmcp JSON-RPC [`ErrorData`]. Used
+/// only for protocol-level failures (bad params, unroutable tool, server
+/// fault); session-level failures travel as `CallToolResult::error` so the
+/// caller sees the message.
+fn mcp_error_to_error_data(err: McpServerError) -> ErrorData {
+    match err {
+        McpServerError::InvalidParams(msg) => ErrorData::invalid_params(msg, None),
+        McpServerError::UnknownTool(name) => {
+            ErrorData::invalid_params(format!("unknown tool: {name}"), None)
+        }
+        McpServerError::ProtocolError(msg) => ErrorData::invalid_request(msg, None),
+        McpServerError::SessionFailed(msg) => ErrorData::internal_error(msg, None),
+        McpServerError::Unauthorized => ErrorData::invalid_request("authentication required", None),
+    }
+}
+
+/// Emit the `McpServerCall` harness event and increment
+/// `octos_mcp_server_call_total{tool,outcome}` for a completed
+/// `run_octos_session` dispatch. Shared by the rmcp `call_tool` handler and
+/// the legacy JSON-RPC `handle_tools_call` path so both transports observe the
+/// same audit trail.
+fn emit_call_outcome(
+    sink: &Option<EventSink>,
+    transport: &str,
+    result: &Result<Value, McpServerError>,
+) {
+    let (outcome_label, contract_label, error_message) = match result {
+        Ok(value) => extract_outcome_from_result(value),
+        Err(err) => ("error".to_string(), None, Some(err.to_string())),
+    };
+    if let Some(sink) = sink {
         let event = HarnessEvent::mcp_server_call(
             format!("mcp:{transport}"),
             TaskId::new().to_string(),
             RUN_OCTOS_SESSION_TOOL,
-            caller_id,
+            caller_id_for_transport(transport),
             transport,
-            outcome,
-            contract.map(|s| s.to_string()),
-            error.map(|s| s.to_string()),
+            &outcome_label,
+            contract_label,
+            error_message,
         );
         (sink)(event);
     }
-
-    /// Bind an HTTP listener on localhost (ephemeral port) for tests.
-    /// Production callers should use [`McpServer::serve_http`] with an
-    /// explicit [`SocketAddr`].
-    pub async fn spawn_http_on_local_port(self, token: String) -> std::io::Result<McpServerHandle> {
-        let listener = TcpListener::bind("127.0.0.1:0").await?;
-        self.serve_http_on_listener(listener, token).await
-    }
-
-    /// Bind an HTTP listener on `addr` and spawn it as a background task,
-    /// returning a handle that observes the bound address and allows the
-    /// caller to shut the listener down. Production entry point.
-    pub async fn serve_http(
-        self,
-        addr: SocketAddr,
-        token: String,
-    ) -> std::io::Result<McpServerHandle> {
-        let listener = TcpListener::bind(addr).await?;
-        self.serve_http_on_listener(listener, token).await
-    }
-
-    async fn serve_http_on_listener(
-        self,
-        listener: TcpListener,
-        token: String,
-    ) -> std::io::Result<McpServerHandle> {
-        let addr = listener.local_addr()?;
-        let server = Arc::new(self);
-        let token = Arc::new(token);
-        let shutdown = Arc::new(tokio::sync::Notify::new());
-        let accept_shutdown = shutdown.clone();
-        let shutdown_requested = Arc::new(AtomicBool::new(false));
-        let accept_shutdown_requested = shutdown_requested.clone();
-        let handle = tokio::spawn(run_http_accept_loop(
-            listener,
-            server,
-            token,
-            accept_shutdown,
-            accept_shutdown_requested,
-        ));
-
-        Ok(McpServerHandle {
-            addr,
-            shutdown,
-            shutdown_requested,
-            handle,
-        })
-    }
-
-    /// Production entry point for the stdio transport — loops on stdin, writes
-    /// JSON-RPC responses to stdout. Returns when stdin closes or the process
-    /// is signalled to shut down.
-    pub async fn serve_stdio(self) -> Result<()> {
-        let server = Arc::new(self);
-        let stdin = tokio::io::stdin();
-        let stdout = tokio::io::stdout();
-        serve_stdio_generic(server, stdin, stdout).await
-    }
-}
-
-/// Handle returned by [`McpServer::spawn_http_on_local_port`] so callers can
-/// observe the bound address and shut the listener down.
-pub struct McpServerHandle {
-    addr: SocketAddr,
-    shutdown: Arc<tokio::sync::Notify>,
-    shutdown_requested: Arc<AtomicBool>,
-    handle: JoinHandle<()>,
-}
-
-impl McpServerHandle {
-    pub fn addr(&self) -> SocketAddr {
-        self.addr
-    }
-
-    pub async fn shutdown(self) {
-        self.shutdown_requested.store(true, Ordering::Release);
-        self.shutdown.notify_waiters();
-        let _ = self.handle.await;
-    }
-}
-
-async fn run_http_accept_loop(
-    listener: TcpListener,
-    server: Arc<McpServer>,
-    token: Arc<String>,
-    accept_shutdown: Arc<tokio::sync::Notify>,
-    accept_shutdown_requested: Arc<AtomicBool>,
-) {
-    loop {
-        if accept_shutdown_requested.load(Ordering::Acquire) {
-            break;
-        }
-        let shutdown_notified = accept_shutdown.notified();
-        tokio::pin!(shutdown_notified);
-        if accept_shutdown_requested.load(Ordering::Acquire) {
-            break;
-        }
-
-        tokio::select! {
-            biased;
-            _ = &mut shutdown_notified => break,
-            accept = listener.accept() => {
-                match accept {
-                    Ok((stream, peer)) => {
-                        let server = server.clone();
-                        let token = token.clone();
-                        tokio::spawn(async move {
-                            if let Err(err) = handle_http_connection(server, token, stream, peer).await {
-                                warn!(error = %err, "mcp-serve http connection error");
-                            }
-                        });
-                    }
-                    Err(err) => {
-                        warn!(error = %err, "mcp-serve accept failed");
-                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                    }
-                }
-            }
-        }
-    }
+    counter!(
+        "octos_mcp_server_call_total",
+        "tool" => RUN_OCTOS_SESSION_TOOL.to_string(),
+        "outcome" => outcome_label,
+    )
+    .increment(1);
 }
 
 /// Build the `initialize` response. Public so transports outside this module
@@ -630,200 +762,10 @@ impl SessionLifecycleObserver for SupervisorObserver<'_> {
     }
 }
 
-// ---- stdio transport ----
-
-async fn serve_stdio_generic<R, W>(server: Arc<McpServer>, stdin: R, mut stdout: W) -> Result<()>
-where
-    R: AsyncRead + Unpin,
-    W: AsyncWrite + Unpin,
-{
-    let mut reader = BufReader::new(stdin);
-    let mut line = String::new();
-    loop {
-        line.clear();
-        let n = reader.read_line(&mut line).await?;
-        if n == 0 {
-            info!("mcp-serve stdio: peer closed");
-            return Ok(());
-        }
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        if trimmed.len() > MAX_REQUEST_BYTES {
-            let err = render_mcp_error(
-                Value::Null,
-                McpServerError::ProtocolError("request exceeds 1MB limit".into()),
-            );
-            let mut buf = serde_json::to_string(&err)?;
-            buf.push('\n');
-            stdout.write_all(buf.as_bytes()).await?;
-            stdout.flush().await?;
-            continue;
-        }
-        let request: Value = match serde_json::from_str(trimmed) {
-            Ok(v) => v,
-            Err(err) => {
-                let response = render_mcp_error(
-                    Value::Null,
-                    McpServerError::ProtocolError(format!("invalid JSON-RPC: {err}")),
-                );
-                let mut buf = serde_json::to_string(&response)?;
-                buf.push('\n');
-                stdout.write_all(buf.as_bytes()).await?;
-                stdout.flush().await?;
-                continue;
-            }
-        };
-
-        let response = server.handle_request(&request, "stdio").await;
-        let mut buf = serde_json::to_string(&response)?;
-        buf.push('\n');
-        stdout.write_all(buf.as_bytes()).await?;
-        stdout.flush().await?;
-    }
-}
-
-// ---- http transport (minimal HTTP/1.1, one request per connection) ----
-
-async fn handle_http_connection(
-    server: Arc<McpServer>,
-    token: Arc<String>,
-    mut stream: tokio::net::TcpStream,
-    peer: SocketAddr,
-) -> Result<()> {
-    let (read, mut write) = stream.split();
-    let mut reader = BufReader::new(read);
-    let mut request_line = String::new();
-    let bytes = reader.read_line(&mut request_line).await?;
-    if bytes == 0 {
-        return Ok(());
-    }
-    let request_line = request_line.trim_end_matches(['\r', '\n']).to_string();
-    let mut parts = request_line.split_whitespace();
-    let method = parts.next().unwrap_or("");
-    let path = parts.next().unwrap_or("");
-
-    if method != "POST" {
-        return write_http_response(
-            &mut write,
-            405,
-            "Method Not Allowed",
-            "application/json",
-            br#"{"error":"method not allowed"}"#,
-        )
-        .await;
-    }
-    // We only accept requests on /, /mcp, or /mcp/jsonrpc to leave routing room
-    // but keep the surface tight.
-    if !matches!(path, "/" | "/mcp" | "/mcp/jsonrpc") {
-        return write_http_response(
-            &mut write,
-            404,
-            "Not Found",
-            "application/json",
-            br#"{"error":"not found"}"#,
-        )
-        .await;
-    }
-
-    let mut content_length: Option<usize> = None;
-    let mut authorization: Option<String> = None;
-    loop {
-        let mut header_line = String::new();
-        let n = reader.read_line(&mut header_line).await?;
-        if n == 0 {
-            break;
-        }
-        let trimmed = header_line.trim_end_matches(['\r', '\n']);
-        if trimmed.is_empty() {
-            break;
-        }
-        if let Some((name, value)) = trimmed.split_once(':') {
-            let name = name.trim();
-            let value = value.trim();
-            if name.eq_ignore_ascii_case("content-length") {
-                content_length = value.parse().ok();
-            } else if name.eq_ignore_ascii_case("authorization") {
-                authorization = Some(value.to_string());
-            }
-        }
-    }
-
-    let supplied = parse_bearer_token(authorization.as_deref());
-    if !supplied
-        .as_deref()
-        .is_some_and(|t| constant_time_eq(t, &token))
-    {
-        return write_http_response(
-            &mut write,
-            401,
-            "Unauthorized",
-            "application/json",
-            br#"{"error":"unauthorized"}"#,
-        )
-        .await;
-    }
-
-    let length = content_length.unwrap_or(0);
-    if length > MAX_REQUEST_BYTES {
-        return write_http_response(
-            &mut write,
-            413,
-            "Payload Too Large",
-            "application/json",
-            br#"{"error":"request body too large"}"#,
-        )
-        .await;
-    }
-    let mut body = vec![0_u8; length];
-    if length > 0 {
-        reader.read_exact(&mut body).await?;
-    }
-
-    let request: Value = match serde_json::from_slice(&body) {
-        Ok(v) => v,
-        Err(err) => {
-            let error_response = render_mcp_error(
-                Value::Null,
-                McpServerError::ProtocolError(format!("invalid JSON: {err}")),
-            );
-            let body = serde_json::to_vec(&error_response)?;
-            return write_http_response(&mut write, 400, "Bad Request", "application/json", &body)
-                .await;
-        }
-    };
-
-    let response = server.handle_request(&request, "http").await;
-    let body = serde_json::to_vec(&response)?;
-    write_http_response(&mut write, 200, "OK", "application/json", &body).await?;
-    info!(peer = %peer, "mcp-serve http: served request");
-    Ok(())
-}
-
-async fn write_http_response<W>(
-    stream: &mut W,
-    status_code: u16,
-    status_text: &str,
-    content_type: &str,
-    body: &[u8],
-) -> Result<()>
-where
-    W: AsyncWrite + Unpin,
-{
-    let header = format!(
-        "HTTP/1.1 {status_code} {status_text}\r\nContent-Type: {content_type}\r\nContent-Length: {len}\r\nConnection: close\r\n\r\n",
-        len = body.len(),
-    );
-    stream.write_all(header.as_bytes()).await?;
-    stream.write_all(body).await?;
-    stream.flush().await?;
-    Ok(())
-}
-
-/// Constant-time comparison of two bytes buffers, used to avoid timing leaks
-/// on the bearer-token check.
-fn constant_time_eq(a: &str, b: &str) -> bool {
+/// Constant-time comparison of two strings, used by the HTTP bearer-token
+/// check (in the CLI's axum middleware) to avoid timing leaks. Public so the
+/// serving layer can reuse the same comparison the parser is paired with.
+pub fn constant_time_eq(a: &str, b: &str) -> bool {
     let a = a.as_bytes();
     let b = b.as_bytes();
     if a.len() != b.len() {
@@ -874,6 +816,71 @@ impl SessionLifecycleObserver for RecordingObserver {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A dispatch that always returns a Ready outcome so the rmcp round-trip
+    /// test can assert protocol behavior without running the agent loop.
+    struct ReadyDispatch;
+
+    #[async_trait]
+    impl McpSessionDispatch for ReadyDispatch {
+        async fn run_session(
+            &self,
+            _contract: &str,
+            _input: &Value,
+            observer: &dyn SessionLifecycleObserver,
+        ) -> Result<McpSessionOutcome, McpServerError> {
+            observer.mark_state(TaskLifecycleState::Running);
+            observer.mark_state(TaskLifecycleState::Verifying);
+            observer.mark_state(TaskLifecycleState::Ready);
+            Ok(McpSessionOutcome {
+                final_state: TaskLifecycleState::Ready,
+                artifact_path: Some("out/deck.pptx".to_string()),
+                artifact_content: Some("BYTES".to_string()),
+                validator_results: vec![],
+                cost: json!({"input_tokens": 1, "output_tokens": 1}),
+                error: None,
+            })
+        }
+    }
+
+    /// End-to-end proof that the rmcp [`OctosMcpHandler`] speaks the real MCP
+    /// protocol: an rmcp client connected over an in-memory duplex completes
+    /// the initialize handshake, sees exactly `run_octos_session` via
+    /// `tools/list`, and receives a non-error `tools/call` result.
+    #[tokio::test]
+    async fn serves_run_octos_session_over_real_rmcp_transport() {
+        use rmcp::model::{CallToolRequestParams, ClientInfo};
+        use rmcp::service::serve_client;
+
+        let server = McpServer::new(Arc::new(ReadyDispatch), Arc::new(TaskSupervisor::new()));
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let (client_read, client_write) = tokio::io::split(client_io);
+        let (server_read, server_write) = tokio::io::split(server_io);
+
+        let server_task =
+            tokio::spawn(async move { server.serve_io(server_read, server_write).await });
+
+        let client = serve_client(ClientInfo::default(), (client_read, client_write))
+            .await
+            .expect("client handshake should complete");
+
+        // tools/list advertises exactly the one session-level tool.
+        let tools = client.list_all_tools().await.expect("tools/list");
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].name.as_ref(), RUN_OCTOS_SESSION_TOOL);
+
+        // tools/call routes through the dispatch and returns a non-error bundle.
+        let mut param = CallToolRequestParams::new(RUN_OCTOS_SESSION_TOOL);
+        param.arguments = json!({ "contract": "coding", "input": {} })
+            .as_object()
+            .cloned();
+        let result = client.call_tool(param).await.expect("tools/call");
+        assert_ne!(result.is_error, Some(true));
+        assert!(!result.content.is_empty());
+
+        client.cancel().await.ok();
+        let _ = server_task.await;
+    }
 
     #[test]
     fn parse_bearer_token_accepts_mixed_case_scheme() {
@@ -986,47 +993,5 @@ mod tests {
         assert_eq!(outcome, "unknown");
         assert!(contract.is_none());
         assert!(error.is_none());
-    }
-
-    struct NoopDispatch;
-
-    #[async_trait::async_trait]
-    impl McpSessionDispatch for NoopDispatch {
-        async fn run_session(
-            &self,
-            _contract: &str,
-            _input: &Value,
-            _observer: &dyn SessionLifecycleObserver,
-        ) -> Result<McpSessionOutcome, McpServerError> {
-            Ok(McpSessionOutcome {
-                final_state: TaskLifecycleState::Ready,
-                artifact_path: None,
-                artifact_content: None,
-                validator_results: Vec::new(),
-                cost: json!({}),
-                error: None,
-            })
-        }
-    }
-
-    #[tokio::test]
-    async fn http_accept_loop_exits_when_shutdown_was_fired_before_poll() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let server = Arc::new(McpServer::new(
-            Arc::new(NoopDispatch),
-            Arc::new(TaskSupervisor::new()),
-        ));
-        let token = Arc::new("test-token".to_string());
-        let shutdown = Arc::new(tokio::sync::Notify::new());
-        let shutdown_requested = Arc::new(AtomicBool::new(true));
-
-        shutdown.notify_waiters();
-
-        tokio::time::timeout(
-            std::time::Duration::from_millis(100),
-            run_http_accept_loop(listener, server, token, shutdown, shutdown_requested),
-        )
-        .await
-        .expect("accept loop must exit when shutdown fired before it polls");
     }
 }

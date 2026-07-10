@@ -7,6 +7,7 @@ license.workspace = true
 description = "Episodic memory layer for octos, extends codex-state"
 
 [dependencies]
+regex = { workspace = true }
 octos-core = { workspace = true }
 # codex-state = { workspace = true }  # Enable when codex builds
 redb = { workspace = true }

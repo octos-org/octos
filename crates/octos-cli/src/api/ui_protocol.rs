@@ -56,13 +56,14 @@ use octos_core::ui_protocol::{
     UI_PROTOCOL_FEATURE_REVIEW_START_V1, UI_PROTOCOL_FEATURE_SESSION_HYDRATE_V1,
     UI_PROTOCOL_FEATURE_SESSION_SANDBOX_V1, UI_PROTOCOL_FEATURE_SESSION_WORKSPACE_CWD_V1,
     UI_PROTOCOL_FEATURE_SPAWN_COMPLETE_V1, UI_PROTOCOL_FEATURE_THREAD_GRAPH_V1,
-    UI_PROTOCOL_FEATURE_TURN_STATE_GET_V1, UI_PROTOCOL_FEATURE_USER_QUESTION_V1, UiAgentRecord,
-    UiArtifactPaneItem, UiArtifactPaneSnapshot, UiCommand, UiContextCompactionRecord,
-    UiContextNormalizationReport, UiContextState, UiCursor, UiFileMutationNotice, UiGitHistoryItem,
-    UiGitPaneSnapshot, UiGitStatusItem, UiNotification, UiPaneSnapshot, UiPaneSnapshotLimitation,
-    UiProgressEvent, UiProgressMetadata, UiProtocolCapabilities, UiRpcResult, UiWorkspacePaneEntry,
-    UiWorkspacePaneSnapshot, UnsupportedCapabilityReport, UserQuestionRequestedEvent,
-    UserQuestionRespondParams, approval_cancelled_reasons, approval_kinds, hydrate_sections,
+    UI_PROTOCOL_FEATURE_TURN_STATE_GET_V1, UI_PROTOCOL_FEATURE_USER_QUESTION_V1,
+    UI_PROTOCOL_FEATURE_VOICE_AUDIO_V1, UiAgentRecord, UiArtifactPaneItem, UiArtifactPaneSnapshot,
+    UiCommand, UiContextCompactionRecord, UiContextNormalizationReport, UiContextState, UiCursor,
+    UiFileMutationNotice, UiGitHistoryItem, UiGitPaneSnapshot, UiGitStatusItem, UiNotification,
+    UiPaneSnapshot, UiPaneSnapshotLimitation, UiProgressEvent, UiProgressMetadata,
+    UiProtocolCapabilities, UiRpcResult, UiWorkspacePaneEntry, UiWorkspacePaneSnapshot,
+    UnsupportedCapabilityReport, UserQuestionRequestedEvent, UserQuestionRespondParams,
+    VoiceAudioChunkEvent, approval_cancelled_reasons, approval_kinds, hydrate_sections,
     progress_kinds, thread_status,
 };
 use octos_core::{
@@ -1032,6 +1033,11 @@ struct ConnectionUiFeatures {
     /// where the richer envelopes' placement logic dropped PPTX
     /// deliveries on the SPA's chat thread.
     file_attached: bool,
+    /// `event.voice_audio.v1` negotiated. When set, the voice turn streams
+    /// reply audio as `voice/audio_chunk` notifications (base64 frames) for
+    /// progressive MSE playback; otherwise it falls back to whole-file
+    /// `file/attached` audio.
+    voice_audio: bool,
     /// UPCR-2026-014 M9-γ `projection.envelope.v1` negotiated. When set,
     /// the client opts in to the canonical [`Envelope`] shape (spec
     /// § 14) for projected events. γ-1 wires capability negotiation
@@ -1122,6 +1128,7 @@ impl ConnectionUiFeatures {
             ),
             spawn_complete: has_ui_feature(headers, query, UI_PROTOCOL_FEATURE_SPAWN_COMPLETE_V1),
             file_attached: has_ui_feature(headers, query, UI_PROTOCOL_FEATURE_FILE_ATTACHED_V1),
+            voice_audio: has_ui_feature(headers, query, UI_PROTOCOL_FEATURE_VOICE_AUDIO_V1),
             projection_envelope: has_ui_feature(
                 headers,
                 query,
@@ -1178,6 +1185,7 @@ impl ConnectionUiFeatures {
             message_persisted: true,
             spawn_complete: true,
             file_attached: true,
+            voice_audio: true,
             // Do NOT auto-enable `projection.envelope.v1` for stdio
             // connections. Legacy `turn/completed` is the turn-lifecycle
             // source for clients that do not consume `projection/envelope`
@@ -1230,6 +1238,7 @@ impl ConnectionUiFeatures {
             message_persisted: has(UI_PROTOCOL_FEATURE_MESSAGE_PERSISTED_V1),
             spawn_complete: has(UI_PROTOCOL_FEATURE_SPAWN_COMPLETE_V1),
             file_attached: has(UI_PROTOCOL_FEATURE_FILE_ATTACHED_V1),
+            voice_audio: has(UI_PROTOCOL_FEATURE_VOICE_AUDIO_V1),
             projection_envelope: has(UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V1),
             auxiliary_rest_to_ws_v1: has(UI_PROTOCOL_FEATURE_AUXILIARY_REST_TO_WS_V1),
             coding_autonomy_v1: has(UI_PROTOCOL_FEATURE_CODING_AUTONOMY_V1),
@@ -1293,6 +1302,9 @@ impl ConnectionUiFeatures {
         }
         if self.file_attached {
             requested.push(UI_PROTOCOL_FEATURE_FILE_ATTACHED_V1);
+        }
+        if self.voice_audio {
+            requested.push(UI_PROTOCOL_FEATURE_VOICE_AUDIO_V1);
         }
         if self.projection_envelope {
             requested.push(UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V1);
@@ -2167,7 +2179,7 @@ struct AppUiLoopPromptScratch {
 /// transcript is untouched — so older turns are trimmed (recent-first kept,
 /// any compaction summary preserved) to keep the spoken-turn prefill small.
 /// Override via `OCTOS_VOICE_MAX_PROMPT_TOKENS`.
-const VOICE_TURN_MAX_PROMPT_TOKENS: usize = 3000;
+const VOICE_TURN_MAX_PROMPT_TOKENS: usize = 8000;
 
 struct AppUiPromptContextBridge {
     session_id: SessionKey,
@@ -2439,6 +2451,54 @@ fn record_appui_context_manager_message(
             error = %error,
             "failed to persist appui context manager snapshot"
         );
+    }
+}
+
+fn replace_voice_user_message_content(messages: &mut [Message], transcript: Option<&str>) {
+    let Some(transcript) = transcript.map(str::trim).filter(|s| !s.is_empty()) else {
+        return;
+    };
+    if let Some(message) = messages
+        .iter_mut()
+        .find(|message| message.role == MessageRole::User)
+    {
+        message.content = transcript.to_owned();
+    }
+}
+
+/// Whether a turn should short-circuit as "no speech detected" (#1555 review).
+///
+/// `run_standalone_turn`'s `asr_media` list holds ALL materialized media paths
+/// (images and files as well as audio), so the short-circuit must NOT key off
+/// "any media + no transcript" — that silently completes e.g. a text+image
+/// turn without ever running the agent. Only swallow the turn when there is
+/// literally nothing left to act on: the turn carried audio, ASR produced no
+/// transcript, and there is no typed prompt and no non-audio media (an image
+/// or file alongside silent audio still gives the agent real input).
+///
+/// Pure (no I/O, no task-locals) so it is unit-testable in isolation.
+fn should_short_circuit_no_speech(
+    had_audio_media: bool,
+    had_non_audio_media: bool,
+    had_audio_input: bool,
+    prompt_is_empty: bool,
+) -> bool {
+    had_audio_media && !had_non_audio_media && !had_audio_input && prompt_is_empty
+}
+
+/// User-visible content of a voice turn: the typed prompt (if any) combined
+/// with the ASR transcript, exactly as the LLM prompt is assembled — but
+/// WITHOUT the `[语音模式:…]` scaffolding that gets appended to the prompt
+/// afterwards. This is both the base the prompt builds on and the value
+/// persisted into history via [`replace_voice_user_message_content`], so a
+/// mixed typed-text + audio turn keeps the typed text in the persisted user
+/// message (#1555 review). Pure-voice turns (empty typed prompt) persist the
+/// bare transcript, unchanged from before.
+fn combine_typed_prompt_with_transcript(typed_prompt: &str, transcript: &str) -> String {
+    if typed_prompt.trim().is_empty() {
+        transcript.to_owned()
+    } else {
+        format!("{typed_prompt}\n{transcript}")
     }
 }
 
@@ -4129,7 +4189,38 @@ async fn ui_protocol_connection(
             serde_json::to_value(&request).unwrap_or_else(|_| json!({ "malformed": true })),
         );
         let id = request.id.clone();
-        if handle_client_hello_rpc(&ws, &state, id.clone(), &request, &mut features) {
+        if handle_client_hello_rpc(
+            &ws,
+            &state,
+            id.clone(),
+            &request,
+            &mut features,
+            session_ingress_scope.is_some(),
+        ) {
+            continue;
+        }
+        // SECURITY (#1594): `handle_raw_appui_rpc` dispatches raw methods BEFORE
+        // `route_rpc_command`, so they never reach the typed
+        // `validate_session_ingress_command_scope` gate below. The raw handlers
+        // resolve their profile/session targets from request params
+        // independently of the credential (`raw_profile_id` prefers
+        // `params.profile_id`; autonomy targeting broadens to the base session
+        // key), so a per-session work-secret could drive autonomy on a sibling
+        // session or mutate an arbitrary profile. A caller-supplied `session_id`
+        // check alone cannot close that gap. Since legitimate ingress clients
+        // (the work-secret bridge) use only the typed surface, deny the entire
+        // raw surface for session-ingress connections — typed methods still flow
+        // to `validate_session_ingress_command_scope` untouched.
+        if session_ingress_scope.is_some()
+            && raw_method_is_dispatched(&request.method, features.stdio_transport)
+        {
+            let _ = send_rpc_error(
+                &ws,
+                Some(id),
+                RpcError::invalid_request(
+                    "session ingress credentials may not call raw (non-session-routed) methods",
+                ),
+            );
             continue;
         }
         if handle_raw_appui_rpc(
@@ -4203,6 +4294,7 @@ async fn ui_protocol_connection(
                     features,
                     id,
                     params,
+                    session_ingress_scope.is_some(),
                 )
                 .await;
                 if opened {
@@ -4744,7 +4836,8 @@ where
         #[cfg(test)]
         record_stdio_dispatch_for_test();
         let id = request.id.clone();
-        if handle_client_hello_rpc(&ws, &state, id.clone(), &request, &mut features) {
+        // stdio transport is never a session-ingress socket.
+        if handle_client_hello_rpc(&ws, &state, id.clone(), &request, &mut features, false) {
             continue;
         }
         let connection_profile_id = connection_profile_id_owned.as_deref();
@@ -4802,6 +4895,7 @@ where
                     features,
                     id,
                     params,
+                    false,
                 )
                 .await;
                 if opened {
@@ -6696,16 +6790,12 @@ fn registered_tool_names(registry: Option<&octos_agent::ToolRegistry>) -> Vec<St
     names
 }
 
-/// Names of tools currently in the deferred set (registered but filtered
-/// out of `specs()` for LRU efficiency). These remain recoverable via
-/// `activate_tools`, so the M14 coding tool contract treats them as
-/// available — otherwise core P0 tools like `shell`, `exec_command`, and
-/// `spawn_agent` would be reported as missing whenever a profile carries
-/// enough skill plugins to trip the auto-defer threshold. #970.
-fn deferred_model_tool_names(registry: Option<&octos_agent::ToolRegistry>) -> Vec<String> {
-    registry
-        .map(|registry| registry.deferred_tool_names())
-        .unwrap_or_default()
+/// RFC-0 (#1289): LRU tool deferral was removed, so no tool is ever deferred.
+/// Retained (returning an empty set) so the coding tool contract's
+/// disabled-vs-deferred bookkeeping keeps compiling; every registered-but-
+/// -not-visible tool is now genuinely disabled (internal-hidden / policy).
+fn deferred_model_tool_names(_registry: Option<&octos_agent::ToolRegistry>) -> Vec<String> {
+    Vec::new()
 }
 
 async fn tool_status_list_result(
@@ -8734,6 +8824,15 @@ async fn handle_raw_appui_rpc(
     id: String,
     request: &RpcRequest<Value>,
 ) -> bool {
+    // SINGLE SOURCE OF TRUTH: `raw_method_is_dispatched` decides the raw surface.
+    // Anything it rejects is NOT dispatched here (it flows to the typed surface),
+    // which lets the match default below be `unreachable!` and guarantees the
+    // session-ingress deny gate (which consults the same function) can never
+    // drift from what this handler actually serves.
+    if !raw_method_is_dispatched(request.method.as_str(), features.stdio_transport) {
+        return false;
+    }
+
     if request.method == APPUI_METHOD_REVIEW_START {
         handle_review_start(
             ws,
@@ -8975,7 +9074,12 @@ async fn handle_raw_appui_rpc(
             };
             onboarding_workspace_probe_result(state, &params.path)
         }
-        _ => return false,
+        // Unreachable: the `raw_method_is_dispatched` guard at the top of this
+        // function admits exactly the methods handled above. A method reaching
+        // here means the guard and this match have drifted — a bug, and (for
+        // session-ingress creds) a scope-bypass, so fail loudly rather than
+        // silently routing it to the typed surface.
+        other => unreachable!("raw_method_is_dispatched admitted an unhandled method: {other}"),
     };
 
     match result {
@@ -9046,6 +9150,7 @@ fn handle_client_hello_rpc(
     id: String,
     request: &RpcRequest<Value>,
     features: &mut ConnectionUiFeatures,
+    session_ingress: bool,
 ) -> bool {
     if request.method != APPUI_METHOD_CLIENT_HELLO {
         return false;
@@ -9078,7 +9183,13 @@ fn handle_client_hello_rpc(
     } else {
         "websocket"
     };
-    let capabilities = features.advertised_capabilities(state);
+    let mut capabilities = features.advertised_capabilities(state);
+    // #1594 follow-up: a session-ingress credential can only call the
+    // session-scoped surface, so don't advertise the raw/global methods it
+    // would be denied — keep advertised == callable.
+    if session_ingress {
+        filter_capabilities_for_session_ingress(&mut capabilities);
+    }
     let _ = send_rpc_result(
         ws,
         id,
@@ -9196,6 +9307,93 @@ fn route_rpc_command(
 
 fn string_session_with_optional_topic(session_id: &str, topic: Option<&str>) -> SessionKey {
     session_key_with_optional_topic(&SessionKey(session_id.to_owned()), topic)
+}
+
+/// SINGLE SOURCE OF TRUTH for which methods `handle_raw_appui_rpc` dispatches —
+/// the raw path that runs BEFORE `route_rpc_command`, so it never reaches the
+/// typed `validate_session_ingress_command_scope` gate.
+///
+/// `handle_raw_appui_rpc` early-returns `false` for any method this rejects and
+/// treats its own match default as `unreachable!`, so the dispatcher and the
+/// session-ingress deny gate CANNOT drift: a new raw arm that isn't also added
+/// here is dead (its feature won't dispatch) and trips the coverage test, while
+/// adding it here without a matching arm panics the `unreachable!`. Both point
+/// back to this one function.
+fn raw_method_is_dispatched(method: &str, stdio_transport: bool) -> bool {
+    if method == APPUI_METHOD_REVIEW_START || is_autonomy_method(method) {
+        return true;
+    }
+    if matches!(
+        method,
+        APPUI_METHOD_CONFIG_CAPABILITIES_LIST
+            | APPUI_METHOD_SESSION_STATUS_READ
+            | APPUI_METHOD_PROFILE_LLM_CATALOG
+            | APPUI_METHOD_PROFILE_LLM_LIST
+            | APPUI_METHOD_PROFILE_LLM_UPSERT
+            | APPUI_METHOD_PROFILE_LLM_TEST
+            | APPUI_METHOD_PROFILE_LLM_SELECT
+            | APPUI_METHOD_PROFILE_LLM_DELETE
+            | APPUI_METHOD_PROFILE_LLM_FETCH_MODELS
+            | APPUI_METHOD_PROFILE_SKILLS_LIST
+            | APPUI_METHOD_PROFILE_SKILLS_REGISTRY_SEARCH
+            | APPUI_METHOD_PROFILE_SKILLS_INSTALL
+            | APPUI_METHOD_PROFILE_SKILLS_REMOVE
+            | APPUI_METHOD_AUTH_STATUS
+            | APPUI_METHOD_AUTH_ME
+            | APPUI_METHOD_AUTH_SEND_CODE
+            | APPUI_METHOD_AUTH_VERIFY
+            | APPUI_METHOD_AUTH_LOGOUT
+            | APPUI_METHOD_MCP_STATUS_LIST
+            | APPUI_METHOD_TOOL_STATUS_LIST
+            | APPUI_METHOD_ONBOARDING_WORKSPACE_PROBE
+    ) {
+        return true;
+    }
+    // Content methods are dispatched by the raw handler ONLY on the stdio
+    // transport (where they return an auth-unavailable error); on every other
+    // transport they fall through to the typed surface. A session-ingress
+    // socket is never stdio, so these never reach the ingress deny gate.
+    stdio_transport
+        && matches!(
+            method,
+            octos_core::ui_protocol::methods::CONTENT_LIST
+                | octos_core::ui_protocol::methods::CONTENT_DELETE
+        )
+}
+
+/// Whether a session-ingress credential can actually CALL `method`. This is the
+/// inverse of the two ingress deny surfaces:
+///   - `raw_method_is_dispatched` (the whole raw surface is denied), and
+///   - the global (non-session-scoped) typed methods
+///     `validate_session_ingress_command_scope` rejects.
+///
+/// Used to filter advertised capabilities (#1594 follow-up) so the surface an
+/// ingress connection is TOLD about matches what it can invoke. The global list
+/// below must stay in lockstep with the reject arm of
+/// `validate_session_ingress_command_scope`; `session_ingress_capability_filter_matches_scope`
+/// pins the two together.
+fn session_ingress_callable_method(method: &str) -> bool {
+    if raw_method_is_dispatched(method, false) {
+        return false;
+    }
+    !matches!(
+        method,
+        APPUI_METHOD_PROFILE_LOCAL_CREATE
+            | octos_core::ui_protocol::methods::SESSION_LIST
+            | octos_core::ui_protocol::methods::SYSTEM_STATUS_GET
+            | octos_core::ui_protocol::methods::CONTENT_LIST
+            | octos_core::ui_protocol::methods::CONTENT_DELETE
+            | octos_core::ui_protocol::methods::CONTENT_BULK_DELETE
+    )
+}
+
+/// Restrict advertised `supported_methods` to what a session-ingress credential
+/// can actually call, closing the advertised-vs-callable gap on the
+/// `client_hello` and `session/open` responses an ingress connection receives.
+fn filter_capabilities_for_session_ingress(capabilities: &mut UiProtocolCapabilities) {
+    capabilities
+        .supported_methods
+        .retain(|method| session_ingress_callable_method(method));
 }
 
 fn validate_session_ingress_command_scope(
@@ -9407,6 +9605,7 @@ async fn handle_session_open(
     features: ConnectionUiFeatures,
     id: String,
     mut params: SessionOpenParams,
+    session_ingress: bool,
 ) -> bool {
     normalize_session_open_params_topic(&mut params);
     let topic_scope = params.topic.clone();
@@ -9421,7 +9620,7 @@ async fn handle_session_open(
     let session_id_for_subscribe = params.session_id.clone();
     let live_rx = ledger.subscribe(&session_id_for_subscribe);
 
-    let outcome = match open_session_result(
+    let mut outcome = match open_session_result(
         state,
         ledger,
         approvals,
@@ -9446,6 +9645,15 @@ async fn handle_session_open(
         }
     };
 
+    // #1594 follow-up: a session-ingress connection may only call the
+    // session-scoped surface, so the SessionOpened reply it receives must not
+    // advertise the raw/global methods it would be denied. Filter only this
+    // direct reply; the ledger-broadcast copy other connections observe is
+    // untouched (it reflects the session's negotiated features, not this
+    // credential's scope).
+    if session_ingress {
+        filter_capabilities_for_session_ingress(&mut outcome.result.opened.capabilities);
+    }
     let result = match serde_json::to_value(outcome.result) {
         Ok(result) => result,
         Err(error) => {
@@ -9546,6 +9754,19 @@ async fn handle_session_open(
         }
     }
 
+    // #1594 follow-up: the SessionOpened NOTIFICATION is a documented
+    // capability-discovery path (UPCR-2026-007), so an ingress connection's
+    // direct-sent copy must be filtered just like the RPC result was. This
+    // mutates only the per-connection clone in `outcome`; the shared ledger
+    // entry (already appended, broadcast to other connections) is untouched, and
+    // `send_ledger_event_durable` sends without re-appending.
+    if session_ingress {
+        if let UiProtocolLedgerEvent::Notification(UiNotification::SessionOpened(opened)) =
+            &mut outcome.opened_event.event
+        {
+            filter_capabilities_for_session_ingress(&mut opened.capabilities);
+        }
+    }
     let ledger_for_forwarder = ledger.clone();
     let _ = send_ledger_event_durable(ws, ledger, outcome.opened_event.event);
 
@@ -9780,6 +10001,14 @@ fn live_event_passes_capability_filter(
     // clients see `file/attached` as an additional dedicated signal.
     if !features.file_attached {
         if let UiProtocolLedgerEvent::Notification(UiNotification::FileAttached(_)) = event {
+            return false;
+        }
+    }
+    // `event.voice_audio.v1` gate: streamed reply-audio chunks only reach
+    // connections that negotiated progressive playback. Others keep the
+    // whole-file `file/attached` audio path.
+    if !features.voice_audio {
+        if let UiProtocolLedgerEvent::Notification(UiNotification::VoiceAudioChunk(_)) = event {
             return false;
         }
     }
@@ -18506,18 +18735,8 @@ async fn run_standalone_turn(
     // `SessionTaskQueryStore` below. Mirrors `session_actor.rs:2671`
     // for the WS path.
     tool_registry.set_session_key(session_id.to_string());
-    // M11-F regression fix REG-1 follow-up round 2 (codex review):
-    // re-register a fresh `ActivateToolsTool` on this per-turn
-    // snapshot so `wire_activate_tools()` below rewires THIS
-    // registry's Weak, not the cached SessionRuntime's. Without this,
-    // the per-turn rebuild would mutate the shared
-    // `Arc<ActivateToolsTool>` (clones share the same Mutex<Weak>)
-    // and the SessionRuntime's cached agent would silently lose its
-    // back-reference once the per-turn registry dropped at end of
-    // turn.
-    if tool_registry.get("activate_tools").is_some() {
-        tool_registry.register(octos_agent::ActivateToolsTool::new());
-    }
+    // RFC-0 (#1289): the `activate_tools` meta-tool was removed — no per-turn
+    // re-registration/rewiring needed.
     // RFC-1 fixup (codex P2): apply the SAME freshness pattern to the
     // `mofa_make` / `mofa_describe_content_type` dispatcher pair.
     // `snapshot_excluding` clones `Arc<dyn Tool>` instances, so the
@@ -18569,15 +18788,14 @@ async fn run_standalone_turn(
     // `mofa_list_styles`, `mofa_site`, `mofa_youtube`, etc. instead of
     // following the prompt's `glob("styles/*.toml")` + `mofa_slides`
     // discipline (see `prompts/slides_default.txt`). Mirror the gateway
-    // pattern byte-for-byte: activate `group:media` so `mofa_slides`
-    // moves out of the deferred set, then retain only `mofa_slides`
-    // among the `mofa_*` skills. Non-`mofa_*` tools (file ops, web,
-    // shell, send_file, contract checks) are untouched.
+    // pattern: retain only `mofa_slides` among the `mofa_*` skills.
+    // Non-`mofa_*` tools (file ops, web, shell, send_file, contract
+    // checks) are untouched. RFC-0 (#1289): no `activate("group:media")`
+    // step — deferral was removed, so all enabled tools are already visible.
     let is_slides_session = session_id
         .topic()
         .is_some_and(|topic| topic.starts_with("slides"));
     if is_slides_session {
-        tool_registry.activate("group:media");
         tool_registry.retain(octos_agent::keep_tool_in_slides_session);
     }
 
@@ -19392,7 +19610,7 @@ async fn run_standalone_turn(
                 spawn_tool.with_child_tool_factory(Arc::new(move || pipeline_factory.create()));
         }
         tool_registry.register(spawn_tool);
-        tool_registry.add_base_tools(["spawn", "check_background_tasks", "read_task_output"]);
+        // RFC-0 (#1289): LRU deferral removed — no base-tool pin needed.
 
         // Wire the PARENT `send_file` for the legacy non-contract
         // `files_to_send` path and any explicit agent calls. The
@@ -19469,19 +19687,9 @@ async fn run_standalone_turn(
     let progress_workspace_root = workspace_root
         .clone()
         .or_else(|| tool_registry.workspace_root().map(Path::to_path_buf));
-    // Voice turn: defer all non-essential tools on this per-turn snapshot so
-    // the (usually single) spoken-reply LLM call is not taxed by the full tool
-    // set. The per-turn snapshot is private to this turn, so this never leaks
-    // into other turns / sessions. Deferred tools stay recoverable via
-    // `activate_tools`. Must run BEFORE the `Arc::new` wrap below — `defer`
-    // takes `&mut self`.
-    if voice_turn_hint {
-        let deferred = crate::api::voice_turn::defer_tools_for_voice_turn(&mut tool_registry);
-        tracing::info!(
-            deferred,
-            "voice turn: deferred non-essential tools for a lean prefill"
-        );
-    }
+    // RFC-0 (#1289): LRU tool deferral + the `activate_tools` recovery
+    // meta-tool were removed. Voice turns now carry the full enabled tool set
+    // like every other turn.
     // Wrap the per-turn `ToolRegistry` in an `Arc` here so we retain a
     // handle after `Agent::new_shared` consumes its own clone. The
     // post-terminal drain task (issue #961) inspects
@@ -19657,8 +19865,7 @@ async fn run_standalone_turn(
     // `specs()` but `activate_tools` is unable to reach the registry
     // (its internal `Weak<ToolRegistry>` is empty). Gateway does the
     // equivalent at `session_actor.rs:2500`.
-    request_agent.wire_activate_tools();
-    // RFC-1: wire mofa_make at the same site.
+    // RFC-1: wire mofa_make.
     request_agent.wire_mofa_make_dispatcher();
 
     let agent_session_id = session_id.clone();
@@ -19766,13 +19973,77 @@ async fn run_standalone_turn(
         had_audio_input,
         "voice_turn: STT result"
     );
+    // #1555 review finding 1: `asr_media` is ALL materialized media (images,
+    // files, audio) — gating the no-speech return on `!asr_media.is_empty()`
+    // silently completed any non-audio-media turn (e.g. text+image) without
+    // running the agent. Short-circuit only genuinely empty voice turns:
+    // audio present, no transcript, no typed prompt, no other media.
+    let had_audio_media = asr_media.iter().any(|p| octos_bus::media::is_audio(p));
+    let had_non_audio_media = asr_media.iter().any(|p| !octos_bus::media::is_audio(p));
+    if should_short_circuit_no_speech(
+        had_audio_media,
+        had_non_audio_media,
+        had_audio_input,
+        prompt.trim().is_empty(),
+    ) {
+        let mut no_speech_metadata = UiProgressMetadata::new("voice_no_speech");
+        no_speech_metadata.message = Some("no speech detected".to_owned());
+        no_speech_metadata.extra.insert(
+            "client_message_id".to_owned(),
+            Value::String(turn_id.0.to_string()),
+        );
+        let _ = send_notification_durable(
+            &ws,
+            &ledger,
+            UiNotification::ProgressUpdated(UiProgressEvent::new(
+                session_id.clone(),
+                Some(turn_id.clone()),
+                no_speech_metadata,
+            )),
+        );
+        try_emit_terminal(
+            &turn_state,
+            TerminalReason::Completed,
+            &ws,
+            &ledger,
+            &session_id,
+            &turn_id,
+            None,
+            None,
+        )
+        .await;
+        contracts.scopes.evict_turn(&session_id, &turn_id);
+        return;
+    }
+    // #1555 review finding 2: content persisted as the voice turn's user
+    // message. Captured below as the COMBINED user-visible content (typed
+    // prompt + transcript, exactly as merged into the LLM prompt) BEFORE the
+    // `[语音模式:…]` scaffolding is appended, so a mixed typed+voice turn
+    // keeps its typed text in history. `None` for non-voice turns leaves the
+    // persisted message untouched.
+    let mut voice_user_content_for_persist: Option<String> = None;
     if had_audio_input {
         let joined = voice_transcripts.join("\n");
-        prompt = if prompt.trim().is_empty() {
-            joined
-        } else {
-            format!("{}\n{}", prompt, joined)
-        };
+        let mut transcript_metadata = UiProgressMetadata::new("voice_transcript");
+        transcript_metadata.message = Some(joined.clone());
+        transcript_metadata
+            .extra
+            .insert("transcript".to_owned(), Value::String(joined.clone()));
+        transcript_metadata.extra.insert(
+            "client_message_id".to_owned(),
+            Value::String(turn_id.0.to_string()),
+        );
+        let _ = send_notification_durable(
+            &ws,
+            &ledger,
+            UiNotification::ProgressUpdated(UiProgressEvent::new(
+                session_id.clone(),
+                Some(turn_id.clone()),
+                transcript_metadata,
+            )),
+        );
+        prompt = combine_typed_prompt_with_transcript(&prompt, &joined);
+        voice_user_content_for_persist = Some(prompt.clone());
         // Voice-turn only (had_audio_input): replies are spoken aloud by TTS, so
         // ask for short, speakable answers. Text chat (had_audio_input == false)
         // keeps its normal detailed/formatted persona — this branch never runs there.
@@ -19800,6 +20071,20 @@ async fn run_standalone_turn(
         // the agent into calling `voice_transcribe` / exploring the workspace.
         turn_media_paths.retain(|p| !octos_bus::media::is_audio(p));
     }
+    // Voice fail-fast activation: `had_audio_input` (ASR produced spoken text)
+    // is the authoritative voice flag. Run the agent under the FailFast LLM
+    // call policy (single attempt — no retry/failover/hedge, so a 429/quota
+    // stall releases the session lock fast instead of retrying for ~30s+) and
+    // capture one classified `TurnFailure` so the error path can speak a short
+    // apology. Text turns leave the sink unset and keep the default Normal
+    // policy (full retry ladder), byte-for-byte unchanged.
+    let mut voice_failure_rx = if had_audio_input {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<octos_agent::TurnFailure>();
+        request_agent.set_voice_failure_sink(tx);
+        Some(rx)
+    } else {
+        None
+    };
     if let Some(rewrite_for) = params.rewrite_for.as_deref() {
         tracing::debug!(
             session = %session_id.0,
@@ -19908,12 +20193,24 @@ async fn run_standalone_turn(
             }
             None => Box::pin(message_future),
         };
-        let result = octos_llm::with_router_context(
-            router_ctx,
-            octos_llm::with_lane_context(
-                lane_ctx,
-                octos_agent::tools::TOOL_APPROVAL_CTX
-                    .scope(approval_requester, scoped_message_future),
+        // Voice fail-fast: wrap the whole provider stack outermost so every
+        // wrapper + the leaf provider short-circuit retry/failover/hedge no
+        // matter how deep the agent loop recurses into `chat()`. Text turns run
+        // Normal (full retry ladder), unchanged.
+        let call_policy = if had_audio_input {
+            octos_llm::LlmCallPolicy::FailFast
+        } else {
+            octos_llm::LlmCallPolicy::Normal
+        };
+        let result = octos_llm::with_llm_call_policy(
+            call_policy,
+            octos_llm::with_router_context(
+                router_ctx,
+                octos_llm::with_lane_context(
+                    lane_ctx,
+                    octos_agent::tools::TOOL_APPROVAL_CTX
+                        .scope(approval_requester, scoped_message_future),
+                ),
             ),
         )
         .await;
@@ -19952,6 +20249,10 @@ async fn run_standalone_turn(
                 };
                 let _ = visual_directive_tx.send(visual_directive);
                 let _ = exit_directive_tx.send(exit_requested);
+                replace_voice_user_message_content(
+                    &mut response.messages,
+                    voice_user_content_for_persist.as_deref(),
+                );
                 // #1134 — capture the LLM reply for the post-turn
                 // self-paced reschedule block. The receiver of this
                 // oneshot uses the captured content instead of
@@ -20571,7 +20872,7 @@ async fn run_standalone_turn(
         None
     };
     let mut voice_streamed_count: usize = 0;
-    let (voice_tx, voice_handle) = if had_audio_input {
+    let (mut voice_tx, mut voice_handle) = if had_audio_input {
         let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(64);
         let w_ledger = ledger.clone();
         let w_session = session_id.clone();
@@ -20585,9 +20886,48 @@ async fn run_standalone_turn(
         );
         let w_provider = session_runtime.profile.voice.tts_provider.clone();
         let w_cloud = session_runtime.profile.voice.cloud.clone();
+        let w_ws = ws.clone();
+        let w_voice_audio = features.voice_audio;
         let handle = tokio::spawn(async move {
+            use base64::Engine as _;
             let mut n: usize = 0;
             while let Some(sentence) = rx.recv().await {
+                // Streaming cloud path: push reply audio as `voice/audio_chunk`
+                // frames so a negotiated client plays progressively. Falls
+                // through to the whole-file path when the client did not
+                // negotiate, the turn is not cloud-routed, or the stream fails.
+                if w_voice_audio {
+                    let segment_id = uuid::Uuid::now_v7().to_string();
+                    let mut seq: u32 = 0;
+                    let streamed = crate::api::voice_turn::synthesize_reply_streaming(
+                        &sentence,
+                        &w_provider,
+                        w_cloud.as_ref(),
+                        |bytes, last, mime| {
+                            let ev = VoiceAudioChunkEvent {
+                                session_id: w_session.clone(),
+                                topic: None,
+                                turn_id: w_turn.clone(),
+                                segment_id: segment_id.clone(),
+                                seq,
+                                mime: mime.to_string(),
+                                audio_b64: base64::engine::general_purpose::STANDARD.encode(bytes),
+                                last,
+                            };
+                            let _ = send_notification_ephemeral(
+                                &w_ws,
+                                &w_ledger,
+                                UiNotification::VoiceAudioChunk(ev),
+                            );
+                            seq += 1;
+                        },
+                    )
+                    .await;
+                    if streamed.is_some() {
+                        n += 1;
+                        continue;
+                    }
+                }
                 if let Some(path) = crate::api::voice_turn::synthesize_reply(
                     &sentence,
                     &w_voice,
@@ -20728,6 +21068,37 @@ async fn run_standalone_turn(
                     .and_then(Value::as_str)
                     .unwrap_or("turn failed")
                     .to_string();
+                // Voice fail-fast: a classified `TurnFailure` rode the side
+                // channel. Speak a short apology through the SAME TTS worker as
+                // a normal reply, and DRAIN the worker before the terminal so
+                // the audio is emitted ahead of the terminal frame (a canonical
+                // client's post-completion barrier would otherwise drop a
+                // file/attached envelope emitted after the terminal). Surface
+                // the classified variant as the terminal code + the friendly
+                // spoken text as the message. Text turns: unchanged.
+                let voice_failure = voice_failure_rx.as_mut().and_then(|rx| rx.try_recv().ok());
+                let (code, wire_msg): (&str, String) = match &voice_failure {
+                    Some(failure) => {
+                        let speech = crate::api::voice_turn::voice_error_speech(failure);
+                        if let Some(tx) = voice_tx.as_ref() {
+                            let _ = tx.try_send(speech.to_string());
+                        }
+                        if let Some(tx) = voice_tx.take() {
+                            drop(tx);
+                        }
+                        if let Some(handle) = voice_handle.take() {
+                            voice_streamed_count = handle.await.unwrap_or(voice_streamed_count);
+                        }
+                        let code = match failure {
+                            octos_agent::TurnFailure::LlmError { error, .. } => {
+                                error.variant_name()
+                            }
+                            octos_agent::TurnFailure::EmptyResponse => "empty_response",
+                        };
+                        (code, speech.to_string())
+                    }
+                    None => ("runtime_error", message),
+                };
                 flush_replay_lossy(&ws, &ledger, &session_id, &progress_dropped);
                 try_emit_terminal(
                     &turn_state,
@@ -20736,7 +21107,7 @@ async fn run_standalone_turn(
                     &ledger,
                     &session_id,
                     &turn_id,
-                    Some(("runtime_error", message.as_str())),
+                    Some((code, wire_msg.as_str())),
                     None,
                 )
                 .await;
@@ -20800,7 +21171,7 @@ async fn run_standalone_turn(
 
     // Voice turn: flush the trailing partial sentence (marker already held back
     // by the splitter), close the channel, and wait for the FIFO TTS worker.
-    if let Some(tx) = voice_tx {
+    if let Some(tx) = voice_tx.take() {
         if let Some(sp) = voice_splitter.take() {
             let (tail, _directive) = sp.finish();
             if !interrupt_observed {
@@ -20833,7 +21204,7 @@ async fn run_standalone_turn(
             }
         }
         drop(tx);
-        if let Some(handle) = voice_handle {
+        if let Some(handle) = voice_handle.take() {
             voice_streamed_count = handle.await.unwrap_or(voice_streamed_count);
         }
     }
@@ -24382,6 +24753,9 @@ fn ledger_event_cursor(event: &UiProtocolLedgerEvent) -> Option<UiCursor> {
             // would re-loop the replay flag onto itself.
             | UiNotification::ReplayLossy(_)
             | UiNotification::FileAttached(_)
+            // Streamed reply-audio chunks are ephemeral; their ordering lives
+            // in the segment_id/seq, not a durable ledger cursor.
+            | UiNotification::VoiceAudioChunk(_)
             | UiNotification::SessionEventBridged(_)
             // Wave4-A: router/queue notifications don't carry their own
             // cursor — they're stateless lifecycle pushes.
@@ -27171,7 +27545,8 @@ ignore = []
                         &state,
                         request.id.clone(),
                         &request,
-                        &mut negotiated
+                        &mut negotiated,
+                        false
                     ),
                     "{method} is advertised over stdio but client_hello dispatch did not handle it"
                 );
@@ -27276,6 +27651,7 @@ ignore = []
             features,
             "open-missing".into(),
             missing_params,
+            false,
         )
         .await;
         if opened {
@@ -27330,6 +27706,7 @@ ignore = []
             features,
             "open-grace".into(),
             grace_params,
+            false,
         )
         .await;
         if opened {
@@ -29002,8 +29379,8 @@ ignore = []
             "topic predicate must match the gateway path's \
              `session_key.topic().is_some_and(|t| t.starts_with(\"slides\"))`",
         );
-        // Mirror the production wiring at `run_standalone_turn`.
-        registry.activate("group:media");
+        // Mirror the production wiring at `run_standalone_turn`. RFC-0
+        // (#1289): no `activate("group:media")` — deferral was removed.
         registry.retain(octos_agent::keep_tool_in_slides_session);
 
         // `mofa_slides` survives — it is the canonical slides skill.
@@ -29484,182 +29861,6 @@ ignore = []
     }
 
     #[test]
-    fn lru_deferred_required_tools_are_reported_deferred_not_disabled_by_policy() {
-        // Regression: the live `tool_status_list_result` path computes the
-        // disabled set as `registered ∧ ¬visible`, which subsumes the
-        // LRU-deferred set (deferred tools are registered but filtered out
-        // of `specs()`). The coding tool contract checks `disabled` before
-        // `deferred`, so without excluding the deferred names the canonical
-        // P0 runtime/subagent tools regress to `disabled_by_policy` and the
-        // contract reports `status: incomplete` on a healthy solo session.
-        // Mirror the exact live-path computation here so the call site stays
-        // honest. #970 / M14-E.
-        let temp = tempfile::tempdir().expect("tempdir");
-        let mut registry = octos_agent::ToolRegistry::with_builtins(temp.path());
-        // Auto-defer (not context-filter) the canonical runtime + subagent
-        // groups, exactly as the per-session LRU resolver does once a
-        // profile carries enough tools to trip the defer threshold.
-        registry.defer_group("group:runtime");
-        registry.defer_group("group:sessions");
-
-        let deferred = deferred_model_tool_names(Some(&registry));
-        assert!(
-            deferred.iter().any(|name| name == "exec_command"),
-            "test precondition: exec_command must be deferred, got {deferred:?}"
-        );
-
-        let visible = model_visible_tool_names(Some(&registry));
-        let registered = registered_tool_names(Some(&registry));
-        let visible_set: HashSet<&str> = visible.iter().map(String::as_str).collect();
-        // Mirror the live path: only deferred tools that survive the effective
-        // policy post-activation are recoverable-deferred. No tool is denied
-        // here, so every deferred tool is recoverable.
-        let recoverable_deferred: Vec<String> = deferred
-            .iter()
-            .filter(|name| registry.is_tool_visible_post_activation(name))
-            .cloned()
-            .collect();
-        let deferred_set: HashSet<&str> = recoverable_deferred.iter().map(String::as_str).collect();
-        // This is the production computation under test: disabled must NOT
-        // include deferred-but-recoverable tools.
-        let disabled = registered
-            .iter()
-            .filter(|name| {
-                !visible_set.contains(name.as_str()) && !deferred_set.contains(name.as_str())
-            })
-            .cloned()
-            .collect::<Vec<_>>();
-        let visible_refs = visible.iter().map(String::as_str).collect::<Vec<_>>();
-        let disabled_refs = disabled.iter().map(String::as_str).collect::<Vec<_>>();
-        let deferred_refs = recoverable_deferred
-            .iter()
-            .map(String::as_str)
-            .collect::<Vec<_>>();
-        let payload = coding_tool_contract::tool_status_list_payload(
-            coding_tool_contract::ToolStatusListContext {
-                available_model_tools: &visible_refs,
-                disabled_model_tools: &disabled_refs,
-                deferred_model_tools: &deferred_refs,
-                ..coding_tool_contract::ToolStatusListContext::default_for_session("coding:test")
-            },
-        );
-        let contract = &payload["coding_tool_contract"];
-        assert_eq!(
-            contract["status"],
-            json!("ready"),
-            "LRU-deferred P0 tools must keep the contract ready; missing={:?}",
-            contract["missing_required_tools"]
-        );
-        assert_eq!(contract["missing_required_tools"], json!([]));
-        let required = contract["required_tools"].as_array().expect("required");
-        let exec_command = required
-            .iter()
-            .find(|tool| tool["name"] == json!("exec_command"))
-            .expect("exec_command status");
-        assert_eq!(
-            exec_command["status"],
-            json!(coding_tool_contract::TOOL_STATUS_DEFERRED)
-        );
-    }
-
-    #[test]
-    fn deferred_but_policy_denied_required_tool_stays_disabled_by_policy() {
-        // Codex BLOCK (#1419 review): excluding the RAW deferred set from the
-        // disabled set mislabels a tool that is both LRU-deferred AND
-        // policy-denied. Such a tool can never be recovered by `activate_tools`
-        // (`is_tool_visible_post_activation` stays false), so it MUST remain
-        // `disabled_by_policy` and MUST NOT be advertised as a recoverable
-        // `deferred` tool (the PR #865 standard). Mirror the live-path
-        // computation with a required tool that is BOTH deferred and denied,
-        // and pin the classification both at the set level and through the
-        // coding-tool contract payload.
-        let temp = tempfile::tempdir().expect("tempdir");
-        let mut registry = octos_agent::ToolRegistry::with_builtins(temp.path());
-        // Defer the canonical runtime + subagent groups (as the per-session LRU
-        // resolver does), then deny one required runtime tool via provider
-        // policy — the deferred + denied combination codex flagged.
-        registry.defer_group("group:runtime");
-        registry.defer_group("group:sessions");
-        let mut policy = octos_agent::ToolPolicy::default();
-        policy.deny.push("exec_command".to_string());
-        registry.set_provider_policy(policy);
-
-        let deferred = deferred_model_tool_names(Some(&registry));
-        assert!(
-            deferred.iter().any(|name| name == "exec_command"),
-            "precondition: exec_command must be deferred, got {deferred:?}"
-        );
-
-        // Production computation under test: only deferred tools that survive
-        // the effective policy post-activation are recoverable-deferred.
-        let recoverable_deferred: Vec<String> = deferred
-            .iter()
-            .filter(|name| registry.is_tool_visible_post_activation(name))
-            .cloned()
-            .collect();
-        assert!(
-            !recoverable_deferred
-                .iter()
-                .any(|name| name == "exec_command"),
-            "denied+deferred exec_command must NOT be recoverable, got {recoverable_deferred:?}"
-        );
-        assert!(
-            !recoverable_deferred.is_empty(),
-            "other allowed+deferred tools must remain recoverable, got {recoverable_deferred:?}"
-        );
-
-        let visible = model_visible_tool_names(Some(&registry));
-        let registered = registered_tool_names(Some(&registry));
-        let visible_set: HashSet<&str> = visible.iter().map(String::as_str).collect();
-        let recoverable_set: HashSet<&str> =
-            recoverable_deferred.iter().map(String::as_str).collect();
-        let disabled = registered
-            .iter()
-            .filter(|name| {
-                !visible_set.contains(name.as_str()) && !recoverable_set.contains(name.as_str())
-            })
-            .cloned()
-            .collect::<Vec<_>>();
-        assert!(
-            disabled.iter().any(|name| name == "exec_command"),
-            "denied+deferred exec_command must be in the disabled set, got {disabled:?}"
-        );
-
-        // End-to-end through the contract: exec_command must report
-        // disabled_by_policy, NOT deferred (the bug would report it deferred).
-        let visible_refs = visible.iter().map(String::as_str).collect::<Vec<_>>();
-        let disabled_refs = disabled.iter().map(String::as_str).collect::<Vec<_>>();
-        let deferred_refs = recoverable_deferred
-            .iter()
-            .map(String::as_str)
-            .collect::<Vec<_>>();
-        let payload = coding_tool_contract::tool_status_list_payload(
-            coding_tool_contract::ToolStatusListContext {
-                available_model_tools: &visible_refs,
-                disabled_model_tools: &disabled_refs,
-                deferred_model_tools: &deferred_refs,
-                ..coding_tool_contract::ToolStatusListContext::default_for_session("coding:test")
-            },
-        );
-        let contract = &payload["coding_tool_contract"];
-        let exec_command = contract["required_tools"]
-            .as_array()
-            .expect("required")
-            .iter()
-            .find(|tool| tool["name"] == json!("exec_command"))
-            .expect("exec_command status");
-        assert_eq!(
-            exec_command["status"],
-            json!(coding_tool_contract::TOOL_STATUS_DISABLED_BY_POLICY),
-            "denied+deferred exec_command must be disabled_by_policy, not deferred"
-        );
-        assert_ne!(
-            exec_command["status"],
-            json!(coding_tool_contract::TOOL_STATUS_DEFERRED)
-        );
-    }
-
-    #[test]
     fn typed_approval_feature_is_negotiated_by_header() {
         let mut headers = HeaderMap::new();
         headers.insert(
@@ -29738,6 +29939,7 @@ ignore = []
                 message_persisted: false,
                 spawn_complete: false,
                 file_attached: false,
+                voice_audio: false,
                 projection_envelope: false,
                 auxiliary_rest_to_ws_v1: false,
                 coding_autonomy_v1: false,
@@ -29801,6 +30003,7 @@ ignore = []
                 message_persisted: false,
                 spawn_complete: false,
                 file_attached: false,
+                voice_audio: false,
                 projection_envelope: false,
                 auxiliary_rest_to_ws_v1: false,
                 coding_autonomy_v1: false,
@@ -29909,6 +30112,7 @@ ignore = []
                 message_persisted: false,
                 spawn_complete: false,
                 file_attached: false,
+                voice_audio: false,
                 projection_envelope: false,
                 auxiliary_rest_to_ws_v1: false,
                 coding_autonomy_v1: false,
@@ -29972,6 +30176,7 @@ ignore = []
                 message_persisted: false,
                 spawn_complete: false,
                 file_attached: false,
+                voice_audio: false,
                 projection_envelope: false,
                 auxiliary_rest_to_ws_v1: false,
                 coding_autonomy_v1: false,
@@ -30028,6 +30233,7 @@ ignore = []
                 message_persisted: false,
                 spawn_complete: false,
                 file_attached: false,
+                voice_audio: false,
                 projection_envelope: false,
                 auxiliary_rest_to_ws_v1: false,
                 coding_autonomy_v1: false,
@@ -30127,6 +30333,7 @@ ignore = []
                 message_persisted: false,
                 spawn_complete: false,
                 file_attached: false,
+                voice_audio: false,
                 projection_envelope: false,
                 auxiliary_rest_to_ws_v1: false,
                 coding_autonomy_v1: false,
@@ -32356,6 +32563,7 @@ ignore = []
                 message_persisted: false,
                 spawn_complete: false,
                 file_attached: false,
+                voice_audio: false,
                 projection_envelope: false,
                 auxiliary_rest_to_ws_v1: false,
                 coding_autonomy_v1: false,
@@ -34188,6 +34396,212 @@ ignore = []
             after: None,
         });
         assert!(validate_session_ingress_command_scope(&mismatched, &allowed).is_err());
+    }
+
+    #[test]
+    fn raw_method_is_dispatched_distinguishes_raw_from_typed() {
+        // Raw-dispatched (bypass route_rpc_command + the typed ingress gate):
+        for method in [
+            APPUI_METHOD_REVIEW_START,
+            APPUI_METHOD_SESSION_STATUS_READ,
+            APPUI_METHOD_PROFILE_LLM_UPSERT,
+            octos_core::ui_protocol::methods::SESSION_GOAL_SET,
+            octos_core::ui_protocol::methods::LOOP_CREATE,
+        ] {
+            assert!(
+                raw_method_is_dispatched(method, false),
+                "{method} is raw-dispatched"
+            );
+        }
+        // Typed (routed through route_rpc_command + `validate_session_ingress_command_scope`):
+        for method in [
+            octos_core::ui_protocol::methods::TURN_START,
+            octos_core::ui_protocol::methods::SESSION_LIST,
+            octos_core::ui_protocol::methods::SESSION_HYDRATE,
+            octos_core::ui_protocol::methods::SESSION_MESSAGES_PAGE,
+            octos_core::ui_protocol::methods::SESSION_STATUS_GET,
+            APPUI_METHOD_CLIENT_HELLO,
+        ] {
+            assert!(
+                !raw_method_is_dispatched(method, true),
+                "{method} is a typed method, not raw-dispatched"
+            );
+        }
+        // Content methods are raw ONLY on stdio; never on a (non-stdio) ingress socket.
+        assert!(raw_method_is_dispatched(
+            octos_core::ui_protocol::methods::CONTENT_LIST,
+            true
+        ));
+        assert!(!raw_method_is_dispatched(
+            octos_core::ui_protocol::methods::CONTENT_LIST,
+            false
+        ));
+    }
+
+    /// Drift guard for the session-ingress raw-surface deny gate. The gate at
+    /// the WS read loop rejects a raw method for ingress connections iff
+    /// `raw_method_is_dispatched` returns true — the SAME function
+    /// `handle_raw_appui_rpc` uses to guard its own dispatch (its match default
+    /// is `unreachable!`). This enumerates the full raw surface and pins every
+    /// entry to `true`. (Content methods are excluded: they are only
+    /// raw-dispatched on the stdio transport, never a session-ingress socket.)
+    #[test]
+    fn raw_method_is_dispatched_covers_full_raw_surface() {
+        let raw_methods = [
+            APPUI_METHOD_REVIEW_START,
+            APPUI_METHOD_CONFIG_CAPABILITIES_LIST,
+            APPUI_METHOD_SESSION_STATUS_READ,
+            APPUI_METHOD_PROFILE_LLM_CATALOG,
+            APPUI_METHOD_PROFILE_LLM_LIST,
+            APPUI_METHOD_PROFILE_LLM_UPSERT,
+            APPUI_METHOD_PROFILE_LLM_TEST,
+            APPUI_METHOD_PROFILE_LLM_SELECT,
+            APPUI_METHOD_PROFILE_LLM_DELETE,
+            APPUI_METHOD_PROFILE_LLM_FETCH_MODELS,
+            APPUI_METHOD_PROFILE_SKILLS_LIST,
+            APPUI_METHOD_PROFILE_SKILLS_REGISTRY_SEARCH,
+            APPUI_METHOD_PROFILE_SKILLS_INSTALL,
+            APPUI_METHOD_PROFILE_SKILLS_REMOVE,
+            APPUI_METHOD_AUTH_STATUS,
+            APPUI_METHOD_AUTH_ME,
+            APPUI_METHOD_AUTH_SEND_CODE,
+            APPUI_METHOD_AUTH_VERIFY,
+            APPUI_METHOD_AUTH_LOGOUT,
+            APPUI_METHOD_MCP_STATUS_LIST,
+            APPUI_METHOD_TOOL_STATUS_LIST,
+            APPUI_METHOD_ONBOARDING_WORKSPACE_PROBE,
+            // Autonomy (session/goal/*, loop/*, agent/*, task/artifact/*):
+            octos_core::ui_protocol::methods::SESSION_GOAL_GET,
+            octos_core::ui_protocol::methods::SESSION_GOAL_SET,
+            octos_core::ui_protocol::methods::SESSION_GOAL_CLEAR,
+            octos_core::ui_protocol::methods::LOOP_CREATE,
+            octos_core::ui_protocol::methods::LOOP_LIST,
+            octos_core::ui_protocol::methods::LOOP_PAUSE,
+            octos_core::ui_protocol::methods::LOOP_RESUME,
+            octos_core::ui_protocol::methods::LOOP_DELETE,
+            octos_core::ui_protocol::methods::LOOP_FIRE_NOW,
+            octos_core::ui_protocol::methods::AGENT_LIST,
+            octos_core::ui_protocol::methods::AGENT_STATUS_READ,
+            octos_core::ui_protocol::methods::AGENT_OUTPUT_READ,
+            octos_core::ui_protocol::methods::AGENT_ARTIFACT_LIST,
+            octos_core::ui_protocol::methods::AGENT_ARTIFACT_READ,
+            octos_core::ui_protocol::methods::AGENT_INTERRUPT,
+            octos_core::ui_protocol::methods::AGENT_CLOSE,
+            octos_core::ui_protocol::methods::TASK_ARTIFACT_LIST,
+            octos_core::ui_protocol::methods::TASK_ARTIFACT_READ,
+        ];
+        for method in raw_methods {
+            assert!(
+                raw_method_is_dispatched(method, false),
+                "{method} is raw-dispatched and MUST be denied for session-ingress creds"
+            );
+        }
+    }
+
+    #[test]
+    fn session_ingress_callable_method_matches_the_deny_surfaces() {
+        // Session-scoped typed methods an ingress credential CAN call:
+        for m in [
+            octos_core::ui_protocol::methods::TURN_START,
+            octos_core::ui_protocol::methods::SESSION_HYDRATE,
+            octos_core::ui_protocol::methods::SESSION_MESSAGES_PAGE,
+            octos_core::ui_protocol::methods::SESSION_STATUS_GET,
+        ] {
+            assert!(session_ingress_callable_method(m), "{m} must stay callable");
+        }
+        // Raw surface — denied wholesale (mirrors the deny gate):
+        for m in [
+            octos_core::ui_protocol::methods::SESSION_GOAL_SET,
+            octos_core::ui_protocol::methods::LOOP_CREATE,
+            APPUI_METHOD_PROFILE_LLM_UPSERT,
+            APPUI_METHOD_SESSION_STATUS_READ,
+        ] {
+            assert!(
+                !session_ingress_callable_method(m),
+                "{m} (raw) must be filtered from advertised caps"
+            );
+        }
+        // Global typed methods `validate_session_ingress_command_scope` rejects:
+        for m in [
+            APPUI_METHOD_PROFILE_LOCAL_CREATE,
+            octos_core::ui_protocol::methods::SESSION_LIST,
+            octos_core::ui_protocol::methods::SYSTEM_STATUS_GET,
+            octos_core::ui_protocol::methods::CONTENT_LIST,
+            octos_core::ui_protocol::methods::CONTENT_DELETE,
+            octos_core::ui_protocol::methods::CONTENT_BULK_DELETE,
+        ] {
+            assert!(
+                !session_ingress_callable_method(m),
+                "{m} (global) must be filtered from advertised caps"
+            );
+        }
+    }
+
+    #[test]
+    fn filter_capabilities_for_session_ingress_keeps_only_callable_methods() {
+        let mut caps = UiProtocolCapabilities::new(
+            &[
+                octos_core::ui_protocol::methods::SESSION_MESSAGES_PAGE, // keep (session-scoped)
+                octos_core::ui_protocol::methods::TURN_START,            // keep (session-scoped)
+                octos_core::ui_protocol::methods::SESSION_LIST,          // drop (global typed)
+                octos_core::ui_protocol::methods::SYSTEM_STATUS_GET,     // drop (global typed)
+                APPUI_METHOD_PROFILE_LLM_UPSERT,                         // drop (raw)
+                octos_core::ui_protocol::methods::SESSION_GOAL_SET,      // drop (raw)
+            ],
+            &[],
+        );
+        filter_capabilities_for_session_ingress(&mut caps);
+        assert_eq!(
+            caps.supported_methods,
+            vec![
+                octos_core::ui_protocol::methods::SESSION_MESSAGES_PAGE.to_string(),
+                octos_core::ui_protocol::methods::TURN_START.to_string(),
+            ]
+        );
+    }
+
+    // Regression guard for codex P1: `session/open` advertises capabilities on
+    // BOTH its RPC result AND the SessionOpened notification, so the ingress
+    // handler must filter the notification event too — not only the result.
+    // This exercises the exact `if let ... SessionOpened(opened)` branch the
+    // handler applies to `outcome.opened_event.event`.
+    #[test]
+    fn session_opened_notification_capabilities_are_filtered_for_ingress() {
+        let mut event =
+            UiProtocolLedgerEvent::Notification(UiNotification::SessionOpened(SessionOpened {
+                session_id: SessionKey("local:work-secret".into()),
+                active_profile_id: Some(MAIN_PROFILE_ID.to_owned()),
+                workspace_root: None,
+                context: None,
+                context_state: None,
+                cursor: None,
+                panes: None,
+                capabilities: UiProtocolCapabilities::new(
+                    &[
+                        octos_core::ui_protocol::methods::SESSION_MESSAGES_PAGE,
+                        APPUI_METHOD_PROFILE_LLM_UPSERT,
+                        octos_core::ui_protocol::methods::SESSION_LIST,
+                    ],
+                    &[],
+                ),
+                reasoning_effort: None,
+            }));
+
+        if let UiProtocolLedgerEvent::Notification(UiNotification::SessionOpened(opened)) =
+            &mut event
+        {
+            filter_capabilities_for_session_ingress(&mut opened.capabilities);
+        }
+
+        let UiProtocolLedgerEvent::Notification(UiNotification::SessionOpened(opened)) = event
+        else {
+            panic!("expected SessionOpened notification");
+        };
+        assert_eq!(
+            opened.capabilities.supported_methods,
+            vec![octos_core::ui_protocol::methods::SESSION_MESSAGES_PAGE.to_string()],
+            "raw/global methods must be filtered from the SessionOpened notification"
+        );
     }
 
     /// Codex review 2026-05-12 (BLOCK 1, companion): the legacy
@@ -39294,6 +39708,69 @@ ignore = []
             parsed.get("thread_id").is_none(),
             "unbound reporter must not stamp thread_id (legacy compat): {parsed}"
         );
+    }
+
+    #[test]
+    fn voice_user_message_persist_uses_transcript_not_prompt_scaffolding() {
+        let mut messages = vec![
+            Message::user("帮我记住我喜欢乌龙茶\n\n[语音模式:用口语化中文、一两句话简短回答]"),
+            Message::assistant("记住了。"),
+        ];
+
+        replace_voice_user_message_content(&mut messages, Some("帮我记住我喜欢乌龙茶"));
+
+        assert_eq!(messages[0].content, "帮我记住我喜欢乌龙茶");
+        assert_eq!(messages[1].content, "记住了。");
+    }
+
+    #[test]
+    fn voice_user_message_persist_keeps_typed_text_for_mixed_turn() {
+        // #1555 review finding 2: a mixed typed-text + audio turn persists the
+        // COMBINED user-visible content (typed + transcript), not the
+        // transcript alone — the typed text must survive in history.
+        let persisted = combine_typed_prompt_with_transcript("请看看这份周报", "帮我念一下重点");
+        assert_eq!(persisted, "请看看这份周报\n帮我念一下重点");
+
+        let mut messages = vec![
+            Message::user(
+                "请看看这份周报\n帮我念一下重点\n\n[语音模式:用口语化中文、一两句话简短回答]",
+            ),
+            Message::assistant("好的。"),
+        ];
+
+        replace_voice_user_message_content(&mut messages, Some(&persisted));
+
+        assert_eq!(messages[0].content, "请看看这份周报\n帮我念一下重点");
+        assert_eq!(messages[1].content, "好的。");
+    }
+
+    #[test]
+    fn voice_combine_falls_back_to_transcript_for_pure_voice_turn() {
+        // Pure-voice turn (no typed prompt): persisted content stays the bare
+        // transcript — unchanged behavior.
+        assert_eq!(combine_typed_prompt_with_transcript("", "你好"), "你好");
+        assert_eq!(combine_typed_prompt_with_transcript("  \n", "你好"), "你好");
+    }
+
+    #[test]
+    fn voice_no_speech_short_circuit_ignores_non_audio_media() {
+        // #1555 review finding 1: `asr_media` holds ALL media paths, so a
+        // text+image turn (no audio at all) must NOT take the no-speech early
+        // return — it previously completed the turn without running the agent.
+        // (had_audio_media, had_non_audio_media, had_audio_input, prompt_is_empty)
+        assert!(!should_short_circuit_no_speech(false, true, false, false));
+        assert!(!should_short_circuit_no_speech(false, true, false, true));
+        // No media at all → nothing voice-related to short-circuit on.
+        assert!(!should_short_circuit_no_speech(false, false, false, true));
+        // Silent audio + typed prompt → proceed as a plain text turn.
+        assert!(!should_short_circuit_no_speech(true, false, false, false));
+        // Silent audio + image/file → proceed; the agent still has real input.
+        assert!(!should_short_circuit_no_speech(true, true, false, true));
+        // Audio that produced a transcript → never short-circuit.
+        assert!(!should_short_circuit_no_speech(true, false, true, true));
+        // Only a genuinely empty voice turn (silent audio, nothing else)
+        // takes the friendly "no speech detected" path.
+        assert!(should_short_circuit_no_speech(true, false, false, true));
     }
 
     // ========================================================================

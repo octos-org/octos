@@ -1166,13 +1166,23 @@ JSON 持久化位于 `.octos/cron.json`。
 
 | 路由 | 方法 | 说明 |
 |---|---|---|
-| `/api/chat` | POST | 发送消息 → 获取响应（同步；流式内容走 WS） |
-| `/api/ui-protocol/ws` | WS | JSON-RPC 2.0 UI Protocol v1（聊天流、`session/list`、`session/messages_page`、`system/status.get` 等） |
+| `/api/ui-protocol/ws` | WS | JSON-RPC 2.0 UI Protocol v1——主要的 **HTTP** 聊天 + 控制平面端点（旧的 `POST /api/chat` 已下线）。同一协议也通过 `octos serve --stdio` 提供。见下。 |
 | `/health` | GET | 存活探针（原 `/api/status`；结构化状态已迁移到 WS `system/status.get`） |
 | `/metrics` | GET | Prometheus 文本指标（无需认证） |
 | `/*`（回退） | GET | 内嵌 Web UI（通过 rust-embed 提供静态文件） |
 | `/metrics` | GET | Prometheus 文本格式（无需认证） |
 | `/*`（回退） | GET | 嵌入式 Web UI（通过 rust-embed 的静态文件） |
+
+**UI Protocol v1 方法族**（`/api/ui-protocol/ws`，JSON-RPC 2.0）：该 WS 端点远不止是聊天流——它是 web/TUI 客户端驱动的完整控制平面：
+
+- **会话/轮次**：`session/open`、`session/hydrate`、`session/list`、`session/messages_page`、`session/status/read`、`turn/start`、`turn/interrupt`、`session/rollback`、`session/snapshot`。
+- **自主运行**：`session/goal/set|get|clear`（目标）与 `loop/create|list|pause|resume|delete`（周期循环）——见[自主运行与会话控制](./advanced.md#自主运行与会话控制)。
+- **任务**：`task/list`、`task/cancel`、`task/restart_from_node`、`task/output/read`、`task/artifact/list`。
+- **审批与提问**：`approval/respond`、`approval/scopes/list`、`user_question/respond`、`diff/preview/get`。
+- **配置/profile**：`profile/llm/*`、`profile/skills/*`、`permission/profile/*`、`content/list`、`config/capabilities/list`。
+- **通知**（服务器→客户端）：`message/delta`、`message/persisted`、`tool/*`、`turn/spawn_complete`、`session/goal/updated`、`loop/fired`、`context/compaction_started` 等。
+
+许多方法由一个**协商的能力标志**（约 22 个 `*.v1` token，如 `coding.goal_runtime.v1`、`harness.task_control.v1`、`auxiliary.rest_to_ws.v1`）门控，客户端在连接时声明——WebSocket 通过 `ui_feature`/`X-Octos-Ui-Features`，`serve --stdio` 通过 `client_hello` 的 `supported_features`。核心的聊天/轮次/会话方法始终可用；自主运行、任务产物与辅助方法组位于标志之后。**「声明」与「可调用」**的确切规则较为微妙：某个方法可能出现在默认能力列表中，却仍需其标志才能被*调用*（如 `auxiliary.rest_to_ws.v1` 方法与 `user_question/respond`），因此客户端应以协商后的能力列表为准，并稳妥处理 `method_not_supported`，而非仅凭「已声明」就假定可调用。
 
 **认证**：可选的 bearer token，常量时间比较（仅 API 路由；`/metrics` 和静态文件为公开）。**CORS**：localhost 开发源加已配置的 base domain。**最大消息**：1MB。
 

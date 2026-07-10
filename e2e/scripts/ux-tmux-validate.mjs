@@ -1526,11 +1526,38 @@ function checkRestartReconnectScenario(artifactDir) {
     }
   }
 
+  const reconnectEvents = parseJsonl(artifactPath(artifactDir, 'reconnect-events.jsonl'));
+  for (const error of reconnectEvents.errors) {
+    problems.push(`reconnect-events.jsonl line ${error.line}: ${error.error}`);
+  }
+  const reconnectRows = reconnectEvents.rows.map((row) => row.value);
+  if (!reconnectRows.some((row) => row.phase === 'pre')) {
+    problems.push('reconnect-events.jsonl is missing a pre-restart connection event');
+  }
+  if (!reconnectRows.some((row) => row.phase === 'post')) {
+    problems.push('reconnect-events.jsonl is missing a post-restart reconnect event');
+  }
+  const reconnectSessionIds = sortedStrings(
+    reconnectRows
+      .map((row) => row.session_id)
+      .filter((value) => typeof value === 'string' && value.length > 0),
+  );
+  if (reconnectRows.length > 0 && reconnectSessionIds.length !== 1) {
+    problems.push('reconnect-events.jsonl events must reference exactly one non-empty session_id');
+  }
+  if (
+    preSnapshot.ok
+    && reconnectSessionIds.length === 1
+    && reconnectSessionIds[0] !== preSnapshot.value.session_id
+  ) {
+    problems.push('reconnect-events.jsonl session_id does not match pre-restart snapshot session_id');
+  }
+
   return makeCheck(
     'restart_reconnect_visible_contract',
     problems.length === 0,
     problems.length === 0
-      ? 'backend restart, TUI reconnect, and session hydrate snapshots are visible and cursor-consistent'
+      ? 'backend restart, TUI reconnect, session hydrate snapshots, and reconnect events are visible and cursor-consistent'
       : `restart/reconnect visible contract problems: ${problems.join('; ')}`,
     [
       'tui-capture-pre-restart.txt',
@@ -1538,6 +1565,7 @@ function checkRestartReconnectScenario(artifactDir) {
       'pre-restart-snapshot.json',
       'post-reconnect-snapshot.json',
       'websocket-transcript.jsonl',
+      'reconnect-events.jsonl',
     ],
   );
 }

@@ -88,6 +88,38 @@ jobs:
       - uses: actions/checkout@v6
       - uses: crate-ci/typos@v1.33.1
 
+  ux-gate-report:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: e2e/package-lock.json
+
+      - name: Install e2e deps
+        working-directory: e2e
+        run: npm ci
+
+      - name: Validate UX scenario manifest
+        run: npm --prefix e2e run ux:scenario:list:test
+
+      - name: Validate UX gate report generator
+        run: npm --prefix e2e run ux:gate:report:test
+
+      - name: Write local UX gate summary
+        run: npm --prefix e2e run ux:gate:local -- --out-dir e2e/test-results-ux/ci-local
+
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: ux-gate-local-summary
+          path: e2e/test-results-ux/ci-local/ux-summary.*
+          if-no-files-found: error
+          retention-days: 7
+
   windows-deploy-script:
     runs-on: windows-latest
     steps:
@@ -269,7 +301,7 @@ jobs:
       fail-fast: false
       matrix:
         # `lib` runs `--lib` only. `integration` runs `--tests` (every
-        # integration test binary, including activate_tools_regression).
+        # integration test binary).
         # Splitting these onto separate runners means each gets a fresh
         # 16GB allocation and neither inherits residual RAM from the
         # other's compile phase.
@@ -307,12 +339,6 @@ jobs:
         # comfortably within the runner's 6h budget.
         run: cargo test -p octos-agent --tests -- --test-threads=1
 
-      # Co-located in the integration job so it reuses the warm octos-agent
-      # integration test build cache (activate_tools_regression is itself an
-      # integration test binary). Skipped in the lib job.
-      - name: activate_tools regression tests
-        if: matrix.test-mode == 'integration'
-        run: cargo test -p octos-agent --test activate_tools_regression -- --nocapture
 
   test-octos-cli:
     runs-on: ubuntu-latest

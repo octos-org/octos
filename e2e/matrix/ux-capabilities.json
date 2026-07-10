@@ -1,6 +1,6 @@
 {
   "schema": "octos.ux.capabilities.v1",
-  "source": "provider-free M19 lanes validated in the 2026-05-26 TUI closure pass",
+  "source": "provider-free M19 lanes validated in the 2026-05-26 TUI closure pass plus validated local M19 restart/reconnect artifact evidence",
   "capabilities": [
     "approval/deny",
     "approval/request",
@@ -8,6 +8,11 @@
     "chat/send_prompt",
     "onboarding/workspace_probe",
     "permission/profile_select",
-    "runtime/policy_stamp"
+    "protocol/replay_lossy",
+    "runtime/policy_stamp",
+    "session/hydrate",
+    "session/resume",
+    "session/snapshot",
+    "transport/reconnect"
   ]
 }

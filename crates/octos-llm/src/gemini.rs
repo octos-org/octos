@@ -699,9 +699,11 @@ fn sanitize_schema_recursive(value: &mut serde_json::Value, depth: usize) {
             }
         }
 
-        if obj.get("enum").and_then(|v| v.as_array()).is_some_and(|values| {
-            values.iter().any(|value| !value.is_string())
-        }) {
+        if obj
+            .get("enum")
+            .and_then(|v| v.as_array())
+            .is_some_and(|values| values.iter().any(|value| !value.is_string()))
+        {
             obj.remove("enum");
         }
 

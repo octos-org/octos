@@ -1167,11 +1167,21 @@ Polls every 5 seconds. SHA-256 hash comparison of file contents.
 
 | Route | Method | Description |
 |---|---|---|
-| `/api/chat` | POST | Send message → response (sync; streaming runs over WS) |
-| `/api/ui-protocol/ws` | WS | JSON-RPC 2.0 UI Protocol v1 (chat stream + `session/list`, `session/messages_page`, `system/status.get`, ...) |
+| `/api/ui-protocol/ws` | WS | JSON-RPC 2.0 UI Protocol v1 — the primary **HTTP** chat + control-plane endpoint (legacy `POST /api/chat` retired). The same protocol is also served over `octos serve --stdio`. See below. |
 | `/health` | GET | Liveness probe (was `/api/status`; data plane moved to WS `system/status.get` in M12 Phase D-5) |
 | `/metrics` | GET | Prometheus text exposition format (unauthenticated) |
 | `/*` (fallback) | GET | Embedded web UI (static files via rust-embed) |
+
+**UI Protocol v1 method families** (`/api/ui-protocol/ws`, JSON-RPC 2.0): the WS endpoint is far more than a chat stream — it is the full control plane the web/TUI clients drive:
+
+- **Session/turn**: `session/open`, `session/hydrate`, `session/list`, `session/messages_page`, `session/status/read`, `turn/start`, `turn/interrupt`, `session/rollback`, `session/snapshot`.
+- **Autonomy**: `session/goal/set|get|clear` (goals) and `loop/create|list|pause|resume|delete` (recurring loops) — see [Autonomy & Session Control](./advanced.md#autonomy--session-control).
+- **Tasks**: `task/list`, `task/cancel`, `task/restart_from_node`, `task/output/read`, `task/artifact/list`.
+- **Approvals & questions**: `approval/respond`, `approval/scopes/list`, `user_question/respond`, `diff/preview/get`.
+- **Config/profile**: `profile/llm/*`, `profile/skills/*`, `permission/profile/*`, `content/list`, `config/capabilities/list`.
+- **Notifications** (server→client): `message/delta`, `message/persisted`, `tool/*`, `turn/spawn_complete`, `session/goal/updated`, `loop/fired`, `context/compaction_started`, etc.
+
+Many methods are gated by a **negotiated capability flag** (~22 `*.v1` tokens such as `coding.goal_runtime.v1`, `harness.task_control.v1`, `auxiliary.rest_to_ws.v1`) advertised at connect time — over WebSocket via `ui_feature`/`X-Octos-Ui-Features`, or over `serve --stdio` via `client_hello`'s `supported_features`. Core chat/turn/session methods are always available; the autonomy, task-artifact, and auxiliary groups sit behind flags. The exact **advertised-versus-callable** rules are intricate: a method can appear in the default capability list yet still require its flag to actually be *called* (e.g. the `auxiliary.rest_to_ws.v1` methods and `user_question/respond`), so a client should rely on the negotiated capability list and handle `method_not_supported` defensively rather than assume callability from advertisement alone.
 
 **Auth**: Optional bearer token with constant-time comparison (API routes only; `/metrics` and static files are public). **CORS**: localhost development origins plus the configured base domain. **Max message**: 1MB.
 

@@ -4,25 +4,16 @@
 
 ---
 
-## 工具与 LRU 延迟加载
+## 工具
 
-Octos 通过将工具分为**活跃**和**延迟**两组来管理庞大的工具目录。活跃工具会作为可调用的工具规格发送给 LLM；延迟工具仅以名称列出在系统提示中，在需要时才发送完整规格。
+Octos 在**每一轮**都把**完整的已启用工具集**作为可调用的工具规格发送给 LLM。不存在基于使用时近性的延迟加载：工具是否可用由[工具策略](#工具策略)（allow/deny 列表、命名组）与逐供应商策略控制，而非取决于工具最近是否被使用。
 
-### 工作原理
+有两类工具会被有意排除在每轮的工具列表之外：
 
-- **基础工具**（不会被淘汰）：`read_file`、`write_file`、`shell`、`glob`、`grep`、`list_dir`、`run_pipeline`、`deep_search` 等。
-- **动态工具**：`save_memory`、`web_search`、`recall_memory` 等按需激活、空闲后淘汰的工具。
-- **延迟工具**：`browser`、`manage_skills`、`spawn`、`configure_tool`、`switch_model` 等仅列出名称的工具。
+- **`spawn_only` 工具** —— 后台/发射即忘的技能。它们被自动拦截并在分离的任务中运行，而不作为主会话中的普通可调用规格（它们会向子 agent 暴露）。
+- **内部隐藏工具** —— 分发器目标（如 `mofa_make` 的逐技能入口），由转发工具在内部调用，但对模型隐藏以保持工具面清爽。
 
-### 淘汰规则
-
-当活跃工具数量超过 15 个时：
-- 空闲 5 次以上迭代且不在基础工具集中的工具成为淘汰候选。
-- 最久未使用的工具优先移入延迟列表。
-
-### 重新激活
-
-当 LLM 需要使用某个延迟工具时，它会调用 `activate_tools({"tools": [...]})`。这会将工具名称解析到对应的工具组，并激活整个组。
+> **历史：** 早期版本采用基于使用时近性的 LRU 方案（约 15 个活跃，其余延迟并通过 `activate_tools` 元工具重新提升）。该方案在 RFC-0（#1289）中被移除：现代 LLM 能无质量损失地处理完整的约 40–50 个工具集，且始终发送完整列表可保持 prompt 缓存稳定、每个工具都可被发现。
 
 ### 工具配置
 
@@ -500,6 +491,54 @@ Shell 命令在沙箱中运行以实现隔离。支持三种后端：
 | Slack | 3900 |
 
 拆分优先级：段落分隔 > 换行符 > 句号结尾 > 空格 > 硬截断。超过 50 块的消息会被截断并添加标记。
+
+---
+
+## 自主运行与会话控制
+
+除一次性对话外，图形客户端（octos-web、octos-tui）还通过 [UI Protocol](./architecture.md) 驱动一些更长时运行的行为。其中自主运行与任务产物组由协商的能力标志门控（见[能力协商](#能力协商)）；核心的轮次/会话控制（`turn/start`、`turn/interrupt`、`session/rollback`、`task/output/read`）始终可用。
+
+### 目标（Goals）
+
+**目标**是附加到会话上的持久化目标。一旦设定，agent 会持续朝其推进——只要目标策略允许就重新触发轮次——而不是在单次回答后停止。目标跨轮次存续，需显式清除。
+
+- 协议：`session/goal/set`、`session/goal/get`、`session/goal/clear`（通知 `session/goal/updated`、`session/goal/cleared`）。特性标志：必须**同时**协商 `coding.autonomy.v1` **和** `coding.goal_runtime.v1`（只声明组标志会得到 `method_not_supported`）。
+- 适用于「一直做到 X 完成」类工作。清除目标会停止**未来**的再次触发，但**不会**中止已在进行中的轮次——要停止正在运行的工作，请调用 `turn/interrupt`。
+
+### 循环（Loops）
+
+**循环**是周期性的 agent 运行，有三种模式：**固定间隔**（每 N 秒触发）、**自定步调**（模型通过发出 `<<loop-next-in: …>>` 提示自行决定下次节奏；未指定时默认 15 分钟）或**维护**（每次触发时重新解析并运行一段维护提示——若找到 `loop.md` 覆盖文件则用之，否则用内置默认）。循环持续触发，直到被暂停、删除、达到 10,000 次触发上限——**或到期**：每个循环都会被打上 `expires_at_ms = now + 7 天`，一旦过期，即使未达触发上限，到期扫描也会跳过它。
+
+- 协议：`loop/create`、`loop/list`、`loop/pause`、`loop/resume`、`loop/delete`、`loop/fire_now`（**请求**立即触发——它会经过循环的触发策略，若循环已暂停/耗尽可能被拒绝或去重，因此应检查返回的 `fire.queued`/错误结果，而非假定一定触发了一次）——通知 `loop/fired`、`loop/updated`（协议中存在 `loop/completed` 变体，但正常迭代时当前并不发送——不要等待它）。特性标志：必须**同时**协商 `coding.autonomy.v1` **和** `coding.loop_runtime.v1`。
+- 适用于轮询、监控和自定步调的后台 agent。
+
+### 回退（Rewind）
+
+`session/rollback` 将**对话**回退到较早的点——它追加一个回退标记，并通过丢弃最近 N 个用户轮次来重建聊天/上下文历史。它**不会**回滚工作区文件或任务状态。`session/snapshot` 是当前状态、文件与任务的**只读**聚合——是一个视图，而非可恢复的检查点。二者仅在对话层面支撑客户端的「回退」UI。
+
+### 任务与轮次控制
+
+- **后台任务**（派生工作、深度搜索、流水线）可被列出与取消：`task/list`、`task/cancel`，输出/产物通过 `task/output/read`、`task/artifact/list`。取消也可经 REST 的 `POST /api/tasks/{id}/cancel` 触达。`task/restart_from_node` **已被接受但尚不能真正重新执行**——生产运行时未接入 relaunch 回调，因此它只会登记一个后继任务，而不会重新运行工作。
+- **运行中的轮次**可用 `turn/interrupt` 中途打断（中止进行中的 LLM 调用与工具）。已提交到会话的消息会保留（可通过回放/hydration 恢复）；只有被打断轮次中尚未提交的流式剩余部分会丢失。`turn/start` 与 `turn/interrupt` **不**受能力门控——始终可用。而独立的**子 agent** 控制（`agent/list`、`agent/status/read`、`agent/interrupt`、`agent/close`）与任务产物（`task/artifact/list|read`）需要 `coding.autonomy.v1` + `coding.agent_control.v1`。
+
+### 能力协商
+
+客户端在连接时声明它支持哪些协议特性：WebSocket 通过 `ui_feature` / `ui_features` 查询参数或 `X-Octos-Ui-Features` 头；`serve --stdio` 通过 `client_hello` 的 `supported_features`。服务器对大多数方法按协商集门控，因此旧客户端可继续工作，新能力也能上线。实现客户端时需注意两点：某些方法虽在默认能力列表中被*声明*，但仍需其具体标志才能被*调用*（应以协商列表为准，并稳妥处理 `method_not_supported`）；通知投递为尽力而为——当另一个连接触发自主运行事件（`session/goal/updated`、`loop/*`、`agent/*`）时，本连接仍可能通过实时转发或回放收到它们。代表性标志：
+
+| 标志 | 解锁 |
+|------|------|
+| `coding.autonomy.v1` | 自主运行根标志——须*与*下方目标/循环/agent-control 标志一起协商 |
+| `coding.goal_runtime.v1` | 目标（`session/goal/*`）——还需 `coding.autonomy.v1` |
+| `coding.loop_runtime.v1` | 循环（`loop/*`）——还需 `coding.autonomy.v1` |
+| `harness.task_control.v1` | 任务 列出/取消/重启 |
+| `harness.task_artifacts.v1` | 任务产物（`task/artifact/*`）——还需 `coding.autonomy.v1` + `coding.agent_control.v1` |
+| `coding.agent_control.v1` | 子 agent 控制（`agent/*`）与任务产物——还需 `coding.autonomy.v1` |
+| `state.session_hydrate.v1` | `session/hydrate` 恢复 |
+| `state.thread_graph.v1` | 线程/轮次图 |
+| `context.lifecycle.v1` | 上下文压缩事件 |
+| `approval.typed.v1` | 类型化人工审批卡片 |
+| `user_question.v1` | 澄清提问卡片 |
+| `auxiliary.rest_to_ws.v1` | 13 个辅助 REST→WS 方法（`session/list`、`content/list`、`session/snapshot` 等） |
 
 ---
 
