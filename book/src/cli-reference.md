@@ -367,7 +367,9 @@ Options:
   -c, --cwd <PATH>              Working directory
 ```
 
-`stdio` uses parent-trust auth (JSON-RPC over stdin/stdout). `http` is a minimal HTTP/1.1 JSON-RPC endpoint and **requires** a bearer token via the `OCTOS_MCP_SERVER_TOKEN` environment variable.
+Both transports are served by the [rmcp](https://github.com/modelcontextprotocol/rust-sdk) SDK. `stdio` uses parent-trust auth (MCP JSON-RPC over stdin/stdout). `http` is an MCP Streamable HTTP endpoint (SSE responses with a per-session `Mcp-Session-Id`) and **requires** a bearer token via the `OCTOS_MCP_SERVER_TOKEN` environment variable; it is only compiled into builds with the `api` feature (otherwise use `--transport stdio`). Binding `--bind` to a non-loopback address disables rmcp's DNS-rebinding host guard, leaving the bearer token as the sole authenticator.
+
+The session it drives runs inside the configured sandbox (`SandboxMode::Auto` by default), so outer callers cannot use the exposed `run_octos_session` tool to read or write outside the working directory.
 
 ---
 
