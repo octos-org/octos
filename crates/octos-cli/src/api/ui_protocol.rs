@@ -15209,20 +15209,28 @@ async fn handle_content_bulk_delete(
     }
 }
 
-/// Per-field RAW byte budgets for the memory RPC results (codex #1621
-/// r1 P1). The REST panel intentionally serves files up to
-/// `memory_panel::MAX_PANEL_FILE_BYTES` (2 MiB), but an RPC result must
-/// fit ONE ~1 MiB WS text frame (`MAX_TEXT_FRAME_BYTES`) — without a
-/// handler-level bound the outbound framing guard
-/// (`preview_oversized_frame`) would splice a head+tail preview into
-/// the largest string while the envelope still reports success: silent
-/// corruption for a document viewer. Budgets keep the WHOLE serialized
-/// result under the frame cap even at the JSON-escaping worst case
-/// (×2 per byte) plus envelope overhead:
-///   96 (long_term) + 48 (today) + 7×24 (recent) + ~90 (entities —
-///   bounded upstream: ≤ MAX_PANEL_ENTITIES=256 summaries, each capped
-///   at 100 bytes by `octos_memory::extract_abstract`, names ≤ 255)
-///   ≈ 402 KiB raw → ≤ ~810 KiB escaped.
+/// Per-field JSON-ESCAPED byte budgets for the memory RPC results
+/// (codex #1621 r1 P1, tightened r2 P1). The REST panel intentionally
+/// serves files up to `memory_panel::MAX_PANEL_FILE_BYTES` (2 MiB), but
+/// an RPC result must fit ONE ~1 MiB WS text frame
+/// (`MAX_TEXT_FRAME_BYTES`) — without a handler-level bound the
+/// outbound framing guard (`preview_oversized_frame`) would splice a
+/// head+tail preview into the largest string while the envelope still
+/// reports success: silent corruption for a document viewer.
+///
+/// Budgets are measured in ESCAPED bytes (r2 P1: a flat raw-byte cap
+/// under-counts — `serde_json` emits SIX bytes (`\u0001`) for a C0
+/// control byte, so a control-heavy file capped by raw length would
+/// still serialize past the frame and re-reach the silent preview).
+/// `cap_index_by_escaped_len` walks the field with serde_json's actual
+/// escaping table, so plain markdown keeps ~the full budget while
+/// pathological content is cut exactly where its wire cost hits it.
+/// Worst-case wire size is therefore the PLAIN SUM of the budgets:
+///   96 (long_term) + 48 (today) + 7×24 (recent) + ~294 (entities —
+///   bounded upstream at ≤ MAX_PANEL_ENTITIES=256 rows: summaries
+///   ≤ 100 raw bytes (`octos_memory::extract_abstract`) → ≤ 600
+///   escaped, names ≤ 255 raw → ≤ 510 escaped, + per-row JSON
+///   overhead) ≈ 606 KiB, well under the frame cap.
 /// Truncation is EXPLICIT: `<field>_truncated` + `<field>_total_bytes`
 /// ride beside every capped field; the content itself is a clean UTF-8
 /// prefix with NO in-band marker.
@@ -15230,10 +15238,36 @@ const MEMORY_RPC_LONG_TERM_BUDGET: usize = 96 * 1024;
 const MEMORY_RPC_TODAY_BUDGET: usize = 48 * 1024;
 const MEMORY_RPC_RECENT_NOTE_BUDGET: usize = 24 * 1024;
 /// `memory/entity` is a single-document result — it gets the largest
-/// budget that still clears the frame cap at escape worst case.
+/// budget that still clears the frame cap.
 const MEMORY_RPC_ENTITY_CONTENT_BUDGET: usize = 384 * 1024;
 
-/// Cap the string at `obj[field]` to `budget` RAW bytes (UTF-8
+/// Wire cost of one char in a JSON string per `serde_json`'s escaper:
+/// `"` / `\` and the short control escapes (`\b \f \n \r \t`)
+/// emit 2 bytes; every other C0 control emits 6 (`\u00XX`); everything
+/// else passes through at its UTF-8 length.
+fn json_escaped_len(c: char) -> usize {
+    match c {
+        '"' | '\\' | '\x08' | '\x0c' | '\n' | '\r' | '\t' => 2,
+        c if (c as u32) < 0x20 => 6,
+        c => c.len_utf8(),
+    }
+}
+
+/// Largest raw prefix of `s` whose JSON-ESCAPED length fits
+/// `escaped_budget`. Always a char boundary (walks `char_indices`).
+fn cap_index_by_escaped_len(s: &str, escaped_budget: usize) -> usize {
+    let mut used = 0usize;
+    for (i, c) in s.char_indices() {
+        let cost = json_escaped_len(c);
+        if used + cost > escaped_budget {
+            return i;
+        }
+        used += cost;
+    }
+    s.len()
+}
+
+/// Cap the string at `obj[field]` to `budget` ESCAPED bytes (UTF-8
 /// boundary, clean prefix — no in-band marker) and record the truth
 /// beside it as `<field>_truncated` + `<field>_total_bytes` (always
 /// written, false/full-length when the field fit).
@@ -15242,9 +15276,10 @@ fn cap_memory_value_field(obj: &mut Value, field: &str, budget: usize) {
         return;
     };
     let total = s.len();
-    let truncated = total > budget;
+    let cut = cap_index_by_escaped_len(s, budget);
+    let truncated = cut < s.len();
     if truncated {
-        octos_core::truncate_utf8(s, budget, "");
+        s.truncate(cut);
     }
     if let Some(map) = obj.as_object_mut() {
         map.insert(format!("{field}_truncated"), json!(truncated));
@@ -15358,9 +15393,10 @@ async fn handle_memory_entity(
             // guard's silent in-band preview (codex #1621 r1 P1).
             let mut content = entity.content;
             let content_total_bytes = content.len();
-            let content_truncated = content_total_bytes > MEMORY_RPC_ENTITY_CONTENT_BUDGET;
+            let cut = cap_index_by_escaped_len(&content, MEMORY_RPC_ENTITY_CONTENT_BUDGET);
+            let content_truncated = cut < content.len();
             if content_truncated {
-                octos_core::truncate_utf8(&mut content, MEMORY_RPC_ENTITY_CONTENT_BUDGET, "");
+                content.truncate(cut);
             }
             send_aux_rpc_result(
                 ws,
@@ -28879,7 +28915,12 @@ ignore = []
         let frame = recv_rpc_json(&mut rx).await;
         let overview = &frame["result"]["overview"];
         let served = overview["long_term"].as_str().unwrap();
-        assert_eq!(served.len(), MEMORY_RPC_LONG_TERM_BUDGET);
+        // Budgets are ESCAPED-byte budgets: the raw cut lands within
+        // the budget and the SERIALIZED field provably fits it.
+        assert!(served.len() <= MEMORY_RPC_LONG_TERM_BUDGET);
+        assert!(served.len() > MEMORY_RPC_LONG_TERM_BUDGET - 8);
+        let wire = serde_json::to_string(served).expect("serialize");
+        assert!(wire.len() - 2 <= MEMORY_RPC_LONG_TERM_BUDGET);
         assert_eq!(overview["long_term_truncated"], json!(true));
         assert_eq!(
             overview["long_term_total_bytes"],
@@ -28887,7 +28928,7 @@ ignore = []
             "total reports the FULL pre-cap size",
         );
         // Clean prefix — the cap never splices a marker into content.
-        assert_eq!(served, &long_term[..MEMORY_RPC_LONG_TERM_BUDGET]);
+        assert_eq!(served, &long_term[..served.len()]);
         assert_eq!(overview["today_truncated"], json!(false));
 
         handle_memory_entity(
@@ -28904,13 +28945,16 @@ ignore = []
         .await;
         let frame = recv_rpc_json(&mut rx).await;
         let served = frame["result"]["content"].as_str().unwrap();
-        assert_eq!(served.len(), MEMORY_RPC_ENTITY_CONTENT_BUDGET);
+        assert!(served.len() <= MEMORY_RPC_ENTITY_CONTENT_BUDGET);
+        assert!(served.len() > MEMORY_RPC_ENTITY_CONTENT_BUDGET - 8);
+        let wire = serde_json::to_string(served).expect("serialize");
+        assert!(wire.len() - 2 <= MEMORY_RPC_ENTITY_CONTENT_BUDGET);
         assert_eq!(frame["result"]["content_truncated"], json!(true));
         assert_eq!(
             frame["result"]["content_total_bytes"],
             json!(entity_page.len())
         );
-        assert_eq!(served, &entity_page[..MEMORY_RPC_ENTITY_CONTENT_BUDGET]);
+        assert_eq!(served, &entity_page[..served.len()]);
     }
 
     /// The budget helper must cut on a UTF-8 char boundary (a capped
@@ -28940,29 +28984,59 @@ ignore = []
         assert_eq!(obj, json!({ "count": 7 }));
     }
 
-    /// Budget arithmetic guard: the overview's worst-case serialized
-    /// size (all budgets spent + bounded entities + envelope) must stay
-    /// under the WS frame cap even at the JSON-escape worst case (×2),
-    /// and the entity budget likewise — otherwise the framing guard's
-    /// silent preview becomes reachable again.
+    /// Budget arithmetic guard: budgets are ESCAPED-byte budgets (codex
+    /// r2 P1 — C0 controls cost 6 wire bytes each, so raw-byte caps
+    /// under-count), which makes the worst-case wire size the PLAIN sum
+    /// of the budgets plus the bounded entities and envelope. That sum
+    /// must clear the frame cap — otherwise the framing guard's silent
+    /// preview becomes reachable again.
     #[test]
     fn memory_rpc_budgets_fit_one_ws_frame_at_escape_worst_case() {
-        // Entities bound: MAX_PANEL_ENTITIES × (100-byte summary +
-        // 255-byte name + ~40 bytes JSON overhead).
-        let entities_bound = 256 * (100 + 255 + 40);
-        let overview_raw = MEMORY_RPC_LONG_TERM_BUDGET
+        // Entities bound (escaped): MAX_PANEL_ENTITIES × (100-raw-byte
+        // summary → ≤ 600 escaped + 255-raw-byte name → ≤ 510 escaped +
+        // ~40 bytes JSON overhead).
+        let entities_bound = 256 * (600 + 510 + 40);
+        let overview_escaped = MEMORY_RPC_LONG_TERM_BUDGET
             + MEMORY_RPC_TODAY_BUDGET
             + 7 * MEMORY_RPC_RECENT_NOTE_BUDGET
             + entities_bound;
         let envelope_overhead = 4 * 1024;
         assert!(
-            overview_raw * 2 + envelope_overhead < MAX_TEXT_FRAME_BYTES,
-            "overview budgets ({overview_raw} raw) must fit the {MAX_TEXT_FRAME_BYTES}-byte frame at escape worst case",
+            overview_escaped + envelope_overhead < MAX_TEXT_FRAME_BYTES,
+            "overview budgets ({overview_escaped} escaped) must fit the {MAX_TEXT_FRAME_BYTES}-byte frame",
         );
         assert!(
-            MEMORY_RPC_ENTITY_CONTENT_BUDGET * 2 + envelope_overhead < MAX_TEXT_FRAME_BYTES,
-            "entity budget must fit the frame at escape worst case",
+            MEMORY_RPC_ENTITY_CONTENT_BUDGET + envelope_overhead < MAX_TEXT_FRAME_BYTES,
+            "entity budget must fit the frame",
         );
+    }
+
+    /// codex #1621 r2 P1 regression: C0 control bytes cost SIX wire
+    /// bytes each (`\u0001`), so the cap must count escaped length —
+    /// a control-heavy document must be cut to budget/6 raw bytes and
+    /// the SERIALIZED field must stay within budget.
+    #[test]
+    fn cap_memory_value_field_counts_six_byte_control_escapes() {
+        let raw = "\u{0001}".repeat(1000); // 6000 escaped bytes
+        let mut obj = json!({ "content": raw });
+        cap_memory_value_field(&mut obj, "content", 600);
+        let served = obj["content"].as_str().unwrap();
+        assert_eq!(served.chars().count(), 100, "600 budget / 6 per control");
+        assert_eq!(obj["content_truncated"], json!(true));
+        assert_eq!(obj["content_total_bytes"], json!(1000));
+        // The PROOF: the serialized field fits the escaped budget.
+        let wire = serde_json::to_string(&obj["content"]).expect("serialize");
+        assert!(
+            wire.len() <= 600 + 2, // + surrounding quotes
+            "serialized capped field ({} bytes) must fit the escaped budget",
+            wire.len(),
+        );
+
+        // Quotes/backslashes cost 2; multibyte costs its UTF-8 length.
+        let mut obj = json!({ "content": "\"\\€x" }); // 2+2+3+1 = 8 escaped
+        cap_memory_value_field(&mut obj, "content", 7);
+        assert_eq!(obj["content"], json!("\"\\€"));
+        assert_eq!(obj["content_truncated"], json!(true));
     }
 
     /// WS-transport auth expiry: the close-code 1008 frame must precede
