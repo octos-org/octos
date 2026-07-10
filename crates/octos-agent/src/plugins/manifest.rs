@@ -8,11 +8,14 @@ use serde::{Deserialize, Deserializer};
 /// A plugin manifest (manifest.json).
 #[derive(Debug, Deserialize)]
 pub struct PluginManifest {
-    /// Plugin name. Accepts `id` as an alias so manifests written against
-    /// upstream's renamed field (which uses `id` with `#[serde(alias = "name")]`)
-    /// still parse cleanly through the agent-side deserializer.
-    #[serde(alias = "id")]
+    /// Display and executable name. Legacy manifests use this as their
+    /// identity when they do not declare an explicit `id`.
+    #[serde(default)]
     pub name: String,
+    /// Canonical plugin identity. This matches `octos-plugin` discovery,
+    /// whose duplicate and root-precedence rules are keyed by manifest `id`.
+    #[serde(default)]
+    pub id: Option<String>,
     /// Plugin version.
     pub version: String,
     /// RFC-1 (issue #1290): the `content_type` discriminator this skill
@@ -127,6 +130,42 @@ pub struct PluginManifest {
 }
 
 impl PluginManifest {
+    /// Canonical identity used for ownership, qualified action resolution,
+    /// and cache keys. Legacy manifests retain their `name` identity.
+    pub fn canonical_id(&self) -> &str {
+        self.id
+            .as_deref()
+            .filter(|id| !id.trim().is_empty())
+            .unwrap_or(&self.name)
+    }
+
+    /// Name used when resolving a plugin executable. Explicit names remain
+    /// compatible with older packages that do not name their binary by `id`.
+    pub fn executable_name(&self) -> &str {
+        if self.name.trim().is_empty() {
+            self.canonical_id()
+        } else {
+            &self.name
+        }
+    }
+
+    /// Validate the manifest name before using it as the skill half of a
+    /// qualified UI action identity. Existing plugins without actions are
+    /// intentionally outside this validation path.
+    pub fn validate_for_action_registration(&self) -> Result<(), ManifestValidationError> {
+        if self.actions.is_empty() {
+            return Ok(());
+        }
+        validate_action_text_field("id", self.canonical_id())?;
+        if self.canonical_id().contains('/') {
+            return Err(ManifestValidationError::InvalidActionField(
+                "id",
+                "must not contain '/'",
+            ));
+        }
+        Ok(())
+    }
+
     /// Whether this manifest declares any extras (MCP servers, hooks, prompts,
     /// or discovery).
     ///
@@ -307,6 +346,23 @@ impl SkillActionBinding {
     }
 }
 
+impl SkillActionDef {
+    /// Validate fields needed to register an action under a stable qualified ID.
+    pub fn validate_for_registration(&self) -> Result<(), ManifestValidationError> {
+        validate_action_text_field("id", &self.id)?;
+        if self.id.contains('/') {
+            return Err(ManifestValidationError::InvalidActionField(
+                "id",
+                "must not contain '/'",
+            ));
+        }
+        validate_action_text_field("label", &self.label)?;
+        let tool = self.binding.tool_name().unwrap_or_default();
+        validate_action_text_field("binding.tool", tool)?;
+        Ok(())
+    }
+}
+
 /// How action input is mapped to the bound tool call.
 #[derive(Debug, Clone, Copy, Deserialize, serde::Serialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
@@ -470,6 +526,8 @@ pub enum ManifestValidationError {
     /// `env` allowlist contains a name that fails the syntactic check.
     /// First field: the offending name; second: human-readable reason.
     InvalidEnvName(String, &'static str),
+    /// An action field cannot be used to form a stable trusted registration.
+    InvalidActionField(&'static str, &'static str),
 }
 
 impl std::fmt::Display for ManifestValidationError {
@@ -479,6 +537,9 @@ impl std::fmt::Display for ManifestValidationError {
                 f,
                 "manifest env allowlist entry {name:?} is invalid: {reason}"
             ),
+            Self::InvalidActionField(field, reason) => {
+                write!(f, "manifest action field {field:?} is invalid: {reason}")
+            }
         }
     }
 }
@@ -589,6 +650,25 @@ fn validate_manifest_env_name(name: &str) -> Result<(), ManifestValidationError>
                 "name is a known process-hijack env var",
             ));
         }
+    }
+    Ok(())
+}
+
+fn validate_action_text_field(
+    field: &'static str,
+    value: &str,
+) -> Result<(), ManifestValidationError> {
+    if value.trim().is_empty() {
+        return Err(ManifestValidationError::InvalidActionField(
+            field,
+            "must not be empty",
+        ));
+    }
+    if value != value.trim() || value.chars().any(char::is_control) {
+        return Err(ManifestValidationError::InvalidActionField(
+            field,
+            "must not have surrounding whitespace or control characters",
+        ));
     }
     Ok(())
 }
@@ -828,13 +908,15 @@ mod tests {
     }
 
     #[test]
-    fn test_missing_name_fails() {
+    fn test_id_based_manifest_can_omit_legacy_name() {
         let json = r#"{
+            "id": "id-based-plugin",
             "version": "1.0.0",
             "tools": []
         }"#;
-        let result = serde_json::from_str::<PluginManifest>(json);
-        assert!(result.is_err());
+        let manifest = serde_json::from_str::<PluginManifest>(json).unwrap();
+        assert_eq!(manifest.canonical_id(), "id-based-plugin");
+        assert_eq!(manifest.executable_name(), "id-based-plugin");
     }
 
     #[test]
@@ -993,6 +1075,30 @@ mod tests {
     }
 
     #[test]
+    fn action_registration_validates_qualified_plugin_identity_names() {
+        for name in [" bad-name ", "bad\nname", "bad/name"] {
+            let manifest: PluginManifest = serde_json::from_value(serde_json::json!({
+                "name": name,
+                "version": "1.0",
+                "actions": [{
+                    "id": "identity.check",
+                    "label": "Check identity",
+                    "binding": {"type": "tool", "tool": "identity_tool"}
+                }]
+            }))
+            .unwrap();
+            assert!(manifest.validate_for_action_registration().is_err());
+        }
+
+        let no_actions: PluginManifest = serde_json::from_value(serde_json::json!({
+            "name": " legacy/name ",
+            "version": "1.0"
+        }))
+        .unwrap();
+        assert!(no_actions.validate_for_action_registration().is_ok());
+    }
+
+    #[test]
     fn manifest_risk_gate_classifies_known_literals() {
         assert_eq!(
             ManifestRiskGate::classify(Some("low")),
@@ -1096,6 +1202,7 @@ mod tests {
     fn manifest_with_tools(make_type: Option<&str>, tools: Vec<PluginToolDef>) -> PluginManifest {
         PluginManifest {
             name: "test-skill".into(),
+            id: None,
             version: "1.0".into(),
             make_type: make_type.map(str::to_string),
             content_type_description: None,

@@ -752,6 +752,7 @@ impl GatewayRuntime {
                 plugin_result = octos_agent::PluginLoadResult {
                     tool_count: rt.plugin_tool_names.len(),
                     tool_names: rt.plugin_tool_names.clone(),
+                    loaded_actions: rt.skill_actions.clone(),
                     mcp_servers: Vec::new(),
                     hooks: rt.plugin_hooks.clone(),
                     prompt_fragments: rt.plugin_prompt_fragments.clone(),
@@ -760,6 +761,7 @@ impl GatewayRuntime {
                     // doesn't need to re-register, so the entries list
                     // stays empty here (no double-registration).
                     make_type_entries: Vec::new(),
+                    plugin_errors: Vec::new(),
                 };
                 plugin_dirs_for_spawn = rt.plugin_dirs.clone();
             } else {

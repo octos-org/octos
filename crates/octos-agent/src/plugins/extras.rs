@@ -375,6 +375,7 @@ mod tests {
     fn test_resolve_extras_empty_manifest() {
         let manifest = PluginManifest {
             name: "test".into(),
+            id: None,
             version: "1.0".into(),
             make_type: None,
             content_type_description: None,
@@ -410,6 +411,7 @@ mod tests {
 
         let manifest = PluginManifest {
             name: "test".into(),
+            id: None,
             version: "1.0".into(),
             make_type: None,
             content_type_description: None,
@@ -455,6 +457,7 @@ mod tests {
         use crate::plugins::manifest::PluginToolDef;
         PluginManifest {
             name: name.into(),
+            id: None,
             version: "1.0.0".into(),
             make_type: None,
             content_type_description: None,

@@ -681,6 +681,7 @@ impl ServeCommand {
         let state = Arc::new(AppState {
             profiles: profile_runtimes,
             session_cache,
+            profile_skill_mutation_locks: Arc::new(crate::api::ProfileSkillMutationLocks::new()),
             sessions,
             broadcaster,
             started_at: chrono::Utc::now(),

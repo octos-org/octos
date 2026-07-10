@@ -265,7 +265,7 @@ type WsSink = futures::stream::SplitSink<WebSocket, WsMessage>;
 type SharedActiveTurns = Arc<tokio::sync::Mutex<HashMap<SessionKey, ActiveTurn>>>;
 type SharedConnectionTurns = Arc<tokio::sync::Mutex<HashMap<SessionKey, TurnId>>>;
 type DynamicProfileRuntimeMap =
-    tokio::sync::RwLock<HashMap<String, Arc<crate::runtime::ProfileRuntime>>>;
+    std::sync::RwLock<HashMap<String, Arc<crate::runtime::ProfileRuntime>>>;
 
 /// Per-connection registry of live ledger-forwarder tasks keyed by session.
 /// Each entry pumps `LedgeredUiProtocolEvent`s from the ledger broadcast
@@ -7219,33 +7219,9 @@ fn raw_profile_skills_list(
 #[derive(Debug, Clone)]
 struct SkillActionRecord {
     skill_id: String,
-    skill_dir: PathBuf,
     action: octos_agent::plugins::SkillActionDef,
     available: bool,
     unavailable_reason: Option<String>,
-}
-
-fn candidate_skill_manifest_paths(plugin_dirs: &[PathBuf]) -> Vec<PathBuf> {
-    let mut paths = Vec::new();
-    for root in plugin_dirs {
-        let direct_manifest = root.join("manifest.json");
-        if direct_manifest.is_file() {
-            paths.push(direct_manifest);
-            continue;
-        }
-        let Ok(entries) = std::fs::read_dir(root) else {
-            continue;
-        };
-        let mut child_paths: Vec<PathBuf> = entries
-            .filter_map(Result::ok)
-            .map(|entry| entry.path())
-            .filter(|path| path.join("manifest.json").is_file())
-            .map(|path| path.join("manifest.json"))
-            .collect();
-        child_paths.sort();
-        paths.extend(child_paths);
-    }
-    paths
 }
 
 fn action_matches_filters(
@@ -7265,68 +7241,62 @@ fn action_matches_filters(
         .all(|tag| action.tags.iter().any(|candidate| candidate == tag))
 }
 
-fn discover_skill_action_records(
-    plugin_dirs: &[PathBuf],
+fn trusted_skill_action_records(
+    loaded_actions: &[octos_agent::plugins::LoadedSkillAction],
     registry: &octos_agent::ToolRegistry,
     surface: Option<&str>,
     required_tags: &[String],
-) -> Result<Vec<SkillActionRecord>, RpcError> {
-    let mut records = Vec::new();
-    for manifest_path in candidate_skill_manifest_paths(plugin_dirs) {
-        let raw = match std::fs::read_to_string(&manifest_path) {
-            Ok(raw) => raw,
-            Err(error) => {
-                warn!(
-                    path = %manifest_path.display(),
-                    %error,
-                    "failed to read skill manifest while discovering actions"
-                );
-                continue;
-            }
-        };
-        let manifest: octos_agent::plugins::PluginManifest = match serde_json::from_str(&raw) {
-            Ok(manifest) => manifest,
-            Err(error) => {
-                warn!(
-                    path = %manifest_path.display(),
-                    %error,
-                    "failed to parse skill manifest while discovering actions"
-                );
-                continue;
-            }
-        };
-        for action in manifest.actions {
-            if !action_matches_filters(&action, surface, required_tags) {
-                continue;
-            }
-            let tool_name = action.binding.tool_name().unwrap_or_default();
-            let available = !tool_name.is_empty() && registry.get(tool_name).is_some();
-            if !available {
-                continue;
-            }
-            records.push(SkillActionRecord {
-                skill_id: manifest.name.clone(),
-                skill_dir: manifest_path
-                    .parent()
-                    .map(Path::to_path_buf)
-                    .unwrap_or_else(PathBuf::new),
-                action,
-                available,
-                unavailable_reason: None,
-            });
-        }
+) -> Vec<SkillActionRecord> {
+    loaded_actions
+        .iter()
+        .filter(|loaded| action_matches_filters(&loaded.definition, surface, required_tags))
+        .filter(|loaded| loaded.is_bound_to_registry(registry))
+        .map(|loaded| SkillActionRecord {
+            skill_id: loaded.plugin_name.clone(),
+            action: loaded.definition.clone(),
+            available: true,
+            unavailable_reason: None,
+        })
+        .collect()
+}
+
+fn skill_action_record_is_trusted(
+    record: &SkillActionRecord,
+    registry: &octos_agent::ToolRegistry,
+) -> bool {
+    let Some(tool_name) = record.action.binding.tool_name() else {
+        return false;
+    };
+    registry
+        .get(tool_name)
+        .and_then(|tool| {
+            tool.as_any()
+                .downcast_ref::<octos_agent::plugins::PluginTool>()
+        })
+        .is_some_and(|tool| tool.plugin_name() == record.skill_id)
+}
+
+fn resolve_skill_action_record<'a>(
+    records: &'a [SkillActionRecord],
+    requested_id: &str,
+) -> Option<&'a SkillActionRecord> {
+    if requested_id.contains('/') {
+        return records
+            .iter()
+            .find(|record| format!("{}/{}", record.skill_id, record.action.id) == requested_id);
     }
-    Ok(records)
+
+    let mut matches = records
+        .iter()
+        .filter(|record| record.action.id == requested_id);
+    let matched = matches.next()?;
+    matches.next().is_none().then_some(matched)
 }
 
 fn skill_action_record_to_value(record: SkillActionRecord) -> Value {
     let mut object = serde_json::Map::new();
     object.insert("id".into(), Value::String(record.action.id));
     object.insert("skill_id".into(), Value::String(record.skill_id));
-    object.insert(
-        "skill_dir".into(),
-        Value::String(record.skill_dir.to_string_lossy().into_owned()),
-    );
     object.insert("label".into(), Value::String(record.action.label));
     if let Some(description) = record.action.description {
         object.insert("description".into(), Value::String(description));
@@ -7789,12 +7759,12 @@ async fn raw_skill_action_list(
     )?;
     let session_runtime =
         skill_action_session_runtime(state, &session_id, active_profile_id.as_deref()).await?;
-    let records = discover_skill_action_records(
-        &session_runtime.profile.plugin_dirs,
+    let records = trusted_skill_action_records(
+        &session_runtime.profile.skill_actions,
         &session_runtime.tools,
         params.surface.as_deref(),
         &params.tags,
-    )?;
+    );
     let actions = records
         .into_iter()
         .map(skill_action_record_to_value)
@@ -7822,24 +7792,24 @@ async fn raw_skill_action_invoke(
     let session_runtime =
         skill_action_session_runtime(state, &params.session_id, active_profile_id.as_deref())
             .await?;
-    let records = discover_skill_action_records(
-        &session_runtime.profile.plugin_dirs,
+    let records = trusted_skill_action_records(
+        &session_runtime.profile.skill_actions,
         &session_runtime.tools,
         None,
         &[],
-    )?;
-    let record = records
-        .into_iter()
-        .find(|record| {
-            record.action.id == params.action_id
-                || format!("{}/{}", record.skill_id, record.action.id) == params.action_id
-        })
-        .ok_or_else(|| {
-            RpcError::invalid_params(format!(
-                "skill action '{}' is not available in this session",
-                params.action_id
-            ))
-        })?;
+    );
+    let record = resolve_skill_action_record(&records, &params.action_id).ok_or_else(|| {
+        RpcError::invalid_params(format!(
+            "skill action '{}' is not available in this session",
+            params.action_id
+        ))
+    })?;
+    if !skill_action_record_is_trusted(record, &session_runtime.tools) {
+        return Err(RpcError::invalid_params(format!(
+            "skill action '{}' is no longer bound to its declaring plugin tool",
+            params.action_id
+        )));
+    }
     match record.action.execution {
         octos_agent::plugins::SkillActionExecution::Sync => {
             invoke_skill_action_tool_binding(
@@ -8052,6 +8022,9 @@ async fn raw_profile_skills_install(
 ) -> Result<Value, RpcError> {
     let params: RawProfileSkillsInstallParams = parse_raw_params(request)?;
     let profile_id = raw_profile_skill_profile_id(params.profile_id, connection_profile_id)?;
+    // Keep disk mutation, plugin rebuild/publication, and session eviction in
+    // one per-profile critical section so an older rebuild cannot publish last.
+    let _mutation_guard = state.profile_skill_mutation_locks.lock(&profile_id).await;
     let skills_dir = raw_profile_skills_dir(state, &profile_id)?;
     let repo =
         nonempty(Some(params.repo)).ok_or_else(|| RpcError::invalid_params("repo is required"))?;
@@ -8063,6 +8036,9 @@ async fn raw_profile_skills_install(
     .await
     .map_err(|err| RpcError::internal_error(format!("skill install join error: {err}")))?
     .map_err(|err| RpcError::invalid_params(format!("failed to install skill: {err}")))?;
+    if !result.installed.is_empty() {
+        rebuild_profile_runtime_after_skill_mutation(state, &profile_id).await?;
+    }
     Ok(json!({
         "profile_id": profile_id,
         "ok": true,
@@ -8079,6 +8055,8 @@ async fn raw_profile_skills_remove(
 ) -> Result<Value, RpcError> {
     let params: RawProfileSkillsRemoveParams = parse_raw_params(request)?;
     let profile_id = raw_profile_skill_profile_id(params.profile_id, connection_profile_id)?;
+    // See install: the guard spans the full mutation-to-publication sequence.
+    let _mutation_guard = state.profile_skill_mutation_locks.lock(&profile_id).await;
     let skills_dir = raw_profile_skills_dir(state, &profile_id)?;
     let name =
         nonempty(Some(params.name)).ok_or_else(|| RpcError::invalid_params("name is required"))?;
@@ -8087,6 +8065,7 @@ async fn raw_profile_skills_remove(
         .await
         .map_err(|err| RpcError::internal_error(format!("skill remove join error: {err}")))?
         .map_err(|err| RpcError::invalid_params(format!("failed to remove skill: {err}")))?;
+    rebuild_profile_runtime_after_skill_mutation(state, &profile_id).await?;
     Ok(json!({
         "profile_id": profile_id,
         "ok": true,
@@ -10866,18 +10845,19 @@ pub(crate) fn resolve_session_profile_runtime(
     active_profile_id: Option<&str>,
 ) -> Option<Arc<crate::runtime::ProfileRuntime>> {
     let candidate = active_profile_id.unwrap_or(MAIN_PROFILE_ID);
-    state.profiles.get(candidate).cloned().or_else(|| {
-        let key = dynamic_profile_runtime_key(state, candidate)?;
+    let dynamic = dynamic_profile_runtime_key(state, candidate).and_then(|key| {
         dynamic_profile_runtimes()
-            .try_read()
-            .ok()
-            .and_then(|runtimes| runtimes.get(&key).cloned())
-    })
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&key)
+            .cloned()
+    });
+    dynamic.or_else(|| state.profiles.get(candidate).cloned())
 }
 
 fn dynamic_profile_runtimes() -> &'static DynamicProfileRuntimeMap {
     static RUNTIMES: OnceLock<DynamicProfileRuntimeMap> = OnceLock::new();
-    RUNTIMES.get_or_init(|| tokio::sync::RwLock::new(HashMap::new()))
+    RUNTIMES.get_or_init(|| std::sync::RwLock::new(HashMap::new()))
 }
 
 fn dynamic_profile_runtime_key(state: &AppState, profile_id: &str) -> Option<String> {
@@ -10893,18 +10873,23 @@ async fn ensure_session_profile_runtime(
     active_profile_id: Option<&str>,
 ) -> Result<Option<Arc<crate::runtime::ProfileRuntime>>, RpcError> {
     let profile_id = active_profile_id.unwrap_or(MAIN_PROFILE_ID);
-    if let Some(runtime) = state.profiles.get(profile_id) {
-        return Ok(Some(runtime.clone()));
-    }
     let Some(store) = state.profile_store.as_ref() else {
-        return Ok(None);
+        return Ok(state.profiles.get(profile_id).cloned());
     };
     let Some(key) = dynamic_profile_runtime_key(state, profile_id) else {
         return Ok(None);
     };
 
-    if let Some(runtime) = dynamic_profile_runtimes().read().await.get(&key).cloned() {
+    if let Some(runtime) = dynamic_profile_runtimes()
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(&key)
+        .cloned()
+    {
         return Ok(Some(runtime));
+    }
+    if let Some(runtime) = state.profiles.get(profile_id) {
+        return Ok(Some(runtime.clone()));
     }
 
     let profile = store
@@ -10947,12 +10932,37 @@ async fn ensure_session_profile_runtime(
         );
     }
 
-    let mut runtimes = dynamic_profile_runtimes().write().await;
+    let mut runtimes = dynamic_profile_runtimes()
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let runtime = runtimes
         .entry(key)
         .or_insert_with(|| runtime.clone())
         .clone();
     Ok(Some(runtime))
+}
+
+async fn rebuild_profile_runtime_after_skill_mutation(
+    state: &Arc<AppState>,
+    profile_id: &str,
+) -> Result<(), RpcError> {
+    let Some(current) = ensure_session_profile_runtime(state, Some(profile_id)).await? else {
+        return Ok(());
+    };
+    let replacement = current.rebuild_plugin_layer().await.map_err(|error| {
+        runtime_unavailable_error(format!(
+            "failed to rebuild profile runtime after skill mutation: {error}"
+        ))
+    })?;
+    let key = dynamic_profile_runtime_key(state, profile_id).ok_or_else(|| {
+        runtime_unavailable_error("profile runtime catalog is unavailable for skill mutation")
+    })?;
+    dynamic_profile_runtimes()
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(key, replacement);
+    state.session_cache.invalidate_profile(profile_id).await;
+    Ok(())
 }
 
 /// Resolve the canonical `SessionManager` handle for read operations
@@ -28065,6 +28075,323 @@ ignore = []
         assert!(listed["skills"].as_array().unwrap().is_empty());
     }
 
+    #[cfg(unix)]
+    fn write_action_skill_fixture(source: &Path, version: u8) {
+        use std::os::unix::fs::PermissionsExt;
+
+        std::fs::create_dir_all(source).unwrap();
+        std::fs::write(
+            source.join("SKILL.md"),
+            format!("---\nname: lifecycle-skill\nversion: {version}.0.0\n---\n# Lifecycle skill\n"),
+        )
+        .unwrap();
+        let tool = format!("lifecycle_tool_v{version}");
+        let action = format!("document.version{version}");
+        std::fs::write(
+            source.join("manifest.json"),
+            serde_json::to_vec_pretty(&json!({
+                "name": "lifecycle-skill",
+                "version": format!("{version}.0.0"),
+                "tools": [{
+                    "name": tool,
+                    "description": format!("Lifecycle tool version {version}"),
+                    "input_schema": {"type": "object", "properties": {}}
+                }],
+                "actions": [{
+                    "id": action,
+                    "label": format!("Version {version}"),
+                    "binding": {"type": "tool", "tool": tool}
+                }]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let executable = source.join("lifecycle-skill");
+        std::fs::write(
+            &executable,
+            format!("#!/bin/sh\necho '{{\"success\":true,\"output\":\"version {version}\"}}'"),
+        )
+        .unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn should_refresh_actions_after_install_force_replace_and_remove() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(crate::profiles::ProfileStore::open(dir.path()).unwrap());
+        let profile_id = "skill-lifecycle";
+        let profile = crate::profiles::UserProfile {
+            id: profile_id.to_string(),
+            name: "Skill lifecycle".to_string(),
+            enabled: true,
+            data_dir: None,
+            parent_id: None,
+            public_subdomain: None,
+            config: crate::profiles::ProfileConfig {
+                gateway: crate::profiles::GatewaySettings::default(),
+                llm: Some(crate::profiles::LlmProfileConfig {
+                    primary: Some(crate::profiles::LlmModelSelectionConfig {
+                        family_id: Some("openai".to_string()),
+                        model_id: Some("gpt-4o-mini".to_string()),
+                        route: Some(crate::profiles::LlmRouteConfig {
+                            api_key_env: Some("LIFECYCLE_TEST_API_KEY".to_string()),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }),
+                    fallbacks: Vec::new(),
+                }),
+                env_vars: HashMap::from([(
+                    "LIFECYCLE_TEST_API_KEY".to_string(),
+                    "test-key-sk-fake".to_string(),
+                )]),
+                ..Default::default()
+            },
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        store.save(&profile).unwrap();
+        let profile_data_dir = store.resolve_data_dir(&profile);
+        let runtime = crate::runtime::ProfileRuntime::bootstrap(
+            &profile,
+            &profile_data_dir,
+            Some(dir.path()),
+            crate::runtime::BootstrapRole::Serve,
+        )
+        .await
+        .unwrap();
+        let mut profiles = HashMap::new();
+        profiles.insert(profile_id.to_string(), runtime);
+        let state = Arc::new(AppState {
+            profiles,
+            profile_store: Some(store),
+            ..AppState::empty_for_tests()
+        });
+        let session_id =
+            SessionKey::with_profile_topic(profile_id, "local", "skill-actions", "documents");
+        let list_request = RpcRequest::new(
+            "list-actions",
+            APPUI_METHOD_SKILL_ACTION_LIST,
+            json!({"profile_id": profile_id, "session_id": session_id.clone()}),
+        );
+        let source = dir.path().join("lifecycle-skill");
+
+        write_action_skill_fixture(&source, 1);
+        let install_v1 = RpcRequest::new(
+            "install-v1",
+            APPUI_METHOD_PROFILE_SKILLS_INSTALL,
+            json!({
+                "profile_id": profile_id,
+                "repo": source.to_string_lossy(),
+                "force": true
+            }),
+        );
+        raw_profile_skills_install(&state, &install_v1, None)
+            .await
+            .unwrap();
+        let listed_v1 = raw_skill_action_list(&state, &list_request, None)
+            .await
+            .unwrap();
+        assert_eq!(listed_v1["count"], json!(1));
+        assert_eq!(listed_v1["actions"][0]["id"], json!("document.version1"));
+        assert!(
+            listed_v1["actions"][0].get("skill_dir").is_none(),
+            "skill/action/list must not expose the absolute plugin directory"
+        );
+        assert!(
+            !listed_v1
+                .to_string()
+                .contains(source.to_string_lossy().as_ref()),
+            "skill/action/list must not disclose the canonical host plugin path"
+        );
+
+        let current_runtime = ensure_session_profile_runtime(&state, Some(profile_id))
+            .await
+            .unwrap()
+            .unwrap();
+        let cached_session = state
+            .session_cache
+            .get_or_init(&current_runtime, session_id.clone(), None)
+            .await
+            .unwrap();
+        assert!(
+            Arc::ptr_eq(&cached_session.profile, &current_runtime),
+            "a session opened after install must use the replacement profile runtime"
+        );
+
+        write_action_skill_fixture(&source, 2);
+        let install_v2 = RpcRequest::new(
+            "install-v2",
+            APPUI_METHOD_PROFILE_SKILLS_INSTALL,
+            json!({
+                "profile_id": profile_id,
+                "repo": source.to_string_lossy(),
+                "force": true
+            }),
+        );
+        raw_profile_skills_install(&state, &install_v2, None)
+            .await
+            .unwrap();
+        let listed_v2 = raw_skill_action_list(&state, &list_request, None)
+            .await
+            .unwrap();
+        assert_eq!(listed_v2["count"], json!(1));
+        assert_eq!(listed_v2["actions"][0]["id"], json!("document.version2"));
+        assert!(listed_v2.to_string().find("document.version1").is_none());
+
+        let remove = RpcRequest::new(
+            "remove",
+            APPUI_METHOD_PROFILE_SKILLS_REMOVE,
+            json!({"profile_id": profile_id, "name": "lifecycle-skill"}),
+        );
+        raw_profile_skills_remove(&state, &remove, None)
+            .await
+            .unwrap();
+        let listed_removed = raw_skill_action_list(&state, &list_request, None)
+            .await
+            .unwrap();
+        assert_eq!(listed_removed["count"], json!(0));
+
+        let invoke_removed = RpcRequest::new(
+            "invoke-removed",
+            APPUI_METHOD_SKILL_ACTION_INVOKE,
+            json!({
+                "profile_id": profile_id,
+                "session_id": session_id,
+                "action_id": "lifecycle-skill/document.version2",
+                "arguments": {}
+            }),
+        );
+        assert!(
+            raw_skill_action_invoke(
+                &state,
+                &Arc::new(UiProtocolLedger::new(16)),
+                &invoke_removed,
+                None,
+            )
+            .await
+            .is_err()
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn should_keep_current_runtime_when_force_install_cannot_reload_plugin() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(crate::profiles::ProfileStore::open(dir.path()).unwrap());
+        let profile_id = "reload-failure";
+        let profile = crate::profiles::UserProfile {
+            id: profile_id.to_string(),
+            name: "Reload failure".to_string(),
+            enabled: true,
+            data_dir: None,
+            parent_id: None,
+            public_subdomain: None,
+            config: crate::profiles::ProfileConfig {
+                gateway: crate::profiles::GatewaySettings::default(),
+                llm: Some(crate::profiles::LlmProfileConfig {
+                    primary: Some(crate::profiles::LlmModelSelectionConfig {
+                        family_id: Some("openai".to_string()),
+                        model_id: Some("gpt-4o-mini".to_string()),
+                        route: Some(crate::profiles::LlmRouteConfig {
+                            api_key_env: Some("RELOAD_FAILURE_TEST_API_KEY".to_string()),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }),
+                    fallbacks: Vec::new(),
+                }),
+                env_vars: HashMap::from([(
+                    "RELOAD_FAILURE_TEST_API_KEY".to_string(),
+                    "test-key-sk-fake".to_string(),
+                )]),
+                ..Default::default()
+            },
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        store.save(&profile).unwrap();
+        let profile_data_dir = store.resolve_data_dir(&profile);
+        let runtime = crate::runtime::ProfileRuntime::bootstrap(
+            &profile,
+            &profile_data_dir,
+            Some(dir.path()),
+            crate::runtime::BootstrapRole::Serve,
+        )
+        .await
+        .unwrap();
+        let mut profiles = HashMap::new();
+        profiles.insert(profile_id.to_string(), runtime);
+        let state = Arc::new(AppState {
+            profiles,
+            profile_store: Some(store),
+            ..AppState::empty_for_tests()
+        });
+        let source = dir.path().join("lifecycle-skill");
+
+        write_action_skill_fixture(&source, 1);
+        let install_v1 = RpcRequest::new(
+            "install-v1",
+            APPUI_METHOD_PROFILE_SKILLS_INSTALL,
+            json!({
+                "profile_id": profile_id,
+                "repo": source.to_string_lossy(),
+                "force": true
+            }),
+        );
+        raw_profile_skills_install(&state, &install_v1, None)
+            .await
+            .unwrap();
+        let current = ensure_session_profile_runtime(&state, Some(profile_id))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(current.tool_specs.get("lifecycle_tool_v1").is_some());
+
+        std::fs::remove_file(source.join("lifecycle-skill")).unwrap();
+        std::fs::write(
+            source.join("manifest.json"),
+            r#"{
+                "name": "lifecycle-skill",
+                "version": "2.0.0",
+                "tools": [{
+                    "name": "broken_reload_tool",
+                    "description": "Cannot be loaded without an executable",
+                    "input_schema": {"type": "object", "properties": {}}
+                }]
+            }"#,
+        )
+        .unwrap();
+        let failed_force_install = RpcRequest::new(
+            "install-broken-v2",
+            APPUI_METHOD_PROFILE_SKILLS_INSTALL,
+            json!({
+                "profile_id": profile_id,
+                "repo": source.to_string_lossy(),
+                "force": true
+            }),
+        );
+        let error = raw_profile_skills_install(&state, &failed_force_install, None)
+            .await
+            .expect_err("a plugin loader failure must reject the mutation");
+
+        assert_eq!(
+            error.data.as_ref().and_then(|data| data.get("kind")),
+            Some(&json!("runtime_unavailable"))
+        );
+        let after_failure = ensure_session_profile_runtime(&state, Some(profile_id))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            Arc::ptr_eq(&current, &after_failure),
+            "failed reload must leave the prior runtime published"
+        );
+        assert!(after_failure.tool_specs.get("lifecycle_tool_v1").is_some());
+        assert!(after_failure.tool_specs.get("broken_reload_tool").is_none());
+    }
+
     #[test]
     fn profile_skills_appui_rejects_cross_profile_under_authenticated_connection() {
         let dir = tempfile::tempdir().unwrap();
@@ -28148,61 +28475,261 @@ ignore = []
         }
     }
 
-    #[test]
-    fn skill_action_discovery_loads_manifest_actions_for_registered_tools() {
+    #[tokio::test]
+    async fn appui_skill_action_should_not_list_or_invoke_on_disk_only_manifest() {
         let dir = tempfile::tempdir().unwrap();
         let skills_dir = dir.path().join("skills");
-        let source_skill = skills_dir.join("mofa-notebook-source");
-        let missing_skill = skills_dir.join("missing-tool-skill");
-        std::fs::create_dir_all(&source_skill).unwrap();
-        std::fs::create_dir_all(&missing_skill).unwrap();
+        let rejected_skill = skills_dir.join("rejected-on-disk");
+        std::fs::create_dir_all(&rejected_skill).unwrap();
         std::fs::write(
-            source_skill.join("manifest.json"),
+            rejected_skill.join("manifest.json"),
             r#"{
-                "name": "mofa-notebook-source",
+                "name": "rejected-on-disk",
                 "version": "0.1.0",
-                "tools": [{"name": "source_import", "description": "Import source"}],
+                "tools": [{
+                    "name": "list_dir",
+                    "description": "Pretend to own a built-in tool",
+                    "input_schema": {"type": "object", "properties": {}}
+                }],
                 "actions": [{
-                    "id": "source.import",
-                    "label": "Add source",
-                    "surfaces": ["studio.sources"],
-                    "binding": {
-                        "type": "tool",
-                        "tool": "source_import",
-                        "input_mode": "file_each",
-                        "file_argument": "path"
-                    }
+                    "id": "filesystem.list",
+                    "label": "List files",
+                    "binding": {"type": "tool", "tool": "list_dir"}
                 }]
             }"#,
         )
         .unwrap();
-        std::fs::write(
-            missing_skill.join("manifest.json"),
-            r#"{
-                "name": "missing-tool-skill",
-                "version": "0.1.0",
-                "actions": [{
-                    "id": "missing.run",
-                    "label": "Missing",
-                    "surfaces": ["studio.sources"],
-                    "binding": { "type": "tool", "tool": "missing_tool" }
-                }]
-            }"#,
+
+        let profile_id = "action-test";
+        let profile_data_dir = dir.path().join("profiles").join(profile_id).join("data");
+        let mut profile_runtime = make_m11e_profile_with_llm_and_sandbox(
+            profile_id,
+            &profile_data_dir,
+            Arc::new(M11EStubLlm),
+            octos_agent::SandboxConfig::default(),
         )
-        .unwrap();
-        let mut registry = octos_agent::ToolRegistry::new();
-        registry.register(CaptureActionTool {
-            calls: Arc::new(StdMutex::new(Vec::new())),
+        .await;
+        Arc::get_mut(&mut profile_runtime)
+            .unwrap()
+            .plugin_dirs
+            .push(skills_dir);
+        assert!(profile_runtime.tool_specs.get("list_dir").is_some());
+
+        let mut profiles = HashMap::new();
+        profiles.insert(profile_id.to_string(), profile_runtime);
+        let state = Arc::new(AppState {
+            profiles,
+            sessions: Some(Arc::new(tokio::sync::Mutex::new(
+                octos_bus::SessionManager::open(dir.path()).unwrap(),
+            ))),
+            ..AppState::empty_for_tests()
         });
+        let session_id =
+            SessionKey::with_profile_topic(profile_id, "local", "skill-actions", "filesystem");
+        let list_request = RpcRequest::new(
+            "action-list",
+            APPUI_METHOD_SKILL_ACTION_LIST,
+            json!({"profile_id": profile_id, "session_id": session_id.clone()}),
+        );
+        let listed = raw_skill_action_list(&state, &list_request, None)
+            .await
+            .unwrap();
+        let invoke_request = RpcRequest::new(
+            "action-invoke",
+            APPUI_METHOD_SKILL_ACTION_INVOKE,
+            json!({
+                "profile_id": profile_id,
+                "session_id": session_id,
+                "action_id": "rejected-on-disk/filesystem.list",
+                "arguments": {"path": "."}
+            }),
+        );
+        let invoked = raw_skill_action_invoke(
+            &state,
+            &Arc::new(UiProtocolLedger::new(16)),
+            &invoke_request,
+            None,
+        )
+        .await;
 
-        let records =
-            discover_skill_action_records(&[skills_dir], &registry, Some("studio.sources"), &[])
-                .unwrap();
+        assert_eq!(listed["count"], json!(0));
+        assert!(invoked.is_err());
+    }
 
-        assert_eq!(records.len(), 1);
-        assert_eq!(records[0].skill_id, "mofa-notebook-source");
-        assert_eq!(records[0].action.id, "source.import");
-        assert!(records[0].available);
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn appui_skill_action_lists_and_invokes_canonical_profile_action() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let skills_dir = dir.path().join("skills");
+        let plugin_dir = skills_dir.join("trusted-action-plugin");
+        std::fs::create_dir_all(&plugin_dir).unwrap();
+        std::fs::write(
+            plugin_dir.join("manifest.json"),
+            r#"{
+                "name": "trusted-action-plugin",
+                "version": "1.0.0",
+                "tools": [{
+                    "name": "trusted_action_tool",
+                    "description": "Trusted action tool",
+                    "input_schema": {"type": "object", "properties": {}}
+                }],
+                "actions": [{
+                    "id": "document.open",
+                    "label": "Open document",
+                    "description": "Open a document through the trusted tool",
+                    "tags": ["trusted", "documents"],
+                    "surfaces": ["studio.documents"],
+                    "input_schema": {"type": "object", "properties": {}},
+                    "ui_schema": {"icon": "file"},
+                    "binding": {"type": "tool", "tool": "trusted_action_tool"}
+                }]
+            }"#,
+        )
+        .unwrap();
+        let executable = plugin_dir.join("trusted-action-plugin");
+        std::fs::write(
+            &executable,
+            "#!/bin/sh\necho '{\"output\":\"trusted action executed\",\"success\":true}'",
+        )
+        .unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let profile_id = "trusted-action-profile";
+        let profile_data_dir = dir.path().join("profiles").join(profile_id).join("data");
+        let mut profile_runtime = make_m11e_profile_with_llm_and_sandbox(
+            profile_id,
+            &profile_data_dir,
+            Arc::new(M11EStubLlm),
+            octos_agent::SandboxConfig::default(),
+        )
+        .await;
+        let runtime = Arc::get_mut(&mut profile_runtime).unwrap();
+        let load_result = octos_agent::PluginLoader::load_into(
+            Arc::get_mut(&mut runtime.tool_specs).unwrap(),
+            &[skills_dir.clone()],
+            &[],
+        )
+        .unwrap();
+        runtime.skill_actions = load_result.loaded_actions;
+        runtime.plugin_dirs.push(skills_dir);
+        assert_eq!(runtime.skill_actions.len(), 1);
+
+        let mut profiles = HashMap::new();
+        profiles.insert(profile_id.to_string(), profile_runtime);
+        let state = Arc::new(AppState {
+            profiles,
+            sessions: Some(Arc::new(tokio::sync::Mutex::new(
+                octos_bus::SessionManager::open(dir.path()).unwrap(),
+            ))),
+            ..AppState::empty_for_tests()
+        });
+        let session_id =
+            SessionKey::with_profile_topic(profile_id, "local", "skill-actions", "documents");
+        let list_request = RpcRequest::new(
+            "action-list",
+            APPUI_METHOD_SKILL_ACTION_LIST,
+            json!({
+                "profile_id": profile_id,
+                "session_id": session_id.clone(),
+                "surface": "studio.documents",
+                "tags": ["trusted", "documents"]
+            }),
+        );
+        let listed = raw_skill_action_list(&state, &list_request, None)
+            .await
+            .unwrap();
+        assert_eq!(listed["count"], json!(1));
+        assert_eq!(listed["actions"][0]["id"], json!("document.open"));
+        assert_eq!(
+            listed["actions"][0]["skill_id"],
+            json!("trusted-action-plugin")
+        );
+        assert_eq!(
+            listed["actions"][0]["description"],
+            json!("Open a document through the trusted tool")
+        );
+        assert_eq!(listed["actions"][0]["ui_schema"], json!({"icon": "file"}));
+        assert!(listed["actions"][0].get("skill_dir").is_none());
+        assert!(
+            !listed
+                .to_string()
+                .contains(plugin_dir.to_string_lossy().as_ref()),
+            "action-list response must not disclose the canonical host plugin path"
+        );
+
+        let invoke_request = RpcRequest::new(
+            "action-invoke",
+            APPUI_METHOD_SKILL_ACTION_INVOKE,
+            json!({
+                "profile_id": profile_id,
+                "session_id": session_id,
+                "action_id": "trusted-action-plugin/document.open",
+                "arguments": {}
+            }),
+        );
+        let invoked = raw_skill_action_invoke(
+            &state,
+            &Arc::new(UiProtocolLedger::new(16)),
+            &invoke_request,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(invoked["action_id"], json!("document.open"));
+        assert_eq!(invoked["ok"], json!(true));
+        assert_eq!(
+            invoked["results"][0]["output"],
+            json!("trusted action executed")
+        );
+    }
+
+    #[test]
+    fn skill_action_should_resolve_unqualified_id_only_when_exactly_one_matches() {
+        let definition = |id: &str| {
+            serde_json::from_value(json!({
+                "id": id,
+                "label": "Open",
+                "binding": {"type": "tool", "tool": "source_import"}
+            }))
+            .unwrap()
+        };
+        let records = vec![
+            SkillActionRecord {
+                skill_id: "documents-a".to_string(),
+                action: definition("document.open"),
+                available: true,
+                unavailable_reason: None,
+            },
+            SkillActionRecord {
+                skill_id: "documents-b".to_string(),
+                action: definition("document.open"),
+                available: true,
+                unavailable_reason: None,
+            },
+            SkillActionRecord {
+                skill_id: "documents-b".to_string(),
+                action: definition("document.close"),
+                available: true,
+                unavailable_reason: None,
+            },
+        ];
+
+        assert!(resolve_skill_action_record(&records, "document.open").is_none());
+        assert_eq!(
+            resolve_skill_action_record(&records, "documents-a/document.open")
+                .unwrap()
+                .skill_id,
+            "documents-a"
+        );
+        assert_eq!(
+            resolve_skill_action_record(&records, "document.close")
+                .unwrap()
+                .skill_id,
+            "documents-b"
+        );
+        assert!(resolve_skill_action_record(&records, "missing/document.open").is_none());
     }
 
     #[tokio::test]
@@ -42243,6 +42770,8 @@ ignore = []
             max_iterations: None,
             tool_specs: Arc::new(base_tools),
             plugin_tool_names: Vec::new(),
+            skill_actions: Vec::new(),
+            plugin_reload: None,
             plugin_dirs: Vec::new(),
             plugin_prompt_fragments: Vec::new(),
             plugin_hooks: Vec::new(),
@@ -42261,6 +42790,7 @@ ignore = []
             memory_refresh: None,
             tool_config,
             cron_service: None,
+            runtime_lifecycle: None,
             pipeline_factory: None,
             hook_executor: None,
             lane_routing: None,

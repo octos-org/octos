@@ -138,7 +138,9 @@ pub use memory_segment::{
     MEMORY_CAPTURE_POLICY, MEMORY_SEGMENT_NAME, MemorySegmentProvider, compose_memory_segment,
 };
 pub use permissions::{InvalidSafetyTier, SafetyTier};
-pub use plugins::{PluginLoadOptions, PluginLoadResult, PluginLoader, SynthesisConfig};
+pub use plugins::{
+    PluginLoadError, PluginLoadOptions, PluginLoadResult, PluginLoader, SynthesisConfig,
+};
 pub use policy::{
     ApprovalPolicy, EffectivePermissions, FileAccessMode, FilesystemScope, NetworkPolicy,
     PermissionProfile, PermissionProfileError, RuntimeMode,

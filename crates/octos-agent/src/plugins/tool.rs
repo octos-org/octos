@@ -159,6 +159,11 @@ impl PluginTool {
         }
     }
 
+    /// Name of the plugin that declared this tool.
+    pub fn plugin_name(&self) -> &str {
+        &self.plugin_name
+    }
+
     /// yolo GAP #2: set the runtime approval behavior for the manifest risk
     /// gate. Threaded from the session's
     /// [`EffectivePermissions::approval_policy`](crate::policy::EffectivePermissions),

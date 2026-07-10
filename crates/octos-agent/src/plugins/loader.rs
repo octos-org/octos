@@ -14,7 +14,9 @@ use crate::sandbox::BLOCKED_ENV_VARS;
 use crate::tools::{MakeTypeEntry, Tool, ToolRegistry};
 
 use super::extras::{SKILL_EXPLORATION_PREAMBLE, SkillExtras, resolve_extras};
-use super::manifest::{ConcurrencyClassClassification, PluginManifest, PluginToolDef};
+use super::manifest::{
+    ConcurrencyClassClassification, PluginManifest, PluginToolDef, SkillActionDef,
+};
 use super::tool::{PluginTool, SynthesisConfig};
 
 const MAX_EXECUTABLE_SIZE: u64 = 100_000_000;
@@ -36,6 +38,9 @@ pub struct PluginLoadResult {
     pub tool_count: usize,
     /// Names of all tools registered by plugins.
     pub tool_names: Vec<String>,
+    /// UI-callable actions whose bindings were validated against tools loaded
+    /// from the same accepted plugin manifest.
+    pub loaded_actions: Vec<LoadedSkillAction>,
     /// MCP server configs resolved from skill manifests.
     pub mcp_servers: Vec<McpServerConfig>,
     /// Hook configs resolved from skill manifests.
@@ -49,6 +54,44 @@ pub struct PluginLoadResult {
     /// means no mofa-* skills were discovered — the dispatcher is not
     /// registered (avoids publishing an unusable tool).
     pub make_type_entries: Vec<MakeTypeEntry>,
+    /// Individual plugins rejected during an otherwise best-effort load.
+    /// Legacy startup callers continue with successfully loaded plugins;
+    /// mutation-time rebuilds may fail closed on this structured record.
+    pub plugin_errors: Vec<PluginLoadError>,
+}
+
+/// A plugin-specific failure observed by the aggregating loader.
+#[derive(Debug, Clone)]
+pub struct PluginLoadError {
+    /// Directory of the rejected plugin.
+    pub plugin_dir: PathBuf,
+    /// Sanitized display message for diagnostics and strict callers.
+    pub message: String,
+}
+
+/// A UI action trusted by the canonical plugin loader.
+#[derive(Debug, Clone)]
+pub struct LoadedSkillAction {
+    /// Plugin that declared and owns the action.
+    pub plugin_name: String,
+    /// Skill directory recorded by the canonical loader.
+    pub plugin_dir: PathBuf,
+    /// Validated manifest action definition.
+    pub definition: SkillActionDef,
+    /// Successfully loaded tool owned by the same plugin.
+    pub tool_name: String,
+}
+
+impl LoadedSkillAction {
+    /// Whether the current registry still contains the plugin tool that this
+    /// action was registered against. Registries may be rebound or extended
+    /// after loading, so name presence alone is not sufficient.
+    pub fn is_bound_to_registry(&self, registry: &ToolRegistry) -> bool {
+        registry
+            .get(&self.tool_name)
+            .and_then(|tool| tool.as_any().downcast_ref::<PluginTool>())
+            .is_some_and(|tool| tool.plugin_name() == self.plugin_name)
+    }
 }
 
 struct LoadedPluginTool {
@@ -225,9 +268,15 @@ impl PluginLoader {
         // through actual invocation. Preserving that behaviour avoids
         // silently dropping skills on hosts where a probe disagrees with
         // reality. We may tighten this in a follow-up.
-        let discovered = octos_plugin::discover_plugins(&sources, &extra_env_map);
+        let discovery = octos_plugin::discover_plugins_with_errors(&sources, &extra_env_map);
+        result
+            .plugin_errors
+            .extend(discovery.errors.into_iter().map(|error| PluginLoadError {
+                plugin_dir: error.plugin_dir,
+                message: error.message,
+            }));
 
-        for plugin in discovered {
+        for plugin in discovery.plugins {
             let path = plugin.path;
             // Re-parse via the agent-side manifest type below: octos_plugin's
             // PluginManifest is a structural subset and doesn't model
@@ -235,7 +284,7 @@ impl PluginLoader {
             // already filtered for `manifest.json` presence, so we skip
             // re-checking and head straight into the rich load path.
             match Self::load_plugin_with_options_and_risks(&path, extra_env, options.clone()) {
-                Ok((tools, extras)) => {
+                Ok((tools, extras, actions)) => {
                     let n = tools.len();
                     let spawn_only = extras.spawn_only_tools.clone();
                     for loaded in tools {
@@ -263,9 +312,14 @@ impl PluginLoader {
                         );
                     }
                     result.tool_count += n;
+                    result.loaded_actions.extend(actions);
                     result.merge_extras(extras);
                 }
                 Err(e) => {
+                    result.plugin_errors.push(PluginLoadError {
+                        plugin_dir: path.clone(),
+                        message: e.to_string(),
+                    });
                     warn!(
                         plugin_dir = %path.display(),
                         error = %e,
@@ -274,6 +328,22 @@ impl PluginLoader {
                 }
             }
         }
+
+        // A later plugin can legally reuse a tool name, and ToolRegistry
+        // resolves that collision by replacement. Drop any action whose
+        // original owner is no longer the registered tool owner.
+        result.loaded_actions.retain(|action| {
+            let keep = action.is_bound_to_registry(registry);
+            if !keep {
+                warn!(
+                    plugin = %action.plugin_name,
+                    action = %action.definition.id,
+                    tool = %action.tool_name,
+                    "dropping action whose bound tool was replaced after plugin load"
+                );
+            }
+            keep
+        });
 
         // RFC-1 (issue #1290): after every per-plugin registration is
         // done, install the `mofa_make` dispatcher + its describe
@@ -420,7 +490,7 @@ impl PluginLoader {
         extra_env: &[(String, String)],
         options: PluginLoadOptions<'_>,
     ) -> Result<(Vec<PluginTool>, SkillExtras)> {
-        let (tools, extras) =
+        let (tools, extras, _actions) =
             Self::load_plugin_with_options_and_risks(plugin_dir, extra_env, options)?;
         Ok((
             tools.into_iter().map(|loaded| loaded.tool).collect(),
@@ -432,7 +502,7 @@ impl PluginLoader {
         plugin_dir: &Path,
         extra_env: &[(String, String)],
         options: PluginLoadOptions<'_>,
-    ) -> Result<(Vec<LoadedPluginTool>, SkillExtras)> {
+    ) -> Result<(Vec<LoadedPluginTool>, SkillExtras, Vec<LoadedSkillAction>)> {
         let work_dir = options.work_dir;
         let synthesis_config = options.synthesis_config;
         let require_signed = options.require_signed;
@@ -523,22 +593,26 @@ impl PluginLoader {
                     "loaded extras-only skill (no tools)"
                 );
             }
-            return Ok((vec![], extras));
+            return Ok((vec![], extras, vec![]));
         }
 
-        if find_plugin_executable(plugin_dir, &manifest.name).is_none() {
+        if manifest.canonical_id().trim().is_empty() {
+            eyre::bail!("plugin manifest must define a non-empty id or name");
+        }
+
+        if find_plugin_executable(plugin_dir, manifest.executable_name()).is_none() {
             let _ = ensure_plugin_executable_for_manifest(plugin_dir, &manifest)?;
         }
 
-        let executable = find_plugin_executable(plugin_dir, &manifest.name).ok_or_else(|| {
+        let executable = find_plugin_executable(plugin_dir, manifest.executable_name()).ok_or_else(|| {
             let dir_name = plugin_dir
                 .file_name()
                 .and_then(|n| n.to_str())
                 .unwrap_or("main");
             eyre::eyre!(
                 "no executable found in plugin '{}' (tried '{}', '{}', 'main', and directory scan)",
-                manifest.name,
-                manifest.name,
+                manifest.canonical_id(),
+                manifest.executable_name(),
                 dir_name
             )
         })?;
@@ -629,7 +703,7 @@ impl PluginLoader {
         // binary and compares against `load_time_hash`, which is what
         // closes the load->exec TOCTOU window in practice.
         let verified_hash_path =
-            resolve_verified_hash_path(verified_cache_dir.as_deref(), &manifest.name)?;
+            resolve_verified_hash_path(verified_cache_dir.as_deref(), manifest.canonical_id())?;
         if let Some(parent) = verified_hash_path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| {
                 eyre::eyre!("cannot create verified cache dir {}: {e}", parent.display())
@@ -693,7 +767,7 @@ impl PluginLoader {
             })
             .collect();
 
-        let plugin_name = manifest.name.clone();
+        let plugin_name = manifest.canonical_id().to_string();
         // RFC-1: snapshot the dispatcher metadata BEFORE `manifest.tools`
         // is consumed by `into_iter()` below. Resolution of the target
         // tool name uses [`PluginManifest::make_target_tool_name`] which
@@ -704,6 +778,35 @@ impl PluginLoader {
         let manifest_content_desc: Option<String> = manifest.content_type_description.clone();
         let manifest_make_target: Option<String> =
             manifest.make_target_tool_name().map(|s| s.to_string());
+        let mut action_ids = std::collections::HashSet::<String>::new();
+        // Check every raw ID before validating labels, bindings, or the
+        // declaring plugin name. Otherwise an invalid duplicate can be
+        // skipped first and leave a second declaration ambiguously active.
+        for definition in &manifest.actions {
+            if !action_ids.insert(definition.id.clone()) {
+                eyre::bail!(
+                    "plugin '{}' rejected: duplicate action id '{}'",
+                    manifest.name,
+                    definition.id
+                );
+            }
+        }
+        let action_name_is_valid = if manifest.actions.is_empty() {
+            true
+        } else {
+            match manifest.validate_for_action_registration() {
+                Ok(()) => true,
+                Err(error) => {
+                    warn!(
+                        plugin = %manifest.name,
+                        %error,
+                        "skipping actions with invalid plugin identity"
+                    );
+                    false
+                }
+            }
+        };
+        let manifest_actions = manifest.actions;
 
         let tools: Vec<LoadedPluginTool> = manifest
             .tools
@@ -799,6 +902,43 @@ impl PluginLoader {
             })
             .collect();
 
+        let mut actions = Vec::new();
+        if action_name_is_valid {
+            let loaded_tool_names: std::collections::HashSet<&str> =
+                tools.iter().map(|loaded| loaded.tool.name()).collect();
+            for definition in manifest_actions {
+                if let Err(error) = definition.validate_for_registration() {
+                    warn!(
+                        plugin = %plugin_name,
+                        action = %definition.id,
+                        %error,
+                        "skipping plugin action with invalid manifest field"
+                    );
+                    continue;
+                }
+                let tool_name = definition
+                    .binding
+                    .tool_name()
+                    .unwrap_or_default()
+                    .to_string();
+                if !loaded_tool_names.contains(tool_name.as_str()) {
+                    warn!(
+                        plugin = %plugin_name,
+                        action = %definition.id,
+                        tool = %tool_name,
+                        "skipping plugin action whose bound tool was not loaded from the same plugin"
+                    );
+                    continue;
+                }
+                actions.push(LoadedSkillAction {
+                    plugin_name: plugin_name.clone(),
+                    plugin_dir: plugin_dir.to_path_buf(),
+                    definition,
+                    tool_name,
+                });
+            }
+        }
+
         // Return extras with spawn_only info
         extras.spawn_only_tools = spawn_only_names;
         extras.spawn_only_messages = spawn_only_msgs;
@@ -852,7 +992,7 @@ impl PluginLoader {
             }
         }
 
-        Ok((tools, extras))
+        Ok((tools, extras, actions))
     }
 }
 
@@ -932,7 +1072,7 @@ fn ensure_plugin_executable_for_manifest(
     if manifest.tools.is_empty() {
         return Ok(false);
     }
-    if find_plugin_executable(plugin_dir, &manifest.name).is_some() {
+    if find_plugin_executable(plugin_dir, manifest.executable_name()).is_some() {
         return Ok(false);
     }
     if manifest
@@ -1160,6 +1300,19 @@ fn is_executable(path: &Path) -> bool {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    fn write_test_plugin_executable(plugin_dir: &Path, plugin_name: &str) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let executable = plugin_dir.join(plugin_name);
+        std::fs::write(
+            &executable,
+            "#!/bin/sh\necho '{\"output\":\"ok\",\"success\":true}'",
+        )
+        .unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
     #[test]
     fn test_load_nonexistent_dir() {
         let mut registry = ToolRegistry::new();
@@ -1176,6 +1329,536 @@ mod tests {
         let result =
             PluginLoader::load_into(&mut registry, &[dir.path().to_path_buf()], &[]).unwrap();
         assert_eq!(result.tool_count, 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn should_register_action_for_successfully_loaded_owned_tool() {
+        let dir = tempfile::tempdir().unwrap();
+        let plugin_dir = dir.path().join("action-owner");
+        std::fs::create_dir(&plugin_dir).unwrap();
+        std::fs::write(
+            plugin_dir.join("manifest.json"),
+            r#"{
+                "name": "action-owner",
+                "version": "1.0",
+                "tools": [{
+                    "name": "owned_tool",
+                    "description": "Owned tool",
+                    "input_schema": {"type": "object", "properties": {}}
+                }],
+                "actions": [{
+                    "id": "document.open",
+                    "label": "Open document",
+                    "binding": {"type": "tool", "tool": "owned_tool"}
+                }]
+            }"#,
+        )
+        .unwrap();
+        write_test_plugin_executable(&plugin_dir, "action-owner");
+
+        let mut registry = ToolRegistry::new();
+        let result =
+            PluginLoader::load_into(&mut registry, &[dir.path().to_path_buf()], &[]).unwrap();
+
+        assert_eq!(result.loaded_actions.len(), 1);
+        assert_eq!(result.loaded_actions[0].plugin_name, "action-owner");
+        assert_eq!(result.loaded_actions[0].definition.id, "document.open");
+        assert_eq!(result.loaded_actions[0].tool_name, "owned_tool");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn should_register_nothing_when_same_root_duplicate_has_richer_validation_failure() {
+        let root = tempfile::tempdir().unwrap();
+        let valid_dir = root.path().join("a-valid-copy");
+        let invalid_dir = root.path().join("z-invalid-copy");
+        std::fs::create_dir(&valid_dir).unwrap();
+        std::fs::create_dir(&invalid_dir).unwrap();
+
+        std::fs::write(
+            valid_dir.join("manifest.json"),
+            r#"{
+                "name": "duplicate-owner",
+                "version": "1.0.0",
+                "tools": [{
+                    "name": "duplicate_owned_tool",
+                    "description": "valid sibling tool",
+                    "input_schema": {"type": "object", "properties": {}}
+                }],
+                "actions": [{
+                    "id": "document.open",
+                    "label": "Open",
+                    "binding": {"type": "tool", "tool": "duplicate_owned_tool"}
+                }]
+            }"#,
+        )
+        .unwrap();
+        write_test_plugin_executable(&valid_dir, "a-valid-copy");
+
+        // Discovery accepts this structural subset, while the richer agent
+        // manifest rejects the unsupported action execution value.
+        std::fs::write(
+            invalid_dir.join("manifest.json"),
+            r#"{
+                "name": "duplicate-owner",
+                "version": "2.0.0",
+                "tools": [{
+                    "name": "invalid_duplicate_tool",
+                    "description": "invalid sibling tool",
+                    "input_schema": {"type": "object", "properties": {}}
+                }],
+                "actions": [{
+                    "id": "document.open",
+                    "label": "Open",
+                    "execution": "unsupported",
+                    "binding": {"type": "tool", "tool": "invalid_duplicate_tool"}
+                }]
+            }"#,
+        )
+        .unwrap();
+        write_test_plugin_executable(&invalid_dir, "z-invalid-copy");
+
+        let mut registry = ToolRegistry::new();
+        let loaded =
+            PluginLoader::load_into(&mut registry, &[root.path().to_path_buf()], &[]).unwrap();
+
+        assert_eq!(loaded.tool_count, 0);
+        assert!(loaded.tool_names.is_empty());
+        assert!(loaded.loaded_actions.is_empty());
+        assert!(registry.get("duplicate_owned_tool").is_none());
+        assert!(registry.get("invalid_duplicate_tool").is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn should_block_lower_priority_copy_when_same_root_duplicate_includes_invalid_manifest() {
+        let high_priority = tempfile::tempdir().unwrap();
+        let lower_priority = tempfile::tempdir().unwrap();
+        let valid_dir = high_priority.path().join("a-valid-copy");
+        let invalid_dir = high_priority.path().join("z-invalid-copy");
+        let lower_dir = lower_priority.path().join("lower-copy");
+        std::fs::create_dir_all(&valid_dir).unwrap();
+        std::fs::create_dir_all(&invalid_dir).unwrap();
+        std::fs::create_dir_all(&lower_dir).unwrap();
+
+        for (dir, tool, schema) in [
+            (
+                &valid_dir,
+                "high_priority_tool",
+                r#"{"type":"object","properties":{}}"#,
+            ),
+            (&invalid_dir, "invalid_tool", r#"{"type":"string"}"#),
+            (
+                &lower_dir,
+                "lower_priority_tool",
+                r#"{"type":"object","properties":{}}"#,
+            ),
+        ] {
+            std::fs::write(
+                dir.join("manifest.json"),
+                format!(
+                    r#"{{"name":"duplicate-owner","version":"1.0.0","tools":[{{"name":"{tool}","description":"tool","input_schema":{schema}}}]}}"#
+                ),
+            )
+            .unwrap();
+        }
+        write_test_plugin_executable(&valid_dir, "a-valid-copy");
+        write_test_plugin_executable(&invalid_dir, "z-invalid-copy");
+        write_test_plugin_executable(&lower_dir, "lower-copy");
+
+        let mut registry = ToolRegistry::new();
+        let loaded = PluginLoader::load_into(
+            &mut registry,
+            &[
+                high_priority.path().to_path_buf(),
+                lower_priority.path().to_path_buf(),
+            ],
+            &[],
+        )
+        .unwrap();
+
+        assert_eq!(loaded.tool_count, 0);
+        assert!(loaded.tool_names.is_empty());
+        assert!(registry.get("high_priority_tool").is_none());
+        assert!(registry.get("lower_priority_tool").is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn should_reject_action_when_bound_tool_is_not_owned_by_declaring_plugin() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner_dir = dir.path().join("a-tool-owner");
+        let borrower_dir = dir.path().join("b-action-borrower");
+        std::fs::create_dir(&owner_dir).unwrap();
+        std::fs::create_dir(&borrower_dir).unwrap();
+        std::fs::write(
+            owner_dir.join("manifest.json"),
+            r#"{
+                "name": "a-tool-owner",
+                "version": "1.0",
+                "tools": [{
+                    "name": "shared_tool",
+                    "description": "Shared tool",
+                    "input_schema": {"type": "object", "properties": {}}
+                }]
+            }"#,
+        )
+        .unwrap();
+        write_test_plugin_executable(&owner_dir, "a-tool-owner");
+        std::fs::write(
+            borrower_dir.join("manifest.json"),
+            r#"{
+                "name": "b-action-borrower",
+                "version": "1.0",
+                "tools": [{
+                    "name": "borrower_tool",
+                    "description": "Borrower's own tool",
+                    "input_schema": {"type": "object", "properties": {}}
+                }],
+                "actions": [{
+                    "id": "shared.run",
+                    "label": "Run shared tool",
+                    "binding": {"type": "tool", "tool": "shared_tool"}
+                }]
+            }"#,
+        )
+        .unwrap();
+        write_test_plugin_executable(&borrower_dir, "b-action-borrower");
+
+        let mut registry = ToolRegistry::new();
+        let result =
+            PluginLoader::load_into(&mut registry, &[dir.path().to_path_buf()], &[]).unwrap();
+
+        assert_eq!(result.tool_count, 2);
+        assert!(registry.get("shared_tool").is_some());
+        assert!(registry.get("borrower_tool").is_some());
+        assert!(result.loaded_actions.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn should_reject_mixed_validity_duplicate_action_ids_before_field_validation() {
+        let dir = tempfile::tempdir().unwrap();
+        let plugin_dir = dir.path().join("mixed-duplicate-actions");
+        std::fs::create_dir(&plugin_dir).unwrap();
+        std::fs::write(
+            plugin_dir.join("manifest.json"),
+            r#"{
+                "name": "mixed-duplicate-actions",
+                "version": "1.0",
+                "tools": [{
+                    "name": "mixed_tool",
+                    "description": "Mixed validity tool",
+                    "input_schema": {"type": "object", "properties": {}}
+                }],
+                "actions": [
+                    {
+                        "id": "mixed.run",
+                        "label": "",
+                        "binding": {"type": "tool", "tool": "mixed_tool"}
+                    },
+                    {
+                        "id": "mixed.run",
+                        "label": "Run mixed tool",
+                        "binding": {"type": "tool", "tool": "mixed_tool"}
+                    }
+                ]
+            }"#,
+        )
+        .unwrap();
+        write_test_plugin_executable(&plugin_dir, "mixed-duplicate-actions");
+
+        let mut registry = ToolRegistry::new();
+        let result =
+            PluginLoader::load_into(&mut registry, &[dir.path().to_path_buf()], &[]).unwrap();
+
+        assert_eq!(result.tool_count, 0);
+        assert!(registry.get("mixed_tool").is_none());
+        assert!(result.loaded_actions.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn should_reject_actions_for_plugins_with_invalid_qualified_identity_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let cases = [
+            ("whitespace-name", " bad-name ", "whitespace_action_tool"),
+            ("control-name", "bad\nname", "control_action_tool"),
+            ("slash-name", "bad/name", "slash_action_tool"),
+        ];
+
+        for (directory, plugin_name, tool_name) in cases {
+            let plugin_dir = dir.path().join(directory);
+            std::fs::create_dir(&plugin_dir).unwrap();
+            let manifest = serde_json::json!({
+                "name": plugin_name,
+                "version": "1.0",
+                "tools": [{
+                    "name": tool_name,
+                    "description": "Action identity test tool",
+                    "input_schema": {"type": "object", "properties": {}}
+                }],
+                "actions": [{
+                    "id": "identity.check",
+                    "label": "Check identity",
+                    "binding": {"type": "tool", "tool": tool_name}
+                }]
+            });
+            std::fs::write(
+                plugin_dir.join("manifest.json"),
+                serde_json::to_vec(&manifest).unwrap(),
+            )
+            .unwrap();
+            write_test_plugin_executable(&plugin_dir, "main");
+        }
+
+        let mut registry = ToolRegistry::new();
+        let result =
+            PluginLoader::load_into(&mut registry, &[dir.path().to_path_buf()], &[]).unwrap();
+
+        assert!(result.loaded_actions.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn should_reject_action_when_a_later_plugin_replaces_the_bound_tool_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let action_root = dir.path().join("action-root");
+        let replacement_root = dir.path().join("replacement-root");
+        let action_plugin_dir = action_root.join("a-action-owner");
+        let replacement_plugin_dir = replacement_root.join("b-tool-replacement");
+        std::fs::create_dir(&action_root).unwrap();
+        std::fs::create_dir(&replacement_root).unwrap();
+        std::fs::create_dir(&action_plugin_dir).unwrap();
+        std::fs::create_dir(&replacement_plugin_dir).unwrap();
+        std::fs::write(
+            action_plugin_dir.join("manifest.json"),
+            r#"{
+                "name": "a-action-owner",
+                "version": "1.0",
+                "tools": [{
+                    "name": "shared_tool",
+                    "description": "Action owner's tool",
+                    "input_schema": {"type": "object", "properties": {}}
+                }],
+                "actions": [{
+                    "id": "owned.run",
+                    "label": "Run owned tool",
+                    "binding": {"type": "tool", "tool": "shared_tool"}
+                }]
+            }"#,
+        )
+        .unwrap();
+        write_test_plugin_executable(&action_plugin_dir, "a-action-owner");
+        std::fs::write(
+            replacement_plugin_dir.join("manifest.json"),
+            r#"{
+                "name": "b-tool-replacement",
+                "version": "1.0",
+                "tools": [{
+                    "name": "shared_tool",
+                    "description": "Replacement tool",
+                    "input_schema": {"type": "object", "properties": {}}
+                }]
+            }"#,
+        )
+        .unwrap();
+        write_test_plugin_executable(&replacement_plugin_dir, "b-tool-replacement");
+
+        let mut registry = ToolRegistry::new();
+        let result =
+            PluginLoader::load_into(&mut registry, &[action_root, replacement_root], &[]).unwrap();
+
+        assert_eq!(result.tool_count, 2);
+        assert!(result.loaded_actions.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn should_not_bind_action_to_replacement_when_distinct_ids_share_display_name_and_tool() {
+        let dir = tempfile::tempdir().unwrap();
+        let action_root = dir.path().join("action-root");
+        let replacement_root = dir.path().join("replacement-root");
+        let action_plugin_dir = action_root.join("a-action-owner");
+        let replacement_plugin_dir = replacement_root.join("b-tool-replacement");
+        std::fs::create_dir(&action_root).unwrap();
+        std::fs::create_dir(&replacement_root).unwrap();
+        std::fs::create_dir(&action_plugin_dir).unwrap();
+        std::fs::create_dir(&replacement_plugin_dir).unwrap();
+
+        std::fs::write(
+            action_plugin_dir.join("manifest.json"),
+            r#"{
+                "id": "owner-alpha",
+                "name": "shared-display-name",
+                "version": "1.0",
+                "tools": [{
+                    "name": "shared_tool",
+                    "description": "Action owner's tool",
+                    "input_schema": {"type": "object", "properties": {}}
+                }],
+                "actions": [{
+                    "id": "owned.run",
+                    "label": "Run owned tool",
+                    "binding": {"type": "tool", "tool": "shared_tool"}
+                }]
+            }"#,
+        )
+        .unwrap();
+        write_test_plugin_executable(&action_plugin_dir, "shared-display-name");
+        std::fs::write(
+            replacement_plugin_dir.join("manifest.json"),
+            r#"{
+                "id": "replacement-beta",
+                "name": "shared-display-name",
+                "version": "1.0",
+                "tools": [{
+                    "name": "shared_tool",
+                    "description": "Replacement tool",
+                    "input_schema": {"type": "object", "properties": {}}
+                }]
+            }"#,
+        )
+        .unwrap();
+        write_test_plugin_executable(&replacement_plugin_dir, "shared-display-name");
+
+        let mut registry = ToolRegistry::new();
+        let result =
+            PluginLoader::load_into(&mut registry, &[action_root, replacement_root], &[]).unwrap();
+
+        assert_eq!(
+            result.tool_count, 2,
+            "plugin errors: {:?}",
+            result.plugin_errors
+        );
+        assert!(
+            result.loaded_actions.is_empty(),
+            "an action must not remain trusted after another plugin replaces its tool"
+        );
+        let replacement = registry
+            .get("shared_tool")
+            .and_then(|tool| tool.as_any().downcast_ref::<PluginTool>())
+            .expect("replacement plugin tool should be registered");
+        assert_eq!(replacement.plugin_name(), "replacement-beta");
+    }
+
+    #[test]
+    fn should_report_manifest_rejections_discovered_before_plugin_loading() {
+        let dir = tempfile::tempdir().unwrap();
+        let plugin_dir = dir.path().join("invalid-discovery-plugin");
+        std::fs::create_dir(&plugin_dir).unwrap();
+        std::fs::write(
+            plugin_dir.join("manifest.json"),
+            r#"{
+                "id": "invalid-discovery-plugin",
+                "version": "1.0.0",
+                "tools": [{
+                    "name": "invalid_schema_tool",
+                    "description": "Invalid schema",
+                    "input_schema": {"type": "array"}
+                }]
+            }"#,
+        )
+        .unwrap();
+
+        let mut registry = ToolRegistry::new();
+        let result = PluginLoader::load_into(&mut registry, &[dir.path().to_path_buf()], &[])
+            .expect("legacy loading remains best-effort");
+
+        assert_eq!(result.plugin_errors.len(), 1);
+        assert_eq!(result.plugin_errors[0].plugin_dir, plugin_dir);
+        assert!(
+            result.plugin_errors[0]
+                .message
+                .contains("manifest validation failed")
+        );
+        assert!(registry.get("invalid_schema_tool").is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn should_not_register_actions_when_strict_signing_rejects_manifest() {
+        let dir = tempfile::tempdir().unwrap();
+        let plugin_dir = dir.path().join("unsigned-actions");
+        std::fs::create_dir(&plugin_dir).unwrap();
+        std::fs::write(
+            plugin_dir.join("manifest.json"),
+            r#"{
+                "name": "unsigned-actions",
+                "version": "1.0",
+                "tools": [{
+                    "name": "unsigned_tool",
+                    "description": "Unsigned tool",
+                    "input_schema": {"type": "object", "properties": {}}
+                }],
+                "actions": [{
+                    "id": "unsigned.run",
+                    "label": "Run unsigned tool",
+                    "binding": {"type": "tool", "tool": "unsigned_tool"}
+                }]
+            }"#,
+        )
+        .unwrap();
+        write_test_plugin_executable(&plugin_dir, "unsigned-actions");
+
+        let mut registry = ToolRegistry::new();
+        let result = PluginLoader::load_into_with_options(
+            &mut registry,
+            &[dir.path().to_path_buf()],
+            &[],
+            PluginLoadOptions {
+                require_signed: true,
+                verified_cache_dir: Some(dir.path().join("verified")),
+                ..PluginLoadOptions::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(result.tool_count, 0);
+        assert!(result.loaded_actions.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn should_reject_plugin_with_duplicate_qualified_action_ids() {
+        let dir = tempfile::tempdir().unwrap();
+        let plugin_dir = dir.path().join("duplicate-actions");
+        std::fs::create_dir(&plugin_dir).unwrap();
+        std::fs::write(
+            plugin_dir.join("manifest.json"),
+            r#"{
+                "name": "duplicate-actions",
+                "version": "1.0",
+                "tools": [{
+                    "name": "duplicate_tool",
+                    "description": "Duplicate tool",
+                    "input_schema": {"type": "object", "properties": {}}
+                }],
+                "actions": [
+                    {
+                        "id": "document.open",
+                        "label": "Open document",
+                        "binding": {"type": "tool", "tool": "duplicate_tool"}
+                    },
+                    {
+                        "id": "document.open",
+                        "label": "Open document again",
+                        "binding": {"type": "tool", "tool": "duplicate_tool"}
+                    }
+                ]
+            }"#,
+        )
+        .unwrap();
+        write_test_plugin_executable(&plugin_dir, "duplicate-actions");
+
+        let mut registry = ToolRegistry::new();
+        let result =
+            PluginLoader::load_into(&mut registry, &[dir.path().to_path_buf()], &[]).unwrap();
+
+        assert_eq!(result.tool_count, 0);
+        assert!(registry.get("duplicate_tool").is_none());
+        assert!(result.loaded_actions.is_empty());
     }
 
     #[cfg(unix)]
