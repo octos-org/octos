@@ -29,6 +29,13 @@ fn policy_equivalent_tool_names(name: &str) -> Vec<&str> {
     match name {
         "spawn_agent" => vec!["spawn_agent", "spawn"],
         "wait_agent" => vec!["wait_agent", "read_task_output"],
+        // #1607 (codex round 2): `shell`/`bash`/`exec_command` are the same
+        // command capability (the `bash`/`exec_command` names are codex-compat
+        // aliases that share the shell policy — see `register`). A provider
+        // policy naming any one must apply to all three: otherwise `deny=["shell"]`
+        // is trivially bypassed via `bash`, and `allow=["shell"]` wrongly drops a
+        // `ToolCall` validator that uses `bash`/`exec_command`.
+        "shell" | "bash" | "exec_command" => vec!["shell", "bash", "exec_command"],
         _ => vec![name],
     }
 }

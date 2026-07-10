@@ -729,32 +729,33 @@ impl ValidatorRunner {
         // so they run the argv directly, where `Command` passes each element as a
         // distinct token (injection-safe).
         //
-        // #1607 (codex-review follow-up) — Docker exception: the Docker backend
-        // bind-mounts the workspace at a fixed in-container path (`/workspace`),
-        // but `Command` validators interpolate absolute *host* paths (e.g.
-        // `${output.patch_path}` -> `/host/ws/.../foo.patch`) that don't exist
-        // inside the container, so wrapping them in `docker run` would make a
-        // previously-passing required validator start failing. Before #1607,
-        // command validators ran on the host and worked. To avoid a silent
-        // regression, Docker-mode command validators stay on the pre-#1607
-        // direct (host) path here (Docker is not the fleet default). This does
-        // NOT sandbox them — full in-container path translation is a documented
-        // known follow-up (see `Sandbox::is_docker`). The non-command validator
-        // kinds (ToolCall / file checks) are unaffected: they never shell out.
-        let real_sandbox = self
-            .sandbox
-            .as_ref()
-            .filter(|s| !s.is_noop() && !s.is_docker());
-        let sandbox_is_windows = cfg!(windows);
-        if real_sandbox.is_some() && sandbox_is_windows {
+        // #1607 (codex-review follow-up): two real backends cannot safely run
+        // the validator argv here, so a real one of either must FAIL CLOSED
+        // rather than mis-quote or escape to the host:
+        //  - Windows (`cmd /C`) ignores the POSIX single quotes `shlex` emits,
+        //    so metacharacters in an argument would stay active.
+        //  - Docker bind-mounts the workspace at a fixed in-container path
+        //    (`/workspace`), but `Command` validators interpolate absolute
+        //    *host* paths (e.g. `${output.patch_path}`) that don't resolve
+        //    inside the container. Running them on the host instead (the prior
+        //    behaviour) would bypass Docker's mount/write/network confinement —
+        //    the very escape #1607 closes. Full in-container path translation
+        //    is a documented follow-up (see `Sandbox::is_docker`).
+        // A no-op / absent sandbox has nothing to escape and runs the argv
+        // directly (injection-safe). ToolCall / file-check validators never
+        // shell out, so they are unaffected either way.
+        let real_sandbox = self.sandbox.as_ref().filter(|s| !s.is_noop());
+        let is_windows = cfg!(windows);
+        let cannot_wrap = real_sandbox.is_some_and(|s| is_windows || s.is_docker());
+        if cannot_wrap {
             return error_outcome(
                 invocation,
                 validator,
                 started_at,
                 started,
                 format!(
-                    "command validator not supported under the Windows sandbox \
-                     (would bypass AppContainer): {command_string}"
+                    "command validator not supported under the active sandbox \
+                     backend (Windows/Docker): {command_string}"
                 ),
             );
         }
@@ -3602,24 +3603,22 @@ mod tests {
         assert_eq!(outcomes[0].status, ValidatorStatus::Pass, "{outcomes:?}");
     }
 
-    /// #1607 (codex-review follow-up) — Docker P2: a Docker-mode sandbox must
-    /// NOT wrap command validators in `docker run` (host absolute paths like
-    /// `${output.target_path}` don't exist inside the `/workspace` bind mount,
-    /// so a previously-passing required validator would break). Instead they
-    /// stay on the pre-#1607 direct (host) path. Proof: a `test -f <host path>`
-    /// validator run under `SandboxMode::Docker` still PASSES against the real
-    /// host file. If it were wrapped in `docker run`, it would either error
-    /// (no docker binary) or fail (host path not visible in the container) —
-    /// never Pass. Unix-only because the host path is checked via `test -f`.
+    /// #1607 (codex-review round 2) — Docker fails CLOSED: a Docker-mode
+    /// sandbox cannot safely run a command validator here. Host absolute paths
+    /// like `${output.target_path}` don't resolve inside the `/workspace` bind
+    /// mount, and running them on the host instead (the prior behaviour) would
+    /// bypass Docker's mount/write/network confinement — the very escape #1607
+    /// closes. So the validator must fail closed with a typed error, NOT run on
+    /// the host (which would Pass). Host-independent: a Docker sandbox is
+    /// constructed regardless of whether the docker binary is present. Unix-only
+    /// for parity with the sibling command-validator tests.
     #[tokio::test]
     #[cfg(unix)]
-    async fn docker_sandbox_keeps_command_validator_on_host_path() {
+    async fn docker_sandbox_fails_command_validator_closed() {
         let dir = tempfile::tempdir().unwrap();
         let path_arg = dir.path().join("deck.pptx");
         std::fs::write(&path_arg, b"x").unwrap();
 
-        // A Docker-mode sandbox is constructed regardless of whether the docker
-        // binary is present, so this test is host-independent.
         let docker: Arc<dyn Sandbox> = Arc::from(crate::sandbox::create_sandbox(
             &crate::sandbox::SandboxConfig {
                 mode: crate::sandbox::SandboxMode::Docker,
@@ -3650,12 +3649,13 @@ mod tests {
             "target_path": path_arg.to_string_lossy().to_string(),
         }));
         let outcomes = runner.run_all(&invocation, &[validator]).await;
-        assert_eq!(
-            outcomes[0].status,
-            ValidatorStatus::Pass,
-            "Docker-mode command validator must run on the host directly and \
-             pass against the real host file (not be wrapped in `docker run`): \
-             {outcomes:?}"
+        // Fails CLOSED: not run on the host (which would Pass and bypass Docker),
+        // and not wrapped in `docker run` either.
+        assert_eq!(outcomes[0].status, ValidatorStatus::Error, "{outcomes:?}");
+        assert!(
+            outcomes[0].reason.contains("Docker") || outcomes[0].reason.contains("not supported"),
+            "expected a fail-closed reason, got: {}",
+            outcomes[0].reason
         );
     }
 

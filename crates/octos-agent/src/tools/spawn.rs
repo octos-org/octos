@@ -2865,10 +2865,16 @@ impl Tool for SpawnTool {
                         // when the parent session is sandboxed. A no-op backend
                         // (no helper present) still runs the argv directly, so
                         // hosts without a real sandbox are unaffected.
-                        let registry_for_validators = ToolRegistry::with_builtins_and_sandbox(
+                        let mut registry_for_validators = ToolRegistry::with_builtins_and_sandbox(
                             &self.working_dir,
                             create_sandbox(&self.sandbox),
                         );
+                        // Honour the parent's provider tool policy in the validator
+                        // registry too, so a workspace `ToolCall` validator can't
+                        // invoke a tool the policy denies (#1607 codex round 2).
+                        if let Some(policy) = self.provider_policy.clone() {
+                            registry_for_validators.set_provider_policy(policy);
+                        }
                         if let Err(reason) = crate::workspace_contract::run_declared_validators(
                             &registry_for_validators,
                             &self.working_dir,
@@ -2908,10 +2914,16 @@ impl Tool for SpawnTool {
                 // hardcoded `NoSandbox`. This is the child mirror of the
                 // `build_validator_runner` chokepoint fix; without it the
                 // agent_mcp branch is a second unsandboxed construction site.
-                let registry_for_validators = ToolRegistry::with_builtins_and_sandbox(
+                let mut registry_for_validators = ToolRegistry::with_builtins_and_sandbox(
                     &self.working_dir,
                     create_sandbox(&self.sandbox),
                 );
+                // Honour the parent's provider tool policy in the validator
+                // registry too, so a workspace `ToolCall` validator can't invoke
+                // a tool the policy denies (#1607 codex round 2).
+                if let Some(policy) = self.provider_policy.clone() {
+                    registry_for_validators.set_provider_policy(policy);
+                }
                 let report = crate::workspace_contract::run_project_root_validators(
                     &registry_for_validators,
                     &self.working_dir,
