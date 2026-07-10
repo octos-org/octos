@@ -921,7 +921,7 @@ mod tests {
         // can only come from the CONTENT gate — not the authority gate.
         let fx = Fixture {
             notes: vec![note("n1", "host", "user_request", "tabs pref changed")],
-            ..Fixture::default()
+            ..Default::default()
         };
         let err = fx
             .validate(&output(
