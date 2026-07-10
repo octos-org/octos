@@ -7817,14 +7817,18 @@ async fn raw_profile_llm_upsert(
     if params.set_primary || llm.primary.is_none() {
         // set_primary is lossless (mirrors `profile/llm/select`): a replaced
         // primary is demoted into the fallback list, and the promoted
-        // selection is de-duplicated out of it.
+        // selection is de-duplicated out of it. Comparison is by selection
+        // *address* (family/model/route_id — all `profile/llm/select` can
+        // discriminate): a same-address upsert is an endpoint edit and
+        // replaces outright, or the old endpoint would linger as a fallback
+        // row the selector can never promote (codex P2).
         if let Some(old_primary) = llm.primary.take() {
-            if !same_llm_selection_identity(&old_primary, &selection) {
+            if !same_llm_selection_address(&old_primary, &selection) {
                 upsert_llm_fallback(&mut llm.fallbacks, old_primary);
             }
         }
         llm.fallbacks
-            .retain(|fallback| !same_llm_selection_identity(fallback, &selection));
+            .retain(|fallback| !same_llm_selection_address(fallback, &selection));
         llm.primary = Some(selection);
     } else {
         upsert_llm_fallback(&mut llm.fallbacks, selection);
@@ -7890,6 +7894,27 @@ fn same_llm_selection_identity(
                 .route
                 .as_ref()
                 .and_then(|route| route.base_url.as_ref())
+}
+
+/// Selection *address* as `profile/llm/select` can discriminate it: family +
+/// model + route_id, with a missing route_id normalized to the synthetic
+/// `"official"` the TUI sends for default routes. `base_url` is deliberately
+/// excluded — the selector cannot address it, so two selections differing
+/// only by endpoint are the same switchable row.
+fn same_llm_selection_address(
+    left: &crate::profiles::LlmModelSelectionConfig,
+    right: &crate::profiles::LlmModelSelectionConfig,
+) -> bool {
+    fn route_address(selection: &crate::profiles::LlmModelSelectionConfig) -> &str {
+        selection
+            .route
+            .as_ref()
+            .and_then(|route| route.route_id.as_deref())
+            .unwrap_or("official")
+    }
+    left.family_id == right.family_id
+        && left.model_id == right.model_id
+        && route_address(left) == route_address(right)
 }
 
 async fn raw_profile_llm_test(
@@ -26155,6 +26180,72 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![Some("glm-5.2")],
             "round-trip must neither duplicate the promoted model nor drop the demoted one"
+        );
+    }
+
+    /// A same-address upsert (same family/model/route_id — including a
+    /// missing route_id, which normalizes to the synthetic "official") is an
+    /// endpoint edit: it replaces the primary outright instead of demoting
+    /// the old endpoint into a fallback row that `profile/llm/select` can
+    /// never address (codex P2 on the lossless-save fix).
+    #[tokio::test]
+    async fn llm_upsert_endpoint_edit_replaces_instead_of_demoting() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = Arc::new(local_profile_state(dir.path()));
+        for (route, tag) in [
+            (
+                json!({ "route_id": "official", "base_url": "https://one.example" }),
+                "one",
+            ),
+            // Same address, new endpoint: must replace, not demote.
+            (
+                json!({ "route_id": "official", "base_url": "https://two.example" }),
+                "two",
+            ),
+            // Missing route_id normalizes to "official": still the same address.
+            (json!({ "base_url": "https://three.example" }), "three"),
+        ] {
+            let request = RpcRequest::new(
+                format!("u-{tag}"),
+                APPUI_METHOD_PROFILE_LLM_UPSERT.to_string(),
+                json!({
+                    "profile_id": "dev",
+                    "selection": {
+                        "family_id": "deepseek",
+                        "model_id": "deepseek-chat",
+                        "route": route,
+                    },
+                    "set_primary": true,
+                }),
+            );
+            raw_profile_llm_upsert(&state, &request, None)
+                .await
+                .expect("upsert");
+        }
+
+        let profile = state
+            .profile_store
+            .as_ref()
+            .unwrap()
+            .get("dev")
+            .unwrap()
+            .unwrap();
+        let llm = profile.config.llm.as_ref().unwrap();
+        assert_eq!(
+            llm.primary
+                .as_ref()
+                .unwrap()
+                .route
+                .as_ref()
+                .unwrap()
+                .base_url
+                .as_deref(),
+            Some("https://three.example"),
+            "the endpoint edit lands on the primary"
+        );
+        assert!(
+            llm.fallbacks.is_empty(),
+            "endpoint edits must not accrete unselectable fallback rows: {llm:?}"
         );
     }
 
