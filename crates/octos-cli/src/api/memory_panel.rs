@@ -280,12 +280,19 @@ mod imp {
     }
 
     pub(super) fn list_md_stems(dir: &OwnedFd, cap: usize) -> (Vec<String>, bool) {
+        // Enumeration failures are TRUNCATION, not emptiness (codex
+        // #1611 r12 P2): a listing we could not start — or an entry we
+        // could not read — must never let a partial result pass as
+        // exact/complete.
         let Ok(mut entries) = rustix::fs::Dir::read_from(dir) else {
-            return (Vec::new(), false);
+            return (Vec::new(), true);
         };
         let mut names = Vec::new();
         let mut raw_seen = 0usize;
-        while let Some(Ok(entry)) = entries.next() {
+        while let Some(next) = entries.next() {
+            let Ok(entry) = next else {
+                return (names, true);
+            };
             // RAW budget BEFORE any filtering (codex #1611 r9 P1): a
             // planted directory of millions of non-.md entries must not
             // be scanned to EOF while a global permit is held.
@@ -311,12 +318,18 @@ mod imp {
     }
 
     pub(super) fn count_md_entries(dir: &OwnedFd, cap: usize) -> (usize, bool) {
+        // Enumeration failures are truncation — see list_md_stems
+        // (codex #1611 r12 P2): a zero/partial count from a failed
+        // scan must not read as exact.
         let Ok(mut entries) = rustix::fs::Dir::read_from(dir) else {
-            return (0, false);
+            return (0, true);
         };
         let mut count = 0;
         let mut raw_seen = 0usize;
-        while let Some(Ok(entry)) = entries.next() {
+        while let Some(next) = entries.next() {
+            let Ok(entry) = next else {
+                return (count, true);
+            };
             // Same raw budget as list_md_stems (codex #1611 r9 P1).
             // Exhaustion reports (observed, truncated=true) — never a
             // fabricated `cap` (r11 P2) and never a partial tally
@@ -387,12 +400,18 @@ mod imp {
     }
 
     pub(super) fn list_md_stems(handle: &Handle, cap: usize) -> (Vec<String>, bool) {
+        // Enumeration failures are truncation, not emptiness — see the
+        // Unix arm (codex #1611 r12 P2). No `flatten()`: it would skip
+        // errored entries and let a partial listing pass as complete.
         let Ok(entries) = std::fs::read_dir(&handle.1) else {
-            return (Vec::new(), false);
+            return (Vec::new(), true);
         };
         let mut names = Vec::new();
         let mut raw_seen = 0usize;
-        for entry in entries.flatten() {
+        for next in entries {
+            let Ok(entry) = next else {
+                return (names, true);
+            };
             // RAW budget BEFORE any filtering (codex #1611 r9 P1) —
             // see the Unix arm.
             raw_seen += 1;
@@ -419,12 +438,17 @@ mod imp {
     }
 
     pub(super) fn count_md_entries(handle: &Handle, cap: usize) -> (usize, bool) {
+        // Enumeration failures are truncation — see the Unix arm
+        // (codex #1611 r12 P2).
         let Ok(entries) = std::fs::read_dir(&handle.1) else {
-            return (0, false);
+            return (0, true);
         };
         let mut count = 0;
         let mut raw_seen = 0usize;
-        for entry in entries.flatten() {
+        for next in entries {
+            let Ok(entry) = next else {
+                return (count, true);
+            };
             // Same raw budget as list_md_stems (codex #1611 r9 P1);
             // exhaustion reports (observed, truncated) — see the Unix
             // arm (r10/r11 P2).
