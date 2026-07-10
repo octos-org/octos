@@ -1,7 +1,12 @@
-//! `/api/my/cron*` — user-scoped cron viewer + enable toggle (web
-//! parity audit P3 item 7: the book documents scheduled tasks, but the
-//! dashboard had no cron surface at all — only the admin-token
-//! `GET /api/admin/profiles/{id}/cron` list).
+//! User-scoped cron viewer + enable toggle (web parity audit P3 item 7: the
+//! book documents scheduled tasks, but the dashboard had no cron surface at
+//! all — only the admin-token `GET /api/admin/profiles/{id}/cron` list).
+//!
+//! Reached over the UI Protocol via the `cron/list` / `cron/toggle` methods
+//! (gated by `auxiliary.rest_to_ws.v1`), which wrap these handlers on the WS
+//! transport. `cron/list` is byte-budget-bounded (row + serialized-size caps
+//! with a `truncated` signal) so it fits one WS frame; the former
+//! `/api/my/cron*` REST routes were retired (see `router.rs`).
 //!
 //! Runtime-ownership constraint that shapes this API: `cron.json` has
 //! up to three writers, and a bare file edit races all of them (each
@@ -148,13 +153,60 @@ pub async fn my_cron(
     };
 
     let now_ms = Utc::now().timestamp_millis();
-    let jobs: Vec<serde_json::Value> = jobs.iter().map(|j| job_json(j, now_ms)).collect();
+    // Bound the serialized list so `cron/list` (the sole transport once the WS
+    // methods replace REST) always fits one WS frame: cap each row's string
+    // fields, stop before the byte budget, and signal via `truncated` with
+    // `count` = true total. Without this the generic outbound-frame guard would
+    // silently drop jobs with a stale count.
+    let total = jobs.len();
+    let mut rendered: Vec<serde_json::Value> = Vec::new();
+    let mut bytes = 0usize;
+    for j in jobs.iter() {
+        if rendered.len() >= MAX_CRON_PANEL_JOBS {
+            break;
+        }
+        let row = cap_cron_row(job_json(j, now_ms));
+        let sz = serde_json::to_string(&row).map(|s| s.len()).unwrap_or(0);
+        // Always include at least one row (even an oversized single row, now
+        // field-capped) so an empty list never masks a present job.
+        if !rendered.is_empty() && bytes + sz > CRON_LIST_BYTE_BUDGET {
+            break;
+        }
+        bytes += sz;
+        rendered.push(row);
+    }
+    let truncated = rendered.len() < total;
     Ok(Json(serde_json::json!({
         "ok": true,
-        "count": jobs.len(),
-        "jobs": jobs,
+        // `count` is the TRUE total; `truncated` marks that `jobs` is capped.
+        "count": total,
+        "truncated": truncated,
+        "jobs": rendered,
         "gateway_running": running,
     })))
+}
+
+/// Row cap for a single `cron/list` response, and the serialized-byte budget
+/// that stops the list well under the 1 MiB WS frame. Per-field cap bounds any
+/// one tenant-controlled string (name / channel / timezone / schedule) so no
+/// single row can blow the frame on its own.
+const MAX_CRON_PANEL_JOBS: usize = 1000;
+const CRON_LIST_BYTE_BUDGET: usize = 900 * 1024;
+const MAX_CRON_FIELD_CHARS: usize = 256;
+
+/// Cap every string field of a rendered cron row to [`MAX_CRON_FIELD_CHARS`],
+/// so an oversized tenant-controlled field can't push the frame over budget.
+fn cap_cron_row(mut row: serde_json::Value) -> serde_json::Value {
+    if let serde_json::Value::Object(map) = &mut row {
+        for value in map.values_mut() {
+            if let serde_json::Value::String(s) = value {
+                if s.chars().count() > MAX_CRON_FIELD_CHARS {
+                    *s = crate::api::admin::truncate_str(s, MAX_CRON_FIELD_CHARS);
+                }
+            }
+        }
+    }
+    row
 }
 
 #[derive(Debug, Deserialize)]
@@ -281,7 +333,9 @@ pub async fn set_my_cron_enabled(
             let now_ms = Utc::now().timestamp_millis();
             Ok(Json(serde_json::json!({
                 "ok": true,
-                "job": job_json(&job, now_ms),
+                // Field-cap the single row too, so `cron/toggle` (WS) can't blow
+                // the frame on an oversized tenant-controlled field.
+                "job": cap_cron_row(job_json(&job, now_ms)),
             })))
         }
         Err(ToggleError::NotFound) => Err(err(StatusCode::NOT_FOUND, "job_not_found")),
@@ -384,6 +438,41 @@ mod tests {
         assert_eq!(resp["ok"], true);
         assert_eq!(resp["count"], 0);
         assert_eq!(resp["gateway_running"], false);
+    }
+
+    #[test]
+    fn cap_cron_row_bounds_oversized_string_fields() {
+        let row = serde_json::json!({
+            "id": "x",
+            "name": "a".repeat(1000),
+            "enabled": true,
+        });
+        let capped = cap_cron_row(row);
+        // `truncate_str` keeps `MAX_CRON_FIELD_CHARS` chars + a `...` marker.
+        assert!(capped["name"].as_str().unwrap().chars().count() <= MAX_CRON_FIELD_CHARS + 3);
+        // Short fields + non-strings are left untouched.
+        assert_eq!(capped["id"], "x");
+        assert_eq!(capped["enabled"], true);
+    }
+
+    #[tokio::test]
+    async fn my_cron_caps_large_lists_and_signals_truncation() {
+        let (_dir, state, ps) = temp_state();
+        let profile = make_user_profile("tenant-big");
+        ps.save(&profile).unwrap();
+        let jobs: Vec<_> = (0..MAX_CRON_PANEL_JOBS + 5)
+            .map(|i| make_job(&format!("job{i:04}"), i % 2 == 0))
+            .collect();
+        seed_cron(&ps, &profile, jobs).await;
+
+        let Json(resp) = my_cron(State(state), HeaderMap::new(), user_identity("tenant-big"))
+            .await
+            .unwrap();
+        // `count` is the TRUE total; `jobs` is capped and `truncated` set, so the
+        // WS frame can't silently drop entries behind a stale count.
+        assert_eq!(resp["count"], MAX_CRON_PANEL_JOBS + 5);
+        assert_eq!(resp["truncated"], true);
+        assert_eq!(resp["jobs"].as_array().unwrap().len(), MAX_CRON_PANEL_JOBS);
     }
 
     #[tokio::test]

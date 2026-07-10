@@ -3251,6 +3251,12 @@ pub struct CronListResult {
     pub jobs: Value,
     pub count: usize,
     pub gateway_running: bool,
+    /// True when `jobs` was capped (row count or serialized byte budget) so the
+    /// result fits a single WS frame. `count` still reports the true total, so a
+    /// client can surface "showing N of `count`". Defaults to `false` for
+    /// backward compatibility with pre-truncation payloads.
+    #[serde(default)]
+    pub truncated: bool,
 }
 
 /// Params for `cron/toggle`.
@@ -11131,6 +11137,7 @@ mod tests {
             jobs: serde_json::json!([{ "id": "job-1" }]),
             count: 1,
             gateway_running: false,
+            truncated: false,
         };
         let value = serde_json::to_value(&cron).expect("serialize");
         let decoded: CronListResult = serde_json::from_value(value).expect("deserialize");
@@ -11571,18 +11578,20 @@ mod tests {
             }),
         );
 
-        // cron/list — `{ jobs, count, gateway_running }`
+        // cron/list — `{ jobs, count, gateway_running, truncated }`
         assert_eq!(
             serde_json::to_value(CronListResult {
                 jobs: serde_json::json!([{ "id": "job-1" }]),
                 count: 1,
                 gateway_running: true,
+                truncated: false,
             })
             .expect("serialize"),
             serde_json::json!({
                 "jobs": [{ "id": "job-1" }],
                 "count": 1,
                 "gateway_running": true,
+                "truncated": false,
             }),
         );
 

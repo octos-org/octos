@@ -15517,6 +15517,13 @@ async fn handle_cron_list(
                 .get("gateway_running")
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
+            // Forward the truncation signal so a client can show "N of `count`"
+            // instead of silently seeing a short list (`cron/list` bounds the
+            // row set to keep the frame under budget).
+            let truncated = body
+                .get("truncated")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
             send_aux_rpc_result(
                 ws,
                 id,
@@ -15525,6 +15532,7 @@ async fn handle_cron_list(
                     "jobs": jobs,
                     "count": count,
                     "gateway_running": gateway_running,
+                    "truncated": truncated,
                 }),
             );
         }

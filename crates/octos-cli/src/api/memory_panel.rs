@@ -1,7 +1,12 @@
-//! `/api/my/memory*` — read-only memory panel endpoints (web parity
-//! audit P3 item 6: the book gives the memory system top-3 prominence,
-//! but the web dashboard had ZERO memory UX — MEMORY.md, daily notes
-//! and the entity bank were invisible outside the CLI).
+//! Read-only memory panel handlers (web parity audit P3 item 6: the book
+//! gives the memory system top-3 prominence, but the web dashboard had ZERO
+//! memory UX — MEMORY.md, daily notes and the entity bank were invisible
+//! outside the CLI).
+//!
+//! Reached over the UI Protocol via the `memory/overview` / `memory/entity`
+//! methods (gated by `auxiliary.rest_to_ws.v1`), which wrap these handlers on
+//! the WS transport. The former `/api/my/memory*` REST routes were retired to
+//! keep a single transport (see `router.rs`).
 //!
 //! Deliberately VIEWER-ONLY: writes stay with the agent tools
 //! (`save_memory`, `memory_note`) and the refresh pipeline, so the
