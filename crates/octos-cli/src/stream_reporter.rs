@@ -111,6 +111,7 @@ impl ProgressReporter for ChannelStreamReporter {
             ProgressEvent::ToolStarted {
                 ref name,
                 ref tool_id,
+                ..
             } => {
                 // Also send raw SSE for web client status indicators
                 let mut payload = serde_json::json!({
@@ -962,6 +963,7 @@ mod tests {
         reporter.report(ProgressEvent::ToolStarted {
             name: "shell".into(),
             tool_id: "t1".into(),
+            arguments: None,
         });
         reporter.report(ProgressEvent::ToolCompleted {
             name: "shell".into(),

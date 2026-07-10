@@ -814,6 +814,9 @@ impl ProfileActorFactoryBuilder {
                 self.memory_store.clone(),
             ));
             tools.register(octos_agent::SaveMemoryTool::new(self.memory_store.clone()));
+            tools.register(octos_agent::RecordMemoryUseTool::new(
+                self.memory_store.clone(),
+            ));
             if memory_refresh_enabled {
                 tools.register(octos_agent::MemoryNoteTool::new(self.memory_store.clone()));
             }

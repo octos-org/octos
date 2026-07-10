@@ -26,6 +26,9 @@ tracing = { workspace = true }
 metrics = { workspace = true }
 glob = { workspace = true }
 globset = { workspace = true }
+# Shell-quote validator argv when wrapping command validators for a POSIX
+# sandbox (so `sh -c` reconstructs the exact argv rather than word-splitting).
+shlex = "1"
 which = { workspace = true }
 regex = { workspace = true }
 ignore = { workspace = true }

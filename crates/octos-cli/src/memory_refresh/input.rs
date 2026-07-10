@@ -17,7 +17,12 @@ use octos_core::{Message, MessageRole};
 use super::redact::redact_secrets;
 
 /// Tool names whose calls/results must never reach the extractor.
-const MEMORY_TOOL_NAMES: &[&str] = &["memory_note", "save_memory", "recall_memory"];
+const MEMORY_TOOL_NAMES: &[&str] = &[
+    "memory_note",
+    "save_memory",
+    "recall_memory",
+    "record_memory_use",
+];
 /// Per-tool-result truncation (chars) before the global budget applies.
 const TOOL_RESULT_MAX_CHARS: usize = 1_000;
 

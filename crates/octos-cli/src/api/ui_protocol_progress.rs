@@ -414,7 +414,15 @@ fn map_tool_end(context: &ProgressMappingContext, event: &Value) -> UiProgressMa
             tool_call_id,
             tool_name,
             success: bool_field(event, &["success"]),
-            output_preview: string_field(event, &["output_preview"]),
+            // Raw progress JSON can come from arbitrary producers (binary
+            // plugins); bound before this lands in the durable ledger.
+            output_preview: string_field(event, &["output_preview"]).map(|preview| {
+                octos_core::truncated_utf8(
+                    &preview,
+                    octos_core::ui_protocol::ENVELOPE_TOOL_OUTPUT_PREVIEW_MAX,
+                    "…",
+                )
+            }),
             duration_ms: u64_field(event, &["duration_ms", "elapsed_ms"]),
         })],
         status: Some(UiProgressStatus::new(context, metadata)),
@@ -776,6 +784,32 @@ mod tests {
         );
         assert_eq!(mapping.status, None);
         assert_eq!(mapping.warning, None);
+    }
+
+    #[test]
+    fn ui_protocol_progress_bounds_tool_end_preview_from_raw_json() {
+        // Raw progress JSON can come from arbitrary producers (binary
+        // plugins) — the mapper must bound before the durable ledger.
+        let mapping = map_progress_json(
+            &context(),
+            &json!({
+                "type": "tool_end",
+                "tool": "shell",
+                "tool_call_id": "call-9",
+                "success": false,
+                "output_preview": "x".repeat(9000),
+            }),
+        );
+        let [UiNotification::ToolCompleted(completed)] = mapping.notifications.as_slice() else {
+            panic!("expected tool completed notification");
+        };
+        let preview = completed.output_preview.as_deref().expect("preview");
+        assert!(
+            preview.chars().count()
+                <= octos_core::ui_protocol::ENVELOPE_TOOL_OUTPUT_PREVIEW_MAX + 1,
+            "mapper must bound raw-JSON previews, got {} chars",
+            preview.chars().count()
+        );
     }
 
     #[test]

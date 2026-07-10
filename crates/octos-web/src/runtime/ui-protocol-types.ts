@@ -143,7 +143,14 @@ interface AssistantPersistedPayload {
 
 interface ToolStartPayload {
   type: 'tool_start';
-  data: { tool_call_id: string; name: string };
+  data: {
+    tool_call_id: string;
+    name: string;
+    /** Compact `key: value` echo of the call arguments, server-bounded
+     *  (700 chars). Omitted for argument-less calls and envelopes persisted
+     *  before the field existed. */
+    arguments_preview?: string;
+  };
 }
 
 interface ToolProgressPayload {
@@ -163,6 +170,12 @@ interface ToolEndPayload {
      *  (user `turn/interrupt`, system cancellation) outcomes. Omitted
      *  on the wire when null. */
     reason?: string;
+    /** First lines of the tool result, server-bounded (2048 chars) — the
+     *  `⎿ …` excerpt under the tool card. Omitted for output-less tools and
+     *  envelopes persisted before the field existed. */
+    output_preview?: string;
+    /** Wall-clock duration of the call, when the emitter tracked it. */
+    duration_ms?: number;
   };
 }
 
