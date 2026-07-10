@@ -7815,6 +7815,16 @@ async fn raw_profile_llm_upsert(
 
     let mut llm = profile.config.llm.take().unwrap_or_default();
     if params.set_primary || llm.primary.is_none() {
+        // set_primary is lossless (mirrors `profile/llm/select`): a replaced
+        // primary is demoted into the fallback list, and the promoted
+        // selection is de-duplicated out of it.
+        if let Some(old_primary) = llm.primary.take() {
+            if !same_llm_selection_identity(&old_primary, &selection) {
+                upsert_llm_fallback(&mut llm.fallbacks, old_primary);
+            }
+        }
+        llm.fallbacks
+            .retain(|fallback| !same_llm_selection_identity(fallback, &selection));
         llm.primary = Some(selection);
     } else {
         upsert_llm_fallback(&mut llm.fallbacks, selection);
@@ -26054,6 +26064,98 @@ mod tests {
             .await
             .expect_err("unconfigured model must reject");
         assert_eq!(error.code, rpc_error_codes::RESOURCE_NOT_FOUND);
+    }
+
+    /// `profile/llm/upsert` with `set_primary` must be lossless: replacing
+    /// the primary demotes the old one to a fallback instead of dropping it
+    /// (the onboarding wizard's "Save" path — a user onboarding glm-5.2 lost
+    /// their deepseek primary and was left with a single unusable model), and
+    /// re-promoting a model that already sits in the fallback list must not
+    /// duplicate it there.
+    #[tokio::test]
+    async fn llm_upsert_set_primary_demotes_old_primary_instead_of_dropping_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = Arc::new(local_profile_state(dir.path()));
+        for (family, model) in [("deepseek", "deepseek-v4-pro"), ("zai", "glm-5.2")] {
+            let request = RpcRequest::new(
+                format!("u-{model}"),
+                APPUI_METHOD_PROFILE_LLM_UPSERT.to_string(),
+                json!({
+                    "profile_id": "dev",
+                    "selection": {
+                        "family_id": family,
+                        "model_id": model,
+                        "route": { "route_id": "official" },
+                    },
+                    "set_primary": true,
+                }),
+            );
+            raw_profile_llm_upsert(&state, &request, None)
+                .await
+                .expect("upsert");
+        }
+
+        let profile = state
+            .profile_store
+            .as_ref()
+            .unwrap()
+            .get("dev")
+            .unwrap()
+            .unwrap();
+        let llm = profile.config.llm.as_ref().unwrap();
+        assert_eq!(
+            llm.primary.as_ref().unwrap().model_id.as_deref(),
+            Some("glm-5.2")
+        );
+        assert_eq!(
+            llm.fallbacks.len(),
+            1,
+            "replaced primary must survive as a fallback: {llm:?}"
+        );
+        assert_eq!(
+            llm.fallbacks[0].model_id.as_deref(),
+            Some("deepseek-v4-pro")
+        );
+
+        // Promote the demoted model back through the same wizard path: it
+        // must leave the fallback list (no duplicate) and demote glm-5.2.
+        let request = RpcRequest::new(
+            "u-back".to_string(),
+            APPUI_METHOD_PROFILE_LLM_UPSERT.to_string(),
+            json!({
+                "profile_id": "dev",
+                "selection": {
+                    "family_id": "deepseek",
+                    "model_id": "deepseek-v4-pro",
+                    "route": { "route_id": "official" },
+                },
+                "set_primary": true,
+            }),
+        );
+        raw_profile_llm_upsert(&state, &request, None)
+            .await
+            .expect("re-promote");
+
+        let profile = state
+            .profile_store
+            .as_ref()
+            .unwrap()
+            .get("dev")
+            .unwrap()
+            .unwrap();
+        let llm = profile.config.llm.as_ref().unwrap();
+        assert_eq!(
+            llm.primary.as_ref().unwrap().model_id.as_deref(),
+            Some("deepseek-v4-pro")
+        );
+        assert_eq!(
+            llm.fallbacks
+                .iter()
+                .map(|fb| fb.model_id.as_deref())
+                .collect::<Vec<_>>(),
+            vec![Some("glm-5.2")],
+            "round-trip must neither duplicate the promoted model nor drop the demoted one"
+        );
     }
 
     /// A profile-scoped connection must not rewire another profile's models
