@@ -7325,6 +7325,225 @@ fn action_arguments_object(arguments: Value) -> Result<serde_json::Map<String, V
     }
 }
 
+fn action_schema_error(path: &str, message: impl Into<String>) -> RpcError {
+    RpcError::invalid_params(format!(
+        "skill action arguments do not match input_schema at {path}: {}",
+        message.into()
+    ))
+}
+
+fn action_value_matches_type(value: &Value, expected: &str) -> bool {
+    match expected {
+        "null" => value.is_null(),
+        "boolean" => value.is_boolean(),
+        "object" => value.is_object(),
+        "array" => value.is_array(),
+        "number" => value.is_number(),
+        "string" => value.is_string(),
+        "integer" => value
+            .as_number()
+            .is_some_and(|number| number.is_i64() || number.is_u64()),
+        _ => false,
+    }
+}
+
+fn validate_action_value(schema: &Value, value: &Value, path: &str) -> Result<(), RpcError> {
+    let object = schema
+        .as_object()
+        .ok_or_else(|| action_schema_error(path, "schema must be an object"))?;
+
+    if let Some(expected) = object.get("const") {
+        if value != expected {
+            return Err(action_schema_error(path, "value does not match const"));
+        }
+    }
+    if let Some(allowed) = object.get("enum").and_then(Value::as_array) {
+        if !allowed.iter().any(|candidate| candidate == value) {
+            return Err(action_schema_error(path, "value is not in enum"));
+        }
+    }
+
+    if let Some(types) = object.get("type") {
+        let matches = match types {
+            Value::String(expected) => action_value_matches_type(value, expected),
+            Value::Array(expected) => expected
+                .iter()
+                .filter_map(Value::as_str)
+                .any(|expected| action_value_matches_type(value, expected)),
+            _ => false,
+        };
+        if !matches {
+            return Err(action_schema_error(path, "value has the wrong JSON type"));
+        }
+    }
+
+    if let Some(all_of) = object.get("allOf").and_then(Value::as_array) {
+        for child in all_of {
+            validate_action_value(child, value, path)?;
+        }
+    }
+    if let Some(any_of) = object.get("anyOf").and_then(Value::as_array) {
+        if !any_of
+            .iter()
+            .any(|child| validate_action_value(child, value, path).is_ok())
+        {
+            return Err(action_schema_error(path, "value does not match anyOf"));
+        }
+    }
+    if let Some(one_of) = object.get("oneOf").and_then(Value::as_array) {
+        let matches = one_of
+            .iter()
+            .filter(|child| validate_action_value(child, value, path).is_ok())
+            .count();
+        if matches != 1 {
+            return Err(action_schema_error(
+                path,
+                "value must match exactly one oneOf schema",
+            ));
+        }
+    }
+    if let Some(not) = object.get("not") {
+        if validate_action_value(not, value, path).is_ok() {
+            return Err(action_schema_error(path, "value matches forbidden schema"));
+        }
+    }
+
+    if let Some(map) = value.as_object() {
+        if let Some(min) = object.get("minProperties").and_then(Value::as_u64) {
+            if map.len() < min as usize {
+                return Err(action_schema_error(path, "object has too few properties"));
+            }
+        }
+        if let Some(max) = object.get("maxProperties").and_then(Value::as_u64) {
+            if map.len() > max as usize {
+                return Err(action_schema_error(path, "object has too many properties"));
+            }
+        }
+        if let Some(required) = object.get("required").and_then(Value::as_array) {
+            for key in required.iter().filter_map(Value::as_str) {
+                if !map.contains_key(key) {
+                    return Err(action_schema_error(
+                        path,
+                        format!("required property `{key}` is missing"),
+                    ));
+                }
+            }
+        }
+
+        let properties = object.get("properties").and_then(Value::as_object);
+        if let Some(properties) = properties {
+            for (key, child_value) in map {
+                let child_path = format!("{path}.{key}");
+                if let Some(child_schema) = properties.get(key) {
+                    validate_action_value(child_schema, child_value, &child_path)?;
+                    continue;
+                }
+                match object.get("additionalProperties") {
+                    Some(Value::Bool(true)) => {}
+                    Some(Value::Object(child_schema)) => {
+                        validate_action_value(
+                            &Value::Object(child_schema.clone()),
+                            child_value,
+                            &child_path,
+                        )?;
+                    }
+                    _ => {
+                        return Err(action_schema_error(
+                            path,
+                            format!("property `{key}` is not declared"),
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    if let Some(array) = value.as_array() {
+        if let Some(min) = object.get("minItems").and_then(Value::as_u64) {
+            if array.len() < min as usize {
+                return Err(action_schema_error(path, "array has too few items"));
+            }
+        }
+        if let Some(max) = object.get("maxItems").and_then(Value::as_u64) {
+            if array.len() > max as usize {
+                return Err(action_schema_error(path, "array has too many items"));
+            }
+        }
+        if object
+            .get("uniqueItems")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            for (index, item) in array.iter().enumerate() {
+                if array[..index].contains(item) {
+                    return Err(action_schema_error(path, "array items must be unique"));
+                }
+            }
+        }
+        if let Some(item_schema) = object.get("items").filter(|items| items.is_object()) {
+            for (index, item) in array.iter().enumerate() {
+                validate_action_value(item_schema, item, &format!("{path}[{index}]"))?;
+            }
+        }
+    }
+
+    if let Some(string) = value.as_str() {
+        let length = string.chars().count();
+        if let Some(min) = object.get("minLength").and_then(Value::as_u64) {
+            if length < min as usize {
+                return Err(action_schema_error(path, "string is too short"));
+            }
+        }
+        if let Some(max) = object.get("maxLength").and_then(Value::as_u64) {
+            if length > max as usize {
+                return Err(action_schema_error(path, "string is too long"));
+            }
+        }
+        if let Some(pattern) = object.get("pattern").and_then(Value::as_str) {
+            let pattern = regex::Regex::new(pattern)
+                .map_err(|_| action_schema_error(path, "schema contains an invalid pattern"))?;
+            if !pattern.is_match(string) {
+                return Err(action_schema_error(path, "string does not match pattern"));
+            }
+        }
+    }
+
+    if let Some(number) = value.as_f64() {
+        if let Some(minimum) = object.get("minimum").and_then(Value::as_f64) {
+            if number < minimum {
+                return Err(action_schema_error(path, "number is below minimum"));
+            }
+        }
+        if let Some(maximum) = object.get("maximum").and_then(Value::as_f64) {
+            if number > maximum {
+                return Err(action_schema_error(path, "number is above maximum"));
+            }
+        }
+        if let Some(minimum) = object.get("exclusiveMinimum").and_then(Value::as_f64) {
+            if number <= minimum {
+                return Err(action_schema_error(
+                    path,
+                    "number is below exclusiveMinimum",
+                ));
+            }
+        }
+        if let Some(maximum) = object.get("exclusiveMaximum").and_then(Value::as_f64) {
+            if number >= maximum {
+                return Err(action_schema_error(
+                    path,
+                    "number is above exclusiveMaximum",
+                ));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_action_arguments(schema: &Value, arguments: &Value) -> Result<(), RpcError> {
+    validate_action_value(schema, arguments, "arguments")
+}
+
 fn string_array_argument(value: Value, field: &str) -> Result<Vec<String>, RpcError> {
     let array = value.as_array().ok_or_else(|| {
         RpcError::invalid_params(format!("skill action field `{field}` must be an array"))
@@ -7382,22 +7601,70 @@ fn materialize_action_file_path(
     tenant_id: Option<&str>,
     raw_path: &str,
     materialization: octos_agent::plugins::SkillActionFileMaterialization,
-) -> Vec<String> {
+) -> Result<Vec<String>, RpcError> {
     match materialization {
-        octos_agent::plugins::SkillActionFileMaterialization::Raw => vec![raw_path.to_string()],
+        octos_agent::plugins::SkillActionFileMaterialization::Raw => Ok(vec![raw_path.to_string()]),
         octos_agent::plugins::SkillActionFileMaterialization::WorkspaceRelative => {
-            octos_bus::file_handle::materialize_uploads_as_workspace_relative(
-                workspace_root,
-                tenant_id,
-                &[raw_path.to_string()],
-            )
+            use octos_bus::file_handle::ToolPathScope;
+
+            let resolved =
+                octos_bus::file_handle::resolve_tool_path(workspace_root, None, raw_path).map_err(
+                    |error| {
+                        RpcError::invalid_params(format!(
+                            "skill action input path `{raw_path}` is invalid: {error}"
+                        ))
+                    },
+                )?;
+            match resolved.scope {
+                ToolPathScope::UploadTmpdir => {
+                    let paths = octos_bus::file_handle::materialize_uploads_as_workspace_relative(
+                        workspace_root,
+                        tenant_id,
+                        &[raw_path.to_string()],
+                    );
+                    if paths.len() != 1 || paths[0] == raw_path {
+                        return Err(RpcError::invalid_params(format!(
+                            "skill action input path `{raw_path}` could not be materialized for this session"
+                        )));
+                    }
+                    Ok(paths)
+                }
+                ToolPathScope::Workspace => {
+                    let canonical_root =
+                        std::fs::canonicalize(workspace_root).map_err(|error| {
+                            RpcError::internal_error(format!(
+                                "failed to resolve action workspace {}: {error}",
+                                workspace_root.display()
+                            ))
+                        })?;
+                    let canonical_path = std::fs::canonicalize(&resolved.absolute).map_err(|_| {
+                        RpcError::invalid_params(format!(
+                            "skill action input path `{raw_path}` does not identify an existing workspace file"
+                        ))
+                    })?;
+                    let relative = canonical_path.strip_prefix(&canonical_root).map_err(|_| {
+                        RpcError::invalid_params(format!(
+                            "skill action input path `{raw_path}` escapes the session workspace"
+                        ))
+                    })?;
+                    if !canonical_path.is_file() {
+                        return Err(RpcError::invalid_params(format!(
+                            "skill action input path `{raw_path}` is not a file"
+                        )));
+                    }
+                    Ok(vec![relative.to_string_lossy().into_owned()])
+                }
+                ToolPathScope::Profile => Err(RpcError::invalid_params(
+                    "profile-scoped files cannot be used as workspace-relative action inputs",
+                )),
+            }
         }
         octos_agent::plugins::SkillActionFileMaterialization::TurnMedia => {
-            octos_bus::file_handle::materialize_turn_uploads(
+            Ok(octos_bus::file_handle::materialize_turn_uploads(
                 workspace_root,
                 tenant_id,
                 &[raw_path.to_string()],
-            )
+            ))
         }
     }
 }
@@ -7437,6 +7704,7 @@ fn prepare_skill_action_tool_invocation(
     })?;
 
     let mut args = action_arguments_object(arguments)?;
+    validate_action_arguments(&action.input_schema, &Value::Object(args.clone()))?;
     match input_mode {
         octos_agent::plugins::SkillActionInputMode::Single => Ok(PreparedSkillActionInvocation {
             tool: tool.to_string(),
@@ -7454,6 +7722,11 @@ fn prepare_skill_action_tool_invocation(
             })?;
             let raw_paths = string_array_argument(paths, "paths")?;
             let file_argument = file_argument.unwrap_or("path");
+            if args.contains_key(file_argument) {
+                return Err(RpcError::invalid_params(format!(
+                    "skill action field `{file_argument}` is host-owned and cannot be supplied by the caller"
+                )));
+            }
             let mut materialized_paths = Vec::new();
             let mut calls = Vec::new();
             for raw_path in raw_paths {
@@ -7462,7 +7735,7 @@ fn prepare_skill_action_tool_invocation(
                     tenant_id,
                     &raw_path,
                     file_materialization,
-                );
+                )?;
                 for materialized_path in prepared_paths {
                     let mut call_args = args.clone();
                     call_args.insert(
@@ -28783,6 +29056,173 @@ ignore = []
             calls[0].get("paths").is_none(),
             "file_each action must not forward the raw upload handles to the tool"
         );
+    }
+
+    #[test]
+    fn skill_action_rejects_arguments_that_do_not_match_input_schema() {
+        let workspace = tempfile::tempdir().unwrap();
+        let action: octos_agent::plugins::SkillActionDef = serde_json::from_value(json!({
+            "id": "report.generate",
+            "label": "Generate report",
+            "input_schema": {
+                "type": "object",
+                "properties": {"focus": {"type": "string"}},
+                "required": ["focus"]
+            },
+            "binding": {"type": "tool", "tool": "source_import"}
+        }))
+        .unwrap();
+        let mut registry = octos_agent::ToolRegistry::new();
+        registry.register(CaptureActionTool {
+            calls: Arc::new(StdMutex::new(Vec::new())),
+        });
+
+        let missing = prepare_skill_action_tool_invocation(
+            &action,
+            &registry,
+            workspace.path(),
+            None,
+            json!({}),
+        )
+        .expect_err("required fields must be enforced");
+        assert_eq!(missing.code, rpc_error_codes::INVALID_PARAMS);
+
+        let wrong_type = prepare_skill_action_tool_invocation(
+            &action,
+            &registry,
+            workspace.path(),
+            None,
+            json!({"focus": 42}),
+        )
+        .expect_err("property types must be enforced");
+        assert_eq!(wrong_type.code, rpc_error_codes::INVALID_PARAMS);
+
+        let undeclared = prepare_skill_action_tool_invocation(
+            &action,
+            &registry,
+            workspace.path(),
+            None,
+            json!({"focus": "security", "workspace_root": "/tmp/escape"}),
+        )
+        .expect_err("undeclared fields must default to denied");
+        assert_eq!(undeclared.code, rpc_error_codes::INVALID_PARAMS);
+    }
+
+    #[test]
+    fn skill_action_allows_undeclared_arguments_only_when_schema_opts_in() {
+        let workspace = tempfile::tempdir().unwrap();
+        let action: octos_agent::plugins::SkillActionDef = serde_json::from_value(json!({
+            "id": "generic.run",
+            "label": "Run generic action",
+            "input_schema": {
+                "type": "object",
+                "properties": {},
+                "additionalProperties": true
+            },
+            "binding": {"type": "tool", "tool": "source_import"}
+        }))
+        .unwrap();
+        let mut registry = octos_agent::ToolRegistry::new();
+        registry.register(CaptureActionTool {
+            calls: Arc::new(StdMutex::new(Vec::new())),
+        });
+
+        let prepared = prepare_skill_action_tool_invocation(
+            &action,
+            &registry,
+            workspace.path(),
+            None,
+            json!({"custom": "value"}),
+        )
+        .expect("the schema explicitly permits additional properties");
+        assert_eq!(prepared.calls[0].args["custom"], json!("value"));
+    }
+
+    #[test]
+    fn skill_action_file_each_rejects_caller_owned_binding_argument() {
+        let workspace = tempfile::tempdir().unwrap();
+        let action: octos_agent::plugins::SkillActionDef = serde_json::from_value(json!({
+            "id": "source.import",
+            "label": "Add source",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "paths": {"type": "array", "items": {"type": "string"}},
+                    "path": {"type": "string"}
+                },
+                "required": ["paths"]
+            },
+            "binding": {
+                "type": "tool",
+                "tool": "source_import",
+                "input_mode": "file_each",
+                "file_argument": "path"
+            }
+        }))
+        .unwrap();
+        let mut registry = octos_agent::ToolRegistry::new();
+        registry.register(CaptureActionTool {
+            calls: Arc::new(StdMutex::new(Vec::new())),
+        });
+
+        let error = prepare_skill_action_tool_invocation(
+            &action,
+            &registry,
+            workspace.path(),
+            None,
+            json!({"paths": ["notes.md"], "path": "/tmp/escape"}),
+        )
+        .expect_err("the host owns the per-file tool argument");
+        assert_eq!(error.code, rpc_error_codes::INVALID_PARAMS);
+    }
+
+    #[test]
+    fn skill_action_workspace_relative_rejects_paths_outside_workspace() {
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::write(workspace.path().join("notes.md"), "safe").unwrap();
+        let action: octos_agent::plugins::SkillActionDef = serde_json::from_value(json!({
+            "id": "source.import",
+            "label": "Add source",
+            "input_schema": {
+                "type": "object",
+                "properties": {"paths": {"type": "array", "items": {"type": "string"}}},
+                "required": ["paths"]
+            },
+            "binding": {
+                "type": "tool",
+                "tool": "source_import",
+                "input_mode": "file_each",
+                "file_argument": "path",
+                "file_materialization": "workspace_relative"
+            }
+        }))
+        .unwrap();
+        let mut registry = octos_agent::ToolRegistry::new();
+        registry.register(CaptureActionTool {
+            calls: Arc::new(StdMutex::new(Vec::new())),
+        });
+
+        let safe = prepare_skill_action_tool_invocation(
+            &action,
+            &registry,
+            workspace.path(),
+            None,
+            json!({"paths": ["notes.md"]}),
+        )
+        .expect("an existing workspace-relative file is valid");
+        assert_eq!(safe.calls[0].materialized_path.as_deref(), Some("notes.md"));
+
+        for unsafe_path in ["../secret.md", "/etc/passwd"] {
+            let error = prepare_skill_action_tool_invocation(
+                &action,
+                &registry,
+                workspace.path(),
+                None,
+                json!({"paths": [unsafe_path]}),
+            )
+            .expect_err("workspace-relative paths must remain contained");
+            assert_eq!(error.code, rpc_error_codes::INVALID_PARAMS);
+        }
     }
 
     #[tokio::test]
