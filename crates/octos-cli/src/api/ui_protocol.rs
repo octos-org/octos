@@ -5684,6 +5684,20 @@ struct RawLlmSelection {
 }
 
 #[derive(Debug, Default, Deserialize)]
+struct RawProfileLlmSelectParams {
+    #[serde(default)]
+    profile_id: Option<String>,
+    #[serde(default)]
+    session_id: Option<SessionKey>,
+    #[serde(default)]
+    family_id: Option<String>,
+    #[serde(default)]
+    model_id: Option<String>,
+    #[serde(default)]
+    route_id: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
 struct RawProfileLlmUpsertParams {
     #[serde(default)]
     profile_id: Option<String>,
@@ -7038,43 +7052,96 @@ fn profile_llm_list_result(
     })
 }
 
+fn configured_model_status_json(provider: &Value, selected: bool) -> Value {
+    json!({
+        "model": provider.get("model_id").and_then(Value::as_str).unwrap_or("unknown"),
+        "provider": provider.get("family_id").and_then(Value::as_str).unwrap_or("unknown"),
+        "title": format!(
+            "{} / {}",
+            provider.get("family_id").and_then(Value::as_str).unwrap_or("unknown"),
+            provider.get("model_id").and_then(Value::as_str).unwrap_or("unknown")
+        ),
+        "family": provider.get("family_id").cloned(),
+        "route": provider.get("route_id").cloned(),
+        "selected": selected,
+        "available": true,
+        "queue_mode": "adaptive",
+        "qoe_policy": "profile",
+    })
+}
+
 fn model_list_result(
     state: &AppState,
     session_id: SessionKey,
     profile_id: &str,
     profile: Option<&crate::profiles::UserProfile>,
 ) -> Value {
-    let primary = profile_llm_list_result(state, profile_id, profile)
+    // EVERY configured model rides the list — the primary as `selected`,
+    // fallbacks as switchable alternatives (`profile/llm/select` promotes
+    // one to primary). A single-primary profile keeps its one-entry shape.
+    let listed = profile_llm_list_result(state, profile_id, profile);
+    let primary = listed
         .get("primary")
         .cloned()
         .filter(|value| !value.is_null());
-    let models = primary
+    let fallbacks = listed
+        .get("fallbacks")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let mut models = primary
         .into_iter()
-        .map(|provider| {
-            json!({
-                "model": provider.get("model_id").and_then(Value::as_str).unwrap_or("unknown"),
-                "provider": provider.get("family_id").and_then(Value::as_str).unwrap_or("unknown"),
-                "title": format!(
-                    "{} / {}",
-                    provider.get("family_id").and_then(Value::as_str).unwrap_or("unknown"),
-                    provider.get("model_id").and_then(Value::as_str).unwrap_or("unknown")
-                ),
-                "family": provider.get("family_id").cloned(),
-                "route": provider.get("route_id").cloned(),
-                "selected": true,
-                "available": true,
-                "queue_mode": "adaptive",
-                "qoe_policy": "profile",
-            })
-        })
+        .map(|provider| configured_model_status_json(&provider, true))
         .collect::<Vec<_>>();
+    models.extend(
+        fallbacks
+            .iter()
+            .map(|provider| configured_model_status_json(provider, false)),
+    );
     json!({ "session_id": session_id, "models": models })
 }
 
-fn raw_catalog_result() -> Result<Value, RpcError> {
-    let families = serde_json::from_str::<Value>(DASHBOARD_PROVIDERS_JSON).map_err(|err| {
+fn raw_catalog_result(state: &AppState) -> Result<Value, RpcError> {
+    let mut families = serde_json::from_str::<Value>(DASHBOARD_PROVIDERS_JSON).map_err(|err| {
         RpcError::internal_error(format!("dashboard provider catalog was not JSON: {err}"))
     })?;
+    // Union in the QoS model catalog (model_catalog.json): it tracks the LIVE
+    // model lineup per provider (e.g. new zai GLM releases) while the bundled
+    // dashboard catalog is hand-maintained and lags. Only models are merged —
+    // a family absent from the bundled catalog has no key-env/route metadata,
+    // so it cannot be onboarded and is skipped.
+    let data_dir = state
+        .profile_store
+        .as_ref()
+        .map(|store| store.octos_home_dir().to_path_buf())
+        .unwrap_or_default();
+    if let Some(qos) = crate::qos_catalog::load_seed_qos_catalog(&data_dir) {
+        if let Some(families_map) = families.as_object_mut() {
+            for entry in &qos.models {
+                let Some((family_id, model_id)) = entry.provider.split_once('/') else {
+                    continue;
+                };
+                let Some(models) = families_map
+                    .get_mut(family_id)
+                    .and_then(|family| family.get_mut("models"))
+                    .and_then(Value::as_array_mut)
+                else {
+                    continue;
+                };
+                let known = models
+                    .iter()
+                    .any(|model| model.get("id").and_then(Value::as_str) == Some(model_id));
+                if !known {
+                    models.push(json!({
+                        "id": model_id,
+                        "input": entry.cost_in,
+                        "output": entry.cost_out,
+                        "max_output": entry.max_output,
+                    }));
+                }
+            }
+        }
+    }
     Ok(json!({ "families": families }))
 }
 
@@ -7357,6 +7424,135 @@ async fn raw_profile_skills_remove(
         "ok": true,
         "removed": removed,
         "message": format!("Removed skill: {removed}"),
+    }))
+}
+
+/// `profile/llm/select` — promote one CONFIGURED model (the primary or any
+/// fallback) to be the ACTIVE primary. The demoted primary becomes a fallback,
+/// so switching back and forth never loses a configuration. Persisted to the
+/// profile store, and the profile's cached runtimes are evicted so the very
+/// next turn runs on the newly selected model — no restart.
+async fn raw_profile_llm_select(
+    state: &Arc<AppState>,
+    request: &RpcRequest<Value>,
+    connection_profile_id: Option<&str>,
+) -> Result<Value, RpcError> {
+    let params: RawProfileLlmSelectParams = parse_raw_params(request)?;
+    let profile_id = raw_profile_id(
+        &RawProfileParams {
+            profile_id: params.profile_id.clone(),
+            session_id: params.session_id.clone(),
+        },
+        connection_profile_id,
+    );
+    let model_id = nonempty(params.model_id)
+        .ok_or_else(|| RpcError::invalid_params("model_id is required"))?;
+    let family_id = nonempty(params.family_id);
+    let route_id = nonempty(params.route_id).filter(|route| route != "official");
+
+    let store = profile_store(state)?;
+    let mut profile = store
+        .get(&profile_id)
+        .map_err(|err| RpcError::internal_error(format!("failed to read profile: {err}")))?
+        .ok_or_else(|| RpcError::not_found("profile", profile_id.clone()))?;
+
+    let mut llm = profile.config.llm.take().unwrap_or_default();
+    let matches_selection = |selection: &crate::profiles::LlmModelSelectionConfig| {
+        selection.model_id.as_deref() == Some(model_id.as_str())
+            && family_id
+                .as_deref()
+                .is_none_or(|family| selection.family_id.as_deref() == Some(family))
+            && route_id.as_deref().is_none_or(|route| {
+                selection
+                    .route
+                    .as_ref()
+                    .and_then(|selection_route| selection_route.route_id.as_deref())
+                    == Some(route)
+            })
+    };
+
+    let already_primary = llm.primary.as_ref().is_some_and(&matches_selection);
+    let mut applied = already_primary;
+    if !already_primary {
+        let Some(index) = llm.fallbacks.iter().position(&matches_selection) else {
+            profile.config.llm = Some(llm);
+            return Err(RpcError::not_found(
+                "configured model",
+                format!(
+                    "{model_id} (not configured on profile '{profile_id}' — save it first \
+                     via profile/llm/upsert / the onboarding provider step)"
+                ),
+            ));
+        };
+        let promoted = llm.fallbacks.remove(index);
+        if let Some(demoted) = llm.primary.take() {
+            upsert_llm_fallback(&mut llm.fallbacks, demoted);
+        }
+        llm.primary = Some(promoted);
+        applied = true;
+    }
+    profile.config.llm = Some(llm);
+
+    if !already_primary {
+        profile.updated_at = Utc::now();
+        store
+            .save_with_merge(&mut profile)
+            .map_err(|err| RpcError::internal_error(format!("failed to save profile: {err}")))?;
+
+        // The switch must take effect on the NEXT turn, not the next restart:
+        // cached SessionRuntimes embed the old provider chain and the dynamic
+        // ProfileRuntime caches forever, so evict both and re-bootstrap.
+        state.session_cache.invalidate_profile(&profile_id).await;
+        if let Some(key) = dynamic_profile_runtime_key(state, &profile_id) {
+            dynamic_profile_runtimes().write().await.remove(&key);
+        }
+        if state.profiles.contains_key(&profile_id) {
+            // Startup-config profiles live in an immutable map — the saved
+            // selection persists but cannot rebuild without a restart.
+            tracing::warn!(
+                profile_id = %profile_id,
+                "profile/llm/select saved, but this startup-config profile's runtime \
+                 rebuilds on restart only"
+            );
+        } else if let Err(error) = ensure_session_profile_runtime(state, Some(&profile_id)).await {
+            tracing::warn!(
+                profile_id = %profile_id,
+                error = %error.message,
+                "profile/llm/select saved; runtime bootstrap deferred to the next turn",
+            );
+        }
+    }
+
+    let session_id = params
+        .session_id
+        .unwrap_or_else(|| SessionKey::with_profile_topic(&profile_id, "local", "tui", "coding"));
+    let refreshed = store
+        .get(&profile_id)
+        .ok()
+        .flatten()
+        .or(Some(profile))
+        .unwrap();
+    let models = model_list_result(state, session_id.clone(), &profile_id, Some(&refreshed));
+    let selected = models
+        .get("models")
+        .and_then(Value::as_array)
+        .and_then(|models| {
+            models
+                .iter()
+                .find(|model| model.get("selected") == Some(&Value::Bool(true)))
+                .cloned()
+        })
+        .unwrap_or_else(|| json!({ "model": model_id, "selected": true }));
+    Ok(json!({
+        "session_id": session_id,
+        "selected": selected,
+        "applied": applied,
+        "runtime_policy_stamp": runtime_policy_stamp_for_profile(
+            state,
+            &profile_id,
+            Some(&session_id),
+            Some(&refreshed),
+        ),
     }))
 }
 
@@ -8125,7 +8321,7 @@ async fn handle_raw_appui_rpc(
         APPUI_METHOD_SESSION_STATUS_READ => {
             raw_session_status_result(state, request, features, connection_profile_id).await
         }
-        APPUI_METHOD_PROFILE_LLM_CATALOG => raw_catalog_result(),
+        APPUI_METHOD_PROFILE_LLM_CATALOG => raw_catalog_result(state),
         APPUI_METHOD_PROFILE_LLM_LIST => {
             let params: RawProfileParams = match parse_raw_params(request) {
                 Ok(params) => params,
@@ -8161,41 +8357,7 @@ async fn handle_raw_appui_rpc(
             raw_profile_llm_test(state, request, connection_profile_id).await
         }
         APPUI_METHOD_PROFILE_LLM_SELECT => {
-            let params: RawProfileParams = match parse_raw_params(request) {
-                Ok(params) => params,
-                Err(error) => {
-                    let _ = send_rpc_error(ws, Some(id), error);
-                    return true;
-                }
-            };
-            let profile_id = raw_profile_id(&params, connection_profile_id);
-            let profile = state
-                .profile_store
-                .as_ref()
-                .and_then(|store| store.get(&profile_id).ok().flatten());
-            let session_id = params.session_id.unwrap_or_else(|| {
-                SessionKey::with_profile_topic(&profile_id, "local", "tui", "coding")
-            });
-            let models =
-                model_list_result(state, session_id.clone(), &profile_id, profile.as_ref());
-            let selected = models
-                .get("models")
-                .and_then(Value::as_array)
-                .and_then(|models| models.first())
-                .cloned()
-                .unwrap_or_else(|| {
-                    json!({
-                        "model": "unknown",
-                        "provider": "unknown",
-                        "selected": true
-                    })
-                });
-            Ok(json!({
-                "session_id": session_id,
-                "selected": selected,
-                "applied": true,
-                "runtime_policy_stamp": runtime_policy_stamp_for_profile(state, &profile_id, Some(&session_id), profile.as_ref()),
-            }))
+            raw_profile_llm_select(state, request, connection_profile_id).await
         }
         APPUI_METHOD_PROFILE_LLM_DELETE => {
             let params: RawProfileParams = match parse_raw_params(request) {
@@ -25203,6 +25365,169 @@ mod tests {
             solo_login_enabled: true,
             ..AppState::empty_for_tests()
         }
+    }
+
+    /// Multi-model profiles: `profile/llm/list`-backed model list exposes the
+    /// primary AND every fallback; `profile/llm/select` promotes a fallback to
+    /// the active primary (demoting the old primary to a fallback), persists,
+    /// and is idempotent for the current primary; unconfigured models reject.
+    #[tokio::test]
+    async fn llm_select_promotes_fallback_and_lists_all_models() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = Arc::new(local_profile_state(dir.path()));
+        for (family, model, set_primary) in [
+            ("deepseek", "deepseek-v4-pro", true),
+            ("zai", "glm-5.2", false),
+        ] {
+            let request = RpcRequest::new(
+                format!("u-{model}"),
+                APPUI_METHOD_PROFILE_LLM_UPSERT.to_string(),
+                json!({
+                    "profile_id": "dev",
+                    "selection": {
+                        "family_id": family,
+                        "model_id": model,
+                        "route": { "route_id": "official" },
+                    },
+                    "set_primary": set_primary,
+                }),
+            );
+            raw_profile_llm_upsert(&state, &request, None)
+                .await
+                .expect("upsert");
+        }
+
+        let profile = state.profile_store.as_ref().unwrap().get("dev").unwrap();
+        let models = model_list_result(
+            &state,
+            SessionKey("dev:local:t".into()),
+            "dev",
+            profile.as_ref(),
+        );
+        let list = models["models"].as_array().unwrap();
+        assert_eq!(list.len(), 2, "primary + fallback both listed: {models}");
+        assert_eq!(list[0]["model"], "deepseek-v4-pro");
+        assert_eq!(list[0]["selected"], true);
+        assert_eq!(list[1]["model"], "glm-5.2");
+        assert_eq!(list[1]["selected"], false);
+
+        let request = RpcRequest::new(
+            "s1".to_string(),
+            APPUI_METHOD_PROFILE_LLM_SELECT.to_string(),
+            json!({
+                "profile_id": "dev",
+                "family_id": "zai",
+                "model_id": "glm-5.2",
+                "route_id": "official",
+            }),
+        );
+        let result = raw_profile_llm_select(&state, &request, None)
+            .await
+            .expect("select");
+        assert_eq!(result["applied"], true);
+        assert_eq!(result["selected"]["model"], "glm-5.2");
+        assert_eq!(result["selected"]["selected"], true);
+
+        let profile = state
+            .profile_store
+            .as_ref()
+            .unwrap()
+            .get("dev")
+            .unwrap()
+            .unwrap();
+        let llm = profile.config.llm.as_ref().unwrap();
+        assert_eq!(
+            llm.primary.as_ref().unwrap().model_id.as_deref(),
+            Some("glm-5.2"),
+            "fallback promoted to primary"
+        );
+        assert_eq!(llm.fallbacks.len(), 1, "demoted primary kept as fallback");
+        assert_eq!(
+            llm.fallbacks[0].model_id.as_deref(),
+            Some("deepseek-v4-pro")
+        );
+
+        let request = RpcRequest::new(
+            "s2".to_string(),
+            APPUI_METHOD_PROFILE_LLM_SELECT.to_string(),
+            json!({ "profile_id": "dev", "model_id": "glm-5.2" }),
+        );
+        let result = raw_profile_llm_select(&state, &request, None)
+            .await
+            .expect("selecting the current primary is idempotent");
+        assert_eq!(result["applied"], true);
+
+        let request = RpcRequest::new(
+            "s3".to_string(),
+            APPUI_METHOD_PROFILE_LLM_SELECT.to_string(),
+            json!({ "profile_id": "dev", "model_id": "kimi-k2.5" }),
+        );
+        let error = raw_profile_llm_select(&state, &request, None)
+            .await
+            .expect_err("unconfigured model must reject");
+        assert_eq!(error.code, rpc_error_codes::RESOURCE_NOT_FOUND);
+    }
+
+    /// The onboarding catalog unions the QoS model catalog into the bundled
+    /// families — new provider releases (e.g. zai GLM updates) appear without
+    /// waiting for the hand-maintained dashboard list; families with no
+    /// onboarding metadata (key env/route) are skipped.
+    #[test]
+    fn catalog_result_unions_qos_models_into_families() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("model_catalog.json"),
+            serde_json::to_string(&json!({
+                "updated_at": "2026-07-10T00:00:00Z",
+                "models": [
+                    {
+                        "provider": "zai/glm-9.9-test",
+                        "type": "strong",
+                        "stability": 0.7,
+                        "tool_avg_ms": 1,
+                        "p95_ms": 1,
+                        "score": 0.1,
+                        "cost_in": 1.0,
+                        "cost_out": 4.0,
+                        "ds_output": 1,
+                        "context_window": 1000,
+                        "max_output": 99
+                    },
+                    {
+                        "provider": "unknownfam/mystery-1",
+                        "type": "fast",
+                        "stability": 0.5,
+                        "tool_avg_ms": 1,
+                        "p95_ms": 1,
+                        "score": 0.2,
+                        "cost_in": 0.1,
+                        "cost_out": 0.2,
+                        "ds_output": 1,
+                        "context_window": 1000,
+                        "max_output": 9
+                    }
+                ]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let state = local_profile_state(dir.path());
+
+        let catalog = raw_catalog_result(&state).expect("catalog");
+        let families = &catalog["families"];
+        let zai_models = families["zai"]["models"].as_array().unwrap();
+        assert!(
+            zai_models.iter().any(|model| model["id"] == "glm-9.9-test"),
+            "QoS-only zai model unioned in: {zai_models:?}"
+        );
+        assert!(
+            zai_models.iter().any(|model| model["id"] == "glm-5.2"),
+            "bundled zai lineup still present"
+        );
+        assert!(
+            families.get("unknownfam").is_none(),
+            "families without onboarding metadata are skipped"
+        );
     }
 
     fn local_profile_state_with_sessions(dir: &Path) -> Arc<AppState> {

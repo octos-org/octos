@@ -489,6 +489,15 @@ impl SessionRuntimeCache {
         guard.remove(key);
     }
 
+    /// Drop every cached session runtime belonging to `profile_id`. Used when
+    /// a profile's LLM selection changes at runtime (`profile/llm/select` /
+    /// upsert): cached `SessionRuntime`s embed the OLD provider chain, so the
+    /// next turn must re-materialize against the rebuilt `ProfileRuntime`.
+    pub async fn invalidate_profile(&self, profile_id: &str) {
+        let mut guard = self.inner.write().await;
+        guard.retain(|(key_profile, _), _| key_profile != profile_id);
+    }
+
     /// Drop every entry whose `last_used` is older than
     /// [`Self::idle_ttl`]. Exposed so tests can verify the eviction
     /// invariant without waiting for the 60 s background sweep.
@@ -620,6 +629,39 @@ mod tests {
             lane_routing: None,
             voice: crate::config::VoiceConfig::default(),
         })
+    }
+
+    #[tokio::test]
+    async fn invalidate_profile_sweeps_only_that_profile() {
+        let tmp = TempDir::new().unwrap();
+        let profile_a = make_profile(tmp.path().join("profile-a")).await;
+        let mut profile_b = make_profile(tmp.path().join("profile-b")).await;
+        // `make_profile` fixes the id; give the second a distinct identity so
+        // the sweep has something to spare.
+        std::sync::Arc::get_mut(&mut profile_b)
+            .map(|profile| profile.profile_id = "other".to_owned());
+
+        let cache = SessionRuntimeCache::new(8, Duration::from_secs(60));
+        cache
+            .get_or_init(&profile_a, SessionKey::new("api", "a1"), None)
+            .await
+            .expect("a1");
+        cache
+            .get_or_init(&profile_a, SessionKey::new("api", "a2"), None)
+            .await
+            .expect("a2");
+        cache
+            .get_or_init(&profile_b, SessionKey::new("api", "b1"), None)
+            .await
+            .expect("b1");
+        assert_eq!(cache.len().await, 3);
+
+        cache.invalidate_profile(&profile_a.profile_id).await;
+        assert_eq!(
+            cache.len().await,
+            1,
+            "only the other profile's entry survives"
+        );
     }
 
     #[tokio::test]
