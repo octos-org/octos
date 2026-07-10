@@ -217,6 +217,8 @@ const APPUI_FEATURE_RUNTIME_POLICY_STAMP_V1: &str = "runtime.policy_stamp.v1";
 const APPUI_FEATURE_CONTEXT_LIFECYCLE_V1: &str = "context.lifecycle.v1";
 const APPUI_FEATURE_SKILL_ACTIONS_V1: &str = "skill.actions.v1";
 const APPUI_FEATURE_SKILL_ACTION_JOBS_V1: &str = "skill.action_jobs.v1";
+const MAX_SKILL_ACTION_BATCH_FILES: usize = 32;
+const MAX_ACTIVE_SKILL_ACTION_BATCHES: usize = 8;
 /// #1057: backend onboarding support contract — TUI Solo Onboarding (M22).
 /// Advertises `onboarding/workspace_probe`, which canonicalizes a workspace
 /// candidate path, reports existence/writability, surfaces
@@ -7777,6 +7779,11 @@ fn prepare_skill_action_tool_invocation(
                 RpcError::invalid_params("file_each skill action requires arguments.paths")
             })?;
             let raw_paths = string_array_argument(paths, "paths")?;
+            if raw_paths.len() > MAX_SKILL_ACTION_BATCH_FILES {
+                return Err(RpcError::invalid_params(format!(
+                    "file_each skill action accepts at most {MAX_SKILL_ACTION_BATCH_FILES} files per batch"
+                )));
+            }
             let file_argument = file_argument.unwrap_or("path");
             if args.contains_key(file_argument) {
                 return Err(RpcError::invalid_params(format!(
@@ -7982,7 +7989,7 @@ async fn run_background_skill_action_job(
     let mut running = queued.job.clone();
     running.status = SkillActionJobStatus::Running;
     running.updated_at = Utc::now();
-    append_skill_action_job_snapshot(&store, ledger.as_ref(), &running)?;
+    append_skill_action_job_snapshot_with_retry(&store, ledger.as_ref(), &running).await?;
 
     let result =
         execute_skill_action_tool_call(&running.action_id, &queued.tool, &registry, &queued.args)
@@ -8014,7 +8021,82 @@ async fn run_background_skill_action_job(
             completed.error = Some(error.message);
         }
     }
-    append_skill_action_job_snapshot(&store, ledger.as_ref(), &completed)
+    append_skill_action_job_snapshot_with_retry(&store, ledger.as_ref(), &completed).await
+}
+
+async fn append_skill_action_job_snapshot_with_retry(
+    store: &SkillActionJobStore,
+    ledger: Option<&Arc<UiProtocolLedger>>,
+    job: &SkillActionJobRecord,
+) -> Result<(), RpcError> {
+    let mut last_error = None;
+    for attempt in 0..3 {
+        match append_skill_action_job_snapshot(store, ledger, job) {
+            Ok(()) => return Ok(()),
+            Err(error) => last_error = Some(error),
+        }
+        tokio::time::sleep(Duration::from_millis(25 * (1 << attempt))).await;
+    }
+    Err(last_error.expect("persistence retry loop always records an error"))
+}
+
+fn skill_action_batch_semaphore() -> Arc<tokio::sync::Semaphore> {
+    static SEMAPHORE: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
+    Arc::clone(
+        SEMAPHORE
+            .get_or_init(|| Arc::new(tokio::sync::Semaphore::new(MAX_ACTIVE_SKILL_ACTION_BATCHES))),
+    )
+}
+
+fn exclusive_skill_action_semaphore() -> Arc<tokio::sync::Semaphore> {
+    static SEMAPHORE: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
+    Arc::clone(SEMAPHORE.get_or_init(|| Arc::new(tokio::sync::Semaphore::new(1))))
+}
+
+fn reserve_skill_action_batch() -> Result<tokio::sync::OwnedSemaphorePermit, RpcError> {
+    skill_action_batch_semaphore()
+        .try_acquire_owned()
+        .map_err(|_| {
+            RpcError::invalid_request(
+                "skill action executor is busy; retry after an active batch completes",
+            )
+        })
+}
+
+async fn run_background_skill_action_batch(
+    registry: Arc<octos_agent::ToolRegistry>,
+    queued_jobs: Vec<QueuedSkillActionJob>,
+    store: SkillActionJobStore,
+    ledger: Arc<UiProtocolLedger>,
+    concurrency_class: octos_agent::ConcurrencyClass,
+    _batch_permit: tokio::sync::OwnedSemaphorePermit,
+) {
+    let _exclusive_permit = if concurrency_class == octos_agent::ConcurrencyClass::Exclusive {
+        Some(
+            exclusive_skill_action_semaphore()
+                .acquire_owned()
+                .await
+                .expect("skill action exclusive semaphore is never closed"),
+        )
+    } else {
+        None
+    };
+
+    for queued_job in queued_jobs {
+        if let Err(error) = run_background_skill_action_job(
+            Arc::clone(&registry),
+            queued_job,
+            store.clone(),
+            Some(Arc::clone(&ledger)),
+        )
+        .await
+        {
+            warn!(
+                error = %error.message,
+                "background skill action job failed to persist status"
+            );
+        }
+    }
 }
 
 async fn skill_action_session_runtime(
@@ -8125,6 +8207,7 @@ async fn raw_skill_action_invoke(
             .await
         }
         octos_agent::plugins::SkillActionExecution::Background => {
+            let batch_permit = reserve_skill_action_batch()?;
             let profile_id = session_runtime.profile.profile_id.clone();
             let store = SkillActionJobStore::open(session_runtime.profile.data_dir.as_path());
             let (response, queued_jobs) = enqueue_background_skill_action_jobs(
@@ -8139,22 +8222,20 @@ async fn raw_skill_action_invoke(
                 Some(ledger),
                 params.arguments,
             )?;
-            for queued_job in queued_jobs {
-                let registry = session_runtime.tools.clone();
-                let store = store.clone();
-                let ledger = Arc::clone(ledger);
-                tokio::spawn(async move {
-                    if let Err(error) =
-                        run_background_skill_action_job(registry, queued_job, store, Some(ledger))
-                            .await
-                    {
-                        warn!(
-                            error = %error.message,
-                            "background skill action job failed to persist status"
-                        );
-                    }
-                });
-            }
+            let registry = session_runtime.tools.clone();
+            let concurrency_class = queued_jobs
+                .first()
+                .map(|queued| registry.concurrency_class(&queued.tool))
+                .unwrap_or_default();
+            let ledger = Arc::clone(ledger);
+            tokio::spawn(run_background_skill_action_batch(
+                registry,
+                queued_jobs,
+                store,
+                ledger,
+                concurrency_class,
+                batch_permit,
+            ));
             Ok(response)
         }
     }
@@ -29485,6 +29566,45 @@ ignore = []
                 && job.action_id == "source.import"
                 && job.skill_id == "mofa-notebook-source"
         }));
+    }
+
+    #[test]
+    fn background_skill_action_rejects_oversized_file_batch() {
+        let workspace = tempfile::tempdir().unwrap();
+        let action: octos_agent::plugins::SkillActionDef = serde_json::from_value(json!({
+            "id": "source.import",
+            "label": "Add source",
+            "execution": "background",
+            "input_schema": {
+                "type": "object",
+                "properties": {"paths": {"type": "array", "items": {"type": "string"}}},
+                "required": ["paths"]
+            },
+            "binding": {
+                "type": "tool",
+                "tool": "source_import",
+                "input_mode": "file_each",
+                "file_argument": "path"
+            }
+        }))
+        .unwrap();
+        let mut registry = octos_agent::ToolRegistry::new();
+        registry.register(CaptureActionTool {
+            calls: Arc::new(StdMutex::new(Vec::new())),
+        });
+        let paths = (0..=MAX_SKILL_ACTION_BATCH_FILES)
+            .map(|index| format!("uploads/source-{index}.md"))
+            .collect::<Vec<_>>();
+
+        let error = prepare_skill_action_tool_invocation(
+            &action,
+            &registry,
+            workspace.path(),
+            None,
+            json!({"paths": paths}),
+        )
+        .expect_err("oversized batches must be rejected before jobs are persisted");
+        assert_eq!(error.code, rpc_error_codes::INVALID_PARAMS);
     }
 
     #[tokio::test]
