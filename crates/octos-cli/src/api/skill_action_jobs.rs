@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
@@ -74,15 +74,23 @@ impl SkillActionJobStore {
             fs::create_dir_all(parent)
                 .wrap_err_with(|| format!("failed to create job store dir {}", parent.display()))?;
         }
+        let mut payload = serde_json::to_vec(job)
+            .wrap_err_with(|| format!("failed to serialize job {}", job.job_id))?;
+        payload.push(b'\n');
         let mut file = OpenOptions::new()
             .create(true)
             .append(true)
             .open(&path)
             .wrap_err_with(|| format!("failed to open job store {}", path.display()))?;
-        serde_json::to_writer(&mut file, job)
-            .wrap_err_with(|| format!("failed to serialize job {}", job.job_id))?;
-        file.write_all(b"\n")
-            .wrap_err_with(|| format!("failed to append job {}", job.job_id))?;
+        fs2::FileExt::lock_exclusive(&file)
+            .wrap_err_with(|| format!("failed to lock job store {}", path.display()))?;
+        let write_result = file
+            .write_all(&payload)
+            .wrap_err_with(|| format!("failed to append job {}", job.job_id));
+        let unlock_result = fs2::FileExt::unlock(&file)
+            .wrap_err_with(|| format!("failed to unlock job store {}", path.display()));
+        write_result?;
+        unlock_result?;
         Ok(())
     }
 
@@ -161,7 +169,7 @@ impl SkillActionJobStore {
     }
 
     fn read_snapshots_from_path(&self, path: &Path) -> Result<Vec<SkillActionJobRecord>> {
-        let file = match File::open(path) {
+        let mut file = match File::open(path) {
             Ok(file) => file,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
             Err(error) => {
@@ -169,27 +177,46 @@ impl SkillActionJobStore {
                     .wrap_err_with(|| format!("failed to open job store {}", path.display()));
             }
         };
-        let reader = BufReader::new(file);
+        fs2::FileExt::lock_shared(&file)
+            .wrap_err_with(|| format!("failed to lock job store {}", path.display()))?;
+        let mut contents = Vec::new();
+        let read_result = file
+            .read_to_end(&mut contents)
+            .wrap_err_with(|| format!("failed to read job store {}", path.display()));
+        let unlock_result = fs2::FileExt::unlock(&file)
+            .wrap_err_with(|| format!("failed to unlock job store {}", path.display()));
+        read_result?;
+        unlock_result?;
+
+        let lines = contents.split(|byte| *byte == b'\n').collect::<Vec<_>>();
+        let last_non_empty = lines
+            .iter()
+            .rposition(|line| !line.iter().all(u8::is_ascii_whitespace));
         let mut records = Vec::new();
-        for (index, line) in reader.lines().enumerate() {
-            let line = line.wrap_err_with(|| {
-                format!(
-                    "failed to read job store line {} in {}",
-                    index + 1,
-                    path.display()
-                )
-            })?;
-            if line.trim().is_empty() {
+        for (index, line) in lines.into_iter().enumerate() {
+            if line.iter().all(u8::is_ascii_whitespace) {
                 continue;
             }
-            let record: SkillActionJobRecord = serde_json::from_str(&line).wrap_err_with(|| {
-                format!(
-                    "failed to parse job store line {} in {}",
-                    index + 1,
-                    path.display()
-                )
-            })?;
-            records.push(record);
+            match serde_json::from_slice(line) {
+                Ok(record) => records.push(record),
+                Err(error) if Some(index) == last_non_empty => {
+                    tracing::warn!(
+                        path = %path.display(),
+                        line = index + 1,
+                        %error,
+                        "ignoring malformed trailing skill action job snapshot"
+                    );
+                }
+                Err(error) => {
+                    return Err(error).wrap_err_with(|| {
+                        format!(
+                            "failed to parse job store line {} in {}",
+                            index + 1,
+                            path.display()
+                        )
+                    });
+                }
+            }
         }
         Ok(records)
     }
@@ -221,6 +248,8 @@ pub(crate) fn recover_skill_action_jobs_for_profile_start(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use chrono::{Duration, Utc};
     use octos_core::SessionKey;
     use serde_json::json;
@@ -430,5 +459,80 @@ mod tests {
         assert!(jobs.iter().any(|job| {
             job.job_id == "job-finished" && job.status == SkillActionJobStatus::Succeeded
         }));
+    }
+
+    #[test]
+    fn should_preserve_every_snapshot_when_appends_are_concurrent() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(SkillActionJobStore::open(dir.path()));
+        let session_id = SessionKey("local:concurrent".to_string());
+        let mut threads = Vec::new();
+
+        for index in 0..32 {
+            let store = Arc::clone(&store);
+            let session_id = session_id.clone();
+            threads.push(std::thread::spawn(move || {
+                store
+                    .append(&record(
+                        &session_id,
+                        &format!("job-{index}"),
+                        SkillActionJobStatus::Queued,
+                        index,
+                    ))
+                    .unwrap();
+            }));
+        }
+        for thread in threads {
+            thread.join().unwrap();
+        }
+
+        let snapshots = store.read_session_snapshots_for_test(&session_id).unwrap();
+        assert_eq!(snapshots.len(), 32);
+    }
+
+    #[test]
+    fn should_ignore_only_a_malformed_trailing_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SkillActionJobStore::open(dir.path());
+        let session_id = SessionKey("local:torn-tail".to_string());
+        let valid = serde_json::to_string(&record(
+            &session_id,
+            "job-valid",
+            SkillActionJobStatus::Succeeded,
+            1,
+        ))
+        .unwrap();
+        std::fs::create_dir_all(store.jobs_dir()).unwrap();
+        std::fs::write(
+            store.session_path(&session_id),
+            format!("{valid}\n{{\"job_id\":\"torn"),
+        )
+        .unwrap();
+
+        let jobs = store.list(&session_id).unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].job_id, "job-valid");
+    }
+
+    #[test]
+    fn should_reject_a_malformed_snapshot_before_the_trailing_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SkillActionJobStore::open(dir.path());
+        let session_id = SessionKey("local:bad-middle".to_string());
+        let valid = serde_json::to_string(&record(
+            &session_id,
+            "job-valid",
+            SkillActionJobStatus::Succeeded,
+            1,
+        ))
+        .unwrap();
+        std::fs::create_dir_all(store.jobs_dir()).unwrap();
+        std::fs::write(
+            store.session_path(&session_id),
+            format!("{{broken\n{valid}\n"),
+        )
+        .unwrap();
+
+        assert!(store.list(&session_id).is_err());
     }
 }
