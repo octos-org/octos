@@ -20,6 +20,7 @@ mod frps_plugin;
 pub(crate) mod goal_loop_runtime;
 mod handlers;
 pub(crate) mod master_continuation_scheduler;
+mod memory_panel;
 pub mod metrics;
 pub(crate) mod ominix_runtime;
 pub mod preview;

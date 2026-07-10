@@ -19,6 +19,7 @@ use super::bilibili;
 use super::events_harness;
 use super::frps_plugin;
 use super::handlers;
+use super::memory_panel;
 use super::metrics;
 use super::purge;
 use super::session_ingress;
@@ -217,6 +218,13 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/my/voice", put(auth_handlers::set_my_voice))
         // Per-tenant voice-assistant pre-flight: ASR + LLM + (route-aware) TTS.
         .route("/api/voice/readiness", get(auth_handlers::voice_readiness))
+        // Memory panel (web parity P3): read-only per-profile memory
+        // surface — MEMORY.md, daily notes, entity bank, staging count.
+        .route("/api/my/memory", get(memory_panel::my_memory))
+        .route(
+            "/api/my/memory/entities/{name}",
+            get(memory_panel::my_memory_entity),
+        )
         .route("/api/my/soul", get(auth_handlers::my_soul))
         .route("/api/my/soul", put(auth_handlers::update_my_soul))
         .route("/api/my/soul", delete(auth_handlers::delete_my_soul))
