@@ -3242,15 +3242,25 @@ pub struct MemoryEntityResult {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CronListParams {}
 
-/// Result for `cron/list`. Mirrors the JSON body of `GET /api/my/cron`:
-/// `jobs` is the rendered job array, `count` its length, and
+/// Result for `cron/list`. Mirrors the JSON body of `GET /api/my/cron`
+/// minus the redundant `ok` flag: `jobs` is the rendered job array and
 /// `gateway_running` reports whether a spawned gateway child owns
 /// `cron.json` (toggles are refused while it does).
+///
+/// WS bounding (the RPC result must fit one ~1 MiB text frame): each
+/// row's user-supplied strings (`id`, `name`, `channel`, `last_status`,
+/// `timezone`) are capped per field — a fired cap is DECLARED beside
+/// the field as `<field>_truncated` + `<field>_total_bytes` (absent
+/// when the field fit) — and rows are kept whole in file order until
+/// the array budget is spent. `jobs_truncated` reports a cut list;
+/// `count` always reports the FULL store size (it can exceed
+/// `jobs.len()` when `jobs_truncated` is true).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CronListResult {
     pub jobs: Value,
     pub count: usize,
     pub gateway_running: bool,
+    pub jobs_truncated: bool,
 }
 
 /// Params for `cron/toggle`.
@@ -3261,9 +3271,10 @@ pub struct CronToggleParams {
 }
 
 /// Result for `cron/toggle`. `job` is the updated job rendered exactly
-/// as a `cron/list` entry. Refusals (spawned gateway owns the store)
-/// surface as an RPC error whose `data.detail` is `"gateway_running"`
-/// with `data.rest_status = 409`.
+/// as a `cron/list` entry — including the same per-field caps and
+/// fire-only truncation declarations. Refusals (spawned gateway owns
+/// the store) surface as an RPC error whose `data.detail` is
+/// `"gateway_running"` with `data.rest_status = 409`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CronToggleResult {
     pub job: Value,
@@ -11131,6 +11142,7 @@ mod tests {
             jobs: serde_json::json!([{ "id": "job-1" }]),
             count: 1,
             gateway_running: false,
+            jobs_truncated: false,
         };
         let value = serde_json::to_value(&cron).expect("serialize");
         let decoded: CronListResult = serde_json::from_value(value).expect("deserialize");
@@ -11571,18 +11583,22 @@ mod tests {
             }),
         );
 
-        // cron/list — `{ jobs, count, gateway_running }`
+        // cron/list — `{ jobs, count, gateway_running, jobs_truncated }`
+        // (`jobs_truncated` declares a budget-cut list; `count` keeps
+        // the full store size).
         assert_eq!(
             serde_json::to_value(CronListResult {
                 jobs: serde_json::json!([{ "id": "job-1" }]),
                 count: 1,
                 gateway_running: true,
+                jobs_truncated: false,
             })
             .expect("serialize"),
             serde_json::json!({
                 "jobs": [{ "id": "job-1" }],
                 "count": 1,
                 "gateway_running": true,
+                "jobs_truncated": false,
             }),
         );
 

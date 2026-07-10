@@ -15288,6 +15288,49 @@ fn cap_memory_value_field(obj: &mut Value, field: &str, budget: usize) {
     }
 }
 
+/// Per-field ESCAPED budget for user-supplied cron row strings (codex
+/// #1629 r1 P2: with the REST fallback retired, the RPC path is the
+/// ONLY list path — an oversized job name must degrade DECLARED, not
+/// via the framing guard's silent splice). `message` is already capped
+/// at 100 chars by `cron_panel::job_json`; the remaining user-file
+/// strings (`id`, `name`, `channel`, `last_status`, `timezone`) get
+/// this cap. Unlike the always-present memory flags, row flags are
+/// written ONLY when a cap fires — rows carry five capped fields and
+/// always-present flags would triple normal row size for zero
+/// information.
+const CRON_RPC_FIELD_BUDGET: usize = 2 * 1024;
+/// Whole `jobs` array ESCAPED budget for `cron/list`. Rows are kept
+/// whole in file order until the budget is spent; the remainder is
+/// declared via `jobs_truncated` while `count` keeps reporting the
+/// FULL store size.
+const CRON_RPC_JOBS_BUDGET: usize = 640 * 1024;
+
+/// Cap one user-string field of a rendered cron row, declaring
+/// `<field>_truncated` + `<field>_total_bytes` beside it IFF the cap
+/// fired (see [`CRON_RPC_FIELD_BUDGET`] for why row flags are
+/// fire-only).
+fn cap_cron_row_field(job: &mut Value, field: &str) {
+    let Some(Value::String(s)) = job.get_mut(field) else {
+        return;
+    };
+    let total = s.len();
+    let cut = cap_index_by_escaped_len(s, CRON_RPC_FIELD_BUDGET);
+    if cut < s.len() {
+        s.truncate(cut);
+        if let Some(map) = job.as_object_mut() {
+            map.insert(format!("{field}_truncated"), json!(true));
+            map.insert(format!("{field}_total_bytes"), json!(total));
+        }
+    }
+}
+
+/// Cap every user-supplied string field of one rendered cron row.
+fn cap_cron_job_fields(job: &mut Value) {
+    for field in ["id", "name", "channel", "last_status", "timezone"] {
+        cap_cron_row_field(job, field);
+    }
+}
+
 /// Apply the per-field budgets to a serialized `MemoryOverviewResponse`.
 fn apply_memory_overview_budgets(overview: &mut Value) {
     cap_memory_value_field(overview, "long_term", MEMORY_RPC_LONG_TERM_BUDGET);
@@ -15450,22 +15493,49 @@ async fn handle_cron_list(
     match result {
         Ok(axum::Json(body)) => {
             // The REST body is `{ ok, count, jobs, gateway_running }`;
-            // `ok` is dropped (envelope carries success), the rest is
-            // forwarded field-for-field per `CronListResult`.
-            let jobs = body.get("jobs").cloned().unwrap_or_else(|| json!([]));
+            // `ok` is dropped (envelope carries success). Rows are
+            // bounded for the WS frame (codex #1629 r1 P2): each row's
+            // user strings get [`CRON_RPC_FIELD_BUDGET`] caps (declared
+            // per field when fired), and rows are kept whole in file
+            // order until [`CRON_RPC_JOBS_BUDGET`] is spent — the
+            // remainder is DECLARED via `jobs_truncated` while `count`
+            // still reports the full store size.
+            let jobs = match body.get("jobs").cloned() {
+                Some(Value::Array(jobs)) => jobs,
+                _ => Vec::new(),
+            };
             let count = body.get("count").and_then(Value::as_u64).unwrap_or(0) as usize;
             let gateway_running = body
                 .get("gateway_running")
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
+            let mut kept: Vec<Value> = Vec::with_capacity(jobs.len());
+            let mut used = 0usize;
+            let mut jobs_truncated = false;
+            for mut job in jobs {
+                cap_cron_job_fields(&mut job);
+                // Serialized length IS the escaped wire cost (+1 for
+                // the array separator). A row that fails to serialize
+                // can never be framed — treat it as over-budget.
+                let row_cost = serde_json::to_string(&job)
+                    .map(|row| row.len() + 1)
+                    .unwrap_or(usize::MAX);
+                if used.saturating_add(row_cost) > CRON_RPC_JOBS_BUDGET {
+                    jobs_truncated = true;
+                    break;
+                }
+                used += row_cost;
+                kept.push(job);
+            }
             send_aux_rpc_result(
                 ws,
                 id,
                 method,
                 json!({
-                    "jobs": jobs,
+                    "jobs": kept,
                     "count": count,
                     "gateway_running": gateway_running,
+                    "jobs_truncated": jobs_truncated,
                 }),
             );
         }
@@ -15515,9 +15585,11 @@ async fn handle_cron_toggle(
     match result {
         Ok(axum::Json(body)) => {
             // REST success body is `{ ok: true, job }`; forward the job
-            // (rendered exactly as a `cron/list` entry) per
+            // (rendered exactly as a `cron/list` entry, including the
+            // same per-field caps — codex #1629 r1 P2) per
             // `CronToggleResult`.
-            let job = body.get("job").cloned().unwrap_or_else(|| json!(null));
+            let mut job = body.get("job").cloned().unwrap_or_else(|| json!(null));
+            cap_cron_job_fields(&mut job);
             send_aux_rpc_result(ws, id, method, json!({ "job": job }));
         }
         Err((status, axum::Json(body))) => {
@@ -28816,8 +28888,11 @@ ignore = []
         assert_eq!(frame["id"], json!("cron-list"));
         assert_eq!(frame["result"]["count"], json!(1));
         assert_eq!(frame["result"]["gateway_running"], json!(false));
+        assert_eq!(frame["result"]["jobs_truncated"], json!(false));
         assert_eq!(frame["result"]["jobs"][0]["id"], json!("job-1"));
         assert_eq!(frame["result"]["jobs"][0]["enabled"], json!(false));
+        // Row caps did not fire — fire-only flags stay absent.
+        assert!(frame["result"]["jobs"][0].get("name_truncated").is_none());
         assert!(frame["result"].get("ok").is_none());
 
         // cron/toggle — updated job forwarded under `job`.
@@ -28958,6 +29033,98 @@ ignore = []
         assert_eq!(served, &entity_page[..served.len()]);
     }
 
+    /// codex #1629 r1 P2: with the REST list retired, the RPC path must
+    /// bound cron rows itself — oversized user strings degrade with a
+    /// DECLARED per-field cap, and an over-budget row list is cut whole
+    /// rows at a time with `jobs_truncated` while `count` keeps the
+    /// full store size. The framing guard's silent splice must stay
+    /// unreachable.
+    #[tokio::test]
+    async fn cron_rpc_methods_bound_rows_and_declare_truncation() {
+        let dir = tempfile::tempdir().unwrap();
+        let profile_store = Arc::new(crate::profiles::ProfileStore::open(dir.path()).unwrap());
+        let profile = panel_user_profile("tenant");
+        profile_store.save(&profile).unwrap();
+        let data_dir = profile_store.resolve_data_dir(&profile);
+        tokio::fs::create_dir_all(&data_dir).await.unwrap();
+
+        // Job 0: pathological 64 KiB name; jobs 1..400: ~2 KiB names so
+        // the aggregate blows the 640 KiB array budget.
+        let mut jobs = vec![panel_cron_job("job-giant", false)];
+        jobs[0].name = "n".repeat(64 * 1024);
+        for i in 0..400 {
+            let mut job = panel_cron_job(&format!("job-{i}"), false);
+            job.name = format!("{i}-{}", "x".repeat(2048));
+            jobs.push(job);
+        }
+        let total_jobs = jobs.len();
+        let cron_store = octos_bus::CronStore { version: 1, jobs };
+        tokio::fs::write(
+            data_dir.join("cron.json"),
+            serde_json::to_string_pretty(&cron_store).unwrap(),
+        )
+        .await
+        .unwrap();
+
+        let state = Arc::new(AppState {
+            profile_store: Some(profile_store),
+            ..AppState::empty_for_tests()
+        });
+        let headers = HeaderMap::new();
+        let identity = AuthIdentity::User {
+            id: "tenant".into(),
+            role: crate::user_store::UserRole::User,
+        };
+        let (ws, mut rx) = ws_connection_for_test(16);
+
+        handle_cron_list(
+            &ws,
+            &state,
+            &headers,
+            Some(&identity),
+            true,
+            "cron-list-bounded".into(),
+            CronListParams::default(),
+        )
+        .await;
+        let frame = recv_rpc_json(&mut rx).await;
+        let result = &frame["result"];
+        // Full store size survives the cut.
+        assert_eq!(result["count"], json!(total_jobs));
+        assert_eq!(result["jobs_truncated"], json!(true));
+        let kept = result["jobs"].as_array().unwrap();
+        assert!(kept.len() < total_jobs, "row list must be cut");
+        assert!(!kept.is_empty(), "capped rows must still be served");
+        // The giant name was capped per field, DECLARED, first in file order.
+        let giant = &kept[0];
+        assert_eq!(giant["name_truncated"], json!(true));
+        assert_eq!(giant["name_total_bytes"], json!(64 * 1024));
+        assert!(giant["name"].as_str().unwrap().len() <= CRON_RPC_FIELD_BUDGET);
+        // The whole result provably fits one WS frame.
+        let wire = serde_json::to_string(result).expect("serialize");
+        assert!(wire.len() <= MAX_TEXT_FRAME_BYTES);
+
+        // cron/toggle returns the SAME bounded row shape.
+        handle_cron_toggle(
+            &ws,
+            &state,
+            &headers,
+            Some(&identity),
+            true,
+            "cron-toggle-bounded".into(),
+            CronToggleParams {
+                job_id: "job-giant".into(),
+                enabled: true,
+            },
+        )
+        .await;
+        let frame = recv_rpc_json(&mut rx).await;
+        let job = &frame["result"]["job"];
+        assert_eq!(job["enabled"], json!(true));
+        assert_eq!(job["name_truncated"], json!(true));
+        assert!(job["name"].as_str().unwrap().len() <= CRON_RPC_FIELD_BUDGET);
+    }
+
     /// The budget helper must cut on a UTF-8 char boundary (a capped
     /// multibyte document ends short of the budget rather than mid
     /// codepoint) and must no-op on absent / non-string fields.
@@ -29011,6 +29178,19 @@ ignore = []
         assert!(
             MEMORY_RPC_ENTITY_CONTENT_BUDGET + envelope_overhead < MAX_TEXT_FRAME_BYTES,
             "entity budget must fit the frame",
+        );
+        // cron/list: the rows array is cut at its own escaped budget.
+        assert!(
+            CRON_RPC_JOBS_BUDGET + envelope_overhead < MAX_TEXT_FRAME_BYTES,
+            "cron jobs budget must fit the frame",
+        );
+        // cron/toggle: one row, five capped user strings (plus their
+        // fire-only declarations), a 100-char message, and small fixed
+        // fields.
+        let toggle_row_bound = 5 * (CRON_RPC_FIELD_BUDGET + 64) + 1024;
+        assert!(
+            toggle_row_bound + envelope_overhead < MAX_TEXT_FRAME_BYTES,
+            "toggle row bound must fit the frame",
         );
     }
 

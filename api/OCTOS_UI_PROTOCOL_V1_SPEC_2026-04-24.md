@@ -1591,9 +1591,16 @@ Request/response Rust types live in `crates/octos-core/src/ui_protocol.rs`
 - Params type: `CronListParams` — `{}` (accepts `params: {}` or
   `params: null`; the `params` member itself must be present, as above).
 - Result type: `CronListResult` — `{ jobs: CronJobRow[], count: number,
-  gateway_running: bool }`. Mirrors the REST body minus the redundant
-  `ok` flag; `gateway_running` reports whether a spawned gateway child
-  owns `cron.json` (toggles are refused while it does).
+  gateway_running: bool, jobs_truncated: bool }`. Mirrors the REST body
+  minus the redundant `ok` flag; `gateway_running` reports whether a
+  spawned gateway child owns `cron.json` (toggles are refused while it
+  does). WS bounding: each row's user-supplied strings (`id`, `name`,
+  `channel`, `last_status`, `timezone`) are capped at a 2 KiB escaped
+  budget per field — a fired cap is declared beside the field as
+  `<field>_truncated` + `<field>_total_bytes` (absent when it fit) —
+  and rows are kept whole in file order until a 640 KiB array budget is
+  spent; `jobs_truncated` reports a cut list while `count` keeps the
+  FULL store size.
 - Errors: `auth_unavailable` with WS close code `1008 auth_expired`;
   `resource_not_found` with `data.resource_type = "cron"` on REST 404
   (collection-style endpoint — id is empty).
@@ -1604,7 +1611,8 @@ Request/response Rust types live in `crates/octos-core/src/ui_protocol.rs`
 - Replaces: `PUT /api/my/cron/{job_id}/enabled`
 - Params type: `CronToggleParams` — `{ job_id: string, enabled: bool }`.
 - Result type: `CronToggleResult` — `{ job: CronJobRow }`, rendered
-  exactly as a `cron/list` entry.
+  exactly as a `cron/list` entry, including the same per-field caps and
+  fire-only truncation declarations.
 - Errors: `auth_unavailable` with WS close code `1008 auth_expired`.
   Refusals forward the REST error body's `reason` as `data.detail` so
   clients branch on typed fields, not message strings:
