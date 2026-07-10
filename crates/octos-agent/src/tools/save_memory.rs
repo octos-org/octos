@@ -94,6 +94,22 @@ impl Tool for SaveMemoryTool {
             });
         }
 
+        // Names reserved for recall_memory's registry load must not become
+        // bank entities — recall_memory would resolve them to MEMORY.md and
+        // the entity would be permanently unreachable (codex #1608 P2).
+        if octos_memory::is_reserved_memory_name(&input.name)
+            || octos_memory::is_reserved_memory_name(&slug)
+        {
+            return Ok(ToolResult {
+                output: format!(
+                    "'{slug}' is reserved (recall_memory uses it for the full registry). \
+                     Choose a different entity name."
+                ),
+                success: false,
+                ..Default::default()
+            });
+        }
+
         // Write-time threat gate (#1585): entity pages are loaded into the
         // prompt via recall_memory and the memory-bank index; refuse content
         // that reads as instruction-override / exfiltration.
@@ -137,6 +153,27 @@ mod tests {
     use super::*;
 
     // --- content guard (#1585) ---
+
+    #[tokio::test]
+    async fn should_reject_reserved_registry_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(MemoryStore::open(dir.path()).await.unwrap());
+        let tool = SaveMemoryTool::new(store.clone());
+        for name in ["MEMORY", "memory", "registry", "long-term memory"] {
+            let result = tool
+                .execute(&serde_json::json!({ "name": name, "content": "# x\nbenign" }))
+                .await
+                .unwrap();
+            assert!(!result.success, "{name:?} must be rejected");
+            assert!(result.output.contains("reserved"), "{}", result.output);
+        }
+        // a normal name still saves
+        let ok = tool
+            .execute(&serde_json::json!({ "name": "memories-of-summer", "content": "# x\nbenign" }))
+            .await
+            .unwrap();
+        assert!(ok.success, "{}", ok.output);
+    }
 
     #[tokio::test]
     async fn should_refuse_save_when_content_guard_flags_it() {

@@ -347,10 +347,11 @@ impl MemoryStore {
                 budget = 0;
                 if kept.is_empty() {
                     sections.long_term = String::new();
-                    omitted.push("long-term memory".to_string());
+                    omitted
+                        .push("long-term memory (load with recall_memory(\"MEMORY\"))".to_string());
                 } else {
                     sections.long_term = format!(
-                        "{kept}\n\n_[long-term memory truncated to fit the context budget — full MEMORY.md on disk]_"
+                        "{kept}\n\n_[long-term memory truncated to fit the context budget — load the complete registry on demand with recall_memory(\"MEMORY\")]_"
                     );
                 }
             }
@@ -494,6 +495,14 @@ impl MemoryStore {
         // unlisted, unrecallable, yet reported as saved (codex round-3 P3).
         if name.trim_matches(['-', '_', ' ']).is_empty() {
             eyre::bail!("memory entity name must not be empty");
+        }
+        // Reserved registry names are refused at the BOUNDARY, not just in
+        // the save_memory tool: session_actor banks background reports via
+        // write_entity with a task-label slug, so a task named "Memory"
+        // would otherwise create an entity that recall_memory permanently
+        // shadows with the registry (#1608 P2).
+        if is_reserved_memory_name(name) {
+            eyre::bail!("memory entity name '{name}' is reserved for the long-term registry");
         }
         // Scan the SANITIZED name+abstract row exactly as it will render in
         // the bank index: name and content pass separately, but the row
@@ -748,6 +757,20 @@ pub fn is_valid_entry_id(s: &str) -> bool {
         return false;
     };
     rest.len() == 6 && rest.chars().all(|c| matches!(c, 'a'..='z' | '2'..='7'))
+}
+
+/// Names reserved for `recall_memory`'s long-term-registry load (#1588).
+/// `recall_memory` resolves these to the whole `MEMORY.md` instead of a
+/// bank entity, so `save_memory` must REFUSE them — otherwise a bank
+/// entity named "memory" is created but forever shadowed by the alias
+/// and can never be recalled (codex #1608 P2). Matched on the trimmed,
+/// lowercased name; the space and hyphen forms are both listed so the
+/// check works on raw names and slugs alike.
+pub fn is_reserved_memory_name(name: &str) -> bool {
+    matches!(
+        name.trim().to_lowercase().as_str(),
+        "memory" | "memory.md" | "registry" | "long-term memory" | "long-term-memory"
+    )
 }
 
 /// A capture-layer staging note awaiting consolidation.
@@ -1453,6 +1476,12 @@ mod tests {
         assert!(ctx.contains("first entry"));
         assert!(!ctx.contains(&big_para));
         assert!(ctx.contains("long-term memory truncated"));
+        // #1588 two-tier: the truncation marker must point the model at the
+        // tool that loads the full registry, not just say it's "on disk".
+        assert!(
+            ctx.contains("recall_memory(\"MEMORY\")"),
+            "truncation marker must name the registry-load affordance: {ctx}"
+        );
     }
 
     #[tokio::test]
@@ -1686,6 +1715,25 @@ mod tests {
                 "{name:?} must be refused"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn should_reject_reserved_registry_names_at_the_write_boundary() {
+        // #1608 P2: session_actor banks reports via write_entity with a
+        // task-label slug, bypassing the save_memory tool check — the
+        // boundary must refuse the reserved names too.
+        let dir = tempfile::tempdir().unwrap();
+        let store = MemoryStore::open(dir.path()).await.unwrap();
+        for name in ["memory", "registry", "long-term-memory"] {
+            assert!(
+                store.write_entity(name, "# x\nbody").await.is_err(),
+                "{name:?} must be refused at the boundary"
+            );
+        }
+        store
+            .write_entity("weekly-report", "# x\nbody")
+            .await
+            .expect("a normal report name still banks");
     }
 
     #[tokio::test]
