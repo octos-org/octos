@@ -400,6 +400,17 @@ impl MapToolDispatcher {
     pub fn from_registry(registry: &ToolRegistry) -> Self {
         let mut me = Self::new();
         for name in registry.tool_names() {
+            // #1607 (P2): only snapshot tools the active provider policy would
+            // let the model call. `MapToolDispatcher::dispatch` invokes
+            // `Tool::execute` directly, bypassing `ToolRegistry::execute`'s
+            // provider-policy gate — so without this filter a nested-project
+            // `ToolCall` validator could invoke a tool the provider policy
+            // denies. A denied tool is simply not inserted, so `dispatch`
+            // returns "tool not registered for validator dispatch". With no
+            // provider policy set (the default) every tool passes through.
+            if !registry.provider_policy_permits(&name) {
+                continue;
+            }
             if let Some(tool) = registry.get_tool(&name) {
                 me.insert(name, tool);
             }
@@ -4785,5 +4796,48 @@ mod tests {
              an unrelated non-silent file exists in the workspace (proves the validator \
              does not fall back to the glob path); outcomes = {outcomes:?}",
         );
+    }
+
+    #[tokio::test]
+    async fn map_tool_dispatcher_snapshots_all_tools_without_a_provider_policy() {
+        // #1607 (P2): with no provider policy, `from_registry` snapshots every
+        // registered tool, so a ToolCall validator can dispatch it.
+        let reg = ToolRegistry::with_builtins(std::env::temp_dir());
+        let dispatcher = MapToolDispatcher::from_registry(&reg);
+        // `read_file` is a built-in and must be dispatchable.
+        assert!(dispatcher.tools.contains_key("read_file"));
+    }
+
+    #[tokio::test]
+    async fn map_tool_dispatcher_excludes_provider_policy_denied_tools() {
+        // #1607 (P2): a tool the provider policy denies must NOT be snapshotted
+        // by `from_registry`, so a nested-project ToolCall validator can't
+        // reach it. `dispatch` then reports it as unregistered instead of
+        // silently invoking `Tool::execute` (which bypasses the policy gate).
+        let mut reg = ToolRegistry::with_builtins(std::env::temp_dir());
+        reg.set_provider_policy(crate::tools::ToolPolicy {
+            deny: vec!["shell".to_string()],
+            ..Default::default()
+        });
+        let dispatcher = MapToolDispatcher::from_registry(&reg);
+        assert!(
+            !dispatcher.tools.contains_key("shell"),
+            "provider-policy-denied tools must be excluded from the validator dispatch snapshot"
+        );
+        // Dispatching the denied tool fails closed with the unregistered error.
+        let err = match dispatcher
+            .dispatch("shell", &serde_json::json!({ "command": "echo hi" }))
+            .await
+        {
+            Ok(_) => panic!("denied tool must not dispatch through the snapshot"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string()
+                .contains("not registered for validator dispatch"),
+            "unexpected error: {err}"
+        );
+        // A non-denied built-in is still present.
+        assert!(dispatcher.tools.contains_key("read_file"));
     }
 }

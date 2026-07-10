@@ -176,6 +176,17 @@ pub struct ToolRegistry {
     /// (`mofa_slides`, `mofa_cards`, ...): the dispatcher is the ONLY
     /// supported LLM entry-point.
     internal_hidden: HashSet<String>,
+    /// #1607: the session sandbox handed to the shell/exec/bash tools at
+    /// construction. Stored (not just handed off and dropped) so the
+    /// Agent-internal project-root validator path
+    /// (`workspace_contract::build_validator_runner`) can thread the same
+    /// sandbox into its `ValidatorRunner` and confine
+    /// `ValidatorSpec::Command` validators declared by an untrusted
+    /// workspace policy. Defaults to `Arc::new(NoSandbox)` (a no-op sandbox
+    /// whose `is_noop()==true`), so on the plain `with_builtins`/`Default`
+    /// path — and on any host without a real backend — command validators
+    /// run the argv directly and behavior is unchanged.
+    sandbox: Arc<dyn Sandbox>,
 }
 
 /// Default per-tool execution-timeout backstop (seconds) for the registry
@@ -212,7 +223,23 @@ impl ToolRegistry {
             output_dir_hint: None,
             tool_timeout_secs: DEFAULT_REGISTRY_TOOL_TIMEOUT_SECS,
             internal_hidden: HashSet::new(),
+            // #1607: default to a no-op sandbox. Constructors that receive a
+            // real sandbox (`with_builtins_and_permissions`,
+            // `rebind_cwd_with_permissions`) overwrite this below.
+            sandbox: Arc::new(NoSandbox),
         }
+    }
+
+    /// #1607: the session sandbox stored on this registry. Threaded into the
+    /// Agent-internal project-root validator runner
+    /// (`workspace_contract::build_validator_runner`) so
+    /// `ValidatorSpec::Command` validators declared by an untrusted workspace
+    /// policy are confined to the same sandbox as the shell/exec tools instead
+    /// of running unsandboxed on the host. A no-op sandbox
+    /// (`NoSandbox`, or a backend whose helper is unavailable) has nothing to
+    /// escape, so `ValidatorRunner` runs the argv directly there.
+    pub fn sandbox(&self) -> Arc<dyn Sandbox> {
+        self.sandbox.clone()
     }
 
     /// Set the global per-tool execution-timeout backstop (seconds) enforced
@@ -856,6 +883,27 @@ impl ToolRegistry {
         self.provider_policy.as_ref()
     }
 
+    /// #1607 (P2): whether the active **provider policy** permits dispatching
+    /// the named tool. Applies the exact deny-wins-then-allow semantics that
+    /// [`Self::execute_with_context`] enforces at the dispatch boundary
+    /// (including alias equivalence, e.g. `bash`/`shell`/`exec_command`), but
+    /// unlike [`Self::is_tool_visible`] does NOT apply the `context_filter` or
+    /// internal-hidden markers — it answers only "would the provider policy
+    /// let the model call this tool".
+    ///
+    /// Used by [`crate::validators::MapToolDispatcher::from_registry`] to keep
+    /// project-root `ToolCall` validators from reaching a tool the provider
+    /// policy denies. With no provider policy set every tool is permitted (the
+    /// default), so this is a no-op on the common path.
+    pub fn provider_policy_permits(&self, name: &str) -> bool {
+        self.provider_policy.as_ref().is_none_or(|policy| {
+            matches!(
+                evaluate_provider_policy_equivalent(policy, name),
+                policy::PolicyDecision::Allow
+            )
+        })
+    }
+
     /// Set a context-based tag filter. Only tools whose tags overlap with these
     /// values will appear in `specs()`. Tools with no tags always pass through.
     pub fn set_context_filter(&mut self, tags: Vec<String>) {
@@ -901,6 +949,13 @@ impl ToolRegistry {
             // the same invariants as the parent (mofa_make targets stay
             // hidden from `specs()`).
             internal_hidden: self.internal_hidden.clone(),
+            // #1607: carry the parent's sandbox onto the snapshot so a
+            // snapshot-derived registry (used by `rebind_cwd_with_permissions`)
+            // keeps a real sandbox by default. `rebind_cwd_with_permissions`
+            // overwrites it below with the sandbox for the rebound cwd, but a
+            // plain `snapshot_excluding` caller still observes the same
+            // confinement as the parent.
+            sandbox: self.sandbox.clone(),
         };
         // #1148 codex P2: the cloned `tool_search` / `tool_suggest`
         // Arcs still point to the PARENT's catalog cell. Re-register
@@ -1100,6 +1155,11 @@ impl ToolRegistry {
         let mut registry = Self::new();
         registry.workspace_root = Some(cwd.to_path_buf());
         let sandbox: Arc<dyn Sandbox> = Arc::from(sandbox);
+        // #1607: store the session sandbox so the Agent-internal project-root
+        // validator path can confine command validators to it (see
+        // `Self::sandbox`). Kept in lockstep with the shell/exec/bash tools
+        // registered just below.
+        registry.sandbox = sandbox.clone();
         registry.register(
             ShellTool::new(cwd)
                 .with_shared_sandbox(sandbox.clone())
@@ -1314,6 +1374,11 @@ impl ToolRegistry {
         let mut registry = self.snapshot_excluding(&exclude);
         registry.workspace_root = Some(cwd.to_path_buf());
         let sandbox: Arc<dyn Sandbox> = Arc::from(sandbox);
+        // #1607: store the sandbox for the rebound cwd (overwriting the
+        // parent's, carried by `snapshot_excluding`) so the project-root
+        // validator path confines command validators to the same sandbox as
+        // the shell/exec/bash tools re-registered just below.
+        registry.sandbox = sandbox.clone();
         // Re-register cwd-bound tools with the new workspace
         registry.register(
             ShellTool::new(cwd)
@@ -1834,6 +1899,94 @@ mod registry_dispatch_tests {
     fn is_tool_visible_returns_false_for_unregistered_tools() {
         let reg = make_registry(5, 3);
         assert!(!reg.is_tool_visible("nope_does_not_exist"));
+    }
+
+    #[test]
+    fn should_expose_a_noop_sandbox_when_registry_built_without_a_real_backend() {
+        // #1607 (P1): `with_builtins` (and `Default`) install `NoSandbox`, so
+        // the getter the project-root validator path calls must return a no-op
+        // sandbox — `ValidatorRunner` then runs command validators' argv
+        // directly, keeping host behavior unchanged where no backend exists.
+        let reg = make_registry(5, 3);
+        assert!(
+            reg.sandbox().is_noop(),
+            "registry built without a real sandbox must expose a no-op sandbox"
+        );
+    }
+
+    #[test]
+    fn should_store_the_real_sandbox_handed_to_builtins_and_expose_it() {
+        // #1607 (P1): a real (non-no-op) sandbox handed to the shell/exec/bash
+        // tools must be STORED on the registry and surfaced via `sandbox()`,
+        // not handed off and dropped — that is the handle the project-root
+        // validator runner threads into `.with_sandbox(...)`.
+        struct FakeRealSandbox;
+        impl Sandbox for FakeRealSandbox {
+            fn wrap_command(
+                &self,
+                command: &str,
+                _cwd: &std::path::Path,
+            ) -> tokio::process::Command {
+                let mut c = tokio::process::Command::new("sh");
+                c.arg("-c").arg(command);
+                c
+            }
+            fn is_noop(&self) -> bool {
+                false
+            }
+        }
+        let reg = ToolRegistry::with_builtins_and_sandbox(
+            PathBuf::from("/tmp"),
+            Box::new(FakeRealSandbox),
+        );
+        assert!(
+            !reg.sandbox().is_noop(),
+            "a real sandbox handed to with_builtins_and_sandbox must be stored, not dropped"
+        );
+    }
+
+    #[test]
+    fn should_permit_all_tools_when_no_provider_policy_is_set() {
+        // #1607 (P2): with no provider policy the permit predicate is a no-op,
+        // so `MapToolDispatcher::from_registry` snapshots every tool.
+        let reg = make_registry(5, 3);
+        assert!(reg.provider_policy_permits("shell"));
+        assert!(reg.provider_policy_permits("read_file"));
+    }
+
+    #[test]
+    fn should_deny_provider_policy_denied_tools_including_aliases() {
+        // #1607 (P2): the permit predicate must mirror the deny-wins semantics
+        // (with alias equivalence) that `execute` enforces, so a project-root
+        // ToolCall validator can't reach a denied tool via the snapshot.
+        let mut reg = make_registry(5, 3);
+        reg.set_provider_policy(ToolPolicy {
+            deny: vec!["spawn".to_string()],
+            ..Default::default()
+        });
+        // `spawn_agent` maps to the `spawn` alias, so denying `spawn` denies it.
+        assert!(
+            !reg.provider_policy_permits("spawn_agent"),
+            "alias-equivalent denied tools must not pass the permit predicate"
+        );
+        // A tool outside the deny list still passes (allow list empty => allow).
+        assert!(reg.provider_policy_permits("read_file"));
+    }
+
+    #[test]
+    fn should_permit_only_allowlisted_tools_when_allow_list_is_set() {
+        // #1607 (P2): a non-empty allow list means only listed (or
+        // alias-equivalent) tools are permitted.
+        let mut reg = make_registry(5, 3);
+        reg.set_provider_policy(ToolPolicy {
+            allow: vec!["read_file".to_string()],
+            ..Default::default()
+        });
+        assert!(reg.provider_policy_permits("read_file"));
+        assert!(
+            !reg.provider_policy_permits("shell"),
+            "tools absent from a non-empty allow list must not pass the permit predicate"
+        );
     }
 
     #[test]

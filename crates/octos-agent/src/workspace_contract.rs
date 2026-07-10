@@ -821,7 +821,17 @@ fn build_validator_runner(tools: &ToolRegistry, workspace_root: &Path) -> Valida
     // Avoids cloning the full registry and its LRU bookkeeping.
     let dispatcher: Arc<dyn crate::validators::ValidatorToolDispatcher> =
         Arc::new(crate::validators::MapToolDispatcher::from_registry(tools));
-    ValidatorRunner::with_dispatcher(dispatcher, workspace_root)
+    // #1607: confine `ValidatorSpec::Command` validators (which a project's
+    // `workspace_policy.toml` can declare) to the same session sandbox the
+    // shell/exec tools use, so the automatic project-root validator pass at
+    // the end of `run_task` can't be turned into a host-level sandbox escape.
+    // `ValidatorRunner::run_command` runs the argv directly when the sandbox is
+    // a no-op (`NoSandbox`, or a backend whose helper is unavailable), so hosts
+    // without a real backend are unaffected; on POSIX with a real backend the
+    // command is shell-quoted and wrapped; the Windows real-sandbox case fails
+    // closed. This is the single chokepoint for every project-root validator
+    // caller (execution.rs / loop_runner.rs / workspace_git.rs).
+    ValidatorRunner::with_dispatcher(dispatcher, workspace_root).with_sandbox(tools.sandbox())
 }
 
 #[cfg(test)]
