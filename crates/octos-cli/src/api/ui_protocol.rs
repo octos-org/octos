@@ -4386,6 +4386,17 @@ async fn ui_protocol_connection(
                 )
                 .await;
             }
+            UiCommand::SessionFork(params) => {
+                handle_session_fork(
+                    &ws,
+                    &state,
+                    connection_profile_id,
+                    routed_profile_id,
+                    id,
+                    params,
+                )
+                .await;
+            }
             UiCommand::ThreadGraphGet(params) => {
                 handle_thread_graph_get(
                     &ws,
@@ -5028,6 +5039,17 @@ where
                     &state,
                     &ledger,
                     &active_turns,
+                    connection_profile_id_owned.as_deref(),
+                    None,
+                    id,
+                    params,
+                )
+                .await;
+            }
+            UiCommand::SessionFork(params) => {
+                handle_session_fork(
+                    &ws,
+                    &state,
                     connection_profile_id_owned.as_deref(),
                     None,
                     id,
@@ -8527,6 +8549,7 @@ fn session_ingress_callable_method(method: &str) -> bool {
             | octos_core::ui_protocol::methods::CONTENT_LIST
             | octos_core::ui_protocol::methods::CONTENT_DELETE
             | octos_core::ui_protocol::methods::CONTENT_BULK_DELETE
+            | octos_core::ui_protocol::methods::SESSION_FORK
     )
 }
 
@@ -8549,7 +8572,8 @@ fn validate_session_ingress_command_scope(
         | UiCommand::SystemStatusGet(_)
         | UiCommand::ContentList(_)
         | UiCommand::ContentDelete(_)
-        | UiCommand::ContentBulkDelete(_) => {
+        | UiCommand::ContentBulkDelete(_)
+        | UiCommand::SessionFork(_) => {
             return Err(RpcError::invalid_request(
                 "session ingress credentials may only call session-scoped methods",
             ));
@@ -12851,6 +12875,117 @@ async fn handle_session_rollback(
     let result = SessionRollbackResult {
         dropped_turns,
         thread,
+    };
+    send_serialized_rpc_result(ws, id, method, result);
+}
+
+/// `session/fork` — branch a NEW session off an existing one, copying
+/// the tail of its history (web parity P3: the book's documented fork
+/// affordance had no wire surface for the SPA; `SessionManager::fork`
+/// existed but had no production caller). MUTATING: writes the child
+/// session (parent tracked via `parent_key`).
+async fn handle_session_fork(
+    ws: &WsConnection,
+    state: &Arc<AppState>,
+    connection_profile_id: Option<&str>,
+    routed_profile_id: Option<&str>,
+    id: String,
+    params: octos_core::ui_protocol::SessionForkParams,
+) {
+    let method = octos_core::ui_protocol::methods::SESSION_FORK;
+    if let Err(error) = validate_session_scope(&params.session_id, None, connection_profile_id) {
+        send_scope_error(ws, id, error);
+        return;
+    }
+    // The child chat-id becomes a filesystem path component and a wire
+    // session key half — hold it to the same charset as topic names.
+    if let Err(reason) = octos_bus::validate_topic_name(&params.new_chat_id) {
+        let _ = send_rpc_error(
+            ws,
+            Some(id),
+            RpcError::invalid_params(format!("{method}: invalid new_chat_id: {reason}"))
+                .with_data(json!({ "kind": "invalid_new_chat_id" })),
+        );
+        return;
+    }
+
+    let Some(sessions) = resolve_sessions_for_lookup(
+        state,
+        connection_profile_id,
+        routed_profile_id,
+        &params.session_id,
+    )
+    .await
+    else {
+        let _ = send_rpc_error(
+            ws,
+            Some(id),
+            runtime_unavailable_error("Sessions not available"),
+        );
+        return;
+    };
+
+    let (new_key, copied) = {
+        let mut sessions_guard = sessions.lock().await;
+        // Mirror rollback's error model: fork of an unknown session is
+        // an error, not an auto-create.
+        if !sessions_guard.session_known(&params.session_id) {
+            drop(sessions_guard);
+            let _ = send_rpc_error(
+                ws,
+                Some(id),
+                RpcError::unknown_session(params.session_id.0.clone()),
+            );
+            return;
+        }
+        // Refuse to clobber an existing session under the child key. The
+        // candidate key MUST be derived exactly as `SessionManager::fork`
+        // derives it (naive first-segment split), or the pre-check would
+        // guard a different key than the one fork writes.
+        let channel = params.session_id.0.split(':').next().unwrap_or("cli");
+        let candidate = SessionKey::new(channel, &params.new_chat_id);
+        if sessions_guard.session_known(&candidate) {
+            drop(sessions_guard);
+            let _ = send_rpc_error(
+                ws,
+                Some(id),
+                RpcError::invalid_params(format!(
+                    "{method}: a session already exists for '{candidate}'"
+                ))
+                .with_data(json!({ "kind": "child_exists" })),
+            );
+            return;
+        }
+        // Absent copy_messages → the FULL parent history.
+        let copy = params
+            .copy_messages
+            .map(|n| n as usize)
+            .unwrap_or(usize::MAX);
+        let copied_upper = {
+            let parent = sessions_guard.get_or_create(&params.session_id).await;
+            parent.messages.len().min(copy)
+        };
+        match sessions_guard
+            .fork(&params.session_id, &params.new_chat_id, copy)
+            .await
+        {
+            Ok(new_key) => (new_key, copied_upper as u32),
+            Err(error) => {
+                drop(sessions_guard);
+                let _ = send_rpc_error(
+                    ws,
+                    Some(id),
+                    RpcError::internal_error(format!("{method}: {error}")),
+                );
+                return;
+            }
+        }
+    };
+
+    let result = octos_core::ui_protocol::SessionForkResult {
+        new_session_id: new_key,
+        parent_session_id: params.session_id,
+        copied_messages: copied,
     };
     send_serialized_rpc_result(ws, id, method, result);
 }
@@ -24307,6 +24442,10 @@ mod tests {
                 "session_id": session_id.to_string(),
                 "title": "Dispatch parity",
             }),
+            methods::SESSION_FORK => json!({
+                "session_id": session_id,
+                "new_chat_id": "probe-fork-child",
+            }),
             methods::CONTENT_DELETE => json!({ "id": "content-1" }),
             methods::CONTENT_BULK_DELETE => json!({ "ids": ["content-1"] }),
             methods::ROUTER_SET_MODE => json!({
@@ -33146,6 +33285,7 @@ ignore = []
             octos_core::ui_protocol::methods::CONTENT_LIST,
             octos_core::ui_protocol::methods::CONTENT_DELETE,
             octos_core::ui_protocol::methods::CONTENT_BULK_DELETE,
+            octos_core::ui_protocol::methods::SESSION_FORK,
         ] {
             assert!(
                 !session_ingress_callable_method(m),
@@ -37148,6 +37288,216 @@ ignore = []
             !turn_ids.contains(&turn_drop.0.to_string()),
             "dropped turn 2 must be excluded from thread.turns; got {turn_ids:?}"
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn session_fork_copies_full_history_by_default() {
+        let session_id = SessionKey("local:fork-parent".into());
+        // 3 turns -> 6 messages persisted on the parent.
+        let (state, _tmp) = prg_state_with_persisted_turns(&session_id, 3).await;
+        let (ws, mut rx) = ws_connection_for_test(8);
+
+        handle_session_fork(
+            &ws,
+            &state,
+            None,
+            None,
+            "fk1".into(),
+            octos_core::ui_protocol::SessionForkParams {
+                session_id: session_id.clone(),
+                new_chat_id: "fork-child".into(),
+                copy_messages: None,
+            },
+        )
+        .await;
+
+        let frame = recv_rpc_json(&mut rx).await;
+        assert_eq!(frame["id"], "fk1");
+        let result = &frame["result"];
+        assert_eq!(result["new_session_id"], "local:fork-child");
+        assert_eq!(result["parent_session_id"], session_id.to_string());
+        assert_eq!(result["copied_messages"], 6);
+
+        // The child must exist on the manager, carry parent lineage, and
+        // hold the full copied history.
+        let sessions = state.sessions.as_ref().expect("sessions");
+        let mut guard = sessions.lock().await;
+        let child_key = SessionKey("local:fork-child".into());
+        assert!(
+            guard.session_known(&child_key),
+            "child session must persist"
+        );
+        let child = guard.get_or_create(&child_key).await;
+        assert_eq!(child.parent_key.as_ref(), Some(&session_id));
+        assert_eq!(child.messages.len(), 6);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn session_fork_copies_only_requested_tail() {
+        let session_id = SessionKey("local:fork-tail".into());
+        let (state, _tmp) = prg_state_with_persisted_turns(&session_id, 3).await;
+        let (ws, mut rx) = ws_connection_for_test(8);
+
+        handle_session_fork(
+            &ws,
+            &state,
+            None,
+            None,
+            "fk2".into(),
+            octos_core::ui_protocol::SessionForkParams {
+                session_id: session_id.clone(),
+                new_chat_id: "tail-child".into(),
+                copy_messages: Some(2),
+            },
+        )
+        .await;
+
+        let frame = recv_rpc_json(&mut rx).await;
+        assert_eq!(frame["result"]["copied_messages"], 2);
+        let sessions = state.sessions.as_ref().expect("sessions");
+        let mut guard = sessions.lock().await;
+        let child = guard
+            .get_or_create(&SessionKey("local:tail-child".into()))
+            .await;
+        assert_eq!(child.messages.len(), 2);
+        // Tail = the LAST turn (user + assistant of turn 3).
+        assert_eq!(child.messages[0].content, "turn 3");
+        assert_eq!(child.messages[1].content, "reply 3");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn session_fork_unknown_session_errors() {
+        let seeded = SessionKey("local:fork-seeded".into());
+        let (state, _tmp) = prg_state_with_persisted_turns(&seeded, 1).await;
+        let (ws, mut rx) = ws_connection_for_test(8);
+
+        handle_session_fork(
+            &ws,
+            &state,
+            None,
+            None,
+            "fk3".into(),
+            octos_core::ui_protocol::SessionForkParams {
+                session_id: SessionKey("local:never-created".into()),
+                new_chat_id: "child".into(),
+                copy_messages: None,
+            },
+        )
+        .await;
+
+        let frame = recv_rpc_json(&mut rx).await;
+        assert!(
+            frame.get("error").is_some(),
+            "fork of an unknown session must error, not auto-create"
+        );
+        // Fork must NOT have created either session as a side effect.
+        let sessions = state.sessions.as_ref().expect("sessions");
+        let mut guard = sessions.lock().await;
+        assert!(!guard.session_known(&SessionKey("local:never-created".into())));
+        assert!(!guard.session_known(&SessionKey("local:child".into())));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn session_fork_refuses_existing_child_key() {
+        let session_id = SessionKey("local:fork-clobber".into());
+        let (state, _tmp) = prg_state_with_persisted_turns(&session_id, 2).await;
+        let (ws, mut rx) = ws_connection_for_test(8);
+
+        for id in ["fka", "fkb"] {
+            handle_session_fork(
+                &ws,
+                &state,
+                None,
+                None,
+                id.into(),
+                octos_core::ui_protocol::SessionForkParams {
+                    session_id: session_id.clone(),
+                    new_chat_id: "same-child".into(),
+                    copy_messages: None,
+                },
+            )
+            .await;
+        }
+
+        let first = recv_rpc_json(&mut rx).await;
+        assert!(first.get("result").is_some(), "first fork succeeds");
+        let second = recv_rpc_json(&mut rx).await;
+        assert_eq!(
+            second["error"]["data"]["kind"], "child_exists",
+            "second fork onto the same child key must refuse, not clobber"
+        );
+
+        // The child's history must be the FIRST fork's copy, untouched.
+        let sessions = state.sessions.as_ref().expect("sessions");
+        let mut guard = sessions.lock().await;
+        let child = guard
+            .get_or_create(&SessionKey("local:same-child".into()))
+            .await;
+        assert_eq!(child.messages.len(), 4);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn session_fork_rejects_invalid_chat_id() {
+        let session_id = SessionKey("local:fork-badname".into());
+        let (state, _tmp) = prg_state_with_persisted_turns(&session_id, 1).await;
+        let (ws, mut rx) = ws_connection_for_test(8);
+
+        handle_session_fork(
+            &ws,
+            &state,
+            None,
+            None,
+            "fk4".into(),
+            octos_core::ui_protocol::SessionForkParams {
+                session_id: session_id.clone(),
+                new_chat_id: "../escape".into(),
+                copy_messages: None,
+            },
+        )
+        .await;
+
+        let frame = recv_rpc_json(&mut rx).await;
+        assert_eq!(frame["error"]["data"]["kind"], "invalid_new_chat_id");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn session_fork_enforces_connection_scope() {
+        // A profile-PREFIXED session id names another tenant's scope
+        // outright; a connection bound to "tenant-b" must be refused.
+        // (Un-prefixed ids are accepted by SPA convention — isolation for
+        // those comes from per-profile runtime resolution.)
+        let session_id = SessionKey("tenant-a:local:fork-scope".into());
+        let (state, _tmp) = prg_state_with_persisted_turns(&session_id, 1).await;
+        let (ws, mut rx) = ws_connection_for_test(8);
+
+        handle_session_fork(
+            &ws,
+            &state,
+            Some("tenant-b"),
+            None,
+            "fk5".into(),
+            octos_core::ui_protocol::SessionForkParams {
+                session_id: session_id.clone(),
+                new_chat_id: "stolen".into(),
+                copy_messages: None,
+            },
+        )
+        .await;
+
+        // Scope violations close 1008-first (see
+        // send_scope_error_closes_with_1008_on_authenticated_mismatch).
+        let first = rx.recv().await.expect("close frame");
+        match first {
+            axum::extract::ws::Message::Close(Some(frame)) => {
+                assert_eq!(frame.code, 1008);
+            }
+            other => panic!("expected 1008 close on cross-scope fork, got {other:?}"),
+        }
+        // And the fork must NOT have happened.
+        let sessions = state.sessions.as_ref().expect("sessions");
+        let mut guard = sessions.lock().await;
+        assert!(!guard.session_known(&SessionKey("tenant-a:local:stolen".into())));
+        assert!(!guard.session_known(&SessionKey("local:stolen".into())));
     }
 
     #[tokio::test(flavor = "current_thread")]
