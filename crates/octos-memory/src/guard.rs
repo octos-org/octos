@@ -14,6 +14,18 @@
 //!
 //! Scope note: this guards PERSISTED, auto-injected memory. It is not a
 //! general prompt-injection defense for transcripts or tool output.
+//!
+//! Explicitly OUT OF SCOPE: reconstruction of a phrase split across
+//! SEPARATE persisted items — two independent MEMORY.md entries, two
+//! daily-note appends, or two consolidation ops — each benign alone but
+//! adjacent when rendered. Adjacent-render checks close the common cases
+//! (bank rows, transcript windows), but a determined attacker with write
+//! access can always split a payload across enough seams to evade any
+//! regex tripwire. The complementary control is the read-path etiquette
+//! injected alongside memory (`octos_agent::memory_segment` MEMORY_USE
+//! guidance, #1589): the model is told to treat ALL recalled memory as
+//! unverified leads, never as authoritative instructions — which holds
+//! regardless of how a payload is assembled.
 
 use std::sync::OnceLock;
 
