@@ -2109,6 +2109,7 @@ impl PipelineExecutor {
                 "pipeline",
                 ValidatorPhase::Completion,
                 None,
+                std::sync::Arc::from(octos_agent::create_sandbox(&self.config.sandbox)),
             )
             .await?;
         }
@@ -2192,6 +2193,7 @@ impl PipelineExecutor {
             &format!("pipeline-node-{node_id}"),
             ValidatorPhase::Completion,
             None,
+            std::sync::Arc::from(octos_agent::create_sandbox(&self.config.sandbox)),
         )
         .await
         .map(|_| ())
@@ -2307,6 +2309,11 @@ impl PipelineExecutor {
         .with_provider_policy(self.config.provider_policy.clone())
         .with_plugin_dirs(self.config.plugin_dirs.clone())
         .with_plugin_require_signed(self.config.plugin_require_signed)
+        // #1607 (codex round 4): thread the session sandbox so each per-node
+        // worker registry is built sandboxed — the worker Agent's own
+        // project-root validator pass then confines a workspace-declared
+        // `Command` validator to it instead of running it on the host.
+        .with_sandbox(self.config.sandbox.clone())
         // M8 parity (W1.A1): propagate the host context so per-node
         // Agents inherit the parent session's FileStateCache /
         // SubAgentOutputRouter / AgentSummaryGenerator. Empty context

@@ -2844,8 +2844,18 @@ pub trait ToolRegistryFactory: Send + Sync {
 }
 
 /// Trait for creating per-session pipeline tool instances.
+///
+/// #1607 (codex round 4): `create` takes the SESSION-effective sandbox so the
+/// produced `run_pipeline` tool (and every spawn-child instance) confines its
+/// pipeline command validators to the sandbox that is actually in force for
+/// this session — NOT a profile-time default captured when the factory was
+/// built. In the AppUI path the effective sandbox is only known after
+/// `SessionRuntime::bootstrap_with_permissions_and_sandbox` resolves the
+/// permission/override, so passing it in at `create` time is the only correct
+/// binding: a read-only session's pipeline validators must not regain writes
+/// or network the profile default allowed.
 pub trait PipelineToolFactory: Send + Sync {
-    fn create(&self) -> Arc<dyn octos_agent::tools::Tool>;
+    fn create(&self, sandbox: &octos_agent::SandboxConfig) -> Arc<dyn octos_agent::tools::Tool>;
 }
 
 /// ToolRegistryFactory backed by snapshot_excluding() — clones shared tools cheaply.
@@ -3386,8 +3396,12 @@ impl ActorFactory {
         }
         if let Some(ref pipeline_factory) = self.pipeline_factory {
             let pipeline_factory = pipeline_factory.clone();
-            spawn_tool =
-                spawn_tool.with_child_tool_factory(Arc::new(move || pipeline_factory.create()));
+            // #1607 (codex round 4): hand each spawn-child `run_pipeline`
+            // instance the SESSION-effective sandbox (the same one the actor's
+            // tool registry uses), not a profile-time default.
+            let child_sandbox = self.sandbox_config.clone();
+            spawn_tool = spawn_tool
+                .with_child_tool_factory(Arc::new(move || pipeline_factory.create(&child_sandbox)));
         }
         // Child SendFileTool factory (gateway parity with AppUI). Every
         // spawned subagent's registry gets a fresh `SendFileTool` wired
@@ -3538,7 +3552,9 @@ impl ActorFactory {
         };
 
         if let Some(ref pf) = self.pipeline_factory {
-            let pt = pf.create();
+            // #1607 (codex round 4): the parent `run_pipeline` also uses the
+            // session-effective sandbox this actor's registry was built with.
+            let pt = pf.create(&self.sandbox_config);
             tools.register_arc(pt);
             tools.mark_spawn_only(
                 "run_pipeline",

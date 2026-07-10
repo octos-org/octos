@@ -2865,6 +2865,8 @@ impl Tool for SpawnTool {
                         // when the parent session is sandboxed. A no-op backend
                         // (no helper present) still runs the argv directly, so
                         // hosts without a real sandbox are unaffected.
+                        let validator_sandbox: std::sync::Arc<dyn crate::sandbox::Sandbox> =
+                            std::sync::Arc::from(create_sandbox(&self.sandbox));
                         let mut registry_for_validators = ToolRegistry::with_builtins_and_sandbox(
                             &self.working_dir,
                             create_sandbox(&self.sandbox),
@@ -2882,6 +2884,7 @@ impl Tool for SpawnTool {
                             "spawn-agent-mcp",
                             crate::validators::ValidatorPhase::Completion,
                             None,
+                            validator_sandbox,
                         )
                         .await
                         {
@@ -2914,6 +2917,8 @@ impl Tool for SpawnTool {
                 // hardcoded `NoSandbox`. This is the child mirror of the
                 // `build_validator_runner` chokepoint fix; without it the
                 // agent_mcp branch is a second unsandboxed construction site.
+                let validator_sandbox: std::sync::Arc<dyn crate::sandbox::Sandbox> =
+                    std::sync::Arc::from(create_sandbox(&self.sandbox));
                 let mut registry_for_validators = ToolRegistry::with_builtins_and_sandbox(
                     &self.working_dir,
                     create_sandbox(&self.sandbox),
@@ -2929,6 +2934,7 @@ impl Tool for SpawnTool {
                     &self.working_dir,
                     expected_kind,
                     &response.files_to_send,
+                    validator_sandbox,
                 )
                 .await;
                 if let Some(reason) = report.first_failure_reason() {
@@ -3255,6 +3261,7 @@ impl Tool for SpawnTool {
                                     "spawn",
                                     crate::validators::ValidatorPhase::Completion,
                                     None,
+                                    std::sync::Arc::from(create_sandbox(&self.sandbox)),
                                 )
                                 .await
                                 {
@@ -3290,6 +3297,7 @@ impl Tool for SpawnTool {
                             &child_working_dir,
                             expected_kind,
                             &r.files_to_send,
+                            std::sync::Arc::from(create_sandbox(&self.sandbox)),
                         )
                         .await;
                         if let Some(reason) = report.first_failure_reason() {
@@ -3829,6 +3837,7 @@ impl Tool for SpawnTool {
                             "spawn",
                             crate::validators::ValidatorPhase::Completion,
                             None,
+                            std::sync::Arc::from(create_sandbox(&child_sandbox)),
                         )
                         .await
                         {
@@ -3862,6 +3871,7 @@ impl Tool for SpawnTool {
                         &working_dir,
                         expected_kind,
                         bg_files_to_send,
+                        std::sync::Arc::from(create_sandbox(&child_sandbox)),
                     )
                     .await;
                     if let Some(reason) = report.first_failure_reason() {
@@ -5363,6 +5373,7 @@ PY
                     temp.path(),
                     Some(crate::WorkspaceProjectKind::Slides),
                     &files_to_send,
+                    std::sync::Arc::new(crate::sandbox::NoSandbox),
                 )
                 .await;
             });

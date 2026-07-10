@@ -928,14 +928,13 @@ impl ProfileActorFactoryBuilder {
                 /// agents inherit hybrid scored + filtered memory
                 /// recall instead of the cwd-only unfiltered fallback.
                 embedder: Option<Arc<dyn octos_llm::EmbeddingProvider>>,
-                /// #1607: session sandbox forwarded onto the pipeline
-                /// executor so terminal / per-node command validators run
-                /// confined instead of on the host.
-                sandbox_config: octos_agent::SandboxConfig,
             }
 
             impl crate::session_actor::PipelineToolFactory for ChildPipelineToolFactory {
-                fn create(&self) -> Arc<dyn octos_agent::Tool> {
+                fn create(
+                    &self,
+                    sandbox: &octos_agent::SandboxConfig,
+                ) -> Arc<dyn octos_agent::Tool> {
                     let mut pt = octos_pipeline::RunPipelineTool::new(
                         self.llm.clone(),
                         self.memory.clone(),
@@ -945,9 +944,10 @@ impl ProfileActorFactoryBuilder {
                     .with_provider_policy(self.policy.clone())
                     .with_plugin_dirs(self.plugin_dirs.clone())
                     .with_plugin_require_signed(self.plugin_require_signed)
-                    // #1607: confine pipeline command validators to the
-                    // session sandbox.
-                    .with_sandbox(self.sandbox_config.clone())
+                    // #1607 (codex round 4): confine pipeline command validators
+                    // to the SESSION-effective sandbox handed in by the actor
+                    // factory.
+                    .with_sandbox(sandbox.clone())
                     .with_octos_home(self.octos_home.clone());
                     if let Some(ref router) = self.router {
                         pt = pt.with_provider_router(router.clone());
@@ -983,11 +983,9 @@ impl ProfileActorFactoryBuilder {
                 // profile's strict-signing policy.
                 plugin_require_signed: profile_config.plugins.require_signed,
                 embedder: child_pipeline_embedder,
-                // #1607: mirror the ActorFactory `sandbox_config` (line
-                // `effective_profile.config.sandbox.clone()` below) so the
-                // pipeline's command validators run under the same session
-                // sandbox as the session's shell/exec tools.
-                sandbox_config: effective_profile.config.sandbox.clone(),
+                // #1607 (codex round 4): the session sandbox is now handed to
+                // `create()` by the actor factory (`self.sandbox_config`), so no
+                // per-factory field is needed.
             })
                 as Arc<dyn crate::session_actor::PipelineToolFactory + Send + Sync>);
 

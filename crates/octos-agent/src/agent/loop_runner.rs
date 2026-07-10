@@ -1945,6 +1945,10 @@ impl Agent {
                                 &task.context.working_dir,
                                 None,
                                 &files_to_send,
+                                // #1607: the Agent's own registry is built
+                                // sandboxed in `session_actor`, so its stored
+                                // sandbox is the session backend.
+                                self.tools.sandbox(),
                             )
                             .await;
                         let contract_failures =
@@ -6813,6 +6817,7 @@ printf '{"output":"voice saved","success":true}\n'
             tmp_root,
             Some(WorkspaceProjectKind::Slides),
             &files_to_send,
+            std::sync::Arc::new(crate::sandbox::NoSandbox),
         )
         .await;
     }

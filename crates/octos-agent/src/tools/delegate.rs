@@ -797,6 +797,7 @@ impl Tool for DelegateTool {
                             "delegate",
                             ValidatorPhase::Completion,
                             None,
+                            std::sync::Arc::from(create_sandbox(&self.sandbox)),
                         )
                         .await
                         .err()
