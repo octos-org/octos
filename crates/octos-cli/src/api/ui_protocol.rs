@@ -34,14 +34,14 @@ use octos_core::ui_protocol::{
     MessagePersistedSource, OutputCursor, Payload, ReplayLossyEvent, RpcError, RpcErrorResponse,
     RpcRequest, RpcResponse, SESSION_HYDRATE_INCLUDE_MAX, SESSION_MESSAGES_PAGE_DEFAULT_LIMIT,
     SESSION_MESSAGES_PAGE_MAX_LIMIT, SESSION_MESSAGES_PAGE_MAX_OFFSET, SESSION_TITLE_SET_MAX_CHARS,
-    SessionDeleteParams, SessionFilesListParams, SessionHydrateParams, SessionHydrateResult,
-    SessionListParams, SessionMessagesPageParams, SessionOpenParams, SessionOpenResult,
-    SessionOpened, SessionOrchestrationEvent, SessionRollbackParams, SessionRollbackResult,
-    SessionSnapshotParams, SessionStatusGetParams, SessionTasksListParams, SessionTitleSetParams,
-    SessionWorkspaceGetParams, SystemStatusGetParams, TaskArtifactListParams,
-    TaskArtifactListResult, TaskArtifactReadParams, TaskArtifactReadResult, TaskArtifactRecord,
-    TaskCancelParams, TaskCancelResult, TaskListEntry, TaskListParams, TaskListResult,
-    TaskOutputDeltaEvent, TaskRestartFromNodeParams, TaskRestartFromNodeResult,
+    SessionBtwParams, SessionDeleteParams, SessionFilesListParams, SessionHydrateParams,
+    SessionHydrateResult, SessionListParams, SessionMessagesPageParams, SessionOpenParams,
+    SessionOpenResult, SessionOpened, SessionOrchestrationEvent, SessionRollbackParams,
+    SessionRollbackResult, SessionSnapshotParams, SessionStatusGetParams, SessionTasksListParams,
+    SessionTitleSetParams, SessionWorkspaceGetParams, SystemStatusGetParams,
+    TaskArtifactListParams, TaskArtifactListResult, TaskArtifactReadParams, TaskArtifactReadResult,
+    TaskArtifactRecord, TaskCancelParams, TaskCancelResult, TaskListEntry, TaskListParams,
+    TaskListResult, TaskOutputDeltaEvent, TaskRestartFromNodeParams, TaskRestartFromNodeResult,
     TaskRuntimeState as UiTaskRuntimeState, TaskUpdatedEvent, ThreadGraphEntry,
     ThreadGraphGetParams, ThreadGraphGetResult, ToolCompletedEvent, ToolProgressEvent,
     ToolStartedEvent, TurnCompletedEvent, TurnErrorEvent, TurnId, TurnInterruptParams,
@@ -242,6 +242,7 @@ const APPUI_EXTRA_METHODS: &[&str] = &[
     APPUI_METHOD_PROFILE_SKILLS_INSTALL,
     APPUI_METHOD_PROFILE_SKILLS_REMOVE,
     APPUI_METHOD_ONBOARDING_WORKSPACE_PROBE,
+    octos_core::ui_protocol::methods::SESSION_BTW,
 ];
 const APPUI_STDIO_AUTH_BOUND_UNAVAILABLE_METHODS: &[&str] = &[
     APPUI_METHOD_AUTH_ME,
@@ -4413,6 +4414,18 @@ async fn ui_protocol_connection(
                 )
                 .await;
             }
+            UiCommand::SessionBtw(params) => {
+                handle_session_btw(
+                    &ws,
+                    &state,
+                    &ledger,
+                    connection_profile_id,
+                    routed_profile_id,
+                    id,
+                    params,
+                )
+                .await;
+            }
             UiCommand::PermissionProfileList(params) => {
                 let result = permission_profile_list_result(&state, params);
                 let _ = send_ui_rpc_result(&ws, id, UiRpcResult::PermissionProfileList(result));
@@ -5057,6 +5070,18 @@ where
                     connection_profile_id_owned.as_deref(),
                     None,
                     features,
+                    id,
+                    params,
+                )
+                .await;
+            }
+            UiCommand::SessionBtw(params) => {
+                handle_session_btw(
+                    &ws,
+                    &state,
+                    &ledger,
+                    connection_profile_id_owned.as_deref(),
+                    None,
                     id,
                     params,
                 )
@@ -8587,6 +8612,9 @@ fn validate_session_ingress_command_scope(
         UiCommand::SessionRollback(params) => params.session_id.clone(),
         UiCommand::ThreadGraphGet(params) => params.session_id.clone(),
         UiCommand::TurnStateGet(params) => params.session_id.clone(),
+        UiCommand::SessionBtw(params) => {
+            session_key_with_optional_topic(&params.session_id, params.topic.as_deref())
+        }
         UiCommand::SessionSnapshot(params) => {
             string_session_with_optional_topic(&params.session_id, params.topic.as_deref())
         }
@@ -13082,6 +13110,352 @@ async fn handle_turn_state_get(
         ws,
         id,
         octos_core::ui_protocol::methods::TURN_STATE_GET,
+        result,
+    );
+}
+
+/// In-flight `session/btw` asides, keyed by session — one at a time per
+/// session so a client cannot stack concurrent aside LLM calls (each is a
+/// paid provider request). `std::sync::Mutex` on purpose: the critical
+/// sections never await, and the release must run in a `Drop` guard (which
+/// cannot lock a tokio mutex).
+fn btw_in_flight_sessions() -> &'static StdMutex<HashSet<SessionKey>> {
+    static BTW_IN_FLIGHT: OnceLock<StdMutex<HashSet<SessionKey>>> = OnceLock::new();
+    BTW_IN_FLIGHT.get_or_init(|| StdMutex::new(HashSet::new()))
+}
+
+/// Releases the per-session `session/btw` slot on every exit path (including
+/// panics/cancellation) so an error can never wedge the session's aside.
+struct BtwInFlightGuard(SessionKey);
+
+impl Drop for BtwInFlightGuard {
+    fn drop(&mut self) {
+        if let Ok(mut in_flight) = btw_in_flight_sessions().lock() {
+            in_flight.remove(&self.0);
+        }
+    }
+}
+
+/// Test-only provider override so handler tests can exercise the full
+/// `session/btw` flow without constructing a `ProfileRuntime`.
+#[cfg(test)]
+fn btw_test_provider_slot() -> &'static StdMutex<Option<Arc<dyn octos_llm::LlmProvider>>> {
+    static SLOT: OnceLock<StdMutex<Option<Arc<dyn octos_llm::LlmProvider>>>> = OnceLock::new();
+    SLOT.get_or_init(|| StdMutex::new(None))
+}
+
+fn btw_test_provider() -> Option<Arc<dyn octos_llm::LlmProvider>> {
+    #[cfg(test)]
+    if let Ok(slot) = btw_test_provider_slot().lock() {
+        if let Some(llm) = slot.as_ref() {
+            return Some(llm.clone());
+        }
+    }
+    None
+}
+
+const BTW_TRANSCRIPT_TAIL_MESSAGES: usize = 20;
+const BTW_TRANSCRIPT_MESSAGE_CHARS: usize = 1_200;
+const BTW_TRANSCRIPT_CHAR_BUDGET: usize = 16_000;
+const BTW_ACTIVITY_TAIL_EVENTS: usize = 12;
+const BTW_ANSWER_MAX_TOKENS: u32 = 700;
+const BTW_TIMEOUT_SECS: u64 = 30;
+
+/// Build the two-message prompt for a `session/btw` aside. Pure so the
+/// context shape is unit-testable: transcript tail (already limited by the
+/// caller) + a short live-activity digest + the question. The system prompt
+/// carries the restrictions: no tools, brief answer, ephemeral exchange.
+fn build_btw_messages(
+    transcript_tail: &[Message],
+    activity_lines: &[String],
+    question: &str,
+) -> Vec<Message> {
+    let mut transcript = String::new();
+    let mut used = 0usize;
+    for message in transcript_tail {
+        let content = message.content.trim();
+        if content.is_empty() {
+            continue;
+        }
+        let rendered = format!(
+            "{}: {}\n",
+            message.role.as_str(),
+            truncate_for_display(content, BTW_TRANSCRIPT_MESSAGE_CHARS)
+        );
+        if used + rendered.len() > BTW_TRANSCRIPT_CHAR_BUDGET {
+            break;
+        }
+        used += rendered.len();
+        transcript.push_str(&rendered);
+    }
+    if transcript.is_empty() {
+        transcript.push_str("(no messages yet)\n");
+    }
+    let activity = if activity_lines.is_empty() {
+        "- (no live activity)".to_owned()
+    } else {
+        activity_lines
+            .iter()
+            .map(|line| format!("- {line}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let prompt = format!(
+        "## Recent conversation\n{transcript}\n## Current activity\n{activity}\n\n## Aside question\n{question}\n"
+    );
+    vec![
+        Message {
+            role: MessageRole::System,
+            content: "You are the assistant working inside this octos session. The user \
+                      asked a QUICK ASIDE question (\"btw, ...\") while your main work \
+                      continues in the background. Answer briefly — a few sentences — \
+                      from the context provided. You have NO tools in this aside: do not \
+                      claim to run commands, read files, or edit anything. If the answer \
+                      genuinely needs that, say so and suggest asking again after the \
+                      current task finishes. This exchange is ephemeral and will not \
+                      join the conversation history."
+                .to_owned(),
+            media: Vec::new(),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+            client_message_id: None,
+            thread_id: None,
+            timestamp: Utc::now(),
+        },
+        Message {
+            role: MessageRole::User,
+            content: prompt,
+            media: Vec::new(),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+            client_message_id: None,
+            thread_id: None,
+            timestamp: Utc::now(),
+        },
+    ]
+}
+
+/// One live-activity digest line per recent ledger notification that says
+/// what the session is DOING right now (tool/task/turn lifecycle); chatty
+/// stream events (message/reasoning deltas) are skipped.
+fn btw_activity_line(notification: &UiNotification) -> Option<String> {
+    match notification {
+        UiNotification::TurnStarted(event) => Some(format!("turn {} started", event.turn_id.0)),
+        UiNotification::TurnCompleted(event) => Some(format!("turn {} completed", event.turn_id.0)),
+        UiNotification::ToolStarted(event) => Some(format!("tool `{}` running", event.tool_name)),
+        UiNotification::ToolCompleted(event) => Some(format!(
+            "tool `{}` finished ({})",
+            event.tool_name,
+            match event.success {
+                Some(true) => "ok",
+                Some(false) => "failed",
+                None => "done",
+            }
+        )),
+        UiNotification::TaskUpdated(event) => {
+            Some(format!("task \"{}\" {:?}", event.title, event.state))
+        }
+        _ => None,
+    }
+}
+
+/// `session/btw` — answer a quick aside question out-of-band while the
+/// session's live turn (if any) keeps running. ONE restricted LLM call: no
+/// tools, capped output, hard timeout. The exchange is ephemeral — nothing
+/// is appended to the session history and no notification is emitted, so
+/// the live turn never sees it; the answer rides only on this RPC result.
+async fn handle_session_btw(
+    ws: &WsConnection,
+    state: &Arc<AppState>,
+    ledger: &Arc<UiProtocolLedger>,
+    connection_profile_id: Option<&str>,
+    routed_profile_id: Option<&str>,
+    id: String,
+    params: SessionBtwParams,
+) {
+    if let Err(error) = validate_session_scope(&params.session_id, None, connection_profile_id) {
+        send_scope_error(ws, id, error);
+        return;
+    }
+    let question = params.question.trim().to_owned();
+    if question.is_empty() {
+        let _ = send_rpc_error(
+            ws,
+            Some(id),
+            RpcError::invalid_params("session/btw requires a non-empty question"),
+        );
+        return;
+    }
+
+    // Transcript tail from the same store turn persistence writes to
+    // (#919.1 routing) — clone under the lock, drop it before the LLM call.
+    let transcript_tail = {
+        let Some(sessions) = resolve_sessions_for_lookup(
+            state,
+            connection_profile_id,
+            routed_profile_id,
+            &params.session_id,
+        )
+        .await
+        else {
+            let _ = send_rpc_error(
+                ws,
+                Some(id),
+                RpcError::unknown_session(params.session_id.0.clone()),
+            );
+            return;
+        };
+        let mut sessions_guard = sessions.lock().await;
+        if !sessions_guard.session_known(&params.session_id) {
+            let _ = send_rpc_error(
+                ws,
+                Some(id),
+                RpcError::unknown_session(params.session_id.0.clone()),
+            );
+            return;
+        }
+        let session = sessions_guard.get_or_create(&params.session_id).await;
+        session
+            .messages
+            .iter()
+            .rev()
+            .take(BTW_TRANSCRIPT_TAIL_MESSAGES)
+            .rev()
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+
+    // One aside per session at a time — a second `/btw` while the first is
+    // still answering is rejected, not queued.
+    {
+        let Ok(mut in_flight) = btw_in_flight_sessions().lock() else {
+            let _ = send_rpc_error(
+                ws,
+                Some(id),
+                RpcError::internal_error("btw in-flight registry poisoned"),
+            );
+            return;
+        };
+        if !in_flight.insert(params.session_id.clone()) {
+            let _ = send_rpc_error(
+                ws,
+                Some(id),
+                RpcError::invalid_request("a btw aside is already answering for this session")
+                    .with_data(json!({ "kind": "btw_busy" })),
+            );
+            return;
+        }
+    }
+    let _in_flight_guard = BtwInFlightGuard(params.session_id.clone());
+
+    // Live-activity digest from the ledger replay window's tail.
+    let activity_lines = ledger
+        .snapshot_with_cursor(&params.session_id, None)
+        .map(|(replayed, _)| {
+            replayed
+                .iter()
+                .filter_map(|event| match &event.event {
+                    UiProtocolLedgerEvent::Notification(notification) => {
+                        btw_activity_line(notification)
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let activity_tail = activity_lines
+        .iter()
+        .rev()
+        .take(BTW_ACTIVITY_TAIL_EVENTS)
+        .rev()
+        .cloned()
+        .collect::<Vec<_>>();
+
+    // The profile's shared provider chain — same one the live turn uses.
+    let profile_id = params
+        .session_id
+        .profile_id()
+        .or(routed_profile_id)
+        .or(connection_profile_id)
+        .map(ToOwned::to_owned);
+    let llm = match btw_test_provider() {
+        Some(llm) => Ok(Some(llm)),
+        None => ensure_session_profile_runtime(state, profile_id.as_deref())
+            .await
+            .map(|runtime| runtime.map(|runtime| runtime.llm.clone())),
+    };
+    let llm = match llm {
+        Ok(Some(llm)) => llm,
+        Ok(None) => {
+            let _ = send_rpc_error(
+                ws,
+                Some(id),
+                RpcError::runtime_not_ready("no LLM provider available for this session"),
+            );
+            return;
+        }
+        Err(error) => {
+            let _ = send_rpc_error(ws, Some(id), error);
+            return;
+        }
+    };
+
+    let messages = build_btw_messages(&transcript_tail, &activity_tail, &question);
+    let config = octos_llm::ChatConfig {
+        max_tokens: Some(BTW_ANSWER_MAX_TOKENS),
+        temperature: Some(0.2),
+        tool_choice: octos_llm::ToolChoice::None,
+        ..Default::default()
+    };
+    // `&[]` tool specs IS the "no tools" restriction — the model cannot call
+    // what it is never offered.
+    let answer = match tokio::time::timeout(
+        std::time::Duration::from_secs(BTW_TIMEOUT_SECS),
+        llm.chat(&messages, &[], &config),
+    )
+    .await
+    {
+        Ok(Ok(response)) => response
+            .content
+            .map(|content| content.trim().to_owned())
+            .filter(|content| !content.is_empty()),
+        Ok(Err(error)) => {
+            let _ = send_rpc_error(
+                ws,
+                Some(id),
+                RpcError::internal_error(format!("btw aside failed: {error}")),
+            );
+            return;
+        }
+        Err(_elapsed) => {
+            let _ = send_rpc_error(
+                ws,
+                Some(id),
+                RpcError::internal_error(format!("btw aside timed out after {BTW_TIMEOUT_SECS}s")),
+            );
+            return;
+        }
+    };
+    let Some(answer) = answer else {
+        let _ = send_rpc_error(
+            ws,
+            Some(id),
+            RpcError::internal_error("btw aside returned an empty answer"),
+        );
+        return;
+    };
+
+    let result = octos_core::ui_protocol::SessionBtwResult {
+        session_id: params.session_id,
+        answer,
+        model: Some(llm.model_id().to_string()),
+    };
+    send_serialized_rpc_result(
+        ws,
+        id,
+        octos_core::ui_protocol::methods::SESSION_BTW,
         result,
     );
 }
@@ -24293,6 +24667,10 @@ mod tests {
                 "session_id": session_id,
                 "turn_id": turn_id,
             }),
+            methods::SESSION_BTW => json!({
+                "session_id": session_id,
+                "question": "what are you working on?",
+            }),
             methods::SESSION_LIST | methods::SYSTEM_STATUS_GET | methods::CONTENT_LIST => {
                 json!({})
             }
@@ -32978,6 +33356,253 @@ ignore = []
                 "{method} must reject with METHOD_NOT_SUPPORTED even with no header",
             );
         }
+    }
+
+    #[test]
+    fn session_ingress_scope_accepts_session_btw_for_matching_session() {
+        let allowed = SessionKey("dspfac:local:tui#coding".into());
+        let command = UiCommand::SessionBtw(SessionBtwParams {
+            session_id: SessionKey("dspfac:local:tui".into()),
+            topic: Some("coding".into()),
+            question: "what are you working on".into(),
+        });
+        validate_session_ingress_command_scope(&command, &allowed).expect("scope matches");
+
+        let mismatched = UiCommand::SessionBtw(SessionBtwParams {
+            session_id: SessionKey("other:local:tui".into()),
+            topic: None,
+            question: "what are you working on".into(),
+        });
+        assert!(validate_session_ingress_command_scope(&mismatched, &allowed).is_err());
+    }
+
+    #[test]
+    fn advertised_capabilities_include_session_btw() {
+        let state = AppState::empty_for_tests();
+        let capabilities = ConnectionUiFeatures::default().advertised_capabilities(&state);
+        assert!(
+            capabilities
+                .supported_methods
+                .iter()
+                .any(|method| method == octos_core::ui_protocol::methods::SESSION_BTW),
+            "session/btw must be advertised so clients can gate /btw; got {:?}",
+            capabilities.supported_methods
+        );
+    }
+
+    #[test]
+    fn build_btw_messages_shapes_prompt_without_tools() {
+        let now = Utc::now();
+        let mk = |role: MessageRole, content: &str| Message {
+            role,
+            content: content.into(),
+            media: vec![],
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+            client_message_id: None,
+            thread_id: None,
+            timestamp: now,
+        };
+        let transcript = vec![
+            mk(MessageRole::User, "please refactor the parser"),
+            mk(MessageRole::Assistant, ""),
+            mk(MessageRole::Assistant, "starting on it"),
+        ];
+        let activity = vec!["tool `shell` running".to_owned()];
+        let messages = build_btw_messages(&transcript, &activity, "btw what are you working on?");
+
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].role, MessageRole::System);
+        assert!(
+            messages[0].content.contains("NO tools"),
+            "system prompt must state the no-tools restriction"
+        );
+        let prompt = &messages[1].content;
+        assert!(prompt.contains("please refactor the parser"));
+        assert!(prompt.contains("starting on it"));
+        assert!(
+            !prompt.contains("assistant: \n"),
+            "empty-content messages are skipped"
+        );
+        assert!(prompt.contains("- tool `shell` running"));
+        assert!(prompt.contains("btw what are you working on?"));
+    }
+
+    #[tokio::test]
+    async fn session_btw_rejects_empty_question() {
+        let state = Arc::new(AppState::empty_for_tests());
+        let ledger = event_ledger(&state).await;
+        let (ws, mut rx) = ws_connection_for_test(4);
+
+        handle_session_btw(
+            &ws,
+            &state,
+            &ledger,
+            None,
+            None,
+            "b1".into(),
+            SessionBtwParams {
+                session_id: SessionKey("local:btw-empty".into()),
+                topic: None,
+                question: "   ".into(),
+            },
+        )
+        .await;
+
+        let frame = recv_rpc_json(&mut rx).await;
+        assert_eq!(frame["id"], "b1");
+        assert!(
+            frame["error"]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("non-empty question")),
+            "got {frame}"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_btw_rejects_unknown_session() {
+        let known = SessionKey("local:btw-known".into());
+        let state = prg_state_with_session(&known, prg_seed_user_assistant);
+        let ledger = event_ledger(&state).await;
+        let (ws, mut rx) = ws_connection_for_test(4);
+
+        handle_session_btw(
+            &ws,
+            &state,
+            &ledger,
+            None,
+            None,
+            "b2".into(),
+            SessionBtwParams {
+                session_id: SessionKey("local:btw-unknown".into()),
+                topic: None,
+                question: "what are you working on?".into(),
+            },
+        )
+        .await;
+
+        let frame = recv_rpc_json(&mut rx).await;
+        assert_eq!(frame["id"], "b2");
+        assert_eq!(frame["error"]["data"]["session_id"], "local:btw-unknown");
+    }
+
+    #[tokio::test]
+    async fn session_btw_rejects_second_aside_while_first_in_flight() {
+        let session_id = SessionKey("local:btw-busy".into());
+        let state = prg_state_with_session(&session_id, prg_seed_user_assistant);
+        let ledger = event_ledger(&state).await;
+        let (ws, mut rx) = ws_connection_for_test(4);
+
+        btw_in_flight_sessions()
+            .lock()
+            .expect("in-flight registry")
+            .insert(session_id.clone());
+
+        handle_session_btw(
+            &ws,
+            &state,
+            &ledger,
+            None,
+            None,
+            "b3".into(),
+            SessionBtwParams {
+                session_id: session_id.clone(),
+                topic: None,
+                question: "still there?".into(),
+            },
+        )
+        .await;
+
+        btw_in_flight_sessions()
+            .lock()
+            .expect("in-flight registry")
+            .remove(&session_id);
+
+        let frame = recv_rpc_json(&mut rx).await;
+        assert_eq!(frame["id"], "b3");
+        assert_eq!(frame["error"]["data"]["kind"], "btw_busy");
+    }
+
+    #[tokio::test]
+    async fn session_btw_answers_via_provider_with_no_tools() {
+        struct BtwStubProvider;
+        #[async_trait::async_trait]
+        impl octos_llm::LlmProvider for BtwStubProvider {
+            async fn chat(
+                &self,
+                messages: &[octos_core::Message],
+                tools: &[octos_llm::ToolSpec],
+                config: &octos_llm::ChatConfig,
+            ) -> eyre::Result<octos_llm::ChatResponse> {
+                assert!(tools.is_empty(), "btw aside must offer NO tools");
+                assert!(
+                    matches!(config.tool_choice, octos_llm::ToolChoice::None),
+                    "btw aside must force tool_choice=None"
+                );
+                let prompt = &messages.last().expect("user prompt").content;
+                assert!(
+                    prompt.contains("what are you working on"),
+                    "question must reach the provider; got {prompt}"
+                );
+                assert!(
+                    prompt.contains("hello"),
+                    "transcript tail must reach the provider; got {prompt}"
+                );
+                Ok(octos_llm::ChatResponse {
+                    content: Some("Refactoring the parser; tests are running.".into()),
+                    reasoning_content: None,
+                    tool_calls: vec![],
+                    stop_reason: octos_llm::StopReason::EndTurn,
+                    usage: octos_llm::TokenUsage::default(),
+                    provider_index: None,
+                })
+            }
+            fn model_id(&self) -> &str {
+                "btw-stub-model"
+            }
+            fn provider_name(&self) -> &str {
+                "stub"
+            }
+        }
+
+        let session_id = SessionKey("local:btw-happy".into());
+        let state = prg_state_with_session(&session_id, prg_seed_user_assistant);
+        let ledger = event_ledger(&state).await;
+        let (ws, mut rx) = ws_connection_for_test(4);
+
+        *btw_test_provider_slot().lock().expect("slot") = Some(Arc::new(BtwStubProvider));
+        handle_session_btw(
+            &ws,
+            &state,
+            &ledger,
+            None,
+            None,
+            "b4".into(),
+            SessionBtwParams {
+                session_id: session_id.clone(),
+                topic: None,
+                question: "btw, what are you working on?".into(),
+            },
+        )
+        .await;
+        *btw_test_provider_slot().lock().expect("slot") = None;
+
+        let frame = recv_rpc_json(&mut rx).await;
+        assert_eq!(frame["id"], "b4", "got {frame}");
+        assert_eq!(
+            frame["result"]["answer"],
+            "Refactoring the parser; tests are running."
+        );
+        assert_eq!(frame["result"]["model"], "btw-stub-model");
+        assert_eq!(frame["result"]["session_id"], session_id.to_string());
+        assert!(
+            !btw_in_flight_sessions()
+                .lock()
+                .expect("in-flight registry")
+                .contains(&session_id),
+            "the in-flight slot must be released after the answer"
+        );
     }
 
     #[test]
