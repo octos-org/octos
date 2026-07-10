@@ -99,13 +99,12 @@ impl Agent {
             );
             return None;
         };
-        // Over-fetch on the task (filtered) path so dropping conversation
-        // episodes below can't starve task recall under the inject limit.
-        let fetch_limit = if include_conversations {
-            RELEVANT_EXPERIENCES_INJECT_LIMIT
-        } else {
-            RELEVANT_EXPERIENCES_INJECT_LIMIT * 4
-        };
+        // Source isolation (codex #1618 P2): a TASK's generic query (e.g.
+        // the fixed "code review") can BM25-admit an unrelated CONVERSATION
+        // summary past the 0.55 floor. Task recall excludes conversation
+        // episodes (the store guarantees none leak in); conversation recall
+        // keeps both.
+        let exclude_conversation = !include_conversations;
         let scored_result = match embedder.embed(&[query]).await {
             Ok(vecs) => {
                 let query_emb = vecs.into_iter().next();
@@ -113,8 +112,9 @@ impl Agent {
                     .find_relevant_hybrid_scored_filtered(
                         query,
                         query_emb,
-                        fetch_limit,
+                        RELEVANT_EXPERIENCES_INJECT_LIMIT,
                         Some(MIN_EPISODE_SIMILARITY),
+                        exclude_conversation,
                     )
                     .await
             }
@@ -124,20 +124,14 @@ impl Agent {
                     .find_relevant_hybrid_scored_filtered(
                         query,
                         None,
-                        fetch_limit,
+                        RELEVANT_EXPERIENCES_INJECT_LIMIT,
                         Some(MIN_EPISODE_SIMILARITY),
+                        exclude_conversation,
                     )
                     .await
             }
         };
-        let mut scored = scored_result.ok()?;
-        // Source isolation (codex #1618 P2): a TASK's generic query (e.g.
-        // the fixed "code review") can BM25-admit an unrelated CONVERSATION
-        // summary past the 0.55 floor. Task recall therefore excludes
-        // conversation episodes; conversation recall keeps both.
-        if !include_conversations {
-            scored.retain(|(ep, _)| ep.source != octos_memory::EpisodeSource::Conversation);
-        }
+        let scored = scored_result.ok()?;
         // NEW-06 diagnostic: one structured line naming the admitted
         // episodes + per-modality scores, so operators can confirm the gate
         // without inspecting the model-visible prompt.
@@ -199,15 +193,16 @@ impl Agent {
             octos_memory::EpisodeOutcome::Success,
         );
         episode.source = octos_memory::EpisodeSource::Conversation;
-        // Reuse this conversation's stable episode id across compactions so
-        // the store INSERT upserts one per-session episode (latest
-        // cumulative summary) instead of accumulating stale snapshots that
-        // crowd the recall slots (codex #1618 P3).
-        let ep_id = self
-            .conversation_episode_id
-            .get_or_init(|| episode.id.clone())
-            .clone();
-        episode.id = ep_id.clone();
+        // Fresh id per compaction. An earlier design reused one id per
+        // session to "upsert", but the hybrid index ignores a repeated id
+        // and HNSW vectors never replace (codex #1618 P2) — so recall would
+        // rank on the FIRST summary forever. A fresh id keeps every episode
+        // fully + correctly indexed. Growth is bounded: compaction is rare
+        // (only when context fills), so a session yields a few episodes —
+        // its substantive chunks. Later summaries subsume earlier ones
+        // (cumulative), so the latest, most complete episode ranks highest;
+        // the earlier partials are minor redundancy.
+        let ep_id = episode.id.clone();
         if let Err(e) = self.memory.store(episode).await {
             warn!(error = %e, "failed to save conversation episode");
             return;
@@ -884,7 +879,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn save_conversation_episode_upserts_one_per_session() {
+    async fn save_conversation_episode_appends_per_compaction() {
         use crate::{Agent, tools::ToolRegistry};
         use octos_memory::EpisodeStore;
         use std::sync::Arc;
@@ -897,8 +892,8 @@ mod tests {
         let agent = Agent::new(AgentId::new("chat"), provider, tools, memory.clone())
             .with_embedder(Arc::new(ConstEmbedder));
 
-        // Two compactions in one session (same agent) → ONE episode, latest
-        // summary — not two overlapping snapshots.
+        // Each compaction appends a fresh, fully-indexed episode (HNSW
+        // can't upsert; growth is bounded per session).
         agent
             .save_conversation_episode("first chunk about widgets".to_string())
             .await;
@@ -907,17 +902,13 @@ mod tests {
             .await;
 
         let all = memory.find_relevant(&workspace, "chunk", 10).await.unwrap();
-        let conv_count = all
-            .iter()
-            .filter(|e| e.summary.contains("chunk about"))
-            .count();
-        assert_eq!(
-            conv_count, 1,
-            "one upserted episode per session, got {conv_count}"
+        assert!(
+            all.iter().any(|e| e.summary.contains("widgets")),
+            "first compaction episode present + indexed"
         );
         assert!(
             all.iter().any(|e| e.summary.contains("gadgets")),
-            "the surviving episode carries the LATEST summary"
+            "second compaction episode present + indexed"
         );
     }
 
