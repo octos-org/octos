@@ -676,8 +676,12 @@ pub async fn verify(
                     .await
             }
             Some(RootLoginTarget::Allowlisted) => {
+                // Allowlist provenance authorizes claiming a
+                // pre-provisioned profile under the derived id — the
+                // profile probe must not bump the invitee to `<id>-1`
+                // (codex #1613 r7 P1).
                 auth_mgr
-                    .verify_otp_with_registration(&requested_email, &req.code, true)
+                    .verify_otp_with_authorized_claim(&requested_email, &req.code)
                     .await
             }
             None if auth_mgr.allow_self_registration() => {

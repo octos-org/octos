@@ -14,6 +14,7 @@ pub(crate) mod agent_orchestrator;
 pub mod auth_handlers;
 mod bilibili;
 pub(crate) mod coding_tool_contract;
+mod cron_panel;
 mod events;
 mod events_harness;
 mod frps_plugin;

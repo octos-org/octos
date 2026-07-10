@@ -811,6 +811,34 @@ impl Agent {
                     timestamp: chrono::Utc::now(),
                 }];
 
+                // #1587: session-start conversational episodic recall.
+                // Recall on an EMPTY-history turn — normally the first turn
+                // of a conversation — so the cost (one embed) is paid once
+                // per conversation, NOT per turn, and the contamination
+                // surface is a single injection. Inherits the guard from the
+                // shared helper (embedder-only, 0.55 floor); no-op without an
+                // embedder or on empty input.
+                //
+                // "Empty history" is the trigger, not a strict session
+                // counter: a rare speculative-interrupt retry can re-invoke
+                // with the empty pre-primary snapshot and recall again. That
+                // is harmless — each turn builds a FRESH prompt, so a repeat
+                // adds one embed on that path and never accumulates or
+                // duplicates within a prompt. A "recalled once" marker was
+                // deliberately NOT added: if the agent were reused across a
+                // `/new` fork it would wrongly SUPPRESS recall on a genuine
+                // new conversation, and missing recall is worse than a rare
+                // extra embed on an advisory feature.
+                if history.is_empty() && !user_content.trim().is_empty() {
+                    let default_cwd = std::path::PathBuf::from(".");
+                    let cwd = self.tools.workspace_root().unwrap_or(default_cwd.as_path());
+                    if let Some(recall) =
+                        self.recall_relevant_episodes(user_content, cwd, true).await
+                    {
+                        messages.push(recall);
+                    }
+                }
+
                 messages.extend_from_slice(history);
 
                 // A turn carrying BOTH an audio attachment (a spoken/voice turn)
@@ -948,7 +976,14 @@ impl Agent {
                     // LLM call when a compaction policy is wired and the
                     // context already exceeds the declared threshold.
                     if iteration == 1 {
-                        self.maybe_run_preflight_compaction(&mut messages)?;
+                        if let Some(summary) =
+                            self.maybe_run_preflight_compaction(&mut messages)?
+                        {
+                            // #1587 write side: a conversation large enough to
+                            // compact on entry is worth recalling later. Upserts
+                            // the per-session episode (see save_conversation_episode).
+                            self.save_conversation_episode(summary).await;
+                        }
                     }
                     // Harness M8.5 tier 1: cheap in-place stale/oversized
                     // tool-result pruning. Runs every iteration (including
@@ -961,7 +996,17 @@ impl Agent {
                     // runner sees the final shape of the conversation (after
                     // tool-pair repair + system-message normalization). This
                     // also feeds the validator rail on subsequent iterations.
-                    self.maybe_run_turn_compaction(&mut messages, iteration)?;
+                    if let Some(summary) =
+                        self.maybe_run_turn_compaction(&mut messages, iteration)?
+                    {
+                        // #1587 write side: a conversation that compacts is
+                        // substantial enough to be worth recalling later.
+                        // Persist the compaction summary as an embedded
+                        // episode so a future conversation's session-start
+                        // recall can surface it. No-op without an embedder
+                        // or when episodes are disabled.
+                        self.save_conversation_episode(summary).await;
+                    }
                     self.prepare_prompt_with_context_manager(
                         &mut messages,
                         if iteration == 1 {

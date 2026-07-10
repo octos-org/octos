@@ -171,11 +171,17 @@ impl CronService {
         let result = job.clone();
 
         {
+            // Mutate + persist under ONE lock hold (persistence
+            // invariant — see persist_store_locked). Roll the push back
+            // on a failed write so memory never diverges from the file.
             let mut store = self.store.lock().unwrap_or_else(|e| e.into_inner());
             store.jobs.push(job);
+            if let Err(error) = persist_store_locked(&self.store_path, &store) {
+                store.jobs.retain(|j| j.id != id);
+                return Err(error);
+            }
         }
 
-        self.save_store()?;
         self.arm_timer();
 
         debug!(id = %id, "added cron job");
@@ -186,15 +192,30 @@ impl CronService {
     pub fn remove_job(self: &std::sync::Arc<Self>, id: &str) -> bool {
         let removed = {
             let mut store = self.store.lock().unwrap_or_else(|e| e.into_inner());
-            let before = store.jobs.len();
-            store.jobs.retain(|j| j.id != id);
-            store.jobs.len() < before
+            let mut extracted = Vec::new();
+            let mut kept = Vec::with_capacity(store.jobs.len());
+            for job in store.jobs.drain(..) {
+                if job.id == id {
+                    extracted.push(job);
+                } else {
+                    kept.push(job);
+                }
+            }
+            store.jobs = kept;
+            if extracted.is_empty() {
+                false
+            } else if let Err(e) = persist_store_locked(&self.store_path, &store) {
+                // Failed write: put the job back so memory matches the
+                // file (persistence invariant), and report not-removed.
+                store.jobs.extend(extracted);
+                tracing::warn!("failed to save cron store: {e}");
+                false
+            } else {
+                true
+            }
         };
 
         if removed {
-            if let Err(e) = self.save_store() {
-                tracing::warn!("failed to save cron store: {e}");
-            }
             self.arm_timer();
             debug!(id = %id, "removed cron job");
         }
@@ -224,27 +245,93 @@ impl CronService {
             let now_ms = Utc::now().timestamp_millis();
             let mut store = self.store.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(job) = store.jobs.iter_mut().find(|j| j.id == id) {
+                let prior = job.clone();
                 job.enabled = enabled;
                 if enabled {
                     job.compute_next_run(now_ms);
                 } else {
                     job.state.next_run_at_ms = None;
                 }
-                true
+                if let Err(e) = persist_store_locked(&self.store_path, &store) {
+                    // Failed write: revert so memory matches the file.
+                    if let Some(job) = store.jobs.iter_mut().find(|j| j.id == id) {
+                        *job = prior;
+                    }
+                    tracing::warn!("failed to save cron store: {e}");
+                    false
+                } else {
+                    true
+                }
             } else {
                 false
             }
         };
 
         if found {
-            if let Err(e) = self.save_store() {
-                tracing::warn!("failed to save cron store: {e}");
-            }
             self.arm_timer();
             debug!(id = %id, enabled = %enabled, "toggled cron job");
         }
 
         found
+    }
+
+    /// Enable/disable a job with RECONCILIATION + durable persistence:
+    /// under one store-lock hold, re-read `cron.json` into memory
+    /// (adopting writes from other owners — a gateway child that ran
+    /// and exited, CLI edits), apply the toggle with `enable_job`'s
+    /// next-run semantics, and persist — propagating save failures
+    /// instead of logging them away.
+    ///
+    /// This exists for the serve-side `/api/my/cron` toggle: the
+    /// long-lived ProfileRuntime service's in-memory store can be
+    /// arbitrarily stale w.r.t. the file, and blindly persisting the
+    /// stale store would erase other owners' jobs (codex #1612 r2).
+    /// `Ok(None)` = job not found; `Err` = persistence failed (the
+    /// in-memory store keeps the reloaded + toggled state either way —
+    /// strictly fresher than what it held before).
+    pub fn toggle_job_reconciling(
+        self: &std::sync::Arc<Self>,
+        id: &str,
+        enabled: bool,
+    ) -> Result<Option<CronJob>> {
+        let found = {
+            let now_ms = Utc::now().timestamp_millis();
+            // Reload + toggle + persist under ONE lock hold. Every other
+            // mutation persists before releasing this lock (persistence
+            // invariant — see persist_store_locked), so the file we
+            // reload is never behind unflushed memory, and nothing can
+            // interleave between our reload and our write (codex #1612
+            // r3 — both P1s).
+            let mut store = self.store.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(fresh) = load_store(&self.store_path) {
+                *store = fresh;
+            }
+            let prior = store.jobs.clone();
+            let found = if let Some(job) = store.jobs.iter_mut().find(|j| j.id == id) {
+                job.enabled = enabled;
+                if enabled {
+                    job.compute_next_run(now_ms);
+                } else {
+                    job.state.next_run_at_ms = None;
+                }
+                Some(job.clone())
+            } else {
+                None
+            };
+            if found.is_some()
+                && let Err(error) = persist_store_locked(&self.store_path, &store)
+            {
+                // Failed write: revert so memory matches the file.
+                store.jobs = prior;
+                return Err(error);
+            }
+            found
+        };
+
+        if found.is_some() {
+            self.arm_timer();
+        }
+        Ok(found)
     }
 
     /// Arm a timer for the earliest due job.
@@ -398,39 +485,72 @@ impl CronService {
         // re-fired and its next occurrence stays scheduled — cron
         // semantics reserve the NEXT slot regardless of this fire's
         // outcome.
-        let due_jobs: Vec<CronJob> = {
-            let mut store = self.store.lock().unwrap_or_else(|e| e.into_inner());
-            let mut due = Vec::new();
-            let mut to_delete = Vec::new();
+        // The reserve+advance+persist critical section is SYNCHRONOUS
+        // (std Mutex + std::fs write) and must stay atomic to keep the
+        // persistence invariant (persist under the same lock hold that
+        // reserved — codex #1612 r3). Run the WHOLE section on the
+        // blocking pool so its fs write never occupies a tokio worker,
+        // even on a slow/full/network FS or a one-worker runtime
+        // (codex #1612 r4 P1).
+        //
+        // The reserve→deliver→re-arm chain runs as ONE DETACHED task
+        // (codex #1612 r5 P1). This on_timer future runs inside the
+        // armed timer task, and EVERY schedule mutation (add_job /
+        // remove_job / enable_job) calls arm_timer, which aborts that
+        // task. If delivery lived here, an abort landing after the
+        // blocking reservation committed but before (or during) the bus
+        // sends would swallow the firing: the reservation already
+        // advanced+persisted next_run, so the re-armed timer sees a
+        // future-dated job and silently skips the occurrence. Detached,
+        // an abort only ever cancels the SLEEP between ticks — a tick
+        // that has begun always finishes reserve → deliver → re-arm.
+        // Overlap is safe by construction: reservation is atomic under
+        // the store lock, so a concurrent tick finds nothing due.
+        // Shutdown does not leak the unit: execute_job races each send
+        // against shutdown_notify, and arm_timer no-ops once `running`
+        // is false.
+        let this = std::sync::Arc::clone(self);
+        tokio::spawn(async move {
+            let reserve = std::sync::Arc::clone(&this);
+            let due_jobs: Vec<CronJob> = tokio::task::spawn_blocking(move || {
+                let mut store = reserve.store.lock().unwrap_or_else(|e| e.into_inner());
+                let mut due = Vec::new();
+                let mut to_delete = Vec::new();
 
-            for stored_job in &mut store.jobs {
-                if !stored_job.is_due(now_ms) {
-                    continue;
+                for stored_job in &mut store.jobs {
+                    if !stored_job.is_due(now_ms) {
+                        continue;
+                    }
+                    due.push(stored_job.clone());
+
+                    stored_job.state.last_run_at_ms = Some(now_ms);
+                    stored_job.state.last_status = Some("ok".into());
+
+                    if stored_job.delete_after_run {
+                        to_delete.push(stored_job.id.clone());
+                    } else {
+                        stored_job.compute_next_run(now_ms);
+                    }
                 }
-                due.push(stored_job.clone());
 
-                stored_job.state.last_run_at_ms = Some(now_ms);
-                stored_job.state.last_status = Some("ok".into());
-
-                if stored_job.delete_after_run {
-                    to_delete.push(stored_job.id.clone());
-                } else {
-                    stored_job.compute_next_run(now_ms);
+                store.jobs.retain(|j| !to_delete.contains(&j.id));
+                // A failed write is logged and the tick proceeds —
+                // next_run stays advanced in memory, so no double-fire;
+                // the file catches up on the next successful persist.
+                if let Err(e) = persist_store_locked(&reserve.store_path, &store) {
+                    tracing::warn!("failed to save cron store: {e}");
                 }
+                due
+            })
+            .await
+            .unwrap_or_default();
+
+            for job in &due_jobs {
+                this.execute_job(job).await;
             }
 
-            store.jobs.retain(|j| !to_delete.contains(&j.id));
-            due
-        };
-
-        for job in &due_jobs {
-            self.execute_job(job).await;
-        }
-
-        if let Err(e) = self.save_store_async().await {
-            tracing::warn!("failed to save cron store: {e}");
-        }
-        self.arm_timer();
+            this.arm_timer();
+        });
     }
 
     /// Fire a single job by sending an InboundMessage into the bus.
@@ -453,41 +573,86 @@ impl CronService {
             origin: octos_core::MessageOrigin::ExternalUser,
         };
 
-        if let Err(e) = self.inbound_tx.send(msg).await {
-            warn!(error = %e, job_id = %job.id, "failed to send cron message to bus");
+        // The delivery unit is detached (not abort-targeted), so a
+        // shutdown can no longer cancel an in-flight send by aborting
+        // the timer task. Race the send against the shutdown notify —
+        // check-then-select, same missed-notify-proof ordering as the
+        // sleeper in arm_timer: register the waiter FIRST, then check
+        // `running`, so a shutdown that fires before registration is
+        // caught by the flag and one that fires after wakes the select.
+        // Without this, a full bus channel whose receiver stopped
+        // draining at shutdown would park the send forever, pinning the
+        // service Arc. Dropping the delivery on shutdown matches the
+        // old abort semantics: the reservation stays advanced, so the
+        // occurrence is skipped, never double-fired.
+        //
+        // `biased` with the notify arm FIRST (codex #1612 r6 P2): when
+        // shutdown lands between the `running` check and the select's
+        // first poll, BOTH arms are ready (the bus may have capacity).
+        // An unbiased select! randomizes the winner, so the send could
+        // deliver a cron message after the service stopped — the old
+        // abort semantics never allowed that. Biased polling makes
+        // cancellation take precedence deterministically.
+        let notified = self.shutdown_notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        if !self.running.load(Ordering::Relaxed) {
+            warn!(job_id = %job.id, "cron service stopped; dropping cron delivery");
+            return;
+        }
+        tokio::select! {
+            biased;
+            _ = &mut notified => {
+                warn!(job_id = %job.id, "cron service shut down during delivery; dropping cron message");
+            }
+            res = self.inbound_tx.send(msg) => {
+                if let Err(e) = res {
+                    warn!(error = %e, job_id = %job.id, "failed to send cron message to bus");
+                }
+            }
         }
     }
+}
 
-    fn save_store(&self) -> Result<()> {
-        let store = self.store.lock().unwrap_or_else(|e| e.into_inner());
-        let json =
-            serde_json::to_string_pretty(&*store).wrap_err("failed to serialize cron store")?;
-        let tmp_path = self.store_path.with_extension("tmp");
-        std::fs::write(&tmp_path, &json).wrap_err("failed to write cron store temp")?;
-        std::fs::rename(&tmp_path, &self.store_path).wrap_err("failed to rename cron store")?;
-        Ok(())
+/// Serialize + atomically replace `cron.json`. The caller MUST hold the
+/// store lock for the whole call — that is the service's persistence
+/// invariant (every mutation persists before releasing the lock), which
+/// keeps memory and file in lockstep so no writer can interleave a
+/// stale snapshot (codex #1612 r3). Unique temp names keep
+/// out-of-process writers from colliding on a shared `cron.tmp`.
+fn persist_store_locked(store_path: &Path, store: &CronStore) -> Result<()> {
+    let json = serde_json::to_string_pretty(store).wrap_err("failed to serialize cron store")?;
+    write_cron_json_atomic(store_path, &json)
+}
+
+/// Process-global temp-name sequence, shared by EVERY cron writer
+/// (`CronService::persist_store_locked` AND the serve-side file toggle
+/// in `cron_panel.rs`), so no two writers can pick the same
+/// `cron.tmp-<pid>-<seq>` path and consume each other's temp file
+/// (codex #1612 r4 P2).
+static CRON_TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Serialize-free atomic replace of `cron.json`: write to a unique temp
+/// then rename. The ONLY cron writer primitive — every mutation path
+/// and the serve-side file toggle route through it (shared temp
+/// sequence, consistent cleanup). Partial temp files are removed on
+/// BOTH the write and rename error paths so repeated failures cannot
+/// accumulate orphans (codex #1612 r4 P2).
+pub fn write_cron_json_atomic(store_path: &Path, json: &str) -> Result<()> {
+    let tmp_path = store_path.with_extension(format!(
+        "tmp-{}-{}",
+        std::process::id(),
+        CRON_TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    if let Err(error) = std::fs::write(&tmp_path, json) {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(eyre::Report::new(error).wrap_err("failed to write cron store temp"));
     }
-
-    /// Async version of save_store that uses spawn_blocking to avoid blocking
-    /// the tokio runtime thread.
-    async fn save_store_async(&self) -> Result<()> {
-        let json = {
-            let store = self.store.lock().unwrap_or_else(|e| e.into_inner());
-            serde_json::to_string_pretty(&*store).wrap_err("failed to serialize cron store")?
-        };
-        let tmp_path = self.store_path.with_extension("tmp");
-        let store_path = self.store_path.clone();
-
-        tokio::task::spawn_blocking(move || {
-            std::fs::write(&tmp_path, &json).wrap_err("failed to write cron store temp")?;
-            std::fs::rename(&tmp_path, &store_path).wrap_err("failed to rename cron store")?;
-            Ok::<_, eyre::Report>(())
-        })
-        .await
-        .map_err(|e| eyre::eyre!("spawn_blocking join error: {e}"))??;
-
-        Ok(())
+    if let Err(error) = std::fs::rename(&tmp_path, store_path) {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(eyre::Report::new(error).wrap_err("failed to rename cron store"));
     }
+    Ok(())
 }
 
 fn load_store(path: &Path) -> Option<CronStore> {
@@ -540,6 +705,70 @@ mod tests {
         let (tx, rx) = mpsc::channel(64);
         let service = std::sync::Arc::new(CronService::new(dir.join("cron.json"), tx));
         (service, rx)
+    }
+
+    #[test]
+    fn concurrent_adds_and_reconciling_toggles_lose_nothing() {
+        // codex #1612 r3: every mutation persists before releasing the
+        // store lock, so a reload-based reconcile can never revert an
+        // unflushed add, and no writer can interleave a stale snapshot
+        // between another's serialize and rename. 8 adds racing 8
+        // reconciling toggles must land ALL adds in the file.
+        let dir = tempfile::tempdir().unwrap();
+        let (tx, _rx) = mpsc::channel(64);
+        let service = std::sync::Arc::new(CronService::new(dir.path().join("cron.json"), tx));
+        let seeded = service
+            .add_job(
+                "seed".into(),
+                CronSchedule::Every { every_ms: 60_000 },
+                CronPayload {
+                    message: "m".into(),
+                    deliver: false,
+                    channel: None,
+                    chat_id: None,
+                },
+            )
+            .unwrap();
+
+        let mut handles = Vec::new();
+        for i in 0..8 {
+            let svc = std::sync::Arc::clone(&service);
+            handles.push(std::thread::spawn(move || {
+                svc.add_job(
+                    format!("racer-{i}"),
+                    CronSchedule::Every { every_ms: 60_000 },
+                    CronPayload {
+                        message: "m".into(),
+                        deliver: false,
+                        channel: None,
+                        chat_id: None,
+                    },
+                )
+                .unwrap();
+            }));
+            let svc = std::sync::Arc::clone(&service);
+            let seed_id = seeded.id.clone();
+            handles.push(std::thread::spawn(move || {
+                svc.toggle_job_reconciling(&seed_id, i % 2 == 0)
+                    .unwrap()
+                    .expect("seed job present");
+            }));
+        }
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        let file: CronStore =
+            serde_json::from_str(&std::fs::read_to_string(dir.path().join("cron.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            file.jobs.len(),
+            9,
+            "all 8 racing adds + the seed must survive: {:?}",
+            file.jobs.iter().map(|j| j.name.clone()).collect::<Vec<_>>()
+        );
+        // And memory agrees with the file (persistence invariant).
+        assert_eq!(service.list_all_jobs().len(), 9);
     }
 
     #[tokio::test]
@@ -990,6 +1219,126 @@ mod tests {
                 "job {id} must have its next occurrence scheduled, got {next:?}"
             );
         }
+
+        service.stop().await;
+    }
+
+    /// codex #1612 r5 P1: a routine schedule mutation must never swallow
+    /// a firing whose reservation already committed.
+    ///
+    /// The tick is reserve-then-fire: the blocking critical section
+    /// advances `next_run_at_ms` and persists, and only then does the
+    /// task deliver to the bus. Every mutation (`add_job` / `remove_job`
+    /// / `enable_job`) calls `arm_timer`, which ABORTS the armed timer
+    /// task. If delivery lives in that abortable future, an abort
+    /// landing after the reservation committed but before (or during)
+    /// the bus send kills the delivery — and the re-armed timer sees
+    /// the advanced next_run and silently skips the occurrence.
+    ///
+    /// Deterministic interleaving: the bus channel (capacity 1) is
+    /// PRE-FILLED, so the tick's send is guaranteed parked (or not yet
+    /// polled) — it cannot complete before the test drains. We wait for
+    /// the reservation to commit (next_run advanced), let a concurrent
+    /// `add_job` abort the timer task, PROVE the task is dead, and only
+    /// then drain: the reserved fire must still arrive, because the
+    /// reserve→deliver→re-arm unit is detached and no abort can sever
+    /// a committed reservation from its delivery.
+    #[tokio::test]
+    async fn should_deliver_reserved_fire_when_rearm_aborts_timer_mid_tick() {
+        let dir = tempfile::tempdir().unwrap();
+        let (tx, mut rx) = mpsc::channel::<InboundMessage>(1);
+        let service =
+            std::sync::Arc::new(CronService::new(dir.path().join("cron.json"), tx.clone()));
+
+        let payload = |msg: &str| CronPayload {
+            message: msg.into(),
+            deliver: false,
+            channel: None,
+            chat_id: None,
+        };
+
+        // Fill the channel BEFORE the timer can fire: the tick's send
+        // parks until the test drains.
+        tx.try_send(InboundMessage {
+            channel: "system".into(),
+            sender_id: "test".into(),
+            chat_id: "plug".into(),
+            content: "plug".into(),
+            timestamp: Utc::now(),
+            media: vec![],
+            metadata: serde_json::Value::Null,
+            message_id: None,
+            origin: octos_core::MessageOrigin::ExternalUser,
+        })
+        .expect("pre-fill send must succeed on an empty capacity-1 channel");
+
+        // Added while stopped, then backdated so it is due immediately.
+        let job = service
+            .add_job(
+                "reserved".into(),
+                CronSchedule::Every { every_ms: 60_000 },
+                payload("reserved fire"),
+            )
+            .unwrap();
+        let past_ms = Utc::now().timestamp_millis() - 60_000;
+        {
+            let mut store = service.store.lock().unwrap();
+            store.jobs[0].state.next_run_at_ms = Some(past_ms);
+        }
+
+        service.start();
+
+        // The reservation has committed once next_run is advanced past
+        // the backdated value; delivery is parked on the full channel.
+        wait_until("reservation committed (next_run advanced)", || {
+            service
+                .list_jobs()
+                .first()
+                .and_then(|j| j.state.next_run_at_ms)
+                .is_some_and(|t| t > past_ms)
+        })
+        .await;
+
+        // Capture the armed timer task, then let a routine mutation
+        // re-arm (and thus abort) it.
+        let timer_abort = {
+            let guard = service.timer_handle.lock().await;
+            guard
+                .as_ref()
+                .expect("timer task must be armed")
+                .abort_handle()
+        };
+        service
+            .add_job(
+                "unrelated".into(),
+                CronSchedule::Every { every_ms: 600_000 },
+                payload("unrelated"),
+            )
+            .unwrap();
+
+        // Only drain once the abort has provably landed, so delivery
+        // cannot win by racing ahead of the abort.
+        wait_until("timer task aborted by the re-arm", || {
+            timer_abort.is_finished()
+        })
+        .await;
+
+        // Drain the plug, then the reserved fire MUST arrive.
+        let plug = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+            .await
+            .expect("plug message must be readable")
+            .expect("bus channel closed unexpectedly");
+        assert_eq!(plug.content, "plug");
+
+        let fired = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+            .await
+            .expect(
+                "reserved fire must be delivered even though a schedule mutation \
+                 aborted the timer task after the reservation committed",
+            )
+            .expect("bus channel closed unexpectedly");
+        assert_eq!(fired.chat_id, job.id);
+        assert_eq!(fired.content, "reserved fire");
 
         service.stop().await;
     }

@@ -34,14 +34,14 @@ use octos_core::ui_protocol::{
     MessagePersistedSource, OutputCursor, Payload, ReplayLossyEvent, RpcError, RpcErrorResponse,
     RpcRequest, RpcResponse, SESSION_HYDRATE_INCLUDE_MAX, SESSION_MESSAGES_PAGE_DEFAULT_LIMIT,
     SESSION_MESSAGES_PAGE_MAX_LIMIT, SESSION_MESSAGES_PAGE_MAX_OFFSET, SESSION_TITLE_SET_MAX_CHARS,
-    SessionDeleteParams, SessionFilesListParams, SessionHydrateParams, SessionHydrateResult,
-    SessionListParams, SessionMessagesPageParams, SessionOpenParams, SessionOpenResult,
-    SessionOpened, SessionOrchestrationEvent, SessionRollbackParams, SessionRollbackResult,
-    SessionSnapshotParams, SessionStatusGetParams, SessionTasksListParams, SessionTitleSetParams,
-    SessionWorkspaceGetParams, SystemStatusGetParams, TaskArtifactListParams,
-    TaskArtifactListResult, TaskArtifactReadParams, TaskArtifactReadResult, TaskArtifactRecord,
-    TaskCancelParams, TaskCancelResult, TaskListEntry, TaskListParams, TaskListResult,
-    TaskOutputDeltaEvent, TaskRestartFromNodeParams, TaskRestartFromNodeResult,
+    SessionBtwParams, SessionDeleteParams, SessionFilesListParams, SessionHydrateParams,
+    SessionHydrateResult, SessionListParams, SessionMessagesPageParams, SessionOpenParams,
+    SessionOpenResult, SessionOpened, SessionOrchestrationEvent, SessionRollbackParams,
+    SessionRollbackResult, SessionSnapshotParams, SessionStatusGetParams, SessionTasksListParams,
+    SessionTitleSetParams, SessionWorkspaceGetParams, SystemStatusGetParams,
+    TaskArtifactListParams, TaskArtifactListResult, TaskArtifactReadParams, TaskArtifactReadResult,
+    TaskArtifactRecord, TaskCancelParams, TaskCancelResult, TaskListEntry, TaskListParams,
+    TaskListResult, TaskOutputDeltaEvent, TaskRestartFromNodeParams, TaskRestartFromNodeResult,
     TaskRuntimeState as UiTaskRuntimeState, TaskUpdatedEvent, ThreadGraphEntry,
     ThreadGraphGetParams, ThreadGraphGetResult, ToolCompletedEvent, ToolProgressEvent,
     ToolStartedEvent, TurnCompletedEvent, TurnErrorEvent, TurnId, TurnInterruptParams,
@@ -242,6 +242,7 @@ const APPUI_EXTRA_METHODS: &[&str] = &[
     APPUI_METHOD_PROFILE_SKILLS_INSTALL,
     APPUI_METHOD_PROFILE_SKILLS_REMOVE,
     APPUI_METHOD_ONBOARDING_WORKSPACE_PROBE,
+    octos_core::ui_protocol::methods::SESSION_BTW,
 ];
 const APPUI_STDIO_AUTH_BOUND_UNAVAILABLE_METHODS: &[&str] = &[
     APPUI_METHOD_AUTH_ME,
@@ -980,6 +981,12 @@ fn m9_protocol_fixture_for_prompt(prompt: &str) -> Option<M9ProtocolFixture> {
 
 struct ActiveTurn {
     turn_id: TurnId,
+    /// Resolved profile the turn was admitted under (canonical: absent maps
+    /// to `MAIN_PROFILE_ID`). `session/btw` verifies it before injecting the
+    /// turn's live draft into an aside — the registry is process-global and
+    /// keyed by bare `SessionKey`, so two profiles' same-named sessions would
+    /// otherwise cross-read each other's stream.
+    profile_id: String,
     /// Per-turn state guard; held by both the registry entry and by the turn
     /// task so interrupt + natural-completion races serialize on a single lock.
     state: Arc<TokioMutex<TurnState>>,
@@ -4040,6 +4047,11 @@ async fn ui_protocol_connection(
     // forces the session to that profile); it only fills the gap left by
     // None-scoped (admin) connections, which are authorized for every profile.
     let mut session_open_profile_id: Option<String> = None;
+    // Detached `session/btw` aside tasks spawned by this connection. Aborted
+    // at teardown: an aside holds a WsConnection clone (writer sender), so an
+    // orphaned one would keep paid provider work running — and hold the stdio
+    // writer open past EOF — for up to its 30s timeout after the client left.
+    let mut btw_aside_tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();
     // Last-emitted whole-job orchestration status per session (dedup so only
     // changes hit the wire). Drives the client's composer top-border indicator.
     let mut last_orchestration: HashMap<SessionKey, SessionOrchestrationEvent> = HashMap::new();
@@ -4386,6 +4398,17 @@ async fn ui_protocol_connection(
                 )
                 .await;
             }
+            UiCommand::SessionFork(params) => {
+                handle_session_fork(
+                    &ws,
+                    &state,
+                    connection_profile_id,
+                    routed_profile_id,
+                    id,
+                    params,
+                )
+                .await;
+            }
             UiCommand::ThreadGraphGet(params) => {
                 handle_thread_graph_get(
                     &ws,
@@ -4412,6 +4435,27 @@ async fn ui_protocol_connection(
                     params,
                 )
                 .await;
+            }
+            UiCommand::SessionBtw(params) => {
+                let aside = handle_session_btw(
+                    &ws,
+                    &state,
+                    &ledger,
+                    &active_turns,
+                    connection_profile_id,
+                    // gap #2: fall back to the session-open profile when the
+                    // connection supplied no routing profile (admin / unscoped)
+                    // so the aside reads and bills the SAME profile the open
+                    // resolved to.
+                    routed_profile_id.or(session_open_profile_id.as_deref()),
+                    id,
+                    params,
+                )
+                .await;
+                if let Some(task) = aside {
+                    btw_aside_tasks.retain(|task| !task.is_finished());
+                    btw_aside_tasks.push(task);
+                }
             }
             UiCommand::PermissionProfileList(params) => {
                 let result = permission_profile_list_result(&state, params);
@@ -4625,6 +4669,7 @@ async fn ui_protocol_connection(
     )
     .await;
     abort_live_forwarders(&live_forwarders, &ledger).await;
+    abort_btw_aside_tasks(&mut btw_aside_tasks).await;
     // Dropping `ws` lets the writer task drain & exit; await it so the socket
     // is closed before we return.
     drop(ws);
@@ -4719,6 +4764,9 @@ where
     let ledger = event_ledger(&state).await;
     let _ = diff_preview_store(&state, contracts.as_ref()).await;
     let mut features = ConnectionUiFeatures::stdio_defaults();
+    // See the ws loop's twin: detached asides must not outlive this stdio
+    // connection (they hold the writer sender → EOF shutdown would block).
+    let mut btw_aside_tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();
     let connection_headers = HeaderMap::new();
     let mut connection_profile_id_owned: Option<String> = None;
     let mut last_orchestration: HashMap<SessionKey, SessionOrchestrationEvent> = HashMap::new();
@@ -5035,6 +5083,17 @@ where
                 )
                 .await;
             }
+            UiCommand::SessionFork(params) => {
+                handle_session_fork(
+                    &ws,
+                    &state,
+                    connection_profile_id_owned.as_deref(),
+                    None,
+                    id,
+                    params,
+                )
+                .await;
+            }
             UiCommand::ThreadGraphGet(params) => {
                 handle_thread_graph_get(
                     &ws,
@@ -5061,6 +5120,23 @@ where
                     params,
                 )
                 .await;
+            }
+            UiCommand::SessionBtw(params) => {
+                let aside = handle_session_btw(
+                    &ws,
+                    &state,
+                    &ledger,
+                    &active_turns,
+                    connection_profile_id_owned.as_deref(),
+                    None,
+                    id,
+                    params,
+                )
+                .await;
+                if let Some(task) = aside {
+                    btw_aside_tasks.retain(|task| !task.is_finished());
+                    btw_aside_tasks.push(task);
+                }
             }
             UiCommand::PermissionProfileList(params) => {
                 let result = permission_profile_list_result(&state, params);
@@ -5199,6 +5275,7 @@ where
         STDIO_SHUTDOWN_TURN_DRAIN_MAX,
     )
     .await;
+    abort_btw_aside_tasks(&mut btw_aside_tasks).await;
     cleanup_stdio_connection_resources(
         &active_turns,
         &connection_turns,
@@ -5409,6 +5486,16 @@ where
         }
         WsMessage::Close(_) => Ok(false),
         WsMessage::Ping(_) | WsMessage::Pong(_) | WsMessage::Binary(_) => Ok(true),
+    }
+}
+
+/// Abort every detached `session/btw` aside this connection spawned and await
+/// each JoinHandle (abort → future dropped → the in-flight guard's Drop frees
+/// the busy slot, and the task's WsConnection clone releases the writer).
+async fn abort_btw_aside_tasks(tasks: &mut Vec<tokio::task::JoinHandle<()>>) {
+    for task in tasks.drain(..) {
+        task.abort();
+        let _ = task.await;
     }
 }
 
@@ -6003,6 +6090,18 @@ fn normalize_local_username(username: &str) -> Result<String, RpcError> {
         return Err(local_profile_error(
             "profile_local_invalid_username",
             "normalized username must be 1-64 characters",
+        ));
+    }
+    // The username becomes BOTH the user id and the profile id.
+    // Profile ids reject reserved channel names (ambiguous session
+    // keys — see profiles::validate_profile_id), so reject here BEFORE
+    // any record persists: previously the user record was saved first
+    // and only the later profile save failed, leaving a valid user
+    // with no usable profile (codex #1613 r5).
+    if octos_core::is_reserved_channel_name(&normalized) {
+        return Err(local_profile_error(
+            "profile_local_invalid_username",
+            "username must not be a reserved channel name (e.g. api, slack, line)",
         ));
     }
     Ok(normalized)
@@ -8527,6 +8626,7 @@ fn session_ingress_callable_method(method: &str) -> bool {
             | octos_core::ui_protocol::methods::CONTENT_LIST
             | octos_core::ui_protocol::methods::CONTENT_DELETE
             | octos_core::ui_protocol::methods::CONTENT_BULK_DELETE
+            | octos_core::ui_protocol::methods::SESSION_FORK
     )
 }
 
@@ -8549,7 +8649,8 @@ fn validate_session_ingress_command_scope(
         | UiCommand::SystemStatusGet(_)
         | UiCommand::ContentList(_)
         | UiCommand::ContentDelete(_)
-        | UiCommand::ContentBulkDelete(_) => {
+        | UiCommand::ContentBulkDelete(_)
+        | UiCommand::SessionFork(_) => {
             return Err(RpcError::invalid_request(
                 "session ingress credentials may only call session-scoped methods",
             ));
@@ -8587,6 +8688,9 @@ fn validate_session_ingress_command_scope(
         UiCommand::SessionRollback(params) => params.session_id.clone(),
         UiCommand::ThreadGraphGet(params) => params.session_id.clone(),
         UiCommand::TurnStateGet(params) => params.session_id.clone(),
+        UiCommand::SessionBtw(params) => {
+            session_key_with_optional_topic(&params.session_id, params.topic.as_deref())
+        }
         UiCommand::SessionSnapshot(params) => {
             string_session_with_optional_topic(&params.session_id, params.topic.as_deref())
         }
@@ -10630,6 +10734,12 @@ async fn handle_review_start(
     let contracts_for_turn = contracts.clone();
     let turn_state_for_task = turn_state.clone();
     let profile_for_turn = active_profile_id.clone();
+    // Stamp for the ActiveTurn registry — see the generic admission's twin.
+    let profile_for_stamp = session_id
+        .profile_id()
+        .map(ToOwned::to_owned)
+        .or_else(|| active_profile_id.clone())
+        .unwrap_or_else(|| MAIN_PROFILE_ID.to_owned());
     let turn_id_for_task = turn_id.clone();
 
     let handle = tokio::spawn(async move {
@@ -10663,10 +10773,14 @@ async fn handle_review_start(
         if occupied {
             false
         } else {
+            // Client-supplied turn ids carry no uniqueness guarantee — a
+            // reused id must not inherit a prior turn's `session/btw` draft.
+            btw_live_draft_clear(&session_id, &turn_id);
             active.insert(
                 session_id.clone(),
                 ActiveTurn {
                     turn_id: turn_id.clone(),
+                    profile_id: profile_for_stamp.clone(),
                     state: turn_state,
                     interrupt_tx,
                     abort: handle.abort_handle(),
@@ -10832,6 +10946,14 @@ async fn handle_turn_start(
     let resolved_profile_id = connection_profile_id
         .or(routed_profile_id)
         .map(ToOwned::to_owned);
+    // Stamp for the ActiveTurn registry: mirror `session/btw`'s resolution
+    // (session key first) so the aside's profile check compares like with
+    // like; canonical `_main` when nothing resolves.
+    let profile_for_stamp = session_id
+        .profile_id()
+        .map(ToOwned::to_owned)
+        .or_else(|| resolved_profile_id.clone())
+        .unwrap_or_else(|| MAIN_PROFILE_ID.to_owned());
     let handle = tokio::spawn(async move {
         if start_rx.await.is_err() {
             return;
@@ -10888,10 +11010,14 @@ async fn handle_turn_start(
         if occupied {
             false
         } else {
+            // Client-supplied turn ids carry no uniqueness guarantee — a
+            // reused id must not inherit a prior turn's `session/btw` draft.
+            btw_live_draft_clear(&session_id, &turn_id);
             active.insert(
                 session_id.clone(),
                 ActiveTurn {
                     turn_id: turn_id.clone(),
+                    profile_id: profile_for_stamp.clone(),
                     state: turn_state.clone(),
                     interrupt_tx,
                     abort: handle.abort_handle(),
@@ -11102,10 +11228,12 @@ async fn maybe_spawn_appui_master_continuation_runner(
         );
     });
 
+    btw_live_draft_clear(&session_id, &turn_id);
     active.insert(
         session_id.clone(),
         ActiveTurn {
             turn_id: turn_id.clone(),
+            profile_id: profile_id.clone(),
             state: turn_state,
             interrupt_tx,
             abort: handle.abort_handle(),
@@ -12555,6 +12683,14 @@ async fn handle_session_hydrate(
                             persisted_at: msg.timestamp,
                             message_id,
                             source,
+                            // The store persists reasoning; without this the
+                            // "· reasoning" block vanishes on every client
+                            // restart. Same gate as message_id/source.
+                            reasoning_content: if expose_message_id {
+                                msg.reasoning_content.clone()
+                            } else {
+                                None
+                            },
                             // P1.3 fix: surface canonical-ledger media so a
                             // client reconnecting after a disconnect can
                             // re-render the same `.md` / `.mp3` / `.pptx`
@@ -12805,6 +12941,7 @@ async fn handle_session_rollback(
                 persisted_at: msg.timestamp,
                 message_id: None,
                 source: None,
+                reasoning_content: None,
                 media: msg.media.clone(),
             })
             .collect::<Vec<_>>();
@@ -12851,6 +12988,183 @@ async fn handle_session_rollback(
     let result = SessionRollbackResult {
         dropped_turns,
         thread,
+    };
+    send_serialized_rpc_result(ws, id, method, result);
+}
+
+/// Process-global in-flight fork child-key reservations. Two forks
+/// from DIFFERENT parents resolve different per-session
+/// `SessionManager`s, so a manager-local existence check cannot see
+/// the other fork mid-write — the later rewrite would silently
+/// overwrite the earlier child (codex #1613 P2). Keyed by
+/// `(sessions_dir, child key)`: the sessions DIR is the on-disk
+/// collision domain — same-profile managers share it and must
+/// mutually exclude, while different profiles' identical child keys
+/// name different files and must NOT reject each other (codex #1613
+/// r2). One serve process owns a profile's sessions dir, so a
+/// process-global set suffices.
+fn fork_reservations() -> &'static std::sync::Mutex<std::collections::HashSet<(PathBuf, String)>> {
+    static RESERVATIONS: OnceLock<std::sync::Mutex<std::collections::HashSet<(PathBuf, String)>>> =
+        OnceLock::new();
+    RESERVATIONS.get_or_init(Default::default)
+}
+
+/// RAII reservation on a fork child key — released on every exit path.
+struct ForkReservation((PathBuf, String));
+
+impl ForkReservation {
+    /// `None` when another fork to the same child key in the same
+    /// sessions dir is in flight.
+    fn try_acquire(sessions_dir: &Path, child_key: &SessionKey) -> Option<Self> {
+        // Canonicalized: two managers can reach one on-disk dir through
+        // different spellings (`..` segments, symlinked data_dir
+        // overrides) — distinct PathBufs would defeat the reservation
+        // (codex #1613 r3). The dir exists (the manager created it), so
+        // canonicalize only fails on races — fall back to the raw path.
+        let dir =
+            std::fs::canonicalize(sessions_dir).unwrap_or_else(|_| sessions_dir.to_path_buf());
+        let key = (dir, child_key.0.clone());
+        let mut set = fork_reservations()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        set.insert(key.clone()).then(|| Self(key))
+    }
+}
+
+impl Drop for ForkReservation {
+    fn drop(&mut self) {
+        let mut set = fork_reservations()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        set.remove(&self.0);
+    }
+}
+
+/// `session/fork` — branch a NEW session off an existing one, copying
+/// the tail of its history (web parity P3: the book's documented fork
+/// affordance had no wire surface for the SPA; `SessionManager::fork`
+/// existed but had no production caller). MUTATING: writes the child
+/// session (parent tracked via `parent_key`).
+async fn handle_session_fork(
+    ws: &WsConnection,
+    state: &Arc<AppState>,
+    connection_profile_id: Option<&str>,
+    routed_profile_id: Option<&str>,
+    id: String,
+    params: octos_core::ui_protocol::SessionForkParams,
+) {
+    let method = octos_core::ui_protocol::methods::SESSION_FORK;
+    if let Err(error) = validate_session_scope(&params.session_id, None, connection_profile_id) {
+        send_scope_error(ws, id, error);
+        return;
+    }
+    // The child chat-id becomes a filesystem path component and a wire
+    // session key half — hold it to the same charset as topic names.
+    if let Err(reason) = octos_bus::validate_topic_name(&params.new_chat_id) {
+        let _ = send_rpc_error(
+            ws,
+            Some(id),
+            RpcError::invalid_params(format!("{method}: invalid new_chat_id: {reason}"))
+                .with_data(json!({ "kind": "invalid_new_chat_id" })),
+        );
+        return;
+    }
+
+    let Some(sessions) = resolve_sessions_for_lookup(
+        state,
+        connection_profile_id,
+        routed_profile_id,
+        &params.session_id,
+    )
+    .await
+    else {
+        let _ = send_rpc_error(
+            ws,
+            Some(id),
+            runtime_unavailable_error("Sessions not available"),
+        );
+        return;
+    };
+
+    let (new_key, copied) = {
+        let mut sessions_guard = sessions.lock().await;
+        // Reserve the child key across the whole check-then-write: the
+        // durable `session_known` check below cannot see a concurrent
+        // fork's child (a DIFFERENT parent's manager) until its write
+        // lands. Scoped to this manager's sessions dir — the on-disk
+        // collision domain (RAII — released on return).
+        let candidate_key = params.session_id.fork_child(&params.new_chat_id);
+        let Some(_reservation) =
+            ForkReservation::try_acquire(sessions_guard.sessions_dir(), &candidate_key)
+        else {
+            drop(sessions_guard);
+            let _ = send_rpc_error(
+                ws,
+                Some(id),
+                RpcError::invalid_params(format!(
+                    "{method}: a fork to '{candidate_key}' is already in flight"
+                ))
+                .with_data(json!({ "kind": "child_exists" })),
+            );
+            return;
+        };
+        // Mirror rollback's error model: fork of an unknown session is
+        // an error, not an auto-create.
+        if !sessions_guard.session_known(&params.session_id) {
+            drop(sessions_guard);
+            let _ = send_rpc_error(
+                ws,
+                Some(id),
+                RpcError::unknown_session(params.session_id.0.clone()),
+            );
+            return;
+        }
+        // Refuse to clobber an existing session under the child key.
+        // `SessionKey::fork_child` is the SAME rule `SessionManager::fork`
+        // applies, so the pre-check guards exactly the key fork writes.
+        let candidate = params.session_id.fork_child(&params.new_chat_id);
+        if sessions_guard.session_known(&candidate) {
+            drop(sessions_guard);
+            let _ = send_rpc_error(
+                ws,
+                Some(id),
+                RpcError::invalid_params(format!(
+                    "{method}: a session already exists for '{candidate}'"
+                ))
+                .with_data(json!({ "kind": "child_exists" })),
+            );
+            return;
+        }
+        // Absent copy_messages → the FULL parent history.
+        let copy = params
+            .copy_messages
+            .map(|n| n as usize)
+            .unwrap_or(usize::MAX);
+        let copied_upper = {
+            let parent = sessions_guard.get_or_create(&params.session_id).await;
+            parent.messages.len().min(copy)
+        };
+        match sessions_guard
+            .fork(&params.session_id, &params.new_chat_id, copy)
+            .await
+        {
+            Ok(new_key) => (new_key, copied_upper as u32),
+            Err(error) => {
+                drop(sessions_guard);
+                let _ = send_rpc_error(
+                    ws,
+                    Some(id),
+                    RpcError::internal_error(format!("{method}: {error}")),
+                );
+                return;
+            }
+        }
+    };
+
+    let result = octos_core::ui_protocol::SessionForkResult {
+        new_session_id: new_key,
+        parent_session_id: params.session_id,
+        copied_messages: copied,
     };
     send_serialized_rpc_result(ws, id, method, result);
 }
@@ -13084,6 +13398,572 @@ async fn handle_turn_state_get(
         octos_core::ui_protocol::methods::TURN_STATE_GET,
         result,
     );
+}
+
+/// In-flight `session/btw` asides, keyed by (profile, session) — session
+/// runtimes are isolated per profile and bare session ids can repeat across
+/// profiles, so a bare-session key would let one profile's aside starve
+/// another's. One at a time per key: each aside is a paid provider request. `std::sync::Mutex` on purpose: the critical
+/// sections never await, and the release must run in a `Drop` guard (which
+/// cannot lock a tokio mutex).
+fn btw_in_flight_sessions() -> &'static StdMutex<HashSet<(String, SessionKey)>> {
+    static BTW_IN_FLIGHT: OnceLock<StdMutex<HashSet<(String, SessionKey)>>> = OnceLock::new();
+    BTW_IN_FLIGHT.get_or_init(|| StdMutex::new(HashSet::new()))
+}
+
+/// Releases the per-(profile, session) `session/btw` slot on every exit path
+/// (including panics/cancellation) so an error can never wedge the aside.
+struct BtwInFlightGuard((String, SessionKey));
+
+impl Drop for BtwInFlightGuard {
+    fn drop(&mut self) {
+        if let Ok(mut in_flight) = btw_in_flight_sessions().lock() {
+            in_flight.remove(&self.0);
+        }
+    }
+}
+
+/// Serializes tests that use the global provider slot — two slot users
+/// running in parallel would clear each other's stub mid-flight.
+#[cfg(test)]
+fn btw_test_slot_serial() -> &'static tokio::sync::Mutex<()> {
+    static SERIAL: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+    SERIAL.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
+/// Test-only provider override so handler tests can exercise the full
+/// `session/btw` flow without constructing a `ProfileRuntime`.
+#[cfg(test)]
+fn btw_test_provider_slot() -> &'static StdMutex<Option<Arc<dyn octos_llm::LlmProvider>>> {
+    static SLOT: OnceLock<StdMutex<Option<Arc<dyn octos_llm::LlmProvider>>>> = OnceLock::new();
+    SLOT.get_or_init(|| StdMutex::new(None))
+}
+
+fn btw_test_provider() -> Option<Arc<dyn octos_llm::LlmProvider>> {
+    #[cfg(test)]
+    if let Ok(slot) = btw_test_provider_slot().lock() {
+        if let Some(llm) = slot.as_ref() {
+            return Some(llm.clone());
+        }
+    }
+    None
+}
+
+/// Live in-flight assistant draft per TURN, fed at the ephemeral send choke
+/// point (`message/delta` is non-durable per spec § 9 — the ledger can never
+/// replay it) so `session/btw` can describe the answer being written RIGHT
+/// NOW. Keyed by [`TurnId`] — globally unique per turn — so no cross-profile
+/// or cross-session stream can ever mix and no lifecycle resets are needed:
+/// a new turn is a new key, and stale keys are unreadable (the aside resolves
+/// the CURRENT non-terminal turn id through the active-turns registry before
+/// reading). Bounded by arbitrary eviction past the cap.
+fn btw_live_draft_store() -> &'static StdMutex<HashMap<(SessionKey, TurnId), String>> {
+    static DRAFTS: OnceLock<StdMutex<HashMap<(SessionKey, TurnId), String>>> = OnceLock::new();
+    DRAFTS.get_or_init(|| StdMutex::new(HashMap::new()))
+}
+
+/// Clear a turn's draft slot at ADMISSION (synchronously, before the turn task
+/// can stream): `turn_id` is client-supplied with no global uniqueness check,
+/// so a reused id must start from a clean slate instead of inheriting the
+/// prior turn's tail.
+fn btw_live_draft_clear(session_id: &SessionKey, turn_id: &TurnId) {
+    if let Ok(mut drafts) = btw_live_draft_store().lock() {
+        drafts.remove(&(session_id.clone(), turn_id.clone()));
+    }
+}
+
+const BTW_LIVE_DRAFT_STORE_MAX_TURNS: usize = 64;
+
+fn btw_live_draft_append(session_id: &SessionKey, turn_id: &TurnId, text: &str) {
+    let Ok(mut drafts) = btw_live_draft_store().lock() else {
+        return;
+    };
+    let key = (session_id.clone(), turn_id.clone());
+    if !drafts.contains_key(&key) && drafts.len() >= BTW_LIVE_DRAFT_STORE_MAX_TURNS {
+        // Arbitrary eviction is fine — a lost draft only degrades one aside's
+        // context, and terminal turns' entries are dead weight anyway
+        // (unreadable through the non-terminal gate).
+        let evict = drafts.keys().next().cloned();
+        if let Some(evict) = evict {
+            drafts.remove(&evict);
+        }
+    }
+    let draft = drafts.entry(key).or_default();
+    draft.push_str(text);
+    if draft.len() > BTW_LIVE_DRAFT_TAIL_CHARS {
+        let cut = draft.len() - BTW_LIVE_DRAFT_TAIL_CHARS;
+        let cut = draft
+            .char_indices()
+            .map(|(index, _)| index)
+            .find(|index| *index >= cut)
+            .unwrap_or(0);
+        *draft = draft.split_off(cut);
+    }
+}
+
+fn btw_live_draft_tail(session_id: &SessionKey, turn_id: &TurnId) -> String {
+    btw_live_draft_store()
+        .lock()
+        .ok()
+        .and_then(|drafts| drafts.get(&(session_id.clone(), turn_id.clone())).cloned())
+        .unwrap_or_default()
+}
+
+const BTW_TRANSCRIPT_TAIL_MESSAGES: usize = 20;
+const BTW_TRANSCRIPT_MESSAGE_CHARS: usize = 1_200;
+const BTW_TRANSCRIPT_CHAR_BUDGET: usize = 16_000;
+const BTW_ACTIVITY_TAIL_EVENTS: usize = 12;
+const BTW_LIVE_DRAFT_TAIL_CHARS: usize = 1_200;
+const BTW_ANSWER_MAX_TOKENS: u32 = 700;
+const BTW_TIMEOUT_SECS: u64 = 30;
+
+/// Build the two-message prompt for a `session/btw` aside. Pure so the
+/// context shape is unit-testable: transcript tail (already limited by the
+/// caller) + a short live-activity digest + the question. The system prompt
+/// carries the restrictions: no tools, brief answer, ephemeral exchange.
+fn build_btw_messages(
+    transcript_tail: &[Message],
+    activity_lines: &[String],
+    live_draft_tail: &str,
+    question: &str,
+) -> Vec<Message> {
+    let mut transcript = String::new();
+    let mut used = 0usize;
+    for message in transcript_tail {
+        let content = message.content.trim();
+        if content.is_empty() {
+            continue;
+        }
+        let rendered = format!(
+            "{}: {}\n",
+            message.role.as_str(),
+            truncate_for_display(content, BTW_TRANSCRIPT_MESSAGE_CHARS)
+        );
+        if used + rendered.len() > BTW_TRANSCRIPT_CHAR_BUDGET {
+            break;
+        }
+        used += rendered.len();
+        transcript.push_str(&rendered);
+    }
+    if transcript.is_empty() {
+        transcript.push_str("(no messages yet)\n");
+    }
+    let activity = if activity_lines.is_empty() {
+        "- (no live activity)".to_owned()
+    } else {
+        activity_lines
+            .iter()
+            .map(|line| format!("- {line}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let draft = if live_draft_tail.trim().is_empty() {
+        String::new()
+    } else {
+        format!("\n## In-flight answer you are writing right now (tail)\n…{live_draft_tail}\n")
+    };
+    let prompt = format!(
+        "## Recent conversation\n{transcript}\n## Current activity\n{activity}\n{draft}\n## Aside question\n{question}\n"
+    );
+    vec![
+        Message {
+            role: MessageRole::System,
+            content: "You are the assistant working inside this octos session. The user \
+                      asked a QUICK ASIDE question (\"btw, ...\") while your main work \
+                      continues in the background. Answer briefly — a few sentences — \
+                      from the context provided. You have NO tools in this aside: do not \
+                      claim to run commands, read files, or edit anything. If the answer \
+                      genuinely needs that, say so and suggest asking again after the \
+                      current task finishes. This exchange is ephemeral and will not \
+                      join the conversation history."
+                .to_owned(),
+            media: Vec::new(),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+            client_message_id: None,
+            thread_id: None,
+            timestamp: Utc::now(),
+        },
+        Message {
+            role: MessageRole::User,
+            content: prompt,
+            media: Vec::new(),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+            client_message_id: None,
+            thread_id: None,
+            timestamp: Utc::now(),
+        },
+    ]
+}
+
+/// One live-activity digest line per recent ledger notification that says
+/// what the session is DOING right now (tool/task/turn lifecycle); chatty
+/// stream events (message/reasoning deltas) are skipped.
+fn btw_activity_line(notification: &UiNotification) -> Option<String> {
+    match notification {
+        UiNotification::TurnStarted(event) => Some(format!("turn {} started", event.turn_id.0)),
+        UiNotification::TurnCompleted(event) => Some(format!("turn {} completed", event.turn_id.0)),
+        UiNotification::ToolStarted(event) => Some(format!("tool `{}` running", event.tool_name)),
+        UiNotification::ToolCompleted(event) => Some(format!(
+            "tool `{}` finished ({})",
+            event.tool_name,
+            match event.success {
+                Some(true) => "ok",
+                Some(false) => "failed",
+                None => "done",
+            }
+        )),
+        UiNotification::TaskUpdated(event) => {
+            Some(format!("task \"{}\" {:?}", event.title, event.state))
+        }
+        _ => None,
+    }
+}
+
+/// `session/btw` — answer a quick aside question out-of-band while the
+/// session's live turn (if any) keeps running. ONE restricted LLM call: no
+/// tools, capped output, hard timeout. The exchange is ephemeral — nothing
+/// is appended to the session history and no notification is emitted, so
+/// the live turn never sees it; the answer rides only on this RPC result.
+///
+/// The provider call runs DETACHED (codex round-1 P1): this fn returns as
+/// soon as the aside is validated and snapshotted, so the connection's read
+/// loop keeps serving interrupts/approvals — and the busy gate actually
+/// gates — while the answer (up to 30s) is produced.
+async fn handle_session_btw(
+    ws: &WsConnection,
+    state: &Arc<AppState>,
+    ledger: &Arc<UiProtocolLedger>,
+    active_turns: &SharedActiveTurns,
+    connection_profile_id: Option<&str>,
+    routed_profile_id: Option<&str>,
+    id: String,
+    params: SessionBtwParams,
+) -> Option<tokio::task::JoinHandle<()>> {
+    // Fold the topic into the canonical session key FIRST (codex round-1 P1):
+    // the ingress gate scopes `session#topic`, so every lookup/guard below
+    // must use the same folded key or a topic-scoped credential could read a
+    // differently-scoped session's transcript.
+    let session_id = session_key_with_optional_topic(&params.session_id, params.topic.as_deref());
+    if let Err(error) = validate_session_scope(&session_id, None, connection_profile_id) {
+        send_scope_error(ws, id, error);
+        return None;
+    }
+    let question = params.question.trim().to_owned();
+    if question.is_empty() {
+        let _ = send_rpc_error(
+            ws,
+            Some(id),
+            RpcError::invalid_params("session/btw requires a non-empty question"),
+        );
+        return None;
+    }
+
+    // ONE profile resolution shared by transcript AND provider, with
+    // `resolve_sessions_for_lookup`'s exact precedence (session key →
+    // connection → routed; the ws arm threads its session-open fallback in
+    // through `routed_profile_id`) — a divergent pair would read one
+    // profile's transcript and bill another profile's provider.
+    let active_profile_id = session_id
+        .profile_id()
+        .or(connection_profile_id)
+        .or(routed_profile_id)
+        .map(ToOwned::to_owned);
+
+    // Transcript tail from the same store turn persistence writes to
+    // (#919.1 routing) — clone under the lock, drop it before the LLM call.
+    let transcript_tail = {
+        let Some(sessions) = resolve_sessions_for_lookup(
+            state,
+            connection_profile_id,
+            routed_profile_id,
+            &session_id,
+        )
+        .await
+        else {
+            let _ = send_rpc_error(
+                ws,
+                Some(id),
+                RpcError::unknown_session(session_id.0.clone()),
+            );
+            return None;
+        };
+        let mut sessions_guard = sessions.lock().await;
+        if !sessions_guard.session_known(&session_id) {
+            let _ = send_rpc_error(
+                ws,
+                Some(id),
+                RpcError::unknown_session(session_id.0.clone()),
+            );
+            return None;
+        }
+        let session = sessions_guard.get_or_create(&session_id).await;
+        session
+            .messages
+            .iter()
+            .rev()
+            .take(BTW_TRANSCRIPT_TAIL_MESSAGES)
+            .rev()
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+
+    // One aside per (profile, session) at a time — a second `/btw` while the
+    // first is still answering is rejected, not queued.
+    // Canonical default-profile key: absent profile means MAIN_PROFILE_ID
+    // everywhere else (sessions lookup, runtime resolution) — the busy gate
+    // must agree or an unscoped and a _main-routed aside race the same
+    // effective session.
+    let busy_key = (
+        active_profile_id
+            .clone()
+            .unwrap_or_else(|| MAIN_PROFILE_ID.to_owned()),
+        session_id.clone(),
+    );
+    {
+        let Ok(mut in_flight) = btw_in_flight_sessions().lock() else {
+            let _ = send_rpc_error(
+                ws,
+                Some(id),
+                RpcError::internal_error("btw in-flight registry poisoned"),
+            );
+            return None;
+        };
+        if !in_flight.insert(busy_key.clone()) {
+            let _ = send_rpc_error(
+                ws,
+                Some(id),
+                RpcError::invalid_request("a btw aside is already answering for this session")
+                    .with_data(json!({ "kind": "btw_busy" })),
+            );
+            return None;
+        }
+    }
+    let in_flight_guard = BtwInFlightGuard(busy_key);
+
+    // Everything past validation runs detached — the read loop must not wait
+    // out a 30s provider call.
+    let ws = ws.clone();
+    let state = state.clone();
+    let ledger = ledger.clone();
+    let active_turns = active_turns.clone();
+    let aside_profile_id = in_flight_guard.0.0.clone();
+    let task = tokio::spawn(async move {
+        let _in_flight_guard = in_flight_guard;
+
+        // Live-activity digest from the ledger replay window's tail.
+        let activity_lines = ledger
+            .snapshot_with_cursor(&session_id, None)
+            .map(|(replayed, _)| {
+                replayed
+                    .iter()
+                    .filter_map(|event| match &event.event {
+                        UiProtocolLedgerEvent::Notification(notification) => {
+                            btw_activity_line(notification)
+                        }
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let activity_tail = activity_lines
+            .iter()
+            .rev()
+            .take(BTW_ACTIVITY_TAIL_EVENTS)
+            .rev()
+            .cloned()
+            .collect::<Vec<_>>();
+
+        // The transcript tail only holds COMMITTED messages; a "what are you
+        // working on?" mid-turn needs the answer being written right now.
+        // Resolve the session's CURRENT turn through the registry and require
+        // a NON-TERMINAL state — `ActiveTurn` entries are deliberately
+        // retained in `Terminal(_)` for idempotent interrupts, and a finished
+        // turn's leftover tail must not masquerade as in-flight (its text is
+        // already in the committed transcript above). TurnId keying then
+        // guarantees the tail belongs to exactly that turn — including turns
+        // admitted a moment ago whose task has not streamed yet (their fresh
+        // TurnId simply has no draft).
+        let live_turn_id = {
+            let registry = active_turns.lock().await;
+            match registry.get(&session_id) {
+                Some(entry) => {
+                    // Profile check: the registry is process-global and keyed
+                    // by bare SessionKey — two profiles' same-named sessions
+                    // (supported for bare `web-*` ids) must never cross-read
+                    // each other's stream.
+                    if entry.profile_id != aside_profile_id {
+                        None
+                    } else {
+                        let state = entry.state.lock().await;
+                        if matches!(*state, TurnState::Terminal(_)) {
+                            None
+                        } else {
+                            Some(entry.turn_id.clone())
+                        }
+                    }
+                }
+                None => None,
+            }
+        };
+        let live_draft_tail = live_turn_id
+            .as_ref()
+            .map(|turn_id| btw_live_draft_tail(&session_id, turn_id))
+            .unwrap_or_default();
+
+        // The profile's shared provider chain — same profile the transcript
+        // came from. `profile_runtime` also carries the data dir for the
+        // usage ledger; the test override provides a bare provider only.
+        let (llm, profile_runtime): (
+            Arc<dyn octos_llm::LlmProvider>,
+            Option<Arc<crate::runtime::ProfileRuntime>>,
+        ) = match btw_test_provider() {
+            Some(llm) => (llm, None),
+            None => {
+                match ensure_session_profile_runtime(&state, active_profile_id.as_deref()).await {
+                    Ok(Some(runtime)) => (runtime.llm.clone(), Some(runtime)),
+                    Ok(None) => {
+                        let _ = send_rpc_error(
+                            &ws,
+                            Some(id),
+                            RpcError::runtime_not_ready(
+                                "no LLM provider available for this session",
+                            ),
+                        );
+                        return;
+                    }
+                    Err(error) => {
+                        let _ = send_rpc_error(&ws, Some(id), error);
+                        return;
+                    }
+                }
+            }
+        };
+
+        let messages = build_btw_messages(
+            &transcript_tail,
+            &activity_tail,
+            &live_draft_tail,
+            &question,
+        );
+        let config = octos_llm::ChatConfig {
+            max_tokens: Some(BTW_ANSWER_MAX_TOKENS),
+            temperature: Some(0.2),
+            tool_choice: octos_llm::ToolChoice::None,
+            ..Default::default()
+        };
+        // `&[]` tool specs IS the "no tools" restriction — the model cannot
+        // call what it is never offered.
+        let response = match tokio::time::timeout(
+            std::time::Duration::from_secs(BTW_TIMEOUT_SECS),
+            llm.chat(&messages, &[], &config),
+        )
+        .await
+        {
+            Ok(Ok(response)) => response,
+            Ok(Err(error)) => {
+                let _ = send_rpc_error(
+                    &ws,
+                    Some(id),
+                    RpcError::internal_error(format!("btw aside failed: {error}")),
+                );
+                return;
+            }
+            Err(_elapsed) => {
+                let _ = send_rpc_error(
+                    &ws,
+                    Some(id),
+                    RpcError::internal_error(format!(
+                        "btw aside timed out after {BTW_TIMEOUT_SECS}s"
+                    )),
+                );
+                return;
+            }
+        };
+
+        // The answering SLOT's metadata (codex round-1 P2): `llm` is a
+        // retry/failover chain, so re-asking `model_id()` after the fact can
+        // name the primary lane rather than the fallback that answered.
+        let metadata = llm.provider_metadata_for_index(response.provider_index);
+
+        // Paid aside → usage ledger (codex round-1 P2), same shape as AppUI
+        // turns but on an aside-specific channel so analytics can split them.
+        if let Some(runtime) = profile_runtime.as_ref() {
+            match PersistentUsageLedger::open(&runtime.data_dir).await {
+                Ok(usage_ledger) => {
+                    let model = (!metadata.model.is_empty()).then(|| metadata.model.clone());
+                    let estimated_cost_usd =
+                        model.as_deref().and_then(model_pricing).map(|pricing| {
+                            pricing.cost(response.usage.input_tokens, response.usage.output_tokens)
+                        });
+                    let cost_source = if estimated_cost_usd.is_some() {
+                        UsageCostSource::CatalogEstimate
+                    } else {
+                        UsageCostSource::Unavailable
+                    };
+                    let event = UsageEvent::completed_run(
+                        active_profile_id
+                            .clone()
+                            .unwrap_or_else(|| MAIN_PROFILE_ID.to_owned()),
+                        session_id.0.clone(),
+                        format!("btw-{id}"),
+                        (!metadata.provider.is_empty()).then(|| metadata.provider.clone()),
+                        model,
+                        metadata.endpoint.clone(),
+                        u64::from(response.usage.input_tokens),
+                        u64::from(response.usage.output_tokens),
+                        estimated_cost_usd,
+                        cost_source,
+                        "appui_btw",
+                        None,
+                    );
+                    if let Err(error) = usage_ledger.record(event).await {
+                        warn!(
+                            session = %session_id.0,
+                            error = %error,
+                            "failed to record btw aside usage event"
+                        );
+                    }
+                }
+                Err(error) => {
+                    warn!(
+                        session = %session_id.0,
+                        error = %error,
+                        "usage ledger unavailable; btw aside not recorded"
+                    );
+                }
+            }
+        }
+
+        let answer = response
+            .content
+            .map(|content| content.trim().to_owned())
+            .filter(|content| !content.is_empty());
+        let Some(answer) = answer else {
+            let _ = send_rpc_error(
+                &ws,
+                Some(id),
+                RpcError::internal_error("btw aside returned an empty answer"),
+            );
+            return;
+        };
+
+        let result = octos_core::ui_protocol::SessionBtwResult {
+            session_id,
+            answer,
+            model: Some(metadata.model.clone()),
+        };
+        send_serialized_rpc_result(
+            &ws,
+            id,
+            octos_core::ui_protocol::methods::SESSION_BTW,
+            result,
+        );
+    });
+    Some(task)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -23793,6 +24673,13 @@ fn send_notification_ephemeral(
 ) -> Result<(), SendError> {
     // Ephemeral frames are NOT appended to the ledger — they are explicitly
     // non-durable per spec § 9. Drops never need a `replay_lossy` summary.
+    // Every legacy `message/delta` send funnels through here exactly once
+    // (the producing turn task's direct send) — feed the `session/btw`
+    // live-draft tail BEFORE the capability filter so envelope-negotiated
+    // connections still record it. TurnId keying isolates streams.
+    if let UiNotification::MessageDelta(delta) = &notification {
+        btw_live_draft_append(&delta.session_id, &delta.turn_id, &delta.text);
+    }
     let method = notification.method().to_string();
     // Codex #1336 round-2 BLOCKER 1: apply the per-connection
     // capability filter to ephemeral direct sends too. `MessageDelta`
@@ -24346,6 +25233,10 @@ mod tests {
                 "session_id": session_id,
                 "turn_id": turn_id,
             }),
+            methods::SESSION_BTW => json!({
+                "session_id": session_id,
+                "question": "what are you working on?",
+            }),
             methods::SESSION_LIST | methods::SYSTEM_STATUS_GET | methods::CONTENT_LIST => {
                 json!({})
             }
@@ -24359,6 +25250,10 @@ mod tests {
             methods::SESSION_TITLE_SET => json!({
                 "session_id": session_id.to_string(),
                 "title": "Dispatch parity",
+            }),
+            methods::SESSION_FORK => json!({
+                "session_id": session_id,
+                "new_chat_id": "probe-fork-child",
             }),
             methods::CONTENT_DELETE => json!({ "id": "content-1" }),
             methods::CONTENT_BULK_DELETE => json!({ "ids": ["content-1"] }),
@@ -24633,6 +25528,7 @@ mod tests {
         active_turns.lock().await.insert(
             session.clone(),
             ActiveTurn {
+                profile_id: MAIN_PROFILE_ID.to_owned(),
                 turn_id: turn_id.clone(),
                 state: Arc::new(TokioMutex::new(TurnState::Active)),
                 interrupt_tx: Arc::new(TokioMutex::new(None)),
@@ -24673,6 +25569,7 @@ mod tests {
         active_turns.lock().await.insert(
             SessionKey("local:foreign".into()),
             ActiveTurn {
+                profile_id: MAIN_PROFILE_ID.to_owned(),
                 turn_id: TurnId::new(),
                 state: Arc::new(TokioMutex::new(TurnState::Active)),
                 interrupt_tx: Arc::new(TokioMutex::new(None)),
@@ -24695,6 +25592,7 @@ mod tests {
         active_turns.lock().await.insert(
             session.clone(),
             ActiveTurn {
+                profile_id: MAIN_PROFILE_ID.to_owned(),
                 turn_id: turn_id.clone(),
                 state: Arc::new(TokioMutex::new(TurnState::Active)),
                 interrupt_tx: Arc::new(TokioMutex::new(None)),
@@ -25252,6 +26150,26 @@ mod tests {
         assert_eq!(
             invalid.data.as_ref().and_then(|data| data.get("kind")),
             Some(&json!("profile_local_invalid_username"))
+        );
+
+        // codex #1613 r5: a reserved channel-name username must be
+        // rejected BEFORE any record persists. Previously the user
+        // record was saved and only the later profile save failed,
+        // leaving a valid user with no usable profile.
+        let reserved = create_or_get_local_solo_profile(
+            &state,
+            local_profile_params("Ada Lovelace", "api", "api@example.com"),
+        )
+        .expect_err("reserved channel-name username");
+        assert_eq!(reserved.code, rpc_error_codes::INVALID_PARAMS);
+        assert_eq!(
+            reserved.data.as_ref().and_then(|data| data.get("kind")),
+            Some(&json!("profile_local_invalid_username"))
+        );
+        let users = state.user_store.as_ref().expect("user store");
+        assert!(
+            users.get("api").unwrap().is_none(),
+            "no user record may persist for a rejected reserved username"
         );
 
         let tenant_state = AppState {
@@ -30492,6 +31410,7 @@ ignore = []
         let (tx, _rx) = mpsc::channel::<()>(1);
         ActiveTurn {
             turn_id,
+            profile_id: MAIN_PROFILE_ID.to_owned(),
             state: Arc::new(TokioMutex::new(TurnState::Active)),
             interrupt_tx: Arc::new(TokioMutex::new(Some(tx))),
             abort,
@@ -33034,6 +33953,511 @@ ignore = []
     }
 
     #[test]
+    fn session_ingress_scope_accepts_session_btw_for_matching_session() {
+        let allowed = SessionKey("dspfac:local:tui#coding".into());
+        let command = UiCommand::SessionBtw(SessionBtwParams {
+            session_id: SessionKey("dspfac:local:tui".into()),
+            topic: Some("coding".into()),
+            question: "what are you working on".into(),
+        });
+        validate_session_ingress_command_scope(&command, &allowed).expect("scope matches");
+
+        let mismatched = UiCommand::SessionBtw(SessionBtwParams {
+            session_id: SessionKey("other:local:tui".into()),
+            topic: None,
+            question: "what are you working on".into(),
+        });
+        assert!(validate_session_ingress_command_scope(&mismatched, &allowed).is_err());
+    }
+
+    #[test]
+    fn advertised_capabilities_include_session_btw() {
+        let state = AppState::empty_for_tests();
+        let capabilities = ConnectionUiFeatures::default().advertised_capabilities(&state);
+        assert!(
+            capabilities
+                .supported_methods
+                .iter()
+                .any(|method| method == octos_core::ui_protocol::methods::SESSION_BTW),
+            "session/btw must be advertised so clients can gate /btw; got {:?}",
+            capabilities.supported_methods
+        );
+    }
+
+    #[test]
+    fn build_btw_messages_shapes_prompt_without_tools() {
+        let now = Utc::now();
+        let mk = |role: MessageRole, content: &str| Message {
+            role,
+            content: content.into(),
+            media: vec![],
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+            client_message_id: None,
+            thread_id: None,
+            timestamp: now,
+        };
+        let transcript = vec![
+            mk(MessageRole::User, "please refactor the parser"),
+            mk(MessageRole::Assistant, ""),
+            mk(MessageRole::Assistant, "starting on it"),
+        ];
+        let activity = vec!["tool `shell` running".to_owned()];
+        let messages = build_btw_messages(
+            &transcript,
+            &activity,
+            "…drafting the cwnd table",
+            "btw what are you working on?",
+        );
+
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].role, MessageRole::System);
+        assert!(
+            messages[0].content.contains("NO tools"),
+            "system prompt must state the no-tools restriction"
+        );
+        let prompt = &messages[1].content;
+        assert!(prompt.contains("please refactor the parser"));
+        assert!(prompt.contains("starting on it"));
+        assert!(
+            !prompt.contains("assistant: \n"),
+            "empty-content messages are skipped"
+        );
+        assert!(prompt.contains("- tool `shell` running"));
+        assert!(
+            prompt.contains("…drafting the cwnd table"),
+            "the in-flight draft tail must reach the provider; got {prompt}"
+        );
+        assert!(prompt.contains("btw what are you working on?"));
+    }
+
+    #[tokio::test]
+    async fn session_btw_rejects_empty_question() {
+        let state = Arc::new(AppState::empty_for_tests());
+        let ledger = event_ledger(&state).await;
+        let (ws, mut rx) = ws_connection_for_test(4);
+
+        handle_session_btw(
+            &ws,
+            &state,
+            &ledger,
+            &active_turns_registry(),
+            None,
+            None,
+            "b1".into(),
+            SessionBtwParams {
+                session_id: SessionKey("local:btw-empty".into()),
+                topic: None,
+                question: "   ".into(),
+            },
+        )
+        .await;
+
+        let frame = recv_rpc_json(&mut rx).await;
+        assert_eq!(frame["id"], "b1");
+        assert!(
+            frame["error"]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("non-empty question")),
+            "got {frame}"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_btw_rejects_unknown_session() {
+        let known = SessionKey("local:btw-known".into());
+        let state = prg_state_with_session(&known, prg_seed_user_assistant);
+        let ledger = event_ledger(&state).await;
+        let (ws, mut rx) = ws_connection_for_test(4);
+
+        handle_session_btw(
+            &ws,
+            &state,
+            &ledger,
+            &active_turns_registry(),
+            None,
+            None,
+            "b2".into(),
+            SessionBtwParams {
+                session_id: SessionKey("local:btw-unknown".into()),
+                topic: None,
+                question: "what are you working on?".into(),
+            },
+        )
+        .await;
+
+        let frame = recv_rpc_json(&mut rx).await;
+        assert_eq!(frame["id"], "b2");
+        assert_eq!(frame["error"]["data"]["session_id"], "local:btw-unknown");
+    }
+
+    #[tokio::test]
+    async fn session_btw_rejects_second_aside_while_first_in_flight() {
+        let session_id = SessionKey("local:btw-busy".into());
+        let state = prg_state_with_session(&session_id, prg_seed_user_assistant);
+        let ledger = event_ledger(&state).await;
+        let (ws, mut rx) = ws_connection_for_test(4);
+
+        btw_in_flight_sessions()
+            .lock()
+            .expect("in-flight registry")
+            .insert((MAIN_PROFILE_ID.to_owned(), session_id.clone()));
+
+        handle_session_btw(
+            &ws,
+            &state,
+            &ledger,
+            &active_turns_registry(),
+            None,
+            None,
+            "b3".into(),
+            SessionBtwParams {
+                session_id: session_id.clone(),
+                topic: None,
+                question: "still there?".into(),
+            },
+        )
+        .await;
+
+        btw_in_flight_sessions()
+            .lock()
+            .expect("in-flight registry")
+            .remove(&(MAIN_PROFILE_ID.to_owned(), session_id.clone()));
+
+        let frame = recv_rpc_json(&mut rx).await;
+        assert_eq!(frame["id"], "b3");
+        assert_eq!(frame["error"]["data"]["kind"], "btw_busy");
+    }
+
+    #[tokio::test]
+    async fn session_btw_answers_via_provider_with_no_tools() {
+        struct BtwStubProvider;
+        #[async_trait::async_trait]
+        impl octos_llm::LlmProvider for BtwStubProvider {
+            async fn chat(
+                &self,
+                messages: &[octos_core::Message],
+                tools: &[octos_llm::ToolSpec],
+                config: &octos_llm::ChatConfig,
+            ) -> eyre::Result<octos_llm::ChatResponse> {
+                assert!(tools.is_empty(), "btw aside must offer NO tools");
+                assert!(
+                    matches!(config.tool_choice, octos_llm::ToolChoice::None),
+                    "btw aside must force tool_choice=None"
+                );
+                let prompt = &messages.last().expect("user prompt").content;
+                assert!(
+                    prompt.contains("what are you working on"),
+                    "question must reach the provider; got {prompt}"
+                );
+                assert!(
+                    prompt.contains("hello"),
+                    "transcript tail must reach the provider; got {prompt}"
+                );
+                Ok(octos_llm::ChatResponse {
+                    content: Some("Refactoring the parser; tests are running.".into()),
+                    reasoning_content: None,
+                    tool_calls: vec![],
+                    stop_reason: octos_llm::StopReason::EndTurn,
+                    usage: octos_llm::TokenUsage::default(),
+                    provider_index: None,
+                })
+            }
+            fn model_id(&self) -> &str {
+                "btw-stub-model"
+            }
+            fn provider_name(&self) -> &str {
+                "stub"
+            }
+        }
+
+        let session_id = SessionKey("local:btw-happy".into());
+        let state = prg_state_with_session(&session_id, prg_seed_user_assistant);
+        let ledger = event_ledger(&state).await;
+        let (ws, mut rx) = ws_connection_for_test(4);
+
+        let _serial = btw_test_slot_serial().lock().await;
+        *btw_test_provider_slot().lock().expect("slot") = Some(Arc::new(BtwStubProvider));
+        handle_session_btw(
+            &ws,
+            &state,
+            &ledger,
+            &active_turns_registry(),
+            None,
+            None,
+            "b4".into(),
+            SessionBtwParams {
+                session_id: session_id.clone(),
+                topic: None,
+                question: "btw, what are you working on?".into(),
+            },
+        )
+        .await;
+
+        // The aside runs detached — only clear the provider slot once the
+        // result frame proves the spawned task has consumed it.
+        let frame = recv_rpc_json(&mut rx).await;
+        *btw_test_provider_slot().lock().expect("slot") = None;
+        assert_eq!(frame["id"], "b4", "got {frame}");
+        assert_eq!(
+            frame["result"]["answer"],
+            "Refactoring the parser; tests are running."
+        );
+        assert_eq!(frame["result"]["model"], "btw-stub-model");
+        assert_eq!(frame["result"]["session_id"], session_id.to_string());
+        // The aside runs detached; give its guard drop a beat before asserting.
+        let busy_key = (MAIN_PROFILE_ID.to_owned(), session_id.clone());
+        for _ in 0..100 {
+            if !btw_in_flight_sessions()
+                .lock()
+                .expect("in-flight registry")
+                .contains(&busy_key)
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !btw_in_flight_sessions()
+                .lock()
+                .expect("in-flight registry")
+                .contains(&busy_key),
+            "the in-flight slot must be released after the answer"
+        );
+    }
+
+    #[test]
+    fn btw_live_draft_is_turn_scoped() {
+        let session_a = SessionKey("local:btw-draft-a".into());
+        let session_b = SessionKey("local:btw-draft-b".into());
+        let turn_a = TurnId::new();
+        let turn_b = TurnId::new();
+        btw_live_draft_append(&session_a, &turn_a, "alpha stream");
+        btw_live_draft_append(&session_b, &turn_b, "beta stream");
+
+        // (session, turn) keying: streams can never mix, and a reused turn id
+        // starts clean after its admission-time clear.
+        assert_eq!(btw_live_draft_tail(&session_a, &turn_a), "alpha stream");
+        assert_eq!(btw_live_draft_tail(&session_b, &turn_b), "beta stream");
+        btw_live_draft_clear(&session_a, &turn_a);
+        assert_eq!(btw_live_draft_tail(&session_a, &turn_a), "");
+        assert_eq!(btw_live_draft_tail(&session_b, &turn_b), "beta stream");
+    }
+
+    /// The aside reads the live draft ONLY through the registry's CURRENT
+    /// NON-TERMINAL turn — a finished turn's entry is retained for idempotent
+    /// interrupts, and its leftover tail must not masquerade as in-flight.
+    #[tokio::test]
+    async fn session_btw_reads_draft_only_for_a_non_terminal_turn() {
+        struct DraftProbeProvider;
+        #[async_trait::async_trait]
+        impl octos_llm::LlmProvider for DraftProbeProvider {
+            async fn chat(
+                &self,
+                messages: &[octos_core::Message],
+                _tools: &[octos_llm::ToolSpec],
+                _config: &octos_llm::ChatConfig,
+            ) -> eyre::Result<octos_llm::ChatResponse> {
+                let prompt = messages.last().expect("prompt").content.clone();
+                Ok(octos_llm::ChatResponse {
+                    content: Some(if prompt.contains("PAXOS-DRAFT-TAIL") {
+                        "saw-draft".into()
+                    } else {
+                        "no-draft".into()
+                    }),
+                    reasoning_content: None,
+                    tool_calls: vec![],
+                    stop_reason: octos_llm::StopReason::EndTurn,
+                    usage: octos_llm::TokenUsage::default(),
+                    provider_index: None,
+                })
+            }
+            fn model_id(&self) -> &str {
+                "draft-probe"
+            }
+            fn provider_name(&self) -> &str {
+                "stub"
+            }
+        }
+
+        let session_id = SessionKey("local:btw-draftgate".into());
+        let state = prg_state_with_session(&session_id, prg_seed_user_assistant);
+        let ledger = event_ledger(&state).await;
+        let turn_id = TurnId::new();
+        btw_live_draft_append(&session_id, &turn_id, "PAXOS-DRAFT-TAIL");
+
+        let _serial = btw_test_slot_serial().lock().await;
+        *btw_test_provider_slot().lock().expect("slot") = Some(Arc::new(DraftProbeProvider));
+
+        // The registry retains the turn as TERMINAL → the leftover draft must
+        // NOT reach the provider.
+        let abort = tokio::spawn(async {}).abort_handle();
+        active_turns_registry().lock().await.insert(
+            session_id.clone(),
+            ActiveTurn {
+                profile_id: MAIN_PROFILE_ID.to_owned(),
+                turn_id: turn_id.clone(),
+                state: Arc::new(TokioMutex::new(TurnState::Terminal(
+                    TerminalReason::Completed,
+                ))),
+                interrupt_tx: Arc::new(TokioMutex::new(None)),
+                abort,
+            },
+        );
+        let (ws, mut rx) = ws_connection_for_test(4);
+        handle_session_btw(
+            &ws,
+            &state,
+            &ledger,
+            &active_turns_registry(),
+            None,
+            None,
+            "b6".into(),
+            SessionBtwParams {
+                session_id: session_id.clone(),
+                topic: None,
+                question: "what are you drafting?".into(),
+            },
+        )
+        .await;
+        let frame = recv_rpc_json(&mut rx).await;
+        assert_eq!(frame["result"]["answer"], "no-draft", "got {frame}");
+
+        // A live turn admitted under ANOTHER profile (bare session-id
+        // collision) must not leak its draft into this profile's aside.
+        let abort = tokio::spawn(async {}).abort_handle();
+        active_turns_registry().lock().await.insert(
+            session_id.clone(),
+            ActiveTurn {
+                profile_id: "someone-else".to_owned(),
+                turn_id: turn_id.clone(),
+                state: Arc::new(TokioMutex::new(TurnState::Active)),
+                interrupt_tx: Arc::new(TokioMutex::new(None)),
+                abort,
+            },
+        );
+        let (ws, mut rx) = ws_connection_for_test(4);
+        handle_session_btw(
+            &ws,
+            &state,
+            &ledger,
+            &active_turns_registry(),
+            None,
+            None,
+            "b6b".into(),
+            SessionBtwParams {
+                session_id: session_id.clone(),
+                topic: None,
+                question: "what are you drafting?".into(),
+            },
+        )
+        .await;
+        let frame = recv_rpc_json(&mut rx).await;
+        assert_eq!(
+            frame["result"]["answer"], "no-draft",
+            "another profile's live draft must not leak; got {frame}"
+        );
+
+        // The same turn ACTIVE under OUR profile → its draft rides the prompt.
+        let abort = tokio::spawn(async {}).abort_handle();
+        active_turns_registry().lock().await.insert(
+            session_id.clone(),
+            ActiveTurn {
+                profile_id: MAIN_PROFILE_ID.to_owned(),
+                turn_id: turn_id.clone(),
+                state: Arc::new(TokioMutex::new(TurnState::Active)),
+                interrupt_tx: Arc::new(TokioMutex::new(None)),
+                abort,
+            },
+        );
+        let (ws, mut rx) = ws_connection_for_test(4);
+        handle_session_btw(
+            &ws,
+            &state,
+            &ledger,
+            &active_turns_registry(),
+            None,
+            None,
+            "b7".into(),
+            SessionBtwParams {
+                session_id: session_id.clone(),
+                topic: None,
+                question: "what are you drafting?".into(),
+            },
+        )
+        .await;
+        let frame = recv_rpc_json(&mut rx).await;
+        active_turns_registry().lock().await.remove(&session_id);
+        *btw_test_provider_slot().lock().expect("slot") = None;
+        assert_eq!(frame["result"]["answer"], "saw-draft", "got {frame}");
+    }
+
+    /// The ingress gate scopes `session#topic`; the handler must fold the
+    /// topic into the canonical key before ANY lookup — a topic-scoped aside
+    /// answers from the topic-scoped session, never the bare one.
+    #[tokio::test]
+    async fn session_btw_folds_topic_into_the_session_key() {
+        struct TopicStubProvider;
+        #[async_trait::async_trait]
+        impl octos_llm::LlmProvider for TopicStubProvider {
+            async fn chat(
+                &self,
+                _messages: &[octos_core::Message],
+                _tools: &[octos_llm::ToolSpec],
+                _config: &octos_llm::ChatConfig,
+            ) -> eyre::Result<octos_llm::ChatResponse> {
+                Ok(octos_llm::ChatResponse {
+                    content: Some("scoped answer".into()),
+                    reasoning_content: None,
+                    tool_calls: vec![],
+                    stop_reason: octos_llm::StopReason::EndTurn,
+                    usage: octos_llm::TokenUsage::default(),
+                    provider_index: None,
+                })
+            }
+            fn model_id(&self) -> &str {
+                "topic-stub"
+            }
+            fn provider_name(&self) -> &str {
+                "stub"
+            }
+        }
+
+        let folded = SessionKey("local:btw-topic#coding".into());
+        let state = prg_state_with_session(&folded, prg_seed_user_assistant);
+        let ledger = event_ledger(&state).await;
+        let (ws, mut rx) = ws_connection_for_test(4);
+
+        let _serial = btw_test_slot_serial().lock().await;
+        *btw_test_provider_slot().lock().expect("slot") = Some(Arc::new(TopicStubProvider));
+        handle_session_btw(
+            &ws,
+            &state,
+            &ledger,
+            &active_turns_registry(),
+            None,
+            None,
+            "b5".into(),
+            SessionBtwParams {
+                session_id: SessionKey("local:btw-topic".into()),
+                topic: Some("coding".into()),
+                question: "which scope answered?".into(),
+            },
+        )
+        .await;
+        let frame = recv_rpc_json(&mut rx).await;
+        *btw_test_provider_slot().lock().expect("slot") = None;
+        assert_eq!(frame["id"], "b5", "got {frame}");
+        assert!(frame["error"].is_null(), "got {frame}");
+        assert_eq!(
+            frame["result"]["session_id"],
+            folded.to_string(),
+            "the result must carry the topic-folded session key"
+        );
+    }
+
+    #[test]
     fn session_ingress_scope_accepts_matching_topic_folded_turn() {
         let allowed = SessionKey("dspfac:local:tui#coding".into());
         let command = UiCommand::TurnStart(TurnStartParams {
@@ -33199,6 +34623,7 @@ ignore = []
             octos_core::ui_protocol::methods::CONTENT_LIST,
             octos_core::ui_protocol::methods::CONTENT_DELETE,
             octos_core::ui_protocol::methods::CONTENT_BULK_DELETE,
+            octos_core::ui_protocol::methods::SESSION_FORK,
         ] {
             assert!(
                 !session_ingress_callable_method(m),
@@ -37042,6 +38467,7 @@ ignore = []
                 session_id.clone(),
                 ActiveTurn {
                     turn_id: TurnId::new(),
+                    profile_id: MAIN_PROFILE_ID.to_owned(),
                     state: Arc::new(TokioMutex::new(TurnState::Active)),
                     interrupt_tx: Arc::new(TokioMutex::new(Some(interrupt_tx))),
                     abort: dummy_handle.abort_handle(),
@@ -37201,6 +38627,341 @@ ignore = []
             !turn_ids.contains(&turn_drop.0.to_string()),
             "dropped turn 2 must be excluded from thread.turns; got {turn_ids:?}"
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn session_fork_copies_full_history_by_default() {
+        let session_id = SessionKey("local:fork-parent".into());
+        // 3 turns -> 6 messages persisted on the parent.
+        let (state, _tmp) = prg_state_with_persisted_turns(&session_id, 3).await;
+        let (ws, mut rx) = ws_connection_for_test(8);
+
+        handle_session_fork(
+            &ws,
+            &state,
+            None,
+            None,
+            "fk1".into(),
+            octos_core::ui_protocol::SessionForkParams {
+                session_id: session_id.clone(),
+                new_chat_id: "fork-child".into(),
+                copy_messages: None,
+            },
+        )
+        .await;
+
+        let frame = recv_rpc_json(&mut rx).await;
+        assert_eq!(frame["id"], "fk1");
+        let result = &frame["result"];
+        assert_eq!(result["new_session_id"], "local:fork-child");
+        assert_eq!(result["parent_session_id"], session_id.to_string());
+        assert_eq!(result["copied_messages"], 6);
+
+        // The child must exist on the manager, carry parent lineage, and
+        // hold the full copied history.
+        let sessions = state.sessions.as_ref().expect("sessions");
+        let mut guard = sessions.lock().await;
+        let child_key = SessionKey("local:fork-child".into());
+        assert!(
+            guard.session_known(&child_key),
+            "child session must persist"
+        );
+        let child = guard.get_or_create(&child_key).await;
+        assert_eq!(child.parent_key.as_ref(), Some(&session_id));
+        assert_eq!(child.messages.len(), 6);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn session_fork_copies_only_requested_tail() {
+        let session_id = SessionKey("local:fork-tail".into());
+        let (state, _tmp) = prg_state_with_persisted_turns(&session_id, 3).await;
+        let (ws, mut rx) = ws_connection_for_test(8);
+
+        handle_session_fork(
+            &ws,
+            &state,
+            None,
+            None,
+            "fk2".into(),
+            octos_core::ui_protocol::SessionForkParams {
+                session_id: session_id.clone(),
+                new_chat_id: "tail-child".into(),
+                copy_messages: Some(2),
+            },
+        )
+        .await;
+
+        let frame = recv_rpc_json(&mut rx).await;
+        assert_eq!(frame["result"]["copied_messages"], 2);
+        let sessions = state.sessions.as_ref().expect("sessions");
+        let mut guard = sessions.lock().await;
+        let child = guard
+            .get_or_create(&SessionKey("local:tail-child".into()))
+            .await;
+        assert_eq!(child.messages.len(), 2);
+        // Tail = the LAST turn (user + assistant of turn 3).
+        assert_eq!(child.messages[0].content, "turn 3");
+        assert_eq!(child.messages[1].content, "reply 3");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn session_fork_unknown_session_errors() {
+        let seeded = SessionKey("local:fork-seeded".into());
+        let (state, _tmp) = prg_state_with_persisted_turns(&seeded, 1).await;
+        let (ws, mut rx) = ws_connection_for_test(8);
+
+        handle_session_fork(
+            &ws,
+            &state,
+            None,
+            None,
+            "fk3".into(),
+            octos_core::ui_protocol::SessionForkParams {
+                session_id: SessionKey("local:never-created".into()),
+                new_chat_id: "child".into(),
+                copy_messages: None,
+            },
+        )
+        .await;
+
+        let frame = recv_rpc_json(&mut rx).await;
+        assert!(
+            frame.get("error").is_some(),
+            "fork of an unknown session must error, not auto-create"
+        );
+        // Fork must NOT have created either session as a side effect.
+        let sessions = state.sessions.as_ref().expect("sessions");
+        let mut guard = sessions.lock().await;
+        assert!(!guard.session_known(&SessionKey("local:never-created".into())));
+        assert!(!guard.session_known(&SessionKey("local:child".into())));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn session_fork_refuses_existing_child_key() {
+        let session_id = SessionKey("local:fork-clobber".into());
+        let (state, _tmp) = prg_state_with_persisted_turns(&session_id, 2).await;
+        let (ws, mut rx) = ws_connection_for_test(8);
+
+        for id in ["fka", "fkb"] {
+            handle_session_fork(
+                &ws,
+                &state,
+                None,
+                None,
+                id.into(),
+                octos_core::ui_protocol::SessionForkParams {
+                    session_id: session_id.clone(),
+                    new_chat_id: "same-child".into(),
+                    copy_messages: None,
+                },
+            )
+            .await;
+        }
+
+        let first = recv_rpc_json(&mut rx).await;
+        assert!(first.get("result").is_some(), "first fork succeeds");
+        let second = recv_rpc_json(&mut rx).await;
+        assert_eq!(
+            second["error"]["data"]["kind"], "child_exists",
+            "second fork onto the same child key must refuse, not clobber"
+        );
+
+        // The child's history must be the FIRST fork's copy, untouched.
+        let sessions = state.sessions.as_ref().expect("sessions");
+        let mut guard = sessions.lock().await;
+        let child = guard
+            .get_or_create(&SessionKey("local:same-child".into()))
+            .await;
+        assert_eq!(child.messages.len(), 4);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn session_fork_rejects_invalid_chat_id() {
+        let session_id = SessionKey("local:fork-badname".into());
+        let (state, _tmp) = prg_state_with_persisted_turns(&session_id, 1).await;
+        let (ws, mut rx) = ws_connection_for_test(8);
+
+        handle_session_fork(
+            &ws,
+            &state,
+            None,
+            None,
+            "fk4".into(),
+            octos_core::ui_protocol::SessionForkParams {
+                session_id: session_id.clone(),
+                new_chat_id: "../escape".into(),
+                copy_messages: None,
+            },
+        )
+        .await;
+
+        let frame = recv_rpc_json(&mut rx).await;
+        assert_eq!(frame["error"]["data"]["kind"], "invalid_new_chat_id");
+    }
+
+    #[test]
+    fn fork_reservations_scope_by_sessions_dir() {
+        // codex #1613 r2: identical child keys in DIFFERENT profiles'
+        // sessions dirs name different files — they must not exclude
+        // each other. Same dir + same key must.
+        let child = SessionKey("local:contested".into());
+        let dir_a = std::path::Path::new("/tmp/profile-a/sessions");
+        let dir_b = std::path::Path::new("/tmp/profile-b/sessions");
+
+        let a = ForkReservation::try_acquire(dir_a, &child).expect("dir A reserves");
+        let b = ForkReservation::try_acquire(dir_b, &child);
+        assert!(b.is_some(), "different sessions dir must not collide");
+        assert!(
+            ForkReservation::try_acquire(dir_a, &child).is_none(),
+            "same dir + same child key must exclude"
+        );
+        drop(a);
+        assert!(
+            ForkReservation::try_acquire(dir_a, &child).is_some(),
+            "released reservation must be reacquirable"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn session_fork_raw_spa_parent_yields_raw_child() {
+        // codex #1613 P1: a raw SPA handle ("web-123") must NOT be
+        // treated as a channel — the child is a raw handle too, not
+        // "web-123:kid" (excluded from the raw REST fallbacks).
+        let session_id = SessionKey("web-123".into());
+        let (state, _tmp) = prg_state_with_persisted_turns(&session_id, 1).await;
+        let (ws, mut rx) = ws_connection_for_test(8);
+
+        handle_session_fork(
+            &ws,
+            &state,
+            None,
+            None,
+            "fk-raw".into(),
+            octos_core::ui_protocol::SessionForkParams {
+                session_id: session_id.clone(),
+                new_chat_id: "web-456".into(),
+                copy_messages: None,
+            },
+        )
+        .await;
+
+        let frame = recv_rpc_json(&mut rx).await;
+        assert_eq!(frame["result"]["new_session_id"], "web-456");
+        let sessions = state.sessions.as_ref().expect("sessions");
+        let mut guard = sessions.lock().await;
+        assert!(guard.session_known(&SessionKey("web-456".into())));
+        assert!(
+            !guard.session_known(&SessionKey("web-123:web-456".into())),
+            "the naive channel-split key must not exist"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn session_fork_concurrent_same_child_one_wins() {
+        // codex #1613 P2: two forks from DIFFERENT parents racing to
+        // the same child key — exactly one may win; the loser must not
+        // silently overwrite the winner's copied history.
+        let parent_a = SessionKey("local:race-a".into());
+        let parent_b = SessionKey("local:race-b".into());
+        let (state, _tmp) = prg_state_with_persisted_turns(&parent_a, 1).await;
+        {
+            // Seed the second parent on the same manager.
+            let sessions = state.sessions.as_ref().expect("sessions");
+            let mut guard = sessions.lock().await;
+            let now = Utc::now();
+            let msg = Message {
+                role: MessageRole::User,
+                content: "b says".into(),
+                media: vec![],
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning_content: None,
+                client_message_id: None,
+                thread_id: None,
+                timestamp: now,
+            };
+            guard.add_message(&parent_b, msg).await.expect("seed b");
+        }
+        let (ws, mut rx) = ws_connection_for_test(8);
+
+        let fork = |parent: SessionKey, id: &str| {
+            let ws = &ws;
+            let state = &state;
+            let id = id.to_string();
+            async move {
+                handle_session_fork(
+                    ws,
+                    state,
+                    None,
+                    None,
+                    id,
+                    octos_core::ui_protocol::SessionForkParams {
+                        session_id: parent,
+                        new_chat_id: "contested".into(),
+                        copy_messages: None,
+                    },
+                )
+                .await;
+            }
+        };
+        tokio::join!(
+            fork(parent_a.clone(), "fk-a"),
+            fork(parent_b.clone(), "fk-b")
+        );
+
+        let first = recv_rpc_json(&mut rx).await;
+        let second = recv_rpc_json(&mut rx).await;
+        let oks = [&first, &second]
+            .iter()
+            .filter(|f| f.get("result").is_some())
+            .count();
+        assert_eq!(oks, 1, "exactly one fork wins: {first} / {second}");
+        let loser = if first.get("error").is_some() {
+            &first
+        } else {
+            &second
+        };
+        assert_eq!(loser["error"]["data"]["kind"], "child_exists");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn session_fork_enforces_connection_scope() {
+        // A profile-PREFIXED session id names another tenant's scope
+        // outright; a connection bound to "tenant-b" must be refused.
+        // (Un-prefixed ids are accepted by SPA convention — isolation for
+        // those comes from per-profile runtime resolution.)
+        let session_id = SessionKey("tenant-a:local:fork-scope".into());
+        let (state, _tmp) = prg_state_with_persisted_turns(&session_id, 1).await;
+        let (ws, mut rx) = ws_connection_for_test(8);
+
+        handle_session_fork(
+            &ws,
+            &state,
+            Some("tenant-b"),
+            None,
+            "fk5".into(),
+            octos_core::ui_protocol::SessionForkParams {
+                session_id: session_id.clone(),
+                new_chat_id: "stolen".into(),
+                copy_messages: None,
+            },
+        )
+        .await;
+
+        // Scope violations close 1008-first (see
+        // send_scope_error_closes_with_1008_on_authenticated_mismatch).
+        let first = rx.recv().await.expect("close frame");
+        match first {
+            axum::extract::ws::Message::Close(Some(frame)) => {
+                assert_eq!(frame.code, 1008);
+            }
+            other => panic!("expected 1008 close on cross-scope fork, got {other:?}"),
+        }
+        // And the fork must NOT have happened.
+        let sessions = state.sessions.as_ref().expect("sessions");
+        let mut guard = sessions.lock().await;
+        assert!(!guard.session_known(&SessionKey("tenant-a:local:stolen".into())));
+        assert!(!guard.session_known(&SessionKey("local:stolen".into())));
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -37495,6 +39256,7 @@ ignore = []
                 session_id.clone(),
                 ActiveTurn {
                     turn_id: turn_id.clone(),
+                    profile_id: MAIN_PROFILE_ID.to_owned(),
                     state: Arc::new(TokioMutex::new(TurnState::Active)),
                     interrupt_tx: Arc::new(TokioMutex::new(Some(interrupt_tx))),
                     abort: dummy_handle.abort_handle(),
@@ -37679,7 +39441,10 @@ ignore = []
                 media: vec!["research/_report.md".into()],
                 tool_calls: None,
                 tool_call_id: None,
-                reasoning_content: None,
+                // Persisted thinking text — must survive into the hydrated
+                // row for negotiated clients (the "· reasoning" block used
+                // to vanish on every client restart).
+                reasoning_content: Some("I should summarize the findings.".into()),
                 client_message_id: None,
                 thread_id: Some("cmid-user-1".into()),
                 timestamp: spawn_ack_ts,
@@ -37820,6 +39585,19 @@ ignore = []
             .expect("seq=1 companion row");
         assert_eq!(companion_row["source"], "background");
         assert_eq!(spawn_ack_row["source"], "background");
+        // Negotiated hydrate carries the persisted reasoning so the
+        // "· reasoning" block survives a client restart.
+        assert_eq!(
+            spawn_ack_row["reasoning_content"], "I should summarize the findings.",
+            "hydrated row must surface persisted reasoning_content"
+        );
+        assert!(
+            companion_row
+                .get("reasoning_content")
+                .map(|v| v.is_null())
+                .unwrap_or(true),
+            "rows without reasoning omit the field"
+        );
         let user_row = messages_new
             .iter()
             .find(|m| m["seq"] == 0)

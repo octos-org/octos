@@ -35,7 +35,7 @@ pub use task::{
 };
 pub use types::{
     AgentId, ClientMessageId, EpisodeRef, IdentityError, IdentityKind, MAIN_PROFILE_ID, Message,
-    MessageRole, SessionKey, TaskId, ThreadId, ToolCall, TurnId,
+    MessageRole, SessionKey, TaskId, ThreadId, ToolCall, TurnId, is_reserved_channel_name,
 };
 pub use ui_protocol::{EventEnvelope, TurnContext};
 pub use utils::{

@@ -974,10 +974,17 @@ pub mod methods {
     /// rewind), persist an idempotent append-only marker, and return the
     /// trimmed hydrated thread. MUTATING: changes persisted session state.
     pub const SESSION_ROLLBACK: &str = "session/rollback";
+    /// `session/fork` — create a NEW session copying the tail of an
+    /// existing one (`SessionManager::fork`; parent tracked via
+    /// `parent_key`). MUTATING: writes the child session to disk.
+    pub const SESSION_FORK: &str = "session/fork";
     /// UPCR-2026-010 `thread/graph/get` — thread partition for the session.
     pub const THREAD_GRAPH_GET: &str = "thread/graph/get";
     /// UPCR-2026-011 `turn/state/get` — turn lifecycle introspection.
     pub const TURN_STATE_GET: &str = "turn/state/get";
+    /// `session/btw` — quick aside question answered out-of-band (no tools)
+    /// while the session's live turn, if any, keeps running.
+    pub const SESSION_BTW: &str = "session/btw";
 
     /// UPCR-2026-021 M15 agent inspection/control surface.
     pub const AGENT_LIST: &str = "agent/list";
@@ -1191,6 +1198,7 @@ pub const UI_PROTOCOL_COMMAND_METHODS: &[&str] = &[
     methods::TURN_INTERRUPT,
     methods::APPROVAL_RESPOND,
     methods::APPROVAL_SCOPES_LIST,
+    methods::SESSION_BTW,
     methods::USER_QUESTION_RESPOND,
     methods::PERMISSION_PROFILE_LIST,
     methods::PERMISSION_PROFILE_SET,
@@ -1201,6 +1209,7 @@ pub const UI_PROTOCOL_COMMAND_METHODS: &[&str] = &[
     methods::TASK_OUTPUT_READ,
     methods::SESSION_HYDRATE,
     methods::SESSION_ROLLBACK,
+    methods::SESSION_FORK,
     methods::THREAD_GRAPH_GET,
     methods::TURN_STATE_GET,
     methods::AGENT_LIST,
@@ -1293,6 +1302,7 @@ pub const UI_PROTOCOL_FIRST_SERVER_METHODS: &[&str] = &[
     methods::TURN_INTERRUPT,
     methods::APPROVAL_RESPOND,
     methods::APPROVAL_SCOPES_LIST,
+    methods::SESSION_BTW,
     methods::USER_QUESTION_RESPOND,
     methods::PERMISSION_PROFILE_LIST,
     methods::PERMISSION_PROFILE_SET,
@@ -1303,6 +1313,7 @@ pub const UI_PROTOCOL_FIRST_SERVER_METHODS: &[&str] = &[
     methods::TASK_OUTPUT_READ,
     methods::SESSION_HYDRATE,
     methods::SESSION_ROLLBACK,
+    methods::SESSION_FORK,
     methods::THREAD_GRAPH_GET,
     methods::TURN_STATE_GET,
     methods::AGENT_LIST,
@@ -1697,8 +1708,10 @@ pub enum UiResultKind {
     TaskArtifactRead,
     SessionHydrate,
     SessionRollback,
+    SessionFork,
     ThreadGraphGet,
     TurnStateGet,
+    SessionBtw,
     UnsupportedCapability,
 }
 
@@ -1721,8 +1734,10 @@ pub fn first_server_result_kind_for_method(method: &str) -> Option<UiResultKind>
         methods::TASK_ARTIFACT_READ => Some(UiResultKind::TaskArtifactRead),
         methods::SESSION_HYDRATE => Some(UiResultKind::SessionHydrate),
         methods::SESSION_ROLLBACK => Some(UiResultKind::SessionRollback),
+        methods::SESSION_FORK => Some(UiResultKind::SessionFork),
         methods::THREAD_GRAPH_GET => Some(UiResultKind::ThreadGraphGet),
         methods::TURN_STATE_GET => Some(UiResultKind::TurnStateGet),
+        methods::SESSION_BTW => Some(UiResultKind::SessionBtw),
         _ => None,
     }
 }
@@ -2580,6 +2595,14 @@ pub struct HydratedMessage {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client_message_id: Option<String>,
     pub persisted_at: DateTime<Utc>,
+    /// Reasoning/thinking text captured for this message (#1502), when the
+    /// provider emitted it. Surfaced on hydrate so the "· reasoning" block
+    /// survives a client restart instead of silently vanishing — the store
+    /// has persisted it all along. Gated on `event.spawn_complete.v1` like
+    /// `message_id`/`source`, so non-negotiated clients keep the pre-fix
+    /// wire byte-identical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
     /// Stable per-row identity, derived from `(session_id, seq,
     /// timestamp_nanos)` — identical to what
     /// [`MessagePersistedEvent::message_id`] and
@@ -2760,6 +2783,28 @@ pub struct SessionRollbackResult {
     pub thread: SessionHydrateResult,
 }
 
+/// Params for `session/fork`: branch a new session off `session_id`,
+/// copying the last `copy_messages` messages (absent → the FULL
+/// history). `new_chat_id` becomes the child's chat id; the channel is
+/// derived from the parent key (`channel:chat_id`), matching
+/// `SessionManager::fork`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionForkParams {
+    pub session_id: SessionKey,
+    pub new_chat_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub copy_messages: Option<u32>,
+}
+
+/// Result for `session/fork`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionForkResult {
+    pub new_session_id: SessionKey,
+    pub parent_session_id: SessionKey,
+    /// Messages actually copied into the child.
+    pub copied_messages: u32,
+}
+
 // ----- UPCR-2026-010 `thread/graph/get` -----
 
 /// Params for `thread/graph/get` (UPCR-2026-010).
@@ -2811,6 +2856,30 @@ impl TurnLifecycleState {
             Self::Unknown => "unknown",
         }
     }
+}
+
+/// Params for `session/btw` — a quick aside question ("btw, what are you
+/// working on?") answered out-of-band while the session's live turn, if any,
+/// keeps running. The server answers with ONE restricted LLM call over a
+/// snapshot of the session's recent context: no tools, capped output, and the
+/// exchange is ephemeral — it is never appended to the session history, so the
+/// live turn never sees it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionBtwParams {
+    pub session_id: SessionKey,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub topic: Option<String>,
+    pub question: String,
+}
+
+/// Result for `session/btw`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionBtwResult {
+    pub session_id: SessionKey,
+    pub answer: String,
+    /// Model that produced the answer, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
 }
 
 /// Params for `turn/state/get` (UPCR-2026-011).
@@ -3668,8 +3737,10 @@ pub enum UiCommand {
     TaskArtifactRead(TaskArtifactReadParams),
     SessionHydrate(SessionHydrateParams),
     SessionRollback(SessionRollbackParams),
+    SessionFork(SessionForkParams),
     ThreadGraphGet(ThreadGraphGetParams),
     TurnStateGet(TurnStateGetParams),
+    SessionBtw(SessionBtwParams),
     // ---- M12 Phase D-1 auxiliary REST → WS frames ----
     SessionList(SessionListParams),
     SessionSnapshot(SessionSnapshotParams),
@@ -3710,8 +3781,10 @@ impl UiCommand {
             Self::TaskArtifactRead(_) => methods::TASK_ARTIFACT_READ,
             Self::SessionHydrate(_) => methods::SESSION_HYDRATE,
             Self::SessionRollback(_) => methods::SESSION_ROLLBACK,
+            Self::SessionFork(_) => methods::SESSION_FORK,
             Self::ThreadGraphGet(_) => methods::THREAD_GRAPH_GET,
             Self::TurnStateGet(_) => methods::TURN_STATE_GET,
+            Self::SessionBtw(_) => methods::SESSION_BTW,
             Self::SessionList(_) => methods::SESSION_LIST,
             Self::SessionSnapshot(_) => methods::SESSION_SNAPSHOT,
             Self::SessionMessagesPage(_) => methods::SESSION_MESSAGES_PAGE,
@@ -3754,8 +3827,10 @@ impl UiCommand {
             Self::TaskArtifactRead(params) => serde_json::to_value(params),
             Self::SessionHydrate(params) => serde_json::to_value(params),
             Self::SessionRollback(params) => serde_json::to_value(params),
+            Self::SessionFork(params) => serde_json::to_value(params),
             Self::ThreadGraphGet(params) => serde_json::to_value(params),
             Self::TurnStateGet(params) => serde_json::to_value(params),
+            Self::SessionBtw(params) => serde_json::to_value(params),
             Self::SessionList(params) => serde_json::to_value(params),
             Self::SessionSnapshot(params) => serde_json::to_value(params),
             Self::SessionMessagesPage(params) => serde_json::to_value(params),
@@ -3824,8 +3899,10 @@ impl UiCommand {
             }
             methods::SESSION_HYDRATE => Ok(Self::SessionHydrate(decode_params(method, params)?)),
             methods::SESSION_ROLLBACK => Ok(Self::SessionRollback(decode_params(method, params)?)),
+            methods::SESSION_FORK => Ok(Self::SessionFork(decode_params(method, params)?)),
             methods::THREAD_GRAPH_GET => Ok(Self::ThreadGraphGet(decode_params(method, params)?)),
             methods::TURN_STATE_GET => Ok(Self::TurnStateGet(decode_params(method, params)?)),
+            methods::SESSION_BTW => Ok(Self::SessionBtw(decode_params(method, params)?)),
             methods::SESSION_LIST => Ok(Self::SessionList(decode_optional_params(method, params)?)),
             methods::SESSION_SNAPSHOT => Ok(Self::SessionSnapshot(decode_params(method, params)?)),
             methods::SESSION_MESSAGES_PAGE => {
@@ -4168,8 +4245,10 @@ pub enum UiRpcResult {
     TaskArtifactRead(TaskArtifactReadResult),
     SessionHydrate(SessionHydrateResult),
     SessionRollback(SessionRollbackResult),
+    SessionFork(SessionForkResult),
     ThreadGraphGet(ThreadGraphGetResult),
     TurnStateGet(TurnStateGetResult),
+    SessionBtw(SessionBtwResult),
     UnsupportedCapability(UnsupportedCapabilityResult),
 }
 
@@ -4193,8 +4272,10 @@ impl UiRpcResult {
             Self::TaskArtifactRead(_) => UiResultKind::TaskArtifactRead,
             Self::SessionHydrate(_) => UiResultKind::SessionHydrate,
             Self::SessionRollback(_) => UiResultKind::SessionRollback,
+            Self::SessionFork(_) => UiResultKind::SessionFork,
             Self::ThreadGraphGet(_) => UiResultKind::ThreadGraphGet,
             Self::TurnStateGet(_) => UiResultKind::TurnStateGet,
+            Self::SessionBtw(_) => UiResultKind::SessionBtw,
             Self::UnsupportedCapability(_) => UiResultKind::UnsupportedCapability,
         }
     }
@@ -4218,8 +4299,10 @@ impl UiRpcResult {
             Self::TaskArtifactRead(_) => Some(methods::TASK_ARTIFACT_READ),
             Self::SessionHydrate(_) => Some(methods::SESSION_HYDRATE),
             Self::SessionRollback(_) => Some(methods::SESSION_ROLLBACK),
+            Self::SessionFork(_) => Some(methods::SESSION_FORK),
             Self::ThreadGraphGet(_) => Some(methods::THREAD_GRAPH_GET),
             Self::TurnStateGet(_) => Some(methods::TURN_STATE_GET),
+            Self::SessionBtw(_) => Some(methods::SESSION_BTW),
             Self::UnsupportedCapability(result) => Some(result.unsupported.method.as_str()),
         }
     }
@@ -4243,8 +4326,10 @@ impl UiRpcResult {
             Self::TaskArtifactRead(result) => serde_json::to_value(result),
             Self::SessionHydrate(result) => serde_json::to_value(result),
             Self::SessionRollback(result) => serde_json::to_value(result),
+            Self::SessionFork(result) => serde_json::to_value(result),
             Self::ThreadGraphGet(result) => serde_json::to_value(result),
             Self::TurnStateGet(result) => serde_json::to_value(result),
+            Self::SessionBtw(result) => serde_json::to_value(result),
             Self::UnsupportedCapability(result) => serde_json::to_value(result),
         }
     }
@@ -4299,8 +4384,10 @@ impl UiRpcResult {
             }
             methods::SESSION_HYDRATE => Ok(Self::SessionHydrate(decode_result(method, result)?)),
             methods::SESSION_ROLLBACK => Ok(Self::SessionRollback(decode_result(method, result)?)),
+            methods::SESSION_FORK => Ok(Self::SessionFork(decode_result(method, result)?)),
             methods::THREAD_GRAPH_GET => Ok(Self::ThreadGraphGet(decode_result(method, result)?)),
             methods::TURN_STATE_GET => Ok(Self::TurnStateGet(decode_result(method, result)?)),
+            methods::SESSION_BTW => Ok(Self::SessionBtw(decode_result(method, result)?)),
             _ => Err(RpcError::method_not_found(method)),
         }
     }
@@ -6884,6 +6971,7 @@ mod tests {
                 "turn/interrupt",
                 "approval/respond",
                 "approval/scopes/list",
+                "session/btw",
                 "user_question/respond",
                 "permission/profile/list",
                 "permission/profile/set",
@@ -6894,6 +6982,7 @@ mod tests {
                 "task/output/read",
                 "session/hydrate",
                 "session/rollback",
+                "session/fork",
                 "thread/graph/get",
                 "turn/state/get",
                 "agent/list",
@@ -6988,6 +7077,7 @@ mod tests {
                 "turn/interrupt",
                 "approval/respond",
                 "approval/scopes/list",
+                "session/btw",
                 "user_question/respond",
                 "permission/profile/list",
                 "permission/profile/set",
@@ -6998,6 +7088,7 @@ mod tests {
                 "task/output/read",
                 "session/hydrate",
                 "session/rollback",
+                "session/fork",
                 "thread/graph/get",
                 "turn/state/get",
                 "agent/list",
@@ -7062,6 +7153,7 @@ mod tests {
                     "turn/interrupt",
                     "approval/respond",
                     "approval/scopes/list",
+                    "session/btw",
                     "user_question/respond",
                     "permission/profile/list",
                     "permission/profile/set",
@@ -7072,6 +7164,7 @@ mod tests {
                     "task/output/read",
                     "session/hydrate",
                     "session/rollback",
+                    "session/fork",
                     "thread/graph/get",
                     "turn/state/get",
                     "agent/list",
@@ -9917,6 +10010,7 @@ mod tests {
                 message_id: Some("local:demo:17:1700000000000000000".into()),
                 source: Some("user".into()),
                 media: vec![],
+                reasoning_content: None,
             }]),
             threads: Some(vec![ThreadGraphEntry {
                 thread_id: "thread-1".into(),

@@ -284,6 +284,13 @@ pub struct Agent {
     pub(super) memory: Arc<EpisodeStore>,
     /// Embedding provider for hybrid memory search.
     pub(super) embedder: Option<Arc<dyn EmbeddingProvider>>,
+    /// Whether THIS conversation has already saved its episode (#1587
+    /// write side). Set on the first compaction; subsequent compactions
+    /// skip. One conversation episode per session — bounded regardless of
+    /// how many times the session compacts, and no index churn (the hybrid
+    /// index only tombstones on delete, so supersede would bloat it).
+    /// Per-agent = per-session (codex-confirmed).
+    pub(super) conversation_episode_saved: std::sync::atomic::AtomicBool,
     /// System prompt for this agent, as ordered segments (RwLock for
     /// hot-reload support). See [`prompt_segments::PromptSegments`].
     pub(super) system_prompt: RwLock<prompt_segments::PromptSegments>,
@@ -465,6 +472,7 @@ impl Agent {
             tools,
             memory,
             embedder: None,
+            conversation_episode_saved: std::sync::atomic::AtomicBool::new(false),
             system_prompt: RwLock::new(prompt_segments::PromptSegments::from_base(system_prompt)),
             segment_providers: RwLock::new(Vec::new()),
             config: AgentConfig::default(),
@@ -538,6 +546,7 @@ impl Agent {
             tools,
             memory,
             embedder: None,
+            conversation_episode_saved: std::sync::atomic::AtomicBool::new(false),
             system_prompt: RwLock::new(prompt_segments::PromptSegments::from_base(system_prompt)),
             segment_providers: RwLock::new(Vec::new()),
             config: AgentConfig::default(),
