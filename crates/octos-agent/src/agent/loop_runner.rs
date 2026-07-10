@@ -811,12 +811,24 @@ impl Agent {
                     timestamp: chrono::Utc::now(),
                 }];
 
-                // #1587: session-start conversational episodic recall. On
-                // the FIRST turn of a conversation (empty history), surface
-                // relevant past episodes ONCE — bounded to turn 1 so there
-                // is no per-turn embed latency, and inheriting the
-                // contamination guard from the shared helper (embedder-only,
-                // 0.55 floor). No-op without an embedder or on empty input.
+                // #1587: session-start conversational episodic recall.
+                // Recall on an EMPTY-history turn — normally the first turn
+                // of a conversation — so the cost (one embed) is paid once
+                // per conversation, NOT per turn, and the contamination
+                // surface is a single injection. Inherits the guard from the
+                // shared helper (embedder-only, 0.55 floor); no-op without an
+                // embedder or on empty input.
+                //
+                // "Empty history" is the trigger, not a strict session
+                // counter: a rare speculative-interrupt retry can re-invoke
+                // with the empty pre-primary snapshot and recall again. That
+                // is harmless — each turn builds a FRESH prompt, so a repeat
+                // adds one embed on that path and never accumulates or
+                // duplicates within a prompt. A "recalled once" marker was
+                // deliberately NOT added: if the agent were reused across a
+                // `/new` fork it would wrongly SUPPRESS recall on a genuine
+                // new conversation, and missing recall is worse than a rare
+                // extra embed on an advisory feature.
                 if history.is_empty() && !user_content.trim().is_empty() {
                     let default_cwd = std::path::PathBuf::from(".");
                     let cwd = self.tools.workspace_root().unwrap_or(default_cwd.as_path());
