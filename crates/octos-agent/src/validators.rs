@@ -728,7 +728,23 @@ impl ValidatorRunner {
         // helper is unavailable) and the no-sandbox case have nothing to escape,
         // so they run the argv directly, where `Command` passes each element as a
         // distinct token (injection-safe).
-        let real_sandbox = self.sandbox.as_ref().filter(|s| !s.is_noop());
+        //
+        // #1607 (codex-review follow-up) — Docker exception: the Docker backend
+        // bind-mounts the workspace at a fixed in-container path (`/workspace`),
+        // but `Command` validators interpolate absolute *host* paths (e.g.
+        // `${output.patch_path}` -> `/host/ws/.../foo.patch`) that don't exist
+        // inside the container, so wrapping them in `docker run` would make a
+        // previously-passing required validator start failing. Before #1607,
+        // command validators ran on the host and worked. To avoid a silent
+        // regression, Docker-mode command validators stay on the pre-#1607
+        // direct (host) path here (Docker is not the fleet default). This does
+        // NOT sandbox them — full in-container path translation is a documented
+        // known follow-up (see `Sandbox::is_docker`). The non-command validator
+        // kinds (ToolCall / file checks) are unaffected: they never shell out.
+        let real_sandbox = self
+            .sandbox
+            .as_ref()
+            .filter(|s| !s.is_noop() && !s.is_docker());
         let sandbox_is_windows = cfg!(windows);
         if real_sandbox.is_some() && sandbox_is_windows {
             return error_outcome(
@@ -3584,6 +3600,63 @@ mod tests {
         }));
         let outcomes = runner.run_all(&invocation, &[validator]).await;
         assert_eq!(outcomes[0].status, ValidatorStatus::Pass, "{outcomes:?}");
+    }
+
+    /// #1607 (codex-review follow-up) — Docker P2: a Docker-mode sandbox must
+    /// NOT wrap command validators in `docker run` (host absolute paths like
+    /// `${output.target_path}` don't exist inside the `/workspace` bind mount,
+    /// so a previously-passing required validator would break). Instead they
+    /// stay on the pre-#1607 direct (host) path. Proof: a `test -f <host path>`
+    /// validator run under `SandboxMode::Docker` still PASSES against the real
+    /// host file. If it were wrapped in `docker run`, it would either error
+    /// (no docker binary) or fail (host path not visible in the container) —
+    /// never Pass. Unix-only because the host path is checked via `test -f`.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn docker_sandbox_keeps_command_validator_on_host_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let path_arg = dir.path().join("deck.pptx");
+        std::fs::write(&path_arg, b"x").unwrap();
+
+        // A Docker-mode sandbox is constructed regardless of whether the docker
+        // binary is present, so this test is host-independent.
+        let docker: Arc<dyn Sandbox> = Arc::from(crate::sandbox::create_sandbox(
+            &crate::sandbox::SandboxConfig {
+                mode: crate::sandbox::SandboxMode::Docker,
+                ..crate::sandbox::SandboxConfig::default()
+            },
+        ));
+        assert!(docker.is_docker(), "guard: backend must be Docker");
+        assert!(
+            !docker.is_noop(),
+            "guard: Docker is a real (non-no-op) backend"
+        );
+
+        let runner = ValidatorRunner::new(Arc::new(ToolRegistry::new()), dir.path().to_path_buf())
+            .with_sandbox(docker);
+        let validator = validator_with_spec(
+            "docker_host_path_cmd",
+            ValidatorSpec::Command {
+                cmd: "test".into(),
+                args: vec!["-f".into(), "${output.target_path}".into()],
+            },
+        );
+        let invocation = ValidatorInvocation::new(
+            ValidatorPhase::Completion,
+            dir.path().to_path_buf(),
+            "test".into(),
+        )
+        .with_tool_output(serde_json::json!({
+            "target_path": path_arg.to_string_lossy().to_string(),
+        }));
+        let outcomes = runner.run_all(&invocation, &[validator]).await;
+        assert_eq!(
+            outcomes[0].status,
+            ValidatorStatus::Pass,
+            "Docker-mode command validator must run on the host directly and \
+             pass against the real host file (not be wrapped in `docker run`): \
+             {outcomes:?}"
+        );
     }
 
     #[tokio::test]

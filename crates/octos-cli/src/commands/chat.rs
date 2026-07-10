@@ -686,7 +686,12 @@ impl ChatCommand {
         let worker_prompt = super::load_prompt("worker", octos_agent::DEFAULT_WORKER_PROMPT);
         let mut spawn_tool =
             octos_agent::SpawnTool::new(llm.clone(), memory.clone(), cwd.clone(), spawn_tx)
-                .with_worker_prompt(worker_prompt);
+                .with_worker_prompt(worker_prompt)
+                // #1607 (codex-review follow-up): thread the same sandbox the
+                // parent registry was built from so the spawn/agent_mcp child
+                // completion path confines workspace-declared `Command`
+                // validators instead of running them on the host.
+                .with_sandbox(effective_sandbox_config.clone());
         if let Some(ref embedder) = embedder {
             // Workers save episodes by default; without the embedder those
             // episodes are stored vectorless and worker recall skips.

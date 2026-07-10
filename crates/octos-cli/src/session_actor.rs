@@ -3343,6 +3343,12 @@ impl ActorFactory {
             chat_id,
         )
         .with_provider_policy(self.provider_policy.clone())
+        // #1607 (codex-review follow-up): thread the same sandbox config the
+        // parent `ToolRegistry` was built with (`create_sandbox(&self.sandbox_config)`
+        // above) so the spawn/agent_mcp child completion path confines
+        // workspace-declared `Command` validators instead of running them on
+        // the host.
+        .with_sandbox(self.sandbox_config.clone())
         .with_agent_config(self.agent_config.clone())
         .with_task_supervisor(
             supervisor.clone(),

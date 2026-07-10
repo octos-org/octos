@@ -18613,6 +18613,12 @@ async fn run_standalone_turn(
             session_id.to_string(),
         )
         .with_provider_policy(tool_registry.provider_policy().cloned())
+        // #1607 (codex-review follow-up): inherit the session's effective
+        // sandbox (the same `SandboxConfig` the parent `tool_registry` was
+        // built from) so the spawn/agent_mcp child completion path confines
+        // workspace-declared `Command` validators rather than running them on
+        // the host.
+        .with_sandbox(session_runtime.sandbox.clone())
         .with_agent_config(agent_config.clone())
         .with_task_supervisor(
             task_supervisor.clone(),
