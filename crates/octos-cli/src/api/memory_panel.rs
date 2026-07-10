@@ -324,7 +324,11 @@ pub async fn my_memory(
     };
 
     // FD-anchored walk to the memory dir (see module doc). A missing
-    // or symlinked memory dir renders as the empty state.
+    // or symlinked memory dir renders as the empty state. The WHOLE
+    // walk runs on the blocking pool: it is synchronous disk I/O over
+    // tenant-controlled content, and O_NONBLOCK only de-fangs FIFO
+    // opens — large/slow regular files would still stall a Tokio
+    // worker inline (codex #1611 r3/r4 P1).
     let memory_dir_path = store
         .memory_md_path()
         .parent()
@@ -333,54 +337,60 @@ pub async fn my_memory(
     let Some(rel_mem) = rel_under(&data_dir, &memory_dir_path) else {
         return Ok(empty(&state, &profile));
     };
-    let Some(root) = AnchoredDir::open_root(&data_dir) else {
-        return Ok(empty(&state, &profile));
-    };
-    let Some(mem) = root.open_beneath(&rel_mem) else {
-        return Ok(empty(&state, &profile));
-    };
+    let rel_bank = rel_under(&memory_dir_path, &store.bank_entities_dir());
+    let walk_root = data_dir.clone();
+    let walked = tokio::task::spawn_blocking(move || {
+        let root = AnchoredDir::open_root(&walk_root)?;
+        let mem = root.open_beneath(&rel_mem)?;
 
-    let (long_term, long_term_updated_at) = match mem.read_file("MEMORY.md") {
+        let long_term = mem.read_file("MEMORY.md");
+        let local_today = chrono::Local::now().date_naive();
+        let today = mem
+            .read_file(&format!("{local_today}.md"))
+            .map(|(content, _)| content)
+            .unwrap_or_default();
+        // Last 7 days, newest first — mirrors `MemoryStore::read_recent`.
+        let mut recent = Vec::new();
+        for i in 1..=7 {
+            let date = local_today - chrono::Duration::days(i);
+            let date_str = date.format("%Y-%m-%d").to_string();
+            if let Some((content, _)) = mem.read_file(&format!("{date_str}.md")) {
+                recent.push(DailyNote {
+                    date: date_str,
+                    content,
+                });
+            }
+        }
+        // Entity bank — walked from the memory-dir FD (its components
+        // can be symlinks independently of memory/ itself).
+        let mut entities = Vec::new();
+        if let Some(bank) = rel_bank.and_then(|rel| mem.open_beneath(&rel)) {
+            for name in bank.list_md_stems() {
+                if let Some((content, _)) = bank.read_file(&format!("{name}.md")) {
+                    entities.push(EntitySummary {
+                        // The store's own parser — byte-identical to the
+                        // agent-prompt summaries (codex #1611 r2 P2).
+                        summary: octos_memory::extract_abstract(&content),
+                        name,
+                    });
+                }
+            }
+            entities.sort_by(|a, b| a.name.cmp(&b.name));
+        }
+        Some((long_term, today, recent, entities))
+    })
+    .await
+    .ok()
+    .flatten();
+    let Some((long_term_read, today, recent, entities)) = walked else {
+        return Ok(empty(&state, &profile));
+    };
+    let (long_term, long_term_updated_at) = match long_term_read {
         // mtime whenever the file EXISTS — an empty long-term memory
         // still reports when it last changed (codex #1611 r2 P2).
         Some((content, mtime)) => (content, mtime.map(rfc3339)),
         None => (String::new(), None),
     };
-    let local_today = chrono::Local::now().date_naive();
-    let today = mem
-        .read_file(&format!("{local_today}.md"))
-        .map(|(content, _)| content)
-        .unwrap_or_default();
-    // Last 7 days, newest first — mirrors `MemoryStore::read_recent`.
-    let mut recent = Vec::new();
-    for i in 1..=7 {
-        let date = local_today - chrono::Duration::days(i);
-        let date_str = date.format("%Y-%m-%d").to_string();
-        if let Some((content, _)) = mem.read_file(&format!("{date_str}.md")) {
-            recent.push(DailyNote {
-                date: date_str,
-                content,
-            });
-        }
-    }
-    // Entity bank — walked from the memory-dir FD (its components can
-    // be symlinks independently of memory/ itself).
-    let mut entities = Vec::new();
-    if let Some(rel_bank) = rel_under(&memory_dir_path, &store.bank_entities_dir())
-        && let Some(bank) = mem.open_beneath(&rel_bank)
-    {
-        for name in bank.list_md_stems() {
-            if let Some((content, _)) = bank.read_file(&format!("{name}.md")) {
-                entities.push(EntitySummary {
-                    // The store's own parser — byte-identical to the
-                    // agent-prompt summaries (codex #1611 r2 P2).
-                    summary: octos_memory::extract_abstract(&content),
-                    name,
-                });
-            }
-        }
-        entities.sort_by(|a, b| a.name.cmp(&b.name));
-    }
     let staging_notes = store.count_staging_notes().await;
 
     Ok(Json(MemoryOverviewResponse {
