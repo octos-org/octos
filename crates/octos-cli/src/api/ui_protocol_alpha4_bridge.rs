@@ -429,6 +429,7 @@ mod tests {
         reporter.report(ProgressEvent::ToolStarted {
             name: "shell".into(),
             tool_id: "call-1".into(),
+            arguments: None,
         });
         reporter.report(ProgressEvent::ToolCompleted {
             name: "shell".into(),

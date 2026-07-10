@@ -67,7 +67,14 @@ pub enum ProgressEvent {
     Response { content: String, iteration: u32 },
 
     /// Agent is calling a tool.
-    ToolStarted { name: String, tool_id: String },
+    ToolStarted {
+        name: String,
+        tool_id: String,
+        /// The call arguments as requested by the LLM (pre-hook). Carried so
+        /// downstream projections (UI protocol tool cards, envelope
+        /// `arguments_preview`) can echo what the tool was asked to do.
+        arguments: Option<serde_json::Value>,
+    },
 
     /// Mid-execution progress from a tool (e.g., stderr line from binary plugin).
     ToolProgress {
@@ -308,7 +315,7 @@ impl ProgressReporter for ConsoleReporter {
                 use std::io::Write;
                 let _ = std::io::stdout().flush();
             }
-            ProgressEvent::ToolStarted { name, tool_id: _ } => {
+            ProgressEvent::ToolStarted { name, .. } => {
                 print!(
                     "\r{} {}",
                     self.yellow("⚙"),

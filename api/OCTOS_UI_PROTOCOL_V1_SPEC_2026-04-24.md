@@ -2219,11 +2219,16 @@ form).
 
 #### `tool_start`
 Tool invocation begun. The projection opens a tool-call card keyed on
-`tool_call_id`.
+`tool_call_id`. `arguments_preview` (optional) is a compact
+`key: value` echo of the call arguments, server-bounded to 700 chars
+(UTF-8-safe) — display fidelity for the card, not a replayable
+argument record. Omitted for argument-less calls and for envelopes
+persisted before the field existed.
 
 ```json
 { "type": "tool_start",
-  "data": { "tool_call_id": "tc-1", "name": "shell" } }
+  "data": { "tool_call_id": "tc-1", "name": "shell",
+            "arguments_preview": "command: \"cargo test\"" } }
 ```
 
 #### `tool_progress`
@@ -2239,11 +2244,18 @@ the projection appends in `seq` order.
 Tool invocation finished. `error` is set iff `status === "error"`;
 omitted on the wire when null. `reason` is an optional human-readable
 detail field, primarily populated for `skipped` and `aborted` outcomes
-(see below); omitted on the wire when null.
+(see below); omitted on the wire when null. `output_preview` (optional)
+carries the first lines of the tool result, server-bounded to
+2048 chars (UTF-8-safe) — the result excerpt under the tool card; the
+`error` field is bounded the same way. `duration_ms` (optional) is the
+call's wall-clock duration. Both are omitted for envelopes persisted
+before the fields existed.
 
 ```json
 { "type": "tool_end",
-  "data": { "tool_call_id": "tc-1", "status": "complete" } }
+  "data": { "tool_call_id": "tc-1", "status": "complete",
+            "output_preview": "test result: ok. 815 passed",
+            "duration_ms": 4321 } }
 ```
 
 ```json

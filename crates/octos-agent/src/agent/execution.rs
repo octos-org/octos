@@ -534,6 +534,7 @@ impl Agent {
             reporter.report(ProgressEvent::ToolStarted {
                 name: tc_name.clone(),
                 tool_id: tc_id.clone(),
+                arguments: Some(tc_args.clone()),
             });
 
             // Before-tool hook: may deny or modify args
