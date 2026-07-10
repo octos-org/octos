@@ -1276,7 +1276,7 @@ pub(crate) fn progress_event_to_acp(event: &ProgressEvent) -> Option<SessionUpda
         ProgressEvent::ReasoningChunk { text, .. } => Some(SessionUpdate::AgentThoughtChunk(
             ContentChunk::new(ContentBlock::from(text.clone())),
         )),
-        ProgressEvent::ToolStarted { name, tool_id } => {
+        ProgressEvent::ToolStarted { name, tool_id, .. } => {
             let call = ToolCall::new(tool_id.clone(), name.clone())
                 .kind(tool_kind_for(name))
                 .status(ToolCallStatus::InProgress);
@@ -1524,6 +1524,7 @@ mod tests {
         let ev = ProgressEvent::ToolStarted {
             name: "shell".into(),
             tool_id: "call-1".into(),
+            arguments: None,
         };
         let update = progress_event_to_acp(&ev).expect("tool start maps to a tool call");
         match update {

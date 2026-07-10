@@ -189,6 +189,7 @@ mod tests {
         reporter.report(ProgressEvent::ToolStarted {
             name: "shell".into(),
             tool_id: "call_x".into(),
+            arguments: None,
         });
 
         // Inner reporter receives both events.

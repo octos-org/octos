@@ -3389,6 +3389,16 @@ pub struct FileRef {
     pub size_bytes: u64,
 }
 
+/// Bound for [`Payload::ToolStart::arguments_preview`]: enough for a
+/// meaningful `shell(cd … && cargo test …)` argument echo without letting a
+/// 1MB tool-arg blob into every persisted envelope + hydrate replay.
+pub const ENVELOPE_TOOL_ARGUMENTS_PREVIEW_MAX: usize = 700;
+
+/// Bound for [`Payload::ToolEnd::output_preview`]: a screenful of result
+/// excerpt for the tool card, not the full output (which stays in the
+/// transcript/tool message).
+pub const ENVELOPE_TOOL_OUTPUT_PREVIEW_MAX: usize = 2048;
+
 /// Sealed tagged union of payloads carried by the M9-γ projection
 /// envelope. Each variant carries everything the projection needs;
 /// the projection function is `(committed_log) → ChatViewModel` and
@@ -3453,7 +3463,17 @@ pub enum Payload {
     AssistantPersisted { text: String, meta: MessageMeta },
     /// Tool invocation begun. The projection opens a tool-call card
     /// keyed on `tool_call_id`.
-    ToolStart { tool_call_id: String, name: String },
+    ToolStart {
+        tool_call_id: String,
+        name: String,
+        /// Compact JSON of the call arguments, UTF-8-truncated to
+        /// [`ENVELOPE_TOOL_ARGUMENTS_PREVIEW_MAX`] — display fidelity for
+        /// tool cards (`shell(cd … && cargo test)`), NOT a replayable
+        /// argument record. `None` on argument-less calls and on
+        /// envelopes persisted before this field existed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        arguments_preview: Option<String>,
+    },
     /// Tool emitted a progress message. Idempotent per `(tool_call_id,
     /// seq)`; the projection appends in `seq` order.
     ToolProgress {
@@ -3471,6 +3491,15 @@ pub enum Payload {
         error: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reason: Option<String>,
+        /// First lines of the tool result, UTF-8-truncated to
+        /// [`ENVELOPE_TOOL_OUTPUT_PREVIEW_MAX`] — the `⎿ …` result excerpt
+        /// under the card. `None` for output-less tools and on envelopes
+        /// persisted before this field existed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        output_preview: Option<String>,
+        /// Wall-clock duration of the call, when the emitter tracked it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        duration_ms: Option<u64>,
     },
     /// File attached to the current thread (e.g. `.md` report from
     /// `deep_search` or `.mp3` from `fm_tts`). The projection adds the
@@ -11232,12 +11261,94 @@ mod tests {
     }
 
     #[test]
+    fn golden_envelope_tool_fidelity_round_trip_and_legacy_decode() {
+        // Enriched shape: arguments/output previews + duration survive the
+        // wire round-trip.
+        let start = envelope(
+            4,
+            Payload::ToolStart {
+                tool_call_id: "tc-1".into(),
+                name: "shell".into(),
+                arguments_preview: Some("command: \"cargo test\"".into()),
+            },
+        );
+        let end = envelope(
+            5,
+            Payload::ToolEnd {
+                tool_call_id: "tc-1".into(),
+                status: EnvelopeToolEndStatus::Complete,
+                error: None,
+                reason: None,
+                output_preview: Some("test result: ok. 815 passed".into()),
+                duration_ms: Some(1234),
+            },
+        );
+        for env in [start, end] {
+            let value = serde_json::to_value(&env).expect("serialize");
+            let parsed: Envelope = serde_json::from_value(value).expect("deserialize");
+            assert_eq!(parsed, env);
+        }
+
+        // Legacy wire (envelopes persisted before the fidelity fields
+        // existed) must still decode — fields default to None. Build the
+        // legacy shape by stripping the new keys from a modern envelope so
+        // the fixture tracks the real tag/content encoding.
+        let strip = |env: &Envelope, keys: &[&str]| -> Envelope {
+            let mut value = serde_json::to_value(env).expect("serialize");
+            let data = value["payload"]["data"]
+                .as_object_mut()
+                .expect("payload data object");
+            for key in keys {
+                data.remove(*key);
+            }
+            serde_json::from_value(value).expect("legacy envelope decodes")
+        };
+        let start = envelope(
+            8,
+            Payload::ToolStart {
+                tool_call_id: "tc-9".into(),
+                name: "read_file".into(),
+                arguments_preview: Some("path: \"x\"".into()),
+            },
+        );
+        match strip(&start, &["arguments_preview"]).payload {
+            Payload::ToolStart {
+                arguments_preview, ..
+            } => assert_eq!(arguments_preview, None),
+            other => panic!("expected ToolStart, got {other:?}"),
+        }
+        let end = envelope(
+            9,
+            Payload::ToolEnd {
+                tool_call_id: "tc-9".into(),
+                status: EnvelopeToolEndStatus::Complete,
+                error: None,
+                reason: None,
+                output_preview: Some("ok".into()),
+                duration_ms: Some(1),
+            },
+        );
+        match strip(&end, &["output_preview", "duration_ms"]).payload {
+            Payload::ToolEnd {
+                output_preview,
+                duration_ms,
+                ..
+            } => {
+                assert_eq!(output_preview, None);
+                assert_eq!(duration_ms, None);
+            }
+            other => panic!("expected ToolEnd, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn golden_envelope_tool_start_progress_end_round_trip() {
         let start = envelope(
             4,
             Payload::ToolStart {
                 tool_call_id: "tc-1".into(),
                 name: "shell".into(),
+                arguments_preview: None,
             },
         );
         let progress = envelope(
@@ -11254,6 +11365,8 @@ mod tests {
                 status: EnvelopeToolEndStatus::Complete,
                 error: None,
                 reason: None,
+                output_preview: None,
+                duration_ms: None,
             },
         );
         let end_err = envelope(
@@ -11263,6 +11376,8 @@ mod tests {
                 status: EnvelopeToolEndStatus::Error,
                 error: Some("boom".into()),
                 reason: None,
+                output_preview: None,
+                duration_ms: None,
             },
         );
 
@@ -11309,6 +11424,8 @@ mod tests {
                 status: EnvelopeToolEndStatus::Skipped,
                 error: None,
                 reason: Some("deadline elapsed before tool started".into()),
+                output_preview: None,
+                duration_ms: None,
             },
         );
         let aborted = envelope(
@@ -11318,6 +11435,8 @@ mod tests {
                 status: EnvelopeToolEndStatus::Aborted,
                 error: None,
                 reason: Some("user issued turn/interrupt".into()),
+                output_preview: None,
+                duration_ms: None,
             },
         );
         for (env, expected_status) in [(&skipped, "skipped"), (&aborted, "aborted")] {

@@ -31,7 +31,12 @@ the claim is memory-derived and may be stale, and offer to re-check.\n\
 do NOT re-ask the user for facts memory already answers.\n\
 - Prefer fresh evidence from THIS conversation over memory when they \
 conflict.\n\
-- Never present an unverified memory-derived fact as confirmed-current.";
+- Never present an unverified memory-derived fact as confirmed-current.\n\
+- What is shown above may be a SUMMARY: memory-bank abstracts and a \
+budget-truncated registry. Load the full detail on demand with \
+`recall_memory` — an entity name for its page, or \"MEMORY\" for the \
+complete long-term registry — instead of guessing when a needed detail \
+is not in the summary.";
 
 /// Capture-policy block appended to the memory segment when the
 /// memory-refresh feature is enabled. Shared by the chat path (via
