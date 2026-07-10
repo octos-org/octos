@@ -69,6 +69,9 @@ run_hosted_fast() {
   # helpers) is feature-gated, so `cargo test --workspace` above never compiles
   # it. Run the api-gated unit tests explicitly so this coverage is real.
   cargo test -p octos-cli --features api voice_turn -- --nocapture
+  # §6 catalog guard is in the same feature-gated `api` module; run it
+  # explicitly so UI Protocol spec/impl drift is caught here too.
+  cargo test -p octos-cli --features api spec_section6_catalog_lists_every_advertised_method -- --nocapture
   cargo test -p octos-agent --test activate_tools_regression -- --nocapture
   cargo test -p octos-bus --test file_handle_resolve_tool_path -- --nocapture
 }

@@ -24963,6 +24963,132 @@ mod tests {
         rpc_error_codes,
     };
 
+    /// The §6 "Envelope Model" catalog in
+    /// `api/OCTOS_UI_PROTOCOL_V1_SPEC_2026-04-24.md` is a hand-maintained
+    /// mirror of the advertised method constants and has historically drifted
+    /// — methods shipped without a catalog update (e.g. `session/rollback`
+    /// #1516, `message/reasoning_delta` #1502). Nothing else gates catalog
+    /// completeness (`check-ui-protocol-upcr.sh` only checks that a protocol
+    /// edit ships with *a* UPCR doc). This test keeps §6 a superset of
+    /// `UI_PROTOCOL_COMMAND_METHODS ∪ UI_PROTOCOL_NOTIFICATION_METHODS ∪
+    /// APPUI_EXTRA_METHODS`, so the catalog can no longer silently fall behind.
+    #[test]
+    fn spec_section6_catalog_lists_every_advertised_method() {
+        fn is_method_char(c: char) -> bool {
+            // `.` is part of a method token (dotted M12 names like
+            // `session/status.get`), NOT a boundary — otherwise a drifted
+            // `session/status.get.v2` catalog entry would still satisfy the
+            // advertised `session/status.get`.
+            c.is_ascii_alphanumeric() || c == '_' || c == '/' || c == '.'
+        }
+        // Bounded substring match within an entry's method-token head, so
+        // `artifact/list` is not satisfied by `agent/artifact/list`; backticks,
+        // commas, and spaces are all boundaries.
+        fn head_has_method(head: &str, method: &str) -> bool {
+            let bytes = head.as_bytes();
+            let mut from = 0;
+            while let Some(rel) = head[from..].find(method) {
+                let i = from + rel;
+                let before_ok = i == 0 || !is_method_char(bytes[i - 1] as char);
+                let after = i + method.len();
+                let after_ok = after >= bytes.len() || !is_method_char(bytes[after] as char);
+                if before_ok && after_ok {
+                    return true;
+                }
+                from = i + 1;
+            }
+            false
+        }
+
+        // A method counts as cataloged only when it appears in the method-token
+        // HEAD of a `- ` list entry — the entry's first line PLUS any indented
+        // continuation lines, truncated at the first description delimiter (`(`
+        // annotation or `—` prose). Grouped entries wrap their comma-separated
+        // method list across continuation lines, so those must be folded in;
+        // but a method named only inside another entry's parenthetical/prose
+        // (e.g. `session/hydrate` inside the `session/rollback` bullet) must NOT
+        // count, or genuine drift for that method would hide.
+        fn catalog_lists(section: &str, method: &str) -> bool {
+            fn head(entry: &str) -> &str {
+                let cut = [entry.find('('), entry.find('—')]
+                    .into_iter()
+                    .flatten()
+                    .min()
+                    .unwrap_or(entry.len());
+                &entry[..cut]
+            }
+            let mut entries: Vec<String> = Vec::new();
+            let mut current: Option<String> = None;
+            for line in section.lines() {
+                let trimmed = line.trim_start();
+                if let Some(rest) = trimmed.strip_prefix("- ") {
+                    if let Some(entry) = current.take() {
+                        entries.push(entry);
+                    }
+                    current = Some(rest.to_string());
+                } else if !trimmed.is_empty() && line.starts_with(char::is_whitespace) {
+                    // Continuation of the active grouped entry, if any.
+                    if let Some(entry) = current.as_mut() {
+                        entry.push(' ');
+                        entry.push_str(trimmed);
+                    }
+                } else {
+                    // Blank / non-indented line ends the active entry.
+                    if let Some(entry) = current.take() {
+                        entries.push(entry);
+                    }
+                }
+            }
+            if let Some(entry) = current.take() {
+                entries.push(entry);
+            }
+            entries
+                .iter()
+                .any(|entry| head_has_method(head(entry), method))
+        }
+
+        let spec_path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../api/OCTOS_UI_PROTOCOL_V1_SPEC_2026-04-24.md"
+        );
+        let spec = std::fs::read_to_string(spec_path)
+            .unwrap_or_else(|e| panic!("cannot read UI Protocol spec at {spec_path}: {e}"));
+
+        // Slice the §6 catalog: its header up to the next top-level section.
+        let start = spec
+            .find("## 6. Envelope Model")
+            .expect("UI Protocol spec is missing `## 6. Envelope Model`");
+        let rest = &spec[start..];
+        // Bound §6 at the NEXT top-level (`## `) heading, whatever its number
+        // or title. Hardcoding `## 7.` would fail OPEN if §7 is ever renamed or
+        // renumbered — the slice would run to end-of-spec, and later semantic
+        // sections repeat these method names in list entries, so a deleted §6
+        // entry could still be satisfied. Fail closed: §6 must be followed by
+        // another top-level section.
+        let end = rest
+            .find("\n## ")
+            .expect("UI Protocol spec §6 must be followed by a `## ` section heading");
+        let section6 = &rest[..end];
+
+        let missing: Vec<&str> = octos_core::ui_protocol::UI_PROTOCOL_COMMAND_METHODS
+            .iter()
+            .chain(octos_core::ui_protocol::UI_PROTOCOL_NOTIFICATION_METHODS.iter())
+            .chain(APPUI_EXTRA_METHODS.iter())
+            .copied()
+            .filter(|method| !catalog_lists(section6, method))
+            .collect();
+
+        assert!(
+            missing.is_empty(),
+            "UI Protocol spec §6 catalog is missing advertised method(s): {missing:?}\n\
+             Add them under `## 6. Envelope Model` in \
+             api/OCTOS_UI_PROTOCOL_V1_SPEC_2026-04-24.md — the catalog is a \
+             hand-maintained mirror and must stay a superset of \
+             UI_PROTOCOL_COMMAND_METHODS / UI_PROTOCOL_NOTIFICATION_METHODS / \
+             APPUI_EXTRA_METHODS."
+        );
+    }
+
     #[tokio::test]
     async fn compaction_started_precedes_completed_in_lifecycle_batch() {
         // UPCR-2026-026: when the threshold trips, the lifecycle batch must

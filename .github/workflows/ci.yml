@@ -367,6 +367,12 @@ jobs:
       - name: API feature tests
         run: cargo test -p octos-cli --features api api::auth_handlers
 
+      # The §6 catalog guard lives in the feature-gated `api` module, so the
+      # unfeatured lib/integration runs above never compile it. Run it
+      # explicitly so UI Protocol spec/impl drift actually fails CI.
+      - name: UI Protocol §6 catalog guard (octos-cli)
+        run: cargo test -p octos-cli --features api spec_section6_catalog_lists_every_advertised_method -- --nocapture
+
       - name: gateway_runtime regression (octos-cli)
         run: cargo test -p octos-cli gateway_runtime::tests --features api -- --nocapture
 
