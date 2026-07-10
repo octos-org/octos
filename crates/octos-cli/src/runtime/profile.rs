@@ -699,6 +699,7 @@ impl ProfileRuntime {
         // session inherits the same memory_store.
         tools.register(octos_agent::RecallMemoryTool::new(memory_store.clone()));
         tools.register(octos_agent::SaveMemoryTool::new(memory_store.clone()));
+        tools.register(octos_agent::RecordMemoryUseTool::new(memory_store.clone()));
         if crate::config::MemoryConfig::refresh_enabled(config.memory.as_ref()) {
             tools.register(octos_agent::MemoryNoteTool::new(memory_store.clone()));
         }

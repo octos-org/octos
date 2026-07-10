@@ -360,6 +360,7 @@ impl McpClient {
         "voice_synthesize",
         "save_memory",
         "recall_memory",
+        "record_memory_use",
         "configure_tool",
     ];
 
