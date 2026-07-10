@@ -23,6 +23,7 @@
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
+use octos_agent::SandboxConfig;
 use octos_agent::mcp_server::{McpSessionDispatch, SessionLifecycleObserver};
 use octos_agent::task_supervisor::TaskLifecycleState;
 use octos_cli::commands::mcp_serve::{AgentLlmFactory, RealSessionDispatch, SessionDispatchConfig};
@@ -138,6 +139,14 @@ struct DispatchHarness {
 
 impl DispatchHarness {
     fn build(provider: Arc<dyn LlmProvider>, workspace: TempDir) -> Self {
+        Self::build_with_sandbox(provider, workspace, SandboxConfig::default())
+    }
+
+    fn build_with_sandbox(
+        provider: Arc<dyn LlmProvider>,
+        workspace: TempDir,
+        sandbox: SandboxConfig,
+    ) -> Self {
         let factory = AgentLlmFactory::scripted(provider);
         let data_dir = workspace.path().join(".octos-data");
         std::fs::create_dir_all(&data_dir).unwrap();
@@ -145,6 +154,7 @@ impl DispatchHarness {
             cwd: workspace.path().to_path_buf(),
             data_dir,
             max_iterations: 4,
+            sandbox,
         };
         Self {
             dispatch: RealSessionDispatch::new_for_test(config, factory),
@@ -500,4 +510,114 @@ async fn should_populate_validator_results_when_workspace_policy_declares_valida
     let entry = &outcome.validator_results[0];
     assert_eq!(entry["validator_id"], "deck-exists");
     assert_eq!(entry["status"], "pass");
+}
+
+/// Security regression for the M7.2 session-dispatch RCE: the per-session tool
+/// registry must confine `shell` to the workspace `cwd`. Before the fix the
+/// dispatch built tools with `with_builtins` (`NoSandbox`), so an outer MCP
+/// caller could drive `shell` to write anywhere the octos process could.
+///
+/// Self-gates on backend availability: where `SandboxMode::Auto` resolves to
+/// `NoSandbox` (no `sandbox-exec` on macOS / no `bwrap` on Linux), OS-level
+/// confinement cannot be exercised, so the test skips instead of failing.
+#[tokio::test]
+async fn should_block_shell_write_outside_workspace_via_sandbox() {
+    // Probe the resolved backend: NoSandbox wraps with `sh`/`cmd`, an
+    // enforcing backend wraps with `sandbox-exec`/`bwrap`/`docker`.
+    let sandbox = octos_agent::create_sandbox(&SandboxConfig::default());
+    let program = sandbox
+        .wrap_command("true", std::path::Path::new("."))
+        .as_std()
+        .get_program()
+        .to_string_lossy()
+        .into_owned();
+    if program == "sh" || program == "cmd" {
+        eprintln!(
+            "skipping should_block_shell_write_outside_workspace_via_sandbox: \
+             no enforcing sandbox backend on this host (wrap program = {program:?})"
+        );
+        return;
+    }
+    // Docker wraps the command into a container whose filesystem does not map
+    // the host `cwd`/sibling temp dirs the assertions below rely on, so the
+    // write-path checks don't apply.
+    if program.ends_with("docker") {
+        eprintln!(
+            "skipping should_block_shell_write_outside_workspace_via_sandbox: \
+             docker backend needs container-relative paths"
+        );
+        return;
+    }
+    let workspace = TempDir::new().unwrap();
+    let ws_path = workspace.path().to_path_buf();
+
+    // The backend binary exists, but on some hosts it is present yet unusable
+    // (`sandbox-exec` denied, `bwrap` without user namespaces, Docker with no
+    // daemon). Trusting the wrapper name alone would let the test proceed and
+    // then fail its own positive control. Actually run a harmless command
+    // through the wrapper — using the SAME absolute workspace the real run
+    // uses: bwrap binds the cwd (`--bind <cwd> <cwd> --chdir <cwd>`), and a
+    // relative "." would bind at the sandbox root and hide `/bin`, failing the
+    // probe (and silently skipping this regression) on an otherwise-working
+    // Linux backend. If it can't execute, OS confinement can't be exercised
+    // here, so skip rather than fail.
+    let probe_ok = sandbox
+        .wrap_command("true", &ws_path)
+        .status()
+        .await
+        .map(|status| status.success())
+        .unwrap_or(false);
+    if !probe_ok {
+        eprintln!(
+            "skipping should_block_shell_write_outside_workspace_via_sandbox: \
+             sandbox backend {program:?} is present but not runnable on this host"
+        );
+        return;
+    }
+    // A sibling temp dir that is NOT under the workspace cwd. The sandbox
+    // allows writes only under cwd, so a write here must be denied.
+    let escape_dir = TempDir::new().unwrap();
+    let escape_file = escape_dir.path().join("escape.txt");
+    // Positive control inside cwd — proves the shell actually executed under
+    // the sandbox, so an absent escape file is a real denial rather than the
+    // shell failing to start.
+    let inside_file = ws_path.join("inside.txt");
+    let command = format!(
+        "echo ok > {}; echo pwned > {}",
+        inside_file.display(),
+        escape_file.display()
+    );
+
+    let provider = ScriptedLlmProvider::new(vec![
+        tool_use(ToolCall {
+            id: "escape-1".to_string(),
+            name: "shell".to_string(),
+            arguments: json!({ "command": command }),
+            metadata: None,
+        }),
+        end_turn("attempted the writes"),
+    ]);
+    let harness = DispatchHarness::build(provider, workspace);
+    let observer = RecordingObserver::new();
+
+    // Outcome may be Ready or Failed depending on artifact resolution; the
+    // regression is about the filesystem effect, not the returned state.
+    let _ = harness
+        .dispatch
+        .run_session("coding", &json!({ "prompt": "run the command" }), &observer)
+        .await;
+
+    assert!(
+        inside_file.exists(),
+        "positive control failed: shell did not write inside the workspace cwd \
+         at {} — the sandbox test cannot distinguish a real denial from a shell \
+         that never ran",
+        inside_file.display()
+    );
+    assert!(
+        !escape_file.exists(),
+        "sandbox must block shell writes outside the workspace cwd; \
+         escape file was created at {}",
+        escape_file.display()
+    );
 }
