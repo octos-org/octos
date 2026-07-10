@@ -71,7 +71,11 @@ pub struct MemoryOverviewResponse {
     pub recent: Vec<DailyNote>,
     /// Entity bank pages (name + first summary line), name-sorted.
     pub entities: Vec<EntitySummary>,
+    /// True when the bank held more than [`MAX_PANEL_ENTITIES`] pages
+    /// and the list was cut off (codex #1611 r8 P2).
+    pub entities_truncated: bool,
     /// Staged capture notes waiting for the next refresh sweep.
+    /// Saturates at [`MAX_STAGING_NOTE_COUNT`].
     pub staging_notes: usize,
     /// Effective `memory.refresh.enabled` for this profile (host-level
     /// policy merged in — same semantics the runtime bootstrap uses).
@@ -97,6 +101,21 @@ static PANEL_SCAN_PERMITS: tokio::sync::Semaphore = tokio::sync::Semaphore::cons
 /// multi-GB "MEMORY.md" must not be slurped into memory. Over-cap
 /// files render as absent.
 const MAX_PANEL_FILE_BYTES: u64 = 2 * 1024 * 1024;
+
+/// Caps entity-bank enumeration per overview response (codex #1611 r8
+/// P2). The per-file cap and scan permits bound single reads and
+/// concurrency, not AGGREGATE work: a tenant-planted bank with tens of
+/// thousands of pages would otherwise make one request allocate every
+/// filename and open every page while holding a permit. Enumeration
+/// stops at the cap (+1 probe to detect overflow); the response flags
+/// `entities_truncated`.
+const MAX_PANEL_ENTITIES: usize = 256;
+
+/// Staging-note count saturation (codex #1611 r8 P1). The count is
+/// status surfacing ("notes waiting for the next sweep"), not an
+/// inventory — the anchored walk stops counting here so a planted
+/// million-entry staging tree costs bounded readdir work.
+const MAX_STAGING_NOTE_COUNT: usize = 1000;
 
 /// A directory handle every panel read is anchored to.
 ///
@@ -129,9 +148,18 @@ impl AnchoredDir {
         imp::read_file(&self.0, name)
     }
 
-    /// Names (stems) of `*.md` direct children.
-    fn list_md_stems(&self) -> Vec<String> {
-        imp::list_md_stems(&self.0)
+    /// Names (stems) of `*.md` direct children, at most `cap` of them.
+    /// The bool is true when more entries existed beyond the cap.
+    fn list_md_stems(&self, cap: usize) -> (Vec<String>, bool) {
+        imp::list_md_stems(&self.0, cap)
+    }
+
+    /// Count `*.md` direct children, saturating at `cap`. Same
+    /// no-follow anchoring as every other panel read — used for the
+    /// staging-note count so it can never follow a symlinked staging
+    /// tree into another profile (codex #1611 r8 P1).
+    fn count_md_entries(&self, cap: usize) -> usize {
+        imp::count_md_entries(&self.0, cap)
     }
 }
 
@@ -225,9 +253,9 @@ mod imp {
         Some((content, mtime))
     }
 
-    pub(super) fn list_md_stems(dir: &OwnedFd) -> Vec<String> {
+    pub(super) fn list_md_stems(dir: &OwnedFd, cap: usize) -> (Vec<String>, bool) {
         let Ok(mut entries) = rustix::fs::Dir::read_from(dir) else {
-            return Vec::new();
+            return (Vec::new(), false);
         };
         let mut names = Vec::new();
         while let Some(Ok(entry)) = entries.next() {
@@ -237,10 +265,34 @@ mod imp {
             if let Some(stem) = name.strip_suffix(".md")
                 && !stem.is_empty()
             {
+                if names.len() == cap {
+                    // One entry beyond the cap proves truncation; stop
+                    // enumerating so a huge bank costs bounded work.
+                    return (names, true);
+                }
                 names.push(stem.to_string());
             }
         }
-        names
+        (names, false)
+    }
+
+    pub(super) fn count_md_entries(dir: &OwnedFd, cap: usize) -> usize {
+        let Ok(mut entries) = rustix::fs::Dir::read_from(dir) else {
+            return 0;
+        };
+        let mut count = 0;
+        while let Some(Ok(entry)) = entries.next() {
+            let Ok(name) = entry.file_name().to_str() else {
+                continue;
+            };
+            if name.len() > ".md".len() && name.ends_with(".md") {
+                count += 1;
+                if count >= cap {
+                    break;
+                }
+            }
+        }
+        count
     }
 }
 
@@ -291,20 +343,49 @@ mod imp {
         Some((content, mtime))
     }
 
-    pub(super) fn list_md_stems(handle: &Handle) -> Vec<String> {
+    pub(super) fn list_md_stems(handle: &Handle, cap: usize) -> (Vec<String>, bool) {
         let Ok(entries) = std::fs::read_dir(&handle.1) else {
-            return Vec::new();
+            return (Vec::new(), false);
         };
-        entries
-            .flatten()
-            .filter_map(|e| {
-                e.file_name()
-                    .to_str()
-                    .and_then(|n| n.strip_suffix(".md"))
-                    .filter(|stem| !stem.is_empty())
-                    .map(str::to_string)
-            })
-            .collect()
+        let mut names = Vec::new();
+        for entry in entries.flatten() {
+            let Some(stem) = entry
+                .file_name()
+                .to_str()
+                .and_then(|n| n.strip_suffix(".md"))
+                .filter(|stem| !stem.is_empty())
+                .map(str::to_string)
+            else {
+                continue;
+            };
+            if names.len() == cap {
+                // One entry beyond the cap proves truncation; stop
+                // enumerating so a huge bank costs bounded work.
+                return (names, true);
+            }
+            names.push(stem);
+        }
+        (names, false)
+    }
+
+    pub(super) fn count_md_entries(handle: &Handle, cap: usize) -> usize {
+        let Ok(entries) = std::fs::read_dir(&handle.1) else {
+            return 0;
+        };
+        let mut count = 0;
+        for entry in entries.flatten() {
+            let is_md = entry
+                .file_name()
+                .to_str()
+                .is_some_and(|n| n.len() > ".md".len() && n.ends_with(".md"));
+            if is_md {
+                count += 1;
+                if count >= cap {
+                    break;
+                }
+            }
+        }
+        count
     }
 }
 
@@ -344,9 +425,13 @@ pub async fn my_memory(
         .ok_or(StatusCode::NOT_FOUND)?;
     let data_dir = ps.resolve_data_dir(&profile);
 
-    let store = octos_memory::MemoryStore::open(&data_dir)
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    // Path-derivation ONLY — `MemoryStore::open` would create_dir_all
+    // the memory tree BEFORE the anchored validation, turning a
+    // symlinked `memory` into a directory-existence oracle (target
+    // exists → empty state; dangling → 500) and materializing dirs on
+    // a read endpoint (codex #1611 r8 P2). The no-follow walk below is
+    // the sole authority on what exists.
+    let store = octos_memory::MemoryStore::at_memory_dir(data_dir.join("memory"));
 
     let empty = |state: &AppState, profile| {
         Json(MemoryOverviewResponse {
@@ -356,6 +441,7 @@ pub async fn my_memory(
             today: String::new(),
             recent: Vec::new(),
             entities: Vec::new(),
+            entities_truncated: false,
             staging_notes: 0,
             refresh_enabled: effective_refresh_enabled(state, profile),
         })
@@ -376,6 +462,7 @@ pub async fn my_memory(
         return Ok(empty(&state, &profile));
     };
     let rel_bank = rel_under(&memory_dir_path, &store.bank_entities_dir());
+    let rel_staging = rel_under(&memory_dir_path, &store.staging_notes_dir());
     let walk_root = data_dir.clone();
     // Bounded blocking-pool usage; waiters park as futures. The permit
     // is MOVED INTO the spawned task and dropped only when the blocking
@@ -409,10 +496,17 @@ pub async fn my_memory(
             }
         }
         // Entity bank — walked from the memory-dir FD (its components
-        // can be symlinks independently of memory/ itself).
+        // can be symlinks independently of memory/ itself). Names are
+        // enumerated up to MAX_PANEL_ENTITIES (codex #1611 r8 P2),
+        // sorted, THEN read — so aggregate page-open work is bounded
+        // and the rendered subset is deterministic for a given listing.
         let mut entities = Vec::new();
+        let mut entities_truncated = false;
         if let Some(bank) = rel_bank.and_then(|rel| mem.open_beneath(&rel)) {
-            for name in bank.list_md_stems() {
+            let (mut names, truncated) = bank.list_md_stems(MAX_PANEL_ENTITIES);
+            entities_truncated = truncated;
+            names.sort();
+            for name in names {
                 if let Some((content, _)) = bank.read_file(&format!("{name}.md")) {
                     entities.push(EntitySummary {
                         // The store's own parser — byte-identical to the
@@ -422,14 +516,32 @@ pub async fn my_memory(
                     });
                 }
             }
-            entities.sort_by(|a, b| a.name.cmp(&b.name));
         }
-        Some((long_term, today, recent, entities))
+        // Staging count through the SAME no-follow chain and permit as
+        // every other panel read (codex #1611 r8 P1 ×2): the previous
+        // normal-path count followed a symlinked `staging/notes` into
+        // other profiles' data (pending-note count disclosure) and ran
+        // AFTER the permit-owning task, so repeated requests could pile
+        // unpermitted, unbounded scans onto the runtime. An absent or
+        // symlinked staging tree counts as zero; the count saturates.
+        let staging_notes = rel_staging
+            .and_then(|rel| mem.open_beneath(&rel))
+            .map(|staging| staging.count_md_entries(MAX_STAGING_NOTE_COUNT))
+            .unwrap_or(0);
+        Some((
+            long_term,
+            today,
+            recent,
+            entities,
+            entities_truncated,
+            staging_notes,
+        ))
     })
     .await
     .ok()
     .flatten();
-    let Some((long_term_read, today, recent, entities)) = walked else {
+    let Some((long_term_read, today, recent, entities, entities_truncated, staging_notes)) = walked
+    else {
         return Ok(empty(&state, &profile));
     };
     let (long_term, long_term_updated_at) = match long_term_read {
@@ -438,7 +550,6 @@ pub async fn my_memory(
         Some((content, mtime)) => (content, mtime.map(rfc3339)),
         None => (String::new(), None),
     };
-    let staging_notes = store.count_staging_notes().await;
 
     Ok(Json(MemoryOverviewResponse {
         ok: true,
@@ -447,6 +558,7 @@ pub async fn my_memory(
         today,
         recent,
         entities,
+        entities_truncated,
         staging_notes,
         refresh_enabled: effective_refresh_enabled(&state, &profile),
     }))
@@ -470,9 +582,9 @@ pub async fn my_memory_entity(
         .ok_or(StatusCode::NOT_FOUND)?;
     let data_dir = ps.resolve_data_dir(&profile);
 
-    let store = octos_memory::MemoryStore::open(&data_dir)
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    // Path-derivation only — no create_dir_all on a read endpoint
+    // (codex #1611 r8 P2, same rationale as the overview handler).
+    let store = octos_memory::MemoryStore::at_memory_dir(data_dir.join("memory"));
     // Same traversal-character sanitization `read_entity` applies, on
     // top of the FD-anchored walk — a symlinked page, bank dir or any
     // ancestor is a plain 404.
@@ -776,6 +888,132 @@ mod tests {
             .unwrap();
         assert_eq!(resp2.long_term, "");
         assert!(resp2.entities.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn staging_note_count_is_anchored_not_path_followed() {
+        // codex #1611 r8 P1: the staging count used the normal-path
+        // store helper, which followed a symlinked `staging/notes`
+        // into another profile's data — disclosing the victim's
+        // pending-note count — and ran OUTSIDE the scan permit. It now
+        // rides the same FD-anchored walk as every other panel read:
+        // a symlinked staging tree counts as zero.
+        let (_dir, state, ps) = temp_state();
+        let victim = make_user_profile("victim", "Victim");
+        let attacker = make_user_profile("attacker", "Attacker");
+        ps.save(&victim).unwrap();
+        ps.save(&attacker).unwrap();
+
+        // Two real pending notes for the victim.
+        let victim_notes = ps.resolve_data_dir(&victim).join("memory/staging/notes");
+        tokio::fs::create_dir_all(&victim_notes).await.unwrap();
+        tokio::fs::write(victim_notes.join("a.md"), "note a")
+            .await
+            .unwrap();
+        tokio::fs::write(victim_notes.join("b.md"), "note b")
+            .await
+            .unwrap();
+
+        // Attacker: memory/staging/notes → victim's notes dir.
+        let attacker_staging = ps.resolve_data_dir(&attacker).join("memory/staging");
+        tokio::fs::create_dir_all(&attacker_staging).await.unwrap();
+        std::os::unix::fs::symlink(&victim_notes, attacker_staging.join("notes")).unwrap();
+
+        let Json(own) = my_memory(
+            State(state.clone()),
+            HeaderMap::new(),
+            user_identity("victim"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(own.staging_notes, 2, "own notes count through the walk");
+
+        let Json(stolen) = my_memory(State(state), HeaderMap::new(), user_identity("attacker"))
+            .await
+            .unwrap();
+        assert_eq!(
+            stolen.staging_notes, 0,
+            "a symlinked staging tree must count as zero, not disclose the victim's count"
+        );
+    }
+
+    #[tokio::test]
+    async fn entity_bank_enumeration_is_capped_with_truncation_flag() {
+        // codex #1611 r8 P2: per-file caps bound single reads, not
+        // aggregate work — a tenant-planted bank with thousands of
+        // pages must not make one overview enumerate and open all of
+        // them while holding a scan permit.
+        let (_dir, state, ps) = temp_state();
+        let profile = make_user_profile("hoarder", "Hoarder");
+        ps.save(&profile).unwrap();
+        let bank = ps.resolve_data_dir(&profile).join("memory/bank/entities");
+        tokio::fs::create_dir_all(&bank).await.unwrap();
+        for i in 0..(MAX_PANEL_ENTITIES + 5) {
+            std::fs::write(bank.join(format!("e{i:04}.md")), "Abstract: x\n").unwrap();
+        }
+
+        let Json(resp) = my_memory(State(state), HeaderMap::new(), user_identity("hoarder"))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.entities.len(),
+            MAX_PANEL_ENTITIES,
+            "enumeration must stop at the cap"
+        );
+        assert!(resp.entities_truncated, "over-cap bank must be flagged");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn read_endpoints_do_not_create_or_probe_the_memory_tree() {
+        // codex #1611 r8 P2: `MemoryStore::open` ran create_dir_all
+        // BEFORE the anchored validation. With `memory` symlinked, an
+        // existing daemon-readable target succeeded (empty state) while
+        // a dangling target 500'd — a directory-existence oracle — and
+        // a plain GET materialized directories. The handlers now derive
+        // paths without creating; the no-follow walk decides.
+        let (_dir, state, ps) = temp_state();
+        let profile = make_user_profile("probe", "Probe");
+        ps.save(&profile).unwrap();
+        let data_dir = ps.resolve_data_dir(&profile);
+        // Replace the scaffolded memory/ with a DANGLING symlink.
+        tokio::fs::remove_dir(data_dir.join("memory"))
+            .await
+            .unwrap();
+        std::os::unix::fs::symlink(data_dir.join("does-not-exist"), data_dir.join("memory"))
+            .unwrap();
+
+        let resp = my_memory(
+            State(state.clone()),
+            HeaderMap::new(),
+            user_identity("probe"),
+        )
+        .await
+        .expect("dangling memory symlink must render the empty state, not 500");
+        assert_eq!(resp.0.long_term, "");
+        assert_eq!(resp.0.staging_notes, 0);
+
+        let entity = my_memory_entity(
+            State(state),
+            HeaderMap::new(),
+            user_identity("probe"),
+            AxumPath("fleet".into()),
+        )
+        .await;
+        assert_eq!(entity.err(), Some(StatusCode::NOT_FOUND));
+
+        // The GETs must not have created anything: the symlink is
+        // intact and its target still absent.
+        let meta = std::fs::symlink_metadata(data_dir.join("memory")).unwrap();
+        assert!(
+            meta.file_type().is_symlink(),
+            "memory must remain a symlink"
+        );
+        assert!(
+            !data_dir.join("does-not-exist").exists(),
+            "read endpoints must not materialize the symlink target"
+        );
     }
 
     #[cfg(unix)]

@@ -728,8 +728,10 @@ impl MemoryStore {
 
     // --- Staging notes (memory-refresh capture layer) ---
 
-    /// Path to `staging/notes/`.
-    fn staging_notes_dir(&self) -> PathBuf {
+    /// Path to `staging/notes/` (pub for the memory panel's FD-anchored
+    /// walk, which needs the store-derived path to compute a relative
+    /// component chain — same role as [`Self::bank_entities_dir`]).
+    pub fn staging_notes_dir(&self) -> PathBuf {
         self.memory_dir.join("staging").join("notes")
     }
 
