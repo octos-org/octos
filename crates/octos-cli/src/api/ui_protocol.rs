@@ -820,12 +820,21 @@ impl SessionPermissionProfileStore {
     }
 
     fn get_state(&self, session_id: &SessionKey) -> StoredSessionPermissionProfile {
+        self.get_state_explicit(session_id).unwrap_or_default()
+    }
+
+    /// The stored selection ONLY if the session made an explicit
+    /// `/permissions` choice — `None` lets the caller apply a configurable
+    /// default (see `effective_session_permission_state`).
+    fn get_state_explicit(
+        &self,
+        session_id: &SessionKey,
+    ) -> Option<StoredSessionPermissionProfile> {
         self.selections
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .get(session_id)
             .copied()
-            .unwrap_or_default()
     }
 
     fn set(
@@ -845,6 +854,45 @@ impl SessionPermissionProfileStore {
                 },
             );
     }
+}
+
+/// Session permission state honoring the serve-level dangerous default
+/// (`--danger-full-access`, octos' analogue of Claude Code's
+/// `--dangerously-skip-permissions`): a session with NO explicit
+/// `/permissions` selection falls back to the full-access profile —
+/// sandbox off, network allowed, approvals never — instead of the gated
+/// workspace-write default. The flag is solo-gated at serve startup (the
+/// same keystone that gates selecting the profile from the menu), and an
+/// explicit per-session choice always wins.
+fn effective_session_permission_state(
+    state: &AppState,
+    session_id: &SessionKey,
+) -> StoredSessionPermissionProfile {
+    if let Some(stored) = session_permission_profiles().get_state_explicit(session_id) {
+        return stored;
+    }
+    // The dangerous default is granted ONLY where an EXPLICIT Full Access
+    // selection would also be allowed (codex P1/P2 on #1639): Local
+    // deployment mode (`effective_permissions_for_session` rejects
+    // DangerFullAccess for Tenant/Cloud — an unscoped default there would
+    // fail every unselected session/open) AND a session key that does not
+    // encode a non-solo tenant/cloud scope (the same defence-in-depth gate
+    // `permission_selection_allowed` applies, so a tenant-scoped session
+    // can't be handed host access via the fallback). A session that fails
+    // either check falls through to the gated workspace-write default.
+    if state.dangerous_default_permissions
+        && state.deployment_mode == crate::config::DeploymentMode::Local
+        && !session_id_encodes_non_solo_scope(session_id)
+    {
+        return StoredSessionPermissionProfile {
+            selection: octos_core::ui_protocol::PermissionProfileSelection {
+                mode: octos_core::ui_protocol::PermissionProfileMode::DangerFullAccess,
+                network: octos_core::ui_protocol::PermissionNetworkPolicy::Allow,
+            },
+            approval_policy: Some(octos_agent::ApprovalPolicy::Never),
+        };
+    }
+    StoredSessionPermissionProfile::default()
 }
 
 #[derive(Default)]
@@ -4538,18 +4586,16 @@ async fn ui_protocol_connection(
             }
             UiCommand::PermissionProfileSet(params) => {
                 let session_id = params.session_id.clone();
-                let profile_id = session_id
-                    .profile_id()
-                    .or(connection_profile_id)
-                    .map(ToOwned::to_owned);
                 match permission_profile_set_result(&state, params) {
                     Ok(result) => {
-                        if let Some(profile_id) = profile_id {
-                            state
-                                .session_cache
-                                .invalidate(&(profile_id, session_id))
-                                .await;
-                        }
+                        // Evict by SESSION across every profile (codex P1 ×2
+                        // on #1639): the runtime may be cached under a
+                        // session/open `params.profile_id` this connection no
+                        // longer knows, and `invalidate_session` also bumps
+                        // the session generation so a concurrent in-flight
+                        // bootstrap can't re-cache the pre-change (possibly
+                        // dangerous) permissions after the downgrade.
+                        state.session_cache.invalidate_session(&session_id).await;
                         let _ =
                             send_ui_rpc_result(&ws, id, UiRpcResult::PermissionProfileSet(result));
                     }
@@ -5267,18 +5313,12 @@ where
             }
             UiCommand::PermissionProfileSet(params) => {
                 let session_id = params.session_id.clone();
-                let profile_id = session_id
-                    .profile_id()
-                    .or(connection_profile_id_owned.as_deref())
-                    .map(ToOwned::to_owned);
                 match permission_profile_set_result(&state, params) {
                     Ok(result) => {
-                        if let Some(profile_id) = profile_id {
-                            state
-                                .session_cache
-                                .invalidate(&(profile_id, session_id))
-                                .await;
-                        }
+                        // Session-scoped eviction across all profiles + the
+                        // in-flight generation guard — see the sibling
+                        // dispatcher above (codex P1 ×2 on #1639).
+                        state.session_cache.invalidate_session(&session_id).await;
                         let _ =
                             send_ui_rpc_result(&ws, id, UiRpcResult::PermissionProfileSet(result));
                     }
@@ -6854,7 +6894,7 @@ fn effective_permissions_for_session(
         PermissionNetworkPolicy as Network, PermissionProfileMode as Mode,
     };
 
-    let permission_state = session_permission_profiles().get_state(session_id);
+    let permission_state = effective_session_permission_state(state, session_id);
     let requested = match permission_state.selection.mode {
         Mode::ReadOnly => octos_agent::PermissionProfile::ReadOnly,
         Mode::WorkspaceWrite => octos_agent::PermissionProfile::WorkspaceWrite,
@@ -6895,8 +6935,7 @@ fn permission_profile_list_result(
     state: &AppState,
     params: octos_core::ui_protocol::PermissionProfileListParams,
 ) -> octos_core::ui_protocol::PermissionProfileListResult {
-    let store = session_permission_profiles();
-    let current = store.get(&params.session_id);
+    let current = effective_session_permission_state(state, &params.session_id).selection;
     let profiles = permission_profile_supported_selections(state, &params.session_id);
     octos_core::ui_protocol::PermissionProfileListResult {
         session_id: params.session_id,
@@ -6910,7 +6949,7 @@ fn permission_profile_set_result(
     params: octos_core::ui_protocol::PermissionProfileSetParams,
 ) -> Result<octos_core::ui_protocol::PermissionProfileSetResult, RpcError> {
     let store = session_permission_profiles();
-    let previous_state = store.get_state(&params.session_id);
+    let previous_state = effective_session_permission_state(state, &params.session_id);
     let previous = previous_state.selection;
     let approval_policy =
         parse_permission_approval_policy(params.update.approval_policy.as_deref())?
@@ -6988,6 +7027,10 @@ async fn tool_status_list_result(
 ) -> Result<Value, RpcError> {
     let profile_runtime = ensure_session_profile_runtime(state, active_profile_id).await?;
     let session_runtime = if let Some(profile_runtime) = profile_runtime.as_ref() {
+        // Epoch BEFORE permission resolution so a concurrent downgrade
+        // can't pair a post-bump epoch with pre-bump permissions on a
+        // preempted caller (codex P1 round 4 on #1639).
+        let permissions_epoch = state.session_cache.session_generation(session_id);
         let permissions = effective_permissions_for_session(state, session_id)?;
         let workspace_hint = session_workspaces().get(session_id);
         Some(
@@ -6998,6 +7041,7 @@ async fn tool_status_list_result(
                     session_id.clone(),
                     workspace_hint,
                     permissions,
+                    permissions_epoch,
                 )
                 .await
                 .map_err(|error| {
@@ -7056,7 +7100,7 @@ async fn tool_status_list_result(
     let tool_name_refs: Vec<&str> = tool_names.iter().map(String::as_str).collect();
     let disabled_tool_refs: Vec<&str> = disabled_tool_names.iter().map(String::as_str).collect();
     let deferred_name_refs: Vec<&str> = recoverable_deferred.iter().map(String::as_str).collect();
-    let permission_state = session_permission_profiles().get_state(session_id);
+    let permission_state = effective_session_permission_state(state, session_id);
     let session_id_wire = session_id.to_string();
     let profile_id = active_profile_id.unwrap_or(MAIN_PROFILE_ID).to_owned();
 
@@ -7118,7 +7162,7 @@ fn runtime_policy_stamp_for_profile(
         )
     };
     let permission_state = session_id
-        .map(|session_id| session_permission_profiles().get_state(session_id))
+        .map(|session_id| effective_session_permission_state(state, session_id))
         .unwrap_or_default();
     let (approval_policy, sandbox_mode, permission_profile, filesystem_scope, network) =
         permission_selection_policy_fields(
@@ -9988,6 +10032,12 @@ async fn open_session_result(
         resolve_session_profile_runtime(state, active_profile_id.as_deref())
     {
         let hint = effective_workspace_hint.clone();
+        // Capture the session epoch BEFORE resolving permissions so any
+        // concurrent `permission/profile/set` (which bumps the epoch AFTER
+        // writing the store) that could have made these permissions stale
+        // also invalidates this epoch — the cache insert then rejects the
+        // stale bootstrap (codex P1 round 3 on #1639).
+        let permissions_epoch = state.session_cache.session_generation(&params.session_id);
         let permissions = effective_permissions_for_session(state, &params.session_id)?;
         let sandbox_override = validate_requested_session_sandbox(
             features,
@@ -10002,6 +10052,7 @@ async fn open_session_result(
                 hint,
                 permissions,
                 sandbox_override,
+                permissions_epoch,
             )
             .await
         {
@@ -10800,10 +10851,17 @@ pub(crate) async fn resolve_sessions_for_lookup(
         .or(routed_profile_id);
     if let Some(profile_runtime) = resolve_session_profile_runtime(state, active_profile_id) {
         let hint = session_workspaces().get(session_id);
+        let permissions_epoch = state.session_cache.session_generation(session_id);
         let permissions = effective_permissions_for_session(state, session_id).ok()?;
         if let Ok(runtime) = state
             .session_cache
-            .get_or_init_with_permissions(&profile_runtime, session_id.clone(), hint, permissions)
+            .get_or_init_with_permissions(
+                &profile_runtime,
+                session_id.clone(),
+                hint,
+                permissions,
+                permissions_epoch,
+            )
             .await
         {
             return Some(runtime.sessions.clone());
@@ -18001,6 +18059,7 @@ async fn run_native_code_review_turn(
         }
     };
     let hint = session_workspaces().get(&session_id);
+    let permissions_epoch = state.session_cache.session_generation(&session_id);
     let permissions = match effective_permissions_for_session(&state, &session_id) {
         Ok(permissions) => permissions,
         Err(error) => {
@@ -18022,7 +18081,13 @@ async fn run_native_code_review_turn(
     };
     let session_runtime = match state
         .session_cache
-        .get_or_init_with_permissions(&profile_runtime, session_id.clone(), hint, permissions)
+        .get_or_init_with_permissions(
+            &profile_runtime,
+            session_id.clone(),
+            hint,
+            permissions,
+            permissions_epoch,
+        )
         .await
     {
         Ok(runtime) => runtime,
@@ -19542,6 +19607,7 @@ async fn run_standalone_turn(
     // use that as the `workspace_hint`. Otherwise the bootstrap default
     // Tier-3 (`<profile_data_dir>/users/.../workspace`) wins.
     let hint = session_workspaces().get(&session_id);
+    let permissions_epoch = state.session_cache.session_generation(&session_id);
     let permissions = match effective_permissions_for_session(&state, &session_id) {
         Ok(permissions) => permissions,
         Err(error) => {
@@ -19563,7 +19629,13 @@ async fn run_standalone_turn(
     };
     let session_runtime = match state
         .session_cache
-        .get_or_init_with_permissions(&profile_runtime, session_id.clone(), hint, permissions)
+        .get_or_init_with_permissions(
+            &profile_runtime,
+            session_id.clone(),
+            hint,
+            permissions,
+            permissions_epoch,
+        )
         .await
     {
         Ok(rt) => rt,
@@ -31036,6 +31108,61 @@ ignore = []
             requested_workspace.as_deref(),
             Some(workspace.path().canonicalize().unwrap().as_path())
         );
+    }
+
+    /// `--danger-full-access` (solo-gated at serve startup): a session with
+    /// NO explicit `/permissions` selection resolves to the dangerous
+    /// full-access profile — sandbox off, network allowed, approvals never —
+    /// when the flag is set, and to the gated default when it is not. Tests
+    /// the pure resolver directly so it writes NOTHING to the process-global
+    /// permission store (a leaked entry there flakes concurrent tests); the
+    /// explicit-choice-wins branch is a structural early-return exercised by
+    /// the store round-trip in
+    /// `runtime_policy_stamp_exposes_effective_permission_fields`.
+    #[test]
+    fn dangerous_default_permissions_resolves_without_an_explicit_choice() {
+        use octos_core::ui_protocol::{
+            PermissionNetworkPolicy as Network, PermissionProfileMode as Mode,
+        };
+
+        // Fresh unique solo-scoped session — never stored, so the resolver
+        // takes the no-explicit-selection path in every case below.
+        let session_id = SessionKey("local:danger-default-pure-probe".into());
+
+        // Flag on, Local mode, solo-scoped session -> full access.
+        let mut state = AppState::empty_for_tests();
+        state.dangerous_default_permissions = true;
+        assert_eq!(state.deployment_mode, crate::config::DeploymentMode::Local);
+        let resolved = effective_session_permission_state(&state, &session_id);
+        assert_eq!(resolved.selection.mode, Mode::DangerFullAccess);
+        assert_eq!(resolved.selection.network, Network::Allow);
+        assert_eq!(
+            resolved.approval_policy,
+            Some(octos_agent::ApprovalPolicy::Never)
+        );
+
+        // Flag off -> the gated workspace-write default, approvals unset.
+        let plain = AppState::empty_for_tests();
+        let resolved = effective_session_permission_state(&plain, &session_id);
+        assert_eq!(resolved.selection.mode, Mode::WorkspaceWrite);
+        assert_eq!(resolved.selection.network, Network::Deny);
+        assert_eq!(resolved.approval_policy, None);
+
+        // Flag on but NON-Local deployment -> gated default (codex P2): the
+        // full-access profile is not grantable outside Local mode.
+        let mut tenant = AppState::empty_for_tests();
+        tenant.dangerous_default_permissions = true;
+        tenant.deployment_mode = crate::config::DeploymentMode::Tenant;
+        let resolved = effective_session_permission_state(&tenant, &session_id);
+        assert_eq!(resolved.selection.mode, Mode::WorkspaceWrite);
+
+        // Flag on, Local, but a NON-SOLO-scoped session key -> gated default
+        // (codex P1): the fallback must not hand a tenant-scoped session the
+        // host access the explicit path would reject.
+        let scoped = SessionKey("coding:tenant:m12-danger-default".into());
+        assert!(session_id_encodes_non_solo_scope(&scoped));
+        let resolved = effective_session_permission_state(&state, &scoped);
+        assert_eq!(resolved.selection.mode, Mode::WorkspaceWrite);
     }
 
     #[test]
