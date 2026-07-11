@@ -7817,18 +7817,23 @@ async fn raw_profile_llm_upsert(
     if params.set_primary || llm.primary.is_none() {
         // set_primary is lossless (mirrors `profile/llm/select`): a replaced
         // primary is demoted into the fallback list, and the promoted
-        // selection is de-duplicated out of it. Comparison is by selection
-        // *address* (family/model/route_id — all `profile/llm/select` can
-        // discriminate): a same-address upsert is an endpoint edit and
-        // replaces outright, or the old endpoint would linger as a fallback
-        // row the selector can never promote (codex P2).
+        // selection is de-duplicated out of it. The two decisions use
+        // different comparisons (codex P2 ×2):
+        // - demote by *address* (family/model/route_id — all the selector can
+        //   discriminate): a same-address upsert is an endpoint edit and
+        //   replaces outright, or the old endpoint would linger as a fallback
+        //   row `profile/llm/select` can never promote;
+        // - de-dup by full *identity* (address + base_url): endpoint-distinct
+        //   fallbacks are real failover chain entries (`config_from_profile`
+        //   threads every fallback's endpoint into the runtime), so only an
+        //   exact duplicate of the new primary leaves the list.
         if let Some(old_primary) = llm.primary.take() {
             if !same_llm_selection_address(&old_primary, &selection) {
                 upsert_llm_fallback(&mut llm.fallbacks, old_primary);
             }
         }
         llm.fallbacks
-            .retain(|fallback| !same_llm_selection_address(fallback, &selection));
+            .retain(|fallback| !same_llm_selection_identity(fallback, &selection));
         llm.primary = Some(selection);
     } else {
         upsert_llm_fallback(&mut llm.fallbacks, selection);
@@ -26246,6 +26251,103 @@ mod tests {
         assert!(
             llm.fallbacks.is_empty(),
             "endpoint edits must not accrete unselectable fallback rows: {llm:?}"
+        );
+    }
+
+    /// Endpoint-distinct fallbacks (same family/model/route_id, different
+    /// base_url) are real failover-chain entries, not selector duplicates —
+    /// `config_from_profile` threads every fallback's endpoint into the
+    /// runtime. A set_primary upsert must not sweep them away (codex P2 on
+    /// the address-comparison fix); only an exact-identity duplicate of the
+    /// new primary leaves the list.
+    #[tokio::test]
+    async fn llm_upsert_preserves_endpoint_distinct_failover_fallbacks() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = Arc::new(local_profile_state(dir.path()));
+        let upsert = |base_url: &str, set_primary: bool| {
+            RpcRequest::new(
+                format!("u-{base_url}-{set_primary}"),
+                APPUI_METHOD_PROFILE_LLM_UPSERT.to_string(),
+                json!({
+                    "profile_id": "dev",
+                    "selection": {
+                        "family_id": "deepseek",
+                        "model_id": "deepseek-chat",
+                        "route": { "route_id": "official", "base_url": base_url },
+                    },
+                    "set_primary": set_primary,
+                }),
+            )
+        };
+        let llm_of = |state: &Arc<AppState>| {
+            state
+                .profile_store
+                .as_ref()
+                .unwrap()
+                .get("dev")
+                .unwrap()
+                .unwrap()
+                .config
+                .llm
+                .clone()
+                .unwrap()
+        };
+
+        // Primary at ONE, plus a same-address failover mirror at MIRROR.
+        for (url, primary) in [
+            ("https://one.example", true),
+            ("https://mirror.example", false),
+        ] {
+            raw_profile_llm_upsert(&state, &upsert(url, primary), None)
+                .await
+                .expect("seed");
+        }
+
+        // Endpoint edit of the primary: the mirror fallback must survive.
+        raw_profile_llm_upsert(&state, &upsert("https://two.example", true), None)
+            .await
+            .expect("endpoint edit");
+        let llm = llm_of(&state);
+        assert_eq!(
+            llm.primary
+                .as_ref()
+                .unwrap()
+                .route
+                .as_ref()
+                .unwrap()
+                .base_url
+                .as_deref(),
+            Some("https://two.example")
+        );
+        assert_eq!(
+            llm.fallbacks
+                .iter()
+                .map(|fb| fb.route.as_ref().unwrap().base_url.as_deref().unwrap())
+                .collect::<Vec<_>>(),
+            vec!["https://mirror.example"],
+            "endpoint-distinct failover fallback must survive a set_primary upsert"
+        );
+
+        // Promoting the exact mirror identity removes it from the fallback
+        // list (true duplicate) rather than leaving two copies.
+        raw_profile_llm_upsert(&state, &upsert("https://mirror.example", true), None)
+            .await
+            .expect("promote mirror");
+        let llm = llm_of(&state);
+        assert_eq!(
+            llm.primary
+                .as_ref()
+                .unwrap()
+                .route
+                .as_ref()
+                .unwrap()
+                .base_url
+                .as_deref(),
+            Some("https://mirror.example")
+        );
+        assert!(
+            llm.fallbacks.is_empty(),
+            "promoting the exact identity must de-dup it out of the fallbacks: {llm:?}"
         );
     }
 
