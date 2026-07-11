@@ -1289,8 +1289,8 @@ mod tests {
                 node_reporter.report(ProgressEvent::CostUpdate {
                     session_input_tokens: 320,
                     session_output_tokens: 110,
-                    response_input_tokens: 320,
-                    response_output_tokens: 110,
+                    turn_input_tokens: 320,
+                    turn_output_tokens: 110,
                     response_cost: Some(0.0008),
                     session_cost: Some(0.0008),
                     model: Some("claude-sonnet".into()),

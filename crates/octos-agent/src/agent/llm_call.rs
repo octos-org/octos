@@ -299,10 +299,14 @@ impl Agent {
                         match self.llm.chat(messages, tools_spec, config).await {
                             Ok(resp) if !Self::is_retriable_response(&resp) => {
                                 info!("non-streaming fallback succeeded after stream failures");
-                                // Stream-error path: discarded attempts never
-                                // yielded usage, so the fallback's own cost
-                                // (plus any retry_spend from earlier empty
-                                // responses) is the whole attribution.
+                                // Codex #1632 r2 P2: merge the accumulated
+                                // retry usage here like the empty-response
+                                // fallback does — earlier EMPTY attempts (not
+                                // just stream errors) can be behind us on
+                                // this path, and `retry_spend` already prices
+                                // them; returning fallback-only tokens next
+                                // to a spend that includes both would skew
+                                // the persisted token/cost pairing.
                                 let final_cost = self.response_usage_cost(
                                     resp.usage.input_tokens,
                                     resp.usage.output_tokens,
@@ -312,6 +316,9 @@ impl Agent {
                                     (None, None) => None,
                                     (a, b) => Some(a.unwrap_or(0.0) + b.unwrap_or(0.0)),
                                 };
+                                let mut resp = resp;
+                                resp.usage.input_tokens += retry_usage.input_tokens;
+                                resp.usage.output_tokens += retry_usage.output_tokens;
                                 return Ok((resp, false, attributed_cost));
                             }
                             Ok(_) => {

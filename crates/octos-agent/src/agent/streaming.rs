@@ -556,8 +556,8 @@ impl Agent {
         self.reporter().report(ProgressEvent::CostUpdate {
             session_input_tokens,
             session_output_tokens,
-            response_input_tokens: response_usage.input_tokens,
-            response_output_tokens: response_usage.output_tokens,
+            turn_input_tokens: total_usage.input_tokens,
+            turn_output_tokens: total_usage.output_tokens,
             response_cost,
             session_cost,
             model,

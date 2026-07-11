@@ -402,6 +402,8 @@ mod tests {
         let event = ProgressEvent::CostUpdate {
             session_input_tokens: 100,
             session_output_tokens: 50,
+            turn_input_tokens: 100,
+            turn_output_tokens: 50,
             response_cost: Some(0.001),
             session_cost: Some(0.005),
             model: None,
@@ -423,6 +425,8 @@ mod tests {
         let event = ProgressEvent::CostUpdate {
             session_input_tokens: 200,
             session_output_tokens: 100,
+            turn_input_tokens: 200,
+            turn_output_tokens: 100,
             response_cost: None,
             session_cost: None,
             model: None,
@@ -442,6 +446,8 @@ mod tests {
         let event = ProgressEvent::CostUpdate {
             session_input_tokens: 12,
             session_output_tokens: 7,
+            turn_input_tokens: 12,
+            turn_output_tokens: 7,
             response_cost: None,
             session_cost: None,
             model: Some("deepseek-v4-pro".into()),
@@ -457,6 +463,8 @@ mod tests {
         let event = ProgressEvent::CostUpdate {
             session_input_tokens: 1,
             session_output_tokens: 1,
+            turn_input_tokens: 1,
+            turn_output_tokens: 1,
             response_cost: None,
             session_cost: None,
             model: None,
@@ -545,6 +553,8 @@ mod tests {
                 ProgressEvent::CostUpdate {
                     session_input_tokens: 0,
                     session_output_tokens: 0,
+                    turn_input_tokens: 0,
+                    turn_output_tokens: 0,
                     response_cost: None,
                     session_cost: None,
                     model: None,

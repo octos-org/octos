@@ -8665,6 +8665,67 @@ impl SessionActor {
                 handle.stop().await;
             }
 
+            // Codex #1632 r2 P2: account BEFORE any response-suppression
+            // exit (slash-command cancellation, pending-approval refusal)
+            // — the tokens were consumed regardless of whether the reply
+            // is shown. Same numbers, same attribution rules as
+            // `record_usage_event` on foreground turns.
+            if let Ok(Ok(conv_response)) = &result {
+                let overflow_model = conv_response
+                    .provider_metadata
+                    .as_ref()
+                    .map(|meta| meta.model.clone());
+                let overflow_cost = conv_response.estimated_spend_usd.or_else(|| {
+                    overflow_model
+                        .as_deref()
+                        .and_then(model_pricing)
+                        .map(|pricing| {
+                            pricing.cost(
+                                conv_response.token_usage.input_tokens,
+                                conv_response.token_usage.output_tokens,
+                            )
+                        })
+                });
+                overflow_session_usage.fold_run(
+                    u64::from(conv_response.token_usage.input_tokens),
+                    u64::from(conv_response.token_usage.output_tokens),
+                    overflow_cost,
+                );
+                if let Some(ledger) = overflow_usage_ledger.as_ref() {
+                    let event = UsageEvent::completed_run(
+                        overflow_usage_profile_id.clone(),
+                        session_key.to_string(),
+                        uuid::Uuid::now_v7().to_string(),
+                        conv_response
+                            .provider_metadata
+                            .as_ref()
+                            .map(|meta| meta.provider.clone()),
+                        overflow_model,
+                        conv_response
+                            .provider_metadata
+                            .as_ref()
+                            .and_then(|meta| meta.endpoint.clone()),
+                        u64::from(conv_response.token_usage.input_tokens),
+                        u64::from(conv_response.token_usage.output_tokens),
+                        overflow_cost,
+                        if overflow_cost.is_some() {
+                            UsageCostSource::CatalogEstimate
+                        } else {
+                            UsageCostSource::Unavailable
+                        },
+                        channel.clone(),
+                        Some("speculative_overflow".to_string()),
+                    );
+                    if let Err(error) = ledger.record(event).await {
+                        warn!(
+                            session = %session_key,
+                            error = %error,
+                            "failed to record overflow usage event"
+                        );
+                    }
+                }
+            }
+
             // If a slash command was handled while this overflow task was
             // running, suppress the response so it doesn't preempt the
             // command reply (GitHub issue #21).
@@ -8720,62 +8781,6 @@ impl SessionActor {
                         // blocking master continuations / new overflow turns.
                         overflow_counter.fetch_sub(1, Ordering::Release);
                         return;
-                    }
-                    // Fold this overflow run into the session usage base and
-                    // the durable ledger — same numbers, same attribution
-                    // rules as `record_usage_event` on foreground turns.
-                    let overflow_model = conv_response
-                        .provider_metadata
-                        .as_ref()
-                        .map(|meta| meta.model.clone());
-                    let overflow_cost = conv_response.estimated_spend_usd.or_else(|| {
-                        overflow_model
-                            .as_deref()
-                            .and_then(model_pricing)
-                            .map(|pricing| {
-                                pricing.cost(
-                                    conv_response.token_usage.input_tokens,
-                                    conv_response.token_usage.output_tokens,
-                                )
-                            })
-                    });
-                    overflow_session_usage.fold_run(
-                        u64::from(conv_response.token_usage.input_tokens),
-                        u64::from(conv_response.token_usage.output_tokens),
-                        overflow_cost,
-                    );
-                    if let Some(ledger) = overflow_usage_ledger.as_ref() {
-                        let event = UsageEvent::completed_run(
-                            overflow_usage_profile_id.clone(),
-                            session_key.to_string(),
-                            uuid::Uuid::now_v7().to_string(),
-                            conv_response
-                                .provider_metadata
-                                .as_ref()
-                                .map(|meta| meta.provider.clone()),
-                            overflow_model.clone(),
-                            conv_response
-                                .provider_metadata
-                                .as_ref()
-                                .and_then(|meta| meta.endpoint.clone()),
-                            u64::from(conv_response.token_usage.input_tokens),
-                            u64::from(conv_response.token_usage.output_tokens),
-                            overflow_cost,
-                            if overflow_cost.is_some() {
-                                UsageCostSource::CatalogEstimate
-                            } else {
-                                UsageCostSource::Unavailable
-                            },
-                            channel.clone(),
-                            Some("speculative_overflow".to_string()),
-                        );
-                        if let Err(error) = ledger.record(event).await {
-                            warn!(
-                                session = %session_key,
-                                error = %error,
-                                "failed to record overflow usage event"
-                            );
-                        }
                     }
                     let final_content = finalize_assistant_content(
                         &session_key,

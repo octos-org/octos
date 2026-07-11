@@ -149,12 +149,15 @@ pub enum ProgressEvent {
         /// the live turn. u64 because sessions outlive single turns.
         session_input_tokens: u64,
         session_output_tokens: u64,
-        /// THIS response's token counts. Metrics counters must increment
-        /// by these — adding the cumulative fields per event over-counts
-        /// (and overflows the u32 metrics boundary now that the
-        /// cumulative fields are session-wide u64).
-        response_input_tokens: u32,
-        response_output_tokens: u32,
+        /// TURN-cumulative token counts (every response recorded this
+        /// turn so far, including ones that emit no cost update of their
+        /// own — mid-turn tool iterations, the verifier). Metrics
+        /// counters meter the DELTA between successive events, so
+        /// nothing is dropped when only the terminal response emits;
+        /// the session_* fields are unsuitable for that (their base
+        /// includes pre-turn history the per-turn reporter never saw).
+        turn_input_tokens: u32,
+        turn_output_tokens: u32,
         /// Cost of this response (None if pricing unknown).
         response_cost: Option<f64>,
         /// Cumulative session cost: each completed run and each response
