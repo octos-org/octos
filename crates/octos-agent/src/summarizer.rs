@@ -438,7 +438,7 @@ rather than appending duplicates.\n\n",
 ///   thread is not itself inside the runtime. This keeps the trait
 ///   signature synchronous without forcing callers into multi-threaded
 ///   scheduling.
-fn run_llm_call_blocking<F, T>(future: F) -> T
+pub(crate) fn run_llm_call_blocking<F, T>(future: F) -> T
 where
     F: std::future::Future<Output = T> + Send + 'static,
     T: Send + 'static,

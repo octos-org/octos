@@ -2043,6 +2043,47 @@ fn appui_context_compact_keep_items() -> usize {
         .unwrap_or(APPUI_CONTEXT_COMPACT_KEEP_ITEMS)
 }
 
+/// Whether AppUI context compaction uses the LLM-summarization path
+/// (`OCTOS_CONTEXT_COMPACT_LLM=1`) instead of the deterministic heuristic.
+/// Default OFF (heuristic): the LLM path makes a real model call — a
+/// higher-quality handoff summary but slower (seconds) — and always falls
+/// back to the heuristic on any error/timeout, so it can never break a turn.
+fn appui_context_compact_llm_enabled() -> bool {
+    std::env::var("OCTOS_CONTEXT_COMPACT_LLM")
+        .ok()
+        .map(|raw| {
+            matches!(
+                raw.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "on" | "yes"
+            )
+        })
+        .unwrap_or(false)
+}
+
+/// Produce a compaction summary for the AppUI path: LLM-summarization when the
+/// switch is on and a provider is available, otherwise the heuristic — and the
+/// heuristic is also the fallback whenever an LLM summary errors or times out.
+/// Both paths return a plain `String` for the unchanged `compact_context`.
+fn appui_compaction_summary(
+    llm_provider: &Arc<dyn octos_llm::LlmProvider>,
+    messages: &[octos_core::Message],
+    budget_tokens: u32,
+) -> String {
+    if appui_context_compact_llm_enabled() {
+        if let Some(summary) = octos_agent::compaction::llm_compaction_summary(
+            llm_provider,
+            messages,
+            budget_tokens,
+            std::time::Duration::from_secs(
+                octos_agent::compaction::DEFAULT_LLM_COMPACTION_TIMEOUT_SECS,
+            ),
+        ) {
+            return summary;
+        }
+    }
+    octos_agent::compaction::compact_messages(messages, budget_tokens)
+}
+
 fn appui_context_prompt_policy(llm_provider: &dyn octos_llm::LlmProvider) -> PromptBuildPolicy {
     PromptBuildPolicy {
         include_reasoning: false,
@@ -2060,7 +2101,7 @@ fn appui_context_history_for_agent(
     data_dir: &Path,
     session_id: &SessionKey,
     history: &[Message],
-    llm_provider: &dyn octos_llm::LlmProvider,
+    llm_provider: &Arc<dyn octos_llm::LlmProvider>,
     trigger: &str,
 ) -> (
     Vec<Message>,
@@ -2075,8 +2116,8 @@ fn appui_context_history_for_agent(
         ledger_status = ?ledger_status,
         "appui context manager loaded for turn"
     );
-    let threshold = appui_context_compact_threshold_tokens(llm_provider);
-    let policy = appui_context_prompt_policy(llm_provider);
+    let threshold = appui_context_compact_threshold_tokens(llm_provider.as_ref());
+    let policy = appui_context_prompt_policy(llm_provider.as_ref());
     let state = manager.state();
     if state.token_estimate > threshold {
         // UPCR-2026-026: the started event precedes the (synchronous) pass;
@@ -2092,7 +2133,7 @@ fn appui_context_history_for_agent(
         ));
         let before = manager.for_prompt(&policy);
         let summary_budget = threshold.clamp(256, 4096) as u32;
-        let summary = octos_agent::compaction::compact_messages(&before.messages, summary_budget);
+        let summary = appui_compaction_summary(llm_provider, &before.messages, summary_budget);
         let record = manager.compact_context(
             summary,
             CompactContextPolicy {
@@ -2248,6 +2289,11 @@ struct AppUiPromptContextBridge {
     /// [`Self::prepare_prompt`] emits `ContextCompactionStarted`/`Completed`
     /// through this hook. `None` in tests and paths without a client.
     context_lifecycle_notify: Option<ContextLifecycleNotify>,
+    /// Provider for the OPT-IN LLM-summarization compaction path
+    /// (`OCTOS_CONTEXT_COMPACT_LLM`). `None` = heuristic only (also the
+    /// fallback whenever an LLM summary fails). Set on the per-turn bridge;
+    /// child/spawn bridges leave it `None`.
+    llm_compaction_provider: Option<Arc<dyn octos_llm::LlmProvider>>,
 }
 
 impl AppUiPromptContextBridge {
@@ -2264,11 +2310,17 @@ impl AppUiPromptContextBridge {
             scratch: StdMutex::new(None),
             voice_turn,
             context_lifecycle_notify: None,
+            llm_compaction_provider: None,
         }
     }
 
     fn with_context_lifecycle_notify(mut self, notify: ContextLifecycleNotify) -> Self {
         self.context_lifecycle_notify = Some(notify);
+        self
+    }
+
+    fn with_llm_compaction_provider(mut self, provider: Arc<dyn octos_llm::LlmProvider>) -> Self {
+        self.llm_compaction_provider = Some(provider);
         self
     }
 
@@ -2387,8 +2439,12 @@ impl PromptContextManager for AppUiPromptContextBridge {
             }
             let before = scratch.manager.for_prompt(&policy);
             let summary_budget = threshold.clamp(256, 4096) as u32;
-            let summary =
-                octos_agent::compaction::compact_messages(&before.messages, summary_budget);
+            let summary = match &self.llm_compaction_provider {
+                Some(provider) => {
+                    appui_compaction_summary(provider, &before.messages, summary_budget)
+                }
+                None => octos_agent::compaction::compact_messages(&before.messages, summary_budget),
+            };
             let record = scratch.manager.compact_context(
                 summary,
                 CompactContextPolicy {
@@ -19961,7 +20017,7 @@ async fn run_standalone_turn(
             &session_runtime.profile.data_dir,
             &session_id,
             &raw_history,
-            llm_provider.as_ref(),
+            &llm_provider,
             "appui_pre_turn",
         );
     for notification in context_lifecycle_notifications {
@@ -20852,7 +20908,8 @@ async fn run_standalone_turn(
             context_manager.clone(),
             voice_turn_hint,
         )
-        .with_context_lifecycle_notify(context_lifecycle_notify),
+        .with_context_lifecycle_notify(context_lifecycle_notify)
+        .with_llm_compaction_provider(llm_provider.clone()),
     );
     request_agent = request_agent.with_prompt_context_manager(prompt_context_bridge);
     if let Some(hooks) = session_runtime.profile.hook_executor.clone() {
@@ -26183,7 +26240,7 @@ mod tests {
             });
         }
 
-        let provider = TinyContextProvider;
+        let provider: Arc<dyn octos_llm::LlmProvider> = Arc::new(TinyContextProvider);
         let (_messages, _manager, notifications) =
             appui_context_history_for_agent(dir.path(), &session, &history, &provider, "preflight");
 
