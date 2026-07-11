@@ -7682,6 +7682,26 @@ async fn raw_profile_llm_select(
         ));
     };
     let already_primary = target.is_none();
+    // Never persist a selection the runtime cannot activate: the eviction
+    // below would silently keep the CURRENT provider chain for live sessions
+    // (ensure fails with a warn) while the next `session/open` fails
+    // bootstrap outright — a keyless primary bricks the profile until the
+    // file is hand-edited. Reject up front, naming the missing key. The
+    // idempotent re-select of a keyless primary rejects too: that state
+    // needs the key (or a different selection), not an "applied" echo.
+    {
+        let target_selection = match target {
+            Some(index) => &llm.fallbacks[index],
+            None => llm
+                .primary
+                .as_ref()
+                .expect("already_primary implies a matched primary"),
+        };
+        if let Err(error) = llm_selection_activation_error(&profile, target_selection) {
+            profile.config.llm = Some(llm);
+            return Err(error);
+        }
+    }
     let mut applied = already_primary;
     if !already_primary {
         let Some(index) = target else {
@@ -7935,6 +7955,42 @@ fn same_llm_selection_address(
     left.family_id == right.family_id
         && left.model_id == right.model_id
         && route_address(left) == route_address(right)
+}
+
+/// `Err` when the selection's provider requires an API key that resolves
+/// nowhere (auth store, profile `env_vars`, keychain, process env — the same
+/// chain the runtime bootstrap uses via [`crate::config::Config::
+/// get_api_key_with_env`]). Families the registry marks keyless (or unknown
+/// families) pass. The caller must not persist a selection this rejects.
+fn llm_selection_activation_error(
+    profile: &crate::profiles::UserProfile,
+    selection: &crate::profiles::LlmModelSelectionConfig,
+) -> Result<(), RpcError> {
+    let family = selection.family_id.as_deref().unwrap_or_default();
+    let requires_key = octos_llm::registry::lookup(family)
+        .map(|entry| entry.requires_api_key)
+        .unwrap_or(false);
+    if !requires_key {
+        return Ok(());
+    }
+    let env_override = selection
+        .route
+        .as_ref()
+        .and_then(|route| route.api_key_env.as_deref());
+    let config = crate::profiles::config_from_profile(profile, None, None);
+    if config.get_api_key_with_env(family, env_override).is_ok() {
+        return Ok(());
+    }
+    let model = selection.model_id.as_deref().unwrap_or("model");
+    let var = env_override
+        .map(String::from)
+        .or_else(|| crate::config::Config::provider_default_env_var(family))
+        .unwrap_or_else(|| format!("{}_API_KEY", family.to_uppercase()));
+    Err(RpcError::invalid_params(format!(
+        "cannot activate {family}/{model}: {var} is not set — add the key via the \
+         onboarding key step (or `octos auth login`) before selecting it"
+    ))
+    .with_data(json!({ "kind": "llm_key_missing", "env": var })))
 }
 
 async fn raw_profile_llm_test(
@@ -26040,6 +26096,10 @@ mod tests {
                         "model_id": model,
                         "route": { "route_id": "official" },
                     },
+                    // Selection validates key availability: seed one per
+                    // family so the selects below exercise promotion, not
+                    // the keyless-rejection path.
+                    "api_key": format!("test-{family}-key"),
                     "set_primary": set_primary,
                 }),
             );
@@ -26117,6 +26177,103 @@ mod tests {
             .await
             .expect_err("unconfigured model must reject");
         assert_eq!(error.code, rpc_error_codes::RESOURCE_NOT_FOUND);
+    }
+
+    /// Selecting a model whose provider key resolves nowhere must REJECT
+    /// without persisting: the runtime re-ensure would fail silently (the
+    /// live session keeps the old chain while the UI claims the switch), and
+    /// the persisted keyless primary bricks the next `session/open` at
+    /// bootstrap. Found live: a user selected zai/glm-5.2 with no
+    /// ZAI_API_KEY — "Model selected" echoed, the footer snapped back, and
+    /// the next launch failed to boot.
+    #[tokio::test]
+    async fn llm_select_rejects_keyless_models_before_persisting() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = Arc::new(local_profile_state(dir.path()));
+        let upsert = |model: &str, api_key: Option<&str>, set_primary: bool| {
+            let mut body = json!({
+                "profile_id": "dev",
+                "selection": {
+                    "family_id": if model.starts_with("glm") { "zai" } else { "deepseek" },
+                    "model_id": model,
+                    "route": {
+                        "route_id": "official",
+                        // A test-scoped variable name so resolution can't
+                        // fall through to a real key in the process env.
+                        "api_key_env": format!("OCTOS_TEST_{}_KEY", model.replace(['-', '.'], "_").to_uppercase()),
+                    },
+                },
+                "set_primary": set_primary,
+            });
+            if let Some(api_key) = api_key {
+                body["api_key"] = json!(api_key);
+            }
+            RpcRequest::new(
+                format!("u-{model}-{}", api_key.is_some()),
+                APPUI_METHOD_PROFILE_LLM_UPSERT.to_string(),
+                body,
+            )
+        };
+
+        raw_profile_llm_upsert(&state, &upsert("deepseek-chat", Some("dk"), true), None)
+            .await
+            .expect("seed keyed primary");
+        raw_profile_llm_upsert(&state, &upsert("glm-5.2", None, false), None)
+            .await
+            .expect("seed keyless fallback");
+
+        let select = |id: &str| {
+            RpcRequest::new(
+                id.to_string(),
+                APPUI_METHOD_PROFILE_LLM_SELECT.to_string(),
+                json!({ "profile_id": "dev", "model_id": "glm-5.2" }),
+            )
+        };
+        let error = raw_profile_llm_select(&state, &select("s-keyless"), None)
+            .await
+            .expect_err("keyless select must reject");
+        assert_eq!(error.code, rpc_error_codes::INVALID_PARAMS);
+        assert_eq!(
+            error.data.as_ref().and_then(|data| data.get("kind")),
+            Some(&json!("llm_key_missing")),
+            "got {error:?}"
+        );
+        assert!(
+            error.message.contains("OCTOS_TEST_GLM_5_2_KEY"),
+            "message must name the missing variable: {}",
+            error.message
+        );
+        let profile = state
+            .profile_store
+            .as_ref()
+            .unwrap()
+            .get("dev")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            profile
+                .config
+                .llm
+                .as_ref()
+                .unwrap()
+                .primary
+                .as_ref()
+                .unwrap()
+                .model_id
+                .as_deref(),
+            Some("deepseek-chat"),
+            "rejected select must not persist"
+        );
+
+        // Adding the key (the onboarding key step) makes the same select work.
+        raw_profile_llm_upsert(&state, &upsert("glm-5.2", Some("zk"), false), None)
+            .await
+            .expect("re-save with key");
+        let result = raw_profile_llm_select(&state, &select("s-keyed"), None)
+            .await
+            .expect("keyed select applies");
+        assert_eq!(result["applied"], true);
+        assert_eq!(result["selected"]["model"], "glm-5.2");
     }
 
     /// `profile/llm/upsert` with `set_primary` must be lossless: replacing
@@ -26519,6 +26676,9 @@ mod tests {
                         "model_id": "glm-5.2",
                         "route": { "route_id": route },
                     },
+                    // Key present so the exact-route select below tests
+                    // route discrimination, not keyless rejection.
+                    "api_key": "test-zai-key",
                     "set_primary": set_primary,
                 }),
             );
