@@ -8019,20 +8019,27 @@ fn llm_selection_activation_error(
         .route
         .as_ref()
         .and_then(|route| route.api_type.as_deref());
-    let requires_key = match api_type {
-        Some("anthropic") | Some("responses") => true,
-        _ if family == "custom" => true,
-        _ => match octos_llm::registry::lookup(family) {
-            Some(entry) => entry.requires_api_key,
-            None => {
-                return Err(RpcError::invalid_params(format!(
-                    "cannot activate {family}/{model}: unknown provider family — valid: \
-                     custom, {}",
-                    octos_llm::registry::all_names().join(", ")
-                ))
-                .with_data(json!({ "kind": "llm_provider_unresolved", "family": family })));
-            }
-        },
+    // Mirror `create_provider_with_api_type`'s ORDER exactly: `custom`
+    // short-circuits first, then the registry lookup gates everything —
+    // including the protocol overrides, which the factory only reaches for
+    // a registered entry. An unknown family with `api_type: anthropic` and
+    // a key would otherwise validate here yet still fail the factory's
+    // lookup at bootstrap (codex P1 round 2).
+    let requires_key = if family == "custom" {
+        true
+    } else {
+        let Some(entry) = octos_llm::registry::lookup(family) else {
+            return Err(RpcError::invalid_params(format!(
+                "cannot activate {family}/{model}: unknown provider family — valid: \
+                 custom, {}",
+                octos_llm::registry::all_names().join(", ")
+            ))
+            .with_data(json!({ "kind": "llm_provider_unresolved", "family": family })));
+        };
+        match api_type {
+            Some("anthropic") | Some("responses") => true,
+            _ => entry.requires_api_key,
+        }
     };
     if !requires_key {
         return Ok(());
@@ -26443,6 +26450,51 @@ mod tests {
         )
         .await
         .expect_err("unknown provider family must reject");
+        assert_eq!(
+            error.data.as_ref().and_then(|data| data.get("kind")),
+            Some(&json!("llm_provider_unresolved")),
+            "got {error:?}"
+        );
+
+        // …even when a protocol override AND a key are configured: the
+        // factory looks the family up before honoring api_type, so this
+        // must reject as unresolved, not slip past via the override arm
+        // (codex P1 round 2).
+        raw_profile_llm_upsert(
+            &state,
+            &RpcRequest::new(
+                "u-frob-anthropic".to_string(),
+                APPUI_METHOD_PROFILE_LLM_UPSERT.to_string(),
+                json!({
+                    "profile_id": "dev",
+                    "selection": {
+                        "family_id": "frobnicator",
+                        "model_id": "frob-2",
+                        "route": {
+                            "route_id": "official",
+                            "api_type": "anthropic",
+                            "api_key_env": "OCTOS_TEST_FROB_KEY",
+                        },
+                    },
+                    "api_key": "fk",
+                    "set_primary": false,
+                }),
+            ),
+            None,
+        )
+        .await
+        .expect("seed keyed unknown-family anthropic fallback");
+        let error = raw_profile_llm_select(
+            &state,
+            &RpcRequest::new(
+                "s-unknown-keyed".to_string(),
+                APPUI_METHOD_PROFILE_LLM_SELECT.to_string(),
+                json!({ "profile_id": "dev", "model_id": "frob-2" }),
+            ),
+            None,
+        )
+        .await
+        .expect_err("unknown family rejects even with api_type override + key");
         assert_eq!(
             error.data.as_ref().and_then(|data| data.get("kind")),
             Some(&json!("llm_provider_unresolved")),
