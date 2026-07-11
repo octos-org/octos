@@ -2411,6 +2411,8 @@ impl Agent {
             if let Some(tokens) = tool_tokens {
                 tokens_used.input_tokens += tokens.input_tokens;
                 tokens_used.output_tokens += tokens.output_tokens;
+                tokens_used.cache_read_tokens += tokens.cache_read_tokens;
+                tokens_used.cache_write_tokens += tokens.cache_write_tokens;
             }
             if let Some(meta) = tool_structured_metadata {
                 structured_metadata.push(meta);
