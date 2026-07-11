@@ -553,6 +553,10 @@ impl Agent {
             response.usage.input_tokens,
             response.usage.output_tokens,
             tracker,
+            // The verifier runs on its own provider — price its usage at
+            // the verifier's model, not the conversation's active slot.
+            octos_llm::pricing::model_pricing(&config.model_label)
+                .map(|p| p.cost(response.usage.input_tokens, response.usage.output_tokens)),
         );
         let content = response.content.unwrap_or_default();
         let verdict = parse_verifier_verdict(&content).unwrap_or_else(|| {

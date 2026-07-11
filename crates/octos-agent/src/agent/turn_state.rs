@@ -60,6 +60,17 @@ pub(crate) struct LoopTurnState {
     started_at: Instant,
     iteration: u32,
     total_usage: TokenUsage,
+    /// Estimated spend for THIS turn: the sum of per-response costs,
+    /// each priced at the model that actually produced the response.
+    /// The old emission path instead re-priced the whole turn's token
+    /// totals at whichever model answered LAST, silently re-pricing
+    /// earlier iterations whenever failover/routing switched models
+    /// mid-turn.
+    turn_spend_usd: f64,
+    /// Whether any recorded usage carried a price. Distinguishes "spend
+    /// is genuinely $0 so far" from "no model in this turn had catalog
+    /// pricing" — emission hides the cost line in the latter case.
+    priced_usage: bool,
     retry_reasons: Vec<LoopRetryReason>,
     repair_reasons: Vec<LoopRepairReason>,
     terminal_reason: Option<LoopTerminalReason>,
@@ -71,6 +82,8 @@ impl LoopTurnState {
             started_at,
             iteration: 0,
             total_usage: TokenUsage::default(),
+            turn_spend_usd: 0.0,
+            priced_usage: false,
             retry_reasons: Vec::new(),
             repair_reasons: Vec::new(),
             terminal_reason: None,
@@ -90,6 +103,17 @@ impl LoopTurnState {
         &self.total_usage
     }
 
+    /// Sum of per-response estimated costs recorded this turn, each
+    /// priced at the model that produced it.
+    pub(crate) fn spend_usd(&self) -> f64 {
+        self.turn_spend_usd
+    }
+
+    /// True once at least one recorded response carried a price.
+    pub(crate) fn has_priced_usage(&self) -> bool {
+        self.priced_usage
+    }
+
     #[cfg(test)]
     pub(crate) fn retry_reasons(&self) -> &[LoopRetryReason] {
         &self.retry_reasons
@@ -100,14 +124,24 @@ impl LoopTurnState {
         &self.repair_reasons
     }
 
+    /// Record one response's usage. `estimated_cost_usd` is that usage
+    /// priced at the model which produced it (`None` when the model has
+    /// no catalog pricing) — the explicit parameter forces every call
+    /// site to decide the attribution instead of a later pass re-pricing
+    /// the turn total at the wrong model.
     pub(crate) fn record_usage(
         &mut self,
         input_tokens: u32,
         output_tokens: u32,
         tracker: Option<&TokenTracker>,
+        estimated_cost_usd: Option<f64>,
     ) {
         self.total_usage.input_tokens += input_tokens;
         self.total_usage.output_tokens += output_tokens;
+        if let Some(cost) = estimated_cost_usd {
+            self.turn_spend_usd += cost;
+            self.priced_usage = true;
+        }
         if let Some(tracker) = tracker {
             tracker.input_tokens.store(
                 self.total_usage.input_tokens,
@@ -183,6 +217,25 @@ mod tests {
                 message: "Token budget exceeded (120 of 100).".to_string(),
             })
         );
+    }
+
+    #[test]
+    fn should_sum_per_response_costs_when_usage_recorded_across_models() {
+        let mut state = LoopTurnState::new(Instant::now());
+        assert!(!state.has_priced_usage());
+        assert!((state.spend_usd() - 0.0).abs() < f64::EPSILON);
+
+        // Two responses priced at DIFFERENT models' rates plus one from
+        // an unpriced model: tokens all count, spend sums only the known
+        // costs — no re-pricing of earlier responses at the last model.
+        state.record_usage(1_000, 200, None, Some(0.015));
+        state.record_usage(2_000, 400, None, Some(0.002));
+        state.record_usage(500, 100, None, None);
+
+        assert_eq!(state.total_usage().input_tokens, 3_500);
+        assert_eq!(state.total_usage().output_tokens, 700);
+        assert!(state.has_priced_usage());
+        assert!((state.spend_usd() - 0.017).abs() < 1e-9);
     }
 
     #[test]

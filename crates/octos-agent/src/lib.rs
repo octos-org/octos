@@ -46,6 +46,7 @@ pub mod role_template;
 pub mod sandbox;
 mod sanitize;
 pub mod session;
+pub mod session_usage;
 pub mod skills;
 pub mod steering;
 pub mod subagent_output;
@@ -157,6 +158,7 @@ pub use role_template::{
 };
 pub use sandbox::{Sandbox, SandboxConfig, SandboxMode, create_sandbox};
 pub use session::{SessionLimits, SessionState, SessionStateHandle, SessionUsage};
+pub use session_usage::{SessionUsageHandle, SessionUsageSnapshot, SharedSessionUsage};
 pub use skills::{SkillInfo, SkillsLoader};
 pub use steering::{SteeringMessage, SteeringReceiver, SteeringSender};
 pub use subagent_output::{

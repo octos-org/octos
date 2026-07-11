@@ -144,11 +144,16 @@ pub enum ProgressEvent {
 
     /// Cost update after a response.
     CostUpdate {
-        session_input_tokens: u32,
-        session_output_tokens: u32,
+        /// Session-cumulative token counts: completed runs folded into the
+        /// shared session-usage base (when the embedder injected one) plus
+        /// the live turn. u64 because sessions outlive single turns.
+        session_input_tokens: u64,
+        session_output_tokens: u64,
         /// Cost of this response (None if pricing unknown).
         response_cost: Option<f64>,
-        /// Cumulative session cost.
+        /// Cumulative session cost: each completed run and each response
+        /// of the live turn priced at the model that produced it. `None`
+        /// until any priced usage exists.
         session_cost: Option<f64>,
         /// Model identifier that produced this response. Forwarded by the
         /// API bridge into `metadata.token_cost.model` so chat clients can

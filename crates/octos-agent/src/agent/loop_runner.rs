@@ -1148,6 +1148,14 @@ impl Agent {
                         response.usage.input_tokens,
                         response.usage.output_tokens,
                         tracker,
+                        // Priced at the slot that ACTUALLY answered, so a
+                        // mid-turn failover doesn't re-price earlier
+                        // responses at the new model's rate.
+                        self.response_usage_cost(
+                            response.usage.input_tokens,
+                            response.usage.output_tokens,
+                            response.provider_index,
+                        ),
                     );
 
                     match response.stop_reason {
@@ -1166,7 +1174,7 @@ impl Agent {
                             {
                                 continue;
                             }
-                            self.emit_cost_update(turn.total_usage(), &response);
+                            self.emit_cost_update(&turn, &response);
                             return Ok(ConversationResponse {
                                 content,
                                 reasoning_content: response.reasoning_content.clone(),
@@ -1262,7 +1270,7 @@ impl Agent {
                                             decision = %outcome.decision,
                                             "shell spiral terminal: returning recovered content as final assistant reply"
                                         );
-                                        self.emit_cost_update(turn.total_usage(), &response);
+                                        self.emit_cost_update(&turn, &response);
                                         return Ok(ConversationResponse {
                                             content: terminal_content,
                                             reasoning_content: None,
@@ -1306,7 +1314,7 @@ impl Agent {
                                     // returns on second fire is caught and
                                     // converted to a terminal Ok response
                                     // here so callers don't see an error.
-                                    self.emit_cost_update(turn.total_usage(), &response);
+                                    self.emit_cost_update(&turn, &response);
                                     match self.dedup_loop_warning(warning) {
                                         Ok(warning_content) => {
                                             inject_loop_detected_synthetic_results_with_log(
@@ -1403,7 +1411,7 @@ impl Agent {
                             // `Agent::execute_approved_tool` when an
                             // authorized human answers.
                             if let Some(draft) = iter_pending_approval {
-                                self.emit_cost_update(turn.total_usage(), &sanitized_response);
+                                self.emit_cost_update(&turn, &sanitized_response);
                                 return Ok(ConversationResponse {
                                     content: String::new(),
                                     reasoning_content: None,
@@ -1493,7 +1501,7 @@ impl Agent {
                                     decision = %outcome.decision,
                                     "shell spiral terminal: returning recovered content as final assistant reply"
                                 );
-                                self.emit_cost_update(turn.total_usage(), &response);
+                                self.emit_cost_update(&turn, &response);
                                 return Ok(ConversationResponse {
                                     content: terminal_content,
                                     reasoning_content: None,
@@ -1599,7 +1607,7 @@ impl Agent {
                                     {
                                         continue;
                                     }
-                                    self.emit_cost_update(turn.total_usage(), &response);
+                                    self.emit_cost_update(&turn, &response);
                                     // Post-spawn failure feedback loop
                                     // (feat/spawn-only-failure-feedback-loop):
                                     // record that the synth-ack went out for
@@ -1700,7 +1708,7 @@ impl Agent {
                             }
                         }
                         StopReason::MaxTokens => {
-                            self.emit_cost_update(turn.total_usage(), &response);
+                            self.emit_cost_update(&turn, &response);
                             return Ok(ConversationResponse {
                                 content: response.content.unwrap_or_default(),
                                 reasoning_content: response.reasoning_content.clone(),
@@ -1720,7 +1728,7 @@ impl Agent {
                         StopReason::ContentFiltered => {
                             // After retries in call_llm_with_hooks, content is still filtered.
                             // Return a user-visible message instead of empty content.
-                            self.emit_cost_update(turn.total_usage(), &response);
+                            self.emit_cost_update(&turn, &response);
                             warn!("content filtered by provider safety/moderation after retries");
                             return Ok(ConversationResponse {
                                 content: response.content.unwrap_or_else(|| {
@@ -1871,7 +1879,16 @@ impl Agent {
                     }
                 };
                 Self::normalize_inline_invokes(&mut response);
-                turn.record_usage(response.usage.input_tokens, response.usage.output_tokens, None);
+                turn.record_usage(
+                    response.usage.input_tokens,
+                    response.usage.output_tokens,
+                    None,
+                    self.response_usage_cost(
+                        response.usage.input_tokens,
+                        response.usage.output_tokens,
+                        response.provider_index,
+                    ),
+                );
 
                 let tool_names: Vec<&str> = response
                     .tool_calls
@@ -1956,7 +1973,7 @@ impl Agent {
                             }
                         }
 
-                        self.emit_cost_update(turn.total_usage(), &final_response);
+                        self.emit_cost_update(&turn, &final_response);
 
                         // Audit Gap-8: auto-fire `check_workspace_contract`
                         // on Completion. The LLM-callable wrapper stays for
@@ -2113,7 +2130,7 @@ impl Agent {
 
                         let final_response =
                             response_with_max_token_fragments(&response, &max_token_fragments);
-                        self.emit_cost_update(turn.total_usage(), &final_response);
+                        self.emit_cost_update(&turn, &final_response);
                         self.reporter().report(ProgressEvent::TaskCompleted {
                             success: false,
                             iterations: iteration,
@@ -2128,7 +2145,7 @@ impl Agent {
                     }
                     StopReason::ContentFiltered => {
                         warn!("content filtered by provider safety/moderation in task");
-                        self.emit_cost_update(turn.total_usage(), &response);
+                        self.emit_cost_update(&turn, &response);
                         self.reporter().report(ProgressEvent::TaskCompleted {
                             success: false,
                             iterations: iteration,
@@ -2546,7 +2563,14 @@ impl Agent {
         if let Some(files_to_send) = files_to_send {
             files_to_send.extend(tool_send_files);
         }
-        turn.record_usage(tool_tokens.input_tokens, tool_tokens.output_tokens, tracker);
+        turn.record_usage(
+            tool_tokens.input_tokens,
+            tool_tokens.output_tokens,
+            tracker,
+            // Tool-reported usage has no per-response provider attribution;
+            // price it at the active slot as the closest estimate.
+            self.response_usage_cost(tool_tokens.input_tokens, tool_tokens.output_tokens, None),
+        );
         // Codex round-3: return the sanitized response so the caller's
         // synth-ack gate sees the SAME tool_call_ids that the success-bit
         // sink was keyed by. See doc-comment on this fn.

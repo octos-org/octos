@@ -377,6 +377,15 @@ pub struct Agent {
     /// sub-agents (pipeline workers, spawn children) reserve and commit
     /// against the same ledger as the parent session.
     pub(super) cost_accountant: Option<Arc<crate::cost_ledger::CostAccountant>>,
+    /// Session-cumulative usage base shared with the owning session
+    /// actor. The actor seeds it from the persistent usage ledger and
+    /// folds each completed run back in (priced at the model that ran
+    /// it); `emit_cost_update` READS it so the `session_*` figures on
+    /// `ProgressEvent::CostUpdate` cover the whole session — surviving
+    /// per-turn resets, provider failover, and the runtime-cache
+    /// eviction a `profile/llm/select` model switch triggers. `None`
+    /// (chat mode, sub-agents) keeps emissions turn-scoped.
+    pub(super) session_usage_base: Option<crate::session_usage::SharedSessionUsage>,
     /// M8 parity: optional parent session key. When the agent is owned
     /// by a session actor, this carries the session key down through
     /// `ToolContext.parent_session_key` so spawn children / pipeline
@@ -495,6 +504,7 @@ impl Agent {
             subagent_output_router: None,
             subagent_summary_generator: None,
             cost_accountant: None,
+            session_usage_base: None,
             parent_session_key: None,
             spawn_depth: 0,
             sandbox_config: None,
@@ -569,6 +579,7 @@ impl Agent {
             subagent_output_router: None,
             subagent_summary_generator: None,
             cost_accountant: None,
+            session_usage_base: None,
             parent_session_key: None,
             spawn_depth: 0,
             sandbox_config: None,
@@ -816,6 +827,19 @@ impl Agent {
     /// Access the configured cost accountant, if any.
     pub fn cost_accountant(&self) -> Option<&Arc<crate::cost_ledger::CostAccountant>> {
         self.cost_accountant.as_ref()
+    }
+
+    /// Share a session-cumulative usage base with this agent. The owner
+    /// (session actor) seeds it from the usage ledger and folds completed
+    /// runs; the agent only reads it when emitting cost updates, so the
+    /// wire's `session_*` figures cover the whole session instead of
+    /// resetting every turn. See [`crate::session_usage`].
+    pub fn with_session_usage_base(
+        mut self,
+        usage: crate::session_usage::SharedSessionUsage,
+    ) -> Self {
+        self.session_usage_base = Some(usage);
+        self
     }
 
     /// Record the owning session key so pipeline workers / spawn
