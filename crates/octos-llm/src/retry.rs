@@ -201,6 +201,26 @@ impl RetryProvider {
                 // above missed them and a mid-turn drop hard-failed the whole
                 // turn with no retry and no failover. Retry on the same
                 // provider — a fresh connection is dialed on the next attempt.
+                //
+                // DELIBERATE at-least-once tradeoff: a statusless send failure
+                // is ambiguous — the request may have been fully received and
+                // billed by the server before the connection dropped ("no
+                // response" != "not accepted"). Replaying can therefore
+                // double-bill a non-idempotent chat POST in the rare
+                // mid-generation-drop sub-case. We accept this because (a) the
+                // dominant cause here is a reused idle-keepalive socket the LB
+                // closed BEFORE servicing the request (never billed → safe to
+                // replay), and for a streaming POST a server that had begun
+                // generating would have already flushed response headers, so
+                // `.send()` would have resolved and the drop would surface as a
+                // stream/body error OUTSIDE this retry scope; (b) the agent
+                // loop consumes exactly one ChatResponse, so a replay never
+                // duplicates tool side-effects — the only residual harm is
+                // provider-side double-billing; (c) the alternative is hard-
+                // failing the entire turn on any transient drop, which is
+                // strictly worse UX. Future hardening (not done here): a short
+                // pool idle-timeout to stop reusing about-to-close sockets, or
+                // a client idempotency key where the endpoint supports one.
                 if reqwest_err.is_request() || reqwest_err.is_body() {
                     return true;
                 }

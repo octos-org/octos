@@ -1226,7 +1226,10 @@ mod tests {
 
     #[test]
     fn test_build_request_filters_system() {
-        let provider = AnthropicProvider::new("test-key", "claude-test");
+        // Pin caching ON: the extraction assertion below reads block-form
+        // `system[0].text`, which only exists when caching is enabled — keep
+        // it hermetic w.r.t. an ambient `OCTOS_PROMPT_CACHING=0`.
+        let provider = AnthropicProvider::new("test-key", "claude-test").with_prompt_caching(true);
         let messages = vec![
             msg(MessageRole::System, "system prompt"),
             msg(MessageRole::User, "hello"),
@@ -1605,7 +1608,11 @@ mod tests {
 
     #[test]
     fn should_mark_system_last_tool_and_last_user_block_with_cache_control() {
-        let provider = AnthropicProvider::new("test-key", "claude-test");
+        // Pin caching ON so this wire-shape assertion is hermetic w.r.t. an
+        // ambient `OCTOS_PROMPT_CACHING=0` (the builder override wins over the
+        // env default). The default-resolution truth table is covered
+        // separately by `prompt_caching_env_*` unit tests.
+        let provider = AnthropicProvider::new("test-key", "claude-test").with_prompt_caching(true);
         let tools = vec![
             tool_spec("alpha", "first tool"),
             tool_spec("omega", "last tool"),
@@ -1672,7 +1679,9 @@ mod tests {
         // batch — the breakpoint must land on its LAST block only, so the
         // whole history including the current results is cached for the
         // next iteration.
-        let provider = AnthropicProvider::new("test-key", "claude-test");
+        // Pin caching ON so the assertion is independent of the ambient
+        // `OCTOS_PROMPT_CACHING` kill-switch (builder override wins).
+        let provider = AnthropicProvider::new("test-key", "claude-test").with_prompt_caching(true);
         let mut assistant = msg(MessageRole::Assistant, "");
         assistant.tool_calls = Some(vec![
             tool_call("toolu_a", "shell", serde_json::json!({"command": "ls"})),
@@ -1704,7 +1713,9 @@ mod tests {
     fn should_keep_blank_system_as_string_even_when_caching_enabled() {
         // An empty text BLOCK is rejected by Anthropic while `"system": ""`
         // is not — an all-blank system prompt must stay in string form.
-        let provider = AnthropicProvider::new("test-key", "claude-test");
+        // Pin caching ON (the test name asserts "even_when_caching_enabled")
+        // so it does not silently pass under an ambient `OCTOS_PROMPT_CACHING=0`.
+        let provider = AnthropicProvider::new("test-key", "claude-test").with_prompt_caching(true);
         let messages = vec![msg(MessageRole::System, ""), msg(MessageRole::User, "hi")];
         let config = ChatConfig::default();
         let body = serde_json::to_value(provider.build_request(&messages, &[], &config)).unwrap();
@@ -1836,8 +1847,11 @@ mod tests {
             .mount(&server)
             .await;
 
-        let provider =
-            AnthropicProvider::new("test-key", "claude-test").with_base_url(server.uri());
+        // Pin caching ON — this test asserts cache breakpoints are sent on the
+        // wire, so it must not depend on the ambient `OCTOS_PROMPT_CACHING`.
+        let provider = AnthropicProvider::new("test-key", "claude-test")
+            .with_base_url(server.uri())
+            .with_prompt_caching(true);
         let tools = vec![tool_spec("shell", "run a command")];
         let messages = vec![
             msg(MessageRole::System, "sys"),
