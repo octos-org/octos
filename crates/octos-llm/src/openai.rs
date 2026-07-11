@@ -593,6 +593,12 @@ impl LlmProvider for OpenAIProvider {
             usage: TokenUsage {
                 input_tokens: api_response.usage.prompt_tokens,
                 output_tokens: api_response.usage.completion_tokens,
+                cache_read_tokens: api_response
+                    .usage
+                    .prompt_tokens_details
+                    .as_ref()
+                    .map(|d| d.cached_tokens)
+                    .unwrap_or(0),
                 ..Default::default()
             },
             provider_index: None,
@@ -943,6 +949,18 @@ struct FunctionCall {
 struct Usage {
     prompt_tokens: u32,
     completion_tokens: u32,
+    /// Automatic prompt-cache breakdown. `cached_tokens` counts the portion
+    /// of `prompt_tokens` served from OpenAI's cache (INCLUDED in
+    /// `prompt_tokens`, unlike Anthropic's disjoint accounting). Compat
+    /// providers that omit the object parse as `None`.
+    #[serde(default)]
+    prompt_tokens_details: Option<PromptTokensDetails>,
+}
+
+#[derive(Deserialize, Default)]
+struct PromptTokensDetails {
+    #[serde(default)]
+    cached_tokens: u32,
 }
 
 // --- Streaming SSE helpers (shared with OpenRouter) ---
@@ -1032,6 +1050,9 @@ pub(crate) fn parse_openai_sse_events(event: &SseEvent) -> Vec<StreamEvent> {
         events.push(StreamEvent::Usage(TokenUsage {
             input_tokens: usage["prompt_tokens"].as_u64().unwrap_or(0) as u32,
             output_tokens: usage["completion_tokens"].as_u64().unwrap_or(0) as u32,
+            cache_read_tokens: usage["prompt_tokens_details"]["cached_tokens"]
+                .as_u64()
+                .unwrap_or(0) as u32,
             ..Default::default()
         }));
     }
@@ -1704,5 +1725,91 @@ mod tests {
         assert!(!full_text.is_empty(), "Stream should produce text");
         assert!(full_text.contains('1'), "Should contain '1': {full_text}");
         assert!(full_text.contains('5'), "Should contain '5': {full_text}");
+    }
+}
+
+#[cfg(test)]
+mod cache_usage_tests {
+    //! OpenAI chat-completions caches long prompts automatically and reports
+    //! the cached portion in `usage.prompt_tokens_details.cached_tokens`.
+    //! Both the non-streaming and SSE paths must surface it as
+    //! `TokenUsage::cache_read_tokens` so cache hits flow into the
+    //! usage/cost pipeline. Compat providers that omit the field parse as 0.
+
+    use super::*;
+    use crate::config::ChatConfig;
+    use octos_core::{Message, MessageRole};
+
+    #[test]
+    fn should_parse_cached_tokens_from_sse_usage() {
+        let event = SseEvent {
+            event: None,
+            data: r#"{"choices":[],"usage":{"prompt_tokens":100,"completion_tokens":5,"prompt_tokens_details":{"cached_tokens":75}}}"#.into(),
+        };
+        let events = parse_openai_sse_events(&event);
+        let usage = events
+            .iter()
+            .find_map(|e| match e {
+                StreamEvent::Usage(u) => Some(u.clone()),
+                _ => None,
+            })
+            .expect("usage event");
+        assert_eq!(usage.input_tokens, 100);
+        assert_eq!(usage.cache_read_tokens, 75);
+    }
+
+    #[test]
+    fn should_default_cached_tokens_to_zero_when_details_missing() {
+        let event = SseEvent {
+            event: None,
+            data: r#"{"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":2}}"#.into(),
+        };
+        let events = parse_openai_sse_events(&event);
+        let usage = events
+            .iter()
+            .find_map(|e| match e {
+                StreamEvent::Usage(u) => Some(u.clone()),
+                _ => None,
+            })
+            .expect("usage event");
+        assert_eq!(usage.cache_read_tokens, 0);
+    }
+
+    #[tokio::test]
+    async fn should_parse_cached_tokens_from_chat_response() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(
+                        r#"{"choices":[{"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":100,"completion_tokens":3,"prompt_tokens_details":{"cached_tokens":75}}}"#,
+                    )
+                    .append_header("Content-Type", "application/json"),
+            )
+            .mount(&server)
+            .await;
+
+        let provider = OpenAIProvider::new("test-key", "gpt-4o").with_base_url(server.uri());
+        let messages = vec![Message {
+            role: MessageRole::User,
+            content: "hi".into(),
+            media: vec![],
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+            client_message_id: None,
+            thread_id: None,
+            timestamp: chrono::Utc::now(),
+        }];
+        let response = provider
+            .chat(&messages, &[], &ChatConfig::default())
+            .await
+            .unwrap();
+        assert_eq!(response.usage.input_tokens, 100);
+        assert_eq!(response.usage.cache_read_tokens, 75);
     }
 }

@@ -64,11 +64,44 @@ fn catalog_pricing(model_id: &str) -> Option<ModelPricing> {
         .map(|(_, p)| *p)
 }
 
+/// Prompt-cache read multiplier on the input rate (Anthropic bills cache
+/// hits at ~10% of the base input price).
+const CACHE_READ_INPUT_MULTIPLIER: f64 = 0.1;
+/// Prompt-cache write multiplier on the input rate (Anthropic bills 5-minute
+/// ephemeral cache writes at 1.25x the base input price).
+const CACHE_WRITE_INPUT_MULTIPLIER: f64 = 1.25;
+
 impl ModelPricing {
     /// Calculate cost for given token counts.
     pub fn cost(&self, input_tokens: u32, output_tokens: u32) -> f64 {
         (input_tokens as f64 / 1_000_000.0) * self.input_per_million
             + (output_tokens as f64 / 1_000_000.0) * self.output_per_million
+    }
+
+    /// Cache-aware cost using Anthropic's DISJOINT accounting: `input_tokens`
+    /// excludes cached tokens, `cache_read_tokens` bills at 0.1x the input
+    /// rate and `cache_write_tokens` at 1.25x. Degenerates to [`Self::cost`]
+    /// when both cache counts are zero.
+    ///
+    /// Do NOT feed this OpenAI/Gemini usage as-is: those providers report
+    /// cached tokens INSIDE `input_tokens` (overlapping accounting), so the
+    /// cached portion would be double-billed. Call sites that price mixed
+    /// providers need per-provider normalization first — until then they
+    /// keep using [`Self::cost`].
+    pub fn cost_with_cache(
+        &self,
+        input_tokens: u32,
+        output_tokens: u32,
+        cache_read_tokens: u32,
+        cache_write_tokens: u32,
+    ) -> f64 {
+        self.cost(input_tokens, output_tokens)
+            + (cache_read_tokens as f64 / 1_000_000.0)
+                * self.input_per_million
+                * CACHE_READ_INPUT_MULTIPLIER
+            + (cache_write_tokens as f64 / 1_000_000.0)
+                * self.input_per_million
+                * CACHE_WRITE_INPUT_MULTIPLIER
     }
 }
 
@@ -285,6 +318,22 @@ mod tests {
         let cost = p.cost(1_000_000, 100_000);
         // $3.00 input + $1.50 output = $4.50
         assert!((cost - 4.5).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_cost_with_cache_applies_read_and_write_multipliers() {
+        let p = ModelPricing {
+            input_per_million: 3.0,
+            output_per_million: 15.0,
+        };
+        // 100k uncached in ($0.30) + 10k out ($0.15)
+        // + 900k cache-read at 0.1x ($0.27) + 50k cache-write at 1.25x ($0.1875)
+        let cost = p.cost_with_cache(100_000, 10_000, 900_000, 50_000);
+        assert!((cost - 0.9075).abs() < 1e-9, "got {cost}");
+
+        // Zero cache counts degenerate to the plain cost().
+        let plain = p.cost_with_cache(100_000, 10_000, 0, 0);
+        assert!((plain - p.cost(100_000, 10_000)).abs() < 1e-12);
     }
 
     #[test]
