@@ -128,44 +128,33 @@ fn resolve_within_workspace(
 /// authenticated caller's profile/tenant root, so this only reaches that
 /// tenant's own sessions.
 ///
-/// Primary: the in-memory open-session map (`session_workspace_root_for_state`),
+/// Primary: the in-memory open-session map (`session_workspace_root_for_profile`),
 /// which holds the exact `workspace_root` the turn used — correct for every
 /// session shape, including `base_key()`-encoded and cwd-hinted workspaces.
 /// Fallback (evicted session): the canonical multi-tenant layout
 /// `<data>/users/<encode_path_component(base_key)>/workspace` (mirrors the
 /// workspace construction in `ui_protocol.rs`).
 ///
-/// SECURITY: the open-session map is process-GLOBAL across tenants, so a map
-/// hit is trusted ONLY when its workspace is contained under the authenticated
-/// `data_dir` (this tenant's root). A foreign session id therefore can't
-/// surface another tenant's workspace; it falls through to the tenant-scoped
-/// reconstruction, which (for a foreign session) won't exist under this
-/// `data_dir` and resolves to a 404 — never a cross-tenant read (codex #1377
-/// round-3/8 P1).
-///
-/// KNOWN LIMITATION: a session opened with an approved `cwd` OUTSIDE the data
-/// dir (desktop/AppUI custom workspaces — NOT the hosted `<data>/users/...`
-/// fleet layout) materialises uploads into that external repo, which this
-/// containment rule won't serve via `/api/files`. Soundly serving those needs a
-/// session→owning-profile binding the workspace map does not carry; a generic
-/// cwd-safety re-check is NOT an ownership proof (it would reopen the
-/// cross-tenant read — codex round-8 P1). Tracked as a follow-up.
+/// SECURITY: the map key includes the authenticated requester's profile id as
+/// well as the session id, so a foreign profile cannot retrieve a same-named
+/// SPA session. The containment check remains required: a profile can point a
+/// session at an approved external cwd, but profile ownership alone is not
+/// sufficient authority to serve arbitrary host files through `/api/files`.
 fn resolve_session_workspace_root(
-    state: &AppState,
+    _state: &AppState,
     data_dir: &std::path::Path,
+    profile_id: Option<&str>,
     session_id: &str,
 ) -> Option<std::path::PathBuf> {
     if session_id.is_empty() {
         return None;
     }
     let key = octos_core::SessionKey(session_id.to_string());
-    if let Some(ws) = crate::api::ui_protocol::session_workspace_root_for_state(state, &key) {
+    if let Some(ws) = crate::api::ui_protocol::session_workspace_root_for_profile(profile_id, &key)
+    {
         if map_workspace_belongs_to_tenant(&ws, data_dir) {
             return Some(ws);
         }
-        // Outside this tenant's data dir → not provably owned by the requester.
-        // Ignore the global map entry and fall through to the tenant-scoped
-        // reconstruction below.
     }
     let base = session_id.split('#').next().unwrap_or(session_id);
     if base.is_empty() || base.contains('/') || base.contains('\\') || base.contains("..") {
@@ -175,9 +164,8 @@ fn resolve_session_workspace_root(
     Some(data_dir.join("users").join(encoded).join("workspace"))
 }
 
-/// True when `ws` (a global-map workspace root) is contained under the
-/// authenticated tenant's `data_dir`. Canonicalizes both sides; fails closed if
-/// either can't be canonicalized.
+/// True when `ws` is contained under the authenticated profile data dir.
+/// Canonicalizes both sides and fails closed if either path is unavailable.
 fn map_workspace_belongs_to_tenant(ws: &std::path::Path, data_dir: &std::path::Path) -> bool {
     match (std::fs::canonicalize(ws), std::fs::canonicalize(data_dir)) {
         (Ok(w), Ok(d)) => w.starts_with(&d),
@@ -1984,9 +1972,9 @@ pub async fn serve_file_by_query(
     // #1377: the authenticated requester's profile gates upload-tmpdir downloads
     // (no cross-tenant) and authorizes a session-relative `uploads/<name>` path.
     let auth_profile = request_owner_profile(&state, &headers, identity);
-    let session_ws = params
-        .get("session")
-        .and_then(|s| resolve_session_workspace_root(&state, &data_dir, s));
+    let session_ws = params.get("session").and_then(|s| {
+        resolve_session_workspace_root(&state, &data_dir, auth_profile.as_deref(), s)
+    });
     serve_file_impl(
         &data_dir,
         filename,
@@ -2010,9 +1998,9 @@ pub async fn serve_file(
         Err(response) => return response,
     };
     let auth_profile = request_owner_profile(&state, &headers, identity);
-    let session_ws = params
-        .get("session")
-        .and_then(|s| resolve_session_workspace_root(&state, &data_dir, s));
+    let session_ws = params.get("session").and_then(|s| {
+        resolve_session_workspace_root(&state, &data_dir, auth_profile.as_deref(), s)
+    });
     serve_file_impl(
         &data_dir,
         &filename,
@@ -4905,7 +4893,13 @@ mod tests {
         let data = tempfile::tempdir().unwrap();
         let state = AppState::empty_for_tests();
         // Topic-suffixed key → workspace dir uses base_key (topic stripped).
-        let ws = resolve_session_workspace_root(&state, data.path(), "slides-xyz#deck-1").unwrap();
+        let ws = resolve_session_workspace_root(
+            &state,
+            data.path(),
+            Some(MAIN_PROFILE_ID),
+            "slides-xyz#deck-1",
+        )
+        .unwrap();
         let expected_base = octos_bus::session::encode_path_component("slides-xyz");
         assert_eq!(
             ws,
@@ -4915,13 +4909,14 @@ mod tests {
                 .join("workspace")
         );
         // Empty session id → None.
-        assert!(resolve_session_workspace_root(&state, data.path(), "").is_none());
+        assert!(
+            resolve_session_workspace_root(&state, data.path(), Some(MAIN_PROFILE_ID), "")
+                .is_none()
+        );
     }
 
     #[test]
     fn map_workspace_must_be_under_authenticated_tenant() {
-        // codex #1377 round-3 P1: a global-map workspace from ANOTHER tenant must
-        // not be trusted by the session-aware download path.
         let tenant_a = tempfile::tempdir().unwrap();
         let tenant_b = tempfile::tempdir().unwrap();
         let a_ws = tenant_a.path().join("users/web-a/workspace");
@@ -4929,9 +4924,7 @@ mod tests {
         let b_ws = tenant_b.path().join("users/web-b/workspace");
         std::fs::create_dir_all(&b_ws).unwrap();
 
-        // A's workspace is under A's data dir → trusted.
         assert!(map_workspace_belongs_to_tenant(&a_ws, tenant_a.path()));
-        // B's workspace is NOT under A's data dir → rejected (no cross-tenant).
         assert!(!map_workspace_belongs_to_tenant(&b_ws, tenant_a.path()));
     }
 

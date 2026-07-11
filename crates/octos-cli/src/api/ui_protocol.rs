@@ -806,24 +806,36 @@ impl UiProtocolContractStores {
 
 #[derive(Default)]
 struct SessionWorkspaceStore {
-    roots: std::sync::Mutex<HashMap<SessionKey, PathBuf>>,
+    roots: std::sync::Mutex<HashMap<(String, SessionKey), PathBuf>>,
 }
 
 impl SessionWorkspaceStore {
-    fn set(&self, session_id: SessionKey, root: PathBuf) {
+    fn set(&self, profile_id: &str, session_id: SessionKey, root: PathBuf) {
         self.roots
             .lock()
             .unwrap_or_else(|error| error.into_inner())
-            .insert(session_id, root);
+            .insert((profile_id.to_owned(), session_id), root);
     }
 
-    fn get(&self, session_id: &SessionKey) -> Option<PathBuf> {
+    fn get(&self, profile_id: &str, session_id: &SessionKey) -> Option<PathBuf> {
         self.roots
             .lock()
             .unwrap_or_else(|error| error.into_inner())
-            .get(session_id)
+            .get(&(profile_id.to_owned(), session_id.clone()))
             .cloned()
     }
+}
+
+/// Resolve the profile component of an in-memory session-workspace key.
+///
+/// Authenticated SPA sessions deliberately use raw `web-*` ids, so the
+/// `SessionKey` alone is not an isolation boundary. Every workspace lookup
+/// therefore uses the profile already resolved by the protocol entrypoint.
+fn workspace_profile_scope(profile_id: Option<&str>, session_id: &SessionKey) -> String {
+    profile_id
+        .or_else(|| session_id.profile_id())
+        .unwrap_or(MAIN_PROFILE_ID)
+        .to_owned()
 }
 
 #[derive(Default)]
@@ -7133,7 +7145,8 @@ async fn tool_status_list_result(
     let profile_runtime = ensure_session_profile_runtime(state, active_profile_id).await?;
     let session_runtime = if let Some(profile_runtime) = profile_runtime.as_ref() {
         let permissions = effective_permissions_for_session(state, session_id)?;
-        let workspace_hint = session_workspaces().get(session_id);
+        let workspace_profile_id = workspace_profile_scope(active_profile_id, session_id);
+        let workspace_hint = session_workspaces().get(&workspace_profile_id, session_id);
         Some(
             state
                 .session_cache
@@ -7270,7 +7283,7 @@ fn runtime_policy_stamp_for_profile(
             permission_state.approval_policy,
         );
     let workspace_root = session_id
-        .and_then(|session_id| session_workspaces().get(session_id))
+        .and_then(|session_id| session_workspaces().get(profile_id, session_id))
         .map(|path| path.to_string_lossy().to_string());
     let mut stamp = json!({
         "runtime_mode": runtime_mode_for_state(state),
@@ -8545,7 +8558,8 @@ async fn skill_action_session_runtime(
         ));
     };
     let permissions = effective_permissions_for_session(state, session_id)?;
-    let workspace_hint = session_workspaces().get(session_id);
+    let workspace_profile_id = workspace_profile_scope(active_profile_id, session_id);
+    let workspace_hint = session_workspaces().get(&workspace_profile_id, session_id);
     state
         .session_cache
         .get_or_init_with_permissions(
@@ -11389,7 +11403,7 @@ async fn open_session_result(
         effective_workspace_root = Some(workspace_root.clone());
     }
     if let Some(root) = effective_workspace_root.as_ref() {
-        session_workspaces().set(params.session_id.clone(), root.clone());
+        session_workspaces().set(&ledger_profile_id, params.session_id.clone(), root.clone());
     }
     let (mut replay, replay_baseline_seq) =
         ledger.replay_after_with_head(&params.session_id, params.after.as_ref())?;
@@ -11474,8 +11488,9 @@ async fn open_session_result(
     // The cached SessionRuntime's `workspace_root` is the source of truth
     // for the wire response when present. Fall back to the legacy lookup
     // when no SessionRuntime was materialized (no profile registered).
-    let workspace_root = effective_workspace_root
-        .or_else(|| session_workspace_root_for_state(state, &params.session_id));
+    let workspace_root = effective_workspace_root.or_else(|| {
+        session_workspace_root_for_profile(active_profile_id.as_deref(), &params.session_id)
+    });
     let panes = features
         .pane_snapshots
         .then(|| build_pane_snapshot(&data_dir, &params.session_id, workspace_root.as_deref()));
@@ -12100,16 +12115,11 @@ async fn ensure_session_profile_runtime(
         return Ok(None);
     };
     let profile_data_dir = store.resolve_data_dir(&profile);
-    if let Err(error) = super::skill_action_jobs::recover_skill_action_jobs_for_profile_start(
-        profile_id,
-        &profile_data_dir,
-    ) {
-        warn!(
-            profile_id,
-            %error,
-            "failed to recover active skill action jobs before dynamic profile bootstrap"
-        );
-    }
+    // Restart recovery belongs exclusively to `octos serve` startup, which
+    // scans every persisted profile before runtimes are bootstrapped. This
+    // helper also runs for live cache replacement (for example
+    // `profile/llm/select`), where marking active jobs abandoned would lie
+    // about work still executing in this process.
     if !profile.enabled || profile.parent_id.is_some() || !profile.config.has_llm_selection() {
         return Ok(None);
     }
@@ -12197,7 +12207,8 @@ pub(crate) async fn resolve_sessions_for_lookup(
         .or(connection_profile_id)
         .or(routed_profile_id);
     if let Some(profile_runtime) = resolve_session_profile_runtime(state, active_profile_id) {
-        let hint = session_workspaces().get(session_id);
+        let workspace_profile_id = workspace_profile_scope(active_profile_id, session_id);
+        let hint = session_workspaces().get(&workspace_profile_id, session_id);
         let permissions = effective_permissions_for_session(state, session_id).ok()?;
         if let Ok(runtime) = state
             .session_cache
@@ -12210,23 +12221,16 @@ pub(crate) async fn resolve_sessions_for_lookup(
     state.sessions.clone()
 }
 
-pub(crate) fn session_workspace_root_for_state(
-    state: &AppState,
+pub(crate) fn session_workspace_root_for_profile(
+    profile_id: Option<&str>,
     session_id: &SessionKey,
 ) -> Option<PathBuf> {
-    // M11-F: read-through view on `session_workspaces()` only. The
-    // legacy `state.agent.tool_registry().workspace_root()` fallback
-    // was deleted alongside `state.agent`; the cached
-    // `SessionRuntime.workspace_root` is the canonical source on a
-    // successful open, and the in-memory `session_workspaces()` map is
-    // the synchronous read-through view `session/open`'s pane snapshot
-    // path uses (computed BEFORE the async cache load completes).
-    // Tier-2 (`appui.default_session_cwd`) is consulted at
-    // `open_session_result` time as a fallback hint, so the map
-    // already reflects the operator default when no client cwd was
-    // supplied.
-    let _ = state; // unused after the agent-fallback deletion
-    session_workspaces().get(session_id)
+    // The cached SessionRuntime is authoritative after bootstrap. This map is
+    // only the synchronous read-through view used before an async cache lookup
+    // can complete, so its key must include the resolved profile as well as the
+    // raw session id.
+    let workspace_profile_id = workspace_profile_scope(profile_id, session_id);
+    session_workspaces().get(&workspace_profile_id, session_id)
 }
 
 /// Append the per-session workspace-root hint to the system prompt.
@@ -13483,7 +13487,9 @@ pub(crate) fn spawn_global_master_continuation_drain(state: Arc<AppState>) {
             // sessions is not operationally reachable on a single serve.
             const DRAIN_SPAWN_CAP: usize = 8;
             const DRAIN_CANDIDATE_WINDOW: usize = 64;
-            let runnable = |session: &SessionKey| session_workspaces().get(session).is_some();
+            let runnable = |session: &SessionKey, profile_id: &str| {
+                session_workspaces().get(profile_id, session).is_some()
+            };
             let due = default_agent_orchestrator().due_loop_targets_with_filter(
                 None,
                 DRAIN_CANDIDATE_WINDOW,
@@ -18806,8 +18812,9 @@ async fn run_m14_codex_p0_tool_parity_fixture_turn(
     interrupt_rx: &mut mpsc::Receiver<()>,
 ) -> M9FixtureOutcome {
     append_appui_server_log("#969 Codex P0 tool parity soak started");
+    let workspace_profile_id = workspace_profile_scope(None, session_id);
     let workspace = session_workspaces()
-        .get(session_id)
+        .get(&workspace_profile_id, session_id)
         .or_else(|| appui_evidence_dir().map(|dir| dir.join("workspace")))
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
     if let Err(error) = std::fs::create_dir_all(&workspace) {
@@ -19398,7 +19405,8 @@ async fn run_native_code_review_turn(
             return;
         }
     };
-    let hint = session_workspaces().get(&session_id);
+    let workspace_profile_id = workspace_profile_scope(active_profile_id.as_deref(), &session_id);
+    let hint = session_workspaces().get(&workspace_profile_id, &session_id);
     let permissions = match effective_permissions_for_session(&state, &session_id) {
         Ok(permissions) => permissions,
         Err(error) => {
@@ -20939,7 +20947,8 @@ async fn run_standalone_turn(
     // Tier-2 operator default, resolved at `open_session_result` time),
     // use that as the `workspace_hint`. Otherwise the bootstrap default
     // Tier-3 (`<profile_data_dir>/users/.../workspace`) wins.
-    let hint = session_workspaces().get(&session_id);
+    let workspace_profile_id = workspace_profile_scope(active_profile_id.as_deref(), &session_id);
+    let hint = session_workspaces().get(&workspace_profile_id, &session_id);
     let permissions = match effective_permissions_for_session(&state, &session_id) {
         Ok(permissions) => permissions,
         Err(error) => {
@@ -27789,6 +27798,94 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn llm_select_does_not_abandon_running_skill_action_jobs() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = Arc::new(local_profile_state(dir.path()));
+        let upsert = |id: &str, family: &str, model: &str, set_primary: bool| {
+            RpcRequest::new(
+                id.to_string(),
+                APPUI_METHOD_PROFILE_LLM_UPSERT.to_string(),
+                json!({
+                    "profile_id": "job-owner",
+                    "selection": {
+                        "family_id": family,
+                        "model_id": model,
+                        "route": { "route_id": "official" },
+                    },
+                    "api_key": format!("test-{family}-key"),
+                    "set_primary": set_primary,
+                }),
+            )
+        };
+
+        raw_profile_llm_upsert(
+            &state,
+            &upsert("primary", "deepseek", "deepseek-v4-pro", true),
+            None,
+        )
+        .await
+        .expect("seed primary");
+        raw_profile_llm_upsert(&state, &upsert("fallback", "zai", "glm-5.2", false), None)
+            .await
+            .expect("seed fallback");
+
+        let profile_store = state.profile_store.as_ref().expect("profile store");
+        let profile = profile_store
+            .get("job-owner")
+            .expect("read profile")
+            .expect("profile exists");
+        let job_store = SkillActionJobStore::open(profile_store.resolve_data_dir(&profile));
+        let session_id = SessionKey("web-running-skill-action".into());
+        let now = Utc::now();
+        job_store
+            .append(&SkillActionJobRecord {
+                job_id: "running-job".into(),
+                batch_id: "batch-1".into(),
+                profile_id: "job-owner".into(),
+                session_id: session_id.clone(),
+                action_id: "source.import".into(),
+                skill_id: "mofa-notebook-source".into(),
+                status: SkillActionJobStatus::Running,
+                input_path: Some("uploads/report.pdf".into()),
+                filename: Some("report.pdf".into()),
+                materialized_path: Some("uploads/report.pdf".into()),
+                output: None,
+                error: None,
+                result: None,
+                created_at: now,
+                updated_at: now,
+            })
+            .expect("persist running job");
+
+        raw_profile_llm_select(
+            &state,
+            &RpcRequest::new(
+                "select-fallback",
+                APPUI_METHOD_PROFILE_LLM_SELECT.to_string(),
+                json!({
+                    "profile_id": "job-owner",
+                    "family_id": "zai",
+                    "model_id": "glm-5.2",
+                    "route_id": "official",
+                }),
+            ),
+            None,
+        )
+        .await
+        .expect("switch dynamic profile runtime");
+
+        assert_eq!(
+            job_store
+                .read(&session_id, "running-job")
+                .expect("read job")
+                .expect("running job")
+                .status,
+            SkillActionJobStatus::Running,
+            "runtime replacement must not perform restart-only job recovery"
+        );
+    }
+
     /// Key requirement mirrors the runtime factory, not just the registry
     /// flag: an `anthropic`/`responses` api_type override needs a key even
     /// on a registry-keyless family, and a family the registry doesn't know
@@ -33768,6 +33865,38 @@ ignore = []
     }
 
     #[test]
+    fn session_workspace_store_isolates_same_bare_session_id_by_profile() {
+        let store = session_workspaces();
+        let session_id = SessionKey(format!("web-shared-workspace-{}", uuid::Uuid::now_v7()));
+        let workspace_a = tempfile::tempdir().unwrap();
+        let workspace_b = tempfile::tempdir().unwrap();
+
+        store.set(
+            "profile-a",
+            session_id.clone(),
+            workspace_a.path().to_path_buf(),
+        );
+        store.set(
+            "profile-b",
+            session_id.clone(),
+            workspace_b.path().to_path_buf(),
+        );
+
+        assert_eq!(
+            session_workspace_root_for_profile(Some("profile-a"), &session_id),
+            Some(workspace_a.path().to_path_buf())
+        );
+        assert_eq!(
+            session_workspace_root_for_profile(Some("profile-b"), &session_id),
+            Some(workspace_b.path().to_path_buf())
+        );
+        assert_eq!(
+            session_workspace_root_for_profile(Some(MAIN_PROFILE_ID), &session_id),
+            None
+        );
+    }
+
+    #[test]
     fn runtime_policy_stamp_exposes_effective_permission_fields() {
         use octos_core::ui_protocol::{
             PermissionNetworkPolicy as Network, PermissionProfileMode as Mode,
@@ -33777,7 +33906,7 @@ ignore = []
         let state = AppState::empty_for_tests();
         let session_id = SessionKey("local:policy-stamp-test".into());
         let workspace = tempfile::tempdir().unwrap();
-        session_workspaces().set(session_id.clone(), workspace.path().to_path_buf());
+        session_workspaces().set("ada", session_id.clone(), workspace.path().to_path_buf());
         session_permission_profiles().set(
             session_id.clone(),
             Selection {

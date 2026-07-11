@@ -1442,7 +1442,7 @@ impl InProcessAgentOrchestrator {
     }
 
     /// Like [`Self::due_loop_targets`] but only counts a target toward
-    /// `max_items` when `runnable(session)` is true. The connection-independent
+    /// `max_items` when `runnable(session, profile_id)` is true. The connection-independent
     /// global drain passes a "workspace is known in-memory" predicate so it can
     /// use a small `max_items` (bounded result + bounded allocation) yet never
     /// let deferred (workspace-unknown) sessions at the head of the queue starve
@@ -1454,7 +1454,7 @@ impl InProcessAgentOrchestrator {
         &self,
         profile_filter: Option<&str>,
         max_items: usize,
-        runnable: Option<&dyn Fn(&SessionKey) -> bool>,
+        runnable: Option<&dyn Fn(&SessionKey, &str) -> bool>,
     ) -> Vec<(SessionKey, String)> {
         if max_items == 0 {
             return Vec::new();
@@ -1488,7 +1488,7 @@ impl InProcessAgentOrchestrator {
                 loop_record.session_id.clone(),
                 loop_record.profile_id.clone(),
             );
-            if runnable.is_some_and(|is_runnable| !is_runnable(&target.0)) {
+            if runnable.is_some_and(|is_runnable| !is_runnable(&target.0, &target.1)) {
                 continue;
             }
             if !targets.contains(&target) {
@@ -1530,7 +1530,7 @@ impl InProcessAgentOrchestrator {
                 if !goal_policy_allows_fire(goal, idle_state, now_system, now) {
                     continue;
                 }
-                if runnable.is_some_and(|is_runnable| !is_runnable(session_id)) {
+                if runnable.is_some_and(|is_runnable| !is_runnable(session_id, &goal.profile_id)) {
                     continue;
                 }
                 let target = (session_id.clone(), goal.profile_id.clone());
@@ -1556,10 +1556,8 @@ impl InProcessAgentOrchestrator {
         // existing control paths (pause/clear/delete) don't cancel
         // queued items, so we filter here at scheduling time.
         if targets.len() < max_items {
-            let mut seen_sessions: std::collections::HashSet<SessionKey> = targets
-                .iter()
-                .map(|(session_id, _)| session_id.clone())
-                .collect();
+            let mut seen_targets: std::collections::HashSet<(SessionKey, String)> =
+                targets.iter().cloned().collect();
             for item in state.continuations.pending_items() {
                 if profile_filter.is_some_and(|profile_id| item.profile_id.as_str() != profile_id) {
                     continue;
@@ -1568,11 +1566,14 @@ impl InProcessAgentOrchestrator {
                     continue;
                 }
                 let session_key = SessionKey(item.session_id.as_str().to_owned());
-                if runnable.is_some_and(|is_runnable| !is_runnable(&session_key)) {
+                if runnable
+                    .is_some_and(|is_runnable| !is_runnable(&session_key, item.profile_id.as_str()))
+                {
                     continue;
                 }
-                if seen_sessions.insert(session_key.clone()) {
-                    targets.push((session_key, item.profile_id.as_str().to_owned()));
+                let target = (session_key, item.profile_id.as_str().to_owned());
+                if seen_targets.insert(target.clone()) {
+                    targets.push(target);
                     if targets.len() >= max_items {
                         break;
                     }
@@ -7791,7 +7792,7 @@ mod tests {
 
         // Only `runnable` passes the predicate; `deferred` must be skipped
         // WITHOUT consuming the single slot.
-        let is_runnable = |session: &SessionKey| *session == runnable;
+        let is_runnable = |session: &SessionKey, _profile_id: &str| *session == runnable;
         let targets = orchestrator.due_loop_targets_with_filter(None, 1, Some(&is_runnable));
         assert_eq!(
             targets,
