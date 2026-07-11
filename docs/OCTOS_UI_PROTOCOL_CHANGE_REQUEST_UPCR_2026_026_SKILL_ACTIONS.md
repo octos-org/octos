@@ -104,8 +104,9 @@ Response:
 
 - `action_id`
 - `ok`
-- `results[]`, each mirroring `ToolResult` as `success`, `output`,
-  `file_modified`, `files_to_send`, and `structured_metadata`
+- `results[]`, each containing `success`, `output`, `file_modified`,
+  `artifacts[]`, and `structured_metadata`; file fields use opaque
+  session-workspace handles rather than raw host paths
 - `materialized_paths[]` for `file_each` actions
 
 ## Compatibility
