@@ -1,8 +1,18 @@
 {
   "name": "coding",
   "version": 1,
-  "description": "Default profile — preserves today's no-flag octos chat behaviour byte-for-byte. Tools are not filtered; the M8.2 built-in sub-agents are preloaded.",
-  "tools": {"mode": "default"},
+  "description": "Default profile — lean core-coding tool surface: files (group:fs), shell (group:runtime), search (group:search), long-term memory (group:memory), sub-agent spawn, and structured user questions. Web/research/media/messaging/pipeline tools and bundled skills are excluded to keep per-round tool-schema overhead low; run with `--profile coding-full` to restore the unfiltered set. The M8.2 built-in sub-agents are preloaded.",
+  "tools": {
+    "mode": "allow_list",
+    "tools": [
+      "group:fs",
+      "group:runtime",
+      "group:search",
+      "group:memory",
+      "spawn",
+      "ask_user_question"
+    ]
+  },
   "mcp_servers": [],
   "permissions": "default",
   "agents": ["research-worker", "repo-editor"]

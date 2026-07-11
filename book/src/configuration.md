@@ -175,6 +175,60 @@ The complete configuration structure with all available fields:
 
 > The `memory.refresh` pipeline is **on by default**. See [Memory & Skills → Automatic Memory Refresh](./memory-skills.md) for the full field list and the `octos memory` command. Opt out with `"enabled": false` or `OCTOS_MEMORY_REFRESH_ENABLED=0`.
 
+## Runtime Tool Profiles
+
+`octos chat` and `octos acp` resolve a **runtime profile** at startup that
+decides which tools are exposed to the LLM. Every tool schema in the registry
+is serialized into *every* LLM round, so the default profile is deliberately
+lean.
+
+Built-in profiles:
+
+| Profile | Tool surface |
+|---------|--------------|
+| `coding` (default) | **Lean core-coding loop only**: files (`group:fs`), shell (`group:runtime`), search (`group:search`), long-term memory (`group:memory`), `spawn`, `ask_user_question` — ≈15–18 tools, ≈3.3K tokens of schemas per round. Web/research/media/messaging tools, `run_pipeline`, and bundled skills (weather, news, send_email, …) are **excluded**. |
+| `coding-full` | The unfiltered pre-lean surface — every native, bundled-skill, plugin, and MCP tool (≈48 tools, ≈9K tokens per round). Byte-for-byte the old `coding` behaviour. |
+| `swarm` | Coding set plus swarm-coordination tools (`send_to_agent`, `cancel_task`, `relaunch_task`, …). |
+
+Switching profiles:
+
+```bash
+octos chat --profile coding-full        # one-off: everything back
+ln -s coding-full ~/.octos/profile      # persistent default (name or path)
+```
+
+Per-project customization — drop a profile file in
+`~/.octos/profiles/<name>/profile.json` (or pass a path via `--profile`) and
+add tools back with allow-list entries (`group:<id>`, exact names, or
+`prefix*` wildcards):
+
+```json
+{
+  "name": "coding-plus-web",
+  "version": 1,
+  "tools": {
+    "mode": "allow_list",
+    "tools": ["group:fs", "group:runtime", "group:search", "group:memory",
+              "spawn", "ask_user_question", "group:web"]
+  },
+  "agents": ["research-worker", "repo-editor"]
+}
+```
+
+Notes:
+
+- The profile filter runs **after** plugins/skills/MCP register, so it
+  applies to bundled-skill and plugin tools exactly as to builtins. Tools
+  marked `spawn_only` are never evicted by the filter; `run_pipeline` is
+  instead gated at registration time by the profile allow list.
+- Sub-agents are unaffected: `spawn` workers build their own registries, so
+  the built-in `research-worker` keeps `web_search`/`web_fetch` under the
+  lean default.
+- `config.json`'s `tool_policy` (below) still applies and can further narrow
+  (deny-wins) any profile.
+- `octos gateway` / `octos serve` do not use runtime profiles; their tool
+  surface is unchanged.
+
 ## Human Approval Rules
 
 Tool calls matching a configured rule suspend the turn until an authorized

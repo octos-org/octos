@@ -2554,25 +2554,28 @@ mod profile_filter_tests {
     }
 
     #[test]
-    fn coding_profile_produces_same_registry_as_default_builtins() {
-        // Behaviour parity gate: applying the built-in `coding` profile
-        // to a builtin registry must leave the registry IDENTICAL to
-        // what today's no-flag default path produces. This is the
-        // critical regression guard called out in the M8.3 issue.
+    fn coding_full_profile_produces_same_registry_as_default_builtins() {
+        // Behaviour parity gate: applying the built-in `coding-full`
+        // profile to a builtin registry must leave the registry IDENTICAL
+        // to what the no-flag default path produced before the lean
+        // `coding` default landed. This is the critical regression guard
+        // called out in the M8.3 issue, retargeted at the unfiltered
+        // escape hatch now that `coding` itself carries an allow list
+        // (see `crate::profile::tests` for the lean-narrowing pins).
         use crate::profile::ProfileDefinition;
 
         let dir = tempfile::tempdir().expect("tempdir");
         let reference = ToolRegistry::with_builtins(dir.path());
         let reference_names = builtin_names(&reference);
 
-        let coding = ProfileDefinition::builtin("coding").expect("coding builtin");
+        let full = ProfileDefinition::builtin("coding-full").expect("coding-full builtin");
         let mut profiled = ToolRegistry::with_builtins(dir.path());
-        coding.apply_to_registry(&mut profiled);
+        full.apply_to_registry(&mut profiled);
 
         let profiled_names = builtin_names(&profiled);
         assert_eq!(
             reference_names, profiled_names,
-            "coding profile must preserve behaviour parity with the default path",
+            "coding-full profile must preserve behaviour parity with the default path",
         );
     }
 

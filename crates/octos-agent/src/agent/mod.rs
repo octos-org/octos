@@ -1336,21 +1336,21 @@ mod profile_integration_tests {
         Agent::new(AgentId::new("default"), provider, tools, memory)
     }
 
-    async fn agent_with_coding_profile(cwd: &std::path::Path) -> Agent {
+    async fn agent_with_builtin_profile(cwd: &std::path::Path, name: &str) -> Agent {
         use crate::profile::ProfileDefinition;
 
         let memory = Arc::new(
-            EpisodeStore::open(cwd.join("memory-profile"))
+            EpisodeStore::open(cwd.join(format!("memory-profile-{name}")))
                 .await
                 .expect("episode store"),
         );
         let provider: Arc<dyn LlmProvider> = Arc::new(NoopProvider);
 
-        let coding = ProfileDefinition::builtin("coding").expect("coding builtin");
+        let profile = ProfileDefinition::builtin(name).expect("builtin profile");
         let mut tools = ToolRegistry::with_builtins(cwd);
-        coding.apply_to_registry(&mut tools);
+        profile.apply_to_registry(&mut tools);
 
-        Agent::new(AgentId::new("coding"), provider, tools, memory).with_profile(Arc::new(coding))
+        Agent::new(AgentId::new(name), provider, tools, memory).with_profile(Arc::new(profile))
     }
 
     fn tool_names(agent: &Agent) -> Vec<String> {
@@ -1365,20 +1365,61 @@ mod profile_integration_tests {
     }
 
     #[tokio::test]
-    async fn coding_profile_matches_default_tool_set() {
+    async fn coding_profile_narrows_default_tool_set() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let base = agent_default(tmp.path()).await;
-        let profiled = agent_with_coding_profile(tmp.path()).await;
+        let profiled = agent_with_builtin_profile(tmp.path(), "coding").await;
 
-        assert_eq!(
-            tool_names(&base),
-            tool_names(&profiled),
-            "coding profile must preserve the default tool set byte-for-byte",
+        let base_names = tool_names(&base);
+        let lean_names = tool_names(&profiled);
+        // Lean default: `coding` narrows the surface to the core coding
+        // loop instead of passing the registry through untouched.
+        assert!(
+            lean_names.len() < base_names.len(),
+            "lean coding profile must narrow the default set \
+             ({} -> {})",
+            base_names.len(),
+            lean_names.len(),
         );
+        assert!(
+            lean_names.iter().all(|n| base_names.contains(n)),
+            "lean set must be a subset of the default set",
+        );
+        for kept in ["read_file", "shell", "edit_file", "grep"] {
+            assert!(
+                lean_names.contains(&kept.to_string()),
+                "core-loop tool {kept} missing from lean set: {lean_names:?}",
+            );
+        }
+        for dropped in ["web_search", "browser", "image_generation"] {
+            assert!(
+                !lean_names.contains(&dropped.to_string()),
+                "non-core tool {dropped} must be filtered by the lean coding profile",
+            );
+        }
 
         // The profiled agent also exposes the recorded profile handle.
         let prof = profiled.profile().expect("profile handle present");
         assert_eq!(prof.name, "coding");
+        assert_eq!(prof.version, 1);
+    }
+
+    #[tokio::test]
+    async fn coding_full_profile_matches_default_tool_set() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let base = agent_default(tmp.path()).await;
+        let profiled = agent_with_builtin_profile(tmp.path(), "coding-full").await;
+
+        // The byte-for-byte parity contract moved from `coding` to the
+        // `coding-full` escape hatch when the lean default landed.
+        assert_eq!(
+            tool_names(&base),
+            tool_names(&profiled),
+            "coding-full profile must preserve the default tool set byte-for-byte",
+        );
+
+        let prof = profiled.profile().expect("profile handle present");
+        assert_eq!(prof.name, "coding-full");
         assert_eq!(prof.version, 1);
     }
 
