@@ -1040,8 +1040,8 @@ mod tests {
         reporter.report(ProgressEvent::CostUpdate {
             session_input_tokens: 12,
             session_output_tokens: 7,
-            response_input_tokens: 12 as u32,
-            response_output_tokens: 7 as u32,
+            response_input_tokens: 12,
+            response_output_tokens: 7,
             response_cost: None,
             session_cost: None,
             model: Some("deepseek-v4-pro".into()),
@@ -1069,8 +1069,8 @@ mod tests {
         reporter.report(ProgressEvent::CostUpdate {
             session_input_tokens: 12,
             session_output_tokens: 7,
-            response_input_tokens: 12 as u32,
-            response_output_tokens: 7 as u32,
+            response_input_tokens: 12,
+            response_output_tokens: 7,
             response_cost: None,
             session_cost: None,
             model: None,
@@ -1099,8 +1099,8 @@ mod tests {
         reporter.report(ProgressEvent::CostUpdate {
             session_input_tokens: 12,
             session_output_tokens: 7,
-            response_input_tokens: 12 as u32,
-            response_output_tokens: 7 as u32,
+            response_input_tokens: 12,
+            response_output_tokens: 7,
             response_cost: None,
             session_cost: None,
             model: None,
