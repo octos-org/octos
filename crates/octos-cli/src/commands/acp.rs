@@ -214,6 +214,32 @@ fn finalize_tool_registry(
     profile.apply_to_registry(tools);
 }
 
+/// Rebind the per-cwd base registry to one session's cwd and re-apply the
+/// finalize narrowing envelope.
+///
+/// codex P1 (lean default): `rebind_cwd_with_permissions` re-registers
+/// every cwd-bound builtin (workspace_*, view_image, tool_search/suggest,
+/// optionally git/code_structure) so they run against the session's repo —
+/// which resurrects tools the profile / config tool-policy narrowing
+/// evicted from the base registry. Re-running [`finalize_tool_registry`]
+/// keeps per-session registries on exactly the same envelope as the
+/// per-cwd base (the filters are idempotent).
+#[allow(clippy::too_many_arguments)]
+fn rebind_session_registry(
+    base: &ToolRegistry,
+    cwd: &std::path::Path,
+    sandbox: Box<dyn octos_agent::Sandbox>,
+    permissions: octos_agent::EffectivePermissions,
+    config: &Config,
+    provider_name: &str,
+    model_id: &str,
+    profile: &octos_agent::profile::ProfileDefinition,
+) -> ToolRegistry {
+    let mut tools = base.rebind_cwd_with_permissions(cwd, sandbox, permissions);
+    finalize_tool_registry(&mut tools, config, provider_name, model_id, profile);
+    tools
+}
+
 /// Process-global, **cwd-independent** state, assembled ONCE per `octos acp`
 /// process (lazily, on the first `session/new`). The redb episode store is a
 /// single-writer resource, so it must live here — never rebuilt per cwd. Also
@@ -646,11 +672,18 @@ impl SessionAgentFactory for ConfigAgentFactory {
 
         // Per-session: rebind this cwd's base registry so the cwd-bound tools
         // (shell/read_file/…) run against the client's repo, and give this session
-        // its own Arc-able registry.
-        let tools = b.tool_specs.rebind_cwd_with_permissions(
+        // its own Arc-able registry. The helper re-applies the finalize
+        // narrowing because the rebind re-registers cwd-bound builtins the
+        // profile/policy filters had evicted (codex P1 on the lean default).
+        let tools = rebind_session_registry(
+            &b.tool_specs,
             &cwd,
             create_sandbox(&b.sandbox),
             octos_agent::EffectivePermissions::workspace_write(),
+            &shared.config,
+            &shared.provider_name,
+            &shared.model_id,
+            &b.profile,
         );
 
         // Per-session filesystem scope (codex P1): contain file tools + plugins to
@@ -1430,6 +1463,68 @@ mod tests {
             );
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// codex P1 (lean default): `rebind_cwd_with_permissions` re-registers
+    /// every cwd-bound builtin (workspace_*, view_image, tool_search, …),
+    /// resurrecting tools that the per-cwd finalize narrowing evicted from
+    /// the base registry. Session assembly must therefore re-run the
+    /// finalize envelope on the rebound registry — pinned here against the
+    /// `rebind_session_registry` helper the production path uses.
+    #[test]
+    fn rebind_session_registry_reapplies_profile_narrowing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = Config::default();
+        let profile =
+            octos_agent::profile::ProfileDefinition::builtin("coding").expect("coding builtin");
+
+        // Base registry the per-cwd bootstrap ends up with: builtins +
+        // finalize narrowing (lean coding profile applied LAST).
+        let mut base = ToolRegistry::with_builtins_and_sandbox(
+            dir.path(),
+            create_sandbox(&octos_agent::SandboxConfig::default()),
+        );
+        finalize_tool_registry(&mut base, &config, "openai", "gpt-test", &profile);
+        assert!(
+            !base.is_tool_visible("workspace_diff"),
+            "lean coding base registry must have dropped workspace_diff"
+        );
+
+        // Pin the resurrection behaviour a raw rebind exhibits — if this
+        // ever stops holding, the helper below can be simplified away.
+        let raw = base.rebind_cwd_with_permissions(
+            dir.path(),
+            create_sandbox(&octos_agent::SandboxConfig::default()),
+            octos_agent::EffectivePermissions::workspace_write(),
+        );
+        assert!(
+            raw.is_tool_visible("workspace_diff"),
+            "rebind_cwd_with_permissions re-registers cwd-bound builtins"
+        );
+
+        // The session helper must re-narrow to the profile envelope.
+        let session = rebind_session_registry(
+            &base,
+            dir.path(),
+            create_sandbox(&octos_agent::SandboxConfig::default()),
+            octos_agent::EffectivePermissions::workspace_write(),
+            &config,
+            "openai",
+            "gpt-test",
+            &profile,
+        );
+        for resurrected in ["workspace_diff", "view_image", "tool_search", "web_search"] {
+            assert!(
+                !session.is_tool_visible(resurrected),
+                "{resurrected} must stay excluded in the rebound session registry"
+            );
+        }
+        for kept in ["read_file", "shell", "grep", "edit_file"] {
+            assert!(
+                session.is_tool_visible(kept),
+                "{kept} must survive the rebound session registry"
+            );
+        }
     }
 
     /// RFC-0 (#1289): LRU tool deferral was removed, so `shell` /
