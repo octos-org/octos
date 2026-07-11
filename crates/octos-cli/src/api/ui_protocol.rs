@@ -7096,12 +7096,21 @@ fn runtime_policy_stamp_for_profile(
 ) -> Value {
     let runtime = state.profiles.get(profile_id);
     let primary = profile.and_then(|profile| profile.config.primary_llm());
-    let model = runtime
-        .map(|runtime| runtime.primary_model_id.clone())
-        .or_else(|| primary.and_then(|selection| selection.model_id.clone()));
-    let provider = runtime
-        .map(|runtime| runtime.provider_name.clone())
-        .or_else(|| primary.and_then(|selection| selection.family_id.clone()));
+    // Precedence: the PROFILE FILE's primary wins over the startup-config
+    // runtime snapshot. `state.profiles` is built once at boot and never
+    // rebuilt, while turns bootstrap from the profile store (the
+    // SessionRuntimeCache re-reads the file after `profile/llm/select`
+    // evicts) — so the file is what the NEXT turn actually runs. With the
+    // old order, every status/read after a select reported the boot-time
+    // model forever, stomping the client's freshly-applied selection (the
+    // /model asterisk+footer flipped and snapped right back). The runtime
+    // snapshot remains the fallback for profiles with no stored file.
+    let model = primary
+        .and_then(|selection| selection.model_id.clone())
+        .or_else(|| runtime.map(|runtime| runtime.primary_model_id.clone()));
+    let provider = primary
+        .and_then(|selection| selection.family_id.clone())
+        .or_else(|| runtime.map(|runtime| runtime.provider_name.clone()));
     let permission_state = session_id
         .map(|session_id| session_permission_profiles().get_state(session_id))
         .unwrap_or_default();
@@ -30783,6 +30792,83 @@ ignore = []
         assert_eq!(stamp["permission_profile"], json!("danger_full_access"));
         assert_eq!(stamp["filesystem_scope"], json!("host"));
         assert_eq!(stamp["network"], json!("allowed"));
+    }
+
+    /// The stamp's model/provider must reflect the PROFILE FILE, not the
+    /// boot-time `state.profiles` runtime snapshot: turns bootstrap from the
+    /// file (SessionRuntimeCache re-reads it after `profile/llm/select`
+    /// evicts), so with the old runtime-first order every status/read after
+    /// a select reported the boot-time model forever — clients applied the
+    /// switch and the next status refresh stomped it back.
+    #[tokio::test]
+    async fn runtime_policy_stamp_prefers_profile_file_over_startup_runtime() {
+        use crate::profiles::{
+            LlmModelSelectionConfig, LlmProfileConfig, LlmRouteConfig, ProfileConfig, UserProfile,
+        };
+        use chrono::Utc;
+
+        let make_profile = |model: &str, family: &str| UserProfile {
+            id: "dev".to_string(),
+            name: "Dev".to_string(),
+            enabled: true,
+            data_dir: None,
+            parent_id: None,
+            public_subdomain: None,
+            config: ProfileConfig {
+                llm: Some(LlmProfileConfig {
+                    primary: Some(LlmModelSelectionConfig {
+                        family_id: Some(family.to_string()),
+                        model_id: Some(model.to_string()),
+                        route: Some(LlmRouteConfig {
+                            route_id: None,
+                            label: None,
+                            base_url: None,
+                            api_key_env: Some("STAMP_TEST_KEY".to_string()),
+                            api_type: None,
+                        }),
+                        ..Default::default()
+                    }),
+                    fallbacks: Vec::new(),
+                }),
+                env_vars: [("STAMP_TEST_KEY".to_string(), "test-key".to_string())]
+                    .into_iter()
+                    .collect(),
+                ..Default::default()
+            },
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+
+        // Boot-time runtime pinned to gpt-4o-mini…
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let boot_profile = make_profile("gpt-4o-mini", "openai");
+        let runtime = crate::runtime::ProfileRuntime::bootstrap(
+            &boot_profile,
+            &data_dir,
+            None,
+            crate::runtime::BootstrapRole::Serve,
+        )
+        .await
+        .expect("bootstrap boot-time runtime");
+        let mut state = AppState::empty_for_tests();
+        state.profiles.insert("dev".to_string(), runtime);
+
+        // …while the profile FILE has since been switched to deepseek-chat.
+        let file_profile = make_profile("deepseek-chat", "deepseek");
+        let stamp = runtime_policy_stamp_for_profile(&state, "dev", None, Some(&file_profile));
+        assert_eq!(
+            stamp["model"],
+            json!("deepseek-chat"),
+            "the file's primary must win over the startup snapshot: {stamp}"
+        );
+        assert_eq!(stamp["provider"], json!("deepseek"));
+
+        // Without a stored file the startup runtime remains the fallback.
+        let stamp = runtime_policy_stamp_for_profile(&state, "dev", None, None);
+        assert_eq!(stamp["model"], json!("gpt-4o-mini"));
+        assert_eq!(stamp["provider"], json!("openai"));
     }
 
     #[test]
