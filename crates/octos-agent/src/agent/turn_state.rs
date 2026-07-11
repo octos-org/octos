@@ -114,6 +114,12 @@ impl LoopTurnState {
         self.priced_usage
     }
 
+    /// `spend_usd` gated on any usage having been priced — the shape
+    /// `ConversationResponse::estimated_spend_usd` carries.
+    pub(crate) fn priced_spend(&self) -> Option<f64> {
+        self.priced_usage.then_some(self.turn_spend_usd)
+    }
+
     #[cfg(test)]
     pub(crate) fn retry_reasons(&self) -> &[LoopRetryReason] {
         &self.retry_reasons

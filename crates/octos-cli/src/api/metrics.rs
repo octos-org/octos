@@ -978,12 +978,16 @@ impl octos_agent::ProgressReporter for MetricsReporter {
                 record_tool_call(name, *success, duration.as_secs_f64());
             }
             octos_agent::ProgressEvent::CostUpdate {
-                session_input_tokens,
-                session_output_tokens,
+                response_input_tokens,
+                response_output_tokens,
                 ..
             } => {
-                record_llm_tokens("input", *session_input_tokens);
-                record_llm_tokens("output", *session_output_tokens);
+                // Count THIS response's tokens. The session_* fields are
+                // cumulative (now session-wide, not just turn-wide) —
+                // incrementing a counter by a cumulative value per event
+                // multiply-counted earlier responses.
+                record_llm_tokens("input", *response_input_tokens);
+                record_llm_tokens("output", *response_output_tokens);
             }
             _ => {}
         }

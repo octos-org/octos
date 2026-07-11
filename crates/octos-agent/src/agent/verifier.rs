@@ -549,13 +549,20 @@ impl Agent {
             config.provider.chat(&messages, &[], &verifier_config),
         )
         .await?;
+        // The verifier runs on its own provider — price its usage at the
+        // model that actually answered, resolved from the provider (which
+        // also handles verifier-side failover). `config.model_label` is a
+        // DISPLAY label ("session-cheap-verifier" when no explicit
+        // OCTOS_AGENT_VERIFIER_MODEL is set) and misses the catalog.
+        let verifier_model = config
+            .provider
+            .provider_metadata_for_index(response.provider_index)
+            .model;
         turn.record_usage(
             response.usage.input_tokens,
             response.usage.output_tokens,
             tracker,
-            // The verifier runs on its own provider — price its usage at
-            // the verifier's model, not the conversation's active slot.
-            octos_llm::pricing::model_pricing(&config.model_label)
+            octos_llm::pricing::model_pricing(&verifier_model)
                 .map(|p| p.cost(response.usage.input_tokens, response.usage.output_tokens)),
         );
         let content = response.content.unwrap_or_default();

@@ -949,6 +949,7 @@ impl Agent {
                                 reasoning_content: None,
                                 provider_metadata: None,
                                 token_usage: turn.total_usage().clone(),
+                                estimated_spend_usd: turn.priced_spend(),
                                 files_modified,
                                 files_to_send,
                                 streamed: false,
@@ -1038,7 +1039,7 @@ impl Agent {
                     // providers ignore `context_management` via
                     // `skip_serializing_if`.
                     let call_config = with_tier2_context_management(&config, self);
-                    let (mut response, streamed) = match self
+                    let (mut response, streamed, attributed_cost) = match self
                         .call_llm_with_hooks(
                             &messages,
                             &tools_spec,
@@ -1148,14 +1149,12 @@ impl Agent {
                         response.usage.input_tokens,
                         response.usage.output_tokens,
                         tracker,
-                        // Priced at the slot that ACTUALLY answered, so a
-                        // mid-turn failover doesn't re-price earlier
-                        // responses at the new model's rate.
-                        self.response_usage_cost(
-                            response.usage.input_tokens,
-                            response.usage.output_tokens,
-                            response.provider_index,
-                        ),
+                        // Attributed inside `call_llm_with_hooks`: each
+                        // attempt (discarded retries included) priced at the
+                        // slot that actually consumed it — re-pricing the
+                        // merged usage at the winner's rate here would
+                        // misprice cross-provider retries.
+                        attributed_cost,
                     );
 
                     match response.stop_reason {
@@ -1182,6 +1181,7 @@ impl Agent {
                                     self.llm.provider_metadata_for_index(response.provider_index),
                                 ),
                                 token_usage: turn.total_usage().clone(),
+                                estimated_spend_usd: turn.priced_spend(),
                                 files_modified,
                                 files_to_send,
                                 streamed,
@@ -1276,6 +1276,7 @@ impl Agent {
                                             reasoning_content: None,
                                             provider_metadata: None,
                                             token_usage: turn.total_usage().clone(),
+                                estimated_spend_usd: turn.priced_spend(),
                                             files_modified,
                                             files_to_send,
                                             streamed,
@@ -1338,6 +1339,7 @@ impl Agent {
                                                 reasoning_content: None,
                                                 provider_metadata: None,
                                                 token_usage: turn.total_usage().clone(),
+                                estimated_spend_usd: turn.priced_spend(),
                                                 files_modified,
                                                 files_to_send,
                                                 streamed,
@@ -1421,6 +1423,7 @@ impl Agent {
                                         ),
                                     ),
                                     token_usage: turn.total_usage().clone(),
+                                estimated_spend_usd: turn.priced_spend(),
                                     files_modified,
                                     files_to_send,
                                     streamed,
@@ -1511,6 +1514,7 @@ impl Agent {
                                         ),
                                     ),
                                     token_usage: turn.total_usage().clone(),
+                                estimated_spend_usd: turn.priced_spend(),
                                     files_modified,
                                     files_to_send,
                                     streamed,
@@ -1684,6 +1688,7 @@ impl Agent {
                                             self.llm.provider_metadata_for_index(response.provider_index),
                                         ),
                                         token_usage: turn.total_usage().clone(),
+                                estimated_spend_usd: turn.priced_spend(),
                                         files_modified,
                                         files_to_send,
                                         streamed,
@@ -1716,6 +1721,7 @@ impl Agent {
                                     self.llm.provider_metadata_for_index(response.provider_index),
                                 ),
                                 token_usage: turn.total_usage().clone(),
+                                estimated_spend_usd: turn.priced_spend(),
                                 files_modified,
                                 files_to_send,
                                 streamed,
@@ -1741,6 +1747,7 @@ impl Agent {
                                     self.llm.provider_metadata_for_index(response.provider_index),
                                 ),
                                 token_usage: turn.total_usage().clone(),
+                                estimated_spend_usd: turn.priced_spend(),
                                 files_modified,
                                 files_to_send,
                                 streamed,
@@ -1851,7 +1858,7 @@ impl Agent {
 
                 // M8.5 tier 2: decorate the config with the Anthropic header.
                 let call_config = with_tier2_context_management(&config, self);
-                let (mut response, _streamed) = match self
+                let (mut response, _streamed, attributed_cost) = match self
                     .call_llm_with_hooks(
                         &messages,
                         &tools_spec,
@@ -1883,11 +1890,9 @@ impl Agent {
                     response.usage.input_tokens,
                     response.usage.output_tokens,
                     None,
-                    self.response_usage_cost(
-                        response.usage.input_tokens,
-                        response.usage.output_tokens,
-                        response.provider_index,
-                    ),
+                    // Attributed per attempt inside `call_llm_with_hooks`
+                    // (cross-provider retries priced at their own slot).
+                    attributed_cost,
                 );
 
                 let tool_names: Vec<&str> = response

@@ -218,6 +218,14 @@ pub struct ConversationResponse {
     /// Exact provider instance provenance for the final assistant reply.
     pub provider_metadata: Option<ProviderMetadata>,
     pub token_usage: TokenUsage,
+    /// Estimated spend for `token_usage`, summed per response with each
+    /// response priced at the model that actually produced it (failover /
+    /// routed slots at their own rate). `None` when no response in the
+    /// turn had catalog pricing. Embedders must persist THIS instead of
+    /// re-pricing `token_usage` at the final `provider_metadata` model —
+    /// a turn that crossed models would re-price earlier responses at
+    /// the final model's rate (codex #1632 P1).
+    pub estimated_spend_usd: Option<f64>,
     pub files_modified: Vec<PathBuf>,
     pub files_to_send: Vec<PathBuf>,
     pub streamed: bool,

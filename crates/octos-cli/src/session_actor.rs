@@ -4511,11 +4511,19 @@ impl SessionActor {
                 let model = self.agent.model_id();
                 (!model.is_empty()).then(|| model.to_string())
             });
-        let estimated_cost_usd = model.as_deref().and_then(model_pricing).map(|pricing| {
-            pricing.cost(
-                response.token_usage.input_tokens,
-                response.token_usage.output_tokens,
-            )
+        // The turn's spend as attributed by the agent loop: each response
+        // priced at the model that produced it. Re-pricing token_usage at
+        // the FINAL provider_metadata model here (the old form) mispriced
+        // any turn that crossed models (failover, verifier) — and then
+        // persisted the wrong number in the ledger (codex #1632 P1). The
+        // fallback reprice covers legacy paths that predate the field.
+        let estimated_cost_usd = response.estimated_spend_usd.or_else(|| {
+            model.as_deref().and_then(model_pricing).map(|pricing| {
+                pricing.cost(
+                    response.token_usage.input_tokens,
+                    response.token_usage.output_tokens,
+                )
+            })
         });
         // Fold this run into the shared session base FIRST — the live
         // display must accumulate across turns even when no ledger is
@@ -8387,6 +8395,14 @@ impl SessionActor {
         let user_workspace = self.user_workspace.clone();
         let data_dir = self.data_dir.clone();
         let overflow_client_message_id = inbound_client_message_id(msg);
+        // codex #1632 P2: overflow runs consume real tokens but never
+        // reached `record_usage_event` (they run detached from the actor),
+        // so both the live session-usage base and the durable ledger
+        // omitted them. Clone the plumbing so the completion arm below can
+        // fold + record with the same numbers a foreground turn would.
+        let overflow_session_usage = self.session_usage.clone();
+        let overflow_usage_ledger = self.usage_ledger.clone();
+        let overflow_usage_profile_id = self.usage_profile_id.clone();
 
         tokio::spawn(async move {
             // Save user message to history first so it survives even if the
@@ -8704,6 +8720,62 @@ impl SessionActor {
                         // blocking master continuations / new overflow turns.
                         overflow_counter.fetch_sub(1, Ordering::Release);
                         return;
+                    }
+                    // Fold this overflow run into the session usage base and
+                    // the durable ledger — same numbers, same attribution
+                    // rules as `record_usage_event` on foreground turns.
+                    let overflow_model = conv_response
+                        .provider_metadata
+                        .as_ref()
+                        .map(|meta| meta.model.clone());
+                    let overflow_cost = conv_response.estimated_spend_usd.or_else(|| {
+                        overflow_model
+                            .as_deref()
+                            .and_then(model_pricing)
+                            .map(|pricing| {
+                                pricing.cost(
+                                    conv_response.token_usage.input_tokens,
+                                    conv_response.token_usage.output_tokens,
+                                )
+                            })
+                    });
+                    overflow_session_usage.fold_run(
+                        u64::from(conv_response.token_usage.input_tokens),
+                        u64::from(conv_response.token_usage.output_tokens),
+                        overflow_cost,
+                    );
+                    if let Some(ledger) = overflow_usage_ledger.as_ref() {
+                        let event = UsageEvent::completed_run(
+                            overflow_usage_profile_id.clone(),
+                            session_key.to_string(),
+                            uuid::Uuid::now_v7().to_string(),
+                            conv_response
+                                .provider_metadata
+                                .as_ref()
+                                .map(|meta| meta.provider.clone()),
+                            overflow_model.clone(),
+                            conv_response
+                                .provider_metadata
+                                .as_ref()
+                                .and_then(|meta| meta.endpoint.clone()),
+                            u64::from(conv_response.token_usage.input_tokens),
+                            u64::from(conv_response.token_usage.output_tokens),
+                            overflow_cost,
+                            if overflow_cost.is_some() {
+                                UsageCostSource::CatalogEstimate
+                            } else {
+                                UsageCostSource::Unavailable
+                            },
+                            channel.clone(),
+                            Some("speculative_overflow".to_string()),
+                        );
+                        if let Err(error) = ledger.record(event).await {
+                            warn!(
+                                session = %session_key,
+                                error = %error,
+                                "failed to record overflow usage event"
+                            );
+                        }
                     }
                     let final_content = finalize_assistant_content(
                         &session_key,
@@ -11994,6 +12066,10 @@ mod tests {
                 output_tokens,
                 ..Default::default()
             },
+            // What the agent loop would carry: the turn's usage priced at
+            // the model that produced it.
+            estimated_spend_usd: model_pricing(model)
+                .map(|pricing| pricing.cost(input_tokens, output_tokens)),
             files_modified: vec![],
             files_to_send: vec![],
             streamed: false,

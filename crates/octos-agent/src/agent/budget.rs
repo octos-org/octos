@@ -408,6 +408,7 @@ mod tests {
                 output_tokens: 20,
                 ..Default::default()
             },
+            estimated_spend_usd: None,
             files_modified: vec![],
             files_to_send: vec![],
             streamed: false,

@@ -19474,6 +19474,39 @@ async fn run_standalone_turn(
             None
         }
     };
+    // Session-cumulative usage base for cost emissions (codex #1632 P1):
+    // this path builds a FRESH agent per turn, so without a seeded base
+    // every `cost_update` reported turn-only "session" figures. Hydrate
+    // from the ledger this same path writes each completed run to —
+    // making the emitted `session_*` figures cover the whole session
+    // across turns, reconnects, and the per-turn agent rebuild. The
+    // completed-run write below lands before the client can start the
+    // next turn on this session, so the next hydration includes it.
+    let session_usage_base = octos_agent::SharedSessionUsage::default();
+    if let Some(ledger) = usage_ledger.as_ref() {
+        match ledger.session_totals(&session_id.to_string()).await {
+            Ok(totals) if totals.run_count > 0 => {
+                session_usage_base.seed(octos_agent::SessionUsageSnapshot {
+                    input_tokens: totals.input_tokens,
+                    output_tokens: totals.output_tokens,
+                    spend_usd: totals.estimated_cost_usd,
+                    priced_runs: if totals.estimated_cost_usd > 0.0 {
+                        totals.run_count
+                    } else {
+                        0
+                    },
+                });
+            }
+            Ok(_) => {}
+            Err(error) => {
+                warn!(
+                    session = %session_id.0,
+                    error = %error,
+                    "failed to hydrate session usage base from ledger"
+                );
+            }
+        }
+    }
 
     // Source the per-session primitives from the SessionRuntime.
     //
@@ -20595,6 +20628,7 @@ async fn run_standalone_turn(
         system_prompt_base.clone(),
         workspace_root.as_deref(),
     ))
+    .with_session_usage_base(session_usage_base.clone())
     .with_reporter(reporter);
     // In-loop compaction delivery (UPCR-2026-026 follow-up): mirror the
     // pre-turn lifecycle delivery — durable direct send for clients that
@@ -21581,13 +21615,18 @@ async fn run_standalone_turn(
                             let model = request_agent.model_id();
                             (!model.is_empty()).then(|| model.to_string())
                         });
-                    let estimated_cost_usd =
+                    // Attributed by the agent loop: each response priced at
+                    // the model that produced it. Re-pricing the turn total
+                    // at the final model mispriced cross-model turns (codex
+                    // #1632 P1); the reprice fallback covers legacy paths.
+                    let estimated_cost_usd = response.estimated_spend_usd.or_else(|| {
                         model.as_deref().and_then(model_pricing).map(|pricing| {
                             pricing.cost(
                                 response.token_usage.input_tokens,
                                 response.token_usage.output_tokens,
                             )
-                        });
+                        })
+                    });
                     let cost_source = if estimated_cost_usd.is_some() {
                         UsageCostSource::CatalogEstimate
                     } else {

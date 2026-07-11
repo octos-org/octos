@@ -27,7 +27,14 @@ impl Agent {
         iteration: u32,
         total_usage: &TokenUsage,
         turn: &mut LoopTurnState,
-    ) -> Result<(ChatResponse, bool)> {
+        // Returns `(response, streamed, attributed_cost_usd)`. The response's
+        // `usage` MERGES discarded retry attempts into the final attempt, and
+        // those attempts can come from DIFFERENT provider slots (an empty
+        // stream falling through to a fallback). `attributed_cost_usd` prices
+        // each attempt's tokens at the provider that actually consumed them,
+        // so callers must record it instead of re-pricing the merged total at
+        // the winner's rate (codex #1632 P2). `None` = no attempt was priced.
+    ) -> Result<(ChatResponse, bool, Option<f64>)> {
         let ctx = self.hook_ctx();
         if let Some(ref hooks) = self.hooks {
             let payload = HookPayload::before_llm(
@@ -45,6 +52,9 @@ impl Agent {
         // Track token usage from retried (discarded) attempts so cost reporting
         // reflects actual consumption, not just the final successful call.
         let mut retry_usage = TokenUsage::default();
+        // Spend already attributed to DISCARDED attempts, each priced at the
+        // provider slot that produced it (see the return-value doc above).
+        let mut retry_spend: Option<f64> = None;
 
         let fail_fast = octos_llm::current_llm_call_policy() == LlmCallPolicy::FailFast;
         let retry_max = if fail_fast { 0 } else { Self::LLM_RETRY_MAX };
@@ -85,7 +95,18 @@ impl Agent {
             match call_result {
                 Ok((response, streamed)) => {
                     if !Self::is_retriable_response(&response) {
-                        // Genuine success -- merge retry usage into response
+                        // Genuine success -- merge retry usage into response.
+                        // Price the FINAL attempt at its own slot BEFORE the
+                        // merge, then add the pre-priced retry spend.
+                        let final_cost = self.response_usage_cost(
+                            response.usage.input_tokens,
+                            response.usage.output_tokens,
+                            response.provider_index,
+                        );
+                        let attributed_cost = match (retry_spend, final_cost) {
+                            (None, None) => None,
+                            (a, b) => Some(a.unwrap_or(0.0) + b.unwrap_or(0.0)),
+                        };
                         let mut response = response;
                         response.usage.input_tokens += retry_usage.input_tokens;
                         response.usage.output_tokens += retry_usage.output_tokens;
@@ -116,7 +137,7 @@ impl Agent {
                             );
                             let _ = hooks.run(HookEvent::AfterLlmCall, &payload).await;
                         }
-                        return Ok((response, streamed));
+                        return Ok((response, streamed, attributed_cost));
                     }
 
                     if attempt == retry_max {
@@ -152,10 +173,19 @@ impl Agent {
                         match self.llm.chat(messages, tools_spec, config).await {
                             Ok(fallback_resp) if !Self::is_retriable_response(&fallback_resp) => {
                                 info!("non-streaming fallback succeeded");
+                                let final_cost = self.response_usage_cost(
+                                    fallback_resp.usage.input_tokens,
+                                    fallback_resp.usage.output_tokens,
+                                    fallback_resp.provider_index,
+                                );
+                                let attributed_cost = match (retry_spend, final_cost) {
+                                    (None, None) => None,
+                                    (a, b) => Some(a.unwrap_or(0.0) + b.unwrap_or(0.0)),
+                                };
                                 let mut fallback_resp = fallback_resp;
                                 fallback_resp.usage.input_tokens += retry_usage.input_tokens;
                                 fallback_resp.usage.output_tokens += retry_usage.output_tokens;
-                                return Ok((fallback_resp, false));
+                                return Ok((fallback_resp, false, attributed_cost));
                             }
                             Ok(_) => {
                                 warn!("non-streaming fallback also returned empty response");
@@ -172,7 +202,17 @@ impl Agent {
                         ));
                     }
 
-                    // Empty or abnormal response -- accumulate usage and retry
+                    // Empty or abnormal response -- accumulate usage and retry.
+                    // Price THIS attempt at the slot that produced it now;
+                    // by the time a later attempt wins, the winning slot's
+                    // rate would misprice these tokens.
+                    if let Some(cost) = self.response_usage_cost(
+                        response.usage.input_tokens,
+                        response.usage.output_tokens,
+                        response.provider_index,
+                    ) {
+                        retry_spend = Some(retry_spend.unwrap_or(0.0) + cost);
+                    }
                     retry_usage.input_tokens += response.usage.input_tokens;
                     retry_usage.output_tokens += response.usage.output_tokens;
 
@@ -259,7 +299,20 @@ impl Agent {
                         match self.llm.chat(messages, tools_spec, config).await {
                             Ok(resp) if !Self::is_retriable_response(&resp) => {
                                 info!("non-streaming fallback succeeded after stream failures");
-                                return Ok((resp, false));
+                                // Stream-error path: discarded attempts never
+                                // yielded usage, so the fallback's own cost
+                                // (plus any retry_spend from earlier empty
+                                // responses) is the whole attribution.
+                                let final_cost = self.response_usage_cost(
+                                    resp.usage.input_tokens,
+                                    resp.usage.output_tokens,
+                                    resp.provider_index,
+                                );
+                                let attributed_cost = match (retry_spend, final_cost) {
+                                    (None, None) => None,
+                                    (a, b) => Some(a.unwrap_or(0.0) + b.unwrap_or(0.0)),
+                                };
+                                return Ok((resp, false, attributed_cost));
                             }
                             Ok(_) => {
                                 warn!("non-streaming fallback also returned empty");
