@@ -278,6 +278,12 @@ pub struct AppState {
     /// same keystone that gates selecting the profile from the menu); an
     /// explicit per-session `/permissions` choice always overrides it.
     pub dangerous_default_permissions: bool,
+    /// `--llm-compaction`: AppUI context compaction asks an LLM for a
+    /// higher-quality handoff summary (a real model call — slower, seconds)
+    /// instead of the instant deterministic heuristic. Always falls back to the
+    /// heuristic on any error/timeout/unsupported-runtime, so it can never
+    /// break a turn. Default off.
+    pub llm_compaction: bool,
     /// Resolved HOST-level memory policy (top-level config). Threaded into
     /// lazily-bootstrapped profile runtimes so a host opt-out of memory
     /// refresh (DEFAULT-ON) also binds profiles created after startup.
@@ -402,6 +408,7 @@ impl AppState {
             deployment_mode: crate::config::DeploymentMode::Local,
             solo_login_enabled: false,
             dangerous_default_permissions: false,
+            llm_compaction: false,
             host_memory: None,
             allow_admin_shell: false,
             content_catalog_mgr: None,
