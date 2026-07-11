@@ -4586,22 +4586,16 @@ async fn ui_protocol_connection(
             }
             UiCommand::PermissionProfileSet(params) => {
                 let session_id = params.session_id.clone();
-                // Fall back to MAIN_PROFILE_ID so the cache is ALWAYS evicted
-                // (codex P1 on #1639): a bare AppUI session on an unscoped
-                // connection resolves to `_main` at session/open, so without
-                // this fallback an explicit downgrade would report success
-                // while the danger-seeded runtime stayed cached and in use.
-                let profile_id = session_id
-                    .profile_id()
-                    .or(connection_profile_id)
-                    .map(ToOwned::to_owned)
-                    .unwrap_or_else(|| MAIN_PROFILE_ID.to_owned());
                 match permission_profile_set_result(&state, params) {
                     Ok(result) => {
-                        state
-                            .session_cache
-                            .invalidate(&(profile_id, session_id))
-                            .await;
+                        // Evict by SESSION across every profile (codex P1 ×2
+                        // on #1639): the runtime may be cached under a
+                        // session/open `params.profile_id` this connection no
+                        // longer knows, and `invalidate_session` also bumps
+                        // the session generation so a concurrent in-flight
+                        // bootstrap can't re-cache the pre-change (possibly
+                        // dangerous) permissions after the downgrade.
+                        state.session_cache.invalidate_session(&session_id).await;
                         let _ =
                             send_ui_rpc_result(&ws, id, UiRpcResult::PermissionProfileSet(result));
                     }
@@ -5319,20 +5313,12 @@ where
             }
             UiCommand::PermissionProfileSet(params) => {
                 let session_id = params.session_id.clone();
-                // MAIN_PROFILE_ID fallback so the cache is ALWAYS evicted on a
-                // permission change (codex P1 on #1639) — see the sibling
-                // dispatcher above.
-                let profile_id = session_id
-                    .profile_id()
-                    .or(connection_profile_id_owned.as_deref())
-                    .map(ToOwned::to_owned)
-                    .unwrap_or_else(|| MAIN_PROFILE_ID.to_owned());
                 match permission_profile_set_result(&state, params) {
                     Ok(result) => {
-                        state
-                            .session_cache
-                            .invalidate(&(profile_id, session_id))
-                            .await;
+                        // Session-scoped eviction across all profiles + the
+                        // in-flight generation guard — see the sibling
+                        // dispatcher above (codex P1 ×2 on #1639).
+                        state.session_cache.invalidate_session(&session_id).await;
                         let _ =
                             send_ui_rpc_result(&ws, id, UiRpcResult::PermissionProfileSet(result));
                     }
