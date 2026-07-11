@@ -1173,7 +1173,7 @@ impl Agent {
                             {
                                 continue;
                             }
-                            self.emit_cost_update(&turn, &response);
+                            self.emit_cost_update(&turn, &response, attributed_cost);
                             return Ok(ConversationResponse {
                                 content,
                                 reasoning_content: response.reasoning_content.clone(),
@@ -1270,7 +1270,7 @@ impl Agent {
                                             decision = %outcome.decision,
                                             "shell spiral terminal: returning recovered content as final assistant reply"
                                         );
-                                        self.emit_cost_update(&turn, &response);
+                                        self.emit_cost_update(&turn, &response, attributed_cost);
                                         return Ok(ConversationResponse {
                                             content: terminal_content,
                                             reasoning_content: None,
@@ -1315,7 +1315,7 @@ impl Agent {
                                     // returns on second fire is caught and
                                     // converted to a terminal Ok response
                                     // here so callers don't see an error.
-                                    self.emit_cost_update(&turn, &response);
+                                    self.emit_cost_update(&turn, &response, attributed_cost);
                                     match self.dedup_loop_warning(warning) {
                                         Ok(warning_content) => {
                                             inject_loop_detected_synthetic_results_with_log(
@@ -1413,7 +1413,7 @@ impl Agent {
                             // `Agent::execute_approved_tool` when an
                             // authorized human answers.
                             if let Some(draft) = iter_pending_approval {
-                                self.emit_cost_update(&turn, &sanitized_response);
+                                self.emit_cost_update(&turn, &sanitized_response, attributed_cost);
                                 return Ok(ConversationResponse {
                                     content: String::new(),
                                     reasoning_content: None,
@@ -1504,7 +1504,7 @@ impl Agent {
                                     decision = %outcome.decision,
                                     "shell spiral terminal: returning recovered content as final assistant reply"
                                 );
-                                self.emit_cost_update(&turn, &response);
+                                self.emit_cost_update(&turn, &response, attributed_cost);
                                 return Ok(ConversationResponse {
                                     content: terminal_content,
                                     reasoning_content: None,
@@ -1611,7 +1611,7 @@ impl Agent {
                                     {
                                         continue;
                                     }
-                                    self.emit_cost_update(&turn, &response);
+                                    self.emit_cost_update(&turn, &response, attributed_cost);
                                     // Post-spawn failure feedback loop
                                     // (feat/spawn-only-failure-feedback-loop):
                                     // record that the synth-ack went out for
@@ -1713,7 +1713,7 @@ impl Agent {
                             }
                         }
                         StopReason::MaxTokens => {
-                            self.emit_cost_update(&turn, &response);
+                            self.emit_cost_update(&turn, &response, attributed_cost);
                             return Ok(ConversationResponse {
                                 content: response.content.unwrap_or_default(),
                                 reasoning_content: response.reasoning_content.clone(),
@@ -1734,7 +1734,7 @@ impl Agent {
                         StopReason::ContentFiltered => {
                             // After retries in call_llm_with_hooks, content is still filtered.
                             // Return a user-visible message instead of empty content.
-                            self.emit_cost_update(&turn, &response);
+                            self.emit_cost_update(&turn, &response, attributed_cost);
                             warn!("content filtered by provider safety/moderation after retries");
                             return Ok(ConversationResponse {
                                 content: response.content.unwrap_or_else(|| {
@@ -1978,7 +1978,7 @@ impl Agent {
                             }
                         }
 
-                        self.emit_cost_update(&turn, &final_response);
+                        self.emit_cost_update(&turn, &final_response, attributed_cost);
 
                         // Audit Gap-8: auto-fire `check_workspace_contract`
                         // on Completion. The LLM-callable wrapper stays for
@@ -2135,7 +2135,7 @@ impl Agent {
 
                         let final_response =
                             response_with_max_token_fragments(&response, &max_token_fragments);
-                        self.emit_cost_update(&turn, &final_response);
+                        self.emit_cost_update(&turn, &final_response, attributed_cost);
                         self.reporter().report(ProgressEvent::TaskCompleted {
                             success: false,
                             iterations: iteration,
@@ -2150,7 +2150,7 @@ impl Agent {
                     }
                     StopReason::ContentFiltered => {
                         warn!("content filtered by provider safety/moderation in task");
-                        self.emit_cost_update(&turn, &response);
+                        self.emit_cost_update(&turn, &response, attributed_cost);
                         self.reporter().report(ProgressEvent::TaskCompleted {
                             success: false,
                             iterations: iteration,

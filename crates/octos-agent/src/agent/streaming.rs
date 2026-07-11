@@ -491,7 +491,18 @@ impl Agent {
             .map(|p| p.cost(input_tokens, output_tokens))
     }
 
-    pub(super) fn emit_cost_update(&self, turn: &LoopTurnState, response: &ChatResponse) {
+    /// `attributed_cost` is the caller's per-attempt-priced cost for
+    /// exactly `response.usage` (see `call_llm_with_hooks`' return value).
+    /// `response.usage` MERGES discarded retry attempts, which can span
+    /// provider slots — re-pricing the aggregate at the final slot's rate
+    /// (the `None` fallback) misprices cross-provider retries, so callers
+    /// that hold the attribution must pass it (codex #1632 r3 P2).
+    pub(super) fn emit_cost_update(
+        &self,
+        turn: &LoopTurnState,
+        response: &ChatResponse,
+        attributed_cost: Option<f64>,
+    ) {
         let response_usage = &response.usage;
         // Codex round-1 P2: for failover / routed responses the slot that
         // produced this response may not match `self.llm.model_id()`
@@ -504,8 +515,9 @@ impl Agent {
             .llm
             .provider_metadata_for_index(response.provider_index);
         let pricing = octos_llm::pricing::model_pricing(&metadata.model);
-        let response_cost =
-            pricing.map(|p| p.cost(response_usage.input_tokens, response_usage.output_tokens));
+        let response_cost = attributed_cost.or_else(|| {
+            pricing.map(|p| p.cost(response_usage.input_tokens, response_usage.output_tokens))
+        });
         // Session figures = completed-runs base + this turn so far.
         //
         // The base comes from the shared session-usage handle (seeded from
