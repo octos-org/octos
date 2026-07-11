@@ -7877,20 +7877,18 @@ fn upsert_llm_fallback(
     }
 }
 
+/// Full selection *identity*: the [`same_llm_selection_address`] (which
+/// normalizes a missing route_id to the synthetic `"official"`) plus the
+/// endpoint. Two entries that agree on both resolve to the same provider —
+/// defined in terms of the address comparison so the two predicates cannot
+/// drift on route_id normalization (codex P2 round 3: a raw `Option`
+/// comparison here kept a route_id-less fallback alongside an identical
+/// `"official"` primary as a redundant retry-chain duplicate).
 fn same_llm_selection_identity(
     left: &crate::profiles::LlmModelSelectionConfig,
     right: &crate::profiles::LlmModelSelectionConfig,
 ) -> bool {
-    left.family_id == right.family_id
-        && left.model_id == right.model_id
-        && left
-            .route
-            .as_ref()
-            .and_then(|route| route.route_id.as_ref())
-            == right
-                .route
-                .as_ref()
-                .and_then(|route| route.route_id.as_ref())
+    same_llm_selection_address(left, right)
         && left
             .route
             .as_ref()
@@ -26348,6 +26346,115 @@ mod tests {
         assert!(
             llm.fallbacks.is_empty(),
             "promoting the exact identity must de-dup it out of the fallbacks: {llm:?}"
+        );
+    }
+
+    /// Identity comparison normalizes a missing route_id to the synthetic
+    /// `"official"` exactly like the address comparison (codex P2 round 3):
+    /// a route_id-less fallback with the same endpoint is the SAME provider
+    /// as an `"official"` upsert — it updates in place rather than
+    /// duplicating, and de-dups out of the list when promoted to primary.
+    #[tokio::test]
+    async fn llm_upsert_normalizes_default_route_ids_when_deduping() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = Arc::new(local_profile_state(dir.path()));
+        let upsert = |route: Value, set_primary: bool, tag: &str| {
+            RpcRequest::new(
+                format!("u-{tag}"),
+                APPUI_METHOD_PROFILE_LLM_UPSERT.to_string(),
+                json!({
+                    "profile_id": "dev",
+                    "selection": {
+                        "family_id": "deepseek",
+                        "model_id": "deepseek-chat",
+                        "route": route,
+                    },
+                    "set_primary": set_primary,
+                }),
+            )
+        };
+        let llm_of = |state: &Arc<AppState>| {
+            state
+                .profile_store
+                .as_ref()
+                .unwrap()
+                .get("dev")
+                .unwrap()
+                .unwrap()
+                .config
+                .llm
+                .clone()
+                .unwrap()
+        };
+
+        let mirror = "https://mirror.example";
+        raw_profile_llm_upsert(
+            &state,
+            &upsert(
+                json!({ "route_id": "official", "base_url": "https://one.example" }),
+                true,
+                "seed-primary",
+            ),
+            None,
+        )
+        .await
+        .expect("seed primary");
+        // Fallback saved WITHOUT a route_id (legacy/default-route shape).
+        raw_profile_llm_upsert(
+            &state,
+            &upsert(json!({ "base_url": mirror }), false, "seed-fallback"),
+            None,
+        )
+        .await
+        .expect("seed route_id-less fallback");
+
+        // Re-adding the same endpoint under the synthetic "official" id must
+        // update the existing fallback in place, not append a duplicate.
+        raw_profile_llm_upsert(
+            &state,
+            &upsert(
+                json!({ "route_id": "official", "base_url": mirror }),
+                false,
+                "readd",
+            ),
+            None,
+        )
+        .await
+        .expect("re-add under official");
+        assert_eq!(
+            llm_of(&state).fallbacks.len(),
+            1,
+            "official ≡ missing route_id: same provider must update in place"
+        );
+
+        // Promoting that provider under "official" de-dups the route_id-less
+        // row out of the retry chain.
+        raw_profile_llm_upsert(
+            &state,
+            &upsert(
+                json!({ "route_id": "official", "base_url": mirror }),
+                true,
+                "promote",
+            ),
+            None,
+        )
+        .await
+        .expect("promote");
+        let llm = llm_of(&state);
+        assert_eq!(
+            llm.primary
+                .as_ref()
+                .unwrap()
+                .route
+                .as_ref()
+                .unwrap()
+                .base_url
+                .as_deref(),
+            Some(mirror)
+        );
+        assert!(
+            llm.fallbacks.is_empty(),
+            "the normalized-identity duplicate must leave the retry chain: {llm:?}"
         );
     }
 
