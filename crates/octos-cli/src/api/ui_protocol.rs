@@ -11632,6 +11632,40 @@ async fn handle_turn_start(
         .map(ToOwned::to_owned)
         .or_else(|| resolved_profile_id.clone())
         .unwrap_or_else(|| MAIN_PROFILE_ID.to_owned());
+    // #1650 — snapshot the interactive goal binding NOW, synchronously,
+    // at dispatch time — before the turn task is spawned and woken via
+    // `start_rx`. A `session/goal/set` that arrives after this `turn/start`
+    // (same or another connection) therefore can't bind this already-
+    // submitted turn to a goal created after the fact (codex P2).
+    //
+    // Resolve the profile through the SAME `resolve_autonomy_profile_id`
+    // the raw `goal/set` handler uses (codex P2), so the binding matches
+    // exactly where the goal was stored. `profile_for_stamp` was subtly
+    // different — it falls back to the routed profile, whereas `goal/set`
+    // for an unscoped connection on an unprofiled session resolves to
+    // `_main` — which left accounting silently disabled for that flow. A
+    // scope error (unreachable here — `handle_turn_start` already ran
+    // `validate_session_scope` with the same inputs) or a session with no
+    // active goal both bind to `None` and never charge.
+    //
+    // KNOWN LIMITATION (codex P2): a `turn/start` carries no goal
+    // profile, so when an unscoped/admin connection sets a goal with an
+    // EXPLICIT `profile_id` on a bare session key, this resolves to
+    // `_main` and misses the tenant-scoped goal — that turn goes
+    // uncharged. Binding by session-key alone (ignoring profile) would
+    // fix it but risks the cross-tenant leak the profile match exists to
+    // prevent, since "unscoped ⇒ authorized for any profile" is
+    // deployment-dependent. A safe fix threads the goal's stored profile
+    // (or an authorized bind-by-session for admin connections) and is
+    // tracked as a follow-up.
+    let interactive_goal_binding =
+        resolve_autonomy_profile_id(Some(&session_id), None, connection_profile_id)
+            .ok()
+            .and_then(|goal_profile| {
+                default_agent_orchestrator()
+                    .active_goal_id(&session_id, &goal_profile)
+                    .map(|goal_id| (goal_profile, goal_id))
+            });
     let handle = tokio::spawn(async move {
         if start_rx.await.is_err() {
             return;
@@ -11667,6 +11701,8 @@ async fn handle_turn_start(
                 // accountant wiring. Only the master continuation
                 // runner sets this to `Some(...)` for `GoalContinue`.
                 None,
+                // #1650 — interactive goal binding snapshotted above.
+                interactive_goal_binding,
             )
             .await;
         }
@@ -11898,6 +11934,10 @@ async fn maybe_spawn_appui_master_continuation_runner(
             true,
             loop_id_for_self_paced,
             goal_context_for_appui,
+            // #1650 — master continuations carry their accounting via
+            // `goal_context` (a `GoalContinue` charges through
+            // `record_goal_turn`); the interactive binding is never used.
+            None,
         )
         .await;
         default_agent_orchestrator().mark_continuation_completed(
@@ -19589,6 +19629,15 @@ async fn run_standalone_turn(
     // record AND detect the `<goal:complete>` sentinel — parity with the
     // `SessionActor::maybe_advance_goal_runtime_after_turn` chat path.
     goal_context: Option<GoalContinuationContext>,
+    // #1650 — for an INTERACTIVE turn, the goal binding
+    // `(charge_profile, goal_id)` snapshotted by the turn-start handler
+    // at DISPATCH time — before this task is woken via `start_rx` — so a
+    // `session/goal/set` racing in after `turn/start` can't bind this
+    // already-submitted turn to a goal created after the fact (codex
+    // P2). `None` for a turn with no active goal at dispatch, and always
+    // `None` for master continuations (`goal_context` carries their
+    // accounting instead).
+    interactive_goal_binding: Option<(String, String)>,
 ) {
     let session_id = params.session_id.clone();
     let turn_id = params.turn_id.clone();
@@ -19623,6 +19672,38 @@ async fn run_standalone_turn(
         .profile_id()
         .map(ToOwned::to_owned)
         .or(routed_profile_id.clone());
+    // #1650 — the interactive goal binding `(charge_profile, goal_id)`
+    // was snapshotted by the turn-start handler at DISPATCH time (before
+    // this task was woken), so a `session/goal/set` racing in after
+    // `turn/start` can't retroactively bind this already-submitted turn
+    // to a goal created after the fact (codex P2). Split it into the
+    // pieces the post-loop accountant reads. Binding to the captured
+    // goal_id also means a mid-turn clear+recreate can't mischarge the
+    // replacement — the charge re-checks the id inside the helper. No
+    // in-flight marker is claimed: the charge runs right after the turn
+    // loop, BEFORE the voice-TTS / spawn_only tail, closing the
+    // scheduler/cancel window without a guard whose non-refcounted
+    // marker could collide with a concurrent SessionActor continuation.
+    let (goal_charge_profile, interactive_goal_id) = match interactive_goal_binding {
+        Some((profile, goal_id)) => (profile, Some(goal_id)),
+        None => (MAIN_PROFILE_ID.to_owned(), None),
+    };
+    // #1650 (codex P1) — when this interactive turn will charge an active
+    // goal, keep that goal NON-RUNNABLE from now until the post-loop
+    // charge commits by claiming its in-flight marker. `drain_and_claim`
+    // then defers any queued `GoalContinue` for the whole turn, so on the
+    // multi-threaded serve runtime a scheduler tick on another thread
+    // can't drain one in the gap between `try_emit_terminal` and the
+    // charge and run it past a just-crossed budget. The claim is
+    // owner-aware (returns `None` if a concurrent `SessionActor`
+    // continuation already holds the marker), so it never wipes another
+    // dispatcher's marker. The guard is dropped right after the charge
+    // block (before the voice-TTS tail) so a rapid follow-up turn can
+    // re-claim; it also drops via RAII on any early return / cancellation.
+    let interactive_goal_guard = interactive_goal_id
+        .is_some()
+        .then(|| default_agent_orchestrator().try_claim_goal_in_flight(&session_id))
+        .flatten();
     let Some(profile_runtime) =
         resolve_session_profile_runtime(&state, active_profile_id.as_deref())
     else {
@@ -19790,6 +19871,11 @@ async fn run_standalone_turn(
     // the chat path's `maybe_advance_goal_runtime_after_turn(goal_turn_start)`
     // pattern in `SessionActor`.
     let goal_turn_start = goal_context.as_ref().map(|_| std::time::Instant::now());
+    // #1650 — wall-clock for the *interactive* (non-goal_context) path.
+    // An interactive turn can still be charged against the session's
+    // active goal (the counter must climb while the user drives), so
+    // capture its start here symmetrically to `goal_turn_start`.
+    let interactive_turn_start = goal_context.is_none().then(std::time::Instant::now);
     // Voice-turn lean-prompt signal. Derived cheaply from the turn's media
     // (an audio attachment) WITHOUT waiting for STT — a safe over-approximation
     // of `had_audio_input` that is available before the tool registry and the
@@ -21924,6 +22010,14 @@ async fn run_standalone_turn(
                     "content": response.content,
                     "tokens_in": response.token_usage.input_tokens,
                     "tokens_out": response.token_usage.output_tokens,
+                    // #1650 — cache reads/writes are DISJOINT from
+                    // `input_tokens` (anthropic: prompt = input + cache_read
+                    // + cache_creation). They are still real tokens the goal
+                    // budget must count, so carry them for the goal
+                    // accountant. `tokens_in`/`tokens_out` keep their prior
+                    // meaning for every other consumer of this event.
+                    "tokens_cache": (response.token_usage.cache_read_tokens as u64)
+                        + (response.token_usage.cache_write_tokens as u64),
                     "cursor": cursor,
                     "message_id": final_assistant_message_id,
                     "final_assistant_committed_seq": final_assistant_committed_seq,
@@ -22143,9 +22237,18 @@ async fn run_standalone_turn(
                 // accumulator total-safe for malformed payloads.
                 let tokens_in = event.get("tokens_in").and_then(Value::as_u64).unwrap_or(0);
                 let tokens_out = event.get("tokens_out").and_then(Value::as_u64).unwrap_or(0);
+                // #1650 — include cache reads/writes (disjoint from
+                // `tokens_in`) so a cache-heavy turn charges the goal its
+                // TRUE token cost instead of just the uncached suffix +
+                // output. Absent on older/malformed payloads → treated as 0.
+                let tokens_cache = event
+                    .get("tokens_cache")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
                 final_tokens_consumed = final_tokens_consumed
                     .saturating_add(tokens_in)
-                    .saturating_add(tokens_out);
+                    .saturating_add(tokens_out)
+                    .saturating_add(tokens_cache);
                 // Issue #1332: thread `done` payload data into the
                 // `turn/completed` lifecycle event. Tokens come from the
                 // same `response.token_usage` values the cost accountant
@@ -22299,6 +22402,132 @@ async fn run_standalone_turn(
             }
         }
     }
+
+    // #1650 — interactive goal accountant. Placed HERE — immediately
+    // after the turn loop and BEFORE the voice-TTS / spawn_only
+    // post-terminal tail — so the (synchronous) charge lands while the
+    // window is short: a WebSocket close during the seconds-long TTS
+    // wait (`abort_connection_turns`) can't cancel the task before the
+    // goal is charged, and the ~2s scheduler tick can't drain a queued
+    // `GoalContinue` past a budget-crossing turn during that tail
+    // (codex P1). The remaining window — loop exit → this block — has no
+    // long awaits, so no in-flight guard (and its non-refcounted marker)
+    // is needed.
+    //
+    // Residual (codex P2, shared with the autonomous `record_goal_turn`
+    // accountant below): the `turn_state.lock().await` here is still an
+    // abort point, so a socket close in the microseconds between loop
+    // exit and this charge can drop the charge. Both goal accountants run
+    // post-terminal and share this exposure; making completed-turn
+    // accounting survive connection-abort belongs to both together and is
+    // tracked as a follow-up. The impact is bounded — one turn's spend
+    // uncounted, and the budget is a post-turn soft cap regardless.
+    //
+    // Fires only for a genuine interactive turn that had an active goal
+    // at turn start (`interactive_goal_id` is Some ⇒ `goal_context` is
+    // None AND not a master continuation): never a `GoalContinue`
+    // (charged by the accountant below) nor a `LoopFire` /
+    // `ChildCompleted` autonomous turn — loop work is not goal work.
+    //
+    // Accounting is DECOUPLED from marker ownership (codex P2): charge on
+    // `interactive_goal_id`, NOT on holding `_interactive_goal_guard`. The
+    // guard is best-effort protection — when we claimed it (the common
+    // case) it defers concurrent `GoalContinue` drains for the whole
+    // turn, closing the multi-threaded race. When another dispatcher
+    // already owned the marker we still charge: skipping would silently
+    // drop this completed turn's spend whenever the holder is a
+    // `LoopFire` / `ChildCompleted` / `External` continuation (which hold
+    // the marker but do NOT invoke the goal accountant). Charging then is
+    // still safe from a concurrent GoalContinue — that holder's own
+    // marker blocks drains while it runs — and the only residual is the
+    // inherent post-turn soft-cap overshoot (≤ one turn) shared with the
+    // autonomous path once the holder releases.
+    //
+    // Gate on the ACTUAL terminal reason (codex P2): only a turn that
+    // WON the `Terminal(Completed)` transition charges. An interrupted
+    // turn is `Terminal(Interrupted)` — or still `Active` here, and
+    // transitioned to `Interrupted` by the `if interrupt_observed` block
+    // below — so it neither charges nor budget-limits the goal. A
+    // successful turn's `done` arm already emitted `Terminal(Completed)`
+    // before breaking the loop, so the reason is authoritative now.
+    if let Some(charge_goal_id) = interactive_goal_id.as_deref() {
+        let terminalized_completed = matches!(
+            &*turn_state.lock().await,
+            TurnState::Terminal(TerminalReason::Completed)
+        );
+        if terminalized_completed {
+            // Charge on nonzero elapsed OR tokens (codex P2): a
+            // successful turn reporting zero token usage but nonzero
+            // wall-clock still advances `time_used_seconds` /
+            // `updated_at_ms`. `charge_active_goal_tokens` binds to
+            // `charge_goal_id` and matches the profile, so a mid-turn
+            // goal replacement or a cross-tenant turn is rejected inside
+            // the helper. It touches ONLY `tokens_used` /
+            // `time_used_seconds` / `updated_at_ms` (plus the
+            // budget-limited flip on crossing): no rate-window or
+            // completion-sentinel machinery runs for a user-driven turn.
+            let elapsed_seconds = interactive_turn_start
+                .map(|start| start.elapsed().as_secs())
+                .unwrap_or(0);
+            if let Some(goal_event_json) = default_agent_orchestrator().charge_active_goal_tokens(
+                &session_id,
+                &goal_charge_profile,
+                charge_goal_id,
+                final_tokens_consumed,
+                elapsed_seconds,
+            ) {
+                match serde_json::from_value::<octos_core::ui_protocol::SessionGoalUpdatedEvent>(
+                    goal_event_json,
+                ) {
+                    Ok(event) => {
+                        // Deliver to the OWNING connection via an
+                        // ephemeral direct-send to `ws` (codex P1): a
+                        // durable ledger append is fanned to EVERY
+                        // session subscriber by their live forwarder,
+                        // which does not filter on `profile_id`, and
+                        // would leak this profile's goal state to a
+                        // different profile that co-opened the same
+                        // unprofiled session id. `ws` is the turn's own
+                        // connection, already proven by the charge-side
+                        // profile match to belong to the goal's owner.
+                        //
+                        // A backpressure drop of a token-count update
+                        // self-heals: the next interactive turn re-pushes
+                        // the fresh count while the goal stays `active`.
+                        // The one exception (codex P2, tracked as a
+                        // follow-up) is the `budget_limited` TRANSITION
+                        // push — once the goal leaves `active`,
+                        // `active_goal_id` returns `None` and no later
+                        // turn re-pushes, so a dropped transition frame
+                        // leaves the chip stale until an explicit
+                        // `goal/get`. A durable-but-owning-connection-only
+                        // delivery (or a retry of the terminal transition)
+                        // would close it without reopening the leak.
+                        let _ = send_notification_ephemeral(
+                            &ws,
+                            &ledger,
+                            UiNotification::SessionGoalUpdated(event),
+                        );
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            error = %err,
+                            session_id = %session_id,
+                            "interactive goal charge produced an unparseable update event",
+                        );
+                    }
+                }
+            }
+        }
+    }
+    // #1650 — release the in-flight marker now that the charge has
+    // committed (goal already flipped `budget_limited` if it crossed) and
+    // BEFORE the voice-TTS / spawn_only tail + `evict_turn`, so a rapid
+    // follow-up interactive turn on this session can re-claim it. A no-op
+    // when the guard is `None` (no goal, or a concurrent SessionActor
+    // continuation owned the marker). Early-return / cancellation paths
+    // that skip this still drop the guard via RAII.
+    drop(interactive_goal_guard);
 
     // Voice turn: flush the trailing partial sentence (marker already held back
     // by the splitter), close the channel, and wait for the FIFO TTS worker.
