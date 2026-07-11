@@ -1273,12 +1273,13 @@ Clients must use that method list to enable or disable slash commands.
 `skill/action/list`:
 
 - requires `session_id`; accepts optional `profile_id`, `surface`, and `tags[]`
-- bootstraps the session's profile runtime and scans installed skill manifests
-  visible to that runtime
+- bootstraps the session's profile runtime and returns manifest actions loaded
+  for that runtime
 - returns `{ profile_id, session_id, count, actions }`
-- each action includes `id`, `skill_id`, `skill_dir`, `label`,
-  optional `description`, `tags[]`, `surfaces[]`, `input_schema`,
+- each action includes `id`, `skill_id`, `label`, `execution`, optional
+  `description`, `tags[]`, `surfaces[]`, `input_schema`,
   `ui_schema`, and `available`
+- `skill_dir` is server-only and is never returned to AppUI clients
 - when `surface` is present, actions with an empty `surfaces[]` remain
   eligible; actions with non-empty `surfaces[]` must include the requested
   surface
@@ -1292,8 +1293,8 @@ Clients must use that method list to enable or disable slash commands.
   `arguments`
 - `action_id` may be either the manifest action id (`source.import`) or the
   skill-qualified id (`mofa-notebook-source/source.import`)
-- the server resolves the session runtime, reloads manifest-declared actions,
-  and invokes only the action's manifest binding; clients cannot override the
+- the server resolves the session runtime and invokes only its loaded manifest
+  binding; clients cannot override the
   backend tool name, input mode, or file-materialization mode at call time
 - `single` input mode forwards the JSON object in `arguments` to the bound tool
 - `file_each` input mode requires `arguments.paths[]` and invokes the bound

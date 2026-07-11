@@ -173,15 +173,12 @@ The canonical wire fields are:
 - `output`
 - `error`
 - `result`
-- `source_id`
-- `source_path`
-- `metadata_path`
 - `created_at`
 - `updated_at`
 
-Notebook source metadata fields are optional convenience projections extracted
-from a skill result's structured metadata. They do not make the job protocol
-notebook-specific; non-source skills can ignore them and use `result`.
+`result` is a generic skill-owned result envelope. Source-oriented skills may
+put structured metadata within it, but the AppUI job protocol does not project
+notebook-specific fields.
 
 ## Persistence
 
@@ -191,9 +188,9 @@ Job snapshots are append-only per session:
 <profile_data_dir>/skill-action-jobs/<encoded-session-id>.jsonl
 ```
 
-The latest snapshot for a `job_id` wins. Startup recovery scans persisted job
-files and appends `abandoned` snapshots for jobs whose latest status is
-`queued` or `running`.
+The latest snapshot for a `job_id` wins. During `octos serve` startup, recovery
+scans persisted job files and appends `abandoned` snapshots for jobs whose
+latest status is `queued` or `running`.
 
 ## Compatibility
 

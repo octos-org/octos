@@ -85,9 +85,12 @@ Request:
 Response:
 
 - `profile_id`, `session_id`, `count`
-- `actions[]`, each containing `id`, `skill_id`, `skill_dir`, `label`,
+- `actions[]`, each containing `id`, `skill_id`, `label`, `execution`,
   optional `description`, `tags[]`, `surfaces[]`, `input_schema`,
   `ui_schema`, and `available`
+
+`skill_dir` is server-only runtime state and is never included in the AppUI
+response.
 
 Actions bound to tools unavailable in the session runtime are filtered out.
 
