@@ -7096,21 +7096,27 @@ fn runtime_policy_stamp_for_profile(
 ) -> Value {
     let runtime = state.profiles.get(profile_id);
     let primary = profile.and_then(|profile| profile.config.primary_llm());
-    // Precedence: the PROFILE FILE's primary wins over the startup-config
-    // runtime snapshot. `state.profiles` is built once at boot and never
-    // rebuilt, while turns bootstrap from the profile store (the
-    // SessionRuntimeCache re-reads the file after `profile/llm/select`
-    // evicts) — so the file is what the NEXT turn actually runs. With the
-    // old order, every status/read after a select reported the boot-time
-    // model forever, stomping the client's freshly-applied selection (the
-    // /model asterisk+footer flipped and snapped right back). The runtime
-    // snapshot remains the fallback for profiles with no stored file.
-    let model = primary
-        .and_then(|selection| selection.model_id.clone())
-        .or_else(|| runtime.map(|runtime| runtime.primary_model_id.clone()));
-    let provider = primary
-        .and_then(|selection| selection.family_id.clone())
-        .or_else(|| runtime.map(|runtime| runtime.provider_name.clone()));
+    // The stamp reports the model that will actually SERVE the next turn,
+    // matching `resolve_session_profile_runtime`'s precedence:
+    // - a profile pinned in startup-config `state.profiles` keeps serving
+    //   that immutable runtime until restart (`profile/llm/select` only
+    //   warns for these), so the boot snapshot is the truth even when the
+    //   stored file has since changed;
+    // - a store-backed (dynamic) profile re-bootstraps from the FILE after
+    //   select evicts, so the file's primary is the truth — the old
+    //   unconditional runtime-first order made every status/read stomp a
+    //   freshly-applied selection back to the boot-time model.
+    let (model, provider) = if let Some(runtime) = runtime {
+        (
+            Some(runtime.primary_model_id.clone()),
+            Some(runtime.provider_name.clone()),
+        )
+    } else {
+        (
+            primary.and_then(|selection| selection.model_id.clone()),
+            primary.and_then(|selection| selection.family_id.clone()),
+        )
+    };
     let permission_state = session_id
         .map(|session_id| session_permission_profiles().get_state(session_id))
         .unwrap_or_default();
@@ -7775,7 +7781,7 @@ async fn raw_profile_llm_select(
                 .cloned()
         })
         .unwrap_or_else(|| json!({ "model": model_id, "selected": true }));
-    Ok(json!({
+    let mut result = json!({
         "session_id": session_id,
         "selected": selected,
         "applied": applied,
@@ -7785,7 +7791,14 @@ async fn raw_profile_llm_select(
             Some(&session_id),
             Some(&refreshed),
         ),
-    }))
+    });
+    if state.profiles.contains_key(&profile_id) {
+        // Startup-pinned runtime: the selection is saved but turns keep the
+        // boot snapshot until restart (the stamp above says so too). Tell
+        // the caller instead of letting the switch silently not take.
+        result["restart_required"] = json!(true);
+    }
+    Ok(result)
 }
 
 /// Resolve the target profile for the profile-LLM raw methods, rejecting
@@ -7975,10 +7988,52 @@ fn llm_selection_activation_error(
     profile: &crate::profiles::UserProfile,
     selection: &crate::profiles::LlmModelSelectionConfig,
 ) -> Result<(), RpcError> {
-    let family = selection.family_id.as_deref().unwrap_or_default();
-    let requires_key = octos_llm::registry::lookup(family)
-        .map(|entry| entry.requires_api_key)
-        .unwrap_or(false);
+    let model = selection.model_id.as_deref().unwrap_or("model");
+    // Effective provider exactly as bootstrap resolves it: the explicit
+    // family, else `detect_provider` on the model id (the same fallback
+    // `ProfileRuntime::bootstrap` applies to `config_from_profile` output).
+    let family = selection
+        .family_id
+        .as_deref()
+        .filter(|family| !family.is_empty())
+        .or_else(|| {
+            selection
+                .model_id
+                .as_deref()
+                .and_then(crate::config::detect_provider)
+        });
+    let Some(family) = family else {
+        return Err(RpcError::invalid_params(format!(
+            "cannot activate {model}: no provider family configured and none detectable \
+             from the model id — re-save the selection with an explicit family first"
+        ))
+        .with_data(json!({ "kind": "llm_provider_unresolved" })));
+    };
+    // Key requirement mirrors `create_provider_with_api_type`: the
+    // `anthropic`/`responses` protocol overrides always need a key (even on
+    // registry-keyless families), `custom` always needs one, otherwise the
+    // registry entry decides. A family the registry doesn't know cannot be
+    // constructed at all — reject rather than persist a guaranteed
+    // bootstrap failure (codex P1).
+    let api_type = selection
+        .route
+        .as_ref()
+        .and_then(|route| route.api_type.as_deref());
+    let requires_key = match api_type {
+        Some("anthropic") | Some("responses") => true,
+        _ if family == "custom" => true,
+        _ => match octos_llm::registry::lookup(family) {
+            Some(entry) => entry.requires_api_key,
+            None => {
+                return Err(RpcError::invalid_params(format!(
+                    "cannot activate {family}/{model}: unknown provider family — valid: \
+                     custom, {}",
+                    octos_llm::registry::all_names().join(", ")
+                ))
+                .with_data(json!({ "kind": "llm_provider_unresolved", "family": family })));
+            }
+        },
+    };
     if !requires_key {
         return Ok(());
     }
@@ -7990,7 +8045,6 @@ fn llm_selection_activation_error(
     if config.get_api_key_with_env(family, env_override).is_ok() {
         return Ok(());
     }
-    let model = selection.model_id.as_deref().unwrap_or("model");
     let var = env_override
         .map(String::from)
         .or_else(|| crate::config::Config::provider_default_env_var(family))
@@ -26283,6 +26337,139 @@ mod tests {
             .expect("keyed select applies");
         assert_eq!(result["applied"], true);
         assert_eq!(result["selected"]["model"], "glm-5.2");
+        assert_eq!(
+            result.get("restart_required"),
+            None,
+            "dynamic profiles apply without a restart: {result}"
+        );
+    }
+
+    /// Key requirement mirrors the runtime factory, not just the registry
+    /// flag: an `anthropic`/`responses` api_type override needs a key even
+    /// on a registry-keyless family, and a family the registry doesn't know
+    /// can never construct — both would persist a bricked primary if the
+    /// validator waved them through (codex P1 on the keyless-select fix).
+    #[tokio::test]
+    async fn llm_select_rejects_unactivatable_api_type_and_unknown_families() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = Arc::new(local_profile_state(dir.path()));
+        let upsert = |family: &str, model: &str, route: Value| {
+            RpcRequest::new(
+                format!("u-{family}-{model}"),
+                APPUI_METHOD_PROFILE_LLM_UPSERT.to_string(),
+                json!({
+                    "profile_id": "dev",
+                    "selection": {
+                        "family_id": family,
+                        "model_id": model,
+                        "route": route,
+                    },
+                    "set_primary": false,
+                }),
+            )
+        };
+        // Keyed primary so the profile is otherwise healthy.
+        raw_profile_llm_upsert(
+            &state,
+            &RpcRequest::new(
+                "u-primary".to_string(),
+                APPUI_METHOD_PROFILE_LLM_UPSERT.to_string(),
+                json!({
+                    "profile_id": "dev",
+                    "selection": {
+                        "family_id": "deepseek",
+                        "model_id": "deepseek-chat",
+                        "route": { "route_id": "official", "api_key_env": "OCTOS_TEST_DS_KEY" },
+                    },
+                    "api_key": "dk",
+                    "set_primary": true,
+                }),
+            ),
+            None,
+        )
+        .await
+        .expect("seed keyed primary");
+
+        // Registry-keyless family, but the anthropic protocol override
+        // requires a key: keyless select must reject.
+        raw_profile_llm_upsert(
+            &state,
+            &upsert(
+                "ollama",
+                "llama3",
+                json!({
+                    "route_id": "official",
+                    "api_type": "anthropic",
+                    "api_key_env": "OCTOS_TEST_OLLAMA_ANTHROPIC_KEY",
+                }),
+            ),
+            None,
+        )
+        .await
+        .expect("seed anthropic-over-keyless fallback");
+        let error = raw_profile_llm_select(
+            &state,
+            &RpcRequest::new(
+                "s-anthropic".to_string(),
+                APPUI_METHOD_PROFILE_LLM_SELECT.to_string(),
+                json!({ "profile_id": "dev", "model_id": "llama3" }),
+            ),
+            None,
+        )
+        .await
+        .expect_err("anthropic api_type needs a key even on keyless families");
+        assert_eq!(
+            error.data.as_ref().and_then(|data| data.get("kind")),
+            Some(&json!("llm_key_missing")),
+            "got {error:?}"
+        );
+
+        // A family the registry doesn't know can never construct.
+        raw_profile_llm_upsert(
+            &state,
+            &upsert("frobnicator", "frob-1", json!({ "route_id": "official" })),
+            None,
+        )
+        .await
+        .expect("seed unknown-family fallback");
+        let error = raw_profile_llm_select(
+            &state,
+            &RpcRequest::new(
+                "s-unknown".to_string(),
+                APPUI_METHOD_PROFILE_LLM_SELECT.to_string(),
+                json!({ "profile_id": "dev", "model_id": "frob-1" }),
+            ),
+            None,
+        )
+        .await
+        .expect_err("unknown provider family must reject");
+        assert_eq!(
+            error.data.as_ref().and_then(|data| data.get("kind")),
+            Some(&json!("llm_provider_unresolved")),
+            "got {error:?}"
+        );
+
+        // Registry-keyless family on its native protocol still selects
+        // without any key.
+        raw_profile_llm_upsert(
+            &state,
+            &upsert("ollama", "llama3-native", json!({ "route_id": "official" })),
+            None,
+        )
+        .await
+        .expect("seed native keyless fallback");
+        let result = raw_profile_llm_select(
+            &state,
+            &RpcRequest::new(
+                "s-native".to_string(),
+                APPUI_METHOD_PROFILE_LLM_SELECT.to_string(),
+                json!({ "profile_id": "dev", "model_id": "llama3-native" }),
+            ),
+            None,
+        )
+        .await
+        .expect("keyless family on its native protocol selects fine");
+        assert_eq!(result["applied"], true);
     }
 
     /// `profile/llm/upsert` with `set_primary` must be lossless: replacing
@@ -30794,14 +30981,15 @@ ignore = []
         assert_eq!(stamp["network"], json!("allowed"));
     }
 
-    /// The stamp's model/provider must reflect the PROFILE FILE, not the
-    /// boot-time `state.profiles` runtime snapshot: turns bootstrap from the
-    /// file (SessionRuntimeCache re-reads it after `profile/llm/select`
-    /// evicts), so with the old runtime-first order every status/read after
-    /// a select reported the boot-time model forever — clients applied the
-    /// switch and the next status refresh stomped it back.
+    /// The stamp's model/provider must reflect the runtime that will SERVE
+    /// the next turn, mirroring `resolve_session_profile_runtime`: a profile
+    /// pinned in startup-config `state.profiles` keeps its boot snapshot
+    /// (immutable until restart — reporting the file would falsely claim a
+    /// select took effect), while a store-backed profile re-bootstraps from
+    /// the FILE after select evicts — the old unconditional runtime-first
+    /// order made every status/read stomp a freshly-applied selection back.
     #[tokio::test]
-    async fn runtime_policy_stamp_prefers_profile_file_over_startup_runtime() {
+    async fn runtime_policy_stamp_reports_the_runtime_that_serves_turns() {
         use crate::profiles::{
             LlmModelSelectionConfig, LlmProfileConfig, LlmRouteConfig, ProfileConfig, UserProfile,
         };
@@ -30855,20 +31043,29 @@ ignore = []
         let mut state = AppState::empty_for_tests();
         state.profiles.insert("dev".to_string(), runtime);
 
-        // …while the profile FILE has since been switched to deepseek-chat.
+        // …and the profile FILE has since been switched to deepseek-chat.
+        // A PINNED profile keeps serving the boot runtime until restart, so
+        // the stamp must keep reporting the snapshot, not the file.
         let file_profile = make_profile("deepseek-chat", "deepseek");
         let stamp = runtime_policy_stamp_for_profile(&state, "dev", None, Some(&file_profile));
         assert_eq!(
             stamp["model"],
+            json!("gpt-4o-mini"),
+            "startup-pinned profiles serve the boot snapshot until restart: {stamp}"
+        );
+        assert_eq!(stamp["provider"], json!("openai"));
+
+        // A store-backed (dynamic) profile re-bootstraps from the file after
+        // `profile/llm/select` evicts — the FILE is what serves next.
+        let dynamic_state = AppState::empty_for_tests();
+        let stamp =
+            runtime_policy_stamp_for_profile(&dynamic_state, "dev", None, Some(&file_profile));
+        assert_eq!(
+            stamp["model"],
             json!("deepseek-chat"),
-            "the file's primary must win over the startup snapshot: {stamp}"
+            "dynamic profiles serve the file's primary: {stamp}"
         );
         assert_eq!(stamp["provider"], json!("deepseek"));
-
-        // Without a stored file the startup runtime remains the fallback.
-        let stamp = runtime_policy_stamp_for_profile(&state, "dev", None, None);
-        assert_eq!(stamp["model"], json!("gpt-4o-mini"));
-        assert_eq!(stamp["provider"], json!("openai"));
     }
 
     #[test]
