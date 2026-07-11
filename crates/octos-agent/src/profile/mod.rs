@@ -901,6 +901,12 @@ mod tests {
             }
             other => panic!("swarm must declare an allow list, got {other:?}"),
         }
+        // Swarm coordinators keep the pipeline engine. Pre-lean this fell
+        // out of the spawn_only carve-out (run_pipeline survived the
+        // filter without being named); now that the chat/acp bootstrap
+        // gates registration on `allows`, the swarm allow list must name
+        // it explicitly or coordinators would silently lose it.
+        assert!(swarm.tools.allows("run_pipeline"));
         assert!(!swarm.agents.is_empty());
     }
 
