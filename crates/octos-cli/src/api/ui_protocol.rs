@@ -1629,6 +1629,14 @@ fn skill_action_method_available(method: &str, features: ConnectionUiFeatures) -
     }
 }
 
+fn skill_action_execution_available(
+    action: &octos_agent::plugins::SkillActionDef,
+    features: ConnectionUiFeatures,
+) -> bool {
+    action.execution != octos_agent::plugins::SkillActionExecution::Background
+        || features.skill_action_jobs_available()
+}
+
 fn push_capability_feature(features: &mut Vec<String>, feature: &str) {
     if !features.iter().any(|existing| existing == feature) {
         features.push(feature.to_owned());
@@ -8018,12 +8026,36 @@ struct PreparedSkillActionInvocation {
     calls: Vec<PreparedSkillActionCall>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 struct QueuedSkillActionJob {
     tool: String,
     args: Value,
     workspace_root: PathBuf,
+    execution_context: SkillActionExecutionContext,
     job: SkillActionJobRecord,
+}
+
+#[derive(Clone)]
+struct SkillActionExecutionContext {
+    tool_context: octos_agent::tools::ToolContext,
+    approval_requester: Option<Arc<dyn octos_agent::ToolApprovalRequester>>,
+}
+
+impl SkillActionExecutionContext {
+    #[cfg(test)]
+    fn zero() -> Self {
+        Self {
+            tool_context: octos_agent::tools::ToolContext::zero(),
+            approval_requester: None,
+        }
+    }
+}
+
+#[derive(Clone)]
+struct SkillActionInvokeUiContext {
+    ws: WsConnection,
+    contracts: Arc<UiProtocolContractStores>,
+    features: ConnectionUiFeatures,
 }
 
 fn filename_from_action_path(path: &str) -> Option<String> {
@@ -8294,8 +8326,23 @@ async fn execute_skill_action_tool_call(
     tool: &str,
     registry: &octos_agent::ToolRegistry,
     args: &Value,
+    execution_context: &SkillActionExecutionContext,
 ) -> Result<octos_agent::ToolResult, RpcError> {
-    registry.execute(tool, args).await.map_err(|error| {
+    let tool_context = execution_context.tool_context.clone();
+    let execute = octos_agent::tools::TOOL_CTX.scope(tool_context.clone(), async {
+        registry
+            .execute_with_context(&tool_context, tool, args)
+            .await
+    });
+    let result = match &execution_context.approval_requester {
+        Some(requester) => {
+            octos_agent::tools::TOOL_APPROVAL_CTX
+                .scope(requester.clone(), execute)
+                .await
+        }
+        None => execute.await,
+    };
+    result.map_err(|error| {
         RpcError::internal_error(format!(
             "skill action '{action_id}' failed to invoke tool '{tool}': {error}"
         ))
@@ -8308,6 +8355,7 @@ async fn invoke_skill_action_tool_binding(
     workspace_root: &Path,
     tenant_id: Option<&str>,
     arguments: Value,
+    execution_context: &SkillActionExecutionContext,
 ) -> Result<Value, RpcError> {
     let prepared = prepare_skill_action_tool_invocation(
         action,
@@ -8319,9 +8367,14 @@ async fn invoke_skill_action_tool_binding(
     let mut ok = true;
     let mut results = Vec::with_capacity(prepared.calls.len());
     for call in &prepared.calls {
-        let result =
-            execute_skill_action_tool_call(&action.id, &prepared.tool, registry, &call.args)
-                .await?;
+        let result = execute_skill_action_tool_call(
+            &action.id,
+            &prepared.tool,
+            registry,
+            &call.args,
+            execution_context,
+        )
+        .await?;
         ok &= result.success;
         results.push(tool_result_to_action_value(result, workspace_root));
         if !ok {
@@ -8373,6 +8426,7 @@ fn enqueue_background_skill_action_jobs(
     store: &SkillActionJobStore,
     ledger: Option<&Arc<UiProtocolLedger>>,
     arguments: Value,
+    execution_context: &SkillActionExecutionContext,
 ) -> Result<(Value, Vec<QueuedSkillActionJob>), RpcError> {
     let prepared = prepare_skill_action_tool_invocation(
         action,
@@ -8409,6 +8463,7 @@ fn enqueue_background_skill_action_jobs(
             tool: prepared.tool.clone(),
             args: call.args,
             workspace_root: workspace_root.to_path_buf(),
+            execution_context: execution_context.clone(),
             job,
         });
     }
@@ -8438,9 +8493,14 @@ async fn run_background_skill_action_job(
     running.updated_at = Utc::now();
     append_skill_action_job_snapshot_with_retry(&store, ledger.as_ref(), &running).await?;
 
-    let result =
-        execute_skill_action_tool_call(&running.action_id, &queued.tool, &registry, &queued.args)
-            .await;
+    let result = execute_skill_action_tool_call(
+        &running.action_id,
+        &queued.tool,
+        &registry,
+        &queued.args,
+        &queued.execution_context,
+    )
+    .await;
     let mut completed = running;
     completed.updated_at = Utc::now();
     match result {
@@ -8580,6 +8640,7 @@ async fn raw_skill_action_list(
     state: &Arc<AppState>,
     request: &RpcRequest<Value>,
     connection_profile_id: Option<&str>,
+    features: ConnectionUiFeatures,
 ) -> Result<Value, RpcError> {
     let params: RawSkillActionListParams = parse_raw_params(request)?;
     let Some(session_id) = params.session_id else {
@@ -8600,6 +8661,7 @@ async fn raw_skill_action_list(
     );
     let actions = records
         .into_iter()
+        .filter(|record| skill_action_execution_available(&record.action, features))
         .map(skill_action_record_to_value)
         .collect::<Vec<_>>();
     Ok(json!({
@@ -8615,6 +8677,7 @@ async fn raw_skill_action_invoke(
     ledger: &Arc<UiProtocolLedger>,
     request: &RpcRequest<Value>,
     connection_profile_id: Option<&str>,
+    ui_context: Option<SkillActionInvokeUiContext>,
 ) -> Result<Value, RpcError> {
     let params: RawSkillActionInvokeParams = parse_raw_params(request)?;
     let active_profile_id = validate_session_scope(
@@ -8643,6 +8706,46 @@ async fn raw_skill_action_invoke(
             params.action_id
         )));
     }
+    let features = ui_context
+        .as_ref()
+        .map(|context| context.features)
+        .unwrap_or_default();
+    if !skill_action_execution_available(&record.action, features) {
+        return Err(RpcError::method_not_supported(
+            APPUI_METHOD_SKILL_ACTION_INVOKE,
+        ));
+    }
+    let session_scope = session_runtime
+        .agent
+        .session_scope()
+        .filter(|scope| scope.workspace() == session_runtime.workspace_root.as_path())
+        .cloned();
+    if session_runtime.agent.session_scope().is_some() && session_scope.is_none() {
+        warn!(
+            session = %params.session_id,
+            workspace = %session_runtime.workspace_root.display(),
+            "skill action skipped a mismatched SessionScope"
+        );
+    }
+    let approval_requester = ui_context.map(|ui_context| {
+        Arc::new(UiProtocolApprovalRequester {
+            ws: ui_context.ws,
+            ledger: Arc::clone(ledger),
+            contracts: ui_context.contracts,
+            state: Arc::clone(state),
+            session_id: params.session_id.clone(),
+            turn_id: TurnId::new(),
+            features: ui_context.features,
+        }) as Arc<dyn octos_agent::ToolApprovalRequester>
+    });
+    let execution_context = SkillActionExecutionContext {
+        tool_context: octos_agent::tools::ToolContext {
+            tool_id: record.action.id.clone(),
+            session_scope,
+            ..octos_agent::tools::ToolContext::zero()
+        },
+        approval_requester,
+    };
     match record.action.execution {
         octos_agent::plugins::SkillActionExecution::Sync => {
             invoke_skill_action_tool_binding(
@@ -8651,6 +8754,7 @@ async fn raw_skill_action_invoke(
                 &session_runtime.workspace_root,
                 Some(session_runtime.profile.profile_id.as_str()),
                 params.arguments,
+                &execution_context,
             )
             .await
         }
@@ -8669,6 +8773,7 @@ async fn raw_skill_action_invoke(
                 &store,
                 Some(ledger),
                 params.arguments,
+                &execution_context,
             )?;
             let registry = session_runtime.tools.clone();
             let concurrency_class = queued_jobs
@@ -10092,10 +10197,21 @@ async fn handle_raw_appui_rpc(
             raw_profile_skills_list(state, request, connection_profile_id)
         }
         APPUI_METHOD_SKILL_ACTION_LIST => {
-            raw_skill_action_list(state, request, connection_profile_id).await
+            raw_skill_action_list(state, request, connection_profile_id, features).await
         }
         APPUI_METHOD_SKILL_ACTION_INVOKE => {
-            raw_skill_action_invoke(state, ledger, request, connection_profile_id).await
+            raw_skill_action_invoke(
+                state,
+                ledger,
+                request,
+                connection_profile_id,
+                Some(SkillActionInvokeUiContext {
+                    ws: ws.clone(),
+                    contracts: Arc::clone(contracts),
+                    features,
+                }),
+            )
+            .await
         }
         APPUI_METHOD_SKILL_ACTION_JOB_LIST => {
             raw_skill_action_job_list(state, request, connection_profile_id)
@@ -31034,6 +31150,39 @@ ignore = []
     }
 
     #[test]
+    fn background_skill_actions_require_the_job_capability() {
+        let sync: octos_agent::plugins::SkillActionDef = serde_json::from_value(json!({
+            "id": "document.open",
+            "label": "Open",
+            "binding": {"type": "tool", "tool": "source_import"}
+        }))
+        .unwrap();
+        let background: octos_agent::plugins::SkillActionDef = serde_json::from_value(json!({
+            "id": "source.import",
+            "label": "Import",
+            "execution": "background",
+            "binding": {"type": "tool", "tool": "source_import"}
+        }))
+        .unwrap();
+        let actions_only = ConnectionUiFeatures::from_requested_feature_tokens(
+            [APPUI_FEATURE_SKILL_ACTIONS_V1],
+            false,
+        );
+
+        assert!(skill_action_execution_available(&sync, actions_only));
+        assert!(!skill_action_execution_available(&background, actions_only));
+
+        let full = ConnectionUiFeatures::from_requested_feature_tokens(
+            [
+                APPUI_FEATURE_SKILL_ACTIONS_V1,
+                APPUI_FEATURE_SKILL_ACTION_JOBS_V1,
+            ],
+            false,
+        );
+        assert!(skill_action_execution_available(&background, full));
+    }
+
+    #[test]
     fn skill_action_job_updates_require_negotiated_job_feature() {
         let event = UiProtocolLedgerEvent::Notification(UiNotification::SkillActionJobUpdated(
             SkillActionJobUpdatedEvent {
@@ -32525,9 +32674,10 @@ ignore = []
         raw_profile_skills_install(&state, &install_v1, None)
             .await
             .unwrap();
-        let listed_v1 = raw_skill_action_list(&state, &list_request, None)
-            .await
-            .unwrap();
+        let listed_v1 =
+            raw_skill_action_list(&state, &list_request, None, ConnectionUiFeatures::default())
+                .await
+                .unwrap();
         assert_eq!(listed_v1["count"], json!(1));
         assert_eq!(listed_v1["actions"][0]["id"], json!("document.version1"));
         assert!(
@@ -32568,9 +32718,10 @@ ignore = []
         raw_profile_skills_install(&state, &install_v2, None)
             .await
             .unwrap();
-        let listed_v2 = raw_skill_action_list(&state, &list_request, None)
-            .await
-            .unwrap();
+        let listed_v2 =
+            raw_skill_action_list(&state, &list_request, None, ConnectionUiFeatures::default())
+                .await
+                .unwrap();
         assert_eq!(listed_v2["count"], json!(1));
         assert_eq!(listed_v2["actions"][0]["id"], json!("document.version2"));
         assert!(listed_v2.to_string().find("document.version1").is_none());
@@ -32583,9 +32734,10 @@ ignore = []
         raw_profile_skills_remove(&state, &remove, None)
             .await
             .unwrap();
-        let listed_removed = raw_skill_action_list(&state, &list_request, None)
-            .await
-            .unwrap();
+        let listed_removed =
+            raw_skill_action_list(&state, &list_request, None, ConnectionUiFeatures::default())
+                .await
+                .unwrap();
         assert_eq!(listed_removed["count"], json!(0));
 
         let invoke_removed = RpcRequest::new(
@@ -32603,6 +32755,7 @@ ignore = []
                 &state,
                 &Arc::new(UiProtocolLedger::new(16)),
                 &invoke_removed,
+                None,
                 None,
             )
             .await
@@ -32810,6 +32963,114 @@ ignore = []
         }
     }
 
+    struct ContextAwareActionTool;
+
+    #[async_trait::async_trait]
+    impl octos_agent::Tool for ContextAwareActionTool {
+        fn name(&self) -> &str {
+            "context_aware_action"
+        }
+
+        fn description(&self) -> &str {
+            "requires the AppUI action execution context"
+        }
+
+        fn input_schema(&self) -> Value {
+            json!({"type": "object"})
+        }
+
+        async fn execute(&self, args: &Value) -> eyre::Result<octos_agent::ToolResult> {
+            self.execute_with_context(&octos_agent::tools::ToolContext::zero(), args)
+                .await
+        }
+
+        async fn execute_with_context(
+            &self,
+            ctx: &octos_agent::tools::ToolContext,
+            _args: &Value,
+        ) -> eyre::Result<octos_agent::ToolResult> {
+            let typed_scope_is_present = ctx.session_scope.is_some();
+            let task_local_scope_is_present = octos_agent::tools::TOOL_CTX
+                .try_with(|scoped| scoped.session_scope.is_some())
+                .unwrap_or(false);
+            let approval_requester = octos_agent::tools::TOOL_APPROVAL_CTX
+                .try_with(Clone::clone)
+                .ok();
+            let approval_was_granted = match approval_requester {
+                Some(requester) => matches!(
+                    requester
+                        .request_approval(ToolApprovalRequest {
+                            tool_id: "action-tool-call".to_string(),
+                            tool_name: self.name().to_string(),
+                            title: "Action approval".to_string(),
+                            body: "test approval bridge".to_string(),
+                            command: None,
+                            cwd: None,
+                        })
+                        .await,
+                    ToolApprovalDecision::Approve
+                ),
+                None => false,
+            };
+            let success =
+                typed_scope_is_present && task_local_scope_is_present && approval_was_granted;
+            Ok(octos_agent::ToolResult {
+                success,
+                output: if success {
+                    "context available".to_string()
+                } else {
+                    "missing action execution context".to_string()
+                },
+                ..Default::default()
+            })
+        }
+    }
+
+    struct ApproveActionRequester;
+
+    #[async_trait::async_trait]
+    impl octos_agent::ToolApprovalRequester for ApproveActionRequester {
+        async fn request_approval(&self, _request: ToolApprovalRequest) -> ToolApprovalDecision {
+            ToolApprovalDecision::Approve
+        }
+    }
+
+    #[tokio::test]
+    async fn skill_action_tool_call_should_preserve_session_scope_and_approval_bridge() {
+        let mut registry = octos_agent::ToolRegistry::new();
+        registry.register(ContextAwareActionTool);
+        let workspace = tempfile::tempdir().unwrap();
+        let execution_context = SkillActionExecutionContext {
+            tool_context: octos_agent::tools::ToolContext {
+                tool_id: "document.generate".to_string(),
+                session_scope: Some(Arc::new(
+                    octos_core::session_scope::SessionScope::solo(
+                        workspace.path().to_path_buf(),
+                        Vec::new(),
+                    )
+                    .unwrap(),
+                )),
+                ..octos_agent::tools::ToolContext::zero()
+            },
+            approval_requester: Some(Arc::new(ApproveActionRequester)),
+        };
+
+        let result = execute_skill_action_tool_call(
+            "document.generate",
+            "context_aware_action",
+            &registry,
+            &json!({}),
+            &execution_context,
+        )
+        .await
+        .expect("tool invocation");
+
+        assert!(
+            result.success,
+            "skill action tools must receive their session scope and approval bridge"
+        );
+    }
+
     #[tokio::test]
     async fn appui_skill_action_should_not_list_or_invoke_on_disk_only_manifest() {
         let dir = tempfile::tempdir().unwrap();
@@ -32866,9 +33127,10 @@ ignore = []
             APPUI_METHOD_SKILL_ACTION_LIST,
             json!({"profile_id": profile_id, "session_id": session_id.clone()}),
         );
-        let listed = raw_skill_action_list(&state, &list_request, None)
-            .await
-            .unwrap();
+        let listed =
+            raw_skill_action_list(&state, &list_request, None, ConnectionUiFeatures::default())
+                .await
+                .unwrap();
         let invoke_request = RpcRequest::new(
             "action-invoke",
             APPUI_METHOD_SKILL_ACTION_INVOKE,
@@ -32883,6 +33145,7 @@ ignore = []
             &state,
             &Arc::new(UiProtocolLedger::new(16)),
             &invoke_request,
+            None,
             None,
         )
         .await;
@@ -32972,9 +33235,10 @@ ignore = []
                 "tags": ["trusted", "documents"]
             }),
         );
-        let listed = raw_skill_action_list(&state, &list_request, None)
-            .await
-            .unwrap();
+        let listed =
+            raw_skill_action_list(&state, &list_request, None, ConnectionUiFeatures::default())
+                .await
+                .unwrap();
         assert_eq!(listed["count"], json!(1));
         assert_eq!(listed["actions"][0]["id"], json!("document.open"));
         assert_eq!(
@@ -33008,6 +33272,7 @@ ignore = []
             &state,
             &Arc::new(UiProtocolLedger::new(16)),
             &invoke_request,
+            None,
             None,
         )
         .await
@@ -33093,6 +33358,7 @@ ignore = []
         registry.register(CaptureActionTool {
             calls: calls.clone(),
         });
+        let execution_context = SkillActionExecutionContext::zero();
 
         let response = invoke_skill_action_tool_binding(
             &action,
@@ -33103,6 +33369,7 @@ ignore = []
                 "paths": [handle],
                 "title": "Report"
             }),
+            &execution_context,
         )
         .await
         .unwrap();
@@ -33313,6 +33580,7 @@ ignore = []
         registry.register(CaptureActionTool {
             calls: calls.clone(),
         });
+        let execution_context = SkillActionExecutionContext::zero();
 
         let response = invoke_skill_action_tool_binding(
             &action,
@@ -33320,6 +33588,7 @@ ignore = []
             workspace.path(),
             Some("tenant-a"),
             json!({ "paths": [handle] }),
+            &execution_context,
         )
         .await
         .unwrap();
@@ -33355,6 +33624,7 @@ ignore = []
         registry.register(CaptureActionTool {
             calls: calls.clone(),
         });
+        let execution_context = SkillActionExecutionContext::zero();
 
         let response = invoke_skill_action_tool_binding(
             &action,
@@ -33362,6 +33632,7 @@ ignore = []
             workspace.path(),
             Some("tenant-a"),
             json!({ "paths": [handle.clone()] }),
+            &execution_context,
         )
         .await
         .unwrap();
@@ -33398,6 +33669,7 @@ ignore = []
             calls: calls.clone(),
         });
         let store = SkillActionJobStore::open(profile_data.path());
+        let execution_context = SkillActionExecutionContext::zero();
 
         let (response, queued) = enqueue_background_skill_action_jobs(
             &action,
@@ -33413,6 +33685,7 @@ ignore = []
                 "paths": ["docs/a.pdf", "docs/b.jpg"],
                 "title": "Notebook imports"
             }),
+            &execution_context,
         )
         .unwrap();
 
@@ -33501,6 +33774,7 @@ ignore = []
         let registry = Arc::new(registry);
         let store = SkillActionJobStore::open(profile_data.path());
         let ledger = Arc::new(UiProtocolLedger::new(8));
+        let execution_context = SkillActionExecutionContext::zero();
         let (_response, mut queued) = enqueue_background_skill_action_jobs(
             &action,
             "mofa-notebook-source",
@@ -33512,6 +33786,7 @@ ignore = []
             &store,
             Some(&ledger),
             json!({ "paths": ["uploads/report.pdf"] }),
+            &execution_context,
         )
         .unwrap();
 

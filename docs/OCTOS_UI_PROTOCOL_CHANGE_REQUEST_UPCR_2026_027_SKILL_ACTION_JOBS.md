@@ -195,10 +195,11 @@ latest status is `queued` or `running`.
 ## Compatibility
 
 Backward-compatible. Existing manifests omit `execution` and keep synchronous
-UPCR-2026-026 behavior. Existing clients that only know `skill.actions.v1` can
-continue to call synchronous actions. Clients that support background actions
-must negotiate `skill.action_jobs.v1` before relying on job methods or
-notifications.
+UPCR-2026-026 behavior. Existing clients that only know `skill.actions.v1` see
+and can call synchronous actions only. Background actions are omitted from
+their action list and direct invocation fails with `method_not_supported`.
+Clients that support background actions must negotiate `skill.action_jobs.v1`
+before relying on job methods or notifications.
 
 ## Tests
 

@@ -487,6 +487,10 @@ Structured user-question lifecycle (gate `user_question.v1`, proposed
 
 - `user_question/requested`
 
+Skill action jobs (gate `skill.action_jobs.v1`, accepted `UPCR-2026-027`):
+
+- `skill/action/job/updated`
+
 Task and progress:
 
 - `task/updated`
@@ -1286,6 +1290,9 @@ Clients must use that method list to enable or disable slash commands.
 - every requested tag must be present in the action's `tags[]`
 - actions bound to tools that are unavailable in the session runtime are not
   listed; clients must treat the list as server truth for the current session
+- when a negotiated connection lacks `skill.action_jobs.v1`, actions declared
+  with `execution: "background"` are omitted; synchronous actions remain
+  available through `skill.actions.v1`
 
 `skill/action/invoke`:
 
@@ -1319,6 +1326,8 @@ Clients must use that method list to enable or disable slash commands.
 - when the manifest action declares `execution: "background"`, response shape
   is `{ action_id, ok, batch_id, jobs }`; the server appends persisted job
   snapshots and emits `skill/action/job/updated` for subsequent state changes
+- background actions require `skill.action_jobs.v1`; direct invocation without
+  that negotiated capability fails with `method_not_supported`
 
 `skill/action/job/list`:
 
