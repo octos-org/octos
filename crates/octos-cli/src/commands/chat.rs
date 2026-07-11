@@ -71,11 +71,14 @@ pub struct ChatCommand {
     pub message: Option<String>,
 
     /// Runtime profile to apply at startup (M8.3). Accepts a built-in name
-    /// (`coding`, `swarm`), a user-dir id under `~/.octos/profiles/<id>/`,
-    /// or an explicit path to a profile JSON/TOML file.
+    /// (`coding`, `coding-full`, `swarm`), a user-dir id under
+    /// `~/.octos/profiles/<id>/`, or an explicit path to a profile
+    /// JSON/TOML file.
     ///
-    /// Defaults to `coding` which preserves today's no-flag behaviour
-    /// byte-for-byte.
+    /// Defaults to `coding`, the lean core-coding tool surface (files,
+    /// shell, search, memory, spawn, user questions). Use `coding-full`
+    /// for the unfiltered pre-lean tool set (web, research, pipelines,
+    /// bundled skills).
     #[arg(long)]
     pub profile: Option<String>,
 
@@ -816,28 +819,38 @@ impl ChatCommand {
         // [`build_run_pipeline_tool`] so the regression test in
         // `octos-pipeline/tests/embedder_propagation.rs` can pin the
         // wiring without instantiating the full chat command.
-        let pipeline_tool = build_run_pipeline_tool(
-            llm.clone(),
-            memory.clone(),
-            cwd.clone(),
-            data_dir.clone(),
-            tools.provider_policy().cloned(),
-            plugin_dirs.clone(),
-            config.plugins.require_signed,
-            embedder.clone(),
-            // #1607: same sandbox `octos chat` builds for its shell/exec tools
-            // (see `effective_sandbox_config` above), so pipeline command
-            // validators run under the identical backend.
-            effective_sandbox_config.clone(),
-        );
-        tools.register(pipeline_tool);
-        tools.mark_spawn_only(
-            "run_pipeline",
-            Some(
-                "Pipeline started in background. The final result and any artifacts will be sent here when complete. You can keep chatting in the meantime."
-                    .to_string(),
-            ),
-        );
+        // Lean-profile gate: `run_pipeline` is marked spawn_only, and
+        // spawn_only tools survive `filter_by_profile` unconditionally —
+        // so a profile can only exclude the pipeline engine by never
+        // registering it. `ProfileTools::allows` mirrors the filter's
+        // name-matching (groups / wildcards / exact names), which keeps
+        // this gate and the registry narrowing below in agreement. The
+        // lean `coding` default excludes it; `coding-full` (and any
+        // profile without an explicit filter) keeps it.
+        if profile.tools.allows("run_pipeline") {
+            let pipeline_tool = build_run_pipeline_tool(
+                llm.clone(),
+                memory.clone(),
+                cwd.clone(),
+                data_dir.clone(),
+                tools.provider_policy().cloned(),
+                plugin_dirs.clone(),
+                config.plugins.require_signed,
+                embedder.clone(),
+                // #1607: same sandbox `octos chat` builds for its shell/exec tools
+                // (see `effective_sandbox_config` above), so pipeline command
+                // validators run under the identical backend.
+                effective_sandbox_config.clone(),
+            );
+            tools.register(pipeline_tool);
+            tools.mark_spawn_only(
+                "run_pipeline",
+                Some(
+                    "Pipeline started in background. The final result and any artifacts will be sent here when complete. You can keep chatting in the meantime."
+                        .to_string(),
+                ),
+            );
+        }
 
         // Apply tool policy from config
         if let Some(ref policy) = config.tool_policy {

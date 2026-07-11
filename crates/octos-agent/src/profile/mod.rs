@@ -10,10 +10,13 @@
 //! across a dozen startup sites; afterwards, a single profile declaration
 //! consolidates the envelope.
 //!
-//! The built-in `coding` profile captures today's no-flag default verbatim
-//! so `octos chat` keeps producing byte-for-byte the same runtime behaviour
-//! as before. Alternate profiles (e.g. `swarm`) layer on top of `coding`
-//! through explicit allow-list changes and expanded agent sets.
+//! The built-in `coding` profile is the no-flag default and carries a lean
+//! core-coding allow list (files, shell, search, memory, spawn, user
+//! questions) so `octos chat` does not ship every tool schema to the LLM on
+//! every round. The `coding-full` built-in preserves the pre-lean
+//! unfiltered surface byte-for-byte for sessions that want everything.
+//! Alternate profiles (e.g. `swarm`) declare their own allow lists and
+//! expanded agent sets.
 //!
 //! # Forward compatibility
 //!
@@ -36,8 +39,9 @@
 //! 3. Finally the loader falls back to the crate-shipped built-in registry
 //!    (JSON files under `crates/octos-agent/src/assets/profiles/`).
 //!
-//! Today's built-in profiles are `coding` (the default) and `swarm` (an
-//! allow-list extension that enables multi-worker swarm coordination tools).
+//! Today's built-in profiles are `coding` (the lean default), `coding-full`
+//! (the unfiltered pre-lean surface), and `swarm` (an allow-list extension
+//! that enables multi-worker swarm coordination tools).
 //!
 //! # Applied vs recorded settings
 //!
@@ -75,6 +79,10 @@ pub const PROFILE_SCHEMA_VERSION: u32 = 1;
 /// user-config search. Ordered (name, raw JSON text).
 const BUILTIN_PROFILES: &[(&str, &str)] = &[
     ("coding", include_str!("../assets/profiles/coding.json")),
+    (
+        "coding-full",
+        include_str!("../assets/profiles/coding-full.json"),
+    ),
     ("swarm", include_str!("../assets/profiles/swarm.json")),
 ];
 
@@ -94,8 +102,8 @@ pub enum ProfileSource {
 /// called out in the issue scope:
 ///
 /// - `default` — no filter; the registry passes through untouched. This is
-///   what the built-in `coding` profile uses so behaviour parity with the
-///   pre-M8.3 default path is guaranteed.
+///   what the built-in `coding-full` profile uses so behaviour parity with
+///   the pre-M8.3 default path stays reachable.
 /// - `allow_list` — only the named tools survive. Names may reference
 ///   [`crate::tools::policy::ToolGroupInfo`] groups via `group:*` strings.
 /// - `deny_list` — every tool survives except the named ones. Useful for
@@ -123,6 +131,32 @@ pub enum ProfileTools {
         #[serde(default)]
         tools: Vec<String>,
     },
+}
+
+impl ProfileTools {
+    /// Whether a tool named `tool_name` would survive this filter.
+    ///
+    /// Mirrors [`crate::tools::ToolRegistry::filter_by_profile`]'s
+    /// name-matching exactly — `group:<id>` expansion, `<prefix>*`
+    /// wildcards, exact names, and the empty-allow-list pass-through —
+    /// but deliberately WITHOUT the spawn_only carve-out. Once a
+    /// spawn_only tool is registered it can never be evicted by the
+    /// filter, so bootstrap sites (chat/acp `run_pipeline`) consult this
+    /// predicate FIRST and skip registration when the profile excludes
+    /// the tool.
+    pub fn allows(&self, tool_name: &str) -> bool {
+        use crate::tools::policy::entry_matches;
+        match self {
+            Self::Default => true,
+            Self::AllowList { tools } => {
+                // Empty allow lists are treated as pass-through by
+                // `filter_by_profile` (with a warning); agree with it so
+                // the bootstrap gate never drops a tool the filter keeps.
+                tools.is_empty() || tools.iter().any(|entry| entry_matches(entry, tool_name))
+            }
+            Self::DenyList { tools } => !tools.iter().any(|entry| entry_matches(entry, tool_name)),
+        }
+    }
 }
 
 /// Reference to an MCP server that the profile wants attached. For M8.3 we
@@ -554,9 +588,15 @@ mod tests {
         let coding = ProfileDefinition::builtin("coding").expect("coding builtin");
         assert_eq!(coding.name, "coding");
         assert_eq!(coding.version, 1);
-        // `coding` must declare the default tool filter so behaviour
-        // parity with the pre-M8.3 no-flag path is preserved.
-        assert!(matches!(coding.tools, ProfileTools::Default));
+        // Lean default: `coding` declares a core-loop allow list so the
+        // no-flag `octos chat` stops shipping every tool schema each round.
+        assert!(matches!(coding.tools, ProfileTools::AllowList { .. }));
+
+        // `coding-full` is the escape hatch that preserves the pre-lean
+        // unfiltered surface (one `--profile coding-full` away).
+        let full = ProfileDefinition::builtin("coding-full").expect("coding-full builtin");
+        assert_eq!(full.name, "coding-full");
+        assert!(matches!(full.tools, ProfileTools::Default));
 
         let swarm = ProfileDefinition::builtin("swarm").expect("swarm builtin");
         assert_eq!(swarm.name, "swarm");
@@ -626,10 +666,44 @@ mod tests {
     fn should_load_builtin_coding_profile_without_error() {
         let coding = ProfileDefinition::builtin("coding").expect("coding");
         coding.validate().expect("valid");
-        // The default profile must not declare a tool allow/deny list —
-        // otherwise the registry would be filtered and behaviour parity
-        // with the pre-M8.3 no-flag path would regress.
-        assert!(matches!(coding.tools, ProfileTools::Default));
+        // Lean default: the allow list covers the core coding loop ONLY.
+        // The exact envelope is pinned here so accidental JSON edits fail
+        // loudly instead of silently re-inflating (or hollowing out) the
+        // per-round tool-schema overhead.
+        match &coding.tools {
+            ProfileTools::AllowList { tools } => {
+                for required in [
+                    "group:fs",
+                    "group:runtime",
+                    "group:search",
+                    "group:memory",
+                    "spawn",
+                    "ask_user_question",
+                ] {
+                    assert!(
+                        tools.contains(&required.to_string()),
+                        "coding allow list must keep {required}, got {tools:?}",
+                    );
+                }
+                // The heavy non-core surfaces must stay out of the lean
+                // default (available via `coding-full` or a custom profile).
+                for excluded in [
+                    "group:web",
+                    "group:research",
+                    "group:media",
+                    "run_pipeline",
+                    "synthesize_research",
+                    "message",
+                    "cron",
+                ] {
+                    assert!(
+                        !tools.contains(&excluded.to_string()),
+                        "coding allow list must not name {excluded}",
+                    );
+                }
+            }
+            other => panic!("coding must declare a lean allow list, got {other:?}"),
+        }
         // Today's coding default carries no compaction or permission
         // override — those live at the workspace / app-state level.
         assert!(coding.compaction_policy.is_none());
@@ -638,6 +712,179 @@ mod tests {
         // resolve them by id.
         assert!(coding.agents.contains(&"research-worker".to_string()));
         assert!(coding.agents.contains(&"repo-editor".to_string()));
+    }
+
+    #[test]
+    fn should_load_builtin_coding_full_profile_as_unfiltered_escape_hatch() {
+        let full = ProfileDefinition::builtin("coding-full").expect("coding-full");
+        full.validate().expect("valid");
+        // `coding-full` preserves the pre-lean unfiltered registry
+        // byte-for-byte: no allow/deny list, no compaction or permission
+        // override.
+        assert!(
+            matches!(full.tools, ProfileTools::Default),
+            "coding-full must not filter tools",
+        );
+        assert!(full.compaction_policy.is_none());
+        assert_eq!(full.permissions, PermissionMode::Default);
+        // Same preloaded sub-agents as `coding` so switching profiles
+        // never changes spawn() manifest resolution.
+        let coding = ProfileDefinition::builtin("coding").expect("coding");
+        assert_eq!(full.agents, coding.agents);
+        assert!(ProfileDefinition::builtin_ids().contains(&"coding-full"));
+    }
+
+    /// Minimal schema-bearing tool used to stand in for bundled-skill /
+    /// plugin tools (and for chat-registered natives like `spawn`) in
+    /// registry-narrowing tests.
+    struct StubTool {
+        name: &'static str,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::tools::Tool for StubTool {
+        fn name(&self) -> &str {
+            self.name
+        }
+        fn description(&self) -> &str {
+            "stub"
+        }
+        fn input_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object", "properties": {}})
+        }
+        async fn execute(&self, _args: &serde_json::Value) -> Result<crate::tools::ToolResult> {
+            Ok(crate::tools::ToolResult {
+                output: "ok".into(),
+                success: true,
+                ..Default::default()
+            })
+        }
+    }
+
+    #[test]
+    fn coding_profile_narrows_registry_to_core_coding_loop() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut tools = ToolRegistry::with_builtins(tmp.path());
+        // Bundled-skill / plugin tools are plain registry entries that
+        // register BEFORE the profile narrowing runs in the chat/acp
+        // bootstrap — the allow list must apply to them exactly as it
+        // does to builtins.
+        tools.register(StubTool {
+            name: "get_weather",
+        });
+        // `spawn` is registered by the chat/acp bootstrap (SpawnTool),
+        // not by `with_builtins`; a stub stands in for the inclusion
+        // assertion.
+        tools.register(StubTool { name: "spawn" });
+
+        let coding = ProfileDefinition::builtin("coding").expect("coding");
+        coding.apply_to_registry(&mut tools);
+
+        let names: std::collections::BTreeSet<String> =
+            tools.specs().into_iter().map(|s| s.name).collect();
+
+        for included in [
+            "read_file",
+            "write_file",
+            "edit_file",
+            "shell",
+            "glob",
+            "grep",
+            "list_dir",
+            "spawn",
+            "ask_user_question",
+        ] {
+            assert!(
+                names.contains(included),
+                "lean coding profile must keep {included}, got {names:?}",
+            );
+        }
+        for excluded in [
+            "web_search",
+            "web_fetch",
+            "browser",
+            "get_weather",
+            "synthesize_research",
+            "image_generation",
+            "workspace_diff",
+            "spawn_agent",
+            "delegate",
+            "update_plan",
+        ] {
+            assert!(
+                !names.contains(excluded),
+                "lean coding profile must drop {excluded}, got {names:?}",
+            );
+        }
+        // Budget pin (#1578 harness review: 48 tools ≈ 9.3K tokens per
+        // round in the unfiltered default). The lean surface must stay a
+        // small fraction of that; 20 leaves headroom for core-loop growth
+        // while failing loudly on accidental bloat.
+        assert!(
+            names.len() <= 20,
+            "lean coding profile grew to {} tools: {names:?}",
+            names.len(),
+        );
+    }
+
+    #[test]
+    fn spawn_only_tools_survive_filter_so_bootstrap_gates_on_allows() {
+        let mut tools = ToolRegistry::new();
+        tools.register(StubTool {
+            name: "run_pipeline",
+        });
+        tools.mark_spawn_only("run_pipeline", None);
+        tools.register(StubTool { name: "read_file" });
+
+        let coding = ProfileDefinition::builtin("coding").expect("coding");
+        coding.apply_to_registry(&mut tools);
+
+        let names: Vec<String> = tools.specs().into_iter().map(|s| s.name).collect();
+        // Registry-level carve-out (M8.3): spawn_only tools are never
+        // evicted by `filter_by_profile` — they carry background-execution
+        // wiring the runtime depends on once registered...
+        assert!(
+            names.contains(&"run_pipeline".to_string()),
+            "spawn_only carve-out regressed: {names:?}",
+        );
+        // ...which is exactly why the chat/acp bootstrap must consult
+        // `ProfileTools::allows` BEFORE registering + marking a spawn_only
+        // tool. The lean coding profile says no; coding-full says yes.
+        assert!(!coding.tools.allows("run_pipeline"));
+        let full = ProfileDefinition::builtin("coding-full").expect("coding-full");
+        assert!(full.tools.allows("run_pipeline"));
+    }
+
+    #[test]
+    fn profile_tools_allows_mirrors_filter_matching() {
+        // Default mode: everything passes.
+        assert!(ProfileTools::Default.allows("anything"));
+
+        let allow = ProfileTools::AllowList {
+            tools: vec!["group:fs".into(), "exec*".into(), "spawn".into()],
+        };
+        assert!(allow.allows("read_file"), "group member must match");
+        assert!(allow.allows("exec_command"), "wildcard must match");
+        assert!(allow.allows("spawn"), "exact name must match");
+        assert!(!allow.allows("web_search"));
+
+        // Empty allow list is treated as pass-through by
+        // `ToolRegistry::filter_by_profile` (with a warning); `allows`
+        // must agree or the bootstrap gate would drop tools the filter
+        // keeps.
+        let empty = ProfileTools::AllowList { tools: vec![] };
+        assert!(empty.allows("web_search"));
+
+        let deny = ProfileTools::DenyList {
+            tools: vec!["group:web".into()],
+        };
+        assert!(!deny.allows("web_fetch"), "denied group member");
+        assert!(deny.allows("read_file"));
+
+        // Empty deny list denies nothing (mirrors the filter's early
+        // return).
+        let empty_deny = ProfileTools::DenyList { tools: vec![] };
+        assert!(empty_deny.allows("web_fetch"));
     }
 
     #[test]

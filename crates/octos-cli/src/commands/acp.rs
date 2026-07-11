@@ -120,8 +120,11 @@ pub struct AcpCommand {
     #[arg(long, default_value = "20")]
     pub max_iterations: u32,
 
-    /// Runtime profile hint (accepted for parity with `octos chat`; the ACP
-    /// bridge builds a minimal agent and does not apply profile tool filters).
+    /// Runtime profile to apply at startup (parity with `octos chat`).
+    /// Accepts a built-in name (`coding`, `coding-full`, `swarm`), a
+    /// user-dir id under `~/.octos/profiles/<id>/`, or a path. Defaults to
+    /// `coding`, the lean core-coding tool surface; use `coding-full` for
+    /// the unfiltered pre-lean tool set.
     #[arg(long)]
     pub profile: Option<String>,
 }
@@ -451,30 +454,36 @@ impl AcpBootstrap {
         }
 
         // Pipeline tool (DOT workflows), embedder-aware, marked spawn_only.
-        let pipeline_tool = super::chat::build_run_pipeline_tool(
-            llm.clone(),
-            memory.clone(),
-            cwd.clone(),
-            data_dir.clone(),
-            // P3 (codex): resolve provider policy NOW (finalize runs later) so
-            // pipeline workers inherit tool_policy_by_provider denials.
-            super::chat::resolve_provider_policy(&config, &provider_name, &model_id),
-            plugin_dirs.clone(),
-            config.plugins.require_signed,
-            shared.embedder.clone(),
-            // #1607: same sandbox the ACP agent registry uses (built at
-            // `build_acp_tool_registry` / the `create_sandbox(&sandbox)` above),
-            // so pipeline command validators run under the identical backend.
-            sandbox.clone(),
-        );
-        tools.register(pipeline_tool);
-        tools.mark_spawn_only(
-            "run_pipeline",
-            Some(
-                "Pipeline started in background. The final result and any artifacts will be sent here when complete."
-                    .to_string(),
-            ),
-        );
+        // Lean-profile gate (mirrors `octos chat`): spawn_only tools survive
+        // `filter_by_profile` unconditionally, so a profile can only exclude
+        // `run_pipeline` by never registering it. The lean `coding` default
+        // excludes it; `coding-full` keeps it.
+        if profile.tools.allows("run_pipeline") {
+            let pipeline_tool = super::chat::build_run_pipeline_tool(
+                llm.clone(),
+                memory.clone(),
+                cwd.clone(),
+                data_dir.clone(),
+                // P3 (codex): resolve provider policy NOW (finalize runs later) so
+                // pipeline workers inherit tool_policy_by_provider denials.
+                super::chat::resolve_provider_policy(&config, &provider_name, &model_id),
+                plugin_dirs.clone(),
+                config.plugins.require_signed,
+                shared.embedder.clone(),
+                // #1607: same sandbox the ACP agent registry uses (built at
+                // `build_acp_tool_registry` / the `create_sandbox(&sandbox)` above),
+                // so pipeline command validators run under the identical backend.
+                sandbox.clone(),
+            );
+            tools.register(pipeline_tool);
+            tools.mark_spawn_only(
+                "run_pipeline",
+                Some(
+                    "Pipeline started in background. The final result and any artifacts will be sent here when complete."
+                        .to_string(),
+                ),
+            );
+        }
 
         // Policy + context filter + provider policy + profile narrowing (LAST).
         finalize_tool_registry(&mut tools, &config, &provider_name, &model_id, &profile);
