@@ -707,6 +707,20 @@ impl ServeCommand {
                  potentially shared host"
             );
         }
+        // `effective_permissions_for_session` only grants DangerFullAccess in
+        // Local deployment mode; enabling the default under Tenant/Cloud would
+        // fail every unselected `session/open` at permission resolution and
+        // let `profile/list` advertise a current profile the runtime rejects
+        // (codex P2 on #1639). Refuse the misconfiguration at startup.
+        if dangerous_default_permissions_flag && config.mode != crate::config::DeploymentMode::Local
+        {
+            eyre::bail!(
+                "--danger-full-access requires Local deployment mode (mode is {:?}); \
+                 the full-access profile is not grantable under Tenant/Cloud, so an \
+                 unselected session would fail permission resolution",
+                config.mode
+            );
+        }
         let state = Arc::new(AppState {
             profiles: profile_runtimes,
             session_cache,

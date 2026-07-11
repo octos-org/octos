@@ -871,7 +871,19 @@ fn effective_session_permission_state(
     if let Some(stored) = session_permission_profiles().get_state_explicit(session_id) {
         return stored;
     }
-    if state.dangerous_default_permissions {
+    // The dangerous default is granted ONLY where an EXPLICIT Full Access
+    // selection would also be allowed (codex P1/P2 on #1639): Local
+    // deployment mode (`effective_permissions_for_session` rejects
+    // DangerFullAccess for Tenant/Cloud — an unscoped default there would
+    // fail every unselected session/open) AND a session key that does not
+    // encode a non-solo tenant/cloud scope (the same defence-in-depth gate
+    // `permission_selection_allowed` applies, so a tenant-scoped session
+    // can't be handed host access via the fallback). A session that fails
+    // either check falls through to the gated workspace-write default.
+    if state.dangerous_default_permissions
+        && state.deployment_mode == crate::config::DeploymentMode::Local
+        && !session_id_encodes_non_solo_scope(session_id)
+    {
         return StoredSessionPermissionProfile {
             selection: octos_core::ui_protocol::PermissionProfileSelection {
                 mode: octos_core::ui_protocol::PermissionProfileMode::DangerFullAccess,
@@ -4574,18 +4586,22 @@ async fn ui_protocol_connection(
             }
             UiCommand::PermissionProfileSet(params) => {
                 let session_id = params.session_id.clone();
+                // Fall back to MAIN_PROFILE_ID so the cache is ALWAYS evicted
+                // (codex P1 on #1639): a bare AppUI session on an unscoped
+                // connection resolves to `_main` at session/open, so without
+                // this fallback an explicit downgrade would report success
+                // while the danger-seeded runtime stayed cached and in use.
                 let profile_id = session_id
                     .profile_id()
                     .or(connection_profile_id)
-                    .map(ToOwned::to_owned);
+                    .map(ToOwned::to_owned)
+                    .unwrap_or_else(|| MAIN_PROFILE_ID.to_owned());
                 match permission_profile_set_result(&state, params) {
                     Ok(result) => {
-                        if let Some(profile_id) = profile_id {
-                            state
-                                .session_cache
-                                .invalidate(&(profile_id, session_id))
-                                .await;
-                        }
+                        state
+                            .session_cache
+                            .invalidate(&(profile_id, session_id))
+                            .await;
                         let _ =
                             send_ui_rpc_result(&ws, id, UiRpcResult::PermissionProfileSet(result));
                     }
@@ -5303,18 +5319,20 @@ where
             }
             UiCommand::PermissionProfileSet(params) => {
                 let session_id = params.session_id.clone();
+                // MAIN_PROFILE_ID fallback so the cache is ALWAYS evicted on a
+                // permission change (codex P1 on #1639) — see the sibling
+                // dispatcher above.
                 let profile_id = session_id
                     .profile_id()
                     .or(connection_profile_id_owned.as_deref())
-                    .map(ToOwned::to_owned);
+                    .map(ToOwned::to_owned)
+                    .unwrap_or_else(|| MAIN_PROFILE_ID.to_owned());
                 match permission_profile_set_result(&state, params) {
                     Ok(result) => {
-                        if let Some(profile_id) = profile_id {
-                            state
-                                .session_cache
-                                .invalidate(&(profile_id, session_id))
-                                .await;
-                        }
+                        state
+                            .session_cache
+                            .invalidate(&(profile_id, session_id))
+                            .await;
                         let _ =
                             send_ui_rpc_result(&ws, id, UiRpcResult::PermissionProfileSet(result));
                     }
@@ -31088,12 +31106,14 @@ ignore = []
             PermissionNetworkPolicy as Network, PermissionProfileMode as Mode,
         };
 
-        // Fresh unique session — never stored, so the resolver takes the
-        // no-explicit-selection path in both cases.
+        // Fresh unique solo-scoped session — never stored, so the resolver
+        // takes the no-explicit-selection path in every case below.
         let session_id = SessionKey("local:danger-default-pure-probe".into());
 
+        // Flag on, Local mode, solo-scoped session -> full access.
         let mut state = AppState::empty_for_tests();
         state.dangerous_default_permissions = true;
+        assert_eq!(state.deployment_mode, crate::config::DeploymentMode::Local);
         let resolved = effective_session_permission_state(&state, &session_id);
         assert_eq!(resolved.selection.mode, Mode::DangerFullAccess);
         assert_eq!(resolved.selection.network, Network::Allow);
@@ -31108,6 +31128,22 @@ ignore = []
         assert_eq!(resolved.selection.mode, Mode::WorkspaceWrite);
         assert_eq!(resolved.selection.network, Network::Deny);
         assert_eq!(resolved.approval_policy, None);
+
+        // Flag on but NON-Local deployment -> gated default (codex P2): the
+        // full-access profile is not grantable outside Local mode.
+        let mut tenant = AppState::empty_for_tests();
+        tenant.dangerous_default_permissions = true;
+        tenant.deployment_mode = crate::config::DeploymentMode::Tenant;
+        let resolved = effective_session_permission_state(&tenant, &session_id);
+        assert_eq!(resolved.selection.mode, Mode::WorkspaceWrite);
+
+        // Flag on, Local, but a NON-SOLO-scoped session key -> gated default
+        // (codex P1): the fallback must not hand a tenant-scoped session the
+        // host access the explicit path would reject.
+        let scoped = SessionKey("coding:tenant:m12-danger-default".into());
+        assert!(session_id_encodes_non_solo_scope(&scoped));
+        let resolved = effective_session_permission_state(&state, &scoped);
+        assert_eq!(resolved.selection.mode, Mode::WorkspaceWrite);
     }
 
     #[test]
