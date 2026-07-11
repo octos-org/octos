@@ -172,15 +172,37 @@ impl RetryProvider {
                 if let Some(status) = reqwest_err.status() {
                     return matches!(status.as_u16(), 429 | 500 | 502 | 503 | 504 | 529);
                 }
-                // Connection errors are retryable (may be transient network issue)
+                // Timeout errors should NOT be retried on the same provider —
+                // if a provider is unresponsive, retrying wastes the
+                // per-request budget × retries. Timeouts trigger failover to a
+                // different provider instead. Checked BEFORE `is_connect`: a
+                // connect *timeout* is BOTH `is_timeout()` and `is_connect()`,
+                // and must fail over rather than hammer the same unreachable
+                // lane (empirically confirmed against a black-holed address).
+                if reqwest_err.is_timeout() {
+                    return false;
+                }
+                // Connection *establishment* errors with no timeout (refused,
+                // DNS, TLS handshake) are transient — retry on the same
+                // provider (may be a transient network blip).
                 if reqwest_err.is_connect() {
                     return true;
                 }
-                // Timeout errors should NOT be retried on the same provider —
-                // if a provider is unresponsive, retrying wastes 120s × retries.
-                // Timeouts trigger failover to a different provider instead.
-                if reqwest_err.is_timeout() {
-                    return false;
+                // Transport-level send/body failures WITHOUT an HTTP status —
+                // the status-bearing branch above already returned, so any
+                // reqwest error reaching here carried no response. These are
+                // transient network faults while sending the request or
+                // reading the response head: connection reset, broken pipe,
+                // early EOF, and most importantly "connection closed before
+                // message completed" — reqwest reusing a pooled keepalive
+                // socket that the peer's load balancer already closed. reqwest
+                // classifies these as `is_request()`/`is_body()` (NOT
+                // `is_connect`, NOT `is_timeout`), so the connect-only branch
+                // above missed them and a mid-turn drop hard-failed the whole
+                // turn with no retry and no failover. Retry on the same
+                // provider — a fresh connection is dialed on the next attempt.
+                if reqwest_err.is_request() || reqwest_err.is_body() {
+                    return true;
                 }
             }
         }
@@ -194,10 +216,17 @@ impl RetryProvider {
             }
         }
 
-        // Network-level errors without reqwest context
+        // Network-level errors without reqwest context (flattened error
+        // strings, provider `bail!`s, or a cause chain that lost the typed
+        // reqwest error). "connection closed before message completed" is the
+        // reused-keepalive drop; "error sending request" / "broken pipe" cover
+        // the same transport family surfaced as plain text.
         let lower = error_str.to_lowercase();
         if lower.contains("connection refused")
             || lower.contains("connection reset")
+            || lower.contains("connection closed")
+            || lower.contains("broken pipe")
+            || lower.contains("error sending request")
             || lower.contains("timed out")
             || lower.contains("overloaded")
         {
@@ -886,5 +915,202 @@ mod tests {
             Err(e) => assert!(e.to_string().contains("503"), "unexpected error: {e}"),
             Ok(_) => panic!("should fail after exhausting retries"),
         }
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // Transport-level send-failure classification (issue: glm-5.2
+    // `failed to send streaming request` hard-failed a 20-action turn).
+    //
+    // These drive a real `reqwest` client at a local TCP server that fails
+    // the request in the same way z.ai's endpoint does under load, then wrap
+    // the error EXACTLY like `anthropic.rs`
+    // (`.send().await.wrap_err("failed to send streaming request to Anthropic")`)
+    // and assert the retry/failover verdict.
+    // ──────────────────────────────────────────────────────────────────────
+    use eyre::WrapErr;
+
+    /// Produce a real `reqwest` send failure of the requested `kind`, wrapped
+    /// like the Anthropic provider does:
+    ///   - `"refused"`         → nothing listening (reqwest `is_connect`)
+    ///   - `"immediate_close"` → server accepts then drops the socket
+    ///   - `"read_then_close"` → server reads the request then closes without
+    ///     replying ("connection closed before message completed" — the
+    ///     reused-keepalive / half-open-socket case)
+    async fn transport_send_error(kind: &str) -> eyre::Report {
+        use tokio::io::AsyncReadExt;
+        use tokio::net::TcpListener;
+
+        let client = crate::provider::build_http_client(5, 5);
+
+        if kind == "refused" {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            drop(listener);
+            let url = format!("http://127.0.0.1:{port}/v1/messages");
+            let res = client
+                .post(&url)
+                .json(&serde_json::json!({"x": 1}))
+                .send()
+                .await;
+            return res
+                .map(|_| ())
+                .wrap_err("failed to send streaming request to Anthropic")
+                .unwrap_err();
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let read_then_close = kind == "read_then_close";
+        let accept = tokio::spawn(async move {
+            if let Ok((mut sock, _)) = listener.accept().await {
+                if read_then_close {
+                    let mut buf = [0u8; 1024];
+                    let _ = sock.read(&mut buf).await;
+                }
+                drop(sock);
+            }
+        });
+
+        let url = format!("http://127.0.0.1:{port}/v1/messages");
+        let res = client
+            .post(&url)
+            .json(&serde_json::json!({"x": 1}))
+            .send()
+            .await;
+        let _ = accept.await;
+        res.map(|_| ())
+            .wrap_err("failed to send streaming request to Anthropic")
+            .unwrap_err()
+    }
+
+    #[tokio::test]
+    async fn should_retry_and_failover_on_connection_closed_before_completed() {
+        // The exact failure z.ai returns when reqwest reuses a keepalive
+        // socket the load balancer already closed: reqwest reports it as
+        // `is_request()` (NOT `is_connect`, NOT `is_timeout`, no status).
+        // Before the fix this was classified non-retryable AND
+        // non-failover-worthy, hard-failing the whole turn.
+        let err = transport_send_error("read_then_close").await;
+        assert!(
+            RetryProvider::is_retryable_error(&err),
+            "statusless transport send failure must retry on the same provider: {err:#}"
+        );
+        assert!(
+            RetryProvider::should_failover(&err),
+            "statusless transport send failure must also be failover-worthy: {err:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn should_retry_and_failover_on_immediate_connection_close() {
+        let err = transport_send_error("immediate_close").await;
+        assert!(
+            RetryProvider::is_retryable_error(&err),
+            "reset-after-accept must retry: {err:#}"
+        );
+        assert!(
+            RetryProvider::should_failover(&err),
+            "reset-after-accept must failover: {err:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn should_failover_not_retry_on_connect_timeout() {
+        // A connect timeout is BOTH is_connect() and is_timeout(); it must be
+        // treated as a timeout (failover, don't retry the same unreachable
+        // lane), so is_timeout() is checked before is_connect(). TEST-NET-1
+        // (192.0.2.0/24, RFC 5737) is routed nowhere → the connect hangs until
+        // connect_timeout fires.
+        let client = reqwest::Client::builder()
+            // Bypass any ambient HTTP_PROXY/ALL_PROXY — a proxy could answer
+            // the request and turn the expected connect-timeout error into a
+            // response, panicking `unwrap_err()`.
+            .no_proxy()
+            .connect_timeout(Duration::from_millis(400))
+            .timeout(Duration::from_secs(30))
+            .build()
+            .unwrap();
+        let err = client
+            .post("http://192.0.2.1:81/v1/messages")
+            .json(&serde_json::json!({"x": 1}))
+            .send()
+            .await
+            .map(|_| ())
+            .wrap_err("failed to send streaming request to Anthropic")
+            .unwrap_err();
+
+        let is_timeout = err
+            .chain()
+            .find_map(|c| c.downcast_ref::<reqwest::Error>())
+            .map(|re| re.is_timeout())
+            .unwrap_or(false);
+
+        if is_timeout {
+            assert!(
+                !RetryProvider::is_retryable_error(&err),
+                "connect timeout must NOT retry the same provider: {err:#}"
+            );
+            assert!(
+                RetryProvider::should_failover(&err),
+                "connect timeout must fail over to another provider: {err:#}"
+            );
+        } else {
+            // Environment produced an immediate non-timeout connect error
+            // (e.g. network unreachable) instead of a timeout — still a
+            // transient connect failure, which stays retryable.
+            assert!(
+                RetryProvider::is_retryable_error(&err),
+                "connect error must remain retryable: {err:#}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn should_retry_and_failover_on_connection_refused() {
+        // Regression guard: connect-refused was already retryable
+        // (`is_connect`); it must stay that way.
+        let err = transport_send_error("refused").await;
+        assert!(RetryProvider::is_retryable_error(&err), "{err:#}");
+        assert!(RetryProvider::should_failover(&err), "{err:#}");
+    }
+
+    #[tokio::test]
+    async fn should_not_retry_request_timeout_on_same_provider_but_should_failover() {
+        // A per-request timeout keeps its existing semantics: NOT retried on
+        // the same (unresponsive) provider, but failover-worthy. Guards that
+        // the new transport branch sits AFTER the `is_timeout` check.
+        use tokio::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accept = tokio::spawn(async move {
+            // Accept and hold the socket open without ever responding.
+            if let Ok((sock, _)) = listener.accept().await {
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                drop(sock);
+            }
+        });
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_millis(300))
+            .build()
+            .unwrap();
+        let url = format!("http://127.0.0.1:{port}/v1/messages");
+        let err = client
+            .post(&url)
+            .json(&serde_json::json!({"x": 1}))
+            .send()
+            .await
+            .map(|_| ())
+            .wrap_err("failed to send streaming request to Anthropic")
+            .unwrap_err();
+        accept.abort();
+
+        assert!(
+            !RetryProvider::is_retryable_error(&err),
+            "request timeout must not retry the same provider: {err:#}"
+        );
+        assert!(
+            RetryProvider::should_failover(&err),
+            "request timeout must failover to another provider: {err:#}"
+        );
     }
 }

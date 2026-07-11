@@ -32,8 +32,33 @@ pub struct AnthropicProvider {
     /// Emit `cache_control: {"type": "ephemeral"}` breakpoints so Anthropic
     /// serves the replayed prefix from its prompt cache (~0.1x input rate on
     /// reads) instead of billing the whole conversation at full rate every
-    /// round. Default ON — see [`Self::with_prompt_caching`].
+    /// round. Default ON, but the `OCTOS_PROMPT_CACHING` env kill-switch can
+    /// force it off at startup without a rebuild — see
+    /// [`Self::with_prompt_caching`] and [`prompt_caching_default`].
     prompt_caching: bool,
+}
+
+/// Resolve the default prompt-caching state from a raw env value.
+///
+/// Caching stays ON unless the value is explicitly falsy (`0`, `false`,
+/// `off`, `no`, case- and whitespace-insensitive). Unset, empty, or any
+/// other value keeps the default ON. Pure over its input so the kill-switch
+/// is unit-testable without mutating process env (the workspace is
+/// `deny(unsafe_code)`, and `std::env::set_var` is `unsafe` on edition 2024).
+fn prompt_caching_default_from(env_value: Option<&str>) -> bool {
+    match env_value {
+        Some(v) => !matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "off" | "no"
+        ),
+        None => true,
+    }
+}
+
+/// Default prompt-caching state, honoring the `OCTOS_PROMPT_CACHING`
+/// kill-switch. See [`prompt_caching_default_from`].
+fn prompt_caching_default() -> bool {
+    prompt_caching_default_from(std::env::var("OCTOS_PROMPT_CACHING").ok().as_deref())
 }
 
 impl AnthropicProvider {
@@ -48,7 +73,7 @@ impl AnthropicProvider {
             model: model.into(),
             base_url: "https://api.anthropic.com".to_string(),
             provider_label: "anthropic".to_string(),
-            prompt_caching: true,
+            prompt_caching: prompt_caching_default(),
         }
     }
 
@@ -90,6 +115,10 @@ impl AnthropicProvider {
     /// unconditionally). Disable for odd proxies that reject the field or
     /// the block-array `system` form; disabling restores the exact
     /// pre-caching wire shape (plain-string `system`, verbatim tools).
+    ///
+    /// Operators can flip the default OFF at startup without a rebuild via
+    /// `OCTOS_PROMPT_CACHING=0` (see [`prompt_caching_default`]); this
+    /// explicit builder still wins over the env default when called.
     pub fn with_prompt_caching(mut self, enabled: bool) -> Self {
         self.prompt_caching = enabled;
         self
@@ -1715,6 +1744,32 @@ mod tests {
             !body.to_string().contains("cache_control"),
             "no cache_control key may appear anywhere when caching is off: {body}"
         );
+    }
+
+    #[test]
+    fn prompt_caching_env_default_stays_on_when_unset_or_truthy() {
+        // Default ON is preserved: unset, empty, or any non-falsy value keeps
+        // caching enabled (Claude Code sends cache_control unconditionally).
+        assert!(prompt_caching_default_from(None));
+        assert!(prompt_caching_default_from(Some("")));
+        assert!(prompt_caching_default_from(Some("1")));
+        assert!(prompt_caching_default_from(Some("true")));
+        assert!(prompt_caching_default_from(Some("on")));
+        assert!(prompt_caching_default_from(Some("yes")));
+        assert!(prompt_caching_default_from(Some("anything-else")));
+    }
+
+    #[test]
+    fn prompt_caching_env_kill_switch_disables_on_falsy_values() {
+        // OCTOS_PROMPT_CACHING kill-switch: disable without a rebuild for any
+        // Anthropic-compatible proxy that rejects cache_control / block-form
+        // system. Case- and whitespace-insensitive.
+        for v in ["0", "false", "FALSE", "off", "Off", "no", "  no ", " 0 "] {
+            assert!(
+                !prompt_caching_default_from(Some(v)),
+                "OCTOS_PROMPT_CACHING={v:?} must disable prompt caching"
+            );
+        }
     }
 
     #[test]
