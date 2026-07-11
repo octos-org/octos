@@ -32,8 +32,33 @@ pub struct AnthropicProvider {
     /// Emit `cache_control: {"type": "ephemeral"}` breakpoints so Anthropic
     /// serves the replayed prefix from its prompt cache (~0.1x input rate on
     /// reads) instead of billing the whole conversation at full rate every
-    /// round. Default ON — see [`Self::with_prompt_caching`].
+    /// round. Default ON, but the `OCTOS_PROMPT_CACHING` env kill-switch can
+    /// force it off at startup without a rebuild — see
+    /// [`Self::with_prompt_caching`] and [`prompt_caching_default`].
     prompt_caching: bool,
+}
+
+/// Resolve the default prompt-caching state from a raw env value.
+///
+/// Caching stays ON unless the value is explicitly falsy (`0`, `false`,
+/// `off`, `no`, case- and whitespace-insensitive). Unset, empty, or any
+/// other value keeps the default ON. Pure over its input so the kill-switch
+/// is unit-testable without mutating process env (the workspace is
+/// `deny(unsafe_code)`, and `std::env::set_var` is `unsafe` on edition 2024).
+fn prompt_caching_default_from(env_value: Option<&str>) -> bool {
+    match env_value {
+        Some(v) => !matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "off" | "no"
+        ),
+        None => true,
+    }
+}
+
+/// Default prompt-caching state, honoring the `OCTOS_PROMPT_CACHING`
+/// kill-switch. See [`prompt_caching_default_from`].
+fn prompt_caching_default() -> bool {
+    prompt_caching_default_from(std::env::var("OCTOS_PROMPT_CACHING").ok().as_deref())
 }
 
 impl AnthropicProvider {
@@ -48,7 +73,7 @@ impl AnthropicProvider {
             model: model.into(),
             base_url: "https://api.anthropic.com".to_string(),
             provider_label: "anthropic".to_string(),
-            prompt_caching: true,
+            prompt_caching: prompt_caching_default(),
         }
     }
 
@@ -90,6 +115,10 @@ impl AnthropicProvider {
     /// unconditionally). Disable for odd proxies that reject the field or
     /// the block-array `system` form; disabling restores the exact
     /// pre-caching wire shape (plain-string `system`, verbatim tools).
+    ///
+    /// Operators can flip the default OFF at startup without a rebuild via
+    /// `OCTOS_PROMPT_CACHING=0` (see [`prompt_caching_default`]); this
+    /// explicit builder still wins over the env default when called.
     pub fn with_prompt_caching(mut self, enabled: bool) -> Self {
         self.prompt_caching = enabled;
         self
@@ -1197,7 +1226,10 @@ mod tests {
 
     #[test]
     fn test_build_request_filters_system() {
-        let provider = AnthropicProvider::new("test-key", "claude-test");
+        // Pin caching ON: the extraction assertion below reads block-form
+        // `system[0].text`, which only exists when caching is enabled — keep
+        // it hermetic w.r.t. an ambient `OCTOS_PROMPT_CACHING=0`.
+        let provider = AnthropicProvider::new("test-key", "claude-test").with_prompt_caching(true);
         let messages = vec![
             msg(MessageRole::System, "system prompt"),
             msg(MessageRole::User, "hello"),
@@ -1576,7 +1608,11 @@ mod tests {
 
     #[test]
     fn should_mark_system_last_tool_and_last_user_block_with_cache_control() {
-        let provider = AnthropicProvider::new("test-key", "claude-test");
+        // Pin caching ON so this wire-shape assertion is hermetic w.r.t. an
+        // ambient `OCTOS_PROMPT_CACHING=0` (the builder override wins over the
+        // env default). The default-resolution truth table is covered
+        // separately by `prompt_caching_env_*` unit tests.
+        let provider = AnthropicProvider::new("test-key", "claude-test").with_prompt_caching(true);
         let tools = vec![
             tool_spec("alpha", "first tool"),
             tool_spec("omega", "last tool"),
@@ -1643,7 +1679,9 @@ mod tests {
         // batch — the breakpoint must land on its LAST block only, so the
         // whole history including the current results is cached for the
         // next iteration.
-        let provider = AnthropicProvider::new("test-key", "claude-test");
+        // Pin caching ON so the assertion is independent of the ambient
+        // `OCTOS_PROMPT_CACHING` kill-switch (builder override wins).
+        let provider = AnthropicProvider::new("test-key", "claude-test").with_prompt_caching(true);
         let mut assistant = msg(MessageRole::Assistant, "");
         assistant.tool_calls = Some(vec![
             tool_call("toolu_a", "shell", serde_json::json!({"command": "ls"})),
@@ -1675,7 +1713,9 @@ mod tests {
     fn should_keep_blank_system_as_string_even_when_caching_enabled() {
         // An empty text BLOCK is rejected by Anthropic while `"system": ""`
         // is not — an all-blank system prompt must stay in string form.
-        let provider = AnthropicProvider::new("test-key", "claude-test");
+        // Pin caching ON (the test name asserts "even_when_caching_enabled")
+        // so it does not silently pass under an ambient `OCTOS_PROMPT_CACHING=0`.
+        let provider = AnthropicProvider::new("test-key", "claude-test").with_prompt_caching(true);
         let messages = vec![msg(MessageRole::System, ""), msg(MessageRole::User, "hi")];
         let config = ChatConfig::default();
         let body = serde_json::to_value(provider.build_request(&messages, &[], &config)).unwrap();
@@ -1715,6 +1755,32 @@ mod tests {
             !body.to_string().contains("cache_control"),
             "no cache_control key may appear anywhere when caching is off: {body}"
         );
+    }
+
+    #[test]
+    fn prompt_caching_env_default_stays_on_when_unset_or_truthy() {
+        // Default ON is preserved: unset, empty, or any non-falsy value keeps
+        // caching enabled (Claude Code sends cache_control unconditionally).
+        assert!(prompt_caching_default_from(None));
+        assert!(prompt_caching_default_from(Some("")));
+        assert!(prompt_caching_default_from(Some("1")));
+        assert!(prompt_caching_default_from(Some("true")));
+        assert!(prompt_caching_default_from(Some("on")));
+        assert!(prompt_caching_default_from(Some("yes")));
+        assert!(prompt_caching_default_from(Some("anything-else")));
+    }
+
+    #[test]
+    fn prompt_caching_env_kill_switch_disables_on_falsy_values() {
+        // OCTOS_PROMPT_CACHING kill-switch: disable without a rebuild for any
+        // Anthropic-compatible proxy that rejects cache_control / block-form
+        // system. Case- and whitespace-insensitive.
+        for v in ["0", "false", "FALSE", "off", "Off", "no", "  no ", " 0 "] {
+            assert!(
+                !prompt_caching_default_from(Some(v)),
+                "OCTOS_PROMPT_CACHING={v:?} must disable prompt caching"
+            );
+        }
     }
 
     #[test]
@@ -1781,8 +1847,11 @@ mod tests {
             .mount(&server)
             .await;
 
-        let provider =
-            AnthropicProvider::new("test-key", "claude-test").with_base_url(server.uri());
+        // Pin caching ON — this test asserts cache breakpoints are sent on the
+        // wire, so it must not depend on the ambient `OCTOS_PROMPT_CACHING`.
+        let provider = AnthropicProvider::new("test-key", "claude-test")
+            .with_base_url(server.uri())
+            .with_prompt_caching(true);
         let tools = vec![tool_spec("shell", "run a command")];
         let messages = vec![
             msg(MessageRole::System, "sys"),
