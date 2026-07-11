@@ -706,8 +706,9 @@ mod tests {
         let mut profile_b = make_profile(tmp.path().join("profile-b")).await;
         // `make_profile` fixes the id; give the second a distinct identity so
         // the sweep has something to spare.
-        std::sync::Arc::get_mut(&mut profile_b)
-            .map(|profile| profile.profile_id = "other".to_owned());
+        if let Some(profile) = std::sync::Arc::get_mut(&mut profile_b) {
+            profile.profile_id = "other".to_owned();
+        }
 
         let cache = SessionRuntimeCache::new(8, Duration::from_secs(60));
         cache
