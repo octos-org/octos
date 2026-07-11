@@ -139,11 +139,19 @@ impl LoopTurnState {
         &mut self,
         input_tokens: u32,
         output_tokens: u32,
+        cache_read_tokens: u32,
+        cache_write_tokens: u32,
         tracker: Option<&TokenTracker>,
         estimated_cost_usd: Option<f64>,
     ) {
         self.total_usage.input_tokens += input_tokens;
         self.total_usage.output_tokens += output_tokens;
+        // Cache traffic is real processed prompt volume — Anthropic reports
+        // it OUTSIDE input_tokens (disjoint accounting) — so accumulate it
+        // too, keeping the turn totals and the token-budget gate at their
+        // pre-caching meaning (everything the provider processed).
+        self.total_usage.cache_read_tokens += cache_read_tokens;
+        self.total_usage.cache_write_tokens += cache_write_tokens;
         if let Some(cost) = estimated_cost_usd {
             self.turn_spend_usd += cost;
             self.priced_usage = true;
@@ -234,14 +242,27 @@ mod tests {
         // Two responses priced at DIFFERENT models' rates plus one from
         // an unpriced model: tokens all count, spend sums only the known
         // costs — no re-pricing of earlier responses at the last model.
-        state.record_usage(1_000, 200, None, Some(0.015));
-        state.record_usage(2_000, 400, None, Some(0.002));
-        state.record_usage(500, 100, None, None);
+        state.record_usage(1_000, 200, 0, 0, None, Some(0.015));
+        state.record_usage(2_000, 400, 0, 0, None, Some(0.002));
+        state.record_usage(500, 100, 0, 0, None, None);
 
         assert_eq!(state.total_usage().input_tokens, 3_500);
         assert_eq!(state.total_usage().output_tokens, 700);
         assert!(state.has_priced_usage());
         assert!((state.spend_usd() - 0.017).abs() < 1e-9);
+    }
+
+    #[test]
+    fn should_accumulate_cache_tokens_when_usage_recorded() {
+        // Anthropic reports cached prefix tokens OUTSIDE input_tokens; the
+        // turn total must carry them so the token budget and downstream
+        // ledgers see the full processed volume.
+        let mut state = LoopTurnState::new(Instant::now());
+        state.record_usage(100, 50, 4_000, 850, None, None);
+        assert_eq!(state.total_usage().input_tokens, 100);
+        assert_eq!(state.total_usage().output_tokens, 50);
+        assert_eq!(state.total_usage().cache_read_tokens, 4_000);
+        assert_eq!(state.total_usage().cache_write_tokens, 850);
     }
 
     #[test]

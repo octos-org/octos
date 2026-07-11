@@ -1148,6 +1148,8 @@ impl Agent {
                     turn.record_usage(
                         response.usage.input_tokens,
                         response.usage.output_tokens,
+                        response.usage.cache_read_tokens,
+                        response.usage.cache_write_tokens,
                         tracker,
                         // Attributed inside `call_llm_with_hooks`: each
                         // attempt (discarded retries included) priced at the
@@ -1889,6 +1891,8 @@ impl Agent {
                 turn.record_usage(
                     response.usage.input_tokens,
                     response.usage.output_tokens,
+                    response.usage.cache_read_tokens,
+                    response.usage.cache_write_tokens,
                     None,
                     // Attributed per attempt inside `call_llm_with_hooks`
                     // (cross-provider retries priced at their own slot).
@@ -2203,6 +2207,8 @@ impl Agent {
             token_usage: octos_core::TokenUsage {
                 input_tokens: usage.input_tokens,
                 output_tokens: usage.output_tokens,
+                cache_read_tokens: usage.cache_read_tokens,
+                cache_write_tokens: usage.cache_write_tokens,
                 ..Default::default()
             },
         }
@@ -2469,6 +2475,8 @@ impl Agent {
             tool_send_files.extend(batch_send_files);
             tool_tokens.input_tokens += batch_tokens.input_tokens;
             tool_tokens.output_tokens += batch_tokens.output_tokens;
+            tool_tokens.cache_read_tokens += batch_tokens.cache_read_tokens;
+            tool_tokens.cache_write_tokens += batch_tokens.cache_write_tokens;
             tool_metadata.extend(batch_metadata);
             tool_success.extend(batch_success);
         }
@@ -2571,6 +2579,8 @@ impl Agent {
         turn.record_usage(
             tool_tokens.input_tokens,
             tool_tokens.output_tokens,
+            tool_tokens.cache_read_tokens,
+            tool_tokens.cache_write_tokens,
             tracker,
             // Tool-reported usage has no per-response provider attribution;
             // price it at the active slot as the closest estimate.
