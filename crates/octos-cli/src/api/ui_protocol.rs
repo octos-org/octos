@@ -29,30 +29,32 @@ use octos_core::ui_protocol::{
     ApprovalDecidedEvent, ApprovalDecision, ApprovalId, ApprovalRenderHints,
     ApprovalRequestedEvent, ApprovalTypedDetails, ContentBulkDeleteParams, ContentDeleteParams,
     ContentListParams, ContextCompactionCompletedEvent, ContextCompactionStartedEvent,
-    ContextNormalizationReportedEvent, Envelope, EnvelopeTokenUsage, FileRef, HydratedMessage,
-    HydratedTurn, InputItem, MessageDeltaEvent, MessageMeta, MessagePersistedEvent,
+    ContextNormalizationReportedEvent, CronListParams, CronToggleParams, Envelope,
+    EnvelopeTokenUsage, FileRef, HydratedMessage, HydratedTurn, InputItem, MemoryEntityParams,
+    MemoryOverviewParams, MessageDeltaEvent, MessageMeta, MessagePersistedEvent,
     MessagePersistedSource, OutputCursor, Payload, ReplayLossyEvent, RpcError, RpcErrorResponse,
     RpcRequest, RpcResponse, SESSION_HYDRATE_INCLUDE_MAX, SESSION_MESSAGES_PAGE_DEFAULT_LIMIT,
     SESSION_MESSAGES_PAGE_MAX_LIMIT, SESSION_MESSAGES_PAGE_MAX_OFFSET, SESSION_TITLE_SET_MAX_CHARS,
-    SessionDeleteParams, SessionFilesListParams, SessionHydrateParams, SessionHydrateResult,
-    SessionListParams, SessionMessagesPageParams, SessionOpenParams, SessionOpenResult,
-    SessionOpened, SessionOrchestrationEvent, SessionRollbackParams, SessionRollbackResult,
-    SessionSnapshotParams, SessionStatusGetParams, SessionTasksListParams, SessionTitleSetParams,
-    SessionWorkspaceGetParams, SkillActionJobUpdatedEvent, SystemStatusGetParams,
-    TaskArtifactListParams, TaskArtifactListResult, TaskArtifactReadParams, TaskArtifactReadResult,
-    TaskArtifactRecord, TaskCancelParams, TaskCancelResult, TaskListEntry, TaskListParams,
-    TaskListResult, TaskOutputDeltaEvent, TaskRestartFromNodeParams, TaskRestartFromNodeResult,
-    TaskRuntimeState as UiTaskRuntimeState, TaskUpdatedEvent, ThreadGraphEntry,
-    ThreadGraphGetParams, ThreadGraphGetResult, ToolCompletedEvent, ToolProgressEvent,
-    ToolStartedEvent, TurnCompletedEvent, TurnErrorEvent, TurnId, TurnInterruptParams,
-    TurnInterruptResult, TurnLifecycleState, TurnSessionResult, TurnSpawnCompleteEvent,
-    TurnStartParams, TurnStateGetParams, TurnStateGetResult, UI_PROTOCOL_FEATURE_APPROVAL_TYPED_V1,
-    UI_PROTOCOL_FEATURE_AUXILIARY_REST_TO_WS_V1, UI_PROTOCOL_FEATURE_CODING_AGENT_CONTROL_V1,
-    UI_PROTOCOL_FEATURE_CODING_AUTONOMY_V1, UI_PROTOCOL_FEATURE_CODING_GOAL_RUNTIME_V1,
-    UI_PROTOCOL_FEATURE_CODING_LOOP_RUNTIME_V1, UI_PROTOCOL_FEATURE_CONTEXT_LIFECYCLE_V1,
-    UI_PROTOCOL_FEATURE_FILE_ATTACHED_V1, UI_PROTOCOL_FEATURE_HARNESS_TASK_ARTIFACTS_V1,
-    UI_PROTOCOL_FEATURE_HARNESS_TASK_CONTROL_V1, UI_PROTOCOL_FEATURE_MESSAGE_PERSISTED_V1,
-    UI_PROTOCOL_FEATURE_PANE_SNAPSHOTS_V1, UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V1,
+    SessionBtwParams, SessionDeleteParams, SessionFilesListParams, SessionHydrateParams,
+    SessionHydrateResult, SessionListParams, SessionMessagesPageParams, SessionOpenParams,
+    SessionOpenResult, SessionOpened, SessionOrchestrationEvent, SessionRollbackParams,
+    SessionRollbackResult, SessionSnapshotParams, SessionStatusGetParams, SessionTasksListParams,
+    SessionTitleSetParams, SessionWorkspaceGetParams, SkillActionJobUpdatedEvent,
+    SystemStatusGetParams, TaskArtifactListParams, TaskArtifactListResult, TaskArtifactReadParams,
+    TaskArtifactReadResult, TaskArtifactRecord, TaskCancelParams, TaskCancelResult, TaskListEntry,
+    TaskListParams, TaskListResult, TaskOutputDeltaEvent, TaskRestartFromNodeParams,
+    TaskRestartFromNodeResult, TaskRuntimeState as UiTaskRuntimeState, TaskUpdatedEvent,
+    ThreadGraphEntry, ThreadGraphGetParams, ThreadGraphGetResult, ToolCompletedEvent,
+    ToolProgressEvent, ToolStartedEvent, TurnCompletedEvent, TurnErrorEvent, TurnId,
+    TurnInterruptParams, TurnInterruptResult, TurnLifecycleState, TurnSessionResult,
+    TurnSpawnCompleteEvent, TurnStartParams, TurnStateGetParams, TurnStateGetResult,
+    UI_PROTOCOL_FEATURE_APPROVAL_TYPED_V1, UI_PROTOCOL_FEATURE_AUXILIARY_REST_TO_WS_V1,
+    UI_PROTOCOL_FEATURE_CODING_AGENT_CONTROL_V1, UI_PROTOCOL_FEATURE_CODING_AUTONOMY_V1,
+    UI_PROTOCOL_FEATURE_CODING_GOAL_RUNTIME_V1, UI_PROTOCOL_FEATURE_CODING_LOOP_RUNTIME_V1,
+    UI_PROTOCOL_FEATURE_CONTEXT_LIFECYCLE_V1, UI_PROTOCOL_FEATURE_FILE_ATTACHED_V1,
+    UI_PROTOCOL_FEATURE_HARNESS_TASK_ARTIFACTS_V1, UI_PROTOCOL_FEATURE_HARNESS_TASK_CONTROL_V1,
+    UI_PROTOCOL_FEATURE_MESSAGE_PERSISTED_V1, UI_PROTOCOL_FEATURE_PANE_SNAPSHOTS_V1,
+    UI_PROTOCOL_FEATURE_PLAN_TODOS_V1, UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V1,
     UI_PROTOCOL_FEATURE_REVIEW_START_V1, UI_PROTOCOL_FEATURE_SESSION_HYDRATE_V1,
     UI_PROTOCOL_FEATURE_SESSION_SANDBOX_V1, UI_PROTOCOL_FEATURE_SESSION_WORKSPACE_CWD_V1,
     UI_PROTOCOL_FEATURE_SPAWN_COMPLETE_V1, UI_PROTOCOL_FEATURE_THREAD_GRAPH_V1,
@@ -255,6 +257,7 @@ const APPUI_EXTRA_METHODS: &[&str] = &[
     APPUI_METHOD_SKILL_ACTION_JOB_LIST,
     APPUI_METHOD_SKILL_ACTION_JOB_READ,
     APPUI_METHOD_ONBOARDING_WORKSPACE_PROBE,
+    octos_core::ui_protocol::methods::SESSION_BTW,
 ];
 const APPUI_STDIO_AUTH_BOUND_UNAVAILABLE_METHODS: &[&str] = &[
     APPUI_METHOD_AUTH_ME,
@@ -262,6 +265,10 @@ const APPUI_STDIO_AUTH_BOUND_UNAVAILABLE_METHODS: &[&str] = &[
     octos_core::ui_protocol::methods::CONTENT_LIST,
     octos_core::ui_protocol::methods::CONTENT_DELETE,
     octos_core::ui_protocol::methods::CONTENT_BULK_DELETE,
+    octos_core::ui_protocol::methods::MEMORY_OVERVIEW,
+    octos_core::ui_protocol::methods::MEMORY_ENTITY,
+    octos_core::ui_protocol::methods::CRON_LIST,
+    octos_core::ui_protocol::methods::CRON_TOGGLE,
 ];
 type WsSink = futures::stream::SplitSink<WebSocket, WsMessage>;
 type SharedActiveTurns = Arc<tokio::sync::Mutex<HashMap<SessionKey, ActiveTurn>>>;
@@ -1011,6 +1018,12 @@ fn m9_protocol_fixture_for_prompt(prompt: &str) -> Option<M9ProtocolFixture> {
 
 struct ActiveTurn {
     turn_id: TurnId,
+    /// Resolved profile the turn was admitted under (canonical: absent maps
+    /// to `MAIN_PROFILE_ID`). `session/btw` verifies it before injecting the
+    /// turn's live draft into an aside — the registry is process-global and
+    /// keyed by bare `SessionKey`, so two profiles' same-named sessions would
+    /// otherwise cross-read each other's stream.
+    profile_id: String,
     /// Per-turn state guard; held by both the registry entry and by the turn
     /// task so interrupt + natural-completion races serialize on a single lock.
     state: Arc<TokioMutex<TurnState>>,
@@ -1058,6 +1071,11 @@ struct ConnectionUiFeatures {
     /// progressive MSE playback; otherwise it falls back to whole-file
     /// `file/attached` audio.
     voice_audio: bool,
+    /// `plan.todos.v1` negotiated. When set, the server streams the
+    /// `update_plan` tool's checklist as `plan/updated` notifications and
+    /// replays the latest snapshot on `session/open`. Otherwise the plan rides
+    /// out only on the legacy `tool/completed` `structured_metadata` path.
+    plan_todos: bool,
     /// UPCR-2026-014 M9-γ `projection.envelope.v1` negotiated. When set,
     /// the client opts in to the canonical [`Envelope`] shape (spec
     /// § 14) for projected events. γ-1 wires capability negotiation
@@ -1153,6 +1171,7 @@ impl ConnectionUiFeatures {
             spawn_complete: has_ui_feature(headers, query, UI_PROTOCOL_FEATURE_SPAWN_COMPLETE_V1),
             file_attached: has_ui_feature(headers, query, UI_PROTOCOL_FEATURE_FILE_ATTACHED_V1),
             voice_audio: has_ui_feature(headers, query, UI_PROTOCOL_FEATURE_VOICE_AUDIO_V1),
+            plan_todos: has_ui_feature(headers, query, UI_PROTOCOL_FEATURE_PLAN_TODOS_V1),
             projection_envelope: has_ui_feature(
                 headers,
                 query,
@@ -1216,6 +1235,7 @@ impl ConnectionUiFeatures {
             spawn_complete: true,
             file_attached: true,
             voice_audio: true,
+            plan_todos: true,
             // Do NOT auto-enable `projection.envelope.v1` for stdio
             // connections. Legacy `turn/completed` is the turn-lifecycle
             // source for clients that do not consume `projection/envelope`
@@ -1271,6 +1291,7 @@ impl ConnectionUiFeatures {
             spawn_complete: has(UI_PROTOCOL_FEATURE_SPAWN_COMPLETE_V1),
             file_attached: has(UI_PROTOCOL_FEATURE_FILE_ATTACHED_V1),
             voice_audio: has(UI_PROTOCOL_FEATURE_VOICE_AUDIO_V1),
+            plan_todos: has(UI_PROTOCOL_FEATURE_PLAN_TODOS_V1),
             projection_envelope: has(UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V1),
             auxiliary_rest_to_ws_v1: has(UI_PROTOCOL_FEATURE_AUXILIARY_REST_TO_WS_V1),
             coding_autonomy_v1: has(UI_PROTOCOL_FEATURE_CODING_AUTONOMY_V1),
@@ -1339,6 +1360,9 @@ impl ConnectionUiFeatures {
         }
         if self.voice_audio {
             requested.push(UI_PROTOCOL_FEATURE_VOICE_AUDIO_V1);
+        }
+        if self.plan_todos {
+            requested.push(UI_PROTOCOL_FEATURE_PLAN_TODOS_V1);
         }
         if self.projection_envelope {
             requested.push(UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V1);
@@ -2257,6 +2281,11 @@ struct AppUiLoopPromptScratch {
 /// Override via `OCTOS_VOICE_MAX_PROMPT_TOKENS`.
 const VOICE_TURN_MAX_PROMPT_TOKENS: usize = 8000;
 
+/// Delivery hook for mid-turn (in-loop) compaction lifecycle notifications.
+/// Captures the turn's `WsConnection` + ledger + negotiated features so the
+/// (sync) bridge can reach the client without owning connection state.
+type ContextLifecycleNotify = Arc<dyn Fn(UiNotification) + Send + Sync>;
+
 struct AppUiPromptContextBridge {
     session_id: SessionKey,
     data_dir: PathBuf,
@@ -2265,6 +2294,14 @@ struct AppUiPromptContextBridge {
     /// When true, the outgoing model prompt is capped at
     /// [`VOICE_TURN_MAX_PROMPT_TOKENS`] (see [`Self::outgoing_prompt_policy`]).
     voice_turn: bool,
+    /// UPCR-2026-026 follow-up: the in-loop compaction pass previously ran
+    /// SILENTLY (tracing + passive status store only), so a session whose
+    /// context fills mid-turn never surfaced any compaction UX — and the
+    /// compacted snapshot it persisted then starved the pre-turn (emitting)
+    /// site forever. When set, the threshold block in
+    /// [`Self::prepare_prompt`] emits `ContextCompactionStarted`/`Completed`
+    /// through this hook. `None` in tests and paths without a client.
+    context_lifecycle_notify: Option<ContextLifecycleNotify>,
 }
 
 impl AppUiPromptContextBridge {
@@ -2280,7 +2317,13 @@ impl AppUiPromptContextBridge {
             context_manager,
             scratch: StdMutex::new(None),
             voice_turn,
+            context_lifecycle_notify: None,
         }
+    }
+
+    fn with_context_lifecycle_notify(mut self, notify: ContextLifecycleNotify) -> Self {
+        self.context_lifecycle_notify = Some(notify);
+        self
     }
 
     /// Voice-turn history budget (tokens), env-overridable.
@@ -2374,7 +2417,28 @@ impl PromptContextManager for AppUiPromptContextBridge {
 
         let threshold = Self::threshold_tokens(&request);
         let mut compaction_performed = false;
+        // UPCR-2026-026 follow-up: surface the MID-TURN pass to the client.
+        // This is where compaction actually happens for a session whose
+        // context fills during a long (multi-agent) turn — and the compacted
+        // snapshot persisted below starves the pre-turn (emitting) site, so
+        // without these events the user never sees any compaction UX at all.
+        // Events are COLLECTED here and emitted only after `scratch_guard`
+        // drops (codex round-2): on the stdio transport the delivery path can
+        // block on a bounded SyncSender under backpressure, and a blocking
+        // send while holding the scratch mutex would stall the bridge.
+        let mut lifecycle_events: Vec<UiNotification> = Vec::new();
         if scratch.manager.state().token_estimate > threshold {
+            let trigger = format!("agent_loop:{}", request.phase.as_str());
+            if self.context_lifecycle_notify.is_some() {
+                lifecycle_events.push(UiNotification::ContextCompactionStarted(
+                    ContextCompactionStartedEvent {
+                        session_id: self.session_id.clone(),
+                        context_state: ui_context_state_for(&self.session_id, &scratch.manager),
+                        trigger: trigger.clone(),
+                        threshold_tokens: threshold,
+                    },
+                ));
+            }
             let before = scratch.manager.for_prompt(&policy);
             let summary_budget = threshold.clamp(256, 4096) as u32;
             let summary =
@@ -2382,12 +2446,19 @@ impl PromptContextManager for AppUiPromptContextBridge {
             let record = scratch.manager.compact_context(
                 summary,
                 CompactContextPolicy {
-                    trigger: format!("agent_loop:{}", request.phase.as_str()),
+                    trigger,
                     keep_recent_items: Self::keep_items(),
                     ..CompactContextPolicy::default()
                 },
             );
             compaction_performed = true;
+            if self.context_lifecycle_notify.is_some() {
+                lifecycle_events.push(appui_context_compaction_notification(
+                    &self.session_id,
+                    &scratch.manager,
+                    &record,
+                ));
+            }
             info!(
                 session = %self.session_id.0,
                 phase = request.phase.as_str(),
@@ -2486,14 +2557,26 @@ impl PromptContextManager for AppUiPromptContextBridge {
                 );
             }
         }
-        Ok(PromptContextReport {
+        let report = PromptContextReport {
             prompt_replaced,
             compaction_performed,
             messages_before,
             messages_after: messages.len(),
             token_estimate: Some(frame.report.token_estimate),
             generation: Some(frame.context_state.generation),
-        })
+        };
+        // Emit AFTER releasing the scratch lock (see the collection comment
+        // above): a blocking stdio send while holding `scratch` would stall
+        // any concurrent bridge user. Wire order (started → completed, one
+        // delivery batch) matches the pre-turn site, which also returns both
+        // events together.
+        drop(scratch_guard);
+        if let Some(notify) = self.context_lifecycle_notify.as_ref() {
+            for event in lifecycle_events {
+                notify(event);
+            }
+        }
+        Ok(report)
     }
 }
 
@@ -4141,6 +4224,11 @@ async fn ui_protocol_connection(
     // forces the session to that profile); it only fills the gap left by
     // None-scoped (admin) connections, which are authorized for every profile.
     let mut session_open_profile_id: Option<String> = None;
+    // Detached `session/btw` aside tasks spawned by this connection. Aborted
+    // at teardown: an aside holds a WsConnection clone (writer sender), so an
+    // orphaned one would keep paid provider work running — and hold the stdio
+    // writer open past EOF — for up to its 30s timeout after the client left.
+    let mut btw_aside_tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();
     // Last-emitted whole-job orchestration status per session (dedup so only
     // changes hit the wire). Drives the client's composer top-border indicator.
     let mut last_orchestration: HashMap<SessionKey, SessionOrchestrationEvent> = HashMap::new();
@@ -4487,6 +4575,17 @@ async fn ui_protocol_connection(
                 )
                 .await;
             }
+            UiCommand::SessionFork(params) => {
+                handle_session_fork(
+                    &ws,
+                    &state,
+                    connection_profile_id,
+                    routed_profile_id,
+                    id,
+                    params,
+                )
+                .await;
+            }
             UiCommand::ThreadGraphGet(params) => {
                 handle_thread_graph_get(
                     &ws,
@@ -4513,6 +4612,27 @@ async fn ui_protocol_connection(
                     params,
                 )
                 .await;
+            }
+            UiCommand::SessionBtw(params) => {
+                let aside = handle_session_btw(
+                    &ws,
+                    &state,
+                    &ledger,
+                    &active_turns,
+                    connection_profile_id,
+                    // gap #2: fall back to the session-open profile when the
+                    // connection supplied no routing profile (admin / unscoped)
+                    // so the aside reads and bills the SAME profile the open
+                    // resolved to.
+                    routed_profile_id.or(session_open_profile_id.as_deref()),
+                    id,
+                    params,
+                )
+                .await;
+                if let Some(task) = aside {
+                    btw_aside_tasks.retain(|task| !task.is_finished());
+                    btw_aside_tasks.push(task);
+                }
             }
             UiCommand::PermissionProfileList(params) => {
                 let result = permission_profile_list_result(&state, params);
@@ -4691,6 +4811,54 @@ async fn ui_protocol_connection(
                 )
                 .await;
             }
+            UiCommand::MemoryOverview(params) => {
+                handle_memory_overview(
+                    &ws,
+                    &state,
+                    &connection_headers,
+                    connection_identity.as_ref(),
+                    true,
+                    id,
+                    params,
+                )
+                .await;
+            }
+            UiCommand::MemoryEntity(params) => {
+                handle_memory_entity(
+                    &ws,
+                    &state,
+                    &connection_headers,
+                    connection_identity.as_ref(),
+                    true,
+                    id,
+                    params,
+                )
+                .await;
+            }
+            UiCommand::CronList(params) => {
+                handle_cron_list(
+                    &ws,
+                    &state,
+                    &connection_headers,
+                    connection_identity.as_ref(),
+                    true,
+                    id,
+                    params,
+                )
+                .await;
+            }
+            UiCommand::CronToggle(params) => {
+                handle_cron_toggle(
+                    &ws,
+                    &state,
+                    &connection_headers,
+                    connection_identity.as_ref(),
+                    true,
+                    id,
+                    params,
+                )
+                .await;
+            }
             UiCommand::RouterSetMode(params) => {
                 handle_router_set_mode(
                     &ws,
@@ -4726,6 +4894,7 @@ async fn ui_protocol_connection(
     )
     .await;
     abort_live_forwarders(&live_forwarders, &ledger).await;
+    abort_btw_aside_tasks(&mut btw_aside_tasks).await;
     // Dropping `ws` lets the writer task drain & exit; await it so the socket
     // is closed before we return.
     drop(ws);
@@ -4820,6 +4989,9 @@ where
     let ledger = event_ledger(&state).await;
     let _ = diff_preview_store(&state, contracts.as_ref()).await;
     let mut features = ConnectionUiFeatures::stdio_defaults();
+    // See the ws loop's twin: detached asides must not outlive this stdio
+    // connection (they hold the writer sender → EOF shutdown would block).
+    let mut btw_aside_tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();
     let connection_headers = HeaderMap::new();
     let mut connection_profile_id_owned: Option<String> = None;
     let mut last_orchestration: HashMap<SessionKey, SessionOrchestrationEvent> = HashMap::new();
@@ -5136,6 +5308,17 @@ where
                 )
                 .await;
             }
+            UiCommand::SessionFork(params) => {
+                handle_session_fork(
+                    &ws,
+                    &state,
+                    connection_profile_id_owned.as_deref(),
+                    None,
+                    id,
+                    params,
+                )
+                .await;
+            }
             UiCommand::ThreadGraphGet(params) => {
                 handle_thread_graph_get(
                     &ws,
@@ -5162,6 +5345,23 @@ where
                     params,
                 )
                 .await;
+            }
+            UiCommand::SessionBtw(params) => {
+                let aside = handle_session_btw(
+                    &ws,
+                    &state,
+                    &ledger,
+                    &active_turns,
+                    connection_profile_id_owned.as_deref(),
+                    None,
+                    id,
+                    params,
+                )
+                .await;
+                if let Some(task) = aside {
+                    btw_aside_tasks.retain(|task| !task.is_finished());
+                    btw_aside_tasks.push(task);
+                }
             }
             UiCommand::PermissionProfileList(params) => {
                 let result = permission_profile_list_result(&state, params);
@@ -5261,6 +5461,20 @@ where
                 )
                 .await;
             }
+            UiCommand::MemoryOverview(params) => {
+                handle_memory_overview(&ws, &state, &connection_headers, None, false, id, params)
+                    .await;
+            }
+            UiCommand::MemoryEntity(params) => {
+                handle_memory_entity(&ws, &state, &connection_headers, None, false, id, params)
+                    .await;
+            }
+            UiCommand::CronList(params) => {
+                handle_cron_list(&ws, &state, &connection_headers, None, false, id, params).await;
+            }
+            UiCommand::CronToggle(params) => {
+                handle_cron_toggle(&ws, &state, &connection_headers, None, false, id, params).await;
+            }
             UiCommand::RouterSetMode(params) => {
                 // stdio is a local single-user transport with no authenticated
                 // tenant scope, so `connection_profile_id` is `None` (no
@@ -5300,6 +5514,7 @@ where
         STDIO_SHUTDOWN_TURN_DRAIN_MAX,
     )
     .await;
+    abort_btw_aside_tasks(&mut btw_aside_tasks).await;
     cleanup_stdio_connection_resources(
         &active_turns,
         &connection_turns,
@@ -5510,6 +5725,16 @@ where
         }
         WsMessage::Close(_) => Ok(false),
         WsMessage::Ping(_) | WsMessage::Pong(_) | WsMessage::Binary(_) => Ok(true),
+    }
+}
+
+/// Abort every detached `session/btw` aside this connection spawned and await
+/// each JoinHandle (abort → future dropped → the in-flight guard's Drop frees
+/// the busy slot, and the task's WsConnection clone releases the writer).
+async fn abort_btw_aside_tasks(tasks: &mut Vec<tokio::task::JoinHandle<()>>) {
+    for task in tasks.drain(..) {
+        task.abort();
+        let _ = task.await;
     }
 }
 
@@ -5726,6 +5951,20 @@ struct RawLlmSelection {
     model_id: Option<String>,
     #[serde(default)]
     route: RawLlmRoute,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct RawProfileLlmSelectParams {
+    #[serde(default)]
+    profile_id: Option<String>,
+    #[serde(default)]
+    session_id: Option<SessionKey>,
+    #[serde(default)]
+    family_id: Option<String>,
+    #[serde(default)]
+    model_id: Option<String>,
+    #[serde(default)]
+    route_id: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -6146,6 +6385,18 @@ fn normalize_local_username(username: &str) -> Result<String, RpcError> {
         return Err(local_profile_error(
             "profile_local_invalid_username",
             "normalized username must be 1-64 characters",
+        ));
+    }
+    // The username becomes BOTH the user id and the profile id.
+    // Profile ids reject reserved channel names (ambiguous session
+    // keys — see profiles::validate_profile_id), so reject here BEFORE
+    // any record persists: previously the user record was saved first
+    // and only the later profile save failed, leaving a valid user
+    // with no usable profile (codex #1613 r5).
+    if octos_core::is_reserved_channel_name(&normalized) {
+        return Err(local_profile_error(
+            "profile_local_invalid_username",
+            "username must not be a reserved channel name (e.g. api, slack, line)",
         ));
     }
     Ok(normalized)
@@ -6989,12 +7240,27 @@ fn runtime_policy_stamp_for_profile(
 ) -> Value {
     let runtime = state.profiles.get(profile_id);
     let primary = profile.and_then(|profile| profile.config.primary_llm());
-    let model = runtime
-        .map(|runtime| runtime.primary_model_id.clone())
-        .or_else(|| primary.and_then(|selection| selection.model_id.clone()));
-    let provider = runtime
-        .map(|runtime| runtime.provider_name.clone())
-        .or_else(|| primary.and_then(|selection| selection.family_id.clone()));
+    // The stamp reports the model that will actually SERVE the next turn,
+    // matching `resolve_session_profile_runtime`'s precedence:
+    // - a profile pinned in startup-config `state.profiles` keeps serving
+    //   that immutable runtime until restart (`profile/llm/select` only
+    //   warns for these), so the boot snapshot is the truth even when the
+    //   stored file has since changed;
+    // - a store-backed (dynamic) profile re-bootstraps from the FILE after
+    //   select evicts, so the file's primary is the truth — the old
+    //   unconditional runtime-first order made every status/read stomp a
+    //   freshly-applied selection back to the boot-time model.
+    let (model, provider) = if let Some(runtime) = runtime {
+        (
+            Some(runtime.primary_model_id.clone()),
+            Some(runtime.provider_name.clone()),
+        )
+    } else {
+        (
+            primary.and_then(|selection| selection.model_id.clone()),
+            primary.and_then(|selection| selection.family_id.clone()),
+        )
+    };
     let permission_state = session_id
         .map(|session_id| session_permission_profiles().get_state(session_id))
         .unwrap_or_default();
@@ -7071,43 +7337,109 @@ fn profile_llm_list_result(
     })
 }
 
+fn configured_model_status_json(provider: &Value, selected: bool) -> Value {
+    json!({
+        "model": provider.get("model_id").and_then(Value::as_str).unwrap_or("unknown"),
+        "provider": provider.get("family_id").and_then(Value::as_str).unwrap_or("unknown"),
+        "title": format!(
+            "{} / {}",
+            provider.get("family_id").and_then(Value::as_str).unwrap_or("unknown"),
+            provider.get("model_id").and_then(Value::as_str).unwrap_or("unknown")
+        ),
+        "family": provider.get("family_id").cloned(),
+        "route": provider.get("route_id").cloned(),
+        "selected": selected,
+        "available": true,
+        "queue_mode": "adaptive",
+        "qoe_policy": "profile",
+    })
+}
+
 fn model_list_result(
     state: &AppState,
     session_id: SessionKey,
     profile_id: &str,
     profile: Option<&crate::profiles::UserProfile>,
 ) -> Value {
-    let primary = profile_llm_list_result(state, profile_id, profile)
+    // EVERY configured model rides the list — the primary as `selected`,
+    // fallbacks as switchable alternatives (`profile/llm/select` promotes
+    // one to primary). A single-primary profile keeps its one-entry shape.
+    let listed = profile_llm_list_result(state, profile_id, profile);
+    let primary = listed
         .get("primary")
         .cloned()
         .filter(|value| !value.is_null());
-    let models = primary
+    let fallbacks = listed
+        .get("fallbacks")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let mut models = primary
         .into_iter()
-        .map(|provider| {
-            json!({
-                "model": provider.get("model_id").and_then(Value::as_str).unwrap_or("unknown"),
-                "provider": provider.get("family_id").and_then(Value::as_str).unwrap_or("unknown"),
-                "title": format!(
-                    "{} / {}",
-                    provider.get("family_id").and_then(Value::as_str).unwrap_or("unknown"),
-                    provider.get("model_id").and_then(Value::as_str).unwrap_or("unknown")
-                ),
-                "family": provider.get("family_id").cloned(),
-                "route": provider.get("route_id").cloned(),
-                "selected": true,
-                "available": true,
-                "queue_mode": "adaptive",
-                "qoe_policy": "profile",
-            })
-        })
+        .map(|provider| configured_model_status_json(&provider, true))
         .collect::<Vec<_>>();
+    models.extend(
+        fallbacks
+            .iter()
+            .map(|provider| configured_model_status_json(provider, false)),
+    );
     json!({ "session_id": session_id, "models": models })
 }
 
-fn raw_catalog_result() -> Result<Value, RpcError> {
-    let families = serde_json::from_str::<Value>(DASHBOARD_PROVIDERS_JSON).map_err(|err| {
+fn raw_catalog_result(state: &AppState, profile_id: Option<&str>) -> Result<Value, RpcError> {
+    let mut families = serde_json::from_str::<Value>(DASHBOARD_PROVIDERS_JSON).map_err(|err| {
         RpcError::internal_error(format!("dashboard provider catalog was not JSON: {err}"))
     })?;
+    // Union in the QoS model catalog (model_catalog.json): it tracks the LIVE
+    // model lineup per provider (e.g. new zai GLM releases) while the bundled
+    // dashboard catalog is hand-maintained and lags. Only models are merged —
+    // a family absent from the bundled catalog has no key-env/route metadata,
+    // so it cannot be onboarded and is skipped.
+    // Per-profile QoS catalogs live under `profiles/<id>/data`
+    // (`ProfileRuntime::bootstrap` exports them there); the octos-home file
+    // is the shared seed. Merge the requesting profile's catalog first, then
+    // the home seed (`load_seed_qos_catalog` also falls back to `~/.octos`).
+    let mut sources = Vec::new();
+    if let Some(store) = state.profile_store.as_ref() {
+        if let Some(profile) =
+            profile_id.and_then(|profile_id| store.get(profile_id).ok().flatten())
+        {
+            // Honors `UserProfile.data_dir` overrides — the same resolution
+            // `ProfileRuntime::bootstrap` uses when it exports the catalog.
+            sources.push(store.resolve_data_dir(&profile));
+        }
+        sources.push(store.octos_home_dir().to_path_buf());
+    }
+    for qos in sources
+        .iter()
+        .filter_map(|dir| crate::qos_catalog::load_seed_qos_catalog(dir))
+    {
+        if let Some(families_map) = families.as_object_mut() {
+            for entry in &qos.models {
+                let Some((family_id, model_id)) = entry.provider.split_once('/') else {
+                    continue;
+                };
+                let Some(models) = families_map
+                    .get_mut(family_id)
+                    .and_then(|family| family.get_mut("models"))
+                    .and_then(Value::as_array_mut)
+                else {
+                    continue;
+                };
+                let known = models
+                    .iter()
+                    .any(|model| model.get("id").and_then(Value::as_str) == Some(model_id));
+                if !known {
+                    models.push(json!({
+                        "id": model_id,
+                        "input": entry.cost_in,
+                        "output": entry.cost_out,
+                        "max_output": entry.max_output,
+                    }));
+                }
+            }
+        }
+    }
     Ok(json!({ "families": families }))
 }
 
@@ -7143,17 +7475,30 @@ async fn raw_session_status_result(
     } else {
         (None, None)
     };
-    Ok(json!({
+    // Emit the `model` object only when the policy actually resolved a
+    // model AND provider. Clients (octos-tui) decode it into a struct whose
+    // `model`/`provider` are non-optional strings, so
+    // `{"model": null, "provider": null, "selected": true}` fails the whole
+    // session/status/read decode and the composer footer degrades to a
+    // placeholder. A missing key is handled fine by their
+    // `Option<ModelStatus>` + `#[serde(default)]` — including in shipped
+    // octos-tui 0.1.5 binaries.
+    let resolved_model = policy.get("model").filter(|value| !value.is_null());
+    let resolved_provider = policy.get("provider").filter(|value| !value.is_null());
+    let model = match (resolved_model, resolved_provider) {
+        (Some(model), Some(provider)) => Some(json!({
+            "model": model,
+            "provider": provider,
+            "selected": true
+        })),
+        _ => None,
+    };
+    let mut result = json!({
         "session_id": session_id,
         "profile_id": profile_id,
         "runtime_policy_stamp": policy,
         "context": context,
         "context_state": context_state,
-        "model": {
-            "model": policy.get("model").cloned().unwrap_or(Value::Null),
-            "provider": policy.get("provider").cloned().unwrap_or(Value::Null),
-            "selected": true
-        },
         "permission_profile": policy.get("permission_profile").cloned().unwrap_or(Value::Null),
         "sandbox": policy.get("sandbox_mode").cloned().unwrap_or(Value::Null),
         "health": { "status": "ok" },
@@ -7162,7 +7507,11 @@ async fn raw_session_status_result(
         "usage": {},
         "cursor": { "healthy": true, "replay_supported": true },
         "capabilities": features.advertised_capabilities(state),
-    }))
+    });
+    if let Some(model) = model {
+        result["model"] = model;
+    }
+    Ok(result)
 }
 
 fn add_autonomy_policy_stamp(policy: &mut Value, features: ConnectionUiFeatures) {
@@ -8543,19 +8892,255 @@ async fn raw_profile_skills_remove(
     }))
 }
 
+/// `profile/llm/select` — promote one CONFIGURED model (the primary or any
+/// fallback) to be the ACTIVE primary. The demoted primary becomes a fallback,
+/// so switching back and forth never loses a configuration. Persisted to the
+/// profile store, and the profile's cached runtimes are evicted so the very
+/// next turn runs on the newly selected model — no restart.
+async fn raw_profile_llm_select(
+    state: &Arc<AppState>,
+    request: &RpcRequest<Value>,
+    connection_profile_id: Option<&str>,
+) -> Result<Value, RpcError> {
+    let params: RawProfileLlmSelectParams = parse_raw_params(request)?;
+    let profile_id = raw_scoped_llm_profile_id(
+        params.profile_id.clone(),
+        params.session_id.as_ref(),
+        connection_profile_id,
+    )?;
+    let model_id = nonempty(params.model_id)
+        .ok_or_else(|| RpcError::invalid_params("model_id is required"))?;
+    let family_id = nonempty(params.family_id);
+    let route_id = nonempty(params.route_id);
+
+    let store = profile_store(state)?;
+    let mut profile = store
+        .get(&profile_id)
+        .map_err(|err| RpcError::internal_error(format!("failed to read profile: {err}")))?
+        .ok_or_else(|| RpcError::not_found("profile", profile_id.clone()))?;
+
+    let mut llm = profile.config.llm.take().unwrap_or_default();
+    let matches_family_model = |selection: &crate::profiles::LlmModelSelectionConfig| {
+        selection.model_id.as_deref() == Some(model_id.as_str())
+            && family_id
+                .as_deref()
+                .is_none_or(|family| selection.family_id.as_deref() == Some(family))
+    };
+    let matches_route = |selection: &crate::profiles::LlmModelSelectionConfig| {
+        route_id.as_deref().is_none_or(|route| {
+            selection
+                .route
+                .as_ref()
+                .and_then(|selection_route| selection_route.route_id.as_deref())
+                == Some(route)
+        })
+    };
+    let matches_exact = |selection: &crate::profiles::LlmModelSelectionConfig| {
+        matches_family_model(selection) && matches_route(selection)
+    };
+    // The route is a REAL discriminator: the same family/model can be
+    // configured on two routes with different endpoints and credentials.
+    // An exact route match always wins; the TUI's synthetic default
+    // ("official" when a configured entry carries no route) may fall back
+    // to a family/model match ONLY when that match is unambiguous.
+    let route_is_synthetic_default = route_id.as_deref() == Some("official");
+    let exact_primary = llm.primary.as_ref().is_some_and(matches_exact);
+    let exact_fallback = llm.fallbacks.iter().position(matches_exact);
+    let target = if exact_primary {
+        None
+    } else if let Some(index) = exact_fallback {
+        Some(index)
+    } else if route_is_synthetic_default {
+        let primary_matches = llm.primary.as_ref().is_some_and(matches_family_model);
+        let fallback_matches = llm
+            .fallbacks
+            .iter()
+            .enumerate()
+            .filter(|(_, selection)| matches_family_model(selection))
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        match (primary_matches, fallback_matches.as_slice()) {
+            (true, []) => None,
+            (false, [index]) => Some(*index),
+            (false, []) => {
+                profile.config.llm = Some(llm);
+                return Err(RpcError::not_found(
+                    "configured model",
+                    format!(
+                        "{model_id} (not configured on profile '{profile_id}' — save it \
+                         first via profile/llm/upsert / the onboarding provider step)"
+                    ),
+                ));
+            }
+            _ => {
+                profile.config.llm = Some(llm);
+                return Err(RpcError::invalid_params(format!(
+                    "model '{model_id}' is configured on multiple routes — pass the \
+                     route_id to disambiguate"
+                )));
+            }
+        }
+    } else {
+        profile.config.llm = Some(llm);
+        return Err(RpcError::not_found(
+            "configured model",
+            format!(
+                "{model_id} (not configured on profile '{profile_id}' — save it first \
+                 via profile/llm/upsert / the onboarding provider step)"
+            ),
+        ));
+    };
+    let already_primary = target.is_none();
+    // Never persist a selection the runtime cannot activate: the eviction
+    // below would silently keep the CURRENT provider chain for live sessions
+    // (ensure fails with a warn) while the next `session/open` fails
+    // bootstrap outright — a keyless primary bricks the profile until the
+    // file is hand-edited. Reject up front, naming the missing key. The
+    // idempotent re-select of a keyless primary rejects too: that state
+    // needs the key (or a different selection), not an "applied" echo.
+    {
+        let target_selection = match target {
+            Some(index) => &llm.fallbacks[index],
+            None => llm
+                .primary
+                .as_ref()
+                .expect("already_primary implies a matched primary"),
+        };
+        if let Err(error) = llm_selection_activation_error(&profile, target_selection) {
+            profile.config.llm = Some(llm);
+            return Err(error);
+        }
+    }
+    let mut applied = already_primary;
+    if !already_primary {
+        let Some(index) = target else {
+            unreachable!("already_primary guarantees a fallback target index");
+        };
+        let promoted = llm.fallbacks.remove(index);
+        if let Some(demoted) = llm.primary.take() {
+            upsert_llm_fallback(&mut llm.fallbacks, demoted);
+        }
+        llm.primary = Some(promoted);
+        applied = true;
+    }
+    profile.config.llm = Some(llm);
+
+    if !already_primary {
+        profile.updated_at = Utc::now();
+        store
+            .save_with_merge(&mut profile)
+            .map_err(|err| RpcError::internal_error(format!("failed to save profile: {err}")))?;
+
+        // The switch must take effect on the NEXT turn, not the next restart:
+        // cached SessionRuntimes embed the old provider chain and the dynamic
+        // ProfileRuntime caches forever, so evict both and re-bootstrap.
+        state.session_cache.invalidate_profile(&profile_id).await;
+        if let Some(key) = dynamic_profile_runtime_key(state, &profile_id) {
+            dynamic_profile_runtimes()
+                .write()
+                .map_err(|err| {
+                    RpcError::internal_error(format!(
+                        "dynamic profile runtime cache lock poisoned: {err}"
+                    ))
+                })?
+                .remove(&key);
+        }
+        if state.profiles.contains_key(&profile_id) {
+            // Startup-config profiles live in an immutable map — the saved
+            // selection persists but cannot rebuild without a restart.
+            tracing::warn!(
+                profile_id = %profile_id,
+                "profile/llm/select saved, but this startup-config profile's runtime \
+                 rebuilds on restart only"
+            );
+        } else if let Err(error) = ensure_session_profile_runtime(state, Some(&profile_id)).await {
+            tracing::warn!(
+                profile_id = %profile_id,
+                error = %error.message,
+                "profile/llm/select saved; runtime bootstrap deferred to the next turn",
+            );
+        }
+    }
+
+    let session_id = params
+        .session_id
+        .unwrap_or_else(|| SessionKey::with_profile_topic(&profile_id, "local", "tui", "coding"));
+    let refreshed = store
+        .get(&profile_id)
+        .ok()
+        .flatten()
+        .or(Some(profile))
+        .unwrap();
+    let models = model_list_result(state, session_id.clone(), &profile_id, Some(&refreshed));
+    let selected = models
+        .get("models")
+        .and_then(Value::as_array)
+        .and_then(|models| {
+            models
+                .iter()
+                .find(|model| model.get("selected") == Some(&Value::Bool(true)))
+                .cloned()
+        })
+        .unwrap_or_else(|| json!({ "model": model_id, "selected": true }));
+    let mut result = json!({
+        "session_id": session_id,
+        "selected": selected,
+        "applied": applied,
+        "runtime_policy_stamp": runtime_policy_stamp_for_profile(
+            state,
+            &profile_id,
+            Some(&session_id),
+            Some(&refreshed),
+        ),
+    });
+    if state.profiles.contains_key(&profile_id) {
+        // Startup-pinned runtime: the selection is saved but turns keep the
+        // boot snapshot until restart (the stamp above says so too). Tell
+        // the caller instead of letting the switch silently not take.
+        result["restart_required"] = json!(true);
+    }
+    Ok(result)
+}
+
+/// Resolve the target profile for the profile-LLM raw methods, rejecting
+/// cross-profile targets on authenticated (profile-scoped) connections —
+/// profile A's credential must never rewire, probe, or spend against
+/// profile B's configured providers.
+fn raw_scoped_llm_profile_id(
+    requested_profile_id: Option<String>,
+    requested_session_id: Option<&SessionKey>,
+    connection_profile_id: Option<&str>,
+) -> Result<String, RpcError> {
+    let requested = nonempty(requested_profile_id).or_else(|| {
+        requested_session_id.and_then(|session_id| session_id.profile_id().map(ToOwned::to_owned))
+    });
+    if let Some(connection_profile_id) = connection_profile_id {
+        if requested
+            .as_deref()
+            .is_some_and(|requested| requested != connection_profile_id)
+        {
+            return Err(RpcError::permission_denied(
+                "profile_id is outside the authenticated profile",
+            )
+            .with_data(json!({
+                "kind": "auth_scope_violation",
+                "connection_profile_id": connection_profile_id,
+                "requested_profile_id": requested,
+            })));
+        }
+        return Ok(connection_profile_id.to_owned());
+    }
+    Ok(requested.unwrap_or_else(|| MAIN_PROFILE_ID.to_string()))
+}
+
 async fn raw_profile_llm_upsert(
     state: &Arc<AppState>,
     request: &RpcRequest<Value>,
     connection_profile_id: Option<&str>,
 ) -> Result<Value, RpcError> {
     let params: RawProfileLlmUpsertParams = parse_raw_params(request)?;
-    let profile_id = raw_profile_id(
-        &RawProfileParams {
-            profile_id: params.profile_id.clone(),
-            session_id: None,
-        },
-        connection_profile_id,
-    );
+    let profile_id =
+        raw_scoped_llm_profile_id(params.profile_id.clone(), None, connection_profile_id)?;
     let store = profile_store(state)?;
     let mut profile = store
         .get(&profile_id)
@@ -8590,6 +9175,25 @@ async fn raw_profile_llm_upsert(
 
     let mut llm = profile.config.llm.take().unwrap_or_default();
     if params.set_primary || llm.primary.is_none() {
+        // set_primary is lossless (mirrors `profile/llm/select`): a replaced
+        // primary is demoted into the fallback list, and the promoted
+        // selection is de-duplicated out of it. The two decisions use
+        // different comparisons (codex P2 ×2):
+        // - demote by *address* (family/model/route_id — all the selector can
+        //   discriminate): a same-address upsert is an endpoint edit and
+        //   replaces outright, or the old endpoint would linger as a fallback
+        //   row `profile/llm/select` can never promote;
+        // - de-dup by full *identity* (address + base_url): endpoint-distinct
+        //   fallbacks are real failover chain entries (`config_from_profile`
+        //   threads every fallback's endpoint into the runtime), so only an
+        //   exact duplicate of the new primary leaves the list.
+        if let Some(old_primary) = llm.primary.take() {
+            if !same_llm_selection_address(&old_primary, &selection) {
+                upsert_llm_fallback(&mut llm.fallbacks, old_primary);
+            }
+        }
+        llm.fallbacks
+            .retain(|fallback| !same_llm_selection_identity(fallback, &selection));
         llm.primary = Some(selection);
     } else {
         upsert_llm_fallback(&mut llm.fallbacks, selection);
@@ -8633,20 +9237,18 @@ fn upsert_llm_fallback(
     }
 }
 
+/// Full selection *identity*: the [`same_llm_selection_address`] (which
+/// normalizes a missing route_id to the synthetic `"official"`) plus the
+/// endpoint. Two entries that agree on both resolve to the same provider —
+/// defined in terms of the address comparison so the two predicates cannot
+/// drift on route_id normalization (codex P2 round 3: a raw `Option`
+/// comparison here kept a route_id-less fallback alongside an identical
+/// `"official"` primary as a redundant retry-chain duplicate).
 fn same_llm_selection_identity(
     left: &crate::profiles::LlmModelSelectionConfig,
     right: &crate::profiles::LlmModelSelectionConfig,
 ) -> bool {
-    left.family_id == right.family_id
-        && left.model_id == right.model_id
-        && left
-            .route
-            .as_ref()
-            .and_then(|route| route.route_id.as_ref())
-            == right
-                .route
-                .as_ref()
-                .and_then(|route| route.route_id.as_ref())
+    same_llm_selection_address(left, right)
         && left
             .route
             .as_ref()
@@ -8657,19 +9259,119 @@ fn same_llm_selection_identity(
                 .and_then(|route| route.base_url.as_ref())
 }
 
+/// Selection *address* as `profile/llm/select` can discriminate it: family +
+/// model + route_id, with a missing route_id normalized to the synthetic
+/// `"official"` the TUI sends for default routes. `base_url` is deliberately
+/// excluded — the selector cannot address it, so two selections differing
+/// only by endpoint are the same switchable row.
+fn same_llm_selection_address(
+    left: &crate::profiles::LlmModelSelectionConfig,
+    right: &crate::profiles::LlmModelSelectionConfig,
+) -> bool {
+    fn route_address(selection: &crate::profiles::LlmModelSelectionConfig) -> &str {
+        selection
+            .route
+            .as_ref()
+            .and_then(|route| route.route_id.as_deref())
+            .unwrap_or("official")
+    }
+    left.family_id == right.family_id
+        && left.model_id == right.model_id
+        && route_address(left) == route_address(right)
+}
+
+/// `Err` when the selection's provider requires an API key that resolves
+/// nowhere (auth store, profile `env_vars`, keychain, process env — the same
+/// chain the runtime bootstrap uses via [`crate::config::Config::
+/// get_api_key_with_env`]). Families the registry marks keyless (or unknown
+/// families) pass. The caller must not persist a selection this rejects.
+fn llm_selection_activation_error(
+    profile: &crate::profiles::UserProfile,
+    selection: &crate::profiles::LlmModelSelectionConfig,
+) -> Result<(), RpcError> {
+    let model = selection.model_id.as_deref().unwrap_or("model");
+    // Effective provider exactly as bootstrap resolves it: the explicit
+    // family, else `detect_provider` on the model id (the same fallback
+    // `ProfileRuntime::bootstrap` applies to `config_from_profile` output).
+    let family = selection
+        .family_id
+        .as_deref()
+        .filter(|family| !family.is_empty())
+        .or_else(|| {
+            selection
+                .model_id
+                .as_deref()
+                .and_then(crate::config::detect_provider)
+        });
+    let Some(family) = family else {
+        return Err(RpcError::invalid_params(format!(
+            "cannot activate {model}: no provider family configured and none detectable \
+             from the model id — re-save the selection with an explicit family first"
+        ))
+        .with_data(json!({ "kind": "llm_provider_unresolved" })));
+    };
+    // Key requirement mirrors `create_provider_with_api_type`: the
+    // `anthropic`/`responses` protocol overrides always need a key (even on
+    // registry-keyless families), `custom` always needs one, otherwise the
+    // registry entry decides. A family the registry doesn't know cannot be
+    // constructed at all — reject rather than persist a guaranteed
+    // bootstrap failure (codex P1).
+    let api_type = selection
+        .route
+        .as_ref()
+        .and_then(|route| route.api_type.as_deref());
+    // Mirror `create_provider_with_api_type`'s ORDER exactly: `custom`
+    // short-circuits first, then the registry lookup gates everything —
+    // including the protocol overrides, which the factory only reaches for
+    // a registered entry. An unknown family with `api_type: anthropic` and
+    // a key would otherwise validate here yet still fail the factory's
+    // lookup at bootstrap (codex P1 round 2).
+    let requires_key = if family == "custom" {
+        true
+    } else {
+        let Some(entry) = octos_llm::registry::lookup(family) else {
+            return Err(RpcError::invalid_params(format!(
+                "cannot activate {family}/{model}: unknown provider family — valid: \
+                 custom, {}",
+                octos_llm::registry::all_names().join(", ")
+            ))
+            .with_data(json!({ "kind": "llm_provider_unresolved", "family": family })));
+        };
+        match api_type {
+            Some("anthropic") | Some("responses") => true,
+            _ => entry.requires_api_key,
+        }
+    };
+    if !requires_key {
+        return Ok(());
+    }
+    let env_override = selection
+        .route
+        .as_ref()
+        .and_then(|route| route.api_key_env.as_deref());
+    let config = crate::profiles::config_from_profile(profile, None, None);
+    if config.get_api_key_with_env(family, env_override).is_ok() {
+        return Ok(());
+    }
+    let var = env_override
+        .map(String::from)
+        .or_else(|| crate::config::Config::provider_default_env_var(family))
+        .unwrap_or_else(|| format!("{}_API_KEY", family.to_uppercase()));
+    Err(RpcError::invalid_params(format!(
+        "cannot activate {family}/{model}: {var} is not set — add the key via the \
+         onboarding key step (or `octos auth login`) before selecting it"
+    ))
+    .with_data(json!({ "kind": "llm_key_missing", "env": var })))
+}
+
 async fn raw_profile_llm_test(
     state: &Arc<AppState>,
     request: &RpcRequest<Value>,
     connection_profile_id: Option<&str>,
 ) -> Result<Value, RpcError> {
     let params: RawProfileLlmUpsertParams = parse_raw_params(request)?;
-    let profile_id = raw_profile_id(
-        &RawProfileParams {
-            profile_id: params.profile_id.clone(),
-            session_id: None,
-        },
-        connection_profile_id,
-    );
+    let profile_id =
+        raw_scoped_llm_profile_id(params.profile_id.clone(), None, connection_profile_id)?;
     let profile = state
         .profile_store
         .as_ref()
@@ -8800,13 +9502,8 @@ async fn raw_profile_llm_fetch_models(
     connection_profile_id: Option<&str>,
 ) -> Result<Value, RpcError> {
     let params: RawProfileLlmUpsertParams = parse_raw_params(request)?;
-    let profile_id = raw_profile_id(
-        &RawProfileParams {
-            profile_id: params.profile_id.clone(),
-            session_id: None,
-        },
-        connection_profile_id,
-    );
+    let profile_id =
+        raw_scoped_llm_profile_id(params.profile_id.clone(), None, connection_profile_id)?;
     let profile = state
         .profile_store
         .as_ref()
@@ -9316,7 +10013,7 @@ async fn handle_raw_appui_rpc(
         APPUI_METHOD_SESSION_STATUS_READ => {
             raw_session_status_result(state, request, features, connection_profile_id).await
         }
-        APPUI_METHOD_PROFILE_LLM_CATALOG => raw_catalog_result(),
+        APPUI_METHOD_PROFILE_LLM_CATALOG => raw_catalog_result(state, connection_profile_id),
         APPUI_METHOD_PROFILE_LLM_LIST => {
             let params: RawProfileParams = match parse_raw_params(request) {
                 Ok(params) => params,
@@ -9352,41 +10049,7 @@ async fn handle_raw_appui_rpc(
             raw_profile_llm_test(state, request, connection_profile_id).await
         }
         APPUI_METHOD_PROFILE_LLM_SELECT => {
-            let params: RawProfileParams = match parse_raw_params(request) {
-                Ok(params) => params,
-                Err(error) => {
-                    let _ = send_rpc_error(ws, Some(id), error);
-                    return true;
-                }
-            };
-            let profile_id = raw_profile_id(&params, connection_profile_id);
-            let profile = state
-                .profile_store
-                .as_ref()
-                .and_then(|store| store.get(&profile_id).ok().flatten());
-            let session_id = params.session_id.unwrap_or_else(|| {
-                SessionKey::with_profile_topic(&profile_id, "local", "tui", "coding")
-            });
-            let models =
-                model_list_result(state, session_id.clone(), &profile_id, profile.as_ref());
-            let selected = models
-                .get("models")
-                .and_then(Value::as_array)
-                .and_then(|models| models.first())
-                .cloned()
-                .unwrap_or_else(|| {
-                    json!({
-                        "model": "unknown",
-                        "provider": "unknown",
-                        "selected": true
-                    })
-                });
-            Ok(json!({
-                "session_id": session_id,
-                "selected": selected,
-                "applied": true,
-                "runtime_policy_stamp": runtime_policy_stamp_for_profile(state, &profile_id, Some(&session_id), profile.as_ref()),
-            }))
+            raw_profile_llm_select(state, request, connection_profile_id).await
         }
         APPUI_METHOD_PROFILE_LLM_DELETE => {
             let params: RawProfileParams = match parse_raw_params(request) {
@@ -9721,9 +10384,11 @@ fn route_rpc_command(
         | octos_core::ui_protocol::methods::SYSTEM_STATUS_GET
         | octos_core::ui_protocol::methods::CONTENT_LIST
         | octos_core::ui_protocol::methods::CONTENT_DELETE
-        | octos_core::ui_protocol::methods::CONTENT_BULK_DELETE => {
-            Some(features.auxiliary_rest_to_ws_v1)
-        }
+        | octos_core::ui_protocol::methods::CONTENT_BULK_DELETE
+        | octos_core::ui_protocol::methods::MEMORY_OVERVIEW
+        | octos_core::ui_protocol::methods::MEMORY_ENTITY
+        | octos_core::ui_protocol::methods::CRON_LIST
+        | octos_core::ui_protocol::methods::CRON_TOGGLE => Some(features.auxiliary_rest_to_ws_v1),
         // UPCR-2026-023: `user_question/respond` is strict opt-in. A client
         // that did not negotiate `user_question.v1` never received a
         // `user_question/requested`, so it has nothing to answer; reject the
@@ -9844,6 +10509,11 @@ fn session_ingress_callable_method(method: &str) -> bool {
             | octos_core::ui_protocol::methods::CONTENT_LIST
             | octos_core::ui_protocol::methods::CONTENT_DELETE
             | octos_core::ui_protocol::methods::CONTENT_BULK_DELETE
+            | octos_core::ui_protocol::methods::MEMORY_OVERVIEW
+            | octos_core::ui_protocol::methods::MEMORY_ENTITY
+            | octos_core::ui_protocol::methods::CRON_LIST
+            | octos_core::ui_protocol::methods::CRON_TOGGLE
+            | octos_core::ui_protocol::methods::SESSION_FORK
     )
 }
 
@@ -9866,7 +10536,12 @@ fn validate_session_ingress_command_scope(
         | UiCommand::SystemStatusGet(_)
         | UiCommand::ContentList(_)
         | UiCommand::ContentDelete(_)
-        | UiCommand::ContentBulkDelete(_) => {
+        | UiCommand::ContentBulkDelete(_)
+        | UiCommand::MemoryOverview(_)
+        | UiCommand::MemoryEntity(_)
+        | UiCommand::CronList(_)
+        | UiCommand::CronToggle(_)
+        | UiCommand::SessionFork(_) => {
             return Err(RpcError::invalid_request(
                 "session ingress credentials may only call session-scoped methods",
             ));
@@ -9904,6 +10579,9 @@ fn validate_session_ingress_command_scope(
         UiCommand::SessionRollback(params) => params.session_id.clone(),
         UiCommand::ThreadGraphGet(params) => params.session_id.clone(),
         UiCommand::TurnStateGet(params) => params.session_id.clone(),
+        UiCommand::SessionBtw(params) => {
+            session_key_with_optional_topic(&params.session_id, params.topic.as_deref())
+        }
         UiCommand::SessionSnapshot(params) => {
             string_session_with_optional_topic(&params.session_id, params.topic.as_deref())
         }
@@ -10488,6 +11166,15 @@ fn live_event_passes_capability_filter(
     // whole-file `file/attached` audio path.
     if !features.voice_audio {
         if let UiProtocolLedgerEvent::Notification(UiNotification::VoiceAudioChunk(_)) = event {
+            return false;
+        }
+    }
+    // `plan.todos.v1` gate: the model-authored plan checklist only reaches
+    // connections that negotiated it (and know how to render `plan/updated`).
+    // Applies on both the live broadcast and reconnect replay, since both
+    // routes call this filter.
+    if !features.plan_todos {
+        if let UiProtocolLedgerEvent::Notification(UiNotification::PlanUpdated(_)) = event {
             return false;
         }
     }
@@ -12020,6 +12707,12 @@ async fn handle_review_start(
     let contracts_for_turn = contracts.clone();
     let turn_state_for_task = turn_state.clone();
     let profile_for_turn = active_profile_id.clone();
+    // Stamp for the ActiveTurn registry — see the generic admission's twin.
+    let profile_for_stamp = session_id
+        .profile_id()
+        .map(ToOwned::to_owned)
+        .or_else(|| active_profile_id.clone())
+        .unwrap_or_else(|| MAIN_PROFILE_ID.to_owned());
     let turn_id_for_task = turn_id.clone();
 
     let handle = tokio::spawn(async move {
@@ -12053,10 +12746,14 @@ async fn handle_review_start(
         if occupied {
             false
         } else {
+            // Client-supplied turn ids carry no uniqueness guarantee — a
+            // reused id must not inherit a prior turn's `session/btw` draft.
+            btw_live_draft_clear(&session_id, &turn_id);
             active.insert(
                 session_id.clone(),
                 ActiveTurn {
                     turn_id: turn_id.clone(),
+                    profile_id: profile_for_stamp.clone(),
                     state: turn_state,
                     interrupt_tx,
                     abort: handle.abort_handle(),
@@ -12222,6 +12919,14 @@ async fn handle_turn_start(
     let resolved_profile_id = connection_profile_id
         .or(routed_profile_id)
         .map(ToOwned::to_owned);
+    // Stamp for the ActiveTurn registry: mirror `session/btw`'s resolution
+    // (session key first) so the aside's profile check compares like with
+    // like; canonical `_main` when nothing resolves.
+    let profile_for_stamp = session_id
+        .profile_id()
+        .map(ToOwned::to_owned)
+        .or_else(|| resolved_profile_id.clone())
+        .unwrap_or_else(|| MAIN_PROFILE_ID.to_owned());
     let handle = tokio::spawn(async move {
         if start_rx.await.is_err() {
             return;
@@ -12278,10 +12983,14 @@ async fn handle_turn_start(
         if occupied {
             false
         } else {
+            // Client-supplied turn ids carry no uniqueness guarantee — a
+            // reused id must not inherit a prior turn's `session/btw` draft.
+            btw_live_draft_clear(&session_id, &turn_id);
             active.insert(
                 session_id.clone(),
                 ActiveTurn {
                     turn_id: turn_id.clone(),
+                    profile_id: profile_for_stamp.clone(),
                     state: turn_state.clone(),
                     interrupt_tx,
                     abort: handle.abort_handle(),
@@ -12492,10 +13201,12 @@ async fn maybe_spawn_appui_master_continuation_runner(
         );
     });
 
+    btw_live_draft_clear(&session_id, &turn_id);
     active.insert(
         session_id.clone(),
         ActiveTurn {
             turn_id: turn_id.clone(),
+            profile_id: profile_id.clone(),
             state: turn_state,
             interrupt_tx,
             abort: handle.abort_handle(),
@@ -13945,6 +14656,14 @@ async fn handle_session_hydrate(
                             persisted_at: msg.timestamp,
                             message_id,
                             source,
+                            // The store persists reasoning; without this the
+                            // "· reasoning" block vanishes on every client
+                            // restart. Same gate as message_id/source.
+                            reasoning_content: if expose_message_id {
+                                msg.reasoning_content.clone()
+                            } else {
+                                None
+                            },
                             // P1.3 fix: surface canonical-ledger media so a
                             // client reconnecting after a disconnect can
                             // re-render the same `.md` / `.mp3` / `.pptx`
@@ -14195,6 +14914,7 @@ async fn handle_session_rollback(
                 persisted_at: msg.timestamp,
                 message_id: None,
                 source: None,
+                reasoning_content: None,
                 media: msg.media.clone(),
             })
             .collect::<Vec<_>>();
@@ -14241,6 +14961,183 @@ async fn handle_session_rollback(
     let result = SessionRollbackResult {
         dropped_turns,
         thread,
+    };
+    send_serialized_rpc_result(ws, id, method, result);
+}
+
+/// Process-global in-flight fork child-key reservations. Two forks
+/// from DIFFERENT parents resolve different per-session
+/// `SessionManager`s, so a manager-local existence check cannot see
+/// the other fork mid-write — the later rewrite would silently
+/// overwrite the earlier child (codex #1613 P2). Keyed by
+/// `(sessions_dir, child key)`: the sessions DIR is the on-disk
+/// collision domain — same-profile managers share it and must
+/// mutually exclude, while different profiles' identical child keys
+/// name different files and must NOT reject each other (codex #1613
+/// r2). One serve process owns a profile's sessions dir, so a
+/// process-global set suffices.
+fn fork_reservations() -> &'static std::sync::Mutex<std::collections::HashSet<(PathBuf, String)>> {
+    static RESERVATIONS: OnceLock<std::sync::Mutex<std::collections::HashSet<(PathBuf, String)>>> =
+        OnceLock::new();
+    RESERVATIONS.get_or_init(Default::default)
+}
+
+/// RAII reservation on a fork child key — released on every exit path.
+struct ForkReservation((PathBuf, String));
+
+impl ForkReservation {
+    /// `None` when another fork to the same child key in the same
+    /// sessions dir is in flight.
+    fn try_acquire(sessions_dir: &Path, child_key: &SessionKey) -> Option<Self> {
+        // Canonicalized: two managers can reach one on-disk dir through
+        // different spellings (`..` segments, symlinked data_dir
+        // overrides) — distinct PathBufs would defeat the reservation
+        // (codex #1613 r3). The dir exists (the manager created it), so
+        // canonicalize only fails on races — fall back to the raw path.
+        let dir =
+            std::fs::canonicalize(sessions_dir).unwrap_or_else(|_| sessions_dir.to_path_buf());
+        let key = (dir, child_key.0.clone());
+        let mut set = fork_reservations()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        set.insert(key.clone()).then(|| Self(key))
+    }
+}
+
+impl Drop for ForkReservation {
+    fn drop(&mut self) {
+        let mut set = fork_reservations()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        set.remove(&self.0);
+    }
+}
+
+/// `session/fork` — branch a NEW session off an existing one, copying
+/// the tail of its history (web parity P3: the book's documented fork
+/// affordance had no wire surface for the SPA; `SessionManager::fork`
+/// existed but had no production caller). MUTATING: writes the child
+/// session (parent tracked via `parent_key`).
+async fn handle_session_fork(
+    ws: &WsConnection,
+    state: &Arc<AppState>,
+    connection_profile_id: Option<&str>,
+    routed_profile_id: Option<&str>,
+    id: String,
+    params: octos_core::ui_protocol::SessionForkParams,
+) {
+    let method = octos_core::ui_protocol::methods::SESSION_FORK;
+    if let Err(error) = validate_session_scope(&params.session_id, None, connection_profile_id) {
+        send_scope_error(ws, id, error);
+        return;
+    }
+    // The child chat-id becomes a filesystem path component and a wire
+    // session key half — hold it to the same charset as topic names.
+    if let Err(reason) = octos_bus::validate_topic_name(&params.new_chat_id) {
+        let _ = send_rpc_error(
+            ws,
+            Some(id),
+            RpcError::invalid_params(format!("{method}: invalid new_chat_id: {reason}"))
+                .with_data(json!({ "kind": "invalid_new_chat_id" })),
+        );
+        return;
+    }
+
+    let Some(sessions) = resolve_sessions_for_lookup(
+        state,
+        connection_profile_id,
+        routed_profile_id,
+        &params.session_id,
+    )
+    .await
+    else {
+        let _ = send_rpc_error(
+            ws,
+            Some(id),
+            runtime_unavailable_error("Sessions not available"),
+        );
+        return;
+    };
+
+    let (new_key, copied) = {
+        let mut sessions_guard = sessions.lock().await;
+        // Reserve the child key across the whole check-then-write: the
+        // durable `session_known` check below cannot see a concurrent
+        // fork's child (a DIFFERENT parent's manager) until its write
+        // lands. Scoped to this manager's sessions dir — the on-disk
+        // collision domain (RAII — released on return).
+        let candidate_key = params.session_id.fork_child(&params.new_chat_id);
+        let Some(_reservation) =
+            ForkReservation::try_acquire(sessions_guard.sessions_dir(), &candidate_key)
+        else {
+            drop(sessions_guard);
+            let _ = send_rpc_error(
+                ws,
+                Some(id),
+                RpcError::invalid_params(format!(
+                    "{method}: a fork to '{candidate_key}' is already in flight"
+                ))
+                .with_data(json!({ "kind": "child_exists" })),
+            );
+            return;
+        };
+        // Mirror rollback's error model: fork of an unknown session is
+        // an error, not an auto-create.
+        if !sessions_guard.session_known(&params.session_id) {
+            drop(sessions_guard);
+            let _ = send_rpc_error(
+                ws,
+                Some(id),
+                RpcError::unknown_session(params.session_id.0.clone()),
+            );
+            return;
+        }
+        // Refuse to clobber an existing session under the child key.
+        // `SessionKey::fork_child` is the SAME rule `SessionManager::fork`
+        // applies, so the pre-check guards exactly the key fork writes.
+        let candidate = params.session_id.fork_child(&params.new_chat_id);
+        if sessions_guard.session_known(&candidate) {
+            drop(sessions_guard);
+            let _ = send_rpc_error(
+                ws,
+                Some(id),
+                RpcError::invalid_params(format!(
+                    "{method}: a session already exists for '{candidate}'"
+                ))
+                .with_data(json!({ "kind": "child_exists" })),
+            );
+            return;
+        }
+        // Absent copy_messages → the FULL parent history.
+        let copy = params
+            .copy_messages
+            .map(|n| n as usize)
+            .unwrap_or(usize::MAX);
+        let copied_upper = {
+            let parent = sessions_guard.get_or_create(&params.session_id).await;
+            parent.messages.len().min(copy)
+        };
+        match sessions_guard
+            .fork(&params.session_id, &params.new_chat_id, copy)
+            .await
+        {
+            Ok(new_key) => (new_key, copied_upper as u32),
+            Err(error) => {
+                drop(sessions_guard);
+                let _ = send_rpc_error(
+                    ws,
+                    Some(id),
+                    RpcError::internal_error(format!("{method}: {error}")),
+                );
+                return;
+            }
+        }
+    };
+
+    let result = octos_core::ui_protocol::SessionForkResult {
+        new_session_id: new_key,
+        parent_session_id: params.session_id,
+        copied_messages: copied,
     };
     send_serialized_rpc_result(ws, id, method, result);
 }
@@ -14474,6 +15371,572 @@ async fn handle_turn_state_get(
         octos_core::ui_protocol::methods::TURN_STATE_GET,
         result,
     );
+}
+
+/// In-flight `session/btw` asides, keyed by (profile, session) — session
+/// runtimes are isolated per profile and bare session ids can repeat across
+/// profiles, so a bare-session key would let one profile's aside starve
+/// another's. One at a time per key: each aside is a paid provider request. `std::sync::Mutex` on purpose: the critical
+/// sections never await, and the release must run in a `Drop` guard (which
+/// cannot lock a tokio mutex).
+fn btw_in_flight_sessions() -> &'static StdMutex<HashSet<(String, SessionKey)>> {
+    static BTW_IN_FLIGHT: OnceLock<StdMutex<HashSet<(String, SessionKey)>>> = OnceLock::new();
+    BTW_IN_FLIGHT.get_or_init(|| StdMutex::new(HashSet::new()))
+}
+
+/// Releases the per-(profile, session) `session/btw` slot on every exit path
+/// (including panics/cancellation) so an error can never wedge the aside.
+struct BtwInFlightGuard((String, SessionKey));
+
+impl Drop for BtwInFlightGuard {
+    fn drop(&mut self) {
+        if let Ok(mut in_flight) = btw_in_flight_sessions().lock() {
+            in_flight.remove(&self.0);
+        }
+    }
+}
+
+/// Serializes tests that use the global provider slot — two slot users
+/// running in parallel would clear each other's stub mid-flight.
+#[cfg(test)]
+fn btw_test_slot_serial() -> &'static tokio::sync::Mutex<()> {
+    static SERIAL: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+    SERIAL.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
+/// Test-only provider override so handler tests can exercise the full
+/// `session/btw` flow without constructing a `ProfileRuntime`.
+#[cfg(test)]
+fn btw_test_provider_slot() -> &'static StdMutex<Option<Arc<dyn octos_llm::LlmProvider>>> {
+    static SLOT: OnceLock<StdMutex<Option<Arc<dyn octos_llm::LlmProvider>>>> = OnceLock::new();
+    SLOT.get_or_init(|| StdMutex::new(None))
+}
+
+fn btw_test_provider() -> Option<Arc<dyn octos_llm::LlmProvider>> {
+    #[cfg(test)]
+    if let Ok(slot) = btw_test_provider_slot().lock() {
+        if let Some(llm) = slot.as_ref() {
+            return Some(llm.clone());
+        }
+    }
+    None
+}
+
+/// Live in-flight assistant draft per TURN, fed at the ephemeral send choke
+/// point (`message/delta` is non-durable per spec § 9 — the ledger can never
+/// replay it) so `session/btw` can describe the answer being written RIGHT
+/// NOW. Keyed by [`TurnId`] — globally unique per turn — so no cross-profile
+/// or cross-session stream can ever mix and no lifecycle resets are needed:
+/// a new turn is a new key, and stale keys are unreadable (the aside resolves
+/// the CURRENT non-terminal turn id through the active-turns registry before
+/// reading). Bounded by arbitrary eviction past the cap.
+fn btw_live_draft_store() -> &'static StdMutex<HashMap<(SessionKey, TurnId), String>> {
+    static DRAFTS: OnceLock<StdMutex<HashMap<(SessionKey, TurnId), String>>> = OnceLock::new();
+    DRAFTS.get_or_init(|| StdMutex::new(HashMap::new()))
+}
+
+/// Clear a turn's draft slot at ADMISSION (synchronously, before the turn task
+/// can stream): `turn_id` is client-supplied with no global uniqueness check,
+/// so a reused id must start from a clean slate instead of inheriting the
+/// prior turn's tail.
+fn btw_live_draft_clear(session_id: &SessionKey, turn_id: &TurnId) {
+    if let Ok(mut drafts) = btw_live_draft_store().lock() {
+        drafts.remove(&(session_id.clone(), turn_id.clone()));
+    }
+}
+
+const BTW_LIVE_DRAFT_STORE_MAX_TURNS: usize = 64;
+
+fn btw_live_draft_append(session_id: &SessionKey, turn_id: &TurnId, text: &str) {
+    let Ok(mut drafts) = btw_live_draft_store().lock() else {
+        return;
+    };
+    let key = (session_id.clone(), turn_id.clone());
+    if !drafts.contains_key(&key) && drafts.len() >= BTW_LIVE_DRAFT_STORE_MAX_TURNS {
+        // Arbitrary eviction is fine — a lost draft only degrades one aside's
+        // context, and terminal turns' entries are dead weight anyway
+        // (unreadable through the non-terminal gate).
+        let evict = drafts.keys().next().cloned();
+        if let Some(evict) = evict {
+            drafts.remove(&evict);
+        }
+    }
+    let draft = drafts.entry(key).or_default();
+    draft.push_str(text);
+    if draft.len() > BTW_LIVE_DRAFT_TAIL_CHARS {
+        let cut = draft.len() - BTW_LIVE_DRAFT_TAIL_CHARS;
+        let cut = draft
+            .char_indices()
+            .map(|(index, _)| index)
+            .find(|index| *index >= cut)
+            .unwrap_or(0);
+        *draft = draft.split_off(cut);
+    }
+}
+
+fn btw_live_draft_tail(session_id: &SessionKey, turn_id: &TurnId) -> String {
+    btw_live_draft_store()
+        .lock()
+        .ok()
+        .and_then(|drafts| drafts.get(&(session_id.clone(), turn_id.clone())).cloned())
+        .unwrap_or_default()
+}
+
+const BTW_TRANSCRIPT_TAIL_MESSAGES: usize = 20;
+const BTW_TRANSCRIPT_MESSAGE_CHARS: usize = 1_200;
+const BTW_TRANSCRIPT_CHAR_BUDGET: usize = 16_000;
+const BTW_ACTIVITY_TAIL_EVENTS: usize = 12;
+const BTW_LIVE_DRAFT_TAIL_CHARS: usize = 1_200;
+const BTW_ANSWER_MAX_TOKENS: u32 = 700;
+const BTW_TIMEOUT_SECS: u64 = 30;
+
+/// Build the two-message prompt for a `session/btw` aside. Pure so the
+/// context shape is unit-testable: transcript tail (already limited by the
+/// caller) + a short live-activity digest + the question. The system prompt
+/// carries the restrictions: no tools, brief answer, ephemeral exchange.
+fn build_btw_messages(
+    transcript_tail: &[Message],
+    activity_lines: &[String],
+    live_draft_tail: &str,
+    question: &str,
+) -> Vec<Message> {
+    let mut transcript = String::new();
+    let mut used = 0usize;
+    for message in transcript_tail {
+        let content = message.content.trim();
+        if content.is_empty() {
+            continue;
+        }
+        let rendered = format!(
+            "{}: {}\n",
+            message.role.as_str(),
+            truncate_for_display(content, BTW_TRANSCRIPT_MESSAGE_CHARS)
+        );
+        if used + rendered.len() > BTW_TRANSCRIPT_CHAR_BUDGET {
+            break;
+        }
+        used += rendered.len();
+        transcript.push_str(&rendered);
+    }
+    if transcript.is_empty() {
+        transcript.push_str("(no messages yet)\n");
+    }
+    let activity = if activity_lines.is_empty() {
+        "- (no live activity)".to_owned()
+    } else {
+        activity_lines
+            .iter()
+            .map(|line| format!("- {line}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let draft = if live_draft_tail.trim().is_empty() {
+        String::new()
+    } else {
+        format!("\n## In-flight answer you are writing right now (tail)\n…{live_draft_tail}\n")
+    };
+    let prompt = format!(
+        "## Recent conversation\n{transcript}\n## Current activity\n{activity}\n{draft}\n## Aside question\n{question}\n"
+    );
+    vec![
+        Message {
+            role: MessageRole::System,
+            content: "You are the assistant working inside this octos session. The user \
+                      asked a QUICK ASIDE question (\"btw, ...\") while your main work \
+                      continues in the background. Answer briefly — a few sentences — \
+                      from the context provided. You have NO tools in this aside: do not \
+                      claim to run commands, read files, or edit anything. If the answer \
+                      genuinely needs that, say so and suggest asking again after the \
+                      current task finishes. This exchange is ephemeral and will not \
+                      join the conversation history."
+                .to_owned(),
+            media: Vec::new(),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+            client_message_id: None,
+            thread_id: None,
+            timestamp: Utc::now(),
+        },
+        Message {
+            role: MessageRole::User,
+            content: prompt,
+            media: Vec::new(),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+            client_message_id: None,
+            thread_id: None,
+            timestamp: Utc::now(),
+        },
+    ]
+}
+
+/// One live-activity digest line per recent ledger notification that says
+/// what the session is DOING right now (tool/task/turn lifecycle); chatty
+/// stream events (message/reasoning deltas) are skipped.
+fn btw_activity_line(notification: &UiNotification) -> Option<String> {
+    match notification {
+        UiNotification::TurnStarted(event) => Some(format!("turn {} started", event.turn_id.0)),
+        UiNotification::TurnCompleted(event) => Some(format!("turn {} completed", event.turn_id.0)),
+        UiNotification::ToolStarted(event) => Some(format!("tool `{}` running", event.tool_name)),
+        UiNotification::ToolCompleted(event) => Some(format!(
+            "tool `{}` finished ({})",
+            event.tool_name,
+            match event.success {
+                Some(true) => "ok",
+                Some(false) => "failed",
+                None => "done",
+            }
+        )),
+        UiNotification::TaskUpdated(event) => {
+            Some(format!("task \"{}\" {:?}", event.title, event.state))
+        }
+        _ => None,
+    }
+}
+
+/// `session/btw` — answer a quick aside question out-of-band while the
+/// session's live turn (if any) keeps running. ONE restricted LLM call: no
+/// tools, capped output, hard timeout. The exchange is ephemeral — nothing
+/// is appended to the session history and no notification is emitted, so
+/// the live turn never sees it; the answer rides only on this RPC result.
+///
+/// The provider call runs DETACHED (codex round-1 P1): this fn returns as
+/// soon as the aside is validated and snapshotted, so the connection's read
+/// loop keeps serving interrupts/approvals — and the busy gate actually
+/// gates — while the answer (up to 30s) is produced.
+async fn handle_session_btw(
+    ws: &WsConnection,
+    state: &Arc<AppState>,
+    ledger: &Arc<UiProtocolLedger>,
+    active_turns: &SharedActiveTurns,
+    connection_profile_id: Option<&str>,
+    routed_profile_id: Option<&str>,
+    id: String,
+    params: SessionBtwParams,
+) -> Option<tokio::task::JoinHandle<()>> {
+    // Fold the topic into the canonical session key FIRST (codex round-1 P1):
+    // the ingress gate scopes `session#topic`, so every lookup/guard below
+    // must use the same folded key or a topic-scoped credential could read a
+    // differently-scoped session's transcript.
+    let session_id = session_key_with_optional_topic(&params.session_id, params.topic.as_deref());
+    if let Err(error) = validate_session_scope(&session_id, None, connection_profile_id) {
+        send_scope_error(ws, id, error);
+        return None;
+    }
+    let question = params.question.trim().to_owned();
+    if question.is_empty() {
+        let _ = send_rpc_error(
+            ws,
+            Some(id),
+            RpcError::invalid_params("session/btw requires a non-empty question"),
+        );
+        return None;
+    }
+
+    // ONE profile resolution shared by transcript AND provider, with
+    // `resolve_sessions_for_lookup`'s exact precedence (session key →
+    // connection → routed; the ws arm threads its session-open fallback in
+    // through `routed_profile_id`) — a divergent pair would read one
+    // profile's transcript and bill another profile's provider.
+    let active_profile_id = session_id
+        .profile_id()
+        .or(connection_profile_id)
+        .or(routed_profile_id)
+        .map(ToOwned::to_owned);
+
+    // Transcript tail from the same store turn persistence writes to
+    // (#919.1 routing) — clone under the lock, drop it before the LLM call.
+    let transcript_tail = {
+        let Some(sessions) = resolve_sessions_for_lookup(
+            state,
+            connection_profile_id,
+            routed_profile_id,
+            &session_id,
+        )
+        .await
+        else {
+            let _ = send_rpc_error(
+                ws,
+                Some(id),
+                RpcError::unknown_session(session_id.0.clone()),
+            );
+            return None;
+        };
+        let mut sessions_guard = sessions.lock().await;
+        if !sessions_guard.session_known(&session_id) {
+            let _ = send_rpc_error(
+                ws,
+                Some(id),
+                RpcError::unknown_session(session_id.0.clone()),
+            );
+            return None;
+        }
+        let session = sessions_guard.get_or_create(&session_id).await;
+        session
+            .messages
+            .iter()
+            .rev()
+            .take(BTW_TRANSCRIPT_TAIL_MESSAGES)
+            .rev()
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+
+    // One aside per (profile, session) at a time — a second `/btw` while the
+    // first is still answering is rejected, not queued.
+    // Canonical default-profile key: absent profile means MAIN_PROFILE_ID
+    // everywhere else (sessions lookup, runtime resolution) — the busy gate
+    // must agree or an unscoped and a _main-routed aside race the same
+    // effective session.
+    let busy_key = (
+        active_profile_id
+            .clone()
+            .unwrap_or_else(|| MAIN_PROFILE_ID.to_owned()),
+        session_id.clone(),
+    );
+    {
+        let Ok(mut in_flight) = btw_in_flight_sessions().lock() else {
+            let _ = send_rpc_error(
+                ws,
+                Some(id),
+                RpcError::internal_error("btw in-flight registry poisoned"),
+            );
+            return None;
+        };
+        if !in_flight.insert(busy_key.clone()) {
+            let _ = send_rpc_error(
+                ws,
+                Some(id),
+                RpcError::invalid_request("a btw aside is already answering for this session")
+                    .with_data(json!({ "kind": "btw_busy" })),
+            );
+            return None;
+        }
+    }
+    let in_flight_guard = BtwInFlightGuard(busy_key);
+
+    // Everything past validation runs detached — the read loop must not wait
+    // out a 30s provider call.
+    let ws = ws.clone();
+    let state = state.clone();
+    let ledger = ledger.clone();
+    let active_turns = active_turns.clone();
+    let aside_profile_id = in_flight_guard.0.0.clone();
+    let task = tokio::spawn(async move {
+        let _in_flight_guard = in_flight_guard;
+
+        // Live-activity digest from the ledger replay window's tail.
+        let activity_lines = ledger
+            .snapshot_with_cursor(&session_id, None)
+            .map(|(replayed, _)| {
+                replayed
+                    .iter()
+                    .filter_map(|event| match &event.event {
+                        UiProtocolLedgerEvent::Notification(notification) => {
+                            btw_activity_line(notification)
+                        }
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let activity_tail = activity_lines
+            .iter()
+            .rev()
+            .take(BTW_ACTIVITY_TAIL_EVENTS)
+            .rev()
+            .cloned()
+            .collect::<Vec<_>>();
+
+        // The transcript tail only holds COMMITTED messages; a "what are you
+        // working on?" mid-turn needs the answer being written right now.
+        // Resolve the session's CURRENT turn through the registry and require
+        // a NON-TERMINAL state — `ActiveTurn` entries are deliberately
+        // retained in `Terminal(_)` for idempotent interrupts, and a finished
+        // turn's leftover tail must not masquerade as in-flight (its text is
+        // already in the committed transcript above). TurnId keying then
+        // guarantees the tail belongs to exactly that turn — including turns
+        // admitted a moment ago whose task has not streamed yet (their fresh
+        // TurnId simply has no draft).
+        let live_turn_id = {
+            let registry = active_turns.lock().await;
+            match registry.get(&session_id) {
+                Some(entry) => {
+                    // Profile check: the registry is process-global and keyed
+                    // by bare SessionKey — two profiles' same-named sessions
+                    // (supported for bare `web-*` ids) must never cross-read
+                    // each other's stream.
+                    if entry.profile_id != aside_profile_id {
+                        None
+                    } else {
+                        let state = entry.state.lock().await;
+                        if matches!(*state, TurnState::Terminal(_)) {
+                            None
+                        } else {
+                            Some(entry.turn_id.clone())
+                        }
+                    }
+                }
+                None => None,
+            }
+        };
+        let live_draft_tail = live_turn_id
+            .as_ref()
+            .map(|turn_id| btw_live_draft_tail(&session_id, turn_id))
+            .unwrap_or_default();
+
+        // The profile's shared provider chain — same profile the transcript
+        // came from. `profile_runtime` also carries the data dir for the
+        // usage ledger; the test override provides a bare provider only.
+        let (llm, profile_runtime): (
+            Arc<dyn octos_llm::LlmProvider>,
+            Option<Arc<crate::runtime::ProfileRuntime>>,
+        ) = match btw_test_provider() {
+            Some(llm) => (llm, None),
+            None => {
+                match ensure_session_profile_runtime(&state, active_profile_id.as_deref()).await {
+                    Ok(Some(runtime)) => (runtime.llm.clone(), Some(runtime)),
+                    Ok(None) => {
+                        let _ = send_rpc_error(
+                            &ws,
+                            Some(id),
+                            RpcError::runtime_not_ready(
+                                "no LLM provider available for this session",
+                            ),
+                        );
+                        return;
+                    }
+                    Err(error) => {
+                        let _ = send_rpc_error(&ws, Some(id), error);
+                        return;
+                    }
+                }
+            }
+        };
+
+        let messages = build_btw_messages(
+            &transcript_tail,
+            &activity_tail,
+            &live_draft_tail,
+            &question,
+        );
+        let config = octos_llm::ChatConfig {
+            max_tokens: Some(BTW_ANSWER_MAX_TOKENS),
+            temperature: Some(0.2),
+            tool_choice: octos_llm::ToolChoice::None,
+            ..Default::default()
+        };
+        // `&[]` tool specs IS the "no tools" restriction — the model cannot
+        // call what it is never offered.
+        let response = match tokio::time::timeout(
+            std::time::Duration::from_secs(BTW_TIMEOUT_SECS),
+            llm.chat(&messages, &[], &config),
+        )
+        .await
+        {
+            Ok(Ok(response)) => response,
+            Ok(Err(error)) => {
+                let _ = send_rpc_error(
+                    &ws,
+                    Some(id),
+                    RpcError::internal_error(format!("btw aside failed: {error}")),
+                );
+                return;
+            }
+            Err(_elapsed) => {
+                let _ = send_rpc_error(
+                    &ws,
+                    Some(id),
+                    RpcError::internal_error(format!(
+                        "btw aside timed out after {BTW_TIMEOUT_SECS}s"
+                    )),
+                );
+                return;
+            }
+        };
+
+        // The answering SLOT's metadata (codex round-1 P2): `llm` is a
+        // retry/failover chain, so re-asking `model_id()` after the fact can
+        // name the primary lane rather than the fallback that answered.
+        let metadata = llm.provider_metadata_for_index(response.provider_index);
+
+        // Paid aside → usage ledger (codex round-1 P2), same shape as AppUI
+        // turns but on an aside-specific channel so analytics can split them.
+        if let Some(runtime) = profile_runtime.as_ref() {
+            match PersistentUsageLedger::open(&runtime.data_dir).await {
+                Ok(usage_ledger) => {
+                    let model = (!metadata.model.is_empty()).then(|| metadata.model.clone());
+                    let estimated_cost_usd =
+                        model.as_deref().and_then(model_pricing).map(|pricing| {
+                            pricing.cost(response.usage.input_tokens, response.usage.output_tokens)
+                        });
+                    let cost_source = if estimated_cost_usd.is_some() {
+                        UsageCostSource::CatalogEstimate
+                    } else {
+                        UsageCostSource::Unavailable
+                    };
+                    let event = UsageEvent::completed_run(
+                        active_profile_id
+                            .clone()
+                            .unwrap_or_else(|| MAIN_PROFILE_ID.to_owned()),
+                        session_id.0.clone(),
+                        format!("btw-{id}"),
+                        (!metadata.provider.is_empty()).then(|| metadata.provider.clone()),
+                        model,
+                        metadata.endpoint.clone(),
+                        u64::from(response.usage.input_tokens),
+                        u64::from(response.usage.output_tokens),
+                        estimated_cost_usd,
+                        cost_source,
+                        "appui_btw",
+                        None,
+                    );
+                    if let Err(error) = usage_ledger.record(event).await {
+                        warn!(
+                            session = %session_id.0,
+                            error = %error,
+                            "failed to record btw aside usage event"
+                        );
+                    }
+                }
+                Err(error) => {
+                    warn!(
+                        session = %session_id.0,
+                        error = %error,
+                        "usage ledger unavailable; btw aside not recorded"
+                    );
+                }
+            }
+        }
+
+        let answer = response
+            .content
+            .map(|content| content.trim().to_owned())
+            .filter(|content| !content.is_empty());
+        let Some(answer) = answer else {
+            let _ = send_rpc_error(
+                &ws,
+                Some(id),
+                RpcError::internal_error("btw aside returned an empty answer"),
+            );
+            return;
+        };
+
+        let result = octos_core::ui_protocol::SessionBtwResult {
+            session_id,
+            answer,
+            model: Some(metadata.model.clone()),
+        };
+        send_serialized_rpc_result(
+            &ws,
+            id,
+            octos_core::ui_protocol::methods::SESSION_BTW,
+            result,
+        );
+    });
+    Some(task)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -15617,6 +17080,346 @@ async fn handle_content_bulk_delete(
                 ws,
                 Some(id),
                 rest_status_to_rpc_error(method, status, Some(message), &context),
+            );
+        }
+    }
+}
+
+/// Per-field JSON-ESCAPED byte budgets for the memory RPC results
+/// (codex #1621 r1 P1, tightened r2 P1). The REST panel intentionally
+/// serves files up to `memory_panel::MAX_PANEL_FILE_BYTES` (2 MiB), but
+/// an RPC result must fit ONE ~1 MiB WS text frame
+/// (`MAX_TEXT_FRAME_BYTES`) — without a handler-level bound the
+/// outbound framing guard (`preview_oversized_frame`) would splice a
+/// head+tail preview into the largest string while the envelope still
+/// reports success: silent corruption for a document viewer.
+///
+/// Budgets are measured in ESCAPED bytes (r2 P1: a flat raw-byte cap
+/// under-counts — `serde_json` emits SIX bytes (`\u0001`) for a C0
+/// control byte, so a control-heavy file capped by raw length would
+/// still serialize past the frame and re-reach the silent preview).
+/// `cap_index_by_escaped_len` walks the field with serde_json's actual
+/// escaping table, so plain markdown keeps ~the full budget while
+/// pathological content is cut exactly where its wire cost hits it.
+/// Worst-case wire size is therefore the PLAIN SUM of the budgets:
+///   96 (long_term) + 48 (today) + 7×24 (recent) + ~543 (entities —
+///   bounded upstream at ≤ MAX_PANEL_ENTITIES=256 rows: summaries
+///   ≤ 100 raw bytes (`octos_memory::extract_abstract`) → ≤ 600
+///   escaped, names ≤ 255 raw → ≤ 1530 escaped (Unix filenames may
+///   carry C0 controls at 6 wire bytes each), + per-row JSON
+///   overhead) ≈ 855 KiB, under the frame cap with ~169 KiB margin.
+/// Truncation is EXPLICIT: `<field>_truncated` + `<field>_total_bytes`
+/// ride beside every capped field; the content itself is a clean UTF-8
+/// prefix with NO in-band marker.
+const MEMORY_RPC_LONG_TERM_BUDGET: usize = 96 * 1024;
+const MEMORY_RPC_TODAY_BUDGET: usize = 48 * 1024;
+const MEMORY_RPC_RECENT_NOTE_BUDGET: usize = 24 * 1024;
+/// `memory/entity` is a single-document result — it gets the largest
+/// budget that still clears the frame cap.
+const MEMORY_RPC_ENTITY_CONTENT_BUDGET: usize = 384 * 1024;
+
+/// Wire cost of one char in a JSON string per `serde_json`'s escaper:
+/// `"` / `\` and the short control escapes (`\b \f \n \r \t`)
+/// emit 2 bytes; every other C0 control emits 6 (`\u00XX`); everything
+/// else passes through at its UTF-8 length.
+fn json_escaped_len(c: char) -> usize {
+    match c {
+        '"' | '\\' | '\x08' | '\x0c' | '\n' | '\r' | '\t' => 2,
+        c if (c as u32) < 0x20 => 6,
+        c => c.len_utf8(),
+    }
+}
+
+/// Largest raw prefix of `s` whose JSON-ESCAPED length fits
+/// `escaped_budget`. Always a char boundary (walks `char_indices`).
+fn cap_index_by_escaped_len(s: &str, escaped_budget: usize) -> usize {
+    let mut used = 0usize;
+    for (i, c) in s.char_indices() {
+        let cost = json_escaped_len(c);
+        if used + cost > escaped_budget {
+            return i;
+        }
+        used += cost;
+    }
+    s.len()
+}
+
+/// Cap the string at `obj[field]` to `budget` ESCAPED bytes (UTF-8
+/// boundary, clean prefix — no in-band marker) and record the truth
+/// beside it as `<field>_truncated` + `<field>_total_bytes` (always
+/// written, false/full-length when the field fit).
+fn cap_memory_value_field(obj: &mut Value, field: &str, budget: usize) {
+    let Some(Value::String(s)) = obj.get_mut(field) else {
+        return;
+    };
+    let total = s.len();
+    let cut = cap_index_by_escaped_len(s, budget);
+    let truncated = cut < s.len();
+    if truncated {
+        s.truncate(cut);
+    }
+    if let Some(map) = obj.as_object_mut() {
+        map.insert(format!("{field}_truncated"), json!(truncated));
+        map.insert(format!("{field}_total_bytes"), json!(total));
+    }
+}
+
+/// Apply the per-field budgets to a serialized `MemoryOverviewResponse`.
+fn apply_memory_overview_budgets(overview: &mut Value) {
+    cap_memory_value_field(overview, "long_term", MEMORY_RPC_LONG_TERM_BUDGET);
+    cap_memory_value_field(overview, "today", MEMORY_RPC_TODAY_BUDGET);
+    if let Some(recent) = overview.get_mut("recent").and_then(Value::as_array_mut) {
+        for note in recent {
+            cap_memory_value_field(note, "content", MEMORY_RPC_RECENT_NOTE_BUDGET);
+        }
+    }
+}
+
+async fn handle_memory_overview(
+    ws: &WsConnection,
+    state: &Arc<AppState>,
+    headers: &HeaderMap,
+    identity: Option<&AuthIdentity>,
+    close_on_auth_unavailable: bool,
+    id: String,
+    _params: MemoryOverviewParams,
+) {
+    let method = octos_core::ui_protocol::methods::MEMORY_OVERVIEW;
+    let Some(identity) = identity.cloned() else {
+        // Web PR #114 contract: see `close_ws_with_code` doc-comment. Codex
+        // BLOCK (2026-05-13): close before error so it survives writer
+        // backpressure when the channel has just one free slot.
+        if close_on_auth_unavailable {
+            let _ = close_ws_with_code(ws, 1008, "auth_expired");
+        }
+        let _ = send_rpc_error(ws, Some(id), auth_unavailable_error(method));
+        return;
+    };
+    let result =
+        super::memory_panel::my_memory(State(state.clone()), headers.clone(), Extension(identity))
+            .await;
+    match result {
+        Ok(axum::Json(overview)) => match serde_json::to_value(&overview) {
+            // The REST body is forwarded whole under `overview` (the
+            // `system/status.get` wrap pattern) so the WS shape cannot
+            // drift from `MemoryOverviewResponse` field by field — then
+            // capped per document field so the result fits one WS frame
+            // with EXPLICIT flags instead of the framing guard's silent
+            // head+tail preview (codex #1621 r1 P1).
+            Ok(mut value) => {
+                apply_memory_overview_budgets(&mut value);
+                send_aux_rpc_result(ws, id, method, json!({ "overview": value }))
+            }
+            Err(error) => {
+                let _ = send_rpc_error(
+                    ws,
+                    Some(id),
+                    RpcError::internal_error(format!(
+                        "{method}: serialize memory overview failed: {error}"
+                    )),
+                );
+            }
+        },
+        Err(status) => {
+            // Collection-style endpoint — no addressable id. The REST
+            // handler returns bare `StatusCode`s (no body), so there is
+            // no detail string to forward.
+            let context = RestResourceContext::resource("memory", "");
+            let _ = send_rpc_error(
+                ws,
+                Some(id),
+                rest_status_to_rpc_error(method, status, None, &context),
+            );
+        }
+    }
+}
+
+async fn handle_memory_entity(
+    ws: &WsConnection,
+    state: &Arc<AppState>,
+    headers: &HeaderMap,
+    identity: Option<&AuthIdentity>,
+    close_on_auth_unavailable: bool,
+    id: String,
+    params: MemoryEntityParams,
+) {
+    let method = octos_core::ui_protocol::methods::MEMORY_ENTITY;
+    let Some(identity) = identity.cloned() else {
+        // Web PR #114 contract: see `close_ws_with_code` doc-comment. Codex
+        // BLOCK (2026-05-13): close before error so it survives writer
+        // backpressure when the channel has just one free slot.
+        if close_on_auth_unavailable {
+            let _ = close_ws_with_code(ws, 1008, "auth_expired");
+        }
+        let _ = send_rpc_error(ws, Some(id), auth_unavailable_error(method));
+        return;
+    };
+    let entity_name = params.name.clone();
+    let result = super::memory_panel::my_memory_entity(
+        State(state.clone()),
+        headers.clone(),
+        Extension(identity),
+        axum_path(params.name),
+    )
+    .await;
+    match result {
+        Ok(axum::Json(entity)) => {
+            // `ok` is dropped — RPC success is carried by the envelope.
+            // Content is capped with an EXPLICIT flag so an over-frame
+            // page degrades to a declared prefix, never the framing
+            // guard's silent in-band preview (codex #1621 r1 P1).
+            let mut content = entity.content;
+            let content_total_bytes = content.len();
+            let cut = cap_index_by_escaped_len(&content, MEMORY_RPC_ENTITY_CONTENT_BUDGET);
+            let content_truncated = cut < content.len();
+            if content_truncated {
+                content.truncate(cut);
+            }
+            send_aux_rpc_result(
+                ws,
+                id,
+                method,
+                json!({
+                    "name": entity.name,
+                    "content": content,
+                    "content_truncated": content_truncated,
+                    "content_total_bytes": content_total_bytes,
+                }),
+            );
+        }
+        Err(status) => {
+            // Entity page miss → `RESOURCE_NOT_FOUND` with the page name
+            // echoed in `data.identifier` (the REST 404 carries no body).
+            let context = RestResourceContext::resource("memory_entity", entity_name);
+            let _ = send_rpc_error(
+                ws,
+                Some(id),
+                rest_status_to_rpc_error(method, status, None, &context),
+            );
+        }
+    }
+}
+
+async fn handle_cron_list(
+    ws: &WsConnection,
+    state: &Arc<AppState>,
+    headers: &HeaderMap,
+    identity: Option<&AuthIdentity>,
+    close_on_auth_unavailable: bool,
+    id: String,
+    _params: CronListParams,
+) {
+    let method = octos_core::ui_protocol::methods::CRON_LIST;
+    let Some(identity) = identity.cloned() else {
+        // Web PR #114 contract: see `close_ws_with_code` doc-comment. Codex
+        // BLOCK (2026-05-13): close before error so it survives writer
+        // backpressure when the channel has just one free slot.
+        if close_on_auth_unavailable {
+            let _ = close_ws_with_code(ws, 1008, "auth_expired");
+        }
+        let _ = send_rpc_error(ws, Some(id), auth_unavailable_error(method));
+        return;
+    };
+    let result =
+        super::cron_panel::my_cron(State(state.clone()), headers.clone(), Extension(identity))
+            .await;
+    match result {
+        Ok(axum::Json(body)) => {
+            // The REST body is `{ ok, count, jobs, gateway_running }`;
+            // `ok` is dropped (envelope carries success), the rest is
+            // forwarded field-for-field per `CronListResult`.
+            let jobs = body.get("jobs").cloned().unwrap_or_else(|| json!([]));
+            let count = body.get("count").and_then(Value::as_u64).unwrap_or(0) as usize;
+            let gateway_running = body
+                .get("gateway_running")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            // Forward the truncation signal so a client can show "N of `count`"
+            // instead of silently seeing a short list (`cron/list` bounds the
+            // row set to keep the frame under budget).
+            let truncated = body
+                .get("truncated")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            send_aux_rpc_result(
+                ws,
+                id,
+                method,
+                json!({
+                    "jobs": jobs,
+                    "count": count,
+                    "gateway_running": gateway_running,
+                    "truncated": truncated,
+                }),
+            );
+        }
+        Err(status) => {
+            // Collection-style endpoint — no addressable id, no REST body.
+            let context = RestResourceContext::resource("cron", "");
+            let _ = send_rpc_error(
+                ws,
+                Some(id),
+                rest_status_to_rpc_error(method, status, None, &context),
+            );
+        }
+    }
+}
+
+async fn handle_cron_toggle(
+    ws: &WsConnection,
+    state: &Arc<AppState>,
+    headers: &HeaderMap,
+    identity: Option<&AuthIdentity>,
+    close_on_auth_unavailable: bool,
+    id: String,
+    params: CronToggleParams,
+) {
+    let method = octos_core::ui_protocol::methods::CRON_TOGGLE;
+    let Some(identity) = identity.cloned() else {
+        // Web PR #114 contract: see `close_ws_with_code` doc-comment. Codex
+        // BLOCK (2026-05-13): close before error so it survives writer
+        // backpressure when the channel has just one free slot.
+        if close_on_auth_unavailable {
+            let _ = close_ws_with_code(ws, 1008, "auth_expired");
+        }
+        let _ = send_rpc_error(ws, Some(id), auth_unavailable_error(method));
+        return;
+    };
+    let job_id = params.job_id.clone();
+    let result = super::cron_panel::set_my_cron_enabled(
+        State(state.clone()),
+        headers.clone(),
+        Extension(identity),
+        axum_path(params.job_id),
+        axum::Json(super::cron_panel::ToggleBody {
+            enabled: params.enabled,
+        }),
+    )
+    .await;
+    match result {
+        Ok(axum::Json(body)) => {
+            // REST success body is `{ ok: true, job }`; forward the job
+            // (rendered exactly as a `cron/list` entry) per
+            // `CronToggleResult`.
+            let job = body.get("job").cloned().unwrap_or_else(|| json!(null));
+            send_aux_rpc_result(ws, id, method, json!({ "job": job }));
+        }
+        Err((status, axum::Json(body))) => {
+            // The REST error body is `{ ok: false, reason }`. Forward
+            // `reason` as the error detail so clients can tell the
+            // gateway-owns-the-store refusal (`detail:
+            // "gateway_running"`, `rest_status: 409`) from a plain miss
+            // without string-matching messages.
+            let detail = body
+                .get("reason")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+                .unwrap_or_else(|| body.to_string());
+            let context = RestResourceContext::resource("cron_job", job_id);
+            let _ = send_rpc_error(
+                ws,
+                Some(id),
+                rest_status_to_rpc_error(method, status, Some(detail), &context),
             );
         }
     }
@@ -19195,6 +20998,39 @@ async fn run_standalone_turn(
             None
         }
     };
+    // Session-cumulative usage base for cost emissions (codex #1632 P1):
+    // this path builds a FRESH agent per turn, so without a seeded base
+    // every `cost_update` reported turn-only "session" figures. Hydrate
+    // from the ledger this same path writes each completed run to —
+    // making the emitted `session_*` figures cover the whole session
+    // across turns, reconnects, and the per-turn agent rebuild. The
+    // completed-run write below lands before the client can start the
+    // next turn on this session, so the next hydration includes it.
+    let session_usage_base = octos_agent::SharedSessionUsage::default();
+    if let Some(ledger) = usage_ledger.as_ref() {
+        match ledger.session_totals(&session_id.to_string()).await {
+            Ok(totals) if totals.run_count > 0 => {
+                session_usage_base.seed(octos_agent::SessionUsageSnapshot {
+                    input_tokens: totals.input_tokens,
+                    output_tokens: totals.output_tokens,
+                    spend_usd: totals.estimated_cost_usd,
+                    priced_runs: if totals.estimated_cost_usd > 0.0 {
+                        totals.run_count
+                    } else {
+                        0
+                    },
+                });
+            }
+            Ok(_) => {}
+            Err(error) => {
+                warn!(
+                    session = %session_id.0,
+                    error = %error,
+                    "failed to hydrate session usage base from ledger"
+                );
+            }
+        }
+    }
 
     // Source the per-session primitives from the SessionRuntime.
     //
@@ -20003,6 +21839,12 @@ async fn run_standalone_turn(
             session_id.to_string(),
         )
         .with_provider_policy(tool_registry.provider_policy().cloned())
+        // #1607 (codex-review follow-up): inherit the session's effective
+        // sandbox (the same `SandboxConfig` the parent `tool_registry` was
+        // built from) so the spawn/agent_mcp child completion path confines
+        // workspace-declared `Command` validators rather than running them on
+        // the host.
+        .with_sandbox(session_runtime.sandbox.clone())
         .with_agent_config(agent_config.clone())
         .with_task_supervisor(
             task_supervisor.clone(),
@@ -20081,6 +21923,14 @@ async fn run_standalone_turn(
                         "failed to persist forked child context manager snapshot"
                     );
                 }
+                // NB: no `with_context_lifecycle_notify` here (child bridges
+                // stay silent, unlike the parent turn bridge). A child's
+                // forked context is SEPARATE from the parent's; emitting its
+                // compaction events under the parent key would overwrite the
+                // client's per-session context gauge with the child's
+                // numbers, and under the child key (`…#spawn-…`) no client
+                // ever opens the session. Surfacing child compactions needs
+                // a dedicated child-attributed event — follow-up.
                 Some(Arc::new(AppUiPromptContextBridge::new(
                     child_session_id,
                     child_context_data_dir.clone(),
@@ -20129,8 +21979,15 @@ async fn run_standalone_turn(
         // clone the `Arc` here for every spawn-tool child closure
         // invocation.
         if let Some(pipeline_factory) = session_runtime.profile.pipeline_factory.clone() {
-            spawn_tool =
-                spawn_tool.with_child_tool_factory(Arc::new(move || pipeline_factory.create()));
+            // #1607 (codex round 4): bind spawn-child `run_pipeline` instances to
+            // the SESSION-effective sandbox (`session_runtime.sandbox`, set by
+            // `bootstrap_with_permissions_and_sandbox`), NOT the profile-time
+            // default the factory was built with — otherwise a read-only
+            // session's spawned pipeline validators regain removed
+            // writes/network.
+            let child_sandbox = session_runtime.sandbox.clone();
+            spawn_tool = spawn_tool
+                .with_child_tool_factory(Arc::new(move || pipeline_factory.create(&child_sandbox)));
         }
         tool_registry.register(spawn_tool);
         // RFC-0 (#1289): LRU deferral removed — no base-tool pin needed.
@@ -20295,14 +22152,34 @@ async fn run_standalone_turn(
         system_prompt_base.clone(),
         workspace_root.as_deref(),
     ))
+    .with_session_usage_base(session_usage_base.clone())
     .with_reporter(reporter);
-    let prompt_context_bridge: Arc<dyn PromptContextManager> =
-        Arc::new(AppUiPromptContextBridge::new(
+    // In-loop compaction delivery (UPCR-2026-026 follow-up): mirror the
+    // pre-turn lifecycle delivery — durable direct send for clients that
+    // negotiated `context.lifecycle.v1`, ledger-only otherwise — so the
+    // MID-TURN compaction pass (the one that actually fires when context
+    // fills during a long turn) is visible to the client, not silent.
+    let context_lifecycle_notify: ContextLifecycleNotify = {
+        let ws = ws.clone();
+        let ledger = ledger.clone();
+        // `features` is Copy — the move closure captures its own copy.
+        Arc::new(move |notification: UiNotification| {
+            if features.context_lifecycle_available() {
+                let _ = send_notification_durable(&ws, &ledger, notification);
+            } else {
+                let _ = ledger.append_notification_from(notification, ws.connection_id);
+            }
+        })
+    };
+    let prompt_context_bridge: Arc<dyn PromptContextManager> = Arc::new(
+        AppUiPromptContextBridge::new(
             session_id.clone(),
             session_runtime.profile.data_dir.clone(),
             context_manager.clone(),
             voice_turn_hint,
-        ));
+        )
+        .with_context_lifecycle_notify(context_lifecycle_notify),
+    );
     request_agent = request_agent.with_prompt_context_manager(prompt_context_bridge);
     if let Some(hooks) = session_runtime.profile.hook_executor.clone() {
         request_agent = request_agent.with_hooks(hooks);
@@ -21262,13 +23139,18 @@ async fn run_standalone_turn(
                             let model = request_agent.model_id();
                             (!model.is_empty()).then(|| model.to_string())
                         });
-                    let estimated_cost_usd =
+                    // Attributed by the agent loop: each response priced at
+                    // the model that produced it. Re-pricing the turn total
+                    // at the final model mispriced cross-model turns (codex
+                    // #1632 P1); the reprice fallback covers legacy paths.
+                    let estimated_cost_usd = response.estimated_spend_usd.or_else(|| {
                         model.as_deref().and_then(model_pricing).map(|pricing| {
                             pricing.cost(
                                 response.token_usage.input_tokens,
                                 response.token_usage.output_tokens,
                             )
-                        });
+                        })
+                    });
                     let cost_source = if estimated_cost_usd.is_some() {
                         UsageCostSource::CatalogEstimate
                     } else {
@@ -22667,6 +24549,28 @@ async fn try_emit_terminal(
 ///
 /// `Skipped` and `Aborted` variants require future signal sources
 /// (deadline-skip plumbing, interrupt propagation) and are NOT
+/// Compact preview of a tool call's arguments for envelope display, bounded
+/// to [`octos_core::ui_protocol::ENVELOPE_TOOL_ARGUMENTS_PREVIEW_MAX`].
+/// Object arguments render as `key: value` pairs (`command: "cargo test",
+/// timeout: 30`) — the human `shell(…)` reading, not raw JSON braces. This is
+/// display fidelity only; the full arguments stay on the live
+/// `ToolStarted` notification and in the agent transcript.
+fn envelope_tool_arguments_preview(arguments: &Value) -> String {
+    let rendered = match arguments {
+        Value::Object(map) => map
+            .iter()
+            .map(|(key, value)| format!("{key}: {value}"))
+            .collect::<Vec<_>>()
+            .join(", "),
+        other => other.to_string(),
+    };
+    octos_core::truncated_utf8(
+        &rendered,
+        octos_core::ui_protocol::ENVELOPE_TOOL_ARGUMENTS_PREVIEW_MAX,
+        "…",
+    )
+}
+
 /// reachable through `ToolCompleted` today.
 fn emit_envelope_for_legacy_notification(
     ledger: &UiProtocolLedger,
@@ -22695,6 +24599,16 @@ fn emit_envelope_for_legacy_notification(
                 Payload::ToolStart {
                     tool_call_id: event.tool_call_id.clone(),
                     name: event.tool_name.clone(),
+                    // Display fidelity for the tool card (`shell(cd … && …)`),
+                    // bounded so a 1MB tool-arg blob never lands in every
+                    // persisted envelope + hydrate replay.
+                    arguments_preview: event
+                        .arguments
+                        .as_ref()
+                        .map(envelope_tool_arguments_preview)
+                        // `{}` args render as "" — the spec says omit, not
+                        // empty-string.
+                        .filter(|preview| !preview.is_empty()),
                 },
                 None,
             ),
@@ -22717,7 +24631,16 @@ fn emit_envelope_for_legacy_notification(
                     Some(false) => EnvelopeToolEndStatus::Error,
                 };
                 let error = match status {
-                    EnvelopeToolEndStatus::Error => event.output_preview.clone(),
+                    // Bounded like `output_preview`: the error source can be
+                    // arbitrary-length tool output, and this string lands in
+                    // the durable ledger + every hydrate replay.
+                    EnvelopeToolEndStatus::Error => event.output_preview.as_deref().map(|s| {
+                        octos_core::truncated_utf8(
+                            s,
+                            octos_core::ui_protocol::ENVELOPE_TOOL_OUTPUT_PREVIEW_MAX,
+                            "…",
+                        )
+                    }),
                     _ => None,
                 };
                 (
@@ -22727,6 +24650,18 @@ fn emit_envelope_for_legacy_notification(
                         status,
                         error,
                         reason: None,
+                        // Result excerpt for the `⎿ …` line under the card.
+                        // `ToolCompletedEvent.output_preview` is already a
+                        // preview upstream; re-bound defensively so ledger
+                        // growth is capped no matter what the emitter sent.
+                        output_preview: event.output_preview.as_deref().map(|preview| {
+                            octos_core::truncated_utf8(
+                                preview,
+                                octos_core::ui_protocol::ENVELOPE_TOOL_OUTPUT_PREVIEW_MAX,
+                                "…",
+                            )
+                        }),
+                        duration_ms: event.duration_ms,
                     },
                     None,
                 )
@@ -25130,6 +27065,13 @@ fn send_notification_ephemeral(
 ) -> Result<(), SendError> {
     // Ephemeral frames are NOT appended to the ledger — they are explicitly
     // non-durable per spec § 9. Drops never need a `replay_lossy` summary.
+    // Every legacy `message/delta` send funnels through here exactly once
+    // (the producing turn task's direct send) — feed the `session/btw`
+    // live-draft tail BEFORE the capability filter so envelope-negotiated
+    // connections still record it. TurnId keying isolates streams.
+    if let UiNotification::MessageDelta(delta) = &notification {
+        btw_live_draft_append(&delta.session_id, &delta.turn_id, &delta.text);
+    }
     let method = notification.method().to_string();
     // Codex #1336 round-2 BLOCKER 1: apply the per-connection
     // capability filter to ephemeral direct sends too. `MessageDelta`
@@ -25266,6 +27208,9 @@ fn ledger_event_cursor(event: &UiProtocolLedgerEvent) -> Option<UiCursor> {
             // surrounding LedgeredUiProtocolEvent is authoritative for replay.
             | UiNotification::UserQuestionRequested(_)
             | UiNotification::TaskUpdated(_)
+            // Plan snapshots are non-cursor-bearing; the surrounding
+            // LedgeredUiProtocolEvent cursor is authoritative for replay.
+            | UiNotification::PlanUpdated(_)
             // TaskOutputDelta carries an `OutputCursor`, not a `UiCursor`.
             | UiNotification::TaskOutputDelta(_)
             | UiNotification::ProgressUpdated(_)
@@ -25391,6 +27336,136 @@ mod tests {
         rpc_error_codes,
     };
 
+    /// The §6 "Envelope Model" catalog in
+    /// `api/OCTOS_UI_PROTOCOL_V1_SPEC_2026-04-24.md` is a hand-maintained
+    /// mirror of the advertised method constants and has historically drifted
+    /// — methods shipped without a catalog update (e.g. `session/rollback`
+    /// #1516, `message/reasoning_delta` #1502). Nothing else gates catalog
+    /// completeness (`check-ui-protocol-upcr.sh` only checks that a protocol
+    /// edit ships with *a* UPCR doc). This test keeps §6 a superset of
+    /// `UI_PROTOCOL_COMMAND_METHODS ∪ UI_PROTOCOL_NOTIFICATION_METHODS ∪
+    /// UI_PROTOCOL_FIRST_SERVER_METHODS ∪ APPUI_EXTRA_METHODS` — the full set the
+    /// server advertises (`ui_protocol_server_supported_methods` builds from
+    /// `FIRST_SERVER ∪ APPUI_EXTRA`) — so the catalog can no longer silently
+    /// fall behind, even for a future server-only method.
+    #[test]
+    fn spec_section6_catalog_lists_every_advertised_method() {
+        fn is_method_char(c: char) -> bool {
+            // `.` is part of a method token (dotted M12 names like
+            // `session/status.get`), NOT a boundary — otherwise a drifted
+            // `session/status.get.v2` catalog entry would still satisfy the
+            // advertised `session/status.get`.
+            c.is_ascii_alphanumeric() || c == '_' || c == '/' || c == '.'
+        }
+        // Bounded substring match within an entry's method-token head, so
+        // `artifact/list` is not satisfied by `agent/artifact/list`; backticks,
+        // commas, and spaces are all boundaries.
+        fn head_has_method(head: &str, method: &str) -> bool {
+            let bytes = head.as_bytes();
+            let mut from = 0;
+            while let Some(rel) = head[from..].find(method) {
+                let i = from + rel;
+                let before_ok = i == 0 || !is_method_char(bytes[i - 1] as char);
+                let after = i + method.len();
+                let after_ok = after >= bytes.len() || !is_method_char(bytes[after] as char);
+                if before_ok && after_ok {
+                    return true;
+                }
+                from = i + 1;
+            }
+            false
+        }
+
+        // A method counts as cataloged only when it appears in the method-token
+        // HEAD of a `- ` list entry — the entry's first line PLUS any indented
+        // continuation lines, truncated at the first description delimiter (`(`
+        // annotation or `—` prose). Grouped entries wrap their comma-separated
+        // method list across continuation lines, so those must be folded in;
+        // but a method named only inside another entry's parenthetical/prose
+        // (e.g. `session/hydrate` inside the `session/rollback` bullet) must NOT
+        // count, or genuine drift for that method would hide.
+        fn catalog_lists(section: &str, method: &str) -> bool {
+            fn head(entry: &str) -> &str {
+                let cut = [entry.find('('), entry.find('—')]
+                    .into_iter()
+                    .flatten()
+                    .min()
+                    .unwrap_or(entry.len());
+                &entry[..cut]
+            }
+            let mut entries: Vec<String> = Vec::new();
+            let mut current: Option<String> = None;
+            for line in section.lines() {
+                let trimmed = line.trim_start();
+                if let Some(rest) = trimmed.strip_prefix("- ") {
+                    if let Some(entry) = current.take() {
+                        entries.push(entry);
+                    }
+                    current = Some(rest.to_string());
+                } else if !trimmed.is_empty() && line.starts_with(char::is_whitespace) {
+                    // Continuation of the active grouped entry, if any.
+                    if let Some(entry) = current.as_mut() {
+                        entry.push(' ');
+                        entry.push_str(trimmed);
+                    }
+                } else {
+                    // Blank / non-indented line ends the active entry.
+                    if let Some(entry) = current.take() {
+                        entries.push(entry);
+                    }
+                }
+            }
+            if let Some(entry) = current.take() {
+                entries.push(entry);
+            }
+            entries
+                .iter()
+                .any(|entry| head_has_method(head(entry), method))
+        }
+
+        let spec_path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../api/OCTOS_UI_PROTOCOL_V1_SPEC_2026-04-24.md"
+        );
+        let spec = std::fs::read_to_string(spec_path)
+            .unwrap_or_else(|e| panic!("cannot read UI Protocol spec at {spec_path}: {e}"));
+
+        // Slice the §6 catalog: its header up to the next top-level section.
+        let start = spec
+            .find("## 6. Envelope Model")
+            .expect("UI Protocol spec is missing `## 6. Envelope Model`");
+        let rest = &spec[start..];
+        // Bound §6 at the NEXT top-level (`## `) heading, whatever its number
+        // or title. Hardcoding `## 7.` would fail OPEN if §7 is ever renamed or
+        // renumbered — the slice would run to end-of-spec, and later semantic
+        // sections repeat these method names in list entries, so a deleted §6
+        // entry could still be satisfied. Fail closed: §6 must be followed by
+        // another top-level section.
+        let end = rest
+            .find("\n## ")
+            .expect("UI Protocol spec §6 must be followed by a `## ` section heading");
+        let section6 = &rest[..end];
+
+        let missing: Vec<&str> = octos_core::ui_protocol::UI_PROTOCOL_COMMAND_METHODS
+            .iter()
+            .chain(octos_core::ui_protocol::UI_PROTOCOL_NOTIFICATION_METHODS.iter())
+            .chain(octos_core::ui_protocol::UI_PROTOCOL_FIRST_SERVER_METHODS.iter())
+            .chain(APPUI_EXTRA_METHODS.iter())
+            .copied()
+            .filter(|method| !catalog_lists(section6, method))
+            .collect();
+
+        assert!(
+            missing.is_empty(),
+            "UI Protocol spec §6 catalog is missing advertised method(s): {missing:?}\n\
+             Add them under `## 6. Envelope Model` in \
+             api/OCTOS_UI_PROTOCOL_V1_SPEC_2026-04-24.md — the catalog is a \
+             hand-maintained mirror and must stay a superset of \
+             UI_PROTOCOL_COMMAND_METHODS / UI_PROTOCOL_NOTIFICATION_METHODS / \
+             UI_PROTOCOL_FIRST_SERVER_METHODS / APPUI_EXTRA_METHODS."
+        );
+    }
+
     #[tokio::test]
     async fn compaction_started_precedes_completed_in_lifecycle_batch() {
         // UPCR-2026-026: when the threshold trips, the lifecycle batch must
@@ -25505,6 +27580,903 @@ mod tests {
             solo_login_enabled: true,
             ..AppState::empty_for_tests()
         }
+    }
+
+    /// Multi-model profiles: `profile/llm/list`-backed model list exposes the
+    /// primary AND every fallback; `profile/llm/select` promotes a fallback to
+    /// the active primary (demoting the old primary to a fallback), persists,
+    /// and is idempotent for the current primary; unconfigured models reject.
+    #[tokio::test]
+    async fn llm_select_promotes_fallback_and_lists_all_models() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = Arc::new(local_profile_state(dir.path()));
+        for (family, model, set_primary) in [
+            ("deepseek", "deepseek-v4-pro", true),
+            ("zai", "glm-5.2", false),
+        ] {
+            let request = RpcRequest::new(
+                format!("u-{model}"),
+                APPUI_METHOD_PROFILE_LLM_UPSERT.to_string(),
+                json!({
+                    "profile_id": "dev",
+                    "selection": {
+                        "family_id": family,
+                        "model_id": model,
+                        "route": { "route_id": "official" },
+                    },
+                    // Selection validates key availability: seed one per
+                    // family so the selects below exercise promotion, not
+                    // the keyless-rejection path.
+                    "api_key": format!("test-{family}-key"),
+                    "set_primary": set_primary,
+                }),
+            );
+            raw_profile_llm_upsert(&state, &request, None)
+                .await
+                .expect("upsert");
+        }
+
+        let profile = state.profile_store.as_ref().unwrap().get("dev").unwrap();
+        let models = model_list_result(
+            &state,
+            SessionKey("dev:local:t".into()),
+            "dev",
+            profile.as_ref(),
+        );
+        let list = models["models"].as_array().unwrap();
+        assert_eq!(list.len(), 2, "primary + fallback both listed: {models}");
+        assert_eq!(list[0]["model"], "deepseek-v4-pro");
+        assert_eq!(list[0]["selected"], true);
+        assert_eq!(list[1]["model"], "glm-5.2");
+        assert_eq!(list[1]["selected"], false);
+
+        let request = RpcRequest::new(
+            "s1".to_string(),
+            APPUI_METHOD_PROFILE_LLM_SELECT.to_string(),
+            json!({
+                "profile_id": "dev",
+                "family_id": "zai",
+                "model_id": "glm-5.2",
+                "route_id": "official",
+            }),
+        );
+        let result = raw_profile_llm_select(&state, &request, None)
+            .await
+            .expect("select");
+        assert_eq!(result["applied"], true);
+        assert_eq!(result["selected"]["model"], "glm-5.2");
+        assert_eq!(result["selected"]["selected"], true);
+
+        let profile = state
+            .profile_store
+            .as_ref()
+            .unwrap()
+            .get("dev")
+            .unwrap()
+            .unwrap();
+        let llm = profile.config.llm.as_ref().unwrap();
+        assert_eq!(
+            llm.primary.as_ref().unwrap().model_id.as_deref(),
+            Some("glm-5.2"),
+            "fallback promoted to primary"
+        );
+        assert_eq!(llm.fallbacks.len(), 1, "demoted primary kept as fallback");
+        assert_eq!(
+            llm.fallbacks[0].model_id.as_deref(),
+            Some("deepseek-v4-pro")
+        );
+
+        let request = RpcRequest::new(
+            "s2".to_string(),
+            APPUI_METHOD_PROFILE_LLM_SELECT.to_string(),
+            json!({ "profile_id": "dev", "model_id": "glm-5.2" }),
+        );
+        let result = raw_profile_llm_select(&state, &request, None)
+            .await
+            .expect("selecting the current primary is idempotent");
+        assert_eq!(result["applied"], true);
+
+        let request = RpcRequest::new(
+            "s3".to_string(),
+            APPUI_METHOD_PROFILE_LLM_SELECT.to_string(),
+            json!({ "profile_id": "dev", "model_id": "kimi-k2.5" }),
+        );
+        let error = raw_profile_llm_select(&state, &request, None)
+            .await
+            .expect_err("unconfigured model must reject");
+        assert_eq!(error.code, rpc_error_codes::RESOURCE_NOT_FOUND);
+    }
+
+    /// Selecting a model whose provider key resolves nowhere must REJECT
+    /// without persisting: the runtime re-ensure would fail silently (the
+    /// live session keeps the old chain while the UI claims the switch), and
+    /// the persisted keyless primary bricks the next `session/open` at
+    /// bootstrap. Found live: a user selected zai/glm-5.2 with no
+    /// ZAI_API_KEY — "Model selected" echoed, the footer snapped back, and
+    /// the next launch failed to boot.
+    #[tokio::test]
+    async fn llm_select_rejects_keyless_models_before_persisting() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = Arc::new(local_profile_state(dir.path()));
+        let upsert = |model: &str, api_key: Option<&str>, set_primary: bool| {
+            let mut body = json!({
+                "profile_id": "dev",
+                "selection": {
+                    "family_id": if model.starts_with("glm") { "zai" } else { "deepseek" },
+                    "model_id": model,
+                    "route": {
+                        "route_id": "official",
+                        // A test-scoped variable name so resolution can't
+                        // fall through to a real key in the process env.
+                        "api_key_env": format!("OCTOS_TEST_{}_KEY", model.replace(['-', '.'], "_").to_uppercase()),
+                    },
+                },
+                "set_primary": set_primary,
+            });
+            if let Some(api_key) = api_key {
+                body["api_key"] = json!(api_key);
+            }
+            RpcRequest::new(
+                format!("u-{model}-{}", api_key.is_some()),
+                APPUI_METHOD_PROFILE_LLM_UPSERT.to_string(),
+                body,
+            )
+        };
+
+        raw_profile_llm_upsert(&state, &upsert("deepseek-chat", Some("dk"), true), None)
+            .await
+            .expect("seed keyed primary");
+        raw_profile_llm_upsert(&state, &upsert("glm-5.2", None, false), None)
+            .await
+            .expect("seed keyless fallback");
+
+        let select = |id: &str| {
+            RpcRequest::new(
+                id.to_string(),
+                APPUI_METHOD_PROFILE_LLM_SELECT.to_string(),
+                json!({ "profile_id": "dev", "model_id": "glm-5.2" }),
+            )
+        };
+        let error = raw_profile_llm_select(&state, &select("s-keyless"), None)
+            .await
+            .expect_err("keyless select must reject");
+        assert_eq!(error.code, rpc_error_codes::INVALID_PARAMS);
+        assert_eq!(
+            error.data.as_ref().and_then(|data| data.get("kind")),
+            Some(&json!("llm_key_missing")),
+            "got {error:?}"
+        );
+        assert!(
+            error.message.contains("OCTOS_TEST_GLM_5_2_KEY"),
+            "message must name the missing variable: {}",
+            error.message
+        );
+        let profile = state
+            .profile_store
+            .as_ref()
+            .unwrap()
+            .get("dev")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            profile
+                .config
+                .llm
+                .as_ref()
+                .unwrap()
+                .primary
+                .as_ref()
+                .unwrap()
+                .model_id
+                .as_deref(),
+            Some("deepseek-chat"),
+            "rejected select must not persist"
+        );
+
+        // Adding the key (the onboarding key step) makes the same select work.
+        raw_profile_llm_upsert(&state, &upsert("glm-5.2", Some("zk"), false), None)
+            .await
+            .expect("re-save with key");
+        let result = raw_profile_llm_select(&state, &select("s-keyed"), None)
+            .await
+            .expect("keyed select applies");
+        assert_eq!(result["applied"], true);
+        assert_eq!(result["selected"]["model"], "glm-5.2");
+        assert_eq!(
+            result.get("restart_required"),
+            None,
+            "dynamic profiles apply without a restart: {result}"
+        );
+    }
+
+    /// Key requirement mirrors the runtime factory, not just the registry
+    /// flag: an `anthropic`/`responses` api_type override needs a key even
+    /// on a registry-keyless family, and a family the registry doesn't know
+    /// can never construct — both would persist a bricked primary if the
+    /// validator waved them through (codex P1 on the keyless-select fix).
+    #[tokio::test]
+    async fn llm_select_rejects_unactivatable_api_type_and_unknown_families() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = Arc::new(local_profile_state(dir.path()));
+        let upsert = |family: &str, model: &str, route: Value| {
+            RpcRequest::new(
+                format!("u-{family}-{model}"),
+                APPUI_METHOD_PROFILE_LLM_UPSERT.to_string(),
+                json!({
+                    "profile_id": "dev",
+                    "selection": {
+                        "family_id": family,
+                        "model_id": model,
+                        "route": route,
+                    },
+                    "set_primary": false,
+                }),
+            )
+        };
+        // Keyed primary so the profile is otherwise healthy.
+        raw_profile_llm_upsert(
+            &state,
+            &RpcRequest::new(
+                "u-primary".to_string(),
+                APPUI_METHOD_PROFILE_LLM_UPSERT.to_string(),
+                json!({
+                    "profile_id": "dev",
+                    "selection": {
+                        "family_id": "deepseek",
+                        "model_id": "deepseek-chat",
+                        "route": { "route_id": "official", "api_key_env": "OCTOS_TEST_DS_KEY" },
+                    },
+                    "api_key": "dk",
+                    "set_primary": true,
+                }),
+            ),
+            None,
+        )
+        .await
+        .expect("seed keyed primary");
+
+        // Registry-keyless family, but the anthropic protocol override
+        // requires a key: keyless select must reject.
+        raw_profile_llm_upsert(
+            &state,
+            &upsert(
+                "ollama",
+                "llama3",
+                json!({
+                    "route_id": "official",
+                    "api_type": "anthropic",
+                    "api_key_env": "OCTOS_TEST_OLLAMA_ANTHROPIC_KEY",
+                }),
+            ),
+            None,
+        )
+        .await
+        .expect("seed anthropic-over-keyless fallback");
+        let error = raw_profile_llm_select(
+            &state,
+            &RpcRequest::new(
+                "s-anthropic".to_string(),
+                APPUI_METHOD_PROFILE_LLM_SELECT.to_string(),
+                json!({ "profile_id": "dev", "model_id": "llama3" }),
+            ),
+            None,
+        )
+        .await
+        .expect_err("anthropic api_type needs a key even on keyless families");
+        assert_eq!(
+            error.data.as_ref().and_then(|data| data.get("kind")),
+            Some(&json!("llm_key_missing")),
+            "got {error:?}"
+        );
+
+        // A family the registry doesn't know can never construct.
+        raw_profile_llm_upsert(
+            &state,
+            &upsert("frobnicator", "frob-1", json!({ "route_id": "official" })),
+            None,
+        )
+        .await
+        .expect("seed unknown-family fallback");
+        let error = raw_profile_llm_select(
+            &state,
+            &RpcRequest::new(
+                "s-unknown".to_string(),
+                APPUI_METHOD_PROFILE_LLM_SELECT.to_string(),
+                json!({ "profile_id": "dev", "model_id": "frob-1" }),
+            ),
+            None,
+        )
+        .await
+        .expect_err("unknown provider family must reject");
+        assert_eq!(
+            error.data.as_ref().and_then(|data| data.get("kind")),
+            Some(&json!("llm_provider_unresolved")),
+            "got {error:?}"
+        );
+
+        // …even when a protocol override AND a key are configured: the
+        // factory looks the family up before honoring api_type, so this
+        // must reject as unresolved, not slip past via the override arm
+        // (codex P1 round 2).
+        raw_profile_llm_upsert(
+            &state,
+            &RpcRequest::new(
+                "u-frob-anthropic".to_string(),
+                APPUI_METHOD_PROFILE_LLM_UPSERT.to_string(),
+                json!({
+                    "profile_id": "dev",
+                    "selection": {
+                        "family_id": "frobnicator",
+                        "model_id": "frob-2",
+                        "route": {
+                            "route_id": "official",
+                            "api_type": "anthropic",
+                            "api_key_env": "OCTOS_TEST_FROB_KEY",
+                        },
+                    },
+                    "api_key": "fk",
+                    "set_primary": false,
+                }),
+            ),
+            None,
+        )
+        .await
+        .expect("seed keyed unknown-family anthropic fallback");
+        let error = raw_profile_llm_select(
+            &state,
+            &RpcRequest::new(
+                "s-unknown-keyed".to_string(),
+                APPUI_METHOD_PROFILE_LLM_SELECT.to_string(),
+                json!({ "profile_id": "dev", "model_id": "frob-2" }),
+            ),
+            None,
+        )
+        .await
+        .expect_err("unknown family rejects even with api_type override + key");
+        assert_eq!(
+            error.data.as_ref().and_then(|data| data.get("kind")),
+            Some(&json!("llm_provider_unresolved")),
+            "got {error:?}"
+        );
+
+        // Registry-keyless family on its native protocol still selects
+        // without any key.
+        raw_profile_llm_upsert(
+            &state,
+            &upsert("ollama", "llama3-native", json!({ "route_id": "official" })),
+            None,
+        )
+        .await
+        .expect("seed native keyless fallback");
+        let result = raw_profile_llm_select(
+            &state,
+            &RpcRequest::new(
+                "s-native".to_string(),
+                APPUI_METHOD_PROFILE_LLM_SELECT.to_string(),
+                json!({ "profile_id": "dev", "model_id": "llama3-native" }),
+            ),
+            None,
+        )
+        .await
+        .expect("keyless family on its native protocol selects fine");
+        assert_eq!(result["applied"], true);
+    }
+
+    /// `profile/llm/upsert` with `set_primary` must be lossless: replacing
+    /// the primary demotes the old one to a fallback instead of dropping it
+    /// (the onboarding wizard's "Save" path — a user onboarding glm-5.2 lost
+    /// their deepseek primary and was left with a single unusable model), and
+    /// re-promoting a model that already sits in the fallback list must not
+    /// duplicate it there.
+    #[tokio::test]
+    async fn llm_upsert_set_primary_demotes_old_primary_instead_of_dropping_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = Arc::new(local_profile_state(dir.path()));
+        for (family, model) in [("deepseek", "deepseek-v4-pro"), ("zai", "glm-5.2")] {
+            let request = RpcRequest::new(
+                format!("u-{model}"),
+                APPUI_METHOD_PROFILE_LLM_UPSERT.to_string(),
+                json!({
+                    "profile_id": "dev",
+                    "selection": {
+                        "family_id": family,
+                        "model_id": model,
+                        "route": { "route_id": "official" },
+                    },
+                    "set_primary": true,
+                }),
+            );
+            raw_profile_llm_upsert(&state, &request, None)
+                .await
+                .expect("upsert");
+        }
+
+        let profile = state
+            .profile_store
+            .as_ref()
+            .unwrap()
+            .get("dev")
+            .unwrap()
+            .unwrap();
+        let llm = profile.config.llm.as_ref().unwrap();
+        assert_eq!(
+            llm.primary.as_ref().unwrap().model_id.as_deref(),
+            Some("glm-5.2")
+        );
+        assert_eq!(
+            llm.fallbacks.len(),
+            1,
+            "replaced primary must survive as a fallback: {llm:?}"
+        );
+        assert_eq!(
+            llm.fallbacks[0].model_id.as_deref(),
+            Some("deepseek-v4-pro")
+        );
+
+        // Promote the demoted model back through the same wizard path: it
+        // must leave the fallback list (no duplicate) and demote glm-5.2.
+        let request = RpcRequest::new(
+            "u-back".to_string(),
+            APPUI_METHOD_PROFILE_LLM_UPSERT.to_string(),
+            json!({
+                "profile_id": "dev",
+                "selection": {
+                    "family_id": "deepseek",
+                    "model_id": "deepseek-v4-pro",
+                    "route": { "route_id": "official" },
+                },
+                "set_primary": true,
+            }),
+        );
+        raw_profile_llm_upsert(&state, &request, None)
+            .await
+            .expect("re-promote");
+
+        let profile = state
+            .profile_store
+            .as_ref()
+            .unwrap()
+            .get("dev")
+            .unwrap()
+            .unwrap();
+        let llm = profile.config.llm.as_ref().unwrap();
+        assert_eq!(
+            llm.primary.as_ref().unwrap().model_id.as_deref(),
+            Some("deepseek-v4-pro")
+        );
+        assert_eq!(
+            llm.fallbacks
+                .iter()
+                .map(|fb| fb.model_id.as_deref())
+                .collect::<Vec<_>>(),
+            vec![Some("glm-5.2")],
+            "round-trip must neither duplicate the promoted model nor drop the demoted one"
+        );
+    }
+
+    /// A same-address upsert (same family/model/route_id — including a
+    /// missing route_id, which normalizes to the synthetic "official") is an
+    /// endpoint edit: it replaces the primary outright instead of demoting
+    /// the old endpoint into a fallback row that `profile/llm/select` can
+    /// never address (codex P2 on the lossless-save fix).
+    #[tokio::test]
+    async fn llm_upsert_endpoint_edit_replaces_instead_of_demoting() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = Arc::new(local_profile_state(dir.path()));
+        for (route, tag) in [
+            (
+                json!({ "route_id": "official", "base_url": "https://one.example" }),
+                "one",
+            ),
+            // Same address, new endpoint: must replace, not demote.
+            (
+                json!({ "route_id": "official", "base_url": "https://two.example" }),
+                "two",
+            ),
+            // Missing route_id normalizes to "official": still the same address.
+            (json!({ "base_url": "https://three.example" }), "three"),
+        ] {
+            let request = RpcRequest::new(
+                format!("u-{tag}"),
+                APPUI_METHOD_PROFILE_LLM_UPSERT.to_string(),
+                json!({
+                    "profile_id": "dev",
+                    "selection": {
+                        "family_id": "deepseek",
+                        "model_id": "deepseek-chat",
+                        "route": route,
+                    },
+                    "set_primary": true,
+                }),
+            );
+            raw_profile_llm_upsert(&state, &request, None)
+                .await
+                .expect("upsert");
+        }
+
+        let profile = state
+            .profile_store
+            .as_ref()
+            .unwrap()
+            .get("dev")
+            .unwrap()
+            .unwrap();
+        let llm = profile.config.llm.as_ref().unwrap();
+        assert_eq!(
+            llm.primary
+                .as_ref()
+                .unwrap()
+                .route
+                .as_ref()
+                .unwrap()
+                .base_url
+                .as_deref(),
+            Some("https://three.example"),
+            "the endpoint edit lands on the primary"
+        );
+        assert!(
+            llm.fallbacks.is_empty(),
+            "endpoint edits must not accrete unselectable fallback rows: {llm:?}"
+        );
+    }
+
+    /// Endpoint-distinct fallbacks (same family/model/route_id, different
+    /// base_url) are real failover-chain entries, not selector duplicates —
+    /// `config_from_profile` threads every fallback's endpoint into the
+    /// runtime. A set_primary upsert must not sweep them away (codex P2 on
+    /// the address-comparison fix); only an exact-identity duplicate of the
+    /// new primary leaves the list.
+    #[tokio::test]
+    async fn llm_upsert_preserves_endpoint_distinct_failover_fallbacks() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = Arc::new(local_profile_state(dir.path()));
+        let upsert = |base_url: &str, set_primary: bool| {
+            RpcRequest::new(
+                format!("u-{base_url}-{set_primary}"),
+                APPUI_METHOD_PROFILE_LLM_UPSERT.to_string(),
+                json!({
+                    "profile_id": "dev",
+                    "selection": {
+                        "family_id": "deepseek",
+                        "model_id": "deepseek-chat",
+                        "route": { "route_id": "official", "base_url": base_url },
+                    },
+                    "set_primary": set_primary,
+                }),
+            )
+        };
+        let llm_of = |state: &Arc<AppState>| {
+            state
+                .profile_store
+                .as_ref()
+                .unwrap()
+                .get("dev")
+                .unwrap()
+                .unwrap()
+                .config
+                .llm
+                .clone()
+                .unwrap()
+        };
+
+        // Primary at ONE, plus a same-address failover mirror at MIRROR.
+        for (url, primary) in [
+            ("https://one.example", true),
+            ("https://mirror.example", false),
+        ] {
+            raw_profile_llm_upsert(&state, &upsert(url, primary), None)
+                .await
+                .expect("seed");
+        }
+
+        // Endpoint edit of the primary: the mirror fallback must survive.
+        raw_profile_llm_upsert(&state, &upsert("https://two.example", true), None)
+            .await
+            .expect("endpoint edit");
+        let llm = llm_of(&state);
+        assert_eq!(
+            llm.primary
+                .as_ref()
+                .unwrap()
+                .route
+                .as_ref()
+                .unwrap()
+                .base_url
+                .as_deref(),
+            Some("https://two.example")
+        );
+        assert_eq!(
+            llm.fallbacks
+                .iter()
+                .map(|fb| fb.route.as_ref().unwrap().base_url.as_deref().unwrap())
+                .collect::<Vec<_>>(),
+            vec!["https://mirror.example"],
+            "endpoint-distinct failover fallback must survive a set_primary upsert"
+        );
+
+        // Promoting the exact mirror identity removes it from the fallback
+        // list (true duplicate) rather than leaving two copies.
+        raw_profile_llm_upsert(&state, &upsert("https://mirror.example", true), None)
+            .await
+            .expect("promote mirror");
+        let llm = llm_of(&state);
+        assert_eq!(
+            llm.primary
+                .as_ref()
+                .unwrap()
+                .route
+                .as_ref()
+                .unwrap()
+                .base_url
+                .as_deref(),
+            Some("https://mirror.example")
+        );
+        assert!(
+            llm.fallbacks.is_empty(),
+            "promoting the exact identity must de-dup it out of the fallbacks: {llm:?}"
+        );
+    }
+
+    /// Identity comparison normalizes a missing route_id to the synthetic
+    /// `"official"` exactly like the address comparison (codex P2 round 3):
+    /// a route_id-less fallback with the same endpoint is the SAME provider
+    /// as an `"official"` upsert — it updates in place rather than
+    /// duplicating, and de-dups out of the list when promoted to primary.
+    #[tokio::test]
+    async fn llm_upsert_normalizes_default_route_ids_when_deduping() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = Arc::new(local_profile_state(dir.path()));
+        let upsert = |route: Value, set_primary: bool, tag: &str| {
+            RpcRequest::new(
+                format!("u-{tag}"),
+                APPUI_METHOD_PROFILE_LLM_UPSERT.to_string(),
+                json!({
+                    "profile_id": "dev",
+                    "selection": {
+                        "family_id": "deepseek",
+                        "model_id": "deepseek-chat",
+                        "route": route,
+                    },
+                    "set_primary": set_primary,
+                }),
+            )
+        };
+        let llm_of = |state: &Arc<AppState>| {
+            state
+                .profile_store
+                .as_ref()
+                .unwrap()
+                .get("dev")
+                .unwrap()
+                .unwrap()
+                .config
+                .llm
+                .clone()
+                .unwrap()
+        };
+
+        let mirror = "https://mirror.example";
+        raw_profile_llm_upsert(
+            &state,
+            &upsert(
+                json!({ "route_id": "official", "base_url": "https://one.example" }),
+                true,
+                "seed-primary",
+            ),
+            None,
+        )
+        .await
+        .expect("seed primary");
+        // Fallback saved WITHOUT a route_id (legacy/default-route shape).
+        raw_profile_llm_upsert(
+            &state,
+            &upsert(json!({ "base_url": mirror }), false, "seed-fallback"),
+            None,
+        )
+        .await
+        .expect("seed route_id-less fallback");
+
+        // Re-adding the same endpoint under the synthetic "official" id must
+        // update the existing fallback in place, not append a duplicate.
+        raw_profile_llm_upsert(
+            &state,
+            &upsert(
+                json!({ "route_id": "official", "base_url": mirror }),
+                false,
+                "readd",
+            ),
+            None,
+        )
+        .await
+        .expect("re-add under official");
+        assert_eq!(
+            llm_of(&state).fallbacks.len(),
+            1,
+            "official ≡ missing route_id: same provider must update in place"
+        );
+
+        // Promoting that provider under "official" de-dups the route_id-less
+        // row out of the retry chain.
+        raw_profile_llm_upsert(
+            &state,
+            &upsert(
+                json!({ "route_id": "official", "base_url": mirror }),
+                true,
+                "promote",
+            ),
+            None,
+        )
+        .await
+        .expect("promote");
+        let llm = llm_of(&state);
+        assert_eq!(
+            llm.primary
+                .as_ref()
+                .unwrap()
+                .route
+                .as_ref()
+                .unwrap()
+                .base_url
+                .as_deref(),
+            Some(mirror)
+        );
+        assert!(
+            llm.fallbacks.is_empty(),
+            "the normalized-identity duplicate must leave the retry chain: {llm:?}"
+        );
+    }
+
+    /// A profile-scoped connection must not rewire another profile's models
+    /// (codex P1) — and an ambiguous route wildcard must reject rather than
+    /// promote an arbitrary route (codex P2).
+    #[tokio::test]
+    async fn llm_select_enforces_scope_and_route_discrimination() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = Arc::new(local_profile_state(dir.path()));
+
+        // Cross-profile mutation from a profile-scoped connection: denied.
+        let request = RpcRequest::new(
+            "sx".to_string(),
+            APPUI_METHOD_PROFILE_LLM_SELECT.to_string(),
+            json!({ "profile_id": "victim", "model_id": "deepseek-chat" }),
+        );
+        let error = raw_profile_llm_select(&state, &request, Some("attacker"))
+            .await
+            .expect_err("cross-profile select must be denied");
+        assert_eq!(
+            error.data.as_ref().and_then(|data| data.get("kind")),
+            Some(&json!("auth_scope_violation")),
+            "got {error:?}"
+        );
+
+        // Same family/model on two routes: the synthetic "official" wildcard
+        // must reject as ambiguous; an exact route selects that route.
+        for (route, set_primary) in [("autodl", true), ("proxy", false)] {
+            let request = RpcRequest::new(
+                format!("u-{route}"),
+                APPUI_METHOD_PROFILE_LLM_UPSERT.to_string(),
+                json!({
+                    "profile_id": "dev",
+                    "selection": {
+                        "family_id": "zai",
+                        "model_id": "glm-5.2",
+                        "route": { "route_id": route },
+                    },
+                    // Key present so the exact-route select below tests
+                    // route discrimination, not keyless rejection.
+                    "api_key": "test-zai-key",
+                    "set_primary": set_primary,
+                }),
+            );
+            raw_profile_llm_upsert(&state, &request, None)
+                .await
+                .expect("upsert");
+        }
+        let request = RpcRequest::new(
+            "amb".to_string(),
+            APPUI_METHOD_PROFILE_LLM_SELECT.to_string(),
+            json!({
+                "profile_id": "dev",
+                "model_id": "glm-5.2",
+                "route_id": "official",
+            }),
+        );
+        let error = raw_profile_llm_select(&state, &request, None)
+            .await
+            .expect_err("ambiguous route wildcard must reject");
+        assert!(error.message.contains("multiple routes"), "got {error:?}");
+
+        let request = RpcRequest::new(
+            "exact".to_string(),
+            APPUI_METHOD_PROFILE_LLM_SELECT.to_string(),
+            json!({
+                "profile_id": "dev",
+                "model_id": "glm-5.2",
+                "route_id": "proxy",
+            }),
+        );
+        let result = raw_profile_llm_select(&state, &request, None)
+            .await
+            .expect("exact route selects");
+        assert_eq!(result["applied"], true);
+        let profile = state
+            .profile_store
+            .as_ref()
+            .unwrap()
+            .get("dev")
+            .unwrap()
+            .unwrap();
+        let llm = profile.config.llm.as_ref().unwrap();
+        assert_eq!(
+            llm.primary
+                .as_ref()
+                .and_then(|primary| primary.route.as_ref())
+                .and_then(|route| route.route_id.as_deref()),
+            Some("proxy"),
+            "the EXACT route was promoted"
+        );
+    }
+
+    /// The onboarding catalog unions the QoS model catalog into the bundled
+    /// families — new provider releases (e.g. zai GLM updates) appear without
+    /// waiting for the hand-maintained dashboard list; families with no
+    /// onboarding metadata (key env/route) are skipped.
+    #[test]
+    fn catalog_result_unions_qos_models_into_families() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("model_catalog.json"),
+            serde_json::to_string(&json!({
+                "updated_at": "2026-07-10T00:00:00Z",
+                "models": [
+                    {
+                        "provider": "zai/glm-9.9-test",
+                        "type": "strong",
+                        "stability": 0.7,
+                        "tool_avg_ms": 1,
+                        "p95_ms": 1,
+                        "score": 0.1,
+                        "cost_in": 1.0,
+                        "cost_out": 4.0,
+                        "ds_output": 1,
+                        "context_window": 1000,
+                        "max_output": 99
+                    },
+                    {
+                        "provider": "unknownfam/mystery-1",
+                        "type": "fast",
+                        "stability": 0.5,
+                        "tool_avg_ms": 1,
+                        "p95_ms": 1,
+                        "score": 0.2,
+                        "cost_in": 0.1,
+                        "cost_out": 0.2,
+                        "ds_output": 1,
+                        "context_window": 1000,
+                        "max_output": 9
+                    }
+                ]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let state = local_profile_state(dir.path());
+
+        let catalog = raw_catalog_result(&state, None).expect("catalog");
+        let families = &catalog["families"];
+        let zai_models = families["zai"]["models"].as_array().unwrap();
+        assert!(
+            zai_models.iter().any(|model| model["id"] == "glm-9.9-test"),
+            "QoS-only zai model unioned in: {zai_models:?}"
+        );
+        assert!(
+            zai_models.iter().any(|model| model["id"] == "glm-5.2"),
+            "bundled zai lineup still present"
+        );
+        assert!(
+            families.get("unknownfam").is_none(),
+            "families without onboarding metadata are skipped"
+        );
     }
 
     fn local_profile_state_with_sessions(dir: &Path) -> Arc<AppState> {
@@ -25704,7 +28676,15 @@ mod tests {
                 "session_id": session_id,
                 "turn_id": turn_id,
             }),
-            methods::SESSION_LIST | methods::SYSTEM_STATUS_GET | methods::CONTENT_LIST => {
+            methods::SESSION_BTW => json!({
+                "session_id": session_id,
+                "question": "what are you working on?",
+            }),
+            methods::SESSION_LIST
+            | methods::SYSTEM_STATUS_GET
+            | methods::CONTENT_LIST
+            | methods::MEMORY_OVERVIEW
+            | methods::CRON_LIST => {
                 json!({})
             }
             methods::SESSION_SNAPSHOT
@@ -25718,8 +28698,14 @@ mod tests {
                 "session_id": session_id.to_string(),
                 "title": "Dispatch parity",
             }),
+            methods::SESSION_FORK => json!({
+                "session_id": session_id,
+                "new_chat_id": "probe-fork-child",
+            }),
             methods::CONTENT_DELETE => json!({ "id": "content-1" }),
             methods::CONTENT_BULK_DELETE => json!({ "ids": ["content-1"] }),
+            methods::MEMORY_ENTITY => json!({ "name": "probe-entity" }),
+            methods::CRON_TOGGLE => json!({ "job_id": "probe-job", "enabled": false }),
             methods::ROUTER_SET_MODE => json!({
                 "session_id": session_id,
                 "mode": "off",
@@ -25991,6 +28977,7 @@ mod tests {
         active_turns.lock().await.insert(
             session.clone(),
             ActiveTurn {
+                profile_id: MAIN_PROFILE_ID.to_owned(),
                 turn_id: turn_id.clone(),
                 state: Arc::new(TokioMutex::new(TurnState::Active)),
                 interrupt_tx: Arc::new(TokioMutex::new(None)),
@@ -26031,6 +29018,7 @@ mod tests {
         active_turns.lock().await.insert(
             SessionKey("local:foreign".into()),
             ActiveTurn {
+                profile_id: MAIN_PROFILE_ID.to_owned(),
                 turn_id: TurnId::new(),
                 state: Arc::new(TokioMutex::new(TurnState::Active)),
                 interrupt_tx: Arc::new(TokioMutex::new(None)),
@@ -26053,6 +29041,7 @@ mod tests {
         active_turns.lock().await.insert(
             session.clone(),
             ActiveTurn {
+                profile_id: MAIN_PROFILE_ID.to_owned(),
                 turn_id: turn_id.clone(),
                 state: Arc::new(TokioMutex::new(TurnState::Active)),
                 interrupt_tx: Arc::new(TokioMutex::new(None)),
@@ -26296,6 +29285,98 @@ mod tests {
                 .exists(),
             "AppUI prompt-context preparation should persist the canonical context ledger"
         );
+    }
+
+    /// UPCR-2026-026 follow-up: the in-loop (mid-turn) compaction pass must
+    /// emit `ContextCompactionStarted` → `ContextCompactionCompleted` through
+    /// the bridge's notify hook. It previously compacted SILENTLY — the only
+    /// emitting site (the pre-turn bridge) was then starved forever by the
+    /// persisted post-compaction snapshot, so a session whose context filled
+    /// mid-turn never showed any compaction UX.
+    #[test]
+    fn in_loop_compaction_emits_lifecycle_notifications() {
+        let session_id = SessionKey::new("api", "context-inloop-events");
+        // Enough history that the items estimate dwarfs 70% of a tiny window.
+        let history: Vec<Message> = (0..10)
+            .flat_map(|idx| {
+                vec![
+                    test_message(
+                        MessageRole::User,
+                        &format!("req {idx}: {}", "x".repeat(400)),
+                    ),
+                    test_message(
+                        MessageRole::Assistant,
+                        &format!("ans {idx}: {}", "y".repeat(400)),
+                    ),
+                ]
+            })
+            .collect();
+        let manager = Arc::new(StdMutex::new(ContextManager::from_session_history(
+            session_id.to_string(),
+            None,
+            &history,
+        )));
+        let dir = tempfile::tempdir().unwrap();
+        let captured: Arc<StdMutex<Vec<UiNotification>>> = Arc::new(StdMutex::new(Vec::new()));
+        let sink = captured.clone();
+        let bridge = AppUiPromptContextBridge::new(
+            session_id.clone(),
+            dir.path().to_path_buf(),
+            manager,
+            false,
+        )
+        .with_context_lifecycle_notify(Arc::new(move |notification| {
+            sink.lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .push(notification);
+        }));
+
+        let mut prompt = vec![test_message(MessageRole::System, "runtime system")];
+        prompt.extend(history);
+        prompt.push(test_message(MessageRole::User, "current request"));
+
+        let report = bridge
+            .prepare_prompt(
+                PromptContextRequest {
+                    phase: PromptContextPhase::TurnStart,
+                    iteration: 1,
+                    provider_name: "test".to_string(),
+                    model_id: "tiny-context".to_string(),
+                    // threshold = 70% of 300 = 210 tokens — trivially exceeded.
+                    context_window: 300,
+                },
+                &mut prompt,
+            )
+            .expect("context manager bridge should prepare prompt");
+        assert!(
+            report.compaction_performed,
+            "the tiny window must force an in-loop compaction"
+        );
+
+        let events = captured.lock().unwrap_or_else(|error| error.into_inner());
+        let started = events
+            .iter()
+            .position(|n| matches!(n, UiNotification::ContextCompactionStarted(_)))
+            .expect("in-loop compaction must emit ContextCompactionStarted");
+        let completed = events
+            .iter()
+            .position(|n| matches!(n, UiNotification::ContextCompactionCompleted(_)))
+            .expect("in-loop compaction must emit ContextCompactionCompleted");
+        assert!(
+            started < completed,
+            "started must precede completed in the emitted order"
+        );
+        let UiNotification::ContextCompactionStarted(event) = &events[started] else {
+            unreachable!()
+        };
+        assert_eq!(event.session_id, session_id);
+        assert_eq!(event.trigger, "agent_loop:turn_start");
+        assert_eq!(event.threshold_tokens, 210);
+        let UiNotification::ContextCompactionCompleted(done) = &events[completed] else {
+            unreachable!()
+        };
+        assert_eq!(done.session_id, session_id);
+        assert_eq!(done.compaction.trigger, "agent_loop:turn_start");
     }
 
     #[test]
@@ -26610,6 +29691,26 @@ mod tests {
         assert_eq!(
             invalid.data.as_ref().and_then(|data| data.get("kind")),
             Some(&json!("profile_local_invalid_username"))
+        );
+
+        // codex #1613 r5: a reserved channel-name username must be
+        // rejected BEFORE any record persists. Previously the user
+        // record was saved and only the later profile save failed,
+        // leaving a valid user with no usable profile.
+        let reserved = create_or_get_local_solo_profile(
+            &state,
+            local_profile_params("Ada Lovelace", "api", "api@example.com"),
+        )
+        .expect_err("reserved channel-name username");
+        assert_eq!(reserved.code, rpc_error_codes::INVALID_PARAMS);
+        assert_eq!(
+            reserved.data.as_ref().and_then(|data| data.get("kind")),
+            Some(&json!("profile_local_invalid_username"))
+        );
+        let users = state.user_store.as_ref().expect("user store");
+        assert!(
+            users.get("api").unwrap().is_none(),
+            "no user record may persist for a rejected reserved username"
         );
 
         let tenant_state = AppState {
@@ -28412,6 +31513,75 @@ ignore = []
     }
 
     #[tokio::test]
+    async fn raw_session_status_read_omits_model_object_when_no_model_resolved() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = Arc::new(local_profile_state(dir.path()));
+        create_or_get_local_solo_profile(
+            &state,
+            local_profile_params("Ada Lovelace", "ada", "ada@example.com"),
+        )
+        .expect("create ada profile");
+
+        let status = raw_session_status_result(
+            &state,
+            &RpcRequest::<Value>::new(
+                "status-no-model",
+                APPUI_METHOD_SESSION_STATUS_READ,
+                json!({ "session_id": "local:tui#coding" }),
+            ),
+            ConnectionUiFeatures::stdio_defaults(),
+            Some("ada"),
+        )
+        .await
+        .expect("status for a profile without a configured model");
+
+        // Guard the setup assumption: this profile really has no resolved
+        // model/provider in its runtime policy stamp.
+        assert_eq!(status["runtime_policy_stamp"]["model"], Value::Null);
+        assert_eq!(status["runtime_policy_stamp"]["provider"], Value::Null);
+        // The contract under test: no resolved model => NO `model` key at
+        // all. Emitting `{"model": null, "provider": null, "selected": true}`
+        // breaks shipped octos-tui decoders whose ModelStatus requires
+        // non-null `model`/`provider` strings — the whole
+        // session/status/read result fails to decode and the composer
+        // footer degrades to the `<server authenticated profile>`
+        // placeholder.
+        assert!(
+            status.get("model").is_none(),
+            "session/status/read must omit the model object when no model is resolved, got: {status}"
+        );
+    }
+
+    #[tokio::test]
+    async fn raw_session_status_read_includes_model_object_when_model_resolved() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, _runtime) = state_with_profile(dir.path(), "coding").await;
+
+        let status = raw_session_status_result(
+            &state,
+            &RpcRequest::<Value>::new(
+                "status-with-model",
+                APPUI_METHOD_SESSION_STATUS_READ,
+                json!({ "session_id": "local:tui#coding" }),
+            ),
+            ConnectionUiFeatures::stdio_defaults(),
+            Some("coding"),
+        )
+        .await
+        .expect("status for a profile with a configured model");
+
+        assert_eq!(
+            status["model"],
+            json!({
+                "model": "m11e-stub",
+                "provider": "stub",
+                "selected": true
+            }),
+            "a resolved model must keep emitting the full model object"
+        );
+    }
+
+    #[tokio::test]
     async fn stdio_multi_profile_open_status_reads_isolated_runtime_policy_stamps() {
         let dir = tempfile::tempdir().unwrap();
         let state = local_profile_state_with_sessions(dir.path());
@@ -28546,6 +31716,65 @@ ignore = []
         assert_eq!(frame["id"], json!("content-bulk-delete-unauth"));
         assert_eq!(frame["error"]["data"]["kind"], json!("auth_unavailable"));
 
+        handle_memory_overview(
+            &ws,
+            &state,
+            &headers,
+            None,
+            false,
+            "memory-overview-unauth".into(),
+            MemoryOverviewParams::default(),
+        )
+        .await;
+        let frame = recv_rpc_json(&mut rx).await;
+        assert_eq!(frame["id"], json!("memory-overview-unauth"));
+        assert_eq!(frame["error"]["data"]["kind"], json!("auth_unavailable"));
+
+        handle_memory_entity(
+            &ws,
+            &state,
+            &headers,
+            None,
+            false,
+            "memory-entity-unauth".into(),
+            MemoryEntityParams { name: "e-1".into() },
+        )
+        .await;
+        let frame = recv_rpc_json(&mut rx).await;
+        assert_eq!(frame["id"], json!("memory-entity-unauth"));
+        assert_eq!(frame["error"]["data"]["kind"], json!("auth_unavailable"));
+
+        handle_cron_list(
+            &ws,
+            &state,
+            &headers,
+            None,
+            false,
+            "cron-list-unauth".into(),
+            CronListParams::default(),
+        )
+        .await;
+        let frame = recv_rpc_json(&mut rx).await;
+        assert_eq!(frame["id"], json!("cron-list-unauth"));
+        assert_eq!(frame["error"]["data"]["kind"], json!("auth_unavailable"));
+
+        handle_cron_toggle(
+            &ws,
+            &state,
+            &headers,
+            None,
+            false,
+            "cron-toggle-unauth".into(),
+            CronToggleParams {
+                job_id: "job-1".into(),
+                enabled: true,
+            },
+        )
+        .await;
+        let frame = recv_rpc_json(&mut rx).await;
+        assert_eq!(frame["id"], json!("cron-toggle-unauth"));
+        assert_eq!(frame["error"]["data"]["kind"], json!("auth_unavailable"));
+
         let contracts = Arc::new(UiProtocolContractStores::default());
         let ledger = Arc::new(UiProtocolLedger::new(16));
         let active_turns: SharedActiveTurns = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
@@ -28589,6 +31818,437 @@ ignore = []
         let frame = recv_rpc_json(&mut rx).await;
         assert_eq!(frame["id"], json!("auth-logout-unauth"));
         assert_eq!(frame["error"]["data"]["kind"], json!("auth_unavailable"));
+    }
+
+    fn panel_user_profile(id: &str) -> crate::profiles::UserProfile {
+        crate::profiles::UserProfile {
+            id: id.into(),
+            name: id.into(),
+            enabled: true,
+            data_dir: None,
+            parent_id: None,
+            public_subdomain: None,
+            config: crate::profiles::ProfileConfig::default(),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        }
+    }
+
+    fn panel_cron_job(id: &str, enabled: bool) -> octos_bus::CronJob {
+        octos_bus::CronJob {
+            id: id.into(),
+            name: format!("job {id}"),
+            enabled,
+            schedule: octos_bus::CronSchedule::Every {
+                every_ms: 1_800_000,
+            },
+            payload: octos_bus::CronPayload {
+                message: "check the queue".into(),
+                deliver: false,
+                channel: Some("system".into()),
+                chat_id: None,
+            },
+            state: Default::default(),
+            created_at_ms: 1,
+            delete_after_run: false,
+            timezone: None,
+        }
+    }
+
+    /// `memory/overview`, `memory/entity`, `cron/list`, and `cron/toggle`
+    /// are thin WS wrappers over the REST panel handlers
+    /// (`memory_panel::my_memory`/`my_memory_entity`,
+    /// `cron_panel::my_cron`/`set_my_cron_enabled`). This pins the wire
+    /// shapes the wrappers rebuild (`MemoryOverviewResult` /
+    /// `MemoryEntityResult` / `CronListResult` / `CronToggleResult`) and
+    /// the typed 404s (`RESOURCE_NOT_FOUND` with the REST `reason`
+    /// forwarded as `data.detail` on the cron side).
+    #[tokio::test]
+    async fn memory_and_cron_rpc_methods_forward_rest_panel_bodies() {
+        let dir = tempfile::tempdir().unwrap();
+        let profile_store = Arc::new(crate::profiles::ProfileStore::open(dir.path()).unwrap());
+        let profile = panel_user_profile("tenant");
+        profile_store.save(&profile).unwrap();
+        let data_dir = profile_store.resolve_data_dir(&profile);
+
+        let mem = octos_memory::MemoryStore::open(&data_dir).await.unwrap();
+        mem.write_long_term("# MEMORY\n\n- remembers things\n")
+            .await
+            .unwrap();
+        mem.write_entity("fleet", "# fleet\n\nAbstract: five minis\n")
+            .await
+            .unwrap();
+
+        tokio::fs::create_dir_all(&data_dir).await.unwrap();
+        let cron_store = octos_bus::CronStore {
+            version: 1,
+            jobs: vec![panel_cron_job("job-1", false)],
+        };
+        tokio::fs::write(
+            data_dir.join("cron.json"),
+            serde_json::to_string_pretty(&cron_store).unwrap(),
+        )
+        .await
+        .unwrap();
+
+        let state = Arc::new(AppState {
+            profile_store: Some(profile_store),
+            ..AppState::empty_for_tests()
+        });
+        let headers = HeaderMap::new();
+        let identity = AuthIdentity::User {
+            id: "tenant".into(),
+            role: crate::user_store::UserRole::User,
+        };
+        let (ws, mut rx) = ws_connection_for_test(16);
+
+        // memory/overview — REST body forwarded whole under `overview`.
+        handle_memory_overview(
+            &ws,
+            &state,
+            &headers,
+            Some(&identity),
+            true,
+            "mem-overview".into(),
+            MemoryOverviewParams::default(),
+        )
+        .await;
+        let frame = recv_rpc_json(&mut rx).await;
+        assert_eq!(frame["id"], json!("mem-overview"));
+        let overview = &frame["result"]["overview"];
+        assert_eq!(overview["ok"], json!(true));
+        assert!(
+            overview["long_term"]
+                .as_str()
+                .unwrap()
+                .contains("remembers things")
+        );
+        assert_eq!(overview["entities"][0]["name"], json!("fleet"));
+        // Truncation metadata is ALWAYS present (false/full when whole).
+        assert_eq!(overview["long_term_truncated"], json!(false));
+        assert_eq!(overview["today_truncated"], json!(false));
+
+        // memory/entity — `{ name, content }`, no `ok` flag.
+        handle_memory_entity(
+            &ws,
+            &state,
+            &headers,
+            Some(&identity),
+            true,
+            "mem-entity".into(),
+            MemoryEntityParams {
+                name: "fleet".into(),
+            },
+        )
+        .await;
+        let frame = recv_rpc_json(&mut rx).await;
+        assert_eq!(frame["id"], json!("mem-entity"));
+        assert_eq!(frame["result"]["name"], json!("fleet"));
+        let content = frame["result"]["content"].as_str().unwrap();
+        assert!(content.contains("five minis"));
+        // Truncation metadata is ALWAYS present (false/full when whole).
+        assert_eq!(frame["result"]["content_truncated"], json!(false));
+        assert_eq!(frame["result"]["content_total_bytes"], json!(content.len()));
+        assert!(frame["result"].get("ok").is_none());
+
+        // memory/entity miss — typed RESOURCE_NOT_FOUND with the page
+        // name in `identifier`, not UNKNOWN_SESSION.
+        handle_memory_entity(
+            &ws,
+            &state,
+            &headers,
+            Some(&identity),
+            true,
+            "mem-entity-miss".into(),
+            MemoryEntityParams {
+                name: "missing".into(),
+            },
+        )
+        .await;
+        let frame = recv_rpc_json(&mut rx).await;
+        assert_eq!(frame["id"], json!("mem-entity-miss"));
+        assert_eq!(frame["error"]["data"]["kind"], json!("not_found"));
+        assert_eq!(
+            frame["error"]["data"]["resource_type"],
+            json!("memory_entity")
+        );
+        assert_eq!(frame["error"]["data"]["identifier"], json!("missing"));
+        assert_eq!(frame["error"]["data"]["rest_status"], json!(404));
+
+        // cron/list — `{ jobs, count, gateway_running }`, no `ok` flag.
+        handle_cron_list(
+            &ws,
+            &state,
+            &headers,
+            Some(&identity),
+            true,
+            "cron-list".into(),
+            CronListParams::default(),
+        )
+        .await;
+        let frame = recv_rpc_json(&mut rx).await;
+        assert_eq!(frame["id"], json!("cron-list"));
+        assert_eq!(frame["result"]["count"], json!(1));
+        assert_eq!(frame["result"]["gateway_running"], json!(false));
+        assert_eq!(frame["result"]["jobs"][0]["id"], json!("job-1"));
+        assert_eq!(frame["result"]["jobs"][0]["enabled"], json!(false));
+        assert!(frame["result"].get("ok").is_none());
+
+        // cron/toggle — updated job forwarded under `job`.
+        handle_cron_toggle(
+            &ws,
+            &state,
+            &headers,
+            Some(&identity),
+            true,
+            "cron-toggle".into(),
+            CronToggleParams {
+                job_id: "job-1".into(),
+                enabled: true,
+            },
+        )
+        .await;
+        let frame = recv_rpc_json(&mut rx).await;
+        assert_eq!(frame["id"], json!("cron-toggle"));
+        assert_eq!(frame["result"]["job"]["id"], json!("job-1"));
+        assert_eq!(frame["result"]["job"]["enabled"], json!(true));
+
+        // cron/toggle miss — the REST `{ ok: false, reason }` body's
+        // reason is forwarded as `data.detail` so clients can branch on
+        // refusal kinds (`job_not_found` here, `gateway_running` when a
+        // spawned gateway owns the store) without parsing messages.
+        handle_cron_toggle(
+            &ws,
+            &state,
+            &headers,
+            Some(&identity),
+            true,
+            "cron-toggle-miss".into(),
+            CronToggleParams {
+                job_id: "nope".into(),
+                enabled: true,
+            },
+        )
+        .await;
+        let frame = recv_rpc_json(&mut rx).await;
+        assert_eq!(frame["id"], json!("cron-toggle-miss"));
+        assert_eq!(frame["error"]["data"]["kind"], json!("not_found"));
+        assert_eq!(frame["error"]["data"]["resource_type"], json!("cron_job"));
+        assert_eq!(frame["error"]["data"]["identifier"], json!("nope"));
+        assert_eq!(frame["error"]["data"]["rest_status"], json!(404));
+        assert_eq!(frame["error"]["data"]["detail"], json!("job_not_found"));
+    }
+
+    /// codex #1621 r1 P1: a memory file the panel legitimately serves
+    /// (≤ 2 MiB) can exceed the ~1 MiB WS frame cap; without a
+    /// handler-level budget the outbound framing guard would splice a
+    /// head+tail preview INTO the markdown while the envelope still
+    /// reports success. The RPC layer instead caps each document field
+    /// to a per-field budget and DECLARES it: clean UTF-8 prefix +
+    /// `<field>_truncated` / `<field>_total_bytes`.
+    #[tokio::test]
+    async fn memory_rpc_methods_declare_truncation_when_over_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let profile_store = Arc::new(crate::profiles::ProfileStore::open(dir.path()).unwrap());
+        let profile = panel_user_profile("tenant");
+        profile_store.save(&profile).unwrap();
+        let data_dir = profile_store.resolve_data_dir(&profile);
+
+        let long_term = format!(
+            "# MEMORY\n{}",
+            "m".repeat(MEMORY_RPC_LONG_TERM_BUDGET + 4096)
+        );
+        let entity_page = format!(
+            "# whale\n{}",
+            "e".repeat(MEMORY_RPC_ENTITY_CONTENT_BUDGET + 4096)
+        );
+        let mem = octos_memory::MemoryStore::open(&data_dir).await.unwrap();
+        mem.write_long_term(&long_term).await.unwrap();
+        mem.write_entity("whale", &entity_page).await.unwrap();
+
+        let state = Arc::new(AppState {
+            profile_store: Some(profile_store),
+            ..AppState::empty_for_tests()
+        });
+        let headers = HeaderMap::new();
+        let identity = AuthIdentity::User {
+            id: "tenant".into(),
+            role: crate::user_store::UserRole::User,
+        };
+        let (ws, mut rx) = ws_connection_for_test(16);
+
+        handle_memory_overview(
+            &ws,
+            &state,
+            &headers,
+            Some(&identity),
+            true,
+            "mem-overview-cap".into(),
+            MemoryOverviewParams::default(),
+        )
+        .await;
+        let frame = recv_rpc_json(&mut rx).await;
+        let overview = &frame["result"]["overview"];
+        let served = overview["long_term"].as_str().unwrap();
+        // Budgets are ESCAPED-byte budgets: the raw cut lands within
+        // the budget and the SERIALIZED field provably fits it.
+        assert!(served.len() <= MEMORY_RPC_LONG_TERM_BUDGET);
+        assert!(served.len() > MEMORY_RPC_LONG_TERM_BUDGET - 8);
+        let wire = serde_json::to_string(served).expect("serialize");
+        assert!(wire.len() - 2 <= MEMORY_RPC_LONG_TERM_BUDGET);
+        assert_eq!(overview["long_term_truncated"], json!(true));
+        assert_eq!(
+            overview["long_term_total_bytes"],
+            json!(long_term.len()),
+            "total reports the FULL pre-cap size",
+        );
+        // Clean prefix — the cap never splices a marker into content.
+        assert_eq!(served, &long_term[..served.len()]);
+        assert_eq!(overview["today_truncated"], json!(false));
+
+        handle_memory_entity(
+            &ws,
+            &state,
+            &headers,
+            Some(&identity),
+            true,
+            "mem-entity-cap".into(),
+            MemoryEntityParams {
+                name: "whale".into(),
+            },
+        )
+        .await;
+        let frame = recv_rpc_json(&mut rx).await;
+        let served = frame["result"]["content"].as_str().unwrap();
+        assert!(served.len() <= MEMORY_RPC_ENTITY_CONTENT_BUDGET);
+        assert!(served.len() > MEMORY_RPC_ENTITY_CONTENT_BUDGET - 8);
+        let wire = serde_json::to_string(served).expect("serialize");
+        assert!(wire.len() - 2 <= MEMORY_RPC_ENTITY_CONTENT_BUDGET);
+        assert_eq!(frame["result"]["content_truncated"], json!(true));
+        assert_eq!(
+            frame["result"]["content_total_bytes"],
+            json!(entity_page.len())
+        );
+        assert_eq!(served, &entity_page[..served.len()]);
+    }
+
+    /// The budget helper must cut on a UTF-8 char boundary (a capped
+    /// multibyte document ends short of the budget rather than mid
+    /// codepoint) and must no-op on absent / non-string fields.
+    #[test]
+    fn cap_memory_value_field_is_utf8_safe_and_typed() {
+        // 3-byte codepoints; budget of 8 lands mid-codepoint → cut at 6.
+        let mut obj = json!({ "content": "€€€" });
+        cap_memory_value_field(&mut obj, "content", 8);
+        assert_eq!(obj["content"], json!("€€"));
+        assert_eq!(obj["content_truncated"], json!(true));
+        assert_eq!(obj["content_total_bytes"], json!(9));
+
+        // Under budget: flags present, false/full.
+        let mut obj = json!({ "content": "abc" });
+        cap_memory_value_field(&mut obj, "content", 8);
+        assert_eq!(obj["content"], json!("abc"));
+        assert_eq!(obj["content_truncated"], json!(false));
+        assert_eq!(obj["content_total_bytes"], json!(3));
+
+        // Absent / non-string fields: untouched, no flags invented.
+        let mut obj = json!({ "count": 7 });
+        cap_memory_value_field(&mut obj, "content", 8);
+        assert_eq!(obj, json!({ "count": 7 }));
+        cap_memory_value_field(&mut obj, "count", 8);
+        assert_eq!(obj, json!({ "count": 7 }));
+    }
+
+    /// Budget arithmetic guard: budgets are ESCAPED-byte budgets (codex
+    /// r2 P1 — C0 controls cost 6 wire bytes each, so raw-byte caps
+    /// under-count), which makes the worst-case wire size the PLAIN sum
+    /// of the budgets plus the bounded entities and envelope. That sum
+    /// must clear the frame cap — otherwise the framing guard's silent
+    /// preview becomes reachable again.
+    #[test]
+    fn memory_rpc_budgets_fit_one_ws_frame_at_escape_worst_case() {
+        // Entities bound (escaped): MAX_PANEL_ENTITIES × (100-raw-byte
+        // summary → ≤ 600 escaped + 255-raw-byte name → ≤ 1530 escaped
+        // (codex r3 P3: Unix filenames may carry non-short C0 controls,
+        // which serialize at 6 bytes per char — not just the 2-byte
+        // quote/backslash class) + ~40 bytes JSON overhead).
+        let entities_bound = 256 * (600 + 255 * 6 + 40);
+        let overview_escaped = MEMORY_RPC_LONG_TERM_BUDGET
+            + MEMORY_RPC_TODAY_BUDGET
+            + 7 * MEMORY_RPC_RECENT_NOTE_BUDGET
+            + entities_bound;
+        let envelope_overhead = 4 * 1024;
+        assert!(
+            overview_escaped + envelope_overhead < MAX_TEXT_FRAME_BYTES,
+            "overview budgets ({overview_escaped} escaped) must fit the {MAX_TEXT_FRAME_BYTES}-byte frame",
+        );
+        assert!(
+            MEMORY_RPC_ENTITY_CONTENT_BUDGET + envelope_overhead < MAX_TEXT_FRAME_BYTES,
+            "entity budget must fit the frame",
+        );
+    }
+
+    /// codex #1621 r2 P1 regression: C0 control bytes cost SIX wire
+    /// bytes each (`\u0001`), so the cap must count escaped length —
+    /// a control-heavy document must be cut to budget/6 raw bytes and
+    /// the SERIALIZED field must stay within budget.
+    #[test]
+    fn cap_memory_value_field_counts_six_byte_control_escapes() {
+        let raw = "\u{0001}".repeat(1000); // 6000 escaped bytes
+        let mut obj = json!({ "content": raw });
+        cap_memory_value_field(&mut obj, "content", 600);
+        let served = obj["content"].as_str().unwrap();
+        assert_eq!(served.chars().count(), 100, "600 budget / 6 per control");
+        assert_eq!(obj["content_truncated"], json!(true));
+        assert_eq!(obj["content_total_bytes"], json!(1000));
+        // The PROOF: the serialized field fits the escaped budget.
+        let wire = serde_json::to_string(&obj["content"]).expect("serialize");
+        assert!(
+            wire.len() <= 600 + 2, // + surrounding quotes
+            "serialized capped field ({} bytes) must fit the escaped budget",
+            wire.len(),
+        );
+
+        // Quotes/backslashes cost 2; multibyte costs its UTF-8 length.
+        let mut obj = json!({ "content": "\"\\€x" }); // 2+2+3+1 = 8 escaped
+        cap_memory_value_field(&mut obj, "content", 7);
+        assert_eq!(obj["content"], json!("\"\\€"));
+        assert_eq!(obj["content_truncated"], json!(true));
+    }
+
+    /// WS-transport auth expiry: the close-code 1008 frame must precede
+    /// the error envelope (codex BLOCK 2026-05-13 — the close is the
+    /// load-bearing signal for the SPA `crew:auth_expired` listener and
+    /// must survive writer backpressure). Representative check on
+    /// `memory/overview`; all four panel wrappers share the shape.
+    #[tokio::test]
+    async fn memory_overview_ws_auth_expiry_closes_1008_before_error() {
+        let state = Arc::new(AppState::empty_for_tests());
+        let headers = HeaderMap::new();
+        let (ws, mut rx) = ws_connection_for_test(16);
+
+        handle_memory_overview(
+            &ws,
+            &state,
+            &headers,
+            None,
+            true,
+            "mem-overview-expired".into(),
+            MemoryOverviewParams::default(),
+        )
+        .await;
+
+        let first = rx.recv().await.expect("close frame");
+        match first {
+            axum::extract::ws::Message::Close(Some(frame)) => {
+                assert_eq!(frame.code, 1008);
+                assert_eq!(frame.reason.as_str(), "auth_expired");
+            }
+            other => panic!("expected close frame with 1008, got {other:?}"),
+        }
+        let second = recv_rpc_json(&mut rx).await;
+        assert_eq!(second["id"], json!("mem-overview-expired"));
+        assert_eq!(second["error"]["data"]["kind"], json!("auth_unavailable"));
     }
 
     #[tokio::test]
@@ -30141,6 +33801,93 @@ ignore = []
         assert_eq!(stamp["network"], json!("allowed"));
     }
 
+    /// The stamp's model/provider must reflect the runtime that will SERVE
+    /// the next turn, mirroring `resolve_session_profile_runtime`: a profile
+    /// pinned in startup-config `state.profiles` keeps its boot snapshot
+    /// (immutable until restart — reporting the file would falsely claim a
+    /// select took effect), while a store-backed profile re-bootstraps from
+    /// the FILE after select evicts — the old unconditional runtime-first
+    /// order made every status/read stomp a freshly-applied selection back.
+    #[tokio::test]
+    async fn runtime_policy_stamp_reports_the_runtime_that_serves_turns() {
+        use crate::profiles::{
+            LlmModelSelectionConfig, LlmProfileConfig, LlmRouteConfig, ProfileConfig, UserProfile,
+        };
+        use chrono::Utc;
+
+        let make_profile = |model: &str, family: &str| UserProfile {
+            id: "dev".to_string(),
+            name: "Dev".to_string(),
+            enabled: true,
+            data_dir: None,
+            parent_id: None,
+            public_subdomain: None,
+            config: ProfileConfig {
+                llm: Some(LlmProfileConfig {
+                    primary: Some(LlmModelSelectionConfig {
+                        family_id: Some(family.to_string()),
+                        model_id: Some(model.to_string()),
+                        route: Some(LlmRouteConfig {
+                            route_id: None,
+                            label: None,
+                            base_url: None,
+                            api_key_env: Some("STAMP_TEST_KEY".to_string()),
+                            api_type: None,
+                        }),
+                        ..Default::default()
+                    }),
+                    fallbacks: Vec::new(),
+                }),
+                env_vars: [("STAMP_TEST_KEY".to_string(), "test-key".to_string())]
+                    .into_iter()
+                    .collect(),
+                ..Default::default()
+            },
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+
+        // Boot-time runtime pinned to gpt-4o-mini…
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let boot_profile = make_profile("gpt-4o-mini", "openai");
+        let runtime = crate::runtime::ProfileRuntime::bootstrap(
+            &boot_profile,
+            &data_dir,
+            None,
+            crate::runtime::BootstrapRole::Serve,
+        )
+        .await
+        .expect("bootstrap boot-time runtime");
+        let mut state = AppState::empty_for_tests();
+        state.profiles.insert("dev".to_string(), runtime);
+
+        // …and the profile FILE has since been switched to deepseek-chat.
+        // A PINNED profile keeps serving the boot runtime until restart, so
+        // the stamp must keep reporting the snapshot, not the file.
+        let file_profile = make_profile("deepseek-chat", "deepseek");
+        let stamp = runtime_policy_stamp_for_profile(&state, "dev", None, Some(&file_profile));
+        assert_eq!(
+            stamp["model"],
+            json!("gpt-4o-mini"),
+            "startup-pinned profiles serve the boot snapshot until restart: {stamp}"
+        );
+        assert_eq!(stamp["provider"], json!("openai"));
+
+        // A store-backed (dynamic) profile re-bootstraps from the file after
+        // `profile/llm/select` evicts — the FILE is what serves next.
+        let dynamic_state = AppState::empty_for_tests();
+        let stamp =
+            runtime_policy_stamp_for_profile(&dynamic_state, "dev", None, Some(&file_profile));
+        assert_eq!(
+            stamp["model"],
+            json!("deepseek-chat"),
+            "dynamic profiles serve the file's primary: {stamp}"
+        );
+        assert_eq!(stamp["provider"], json!("deepseek"));
+    }
+
     #[test]
     fn parses_turn_start_rpc_request() {
         let request = UiCommand::TurnStart(TurnStartParams {
@@ -31278,6 +35025,7 @@ ignore = []
                 spawn_complete: false,
                 file_attached: false,
                 voice_audio: false,
+                plan_todos: false,
                 projection_envelope: false,
                 auxiliary_rest_to_ws_v1: false,
                 coding_autonomy_v1: false,
@@ -31344,6 +35092,7 @@ ignore = []
                 spawn_complete: false,
                 file_attached: false,
                 voice_audio: false,
+                plan_todos: false,
                 projection_envelope: false,
                 auxiliary_rest_to_ws_v1: false,
                 coding_autonomy_v1: false,
@@ -31455,6 +35204,7 @@ ignore = []
                 spawn_complete: false,
                 file_attached: false,
                 voice_audio: false,
+                plan_todos: false,
                 projection_envelope: false,
                 auxiliary_rest_to_ws_v1: false,
                 coding_autonomy_v1: false,
@@ -31521,6 +35271,7 @@ ignore = []
                 spawn_complete: false,
                 file_attached: false,
                 voice_audio: false,
+                plan_todos: false,
                 projection_envelope: false,
                 auxiliary_rest_to_ws_v1: false,
                 coding_autonomy_v1: false,
@@ -31580,6 +35331,7 @@ ignore = []
                 spawn_complete: false,
                 file_attached: false,
                 voice_audio: false,
+                plan_todos: false,
                 projection_envelope: false,
                 auxiliary_rest_to_ws_v1: false,
                 coding_autonomy_v1: false,
@@ -31682,6 +35434,7 @@ ignore = []
                 spawn_complete: false,
                 file_attached: false,
                 voice_audio: false,
+                plan_todos: false,
                 projection_envelope: false,
                 auxiliary_rest_to_ws_v1: false,
                 coding_autonomy_v1: false,
@@ -33186,6 +36939,7 @@ ignore = []
         let (tx, _rx) = mpsc::channel::<()>(1);
         ActiveTurn {
             turn_id,
+            profile_id: MAIN_PROFILE_ID.to_owned(),
             state: Arc::new(TokioMutex::new(TurnState::Active)),
             interrupt_tx: Arc::new(TokioMutex::new(Some(tx))),
             abort,
@@ -33600,6 +37354,33 @@ ignore = []
         );
     }
 
+    #[test]
+    fn plan_updated_gated_by_plan_todos_capability() {
+        use octos_core::ui_protocol::{PlanUpdatedEvent, UiPlanRecord};
+        let event =
+            UiProtocolLedgerEvent::Notification(UiNotification::PlanUpdated(PlanUpdatedEvent {
+                session_id: SessionKey("local:test".into()),
+                topic: None,
+                turn_id: None,
+                plan: UiPlanRecord {
+                    items: Vec::new(),
+                    title: None,
+                    updated_at_ms: 0,
+                },
+            }));
+        // A connection that did not negotiate plan.todos.v1 never receives it —
+        // on the live broadcast OR reconnect replay (both call this filter).
+        assert!(!live_event_passes_capability_filter(
+            &event,
+            ConnectionUiFeatures::default()
+        ));
+        let negotiated = ConnectionUiFeatures {
+            plan_todos: true,
+            ..Default::default()
+        };
+        assert!(live_event_passes_capability_filter(&event, negotiated));
+    }
+
     #[tokio::test]
     async fn session_open_does_not_duplicate_pending_question_already_in_cursor_replay() {
         // #3: a question already carried by the cursor replay window must not
@@ -33928,6 +37709,7 @@ ignore = []
                 spawn_complete: false,
                 file_attached: false,
                 voice_audio: false,
+                plan_todos: false,
                 projection_envelope: false,
                 auxiliary_rest_to_ws_v1: false,
                 coding_autonomy_v1: false,
@@ -35730,6 +39512,511 @@ ignore = []
     }
 
     #[test]
+    fn session_ingress_scope_accepts_session_btw_for_matching_session() {
+        let allowed = SessionKey("dspfac:local:tui#coding".into());
+        let command = UiCommand::SessionBtw(SessionBtwParams {
+            session_id: SessionKey("dspfac:local:tui".into()),
+            topic: Some("coding".into()),
+            question: "what are you working on".into(),
+        });
+        validate_session_ingress_command_scope(&command, &allowed).expect("scope matches");
+
+        let mismatched = UiCommand::SessionBtw(SessionBtwParams {
+            session_id: SessionKey("other:local:tui".into()),
+            topic: None,
+            question: "what are you working on".into(),
+        });
+        assert!(validate_session_ingress_command_scope(&mismatched, &allowed).is_err());
+    }
+
+    #[test]
+    fn advertised_capabilities_include_session_btw() {
+        let state = AppState::empty_for_tests();
+        let capabilities = ConnectionUiFeatures::default().advertised_capabilities(&state);
+        assert!(
+            capabilities
+                .supported_methods
+                .iter()
+                .any(|method| method == octos_core::ui_protocol::methods::SESSION_BTW),
+            "session/btw must be advertised so clients can gate /btw; got {:?}",
+            capabilities.supported_methods
+        );
+    }
+
+    #[test]
+    fn build_btw_messages_shapes_prompt_without_tools() {
+        let now = Utc::now();
+        let mk = |role: MessageRole, content: &str| Message {
+            role,
+            content: content.into(),
+            media: vec![],
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+            client_message_id: None,
+            thread_id: None,
+            timestamp: now,
+        };
+        let transcript = vec![
+            mk(MessageRole::User, "please refactor the parser"),
+            mk(MessageRole::Assistant, ""),
+            mk(MessageRole::Assistant, "starting on it"),
+        ];
+        let activity = vec!["tool `shell` running".to_owned()];
+        let messages = build_btw_messages(
+            &transcript,
+            &activity,
+            "…drafting the cwnd table",
+            "btw what are you working on?",
+        );
+
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].role, MessageRole::System);
+        assert!(
+            messages[0].content.contains("NO tools"),
+            "system prompt must state the no-tools restriction"
+        );
+        let prompt = &messages[1].content;
+        assert!(prompt.contains("please refactor the parser"));
+        assert!(prompt.contains("starting on it"));
+        assert!(
+            !prompt.contains("assistant: \n"),
+            "empty-content messages are skipped"
+        );
+        assert!(prompt.contains("- tool `shell` running"));
+        assert!(
+            prompt.contains("…drafting the cwnd table"),
+            "the in-flight draft tail must reach the provider; got {prompt}"
+        );
+        assert!(prompt.contains("btw what are you working on?"));
+    }
+
+    #[tokio::test]
+    async fn session_btw_rejects_empty_question() {
+        let state = Arc::new(AppState::empty_for_tests());
+        let ledger = event_ledger(&state).await;
+        let (ws, mut rx) = ws_connection_for_test(4);
+
+        handle_session_btw(
+            &ws,
+            &state,
+            &ledger,
+            &active_turns_registry(),
+            None,
+            None,
+            "b1".into(),
+            SessionBtwParams {
+                session_id: SessionKey("local:btw-empty".into()),
+                topic: None,
+                question: "   ".into(),
+            },
+        )
+        .await;
+
+        let frame = recv_rpc_json(&mut rx).await;
+        assert_eq!(frame["id"], "b1");
+        assert!(
+            frame["error"]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("non-empty question")),
+            "got {frame}"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_btw_rejects_unknown_session() {
+        let known = SessionKey("local:btw-known".into());
+        let state = prg_state_with_session(&known, prg_seed_user_assistant);
+        let ledger = event_ledger(&state).await;
+        let (ws, mut rx) = ws_connection_for_test(4);
+
+        handle_session_btw(
+            &ws,
+            &state,
+            &ledger,
+            &active_turns_registry(),
+            None,
+            None,
+            "b2".into(),
+            SessionBtwParams {
+                session_id: SessionKey("local:btw-unknown".into()),
+                topic: None,
+                question: "what are you working on?".into(),
+            },
+        )
+        .await;
+
+        let frame = recv_rpc_json(&mut rx).await;
+        assert_eq!(frame["id"], "b2");
+        assert_eq!(frame["error"]["data"]["session_id"], "local:btw-unknown");
+    }
+
+    #[tokio::test]
+    async fn session_btw_rejects_second_aside_while_first_in_flight() {
+        let session_id = SessionKey("local:btw-busy".into());
+        let state = prg_state_with_session(&session_id, prg_seed_user_assistant);
+        let ledger = event_ledger(&state).await;
+        let (ws, mut rx) = ws_connection_for_test(4);
+
+        btw_in_flight_sessions()
+            .lock()
+            .expect("in-flight registry")
+            .insert((MAIN_PROFILE_ID.to_owned(), session_id.clone()));
+
+        handle_session_btw(
+            &ws,
+            &state,
+            &ledger,
+            &active_turns_registry(),
+            None,
+            None,
+            "b3".into(),
+            SessionBtwParams {
+                session_id: session_id.clone(),
+                topic: None,
+                question: "still there?".into(),
+            },
+        )
+        .await;
+
+        btw_in_flight_sessions()
+            .lock()
+            .expect("in-flight registry")
+            .remove(&(MAIN_PROFILE_ID.to_owned(), session_id.clone()));
+
+        let frame = recv_rpc_json(&mut rx).await;
+        assert_eq!(frame["id"], "b3");
+        assert_eq!(frame["error"]["data"]["kind"], "btw_busy");
+    }
+
+    #[tokio::test]
+    async fn session_btw_answers_via_provider_with_no_tools() {
+        struct BtwStubProvider;
+        #[async_trait::async_trait]
+        impl octos_llm::LlmProvider for BtwStubProvider {
+            async fn chat(
+                &self,
+                messages: &[octos_core::Message],
+                tools: &[octos_llm::ToolSpec],
+                config: &octos_llm::ChatConfig,
+            ) -> eyre::Result<octos_llm::ChatResponse> {
+                assert!(tools.is_empty(), "btw aside must offer NO tools");
+                assert!(
+                    matches!(config.tool_choice, octos_llm::ToolChoice::None),
+                    "btw aside must force tool_choice=None"
+                );
+                let prompt = &messages.last().expect("user prompt").content;
+                assert!(
+                    prompt.contains("what are you working on"),
+                    "question must reach the provider; got {prompt}"
+                );
+                assert!(
+                    prompt.contains("hello"),
+                    "transcript tail must reach the provider; got {prompt}"
+                );
+                Ok(octos_llm::ChatResponse {
+                    content: Some("Refactoring the parser; tests are running.".into()),
+                    reasoning_content: None,
+                    tool_calls: vec![],
+                    stop_reason: octos_llm::StopReason::EndTurn,
+                    usage: octos_llm::TokenUsage::default(),
+                    provider_index: None,
+                })
+            }
+            fn model_id(&self) -> &str {
+                "btw-stub-model"
+            }
+            fn provider_name(&self) -> &str {
+                "stub"
+            }
+        }
+
+        let session_id = SessionKey("local:btw-happy".into());
+        let state = prg_state_with_session(&session_id, prg_seed_user_assistant);
+        let ledger = event_ledger(&state).await;
+        let (ws, mut rx) = ws_connection_for_test(4);
+
+        let _serial = btw_test_slot_serial().lock().await;
+        *btw_test_provider_slot().lock().expect("slot") = Some(Arc::new(BtwStubProvider));
+        handle_session_btw(
+            &ws,
+            &state,
+            &ledger,
+            &active_turns_registry(),
+            None,
+            None,
+            "b4".into(),
+            SessionBtwParams {
+                session_id: session_id.clone(),
+                topic: None,
+                question: "btw, what are you working on?".into(),
+            },
+        )
+        .await;
+
+        // The aside runs detached — only clear the provider slot once the
+        // result frame proves the spawned task has consumed it.
+        let frame = recv_rpc_json(&mut rx).await;
+        *btw_test_provider_slot().lock().expect("slot") = None;
+        assert_eq!(frame["id"], "b4", "got {frame}");
+        assert_eq!(
+            frame["result"]["answer"],
+            "Refactoring the parser; tests are running."
+        );
+        assert_eq!(frame["result"]["model"], "btw-stub-model");
+        assert_eq!(frame["result"]["session_id"], session_id.to_string());
+        // The aside runs detached; give its guard drop a beat before asserting.
+        let busy_key = (MAIN_PROFILE_ID.to_owned(), session_id.clone());
+        for _ in 0..100 {
+            if !btw_in_flight_sessions()
+                .lock()
+                .expect("in-flight registry")
+                .contains(&busy_key)
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !btw_in_flight_sessions()
+                .lock()
+                .expect("in-flight registry")
+                .contains(&busy_key),
+            "the in-flight slot must be released after the answer"
+        );
+    }
+
+    #[test]
+    fn btw_live_draft_is_turn_scoped() {
+        let session_a = SessionKey("local:btw-draft-a".into());
+        let session_b = SessionKey("local:btw-draft-b".into());
+        let turn_a = TurnId::new();
+        let turn_b = TurnId::new();
+        btw_live_draft_append(&session_a, &turn_a, "alpha stream");
+        btw_live_draft_append(&session_b, &turn_b, "beta stream");
+
+        // (session, turn) keying: streams can never mix, and a reused turn id
+        // starts clean after its admission-time clear.
+        assert_eq!(btw_live_draft_tail(&session_a, &turn_a), "alpha stream");
+        assert_eq!(btw_live_draft_tail(&session_b, &turn_b), "beta stream");
+        btw_live_draft_clear(&session_a, &turn_a);
+        assert_eq!(btw_live_draft_tail(&session_a, &turn_a), "");
+        assert_eq!(btw_live_draft_tail(&session_b, &turn_b), "beta stream");
+    }
+
+    /// The aside reads the live draft ONLY through the registry's CURRENT
+    /// NON-TERMINAL turn — a finished turn's entry is retained for idempotent
+    /// interrupts, and its leftover tail must not masquerade as in-flight.
+    #[tokio::test]
+    async fn session_btw_reads_draft_only_for_a_non_terminal_turn() {
+        struct DraftProbeProvider;
+        #[async_trait::async_trait]
+        impl octos_llm::LlmProvider for DraftProbeProvider {
+            async fn chat(
+                &self,
+                messages: &[octos_core::Message],
+                _tools: &[octos_llm::ToolSpec],
+                _config: &octos_llm::ChatConfig,
+            ) -> eyre::Result<octos_llm::ChatResponse> {
+                let prompt = messages.last().expect("prompt").content.clone();
+                Ok(octos_llm::ChatResponse {
+                    content: Some(if prompt.contains("PAXOS-DRAFT-TAIL") {
+                        "saw-draft".into()
+                    } else {
+                        "no-draft".into()
+                    }),
+                    reasoning_content: None,
+                    tool_calls: vec![],
+                    stop_reason: octos_llm::StopReason::EndTurn,
+                    usage: octos_llm::TokenUsage::default(),
+                    provider_index: None,
+                })
+            }
+            fn model_id(&self) -> &str {
+                "draft-probe"
+            }
+            fn provider_name(&self) -> &str {
+                "stub"
+            }
+        }
+
+        let session_id = SessionKey("local:btw-draftgate".into());
+        let state = prg_state_with_session(&session_id, prg_seed_user_assistant);
+        let ledger = event_ledger(&state).await;
+        let turn_id = TurnId::new();
+        btw_live_draft_append(&session_id, &turn_id, "PAXOS-DRAFT-TAIL");
+
+        let _serial = btw_test_slot_serial().lock().await;
+        *btw_test_provider_slot().lock().expect("slot") = Some(Arc::new(DraftProbeProvider));
+
+        // The registry retains the turn as TERMINAL → the leftover draft must
+        // NOT reach the provider.
+        let abort = tokio::spawn(async {}).abort_handle();
+        active_turns_registry().lock().await.insert(
+            session_id.clone(),
+            ActiveTurn {
+                profile_id: MAIN_PROFILE_ID.to_owned(),
+                turn_id: turn_id.clone(),
+                state: Arc::new(TokioMutex::new(TurnState::Terminal(
+                    TerminalReason::Completed,
+                ))),
+                interrupt_tx: Arc::new(TokioMutex::new(None)),
+                abort,
+            },
+        );
+        let (ws, mut rx) = ws_connection_for_test(4);
+        handle_session_btw(
+            &ws,
+            &state,
+            &ledger,
+            &active_turns_registry(),
+            None,
+            None,
+            "b6".into(),
+            SessionBtwParams {
+                session_id: session_id.clone(),
+                topic: None,
+                question: "what are you drafting?".into(),
+            },
+        )
+        .await;
+        let frame = recv_rpc_json(&mut rx).await;
+        assert_eq!(frame["result"]["answer"], "no-draft", "got {frame}");
+
+        // A live turn admitted under ANOTHER profile (bare session-id
+        // collision) must not leak its draft into this profile's aside.
+        let abort = tokio::spawn(async {}).abort_handle();
+        active_turns_registry().lock().await.insert(
+            session_id.clone(),
+            ActiveTurn {
+                profile_id: "someone-else".to_owned(),
+                turn_id: turn_id.clone(),
+                state: Arc::new(TokioMutex::new(TurnState::Active)),
+                interrupt_tx: Arc::new(TokioMutex::new(None)),
+                abort,
+            },
+        );
+        let (ws, mut rx) = ws_connection_for_test(4);
+        handle_session_btw(
+            &ws,
+            &state,
+            &ledger,
+            &active_turns_registry(),
+            None,
+            None,
+            "b6b".into(),
+            SessionBtwParams {
+                session_id: session_id.clone(),
+                topic: None,
+                question: "what are you drafting?".into(),
+            },
+        )
+        .await;
+        let frame = recv_rpc_json(&mut rx).await;
+        assert_eq!(
+            frame["result"]["answer"], "no-draft",
+            "another profile's live draft must not leak; got {frame}"
+        );
+
+        // The same turn ACTIVE under OUR profile → its draft rides the prompt.
+        let abort = tokio::spawn(async {}).abort_handle();
+        active_turns_registry().lock().await.insert(
+            session_id.clone(),
+            ActiveTurn {
+                profile_id: MAIN_PROFILE_ID.to_owned(),
+                turn_id: turn_id.clone(),
+                state: Arc::new(TokioMutex::new(TurnState::Active)),
+                interrupt_tx: Arc::new(TokioMutex::new(None)),
+                abort,
+            },
+        );
+        let (ws, mut rx) = ws_connection_for_test(4);
+        handle_session_btw(
+            &ws,
+            &state,
+            &ledger,
+            &active_turns_registry(),
+            None,
+            None,
+            "b7".into(),
+            SessionBtwParams {
+                session_id: session_id.clone(),
+                topic: None,
+                question: "what are you drafting?".into(),
+            },
+        )
+        .await;
+        let frame = recv_rpc_json(&mut rx).await;
+        active_turns_registry().lock().await.remove(&session_id);
+        *btw_test_provider_slot().lock().expect("slot") = None;
+        assert_eq!(frame["result"]["answer"], "saw-draft", "got {frame}");
+    }
+
+    /// The ingress gate scopes `session#topic`; the handler must fold the
+    /// topic into the canonical key before ANY lookup — a topic-scoped aside
+    /// answers from the topic-scoped session, never the bare one.
+    #[tokio::test]
+    async fn session_btw_folds_topic_into_the_session_key() {
+        struct TopicStubProvider;
+        #[async_trait::async_trait]
+        impl octos_llm::LlmProvider for TopicStubProvider {
+            async fn chat(
+                &self,
+                _messages: &[octos_core::Message],
+                _tools: &[octos_llm::ToolSpec],
+                _config: &octos_llm::ChatConfig,
+            ) -> eyre::Result<octos_llm::ChatResponse> {
+                Ok(octos_llm::ChatResponse {
+                    content: Some("scoped answer".into()),
+                    reasoning_content: None,
+                    tool_calls: vec![],
+                    stop_reason: octos_llm::StopReason::EndTurn,
+                    usage: octos_llm::TokenUsage::default(),
+                    provider_index: None,
+                })
+            }
+            fn model_id(&self) -> &str {
+                "topic-stub"
+            }
+            fn provider_name(&self) -> &str {
+                "stub"
+            }
+        }
+
+        let folded = SessionKey("local:btw-topic#coding".into());
+        let state = prg_state_with_session(&folded, prg_seed_user_assistant);
+        let ledger = event_ledger(&state).await;
+        let (ws, mut rx) = ws_connection_for_test(4);
+
+        let _serial = btw_test_slot_serial().lock().await;
+        *btw_test_provider_slot().lock().expect("slot") = Some(Arc::new(TopicStubProvider));
+        handle_session_btw(
+            &ws,
+            &state,
+            &ledger,
+            &active_turns_registry(),
+            None,
+            None,
+            "b5".into(),
+            SessionBtwParams {
+                session_id: SessionKey("local:btw-topic".into()),
+                topic: Some("coding".into()),
+                question: "which scope answered?".into(),
+            },
+        )
+        .await;
+        let frame = recv_rpc_json(&mut rx).await;
+        *btw_test_provider_slot().lock().expect("slot") = None;
+        assert_eq!(frame["id"], "b5", "got {frame}");
+        assert!(frame["error"].is_null(), "got {frame}");
+        assert_eq!(
+            frame["result"]["session_id"],
+            folded.to_string(),
+            "the result must carry the topic-folded session key"
+        );
+    }
+
+    #[test]
     fn session_ingress_scope_accepts_matching_topic_folded_turn() {
         let allowed = SessionKey("dspfac:local:tui#coding".into());
         let command = UiCommand::TurnStart(TurnStartParams {
@@ -35895,6 +40182,11 @@ ignore = []
             octos_core::ui_protocol::methods::CONTENT_LIST,
             octos_core::ui_protocol::methods::CONTENT_DELETE,
             octos_core::ui_protocol::methods::CONTENT_BULK_DELETE,
+            octos_core::ui_protocol::methods::MEMORY_OVERVIEW,
+            octos_core::ui_protocol::methods::MEMORY_ENTITY,
+            octos_core::ui_protocol::methods::CRON_LIST,
+            octos_core::ui_protocol::methods::CRON_TOGGLE,
+            octos_core::ui_protocol::methods::SESSION_FORK,
         ] {
             assert!(
                 !session_ingress_callable_method(m),
@@ -39738,6 +44030,7 @@ ignore = []
                 session_id.clone(),
                 ActiveTurn {
                     turn_id: TurnId::new(),
+                    profile_id: MAIN_PROFILE_ID.to_owned(),
                     state: Arc::new(TokioMutex::new(TurnState::Active)),
                     interrupt_tx: Arc::new(TokioMutex::new(Some(interrupt_tx))),
                     abort: dummy_handle.abort_handle(),
@@ -39897,6 +44190,341 @@ ignore = []
             !turn_ids.contains(&turn_drop.0.to_string()),
             "dropped turn 2 must be excluded from thread.turns; got {turn_ids:?}"
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn session_fork_copies_full_history_by_default() {
+        let session_id = SessionKey("local:fork-parent".into());
+        // 3 turns -> 6 messages persisted on the parent.
+        let (state, _tmp) = prg_state_with_persisted_turns(&session_id, 3).await;
+        let (ws, mut rx) = ws_connection_for_test(8);
+
+        handle_session_fork(
+            &ws,
+            &state,
+            None,
+            None,
+            "fk1".into(),
+            octos_core::ui_protocol::SessionForkParams {
+                session_id: session_id.clone(),
+                new_chat_id: "fork-child".into(),
+                copy_messages: None,
+            },
+        )
+        .await;
+
+        let frame = recv_rpc_json(&mut rx).await;
+        assert_eq!(frame["id"], "fk1");
+        let result = &frame["result"];
+        assert_eq!(result["new_session_id"], "local:fork-child");
+        assert_eq!(result["parent_session_id"], session_id.to_string());
+        assert_eq!(result["copied_messages"], 6);
+
+        // The child must exist on the manager, carry parent lineage, and
+        // hold the full copied history.
+        let sessions = state.sessions.as_ref().expect("sessions");
+        let mut guard = sessions.lock().await;
+        let child_key = SessionKey("local:fork-child".into());
+        assert!(
+            guard.session_known(&child_key),
+            "child session must persist"
+        );
+        let child = guard.get_or_create(&child_key).await;
+        assert_eq!(child.parent_key.as_ref(), Some(&session_id));
+        assert_eq!(child.messages.len(), 6);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn session_fork_copies_only_requested_tail() {
+        let session_id = SessionKey("local:fork-tail".into());
+        let (state, _tmp) = prg_state_with_persisted_turns(&session_id, 3).await;
+        let (ws, mut rx) = ws_connection_for_test(8);
+
+        handle_session_fork(
+            &ws,
+            &state,
+            None,
+            None,
+            "fk2".into(),
+            octos_core::ui_protocol::SessionForkParams {
+                session_id: session_id.clone(),
+                new_chat_id: "tail-child".into(),
+                copy_messages: Some(2),
+            },
+        )
+        .await;
+
+        let frame = recv_rpc_json(&mut rx).await;
+        assert_eq!(frame["result"]["copied_messages"], 2);
+        let sessions = state.sessions.as_ref().expect("sessions");
+        let mut guard = sessions.lock().await;
+        let child = guard
+            .get_or_create(&SessionKey("local:tail-child".into()))
+            .await;
+        assert_eq!(child.messages.len(), 2);
+        // Tail = the LAST turn (user + assistant of turn 3).
+        assert_eq!(child.messages[0].content, "turn 3");
+        assert_eq!(child.messages[1].content, "reply 3");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn session_fork_unknown_session_errors() {
+        let seeded = SessionKey("local:fork-seeded".into());
+        let (state, _tmp) = prg_state_with_persisted_turns(&seeded, 1).await;
+        let (ws, mut rx) = ws_connection_for_test(8);
+
+        handle_session_fork(
+            &ws,
+            &state,
+            None,
+            None,
+            "fk3".into(),
+            octos_core::ui_protocol::SessionForkParams {
+                session_id: SessionKey("local:never-created".into()),
+                new_chat_id: "child".into(),
+                copy_messages: None,
+            },
+        )
+        .await;
+
+        let frame = recv_rpc_json(&mut rx).await;
+        assert!(
+            frame.get("error").is_some(),
+            "fork of an unknown session must error, not auto-create"
+        );
+        // Fork must NOT have created either session as a side effect.
+        let sessions = state.sessions.as_ref().expect("sessions");
+        let mut guard = sessions.lock().await;
+        assert!(!guard.session_known(&SessionKey("local:never-created".into())));
+        assert!(!guard.session_known(&SessionKey("local:child".into())));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn session_fork_refuses_existing_child_key() {
+        let session_id = SessionKey("local:fork-clobber".into());
+        let (state, _tmp) = prg_state_with_persisted_turns(&session_id, 2).await;
+        let (ws, mut rx) = ws_connection_for_test(8);
+
+        for id in ["fka", "fkb"] {
+            handle_session_fork(
+                &ws,
+                &state,
+                None,
+                None,
+                id.into(),
+                octos_core::ui_protocol::SessionForkParams {
+                    session_id: session_id.clone(),
+                    new_chat_id: "same-child".into(),
+                    copy_messages: None,
+                },
+            )
+            .await;
+        }
+
+        let first = recv_rpc_json(&mut rx).await;
+        assert!(first.get("result").is_some(), "first fork succeeds");
+        let second = recv_rpc_json(&mut rx).await;
+        assert_eq!(
+            second["error"]["data"]["kind"], "child_exists",
+            "second fork onto the same child key must refuse, not clobber"
+        );
+
+        // The child's history must be the FIRST fork's copy, untouched.
+        let sessions = state.sessions.as_ref().expect("sessions");
+        let mut guard = sessions.lock().await;
+        let child = guard
+            .get_or_create(&SessionKey("local:same-child".into()))
+            .await;
+        assert_eq!(child.messages.len(), 4);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn session_fork_rejects_invalid_chat_id() {
+        let session_id = SessionKey("local:fork-badname".into());
+        let (state, _tmp) = prg_state_with_persisted_turns(&session_id, 1).await;
+        let (ws, mut rx) = ws_connection_for_test(8);
+
+        handle_session_fork(
+            &ws,
+            &state,
+            None,
+            None,
+            "fk4".into(),
+            octos_core::ui_protocol::SessionForkParams {
+                session_id: session_id.clone(),
+                new_chat_id: "../escape".into(),
+                copy_messages: None,
+            },
+        )
+        .await;
+
+        let frame = recv_rpc_json(&mut rx).await;
+        assert_eq!(frame["error"]["data"]["kind"], "invalid_new_chat_id");
+    }
+
+    #[test]
+    fn fork_reservations_scope_by_sessions_dir() {
+        // codex #1613 r2: identical child keys in DIFFERENT profiles'
+        // sessions dirs name different files — they must not exclude
+        // each other. Same dir + same key must.
+        let child = SessionKey("local:contested".into());
+        let dir_a = std::path::Path::new("/tmp/profile-a/sessions");
+        let dir_b = std::path::Path::new("/tmp/profile-b/sessions");
+
+        let a = ForkReservation::try_acquire(dir_a, &child).expect("dir A reserves");
+        let b = ForkReservation::try_acquire(dir_b, &child);
+        assert!(b.is_some(), "different sessions dir must not collide");
+        assert!(
+            ForkReservation::try_acquire(dir_a, &child).is_none(),
+            "same dir + same child key must exclude"
+        );
+        drop(a);
+        assert!(
+            ForkReservation::try_acquire(dir_a, &child).is_some(),
+            "released reservation must be reacquirable"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn session_fork_raw_spa_parent_yields_raw_child() {
+        // codex #1613 P1: a raw SPA handle ("web-123") must NOT be
+        // treated as a channel — the child is a raw handle too, not
+        // "web-123:kid" (excluded from the raw REST fallbacks).
+        let session_id = SessionKey("web-123".into());
+        let (state, _tmp) = prg_state_with_persisted_turns(&session_id, 1).await;
+        let (ws, mut rx) = ws_connection_for_test(8);
+
+        handle_session_fork(
+            &ws,
+            &state,
+            None,
+            None,
+            "fk-raw".into(),
+            octos_core::ui_protocol::SessionForkParams {
+                session_id: session_id.clone(),
+                new_chat_id: "web-456".into(),
+                copy_messages: None,
+            },
+        )
+        .await;
+
+        let frame = recv_rpc_json(&mut rx).await;
+        assert_eq!(frame["result"]["new_session_id"], "web-456");
+        let sessions = state.sessions.as_ref().expect("sessions");
+        let mut guard = sessions.lock().await;
+        assert!(guard.session_known(&SessionKey("web-456".into())));
+        assert!(
+            !guard.session_known(&SessionKey("web-123:web-456".into())),
+            "the naive channel-split key must not exist"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn session_fork_concurrent_same_child_one_wins() {
+        // codex #1613 P2: two forks from DIFFERENT parents racing to
+        // the same child key — exactly one may win; the loser must not
+        // silently overwrite the winner's copied history.
+        let parent_a = SessionKey("local:race-a".into());
+        let parent_b = SessionKey("local:race-b".into());
+        let (state, _tmp) = prg_state_with_persisted_turns(&parent_a, 1).await;
+        {
+            // Seed the second parent on the same manager.
+            let sessions = state.sessions.as_ref().expect("sessions");
+            let mut guard = sessions.lock().await;
+            let now = Utc::now();
+            let msg = Message {
+                role: MessageRole::User,
+                content: "b says".into(),
+                media: vec![],
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning_content: None,
+                client_message_id: None,
+                thread_id: None,
+                timestamp: now,
+            };
+            guard.add_message(&parent_b, msg).await.expect("seed b");
+        }
+        let (ws, mut rx) = ws_connection_for_test(8);
+
+        let fork = |parent: SessionKey, id: &str| {
+            let ws = &ws;
+            let state = &state;
+            let id = id.to_string();
+            async move {
+                handle_session_fork(
+                    ws,
+                    state,
+                    None,
+                    None,
+                    id,
+                    octos_core::ui_protocol::SessionForkParams {
+                        session_id: parent,
+                        new_chat_id: "contested".into(),
+                        copy_messages: None,
+                    },
+                )
+                .await;
+            }
+        };
+        tokio::join!(
+            fork(parent_a.clone(), "fk-a"),
+            fork(parent_b.clone(), "fk-b")
+        );
+
+        let first = recv_rpc_json(&mut rx).await;
+        let second = recv_rpc_json(&mut rx).await;
+        let oks = [&first, &second]
+            .iter()
+            .filter(|f| f.get("result").is_some())
+            .count();
+        assert_eq!(oks, 1, "exactly one fork wins: {first} / {second}");
+        let loser = if first.get("error").is_some() {
+            &first
+        } else {
+            &second
+        };
+        assert_eq!(loser["error"]["data"]["kind"], "child_exists");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn session_fork_enforces_connection_scope() {
+        // A profile-PREFIXED session id names another tenant's scope
+        // outright; a connection bound to "tenant-b" must be refused.
+        // (Un-prefixed ids are accepted by SPA convention — isolation for
+        // those comes from per-profile runtime resolution.)
+        let session_id = SessionKey("tenant-a:local:fork-scope".into());
+        let (state, _tmp) = prg_state_with_persisted_turns(&session_id, 1).await;
+        let (ws, mut rx) = ws_connection_for_test(8);
+
+        handle_session_fork(
+            &ws,
+            &state,
+            Some("tenant-b"),
+            None,
+            "fk5".into(),
+            octos_core::ui_protocol::SessionForkParams {
+                session_id: session_id.clone(),
+                new_chat_id: "stolen".into(),
+                copy_messages: None,
+            },
+        )
+        .await;
+
+        // Scope violations close 1008-first (see
+        // send_scope_error_closes_with_1008_on_authenticated_mismatch).
+        let first = rx.recv().await.expect("close frame");
+        match first {
+            axum::extract::ws::Message::Close(Some(frame)) => {
+                assert_eq!(frame.code, 1008);
+            }
+            other => panic!("expected 1008 close on cross-scope fork, got {other:?}"),
+        }
+        // And the fork must NOT have happened.
+        let sessions = state.sessions.as_ref().expect("sessions");
+        let mut guard = sessions.lock().await;
+        assert!(!guard.session_known(&SessionKey("tenant-a:local:stolen".into())));
+        assert!(!guard.session_known(&SessionKey("local:stolen".into())));
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -40191,6 +44819,7 @@ ignore = []
                 session_id.clone(),
                 ActiveTurn {
                     turn_id: turn_id.clone(),
+                    profile_id: MAIN_PROFILE_ID.to_owned(),
                     state: Arc::new(TokioMutex::new(TurnState::Active)),
                     interrupt_tx: Arc::new(TokioMutex::new(Some(interrupt_tx))),
                     abort: dummy_handle.abort_handle(),
@@ -40375,7 +45004,10 @@ ignore = []
                 media: vec!["research/_report.md".into()],
                 tool_calls: None,
                 tool_call_id: None,
-                reasoning_content: None,
+                // Persisted thinking text — must survive into the hydrated
+                // row for negotiated clients (the "· reasoning" block used
+                // to vanish on every client restart).
+                reasoning_content: Some("I should summarize the findings.".into()),
                 client_message_id: None,
                 thread_id: Some("cmid-user-1".into()),
                 timestamp: spawn_ack_ts,
@@ -40456,6 +45088,7 @@ ignore = []
             Payload::ToolStart {
                 tool_call_id: "tc-shell-1".into(),
                 name: "shell".into(),
+                arguments_preview: None,
             },
             None,
         );
@@ -40515,6 +45148,19 @@ ignore = []
             .expect("seq=1 companion row");
         assert_eq!(companion_row["source"], "background");
         assert_eq!(spawn_ack_row["source"], "background");
+        // Negotiated hydrate carries the persisted reasoning so the
+        // "· reasoning" block survives a client restart.
+        assert_eq!(
+            spawn_ack_row["reasoning_content"], "I should summarize the findings.",
+            "hydrated row must surface persisted reasoning_content"
+        );
+        assert!(
+            companion_row
+                .get("reasoning_content")
+                .map(|v| v.is_null())
+                .unwrap_or(true),
+            "rows without reasoning omit the field"
+        );
         let user_row = messages_new
             .iter()
             .find(|m| m["seq"] == 0)
@@ -42157,6 +46803,123 @@ ignore = []
     /// the helper that wires the dual-emit
     /// (`emit_envelope_for_legacy_notification`) so a future refactor
     /// can't silently drop a variant from the dual surface.
+    #[test]
+    fn emit_envelope_carries_tool_fidelity_previews() {
+        // The tool-card fidelity lane: ToolStarted.arguments →
+        // ToolStart.arguments_preview (key: value rendering, bounded) and
+        // ToolCompleted.output_preview/duration_ms → ToolEnd (re-bounded).
+        let ledger = UiProtocolLedger::new(32);
+        let session_id = SessionKey("local:fidelity-emit".into());
+        let turn_id = TurnId::new();
+
+        let giant = "æ".repeat(9000);
+        emit_envelope_for_legacy_notification(
+            &ledger,
+            &session_id,
+            &UiNotification::ToolStarted(ToolStartedEvent {
+                session_id: session_id.clone(),
+                topic: None,
+                turn_id: turn_id.clone(),
+                tool_call_id: "tc-fid".into(),
+                tool_name: "shell".into(),
+                arguments: Some(serde_json::json!({
+                    "command": "cargo test",
+                    "blob": giant,
+                })),
+            }),
+        );
+        emit_envelope_for_legacy_notification(
+            &ledger,
+            &session_id,
+            &UiNotification::ToolCompleted(ToolCompletedEvent {
+                session_id: session_id.clone(),
+                topic: None,
+                turn_id: turn_id.clone(),
+                tool_call_id: "tc-fid".into(),
+                tool_name: "shell".into(),
+                success: Some(true),
+                output_preview: Some("test result: ok. 815 passed".into()),
+                duration_ms: Some(4321),
+            }),
+        );
+
+        let baseline = UiCursor {
+            stream: session_id.0.clone(),
+            seq: 0,
+        };
+        let replay = ledger.replay_after(&session_id, Some(&baseline)).unwrap();
+        let payloads: Vec<&Payload> = replay
+            .iter()
+            .filter_map(|e| match &e.event {
+                UiProtocolLedgerEvent::Notification(UiNotification::Envelope(env)) => {
+                    Some(&env.envelope.payload)
+                }
+                _ => None,
+            })
+            .collect();
+
+        let Some(Payload::ToolStart {
+            arguments_preview: Some(preview),
+            ..
+        }) = payloads.first()
+        else {
+            panic!("expected enriched ToolStart, got {payloads:?}");
+        };
+        assert!(
+            preview.contains("command: \"cargo test\""),
+            "object args render as key: value pairs, got {preview}"
+        );
+        assert!(
+            preview.chars().count()
+                <= octos_core::ui_protocol::ENVELOPE_TOOL_ARGUMENTS_PREVIEW_MAX + 1,
+            "arguments preview must be bounded (UTF-8-safe), got {} chars",
+            preview.chars().count()
+        );
+        let Some(Payload::ToolEnd {
+            output_preview: Some(output),
+            duration_ms: Some(duration),
+            ..
+        }) = payloads.get(1)
+        else {
+            panic!("expected enriched ToolEnd, got {payloads:?}");
+        };
+        assert_eq!(output, "test result: ok. 815 passed");
+        assert_eq!(*duration, 4321);
+
+        // `{}` arguments render empty — spec says OMIT, not empty-string.
+        emit_envelope_for_legacy_notification(
+            &ledger,
+            &session_id,
+            &UiNotification::ToolStarted(ToolStartedEvent {
+                session_id: session_id.clone(),
+                topic: None,
+                turn_id: turn_id.clone(),
+                tool_call_id: "tc-empty".into(),
+                tool_name: "noop".into(),
+                arguments: Some(serde_json::json!({})),
+            }),
+        );
+        let replay = ledger.replay_after(&session_id, Some(&baseline)).unwrap();
+        let empty_start = replay
+            .iter()
+            .filter_map(|e| match &e.event {
+                UiProtocolLedgerEvent::Notification(UiNotification::Envelope(env)) => {
+                    match &env.envelope.payload {
+                        Payload::ToolStart {
+                            tool_call_id,
+                            arguments_preview,
+                            ..
+                        } if tool_call_id == "tc-empty" => Some(arguments_preview.clone()),
+                        _ => None,
+                    }
+                }
+                _ => None,
+            })
+            .next()
+            .expect("tc-empty envelope present");
+        assert_eq!(empty_start, None, "empty args must omit the preview");
+    }
+
     #[test]
     fn emit_envelope_for_legacy_notification_covers_every_progress_variant() {
         let ledger = UiProtocolLedger::new(32);

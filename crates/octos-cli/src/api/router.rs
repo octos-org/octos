@@ -217,6 +217,15 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/my/voice", put(auth_handlers::set_my_voice))
         // Per-tenant voice-assistant pre-flight: ASR + LLM + (route-aware) TTS.
         .route("/api/voice/readiness", get(auth_handlers::voice_readiness))
+        // Memory + Cron panel REST routes retired in favor of the UI Protocol
+        // methods (`memory/overview`, `memory/entity`, `cron/list`,
+        // `cron/toggle`, gated by `auxiliary.rest_to_ws.v1`), which wrap the
+        // SAME `memory_panel::*` / `cron_panel::*` handlers over the WS
+        // transport. `cron/list` is now byte-budget-bounded (row + serialized
+        // caps with a `truncated` signal), matching `memory/overview`, so it is
+        // safe as the sole transport. Mirrors the earlier `/api/my/content` →
+        // `content/*` retirement (M12 Phase D-5): one implementation, one
+        // transport.
         .route("/api/my/soul", get(auth_handlers::my_soul))
         .route("/api/my/soul", put(auth_handlers::update_my_soul))
         .route("/api/my/soul", delete(auth_handlers::delete_my_soul))

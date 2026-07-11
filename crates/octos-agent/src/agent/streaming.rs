@@ -4,11 +4,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use eyre::Result;
 use futures::StreamExt;
-use octos_core::{Message, MessageRole, TokenUsage};
+use octos_core::{Message, MessageRole};
 use octos_llm::{ChatResponse, ChatStream, StopReason, StreamError, StreamEvent};
 use tracing::warn;
 
 use super::Agent;
+use super::turn_state::LoopTurnState;
 use crate::progress::ProgressEvent;
 
 /// Process-global monotonic counter for synthesizing tool-call ids when a
@@ -473,7 +474,35 @@ impl Agent {
         ))
     }
 
-    pub(super) fn emit_cost_update(&self, total_usage: &TokenUsage, response: &ChatResponse) {
+    /// Estimate the cost of one response's usage at the model that
+    /// actually produced it (resolved via `provider_index`, so failover /
+    /// routed slots price at their own model, not the active slot's).
+    /// `None` when that model has no catalog pricing. Pass
+    /// `provider_index: None` to price at the active slot — used for
+    /// tool-reported usage that has no per-response attribution.
+    pub(super) fn response_usage_cost(
+        &self,
+        input_tokens: u32,
+        output_tokens: u32,
+        provider_index: Option<usize>,
+    ) -> Option<f64> {
+        let metadata = self.llm.provider_metadata_for_index(provider_index);
+        octos_llm::pricing::model_pricing(&metadata.model)
+            .map(|p| p.cost(input_tokens, output_tokens))
+    }
+
+    /// `attributed_cost` is the caller's per-attempt-priced cost for
+    /// exactly `response.usage` (see `call_llm_with_hooks`' return value).
+    /// `response.usage` MERGES discarded retry attempts, which can span
+    /// provider slots — re-pricing the aggregate at the final slot's rate
+    /// (the `None` fallback) misprices cross-provider retries, so callers
+    /// that hold the attribution must pass it (codex #1632 r3 P2).
+    pub(super) fn emit_cost_update(
+        &self,
+        turn: &LoopTurnState,
+        response: &ChatResponse,
+        attributed_cost: Option<f64>,
+    ) {
         let response_usage = &response.usage;
         // Codex round-1 P2: for failover / routed responses the slot that
         // produced this response may not match `self.llm.model_id()`
@@ -486,10 +515,35 @@ impl Agent {
             .llm
             .provider_metadata_for_index(response.provider_index);
         let pricing = octos_llm::pricing::model_pricing(&metadata.model);
-        let response_cost =
-            pricing.map(|p| p.cost(response_usage.input_tokens, response_usage.output_tokens));
-        let session_cost =
-            pricing.map(|p| p.cost(total_usage.input_tokens, total_usage.output_tokens));
+        let response_cost = attributed_cost.or_else(|| {
+            pricing.map(|p| p.cost(response_usage.input_tokens, response_usage.output_tokens))
+        });
+        // Session figures = completed-runs base + this turn so far.
+        //
+        // The base comes from the shared session-usage handle (seeded from
+        // the usage ledger and folded per completed run by the session
+        // actor — each run priced at the model that ran it), so the wire's
+        // `session_*` fields survive per-turn resets and the runtime
+        // rebuild a `profile/llm/select` switch triggers. The turn part
+        // uses `LoopTurnState`'s per-response spend, NOT
+        // `pricing.cost(turn totals)` — the old form re-priced the whole
+        // turn at the latest answering model whenever failover switched
+        // models mid-turn. Without an injected handle (chat mode,
+        // sub-agents) the base is zero and the figures stay turn-scoped.
+        let total_usage = turn.total_usage();
+        let base = self
+            .session_usage_base
+            .as_ref()
+            .map(|handle| handle.snapshot())
+            .unwrap_or_default();
+        let session_input_tokens = base
+            .input_tokens
+            .saturating_add(u64::from(total_usage.input_tokens));
+        let session_output_tokens = base
+            .output_tokens
+            .saturating_add(u64::from(total_usage.output_tokens));
+        let session_cost = (turn.has_priced_usage() || base.priced_runs > 0)
+            .then(|| base.spend_usd + turn.spend_usd());
         // Carry the model id so chat clients can render
         // `model · tokens_in / tokens_out · duration` footers. Skip the
         // synthesis if the provider returns an empty identifier — empty
@@ -512,8 +566,10 @@ impl Agent {
             _ => self.llm.context_window(),
         };
         self.reporter().report(ProgressEvent::CostUpdate {
-            session_input_tokens: total_usage.input_tokens,
-            session_output_tokens: total_usage.output_tokens,
+            session_input_tokens,
+            session_output_tokens,
+            turn_input_tokens: total_usage.input_tokens,
+            turn_output_tokens: total_usage.output_tokens,
             response_cost,
             session_cost,
             model,

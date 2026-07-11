@@ -287,6 +287,10 @@ pub struct CompactionOutcome {
     pub tokens_after: u32,
     /// Which summarizer flavour handled the pass.
     pub summarizer_kind: &'static str,
+    /// The summary text folded into the compacted prompt, when a pass
+    /// produced one. Exposed so a conversational loop can persist it as a
+    /// searchable episode (#1587 write side).
+    pub summary: Option<String>,
 }
 
 /// Result of the preservation check — which declared artifacts/invariants were
@@ -567,6 +571,7 @@ impl CompactionRunner {
             tokens_before,
             tokens_after: 0,
             summarizer_kind: self.summarizer.kind(),
+            summary: None,
         };
 
         // Budget decision uses the POST-prune estimate: when placeholder
@@ -652,6 +657,7 @@ impl CompactionRunner {
             }
         };
 
+        outcome.summary = Some(summary_text.clone());
         messages.drain(1..split);
         messages.insert(
             1,

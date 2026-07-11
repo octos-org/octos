@@ -50,6 +50,11 @@ jobs:
       - name: API feature tests
         run: cargo test -p octos-cli --features api api::auth_handlers
 
+      # Feature-gated §6 catalog guard — `cargo test --workspace` above never
+      # compiles the `api` module, so run it explicitly to catch spec drift.
+      - name: UI Protocol §6 catalog guard (octos-cli)
+        run: cargo test -p octos-cli --features api spec_section6_catalog_lists_every_advertised_method -- --nocapture
+
       - name: QoS adaptive/runtime catalog regressions
         run: |
           cargo test -p octos-llm test_qos_ranking_changes_lane_selection -- --nocapture

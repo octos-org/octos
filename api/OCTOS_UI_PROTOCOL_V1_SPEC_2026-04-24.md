@@ -388,6 +388,10 @@ Session, turn, and approval core:
 
 - `session/open`
 - `session/hydrate` (gate `state.session_hydrate.v1`, accepted `UPCR-2026-009`)
+- `session/rollback` (conversation-only rewind; drops the last N user turns and
+  re-projects the trimmed thread exactly like `session/hydrate`; #1516)
+- `session/fork` (branch a session into a new one with copied history; #1613)
+- `session/btw` (quick aside question answered while the current turn runs; #1609)
 - `turn/start`
 - `turn/interrupt`
 - `turn/state/get` (gate `state.turn_state_get.v1`, accepted `UPCR-2026-011`)
@@ -429,6 +433,7 @@ M12 Phase-D auxiliary REST→WS surface (all gated `auxiliary.rest_to_ws.v1`):
   `session/workspace.get`, `session/title.set`, `session/delete`
 - `system/status.get`
 - `content/list`, `content/delete`, `content/bulk_delete`
+- `memory/overview`, `memory/entity`, `cron/list`, `cron/toggle`
 
 Runtime, auth, profile, and onboarding inspection (server-handled
 `APPUI_EXTRA_METHODS`):
@@ -466,6 +471,8 @@ Turn, message, and tool lifecycle:
 
 - `turn/started`, `turn/completed`, `turn/error`
 - `message/delta`
+- `message/reasoning_delta` (live LLM reasoning/thinking stream, sibling of
+  `message/delta`; #1502)
 - `message/persisted` (accepted `UPCR-2026-012`)
 - `turn/spawn_complete` (gate `event.spawn_complete.v1`; M10 background-tool completion envelope)
 - `tool/started`, `tool/progress`, `tool/completed`
@@ -483,6 +490,8 @@ Structured user-question lifecycle (gate `user_question.v1`, proposed
 Task and progress:
 
 - `task/updated`
+- `plan/updated` (gate `plan.todos.v1`; model-authored plan/todo checklist
+  snapshot that replaces any prior plan wholesale; #1622)
 - `task/output/delta`
 - `progress/updated`
 - `warning`
@@ -507,6 +516,15 @@ Voice rich-output visual lifecycle (#1477, ungated; accepted
   `file/attached` stays a pure artifact-delivery signal while these carry
   the placeholder lifecycle, so the split survives a future
   `projection.envelope.v1` cutover. See § 8.
+
+Voice reply-audio streaming (gate `event.voice_audio.v1`; #1504):
+
+- `voice/audio_chunk` — streamed reply-audio frames (base64) for a voice turn.
+  Delivery is gated by the `event.voice_audio.v1` capability: a client that did
+  not negotiate it is filtered off the chunk stream and instead receives the
+  whole-file audio as a `file/attached` envelope, which is itself gated by
+  `event.file_attached.v1` (the reply audio has no other carrier — a client
+  that negotiated neither capability receives no playable reply audio).
 
 Voice exit intent (ungated; accepted `UPCR-2026-025`):
 
@@ -1628,6 +1646,69 @@ Request/response Rust types live in `crates/octos-core/src/ui_protocol.rs`
   `invalid_params` on the over-cap guard; `resource_not_found` with
   `data.resource_type = "content"` on REST 404 (collection endpoint).
 
+#### `memory/overview`
+
+- Gate: `auxiliary.rest_to_ws.v1`
+- Replaces: `GET /api/my/memory`
+- Params type: `MemoryOverviewParams` — `{}` (accepts `params: {}` or
+  `params: null`; the `params` member itself must be present — the
+  shared frame parser rejects a request without one, codex #1621 r5).
+- Result type: `MemoryOverviewResult` — `{ overview: MemoryOverviewResponse }`.
+  `overview` carries the REST panel body whole (`memory_panel.rs`), plus
+  RPC-layer truncation metadata: each document field is capped to a
+  per-field JSON-ESCAPED byte budget (`long_term` 96 KiB, `today`
+  48 KiB, each `recent[]` note 24 KiB) so the result fits one WS text
+  frame; capped fields are clean UTF-8 prefixes DECLARED via
+  `<field>_truncated` + `<field>_total_bytes` beside them (always
+  present) — never spliced with an in-band marker.
+- Errors: `auth_unavailable` (`-32120`) with WS close code
+  `1008 auth_expired` if the connection has no usable identity;
+  `resource_not_found` with `data.resource_type = "memory"` on REST 404
+  (collection-style endpoint — id is empty).
+
+#### `memory/entity`
+
+- Gate: `auxiliary.rest_to_ws.v1`
+- Replaces: `GET /api/my/memory/entities/{name}`
+- Params type: `MemoryEntityParams` — `{ name: string }` (the entity
+  page stem, as returned in each overview entity summary).
+- Result type: `MemoryEntityResult` — `{ name: string, content: string,
+  content_truncated: bool, content_total_bytes: number }`. `content` is
+  capped at a 384 KiB JSON-ESCAPED budget; when capped it is a clean
+  UTF-8 prefix with the truth declared in the two metadata fields.
+- Errors: `auth_unavailable` with WS close code `1008 auth_expired`;
+  `resource_not_found` with `data.resource_type = "memory_entity"` and
+  `data.identifier = <name>` on REST 404.
+
+#### `cron/list`
+
+- Gate: `auxiliary.rest_to_ws.v1`
+- Replaces: `GET /api/my/cron`
+- Params type: `CronListParams` — `{}` (accepts `params: {}` or
+  `params: null`; the `params` member itself must be present, as above).
+- Result type: `CronListResult` — `{ jobs: CronJobRow[], count: number,
+  gateway_running: bool }`. Mirrors the REST body minus the redundant
+  `ok` flag; `gateway_running` reports whether a spawned gateway child
+  owns `cron.json` (toggles are refused while it does).
+- Errors: `auth_unavailable` with WS close code `1008 auth_expired`;
+  `resource_not_found` with `data.resource_type = "cron"` on REST 404
+  (collection-style endpoint — id is empty).
+
+#### `cron/toggle`
+
+- Gate: `auxiliary.rest_to_ws.v1`
+- Replaces: `PUT /api/my/cron/{job_id}/enabled`
+- Params type: `CronToggleParams` — `{ job_id: string, enabled: bool }`.
+- Result type: `CronToggleResult` — `{ job: CronJobRow }`, rendered
+  exactly as a `cron/list` entry.
+- Errors: `auth_unavailable` with WS close code `1008 auth_expired`.
+  Refusals forward the REST error body's `reason` as `data.detail` so
+  clients branch on typed fields, not message strings:
+  `data.detail = "gateway_running"` with `data.rest_status = 409` when a
+  spawned gateway owns the store, `resource_not_found` with
+  `data.resource_type = "cron_job"`, `data.identifier = <job_id>`, and
+  `data.detail = "job_not_found"` on a stale row.
+
 ## 8. Event Semantics
 
 ### `turn/started`
@@ -2315,11 +2396,16 @@ form).
 
 #### `tool_start`
 Tool invocation begun. The projection opens a tool-call card keyed on
-`tool_call_id`.
+`tool_call_id`. `arguments_preview` (optional) is a compact
+`key: value` echo of the call arguments, server-bounded to 700 chars
+(UTF-8-safe) — display fidelity for the card, not a replayable
+argument record. Omitted for argument-less calls and for envelopes
+persisted before the field existed.
 
 ```json
 { "type": "tool_start",
-  "data": { "tool_call_id": "tc-1", "name": "shell" } }
+  "data": { "tool_call_id": "tc-1", "name": "shell",
+            "arguments_preview": "command: \"cargo test\"" } }
 ```
 
 #### `tool_progress`
@@ -2335,11 +2421,18 @@ the projection appends in `seq` order.
 Tool invocation finished. `error` is set iff `status === "error"`;
 omitted on the wire when null. `reason` is an optional human-readable
 detail field, primarily populated for `skipped` and `aborted` outcomes
-(see below); omitted on the wire when null.
+(see below); omitted on the wire when null. `output_preview` (optional)
+carries the first lines of the tool result, server-bounded to
+2048 chars (UTF-8-safe) — the result excerpt under the tool card; the
+`error` field is bounded the same way. `duration_ms` (optional) is the
+call's wall-clock duration. Both are omitted for envelopes persisted
+before the fields existed.
 
 ```json
 { "type": "tool_end",
-  "data": { "tool_call_id": "tc-1", "status": "complete" } }
+  "data": { "tool_call_id": "tc-1", "status": "complete",
+            "output_preview": "test result: ok. 815 passed",
+            "duration_ms": 4321 } }
 ```
 
 ```json

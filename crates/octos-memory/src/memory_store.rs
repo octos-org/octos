@@ -18,9 +18,47 @@ use eyre::{Result, WrapErr};
 /// [`MemoryStore::get_injectable_context`].
 pub const DEFAULT_MAX_INJECT_TOKENS: usize = 2500;
 
+/// Usage statistics for one memory entry (`^m…` id or bank slug).
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct UsageStat {
+    /// Times the entry was cited via `record_memory_use`.
+    pub count: u64,
+    /// Last-cited local date (`YYYY-MM-DD`), empty if never.
+    #[serde(default)]
+    pub last_used: String,
+}
+
+/// The `usage.json` sidecar: id/slug -> [`UsageStat`]. Advisory input to
+/// consolidation aging (#1586); never load-bearing for correctness.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct UsageMap {
+    #[serde(default)]
+    pub entries: std::collections::BTreeMap<String, UsageStat>,
+}
+
 /// Persistent memory store backed by markdown files.
 pub struct MemoryStore {
     memory_dir: PathBuf,
+}
+
+/// Process-global usage-file locks keyed by path. A per-INSTANCE lock only
+/// serializes calls on ONE `MemoryStore`; two instances opened on the same
+/// data dir (e.g. a gateway session + an in-process consolidation) would
+/// otherwise both read-modify-rename and lose an update (codex #1614 P2).
+/// Keyed by path so every instance on a given usage.json shares one lock.
+/// (Cross-PROCESS writers still race — acceptable for advisory usage data;
+/// they would already contend the redb lock.)
+static USAGE_LOCKS: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<PathBuf, std::sync::Arc<tokio::sync::Mutex<()>>>>,
+> = std::sync::OnceLock::new();
+
+fn usage_lock_for(path: &Path) -> std::sync::Arc<tokio::sync::Mutex<()>> {
+    let map = USAGE_LOCKS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    let mut guard = map.lock().expect("usage-lock registry poisoned");
+    guard
+        .entry(path.to_path_buf())
+        .or_insert_with(|| std::sync::Arc::new(tokio::sync::Mutex::new(())))
+        .clone()
 }
 
 /// Raw markdown sections loaded from disk, before prompt formatting.
@@ -153,9 +191,102 @@ impl MemoryStore {
         Ok(Self { memory_dir })
     }
 
+    /// Construct a store at an ALREADY-resolved memory dir (the `…/memory`
+    /// directory itself, not its parent). For callers like consolidation
+    /// that hold the memory_dir directly and want the usage sidecar helpers
+    /// without re-deriving the path.
+    ///
+    /// Does NOT itself enforce profile containment — like [`Self::open`] it
+    /// trusts the caller's path. Pass only an internally-derived memory dir,
+    /// never a request-derived one (#1614 P3).
+    #[doc(hidden)]
+    pub fn at_memory_dir(memory_dir: impl Into<PathBuf>) -> Self {
+        Self {
+            memory_dir: memory_dir.into(),
+        }
+    }
+
     /// Path to `MEMORY.md` (for cheap change detection by callers).
     pub fn memory_md_path(&self) -> PathBuf {
         self.memory_dir.join("MEMORY.md")
+    }
+
+    /// Path to the memory-usage sidecar (`usage.json`).
+    fn usage_path(&self) -> PathBuf {
+        self.memory_dir.join("usage.json")
+    }
+
+    /// Drop usage entries whose id/slug is no longer live, keeping the
+    /// sidecar bounded as entries are archived/deleted (codex #1614 P2).
+    /// `live` is the set of surviving MEMORY.md entry ids and bank slugs.
+    pub async fn prune_usage(&self, live: &std::collections::HashSet<String>) {
+        let path = self.usage_path();
+        let lock = usage_lock_for(&path);
+        let _guard = lock.lock().await;
+        let mut usage = self.load_usage().await;
+        let before = usage.entries.len();
+        usage.entries.retain(|k, _| live.contains(k));
+        if usage.entries.len() == before {
+            return;
+        }
+        if let Ok(body) = serde_json::to_string_pretty(&usage) {
+            if let Err(e) = write_atomic_with_backup(path, body, None).await {
+                tracing::warn!(error = %e, "failed to prune memory usage");
+            }
+        }
+    }
+
+    /// Load the usage sidecar: entry id (`^m…`) or bank slug -> stats.
+    /// Missing/corrupt file reads as empty — usage is advisory, never fatal.
+    pub async fn load_usage(&self) -> UsageMap {
+        match tokio::fs::read_to_string(self.usage_path()).await {
+            Ok(raw) => serde_json::from_str(&raw).unwrap_or_default(),
+            Err(_) => UsageMap::default(),
+        }
+    }
+
+    /// Record that `ids` (MEMORY.md entry ids and/or bank slugs) informed an
+    /// answer today: bump each count and stamp `last_used`. Best-effort and
+    /// self-serializing via read-modify-write under the store; a failure is
+    /// logged, never propagated (usage feeds ranking, not correctness).
+    /// #1586.
+    pub async fn record_memory_use<I, S>(&self, ids: I, today: chrono::NaiveDate)
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        // Cap per-call ids and skip absurd ones so a runaway/hostile call
+        // can't bloat usage.json (codex #1614 P2).
+        const MAX_IDS_PER_CALL: usize = 64;
+        const MAX_ID_LEN: usize = 128;
+
+        let path = self.usage_path();
+        let lock = usage_lock_for(&path);
+        let _guard = lock.lock().await;
+        let mut usage = self.load_usage().await;
+        let stamp = today.format("%Y-%m-%d").to_string();
+        let mut changed = false;
+        for id in ids.into_iter().take(MAX_IDS_PER_CALL) {
+            let id = id.as_ref().trim();
+            if id.is_empty() || id.len() > MAX_ID_LEN {
+                continue;
+            }
+            let entry = usage.entries.entry(id.to_string()).or_default();
+            entry.count = entry.count.saturating_add(1);
+            entry.last_used = stamp.clone();
+            changed = true;
+        }
+        if !changed {
+            return;
+        }
+        match serde_json::to_string_pretty(&usage) {
+            Ok(body) => {
+                if let Err(e) = write_atomic_with_backup(self.usage_path(), body, None).await {
+                    tracing::warn!(error = %e, "failed to persist memory usage");
+                }
+            }
+            Err(e) => tracing::warn!(error = %e, "failed to serialize memory usage"),
+        }
     }
 
     /// Path to today's daily-note file (for cheap change detection).
@@ -347,10 +478,11 @@ impl MemoryStore {
                 budget = 0;
                 if kept.is_empty() {
                     sections.long_term = String::new();
-                    omitted.push("long-term memory".to_string());
+                    omitted
+                        .push("long-term memory (load with recall_memory(\"MEMORY\"))".to_string());
                 } else {
                     sections.long_term = format!(
-                        "{kept}\n\n_[long-term memory truncated to fit the context budget — full MEMORY.md on disk]_"
+                        "{kept}\n\n_[long-term memory truncated to fit the context budget — load the complete registry on demand with recall_memory(\"MEMORY\")]_"
                     );
                 }
             }
@@ -495,6 +627,14 @@ impl MemoryStore {
         if name.trim_matches(['-', '_', ' ']).is_empty() {
             eyre::bail!("memory entity name must not be empty");
         }
+        // Reserved registry names are refused at the BOUNDARY, not just in
+        // the save_memory tool: session_actor banks background reports via
+        // write_entity with a task-label slug, so a task named "Memory"
+        // would otherwise create an entity that recall_memory permanently
+        // shadows with the registry (#1608 P2).
+        if is_reserved_memory_name(name) {
+            eyre::bail!("memory entity name '{name}' is reserved for the long-term registry");
+        }
         // Scan the SANITIZED name+abstract row exactly as it will render in
         // the bank index: name and content pass separately, but the row
         // `- **name**: abstract` can reconstruct an injection across that
@@ -588,8 +728,10 @@ impl MemoryStore {
 
     // --- Staging notes (memory-refresh capture layer) ---
 
-    /// Path to `staging/notes/`.
-    fn staging_notes_dir(&self) -> PathBuf {
+    /// Path to `staging/notes/` (pub for the memory panel's FD-anchored
+    /// walk, which needs the store-derived path to compute a relative
+    /// component chain — same role as [`Self::bank_entities_dir`]).
+    pub fn staging_notes_dir(&self) -> PathBuf {
         self.memory_dir.join("staging").join("notes")
     }
 
@@ -748,6 +890,20 @@ pub fn is_valid_entry_id(s: &str) -> bool {
         return false;
     };
     rest.len() == 6 && rest.chars().all(|c| matches!(c, 'a'..='z' | '2'..='7'))
+}
+
+/// Names reserved for `recall_memory`'s long-term-registry load (#1588).
+/// `recall_memory` resolves these to the whole `MEMORY.md` instead of a
+/// bank entity, so `save_memory` must REFUSE them — otherwise a bank
+/// entity named "memory" is created but forever shadowed by the alias
+/// and can never be recalled (codex #1608 P2). Matched on the trimmed,
+/// lowercased name; the space and hyphen forms are both listed so the
+/// check works on raw names and slugs alike.
+pub fn is_reserved_memory_name(name: &str) -> bool {
+    matches!(
+        name.trim().to_lowercase().as_str(),
+        "memory" | "memory.md" | "registry" | "long-term memory" | "long-term-memory"
+    )
 }
 
 /// A capture-layer staging note awaiting consolidation.
@@ -939,7 +1095,12 @@ fn bank_summary_row(name: &str, abstract_line: &str) -> String {
     format!("- **{name}**: {abstract_line}\n")
 }
 
-fn extract_abstract(content: &str) -> String {
+/// First abstract line of an entity page: frontmatter stripped, first
+/// non-empty non-heading line, 100-char truncated. `pub` because the
+/// serve-side memory panel (`/api/my/memory`) must render EXACTLY the
+/// summary string `list_entities` feeds the agent prompt — a second
+/// parser drifted (codex octos#1611 round-2 P2).
+pub fn extract_abstract(content: &str) -> String {
     let body = strip_frontmatter(content);
     let first_line = body
         .lines()
@@ -989,6 +1150,65 @@ fn strip_frontmatter(content: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn should_accumulate_and_persist_memory_usage() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MemoryStore::open(dir.path()).await.unwrap();
+        let d1 = chrono::NaiveDate::from_ymd_opt(2026, 7, 9).unwrap();
+        let d2 = chrono::NaiveDate::from_ymd_opt(2026, 7, 10).unwrap();
+
+        store.record_memory_use(["^maaaaaa", "octos"], d1).await;
+        store.record_memory_use(["^maaaaaa"], d2).await;
+        // blank ids are ignored, and a no-op call writes nothing new
+        store.record_memory_use(["", "  "], d2).await;
+
+        let usage = store.load_usage().await;
+        assert_eq!(usage.entries["^maaaaaa"].count, 2);
+        assert_eq!(usage.entries["^maaaaaa"].last_used, "2026-07-10");
+        assert_eq!(usage.entries["octos"].count, 1);
+        assert_eq!(usage.entries["octos"].last_used, "2026-07-09");
+        assert!(!usage.entries.contains_key(""));
+
+        // Survives reopen (persisted, not in-memory).
+        let reopened = MemoryStore::open(dir.path()).await.unwrap();
+        assert_eq!(reopened.load_usage().await.entries["^maaaaaa"].count, 2);
+    }
+
+    #[tokio::test]
+    async fn should_prune_orphaned_usage_ids() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MemoryStore::open(dir.path()).await.unwrap();
+        let d = chrono::NaiveDate::from_ymd_opt(2026, 7, 10).unwrap();
+        store
+            .record_memory_use(["^malive0", "^mdead00", "octos"], d)
+            .await;
+
+        let mut live = std::collections::HashSet::new();
+        live.insert("^malive0".to_string());
+        live.insert("octos".to_string());
+        store.prune_usage(&live).await;
+
+        let usage = store.load_usage().await;
+        assert!(usage.entries.contains_key("^malive0"));
+        assert!(usage.entries.contains_key("octos"));
+        assert!(!usage.entries.contains_key("^mdead00"), "orphan pruned");
+    }
+
+    #[tokio::test]
+    async fn should_cap_ids_per_call_and_skip_oversized() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MemoryStore::open(dir.path()).await.unwrap();
+        let d = chrono::NaiveDate::from_ymd_opt(2026, 7, 10).unwrap();
+        let many: Vec<String> = (0..100).map(|i| format!("^mid{i:04}")).collect();
+        store.record_memory_use(&many, d).await;
+        let over = "x".repeat(200);
+        store.record_memory_use([over.clone()], d).await;
+
+        let usage = store.load_usage().await;
+        assert!(usage.entries.len() <= 64, "per-call id cap enforced");
+        assert!(!usage.entries.contains_key(&over), "oversized id skipped");
+    }
 
     #[tokio::test]
     async fn test_empty_state() {
@@ -1453,6 +1673,12 @@ mod tests {
         assert!(ctx.contains("first entry"));
         assert!(!ctx.contains(&big_para));
         assert!(ctx.contains("long-term memory truncated"));
+        // #1588 two-tier: the truncation marker must point the model at the
+        // tool that loads the full registry, not just say it's "on disk".
+        assert!(
+            ctx.contains("recall_memory(\"MEMORY\")"),
+            "truncation marker must name the registry-load affordance: {ctx}"
+        );
     }
 
     #[tokio::test]
@@ -1686,6 +1912,25 @@ mod tests {
                 "{name:?} must be refused"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn should_reject_reserved_registry_names_at_the_write_boundary() {
+        // #1608 P2: session_actor banks reports via write_entity with a
+        // task-label slug, bypassing the save_memory tool check — the
+        // boundary must refuse the reserved names too.
+        let dir = tempfile::tempdir().unwrap();
+        let store = MemoryStore::open(dir.path()).await.unwrap();
+        for name in ["memory", "registry", "long-term-memory"] {
+            assert!(
+                store.write_entity(name, "# x\nbody").await.is_err(),
+                "{name:?} must be refused at the boundary"
+            );
+        }
+        store
+            .write_entity("weekly-report", "# x\nbody")
+            .await
+            .expect("a normal report name still banks");
     }
 
     #[tokio::test]

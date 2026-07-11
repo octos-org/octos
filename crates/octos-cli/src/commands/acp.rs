@@ -182,6 +182,7 @@ fn register_memory_bank(
 ) {
     tools.register(octos_agent::RecallMemoryTool::new(memory_store.clone()));
     tools.register(octos_agent::SaveMemoryTool::new(memory_store.clone()));
+    tools.register(octos_agent::RecordMemoryUseTool::new(memory_store.clone()));
     if refresh_enabled {
         tools.register(octos_agent::MemoryNoteTool::new(memory_store.clone()));
     }
@@ -377,6 +378,11 @@ impl AcpBootstrap {
         tools.register(
             octos_agent::SpawnTool::new(llm.clone(), memory.clone(), cwd.clone(), spawn_tx)
                 .with_worker_prompt(worker_prompt)
+                // #1607 (codex-review follow-up): thread the same sandbox the
+                // parent registry was built from so the spawn/agent_mcp child
+                // completion path confines workspace-declared `Command`
+                // validators instead of running them on the host.
+                .with_sandbox(sandbox.clone())
                 // Embed-on-save + recall parity: ACP spawn subagents save
                 // episodes; without the shared embedder they store them
                 // vectorless and their episodic recall silently skips.
@@ -456,6 +462,10 @@ impl AcpBootstrap {
             plugin_dirs.clone(),
             config.plugins.require_signed,
             shared.embedder.clone(),
+            // #1607: same sandbox the ACP agent registry uses (built at
+            // `build_acp_tool_registry` / the `create_sandbox(&sandbox)` above),
+            // so pipeline command validators run under the identical backend.
+            sandbox.clone(),
         );
         tools.register(pipeline_tool);
         tools.mark_spawn_only(
@@ -1276,7 +1286,7 @@ pub(crate) fn progress_event_to_acp(event: &ProgressEvent) -> Option<SessionUpda
         ProgressEvent::ReasoningChunk { text, .. } => Some(SessionUpdate::AgentThoughtChunk(
             ContentChunk::new(ContentBlock::from(text.clone())),
         )),
-        ProgressEvent::ToolStarted { name, tool_id } => {
+        ProgressEvent::ToolStarted { name, tool_id, .. } => {
             let call = ToolCall::new(tool_id.clone(), name.clone())
                 .kind(tool_kind_for(name))
                 .status(ToolCallStatus::InProgress);
@@ -1524,6 +1534,7 @@ mod tests {
         let ev = ProgressEvent::ToolStarted {
             name: "shell".into(),
             tool_id: "call-1".into(),
+            arguments: None,
         };
         let update = progress_event_to_acp(&ev).expect("tool start maps to a tool call");
         match update {

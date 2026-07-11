@@ -6,11 +6,11 @@
 #![allow(dead_code)]
 
 use octos_core::ui_protocol::{
-    ApprovalId, ApprovalRequestedEvent, MessageDeltaEvent, ReasoningDeltaEvent,
+    ApprovalId, ApprovalRequestedEvent, MessageDeltaEvent, PlanUpdatedEvent, ReasoningDeltaEvent,
     TaskRuntimeState as UiTaskRuntimeState, TaskUpdatedEvent, ToolCompletedEvent,
     ToolProgressEvent, ToolStartedEvent, TurnId, UiFileMutationNotice, UiNotification,
-    UiProgressEvent, UiProgressMetadata, UiRetryBackoff, UiTokenCostUpdate, WarningEvent,
-    file_mutation_operations, progress_kinds,
+    UiPlanRecord, UiProgressEvent, UiProgressMetadata, UiRetryBackoff, UiTokenCostUpdate,
+    WarningEvent, file_mutation_operations, progress_kinds,
 };
 use octos_core::{SessionKey, TaskId};
 use serde_json::{Value, json};
@@ -105,6 +105,7 @@ pub(crate) fn map_progress_json(
         "tool_end" => map_tool_end(context, event),
         "task_started" => map_task_started(context, event),
         "task_updated" => map_task_updated(context, event),
+        "plan_updated" => map_plan_updated(context, event),
         "task_completed" => map_task_completed(context, event),
         "task_interrupted" => map_task_interrupted(context, event),
         "max_iterations_reached" => map_budget_stop(context, event, "max iterations reached"),
@@ -150,6 +151,32 @@ fn map_approval_requested(context: &ProgressMappingContext, event: &Value) -> Ui
             body,
         ),
     )])
+}
+
+fn map_plan_updated(context: &ProgressMappingContext, event: &Value) -> UiProgressMapping {
+    let Some(plan_value) = event.get("plan").cloned() else {
+        return UiProgressMapping::warning(
+            context,
+            "invalid_plan",
+            "plan_updated event is missing `plan`".to_string(),
+        );
+    };
+    let plan: UiPlanRecord = match serde_json::from_value(plan_value) {
+        Ok(plan) => plan,
+        Err(err) => {
+            return UiProgressMapping::warning(
+                context,
+                "invalid_plan",
+                format!("plan_updated `plan` did not deserialize: {err}"),
+            );
+        }
+    };
+    UiProgressMapping::notifications(vec![UiNotification::PlanUpdated(PlanUpdatedEvent {
+        session_id: context.session_id.clone(),
+        topic: None,
+        turn_id: Some(context.turn_id.clone()),
+        plan,
+    })])
 }
 
 fn map_task_started(context: &ProgressMappingContext, event: &Value) -> UiProgressMapping {
@@ -414,7 +441,15 @@ fn map_tool_end(context: &ProgressMappingContext, event: &Value) -> UiProgressMa
             tool_call_id,
             tool_name,
             success: bool_field(event, &["success"]),
-            output_preview: string_field(event, &["output_preview"]),
+            // Raw progress JSON can come from arbitrary producers (binary
+            // plugins); bound before this lands in the durable ledger.
+            output_preview: string_field(event, &["output_preview"]).map(|preview| {
+                octos_core::truncated_utf8(
+                    &preview,
+                    octos_core::ui_protocol::ENVELOPE_TOOL_OUTPUT_PREVIEW_MAX,
+                    "…",
+                )
+            }),
             duration_ms: u64_field(event, &["duration_ms", "elapsed_ms"]),
         })],
         status: Some(UiProgressStatus::new(context, metadata)),
@@ -715,6 +750,46 @@ mod tests {
     }
 
     #[test]
+    fn ui_protocol_progress_maps_plan_updated_to_notification() {
+        let mapping = map_progress_json(
+            &context(),
+            &json!({
+                "type": "plan_updated",
+                "plan": {
+                    "title": "Building memory panel…",
+                    "updated_at_ms": 42,
+                    "items": [
+                        { "id": "1", "title": "done", "status": "completed", "priority": "P3" },
+                        { "id": "2", "title": "active", "status": "in_progress" }
+                    ]
+                }
+            }),
+        );
+        assert_eq!(mapping.warning, None);
+        let [UiNotification::PlanUpdated(event)] = mapping.notifications.as_slice() else {
+            panic!(
+                "expected a plan/updated notification, got {:?}",
+                mapping.notifications
+            );
+        };
+        assert_eq!(event.session_id, SessionKey("local:demo".into()));
+        assert!(event.turn_id.is_some());
+        assert_eq!(event.plan.title.as_deref(), Some("Building memory panel…"));
+        assert_eq!(event.plan.items.len(), 2);
+        assert_eq!(
+            event.plan.items[1].status,
+            octos_core::ui_protocol::PlanItemStatus::InProgress
+        );
+    }
+
+    #[test]
+    fn ui_protocol_progress_plan_updated_missing_plan_warns() {
+        let mapping = map_progress_json(&context(), &json!({ "type": "plan_updated" }));
+        assert!(mapping.notifications.is_empty());
+        assert!(mapping.warning.is_some());
+    }
+
+    #[test]
     fn ui_protocol_progress_maps_reasoning_chunk_to_reasoning_delta() {
         let mapping = map_progress_json(
             &context(),
@@ -776,6 +851,32 @@ mod tests {
         );
         assert_eq!(mapping.status, None);
         assert_eq!(mapping.warning, None);
+    }
+
+    #[test]
+    fn ui_protocol_progress_bounds_tool_end_preview_from_raw_json() {
+        // Raw progress JSON can come from arbitrary producers (binary
+        // plugins) — the mapper must bound before the durable ledger.
+        let mapping = map_progress_json(
+            &context(),
+            &json!({
+                "type": "tool_end",
+                "tool": "shell",
+                "tool_call_id": "call-9",
+                "success": false,
+                "output_preview": "x".repeat(9000),
+            }),
+        );
+        let [UiNotification::ToolCompleted(completed)] = mapping.notifications.as_slice() else {
+            panic!("expected tool completed notification");
+        };
+        let preview = completed.output_preview.as_deref().expect("preview");
+        assert!(
+            preview.chars().count()
+                <= octos_core::ui_protocol::ENVELOPE_TOOL_OUTPUT_PREVIEW_MAX + 1,
+            "mapper must bound raw-JSON previews, got {} chars",
+            preview.chars().count()
+        );
     }
 
     #[test]

@@ -811,6 +811,34 @@ impl Agent {
                     timestamp: chrono::Utc::now(),
                 }];
 
+                // #1587: session-start conversational episodic recall.
+                // Recall on an EMPTY-history turn — normally the first turn
+                // of a conversation — so the cost (one embed) is paid once
+                // per conversation, NOT per turn, and the contamination
+                // surface is a single injection. Inherits the guard from the
+                // shared helper (embedder-only, 0.55 floor); no-op without an
+                // embedder or on empty input.
+                //
+                // "Empty history" is the trigger, not a strict session
+                // counter: a rare speculative-interrupt retry can re-invoke
+                // with the empty pre-primary snapshot and recall again. That
+                // is harmless — each turn builds a FRESH prompt, so a repeat
+                // adds one embed on that path and never accumulates or
+                // duplicates within a prompt. A "recalled once" marker was
+                // deliberately NOT added: if the agent were reused across a
+                // `/new` fork it would wrongly SUPPRESS recall on a genuine
+                // new conversation, and missing recall is worse than a rare
+                // extra embed on an advisory feature.
+                if history.is_empty() && !user_content.trim().is_empty() {
+                    let default_cwd = std::path::PathBuf::from(".");
+                    let cwd = self.tools.workspace_root().unwrap_or(default_cwd.as_path());
+                    if let Some(recall) =
+                        self.recall_relevant_episodes(user_content, cwd, true).await
+                    {
+                        messages.push(recall);
+                    }
+                }
+
                 messages.extend_from_slice(history);
 
                 // A turn carrying BOTH an audio attachment (a spoken/voice turn)
@@ -921,6 +949,7 @@ impl Agent {
                                 reasoning_content: None,
                                 provider_metadata: None,
                                 token_usage: turn.total_usage().clone(),
+                                estimated_spend_usd: turn.priced_spend(),
                                 files_modified,
                                 files_to_send,
                                 streamed: false,
@@ -948,7 +977,14 @@ impl Agent {
                     // LLM call when a compaction policy is wired and the
                     // context already exceeds the declared threshold.
                     if iteration == 1 {
-                        self.maybe_run_preflight_compaction(&mut messages)?;
+                        if let Some(summary) =
+                            self.maybe_run_preflight_compaction(&mut messages)?
+                        {
+                            // #1587 write side: a conversation large enough to
+                            // compact on entry is worth recalling later. Upserts
+                            // the per-session episode (see save_conversation_episode).
+                            self.save_conversation_episode(summary).await;
+                        }
                     }
                     // Harness M8.5 tier 1: cheap in-place stale/oversized
                     // tool-result pruning. Runs every iteration (including
@@ -961,7 +997,17 @@ impl Agent {
                     // runner sees the final shape of the conversation (after
                     // tool-pair repair + system-message normalization). This
                     // also feeds the validator rail on subsequent iterations.
-                    self.maybe_run_turn_compaction(&mut messages, iteration)?;
+                    if let Some(summary) =
+                        self.maybe_run_turn_compaction(&mut messages, iteration)?
+                    {
+                        // #1587 write side: a conversation that compacts is
+                        // substantial enough to be worth recalling later.
+                        // Persist the compaction summary as an embedded
+                        // episode so a future conversation's session-start
+                        // recall can surface it. No-op without an embedder
+                        // or when episodes are disabled.
+                        self.save_conversation_episode(summary).await;
+                    }
                     self.prepare_prompt_with_context_manager(
                         &mut messages,
                         if iteration == 1 {
@@ -993,7 +1039,7 @@ impl Agent {
                     // providers ignore `context_management` via
                     // `skip_serializing_if`.
                     let call_config = with_tier2_context_management(&config, self);
-                    let (mut response, streamed) = match self
+                    let (mut response, streamed, attributed_cost) = match self
                         .call_llm_with_hooks(
                             &messages,
                             &tools_spec,
@@ -1103,6 +1149,12 @@ impl Agent {
                         response.usage.input_tokens,
                         response.usage.output_tokens,
                         tracker,
+                        // Attributed inside `call_llm_with_hooks`: each
+                        // attempt (discarded retries included) priced at the
+                        // slot that actually consumed it — re-pricing the
+                        // merged usage at the winner's rate here would
+                        // misprice cross-provider retries.
+                        attributed_cost,
                     );
 
                     match response.stop_reason {
@@ -1121,7 +1173,7 @@ impl Agent {
                             {
                                 continue;
                             }
-                            self.emit_cost_update(turn.total_usage(), &response);
+                            self.emit_cost_update(&turn, &response, attributed_cost);
                             return Ok(ConversationResponse {
                                 content,
                                 reasoning_content: response.reasoning_content.clone(),
@@ -1129,6 +1181,7 @@ impl Agent {
                                     self.llm.provider_metadata_for_index(response.provider_index),
                                 ),
                                 token_usage: turn.total_usage().clone(),
+                                estimated_spend_usd: turn.priced_spend(),
                                 files_modified,
                                 files_to_send,
                                 streamed,
@@ -1217,12 +1270,13 @@ impl Agent {
                                             decision = %outcome.decision,
                                             "shell spiral terminal: returning recovered content as final assistant reply"
                                         );
-                                        self.emit_cost_update(turn.total_usage(), &response);
+                                        self.emit_cost_update(&turn, &response, attributed_cost);
                                         return Ok(ConversationResponse {
                                             content: terminal_content,
                                             reasoning_content: None,
                                             provider_metadata: None,
                                             token_usage: turn.total_usage().clone(),
+                                estimated_spend_usd: turn.priced_spend(),
                                             files_modified,
                                             files_to_send,
                                             streamed,
@@ -1261,7 +1315,7 @@ impl Agent {
                                     // returns on second fire is caught and
                                     // converted to a terminal Ok response
                                     // here so callers don't see an error.
-                                    self.emit_cost_update(turn.total_usage(), &response);
+                                    self.emit_cost_update(&turn, &response, attributed_cost);
                                     match self.dedup_loop_warning(warning) {
                                         Ok(warning_content) => {
                                             inject_loop_detected_synthetic_results_with_log(
@@ -1285,6 +1339,7 @@ impl Agent {
                                                 reasoning_content: None,
                                                 provider_metadata: None,
                                                 token_usage: turn.total_usage().clone(),
+                                estimated_spend_usd: turn.priced_spend(),
                                                 files_modified,
                                                 files_to_send,
                                                 streamed,
@@ -1358,7 +1413,7 @@ impl Agent {
                             // `Agent::execute_approved_tool` when an
                             // authorized human answers.
                             if let Some(draft) = iter_pending_approval {
-                                self.emit_cost_update(turn.total_usage(), &sanitized_response);
+                                self.emit_cost_update(&turn, &sanitized_response, attributed_cost);
                                 return Ok(ConversationResponse {
                                     content: String::new(),
                                     reasoning_content: None,
@@ -1368,6 +1423,7 @@ impl Agent {
                                         ),
                                     ),
                                     token_usage: turn.total_usage().clone(),
+                                estimated_spend_usd: turn.priced_spend(),
                                     files_modified,
                                     files_to_send,
                                     streamed,
@@ -1448,7 +1504,7 @@ impl Agent {
                                     decision = %outcome.decision,
                                     "shell spiral terminal: returning recovered content as final assistant reply"
                                 );
-                                self.emit_cost_update(turn.total_usage(), &response);
+                                self.emit_cost_update(&turn, &response, attributed_cost);
                                 return Ok(ConversationResponse {
                                     content: terminal_content,
                                     reasoning_content: None,
@@ -1458,6 +1514,7 @@ impl Agent {
                                         ),
                                     ),
                                     token_usage: turn.total_usage().clone(),
+                                estimated_spend_usd: turn.priced_spend(),
                                     files_modified,
                                     files_to_send,
                                     streamed,
@@ -1554,7 +1611,7 @@ impl Agent {
                                     {
                                         continue;
                                     }
-                                    self.emit_cost_update(turn.total_usage(), &response);
+                                    self.emit_cost_update(&turn, &response, attributed_cost);
                                     // Post-spawn failure feedback loop
                                     // (feat/spawn-only-failure-feedback-loop):
                                     // record that the synth-ack went out for
@@ -1631,6 +1688,7 @@ impl Agent {
                                             self.llm.provider_metadata_for_index(response.provider_index),
                                         ),
                                         token_usage: turn.total_usage().clone(),
+                                estimated_spend_usd: turn.priced_spend(),
                                         files_modified,
                                         files_to_send,
                                         streamed,
@@ -1655,7 +1713,7 @@ impl Agent {
                             }
                         }
                         StopReason::MaxTokens => {
-                            self.emit_cost_update(turn.total_usage(), &response);
+                            self.emit_cost_update(&turn, &response, attributed_cost);
                             return Ok(ConversationResponse {
                                 content: response.content.unwrap_or_default(),
                                 reasoning_content: response.reasoning_content.clone(),
@@ -1663,6 +1721,7 @@ impl Agent {
                                     self.llm.provider_metadata_for_index(response.provider_index),
                                 ),
                                 token_usage: turn.total_usage().clone(),
+                                estimated_spend_usd: turn.priced_spend(),
                                 files_modified,
                                 files_to_send,
                                 streamed,
@@ -1675,7 +1734,7 @@ impl Agent {
                         StopReason::ContentFiltered => {
                             // After retries in call_llm_with_hooks, content is still filtered.
                             // Return a user-visible message instead of empty content.
-                            self.emit_cost_update(turn.total_usage(), &response);
+                            self.emit_cost_update(&turn, &response, attributed_cost);
                             warn!("content filtered by provider safety/moderation after retries");
                             return Ok(ConversationResponse {
                                 content: response.content.unwrap_or_else(|| {
@@ -1688,6 +1747,7 @@ impl Agent {
                                     self.llm.provider_metadata_for_index(response.provider_index),
                                 ),
                                 token_usage: turn.total_usage().clone(),
+                                estimated_spend_usd: turn.priced_spend(),
                                 files_modified,
                                 files_to_send,
                                 streamed,
@@ -1798,7 +1858,7 @@ impl Agent {
 
                 // M8.5 tier 2: decorate the config with the Anthropic header.
                 let call_config = with_tier2_context_management(&config, self);
-                let (mut response, _streamed) = match self
+                let (mut response, _streamed, attributed_cost) = match self
                     .call_llm_with_hooks(
                         &messages,
                         &tools_spec,
@@ -1826,7 +1886,14 @@ impl Agent {
                     }
                 };
                 Self::normalize_inline_invokes(&mut response);
-                turn.record_usage(response.usage.input_tokens, response.usage.output_tokens, None);
+                turn.record_usage(
+                    response.usage.input_tokens,
+                    response.usage.output_tokens,
+                    None,
+                    // Attributed per attempt inside `call_llm_with_hooks`
+                    // (cross-provider retries priced at their own slot).
+                    attributed_cost,
+                );
 
                 let tool_names: Vec<&str> = response
                     .tool_calls
@@ -1911,7 +1978,7 @@ impl Agent {
                             }
                         }
 
-                        self.emit_cost_update(turn.total_usage(), &final_response);
+                        self.emit_cost_update(&turn, &final_response, attributed_cost);
 
                         // Audit Gap-8: auto-fire `check_workspace_contract`
                         // on Completion. The LLM-callable wrapper stays for
@@ -1945,6 +2012,10 @@ impl Agent {
                                 &task.context.working_dir,
                                 None,
                                 &files_to_send,
+                                // #1607: the Agent's own registry is built
+                                // sandboxed in `session_actor`, so its stored
+                                // sandbox is the session backend.
+                                self.tools.sandbox(),
                             )
                             .await;
                         let contract_failures =
@@ -2064,7 +2135,7 @@ impl Agent {
 
                         let final_response =
                             response_with_max_token_fragments(&response, &max_token_fragments);
-                        self.emit_cost_update(turn.total_usage(), &final_response);
+                        self.emit_cost_update(&turn, &final_response, attributed_cost);
                         self.reporter().report(ProgressEvent::TaskCompleted {
                             success: false,
                             iterations: iteration,
@@ -2079,7 +2150,7 @@ impl Agent {
                     }
                     StopReason::ContentFiltered => {
                         warn!("content filtered by provider safety/moderation in task");
-                        self.emit_cost_update(turn.total_usage(), &response);
+                        self.emit_cost_update(&turn, &response, attributed_cost);
                         self.reporter().report(ProgressEvent::TaskCompleted {
                             success: false,
                             iterations: iteration,
@@ -2497,7 +2568,14 @@ impl Agent {
         if let Some(files_to_send) = files_to_send {
             files_to_send.extend(tool_send_files);
         }
-        turn.record_usage(tool_tokens.input_tokens, tool_tokens.output_tokens, tracker);
+        turn.record_usage(
+            tool_tokens.input_tokens,
+            tool_tokens.output_tokens,
+            tracker,
+            // Tool-reported usage has no per-response provider attribution;
+            // price it at the active slot as the closest estimate.
+            self.response_usage_cost(tool_tokens.input_tokens, tool_tokens.output_tokens, None),
+        );
         // Codex round-3: return the sanitized response so the caller's
         // synth-ack gate sees the SAME tool_call_ids that the success-bit
         // sink was keyed by. See doc-comment on this fn.
@@ -6813,6 +6891,7 @@ printf '{"output":"voice saved","success":true}\n'
             tmp_root,
             Some(WorkspaceProjectKind::Slides),
             &files_to_send,
+            std::sync::Arc::new(crate::sandbox::NoSandbox),
         )
         .await;
     }

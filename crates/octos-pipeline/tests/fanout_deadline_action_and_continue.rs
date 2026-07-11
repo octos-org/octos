@@ -128,6 +128,9 @@ async fn make_executor(dir: &TempDir) -> PipelineExecutor {
         host_context: octos_pipeline::host_context::PipelineHostContext::default(),
         embedder: None,
         catalog_dir: None,
+        // #1607: pipeline validators run under a no-op sandbox in tests
+        // (host-independent — command validators run the argv directly).
+        sandbox: octos_agent::SandboxConfig::default(),
     };
     PipelineExecutor::new(config)
 }

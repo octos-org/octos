@@ -46,6 +46,7 @@ pub mod role_template;
 pub mod sandbox;
 mod sanitize;
 pub mod session;
+pub mod session_usage;
 pub mod skills;
 pub mod steering;
 pub mod subagent_output;
@@ -159,6 +160,7 @@ pub use role_template::{
 };
 pub use sandbox::{Sandbox, SandboxConfig, SandboxMode, create_sandbox};
 pub use session::{SessionLimits, SessionState, SessionStateHandle, SessionUsage};
+pub use session_usage::{SessionUsageHandle, SessionUsageSnapshot, SharedSessionUsage};
 pub use skills::{SkillInfo, SkillsLoader};
 pub use steering::{SteeringMessage, SteeringReceiver, SteeringSender};
 pub use subagent_output::{
@@ -189,8 +191,8 @@ pub use tools::{
     GlobTool, GrepTool, HttpMcpAgent, ListDirTool, MAX_DEPTH, MakeTypeEntry, ManageSkillsTool,
     McpAgentBackend, McpAgentBackendConfig, MemoryNoteTool, MessageTool,
     MofaDescribeContentTypeTool, MofaMakeTool, PolicyDecision, ReadFileTool, ReadTaskOutputTool,
-    RecallMemoryTool, RobotToolRegistry, SaveMemoryTool, SendAppCardTool, SendFileTool,
-    SharedBackend, ShellTool, SpawnTool, StdioMcpAgent, SynthesizeResearchTool, Tool,
+    RecallMemoryTool, RecordMemoryUseTool, RobotToolRegistry, SaveMemoryTool, SendAppCardTool,
+    SendFileTool, SharedBackend, ShellTool, SpawnTool, StdioMcpAgent, SynthesizeResearchTool, Tool,
     ToolApprovalDecision, ToolApprovalRequest, ToolApprovalRequester, ToolConfigStore, ToolPolicy,
     ToolRegistry, ToolResult, TurnAttachmentContext, UserQuestionOutcome, UserQuestionRequest,
     UserQuestionRequester, WebFetchTool, WebSearchTool, WriteFileTool,

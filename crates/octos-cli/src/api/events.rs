@@ -79,25 +79,51 @@ pub(crate) fn event_to_json(event: &ProgressEvent, thread_id: Option<&str>) -> s
                 "task_id": task_id,
             })
         }
-        ProgressEvent::ToolStarted { name, tool_id } => {
-            serde_json::json!({
+        ProgressEvent::ToolStarted {
+            name,
+            tool_id,
+            arguments,
+        } => {
+            let mut value = serde_json::json!({
                 "type": "tool_start",
                 "tool": name,
                 "tool_call_id": tool_id,
-            })
+            });
+            // Additive: carried so the UI-protocol mapper (`map_tool_start`)
+            // and the envelope `arguments_preview` can echo the call.
+            if let Some(arguments) = arguments {
+                value["arguments"] = arguments.clone();
+            }
+            value
         }
         ProgressEvent::ToolCompleted {
             name,
             tool_id,
             success,
-            ..
+            output_preview,
+            duration,
         } => {
-            serde_json::json!({
+            let mut value = serde_json::json!({
                 "type": "tool_end",
                 "tool": name,
                 "tool_call_id": tool_id,
                 "success": success,
-            })
+                "duration_ms": duration.as_millis() as u64,
+            });
+            // Additive: the mapper (`map_tool_end`) lifts these onto
+            // `ToolCompletedEvent` so tool cards and envelope previews can
+            // show the result excerpt. Bounded HERE — the chokepoint feeding
+            // both the durable notification ledger and the envelope lane —
+            // because producers are not trustworthy about size (a failing
+            // tool emits unbounded `e.to_string()`).
+            if !output_preview.is_empty() {
+                value["output_preview"] = serde_json::json!(octos_core::truncated_utf8(
+                    output_preview,
+                    octos_core::ui_protocol::ENVELOPE_TOOL_OUTPUT_PREVIEW_MAX,
+                    "…",
+                ));
+            }
+            value
         }
         ProgressEvent::ToolProgress {
             name,
@@ -160,6 +186,9 @@ pub(crate) fn event_to_json(event: &ProgressEvent, thread_id: Option<&str>) -> s
         }
         ProgressEvent::FileModified { path } => {
             serde_json::json!({"type": "file_modified", "path": path})
+        }
+        ProgressEvent::PlanUpdated { plan } => {
+            serde_json::json!({"type": "plan_updated", "plan": plan})
         }
         ProgressEvent::TokenUsage {
             input_tokens,
@@ -243,11 +272,28 @@ mod tests {
         let event = ProgressEvent::ToolStarted {
             name: "shell".into(),
             tool_id: "t1".into(),
+            arguments: None,
         };
         let json = event_to_json(&event, None);
         assert_eq!(json["type"], "tool_start");
         assert_eq!(json["tool"], "shell");
         assert_eq!(json["tool_call_id"], "t1");
+        // No-args calls omit the field entirely (additive wire).
+        assert!(json.get("arguments").is_none());
+    }
+
+    #[test]
+    fn event_to_json_tool_started_carries_arguments() {
+        // The fidelity route: arguments must survive Progress→JSON so the
+        // UI-protocol mapper (`map_tool_start`) and the envelope
+        // `arguments_preview` can echo the call.
+        let event = ProgressEvent::ToolStarted {
+            name: "shell".into(),
+            tool_id: "t1".into(),
+            arguments: Some(serde_json::json!({"command": "cargo test"})),
+        };
+        let json = event_to_json(&event, None);
+        assert_eq!(json["arguments"]["command"], "cargo test");
     }
 
     #[test]
@@ -264,6 +310,31 @@ mod tests {
         assert_eq!(json["tool"], "read_file");
         assert_eq!(json["tool_call_id"], "t2");
         assert_eq!(json["success"], true);
+        // Fidelity route: preview + duration survive Progress→JSON for the
+        // mapper (`map_tool_end`) and the envelope `output_preview`.
+        assert_eq!(json["output_preview"], "contents");
+        assert_eq!(json["duration_ms"], 42);
+    }
+
+    #[test]
+    fn event_to_json_bounds_giant_output_preview() {
+        // A failing tool emits unbounded `e.to_string()` — this serializer is
+        // the chokepoint before the durable ledger + envelope lane.
+        let event = ProgressEvent::ToolCompleted {
+            name: "shell".into(),
+            tool_id: "t9".into(),
+            success: false,
+            output_preview: "é".repeat(9000),
+            duration: Duration::from_millis(1),
+        };
+        let json = event_to_json(&event, None);
+        let preview = json["output_preview"].as_str().expect("preview");
+        assert!(
+            preview.chars().count()
+                <= octos_core::ui_protocol::ENVELOPE_TOOL_OUTPUT_PREVIEW_MAX + 1,
+            "preview must be bounded, got {} chars",
+            preview.chars().count()
+        );
     }
 
     #[test]
@@ -331,6 +402,8 @@ mod tests {
         let event = ProgressEvent::CostUpdate {
             session_input_tokens: 100,
             session_output_tokens: 50,
+            turn_input_tokens: 100,
+            turn_output_tokens: 50,
             response_cost: Some(0.001),
             session_cost: Some(0.005),
             model: None,
@@ -352,6 +425,8 @@ mod tests {
         let event = ProgressEvent::CostUpdate {
             session_input_tokens: 200,
             session_output_tokens: 100,
+            turn_input_tokens: 200,
+            turn_output_tokens: 100,
             response_cost: None,
             session_cost: None,
             model: None,
@@ -371,6 +446,8 @@ mod tests {
         let event = ProgressEvent::CostUpdate {
             session_input_tokens: 12,
             session_output_tokens: 7,
+            turn_input_tokens: 12,
+            turn_output_tokens: 7,
             response_cost: None,
             session_cost: None,
             model: Some("deepseek-v4-pro".into()),
@@ -386,6 +463,8 @@ mod tests {
         let event = ProgressEvent::CostUpdate {
             session_input_tokens: 1,
             session_output_tokens: 1,
+            turn_input_tokens: 1,
+            turn_output_tokens: 1,
             response_cost: None,
             session_cost: None,
             model: None,
@@ -433,6 +512,7 @@ mod tests {
                 ProgressEvent::ToolStarted {
                     name: "shell".into(),
                     tool_id: "t1".into(),
+                    arguments: None,
                 },
                 "tool_start",
             ),
@@ -473,6 +553,8 @@ mod tests {
                 ProgressEvent::CostUpdate {
                     session_input_tokens: 0,
                     session_output_tokens: 0,
+                    turn_input_tokens: 0,
+                    turn_output_tokens: 0,
                     response_cost: None,
                     session_cost: None,
                     model: None,

@@ -247,6 +247,13 @@ pub const UI_PROTOCOL_FEATURE_USER_QUESTION_V1: &str = "user_question.v1";
 /// turn keeps emitting whole-file `file/attached` audio.
 pub const UI_PROTOCOL_FEATURE_VOICE_AUDIO_V1: &str = "event.voice_audio.v1";
 
+/// Feature flag for the model-authored plan/todo checklist. When negotiated,
+/// the server pushes `plan/updated` notifications carrying the agent's current
+/// ordered checklist (the `update_plan` tool's live state), and replays the
+/// latest snapshot on `session/open`. Not negotiated → the plan rides out only
+/// on the legacy `tool/completed` `structured_metadata` path.
+pub const UI_PROTOCOL_FEATURE_PLAN_TODOS_V1: &str = "plan.todos.v1";
+
 /// Server-known feature registry. Used by
 /// [`UiProtocolCapabilities::for_negotiated_features`] (UPCR-2026-007) to
 /// intersect a client's `X-Octos-Ui-Features` request with the names the
@@ -276,6 +283,7 @@ pub const UI_PROTOCOL_KNOWN_FEATURES: &[&str] = &[
     UI_PROTOCOL_FEATURE_HARNESS_TASK_ARTIFACTS_V1,
     UI_PROTOCOL_FEATURE_USER_QUESTION_V1,
     UI_PROTOCOL_FEATURE_VOICE_AUDIO_V1,
+    UI_PROTOCOL_FEATURE_PLAN_TODOS_V1,
 ];
 
 /// Returns the feature flag that gates `method` per spec § 7 capability
@@ -311,7 +319,11 @@ fn method_capability_gate(method: &str) -> Option<&'static str> {
         | methods::SYSTEM_STATUS_GET
         | methods::CONTENT_LIST
         | methods::CONTENT_DELETE
-        | methods::CONTENT_BULK_DELETE => Some(UI_PROTOCOL_FEATURE_AUXILIARY_REST_TO_WS_V1),
+        | methods::CONTENT_BULK_DELETE
+        | methods::MEMORY_OVERVIEW
+        | methods::MEMORY_ENTITY
+        | methods::CRON_LIST
+        | methods::CRON_TOGGLE => Some(UI_PROTOCOL_FEATURE_AUXILIARY_REST_TO_WS_V1),
         methods::AGENT_LIST
         | methods::AGENT_STATUS_READ
         | methods::AGENT_OUTPUT_READ
@@ -974,10 +986,17 @@ pub mod methods {
     /// rewind), persist an idempotent append-only marker, and return the
     /// trimmed hydrated thread. MUTATING: changes persisted session state.
     pub const SESSION_ROLLBACK: &str = "session/rollback";
+    /// `session/fork` — create a NEW session copying the tail of an
+    /// existing one (`SessionManager::fork`; parent tracked via
+    /// `parent_key`). MUTATING: writes the child session to disk.
+    pub const SESSION_FORK: &str = "session/fork";
     /// UPCR-2026-010 `thread/graph/get` — thread partition for the session.
     pub const THREAD_GRAPH_GET: &str = "thread/graph/get";
     /// UPCR-2026-011 `turn/state/get` — turn lifecycle introspection.
     pub const TURN_STATE_GET: &str = "turn/state/get";
+    /// `session/btw` — quick aside question answered out-of-band (no tools)
+    /// while the session's live turn, if any, keeps running.
+    pub const SESSION_BTW: &str = "session/btw";
 
     /// UPCR-2026-021 M15 agent inspection/control surface.
     pub const AGENT_LIST: &str = "agent/list";
@@ -1031,6 +1050,9 @@ pub mod methods {
     /// `approval/requested`). Gated by `user_question.v1`.
     pub const USER_QUESTION_REQUESTED: &str = "user_question/requested";
     pub const TASK_UPDATED: &str = "task/updated";
+    /// Model-authored plan/todo checklist snapshot (the `update_plan` tool).
+    /// Gated by `plan.todos.v1`. Replaces any prior plan wholesale.
+    pub const PLAN_UPDATED: &str = "plan/updated";
     pub const TASK_OUTPUT_DELTA: &str = "task/output/delta";
     pub const PROGRESS_UPDATED: &str = "progress/updated";
     pub const WARNING: &str = "warning";
@@ -1137,6 +1159,15 @@ pub mod methods {
     pub const CONTENT_DELETE: &str = "content/delete";
     /// Replaces `POST /api/my/content/bulk-delete` — bulk-content deletion.
     pub const CONTENT_BULK_DELETE: &str = "content/bulk_delete";
+    /// Replaces `GET /api/my/memory` — memory panel overview (long-term
+    /// memory, daily notes, entity bank summaries, staging count).
+    pub const MEMORY_OVERVIEW: &str = "memory/overview";
+    /// Replaces `GET /api/my/memory/entities/{name}` — full entity page.
+    pub const MEMORY_ENTITY: &str = "memory/entity";
+    /// Replaces `GET /api/my/cron` — cron panel job listing.
+    pub const CRON_LIST: &str = "cron/list";
+    /// Replaces `PUT /api/my/cron/{job_id}/enabled` — cron job toggle.
+    pub const CRON_TOGGLE: &str = "cron/toggle";
 
     // ---- Wave4-A: adaptive routing + queue state ----
 
@@ -1194,6 +1225,7 @@ pub const UI_PROTOCOL_COMMAND_METHODS: &[&str] = &[
     methods::TURN_INTERRUPT,
     methods::APPROVAL_RESPOND,
     methods::APPROVAL_SCOPES_LIST,
+    methods::SESSION_BTW,
     methods::USER_QUESTION_RESPOND,
     methods::PERMISSION_PROFILE_LIST,
     methods::PERMISSION_PROFILE_SET,
@@ -1204,6 +1236,7 @@ pub const UI_PROTOCOL_COMMAND_METHODS: &[&str] = &[
     methods::TASK_OUTPUT_READ,
     methods::SESSION_HYDRATE,
     methods::SESSION_ROLLBACK,
+    methods::SESSION_FORK,
     methods::THREAD_GRAPH_GET,
     methods::TURN_STATE_GET,
     methods::AGENT_LIST,
@@ -1238,6 +1271,10 @@ pub const UI_PROTOCOL_COMMAND_METHODS: &[&str] = &[
     methods::CONTENT_LIST,
     methods::CONTENT_DELETE,
     methods::CONTENT_BULK_DELETE,
+    methods::MEMORY_OVERVIEW,
+    methods::MEMORY_ENTITY,
+    methods::CRON_LIST,
+    methods::CRON_TOGGLE,
     methods::ROUTER_SET_MODE,
     methods::ROUTER_GET_METRICS,
 ];
@@ -1259,6 +1296,7 @@ pub const UI_PROTOCOL_NOTIFICATION_METHODS: &[&str] = &[
     methods::APPROVAL_CANCELLED,
     methods::USER_QUESTION_REQUESTED,
     methods::TASK_UPDATED,
+    methods::PLAN_UPDATED,
     methods::TASK_OUTPUT_DELTA,
     methods::PROGRESS_UPDATED,
     methods::WARNING,
@@ -1297,6 +1335,7 @@ pub const UI_PROTOCOL_FIRST_SERVER_METHODS: &[&str] = &[
     methods::TURN_INTERRUPT,
     methods::APPROVAL_RESPOND,
     methods::APPROVAL_SCOPES_LIST,
+    methods::SESSION_BTW,
     methods::USER_QUESTION_RESPOND,
     methods::PERMISSION_PROFILE_LIST,
     methods::PERMISSION_PROFILE_SET,
@@ -1307,6 +1346,7 @@ pub const UI_PROTOCOL_FIRST_SERVER_METHODS: &[&str] = &[
     methods::TASK_OUTPUT_READ,
     methods::SESSION_HYDRATE,
     methods::SESSION_ROLLBACK,
+    methods::SESSION_FORK,
     methods::THREAD_GRAPH_GET,
     methods::TURN_STATE_GET,
     methods::AGENT_LIST,
@@ -1341,6 +1381,10 @@ pub const UI_PROTOCOL_FIRST_SERVER_METHODS: &[&str] = &[
     methods::CONTENT_LIST,
     methods::CONTENT_DELETE,
     methods::CONTENT_BULK_DELETE,
+    methods::MEMORY_OVERVIEW,
+    methods::MEMORY_ENTITY,
+    methods::CRON_LIST,
+    methods::CRON_TOGGLE,
     methods::ROUTER_SET_MODE,
     methods::ROUTER_GET_METRICS,
 ];
@@ -1422,6 +1466,7 @@ impl UiProtocolCapabilities {
             UI_PROTOCOL_FEATURE_REVIEW_START_V1,
             UI_PROTOCOL_FEATURE_CONTEXT_LIFECYCLE_V1,
             UI_PROTOCOL_FEATURE_USER_QUESTION_V1,
+            UI_PROTOCOL_FEATURE_PLAN_TODOS_V1,
         ])
     }
 
@@ -1701,8 +1746,10 @@ pub enum UiResultKind {
     TaskArtifactRead,
     SessionHydrate,
     SessionRollback,
+    SessionFork,
     ThreadGraphGet,
     TurnStateGet,
+    SessionBtw,
     UnsupportedCapability,
 }
 
@@ -1725,8 +1772,10 @@ pub fn first_server_result_kind_for_method(method: &str) -> Option<UiResultKind>
         methods::TASK_ARTIFACT_READ => Some(UiResultKind::TaskArtifactRead),
         methods::SESSION_HYDRATE => Some(UiResultKind::SessionHydrate),
         methods::SESSION_ROLLBACK => Some(UiResultKind::SessionRollback),
+        methods::SESSION_FORK => Some(UiResultKind::SessionFork),
         methods::THREAD_GRAPH_GET => Some(UiResultKind::ThreadGraphGet),
         methods::TURN_STATE_GET => Some(UiResultKind::TurnStateGet),
+        methods::SESSION_BTW => Some(UiResultKind::SessionBtw),
         _ => None,
     }
 }
@@ -2584,6 +2633,14 @@ pub struct HydratedMessage {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client_message_id: Option<String>,
     pub persisted_at: DateTime<Utc>,
+    /// Reasoning/thinking text captured for this message (#1502), when the
+    /// provider emitted it. Surfaced on hydrate so the "· reasoning" block
+    /// survives a client restart instead of silently vanishing — the store
+    /// has persisted it all along. Gated on `event.spawn_complete.v1` like
+    /// `message_id`/`source`, so non-negotiated clients keep the pre-fix
+    /// wire byte-identical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
     /// Stable per-row identity, derived from `(session_id, seq,
     /// timestamp_nanos)` — identical to what
     /// [`MessagePersistedEvent::message_id`] and
@@ -2764,6 +2821,28 @@ pub struct SessionRollbackResult {
     pub thread: SessionHydrateResult,
 }
 
+/// Params for `session/fork`: branch a new session off `session_id`,
+/// copying the last `copy_messages` messages (absent → the FULL
+/// history). `new_chat_id` becomes the child's chat id; the channel is
+/// derived from the parent key (`channel:chat_id`), matching
+/// `SessionManager::fork`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionForkParams {
+    pub session_id: SessionKey,
+    pub new_chat_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub copy_messages: Option<u32>,
+}
+
+/// Result for `session/fork`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionForkResult {
+    pub new_session_id: SessionKey,
+    pub parent_session_id: SessionKey,
+    /// Messages actually copied into the child.
+    pub copied_messages: u32,
+}
+
 // ----- UPCR-2026-010 `thread/graph/get` -----
 
 /// Params for `thread/graph/get` (UPCR-2026-010).
@@ -2815,6 +2894,30 @@ impl TurnLifecycleState {
             Self::Unknown => "unknown",
         }
     }
+}
+
+/// Params for `session/btw` — a quick aside question ("btw, what are you
+/// working on?") answered out-of-band while the session's live turn, if any,
+/// keeps running. The server answers with ONE restricted LLM call over a
+/// snapshot of the session's recent context: no tools, capped output, and the
+/// exchange is ephemeral — it is never appended to the session history, so the
+/// live turn never sees it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionBtwParams {
+    pub session_id: SessionKey,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub topic: Option<String>,
+    pub question: String,
+}
+
+/// Result for `session/btw`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionBtwResult {
+    pub session_id: SessionKey,
+    pub answer: String,
+    /// Model that produced the answer, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
 }
 
 /// Params for `turn/state/get` (UPCR-2026-011).
@@ -3085,6 +3188,95 @@ pub const CONTENT_BULK_DELETE_MAX_IDS: usize = 256;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContentBulkDeleteResult {
     pub deleted: usize,
+}
+
+/// Params for `memory/overview`. Empty today; the struct exists so
+/// `{}` / `null` params decode uniformly (mirrors
+/// [`SystemStatusGetParams`]; the wire `params` MEMBER must still be
+/// present — the frame parser rejects requests without one).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemoryOverviewParams {}
+
+/// Result for `memory/overview`. `overview` is the JSON body of the
+/// existing `GET /api/my/memory` handler (`MemoryOverviewResponse` —
+/// `crates/octos-cli/src/api/memory_panel.rs`), forwarded whole so the
+/// wire shape and the REST shape cannot drift apart — PLUS RPC-layer
+/// truncation metadata: the panel serves files up to 2 MiB but an RPC
+/// result must fit one ~1 MiB WS text frame, so the dispatcher caps
+/// each document field to a per-field byte budget and records the
+/// truth beside it (`long_term_truncated` + `long_term_total_bytes`,
+/// `today_truncated` + `today_total_bytes`, and per `recent[]` note
+/// `content_truncated` + `content_total_bytes`; always present on the
+/// WS wire). Capped fields are clean UTF-8 prefixes — no in-band
+/// marker is ever spliced into the markdown.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MemoryOverviewResult {
+    pub overview: Value,
+}
+
+/// Params for `memory/entity`. `name` is the entity page stem — the
+/// same value the REST route took as its `{name}` path segment and the
+/// same string `memory/overview` returns in each entity summary.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemoryEntityParams {
+    pub name: String,
+}
+
+/// Result for `memory/entity`. Mirrors the JSON body of
+/// `GET /api/my/memory/entities/{name}` minus the redundant `ok` flag
+/// (RPC success is carried by the envelope), plus RPC-layer truncation
+/// metadata (the panel serves files up to 2 MiB; an RPC result must
+/// fit one ~1 MiB WS text frame).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemoryEntityResult {
+    pub name: String,
+    /// Page markdown. When `content_truncated` is true this is a clean
+    /// UTF-8 PREFIX of the page capped at the RPC-layer byte budget —
+    /// no in-band marker is spliced into it.
+    pub content: String,
+    /// True when `content` was capped to fit the WS frame.
+    pub content_truncated: bool,
+    /// Raw byte length of the FULL page before any RPC-layer cap.
+    pub content_total_bytes: usize,
+}
+
+/// Params for `cron/list`. Empty today; the struct exists so `{}` /
+/// `null` params decode uniformly (mirrors [`SystemStatusGetParams`];
+/// the wire `params` MEMBER must still be present).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CronListParams {}
+
+/// Result for `cron/list`. Mirrors the JSON body of `GET /api/my/cron`:
+/// `jobs` is the rendered job array, `count` its length, and
+/// `gateway_running` reports whether a spawned gateway child owns
+/// `cron.json` (toggles are refused while it does).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CronListResult {
+    pub jobs: Value,
+    pub count: usize,
+    pub gateway_running: bool,
+    /// True when `jobs` was capped (row count or serialized byte budget) so the
+    /// result fits a single WS frame. `count` still reports the true total, so a
+    /// client can surface "showing N of `count`". Defaults to `false` for
+    /// backward compatibility with pre-truncation payloads.
+    #[serde(default)]
+    pub truncated: bool,
+}
+
+/// Params for `cron/toggle`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CronToggleParams {
+    pub job_id: String,
+    pub enabled: bool,
+}
+
+/// Result for `cron/toggle`. `job` is the updated job rendered exactly
+/// as a `cron/list` entry. Refusals (spawned gateway owns the store)
+/// surface as an RPC error whose `data.detail` is `"gateway_running"`
+/// with `data.rest_status = 409`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CronToggleResult {
+    pub job: Value,
 }
 
 // ----- Wave4-A `router/*` + `queue/state` -----
@@ -3393,6 +3585,16 @@ pub struct FileRef {
     pub size_bytes: u64,
 }
 
+/// Bound for [`Payload::ToolStart::arguments_preview`]: enough for a
+/// meaningful `shell(cd … && cargo test …)` argument echo without letting a
+/// 1MB tool-arg blob into every persisted envelope + hydrate replay.
+pub const ENVELOPE_TOOL_ARGUMENTS_PREVIEW_MAX: usize = 700;
+
+/// Bound for [`Payload::ToolEnd::output_preview`]: a screenful of result
+/// excerpt for the tool card, not the full output (which stays in the
+/// transcript/tool message).
+pub const ENVELOPE_TOOL_OUTPUT_PREVIEW_MAX: usize = 2048;
+
 /// Sealed tagged union of payloads carried by the M9-γ projection
 /// envelope. Each variant carries everything the projection needs;
 /// the projection function is `(committed_log) → ChatViewModel` and
@@ -3457,7 +3659,17 @@ pub enum Payload {
     AssistantPersisted { text: String, meta: MessageMeta },
     /// Tool invocation begun. The projection opens a tool-call card
     /// keyed on `tool_call_id`.
-    ToolStart { tool_call_id: String, name: String },
+    ToolStart {
+        tool_call_id: String,
+        name: String,
+        /// Compact JSON of the call arguments, UTF-8-truncated to
+        /// [`ENVELOPE_TOOL_ARGUMENTS_PREVIEW_MAX`] — display fidelity for
+        /// tool cards (`shell(cd … && cargo test)`), NOT a replayable
+        /// argument record. `None` on argument-less calls and on
+        /// envelopes persisted before this field existed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        arguments_preview: Option<String>,
+    },
     /// Tool emitted a progress message. Idempotent per `(tool_call_id,
     /// seq)`; the projection appends in `seq` order.
     ToolProgress {
@@ -3475,6 +3687,15 @@ pub enum Payload {
         error: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reason: Option<String>,
+        /// First lines of the tool result, UTF-8-truncated to
+        /// [`ENVELOPE_TOOL_OUTPUT_PREVIEW_MAX`] — the `⎿ …` result excerpt
+        /// under the card. `None` for output-less tools and on envelopes
+        /// persisted before this field existed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        output_preview: Option<String>,
+        /// Wall-clock duration of the call, when the emitter tracked it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        duration_ms: Option<u64>,
     },
     /// File attached to the current thread (e.g. `.md` report from
     /// `deep_search` or `.mp3` from `fm_tts`). The projection adds the
@@ -3643,8 +3864,10 @@ pub enum UiCommand {
     TaskArtifactRead(TaskArtifactReadParams),
     SessionHydrate(SessionHydrateParams),
     SessionRollback(SessionRollbackParams),
+    SessionFork(SessionForkParams),
     ThreadGraphGet(ThreadGraphGetParams),
     TurnStateGet(TurnStateGetParams),
+    SessionBtw(SessionBtwParams),
     // ---- M12 Phase D-1 auxiliary REST → WS frames ----
     SessionList(SessionListParams),
     SessionSnapshot(SessionSnapshotParams),
@@ -3659,6 +3882,10 @@ pub enum UiCommand {
     ContentList(ContentListParams),
     ContentDelete(ContentDeleteParams),
     ContentBulkDelete(ContentBulkDeleteParams),
+    MemoryOverview(MemoryOverviewParams),
+    MemoryEntity(MemoryEntityParams),
+    CronList(CronListParams),
+    CronToggle(CronToggleParams),
     // ---- Wave4-A: adaptive router controls ----
     RouterSetMode(RouterSetModeParams),
     RouterGetMetrics(RouterGetMetricsParams),
@@ -3685,8 +3912,10 @@ impl UiCommand {
             Self::TaskArtifactRead(_) => methods::TASK_ARTIFACT_READ,
             Self::SessionHydrate(_) => methods::SESSION_HYDRATE,
             Self::SessionRollback(_) => methods::SESSION_ROLLBACK,
+            Self::SessionFork(_) => methods::SESSION_FORK,
             Self::ThreadGraphGet(_) => methods::THREAD_GRAPH_GET,
             Self::TurnStateGet(_) => methods::TURN_STATE_GET,
+            Self::SessionBtw(_) => methods::SESSION_BTW,
             Self::SessionList(_) => methods::SESSION_LIST,
             Self::SessionSnapshot(_) => methods::SESSION_SNAPSHOT,
             Self::SessionMessagesPage(_) => methods::SESSION_MESSAGES_PAGE,
@@ -3700,6 +3929,10 @@ impl UiCommand {
             Self::ContentList(_) => methods::CONTENT_LIST,
             Self::ContentDelete(_) => methods::CONTENT_DELETE,
             Self::ContentBulkDelete(_) => methods::CONTENT_BULK_DELETE,
+            Self::MemoryOverview(_) => methods::MEMORY_OVERVIEW,
+            Self::MemoryEntity(_) => methods::MEMORY_ENTITY,
+            Self::CronList(_) => methods::CRON_LIST,
+            Self::CronToggle(_) => methods::CRON_TOGGLE,
             Self::RouterSetMode(_) => methods::ROUTER_SET_MODE,
             Self::RouterGetMetrics(_) => methods::ROUTER_GET_METRICS,
         }
@@ -3729,8 +3962,10 @@ impl UiCommand {
             Self::TaskArtifactRead(params) => serde_json::to_value(params),
             Self::SessionHydrate(params) => serde_json::to_value(params),
             Self::SessionRollback(params) => serde_json::to_value(params),
+            Self::SessionFork(params) => serde_json::to_value(params),
             Self::ThreadGraphGet(params) => serde_json::to_value(params),
             Self::TurnStateGet(params) => serde_json::to_value(params),
+            Self::SessionBtw(params) => serde_json::to_value(params),
             Self::SessionList(params) => serde_json::to_value(params),
             Self::SessionSnapshot(params) => serde_json::to_value(params),
             Self::SessionMessagesPage(params) => serde_json::to_value(params),
@@ -3744,6 +3979,10 @@ impl UiCommand {
             Self::ContentList(params) => serde_json::to_value(params),
             Self::ContentDelete(params) => serde_json::to_value(params),
             Self::ContentBulkDelete(params) => serde_json::to_value(params),
+            Self::MemoryOverview(params) => serde_json::to_value(params),
+            Self::MemoryEntity(params) => serde_json::to_value(params),
+            Self::CronList(params) => serde_json::to_value(params),
+            Self::CronToggle(params) => serde_json::to_value(params),
             Self::RouterSetMode(params) => serde_json::to_value(params),
             Self::RouterGetMetrics(params) => serde_json::to_value(params),
         }?;
@@ -3799,8 +4038,10 @@ impl UiCommand {
             }
             methods::SESSION_HYDRATE => Ok(Self::SessionHydrate(decode_params(method, params)?)),
             methods::SESSION_ROLLBACK => Ok(Self::SessionRollback(decode_params(method, params)?)),
+            methods::SESSION_FORK => Ok(Self::SessionFork(decode_params(method, params)?)),
             methods::THREAD_GRAPH_GET => Ok(Self::ThreadGraphGet(decode_params(method, params)?)),
             methods::TURN_STATE_GET => Ok(Self::TurnStateGet(decode_params(method, params)?)),
+            methods::SESSION_BTW => Ok(Self::SessionBtw(decode_params(method, params)?)),
             methods::SESSION_LIST => Ok(Self::SessionList(decode_optional_params(method, params)?)),
             methods::SESSION_SNAPSHOT => Ok(Self::SessionSnapshot(decode_params(method, params)?)),
             methods::SESSION_MESSAGES_PAGE => {
@@ -3828,6 +4069,12 @@ impl UiCommand {
             methods::CONTENT_BULK_DELETE => {
                 Ok(Self::ContentBulkDelete(decode_params(method, params)?))
             }
+            methods::MEMORY_OVERVIEW => Ok(Self::MemoryOverview(decode_optional_params(
+                method, params,
+            )?)),
+            methods::MEMORY_ENTITY => Ok(Self::MemoryEntity(decode_params(method, params)?)),
+            methods::CRON_LIST => Ok(Self::CronList(decode_optional_params(method, params)?)),
+            methods::CRON_TOGGLE => Ok(Self::CronToggle(decode_params(method, params)?)),
             methods::ROUTER_SET_MODE => Ok(Self::RouterSetMode(decode_params(method, params)?)),
             methods::ROUTER_GET_METRICS => {
                 Ok(Self::RouterGetMetrics(decode_params(method, params)?))
@@ -4143,8 +4390,10 @@ pub enum UiRpcResult {
     TaskArtifactRead(TaskArtifactReadResult),
     SessionHydrate(SessionHydrateResult),
     SessionRollback(SessionRollbackResult),
+    SessionFork(SessionForkResult),
     ThreadGraphGet(ThreadGraphGetResult),
     TurnStateGet(TurnStateGetResult),
+    SessionBtw(SessionBtwResult),
     UnsupportedCapability(UnsupportedCapabilityResult),
 }
 
@@ -4168,8 +4417,10 @@ impl UiRpcResult {
             Self::TaskArtifactRead(_) => UiResultKind::TaskArtifactRead,
             Self::SessionHydrate(_) => UiResultKind::SessionHydrate,
             Self::SessionRollback(_) => UiResultKind::SessionRollback,
+            Self::SessionFork(_) => UiResultKind::SessionFork,
             Self::ThreadGraphGet(_) => UiResultKind::ThreadGraphGet,
             Self::TurnStateGet(_) => UiResultKind::TurnStateGet,
+            Self::SessionBtw(_) => UiResultKind::SessionBtw,
             Self::UnsupportedCapability(_) => UiResultKind::UnsupportedCapability,
         }
     }
@@ -4193,8 +4444,10 @@ impl UiRpcResult {
             Self::TaskArtifactRead(_) => Some(methods::TASK_ARTIFACT_READ),
             Self::SessionHydrate(_) => Some(methods::SESSION_HYDRATE),
             Self::SessionRollback(_) => Some(methods::SESSION_ROLLBACK),
+            Self::SessionFork(_) => Some(methods::SESSION_FORK),
             Self::ThreadGraphGet(_) => Some(methods::THREAD_GRAPH_GET),
             Self::TurnStateGet(_) => Some(methods::TURN_STATE_GET),
+            Self::SessionBtw(_) => Some(methods::SESSION_BTW),
             Self::UnsupportedCapability(result) => Some(result.unsupported.method.as_str()),
         }
     }
@@ -4218,8 +4471,10 @@ impl UiRpcResult {
             Self::TaskArtifactRead(result) => serde_json::to_value(result),
             Self::SessionHydrate(result) => serde_json::to_value(result),
             Self::SessionRollback(result) => serde_json::to_value(result),
+            Self::SessionFork(result) => serde_json::to_value(result),
             Self::ThreadGraphGet(result) => serde_json::to_value(result),
             Self::TurnStateGet(result) => serde_json::to_value(result),
+            Self::SessionBtw(result) => serde_json::to_value(result),
             Self::UnsupportedCapability(result) => serde_json::to_value(result),
         }
     }
@@ -4274,8 +4529,10 @@ impl UiRpcResult {
             }
             methods::SESSION_HYDRATE => Ok(Self::SessionHydrate(decode_result(method, result)?)),
             methods::SESSION_ROLLBACK => Ok(Self::SessionRollback(decode_result(method, result)?)),
+            methods::SESSION_FORK => Ok(Self::SessionFork(decode_result(method, result)?)),
             methods::THREAD_GRAPH_GET => Ok(Self::ThreadGraphGet(decode_result(method, result)?)),
             methods::TURN_STATE_GET => Ok(Self::TurnStateGet(decode_result(method, result)?)),
+            methods::SESSION_BTW => Ok(Self::SessionBtw(decode_result(method, result)?)),
             _ => Err(RpcError::method_not_found(method)),
         }
     }
@@ -5182,6 +5439,57 @@ pub struct TaskOutputDeltaEvent {
     pub text: String,
 }
 
+/// Status of one model-authored plan item. Wire form is snake_case
+/// (`"pending"`, `"in_progress"`, `"completed"`) so clients map it to a glyph
+/// without matching free-form strings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlanItemStatus {
+    Pending,
+    InProgress,
+    Completed,
+}
+
+/// One entry in the agent's live checklist (`plan/updated`). `id` is stable
+/// across updates so a client can re-render in place without losing selection
+/// or scroll position when the plan mutates.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UiPlanItem {
+    pub id: String,
+    pub title: String,
+    pub status: PlanItemStatus,
+    /// Optional priority/label tag (e.g. `"P3"`), rendered as a chip.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub priority: Option<String>,
+}
+
+/// Snapshot of the agent's plan for a session. The `update_plan` tool sends the
+/// full ordered list on every call, so a `plan/updated` REPLACES any prior
+/// plan wholesale rather than diffing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UiPlanRecord {
+    pub items: Vec<UiPlanItem>,
+    /// Overall activity label for the header line (e.g. `"Building memory
+    /// panel…"`). `None` → the client derives one from the in-progress item.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    pub updated_at_ms: i64,
+}
+
+/// `plan/updated` notification payload. Template: [`TaskUpdatedEvent`]. Gated by
+/// `plan.todos.v1`; replayed as an ephemeral snapshot on `session/open`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PlanUpdatedEvent {
+    pub session_id: SessionKey,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub topic: Option<String>,
+    /// The turn that authored this plan, when known. Lets the client scope the
+    /// panel to the active turn and drop it on turn completion.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_id: Option<TurnId>,
+    pub plan: UiPlanRecord,
+}
+
 /// Runtime policy details attached to M15 agent records. The policy stamp is
 /// backend-owned and intentionally open so future autonomy policy fields round
 /// trip without forcing clients back to raw JSON.
@@ -5723,6 +6031,8 @@ pub enum UiNotification {
     /// `ApprovalRequested`; pauses the turn at the blocking-tool boundary.
     UserQuestionRequested(UserQuestionRequestedEvent),
     TaskUpdated(TaskUpdatedEvent),
+    /// Model-authored plan/todo checklist snapshot (gated by `plan.todos.v1`).
+    PlanUpdated(PlanUpdatedEvent),
     TaskOutputDelta(TaskOutputDeltaEvent),
     ProgressUpdated(ProgressUpdatedEvent),
     Warning(WarningEvent),
@@ -5824,6 +6134,7 @@ impl UiNotification {
             Self::ApprovalCancelled(_) => methods::APPROVAL_CANCELLED,
             Self::UserQuestionRequested(_) => methods::USER_QUESTION_REQUESTED,
             Self::TaskUpdated(_) => methods::TASK_UPDATED,
+            Self::PlanUpdated(_) => methods::PLAN_UPDATED,
             Self::TaskOutputDelta(_) => methods::TASK_OUTPUT_DELTA,
             Self::ProgressUpdated(_) => methods::PROGRESS_UPDATED,
             Self::Warning(_) => methods::WARNING,
@@ -5874,6 +6185,7 @@ impl UiNotification {
             Self::ApprovalCancelled(event) => &event.session_id,
             Self::UserQuestionRequested(event) => &event.session_id,
             Self::TaskUpdated(event) => &event.session_id,
+            Self::PlanUpdated(event) => &event.session_id,
             Self::TaskOutputDelta(event) => &event.session_id,
             Self::ProgressUpdated(event) => &event.session_id,
             Self::Warning(event) => &event.session_id,
@@ -5946,6 +6258,7 @@ impl UiNotification {
                 event.topic.as_deref().or_else(|| event.session_id.topic())
             }
             Self::TaskUpdated(event) => event.topic.as_deref().or_else(|| event.session_id.topic()),
+            Self::PlanUpdated(event) => event.topic.as_deref().or_else(|| event.session_id.topic()),
             Self::TaskOutputDelta(event) => {
                 event.topic.as_deref().or_else(|| event.session_id.topic())
             }
@@ -5994,6 +6307,7 @@ impl UiNotification {
             Self::ApprovalCancelled(event) => set_topic_if_absent(&mut event.topic, &topic),
             Self::UserQuestionRequested(event) => set_topic_if_absent(&mut event.topic, &topic),
             Self::TaskUpdated(event) => set_topic_if_absent(&mut event.topic, &topic),
+            Self::PlanUpdated(event) => set_topic_if_absent(&mut event.topic, &topic),
             Self::TaskOutputDelta(event) => set_topic_if_absent(&mut event.topic, &topic),
             Self::TurnCompleted(event) => set_topic_if_absent(&mut event.topic, &topic),
             Self::TurnError(event) => set_topic_if_absent(&mut event.topic, &topic),
@@ -6029,6 +6343,7 @@ impl UiNotification {
             Self::ApprovalCancelled(params) => serde_json::to_value(params),
             Self::UserQuestionRequested(params) => serde_json::to_value(params),
             Self::TaskUpdated(params) => serde_json::to_value(params),
+            Self::PlanUpdated(params) => serde_json::to_value(params),
             Self::TaskOutputDelta(params) => serde_json::to_value(params),
             Self::ProgressUpdated(params) => serde_json::to_value(params),
             Self::Warning(params) => serde_json::to_value(params),
@@ -6146,6 +6461,7 @@ impl UiNotification {
                 Ok(Self::UserQuestionRequested(decode_params(method, params)?))
             }
             methods::TASK_UPDATED => Ok(Self::TaskUpdated(decode_params(method, params)?)),
+            methods::PLAN_UPDATED => Ok(Self::PlanUpdated(decode_params(method, params)?)),
             methods::TASK_OUTPUT_DELTA => Ok(Self::TaskOutputDelta(decode_params(method, params)?)),
             methods::PROGRESS_UPDATED => Ok(Self::ProgressUpdated(decode_params(method, params)?)),
             methods::WARNING => Ok(Self::Warning(decode_params(method, params)?)),
@@ -6883,6 +7199,7 @@ mod tests {
                 "turn/interrupt",
                 "approval/respond",
                 "approval/scopes/list",
+                "session/btw",
                 "user_question/respond",
                 "permission/profile/list",
                 "permission/profile/set",
@@ -6893,6 +7210,7 @@ mod tests {
                 "task/output/read",
                 "session/hydrate",
                 "session/rollback",
+                "session/fork",
                 "thread/graph/get",
                 "turn/state/get",
                 "agent/list",
@@ -6927,6 +7245,10 @@ mod tests {
                 "content/list",
                 "content/delete",
                 "content/bulk_delete",
+                "memory/overview",
+                "memory/entity",
+                "cron/list",
+                "cron/toggle",
                 "router/set_mode",
                 "router/get_metrics",
             ]
@@ -6949,6 +7271,7 @@ mod tests {
                 "approval/cancelled",
                 "user_question/requested",
                 "task/updated",
+                "plan/updated",
                 "task/output/delta",
                 "progress/updated",
                 "warning",
@@ -6988,6 +7311,7 @@ mod tests {
                 "turn/interrupt",
                 "approval/respond",
                 "approval/scopes/list",
+                "session/btw",
                 "user_question/respond",
                 "permission/profile/list",
                 "permission/profile/set",
@@ -6998,6 +7322,7 @@ mod tests {
                 "task/output/read",
                 "session/hydrate",
                 "session/rollback",
+                "session/fork",
                 "thread/graph/get",
                 "turn/state/get",
                 "agent/list",
@@ -7032,6 +7357,10 @@ mod tests {
                 "content/list",
                 "content/delete",
                 "content/bulk_delete",
+                "memory/overview",
+                "memory/entity",
+                "cron/list",
+                "cron/toggle",
                 "router/set_mode",
                 "router/get_metrics",
             ]
@@ -7062,6 +7391,7 @@ mod tests {
                     "turn/interrupt",
                     "approval/respond",
                     "approval/scopes/list",
+                    "session/btw",
                     "user_question/respond",
                     "permission/profile/list",
                     "permission/profile/set",
@@ -7072,6 +7402,7 @@ mod tests {
                     "task/output/read",
                     "session/hydrate",
                     "session/rollback",
+                    "session/fork",
                     "thread/graph/get",
                     "turn/state/get",
                     "agent/list",
@@ -7106,6 +7437,10 @@ mod tests {
                     "content/list",
                     "content/delete",
                     "content/bulk_delete",
+                    "memory/overview",
+                    "memory/entity",
+                    "cron/list",
+                    "cron/toggle",
                     "router/set_mode",
                     "router/get_metrics"
                 ],
@@ -7125,6 +7460,7 @@ mod tests {
                     "approval/cancelled",
                     "user_question/requested",
                     "task/updated",
+                    "plan/updated",
                     "task/output/delta",
                     "progress/updated",
                     "warning",
@@ -7178,7 +7514,8 @@ mod tests {
                     "harness.task_supervision_inspection.v1",
                     "harness.task_artifacts.v1",
                     "user_question.v1",
-                    "event.voice_audio.v1"
+                    "event.voice_audio.v1",
+                    "plan.todos.v1"
                 ]
             })
         );
@@ -9733,6 +10070,53 @@ mod tests {
         assert_eq!(decoded, event);
     }
 
+    #[test]
+    fn plan_updated_event_round_trips_and_advertises() {
+        let event = UiNotification::PlanUpdated(PlanUpdatedEvent {
+            // No topic in the key → `stamp_topic_from_session` is a no-op, so the
+            // absent-`topic` assertion below holds and the round-trip is exact.
+            session_id: SessionKey("acct:web:tui".into()),
+            topic: None,
+            turn_id: None,
+            plan: UiPlanRecord {
+                items: vec![
+                    UiPlanItem {
+                        id: "1".into(),
+                        title: "web P3: PWA manifest + bridge hygiene".into(),
+                        status: PlanItemStatus::Completed,
+                        priority: Some("P3".into()),
+                    },
+                    UiPlanItem {
+                        id: "2".into(),
+                        title: "memory panel (octos endpoints + web UI)".into(),
+                        status: PlanItemStatus::InProgress,
+                        priority: None,
+                    },
+                ],
+                title: Some("Building memory panel…".into()),
+                updated_at_ms: 1_700_000_000_000,
+            },
+        });
+        assert_eq!(event.method(), methods::PLAN_UPDATED);
+
+        let rpc = event
+            .clone()
+            .into_rpc_notification()
+            .expect("serialize plan/updated");
+        // Status is snake_case on the wire; an absent `priority`/`topic` stays
+        // absent (no `null` leakage that would clobber a cached value).
+        assert_eq!(rpc.params["plan"]["items"][1]["status"], "in_progress");
+        assert!(rpc.params["plan"]["items"][1].get("priority").is_none());
+        assert!(rpc.params.get("topic").is_none());
+
+        let decoded = UiNotification::from_rpc_notification(rpc).expect("deserialize plan/updated");
+        assert_eq!(decoded, event);
+
+        // Advertised in both the notification and feature registries.
+        assert!(UI_PROTOCOL_NOTIFICATION_METHODS.contains(&methods::PLAN_UPDATED));
+        assert!(UI_PROTOCOL_KNOWN_FEATURES.contains(&UI_PROTOCOL_FEATURE_PLAN_TODOS_V1));
+    }
+
     /// #1123 codex P2 follow-up to #1113: pin that the new M13-B
     /// projection fields (source / role / summary / artifact_count /
     /// runtime_policy_stamp) round-trip through serde on
@@ -9918,6 +10302,7 @@ mod tests {
                 message_id: Some("local:demo:17:1700000000000000000".into()),
                 source: Some("user".into()),
                 media: vec![],
+                reasoning_content: None,
             }]),
             threads: Some(vec![ThreadGraphEntry {
                 thread_id: "thread-1".into(),
@@ -10624,17 +11009,39 @@ mod tests {
                 }),
                 methods::CONTENT_BULK_DELETE,
             ),
+            (
+                UiCommand::MemoryOverview(MemoryOverviewParams::default()),
+                methods::MEMORY_OVERVIEW,
+            ),
+            (
+                UiCommand::MemoryEntity(MemoryEntityParams {
+                    name: "acme-corp".into(),
+                }),
+                methods::MEMORY_ENTITY,
+            ),
+            (
+                UiCommand::CronList(CronListParams::default()),
+                methods::CRON_LIST,
+            ),
+            (
+                UiCommand::CronToggle(CronToggleParams {
+                    job_id: "job-1".into(),
+                    enabled: false,
+                }),
+                methods::CRON_TOGGLE,
+            ),
         ];
         assert_eq!(
             cases.len(),
-            13,
-            "13 UiCommand arms cover the 13 auxiliary methods \
+            17,
+            "17 UiCommand arms cover the 17 auxiliary methods \
              (`session/list`, `session/snapshot`, `session/messages_page`, \
              `session/status.get`, `session/files.list`, `session/tasks.list`, \
              `session/workspace.get`, `session/title.set`, `session/delete`, \
              `system/status.get`, `content/list`, `content/delete`, \
-             `content/bulk_delete`) — `content/delete` and `content/bulk_delete` \
-             are distinct methods"
+             `content/bulk_delete`, `memory/overview`, `memory/entity`, \
+             `cron/list`, `cron/toggle`) — `content/delete` and \
+             `content/bulk_delete` are distinct methods"
         );
         for (command, expected_method) in cases {
             let rpc = command
@@ -10666,6 +11073,15 @@ mod tests {
             UiCommand::from_method_and_params(methods::CONTENT_LIST, Value::Null)
                 .expect("content/list with null params");
         assert!(matches!(content_list_null, UiCommand::ContentList(_)));
+
+        let memory_overview_null =
+            UiCommand::from_method_and_params(methods::MEMORY_OVERVIEW, Value::Null)
+                .expect("memory/overview with null params");
+        assert!(matches!(memory_overview_null, UiCommand::MemoryOverview(_)));
+
+        let cron_list_null = UiCommand::from_method_and_params(methods::CRON_LIST, Value::Null)
+            .expect("cron/list with null params");
+        assert!(matches!(cron_list_null, UiCommand::CronList(_)));
     }
 
     #[test]
@@ -10729,6 +11145,42 @@ mod tests {
         let value = serde_json::to_value(&bulk).expect("serialize");
         let decoded: ContentBulkDeleteResult = serde_json::from_value(value).expect("deserialize");
         assert_eq!(decoded, bulk);
+
+        let overview = MemoryOverviewResult {
+            overview: serde_json::json!({ "ok": true, "long_term": "# MEMORY" }),
+        };
+        let value = serde_json::to_value(&overview).expect("serialize");
+        let decoded: MemoryOverviewResult = serde_json::from_value(value).expect("deserialize");
+        assert_eq!(decoded.overview, overview.overview);
+
+        let entity = MemoryEntityResult {
+            name: "acme-corp".into(),
+            content: "# acme".into(),
+            content_truncated: false,
+            content_total_bytes: 6,
+        };
+        let value = serde_json::to_value(&entity).expect("serialize");
+        let decoded: MemoryEntityResult = serde_json::from_value(value).expect("deserialize");
+        assert_eq!(decoded, entity);
+
+        let cron = CronListResult {
+            jobs: serde_json::json!([{ "id": "job-1" }]),
+            count: 1,
+            gateway_running: false,
+            truncated: false,
+        };
+        let value = serde_json::to_value(&cron).expect("serialize");
+        let decoded: CronListResult = serde_json::from_value(value).expect("deserialize");
+        assert_eq!(decoded.jobs, cron.jobs);
+        assert_eq!(decoded.count, cron.count);
+        assert!(!decoded.gateway_running);
+
+        let toggle = CronToggleResult {
+            job: serde_json::json!({ "id": "job-1", "enabled": false }),
+        };
+        let value = serde_json::to_value(&toggle).expect("serialize");
+        let decoded: CronToggleResult = serde_json::from_value(value).expect("deserialize");
+        assert_eq!(decoded.job, toggle.job);
     }
 
     #[test]
@@ -10752,6 +11204,10 @@ mod tests {
             methods::CONTENT_LIST,
             methods::CONTENT_DELETE,
             methods::CONTENT_BULK_DELETE,
+            methods::MEMORY_OVERVIEW,
+            methods::MEMORY_ENTITY,
+            methods::CRON_LIST,
+            methods::CRON_TOGGLE,
         ] {
             assert!(
                 !none.supports_method(method),
@@ -10776,6 +11232,10 @@ mod tests {
             methods::CONTENT_LIST,
             methods::CONTENT_DELETE,
             methods::CONTENT_BULK_DELETE,
+            methods::MEMORY_OVERVIEW,
+            methods::MEMORY_ENTITY,
+            methods::CRON_LIST,
+            methods::CRON_TOGGLE,
         ] {
             assert!(
                 with_feature.supports_method(method),
@@ -10955,6 +11415,37 @@ mod tests {
             .expect("serialize"),
             serde_json::json!({ "ids": ["c-1", "c-2"] }),
         );
+
+        // memory/overview — empty
+        assert_eq!(
+            serde_json::to_value(MemoryOverviewParams::default()).expect("serialize"),
+            serde_json::json!({}),
+        );
+
+        // memory/entity
+        assert_eq!(
+            serde_json::to_value(MemoryEntityParams {
+                name: "acme-corp".into(),
+            })
+            .expect("serialize"),
+            serde_json::json!({ "name": "acme-corp" }),
+        );
+
+        // cron/list — empty
+        assert_eq!(
+            serde_json::to_value(CronListParams::default()).expect("serialize"),
+            serde_json::json!({}),
+        );
+
+        // cron/toggle
+        assert_eq!(
+            serde_json::to_value(CronToggleParams {
+                job_id: "job-1".into(),
+                enabled: true,
+            })
+            .expect("serialize"),
+            serde_json::json!({ "job_id": "job-1", "enabled": true }),
+        );
     }
 
     /// Codex review 2026-05-12 (MEDIUM 2): JSON golden assertions for
@@ -11087,6 +11578,60 @@ mod tests {
         assert_eq!(
             serde_json::to_value(ContentBulkDeleteResult { deleted: 12 }).expect("serialize"),
             serde_json::json!({ "deleted": 12 }),
+        );
+
+        // memory/overview — `{ overview: <opaque REST body> }`
+        assert_eq!(
+            serde_json::to_value(MemoryOverviewResult {
+                overview: serde_json::json!({ "ok": true, "staging_notes": 2 }),
+            })
+            .expect("serialize"),
+            serde_json::json!({ "overview": { "ok": true, "staging_notes": 2 } }),
+        );
+
+        // memory/entity — `{ name, content, content_truncated,
+        // content_total_bytes }` (truncation metadata is part of the
+        // wire contract: capped fields must be DECLARED, never silent).
+        assert_eq!(
+            serde_json::to_value(MemoryEntityResult {
+                name: "acme-corp".into(),
+                content: "# acme".into(),
+                content_truncated: false,
+                content_total_bytes: 6,
+            })
+            .expect("serialize"),
+            serde_json::json!({
+                "name": "acme-corp",
+                "content": "# acme",
+                "content_truncated": false,
+                "content_total_bytes": 6,
+            }),
+        );
+
+        // cron/list — `{ jobs, count, gateway_running, truncated }`
+        assert_eq!(
+            serde_json::to_value(CronListResult {
+                jobs: serde_json::json!([{ "id": "job-1" }]),
+                count: 1,
+                gateway_running: true,
+                truncated: false,
+            })
+            .expect("serialize"),
+            serde_json::json!({
+                "jobs": [{ "id": "job-1" }],
+                "count": 1,
+                "gateway_running": true,
+                "truncated": false,
+            }),
+        );
+
+        // cron/toggle — `{ job: <opaque cron/list entry> }`
+        assert_eq!(
+            serde_json::to_value(CronToggleResult {
+                job: serde_json::json!({ "id": "job-1", "enabled": false }),
+            })
+            .expect("serialize"),
+            serde_json::json!({ "job": { "id": "job-1", "enabled": false } }),
         );
     }
 
@@ -11262,12 +11807,94 @@ mod tests {
     }
 
     #[test]
+    fn golden_envelope_tool_fidelity_round_trip_and_legacy_decode() {
+        // Enriched shape: arguments/output previews + duration survive the
+        // wire round-trip.
+        let start = envelope(
+            4,
+            Payload::ToolStart {
+                tool_call_id: "tc-1".into(),
+                name: "shell".into(),
+                arguments_preview: Some("command: \"cargo test\"".into()),
+            },
+        );
+        let end = envelope(
+            5,
+            Payload::ToolEnd {
+                tool_call_id: "tc-1".into(),
+                status: EnvelopeToolEndStatus::Complete,
+                error: None,
+                reason: None,
+                output_preview: Some("test result: ok. 815 passed".into()),
+                duration_ms: Some(1234),
+            },
+        );
+        for env in [start, end] {
+            let value = serde_json::to_value(&env).expect("serialize");
+            let parsed: Envelope = serde_json::from_value(value).expect("deserialize");
+            assert_eq!(parsed, env);
+        }
+
+        // Legacy wire (envelopes persisted before the fidelity fields
+        // existed) must still decode — fields default to None. Build the
+        // legacy shape by stripping the new keys from a modern envelope so
+        // the fixture tracks the real tag/content encoding.
+        let strip = |env: &Envelope, keys: &[&str]| -> Envelope {
+            let mut value = serde_json::to_value(env).expect("serialize");
+            let data = value["payload"]["data"]
+                .as_object_mut()
+                .expect("payload data object");
+            for key in keys {
+                data.remove(*key);
+            }
+            serde_json::from_value(value).expect("legacy envelope decodes")
+        };
+        let start = envelope(
+            8,
+            Payload::ToolStart {
+                tool_call_id: "tc-9".into(),
+                name: "read_file".into(),
+                arguments_preview: Some("path: \"x\"".into()),
+            },
+        );
+        match strip(&start, &["arguments_preview"]).payload {
+            Payload::ToolStart {
+                arguments_preview, ..
+            } => assert_eq!(arguments_preview, None),
+            other => panic!("expected ToolStart, got {other:?}"),
+        }
+        let end = envelope(
+            9,
+            Payload::ToolEnd {
+                tool_call_id: "tc-9".into(),
+                status: EnvelopeToolEndStatus::Complete,
+                error: None,
+                reason: None,
+                output_preview: Some("ok".into()),
+                duration_ms: Some(1),
+            },
+        );
+        match strip(&end, &["output_preview", "duration_ms"]).payload {
+            Payload::ToolEnd {
+                output_preview,
+                duration_ms,
+                ..
+            } => {
+                assert_eq!(output_preview, None);
+                assert_eq!(duration_ms, None);
+            }
+            other => panic!("expected ToolEnd, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn golden_envelope_tool_start_progress_end_round_trip() {
         let start = envelope(
             4,
             Payload::ToolStart {
                 tool_call_id: "tc-1".into(),
                 name: "shell".into(),
+                arguments_preview: None,
             },
         );
         let progress = envelope(
@@ -11284,6 +11911,8 @@ mod tests {
                 status: EnvelopeToolEndStatus::Complete,
                 error: None,
                 reason: None,
+                output_preview: None,
+                duration_ms: None,
             },
         );
         let end_err = envelope(
@@ -11293,6 +11922,8 @@ mod tests {
                 status: EnvelopeToolEndStatus::Error,
                 error: Some("boom".into()),
                 reason: None,
+                output_preview: None,
+                duration_ms: None,
             },
         );
 
@@ -11339,6 +11970,8 @@ mod tests {
                 status: EnvelopeToolEndStatus::Skipped,
                 error: None,
                 reason: Some("deadline elapsed before tool started".into()),
+                output_preview: None,
+                duration_ms: None,
             },
         );
         let aborted = envelope(
@@ -11348,6 +11981,8 @@ mod tests {
                 status: EnvelopeToolEndStatus::Aborted,
                 error: None,
                 reason: Some("user issued turn/interrupt".into()),
+                output_preview: None,
+                duration_ms: None,
             },
         );
         for (env, expected_status) in [(&skipped, "skipped"), (&aborted, "aborted")] {

@@ -74,6 +74,178 @@ const NO_EMBEDDER_RECALL_SKIPPED_MSG: &str =
     "memory recall: no embedder configured; skipping episodic recall (no cross-task injection)";
 
 impl Agent {
+    /// Embedding-backed episodic recall for `query`, gated by the shared
+    /// contamination guard: hybrid scored+filtered search at the
+    /// [`MIN_EPISODE_SIMILARITY`] floor when an embedder is present, and a
+    /// NO-OP (`None`) otherwise — BM25-only same-workspace recall can't
+    /// tell on-task from cross-task and would leak unrelated memory.
+    /// Returns the "Relevant Past Experiences" system message to inject, or
+    /// `None`. Shared by the task loop ([`Self::build_initial_messages`])
+    /// and conversational session-start recall (#1587). `cwd` is used only
+    /// for the no-embedder diagnostic log.
+    pub(super) async fn recall_relevant_episodes(
+        &self,
+        query: &str,
+        cwd: &std::path::Path,
+        include_conversations: bool,
+    ) -> Option<Message> {
+        let Some(ref embedder) = self.embedder else {
+            tracing::debug!(
+                caller = "agent_memory_no_embedder",
+                agent = %self.id,
+                cwd = %cwd.display(),
+                query_len = query.len(),
+                "{NO_EMBEDDER_RECALL_SKIPPED_MSG}"
+            );
+            return None;
+        };
+        // Source isolation (codex #1618 P2): a TASK's generic query (e.g.
+        // the fixed "code review") can BM25-admit an unrelated CONVERSATION
+        // summary past the 0.55 floor. Task recall excludes conversation
+        // episodes (the store guarantees none leak in); conversation recall
+        // keeps both.
+        let exclude_conversation = !include_conversations;
+        let scored_result = match embedder.embed(&[query]).await {
+            Ok(vecs) => {
+                let query_emb = vecs.into_iter().next();
+                self.memory
+                    .find_relevant_hybrid_scored_filtered(
+                        query,
+                        query_emb,
+                        RELEVANT_EXPERIENCES_INJECT_LIMIT,
+                        Some(MIN_EPISODE_SIMILARITY),
+                        exclude_conversation,
+                    )
+                    .await
+            }
+            Err(e) => {
+                warn!(error = %e, "embedding failed, falling back to keyword search");
+                self.memory
+                    .find_relevant_hybrid_scored_filtered(
+                        query,
+                        None,
+                        RELEVANT_EXPERIENCES_INJECT_LIMIT,
+                        Some(MIN_EPISODE_SIMILARITY),
+                        exclude_conversation,
+                    )
+                    .await
+            }
+        };
+        let scored = scored_result.ok()?;
+        // NEW-06 diagnostic: one structured line naming the admitted
+        // episodes + per-modality scores, so operators can confirm the gate
+        // without inspecting the model-visible prompt.
+        let admitted: Vec<(String, f32, f32, f32)> = scored
+            .iter()
+            .filter(|(_, s)| s.best_modality() >= MIN_EPISODE_SIMILARITY)
+            .map(|(ep, s)| (ep.id.clone(), s.bm25, s.vector, s.combined))
+            .collect();
+        info!(
+            caller = "agent_memory_hybrid",
+            agent = %self.id,
+            query_len = query.len(),
+            candidates = scored.len(),
+            admitted = admitted.len(),
+            threshold = MIN_EPISODE_SIMILARITY,
+            episodes = ?admitted,
+            "memory recall: hybrid scored + filtered path"
+        );
+        let content = format_relevant_experiences(&scored)?;
+        Some(Message {
+            role: MessageRole::System,
+            content,
+            media: vec![],
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+            client_message_id: None,
+            thread_id: None,
+            timestamp: chrono::Utc::now(),
+        })
+    }
+
+    /// Persist a conversation's compaction summary as a searchable episode
+    /// (#1587 write side): store it and — fire-and-forget so the turn isn't
+    /// blocked — embed it, so a future conversation's session-start recall
+    /// ([`Self::recall_relevant_episodes`]) can surface it. No-op unless
+    /// episodes are enabled AND an embedder is present: an unembedded
+    /// episode is invisible to every (embedder-gated) recall path, so
+    /// storing it would only bloat the index.
+    pub(super) async fn save_conversation_episode(&self, summary: String) {
+        if !self.config.save_episodes || self.embedder.is_none() {
+            return;
+        }
+        let summary_truncated = octos_core::truncated_utf8(&summary, 500, "...");
+        if summary_truncated.trim().is_empty() {
+            return;
+        }
+        let cwd = self
+            .tools
+            .workspace_root()
+            .map(std::path::Path::to_path_buf)
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
+
+        let mut episode = octos_memory::Episode::new(
+            octos_core::TaskId::new(),
+            self.id.clone(),
+            cwd,
+            summary_truncated.clone(),
+            octos_memory::EpisodeOutcome::Success,
+        );
+        episode.source = octos_memory::EpisodeSource::Conversation;
+        let ep_id = episode.id.clone();
+        // Save ONCE per session, at the first compaction. Preflight
+        // compaction fires on iteration 1 of EVERY turn once the
+        // conversation is large, so saving on each would grow per-turn
+        // (codex #1618 round-3). Supersede-via-delete was rejected: the
+        // hybrid index only TOMBSTONES on delete (never reclaims), so it
+        // would churn the index per compaction (round-4). One episode
+        // captures the conversation's first substantial summary — enough
+        // for "was there a conversation about X"; durable facts are handled
+        // separately by the memory-refresh pipeline. The swap makes
+        // concurrent saves collapse to exactly one.
+        if self
+            .conversation_episode_saved
+            .swap(true, std::sync::atomic::Ordering::AcqRel)
+        {
+            return;
+        }
+        if let Err(e) = self.memory.store(episode).await {
+            warn!(error = %e, "failed to save conversation episode");
+            // Allow a retry on the next compaction — the save didn't land.
+            self.conversation_episode_saved
+                .store(false, std::sync::atomic::Ordering::Release);
+            return;
+        }
+        info!(
+            episode_id = %ep_id,
+            summary_len = summary_truncated.len(),
+            "saved conversation episode (#1587 write side)"
+        );
+
+        // Fire-and-forget embed (mirrors the task-loop pattern): compaction
+        // already ran mid-turn, so don't add an embed round-trip to the
+        // turn's latency.
+        if let Some(ref embedder) = self.embedder {
+            let embedder = embedder.clone();
+            let memory = self.memory.clone();
+            tokio::spawn(async move {
+                match embedder.embed(&[summary_truncated.as_str()]).await {
+                    Ok(vecs) => {
+                        if let Some(vec) = vecs.into_iter().next() {
+                            if let Err(e) = memory.store_embedding(&ep_id, vec).await {
+                                warn!(error = %e, "failed to store conversation-episode embedding");
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        warn!(error = %e, episode_id = %ep_id, "failed to embed conversation episode");
+                    }
+                }
+            });
+        }
+    }
+
     pub(super) async fn build_initial_messages(&self, task: &Task) -> Vec<Message> {
         let mut messages = vec![Message {
             role: MessageRole::System,
@@ -99,121 +271,15 @@ impl Agent {
             octos_core::TaskKind::Custom { name, .. } => name.clone(),
         };
 
-        // Episodic recall requires an embedder. The hybrid (embedding-aware)
-        // path returns scored matches so we can filter out below-threshold
-        // noise that would otherwise contaminate unrelated sessions. WITHOUT
-        // an embedder we SKIP recall entirely (the `else` below): BM25-only
-        // keyword overlap within a single shared workspace can't discriminate
-        // on-task from cross-task episodes, so injecting it leaks stale,
-        // unrelated memory into the prompt.
-        if let Some(ref embedder) = self.embedder {
-            // Push the modality-aware similarity floor down into the
-            // index via `_filtered`. The floor is applied to every
-            // candidate that contributed in either modality BEFORE the
-            // combined-rank truncation to `limit`, so a high-
-            // `best_modality` low-`combined` candidate (a keyword-perfect
-            // older episode) survives even when many sub-threshold
-            // vector-only hits would otherwise crowd it out. Codex P2
-            // round 2 flagged that a fixed agent-side over-fetch wasn't
-            // sufficient for larger memory stores; pushing the floor
-            // into the index makes the BM25-only recall guarantee hold
-            // regardless of store size.
-            let scored_result = match embedder.embed(&[query.as_str()]).await {
-                Ok(vecs) => {
-                    let query_emb = vecs.into_iter().next();
-                    self.memory
-                        .find_relevant_hybrid_scored_filtered(
-                            &query,
-                            query_emb,
-                            RELEVANT_EXPERIENCES_INJECT_LIMIT,
-                            Some(MIN_EPISODE_SIMILARITY),
-                        )
-                        .await
-                }
-                Err(e) => {
-                    warn!(error = %e, "embedding failed, falling back to keyword search");
-                    self.memory
-                        .find_relevant_hybrid_scored_filtered(
-                            &query,
-                            None,
-                            RELEVANT_EXPERIENCES_INJECT_LIMIT,
-                            Some(MIN_EPISODE_SIMILARITY),
-                        )
-                        .await
-                }
-            };
-
-            if let Ok(scored) = scored_result {
-                // NEW-06 diagnostic: surface which episodes (id + per-
-                // modality scores) the gate ultimately admitted. The
-                // round-3 mini5 contamination shipped silently because
-                // the agent loop had no telemetry on what cleared the
-                // threshold — only the rendered prompt downstream. We
-                // emit one structured log per `build_initial_messages`
-                // so fleet operators can confirm the gate is active
-                // and which episodes contributed without inspecting
-                // the model-visible prompt directly.
-                let admitted: Vec<(String, f32, f32, f32)> = scored
-                    .iter()
-                    .filter(|(_, s)| s.best_modality() >= MIN_EPISODE_SIMILARITY)
-                    .map(|(ep, s)| (ep.id.clone(), s.bm25, s.vector, s.combined))
-                    .collect();
-                info!(
-                    caller = "agent_memory_hybrid",
-                    agent = %self.id,
-                    query_len = query.len(),
-                    candidates = scored.len(),
-                    admitted = admitted.len(),
-                    threshold = MIN_EPISODE_SIMILARITY,
-                    episodes = ?admitted,
-                    "memory recall: hybrid scored + filtered path"
-                );
-                if let Some(content) = format_relevant_experiences(&scored) {
-                    messages.push(Message {
-                        role: MessageRole::System,
-                        content,
-                        media: vec![],
-                        tool_calls: None,
-                        tool_call_id: None,
-                        reasoning_content: None,
-                        client_message_id: None,
-                        thread_id: None,
-                        timestamp: chrono::Utc::now(),
-                    });
-                }
-            }
-        } else {
-            // No-embedder path. Contamination guard (NEW-06 follow-up,
-            // option (a)): when there is NO embedder we skip episodic
-            // recall ENTIRELY rather than injecting BM25-only,
-            // same-workspace matches.
-            //
-            // Rationale for option (a) over raising the floor (option b):
-            // without an embedder the only signal is BM25 keyword overlap
-            // scoped to the working directory. On the soak hosts every
-            // task shares ONE workspace, so a prior *unrelated* episode
-            // that merely shares vocabulary (the "Jingkang Incident"
-            // research doc recalled into a code-review run) can clear any
-            // BM25 floor and get injected into a fresh, unrelated context.
-            // BM25-only same-workspace recall has no reliable way to
-            // distinguish on-task from cross-task here, so there is no
-            // safe value in injecting it at all — skipping is the
-            // least-invasive correct fix. Embedder-backed recall (the
-            // `if let Some(embedder)` arm above) keeps the modality-aware
-            // similarity gate and is unaffected.
-            //
-            // The log is deliberately neutral (`debug!`, no NEW-06 /
-            // `with_embedder` wiring attribution): the only knowable state
-            // here is "this agent has no embedder", which is the expected
-            // condition on an unconfigured host, not evidence of a wiring
-            // bug. See `NO_EMBEDDER_RECALL_SKIPPED_MSG`.
-            tracing::debug!(
-                caller = "agent_memory_no_embedder",
-                agent = %self.id,
-                cwd = %task.context.working_dir.display(),
-                query_len = query.len(),
-                "{NO_EMBEDDER_RECALL_SKIPPED_MSG}"
-            );
+        // Episodic recall (embedder-gated contamination guard lives in the
+        // shared helper). WITHOUT an embedder it is a no-op: BM25-only
+        // keyword overlap within a single shared workspace can't
+        // discriminate on-task from cross-task and would leak stale memory.
+        if let Some(msg) = self
+            .recall_relevant_episodes(&query, &task.context.working_dir, false)
+            .await
+        {
+            messages.push(msg);
         }
 
         // Add the task as user message
@@ -680,6 +746,248 @@ mod tests {
     /// "Jingkang Incident" research doc leaked into a code-review run.
     /// Post-fix (option a): the no-embedder branch skips recall entirely,
     /// so no "Relevant Past Experiences" message is produced.
+    /// Embedder that returns one fixed unit vector for every text, so a
+    /// stored episode carrying the SAME vector matches at cosine 1.0 —
+    /// deterministic vector-modality admission independent of BM25.
+    struct ConstEmbedder;
+
+    #[async_trait::async_trait]
+    impl octos_llm::EmbeddingProvider for ConstEmbedder {
+        async fn embed(&self, texts: &[&str]) -> eyre::Result<Vec<Vec<f32>>> {
+            Ok(vec![Self::vector(); texts.len()])
+        }
+        fn dimension(&self) -> usize {
+            octos_memory::EPISODIC_INDEX_DIMENSION
+        }
+    }
+    impl ConstEmbedder {
+        fn vector() -> Vec<f32> {
+            let mut v = vec![0.0_f32; octos_memory::EPISODIC_INDEX_DIMENSION];
+            v[0] = 1.0;
+            v
+        }
+    }
+
+    #[tokio::test]
+    async fn recall_returns_experiences_when_embedder_present_and_match() {
+        use crate::{Agent, tools::ToolRegistry};
+        use octos_memory::EpisodeStore;
+        use std::sync::Arc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().to_path_buf();
+        let memory = Arc::new(EpisodeStore::open(workspace.join("memory")).await.unwrap());
+
+        let ep = Episode::new(
+            TaskId::new(),
+            AgentId::new("prior"),
+            workspace.clone(),
+            "Tuned the websocket gateway keepalive from 60s to 25s".to_string(),
+            EpisodeOutcome::Success,
+        );
+        let ep_id = ep.id.clone();
+        memory.store(ep).await.unwrap();
+        // Store the SAME vector the embedder returns → cosine 1.0 match.
+        memory
+            .store_embedding(&ep_id, ConstEmbedder::vector())
+            .await
+            .unwrap();
+
+        let provider: Arc<dyn octos_llm::LlmProvider> = Arc::new(EndTurnProvider);
+        let tools = ToolRegistry::with_builtins(&workspace);
+        let agent = Agent::new(AgentId::new("chat"), provider, tools, memory)
+            .with_embedder(Arc::new(ConstEmbedder));
+
+        let msg = agent
+            .recall_relevant_episodes("clients keep dropping", &workspace, true)
+            .await
+            .expect("embedder present + vector match must recall");
+        assert!(msg.content.contains("Relevant Past Experiences"));
+        assert!(msg.content.contains("keepalive"));
+    }
+
+    #[tokio::test]
+    async fn save_conversation_episode_stores_recallable_episode() {
+        use crate::{Agent, tools::ToolRegistry};
+        use octos_memory::EpisodeStore;
+        use std::sync::Arc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().to_path_buf();
+        let memory = Arc::new(EpisodeStore::open(workspace.join("memory")).await.unwrap());
+
+        let provider: Arc<dyn octos_llm::LlmProvider> = Arc::new(EndTurnProvider);
+        let tools = ToolRegistry::with_builtins(&workspace);
+        let agent = Agent::new(AgentId::new("chat"), provider, tools, memory.clone())
+            .with_embedder(Arc::new(ConstEmbedder));
+
+        agent
+            .save_conversation_episode(
+                "We diagnosed the websocket gateway keepalive dropping clients".to_string(),
+            )
+            .await;
+
+        // The store write is awaited (the embed is fire-and-forget); the
+        // episode is BM25-findable in its cwd immediately.
+        let hits = memory
+            .find_relevant(&workspace, "websocket gateway keepalive", 5)
+            .await
+            .unwrap();
+        assert!(
+            hits.iter().any(|e| e.summary.contains("keepalive")),
+            "conversation episode must be stored + recallable"
+        );
+    }
+
+    #[tokio::test]
+    async fn task_recall_excludes_conversation_episodes() {
+        use crate::{Agent, tools::ToolRegistry};
+        use octos_memory::EpisodeStore;
+        use std::sync::Arc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().to_path_buf();
+        let memory = Arc::new(EpisodeStore::open(workspace.join("memory")).await.unwrap());
+
+        let mut conv = Episode::new(
+            TaskId::new(),
+            AgentId::new("chat"),
+            workspace.clone(),
+            "Chatted about a code review of the parser".to_string(),
+            EpisodeOutcome::Success,
+        );
+        conv.source = octos_memory::EpisodeSource::Conversation;
+        let conv_id = conv.id.clone();
+        memory.store(conv).await.unwrap();
+        memory
+            .store_embedding(&conv_id, ConstEmbedder::vector())
+            .await
+            .unwrap();
+
+        let provider: Arc<dyn octos_llm::LlmProvider> = Arc::new(EndTurnProvider);
+        let tools = ToolRegistry::with_builtins(&workspace);
+        let agent = Agent::new(AgentId::new("worker"), provider, tools, memory)
+            .with_embedder(Arc::new(ConstEmbedder));
+
+        // Task path (include_conversations = false): must NOT surface it.
+        let task_recall = agent
+            .recall_relevant_episodes("code review", &workspace, false)
+            .await;
+        assert!(
+            task_recall
+                .as_ref()
+                .map(|m| !m.content.contains("code review of the parser"))
+                .unwrap_or(true),
+            "task recall must exclude conversation episodes"
+        );
+        // Conversation path (true): the same episode IS recallable.
+        let conv_recall = agent
+            .recall_relevant_episodes("code review", &workspace, true)
+            .await
+            .expect("conversation recall includes conversation episodes");
+        assert!(conv_recall.content.contains("code review of the parser"));
+    }
+
+    #[tokio::test]
+    async fn save_conversation_episode_saves_once_per_session() {
+        use crate::{Agent, tools::ToolRegistry};
+        use octos_memory::EpisodeStore;
+        use std::sync::Arc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().to_path_buf();
+        let memory = Arc::new(EpisodeStore::open(workspace.join("memory")).await.unwrap());
+        let provider: Arc<dyn octos_llm::LlmProvider> = Arc::new(EndTurnProvider);
+        let tools = ToolRegistry::with_builtins(&workspace);
+        let agent = Agent::new(AgentId::new("chat"), provider, tools, memory.clone())
+            .with_embedder(Arc::new(ConstEmbedder));
+
+        // Save-once per session: the first compaction's summary is kept;
+        // later compactions are no-ops. Exactly one conversation episode.
+        agent
+            .save_conversation_episode("first chunk about widgets".to_string())
+            .await;
+        agent
+            .save_conversation_episode("second chunk about gadgets".to_string())
+            .await;
+
+        let all = memory.find_relevant(&workspace, "chunk", 10).await.unwrap();
+        let conv: Vec<_> = all
+            .iter()
+            .filter(|e| e.summary.contains("chunk about"))
+            .collect();
+        assert_eq!(
+            conv.len(),
+            1,
+            "one conversation episode per session, got {}",
+            conv.len()
+        );
+        assert!(
+            conv[0].summary.contains("widgets"),
+            "the first compaction's summary is the one kept"
+        );
+    }
+
+    #[tokio::test]
+    async fn save_conversation_episode_is_noop_without_embedder() {
+        use crate::{Agent, tools::ToolRegistry};
+        use octos_memory::EpisodeStore;
+        use std::sync::Arc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().to_path_buf();
+        let memory = Arc::new(EpisodeStore::open(workspace.join("memory")).await.unwrap());
+        let provider: Arc<dyn octos_llm::LlmProvider> = Arc::new(EndTurnProvider);
+        let tools = ToolRegistry::with_builtins(&workspace);
+        // No embedder: an unembedded conversation episode is invisible to
+        // recall, so we must not store it at all.
+        let agent = Agent::new(AgentId::new("chat"), provider, tools, memory.clone());
+
+        agent
+            .save_conversation_episode("some conversation summary".to_string())
+            .await;
+
+        let hits = memory
+            .find_relevant(&workspace, "conversation summary", 5)
+            .await
+            .unwrap();
+        assert!(hits.is_empty(), "no episode without an embedder");
+    }
+
+    #[tokio::test]
+    async fn recall_is_noop_without_embedder() {
+        use crate::{Agent, tools::ToolRegistry};
+        use octos_memory::EpisodeStore;
+        use std::sync::Arc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().to_path_buf();
+        let memory = Arc::new(EpisodeStore::open(workspace.join("memory")).await.unwrap());
+        memory
+            .store(Episode::new(
+                TaskId::new(),
+                AgentId::new("prior"),
+                workspace.clone(),
+                "Some prior episode about gateways".to_string(),
+                EpisodeOutcome::Success,
+            ))
+            .await
+            .unwrap();
+
+        let provider: Arc<dyn octos_llm::LlmProvider> = Arc::new(EndTurnProvider);
+        let tools = ToolRegistry::with_builtins(&workspace);
+        // Agent::new defaults embedder = None.
+        let agent = Agent::new(AgentId::new("chat"), provider, tools, memory);
+
+        assert!(
+            agent
+                .recall_relevant_episodes("gateways", &workspace, true)
+                .await
+                .is_none(),
+            "no-embedder recall must be a no-op"
+        );
+    }
+
     #[tokio::test]
     async fn no_embedder_path_does_not_inject_shared_vocab_episode() {
         use crate::{Agent, tools::ToolRegistry};

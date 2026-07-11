@@ -33,6 +33,7 @@ use tokio::time::timeout;
 use tracing::{debug, warn};
 
 use crate::policy::{CommandPolicy, Decision, SafePolicy};
+use crate::sandbox::Sandbox;
 use crate::subprocess_env::{EnvAllowlist, sanitize_command_env};
 use crate::tools::{ToolRegistry, ToolResult};
 use crate::workspace_policy::{
@@ -399,6 +400,17 @@ impl MapToolDispatcher {
     pub fn from_registry(registry: &ToolRegistry) -> Self {
         let mut me = Self::new();
         for name in registry.tool_names() {
+            // #1607 (P2): only snapshot tools the active provider policy would
+            // let the model call. `MapToolDispatcher::dispatch` invokes
+            // `Tool::execute` directly, bypassing `ToolRegistry::execute`'s
+            // provider-policy gate — so without this filter a nested-project
+            // `ToolCall` validator could invoke a tool the provider policy
+            // denies. A denied tool is simply not inserted, so `dispatch`
+            // returns "tool not registered for validator dispatch". With no
+            // provider policy set (the default) every tool passes through.
+            if !registry.provider_policy_permits(&name) {
+                continue;
+            }
             if let Some(tool) = registry.get_tool(&name) {
                 me.insert(name, tool);
             }
@@ -430,6 +442,12 @@ pub struct ValidatorRunner {
     evidence_root: PathBuf,
     policy: Arc<dyn CommandPolicy>,
     ledger: Option<ValidatorLedger>,
+    /// Optional sandbox for **command** validators (which shell out). When set,
+    /// each command validator is wrapped via [`Sandbox::wrap_command`] so an
+    /// untrusted workspace `.octos-workspace.toml` can't run unsandboxed host
+    /// commands post-turn. `None` = run directly (current default; trusted
+    /// callers). Opted into on the `mcp-serve` path.
+    sandbox: Option<Arc<dyn Sandbox>>,
 }
 
 impl std::fmt::Debug for ValidatorRunner {
@@ -460,12 +478,21 @@ impl ValidatorRunner {
             evidence_root,
             policy: Arc::new(SafePolicy::default()),
             ledger: None,
+            sandbox: None,
         }
     }
 
     /// Override the directory where evidence files are written.
     pub fn with_evidence_root(mut self, path: impl Into<PathBuf>) -> Self {
         self.evidence_root = path.into();
+        self
+    }
+
+    /// Run **command** validators under `sandbox` (wraps each via
+    /// [`Sandbox::wrap_command`]). Used by callers that must confine
+    /// workspace-declared command validators (e.g. `mcp-serve`).
+    pub fn with_sandbox(mut self, sandbox: Arc<dyn Sandbox>) -> Self {
+        self.sandbox = Some(sandbox);
         self
     }
 
@@ -691,10 +718,78 @@ impl ValidatorRunner {
             }
         }
 
-        let mut command = Command::new(&resolved_cmd);
+        // A configured, real (non-no-op) sandbox means the validator MUST run
+        // inside it. On POSIX the backend runs via `sh -c`, so we shell-quote the
+        // argv with `shlex`. On Windows the backends shell out via `cmd /C`, for
+        // which there is no safe POSIX argv wrapping here — and a workspace policy
+        // can name an arbitrary executable, not merely inject an argument — so
+        // running the argv directly would *bypass* the sandbox. Fail closed there
+        // rather than escape it. A no-op sandbox (NoSandbox, or a backend whose
+        // helper is unavailable) and the no-sandbox case have nothing to escape,
+        // so they run the argv directly, where `Command` passes each element as a
+        // distinct token (injection-safe).
+        //
+        // #1607 (codex-review follow-up): two real backends cannot safely run
+        // the validator argv here, so a real one of either must FAIL CLOSED
+        // rather than mis-quote or escape to the host:
+        //  - Windows (`cmd /C`) ignores the POSIX single quotes `shlex` emits,
+        //    so metacharacters in an argument would stay active.
+        //  - Docker bind-mounts the workspace at a fixed in-container path
+        //    (`/workspace`), but `Command` validators interpolate absolute
+        //    *host* paths (e.g. `${output.patch_path}`) that don't resolve
+        //    inside the container. Running them on the host instead (the prior
+        //    behaviour) would bypass Docker's mount/write/network confinement —
+        //    the very escape #1607 closes. Full in-container path translation
+        //    is a documented follow-up (see `Sandbox::is_docker`).
+        // A no-op / absent sandbox has nothing to escape and runs the argv
+        // directly (injection-safe). ToolCall / file-check validators never
+        // shell out, so they are unaffected either way.
+        let real_sandbox = self.sandbox.as_ref().filter(|s| !s.is_noop());
+        let is_windows = cfg!(windows);
+        let cannot_wrap = real_sandbox.is_some_and(|s| is_windows || s.is_docker());
+        if cannot_wrap {
+            return error_outcome(
+                invocation,
+                validator,
+                started_at,
+                started,
+                format!(
+                    "command validator not supported under the active sandbox \
+                     backend (Windows/Docker): {command_string}"
+                ),
+            );
+        }
+        let mut command = match real_sandbox {
+            Some(sandbox) => {
+                // wrap_command runs the string via `sh -c`, so shell-quote each
+                // argv element (build_command_string above is unquoted — it's
+                // only for the SafePolicy display/check). Otherwise `sh -c "sh -c
+                // exit 1"`-style validators would word-split and mis-report.
+                let quoted = match shlex::try_join(
+                    std::iter::once(resolved_cmd.as_str())
+                        .chain(resolved_args.iter().map(String::as_str)),
+                ) {
+                    Ok(q) => q,
+                    Err(_) => {
+                        return error_outcome(
+                            invocation,
+                            validator,
+                            started_at,
+                            started,
+                            format!("command validator contains a NUL byte: {command_string}"),
+                        );
+                    }
+                };
+                sandbox.wrap_command(&quoted, &invocation.workspace_root)
+            }
+            None => {
+                let mut c = Command::new(&resolved_cmd);
+                c.args(&resolved_args)
+                    .current_dir(&invocation.workspace_root);
+                c
+            }
+        };
         command
-            .args(&resolved_args)
-            .current_dir(&invocation.workspace_root)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .stdin(Stdio::null());
@@ -3508,6 +3603,62 @@ mod tests {
         assert_eq!(outcomes[0].status, ValidatorStatus::Pass, "{outcomes:?}");
     }
 
+    /// #1607 (codex-review round 2) — Docker fails CLOSED: a Docker-mode
+    /// sandbox cannot safely run a command validator here. Host absolute paths
+    /// like `${output.target_path}` don't resolve inside the `/workspace` bind
+    /// mount, and running them on the host instead (the prior behaviour) would
+    /// bypass Docker's mount/write/network confinement — the very escape #1607
+    /// closes. So the validator must fail closed with a typed error, NOT run on
+    /// the host (which would Pass). Host-independent: a Docker sandbox is
+    /// constructed regardless of whether the docker binary is present. Unix-only
+    /// for parity with the sibling command-validator tests.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn docker_sandbox_fails_command_validator_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path_arg = dir.path().join("deck.pptx");
+        std::fs::write(&path_arg, b"x").unwrap();
+
+        let docker: Arc<dyn Sandbox> = Arc::from(crate::sandbox::create_sandbox(
+            &crate::sandbox::SandboxConfig {
+                mode: crate::sandbox::SandboxMode::Docker,
+                ..crate::sandbox::SandboxConfig::default()
+            },
+        ));
+        assert!(docker.is_docker(), "guard: backend must be Docker");
+        assert!(
+            !docker.is_noop(),
+            "guard: Docker is a real (non-no-op) backend"
+        );
+
+        let runner = ValidatorRunner::new(Arc::new(ToolRegistry::new()), dir.path().to_path_buf())
+            .with_sandbox(docker);
+        let validator = validator_with_spec(
+            "docker_host_path_cmd",
+            ValidatorSpec::Command {
+                cmd: "test".into(),
+                args: vec!["-f".into(), "${output.target_path}".into()],
+            },
+        );
+        let invocation = ValidatorInvocation::new(
+            ValidatorPhase::Completion,
+            dir.path().to_path_buf(),
+            "test".into(),
+        )
+        .with_tool_output(serde_json::json!({
+            "target_path": path_arg.to_string_lossy().to_string(),
+        }));
+        let outcomes = runner.run_all(&invocation, &[validator]).await;
+        // Fails CLOSED: not run on the host (which would Pass and bypass Docker),
+        // and not wrapped in `docker run` either.
+        assert_eq!(outcomes[0].status, ValidatorStatus::Error, "{outcomes:?}");
+        assert!(
+            outcomes[0].reason.contains("Docker") || outcomes[0].reason.contains("not supported"),
+            "expected a fail-closed reason, got: {}",
+            outcomes[0].reason
+        );
+    }
+
     #[tokio::test]
     async fn command_args_error_when_output_key_missing() {
         let dir = tempfile::tempdir().unwrap();
@@ -4718,5 +4869,48 @@ mod tests {
              an unrelated non-silent file exists in the workspace (proves the validator \
              does not fall back to the glob path); outcomes = {outcomes:?}",
         );
+    }
+
+    #[tokio::test]
+    async fn map_tool_dispatcher_snapshots_all_tools_without_a_provider_policy() {
+        // #1607 (P2): with no provider policy, `from_registry` snapshots every
+        // registered tool, so a ToolCall validator can dispatch it.
+        let reg = ToolRegistry::with_builtins(std::env::temp_dir());
+        let dispatcher = MapToolDispatcher::from_registry(&reg);
+        // `read_file` is a built-in and must be dispatchable.
+        assert!(dispatcher.tools.contains_key("read_file"));
+    }
+
+    #[tokio::test]
+    async fn map_tool_dispatcher_excludes_provider_policy_denied_tools() {
+        // #1607 (P2): a tool the provider policy denies must NOT be snapshotted
+        // by `from_registry`, so a nested-project ToolCall validator can't
+        // reach it. `dispatch` then reports it as unregistered instead of
+        // silently invoking `Tool::execute` (which bypasses the policy gate).
+        let mut reg = ToolRegistry::with_builtins(std::env::temp_dir());
+        reg.set_provider_policy(crate::tools::ToolPolicy {
+            deny: vec!["shell".to_string()],
+            ..Default::default()
+        });
+        let dispatcher = MapToolDispatcher::from_registry(&reg);
+        assert!(
+            !dispatcher.tools.contains_key("shell"),
+            "provider-policy-denied tools must be excluded from the validator dispatch snapshot"
+        );
+        // Dispatching the denied tool fails closed with the unregistered error.
+        let err = match dispatcher
+            .dispatch("shell", &serde_json::json!({ "command": "echo hi" }))
+            .await
+        {
+            Ok(_) => panic!("denied tool must not dispatch through the snapshot"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string()
+                .contains("not registered for validator dispatch"),
+            "unexpected error: {err}"
+        );
+        // A non-denied built-in is still present.
+        assert!(dispatcher.tools.contains_key("read_file"));
     }
 }

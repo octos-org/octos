@@ -67,7 +67,14 @@ pub enum ProgressEvent {
     Response { content: String, iteration: u32 },
 
     /// Agent is calling a tool.
-    ToolStarted { name: String, tool_id: String },
+    ToolStarted {
+        name: String,
+        tool_id: String,
+        /// The call arguments as requested by the LLM (pre-hook). Carried so
+        /// downstream projections (UI protocol tool cards, envelope
+        /// `arguments_preview`) can echo what the tool was asked to do.
+        arguments: Option<serde_json::Value>,
+    },
 
     /// Mid-execution progress from a tool (e.g., stderr line from binary plugin).
     ToolProgress {
@@ -87,6 +94,12 @@ pub enum ProgressEvent {
 
     /// File was modified.
     FileModified { path: String },
+
+    /// Model-authored plan/todo checklist snapshot from the `update_plan`
+    /// tool. Carried as the serialized `UiPlanRecord` JSON so this low-level
+    /// event stays decoupled from the octos-core wire structs; the serve
+    /// mapper deserializes it into a `plan/updated` notification.
+    PlanUpdated { plan: serde_json::Value },
 
     /// Token usage update.
     TokenUsage {
@@ -131,11 +144,25 @@ pub enum ProgressEvent {
 
     /// Cost update after a response.
     CostUpdate {
-        session_input_tokens: u32,
-        session_output_tokens: u32,
+        /// Session-cumulative token counts: completed runs folded into the
+        /// shared session-usage base (when the embedder injected one) plus
+        /// the live turn. u64 because sessions outlive single turns.
+        session_input_tokens: u64,
+        session_output_tokens: u64,
+        /// TURN-cumulative token counts (every response recorded this
+        /// turn so far, including ones that emit no cost update of their
+        /// own — mid-turn tool iterations, the verifier). Metrics
+        /// counters meter the DELTA between successive events, so
+        /// nothing is dropped when only the terminal response emits;
+        /// the session_* fields are unsuitable for that (their base
+        /// includes pre-turn history the per-turn reporter never saw).
+        turn_input_tokens: u32,
+        turn_output_tokens: u32,
         /// Cost of this response (None if pricing unknown).
         response_cost: Option<f64>,
-        /// Cumulative session cost.
+        /// Cumulative session cost: each completed run and each response
+        /// of the live turn priced at the model that produced it. `None`
+        /// until any priced usage exists.
         session_cost: Option<f64>,
         /// Model identifier that produced this response. Forwarded by the
         /// API bridge into `metadata.token_cost.model` so chat clients can
@@ -308,7 +335,7 @@ impl ProgressReporter for ConsoleReporter {
                 use std::io::Write;
                 let _ = std::io::stdout().flush();
             }
-            ProgressEvent::ToolStarted { name, tool_id: _ } => {
+            ProgressEvent::ToolStarted { name, .. } => {
                 print!(
                     "\r{} {}",
                     self.yellow("⚙"),
@@ -359,6 +386,22 @@ impl ProgressReporter for ConsoleReporter {
             }
             ProgressEvent::FileModified { path } => {
                 println!("{} {} {}", self.green("📝"), self.dim("Modified:"), path);
+            }
+            ProgressEvent::PlanUpdated { plan } => {
+                if self.verbose {
+                    if let Some(items) = plan.get("items").and_then(|v| v.as_array()) {
+                        println!("{}", self.dim("Plan:"));
+                        for item in items {
+                            let title = item.get("title").and_then(|v| v.as_str()).unwrap_or("");
+                            let glyph = match item.get("status").and_then(|v| v.as_str()) {
+                                Some("completed") => self.green("✔"),
+                                Some("in_progress") => self.dim("▸"),
+                                _ => self.dim("◼"),
+                            };
+                            println!("  {} {}", glyph, title);
+                        }
+                    }
+                }
             }
             ProgressEvent::TokenUsage {
                 input_tokens,

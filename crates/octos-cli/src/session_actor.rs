@@ -2844,8 +2844,18 @@ pub trait ToolRegistryFactory: Send + Sync {
 }
 
 /// Trait for creating per-session pipeline tool instances.
+///
+/// #1607 (codex round 4): `create` takes the SESSION-effective sandbox so the
+/// produced `run_pipeline` tool (and every spawn-child instance) confines its
+/// pipeline command validators to the sandbox that is actually in force for
+/// this session — NOT a profile-time default captured when the factory was
+/// built. In the AppUI path the effective sandbox is only known after
+/// `SessionRuntime::bootstrap_with_permissions_and_sandbox` resolves the
+/// permission/override, so passing it in at `create` time is the only correct
+/// binding: a read-only session's pipeline validators must not regain writes
+/// or network the profile default allowed.
 pub trait PipelineToolFactory: Send + Sync {
-    fn create(&self) -> Arc<dyn octos_agent::tools::Tool>;
+    fn create(&self, sandbox: &octos_agent::SandboxConfig) -> Arc<dyn octos_agent::tools::Tool>;
 }
 
 /// ToolRegistryFactory backed by snapshot_excluding() — clones shared tools cheaply.
@@ -3343,6 +3353,12 @@ impl ActorFactory {
             chat_id,
         )
         .with_provider_policy(self.provider_policy.clone())
+        // #1607 (codex-review follow-up): thread the same sandbox config the
+        // parent `ToolRegistry` was built with (`create_sandbox(&self.sandbox_config)`
+        // above) so the spawn/agent_mcp child completion path confines
+        // workspace-declared `Command` validators instead of running them on
+        // the host.
+        .with_sandbox(self.sandbox_config.clone())
         .with_agent_config(self.agent_config.clone())
         .with_task_supervisor(
             supervisor.clone(),
@@ -3380,8 +3396,12 @@ impl ActorFactory {
         }
         if let Some(ref pipeline_factory) = self.pipeline_factory {
             let pipeline_factory = pipeline_factory.clone();
-            spawn_tool =
-                spawn_tool.with_child_tool_factory(Arc::new(move || pipeline_factory.create()));
+            // #1607 (codex round 4): hand each spawn-child `run_pipeline`
+            // instance the SESSION-effective sandbox (the same one the actor's
+            // tool registry uses), not a profile-time default.
+            let child_sandbox = self.sandbox_config.clone();
+            spawn_tool = spawn_tool
+                .with_child_tool_factory(Arc::new(move || pipeline_factory.create(&child_sandbox)));
         }
         // Child SendFileTool factory (gateway parity with AppUI). Every
         // spawned subagent's registry gets a fresh `SendFileTool` wired
@@ -3494,6 +3514,11 @@ impl ActorFactory {
                 .with_agent_config(self.agent_config.clone())
                 .with_optional_embedder(self.embedder.clone())
                 .with_task_supervisor(supervisor.clone(), session_key.to_string())
+                // #1607: thread the session sandbox onto delegated children so
+                // their completion-phase command validators run confined —
+                // mirrors the SpawnTool `.with_sandbox(self.sandbox_config...)`
+                // wiring above.
+                .with_sandbox(self.sandbox_config.clone())
                 .with_child_prompt_context_manager_factory(delegate_factory);
         if let Some(ref prompt) = self.worker_prompt {
             delegate_tool = delegate_tool.with_worker_prompt(prompt.clone());
@@ -3527,7 +3552,9 @@ impl ActorFactory {
         };
 
         if let Some(ref pf) = self.pipeline_factory {
-            let pt = pf.create();
+            // #1607 (codex round 4): the parent `run_pipeline` also uses the
+            // session-effective sandbox this actor's registry was built with.
+            let pt = pf.create(&self.sandbox_config);
             tools.register_arc(pt);
             tools.mark_spawn_only(
                 "run_pipeline",
@@ -3838,6 +3865,14 @@ impl ActorFactory {
         // back-reference now that tools are in Arc.
         agent.wire_mofa_make_dispatcher();
 
+        // Session-cumulative usage base: the agent READS it when emitting
+        // `cost_update` progress (base + live turn); this actor seeds it
+        // from the usage ledger at run() start and folds every completed
+        // run back in. Without it the wire's `session_*` figures reset to
+        // zero each turn and past turns were re-priced at the latest model.
+        let session_usage = octos_agent::SharedSessionUsage::default();
+        let agent = agent.with_session_usage_base(session_usage.clone());
+
         // Load per-user status configuration
         let user_status_config = UserStatusConfig::load(&self.data_dir, session_key.base_key());
 
@@ -3857,6 +3892,7 @@ impl ActorFactory {
             user_status_config,
             data_dir: self.data_dir.clone(),
             usage_ledger: self.usage_ledger.clone(),
+            session_usage,
             max_history: self.max_history.clone(),
             idle_timeout: self.idle_timeout,
             session_timeout: self.session_timeout,
@@ -4347,6 +4383,13 @@ struct SessionActor {
     /// Durable per-profile usage ledger. `None` only in tests or if startup
     /// deliberately omitted usage accounting.
     usage_ledger: Option<Arc<PersistentUsageLedger>>,
+    /// Session-cumulative usage base shared with the agent (see the
+    /// `octos_agent::session_usage` module docs). Seeded from
+    /// `usage_ledger` at run() start so it survives the runtime-cache
+    /// eviction a `profile/llm/select` model switch triggers; folded
+    /// after every completed run, each run priced at the model that
+    /// ran it.
+    session_usage: octos_agent::SharedSessionUsage,
     /// Profile/account id used for usage analytics rollups.
     usage_profile_id: String,
     max_history: Arc<std::sync::atomic::AtomicUsize>,
@@ -4453,9 +4496,6 @@ impl SessionActor {
         run_id: Option<&str>,
         attribution: Option<&str>,
     ) {
-        let Some(usage_ledger) = self.usage_ledger.as_ref() else {
-            return;
-        };
         let provider_metadata = response.provider_metadata.clone();
         let provider = provider_metadata
             .as_ref()
@@ -4471,12 +4511,34 @@ impl SessionActor {
                 let model = self.agent.model_id();
                 (!model.is_empty()).then(|| model.to_string())
             });
-        let estimated_cost_usd = model.as_deref().and_then(model_pricing).map(|pricing| {
-            pricing.cost(
-                response.token_usage.input_tokens,
-                response.token_usage.output_tokens,
-            )
+        // The turn's spend as attributed by the agent loop: each response
+        // priced at the model that produced it. Re-pricing token_usage at
+        // the FINAL provider_metadata model here (the old form) mispriced
+        // any turn that crossed models (failover, verifier) — and then
+        // persisted the wrong number in the ledger (codex #1632 P1). The
+        // fallback reprice covers legacy paths that predate the field.
+        let estimated_cost_usd = response.estimated_spend_usd.or_else(|| {
+            model.as_deref().and_then(model_pricing).map(|pricing| {
+                pricing.cost(
+                    response.token_usage.input_tokens,
+                    response.token_usage.output_tokens,
+                )
+            })
         });
+        // Fold this run into the shared session base FIRST — the live
+        // display must accumulate across turns even when no ledger is
+        // configured. Uses the SAME numbers the ledger event records
+        // (turn totals priced at the run's model), so re-seeding from the
+        // ledger after a runtime rebuild reproduces exactly the sum of
+        // these folds — no drift between the live figure and the seed.
+        self.session_usage.fold_run(
+            u64::from(response.token_usage.input_tokens),
+            u64::from(response.token_usage.output_tokens),
+            estimated_cost_usd,
+        );
+        let Some(usage_ledger) = self.usage_ledger.as_ref() else {
+            return;
+        };
         let cost_source = if estimated_cost_usd.is_some() {
             UsageCostSource::CatalogEstimate
         } else {
@@ -5383,7 +5445,44 @@ impl SessionActor {
         true
     }
 
+    /// Hydrate the session-cumulative usage base from the durable ledger.
+    /// Runs BEFORE the first turn so cost emissions include prior runs:
+    /// the runtime cache evicts and rebuilds this actor on a
+    /// `profile/llm/select` model switch — without the re-seed every
+    /// switch would zero the displayed session spend.
+    async fn hydrate_session_usage_from_ledger(&self) {
+        let Some(ledger) = self.usage_ledger.as_ref() else {
+            return;
+        };
+        match ledger.session_totals(&self.session_key.to_string()).await {
+            Ok(totals) if totals.run_count > 0 => {
+                self.session_usage.seed(octos_agent::SessionUsageSnapshot {
+                    input_tokens: totals.input_tokens,
+                    output_tokens: totals.output_tokens,
+                    spend_usd: totals.estimated_cost_usd,
+                    // The ledger doesn't track per-run priced-ness; this
+                    // only drives the Some/None gate on the cost line,
+                    // never the amount.
+                    priced_runs: if totals.estimated_cost_usd > 0.0 {
+                        totals.run_count
+                    } else {
+                        0
+                    },
+                });
+            }
+            Ok(_) => {}
+            Err(error) => {
+                warn!(
+                    session = %self.session_key,
+                    error = %error,
+                    "failed to hydrate session usage base from ledger"
+                );
+            }
+        }
+    }
+
     async fn run(mut self) {
+        self.hydrate_session_usage_from_ledger().await;
         self.emit_resume_hook().await;
         // Wave-4 B3.4 — surface adaptive-router failovers on the bus so
         // operators on a chat channel SEE when the router escalated
@@ -7774,11 +7873,18 @@ impl SessionActor {
                             Some(model.to_string())
                         }
                     });
-                let session_cost = model_id.as_deref().and_then(model_pricing).map(|pricing| {
-                    pricing.cost(cr.token_usage.input_tokens, cr.token_usage.output_tokens)
-                });
                 self.record_usage_event(cr, client_message_id.as_deref(), None)
                     .await;
+                // Session-cumulative, read AFTER the fold above so it
+                // includes the run that just completed. Despite living in
+                // per-message metadata this field is named `session_cost`,
+                // and clients merge it into session stats — it used to
+                // carry only THIS turn priced at the final model, silently
+                // shrinking the displayed spend after every model switch.
+                let session_cost = {
+                    let snapshot = self.session_usage.snapshot();
+                    (snapshot.priced_runs > 0).then_some(snapshot.spend_usd)
+                };
                 // Bug 3 / W1.G4 cost panel — collect per-node cost rows that
                 // tools (today: `run_pipeline`) surfaced through their
                 // `ToolResult.structured_metadata` side-channel. Without this
@@ -8289,6 +8395,14 @@ impl SessionActor {
         let user_workspace = self.user_workspace.clone();
         let data_dir = self.data_dir.clone();
         let overflow_client_message_id = inbound_client_message_id(msg);
+        // codex #1632 P2: overflow runs consume real tokens but never
+        // reached `record_usage_event` (they run detached from the actor),
+        // so both the live session-usage base and the durable ledger
+        // omitted them. Clone the plumbing so the completion arm below can
+        // fold + record with the same numbers a foreground turn would.
+        let overflow_session_usage = self.session_usage.clone();
+        let overflow_usage_ledger = self.usage_ledger.clone();
+        let overflow_usage_profile_id = self.usage_profile_id.clone();
 
         tokio::spawn(async move {
             // Save user message to history first so it survives even if the
@@ -8549,6 +8663,67 @@ impl SessionActor {
             // Stop status indicator (deletes the "✦ Thinking..." message)
             if let Some(handle) = status_handle {
                 handle.stop().await;
+            }
+
+            // Codex #1632 r2 P2: account BEFORE any response-suppression
+            // exit (slash-command cancellation, pending-approval refusal)
+            // — the tokens were consumed regardless of whether the reply
+            // is shown. Same numbers, same attribution rules as
+            // `record_usage_event` on foreground turns.
+            if let Ok(Ok(conv_response)) = &result {
+                let overflow_model = conv_response
+                    .provider_metadata
+                    .as_ref()
+                    .map(|meta| meta.model.clone());
+                let overflow_cost = conv_response.estimated_spend_usd.or_else(|| {
+                    overflow_model
+                        .as_deref()
+                        .and_then(model_pricing)
+                        .map(|pricing| {
+                            pricing.cost(
+                                conv_response.token_usage.input_tokens,
+                                conv_response.token_usage.output_tokens,
+                            )
+                        })
+                });
+                overflow_session_usage.fold_run(
+                    u64::from(conv_response.token_usage.input_tokens),
+                    u64::from(conv_response.token_usage.output_tokens),
+                    overflow_cost,
+                );
+                if let Some(ledger) = overflow_usage_ledger.as_ref() {
+                    let event = UsageEvent::completed_run(
+                        overflow_usage_profile_id.clone(),
+                        session_key.to_string(),
+                        uuid::Uuid::now_v7().to_string(),
+                        conv_response
+                            .provider_metadata
+                            .as_ref()
+                            .map(|meta| meta.provider.clone()),
+                        overflow_model,
+                        conv_response
+                            .provider_metadata
+                            .as_ref()
+                            .and_then(|meta| meta.endpoint.clone()),
+                        u64::from(conv_response.token_usage.input_tokens),
+                        u64::from(conv_response.token_usage.output_tokens),
+                        overflow_cost,
+                        if overflow_cost.is_some() {
+                            UsageCostSource::CatalogEstimate
+                        } else {
+                            UsageCostSource::Unavailable
+                        },
+                        channel.clone(),
+                        Some("speculative_overflow".to_string()),
+                    );
+                    if let Err(error) = ledger.record(event).await {
+                        warn!(
+                            session = %session_key,
+                            error = %error,
+                            "failed to record overflow usage event"
+                        );
+                    }
+                }
             }
 
             // If a slash command was handled while this overflow task was
@@ -11772,6 +11947,7 @@ mod tests {
             user_status_config: UserStatusConfig::default(),
             data_dir: dir.path().to_path_buf(),
             usage_ledger: None,
+            session_usage: Default::default(),
             usage_profile_id: "test-profile".to_string(),
             max_history: Arc::new(std::sync::atomic::AtomicUsize::new(50)),
             idle_timeout: Duration::from_secs(60),
@@ -11800,6 +11976,209 @@ mod tests {
 
         let handle = tokio::spawn(actor.run());
         (inbox_tx, out_rx, handle, session_mgr)
+    }
+
+    /// Minimal non-spawned actor for unit-testing methods directly
+    /// (`record_usage_event`, `hydrate_session_usage_from_ledger`).
+    /// Unlike `setup_actor_with_mode` the actor loop never runs, so the
+    /// test observes exactly the state a single method call produced.
+    async fn build_unspawned_actor(
+        dir: &tempfile::TempDir,
+        usage_ledger: Option<Arc<PersistentUsageLedger>>,
+    ) -> SessionActor {
+        let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+        let tools = octos_agent::ToolRegistry::with_builtins(dir.path());
+        let provider: Arc<dyn LlmProvider> =
+            Arc::new(ErrorMockProvider::new("unused-mock", "never called"));
+        let agent = Agent::new(AgentId::new("test-usage"), provider, tools, memory).with_config(
+            AgentConfig {
+                save_episodes: false,
+                max_iterations: 1,
+                ..Default::default()
+            },
+        );
+        let (inbox_tx, inbox_rx) = mpsc::channel(4);
+        // The outbound receiver is dropped; these tests never send.
+        let (out_tx, _out_rx) = mpsc::channel(4);
+        SessionActor {
+            session_key: test_session_key(dir.path()),
+            channel: "cli".to_string(),
+            chat_id: "test".to_string(),
+            tenant_id: None,
+            inbox: inbox_rx,
+            self_tx: inbox_tx,
+            pending_approvals: HumanPendingApprovalStore::default(),
+            approvals_audit: Arc::new(crate::approvals_audit::ApprovalsAuditLog::new(
+                dir.path(),
+                crate::approvals_audit::ApprovalsAuditConfig::from_env(),
+            )),
+            agent: Arc::new(agent),
+            hooks: None,
+            hook_context: None,
+            session_handle: Arc::new(Mutex::new(SessionHandle::open(
+                dir.path(),
+                &test_session_key(dir.path()),
+            ))),
+            out_tx,
+            status_indicator: None,
+            sender_user_id: None,
+            user_status_config: UserStatusConfig::default(),
+            data_dir: dir.path().to_path_buf(),
+            usage_ledger,
+            session_usage: Default::default(),
+            usage_profile_id: "test-profile".to_string(),
+            max_history: Arc::new(std::sync::atomic::AtomicUsize::new(50)),
+            idle_timeout: Duration::from_secs(60),
+            session_timeout: Duration::from_secs(120),
+            semaphore: Arc::new(Semaphore::new(10)),
+            global_shutdown: Arc::new(AtomicBool::new(false)),
+            cancelled: Arc::new(AtomicBool::new(false)),
+            queue_mode: QueueMode::Followup,
+            responsiveness: ResponsivenessObserver::new(),
+            adaptive_router: None,
+            lane_routing: None,
+            memory_store: None,
+            active_overflow_tasks: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            overflow_cancelled: Arc::new(AtomicBool::new(false)),
+            active_sessions: Arc::new(RwLock::new(ActiveSessionStore::open(dir.path()).unwrap())),
+            user_workspace: dir.path().join("workspace"),
+            cron_tool: None,
+            persistent_retry_state: Arc::new(StdMutex::new(LoopRetryState::default())),
+            context_manager: test_context_manager(&test_session_key(dir.path())),
+            retry_state_path: None,
+            recovered_tasks: Arc::new(StdMutex::new(std::collections::HashSet::new())),
+            consecutive_recovery_turns: Arc::new(StdMutex::new(0)),
+            current_command_cmid: None,
+            last_turn_total_tokens: 0,
+        }
+    }
+
+    fn conversation_response_with_usage(
+        model: &str,
+        input_tokens: u32,
+        output_tokens: u32,
+    ) -> ConversationResponse {
+        ConversationResponse {
+            content: "done".to_string(),
+            reasoning_content: None,
+            provider_metadata: Some(octos_llm::ProviderMetadata::new(
+                "test-provider",
+                model,
+                None,
+            )),
+            token_usage: octos_core::TokenUsage {
+                input_tokens,
+                output_tokens,
+                ..Default::default()
+            },
+            // What the agent loop would carry: the turn's usage priced at
+            // the model that produced it.
+            estimated_spend_usd: model_pricing(model)
+                .map(|pricing| pricing.cost(input_tokens, output_tokens)),
+            files_modified: vec![],
+            files_to_send: vec![],
+            streamed: false,
+            messages: vec![],
+            tool_results: vec![],
+            synthesized_from_spawn_only: false,
+            pending_approval: None,
+        }
+    }
+
+    /// Each completed run must fold into the shared session base priced
+    /// at ITS OWN model — the old path priced the whole session at the
+    /// latest model, so switching models re-priced (or vanished) prior
+    /// spend.
+    #[tokio::test]
+    async fn record_usage_event_folds_each_run_at_its_own_model_pricing() {
+        let dir = tempfile::tempdir().unwrap();
+        let actor = build_unspawned_actor(&dir, None).await;
+
+        // claude-opus-4 ladder rate: $15/M in, $75/M out.
+        actor
+            .record_usage_event(
+                &conversation_response_with_usage("claude-opus-4", 1_000, 500),
+                Some("run-1"),
+                None,
+            )
+            .await;
+        // gpt-4o-mini ladder rate: $0.15/M in, $0.60/M out.
+        actor
+            .record_usage_event(
+                &conversation_response_with_usage("gpt-4o-mini", 2_000, 1_000),
+                Some("run-2"),
+                None,
+            )
+            .await;
+
+        let snapshot = actor.session_usage.snapshot();
+        assert_eq!(snapshot.input_tokens, 3_000);
+        assert_eq!(snapshot.output_tokens, 1_500);
+        assert_eq!(snapshot.priced_runs, 2);
+        let expected = (0.015 + 0.0375) + (0.0003 + 0.0006);
+        assert!(
+            (snapshot.spend_usd - expected).abs() < 1e-9,
+            "spend {} != expected {} (runs must keep their own model's pricing)",
+            snapshot.spend_usd,
+            expected
+        );
+    }
+
+    /// A rebuilt actor (the runtime cache evicts on `profile/llm/select`)
+    /// must hydrate the base from the durable ledger so the displayed
+    /// session spend survives model switches and restarts.
+    #[tokio::test]
+    async fn hydrate_session_usage_seeds_base_from_ledger_totals() {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = Arc::new(
+            PersistentUsageLedger::open(dir.path())
+                .await
+                .expect("open test ledger"),
+        );
+        let session_id = test_session_key(dir.path()).to_string();
+        ledger
+            .record(UsageEvent::completed_run(
+                "test-profile",
+                session_id.clone(),
+                "run-1",
+                Some("test-provider".to_string()),
+                Some("claude-opus-4".to_string()),
+                None,
+                1_000,
+                500,
+                Some(0.0525),
+                UsageCostSource::CatalogEstimate,
+                "cli",
+                None,
+            ))
+            .await
+            .unwrap();
+        ledger
+            .record(UsageEvent::completed_run(
+                "test-profile",
+                session_id,
+                "run-2",
+                Some("test-provider".to_string()),
+                Some("gpt-4o-mini".to_string()),
+                None,
+                2_000,
+                1_000,
+                Some(0.0009),
+                UsageCostSource::CatalogEstimate,
+                "cli",
+                None,
+            ))
+            .await
+            .unwrap();
+
+        let actor = build_unspawned_actor(&dir, Some(ledger)).await;
+        actor.hydrate_session_usage_from_ledger().await;
+
+        let snapshot = actor.session_usage.snapshot();
+        assert_eq!(snapshot.input_tokens, 3_000);
+        assert_eq!(snapshot.output_tokens, 1_500);
+        assert!(snapshot.priced_runs > 0);
+        assert!((snapshot.spend_usd - 0.0534).abs() < 1e-9);
     }
 
     async fn setup_actor_with_timeout(
@@ -11853,6 +12232,7 @@ mod tests {
             user_status_config: UserStatusConfig::default(),
             data_dir: dir.path().to_path_buf(),
             usage_ledger: None,
+            session_usage: Default::default(),
             usage_profile_id: "test-profile".to_string(),
             max_history: Arc::new(std::sync::atomic::AtomicUsize::new(50)),
             idle_timeout: Duration::from_secs(60),
@@ -12119,6 +12499,7 @@ mod tests {
             user_status_config: UserStatusConfig::default(),
             data_dir: dir.path().to_path_buf(),
             usage_ledger: None,
+            session_usage: Default::default(),
             usage_profile_id: "test-profile".to_string(),
             max_history: Arc::new(std::sync::atomic::AtomicUsize::new(50)),
             idle_timeout: Duration::from_secs(60),
@@ -12253,6 +12634,7 @@ mod tests {
             user_status_config: UserStatusConfig::default(),
             data_dir: dir.path().to_path_buf(),
             usage_ledger: None,
+            session_usage: Default::default(),
             usage_profile_id: "test-profile".to_string(),
             max_history: Arc::new(std::sync::atomic::AtomicUsize::new(50)),
             idle_timeout: Duration::from_secs(60),
@@ -12383,6 +12765,7 @@ mod tests {
             user_status_config: UserStatusConfig::default(),
             data_dir: dir.path().to_path_buf(),
             usage_ledger: None,
+            session_usage: Default::default(),
             usage_profile_id: "test-profile".to_string(),
             max_history: Arc::new(std::sync::atomic::AtomicUsize::new(50)),
             idle_timeout: Duration::from_secs(60),
@@ -12485,6 +12868,7 @@ mod tests {
             user_status_config: UserStatusConfig::default(),
             data_dir: dir.path().to_path_buf(),
             usage_ledger: None,
+            session_usage: Default::default(),
             usage_profile_id: "test-profile".to_string(),
             max_history: Arc::new(std::sync::atomic::AtomicUsize::new(50)),
             idle_timeout: Duration::from_secs(60),
@@ -12586,6 +12970,7 @@ mod tests {
             user_status_config: UserStatusConfig::default(),
             data_dir: std::path::PathBuf::from("/tmp"),
             usage_ledger: None,
+            session_usage: Default::default(),
             usage_profile_id: "test-profile".to_string(),
             max_history: Arc::new(std::sync::atomic::AtomicUsize::new(50)),
             idle_timeout: Duration::from_secs(60),
@@ -18043,6 +18428,7 @@ mod tests {
             current_command_cmid: None,
             last_turn_total_tokens: 0,
             usage_ledger: None,
+            session_usage: Default::default(),
             usage_profile_id: "test-profile".to_string(),
         };
 

@@ -111,6 +111,7 @@ impl ProgressReporter for ChannelStreamReporter {
             ProgressEvent::ToolStarted {
                 ref name,
                 ref tool_id,
+                ..
             } => {
                 // Also send raw SSE for web client status indicators
                 let mut payload = serde_json::json!({
@@ -962,6 +963,7 @@ mod tests {
         reporter.report(ProgressEvent::ToolStarted {
             name: "shell".into(),
             tool_id: "t1".into(),
+            arguments: None,
         });
         reporter.report(ProgressEvent::ToolCompleted {
             name: "shell".into(),
@@ -987,6 +989,8 @@ mod tests {
         reporter.report(ProgressEvent::CostUpdate {
             session_input_tokens: 10,
             session_output_tokens: 20,
+            turn_input_tokens: 10,
+            turn_output_tokens: 20,
             response_cost: None,
             session_cost: None,
             model: None,
@@ -1036,6 +1040,8 @@ mod tests {
         reporter.report(ProgressEvent::CostUpdate {
             session_input_tokens: 12,
             session_output_tokens: 7,
+            turn_input_tokens: 12,
+            turn_output_tokens: 7,
             response_cost: None,
             session_cost: None,
             model: Some("deepseek-v4-pro".into()),
@@ -1063,6 +1069,8 @@ mod tests {
         reporter.report(ProgressEvent::CostUpdate {
             session_input_tokens: 12,
             session_output_tokens: 7,
+            turn_input_tokens: 12,
+            turn_output_tokens: 7,
             response_cost: None,
             session_cost: None,
             model: None,
@@ -1091,6 +1099,8 @@ mod tests {
         reporter.report(ProgressEvent::CostUpdate {
             session_input_tokens: 12,
             session_output_tokens: 7,
+            turn_input_tokens: 12,
+            turn_output_tokens: 7,
             response_cost: None,
             session_cost: None,
             model: None,
