@@ -1311,6 +1311,9 @@ Clients must use that method list to enable or disable slash commands.
   `abandoned`
 - queued/running jobs from a previous server process are surfaced as
   `abandoned` after startup recovery; clients must not assume automatic resume
+- job list/read, replay, and live notification delivery are scoped by both
+  `profile_id` and `session_id`; equal bare session IDs in different profiles
+  must not expose each other's jobs
 
 `skill/action/job/read`:
 

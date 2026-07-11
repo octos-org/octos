@@ -42,6 +42,10 @@ recovery marks them `abandoned`.
 
 Do emit `skill/action/job/updated` after each appended job snapshot.
 
+Do enforce the job snapshot's `profile_id` at both replay and live fan-out.
+A connection bound to another profile must not receive the notification even
+when both profiles use the same bare wire `session_id`.
+
 Do NOT add `/api/notebook/*` routes or a notebook-specific job type. Notebook
 source import is one consumer of generic skill action jobs.
 

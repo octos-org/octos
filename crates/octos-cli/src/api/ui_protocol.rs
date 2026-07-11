@@ -405,6 +405,7 @@ pub(crate) struct WsConnection {
     /// [`update_live_features`]). Reads are far more frequent than
     /// writes, so `RwLock` is the right fit.
     live_features: Arc<std::sync::RwLock<ConnectionUiFeatures>>,
+    live_profile_id: Arc<std::sync::RwLock<String>>,
 }
 
 impl WsConnection {
@@ -417,6 +418,7 @@ impl WsConnection {
             failed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             failed_notify: Arc::new(tokio::sync::Notify::new()),
             live_features: Arc::new(std::sync::RwLock::new(ConnectionUiFeatures::default())),
+            live_profile_id: Arc::new(std::sync::RwLock::new(MAIN_PROFILE_ID.to_owned())),
         }
     }
 
@@ -432,6 +434,7 @@ impl WsConnection {
             live_features: Arc::new(std::sync::RwLock::new(
                 ConnectionUiFeatures::stdio_defaults(),
             )),
+            live_profile_id: Arc::new(std::sync::RwLock::new(MAIN_PROFILE_ID.to_owned())),
         }
     }
 
@@ -456,6 +459,21 @@ impl WsConnection {
             Err(poisoned) => poisoned.into_inner(),
         };
         *guard = features;
+    }
+
+    fn snapshot_live_profile_id(&self) -> String {
+        match self.live_profile_id.read() {
+            Ok(guard) => guard.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        }
+    }
+
+    fn update_live_profile_id(&self, profile_id: String) {
+        let mut guard = match self.live_profile_id.write() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        *guard = profile_id;
     }
 
     pub(crate) fn is_failed(&self) -> bool {
@@ -10086,6 +10104,7 @@ async fn handle_session_open(
             return false;
         }
     };
+    ws.update_live_profile_id(outcome.profile_id.clone());
 
     // #1594 follow-up: a session-ingress connection may only call the
     // session-scoped surface, so the SessionOpened reply it receives must not
@@ -10135,6 +10154,9 @@ async fn handle_session_open(
     // `turn/spawn_complete`, never both). Reusing the helper keeps replay
     // and live in lockstep.
     for event in outcome.replay {
+        if !ledger_event_matches_profile_scope(&event.event, &outcome.profile_id) {
+            continue;
+        }
         if !live_event_passes_capability_filter(&event.event, features) {
             continue;
         }
@@ -10275,6 +10297,15 @@ fn ledger_event_matches_topic_scope(
     }
 }
 
+fn ledger_event_matches_profile_scope(event: &UiProtocolLedgerEvent, profile_id: &str) -> bool {
+    match event {
+        UiProtocolLedgerEvent::Notification(UiNotification::SkillActionJobUpdated(update)) => {
+            update.profile_id == profile_id
+        }
+        _ => true,
+    }
+}
+
 fn stdio_session_open_candidate_profile(
     params: &SessionOpenParams,
     current_profile_id: Option<&str>,
@@ -10337,6 +10368,12 @@ async fn spawn_live_forwarder(
                         continue;
                     }
                     if !ledger_event_matches_topic_scope(&event.event, topic_scope.as_deref()) {
+                        continue;
+                    }
+                    if !ledger_event_matches_profile_scope(
+                        &event.event,
+                        &ws.snapshot_live_profile_id(),
+                    ) {
                         continue;
                     }
                     if !live_event_passes_capability_filter(&event.event, features) {
@@ -10533,6 +10570,7 @@ struct SessionOpenOutcome {
     /// where an event landing between replay and the session/open append
     /// would otherwise be filtered out (codex PR #761 MUST-FIX-1).
     replay_baseline_seq: u64,
+    profile_id: String,
 }
 
 // Threading both the approval store and the (UPCR-2026-023) question store
@@ -10556,6 +10594,9 @@ async fn open_session_result(
         params.profile_id.as_deref(),
         connection_profile_id,
     )?;
+    let ledger_profile_id = active_profile_id
+        .clone()
+        .unwrap_or_else(|| MAIN_PROFILE_ID.to_owned());
     if let Some(profile_id) = active_profile_id.as_deref() {
         ensure_known_profile(state, profile_id)?;
     }
@@ -10665,7 +10706,10 @@ async fn open_session_result(
     }
     let (mut replay, replay_baseline_seq) =
         ledger.replay_after_with_head(&params.session_id, params.after.as_ref())?;
-    replay.retain(|event| ledger_event_matches_topic_scope(&event.event, topic_scope.as_deref()));
+    replay.retain(|event| {
+        ledger_event_matches_topic_scope(&event.event, topic_scope.as_deref())
+            && ledger_event_matches_profile_scope(&event.event, &ledger_profile_id)
+    });
     let replayed_approval_ids = replay
         .iter()
         .filter_map(|event| match &event.event {
@@ -10791,6 +10835,7 @@ async fn open_session_result(
         pending_questions,
         opened_event,
         replay_baseline_seq,
+        profile_id: ledger_profile_id,
     })
 }
 
@@ -32824,6 +32869,20 @@ ignore = []
 
         assert_eq!(authenticated_profile_id(&user), Some("profile-a"));
         assert_eq!(authenticated_profile_id(&AuthIdentity::Admin), None);
+    }
+
+    #[test]
+    fn skill_action_job_events_are_visible_only_to_their_profile() {
+        let event = UiProtocolLedgerEvent::Notification(UiNotification::SkillActionJobUpdated(
+            SkillActionJobUpdatedEvent {
+                profile_id: "profile-a".into(),
+                session_id: SessionKey("web-shared".into()),
+                job: json!({"secret": "a"}),
+            },
+        ));
+
+        assert!(ledger_event_matches_profile_scope(&event, "profile-a"));
+        assert!(!ledger_event_matches_profile_scope(&event, "profile-b"));
     }
 
     #[test]
