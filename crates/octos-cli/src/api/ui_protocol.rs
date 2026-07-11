@@ -23642,6 +23642,8 @@ fn materialize_file_mutation_diff(
     };
     let git_root = find_git_root_for_path(&absolute_path)?;
     let relative_path = absolute_path.strip_prefix(&git_root).ok()?;
+
+    // Primary: working-tree vs index for a TRACKED file — the common edit case.
     let output = Command::new("git")
         .arg("-C")
         .arg(&git_root)
@@ -23650,14 +23652,105 @@ fn materialize_file_mutation_diff(
         .arg(relative_path)
         .output()
         .ok()?;
-
-    if !output.status.success() && output.stdout.is_empty() {
+    // A non-zero exit is a genuine git error (a corrupt/overridden index, or a
+    // path git rejects) — NOT "the file is untracked". Give up rather than
+    // mis-render a tracked file as wholly-added through the fallback below.
+    if !output.status.success() {
         return None;
     }
+    if let Some(diff) = finish_diff_preview(output.stdout) {
+        return Some(diff);
+    }
 
-    let diff = String::from_utf8(output.stdout).ok()?;
+    // Fallback: a brand-new file the agent just created is UNTRACKED, so the
+    // plain `git diff` above reports nothing and the preview would render an
+    // empty "ready" box with no hunks. Render the whole file as additions.
+    render_untracked_file_as_additions(&git_root, relative_path, &absolute_path)
+}
+
+/// Trim, cap, and drop-if-empty a raw `git diff` stdout into a preview body.
+/// `None` means "no renderable diff".
+fn finish_diff_preview(stdout: Vec<u8>) -> Option<String> {
+    let diff = String::from_utf8(stdout).ok()?;
     let diff = truncate_utf8(diff.trim_end().to_owned(), MAX_DIFF_PREVIEW_BYTES);
     (!diff.is_empty()).then_some(diff)
+}
+
+/// Render a newly-created UNTRACKED file as an all-additions diff via
+/// `git diff --no-index /dev/null <file>` (read-only — it never touches the
+/// index). `--no-index` exits 1 when the two paths differ (the normal case),
+/// so a renderable diff is judged by non-empty output rather than the exit
+/// code. `/dev/null` is Unix-only; on other platforms the file keeps today's
+/// behavior (empty preview, no regression).
+#[cfg(unix)]
+fn render_untracked_file_as_additions(
+    git_root: &Path,
+    relative_path: &Path,
+    absolute_path: &Path,
+) -> Option<String> {
+    if !absolute_path.is_file() || !file_is_untracked(git_root, relative_path) {
+        return None;
+    }
+    // Containment guard: this fallback reads the file directly, so a notice
+    // path that escapes the repo — a `..` component, or a symlinked directory
+    // that the lexical `strip_prefix` accepted — must NOT be read. Resolve BOTH
+    // sides (so a symlinked repo root, e.g. macOS `/tmp` -> `/private/tmp`,
+    // still matches) and derive the repo-relative path from the *canonical*
+    // file. `strip_prefix` succeeds only when the file lives below the real git
+    // root, so it doubles as the containment check.
+    let canonical_root = git_root.canonicalize().ok()?;
+    let canonical_file = absolute_path.canonicalize().ok()?;
+    let safe_relative = canonical_file.strip_prefix(&canonical_root).ok()?;
+    // Diff the SYMLINK-FREE canonical path (relative to the canonical root) so
+    // git does not re-follow a symlink we already resolved, and the preview
+    // still shows the tidy repo-relative path.
+    //
+    // Residual TOCTOU (accepted): a concurrent process could swap one of the
+    // now-real parent directories for an outside-pointing symlink between this
+    // check and git's open. Closing that fully needs `openat2(RESOLVE_BENEATH)`
+    // / a capability-`Dir`, which this `deny(unsafe_code)` crate can't express
+    // without a carve-out; in the multi-tenant deployment the sandbox's
+    // per-tenant FS isolation bounds that race, and the static `..`/symlink
+    // vectors (the reachable ones) are closed above.
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(&canonical_root)
+        .arg("diff")
+        .arg("--no-index")
+        .arg("--")
+        .arg("/dev/null")
+        .arg(safe_relative)
+        .output()
+        .ok()?;
+    finish_diff_preview(output.stdout)
+}
+
+#[cfg(not(unix))]
+fn render_untracked_file_as_additions(
+    _git_root: &Path,
+    _relative_path: &Path,
+    _absolute_path: &Path,
+) -> Option<String> {
+    None
+}
+
+/// True when git is not tracking `relative_path` (newly created, never
+/// `git add`ed). `git ls-files --error-unmatch` exits 0 when the path IS
+/// tracked, 1 when it is not, and 128 on a genuine git error. Treat ONLY the
+/// explicit unmatched code (1) as untracked, so a repo-level failure is never
+/// mistaken for "new file" (which would wrongly render it as wholly-added).
+#[cfg(unix)]
+fn file_is_untracked(git_root: &Path, relative_path: &Path) -> bool {
+    Command::new("git")
+        .arg("-C")
+        .arg(git_root)
+        .arg("ls-files")
+        .arg("--error-unmatch")
+        .arg("--")
+        .arg(relative_path)
+        .output()
+        .map(|output| output.status.code() == Some(1))
+        .unwrap_or(false)
 }
 
 fn find_git_root_for_path(path: &Path) -> Option<PathBuf> {
@@ -33965,6 +34058,159 @@ ignore = []
             .expect("snapshot should be retained for the entry");
         assert!(snapshot.contains("\"v1\""));
         assert!(!snapshot.contains("\"v2\""));
+    }
+
+    // Unix-only: the untracked fallback uses `git diff --no-index /dev/null`,
+    // which is only implemented on Unix (a no-op stub elsewhere).
+    #[cfg(unix)]
+    #[test]
+    fn file_mutation_diff_renders_untracked_new_file() {
+        // A brand-new file the agent just created is UNTRACKED, so plain
+        // `git diff -- <path>` reports nothing and the preview used to render
+        // an empty "ready" box. The preview must instead show the new file's
+        // contents as all-additions.
+        let repo = tempfile::tempdir().expect("temp repo");
+        for args in [
+            vec!["init"],
+            vec!["config", "user.name", "octos-test"],
+            vec!["config", "user.email", "octos-test@example.invalid"],
+        ] {
+            assert!(
+                Command::new("git")
+                    .arg("-C")
+                    .arg(repo.path())
+                    .args(&args)
+                    .status()
+                    .expect("git command")
+                    .success(),
+                "git {args:?} setup failed"
+            );
+        }
+        // Seed a committed file so the repo has history; the file under test
+        // stays UNTRACKED (it is never `git add`ed).
+        std::fs::write(repo.path().join("README.md"), "seed\n").expect("seed");
+        for args in [vec!["add", "."], vec!["commit", "-m", "seed"]] {
+            assert!(
+                Command::new("git")
+                    .arg("-C")
+                    .arg(repo.path())
+                    .args(&args)
+                    .status()
+                    .expect("git command")
+                    .success()
+            );
+        }
+
+        let src_dir = repo.path().join("app/src");
+        std::fs::create_dir_all(&src_dir).expect("src dir");
+        let path = src_dir.join("NewScreen.kt");
+        std::fs::write(&path, "class NewScreen\nfun render() {}\n").expect("write new file");
+
+        let contracts = UiProtocolContractStores::default();
+        let session_id = SessionKey("local:test".into());
+        let context = ProgressMappingContext::new(session_id.clone(), TurnId::new());
+        let event = json!({
+            "type": "file_modified",
+            "path": path,
+            "tool_call_id": "tool-new",
+        });
+        let mut mapping = map_progress_json(&context, &event);
+        apply_progress_contract_side_effects(&contracts, &context, None, &event, &mut mapping);
+
+        let preview_id = mapping
+            .status
+            .as_ref()
+            .and_then(|status| status.event.metadata.file_mutation.as_ref())
+            .and_then(|notice| notice.preview_id.clone())
+            .expect("file mutation should expose a preview id");
+
+        let result = contracts
+            .diff_previews(None)
+            .get(DiffPreviewGetParams {
+                session_id: session_id.clone(),
+                preview_id,
+            })
+            .expect("preview should be readable");
+
+        let file = &result.preview.files[0];
+        assert!(
+            file.hunks.iter().any(|hunk| !hunk.lines.is_empty()),
+            "an untracked new file must render its contents, not an empty preview"
+        );
+        assert!(
+            file.hunks
+                .iter()
+                .flat_map(|hunk| &hunk.lines)
+                .any(|line| line.content.contains("class NewScreen")),
+            "the preview must include the new file's added lines"
+        );
+    }
+
+    // Security regression: the untracked fallback reads the file directly, so it
+    // must never render a path that resolves OUTSIDE the git root (a `..` path
+    // or a symlink escape) — that would leak arbitrary file contents into a
+    // diff preview.
+    #[cfg(unix)]
+    #[test]
+    fn file_mutation_diff_does_not_leak_files_outside_the_repo() {
+        let repo = tempfile::tempdir().expect("temp repo");
+        for args in [
+            vec!["init"],
+            vec!["config", "user.name", "octos-test"],
+            vec!["config", "user.email", "octos-test@example.invalid"],
+        ] {
+            assert!(
+                Command::new("git")
+                    .arg("-C")
+                    .arg(repo.path())
+                    .args(&args)
+                    .status()
+                    .expect("git command")
+                    .success()
+            );
+        }
+        // A secret living OUTSIDE the repo, reachable via a symlink inside it.
+        let outside = tempfile::tempdir().expect("outside dir");
+        std::fs::write(outside.path().join("secret.txt"), "TOP_SECRET_VALUE\n").expect("secret");
+        let link = repo.path().join("leak.txt");
+        std::os::unix::fs::symlink(outside.path().join("secret.txt"), &link).expect("symlink");
+
+        let contracts = UiProtocolContractStores::default();
+        let session_id = SessionKey("local:test".into());
+        let context = ProgressMappingContext::new(session_id.clone(), TurnId::new());
+        let event = json!({
+            "type": "file_modified",
+            "path": link,
+            "tool_call_id": "tool-leak",
+        });
+        let mut mapping = map_progress_json(&context, &event);
+        apply_progress_contract_side_effects(&contracts, &context, None, &event, &mut mapping);
+
+        let preview_id = mapping
+            .status
+            .as_ref()
+            .and_then(|status| status.event.metadata.file_mutation.as_ref())
+            .and_then(|notice| notice.preview_id.clone())
+            .expect("file mutation should expose a preview id");
+        let result = contracts
+            .diff_previews(None)
+            .get(DiffPreviewGetParams {
+                session_id: session_id.clone(),
+                preview_id,
+            })
+            .expect("preview should be readable");
+
+        for file in &result.preview.files {
+            assert!(
+                file.hunks.iter().all(|hunk| hunk.lines.is_empty()),
+                "an escaping symlink must not render any hunks"
+            );
+        }
+        let serialized = serde_json::to_string(&result.preview).expect("serialize preview");
+        assert!(
+            !serialized.contains("TOP_SECRET_VALUE"),
+            "file contents outside the repo must never leak into a preview"
+        );
     }
 
     #[test]
