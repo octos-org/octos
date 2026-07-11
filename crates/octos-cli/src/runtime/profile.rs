@@ -511,6 +511,9 @@ impl ProfileRuntime {
             self.memory_store.clone(),
         ));
         tools.register(octos_agent::SaveMemoryTool::new(self.memory_store.clone()));
+        tools.register(octos_agent::RecordMemoryUseTool::new(
+            self.memory_store.clone(),
+        ));
         if self.memory_refresh_enabled {
             tools.register(octos_agent::MemoryNoteTool::new(self.memory_store.clone()));
         }
@@ -1979,6 +1982,10 @@ mod tests {
         ));
         assert!(Arc::ptr_eq(&original.tool_config, &replacement.tool_config));
         assert!(replacement.tool_specs.get("reload_action_tool").is_some());
+        assert!(
+            replacement.tool_specs.get("record_memory_use").is_some(),
+            "plugin-layer rebuild must retain the memory usage feedback tool"
+        );
         assert_eq!(replacement.skill_actions.len(), 1);
         assert_eq!(
             replacement.skill_actions[0].definition.id,
@@ -2090,7 +2097,7 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn should_retain_host_strict_signing_when_rebuilding_plugin_layer() {
+    async fn should_reject_unsigned_plugins_when_rebuilding_under_host_strict_signing() {
         use std::os::unix::fs::PermissionsExt;
 
         let _key = ScopedEnvKey::set("OCTOS_PLUGIN_RELOAD_SIGN_KEY");
@@ -2135,10 +2142,14 @@ mod tests {
         std::fs::write(&executable, "#!/bin/sh\necho unsigned").unwrap();
         std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
 
-        let replacement = original.rebuild_plugin_layer().await.unwrap();
-
-        assert!(replacement.tool_specs.get("unsigned_reload_tool").is_none());
-        assert!(replacement.plugin_tool_names.is_empty());
+        let error = match original.rebuild_plugin_layer().await {
+            Ok(_) => panic!("strict signing must reject an unsigned plugin during reload"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("plugins.require_signed"),
+            "unexpected reload error: {error}"
+        );
     }
 
     /// M11-F regression fix REG-2 follow-up (codex review): when the
