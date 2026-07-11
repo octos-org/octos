@@ -270,6 +270,14 @@ pub struct AppState {
     /// configs never set) is the primary defence; the handlers additionally
     /// reject any request carrying proxy-forwarding headers.
     pub solo_login_enabled: bool,
+    /// `--danger-full-access`: sessions with NO explicit `/permissions`
+    /// selection default to the dangerous full-access profile (sandbox off,
+    /// network allowed, approvals never) instead of the gated
+    /// workspace-write default — octos' analogue of Claude Code's
+    /// `--dangerously-skip-permissions`. Solo-gated at serve startup (the
+    /// same keystone that gates selecting the profile from the menu); an
+    /// explicit per-session `/permissions` choice always overrides it.
+    pub dangerous_default_permissions: bool,
     /// Resolved HOST-level memory policy (top-level config). Threaded into
     /// lazily-bootstrapped profile runtimes so a host opt-out of memory
     /// refresh (DEFAULT-ON) also binds profiles created after startup.
@@ -393,6 +401,7 @@ impl AppState {
             frps_port: None,
             deployment_mode: crate::config::DeploymentMode::Local,
             solo_login_enabled: false,
+            dangerous_default_permissions: false,
             host_memory: None,
             allow_admin_shell: false,
             content_catalog_mgr: None,

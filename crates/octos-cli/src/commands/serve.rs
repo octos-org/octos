@@ -255,6 +255,16 @@ pub struct ServeCommand {
     #[arg(long)]
     pub solo: bool,
 
+    /// Default every session to the dangerous FULL-ACCESS permission
+    /// profile: sandbox disabled, network allowed, approvals never —
+    /// octos' analogue of Claude Code's `--dangerously-skip-permissions`.
+    /// Requires `--solo` (the same local-single-user keystone that gates
+    /// selecting Full Access from the `/permissions` menu). A session's
+    /// explicit `/permissions` choice still overrides the default. Also
+    /// settable via `OCTOS_DANGER_FULL_ACCESS=1`.
+    #[arg(long)]
+    pub danger_full_access: bool,
+
     /// Disable automatic retry on transient errors.
     #[arg(long)]
     pub no_retry: bool,
@@ -679,6 +689,24 @@ impl ServeCommand {
             crate::api::DEFAULT_PREVIEW_SWEEP_INTERVAL,
         );
 
+        let solo_login_enabled_flag = self.solo
+            || std::env::var("OCTOS_SOLO_LOGIN")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false);
+        let dangerous_default_permissions_flag = self.danger_full_access
+            || std::env::var("OCTOS_DANGER_FULL_ACCESS")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false);
+        // SECURITY KEYSTONE: the dangerous default rides the SAME solo
+        // opt-in that gates selecting Full Access from the menu — a fleet
+        // config that never sets --solo can reach neither surface.
+        if dangerous_default_permissions_flag && !solo_login_enabled_flag {
+            eyre::bail!(
+                "--danger-full-access requires --solo (local single-user opt-in); \
+                 refusing to default sessions to the dangerous profile on a \
+                 potentially shared host"
+            );
+        }
         let state = Arc::new(AppState {
             profiles: profile_runtimes,
             session_cache,
@@ -728,10 +756,8 @@ impl ServeCommand {
             frps_port: std::env::var("FRPS_PORT").ok().and_then(|p| p.parse().ok()),
             deployment_mode: config.mode.clone(),
             host_memory: config.memory.clone(),
-            solo_login_enabled: self.solo
-                || std::env::var("OCTOS_SOLO_LOGIN")
-                    .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-                    .unwrap_or(false),
+            solo_login_enabled: solo_login_enabled_flag,
+            dangerous_default_permissions: dangerous_default_permissions_flag,
             allow_admin_shell: config.allow_admin_shell,
             content_catalog_mgr: Some(Arc::new(
                 crate::content_catalog::ContentCatalogManager::new(profile_store.clone()),
