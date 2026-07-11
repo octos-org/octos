@@ -2999,6 +2999,7 @@ impl Tool for PluginTool {
                 .get("success")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(exit_status.success());
+            let structured_metadata = parsed.get("structured_metadata").cloned();
             // Check if plugin reported a file path
             let file_modified = parsed
                 .get("file_modified")
@@ -3065,6 +3066,7 @@ impl Tool for PluginTool {
                 success,
                 file_modified,
                 files_to_send,
+                structured_metadata,
                 named_outputs,
                 ..Default::default()
             });
@@ -4482,6 +4484,34 @@ mod tests {
             result.output.contains("got:"),
             "output should contain echoed input, got: {}",
             result.output
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg(unix)]
+    async fn execute_preserves_plugin_structured_metadata() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let script_path = dir.path().join("script.sh");
+        write_test_script(
+            &script_path,
+            "#!/bin/sh\ncat >/dev/null\nprintf '{\"success\":true,\"output\":\"ok\",\"structured_metadata\":{\"sources\":[{\"id\":\"report\"}]}}\\n'\n",
+        );
+
+        let tool = PluginTool::new(
+            "test-plugin".into(),
+            make_tool_def("metadata_tool", "returns structured metadata"),
+            script_path,
+        )
+        .with_timeout(Duration::from_secs(5));
+
+        let result = tool
+            .execute(&json!({}))
+            .await
+            .expect("execute should succeed");
+
+        assert_eq!(
+            result.structured_metadata,
+            Some(json!({"sources": [{"id": "report"}]}))
         );
     }
 
