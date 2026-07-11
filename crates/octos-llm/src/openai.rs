@@ -590,16 +590,22 @@ impl LlmProvider for OpenAIProvider {
             reasoning_content,
             tool_calls,
             stop_reason,
-            usage: TokenUsage {
-                input_tokens: api_response.usage.prompt_tokens,
-                output_tokens: api_response.usage.completion_tokens,
-                cache_read_tokens: api_response
+            usage: {
+                // OpenAI reports cached tokens INSIDE prompt_tokens; the
+                // TokenUsage contract is disjoint (Anthropic-style: total
+                // prompt = input + cache_read), so subtract at the boundary.
+                let cached = api_response
                     .usage
                     .prompt_tokens_details
                     .as_ref()
                     .map(|d| d.cached_tokens)
-                    .unwrap_or(0),
-                ..Default::default()
+                    .unwrap_or(0);
+                TokenUsage {
+                    input_tokens: api_response.usage.prompt_tokens.saturating_sub(cached),
+                    output_tokens: api_response.usage.completion_tokens,
+                    cache_read_tokens: cached,
+                    ..Default::default()
+                }
             },
             provider_index: None,
         })
@@ -1047,12 +1053,16 @@ pub(crate) fn parse_openai_sse_events(event: &SseEvent) -> Vec<StreamEvent> {
     }
 
     if let Some(usage) = data.get("usage").filter(|u| !u.is_null()) {
+        // OpenAI reports cached tokens INSIDE prompt_tokens; the TokenUsage
+        // contract is disjoint (total prompt = input + cache_read).
+        let prompt = usage["prompt_tokens"].as_u64().unwrap_or(0) as u32;
+        let cached = usage["prompt_tokens_details"]["cached_tokens"]
+            .as_u64()
+            .unwrap_or(0) as u32;
         events.push(StreamEvent::Usage(TokenUsage {
-            input_tokens: usage["prompt_tokens"].as_u64().unwrap_or(0) as u32,
+            input_tokens: prompt.saturating_sub(cached),
             output_tokens: usage["completion_tokens"].as_u64().unwrap_or(0) as u32,
-            cache_read_tokens: usage["prompt_tokens_details"]["cached_tokens"]
-                .as_u64()
-                .unwrap_or(0) as u32,
+            cache_read_tokens: cached,
             ..Default::default()
         }));
     }
@@ -1754,7 +1764,9 @@ mod cache_usage_tests {
                 _ => None,
             })
             .expect("usage event");
-        assert_eq!(usage.input_tokens, 100);
+        // Normalized to disjoint accounting: OpenAI's prompt_tokens INCLUDES
+        // cached_tokens, TokenUsage does not — total = input + cache_read.
+        assert_eq!(usage.input_tokens, 25);
         assert_eq!(usage.cache_read_tokens, 75);
     }
 
@@ -1809,7 +1821,9 @@ mod cache_usage_tests {
             .chat(&messages, &[], &ChatConfig::default())
             .await
             .unwrap();
-        assert_eq!(response.usage.input_tokens, 100);
+        // Normalized to disjoint accounting: OpenAI's prompt_tokens INCLUDES
+        // cached_tokens, TokenUsage does not — total = input + cache_read.
+        assert_eq!(response.usage.input_tokens, 25);
         assert_eq!(response.usage.cache_read_tokens, 75);
     }
 }

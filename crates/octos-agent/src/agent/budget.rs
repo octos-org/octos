@@ -77,17 +77,12 @@ impl BudgetStop {
 }
 
 /// Tokens counted against the turn token budget: everything the provider
-/// processed. Anthropic reports cached prefix tokens OUTSIDE `input_tokens`
-/// (disjoint accounting: total prompt = input + cache_read + cache_write),
-/// so counting only input+output would let a cache-served loop run ~10x
-/// past the cap that bounded it before prompt caching landed.
-///
-/// Providers with INCLUSIVE accounting (OpenAI/Gemini report cached tokens
-/// inside `input_tokens`) get their cached portion counted twice here —
-/// deliberately conservative: the opt-in budget fires somewhat EARLY on
-/// their cache hits rather than 10x late on Anthropic's. Exact per-provider
-/// budgets need usage-semantics normalization (tracked as the pricing
-/// follow-up on the caching PR).
+/// processed. Per the [`octos_llm::TokenUsage`] contract, cache counts are
+/// DISJOINT from `input_tokens` on every provider (total prompt = input +
+/// cache_read + cache_write; inclusive wire formats are normalized at their
+/// parse boundary), so this sum is exact. Counting only input+output would
+/// let a cache-served Anthropic loop run ~10x past the cap that bounded it
+/// before prompt caching landed.
 fn budget_tokens_used(total_usage: &TokenUsage) -> u32 {
     total_usage
         .input_tokens

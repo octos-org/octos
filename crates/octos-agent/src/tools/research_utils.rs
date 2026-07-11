@@ -167,6 +167,8 @@ pub async fn extract_findings(
     let usage = TokenUsage {
         input_tokens: response.usage.input_tokens,
         output_tokens: response.usage.output_tokens,
+        cache_read_tokens: response.usage.cache_read_tokens,
+        cache_write_tokens: response.usage.cache_write_tokens,
         ..Default::default()
     };
     Ok((response.content.unwrap_or_default(), usage))
@@ -233,6 +235,8 @@ pub async fn merge_findings(
     let usage = TokenUsage {
         input_tokens: response.usage.input_tokens,
         output_tokens: response.usage.output_tokens,
+        cache_read_tokens: response.usage.cache_read_tokens,
+        cache_write_tokens: response.usage.cache_write_tokens,
         ..Default::default()
     };
     Ok((response.content.unwrap_or_default(), usage))
