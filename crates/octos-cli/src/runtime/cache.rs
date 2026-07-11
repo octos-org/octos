@@ -271,11 +271,15 @@ impl SessionRuntimeCache {
         session_key: SessionKey,
         workspace_hint: Option<PathBuf>,
     ) -> Result<Arc<SessionRuntime>> {
+        // Fixed workspace-write default (no mutable-store resolution to race
+        // against): sampling the epoch here is correct.
+        let permissions_epoch = self.session_generation(&session_key);
         self.get_or_init_with_permissions(
             profile,
             session_key,
             workspace_hint,
             EffectivePermissions::workspace_write(),
+            permissions_epoch,
         )
         .await
     }
@@ -290,10 +294,14 @@ impl SessionRuntimeCache {
         session_key: SessionKey,
         workspace_hint: Option<PathBuf>,
         permissions: EffectivePermissions,
+        // Epoch captured by the caller BEFORE it resolved `permissions` — see
+        // `get_or_init_with_permissions_and_sandbox`. REQUIRED (not
+        // self-sampled) so every permission-bearing call site is forced to
+        // pair its snapshot with the pre-resolution epoch; a self-sample here
+        // could pair a post-downgrade epoch with pre-downgrade permissions on
+        // a preempted multi-threaded caller (codex P1 round 4 on #1639).
+        permissions_epoch: u64,
     ) -> Result<Arc<SessionRuntime>> {
-        // Non-race callers (no separate permission-change dance): sample the
-        // current epoch at call time — equivalent to the prior behaviour.
-        let permissions_epoch = self.session_generation(&session_key);
         self.get_or_init_with_permissions_and_sandbox(
             profile,
             session_key,

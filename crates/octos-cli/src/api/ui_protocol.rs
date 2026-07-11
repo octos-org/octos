@@ -7027,6 +7027,10 @@ async fn tool_status_list_result(
 ) -> Result<Value, RpcError> {
     let profile_runtime = ensure_session_profile_runtime(state, active_profile_id).await?;
     let session_runtime = if let Some(profile_runtime) = profile_runtime.as_ref() {
+        // Epoch BEFORE permission resolution so a concurrent downgrade
+        // can't pair a post-bump epoch with pre-bump permissions on a
+        // preempted caller (codex P1 round 4 on #1639).
+        let permissions_epoch = state.session_cache.session_generation(session_id);
         let permissions = effective_permissions_for_session(state, session_id)?;
         let workspace_hint = session_workspaces().get(session_id);
         Some(
@@ -7037,6 +7041,7 @@ async fn tool_status_list_result(
                     session_id.clone(),
                     workspace_hint,
                     permissions,
+                    permissions_epoch,
                 )
                 .await
                 .map_err(|error| {
@@ -10846,10 +10851,17 @@ pub(crate) async fn resolve_sessions_for_lookup(
         .or(routed_profile_id);
     if let Some(profile_runtime) = resolve_session_profile_runtime(state, active_profile_id) {
         let hint = session_workspaces().get(session_id);
+        let permissions_epoch = state.session_cache.session_generation(session_id);
         let permissions = effective_permissions_for_session(state, session_id).ok()?;
         if let Ok(runtime) = state
             .session_cache
-            .get_or_init_with_permissions(&profile_runtime, session_id.clone(), hint, permissions)
+            .get_or_init_with_permissions(
+                &profile_runtime,
+                session_id.clone(),
+                hint,
+                permissions,
+                permissions_epoch,
+            )
             .await
         {
             return Some(runtime.sessions.clone());
@@ -18047,6 +18059,7 @@ async fn run_native_code_review_turn(
         }
     };
     let hint = session_workspaces().get(&session_id);
+    let permissions_epoch = state.session_cache.session_generation(&session_id);
     let permissions = match effective_permissions_for_session(&state, &session_id) {
         Ok(permissions) => permissions,
         Err(error) => {
@@ -18068,7 +18081,13 @@ async fn run_native_code_review_turn(
     };
     let session_runtime = match state
         .session_cache
-        .get_or_init_with_permissions(&profile_runtime, session_id.clone(), hint, permissions)
+        .get_or_init_with_permissions(
+            &profile_runtime,
+            session_id.clone(),
+            hint,
+            permissions,
+            permissions_epoch,
+        )
         .await
     {
         Ok(runtime) => runtime,
@@ -19588,6 +19607,7 @@ async fn run_standalone_turn(
     // use that as the `workspace_hint`. Otherwise the bootstrap default
     // Tier-3 (`<profile_data_dir>/users/.../workspace`) wins.
     let hint = session_workspaces().get(&session_id);
+    let permissions_epoch = state.session_cache.session_generation(&session_id);
     let permissions = match effective_permissions_for_session(&state, &session_id) {
         Ok(permissions) => permissions,
         Err(error) => {
@@ -19609,7 +19629,13 @@ async fn run_standalone_turn(
     };
     let session_runtime = match state
         .session_cache
-        .get_or_init_with_permissions(&profile_runtime, session_id.clone(), hint, permissions)
+        .get_or_init_with_permissions(
+            &profile_runtime,
+            session_id.clone(),
+            hint,
+            permissions,
+            permissions_epoch,
+        )
         .await
     {
         Ok(rt) => rt,
