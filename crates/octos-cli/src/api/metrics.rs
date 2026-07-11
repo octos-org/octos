@@ -958,11 +958,31 @@ pub fn record_routing_decision(tier: &str, lane: Option<&str>) {
 /// then delegates to an inner reporter.
 pub struct MetricsReporter {
     inner: Arc<dyn octos_agent::ProgressReporter>,
+    /// Turn-cumulative counters at the last `CostUpdate` this reporter
+    /// metered. `octos_llm_tokens_total` increments by the DELTA between
+    /// successive events so responses that emit no cost update of their
+    /// own (mid-turn tool iterations, the verifier) are still counted by
+    /// the next event that does fire. The reporter is built per turn, so
+    /// the counters start at zero with the turn; a smaller-than-last
+    /// value (a reporter reused across turns) is treated as a reset.
+    last_turn_input_tokens: std::sync::atomic::AtomicU32,
+    last_turn_output_tokens: std::sync::atomic::AtomicU32,
 }
 
 impl MetricsReporter {
     pub fn new(inner: Arc<dyn octos_agent::ProgressReporter>) -> Self {
-        Self { inner }
+        Self {
+            inner,
+            last_turn_input_tokens: std::sync::atomic::AtomicU32::new(0),
+            last_turn_output_tokens: std::sync::atomic::AtomicU32::new(0),
+        }
+    }
+
+    /// Delta since the last metered value, treating a decrease as a
+    /// turn reset (the new value counts in full).
+    fn meter_delta(last: &std::sync::atomic::AtomicU32, now: u32) -> u32 {
+        let prev = last.swap(now, std::sync::atomic::Ordering::AcqRel);
+        if now >= prev { now - prev } else { now }
     }
 }
 
@@ -978,12 +998,23 @@ impl octos_agent::ProgressReporter for MetricsReporter {
                 record_tool_call(name, *success, duration.as_secs_f64());
             }
             octos_agent::ProgressEvent::CostUpdate {
-                session_input_tokens,
-                session_output_tokens,
+                turn_input_tokens,
+                turn_output_tokens,
                 ..
             } => {
-                record_llm_tokens("input", *session_input_tokens);
-                record_llm_tokens("output", *session_output_tokens);
+                // Meter the delta of the TURN-cumulative counters (see
+                // the field docs on `MetricsReporter`). The old form
+                // added the cumulative session values on every event —
+                // multiply-counting earlier responses and overflowing
+                // the u32 boundary once those went session-wide u64.
+                record_llm_tokens(
+                    "input",
+                    Self::meter_delta(&self.last_turn_input_tokens, *turn_input_tokens),
+                );
+                record_llm_tokens(
+                    "output",
+                    Self::meter_delta(&self.last_turn_output_tokens, *turn_output_tokens),
+                );
             }
             _ => {}
         }

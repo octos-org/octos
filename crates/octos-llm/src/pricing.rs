@@ -42,12 +42,26 @@ fn catalog_pricing(model_id: &str) -> Option<ModelPricing> {
     if let Some(p) = map.get(&m) {
         return Some(*p);
     }
-    for (key, p) in map {
-        if m.contains(key) || key.contains(&m) {
-            return Some(*p);
-        }
+    // The substring fallback used to return the FIRST HashMap hit, which
+    // made pricing nondeterministic whenever a model id matched several
+    // keys ("gpt-5.2-codex" matches both "gpt-5.2" and "gpt-5" — which
+    // one won differed per process). Deterministic rule instead:
+    //   1. Keys the model id CONTAINS name a family the id extends; the
+    //      LONGEST such key is the most specific family, so it wins.
+    //   2. Otherwise, among keys that contain the model id, the SHORTEST
+    //      is the closest match.
+    // Ties break lexicographically so equal-length keys are stable too.
+    let family = map
+        .iter()
+        .filter(|(key, _)| m.contains(key.as_str()))
+        .max_by(|(a, _), (b, _)| a.len().cmp(&b.len()).then_with(|| b.cmp(a)));
+    if let Some((_, p)) = family {
+        return Some(*p);
     }
-    None
+    map.iter()
+        .filter(|(key, _)| key.contains(&m))
+        .min_by(|(a, _), (b, _)| a.len().cmp(&b.len()).then_with(|| a.cmp(b)))
+        .map(|(_, p)| *p)
 }
 
 impl ModelPricing {
@@ -306,5 +320,44 @@ mod tests {
         let r1 = model_pricing("deepseek-ai/deepseek-r1").unwrap();
         let base = model_pricing("deepseek-chat").unwrap();
         assert!(r1.input_per_million > base.input_per_million);
+    }
+
+    /// Catalog substring fallback must be deterministic. The old scan
+    /// returned the FIRST HashMap hit, so a model id matching several
+    /// catalog keys ("octestfam-5.2-codex" matches both "octestfam-5"
+    /// and "octestfam-5.2") got a random sibling's pricing per process.
+    ///
+    /// One #[test] on purpose: these sections share the process-global
+    /// PRICING_CATALOG, so splitting them into parallel tests would race.
+    /// Key names are deliberately weird so no other test's probe can
+    /// substring-match them while the seed is live.
+    #[test]
+    fn should_match_catalog_keys_deterministically_when_no_exact_hit() {
+        // Section 1: model id EXTENDS several family keys — the longest
+        // (most specific) family must win, not HashMap iteration order.
+        seed_pricing_catalog(&[
+            ("octestprov/octestfam-5".to_string(), 1.0, 2.0),
+            ("octestprov/octestfam-5.2".to_string(), 3.0, 4.0),
+        ]);
+        let p = model_pricing("octestfam-5.2-codex").unwrap();
+        assert!((p.input_per_million - 3.0).abs() < f64::EPSILON);
+        assert!((p.output_per_million - 4.0).abs() < f64::EPSILON);
+
+        // Section 2: exact key still wins over any substring candidate.
+        let exact = model_pricing("octestfam-5").unwrap();
+        assert!((exact.input_per_million - 1.0).abs() < f64::EPSILON);
+
+        // Section 3: model id is a PREFIX of several keys — the shortest
+        // (closest) super-key must win deterministically.
+        seed_pricing_catalog(&[
+            ("octestprov/octestfam-7.2".to_string(), 5.0, 6.0),
+            ("octestprov/octestfam-7-mini-preview".to_string(), 7.0, 8.0),
+        ]);
+        let sup = model_pricing("octestfam-7").unwrap();
+        assert!((sup.input_per_million - 5.0).abs() < f64::EPSILON);
+
+        // Restore an empty catalog so parallel tests keep hitting the
+        // hardcoded ladder exactly as before this test ran.
+        seed_pricing_catalog(&[]);
     }
 }
