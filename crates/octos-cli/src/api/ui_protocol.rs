@@ -7642,6 +7642,7 @@ struct PreparedSkillActionInvocation {
 struct QueuedSkillActionJob {
     tool: String,
     args: Value,
+    workspace_root: PathBuf,
     job: SkillActionJobRecord,
 }
 
@@ -7830,15 +7831,80 @@ fn prepare_skill_action_tool_invocation(
     }
 }
 
-fn tool_result_to_action_value(result: octos_agent::ToolResult) -> Value {
+fn artifact_media_type(path: &Path) -> &'static str {
+    match path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("md" | "markdown") => "text/markdown",
+        Some("txt") => "text/plain",
+        Some("json") => "application/json",
+        Some("csv") => "text/csv",
+        Some("pdf") => "application/pdf",
+        Some("png") => "image/png",
+        Some("jpg" | "jpeg") => "image/jpeg",
+        Some("gif") => "image/gif",
+        Some("webp") => "image/webp",
+        Some("mp3") => "audio/mpeg",
+        Some("wav") => "audio/wav",
+        Some("m4a") => "audio/mp4",
+        Some("mp4") => "video/mp4",
+        Some("webm") => "video/webm",
+        Some("pptx") => "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        Some("docx") => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        Some("xlsx") => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        _ => "application/octet-stream",
+    }
+}
+
+fn action_artifact_value(workspace_root: &Path, path: &Path) -> Option<Value> {
+    let candidate = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        workspace_root.join(path)
+    };
+    let canonical_root = std::fs::canonicalize(workspace_root).ok()?;
+    let canonical_path = std::fs::canonicalize(candidate).ok()?;
+    if !canonical_path.is_file() || !canonical_path.starts_with(&canonical_root) {
+        return None;
+    }
+    let handle =
+        octos_bus::file_handle::encode_workspace_file_handle(&canonical_root, &canonical_path)?;
+    let display_name = canonical_path.file_name()?.to_str()?;
+    let size = std::fs::metadata(&canonical_path).ok()?.len();
+    Some(json!({
+        "handle": handle,
+        "display_name": display_name,
+        "media_type": artifact_media_type(&canonical_path),
+        "size": size,
+    }))
+}
+
+fn tool_result_to_action_value(result: octos_agent::ToolResult, workspace_root: &Path) -> Value {
+    let file_modified = result
+        .file_modified
+        .as_deref()
+        .and_then(|path| action_artifact_value(workspace_root, path))
+        .and_then(|artifact| artifact.get("handle").cloned());
+    let mut seen = HashSet::new();
+    let artifacts = result
+        .files_to_send
+        .iter()
+        .filter_map(|path| action_artifact_value(workspace_root, path))
+        .filter(|artifact| {
+            artifact
+                .get("handle")
+                .and_then(Value::as_str)
+                .is_some_and(|handle| seen.insert(handle.to_owned()))
+        })
+        .collect::<Vec<_>>();
     json!({
         "success": result.success,
         "output": result.output,
-        "file_modified": result.file_modified.map(|path| path.to_string_lossy().into_owned()),
-        "files_to_send": result.files_to_send
-            .into_iter()
-            .map(|path| path.to_string_lossy().into_owned())
-            .collect::<Vec<_>>(),
+        "file_modified": file_modified,
+        "artifacts": artifacts,
         "structured_metadata": result.structured_metadata,
     })
 }
@@ -7877,7 +7943,7 @@ async fn invoke_skill_action_tool_binding(
             execute_skill_action_tool_call(&action.id, &prepared.tool, registry, &call.args)
                 .await?;
         ok &= result.success;
-        results.push(tool_result_to_action_value(result));
+        results.push(tool_result_to_action_value(result, workspace_root));
         if !ok {
             break;
         }
@@ -7962,6 +8028,7 @@ fn enqueue_background_skill_action_jobs(
         queued_jobs.push(QueuedSkillActionJob {
             tool: prepared.tool.clone(),
             args: call.args,
+            workspace_root: workspace_root.to_path_buf(),
             job,
         });
     }
@@ -8000,7 +8067,7 @@ async fn run_background_skill_action_job(
         Ok(tool_result) => {
             let success = tool_result.success;
             let output = tool_result.output.clone();
-            let result_value = tool_result_to_action_value(tool_result);
+            let result_value = tool_result_to_action_value(tool_result, &queued.workspace_root);
             if !output.is_empty() {
                 completed.output = Some(output.clone());
             }
@@ -29700,6 +29767,30 @@ ignore = []
             })
             .collect::<Vec<_>>();
         assert_eq!(update_statuses, vec!["queued", "running", "succeeded"]);
+    }
+
+    #[test]
+    fn skill_action_result_exposes_only_session_scoped_artifacts() {
+        let workspace = tempfile::tempdir().unwrap();
+        let artifact = workspace.path().join("notebook-outputs/quiz.md");
+        std::fs::create_dir_all(artifact.parent().unwrap()).unwrap();
+        std::fs::write(&artifact, b"# Quiz").unwrap();
+        let outside = tempfile::NamedTempFile::new().unwrap();
+        let result = octos_agent::ToolResult {
+            success: true,
+            files_to_send: vec![artifact, outside.path().to_path_buf()],
+            ..Default::default()
+        };
+
+        let value = tool_result_to_action_value(result, workspace.path());
+
+        assert!(value.get("files_to_send").is_none());
+        let artifacts = value["artifacts"].as_array().expect("artifacts");
+        assert_eq!(artifacts.len(), 1);
+        assert!(artifacts[0]["handle"].as_str().unwrap().starts_with("ws/"));
+        assert_eq!(artifacts[0]["display_name"], "quiz.md");
+        assert_eq!(artifacts[0]["media_type"], "text/markdown");
+        assert_eq!(artifacts[0]["size"], 6);
     }
 
     #[tokio::test]

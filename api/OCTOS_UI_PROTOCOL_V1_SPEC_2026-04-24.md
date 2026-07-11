@@ -1289,8 +1289,14 @@ Clients must use that method list to enable or disable slash commands.
   upload path
 - result shape is `{ action_id, ok, results }`; `file_each` also includes
   `materialized_paths`
-- each `results[]` entry mirrors an Octos `ToolResult` as `success`, `output`,
-  `file_modified`, `files_to_send`, and `structured_metadata`
+- each `results[]` entry contains `success`, `output`, `file_modified`,
+  `artifacts[]`, and `structured_metadata`; `file_modified` is an opaque
+  session-workspace handle or `null`, and each artifact contains `handle`,
+  `display_name`, `media_type`, and `size`
+- `ws/...` artifact handles require the owning `session_id` when fetched;
+  clients must not interpret the handle payload or accept raw absolute paths
+- files missing from or outside the session workspace are omitted from
+  `artifacts[]`
 - when the manifest action declares `execution: "background"`, response shape
   is `{ action_id, ok, batch_id, jobs }`; the server appends persisted job
   snapshots and emits `skill/action/job/updated` for subsequent state changes

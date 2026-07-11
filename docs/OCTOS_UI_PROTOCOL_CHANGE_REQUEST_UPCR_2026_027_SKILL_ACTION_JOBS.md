@@ -102,6 +102,12 @@ Each job entry includes at least `job_id`, `batch_id`, `session_id`,
 `updated_at`. File-based jobs also include `input_path`, `filename`, and
 `materialized_path` when available.
 
+A completed job's generic `result.artifacts[]` entries contain `handle`,
+`display_name`, `media_type`, and `size`. The `ws/...` handle is opaque and
+must be resolved with the owning `session_id`; raw host paths are never exposed.
+Files outside the session workspace, missing files, and traversal paths are
+omitted. `result.file_modified`, when present, is also an opaque handle.
+
 ### `skill/action/job/list`
 
 Request:

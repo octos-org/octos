@@ -5,11 +5,13 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 
 const PROFILE_HANDLE_PREFIX: &str = "pf";
 const UPLOAD_HANDLE_PREFIX: &str = "up";
+const WORKSPACE_HANDLE_PREFIX: &str = "ws";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FileHandleScope {
     ProfileRelative(PathBuf),
     TempUpload(PathBuf),
+    WorkspaceRelative(PathBuf),
 }
 
 /// Scope of a resolved tool-argument path. Lets callers apply
@@ -99,6 +101,17 @@ pub fn encode_tmp_upload_handle(path: &Path, display_name: Option<&str>) -> Opti
     encode_scoped_handle(UPLOAD_HANDLE_PREFIX, relative, display_name)
 }
 
+pub fn encode_workspace_file_handle(workspace_root: &Path, path: &Path) -> Option<String> {
+    let canonical_root = std::fs::canonicalize(workspace_root).ok()?;
+    let canonical_path = std::fs::canonicalize(path).ok()?;
+    if !canonical_path.is_file() {
+        return None;
+    }
+    let relative = canonical_path.strip_prefix(canonical_root).ok()?;
+    let display_name = canonical_path.file_name()?.to_str()?;
+    encode_scoped_handle(WORKSPACE_HANDLE_PREFIX, relative, display_name)
+}
+
 pub fn decode_file_handle(handle: &str) -> Option<FileHandleScope> {
     let mut parts = handle.splitn(3, '/');
     let prefix = parts.next()?;
@@ -116,6 +129,7 @@ pub fn decode_file_handle(handle: &str) -> Option<FileHandleScope> {
     match prefix {
         PROFILE_HANDLE_PREFIX => Some(FileHandleScope::ProfileRelative(relative)),
         UPLOAD_HANDLE_PREFIX => Some(FileHandleScope::TempUpload(relative)),
+        WORKSPACE_HANDLE_PREFIX => Some(FileHandleScope::WorkspaceRelative(relative)),
         _ => None,
     }
 }
@@ -124,7 +138,15 @@ pub fn resolve_scoped_file_handle(base_dir: &Path, handle: &str) -> Option<PathB
     match decode_file_handle(handle)? {
         FileHandleScope::ProfileRelative(relative) => canonicalize_under(base_dir, &relative),
         FileHandleScope::TempUpload(relative) => canonicalize_under(&temp_upload_root(), &relative),
+        FileHandleScope::WorkspaceRelative(_) => None,
     }
+}
+
+pub fn resolve_workspace_file_handle(workspace_root: &Path, handle: &str) -> Option<PathBuf> {
+    let FileHandleScope::WorkspaceRelative(relative) = decode_file_handle(handle)? else {
+        return None;
+    };
+    canonicalize_under(workspace_root, &relative)
 }
 
 pub fn resolve_legacy_file_request(base_dir: &Path, raw: &str) -> Option<PathBuf> {
@@ -151,6 +173,7 @@ pub fn resolve_upload_reference(raw: &str) -> Option<PathBuf> {
             canonicalize_under(&temp_upload_root(), &relative)
         }
         Some(FileHandleScope::ProfileRelative(_)) => None,
+        Some(FileHandleScope::WorkspaceRelative(_)) => None,
         None => {
             let candidate = Path::new(raw);
             if candidate.is_absolute() {
@@ -228,6 +251,14 @@ pub fn resolve_tool_path(
                 .map(|absolute| ResolvedToolPath {
                     absolute,
                     scope: ToolPathScope::Profile,
+                })
+                .ok_or(ToolPathError::OutsideAllowedRoots);
+        }
+        Some(FileHandleScope::WorkspaceRelative(relative)) => {
+            return canonicalize_under(workspace_root, &relative)
+                .map(|absolute| ResolvedToolPath {
+                    absolute,
+                    scope: ToolPathScope::Workspace,
                 })
                 .ok_or(ToolPathError::OutsideAllowedRoots);
         }
@@ -951,6 +982,24 @@ mod tests {
             FileHandleScope::ProfileRelative(PathBuf::from("slides/demo/output/deck.pptx"))
         );
         assert!(handle.ends_with("/deck.pptx"));
+    }
+
+    #[test]
+    fn workspace_handle_round_trips_only_within_its_workspace() {
+        let workspace = tempfile::tempdir().unwrap();
+        let artifact = workspace.path().join("outputs/quiz.md");
+        std::fs::create_dir_all(artifact.parent().unwrap()).unwrap();
+        std::fs::write(&artifact, b"quiz").unwrap();
+
+        let handle = encode_workspace_file_handle(workspace.path(), &artifact).expect("handle");
+
+        assert!(handle.starts_with("ws/"));
+        assert_eq!(
+            resolve_workspace_file_handle(workspace.path(), &handle),
+            std::fs::canonicalize(artifact).ok(),
+        );
+        let other_workspace = tempfile::tempdir().unwrap();
+        assert!(resolve_workspace_file_handle(other_workspace.path(), &handle).is_none());
     }
 
     #[test]

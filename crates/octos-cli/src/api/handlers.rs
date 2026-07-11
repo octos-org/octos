@@ -12,7 +12,7 @@ use axum::response::{IntoResponse, Response};
 use octos_agent::inspect_workspace_contract;
 use octos_bus::file_handle::{
     encode_profile_file_handle, encode_tmp_upload_handle, resolve_legacy_file_request,
-    resolve_scoped_file_handle,
+    resolve_scoped_file_handle, resolve_workspace_file_handle,
 };
 #[cfg(test)]
 use octos_core::Message;
@@ -85,7 +85,9 @@ fn resolve_scoped_download_path(
     // (`<workspace>/uploads/<name>`) and the user-message `FileRef` carries that
     // workspace-relative path. Serve it from the resolved session workspace (the
     // caller passes the SAME root the turn materialized into).
-    resolve_within_workspace(session_workspace?, request_path)
+    let session_workspace = session_workspace?;
+    resolve_workspace_file_handle(session_workspace, request_path)
+        .or_else(|| resolve_within_workspace(session_workspace, request_path))
 }
 
 /// If `p` is contained under the process-global upload tmpdir, return its owning
@@ -4848,6 +4850,17 @@ mod tests {
             ok,
             Some(std::fs::canonicalize(ws.join("uploads/report.md")).unwrap())
         );
+
+        let handle = octos_bus::file_handle::encode_workspace_file_handle(
+            &ws,
+            &ws.join("uploads/report.md"),
+        )
+        .unwrap();
+        assert_eq!(
+            resolve_scoped_download_path(data.path(), &handle, None, Some(ws.as_path())),
+            Some(std::fs::canonicalize(ws.join("uploads/report.md")).unwrap())
+        );
+        assert!(resolve_scoped_download_path(data.path(), &handle, None, None).is_none());
 
         // Without a session workspace → not resolvable (no session context).
         assert!(
