@@ -10027,6 +10027,12 @@ async fn open_session_result(
         resolve_session_profile_runtime(state, active_profile_id.as_deref())
     {
         let hint = effective_workspace_hint.clone();
+        // Capture the session epoch BEFORE resolving permissions so any
+        // concurrent `permission/profile/set` (which bumps the epoch AFTER
+        // writing the store) that could have made these permissions stale
+        // also invalidates this epoch — the cache insert then rejects the
+        // stale bootstrap (codex P1 round 3 on #1639).
+        let permissions_epoch = state.session_cache.session_generation(&params.session_id);
         let permissions = effective_permissions_for_session(state, &params.session_id)?;
         let sandbox_override = validate_requested_session_sandbox(
             features,
@@ -10041,6 +10047,7 @@ async fn open_session_result(
                 hint,
                 permissions,
                 sandbox_override,
+                permissions_epoch,
             )
             .await
         {

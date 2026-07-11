@@ -291,12 +291,16 @@ impl SessionRuntimeCache {
         workspace_hint: Option<PathBuf>,
         permissions: EffectivePermissions,
     ) -> Result<Arc<SessionRuntime>> {
+        // Non-race callers (no separate permission-change dance): sample the
+        // current epoch at call time — equivalent to the prior behaviour.
+        let permissions_epoch = self.session_generation(&session_key);
         self.get_or_init_with_permissions_and_sandbox(
             profile,
             session_key,
             workspace_hint,
             permissions,
             None,
+            permissions_epoch,
         )
         .await
     }
@@ -312,6 +316,14 @@ impl SessionRuntimeCache {
         workspace_hint: Option<PathBuf>,
         permissions: EffectivePermissions,
         sandbox_override: Option<SandboxConfig>,
+        // Session-generation epoch captured by the CALLER at (or before) the
+        // moment it resolved `permissions` — NOT re-sampled here. A bootstrap
+        // that waits on an in-flight slot and then claims its own must reject
+        // its insert if an `invalidate_session` bumped the generation any time
+        // after the permissions were resolved, or it would re-cache the
+        // pre-change (possibly dangerous) policy after a downgrade (codex P1
+        // round 3 on #1639).
+        permissions_epoch: u64,
     ) -> Result<Arc<SessionRuntime>> {
         let key = (profile.profile_id.clone(), session_key.clone());
 
@@ -399,7 +411,9 @@ impl SessionRuntimeCache {
                 }
                 InflightOutcome::OwnGuard(guard) => {
                     let generation_at_start = self.profile_generation(&key.0);
-                    let session_generation_at_start = self.session_generation(&session_key);
+                    // Caller-supplied epoch (tied to the permission snapshot),
+                    // not a post-wait re-sample — see the param doc.
+                    let session_generation_at_start = permissions_epoch;
                     let result = SessionRuntime::bootstrap_with_permissions_and_sandbox(
                         profile,
                         session_key.clone(),
@@ -571,7 +585,7 @@ impl SessionRuntimeCache {
         guard.retain(|(_, key_session), _| key_session != session_key);
     }
 
-    fn session_generation(&self, session_key: &SessionKey) -> u64 {
+    pub(crate) fn session_generation(&self, session_key: &SessionKey) -> u64 {
         self.session_generations
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -847,6 +861,57 @@ mod tests {
             1,
             "a post-invalidate bootstrap caches normally"
         );
+    }
+
+    #[tokio::test]
+    async fn stale_permission_epoch_is_rejected_at_insert() {
+        // codex P1 round 3: an epoch captured BEFORE a concurrent
+        // `invalidate_session` must reject the bootstrap's insert even though
+        // the OwnGuard arm no longer re-samples the (now-bumped) generation.
+        // This is the wait-race made deterministic: capture the epoch, bump
+        // it, then run get_or_init with the STALE epoch — nothing caches.
+        let tmp = TempDir::new().unwrap();
+        let profile = make_profile(tmp.path().join("profile-data")).await;
+        let session = SessionKey::new("api", "stale-epoch");
+
+        let cache = SessionRuntimeCache::new(8, Duration::from_secs(60));
+        let stale_epoch = cache.session_generation(&session); // 0
+        cache.invalidate_session(&session).await; // bump -> 1
+
+        let runtime = cache
+            .get_or_init_with_permissions_and_sandbox(
+                &profile,
+                session.clone(),
+                None,
+                EffectivePermissions::workspace_write(),
+                None,
+                stale_epoch,
+            )
+            .await
+            .expect("bootstrap succeeds but must not cache");
+        // The caller still gets a working runtime…
+        assert_eq!(runtime.session_key, session);
+        // …but it was NOT cached (stale epoch rejected at insert).
+        assert_eq!(
+            cache.len().await,
+            0,
+            "a bootstrap carrying a pre-invalidate epoch must not cache"
+        );
+
+        // A fresh call with the CURRENT epoch caches normally.
+        let current_epoch = cache.session_generation(&session);
+        cache
+            .get_or_init_with_permissions_and_sandbox(
+                &profile,
+                session.clone(),
+                None,
+                EffectivePermissions::workspace_write(),
+                None,
+                current_epoch,
+            )
+            .await
+            .expect("current-epoch bootstrap");
+        assert_eq!(cache.len().await, 1, "current epoch caches");
     }
 
     #[tokio::test]
