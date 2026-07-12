@@ -33,8 +33,21 @@ use serde_json::{Value, json};
 use tokio::sync::mpsc;
 
 const AUTONOMY_POLICY_ID: &str = "coding-autonomy-v1";
-const GOAL_DEFAULT_TOKEN_BUDGET: u64 = 50_000;
-const GOAL_MAX_TOKEN_BUDGET: u64 = 200_000;
+/// Default per-goal continuation token budget when the caller does not
+/// specify one. Sized to survive several real turns: each goal turn
+/// charges its FULL token cost (input + output + cache reads/writes), so
+/// on any non-trivial session a single turn spends 100K–200K+ tokens. The
+/// earlier 50K default budget-limited a goal after ~one turn, which read
+/// as "the goal stopped counting". Users can override per-goal up to
+/// [`GOAL_MAX_TOKEN_BUDGET`]. `pub(crate)` so the capability advertisement
+/// (`ui_protocol`) reports the real value instead of a drifting literal.
+pub(crate) const GOAL_DEFAULT_TOKEN_BUDGET: u64 = 2_000_000;
+/// Hard ceiling on a caller-supplied goal budget — a sanity limit against
+/// typos / overflow, NOT a practical cap (at ~175K tokens/turn this still
+/// allows thousands of continuations). The user owns whatever value they
+/// set beneath it; the small default above is what guards an unspecified
+/// goal from unbounded autonomous spend.
+pub(crate) const GOAL_MAX_TOKEN_BUDGET: u64 = 1_000_000_000;
 const LOOP_MIN_INTERVAL_SECONDS: u64 = 60;
 const LOOP_MAX_INTERVAL_SECONDS: u64 = 86_400;
 const LOOP_MAX_AGE_DAYS: i64 = 7;
@@ -8353,6 +8366,58 @@ mod tests {
             GoalRuntimeIdleState::idle(),
         ));
         assert_eq!(orchestrator.pending_continuation_count_for_test(), 0);
+    }
+
+    /// User-settable budget: a `token_budget` above the OLD 200K ceiling
+    /// (but within the raised `GOAL_MAX_TOKEN_BUDGET`) must be accepted,
+    /// not rejected as `AUTONOMY_QUOTA_EXCEEDED`. Regression guard for the
+    /// "goal budget dies in ~one turn" report — a single large-context
+    /// turn charges more than the legacy 200K ceiling, so the cap had to
+    /// grow past a realistic per-turn cost.
+    #[test]
+    fn set_goal_accepts_budget_above_legacy_ceiling() {
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let session_id = SessionKey::with_profile("tenant-a", "api", "goal-big-budget");
+        let result = orchestrator
+            .set_goal(GoalSetRequest {
+                session_id: session_id.clone(),
+                profile_id: "tenant-a".into(),
+                objective: "run many turns".into(),
+                status: Some("active".into()),
+                token_budget: Some(5_000_000),
+                transition_actor: None,
+            })
+            .expect("a 5M budget must be accepted after the ceiling raise");
+        assert_eq!(
+            result["goal"]["token_budget"].as_u64(),
+            Some(5_000_000),
+            "the accepted goal must carry the caller's budget"
+        );
+    }
+
+    /// The default budget applied when the caller omits `token_budget`
+    /// tracks `GOAL_DEFAULT_TOKEN_BUDGET` — asserted via the constant so a
+    /// future retune of the default does not silently break this contract
+    /// (unset budget ⇒ backend default).
+    #[test]
+    fn set_goal_applies_default_budget_when_unset() {
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let session_id = SessionKey::with_profile("tenant-a", "api", "goal-default-budget");
+        let result = orchestrator
+            .set_goal(GoalSetRequest {
+                session_id: session_id.clone(),
+                profile_id: "tenant-a".into(),
+                objective: "use the default".into(),
+                status: Some("active".into()),
+                token_budget: None,
+                transition_actor: None,
+            })
+            .expect("set goal with default budget");
+        assert_eq!(
+            result["goal"]["token_budget"].as_u64(),
+            Some(GOAL_DEFAULT_TOKEN_BUDGET),
+            "an unset budget falls back to the default constant"
+        );
     }
 
     /// Bullet 3: budget exhaustion → enqueue a wrap-up turn AND

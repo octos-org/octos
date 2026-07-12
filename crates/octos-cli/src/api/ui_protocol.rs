@@ -7503,8 +7503,17 @@ fn add_autonomy_policy_stamp(policy: &mut Value, features: ConnectionUiFeatures)
             .into(),
         ),
     );
-    object.insert("goal_default_token_budget".into(), json!(50_000));
-    object.insert("goal_max_token_budget".into(), json!(200_000));
+    // Report the REAL budget policy from the single source of truth in
+    // `agent_orchestrator` — hardcoded literals here drifted from the
+    // constants the backend actually enforces.
+    object.insert(
+        "goal_default_token_budget".into(),
+        json!(super::agent_orchestrator::GOAL_DEFAULT_TOKEN_BUDGET),
+    );
+    object.insert(
+        "goal_max_token_budget".into(),
+        json!(super::agent_orchestrator::GOAL_MAX_TOKEN_BUDGET),
+    );
     object.insert("continuation_min_delay_seconds".into(), json!(30));
     object.insert("continuation_max_per_hour".into(), json!(20));
     object.insert("loop_min_interval_seconds".into(), json!(60));
