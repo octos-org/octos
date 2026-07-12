@@ -265,6 +265,14 @@ pub struct ServeCommand {
     #[arg(long)]
     pub danger_full_access: bool,
 
+    /// Use LLM-summarization for AppUI context compaction: when a session's
+    /// context fills, ask the model for a high-quality handoff summary (a real
+    /// model call — slower, a few seconds) instead of the instant deterministic
+    /// heuristic. Falls back to the heuristic on any error/timeout, so it never
+    /// breaks a turn. Off by default.
+    #[arg(long)]
+    pub llm_compaction: bool,
+
     /// Disable automatic retry on transient errors.
     #[arg(long)]
     pub no_retry: bool,
@@ -772,6 +780,7 @@ impl ServeCommand {
             host_memory: config.memory.clone(),
             solo_login_enabled: solo_login_enabled_flag,
             dangerous_default_permissions: dangerous_default_permissions_flag,
+            llm_compaction: self.llm_compaction,
             allow_admin_shell: config.allow_admin_shell,
             content_catalog_mgr: Some(Arc::new(
                 crate::content_catalog::ContentCatalogManager::new(profile_store.clone()),
