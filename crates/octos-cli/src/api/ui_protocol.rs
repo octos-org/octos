@@ -6471,6 +6471,17 @@ const LOCAL_PROFILE_ID_MAX_LEN: usize = 64;
 /// terminates instead of spinning on a pathological store.
 const MAX_LOCAL_PROFILE_ID_SUFFIX: u32 = 10_000;
 
+/// Serializes local-solo profile CREATION (id + email assignment through
+/// persistence). Without it, two concurrent REST/WS creates for the same
+/// `requested_id` can BOTH pass the free-id / free-email checks before either
+/// save runs, then write the same records and clash on the shared
+/// `.json.tmp` paths instead of one getting `glm` and the other `glm-2`. A
+/// single serve process shares one profiles dir, so a process-wide lock is
+/// the reservation boundary that makes find-free + create atomic. Held only
+/// across synchronous store I/O (never across an `.await`); poison is
+/// recovered because one panicking creator must not brick all future ones.
+static LOCAL_PROFILE_CREATE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Normalize a user-requested profile id into slug shape: lowercase ASCII
 /// alphanumerics are kept, every other run collapses to a single `-`, edge
 /// `-` are trimmed, and the result is capped at 64 bytes. Returns `None` when
@@ -6612,13 +6623,40 @@ fn resolve_optional_local_email(
     }
 }
 
-/// A login-ready email for the User record. Solo re-login resolution
-/// (`resolve_solo_user` → `is_login_ready_email`) filters out empty/placeholder
-/// emails, so when the client provides none we synthesize a per-id placeholder
-/// (`<id>@solo.local`) that is unique, login-ready, and never equal to the
-/// admin placeholder (`admin@localhost`).
-fn login_ready_local_email(provided: Option<String>, profile_id: &str) -> String {
-    provided.unwrap_or_else(|| format!("{profile_id}@solo.local"))
+/// Assign a unique, login-ready email for the User record when the client
+/// provides none. Solo re-login resolution (`resolve_solo_user` →
+/// `is_login_ready_email`) filters out empty/placeholder emails and resolves
+/// an owner BY email, so the synthesized address must be login-ready AND
+/// unique among top-level users: an existing user may have EXPLICITLY claimed
+/// `<id>@solo.local`, and duplicate top-level emails make OTP login
+/// ambiguous. We start from the per-id placeholder `<id>@solo.local` (already
+/// unique because the assigned id is unique) and, only if some other user
+/// already holds that exact address, suffix the local-part (`<id>-2@…`, …)
+/// until free. Never equals the admin placeholder (`admin@localhost`). Must be
+/// called while holding [`LOCAL_PROFILE_CREATE_LOCK`] so the check-then-save is
+/// atomic w.r.t. concurrent creators.
+fn assign_synthesized_local_email(
+    profile_id: &str,
+    user_store: &crate::user_store::UserStore,
+) -> Result<String, RpcError> {
+    for n in 1..=MAX_LOCAL_PROFILE_ID_SUFFIX {
+        let local_part = if n == 1 {
+            profile_id.to_owned()
+        } else {
+            format!("{profile_id}-{n}")
+        };
+        let candidate = format!("{local_part}@solo.local");
+        let taken = user_store
+            .get_by_email(&candidate)
+            .map_err(|error| runtime_unavailable_error(format!("failed to read users: {error}")))?
+            .is_some_and(|existing| existing.id != profile_id);
+        if !taken {
+            return Ok(candidate);
+        }
+    }
+    // Practically unreachable (would need 10k explicit `<id>-N@solo.local`
+    // users); fall back to a uuid local-part that cannot collide.
+    Ok(format!("{}@solo.local", uuid::Uuid::now_v7()))
 }
 
 /// Create a fresh, uniquely-named local solo profile. Used when the client
@@ -6640,20 +6678,22 @@ fn create_fresh_local_solo_profile(
     };
 
     let name = resolve_local_display_name(params, &profile_id);
-    let provided_email = resolve_optional_local_email(params)?;
-    // Enforce email uniqueness only for a client-provided email; the
-    // synthesized placeholder is inherently unique per id.
-    if let Some(ref email) = provided_email {
-        if let Some(existing) = user_store
-            .get_by_email(email)
-            .map_err(|error| runtime_unavailable_error(format!("failed to read users: {error}")))?
-        {
-            if existing.id != profile_id {
-                return Err(profile_collision_error(&profile_id, "email"));
+    // A client-provided email is a hard error on collision (the caller chose
+    // it); a synthesized placeholder is disambiguated by suffixing so top-level
+    // emails stay unique either way.
+    let email = match resolve_optional_local_email(params)? {
+        Some(provided) => {
+            if let Some(existing) = user_store.get_by_email(&provided).map_err(|error| {
+                runtime_unavailable_error(format!("failed to read users: {error}"))
+            })? {
+                if existing.id != profile_id {
+                    return Err(profile_collision_error(&profile_id, "email"));
+                }
             }
+            provided
         }
-    }
-    let email = login_ready_local_email(provided_email, &profile_id);
+        None => assign_synthesized_local_email(&profile_id, user_store)?,
+    };
     let username = profile_id.clone();
 
     let now = Utc::now();
@@ -6710,6 +6750,17 @@ pub(crate) fn create_or_get_local_solo_profile(
 
     let profile_store = profile_store(state)?;
     let user_store = user_store(state)?;
+
+    // Reserve the id + email and persist under one process-wide lock so a
+    // concurrent REST/WS double-submit cannot both pass the free-id / free-email
+    // checks before either save runs. Covers BOTH the fresh (requested_id /
+    // generated) path and the legacy username path (whose `.json.tmp`
+    // write-then-rename would otherwise race a same-username peer). Held only
+    // across synchronous store I/O below — the function returns (dropping the
+    // guard) before any caller `.await`s.
+    let _create_guard = LOCAL_PROFILE_CREATE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
 
     // User-nameable onboarding: an explicit `requested_id` assigns a fresh,
     // collision-suffixed id; a request that omits the legacy `username` derives
@@ -29150,6 +29201,120 @@ mod tests {
         assert!(
             !second.created,
             "same owner is a no-op create, never suffixed"
+        );
+    }
+
+    #[test]
+    fn should_reserve_requested_id_atomically_under_concurrency() {
+        // P1: concurrent creates for the same requested_id must each get a
+        // DISTINCT suffixed id (glm, glm-2, …) — never both write "glm" and
+        // overwrite / clash on the shared `.json.tmp`. The reservation lock
+        // makes find-free-id + save atomic, so this is deterministic.
+        let dir = tempfile::tempdir().unwrap();
+        let state = local_profile_state(dir.path());
+
+        let n = 8usize;
+        let barrier = std::sync::Barrier::new(n);
+        let ids: Vec<String> = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..n)
+                .map(|_| {
+                    scope.spawn(|| {
+                        // Release all threads together to maximize contention.
+                        barrier.wait();
+                        create_or_get_local_solo_profile(
+                            &state,
+                            octos_core::ui_protocol::ProfileLocalCreateParams {
+                                requested_id: Some("glm".into()),
+                                ..Default::default()
+                            },
+                        )
+                        .expect("concurrent requested_id create")
+                        .profile_id
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+
+        let unique: std::collections::BTreeSet<&str> = ids.iter().map(String::as_str).collect();
+        assert_eq!(
+            unique.len(),
+            n,
+            "each concurrent create must get a distinct id, got {ids:?}"
+        );
+        let expected: std::collections::BTreeSet<String> = std::iter::once("glm".to_owned())
+            .chain((2..=n).map(|i| format!("glm-{i}")))
+            .collect();
+        assert_eq!(
+            unique
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<std::collections::BTreeSet<_>>(),
+            expected,
+            "ids must be exactly glm, glm-2, … glm-{n}"
+        );
+        assert_eq!(
+            state.profile_store.as_ref().unwrap().list().unwrap().len(),
+            n,
+            "no concurrent create overwrote another profile"
+        );
+        assert_eq!(
+            state.user_store.as_ref().unwrap().list().unwrap().len(),
+            n,
+            "no concurrent create overwrote another user"
+        );
+    }
+
+    #[test]
+    fn should_disambiguate_synthesized_email_on_collision() {
+        // P2: a no-email create synthesizes `<id>@solo.local`. If some other
+        // user EXPLICITLY claimed that exact address, reusing it would create a
+        // duplicate top-level email (ambiguous OTP login). The synthesized
+        // address must be disambiguated instead, leaving the explicit one intact.
+        let dir = tempfile::tempdir().unwrap();
+        let state = local_profile_state(dir.path());
+
+        // A different profile already holds glm@solo.local explicitly.
+        state
+            .user_store
+            .as_ref()
+            .unwrap()
+            .save(&crate::user_store::User {
+                id: "zai".into(),
+                email: "glm@solo.local".into(),
+                name: "Zai".into(),
+                role: crate::user_store::UserRole::Admin,
+                created_at: chrono::Utc::now(),
+                last_login_at: None,
+            })
+            .unwrap();
+
+        let result = create_or_get_local_solo_profile(
+            &state,
+            octos_core::ui_protocol::ProfileLocalCreateParams {
+                requested_id: Some("glm".into()),
+                ..Default::default()
+            },
+        )
+        .expect("create with a colliding synthesized email");
+
+        assert_eq!(result.profile_id, "glm");
+        assert_ne!(
+            result.email, "glm@solo.local",
+            "must not reuse an explicitly-claimed email"
+        );
+        assert!(result.email.ends_with("@solo.local"));
+
+        let users = state.user_store.as_ref().unwrap().list().unwrap();
+        assert_eq!(
+            users.iter().filter(|u| u.email == result.email).count(),
+            1,
+            "the synthesized email must be unique among top-level users"
+        );
+        assert_eq!(
+            users.iter().filter(|u| u.email == "glm@solo.local").count(),
+            1,
+            "the pre-existing explicit email must be untouched"
         );
     }
 
