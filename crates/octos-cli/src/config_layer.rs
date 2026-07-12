@@ -100,6 +100,12 @@ fn overlay<T>(
         return;
     };
 
+    // A chat invocation carrying an explicit full-access request (`--yolo` or
+    // `--sandbox danger-full-access`) must win outright: overlaying a saved
+    // `sandbox`/`ask_for_approval` would make `resolve_chat_permissions` abort
+    // on contradictory flags (codex).
+    let chat_full_access = cmd == "chat" && chat_explicit_full_access(&obj, sub_matches);
+
     let mut changed = false;
     for arg in sub_cmd.get_arguments() {
         if !is_layerable(cmd, arg) {
@@ -110,6 +116,9 @@ fn overlay<T>(
             continue;
         };
         if !should_overlay(sub_matches.value_source(id)) {
+            continue;
+        }
+        if cmd == "chat" && chat_control_blocked(id, json_val, chat_full_access) {
             continue;
         }
         obj.insert(id.to_string(), json_val.clone());
@@ -148,6 +157,48 @@ fn should_overlay(source: Option<clap::parser::ValueSource>) -> bool {
         source,
         Some(clap::parser::ValueSource::CommandLine) | Some(clap::parser::ValueSource::EnvVariable)
     )
+}
+
+/// Sandbox value that disables the sandbox AND approvals — full access. Never a
+/// persistable default: excluded from the wizard and refused by the overlay, so
+/// full access stays a per-run opt-in (`--yolo` / explicit `--sandbox`).
+pub const DANGER_FULL_ACCESS_SANDBOX: &str = "danger-full-access";
+
+/// Does this `octos chat` invocation carry an EXPLICIT full-access request on
+/// the command line — `--yolo` (`dangerously_bypass_approvals_and_sandbox`) or
+/// `--sandbox danger-full-access`? Read from the already-parsed struct (`obj`
+/// reflects clap's CLI resolution) plus `value_source` to confirm the sandbox
+/// value was CLI-supplied, not defaulted.
+fn chat_explicit_full_access(
+    obj: &serde_json::Map<String, serde_json::Value>,
+    sub_matches: &clap::ArgMatches,
+) -> bool {
+    let yolo = obj
+        .get("dangerously_bypass_approvals_and_sandbox")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let explicit_danger_sandbox = matches!(
+        sub_matches.value_source("sandbox"),
+        Some(clap::parser::ValueSource::CommandLine)
+    ) && obj.get("sandbox").and_then(serde_json::Value::as_str)
+        == Some(DANGER_FULL_ACCESS_SANDBOX);
+    yolo || explicit_danger_sandbox
+}
+
+/// Should this saved chat control be REFUSED even though it's otherwise
+/// layerable and unset on the CLI?
+///
+/// 1. A persisted `sandbox: danger-full-access` is never applied — full access
+///    is a per-run opt-in (`--yolo` / explicit `--sandbox`), not a saved default
+///    that would silently disable the sandbox on every `octos chat`.
+/// 2. When the invocation already carries an explicit full-access request, the
+///    saved `sandbox` / `ask_for_approval` controls are skipped so the explicit
+///    request wins instead of tripping the contradictory-flags check.
+fn chat_control_blocked(id: &str, json_val: &serde_json::Value, full_access: bool) -> bool {
+    if id == "sandbox" && json_val.as_str() == Some(DANGER_FULL_ACCESS_SANDBOX) {
+        return true;
+    }
+    full_access && matches!(id, "sandbox" | "ask_for_approval")
 }
 
 /// Is `arg` safe to persist in `cli.<cmd>` and overlay at startup?
@@ -355,6 +406,85 @@ mod tests {
             "JSON beats default"
         );
         assert!(should_overlay(None), "JSON fills an unset arg");
+    }
+
+    #[test]
+    fn should_never_layer_a_persisted_full_access_sandbox() {
+        let danger = serde_json::Value::from(DANGER_FULL_ACCESS_SANDBOX);
+        // Refused whether or not the run requested full access — a saved
+        // danger-full-access must never silently disable the sandbox.
+        assert!(chat_control_blocked("sandbox", &danger, false));
+        assert!(chat_control_blocked("sandbox", &danger, true));
+        // A safe saved sandbox / approval is fine absent an explicit request.
+        assert!(!chat_control_blocked(
+            "sandbox",
+            &serde_json::Value::from("workspace-write"),
+            false
+        ));
+        assert!(!chat_control_blocked(
+            "ask_for_approval",
+            &serde_json::Value::from("ask"),
+            false
+        ));
+    }
+
+    #[test]
+    fn should_skip_saved_controls_when_explicit_full_access() {
+        // An explicit --yolo / --sandbox danger-full-access must win: the saved
+        // sandbox + approval controls are skipped so they can't trip the
+        // contradictory-flags error in resolve_chat_permissions.
+        assert!(chat_control_blocked(
+            "sandbox",
+            &serde_json::Value::from("workspace-write"),
+            true
+        ));
+        assert!(chat_control_blocked(
+            "ask_for_approval",
+            &serde_json::Value::from("ask"),
+            true
+        ));
+        // Unrelated saved controls still layer under full access.
+        assert!(!chat_control_blocked(
+            "verbose",
+            &serde_json::Value::Bool(true),
+            true
+        ));
+    }
+
+    #[test]
+    fn should_detect_explicit_chat_full_access() {
+        use clap::{Arg, ArgAction, Command};
+        let cmd = Command::new("chat")
+            .arg(
+                Arg::new("dangerously_bypass_approvals_and_sandbox")
+                    .long("yolo")
+                    .action(ArgAction::SetTrue),
+            )
+            .arg(Arg::new("sandbox").long("sandbox").action(ArgAction::Set));
+
+        // --yolo → full access.
+        let matches = cmd.clone().get_matches_from(["chat", "--yolo"]);
+        let mut obj = serde_json::Map::new();
+        obj.insert(
+            "dangerously_bypass_approvals_and_sandbox".into(),
+            true.into(),
+        );
+        assert!(chat_explicit_full_access(&obj, &matches));
+
+        // --sandbox danger-full-access (CLI-sourced) → full access.
+        let matches =
+            cmd.clone()
+                .get_matches_from(["chat", "--sandbox", DANGER_FULL_ACCESS_SANDBOX]);
+        let mut obj = serde_json::Map::new();
+        obj.insert("sandbox".into(), DANGER_FULL_ACCESS_SANDBOX.into());
+        assert!(chat_explicit_full_access(&obj, &matches));
+
+        // Neither → not full access.
+        let matches = cmd.get_matches_from(["chat"]);
+        assert!(!chat_explicit_full_access(
+            &serde_json::Map::new(),
+            &matches
+        ));
     }
 
     #[test]

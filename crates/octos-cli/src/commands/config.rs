@@ -288,6 +288,9 @@ fn prompt_value(
         .get_possible_values()
         .iter()
         .map(|value| value.get_name().to_string())
+        // Full access must be a per-run opt-in, never a saved default — exclude
+        // it here just as `config_layer` refuses to apply it (codex).
+        .filter(|name| name != crate::config_layer::DANGER_FULL_ACCESS_SANDBOX)
         .collect();
     if !choices.is_empty() {
         return prompt_choice(long, help, &choices, default_val, current_val);
