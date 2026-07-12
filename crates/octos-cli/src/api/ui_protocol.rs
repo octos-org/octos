@@ -208,6 +208,14 @@ const APPUI_METHOD_ONBOARDING_WORKSPACE_PROBE: &str = "onboarding/workspace_prob
 const APPUI_METHOD_REVIEW_START: &str = octos_core::ui_protocol::methods::REVIEW_START;
 const DASHBOARD_PROVIDERS_JSON: &str = include_str!("../../../../dashboard/src/providers.json");
 const APPUI_FEATURE_PROFILE_LOCAL_CREATE_V1: &str = "profile.local_create.v1";
+/// Additive capability: the server understands the optional `requested_id`
+/// field on `profile/local/create` (and treats `username`/`email` as
+/// optional). Advertised only alongside `profile.local_create.v1` so a client
+/// can negotiate the user-nameable-profile onboarding flow before sending the
+/// new shape. Purely additive — no protocol/capabilities schema-version bump,
+/// matching how `profile.local_create.v1` itself was introduced.
+const APPUI_FEATURE_PROFILE_LOCAL_CREATE_REQUESTED_ID_V1: &str =
+    "profile.local_create.requested_id.v1";
 const APPUI_FEATURE_PERMISSION_PROFILE_V1: &str = "permission.profile.v1";
 const APPUI_FEATURE_RUNTIME_POLICY_STAMP_V1: &str = "runtime.policy_stamp.v1";
 const APPUI_FEATURE_CONTEXT_LIFECYCLE_V1: &str = "context.lifecycle.v1";
@@ -1521,6 +1529,14 @@ impl ConnectionUiFeatures {
             push_capability_feature(
                 &mut capabilities.supported_features,
                 APPUI_FEATURE_PROFILE_LOCAL_CREATE_V1,
+            );
+            // Nameable profiles: advertise that this server honors the optional
+            // `requested_id` field (and optional username/email). Additive on
+            // top of the v1 flag, so older clients that negotiate only v1 keep
+            // working with the legacy `{name, username, email}` shape.
+            push_capability_feature(
+                &mut capabilities.supported_features,
+                APPUI_FEATURE_PROFILE_LOCAL_CREATE_REQUESTED_ID_V1,
             );
             // #1057: workspace probe ships next to local-solo onboarding so
             // the TUI can advertise the recovery UX only when the backend
@@ -6446,6 +6462,240 @@ fn ensure_existing_local_profile_matches(
     Ok(())
 }
 
+/// Maximum profile-id slug length (mirrors `profiles::validate_slug_shape`).
+const LOCAL_PROFILE_ID_MAX_LEN: usize = 64;
+
+/// Upper bound on the numeric suffix tried when auto-suffixing a requested
+/// profile id (`glm`, `glm-2`, …, `glm-10000`). A store with more collisions
+/// than this falls back to a uuid-based id, so id assignment always
+/// terminates instead of spinning on a pathological store.
+const MAX_LOCAL_PROFILE_ID_SUFFIX: u32 = 10_000;
+
+/// Normalize a user-requested profile id into slug shape: lowercase ASCII
+/// alphanumerics are kept, every other run collapses to a single `-`, edge
+/// `-` are trimmed, and the result is capped at 64 bytes. Returns `None` when
+/// nothing usable remains, or when the result would collide with a reserved
+/// id (a session-key channel name or the synthetic `MAIN_PROFILE_ID`), so the
+/// caller falls back to a generated id. The output always satisfies
+/// `profiles::validate_profile_id`.
+fn normalize_requested_profile_id(requested: &str) -> Option<String> {
+    let mut slug = String::with_capacity(requested.len());
+    let mut last_hyphen = false;
+    for c in requested.chars() {
+        if c.is_ascii_alphanumeric() {
+            slug.push(c.to_ascii_lowercase());
+            last_hyphen = false;
+        } else if !last_hyphen {
+            slug.push('-');
+            last_hyphen = true;
+        }
+    }
+    // All bytes are ASCII, so `truncate` never splits a char; trim any hyphen
+    // the cut (or the edges) left behind.
+    slug.truncate(LOCAL_PROFILE_ID_MAX_LEN);
+    let slug = slug.trim_matches('-').to_owned();
+    if slug.is_empty()
+        || slug == octos_core::MAIN_PROFILE_ID
+        || octos_core::is_reserved_channel_name(&slug)
+    {
+        return None;
+    }
+    Some(slug)
+}
+
+/// Whether `id` is free to claim as a local profile id. Normalized (slug-shaped)
+/// input is assumed. Rejects reserved ids and any id already backed by a
+/// profile file or user record. An unreadable user record is treated as taken
+/// (fail closed) so assignment never overwrites it.
+fn local_profile_id_is_free(
+    id: &str,
+    profile_store: &crate::profiles::ProfileStore,
+    user_store: &crate::user_store::UserStore,
+) -> bool {
+    if id == octos_core::MAIN_PROFILE_ID || octos_core::is_reserved_channel_name(id) {
+        return false;
+    }
+    if profile_store.profile_path(id).exists() {
+        return false;
+    }
+    matches!(user_store.get(id), Ok(None))
+}
+
+/// Assign a unique local profile id from a normalized `base` slug by trying
+/// `base`, then `base-2`, `base-3`, … until a free id is found (bounded by
+/// [`MAX_LOCAL_PROFILE_ID_SUFFIX`]). Returns `None` if the bound is exhausted,
+/// so the caller can fall back to a uuid-based id.
+fn assign_unique_local_profile_id(
+    base: &str,
+    profile_store: &crate::profiles::ProfileStore,
+    user_store: &crate::user_store::UserStore,
+) -> Option<String> {
+    for n in 1..=MAX_LOCAL_PROFILE_ID_SUFFIX {
+        let candidate = if n == 1 {
+            base.to_owned()
+        } else {
+            // Keep `base-N` within the slug budget by trimming the base (not
+            // the numeric tag), then drop any hyphen the trim exposed.
+            let tag = format!("-{n}");
+            let budget = LOCAL_PROFILE_ID_MAX_LEN.saturating_sub(tag.len());
+            let mut trimmed = base.to_owned();
+            trimmed.truncate(budget);
+            let trimmed = trimmed.trim_end_matches('-');
+            if trimmed.is_empty() {
+                continue;
+            }
+            format!("{trimmed}{tag}")
+        };
+        if local_profile_id_is_free(&candidate, profile_store, user_store) {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+/// Generate a guaranteed-unique, slug-valid local profile id when no usable
+/// requested id or username is available: derive a slug from `seed` (a display
+/// name) when possible, else a uuid-based id. Always collision-free.
+fn generated_local_profile_id(
+    seed: &str,
+    profile_store: &crate::profiles::ProfileStore,
+    user_store: &crate::user_store::UserStore,
+) -> String {
+    if let Some(id) = normalize_requested_profile_id(seed)
+        .and_then(|base| assign_unique_local_profile_id(&base, profile_store, user_store))
+    {
+        return id;
+    }
+    loop {
+        // A v7 UUID renders as lowercase hex + hyphens with no leading/trailing
+        // hyphen, so `profile-<uuid>` is always slug-valid and well within 64
+        // chars. The loop guards the (practically impossible) collision.
+        let candidate = format!("profile-{}", uuid::Uuid::now_v7());
+        if local_profile_id_is_free(&candidate, profile_store, user_store) {
+            return candidate;
+        }
+    }
+}
+
+/// Resolve the display name for a nameable local profile without erroring: the
+/// provided `name` when it is a valid 1-128 printable string, else the trimmed
+/// original `requested_id` when valid, else the assigned `profile_id`. A
+/// profile therefore always ends up with SOME display name.
+fn resolve_local_display_name(
+    params: &octos_core::ui_protocol::ProfileLocalCreateParams,
+    profile_id: &str,
+) -> String {
+    let is_displayable = |candidate: &str| {
+        let trimmed = candidate.trim();
+        !trimmed.is_empty() && trimmed.len() <= 128 && !trimmed.chars().any(char::is_control)
+    };
+    if is_displayable(&params.name) {
+        return params.name.trim().to_owned();
+    }
+    if let Some(requested) = params.requested_id.as_deref() {
+        if is_displayable(requested) {
+            return requested.trim().to_owned();
+        }
+    }
+    profile_id.to_owned()
+}
+
+/// Resolve the optional owner email: validated when the client provides one,
+/// else `None` (a solo local profile does not require an email).
+fn resolve_optional_local_email(
+    params: &octos_core::ui_protocol::ProfileLocalCreateParams,
+) -> Result<Option<String>, RpcError> {
+    if params.email.trim().is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(validate_local_email(&params.email)?))
+    }
+}
+
+/// A login-ready email for the User record. Solo re-login resolution
+/// (`resolve_solo_user` → `is_login_ready_email`) filters out empty/placeholder
+/// emails, so when the client provides none we synthesize a per-id placeholder
+/// (`<id>@solo.local`) that is unique, login-ready, and never equal to the
+/// admin placeholder (`admin@localhost`).
+fn login_ready_local_email(provided: Option<String>, profile_id: &str) -> String {
+    provided.unwrap_or_else(|| format!("{profile_id}@solo.local"))
+}
+
+/// Create a fresh, uniquely-named local solo profile. Used when the client
+/// sends a `requested_id` (normalized + collision-suffixed) or omits the legacy
+/// `username` entirely (id derived from the display name, else generated).
+/// Unlike the legacy username path this always creates a NEW profile: the
+/// assigned id is guaranteed free, so there is never an existing record to
+/// reconcile.
+fn create_fresh_local_solo_profile(
+    profile_store: &crate::profiles::ProfileStore,
+    user_store: &crate::user_store::UserStore,
+    params: &octos_core::ui_protocol::ProfileLocalCreateParams,
+    requested_slug: Option<String>,
+) -> Result<octos_core::ui_protocol::ProfileLocalCreateResult, RpcError> {
+    let profile_id = match requested_slug {
+        Some(base) => assign_unique_local_profile_id(&base, profile_store, user_store)
+            .unwrap_or_else(|| generated_local_profile_id(&base, profile_store, user_store)),
+        None => generated_local_profile_id(params.name.trim(), profile_store, user_store),
+    };
+
+    let name = resolve_local_display_name(params, &profile_id);
+    let provided_email = resolve_optional_local_email(params)?;
+    // Enforce email uniqueness only for a client-provided email; the
+    // synthesized placeholder is inherently unique per id.
+    if let Some(ref email) = provided_email {
+        if let Some(existing) = user_store
+            .get_by_email(email)
+            .map_err(|error| runtime_unavailable_error(format!("failed to read users: {error}")))?
+        {
+            if existing.id != profile_id {
+                return Err(profile_collision_error(&profile_id, "email"));
+            }
+        }
+    }
+    let email = login_ready_local_email(provided_email, &profile_id);
+    let username = profile_id.clone();
+
+    let now = Utc::now();
+    let user = crate::user_store::User {
+        id: profile_id.clone(),
+        email: email.clone(),
+        name: name.clone(),
+        role: crate::user_store::UserRole::Admin,
+        created_at: now,
+        last_login_at: None,
+    };
+    user_store
+        .save(&user)
+        .map_err(|error| runtime_unavailable_error(format!("failed to save user: {error}")))?;
+
+    let profile = crate::profiles::UserProfile {
+        id: profile_id.clone(),
+        name: name.clone(),
+        public_subdomain: None,
+        enabled: true,
+        data_dir: None,
+        parent_id: None,
+        config: crate::profiles::ProfileConfig::default(),
+        created_at: now,
+        updated_at: now,
+    };
+    profile_store
+        .save(&profile)
+        .map_err(|error| runtime_unavailable_error(format!("failed to save profile: {error}")))?;
+    write_local_profile_metadata(profile_store, &profile, &username, &email)?;
+
+    Ok(octos_core::ui_protocol::ProfileLocalCreateResult {
+        profile_id: profile_id.clone(),
+        user_id: profile_id,
+        name,
+        username,
+        email,
+        created: true,
+        runtime_mode: "solo".to_owned(),
+    })
+}
+
 pub(crate) fn create_or_get_local_solo_profile(
     state: &AppState,
     params: octos_core::ui_protocol::ProfileLocalCreateParams,
@@ -6458,12 +6708,36 @@ pub(crate) fn create_or_get_local_solo_profile(
         ));
     }
 
+    let profile_store = profile_store(state)?;
+    let user_store = user_store(state)?;
+
+    // User-nameable onboarding: an explicit `requested_id` assigns a fresh,
+    // collision-suffixed id; a request that omits the legacy `username` derives
+    // the id from the display name (or generates one). Both create a NEW
+    // profile — the assigned id is guaranteed free — instead of reconciling
+    // against an existing username the way the legacy path below does. A
+    // requested_id that normalizes to nothing usable (empty / reserved) is
+    // treated as absent, deferring to the username path when one was sent.
+    let requested_slug = params
+        .requested_id
+        .as_deref()
+        .and_then(normalize_requested_profile_id);
+    let has_legacy_username = !params.username.trim().is_empty();
+    if requested_slug.is_some() || !has_legacy_username {
+        return create_fresh_local_solo_profile(
+            &profile_store,
+            &user_store,
+            &params,
+            requested_slug,
+        );
+    }
+
+    // ---- Legacy path: id derived from the provided username (idempotent
+    // create-or-get; behavior unchanged). ----
     let name = validate_local_name(&params.name)?;
     let profile_id = normalize_local_username(&params.username)?;
     let email = validate_local_email(&params.email)?;
     let username = profile_id.clone();
-    let profile_store = profile_store(state)?;
-    let user_store = user_store(state)?;
 
     if let Some(existing_email_user) = user_store
         .get_by_email(&email)
@@ -27556,6 +27830,7 @@ mod tests {
         email: &str,
     ) -> octos_core::ui_protocol::ProfileLocalCreateParams {
         octos_core::ui_protocol::ProfileLocalCreateParams {
+            requested_id: None,
             name: name.into(),
             username: username.into(),
             email: email.into(),
@@ -28684,6 +28959,197 @@ mod tests {
         assert_eq!(
             state.profile_store.as_ref().unwrap().list().unwrap().len(),
             1
+        );
+    }
+
+    #[test]
+    fn should_honor_requested_id_when_present_without_username_or_email() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = local_profile_state(dir.path());
+
+        let result = create_or_get_local_solo_profile(
+            &state,
+            octos_core::ui_protocol::ProfileLocalCreateParams {
+                requested_id: Some("glm".into()),
+                ..Default::default()
+            },
+        )
+        .expect("requested_id create should succeed with no username/email");
+
+        assert_eq!(result.profile_id, "glm");
+        assert_eq!(result.user_id, "glm");
+        assert!(result.created);
+        assert_eq!(result.runtime_mode, "solo");
+        // Display name falls back to the requested id when no name is sent.
+        assert_eq!(result.name, "glm");
+        // A login-ready placeholder email is synthesized so solo re-login works.
+        assert_eq!(result.email, "glm@solo.local");
+
+        assert!(
+            state
+                .profile_store
+                .as_ref()
+                .unwrap()
+                .get("glm")
+                .unwrap()
+                .is_some(),
+            "a profile file should exist under the requested id"
+        );
+        assert!(
+            state
+                .user_store
+                .as_ref()
+                .unwrap()
+                .get("glm")
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn should_suffix_requested_id_on_collision() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = local_profile_state(dir.path());
+
+        let mk = |state: &AppState| {
+            create_or_get_local_solo_profile(
+                state,
+                octos_core::ui_protocol::ProfileLocalCreateParams {
+                    requested_id: Some("glm".into()),
+                    ..Default::default()
+                },
+            )
+            .expect("requested_id create")
+        };
+
+        assert_eq!(mk(&state).profile_id, "glm");
+        assert_eq!(mk(&state).profile_id, "glm-2");
+        assert_eq!(mk(&state).profile_id, "glm-3");
+        assert_eq!(
+            state.profile_store.as_ref().unwrap().list().unwrap().len(),
+            3,
+            "each requested_id create makes a distinct suffixed profile"
+        );
+    }
+
+    #[test]
+    fn should_normalize_requested_id_into_slug() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = local_profile_state(dir.path());
+
+        let result = create_or_get_local_solo_profile(
+            &state,
+            octos_core::ui_protocol::ProfileLocalCreateParams {
+                requested_id: Some("My GLM!!".into()),
+                ..Default::default()
+            },
+        )
+        .expect("normalized requested_id create");
+        assert_eq!(result.profile_id, "my-glm");
+    }
+
+    #[test]
+    fn should_generate_id_when_requested_id_and_username_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = local_profile_state(dir.path());
+
+        // A display name but no requested_id/username/email → the id is derived
+        // from the name when that yields a free slug.
+        let named = create_or_get_local_solo_profile(
+            &state,
+            octos_core::ui_protocol::ProfileLocalCreateParams {
+                name: "Robo".into(),
+                ..Default::default()
+            },
+        )
+        .expect("generated create from a display name");
+        assert!(named.created);
+        assert_eq!(named.profile_id, "robo");
+        assert_eq!(named.name, "Robo");
+
+        // Fully empty params still create a valid profile with a non-empty
+        // generated id.
+        let empty = create_or_get_local_solo_profile(
+            &state,
+            octos_core::ui_protocol::ProfileLocalCreateParams::default(),
+        )
+        .expect("generated create from empty params");
+        assert!(empty.created);
+        assert!(!empty.profile_id.is_empty());
+        assert!(
+            state
+                .profile_store
+                .as_ref()
+                .unwrap()
+                .get(&empty.profile_id)
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn should_avoid_reserved_id_when_requested_id_is_reserved_channel_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = local_profile_state(dir.path());
+
+        // "slack" is a reserved session-key channel name → it must NOT become a
+        // profile id; the server falls back to a generated id instead.
+        let result = create_or_get_local_solo_profile(
+            &state,
+            octos_core::ui_protocol::ProfileLocalCreateParams {
+                requested_id: Some("slack".into()),
+                ..Default::default()
+            },
+        )
+        .expect("reserved requested_id falls back to a generated id");
+        assert!(result.created);
+        assert_ne!(result.profile_id, "slack");
+        assert!(!octos_core::is_reserved_channel_name(&result.profile_id));
+    }
+
+    #[test]
+    fn should_fall_back_to_generated_when_requested_id_is_pathological() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = local_profile_state(dir.path());
+
+        // Punctuation-only requested_id normalizes to nothing; with no username
+        // to fall back on, the server generates a valid id rather than erroring.
+        let result = create_or_get_local_solo_profile(
+            &state,
+            octos_core::ui_protocol::ProfileLocalCreateParams {
+                requested_id: Some("!!!".into()),
+                ..Default::default()
+            },
+        )
+        .expect("pathological requested_id falls back to a generated id");
+        assert!(result.created);
+        assert!(!result.profile_id.is_empty());
+    }
+
+    #[test]
+    fn should_keep_legacy_username_path_when_no_requested_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = local_profile_state(dir.path());
+
+        // requested_id absent + username present → legacy id == username, and
+        // the path stays idempotent (create-or-get), never suffixed.
+        let first = create_or_get_local_solo_profile(
+            &state,
+            local_profile_params("Ada Lovelace", "ada", "ada@example.com"),
+        )
+        .expect("legacy create");
+        assert_eq!(first.profile_id, "ada");
+        assert!(first.created);
+
+        let second = create_or_get_local_solo_profile(
+            &state,
+            local_profile_params("Ada Lovelace", "ada", "ada@example.com"),
+        )
+        .expect("legacy get");
+        assert_eq!(second.profile_id, "ada");
+        assert!(
+            !second.created,
+            "same owner is a no-op create, never suffixed"
         );
     }
 
@@ -29860,6 +30326,9 @@ ignore = []
                 .any(|method| method == methods::PROFILE_LOCAL_CREATE)
         );
         assert!(local_capabilities.supports_feature(APPUI_FEATURE_PROFILE_LOCAL_CREATE_V1));
+        assert!(
+            local_capabilities.supports_feature(APPUI_FEATURE_PROFILE_LOCAL_CREATE_REQUESTED_ID_V1)
+        );
         assert!(local_capabilities.supports_feature(APPUI_FEATURE_PERMISSION_PROFILE_V1));
         assert!(local_capabilities.supports_feature(APPUI_FEATURE_RUNTIME_POLICY_STAMP_V1));
         assert!(local_capabilities.supports_feature(APPUI_FEATURE_CONTEXT_LIFECYCLE_V1));
@@ -29902,6 +30371,10 @@ ignore = []
                 .any(|method| method == methods::PROFILE_LOCAL_CREATE)
         );
         assert!(!tenant_capabilities.supports_feature(APPUI_FEATURE_PROFILE_LOCAL_CREATE_V1));
+        assert!(
+            !tenant_capabilities
+                .supports_feature(APPUI_FEATURE_PROFILE_LOCAL_CREATE_REQUESTED_ID_V1)
+        );
     }
 
     #[test]

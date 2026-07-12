@@ -229,6 +229,7 @@ mod tests {
 
     fn params(name: &str, username: &str, email: &str) -> ProfileLocalCreateParams {
         ProfileLocalCreateParams {
+            requested_id: None,
             name: name.into(),
             username: username.into(),
             email: email.into(),

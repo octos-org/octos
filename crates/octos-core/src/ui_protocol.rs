@@ -2217,10 +2217,40 @@ pub struct PermissionProfileSetResult {
     pub applied: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Parameters for `profile/local/create` (solo local onboarding).
+///
+/// Backward compatible: an older client that sends `{name, username, email}`
+/// with no `requested_id` still deserializes and works — the server derives
+/// the profile id from `username`, exactly as before. A newer client may
+/// instead send a meaningful `requested_id` (e.g. `"glm"`, `"deepseek"`) and
+/// omit `username`/`email`, because a solo local profile does not require an
+/// owner username or email. The server normalizes `requested_id` into a slug
+/// and collision-suffixes it (`glm`, `glm-2`, `glm-3`, …) to derive the
+/// assigned [`ProfileLocalCreateResult::profile_id`].
+///
+/// Servers that understand `requested_id` advertise the additive capability
+/// feature `profile.local_create.requested_id.v1`; a client can negotiate on
+/// that flag before sending the new shape.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProfileLocalCreateParams {
+    /// Meaningful profile id the user typed during onboarding. Normalized
+    /// (lowercased, non-`[a-z0-9-]` collapsed to `-`) and uniqueness-suffixed
+    /// server-side. Absent / empty / pathological → the server derives the id
+    /// from `username` (legacy shape) or generates one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_id: Option<String>,
+    /// Display name. Optional; when empty the server falls back to
+    /// `requested_id` (then the assigned id) so a profile always has some
+    /// display name.
+    #[serde(default)]
     pub name: String,
+    /// Legacy owner username. Optional now that `requested_id` can name a solo
+    /// profile. When present and `requested_id` is absent it still derives the
+    /// profile id, preserving the pre-existing behavior.
+    #[serde(default)]
     pub username: String,
+    /// Legacy owner email. Optional for a solo local profile.
+    #[serde(default)]
     pub email: String,
 }
 
@@ -6845,6 +6875,56 @@ mod tests {
         assert!(decoded_legacy.topic.is_none());
         assert!(decoded_legacy.cwd.is_none());
         assert!(decoded_legacy.sandbox.is_none());
+    }
+
+    #[test]
+    fn profile_local_create_params_new_shape_requested_id_round_trips() {
+        // New shape: a meaningful requested_id, NO username/email/name.
+        let params = ProfileLocalCreateParams {
+            requested_id: Some("glm".into()),
+            name: String::new(),
+            username: String::new(),
+            email: String::new(),
+        };
+        let wire = serde_json::to_value(&params).expect("serialize profile/local/create params");
+        assert_eq!(wire["requested_id"], json!("glm"));
+        let decoded: ProfileLocalCreateParams =
+            serde_json::from_value(wire).expect("round-trip decode");
+        assert_eq!(decoded, params);
+
+        // Raw new-shape JSON that omits username/email/name entirely still
+        // deserializes (the newly-optional fields default to empty).
+        let new_shape = json!({ "requested_id": "deepseek" });
+        let decoded_new: ProfileLocalCreateParams =
+            serde_json::from_value(new_shape).expect("new-shape decode without username/email");
+        assert_eq!(decoded_new.requested_id.as_deref(), Some("deepseek"));
+        assert!(decoded_new.name.is_empty());
+        assert!(decoded_new.username.is_empty());
+        assert!(decoded_new.email.is_empty());
+    }
+
+    #[test]
+    fn profile_local_create_params_legacy_shape_still_deserializes() {
+        // Old client shape: {name, username, email}, NO requested_id.
+        let legacy = json!({
+            "name": "Ada Lovelace",
+            "username": "ada",
+            "email": "ada@example.com"
+        });
+        let decoded: ProfileLocalCreateParams =
+            serde_json::from_value(legacy).expect("legacy profile/local/create params decode");
+        assert!(decoded.requested_id.is_none());
+        assert_eq!(decoded.name, "Ada Lovelace");
+        assert_eq!(decoded.username, "ada");
+        assert_eq!(decoded.email, "ada@example.com");
+
+        // A `None` requested_id serializes to exactly the legacy wire shape
+        // (the key is skipped), so an OLDER server sees the bytes unchanged.
+        let wire = serde_json::to_value(&decoded).expect("serialize legacy-shaped params");
+        assert!(wire.get("requested_id").is_none());
+        assert_eq!(wire["name"], json!("Ada Lovelace"));
+        assert_eq!(wire["username"], json!("ada"));
+        assert_eq!(wire["email"], json!("ada@example.com"));
     }
 
     #[test]
