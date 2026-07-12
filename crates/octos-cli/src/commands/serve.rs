@@ -205,7 +205,11 @@ fn resolve_dashboard_auth_smtp_password(
 }
 
 /// Start the REST API server.
-#[derive(Debug, Args)]
+///
+/// `Serialize`/`Deserialize` back the layered startup config: the resolved
+/// struct is serialized, non-explicit fields are overlaid from
+/// `config.cli.serve`, then deserialized back (see [`crate::config_layer`]).
+#[derive(Debug, Args, serde::Serialize, serde::Deserialize, PartialEq)]
 pub struct ServeCommand {
     /// Port to listen on. Default lives in IANA's Dynamic/Private range
     /// (49152–65535) to avoid collisions with `http-alt` services like

@@ -214,6 +214,21 @@ pub struct Config {
     /// ensuring every shipped skill declares `sha256` in `manifest.json`.
     #[serde(default)]
     pub plugins: PluginsConfig,
+
+    /// Per-subcommand CLI-flag defaults — the "initial startup config".
+    ///
+    /// Keys are subcommand names (`serve`, `gateway`, `chat`); each value is a
+    /// JSON object of snake_case flag id → default value (e.g.
+    /// `{"serve": {"port": 50080, "solo": true}}`). Consulted by the startup
+    /// layering ([`crate::config_layer`]) BELOW an explicit CLI flag / env var
+    /// but ABOVE the built-in clap default, so operators can persist their
+    /// preferred flags without retyping them. Written by `octos config wizard`.
+    ///
+    /// Unknown command keys round-trip untouched. The block is empty by default
+    /// and omitted from serialization so configs that never used it stay
+    /// byte-identical.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub cli: std::collections::BTreeMap<String, serde_json::Value>,
 }
 
 /// Plugin loader policy.
@@ -1504,6 +1519,47 @@ where
     std::fs::rename(&tmp, path)
         .wrap_err_with(|| format!("failed to rename into {}", path.display()))?;
     Ok(())
+}
+
+/// Resolve the `config.json` path a command WOULD read/write, using existence
+/// checks only (never parses the file — safe when the config is malformed).
+///
+/// Mirrors [`Config::load_resolved`]'s precedence so `octos config` targets the
+/// exact same file the runtime loads:
+/// 1. `config_override` (an explicit `--config <FILE>`),
+/// 2. (default installs only) project-local `cwd/.octos/config.json`,
+/// 3. `ctx.config_home/config.json`,
+/// 4. (default installs only) legacy `~/.octos/config.json`.
+///
+/// Falls back to the canonical `config_home/config.json` (the write location)
+/// when no file exists yet.
+pub fn resolve_config_file_path(
+    cwd: &Path,
+    ctx: &crate::config_context::ConfigContext,
+    config_override: Option<&Path>,
+) -> PathBuf {
+    if let Some(path) = config_override {
+        return path.to_path_buf();
+    }
+    if ctx.is_default {
+        let local = cwd.join(".octos").join("config.json");
+        if local.exists() {
+            return local;
+        }
+    }
+    let home = ctx.config_home.join("config.json");
+    if home.exists() {
+        return home;
+    }
+    if ctx.is_default {
+        if let Some(home_dir) = dirs::home_dir() {
+            let legacy = home_dir.join(".octos").join("config.json");
+            if legacy != home && legacy.exists() {
+                return legacy;
+            }
+        }
+    }
+    home
 }
 
 impl Config {
@@ -3155,5 +3211,53 @@ mod tests {
             Some(v) => unsafe { std::env::set_var("OCTOS_MEMORY_REFRESH_ENABLED", v) },
             None => unsafe { std::env::remove_var("OCTOS_MEMORY_REFRESH_ENABLED") },
         }
+    }
+
+    #[test]
+    fn should_round_trip_cli_block() {
+        // The `cli.<cmd>` block survives a deserialize → serialize → deserialize
+        // cycle, including a command key the typed struct doesn't know about.
+        let json = serde_json::json!({
+            "provider": "deepseek",
+            "cli": {
+                "serve": { "port": 50080, "solo": true },
+                "chat": { "sandbox": "workspace-write" },
+                "future_command": { "some_flag": 1 }
+            }
+        });
+        let config: Config = serde_json::from_value(json).unwrap();
+        assert_eq!(
+            config.cli.get("serve").and_then(|v| v.get("port")),
+            Some(&serde_json::json!(50080))
+        );
+        // A round-trip preserves every command section, including unknown ones.
+        let reserialized = serde_json::to_value(&config).unwrap();
+        assert_eq!(
+            reserialized.get("cli"),
+            Some(&serde_json::json!({
+                "serve": { "port": 50080, "solo": true },
+                "chat": { "sandbox": "workspace-write" },
+                "future_command": { "some_flag": 1 }
+            }))
+        );
+    }
+
+    #[test]
+    fn should_omit_empty_cli_block_from_serialization() {
+        // An empty `cli` map must NOT appear in serialized output, so configs
+        // that never used the feature stay byte-identical.
+        let config = Config::default();
+        let value = serde_json::to_value(&config).unwrap();
+        assert!(
+            value.get("cli").is_none(),
+            "empty cli block must be omitted, got {value:#}"
+        );
+    }
+
+    #[test]
+    fn should_default_cli_block_when_absent() {
+        // A legacy config.json with no `cli` key deserializes to an empty block.
+        let config: Config = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert!(config.cli.is_empty());
     }
 }

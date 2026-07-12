@@ -1,6 +1,6 @@
 //! octos CLI entry point.
 
-use clap::Parser;
+use clap::{CommandFactory, FromArgMatches};
 use color_eyre::eyre::Result;
 
 #[cfg_attr(not(feature = "api"), allow(unused_imports))]
@@ -27,8 +27,14 @@ fn main() -> Result<()> {
     // Initialize error handling
     color_eyre::install()?;
 
-    // Parse arguments first to determine logging setup
-    let args = Args::parse();
+    // Parse into ArgMatches first (this preserves clap's --help/--version/error
+    // handling exactly as `Args::parse()` did), materialize the typed Args, then
+    // merge the layered `cli.<cmd>` startup defaults BEFORE any downstream reads
+    // of the subcommand. Precedence: explicit CLI flag > env var > config.json
+    // `cli.<cmd>` > built-in default (see `octos_cli::config_layer`).
+    let matches = Args::command().get_matches();
+    let mut args = Args::from_arg_matches(&matches).unwrap_or_else(|error| error.exit());
+    octos_cli::config_layer::apply(&mut args, &matches)?;
 
     // Determine log directory for serve command (enables rolling file logs)
     #[allow(unused_mut)]

@@ -1979,6 +1979,9 @@ pub(crate) fn config_from_profile(
         // JSON declared. Defaults to permissive when the profile omits
         // the field.
         plugins: profile.config.plugins.clone(),
+        // Startup CLI-flag defaults are not sourced from profile JSON — a
+        // flattened profile Config always starts with an empty `cli` block.
+        cli: Default::default(),
     }
 }
 

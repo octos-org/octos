@@ -28,7 +28,11 @@ use super::Executable;
 use crate::config::Config;
 
 /// Interactive multi-turn chat with an agent.
-#[derive(Debug, Args)]
+///
+/// `Serialize`/`Deserialize` back the layered startup config (see
+/// [`crate::config_layer`]): non-explicit fields fall back to
+/// `config.cli.chat`.
+#[derive(Debug, Args, serde::Serialize, serde::Deserialize, PartialEq)]
 pub struct ChatCommand {
     /// Working directory (defaults to current directory).
     #[arg(short, long)]
@@ -111,7 +115,12 @@ pub struct ChatCommand {
 
 /// `--sandbox` choices, mirroring codex's sandbox modes and octos's
 /// [`PermissionProfile`](octos_agent::PermissionProfile).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+///
+/// `rename_all = "kebab-case"` makes the serde encoding (`"workspace-write"`,
+/// …) identical to clap's `ValueEnum` possible-value names, so the config
+/// layering round-trips a `config.cli.chat.sandbox` value losslessly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum ChatSandboxMode {
     /// Read-only workspace access; write/edit tools fail.
     ReadOnly,
@@ -122,7 +131,8 @@ pub enum ChatSandboxMode {
 }
 
 /// `--ask-for-approval` choices, mirroring codex.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum ChatApprovalMode {
     /// Prompt for approval on risky commands (default).
     Ask,

@@ -8,6 +8,7 @@ mod channels;
 pub mod chat;
 mod clean;
 mod completions;
+mod config;
 mod cron;
 mod docs;
 mod doctor;
@@ -43,6 +44,7 @@ pub use channels::ChannelsCommand;
 pub use chat::ChatCommand;
 pub use clean::CleanCommand;
 pub use completions::CompletionsCommand;
+pub use config::ConfigCommand;
 pub use cron::CronCommand;
 pub use docs::DocsCommand;
 pub use doctor::DoctorCommand;
@@ -105,6 +107,8 @@ pub enum Command {
     Channels(ChannelsCommand),
     /// Interactive multi-turn chat with an agent.
     Chat(ChatCommand),
+    /// Configure startup CLI defaults interactively (wizard) and inspect config.
+    Config(ConfigCommand),
     /// Manage scheduled cron jobs.
     Cron(CronCommand),
     /// Run local environment diagnostics (flutter-doctor style).
@@ -326,6 +330,7 @@ impl Executable for Command {
             Self::Auth(cmd) => cmd.execute(),
             Self::Channels(cmd) => cmd.execute(),
             Self::Chat(cmd) => cmd.execute(),
+            Self::Config(cmd) => cmd.execute(),
             Self::Cron(cmd) => cmd.execute(),
             Self::Doctor(cmd) => cmd.execute(),
             Self::Docs(cmd) => cmd.execute(),
