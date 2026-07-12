@@ -6514,14 +6514,43 @@ fn normalize_requested_profile_id(requested: &str) -> Option<String> {
     Some(slug)
 }
 
-/// Whether `id` is free to claim as a local profile id. Normalized (slug-shaped)
-/// input is assumed. Rejects reserved ids and any id already backed by a
-/// profile file or user record. An unreadable user record is treated as taken
-/// (fail closed) so assignment never overwrites it.
-fn local_profile_id_is_free(
+/// The synthesized login-ready email for a no-email local profile:
+/// `<id>@solo.local`. The id is already a lowercase slug ≤64 chars, so the
+/// local part (= the id) is ≤64 bytes — within lettre's RFC-5321 limit — with
+/// no separate email suffix that could overflow it.
+fn synthesized_local_email(profile_id: &str) -> String {
+    format!("{profile_id}@solo.local")
+}
+
+/// Snapshot every already-claimed email (lowercased) in ONE `UserStore::list()`
+/// pass so the id-selection loop can require a free `<id>@solo.local` via O(1)
+/// set membership instead of an O(n) `get_by_email` scan per candidate. Taken
+/// under [`LOCAL_PROFILE_CREATE_LOCK`], so no concurrent creator mutates it
+/// mid-selection.
+fn claimed_email_set(
+    user_store: &crate::user_store::UserStore,
+) -> Result<std::collections::HashSet<String>, RpcError> {
+    Ok(user_store
+        .list()
+        .map_err(|error| runtime_unavailable_error(format!("failed to read users: {error}")))?
+        .into_iter()
+        .map(|user| user.email.to_lowercase())
+        .collect())
+}
+
+/// Whether `id` is free to claim, considering BOTH the id itself (reserved /
+/// profile file / user record) AND — when `claimed_emails` is `Some` (the
+/// no-user-email case) — its synthesized `<id>@solo.local`. Folding the email
+/// check in here (against a set snapshotted once) lets the id-selection loop
+/// pick an id whose synthesized email is also free, so the final
+/// `<id>@solo.local` is unique AND length-safe by construction (local part =
+/// id, already ≤64). Normalized slug input assumed; an unreadable user record
+/// is treated as taken (fail closed) so assignment never overwrites it.
+fn local_profile_candidate_is_free(
     id: &str,
     profile_store: &crate::profiles::ProfileStore,
     user_store: &crate::user_store::UserStore,
+    claimed_emails: Option<&std::collections::HashSet<String>>,
 ) -> bool {
     if id == octos_core::MAIN_PROFILE_ID || octos_core::is_reserved_channel_name(id) {
         return false;
@@ -6529,24 +6558,35 @@ fn local_profile_id_is_free(
     if profile_store.profile_path(id).exists() {
         return false;
     }
-    matches!(user_store.get(id), Ok(None))
+    if !matches!(user_store.get(id), Ok(None)) {
+        return false;
+    }
+    match claimed_emails {
+        Some(claimed) => !claimed.contains(&synthesized_local_email(id)),
+        None => true,
+    }
 }
 
 /// Assign a unique local profile id from a normalized `base` slug by trying
 /// `base`, then `base-2`, `base-3`, … until a free id is found (bounded by
-/// [`MAX_LOCAL_PROFILE_ID_SUFFIX`]). Returns `None` if the bound is exhausted,
-/// so the caller can fall back to a uuid-based id.
+/// [`MAX_LOCAL_PROFILE_ID_SUFFIX`]). When `claimed_emails` is `Some`, a
+/// candidate must ALSO have a free `<candidate>@solo.local`, so the id and its
+/// synthesized email are chosen together. Returns `None` if the bound is
+/// exhausted, so the caller can fall back to a uuid-based id.
 fn assign_unique_local_profile_id(
     base: &str,
     profile_store: &crate::profiles::ProfileStore,
     user_store: &crate::user_store::UserStore,
+    claimed_emails: Option<&std::collections::HashSet<String>>,
 ) -> Option<String> {
     for n in 1..=MAX_LOCAL_PROFILE_ID_SUFFIX {
         let candidate = if n == 1 {
             base.to_owned()
         } else {
             // Keep `base-N` within the slug budget by trimming the base (not
-            // the numeric tag), then drop any hyphen the trim exposed.
+            // the numeric tag), then drop any hyphen the trim exposed. Because
+            // the synthesized email's local part IS this id, staying ≤64 here
+            // also keeps `<id>@solo.local` within lettre's local-part limit.
             let tag = format!("-{n}");
             let budget = LOCAL_PROFILE_ID_MAX_LEN.saturating_sub(tag.len());
             let mut trimmed = base.to_owned();
@@ -6557,7 +6597,7 @@ fn assign_unique_local_profile_id(
             }
             format!("{trimmed}{tag}")
         };
-        if local_profile_id_is_free(&candidate, profile_store, user_store) {
+        if local_profile_candidate_is_free(&candidate, profile_store, user_store, claimed_emails) {
             return Some(candidate);
         }
     }
@@ -6571,10 +6611,11 @@ fn generated_local_profile_id(
     seed: &str,
     profile_store: &crate::profiles::ProfileStore,
     user_store: &crate::user_store::UserStore,
+    claimed_emails: Option<&std::collections::HashSet<String>>,
 ) -> String {
-    if let Some(id) = normalize_requested_profile_id(seed)
-        .and_then(|base| assign_unique_local_profile_id(&base, profile_store, user_store))
-    {
+    if let Some(id) = normalize_requested_profile_id(seed).and_then(|base| {
+        assign_unique_local_profile_id(&base, profile_store, user_store, claimed_emails)
+    }) {
         return id;
     }
     loop {
@@ -6582,7 +6623,7 @@ fn generated_local_profile_id(
         // hyphen, so `profile-<uuid>` is always slug-valid and well within 64
         // chars. The loop guards the (practically impossible) collision.
         let candidate = format!("profile-{}", uuid::Uuid::now_v7());
-        if local_profile_id_is_free(&candidate, profile_store, user_store) {
+        if local_profile_candidate_is_free(&candidate, profile_store, user_store, claimed_emails) {
             return candidate;
         }
     }
@@ -6623,65 +6664,50 @@ fn resolve_optional_local_email(
     }
 }
 
-/// Assign a unique, login-ready email for the User record when the client
-/// provides none. Solo re-login resolution (`resolve_solo_user` →
-/// `is_login_ready_email`) filters out empty/placeholder emails and resolves
-/// an owner BY email, so the synthesized address must be login-ready AND
-/// unique among top-level users: an existing user may have EXPLICITLY claimed
-/// `<id>@solo.local`, and duplicate top-level emails make OTP login
-/// ambiguous. We start from the per-id placeholder `<id>@solo.local` (already
-/// unique because the assigned id is unique) and, only if some other user
-/// already holds that exact address, suffix the local-part (`<id>-2@…`, …)
-/// until free. Never equals the admin placeholder (`admin@localhost`). Must be
-/// called while holding [`LOCAL_PROFILE_CREATE_LOCK`] so the check-then-save is
-/// atomic w.r.t. concurrent creators.
-fn assign_synthesized_local_email(
-    profile_id: &str,
-    user_store: &crate::user_store::UserStore,
-) -> Result<String, RpcError> {
-    for n in 1..=MAX_LOCAL_PROFILE_ID_SUFFIX {
-        let local_part = if n == 1 {
-            profile_id.to_owned()
-        } else {
-            format!("{profile_id}-{n}")
-        };
-        let candidate = format!("{local_part}@solo.local");
-        let taken = user_store
-            .get_by_email(&candidate)
-            .map_err(|error| runtime_unavailable_error(format!("failed to read users: {error}")))?
-            .is_some_and(|existing| existing.id != profile_id);
-        if !taken {
-            return Ok(candidate);
-        }
-    }
-    // Practically unreachable (would need 10k explicit `<id>-N@solo.local`
-    // users); fall back to a uuid local-part that cannot collide.
-    Ok(format!("{}@solo.local", uuid::Uuid::now_v7()))
-}
-
 /// Create a fresh, uniquely-named local solo profile. Used when the client
 /// sends a `requested_id` (normalized + collision-suffixed) or omits the legacy
 /// `username` entirely (id derived from the display name, else generated).
 /// Unlike the legacy username path this always creates a NEW profile: the
 /// assigned id is guaranteed free, so there is never an existing record to
 /// reconcile.
+///
+/// When the client sends NO email we synthesize `<id>@solo.local`. Because the
+/// id and its synthesized email must BOTH be unique, the id-selection loop is
+/// given a one-shot snapshot of claimed emails and picks the id and its
+/// `<id>@solo.local` together — so the synthesized address is unique and
+/// length-safe (local part = id, ≤64) by construction, with no per-candidate
+/// email rescan. A client-PROVIDED email keeps its hard-error-on-collision
+/// behavior and does not influence id selection.
 fn create_fresh_local_solo_profile(
     profile_store: &crate::profiles::ProfileStore,
     user_store: &crate::user_store::UserStore,
     params: &octos_core::ui_protocol::ProfileLocalCreateParams,
     requested_slug: Option<String>,
 ) -> Result<octos_core::ui_protocol::ProfileLocalCreateResult, RpcError> {
+    // Resolve the optional client email up front: when absent we must also pick
+    // an id whose synthesized `<id>@solo.local` is free, so snapshot claimed
+    // emails ONCE and thread the set through id selection.
+    let provided_email = resolve_optional_local_email(params)?;
+    let claimed_emails = if provided_email.is_none() {
+        Some(claimed_email_set(user_store)?)
+    } else {
+        None
+    };
+    let claimed_ref = claimed_emails.as_ref();
+
     let profile_id = match requested_slug {
-        Some(base) => assign_unique_local_profile_id(&base, profile_store, user_store)
-            .unwrap_or_else(|| generated_local_profile_id(&base, profile_store, user_store)),
-        None => generated_local_profile_id(params.name.trim(), profile_store, user_store),
+        Some(base) => assign_unique_local_profile_id(&base, profile_store, user_store, claimed_ref)
+            .unwrap_or_else(|| {
+                generated_local_profile_id(&base, profile_store, user_store, claimed_ref)
+            }),
+        None => {
+            generated_local_profile_id(params.name.trim(), profile_store, user_store, claimed_ref)
+        }
     };
 
     let name = resolve_local_display_name(params, &profile_id);
-    // A client-provided email is a hard error on collision (the caller chose
-    // it); a synthesized placeholder is disambiguated by suffixing so top-level
-    // emails stay unique either way.
-    let email = match resolve_optional_local_email(params)? {
+    let email = match provided_email {
+        // Client chose it → a collision with another owner is a hard error.
         Some(provided) => {
             if let Some(existing) = user_store.get_by_email(&provided).map_err(|error| {
                 runtime_unavailable_error(format!("failed to read users: {error}"))
@@ -6692,7 +6718,8 @@ fn create_fresh_local_solo_profile(
             }
             provided
         }
-        None => assign_synthesized_local_email(&profile_id, user_store)?,
+        // Free by construction: the id was chosen so `<id>@solo.local` is unclaimed.
+        None => synthesized_local_email(&profile_id),
     };
     let username = profile_id.clone();
 
@@ -29269,8 +29296,10 @@ mod tests {
     fn should_disambiguate_synthesized_email_on_collision() {
         // P2: a no-email create synthesizes `<id>@solo.local`. If some other
         // user EXPLICITLY claimed that exact address, reusing it would create a
-        // duplicate top-level email (ambiguous OTP login). The synthesized
-        // address must be disambiguated instead, leaving the explicit one intact.
+        // duplicate top-level email (ambiguous OTP login). The id and its
+        // synthesized email are chosen TOGETHER, so the id bumps to `glm-2`
+        // (keeping id == email local-part) rather than issuing a mismatched
+        // email — leaving the explicit address intact.
         let dir = tempfile::tempdir().unwrap();
         let state = local_profile_state(dir.path());
 
@@ -29298,12 +29327,15 @@ mod tests {
         )
         .expect("create with a colliding synthesized email");
 
-        assert_eq!(result.profile_id, "glm");
-        assert_ne!(
-            result.email, "glm@solo.local",
-            "must not reuse an explicitly-claimed email"
+        // Id and email move together: the claimed glm@solo.local pushes the id
+        // to glm-2, whose email glm-2@solo.local is free.
+        assert_eq!(result.profile_id, "glm-2");
+        assert_eq!(result.email, "glm-2@solo.local");
+        assert_eq!(
+            result.email,
+            format!("{}@solo.local", result.profile_id),
+            "synthesized email local-part must equal the assigned id"
         );
-        assert!(result.email.ends_with("@solo.local"));
 
         let users = state.user_store.as_ref().unwrap().list().unwrap();
         assert_eq!(
@@ -29315,6 +29347,63 @@ mod tests {
             users.iter().filter(|u| u.email == "glm@solo.local").count(),
             1,
             "the pre-existing explicit email must be untouched"
+        );
+    }
+
+    #[test]
+    fn should_keep_synthesized_email_local_part_within_64_bytes() {
+        // P2 (length): a max-length (64-char) slug whose `<slug>@solo.local` is
+        // already claimed must NOT produce a 66-byte local part by suffixing the
+        // email separately (`<slug>-2@…` > lettre's 64-byte limit). Choosing the
+        // id and email together instead bumps the ID within the 64-char budget,
+        // so the local part (= the id) stays ≤64.
+        let dir = tempfile::tempdir().unwrap();
+        let state = local_profile_state(dir.path());
+
+        let base = "a".repeat(LOCAL_PROFILE_ID_MAX_LEN); // 64-char slug
+        // Force the synthesized-email collision: a different user explicitly
+        // holds <base>@solo.local.
+        state
+            .user_store
+            .as_ref()
+            .unwrap()
+            .save(&crate::user_store::User {
+                id: "other".into(),
+                email: format!("{base}@solo.local"),
+                name: "Other".into(),
+                role: crate::user_store::UserRole::Admin,
+                created_at: chrono::Utc::now(),
+                last_login_at: None,
+            })
+            .unwrap();
+
+        let result = create_or_get_local_solo_profile(
+            &state,
+            octos_core::ui_protocol::ProfileLocalCreateParams {
+                requested_id: Some(base.clone()),
+                ..Default::default()
+            },
+        )
+        .expect("create with a max-length slug and colliding synthesized email");
+
+        let local_part = result
+            .email
+            .strip_suffix("@solo.local")
+            .expect("synthesized @solo.local email");
+        assert!(
+            local_part.len() <= LOCAL_PROFILE_ID_MAX_LEN,
+            "email local part is {} bytes, exceeds the 64-byte limit",
+            local_part.len()
+        );
+        assert_eq!(
+            local_part, result.profile_id,
+            "email local-part must equal the assigned id"
+        );
+        assert!(result.profile_id.len() <= LOCAL_PROFILE_ID_MAX_LEN);
+        assert_ne!(
+            result.email,
+            format!("{base}@solo.local"),
+            "must not reuse the explicitly-claimed email"
         );
     }
 
