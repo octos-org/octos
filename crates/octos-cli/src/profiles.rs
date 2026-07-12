@@ -1297,6 +1297,11 @@ pub enum ChannelCredentials {
         port: u16,
         #[serde(default)]
         allowed_senders: Vec<String>,
+        /// Appservice-mode: outside a true 1:1 DM, bots only reply when
+        /// explicitly addressed. Safe-by-default; set to `false` to let bots
+        /// answer every message.
+        #[serde(default = "crate::config::default_true")]
+        mention_only: bool,
         /// Channel mode: "appservice" (default) or "user" (regular account login).
         #[serde(default)]
         mode: String,
@@ -2946,6 +2951,7 @@ fn channel_to_entry(cred: &ChannelCredentials) -> serde_json::Value {
             user_prefix,
             port,
             allowed_senders,
+            mention_only,
             mode,
             user_id,
             access_token,
@@ -2991,6 +2997,7 @@ fn channel_to_entry(cred: &ChannelCredentials) -> serde_json::Value {
                 settings["sender_localpart"] = serde_json::json!(sender_localpart);
                 settings["user_prefix"] = serde_json::json!(user_prefix);
                 settings["port"] = serde_json::json!(port);
+                settings["mention_only"] = serde_json::json!(mention_only);
             }
             serde_json::json!({
                 "type": "matrix",
@@ -4282,6 +4289,7 @@ mod tests {
                         user_prefix: "octos_".into(),
                         port: 8009,
                         allowed_senders: Vec::new(),
+                        mention_only: true,
                         mode: "user".into(),
                         user_id: "@bot:example.org".into(),
                         access_token: "syt_access_token_secret".into(),
@@ -4530,6 +4538,7 @@ mod tests {
                         user_prefix: "octos_".into(),
                         port: 8009,
                         allowed_senders: Vec::new(),
+                        mention_only: true,
                         mode: "user".into(),
                         user_id: "@bot:old.example.org".into(),
                         access_token: "syt_real_access_token".into(),
@@ -4621,6 +4630,7 @@ mod tests {
                     user_prefix: "octos_".into(),
                     port: 8009,
                     allowed_senders: Vec::new(),
+                    mention_only: true,
                     mode: "user".into(),
                     user_id: "@bot:example.org".into(),
                     access_token: "syt_old_access_token".into(),
@@ -4679,6 +4689,7 @@ mod tests {
             user_prefix: "octos_".into(),
             port: 8009,
             allowed_senders: Vec::new(),
+            mention_only: true,
             mode: "user".into(),
             user_id: user_id.into(),
             access_token: token.into(),
@@ -5752,6 +5763,39 @@ mod tests {
         assert!(settings.get("as_token").is_none());
         assert!(settings.get("hs_token").is_none());
         assert!(settings.get("port").is_none());
+    }
+
+    #[test]
+    fn test_matrix_appservice_channel_to_entry_carries_mention_only() {
+        // The documented opt-out (`mention_only: false`) must survive the
+        // profiles → ChannelEntry conversion; otherwise a matrix channel
+        // configured through this path silently reverts to the default.
+        let channel: ChannelCredentials = serde_json::from_value(serde_json::json!({
+            "type": "matrix",
+            "homeserver": "http://localhost:6167",
+            "as_token": "as",
+            "hs_token": "hs",
+            "server_name": "localhost",
+            "mention_only": false,
+        }))
+        .unwrap();
+
+        let entry = channel_to_entry(&channel);
+        assert_eq!(entry["settings"]["mention_only"], false);
+
+        // Omitted → safe default `true`, and the entry says so explicitly.
+        let default_channel: ChannelCredentials = serde_json::from_value(serde_json::json!({
+            "type": "matrix",
+            "homeserver": "http://localhost:6167",
+            "as_token": "as",
+            "hs_token": "hs",
+            "server_name": "localhost",
+        }))
+        .unwrap();
+        assert_eq!(
+            channel_to_entry(&default_channel)["settings"]["mention_only"],
+            true
+        );
     }
 
     #[test]

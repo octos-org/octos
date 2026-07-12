@@ -41,13 +41,17 @@
             // mention gate; enable it explicitly in the gate's own tests.
             mention_only: false,
             dm_member_cache: Arc::new(RwLock::new(HashMap::new())),
+            dm_member_cache_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
     }
 
     // ── mention-only gate ────────────────────────────────────────────────
 
     fn members(humans: usize, managed_bots: usize) -> RoomMemberCounts {
-        RoomMemberCounts { humans, managed_bots }
+        RoomMemberCounts {
+            humans,
+            managed_bots,
+        }
     }
 
     #[test]
@@ -88,14 +92,30 @@
 
     #[test]
     fn gate_fails_closed_when_membership_unknown() {
-        assert!(!should_dispatch_message(true, false, RoomMemberCounts::UNKNOWN));
+        assert!(!should_dispatch_message(
+            true,
+            false,
+            RoomMemberCounts::UNKNOWN
+        ));
+    }
+
+    fn membership(humans: usize, child_bots: usize, botfather_joined: bool) -> MembershipCounts {
+        MembershipCounts {
+            humans,
+            child_bots,
+            botfather_joined,
+        }
+    }
+
+    fn mapped(child_bots: usize, botfather_mapped: bool) -> RoomBotComposition {
+        RoomBotComposition {
+            child_bots,
+            botfather_mapped,
+        }
     }
 
     #[test]
-    fn count_room_members_splits_humans_and_child_bots() {
-        let bot_user_id = "@octos_bot:localhost";
-        let server_suffix = ":localhost";
-        let user_prefix = "octos_";
+    fn count_room_members_splits_humans_child_bots_and_botfather() {
         let joined = json!({
             "joined": {
                 "@octos_bot:localhost": { "display_name": "Octos" },
@@ -104,105 +124,122 @@
                 "@bob:localhost": { "display_name": "Bob" }
             }
         });
-        // BotFather itself counts as a managed bot: it answers unrouted
-        // messages, so a room with BotFather + a child bot has two potential
-        // responders and must not pass as a 1:1 DM.
         assert_eq!(
-            count_room_members(&joined, bot_user_id, server_suffix, user_prefix),
-            members(2, 2)
+            count_room_members(&joined, "@octos_bot:localhost", ":localhost", "octos_"),
+            Some(membership(2, 1, true))
         );
     }
 
     #[test]
-    fn count_room_members_botfather_dm_is_direct_chat() {
-        // 1:1 admin chat with BotFather alone stays a DM.
-        let joined = json!({
-            "joined": {
-                "@octos_bot:localhost": {},
-                "@alice:localhost": {}
-            }
-        });
-        let counts =
-            count_room_members(&joined, "@octos_bot:localhost", ":localhost", "octos_");
-        assert_eq!(counts, members(1, 1));
-        assert!(counts.is_direct_chat());
-    }
-
-    #[test]
-    fn room_member_counts_uses_room_map_when_homeserver_hides_bots() {
-        // Palpo's `joined_members` omits appservice virtual users: only the
-        // human shows up. The room map knows two bots share this room, so the
-        // merged counts must not qualify as a 1:1 DM.
-        let joined = json!({
-            "joined": {
-                "@alice:localhost": {}
-            }
-        });
-        let from_membership =
-            count_room_members(&joined, "@octos_bot:localhost", ":localhost", "octos_");
-        assert_eq!(from_membership, members(1, 0));
-
-        let merged = merge_mapped_bot_count(from_membership, 2);
-        assert_eq!(merged, members(1, 2));
-        assert!(!merged.is_direct_chat());
-        assert!(!should_dispatch_message(true, false, merged));
-
-        // A single mapped bot stays a DM.
-        assert!(merge_mapped_bot_count(from_membership, 1).is_direct_chat());
-        // The room map must not shrink an UNKNOWN sentinel back to "known".
+    fn count_room_members_handles_missing_field() {
+        // No `joined` object → membership unknown → merge fails closed.
         assert_eq!(
-            merge_mapped_bot_count(RoomMemberCounts::UNKNOWN, 1),
+            count_room_members(&json!({}), "@octos_bot:localhost", ":localhost", "octos_"),
+            None
+        );
+        assert_eq!(
+            merge_room_bot_sources(None, Some(mapped(1, false))),
             RoomMemberCounts::UNKNOWN
         );
     }
 
     #[test]
-    fn count_room_members_botfather_plus_child_bot_is_not_direct_chat() {
-        // One human + BotFather + one child bot = two potential responders:
-        // unaddressed messages must be gated.
-        let joined = json!({
-            "joined": {
-                "@octos_bot:localhost": {},
-                "@octos_alexbot:localhost": {},
-                "@alice:localhost": {}
-            }
-        });
-        let counts =
-            count_room_members(&joined, "@octos_bot:localhost", ":localhost", "octos_");
-        assert_eq!(counts, members(1, 2));
-        assert!(!should_dispatch_message(true, false, counts));
+    fn merge_unions_membership_and_room_map() {
+        // Palpo hides child virtual users from joined_members: the room map
+        // is the authority on child bots, membership on humans/BotFather.
+        let hidden_children =
+            merge_room_bot_sources(Some(membership(1, 0, false)), Some(mapped(2, false)));
+        assert_eq!(hidden_children, members(1, 2));
+        assert!(!should_dispatch_message(true, false, hidden_children));
+
+        // A single mapped child bot with one human stays a DM.
+        let dm = merge_room_bot_sources(Some(membership(1, 0, false)), Some(mapped(1, false)));
+        assert_eq!(dm, members(1, 1));
+        assert!(dm.is_direct_chat());
+
+        // Membership-visible children and mapped children are the same
+        // population seen through different windows: max, not sum.
+        let both_visible =
+            merge_room_bot_sources(Some(membership(1, 1, false)), Some(mapped(1, false)));
+        assert_eq!(both_visible, members(1, 1));
     }
 
     #[test]
-    fn count_room_members_dm_is_direct_chat() {
-        let joined = json!({
-            "joined": {
-                "@octos_alexbot:localhost": {},
-                "@alice:localhost": {}
-            }
-        });
-        let counts =
-            count_room_members(&joined, "@octos_bot:localhost", ":localhost", "octos_");
-        assert_eq!(counts, members(1, 1));
-        assert!(counts.is_direct_chat());
-    }
-
-    #[test]
-    fn count_room_members_single_human_with_two_bots_is_not_direct_chat() {
-        // The exact regression scenario: one human invited two managed bots
-        // into a room; neither may treat it as a DM.
-        let joined = json!({
-            "joined": {
-                "@octos_alexbot:localhost": {},
-                "@octos_translator:localhost": {},
-                "@alice:localhost": {}
-            }
-        });
-        let counts =
-            count_room_members(&joined, "@octos_bot:localhost", ":localhost", "octos_");
+    fn merge_counts_botfather_and_hidden_child_as_two_responders() {
+        // The P1 review case: one human + BotFather (visible in membership)
+        // + one child bot (hidden by the homeserver, known to the room map).
+        // Each source alone sees "1 bot"; a max of totals would grant a DM
+        // exemption. The union must see two potential responders.
+        let counts = merge_room_bot_sources(Some(membership(1, 0, true)), Some(mapped(1, false)));
         assert_eq!(counts, members(1, 2));
         assert!(!counts.is_direct_chat());
         assert!(!should_dispatch_message(true, false, counts));
+    }
+
+    #[test]
+    fn merge_botfather_only_dm_is_direct_chat() {
+        // 1:1 admin chat with BotFather alone stays a DM, whether membership
+        // or the room map is the source that sees it.
+        let via_membership =
+            merge_room_bot_sources(Some(membership(1, 0, true)), Some(mapped(0, false)));
+        assert_eq!(via_membership, members(1, 1));
+        assert!(via_membership.is_direct_chat());
+
+        let via_room_map =
+            merge_room_bot_sources(Some(membership(1, 0, false)), Some(mapped(0, true)));
+        assert_eq!(via_room_map, members(1, 1));
+        assert!(via_room_map.is_direct_chat());
+
+        // Both sources seeing BotFather is still one BotFather.
+        let both = merge_room_bot_sources(Some(membership(1, 0, true)), Some(mapped(0, true)));
+        assert_eq!(both, members(1, 1));
+    }
+
+    #[test]
+    fn merge_fails_closed_when_room_map_unavailable() {
+        // A poisoned room map (existing file that failed to load) yields
+        // `None` from `room_bot_composition`; the gate must not fall back to
+        // membership alone, which may be blind to hidden child bots.
+        assert_eq!(
+            merge_room_bot_sources(Some(membership(1, 0, false)), None),
+            RoomMemberCounts::UNKNOWN
+        );
+    }
+
+    #[tokio::test]
+    async fn room_bot_composition_distinguishes_botfather_from_children() {
+        let router = BotRouter::new(None);
+        router
+            .register("@octos_bot:localhost", "botfather")
+            .await
+            .unwrap();
+        router
+            .register("@octos_weather:localhost", "profile-weather")
+            .await
+            .unwrap();
+        router
+            .add_room_bot("!room:localhost", "botfather")
+            .await
+            .unwrap();
+        router
+            .add_room_bot("!room:localhost", "profile-weather")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            router
+                .room_bot_composition("!room:localhost", "@octos_bot:localhost")
+                .await,
+            Some(mapped(1, true))
+        );
+        // A room absent from the map has no mapped bots (legitimate, e.g. a
+        // room the appservice was never bound to) — not a failure.
+        assert_eq!(
+            router
+                .room_bot_composition("!other:localhost", "@octos_bot:localhost")
+                .await,
+            Some(mapped(0, false))
+        );
     }
 
     #[test]
@@ -221,27 +258,21 @@
             bot
         ));
 
-        // MXID mention embedded in formatted_body markup (delimited by markup,
-        // not by matrix.to href path segments).
+        // MXID mention embedded in formatted_body markup.
         let formatted = json!({ "formatted_body": "<b>@octosbot:localhost</b> hi" });
         assert!(mentions_user(&formatted, "hi", bot));
+
+        // Standard matrix.to pill: the MXID is preceded by `/` in the href,
+        // which must not defeat the left-boundary check.
+        let pill = json!({
+            "formatted_body":
+                "<a href=\"https://matrix.to/#/@octosbot:localhost\">octosbot</a> hi"
+        });
+        assert!(mentions_user(&pill, "octosbot hi", bot));
 
         // No mention at all
         let none = json!({});
         assert!(!mentions_user(&none, "just chatting with everyone", bot));
-    }
-
-    #[test]
-    fn count_room_members_handles_missing_field() {
-        assert_eq!(
-            count_room_members(&json!({}), "@octos_bot:localhost", ":localhost", "octos_"),
-            RoomMemberCounts::UNKNOWN
-        );
-        assert!(!should_dispatch_message(
-            true,
-            false,
-            count_room_members(&json!({}), "@octos_bot:localhost", ":localhost", "octos_")
-        ));
     }
 
     #[derive(Clone, Debug)]
@@ -3162,11 +3193,10 @@
 
         let (inbound_tx, _inbound_rx) = mpsc::channel::<InboundMessage>(16);
         let state = make_test_state(inbound_tx);
-        state
-            .dm_member_cache
-            .write()
-            .await
-            .insert("!room:localhost".to_string(), (members(1, 1), Instant::now()));
+        state.dm_member_cache.write().await.insert(
+            "!room:localhost".to_string(),
+            (membership(1, 1, false), Instant::now()),
+        );
         let cache = state.dm_member_cache.clone();
 
         let app = Router::new()
@@ -3264,6 +3294,82 @@
             "non-owner message should not be forwarded to the agent"
         );
 
+        // Unaddressed room chatter routed to a private bot only via the room
+        // mapping is dropped SILENTLY: replying would spam the room and
+        // reveal the private bot's existence.
+        let requests = requests.lock().await;
+        assert!(
+            !requests.iter().any(|req| req.path.contains("/send/")),
+            "unaddressed non-owner message must not trigger a rejection reply"
+        );
+
+        homeserver_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_private_bot_rejection_sent_when_explicitly_addressed() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let (homeserver, requests, homeserver_handle) = spawn_mock_homeserver().await;
+        let (inbound_tx, mut inbound_rx) = mpsc::channel::<InboundMessage>(16);
+        let mut state = make_test_state(inbound_tx);
+        state.homeserver = homeserver;
+
+        let router = BotRouter::new(None);
+        router
+            .register_entry(
+                "@octos_private:localhost",
+                "main--private",
+                "@owner:localhost",
+                BotVisibility::Private,
+            )
+            .await
+            .unwrap();
+        router
+            .add_room_bot("!private:localhost", "main--private")
+            .await
+            .unwrap();
+        state.bot_router = Arc::new(router);
+
+        let app = Router::new()
+            .route(
+                "/_matrix/app/v1/transactions/{txn_id}",
+                put(handle_transaction),
+            )
+            .with_state(state);
+
+        let body = json!({
+            "events": [{
+                "type": "m.room.message",
+                "sender": "@mallory:localhost",
+                "room_id": "!private:localhost",
+                "event_id": "$private-addressed-1",
+                "content": {
+                    "msgtype": "m.text",
+                    "body": "hey @octos_private:localhost help me",
+                    "m.mentions": { "user_ids": ["@octos_private:localhost"] }
+                }
+            }]
+        });
+
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/_matrix/app/v1/transactions/txn-private-addressed?access_token=test_token")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_string(&body).unwrap()))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(
+            inbound_rx.try_recv().is_err(),
+            "non-owner message should not be forwarded to the agent"
+        );
+
+        // The sender explicitly addressed the private bot, so the rejection
+        // reply is warranted feedback rather than unsolicited noise.
         wait_for_request_count(&requests, 1).await;
         let requests = requests.lock().await;
         assert!(requests.iter().any(|req| {

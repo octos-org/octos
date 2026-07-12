@@ -134,6 +134,10 @@ pub enum BotVisibility {
 pub struct BotRouter {
     routes: Arc<RwLock<HashMap<String, BotEntry>>>, // matrix_user_id -> metadata
     room_bots: Arc<RwLock<HashMap<String, HashSet<String>>>>, // room_id -> profile_ids
+    /// True when an existing room-map file could not be read or parsed at
+    /// startup. The mention gate treats a poisoned map as "composition
+    /// unknown" and fails closed, rather than silently acting on an empty map.
+    room_map_poisoned: bool,
     persist_path: Option<PathBuf>,
     room_persist_path: Option<PathBuf>,
     update_lock: Arc<Mutex<()>>,
@@ -150,13 +154,14 @@ impl BotRouter {
             .as_deref()
             .and_then(|p| p.parent())
             .map(|dir| dir.join("matrix-bot-room-map.json"));
-        let room_bots = room_persist_path
+        let (room_bots, room_map_poisoned) = room_persist_path
             .as_deref()
             .map(Self::load_rooms)
             .unwrap_or_default();
         Self {
             routes: Arc::new(RwLock::new(routes)),
             room_bots: Arc::new(RwLock::new(room_bots)),
+            room_map_poisoned,
             persist_path,
             room_persist_path,
             update_lock: Arc::new(Mutex::new(())),
@@ -291,6 +296,47 @@ impl BotRouter {
         room_bots.get(room_id).map_or(0, |profiles| profiles.len())
     }
 
+    /// Managed-bot composition of `room_id` from the appservice's own room
+    /// map, split into child bots and the BotFather profile so it can be
+    /// unioned with a membership-derived count (which sees BotFather but may
+    /// not see homeserver-hidden child virtual users).
+    ///
+    /// A mapped profile whose Matrix user ID equals `bot_user_id` is the
+    /// BotFather profile; a profile with no known reverse route is counted as
+    /// a child bot (over-counting fails safe: it can only demand a mention,
+    /// never grant a DM exemption). Returns `None` when the room map failed
+    /// to load at startup, so the caller fails closed.
+    pub async fn room_bot_composition(
+        &self,
+        room_id: &str,
+        bot_user_id: &str,
+    ) -> Option<RoomBotComposition> {
+        if self.room_map_poisoned {
+            return None;
+        }
+        let mut composition = RoomBotComposition {
+            child_bots: 0,
+            botfather_mapped: false,
+        };
+        let room_bots = self.room_bots.read().await;
+        let Some(profiles) = room_bots.get(room_id) else {
+            return Some(composition);
+        };
+        let routes = self.routes.read().await;
+        for profile_id in profiles {
+            let matrix_user_id = routes
+                .iter()
+                .find(|(_, entry)| entry.profile_id == *profile_id)
+                .map(|(matrix_user_id, _)| matrix_user_id.as_str());
+            if matrix_user_id == Some(bot_user_id) {
+                composition.botfather_mapped = true;
+            } else {
+                composition.child_bots += 1;
+            }
+        }
+        Some(composition)
+    }
+
     /// Record that a bot (by profile_id) is in a room.
     /// Called when a bot virtual user is invited to and joins a room.
     pub async fn add_room_bot(&self, room_id: &str, profile_id: &str) -> Result<()> {
@@ -351,9 +397,14 @@ impl BotRouter {
             *routes = new_routes;
         }
         if let Some(ref path) = self.room_persist_path {
-            let new_rooms = Self::load_rooms(path);
-            let mut room_bots = self.room_bots.write().await;
-            *room_bots = new_rooms;
+            // A reload that fails to parse keeps the previous in-memory map
+            // rather than clobbering it with an empty one; the startup
+            // `room_map_poisoned` flag is not revisited here.
+            let (new_rooms, poisoned) = Self::load_rooms(path);
+            if !poisoned {
+                let mut room_bots = self.room_bots.write().await;
+                *room_bots = new_rooms;
+            }
         }
         Ok(())
     }
@@ -427,22 +478,40 @@ impl BotRouter {
     }
 
     /// Load room-bot mappings from a JSON file.
-    fn load_rooms(path: &std::path::Path) -> HashMap<String, HashSet<String>> {
+    /// Load the room map from disk. The boolean is the "poisoned" flag: a
+    /// missing file is a legitimate first run (empty map, not poisoned), but
+    /// an existing file that cannot be read or parsed must not silently
+    /// become an empty map — the mention gate would then see zero bots in
+    /// every room and treat multi-bot rooms as DMs.
+    fn load_rooms(path: &std::path::Path) -> (HashMap<String, HashSet<String>>, bool) {
         match std::fs::read_to_string(path) {
-            Ok(data) => {
-                let map: HashMap<String, Vec<String>> =
-                    serde_json::from_str(&data).unwrap_or_default();
-                map.into_iter()
-                    .map(|(k, v)| (k, v.into_iter().collect()))
-                    .collect()
+            Ok(data) => match serde_json::from_str::<HashMap<String, Vec<String>>>(&data) {
+                Ok(map) => (
+                    map.into_iter()
+                        .map(|(k, v)| (k, v.into_iter().collect()))
+                        .collect(),
+                    false,
+                ),
+                Err(e) => {
+                    warn!(path = %path.display(), error = %e, "failed to parse matrix room map; failing closed");
+                    (HashMap::new(), true)
+                }
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => (HashMap::new(), false),
+            Err(e) => {
+                warn!(path = %path.display(), error = %e, "failed to read matrix room map; failing closed");
+                (HashMap::new(), true)
             }
-            Err(_) => HashMap::new(),
         }
     }
 }
 
+// `/` is deliberately NOT a user-id char: it is not valid in an MXID, and in a
+// standard matrix.to pill (`https://matrix.to/#/@bot:server`) the MXID is
+// immediately preceded by `/` — treating `/` as part of a user ID would make
+// the left-boundary check reject exactly that pill form.
 fn is_matrix_user_id_char(c: char) -> bool {
-    c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '=' | '-' | '/' | ':' | '@')
+    c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '=' | '-' | ':' | '@')
 }
 
 fn contains_exact_matrix_user_id_mention(text: &str, user_id: &str) -> bool {
@@ -552,11 +621,11 @@ fn mentions_user(content: &Value, body_text: &str, user_id: &str) -> bool {
     !formatted_body.is_empty() && contains_exact_matrix_user_id_mention(formatted_body, user_id)
 }
 
-/// Joined-member breakdown of a room, as seen by the mention gate.
+/// Final member breakdown of a room, as seen by the mention gate.
 ///
 /// `humans` are joined users that are neither the appservice bot nor managed
-/// virtual users. `managed_bots` are all managed users — child bots and the
-/// appservice's own BotFather user alike: BotFather answers unrouted messages
+/// virtual users. `managed_bots` are all managed responders — child bots plus
+/// the appservice's own BotFather user: BotFather answers unrouted messages
 /// itself (admin mode), so it counts as a potential responder too.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct RoomMemberCounts {
@@ -571,23 +640,56 @@ impl RoomMemberCounts {
         managed_bots: usize::MAX,
     };
 
-    /// A true 1:1 DM: at most one human talking to at most one child bot.
+    /// A true 1:1 DM: at most one human talking to at most one managed bot.
     fn is_direct_chat(self) -> bool {
         self.humans <= 1 && self.managed_bots <= 1
     }
 }
 
-/// Combine the membership-derived member counts with the appservice's own
-/// room-map bot count, taking the larger bot figure.
+/// Member breakdown derived from the homeserver's `joined_members` response.
 ///
-/// The homeserver's `joined_members` may hide appservice virtual users
-/// (Palpo returns only real users), which would make the gate blind to how
-/// many bots share the room. The room map cannot shrink an UNKNOWN sentinel:
-/// `max` keeps `usize::MAX`, so fail-closed behaviour is preserved.
-fn merge_mapped_bot_count(counts: RoomMemberCounts, mapped_bots: usize) -> RoomMemberCounts {
+/// Kept separate from [`RoomMemberCounts`] because this source sees BotFather
+/// (when the homeserver reports it) but may not see managed child virtual
+/// users at all — Palpo omits appservice virtual users from `joined_members`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct MembershipCounts {
+    humans: usize,
+    /// Managed child (virtual) bot users visible in the membership list.
+    child_bots: usize,
+    /// Whether the appservice's own BotFather user appears as joined.
+    botfather_joined: bool,
+}
+
+/// Managed-bot composition of a room from the appservice's room map
+/// (see [`BotRouter::room_bot_composition`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RoomBotComposition {
+    pub child_bots: usize,
+    pub botfather_mapped: bool,
+}
+
+/// Union the two bot-count sources into the gate's final member breakdown.
+///
+/// The sources see different bots, so a plain `max` of totals undercounts:
+/// membership sees BotFather but may miss homeserver-hidden child users,
+/// while the room map sees bound child bots. A room of one human + BotFather
+/// + one hidden child would look like "1 bot" to each source individually,
+/// yet has two potential responders. Child bots are maxed across sources
+/// (same population, different visibility) and BotFather is added separately
+/// when either source saw it. `None` from either source means that source
+/// could not be determined — fail closed.
+fn merge_room_bot_sources(
+    membership: Option<MembershipCounts>,
+    mapped: Option<RoomBotComposition>,
+) -> RoomMemberCounts {
+    let (Some(membership), Some(mapped)) = (membership, mapped) else {
+        return RoomMemberCounts::UNKNOWN;
+    };
+    let child_bots = membership.child_bots.max(mapped.child_bots);
+    let botfather_present = membership.botfather_joined || mapped.botfather_mapped;
     RoomMemberCounts {
-        humans: counts.humans,
-        managed_bots: counts.managed_bots.max(mapped_bots),
+        humans: membership.humans,
+        managed_bots: child_bots.saturating_add(usize::from(botfather_present)),
     }
 }
 
@@ -609,41 +711,49 @@ fn should_dispatch_message(gated: bool, addressed: bool, members: RoomMemberCoun
 }
 
 /// Break down the members in a homeserver `joined_members` response into
-/// humans and managed child-bot users (see [`RoomMemberCounts`]).
+/// humans, visible child bots, and BotFather (see [`MembershipCounts`]).
+/// Returns `None` when the response has no `joined` object, so the caller
+/// can fail closed.
 fn count_room_members(
     joined_members: &Value,
     bot_user_id: &str,
     server_suffix: &str,
     user_prefix: &str,
-) -> RoomMemberCounts {
-    let Some(members) = joined_members
+) -> Option<MembershipCounts> {
+    let members = joined_members
         .get("joined")
-        .and_then(|value| value.as_object())
-    else {
-        return RoomMemberCounts::UNKNOWN;
-    };
+        .and_then(|value| value.as_object())?;
 
-    let mut counts = RoomMemberCounts {
+    let mut counts = MembershipCounts {
         humans: 0,
-        managed_bots: 0,
+        child_bots: 0,
+        botfather_joined: false,
     };
     for user_id in members.keys() {
-        if !is_managed_user(user_id, bot_user_id, server_suffix, user_prefix) {
-            counts.humans += 1;
+        if user_id == bot_user_id {
+            counts.botfather_joined = true;
+        } else if is_managed_user(user_id, bot_user_id, server_suffix, user_prefix) {
+            counts.child_bots += 1;
         } else {
-            counts.managed_bots += 1;
+            counts.humans += 1;
         }
     }
-    counts
+    Some(counts)
 }
 
+/// Invalidate the cached membership for `room_id` and bump the cache
+/// generation so any in-flight fetch that started before this invalidation
+/// cannot reinsert its (now stale) result afterward.
 async fn invalidate_room_member_cache(state: &AppserviceState, room_id: &str) {
     if !room_id.is_empty() {
+        state
+            .dm_member_cache_generation
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         state.dm_member_cache.write().await.remove(room_id);
     }
 }
 
-/// Return the member breakdown of `room_id`, consulting a short-TTL cache
+/// Return the membership breakdown of `room_id`, consulting a short-TTL cache
 /// first and otherwise querying the homeserver. Returns `None` when the
 /// membership cannot be determined (so the caller can fail closed).
 async fn room_member_counts(
@@ -651,7 +761,7 @@ async fn room_member_counts(
     room_id: &str,
     as_user_id: &str,
     server_suffix: &str,
-) -> Option<RoomMemberCounts> {
+) -> Option<MembershipCounts> {
     {
         let cache = state.dm_member_cache.read().await;
         if let Some((counts, fetched_at)) = cache.get(room_id) {
@@ -661,9 +771,24 @@ async fn room_member_counts(
         }
     }
 
+    let generation_before_fetch = state
+        .dm_member_cache_generation
+        .load(std::sync::atomic::Ordering::SeqCst);
     let counts = fetch_room_member_counts(state, room_id, as_user_id, server_suffix).await?;
     let mut cache = state.dm_member_cache.write().await;
-    cache.insert(room_id.to_string(), (counts, Instant::now()));
+    // Age-based eviction on write keeps the cache bounded: entries are
+    // otherwise only removed by membership events for their own room.
+    cache.retain(|_, (_, fetched_at)| fetched_at.elapsed() < DM_MEMBER_CACHE_TTL);
+    // A membership event may have invalidated this room while the fetch was
+    // in flight; inserting the pre-event snapshot would resurrect stale
+    // counts for a full TTL. Serve the fresh value but do not cache it.
+    if state
+        .dm_member_cache_generation
+        .load(std::sync::atomic::Ordering::SeqCst)
+        == generation_before_fetch
+    {
+        cache.insert(room_id.to_string(), (counts, Instant::now()));
+    }
     Some(counts)
 }
 
@@ -675,7 +800,7 @@ async fn fetch_room_member_counts(
     room_id: &str,
     as_user_id: &str,
     server_suffix: &str,
-) -> Option<RoomMemberCounts> {
+) -> Option<MembershipCounts> {
     let url = format!(
         "{}/_matrix/client/v3/rooms/{}/joined_members?user_id={}",
         state.homeserver,
@@ -710,12 +835,7 @@ async fn fetch_room_member_counts(
             return None;
         }
     };
-    Some(count_room_members(
-        &body,
-        &state.bot_user_id,
-        server_suffix,
-        &state.user_prefix,
-    ))
+    count_room_members(&body, &state.bot_user_id, server_suffix, &state.user_prefix)
 }
 
 /// Shared state for the appservice HTTP handlers.
@@ -742,7 +862,11 @@ struct AppserviceState {
     /// Cached human-member counts per room (`room_id -> (count, fetched_at)`),
     /// used by the mention-only gate to avoid a homeserver round-trip on every
     /// message. Entries expire after [`DM_MEMBER_CACHE_TTL`].
-    dm_member_cache: Arc<RwLock<HashMap<String, (RoomMemberCounts, Instant)>>>,
+    dm_member_cache: Arc<RwLock<HashMap<String, (MembershipCounts, Instant)>>>,
+    /// Monotonic generation counter for `dm_member_cache`: bumped on every
+    /// membership-event invalidation so an in-flight fetch that predates the
+    /// event cannot reinsert stale counts (see `room_member_counts`).
+    dm_member_cache_generation: Arc<std::sync::atomic::AtomicU64>,
 }
 
 fn error_json_response(
@@ -796,7 +920,9 @@ pub struct MatrixChannel {
     /// `true`; override via [`MatrixChannel::with_mention_only`].
     mention_only: bool,
     /// Shared room human-member-count cache backing the mention-only gate.
-    dm_member_cache: Arc<RwLock<HashMap<String, (RoomMemberCounts, Instant)>>>,
+    dm_member_cache: Arc<RwLock<HashMap<String, (MembershipCounts, Instant)>>>,
+    /// Generation counter paired with `dm_member_cache` (see `AppserviceState`).
+    dm_member_cache_generation: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl MatrixChannel {
@@ -834,6 +960,7 @@ impl MatrixChannel {
             media_dir: std::env::temp_dir().join("octos-matrix-media"),
             mention_only: true,
             dm_member_cache: Arc::new(RwLock::new(HashMap::new())),
+            dm_member_cache_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
     }
 
@@ -1597,15 +1724,29 @@ async fn handle_transaction(
         {
             if let Some(entry) = state.bot_router.get_entry(target_user_id).await {
                 if entry.visibility == BotVisibility::Private && sender != entry.owner {
-                    if let Err(e) = send_text_to_room_as(
-                        &state,
-                        room_id,
-                        "This is a private bot. Only its owner can chat with it.",
-                        target_user_id,
-                    )
-                    .await
-                    {
-                        warn!(error = %e, room_id, target_user_id, "failed to send private bot message rejection");
+                    // Only reply with the rejection when the sender explicitly
+                    // addressed the bot. Room-mapping routing alone can target
+                    // a private bot with any unaddressed group chatter, and
+                    // answering that would both spam the room and reveal the
+                    // private bot's existence — exactly the unmentioned noise
+                    // the mention gate suppresses. Unaddressed messages are
+                    // dropped silently either way.
+                    if addressed {
+                        if let Err(e) = send_text_to_room_as(
+                            &state,
+                            room_id,
+                            "This is a private bot. Only its owner can chat with it.",
+                            target_user_id,
+                        )
+                        .await
+                        {
+                            warn!(error = %e, room_id, target_user_id, "failed to send private bot message rejection");
+                        }
+                    } else {
+                        debug!(
+                            room_id,
+                            sender, target_user_id, "unaddressed message to private bot ignored"
+                        );
                     }
                     continue;
                 }
@@ -1662,16 +1803,19 @@ async fn handle_transaction(
                 .and_then(|value| value.as_str())
                 .unwrap_or(state.bot_user_id.as_str())
                 .to_string();
-            let mapped_bots = state.bot_router.bot_count_for_room(room_id).await;
-            let members = room_member_counts(&state, room_id, &as_user_id, &server_suffix)
-                .await
-                .map(|counts| merge_mapped_bot_count(counts, mapped_bots));
-            if !should_dispatch_message(true, false, members.unwrap_or(RoomMemberCounts::UNKNOWN)) {
+            let membership = room_member_counts(&state, room_id, &as_user_id, &server_suffix).await;
+            let mapped = state
+                .bot_router
+                .room_bot_composition(room_id, state.bot_user_id.as_str())
+                .await;
+            let members = merge_room_bot_sources(membership, mapped);
+            if !should_dispatch_message(true, false, members) {
                 debug!(
                     room_id,
                     sender,
                     explicit_room,
-                    members = ?members,
+                    membership = ?membership,
+                    mapped = ?mapped,
                     "Matrix message ignored; mention required outside 1:1 DM"
                 );
                 continue;
@@ -2242,6 +2386,7 @@ impl Channel for MatrixChannel {
             media_dir: self.media_dir.clone(),
             mention_only: self.mention_only,
             dm_member_cache: self.dm_member_cache.clone(),
+            dm_member_cache_generation: self.dm_member_cache_generation.clone(),
         };
 
         let app = Router::new()
@@ -3757,4 +3902,4 @@ impl std::fmt::Display for MatrixEventId {
 
 #[cfg(test)]
 #[path = "matrix_channel_tests.rs"]
-mod tests; (style: rustfmt matrix_channel)
+mod tests;
