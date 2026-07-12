@@ -369,6 +369,10 @@ mod tests {
         assert_eq!(settings.user_prefix, MATRIX_DEFAULT_USER_PREFIX);
         assert_eq!(settings.port, MATRIX_DEFAULT_PORT);
         assert!(settings.allowed_senders.is_empty());
+        assert!(
+            settings.mention_only,
+            "mention-only gating is safe-by-default (true) when unset"
+        );
     }
 
     #[test]
@@ -387,6 +391,22 @@ mod tests {
         assert_eq!(
             settings.allowed_senders,
             vec!["@alice:localhost".to_string(), "@bob:localhost".to_string()]
+        );
+    }
+
+    #[test]
+    fn matrix_channel_settings_mention_only_opt_out() {
+        let entry = matrix_entry(serde_json::json!({
+            MATRIX_SETTING_AS_TOKEN: "as-token",
+            MATRIX_SETTING_HS_TOKEN: "hs-token",
+            MATRIX_SETTING_MENTION_ONLY: false,
+        }));
+
+        let settings = MatrixChannelSettings::from_entry(&entry).unwrap();
+
+        assert!(
+            !settings.mention_only,
+            "operator can disable mention-only gating"
         );
     }
 
