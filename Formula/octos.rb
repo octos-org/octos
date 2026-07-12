@@ -1,13 +1,13 @@
 class Octos < Formula
   desc "Rust-native, API-first Agentic OS server (octos serve + bundled skills)"
   homepage "https://github.com/octos-org/octos"
-  version "2.0.0"
+  version "2.0.1"
   license "Apache-2.0"
 
   on_macos do
     on_arm do
-      url "https://github.com/octos-org/octos/releases/download/v2.0.0/octos-bundle-aarch64-apple-darwin.tar.gz"
-      sha256 "d6c3b53380a51579386687218feb575b4199a188061bad332a3541019a2107f4"
+      url "https://github.com/octos-org/octos/releases/download/v2.0.1/octos-bundle-aarch64-apple-darwin.tar.gz"
+      sha256 "8c9803b138d98d9a8cf0170b415a6f4b7fb58878ce20cfec9295efc56dd37195"
     end
     on_intel do
       odie "octos requires Apple Silicon; no x86_64 macOS build is published"
@@ -16,12 +16,12 @@ class Octos < Formula
 
   on_linux do
     on_intel do
-      url "https://github.com/octos-org/octos/releases/download/v2.0.0/octos-bundle-x86_64-unknown-linux-gnu.tar.gz"
-      sha256 "a28ca262a060e1e76862f4eda9af831d31a7f46de04a34e397737b17830f46da"
+      url "https://github.com/octos-org/octos/releases/download/v2.0.1/octos-bundle-x86_64-unknown-linux-gnu.tar.gz"
+      sha256 "9b068dd702055f0418661e919184106c3610262fb00ccad142efd658b32d3006"
     end
     on_arm do
-      url "https://github.com/octos-org/octos/releases/download/v2.0.0/octos-bundle-aarch64-unknown-linux-gnu.tar.gz"
-      sha256 "eb27475fde3fd823d23b460f6a8ab3f048f4bcde9cece22ab7bcab6f6d08eb8a"
+      url "https://github.com/octos-org/octos/releases/download/v2.0.1/octos-bundle-aarch64-unknown-linux-gnu.tar.gz"
+      sha256 "36cd7f43a1608ea5c12a35d9df28f8d08191e04c195132a22e95aa200f1ebf83"
     end
   end
 
