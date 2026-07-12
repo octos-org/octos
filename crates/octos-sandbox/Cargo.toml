@@ -5,6 +5,15 @@ edition = "2024"
 rust-version = "1.85.0"
 description = "Platform sandbox helper for octos"
 
+# Excluded from `cargo release`. Unlike every other crate (which inherits the
+# shared workspace version via `version.workspace = true`), this helper keeps an
+# independent `0.1.0`. With the workspace's `shared-version = true`, a workspace
+# bump would otherwise try to bump + tag this crate on its OWN track — e.g. a
+# `major` release computes `1.0.0` for it and fails on `tag v1.0.0 already
+# exists`. `release = false` makes `cargo release` skip it entirely.
+[package.metadata.release]
+release = false
+
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 eyre = "0.6"
