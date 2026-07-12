@@ -1725,6 +1725,43 @@ impl InProcessAgentOrchestrator {
         }
     }
 
+    /// #1650 — atomic, OWNER-AWARE claim of the in-flight marker for an
+    /// interactive turn, returning a drop-guard ONLY if the marker was
+    /// free.
+    ///
+    /// Unlike [`Self::goal_dispatch_in_flight_guard`] (which marks
+    /// unconditionally), this checks-and-inserts under a single lock and
+    /// returns `None` if another dispatcher already owns the marker —
+    /// e.g. a `SessionActor` `GoalContinue` running for the same session
+    /// on the CLI/gateway path (which AppUI's `active_turns` can't see).
+    /// That prevents an interactive turn from becoming a SECOND owner of
+    /// the non-refcounted `in_flight_goal_sessions` entry, whose Drop
+    /// would otherwise wipe the other dispatcher's marker and admit a
+    /// concurrent continuation.
+    ///
+    /// The interactive accountant uses this to keep the goal non-runnable
+    /// from turn start until its post-loop charge commits — closing the
+    /// window where, on the multi-threaded serve runtime, a queued
+    /// `GoalContinue` could drain in the gap between `try_emit_terminal`
+    /// and the charge and run past a just-crossed budget. When the marker
+    /// is already held the interactive turn still charges (the spend is
+    /// real); it simply doesn't add redundant marker protection.
+    pub(crate) fn try_claim_goal_in_flight(
+        &'static self,
+        session_id: &SessionKey,
+    ) -> Option<GoalDispatchInFlightGuard> {
+        let mut state = self.state();
+        if state.in_flight_goal_sessions.contains(session_id) {
+            return None;
+        }
+        state.in_flight_goal_sessions.insert(session_id.clone());
+        Some(GoalDispatchInFlightGuard {
+            orchestrator: self,
+            session_id: session_id.clone(),
+            disarmed: false,
+        })
+    }
+
     /// #1133 — the AppUI tick path no longer calls this helper.
     /// `run_standalone_turn` now folds real `tokens_consumed +
     /// elapsed` into `record_goal_turn` AFTER the agent task returns,
@@ -1786,27 +1823,159 @@ impl InProcessAgentOrchestrator {
             // #1131 — Enqueue a one-shot wrap-up turn under the
             // dedicated `GoalWrapUp` reason so the prompt renderer
             // emits the wrap-up directive verbatim instead of the
-            // standard "Advance the goal..." template. Use an
-            // explicit dedupe key so the wrap-up cannot collide with
-            // the normal-continuation key shape.
-            let mut wrap_up_request = MasterContinuationRequest::new(
-                "coding-autonomy-goal",
-                session_id.to_string(),
-                profile_id.to_owned(),
-                MasterContinuationReason::GoalWrapUp,
+            // standard "Advance the goal..." template. The shared
+            // `enqueue_goal_wrap_up` applies the explicit dedupe key so
+            // the wrap-up cannot collide with the normal-continuation
+            // key shape.
+            enqueue_goal_wrap_up(
+                &mut state,
+                session_id,
+                profile_id,
+                &goal_id,
+                &goal_snapshot.objective,
+                prompt,
                 now_system,
-            )
-            .with_goal_id(goal_id.clone())
-            .with_metadata("objective", goal_snapshot.objective.clone())
-            .with_metadata("status", "budget_limited".to_owned())
-            .with_metadata("wrap_up", "true".to_owned())
-            .with_metadata("wrap_up_prompt", prompt);
-            wrap_up_request = wrap_up_request.with_dedupe_key(format!(
-                "coding-autonomy-goal/wrap_up/{}/{}",
-                profile_id, goal_id
-            ));
-            enqueue_and_persist_continuation(&mut state, wrap_up_request);
+            );
         }
+    }
+
+    /// #1650 — the `goal_id` of the session's active goal for
+    /// `profile_id`, or `None` when there is no goal, it is outside the
+    /// profile scope, or it is not `active`. Captured at TURN START by
+    /// the interactive accountant so the post-turn charge can (a) bind
+    /// to exactly this goal (reject a mid-turn clear+recreate) and (b)
+    /// decide whether to hold the goal in-flight for the turn.
+    pub(crate) fn active_goal_id(
+        &self,
+        session_id: &SessionKey,
+        profile_id: &str,
+    ) -> Option<String> {
+        let state = self.state();
+        let goal = state.goals.get(session_id)?;
+        if goal.profile_id == profile_id && goal.status == "active" {
+            Some(goal.goal_id.clone())
+        } else {
+            None
+        }
+    }
+
+    /// #1650 — charge an *interactive* (user-driven) turn's token spend
+    /// against the session's active goal so the goal chip's token
+    /// counter climbs while the user works.
+    ///
+    /// Unlike [`Self::record_goal_turn`] (the autonomous-continuation
+    /// accountant) this touches ONLY the accounting fields the user
+    /// watches climb — `tokens_used`, `time_used_seconds`,
+    /// `updated_at_ms` — and deliberately does NOT advance
+    /// `continuations_used`, `last_continued_at_ms`, the sliding rate
+    /// window, or the completion sentinel. Interactive turns are not
+    /// continuations: folding them into the recurrence machinery would
+    /// corrupt the autonomous fire cadence and the hourly cap.
+    ///
+    /// When the charge crosses `token_budget` it DOES flip the goal to
+    /// `budget_limited` and enqueue the one-shot wrap-up (via the shared
+    /// [`enqueue_goal_wrap_up`], exactly as `record_goal_turn` does).
+    /// The flip is required, not cosmetic: an ALREADY-QUEUED
+    /// `GoalContinue` is admitted by the drain-time schedulability check
+    /// solely because the goal is still `active`
+    /// ([`goal_policy_allows_fire`] only gates the *enqueue* path on the
+    /// token count), so without the status flip one more autonomous turn
+    /// would fire after exhaustion.
+    ///
+    /// Charges the goal keyed to `session_id` only when it is `active`
+    /// AND `goal.profile_id == profile_id`. The profile match mirrors
+    /// `record_goal_turn` and is a hard isolation requirement: an
+    /// unprofiled/shared session key can be driven by a different
+    /// authenticated profile than the one that owns the goal, so an
+    /// unmatched charge would both miscount and leak the goal snapshot
+    /// across tenants. Returns a `SessionGoalUpdated`-shaped wire value
+    /// so the caller can push a live notification and refresh the
+    /// TUI/web goal chip; `None` when the session has no active goal for
+    /// `profile_id` (the common interactive case) or the turn spent
+    /// nothing.
+    pub(crate) fn charge_active_goal_tokens(
+        &self,
+        session_id: &SessionKey,
+        profile_id: &str,
+        expected_goal_id: &str,
+        tokens_consumed: u64,
+        elapsed_seconds: u64,
+    ) -> Option<Value> {
+        if tokens_consumed == 0 && elapsed_seconds == 0 {
+            return None;
+        }
+        let now = now_ms();
+        let now_system = SystemTime::now();
+        let mut state = self.state();
+        let goal = state.goals.get_mut(session_id)?;
+        // Profile isolation: never charge or leak a goal owned by a
+        // different profile on the same (possibly unprofiled/shared)
+        // session key. Mirrors `record_goal_turn`.
+        if goal.profile_id != profile_id {
+            return None;
+        }
+        // Goal-identity binding: the caller captured the goal_id at TURN
+        // START. If the user cleared that goal and created a new one
+        // mid-turn, the session key now points at a different goal_id —
+        // charging this turn's spend to the replacement would let a
+        // large prior turn instantly consume or budget-limit a goal it
+        // never worked toward. Reject the mismatch.
+        if goal.goal_id != expected_goal_id {
+            return None;
+        }
+        // Only an actively-accruing goal advances. A paused /
+        // budget_limited / complete goal must not creep forward on a
+        // stray interactive turn.
+        if goal.status != "active" {
+            return None;
+        }
+        goal.updated_at_ms = now;
+        goal.tokens_used = goal.tokens_used.saturating_add(tokens_consumed);
+        goal.time_used_seconds = goal.time_used_seconds.saturating_add(elapsed_seconds);
+        // Budget exhaustion: flip to `budget_limited` and enqueue the
+        // one-shot wrap-up, mirroring `record_goal_turn_internal` minus
+        // the continuation/rate-window bumps that only apply to
+        // autonomous turns. The flip STOPS an already-queued
+        // `GoalContinue` from draining past the cap (drain-time
+        // schedulability gates on `status == "active"`, not on the live
+        // token count).
+        let goal_id = goal.goal_id.clone();
+        let objective = goal.objective.clone();
+        let wrap_up_prompt = {
+            let exhausted = goal.token_budget > 0
+                && goal.tokens_used >= goal.token_budget
+                && !goal.wrap_up_emitted;
+            if exhausted {
+                goal.status = "budget_limited".to_owned();
+                goal.wrap_up_emitted = true;
+                Some(format!(
+                    "Goal `{}` has exhausted its continuation budget. Summarize the current state, call out remaining work, and stop starting new work.",
+                    goal_id
+                ))
+            } else {
+                None
+            }
+        };
+        let snapshot = goal.clone();
+        let profile_for_event = snapshot.profile_id.clone();
+        persist_goal_state(&state, session_id, &snapshot, false);
+        if let Some(prompt) = wrap_up_prompt {
+            enqueue_goal_wrap_up(
+                &mut state,
+                session_id,
+                &profile_for_event,
+                &goal_id,
+                &objective,
+                prompt,
+                now_system,
+            );
+        }
+        Some(json!({
+            "session_id": session_id,
+            "profile_id": profile_for_event,
+            "goal": autonomy_goal_json(&snapshot),
+            "transition_actor": "backend",
+        }))
     }
 
     /// #979 / M15-C2 — after a goal-driven turn finishes, re-queue
@@ -1951,6 +2120,27 @@ impl InProcessAgentOrchestrator {
             .goals
             .get(session_id)
             .map(|goal| goal.status.clone())
+    }
+
+    /// #1650 — the goal_id of the session's goal REGARDLESS of status
+    /// (unlike [`Self::active_goal_id`], which only returns it while
+    /// `active`). Used by the interactive-charge tests to pass the
+    /// goal-identity binding for paused / budget-crossing cases.
+    #[cfg(test)]
+    pub(crate) fn goal_id_for_test(&self, session_id: &SessionKey) -> Option<String> {
+        self.state()
+            .goals
+            .get(session_id)
+            .map(|goal| goal.goal_id.clone())
+    }
+
+    /// #1650 — `time_used_seconds` accessor for the elapsed-only charge test.
+    #[cfg(test)]
+    pub(crate) fn goal_time_used_seconds_for_test(&self, session_id: &SessionKey) -> Option<u64> {
+        self.state()
+            .goals
+            .get(session_id)
+            .map(|goal| goal.time_used_seconds)
     }
 
     /// #1133 — accessor used by the AppUI goal-turn acceptance tests to
@@ -3910,6 +4100,42 @@ fn record_goal_turn_internal(
     } else {
         None
     }
+}
+
+/// #1131 / #1650 — enqueue the one-shot budget wrap-up continuation
+/// shared by the autonomous (`record_goal_turn`) and interactive
+/// (`charge_active_goal_tokens`) budget-exhaustion transitions. Rides
+/// the dedicated `GoalWrapUp` reason so the prompt renderer emits the
+/// wrap-up directive verbatim, and uses an explicit dedupe key
+/// (`coding-autonomy-goal/wrap_up/<profile>/<goal>`) so the wrap-up
+/// cannot collide with a normal continuation and repeated exhaustion
+/// marks collapse to one entry.
+fn enqueue_goal_wrap_up(
+    state: &mut AutonomyRuntimeState,
+    session_id: &SessionKey,
+    profile_id: &str,
+    goal_id: &str,
+    objective: &str,
+    wrap_up_prompt: String,
+    now_system: SystemTime,
+) {
+    let wrap_up_request = MasterContinuationRequest::new(
+        "coding-autonomy-goal",
+        session_id.to_string(),
+        profile_id.to_owned(),
+        MasterContinuationReason::GoalWrapUp,
+        now_system,
+    )
+    .with_goal_id(goal_id.to_owned())
+    .with_metadata("objective", objective.to_owned())
+    .with_metadata("status", "budget_limited".to_owned())
+    .with_metadata("wrap_up", "true".to_owned())
+    .with_metadata("wrap_up_prompt", wrap_up_prompt)
+    .with_dedupe_key(format!(
+        "coding-autonomy-goal/wrap_up/{}/{}",
+        profile_id, goal_id
+    ));
+    enqueue_and_persist_continuation(state, wrap_up_request);
 }
 
 /// #979 / M15-C2 — detect the model-driven completion sentinels and
@@ -8193,6 +8419,326 @@ mod tests {
         assert_eq!(orchestrator.pending_continuation_count_for_test(), 0);
     }
 
+    /// #1650 — interactive (user-driven) turns must charge the
+    /// session's active goal so its `tokens_used` counter climbs while
+    /// the user works, WITHOUT advancing the autonomous-continuation
+    /// machinery (`continuations_used`, rate window) or flipping the
+    /// goal's status. This is the non-continuation accountant path
+    /// `run_standalone_turn` takes when `goal_context` is `None`.
+    #[test]
+    fn charge_active_goal_tokens_bumps_tokens_without_continuation_side_effects() {
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let session_id = SessionKey::with_profile("tenant-a", "api", "goal-interactive");
+        orchestrator
+            .set_goal(GoalSetRequest {
+                session_id: session_id.clone(),
+                profile_id: "tenant-a".into(),
+                objective: "improve the score".into(),
+                status: Some("active".into()),
+                token_budget: Some(50_000),
+                transition_actor: None,
+            })
+            .expect("set active goal");
+        let goal_id = orchestrator
+            .active_goal_id(&session_id, "tenant-a")
+            .expect("active goal id");
+        // Drain the initial continuation `set_goal` enqueues for a new
+        // active goal so the queue is empty before we charge — the
+        // assertion below then proves the *charge* enqueues nothing.
+        let _ = orchestrator.drain_ready_continuations_for_session(
+            &session_id,
+            "tenant-a",
+            MasterContinuationRuntimeState::idle(),
+            usize::MAX,
+        );
+        assert_eq!(
+            orchestrator.pending_continuation_count_for_test(),
+            0,
+            "queue drained before the interactive charge",
+        );
+
+        let event =
+            orchestrator.charge_active_goal_tokens(&session_id, "tenant-a", &goal_id, 1_234, 7);
+        assert!(
+            event.is_some(),
+            "charging an active goal returns an update event for live emission",
+        );
+
+        let (tokens_used, continuations_used, rate_window_count) = orchestrator
+            .goal_counters_for_test(&session_id)
+            .expect("goal exists");
+        assert_eq!(
+            tokens_used, 1_234,
+            "interactive charge advances tokens_used"
+        );
+        assert_eq!(
+            continuations_used, 0,
+            "interactive charge is NOT a continuation — must not bump continuations_used",
+        );
+        assert_eq!(
+            rate_window_count, 0,
+            "interactive charge must not touch the autonomous rate window",
+        );
+        assert_eq!(
+            orchestrator.goal_status_for_test(&session_id).as_deref(),
+            Some("active"),
+            "interactive charge leaves the goal active (no status flip, no wrap-up)",
+        );
+
+        // No continuation may be enqueued by an interactive charge —
+        // the user is driving the session; an unsolicited autonomous
+        // wrap-up turn would collide with their work.
+        assert_eq!(
+            orchestrator.pending_continuation_count_for_test(),
+            0,
+            "interactive charge must not enqueue any continuation",
+        );
+
+        // A second interactive charge accumulates.
+        let _ = orchestrator.charge_active_goal_tokens(&session_id, "tenant-a", &goal_id, 766, 3);
+        let (tokens_used, _, _) = orchestrator
+            .goal_counters_for_test(&session_id)
+            .expect("goal exists");
+        assert_eq!(tokens_used, 2_000, "interactive charges accumulate");
+    }
+
+    /// A session with no active goal — the common interactive case —
+    /// must be a no-op: nothing to charge, no event to emit.
+    #[test]
+    fn charge_active_goal_tokens_is_noop_without_active_goal() {
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let session_id = SessionKey::with_profile("tenant-a", "api", "no-goal");
+        assert!(
+            orchestrator
+                .charge_active_goal_tokens(&session_id, "tenant-a", "any-goal", 500, 2)
+                .is_none(),
+            "no goal → no charge, no event",
+        );
+    }
+
+    /// A paused goal must not creep forward on stray interactive
+    /// turns — only an `active` goal accrues.
+    #[test]
+    fn charge_active_goal_tokens_skips_paused_goal() {
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let session_id = SessionKey::with_profile("tenant-a", "api", "goal-paused");
+        orchestrator
+            .set_goal(GoalSetRequest {
+                session_id: session_id.clone(),
+                profile_id: "tenant-a".into(),
+                objective: "paused work".into(),
+                status: Some("paused".into()),
+                token_budget: Some(50_000),
+                transition_actor: None,
+            })
+            .expect("set paused goal");
+        // Real goal_id so the charge passes profile + identity and is
+        // rejected specifically on the `active` status gate.
+        let goal_id = orchestrator
+            .goal_id_for_test(&session_id)
+            .expect("goal exists");
+        assert!(
+            orchestrator
+                .charge_active_goal_tokens(&session_id, "tenant-a", &goal_id, 500, 2)
+                .is_none(),
+            "paused goal is not charged by interactive turns",
+        );
+        let (tokens_used, _, _) = orchestrator
+            .goal_counters_for_test(&session_id)
+            .expect("goal exists");
+        assert_eq!(tokens_used, 0, "paused goal tokens_used unchanged");
+    }
+
+    /// #1650 P1 (codex) — profile isolation: an interactive turn running
+    /// under a DIFFERENT profile than the one that owns the goal on the
+    /// same (unprofiled/shared) session key must NOT charge or leak the
+    /// goal. Mirrors `record_goal_turn`'s profile guard.
+    #[test]
+    fn charge_active_goal_tokens_enforces_profile_isolation() {
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let session_id = SessionKey::with_profile("tenant-a", "api", "goal-iso");
+        orchestrator
+            .set_goal(GoalSetRequest {
+                session_id: session_id.clone(),
+                profile_id: "tenant-a".into(),
+                objective: "A's work".into(),
+                status: Some("active".into()),
+                token_budget: Some(50_000),
+                transition_actor: None,
+            })
+            .expect("set active goal owned by tenant-a");
+        let goal_id = orchestrator
+            .active_goal_id(&session_id, "tenant-a")
+            .expect("active goal id");
+
+        // A turn resolved under tenant-b must be rejected outright.
+        assert!(
+            orchestrator
+                .charge_active_goal_tokens(&session_id, "tenant-b", &goal_id, 999, 5)
+                .is_none(),
+            "cross-profile charge is rejected (no snapshot leak)",
+        );
+        let (tokens_used, _, _) = orchestrator
+            .goal_counters_for_test(&session_id)
+            .expect("goal exists");
+        assert_eq!(tokens_used, 0, "A's goal is untouched by B's turn");
+    }
+
+    /// #1650 P2 (codex) — goal-identity binding: a turn that started
+    /// under goal A must not charge a goal B that replaced it mid-turn
+    /// (same session key, new goal_id). The stale `expected_goal_id`
+    /// no longer matches, so the charge is a no-op.
+    #[test]
+    fn charge_active_goal_tokens_rejects_replaced_goal() {
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let session_id = SessionKey::with_profile("tenant-a", "api", "goal-replaced");
+        orchestrator
+            .set_goal(GoalSetRequest {
+                session_id: session_id.clone(),
+                profile_id: "tenant-a".into(),
+                objective: "goal A".into(),
+                status: Some("active".into()),
+                token_budget: Some(50_000),
+                transition_actor: None,
+            })
+            .expect("set goal A");
+        let goal_a_id = orchestrator
+            .active_goal_id(&session_id, "tenant-a")
+            .expect("goal A id");
+
+        // User clears A and creates B on the same session key mid-turn.
+        orchestrator
+            .clear_goal(GoalSessionRequest {
+                session_id: session_id.clone(),
+                profile_id: "tenant-a".into(),
+            })
+            .expect("clear goal A");
+        orchestrator
+            .set_goal(GoalSetRequest {
+                session_id: session_id.clone(),
+                profile_id: "tenant-a".into(),
+                objective: "goal B".into(),
+                status: Some("active".into()),
+                token_budget: Some(50_000),
+                transition_actor: None,
+            })
+            .expect("set goal B");
+        let goal_b_id = orchestrator
+            .active_goal_id(&session_id, "tenant-a")
+            .expect("goal B id");
+        assert_ne!(goal_a_id, goal_b_id, "replacement has a new goal_id");
+
+        // The in-flight turn charges with A's captured id → rejected.
+        assert!(
+            orchestrator
+                .charge_active_goal_tokens(&session_id, "tenant-a", &goal_a_id, 9_999, 5)
+                .is_none(),
+            "a turn bound to goal A must not charge the replacement goal B",
+        );
+        let (tokens_used, _, _) = orchestrator
+            .goal_counters_for_test(&session_id)
+            .expect("goal B exists");
+        assert_eq!(tokens_used, 0, "replacement goal B is untouched");
+    }
+
+    /// #1650 P2 (codex) — elapsed-only charge: a successful turn that
+    /// reports zero tokens but took real wall-clock time must still
+    /// advance `time_used_seconds` and emit an update.
+    #[test]
+    fn charge_active_goal_tokens_charges_elapsed_only_turn() {
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let session_id = SessionKey::with_profile("tenant-a", "api", "goal-elapsed");
+        orchestrator
+            .set_goal(GoalSetRequest {
+                session_id: session_id.clone(),
+                profile_id: "tenant-a".into(),
+                objective: "measure time".into(),
+                status: Some("active".into()),
+                token_budget: Some(50_000),
+                transition_actor: None,
+            })
+            .expect("set active goal");
+        let goal_id = orchestrator
+            .active_goal_id(&session_id, "tenant-a")
+            .expect("active goal id");
+
+        // Zero tokens, nonzero elapsed → still charges + emits.
+        let event = orchestrator.charge_active_goal_tokens(&session_id, "tenant-a", &goal_id, 0, 9);
+        assert!(event.is_some(), "elapsed-only turn still emits an update");
+        assert_eq!(
+            orchestrator.goal_time_used_seconds_for_test(&session_id),
+            Some(9),
+            "elapsed-only turn advances time_used_seconds",
+        );
+        let (tokens_used, _, _) = orchestrator
+            .goal_counters_for_test(&session_id)
+            .expect("goal exists");
+        assert_eq!(tokens_used, 0, "no token spend recorded");
+    }
+
+    /// #1650 P1 (codex) — an interactive charge that crosses
+    /// `token_budget` must flip the goal to `budget_limited` and enqueue
+    /// exactly one wrap-up, so an already-queued autonomous
+    /// `GoalContinue` cannot drain past the cap. Parity with
+    /// `record_goal_turn_emits_wrap_up_on_budget_exhaustion`.
+    #[test]
+    fn charge_active_goal_tokens_flips_budget_limited_and_wraps_up_on_exhaustion() {
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let session_id = SessionKey::with_profile("tenant-a", "api", "goal-exhaust");
+        orchestrator
+            .set_goal(GoalSetRequest {
+                session_id: session_id.clone(),
+                profile_id: "tenant-a".into(),
+                objective: "exhaust via interactive work".into(),
+                status: Some("active".into()),
+                token_budget: Some(1_000),
+                transition_actor: None,
+            })
+            .expect("set active goal");
+        let goal_id = orchestrator
+            .active_goal_id(&session_id, "tenant-a")
+            .expect("active goal id");
+        // Drain the initial GoalContinue set_goal enqueues so the only
+        // continuation left after the charge is the wrap-up we assert on.
+        let _ = orchestrator.drain_ready_continuations_for_session(
+            &session_id,
+            "tenant-a",
+            MasterContinuationRuntimeState::idle(),
+            usize::MAX,
+        );
+
+        orchestrator.force_goal_tokens_used_for_test(&session_id, 900);
+        // 900 + 200 >= 1_000 → crosses the budget on this interactive turn.
+        let event =
+            orchestrator.charge_active_goal_tokens(&session_id, "tenant-a", &goal_id, 200, 5);
+        assert!(event.is_some(), "the crossing turn still emits an update");
+
+        assert_eq!(
+            orchestrator.goal_status_for_test(&session_id).as_deref(),
+            Some("budget_limited"),
+            "interactive crossing flips the goal to budget_limited",
+        );
+
+        // Exactly one wrap-up continuation, on the dedicated reason.
+        let drained = orchestrator.drain_ready_continuations_for_session(
+            &session_id,
+            "tenant-a",
+            MasterContinuationRuntimeState::idle(),
+            usize::MAX,
+        );
+        assert_eq!(drained.len(), 1, "one wrap-up enqueued");
+        assert_eq!(drained[0].reason, MasterContinuationReason::GoalWrapUp);
+        assert_eq!(
+            drained[0].metadata.get("wrap_up").map(String::as_str),
+            Some("true"),
+        );
+
+        // Idempotent: a second interactive charge after exhaustion must
+        // not enqueue a duplicate wrap-up.
+        let _ = orchestrator.charge_active_goal_tokens(&session_id, "tenant-a", &goal_id, 100, 1);
+        assert_eq!(orchestrator.pending_continuation_count_for_test(), 0);
+    }
+
     /// #1141 — when an AppUI goal turn exhausts `token_budget`,
     /// `record_goal_turn` transitions the goal to `budget_limited` and
     /// enqueues a one-shot wrap-up continuation. For a goal-only AppUI
@@ -10957,6 +11503,47 @@ mod tests {
         assert!(
             !orchestrator.is_goal_dispatch_in_flight(&session_id),
             "clearing the marker must let dispatch resume"
+        );
+    }
+
+    /// #1650 (codex P1) — the interactive accountant's owner-aware claim:
+    /// it marks the session in-flight only when the marker is FREE, and
+    /// returns `None` (never a second owner) when another dispatcher — a
+    /// concurrent `SessionActor` `GoalContinue` — already holds it, so a
+    /// dropping interactive turn can't wipe that dispatcher's marker.
+    #[test]
+    fn try_claim_goal_in_flight_is_owner_aware() {
+        // The returned guard holds a 'static ref, so leak a FRESH
+        // orchestrator: a fully hermetic in-flight set, never the process
+        // global (no cross-test state).
+        let orchestrator: &'static InProcessAgentOrchestrator =
+            Box::leak(Box::new(InProcessAgentOrchestrator::default()));
+        let session_id = SessionKey::with_profile("tenant-a", "api", "try-claim");
+
+        let first = orchestrator.try_claim_goal_in_flight(&session_id);
+        assert!(first.is_some(), "claiming a free marker returns a guard");
+        assert!(
+            orchestrator.is_goal_dispatch_in_flight(&session_id),
+            "the claim marks the session in-flight",
+        );
+
+        // While held, a second claim must NOT double-own.
+        assert!(
+            orchestrator.try_claim_goal_in_flight(&session_id).is_none(),
+            "a held marker cannot be claimed twice (owner-aware)",
+        );
+
+        // Dropping the owning guard clears the marker; a fresh claim then
+        // succeeds — proving the guard, not the second (None) attempt,
+        // owns the marker.
+        drop(first);
+        assert!(
+            !orchestrator.is_goal_dispatch_in_flight(&session_id),
+            "dropping the owning guard clears the marker",
+        );
+        assert!(
+            orchestrator.try_claim_goal_in_flight(&session_id).is_some(),
+            "the marker is re-claimable after release",
         );
     }
 
