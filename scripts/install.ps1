@@ -1,4 +1,4 @@
-# install.ps1 — Install octos from pre-built binaries on Windows.
+# install.ps1 - Install octos from pre-built binaries on Windows.
 # Self-contained: no repo clone, Rust, or Node.js needed.
 #
 # Usage:
@@ -10,8 +10,8 @@
 #   .\install.ps1 -Uninstall
 #
 # Environment variables (for piped installs):
-#   $env:OCTOS_VERSION   — Release version (default: latest)
-#   $env:OCTOS_PREFIX    — Install prefix (default: ~\.octos\bin)
+#   $env:OCTOS_VERSION   - Release version (default: latest)
+#   $env:OCTOS_PREFIX    - Install prefix (default: ~\.octos\bin)
 
 [CmdletBinding(DefaultParameterSetName = 'Install')]
 param(
@@ -67,10 +67,10 @@ param(
 
 $ErrorActionPreference = "Stop"
 
-# ── Help ─────────────────────────────────────────────────────────────
+# -- Help -------------------------------------------------------------
 if ($Help) {
     Write-Host @"
-install.ps1 — Install octos from pre-built binaries on Windows.
+install.ps1 - Install octos from pre-built binaries on Windows.
 
 USAGE
   Piped:     irm https://github.com/octos-org/octos/releases/latest/download/install.ps1 | iex
@@ -109,7 +109,7 @@ ENVIRONMENT VARIABLES
     exit 0
 }
 
-# ── Defaults ──────────────────────────────────────────────────────────
+# -- Defaults ----------------------------------------------------------
 $GithubRepo = "octos-org/octos"
 
 if (-not $Version)   { $Version = if ($env:OCTOS_VERSION) { $env:OCTOS_VERSION } else { "latest" } }
@@ -117,7 +117,7 @@ if (-not $Prefix)    { $Prefix  = if ($env:OCTOS_PREFIX)  { $env:OCTOS_PREFIX } 
 
 $DataDir = if ($env:OCTOS_HOME) { $env:OCTOS_HOME } else { Join-Path $HOME ".octos" }
 
-# ── Tunnel defaults ──────────────────────────────────────────────────
+# -- Tunnel defaults --------------------------------------------------
 $FrpcVersion = "0.65.0"
 if (-not $FrpsServer)   { $FrpsServer   = "163.192.33.32" }
 if ($SshPort -eq 0)     { $SshPort      = 6001 }
@@ -141,7 +141,7 @@ $FrpcBin    = Join-Path $Prefix "frpc.exe"
 $FrpcConfig = Join-Path $DataDir "frpc.toml"
 $FrpcLog    = Join-Path $DataDir "logs\frpc.log"
 
-# ── Helpers ───────────────────────────────────────────────────────────
+# -- Helpers -----------------------------------------------------------
 # (Validate-Inputs is called after helper definitions below)
 function Section($msg) { Write-Host "`n==> $msg" }
 function Ok($msg)      { Write-Host "    OK: $msg" }
@@ -209,7 +209,7 @@ function Get-WindowsArchitecture() {
     return [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString().ToUpperInvariant()
 }
 
-# ── frpc tunnel helpers ──────────────────────────────────────────────
+# -- frpc tunnel helpers ----------------------------------------------
 
 # Write frpc.toml to $DataDir\frpc.toml.
 function Write-FrpcConfig {
@@ -313,7 +313,7 @@ function Invoke-TunnelPrompts {
 
     if (-not $script:TenantName) {
         Write-Host "    Enter the tenant subdomain (e.g. 'alice' for alice.${TunnelDomain}):"
-        Write-Host "    (press Enter to use placeholder — you can update later)"
+        Write-Host "    (press Enter to use placeholder - you can update later)"
         $userInput = Read-Host "    > "
         if ($userInput) {
             $script:TenantName = $userInput
@@ -341,7 +341,7 @@ function Invoke-TunnelPrompts {
         } else {
             $script:FrpsToken = "CHANGE_ME"
             $script:TokenPlaceholder = $true
-            Warn "Using placeholder token — frpc will not connect until updated"
+            Warn "Using placeholder token - frpc will not connect until updated"
         }
     }
 
@@ -374,12 +374,12 @@ function Invoke-TunnelPrompts {
     Read-Host "    Press Enter to continue, or Ctrl+C to abort"
 }
 
-# ── Validate inputs ──────────────────────────────────────────────────
+# -- Validate inputs --------------------------------------------------
 Validate-Inputs
 
-# ══════════════════════════════════════════════════════════════════════
-# ── Tunnel-only update (when octos is already installed) ─────────────
-# ══════════════════════════════════════════════════════════════════════
+# ======================================================================
+# -- Tunnel-only update (when octos is already installed) -------------
+# ======================================================================
 # If octos binary exists and tunnel is explicitly enabled,
 # skip the full install and just update the tunnel configuration.
 
@@ -402,7 +402,7 @@ if ((Test-Path $octosBinCheck) -and $Tunnel) {
             }
         }
         # Per-tenant tunnel token lives in metadatas.token (auth.token is
-        # intentionally empty — see tenant-frpc.toml.template).
+        # intentionally empty - see tenant-frpc.toml.template).
         if (-not $FrpsToken -and $existingConfig -match 'metadatas\.token\s*=\s*"([^"]+)"') {
             $FrpsToken = $Matches[1]
             Ok "per-tenant tunnel token from existing config: $($FrpsToken.Substring(0, [Math]::Min(8, $FrpsToken.Length)))..."
@@ -457,9 +457,9 @@ if ((Test-Path $octosBinCheck) -and $Tunnel) {
     exit 0
 }
 
-# ══════════════════════════════════════════════════════════════════════
-# ── Doctor mode ──────────────────────────────────────────────────────
-# ══════════════════════════════════════════════════════════════════════
+# ======================================================================
+# -- Doctor mode ------------------------------------------------------
+# ======================================================================
 if ($Doctor) {
     $script:DoctorIssues = 0
 
@@ -474,7 +474,7 @@ if ($Doctor) {
         }
     }
 
-    # ── Binary ───────────────────────────────────────────────────────
+    # -- Binary -------------------------------------------------------
     Section "octos binary"
 
     $OctosBin = Join-Path $Prefix "octos.exe"
@@ -498,7 +498,7 @@ if ($Doctor) {
         }
     }
 
-    # ── Data directory ───────────────────────────────────────────────
+    # -- Data directory -----------------------------------------------
     Section "Data directory"
 
     if (Test-Path $DataDir) {
@@ -515,7 +515,7 @@ if ($Doctor) {
         Hint "Run: octos init --defaults"
     }
 
-    # ── octos serve process ──────────────────────────────────────────
+    # -- octos serve process ------------------------------------------
     Section "octos serve"
 
     $octosProc = Get-Process -Name "octos" -ErrorAction SilentlyContinue |
@@ -528,7 +528,7 @@ if ($Doctor) {
         Hint "Start: Start-ScheduledTask -TaskName OctosServe"
     }
 
-    # ── Port check ───────────────────────────────────────────────────
+    # -- Port check ---------------------------------------------------
     Section "Port $Port"
 
     $listener = Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue |
@@ -551,7 +551,7 @@ if ($Doctor) {
         }
     }
 
-    # ── Admin portal ─────────────────────────────────────────────────
+    # -- Admin portal -------------------------------------------------
     Section "Admin portal"
 
     try {
@@ -572,7 +572,7 @@ if ($Doctor) {
         }
     }
 
-    # ── PATH ─────────────────────────────────────────────────────────
+    # -- PATH ---------------------------------------------------------
     Section "PATH configuration"
 
     $userPath = [Environment]::GetEnvironmentVariable("Path", "User")
@@ -583,7 +583,7 @@ if ($Doctor) {
         Hint "Add it: [Environment]::SetEnvironmentVariable('Path', '$Prefix;' + [Environment]::GetEnvironmentVariable('Path', 'User'), 'User')"
     }
 
-    # ── Runtime dependencies ─────────────────────────────────────────
+    # -- Runtime dependencies -----------------------------------------
     Section "Runtime dependencies"
 
     if (Test-Command "git") {
@@ -628,7 +628,7 @@ if ($Doctor) {
     }
     if (-not $chromeFound) { Warn "Chrome/Chromium not found (optional)"; Hint (Get-PkgHint "chromium") }
 
-    # ── Service configuration ────────────────────────────────────────
+    # -- Service configuration ----------------------------------------
     Section "Service configuration"
 
     $task = Get-ScheduledTask -TaskName "OctosServe" -ErrorAction SilentlyContinue
@@ -654,7 +654,7 @@ if ($Doctor) {
         Hint "Re-run install.ps1 to create it"
     }
 
-    # ── Recent serve logs ────────────────────────────────────────────
+    # -- Recent serve logs --------------------------------------------
     Section "Recent serve logs"
 
     $serveLog = Join-Path $DataDir "serve.log"
@@ -673,7 +673,7 @@ if ($Doctor) {
         Hint "octos serve may not have started yet"
     }
 
-    # ── frpc tunnel (only if tunnel was ever configured) ─────────────
+    # -- frpc tunnel (only if tunnel was ever configured) -------------
     $FrpcBinDoc = Join-Path $Prefix "frpc.exe"
     $FrpcConfigDoc = Join-Path $DataDir "frpc.toml"
     $FrpcLogDoc = Join-Path $DataDir "logs\frpc.log"
@@ -741,7 +741,7 @@ if ($Doctor) {
             }
         }
 
-        # ── Remote access ───────────────────────────────────────────
+        # -- Remote access -------------------------------------------
         Section "Remote access"
 
         $adminOk = $false
@@ -765,16 +765,16 @@ if ($Doctor) {
                 Err "admin portal works locally but frpc service is NOT registered"
                 Hint "Re-run: .\install.ps1 -Tunnel -TenantName <name> -FrpsToken <token>"
             } else {
-                Err "admin portal works locally but frpc is NOT running — remote access is down"
+                Err "admin portal works locally but frpc is NOT running - remote access is down"
                 Hint "Start-Service frpc"
             }
         } elseif (-not $adminOk) {
-            Err "admin portal is not responding locally — fix octos serve first (see above)"
+            Err "admin portal is not responding locally - fix octos serve first (see above)"
             Hint "Remote access depends on the local server working first"
         }
     }
 
-    # ── Summary ──────────────────────────────────────────────────────
+    # -- Summary ------------------------------------------------------
     Section "Summary"
     if ($script:DoctorIssues -eq 0) {
         Write-Host "    All checks passed. Everything looks healthy."
@@ -785,9 +785,9 @@ if ($Doctor) {
     exit 0
 }
 
-# ══════════════════════════════════════════════════════════════════════
-# ── Uninstall mode ───────────────────────────────────────────────────
-# ══════════════════════════════════════════════════════════════════════
+# ======================================================================
+# -- Uninstall mode ---------------------------------------------------
+# ======================================================================
 if ($Uninstall) {
     Section "Uninstalling octos"
 
@@ -860,11 +860,11 @@ if ($Uninstall) {
     exit 0
 }
 
-# ══════════════════════════════════════════════════════════════════════
-# ── Install mode (default) ───────────────────────────────────────────
-# ══════════════════════════════════════════════════════════════════════
+# ======================================================================
+# -- Install mode (default) -------------------------------------------
+# ======================================================================
 
-# ── Detect platform ──────────────────────────────────────────────────
+# -- Detect platform --------------------------------------------------
 Section "Detecting platform"
 
 $arch = Get-WindowsArchitecture
@@ -887,7 +887,7 @@ switch ($arch) {
     }
 }
 
-# ── Auto-install helper ──────────────────────────────────────────────
+# -- Auto-install helper ----------------------------------------------
 function Install-Dep($name, $testCmd, $installBlock) {
     if (Test-Command $testCmd) { return $true }
     if (-not $InstallDeps) { return $false }
@@ -895,7 +895,7 @@ function Install-Dep($name, $testCmd, $installBlock) {
     try { & $installBlock; return $true } catch { Warn "Failed to install ${name}: $_"; return $false }
 }
 
-# ── Check/install runtime dependencies ───────────────────────────────
+# -- Check/install runtime dependencies -------------------------------
 Section "Runtime dependencies$(if ($InstallDeps) { ' (auto-install)' })"
 
 # git
@@ -1015,7 +1015,7 @@ if (Test-Command "caddy") {
     Warn "Caddy not found (needed for HTTPS with -Domain)"
 }
 
-# ── Resolve download source ──────────────────────────────────────────
+# -- Resolve download source ------------------------------------------
 Section "Resolving release"
 
 $Zipfile = "octos-bundle-${Triple}.zip"
@@ -1053,7 +1053,7 @@ if ($DownloadBase) {
     Ok "version: $Version"
 }
 
-# ── Download and install octos ────────────────────────────────────────
+# -- Download and install octos ----------------------------------------
 Section "Installing octos"
 
 $installTmp = Join-Path ([System.IO.Path]::GetTempPath()) "octos-install-$([System.Guid]::NewGuid().ToString('N').Substring(0,8))"
@@ -1121,7 +1121,7 @@ if (Test-Path (Join-Path $Prefix "install.ps1")) {
     Warn "could not save install script to $Prefix"
 }
 
-# ── Add to PATH ───────────────────────────────────────────────────────
+# -- Add to PATH -------------------------------------------------------
 $userPath = [Environment]::GetEnvironmentVariable("Path", "User")
 if (-not ($userPath -split ";" | Where-Object { $_ -eq $Prefix })) {
     [Environment]::SetEnvironmentVariable("Path", "$Prefix;$userPath", "User")
@@ -1133,7 +1133,7 @@ if (-not ($userPath -split ";" | Where-Object { $_ -eq $Prefix })) {
     Ok "$Prefix already in PATH"
 }
 
-# ── Initialize octos workspace ────────────────────────────────────────
+# -- Initialize octos workspace ----------------------------------------
 Section "Initializing octos"
 
 $env:OCTOS_HOME = $DataDir
@@ -1170,7 +1170,7 @@ foreach ($d in $subdirs) {
     }
 }
 
-# Bootstrap config.json — auto-detect provider from available API keys
+# Bootstrap config.json - auto-detect provider from available API keys
 $configPath = Join-Path $DataDir "config.json"
 if (-not (Test-Path $configPath)) {
     if ($env:OPENAI_API_KEY)     { $_prov = "openai";    $_model = "gpt-4.1-mini";            $_env = "OPENAI_API_KEY" }
@@ -1239,7 +1239,7 @@ if (-not (Test-Path $userPath2)) {
 
 Ok "data directory: $DataDir"
 
-# ── Generate auth token ──────────────────────────────────────────────
+# -- Generate auth token ----------------------------------------------
 if (-not $AuthToken) { $AuthToken = if ($env:OCTOS_AUTH_TOKEN) { $env:OCTOS_AUTH_TOKEN } else { "" } }
 if (-not $AuthToken) {
     # Generate 32-byte hex token
@@ -1248,7 +1248,7 @@ if (-not $AuthToken) {
     $AuthToken = ($bytes | ForEach-Object { $_.ToString("x2") }) -join ""
 }
 
-# ── Set up octos serve as scheduled task ─────────────────────────────
+# -- Set up octos serve as scheduled task -----------------------------
 Section "Setting up octos serve"
 
 $serveLog = Join-Path $DataDir "serve.log"
@@ -1306,7 +1306,7 @@ Ok "registered scheduled task: $taskName"
 Start-ScheduledTask -TaskName $taskName
 Ok "octos serve starting"
 
-# ── Verify octos serve ───────────────────────────────────────────────
+# -- Verify octos serve -----------------------------------------------
 Section "Verifying octos serve"
 
 $retries = 10
@@ -1326,7 +1326,7 @@ if ($retries -eq 0) {
     Write-Host "    Check logs: Get-Content '$serveLog' -Tail 20"
 }
 
-# ── Firewall (Caddy only) ─────────────────────────────────────────────
+# -- Firewall (Caddy only) ---------------------------------------------
 if ($Domain) {
     Section "Configuring firewall for Caddy"
     Write-Host "    Running: netsh advfirewall firewall add rule name=`"octos-caddy`" dir=in action=allow protocol=TCP localport=80,443"
@@ -1340,7 +1340,7 @@ if ($Domain) {
     }
 }
 
-# ── Caddy setup (HTTPS) ─────────────────────────────────────────────
+# -- Caddy setup (HTTPS) ---------------------------------------------
 if ($Domain -and (Test-Command "caddy")) {
     Section "Configuring Caddy for $Domain"
     $caddyfile = Join-Path $DataDir "Caddyfile"
@@ -1359,7 +1359,7 @@ if ($Domain -and (Test-Command "caddy")) {
 :9999 {
     # On-demand TLS gate. Only the configured apex or exactly one
     # label before it (matching the *.$Domain route below) may
-    # trigger ACME issuance — any other SNI returns 403 so Caddy
+    # trigger ACME issuance - any other SNI returns 403 so Caddy
     # refuses to ask Let's Encrypt for a cert. Deeper names like
     # a.b.$Domain are NOT routed and must not consume the
     # configured domain's ACME rate limit. This is the security
@@ -1435,7 +1435,7 @@ https:// {
     if ($LASTEXITCODE -eq 0) {
         Ok "Caddyfile is valid"
     } else {
-        Warn "Caddyfile validation failed — check $caddyfile"
+        Warn "Caddyfile validation failed - check $caddyfile"
     }
 
     # Register Caddy as scheduled task
@@ -1458,7 +1458,7 @@ https:// {
     Ok "Caddy configured for $Domain (HTTPS auto-provisioned)"
 }
 
-# ── Tunnel setup (frpc) ──────────────────────────────────────────────
+# -- Tunnel setup (frpc) ----------------------------------------------
 if ($Tunnel) {
     Section "Tunnel setup"
 
@@ -1487,7 +1487,7 @@ if ($Tunnel) {
         Write-Host "    Check logs: Get-Content '$FrpcLog' -Tail 20"
     }
 
-    # `/api/status` was retired in M12 Phase D-5 — probe the public `/health`
+    # `/api/status` was retired in M12 Phase D-5 - probe the public `/health`
     # endpoint as a daemon liveness check instead.
     try {
         $resp = Invoke-WebRequest -Uri "http://localhost:${Port}/health" -UseBasicParsing -TimeoutSec 3 -ErrorAction Stop
@@ -1497,7 +1497,7 @@ if ($Tunnel) {
     }
 }
 
-# ── Summary ───────────────────────────────────────────────────────────
+# -- Summary -----------------------------------------------------------
 Section "Installation complete!"
 Write-Host ""
 Write-Host "    Binary:     $octosBin"
