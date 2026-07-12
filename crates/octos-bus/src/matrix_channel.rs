@@ -566,7 +566,10 @@ struct RoomMemberCounts {
 
 impl RoomMemberCounts {
     /// Sentinel for "membership unknown": fails every `<= 1` check closed.
-    const UNKNOWN: Self = Self { humans: usize::MAX, managed_bots: usize::MAX };
+    const UNKNOWN: Self = Self {
+        humans: usize::MAX,
+        managed_bots: usize::MAX,
+    };
 
     /// A true 1:1 DM: at most one human talking to at most one child bot.
     fn is_direct_chat(self) -> bool {
@@ -620,7 +623,10 @@ fn count_room_members(
         return RoomMemberCounts::UNKNOWN;
     };
 
-    let mut counts = RoomMemberCounts { humans: 0, managed_bots: 0 };
+    let mut counts = RoomMemberCounts {
+        humans: 0,
+        managed_bots: 0,
+    };
     for user_id in members.keys() {
         if !is_managed_user(user_id, bot_user_id, server_suffix, user_prefix) {
             counts.humans += 1;
@@ -3751,4 +3757,4 @@ impl std::fmt::Display for MatrixEventId {
 
 #[cfg(test)]
 #[path = "matrix_channel_tests.rs"]
-mod tests;
+mod tests; (style: rustfmt matrix_channel)
