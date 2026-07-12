@@ -86,6 +86,14 @@ impl ConfigCommand {
 /// the file directly). Kept as a pure function so it stays trivially testable.
 fn overview(path: &Path) -> String {
     let path = path.display();
+    // `serve` is only compiled with the `api` feature, so a `cli.serve` block is
+    // inert in a non-api build — list only the commands actually available so we
+    // don't point operators at ineffective config (codex).
+    let layered = if cfg!(feature = "api") {
+        "serve/gateway/chat"
+    } else {
+        "gateway/chat"
+    };
     format!(
         "octos config — inspect the saved startup config (read-only).\n\
          \n\
@@ -97,7 +105,7 @@ fn overview(path: &Path) -> String {
          \n\
          To change settings, edit {path} directly (or run `octos init` for a\n\
          provider quickstart). The `cli.<cmd>` block sets startup defaults for\n\
-         serve/gateway/chat; an explicit CLI flag or env var still wins.\n"
+         {layered}; an explicit CLI flag or env var still wins.\n"
     )
 }
 
