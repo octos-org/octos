@@ -27963,7 +27963,11 @@ mod tests {
         // Key-env comes from the registry, not a hand-maintained env map.
         assert_eq!(families["zai"]["env"], "ZAI_API_KEY");
         // Curation: glm-5.2 + kimi-k2.6 present; deepseek-chat removed.
-        assert!(ids("zai").contains(&"glm-5.2".to_owned()), "{:?}", ids("zai"));
+        assert!(
+            ids("zai").contains(&"glm-5.2".to_owned()),
+            "{:?}",
+            ids("zai")
+        );
         assert!(
             ids("moonshot").contains(&"kimi-k2.6".to_owned()),
             "{:?}",
