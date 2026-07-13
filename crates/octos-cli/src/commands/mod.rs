@@ -144,6 +144,26 @@ pub enum Command {
     Office(OfficeCommand),
 }
 
+/// Whether `command` emits machine-readable output on stdout and therefore
+/// needs the tracing console layer routed to stderr so logs never corrupt that
+/// stream.
+///
+/// * `acp` speaks ACP JSON-RPC on stdout (one stray log line → a `-32700`
+///   parse error at strict clients like Zed);
+/// * `mcp-serve --transport stdio` speaks MCP JSON-RPC on stdout;
+/// * `profile` emits payloads meant for `$(...)` capture / piping;
+/// * `chat --json` emits a single JSON result object on stdout (scripting /
+///   agent-to-agent).
+///
+/// Every other command keeps its historical stdout console routing untouched.
+pub fn reserve_stdout(command: &Command) -> bool {
+    match command {
+        Command::Acp(_) | Command::Profile(_) | Command::McpServe(_) => true,
+        Command::Chat(cmd) => cmd.json,
+        _ => false,
+    }
+}
+
 /// Trait for executable commands (following dora-rs pattern).
 pub trait Executable {
     fn execute(self) -> Result<()>;
@@ -349,5 +369,46 @@ impl Executable for Command {
             Self::Completions(cmd) => cmd.execute(),
             Self::Office(cmd) => cmd.execute(),
         }
+    }
+}
+
+#[cfg(test)]
+mod reserve_stdout_tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn should_reserve_stdout_when_chat_json_set() {
+        // `octos chat --json` opts into a pure-stdout JSON result stream, so
+        // its tracing logs must route to stderr.
+        let args = Args::try_parse_from(["octos", "chat", "--json", "--message", "hi"])
+            .expect("`chat --json` must parse");
+        assert!(reserve_stdout(&args.command));
+    }
+
+    #[test]
+    fn should_not_reserve_stdout_when_chat_lacks_json() {
+        // Plain `octos chat` keeps its historical stdout console routing.
+        let args =
+            Args::try_parse_from(["octos", "chat", "--message", "hi"]).expect("`chat` must parse");
+        assert!(!reserve_stdout(&args.command));
+    }
+
+    #[test]
+    fn should_not_reserve_stdout_for_ordinary_command() {
+        // A non-protocol command (e.g. `status`) is unchanged by the chat-json
+        // extension — Serve, Status, etc. never reserve stdout.
+        let args = Args::try_parse_from(["octos", "status"]).expect("`status` must parse");
+        assert!(!reserve_stdout(&args.command));
+    }
+
+    #[test]
+    fn should_reserve_stdout_for_stdio_protocol_commands() {
+        // Pre-existing reservations must remain: acp / mcp-serve speak a
+        // machine protocol on stdout.
+        let acp = Args::try_parse_from(["octos", "acp"]).expect("`acp` must parse");
+        assert!(reserve_stdout(&acp.command));
+        let mcp = Args::try_parse_from(["octos", "mcp-serve"]).expect("`mcp-serve` must parse");
+        assert!(reserve_stdout(&mcp.command));
     }
 }
