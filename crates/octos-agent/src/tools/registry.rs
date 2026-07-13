@@ -663,7 +663,7 @@ impl ToolRegistry {
         // dispatcher targets), provider-policy denials, and context-filter
         // misses. There is no longer any recency-based (LRU) deferral nor an
         // `activate_tools` meta-tool description to inject.
-        let specs: Vec<ToolSpec> = self
+        let mut specs: Vec<ToolSpec> = self
             .tools
             .values()
             // RFC-1 fixup (codex P1): exclude internal-hidden tools from
@@ -689,6 +689,15 @@ impl ToolRegistry {
                 input_schema: t.input_schema(),
             })
             .collect();
+
+        // Deterministic order: `self.tools` is a HashMap, so `.values()`
+        // iteration order varies per process and per registry rebuild.
+        // Providers replay this array verbatim into the LLM prompt prefix, so
+        // a shuffled order made requests nondeterministic AND busted
+        // provider-side prompt caches (the tool array is the first segment of
+        // the cached prefix — e.g. Anthropic `cache_control`) on every
+        // rebuild. Sort by name so identical tool sets serialize identically.
+        specs.sort_by(|a, b| a.name.cmp(&b.name));
 
         *cache = Some(specs.clone());
         specs
@@ -2554,25 +2563,28 @@ mod profile_filter_tests {
     }
 
     #[test]
-    fn coding_profile_produces_same_registry_as_default_builtins() {
-        // Behaviour parity gate: applying the built-in `coding` profile
-        // to a builtin registry must leave the registry IDENTICAL to
-        // what today's no-flag default path produces. This is the
-        // critical regression guard called out in the M8.3 issue.
+    fn coding_full_profile_produces_same_registry_as_default_builtins() {
+        // Behaviour parity gate: applying the built-in `coding-full`
+        // profile to a builtin registry must leave the registry IDENTICAL
+        // to what the no-flag default path produced before the lean
+        // `coding` default landed. This is the critical regression guard
+        // called out in the M8.3 issue, retargeted at the unfiltered
+        // escape hatch now that `coding` itself carries an allow list
+        // (see `crate::profile::tests` for the lean-narrowing pins).
         use crate::profile::ProfileDefinition;
 
         let dir = tempfile::tempdir().expect("tempdir");
         let reference = ToolRegistry::with_builtins(dir.path());
         let reference_names = builtin_names(&reference);
 
-        let coding = ProfileDefinition::builtin("coding").expect("coding builtin");
+        let full = ProfileDefinition::builtin("coding-full").expect("coding-full builtin");
         let mut profiled = ToolRegistry::with_builtins(dir.path());
-        coding.apply_to_registry(&mut profiled);
+        full.apply_to_registry(&mut profiled);
 
         let profiled_names = builtin_names(&profiled);
         assert_eq!(
             reference_names, profiled_names,
-            "coding profile must preserve behaviour parity with the default path",
+            "coding-full profile must preserve behaviour parity with the default path",
         );
     }
 
@@ -3130,6 +3142,81 @@ mod profile_filter_tests {
                 .iter()
                 .map(|e| &e.content_type)
                 .collect::<Vec<_>>()
+        );
+    }
+}
+
+#[cfg(test)]
+mod spec_order_tests {
+    //! `specs()` order determinism: providers replay the tool array verbatim
+    //! into the LLM prompt prefix, so a shuffled order both busts
+    //! provider-side prompt caches (Anthropic `cache_control` breakpoints
+    //! cache the tools+system prefix) and makes requests nondeterministic
+    //! across registry rebuilds. `specs()` must emit tools sorted by name.
+
+    use super::super::{Tool, ToolResult};
+    use super::*;
+    use async_trait::async_trait;
+    use eyre::Result;
+    use serde_json::Value;
+
+    struct NamedTool {
+        name: String,
+    }
+
+    #[async_trait]
+    impl Tool for NamedTool {
+        fn name(&self) -> &str {
+            &self.name
+        }
+        fn description(&self) -> &str {
+            "test-only"
+        }
+        fn input_schema(&self) -> Value {
+            serde_json::json!({"type": "object"})
+        }
+        async fn execute(&self, _args: &Value) -> Result<ToolResult> {
+            Ok(ToolResult {
+                output: String::new(),
+                success: true,
+                ..Default::default()
+            })
+        }
+    }
+
+    fn registry_with(names: &[&str]) -> ToolRegistry {
+        let mut registry = ToolRegistry::new();
+        for name in names {
+            registry.register(NamedTool {
+                name: (*name).to_string(),
+            });
+        }
+        registry
+    }
+
+    #[test]
+    fn specs_are_sorted_by_name_and_deterministic_across_rebuilds() {
+        let names = [
+            "zeta", "alpha", "mid", "beta", "omega", "kappa", "gamma", "delta",
+        ];
+        let mut reversed = names;
+        reversed.reverse();
+
+        let a = registry_with(&names);
+        let b = registry_with(&reversed);
+
+        let a_names: Vec<String> = a.specs().iter().map(|s| s.name.clone()).collect();
+        let b_names: Vec<String> = b.specs().iter().map(|s| s.name.clone()).collect();
+
+        let mut sorted = a_names.clone();
+        sorted.sort();
+        assert_eq!(
+            a_names, sorted,
+            "specs() must emit tools sorted by name (HashMap order is nondeterministic)"
+        );
+        assert_eq!(
+            a_names, b_names,
+            "two registries with the same tools must serialize identically"
         );
     }
 }

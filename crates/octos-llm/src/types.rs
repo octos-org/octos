@@ -71,8 +71,19 @@ pub enum StopReason {
 }
 
 /// Token usage statistics.
+///
+/// Cache accounting contract: `cache_read_tokens` / `cache_write_tokens`
+/// are DISJOINT from `input_tokens` (Anthropic-style) — the total prompt is
+/// `input + cache_read + cache_write`. Anthropic reports this natively;
+/// providers whose wire format counts cached tokens INSIDE the prompt total
+/// (OpenAI `prompt_tokens_details.cached_tokens`, Gemini
+/// `cachedContentTokenCount`) are normalized at their parse boundary by
+/// subtracting the cached share from `input_tokens`. Consumers summing
+/// "everything processed" must add all three; never re-add cache counts to
+/// an inclusive total.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TokenUsage {
+    /// Non-cached prompt tokens billed at the full input rate.
     pub input_tokens: u32,
     pub output_tokens: u32,
     /// Tokens used for internal chain-of-thought (o1/o3, Claude thinking, Gemini thinking).

@@ -4258,7 +4258,7 @@ dependencies = [
 
 [[package]]
 name = "octos-agent"
-version = "1.1.0"
+version = "2.0.1"
 dependencies = [
  "async-trait",
  "base64",
@@ -4317,7 +4317,7 @@ dependencies = [
 
 [[package]]
 name = "octos-bus"
-version = "1.1.0"
+version = "2.0.1"
 dependencies = [
  "aes",
  "async-imap",
@@ -4359,7 +4359,7 @@ dependencies = [
 
 [[package]]
 name = "octos-cli"
-version = "1.1.0"
+version = "2.0.1"
 dependencies = [
  "agent-client-protocol",
  "argon2",
@@ -4432,7 +4432,7 @@ dependencies = [
 
 [[package]]
 name = "octos-core"
-version = "1.1.0"
+version = "2.0.1"
 dependencies = [
  "chrono",
  "eyre",
@@ -4447,7 +4447,7 @@ dependencies = [
 
 [[package]]
 name = "octos-diagnostics"
-version = "1.1.0"
+version = "2.0.1"
 dependencies = [
  "eyre",
  "octos-core",
@@ -4459,14 +4459,14 @@ dependencies = [
 
 [[package]]
 name = "octos-dora-mcp"
-version = "1.1.0"
+version = "2.0.1"
 dependencies = [
  "octos-agent",
 ]
 
 [[package]]
 name = "octos-llm"
-version = "1.1.0"
+version = "2.0.1"
 dependencies = [
  "async-trait",
  "base64",
@@ -4490,7 +4490,7 @@ dependencies = [
 
 [[package]]
 name = "octos-memory"
-version = "1.1.0"
+version = "2.0.1"
 dependencies = [
  "bincode",
  "chrono",
@@ -4510,7 +4510,7 @@ dependencies = [
 
 [[package]]
 name = "octos-pipeline"
-version = "1.1.0"
+version = "2.0.1"
 dependencies = [
  "async-trait",
  "chrono",
@@ -4534,7 +4534,7 @@ dependencies = [
 
 [[package]]
 name = "octos-plugin"
-version = "1.1.0"
+version = "2.0.1"
 dependencies = [
  "eyre",
  "metrics",
@@ -4563,7 +4563,7 @@ dependencies = [
 
 [[package]]
 name = "octos-swarm"
-version = "1.1.0"
+version = "2.0.1"
 dependencies = [
  "async-trait",
  "chrono",
@@ -7650,7 +7650,7 @@ dependencies = [
 
 [[package]]
 name = "wechat-bridge"
-version = "1.1.0"
+version = "2.0.1"
 dependencies = [
  "clap",
  "futures-util",

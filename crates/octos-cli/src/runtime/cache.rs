@@ -103,6 +103,13 @@ pub struct SessionRuntimeCache {
     /// (holding the old `ProfileRuntime`) must not insert its stale runtime
     /// after the sweep — it serves its own caller uncached instead.
     generations: Arc<std::sync::Mutex<HashMap<String, u64>>>,
+    /// Per-SESSION invalidation generation. Bumped by
+    /// [`Self::invalidate_session`] on a permission change; a bootstrap that
+    /// STARTED before the bump (holding the pre-change permissions) must not
+    /// insert its now-stale runtime after the sweep. Session-scoped rather
+    /// than profile-scoped because a permission change targets one session
+    /// but its runtime may be cached under any of several profile ids.
+    session_generations: Arc<std::sync::Mutex<HashMap<SessionKey, u64>>>,
     max_size: usize,
     idle_ttl: Duration,
     /// Cancellation signal for the background sweep task. Notified
@@ -222,6 +229,7 @@ impl SessionRuntimeCache {
             inner,
             inflight: Arc::new(std::sync::Mutex::new(HashMap::new())),
             generations: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            session_generations: Arc::new(std::sync::Mutex::new(HashMap::new())),
             max_size,
             idle_ttl,
             shutdown,
@@ -263,11 +271,15 @@ impl SessionRuntimeCache {
         session_key: SessionKey,
         workspace_hint: Option<PathBuf>,
     ) -> Result<Arc<SessionRuntime>> {
+        // Fixed workspace-write default (no mutable-store resolution to race
+        // against): sampling the epoch here is correct.
+        let permissions_epoch = self.session_generation(&session_key);
         self.get_or_init_with_permissions(
             profile,
             session_key,
             workspace_hint,
             EffectivePermissions::workspace_write(),
+            permissions_epoch,
         )
         .await
     }
@@ -282,6 +294,13 @@ impl SessionRuntimeCache {
         session_key: SessionKey,
         workspace_hint: Option<PathBuf>,
         permissions: EffectivePermissions,
+        // Epoch captured by the caller BEFORE it resolved `permissions` — see
+        // `get_or_init_with_permissions_and_sandbox`. REQUIRED (not
+        // self-sampled) so every permission-bearing call site is forced to
+        // pair its snapshot with the pre-resolution epoch; a self-sample here
+        // could pair a post-downgrade epoch with pre-downgrade permissions on
+        // a preempted multi-threaded caller (codex P1 round 4 on #1639).
+        permissions_epoch: u64,
     ) -> Result<Arc<SessionRuntime>> {
         self.get_or_init_with_permissions_and_sandbox(
             profile,
@@ -289,6 +308,7 @@ impl SessionRuntimeCache {
             workspace_hint,
             permissions,
             None,
+            permissions_epoch,
         )
         .await
     }
@@ -304,6 +324,14 @@ impl SessionRuntimeCache {
         workspace_hint: Option<PathBuf>,
         permissions: EffectivePermissions,
         sandbox_override: Option<SandboxConfig>,
+        // Session-generation epoch captured by the CALLER at (or before) the
+        // moment it resolved `permissions` — NOT re-sampled here. A bootstrap
+        // that waits on an in-flight slot and then claims its own must reject
+        // its insert if an `invalidate_session` bumped the generation any time
+        // after the permissions were resolved, or it would re-cache the
+        // pre-change (possibly dangerous) policy after a downgrade (codex P1
+        // round 3 on #1639).
+        permissions_epoch: u64,
     ) -> Result<Arc<SessionRuntime>> {
         let key = (profile.profile_id.clone(), session_key.clone());
 
@@ -385,6 +413,9 @@ impl SessionRuntimeCache {
                 }
                 InflightOutcome::OwnGuard(guard) => {
                     let generation_at_start = self.profile_generation(&key.0);
+                    // Caller-supplied epoch (tied to the permission snapshot),
+                    // not a post-wait re-sample — see the param doc.
+                    let session_generation_at_start = permissions_epoch;
                     let result = SessionRuntime::bootstrap_with_permissions_and_sandbox(
                         profile,
                         session_key.clone(),
@@ -410,7 +441,12 @@ impl SessionRuntimeCache {
                             // than a "one bootstrap per inflight
                             // era" invariant.
                             let canonical = self
-                                .insert_with_eviction(key.clone(), runtime, generation_at_start)
+                                .insert_with_eviction(
+                                    key.clone(),
+                                    runtime,
+                                    generation_at_start,
+                                    session_generation_at_start,
+                                )
                                 .await;
                             drop(guard);
                             return Ok(canonical);
@@ -445,14 +481,18 @@ impl SessionRuntimeCache {
         key: CacheKey,
         runtime: Arc<SessionRuntime>,
         generation_at_start: u64,
+        session_generation_at_start: u64,
     ) -> Arc<SessionRuntime> {
         let mut guard = self.inner.write().await;
-        // Re-check the profile generation UNDER the map lock: the sweep in
-        // `invalidate_profile` serializes on this same lock and its bump
-        // happens-before its sweep, so either we observe the bump here (and
-        // skip caching the stale runtime) or our insert lands first and the
-        // sweep removes it — a stale runtime can never survive a switch.
-        if self.profile_generation(&key.0) != generation_at_start {
+        // Re-check BOTH generations UNDER the map lock: each sweep
+        // (`invalidate_profile` / `invalidate_session`) serializes on this
+        // same lock and its bump happens-before its sweep, so either we
+        // observe the bump here (and skip caching the stale runtime) or our
+        // insert lands first and the sweep removes it — a stale runtime can
+        // never survive a profile switch OR a permission change.
+        if self.profile_generation(&key.0) != generation_at_start
+            || self.session_generation(&key.1) != session_generation_at_start
+        {
             return runtime;
         }
 
@@ -528,6 +568,33 @@ impl SessionRuntimeCache {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .get(profile_id)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// Drop every cached runtime for `session_key` REGARDLESS of profile, and
+    /// bump its session generation so an in-flight bootstrap (started before
+    /// this call, holding pre-change permissions) skips caching at insert.
+    /// Used on a permission change (`permission/profile/set`): the runtime
+    /// embeds the old sandbox/network policy, and the connection may not know
+    /// which profile id the session was opened under (codex P1 ×2 on #1639).
+    pub async fn invalidate_session(&self, session_key: &SessionKey) {
+        {
+            let mut generations = self
+                .session_generations
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            *generations.entry(session_key.clone()).or_insert(0) += 1;
+        }
+        let mut guard = self.inner.write().await;
+        guard.retain(|(_, key_session), _| key_session != session_key);
+    }
+
+    pub(crate) fn session_generation(&self, session_key: &SessionKey) -> u64 {
+        self.session_generations
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(session_key)
             .copied()
             .unwrap_or(0)
     }
@@ -731,6 +798,128 @@ mod tests {
             1,
             "only the other profile's entry survives"
         );
+    }
+
+    #[tokio::test]
+    async fn invalidate_session_sweeps_the_session_across_profiles() {
+        // A permission change targets ONE session but its runtime may be
+        // cached under any profile id — `invalidate_session` drops every
+        // profile's entry for that session and spares other sessions
+        // (codex P1 ×2 on #1639).
+        let tmp = TempDir::new().unwrap();
+        let profile_a = make_profile(tmp.path().join("profile-a")).await;
+        let mut profile_b = make_profile(tmp.path().join("profile-b")).await;
+        if let Some(profile) = std::sync::Arc::get_mut(&mut profile_b) {
+            profile.profile_id = "other".to_owned();
+        }
+        let shared = SessionKey::new("api", "shared");
+        let spared = SessionKey::new("api", "spared");
+
+        let cache = SessionRuntimeCache::new(8, Duration::from_secs(60));
+        cache
+            .get_or_init(&profile_a, shared.clone(), None)
+            .await
+            .expect("a");
+        cache
+            .get_or_init(&profile_b, shared.clone(), None)
+            .await
+            .expect("b");
+        cache
+            .get_or_init(&profile_a, spared.clone(), None)
+            .await
+            .expect("s");
+        assert_eq!(cache.len().await, 3);
+
+        cache.invalidate_session(&shared).await;
+        assert_eq!(
+            cache.len().await,
+            1,
+            "both profiles' entries for the target session are gone; the other session survives"
+        );
+    }
+
+    #[tokio::test]
+    async fn invalidate_session_mid_bootstrap_skips_the_stale_insert() {
+        // A bootstrap that STARTED before an `invalidate_session` (holding the
+        // pre-change permissions) must not cache its stale runtime after the
+        // bump — the session generation re-check rejects it at insert (codex
+        // P1 in-flight race on #1639).
+        let tmp = TempDir::new().unwrap();
+        let profile = make_profile(tmp.path().join("profile-data")).await;
+        let session = SessionKey::new("api", "inflight-perm");
+
+        let cache = SessionRuntimeCache::new(8, Duration::from_secs(60));
+        // Simulate the race: the invalidate bumps the generation while a
+        // bootstrap is notionally in flight, then that bootstrap tries to
+        // land its runtime with a stale generation snapshot.
+        cache.invalidate_session(&session).await;
+        assert_eq!(
+            cache.session_generation(&session),
+            1,
+            "the invalidate bumped the session generation"
+        );
+
+        // A fresh init AFTER the bump caches normally (its snapshot matches).
+        cache
+            .get_or_init(&profile, session.clone(), None)
+            .await
+            .expect("post-bump init");
+        assert_eq!(
+            cache.len().await,
+            1,
+            "a post-invalidate bootstrap caches normally"
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_permission_epoch_is_rejected_at_insert() {
+        // codex P1 round 3: an epoch captured BEFORE a concurrent
+        // `invalidate_session` must reject the bootstrap's insert even though
+        // the OwnGuard arm no longer re-samples the (now-bumped) generation.
+        // This is the wait-race made deterministic: capture the epoch, bump
+        // it, then run get_or_init with the STALE epoch — nothing caches.
+        let tmp = TempDir::new().unwrap();
+        let profile = make_profile(tmp.path().join("profile-data")).await;
+        let session = SessionKey::new("api", "stale-epoch");
+
+        let cache = SessionRuntimeCache::new(8, Duration::from_secs(60));
+        let stale_epoch = cache.session_generation(&session); // 0
+        cache.invalidate_session(&session).await; // bump -> 1
+
+        let runtime = cache
+            .get_or_init_with_permissions_and_sandbox(
+                &profile,
+                session.clone(),
+                None,
+                EffectivePermissions::workspace_write(),
+                None,
+                stale_epoch,
+            )
+            .await
+            .expect("bootstrap succeeds but must not cache");
+        // The caller still gets a working runtime…
+        assert_eq!(runtime.session_key, session);
+        // …but it was NOT cached (stale epoch rejected at insert).
+        assert_eq!(
+            cache.len().await,
+            0,
+            "a bootstrap carrying a pre-invalidate epoch must not cache"
+        );
+
+        // A fresh call with the CURRENT epoch caches normally.
+        let current_epoch = cache.session_generation(&session);
+        cache
+            .get_or_init_with_permissions_and_sandbox(
+                &profile,
+                session.clone(),
+                None,
+                EffectivePermissions::workspace_write(),
+                None,
+                current_epoch,
+            )
+            .await
+            .expect("current-epoch bootstrap");
+        assert_eq!(cache.len().await, 1, "current epoch caches");
     }
 
     #[tokio::test]
@@ -951,6 +1140,7 @@ mod tests {
                 (profile.profile_id.clone(), key.clone()),
                 redundant,
                 cache.profile_generation(&profile.profile_id),
+                cache.session_generation(&key),
             )
             .await;
         assert!(

@@ -864,12 +864,21 @@ impl SessionPermissionProfileStore {
     }
 
     fn get_state(&self, session_id: &SessionKey) -> StoredSessionPermissionProfile {
+        self.get_state_explicit(session_id).unwrap_or_default()
+    }
+
+    /// The stored selection ONLY if the session made an explicit
+    /// `/permissions` choice — `None` lets the caller apply a configurable
+    /// default (see `effective_session_permission_state`).
+    fn get_state_explicit(
+        &self,
+        session_id: &SessionKey,
+    ) -> Option<StoredSessionPermissionProfile> {
         self.selections
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .get(session_id)
             .copied()
-            .unwrap_or_default()
     }
 
     fn set(
@@ -889,6 +898,45 @@ impl SessionPermissionProfileStore {
                 },
             );
     }
+}
+
+/// Session permission state honoring the serve-level dangerous default
+/// (`--danger-full-access`, octos' analogue of Claude Code's
+/// `--dangerously-skip-permissions`): a session with NO explicit
+/// `/permissions` selection falls back to the full-access profile —
+/// sandbox off, network allowed, approvals never — instead of the gated
+/// workspace-write default. The flag is solo-gated at serve startup (the
+/// same keystone that gates selecting the profile from the menu), and an
+/// explicit per-session choice always wins.
+fn effective_session_permission_state(
+    state: &AppState,
+    session_id: &SessionKey,
+) -> StoredSessionPermissionProfile {
+    if let Some(stored) = session_permission_profiles().get_state_explicit(session_id) {
+        return stored;
+    }
+    // The dangerous default is granted ONLY where an EXPLICIT Full Access
+    // selection would also be allowed (codex P1/P2 on #1639): Local
+    // deployment mode (`effective_permissions_for_session` rejects
+    // DangerFullAccess for Tenant/Cloud — an unscoped default there would
+    // fail every unselected session/open) AND a session key that does not
+    // encode a non-solo tenant/cloud scope (the same defence-in-depth gate
+    // `permission_selection_allowed` applies, so a tenant-scoped session
+    // can't be handed host access via the fallback). A session that fails
+    // either check falls through to the gated workspace-write default.
+    if state.dangerous_default_permissions
+        && state.deployment_mode == crate::config::DeploymentMode::Local
+        && !session_id_encodes_non_solo_scope(session_id)
+    {
+        return StoredSessionPermissionProfile {
+            selection: octos_core::ui_protocol::PermissionProfileSelection {
+                mode: octos_core::ui_protocol::PermissionProfileMode::DangerFullAccess,
+                network: octos_core::ui_protocol::PermissionNetworkPolicy::Allow,
+            },
+            approval_policy: Some(octos_agent::ApprovalPolicy::Never),
+        };
+    }
+    StoredSessionPermissionProfile::default()
 }
 
 #[derive(Default)]
@@ -2117,6 +2165,30 @@ fn appui_context_compact_keep_items() -> usize {
         .unwrap_or(APPUI_CONTEXT_COMPACT_KEEP_ITEMS)
 }
 
+/// Produce an LLM-summarization compaction summary for the AppUI path, falling
+/// back to the deterministic [`compact_messages`] heuristic whenever the LLM
+/// summary errors, times out, or the runtime is unsupported — so it can never
+/// break a turn. Only invoked when the `--llm-compaction` serve flag is on
+/// (`AppState::llm_compaction`); the flag-off path calls the heuristic directly.
+/// Returns a plain `String` for the unchanged `compact_context`.
+fn appui_compaction_summary(
+    llm_provider: &Arc<dyn octos_llm::LlmProvider>,
+    messages: &[octos_core::Message],
+    budget_tokens: u32,
+) -> String {
+    if let Some(summary) = octos_agent::compaction::llm_compaction_summary(
+        llm_provider,
+        messages,
+        budget_tokens,
+        std::time::Duration::from_secs(
+            octos_agent::compaction::DEFAULT_LLM_COMPACTION_TIMEOUT_SECS,
+        ),
+    ) {
+        return summary;
+    }
+    octos_agent::compaction::compact_messages(messages, budget_tokens)
+}
+
 fn appui_context_prompt_policy(llm_provider: &dyn octos_llm::LlmProvider) -> PromptBuildPolicy {
     PromptBuildPolicy {
         include_reasoning: false,
@@ -2134,7 +2206,8 @@ fn appui_context_history_for_agent(
     data_dir: &Path,
     session_id: &SessionKey,
     history: &[Message],
-    llm_provider: &dyn octos_llm::LlmProvider,
+    llm_provider: &Arc<dyn octos_llm::LlmProvider>,
+    llm_compaction_enabled: bool,
     trigger: &str,
 ) -> (
     Vec<Message>,
@@ -2149,8 +2222,8 @@ fn appui_context_history_for_agent(
         ledger_status = ?ledger_status,
         "appui context manager loaded for turn"
     );
-    let threshold = appui_context_compact_threshold_tokens(llm_provider);
-    let policy = appui_context_prompt_policy(llm_provider);
+    let threshold = appui_context_compact_threshold_tokens(llm_provider.as_ref());
+    let policy = appui_context_prompt_policy(llm_provider.as_ref());
     let state = manager.state();
     if state.token_estimate > threshold {
         // UPCR-2026-026: the started event precedes the (synchronous) pass;
@@ -2166,7 +2239,11 @@ fn appui_context_history_for_agent(
         ));
         let before = manager.for_prompt(&policy);
         let summary_budget = threshold.clamp(256, 4096) as u32;
-        let summary = octos_agent::compaction::compact_messages(&before.messages, summary_budget);
+        let summary = if llm_compaction_enabled {
+            appui_compaction_summary(llm_provider, &before.messages, summary_budget)
+        } else {
+            octos_agent::compaction::compact_messages(&before.messages, summary_budget)
+        };
         let record = manager.compact_context(
             summary,
             CompactContextPolicy {
@@ -2322,6 +2399,12 @@ struct AppUiPromptContextBridge {
     /// [`Self::prepare_prompt`] emits `ContextCompactionStarted`/`Completed`
     /// through this hook. `None` in tests and paths without a client.
     context_lifecycle_notify: Option<ContextLifecycleNotify>,
+    /// Provider for the OPT-IN LLM-summarization compaction path
+    /// (`--llm-compaction` serve flag). `None` = heuristic only (also the
+    /// fallback whenever an LLM summary fails, and the flag-off state). Set on
+    /// the per-turn bridge only when the flag is on; child/spawn bridges leave
+    /// it `None`.
+    llm_compaction_provider: Option<Arc<dyn octos_llm::LlmProvider>>,
 }
 
 impl AppUiPromptContextBridge {
@@ -2338,11 +2421,17 @@ impl AppUiPromptContextBridge {
             scratch: StdMutex::new(None),
             voice_turn,
             context_lifecycle_notify: None,
+            llm_compaction_provider: None,
         }
     }
 
     fn with_context_lifecycle_notify(mut self, notify: ContextLifecycleNotify) -> Self {
         self.context_lifecycle_notify = Some(notify);
+        self
+    }
+
+    fn with_llm_compaction_provider(mut self, provider: Arc<dyn octos_llm::LlmProvider>) -> Self {
+        self.llm_compaction_provider = Some(provider);
         self
     }
 
@@ -2461,8 +2550,12 @@ impl PromptContextManager for AppUiPromptContextBridge {
             }
             let before = scratch.manager.for_prompt(&policy);
             let summary_budget = threshold.clamp(256, 4096) as u32;
-            let summary =
-                octos_agent::compaction::compact_messages(&before.messages, summary_budget);
+            let summary = match &self.llm_compaction_provider {
+                Some(provider) => {
+                    appui_compaction_summary(provider, &before.messages, summary_budget)
+                }
+                None => octos_agent::compaction::compact_messages(&before.messages, summary_budget),
+            };
             let record = scratch.manager.compact_context(
                 summary,
                 CompactContextPolicy {
@@ -4660,18 +4753,16 @@ async fn ui_protocol_connection(
             }
             UiCommand::PermissionProfileSet(params) => {
                 let session_id = params.session_id.clone();
-                let profile_id = session_id
-                    .profile_id()
-                    .or(connection_profile_id)
-                    .map(ToOwned::to_owned);
                 match permission_profile_set_result(&state, params) {
                     Ok(result) => {
-                        if let Some(profile_id) = profile_id {
-                            state
-                                .session_cache
-                                .invalidate(&(profile_id, session_id))
-                                .await;
-                        }
+                        // Evict by SESSION across every profile (codex P1 ×2
+                        // on #1639): the runtime may be cached under a
+                        // session/open `params.profile_id` this connection no
+                        // longer knows, and `invalidate_session` also bumps
+                        // the session generation so a concurrent in-flight
+                        // bootstrap can't re-cache the pre-change (possibly
+                        // dangerous) permissions after the downgrade.
+                        state.session_cache.invalidate_session(&session_id).await;
                         let _ =
                             send_ui_rpc_result(&ws, id, UiRpcResult::PermissionProfileSet(result));
                     }
@@ -5389,18 +5480,12 @@ where
             }
             UiCommand::PermissionProfileSet(params) => {
                 let session_id = params.session_id.clone();
-                let profile_id = session_id
-                    .profile_id()
-                    .or(connection_profile_id_owned.as_deref())
-                    .map(ToOwned::to_owned);
                 match permission_profile_set_result(&state, params) {
                     Ok(result) => {
-                        if let Some(profile_id) = profile_id {
-                            state
-                                .session_cache
-                                .invalidate(&(profile_id, session_id))
-                                .await;
-                        }
+                        // Session-scoped eviction across all profiles + the
+                        // in-flight generation guard — see the sibling
+                        // dispatcher above (codex P1 ×2 on #1639).
+                        state.session_cache.invalidate_session(&session_id).await;
                         let _ =
                             send_ui_rpc_result(&ws, id, UiRpcResult::PermissionProfileSet(result));
                     }
@@ -7018,7 +7103,7 @@ fn effective_permissions_for_session(
         PermissionNetworkPolicy as Network, PermissionProfileMode as Mode,
     };
 
-    let permission_state = session_permission_profiles().get_state(session_id);
+    let permission_state = effective_session_permission_state(state, session_id);
     let requested = match permission_state.selection.mode {
         Mode::ReadOnly => octos_agent::PermissionProfile::ReadOnly,
         Mode::WorkspaceWrite => octos_agent::PermissionProfile::WorkspaceWrite,
@@ -7059,8 +7144,7 @@ fn permission_profile_list_result(
     state: &AppState,
     params: octos_core::ui_protocol::PermissionProfileListParams,
 ) -> octos_core::ui_protocol::PermissionProfileListResult {
-    let store = session_permission_profiles();
-    let current = store.get(&params.session_id);
+    let current = effective_session_permission_state(state, &params.session_id).selection;
     let profiles = permission_profile_supported_selections(state, &params.session_id);
     octos_core::ui_protocol::PermissionProfileListResult {
         session_id: params.session_id,
@@ -7074,7 +7158,7 @@ fn permission_profile_set_result(
     params: octos_core::ui_protocol::PermissionProfileSetParams,
 ) -> Result<octos_core::ui_protocol::PermissionProfileSetResult, RpcError> {
     let store = session_permission_profiles();
-    let previous_state = store.get_state(&params.session_id);
+    let previous_state = effective_session_permission_state(state, &params.session_id);
     let previous = previous_state.selection;
     let approval_policy =
         parse_permission_approval_policy(params.update.approval_policy.as_deref())?
@@ -7152,6 +7236,10 @@ async fn tool_status_list_result(
 ) -> Result<Value, RpcError> {
     let profile_runtime = ensure_session_profile_runtime(state, active_profile_id).await?;
     let session_runtime = if let Some(profile_runtime) = profile_runtime.as_ref() {
+        // Epoch BEFORE permission resolution so a concurrent downgrade
+        // can't pair a post-bump epoch with pre-bump permissions on a
+        // preempted caller (codex P1 round 4 on #1639).
+        let permissions_epoch = state.session_cache.session_generation(session_id);
         let permissions = effective_permissions_for_session(state, session_id)?;
         let workspace_profile_id = workspace_profile_scope(active_profile_id, session_id);
         let workspace_hint = session_workspaces().get(&workspace_profile_id, session_id);
@@ -7163,6 +7251,7 @@ async fn tool_status_list_result(
                     session_id.clone(),
                     workspace_hint,
                     permissions,
+                    permissions_epoch,
                 )
                 .await
                 .map_err(|error| {
@@ -7221,7 +7310,7 @@ async fn tool_status_list_result(
     let tool_name_refs: Vec<&str> = tool_names.iter().map(String::as_str).collect();
     let disabled_tool_refs: Vec<&str> = disabled_tool_names.iter().map(String::as_str).collect();
     let deferred_name_refs: Vec<&str> = recoverable_deferred.iter().map(String::as_str).collect();
-    let permission_state = session_permission_profiles().get_state(session_id);
+    let permission_state = effective_session_permission_state(state, session_id);
     let session_id_wire = session_id.to_string();
     let profile_id = active_profile_id.unwrap_or(MAIN_PROFILE_ID).to_owned();
 
@@ -7283,7 +7372,7 @@ fn runtime_policy_stamp_for_profile(
         )
     };
     let permission_state = session_id
-        .map(|session_id| session_permission_profiles().get_state(session_id))
+        .map(|session_id| effective_session_permission_state(state, session_id))
         .unwrap_or_default();
     let (approval_policy, sandbox_mode, permission_profile, filesystem_scope, network) =
         permission_selection_policy_fields(
@@ -7579,8 +7668,17 @@ fn add_autonomy_policy_stamp(policy: &mut Value, features: ConnectionUiFeatures)
             .into(),
         ),
     );
-    object.insert("goal_default_token_budget".into(), json!(50_000));
-    object.insert("goal_max_token_budget".into(), json!(200_000));
+    // Report the REAL budget policy from the single source of truth in
+    // `agent_orchestrator` — hardcoded literals here drifted from the
+    // constants the backend actually enforces.
+    object.insert(
+        "goal_default_token_budget".into(),
+        json!(super::agent_orchestrator::GOAL_DEFAULT_TOKEN_BUDGET),
+    );
+    object.insert(
+        "goal_max_token_budget".into(),
+        json!(super::agent_orchestrator::GOAL_MAX_TOKEN_BUDGET),
+    );
     object.insert("continuation_min_delay_seconds".into(), json!(30));
     object.insert("continuation_max_per_hour".into(), json!(20));
     object.insert("loop_min_interval_seconds".into(), json!(60));
@@ -8617,6 +8715,7 @@ async fn skill_action_session_runtime(
             "profile runtime is required for skill actions",
         ));
     };
+    let permissions_epoch = state.session_cache.session_generation(session_id);
     let permissions = effective_permissions_for_session(state, session_id)?;
     let workspace_profile_id = workspace_profile_scope(active_profile_id, session_id);
     let workspace_hint = session_workspaces().get(&workspace_profile_id, session_id);
@@ -8627,6 +8726,7 @@ async fn skill_action_session_runtime(
             session_id.clone(),
             workspace_hint,
             permissions,
+            permissions_epoch,
         )
         .await
         .map_err(|error| {
@@ -11472,6 +11572,12 @@ async fn open_session_result(
         resolve_session_profile_runtime(state, active_profile_id.as_deref())
     {
         let hint = effective_workspace_hint.clone();
+        // Capture the session epoch BEFORE resolving permissions so any
+        // concurrent `permission/profile/set` (which bumps the epoch AFTER
+        // writing the store) that could have made these permissions stale
+        // also invalidates this epoch — the cache insert then rejects the
+        // stale bootstrap (codex P1 round 3 on #1639).
+        let permissions_epoch = state.session_cache.session_generation(&params.session_id);
         let permissions = effective_permissions_for_session(state, &params.session_id)?;
         let sandbox_override = validate_requested_session_sandbox(
             features,
@@ -11486,6 +11592,7 @@ async fn open_session_result(
                 hint,
                 permissions,
                 sandbox_override,
+                permissions_epoch,
             )
             .await
         {
@@ -12325,10 +12432,17 @@ pub(crate) async fn resolve_sessions_for_lookup(
     if let Some(profile_runtime) = resolve_session_profile_runtime(state, active_profile_id) {
         let workspace_profile_id = workspace_profile_scope(active_profile_id, session_id);
         let hint = session_workspaces().get(&workspace_profile_id, session_id);
+        let permissions_epoch = state.session_cache.session_generation(session_id);
         let permissions = effective_permissions_for_session(state, session_id).ok()?;
         if let Ok(runtime) = state
             .session_cache
-            .get_or_init_with_permissions(&profile_runtime, session_id.clone(), hint, permissions)
+            .get_or_init_with_permissions(
+                &profile_runtime,
+                session_id.clone(),
+                hint,
+                permissions,
+                permissions_epoch,
+            )
             .await
         {
             return Some(runtime.sessions.clone());
@@ -13047,6 +13161,40 @@ async fn handle_turn_start(
         .map(ToOwned::to_owned)
         .or_else(|| resolved_profile_id.clone())
         .unwrap_or_else(|| MAIN_PROFILE_ID.to_owned());
+    // #1650 — snapshot the interactive goal binding NOW, synchronously,
+    // at dispatch time — before the turn task is spawned and woken via
+    // `start_rx`. A `session/goal/set` that arrives after this `turn/start`
+    // (same or another connection) therefore can't bind this already-
+    // submitted turn to a goal created after the fact (codex P2).
+    //
+    // Resolve the profile through the SAME `resolve_autonomy_profile_id`
+    // the raw `goal/set` handler uses (codex P2), so the binding matches
+    // exactly where the goal was stored. `profile_for_stamp` was subtly
+    // different — it falls back to the routed profile, whereas `goal/set`
+    // for an unscoped connection on an unprofiled session resolves to
+    // `_main` — which left accounting silently disabled for that flow. A
+    // scope error (unreachable here — `handle_turn_start` already ran
+    // `validate_session_scope` with the same inputs) or a session with no
+    // active goal both bind to `None` and never charge.
+    //
+    // KNOWN LIMITATION (codex P2): a `turn/start` carries no goal
+    // profile, so when an unscoped/admin connection sets a goal with an
+    // EXPLICIT `profile_id` on a bare session key, this resolves to
+    // `_main` and misses the tenant-scoped goal — that turn goes
+    // uncharged. Binding by session-key alone (ignoring profile) would
+    // fix it but risks the cross-tenant leak the profile match exists to
+    // prevent, since "unscoped ⇒ authorized for any profile" is
+    // deployment-dependent. A safe fix threads the goal's stored profile
+    // (or an authorized bind-by-session for admin connections) and is
+    // tracked as a follow-up.
+    let interactive_goal_binding =
+        resolve_autonomy_profile_id(Some(&session_id), None, connection_profile_id)
+            .ok()
+            .and_then(|goal_profile| {
+                default_agent_orchestrator()
+                    .active_goal_id(&session_id, &goal_profile)
+                    .map(|goal_id| (goal_profile, goal_id))
+            });
     let handle = tokio::spawn(async move {
         if start_rx.await.is_err() {
             return;
@@ -13082,6 +13230,8 @@ async fn handle_turn_start(
                 // accountant wiring. Only the master continuation
                 // runner sets this to `Some(...)` for `GoalContinue`.
                 None,
+                // #1650 — interactive goal binding snapshotted above.
+                interactive_goal_binding,
             )
             .await;
         }
@@ -13313,6 +13463,10 @@ async fn maybe_spawn_appui_master_continuation_runner(
             true,
             loop_id_for_self_paced,
             goal_context_for_appui,
+            // #1650 — master continuations carry their accounting via
+            // `goal_context` (a `GoalContinue` charges through
+            // `record_goal_turn`); the interactive binding is never used.
+            None,
         )
         .await;
         default_agent_orchestrator().mark_continuation_completed(
@@ -19523,6 +19677,7 @@ async fn run_native_code_review_turn(
     };
     let workspace_profile_id = workspace_profile_scope(active_profile_id.as_deref(), &session_id);
     let hint = session_workspaces().get(&workspace_profile_id, &session_id);
+    let permissions_epoch = state.session_cache.session_generation(&session_id);
     let permissions = match effective_permissions_for_session(&state, &session_id) {
         Ok(permissions) => permissions,
         Err(error) => {
@@ -19544,7 +19699,13 @@ async fn run_native_code_review_turn(
     };
     let session_runtime = match state
         .session_cache
-        .get_or_init_with_permissions(&profile_runtime, session_id.clone(), hint, permissions)
+        .get_or_init_with_permissions(
+            &profile_runtime,
+            session_id.clone(),
+            hint,
+            permissions,
+            permissions_epoch,
+        )
         .await
     {
         Ok(runtime) => runtime,
@@ -21001,6 +21162,15 @@ async fn run_standalone_turn(
     // record AND detect the `<goal:complete>` sentinel — parity with the
     // `SessionActor::maybe_advance_goal_runtime_after_turn` chat path.
     goal_context: Option<GoalContinuationContext>,
+    // #1650 — for an INTERACTIVE turn, the goal binding
+    // `(charge_profile, goal_id)` snapshotted by the turn-start handler
+    // at DISPATCH time — before this task is woken via `start_rx` — so a
+    // `session/goal/set` racing in after `turn/start` can't bind this
+    // already-submitted turn to a goal created after the fact (codex
+    // P2). `None` for a turn with no active goal at dispatch, and always
+    // `None` for master continuations (`goal_context` carries their
+    // accounting instead).
+    interactive_goal_binding: Option<(String, String)>,
 ) {
     let session_id = params.session_id.clone();
     let turn_id = params.turn_id.clone();
@@ -21035,6 +21205,38 @@ async fn run_standalone_turn(
         .profile_id()
         .map(ToOwned::to_owned)
         .or(routed_profile_id.clone());
+    // #1650 — the interactive goal binding `(charge_profile, goal_id)`
+    // was snapshotted by the turn-start handler at DISPATCH time (before
+    // this task was woken), so a `session/goal/set` racing in after
+    // `turn/start` can't retroactively bind this already-submitted turn
+    // to a goal created after the fact (codex P2). Split it into the
+    // pieces the post-loop accountant reads. Binding to the captured
+    // goal_id also means a mid-turn clear+recreate can't mischarge the
+    // replacement — the charge re-checks the id inside the helper. No
+    // in-flight marker is claimed: the charge runs right after the turn
+    // loop, BEFORE the voice-TTS / spawn_only tail, closing the
+    // scheduler/cancel window without a guard whose non-refcounted
+    // marker could collide with a concurrent SessionActor continuation.
+    let (goal_charge_profile, interactive_goal_id) = match interactive_goal_binding {
+        Some((profile, goal_id)) => (profile, Some(goal_id)),
+        None => (MAIN_PROFILE_ID.to_owned(), None),
+    };
+    // #1650 (codex P1) — when this interactive turn will charge an active
+    // goal, keep that goal NON-RUNNABLE from now until the post-loop
+    // charge commits by claiming its in-flight marker. `drain_and_claim`
+    // then defers any queued `GoalContinue` for the whole turn, so on the
+    // multi-threaded serve runtime a scheduler tick on another thread
+    // can't drain one in the gap between `try_emit_terminal` and the
+    // charge and run it past a just-crossed budget. The claim is
+    // owner-aware (returns `None` if a concurrent `SessionActor`
+    // continuation already holds the marker), so it never wipes another
+    // dispatcher's marker. The guard is dropped right after the charge
+    // block (before the voice-TTS tail) so a rapid follow-up turn can
+    // re-claim; it also drops via RAII on any early return / cancellation.
+    let interactive_goal_guard = interactive_goal_id
+        .is_some()
+        .then(|| default_agent_orchestrator().try_claim_goal_in_flight(&session_id))
+        .flatten();
     let Some(profile_runtime) =
         resolve_session_profile_runtime(&state, active_profile_id.as_deref())
     else {
@@ -21065,6 +21267,7 @@ async fn run_standalone_turn(
     // Tier-3 (`<profile_data_dir>/users/.../workspace`) wins.
     let workspace_profile_id = workspace_profile_scope(active_profile_id.as_deref(), &session_id);
     let hint = session_workspaces().get(&workspace_profile_id, &session_id);
+    let permissions_epoch = state.session_cache.session_generation(&session_id);
     let permissions = match effective_permissions_for_session(&state, &session_id) {
         Ok(permissions) => permissions,
         Err(error) => {
@@ -21086,7 +21289,13 @@ async fn run_standalone_turn(
     };
     let session_runtime = match state
         .session_cache
-        .get_or_init_with_permissions(&profile_runtime, session_id.clone(), hint, permissions)
+        .get_or_init_with_permissions(
+            &profile_runtime,
+            session_id.clone(),
+            hint,
+            permissions,
+            permissions_epoch,
+        )
         .await
     {
         Ok(rt) => rt,
@@ -21196,6 +21405,11 @@ async fn run_standalone_turn(
     // the chat path's `maybe_advance_goal_runtime_after_turn(goal_turn_start)`
     // pattern in `SessionActor`.
     let goal_turn_start = goal_context.as_ref().map(|_| std::time::Instant::now());
+    // #1650 — wall-clock for the *interactive* (non-goal_context) path.
+    // An interactive turn can still be charged against the session's
+    // active goal (the counter must climb while the user drives), so
+    // capture its start here symmetrically to `goal_turn_start`.
+    let interactive_turn_start = goal_context.is_none().then(std::time::Instant::now);
     // Voice-turn lean-prompt signal. Derived cheaply from the turn's media
     // (an audio attachment) WITHOUT waiting for STT — a safe over-approximation
     // of `had_audio_input` that is available before the tool registry and the
@@ -21412,7 +21626,8 @@ async fn run_standalone_turn(
             &session_runtime.profile.data_dir,
             &session_id,
             &raw_history,
-            llm_provider.as_ref(),
+            &llm_provider,
+            state.llm_compaction,
             "appui_pre_turn",
         );
     for notification in context_lifecycle_notifications {
@@ -22296,15 +22511,21 @@ async fn run_standalone_turn(
             }
         })
     };
-    let prompt_context_bridge: Arc<dyn PromptContextManager> = Arc::new(
-        AppUiPromptContextBridge::new(
-            session_id.clone(),
-            session_runtime.profile.data_dir.clone(),
-            context_manager.clone(),
-            voice_turn_hint,
-        )
-        .with_context_lifecycle_notify(context_lifecycle_notify),
-    );
+    let mut prompt_context_bridge_inner = AppUiPromptContextBridge::new(
+        session_id.clone(),
+        session_runtime.profile.data_dir.clone(),
+        context_manager.clone(),
+        voice_turn_hint,
+    )
+    .with_context_lifecycle_notify(context_lifecycle_notify);
+    // Only wire the provider when `--llm-compaction` is on; a present provider
+    // is what flips the in-loop bridge to the LLM-summarization path.
+    if state.llm_compaction {
+        prompt_context_bridge_inner =
+            prompt_context_bridge_inner.with_llm_compaction_provider(llm_provider.clone());
+    }
+    let prompt_context_bridge: Arc<dyn PromptContextManager> =
+        Arc::new(prompt_context_bridge_inner);
     request_agent = request_agent.with_prompt_context_manager(prompt_context_bridge);
     if let Some(hooks) = session_runtime.profile.hook_executor.clone() {
         request_agent = request_agent.with_hooks(hooks);
@@ -23323,6 +23544,14 @@ async fn run_standalone_turn(
                     "content": response.content,
                     "tokens_in": response.token_usage.input_tokens,
                     "tokens_out": response.token_usage.output_tokens,
+                    // #1650 — cache reads/writes are DISJOINT from
+                    // `input_tokens` (anthropic: prompt = input + cache_read
+                    // + cache_creation). They are still real tokens the goal
+                    // budget must count, so carry them for the goal
+                    // accountant. `tokens_in`/`tokens_out` keep their prior
+                    // meaning for every other consumer of this event.
+                    "tokens_cache": (response.token_usage.cache_read_tokens as u64)
+                        + (response.token_usage.cache_write_tokens as u64),
                     "cursor": cursor,
                     "message_id": final_assistant_message_id,
                     "final_assistant_committed_seq": final_assistant_committed_seq,
@@ -23542,9 +23771,18 @@ async fn run_standalone_turn(
                 // accumulator total-safe for malformed payloads.
                 let tokens_in = event.get("tokens_in").and_then(Value::as_u64).unwrap_or(0);
                 let tokens_out = event.get("tokens_out").and_then(Value::as_u64).unwrap_or(0);
+                // #1650 — include cache reads/writes (disjoint from
+                // `tokens_in`) so a cache-heavy turn charges the goal its
+                // TRUE token cost instead of just the uncached suffix +
+                // output. Absent on older/malformed payloads → treated as 0.
+                let tokens_cache = event
+                    .get("tokens_cache")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
                 final_tokens_consumed = final_tokens_consumed
                     .saturating_add(tokens_in)
-                    .saturating_add(tokens_out);
+                    .saturating_add(tokens_out)
+                    .saturating_add(tokens_cache);
                 // Issue #1332: thread `done` payload data into the
                 // `turn/completed` lifecycle event. Tokens come from the
                 // same `response.token_usage` values the cost accountant
@@ -23698,6 +23936,132 @@ async fn run_standalone_turn(
             }
         }
     }
+
+    // #1650 — interactive goal accountant. Placed HERE — immediately
+    // after the turn loop and BEFORE the voice-TTS / spawn_only
+    // post-terminal tail — so the (synchronous) charge lands while the
+    // window is short: a WebSocket close during the seconds-long TTS
+    // wait (`abort_connection_turns`) can't cancel the task before the
+    // goal is charged, and the ~2s scheduler tick can't drain a queued
+    // `GoalContinue` past a budget-crossing turn during that tail
+    // (codex P1). The remaining window — loop exit → this block — has no
+    // long awaits, so no in-flight guard (and its non-refcounted marker)
+    // is needed.
+    //
+    // Residual (codex P2, shared with the autonomous `record_goal_turn`
+    // accountant below): the `turn_state.lock().await` here is still an
+    // abort point, so a socket close in the microseconds between loop
+    // exit and this charge can drop the charge. Both goal accountants run
+    // post-terminal and share this exposure; making completed-turn
+    // accounting survive connection-abort belongs to both together and is
+    // tracked as a follow-up. The impact is bounded — one turn's spend
+    // uncounted, and the budget is a post-turn soft cap regardless.
+    //
+    // Fires only for a genuine interactive turn that had an active goal
+    // at turn start (`interactive_goal_id` is Some ⇒ `goal_context` is
+    // None AND not a master continuation): never a `GoalContinue`
+    // (charged by the accountant below) nor a `LoopFire` /
+    // `ChildCompleted` autonomous turn — loop work is not goal work.
+    //
+    // Accounting is DECOUPLED from marker ownership (codex P2): charge on
+    // `interactive_goal_id`, NOT on holding `_interactive_goal_guard`. The
+    // guard is best-effort protection — when we claimed it (the common
+    // case) it defers concurrent `GoalContinue` drains for the whole
+    // turn, closing the multi-threaded race. When another dispatcher
+    // already owned the marker we still charge: skipping would silently
+    // drop this completed turn's spend whenever the holder is a
+    // `LoopFire` / `ChildCompleted` / `External` continuation (which hold
+    // the marker but do NOT invoke the goal accountant). Charging then is
+    // still safe from a concurrent GoalContinue — that holder's own
+    // marker blocks drains while it runs — and the only residual is the
+    // inherent post-turn soft-cap overshoot (≤ one turn) shared with the
+    // autonomous path once the holder releases.
+    //
+    // Gate on the ACTUAL terminal reason (codex P2): only a turn that
+    // WON the `Terminal(Completed)` transition charges. An interrupted
+    // turn is `Terminal(Interrupted)` — or still `Active` here, and
+    // transitioned to `Interrupted` by the `if interrupt_observed` block
+    // below — so it neither charges nor budget-limits the goal. A
+    // successful turn's `done` arm already emitted `Terminal(Completed)`
+    // before breaking the loop, so the reason is authoritative now.
+    if let Some(charge_goal_id) = interactive_goal_id.as_deref() {
+        let terminalized_completed = matches!(
+            &*turn_state.lock().await,
+            TurnState::Terminal(TerminalReason::Completed)
+        );
+        if terminalized_completed {
+            // Charge on nonzero elapsed OR tokens (codex P2): a
+            // successful turn reporting zero token usage but nonzero
+            // wall-clock still advances `time_used_seconds` /
+            // `updated_at_ms`. `charge_active_goal_tokens` binds to
+            // `charge_goal_id` and matches the profile, so a mid-turn
+            // goal replacement or a cross-tenant turn is rejected inside
+            // the helper. It touches ONLY `tokens_used` /
+            // `time_used_seconds` / `updated_at_ms` (plus the
+            // budget-limited flip on crossing): no rate-window or
+            // completion-sentinel machinery runs for a user-driven turn.
+            let elapsed_seconds = interactive_turn_start
+                .map(|start| start.elapsed().as_secs())
+                .unwrap_or(0);
+            if let Some(goal_event_json) = default_agent_orchestrator().charge_active_goal_tokens(
+                &session_id,
+                &goal_charge_profile,
+                charge_goal_id,
+                final_tokens_consumed,
+                elapsed_seconds,
+            ) {
+                match serde_json::from_value::<octos_core::ui_protocol::SessionGoalUpdatedEvent>(
+                    goal_event_json,
+                ) {
+                    Ok(event) => {
+                        // Deliver to the OWNING connection via an
+                        // ephemeral direct-send to `ws` (codex P1): a
+                        // durable ledger append is fanned to EVERY
+                        // session subscriber by their live forwarder,
+                        // which does not filter on `profile_id`, and
+                        // would leak this profile's goal state to a
+                        // different profile that co-opened the same
+                        // unprofiled session id. `ws` is the turn's own
+                        // connection, already proven by the charge-side
+                        // profile match to belong to the goal's owner.
+                        //
+                        // A backpressure drop of a token-count update
+                        // self-heals: the next interactive turn re-pushes
+                        // the fresh count while the goal stays `active`.
+                        // The one exception (codex P2, tracked as a
+                        // follow-up) is the `budget_limited` TRANSITION
+                        // push — once the goal leaves `active`,
+                        // `active_goal_id` returns `None` and no later
+                        // turn re-pushes, so a dropped transition frame
+                        // leaves the chip stale until an explicit
+                        // `goal/get`. A durable-but-owning-connection-only
+                        // delivery (or a retry of the terminal transition)
+                        // would close it without reopening the leak.
+                        let _ = send_notification_ephemeral(
+                            &ws,
+                            &ledger,
+                            UiNotification::SessionGoalUpdated(event),
+                        );
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            error = %err,
+                            session_id = %session_id,
+                            "interactive goal charge produced an unparseable update event",
+                        );
+                    }
+                }
+            }
+        }
+    }
+    // #1650 — release the in-flight marker now that the charge has
+    // committed (goal already flipped `budget_limited` if it crossed) and
+    // BEFORE the voice-TTS / spawn_only tail + `evict_turn`, so a rapid
+    // follow-up interactive turn on this session can re-claim it. A no-op
+    // when the guard is `None` (no goal, or a concurrent SessionActor
+    // continuation owned the marker). Early-return / cancellation paths
+    // that skip this still drop the guard via RAII.
+    drop(interactive_goal_guard);
 
     // Voice turn: flush the trailing partial sentence (marker already held back
     // by the splitter), close the channel, and wait for the FIFO TTS worker.
@@ -25036,6 +25400,8 @@ fn materialize_file_mutation_diff(
     };
     let git_root = find_git_root_for_path(&absolute_path)?;
     let relative_path = absolute_path.strip_prefix(&git_root).ok()?;
+
+    // Primary: working-tree vs index for a TRACKED file — the common edit case.
     let output = Command::new("git")
         .arg("-C")
         .arg(&git_root)
@@ -25044,14 +25410,105 @@ fn materialize_file_mutation_diff(
         .arg(relative_path)
         .output()
         .ok()?;
-
-    if !output.status.success() && output.stdout.is_empty() {
+    // A non-zero exit is a genuine git error (a corrupt/overridden index, or a
+    // path git rejects) — NOT "the file is untracked". Give up rather than
+    // mis-render a tracked file as wholly-added through the fallback below.
+    if !output.status.success() {
         return None;
     }
+    if let Some(diff) = finish_diff_preview(output.stdout) {
+        return Some(diff);
+    }
 
-    let diff = String::from_utf8(output.stdout).ok()?;
+    // Fallback: a brand-new file the agent just created is UNTRACKED, so the
+    // plain `git diff` above reports nothing and the preview would render an
+    // empty "ready" box with no hunks. Render the whole file as additions.
+    render_untracked_file_as_additions(&git_root, relative_path, &absolute_path)
+}
+
+/// Trim, cap, and drop-if-empty a raw `git diff` stdout into a preview body.
+/// `None` means "no renderable diff".
+fn finish_diff_preview(stdout: Vec<u8>) -> Option<String> {
+    let diff = String::from_utf8(stdout).ok()?;
     let diff = truncate_utf8(diff.trim_end().to_owned(), MAX_DIFF_PREVIEW_BYTES);
     (!diff.is_empty()).then_some(diff)
+}
+
+/// Render a newly-created UNTRACKED file as an all-additions diff via
+/// `git diff --no-index /dev/null <file>` (read-only — it never touches the
+/// index). `--no-index` exits 1 when the two paths differ (the normal case),
+/// so a renderable diff is judged by non-empty output rather than the exit
+/// code. `/dev/null` is Unix-only; on other platforms the file keeps today's
+/// behavior (empty preview, no regression).
+#[cfg(unix)]
+fn render_untracked_file_as_additions(
+    git_root: &Path,
+    relative_path: &Path,
+    absolute_path: &Path,
+) -> Option<String> {
+    if !absolute_path.is_file() || !file_is_untracked(git_root, relative_path) {
+        return None;
+    }
+    // Containment guard: this fallback reads the file directly, so a notice
+    // path that escapes the repo — a `..` component, or a symlinked directory
+    // that the lexical `strip_prefix` accepted — must NOT be read. Resolve BOTH
+    // sides (so a symlinked repo root, e.g. macOS `/tmp` -> `/private/tmp`,
+    // still matches) and derive the repo-relative path from the *canonical*
+    // file. `strip_prefix` succeeds only when the file lives below the real git
+    // root, so it doubles as the containment check.
+    let canonical_root = git_root.canonicalize().ok()?;
+    let canonical_file = absolute_path.canonicalize().ok()?;
+    let safe_relative = canonical_file.strip_prefix(&canonical_root).ok()?;
+    // Diff the SYMLINK-FREE canonical path (relative to the canonical root) so
+    // git does not re-follow a symlink we already resolved, and the preview
+    // still shows the tidy repo-relative path.
+    //
+    // Residual TOCTOU (accepted): a concurrent process could swap one of the
+    // now-real parent directories for an outside-pointing symlink between this
+    // check and git's open. Closing that fully needs `openat2(RESOLVE_BENEATH)`
+    // / a capability-`Dir`, which this `deny(unsafe_code)` crate can't express
+    // without a carve-out; in the multi-tenant deployment the sandbox's
+    // per-tenant FS isolation bounds that race, and the static `..`/symlink
+    // vectors (the reachable ones) are closed above.
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(&canonical_root)
+        .arg("diff")
+        .arg("--no-index")
+        .arg("--")
+        .arg("/dev/null")
+        .arg(safe_relative)
+        .output()
+        .ok()?;
+    finish_diff_preview(output.stdout)
+}
+
+#[cfg(not(unix))]
+fn render_untracked_file_as_additions(
+    _git_root: &Path,
+    _relative_path: &Path,
+    _absolute_path: &Path,
+) -> Option<String> {
+    None
+}
+
+/// True when git is not tracking `relative_path` (newly created, never
+/// `git add`ed). `git ls-files --error-unmatch` exits 0 when the path IS
+/// tracked, 1 when it is not, and 128 on a genuine git error. Treat ONLY the
+/// explicit unmatched code (1) as untracked, so a repo-level failure is never
+/// mistaken for "new file" (which would wrongly render it as wholly-added).
+#[cfg(unix)]
+fn file_is_untracked(git_root: &Path, relative_path: &Path) -> bool {
+    Command::new("git")
+        .arg("-C")
+        .arg(git_root)
+        .arg("ls-files")
+        .arg("--error-unmatch")
+        .arg("--")
+        .arg(relative_path)
+        .output()
+        .map(|output| output.status.code() == Some(1))
+        .unwrap_or(false)
 }
 
 fn find_git_root_for_path(path: &Path) -> Option<PathBuf> {
@@ -27635,9 +28092,15 @@ mod tests {
             });
         }
 
-        let provider = TinyContextProvider;
-        let (_messages, _manager, notifications) =
-            appui_context_history_for_agent(dir.path(), &session, &history, &provider, "preflight");
+        let provider: Arc<dyn octos_llm::LlmProvider> = Arc::new(TinyContextProvider);
+        let (_messages, _manager, notifications) = appui_context_history_for_agent(
+            dir.path(),
+            &session,
+            &history,
+            &provider,
+            false,
+            "preflight",
+        );
 
         let started_pos = notifications
             .iter()
@@ -34139,6 +34602,61 @@ ignore = []
         );
     }
 
+    /// `--danger-full-access` (solo-gated at serve startup): a session with
+    /// NO explicit `/permissions` selection resolves to the dangerous
+    /// full-access profile — sandbox off, network allowed, approvals never —
+    /// when the flag is set, and to the gated default when it is not. Tests
+    /// the pure resolver directly so it writes NOTHING to the process-global
+    /// permission store (a leaked entry there flakes concurrent tests); the
+    /// explicit-choice-wins branch is a structural early-return exercised by
+    /// the store round-trip in
+    /// `runtime_policy_stamp_exposes_effective_permission_fields`.
+    #[test]
+    fn dangerous_default_permissions_resolves_without_an_explicit_choice() {
+        use octos_core::ui_protocol::{
+            PermissionNetworkPolicy as Network, PermissionProfileMode as Mode,
+        };
+
+        // Fresh unique solo-scoped session — never stored, so the resolver
+        // takes the no-explicit-selection path in every case below.
+        let session_id = SessionKey("local:danger-default-pure-probe".into());
+
+        // Flag on, Local mode, solo-scoped session -> full access.
+        let mut state = AppState::empty_for_tests();
+        state.dangerous_default_permissions = true;
+        assert_eq!(state.deployment_mode, crate::config::DeploymentMode::Local);
+        let resolved = effective_session_permission_state(&state, &session_id);
+        assert_eq!(resolved.selection.mode, Mode::DangerFullAccess);
+        assert_eq!(resolved.selection.network, Network::Allow);
+        assert_eq!(
+            resolved.approval_policy,
+            Some(octos_agent::ApprovalPolicy::Never)
+        );
+
+        // Flag off -> the gated workspace-write default, approvals unset.
+        let plain = AppState::empty_for_tests();
+        let resolved = effective_session_permission_state(&plain, &session_id);
+        assert_eq!(resolved.selection.mode, Mode::WorkspaceWrite);
+        assert_eq!(resolved.selection.network, Network::Deny);
+        assert_eq!(resolved.approval_policy, None);
+
+        // Flag on but NON-Local deployment -> gated default (codex P2): the
+        // full-access profile is not grantable outside Local mode.
+        let mut tenant = AppState::empty_for_tests();
+        tenant.dangerous_default_permissions = true;
+        tenant.deployment_mode = crate::config::DeploymentMode::Tenant;
+        let resolved = effective_session_permission_state(&tenant, &session_id);
+        assert_eq!(resolved.selection.mode, Mode::WorkspaceWrite);
+
+        // Flag on, Local, but a NON-SOLO-scoped session key -> gated default
+        // (codex P1): the fallback must not hand a tenant-scoped session the
+        // host access the explicit path would reject.
+        let scoped = SessionKey("coding:tenant:m12-danger-default".into());
+        assert!(session_id_encodes_non_solo_scope(&scoped));
+        let resolved = effective_session_permission_state(&state, &scoped);
+        assert_eq!(resolved.selection.mode, Mode::WorkspaceWrite);
+    }
+
     #[test]
     fn session_workspace_store_isolates_same_bare_session_id_by_profile() {
         let store = session_workspaces();
@@ -36926,6 +37444,159 @@ ignore = []
             .expect("snapshot should be retained for the entry");
         assert!(snapshot.contains("\"v1\""));
         assert!(!snapshot.contains("\"v2\""));
+    }
+
+    // Unix-only: the untracked fallback uses `git diff --no-index /dev/null`,
+    // which is only implemented on Unix (a no-op stub elsewhere).
+    #[cfg(unix)]
+    #[test]
+    fn file_mutation_diff_renders_untracked_new_file() {
+        // A brand-new file the agent just created is UNTRACKED, so plain
+        // `git diff -- <path>` reports nothing and the preview used to render
+        // an empty "ready" box. The preview must instead show the new file's
+        // contents as all-additions.
+        let repo = tempfile::tempdir().expect("temp repo");
+        for args in [
+            vec!["init"],
+            vec!["config", "user.name", "octos-test"],
+            vec!["config", "user.email", "octos-test@example.invalid"],
+        ] {
+            assert!(
+                Command::new("git")
+                    .arg("-C")
+                    .arg(repo.path())
+                    .args(&args)
+                    .status()
+                    .expect("git command")
+                    .success(),
+                "git {args:?} setup failed"
+            );
+        }
+        // Seed a committed file so the repo has history; the file under test
+        // stays UNTRACKED (it is never `git add`ed).
+        std::fs::write(repo.path().join("README.md"), "seed\n").expect("seed");
+        for args in [vec!["add", "."], vec!["commit", "-m", "seed"]] {
+            assert!(
+                Command::new("git")
+                    .arg("-C")
+                    .arg(repo.path())
+                    .args(&args)
+                    .status()
+                    .expect("git command")
+                    .success()
+            );
+        }
+
+        let src_dir = repo.path().join("app/src");
+        std::fs::create_dir_all(&src_dir).expect("src dir");
+        let path = src_dir.join("NewScreen.kt");
+        std::fs::write(&path, "class NewScreen\nfun render() {}\n").expect("write new file");
+
+        let contracts = UiProtocolContractStores::default();
+        let session_id = SessionKey("local:test".into());
+        let context = ProgressMappingContext::new(session_id.clone(), TurnId::new());
+        let event = json!({
+            "type": "file_modified",
+            "path": path,
+            "tool_call_id": "tool-new",
+        });
+        let mut mapping = map_progress_json(&context, &event);
+        apply_progress_contract_side_effects(&contracts, &context, None, &event, &mut mapping);
+
+        let preview_id = mapping
+            .status
+            .as_ref()
+            .and_then(|status| status.event.metadata.file_mutation.as_ref())
+            .and_then(|notice| notice.preview_id.clone())
+            .expect("file mutation should expose a preview id");
+
+        let result = contracts
+            .diff_previews(None)
+            .get(DiffPreviewGetParams {
+                session_id: session_id.clone(),
+                preview_id,
+            })
+            .expect("preview should be readable");
+
+        let file = &result.preview.files[0];
+        assert!(
+            file.hunks.iter().any(|hunk| !hunk.lines.is_empty()),
+            "an untracked new file must render its contents, not an empty preview"
+        );
+        assert!(
+            file.hunks
+                .iter()
+                .flat_map(|hunk| &hunk.lines)
+                .any(|line| line.content.contains("class NewScreen")),
+            "the preview must include the new file's added lines"
+        );
+    }
+
+    // Security regression: the untracked fallback reads the file directly, so it
+    // must never render a path that resolves OUTSIDE the git root (a `..` path
+    // or a symlink escape) — that would leak arbitrary file contents into a
+    // diff preview.
+    #[cfg(unix)]
+    #[test]
+    fn file_mutation_diff_does_not_leak_files_outside_the_repo() {
+        let repo = tempfile::tempdir().expect("temp repo");
+        for args in [
+            vec!["init"],
+            vec!["config", "user.name", "octos-test"],
+            vec!["config", "user.email", "octos-test@example.invalid"],
+        ] {
+            assert!(
+                Command::new("git")
+                    .arg("-C")
+                    .arg(repo.path())
+                    .args(&args)
+                    .status()
+                    .expect("git command")
+                    .success()
+            );
+        }
+        // A secret living OUTSIDE the repo, reachable via a symlink inside it.
+        let outside = tempfile::tempdir().expect("outside dir");
+        std::fs::write(outside.path().join("secret.txt"), "TOP_SECRET_VALUE\n").expect("secret");
+        let link = repo.path().join("leak.txt");
+        std::os::unix::fs::symlink(outside.path().join("secret.txt"), &link).expect("symlink");
+
+        let contracts = UiProtocolContractStores::default();
+        let session_id = SessionKey("local:test".into());
+        let context = ProgressMappingContext::new(session_id.clone(), TurnId::new());
+        let event = json!({
+            "type": "file_modified",
+            "path": link,
+            "tool_call_id": "tool-leak",
+        });
+        let mut mapping = map_progress_json(&context, &event);
+        apply_progress_contract_side_effects(&contracts, &context, None, &event, &mut mapping);
+
+        let preview_id = mapping
+            .status
+            .as_ref()
+            .and_then(|status| status.event.metadata.file_mutation.as_ref())
+            .and_then(|notice| notice.preview_id.clone())
+            .expect("file mutation should expose a preview id");
+        let result = contracts
+            .diff_previews(None)
+            .get(DiffPreviewGetParams {
+                session_id: session_id.clone(),
+                preview_id,
+            })
+            .expect("preview should be readable");
+
+        for file in &result.preview.files {
+            assert!(
+                file.hunks.iter().all(|hunk| hunk.lines.is_empty()),
+                "an escaping symlink must not render any hunks"
+            );
+        }
+        let serialized = serde_json::to_string(&result.preview).expect("serialize preview");
+        assert!(
+            !serialized.contains("TOP_SECRET_VALUE"),
+            "file contents outside the repo must never leak into a preview"
+        );
     }
 
     #[test]

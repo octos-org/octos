@@ -110,6 +110,8 @@ impl Agent {
                         let mut response = response;
                         response.usage.input_tokens += retry_usage.input_tokens;
                         response.usage.output_tokens += retry_usage.output_tokens;
+                        response.usage.cache_read_tokens += retry_usage.cache_read_tokens;
+                        response.usage.cache_write_tokens += retry_usage.cache_write_tokens;
 
                         if let Some(ref hooks) = self.hooks {
                             let latency_ms = call_start.elapsed().as_millis() as u64;
@@ -185,6 +187,10 @@ impl Agent {
                                 let mut fallback_resp = fallback_resp;
                                 fallback_resp.usage.input_tokens += retry_usage.input_tokens;
                                 fallback_resp.usage.output_tokens += retry_usage.output_tokens;
+                                fallback_resp.usage.cache_read_tokens +=
+                                    retry_usage.cache_read_tokens;
+                                fallback_resp.usage.cache_write_tokens +=
+                                    retry_usage.cache_write_tokens;
                                 return Ok((fallback_resp, false, attributed_cost));
                             }
                             Ok(_) => {
@@ -215,6 +221,8 @@ impl Agent {
                     }
                     retry_usage.input_tokens += response.usage.input_tokens;
                     retry_usage.output_tokens += response.usage.output_tokens;
+                    retry_usage.cache_read_tokens += response.usage.cache_read_tokens;
+                    retry_usage.cache_write_tokens += response.usage.cache_write_tokens;
 
                     let delay = Duration::from_secs(1 << attempt);
                     let reason = if response.stop_reason == StopReason::ContentFiltered {
@@ -319,6 +327,8 @@ impl Agent {
                                 let mut resp = resp;
                                 resp.usage.input_tokens += retry_usage.input_tokens;
                                 resp.usage.output_tokens += retry_usage.output_tokens;
+                                resp.usage.cache_read_tokens += retry_usage.cache_read_tokens;
+                                resp.usage.cache_write_tokens += retry_usage.cache_write_tokens;
                                 return Ok((resp, false, attributed_cost));
                             }
                             Ok(_) => {

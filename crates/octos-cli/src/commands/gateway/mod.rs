@@ -37,7 +37,11 @@ use {
 };
 
 /// Run as a persistent gateway daemon.
-#[derive(Debug, Args)]
+///
+/// `Serialize`/`Deserialize` back the layered startup config (see
+/// [`crate::config_layer`]): non-explicit fields fall back to
+/// `config.cli.gateway`.
+#[derive(Debug, Args, serde::Serialize, serde::Deserialize, PartialEq)]
 pub struct GatewayCommand {
     /// Working directory (defaults to current directory).
     #[arg(short, long)]

@@ -561,6 +561,8 @@ impl Agent {
         turn.record_usage(
             response.usage.input_tokens,
             response.usage.output_tokens,
+            response.usage.cache_read_tokens,
+            response.usage.cache_write_tokens,
             tracker,
             octos_llm::pricing::model_pricing(&verifier_model)
                 .map(|p| p.cost(response.usage.input_tokens, response.usage.output_tokens)),

@@ -9385,8 +9385,17 @@ impl SessionActor {
             // Attribute this turn's real token usage so a goal continuation
             // charges its budget correctly (read by
             // `maybe_advance_goal_runtime_after_turn`).
+            //
+            // #1650 — include cache reads/writes (disjoint from
+            // `input_tokens`) so a cache-heavy `GoalContinue` drained
+            // through this SessionActor (CLI/gateway) path charges the
+            // goal its TRUE cost, matching the AppUI `run_standalone_turn`
+            // sum. Without this, cache-heavy goal turns on this path
+            // undercount `tokens_used` and can slip past `token_budget`.
             self.last_turn_total_tokens = u64::from(cr.token_usage.input_tokens)
-                .saturating_add(u64::from(cr.token_usage.output_tokens));
+                .saturating_add(u64::from(cr.token_usage.output_tokens))
+                .saturating_add(u64::from(cr.token_usage.cache_read_tokens))
+                .saturating_add(u64::from(cr.token_usage.cache_write_tokens));
         }
 
         match result {

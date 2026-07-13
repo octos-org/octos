@@ -849,7 +849,12 @@ fn gemini_response_to_chat_response(api_response: GeminiResponse) -> Result<Chat
         tool_calls,
         stop_reason,
         usage: TokenUsage {
-            input_tokens: usage.prompt_token_count,
+            // Gemini reports cached tokens INSIDE promptTokenCount; the
+            // TokenUsage contract is disjoint (Anthropic-style: total prompt
+            // = input + cache_read), so subtract at the boundary.
+            input_tokens: usage
+                .prompt_token_count
+                .saturating_sub(usage.cached_content_token_count),
             output_tokens: usage.candidates_token_count,
             reasoning_tokens: usage.thoughts_token_count,
             cache_read_tokens: usage.cached_content_token_count,
@@ -947,7 +952,9 @@ fn map_gemini_sse(state: &mut GeminiStreamState, event: &crate::sse::SseEvent) -
         let cached = usage["cachedContentTokenCount"].as_u64().unwrap_or(0) as u32;
         if input > 0 || output > 0 {
             events.push(StreamEvent::Usage(TokenUsage {
-                input_tokens: input,
+                // promptTokenCount INCLUDES cached tokens; the TokenUsage
+                // contract is disjoint (total prompt = input + cache_read).
+                input_tokens: input.saturating_sub(cached),
                 output_tokens: output,
                 reasoning_tokens: thinking,
                 cache_read_tokens: cached,
@@ -1550,8 +1557,10 @@ mod tests {
             data: r#"{"usageMetadata": {"promptTokenCount": 100, "candidatesTokenCount": 50, "thoughtsTokenCount": 20, "cachedContentTokenCount": 30}}"#.into(),
         };
         let events = map_gemini_sse(&mut state, &event);
+        // input is normalized to disjoint accounting: promptTokenCount (100)
+        // minus cachedContentTokenCount (30).
         assert!(events.iter().any(
-            |e| matches!(e, StreamEvent::Usage(u) if u.reasoning_tokens == 20 && u.cache_read_tokens == 30)
+            |e| matches!(e, StreamEvent::Usage(u) if u.reasoning_tokens == 20 && u.cache_read_tokens == 30 && u.input_tokens == 70)
         ));
     }
 }
