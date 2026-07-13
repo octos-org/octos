@@ -112,6 +112,14 @@ pub struct SessionRuntimeCache {
     session_generations: Arc<std::sync::Mutex<HashMap<SessionKey, u64>>>,
     max_size: usize,
     idle_ttl: Duration,
+    /// Process-global `appui.sessions_in_cwd` flag, threaded verbatim into
+    /// every [`SessionRuntime::bootstrap_with_permissions_and_sandbox`] this
+    /// cache performs. Held on the cache (constructed once per `octos serve`)
+    /// so the flag has a single source of truth and `get_or_init*` needs no
+    /// per-call parameter. When set, a cwd-hinted session's transcript store
+    /// relocates to `<cwd>/.octos`; no-hint sessions are unaffected. Default
+    /// `false` (legacy per-profile storage).
+    sessions_in_cwd: bool,
     /// Cancellation signal for the background sweep task. Notified
     /// when the cache is dropped so the task can shut down cleanly
     /// instead of leaking onto the runtime.
@@ -232,9 +240,29 @@ impl SessionRuntimeCache {
             session_generations: Arc::new(std::sync::Mutex::new(HashMap::new())),
             max_size,
             idle_ttl,
+            // Default OFF: legacy per-profile storage. `octos serve` opts in
+            // via `with_sessions_in_cwd(config.appui.sessions_in_cwd)`.
+            sessions_in_cwd: false,
             shutdown,
             sweep_task: std::sync::Mutex::new(sweep_task),
         }
+    }
+
+    /// Enable per-project (`appui.sessions_in_cwd`) session storage for every
+    /// runtime this cache bootstraps. Wired by `octos serve` from
+    /// `config.appui.sessions_in_cwd`; off by default so all existing call
+    /// sites (and tests) keep legacy per-profile storage.
+    pub fn with_sessions_in_cwd(mut self, sessions_in_cwd: bool) -> Self {
+        self.sessions_in_cwd = sessions_in_cwd;
+        self
+    }
+
+    /// Whether this cache relocates cwd-hinted sessions to `<cwd>/.octos`.
+    /// Read by the `session/list` handler to decide whether an incoming
+    /// `cwd` param scopes the listing (single source of truth with the
+    /// bootstrap path).
+    pub fn sessions_in_cwd(&self) -> bool {
+        self.sessions_in_cwd
     }
 
     /// The LRU capacity this cache was constructed with. Exposed
@@ -428,6 +456,10 @@ impl SessionRuntimeCache {
                         workspace_hint,
                         permissions,
                         sandbox_override,
+                        // Process-global flag (default false). A cwd-hinted
+                        // session relocates its store to `<cwd>/.octos` only
+                        // when this is on; no-hint sessions ignore it.
+                        self.sessions_in_cwd,
                     )
                     .await;
                     match result {
@@ -1226,5 +1258,56 @@ mod tests {
                 .is_empty(),
         );
         drop(rt);
+    }
+
+    #[test]
+    fn with_sessions_in_cwd_builder_toggles_flag() {
+        // Default OFF; the builder flips it. Single source of truth for the
+        // bootstrap path and the `session/list` cwd gate.
+        let cache = SessionRuntimeCache::new(4, Duration::from_secs(60));
+        assert!(!cache.sessions_in_cwd());
+        assert!(
+            SessionRuntimeCache::new(4, Duration::from_secs(60))
+                .with_sessions_in_cwd(true)
+                .sessions_in_cwd()
+        );
+    }
+
+    #[tokio::test]
+    async fn cache_flag_on_relocates_cwd_hinted_session() {
+        // The flag on the cache must reach `SessionRuntime::bootstrap` via
+        // `get_or_init` so a cwd-hinted session's store lands under
+        // `<cwd>/.octos`.
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("profile-data");
+        let profile = make_profile(data_dir.clone()).await;
+        let cwd = tmp.path().join("proj");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let cwd_canon = std::fs::canonicalize(&cwd).unwrap();
+
+        let cache = SessionRuntimeCache::new(4, Duration::from_secs(60)).with_sessions_in_cwd(true);
+        let rt = cache
+            .get_or_init(&profile, SessionKey::new("api", "coding"), Some(cwd))
+            .await
+            .expect("bootstrap via cache");
+        assert_eq!(rt.sessions_root, cwd_canon.join(".octos"));
+    }
+
+    #[tokio::test]
+    async fn cache_default_keeps_cwd_hinted_session_in_profile() {
+        // Regression: a default (flag-off) cache keeps a cwd-hinted session on
+        // profile.data_dir — byte-identical to today.
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("profile-data");
+        let profile = make_profile(data_dir.clone()).await;
+        let cwd = tmp.path().join("proj");
+        std::fs::create_dir_all(&cwd).unwrap();
+
+        let cache = SessionRuntimeCache::new(4, Duration::from_secs(60));
+        let rt = cache
+            .get_or_init(&profile, SessionKey::new("api", "coding"), Some(cwd))
+            .await
+            .expect("bootstrap via cache");
+        assert_eq!(rt.sessions_root, data_dir);
     }
 }

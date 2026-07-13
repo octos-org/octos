@@ -283,6 +283,24 @@ pub struct AppUiConfig {
     /// `config.json`.
     #[serde(default)]
     pub default_session_cwd: Option<PathBuf>,
+
+    /// Relocate AppUi/stdio "coding-agent" session storage from the global
+    /// per-profile store (`<data_dir>/sessions/`) to a **per-project** store
+    /// at `<cwd>/.octos/sessions/`, so `resume` / `session/list` show the
+    /// conversations that belong to the folder the client launched in.
+    ///
+    /// Scope: only sessions opened with a `cwd`/`workspace_hint` (the
+    /// AppUi/coding-agent path). No-hint web-chat and every gateway session
+    /// stay on the per-profile store regardless of this flag — the
+    /// sessions-root resolver returns `profile.data_dir` when there is no
+    /// hint, so per-cwd storage is inert for those paths by construction.
+    ///
+    /// Default `false` for a conservative first cut: nothing changes for
+    /// existing deployments until an operator opts in. Legacy global sessions
+    /// are left in place (their cwd was never persisted, so retro-migration is
+    /// infeasible) and remain reachable via a no-`cwd` `session/list`.
+    #[serde(default)]
+    pub sessions_in_cwd: bool,
 }
 
 /// Top-level credential-pool configuration for `chat` / `serve`. Mirrors

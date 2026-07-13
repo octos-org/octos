@@ -4681,6 +4681,7 @@ async fn ui_protocol_connection(
                     &connection_headers,
                     connection_identity.as_ref(),
                     connection_profile_id,
+                    features,
                     id,
                     params,
                 )
@@ -5395,6 +5396,7 @@ where
                     &connection_headers,
                     None,
                     connection_profile_id_owned.as_deref(),
+                    features,
                     id,
                     params,
                 )
@@ -15529,15 +15531,28 @@ async fn handle_session_list(
     headers: &HeaderMap,
     identity: Option<&AuthIdentity>,
     connection_profile_id: Option<&str>,
+    features: ConnectionUiFeatures,
     id: String,
-    _params: SessionListParams,
+    params: SessionListParams,
 ) {
+    // Per-project (`appui.sessions_in_cwd`) scoping. When the client sends a
+    // `cwd` AND the server flag is on AND the connection negotiated
+    // `session.workspace_cwd.v1`, the listing is scoped to `<cwd>/.octos`.
+    // Absent cwd / flag off → `None` → byte-identical legacy listing.
+    let cwd_sessions_root = match resolve_session_list_cwd_root(state, features, &params) {
+        Ok(root) => root,
+        Err(error) => {
+            let _ = send_rpc_error(ws, Some(id), error);
+            return;
+        }
+    };
     let identity_ext = identity.cloned().map(Extension);
     let response = super::handlers::list_sessions(
         State(state.clone()),
         headers.clone(),
         identity_ext,
         connection_profile_id,
+        cwd_sessions_root,
     )
     .await;
     let method = octos_core::ui_protocol::methods::SESSION_LIST;
@@ -15553,6 +15568,55 @@ async fn handle_session_list(
             let _ = send_rpc_error(ws, Some(id), error);
         }
     }
+}
+
+/// Resolve an optional `session/list` `cwd` into the per-project session-store
+/// root (`<cwd>/.octos`), applying the same three gates the write path uses so
+/// list and open agree on where a project's sessions live:
+///
+/// 1. **Flag** — when `appui.sessions_in_cwd` is off, the `cwd` is ignored
+///    entirely (`Ok(None)` → legacy per-profile/global listing). This keeps a
+///    flag-off server byte-identical: nothing was ever written under
+///    `<cwd>/.octos`, so scoping to it would only ever return an empty list.
+/// 2. **Capability** — a `cwd` under the flag requires the connection to have
+///    negotiated `session.workspace_cwd.v1` (mirrors `session/open`'s cwd
+///    gate). A client that sends `cwd` without it gets a typed error rather
+///    than a silently-global list.
+/// 3. **Canonicalization** — the cwd must canonicalize to an existing
+///    directory; the store root is `canonical(cwd).join(".octos")`, matching
+///    `resolve_sessions_root` (which roots at the canonicalized
+///    `workspace_root`), so the listing reads exactly where the runtime
+///    persisted.
+///
+/// A trimmed-empty or absent `cwd` is always `Ok(None)` (legacy listing).
+fn resolve_session_list_cwd_root(
+    state: &AppState,
+    features: ConnectionUiFeatures,
+    params: &SessionListParams,
+) -> Result<Option<PathBuf>, RpcError> {
+    let Some(cwd) = params
+        .cwd
+        .as_deref()
+        .map(str::trim)
+        .filter(|cwd| !cwd.is_empty())
+    else {
+        return Ok(None);
+    };
+    // Flag off → the store was never relocated; ignore the cwd (legacy).
+    if !state.session_cache.sessions_in_cwd() {
+        return Ok(None);
+    }
+    if !features.session_workspace_cwd {
+        return Err(RpcError::invalid_params(
+            "session/list cwd requires feature session.workspace_cwd.v1",
+        )
+        .with_data(json!({
+            "kind": "feature_required",
+            "feature": UI_PROTOCOL_FEATURE_SESSION_WORKSPACE_CWD_V1,
+        })));
+    }
+    let workspace_root = canonical_existing_dir(cwd)?;
+    Ok(Some(workspace_root.join(".octos")))
 }
 
 async fn handle_session_status_get(
@@ -30915,6 +30979,65 @@ ignore = []
         .await;
     }
 
+    #[tokio::test]
+    async fn session_list_cwd_root_honors_flag_and_capability() {
+        // The `session/list` cwd gate: flag OFF ignores cwd (legacy listing);
+        // flag ON honors it only with the `session.workspace_cwd.v1`
+        // capability, resolving to the canonical `<cwd>/.octos` — the same
+        // root the write path (`resolve_sessions_root`) persists to.
+        use octos_core::ui_protocol::SessionListParams;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let cwd = tmp.path().join("proj");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let cwd_canon = std::fs::canonicalize(&cwd).unwrap();
+
+        let has_cap = ConnectionUiFeatures::stdio_defaults(); // workspace_cwd = true
+        let no_cap = ConnectionUiFeatures {
+            session_workspace_cwd: false,
+            ..ConnectionUiFeatures::stdio_defaults()
+        };
+        let with_cwd = SessionListParams {
+            cwd: Some(cwd.to_string_lossy().into_owned()),
+        };
+        let no_cwd = SessionListParams { cwd: None };
+
+        let state_off = {
+            let mut s = AppState::empty_for_tests();
+            s.session_cache = Arc::new(
+                crate::runtime::SessionRuntimeCache::new(4, std::time::Duration::from_secs(60))
+                    .with_sessions_in_cwd(false),
+            );
+            s
+        };
+        // Flag OFF → cwd ignored even with the capability (byte-identical legacy).
+        assert_eq!(
+            resolve_session_list_cwd_root(&state_off, has_cap, &with_cwd).unwrap(),
+            None,
+        );
+
+        let state_on = {
+            let mut s = AppState::empty_for_tests();
+            s.session_cache = Arc::new(
+                crate::runtime::SessionRuntimeCache::new(4, std::time::Duration::from_secs(60))
+                    .with_sessions_in_cwd(true),
+            );
+            s
+        };
+        // Flag ON + capability + valid cwd → the canonical <cwd>/.octos root.
+        assert_eq!(
+            resolve_session_list_cwd_root(&state_on, has_cap, &with_cwd).unwrap(),
+            Some(cwd_canon.join(".octos")),
+        );
+        // Flag ON + no cwd → None (legacy listing).
+        assert_eq!(
+            resolve_session_list_cwd_root(&state_on, has_cap, &no_cwd).unwrap(),
+            None,
+        );
+        // Flag ON + cwd but NO capability → typed error (mirrors session/open).
+        assert!(resolve_session_list_cwd_root(&state_on, no_cap, &with_cwd).is_err());
+    }
+
     async fn assert_advertised_stdio_methods_have_dispatch_path(state: Arc<AppState>) {
         let features = ConnectionUiFeatures::stdio_defaults();
         let capabilities = features.advertised_capabilities(&state);
@@ -44088,8 +44211,17 @@ ignore = []
         let observed: Arc<std::sync::Mutex<Vec<(SessionKey, Message, usize)>>> =
             Arc::new(std::sync::Mutex::new(Vec::new()));
         let observed_clone = observed.clone();
+        // Filter to THIS test's session id: the commit observer is
+        // process-global, so a concurrently-running suite test that commits a
+        // message to a DIFFERENT session would otherwise pollute this sink and
+        // make `observed.len()` exceed 3 (the `message_commit_observer_test_lock`
+        // only serialises observer-MUTATING tests, not every committer).
+        let filter_key = "local:persisted-order";
         let prev =
             octos_bus::set_message_commit_observer(Some(Arc::new(move |key, message, seq| {
+                if key.0 != filter_key {
+                    return;
+                }
                 observed_clone
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
@@ -44099,7 +44231,7 @@ ignore = []
         let tmp = tempfile::tempdir().expect("tempdir");
         let mut manager =
             octos_bus::SessionManager::open(tmp.path()).expect("session manager open");
-        let session_id = SessionKey("local:persisted-order".into());
+        let session_id = SessionKey(filter_key.into());
         for content in ["one", "two", "three"] {
             let msg = Message {
                 role: MessageRole::User,
@@ -44178,8 +44310,13 @@ ignore = []
         assert!(observed.lock().unwrap().is_empty());
 
         // Install the sink and run a second commit. Sink must contain
-        // exactly one event (the second), not two.
-        octos_bus::set_message_commit_observer(Some(Arc::new(move |_key, _message, _seq| {
+        // exactly one event (the second), not two. Filter to this test's
+        // session id so a concurrent suite committer (the observer is
+        // process-global) cannot inflate the count past 1.
+        octos_bus::set_message_commit_observer(Some(Arc::new(move |key, _message, _seq| {
+            if key.0 != "local:persisted-failure" {
+                return;
+            }
             observed_clone.lock().unwrap().push(());
         })));
         let msg2 = Message {
