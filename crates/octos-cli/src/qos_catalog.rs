@@ -10,6 +10,54 @@ use tracing::{info, warn};
 use crate::commands::chat::create_provider_with_api_type;
 use crate::config::Config;
 
+/// The canonical model catalog (`model_catalog.json`), compiled in. This is the
+/// single source of truth for model provisioning and the researched
+/// context-window / pricing floor. It ships next to the binary at release time
+/// (see `scripts/build-local-bundle.sh`), but is also embedded so a fresh
+/// install — one with no per-profile data-dir catalog and no `~/.octos`
+/// catalog yet — still seeds the adaptive router, the context-window table, and
+/// the pricing table with researched values instead of cold-start zeros.
+///
+/// `crates/octos-cli/src/api/ui_protocol.rs` (onboarding) and
+/// `crates/octos-cli/src/commands/init.rs` reference this same const so there is
+/// exactly one embedded copy.
+pub(crate) const EMBEDDED_MODEL_CATALOG: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../model_catalog.json"
+));
+
+/// Parse the compiled-in canonical catalog. `None` only if the committed file
+/// is malformed (a build-time invariant, so effectively always `Some`).
+pub(crate) fn embedded_qos_catalog() -> Option<QosCatalog> {
+    serde_json::from_str(EMBEDDED_MODEL_CATALOG).ok()
+}
+
+/// Merge a live-scored `overlay` catalog onto a full `base` catalog: every base
+/// provider is preserved, and an overlay entry replaces the base entry for the
+/// same `provider` key (live scores win). Overlay-only providers are appended.
+///
+/// The exporter persists `merge(embedded_base, router_export)` so the on-disk
+/// `model_catalog.json` stays a full superset — the sparse router export
+/// (configured lanes only) never shrinks the on-disk catalog or drops a
+/// researched context window for a model that isn't currently configured. Output
+/// is sorted by provider for deterministic diffs.
+pub(crate) fn merge_qos_catalog(base: &QosCatalog, overlay: &QosCatalog) -> QosCatalog {
+    let mut by_provider: std::collections::BTreeMap<String, ModelCatalogEntry> = base
+        .models
+        .iter()
+        .map(|entry| (entry.provider.clone(), entry.clone()))
+        .collect();
+    for entry in &overlay.models {
+        by_provider.insert(entry.provider.clone(), entry.clone());
+    }
+    QosCatalog {
+        // The overlay carries the fresh export timestamp; prefer it so the file
+        // reflects when the live scores were last written.
+        updated_at: overlay.updated_at.clone(),
+        models: by_provider.into_values().collect(),
+    }
+}
+
 /// Result of wiring up the LLM provider chain together with full
 /// QoS-aware adaptive routing.
 ///
@@ -232,6 +280,13 @@ pub(crate) fn build_adaptive_provider_chain(
         )
     };
 
+    // The persisted `model_catalog.json` merges the sparse live export ON TOP of
+    // the full compiled-in canonical catalog, so it stays a complete superset
+    // (all researched entries + live scores for configured lanes) rather than
+    // shrinking to just the configured lanes. This also "seeds the data-dir on
+    // first run": a fresh install writes the full catalog here immediately.
+    let persist_base = embedded_qos_catalog();
+
     if let Some(ref catalog) = runtime_qos_catalog {
         let ctx_entries: Vec<(String, u64, u64)> = catalog
             .models
@@ -245,20 +300,30 @@ pub(crate) fn build_adaptive_provider_chain(
             .map(|m| (m.provider.clone(), m.cost_in, m.cost_out))
             .collect();
         octos_llm::pricing::seed_pricing_catalog(&price_entries);
-        persist_qos_catalog(&catalog_path, catalog);
+        let to_persist = match &persist_base {
+            Some(base) => merge_qos_catalog(base, catalog),
+            None => catalog.clone(),
+        };
+        persist_qos_catalog(&catalog_path, &to_persist);
     }
 
     if exporter == ExporterMode::Spawn {
         if let Some(ref router) = adaptive_router_ref {
             let metrics_router = router.clone();
             let exporter_path = catalog_path.clone();
+            // The periodic exporter merges each fresh export onto the same full
+            // base, so the 30s rewrite never shrinks the on-disk catalog.
+            let exporter_base = persist_base.clone();
             tokio::spawn(async move {
                 let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
                 loop {
                     interval.tick().await;
-                    if let Ok(json) =
-                        serde_json::to_string_pretty(&metrics_router.export_model_catalog())
-                    {
+                    let export = metrics_router.export_model_catalog();
+                    let to_write = match &exporter_base {
+                        Some(base) => merge_qos_catalog(base, &export),
+                        None => export,
+                    };
+                    if let Ok(json) = serde_json::to_string_pretty(&to_write) {
                         let _ = tokio::fs::write(&exporter_path, &json).await;
                     }
                 }
@@ -297,7 +362,11 @@ pub(crate) fn load_seed_qos_catalog(data_dir: &Path) -> Option<QosCatalog> {
             }
         }
     }
-    None
+    // Fresh install: no runtime catalog on disk yet. Fall back to the compiled-in
+    // canonical catalog so the router / context-window table / pricing table are
+    // seeded with researched values instead of cold-start zeros. (On any machine
+    // that already has a runtime catalog this branch is never reached.)
+    embedded_qos_catalog()
 }
 
 pub(crate) fn persist_qos_catalog(path: &Path, catalog: &QosCatalog) {
@@ -384,6 +453,87 @@ mod tests {
         assert_eq!(loaded.models.len(), 2);
         assert_eq!(loaded.models[0].provider, "zai/glm-5-turbo");
         assert_eq!(loaded.models[1].provider, "dashscope/qwen3.5-plus");
+    }
+
+    fn scored_entry(provider: &str, score: f64, ctx: u64) -> ModelCatalogEntry {
+        ModelCatalogEntry {
+            provider: provider.to_string(),
+            model_type: ModelType::Strong,
+            stability: 1.0,
+            tool_avg_ms: 0,
+            p95_ms: 0,
+            score,
+            cost_in: 0.0,
+            cost_out: 0.0,
+            ds_output: 0,
+            context_window: ctx,
+            max_output: 0,
+        }
+    }
+
+    /// The exporter persists `merge(embedded_base, live_export)`: every base
+    /// entry survives, a live entry overrides the base for the SAME provider
+    /// (fresh scores win), and a live-only lane is appended. This keeps the
+    /// on-disk catalog a full superset even though the router export is sparse.
+    #[test]
+    fn merge_qos_catalog_preserves_base_and_overlays_live() {
+        let base = QosCatalog {
+            updated_at: "SEED".to_string(),
+            models: vec![
+                scored_entry("zai/glm-5.2", 0.0, 1_000_000),
+                scored_entry("deepseek/deepseek-v4-pro", 0.0, 1_048_576),
+            ],
+        };
+        let overlay = QosCatalog {
+            updated_at: "2026-07-12T00:00:00Z".to_string(),
+            models: vec![
+                // Live score for a configured lane already in the base …
+                scored_entry("deepseek/deepseek-v4-pro", 0.87, 1_048_576),
+                // … plus a lane not in the base (custom base_url model).
+                scored_entry("stub/stub-model", 0.5, 0),
+            ],
+        };
+
+        let merged = merge_qos_catalog(&base, &overlay);
+        // Fresh export timestamp is carried onto the merged catalog.
+        assert_eq!(merged.updated_at, "2026-07-12T00:00:00Z");
+        // Union of providers: base-only + overlaid + overlay-only = 3.
+        assert_eq!(merged.models.len(), 3);
+        let by = |p: &str| merged.models.iter().find(|m| m.provider == p).unwrap();
+        // Base-only entry preserved (researched context window intact).
+        assert_eq!(by("zai/glm-5.2").context_window, 1_000_000);
+        assert_eq!(by("zai/glm-5.2").score, 0.0);
+        // Overlapping provider: live score wins.
+        assert_eq!(by("deepseek/deepseek-v4-pro").score, 0.87);
+        // Overlay-only lane appended.
+        assert_eq!(by("stub/stub-model").score, 0.5);
+        // Deterministic (sorted-by-provider) output.
+        let providers: Vec<&str> = merged.models.iter().map(|m| m.provider.as_str()).collect();
+        let mut sorted = providers.clone();
+        sorted.sort_unstable();
+        assert_eq!(providers, sorted);
+    }
+
+    /// The compiled-in canonical catalog (the seed floor for fresh installs) is
+    /// well-formed and reflects curation: glm-5.2 + kimi-k2.6 present,
+    /// deepseek-chat removed.
+    #[test]
+    fn embedded_qos_catalog_is_curated_ssot() {
+        let catalog = embedded_qos_catalog().expect("embedded canonical catalog must parse");
+        let has = |p: &str| catalog.models.iter().any(|m| m.provider == p);
+        assert!(has("zai/glm-5.2"), "glm-5.2 present");
+        assert!(has("moonshot/kimi-k2.6"), "kimi-k2.6 present");
+        assert!(
+            !has("deepseek/deepseek-chat"),
+            "deepseek-chat curated out of the embedded catalog"
+        );
+        // Researched context window survives the round-trip through the embed.
+        let glm52 = catalog
+            .models
+            .iter()
+            .find(|m| m.provider == "zai/glm-5.2")
+            .unwrap();
+        assert_eq!(glm52.context_window, 1_000_000);
     }
 
     #[test]

@@ -116,6 +116,10 @@ for b in octos octos-sandbox news_fetch deep-search deep_crawl send_email accoun
          voice clock weather; do
     cp "target/release/$b" dist/ 2>/dev/null || true
 done
+# Ship the canonical model catalog (the model-provisioning SSOT) next to the
+# binary so a fresh install has the full catalog + accurate context windows
+# without a network fetch (octos resolves `model_catalog.json` beside the exe).
+cp model_catalog.json dist/ 2>/dev/null || true
 (cd dist && tar czf "../scripts/${TARBALL}" ./*)
 echo "==> Wrote scripts/${TARBALL}"
 

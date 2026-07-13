@@ -206,7 +206,13 @@ const APPUI_METHOD_PROFILE_SKILLS_REMOVE: &str = "profile/skills/remove";
 /// see the same typed shape they get from `profile/local/create`.
 const APPUI_METHOD_ONBOARDING_WORKSPACE_PROBE: &str = "onboarding/workspace_probe";
 const APPUI_METHOD_REVIEW_START: &str = octos_core::ui_protocol::methods::REVIEW_START;
-const DASHBOARD_PROVIDERS_JSON: &str = include_str!("../../../../dashboard/src/providers.json");
+
+/// The canonical model catalog — the single source of truth for provisionable
+/// models (`model_catalog.json`). Compiled in so onboarding always has the full
+/// catalog. This aliases the single embedded copy owned by `qos_catalog` (which
+/// also seeds the router / context / pricing tables), so there is exactly one
+/// compiled-in catalog across the crate.
+use crate::qos_catalog::EMBEDDED_MODEL_CATALOG as CANONICAL_MODEL_CATALOG;
 const APPUI_FEATURE_PROFILE_LOCAL_CREATE_V1: &str = "profile.local_create.v1";
 /// Additive capability: the server understands the optional `requested_id`
 /// field on `profile/local/create` (and treats `username`/`email` as
@@ -7716,61 +7722,81 @@ fn model_list_result(
     json!({ "session_id": session_id, "models": models })
 }
 
-fn raw_catalog_result(state: &AppState, profile_id: Option<&str>) -> Result<Value, RpcError> {
-    let mut families = serde_json::from_str::<Value>(DASHBOARD_PROVIDERS_JSON).map_err(|err| {
-        RpcError::internal_error(format!("dashboard provider catalog was not JSON: {err}"))
-    })?;
-    // Union in the QoS model catalog (model_catalog.json): it tracks the LIVE
-    // model lineup per provider (e.g. new zai GLM releases) while the bundled
-    // dashboard catalog is hand-maintained and lags. Only models are merged —
-    // a family absent from the bundled catalog has no key-env/route metadata,
-    // so it cannot be onboarded and is skipped.
-    // Per-profile QoS catalogs live under `profiles/<id>/data`
-    // (`ProfileRuntime::bootstrap` exports them there); the octos-home file
-    // is the shared seed. Merge the requesting profile's catalog first, then
-    // the home seed (`load_seed_qos_catalog` also falls back to `~/.octos`).
-    let mut sources = Vec::new();
-    if let Some(store) = state.profile_store.as_ref() {
-        if let Some(profile) =
-            profile_id.and_then(|profile_id| store.get(profile_id).ok().flatten())
-        {
-            // Honors `UserProfile.data_dir` overrides — the same resolution
-            // `ProfileRuntime::bootstrap` uses when it exports the catalog.
-            sources.push(store.resolve_data_dir(&profile));
-        }
-        sources.push(store.octos_home_dir().to_path_buf());
-    }
-    for qos in sources
-        .iter()
-        .filter_map(|dir| crate::qos_catalog::load_seed_qos_catalog(dir))
-    {
-        if let Some(families_map) = families.as_object_mut() {
-            for entry in &qos.models {
-                let Some((family_id, model_id)) = entry.provider.split_once('/') else {
-                    continue;
-                };
-                let Some(models) = families_map
-                    .get_mut(family_id)
-                    .and_then(|family| family.get_mut("models"))
-                    .and_then(Value::as_array_mut)
-                else {
-                    continue;
-                };
-                let known = models
-                    .iter()
-                    .any(|model| model.get("id").and_then(Value::as_str) == Some(model_id));
-                if !known {
-                    models.push(json!({
-                        "id": model_id,
-                        "input": entry.cost_in,
-                        "output": entry.cost_out,
-                        "max_output": entry.max_output,
-                    }));
-                }
+fn raw_catalog_result(_state: &AppState, _profile_id: Option<&str>) -> Result<Value, RpcError> {
+    // The onboarding catalog is the compiled-in canonical model_catalog.json
+    // (the model-provisioning SSOT) projected through the provider REGISTRY for
+    // family key-env metadata. providers.json is retired (now a derived,
+    // web-only artifact).
+    //
+    // The runtime QoS catalogs (per-profile data-dir + `~/.octos` seed) are
+    // deliberately NOT unioned here. Configured providers are a *subset* of the
+    // catalog, so a live QoS catalog can only ever (a) re-introduce a model that
+    // was deliberately curated out — it still lists whatever was once
+    // configured — or (b) zero out a researched context window with a QoS entry
+    // that never carried one. Neither is desirable: the canonical catalog is the
+    // single source of truth for what is provisionable, and new models are added
+    // by editing it (and shipping the updated file), which is the whole point of
+    // an SSOT. Live QoS still drives *routing* via the adaptive chain; that path
+    // is untouched.
+    //
+    // Families with no registry entry have no key-env/route metadata and can't
+    // be onboarded, so they're skipped.
+    let canonical: octos_llm::QosCatalog = serde_json::from_str(CANONICAL_MODEL_CATALOG)
+        .map_err(|error| RpcError::internal_error(format!("canonical model catalog: {error}")))?;
+
+    // `endpoints` (alternative provisioning routes — e.g. AutoDL/WiseModel) is
+    // onboarding metadata that `ModelCatalogEntry` doesn't model, so read it
+    // straight from the canonical JSON keyed by `provider`. This keeps the TUI
+    // onboarding route-picker (Official + alternatives) that the retired
+    // providers.json used to supply, without polluting the routing catalog type.
+    let endpoints_by_provider: std::collections::HashMap<String, Value> =
+        serde_json::from_str::<Value>(CANONICAL_MODEL_CATALOG)
+            .ok()
+            .and_then(|catalog| catalog.get("models").and_then(Value::as_array).cloned())
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|model| {
+                let provider = model.get("provider")?.as_str()?.to_owned();
+                let endpoints = model.get("endpoints")?.clone();
+                Some((provider, endpoints))
+            })
+            .collect();
+
+    let mut families = serde_json::Map::new();
+    for entry in &canonical.models {
+        let Some((family_id, model_id)) = entry.provider.split_once('/') else {
+            continue;
+        };
+        // Canonicalize the family via the registry (handles aliases:
+        // google->gemini, qwen->dashscope, glm->zhipu). A family with no
+        // registry entry has no key-env/route and can't be onboarded.
+        let Some(reg) = octos_llm::registry::lookup(family_id) else {
+            continue;
+        };
+        let family = families
+            .entry(reg.name.to_owned())
+            .or_insert_with(|| json!({ "env": reg.api_key_env.unwrap_or(""), "models": [] }));
+        let Some(models) = family.get_mut("models").and_then(Value::as_array_mut) else {
+            continue;
+        };
+        let known = models
+            .iter()
+            .any(|model| model.get("id").and_then(Value::as_str) == Some(model_id));
+        if !known {
+            let mut model_json = json!({
+                "id": model_id,
+                "input": entry.cost_in,
+                "output": entry.cost_out,
+                "max_output": entry.max_output,
+                "context_window": entry.context_window,
+            });
+            if let Some(endpoints) = endpoints_by_provider.get(&entry.provider) {
+                model_json["endpoints"] = endpoints.clone();
             }
+            models.push(model_json);
         }
     }
-    Ok(json!({ "families": families }))
+    Ok(json!({ "families": Value::Object(families) }))
 }
 
 async fn raw_session_status_result(
@@ -8763,15 +8789,11 @@ fn build_test_llm_provider(
 }
 
 fn dashboard_family_api_key_env(family_id: &str) -> Option<String> {
-    serde_json::from_str::<Value>(DASHBOARD_PROVIDERS_JSON)
-        .ok()
-        .and_then(|catalog| {
-            catalog
-                .get(family_id)?
-                .get("env")?
-                .as_str()
-                .map(str::to_owned)
-        })
+    // Key-env now comes from the provider registry (single source of truth),
+    // not the retired dashboard providers.json. `lookup` resolves aliases too.
+    octos_llm::registry::lookup(family_id)
+        .and_then(|entry| entry.api_key_env)
+        .map(str::to_owned)
         .and_then(|env| nonempty(Some(env)))
 }
 
@@ -27864,45 +27886,35 @@ mod tests {
         );
     }
 
-    /// The onboarding catalog unions the QoS model catalog into the bundled
-    /// families — new provider releases (e.g. zai GLM updates) appear without
-    /// waiting for the hand-maintained dashboard list; families with no
-    /// onboarding metadata (key env/route) are skipped.
+    /// The onboarding catalog is the canonical model_catalog.json — the SSOT —
+    /// and is NOT unioned with the runtime QoS catalog. A live QoS catalog only
+    /// reflects already-configured providers (a subset of the catalog), so
+    /// unioning it could only re-introduce curated-out models or zero out
+    /// researched context windows. This guards that regression: a model present
+    /// in the runtime QoS catalog but absent from the canonical catalog must NOT
+    /// appear in onboarding.
     #[test]
-    fn catalog_result_unions_qos_models_into_families() {
+    fn catalog_result_ignores_runtime_qos_not_in_canonical() {
         let dir = tempfile::tempdir().unwrap();
+        // `octos_home_dir()` resolves to `dir` for this store, so this file is
+        // the seed QoS catalog the OLD union path would have read.
         std::fs::write(
             dir.path().join("model_catalog.json"),
             serde_json::to_string(&json!({
                 "updated_at": "2026-07-10T00:00:00Z",
-                "models": [
-                    {
-                        "provider": "zai/glm-9.9-test",
-                        "type": "strong",
-                        "stability": 0.7,
-                        "tool_avg_ms": 1,
-                        "p95_ms": 1,
-                        "score": 0.1,
-                        "cost_in": 1.0,
-                        "cost_out": 4.0,
-                        "ds_output": 1,
-                        "context_window": 1000,
-                        "max_output": 99
-                    },
-                    {
-                        "provider": "unknownfam/mystery-1",
-                        "type": "fast",
-                        "stability": 0.5,
-                        "tool_avg_ms": 1,
-                        "p95_ms": 1,
-                        "score": 0.2,
-                        "cost_in": 0.1,
-                        "cost_out": 0.2,
-                        "ds_output": 1,
-                        "context_window": 1000,
-                        "max_output": 9
-                    }
-                ]
+                "models": [{
+                    "provider": "zai/glm-9.9-not-in-catalog",
+                    "type": "strong",
+                    "stability": 0.7,
+                    "tool_avg_ms": 1,
+                    "p95_ms": 1,
+                    "score": 0.1,
+                    "cost_in": 1.0,
+                    "cost_out": 4.0,
+                    "ds_output": 1,
+                    "context_window": 1000,
+                    "max_output": 99
+                }]
             }))
             .unwrap(),
         )
@@ -27912,17 +27924,82 @@ mod tests {
         let catalog = raw_catalog_result(&state, None).expect("catalog");
         let families = &catalog["families"];
         let zai_models = families["zai"]["models"].as_array().unwrap();
-        assert!(
-            zai_models.iter().any(|model| model["id"] == "glm-9.9-test"),
-            "QoS-only zai model unioned in: {zai_models:?}"
-        );
+        // Canonical lineup is present …
         assert!(
             zai_models.iter().any(|model| model["id"] == "glm-5.2"),
-            "bundled zai lineup still present"
+            "canonical zai lineup present: {zai_models:?}"
+        );
+        // … but the runtime-QoS-only model does NOT leak into onboarding: the
+        // canonical catalog is the single source of truth for what's
+        // provisionable.
+        assert!(
+            !zai_models
+                .iter()
+                .any(|model| model["id"] == "glm-9.9-not-in-catalog"),
+            "runtime-QoS-only model must not appear in onboarding: {zai_models:?}"
+        );
+    }
+
+    #[test]
+    fn catalog_result_sourced_from_registry_and_canonical_catalog() {
+        // With no runtime data-dir catalog, the onboarding catalog is fully
+        // populated from the compiled-in canonical model_catalog.json (the SSOT)
+        // with family key-env from the provider registry — providers.json is no
+        // longer the source.
+        let dir = tempfile::tempdir().unwrap();
+        let state = local_profile_state(dir.path());
+        let catalog = raw_catalog_result(&state, None).expect("catalog");
+        let families = catalog["families"].as_object().expect("families object");
+
+        let ids = |fam: &str| -> Vec<String> {
+            families[fam]["models"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|m| m["id"].as_str().map(str::to_owned))
+                .collect()
+        };
+
+        // Key-env comes from the registry, not a hand-maintained env map.
+        assert_eq!(families["zai"]["env"], "ZAI_API_KEY");
+        // Curation: glm-5.2 + kimi-k2.6 present; deepseek-chat removed.
+        assert!(ids("zai").contains(&"glm-5.2".to_owned()), "{:?}", ids("zai"));
+        assert!(
+            ids("moonshot").contains(&"kimi-k2.6".to_owned()),
+            "{:?}",
+            ids("moonshot")
         );
         assert!(
-            families.get("unknownfam").is_none(),
-            "families without onboarding metadata are skipped"
+            !ids("deepseek").contains(&"deepseek-chat".to_owned()),
+            "deepseek-chat curated out: {:?}",
+            ids("deepseek")
+        );
+        assert!(ids("deepseek").contains(&"deepseek-v4-pro".to_owned()));
+
+        // Researched context window flows through to the catalog (glm-5.2 = 1M).
+        let glm52 = families["zai"]["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["id"] == "glm-5.2")
+            .unwrap();
+        assert_eq!(glm52["context_window"], 1_000_000);
+
+        // Alternative provisioning endpoints (AutoDL/WiseModel) survive into the
+        // onboarding catalog so the TUI route-picker keeps its choices — this was
+        // supplied by the retired providers.json and must not be lost.
+        let v4pro = families["deepseek"]["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["id"] == "deepseek-v4-pro")
+            .unwrap();
+        let endpoints = v4pro["endpoints"].as_array().expect("v4-pro has endpoints");
+        assert!(
+            endpoints
+                .iter()
+                .any(|e| e["id"] == "autodl" && e["api_key_env"] == "AUTODL_API_KEY"),
+            "AutoDL alternative endpoint present: {endpoints:?}"
         );
     }
 
