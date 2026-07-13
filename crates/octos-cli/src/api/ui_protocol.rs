@@ -6677,7 +6677,10 @@ fn resolve_optional_local_email(
 /// `<id>@solo.local` together — so the synthesized address is unique and
 /// length-safe (local part = id, ≤64) by construction, with no per-candidate
 /// email rescan. A client-PROVIDED email keeps its hard-error-on-collision
-/// behavior and does not influence id selection.
+/// behavior and does not influence id selection. A final `get_by_email`
+/// revalidation runs immediately before the write to also catch an email
+/// claimed by a writer OUTSIDE `LOCAL_PROFILE_CREATE_LOCK` after the snapshot
+/// (see the residual-race note at that check).
 fn create_fresh_local_solo_profile(
     profile_store: &crate::profiles::ProfileStore,
     user_store: &crate::user_store::UserStore,
@@ -6706,21 +6709,51 @@ fn create_fresh_local_solo_profile(
     };
 
     let name = resolve_local_display_name(params, &profile_id);
-    let email = match provided_email {
-        // Client chose it → a collision with another owner is a hard error.
-        Some(provided) => {
-            if let Some(existing) = user_store.get_by_email(&provided).map_err(|error| {
-                runtime_unavailable_error(format!("failed to read users: {error}"))
-            })? {
-                if existing.id != profile_id {
-                    return Err(profile_collision_error(&profile_id, "email"));
-                }
-            }
-            provided
+    // The client's email when supplied, else the synthesized `<id>@solo.local`
+    // (chosen free from the snapshot during id selection).
+    let email_provided = provided_email.is_some();
+    let email = provided_email.unwrap_or_else(|| synthesized_local_email(&profile_id));
+
+    // Final email-uniqueness gate, re-read from the live store immediately
+    // before the write. Our earlier snapshot (and the id-selection folding) is
+    // only consistent w.r.t. other creators that hold LOCAL_PROFILE_CREATE_LOCK;
+    // a writer OUTSIDE that lock (e.g. `admin::update_profile`, which sets a
+    // user's email directly) could claim `email` AFTER the snapshot. Re-reading
+    // here shrinks that cross-writer window to the sub-microsecond gap between
+    // this check and `save`.
+    //
+    // RESIDUAL (accepted): an admin/OTP email-write that lands in that tiny gap
+    // can still produce a duplicate top-level email. It is rare and adversarial
+    // (an admin setting some user's email to exactly a concurrently-minted
+    // `<id>@solo.local`) and self-heals — `resolve_solo_user` resolves by newest
+    // `created_at`, and the next create observes the claim. Fully closing it
+    // would require enforcing email uniqueness inside `UserStore::save` itself
+    // (so admin/OTP writers are covered too), a broader change than this
+    // onboarding path warrants; see the codex thread on this file.
+    if let Some(existing) = user_store
+        .get_by_email(&email)
+        .map_err(|error| runtime_unavailable_error(format!("failed to read users: {error}")))?
+    {
+        if existing.id != profile_id {
+            return Err(if email_provided {
+                // Client chose a duplicate address → durable conflict.
+                profile_collision_error(&profile_id, "email")
+            } else {
+                // A synthesized address was raced by an outside writer →
+                // recoverable: a retry mints a fresh id + `<id>@solo.local`.
+                local_profile_error(
+                    "profile_local_collision",
+                    format!("email '{email}' was claimed during creation; retry"),
+                )
+                .with_data(json!({
+                    "kind": "profile_local_collision",
+                    "profile_id": profile_id,
+                    "reason": "email",
+                    "recoverable": true,
+                }))
+            });
         }
-        // Free by construction: the id was chosen so `<id>@solo.local` is unclaimed.
-        None => synthesized_local_email(&profile_id),
-    };
+    }
     let username = profile_id.clone();
 
     let now = Utc::now();
@@ -29404,6 +29437,54 @@ mod tests {
             result.email,
             format!("{base}@solo.local"),
             "must not reuse the explicitly-claimed email"
+        );
+    }
+
+    #[test]
+    fn should_reject_when_provided_email_belongs_to_another_user() {
+        // The pre-save email-uniqueness gate (which also closes the cross-writer
+        // race window) rejects a create whose CLIENT-PROVIDED email is already
+        // held by a different user.
+        let dir = tempfile::tempdir().unwrap();
+        let state = local_profile_state(dir.path());
+
+        state
+            .user_store
+            .as_ref()
+            .unwrap()
+            .save(&crate::user_store::User {
+                id: "zai".into(),
+                email: "taken@example.com".into(),
+                name: "Zai".into(),
+                role: crate::user_store::UserRole::Admin,
+                created_at: chrono::Utc::now(),
+                last_login_at: None,
+            })
+            .unwrap();
+
+        let err = create_or_get_local_solo_profile(
+            &state,
+            octos_core::ui_protocol::ProfileLocalCreateParams {
+                requested_id: Some("glm".into()),
+                email: "taken@example.com".into(),
+                ..Default::default()
+            },
+        )
+        .expect_err("a provided email held by another user must be rejected");
+        assert_eq!(err.code, rpc_error_codes::INVALID_PARAMS);
+        assert_eq!(
+            err.data.as_ref().and_then(|data| data.get("kind")),
+            Some(&json!("profile_local_collision"))
+        );
+        // No half-written profile: the create was rejected before persistence.
+        assert!(
+            state
+                .profile_store
+                .as_ref()
+                .unwrap()
+                .get("glm")
+                .unwrap()
+                .is_none()
         );
     }
 
