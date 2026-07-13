@@ -2986,9 +2986,26 @@ pub struct TurnStateGetResult {
 // `StatusResponse`, `ContentEntry`) into the protocol crate. The shapes
 // are unchanged from the REST contract — only the transport flips.
 
-/// Params for `session/list` — empty request.
+/// Params for `session/list`.
+///
+/// Historically an empty request (`{}`). The optional `cwd` field is an
+/// **additive** extension for per-project session storage
+/// (`appui.sessions_in_cwd`): when a client supplies it (and has negotiated
+/// [`UI_PROTOCOL_FEATURE_SESSION_WORKSPACE_CWD_V1`]), a server with the flag
+/// enabled lists the sessions stored under `<cwd>/.octos` instead of the
+/// per-profile global store. It is `#[serde(default, skip_serializing_if =
+/// "Option::is_none")]` so old clients that send `{}` still deserialize
+/// (→ `cwd: None` → legacy global listing) and the wire shape of a
+/// no-cwd request is byte-identical to the historical empty object.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SessionListParams {}
+pub struct SessionListParams {
+    /// Optional project working directory. When present, honored by a
+    /// server with `appui.sessions_in_cwd` enabled to scope the listing to
+    /// that project's `<cwd>/.octos` session store. Absent → legacy
+    /// per-profile/global listing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+}
 
 /// Result for `session/list`. `sessions` is the JSON array the existing
 /// `GET /api/sessions` handler emits (one `SessionInfo` per entry, per
@@ -11327,14 +11344,32 @@ mod tests {
     /// REST DTO to fail this test before it lands.
     #[test]
     fn aux_rest_to_ws_v1_request_dtos_match_json_goldens() {
-        // session/list — empty params
+        // session/list — default (no cwd) params still serialize to the
+        // historical empty object. The `cwd` field is
+        // `skip_serializing_if = "Option::is_none"`, so an additive optional
+        // field does NOT break the pinned wire shape: a no-cwd request is
+        // byte-identical to the legacy `{}`.
         assert_eq!(
             serde_json::to_value(SessionListParams::default()).expect("serialize"),
             serde_json::json!({}),
         );
+        // Old clients that send a bare `{}` still deserialize (→ cwd: None).
         let parsed: SessionListParams =
             serde_json::from_value(serde_json::json!({})).expect("decode");
         assert_eq!(parsed, SessionListParams::default());
+        assert_eq!(parsed.cwd, None);
+        // session/list — WITH the additive cwd (per-project storage). Pin the
+        // new wire shape so a rename/type-flip of the field fails here.
+        let with_cwd = SessionListParams {
+            cwd: Some("/home/me/proj".into()),
+        };
+        assert_eq!(
+            serde_json::to_value(&with_cwd).expect("serialize"),
+            serde_json::json!({ "cwd": "/home/me/proj" }),
+        );
+        let parsed_cwd: SessionListParams =
+            serde_json::from_value(serde_json::json!({ "cwd": "/home/me/proj" })).expect("decode");
+        assert_eq!(parsed_cwd, with_cwd);
 
         // session/snapshot
         let p = SessionSnapshotParams {

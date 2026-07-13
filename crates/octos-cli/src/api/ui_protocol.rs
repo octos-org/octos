@@ -4681,6 +4681,7 @@ async fn ui_protocol_connection(
                     &connection_headers,
                     connection_identity.as_ref(),
                     connection_profile_id,
+                    features,
                     id,
                     params,
                 )
@@ -5395,6 +5396,7 @@ where
                     &connection_headers,
                     None,
                     connection_profile_id_owned.as_deref(),
+                    features,
                     id,
                     params,
                 )
@@ -15529,15 +15531,29 @@ async fn handle_session_list(
     headers: &HeaderMap,
     identity: Option<&AuthIdentity>,
     connection_profile_id: Option<&str>,
+    features: ConnectionUiFeatures,
     id: String,
-    _params: SessionListParams,
+    params: SessionListParams,
 ) {
+    // Per-project (`appui.sessions_in_cwd`) scoping. When the client sends a
+    // `cwd` AND the server flag is on AND the connection negotiated
+    // `session.workspace_cwd.v1`, the listing is scoped to `<cwd>/.octos`.
+    // Absent cwd / flag off → `None` → byte-identical legacy listing.
+    let cwd_sessions_root =
+        match resolve_session_list_cwd_root(state, features, connection_profile_id, &params) {
+            Ok(root) => root,
+            Err(error) => {
+                let _ = send_rpc_error(ws, Some(id), error);
+                return;
+            }
+        };
     let identity_ext = identity.cloned().map(Extension);
     let response = super::handlers::list_sessions(
         State(state.clone()),
         headers.clone(),
         identity_ext,
         connection_profile_id,
+        cwd_sessions_root,
     )
     .await;
     let method = octos_core::ui_protocol::methods::SESSION_LIST;
@@ -15553,6 +15569,75 @@ async fn handle_session_list(
             let _ = send_rpc_error(ws, Some(id), error);
         }
     }
+}
+
+/// Resolve an optional `session/list` `cwd` into the per-project, per-profile
+/// session-store root (`<cwd>/.octos/<profile_id>`), applying the same gates
+/// the write path uses so list and open agree on where a project's sessions
+/// live:
+///
+/// 1. **Flag** — when `appui.sessions_in_cwd` is off, the `cwd` is ignored
+///    entirely (`Ok(None)` → legacy per-profile/global listing). This keeps a
+///    flag-off server byte-identical: nothing was ever written under
+///    `<cwd>/.octos`, so scoping to it would only ever return an empty list.
+/// 2. **Capability** — a `cwd` under the flag requires the connection to have
+///    negotiated `session.workspace_cwd.v1` (mirrors `session/open`'s cwd
+///    gate). A client that sends `cwd` without it gets a typed error rather
+///    than a silently-global list.
+/// 3. **Workspace safety** — the SAME [`validate_session_workspace_allowed`]
+///    gate `session/open` runs: the cwd must canonicalize to a directory AND
+///    must not be rooted under a banned system path. Without this a client
+///    could point the listing at `/etc` (or any service-writable path) and
+///    `SessionManager::open` would CREATE `<cwd>/.octos/…` there and enumerate
+///    it. On rejection we surface the typed error (consistent with
+///    `session/open`) rather than silently degrading.
+/// 4. **Profile namespace** — the store root is
+///    `<cwd>/.octos/<profile_id>` (via [`project_sessions_root`]), matching
+///    the write path so two profiles that share a project cwd never read each
+///    other's transcripts.
+///
+/// A trimmed-empty or absent `cwd` is always `Ok(None)` (legacy listing).
+fn resolve_session_list_cwd_root(
+    state: &AppState,
+    features: ConnectionUiFeatures,
+    connection_profile_id: Option<&str>,
+    params: &SessionListParams,
+) -> Result<Option<PathBuf>, RpcError> {
+    let Some(cwd) = params
+        .cwd
+        .as_deref()
+        .map(str::trim)
+        .filter(|cwd| !cwd.is_empty())
+    else {
+        return Ok(None);
+    };
+    // Flag off → the store was never relocated; ignore the cwd (legacy).
+    if !state.session_cache.sessions_in_cwd() {
+        return Ok(None);
+    }
+    if !features.session_workspace_cwd {
+        return Err(RpcError::invalid_params(
+            "session/list cwd requires feature session.workspace_cwd.v1",
+        )
+        .with_data(json!({
+            "kind": "feature_required",
+            "feature": UI_PROTOCOL_FEATURE_SESSION_WORKSPACE_CWD_V1,
+        })));
+    }
+    let workspace_root = canonical_existing_dir(cwd)?;
+    // SAME safety gate as session/open — reject banned system roots (and the
+    // missing-profile-runtime case) BEFORE opening a SessionManager that would
+    // otherwise materialize `<cwd>/.octos` at an arbitrary path.
+    validate_session_workspace_allowed(state, connection_profile_id, &workspace_root)?;
+    // Namespace by the SAME profile the write path uses so the listing reads
+    // exactly the connection's own project store.
+    let profile_id = resolve_session_profile_runtime(state, connection_profile_id)
+        .map(|runtime| runtime.profile_id.clone())
+        .unwrap_or_else(|| connection_profile_id.unwrap_or(MAIN_PROFILE_ID).to_string());
+    Ok(Some(crate::runtime::session::project_sessions_root(
+        &workspace_root,
+        &profile_id,
+    )))
 }
 
 async fn handle_session_status_get(
@@ -30915,6 +31000,152 @@ ignore = []
         .await;
     }
 
+    #[tokio::test]
+    async fn session_list_cwd_root_honors_flag_and_capability() {
+        // The `session/list` cwd gate: flag OFF ignores cwd (legacy listing);
+        // flag ON honors it only with the `session.workspace_cwd.v1`
+        // capability; and it runs the SAME workspace-safety gate as
+        // session/open before resolving a root (proven here by the no-runtime
+        // rejection — see `session_list_cwd_root_gates_path_and_namespaces_by_profile`
+        // for the safe-path happy case + banned-path rejection).
+        use octos_core::ui_protocol::SessionListParams;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let cwd = tmp.path().join("proj");
+        std::fs::create_dir_all(&cwd).unwrap();
+
+        let has_cap = ConnectionUiFeatures::stdio_defaults(); // workspace_cwd = true
+        let no_cap = ConnectionUiFeatures {
+            session_workspace_cwd: false,
+            ..ConnectionUiFeatures::stdio_defaults()
+        };
+        let with_cwd = SessionListParams {
+            cwd: Some(cwd.to_string_lossy().into_owned()),
+        };
+        let no_cwd = SessionListParams { cwd: None };
+
+        let state_off = {
+            let mut s = AppState::empty_for_tests();
+            s.session_cache = Arc::new(
+                crate::runtime::SessionRuntimeCache::new(4, std::time::Duration::from_secs(60))
+                    .with_sessions_in_cwd(false),
+            );
+            s
+        };
+        // Flag OFF → cwd ignored even with the capability (byte-identical legacy).
+        assert_eq!(
+            resolve_session_list_cwd_root(&state_off, has_cap, None, &with_cwd).unwrap(),
+            None,
+        );
+
+        let state_on = {
+            let mut s = AppState::empty_for_tests();
+            s.session_cache = Arc::new(
+                crate::runtime::SessionRuntimeCache::new(4, std::time::Duration::from_secs(60))
+                    .with_sessions_in_cwd(true),
+            );
+            s
+        };
+        // Flag ON + no cwd → None (legacy listing).
+        assert_eq!(
+            resolve_session_list_cwd_root(&state_on, has_cap, None, &no_cwd).unwrap(),
+            None,
+        );
+        // Flag ON + cwd but NO capability → typed error (mirrors session/open).
+        assert!(resolve_session_list_cwd_root(&state_on, no_cap, None, &with_cwd).is_err());
+        // Flag ON + capability + a valid cwd but NO registered profile runtime
+        // → the workspace-safety gate (`validate_session_workspace_allowed`)
+        // rejects. This proves the gate is wired BEFORE any SessionManager is
+        // opened at the cwd (the P1 the codex review flagged).
+        assert!(resolve_session_list_cwd_root(&state_on, has_cap, None, &with_cwd).is_err());
+    }
+
+    #[tokio::test]
+    async fn session_list_cwd_root_gates_path_and_namespaces_by_profile() {
+        // With a registered profile runtime: a SAFE cwd resolves to the
+        // per-project, per-PROFILE store `<cwd>/.octos/<profile_id>` (so two
+        // profiles sharing a cwd can't read each other's transcripts), and a
+        // banned system path is rejected by the shared safety gate.
+        use octos_core::ui_protocol::SessionListParams;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let profile = crate::profiles::UserProfile {
+            id: "dev".to_string(),
+            name: "Dev".to_string(),
+            enabled: true,
+            data_dir: None,
+            parent_id: None,
+            public_subdomain: None,
+            config: crate::profiles::ProfileConfig {
+                llm: Some(crate::profiles::LlmProfileConfig {
+                    primary: Some(crate::profiles::LlmModelSelectionConfig {
+                        family_id: Some("openai".to_string()),
+                        model_id: Some("gpt-4o-mini".to_string()),
+                        route: Some(crate::profiles::LlmRouteConfig {
+                            route_id: None,
+                            label: None,
+                            base_url: None,
+                            api_key_env: Some("SESS_CWD_TEST_KEY".to_string()),
+                            api_type: None,
+                        }),
+                        ..Default::default()
+                    }),
+                    fallbacks: Vec::new(),
+                }),
+                env_vars: [("SESS_CWD_TEST_KEY".to_string(), "test-key".to_string())]
+                    .into_iter()
+                    .collect(),
+                ..Default::default()
+            },
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        let data_dir = tmp.path().join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let runtime = crate::runtime::ProfileRuntime::bootstrap(
+            &profile,
+            &data_dir,
+            None,
+            crate::runtime::BootstrapRole::Serve,
+        )
+        .await
+        .expect("bootstrap dev runtime");
+
+        let mut state = AppState::empty_for_tests();
+        state.profiles.insert("dev".to_string(), runtime);
+        state.session_cache = Arc::new(
+            crate::runtime::SessionRuntimeCache::new(4, std::time::Duration::from_secs(60))
+                .with_sessions_in_cwd(true),
+        );
+
+        let cap = ConnectionUiFeatures::stdio_defaults();
+
+        // Safe cwd → `<cwd>/.octos/dev` (profile-namespaced).
+        let good = tmp.path().join("project");
+        std::fs::create_dir_all(&good).unwrap();
+        let good_canon = std::fs::canonicalize(&good).unwrap();
+        let good_params = SessionListParams {
+            cwd: Some(good.to_string_lossy().into_owned()),
+        };
+        let resolved =
+            resolve_session_list_cwd_root(&state, cap, Some("dev"), &good_params).unwrap();
+        assert_eq!(
+            resolved,
+            Some(crate::runtime::session::project_sessions_root(
+                &good_canon,
+                "dev"
+            )),
+        );
+        assert_eq!(resolved, Some(good_canon.join(".octos").join("dev")));
+
+        // Banned system root (`/usr` is a real dir on Linux and macOS that
+        // canonicalizes to `/usr`) → rejected by the safety gate.
+        let banned = SessionListParams {
+            cwd: Some("/usr".to_string()),
+        };
+        assert!(resolve_session_list_cwd_root(&state, cap, Some("dev"), &banned).is_err());
+    }
+
     async fn assert_advertised_stdio_methods_have_dispatch_path(state: Arc<AppState>) {
         let features = ConnectionUiFeatures::stdio_defaults();
         let capabilities = features.advertised_capabilities(&state);
@@ -44088,8 +44319,17 @@ ignore = []
         let observed: Arc<std::sync::Mutex<Vec<(SessionKey, Message, usize)>>> =
             Arc::new(std::sync::Mutex::new(Vec::new()));
         let observed_clone = observed.clone();
+        // Filter to THIS test's session id: the commit observer is
+        // process-global, so a concurrently-running suite test that commits a
+        // message to a DIFFERENT session would otherwise pollute this sink and
+        // make `observed.len()` exceed 3 (the `message_commit_observer_test_lock`
+        // only serialises observer-MUTATING tests, not every committer).
+        let filter_key = "local:persisted-order";
         let prev =
             octos_bus::set_message_commit_observer(Some(Arc::new(move |key, message, seq| {
+                if key.0 != filter_key {
+                    return;
+                }
                 observed_clone
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
@@ -44099,7 +44339,7 @@ ignore = []
         let tmp = tempfile::tempdir().expect("tempdir");
         let mut manager =
             octos_bus::SessionManager::open(tmp.path()).expect("session manager open");
-        let session_id = SessionKey("local:persisted-order".into());
+        let session_id = SessionKey(filter_key.into());
         for content in ["one", "two", "three"] {
             let msg = Message {
                 role: MessageRole::User,
@@ -44178,8 +44418,13 @@ ignore = []
         assert!(observed.lock().unwrap().is_empty());
 
         // Install the sink and run a second commit. Sink must contain
-        // exactly one event (the second), not two.
-        octos_bus::set_message_commit_observer(Some(Arc::new(move |_key, _message, _seq| {
+        // exactly one event (the second), not two. Filter to this test's
+        // session id so a concurrent suite committer (the observer is
+        // process-global) cannot inflate the count past 1.
+        octos_bus::set_message_commit_observer(Some(Arc::new(move |key, _message, _seq| {
+            if key.0 != "local:persisted-failure" {
+                return;
+            }
             observed_clone.lock().unwrap().push(());
         })));
         let msg2 = Message {

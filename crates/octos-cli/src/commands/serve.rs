@@ -535,10 +535,13 @@ impl ServeCommand {
                 }
             }
         }
-        let session_cache = Arc::new(crate::runtime::SessionRuntimeCache::new(
-            64,
-            std::time::Duration::from_secs(1800),
-        ));
+        let session_cache = Arc::new(
+            crate::runtime::SessionRuntimeCache::new(64, std::time::Duration::from_secs(1800))
+                // Per-project session storage (opt-in, default off). When set,
+                // a cwd-hinted AppUi session's transcript store relocates to
+                // `<cwd>/.octos`; no-hint/gateway sessions are unaffected.
+                .with_sessions_in_cwd(config.appui.sessions_in_cwd),
+        );
 
         let bridge_js_path = data_dir.join("whatsapp-bridge").join("bridge.js");
         let process_manager = Arc::new(

@@ -593,6 +593,15 @@ pub async fn list_sessions(
     headers: HeaderMap,
     identity: Option<Extension<AuthIdentity>>,
     connection_profile_id: Option<&str>,
+    // Per-project (`appui.sessions_in_cwd`) session-store root, already
+    // resolved to `<cwd>/.octos` and gated by the WS handler (flag on +
+    // `session.workspace_cwd.v1` negotiated + canonicalized cwd). When
+    // `Some`, the listing is scoped to that project's store ONLY — the
+    // per-profile / global / gateway merge below is skipped, because the
+    // client asked for "this project's conversations", not every scope.
+    // `None` (the default, and always when the flag is off) → byte-identical
+    // legacy behavior.
+    cwd_sessions_root: Option<std::path::PathBuf>,
 ) -> Response {
     // Collect sessions from both the standalone store and gateway profiles.
     let mut all: Vec<SessionInfo> = Vec::new();
@@ -606,6 +615,16 @@ pub async fn list_sessions(
         Ok(pid) => pid,
         Err(response) => return response,
     };
+
+    // Per-project listing short-circuit (`appui.sessions_in_cwd`). The
+    // authorization gate above still runs (the connection must be allowed to
+    // list at all); we then scope the listing to the cwd's `<cwd>/.octos`
+    // store instead of the profile/global stores. Runs BEFORE the legacy
+    // merge so a project session list never bleeds in another scope's rows.
+    if let Some(cwd_root) = cwd_sessions_root {
+        let cwd_sessions = list_profile_sessions(&cwd_root);
+        return Json(cwd_sessions).into_response();
+    }
 
     // M11-F per-profile SessionManager listing. Mirrors the
     // `session_messages` fix in commit 10cc9378d (`fix(api): route
@@ -4634,6 +4653,7 @@ mod tests {
             HeaderMap::new(),
             Some(Extension(AuthIdentity::Admin)),
             None,
+            None,
         )
         .await;
         assert_eq!(response.status(), StatusCode::OK);
@@ -4710,7 +4730,7 @@ mod tests {
 
         // connection_profile_id = "dev", empty headers, no identity — the
         // frozen scope a solo stdio connection carries.
-        let response = list_sessions(State(state), HeaderMap::new(), None, Some("dev")).await;
+        let response = list_sessions(State(state), HeaderMap::new(), None, Some("dev"), None).await;
         assert_eq!(response.status(), StatusCode::OK);
         let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
             .await
@@ -5500,7 +5520,7 @@ mod tests {
             ..AppState::empty_for_tests()
         });
 
-        let response = list_sessions(State(state), HeaderMap::new(), None, None).await;
+        let response = list_sessions(State(state), HeaderMap::new(), None, None, None).await;
         assert_eq!(response.status(), StatusCode::OK);
         let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
             .await
@@ -5558,7 +5578,7 @@ mod tests {
         });
 
         let start = std::time::Instant::now();
-        let response = list_sessions(State(state), HeaderMap::new(), None, None).await;
+        let response = list_sessions(State(state), HeaderMap::new(), None, None, None).await;
         let elapsed = start.elapsed();
 
         assert_eq!(response.status(), StatusCode::OK);
