@@ -692,10 +692,15 @@ impl SessionRuntime {
 /// (`SessionManager::open(root)`), so relocating it is "pass a different
 /// root", not "re-architect the store".
 ///
-/// - `sessions_in_cwd && had_hint` → `<cwd>/.octos`, where `<cwd>` is the
-///   canonical hinted workspace (`workspace_root` already canonicalizes a
-///   coding-agent hint, so `workspace_root.join(".octos")` is the project
-///   store and matches what `session/list`'s `cwd` branch derives).
+/// - `sessions_in_cwd && had_hint` → `<cwd>/.octos/<profile_id>` (see
+///   [`project_sessions_root`]), where `<cwd>` is the canonical hinted
+///   workspace (`workspace_root` already canonicalizes a coding-agent hint).
+///   The `<profile_id>` segment is load-bearing: two authenticated profiles
+///   that point at the SAME project cwd must NOT share on-disk files — without
+///   it, raw `web-*` session ids (whose key carries no profile) would collide
+///   in `users/<base>/` and one profile could list/open/mutate another's
+///   transcripts. It mirrors how the global store isolates profiles by giving
+///   each its own `data_dir` root.
 /// - otherwise → [`ProfileRuntime::data_dir`] — the historical per-profile
 ///   store. This includes **every** no-hint session (web-chat, gateway) and
 ///   **every** session while the flag is off, so per-cwd storage is inert for
@@ -713,9 +718,49 @@ pub(crate) fn resolve_sessions_root(
     sessions_in_cwd: bool,
 ) -> PathBuf {
     if sessions_in_cwd && had_hint {
-        workspace_root.join(".octos")
+        project_sessions_root(workspace_root, &profile.profile_id)
     } else {
         profile.data_dir.clone()
+    }
+}
+
+/// The per-project, per-profile session-store root: `<cwd>/.octos/<profile_id>`.
+///
+/// The single source of truth for the on-disk location of a cwd-scoped store,
+/// shared by the write path ([`resolve_sessions_root`] /
+/// [`resolve_sessions_root_from_hint`]) and the `session/list` cwd branch so
+/// listing reads exactly where the runtime persisted. `profile_id` is
+/// percent-encoded so an exotic profile id (`:`, `/`, …) can't escape the
+/// project's `.octos` directory.
+pub(crate) fn project_sessions_root(canonical_cwd: &Path, profile_id: &str) -> PathBuf {
+    canonical_cwd
+        .join(".octos")
+        .join(octos_bus::session::encode_path_component(profile_id))
+}
+
+/// Resolve the sessions root from a **raw** (possibly non-canonical) workspace
+/// hint, as the [`super::SessionRuntimeCache`] sees it before bootstrap
+/// canonicalizes it.
+///
+/// This is the cache-key form of [`resolve_sessions_root`]: it best-effort
+/// canonicalizes the hint (idempotent when it is already canonical, which it is
+/// on the `session/open` and turn/read paths — both pass a canonicalized cwd or
+/// the stored canonical `workspace_root`) so the cache identity a session is
+/// stored under matches the `sessions_root` bootstrap computes from the
+/// canonical `workspace_root`. A canonicalization failure (e.g. a hint that
+/// bootstrap will itself reject as banned/nonexistent) falls back to the raw
+/// path; nothing is cached under a rejected hint, so the fallback is inert.
+pub(crate) fn resolve_sessions_root_from_hint(
+    profile: &ProfileRuntime,
+    workspace_hint: Option<&Path>,
+    sessions_in_cwd: bool,
+) -> PathBuf {
+    match (sessions_in_cwd, workspace_hint) {
+        (true, Some(hint)) => {
+            let canonical = std::fs::canonicalize(hint).unwrap_or_else(|_| hint.to_path_buf());
+            project_sessions_root(&canonical, &profile.profile_id)
+        }
+        _ => profile.data_dir.clone(),
     }
 }
 
@@ -1935,10 +1980,15 @@ mod tests {
         let profile = make_profile(data_dir.clone()).await;
         let cwd = tmp.path().join("proj");
 
-        // flag ON + hint -> per-project store.
+        // flag ON + hint -> per-project, per-PROFILE store (the profile
+        // segment isolates two profiles that share a project cwd).
         assert_eq!(
             resolve_sessions_root(&profile, &cwd, true, true),
-            cwd.join(".octos"),
+            cwd.join(".octos").join(&profile.profile_id),
+        );
+        assert_eq!(
+            resolve_sessions_root(&profile, &cwd, true, true),
+            project_sessions_root(&cwd, &profile.profile_id),
         );
         // flag OFF + hint -> legacy (regression guard: flipping off is a no-op).
         assert_eq!(resolve_sessions_root(&profile, &cwd, true, false), data_dir,);
@@ -1969,11 +2019,13 @@ mod tests {
             .await
             .expect("bootstrap in cwd");
 
-        // sessions_root and the manager's data_dir both point at <cwd>/.octos.
-        assert_eq!(rt.sessions_root, cwd_canon.join(".octos"));
+        // sessions_root and the manager's data_dir both point at
+        // <cwd>/.octos/<profile_id>.
+        let expected_root = cwd_canon.join(".octos").join(&profile.profile_id);
+        assert_eq!(rt.sessions_root, expected_root);
         {
             let mgr = rt.sessions.lock().await;
-            assert_eq!(mgr.data_dir(), cwd_canon.join(".octos"));
+            assert_eq!(mgr.data_dir(), expected_root);
         }
 
         // Persist a message and confirm the JSONL lives under <cwd>/.octos and
@@ -2091,10 +2143,19 @@ mod tests {
                 .await
                 .expect("bootstrap B");
 
-        // Distinct roots — the isolation boundary.
+        // Distinct roots — the isolation boundary — each the project's own
+        // profile-namespaced `<cwd>/.octos/<profile_id>`.
         assert_ne!(rt_a.sessions_root, rt_b.sessions_root);
-        assert!(rt_a.sessions_root.ends_with(".octos"));
-        assert!(rt_b.sessions_root.ends_with(".octos"));
+        let proj_a_canon = std::fs::canonicalize(&proj_a).unwrap();
+        let proj_b_canon = std::fs::canonicalize(&proj_b).unwrap();
+        assert_eq!(
+            rt_a.sessions_root,
+            project_sessions_root(&proj_a_canon, &profile.profile_id)
+        );
+        assert_eq!(
+            rt_b.sessions_root,
+            project_sessions_root(&proj_b_canon, &profile.profile_id)
+        );
 
         // Write a distinct message through each runtime's own manager.
         {
@@ -2153,7 +2214,10 @@ mod tests {
         .expect("bootstrap");
 
         let gitignore = rt.sessions_root.join(".gitignore");
-        assert_eq!(rt.sessions_root, cwd_canon.join(".octos"));
+        assert_eq!(
+            rt.sessions_root,
+            cwd_canon.join(".octos").join(&profile.profile_id)
+        );
         assert!(
             gitignore.exists(),
             "per-project store must have a .gitignore"

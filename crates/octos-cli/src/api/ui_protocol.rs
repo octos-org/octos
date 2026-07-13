@@ -15539,13 +15539,14 @@ async fn handle_session_list(
     // `cwd` AND the server flag is on AND the connection negotiated
     // `session.workspace_cwd.v1`, the listing is scoped to `<cwd>/.octos`.
     // Absent cwd / flag off → `None` → byte-identical legacy listing.
-    let cwd_sessions_root = match resolve_session_list_cwd_root(state, features, &params) {
-        Ok(root) => root,
-        Err(error) => {
-            let _ = send_rpc_error(ws, Some(id), error);
-            return;
-        }
-    };
+    let cwd_sessions_root =
+        match resolve_session_list_cwd_root(state, features, connection_profile_id, &params) {
+            Ok(root) => root,
+            Err(error) => {
+                let _ = send_rpc_error(ws, Some(id), error);
+                return;
+            }
+        };
     let identity_ext = identity.cloned().map(Extension);
     let response = super::handlers::list_sessions(
         State(state.clone()),
@@ -15570,9 +15571,10 @@ async fn handle_session_list(
     }
 }
 
-/// Resolve an optional `session/list` `cwd` into the per-project session-store
-/// root (`<cwd>/.octos`), applying the same three gates the write path uses so
-/// list and open agree on where a project's sessions live:
+/// Resolve an optional `session/list` `cwd` into the per-project, per-profile
+/// session-store root (`<cwd>/.octos/<profile_id>`), applying the same gates
+/// the write path uses so list and open agree on where a project's sessions
+/// live:
 ///
 /// 1. **Flag** — when `appui.sessions_in_cwd` is off, the `cwd` is ignored
 ///    entirely (`Ok(None)` → legacy per-profile/global listing). This keeps a
@@ -15582,16 +15584,23 @@ async fn handle_session_list(
 ///    negotiated `session.workspace_cwd.v1` (mirrors `session/open`'s cwd
 ///    gate). A client that sends `cwd` without it gets a typed error rather
 ///    than a silently-global list.
-/// 3. **Canonicalization** — the cwd must canonicalize to an existing
-///    directory; the store root is `canonical(cwd).join(".octos")`, matching
-///    `resolve_sessions_root` (which roots at the canonicalized
-///    `workspace_root`), so the listing reads exactly where the runtime
-///    persisted.
+/// 3. **Workspace safety** — the SAME [`validate_session_workspace_allowed`]
+///    gate `session/open` runs: the cwd must canonicalize to a directory AND
+///    must not be rooted under a banned system path. Without this a client
+///    could point the listing at `/etc` (or any service-writable path) and
+///    `SessionManager::open` would CREATE `<cwd>/.octos/…` there and enumerate
+///    it. On rejection we surface the typed error (consistent with
+///    `session/open`) rather than silently degrading.
+/// 4. **Profile namespace** — the store root is
+///    `<cwd>/.octos/<profile_id>` (via [`project_sessions_root`]), matching
+///    the write path so two profiles that share a project cwd never read each
+///    other's transcripts.
 ///
 /// A trimmed-empty or absent `cwd` is always `Ok(None)` (legacy listing).
 fn resolve_session_list_cwd_root(
     state: &AppState,
     features: ConnectionUiFeatures,
+    connection_profile_id: Option<&str>,
     params: &SessionListParams,
 ) -> Result<Option<PathBuf>, RpcError> {
     let Some(cwd) = params
@@ -15616,7 +15625,19 @@ fn resolve_session_list_cwd_root(
         })));
     }
     let workspace_root = canonical_existing_dir(cwd)?;
-    Ok(Some(workspace_root.join(".octos")))
+    // SAME safety gate as session/open — reject banned system roots (and the
+    // missing-profile-runtime case) BEFORE opening a SessionManager that would
+    // otherwise materialize `<cwd>/.octos` at an arbitrary path.
+    validate_session_workspace_allowed(state, connection_profile_id, &workspace_root)?;
+    // Namespace by the SAME profile the write path uses so the listing reads
+    // exactly the connection's own project store.
+    let profile_id = resolve_session_profile_runtime(state, connection_profile_id)
+        .map(|runtime| runtime.profile_id.clone())
+        .unwrap_or_else(|| connection_profile_id.unwrap_or(MAIN_PROFILE_ID).to_string());
+    Ok(Some(crate::runtime::session::project_sessions_root(
+        &workspace_root,
+        &profile_id,
+    )))
 }
 
 async fn handle_session_status_get(
@@ -30983,14 +31004,15 @@ ignore = []
     async fn session_list_cwd_root_honors_flag_and_capability() {
         // The `session/list` cwd gate: flag OFF ignores cwd (legacy listing);
         // flag ON honors it only with the `session.workspace_cwd.v1`
-        // capability, resolving to the canonical `<cwd>/.octos` — the same
-        // root the write path (`resolve_sessions_root`) persists to.
+        // capability; and it runs the SAME workspace-safety gate as
+        // session/open before resolving a root (proven here by the no-runtime
+        // rejection — see `session_list_cwd_root_gates_path_and_namespaces_by_profile`
+        // for the safe-path happy case + banned-path rejection).
         use octos_core::ui_protocol::SessionListParams;
 
         let tmp = tempfile::tempdir().unwrap();
         let cwd = tmp.path().join("proj");
         std::fs::create_dir_all(&cwd).unwrap();
-        let cwd_canon = std::fs::canonicalize(&cwd).unwrap();
 
         let has_cap = ConnectionUiFeatures::stdio_defaults(); // workspace_cwd = true
         let no_cap = ConnectionUiFeatures {
@@ -31012,7 +31034,7 @@ ignore = []
         };
         // Flag OFF → cwd ignored even with the capability (byte-identical legacy).
         assert_eq!(
-            resolve_session_list_cwd_root(&state_off, has_cap, &with_cwd).unwrap(),
+            resolve_session_list_cwd_root(&state_off, has_cap, None, &with_cwd).unwrap(),
             None,
         );
 
@@ -31024,18 +31046,104 @@ ignore = []
             );
             s
         };
-        // Flag ON + capability + valid cwd → the canonical <cwd>/.octos root.
-        assert_eq!(
-            resolve_session_list_cwd_root(&state_on, has_cap, &with_cwd).unwrap(),
-            Some(cwd_canon.join(".octos")),
-        );
         // Flag ON + no cwd → None (legacy listing).
         assert_eq!(
-            resolve_session_list_cwd_root(&state_on, has_cap, &no_cwd).unwrap(),
+            resolve_session_list_cwd_root(&state_on, has_cap, None, &no_cwd).unwrap(),
             None,
         );
         // Flag ON + cwd but NO capability → typed error (mirrors session/open).
-        assert!(resolve_session_list_cwd_root(&state_on, no_cap, &with_cwd).is_err());
+        assert!(resolve_session_list_cwd_root(&state_on, no_cap, None, &with_cwd).is_err());
+        // Flag ON + capability + a valid cwd but NO registered profile runtime
+        // → the workspace-safety gate (`validate_session_workspace_allowed`)
+        // rejects. This proves the gate is wired BEFORE any SessionManager is
+        // opened at the cwd (the P1 the codex review flagged).
+        assert!(resolve_session_list_cwd_root(&state_on, has_cap, None, &with_cwd).is_err());
+    }
+
+    #[tokio::test]
+    async fn session_list_cwd_root_gates_path_and_namespaces_by_profile() {
+        // With a registered profile runtime: a SAFE cwd resolves to the
+        // per-project, per-PROFILE store `<cwd>/.octos/<profile_id>` (so two
+        // profiles sharing a cwd can't read each other's transcripts), and a
+        // banned system path is rejected by the shared safety gate.
+        use octos_core::ui_protocol::SessionListParams;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let profile = crate::profiles::UserProfile {
+            id: "dev".to_string(),
+            name: "Dev".to_string(),
+            enabled: true,
+            data_dir: None,
+            parent_id: None,
+            public_subdomain: None,
+            config: crate::profiles::ProfileConfig {
+                llm: Some(crate::profiles::LlmProfileConfig {
+                    primary: Some(crate::profiles::LlmModelSelectionConfig {
+                        family_id: Some("openai".to_string()),
+                        model_id: Some("gpt-4o-mini".to_string()),
+                        route: Some(crate::profiles::LlmRouteConfig {
+                            route_id: None,
+                            label: None,
+                            base_url: None,
+                            api_key_env: Some("SESS_CWD_TEST_KEY".to_string()),
+                            api_type: None,
+                        }),
+                        ..Default::default()
+                    }),
+                    fallbacks: Vec::new(),
+                }),
+                env_vars: [("SESS_CWD_TEST_KEY".to_string(), "test-key".to_string())]
+                    .into_iter()
+                    .collect(),
+                ..Default::default()
+            },
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        let data_dir = tmp.path().join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let runtime = crate::runtime::ProfileRuntime::bootstrap(
+            &profile,
+            &data_dir,
+            None,
+            crate::runtime::BootstrapRole::Serve,
+        )
+        .await
+        .expect("bootstrap dev runtime");
+
+        let mut state = AppState::empty_for_tests();
+        state.profiles.insert("dev".to_string(), runtime);
+        state.session_cache = Arc::new(
+            crate::runtime::SessionRuntimeCache::new(4, std::time::Duration::from_secs(60))
+                .with_sessions_in_cwd(true),
+        );
+
+        let cap = ConnectionUiFeatures::stdio_defaults();
+
+        // Safe cwd → `<cwd>/.octos/dev` (profile-namespaced).
+        let good = tmp.path().join("project");
+        std::fs::create_dir_all(&good).unwrap();
+        let good_canon = std::fs::canonicalize(&good).unwrap();
+        let good_params = SessionListParams {
+            cwd: Some(good.to_string_lossy().into_owned()),
+        };
+        let resolved =
+            resolve_session_list_cwd_root(&state, cap, Some("dev"), &good_params).unwrap();
+        assert_eq!(
+            resolved,
+            Some(crate::runtime::session::project_sessions_root(
+                &good_canon,
+                "dev"
+            )),
+        );
+        assert_eq!(resolved, Some(good_canon.join(".octos").join("dev")));
+
+        // Banned system root (`/usr` is a real dir on Linux and macOS that
+        // canonicalizes to `/usr`) → rejected by the safety gate.
+        let banned = SessionListParams {
+            cwd: Some("/usr".to_string()),
+        };
+        assert!(resolve_session_list_cwd_root(&state, cap, Some("dev"), &banned).is_err());
     }
 
     async fn assert_advertised_stdio_methods_have_dispatch_path(state: Arc<AppState>) {
