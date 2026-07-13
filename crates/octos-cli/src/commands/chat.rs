@@ -58,6 +58,13 @@ pub struct ChatCommand {
     #[arg(long)]
     pub base_url: Option<String>,
 
+    /// API wire protocol to speak to `--base-url` (overrides config's
+    /// `api_type`): `anthropic`, `openai`, or `responses`. Use this for a
+    /// custom endpoint that speaks a known protocol (e.g. a z.ai/GLM Anthropic
+    /// endpoint) instead of overloading `--provider` with a vendor name.
+    #[arg(long = "api-type", visible_alias = "api-style")]
+    pub api_type: Option<String>,
+
     /// Maximum tool-call iterations per message (default: 20).
     #[arg(long, default_value = "20")]
     pub max_iterations: u32,
@@ -566,9 +573,14 @@ impl ChatCommand {
                 )
             })?;
 
-        // Create LLM provider (with optional failover chain)
+        // Create LLM provider (with optional failover chain). `--api-type`
+        // (alias `--api-style`) overrides config's `api_type` so a custom
+        // `--base-url` can pick the wire protocol without pretending to be a
+        // vendor via `--provider`.
+        let api_type = self.api_type.as_deref().or(config.api_type.as_deref());
         let base_provider: Arc<dyn LlmProvider> =
-            create_provider(&provider_name, &config, model, base_url)?;
+            create_provider_with_api_type(&provider_name, &config, model, base_url, api_type)?;
+        eprintln!("{}: {}", "Model".green(), base_provider.model_id());
         let model_id = base_provider.model_id().to_string();
 
         let llm: Arc<dyn LlmProvider> = if self.no_retry {
@@ -1612,6 +1624,34 @@ mod tests {
         assert!(!bare.dangerously_bypass_approvals_and_sandbox);
         assert_eq!(bare.sandbox, None);
         assert_eq!(bare.ask_for_approval, None);
+    }
+
+    #[test]
+    fn should_parse_api_type_flag_and_its_api_style_alias() {
+        // `--api-type` (and its `--api-style` alias) picks the wire protocol
+        // for a custom `--base-url`, independent of the vendor `--provider`.
+        use clap::Parser;
+
+        #[derive(Parser)]
+        struct Wrap {
+            #[command(flatten)]
+            chat: ChatCommand,
+        }
+
+        let via_type = Wrap::parse_from(["prog", "--api-type", "anthropic"]).chat;
+        assert_eq!(via_type.api_type.as_deref(), Some("anthropic"));
+
+        let via_alias = Wrap::parse_from(["prog", "--api-style", "openai"]).chat;
+        assert_eq!(via_alias.api_type.as_deref(), Some("openai"));
+
+        // Honest form: a real vendor name + an explicit protocol, no overload.
+        let combined =
+            Wrap::parse_from(["prog", "--provider", "zai", "--api-type", "anthropic"]).chat;
+        assert_eq!(combined.provider.as_deref(), Some("zai"));
+        assert_eq!(combined.api_type.as_deref(), Some("anthropic"));
+
+        // Absent by default (falls back to config's api_type at runtime).
+        assert_eq!(Wrap::parse_from(["prog"]).chat.api_type, None);
     }
 
     // ---- #1570: [y/s/N] approval prompt + numbered user-question prompt ----
