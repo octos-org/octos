@@ -107,7 +107,7 @@ pub enum Command {
     Channels(ChannelsCommand),
     /// Interactive multi-turn chat with an agent.
     Chat(ChatCommand),
-    /// Configure startup CLI defaults interactively (wizard) and inspect config.
+    /// Inspect the saved startup config (`show` / `path`); read-only.
     Config(ConfigCommand),
     /// Manage scheduled cron jobs.
     Cron(CronCommand),

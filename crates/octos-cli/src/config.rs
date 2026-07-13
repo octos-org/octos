@@ -222,7 +222,7 @@ pub struct Config {
     /// `{"serve": {"port": 50080, "solo": true}}`). Consulted by the startup
     /// layering ([`crate::config_layer`]) BELOW an explicit CLI flag / env var
     /// but ABOVE the built-in clap default, so operators can persist their
-    /// preferred flags without retyping them. Written by `octos config wizard`.
+    /// preferred flags without retyping them. Hand-edited in `config.json`.
     ///
     /// Unknown command keys round-trip untouched. The block is empty by default
     /// and omitted from serialization so configs that never used it stay
