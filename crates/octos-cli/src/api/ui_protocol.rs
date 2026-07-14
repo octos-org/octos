@@ -15816,17 +15816,42 @@ fn resolve_launch_result(
             "launch/resolve requires a non-empty cwd",
         ));
     }
-    // SAME safety gates the write path runs before materializing `<cwd>/.octos`.
+    // Path-safety ONLY (canonicalize + banned-root reject) — the SAME check the
+    // write path runs before materializing `<cwd>/.octos`. Crucially NOT the
+    // full `validate_session_workspace_allowed`, which additionally requires a
+    // materialized `SessionRuntime` for the routed profile: launch/resolve is a
+    // read-only decision that runs BEFORE any session is opened (and, in solo
+    // `--stdio`, before any profile runtime is lazily bootstrapped), so gating
+    // it on a loaded runtime made every Resume / CrossProfile / NoProfile
+    // outcome unreachable — the folder always fell through to `activate`, or a
+    // bare launch got a spurious `cwd_runtime_unavailable`. Found by the
+    // launch-flow soak against a real `octos serve --stdio`.
     let workspace_root = canonical_existing_dir(cwd)?;
-    validate_session_workspace_allowed(state, connection_profile_id, &workspace_root)?;
+    validate_session_workspace_path_safety(&workspace_root)?;
 
-    // Known profiles = every loaded/launchable profile (`octos serve`
-    // bootstraps `ProfileStore::list()` into `state.profiles` at startup). A
-    // since-deleted profile's leftover store dir is ignored by the scanner.
-    // Sorted for a deterministic default + cross-profile listing. Empty (no
+    // Known profiles = every launchable brain that EXISTS, sourced from the
+    // persistent `ProfileStore` (enabled, top-level), NOT just `state.profiles`
+    // — the in-memory runtime map, which in solo `--stdio` is populated lazily
+    // on `session/open` and so is EMPTY at bare-launch time. A profile is
+    // launchable whether or not its runtime is loaded yet, so the scanner must
+    // see its folder store and the default resolver must be able to name it.
+    // Unioned with `state.profiles.keys()` so eager-load deployments stay
+    // covered. A since-deleted profile's leftover store dir is ignored (the
+    // scanner is bounded by this set). `BTreeSet` yields a sorted, deduped
+    // listing for a deterministic default + cross-profile result. Empty (no
     // profiles) → `NoProfile`.
-    let mut known_profiles: Vec<String> = state.profiles.keys().cloned().collect();
-    known_profiles.sort();
+    let mut known_set: std::collections::BTreeSet<String> =
+        state.profiles.keys().cloned().collect();
+    if let Some(store) = state.profile_store.as_ref() {
+        if let Ok(profiles) = store.list() {
+            for profile in profiles {
+                if profile.enabled && profile.parent_id.is_none() {
+                    known_set.insert(profile.id);
+                }
+            }
+        }
+    }
+    let known_profiles: Vec<String> = known_set.into_iter().collect();
 
     // Global default. An explicit user-chosen `default-profile` pointer (set via
     // the onboarding "make default" flow) wins when it still names a known
@@ -31649,6 +31674,79 @@ ignore = []
         store.set_default_profile("ghost").unwrap();
         let stale = resolve_launch_result(&state, Some("alpha"), cap, &params).unwrap();
         assert_eq!(stale.resolved_profile.as_deref(), Some("alpha"));
+    }
+
+    #[tokio::test]
+    async fn launch_resolve_uses_stored_profiles_without_a_loaded_runtime() {
+        // Regression (launch-flow soak against a real `octos serve --stdio`): in
+        // solo `--stdio`, profile runtimes materialize LAZILY on `session/open`,
+        // so `state.profiles` is EMPTY at bare-launch time. launch/resolve must
+        // still see a profile that EXISTS in the persistent `ProfileStore` and
+        // must NOT require a loaded runtime — otherwise every folder falls
+        // through to `activate` (Resume/CrossProfile unreachable) and a
+        // zero-profile machine gets a spurious `cwd_runtime_unavailable` instead
+        // of `NoProfile`. `state.profiles` stays empty for the WHOLE test.
+        use octos_core::ui_protocol::{LaunchDecisionKind, LaunchResolveParams};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let mut state = AppState::empty_for_tests();
+        state.profile_store = Some(Arc::new(
+            crate::profiles::ProfileStore::open(&home).unwrap(),
+        ));
+        let state = Arc::new(state);
+        let cap = ConnectionUiFeatures::stdio_defaults();
+        let resolve = |cwd: &std::path::Path| {
+            resolve_launch_result(
+                &state,
+                None,
+                cap,
+                &LaunchResolveParams {
+                    cwd: cwd.to_string_lossy().into_owned(),
+                    profile_id: None,
+                },
+            )
+        };
+
+        // A valid folder with ZERO stored profiles → NoProfile, NOT an error.
+        let empty = tmp.path().join("empty");
+        std::fs::create_dir_all(&empty).unwrap();
+        let no_profile = resolve(&empty).unwrap();
+        assert_eq!(no_profile.decision, LaunchDecisionKind::NoProfile);
+        assert_eq!(no_profile.resolved_profile, None);
+
+        // Persist a launchable brain to the STORE only — no runtime loaded.
+        state
+            .profile_store
+            .as_ref()
+            .unwrap()
+            .save(&crate::profiles::UserProfile {
+                id: "ghost".to_string(),
+                name: "Ghost".to_string(),
+                enabled: true,
+                data_dir: None,
+                parent_id: None,
+                public_subdomain: None,
+                config: crate::profiles::ProfileConfig::default(),
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+            })
+            .unwrap();
+
+        // Empty folder + the sole stored profile is ghost → Activate{ghost}
+        // (default falls back to the only known profile), NOT an error.
+        let activate = resolve(&empty).unwrap();
+        assert_eq!(activate.decision, LaunchDecisionKind::Activate);
+        assert_eq!(activate.resolved_profile.as_deref(), Some("ghost"));
+
+        // A folder holding ghost's activated store + sticky marker → Resume{ghost},
+        // even though ghost's runtime was never loaded into `state.profiles`.
+        let project = tmp.path().join("proj");
+        std::fs::create_dir_all(project.join(".octos").join("ghost").join("sessions")).unwrap();
+        std::fs::write(project.join(".octos").join("active-profile"), "ghost").unwrap();
+        let resume = resolve(&project).unwrap();
+        assert_eq!(resume.decision, LaunchDecisionKind::Resume);
+        assert_eq!(resume.resolved_profile.as_deref(), Some("ghost"));
     }
 
     async fn assert_advertised_stdio_methods_have_dispatch_path(state: Arc<AppState>) {
