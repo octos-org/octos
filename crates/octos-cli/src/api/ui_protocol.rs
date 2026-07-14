@@ -28543,6 +28543,7 @@ mod tests {
                 "mode": "off",
             }),
             methods::ROUTER_GET_METRICS => json!({ "session_id": session_id }),
+            methods::LAUNCH_RESOLVE => json!({ "cwd": "/tmp/probe-launch-resolve" }),
             other => panic!("missing AppUI dispatch probe params for {other}"),
         };
 
