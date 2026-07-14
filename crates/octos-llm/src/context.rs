@@ -51,25 +51,35 @@ pub fn seed_from_catalog(entries: &[(String, u64, u64)]) {
 fn catalog_lookup(model_id: &str) -> Option<(u64, u64)> {
     let guard = CATALOG.read().ok()?;
     let map = guard.as_ref()?;
+    catalog_lookup_in(map, model_id)
+}
+
+/// Pure catalog matcher over a supplied map (no global state), so the matching
+/// rules are unit-testable without racing the shared `CATALOG`.
+fn catalog_lookup_in(map: &HashMap<String, CatalogModel>, model_id: &str) -> Option<(u64, u64)> {
     let m = model_id.to_lowercase();
     // Try exact match first, then substring match.
     if let Some(entry) = map.get(&m) {
         return Some((entry.context_window, entry.max_output));
     }
-    // Deterministic substring match: prefer the longest (most specific) matching
-    // key. HashMap iteration order is nondeterministic, so without a length
-    // tie-breaker the winning entry varied per process when several keys matched
-    // (pricing.rs already applies this rule; context.rs did not).
-    let mut best: Option<(usize, u64, u64)> = None;
-    for (key, entry) in map {
-        if m.contains(key) || key.contains(&m) {
-            let len = key.len();
-            if best.is_none_or(|(best_len, _, _)| len > best_len) {
-                best = Some((len, entry.context_window, entry.max_output));
-            }
-        }
+    // Deterministic substring match, mirroring pricing.rs so both agree:
+    //   1. Among keys the model id CONTAINS (families the id extends), the
+    //      LONGEST (most specific) wins.
+    //   2. Otherwise, among keys that CONTAIN the model id, the SHORTEST is the
+    //      closest match.
+    // Ties break lexicographically so equal-length keys stay stable. Returning
+    // the first HashMap hit (as before) was nondeterministic across processes.
+    if let Some((_, entry)) = map
+        .iter()
+        .filter(|(key, _)| m.contains(key.as_str()))
+        .max_by(|(a, _), (b, _)| a.len().cmp(&b.len()).then_with(|| b.cmp(a)))
+    {
+        return Some((entry.context_window, entry.max_output));
     }
-    best.map(|(_, ctx, out)| (ctx, out))
+    map.iter()
+        .filter(|(key, _)| key.contains(&m))
+        .min_by(|(a, _), (b, _)| a.len().cmp(&b.len()).then_with(|| a.cmp(b)))
+        .map(|(_, entry)| (entry.context_window, entry.max_output))
 }
 
 // ── Public API ────────────────────────────────────────────────
@@ -222,36 +232,43 @@ mod tests {
     }
 
     #[test]
-    fn should_pick_longest_key_on_ambiguous_substring_lookup() {
-        // Regression: when several catalog keys are substrings of the model id,
-        // the winner used to depend on nondeterministic HashMap iteration order.
-        // The most-specific (longest) key must win every time.
-        let mut guard = CATALOG.write().unwrap_or_else(|e| e.into_inner());
+    fn should_deterministically_match_by_substring_mirroring_pricing() {
+        // Regression: the substring fallback returned the first HashMap hit, so
+        // the winner depended on nondeterministic iteration order. Test the pure
+        // matcher over a LOCAL map (no shared CATALOG race), using model ids that
+        // are NOT exact keys so lookup goes through the substring path.
         let mut map = HashMap::new();
-        map.insert(
-            "gpt".to_string(),
-            CatalogModel {
-                context_window: 8_000,
-                max_output: 1_000,
-            },
-        );
-        map.insert(
-            "gpt-4o-mini".to_string(),
-            CatalogModel {
-                context_window: 128_000,
-                max_output: 16_000,
-            },
-        );
-        *guard = Some(map);
-        drop(guard);
-
-        // "gpt-4o-mini" contains both "gpt" and "gpt-4o-mini"; longest wins.
-        for _ in 0..20 {
-            assert_eq!(catalog_lookup("gpt-4o-mini"), Some((128_000, 16_000)));
+        for (key, ctx, out) in [
+            ("gpt", 8_000u64, 1_000u64),
+            ("gpt-4o-mini", 128_000, 16_000),
+        ] {
+            map.insert(
+                key.to_string(),
+                CatalogModel {
+                    context_window: ctx,
+                    max_output: out,
+                },
+            );
         }
 
-        let mut guard = CATALOG.write().unwrap_or_else(|e| e.into_inner());
-        *guard = None;
+        // Branch 1 (model id EXTENDS a family): "gpt-4o-mini-2024-07-18" is not a
+        // key; it contains both "gpt" and "gpt-4o-mini" — the LONGEST wins.
+        // Repeated to shake out any iteration-order dependence.
+        for _ in 0..20 {
+            assert_eq!(
+                catalog_lookup_in(&map, "gpt-4o-mini-2024-07-18"),
+                Some((128_000, 16_000))
+            );
+        }
+        // Branch 2 (a catalog key EXTENDS the model id): "4o-mini" contains no
+        // key, but the key "gpt-4o-mini" contains it, so branch 2 picks that
+        // (shortest containing key).
+        assert_eq!(catalog_lookup_in(&map, "4o-mini"), Some((128_000, 16_000)));
+        // Exact key still short-circuits via map.get.
+        assert_eq!(
+            catalog_lookup_in(&map, "gpt-4o-mini"),
+            Some((128_000, 16_000))
+        );
     }
 
     #[test]

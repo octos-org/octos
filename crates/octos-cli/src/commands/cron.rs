@@ -203,9 +203,10 @@ fn cmd_add(
         if secs <= 0 {
             eyre::bail!("--every must be a positive number of seconds (got {secs})");
         }
-        CronSchedule::Every {
-            every_ms: secs * 1000,
-        }
+        let every_ms = secs.checked_mul(1000).ok_or_else(|| {
+            eyre::eyre!("--every is too large: {secs} seconds overflows the millisecond interval")
+        })?;
+        CronSchedule::Every { every_ms }
     } else if let Some(expr) = cron {
         CronSchedule::Cron { expr }
     } else if let Some(at_str) = at {
@@ -304,5 +305,49 @@ fn truncate(s: &str, max: usize) -> String {
     } else {
         let end: String = s.chars().take(max.saturating_sub(3)).collect();
         format!("{end}...")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn add(store: &std::path::Path, every: Option<i64>) -> Result<()> {
+        cmd_add(
+            store,
+            "t".into(),
+            "ping".into(),
+            every,
+            None,
+            None,
+            false,
+            None,
+            None,
+        )
+    }
+
+    #[test]
+    fn should_reject_nonpositive_every() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = dir.path().join("cron.json");
+        assert!(add(&store, Some(0)).is_err());
+        assert!(add(&store, Some(-5)).is_err());
+    }
+
+    #[test]
+    fn should_reject_every_that_overflows_milliseconds() {
+        // Regression: `secs * 1000` overflowed i64 for very large values,
+        // panicking in debug and wrapping to a negative (immediately-due)
+        // interval in release. Must be rejected, not silently wrapped.
+        let dir = tempfile::tempdir().unwrap();
+        let store = dir.path().join("cron.json");
+        assert!(add(&store, Some(i64::MAX)).is_err());
+    }
+
+    #[test]
+    fn should_accept_valid_every() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = dir.path().join("cron.json");
+        assert!(add(&store, Some(60)).is_ok());
     }
 }

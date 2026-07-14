@@ -1827,7 +1827,21 @@ impl Config {
     /// Shared resolution body: auth store → env_vars (keychain) → process
     /// env, with the var name secret-registered first.
     fn resolve_api_key(&self, provider: &str, env_var: String) -> Result<String> {
-        octos_agent::register_secret_env_names([env_var.as_str()]);
+        // Candidate env-var names: the primary, plus registry-alias-derived
+        // names (e.g. moonshot aliases "kimi" -> KIMI_API_KEY). Some providers
+        // are configured under more than one env var in the wild (Moonshot is
+        // set via MOONSHOT_API_KEY or KIMI_API_KEY, and the bundled skills use
+        // KIMI_API_KEY), so we accept any of them rather than forcing one name.
+        let mut candidates = vec![env_var.clone()];
+        if let Some(entry) = octos_llm::registry::lookup(provider) {
+            for alias in entry.aliases {
+                let alias_var = format!("{}_API_KEY", alias.to_uppercase());
+                if !candidates.contains(&alias_var) {
+                    candidates.push(alias_var);
+                }
+            }
+        }
+        octos_agent::register_secret_env_names(candidates.iter());
 
         // Check auth store first. Auth is GLOBAL: it lives under the resolver's
         // `auth_home` (OCTOS_CONFIG_DIR if set, else the XDG default). This is
@@ -1843,15 +1857,25 @@ impl Config {
             }
         }
 
-        if let Some(value) = self.env_vars.get(&env_var).and_then(|value| {
-            crate::auth::keychain::resolve_value(&env_var, value).filter(|value| !value.is_empty())
-        }) {
-            return Ok(value);
+        for name in &candidates {
+            if let Some(value) = self.env_vars.get(name).and_then(|value| {
+                crate::auth::keychain::resolve_value(name, value).filter(|value| !value.is_empty())
+            }) {
+                return Ok(value);
+            }
         }
 
-        std::env::var(&env_var).wrap_err_with(|| {
-            format!("{env_var} not set. Run `octos auth login -p {provider}` or set the env var")
-        })
+        for name in &candidates {
+            if let Ok(value) = std::env::var(name) {
+                if !value.is_empty() {
+                    return Ok(value);
+                }
+            }
+        }
+
+        Err(eyre::eyre!(
+            "{env_var} not set. Run `octos auth login -p {provider}` or set the env var"
+        ))
     }
 
     /// Validate the configuration, returning any warnings.

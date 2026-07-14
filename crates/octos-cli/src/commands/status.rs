@@ -123,7 +123,23 @@ fn show_system_status(cwd: &std::path::Path) -> Result<()> {
     println!("{}", "─".repeat(50).dimmed());
 
     for (label, env_var) in PROVIDER_ENV_VARS {
-        let status = if std::env::var(env_var).is_ok() {
+        // A provider may accept more than one key env var (e.g. Moonshot reads
+        // MOONSHOT_API_KEY or KIMI_API_KEY via its "kimi" registry alias). Treat
+        // it as "set" when the displayed var OR any alias-derived var is set, so
+        // status matches what config resolution actually accepts.
+        let mut is_set = std::env::var(env_var).is_ok();
+        if !is_set {
+            if let Some(entry) = octos_llm::registry::lookup(&label.to_lowercase()) {
+                // Also honor the registry's own key var (e.g. MOONSHOT_API_KEY)
+                // and every alias-derived var (kimi -> KIMI_API_KEY), matching
+                // exactly what config resolution accepts.
+                is_set = entry.api_key_env.is_some_and(|v| std::env::var(v).is_ok())
+                    || entry.aliases.iter().any(|alias| {
+                        std::env::var(format!("{}_API_KEY", alias.to_uppercase())).is_ok()
+                    });
+            }
+        }
+        let status = if is_set {
             "set".green().to_string()
         } else {
             "not set".dimmed().to_string()
