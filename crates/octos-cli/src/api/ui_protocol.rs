@@ -181,6 +181,10 @@ const APPUI_METHOD_PROFILE_LLM_LIST: &str = "profile/llm/list";
 const APPUI_METHOD_PROFILE_LLM_SELECT: &str = "profile/llm/select";
 const APPUI_METHOD_MCP_STATUS_LIST: &str = "mcp/status/list";
 const APPUI_METHOD_TOOL_STATUS_LIST: &str = "tool/status/list";
+/// Manual, on-demand context compaction for an open session (the `/compact`
+/// TUI command). Forces the compaction pass regardless of the auto-compaction
+/// threshold; AppUI-only, so a local literal like the other AppUI methods.
+const APPUI_METHOD_SESSION_COMPACT: &str = "session/compact";
 const APPUI_METHOD_AUTH_STATUS: &str = "auth/status";
 const APPUI_METHOD_AUTH_SEND_CODE: &str = "auth/send_code";
 const APPUI_METHOD_AUTH_VERIFY: &str = "auth/verify";
@@ -252,6 +256,7 @@ const APPUI_EXTRA_METHODS: &[&str] = &[
     APPUI_METHOD_PROFILE_SKILLS_REMOVE,
     APPUI_METHOD_ONBOARDING_WORKSPACE_PROBE,
     octos_core::ui_protocol::methods::SESSION_BTW,
+    APPUI_METHOD_SESSION_COMPACT,
 ];
 const APPUI_STDIO_AUTH_BOUND_UNAVAILABLE_METHODS: &[&str] = &[
     APPUI_METHOD_AUTH_ME,
@@ -2178,6 +2183,158 @@ fn appui_context_history_for_agent(
         Arc::new(StdMutex::new(manager)),
         lifecycle_notifications,
     )
+}
+
+/// Force a context-compaction pass on a session's ledger, bypassing the
+/// auto-compaction threshold. Powers the manual `session/compact` UI method.
+///
+/// Mirrors the pre-turn path [`appui_context_history_for_agent`] but always runs
+/// the compaction body (no `token_estimate > threshold` gate). Returns the
+/// lifecycle notifications to emit (`ContextCompactionStarted` + `Completed`)
+/// and a small result value (`token_estimate` before/after) for the RPC reply.
+fn appui_force_compact_context(
+    data_dir: &Path,
+    session_id: &SessionKey,
+    history: &[Message],
+    llm_provider: &Arc<dyn octos_llm::LlmProvider>,
+    llm_compaction_enabled: bool,
+) -> (Vec<UiNotification>, serde_json::Value) {
+    const TRIGGER: &str = "appui_manual_compact";
+    let (mut manager, ledger_status) =
+        load_or_rebuild_context_manager(data_dir, session_id.to_string(), None, history);
+    tracing::debug!(
+        session = %session_id.0,
+        ledger_status = ?ledger_status,
+        "appui context manager loaded for manual compaction"
+    );
+    let threshold = appui_context_compact_threshold_tokens(llm_provider.as_ref());
+    let policy = appui_context_prompt_policy(llm_provider.as_ref());
+    let mut lifecycle_notifications = Vec::new();
+    // Forced: unlike the pre-turn path there is no `token_estimate > threshold`
+    // gate — the user explicitly asked to compact now.
+    lifecycle_notifications.push(UiNotification::ContextCompactionStarted(
+        ContextCompactionStartedEvent {
+            session_id: session_id.clone(),
+            context_state: ui_context_state_for(session_id, &manager),
+            trigger: TRIGGER.to_owned(),
+            threshold_tokens: threshold,
+        },
+    ));
+    let before = manager.for_prompt(&policy);
+    let summary_budget = threshold.clamp(256, 4096) as u32;
+    let summary = if llm_compaction_enabled {
+        appui_compaction_summary(llm_provider, &before.messages, summary_budget)
+    } else {
+        octos_agent::compaction::compact_messages(&before.messages, summary_budget)
+    };
+    let record = manager.compact_context(
+        summary,
+        CompactContextPolicy {
+            trigger: TRIGGER.to_owned(),
+            keep_recent_items: appui_context_compact_keep_items(),
+            ..CompactContextPolicy::default()
+        },
+    );
+    info!(
+        session = %session_id.0,
+        compaction_id = %record.compaction_id.as_str(),
+        token_estimate_before = record.token_estimate_before,
+        token_estimate_after = ?record.token_estimate_after,
+        trigger = TRIGGER,
+        "appui manual compact_context installed"
+    );
+    let result = serde_json::json!({
+        "session_id": session_id.to_string(),
+        "compacted": true,
+        "token_estimate_before": record.token_estimate_before,
+        "token_estimate_after": record.token_estimate_after,
+    });
+    lifecycle_notifications.push(appui_context_compaction_notification(
+        session_id, &manager, &record,
+    ));
+    publish_appui_context_status(session_id, &manager);
+    if let Err(error) =
+        persist_context_manager_snapshot(data_dir, &session_id.to_string(), &manager)
+    {
+        warn!(
+            session = %session_id.0,
+            error = %error,
+            "failed to persist appui context manager snapshot after manual compaction"
+        );
+    }
+    (lifecycle_notifications, result)
+}
+
+/// `session/compact`: force a context-compaction pass on an open session,
+/// bypassing the auto-compaction threshold (powers the manual `/compact`
+/// command). Resolves the already-open session runtime — a cache hit for the
+/// active session — mirroring [`tool_status_list_result`]'s resolution, then
+/// runs [`appui_force_compact_context`] and emits its lifecycle notifications
+/// so clients render the compaction the same way they do the automatic pass.
+async fn handle_session_compact(
+    ws: &WsConnection,
+    state: &Arc<AppState>,
+    ledger: &Arc<UiProtocolLedger>,
+    features: ConnectionUiFeatures,
+    connection_profile_id: Option<&str>,
+    request: &RpcRequest<Value>,
+) -> Result<Value, RpcError> {
+    let params: RawProfileParams = parse_raw_params(request)?;
+    let Some(session_id) = params.session_id.clone() else {
+        return Err(RpcError::invalid_params("session_id is required"));
+    };
+    let profile_id = raw_profile_id(&params, connection_profile_id);
+    let Some(profile_runtime) = ensure_session_profile_runtime(state, Some(&profile_id)).await?
+    else {
+        return Err(runtime_unavailable_error(format!(
+            "no runtime for profile {profile_id}; cannot compact session {session_id}"
+        )));
+    };
+    // Epoch BEFORE permission resolution (codex #1639). For an already-open
+    // session this is a cache hit that returns the existing runtime.
+    let permissions_epoch = state.session_cache.session_generation(&session_id);
+    let permissions = effective_permissions_for_session(state, &session_id)?;
+    let workspace_hint = session_workspaces().get(&session_id);
+    let session_runtime = state
+        .session_cache
+        .get_or_init_with_permissions(
+            &profile_runtime,
+            session_id.clone(),
+            workspace_hint,
+            permissions,
+            permissions_epoch,
+        )
+        .await
+        .map_err(|error| {
+            runtime_unavailable_error(format!("failed to resolve session runtime: {error}"))
+        })?;
+
+    let llm_provider = session_runtime.profile.llm.clone();
+    // #1666: the per-project ledger lives under `sessions_root`, not
+    // `profile.data_dir` — the forced path must touch the SAME ledger the
+    // pre-turn path uses.
+    let data_dir = session_runtime.sessions_root.clone();
+    let history: Vec<Message> = {
+        let mut sessions = session_runtime.sessions.lock().await;
+        let session = sessions.get_or_create(&session_id).await;
+        session.get_history(50).to_vec()
+    };
+
+    let (notifications, result) = appui_force_compact_context(
+        &data_dir,
+        &session_id,
+        &history,
+        &llm_provider,
+        state.llm_compaction,
+    );
+    for notification in notifications {
+        if features.context_lifecycle_available() {
+            let _ = send_notification_durable(ws, ledger, notification);
+        } else {
+            let _ = ledger.append_notification_from(notification, ws.connection_id);
+        }
+    }
+    Ok(result)
 }
 
 fn prompt_message_matches(left: &Message, right: &Message) -> bool {
@@ -9233,6 +9390,10 @@ async fn handle_raw_appui_rpc(
         APPUI_METHOD_SESSION_STATUS_READ => {
             raw_session_status_result(state, request, features, connection_profile_id).await
         }
+        APPUI_METHOD_SESSION_COMPACT => {
+            handle_session_compact(ws, state, ledger, features, connection_profile_id, request)
+                .await
+        }
         APPUI_METHOD_PROFILE_LLM_CATALOG => raw_catalog_result(state, connection_profile_id),
         APPUI_METHOD_PROFILE_LLM_LIST => {
             let params: RawProfileParams = match parse_raw_params(request) {
@@ -9675,6 +9836,7 @@ fn raw_method_is_dispatched(method: &str, stdio_transport: bool) -> bool {
             | APPUI_METHOD_MCP_STATUS_LIST
             | APPUI_METHOD_TOOL_STATUS_LIST
             | APPUI_METHOD_ONBOARDING_WORKSPACE_PROBE
+            | APPUI_METHOD_SESSION_COMPACT
     ) {
         return true;
     }
@@ -28302,6 +28464,7 @@ mod tests {
                 "mode": "off",
             }),
             methods::ROUTER_GET_METRICS => json!({ "session_id": session_id }),
+            APPUI_METHOD_SESSION_COMPACT => json!({ "session_id": session_id }),
             other => panic!("missing AppUI dispatch probe params for {other}"),
         };
 
