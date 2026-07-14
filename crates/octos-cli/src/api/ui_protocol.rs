@@ -181,6 +181,10 @@ const APPUI_METHOD_PROFILE_LLM_LIST: &str = "profile/llm/list";
 const APPUI_METHOD_PROFILE_LLM_SELECT: &str = "profile/llm/select";
 const APPUI_METHOD_MCP_STATUS_LIST: &str = "mcp/status/list";
 const APPUI_METHOD_TOOL_STATUS_LIST: &str = "tool/status/list";
+/// Manual, on-demand context compaction for an open session (the `/compact`
+/// TUI command). Forces the compaction pass regardless of the auto-compaction
+/// threshold; AppUI-only, so a local literal like the other AppUI methods.
+const APPUI_METHOD_SESSION_COMPACT: &str = "session/compact";
 const APPUI_METHOD_AUTH_STATUS: &str = "auth/status";
 const APPUI_METHOD_AUTH_SEND_CODE: &str = "auth/send_code";
 const APPUI_METHOD_AUTH_VERIFY: &str = "auth/verify";
@@ -206,7 +210,13 @@ const APPUI_METHOD_PROFILE_SKILLS_REMOVE: &str = "profile/skills/remove";
 /// see the same typed shape they get from `profile/local/create`.
 const APPUI_METHOD_ONBOARDING_WORKSPACE_PROBE: &str = "onboarding/workspace_probe";
 const APPUI_METHOD_REVIEW_START: &str = octos_core::ui_protocol::methods::REVIEW_START;
-const DASHBOARD_PROVIDERS_JSON: &str = include_str!("../../../../dashboard/src/providers.json");
+
+/// The canonical model catalog — the single source of truth for provisionable
+/// models (`model_catalog.json`). Compiled in so onboarding always has the full
+/// catalog. This aliases the single embedded copy owned by `qos_catalog` (which
+/// also seeds the router / context / pricing tables), so there is exactly one
+/// compiled-in catalog across the crate.
+use crate::qos_catalog::EMBEDDED_MODEL_CATALOG as CANONICAL_MODEL_CATALOG;
 const APPUI_FEATURE_PROFILE_LOCAL_CREATE_V1: &str = "profile.local_create.v1";
 /// Additive capability: the server understands the optional `requested_id`
 /// field on `profile/local/create` (and treats `username`/`email` as
@@ -252,6 +262,7 @@ const APPUI_EXTRA_METHODS: &[&str] = &[
     APPUI_METHOD_PROFILE_SKILLS_REMOVE,
     APPUI_METHOD_ONBOARDING_WORKSPACE_PROBE,
     octos_core::ui_protocol::methods::SESSION_BTW,
+    APPUI_METHOD_SESSION_COMPACT,
 ];
 const APPUI_STDIO_AUTH_BOUND_UNAVAILABLE_METHODS: &[&str] = &[
     APPUI_METHOD_AUTH_ME,
@@ -2073,13 +2084,13 @@ fn appui_compaction_summary(
     if let Some(summary) = octos_agent::compaction::llm_compaction_summary(
         llm_provider,
         messages,
-        budget_tokens,
         std::time::Duration::from_secs(
             octos_agent::compaction::DEFAULT_LLM_COMPACTION_TIMEOUT_SECS,
         ),
     ) {
         return summary;
     }
+    // Heuristic fallback still uses the summary-size budget (correct there).
     octos_agent::compaction::compact_messages(messages, budget_tokens)
 }
 
@@ -2178,6 +2189,158 @@ fn appui_context_history_for_agent(
         Arc::new(StdMutex::new(manager)),
         lifecycle_notifications,
     )
+}
+
+/// Force a context-compaction pass on a session's ledger, bypassing the
+/// auto-compaction threshold. Powers the manual `session/compact` UI method.
+///
+/// Mirrors the pre-turn path [`appui_context_history_for_agent`] but always runs
+/// the compaction body (no `token_estimate > threshold` gate). Returns the
+/// lifecycle notifications to emit (`ContextCompactionStarted` + `Completed`)
+/// and a small result value (`token_estimate` before/after) for the RPC reply.
+fn appui_force_compact_context(
+    data_dir: &Path,
+    session_id: &SessionKey,
+    history: &[Message],
+    llm_provider: &Arc<dyn octos_llm::LlmProvider>,
+    llm_compaction_enabled: bool,
+) -> (Vec<UiNotification>, serde_json::Value) {
+    const TRIGGER: &str = "appui_manual_compact";
+    let (mut manager, ledger_status) =
+        load_or_rebuild_context_manager(data_dir, session_id.to_string(), None, history);
+    tracing::debug!(
+        session = %session_id.0,
+        ledger_status = ?ledger_status,
+        "appui context manager loaded for manual compaction"
+    );
+    let threshold = appui_context_compact_threshold_tokens(llm_provider.as_ref());
+    let policy = appui_context_prompt_policy(llm_provider.as_ref());
+    let mut lifecycle_notifications = Vec::new();
+    // Forced: unlike the pre-turn path there is no `token_estimate > threshold`
+    // gate — the user explicitly asked to compact now.
+    lifecycle_notifications.push(UiNotification::ContextCompactionStarted(
+        ContextCompactionStartedEvent {
+            session_id: session_id.clone(),
+            context_state: ui_context_state_for(session_id, &manager),
+            trigger: TRIGGER.to_owned(),
+            threshold_tokens: threshold,
+        },
+    ));
+    let before = manager.for_prompt(&policy);
+    let summary_budget = threshold.clamp(256, 4096) as u32;
+    let summary = if llm_compaction_enabled {
+        appui_compaction_summary(llm_provider, &before.messages, summary_budget)
+    } else {
+        octos_agent::compaction::compact_messages(&before.messages, summary_budget)
+    };
+    let record = manager.compact_context(
+        summary,
+        CompactContextPolicy {
+            trigger: TRIGGER.to_owned(),
+            keep_recent_items: appui_context_compact_keep_items(),
+            ..CompactContextPolicy::default()
+        },
+    );
+    info!(
+        session = %session_id.0,
+        compaction_id = %record.compaction_id.as_str(),
+        token_estimate_before = record.token_estimate_before,
+        token_estimate_after = ?record.token_estimate_after,
+        trigger = TRIGGER,
+        "appui manual compact_context installed"
+    );
+    let result = serde_json::json!({
+        "session_id": session_id.to_string(),
+        "compacted": true,
+        "token_estimate_before": record.token_estimate_before,
+        "token_estimate_after": record.token_estimate_after,
+    });
+    lifecycle_notifications.push(appui_context_compaction_notification(
+        session_id, &manager, &record,
+    ));
+    publish_appui_context_status(session_id, &manager);
+    if let Err(error) =
+        persist_context_manager_snapshot(data_dir, &session_id.to_string(), &manager)
+    {
+        warn!(
+            session = %session_id.0,
+            error = %error,
+            "failed to persist appui context manager snapshot after manual compaction"
+        );
+    }
+    (lifecycle_notifications, result)
+}
+
+/// `session/compact`: force a context-compaction pass on an open session,
+/// bypassing the auto-compaction threshold (powers the manual `/compact`
+/// command). Resolves the already-open session runtime — a cache hit for the
+/// active session — mirroring [`tool_status_list_result`]'s resolution, then
+/// runs [`appui_force_compact_context`] and emits its lifecycle notifications
+/// so clients render the compaction the same way they do the automatic pass.
+async fn handle_session_compact(
+    ws: &WsConnection,
+    state: &Arc<AppState>,
+    ledger: &Arc<UiProtocolLedger>,
+    features: ConnectionUiFeatures,
+    connection_profile_id: Option<&str>,
+    request: &RpcRequest<Value>,
+) -> Result<Value, RpcError> {
+    let params: RawProfileParams = parse_raw_params(request)?;
+    let Some(session_id) = params.session_id.clone() else {
+        return Err(RpcError::invalid_params("session_id is required"));
+    };
+    let profile_id = raw_profile_id(&params, connection_profile_id);
+    let Some(profile_runtime) = ensure_session_profile_runtime(state, Some(&profile_id)).await?
+    else {
+        return Err(runtime_unavailable_error(format!(
+            "no runtime for profile {profile_id}; cannot compact session {session_id}"
+        )));
+    };
+    // Epoch BEFORE permission resolution (codex #1639). For an already-open
+    // session this is a cache hit that returns the existing runtime.
+    let permissions_epoch = state.session_cache.session_generation(&session_id);
+    let permissions = effective_permissions_for_session(state, &session_id)?;
+    let workspace_hint = session_workspaces().get(&session_id);
+    let session_runtime = state
+        .session_cache
+        .get_or_init_with_permissions(
+            &profile_runtime,
+            session_id.clone(),
+            workspace_hint,
+            permissions,
+            permissions_epoch,
+        )
+        .await
+        .map_err(|error| {
+            runtime_unavailable_error(format!("failed to resolve session runtime: {error}"))
+        })?;
+
+    let llm_provider = session_runtime.profile.llm.clone();
+    // #1666: the per-project ledger lives under `sessions_root`, not
+    // `profile.data_dir` — the forced path must touch the SAME ledger the
+    // pre-turn path uses.
+    let data_dir = session_runtime.sessions_root.clone();
+    let history: Vec<Message> = {
+        let mut sessions = session_runtime.sessions.lock().await;
+        let session = sessions.get_or_create(&session_id).await;
+        session.get_history(50).to_vec()
+    };
+
+    let (notifications, result) = appui_force_compact_context(
+        &data_dir,
+        &session_id,
+        &history,
+        &llm_provider,
+        state.llm_compaction,
+    );
+    for notification in notifications {
+        if features.context_lifecycle_available() {
+            let _ = send_notification_durable(ws, ledger, notification);
+        } else {
+            let _ = ledger.append_notification_from(notification, ws.connection_id);
+        }
+    }
+    Ok(result)
 }
 
 fn prompt_message_matches(left: &Message, right: &Message) -> bool {
@@ -2665,6 +2828,50 @@ fn combine_typed_prompt_with_transcript(typed_prompt: &str, transcript: &str) ->
         transcript.to_owned()
     } else {
         format!("{typed_prompt}\n{transcript}")
+    }
+}
+
+/// Register the per-project ledger storage scope for a just-materialized
+/// [`SessionRuntime`] — the UI-protocol half of `appui.sessions_in_cwd`
+/// isolation (#1666).
+///
+/// The ledger is a process-global singleton rooted at the serve data dir, and
+/// it keys each session's ring/dir by the session id alone. With
+/// `sessions_in_cwd` the SAME wire id can belong to different projects, so a
+/// relocated session (`sessions_root != profile.data_dir`) registers a
+/// 16-hex digest of its canonical `sessions_root`; the ledger then keeps that
+/// project's events under a distinct storage identity. Flag-OFF (or no cwd
+/// hint) resolves `sessions_root == profile.data_dir` → scope `None` →
+/// byte-identical legacy behavior (and clears a stale registration if the
+/// flag was toggled off).
+///
+/// MUST be called before the flow replays the session (`session/open` calls
+/// it right after the runtime cache materializes, before
+/// `replay_after_with_head`) so replay and subsequent appends agree.
+fn register_session_ledger_scope(
+    ledger: &UiProtocolLedger,
+    runtime: &crate::runtime::SessionRuntime,
+) {
+    let scope = (runtime.sessions_root != runtime.profile.data_dir).then(|| {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(runtime.sessions_root.as_os_str().as_encoded_bytes());
+        hasher.finalize()[..8]
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    });
+    ledger.set_session_scope(&runtime.session_key, scope.clone());
+    // Topic-suffixed sessions also emit ledger events under their BASE key:
+    // the alpha-9 file/visual bridges deliberately strip the `#topic` before
+    // appending so base-bucket subscribers see them (see
+    // `ui_protocol_alpha9_bridge.rs`). Register the base alias with the same
+    // scope so those appends land in the same per-project dir instead of the
+    // unscoped legacy one (codex v2 P2). Same cwd → same scope, so this can
+    // never mis-route a different project's base-key session.
+    let base = runtime.session_key.base_key();
+    if base != runtime.session_key.0 {
+        ledger.set_session_scope(&SessionKey(base.to_owned()), scope);
     }
 }
 
@@ -4681,6 +4888,7 @@ async fn ui_protocol_connection(
                     &connection_headers,
                     connection_identity.as_ref(),
                     connection_profile_id,
+                    features,
                     id,
                     params,
                 )
@@ -5395,6 +5603,7 @@ where
                     &connection_headers,
                     None,
                     connection_profile_id_owned.as_deref(),
+                    features,
                     id,
                     params,
                 )
@@ -7716,61 +7925,81 @@ fn model_list_result(
     json!({ "session_id": session_id, "models": models })
 }
 
-fn raw_catalog_result(state: &AppState, profile_id: Option<&str>) -> Result<Value, RpcError> {
-    let mut families = serde_json::from_str::<Value>(DASHBOARD_PROVIDERS_JSON).map_err(|err| {
-        RpcError::internal_error(format!("dashboard provider catalog was not JSON: {err}"))
-    })?;
-    // Union in the QoS model catalog (model_catalog.json): it tracks the LIVE
-    // model lineup per provider (e.g. new zai GLM releases) while the bundled
-    // dashboard catalog is hand-maintained and lags. Only models are merged —
-    // a family absent from the bundled catalog has no key-env/route metadata,
-    // so it cannot be onboarded and is skipped.
-    // Per-profile QoS catalogs live under `profiles/<id>/data`
-    // (`ProfileRuntime::bootstrap` exports them there); the octos-home file
-    // is the shared seed. Merge the requesting profile's catalog first, then
-    // the home seed (`load_seed_qos_catalog` also falls back to `~/.octos`).
-    let mut sources = Vec::new();
-    if let Some(store) = state.profile_store.as_ref() {
-        if let Some(profile) =
-            profile_id.and_then(|profile_id| store.get(profile_id).ok().flatten())
-        {
-            // Honors `UserProfile.data_dir` overrides — the same resolution
-            // `ProfileRuntime::bootstrap` uses when it exports the catalog.
-            sources.push(store.resolve_data_dir(&profile));
-        }
-        sources.push(store.octos_home_dir().to_path_buf());
-    }
-    for qos in sources
-        .iter()
-        .filter_map(|dir| crate::qos_catalog::load_seed_qos_catalog(dir))
-    {
-        if let Some(families_map) = families.as_object_mut() {
-            for entry in &qos.models {
-                let Some((family_id, model_id)) = entry.provider.split_once('/') else {
-                    continue;
-                };
-                let Some(models) = families_map
-                    .get_mut(family_id)
-                    .and_then(|family| family.get_mut("models"))
-                    .and_then(Value::as_array_mut)
-                else {
-                    continue;
-                };
-                let known = models
-                    .iter()
-                    .any(|model| model.get("id").and_then(Value::as_str) == Some(model_id));
-                if !known {
-                    models.push(json!({
-                        "id": model_id,
-                        "input": entry.cost_in,
-                        "output": entry.cost_out,
-                        "max_output": entry.max_output,
-                    }));
-                }
+fn raw_catalog_result(_state: &AppState, _profile_id: Option<&str>) -> Result<Value, RpcError> {
+    // The onboarding catalog is the compiled-in canonical model_catalog.json
+    // (the model-provisioning SSOT) projected through the provider REGISTRY for
+    // family key-env metadata. providers.json is retired (now a derived,
+    // web-only artifact).
+    //
+    // The runtime QoS catalogs (per-profile data-dir + `~/.octos` seed) are
+    // deliberately NOT unioned here. Configured providers are a *subset* of the
+    // catalog, so a live QoS catalog can only ever (a) re-introduce a model that
+    // was deliberately curated out — it still lists whatever was once
+    // configured — or (b) zero out a researched context window with a QoS entry
+    // that never carried one. Neither is desirable: the canonical catalog is the
+    // single source of truth for what is provisionable, and new models are added
+    // by editing it (and shipping the updated file), which is the whole point of
+    // an SSOT. Live QoS still drives *routing* via the adaptive chain; that path
+    // is untouched.
+    //
+    // Families with no registry entry have no key-env/route metadata and can't
+    // be onboarded, so they're skipped.
+    let canonical: octos_llm::QosCatalog = serde_json::from_str(CANONICAL_MODEL_CATALOG)
+        .map_err(|error| RpcError::internal_error(format!("canonical model catalog: {error}")))?;
+
+    // `endpoints` (alternative provisioning routes — e.g. AutoDL/WiseModel) is
+    // onboarding metadata that `ModelCatalogEntry` doesn't model, so read it
+    // straight from the canonical JSON keyed by `provider`. This keeps the TUI
+    // onboarding route-picker (Official + alternatives) that the retired
+    // providers.json used to supply, without polluting the routing catalog type.
+    let endpoints_by_provider: std::collections::HashMap<String, Value> =
+        serde_json::from_str::<Value>(CANONICAL_MODEL_CATALOG)
+            .ok()
+            .and_then(|catalog| catalog.get("models").and_then(Value::as_array).cloned())
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|model| {
+                let provider = model.get("provider")?.as_str()?.to_owned();
+                let endpoints = model.get("endpoints")?.clone();
+                Some((provider, endpoints))
+            })
+            .collect();
+
+    let mut families = serde_json::Map::new();
+    for entry in &canonical.models {
+        let Some((family_id, model_id)) = entry.provider.split_once('/') else {
+            continue;
+        };
+        // Canonicalize the family via the registry (handles aliases:
+        // google->gemini, qwen->dashscope, glm->zhipu). A family with no
+        // registry entry has no key-env/route and can't be onboarded.
+        let Some(reg) = octos_llm::registry::lookup(family_id) else {
+            continue;
+        };
+        let family = families
+            .entry(reg.name.to_owned())
+            .or_insert_with(|| json!({ "env": reg.api_key_env.unwrap_or(""), "models": [] }));
+        let Some(models) = family.get_mut("models").and_then(Value::as_array_mut) else {
+            continue;
+        };
+        let known = models
+            .iter()
+            .any(|model| model.get("id").and_then(Value::as_str) == Some(model_id));
+        if !known {
+            let mut model_json = json!({
+                "id": model_id,
+                "input": entry.cost_in,
+                "output": entry.cost_out,
+                "max_output": entry.max_output,
+                "context_window": entry.context_window,
+            });
+            if let Some(endpoints) = endpoints_by_provider.get(&entry.provider) {
+                model_json["endpoints"] = endpoints.clone();
             }
+            models.push(model_json);
         }
     }
-    Ok(json!({ "families": families }))
+    Ok(json!({ "families": Value::Object(families) }))
 }
 
 async fn raw_session_status_result(
@@ -8763,15 +8992,11 @@ fn build_test_llm_provider(
 }
 
 fn dashboard_family_api_key_env(family_id: &str) -> Option<String> {
-    serde_json::from_str::<Value>(DASHBOARD_PROVIDERS_JSON)
-        .ok()
-        .and_then(|catalog| {
-            catalog
-                .get(family_id)?
-                .get("env")?
-                .as_str()
-                .map(str::to_owned)
-        })
+    // Key-env now comes from the provider registry (single source of truth),
+    // not the retired dashboard providers.json. `lookup` resolves aliases too.
+    octos_llm::registry::lookup(family_id)
+        .and_then(|entry| entry.api_key_env)
+        .map(str::to_owned)
         .and_then(|env| nonempty(Some(env)))
 }
 
@@ -9186,6 +9411,10 @@ async fn handle_raw_appui_rpc(
         }
         APPUI_METHOD_SESSION_STATUS_READ => {
             raw_session_status_result(state, request, features, connection_profile_id).await
+        }
+        APPUI_METHOD_SESSION_COMPACT => {
+            handle_session_compact(ws, state, ledger, features, connection_profile_id, request)
+                .await
         }
         APPUI_METHOD_PROFILE_LLM_CATALOG => raw_catalog_result(state, connection_profile_id),
         APPUI_METHOD_PROFILE_LLM_LIST => {
@@ -9629,6 +9858,7 @@ fn raw_method_is_dispatched(method: &str, stdio_transport: bool) -> bool {
             | APPUI_METHOD_MCP_STATUS_LIST
             | APPUI_METHOD_TOOL_STATUS_LIST
             | APPUI_METHOD_ONBOARDING_WORKSPACE_PROBE
+            | APPUI_METHOD_SESSION_COMPACT
     ) {
         return true;
     }
@@ -10496,6 +10726,11 @@ async fn open_session_result(
             .await
         {
             Ok(runtime) => {
+                // Per-project ledger isolation (#1666): registered BEFORE the
+                // `replay_after_with_head` below, so this open replays (and
+                // this session's turns later append) under the per-cwd
+                // storage identity. No-op when the store wasn't relocated.
+                register_session_ledger_scope(ledger, &runtime);
                 effective_workspace_root = Some(runtime.workspace_root.clone());
             }
             Err(error) => {
@@ -15529,15 +15764,29 @@ async fn handle_session_list(
     headers: &HeaderMap,
     identity: Option<&AuthIdentity>,
     connection_profile_id: Option<&str>,
+    features: ConnectionUiFeatures,
     id: String,
-    _params: SessionListParams,
+    params: SessionListParams,
 ) {
+    // Per-project (`appui.sessions_in_cwd`) scoping. When the client sends a
+    // `cwd` AND the server flag is on AND the connection negotiated
+    // `session.workspace_cwd.v1`, the listing is scoped to `<cwd>/.octos`.
+    // Absent cwd / flag off → `None` → byte-identical legacy listing.
+    let cwd_sessions_root =
+        match resolve_session_list_cwd_root(state, features, connection_profile_id, &params) {
+            Ok(root) => root,
+            Err(error) => {
+                let _ = send_rpc_error(ws, Some(id), error);
+                return;
+            }
+        };
     let identity_ext = identity.cloned().map(Extension);
     let response = super::handlers::list_sessions(
         State(state.clone()),
         headers.clone(),
         identity_ext,
         connection_profile_id,
+        cwd_sessions_root,
     )
     .await;
     let method = octos_core::ui_protocol::methods::SESSION_LIST;
@@ -15553,6 +15802,75 @@ async fn handle_session_list(
             let _ = send_rpc_error(ws, Some(id), error);
         }
     }
+}
+
+/// Resolve an optional `session/list` `cwd` into the per-project, per-profile
+/// session-store root (`<cwd>/.octos/<profile_id>`), applying the same gates
+/// the write path uses so list and open agree on where a project's sessions
+/// live:
+///
+/// 1. **Flag** — when `appui.sessions_in_cwd` is off, the `cwd` is ignored
+///    entirely (`Ok(None)` → legacy per-profile/global listing). This keeps a
+///    flag-off server byte-identical: nothing was ever written under
+///    `<cwd>/.octos`, so scoping to it would only ever return an empty list.
+/// 2. **Capability** — a `cwd` under the flag requires the connection to have
+///    negotiated `session.workspace_cwd.v1` (mirrors `session/open`'s cwd
+///    gate). A client that sends `cwd` without it gets a typed error rather
+///    than a silently-global list.
+/// 3. **Workspace safety** — the SAME [`validate_session_workspace_allowed`]
+///    gate `session/open` runs: the cwd must canonicalize to a directory AND
+///    must not be rooted under a banned system path. Without this a client
+///    could point the listing at `/etc` (or any service-writable path) and
+///    `SessionManager::open` would CREATE `<cwd>/.octos/…` there and enumerate
+///    it. On rejection we surface the typed error (consistent with
+///    `session/open`) rather than silently degrading.
+/// 4. **Profile namespace** — the store root is
+///    `<cwd>/.octos/<profile_id>` (via [`project_sessions_root`]), matching
+///    the write path so two profiles that share a project cwd never read each
+///    other's transcripts.
+///
+/// A trimmed-empty or absent `cwd` is always `Ok(None)` (legacy listing).
+fn resolve_session_list_cwd_root(
+    state: &AppState,
+    features: ConnectionUiFeatures,
+    connection_profile_id: Option<&str>,
+    params: &SessionListParams,
+) -> Result<Option<PathBuf>, RpcError> {
+    let Some(cwd) = params
+        .cwd
+        .as_deref()
+        .map(str::trim)
+        .filter(|cwd| !cwd.is_empty())
+    else {
+        return Ok(None);
+    };
+    // Flag off → the store was never relocated; ignore the cwd (legacy).
+    if !state.session_cache.sessions_in_cwd() {
+        return Ok(None);
+    }
+    if !features.session_workspace_cwd {
+        return Err(RpcError::invalid_params(
+            "session/list cwd requires feature session.workspace_cwd.v1",
+        )
+        .with_data(json!({
+            "kind": "feature_required",
+            "feature": UI_PROTOCOL_FEATURE_SESSION_WORKSPACE_CWD_V1,
+        })));
+    }
+    let workspace_root = canonical_existing_dir(cwd)?;
+    // SAME safety gate as session/open — reject banned system roots (and the
+    // missing-profile-runtime case) BEFORE opening a SessionManager that would
+    // otherwise materialize `<cwd>/.octos` at an arbitrary path.
+    validate_session_workspace_allowed(state, connection_profile_id, &workspace_root)?;
+    // Namespace by the SAME profile the write path uses so the listing reads
+    // exactly the connection's own project store.
+    let profile_id = resolve_session_profile_runtime(state, connection_profile_id)
+        .map(|runtime| runtime.profile_id.clone())
+        .unwrap_or_else(|| connection_profile_id.unwrap_or(MAIN_PROFILE_ID).to_string());
+    Ok(Some(crate::runtime::session::project_sessions_root(
+        &workspace_root,
+        &profile_id,
+    )))
 }
 
 async fn handle_session_status_get(
@@ -18586,6 +18904,11 @@ async fn run_native_code_review_turn(
             return;
         }
     };
+    // Per-project ledger isolation (#1666): the review turn appends durable
+    // task/turn events for this session — same idempotent registration as
+    // `run_standalone_turn`, covering runtimes that re-materialized without
+    // a fresh `session/open`.
+    register_session_ledger_scope(&ledger, &session_runtime);
 
     let profile_id = session_id
         .profile_id()
@@ -20175,6 +20498,12 @@ async fn run_standalone_turn(
             return;
         }
     };
+    // Per-project ledger isolation (#1666): every event this turn appends
+    // must land under the session's per-cwd storage identity. `session/open`
+    // registered it already for the normal flow; re-registering here is an
+    // idempotent no-op that also covers turns whose runtime re-materialized
+    // (e.g. after cache eviction) without a fresh open.
+    register_session_ledger_scope(&ledger, &session_runtime);
     let usage_profile_id = active_profile_id
         .clone()
         .or_else(|| session_id.profile_id().map(ToOwned::to_owned))
@@ -20483,7 +20812,15 @@ async fn run_standalone_turn(
     };
     let (history, context_manager, context_lifecycle_notifications) =
         appui_context_history_for_agent(
-            &session_runtime.profile.data_dir,
+            // Root the context ledger at the session's TRANSCRIPT root, not the
+            // profile-global data dir: with `appui.sessions_in_cwd` the
+            // transcript relocates to `<cwd>/.octos/<profile>` and a
+            // profile-rooted context ledger is SHARED across projects that
+            // reuse the same session key — project B's snapshot would beat
+            // project A's raw history on rebuild and leak B's conversation
+            // into A's LLM context (#1666). Flag-OFF: `sessions_root ==
+            // profile.data_dir`, byte-identical.
+            &session_runtime.sessions_root,
             &session_id,
             &raw_history,
             &llm_provider,
@@ -21077,7 +21414,11 @@ async fn run_standalone_turn(
             spawn_tool = spawn_tool.with_parent_subagent_summary_generator(generator);
         }
         let child_context_parent = context_manager.clone();
-        let child_context_data_dir = session_runtime.profile.data_dir.clone();
+        // Child (forked sub-agent) context ledgers belong to the parent's
+        // project store: with `appui.sessions_in_cwd` on, `sessions_root` is
+        // the per-cwd root; profile-rooting them would leak child context
+        // across projects sharing a child key (#1666). Flag-OFF: identical.
+        let child_context_data_dir = session_runtime.sessions_root.clone();
         let child_context_parent_session = session_id.clone();
         spawn_tool = spawn_tool.with_child_prompt_context_manager_factory(Arc::new(
             move |request: octos_agent::tools::spawn::ChildPromptContextRequest| {
@@ -21373,7 +21714,10 @@ async fn run_standalone_turn(
     };
     let mut prompt_context_bridge_inner = AppUiPromptContextBridge::new(
         session_id.clone(),
-        session_runtime.profile.data_dir.clone(),
+        // Mid-turn (compaction-bridge) context persists share the transcript
+        // root — per-cwd under `appui.sessions_in_cwd` — for the same
+        // cross-project isolation as the pre/post-turn sites above (#1666).
+        session_runtime.sessions_root.clone(),
         context_manager.clone(),
         voice_turn_hint,
     )
@@ -21508,7 +21852,10 @@ async fn run_standalone_turn(
     let turn_thread_id_for_persist = turn_id.0.to_string();
     let turn_thread_id_for_done = turn_thread_id_for_persist.clone();
     let context_manager_for_result = context_manager.clone();
-    let context_data_dir_for_result = session_runtime.profile.data_dir.clone();
+    // Post-turn context persists go to the session's transcript root (per-cwd
+    // when `appui.sessions_in_cwd` is on) so the snapshot the NEXT turn's
+    // `appui_context_history_for_agent` loads is the same project's (#1666).
+    let context_data_dir_for_result = session_runtime.sessions_root.clone();
     let usage_ledger_for_result = usage_ledger.clone();
     let usage_profile_id_for_result = usage_profile_id.clone();
     let usage_session_id_for_result = session_id.to_string();
@@ -27864,45 +28211,35 @@ mod tests {
         );
     }
 
-    /// The onboarding catalog unions the QoS model catalog into the bundled
-    /// families — new provider releases (e.g. zai GLM updates) appear without
-    /// waiting for the hand-maintained dashboard list; families with no
-    /// onboarding metadata (key env/route) are skipped.
+    /// The onboarding catalog is the canonical model_catalog.json — the SSOT —
+    /// and is NOT unioned with the runtime QoS catalog. A live QoS catalog only
+    /// reflects already-configured providers (a subset of the catalog), so
+    /// unioning it could only re-introduce curated-out models or zero out
+    /// researched context windows. This guards that regression: a model present
+    /// in the runtime QoS catalog but absent from the canonical catalog must NOT
+    /// appear in onboarding.
     #[test]
-    fn catalog_result_unions_qos_models_into_families() {
+    fn catalog_result_ignores_runtime_qos_not_in_canonical() {
         let dir = tempfile::tempdir().unwrap();
+        // `octos_home_dir()` resolves to `dir` for this store, so this file is
+        // the seed QoS catalog the OLD union path would have read.
         std::fs::write(
             dir.path().join("model_catalog.json"),
             serde_json::to_string(&json!({
                 "updated_at": "2026-07-10T00:00:00Z",
-                "models": [
-                    {
-                        "provider": "zai/glm-9.9-test",
-                        "type": "strong",
-                        "stability": 0.7,
-                        "tool_avg_ms": 1,
-                        "p95_ms": 1,
-                        "score": 0.1,
-                        "cost_in": 1.0,
-                        "cost_out": 4.0,
-                        "ds_output": 1,
-                        "context_window": 1000,
-                        "max_output": 99
-                    },
-                    {
-                        "provider": "unknownfam/mystery-1",
-                        "type": "fast",
-                        "stability": 0.5,
-                        "tool_avg_ms": 1,
-                        "p95_ms": 1,
-                        "score": 0.2,
-                        "cost_in": 0.1,
-                        "cost_out": 0.2,
-                        "ds_output": 1,
-                        "context_window": 1000,
-                        "max_output": 9
-                    }
-                ]
+                "models": [{
+                    "provider": "zai/glm-9.9-not-in-catalog",
+                    "type": "strong",
+                    "stability": 0.7,
+                    "tool_avg_ms": 1,
+                    "p95_ms": 1,
+                    "score": 0.1,
+                    "cost_in": 1.0,
+                    "cost_out": 4.0,
+                    "ds_output": 1,
+                    "context_window": 1000,
+                    "max_output": 99
+                }]
             }))
             .unwrap(),
         )
@@ -27912,17 +28249,86 @@ mod tests {
         let catalog = raw_catalog_result(&state, None).expect("catalog");
         let families = &catalog["families"];
         let zai_models = families["zai"]["models"].as_array().unwrap();
-        assert!(
-            zai_models.iter().any(|model| model["id"] == "glm-9.9-test"),
-            "QoS-only zai model unioned in: {zai_models:?}"
-        );
+        // Canonical lineup is present …
         assert!(
             zai_models.iter().any(|model| model["id"] == "glm-5.2"),
-            "bundled zai lineup still present"
+            "canonical zai lineup present: {zai_models:?}"
+        );
+        // … but the runtime-QoS-only model does NOT leak into onboarding: the
+        // canonical catalog is the single source of truth for what's
+        // provisionable.
+        assert!(
+            !zai_models
+                .iter()
+                .any(|model| model["id"] == "glm-9.9-not-in-catalog"),
+            "runtime-QoS-only model must not appear in onboarding: {zai_models:?}"
+        );
+    }
+
+    #[test]
+    fn catalog_result_sourced_from_registry_and_canonical_catalog() {
+        // With no runtime data-dir catalog, the onboarding catalog is fully
+        // populated from the compiled-in canonical model_catalog.json (the SSOT)
+        // with family key-env from the provider registry — providers.json is no
+        // longer the source.
+        let dir = tempfile::tempdir().unwrap();
+        let state = local_profile_state(dir.path());
+        let catalog = raw_catalog_result(&state, None).expect("catalog");
+        let families = catalog["families"].as_object().expect("families object");
+
+        let ids = |fam: &str| -> Vec<String> {
+            families[fam]["models"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|m| m["id"].as_str().map(str::to_owned))
+                .collect()
+        };
+
+        // Key-env comes from the registry, not a hand-maintained env map.
+        assert_eq!(families["zai"]["env"], "ZAI_API_KEY");
+        // Curation: glm-5.2 + kimi-k2.6 present; deepseek-chat removed.
+        assert!(
+            ids("zai").contains(&"glm-5.2".to_owned()),
+            "{:?}",
+            ids("zai")
         );
         assert!(
-            families.get("unknownfam").is_none(),
-            "families without onboarding metadata are skipped"
+            ids("moonshot").contains(&"kimi-k2.6".to_owned()),
+            "{:?}",
+            ids("moonshot")
+        );
+        assert!(
+            !ids("deepseek").contains(&"deepseek-chat".to_owned()),
+            "deepseek-chat curated out: {:?}",
+            ids("deepseek")
+        );
+        assert!(ids("deepseek").contains(&"deepseek-v4-pro".to_owned()));
+
+        // Researched context window flows through to the catalog (glm-5.2 = 1M).
+        let glm52 = families["zai"]["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["id"] == "glm-5.2")
+            .unwrap();
+        assert_eq!(glm52["context_window"], 1_000_000);
+
+        // Alternative provisioning endpoints (AutoDL/WiseModel) survive into the
+        // onboarding catalog so the TUI route-picker keeps its choices — this was
+        // supplied by the retired providers.json and must not be lost.
+        let v4pro = families["deepseek"]["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["id"] == "deepseek-v4-pro")
+            .unwrap();
+        let endpoints = v4pro["endpoints"].as_array().expect("v4-pro has endpoints");
+        assert!(
+            endpoints
+                .iter()
+                .any(|e| e["id"] == "autodl" && e["api_key_env"] == "AUTODL_API_KEY"),
+            "AutoDL alternative endpoint present: {endpoints:?}"
         );
     }
 
@@ -28139,6 +28545,7 @@ mod tests {
                 "mode": "off",
             }),
             methods::ROUTER_GET_METRICS => json!({ "session_id": session_id }),
+            APPUI_METHOD_SESSION_COMPACT => json!({ "session_id": session_id }),
             other => panic!("missing AppUI dispatch probe params for {other}"),
         };
 
@@ -30913,6 +31320,152 @@ ignore = []
             dir.path(),
         )))
         .await;
+    }
+
+    #[tokio::test]
+    async fn session_list_cwd_root_honors_flag_and_capability() {
+        // The `session/list` cwd gate: flag OFF ignores cwd (legacy listing);
+        // flag ON honors it only with the `session.workspace_cwd.v1`
+        // capability; and it runs the SAME workspace-safety gate as
+        // session/open before resolving a root (proven here by the no-runtime
+        // rejection — see `session_list_cwd_root_gates_path_and_namespaces_by_profile`
+        // for the safe-path happy case + banned-path rejection).
+        use octos_core::ui_protocol::SessionListParams;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let cwd = tmp.path().join("proj");
+        std::fs::create_dir_all(&cwd).unwrap();
+
+        let has_cap = ConnectionUiFeatures::stdio_defaults(); // workspace_cwd = true
+        let no_cap = ConnectionUiFeatures {
+            session_workspace_cwd: false,
+            ..ConnectionUiFeatures::stdio_defaults()
+        };
+        let with_cwd = SessionListParams {
+            cwd: Some(cwd.to_string_lossy().into_owned()),
+        };
+        let no_cwd = SessionListParams { cwd: None };
+
+        let state_off = {
+            let mut s = AppState::empty_for_tests();
+            s.session_cache = Arc::new(
+                crate::runtime::SessionRuntimeCache::new(4, std::time::Duration::from_secs(60))
+                    .with_sessions_in_cwd(false),
+            );
+            s
+        };
+        // Flag OFF → cwd ignored even with the capability (byte-identical legacy).
+        assert_eq!(
+            resolve_session_list_cwd_root(&state_off, has_cap, None, &with_cwd).unwrap(),
+            None,
+        );
+
+        let state_on = {
+            let mut s = AppState::empty_for_tests();
+            s.session_cache = Arc::new(
+                crate::runtime::SessionRuntimeCache::new(4, std::time::Duration::from_secs(60))
+                    .with_sessions_in_cwd(true),
+            );
+            s
+        };
+        // Flag ON + no cwd → None (legacy listing).
+        assert_eq!(
+            resolve_session_list_cwd_root(&state_on, has_cap, None, &no_cwd).unwrap(),
+            None,
+        );
+        // Flag ON + cwd but NO capability → typed error (mirrors session/open).
+        assert!(resolve_session_list_cwd_root(&state_on, no_cap, None, &with_cwd).is_err());
+        // Flag ON + capability + a valid cwd but NO registered profile runtime
+        // → the workspace-safety gate (`validate_session_workspace_allowed`)
+        // rejects. This proves the gate is wired BEFORE any SessionManager is
+        // opened at the cwd (the P1 the codex review flagged).
+        assert!(resolve_session_list_cwd_root(&state_on, has_cap, None, &with_cwd).is_err());
+    }
+
+    #[tokio::test]
+    async fn session_list_cwd_root_gates_path_and_namespaces_by_profile() {
+        // With a registered profile runtime: a SAFE cwd resolves to the
+        // per-project, per-PROFILE store `<cwd>/.octos/<profile_id>` (so two
+        // profiles sharing a cwd can't read each other's transcripts), and a
+        // banned system path is rejected by the shared safety gate.
+        use octos_core::ui_protocol::SessionListParams;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let profile = crate::profiles::UserProfile {
+            id: "dev".to_string(),
+            name: "Dev".to_string(),
+            enabled: true,
+            data_dir: None,
+            parent_id: None,
+            public_subdomain: None,
+            config: crate::profiles::ProfileConfig {
+                llm: Some(crate::profiles::LlmProfileConfig {
+                    primary: Some(crate::profiles::LlmModelSelectionConfig {
+                        family_id: Some("openai".to_string()),
+                        model_id: Some("gpt-4o-mini".to_string()),
+                        route: Some(crate::profiles::LlmRouteConfig {
+                            route_id: None,
+                            label: None,
+                            base_url: None,
+                            api_key_env: Some("SESS_CWD_TEST_KEY".to_string()),
+                            api_type: None,
+                        }),
+                        ..Default::default()
+                    }),
+                    fallbacks: Vec::new(),
+                }),
+                env_vars: [("SESS_CWD_TEST_KEY".to_string(), "test-key".to_string())]
+                    .into_iter()
+                    .collect(),
+                ..Default::default()
+            },
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        let data_dir = tmp.path().join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let runtime = crate::runtime::ProfileRuntime::bootstrap(
+            &profile,
+            &data_dir,
+            None,
+            crate::runtime::BootstrapRole::Serve,
+        )
+        .await
+        .expect("bootstrap dev runtime");
+
+        let mut state = AppState::empty_for_tests();
+        state.profiles.insert("dev".to_string(), runtime);
+        state.session_cache = Arc::new(
+            crate::runtime::SessionRuntimeCache::new(4, std::time::Duration::from_secs(60))
+                .with_sessions_in_cwd(true),
+        );
+
+        let cap = ConnectionUiFeatures::stdio_defaults();
+
+        // Safe cwd → `<cwd>/.octos/dev` (profile-namespaced).
+        let good = tmp.path().join("project");
+        std::fs::create_dir_all(&good).unwrap();
+        let good_canon = std::fs::canonicalize(&good).unwrap();
+        let good_params = SessionListParams {
+            cwd: Some(good.to_string_lossy().into_owned()),
+        };
+        let resolved =
+            resolve_session_list_cwd_root(&state, cap, Some("dev"), &good_params).unwrap();
+        assert_eq!(
+            resolved,
+            Some(crate::runtime::session::project_sessions_root(
+                &good_canon,
+                "dev"
+            )),
+        );
+        assert_eq!(resolved, Some(good_canon.join(".octos").join("dev")));
+
+        // Banned system root (`/usr` is a real dir on Linux and macOS that
+        // canonicalizes to `/usr`) → rejected by the safety gate.
+        let banned = SessionListParams {
+            cwd: Some("/usr".to_string()),
+        };
+        assert!(resolve_session_list_cwd_root(&state, cap, Some("dev"), &banned).is_err());
     }
 
     async fn assert_advertised_stdio_methods_have_dispatch_path(state: Arc<AppState>) {
@@ -44088,8 +44641,17 @@ ignore = []
         let observed: Arc<std::sync::Mutex<Vec<(SessionKey, Message, usize)>>> =
             Arc::new(std::sync::Mutex::new(Vec::new()));
         let observed_clone = observed.clone();
+        // Filter to THIS test's session id: the commit observer is
+        // process-global, so a concurrently-running suite test that commits a
+        // message to a DIFFERENT session would otherwise pollute this sink and
+        // make `observed.len()` exceed 3 (the `message_commit_observer_test_lock`
+        // only serialises observer-MUTATING tests, not every committer).
+        let filter_key = "local:persisted-order";
         let prev =
             octos_bus::set_message_commit_observer(Some(Arc::new(move |key, message, seq| {
+                if key.0 != filter_key {
+                    return;
+                }
                 observed_clone
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
@@ -44099,7 +44661,7 @@ ignore = []
         let tmp = tempfile::tempdir().expect("tempdir");
         let mut manager =
             octos_bus::SessionManager::open(tmp.path()).expect("session manager open");
-        let session_id = SessionKey("local:persisted-order".into());
+        let session_id = SessionKey(filter_key.into());
         for content in ["one", "two", "three"] {
             let msg = Message {
                 role: MessageRole::User,
@@ -44178,8 +44740,13 @@ ignore = []
         assert!(observed.lock().unwrap().is_empty());
 
         // Install the sink and run a second commit. Sink must contain
-        // exactly one event (the second), not two.
-        octos_bus::set_message_commit_observer(Some(Arc::new(move |_key, _message, _seq| {
+        // exactly one event (the second), not two. Filter to this test's
+        // session id so a concurrent suite committer (the observer is
+        // process-global) cannot inflate the count past 1.
+        octos_bus::set_message_commit_observer(Some(Arc::new(move |key, _message, _seq| {
+            if key.0 != "local:persisted-failure" {
+                return;
+            }
             observed_clone.lock().unwrap().push(());
         })));
         let msg2 = Message {

@@ -972,7 +972,7 @@ fn render_transcript(messages: &[Message]) -> String {
 }
 
 /// One-shot LLM context-compaction summary: prompts the model for a handoff
-/// summary of `messages`, bounded by `budget_tokens` and `timeout`. Returns
+/// summary of `messages`, bounded by the model's max output and `timeout`. Returns
 /// `None` on ANY error, timeout, empty content, or unsupported runtime so the
 /// caller falls back to the deterministic [`compact_messages`] heuristic —
 /// compaction must never block or fail a turn.
@@ -988,7 +988,6 @@ fn render_transcript(messages: &[Message]) -> String {
 pub fn llm_compaction_summary(
     provider: &Arc<dyn LlmProvider>,
     messages: &[Message],
-    budget_tokens: u32,
     timeout: Duration,
 ) -> Option<String> {
     if messages.is_empty() {
@@ -1006,8 +1005,14 @@ pub fn llm_compaction_summary(
     let provider = Arc::clone(provider);
     let transcript = render_transcript(messages);
     crate::summarizer::run_llm_call_blocking(async move {
+        // Give the call the model's FULL output budget, not a small
+        // summary-size heuristic. Reasoning models spend tokens on
+        // `reasoning_content` before emitting the summary `content`; capping at
+        // a small budget starves the summary and returns empty content (a
+        // silent heuristic fallback). Mirrors codex, which sets no output cap on
+        // its compaction turn — the system prompt keeps the summary concise.
         let config = ChatConfig {
-            max_tokens: Some(budget_tokens),
+            max_tokens: Some(provider.max_output_tokens()),
             // Low but non-zero: a factual handoff summary, lightly deterministic.
             temperature: Some(0.2),
             ..Default::default()
@@ -1091,7 +1096,7 @@ mod tests {
             result: Ok("Goal: X. Done: Y. Next: Z.".into()),
         });
         let messages = vec![Message::user("do X"), Message::assistant("did Y")];
-        let out = llm_compaction_summary(&provider, &messages, 512, Duration::from_secs(5));
+        let out = llm_compaction_summary(&provider, &messages, Duration::from_secs(5));
         assert_eq!(out.as_deref(), Some("Goal: X. Done: Y. Next: Z."));
     }
 
@@ -1103,7 +1108,7 @@ mod tests {
             result: Err("provider down".into()),
         });
         let messages = vec![Message::user("do X")];
-        let out = llm_compaction_summary(&provider, &messages, 512, Duration::from_secs(5));
+        let out = llm_compaction_summary(&provider, &messages, Duration::from_secs(5));
         assert!(out.is_none());
     }
 
@@ -1113,7 +1118,7 @@ mod tests {
         let provider: Arc<dyn LlmProvider> = Arc::new(CompactionMockProvider {
             result: Ok("unused".into()),
         });
-        assert!(llm_compaction_summary(&provider, &[], 512, Duration::from_secs(5)).is_none());
+        assert!(llm_compaction_summary(&provider, &[], Duration::from_secs(5)).is_none());
     }
 
     #[tokio::test] // current_thread runtime (the default, no `flavor`)
@@ -1125,7 +1130,7 @@ mod tests {
             result: Ok("should not be used on current_thread".into()),
         });
         let messages = vec![Message::user("do X")];
-        let out = llm_compaction_summary(&provider, &messages, 512, Duration::from_secs(5));
+        let out = llm_compaction_summary(&provider, &messages, Duration::from_secs(5));
         assert!(
             out.is_none(),
             "current_thread runtime must degrade to the heuristic, not run the LLM path"

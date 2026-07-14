@@ -47,18 +47,12 @@ fn main() -> Result<()> {
         log_dir = Some(dir);
     }
 
-    // Initialize tracing (with optional rolling file output for serve).
-    // `octos acp` speaks ACP JSON-RPC on STDOUT, so its logs MUST NOT touch
-    // stdout — one stray log line corrupts the protocol stream and strict
-    // clients (Zed) reject it all with a -32700 parse error. Route to stderr.
-    // `octos mcp-serve --transport stdio` speaks MCP JSON-RPC on STDOUT for
-    // the same reason (and stderr logging is harmless for its http transport).
-    // `octos profile` emits payloads meant for `$(...)` capture and piping
-    // (`qr --payload-only`, `decode`), so it reserves stdout the same way.
-    let reserve_stdout = matches!(
-        args.command,
-        commands::Command::Acp(_) | commands::Command::Profile(_) | commands::Command::McpServe(_)
-    );
+    // Initialize tracing (with optional rolling file output for serve). Some
+    // commands emit a machine-readable stream on STDOUT (ACP/MCP JSON-RPC,
+    // `profile` payloads, `chat --json`) and must keep it pure — one stray log
+    // line corrupts it — so their console logs are routed to stderr. See
+    // [`commands::reserve_stdout`] for the exact set.
+    let reserve_stdout = commands::reserve_stdout(&args.command);
     let _log_guard = init_tracing(log_dir.as_deref(), reserve_stdout)?;
 
     args.command.execute()

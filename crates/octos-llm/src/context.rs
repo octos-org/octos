@@ -24,27 +24,54 @@ static CATALOG: RwLock<Option<HashMap<String, CatalogModel>>> = RwLock::new(None
 /// Called once at startup by the gateway after loading the catalog.
 /// The `entries` parameter is a list of (provider_slash_model, context_window, max_output).
 pub fn seed_from_catalog(entries: &[(String, u64, u64)]) {
+    *CATALOG.write().unwrap_or_else(|e| e.into_inner()) = Some(build_catalog_map(entries));
+}
+
+/// Build the runtime catalog lookup map from `(provider/model, ctx, max_out)`
+/// entries. Pure (touches no global state) so the alias-selection rules below
+/// are unit-testable without racing the shared `CATALOG`.
+fn build_catalog_map(entries: &[(String, u64, u64)]) -> HashMap<String, CatalogModel> {
     let mut map = HashMap::new();
+    // See `pricing::seed_pricing_catalog`: a bare model id can be shared by the
+    // native provider and its re-hosts, so award the bare alias to the row with
+    // the FEWEST path segments (most canonical/native), deterministically. On an
+    // EQUAL segment count the lexicographically-smaller lowercased full key wins
+    // (e.g. `minimax/MiniMax-M3` beats `r9s/minimax-m3`, both one slash), so the
+    // bare alias does not depend on seed/export order.
+    let mut bare_owner: HashMap<String, (usize, String)> = HashMap::new();
     for (key, ctx, max_out) in entries {
         // Store by full key ("dashscope/qwen3.5-plus") and by model name alone ("qwen3.5-plus")
+        let key_lower = key.to_lowercase();
         map.insert(
-            key.to_lowercase(),
+            key_lower.clone(),
             CatalogModel {
                 context_window: *ctx,
                 max_output: *max_out,
             },
         );
         if let Some(model) = key.split('/').next_back() {
-            map.insert(
-                model.to_lowercase(),
-                CatalogModel {
-                    context_window: *ctx,
-                    max_output: *max_out,
-                },
-            );
+            let bare = model.to_lowercase();
+            let segments = key.matches('/').count();
+            let take = match bare_owner.get(&bare) {
+                None => true,
+                Some((owned_seg, owner_key)) => {
+                    segments < *owned_seg
+                        || (segments == *owned_seg && key_lower.as_str() < owner_key.as_str())
+                }
+            };
+            if take {
+                map.insert(
+                    bare.clone(),
+                    CatalogModel {
+                        context_window: *ctx,
+                        max_output: *max_out,
+                    },
+                );
+                bare_owner.insert(bare, (segments, key_lower));
+            }
         }
     }
-    *CATALOG.write().unwrap_or_else(|e| e.into_inner()) = Some(map);
+    map
 }
 
 /// Look up a value from the runtime catalog by model ID.
@@ -269,6 +296,39 @@ mod tests {
             catalog_lookup_in(&map, "gpt-4o-mini"),
             Some((128_000, 16_000))
         );
+    }
+
+    #[test]
+    fn build_catalog_map_awards_bare_alias_to_native_then_lexicographically() {
+        // A deeper re-host loses the bare alias to the fewest-segments native
+        // row regardless of order.
+        let native = build_catalog_map(&[
+            ("rehost/vendor/mdeep-9".to_string(), 111, 1), // 2 seg, listed first
+            ("native/mdeep-9".to_string(), 1_000_000, 8_192), // 1 seg (native) wins
+        ]);
+        let bare = native.get("mdeep-9").unwrap();
+        assert_eq!(bare.context_window, 1_000_000);
+        assert_eq!(bare.max_output, 8_192);
+        // Deeper re-host still resolves under its own fully-qualified key.
+        assert_eq!(
+            native.get("rehost/vendor/mdeep-9").unwrap().context_window,
+            111
+        );
+
+        // EQUAL depth (both one segment): segment count can't break the tie, so
+        // the lexicographically-smaller lowercased key wins deterministically —
+        // mirrors `minimax/MiniMax-M3` vs `r9s/minimax-m3`. Larger key first to
+        // prove order-independence.
+        let tie = build_catalog_map(&[
+            ("zeta/mtie-9".to_string(), 500_000, 4_096), // larger key, first
+            ("alpha/mtie-9".to_string(), 1_000_000, 8_192), // smaller key wins
+        ]);
+        let bare = tie.get("mtie-9").unwrap();
+        assert_eq!(
+            bare.context_window, 1_000_000,
+            "equal-depth bare alias resolves to the lexicographically-smaller key"
+        );
+        assert_eq!(bare.max_output, 8_192);
     }
 
     #[test]
