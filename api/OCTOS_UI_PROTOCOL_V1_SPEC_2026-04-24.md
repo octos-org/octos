@@ -420,6 +420,10 @@ M12 Phase-D auxiliary REST→WS surface (all gated `auxiliary.rest_to_ws.v1`):
 - `content/list`, `content/delete`, `content/bulk_delete`
 - `memory/overview`, `memory/entity`, `cron/list`, `cron/toggle`
 
+Launch (per-project session UX, gated `session.workspace_cwd.v1`):
+
+- `launch/resolve`
+
 Runtime, auth, profile, and onboarding inspection (server-handled
 `APPUI_EXTRA_METHODS`):
 

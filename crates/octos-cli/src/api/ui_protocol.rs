@@ -4481,6 +4481,10 @@ async fn ui_protocol_connection(
                     }
                 }
             }
+            UiCommand::LaunchResolve(params) => {
+                handle_launch_resolve(&ws, &state, connection_profile_id, features, id, params)
+                    .await;
+            }
             UiCommand::SessionOpen(params) => {
                 // gap #2 (codex P2): record the profile this open RESOLVES to so
                 // a None-scoped (admin) connection's later turn/start +
@@ -5176,6 +5180,17 @@ where
                         let _ = send_rpc_error(&ws, Some(id), error);
                     }
                 }
+            }
+            UiCommand::LaunchResolve(params) => {
+                handle_launch_resolve(
+                    &ws,
+                    &state,
+                    connection_profile_id_owned.as_deref(),
+                    features,
+                    id,
+                    params,
+                )
+                .await;
             }
             UiCommand::SessionOpen(params) => {
                 let next_connection_profile_id = stdio_session_open_candidate_profile(
@@ -9736,6 +9751,7 @@ fn validate_session_ingress_command_scope(
 ) -> Result<(), RpcError> {
     let actual = match command {
         UiCommand::ProfileLocalCreate(_)
+        | UiCommand::LaunchResolve(_)
         | UiCommand::SessionList(_)
         | UiCommand::SystemStatusGet(_)
         | UiCommand::ContentList(_)
@@ -15687,6 +15703,126 @@ fn resolve_session_list_cwd_root(
         &workspace_root,
         &profile_id,
     )))
+}
+
+/// `launch/resolve` — the pre-session launch probe. Resolves the launching
+/// profile (requested `--profile` → folder-sticky → global default) and reports
+/// whether the client should resume the folder's conversation, activate a new
+/// one, or choose among profiles. Delegates to the tested
+/// [`crate::runtime::launch`] decision core.
+async fn handle_launch_resolve(
+    ws: &WsConnection,
+    state: &Arc<AppState>,
+    connection_profile_id: Option<&str>,
+    features: ConnectionUiFeatures,
+    id: String,
+    params: octos_core::ui_protocol::LaunchResolveParams,
+) {
+    match resolve_launch_result(state, connection_profile_id, features, &params) {
+        Ok(result) => {
+            let body = serde_json::to_value(&result).unwrap_or_else(|_| json!({}));
+            send_aux_rpc_result(
+                ws,
+                id,
+                octos_core::ui_protocol::methods::LAUNCH_RESOLVE,
+                body,
+            );
+        }
+        Err(error) => {
+            let _ = send_rpc_error(ws, Some(id), error);
+        }
+    }
+}
+
+/// Resolution core for [`handle_launch_resolve`], split out so the error paths
+/// are a single `?`-chain. Applies the SAME cwd safety gates as `session/open`
+/// and `session/list` before scanning the project's `.octos` store.
+fn resolve_launch_result(
+    state: &Arc<AppState>,
+    connection_profile_id: Option<&str>,
+    features: ConnectionUiFeatures,
+    params: &octos_core::ui_protocol::LaunchResolveParams,
+) -> Result<octos_core::ui_protocol::LaunchResolveResult, RpcError> {
+    use crate::runtime::launch::{LaunchDecision, resolve_launch_decision, scan_folder_sessions};
+    use octos_core::ui_protocol::{LaunchDecisionKind, LaunchResolveResult};
+
+    // The method is advertised only when `session.workspace_cwd.v1` is
+    // negotiated; reject a client that calls it without the feature.
+    if !features.session_workspace_cwd {
+        return Err(RpcError::invalid_params(
+            "launch/resolve requires feature session.workspace_cwd.v1",
+        )
+        .with_data(json!({
+            "kind": "feature_required",
+            "feature": UI_PROTOCOL_FEATURE_SESSION_WORKSPACE_CWD_V1,
+        })));
+    }
+
+    let cwd = params.cwd.trim();
+    if cwd.is_empty() {
+        return Err(RpcError::invalid_params(
+            "launch/resolve requires a non-empty cwd",
+        ));
+    }
+    // SAME safety gates the write path runs before materializing `<cwd>/.octos`.
+    let workspace_root = canonical_existing_dir(cwd)?;
+    validate_session_workspace_allowed(state, connection_profile_id, &workspace_root)?;
+
+    // Known profiles = every loaded/launchable profile (`octos serve`
+    // bootstraps `ProfileStore::list()` into `state.profiles` at startup). A
+    // since-deleted profile's leftover store dir is ignored by the scanner.
+    // Sorted for a deterministic default + cross-profile listing. Empty (no
+    // profiles) → `NoProfile`.
+    let mut known_profiles: Vec<String> = state.profiles.keys().cloned().collect();
+    known_profiles.sort();
+
+    // Global default: the connection's own profile when it is registered, else
+    // `_main` when present, else the first known profile. `None` (→
+    // `NoProfile`) only when no profile exists at all. Phase-3 replaces this
+    // with an explicit `default-profile` pointer.
+    let default_profile: Option<String> = connection_profile_id
+        .map(str::to_string)
+        .filter(|candidate| known_profiles.iter().any(|known| known == candidate))
+        .or_else(|| {
+            known_profiles
+                .iter()
+                .find(|known| known.as_str() == MAIN_PROFILE_ID)
+                .cloned()
+        })
+        .or_else(|| known_profiles.first().cloned());
+
+    let folder = scan_folder_sessions(&workspace_root, &known_profiles);
+    let decision = resolve_launch_decision(
+        params.profile_id.as_deref(),
+        default_profile.as_deref(),
+        &folder,
+    );
+
+    Ok(match decision {
+        LaunchDecision::Resume { profile_id } => LaunchResolveResult {
+            decision: LaunchDecisionKind::Resume,
+            resolved_profile: Some(profile_id),
+            existing_profiles: Vec::new(),
+        },
+        LaunchDecision::NeedsActivation { profile_id } => LaunchResolveResult {
+            decision: LaunchDecisionKind::Activate,
+            resolved_profile: Some(profile_id),
+            existing_profiles: Vec::new(),
+        },
+        LaunchDecision::CrossProfile {
+            launching_profile,
+            existing_profiles,
+        } => LaunchResolveResult {
+            decision: LaunchDecisionKind::CrossProfile,
+            resolved_profile: Some(launching_profile),
+            existing_profiles,
+        },
+        LaunchDecision::NoProfile => LaunchResolveResult {
+            decision: LaunchDecisionKind::NoProfile,
+            resolved_profile: None,
+            existing_profiles: Vec::new(),
+        },
+    })
 }
 
 async fn handle_session_status_get(
@@ -31222,6 +31358,92 @@ ignore = []
             cwd: Some("/usr".to_string()),
         };
         assert!(resolve_session_list_cwd_root(&state, cap, Some("dev"), &banned).is_err());
+    }
+
+    #[tokio::test]
+    async fn launch_resolve_activates_empty_folder_then_resumes_after_store_exists() {
+        use octos_core::ui_protocol::{LaunchDecisionKind, LaunchResolveParams};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let profile = crate::profiles::UserProfile {
+            id: "dev".to_string(),
+            name: "Dev".to_string(),
+            enabled: true,
+            data_dir: None,
+            parent_id: None,
+            public_subdomain: None,
+            config: crate::profiles::ProfileConfig {
+                llm: Some(crate::profiles::LlmProfileConfig {
+                    primary: Some(crate::profiles::LlmModelSelectionConfig {
+                        family_id: Some("openai".to_string()),
+                        model_id: Some("gpt-4o-mini".to_string()),
+                        route: Some(crate::profiles::LlmRouteConfig {
+                            route_id: None,
+                            label: None,
+                            base_url: None,
+                            api_key_env: Some("LAUNCH_RESOLVE_TEST_KEY".to_string()),
+                            api_type: None,
+                        }),
+                        ..Default::default()
+                    }),
+                    fallbacks: Vec::new(),
+                }),
+                env_vars: [(
+                    "LAUNCH_RESOLVE_TEST_KEY".to_string(),
+                    "test-key".to_string(),
+                )]
+                .into_iter()
+                .collect(),
+                ..Default::default()
+            },
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        let data_dir = tmp.path().join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let runtime = crate::runtime::ProfileRuntime::bootstrap(
+            &profile,
+            &data_dir,
+            None,
+            crate::runtime::BootstrapRole::Serve,
+        )
+        .await
+        .expect("bootstrap dev runtime");
+
+        let mut state = AppState::empty_for_tests();
+        state.profiles.insert("dev".to_string(), runtime);
+        state.session_cache = Arc::new(
+            crate::runtime::SessionRuntimeCache::new(4, std::time::Duration::from_secs(60))
+                .with_sessions_in_cwd(true),
+        );
+        let state = Arc::new(state);
+        let cap = ConnectionUiFeatures::stdio_defaults();
+
+        let project = tmp.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let params = LaunchResolveParams {
+            cwd: project.to_string_lossy().into_owned(),
+            profile_id: Some("dev".to_string()),
+        };
+
+        // Empty folder → activate a new session for the launching profile.
+        let activate = resolve_launch_result(&state, Some("dev"), cap, &params).unwrap();
+        assert_eq!(activate.decision, LaunchDecisionKind::Activate);
+        assert_eq!(activate.resolved_profile.as_deref(), Some("dev"));
+
+        // Once dev has a store here, a relaunch resumes it.
+        let canon = std::fs::canonicalize(&project).unwrap();
+        std::fs::create_dir_all(
+            crate::runtime::session::project_sessions_root(&canon, "dev").join("sessions"),
+        )
+        .unwrap();
+        let resume = resolve_launch_result(&state, Some("dev"), cap, &params).unwrap();
+        assert_eq!(resume.decision, LaunchDecisionKind::Resume);
+        assert_eq!(resume.resolved_profile.as_deref(), Some("dev"));
+
+        // Without the workspace-cwd feature the probe is rejected.
+        let no_cap = ConnectionUiFeatures::default();
+        assert!(resolve_launch_result(&state, Some("dev"), no_cap, &params).is_err());
     }
 
     async fn assert_advertised_stdio_methods_have_dispatch_path(state: Arc<AppState>) {

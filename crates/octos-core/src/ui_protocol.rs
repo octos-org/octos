@@ -307,6 +307,7 @@ fn method_capability_gate(method: &str) -> Option<&'static str> {
         methods::SESSION_HYDRATE => Some(UI_PROTOCOL_FEATURE_SESSION_HYDRATE_V1),
         methods::THREAD_GRAPH_GET => Some(UI_PROTOCOL_FEATURE_THREAD_GRAPH_V1),
         methods::TURN_STATE_GET => Some(UI_PROTOCOL_FEATURE_TURN_STATE_GET_V1),
+        methods::LAUNCH_RESOLVE => Some(UI_PROTOCOL_FEATURE_SESSION_WORKSPACE_CWD_V1),
         methods::SESSION_LIST
         | methods::SESSION_SNAPSHOT
         | methods::SESSION_MESSAGES_PAGE
@@ -1166,6 +1167,13 @@ pub mod methods {
     /// Replaces `PUT /api/my/cron/{job_id}/enabled` — cron job toggle.
     pub const CRON_TOGGLE: &str = "cron/toggle";
 
+    /// Pre-session launch probe. Given the project cwd + optional requested
+    /// profile, the server decides whether to resume the folder's
+    /// conversation, activate a new one, or surface a cross-profile choice.
+    /// Capability-gated on
+    /// [`UI_PROTOCOL_FEATURE_SESSION_WORKSPACE_CWD_V1`].
+    pub const LAUNCH_RESOLVE: &str = "launch/resolve";
+
     // ---- Wave4-A: adaptive routing + queue state ----
 
     /// Wave4-A `router/status` — adaptive routing snapshot notification.
@@ -1274,6 +1282,7 @@ pub const UI_PROTOCOL_COMMAND_METHODS: &[&str] = &[
     methods::CRON_TOGGLE,
     methods::ROUTER_SET_MODE,
     methods::ROUTER_GET_METRICS,
+    methods::LAUNCH_RESOLVE,
 ];
 
 /// Notification methods defined by the v1alpha1 protocol model.
@@ -1383,6 +1392,7 @@ pub const UI_PROTOCOL_FIRST_SERVER_METHODS: &[&str] = &[
     methods::CRON_TOGGLE,
     methods::ROUTER_SET_MODE,
     methods::ROUTER_GET_METRICS,
+    methods::LAUNCH_RESOLVE,
 ];
 
 /// Protocol methods known but not implemented by the first server/runtime slice.
@@ -3015,6 +3025,53 @@ pub struct SessionListResult {
     pub sessions: Value,
 }
 
+/// Params for `launch/resolve` — the pre-session launch probe. Given the
+/// project `cwd` and the optionally requested profile, the server decides
+/// whether to resume the folder's conversation, activate a new one, or surface
+/// a cross-profile choice. Gated on
+/// [`UI_PROTOCOL_FEATURE_SESSION_WORKSPACE_CWD_V1`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LaunchResolveParams {
+    /// Absolute project directory the client launched in.
+    pub cwd: String,
+    /// The profile the client was launched with (`--profile`), if any. Absent
+    /// → the server resolves the folder's sticky profile, else its global
+    /// default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<String>,
+}
+
+/// The action a [`LaunchResolveResult`] tells the client to take.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LaunchDecisionKind {
+    /// The resolved profile already has a conversation in the folder — open it.
+    Resume,
+    /// The folder has no conversation for any known profile — prompt to
+    /// activate (create) one for the resolved profile.
+    Activate,
+    /// The folder holds conversation(s) for other profile(s) but not the
+    /// resolved one — offer switch-and-resume or start-fresh.
+    CrossProfile,
+    /// No profile exists on the machine — send the user to `octos-tui onboard`.
+    NoProfile,
+}
+
+/// Result for `launch/resolve`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LaunchResolveResult {
+    /// What the client should do next.
+    pub decision: LaunchDecisionKind,
+    /// The canonical (server-finalized) profile id to use — present for every
+    /// decision except [`LaunchDecisionKind::NoProfile`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_profile: Option<String>,
+    /// The other profiles that already have a conversation in the folder —
+    /// present (and non-empty) only for [`LaunchDecisionKind::CrossProfile`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub existing_profiles: Vec<String>,
+}
+
 /// Params for `session/snapshot` — combined bootstrap fetch.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionSnapshotParams {
@@ -3932,6 +3989,8 @@ pub enum UiCommand {
     // ---- Wave4-A: adaptive router controls ----
     RouterSetMode(RouterSetModeParams),
     RouterGetMetrics(RouterGetMetricsParams),
+    // ---- launch/resolve: pre-session launch probe ----
+    LaunchResolve(LaunchResolveParams),
 }
 
 impl UiCommand {
@@ -3978,6 +4037,7 @@ impl UiCommand {
             Self::CronToggle(_) => methods::CRON_TOGGLE,
             Self::RouterSetMode(_) => methods::ROUTER_SET_MODE,
             Self::RouterGetMetrics(_) => methods::ROUTER_GET_METRICS,
+            Self::LaunchResolve(_) => methods::LAUNCH_RESOLVE,
         }
     }
 
@@ -4028,6 +4088,7 @@ impl UiCommand {
             Self::CronToggle(params) => serde_json::to_value(params),
             Self::RouterSetMode(params) => serde_json::to_value(params),
             Self::RouterGetMetrics(params) => serde_json::to_value(params),
+            Self::LaunchResolve(params) => serde_json::to_value(params),
         }?;
 
         Ok(RpcRequest::new(id, method, params))
@@ -4086,6 +4147,7 @@ impl UiCommand {
             methods::TURN_STATE_GET => Ok(Self::TurnStateGet(decode_params(method, params)?)),
             methods::SESSION_BTW => Ok(Self::SessionBtw(decode_params(method, params)?)),
             methods::SESSION_LIST => Ok(Self::SessionList(decode_optional_params(method, params)?)),
+            methods::LAUNCH_RESOLVE => Ok(Self::LaunchResolve(decode_params(method, params)?)),
             methods::SESSION_SNAPSHOT => Ok(Self::SessionSnapshot(decode_params(method, params)?)),
             methods::SESSION_MESSAGES_PAGE => {
                 Ok(Self::SessionMessagesPage(decode_params(method, params)?))
@@ -7320,6 +7382,7 @@ mod tests {
                 "cron/toggle",
                 "router/set_mode",
                 "router/get_metrics",
+                "launch/resolve",
             ]
         );
         assert_eq!(
@@ -7431,6 +7494,7 @@ mod tests {
                 "cron/toggle",
                 "router/set_mode",
                 "router/get_metrics",
+                "launch/resolve",
             ]
         );
         assert_eq!(UI_PROTOCOL_FIRST_SERVER_UNSUPPORTED_METHODS.len(), 0);
@@ -7510,7 +7574,8 @@ mod tests {
                     "cron/list",
                     "cron/toggle",
                     "router/set_mode",
-                    "router/get_metrics"
+                    "router/get_metrics",
+                    "launch/resolve"
                 ],
                 "supported_notifications": [
                     "session/open",
@@ -11248,6 +11313,50 @@ mod tests {
         let value = serde_json::to_value(&toggle).expect("serialize");
         let decoded: CronToggleResult = serde_json::from_value(value).expect("deserialize");
         assert_eq!(decoded.job, toggle.job);
+    }
+
+    #[test]
+    fn launch_resolve_round_trips_through_rpc_envelope() {
+        let command = UiCommand::LaunchResolve(LaunchResolveParams {
+            cwd: "/tmp/project".into(),
+            profile_id: Some("glm".into()),
+        });
+        let rpc = command
+            .clone()
+            .into_rpc_request("req")
+            .expect("serialize command");
+        assert_eq!(rpc.method, methods::LAUNCH_RESOLVE);
+        let decoded = UiCommand::from_rpc_request(rpc).expect("decode command");
+        assert_eq!(decoded, command);
+    }
+
+    #[test]
+    fn launch_resolve_is_gated_on_session_workspace_cwd_v1() {
+        let none = UiProtocolCapabilities::for_negotiated_features(Vec::<String>::new());
+        assert!(
+            !none.supports_method(methods::LAUNCH_RESOLVE),
+            "launch/resolve must NOT be advertised without session.workspace_cwd.v1"
+        );
+        let with_feature = UiProtocolCapabilities::for_negotiated_features([
+            UI_PROTOCOL_FEATURE_SESSION_WORKSPACE_CWD_V1,
+        ]);
+        assert!(
+            with_feature.supports_method(methods::LAUNCH_RESOLVE),
+            "launch/resolve must be advertised once session.workspace_cwd.v1 is negotiated"
+        );
+    }
+
+    #[test]
+    fn launch_resolve_result_serializes_snake_case_decision() {
+        let result = LaunchResolveResult {
+            decision: LaunchDecisionKind::CrossProfile,
+            resolved_profile: Some("deepseek".into()),
+            existing_profiles: vec!["glm".into()],
+        };
+        let value = serde_json::to_value(&result).expect("serialize");
+        assert_eq!(value["decision"], "cross_profile");
+        let decoded: LaunchResolveResult = serde_json::from_value(value).expect("deserialize");
+        assert_eq!(decoded, result);
     }
 
     #[test]
