@@ -779,7 +779,9 @@ pub(crate) fn resolve_sessions_root_from_hint(
 /// (`init.rs`: `sessions/`, `tasks/`, `*.redb`) and to leave a
 /// deliberately-committed `<cwd>/.octos/config.json` untouched; `users/` is
 /// added because per-project transcripts + their sidecars land under
-/// `<cwd>/.octos/users/<base>/sessions/`.
+/// `<cwd>/.octos/users/<base>/sessions/`; `context_ledgers/` because the
+/// per-turn context-manager snapshots (verbatim conversation content) are
+/// rooted at this store alongside the transcript (#1666).
 fn ensure_session_store_gitignore(sessions_root: &Path) {
     use std::io::Write;
 
@@ -789,6 +791,7 @@ fn ensure_session_store_gitignore(sessions_root: &Path) {
 sessions/
 users/
 tasks/
+context_ledgers/
 *.redb
 ";
     if let Err(error) = std::fs::create_dir_all(sessions_root) {
@@ -2225,6 +2228,9 @@ mod tests {
         let body = std::fs::read_to_string(&gitignore).unwrap();
         assert!(body.contains("sessions/"));
         assert!(body.contains("users/"));
+        // Context-manager snapshots hold verbatim conversation content and
+        // are rooted at this store alongside the transcript (#1666).
+        assert!(body.contains("context_ledgers/"));
 
         // Idempotent + non-clobbering: hand-edit it, re-run the helper, and
         // confirm the operator's content survives.

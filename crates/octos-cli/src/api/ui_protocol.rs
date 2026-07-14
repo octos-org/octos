@@ -2668,6 +2668,50 @@ fn combine_typed_prompt_with_transcript(typed_prompt: &str, transcript: &str) ->
     }
 }
 
+/// Register the per-project ledger storage scope for a just-materialized
+/// [`SessionRuntime`] — the UI-protocol half of `appui.sessions_in_cwd`
+/// isolation (#1666).
+///
+/// The ledger is a process-global singleton rooted at the serve data dir, and
+/// it keys each session's ring/dir by the session id alone. With
+/// `sessions_in_cwd` the SAME wire id can belong to different projects, so a
+/// relocated session (`sessions_root != profile.data_dir`) registers a
+/// 16-hex digest of its canonical `sessions_root`; the ledger then keeps that
+/// project's events under a distinct storage identity. Flag-OFF (or no cwd
+/// hint) resolves `sessions_root == profile.data_dir` → scope `None` →
+/// byte-identical legacy behavior (and clears a stale registration if the
+/// flag was toggled off).
+///
+/// MUST be called before the flow replays the session (`session/open` calls
+/// it right after the runtime cache materializes, before
+/// `replay_after_with_head`) so replay and subsequent appends agree.
+fn register_session_ledger_scope(
+    ledger: &UiProtocolLedger,
+    runtime: &crate::runtime::SessionRuntime,
+) {
+    let scope = (runtime.sessions_root != runtime.profile.data_dir).then(|| {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(runtime.sessions_root.as_os_str().as_encoded_bytes());
+        hasher.finalize()[..8]
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    });
+    ledger.set_session_scope(&runtime.session_key, scope.clone());
+    // Topic-suffixed sessions also emit ledger events under their BASE key:
+    // the alpha-9 file/visual bridges deliberately strip the `#topic` before
+    // appending so base-bucket subscribers see them (see
+    // `ui_protocol_alpha9_bridge.rs`). Register the base alias with the same
+    // scope so those appends land in the same per-project dir instead of the
+    // unscoped legacy one (codex v2 P2). Same cwd → same scope, so this can
+    // never mis-route a different project's base-key session.
+    let base = runtime.session_key.base_key();
+    if base != runtime.session_key.0 {
+        ledger.set_session_scope(&SessionKey(base.to_owned()), scope);
+    }
+}
+
 /// Process-global event ledger.
 ///
 /// First call decides the durability path:
@@ -10498,6 +10542,11 @@ async fn open_session_result(
             .await
         {
             Ok(runtime) => {
+                // Per-project ledger isolation (#1666): registered BEFORE the
+                // `replay_after_with_head` below, so this open replays (and
+                // this session's turns later append) under the per-cwd
+                // storage identity. No-op when the store wasn't relocated.
+                register_session_ledger_scope(ledger, &runtime);
                 effective_workspace_root = Some(runtime.workspace_root.clone());
             }
             Err(error) => {
@@ -18671,6 +18720,11 @@ async fn run_native_code_review_turn(
             return;
         }
     };
+    // Per-project ledger isolation (#1666): the review turn appends durable
+    // task/turn events for this session — same idempotent registration as
+    // `run_standalone_turn`, covering runtimes that re-materialized without
+    // a fresh `session/open`.
+    register_session_ledger_scope(&ledger, &session_runtime);
 
     let profile_id = session_id
         .profile_id()
@@ -20260,6 +20314,12 @@ async fn run_standalone_turn(
             return;
         }
     };
+    // Per-project ledger isolation (#1666): every event this turn appends
+    // must land under the session's per-cwd storage identity. `session/open`
+    // registered it already for the normal flow; re-registering here is an
+    // idempotent no-op that also covers turns whose runtime re-materialized
+    // (e.g. after cache eviction) without a fresh open.
+    register_session_ledger_scope(&ledger, &session_runtime);
     let usage_profile_id = active_profile_id
         .clone()
         .or_else(|| session_id.profile_id().map(ToOwned::to_owned))
@@ -20568,7 +20628,15 @@ async fn run_standalone_turn(
     };
     let (history, context_manager, context_lifecycle_notifications) =
         appui_context_history_for_agent(
-            &session_runtime.profile.data_dir,
+            // Root the context ledger at the session's TRANSCRIPT root, not the
+            // profile-global data dir: with `appui.sessions_in_cwd` the
+            // transcript relocates to `<cwd>/.octos/<profile>` and a
+            // profile-rooted context ledger is SHARED across projects that
+            // reuse the same session key — project B's snapshot would beat
+            // project A's raw history on rebuild and leak B's conversation
+            // into A's LLM context (#1666). Flag-OFF: `sessions_root ==
+            // profile.data_dir`, byte-identical.
+            &session_runtime.sessions_root,
             &session_id,
             &raw_history,
             &llm_provider,
@@ -21162,7 +21230,11 @@ async fn run_standalone_turn(
             spawn_tool = spawn_tool.with_parent_subagent_summary_generator(generator);
         }
         let child_context_parent = context_manager.clone();
-        let child_context_data_dir = session_runtime.profile.data_dir.clone();
+        // Child (forked sub-agent) context ledgers belong to the parent's
+        // project store: with `appui.sessions_in_cwd` on, `sessions_root` is
+        // the per-cwd root; profile-rooting them would leak child context
+        // across projects sharing a child key (#1666). Flag-OFF: identical.
+        let child_context_data_dir = session_runtime.sessions_root.clone();
         let child_context_parent_session = session_id.clone();
         spawn_tool = spawn_tool.with_child_prompt_context_manager_factory(Arc::new(
             move |request: octos_agent::tools::spawn::ChildPromptContextRequest| {
@@ -21458,7 +21530,10 @@ async fn run_standalone_turn(
     };
     let mut prompt_context_bridge_inner = AppUiPromptContextBridge::new(
         session_id.clone(),
-        session_runtime.profile.data_dir.clone(),
+        // Mid-turn (compaction-bridge) context persists share the transcript
+        // root — per-cwd under `appui.sessions_in_cwd` — for the same
+        // cross-project isolation as the pre/post-turn sites above (#1666).
+        session_runtime.sessions_root.clone(),
         context_manager.clone(),
         voice_turn_hint,
     )
@@ -21593,7 +21668,10 @@ async fn run_standalone_turn(
     let turn_thread_id_for_persist = turn_id.0.to_string();
     let turn_thread_id_for_done = turn_thread_id_for_persist.clone();
     let context_manager_for_result = context_manager.clone();
-    let context_data_dir_for_result = session_runtime.profile.data_dir.clone();
+    // Post-turn context persists go to the session's transcript root (per-cwd
+    // when `appui.sessions_in_cwd` is on) so the snapshot the NEXT turn's
+    // `appui_context_history_for_agent` loads is the same project's (#1666).
+    let context_data_dir_for_result = session_runtime.sessions_root.clone();
     let usage_ledger_for_result = usage_ledger.clone();
     let usage_profile_id_for_result = usage_profile_id.clone();
     let usage_session_id_for_result = session_id.to_string();
