@@ -54,6 +54,7 @@
 //! credentials/skills/plugin/registry assembly the runtime owns.
 
 pub mod cache;
+pub mod launch;
 pub mod profile;
 pub mod session;
 

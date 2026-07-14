@@ -233,6 +233,7 @@ mod tests {
             name: name.into(),
             username: username.into(),
             email: email.into(),
+            make_default: None,
         }
     }
 

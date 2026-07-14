@@ -226,6 +226,12 @@ const APPUI_FEATURE_PROFILE_LOCAL_CREATE_V1: &str = "profile.local_create.v1";
 /// matching how `profile.local_create.v1` itself was introduced.
 const APPUI_FEATURE_PROFILE_LOCAL_CREATE_REQUESTED_ID_V1: &str =
     "profile.local_create.requested_id.v1";
+/// Nameable-profiles extension: this server honors the optional `make_default`
+/// field on `profile/local/create`, recording the created profile as the
+/// machine's global default (the brain a bare launch resolves to in a folder
+/// with no sticky profile). Advertised alongside `profile.local_create.v1`;
+/// purely additive. Gates the onboarding "Make this your default brain?" prompt.
+const APPUI_FEATURE_PROFILE_LOCAL_CREATE_DEFAULT_V1: &str = "profile.local_create.default.v1";
 const APPUI_FEATURE_PERMISSION_PROFILE_V1: &str = "permission.profile.v1";
 const APPUI_FEATURE_RUNTIME_POLICY_STAMP_V1: &str = "runtime.policy_stamp.v1";
 const APPUI_FEATURE_CONTEXT_LIFECYCLE_V1: &str = "context.lifecycle.v1";
@@ -1548,6 +1554,13 @@ impl ConnectionUiFeatures {
             push_capability_feature(
                 &mut capabilities.supported_features,
                 APPUI_FEATURE_PROFILE_LOCAL_CREATE_REQUESTED_ID_V1,
+            );
+            // Nameable profiles: advertise that this server honors the optional
+            // `make_default` field, recording the created profile as the global
+            // default. Additive; gates the onboarding make-default prompt.
+            push_capability_feature(
+                &mut capabilities.supported_features,
+                APPUI_FEATURE_PROFILE_LOCAL_CREATE_DEFAULT_V1,
             );
             // #1057: workspace probe ships next to local-solo onboarding so
             // the TUI can advertise the recovery UX only when the backend
@@ -4644,6 +4657,10 @@ async fn ui_protocol_connection(
                     }
                 }
             }
+            UiCommand::LaunchResolve(params) => {
+                handle_launch_resolve(&ws, &state, connection_profile_id, features, id, params)
+                    .await;
+            }
             UiCommand::SessionOpen(params) => {
                 // gap #2 (codex P2): record the profile this open RESOLVES to so
                 // a None-scoped (admin) connection's later turn/start +
@@ -5339,6 +5356,17 @@ where
                         let _ = send_rpc_error(&ws, Some(id), error);
                     }
                 }
+            }
+            UiCommand::LaunchResolve(params) => {
+                handle_launch_resolve(
+                    &ws,
+                    &state,
+                    connection_profile_id_owned.as_deref(),
+                    features,
+                    id,
+                    params,
+                )
+                .await;
             }
             UiCommand::SessionOpen(params) => {
                 let next_connection_profile_id = stdio_session_open_candidate_profile(
@@ -6993,6 +7021,7 @@ fn create_fresh_local_solo_profile(
         .save(&profile)
         .map_err(|error| runtime_unavailable_error(format!("failed to save profile: {error}")))?;
     write_local_profile_metadata(profile_store, &profile, &username, &email)?;
+    persist_default_if_requested(profile_store, params, &profile_id)?;
 
     Ok(octos_core::ui_protocol::ProfileLocalCreateResult {
         profile_id: profile_id.clone(),
@@ -7003,6 +7032,25 @@ fn create_fresh_local_solo_profile(
         created: true,
         runtime_mode: "solo".to_owned(),
     })
+}
+
+/// Record the just-created/resolved profile as the machine's global default
+/// when the client set `make_default`. A no-op when the flag is absent or
+/// false. Called on every `profile/local/create` success path so "make default"
+/// applies whether the profile was freshly minted or already existed.
+fn persist_default_if_requested(
+    profile_store: &crate::profiles::ProfileStore,
+    params: &octos_core::ui_protocol::ProfileLocalCreateParams,
+    profile_id: &str,
+) -> Result<(), RpcError> {
+    if params.make_default.unwrap_or(false) {
+        profile_store
+            .set_default_profile(profile_id)
+            .map_err(|error| {
+                runtime_unavailable_error(format!("failed to set default profile: {error}"))
+            })?;
+    }
+    Ok(())
 }
 
 pub(crate) fn create_or_get_local_solo_profile(
@@ -7100,6 +7148,7 @@ pub(crate) fn create_or_get_local_solo_profile(
         }
         if existing_user.is_some() {
             write_local_profile_metadata(&profile_store, profile, &username, &email)?;
+            persist_default_if_requested(&profile_store, &params, &profile_id)?;
             return Ok(octos_core::ui_protocol::ProfileLocalCreateResult {
                 profile_id: profile_id.clone(),
                 user_id: profile_id,
@@ -7149,6 +7198,7 @@ pub(crate) fn create_or_get_local_solo_profile(
         .save(&profile)
         .map_err(|error| runtime_unavailable_error(format!("failed to save profile: {error}")))?;
     write_local_profile_metadata(&profile_store, &profile, &username, &email)?;
+    persist_default_if_requested(&profile_store, &params, &profile_id)?;
 
     Ok(octos_core::ui_protocol::ProfileLocalCreateResult {
         profile_id: profile_id.clone(),
@@ -9920,6 +9970,7 @@ fn validate_session_ingress_command_scope(
 ) -> Result<(), RpcError> {
     let actual = match command {
         UiCommand::ProfileLocalCreate(_)
+        | UiCommand::LaunchResolve(_)
         | UiCommand::SessionList(_)
         | UiCommand::SystemStatusGet(_)
         | UiCommand::ContentList(_)
@@ -10732,6 +10783,23 @@ async fn open_session_result(
                 // storage identity. No-op when the store wasn't relocated.
                 register_session_ledger_scope(ledger, &runtime);
                 effective_workspace_root = Some(runtime.workspace_root.clone());
+                // Sticky marker: record this profile as the folder's active one
+                // so a later bare launch resumes it deterministically (beats the
+                // store-mtime recency fallback in `derive_sticky_profile`). Gated
+                // on the SAME condition `resolve_sessions_root_from_hint` uses to
+                // relocate the store — `sessions_in_cwd && effective hint present`
+                // — so the marker lands in the same `<cwd>/.octos` the store did
+                // (client cwd OR operator `appui_default_session_cwd`), and a
+                // no-hint (web/gateway) session that stays in its data-dir
+                // workspace never drops a stray marker there. Written to the
+                // runtime's canonical `workspace_root` (the store's actual parent,
+                // post-canonicalize), not the raw hint. Best-effort in the helper.
+                if state.session_cache.sessions_in_cwd() && effective_workspace_hint.is_some() {
+                    crate::runtime::session::write_active_profile_marker(
+                        &runtime.workspace_root,
+                        &profile_runtime.profile_id,
+                    );
+                }
             }
             Err(error) => {
                 tracing::error!(
@@ -15871,6 +15939,159 @@ fn resolve_session_list_cwd_root(
         &workspace_root,
         &profile_id,
     )))
+}
+
+/// `launch/resolve` — the pre-session launch probe. Resolves the launching
+/// profile (requested `--profile` → folder-sticky → global default) and reports
+/// whether the client should resume the folder's conversation, activate a new
+/// one, or choose among profiles. Delegates to the tested
+/// [`crate::runtime::launch`] decision core.
+async fn handle_launch_resolve(
+    ws: &WsConnection,
+    state: &Arc<AppState>,
+    connection_profile_id: Option<&str>,
+    features: ConnectionUiFeatures,
+    id: String,
+    params: octos_core::ui_protocol::LaunchResolveParams,
+) {
+    match resolve_launch_result(state, connection_profile_id, features, &params) {
+        Ok(result) => {
+            let body = serde_json::to_value(&result).unwrap_or_else(|_| json!({}));
+            send_aux_rpc_result(
+                ws,
+                id,
+                octos_core::ui_protocol::methods::LAUNCH_RESOLVE,
+                body,
+            );
+        }
+        Err(error) => {
+            let _ = send_rpc_error(ws, Some(id), error);
+        }
+    }
+}
+
+/// Resolution core for [`handle_launch_resolve`], split out so the error paths
+/// are a single `?`-chain. Applies the SAME cwd safety gates as `session/open`
+/// and `session/list` before scanning the project's `.octos` store.
+fn resolve_launch_result(
+    state: &Arc<AppState>,
+    connection_profile_id: Option<&str>,
+    features: ConnectionUiFeatures,
+    params: &octos_core::ui_protocol::LaunchResolveParams,
+) -> Result<octos_core::ui_protocol::LaunchResolveResult, RpcError> {
+    use crate::runtime::launch::{LaunchDecision, resolve_launch_decision, scan_folder_sessions};
+    use octos_core::ui_protocol::{LaunchDecisionKind, LaunchResolveResult};
+
+    // The method is advertised only when `session.workspace_cwd.v1` is
+    // negotiated; reject a client that calls it without the feature.
+    if !features.session_workspace_cwd {
+        return Err(RpcError::invalid_params(
+            "launch/resolve requires feature session.workspace_cwd.v1",
+        )
+        .with_data(json!({
+            "kind": "feature_required",
+            "feature": UI_PROTOCOL_FEATURE_SESSION_WORKSPACE_CWD_V1,
+        })));
+    }
+
+    let cwd = params.cwd.trim();
+    if cwd.is_empty() {
+        return Err(RpcError::invalid_params(
+            "launch/resolve requires a non-empty cwd",
+        ));
+    }
+    // Path-safety ONLY (canonicalize + banned-root reject) — the SAME check the
+    // write path runs before materializing `<cwd>/.octos`. Crucially NOT the
+    // full `validate_session_workspace_allowed`, which additionally requires a
+    // materialized `SessionRuntime` for the routed profile: launch/resolve is a
+    // read-only decision that runs BEFORE any session is opened (and, in solo
+    // `--stdio`, before any profile runtime is lazily bootstrapped), so gating
+    // it on a loaded runtime made every Resume / CrossProfile / NoProfile
+    // outcome unreachable — the folder always fell through to `activate`, or a
+    // bare launch got a spurious `cwd_runtime_unavailable`. Found by the
+    // launch-flow soak against a real `octos serve --stdio`.
+    let workspace_root = canonical_existing_dir(cwd)?;
+    validate_session_workspace_path_safety(&workspace_root)?;
+
+    // Known profiles = every launchable brain that EXISTS, sourced from the
+    // persistent `ProfileStore` (enabled, top-level), NOT just `state.profiles`
+    // — the in-memory runtime map, which in solo `--stdio` is populated lazily
+    // on `session/open` and so is EMPTY at bare-launch time. A profile is
+    // launchable whether or not its runtime is loaded yet, so the scanner must
+    // see its folder store and the default resolver must be able to name it.
+    // Unioned with `state.profiles.keys()` so eager-load deployments stay
+    // covered. A since-deleted profile's leftover store dir is ignored (the
+    // scanner is bounded by this set). `BTreeSet` yields a sorted, deduped
+    // listing for a deterministic default + cross-profile result. Empty (no
+    // profiles) → `NoProfile`.
+    let mut known_set: std::collections::BTreeSet<String> =
+        state.profiles.keys().cloned().collect();
+    if let Some(store) = state.profile_store.as_ref() {
+        if let Ok(profiles) = store.list() {
+            for profile in profiles {
+                if profile.enabled && profile.parent_id.is_none() {
+                    known_set.insert(profile.id);
+                }
+            }
+        }
+    }
+    let known_profiles: Vec<String> = known_set.into_iter().collect();
+
+    // Global default. An explicit user-chosen `default-profile` pointer (set via
+    // the onboarding "make default" flow) wins when it still names a known
+    // profile; otherwise fall back to the connection's own profile when
+    // registered, else `_main` when present, else the first known profile.
+    // `None` (→ `NoProfile`) only when no profile exists at all.
+    let persisted_default = profile_store(state)
+        .ok()
+        .and_then(|store| store.default_profile())
+        .filter(|candidate| known_profiles.iter().any(|known| known == candidate));
+    let default_profile: Option<String> = persisted_default
+        .or_else(|| {
+            connection_profile_id
+                .map(str::to_string)
+                .filter(|candidate| known_profiles.iter().any(|known| known == candidate))
+        })
+        .or_else(|| {
+            known_profiles
+                .iter()
+                .find(|known| known.as_str() == MAIN_PROFILE_ID)
+                .cloned()
+        })
+        .or_else(|| known_profiles.first().cloned());
+
+    let folder = scan_folder_sessions(&workspace_root, &known_profiles);
+    let decision = resolve_launch_decision(
+        params.profile_id.as_deref(),
+        default_profile.as_deref(),
+        &folder,
+    );
+
+    Ok(match decision {
+        LaunchDecision::Resume { profile_id } => LaunchResolveResult {
+            decision: LaunchDecisionKind::Resume,
+            resolved_profile: Some(profile_id),
+            existing_profiles: Vec::new(),
+        },
+        LaunchDecision::NeedsActivation { profile_id } => LaunchResolveResult {
+            decision: LaunchDecisionKind::Activate,
+            resolved_profile: Some(profile_id),
+            existing_profiles: Vec::new(),
+        },
+        LaunchDecision::CrossProfile {
+            launching_profile,
+            existing_profiles,
+        } => LaunchResolveResult {
+            decision: LaunchDecisionKind::CrossProfile,
+            resolved_profile: Some(launching_profile),
+            existing_profiles,
+        },
+        LaunchDecision::NoProfile => LaunchResolveResult {
+            decision: LaunchDecisionKind::NoProfile,
+            resolved_profile: None,
+            existing_profiles: Vec::new(),
+        },
+    })
 }
 
 async fn handle_session_status_get(
@@ -27376,6 +27597,50 @@ mod tests {
         }
     }
 
+    #[test]
+    fn profile_local_create_make_default_persists_pointer() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = local_profile_state(dir.path());
+
+        // Create with make_default → the assigned profile becomes the global
+        // default pointer.
+        let created = create_or_get_local_solo_profile(
+            &state,
+            octos_core::ui_protocol::ProfileLocalCreateParams {
+                requested_id: Some("glm".into()),
+                name: String::new(),
+                username: String::new(),
+                email: String::new(),
+                make_default: Some(true),
+            },
+        )
+        .expect("create with make_default");
+        let store = state.profile_store.as_ref().unwrap();
+        assert_eq!(
+            store.default_profile().as_deref(),
+            Some(created.profile_id.as_str())
+        );
+
+        // A later create WITHOUT make_default must not steal the default.
+        let other = create_or_get_local_solo_profile(
+            &state,
+            octos_core::ui_protocol::ProfileLocalCreateParams {
+                requested_id: Some("deepseek".into()),
+                name: String::new(),
+                username: String::new(),
+                email: String::new(),
+                make_default: None,
+            },
+        )
+        .expect("create without make_default");
+        assert_ne!(other.profile_id, created.profile_id);
+        assert_eq!(
+            store.default_profile().as_deref(),
+            Some(created.profile_id.as_str()),
+            "a create without make_default must leave the default pointer intact"
+        );
+    }
+
     /// Multi-model profiles: `profile/llm/list`-backed model list exposes the
     /// primary AND every fallback; `profile/llm/select` promotes a fallback to
     /// the active primary (demoting the old primary to a fallback), persists,
@@ -28351,6 +28616,7 @@ mod tests {
             name: name.into(),
             username: username.into(),
             email: email.into(),
+            make_default: None,
         }
     }
 
@@ -28545,6 +28811,7 @@ mod tests {
                 "mode": "off",
             }),
             methods::ROUTER_GET_METRICS => json!({ "session_id": session_id }),
+            methods::LAUNCH_RESOLVE => json!({ "cwd": "/tmp/probe-launch-resolve" }),
             APPUI_METHOD_SESSION_COMPACT => json!({ "session_id": session_id }),
             other => panic!("missing AppUI dispatch probe params for {other}"),
         };
@@ -31468,6 +31735,264 @@ ignore = []
         assert!(resolve_session_list_cwd_root(&state, cap, Some("dev"), &banned).is_err());
     }
 
+    #[tokio::test]
+    async fn launch_resolve_activates_empty_folder_then_resumes_after_store_exists() {
+        use octos_core::ui_protocol::{LaunchDecisionKind, LaunchResolveParams};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let profile = crate::profiles::UserProfile {
+            id: "dev".to_string(),
+            name: "Dev".to_string(),
+            enabled: true,
+            data_dir: None,
+            parent_id: None,
+            public_subdomain: None,
+            config: crate::profiles::ProfileConfig {
+                llm: Some(crate::profiles::LlmProfileConfig {
+                    primary: Some(crate::profiles::LlmModelSelectionConfig {
+                        family_id: Some("openai".to_string()),
+                        model_id: Some("gpt-4o-mini".to_string()),
+                        route: Some(crate::profiles::LlmRouteConfig {
+                            route_id: None,
+                            label: None,
+                            base_url: None,
+                            api_key_env: Some("LAUNCH_RESOLVE_TEST_KEY".to_string()),
+                            api_type: None,
+                        }),
+                        ..Default::default()
+                    }),
+                    fallbacks: Vec::new(),
+                }),
+                env_vars: [(
+                    "LAUNCH_RESOLVE_TEST_KEY".to_string(),
+                    "test-key".to_string(),
+                )]
+                .into_iter()
+                .collect(),
+                ..Default::default()
+            },
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        let data_dir = tmp.path().join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let runtime = crate::runtime::ProfileRuntime::bootstrap(
+            &profile,
+            &data_dir,
+            None,
+            crate::runtime::BootstrapRole::Serve,
+        )
+        .await
+        .expect("bootstrap dev runtime");
+
+        let mut state = AppState::empty_for_tests();
+        state.profiles.insert("dev".to_string(), runtime);
+        state.session_cache = Arc::new(
+            crate::runtime::SessionRuntimeCache::new(4, std::time::Duration::from_secs(60))
+                .with_sessions_in_cwd(true),
+        );
+        let state = Arc::new(state);
+        let cap = ConnectionUiFeatures::stdio_defaults();
+
+        let project = tmp.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let params = LaunchResolveParams {
+            cwd: project.to_string_lossy().into_owned(),
+            profile_id: Some("dev".to_string()),
+        };
+
+        // Empty folder → activate a new session for the launching profile.
+        let activate = resolve_launch_result(&state, Some("dev"), cap, &params).unwrap();
+        assert_eq!(activate.decision, LaunchDecisionKind::Activate);
+        assert_eq!(activate.resolved_profile.as_deref(), Some("dev"));
+
+        // Once dev has a store here, a relaunch resumes it.
+        let canon = std::fs::canonicalize(&project).unwrap();
+        std::fs::create_dir_all(
+            crate::runtime::session::project_sessions_root(&canon, "dev").join("sessions"),
+        )
+        .unwrap();
+        let resume = resolve_launch_result(&state, Some("dev"), cap, &params).unwrap();
+        assert_eq!(resume.decision, LaunchDecisionKind::Resume);
+        assert_eq!(resume.resolved_profile.as_deref(), Some("dev"));
+
+        // Without the workspace-cwd feature the probe is rejected.
+        let no_cap = ConnectionUiFeatures::default();
+        assert!(resolve_launch_result(&state, Some("dev"), no_cap, &params).is_err());
+    }
+
+    /// The persisted `default-profile` pointer drives a bare launch: with no
+    /// `--profile` and no folder-sticky profile, `launch/resolve` resolves to
+    /// the pointer even when it is not the first-sorted profile. A stale pointer
+    /// (naming a profile that no longer exists) is ignored, falling back to the
+    /// derived default.
+    #[tokio::test]
+    async fn launch_resolve_prefers_persisted_default_profile() {
+        use octos_core::ui_protocol::{LaunchDecisionKind, LaunchResolveParams};
+
+        let tmp = tempfile::tempdir().unwrap();
+        // The default-profile pointer lives in its own octos home; each profile
+        // bootstraps in a separate data dir because the redb episode store takes
+        // an exclusive lock and two profiles cannot share one.
+        let home = tmp.path().join("home");
+
+        let make_profile = |id: &str| crate::profiles::UserProfile {
+            id: id.to_string(),
+            name: id.to_string(),
+            enabled: true,
+            data_dir: None,
+            parent_id: None,
+            public_subdomain: None,
+            config: crate::profiles::ProfileConfig {
+                llm: Some(crate::profiles::LlmProfileConfig {
+                    primary: Some(crate::profiles::LlmModelSelectionConfig {
+                        family_id: Some("openai".to_string()),
+                        model_id: Some("gpt-4o-mini".to_string()),
+                        route: Some(crate::profiles::LlmRouteConfig {
+                            route_id: None,
+                            label: None,
+                            base_url: None,
+                            api_key_env: Some("LAUNCH_DEFAULT_TEST_KEY".to_string()),
+                            api_type: None,
+                        }),
+                        ..Default::default()
+                    }),
+                    fallbacks: Vec::new(),
+                }),
+                env_vars: [(
+                    "LAUNCH_DEFAULT_TEST_KEY".to_string(),
+                    "test-key".to_string(),
+                )]
+                .into_iter()
+                .collect(),
+                ..Default::default()
+            },
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+
+        let mut state = AppState::empty_for_tests();
+        for id in ["alpha", "zeta"] {
+            let profile_dir = tmp.path().join(format!("profile-{id}"));
+            std::fs::create_dir_all(&profile_dir).unwrap();
+            let runtime = crate::runtime::ProfileRuntime::bootstrap(
+                &make_profile(id),
+                &profile_dir,
+                None,
+                crate::runtime::BootstrapRole::Serve,
+            )
+            .await
+            .expect("bootstrap profile");
+            state.profiles.insert(id.to_string(), runtime);
+        }
+        let store = Arc::new(crate::profiles::ProfileStore::open(&home).unwrap());
+        // Point the global default at "zeta" — NOT the first-sorted profile.
+        store.set_default_profile("zeta").unwrap();
+        state.profile_store = Some(store.clone());
+        state.session_cache = Arc::new(
+            crate::runtime::SessionRuntimeCache::new(4, std::time::Duration::from_secs(60))
+                .with_sessions_in_cwd(true),
+        );
+        let state = Arc::new(state);
+        let cap = ConnectionUiFeatures::stdio_defaults();
+
+        let project = tmp.path().join("fresh");
+        std::fs::create_dir_all(&project).unwrap();
+        // Bare launch (no `--profile`) in an empty folder. The connection
+        // authenticated as "alpha"; the persisted default is "zeta". The default
+        // pointer must win over BOTH the connection profile and sort order.
+        let params = LaunchResolveParams {
+            cwd: project.to_string_lossy().into_owned(),
+            profile_id: None,
+        };
+        let decision = resolve_launch_result(&state, Some("alpha"), cap, &params).unwrap();
+        assert_eq!(decision.decision, LaunchDecisionKind::Activate);
+        assert_eq!(
+            decision.resolved_profile.as_deref(),
+            Some("zeta"),
+            "the persisted default must win over the connection profile"
+        );
+
+        // A stale pointer (unknown profile) is ignored → falls back to the
+        // connection profile (alpha).
+        store.set_default_profile("ghost").unwrap();
+        let stale = resolve_launch_result(&state, Some("alpha"), cap, &params).unwrap();
+        assert_eq!(stale.resolved_profile.as_deref(), Some("alpha"));
+    }
+
+    #[tokio::test]
+    async fn launch_resolve_uses_stored_profiles_without_a_loaded_runtime() {
+        // Regression (launch-flow soak against a real `octos serve --stdio`): in
+        // solo `--stdio`, profile runtimes materialize LAZILY on `session/open`,
+        // so `state.profiles` is EMPTY at bare-launch time. launch/resolve must
+        // still see a profile that EXISTS in the persistent `ProfileStore` and
+        // must NOT require a loaded runtime — otherwise every folder falls
+        // through to `activate` (Resume/CrossProfile unreachable) and a
+        // zero-profile machine gets a spurious `cwd_runtime_unavailable` instead
+        // of `NoProfile`. `state.profiles` stays empty for the WHOLE test.
+        use octos_core::ui_protocol::{LaunchDecisionKind, LaunchResolveParams};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let mut state = AppState::empty_for_tests();
+        state.profile_store = Some(Arc::new(
+            crate::profiles::ProfileStore::open(&home).unwrap(),
+        ));
+        let state = Arc::new(state);
+        let cap = ConnectionUiFeatures::stdio_defaults();
+        let resolve = |cwd: &std::path::Path| {
+            resolve_launch_result(
+                &state,
+                None,
+                cap,
+                &LaunchResolveParams {
+                    cwd: cwd.to_string_lossy().into_owned(),
+                    profile_id: None,
+                },
+            )
+        };
+
+        // A valid folder with ZERO stored profiles → NoProfile, NOT an error.
+        let empty = tmp.path().join("empty");
+        std::fs::create_dir_all(&empty).unwrap();
+        let no_profile = resolve(&empty).unwrap();
+        assert_eq!(no_profile.decision, LaunchDecisionKind::NoProfile);
+        assert_eq!(no_profile.resolved_profile, None);
+
+        // Persist a launchable brain to the STORE only — no runtime loaded.
+        state
+            .profile_store
+            .as_ref()
+            .unwrap()
+            .save(&crate::profiles::UserProfile {
+                id: "ghost".to_string(),
+                name: "Ghost".to_string(),
+                enabled: true,
+                data_dir: None,
+                parent_id: None,
+                public_subdomain: None,
+                config: crate::profiles::ProfileConfig::default(),
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+            })
+            .unwrap();
+
+        // Empty folder + the sole stored profile is ghost → Activate{ghost}
+        // (default falls back to the only known profile), NOT an error.
+        let activate = resolve(&empty).unwrap();
+        assert_eq!(activate.decision, LaunchDecisionKind::Activate);
+        assert_eq!(activate.resolved_profile.as_deref(), Some("ghost"));
+
+        // A folder holding ghost's activated store + sticky marker → Resume{ghost},
+        // even though ghost's runtime was never loaded into `state.profiles`.
+        let project = tmp.path().join("proj");
+        std::fs::create_dir_all(project.join(".octos").join("ghost").join("sessions")).unwrap();
+        std::fs::write(project.join(".octos").join("active-profile"), "ghost").unwrap();
+        let resume = resolve(&project).unwrap();
+        assert_eq!(resume.decision, LaunchDecisionKind::Resume);
+        assert_eq!(resume.resolved_profile.as_deref(), Some("ghost"));
+    }
+
     async fn assert_advertised_stdio_methods_have_dispatch_path(state: Arc<AppState>) {
         let features = ConnectionUiFeatures::stdio_defaults();
         let capabilities = features.advertised_capabilities(&state);
@@ -31921,6 +32446,122 @@ ignore = []
         assert_eq!(
             grace_status["runtime_policy_stamp"]["profile_id"],
             json!("grace")
+        );
+    }
+
+    /// End-to-end sticky-marker contract through the real `session/open`
+    /// dispatcher: a cwd-hinted open under the per-project flag records the
+    /// folder's active profile; reopening a different brain in the same folder
+    /// flips it (last-writer-wins); a no-cwd open never touches the marker.
+    #[tokio::test]
+    async fn session_open_writes_active_profile_marker_only_with_flag_and_cwd() {
+        let dir = tempfile::tempdir().unwrap();
+        // Two LLM-configured runtimes (each with its own data dir → its own
+        // redb episode store, no exclusive-lock clash) so a cwd-hinted
+        // `session/open` clears the `profile_unconfigured` LLM gate. Flag-ON
+        // cache so a cwd hint relocates the store to `<cwd>/.octos`.
+        let mut profiles = HashMap::new();
+        for id in ["grace", "ada"] {
+            let profile_data_dir = dir.path().join("profiles").join(id).join("data");
+            let runtime = make_m11e_profile_with_llm_and_sandbox(
+                id,
+                &profile_data_dir,
+                Arc::new(M11EStubLlm),
+                octos_agent::SandboxConfig::default(),
+            )
+            .await;
+            profiles.insert(id.to_string(), runtime);
+        }
+        let state = Arc::new(AppState {
+            profiles,
+            sessions: Some(Arc::new(tokio::sync::Mutex::new(
+                octos_bus::SessionManager::open(dir.path()).expect("session manager"),
+            ))),
+            session_cache: Arc::new(
+                crate::runtime::SessionRuntimeCache::new(4, std::time::Duration::from_secs(60))
+                    .with_sessions_in_cwd(true),
+            ),
+            ..AppState::empty_for_tests()
+        });
+
+        let ledger = UiProtocolLedger::new(16);
+        let approvals = PendingApprovalStore::default();
+        let questions = PendingQuestionStore::default();
+        let features = ConnectionUiFeatures::stdio_defaults();
+
+        // A separate project folder (NOT the data dir) the session opens against.
+        let workspace = tempfile::tempdir().unwrap();
+        let workspace_canon = std::fs::canonicalize(workspace.path()).unwrap();
+        let marker = workspace_canon.join(".octos").join("active-profile");
+        let cwd_hint = || Some(workspace.path().to_string_lossy().into_owned());
+        assert!(!marker.exists(), "marker must not pre-exist the first open");
+
+        let open = |session_id: SessionKey, profile: &'static str, cwd: Option<String>| {
+            let state = state.clone();
+            let ledger = &ledger;
+            let approvals = &approvals;
+            let questions = &questions;
+            async move {
+                open_session_result(
+                    &state,
+                    ledger,
+                    approvals,
+                    questions,
+                    ConnectionId::next(),
+                    Some(profile),
+                    features,
+                    SessionOpenParams {
+                        session_id,
+                        topic: None,
+                        profile_id: None,
+                        cwd,
+                        sandbox: None,
+                        after: None,
+                    },
+                )
+                .await
+                .expect("session/open succeeds")
+            }
+        };
+
+        // Open grace WITH a cwd hint → store relocates, marker records "grace".
+        open(
+            SessionKey::with_profile_topic("grace", "local", "tui", "coding"),
+            "grace",
+            cwd_hint(),
+        )
+        .await;
+        assert_eq!(
+            std::fs::read_to_string(&marker).unwrap().trim(),
+            "grace",
+            "session/open with flag+cwd records the folder's active profile",
+        );
+
+        // Reopen a DIFFERENT brain in the SAME folder → last-writer-wins: the
+        // sticky marker flips to "ada" (the "switch brains here" semantics).
+        open(
+            SessionKey::with_profile_topic("ada", "local", "tui", "coding"),
+            "ada",
+            cwd_hint(),
+        )
+        .await;
+        assert_eq!(
+            std::fs::read_to_string(&marker).unwrap().trim(),
+            "ada",
+            "reopening a different brain in the folder updates the sticky marker",
+        );
+
+        // A no-cwd open (web/gateway shape) must NOT touch the folder marker.
+        open(
+            SessionKey::with_profile_topic("grace", "local", "tui", "review"),
+            "grace",
+            None,
+        )
+        .await;
+        assert_eq!(
+            std::fs::read_to_string(&marker).unwrap().trim(),
+            "ada",
+            "a no-cwd session/open leaves the existing folder marker intact",
         );
     }
 
