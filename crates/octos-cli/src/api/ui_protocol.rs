@@ -2073,13 +2073,13 @@ fn appui_compaction_summary(
     if let Some(summary) = octos_agent::compaction::llm_compaction_summary(
         llm_provider,
         messages,
-        budget_tokens,
         std::time::Duration::from_secs(
             octos_agent::compaction::DEFAULT_LLM_COMPACTION_TIMEOUT_SECS,
         ),
     ) {
         return summary;
     }
+    // Heuristic fallback still uses the summary-size budget (correct there).
     octos_agent::compaction::compact_messages(messages, budget_tokens)
 }
 
