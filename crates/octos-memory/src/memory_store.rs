@@ -1388,7 +1388,9 @@ mod tests {
         assert!(ctx.contains("===== framework.md ====="));
         assert!(ctx.contains("===== widgets/sys.md ====="));
         assert!(ctx.contains("===== apps/stock/app.md ====="));
-        assert!(ctx.contains("===== apps/stock/exemplars/card.splash (known-good reference) ====="));
+        assert!(
+            ctx.contains("===== apps/stock/exemplars/card.splash (known-good reference) =====")
+        );
         assert!(ctx.contains("===== apps/news/app.md ====="));
         // Stable order: framework < widgets < app.md < exemplar; apps sorted (news < stock).
         let f = ctx.find("framework.md").unwrap();
