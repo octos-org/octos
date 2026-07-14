@@ -627,15 +627,13 @@ fn write_init_files(
     Ok(())
 }
 
-/// The repo's model catalog, baked in at compile time so INSTALLED
-/// binaries (brew/npm/installer bundles ship no model_catalog.json on
-/// disk) still offer real model names in `octos init` — pre-fix, every
-/// provider fell into manual entry whose "auto" default is rejected by
-/// real APIs (#1541 item 3).
-const EMBEDDED_MODEL_CATALOG: &str = include_str!(concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../../model_catalog.json"
-));
+// The repo's model catalog, baked in at compile time so INSTALLED binaries
+// (brew/npm/installer bundles ship no model_catalog.json on disk) still offer
+// real model names in `octos init` — pre-fix, every provider fell into manual
+// entry whose "auto" default is rejected by real APIs (#1541 item 3). The single
+// embedded copy lives in `qos_catalog`; alias it here so there is exactly one
+// compiled-in `model_catalog.json` across the crate.
+use crate::qos_catalog::EMBEDDED_MODEL_CATALOG;
 
 /// Parse a model_catalog.json payload into provider → model-name lists.
 fn parse_catalog_content(content: &str) -> BTreeMap<String, Vec<String>> {

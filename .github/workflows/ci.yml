@@ -46,6 +46,28 @@ jobs:
       - name: Verify dashboard build script runs cleanly
         run: ./scripts/build-dashboard.sh
 
+      # providers.json is a DERIVED artifact: the dashboard model picker is
+      # sourced from the canonical model_catalog.json via this append-only
+      # generator. Run it and fail if the committed file drifted — e.g. a new
+      # catalog model was added but never reflected into the picker.
+      - name: Verify dashboard providers.json is in sync with the model catalog
+        run: |
+          # The generator exits nonzero on an unsupported parity case (a new
+          # catalog family with no env mapping, a lingering web-only model, or a
+          # read/write error) — propagate that instead of masking it. A clean run
+          # that merely APPENDED catalog models exits zero, so the git-status
+          # diff below is what catches ordinary drift.
+          if ! python3 scripts/sync-dashboard-providers.py; then
+            echo "sync-dashboard-providers.py reported a parity problem (see the WARNING lines above) — resolve it before merging."
+            exit 1
+          fi
+          if [ -n "$(git status --porcelain -- dashboard/src/providers.json)" ]; then
+            echo "dashboard/src/providers.json is out of date. Run scripts/sync-dashboard-providers.py and commit the result."
+            git status --short -- dashboard/src/providers.json
+            git --no-pager diff -- dashboard/src/providers.json
+            exit 1
+          fi
+
   swarm-app:
     runs-on: ubuntu-latest
     steps:

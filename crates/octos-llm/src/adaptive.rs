@@ -1426,12 +1426,21 @@ impl AdaptiveRouter {
     /// Call after `seed_baseline()` — this sets the non-QoS fields.
     pub fn seed_catalog(&self, entries: &[ModelCatalogEntry]) {
         for slot in &self.slots {
-            let slot_key = format!(
-                "{}/{}",
-                slot.provider.provider_name(),
-                slot.provider.model_id()
-            );
-            if let Some(entry) = entries.iter().find(|e| e.provider == slot_key) {
+            let provider_name = slot.provider.provider_name();
+            let model_id = slot.provider.model_id();
+            let slot_key = format!("{provider_name}/{model_id}");
+            // Prefer an exact match — a runtime-saved catalog stores the
+            // host-tagged lane key (`moonshot@autodl/kimi-k2.5`). Fall back to
+            // the normalized bare-family key so the canonical catalog, which
+            // uses untagged families (`moonshot/kimi-k2.5`), still seeds an
+            // OpenAI-compatible lane whose provider_name carries an `@host`
+            // suffix — otherwise that lane's type/cost/context/QoS is skipped.
+            let bare_key = format!("{}/{model_id}", normalized_provider_name(provider_name));
+            if let Some(entry) = entries
+                .iter()
+                .find(|e| e.provider == slot_key)
+                .or_else(|| entries.iter().find(|e| e.provider == bare_key))
+            {
                 slot.model_type
                     .store(entry.model_type.to_u8(), Ordering::Relaxed);
                 slot.cost_in
@@ -3452,6 +3461,50 @@ mod tests {
         router.set_qos_ranking(true);
         let with_qos = router.chat(&[], &[], &ChatConfig::default()).await.unwrap();
         assert_eq!(with_qos.content.as_deref(), Some("from-quality-fallback"));
+    }
+
+    /// An OpenAI-compatible lane carries an `@host` suffix in its
+    /// provider_name (`moonshot@api`), but the canonical catalog uses the
+    /// untagged family key (`moonshot/kimi-k2.5`). `seed_catalog` must fall back
+    /// to the normalized key so the lane still receives its catalogued
+    /// type/cost/context/output — otherwise those are silently skipped.
+    #[test]
+    fn seed_catalog_matches_host_tagged_lane_to_bare_catalog_key() {
+        use std::sync::atomic::Ordering;
+        let router = AdaptiveRouter::new(
+            vec![Arc::new(MockProvider {
+                name: "moonshot@api",
+                model: "kimi-k2.5",
+                latency_ms: 10,
+                fail: false,
+                error_msg: "",
+            })],
+            &[0.0],
+            AdaptiveConfig::default(),
+        );
+        router.seed_catalog(&[ModelCatalogEntry {
+            provider: "moonshot/kimi-k2.5".into(),
+            model_type: ModelType::Strong,
+            stability: 1.0,
+            tool_avg_ms: 200,
+            p95_ms: 300,
+            score: 0.0,
+            cost_in: 0.6,
+            cost_out: 2.4,
+            ds_output: 1000,
+            context_window: 262_144,
+            max_output: 98_304,
+        }]);
+        // The host-tagged lane was seeded from the bare canonical entry.
+        assert_eq!(
+            router.slots[0].context_window.load(Ordering::Relaxed),
+            262_144
+        );
+        assert_eq!(router.slots[0].max_output.load(Ordering::Relaxed), 98_304);
+        assert_eq!(
+            f64::from_bits(router.slots[0].seeded_cost_in.load(Ordering::Relaxed)),
+            0.6
+        );
     }
 
     #[test]
