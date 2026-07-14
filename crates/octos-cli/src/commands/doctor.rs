@@ -38,6 +38,11 @@
 //!   own probes (`octos_agent::sandbox::auto_sandbox_kind`).
 //! - `Skills` / `MCP` / `Channels`: discovered skill manifests, MCP stdio
 //!   command PATH-resolution, configured gateway channels.
+//! - `Sessions` (Stage 4): a CONTENT-FREE inventory per store — counts,
+//!   total size, newest/oldest age, transcripts near octos-bus's 10 MiB
+//!   write cap, and transcripts whose final line no longer parses (the
+//!   crash-mid-write signature that breaks resume). The tail probe parses
+//!   and immediately discards; no transcript content reaches the report.
 //!
 //! Stage-3 contract: octos state is never created, migrated, or modified, and
 //! no secret value reaches the report or the JSON bundle (env var NAMES only;
@@ -76,6 +81,7 @@ const CAT_SANDBOX: &str = "Sandbox";
 const CAT_SKILLS: &str = "Skills";
 const CAT_MCP: &str = "MCP";
 const CAT_CHANNELS: &str = "Channels";
+const CAT_SESSIONS: &str = "Sessions";
 
 /// Per-profile rows (and per-profile store checks) are bounded so a fleet
 /// data-dir with hundreds of profiles cannot flood the report.
@@ -86,6 +92,14 @@ const DISK_WARN_BYTES: u64 = 1024 * 1024 * 1024; // 1 GiB
 /// Hard cap on filesystem entries visited by the disk-usage walk so a
 /// pathological tree cannot stall doctor.
 const DISK_WALK_MAX_ENTRIES: usize = 100_000;
+/// Sessions at ≥80% of `octos-bus`'s `MAX_SESSION_FILE_SIZE` (10 MiB) get
+/// flagged before writes start failing at the cap.
+const SESSION_NEAR_CAP_BYTES: u64 = 8 * 1024 * 1024;
+/// Bytes read from a transcript's TAIL for the content-free integrity probe
+/// (parse the final line, discard it). Bounds I/O per session file.
+const SESSION_TAIL_PROBE_BYTES: u64 = 64 * 1024;
+/// Session files examined per store (metadata + tail probe each).
+const MAX_SESSION_FILES: usize = 256;
 
 /// Run local environment diagnostics for the octos server.
 #[derive(Debug, Args)]
@@ -258,6 +272,8 @@ fn build_report(cmd: &DoctorCommand, with_network: bool) -> Result<Report> {
         report.extend(profile_checks(&profiles));
         // --- Stage 3: Stores & data -------------------------------------------
         report.extend(store_checks(&ctx.data_dir, &profiles));
+        // --- Stage 4: Sessions (content-free inventory) -------------------------
+        report.extend(session_checks(&ctx.data_dir, &profiles));
         // --- Stage 3: Skills / MCP / Channels ----------------------------------
         report.push(skills_check(&ctx.data_dir));
         report.extend(mcp_checks(config));
@@ -997,6 +1013,336 @@ fn store_checks(data_dir: &Path, profiles: &[DiscoveredProfile]) -> Vec<Check> {
     checks
 }
 
+/// Content-free inventory of one session STORE (a root's `sessions/` +
+/// `users/<base>/sessions/` dirs — the exact layout `SessionManager` writes).
+/// Only counts, sizes, ages, and file stems (session keys) are collected;
+/// transcript CONTENT is parsed for validity and immediately discarded, and
+/// never reaches the report or the JSON support bundle.
+#[derive(Default)]
+struct SessionInventory {
+    files: u64,
+    bytes: u64,
+    newest_age_secs: Option<u64>,
+    oldest_age_secs: Option<u64>,
+    /// Session keys (file stems) whose size is ≥ [`SESSION_NEAR_CAP_BYTES`]
+    /// — writes fail outright at octos-bus's 10 MiB cap.
+    near_cap: Vec<String>,
+    /// Session keys whose final line does not parse as JSON (a truncated /
+    /// corrupt tail — the usual crash-mid-write signature).
+    corrupt_tail: Vec<String>,
+    capped: bool,
+    unreadable: bool,
+    /// Some files had a future/unavailable mtime and are excluded from the
+    /// newest/oldest range.
+    ages_missing: bool,
+}
+
+/// Inventory `root/sessions/*.jsonl` + `root/users/<base>/sessions/*.jsonl`.
+fn scan_session_store(root: &Path, inventory: &mut SessionInventory) {
+    scan_session_dir(&root.join("sessions"), inventory);
+    let users = root.join("users");
+    if users.is_dir() {
+        let Ok(entries) = std::fs::read_dir(&users) else {
+            inventory.unreadable = true;
+            return;
+        };
+        // Enumerate RAW entries so hitting the bound is observable — a
+        // silent `take` would let user-dir #257 vanish while the row still
+        // read as a complete inventory (codex).
+        for (index, entry) in entries.enumerate() {
+            if index >= MAX_SCAN_ENTRIES {
+                inventory.capped = true;
+                break;
+            }
+            let Ok(entry) = entry else {
+                inventory.unreadable = true;
+                continue;
+            };
+            // lstat-based: a symlinked user dir would walk OUTSIDE the store
+            // (the disk walker doesn't follow links either).
+            if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                continue;
+            }
+            scan_session_dir(&entry.path().join("sessions"), inventory);
+        }
+    }
+}
+
+fn scan_session_dir(dir: &Path, inventory: &mut SessionInventory) {
+    if !dir.is_dir() {
+        return;
+    }
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(_) => {
+            inventory.unreadable = true;
+            return;
+        }
+    };
+    for (index, entry) in entries.enumerate() {
+        if index >= MAX_SESSION_FILES || inventory.files >= MAX_SESSION_FILES as u64 {
+            inventory.capped = true;
+            return;
+        }
+        let Ok(entry) = entry else {
+            inventory.unreadable = true;
+            continue;
+        };
+        let path = entry.path();
+        if path.extension().is_none_or(|ext| ext != "jsonl") {
+            continue;
+        }
+        // Skip SIDECARS (`<key>.tasks.jsonl` task ledgers, and any future
+        // dotted suffix): session keys are fully percent-encoded
+        // (`encode_path_component` encodes `.` as %2E), so a literal dot in
+        // the stem can only be a sidecar — not a transcript, not governed by
+        // the 10 MiB session cap, and it must not consume the scan budget or
+        // trigger resume/fork advice (codex r2).
+        if path
+            .file_stem()
+            .is_some_and(|stem| stem.to_string_lossy().contains('.'))
+        {
+            continue;
+        }
+        // lstat-based file-type check: symlinked "session files" would read
+        // an unrelated target outside the store — skip them, matching the
+        // disk walker's no-follow rule (codex).
+        if !entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
+            continue;
+        }
+        let Ok(meta) = entry.metadata() else {
+            inventory.unreadable = true;
+            continue;
+        };
+        inventory.files += 1;
+        inventory.bytes += meta.len();
+        match meta
+            .modified()
+            .ok()
+            .and_then(|modified| std::time::SystemTime::now().duration_since(modified).ok())
+        {
+            Some(age) => {
+                let secs = age.as_secs();
+                inventory.newest_age_secs =
+                    Some(inventory.newest_age_secs.map_or(secs, |n| n.min(secs)));
+                inventory.oldest_age_secs =
+                    Some(inventory.oldest_age_secs.map_or(secs, |o| o.max(secs)));
+            }
+            // Future or unavailable mtime: excluded from the range — say so
+            // instead of presenting a partial range as complete (codex).
+            None => inventory.ages_missing = true,
+        }
+        let stem = path
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        if meta.len() >= SESSION_NEAR_CAP_BYTES {
+            inventory.near_cap.push(stem.clone());
+        }
+        if meta.len() > 0 && session_tail_parses(&path, meta.len()) == Some(false) {
+            inventory.corrupt_tail.push(stem);
+        }
+    }
+}
+
+/// Content-free integrity probe: read at most the final
+/// [`SESSION_TAIL_PROBE_BYTES`] of the transcript and check that its LAST
+/// line parses as JSON. Parsing goes straight from the raw BYTES into
+/// `serde::de::IgnoredAny` (byte-faithful: invalid UTF-8 fails exactly like
+/// the runtime's `read_to_string` would, and nothing from the transcript is
+/// retained or reported). Returns:
+/// - `Some(true)`  — final line parses (or the file is whitespace-only)
+/// - `Some(false)` — final line is definitively corrupt
+/// - `None`        — VERDICT UNKNOWN: the window has no newline before the
+///   final line and the file extends beyond the window, so that "line" may
+///   be the mere suffix of a legitimately huge (>64 KiB) record. Flagging it
+///   would tell the user to delete a healthy session (codex) — callers must
+///   treat `None` as not-corrupt.
+///
+/// An unreadable file is `Some(false)` — it would fail at resume too.
+fn session_tail_parses(path: &Path, len: u64) -> Option<bool> {
+    use std::io::{Read, Seek, SeekFrom};
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return Some(false);
+    };
+    let start = len.saturating_sub(SESSION_TAIL_PROBE_BYTES);
+    if file.seek(SeekFrom::Start(start)).is_err() {
+        return Some(false);
+    }
+    let mut tail = Vec::with_capacity((len - start) as usize);
+    if file
+        .take(SESSION_TAIL_PROBE_BYTES)
+        .read_to_end(&mut tail)
+        .is_err()
+    {
+        return Some(false);
+    }
+    // Trim trailing whitespace (covers trailing newline / CRLF) — JSON's
+    // whitespace set ONLY (space/tab/CR/LF): trimming e.g. a form-feed would
+    // make a tail pass that raw serde_json rejects (codex r2).
+    let trimmed_end = tail
+        .iter()
+        .rposition(|&byte| !is_json_whitespace(byte))
+        .map(|pos| &tail[..=pos]);
+    let Some(content) = trimmed_end else {
+        // Whitespace-only window: nothing to validate.
+        return Some(true);
+    };
+    let line_start = match content.iter().rposition(|&byte| byte == b'\n') {
+        Some(pos) => pos + 1,
+        // No newline in the whole window: if the file extends beyond the
+        // window, this is a fragment of a longer record — verdict unknown.
+        None if start > 0 => return None,
+        None => 0,
+    };
+    let line = trim_json_whitespace(&content[line_start..]);
+    Some(serde_json::from_slice::<serde::de::IgnoredAny>(line).is_ok())
+}
+
+/// JSON whitespace (RFC 8259): space, tab, CR, LF — deliberately NOT the full
+/// ASCII whitespace set.
+fn is_json_whitespace(byte: u8) -> bool {
+    matches!(byte, b' ' | b'\t' | b'\r' | b'\n')
+}
+
+fn trim_json_whitespace(bytes: &[u8]) -> &[u8] {
+    let start = bytes
+        .iter()
+        .position(|&byte| !is_json_whitespace(byte))
+        .unwrap_or(bytes.len());
+    let end = bytes
+        .iter()
+        .rposition(|&byte| !is_json_whitespace(byte))
+        .map_or(start, |pos| pos + 1);
+    &bytes[start..end]
+}
+
+fn humanize_age(secs: u64) -> String {
+    match secs {
+        0..=59 => "<1m".to_string(),
+        60..=3_599 => format!("{}m", secs / 60),
+        3_600..=86_399 => format!("{}h", secs / 3_600),
+        _ => format!("{}d", secs / 86_400),
+    }
+}
+
+/// One inventory row per session store: the serve-level store at the data-dir
+/// root plus each profile's store (same roots the disk-usage walk covers;
+/// per-project `sessions_in_cwd` stores live in unknown project dirs and stay
+/// out of scope). Rows are informational; unparseable tails and near-cap
+/// transcripts WARN with the offending session keys (bounded).
+fn session_checks(data_dir: &Path, profiles: &[DiscoveredProfile]) -> Vec<Check> {
+    let mut checks = Vec::new();
+    let mut stores: Vec<(String, PathBuf)> = vec![("server".to_string(), data_dir.to_path_buf())];
+    for (id, parsed) in profiles.iter().take(MAX_PROFILE_ROWS) {
+        let base = parsed
+            .as_ref()
+            .ok()
+            .and_then(|profile| profile.data_dir.as_ref())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| data_dir.join("profiles").join(id).join("data"));
+        // Dedup: a profile whose data_dir override points AT (or repeats) an
+        // already-listed root would inventory the same store twice (codex).
+        if stores.iter().any(|(_, existing)| existing == &base) {
+            continue;
+        }
+        stores.push((id.clone(), base));
+    }
+
+    for (label, root) in stores {
+        let mut inventory = SessionInventory::default();
+        scan_session_store(&root, &mut inventory);
+        if inventory.files == 0 {
+            // An empty-LOOKING store that was actually unreadable/truncated
+            // must not vanish into a green "none stored yet" (codex).
+            if inventory.unreadable || inventory.capped {
+                checks.push(Check::warn(
+                    CAT_SESSIONS,
+                    format!("sessions ({label})"),
+                    "store could not be fully scanned (unreadable or truncated listing)",
+                    "check directory permissions under the store root",
+                ));
+            }
+            continue;
+        }
+        let ages = match (inventory.newest_age_secs, inventory.oldest_age_secs) {
+            (Some(newest), Some(oldest)) => format!(
+                " · newest {} ago · oldest {} ago",
+                humanize_age(newest),
+                humanize_age(oldest)
+            ),
+            _ => String::new(),
+        };
+        let mut notes = String::new();
+        if inventory.capped {
+            notes.push_str(&format!(" (scan capped at {MAX_SESSION_FILES})"));
+        }
+        if inventory.unreadable {
+            notes.push_str(" (some paths unreadable)");
+        }
+        if inventory.ages_missing {
+            notes.push_str(" (some ages unavailable)");
+        }
+        let summary = format!(
+            "{} session(s) · {}{ages}{notes}",
+            inventory.files,
+            human_bytes(inventory.bytes)
+        );
+        if inventory.corrupt_tail.is_empty() && inventory.near_cap.is_empty() {
+            checks.push(Check::pass(
+                CAT_SESSIONS,
+                format!("sessions ({label})"),
+                summary,
+            ));
+        } else {
+            let mut problems = Vec::new();
+            let mut fixes = Vec::new();
+            if !inventory.corrupt_tail.is_empty() {
+                let total = inventory.corrupt_tail.len();
+                let mut names = inventory.corrupt_tail.clone();
+                names.sort();
+                names.truncate(3);
+                let suffix = if total > 3 { ", …" } else { "" };
+                problems.push(format!(
+                    "{total} with unparseable tail: {}{suffix}",
+                    names.join(", ")
+                ));
+                fixes.push("unparseable tails break resume — back up + remove those files");
+            }
+            if !inventory.near_cap.is_empty() {
+                problems.push(format!(
+                    "{} near the 10 MiB session cap",
+                    inventory.near_cap.len()
+                ));
+                fixes.push("fork near-cap sessions (`/new`) before writes start failing");
+            }
+            checks.push(Check::warn(
+                CAT_SESSIONS,
+                format!("sessions ({label})"),
+                format!("{summary} — {}", problems.join("; ")),
+                fixes.join("; "),
+            ));
+        }
+    }
+    if profiles.len() > MAX_PROFILE_ROWS {
+        checks.push(Check::pass(
+            CAT_SESSIONS,
+            "sessions (more)",
+            format!(
+                "… {} more profile store(s) not scanned (showing first {MAX_PROFILE_ROWS})",
+                profiles.len() - MAX_PROFILE_ROWS
+            ),
+        ));
+    }
+    // "none stored yet" only when NOTHING else was said: with unscanned
+    // profile stores disclosed above, claiming "none" would contradict the
+    // disclosure — an unscanned store may well contain sessions (codex r2).
+    if checks.is_empty() {
+        checks.push(Check::pass(CAT_SESSIONS, "sessions", "none stored yet"));
+    }
+    checks
+}
+
 /// Outcome of the bounded disk walk. `capped`/`unreadable` make the summary
 /// honest: a truncated or partially-unreadable walk must not read as a
 /// complete measurement (codex false-green).
@@ -1636,6 +1982,245 @@ mod tests {
         );
         // The probe itself rejects unparseable URLs instead of sending them.
         assert!(probe_endpoint("not a url").is_err());
+    }
+
+    // ---- Stage 4: session inventory ----
+
+    fn write_session(dir: &Path, name: &str, lines: &[&str]) {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(dir.join(name), lines.join("\n")).unwrap();
+    }
+
+    #[test]
+    fn should_inventory_sessions_across_main_and_user_stores() {
+        let temp = tempfile::tempdir().unwrap();
+        let data_dir = temp.path().to_path_buf();
+        write_session(
+            &data_dir.join("sessions"),
+            "glm%3Alocal%3Atui%23coding.jsonl",
+            &[
+                r#"{"role":"user","content":"x"}"#,
+                r#"{"role":"assistant"}"#,
+            ],
+        );
+        write_session(
+            &data_dir.join("users/u1/sessions"),
+            "topic.jsonl",
+            &[r#"{"role":"user"}"#],
+        );
+
+        let checks = session_checks(&data_dir, &[]);
+        assert_eq!(checks.len(), 1, "one row for the server store");
+        let row = &checks[0];
+        assert_eq!(row.status, CheckStatus::Pass);
+        assert!(row.detail.contains("2 session(s)"), "{}", row.detail);
+        assert!(row.detail.contains("ago"), "ages present: {}", row.detail);
+    }
+
+    #[test]
+    fn should_flag_corrupt_tail_but_not_valid_or_empty_sessions() {
+        let temp = tempfile::tempdir().unwrap();
+        let data_dir = temp.path().to_path_buf();
+        let dir = data_dir.join("sessions");
+        write_session(&dir, "good.jsonl", &[r#"{"role":"user"}"#]);
+        write_session(
+            &dir,
+            "truncated.jsonl",
+            &[r#"{"role":"user"}"#, r#"{"role":"assis"#],
+        );
+        std::fs::write(dir.join("empty.jsonl"), "").unwrap();
+
+        let checks = session_checks(&data_dir, &[]);
+        let row = &checks[0];
+        assert_eq!(row.status, CheckStatus::Warn);
+        assert!(
+            row.detail.contains("1 with unparseable tail: truncated"),
+            "{}",
+            row.detail
+        );
+        assert!(!row.detail.contains("good,"), "valid session not flagged");
+        assert!(
+            row.fix.as_deref().unwrap_or("").contains("resume"),
+            "fix explains the consequence"
+        );
+    }
+
+    #[test]
+    fn should_pass_when_a_large_transcript_has_a_valid_tail_beyond_probe_window() {
+        // A file bigger than the 64 KiB probe window whose tail is healthy
+        // must NOT be flagged (the window cut lands mid-line at the START of
+        // the window, never the end).
+        let temp = tempfile::tempdir().unwrap();
+        let data_dir = temp.path().to_path_buf();
+        let line = format!(r#"{{"role":"user","content":"{}"}}"#, "x".repeat(200));
+        let lines: Vec<&str> = std::iter::repeat_n(line.as_str(), 600).collect();
+        write_session(&data_dir.join("sessions"), "big.jsonl", &lines);
+        let meta = std::fs::metadata(data_dir.join("sessions/big.jsonl")).unwrap();
+        assert!(
+            meta.len() > SESSION_TAIL_PROBE_BYTES,
+            "test file must exceed the window"
+        );
+
+        let checks = session_checks(&data_dir, &[]);
+        assert_eq!(checks[0].status, CheckStatus::Pass, "{}", checks[0].detail);
+    }
+
+    #[test]
+    fn should_flag_sessions_near_the_write_cap() {
+        let temp = tempfile::tempdir().unwrap();
+        let data_dir = temp.path().to_path_buf();
+        let dir = data_dir.join("sessions");
+        std::fs::create_dir_all(&dir).unwrap();
+        // Sparse 9 MiB file with a valid JSON tail: metadata length is what
+        // counts (same trick as the disk-usage soak).
+        let path = dir.join("huge.jsonl");
+        let file = std::fs::File::create(&path).unwrap();
+        file.set_len(9 * 1024 * 1024).unwrap();
+        drop(file);
+        {
+            use std::io::{Seek, SeekFrom, Write};
+            let mut file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+            file.seek(SeekFrom::End(0)).unwrap();
+            writeln!(file, "{}", r#"{"role":"user"}"#).unwrap();
+        }
+
+        let checks = session_checks(&data_dir, &[]);
+        let row = &checks[0];
+        assert_eq!(row.status, CheckStatus::Warn);
+        assert!(
+            row.detail.contains("1 near the 10 MiB session cap"),
+            "{}",
+            row.detail
+        );
+    }
+
+    #[test]
+    fn should_not_flag_a_single_giant_line_as_corrupt() {
+        // A final record longer than the probe window arrives as a FRAGMENT
+        // (no newline in the window) — verdict must be UNKNOWN, not corrupt:
+        // flagging it would advise deleting a healthy session (codex).
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("sessions");
+        std::fs::create_dir_all(&dir).unwrap();
+        let giant = format!(
+            r#"{{"role":"user","content":"{}"}}"#,
+            "y".repeat((SESSION_TAIL_PROBE_BYTES as usize) + 4096)
+        );
+        std::fs::write(dir.join("giant.jsonl"), &giant).unwrap();
+
+        let checks = session_checks(temp.path(), &[]);
+        assert_eq!(
+            checks[0].status,
+            CheckStatus::Pass,
+            "giant single-line session must not be flagged: {}",
+            checks[0].detail
+        );
+
+        // But a SMALL file with no newline and invalid JSON is definitively
+        // corrupt (the whole file is in the window: start == 0).
+        std::fs::write(dir.join("smallbad.jsonl"), "not json at all").unwrap();
+        let checks = session_checks(temp.path(), &[]);
+        assert_eq!(checks[0].status, CheckStatus::Warn);
+        assert!(
+            checks[0].detail.contains("smallbad"),
+            "{}",
+            checks[0].detail
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn should_skip_symlinked_session_files() {
+        // A symlink dropped into the store must not be read (it points
+        // outside the store boundary — same no-follow rule as the disk walk).
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("sessions");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(temp.path().join("outside.jsonl"), "not json").unwrap();
+        std::os::unix::fs::symlink(temp.path().join("outside.jsonl"), dir.join("linked.jsonl"))
+            .unwrap();
+        std::fs::write(dir.join("real.jsonl"), "{}").unwrap();
+
+        let checks = session_checks(temp.path(), &[]);
+        assert_eq!(checks[0].status, CheckStatus::Pass, "{}", checks[0].detail);
+        assert!(
+            checks[0].detail.contains("1 session(s)"),
+            "symlink not counted: {}",
+            checks[0].detail
+        );
+    }
+
+    #[test]
+    fn should_dedup_profile_stores_pointing_at_the_server_root() {
+        // A profile whose data_dir override IS the data-dir root must not
+        // produce a second inventory of the same store.
+        let temp = tempfile::tempdir().unwrap();
+        let data_dir = temp.path().to_path_buf();
+        write_session(&data_dir.join("sessions"), "s.jsonl", &[r#"{"a":1}"#]);
+        let now = chrono::Utc::now().to_rfc3339();
+        let profile: crate::profiles::UserProfile = serde_json::from_str(&format!(
+            r#"{{"id":"alias","name":"alias","enabled":true,"config":{{}},"data_dir":"{}","created_at":"{now}","updated_at":"{now}"}}"#,
+            data_dir.display()
+        ))
+        .unwrap();
+        let profiles: Vec<DiscoveredProfile> = vec![("alias".into(), Ok(profile))];
+
+        let checks = session_checks(&data_dir, &profiles);
+        let rows = checks
+            .iter()
+            .filter(|c| c.name.starts_with("sessions ("))
+            .count();
+        assert_eq!(rows, 1, "duplicate store must be deduped: {checks:?}");
+    }
+
+    #[test]
+    fn should_skip_task_ledger_sidecars() {
+        // `<key>.tasks.jsonl` sidecars are task ledgers, not transcripts —
+        // they must not count, consume budget, or trigger resume/fork advice
+        // (session keys are percent-encoded, so a dotted stem = sidecar).
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("sessions");
+        write_session(&dir, "glm%3Alocal.jsonl", &[r#"{"role":"user"}"#]);
+        std::fs::write(dir.join("glm%3Alocal.tasks.jsonl"), "not json").unwrap();
+
+        let checks = session_checks(temp.path(), &[]);
+        assert_eq!(checks[0].status, CheckStatus::Pass, "{}", checks[0].detail);
+        assert!(
+            checks[0].detail.contains("1 session(s)"),
+            "sidecar not counted: {}",
+            checks[0].detail
+        );
+    }
+
+    #[test]
+    fn should_report_none_stored_when_no_sessions_exist_anywhere() {
+        let temp = tempfile::tempdir().unwrap();
+        let checks = session_checks(temp.path(), &[]);
+        assert_eq!(checks.len(), 1);
+        assert_eq!(checks[0].status, CheckStatus::Pass);
+        assert!(checks[0].detail.contains("none stored yet"));
+    }
+
+    #[test]
+    fn should_inventory_profile_session_stores_by_their_base() {
+        let temp = tempfile::tempdir().unwrap();
+        let data_dir = temp.path().to_path_buf();
+        let base = data_dir.join("profiles/glm/data");
+        write_session(&base.join("sessions"), "s.jsonl", &[r#"{"role":"user"}"#]);
+        let now = chrono::Utc::now().to_rfc3339();
+        let profile: crate::profiles::UserProfile = serde_json::from_str(&format!(
+            r#"{{"id":"glm","name":"glm","enabled":true,"config":{{}},"created_at":"{now}","updated_at":"{now}"}}"#
+        ))
+        .unwrap();
+        let profiles: Vec<DiscoveredProfile> = vec![("glm".into(), Ok(profile))];
+
+        let checks = session_checks(&data_dir, &profiles);
+        assert!(
+            checks
+                .iter()
+                .any(|c| c.name == "sessions (glm)" && c.detail.contains("1 session(s)")),
+            "profile store row present"
+        );
     }
 
     #[test]
