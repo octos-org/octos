@@ -750,6 +750,9 @@ pub(crate) fn project_sessions_root(canonical_cwd: &Path, profile_id: &str) -> P
 /// blocks the session open. Atomic write-then-rename so a crash can't leave a
 /// torn marker; last writer wins, which is exactly the "last profile opened
 /// here" semantics we want.
+// The only non-test caller (`session/open` in the AppUI server) is api-gated;
+// the writer stays unconditional next to the store layout it records.
+#[cfg_attr(not(feature = "api"), allow(dead_code))]
 pub(crate) fn write_active_profile_marker(canonical_cwd: &Path, profile_id: &str) {
     let octos_dir = canonical_cwd.join(".octos");
     if let Err(error) = std::fs::create_dir_all(&octos_dir) {
