@@ -153,13 +153,18 @@ pub enum Command {
 /// * `mcp-serve --transport stdio` speaks MCP JSON-RPC on stdout;
 /// * `profile` emits payloads meant for `$(...)` capture / piping;
 /// * `chat --json` emits a single JSON result object on stdout (scripting /
-///   agent-to-agent).
+///   agent-to-agent);
+/// * `doctor --json` emits the diagnostics support bundle on stdout — the
+///   config-parse check loads the real config, whose tracing INFO lines
+///   ("no config.json found, using defaults") would otherwise corrupt the
+///   JSON.
 ///
 /// Every other command keeps its historical stdout console routing untouched.
 pub fn reserve_stdout(command: &Command) -> bool {
     match command {
         Command::Acp(_) | Command::Profile(_) | Command::McpServe(_) => true,
         Command::Chat(cmd) => cmd.json,
+        Command::Doctor(cmd) => cmd.json,
         _ => false,
     }
 }
@@ -392,6 +397,18 @@ mod reserve_stdout_tests {
         let args =
             Args::try_parse_from(["octos", "chat", "--message", "hi"]).expect("`chat` must parse");
         assert!(!reserve_stdout(&args.command));
+    }
+
+    #[test]
+    fn should_reserve_stdout_only_for_doctor_json() {
+        // `octos doctor --json` emits the support bundle on stdout; the
+        // config-parse check's tracing INFO lines must route to stderr so the
+        // JSON stays parseable. Plain `octos doctor` keeps stdout logging.
+        let json = Args::try_parse_from(["octos", "doctor", "--json"])
+            .expect("`doctor --json` must parse");
+        assert!(reserve_stdout(&json.command));
+        let human = Args::try_parse_from(["octos", "doctor"]).expect("`doctor` must parse");
+        assert!(!reserve_stdout(&human.command));
     }
 
     #[test]
