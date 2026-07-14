@@ -1827,17 +1827,24 @@ impl Config {
     /// Shared resolution body: auth store → env_vars (keychain) → process
     /// env, with the var name secret-registered first.
     fn resolve_api_key(&self, provider: &str, env_var: String) -> Result<String> {
-        // Candidate env-var names: the primary, plus registry-alias-derived
-        // names (e.g. moonshot aliases "kimi" -> KIMI_API_KEY). Some providers
-        // are configured under more than one env var in the wild (Moonshot is
-        // set via MOONSHOT_API_KEY or KIMI_API_KEY, and the bundled skills use
-        // KIMI_API_KEY), so we accept any of them rather than forcing one name.
+        // Candidate env-var names. A provider may declare sibling key vars in
+        // the registry (e.g. Moonshot accepts MOONSHOT_API_KEY or KIMI_API_KEY).
+        // We only expand to those siblings when the configured var is ITSELF one
+        // of the provider's known key names — an arbitrary custom `api_key_env`
+        // override (e.g. a proxy key) stays exclusive so a missing override
+        // never falls back to an unrelated ambient credential.
         let mut candidates = vec![env_var.clone()];
         if let Some(entry) = octos_llm::registry::lookup(provider) {
-            for alias in entry.aliases {
-                let alias_var = format!("{}_API_KEY", alias.to_uppercase());
-                if !candidates.contains(&alias_var) {
-                    candidates.push(alias_var);
+            let known: Vec<&str> = entry
+                .api_key_env
+                .into_iter()
+                .chain(entry.key_env_aliases.iter().copied())
+                .collect();
+            if known.iter().any(|k| k.eq_ignore_ascii_case(&env_var)) {
+                for k in known {
+                    if !candidates.iter().any(|c| c.eq_ignore_ascii_case(k)) {
+                        candidates.push(k.to_string());
+                    }
                 }
             }
         }
@@ -2515,6 +2522,75 @@ mod tests {
             "global-xdg-token",
             "get_api_key must read the GLOBAL XDG auth store (shared login)"
         );
+    }
+
+    /// Run `f` with HOME pointed at an empty temp dir (so the global auth store
+    /// is empty) and the config/XDG env vars cleared. Serialized on the shared
+    /// env lock; all vars restored afterwards.
+    #[allow(unsafe_code)]
+    fn with_isolated_home<T>(f: impl FnOnce() -> T) -> T {
+        let _g = HOME_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let keys = ["HOME", "OCTOS_HOME", "OCTOS_CONFIG_DIR", "XDG_CONFIG_HOME"];
+        let saved: Vec<(&str, Option<std::ffi::OsString>)> =
+            keys.iter().map(|k| (*k, std::env::var_os(k))).collect();
+        // SAFETY: serialized by HOME_ENV_LOCK; restored below.
+        unsafe {
+            std::env::set_var("HOME", tmp.path());
+            std::env::remove_var("OCTOS_HOME");
+            std::env::remove_var("OCTOS_CONFIG_DIR");
+            std::env::remove_var("XDG_CONFIG_HOME");
+        }
+        let out = f();
+        for (k, v) in saved {
+            match v {
+                Some(v) => unsafe { std::env::set_var(k, v) },
+                None => unsafe { std::env::remove_var(k) },
+            }
+        }
+        out
+    }
+
+    #[test]
+    #[allow(unsafe_code)]
+    fn custom_api_key_env_override_stays_exclusive() {
+        // Regression: an explicit custom `api_key_env` must NOT fall back to a
+        // provider's sibling key vars — otherwise a missing proxy key would leak
+        // an ambient KIMI_API_KEY to a custom endpoint.
+        with_isolated_home(|| {
+            let cfg = Config {
+                provider: Some("moonshot".to_string()),
+                api_key_env: Some("MY_PROXY_KEY".to_string()),
+                env_vars: std::collections::HashMap::from([(
+                    "KIMI_API_KEY".to_string(),
+                    "ambient-kimi".to_string(),
+                )]),
+                ..Default::default()
+            };
+            // MY_PROXY_KEY is unset; resolution must fail, not return the
+            // unrelated KIMI credential.
+            assert!(cfg.get_api_key("moonshot").is_err());
+        });
+    }
+
+    #[test]
+    #[allow(unsafe_code)]
+    fn moonshot_accepts_either_declared_key_name() {
+        // Regression (symmetry): an init-generated config uses api_key_env =
+        // KIMI_API_KEY, but a user who set MOONSHOT_API_KEY must still resolve,
+        // because both are declared key names for the provider.
+        with_isolated_home(|| {
+            let cfg = Config {
+                provider: Some("moonshot".to_string()),
+                api_key_env: Some("KIMI_API_KEY".to_string()),
+                env_vars: std::collections::HashMap::from([(
+                    "MOONSHOT_API_KEY".to_string(),
+                    "mkey".to_string(),
+                )]),
+                ..Default::default()
+            };
+            assert_eq!(cfg.get_api_key("moonshot").unwrap(), "mkey");
+        });
     }
 
     #[test]

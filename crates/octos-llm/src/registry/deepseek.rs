@@ -12,6 +12,7 @@ pub const ENTRY: ProviderEntry = ProviderEntry {
     aliases: &[],
     default_model: Some("deepseek-chat"),
     api_key_env: Some("DEEPSEEK_API_KEY"),
+    key_env_aliases: &[],
     default_base_url: Some("https://api.deepseek.com/v1"),
     requires_api_key: true,
     requires_base_url: false,

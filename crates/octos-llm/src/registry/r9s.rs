@@ -13,6 +13,7 @@ pub const ENTRY: ProviderEntry = ProviderEntry {
     aliases: &["r9s.ai"],
     default_model: Some("claude-sonnet-4-6"),
     api_key_env: Some("R9S_API_KEY"),
+    key_env_aliases: &[],
     default_base_url: Some("https://api.r9s.ai/v1"),
     requires_api_key: true,
     requires_base_url: false,

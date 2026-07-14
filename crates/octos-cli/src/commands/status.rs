@@ -130,13 +130,14 @@ fn show_system_status(cwd: &std::path::Path) -> Result<()> {
         let mut is_set = std::env::var(env_var).is_ok();
         if !is_set {
             if let Some(entry) = octos_llm::registry::lookup(&label.to_lowercase()) {
-                // Also honor the registry's own key var (e.g. MOONSHOT_API_KEY)
-                // and every alias-derived var (kimi -> KIMI_API_KEY), matching
-                // exactly what config resolution accepts.
+                // Honor the provider's registry key var plus any declared sibling
+                // key vars (e.g. MOONSHOT_API_KEY / KIMI_API_KEY), matching what
+                // config resolution actually accepts.
                 is_set = entry.api_key_env.is_some_and(|v| std::env::var(v).is_ok())
-                    || entry.aliases.iter().any(|alias| {
-                        std::env::var(format!("{}_API_KEY", alias.to_uppercase())).is_ok()
-                    });
+                    || entry
+                        .key_env_aliases
+                        .iter()
+                        .any(|v| std::env::var(v).is_ok());
             }
         }
         let status = if is_set {
