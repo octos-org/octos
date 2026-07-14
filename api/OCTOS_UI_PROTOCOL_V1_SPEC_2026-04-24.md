@@ -377,6 +377,7 @@ Session, turn, and approval core:
   re-projects the trimmed thread exactly like `session/hydrate`; #1516)
 - `session/fork` (branch a session into a new one with copied history; #1613)
 - `session/btw` (quick aside question answered while the current turn runs; #1609)
+- `session/compact` (force a context-compaction pass on the session now; the manual `/compact` command)
 - `turn/start`
 - `turn/interrupt`
 - `turn/state/get` (gate `state.turn_state_get.v1`, accepted `UPCR-2026-011`)
