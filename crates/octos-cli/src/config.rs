@@ -266,10 +266,13 @@ pub struct PluginsConfig {
 
 /// AppUi session defaults applied by `octos serve`'s API agent.
 ///
-/// All fields are optional; an empty `[appui]` section preserves the
-/// historical behavior (no server-side default cwd, every session falls
-/// through Tier-3 of the `session_tool_registry` chain unchanged).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+/// Both fields are optional. `default_session_cwd` defaults to `None` (no
+/// server-side default cwd; sessions fall through Tier-3 of the
+/// `session_tool_registry` chain unchanged), but `sessions_in_cwd` defaults
+/// to `true` — see its field doc for the coexistence trade-off — so an
+/// absent or empty `[appui]` section now enables per-project session storage
+/// for cwd-hinted launches.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AppUiConfig {
     /// Optional default workspace cwd for AppUi sessions. When set, every
@@ -295,12 +298,39 @@ pub struct AppUiConfig {
     /// sessions-root resolver returns `profile.data_dir` when there is no
     /// hint, so per-cwd storage is inert for those paths by construction.
     ///
-    /// Default `false` for a conservative first cut: nothing changes for
-    /// existing deployments until an operator opts in. Legacy global sessions
-    /// are left in place (their cwd was never persisted, so retro-migration is
-    /// infeasible) and remain reachable via a no-`cwd` `session/list`.
-    #[serde(default)]
+    /// Default `true`: a bare launch in a folder resumes that folder's own
+    /// conversations, which is the launch-flow contract (`launch/resolve` +
+    /// the sticky `active-profile` marker record their per-project store).
+    /// An operator can still force the legacy global store by setting
+    /// `sessions_in_cwd = false`.
+    ///
+    /// Coexistence trade-off (this flip is NOT a migration): cwd-hinted
+    /// coding sessions created before the default flipped live under the old
+    /// per-profile store and do NOT appear in a per-project `session/list`
+    /// for their folder — their cwd was never persisted, so they cannot be
+    /// relocated. They remain reachable via a no-`cwd` `session/list` (which
+    /// still resolves to `profile.data_dir`). No-hint web-chat and every
+    /// gateway session are unaffected: they never used per-cwd storage, so
+    /// flipping the default is inert for those paths by construction.
+    #[serde(default = "default_sessions_in_cwd")]
     pub sessions_in_cwd: bool,
+}
+
+/// Default for [`AppUiConfig::sessions_in_cwd`] — `true` so a bare launch in
+/// a folder resumes that folder's own conversations. Kept in sync with the
+/// manual [`Default`] impl below (serde uses this for a present `[appui]`
+/// missing the key; `Default` covers an absent `[appui]` section).
+fn default_sessions_in_cwd() -> bool {
+    true
+}
+
+impl Default for AppUiConfig {
+    fn default() -> Self {
+        Self {
+            default_session_cwd: None,
+            sessions_in_cwd: default_sessions_in_cwd(),
+        }
+    }
 }
 
 /// Top-level credential-pool configuration for `chat` / `serve`. Mirrors
@@ -2147,6 +2177,39 @@ mod tests {
         let json = r#"{"channels": [{"type": "cli"}]}"#;
         let gw: GatewayConfig = serde_json::from_str(json).unwrap();
         assert_eq!(gw.max_history, 50);
+    }
+
+    #[test]
+    fn appui_sessions_in_cwd_defaults_on_and_can_be_disabled() {
+        // Absent `[appui]` → the `#[serde(default)]` on the parent field calls
+        // `AppUiConfig::default()` → per-project storage ON.
+        let absent: Config = serde_json::from_str(r#"{"provider": "anthropic"}"#).unwrap();
+        assert!(
+            absent.appui.sessions_in_cwd,
+            "an absent [appui] section must default sessions_in_cwd on",
+        );
+
+        // Present `[appui]` missing the key → the field-level
+        // `#[serde(default = \"default_sessions_in_cwd\")]` path → ON.
+        let empty: Config =
+            serde_json::from_str(r#"{"provider": "anthropic", "appui": {}}"#).unwrap();
+        assert!(
+            empty.appui.sessions_in_cwd,
+            "an empty [appui] section must default sessions_in_cwd on",
+        );
+
+        // Explicit opt-out → the legacy global per-profile store is honored.
+        let disabled: Config = serde_json::from_str(
+            r#"{"provider": "anthropic", "appui": {"sessions_in_cwd": false}}"#,
+        )
+        .unwrap();
+        assert!(
+            !disabled.appui.sessions_in_cwd,
+            "an operator can still force the legacy global store off",
+        );
+
+        // The programmatic Default agrees with both serde paths.
+        assert!(AppUiConfig::default().sessions_in_cwd);
     }
 
     #[test]
