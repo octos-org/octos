@@ -2262,6 +2262,13 @@ pub struct ProfileLocalCreateParams {
     /// Legacy owner email. Optional for a solo local profile.
     #[serde(default)]
     pub email: String,
+    /// When `Some(true)`, the server records this profile as the machine's
+    /// global default — the brain a bare launch resolves to in a folder with no
+    /// sticky profile yet (Model A launch flow). Omitted from the wire when
+    /// `None` so older servers receive the unchanged shape. Clients only send it
+    /// when the server advertises `profile.local_create.default.v1`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub make_default: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -6964,6 +6971,7 @@ mod tests {
             name: String::new(),
             username: String::new(),
             email: String::new(),
+            make_default: None,
         };
         let wire = serde_json::to_value(&params).expect("serialize profile/local/create params");
         assert_eq!(wire["requested_id"], json!("glm"));

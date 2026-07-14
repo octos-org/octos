@@ -216,6 +216,12 @@ const APPUI_FEATURE_PROFILE_LOCAL_CREATE_V1: &str = "profile.local_create.v1";
 /// matching how `profile.local_create.v1` itself was introduced.
 const APPUI_FEATURE_PROFILE_LOCAL_CREATE_REQUESTED_ID_V1: &str =
     "profile.local_create.requested_id.v1";
+/// Nameable-profiles extension: this server honors the optional `make_default`
+/// field on `profile/local/create`, recording the created profile as the
+/// machine's global default (the brain a bare launch resolves to in a folder
+/// with no sticky profile). Advertised alongside `profile.local_create.v1`;
+/// purely additive. Gates the onboarding "Make this your default brain?" prompt.
+const APPUI_FEATURE_PROFILE_LOCAL_CREATE_DEFAULT_V1: &str = "profile.local_create.default.v1";
 const APPUI_FEATURE_PERMISSION_PROFILE_V1: &str = "permission.profile.v1";
 const APPUI_FEATURE_RUNTIME_POLICY_STAMP_V1: &str = "runtime.policy_stamp.v1";
 const APPUI_FEATURE_CONTEXT_LIFECYCLE_V1: &str = "context.lifecycle.v1";
@@ -1537,6 +1543,13 @@ impl ConnectionUiFeatures {
             push_capability_feature(
                 &mut capabilities.supported_features,
                 APPUI_FEATURE_PROFILE_LOCAL_CREATE_REQUESTED_ID_V1,
+            );
+            // Nameable profiles: advertise that this server honors the optional
+            // `make_default` field, recording the created profile as the global
+            // default. Additive; gates the onboarding make-default prompt.
+            push_capability_feature(
+                &mut capabilities.supported_features,
+                APPUI_FEATURE_PROFILE_LOCAL_CREATE_DEFAULT_V1,
             );
             // #1057: workspace probe ships next to local-solo onboarding so
             // the TUI can advertise the recovery UX only when the backend
@@ -6845,6 +6858,7 @@ fn create_fresh_local_solo_profile(
         .save(&profile)
         .map_err(|error| runtime_unavailable_error(format!("failed to save profile: {error}")))?;
     write_local_profile_metadata(profile_store, &profile, &username, &email)?;
+    persist_default_if_requested(profile_store, params, &profile_id)?;
 
     Ok(octos_core::ui_protocol::ProfileLocalCreateResult {
         profile_id: profile_id.clone(),
@@ -6855,6 +6869,23 @@ fn create_fresh_local_solo_profile(
         created: true,
         runtime_mode: "solo".to_owned(),
     })
+}
+
+/// Record the just-created/resolved profile as the machine's global default
+/// when the client set `make_default`. A no-op when the flag is absent or
+/// false. Called on every `profile/local/create` success path so "make default"
+/// applies whether the profile was freshly minted or already existed.
+fn persist_default_if_requested(
+    profile_store: &crate::profiles::ProfileStore,
+    params: &octos_core::ui_protocol::ProfileLocalCreateParams,
+    profile_id: &str,
+) -> Result<(), RpcError> {
+    if params.make_default.unwrap_or(false) {
+        profile_store.set_default_profile(profile_id).map_err(|error| {
+            runtime_unavailable_error(format!("failed to set default profile: {error}"))
+        })?;
+    }
+    Ok(())
 }
 
 pub(crate) fn create_or_get_local_solo_profile(
@@ -6952,6 +6983,7 @@ pub(crate) fn create_or_get_local_solo_profile(
         }
         if existing_user.is_some() {
             write_local_profile_metadata(&profile_store, profile, &username, &email)?;
+            persist_default_if_requested(&profile_store, &params, &profile_id)?;
             return Ok(octos_core::ui_protocol::ProfileLocalCreateResult {
                 profile_id: profile_id.clone(),
                 user_id: profile_id,
@@ -7001,6 +7033,7 @@ pub(crate) fn create_or_get_local_solo_profile(
         .save(&profile)
         .map_err(|error| runtime_unavailable_error(format!("failed to save profile: {error}")))?;
     write_local_profile_metadata(&profile_store, &profile, &username, &email)?;
+    persist_default_if_requested(&profile_store, &params, &profile_id)?;
 
     Ok(octos_core::ui_protocol::ProfileLocalCreateResult {
         profile_id: profile_id.clone(),
@@ -15776,13 +15809,21 @@ fn resolve_launch_result(
     let mut known_profiles: Vec<String> = state.profiles.keys().cloned().collect();
     known_profiles.sort();
 
-    // Global default: the connection's own profile when it is registered, else
-    // `_main` when present, else the first known profile. `None` (→
-    // `NoProfile`) only when no profile exists at all. Phase-3 replaces this
-    // with an explicit `default-profile` pointer.
-    let default_profile: Option<String> = connection_profile_id
-        .map(str::to_string)
-        .filter(|candidate| known_profiles.iter().any(|known| known == candidate))
+    // Global default. An explicit user-chosen `default-profile` pointer (set via
+    // the onboarding "make default" flow) wins when it still names a known
+    // profile; otherwise fall back to the connection's own profile when
+    // registered, else `_main` when present, else the first known profile.
+    // `None` (→ `NoProfile`) only when no profile exists at all.
+    let persisted_default = profile_store(state)
+        .ok()
+        .and_then(|store| store.default_profile())
+        .filter(|candidate| known_profiles.iter().any(|known| known == candidate));
+    let default_profile: Option<String> = persisted_default
+        .or_else(|| {
+            connection_profile_id
+                .map(str::to_string)
+                .filter(|candidate| known_profiles.iter().any(|known| known == candidate))
+        })
         .or_else(|| {
             known_profiles
                 .iter()
@@ -27328,6 +27369,50 @@ mod tests {
         }
     }
 
+    #[test]
+    fn profile_local_create_make_default_persists_pointer() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = local_profile_state(dir.path());
+
+        // Create with make_default → the assigned profile becomes the global
+        // default pointer.
+        let created = create_or_get_local_solo_profile(
+            &state,
+            octos_core::ui_protocol::ProfileLocalCreateParams {
+                requested_id: Some("glm".into()),
+                name: String::new(),
+                username: String::new(),
+                email: String::new(),
+                make_default: Some(true),
+            },
+        )
+        .expect("create with make_default");
+        let store = state.profile_store.as_ref().unwrap();
+        assert_eq!(
+            store.default_profile().as_deref(),
+            Some(created.profile_id.as_str())
+        );
+
+        // A later create WITHOUT make_default must not steal the default.
+        let other = create_or_get_local_solo_profile(
+            &state,
+            octos_core::ui_protocol::ProfileLocalCreateParams {
+                requested_id: Some("deepseek".into()),
+                name: String::new(),
+                username: String::new(),
+                email: String::new(),
+                make_default: None,
+            },
+        )
+        .expect("create without make_default");
+        assert_ne!(other.profile_id, created.profile_id);
+        assert_eq!(
+            store.default_profile().as_deref(),
+            Some(created.profile_id.as_str()),
+            "a create without make_default must leave the default pointer intact"
+        );
+    }
+
     /// Multi-model profiles: `profile/llm/list`-backed model list exposes the
     /// primary AND every fallback; `profile/llm/select` promotes a fallback to
     /// the active primary (demoting the old primary to a fallback), persists,
@@ -28244,6 +28329,7 @@ mod tests {
             name: name.into(),
             username: username.into(),
             email: email.into(),
+            make_default: None,
         }
     }
 
@@ -31444,6 +31530,105 @@ ignore = []
         // Without the workspace-cwd feature the probe is rejected.
         let no_cap = ConnectionUiFeatures::default();
         assert!(resolve_launch_result(&state, Some("dev"), no_cap, &params).is_err());
+    }
+
+    /// The persisted `default-profile` pointer drives a bare launch: with no
+    /// `--profile` and no folder-sticky profile, `launch/resolve` resolves to
+    /// the pointer even when it is not the first-sorted profile. A stale pointer
+    /// (naming a profile that no longer exists) is ignored, falling back to the
+    /// derived default.
+    #[tokio::test]
+    async fn launch_resolve_prefers_persisted_default_profile() {
+        use octos_core::ui_protocol::{LaunchDecisionKind, LaunchResolveParams};
+
+        let tmp = tempfile::tempdir().unwrap();
+        // The default-profile pointer lives in its own octos home; each profile
+        // bootstraps in a separate data dir because the redb episode store takes
+        // an exclusive lock and two profiles cannot share one.
+        let home = tmp.path().join("home");
+
+        let make_profile = |id: &str| crate::profiles::UserProfile {
+            id: id.to_string(),
+            name: id.to_string(),
+            enabled: true,
+            data_dir: None,
+            parent_id: None,
+            public_subdomain: None,
+            config: crate::profiles::ProfileConfig {
+                llm: Some(crate::profiles::LlmProfileConfig {
+                    primary: Some(crate::profiles::LlmModelSelectionConfig {
+                        family_id: Some("openai".to_string()),
+                        model_id: Some("gpt-4o-mini".to_string()),
+                        route: Some(crate::profiles::LlmRouteConfig {
+                            route_id: None,
+                            label: None,
+                            base_url: None,
+                            api_key_env: Some("LAUNCH_DEFAULT_TEST_KEY".to_string()),
+                            api_type: None,
+                        }),
+                        ..Default::default()
+                    }),
+                    fallbacks: Vec::new(),
+                }),
+                env_vars: [(
+                    "LAUNCH_DEFAULT_TEST_KEY".to_string(),
+                    "test-key".to_string(),
+                )]
+                .into_iter()
+                .collect(),
+                ..Default::default()
+            },
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+
+        let mut state = AppState::empty_for_tests();
+        for id in ["alpha", "zeta"] {
+            let profile_dir = tmp.path().join(format!("profile-{id}"));
+            std::fs::create_dir_all(&profile_dir).unwrap();
+            let runtime = crate::runtime::ProfileRuntime::bootstrap(
+                &make_profile(id),
+                &profile_dir,
+                None,
+                crate::runtime::BootstrapRole::Serve,
+            )
+            .await
+            .expect("bootstrap profile");
+            state.profiles.insert(id.to_string(), runtime);
+        }
+        let store = Arc::new(crate::profiles::ProfileStore::open(&home).unwrap());
+        // Point the global default at "zeta" — NOT the first-sorted profile.
+        store.set_default_profile("zeta").unwrap();
+        state.profile_store = Some(store.clone());
+        state.session_cache = Arc::new(
+            crate::runtime::SessionRuntimeCache::new(4, std::time::Duration::from_secs(60))
+                .with_sessions_in_cwd(true),
+        );
+        let state = Arc::new(state);
+        let cap = ConnectionUiFeatures::stdio_defaults();
+
+        let project = tmp.path().join("fresh");
+        std::fs::create_dir_all(&project).unwrap();
+        // Bare launch (no `--profile`) in an empty folder. The connection
+        // authenticated as "alpha"; the persisted default is "zeta". The default
+        // pointer must win over BOTH the connection profile and sort order.
+        let params = LaunchResolveParams {
+            cwd: project.to_string_lossy().into_owned(),
+            profile_id: None,
+        };
+        let decision = resolve_launch_result(&state, Some("alpha"), cap, &params).unwrap();
+        assert_eq!(decision.decision, LaunchDecisionKind::Activate);
+        assert_eq!(
+            decision.resolved_profile.as_deref(),
+            Some("zeta"),
+            "the persisted default must win over the connection profile"
+        );
+
+        // A stale pointer (unknown profile) is ignored → falls back to the
+        // connection profile (alpha).
+        store.set_default_profile("ghost").unwrap();
+        let stale = resolve_launch_result(&state, Some("alpha"), cap, &params).unwrap();
+        assert_eq!(stale.resolved_profile.as_deref(), Some("alpha"));
     }
 
     async fn assert_advertised_stdio_methods_have_dispatch_path(state: Arc<AppState>) {
