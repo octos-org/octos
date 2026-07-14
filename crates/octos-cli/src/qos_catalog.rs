@@ -10,6 +10,143 @@ use tracing::{info, warn};
 use crate::commands::chat::create_provider_with_api_type;
 use crate::config::Config;
 
+/// The canonical model catalog (`model_catalog.json`), compiled in. This is the
+/// single source of truth for model provisioning and the researched
+/// context-window / pricing floor. It ships next to the binary at release time
+/// (see `scripts/build-local-bundle.sh`), but is also embedded so a fresh
+/// install — one with no per-profile data-dir catalog and no `~/.octos`
+/// catalog yet — still seeds the adaptive router, the context-window table, and
+/// the pricing table with researched values instead of cold-start zeros.
+///
+/// `crates/octos-cli/src/api/ui_protocol.rs` (onboarding) and
+/// `crates/octos-cli/src/commands/init.rs` reference this same const so there is
+/// exactly one embedded copy.
+pub(crate) const EMBEDDED_MODEL_CATALOG: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../model_catalog.json"
+));
+
+/// Parse the compiled-in canonical catalog. `None` only if the committed file
+/// is malformed (a build-time invariant, so effectively always `Some`).
+pub(crate) fn embedded_qos_catalog() -> Option<QosCatalog> {
+    serde_json::from_str(EMBEDDED_MODEL_CATALOG).ok()
+}
+
+/// Merge a live-scored `overlay` catalog onto a full canonical `base` catalog.
+///
+/// For a provider present in BOTH, the merged entry keeps the canonical
+/// **static** metadata (cost, context window, max output, model type,
+/// deep-search quality `ds_output`) from the base and takes only the
+/// **dynamic** live QoS (score, stability, latency) from the overlay. This is
+/// deliberate: the router export's static fields are whatever was seeded from
+/// the previous on-disk catalog, so a plain overlay-wins merge would let a stale
+/// cost/context value written before an upgrade win over the corrected canonical
+/// value and re-persist itself forever — the on-disk catalog would never
+/// converge to the SSOT. `ds_output` (deep-search quality) is also static/
+/// seed-only, but with one twist: the canonical catalog uses `0` as a "not
+/// evaluated" sentinel, so it wins only when it carries a positive evaluated
+/// value; when canonical `ds_output` is 0 the overlay's value is preserved so an
+/// older on-disk benchmark is not erased. (Contrast `cost`, where 0 is a real
+/// free-tier price and canonical 0 must win.) Overlay-only providers (e.g. a
+/// configured custom-`base_url` model absent from the canonical catalog) are
+/// kept verbatim; base-only providers are preserved.
+///
+/// The exporter persists `merge(embedded_base, router_export)` so the on-disk
+/// `model_catalog.json` stays a full superset (all researched entries + live
+/// scores for configured lanes) and never shrinks to just the configured lanes.
+/// Output is sorted by provider for deterministic diffs.
+/// Strip an OpenAI-compatible `@host` tag from the family segment of a provider
+/// key (`moonshot@api/kimi-k2.5` -> `moonshot/kimi-k2.5`). Returns `None` when
+/// there is no tag, so callers only do the extra lookup when it can differ.
+fn normalized_provider_key(provider: &str) -> Option<String> {
+    let (family, model) = provider.split_once('/')?;
+    let bare = family.split('@').next().unwrap_or(family);
+    (bare != family).then(|| format!("{bare}/{model}"))
+}
+
+pub(crate) fn merge_qos_catalog(base: &QosCatalog, overlay: &QosCatalog) -> QosCatalog {
+    // Immutable view of the canonical base, keyed by provider. Static-field
+    // lookups below consult ONLY this map — never the accumulating `by_provider`
+    // — so an overlay lane can never source its "canonical" static metadata from
+    // a prior overlay lane that merely shares a host-tag-normalized key (e.g. an
+    // overlay-only `openai/custom` followed by `openai@proxy/custom`: both are
+    // custom lanes absent from the base and must be kept verbatim, not merged
+    // into each other).
+    let base_by_provider: std::collections::HashMap<&str, &ModelCatalogEntry> = base
+        .models
+        .iter()
+        .map(|entry| (entry.provider.as_str(), entry))
+        .collect();
+    let mut by_provider: std::collections::BTreeMap<String, ModelCatalogEntry> = base
+        .models
+        .iter()
+        .map(|entry| (entry.provider.clone(), entry.clone()))
+        .collect();
+    for entry in &overlay.models {
+        // Find the canonical base entry by the exact key, then by the
+        // host-tag-stripped key — a live OpenAI-compatible lane exports a
+        // `moonshot@api/kimi-k2.5` key that must still reconcile with the
+        // untagged canonical `moonshot/kimi-k2.5` so its corrected static
+        // metadata wins. Copy the static fields out (all `Copy`) so the
+        // immutable borrow ends before the insert below.
+        let base_static = base_by_provider
+            .get(entry.provider.as_str())
+            .copied()
+            .or_else(|| {
+                normalized_provider_key(&entry.provider)
+                    .and_then(|key| base_by_provider.get(key.as_str()).copied())
+            })
+            .map(|b| {
+                (
+                    b.model_type,
+                    b.cost_in,
+                    b.cost_out,
+                    b.context_window,
+                    b.max_output,
+                    b.ds_output,
+                )
+            });
+        let merged = match base_static {
+            Some((model_type, cost_in, cost_out, context_window, max_output, ds_output)) => {
+                ModelCatalogEntry {
+                    provider: entry.provider.clone(),
+                    // Static — canonical base wins (SSOT convergence).
+                    model_type,
+                    cost_in,
+                    cost_out,
+                    context_window,
+                    max_output,
+                    // `ds_output` (deep-search quality) is static/seed-only, BUT
+                    // the canonical catalog leaves it `0` = "not evaluated". Taking
+                    // a canonical 0 unconditionally would erase a positive value
+                    // an older on-disk catalog had actually benchmarked. So the
+                    // canonical wins only when it carries an evaluated value;
+                    // otherwise the overlay's value is preserved. (`cost` differs:
+                    // 0 there is a real free-tier price, so canonical 0 must win.)
+                    ds_output: if ds_output != 0 {
+                        ds_output
+                    } else {
+                        entry.ds_output
+                    },
+                    // Dynamic — live overlay wins.
+                    stability: entry.stability,
+                    tool_avg_ms: entry.tool_avg_ms,
+                    p95_ms: entry.p95_ms,
+                    score: entry.score,
+                }
+            }
+            None => entry.clone(),
+        };
+        by_provider.insert(entry.provider.clone(), merged);
+    }
+    QosCatalog {
+        // The overlay carries the fresh export timestamp; prefer it so the file
+        // reflects when the live scores were last written.
+        updated_at: overlay.updated_at.clone(),
+        models: by_provider.into_values().collect(),
+    }
+}
+
 /// Result of wiring up the LLM provider chain together with full
 /// QoS-aware adaptive routing.
 ///
@@ -178,7 +315,19 @@ pub(crate) fn build_adaptive_provider_chain(
         .as_ref()
         .map(|cfg| cfg.qos_ranking)
         .unwrap_or(true);
-    let seed_catalog = load_seed_qos_catalog(data_dir);
+    // Merge the canonical STATIC metadata onto the on-disk seed BEFORE it seeds
+    // the router and the runtime context/pricing tables. Otherwise a stale static
+    // value in an on-disk `model_catalog.json` written by a pre-upgrade build (or
+    // hand-edited) would drive THIS process's routing scores, cost estimates, and
+    // context windows until the next restart: the persisted file is corrected
+    // below via the same merge, but the already-seeded runtime tables would keep
+    // the stale values. `embedded_base` is computed once and reused as the
+    // persist base further down.
+    let embedded_base = embedded_qos_catalog();
+    let seed_catalog = load_seed_qos_catalog(data_dir).map(|on_disk| match &embedded_base {
+        Some(base) => merge_qos_catalog(base, &on_disk),
+        None => on_disk,
+    });
 
     let runtime_qos_catalog: Option<QosCatalog> = if let Some(ref router) = adaptive_router_ref {
         // Look in data_dir first, then fall back to ~/.octos/ (shared across profiles)
@@ -232,6 +381,14 @@ pub(crate) fn build_adaptive_provider_chain(
         )
     };
 
+    // The persisted `model_catalog.json` merges the sparse live export ON TOP of
+    // the full compiled-in canonical catalog, so it stays a complete superset
+    // (all researched entries + live scores for configured lanes) rather than
+    // shrinking to just the configured lanes. This also "seeds the data-dir on
+    // first run": a fresh install writes the full catalog here immediately. Reuse
+    // the base already loaded above for the seed merge (single embed parse).
+    let persist_base = embedded_base;
+
     if let Some(ref catalog) = runtime_qos_catalog {
         let ctx_entries: Vec<(String, u64, u64)> = catalog
             .models
@@ -245,20 +402,30 @@ pub(crate) fn build_adaptive_provider_chain(
             .map(|m| (m.provider.clone(), m.cost_in, m.cost_out))
             .collect();
         octos_llm::pricing::seed_pricing_catalog(&price_entries);
-        persist_qos_catalog(&catalog_path, catalog);
+        let to_persist = match &persist_base {
+            Some(base) => merge_qos_catalog(base, catalog),
+            None => catalog.clone(),
+        };
+        persist_qos_catalog(&catalog_path, &to_persist);
     }
 
     if exporter == ExporterMode::Spawn {
         if let Some(ref router) = adaptive_router_ref {
             let metrics_router = router.clone();
             let exporter_path = catalog_path.clone();
+            // The periodic exporter merges each fresh export onto the same full
+            // base, so the 30s rewrite never shrinks the on-disk catalog.
+            let exporter_base = persist_base.clone();
             tokio::spawn(async move {
                 let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
                 loop {
                     interval.tick().await;
-                    if let Ok(json) =
-                        serde_json::to_string_pretty(&metrics_router.export_model_catalog())
-                    {
+                    let export = metrics_router.export_model_catalog();
+                    let to_write = match &exporter_base {
+                        Some(base) => merge_qos_catalog(base, &export),
+                        None => export,
+                    };
+                    if let Ok(json) = serde_json::to_string_pretty(&to_write) {
                         let _ = tokio::fs::write(&exporter_path, &json).await;
                     }
                 }
@@ -297,7 +464,11 @@ pub(crate) fn load_seed_qos_catalog(data_dir: &Path) -> Option<QosCatalog> {
             }
         }
     }
-    None
+    // Fresh install: no runtime catalog on disk yet. Fall back to the compiled-in
+    // canonical catalog so the router / context-window table / pricing table are
+    // seeded with researched values instead of cold-start zeros. (On any machine
+    // that already has a runtime catalog this branch is never reached.)
+    embedded_qos_catalog()
 }
 
 pub(crate) fn persist_qos_catalog(path: &Path, catalog: &QosCatalog) {
@@ -384,6 +555,150 @@ mod tests {
         assert_eq!(loaded.models.len(), 2);
         assert_eq!(loaded.models[0].provider, "zai/glm-5-turbo");
         assert_eq!(loaded.models[1].provider, "dashscope/qwen3.5-plus");
+    }
+
+    fn scored_entry(provider: &str, score: f64, ctx: u64) -> ModelCatalogEntry {
+        ModelCatalogEntry {
+            provider: provider.to_string(),
+            model_type: ModelType::Strong,
+            stability: 1.0,
+            tool_avg_ms: 0,
+            p95_ms: 0,
+            score,
+            cost_in: 0.0,
+            cost_out: 0.0,
+            ds_output: 0,
+            context_window: ctx,
+            max_output: 0,
+        }
+    }
+
+    /// The exporter persists `merge(embedded_base, live_export)`: every base
+    /// entry survives; for an overlapping provider the canonical STATIC metadata
+    /// (context window etc.) wins while the live DYNAMIC score is taken from the
+    /// overlay; a live-only lane is appended. This keeps the on-disk catalog a
+    /// full superset that converges to the SSOT instead of re-persisting stale
+    /// static values written before an upgrade.
+    #[test]
+    fn merge_qos_catalog_preserves_base_and_overlays_live() {
+        // Base deepseek carries an EVALUATED canonical deep-search quality (>0);
+        // the overlay's is stale, so the canonical value wins. Base glm-5.2 leaves
+        // ds_output at the `0` "not evaluated" sentinel (via `scored_entry`), so an
+        // evaluated overlay value there must be PRESERVED, not clobbered by 0.
+        let mut base_deepseek = scored_entry("deepseek/deepseek-v4-pro", 0.0, 1_048_576);
+        base_deepseek.ds_output = 1500;
+        let base = QosCatalog {
+            updated_at: "SEED".to_string(),
+            models: vec![scored_entry("zai/glm-5.2", 0.0, 1_000_000), base_deepseek],
+        };
+        let mut overlay_deepseek = scored_entry("deepseek/deepseek-v4-pro", 0.87, 999);
+        overlay_deepseek.ds_output = 1; // stale seed re-exported by the router
+        // Host-tagged lane whose bare base (`zai/glm-5.2`) is unevaluated (0);
+        // this lane carries a real benchmarked ds_output the merge must keep.
+        let mut overlay_glm = scored_entry("zai@api/glm-5.2", 0.9, 111);
+        overlay_glm.ds_output = 2222;
+        let overlay = QosCatalog {
+            updated_at: "2026-07-12T00:00:00Z".to_string(),
+            models: vec![
+                // Live score for a configured lane already in the base, but with
+                // a STALE context window + ds_output (as if seeded from a
+                // pre-upgrade catalog) — the canonical values must win.
+                overlay_deepseek,
+                // A host-tagged OpenAI-compatible lane whose bare form IS in the
+                // base — it must reconcile with `zai/glm-5.2` (stale ctx wins from
+                // canonical, live score from overlay), not be treated as new.
+                overlay_glm,
+                // … plus a lane not in the base (custom base_url model).
+                scored_entry("stub/stub-model", 0.5, 0),
+                // Two overlay-only lanes that share a host-tag-normalized key but
+                // are BOTH absent from the base. Ordered so the untagged lane is
+                // processed first: a lookup against the accumulating merge map
+                // (rather than the immutable base) would let the proxy lane copy
+                // this lane's static fields. Both must be kept verbatim instead.
+                scored_entry("openai/custom-model", 0.3, 40_000),
+                scored_entry("openai@proxy/custom-model", 0.4, 50_000),
+            ],
+        };
+
+        let merged = merge_qos_catalog(&base, &overlay);
+        // Fresh export timestamp is carried onto the merged catalog.
+        assert_eq!(merged.updated_at, "2026-07-12T00:00:00Z");
+        // base-only (zai/glm-5.2) + overlaid (deepseek) + host-tagged
+        // (zai@api/glm-5.2) + overlay-only (stub) + two custom lanes = 6.
+        assert_eq!(merged.models.len(), 6);
+        let by = |p: &str| merged.models.iter().find(|m| m.provider == p).unwrap();
+        // Base-only entry preserved (researched context window intact).
+        assert_eq!(by("zai/glm-5.2").context_window, 1_000_000);
+        assert_eq!(by("zai/glm-5.2").score, 0.0);
+        // Overlapping provider: live score wins (DYNAMIC) …
+        assert_eq!(by("deepseek/deepseek-v4-pro").score, 0.87);
+        // … but the canonical static context window wins over the stale overlay.
+        assert_eq!(
+            by("deepseek/deepseek-v4-pro").context_window,
+            1_048_576,
+            "canonical static field must win over a stale overlay value"
+        );
+        // ds_output: the canonical base has an EVALUATED value (>0), so it wins
+        // over the stale overlay.
+        assert_eq!(
+            by("deepseek/deepseek-v4-pro").ds_output,
+            1500,
+            "evaluated canonical ds_output must win over a stale overlay value"
+        );
+        // Host-tagged lane reconciled with the bare canonical base: canonical
+        // static context window, live overlay score.
+        assert_eq!(
+            by("zai@api/glm-5.2").context_window,
+            1_000_000,
+            "host-tagged lane converges to canonical static via key normalization"
+        );
+        assert_eq!(by("zai@api/glm-5.2").score, 0.9);
+        // …but the canonical ds_output for glm-5.2 is the `0` "not evaluated"
+        // sentinel, so the overlay's benchmarked value must be PRESERVED, not
+        // erased to 0.
+        assert_eq!(
+            by("zai@api/glm-5.2").ds_output,
+            2222,
+            "an evaluated overlay ds_output survives when the canonical value is the 0 sentinel"
+        );
+        // Overlay-only lane appended.
+        assert_eq!(by("stub/stub-model").score, 0.5);
+        // Both overlay-only custom lanes are kept verbatim — the proxy lane does
+        // NOT source its static metadata from the untagged lane processed before
+        // it (that would happen if lookups consulted the accumulating merge map).
+        assert_eq!(by("openai/custom-model").context_window, 40_000);
+        assert_eq!(
+            by("openai@proxy/custom-model").context_window,
+            50_000,
+            "overlay-only proxy lane must keep its own static, not copy a sibling overlay lane"
+        );
+        // Deterministic (sorted-by-provider) output.
+        let providers: Vec<&str> = merged.models.iter().map(|m| m.provider.as_str()).collect();
+        let mut sorted = providers.clone();
+        sorted.sort_unstable();
+        assert_eq!(providers, sorted);
+    }
+
+    /// The compiled-in canonical catalog (the seed floor for fresh installs) is
+    /// well-formed and reflects curation: glm-5.2 + kimi-k2.6 present,
+    /// deepseek-chat removed.
+    #[test]
+    fn embedded_qos_catalog_is_curated_ssot() {
+        let catalog = embedded_qos_catalog().expect("embedded canonical catalog must parse");
+        let has = |p: &str| catalog.models.iter().any(|m| m.provider == p);
+        assert!(has("zai/glm-5.2"), "glm-5.2 present");
+        assert!(has("moonshot/kimi-k2.6"), "kimi-k2.6 present");
+        assert!(
+            !has("deepseek/deepseek-chat"),
+            "deepseek-chat curated out of the embedded catalog"
+        );
+        // Researched context window survives the round-trip through the embed.
+        let glm52 = catalog
+            .models
+            .iter()
+            .find(|m| m.provider == "zai/glm-5.2")
+            .unwrap();
+        assert_eq!(glm52.context_window, 1_000_000);
     }
 
     #[test]
@@ -631,8 +946,14 @@ mod tests {
             "AdaptiveRouter should be present when fallback build succeeds"
         );
 
-        // (b) seed fields propagated into the runtime catalog via
-        //     seed_catalog → router.export_model_catalog.
+        // (b) The RUNNING process's runtime catalog converges to the canonical
+        //     SSOT for STATIC fields, exactly like the persisted file in (e) —
+        //     not only the on-disk file. The seed is merged with the embedded
+        //     canonical base BEFORE it seeds the router, so the host-tagged
+        //     `ollama@…/llama3.2` lane carries the canonical context window
+        //     (131072) and max output (131072), NOT the stale on-disk seed's
+        //     128000 / 8192. Without that pre-seed merge the live process would
+        //     route/cost/size with the stale values until the next restart.
         let runtime = bundle
             .runtime_qos_catalog
             .as_ref()
@@ -643,17 +964,35 @@ mod tests {
             .find(|m| m.provider == ollama_key)
             .expect("ollama lane should be present in runtime catalog");
         assert_eq!(
-            ollama_entry.context_window, 128_000,
-            "context_window from seed should survive into runtime export"
+            ollama_entry.context_window, 131_072,
+            "runtime lane uses the canonical static context window, not the stale on-disk seed"
         );
         assert_eq!(
-            ollama_entry.max_output, 8_192,
-            "max_output from seed should survive into runtime export"
+            ollama_entry.max_output, 131_072,
+            "runtime lane uses the canonical static max output, not the stale on-disk seed"
         );
         assert_eq!(
             ollama_entry.model_type,
             ModelType::Strong,
-            "model_type from seed should survive into runtime export"
+            "model_type carries through (canonical and seed agree here)"
+        );
+
+        // The overlay-only `stub/stub-model` lane has no canonical entry, so the
+        // running process keeps its seed static verbatim — proving the pre-seed
+        // merge is field-level (canonical for known lanes, verbatim otherwise),
+        // not a blanket replacement.
+        let stub_entry = runtime
+            .models
+            .iter()
+            .find(|m| m.provider == stub_key)
+            .expect("stub lane should be present in runtime catalog");
+        assert_eq!(
+            stub_entry.context_window, 64_000,
+            "overlay-only lane keeps its seed static context window"
+        );
+        assert_eq!(
+            stub_entry.max_output, 4_096,
+            "overlay-only lane keeps its seed static max output"
         );
 
         // (c) `seed_baseline` actually ran. We know because:
@@ -675,8 +1014,13 @@ mod tests {
             ollama_entry.stability
         );
 
-        // (e) persisted file reflects the runtime, not just the cold
-        //     seed (catalog gets rewritten with router-derived data).
+        // (e) persisted file reflects runtime DYNAMIC state while converging to
+        //     the canonical SSOT for STATIC fields. The ollama lane's provider
+        //     key carries the OpenAI-flavored host suffix (`ollama@…/llama3.2`);
+        //     the merge strips that tag to reconcile it with the embedded
+        //     canonical `ollama/llama3.2`, so the persisted lane gets the
+        //     canonical static context window (131072, NOT the seed's 128000)
+        //     with the blended runtime stability layered on.
         let persisted_json = std::fs::read_to_string(data_dir.join("model_catalog.json"))
             .expect("persisted catalog readable");
         let persisted: QosCatalog = serde_json::from_str(&persisted_json).unwrap();
@@ -685,8 +1029,15 @@ mod tests {
             .iter()
             .find(|m| m.provider == ollama_key)
             .expect("ollama lane should be in persisted catalog");
-        assert_eq!(persisted_ollama.context_window, 128_000);
-        assert_eq!(persisted_ollama.max_output, 8_192);
+        // Dynamic runtime state persisted (blended stability, not the raw 0.88).
+        assert!(
+            persisted_ollama.stability < 0.85 && persisted_ollama.stability > 0.65,
+            "persisted stability is the blended runtime value: {}",
+            persisted_ollama.stability
+        );
+        // Static converged to the canonical catalog despite the host-tagged key.
+        assert_eq!(persisted_ollama.context_window, 131_072);
+        assert_eq!(persisted_ollama.max_output, 131_072);
     }
 
     /// A1 regression: `adaptive_routing.enabled = false` MUST NOT

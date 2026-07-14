@@ -94,8 +94,21 @@ function getModelPricing(provider: string, modelId: string): ModelEntry | null {
   return findModelEntry(provider, modelId) || null
 }
 
-function formatPrice(p: ModelEntry): string {
-  if (p.input === 0 && p.output === 0) return 'Free (local)'
+/** Local providers (e.g. ollama) need no API key, so their family `env` is
+ * empty. Remote providers — including free-tier NVIDIA — always require a key. */
+function isLocalProvider(provider: string): boolean {
+  return PROVIDER_MODELS[provider]?.env === ''
+}
+
+function formatPrice(p: ModelEntry, isLocal = false): string {
+  // Zero pricing for a LOCAL provider is genuinely free. For a REMOTE provider
+  // (e.g. NVIDIA's free tier) a 0/0 catalog entry does NOT guarantee zero spend:
+  // the runtime cost estimator prices by bare model id, and when that id is
+  // shared with a paid native/re-host lane it resolves to that lane's rate (it
+  // cannot tell which host actually served the request without provider-aware
+  // pricing). Advertising such a model as "Free" would contradict the nonzero
+  // cost the usage ledger records, so show it as unpriced instead of "Free".
+  if (p.input === 0 && p.output === 0) return isLocal ? 'Free (local)' : 'Not listed'
   return `$${p.input}/M in, $${p.output}/M out`
 }
 
@@ -561,6 +574,7 @@ export default function LlmProviderTab({ config, onChange, profileId }: Props) {
 
         <TestButton
           result={testResults[-1] || null}
+          isLocal={isLocalProvider(primaryProvider || 'anthropic')}
           onTest={() => doTest(
             -1,
             primaryProvider || 'anthropic',
@@ -673,6 +687,7 @@ export default function LlmProviderTab({ config, onChange, profileId }: Props) {
 
               <TestButton
                 result={testResults[idx] || null}
+                isLocal={isLocalProvider(fbProvider)}
                 onTest={() => doTest(
                   idx,
                   fbProvider,
@@ -876,7 +891,7 @@ function ModelSelect({ provider, model, baseUrl, onModelChange, fetchedModels }:
   )
 }
 
-function TestButton({ result, onTest }: { result: TestResult | null; onTest: () => void }) {
+function TestButton({ result, onTest, isLocal }: { result: TestResult | null; onTest: () => void; isLocal?: boolean }) {
   const state = result?.state || 'idle'
   return (
     <div className="space-y-1">
@@ -899,7 +914,7 @@ function TestButton({ result, onTest }: { result: TestResult | null; onTest: () 
       </button>
       {state === 'success' && result?.pricing && (
         <p className="text-xs text-green-400/80 pl-1">
-          {formatPrice(result.pricing)}
+          {formatPrice(result.pricing, isLocal)}
         </p>
       )}
       {state === 'error' && result?.error && (

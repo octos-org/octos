@@ -181,6 +181,10 @@ const APPUI_METHOD_PROFILE_LLM_LIST: &str = "profile/llm/list";
 const APPUI_METHOD_PROFILE_LLM_SELECT: &str = "profile/llm/select";
 const APPUI_METHOD_MCP_STATUS_LIST: &str = "mcp/status/list";
 const APPUI_METHOD_TOOL_STATUS_LIST: &str = "tool/status/list";
+/// Manual, on-demand context compaction for an open session (the `/compact`
+/// TUI command). Forces the compaction pass regardless of the auto-compaction
+/// threshold; AppUI-only, so a local literal like the other AppUI methods.
+const APPUI_METHOD_SESSION_COMPACT: &str = "session/compact";
 const APPUI_METHOD_AUTH_STATUS: &str = "auth/status";
 const APPUI_METHOD_AUTH_SEND_CODE: &str = "auth/send_code";
 const APPUI_METHOD_AUTH_VERIFY: &str = "auth/verify";
@@ -206,7 +210,13 @@ const APPUI_METHOD_PROFILE_SKILLS_REMOVE: &str = "profile/skills/remove";
 /// see the same typed shape they get from `profile/local/create`.
 const APPUI_METHOD_ONBOARDING_WORKSPACE_PROBE: &str = "onboarding/workspace_probe";
 const APPUI_METHOD_REVIEW_START: &str = octos_core::ui_protocol::methods::REVIEW_START;
-const DASHBOARD_PROVIDERS_JSON: &str = include_str!("../../../../dashboard/src/providers.json");
+
+/// The canonical model catalog — the single source of truth for provisionable
+/// models (`model_catalog.json`). Compiled in so onboarding always has the full
+/// catalog. This aliases the single embedded copy owned by `qos_catalog` (which
+/// also seeds the router / context / pricing tables), so there is exactly one
+/// compiled-in catalog across the crate.
+use crate::qos_catalog::EMBEDDED_MODEL_CATALOG as CANONICAL_MODEL_CATALOG;
 const APPUI_FEATURE_PROFILE_LOCAL_CREATE_V1: &str = "profile.local_create.v1";
 /// Additive capability: the server understands the optional `requested_id`
 /// field on `profile/local/create` (and treats `username`/`email` as
@@ -258,6 +268,7 @@ const APPUI_EXTRA_METHODS: &[&str] = &[
     APPUI_METHOD_PROFILE_SKILLS_REMOVE,
     APPUI_METHOD_ONBOARDING_WORKSPACE_PROBE,
     octos_core::ui_protocol::methods::SESSION_BTW,
+    APPUI_METHOD_SESSION_COMPACT,
 ];
 const APPUI_STDIO_AUTH_BOUND_UNAVAILABLE_METHODS: &[&str] = &[
     APPUI_METHOD_AUTH_ME,
@@ -2086,13 +2097,13 @@ fn appui_compaction_summary(
     if let Some(summary) = octos_agent::compaction::llm_compaction_summary(
         llm_provider,
         messages,
-        budget_tokens,
         std::time::Duration::from_secs(
             octos_agent::compaction::DEFAULT_LLM_COMPACTION_TIMEOUT_SECS,
         ),
     ) {
         return summary;
     }
+    // Heuristic fallback still uses the summary-size budget (correct there).
     octos_agent::compaction::compact_messages(messages, budget_tokens)
 }
 
@@ -2191,6 +2202,158 @@ fn appui_context_history_for_agent(
         Arc::new(StdMutex::new(manager)),
         lifecycle_notifications,
     )
+}
+
+/// Force a context-compaction pass on a session's ledger, bypassing the
+/// auto-compaction threshold. Powers the manual `session/compact` UI method.
+///
+/// Mirrors the pre-turn path [`appui_context_history_for_agent`] but always runs
+/// the compaction body (no `token_estimate > threshold` gate). Returns the
+/// lifecycle notifications to emit (`ContextCompactionStarted` + `Completed`)
+/// and a small result value (`token_estimate` before/after) for the RPC reply.
+fn appui_force_compact_context(
+    data_dir: &Path,
+    session_id: &SessionKey,
+    history: &[Message],
+    llm_provider: &Arc<dyn octos_llm::LlmProvider>,
+    llm_compaction_enabled: bool,
+) -> (Vec<UiNotification>, serde_json::Value) {
+    const TRIGGER: &str = "appui_manual_compact";
+    let (mut manager, ledger_status) =
+        load_or_rebuild_context_manager(data_dir, session_id.to_string(), None, history);
+    tracing::debug!(
+        session = %session_id.0,
+        ledger_status = ?ledger_status,
+        "appui context manager loaded for manual compaction"
+    );
+    let threshold = appui_context_compact_threshold_tokens(llm_provider.as_ref());
+    let policy = appui_context_prompt_policy(llm_provider.as_ref());
+    let mut lifecycle_notifications = Vec::new();
+    // Forced: unlike the pre-turn path there is no `token_estimate > threshold`
+    // gate — the user explicitly asked to compact now.
+    lifecycle_notifications.push(UiNotification::ContextCompactionStarted(
+        ContextCompactionStartedEvent {
+            session_id: session_id.clone(),
+            context_state: ui_context_state_for(session_id, &manager),
+            trigger: TRIGGER.to_owned(),
+            threshold_tokens: threshold,
+        },
+    ));
+    let before = manager.for_prompt(&policy);
+    let summary_budget = threshold.clamp(256, 4096) as u32;
+    let summary = if llm_compaction_enabled {
+        appui_compaction_summary(llm_provider, &before.messages, summary_budget)
+    } else {
+        octos_agent::compaction::compact_messages(&before.messages, summary_budget)
+    };
+    let record = manager.compact_context(
+        summary,
+        CompactContextPolicy {
+            trigger: TRIGGER.to_owned(),
+            keep_recent_items: appui_context_compact_keep_items(),
+            ..CompactContextPolicy::default()
+        },
+    );
+    info!(
+        session = %session_id.0,
+        compaction_id = %record.compaction_id.as_str(),
+        token_estimate_before = record.token_estimate_before,
+        token_estimate_after = ?record.token_estimate_after,
+        trigger = TRIGGER,
+        "appui manual compact_context installed"
+    );
+    let result = serde_json::json!({
+        "session_id": session_id.to_string(),
+        "compacted": true,
+        "token_estimate_before": record.token_estimate_before,
+        "token_estimate_after": record.token_estimate_after,
+    });
+    lifecycle_notifications.push(appui_context_compaction_notification(
+        session_id, &manager, &record,
+    ));
+    publish_appui_context_status(session_id, &manager);
+    if let Err(error) =
+        persist_context_manager_snapshot(data_dir, &session_id.to_string(), &manager)
+    {
+        warn!(
+            session = %session_id.0,
+            error = %error,
+            "failed to persist appui context manager snapshot after manual compaction"
+        );
+    }
+    (lifecycle_notifications, result)
+}
+
+/// `session/compact`: force a context-compaction pass on an open session,
+/// bypassing the auto-compaction threshold (powers the manual `/compact`
+/// command). Resolves the already-open session runtime — a cache hit for the
+/// active session — mirroring [`tool_status_list_result`]'s resolution, then
+/// runs [`appui_force_compact_context`] and emits its lifecycle notifications
+/// so clients render the compaction the same way they do the automatic pass.
+async fn handle_session_compact(
+    ws: &WsConnection,
+    state: &Arc<AppState>,
+    ledger: &Arc<UiProtocolLedger>,
+    features: ConnectionUiFeatures,
+    connection_profile_id: Option<&str>,
+    request: &RpcRequest<Value>,
+) -> Result<Value, RpcError> {
+    let params: RawProfileParams = parse_raw_params(request)?;
+    let Some(session_id) = params.session_id.clone() else {
+        return Err(RpcError::invalid_params("session_id is required"));
+    };
+    let profile_id = raw_profile_id(&params, connection_profile_id);
+    let Some(profile_runtime) = ensure_session_profile_runtime(state, Some(&profile_id)).await?
+    else {
+        return Err(runtime_unavailable_error(format!(
+            "no runtime for profile {profile_id}; cannot compact session {session_id}"
+        )));
+    };
+    // Epoch BEFORE permission resolution (codex #1639). For an already-open
+    // session this is a cache hit that returns the existing runtime.
+    let permissions_epoch = state.session_cache.session_generation(&session_id);
+    let permissions = effective_permissions_for_session(state, &session_id)?;
+    let workspace_hint = session_workspaces().get(&session_id);
+    let session_runtime = state
+        .session_cache
+        .get_or_init_with_permissions(
+            &profile_runtime,
+            session_id.clone(),
+            workspace_hint,
+            permissions,
+            permissions_epoch,
+        )
+        .await
+        .map_err(|error| {
+            runtime_unavailable_error(format!("failed to resolve session runtime: {error}"))
+        })?;
+
+    let llm_provider = session_runtime.profile.llm.clone();
+    // #1666: the per-project ledger lives under `sessions_root`, not
+    // `profile.data_dir` — the forced path must touch the SAME ledger the
+    // pre-turn path uses.
+    let data_dir = session_runtime.sessions_root.clone();
+    let history: Vec<Message> = {
+        let mut sessions = session_runtime.sessions.lock().await;
+        let session = sessions.get_or_create(&session_id).await;
+        session.get_history(50).to_vec()
+    };
+
+    let (notifications, result) = appui_force_compact_context(
+        &data_dir,
+        &session_id,
+        &history,
+        &llm_provider,
+        state.llm_compaction,
+    );
+    for notification in notifications {
+        if features.context_lifecycle_available() {
+            let _ = send_notification_durable(ws, ledger, notification);
+        } else {
+            let _ = ledger.append_notification_from(notification, ws.connection_id);
+        }
+    }
+    Ok(result)
 }
 
 fn prompt_message_matches(left: &Message, right: &Message) -> bool {
@@ -7812,61 +7975,81 @@ fn model_list_result(
     json!({ "session_id": session_id, "models": models })
 }
 
-fn raw_catalog_result(state: &AppState, profile_id: Option<&str>) -> Result<Value, RpcError> {
-    let mut families = serde_json::from_str::<Value>(DASHBOARD_PROVIDERS_JSON).map_err(|err| {
-        RpcError::internal_error(format!("dashboard provider catalog was not JSON: {err}"))
-    })?;
-    // Union in the QoS model catalog (model_catalog.json): it tracks the LIVE
-    // model lineup per provider (e.g. new zai GLM releases) while the bundled
-    // dashboard catalog is hand-maintained and lags. Only models are merged —
-    // a family absent from the bundled catalog has no key-env/route metadata,
-    // so it cannot be onboarded and is skipped.
-    // Per-profile QoS catalogs live under `profiles/<id>/data`
-    // (`ProfileRuntime::bootstrap` exports them there); the octos-home file
-    // is the shared seed. Merge the requesting profile's catalog first, then
-    // the home seed (`load_seed_qos_catalog` also falls back to `~/.octos`).
-    let mut sources = Vec::new();
-    if let Some(store) = state.profile_store.as_ref() {
-        if let Some(profile) =
-            profile_id.and_then(|profile_id| store.get(profile_id).ok().flatten())
-        {
-            // Honors `UserProfile.data_dir` overrides — the same resolution
-            // `ProfileRuntime::bootstrap` uses when it exports the catalog.
-            sources.push(store.resolve_data_dir(&profile));
-        }
-        sources.push(store.octos_home_dir().to_path_buf());
-    }
-    for qos in sources
-        .iter()
-        .filter_map(|dir| crate::qos_catalog::load_seed_qos_catalog(dir))
-    {
-        if let Some(families_map) = families.as_object_mut() {
-            for entry in &qos.models {
-                let Some((family_id, model_id)) = entry.provider.split_once('/') else {
-                    continue;
-                };
-                let Some(models) = families_map
-                    .get_mut(family_id)
-                    .and_then(|family| family.get_mut("models"))
-                    .and_then(Value::as_array_mut)
-                else {
-                    continue;
-                };
-                let known = models
-                    .iter()
-                    .any(|model| model.get("id").and_then(Value::as_str) == Some(model_id));
-                if !known {
-                    models.push(json!({
-                        "id": model_id,
-                        "input": entry.cost_in,
-                        "output": entry.cost_out,
-                        "max_output": entry.max_output,
-                    }));
-                }
+fn raw_catalog_result(_state: &AppState, _profile_id: Option<&str>) -> Result<Value, RpcError> {
+    // The onboarding catalog is the compiled-in canonical model_catalog.json
+    // (the model-provisioning SSOT) projected through the provider REGISTRY for
+    // family key-env metadata. providers.json is retired (now a derived,
+    // web-only artifact).
+    //
+    // The runtime QoS catalogs (per-profile data-dir + `~/.octos` seed) are
+    // deliberately NOT unioned here. Configured providers are a *subset* of the
+    // catalog, so a live QoS catalog can only ever (a) re-introduce a model that
+    // was deliberately curated out — it still lists whatever was once
+    // configured — or (b) zero out a researched context window with a QoS entry
+    // that never carried one. Neither is desirable: the canonical catalog is the
+    // single source of truth for what is provisionable, and new models are added
+    // by editing it (and shipping the updated file), which is the whole point of
+    // an SSOT. Live QoS still drives *routing* via the adaptive chain; that path
+    // is untouched.
+    //
+    // Families with no registry entry have no key-env/route metadata and can't
+    // be onboarded, so they're skipped.
+    let canonical: octos_llm::QosCatalog = serde_json::from_str(CANONICAL_MODEL_CATALOG)
+        .map_err(|error| RpcError::internal_error(format!("canonical model catalog: {error}")))?;
+
+    // `endpoints` (alternative provisioning routes — e.g. AutoDL/WiseModel) is
+    // onboarding metadata that `ModelCatalogEntry` doesn't model, so read it
+    // straight from the canonical JSON keyed by `provider`. This keeps the TUI
+    // onboarding route-picker (Official + alternatives) that the retired
+    // providers.json used to supply, without polluting the routing catalog type.
+    let endpoints_by_provider: std::collections::HashMap<String, Value> =
+        serde_json::from_str::<Value>(CANONICAL_MODEL_CATALOG)
+            .ok()
+            .and_then(|catalog| catalog.get("models").and_then(Value::as_array).cloned())
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|model| {
+                let provider = model.get("provider")?.as_str()?.to_owned();
+                let endpoints = model.get("endpoints")?.clone();
+                Some((provider, endpoints))
+            })
+            .collect();
+
+    let mut families = serde_json::Map::new();
+    for entry in &canonical.models {
+        let Some((family_id, model_id)) = entry.provider.split_once('/') else {
+            continue;
+        };
+        // Canonicalize the family via the registry (handles aliases:
+        // google->gemini, qwen->dashscope, glm->zhipu). A family with no
+        // registry entry has no key-env/route and can't be onboarded.
+        let Some(reg) = octos_llm::registry::lookup(family_id) else {
+            continue;
+        };
+        let family = families
+            .entry(reg.name.to_owned())
+            .or_insert_with(|| json!({ "env": reg.api_key_env.unwrap_or(""), "models": [] }));
+        let Some(models) = family.get_mut("models").and_then(Value::as_array_mut) else {
+            continue;
+        };
+        let known = models
+            .iter()
+            .any(|model| model.get("id").and_then(Value::as_str) == Some(model_id));
+        if !known {
+            let mut model_json = json!({
+                "id": model_id,
+                "input": entry.cost_in,
+                "output": entry.cost_out,
+                "max_output": entry.max_output,
+                "context_window": entry.context_window,
+            });
+            if let Some(endpoints) = endpoints_by_provider.get(&entry.provider) {
+                model_json["endpoints"] = endpoints.clone();
             }
+            models.push(model_json);
         }
     }
-    Ok(json!({ "families": families }))
+    Ok(json!({ "families": Value::Object(families) }))
 }
 
 async fn raw_session_status_result(
@@ -8859,15 +9042,11 @@ fn build_test_llm_provider(
 }
 
 fn dashboard_family_api_key_env(family_id: &str) -> Option<String> {
-    serde_json::from_str::<Value>(DASHBOARD_PROVIDERS_JSON)
-        .ok()
-        .and_then(|catalog| {
-            catalog
-                .get(family_id)?
-                .get("env")?
-                .as_str()
-                .map(str::to_owned)
-        })
+    // Key-env now comes from the provider registry (single source of truth),
+    // not the retired dashboard providers.json. `lookup` resolves aliases too.
+    octos_llm::registry::lookup(family_id)
+        .and_then(|entry| entry.api_key_env)
+        .map(str::to_owned)
         .and_then(|env| nonempty(Some(env)))
 }
 
@@ -9282,6 +9461,10 @@ async fn handle_raw_appui_rpc(
         }
         APPUI_METHOD_SESSION_STATUS_READ => {
             raw_session_status_result(state, request, features, connection_profile_id).await
+        }
+        APPUI_METHOD_SESSION_COMPACT => {
+            handle_session_compact(ws, state, ledger, features, connection_profile_id, request)
+                .await
         }
         APPUI_METHOD_PROFILE_LLM_CATALOG => raw_catalog_result(state, connection_profile_id),
         APPUI_METHOD_PROFILE_LLM_LIST => {
@@ -9725,6 +9908,7 @@ fn raw_method_is_dispatched(method: &str, stdio_transport: bool) -> bool {
             | APPUI_METHOD_MCP_STATUS_LIST
             | APPUI_METHOD_TOOL_STATUS_LIST
             | APPUI_METHOD_ONBOARDING_WORKSPACE_PROBE
+            | APPUI_METHOD_SESSION_COMPACT
     ) {
         return true;
     }
@@ -28292,45 +28476,35 @@ mod tests {
         );
     }
 
-    /// The onboarding catalog unions the QoS model catalog into the bundled
-    /// families — new provider releases (e.g. zai GLM updates) appear without
-    /// waiting for the hand-maintained dashboard list; families with no
-    /// onboarding metadata (key env/route) are skipped.
+    /// The onboarding catalog is the canonical model_catalog.json — the SSOT —
+    /// and is NOT unioned with the runtime QoS catalog. A live QoS catalog only
+    /// reflects already-configured providers (a subset of the catalog), so
+    /// unioning it could only re-introduce curated-out models or zero out
+    /// researched context windows. This guards that regression: a model present
+    /// in the runtime QoS catalog but absent from the canonical catalog must NOT
+    /// appear in onboarding.
     #[test]
-    fn catalog_result_unions_qos_models_into_families() {
+    fn catalog_result_ignores_runtime_qos_not_in_canonical() {
         let dir = tempfile::tempdir().unwrap();
+        // `octos_home_dir()` resolves to `dir` for this store, so this file is
+        // the seed QoS catalog the OLD union path would have read.
         std::fs::write(
             dir.path().join("model_catalog.json"),
             serde_json::to_string(&json!({
                 "updated_at": "2026-07-10T00:00:00Z",
-                "models": [
-                    {
-                        "provider": "zai/glm-9.9-test",
-                        "type": "strong",
-                        "stability": 0.7,
-                        "tool_avg_ms": 1,
-                        "p95_ms": 1,
-                        "score": 0.1,
-                        "cost_in": 1.0,
-                        "cost_out": 4.0,
-                        "ds_output": 1,
-                        "context_window": 1000,
-                        "max_output": 99
-                    },
-                    {
-                        "provider": "unknownfam/mystery-1",
-                        "type": "fast",
-                        "stability": 0.5,
-                        "tool_avg_ms": 1,
-                        "p95_ms": 1,
-                        "score": 0.2,
-                        "cost_in": 0.1,
-                        "cost_out": 0.2,
-                        "ds_output": 1,
-                        "context_window": 1000,
-                        "max_output": 9
-                    }
-                ]
+                "models": [{
+                    "provider": "zai/glm-9.9-not-in-catalog",
+                    "type": "strong",
+                    "stability": 0.7,
+                    "tool_avg_ms": 1,
+                    "p95_ms": 1,
+                    "score": 0.1,
+                    "cost_in": 1.0,
+                    "cost_out": 4.0,
+                    "ds_output": 1,
+                    "context_window": 1000,
+                    "max_output": 99
+                }]
             }))
             .unwrap(),
         )
@@ -28340,17 +28514,86 @@ mod tests {
         let catalog = raw_catalog_result(&state, None).expect("catalog");
         let families = &catalog["families"];
         let zai_models = families["zai"]["models"].as_array().unwrap();
-        assert!(
-            zai_models.iter().any(|model| model["id"] == "glm-9.9-test"),
-            "QoS-only zai model unioned in: {zai_models:?}"
-        );
+        // Canonical lineup is present …
         assert!(
             zai_models.iter().any(|model| model["id"] == "glm-5.2"),
-            "bundled zai lineup still present"
+            "canonical zai lineup present: {zai_models:?}"
+        );
+        // … but the runtime-QoS-only model does NOT leak into onboarding: the
+        // canonical catalog is the single source of truth for what's
+        // provisionable.
+        assert!(
+            !zai_models
+                .iter()
+                .any(|model| model["id"] == "glm-9.9-not-in-catalog"),
+            "runtime-QoS-only model must not appear in onboarding: {zai_models:?}"
+        );
+    }
+
+    #[test]
+    fn catalog_result_sourced_from_registry_and_canonical_catalog() {
+        // With no runtime data-dir catalog, the onboarding catalog is fully
+        // populated from the compiled-in canonical model_catalog.json (the SSOT)
+        // with family key-env from the provider registry — providers.json is no
+        // longer the source.
+        let dir = tempfile::tempdir().unwrap();
+        let state = local_profile_state(dir.path());
+        let catalog = raw_catalog_result(&state, None).expect("catalog");
+        let families = catalog["families"].as_object().expect("families object");
+
+        let ids = |fam: &str| -> Vec<String> {
+            families[fam]["models"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|m| m["id"].as_str().map(str::to_owned))
+                .collect()
+        };
+
+        // Key-env comes from the registry, not a hand-maintained env map.
+        assert_eq!(families["zai"]["env"], "ZAI_API_KEY");
+        // Curation: glm-5.2 + kimi-k2.6 present; deepseek-chat removed.
+        assert!(
+            ids("zai").contains(&"glm-5.2".to_owned()),
+            "{:?}",
+            ids("zai")
         );
         assert!(
-            families.get("unknownfam").is_none(),
-            "families without onboarding metadata are skipped"
+            ids("moonshot").contains(&"kimi-k2.6".to_owned()),
+            "{:?}",
+            ids("moonshot")
+        );
+        assert!(
+            !ids("deepseek").contains(&"deepseek-chat".to_owned()),
+            "deepseek-chat curated out: {:?}",
+            ids("deepseek")
+        );
+        assert!(ids("deepseek").contains(&"deepseek-v4-pro".to_owned()));
+
+        // Researched context window flows through to the catalog (glm-5.2 = 1M).
+        let glm52 = families["zai"]["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["id"] == "glm-5.2")
+            .unwrap();
+        assert_eq!(glm52["context_window"], 1_000_000);
+
+        // Alternative provisioning endpoints (AutoDL/WiseModel) survive into the
+        // onboarding catalog so the TUI route-picker keeps its choices — this was
+        // supplied by the retired providers.json and must not be lost.
+        let v4pro = families["deepseek"]["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["id"] == "deepseek-v4-pro")
+            .unwrap();
+        let endpoints = v4pro["endpoints"].as_array().expect("v4-pro has endpoints");
+        assert!(
+            endpoints
+                .iter()
+                .any(|e| e["id"] == "autodl" && e["api_key_env"] == "AUTODL_API_KEY"),
+            "AutoDL alternative endpoint present: {endpoints:?}"
         );
     }
 
@@ -28569,6 +28812,7 @@ mod tests {
             }),
             methods::ROUTER_GET_METRICS => json!({ "session_id": session_id }),
             methods::LAUNCH_RESOLVE => json!({ "cwd": "/tmp/probe-launch-resolve" }),
+            APPUI_METHOD_SESSION_COMPACT => json!({ "session_id": session_id }),
             other => panic!("missing AppUI dispatch probe params for {other}"),
         };
 
