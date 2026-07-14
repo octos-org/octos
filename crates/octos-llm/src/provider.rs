@@ -107,10 +107,12 @@ pub(crate) fn endpoint_label_from_base_url(url: &str) -> Option<String> {
 /// Truncate an API error body to avoid leaking verbose internal details.
 /// Keeps the first 200 chars which typically contain the error message/code.
 pub(crate) fn truncate_error_body(body: &str) -> String {
-    if body.len() <= 200 {
-        body.to_string()
-    } else {
-        format!("{}... ({} bytes total)", &body[..200], body.len())
+    // Truncate on a char boundary, not a raw byte index: API error bodies are
+    // often non-ASCII (e.g. Chinese providers like zhipu/minimax/moonshot), and
+    // slicing at byte 200 mid-codepoint would panic.
+    match body.char_indices().nth(200) {
+        Some((cut, _)) => format!("{}... ({} bytes total)", &body[..cut], body.len()),
+        None => body.to_string(),
     }
 }
 
@@ -169,6 +171,17 @@ mod tests {
     #[test]
     fn test_truncate_error_body_empty() {
         assert_eq!(truncate_error_body(""), "");
+    }
+
+    #[test]
+    fn should_not_panic_when_truncating_multibyte_utf8_body() {
+        // Regression: byte-index slicing at 200 could land mid-codepoint and
+        // panic on non-ASCII error bodies (e.g. Chinese providers).
+        let body = "错误".repeat(500); // each char is 3 bytes, > 200 chars total
+        let result = truncate_error_body(&body);
+        assert!(result.contains("bytes total"));
+        // The kept prefix must itself be valid UTF-8 (no panic, no mojibake).
+        assert!(result.starts_with("错误"));
     }
 
     #[test]

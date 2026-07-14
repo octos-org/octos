@@ -1097,7 +1097,15 @@ fn cmd_validate(path: &Path, auto_repair: bool) -> Result<()> {
         let rels_parent = entry.parent().and_then(|p| p.parent()).unwrap_or(&dir);
 
         for target in parse_all_rels_targets(&xml) {
-            let resolved = rels_parent.join(&target);
+            // OPC relationship targets may be package-absolute (leading '/',
+            // resolved from the package root) or relative to the .rels file's
+            // parent part. `PathBuf::join` replaces the base on an absolute
+            // component, so an absolute target like "/xl/worksheets/sheet1.xml"
+            // must be re-rooted at `dir`, not joined onto `rels_parent`.
+            let resolved = match target.strip_prefix('/') {
+                Some(abs) => dir.join(abs),
+                None => rels_parent.join(&target),
+            };
             if !resolved.exists() {
                 let rel_from = entry.strip_prefix(&dir).unwrap_or(&entry);
                 issues.push(format!(

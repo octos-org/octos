@@ -200,6 +200,9 @@ fn cmd_add(
     to: Option<String>,
 ) -> Result<()> {
     let schedule = if let Some(secs) = every {
+        if secs <= 0 {
+            eyre::bail!("--every must be a positive number of seconds (got {secs})");
+        }
         CronSchedule::Every {
             every_ms: secs * 1000,
         }
@@ -256,10 +259,10 @@ fn cmd_remove(store_path: &std::path::Path, job_id: &str) -> Result<()> {
     if store.jobs.len() < before {
         save_store(store_path, &store)?;
         println!("{} Removed job {}", "OK".green(), job_id.cyan());
+        Ok(())
     } else {
-        println!("{}", format!("Job {job_id} not found.").red());
+        eyre::bail!("Job {job_id} not found.");
     }
-    Ok(())
 }
 
 fn cmd_enable(store_path: &std::path::Path, job_id: &str, enabled: bool) -> Result<()> {
@@ -284,10 +287,10 @@ fn cmd_enable(store_path: &std::path::Path, job_id: &str, enabled: bool) -> Resu
             name,
             job_id.cyan()
         );
+        Ok(())
     } else {
-        println!("{}", format!("Job {job_id} not found.").red());
+        eyre::bail!("Job {job_id} not found.");
     }
-    Ok(())
 }
 
 fn short_id() -> String {

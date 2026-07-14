@@ -35,7 +35,7 @@ const PROVIDER_ENV_VARS: &[(&str, &str)] = &[
     ("OpenRouter", "OPENROUTER_API_KEY"),
     ("DeepSeek", "DEEPSEEK_API_KEY"),
     ("Groq", "GROQ_API_KEY"),
-    ("Moonshot", "MOONSHOT_API_KEY"),
+    ("Moonshot", "KIMI_API_KEY"),
     ("DashScope", "DASHSCOPE_API_KEY"),
     ("MiniMax", "MINIMAX_API_KEY"),
     ("Zhipu", "ZHIPU_API_KEY"),

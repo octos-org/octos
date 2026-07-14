@@ -1037,12 +1037,17 @@ impl InitCommand {
             eyre::bail!("--custom-base-url is required when using custom init flags");
         };
 
+        // Never silently write model "auto" for a custom endpoint (#1541): real
+        // OpenAI-compatible APIs reject "auto" with a 400. Require an explicit
+        // --custom-model, matching the interactive and --defaults guards.
+        let Some(model) = self.custom_model.clone() else {
+            eyre::bail!(
+                "--custom-model is required when using --custom-base-url (a custom endpoint has no \"auto\" model)"
+            );
+        };
         Ok(Some(SelectedProvider {
             provider: CUSTOM_PROVIDER_NAME.to_string(),
-            model: self
-                .custom_model
-                .clone()
-                .unwrap_or_else(|| "auto".to_string()),
+            model,
             api_key_env: self
                 .custom_api_key_env
                 .clone()

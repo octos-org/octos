@@ -104,7 +104,7 @@ fn providers_list() -> Vec<(
         ),
         (
             "Moonshot",
-            "MOONSHOT_API_KEY",
+            "KIMI_API_KEY",
             "kimi-k2.5",
             Some("https://api.moonshot.ai/v1"),
         ),

@@ -52,16 +52,24 @@ fn catalog_lookup(model_id: &str) -> Option<(u64, u64)> {
     let guard = CATALOG.read().ok()?;
     let map = guard.as_ref()?;
     let m = model_id.to_lowercase();
-    // Try exact match first, then substring match
+    // Try exact match first, then substring match.
     if let Some(entry) = map.get(&m) {
         return Some((entry.context_window, entry.max_output));
     }
+    // Deterministic substring match: prefer the longest (most specific) matching
+    // key. HashMap iteration order is nondeterministic, so without a length
+    // tie-breaker the winning entry varied per process when several keys matched
+    // (pricing.rs already applies this rule; context.rs did not).
+    let mut best: Option<(usize, u64, u64)> = None;
     for (key, entry) in map {
         if m.contains(key) || key.contains(&m) {
-            return Some((entry.context_window, entry.max_output));
+            let len = key.len();
+            if best.is_none_or(|(best_len, _, _)| len > best_len) {
+                best = Some((len, entry.context_window, entry.max_output));
+            }
         }
     }
-    None
+    best.map(|(_, ctx, out)| (ctx, out))
 }
 
 // ── Public API ────────────────────────────────────────────────
@@ -210,6 +218,39 @@ mod tests {
         assert_eq!(ds.max_output, 8_192);
 
         // Clean up
+        *guard = None;
+    }
+
+    #[test]
+    fn should_pick_longest_key_on_ambiguous_substring_lookup() {
+        // Regression: when several catalog keys are substrings of the model id,
+        // the winner used to depend on nondeterministic HashMap iteration order.
+        // The most-specific (longest) key must win every time.
+        let mut guard = CATALOG.write().unwrap_or_else(|e| e.into_inner());
+        let mut map = HashMap::new();
+        map.insert(
+            "gpt".to_string(),
+            CatalogModel {
+                context_window: 8_000,
+                max_output: 1_000,
+            },
+        );
+        map.insert(
+            "gpt-4o-mini".to_string(),
+            CatalogModel {
+                context_window: 128_000,
+                max_output: 16_000,
+            },
+        );
+        *guard = Some(map);
+        drop(guard);
+
+        // "gpt-4o-mini" contains both "gpt" and "gpt-4o-mini"; longest wins.
+        for _ in 0..20 {
+            assert_eq!(catalog_lookup("gpt-4o-mini"), Some((128_000, 16_000)));
+        }
+
+        let mut guard = CATALOG.write().unwrap_or_else(|e| e.into_inner());
         *guard = None;
     }
 
