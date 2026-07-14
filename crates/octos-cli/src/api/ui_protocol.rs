@@ -6881,9 +6881,11 @@ fn persist_default_if_requested(
     profile_id: &str,
 ) -> Result<(), RpcError> {
     if params.make_default.unwrap_or(false) {
-        profile_store.set_default_profile(profile_id).map_err(|error| {
-            runtime_unavailable_error(format!("failed to set default profile: {error}"))
-        })?;
+        profile_store
+            .set_default_profile(profile_id)
+            .map_err(|error| {
+                runtime_unavailable_error(format!("failed to set default profile: {error}"))
+            })?;
     }
     Ok(())
 }
@@ -10597,6 +10599,23 @@ async fn open_session_result(
                 // storage identity. No-op when the store wasn't relocated.
                 register_session_ledger_scope(ledger, &runtime);
                 effective_workspace_root = Some(runtime.workspace_root.clone());
+                // Sticky marker: record this profile as the folder's active one
+                // so a later bare launch resumes it deterministically (beats the
+                // store-mtime recency fallback in `derive_sticky_profile`). Gated
+                // on the SAME condition `resolve_sessions_root_from_hint` uses to
+                // relocate the store — `sessions_in_cwd && effective hint present`
+                // — so the marker lands in the same `<cwd>/.octos` the store did
+                // (client cwd OR operator `appui_default_session_cwd`), and a
+                // no-hint (web/gateway) session that stays in its data-dir
+                // workspace never drops a stray marker there. Written to the
+                // runtime's canonical `workspace_root` (the store's actual parent,
+                // post-canonicalize), not the raw hint. Best-effort in the helper.
+                if state.session_cache.sessions_in_cwd() && effective_workspace_hint.is_some() {
+                    crate::runtime::session::write_active_profile_marker(
+                        &runtime.workspace_root,
+                        &profile_runtime.profile_id,
+                    );
+                }
             }
             Err(error) => {
                 tracing::error!(
@@ -32084,6 +32103,122 @@ ignore = []
         assert_eq!(
             grace_status["runtime_policy_stamp"]["profile_id"],
             json!("grace")
+        );
+    }
+
+    /// End-to-end sticky-marker contract through the real `session/open`
+    /// dispatcher: a cwd-hinted open under the per-project flag records the
+    /// folder's active profile; reopening a different brain in the same folder
+    /// flips it (last-writer-wins); a no-cwd open never touches the marker.
+    #[tokio::test]
+    async fn session_open_writes_active_profile_marker_only_with_flag_and_cwd() {
+        let dir = tempfile::tempdir().unwrap();
+        // Two LLM-configured runtimes (each with its own data dir → its own
+        // redb episode store, no exclusive-lock clash) so a cwd-hinted
+        // `session/open` clears the `profile_unconfigured` LLM gate. Flag-ON
+        // cache so a cwd hint relocates the store to `<cwd>/.octos`.
+        let mut profiles = HashMap::new();
+        for id in ["grace", "ada"] {
+            let profile_data_dir = dir.path().join("profiles").join(id).join("data");
+            let runtime = make_m11e_profile_with_llm_and_sandbox(
+                id,
+                &profile_data_dir,
+                Arc::new(M11EStubLlm),
+                octos_agent::SandboxConfig::default(),
+            )
+            .await;
+            profiles.insert(id.to_string(), runtime);
+        }
+        let state = Arc::new(AppState {
+            profiles,
+            sessions: Some(Arc::new(tokio::sync::Mutex::new(
+                octos_bus::SessionManager::open(dir.path()).expect("session manager"),
+            ))),
+            session_cache: Arc::new(
+                crate::runtime::SessionRuntimeCache::new(4, std::time::Duration::from_secs(60))
+                    .with_sessions_in_cwd(true),
+            ),
+            ..AppState::empty_for_tests()
+        });
+
+        let ledger = UiProtocolLedger::new(16);
+        let approvals = PendingApprovalStore::default();
+        let questions = PendingQuestionStore::default();
+        let features = ConnectionUiFeatures::stdio_defaults();
+
+        // A separate project folder (NOT the data dir) the session opens against.
+        let workspace = tempfile::tempdir().unwrap();
+        let workspace_canon = std::fs::canonicalize(workspace.path()).unwrap();
+        let marker = workspace_canon.join(".octos").join("active-profile");
+        let cwd_hint = || Some(workspace.path().to_string_lossy().into_owned());
+        assert!(!marker.exists(), "marker must not pre-exist the first open");
+
+        let open = |session_id: SessionKey, profile: &'static str, cwd: Option<String>| {
+            let state = state.clone();
+            let ledger = &ledger;
+            let approvals = &approvals;
+            let questions = &questions;
+            async move {
+                open_session_result(
+                    &state,
+                    ledger,
+                    approvals,
+                    questions,
+                    ConnectionId::next(),
+                    Some(profile),
+                    features,
+                    SessionOpenParams {
+                        session_id,
+                        topic: None,
+                        profile_id: None,
+                        cwd,
+                        sandbox: None,
+                        after: None,
+                    },
+                )
+                .await
+                .expect("session/open succeeds")
+            }
+        };
+
+        // Open grace WITH a cwd hint → store relocates, marker records "grace".
+        open(
+            SessionKey::with_profile_topic("grace", "local", "tui", "coding"),
+            "grace",
+            cwd_hint(),
+        )
+        .await;
+        assert_eq!(
+            std::fs::read_to_string(&marker).unwrap().trim(),
+            "grace",
+            "session/open with flag+cwd records the folder's active profile",
+        );
+
+        // Reopen a DIFFERENT brain in the SAME folder → last-writer-wins: the
+        // sticky marker flips to "ada" (the "switch brains here" semantics).
+        open(
+            SessionKey::with_profile_topic("ada", "local", "tui", "coding"),
+            "ada",
+            cwd_hint(),
+        )
+        .await;
+        assert_eq!(
+            std::fs::read_to_string(&marker).unwrap().trim(),
+            "ada",
+            "reopening a different brain in the folder updates the sticky marker",
+        );
+
+        // A no-cwd open (web/gateway shape) must NOT touch the folder marker.
+        open(
+            SessionKey::with_profile_topic("grace", "local", "tui", "review"),
+            "grace",
+            None,
+        )
+        .await;
+        assert_eq!(
+            std::fs::read_to_string(&marker).unwrap().trim(),
+            "ada",
+            "a no-cwd session/open leaves the existing folder marker intact",
         );
     }
 

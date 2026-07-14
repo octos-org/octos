@@ -738,6 +738,48 @@ pub(crate) fn project_sessions_root(canonical_cwd: &Path, profile_id: &str) -> P
         .join(octos_bus::session::encode_path_component(profile_id))
 }
 
+/// Record `profile_id` as the folder's sticky profile at
+/// `<cwd>/.octos/active-profile`, so a later bare launch resumes the brain last
+/// opened here — deterministic, beating the store-mtime recency fallback in
+/// [`super::launch::derive_sticky_profile`].
+///
+/// The marker is a SIBLING of the per-profile store dir (NOT inside
+/// [`project_sessions_root`]), and the id is written RAW (un-encoded) to
+/// byte-match the reader in `scan_folder_sessions`, which trims it. Best-effort:
+/// a failure is logged and ignored — stickiness degrades to recency, it never
+/// blocks the session open. Atomic write-then-rename so a crash can't leave a
+/// torn marker; last writer wins, which is exactly the "last profile opened
+/// here" semantics we want.
+pub(crate) fn write_active_profile_marker(canonical_cwd: &Path, profile_id: &str) {
+    let octos_dir = canonical_cwd.join(".octos");
+    if let Err(error) = std::fs::create_dir_all(&octos_dir) {
+        tracing::warn!(
+            dir = %octos_dir.display(),
+            error = %error,
+            "failed to create .octos dir for active-profile marker",
+        );
+        return;
+    }
+    let path = octos_dir.join("active-profile");
+    let tmp = octos_dir.join("active-profile.tmp");
+    if let Err(error) = std::fs::write(&tmp, profile_id.as_bytes()) {
+        tracing::warn!(
+            path = %tmp.display(),
+            error = %error,
+            "failed to write active-profile marker",
+        );
+        return;
+    }
+    if let Err(error) = std::fs::rename(&tmp, &path) {
+        tracing::warn!(
+            path = %path.display(),
+            error = %error,
+            "failed to install active-profile marker",
+        );
+        let _ = std::fs::remove_file(&tmp);
+    }
+}
+
 /// Resolve the sessions root from a **raw** (possibly non-canonical) workspace
 /// hint, as the [`super::SessionRuntimeCache`] sees it before bootstrap
 /// canonicalizes it.
@@ -2002,6 +2044,27 @@ mod tests {
             resolve_sessions_root(&profile, &cwd, false, false),
             data_dir,
         );
+    }
+
+    #[test]
+    fn active_profile_marker_round_trips_through_scanner() {
+        let tmp = TempDir::new().unwrap();
+        // Write the marker, then read it back through the SAME path the launch
+        // scanner uses — proving the write byte-matches the read, and that the
+        // explicit marker drives `derive_sticky_profile`.
+        write_active_profile_marker(tmp.path(), "glm");
+        let folder = crate::runtime::launch::scan_folder_sessions(tmp.path(), &["glm".to_string()]);
+        assert_eq!(folder.active_profile.as_deref(), Some("glm"));
+        assert_eq!(
+            crate::runtime::launch::derive_sticky_profile(&folder).as_deref(),
+            Some("glm"),
+        );
+
+        // Last writer wins — reopening under a different brain updates the marker.
+        write_active_profile_marker(tmp.path(), "deepseek");
+        let folder2 =
+            crate::runtime::launch::scan_folder_sessions(tmp.path(), &["deepseek".to_string()]);
+        assert_eq!(folder2.active_profile.as_deref(), Some("deepseek"));
     }
 
     #[tokio::test]
