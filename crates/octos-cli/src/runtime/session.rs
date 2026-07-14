@@ -118,9 +118,29 @@ pub struct SessionRuntime {
     /// `/api/chat` and UI Protocol v1 dispatchers invoke.
     pub agent: Arc<Agent>,
 
+    /// The on-disk **root** the session transcript store is opened at
+    /// (`SessionManager::open(sessions_root)` yields
+    /// `sessions_root/sessions/` + `sessions_root/users/<base>/sessions/`).
+    ///
+    /// Equals [`ProfileRuntime::data_dir`] for the historical behavior
+    /// (web-chat, gateway, or any session with no cwd hint). For an
+    /// AppUi/coding-agent session opened with a cwd hint **and** the
+    /// `appui.sessions_in_cwd` flag on, this is `<cwd>/.octos` — the
+    /// per-project store. Sidecars that derive their path from
+    /// `sessions.data_dir()` (reasoning-effort, task ledger) therefore
+    /// follow the transcript to the same root automatically.
+    ///
+    /// Held explicitly (rather than re-derived) so callers that need the
+    /// root without locking the manager — and tests asserting the per-cwd
+    /// relocation — can read it directly.
+    pub sessions_root: PathBuf,
+
     /// The per-session chat history manager. Wrapped in a
     /// [`tokio::sync::Mutex`] because multiple subscribers
     /// (SSE + WS) may observe and persist messages concurrently.
+    ///
+    /// Opened at [`Self::sessions_root`] (which is
+    /// [`ProfileRuntime::data_dir`] unless the session is cwd-scoped).
     pub sessions: Arc<tokio::sync::Mutex<SessionManager>>,
 }
 
@@ -154,11 +174,15 @@ impl SessionRuntime {
     ///    AppState-derived plumbing (broadcaster/MetricsReporter/
     ///    HookExecutor/system prompt fragments) layers on at the
     ///    dispatcher (UI Protocol / `/api/chat`).
-    /// 7. Open the [`SessionManager`] via
-    ///    `SessionManager::open(&profile.data_dir)` — the canonical
-    ///    JSONL session store namespaces on-disk files by
-    ///    [`SessionKey`] under `data_dir/sessions/`, so the
-    ///    profile data dir is the correct root.
+    /// 7. Open the [`SessionManager`] at the resolved **sessions root**
+    ///    (`resolve_sessions_root`). The canonical JSONL store namespaces
+    ///    on-disk files by [`SessionKey`] under `<root>/sessions/` +
+    ///    `<root>/users/<base>/sessions/`, so the store is fully
+    ///    root-parameterized. The root is `profile.data_dir` for every
+    ///    no-hint/gateway/web-chat session and while `appui.sessions_in_cwd`
+    ///    is off (byte-identical to the historic behavior); a cwd-hinted AppUi
+    ///    session with the flag on relocates to `<cwd>/.octos` (per-project
+    ///    storage). Stored on [`Self::sessions_root`].
     /// 8. Return `Arc<Self>`.
     ///
     /// # Parameters
@@ -195,6 +219,27 @@ impl SessionRuntime {
         .await
     }
 
+    /// [`Self::bootstrap`] with an explicit `sessions_in_cwd` flag. The
+    /// convenience [`Self::bootstrap`] hard-codes `false` (legacy per-profile
+    /// storage); this variant lets the AppUi path (and tests) request the
+    /// per-project relocation when a cwd hint is present.
+    pub async fn bootstrap_in_cwd(
+        profile: &Arc<ProfileRuntime>,
+        session_key: SessionKey,
+        workspace_hint: Option<PathBuf>,
+        sessions_in_cwd: bool,
+    ) -> Result<Arc<Self>> {
+        Self::bootstrap_with_permissions_and_sandbox(
+            profile,
+            session_key,
+            workspace_hint,
+            EffectivePermissions::workspace_write(),
+            None,
+            sessions_in_cwd,
+        )
+        .await
+    }
+
     /// Construct a [`SessionRuntime`] with an explicit effective permission
     /// profile. AppUI integration should resolve and gate requested permission
     /// profiles before calling this hook.
@@ -210,6 +255,11 @@ impl SessionRuntime {
             workspace_hint,
             permissions,
             None,
+            // Legacy per-profile storage. The AppUi path opts into per-cwd
+            // storage via the `sessions_in_cwd` param on
+            // `bootstrap_with_permissions_and_sandbox`, threaded by the
+            // session-runtime cache from `appui.sessions_in_cwd`.
+            false,
         )
         .await
     }
@@ -223,8 +273,18 @@ impl SessionRuntime {
         workspace_hint: Option<PathBuf>,
         permissions: EffectivePermissions,
         sandbox_override: Option<SandboxConfig>,
+        // When `true` AND a `workspace_hint` (cwd) is present, the session
+        // transcript store is relocated from `profile.data_dir` to
+        // `<cwd>/.octos` (per-project storage, `appui.sessions_in_cwd`). No
+        // hint → `profile.data_dir` regardless, so gateway/web-chat are inert.
+        // Threaded from the `SessionRuntimeCache`'s process-global flag.
+        sessions_in_cwd: bool,
     ) -> Result<Arc<Self>> {
-        // Step 1: resolve workspace_root.
+        // Step 1: resolve workspace_root. Capture whether a hint was supplied
+        // BEFORE it is consumed — the sessions-root resolution below keys off
+        // "was this a cwd/coding-agent session" (a hint), not off the derived
+        // workspace path.
+        let had_workspace_hint = workspace_hint.is_some();
         let workspace_root = resolve_workspace_root(profile, &session_key, workspace_hint)?;
         std::fs::create_dir_all(&workspace_root).wrap_err_with(|| {
             format!("create workspace root failed: {}", workspace_root.display())
@@ -578,14 +638,36 @@ impl SessionRuntime {
 
         let agent = Arc::new(agent);
 
-        // Step 6: open the per-profile SessionManager. The on-disk
-        // layout (`<data_dir>/sessions/`) already namespaces by
-        // SessionKey via `encode_path_component`, so the profile
-        // data_dir is the correct root. Sharing one SessionManager
-        // per profile (vs per session) matches today's serve +
-        // gateway call sites.
+        // Step 6: open the SessionManager at the resolved sessions root.
+        //
+        // The on-disk layout (`<root>/sessions/` +
+        // `<root>/users/<base>/sessions/<topic>.jsonl`) already namespaces by
+        // SessionKey via `encode_path_component`, so re-rooting it at
+        // `<cwd>/.octos` (per-project storage) instead of `profile.data_dir`
+        // relocates the whole store with zero storage-code change — the store
+        // is fully root-parameterized.
+        //
+        // `resolve_sessions_root` returns `profile.data_dir` for every
+        // no-hint session (web-chat, gateway) and for every session while
+        // `sessions_in_cwd` is off, so this is byte-identical to the historic
+        // `SessionManager::open(&profile.data_dir)` unless a cwd-scoped AppUi
+        // session has explicitly opted in. Sidecars that build their path
+        // from `sessions.data_dir()` (reasoning-effort, task ledger) follow to
+        // the same root by construction.
+        let sessions_root = resolve_sessions_root(
+            profile,
+            &workspace_root,
+            had_workspace_hint,
+            sessions_in_cwd,
+        );
+        // Keep a project-local `.gitignore` under a freshly-created
+        // `<cwd>/.octos` so transcripts never leak into the user's repo. No-op
+        // for the profile-data-dir root (not a project working tree).
+        if sessions_root != profile.data_dir {
+            ensure_session_store_gitignore(&sessions_root);
+        }
         let sessions = Arc::new(tokio::sync::Mutex::new(
-            SessionManager::open(&profile.data_dir).wrap_err("failed to open session manager")?,
+            SessionManager::open(&sessions_root).wrap_err("failed to open session manager")?,
         ));
 
         Ok(Arc::new(Self {
@@ -597,8 +679,154 @@ impl SessionRuntime {
             permissions,
             tools,
             agent,
+            sessions_root,
             sessions,
         }))
+    }
+}
+
+/// Resolve the on-disk **root** for a session's transcript store.
+///
+/// This is the one seam that makes per-project (`appui.sessions_in_cwd`)
+/// storage possible: the session store is fully root-parameterized
+/// (`SessionManager::open(root)`), so relocating it is "pass a different
+/// root", not "re-architect the store".
+///
+/// - `sessions_in_cwd && had_hint` → `<cwd>/.octos/<profile_id>` (see
+///   [`project_sessions_root`]), where `<cwd>` is the canonical hinted
+///   workspace (`workspace_root` already canonicalizes a coding-agent hint).
+///   The `<profile_id>` segment is load-bearing: two authenticated profiles
+///   that point at the SAME project cwd must NOT share on-disk files — without
+///   it, raw `web-*` session ids (whose key carries no profile) would collide
+///   in `users/<base>/` and one profile could list/open/mutate another's
+///   transcripts. It mirrors how the global store isolates profiles by giving
+///   each its own `data_dir` root.
+/// - otherwise → [`ProfileRuntime::data_dir`] — the historical per-profile
+///   store. This includes **every** no-hint session (web-chat, gateway) and
+///   **every** session while the flag is off, so per-cwd storage is inert for
+///   the gateway/web-chat paths by construction and flipping the flag off is a
+///   guaranteed no-op.
+///
+/// Only a hinted (coding-agent) session can relocate: a no-hint session's
+/// `workspace_root` is the conventional `<data_dir>/users/<base>/workspace`
+/// path, which is NOT a project the user launched in — rooting a store at
+/// `<that>/.octos` would be meaningless, so `had_hint` gates it.
+pub(crate) fn resolve_sessions_root(
+    profile: &ProfileRuntime,
+    workspace_root: &Path,
+    had_hint: bool,
+    sessions_in_cwd: bool,
+) -> PathBuf {
+    if sessions_in_cwd && had_hint {
+        project_sessions_root(workspace_root, &profile.profile_id)
+    } else {
+        profile.data_dir.clone()
+    }
+}
+
+/// The per-project, per-profile session-store root: `<cwd>/.octos/<profile_id>`.
+///
+/// The single source of truth for the on-disk location of a cwd-scoped store,
+/// shared by the write path ([`resolve_sessions_root`] /
+/// [`resolve_sessions_root_from_hint`]) and the `session/list` cwd branch so
+/// listing reads exactly where the runtime persisted. `profile_id` is
+/// percent-encoded so an exotic profile id (`:`, `/`, …) can't escape the
+/// project's `.octos` directory.
+pub(crate) fn project_sessions_root(canonical_cwd: &Path, profile_id: &str) -> PathBuf {
+    canonical_cwd
+        .join(".octos")
+        .join(octos_bus::session::encode_path_component(profile_id))
+}
+
+/// Resolve the sessions root from a **raw** (possibly non-canonical) workspace
+/// hint, as the [`super::SessionRuntimeCache`] sees it before bootstrap
+/// canonicalizes it.
+///
+/// This is the cache-key form of [`resolve_sessions_root`]: it best-effort
+/// canonicalizes the hint (idempotent when it is already canonical, which it is
+/// on the `session/open` and turn/read paths — both pass a canonicalized cwd or
+/// the stored canonical `workspace_root`) so the cache identity a session is
+/// stored under matches the `sessions_root` bootstrap computes from the
+/// canonical `workspace_root`. A canonicalization failure (e.g. a hint that
+/// bootstrap will itself reject as banned/nonexistent) falls back to the raw
+/// path; nothing is cached under a rejected hint, so the fallback is inert.
+pub(crate) fn resolve_sessions_root_from_hint(
+    profile: &ProfileRuntime,
+    workspace_hint: Option<&Path>,
+    sessions_in_cwd: bool,
+) -> PathBuf {
+    match (sessions_in_cwd, workspace_hint) {
+        (true, Some(hint)) => {
+            let canonical = std::fs::canonicalize(hint).unwrap_or_else(|_| hint.to_path_buf());
+            project_sessions_root(&canonical, &profile.profile_id)
+        }
+        _ => profile.data_dir.clone(),
+    }
+}
+
+/// Idempotently write a `.gitignore` into a per-project session-store root
+/// (`<cwd>/.octos`) so chat transcripts and runtime state never get committed
+/// into the user's repository.
+///
+/// Uses `OpenOptions::create_new` (single `open(O_CREAT|O_EXCL)`), so a
+/// pre-existing `.gitignore` (e.g. one an operator hand-wrote alongside a
+/// project-local `.octos/config.json`) is left untouched — `AlreadyExists` is
+/// treated as success. Best-effort: a failure to write the ignore file must
+/// not fail session bootstrap (the transcript store still works), it only
+/// risks leaking runtime state into git, which we log.
+///
+/// Selective (not `*`) to match the `octos init` convention
+/// (`init.rs`: `sessions/`, `tasks/`, `*.redb`) and to leave a
+/// deliberately-committed `<cwd>/.octos/config.json` untouched; `users/` is
+/// added because per-project transcripts + their sidecars land under
+/// `<cwd>/.octos/users/<base>/sessions/`; `context_ledgers/` because the
+/// per-turn context-manager snapshots (verbatim conversation content) are
+/// rooted at this store alongside the transcript (#1666).
+fn ensure_session_store_gitignore(sessions_root: &Path) {
+    use std::io::Write;
+
+    const GITIGNORE_BODY: &str = "\
+# Managed by octos (appui.sessions_in_cwd): per-project session store.
+# Chat transcripts and runtime state must not be committed to the repo.
+sessions/
+users/
+tasks/
+context_ledgers/
+*.redb
+";
+    if let Err(error) = std::fs::create_dir_all(sessions_root) {
+        tracing::warn!(
+            root = %sessions_root.display(),
+            error = %error,
+            "failed to create per-project session store root for .gitignore",
+        );
+        return;
+    }
+    let path = sessions_root.join(".gitignore");
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+    {
+        Ok(mut file) => {
+            if let Err(error) = file.write_all(GITIGNORE_BODY.as_bytes()) {
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %error,
+                    "failed to write per-project session-store .gitignore",
+                );
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            // Operator/earlier bootstrap already placed one — never clobber.
+        }
+        Err(error) => {
+            tracing::warn!(
+                path = %path.display(),
+                error = %error,
+                "failed to create per-project session-store .gitignore",
+            );
+        }
     }
 }
 
@@ -1064,6 +1292,7 @@ mod tests {
             Some(tmp.path().join("gamma")),
             EffectivePermissions::workspace_write(),
             Some(gamma_sandbox),
+            false,
         )
         .await
         .expect("gamma bootstrap");
@@ -1073,6 +1302,7 @@ mod tests {
             Some(tmp.path().join("delta")),
             EffectivePermissions::workspace_write(),
             None,
+            false,
         )
         .await
         .expect("delta bootstrap");
@@ -1739,5 +1969,332 @@ mod tests {
             .expect("write_file result");
         assert!(write.success, "write_file failed: {}", write.output);
         assert_eq!(std::fs::read_to_string(outside).unwrap(), "host\n");
+    }
+
+    // ---- Per-project session storage (appui.sessions_in_cwd) --------------
+
+    #[tokio::test]
+    async fn resolve_sessions_root_relocates_only_with_flag_and_hint() {
+        // The one seam that gates per-cwd storage. Only (flag ON + a hint)
+        // relocates; every other combination stays on `profile.data_dir` so
+        // gateway/web-chat and a flag-off server are inert by construction.
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("profile-data");
+        let profile = make_profile(data_dir.clone()).await;
+        let cwd = tmp.path().join("proj");
+
+        // flag ON + hint -> per-project, per-PROFILE store (the profile
+        // segment isolates two profiles that share a project cwd).
+        assert_eq!(
+            resolve_sessions_root(&profile, &cwd, true, true),
+            cwd.join(".octos").join(&profile.profile_id),
+        );
+        assert_eq!(
+            resolve_sessions_root(&profile, &cwd, true, true),
+            project_sessions_root(&cwd, &profile.profile_id),
+        );
+        // flag OFF + hint -> legacy (regression guard: flipping off is a no-op).
+        assert_eq!(resolve_sessions_root(&profile, &cwd, true, false), data_dir,);
+        // flag ON + NO hint (web-chat / gateway) -> legacy.
+        assert_eq!(resolve_sessions_root(&profile, &cwd, false, true), data_dir,);
+        // flag OFF + NO hint -> legacy.
+        assert_eq!(
+            resolve_sessions_root(&profile, &cwd, false, false),
+            data_dir,
+        );
+    }
+
+    #[tokio::test]
+    async fn bootstrap_relocates_store_to_cwd_when_flag_on() {
+        // A cwd-hinted AppUi session with the flag on persists its transcript
+        // under `<cwd>/.octos`, NOT under `profile.data_dir`. Sidecars that
+        // derive their path from `sessions.data_dir()` follow to the same
+        // root by construction (asserted via data_dir()).
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("profile-data");
+        let profile = make_profile(data_dir.clone()).await;
+        let cwd = tmp.path().join("project");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let cwd_canon = std::fs::canonicalize(&cwd).unwrap();
+
+        let key = SessionKey::new("api", "coding");
+        let rt = SessionRuntime::bootstrap_in_cwd(&profile, key.clone(), Some(cwd.clone()), true)
+            .await
+            .expect("bootstrap in cwd");
+
+        // sessions_root and the manager's data_dir both point at
+        // <cwd>/.octos/<profile_id>.
+        let expected_root = cwd_canon.join(".octos").join(&profile.profile_id);
+        assert_eq!(rt.sessions_root, expected_root);
+        {
+            let mgr = rt.sessions.lock().await;
+            assert_eq!(mgr.data_dir(), expected_root);
+        }
+
+        // Persist a message and confirm the JSONL lives under <cwd>/.octos and
+        // NOT under the profile data dir.
+        let session_path = {
+            let mut mgr = rt.sessions.lock().await;
+            mgr.add_message(&key, Message::user("hello from the project"))
+                .await
+                .unwrap();
+            mgr.session_path(&key)
+        };
+        assert!(
+            session_path.starts_with(cwd_canon.join(".octos")),
+            "transcript must live under <cwd>/.octos: {}",
+            session_path.display()
+        );
+        assert!(
+            !session_path.starts_with(&data_dir),
+            "transcript must NOT live under profile.data_dir: {}",
+            session_path.display()
+        );
+        assert!(
+            session_path.exists(),
+            "transcript file should exist on disk"
+        );
+        // The profile data dir has no `users/` session tree for this key.
+        assert!(
+            !data_dir.join("users").exists()
+                || std::fs::read_dir(data_dir.join("users"))
+                    .map(|mut d| d.next().is_none())
+                    .unwrap_or(true),
+            "profile data dir must not accrue this session's transcript"
+        );
+    }
+
+    #[tokio::test]
+    async fn bootstrap_keeps_store_in_profile_when_flag_off() {
+        // Regression: with the flag OFF a cwd-hinted session is byte-identical
+        // to today — the store stays under profile.data_dir.
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("profile-data");
+        let profile = make_profile(data_dir.clone()).await;
+        let cwd = tmp.path().join("project");
+        std::fs::create_dir_all(&cwd).unwrap();
+
+        let key = SessionKey::new("api", "coding");
+        let rt = SessionRuntime::bootstrap_in_cwd(&profile, key.clone(), Some(cwd.clone()), false)
+            .await
+            .expect("bootstrap flag off");
+
+        assert_eq!(rt.sessions_root, data_dir);
+        let session_path = {
+            let mut mgr = rt.sessions.lock().await;
+            mgr.add_message(&key, Message::user("legacy"))
+                .await
+                .unwrap();
+            mgr.session_path(&key)
+        };
+        assert!(
+            session_path.starts_with(&data_dir),
+            "flag OFF must keep the store under profile.data_dir: {}",
+            session_path.display()
+        );
+        // Nothing was created under <cwd>/.octos.
+        assert!(
+            !cwd.join(".octos").exists(),
+            "flag OFF must not create a per-project store"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_hint_session_stays_in_profile_even_with_flag_on() {
+        // The gateway/web-chat guarantee: a NO-hint session ignores the flag
+        // (its "workspace" is the conventional data-dir path, not a project),
+        // so its store stays on profile.data_dir. This is what keeps per-cwd
+        // storage inert for the gateway path by construction.
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("profile-data");
+        let profile = make_profile(data_dir.clone()).await;
+
+        let key = SessionKey::new("api", "web-chat");
+        let rt = SessionRuntime::bootstrap_in_cwd(&profile, key, None, true)
+            .await
+            .expect("bootstrap no hint, flag on");
+
+        assert_eq!(
+            rt.sessions_root, data_dir,
+            "a no-hint session must stay on profile.data_dir even with the flag on"
+        );
+    }
+
+    #[tokio::test]
+    async fn two_cwds_same_key_do_not_collide() {
+        // The sharpest risk: the SAME logical session key opened against two
+        // different projects must not conflate transcripts. Per-cwd roots are
+        // separate file trees, so two runtimes with the same key + distinct
+        // hints persist to distinct files with no cross-contamination.
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("profile-data");
+        let profile = make_profile(data_dir.clone()).await;
+
+        let proj_a = tmp.path().join("project-a");
+        let proj_b = tmp.path().join("project-b");
+        std::fs::create_dir_all(&proj_a).unwrap();
+        std::fs::create_dir_all(&proj_b).unwrap();
+
+        // Same key, two projects.
+        let key = SessionKey::new("api", "default");
+        let rt_a =
+            SessionRuntime::bootstrap_in_cwd(&profile, key.clone(), Some(proj_a.clone()), true)
+                .await
+                .expect("bootstrap A");
+        let rt_b =
+            SessionRuntime::bootstrap_in_cwd(&profile, key.clone(), Some(proj_b.clone()), true)
+                .await
+                .expect("bootstrap B");
+
+        // Distinct roots — the isolation boundary — each the project's own
+        // profile-namespaced `<cwd>/.octos/<profile_id>`.
+        assert_ne!(rt_a.sessions_root, rt_b.sessions_root);
+        let proj_a_canon = std::fs::canonicalize(&proj_a).unwrap();
+        let proj_b_canon = std::fs::canonicalize(&proj_b).unwrap();
+        assert_eq!(
+            rt_a.sessions_root,
+            project_sessions_root(&proj_a_canon, &profile.profile_id)
+        );
+        assert_eq!(
+            rt_b.sessions_root,
+            project_sessions_root(&proj_b_canon, &profile.profile_id)
+        );
+
+        // Write a distinct message through each runtime's own manager.
+        {
+            let mut mgr = rt_a.sessions.lock().await;
+            mgr.add_message(&key, Message::user("message-for-A"))
+                .await
+                .unwrap();
+        }
+        {
+            let mut mgr = rt_b.sessions.lock().await;
+            mgr.add_message(&key, Message::user("message-for-B"))
+                .await
+                .unwrap();
+        }
+
+        // Reload each project's store from scratch (fresh manager, no shared
+        // in-memory cache) and confirm each holds ONLY its own message.
+        let mut reload_a = SessionManager::open(&rt_a.sessions_root).unwrap();
+        let a = reload_a.get_or_create(&key).await;
+        assert_eq!(
+            a.messages.len(),
+            1,
+            "project A must have exactly its message"
+        );
+        assert_eq!(a.messages[0].content, "message-for-A");
+
+        let mut reload_b = SessionManager::open(&rt_b.sessions_root).unwrap();
+        let b = reload_b.get_or_create(&key).await;
+        assert_eq!(
+            b.messages.len(),
+            1,
+            "project B must have exactly its message"
+        );
+        assert_eq!(b.messages[0].content, "message-for-B");
+    }
+
+    #[tokio::test]
+    async fn cwd_store_writes_gitignore_idempotently() {
+        // A freshly-created per-project store gets a `.gitignore` so chat logs
+        // never leak into the user's repo; a pre-existing one is never
+        // clobbered.
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("profile-data");
+        let profile = make_profile(data_dir).await;
+        let cwd = tmp.path().join("project");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let cwd_canon = std::fs::canonicalize(&cwd).unwrap();
+
+        let rt = SessionRuntime::bootstrap_in_cwd(
+            &profile,
+            SessionKey::new("api", "gi"),
+            Some(cwd.clone()),
+            true,
+        )
+        .await
+        .expect("bootstrap");
+
+        let gitignore = rt.sessions_root.join(".gitignore");
+        assert_eq!(
+            rt.sessions_root,
+            cwd_canon.join(".octos").join(&profile.profile_id)
+        );
+        assert!(
+            gitignore.exists(),
+            "per-project store must have a .gitignore"
+        );
+        let body = std::fs::read_to_string(&gitignore).unwrap();
+        assert!(body.contains("sessions/"));
+        assert!(body.contains("users/"));
+        // Context-manager snapshots hold verbatim conversation content and
+        // are rooted at this store alongside the transcript (#1666).
+        assert!(body.contains("context_ledgers/"));
+
+        // Idempotent + non-clobbering: hand-edit it, re-run the helper, and
+        // confirm the operator's content survives.
+        std::fs::write(&gitignore, "custom operator content\n").unwrap();
+        ensure_session_store_gitignore(&rt.sessions_root);
+        assert_eq!(
+            std::fs::read_to_string(&gitignore).unwrap(),
+            "custom operator content\n",
+            "existing .gitignore must never be clobbered"
+        );
+    }
+
+    #[tokio::test]
+    async fn fork_and_rollback_resolve_through_cwd_root() {
+        // hydrate/rollback/fork all operate on the session runtime's own
+        // `SessionManager` (resolved via `resolve_sessions_for_lookup` in the
+        // dispatcher), so once the manager is rooted at `<cwd>/.octos` they
+        // follow automatically. Prove it for fork + rollback: a child forked
+        // from a cwd-scoped session lands under the SAME `<cwd>/.octos` root,
+        // and a rollback rewrites there too.
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("profile-data");
+        let profile = make_profile(data_dir.clone()).await;
+        let cwd = tmp.path().join("project");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let cwd_canon = std::fs::canonicalize(&cwd).unwrap();
+
+        let key = SessionKey::new("api", "parent");
+        let rt = SessionRuntime::bootstrap_in_cwd(&profile, key.clone(), Some(cwd), true)
+            .await
+            .expect("bootstrap");
+
+        let child_path = {
+            let mut mgr = rt.sessions.lock().await;
+            // User rows only: the new write path requires a caller-supplied
+            // thread_id for Assistant/Tool rows, and this test only cares
+            // about the on-disk ROOT, not the transcript shape.
+            mgr.add_message(&key, Message::user("q1")).await.unwrap();
+            mgr.add_message(&key, Message::user("q2")).await.unwrap();
+            let child = mgr.fork(&key, "child-1", 2).await.expect("fork");
+            mgr.session_path(&child)
+        };
+        assert!(
+            child_path.starts_with(cwd_canon.join(".octos")),
+            "forked child must live under <cwd>/.octos: {}",
+            child_path.display()
+        );
+        assert!(
+            !child_path.starts_with(&data_dir),
+            "forked child must NOT live under profile.data_dir"
+        );
+
+        // Rollback rewrites in-place under the same root.
+        {
+            let mut mgr = rt.sessions.lock().await;
+            mgr.rollback_last_n_user_turns(&key, 1)
+                .await
+                .expect("rollback");
+            let parent_path = mgr.session_path(&key);
+            assert!(
+                parent_path.starts_with(cwd_canon.join(".octos")),
+                "rollback must rewrite under <cwd>/.octos: {}",
+                parent_path.display()
+            );
+        }
     }
 }

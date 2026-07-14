@@ -332,6 +332,43 @@ pub fn create_sandbox(config: &SandboxConfig) -> Box<dyn Sandbox> {
     }
 }
 
+/// Which backend [`SandboxMode::Auto`] would select on this host — a stable
+/// human-readable label plus whether that selection actually sandboxes
+/// (`false` = [`NoSandbox`]). Runs the SAME availability probes as
+/// [`create_auto_sandbox`] (on Linux `bwrap_works` actually runs
+/// `bwrap --version`), reported instead of instantiated. Used by
+/// `octos doctor` so its sandbox row reflects the real runtime selection
+/// rather than a PATH existence guess; the boolean keeps callers from
+/// sniffing the label text for status.
+pub fn auto_sandbox_kind() -> (&'static str, bool) {
+    #[cfg(target_os = "macos")]
+    {
+        if which_exists("sandbox-exec") {
+            return ("macOS Seatbelt (sandbox-exec)", true);
+        }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        if bwrap_works() {
+            return ("bubblewrap (bwrap)", true);
+        }
+        if linux_container_sandbox_available() {
+            return ("Linux container helper (Landlock/seccomp)", true);
+        }
+    }
+    #[cfg(target_os = "windows")]
+    {
+        if has_sandbox_helper() {
+            return ("Windows AppContainer", true);
+        }
+    }
+    if which_exists("docker") {
+        ("Docker", true)
+    } else {
+        ("none — shell commands would run UNSANDBOXED", false)
+    }
+}
+
 fn create_auto_sandbox(config: &SandboxConfig) -> Box<dyn Sandbox> {
     #[cfg(target_os = "macos")]
     {
