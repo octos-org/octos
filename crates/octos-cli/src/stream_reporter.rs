@@ -96,6 +96,10 @@ pub struct ChannelStreamReporter {
     /// Files modified this turn (deduped), drained on `TaskCompleted` into a
     /// single `artifact` card — so N edits never post N cards.
     modified_files: Mutex<Vec<String>>,
+    /// Tool invocations this turn, drained on `TaskCompleted` into a single
+    /// `tool_activity` card — so a research turn with N searches posts ONE
+    /// card, not N `tool_call` cards.
+    tool_activity: Mutex<Vec<serde_json::Value>>,
 }
 
 impl ChannelStreamReporter {
@@ -106,6 +110,7 @@ impl ChannelStreamReporter {
             tool_args: Mutex::new(HashMap::new()),
             run_accum: Mutex::new(None),
             modified_files: Mutex::new(Vec::new()),
+            tool_activity: Mutex::new(Vec::new()),
         }
     }
 
@@ -232,30 +237,29 @@ impl ProgressReporter for ChannelStreamReporter {
                     .lock()
                     .ok()
                     .and_then(|mut m| m.remove(tool_id));
-                // Project a `tool_call` card (org.octos.app) so capable clients
-                // render the invocation as a structured card (name · status ·
-                // args · result · duration) — except for tools that already emit
-                // their own card, which would otherwise be duplicated.
+                // Accumulate into a per-turn `tool_activity` card (one card at
+                // turn end) instead of one `tool_call` card per tool — except
+                // self-carding tools, which already emit their own card.
                 if !SELF_CARDING_TOOLS.contains(&name.as_str()) {
                     let status = if success { "completed" } else { "error" };
-                    let mut initial_state = serde_json::json!({
-                        "tool_name": name,
-                        "status": status,
-                        "duration_ms": duration.as_millis() as u64,
-                    });
-                    if let Some(args) = arguments {
-                        initial_state["arguments"] = args;
+                    // Short "what it did" line: the call args on success, the
+                    // error on failure.
+                    let summary = if success {
+                        arguments
+                            .as_ref()
+                            .map(|a| truncate_card_preview(&a.to_string(), 120))
+                            .unwrap_or_default()
+                    } else {
+                        truncate_card_preview(output_preview, 120)
+                    };
+                    if let Ok(mut v) = self.tool_activity.lock() {
+                        v.push(serde_json::json!({
+                            "tool_name": name,
+                            "status": status,
+                            "duration_ms": duration.as_millis() as u64,
+                            "summary": summary,
+                        }));
                     }
-                    let preview = truncate_card_preview(output_preview, 600);
-                    if !preview.is_empty() {
-                        let key = if success { "output_preview" } else { "error" };
-                        initial_state[key] = serde_json::Value::String(preview);
-                    }
-                    let _ = self.tx.send(StreamProgressEvent::AppCard {
-                        card_type: "tool_call".to_string(),
-                        body: format!("{name} {status}"),
-                        initial_state,
-                    });
                 }
                 StreamProgressEvent::ToolCompleted {
                     name: name.clone(),
@@ -374,6 +378,31 @@ impl ProgressReporter for ChannelStreamReporter {
                 return;
             }
             ProgressEvent::TaskCompleted { duration, .. } => {
+                // Drain this turn's tool invocations into ONE `tool_activity`
+                // card, rather than one `tool_call` card per tool.
+                if let Some(tools) = self
+                    .tool_activity
+                    .lock()
+                    .ok()
+                    .map(|mut v| std::mem::take(&mut *v))
+                    .filter(|v| !v.is_empty())
+                {
+                    let n = tools.len();
+                    let failed = tools
+                        .iter()
+                        .filter(|t| t.get("status").and_then(|s| s.as_str()) == Some("error"))
+                        .count();
+                    let body = if failed > 0 {
+                        format!("{n} tools · {failed} failed")
+                    } else {
+                        format!("{n} tools")
+                    };
+                    let _ = self.tx.send(StreamProgressEvent::AppCard {
+                        card_type: "tool_activity".to_string(),
+                        body,
+                        initial_state: serde_json::json!({ "tools": tools }),
+                    });
+                }
                 // Drain the accumulated cost into one per-turn `run_summary`
                 // card. Matrix canonical JSON forbids floats, so costs are sent
                 // as decimal strings.
@@ -1281,23 +1310,37 @@ mod tests {
     /// these as structured cards; `run_stream_forwarder` gates emission on
     /// matrix + an app-reply-capable tool set.
     #[test]
-    fn projects_tool_call_and_plan_app_cards() {
+    fn projects_tool_activity_and_plan_app_cards() {
         use octos_agent::progress::ProgressEvent;
+        use std::collections::HashMap;
 
         let (tx, mut rx) = mpsc::unbounded_channel();
         let reporter = ChannelStreamReporter::new(tx);
 
+        // Two tool calls in one turn (one ok, one error).
         reporter.report(ProgressEvent::ToolStarted {
-            name: "shell".into(),
+            name: "web_search".into(),
             tool_id: "t1".into(),
-            arguments: Some(serde_json::json!({ "command": "ls -la" })),
+            arguments: Some(serde_json::json!({ "query": "SK Hynix 2025" })),
         });
         reporter.report(ProgressEvent::ToolCompleted {
-            name: "shell".into(),
+            name: "web_search".into(),
             tool_id: "t1".into(),
             success: true,
-            output_preview: "total 0\ndrwxr-xr-x".into(),
-            duration: Duration::from_millis(1200),
+            output_preview: "Results for: SK Hynix".into(),
+            duration: Duration::from_millis(3800),
+        });
+        reporter.report(ProgressEvent::ToolStarted {
+            name: "web_fetch".into(),
+            tool_id: "t2".into(),
+            arguments: Some(serde_json::json!({ "url": "https://x" })),
+        });
+        reporter.report(ProgressEvent::ToolCompleted {
+            name: "web_fetch".into(),
+            tool_id: "t2".into(),
+            success: false,
+            output_preview: "private IP not allowed".into(),
+            duration: Duration::from_millis(30),
         });
         reporter.report(ProgressEvent::PlanUpdated {
             plan: serde_json::json!({
@@ -1305,8 +1348,13 @@ mod tests {
                 "items": [{ "id": "1", "title": "step", "status": "in_progress" }],
             }),
         });
+        reporter.report(ProgressEvent::TaskCompleted {
+            success: true,
+            iterations: 2,
+            duration: Duration::from_millis(5000),
+        });
 
-        let mut cards: Vec<(String, serde_json::Value)> = Vec::new();
+        let mut cards: HashMap<String, serde_json::Value> = HashMap::new();
         while let Ok(event) = rx.try_recv() {
             if let StreamProgressEvent::AppCard {
                 card_type,
@@ -1314,31 +1362,34 @@ mod tests {
                 ..
             } = event
             {
-                cards.push((card_type, initial_state));
+                cards.insert(card_type, initial_state);
             }
         }
 
-        assert_eq!(cards.len(), 2, "expected a tool_call + a plan card, got {cards:?}");
+        // Plan card fires immediately on PlanUpdated.
+        let plan = cards.get("plan").expect("plan card");
+        assert_eq!(plan["items"][0]["status"].as_str(), Some("in_progress"));
 
-        let (tc_type, tc_state) = &cards[0];
-        assert_eq!(tc_type.as_str(), "tool_call");
-        assert_eq!(tc_state["tool_name"].as_str(), Some("shell"));
-        assert_eq!(tc_state["status"].as_str(), Some("completed"));
-        assert_eq!(tc_state["arguments"]["command"].as_str(), Some("ls -la"));
-        assert_eq!(tc_state["duration_ms"].as_u64(), Some(1200));
+        // The two tools coalesce into ONE tool_activity card at turn end — NOT
+        // two per-tool tool_call cards.
         assert!(
-            tc_state["output_preview"]
-                .as_str()
-                .unwrap_or_default()
-                .contains("total 0")
+            !cards.contains_key("tool_call"),
+            "must not emit per-tool tool_call cards"
         );
-
-        let (plan_type, plan_state) = &cards[1];
-        assert_eq!(plan_type.as_str(), "plan");
-        assert_eq!(
-            plan_state["items"][0]["status"].as_str(),
-            Some("in_progress")
-        );
+        let tools = cards
+            .get("tool_activity")
+            .expect("tool_activity card")["tools"]
+            .as_array()
+            .expect("tools array")
+            .clone();
+        assert_eq!(tools.len(), 2);
+        assert_eq!(tools[0]["tool_name"].as_str(), Some("web_search"));
+        assert_eq!(tools[0]["status"].as_str(), Some("completed"));
+        assert_eq!(tools[0]["duration_ms"].as_u64(), Some(3800));
+        assert!(tools[0]["summary"].as_str().unwrap().contains("SK Hynix"));
+        assert_eq!(tools[1]["tool_name"].as_str(), Some("web_fetch"));
+        assert_eq!(tools[1]["status"].as_str(), Some("error"));
+        assert!(tools[1]["summary"].as_str().unwrap().contains("private IP"));
     }
 
     /// The reporter coalesces per-response `CostUpdate`s and emits ONE
