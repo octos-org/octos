@@ -14,6 +14,26 @@ use octos_core::{METADATA_SENDER_USER_ID, OutboundMessage, SessionKey};
 use tokio::sync::{RwLock, mpsc};
 use tracing::{debug, warn};
 
+/// Tools that already emit their own `org.octos.app` card (a plan card, an app
+/// card), so the generic `tool_call` projection would duplicate their output.
+const SELF_CARDING_TOOLS: &[&str] = &["update_plan", "send_app_card"];
+
+/// Accumulates a turn's token/cost figures across the per-response `CostUpdate`
+/// events so a single `run_summary` card can be emitted on `TaskCompleted`
+/// (turn end) rather than one per response.
+#[derive(Default)]
+struct RunSummaryAccum {
+    model: Option<String>,
+    /// Turn-cumulative token counts — the latest `CostUpdate` carries the total.
+    input_tokens: u64,
+    output_tokens: u64,
+    /// Cumulative session cost from the latest `CostUpdate`.
+    session_cost: Option<f64>,
+    /// Turn cost = sum of the per-response costs seen this turn.
+    turn_cost: f64,
+    has_cost: bool,
+}
+
 /// Events forwarded from the synchronous reporter to the async forwarder.
 #[derive(Debug)]
 pub enum StreamProgressEvent {
@@ -70,6 +90,9 @@ pub struct ChannelStreamReporter {
     /// `tool_call` card can echo what the tool was asked to do (the
     /// completion event itself does not carry the arguments).
     tool_args: Mutex<HashMap<String, serde_json::Value>>,
+    /// Per-turn token/cost accumulator, drained on `TaskCompleted` into a
+    /// single `run_summary` card.
+    run_accum: Mutex<Option<RunSummaryAccum>>,
 }
 
 impl ChannelStreamReporter {
@@ -78,6 +101,7 @@ impl ChannelStreamReporter {
             tx,
             thread_id: None,
             tool_args: Mutex::new(HashMap::new()),
+            run_accum: Mutex::new(None),
         }
     }
 
@@ -180,33 +204,37 @@ impl ProgressReporter for ChannelStreamReporter {
                 let _ = self.tx.send(StreamProgressEvent::RawSse {
                     json: payload.to_string(),
                 });
-                // Project a `tool_call` card (org.octos.app) so capable clients
-                // render the invocation as a structured card (name · status ·
-                // args · result · duration).
+                // Consume any recorded args regardless, so the entry never leaks.
                 let arguments = self
                     .tool_args
                     .lock()
                     .ok()
                     .and_then(|mut m| m.remove(tool_id));
-                let status = if success { "completed" } else { "error" };
-                let mut initial_state = serde_json::json!({
-                    "tool_name": name,
-                    "status": status,
-                    "duration_ms": duration.as_millis() as u64,
-                });
-                if let Some(args) = arguments {
-                    initial_state["arguments"] = args;
+                // Project a `tool_call` card (org.octos.app) so capable clients
+                // render the invocation as a structured card (name · status ·
+                // args · result · duration) — except for tools that already emit
+                // their own card, which would otherwise be duplicated.
+                if !SELF_CARDING_TOOLS.contains(&name.as_str()) {
+                    let status = if success { "completed" } else { "error" };
+                    let mut initial_state = serde_json::json!({
+                        "tool_name": name,
+                        "status": status,
+                        "duration_ms": duration.as_millis() as u64,
+                    });
+                    if let Some(args) = arguments {
+                        initial_state["arguments"] = args;
+                    }
+                    let preview = truncate_card_preview(output_preview, 600);
+                    if !preview.is_empty() {
+                        let key = if success { "output_preview" } else { "error" };
+                        initial_state[key] = serde_json::Value::String(preview);
+                    }
+                    let _ = self.tx.send(StreamProgressEvent::AppCard {
+                        card_type: "tool_call".to_string(),
+                        body: format!("{name} {status}"),
+                        initial_state,
+                    });
                 }
-                let preview = truncate_card_preview(output_preview, 600);
-                if !preview.is_empty() {
-                    let key = if success { "output_preview" } else { "error" };
-                    initial_state[key] = serde_json::Value::String(preview);
-                }
-                let _ = self.tx.send(StreamProgressEvent::AppCard {
-                    card_type: "tool_call".to_string(),
-                    body: format!("{name} {status}"),
-                    initial_state,
-                });
                 StreamProgressEvent::ToolCompleted {
                     name: name.clone(),
                     success,
@@ -253,11 +281,31 @@ impl ProgressReporter for ChannelStreamReporter {
             ProgressEvent::CostUpdate {
                 session_input_tokens,
                 session_output_tokens,
+                turn_input_tokens,
+                turn_output_tokens,
+                response_cost,
                 session_cost,
                 model,
                 context_window,
-                ..
             } => {
+                // Accumulate the turn's token/cost figures for a single
+                // `run_summary` card emitted on TaskCompleted (turn end).
+                if let Ok(mut acc) = self.run_accum.lock() {
+                    let a = acc.get_or_insert_with(RunSummaryAccum::default);
+                    a.input_tokens = turn_input_tokens as u64;
+                    a.output_tokens = turn_output_tokens as u64;
+                    if model.is_some() {
+                        a.model = model.clone();
+                    }
+                    if let Some(c) = session_cost {
+                        a.session_cost = Some(c);
+                        a.has_cost = true;
+                    }
+                    if let Some(c) = response_cost {
+                        a.turn_cost += c;
+                        a.has_cost = true;
+                    }
+                }
                 // Codex round-1 P2: every wire-shape mapper for
                 // `cost_update` must carry `model` so the chat bubble
                 // footer (`model · tokens_in / tokens_out · duration`)
@@ -293,6 +341,36 @@ impl ProgressReporter for ChannelStreamReporter {
                     body: "Plan updated".to_string(),
                     initial_state: plan,
                 });
+                return;
+            }
+            ProgressEvent::TaskCompleted { duration, .. } => {
+                // Drain the accumulated cost into one per-turn `run_summary`
+                // card. Matrix canonical JSON forbids floats, so costs are sent
+                // as decimal strings.
+                if let Some(acc) = self.run_accum.lock().ok().and_then(|mut a| a.take()) {
+                    let mut initial_state = serde_json::json!({
+                        "input_tokens": acc.input_tokens,
+                        "output_tokens": acc.output_tokens,
+                        "total_tokens": acc.input_tokens + acc.output_tokens,
+                        "duration_ms": duration.as_millis() as u64,
+                    });
+                    if let Some(m) = acc.model {
+                        initial_state["model"] = serde_json::Value::String(m);
+                    }
+                    if acc.has_cost {
+                        initial_state["response_cost"] =
+                            serde_json::Value::String(format!("{:.4}", acc.turn_cost));
+                        if let Some(sc) = acc.session_cost {
+                            initial_state["session_cost"] =
+                                serde_json::Value::String(format!("{:.4}", sc));
+                        }
+                    }
+                    let _ = self.tx.send(StreamProgressEvent::AppCard {
+                        card_type: "run_summary".to_string(),
+                        body: "Turn complete".to_string(),
+                        initial_state,
+                    });
+                }
                 return;
             }
             _ => return,
@@ -1202,6 +1280,67 @@ mod tests {
             plan_state["items"][0]["status"].as_str(),
             Some("in_progress")
         );
+    }
+
+    /// The reporter coalesces per-response `CostUpdate`s and emits ONE
+    /// `run_summary` card on `TaskCompleted` (turn end): turn-cumulative tokens,
+    /// summed turn cost, and duration. Costs are decimal strings (Matrix
+    /// canonical JSON forbids floats).
+    #[test]
+    fn projects_run_summary_on_turn_end() {
+        use octos_agent::progress::ProgressEvent;
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let reporter = ChannelStreamReporter::new(tx);
+
+        reporter.report(ProgressEvent::CostUpdate {
+            session_input_tokens: 100,
+            session_output_tokens: 50,
+            turn_input_tokens: 40,
+            turn_output_tokens: 20,
+            response_cost: Some(0.001),
+            session_cost: Some(0.010),
+            model: Some("deepseek-chat".into()),
+            context_window: Some(64000),
+        });
+        reporter.report(ProgressEvent::CostUpdate {
+            session_input_tokens: 130,
+            session_output_tokens: 70,
+            turn_input_tokens: 70, // turn-cumulative -> latest wins
+            turn_output_tokens: 40,
+            response_cost: Some(0.002), // summed with the first -> 0.0030
+            session_cost: Some(0.013),
+            model: Some("deepseek-chat".into()),
+            context_window: Some(64000),
+        });
+        reporter.report(ProgressEvent::TaskCompleted {
+            success: true,
+            iterations: 2,
+            duration: Duration::from_millis(3400),
+        });
+
+        let mut card = None;
+        while let Ok(event) = rx.try_recv() {
+            if let StreamProgressEvent::AppCard {
+                card_type,
+                initial_state,
+                ..
+            } = event
+            {
+                if card_type == "run_summary" {
+                    card = Some(initial_state);
+                }
+            }
+        }
+        let card = card.expect("expected a run_summary card on TaskCompleted");
+
+        assert_eq!(card["model"].as_str(), Some("deepseek-chat"));
+        assert_eq!(card["input_tokens"].as_u64(), Some(70));
+        assert_eq!(card["output_tokens"].as_u64(), Some(40));
+        assert_eq!(card["total_tokens"].as_u64(), Some(110));
+        assert_eq!(card["duration_ms"].as_u64(), Some(3400));
+        assert_eq!(card["response_cost"].as_str(), Some("0.0030"));
+        assert_eq!(card["session_cost"].as_str(), Some("0.0130"));
     }
 
     /// The channel stream reporter feeds API/channel clients that read
