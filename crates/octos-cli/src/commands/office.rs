@@ -1672,14 +1672,14 @@ fn lexical_normalize(path: &Path) -> PathBuf {
             Component::ParentDir => {
                 if matches!(out.last(), Some(Component::Normal(_))) {
                     out.pop();
-                } else if !matches!(
-                    out.last(),
-                    Some(Component::RootDir) | Some(Component::Prefix(_))
-                ) {
-                    // Empty stack or a preceding `..`: preserve this `..`.
+                } else if !matches!(out.last(), Some(Component::RootDir)) {
+                    // Preserve `..` unless it follows a real filesystem root
+                    // (`RootDir`). A bare Windows drive prefix like `C:` is
+                    // drive-RELATIVE (`C:package`, not `C:\package`), so a `..`
+                    // after it can still climb above the root and must be kept.
                     out.push(Component::ParentDir);
                 }
-                // else: at a filesystem root, `..` is a no-op.
+                // else: at a filesystem root (after RootDir), `..` is a no-op.
             }
             other => out.push(other),
         }
@@ -3435,6 +3435,29 @@ mod tests {
                 Path::new("../package")
             ),
             None
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn normalize_path_rejects_drive_relative_escape_and_reenter() {
+        // `C:package` is drive-RELATIVE (unlike `C:\package`), so a target may
+        // climb above the root and re-enter a same-named dir elsewhere. Dropping
+        // the `..` after the bare `C:` prefix would mask that as contained.
+        assert_eq!(
+            normalize_path(
+                Path::new(r"C:package\xl\..\..\..\package\secret"),
+                Path::new("C:package")
+            ),
+            None
+        );
+        // A genuinely contained drive-relative target still resolves.
+        assert_eq!(
+            normalize_path(
+                Path::new(r"C:package\media\img.png"),
+                Path::new("C:package")
+            ),
+            Some(PathBuf::from(r"media\img.png"))
         );
     }
 
