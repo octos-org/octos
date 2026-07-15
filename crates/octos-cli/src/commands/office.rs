@@ -1658,8 +1658,8 @@ fn walkdir_inner(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
     Ok(())
 }
 
-fn normalize_path(path: &Path, base: &Path) -> Option<PathBuf> {
-    // Simple normalization: resolve .. and .
+/// Lexically resolve `.` and `..` components without touching the filesystem.
+fn lexical_normalize(path: &Path) -> PathBuf {
     let mut components = Vec::new();
     for comp in path.components() {
         match comp {
@@ -1670,8 +1670,17 @@ fn normalize_path(path: &Path, base: &Path) -> Option<PathBuf> {
             other => components.push(other),
         }
     }
-    let normalized: PathBuf = components.iter().collect();
-    normalized.strip_prefix(base).ok().map(|p| p.to_path_buf())
+    components.iter().collect()
+}
+
+fn normalize_path(path: &Path, base: &Path) -> Option<PathBuf> {
+    // Normalize BOTH sides before the containment check: `base` may itself be
+    // non-canonical (e.g. `octos office validate .`, or `/tmp/../tmp/pkg`), and
+    // stripping an un-normalized prefix from a normalized path would wrongly
+    // report a contained target as escaping.
+    let normalized = lexical_normalize(path);
+    let base = lexical_normalize(base);
+    normalized.strip_prefix(&base).ok().map(|p| p.to_path_buf())
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -3331,6 +3340,30 @@ mod tests {
         )
         .unwrap();
         assert!(cmd_validate(dir, false).is_ok());
+    }
+
+    #[test]
+    fn validate_accepts_parent_relative_target_with_noncanonical_root() {
+        // Regression: containment must hold even when the package root itself is
+        // non-canonical (e.g. `octos office validate .` or `/tmp/../tmp/pkg`).
+        // Build under <tmp>/pkg but validate via <tmp>/pkg/../pkg.
+        let tmp = tempfile::tempdir().unwrap();
+        let pkg = tmp.path().join("pkg");
+        fs::create_dir_all(pkg.join("media")).unwrap();
+        fs::write(pkg.join("media/image.png"), "png").unwrap();
+        fs::write(
+            pkg.join("[Content_Types].xml"),
+            r#"<?xml version="1.0"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"/>"#,
+        )
+        .unwrap();
+        fs::create_dir_all(pkg.join("xl/_rels")).unwrap();
+        fs::write(
+            pkg.join("xl/_rels/workbook.xml.rels"),
+            r#"<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="../media/image.png"/></Relationships>"#,
+        )
+        .unwrap();
+        let noncanonical = pkg.join("..").join("pkg");
+        assert!(cmd_validate(&noncanonical, false).is_ok());
     }
 
     #[test]
