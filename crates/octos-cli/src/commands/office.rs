@@ -1110,28 +1110,29 @@ fn cmd_validate(path: &Path, auto_repair: bool) -> Result<()> {
             } else {
                 rels_parent
             };
-            // Reject traversal: a crafted "../.." target must not let `.exists()`
-            // probe files outside the package.
-            if std::path::Path::new(stripped)
-                .components()
-                .any(|c| matches!(c, std::path::Component::ParentDir))
-            {
-                let rel_from = entry.strip_prefix(&dir).unwrap_or(&entry);
-                issues.push(format!(
-                    "{}: target '{}' escapes the package root",
-                    rel_from.display(),
-                    target
-                ));
-                continue;
-            }
-            let resolved = base.join(stripped);
-            if !resolved.exists() {
-                let rel_from = entry.strip_prefix(&dir).unwrap_or(&entry);
-                issues.push(format!(
-                    "{}: target '{}' does not exist",
-                    rel_from.display(),
-                    target
-                ));
+            // Lexically normalize the joined path (resolve `.`/`..` without
+            // touching the filesystem) and require it to stay inside the package
+            // root. Parent-relative targets like "../media/image1.png" are legal
+            // OPC and resolve INSIDE the package (the CLI itself emits them), so
+            // we reject only a target whose normalized path actually escapes
+            // `dir` — not any target that merely contains "..".
+            let rel_from = || entry.strip_prefix(&dir).unwrap_or(&entry).to_path_buf();
+            match normalize_path(&base.join(stripped), &dir) {
+                None => {
+                    issues.push(format!(
+                        "{}: target '{}' escapes the package root",
+                        rel_from().display(),
+                        target
+                    ));
+                }
+                Some(rel) if !dir.join(&rel).exists() => {
+                    issues.push(format!(
+                        "{}: target '{}' does not exist",
+                        rel_from().display(),
+                        target
+                    ));
+                }
+                Some(_) => {}
             }
         }
     }
@@ -3304,6 +3305,32 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         write_package(tmp.path(), "/xl/worksheet.xml", false);
         assert!(cmd_validate(tmp.path(), false).is_err());
+    }
+
+    #[test]
+    fn validate_accepts_parent_relative_target_inside_package() {
+        // Regression: legal OPC parent-relative targets ("../media/image.png",
+        // which the CLI itself emits) resolve INSIDE the package and must NOT be
+        // rejected as escaping — only targets whose normalized path leaves the
+        // package root are flagged.
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        fs::write(
+            dir.join("[Content_Types].xml"),
+            r#"<?xml version="1.0"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"/>"#,
+        )
+        .unwrap();
+        fs::create_dir_all(dir.join("media")).unwrap();
+        fs::write(dir.join("media/image.png"), "png").unwrap();
+        // rels at xl/_rels/*.rels -> its parent part is `xl`, so "../media/..."
+        // resolves to <pkg>/media/image.png.
+        fs::create_dir_all(dir.join("xl/_rels")).unwrap();
+        fs::write(
+            dir.join("xl/_rels/workbook.xml.rels"),
+            r#"<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="../media/image.png"/></Relationships>"#,
+        )
+        .unwrap();
+        assert!(cmd_validate(dir, false).is_ok());
     }
 
     #[test]

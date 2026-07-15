@@ -199,6 +199,11 @@ fn cmd_add(
     channel: Option<String>,
     to: Option<String>,
 ) -> Result<()> {
+    // Capture a single `now` and reuse it for overflow validation, creation, and
+    // scheduling — otherwise a boundary-sized interval can pass a check taken at
+    // one instant and then overflow the addition taken a moment later.
+    let now_ms = Utc::now().timestamp_millis();
+
     let schedule = if let Some(secs) = every {
         if secs <= 0 {
             eyre::bail!("--every must be a positive number of seconds (got {secs})");
@@ -206,14 +211,11 @@ fn cmd_add(
         let every_ms = secs.checked_mul(1000).ok_or_else(|| {
             eyre::eyre!("--every is too large: {secs} seconds overflows the millisecond interval")
         })?;
-        // `compute_next_run` adds `every_ms` to the current timestamp; reject a
-        // value so large that `now_ms + every_ms` would overflow i64 (which
-        // panics in debug and wraps to a negative, immediately-due time).
-        if Utc::now()
-            .timestamp_millis()
-            .checked_add(every_ms)
-            .is_none()
-        {
+        // `compute_next_run` adds `every_ms` to `now_ms`; reject a value so large
+        // that the addition would overflow i64 (which panics in debug and wraps
+        // to a negative, immediately-due time). Uses the SAME `now_ms` that
+        // scheduling will use below.
+        if now_ms.checked_add(every_ms).is_none() {
             eyre::bail!("--every is too large: {secs} seconds overflows the next-run timestamp");
         }
         CronSchedule::Every { every_ms }
@@ -248,11 +250,11 @@ fn cmd_add(
             chat_id: to,
         },
         state: Default::default(),
-        created_at_ms: Utc::now().timestamp_millis(),
+        created_at_ms: now_ms,
         delete_after_run,
         timezone: None,
     };
-    job.compute_next_run(Utc::now().timestamp_millis());
+    job.compute_next_run(now_ms);
 
     let mut store = load_store(store_path);
     store.jobs.push(job);
