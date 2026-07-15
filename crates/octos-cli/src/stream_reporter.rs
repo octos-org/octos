@@ -93,6 +93,9 @@ pub struct ChannelStreamReporter {
     /// Per-turn token/cost accumulator, drained on `TaskCompleted` into a
     /// single `run_summary` card.
     run_accum: Mutex<Option<RunSummaryAccum>>,
+    /// Files modified this turn (deduped), drained on `TaskCompleted` into a
+    /// single `artifact` card — so N edits never post N cards.
+    modified_files: Mutex<Vec<String>>,
 }
 
 impl ChannelStreamReporter {
@@ -102,6 +105,7 @@ impl ChannelStreamReporter {
             thread_id: None,
             tool_args: Mutex::new(HashMap::new()),
             run_accum: Mutex::new(None),
+            modified_files: Mutex::new(Vec::new()),
         }
     }
 
@@ -122,6 +126,24 @@ fn inject_thread_id(value: &mut serde_json::Value, thread_id: Option<&str>) {
             "thread_id".to_string(),
             serde_json::Value::String(tid.to_string()),
         );
+    }
+}
+
+/// Coarse artifact kind from a file extension, feeding the `artifact` card's
+/// per-item glyph on the client.
+fn artifact_kind_for(path: &str) -> &'static str {
+    let ext = std::path::Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    match ext.as_str() {
+        "rs" | "py" | "js" | "ts" | "go" | "c" | "cpp" | "h" | "java" | "rb" | "sh" => "code",
+        "md" | "txt" | "rst" | "adoc" => "doc",
+        "png" | "jpg" | "jpeg" | "gif" | "svg" | "webp" => "image",
+        "json" | "csv" | "tsv" | "yaml" | "yml" | "toml" => "data",
+        "log" => "log",
+        _ => "file",
     }
 }
 
@@ -261,7 +283,15 @@ impl ProgressReporter for ChannelStreamReporter {
                 }
             }
             ProgressEvent::LlmStatus { message, .. } => StreamProgressEvent::LlmStatus { message },
-            ProgressEvent::FileModified { path } => StreamProgressEvent::FileWritten { path },
+            ProgressEvent::FileModified { path } => {
+                // Record for a coalesced `artifact` card at turn end (deduped).
+                if let Ok(mut v) = self.modified_files.lock() {
+                    if !v.iter().any(|p| p == &path) {
+                        v.push(path.clone());
+                    }
+                }
+                StreamProgressEvent::FileWritten { path }
+            }
             ProgressEvent::StreamRetry { .. } => StreamProgressEvent::BufferReset,
             // Forward discrete progress events as raw SSE JSON for the web client.
             ProgressEvent::Thinking { iteration } => {
@@ -369,6 +399,35 @@ impl ProgressReporter for ChannelStreamReporter {
                         card_type: "run_summary".to_string(),
                         body: "Turn complete".to_string(),
                         initial_state,
+                    });
+                }
+                // Emit one `artifact` card listing the files produced this turn.
+                if let Some(files) = self
+                    .modified_files
+                    .lock()
+                    .ok()
+                    .map(|mut v| std::mem::take(&mut *v))
+                    .filter(|v| !v.is_empty())
+                {
+                    let artifacts: Vec<serde_json::Value> = files
+                        .iter()
+                        .map(|path| {
+                            let filename = std::path::Path::new(path)
+                                .file_name()
+                                .and_then(|n| n.to_str())
+                                .unwrap_or(path.as_str());
+                            serde_json::json!({
+                                "title": filename,
+                                "kind": artifact_kind_for(path),
+                                "status": "ready",
+                                "path": path,
+                            })
+                        })
+                        .collect();
+                    let _ = self.tx.send(StreamProgressEvent::AppCard {
+                        card_type: "artifact".to_string(),
+                        body: format!("{} file(s) written", files.len()),
+                        initial_state: serde_json::json!({ "artifacts": artifacts }),
                     });
                 }
                 return;
@@ -1341,6 +1400,53 @@ mod tests {
         assert_eq!(card["duration_ms"].as_u64(), Some(3400));
         assert_eq!(card["response_cost"].as_str(), Some("0.0030"));
         assert_eq!(card["session_cost"].as_str(), Some("0.0130"));
+    }
+
+    /// Files modified during a turn are deduped and coalesced into ONE
+    /// `artifact` card on `TaskCompleted`, with a kind inferred per extension.
+    #[test]
+    fn projects_artifact_card_coalesced_on_turn_end() {
+        use octos_agent::progress::ProgressEvent;
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let reporter = ChannelStreamReporter::new(tx);
+
+        reporter.report(ProgressEvent::FileModified {
+            path: "src/auth/mod.rs".into(),
+        });
+        reporter.report(ProgressEvent::FileModified {
+            path: "src/auth/mod.rs".into(), // duplicate -> one entry
+        });
+        reporter.report(ProgressEvent::FileModified {
+            path: "README.md".into(),
+        });
+        reporter.report(ProgressEvent::TaskCompleted {
+            success: true,
+            iterations: 1,
+            duration: Duration::from_millis(10),
+        });
+
+        let mut art = None;
+        while let Ok(event) = rx.try_recv() {
+            if let StreamProgressEvent::AppCard {
+                card_type,
+                initial_state,
+                ..
+            } = event
+            {
+                if card_type == "artifact" {
+                    art = Some(initial_state);
+                }
+            }
+        }
+        let art = art.expect("expected an artifact card on TaskCompleted");
+        let items = art["artifacts"].as_array().expect("artifacts array");
+        assert_eq!(items.len(), 2, "src/auth/mod.rs deduped -> 2 files");
+        assert_eq!(items[0]["title"].as_str(), Some("mod.rs"));
+        assert_eq!(items[0]["kind"].as_str(), Some("code"));
+        assert_eq!(items[0]["path"].as_str(), Some("src/auth/mod.rs"));
+        assert_eq!(items[1]["title"].as_str(), Some("README.md"));
+        assert_eq!(items[1]["kind"].as_str(), Some("doc"));
     }
 
     /// The channel stream reporter feeds API/channel clients that read
