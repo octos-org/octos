@@ -378,6 +378,7 @@ Session, turn, and approval core:
 - `session/fork` (branch a session into a new one with copied history; #1613)
 - `session/btw` (quick aside question answered while the current turn runs; #1609)
 - `session/compact` (force a context-compaction pass on the session now; the manual `/compact` command)
+- `session/compact/mode/set` (per-session LLM-vs-heuristic compaction mode; the `/context` menu)
 - `turn/start`
 - `turn/interrupt`
 - `turn/state/get` (gate `state.turn_state_get.v1`, accepted `UPCR-2026-011`)

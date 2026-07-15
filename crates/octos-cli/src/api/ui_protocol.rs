@@ -185,6 +185,9 @@ const APPUI_METHOD_TOOL_STATUS_LIST: &str = "tool/status/list";
 /// TUI command). Forces the compaction pass regardless of the auto-compaction
 /// threshold; AppUI-only, so a local literal like the other AppUI methods.
 const APPUI_METHOD_SESSION_COMPACT: &str = "session/compact";
+/// Set the per-session compaction mode (LLM vs heuristic) from the `/context`
+/// menu; overrides the `--llm-compaction` default for auto + manual compaction.
+const APPUI_METHOD_SESSION_COMPACT_MODE_SET: &str = "session/compact/mode/set";
 const APPUI_METHOD_AUTH_STATUS: &str = "auth/status";
 const APPUI_METHOD_AUTH_SEND_CODE: &str = "auth/send_code";
 const APPUI_METHOD_AUTH_VERIFY: &str = "auth/verify";
@@ -269,6 +272,7 @@ const APPUI_EXTRA_METHODS: &[&str] = &[
     APPUI_METHOD_ONBOARDING_WORKSPACE_PROBE,
     octos_core::ui_protocol::methods::SESSION_BTW,
     APPUI_METHOD_SESSION_COMPACT,
+    APPUI_METHOD_SESSION_COMPACT_MODE_SET,
 ];
 const APPUI_STDIO_AUTH_BOUND_UNAVAILABLE_METHODS: &[&str] = &[
     APPUI_METHOD_AUTH_ME,
@@ -2083,6 +2087,45 @@ fn appui_context_compact_keep_items() -> usize {
         .unwrap_or(APPUI_CONTEXT_COMPACT_KEEP_ITEMS)
 }
 
+/// Per-session compaction-mode override, set from the `/context` menu via
+/// `session/compact/mode/set`. `true` = force the LLM summary path, `false` =
+/// force the heuristic. Absent = follow the server `--llm-compaction` default.
+/// In-memory per serve process (resets on restart), like the other per-session
+/// runtime maps in this module.
+fn session_compaction_llm_override() -> &'static std::sync::RwLock<HashMap<SessionKey, bool>> {
+    static OVERRIDE: OnceLock<std::sync::RwLock<HashMap<SessionKey, bool>>> = OnceLock::new();
+    OVERRIDE.get_or_init(|| std::sync::RwLock::new(HashMap::new()))
+}
+
+/// Effective LLM-vs-heuristic decision for a session: the per-session `/context`
+/// override if set, else the server `--llm-compaction` default. Read by all
+/// three compaction sites (auto pre-turn, auto in-loop, manual `session/compact`).
+fn session_compaction_llm_enabled(session_id: &SessionKey, state: &AppState) -> bool {
+    session_compaction_llm_override()
+        .read()
+        .ok()
+        .and_then(|map| map.get(session_id).copied())
+        .unwrap_or(state.llm_compaction)
+}
+
+/// Persist a per-session compaction-mode override.
+fn set_session_compaction_llm(session_id: &SessionKey, llm: bool) {
+    if let Ok(mut map) = session_compaction_llm_override().write() {
+        map.insert(session_id.clone(), llm);
+    }
+}
+
+/// Effective compaction mode as a wire string (`"llm"` / `"heuristic"`), for the
+/// `session/status/read` payload and the `session/compact*` RPC replies so the
+/// `/context` menu can render + reflect the current selection.
+fn session_compaction_mode_str(session_id: &SessionKey, state: &AppState) -> &'static str {
+    if session_compaction_llm_enabled(session_id, state) {
+        "llm"
+    } else {
+        "heuristic"
+    }
+}
+
 /// Produce an LLM-summarization compaction summary for the AppUI path, falling
 /// back to the deterministic [`compact_messages`] heuristic whenever the LLM
 /// summary errors, times out, or the runtime is unsupported — so it can never
@@ -2284,6 +2327,34 @@ fn appui_force_compact_context(
     (lifecycle_notifications, result)
 }
 
+/// `session/compact/mode/set`: set the per-session compaction-mode override
+/// from the `/context` menu. Params `{ session_id, mode: "llm" | "heuristic" }`.
+/// The override wins over the server `--llm-compaction` default for BOTH the
+/// automatic compaction and manual `session/compact`.
+fn handle_session_compact_mode_set(
+    state: &Arc<AppState>,
+    request: &RpcRequest<Value>,
+) -> Result<Value, RpcError> {
+    let params: RawProfileParams = parse_raw_params(request)?;
+    let Some(session_id) = params.session_id.clone() else {
+        return Err(RpcError::invalid_params("session_id is required"));
+    };
+    let llm = match request.params.get("mode").and_then(Value::as_str) {
+        Some("llm") => true,
+        Some("heuristic") => false,
+        _ => {
+            return Err(RpcError::invalid_params(
+                "mode is required and must be \"llm\" or \"heuristic\"",
+            ));
+        }
+    };
+    set_session_compaction_llm(&session_id, llm);
+    Ok(json!({
+        "session_id": session_id,
+        "mode": session_compaction_mode_str(&session_id, state),
+    }))
+}
+
 /// `session/compact`: force a context-compaction pass on an open session,
 /// bypassing the auto-compaction threshold (powers the manual `/compact`
 /// command). Resolves the already-open session runtime — a cache hit for the
@@ -2344,7 +2415,7 @@ async fn handle_session_compact(
         &session_id,
         &history,
         &llm_provider,
-        state.llm_compaction,
+        session_compaction_llm_enabled(&session_id, state),
     );
     for notification in notifications {
         if features.context_lifecycle_available() {
@@ -9466,6 +9537,7 @@ async fn handle_raw_appui_rpc(
             handle_session_compact(ws, state, ledger, features, connection_profile_id, request)
                 .await
         }
+        APPUI_METHOD_SESSION_COMPACT_MODE_SET => handle_session_compact_mode_set(state, request),
         APPUI_METHOD_PROFILE_LLM_CATALOG => raw_catalog_result(state, connection_profile_id),
         APPUI_METHOD_PROFILE_LLM_LIST => {
             let params: RawProfileParams = match parse_raw_params(request) {
@@ -9909,6 +9981,7 @@ fn raw_method_is_dispatched(method: &str, stdio_transport: bool) -> bool {
             | APPUI_METHOD_TOOL_STATUS_LIST
             | APPUI_METHOD_ONBOARDING_WORKSPACE_PROBE
             | APPUI_METHOD_SESSION_COMPACT
+            | APPUI_METHOD_SESSION_COMPACT_MODE_SET
     ) {
         return true;
     }
@@ -21045,7 +21118,7 @@ async fn run_standalone_turn(
             &session_id,
             &raw_history,
             &llm_provider,
-            state.llm_compaction,
+            session_compaction_llm_enabled(&session_id, &state),
             "appui_pre_turn",
         );
     for notification in context_lifecycle_notifications {
@@ -21945,7 +22018,7 @@ async fn run_standalone_turn(
     .with_context_lifecycle_notify(context_lifecycle_notify);
     // Only wire the provider when `--llm-compaction` is on; a present provider
     // is what flips the in-loop bridge to the LLM-summarization path.
-    if state.llm_compaction {
+    if session_compaction_llm_enabled(&session_id, &state) {
         prompt_context_bridge_inner =
             prompt_context_bridge_inner.with_llm_compaction_provider(llm_provider.clone());
     }
@@ -28813,6 +28886,9 @@ mod tests {
             methods::ROUTER_GET_METRICS => json!({ "session_id": session_id }),
             methods::LAUNCH_RESOLVE => json!({ "cwd": "/tmp/probe-launch-resolve" }),
             APPUI_METHOD_SESSION_COMPACT => json!({ "session_id": session_id }),
+            APPUI_METHOD_SESSION_COMPACT_MODE_SET => {
+                json!({ "session_id": session_id, "mode": "heuristic" })
+            }
             other => panic!("missing AppUI dispatch probe params for {other}"),
         };
 
