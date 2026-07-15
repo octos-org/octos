@@ -12,6 +12,7 @@ pub const ENTRY: ProviderEntry = ProviderEntry {
     aliases: &["google"],
     default_model: Some("gemini-2.5-flash"),
     api_key_env: Some("GEMINI_API_KEY"),
+    key_env_aliases: &[],
     default_base_url: Some("https://generativelanguage.googleapis.com/v1beta"),
     requires_api_key: true,
     requires_base_url: false,

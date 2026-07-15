@@ -12,6 +12,7 @@ pub const ENTRY: ProviderEntry = ProviderEntry {
     aliases: &[],
     default_model: None,
     api_key_env: Some("VLLM_API_KEY"),
+    key_env_aliases: &[],
     default_base_url: None,
     requires_api_key: false,
     requires_base_url: true,

@@ -69,6 +69,12 @@ pub struct ProviderEntry {
     pub default_model: Option<&'static str>,
     /// Environment variable holding the API key. `None` = no key required.
     pub api_key_env: Option<&'static str>,
+    /// Additional accepted API-key env var names for this provider, beyond
+    /// `api_key_env` (e.g. Moonshot accepts both `MOONSHOT_API_KEY` and
+    /// `KIMI_API_KEY`). Only consulted when the configured key var is already
+    /// one of the provider's known names — an arbitrary custom `api_key_env`
+    /// override stays exclusive and never falls back to these.
+    pub key_env_aliases: &'static [&'static str],
     /// Default base URL. `None` = must be provided by user.
     pub default_base_url: Option<&'static str>,
     /// Whether construction fails without an API key.
@@ -81,6 +87,25 @@ pub struct ProviderEntry {
     pub detect_patterns: &'static [&'static str],
     /// Factory function with full control over provider construction.
     pub create: fn(CreateParams) -> Result<Arc<dyn LlmProvider>>,
+}
+
+impl ProviderEntry {
+    /// Every API-key env var name this provider accepts: the primary
+    /// `api_key_env` plus any declared `key_env_aliases`.
+    pub fn key_env_names(&self) -> impl Iterator<Item = &'static str> {
+        self.api_key_env
+            .into_iter()
+            .chain(self.key_env_aliases.iter().copied())
+    }
+
+    /// Whether `name` is one of this provider's declared key env var names.
+    /// Comparison is case-SENSITIVE: environment variable names are
+    /// case-sensitive on Unix, so a genuinely custom `kimi_api_key` must NOT be
+    /// treated as the declared `KIMI_API_KEY` (doing so would let a missing
+    /// custom override fall back to an ambient sibling credential).
+    pub fn is_known_key_env(&self, name: &str) -> bool {
+        self.key_env_names().any(|k| k == name)
+    }
 }
 
 // ── Master list ─────────────────────────────────────────────────────────────

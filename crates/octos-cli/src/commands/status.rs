@@ -35,7 +35,7 @@ const PROVIDER_ENV_VARS: &[(&str, &str)] = &[
     ("OpenRouter", "OPENROUTER_API_KEY"),
     ("DeepSeek", "DEEPSEEK_API_KEY"),
     ("Groq", "GROQ_API_KEY"),
-    ("Moonshot", "MOONSHOT_API_KEY"),
+    ("Moonshot", "KIMI_API_KEY"),
     ("DashScope", "DASHSCOPE_API_KEY"),
     ("MiniMax", "MINIMAX_API_KEY"),
     ("Zhipu", "ZHIPU_API_KEY"),
@@ -123,7 +123,19 @@ fn show_system_status(cwd: &std::path::Path) -> Result<()> {
     println!("{}", "─".repeat(50).dimmed());
 
     for (label, env_var) in PROVIDER_ENV_VARS {
-        let status = if std::env::var(env_var).is_ok() {
+        // A provider may accept more than one key env var (e.g. Moonshot declares
+        // KIMI_API_KEY in `key_env_aliases` alongside MOONSHOT_API_KEY). Treat it
+        // as "set" when the displayed var OR any declared sibling key var holds a
+        // non-empty value, matching exactly what config resolution accepts (which
+        // also rejects empty strings).
+        let is_var_set = |name: &str| std::env::var(name).is_ok_and(|v| !v.is_empty());
+        let mut is_set = is_var_set(env_var);
+        if !is_set {
+            if let Some(entry) = octos_llm::registry::lookup(&label.to_lowercase()) {
+                is_set = entry.key_env_names().any(is_var_set);
+            }
+        }
+        let status = if is_set {
             "set".green().to_string()
         } else {
             "not set".dimmed().to_string()

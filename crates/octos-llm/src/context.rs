@@ -78,17 +78,35 @@ fn build_catalog_map(entries: &[(String, u64, u64)]) -> HashMap<String, CatalogM
 fn catalog_lookup(model_id: &str) -> Option<(u64, u64)> {
     let guard = CATALOG.read().ok()?;
     let map = guard.as_ref()?;
+    catalog_lookup_in(map, model_id)
+}
+
+/// Pure catalog matcher over a supplied map (no global state), so the matching
+/// rules are unit-testable without racing the shared `CATALOG`.
+fn catalog_lookup_in(map: &HashMap<String, CatalogModel>, model_id: &str) -> Option<(u64, u64)> {
     let m = model_id.to_lowercase();
-    // Try exact match first, then substring match
+    // Try exact match first, then substring match.
     if let Some(entry) = map.get(&m) {
         return Some((entry.context_window, entry.max_output));
     }
-    for (key, entry) in map {
-        if m.contains(key) || key.contains(&m) {
-            return Some((entry.context_window, entry.max_output));
-        }
+    // Deterministic substring match, mirroring pricing.rs so both agree:
+    //   1. Among keys the model id CONTAINS (families the id extends), the
+    //      LONGEST (most specific) wins.
+    //   2. Otherwise, among keys that CONTAIN the model id, the SHORTEST is the
+    //      closest match.
+    // Ties break lexicographically so equal-length keys stay stable. Returning
+    // the first HashMap hit (as before) was nondeterministic across processes.
+    if let Some((_, entry)) = map
+        .iter()
+        .filter(|(key, _)| m.contains(key.as_str()))
+        .max_by(|(a, _), (b, _)| a.len().cmp(&b.len()).then_with(|| b.cmp(a)))
+    {
+        return Some((entry.context_window, entry.max_output));
     }
-    None
+    map.iter()
+        .filter(|(key, _)| key.contains(&m))
+        .min_by(|(a, _), (b, _)| a.len().cmp(&b.len()).then_with(|| a.cmp(b)))
+        .map(|(_, entry)| (entry.context_window, entry.max_output))
 }
 
 // ── Public API ────────────────────────────────────────────────
@@ -238,6 +256,73 @@ mod tests {
 
         // Clean up
         *guard = None;
+    }
+
+    #[test]
+    fn should_deterministically_match_by_substring_mirroring_pricing() {
+        // Regression: the substring fallback returned the first HashMap hit, so
+        // the winner depended on nondeterministic iteration order. Test the pure
+        // matcher over a LOCAL map (no shared CATALOG race), using model ids that
+        // are NOT exact keys so lookup goes through the substring path.
+        let mut map = HashMap::new();
+        for (key, ctx, out) in [
+            ("gpt", 8_000u64, 1_000u64),
+            ("gpt-4o-mini", 128_000, 16_000),
+        ] {
+            map.insert(
+                key.to_string(),
+                CatalogModel {
+                    context_window: ctx,
+                    max_output: out,
+                },
+            );
+        }
+
+        // Branch 1 (model id EXTENDS a family): "gpt-4o-mini-2024-07-18" is not a
+        // key; it contains both "gpt" and "gpt-4o-mini" — the LONGEST wins.
+        // Repeated to shake out any iteration-order dependence.
+        for _ in 0..20 {
+            assert_eq!(
+                catalog_lookup_in(&map, "gpt-4o-mini-2024-07-18"),
+                Some((128_000, 16_000))
+            );
+        }
+        // Branch 2 (a catalog key EXTENDS the model id): "4o-mini" contains no
+        // key, but the key "gpt-4o-mini" contains it, so branch 2 picks that
+        // (shortest containing key).
+        assert_eq!(catalog_lookup_in(&map, "4o-mini"), Some((128_000, 16_000)));
+        // Exact key still short-circuits via map.get.
+        assert_eq!(
+            catalog_lookup_in(&map, "gpt-4o-mini"),
+            Some((128_000, 16_000))
+        );
+    }
+
+    #[test]
+    fn should_break_equal_length_substring_ties_deterministically() {
+        // Two equal-length keys both contained in the model id: length can't
+        // decide, so the lexical tie-break must pick a stable winner (matching
+        // pricing.rs). Repeated to shake out HashMap iteration-order dependence.
+        let mut map = HashMap::new();
+        map.insert(
+            "m-aaa".to_string(),
+            CatalogModel {
+                context_window: 111,
+                max_output: 1,
+            },
+        );
+        map.insert(
+            "m-bbb".to_string(),
+            CatalogModel {
+                context_window: 222,
+                max_output: 2,
+            },
+        );
+        // "x-m-aaa-m-bbb-y" contains both equal-length keys; the lex-smaller
+        // "m-aaa" wins deterministically.
+        for _ in 0..20 {
+            assert_eq!(catalog_lookup_in(&map, "x-m-aaa-m-bbb-y"), Some((111, 1)));
+        }
     }
 
     #[test]

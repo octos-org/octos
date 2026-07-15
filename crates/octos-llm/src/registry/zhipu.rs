@@ -12,6 +12,7 @@ pub const ENTRY: ProviderEntry = ProviderEntry {
     aliases: &["glm"],
     default_model: Some("glm-4-plus"),
     api_key_env: Some("ZHIPU_API_KEY"),
+    key_env_aliases: &[],
     default_base_url: Some("https://open.bigmodel.cn/api/paas/v4"),
     requires_api_key: true,
     requires_base_url: false,

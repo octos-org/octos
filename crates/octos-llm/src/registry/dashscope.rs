@@ -12,6 +12,7 @@ pub const ENTRY: ProviderEntry = ProviderEntry {
     aliases: &["qwen"],
     default_model: Some("qwen-max"),
     api_key_env: Some("DASHSCOPE_API_KEY"),
+    key_env_aliases: &[],
     default_base_url: Some("https://dashscope.aliyuncs.com/compatible-mode/v1"),
     requires_api_key: true,
     requires_base_url: false,
