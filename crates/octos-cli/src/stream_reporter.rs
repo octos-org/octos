@@ -598,6 +598,9 @@ pub async fn run_stream_forwarder(
     operation_updater: Option<Arc<dyn Fn(&str) + Send + Sync>>,
     thread_id: Option<String>,
     matrix_app_reply_tools: Arc<HashSet<String>>,
+    // Session workspace root — used to reconstruct `git diff` for the
+    // `diff_view` card at turn end (`api` feature only).
+    workspace_root: Option<std::path::PathBuf>,
 ) -> StreamResult {
     let mut buffer = String::new();
     let mut message_id: Option<String> = None;
@@ -615,6 +618,10 @@ pub async fn run_stream_forwarder(
     // When true, the channel doesn't support send_with_id (returned None),
     // so we stop streaming edits and let the final reply go through out_tx.
     let mut no_edit_support = false;
+    // Files written this turn (deduped), used to emit ONE `diff_view` card after
+    // the loop (turn end), reconstructed via `git diff`. `api` feature only.
+    #[cfg(feature = "api")]
+    let mut diff_paths: Vec<String> = Vec::new();
 
     while let Some(event) = rx.recv().await {
         match event {
@@ -893,6 +900,11 @@ pub async fn run_stream_forwarder(
                 }
             }
             StreamProgressEvent::FileWritten { path } => {
+                // Record (deduped) for a coalesced `diff_view` card at turn end.
+                #[cfg(feature = "api")]
+                if !diff_paths.contains(&path) {
+                    diff_paths.push(path.clone());
+                }
                 if suppress_follow_up_text_after_app_reply || suppress_matrix_transient_status {
                     continue;
                 }
@@ -968,6 +980,49 @@ pub async fn run_stream_forwarder(
             .await;
         }
     }
+
+    // Turn end: emit ONE `diff_view` card for the files edited this turn, with
+    // each diff reconstructed via `git diff` off the async executor. Coalesced
+    // (one card, net diff), gated on the same matrix + app-reply condition, and
+    // on the `api` feature (which owns the diff-reconstruction helpers).
+    #[cfg(feature = "api")]
+    if suppress_matrix_transient_status
+        && !diff_paths.is_empty()
+        && is_session_active(&session_key, &active_sessions).await
+        && let Some(root) = workspace_root.clone()
+    {
+        let paths = std::mem::take(&mut diff_paths);
+        let initial_state =
+            tokio::task::spawn_blocking(move || crate::api::diff_view_for_paths(&paths, &root))
+                .await
+                .ok()
+                .flatten();
+        if let Some(initial_state) = initial_state {
+            let mut metadata = serde_json::json!({
+                "org.octos.app": {
+                    "type": "diff_view",
+                    "version": 1,
+                    "initial_state": initial_state,
+                }
+            });
+            if let Some(uid) = sender_user_id.as_deref() {
+                metadata[METADATA_SENDER_USER_ID] = serde_json::Value::String(uid.to_string());
+            }
+            let msg = OutboundMessage {
+                channel: channel.name().to_string(),
+                chat_id: chat_id.clone(),
+                content: "Diff preview".to_string(),
+                reply_to: None,
+                media: Vec::new(),
+                metadata,
+            };
+            if let Err(e) = channel.send(&msg).await {
+                warn!("failed to emit diff_view card: {e}");
+            }
+        }
+    }
+    #[cfg(not(feature = "api"))]
+    let _ = &workspace_root;
 
     StreamResult {
         message_id,
@@ -1743,6 +1798,7 @@ mod tests {
             None,
             None,
             Arc::new(HashSet::from(["send_app_card".to_string()])),
+            None,
         )
         .await;
 

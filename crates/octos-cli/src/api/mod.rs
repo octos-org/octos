@@ -68,6 +68,38 @@ pub use preview_tokens::{
 };
 pub use router::{DEFAULT_BASE_DOMAIN, build_router, cors_allowlist_for_base_domain};
 
+/// Build a `diff_view` card's `initial_state` from the files edited during a
+/// turn, reconstructing each file's unified diff via `git diff` (BLOCKING — the
+/// caller must run this off the async executor). Each path with no obtainable
+/// diff (not a git repo, staged-only, …) degrades to a path-only entry, the
+/// same fallback the web diff-preview path ships. Returns `None` when nothing
+/// could be produced. Shared by the Matrix `diff_view` emitter (stream_reporter).
+pub(crate) fn diff_view_for_paths(
+    paths: &[String],
+    workspace_root: &std::path::Path,
+) -> Option<serde_json::Value> {
+    use octos_core::ui_protocol::{UiFileMutationNotice, file_mutation_operations};
+    let mut files = Vec::new();
+    for path in paths {
+        let notice = UiFileMutationNotice::new(path.as_str(), file_mutation_operations::MODIFY);
+        match ui_protocol::materialize_file_mutation_diff(&notice, Some(workspace_root))
+            .and_then(|diff| ui_protocol_diff::parse_unified_diff_preview_files(&diff))
+            .filter(|f| !f.is_empty())
+        {
+            Some(mut f) => files.append(&mut f),
+            None => files.push(ui_protocol_diff::file_from_mutation_notice(&notice)),
+        }
+    }
+    if files.is_empty() {
+        return None;
+    }
+    let n = files.len();
+    Some(serde_json::json!({
+        "title": format!("Edited {n} file(s)"),
+        "files": files,
+    }))
+}
+
 /// Test-only re-exports for the build_output_dir validation suite.
 /// Not part of the public API — used by
 /// `crates/octos-cli/tests/build_output_dir_validation.rs` to assert

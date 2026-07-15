@@ -988,7 +988,7 @@ fn preview_from_file_mutation(
     }
 }
 
-fn file_from_mutation_notice(notice: &UiFileMutationNotice) -> DiffPreviewFile {
+pub(crate) fn file_from_mutation_notice(notice: &UiFileMutationNotice) -> DiffPreviewFile {
     DiffPreviewFile {
         path: super::ui_protocol_sanitize::sanitize_display_path(&notice.path),
         old_path: None,
@@ -1015,7 +1015,7 @@ fn status_from_operation(operation: &str) -> DiffPreviewFileStatus {
     }
 }
 
-fn parse_unified_diff_preview_files(diff: &str) -> Option<Vec<DiffPreviewFile>> {
+pub(crate) fn parse_unified_diff_preview_files(diff: &str) -> Option<Vec<DiffPreviewFile>> {
     let mut files = Vec::new();
     let mut current: Option<DiffPreviewFile> = None;
     let mut current_hunk: Option<DiffPreviewHunk> = None;

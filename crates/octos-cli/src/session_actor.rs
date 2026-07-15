@@ -7489,6 +7489,7 @@ impl SessionActor {
                     // bubble.
                     client_message_id.clone(),
                     Arc::clone(&app_reply_tools),
+                    Some(self.user_workspace.clone()),
                 )))
             } else {
                 drop(stream_rx);
@@ -8620,6 +8621,7 @@ impl SessionActor {
                     // the bubble of whichever turn arrived last.
                     overflow_client_message_id.clone(),
                     Arc::clone(&app_reply_tools),
+                    Some(user_workspace.clone()),
                 )))
             } else {
                 drop(stream_rx);
@@ -9255,6 +9257,7 @@ impl SessionActor {
                     // cmid so streaming chunks stamp it on the wire.
                     client_message_id.clone(),
                     Arc::clone(&app_reply_tools),
+                    Some(self.user_workspace.clone()),
                 )))
             } else {
                 drop(stream_rx);
