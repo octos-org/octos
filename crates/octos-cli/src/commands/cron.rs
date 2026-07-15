@@ -206,6 +206,16 @@ fn cmd_add(
         let every_ms = secs.checked_mul(1000).ok_or_else(|| {
             eyre::eyre!("--every is too large: {secs} seconds overflows the millisecond interval")
         })?;
+        // `compute_next_run` adds `every_ms` to the current timestamp; reject a
+        // value so large that `now_ms + every_ms` would overflow i64 (which
+        // panics in debug and wraps to a negative, immediately-due time).
+        if Utc::now()
+            .timestamp_millis()
+            .checked_add(every_ms)
+            .is_none()
+        {
+            eyre::bail!("--every is too large: {secs} seconds overflows the next-run timestamp");
+        }
         CronSchedule::Every { every_ms }
     } else if let Some(expr) = cron {
         CronSchedule::Cron { expr }
@@ -345,9 +355,29 @@ mod tests {
     }
 
     #[test]
+    fn should_reject_every_that_overflows_next_run_timestamp() {
+        // Regression (codex P2): a value that passes `checked_mul(1000)` can
+        // still overflow `now_ms + every_ms` inside compute_next_run. i64::MAX/1000
+        // multiplies cleanly but the timestamp add overflows — must be rejected.
+        let dir = tempfile::tempdir().unwrap();
+        let store = dir.path().join("cron.json");
+        assert!(add(&store, Some(i64::MAX / 1000)).is_err());
+    }
+
+    #[test]
     fn should_accept_valid_every() {
         let dir = tempfile::tempdir().unwrap();
         let store = dir.path().join("cron.json");
         assert!(add(&store, Some(60)).is_ok());
+    }
+
+    #[test]
+    fn should_error_when_removing_or_enabling_unknown_job() {
+        // Regression: remove/enable on an unknown id used to print red and exit
+        // 0; they must now return Err so scripts can detect failure.
+        let dir = tempfile::tempdir().unwrap();
+        let store = dir.path().join("cron.json");
+        assert!(cmd_remove(&store, "nope").is_err());
+        assert!(cmd_enable(&store, "nope", true).is_err());
     }
 }

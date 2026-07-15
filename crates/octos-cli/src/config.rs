@@ -1786,14 +1786,22 @@ impl Config {
             // provider's default var name (a redundant-but-legal config),
             // the full provider chain — auth store included — still
             // applies, preserving pre-existing login-based setups.
-            Some(var) if Some(var) != Self::provider_default_env_var(provider).as_deref() => {
-                self.resolve_env_var_only(var)
+            // A registry-known key name (the provider's `api_key_env` OR any
+            // declared `key_env_aliases`, e.g. KIMI_API_KEY for moonshot) is
+            // NOT a custom override: run the FULL chain (auth store + sibling
+            // expansion) via `resolve_api_key`, so `octos doctor`, the dashboard,
+            // and embedding config agree with what `get_api_key` accepts. Without
+            // this, an init-generated Moonshot config (api_key_env=KIMI_API_KEY)
+            // would be misclassified as custom and skip the MOONSHOT_API_KEY
+            // fallback + auth store.
+            Some(var) if Self::provider_knows_key_env(provider, var) => {
+                self.resolve_api_key(provider, var.to_string())
             }
-            // Default-name override: the FULL chain (auth store included)
-            // but with THE GIVEN var — get_api_key would re-apply the
-            // top-level Config.api_key_env, which in mixed-provider
-            // configs points at the PRIMARY provider's key (codex R4).
-            Some(var) => self.resolve_api_key(provider, var.to_string()),
+            // A genuinely custom var means "use this variable": the
+            // provider-scoped auth store must not win, or a stored `octos auth
+            // login -p openai` token would be sent to the custom
+            // OpenAI-compatible endpoint the override targets.
+            Some(var) => self.resolve_env_var_only(var),
             None => self.get_api_key(provider),
         }
     }
@@ -1808,6 +1816,17 @@ impl Config {
         )
     }
 
+    /// Whether `name` is one of `provider`'s known key env var names — its
+    /// registry `api_key_env` or a declared `key_env_alias`. For a provider not
+    /// in the registry, falls back to the conventional `{PROVIDER}_API_KEY`.
+    /// Case-sensitive (Unix env names are case-sensitive).
+    pub(crate) fn provider_knows_key_env(provider: &str, name: &str) -> bool {
+        match octos_llm::registry::lookup(provider) {
+            Some(entry) => entry.is_known_key_env(name),
+            None => name == format!("{}_API_KEY", provider.to_uppercase()),
+        }
+    }
+
     /// Resolve a key from an explicit env-var name WITHOUT provider-scoped
     /// auth-store lookup: secret registration → `env_vars` map (keychain-
     /// resolved) → process env.
@@ -1818,8 +1837,14 @@ impl Config {
         }) {
             return Ok(value);
         }
-        std::env::var(env_var)
-            .wrap_err_with(|| format!("{env_var} not set (explicit embedding api_key_env)"))
+        // Treat an empty value as unset, matching `resolve_api_key`, so status
+        // reporting and resolution agree and an empty Bearer key is never sent.
+        match std::env::var(env_var) {
+            Ok(value) if !value.is_empty() => Ok(value),
+            _ => Err(eyre::eyre!(
+                "{env_var} not set or empty (explicit embedding api_key_env)"
+            )),
+        }
     }
 
     pub fn get_api_key(&self, provider: &str) -> Result<String> {
@@ -1853,14 +1878,11 @@ impl Config {
         // never falls back to an unrelated ambient credential.
         let mut candidates = vec![env_var.clone()];
         if let Some(entry) = octos_llm::registry::lookup(provider) {
-            let known: Vec<&str> = entry
-                .api_key_env
-                .into_iter()
-                .chain(entry.key_env_aliases.iter().copied())
-                .collect();
-            if known.iter().any(|k| k.eq_ignore_ascii_case(&env_var)) {
-                for k in known {
-                    if !candidates.iter().any(|c| c.eq_ignore_ascii_case(k)) {
+            // Only expand to sibling key vars when the configured var is itself
+            // a declared key name (case-sensitive — see `is_known_key_env`).
+            if entry.is_known_key_env(&env_var) {
+                for k in entry.key_env_names() {
+                    if !candidates.iter().any(|c| c == k) {
                         candidates.push(k.to_string());
                     }
                 }
@@ -1899,7 +1921,7 @@ impl Config {
         }
 
         Err(eyre::eyre!(
-            "{env_var} not set. Run `octos auth login -p {provider}` or set the env var"
+            "{env_var} not set or empty. Run `octos auth login -p {provider}` or set the env var"
         ))
     }
 
@@ -2543,21 +2565,32 @@ mod tests {
     }
 
     /// Run `f` with HOME pointed at an empty temp dir (so the global auth store
-    /// is empty) and the config/XDG env vars cleared. Serialized on the shared
-    /// env lock; all vars restored afterwards.
+    /// is empty) and the config/XDG env vars cleared, plus the Moonshot key vars
+    /// the credential tests assert against removed from the ambient process env
+    /// (so a dev machine that happens to export one can't flip the result).
+    /// Serialized on the shared env lock; all vars restored afterwards.
     #[allow(unsafe_code)]
     fn with_isolated_home<T>(f: impl FnOnce() -> T) -> T {
         let _g = HOME_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let tmp = tempfile::tempdir().unwrap();
-        let keys = ["HOME", "OCTOS_HOME", "OCTOS_CONFIG_DIR", "XDG_CONFIG_HOME"];
+        let keys = [
+            "HOME",
+            "OCTOS_HOME",
+            "OCTOS_CONFIG_DIR",
+            "XDG_CONFIG_HOME",
+            "MOONSHOT_API_KEY",
+            "KIMI_API_KEY",
+            "MY_PROXY_KEY",
+            "kimi_api_key",
+        ];
         let saved: Vec<(&str, Option<std::ffi::OsString>)> =
             keys.iter().map(|k| (*k, std::env::var_os(k))).collect();
         // SAFETY: serialized by HOME_ENV_LOCK; restored below.
         unsafe {
             std::env::set_var("HOME", tmp.path());
-            std::env::remove_var("OCTOS_HOME");
-            std::env::remove_var("OCTOS_CONFIG_DIR");
-            std::env::remove_var("XDG_CONFIG_HOME");
+            for k in &keys[1..] {
+                std::env::remove_var(k);
+            }
         }
         let out = f();
         for (k, v) in saved {
@@ -2593,6 +2626,24 @@ mod tests {
 
     #[test]
     #[allow(unsafe_code)]
+    fn custom_api_key_env_matching_alias_case_insensitively_stays_exclusive() {
+        // Regression (codex P1): env var names are case-sensitive on Unix, so a
+        // genuinely custom `kimi_api_key` (lowercase) is NOT the declared
+        // KIMI_API_KEY and must stay exclusive — it must not fall back to an
+        // ambient MOONSHOT_API_KEY and leak it to a custom endpoint.
+        with_isolated_home(|| {
+            unsafe { std::env::set_var("MOONSHOT_API_KEY", "ambient-moonshot") };
+            let cfg = Config {
+                provider: Some("moonshot".to_string()),
+                api_key_env: Some("kimi_api_key".to_string()),
+                ..Default::default()
+            };
+            assert!(cfg.get_api_key("moonshot").is_err());
+        });
+    }
+
+    #[test]
+    #[allow(unsafe_code)]
     fn moonshot_accepts_either_declared_key_name() {
         // Regression (symmetry): an init-generated config uses api_key_env =
         // KIMI_API_KEY, but a user who set MOONSHOT_API_KEY must still resolve,
@@ -2608,6 +2659,44 @@ mod tests {
                 ..Default::default()
             };
             assert_eq!(cfg.get_api_key("moonshot").unwrap(), "mkey");
+        });
+    }
+
+    #[test]
+    #[allow(unsafe_code)]
+    fn moonshot_kimi_config_resolves_moonshot_var_from_process_env() {
+        // Regression: the headline scenario — init writes api_key_env=KIMI_API_KEY
+        // but the user exports MOONSHOT_API_KEY in their shell — resolves via the
+        // process-env candidate loop (not the env_vars map).
+        with_isolated_home(|| {
+            unsafe { std::env::set_var("MOONSHOT_API_KEY", "from-shell") };
+            let cfg = Config {
+                provider: Some("moonshot".to_string()),
+                api_key_env: Some("KIMI_API_KEY".to_string()),
+                ..Default::default()
+            };
+            assert_eq!(cfg.get_api_key("moonshot").unwrap(), "from-shell");
+        });
+    }
+
+    #[test]
+    #[allow(unsafe_code)]
+    fn get_api_key_with_env_alias_agrees_with_get_api_key() {
+        // Regression (codex P1): the explicit-env entry point must treat a
+        // declared alias (KIMI_API_KEY) as a known name and run the full chain,
+        // so doctor/dashboard/embedding agree with chat runtime — resolving the
+        // sibling MOONSHOT_API_KEY rather than misclassifying KIMI as custom.
+        with_isolated_home(|| {
+            unsafe { std::env::set_var("MOONSHOT_API_KEY", "from-shell") };
+            let cfg = Config {
+                provider: Some("moonshot".to_string()),
+                ..Default::default()
+            };
+            assert_eq!(
+                cfg.get_api_key_with_env("moonshot", Some("KIMI_API_KEY"))
+                    .unwrap(),
+                "from-shell"
+            );
         });
     }
 

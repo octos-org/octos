@@ -1101,11 +1101,30 @@ fn cmd_validate(path: &Path, auto_repair: bool) -> Result<()> {
             // resolved from the package root) or relative to the .rels file's
             // parent part. `PathBuf::join` replaces the base on an absolute
             // component, so an absolute target like "/xl/worksheets/sheet1.xml"
-            // must be re-rooted at `dir`, not joined onto `rels_parent`.
-            let resolved = match target.strip_prefix('/') {
-                Some(abs) => dir.join(abs),
-                None => rels_parent.join(&target),
+            // must be re-rooted at `dir` (strip ALL leading slashes so "//x"
+            // doesn't re-introduce an absolute path), not joined onto
+            // `rels_parent`.
+            let stripped = target.trim_start_matches('/');
+            let base: &std::path::Path = if stripped.len() != target.len() {
+                dir.as_ref()
+            } else {
+                rels_parent
             };
+            // Reject traversal: a crafted "../.." target must not let `.exists()`
+            // probe files outside the package.
+            if std::path::Path::new(stripped)
+                .components()
+                .any(|c| matches!(c, std::path::Component::ParentDir))
+            {
+                let rel_from = entry.strip_prefix(&dir).unwrap_or(&entry);
+                issues.push(format!(
+                    "{}: target '{}' escapes the package root",
+                    rel_from.display(),
+                    target
+                ));
+                continue;
+            }
+            let resolved = base.join(stripped);
             if !resolved.exists() {
                 let rel_from = entry.strip_prefix(&dir).unwrap_or(&entry);
                 issues.push(format!(
@@ -3242,4 +3261,71 @@ fn cmd_overlay_text(
     img.save_with_format(out_path, fmt)?;
     println!("{}", out_path.display());
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Minimal OOXML package: [Content_Types].xml with no part overrides (so the
+    // Content_Types section reports nothing) plus a single .rels file whose
+    // Target we control.
+    fn write_package(dir: &Path, rels_target: &str, make_target_file: bool) {
+        fs::write(
+            dir.join("[Content_Types].xml"),
+            r#"<?xml version="1.0"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"/>"#,
+        )
+        .unwrap();
+        fs::create_dir_all(dir.join("xl/_rels")).unwrap();
+        fs::write(
+            dir.join("xl/_rels/workbook.xml.rels"),
+            format!(
+                r#"<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="{rels_target}"/></Relationships>"#
+            ),
+        )
+        .unwrap();
+        if make_target_file {
+            fs::write(dir.join("xl/worksheet.xml"), "<worksheet/>").unwrap();
+        }
+    }
+
+    #[test]
+    fn validate_resolves_package_absolute_rels_target() {
+        // Regression (CLI-83): an absolute OPC target "/xl/worksheet.xml" must be
+        // re-rooted at the package dir, not treated as a filesystem-absolute path.
+        let tmp = tempfile::tempdir().unwrap();
+        write_package(tmp.path(), "/xl/worksheet.xml", true);
+        assert!(cmd_validate(tmp.path(), false).is_ok());
+    }
+
+    #[test]
+    fn validate_flags_missing_absolute_rels_target() {
+        // The absolute-path branch still reports a genuinely missing target.
+        let tmp = tempfile::tempdir().unwrap();
+        write_package(tmp.path(), "/xl/worksheet.xml", false);
+        assert!(cmd_validate(tmp.path(), false).is_err());
+    }
+
+    #[test]
+    fn validate_rejects_traversal_rels_target() {
+        // A crafted "../"-containing target must be flagged as escaping the
+        // package, not silently resolved to an existing file outside `dir`.
+        let tmp = tempfile::tempdir().unwrap();
+        let pkg = tmp.path().join("pkg");
+        fs::create_dir_all(&pkg).unwrap();
+        // A real file OUTSIDE the package that the traversal would otherwise hit.
+        fs::write(tmp.path().join("outside.txt"), "x").unwrap();
+        write_package(&pkg, "/../outside.txt", false);
+        // Pre-fix this resolved to the existing outside file and validate PASSED.
+        assert!(cmd_validate(&pkg, false).is_err());
+    }
+
+    #[test]
+    fn validate_resolves_double_slash_absolute_target() {
+        // "//xl/worksheet.xml" must strip BOTH leading slashes and re-root at the
+        // package dir (single-strip would leave "/xl/..." absolute again).
+        let tmp = tempfile::tempdir().unwrap();
+        write_package(tmp.path(), "//xl/worksheet.xml", true);
+        assert!(cmd_validate(tmp.path(), false).is_ok());
+    }
 }

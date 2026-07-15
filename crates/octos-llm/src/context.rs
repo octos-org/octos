@@ -299,6 +299,33 @@ mod tests {
     }
 
     #[test]
+    fn should_break_equal_length_substring_ties_deterministically() {
+        // Two equal-length keys both contained in the model id: length can't
+        // decide, so the lexical tie-break must pick a stable winner (matching
+        // pricing.rs). Repeated to shake out HashMap iteration-order dependence.
+        let mut map = HashMap::new();
+        map.insert(
+            "m-aaa".to_string(),
+            CatalogModel {
+                context_window: 111,
+                max_output: 1,
+            },
+        );
+        map.insert(
+            "m-bbb".to_string(),
+            CatalogModel {
+                context_window: 222,
+                max_output: 2,
+            },
+        );
+        // "x-m-aaa-m-bbb-y" contains both equal-length keys; the lex-smaller
+        // "m-aaa" wins deterministically.
+        for _ in 0..20 {
+            assert_eq!(catalog_lookup_in(&map, "x-m-aaa-m-bbb-y"), Some((111, 1)));
+        }
+    }
+
+    #[test]
     fn build_catalog_map_awards_bare_alias_to_native_then_lexicographically() {
         // A deeper re-host loses the bare alias to the fewest-segments native
         // row regardless of order.

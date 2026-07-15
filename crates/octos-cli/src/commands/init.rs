@@ -1329,6 +1329,25 @@ mod tests {
     }
 
     #[test]
+    fn custom_flags_require_model() {
+        // Regression (#1541): --custom-base-url without --custom-model must error
+        // rather than silently writing model "auto" (which real APIs 400 on).
+        let cmd = InitCommand {
+            cwd: None,
+            defaults: false,
+            force: false,
+            custom_base_url: Some("https://api.example.com/v1".to_string()),
+            custom_model: None,
+            custom_api_type: None,
+            custom_api_key_env: None,
+        };
+
+        let err = cmd.custom_selection_from_flags().unwrap_err();
+
+        assert!(err.to_string().contains("--custom-model is required"));
+    }
+
+    #[test]
     fn custom_models_endpoint_trims_trailing_slashes() {
         assert_eq!(
             models_endpoint("https://api.example.com/v1/"),

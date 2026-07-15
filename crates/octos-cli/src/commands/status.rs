@@ -123,21 +123,16 @@ fn show_system_status(cwd: &std::path::Path) -> Result<()> {
     println!("{}", "─".repeat(50).dimmed());
 
     for (label, env_var) in PROVIDER_ENV_VARS {
-        // A provider may accept more than one key env var (e.g. Moonshot reads
-        // MOONSHOT_API_KEY or KIMI_API_KEY via its "kimi" registry alias). Treat
-        // it as "set" when the displayed var OR any alias-derived var is set, so
-        // status matches what config resolution actually accepts.
-        let mut is_set = std::env::var(env_var).is_ok();
+        // A provider may accept more than one key env var (e.g. Moonshot declares
+        // KIMI_API_KEY in `key_env_aliases` alongside MOONSHOT_API_KEY). Treat it
+        // as "set" when the displayed var OR any declared sibling key var holds a
+        // non-empty value, matching exactly what config resolution accepts (which
+        // also rejects empty strings).
+        let is_var_set = |name: &str| std::env::var(name).is_ok_and(|v| !v.is_empty());
+        let mut is_set = is_var_set(env_var);
         if !is_set {
             if let Some(entry) = octos_llm::registry::lookup(&label.to_lowercase()) {
-                // Honor the provider's registry key var plus any declared sibling
-                // key vars (e.g. MOONSHOT_API_KEY / KIMI_API_KEY), matching what
-                // config resolution actually accepts.
-                is_set = entry.api_key_env.is_some_and(|v| std::env::var(v).is_ok())
-                    || entry
-                        .key_env_aliases
-                        .iter()
-                        .any(|v| std::env::var(v).is_ok());
+                is_set = entry.key_env_names().any(is_var_set);
             }
         }
         let status = if is_set {

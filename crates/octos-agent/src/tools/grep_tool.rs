@@ -431,6 +431,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_grep_invalid_file_pattern_errors() {
+        // Regression: an uncompilable file_pattern glob used to be silently
+        // ignored, searching every file. It must now error loudly.
+        let dir = tempfile::tempdir().unwrap();
+        setup_project(dir.path());
+
+        let tool = GrepTool::new(dir.path());
+        let result = tool
+            .execute(&serde_json::json!({"pattern": "hello", "file_pattern": "[bad"}))
+            .await;
+
+        let err = match result {
+            Ok(_) => panic!("expected an error for an invalid file_pattern glob"),
+            Err(e) => e.to_string(),
+        };
+        assert!(err.contains("invalid file_pattern glob"), "got: {err}");
+    }
+
+    #[tokio::test]
     async fn test_grep_case_insensitive() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(

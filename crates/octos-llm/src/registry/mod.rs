@@ -89,6 +89,25 @@ pub struct ProviderEntry {
     pub create: fn(CreateParams) -> Result<Arc<dyn LlmProvider>>,
 }
 
+impl ProviderEntry {
+    /// Every API-key env var name this provider accepts: the primary
+    /// `api_key_env` plus any declared `key_env_aliases`.
+    pub fn key_env_names(&self) -> impl Iterator<Item = &'static str> {
+        self.api_key_env
+            .into_iter()
+            .chain(self.key_env_aliases.iter().copied())
+    }
+
+    /// Whether `name` is one of this provider's declared key env var names.
+    /// Comparison is case-SENSITIVE: environment variable names are
+    /// case-sensitive on Unix, so a genuinely custom `kimi_api_key` must NOT be
+    /// treated as the declared `KIMI_API_KEY` (doing so would let a missing
+    /// custom override fall back to an ambient sibling credential).
+    pub fn is_known_key_env(&self, name: &str) -> bool {
+        self.key_env_names().any(|k| k == name)
+    }
+}
+
 // ── Master list ─────────────────────────────────────────────────────────────
 
 /// All registered providers.  Order matters for `detect_provider` — more
