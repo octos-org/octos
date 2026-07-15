@@ -1659,18 +1659,32 @@ fn walkdir_inner(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
 }
 
 /// Lexically resolve `.` and `..` components without touching the filesystem.
+/// A `..` that cannot be matched against a preceding `Normal` component (i.e. it
+/// would climb above a relative root) is PRESERVED, so an escaping path keeps a
+/// leading `..` rather than silently collapsing (`xl/../../secret` -> `../secret`,
+/// not `secret`). A `..` at a filesystem root is dropped (can't go above root).
 fn lexical_normalize(path: &Path) -> PathBuf {
-    let mut components = Vec::new();
+    use std::path::Component;
+    let mut out: Vec<Component> = Vec::new();
     for comp in path.components() {
         match comp {
-            std::path::Component::ParentDir => {
-                components.pop();
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if matches!(out.last(), Some(Component::Normal(_))) {
+                    out.pop();
+                } else if !matches!(
+                    out.last(),
+                    Some(Component::RootDir) | Some(Component::Prefix(_))
+                ) {
+                    // Empty stack or a preceding `..`: preserve this `..`.
+                    out.push(Component::ParentDir);
+                }
+                // else: at a filesystem root, `..` is a no-op.
             }
-            std::path::Component::CurDir => {}
-            other => components.push(other),
+            other => out.push(other),
         }
     }
-    components.iter().collect()
+    out.iter().collect()
 }
 
 fn normalize_path(path: &Path, base: &Path) -> Option<PathBuf> {
@@ -1679,6 +1693,11 @@ fn normalize_path(path: &Path, base: &Path) -> Option<PathBuf> {
     // stripping an un-normalized prefix from a normalized path would wrongly
     // report a contained target as escaping.
     let normalized = lexical_normalize(path);
+    // A leading `..` means the path climbed above a relative root — an escape
+    // that `strip_prefix` on an empty (relative-root) base would otherwise miss.
+    if normalized.components().next() == Some(std::path::Component::ParentDir) {
+        return None;
+    }
     let base = lexical_normalize(base);
     normalized.strip_prefix(&base).ok().map(|p| p.to_path_buf())
 }
@@ -3364,6 +3383,34 @@ mod tests {
         .unwrap();
         let noncanonical = pkg.join("..").join("pkg");
         assert!(cmd_validate(&noncanonical, false).is_ok());
+    }
+
+    #[test]
+    fn lexical_normalize_preserves_unmatched_parents() {
+        // Excess/leading `..` must survive so an escape stays visible rather than
+        // collapsing away (the relative-root bug).
+        assert_eq!(
+            lexical_normalize(Path::new("xl/../../secret")),
+            PathBuf::from("../secret")
+        );
+        assert_eq!(lexical_normalize(Path::new("./a/../b")), PathBuf::from("b"));
+    }
+
+    #[test]
+    fn normalize_path_rejects_relative_root_traversal() {
+        // Under a relative root (e.g. `octos office validate .`), a target that
+        // climbs above the root must be rejected — not accepted because the
+        // unmatched `..` collapsed. `base = "."` normalizes to empty, so this is
+        // the exact case a bare strip_prefix would have missed.
+        assert_eq!(
+            normalize_path(Path::new("xl/../../secret"), Path::new(".")),
+            None
+        );
+        // A contained parent-relative target under the same relative root is fine.
+        assert_eq!(
+            normalize_path(Path::new("xl/../media/img.png"), Path::new(".")),
+            Some(PathBuf::from("media/img.png"))
+        );
     }
 
     #[test]
