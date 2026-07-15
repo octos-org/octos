@@ -1693,13 +1693,16 @@ fn normalize_path(path: &Path, base: &Path) -> Option<PathBuf> {
     // stripping an un-normalized prefix from a normalized path would wrongly
     // report a contained target as escaping.
     let normalized = lexical_normalize(path);
-    // A leading `..` means the path climbed above a relative root — an escape
-    // that `strip_prefix` on an empty (relative-root) base would otherwise miss.
-    if normalized.components().next() == Some(std::path::Component::ParentDir) {
+    let base = lexical_normalize(base);
+    let rel = normalized.strip_prefix(&base).ok()?;
+    // Reject AFTER removing the package base: a `..` remaining at the front of the
+    // relative path means the target climbed above the root. Checking before the
+    // strip would wrongly reject a contained target under a base that itself
+    // begins with `..` (e.g. `octos office validate ../package`).
+    if rel.components().next() == Some(std::path::Component::ParentDir) {
         return None;
     }
-    let base = lexical_normalize(base);
-    normalized.strip_prefix(&base).ok().map(|p| p.to_path_buf())
+    Some(rel.to_path_buf())
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -3410,6 +3413,28 @@ mod tests {
         assert_eq!(
             normalize_path(Path::new("xl/../media/img.png"), Path::new(".")),
             Some(PathBuf::from("media/img.png"))
+        );
+    }
+
+    #[test]
+    fn normalize_path_allows_containment_under_sibling_relative_root() {
+        // When the package root itself begins with `..` (e.g. `octos office
+        // validate ../package`), a contained target normalizes to a path that
+        // ALSO begins with `..`; it must be accepted after stripping the base,
+        // and only a target that escapes past the base rejected.
+        assert_eq!(
+            normalize_path(
+                Path::new("../package/xl/../media/img.png"),
+                Path::new("../package")
+            ),
+            Some(PathBuf::from("media/img.png"))
+        );
+        assert_eq!(
+            normalize_path(
+                Path::new("../package/xl/../../secret"),
+                Path::new("../package")
+            ),
+            None
         );
     }
 
