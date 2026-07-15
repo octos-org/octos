@@ -2081,7 +2081,7 @@ mod tests {
             use std::io::{Seek, SeekFrom, Write};
             let mut file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
             file.seek(SeekFrom::End(0)).unwrap();
-            writeln!(file, "{}", r#"{"role":"user"}"#).unwrap();
+            file.write_all(b"{\"role\":\"user\"}\n").unwrap();
         }
 
         let checks = session_checks(&data_dir, &[]);
