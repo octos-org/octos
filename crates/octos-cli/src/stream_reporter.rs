@@ -4,8 +4,8 @@
 //! enabling real-time LLM text streaming to Telegram, WhatsApp, etc.
 //! Text is accumulated and the channel message is edited at a throttled rate.
 
-use std::collections::HashSet;
-use std::sync::Arc;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use octos_agent::progress::{ProgressEvent, ProgressReporter};
@@ -38,6 +38,18 @@ pub enum StreamProgressEvent {
     /// Used for discrete progress events (thinking, cost_update) that
     /// the web UI needs as separate SSE events, not baked into message text.
     RawSse { json: String },
+    /// An `org.octos.app` agent-output card projected from a runtime event
+    /// (a completed tool call, a plan update, …). The forwarder emits it as a
+    /// structured Matrix card on capable clients (Robrix); other clients fall
+    /// back to the `body` text. See `run_stream_forwarder`.
+    AppCard {
+        /// The `org.octos.app.type` key (e.g. `"tool_call"`, `"plan"`).
+        card_type: String,
+        /// Human-readable fallback text for clients without the type registry.
+        body: String,
+        /// The card's `initial_state` object.
+        initial_state: serde_json::Value,
+    },
 }
 
 /// A `ProgressReporter` that forwards stream events through an unbounded channel.
@@ -53,6 +65,11 @@ pub enum StreamProgressEvent {
 pub struct ChannelStreamReporter {
     tx: mpsc::UnboundedSender<StreamProgressEvent>,
     thread_id: Option<String>,
+    /// In-flight tool-call arguments keyed by `tool_id`, recorded on
+    /// `ToolStarted` and consumed on `ToolCompleted` so the projected
+    /// `tool_call` card can echo what the tool was asked to do (the
+    /// completion event itself does not carry the arguments).
+    tool_args: Mutex<HashMap<String, serde_json::Value>>,
 }
 
 impl ChannelStreamReporter {
@@ -60,6 +77,7 @@ impl ChannelStreamReporter {
         Self {
             tx,
             thread_id: None,
+            tool_args: Mutex::new(HashMap::new()),
         }
     }
 
@@ -80,6 +98,19 @@ fn inject_thread_id(value: &mut serde_json::Value, thread_id: Option<&str>) {
             "thread_id".to_string(),
             serde_json::Value::String(tid.to_string()),
         );
+    }
+}
+
+/// Truncate a preview string to at most `max` characters (char-safe), trimming
+/// surrounding whitespace and appending an ellipsis when cut. Bounds the tool
+/// output echoed into a projected `tool_call` card.
+fn truncate_card_preview(s: &str, max: usize) -> String {
+    let t = s.trim();
+    if t.chars().count() <= max {
+        t.to_string()
+    } else {
+        let cut: String = t.chars().take(max).collect();
+        format!("{cut}…")
     }
 }
 
@@ -111,8 +142,15 @@ impl ProgressReporter for ChannelStreamReporter {
             ProgressEvent::ToolStarted {
                 ref name,
                 ref tool_id,
-                ..
+                ref arguments,
             } => {
+                // Record the call arguments so the `tool_call` card projected on
+                // ToolCompleted can echo them (the completion event omits them).
+                if let Some(args) = arguments {
+                    if let Ok(mut m) = self.tool_args.lock() {
+                        m.insert(tool_id.clone(), args.clone());
+                    }
+                }
                 // Also send raw SSE for web client status indicators
                 let mut payload = serde_json::json!({
                     "type": "tool_start",
@@ -129,7 +167,8 @@ impl ProgressReporter for ChannelStreamReporter {
                 ref name,
                 ref tool_id,
                 success,
-                ..
+                ref output_preview,
+                duration,
             } => {
                 let mut payload = serde_json::json!({
                     "type": "tool_end",
@@ -140,6 +179,33 @@ impl ProgressReporter for ChannelStreamReporter {
                 inject_thread_id(&mut payload, thread_id);
                 let _ = self.tx.send(StreamProgressEvent::RawSse {
                     json: payload.to_string(),
+                });
+                // Project a `tool_call` card (org.octos.app) so capable clients
+                // render the invocation as a structured card (name · status ·
+                // args · result · duration).
+                let arguments = self
+                    .tool_args
+                    .lock()
+                    .ok()
+                    .and_then(|mut m| m.remove(tool_id));
+                let status = if success { "completed" } else { "error" };
+                let mut initial_state = serde_json::json!({
+                    "tool_name": name,
+                    "status": status,
+                    "duration_ms": duration.as_millis() as u64,
+                });
+                if let Some(args) = arguments {
+                    initial_state["arguments"] = args;
+                }
+                let preview = truncate_card_preview(output_preview, 600);
+                if !preview.is_empty() {
+                    let key = if success { "output_preview" } else { "error" };
+                    initial_state[key] = serde_json::Value::String(preview);
+                }
+                let _ = self.tx.send(StreamProgressEvent::AppCard {
+                    card_type: "tool_call".to_string(),
+                    body: format!("{name} {status}"),
+                    initial_state,
                 });
                 StreamProgressEvent::ToolCompleted {
                     name: name.clone(),
@@ -218,6 +284,16 @@ impl ProgressReporter for ChannelStreamReporter {
                 StreamProgressEvent::RawSse {
                     json: payload.to_string(),
                 }
+            }
+            ProgressEvent::PlanUpdated { plan } => {
+                // `plan` is a serialized UiPlanRecord ({items, title?, …}), which
+                // is exactly the `plan` card's initial_state contract.
+                let _ = self.tx.send(StreamProgressEvent::AppCard {
+                    card_type: "plan".to_string(),
+                    body: "Plan updated".to_string(),
+                    initial_state: plan,
+                });
+                return;
             }
             _ => return,
         };
@@ -534,6 +610,44 @@ pub async fn run_stream_forwarder(
                         }
                         last_edit = Instant::now();
                     }
+                }
+            }
+            StreamProgressEvent::AppCard {
+                card_type,
+                body,
+                initial_state,
+            } => {
+                // Automatic agent-output card. Only meaningful on clients that
+                // understand `org.octos.app` (Robrix); other clients render the
+                // `body` fallback. Gated on the same condition as transient tool
+                // status suppression: matrix + an app-reply-capable tool set.
+                if !suppress_matrix_transient_status {
+                    continue;
+                }
+                if !is_session_active(&session_key, &active_sessions).await {
+                    continue;
+                }
+                let mut metadata = serde_json::json!({
+                    "org.octos.app": {
+                        "type": card_type.clone(),
+                        "version": 1,
+                        "initial_state": initial_state,
+                    }
+                });
+                if let Some(uid) = sender_user_id.as_deref() {
+                    metadata[METADATA_SENDER_USER_ID] =
+                        serde_json::Value::String(uid.to_string());
+                }
+                let msg = OutboundMessage {
+                    channel: channel.name().to_string(),
+                    chat_id: chat_id.clone(),
+                    content: body,
+                    reply_to: None,
+                    media: Vec::new(),
+                    metadata,
+                };
+                if let Err(e) = channel.send(&msg).await {
+                    warn!(card = %card_type, "failed to emit agent-output card: {e}");
                 }
             }
             StreamProgressEvent::ToolProgress { name, message } => {
@@ -1022,6 +1136,72 @@ mod tests {
                 "payload `{json}` missing `thread_id` field",
             );
         }
+    }
+
+    /// The reporter projects an `org.octos.app` `tool_call` card on
+    /// `ToolCompleted` (echoing the arguments recorded at `ToolStarted`) and a
+    /// `plan` card on `PlanUpdated`. Capable Matrix clients (Robrix) render
+    /// these as structured cards; `run_stream_forwarder` gates emission on
+    /// matrix + an app-reply-capable tool set.
+    #[test]
+    fn projects_tool_call_and_plan_app_cards() {
+        use octos_agent::progress::ProgressEvent;
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let reporter = ChannelStreamReporter::new(tx);
+
+        reporter.report(ProgressEvent::ToolStarted {
+            name: "shell".into(),
+            tool_id: "t1".into(),
+            arguments: Some(serde_json::json!({ "command": "ls -la" })),
+        });
+        reporter.report(ProgressEvent::ToolCompleted {
+            name: "shell".into(),
+            tool_id: "t1".into(),
+            success: true,
+            output_preview: "total 0\ndrwxr-xr-x".into(),
+            duration: Duration::from_millis(1200),
+        });
+        reporter.report(ProgressEvent::PlanUpdated {
+            plan: serde_json::json!({
+                "title": "Do the thing",
+                "items": [{ "id": "1", "title": "step", "status": "in_progress" }],
+            }),
+        });
+
+        let mut cards: Vec<(String, serde_json::Value)> = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            if let StreamProgressEvent::AppCard {
+                card_type,
+                initial_state,
+                ..
+            } = event
+            {
+                cards.push((card_type, initial_state));
+            }
+        }
+
+        assert_eq!(cards.len(), 2, "expected a tool_call + a plan card, got {cards:?}");
+
+        let (tc_type, tc_state) = &cards[0];
+        assert_eq!(tc_type.as_str(), "tool_call");
+        assert_eq!(tc_state["tool_name"].as_str(), Some("shell"));
+        assert_eq!(tc_state["status"].as_str(), Some("completed"));
+        assert_eq!(tc_state["arguments"]["command"].as_str(), Some("ls -la"));
+        assert_eq!(tc_state["duration_ms"].as_u64(), Some(1200));
+        assert!(
+            tc_state["output_preview"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("total 0")
+        );
+
+        let (plan_type, plan_state) = &cards[1];
+        assert_eq!(plan_type.as_str(), "plan");
+        assert_eq!(
+            plan_state["items"][0]["status"].as_str(),
+            Some("in_progress")
+        );
     }
 
     /// The channel stream reporter feeds API/channel clients that read
