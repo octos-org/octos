@@ -680,14 +680,15 @@ mod tests {
     }
 
     /// The compiled-in canonical catalog (the seed floor for fresh installs) is
-    /// well-formed and reflects curation: glm-5.2 + kimi-k2.6 present,
-    /// deepseek-chat removed.
+    /// well-formed and reflects curation: glm-5.2 + kimi-k2.6 + kimi-k3
+    /// present, deepseek-chat removed.
     #[test]
     fn embedded_qos_catalog_is_curated_ssot() {
         let catalog = embedded_qos_catalog().expect("embedded canonical catalog must parse");
         let has = |p: &str| catalog.models.iter().any(|m| m.provider == p);
         assert!(has("zai/glm-5.2"), "glm-5.2 present");
         assert!(has("moonshot/kimi-k2.6"), "kimi-k2.6 present");
+        assert!(has("moonshot/kimi-k3"), "kimi-k3 present");
         assert!(
             !has("deepseek/deepseek-chat"),
             "deepseek-chat curated out of the embedded catalog"
@@ -699,6 +700,17 @@ mod tests {
             .find(|m| m.provider == "zai/glm-5.2")
             .unwrap();
         assert_eq!(glm52.context_window, 1_000_000);
+        // kimi-k3 researched values: 1M window, 131072 (default max
+        // completion), official pricing $3.00/M in (cache miss) / $15.00/M out.
+        let k3 = catalog
+            .models
+            .iter()
+            .find(|m| m.provider == "moonshot/kimi-k3")
+            .unwrap();
+        assert_eq!(k3.context_window, 1_048_576);
+        assert_eq!(k3.max_output, 131_072);
+        assert!((k3.cost_in - 3.0).abs() < f64::EPSILON);
+        assert!((k3.cost_out - 15.0).abs() < f64::EPSILON);
     }
 
     #[test]

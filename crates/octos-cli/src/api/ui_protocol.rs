@@ -28713,7 +28713,7 @@ mod tests {
 
         // Key-env comes from the registry, not a hand-maintained env map.
         assert_eq!(families["zai"]["env"], "ZAI_API_KEY");
-        // Curation: glm-5.2 + kimi-k2.6 present; deepseek-chat removed.
+        // Curation: glm-5.2 + kimi-k2.6 + kimi-k3 present; deepseek-chat removed.
         assert!(
             ids("zai").contains(&"glm-5.2".to_owned()),
             "{:?}",
@@ -28724,6 +28724,22 @@ mod tests {
             "{:?}",
             ids("moonshot")
         );
+        assert!(
+            ids("moonshot").contains(&"kimi-k3".to_owned()),
+            "{:?}",
+            ids("moonshot")
+        );
+        // kimi-k3 onboards under the moonshot family key-env with its
+        // researched 1M context window.
+        assert_eq!(families["moonshot"]["env"], "MOONSHOT_API_KEY");
+        let k3 = families["moonshot"]["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["id"] == "kimi-k3")
+            .unwrap();
+        assert_eq!(k3["context_window"], 1_048_576);
+        assert_eq!(k3["max_output"], 131_072);
         assert!(
             !ids("deepseek").contains(&"deepseek-chat".to_owned()),
             "deepseek-chat curated out: {:?}",
