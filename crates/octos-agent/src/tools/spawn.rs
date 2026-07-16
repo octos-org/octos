@@ -983,6 +983,78 @@ impl SpawnTool {
         }
     }
 
+    /// Reconstruct an equivalent `SpawnTool` for a spawned child's own
+    /// registry, rebased on the child's working directory.
+    ///
+    /// Registering the returned tool under the name `spawn` triggers the
+    /// [`ToolRegistry::register`] swap that binds `spawn_agent` + `delegate`
+    /// behind it, so a subagent can nest a further spawn (bounded by
+    /// [`MAX_SPAWN_DEPTH`] via the child worker's incremented
+    /// `ToolContext::spawn_depth`). Without this the child registry carries
+    /// only the delegate-less builtin `spawn_agent`, and any nested spawn
+    /// fails with "No native Octos spawn tool is bound behind spawn_agent in
+    /// this ToolRegistry." — orphaning the child task with empty outputs.
+    ///
+    /// Every wired field (routers, factories, supervisor, sandbox, plugin
+    /// dirs, policies, …) is carried forward by `Arc`/value clone so nesting
+    /// works identically at each level; `worker_count` restarts at 0 because
+    /// each instance numbers only its own direct children, and `origin` is
+    /// snapshotted from the parent's current value.
+    fn child_spawn_clone(&self, working_dir: PathBuf) -> SpawnTool {
+        SpawnTool {
+            llm: self.llm.clone(),
+            memory: self.memory.clone(),
+            working_dir,
+            inbound_tx: self.inbound_tx.clone(),
+            origin: std::sync::Mutex::new(
+                self.origin
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone(),
+            ),
+            worker_count: AtomicU32::new(0),
+            provider_policy: self.provider_policy.clone(),
+            provider_router: self.provider_router.clone(),
+            worker_prompt: self.worker_prompt.clone(),
+            background_result_sender: self.background_result_sender.clone(),
+            child_session_sender: self.child_session_sender.clone(),
+            hooks: self.hooks.clone(),
+            hook_context_template: self.hook_context_template.clone(),
+            plugin_dirs: self.plugin_dirs.clone(),
+            plugin_extra_env: self.plugin_extra_env.clone(),
+            plugin_require_signed: self.plugin_require_signed,
+            child_tool_factories: self.child_tool_factories.clone(),
+            task_supervisor: self.task_supervisor.clone(),
+            session_key: self.session_key.clone(),
+            task_ledger_path: self.task_ledger_path.clone(),
+            worker_config: self.worker_config.clone(),
+            embedder: self.embedder.clone(),
+            mcp_agent_backend: self.mcp_agent_backend.clone(),
+            mcp_agent_tool_name: self.mcp_agent_tool_name.clone(),
+            cost_accountant: self.cost_accountant.clone(),
+            parent_file_state_cache: self.parent_file_state_cache.clone(),
+            parent_subagent_output_router: self.parent_subagent_output_router.clone(),
+            parent_subagent_summary_generator: self.parent_subagent_summary_generator.clone(),
+            // Depth-1-only wiring, deliberately DROPPED for grandchildren: the
+            // AppUI context-fork factory captures the ORIGINAL parent session's
+            // context and keys the fork by worker_id. Carried to a grandchild
+            // it would (a) fork from the wrong ancestor and (b) collide keys
+            // when worker_count restarts at 0 per level — sync children pass
+            // child_session_key=None, so the fallback key is
+            // `{base}#spawn-{worker_id}` and `subagent-0`'s grandchild reuses
+            // `subagent-0`, overwriting the child's own forked ledger. A
+            // grandchild instead runs with a fresh context.
+            child_prompt_context_manager_factory: None,
+            dispatch_policy: self.dispatch_policy.clone(),
+            // NB: `task_supervisor` is carried from the parent here but the
+            // caller MUST overwrite it with the child registry's own
+            // `tools.supervisor()` before registering, so it matches the
+            // `ctx.task_supervisor` a nested `spawn_agent` reads. See the two
+            // registration sites in `execute_with_context`.
+            sandbox: self.sandbox.clone(),
+        }
+    }
+
     /// Set a direct result sender that bypasses the InboundMessage relay.
     /// When set, background task results are injected as system messages
     /// into the session without triggering an extra LLM call.
@@ -3106,6 +3178,38 @@ impl Tool for SpawnTool {
             for factory in &self.child_tool_factories {
                 tools.register_arc(factory());
             }
+            // Bind the child's OWN native `spawn` delegate. Registering a
+            // tool named "spawn" triggers the `ToolRegistry` swap that binds
+            // `spawn_agent` + `delegate` behind it, so a subagent can nest a
+            // further spawn instead of hitting the delegate-less builtin
+            // ("No native Octos spawn tool is bound…"). `MAX_SPAWN_DEPTH`
+            // (via the child worker's incremented `ctx.spawn_depth`) bounds
+            // the recursion, and the subagent policy still denies DIRECT
+            // `spawn` (deny is exact-match, so `spawn_agent` stays allowed).
+            //
+            // The spawn tool and the registry it lives in MUST share one
+            // supervisor (the top level wires `with_task_supervisor(
+            // tool_registry.supervisor())`). Bind the clone to THIS child
+            // registry's OWN supervisor — the one `ctx.task_supervisor`
+            // exposes — so `SpawnAgentTool`'s before/after task lookup finds
+            // the task the delegate registers; otherwise `spawn_agent` returns
+            // no `agent_id` and `delegate` fails with "did not register a task".
+            //
+            // This keeps each spawned subtree's nested tasks in its OWN
+            // (private, per-child) supervisor rather than the shared session
+            // one — a deliberate isolation choice. Sharing the session
+            // supervisor would (a) let `newest_spawned_task` mis-correlate
+            // across CONCURRENT sibling spawners racing the same map,
+            // (b) give the child's task-control aliases (wait/close/resume)
+            // session-wide reach, and (c) leak a child's own `run_pipeline`
+            // node tasks into the persisted session ledger. The trade-off:
+            // grandchildren are not surfaced in the session task/list and the
+            // fan-out cap is per-subtree, not global. The grandchild's RESULT
+            // still flows back via the inherited result sender / inline
+            // output; only its task-tracking row stays subtree-local.
+            let mut child_spawn = self.child_spawn_clone(child_working_dir.clone());
+            child_spawn.task_supervisor = Some(tools.supervisor());
+            tools.register(child_spawn);
             // In subagent context, spawn_only tools should be regular tools —
             // the subagent IS the background, so no need to auto-background again.
             tools.clear_spawn_only();
@@ -3443,6 +3547,15 @@ impl Tool for SpawnTool {
             let plugin_extra_env = self.plugin_extra_env.clone();
             let plugin_require_signed = self.plugin_require_signed;
             let child_tool_factories = self.child_tool_factories.clone();
+            // Detached path: `self` is not available inside the `tokio::spawn`
+            // closure below, so pre-build the child's native `spawn` delegate
+            // HERE (foreground) and move it in. Same purpose as the sync path —
+            // registering it under "spawn" binds the child's `spawn_agent` /
+            // `delegate` so a nested spawn resolves instead of hitting the
+            // delegate-less builtin. Kept concrete (not `Arc<dyn Tool>`) so the
+            // closure can align its supervisor with the child registry before
+            // registering (see the sync-path rationale).
+            let child_spawn_template = self.child_spawn_clone(child_working_dir.clone());
             let task_supervisor = self.task_supervisor.clone();
             let worker_config = self.worker_config.clone();
             let worker_embedder = self.embedder.clone();
@@ -3668,6 +3781,17 @@ impl Tool for SpawnTool {
                 for factory in &child_tool_factories {
                     tools.register_arc(factory());
                 }
+                // Bind the detached child's OWN native `spawn` delegate (see
+                // the foreground `child_spawn_template` build). Mirrors the
+                // sync path: bind the template to THIS child registry's own
+                // (private, per-child) supervisor — the one that backs the
+                // child's `ctx.task_supervisor` — so the nested spawn_agent's
+                // before/after lookup resolves against the same map the
+                // delegate registers into (see the sync-path rationale for the
+                // isolation trade-off).
+                let mut child_spawn_template = child_spawn_template;
+                child_spawn_template.task_supervisor = Some(tools.supervisor());
+                tools.register(child_spawn_template);
                 // In subagent context, spawn_only tools should be regular tools —
                 // the subagent IS the background, so no need to auto-background again.
                 tools.clear_spawn_only();
@@ -5329,6 +5453,172 @@ PY
 
         assert!(result.success);
         assert_eq!(result.output, "done");
+    }
+
+    #[tokio::test]
+    async fn should_bind_native_spawn_in_child_registry_for_nested_delegation() {
+        // Regression: a spawned subagent's registry must carry the native
+        // `spawn` tool so the `ToolRegistry` swap binds `spawn_agent` /
+        // `delegate` behind it. Without it a child that nested a spawn hit
+        // "No native Octos spawn tool is bound behind spawn_agent in this
+        // ToolRegistry.", and the second-round agents were orphaned with
+        // empty output_files (the exact failure a live review session hit).
+        //
+        // Probe through the real `execute` path: a child declaring
+        // `allowed_tools: ["spawn"]` must clear the
+        // `ensure_subagent_tools_available` preflight, which only passes
+        // when `spawn` is actually present in the child registry. (The
+        // subagent policy then denies DIRECT `spawn` use — deny is
+        // exact-match, so `spawn_agent` / `delegate` stay allowed and keep
+        // the freshly-bound delegate.)
+        let (in_tx, _in_rx) = tokio::sync::mpsc::channel(16);
+        let tool = SpawnTool::new(
+            Arc::new(MockProvider),
+            Arc::new(create_test_store().await),
+            PathBuf::from("/tmp"),
+            in_tx,
+        );
+
+        let result = tool
+            .execute(&serde_json::json!({
+                "task": "review the change",
+                "label": "reviewer",
+                "mode": "sync",
+                "allowed_tools": ["spawn"]
+            }))
+            .await
+            .expect(
+                "child spawn preflight must pass once the native spawn delegate is bound in the \
+                 child registry",
+            );
+
+        assert!(
+            result.success,
+            "sync child must complete, got: {}",
+            result.output
+        );
+        assert_eq!(result.output, "done");
+    }
+
+    #[tokio::test]
+    async fn child_spawn_clone_is_named_spawn_and_binds_spawn_agent_via_registry_swap() {
+        // The clone the child-registry sites register must be named "spawn"
+        // (so `ToolRegistry::register` swaps the delegate-less builtin
+        // `spawn_agent` for a delegate-bound one) and must be rebased onto
+        // the child's working directory rather than the parent's.
+        let (in_tx, _in_rx) = tokio::sync::mpsc::channel(16);
+        let parent = SpawnTool::new(
+            Arc::new(MockProvider),
+            Arc::new(create_test_store().await),
+            PathBuf::from("/tmp"),
+            in_tx,
+        );
+
+        let child_spawn = parent.child_spawn_clone(PathBuf::from("/work/child"));
+        assert_eq!(child_spawn.name(), "spawn");
+        assert_eq!(child_spawn.working_dir, PathBuf::from("/work/child"));
+
+        // A bare builtins registry (what every child registry starts from)
+        // carries only the delegate-LESS builtin spawn_agent — the reason a
+        // nested spawn failed with "No native Octos spawn tool is bound".
+        let mut registry = ToolRegistry::with_builtins("/tmp");
+        assert!(
+            registry.get("spawn").is_none(),
+            "builtins must not carry a native spawn delegate on their own"
+        );
+
+        // Registering the clone triggers the swap: spawn + a delegate-bound
+        // spawn_agent + delegate are all present for the child.
+        registry.register(child_spawn);
+        assert!(registry.get("spawn").is_some());
+        assert!(registry.get("spawn_agent").is_some());
+        assert!(registry.get("delegate").is_some());
+    }
+
+    #[test]
+    fn default_subagent_policy_allows_spawn_agent_and_delegate_but_denies_direct_spawn() {
+        // The usability half of the fix: a DEFAULT child (empty allow-list =
+        // allow-all-except-deny) keeps the sanctioned nesting aliases while the
+        // low-level `spawn` stays denied. This is the policy the child registry
+        // runs under after `apply_policy`, so a child with no explicit tool
+        // restriction can actually call the freshly-bound spawn_agent/delegate.
+        // (A child with an explicit allow-list that omits them is denied — that
+        // is the intended per-contract gate, not a regression.)
+        let policy = build_subagent_tool_policy(Vec::new(), Vec::new(), None);
+        assert!(
+            !policy.is_allowed("spawn"),
+            "direct low-level spawn stays denied for subagents"
+        );
+        assert!(
+            policy.is_allowed("spawn_agent"),
+            "spawn_agent (the sanctioned nesting alias) is allowed for a default child"
+        );
+        assert!(
+            policy.is_allowed("delegate"),
+            "delegate is allowed for a default child"
+        );
+    }
+
+    #[tokio::test]
+    async fn nested_spawn_agent_resolves_a_real_agent_id_through_the_bound_delegate() {
+        // Build a child-style registry exactly as the spawn sites do: a fresh
+        // builtins registry (which carries only the delegate-LESS builtin
+        // spawn_agent) plus the aligned native-spawn clone. The clone is bound
+        // to THIS registry's own supervisor — the same one the child worker's
+        // `ctx.task_supervisor` exposes (align-down / per-subtree isolation).
+        //
+        // Then drive `spawn_agent` the way a nesting child would: with
+        // `ctx.task_supervisor` == that registry supervisor. It must (a) reach
+        // the bound delegate instead of failing "No native Octos spawn tool is
+        // bound", and (b) resolve a concrete `agent_id` — proving the
+        // before/after task lookup and the delegate register into the SAME
+        // supervisor.
+        let (in_tx, _in_rx) = tokio::sync::mpsc::channel(16);
+        let parent = SpawnTool::new(
+            Arc::new(MockProvider),
+            Arc::new(create_test_store().await),
+            std::env::temp_dir(),
+            in_tx,
+        );
+
+        let mut tools = ToolRegistry::with_builtins(std::env::temp_dir());
+        let mut clone = parent.child_spawn_clone(std::env::temp_dir());
+        clone.task_supervisor = Some(tools.supervisor());
+        tools.register(clone);
+
+        let mut ctx = crate::tools::ToolContext::zero();
+        ctx.task_supervisor = Some(tools.supervisor());
+        let spawn_agent = tools.get("spawn_agent").expect("spawn_agent is bound");
+        let result = spawn_agent
+            .execute_with_context(
+                &ctx,
+                &serde_json::json!({
+                    "task": "grandchild review",
+                    "label": "grandchild",
+                    "mode": "background"
+                }),
+            )
+            .await
+            .expect("spawn_agent executes");
+
+        assert!(
+            !result
+                .output
+                .contains("No native Octos spawn tool is bound"),
+            "the delegate must be bound behind spawn_agent: {}",
+            result.output
+        );
+        assert!(
+            result.success,
+            "nested spawn_agent must succeed via the bound delegate: {}",
+            result.output
+        );
+        assert!(
+            result.output.contains("agent_id"),
+            "spawn_agent must resolve a concrete agent_id from the aligned \
+             supervisor; got: {}",
+            result.output
+        );
     }
 
     #[test]
