@@ -1387,6 +1387,41 @@ impl ProfileStore {
         self.profiles_dir.parent().unwrap_or(&self.profiles_dir)
     }
 
+    /// Path to the persisted global default-profile pointer
+    /// (`<octos-home>/default-profile`).
+    fn default_profile_pointer_path(&self) -> PathBuf {
+        self.octos_home_dir().join("default-profile")
+    }
+
+    /// The explicitly-chosen global default profile id, if one was set with
+    /// [`Self::set_default_profile`] and the pointer file is readable. Trimmed;
+    /// an empty or missing pointer yields `None`. The launch resolver
+    /// (`launch/resolve`) uses this as the top default for a bare launch that
+    /// has no folder-sticky profile.
+    pub fn default_profile(&self) -> Option<String> {
+        let raw = std::fs::read_to_string(self.default_profile_pointer_path()).ok()?;
+        let trimmed = raw.trim();
+        (!trimmed.is_empty()).then(|| trimmed.to_owned())
+    }
+
+    /// Persist `id` as the machine's global default profile, replacing any prior
+    /// pointer. Atomic write-then-rename within the octos home dir so a crash
+    /// mid-write cannot leave a torn pointer.
+    pub fn set_default_profile(&self, id: &str) -> Result<()> {
+        let path = self.default_profile_pointer_path();
+        let tmp = path.with_extension("tmp");
+        std::fs::write(&tmp, id.trim().as_bytes()).wrap_err_with(|| {
+            format!("failed to write default-profile pointer: {}", tmp.display())
+        })?;
+        std::fs::rename(&tmp, &path).wrap_err_with(|| {
+            format!(
+                "failed to install default-profile pointer: {}",
+                path.display()
+            )
+        })?;
+        Ok(())
+    }
+
     /// List sub-accounts for a given parent profile.
     ///
     /// NOTE(#148): This performs an O(N) scan over all profiles and filters by parent_id.
@@ -2512,6 +2547,29 @@ mod tests {
         std::fs::write(store.profile_path("mangled"), "{not json").unwrap();
         assert!(store.id_reserved_for_registration("mangled", false));
         assert!(store.id_reserved_for_registration("mangled", true));
+    }
+
+    #[test]
+    fn default_profile_pointer_round_trips_and_defaults_to_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ProfileStore::open(dir.path()).unwrap();
+
+        // Unset: no pointer file yet.
+        assert_eq!(store.default_profile(), None);
+
+        store.set_default_profile("glm").unwrap();
+        assert_eq!(store.default_profile().as_deref(), Some("glm"));
+
+        // Overwrite replaces the prior pointer.
+        store.set_default_profile("deepseek").unwrap();
+        assert_eq!(store.default_profile().as_deref(), Some("deepseek"));
+
+        // Whitespace is trimmed on both write and read; an all-whitespace
+        // pointer reads back as unset rather than a blank id.
+        store.set_default_profile("  kimi \n").unwrap();
+        assert_eq!(store.default_profile().as_deref(), Some("kimi"));
+        std::fs::write(store.default_profile_pointer_path(), "   \n").unwrap();
+        assert_eq!(store.default_profile(), None);
     }
 
     #[test]

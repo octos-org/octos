@@ -12,6 +12,7 @@ pub const ENTRY: ProviderEntry = ProviderEntry {
     aliases: &["nim"],
     default_model: Some("meta/llama-3.3-70b-instruct"),
     api_key_env: Some("NVIDIA_API_KEY"),
+    key_env_aliases: &[],
     default_base_url: Some("https://integrate.api.nvidia.com/v1"),
     requires_api_key: true,
     requires_base_url: false,

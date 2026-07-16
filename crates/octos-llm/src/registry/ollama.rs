@@ -12,6 +12,7 @@ pub const ENTRY: ProviderEntry = ProviderEntry {
     aliases: &[],
     default_model: Some("llama3.2"),
     api_key_env: None,
+    key_env_aliases: &[],
     default_base_url: Some("http://localhost:11434/v1"),
     requires_api_key: false,
     requires_base_url: false,

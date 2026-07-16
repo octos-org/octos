@@ -736,6 +736,7 @@ impl InProcessAgentOrchestrator {
                     created_at_ms: now,
                     updated_at_ms: now,
                     context_contract: None,
+                    restored: false,
                 });
             entry.parent_agent_id = upsert.parent_agent_id;
             entry.session_id = upsert.session_id;
@@ -749,6 +750,9 @@ impl InProcessAgentOrchestrator {
             entry.cwd = upsert.cwd;
             entry.profile_id = upsert.profile_id;
             entry.updated_at_ms = now;
+            // A live upsert means the agent is active in THIS lifetime — it
+            // must reappear in `agent/list` even if the id was boot-restored.
+            entry.restored = false;
             let transitioned_terminal = is_agent_terminal_status(&entry.status)
                 && previous_status.as_deref().is_none_or(|status| {
                     !is_agent_terminal_status(status) || status != entry.status
@@ -2323,6 +2327,13 @@ impl AgentOrchestrator for InProcessAgentOrchestrator {
         let agents = state
             .agents
             .values()
+            // Ghost-roster fix: records rebuilt from the supervisor store at
+            // boot are dead history from a PREVIOUS server lifetime (the
+            // replay flips still-running ones to "interrupted"). They stay
+            // individually queryable, but must not populate a fresh
+            // lifetime's roster — the client strip would resurface them as
+            // chips forever on every rehydration.
+            .filter(|agent| !agent.restored)
             .filter(|agent| {
                 request
                     .session_id
@@ -3254,6 +3265,14 @@ struct AutonomyAgentRecord {
     updated_at_ms: i64,
     /// #1021 / M17-C — most-recent dispatch context contract for this child agent. Populated by specialist runners (CLI / native / MCP) when they emit a dispatch and surfaced through `agent/updated` so AppUI clients can tell `managed_payload` from `external_context_unmanaged` per child.
     context_contract: Option<DispatchContextContract>,
+    /// True when this record was rebuilt from the supervisor store at boot —
+    /// an agent from a PREVIOUS server lifetime (necessarily terminal; the
+    /// replay flips still-running children to "interrupted"). Restored records
+    /// stay individually queryable (`agent/status`, `agent/artifact/list`) but
+    /// are EXCLUDED from `agent/list`: a fresh lifetime's roster must not
+    /// resurface dead history as chips in the client strip. Cleared if a live
+    /// upsert reuses the id (the agent is active in THIS lifetime again).
+    restored: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -4761,6 +4780,7 @@ fn restore_agents_from_supervisor_state(
             created_at_ms,
             updated_at_ms,
             context_contract: None,
+            restored: true,
         };
         state.agents.insert(agent.agent_id.clone(), agent);
     }
@@ -4791,7 +4811,15 @@ fn restored_agent_status(child: &ChildAgentRecord) -> String {
         .to_owned();
     }
     match &child.status {
-        ChildStatus::Starting | ChildStatus::Running => "running",
+        // Ghost-agent fix: this replay runs at process boot, before this
+        // server has spawned anything. A child persisted as Starting/Running
+        // was live in the PREVIOUS server process and died with it (children
+        // are in-process tasks / child processes of the server) — nothing will
+        // ever move its status again. Restoring it as "running" resurrected
+        // permanently-active ghosts: `list_agents` kept returning them and the
+        // TUI showed the chips as active forever. Restore as terminal
+        // "interrupted" so rehydration tells clients the truth.
+        ChildStatus::Starting | ChildStatus::Running => "interrupted",
         ChildStatus::Completed => "completed",
         ChildStatus::Failed => "failed",
         ChildStatus::Cancelled => "interrupted",
@@ -6055,6 +6083,7 @@ mod tests {
             created_at_ms: 1,
             updated_at_ms: 2,
             context_contract: None,
+            restored: false,
         }
     }
 
@@ -10298,12 +10327,32 @@ mod tests {
                 }],
             )
             .expect("persist artifact");
+        // A sibling that finished BEFORE the restart must keep its real
+        // terminal status through the replay.
+        orchestrator.upsert_agent(AgentUpsert {
+            agent_id: "child-done".into(),
+            parent_agent_id: Some("master".into()),
+            session_id: session_id.clone(),
+            task_id: None,
+            path: "master/child-done".into(),
+            role: "reviewer".into(),
+            nickname: "Noether".into(),
+            backend_kind: "native".into(),
+            status: "completed".into(),
+            last_task: Some("review persistence module".into()),
+            cwd: Some("/tmp/project".into()),
+            profile_id: "tenant-a".into(),
+        });
 
         let restarted = InProcessAgentOrchestrator::default();
         restarted
             .configure_supervisor_store(&store_dir)
             .expect("replay store");
 
+        // Ghost-agent fix: the child persisted as "running" was live in the
+        // OLD process and died with it — the replay must restore it as
+        // terminal "interrupted", not resurrect a permanently-"running"
+        // ghost the TUI would show as active forever.
         let status = restarted
             .read_agent_status(AgentRequest {
                 agent_id: "child-restore".into(),
@@ -10311,17 +10360,73 @@ mod tests {
                 profile_id: "tenant-a".into(),
             })
             .expect("restored status");
-        assert_eq!(status["agent"]["status"], json!("running"));
+        assert_eq!(status["agent"]["status"], json!("interrupted"));
         assert_eq!(status["agent"]["nickname"], json!("Curie"));
+
+        let done = restarted
+            .read_agent_status(AgentRequest {
+                agent_id: "child-done".into(),
+                session_id: Some(session_id.clone()),
+                profile_id: "tenant-a".into(),
+            })
+            .expect("restored terminal status");
+        assert_eq!(done["agent"]["status"], json!("completed"));
 
         let artifacts = restarted
             .list_agent_artifacts(AgentRequest {
                 agent_id: "child-restore".into(),
-                session_id: Some(session_id),
+                session_id: Some(session_id.clone()),
                 profile_id: "tenant-a".into(),
             })
             .expect("restored artifacts");
         assert_eq!(artifacts["artifacts"][0]["id"], json!("review"));
+
+        // Ghost-roster fix: boot-restored records are dead history from the
+        // previous lifetime — individually queryable (above), but they must
+        // NOT populate the fresh lifetime's roster, or the client strip
+        // resurfaces them as chips forever on every rehydration.
+        let listed = restarted
+            .list_agents(AgentListRequest {
+                session_id: Some(session_id.clone()),
+                profile_id: "tenant-a".into(),
+                connection_profile_id: None,
+            })
+            .expect("agent list after restart");
+        assert_eq!(
+            listed["agents"].as_array().map(Vec::len),
+            Some(0),
+            "restored dead-history agents must not appear in agent/list: {listed}"
+        );
+
+        // A live upsert reusing the id makes the agent current again — it
+        // must reappear in the roster.
+        restarted.upsert_agent(AgentUpsert {
+            agent_id: "child-restore".into(),
+            parent_agent_id: Some("master".into()),
+            session_id: session_id.clone(),
+            task_id: None,
+            path: "master/child-restore".into(),
+            role: "reviewer".into(),
+            nickname: "Curie".into(),
+            backend_kind: "native".into(),
+            status: "running".into(),
+            last_task: Some("second review pass".into()),
+            cwd: Some("/tmp/project".into()),
+            profile_id: "tenant-a".into(),
+        });
+        let relisted = restarted
+            .list_agents(AgentListRequest {
+                session_id: Some(session_id),
+                profile_id: "tenant-a".into(),
+                connection_profile_id: None,
+            })
+            .expect("agent list after live upsert");
+        assert_eq!(
+            relisted["agents"].as_array().map(Vec::len),
+            Some(1),
+            "a live upsert must resurface the agent in the roster"
+        );
+        assert_eq!(relisted["agents"][0]["agent_id"], json!("child-restore"));
     }
 
     #[test]

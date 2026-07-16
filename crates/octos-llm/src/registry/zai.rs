@@ -13,6 +13,7 @@ pub const ENTRY: ProviderEntry = ProviderEntry {
     aliases: &["z.ai"],
     default_model: Some("glm-5-turbo"),
     api_key_env: Some("ZAI_API_KEY"),
+    key_env_aliases: &[],
     default_base_url: Some("https://api.z.ai/api/anthropic"),
     requires_api_key: true,
     requires_base_url: false,

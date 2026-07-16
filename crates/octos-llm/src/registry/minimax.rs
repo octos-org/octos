@@ -12,6 +12,7 @@ pub const ENTRY: ProviderEntry = ProviderEntry {
     aliases: &[],
     default_model: Some("MiniMax-Text-01"),
     api_key_env: Some("MINIMAX_API_KEY"),
+    key_env_aliases: &[],
     default_base_url: Some("https://api.minimax.io/v1"),
     requires_api_key: true,
     requires_base_url: false,

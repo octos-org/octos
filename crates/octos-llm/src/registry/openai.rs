@@ -13,6 +13,7 @@ pub const ENTRY: ProviderEntry = ProviderEntry {
     aliases: &[],
     default_model: Some("gpt-4o"),
     api_key_env: Some("OPENAI_API_KEY"),
+    key_env_aliases: &[],
     default_base_url: Some("https://api.openai.com/v1"),
     requires_api_key: true,
     requires_base_url: false,

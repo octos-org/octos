@@ -152,25 +152,30 @@ fn tokenize(input: &str) -> Result<Vec<Token>> {
             }
             b'"' => {
                 i += 1;
-                let mut s = String::new();
+                // Accumulate raw bytes and decode as UTF-8 at the end. Pushing
+                // `bytes[i] as char` per byte mangles any multi-byte codepoint
+                // (e.g. a `"中文"` literal), so non-ASCII string literals would
+                // never match at runtime.
+                let mut buf: Vec<u8> = Vec::new();
                 while i < bytes.len() && bytes[i] != b'"' {
                     if bytes[i] == b'\\' && i + 1 < bytes.len() {
                         i += 1; // skip backslash
                         match bytes[i] {
-                            b'n' => s.push('\n'),
-                            b't' => s.push('\t'),
-                            b'\\' => s.push('\\'),
-                            b'"' => s.push('"'),
+                            b'n' => buf.push(b'\n'),
+                            b't' => buf.push(b'\t'),
+                            b'\\' => buf.push(b'\\'),
+                            b'"' => buf.push(b'"'),
                             c => {
-                                s.push('\\');
-                                s.push(c as char);
+                                buf.push(b'\\');
+                                buf.push(c);
                             }
                         }
                     } else {
-                        s.push(bytes[i] as char);
+                        buf.push(bytes[i]);
                     }
                     i += 1;
                 }
+                let s = String::from_utf8_lossy(&buf).into_owned();
                 tokens.push(Token::StringLit(s));
                 if i < bytes.len() {
                     i += 1; // skip closing quote
@@ -357,6 +362,21 @@ mod tests {
             &outcome(OutcomeStatus::Pass, "found an error")
         ));
         assert!(!evaluate(&expr, &outcome(OutcomeStatus::Pass, "all good")));
+    }
+
+    #[test]
+    fn should_match_non_ascii_string_literal() {
+        // Regression: the tokenizer used `byte as char`, mangling multi-byte
+        // UTF-8 literals so a `"中文"` keyword could never match.
+        let expr = parse_condition(r#"outcome.contains("中文")"#).unwrap();
+        assert!(evaluate(
+            &expr,
+            &outcome(OutcomeStatus::Pass, "包含中文内容")
+        ));
+        assert!(!evaluate(
+            &expr,
+            &outcome(OutcomeStatus::Pass, "english only")
+        ));
     }
 
     #[test]

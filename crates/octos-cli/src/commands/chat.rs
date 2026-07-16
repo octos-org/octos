@@ -12,8 +12,9 @@ use eyre::{Result, WrapErr, eyre};
 use octos_agent::compaction::CompactionRunner;
 use octos_agent::{
     Agent, AgentConfig, CompactionSummarizerKind, ConsoleReporter, ConversationResponse,
-    HookExecutor, ToolApprovalDecision, ToolApprovalRequest, ToolApprovalRequester, ToolRegistry,
-    UserQuestionOutcome, UserQuestionRequest, UserQuestionRequester, read_workspace_policy,
+    HookExecutor, ProgressReporter, SilentReporter, ToolApprovalDecision, ToolApprovalRequest,
+    ToolApprovalRequester, ToolRegistry, UserQuestionOutcome, UserQuestionRequest,
+    UserQuestionRequester, read_workspace_policy,
 };
 use octos_core::ui_protocol::UserQuestionAnswer;
 use octos_core::{AgentId, Message, MessageRole, SessionScope};
@@ -58,6 +59,13 @@ pub struct ChatCommand {
     #[arg(long)]
     pub base_url: Option<String>,
 
+    /// API wire protocol to speak to `--base-url` (overrides config's
+    /// `api_type`): `anthropic`, `openai`, or `responses`. Use this for a
+    /// custom endpoint that speaks a known protocol (e.g. a z.ai/GLM Anthropic
+    /// endpoint) instead of overloading `--provider` with a vendor name.
+    #[arg(long = "api-type", visible_alias = "api-style")]
+    pub api_type: Option<String>,
+
     /// Maximum tool-call iterations per message (default: 20).
     #[arg(long, default_value = "20")]
     pub max_iterations: u32,
@@ -73,6 +81,17 @@ pub struct ChatCommand {
     /// Send a single message and exit (non-interactive mode).
     #[arg(short, long)]
     pub message: Option<String>,
+
+    /// Emit the result as a single JSON object on stdout (logs + UI go to
+    /// stderr); intended for scripting / one-shot `--message` use. Requires
+    /// `--message`: interactive `--json` is rejected (a REPL cannot keep
+    /// stdout pure). On any runtime error a `{"error": "..."}` object is
+    /// printed to stdout and the process exits non-zero, so stdout is always
+    /// parseable — for a valid invocation. (Argument errors and `--help` are
+    /// handled by the arg parser and follow normal CLI conventions: usage/help
+    /// text and a non-zero exit, not a JSON object.)
+    #[arg(long)]
+    pub json: bool,
 
     /// Runtime profile to apply at startup (M8.3). Accepts a built-in name
     /// (`coding`, `coding-full`, `swarm`), a user-dir id under
@@ -111,6 +130,25 @@ pub struct ChatCommand {
     /// boundary instead of prompting.
     #[arg(long, value_enum)]
     pub ask_for_approval: Option<ChatApprovalMode>,
+
+    /// Reasoning effort for thinking models: `low`, `medium`, `high`, or
+    /// `max` (claude/codex parity). Overrides the config
+    /// `gateway.reasoning_effort`; non-thinking models ignore it, and
+    /// providers without a distinct `max` tier clamp it to `high`.
+    #[arg(long, value_enum)]
+    pub effort: Option<ChatEffort>,
+
+    /// Do NOT persist this run as an episode (ephemeral). Mirrors
+    /// `claude --no-session-persistence`: by default a completed turn is
+    /// saved to the episode store for future recall; this skips that write.
+    #[arg(long)]
+    pub no_session_persistence: bool,
+
+    /// One-shot PROMPT (positional): `octos chat "…"` runs a single turn and
+    /// exits, matching `claude -p "…"`. Sugar for `--message`; supplying the
+    /// prompt both positionally and via `--message` is an error.
+    #[arg(value_name = "PROMPT")]
+    pub prompt: Option<String>,
 }
 
 /// `--sandbox` choices, mirroring codex's sandbox modes and octos's
@@ -138,6 +176,48 @@ pub enum ChatApprovalMode {
     Ask,
     /// Never prompt; risky commands fail closed at the tool boundary.
     Never,
+}
+
+/// `--effort` choices, mirroring claude/codex reasoning-effort tiers. Maps
+/// 1:1 to [`octos_llm::ReasoningEffort`]. For these single-word variants
+/// clap's default `ValueEnum` naming and serde's `kebab-case` agree
+/// (`low`/`medium`/`high`/`max`), so a `config.cli.chat.effort` round-trips
+/// losslessly — matching [`ChatSandboxMode`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ChatEffort {
+    Low,
+    Medium,
+    High,
+    Max,
+}
+
+impl From<ChatEffort> for octos_llm::ReasoningEffort {
+    fn from(effort: ChatEffort) -> Self {
+        match effort {
+            ChatEffort::Low => octos_llm::ReasoningEffort::Low,
+            ChatEffort::Medium => octos_llm::ReasoningEffort::Medium,
+            ChatEffort::High => octos_llm::ReasoningEffort::High,
+            ChatEffort::Max => octos_llm::ReasoningEffort::Max,
+        }
+    }
+}
+
+/// `claude -p "…"` parity: fold a positional PROMPT into `--message`. The two
+/// are two spellings of the same one-shot prompt, so supplying both is
+/// contradictory — fail closed. Returns the single effective one-shot message,
+/// or `None` for interactive mode (neither given).
+fn reconcile_one_shot_prompt(
+    message: Option<String>,
+    prompt: Option<String>,
+) -> Result<Option<String>> {
+    match (message, prompt) {
+        (Some(_), Some(_)) => Err(eyre!(
+            "provide the prompt positionally OR via --message/-m, not both"
+        )),
+        (Some(message), None) => Ok(Some(message)),
+        (None, prompt) => Ok(prompt),
+    }
 }
 
 /// Resolve the chat session's [`EffectivePermissions`] from the CLI flags.
@@ -519,19 +599,128 @@ async fn process_chat_turn(
     .await
 }
 
+/// Machine-readable result envelope for `octos chat --json --message`.
+///
+/// Serialized as a single JSON object — the ONLY thing `--json` writes to
+/// stdout on success. Deliberately limited to the fields the completed
+/// [`ConversationResponse`] reports as ground truth (final text, answering
+/// model, token usage). Turn telemetry — a real terminal stop reason, the loop
+/// iteration count, the executed tool-call count — is intentionally omitted:
+/// `ConversationResponse` does not carry those, and deriving them from the
+/// message list is wrong in edge cases (budget / max-token cutoffs mislabel the
+/// stop reason; the loop detector inserts synthetic tool-result rows that
+/// overstate tool calls). Surfacing them correctly needs an octos-agent change
+/// to populate them at every turn return site — deferred to a follow-up.
+#[derive(Debug, serde::Serialize)]
+struct ChatJsonResult {
+    /// Final assistant text for this turn.
+    text: String,
+    /// Model that actually produced the answer (e.g. `glm-5.2`). Taken from the
+    /// final reply's provider provenance, so adaptive failover to a fallback
+    /// lane is reported honestly.
+    model: String,
+    /// Prompt tokens consumed across the turn.
+    input_tokens: u32,
+    /// Completion tokens produced across the turn.
+    output_tokens: u32,
+    // NOTE: intentionally limited to fields `ConversationResponse` reports as
+    // ground truth. Turn telemetry (a real terminal `stop_reason`, the loop
+    // iteration count, executed tool-call count) is deferred to a follow-up:
+    // `ConversationResponse` does not carry those, and deriving them from
+    // `messages` is wrong in edge cases (budget/max-token cutoffs mislabel the
+    // stop reason; the loop detector inserts synthetic tool-result rows that
+    // overstate tool calls). Surfacing them correctly needs an octos-agent
+    // change to populate them at every turn return site.
+}
+
+impl ChatJsonResult {
+    /// Build the envelope from a completed turn. `fallback_model` is the
+    /// configured model id, used only when the reply carries no provider
+    /// provenance.
+    fn from_response(response: &ConversationResponse, fallback_model: &str) -> Self {
+        // Prefer the provenance of the FINAL reply: adaptive failover can answer
+        // from a different lane than the primary provider, and the caller should
+        // see the model that actually produced the text.
+        let model = response
+            .provider_metadata
+            .as_ref()
+            .map(|m| m.model.clone())
+            .unwrap_or_else(|| fallback_model.to_string());
+        Self {
+            text: response.content.clone(),
+            model,
+            input_tokens: response.token_usage.input_tokens,
+            output_tokens: response.token_usage.output_tokens,
+        }
+    }
+
+    /// Serialize to a single-line JSON string (nice for piping). This fixed
+    /// string/number-only struct cannot realistically fail to serialize; if it
+    /// ever did, fall back to a valid JSON error object so stdout stays
+    /// parseable.
+    fn to_json_line(&self) -> String {
+        serde_json::to_string(self)
+            .unwrap_or_else(|_| "{\"error\":\"failed to serialize chat result\"}".to_string())
+    }
+}
+
+/// Emit `{"error": "<message>"}` on stdout (so a `--json` caller can always
+/// parse stdout) and flush. Used on the `--json` error paths before a
+/// non-zero exit; `serde_json` handles all string escaping.
+fn print_json_error(message: &str) {
+    let obj = serde_json::json!({ "error": message });
+    println!("{obj}");
+    let _ = io::stdout().flush();
+}
+
 impl Executable for ChatCommand {
     fn execute(self) -> Result<()> {
-        tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .thread_stack_size(8 * 1024 * 1024) // 8MB stack for deep agent futures
-            .build()
-            .wrap_err("failed to create tokio runtime")?
-            .block_on(self.run_async())
+        // Capture before `self` is moved: in `--json` mode ANY failure —
+        // provider/config bootstrap or the turn itself — must surface as a
+        // `{"error": ...}` object on stdout with a non-zero exit, so a caller
+        // can always parse stdout instead of hitting an empty stream + an eyre
+        // report on stderr.
+        let json = self.json;
+        // Build the runtime and run the turn inside one fallible block so that
+        // EVERY failure — including a runtime-build failure — is caught by the
+        // `--json` arm below rather than escaping as a bare `?` before it.
+        let outcome = (|| -> Result<()> {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .thread_stack_size(8 * 1024 * 1024) // 8MB stack for deep agent futures
+                .build()
+                .wrap_err("failed to create tokio runtime")?;
+            runtime.block_on(self.run_async())
+        })();
+        match outcome {
+            Ok(()) => Ok(()),
+            Err(error) if json => {
+                print_json_error(&error.to_string());
+                std::process::exit(1);
+            }
+            Err(error) => Err(error),
+        }
     }
 }
 
 impl ChatCommand {
-    async fn run_async(self) -> Result<()> {
+    async fn run_async(mut self) -> Result<()> {
+        // `claude -p "…"` parity: fold a positional PROMPT into `--message` up
+        // front so every downstream `self.message` check (the `--json` guard
+        // just below and the one-shot dispatch) sees a single source of truth.
+        self.message = reconcile_one_shot_prompt(self.message.take(), self.prompt.take())?;
+
+        // `--json` is a one-shot, machine-readable mode: exactly one JSON
+        // object on stdout, and it requires `--message`. An interactive REPL
+        // cannot keep stdout pure (the readline prompt and per-turn framing
+        // would interleave with the JSON), so reject `--json` without
+        // `--message` up front — emitted as a JSON error so even this failure
+        // is parseable on stdout — before doing any provider/agent bootstrap.
+        if self.json && self.message.is_none() {
+            print_json_error("--json requires --message (interactive --json is not supported)");
+            std::process::exit(2);
+        }
+
         let cwd = match self.cwd {
             Some(p) => p,
             None => std::env::current_dir().wrap_err("failed to get current directory")?,
@@ -566,9 +755,18 @@ impl ChatCommand {
                 )
             })?;
 
-        // Create LLM provider (with optional failover chain)
+        // Create LLM provider (with optional failover chain). `--api-type`
+        // (alias `--api-style`) overrides config's `api_type` so a custom
+        // `--base-url` can pick the wire protocol without pretending to be a
+        // vendor via `--provider`.
+        let api_type = self.api_type.as_deref().or(config.api_type.as_deref());
         let base_provider: Arc<dyn LlmProvider> =
-            create_provider(&provider_name, &config, model, base_url)?;
+            create_provider_with_api_type(&provider_name, &config, model, base_url, api_type)?;
+        // Status line goes to stderr; suppress it entirely in `--json` mode to
+        // keep even stderr quiet for scripting.
+        if !self.json {
+            eprintln!("{}: {}", "Model".green(), base_provider.model_id());
+        }
         let model_id = base_provider.model_id().to_string();
 
         let llm: Arc<dyn LlmProvider> = if self.no_retry {
@@ -904,13 +1102,25 @@ impl ChatCommand {
             .filter(|cfg| cfg.enabled)
             .map(|cfg| Arc::new(octos_llm::ContentClassifier::new(cfg.clone())));
 
-        // Create agent
-        let reporter = Arc::new(ConsoleReporter::new().with_verbose(self.verbose));
+        // Create agent. In `--json` mode nothing may reach stdout except the
+        // final result object, so silence the console reporter — its spinner,
+        // `◆` answer preview, streamed chunks, and tool-progress lines all
+        // print to stdout.
+        let reporter: Arc<dyn ProgressReporter> = if self.json {
+            Arc::new(SilentReporter)
+        } else {
+            Arc::new(ConsoleReporter::new().with_verbose(self.verbose))
+        };
         let agent_config = AgentConfig {
             max_iterations: self.max_iterations,
-            save_episodes: true,
+            // `--no-session-persistence` (claude parity): skip the episode write.
+            save_episodes: !self.no_session_persistence,
             chat_max_tokens: config.gateway.as_ref().and_then(|g| g.max_output_tokens),
-            reasoning_effort: config.gateway.as_ref().and_then(|g| g.reasoning_effort),
+            // `--effort` (claude/codex parity) overrides `gateway.reasoning_effort`.
+            reasoning_effort: self
+                .effort
+                .map(octos_llm::ReasoningEffort::from)
+                .or_else(|| config.gateway.as_ref().and_then(|g| g.reasoning_effort)),
             ..Default::default()
         };
         // M8.2: load sub-agent manifests from `<cwd>/agents/` layered on
@@ -1146,10 +1356,22 @@ impl ChatCommand {
         let approval_requester: Arc<dyn ToolApprovalRequester> =
             Arc::new(CliApprovalRequester::default());
 
-        // Single-message mode: send one message and exit
+        // Single-message mode: send one message and exit.
         if let Some(msg) = self.message {
             let response =
                 process_chat_turn(&agent, &msg, &[], Arc::clone(&approval_requester)).await?;
+            if self.json {
+                // JSON mode: emit exactly one machine-readable result object on
+                // stdout (the reporter is silent and every status line goes to
+                // stderr). A turn failure propagates via `?` and is rendered as
+                // a JSON error at the `execute` boundary.
+                println!(
+                    "{}",
+                    ChatJsonResult::from_response(&response, &model_id).to_json_line()
+                );
+                let _ = io::stdout().flush();
+                return Ok(());
+            }
             if !response.streamed {
                 println!("{}", response.content);
             }
@@ -1612,6 +1834,182 @@ mod tests {
         assert!(!bare.dangerously_bypass_approvals_and_sandbox);
         assert_eq!(bare.sandbox, None);
         assert_eq!(bare.ask_for_approval, None);
+    }
+
+    #[test]
+    fn should_map_chat_effort_to_reasoning_effort() {
+        use octos_llm::ReasoningEffort;
+        assert_eq!(ReasoningEffort::from(ChatEffort::Low), ReasoningEffort::Low);
+        assert_eq!(
+            ReasoningEffort::from(ChatEffort::Medium),
+            ReasoningEffort::Medium
+        );
+        assert_eq!(
+            ReasoningEffort::from(ChatEffort::High),
+            ReasoningEffort::High
+        );
+        assert_eq!(ReasoningEffort::from(ChatEffort::Max), ReasoningEffort::Max);
+    }
+
+    #[test]
+    fn should_reconcile_positional_prompt_with_message() {
+        // Positional-only → used as the one-shot message.
+        assert_eq!(
+            reconcile_one_shot_prompt(None, Some("hi".into())).unwrap(),
+            Some("hi".to_string())
+        );
+        // --message-only → passthrough.
+        assert_eq!(
+            reconcile_one_shot_prompt(Some("hi".into()), None).unwrap(),
+            Some("hi".to_string())
+        );
+        // Neither → interactive (None).
+        assert_eq!(reconcile_one_shot_prompt(None, None).unwrap(), None);
+        // Both → contradictory, fail closed.
+        let err = reconcile_one_shot_prompt(Some("a".into()), Some("b".into()))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not both"), "{err}");
+    }
+
+    #[test]
+    fn should_parse_effort_no_persistence_and_positional_prompt_via_clap() {
+        // `claude -p` parity: --effort, --no-session-persistence, and a bare
+        // positional PROMPT all parse into the expected fields.
+        use clap::Parser;
+
+        #[derive(Parser)]
+        struct Wrap {
+            #[command(flatten)]
+            chat: ChatCommand,
+        }
+
+        let full = Wrap::parse_from([
+            "prog",
+            "--effort",
+            "max",
+            "--no-session-persistence",
+            "Review the diff",
+        ])
+        .chat;
+        assert_eq!(full.effort, Some(ChatEffort::Max));
+        assert!(full.no_session_persistence);
+        // The positional prompt lands in `prompt`, distinct from `--message`.
+        assert_eq!(full.prompt.as_deref(), Some("Review the diff"));
+        assert_eq!(full.message, None);
+
+        // Every effort tier parses (clap's default kebab/lower naming).
+        for (arg, want) in [
+            ("low", ChatEffort::Low),
+            ("medium", ChatEffort::Medium),
+            ("high", ChatEffort::High),
+            ("max", ChatEffort::Max),
+        ] {
+            let c = Wrap::parse_from(["prog", "--effort", arg]).chat;
+            assert_eq!(c.effort, Some(want));
+        }
+
+        // Defaults: no effort, persistence ON, no positional prompt.
+        let bare = Wrap::parse_from(["prog"]).chat;
+        assert_eq!(bare.effort, None);
+        assert!(!bare.no_session_persistence);
+        assert_eq!(bare.prompt, None);
+    }
+
+    #[test]
+    fn should_parse_api_type_flag_and_its_api_style_alias() {
+        // `--api-type` (and its `--api-style` alias) picks the wire protocol
+        // for a custom `--base-url`, independent of the vendor `--provider`.
+        use clap::Parser;
+
+        #[derive(Parser)]
+        struct Wrap {
+            #[command(flatten)]
+            chat: ChatCommand,
+        }
+
+        let via_type = Wrap::parse_from(["prog", "--api-type", "anthropic"]).chat;
+        assert_eq!(via_type.api_type.as_deref(), Some("anthropic"));
+
+        let via_alias = Wrap::parse_from(["prog", "--api-style", "openai"]).chat;
+        assert_eq!(via_alias.api_type.as_deref(), Some("openai"));
+
+        // Honest form: a real vendor name + an explicit protocol, no overload.
+        let combined =
+            Wrap::parse_from(["prog", "--provider", "zai", "--api-type", "anthropic"]).chat;
+        assert_eq!(combined.provider.as_deref(), Some("zai"));
+        assert_eq!(combined.api_type.as_deref(), Some("anthropic"));
+
+        // Absent by default (falls back to config's api_type at runtime).
+        assert_eq!(Wrap::parse_from(["prog"]).chat.api_type, None);
+    }
+
+    // ---- `--json` result envelope ----
+
+    #[test]
+    fn should_serialize_chat_json_result_with_expected_shape() {
+        // The `--json` envelope is a single-line object with every documented
+        // key, in declaration order, so an agent/script can parse it directly.
+        let result = ChatJsonResult {
+            text: "hello world".to_string(),
+            model: "glm-5.2".to_string(),
+            input_tokens: 4582,
+            output_tokens: 7,
+        };
+        let json = serde_json::to_string(&result).expect("envelope must serialize");
+        assert_eq!(
+            json,
+            r#"{"text":"hello world","model":"glm-5.2","input_tokens":4582,"output_tokens":7}"#
+        );
+
+        // And it parses back to the exact fields/values a caller reads.
+        let value: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
+        assert_eq!(value["text"], "hello world");
+        assert_eq!(value["model"], "glm-5.2");
+        assert_eq!(value["input_tokens"], 4582);
+        assert_eq!(value["output_tokens"], 7);
+    }
+
+    #[test]
+    fn should_build_envelope_from_conversation_response() {
+        // The envelope carries ground-truth fields only: text + token usage pass
+        // through, and `model` comes from the final reply's provider provenance
+        // so adaptive failover is reported honestly — falling back to the
+        // configured id only when the reply carries no provenance.
+        let build = |provider_metadata: Option<octos_llm::ProviderMetadata>| ConversationResponse {
+            content: "final answer".to_string(),
+            reasoning_content: None,
+            provider_metadata,
+            token_usage: octos_core::TokenUsage {
+                input_tokens: 100,
+                output_tokens: 5,
+                ..Default::default()
+            },
+            estimated_spend_usd: None,
+            files_modified: vec![],
+            files_to_send: vec![],
+            streamed: false,
+            messages: vec![],
+            tool_results: vec![],
+            synthesized_from_spawn_only: false,
+            pending_approval: None,
+        };
+
+        // No provenance → fall back to the configured model id.
+        let fallback = build(None);
+        let envelope = ChatJsonResult::from_response(&fallback, "glm-5.2");
+        assert_eq!(envelope.text, "final answer");
+        assert_eq!(envelope.model, "glm-5.2");
+        assert_eq!(envelope.input_tokens, 100);
+        assert_eq!(envelope.output_tokens, 5);
+
+        // Failover: the reply came from a different lane than the configured id
+        // → report the model that actually answered, not the fallback.
+        let routed = build(Some(octos_llm::ProviderMetadata::new(
+            "zai", "glm-4.7", None,
+        )));
+        let envelope = ChatJsonResult::from_response(&routed, "glm-5.2");
+        assert_eq!(envelope.model, "glm-4.7");
     }
 
     // ---- #1570: [y/s/N] approval prompt + numbered user-question prompt ----

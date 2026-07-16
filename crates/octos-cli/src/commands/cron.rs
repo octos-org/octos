@@ -199,10 +199,26 @@ fn cmd_add(
     channel: Option<String>,
     to: Option<String>,
 ) -> Result<()> {
+    // Capture a single `now` and reuse it for overflow validation, creation, and
+    // scheduling — otherwise a boundary-sized interval can pass a check taken at
+    // one instant and then overflow the addition taken a moment later.
+    let now_ms = Utc::now().timestamp_millis();
+
     let schedule = if let Some(secs) = every {
-        CronSchedule::Every {
-            every_ms: secs * 1000,
+        if secs <= 0 {
+            eyre::bail!("--every must be a positive number of seconds (got {secs})");
         }
+        let every_ms = secs.checked_mul(1000).ok_or_else(|| {
+            eyre::eyre!("--every is too large: {secs} seconds overflows the millisecond interval")
+        })?;
+        // `compute_next_run` adds `every_ms` to `now_ms`; reject a value so large
+        // that the addition would overflow i64 (which panics in debug and wraps
+        // to a negative, immediately-due time). Uses the SAME `now_ms` that
+        // scheduling will use below.
+        if now_ms.checked_add(every_ms).is_none() {
+            eyre::bail!("--every is too large: {secs} seconds overflows the next-run timestamp");
+        }
+        CronSchedule::Every { every_ms }
     } else if let Some(expr) = cron {
         CronSchedule::Cron { expr }
     } else if let Some(at_str) = at {
@@ -234,11 +250,11 @@ fn cmd_add(
             chat_id: to,
         },
         state: Default::default(),
-        created_at_ms: Utc::now().timestamp_millis(),
+        created_at_ms: now_ms,
         delete_after_run,
         timezone: None,
     };
-    job.compute_next_run(Utc::now().timestamp_millis());
+    job.compute_next_run(now_ms);
 
     let mut store = load_store(store_path);
     store.jobs.push(job);
@@ -256,10 +272,10 @@ fn cmd_remove(store_path: &std::path::Path, job_id: &str) -> Result<()> {
     if store.jobs.len() < before {
         save_store(store_path, &store)?;
         println!("{} Removed job {}", "OK".green(), job_id.cyan());
+        Ok(())
     } else {
-        println!("{}", format!("Job {job_id} not found.").red());
+        eyre::bail!("Job {job_id} not found.");
     }
-    Ok(())
 }
 
 fn cmd_enable(store_path: &std::path::Path, job_id: &str, enabled: bool) -> Result<()> {
@@ -284,10 +300,10 @@ fn cmd_enable(store_path: &std::path::Path, job_id: &str, enabled: bool) -> Resu
             name,
             job_id.cyan()
         );
+        Ok(())
     } else {
-        println!("{}", format!("Job {job_id} not found.").red());
+        eyre::bail!("Job {job_id} not found.");
     }
-    Ok(())
 }
 
 fn short_id() -> String {
@@ -301,5 +317,69 @@ fn truncate(s: &str, max: usize) -> String {
     } else {
         let end: String = s.chars().take(max.saturating_sub(3)).collect();
         format!("{end}...")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn add(store: &std::path::Path, every: Option<i64>) -> Result<()> {
+        cmd_add(
+            store,
+            "t".into(),
+            "ping".into(),
+            every,
+            None,
+            None,
+            false,
+            None,
+            None,
+        )
+    }
+
+    #[test]
+    fn should_reject_nonpositive_every() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = dir.path().join("cron.json");
+        assert!(add(&store, Some(0)).is_err());
+        assert!(add(&store, Some(-5)).is_err());
+    }
+
+    #[test]
+    fn should_reject_every_that_overflows_milliseconds() {
+        // Regression: `secs * 1000` overflowed i64 for very large values,
+        // panicking in debug and wrapping to a negative (immediately-due)
+        // interval in release. Must be rejected, not silently wrapped.
+        let dir = tempfile::tempdir().unwrap();
+        let store = dir.path().join("cron.json");
+        assert!(add(&store, Some(i64::MAX)).is_err());
+    }
+
+    #[test]
+    fn should_reject_every_that_overflows_next_run_timestamp() {
+        // Regression (codex P2): a value that passes `checked_mul(1000)` can
+        // still overflow `now_ms + every_ms` inside compute_next_run. i64::MAX/1000
+        // multiplies cleanly but the timestamp add overflows — must be rejected.
+        let dir = tempfile::tempdir().unwrap();
+        let store = dir.path().join("cron.json");
+        assert!(add(&store, Some(i64::MAX / 1000)).is_err());
+    }
+
+    #[test]
+    fn should_accept_valid_every() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = dir.path().join("cron.json");
+        assert!(add(&store, Some(60)).is_ok());
+    }
+
+    #[test]
+    fn should_error_when_removing_or_enabling_unknown_job() {
+        // Regression: remove/enable on an unknown id used to print red and exit
+        // 0; they must now return Err so scripts can detect failure.
+        let dir = tempfile::tempdir().unwrap();
+        let store = dir.path().join("cron.json");
+        assert!(cmd_remove(&store, "nope").is_err());
+        assert!(cmd_enable(&store, "nope", true).is_err());
     }
 }

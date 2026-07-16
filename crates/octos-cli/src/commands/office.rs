@@ -1097,14 +1097,42 @@ fn cmd_validate(path: &Path, auto_repair: bool) -> Result<()> {
         let rels_parent = entry.parent().and_then(|p| p.parent()).unwrap_or(&dir);
 
         for target in parse_all_rels_targets(&xml) {
-            let resolved = rels_parent.join(&target);
-            if !resolved.exists() {
-                let rel_from = entry.strip_prefix(&dir).unwrap_or(&entry);
-                issues.push(format!(
-                    "{}: target '{}' does not exist",
-                    rel_from.display(),
-                    target
-                ));
+            // OPC relationship targets may be package-absolute (leading '/',
+            // resolved from the package root) or relative to the .rels file's
+            // parent part. `PathBuf::join` replaces the base on an absolute
+            // component, so an absolute target like "/xl/worksheets/sheet1.xml"
+            // must be re-rooted at `dir` (strip ALL leading slashes so "//x"
+            // doesn't re-introduce an absolute path), not joined onto
+            // `rels_parent`.
+            let stripped = target.trim_start_matches('/');
+            let base: &std::path::Path = if stripped.len() != target.len() {
+                dir.as_ref()
+            } else {
+                rels_parent
+            };
+            // Lexically normalize the joined path (resolve `.`/`..` without
+            // touching the filesystem) and require it to stay inside the package
+            // root. Parent-relative targets like "../media/image1.png" are legal
+            // OPC and resolve INSIDE the package (the CLI itself emits them), so
+            // we reject only a target whose normalized path actually escapes
+            // `dir` — not any target that merely contains "..".
+            let rel_from = || entry.strip_prefix(&dir).unwrap_or(&entry).to_path_buf();
+            match normalize_path(&base.join(stripped), &dir) {
+                None => {
+                    issues.push(format!(
+                        "{}: target '{}' escapes the package root",
+                        rel_from().display(),
+                        target
+                    ));
+                }
+                Some(rel) if !dir.join(&rel).exists() => {
+                    issues.push(format!(
+                        "{}: target '{}' does not exist",
+                        rel_from().display(),
+                        target
+                    ));
+                }
+                Some(_) => {}
             }
         }
     }
@@ -1630,20 +1658,51 @@ fn walkdir_inner(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
     Ok(())
 }
 
-fn normalize_path(path: &Path, base: &Path) -> Option<PathBuf> {
-    // Simple normalization: resolve .. and .
-    let mut components = Vec::new();
+/// Lexically resolve `.` and `..` components without touching the filesystem.
+/// A `..` that cannot be matched against a preceding `Normal` component (i.e. it
+/// would climb above a relative root) is PRESERVED, so an escaping path keeps a
+/// leading `..` rather than silently collapsing (`xl/../../secret` -> `../secret`,
+/// not `secret`). A `..` at a filesystem root is dropped (can't go above root).
+fn lexical_normalize(path: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut out: Vec<Component> = Vec::new();
     for comp in path.components() {
         match comp {
-            std::path::Component::ParentDir => {
-                components.pop();
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if matches!(out.last(), Some(Component::Normal(_))) {
+                    out.pop();
+                } else if !matches!(out.last(), Some(Component::RootDir)) {
+                    // Preserve `..` unless it follows a real filesystem root
+                    // (`RootDir`). A bare Windows drive prefix like `C:` is
+                    // drive-RELATIVE (`C:package`, not `C:\package`), so a `..`
+                    // after it can still climb above the root and must be kept.
+                    out.push(Component::ParentDir);
+                }
+                // else: at a filesystem root (after RootDir), `..` is a no-op.
             }
-            std::path::Component::CurDir => {}
-            other => components.push(other),
+            other => out.push(other),
         }
     }
-    let normalized: PathBuf = components.iter().collect();
-    normalized.strip_prefix(base).ok().map(|p| p.to_path_buf())
+    out.iter().collect()
+}
+
+fn normalize_path(path: &Path, base: &Path) -> Option<PathBuf> {
+    // Normalize BOTH sides before the containment check: `base` may itself be
+    // non-canonical (e.g. `octos office validate .`, or `/tmp/../tmp/pkg`), and
+    // stripping an un-normalized prefix from a normalized path would wrongly
+    // report a contained target as escaping.
+    let normalized = lexical_normalize(path);
+    let base = lexical_normalize(base);
+    let rel = normalized.strip_prefix(&base).ok()?;
+    // Reject AFTER removing the package base: a `..` remaining at the front of the
+    // relative path means the target climbed above the root. Checking before the
+    // strip would wrongly reject a contained target under a base that itself
+    // begins with `..` (e.g. `octos office validate ../package`).
+    if rel.components().next() == Some(std::path::Component::ParentDir) {
+        return None;
+    }
+    Some(rel.to_path_buf())
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -3234,4 +3293,194 @@ fn cmd_overlay_text(
     img.save_with_format(out_path, fmt)?;
     println!("{}", out_path.display());
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Minimal OOXML package: [Content_Types].xml with no part overrides (so the
+    // Content_Types section reports nothing) plus a single .rels file whose
+    // Target we control.
+    fn write_package(dir: &Path, rels_target: &str, make_target_file: bool) {
+        fs::write(
+            dir.join("[Content_Types].xml"),
+            r#"<?xml version="1.0"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"/>"#,
+        )
+        .unwrap();
+        fs::create_dir_all(dir.join("xl/_rels")).unwrap();
+        fs::write(
+            dir.join("xl/_rels/workbook.xml.rels"),
+            format!(
+                r#"<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="{rels_target}"/></Relationships>"#
+            ),
+        )
+        .unwrap();
+        if make_target_file {
+            fs::write(dir.join("xl/worksheet.xml"), "<worksheet/>").unwrap();
+        }
+    }
+
+    #[test]
+    fn validate_resolves_package_absolute_rels_target() {
+        // Regression (CLI-83): an absolute OPC target "/xl/worksheet.xml" must be
+        // re-rooted at the package dir, not treated as a filesystem-absolute path.
+        let tmp = tempfile::tempdir().unwrap();
+        write_package(tmp.path(), "/xl/worksheet.xml", true);
+        assert!(cmd_validate(tmp.path(), false).is_ok());
+    }
+
+    #[test]
+    fn validate_flags_missing_absolute_rels_target() {
+        // The absolute-path branch still reports a genuinely missing target.
+        let tmp = tempfile::tempdir().unwrap();
+        write_package(tmp.path(), "/xl/worksheet.xml", false);
+        assert!(cmd_validate(tmp.path(), false).is_err());
+    }
+
+    #[test]
+    fn validate_accepts_parent_relative_target_inside_package() {
+        // Regression: legal OPC parent-relative targets ("../media/image.png",
+        // which the CLI itself emits) resolve INSIDE the package and must NOT be
+        // rejected as escaping — only targets whose normalized path leaves the
+        // package root are flagged.
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        fs::write(
+            dir.join("[Content_Types].xml"),
+            r#"<?xml version="1.0"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"/>"#,
+        )
+        .unwrap();
+        fs::create_dir_all(dir.join("media")).unwrap();
+        fs::write(dir.join("media/image.png"), "png").unwrap();
+        // rels at xl/_rels/*.rels -> its parent part is `xl`, so "../media/..."
+        // resolves to <pkg>/media/image.png.
+        fs::create_dir_all(dir.join("xl/_rels")).unwrap();
+        fs::write(
+            dir.join("xl/_rels/workbook.xml.rels"),
+            r#"<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="../media/image.png"/></Relationships>"#,
+        )
+        .unwrap();
+        assert!(cmd_validate(dir, false).is_ok());
+    }
+
+    #[test]
+    fn validate_accepts_parent_relative_target_with_noncanonical_root() {
+        // Regression: containment must hold even when the package root itself is
+        // non-canonical (e.g. `octos office validate .` or `/tmp/../tmp/pkg`).
+        // Build under <tmp>/pkg but validate via <tmp>/pkg/../pkg.
+        let tmp = tempfile::tempdir().unwrap();
+        let pkg = tmp.path().join("pkg");
+        fs::create_dir_all(pkg.join("media")).unwrap();
+        fs::write(pkg.join("media/image.png"), "png").unwrap();
+        fs::write(
+            pkg.join("[Content_Types].xml"),
+            r#"<?xml version="1.0"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"/>"#,
+        )
+        .unwrap();
+        fs::create_dir_all(pkg.join("xl/_rels")).unwrap();
+        fs::write(
+            pkg.join("xl/_rels/workbook.xml.rels"),
+            r#"<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="../media/image.png"/></Relationships>"#,
+        )
+        .unwrap();
+        let noncanonical = pkg.join("..").join("pkg");
+        assert!(cmd_validate(&noncanonical, false).is_ok());
+    }
+
+    #[test]
+    fn lexical_normalize_preserves_unmatched_parents() {
+        // Excess/leading `..` must survive so an escape stays visible rather than
+        // collapsing away (the relative-root bug).
+        assert_eq!(
+            lexical_normalize(Path::new("xl/../../secret")),
+            PathBuf::from("../secret")
+        );
+        assert_eq!(lexical_normalize(Path::new("./a/../b")), PathBuf::from("b"));
+    }
+
+    #[test]
+    fn normalize_path_rejects_relative_root_traversal() {
+        // Under a relative root (e.g. `octos office validate .`), a target that
+        // climbs above the root must be rejected — not accepted because the
+        // unmatched `..` collapsed. `base = "."` normalizes to empty, so this is
+        // the exact case a bare strip_prefix would have missed.
+        assert_eq!(
+            normalize_path(Path::new("xl/../../secret"), Path::new(".")),
+            None
+        );
+        // A contained parent-relative target under the same relative root is fine.
+        assert_eq!(
+            normalize_path(Path::new("xl/../media/img.png"), Path::new(".")),
+            Some(PathBuf::from("media/img.png"))
+        );
+    }
+
+    #[test]
+    fn normalize_path_allows_containment_under_sibling_relative_root() {
+        // When the package root itself begins with `..` (e.g. `octos office
+        // validate ../package`), a contained target normalizes to a path that
+        // ALSO begins with `..`; it must be accepted after stripping the base,
+        // and only a target that escapes past the base rejected.
+        assert_eq!(
+            normalize_path(
+                Path::new("../package/xl/../media/img.png"),
+                Path::new("../package")
+            ),
+            Some(PathBuf::from("media/img.png"))
+        );
+        assert_eq!(
+            normalize_path(
+                Path::new("../package/xl/../../secret"),
+                Path::new("../package")
+            ),
+            None
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn normalize_path_rejects_drive_relative_escape_and_reenter() {
+        // `C:package` is drive-RELATIVE (unlike `C:\package`), so a target may
+        // climb above the root and re-enter a same-named dir elsewhere. Dropping
+        // the `..` after the bare `C:` prefix would mask that as contained.
+        assert_eq!(
+            normalize_path(
+                Path::new(r"C:package\xl\..\..\..\package\secret"),
+                Path::new("C:package")
+            ),
+            None
+        );
+        // A genuinely contained drive-relative target still resolves.
+        assert_eq!(
+            normalize_path(
+                Path::new(r"C:package\media\img.png"),
+                Path::new("C:package")
+            ),
+            Some(PathBuf::from(r"media\img.png"))
+        );
+    }
+
+    #[test]
+    fn validate_rejects_traversal_rels_target() {
+        // A crafted "../"-containing target must be flagged as escaping the
+        // package, not silently resolved to an existing file outside `dir`.
+        let tmp = tempfile::tempdir().unwrap();
+        let pkg = tmp.path().join("pkg");
+        fs::create_dir_all(&pkg).unwrap();
+        // A real file OUTSIDE the package that the traversal would otherwise hit.
+        fs::write(tmp.path().join("outside.txt"), "x").unwrap();
+        write_package(&pkg, "/../outside.txt", false);
+        // Pre-fix this resolved to the existing outside file and validate PASSED.
+        assert!(cmd_validate(&pkg, false).is_err());
+    }
+
+    #[test]
+    fn validate_resolves_double_slash_absolute_target() {
+        // "//xl/worksheet.xml" must strip BOTH leading slashes and re-root at the
+        // package dir (single-strip would leave "/xl/..." absolute again).
+        let tmp = tempfile::tempdir().unwrap();
+        write_package(tmp.path(), "//xl/worksheet.xml", true);
+        assert!(cmd_validate(tmp.path(), false).is_ok());
+    }
 }

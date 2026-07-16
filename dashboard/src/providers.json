@@ -206,7 +206,10 @@
       { "id": "qwen/qwen3.5-397b-a17b", "input": 0.55, "output": 3.5, "max_output": 16384 },
       { "id": "qwen/qwen3-coder-480b-a35b-instruct", "input": 0.22, "output": 1.0, "max_output": 8192 },
       { "id": "qwen/qwen3-235b-a22b", "input": 0.45, "output": 1.82, "max_output": 8192 },
-      { "id": "meta/llama-3.3-70b-instruct", "input": 0.1, "output": 0.32, "max_output": 8192 }
+      { "id": "meta/llama-3.3-70b-instruct", "input": 0.1, "output": 0.32, "max_output": 8192 },
+      { "id": "deepseek-ai/deepseek-v3.2", "input": 0.0, "output": 0.0, "max_output": 65536 },
+      { "id": "minimaxai/minimax-m2.5", "input": 0.0, "output": 0.0, "max_output": 131072 },
+      { "id": "moonshotai/kimi-k2.5", "input": 0.0, "output": 0.0, "max_output": 98304 }
     ]
   },
   "ollama": {

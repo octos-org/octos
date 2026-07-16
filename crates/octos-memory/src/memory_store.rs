@@ -36,6 +36,11 @@ pub struct UsageMap {
     pub entries: std::collections::BTreeMap<String, UsageStat>,
 }
 
+/// Header prepended to the assembled app-cards manual (see
+/// [`MemoryStore::app_cards_dir`]).
+const APP_CARDS_HEADER: &str =
+    "# APP AGENT MEMORY — your complete manual (use directly; do NOT read files)\n";
+
 /// Persistent memory store backed by markdown files.
 pub struct MemoryStore {
     memory_dir: PathBuf,
@@ -389,9 +394,123 @@ impl MemoryStore {
         Ok(entries)
     }
 
+    /// Directory of the read-only "app agent memory" tree — the app framework
+    /// doc, widget helper docs, and one `app.md` + exemplar(s) per app. When it
+    /// exists, it is assembled at INJECT time into the long-term memory block, so
+    /// the app-agent manual is data on disk (provisioned from `octos-one/a2app`),
+    /// not a pre-built `MEMORY.md` artifact or a build script. Absent on normal
+    /// profiles → the classic `MEMORY.md` path is used unchanged.
+    pub fn app_cards_dir(&self) -> PathBuf {
+        self.memory_dir.join("app-cards")
+    }
+
+    /// File names (not sub-dirs) directly under `dir`, sorted; empty if unreadable.
+    async fn sorted_file_names(dir: &Path) -> Vec<String> {
+        let mut names = Vec::new();
+        if let Ok(mut rd) = tokio::fs::read_dir(dir).await {
+            while let Ok(Some(e)) = rd.next_entry().await {
+                if e.file_type().await.map(|t| t.is_file()).unwrap_or(false) {
+                    if let Some(n) = e.file_name().to_str() {
+                        names.push(n.to_string());
+                    }
+                }
+            }
+        }
+        names.sort();
+        names
+    }
+
+    /// Sub-directory names directly under `dir`, sorted; empty if unreadable.
+    async fn sorted_dir_names(dir: &Path) -> Vec<String> {
+        let mut names = Vec::new();
+        if let Ok(mut rd) = tokio::fs::read_dir(dir).await {
+            while let Ok(Some(e)) = rd.next_entry().await {
+                if e.file_type().await.map(|t| t.is_dir()).unwrap_or(false) {
+                    if let Some(n) = e.file_name().to_str() {
+                        names.push(n.to_string());
+                    }
+                }
+            }
+        }
+        names.sort();
+        names
+    }
+
+    /// Assemble the app-cards tree at `dir` into one delimited memory string, in a
+    /// stable order — `framework.md`, then `widgets/*`, then each app under
+    /// `apps/*` as `app.md` followed by its `exemplars/*` — each section prefixed
+    /// with a `===== <relpath> =====` marker (exemplars tagged as a known-good
+    /// reference). Empty string when nothing is readable. Adding an app is a
+    /// drop-in: create `apps/<id>/app.md` (+ exemplars); no code or script edit.
+    async fn assemble_app_cards(dir: &Path) -> String {
+        let mut rels: Vec<String> = Vec::new();
+        if tokio::fs::try_exists(dir.join("framework.md"))
+            .await
+            .unwrap_or(false)
+        {
+            rels.push("framework.md".to_string());
+        }
+        for w in Self::sorted_file_names(&dir.join("widgets")).await {
+            rels.push(format!("widgets/{w}"));
+        }
+        for app in Self::sorted_dir_names(&dir.join("apps")).await {
+            let app_dir = dir.join("apps").join(&app);
+            if tokio::fs::try_exists(app_dir.join("app.md"))
+                .await
+                .unwrap_or(false)
+            {
+                rels.push(format!("apps/{app}/app.md"));
+            }
+            for ex in Self::sorted_file_names(&app_dir.join("exemplars")).await {
+                rels.push(format!("apps/{app}/exemplars/{ex}"));
+            }
+        }
+
+        let mut out = String::new();
+        for rel in &rels {
+            let Ok(body) = tokio::fs::read_to_string(dir.join(rel)).await else {
+                continue;
+            };
+            if out.is_empty() {
+                out.push_str(APP_CARDS_HEADER);
+            }
+            let suffix = if rel.contains("/exemplars/") {
+                " (known-good reference)"
+            } else {
+                ""
+            };
+            out.push_str(&format!("\n===== {rel}{suffix} =====\n"));
+            out.push_str(&body);
+            if !body.ends_with('\n') {
+                out.push('\n');
+            }
+        }
+        out
+    }
+
+    /// Long-term memory for INJECTION: the assembled app-cards manual when a tree
+    /// is provisioned, otherwise `MEMORY.md`. Any hand-written `MEMORY.md` notes
+    /// are appended after the manual. Kept separate from [`Self::read_long_term`]
+    /// so memory consolidation still reads the raw file.
+    async fn read_injectable_long_term(&self) -> Result<String> {
+        let cards_dir = self.app_cards_dir();
+        if tokio::fs::try_exists(&cards_dir).await.unwrap_or(false) {
+            let assembled = Self::assemble_app_cards(&cards_dir).await;
+            if !assembled.is_empty() {
+                let md = self.read_long_term().await.unwrap_or_default();
+                return Ok(if md.trim().is_empty() {
+                    assembled
+                } else {
+                    format!("{assembled}\n{md}")
+                });
+            }
+        }
+        self.read_long_term().await
+    }
+
     /// Load the raw markdown sections, downgrading read errors to warnings.
     async fn load_sections(&self) -> MemorySections {
-        let long_term = match self.read_long_term().await {
+        let long_term = match self.read_injectable_long_term().await {
             Ok(v) => v,
             Err(e) => {
                 tracing::warn!("failed to read long-term memory: {e}");
@@ -1230,6 +1349,69 @@ mod tests {
 
         store.write_long_term("updated").await.unwrap();
         assert_eq!(store.read_long_term().await.unwrap(), "updated");
+    }
+
+    #[tokio::test]
+    async fn should_assemble_app_cards_tree_when_present() {
+        let dir = tempfile::tempdir().unwrap();
+        let cards = dir.path().join("memory").join("app-cards");
+        tokio::fs::create_dir_all(cards.join("widgets"))
+            .await
+            .unwrap();
+        tokio::fs::create_dir_all(cards.join("apps/stock/exemplars"))
+            .await
+            .unwrap();
+        tokio::fs::create_dir_all(cards.join("apps/news"))
+            .await
+            .unwrap();
+        tokio::fs::write(cards.join("framework.md"), "FRAMEWORK")
+            .await
+            .unwrap();
+        tokio::fs::write(cards.join("widgets/sys.md"), "SYS")
+            .await
+            .unwrap();
+        tokio::fs::write(cards.join("apps/stock/app.md"), "STOCK APP")
+            .await
+            .unwrap();
+        tokio::fs::write(cards.join("apps/stock/exemplars/card.splash"), "EXEMPLAR")
+            .await
+            .unwrap();
+        tokio::fs::write(cards.join("apps/news/app.md"), "NEWS APP")
+            .await
+            .unwrap();
+
+        let store = MemoryStore::open(dir.path()).await.unwrap();
+        let ctx = store.get_injectable_context(100_000).await;
+
+        // Header + every section, with exemplars tagged.
+        assert!(ctx.contains("APP AGENT MEMORY"));
+        assert!(ctx.contains("===== framework.md ====="));
+        assert!(ctx.contains("===== widgets/sys.md ====="));
+        assert!(ctx.contains("===== apps/stock/app.md ====="));
+        assert!(
+            ctx.contains("===== apps/stock/exemplars/card.splash (known-good reference) =====")
+        );
+        assert!(ctx.contains("===== apps/news/app.md ====="));
+        // Stable order: framework < widgets < app.md < exemplar; apps sorted (news < stock).
+        let f = ctx.find("framework.md").unwrap();
+        let w = ctx.find("widgets/sys.md").unwrap();
+        let news = ctx.find("apps/news/app.md").unwrap();
+        let stock = ctx.find("apps/stock/app.md").unwrap();
+        let ex = ctx.find("exemplars/card.splash").unwrap();
+        assert!(f < w && w < news && news < stock && stock < ex);
+    }
+
+    #[tokio::test]
+    async fn should_read_memory_md_when_no_app_cards() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MemoryStore::open(dir.path()).await.unwrap();
+        store.write_long_term("PLAIN NOTES").await.unwrap();
+
+        let ctx = store.get_injectable_context(100_000).await;
+        assert!(ctx.contains("PLAIN NOTES"));
+        assert!(!ctx.contains("APP AGENT MEMORY"));
+        // read_long_term stays the raw MEMORY.md reader (consolidation depends on it).
+        assert_eq!(store.read_long_term().await.unwrap(), "PLAIN NOTES");
     }
 
     #[tokio::test]

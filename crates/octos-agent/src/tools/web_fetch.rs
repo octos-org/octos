@@ -212,8 +212,12 @@ async fn ssrf_safe_fetch(initial_url: &str) -> Result<reqwest::Response, String>
             .timeout(Duration::from_secs(30))
             .user_agent("octos/0.1 (web-fetch-tool)")
             .redirect(Policy::none());
-        for addr in &check.resolved_addrs {
-            builder = builder.resolve(&host, *addr);
+        // Pin ALL validated addresses at once. `resolve()` called in a loop
+        // overwrites the per-host entry each time, leaving only the last address
+        // pinned — so a host whose last DNS answer is unreachable would fail even
+        // when another validated address works. `resolve_to_addrs` keeps them all.
+        if !check.resolved_addrs.is_empty() {
+            builder = builder.resolve_to_addrs(&host, &check.resolved_addrs);
         }
         let client = builder
             .build()

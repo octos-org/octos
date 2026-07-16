@@ -207,9 +207,7 @@ impl Executable for AccountCommand {
                 if sub.config.channels.is_empty() {
                     println!();
                     println!("No channels configured. Add via dashboard or:");
-                    println!(
-                        "  octos account create --profile {profile} --sub-account-id <id> --public-subdomain <slug> <name> --telegram-token <token>"
-                    );
+                    println!("  octos account update {} --telegram-token <token>", sub.id);
                 }
             }
 

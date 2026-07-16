@@ -627,15 +627,13 @@ fn write_init_files(
     Ok(())
 }
 
-/// The repo's model catalog, baked in at compile time so INSTALLED
-/// binaries (brew/npm/installer bundles ship no model_catalog.json on
-/// disk) still offer real model names in `octos init` — pre-fix, every
-/// provider fell into manual entry whose "auto" default is rejected by
-/// real APIs (#1541 item 3).
-const EMBEDDED_MODEL_CATALOG: &str = include_str!(concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../../model_catalog.json"
-));
+// The repo's model catalog, baked in at compile time so INSTALLED binaries
+// (brew/npm/installer bundles ship no model_catalog.json on disk) still offer
+// real model names in `octos init` — pre-fix, every provider fell into manual
+// entry whose "auto" default is rejected by real APIs (#1541 item 3). The single
+// embedded copy lives in `qos_catalog`; alias it here so there is exactly one
+// compiled-in `model_catalog.json` across the crate.
+use crate::qos_catalog::EMBEDDED_MODEL_CATALOG;
 
 /// Parse a model_catalog.json payload into provider → model-name lists.
 fn parse_catalog_content(content: &str) -> BTreeMap<String, Vec<String>> {
@@ -1037,12 +1035,17 @@ impl InitCommand {
             eyre::bail!("--custom-base-url is required when using custom init flags");
         };
 
+        // Never silently write model "auto" for a custom endpoint (#1541): real
+        // OpenAI-compatible APIs reject "auto" with a 400. Require an explicit
+        // --custom-model, matching the interactive and --defaults guards.
+        let Some(model) = self.custom_model.clone() else {
+            eyre::bail!(
+                "--custom-model is required when using --custom-base-url (a custom endpoint has no \"auto\" model)"
+            );
+        };
         Ok(Some(SelectedProvider {
             provider: CUSTOM_PROVIDER_NAME.to_string(),
-            model: self
-                .custom_model
-                .clone()
-                .unwrap_or_else(|| "auto".to_string()),
+            model,
             api_key_env: self
                 .custom_api_key_env
                 .clone()
@@ -1323,6 +1326,25 @@ mod tests {
         let err = cmd.custom_selection_from_flags().unwrap_err();
 
         assert!(err.to_string().contains("--custom-base-url is required"));
+    }
+
+    #[test]
+    fn custom_flags_require_model() {
+        // Regression (#1541): --custom-base-url without --custom-model must error
+        // rather than silently writing model "auto" (which real APIs 400 on).
+        let cmd = InitCommand {
+            cwd: None,
+            defaults: false,
+            force: false,
+            custom_base_url: Some("https://api.example.com/v1".to_string()),
+            custom_model: None,
+            custom_api_type: None,
+            custom_api_key_env: None,
+        };
+
+        let err = cmd.custom_selection_from_flags().unwrap_err();
+
+        assert!(err.to_string().contains("--custom-model is required"));
     }
 
     #[test]

@@ -32,11 +32,22 @@ use super::{ProfileRuntime, SessionRuntime};
 /// sweep cadence is fixed.
 const BACKGROUND_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
 
-/// Cache key shared by every storage map in this module. Pairs the
-/// profile id (from [`ProfileRuntime::profile_id`]) with the session
-/// key half so a profile reload only invalidates entries belonging
-/// to that profile.
-type CacheKey = (String, SessionKey);
+/// Cache key shared by every storage map in this module. Triples the
+/// profile id (from [`ProfileRuntime::profile_id`]), the session key,
+/// and the resolved **sessions root** so a profile reload only
+/// invalidates entries belonging to that profile.
+///
+/// The `PathBuf` third element is the on-disk store root a runtime is
+/// bootstrapped against ([`resolve_sessions_root_from_hint`]). It is
+/// **constant** (`profile.data_dir`) while `appui.sessions_in_cwd` is off, so
+/// keying by it is byte-identical to the historical `(profile, session_key)`
+/// pair in that mode. With the flag on it makes the cache identity distinguish
+/// the SAME `SessionKey` opened against DIFFERENT project cwds: same key + same
+/// cwd stays single-flight (one runtime), but same key + different cwd
+/// resolves to SEPARATE runtimes/roots — closing the corruption where a
+/// re-open in project B was handed project A's cached runtime (and then ran
+/// tools / wrote history under A's root).
+type CacheKey = (String, SessionKey, PathBuf);
 
 /// Storage shape for the main cache: `(profile_id, session_key) ->
 /// CacheEntry`. Factored into a `type` alias because clippy flags
@@ -112,6 +123,14 @@ pub struct SessionRuntimeCache {
     session_generations: Arc<std::sync::Mutex<HashMap<SessionKey, u64>>>,
     max_size: usize,
     idle_ttl: Duration,
+    /// Process-global `appui.sessions_in_cwd` flag, threaded verbatim into
+    /// every [`SessionRuntime::bootstrap_with_permissions_and_sandbox`] this
+    /// cache performs. Held on the cache (constructed once per `octos serve`)
+    /// so the flag has a single source of truth and `get_or_init*` needs no
+    /// per-call parameter. When set, a cwd-hinted session's transcript store
+    /// relocates to `<cwd>/.octos`; no-hint sessions are unaffected. Default
+    /// `false` (legacy per-profile storage).
+    sessions_in_cwd: bool,
     /// Cancellation signal for the background sweep task. Notified
     /// when the cache is dropped so the task can shut down cleanly
     /// instead of leaking onto the runtime.
@@ -232,9 +251,29 @@ impl SessionRuntimeCache {
             session_generations: Arc::new(std::sync::Mutex::new(HashMap::new())),
             max_size,
             idle_ttl,
+            // Default OFF: legacy per-profile storage. `octos serve` opts in
+            // via `with_sessions_in_cwd(config.appui.sessions_in_cwd)`.
+            sessions_in_cwd: false,
             shutdown,
             sweep_task: std::sync::Mutex::new(sweep_task),
         }
+    }
+
+    /// Enable per-project (`appui.sessions_in_cwd`) session storage for every
+    /// runtime this cache bootstraps. Wired by `octos serve` from
+    /// `config.appui.sessions_in_cwd`; off by default so all existing call
+    /// sites (and tests) keep legacy per-profile storage.
+    pub fn with_sessions_in_cwd(mut self, sessions_in_cwd: bool) -> Self {
+        self.sessions_in_cwd = sessions_in_cwd;
+        self
+    }
+
+    /// Whether this cache relocates cwd-hinted sessions to `<cwd>/.octos`.
+    /// Read by the `session/list` handler to decide whether an incoming
+    /// `cwd` param scopes the listing (single source of truth with the
+    /// bootstrap path).
+    pub fn sessions_in_cwd(&self) -> bool {
+        self.sessions_in_cwd
     }
 
     /// The LRU capacity this cache was constructed with. Exposed
@@ -333,7 +372,16 @@ impl SessionRuntimeCache {
         // round 3 on #1639).
         permissions_epoch: u64,
     ) -> Result<Arc<SessionRuntime>> {
-        let key = (profile.profile_id.clone(), session_key.clone());
+        // Resolve the sessions root the same way bootstrap will, so the cache
+        // identity separates the same key opened against different project
+        // cwds (flag on) while staying constant — `profile.data_dir` — for
+        // every session when the flag is off (byte-identical legacy keying).
+        let key_root = super::session::resolve_sessions_root_from_hint(
+            profile,
+            workspace_hint.as_deref(),
+            self.sessions_in_cwd,
+        );
+        let key = (profile.profile_id.clone(), session_key.clone(), key_root);
 
         loop {
             // Fast path: a matching profile allocation may reuse the cached
@@ -422,6 +470,10 @@ impl SessionRuntimeCache {
                         workspace_hint,
                         permissions,
                         sandbox_override,
+                        // Process-global flag (default false). A cwd-hinted
+                        // session relocates its store to `<cwd>/.octos` only
+                        // when this is on; no-hint sessions ignore it.
+                        self.sessions_in_cwd,
                     )
                     .await;
                     match result {
@@ -533,15 +585,22 @@ impl SessionRuntimeCache {
         canonical
     }
 
-    /// Drop the entry for `key` if present. Used by M11-D's
-    /// `/api/sessions/:id/delete` handler and by the config
-    /// watcher when a profile reload invalidates every cached
-    /// session for the profile.
+    /// Drop every cached entry for `(profile_id, session_key)` regardless of
+    /// the resolved sessions root. Used by M11-D's
+    /// `/api/sessions/:id/delete` handler and by the config watcher when a
+    /// profile reload invalidates every cached session for the profile.
+    ///
+    /// Root-agnostic on purpose: a session key can now be cached under more
+    /// than one root (the same key opened against two project cwds with
+    /// `appui.sessions_in_cwd` on), and an invalidation of that logical
+    /// session must clear all of them.
     ///
     /// Idempotent: removing an absent key is a no-op.
-    pub async fn invalidate(&self, key: &(String, SessionKey)) {
+    pub async fn invalidate(&self, profile_id: &str, session_key: &SessionKey) {
         let mut guard = self.inner.write().await;
-        guard.remove(key);
+        guard.retain(|(key_profile, key_session, _), _| {
+            key_profile != profile_id || key_session != session_key
+        });
     }
 
     /// Drop every cached session runtime belonging to `profile_id`. Used when
@@ -560,7 +619,7 @@ impl SessionRuntimeCache {
             *generations.entry(profile_id.to_owned()).or_insert(0) += 1;
         }
         let mut guard = self.inner.write().await;
-        guard.retain(|(key_profile, _), _| key_profile != profile_id);
+        guard.retain(|(key_profile, _, _), _| key_profile != profile_id);
     }
 
     fn profile_generation(&self, profile_id: &str) -> u64 {
@@ -587,7 +646,7 @@ impl SessionRuntimeCache {
             *generations.entry(session_key.clone()).or_insert(0) += 1;
         }
         let mut guard = self.inner.write().await;
-        guard.retain(|(_, key_session), _| key_session != session_key);
+        guard.retain(|(_, key_session, _), _| key_session != session_key);
     }
 
     pub(crate) fn session_generation(&self, session_key: &SessionKey) -> u64 {
@@ -1016,13 +1075,11 @@ mod tests {
             .expect("init");
         assert_eq!(cache.len().await, 1);
 
-        cache
-            .invalidate(&(profile.profile_id.clone(), key.clone()))
-            .await;
+        cache.invalidate(&profile.profile_id, &key).await;
         assert!(cache.is_empty().await);
 
         // Idempotent.
-        cache.invalidate(&(profile.profile_id.clone(), key)).await;
+        cache.invalidate(&profile.profile_id, &key).await;
     }
 
     #[tokio::test]
@@ -1137,7 +1194,12 @@ mod tests {
 
         let canonical = cache
             .insert_with_eviction(
-                (profile.profile_id.clone(), key.clone()),
+                // Flag off ⇒ the seed above was cached under `profile.data_dir`.
+                (
+                    profile.profile_id.clone(),
+                    key.clone(),
+                    profile.data_dir.clone(),
+                ),
                 redundant,
                 cache.profile_generation(&profile.profile_id),
                 cache.session_generation(&key),
@@ -1177,7 +1239,12 @@ mod tests {
 
         let cache = Arc::new(SessionRuntimeCache::new(8, Duration::from_secs(60)));
         let key = SessionKey::new("api", "owner-cancelled");
-        let cache_key = (profile.profile_id.clone(), key.clone());
+        // Flag off ⇒ get_or_init keys this session under `profile.data_dir`.
+        let cache_key = (
+            profile.profile_id.clone(),
+            key.clone(),
+            profile.data_dir.clone(),
+        );
 
         // Step 1+2: hand-construct a guard the way `get_or_init`
         // would, then drop it. This is the same `InflightGuard`
@@ -1253,5 +1320,173 @@ mod tests {
                 .is_empty(),
         );
         drop(rt);
+    }
+
+    #[test]
+    fn with_sessions_in_cwd_builder_toggles_flag() {
+        // Default OFF; the builder flips it. Single source of truth for the
+        // bootstrap path and the `session/list` cwd gate.
+        let cache = SessionRuntimeCache::new(4, Duration::from_secs(60));
+        assert!(!cache.sessions_in_cwd());
+        assert!(
+            SessionRuntimeCache::new(4, Duration::from_secs(60))
+                .with_sessions_in_cwd(true)
+                .sessions_in_cwd()
+        );
+    }
+
+    #[tokio::test]
+    async fn cache_flag_on_relocates_cwd_hinted_session() {
+        // The flag on the cache must reach `SessionRuntime::bootstrap` via
+        // `get_or_init` so a cwd-hinted session's store lands under
+        // `<cwd>/.octos`.
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("profile-data");
+        let profile = make_profile(data_dir.clone()).await;
+        let cwd = tmp.path().join("proj");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let cwd_canon = std::fs::canonicalize(&cwd).unwrap();
+
+        let cache = SessionRuntimeCache::new(4, Duration::from_secs(60)).with_sessions_in_cwd(true);
+        let rt = cache
+            .get_or_init(&profile, SessionKey::new("api", "coding"), Some(cwd))
+            .await
+            .expect("bootstrap via cache");
+        assert_eq!(
+            rt.sessions_root,
+            cwd_canon.join(".octos").join(&profile.profile_id)
+        );
+    }
+
+    #[tokio::test]
+    async fn cache_default_keeps_cwd_hinted_session_in_profile() {
+        // Regression: a default (flag-off) cache keeps a cwd-hinted session on
+        // profile.data_dir — byte-identical to today.
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("profile-data");
+        let profile = make_profile(data_dir.clone()).await;
+        let cwd = tmp.path().join("proj");
+        std::fs::create_dir_all(&cwd).unwrap();
+
+        let cache = SessionRuntimeCache::new(4, Duration::from_secs(60));
+        let rt = cache
+            .get_or_init(&profile, SessionKey::new("api", "coding"), Some(cwd))
+            .await
+            .expect("bootstrap via cache");
+        assert_eq!(rt.sessions_root, data_dir);
+    }
+
+    #[tokio::test]
+    async fn cache_separates_same_key_across_cwds_flag_on() {
+        // Codex P1: with the flag ON, opening the SAME SessionKey in project A
+        // then project B THROUGH THE CACHE must return DISTINCT runtimes rooted
+        // at each project — NOT hand B project A's cached runtime (which would
+        // make B run tools / write history under A's root). Exercises the cache
+        // path (the corruption site), not a direct bootstrap.
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("profile-data");
+        let profile = make_profile(data_dir).await;
+        let proj_a = tmp.path().join("project-a");
+        let proj_b = tmp.path().join("project-b");
+        std::fs::create_dir_all(&proj_a).unwrap();
+        std::fs::create_dir_all(&proj_b).unwrap();
+
+        let cache = SessionRuntimeCache::new(8, Duration::from_secs(60)).with_sessions_in_cwd(true);
+        let key = SessionKey::new("api", "default");
+
+        let rt_a = cache
+            .get_or_init(&profile, key.clone(), Some(proj_a.clone()))
+            .await
+            .expect("open K in A");
+        let rt_b = cache
+            .get_or_init(&profile, key.clone(), Some(proj_b.clone()))
+            .await
+            .expect("open K in B");
+
+        // Distinct cached runtimes rooted at their own project — no cross-wire.
+        assert!(
+            !Arc::ptr_eq(&rt_a, &rt_b),
+            "same key + different cwd must yield distinct runtimes"
+        );
+        assert_ne!(rt_a.sessions_root, rt_b.sessions_root);
+        assert!(
+            rt_a.sessions_root
+                .starts_with(std::fs::canonicalize(&proj_a).unwrap())
+        );
+        assert!(
+            rt_b.sessions_root
+                .starts_with(std::fs::canonicalize(&proj_b).unwrap())
+        );
+        // Both entries coexist in the cache (not one clobbering the other).
+        assert_eq!(cache.len().await, 2);
+
+        // Single-flight preserved for same key + SAME cwd: re-opening K in A
+        // returns the SAME cached runtime, not a third entry.
+        let rt_a2 = cache
+            .get_or_init(&profile, key.clone(), Some(proj_a.clone()))
+            .await
+            .expect("re-open K in A");
+        assert!(
+            Arc::ptr_eq(&rt_a, &rt_a2),
+            "same key + same cwd must stay single-flight"
+        );
+        assert_eq!(cache.len().await, 2);
+
+        // No cross-write: each runtime's manager persists under its own root.
+        {
+            let mut mgr = rt_a.sessions.lock().await;
+            mgr.add_message(&key, octos_core::Message::user("for-A"))
+                .await
+                .unwrap();
+        }
+        {
+            let mut mgr = rt_b.sessions.lock().await;
+            mgr.add_message(&key, octos_core::Message::user("for-B"))
+                .await
+                .unwrap();
+        }
+        let mut reload_a = octos_bus::SessionManager::open(&rt_a.sessions_root).unwrap();
+        assert_eq!(reload_a.get_or_create(&key).await.messages.len(), 1);
+        assert_eq!(
+            reload_a.get_or_create(&key).await.messages[0].content,
+            "for-A"
+        );
+        let mut reload_b = octos_bus::SessionManager::open(&rt_b.sessions_root).unwrap();
+        assert_eq!(reload_b.get_or_create(&key).await.messages.len(), 1);
+        assert_eq!(
+            reload_b.get_or_create(&key).await.messages[0].content,
+            "for-B"
+        );
+    }
+
+    #[tokio::test]
+    async fn cache_shares_same_key_across_cwds_flag_off() {
+        // Regression: with the flag OFF the cache key's root element is constant
+        // (`profile.data_dir`), so the same key opened against two different
+        // cwds collapses to ONE runtime — byte-identical to the historical
+        // `(profile, session_key)` keying / first-cwd-wins.
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("profile-data");
+        let profile = make_profile(data_dir).await;
+        let proj_a = tmp.path().join("project-a");
+        let proj_b = tmp.path().join("project-b");
+        std::fs::create_dir_all(&proj_a).unwrap();
+        std::fs::create_dir_all(&proj_b).unwrap();
+
+        let cache = SessionRuntimeCache::new(8, Duration::from_secs(60)); // flag OFF
+        let key = SessionKey::new("api", "default");
+        let rt_a = cache
+            .get_or_init(&profile, key.clone(), Some(proj_a))
+            .await
+            .expect("A");
+        let rt_b = cache
+            .get_or_init(&profile, key.clone(), Some(proj_b))
+            .await
+            .expect("B");
+        assert!(
+            Arc::ptr_eq(&rt_a, &rt_b),
+            "flag off: same key must reuse one runtime regardless of cwd"
+        );
+        assert_eq!(cache.len().await, 1);
     }
 }

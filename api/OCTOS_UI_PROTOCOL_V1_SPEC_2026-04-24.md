@@ -392,6 +392,8 @@ Session, turn, and approval core:
   re-projects the trimmed thread exactly like `session/hydrate`; #1516)
 - `session/fork` (branch a session into a new one with copied history; #1613)
 - `session/btw` (quick aside question answered while the current turn runs; #1609)
+- `session/compact` (force a context-compaction pass on the session now; the manual `/compact` command)
+- `session/compact/mode/set` (per-session LLM-vs-heuristic compaction mode; the `/context` menu)
 - `turn/start`
 - `turn/interrupt`
 - `turn/state/get` (gate `state.turn_state_get.v1`, accepted `UPCR-2026-011`)
@@ -434,6 +436,10 @@ M12 Phase-D auxiliary REST→WS surface (all gated `auxiliary.rest_to_ws.v1`):
 - `system/status.get`
 - `content/list`, `content/delete`, `content/bulk_delete`
 - `memory/overview`, `memory/entity`, `cron/list`, `cron/toggle`
+
+Launch (per-project session UX, gated `session.workspace_cwd.v1`):
+
+- `launch/resolve`
 
 Runtime, auth, profile, and onboarding inspection (server-handled
 `APPUI_EXTRA_METHODS`):

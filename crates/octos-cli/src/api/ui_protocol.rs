@@ -183,6 +183,13 @@ const APPUI_METHOD_PROFILE_LLM_LIST: &str = "profile/llm/list";
 const APPUI_METHOD_PROFILE_LLM_SELECT: &str = "profile/llm/select";
 const APPUI_METHOD_MCP_STATUS_LIST: &str = "mcp/status/list";
 const APPUI_METHOD_TOOL_STATUS_LIST: &str = "tool/status/list";
+/// Manual, on-demand context compaction for an open session (the `/compact`
+/// TUI command). Forces the compaction pass regardless of the auto-compaction
+/// threshold; AppUI-only, so a local literal like the other AppUI methods.
+const APPUI_METHOD_SESSION_COMPACT: &str = "session/compact";
+/// Set the per-session compaction mode (LLM vs heuristic) from the `/context`
+/// menu; overrides the `--llm-compaction` default for auto + manual compaction.
+const APPUI_METHOD_SESSION_COMPACT_MODE_SET: &str = "session/compact/mode/set";
 const APPUI_METHOD_AUTH_STATUS: &str = "auth/status";
 const APPUI_METHOD_AUTH_SEND_CODE: &str = "auth/send_code";
 const APPUI_METHOD_AUTH_VERIFY: &str = "auth/verify";
@@ -212,8 +219,28 @@ const APPUI_METHOD_SKILL_ACTION_JOB_READ: &str = "skill/action/job/read";
 /// see the same typed shape they get from `profile/local/create`.
 const APPUI_METHOD_ONBOARDING_WORKSPACE_PROBE: &str = "onboarding/workspace_probe";
 const APPUI_METHOD_REVIEW_START: &str = octos_core::ui_protocol::methods::REVIEW_START;
-const DASHBOARD_PROVIDERS_JSON: &str = include_str!("../../../../dashboard/src/providers.json");
+
+/// The canonical model catalog — the single source of truth for provisionable
+/// models (`model_catalog.json`). Compiled in so onboarding always has the full
+/// catalog. This aliases the single embedded copy owned by `qos_catalog` (which
+/// also seeds the router / context / pricing tables), so there is exactly one
+/// compiled-in catalog across the crate.
+use crate::qos_catalog::EMBEDDED_MODEL_CATALOG as CANONICAL_MODEL_CATALOG;
 const APPUI_FEATURE_PROFILE_LOCAL_CREATE_V1: &str = "profile.local_create.v1";
+/// Additive capability: the server understands the optional `requested_id`
+/// field on `profile/local/create` (and treats `username`/`email` as
+/// optional). Advertised only alongside `profile.local_create.v1` so a client
+/// can negotiate the user-nameable-profile onboarding flow before sending the
+/// new shape. Purely additive — no protocol/capabilities schema-version bump,
+/// matching how `profile.local_create.v1` itself was introduced.
+const APPUI_FEATURE_PROFILE_LOCAL_CREATE_REQUESTED_ID_V1: &str =
+    "profile.local_create.requested_id.v1";
+/// Nameable-profiles extension: this server honors the optional `make_default`
+/// field on `profile/local/create`, recording the created profile as the
+/// machine's global default (the brain a bare launch resolves to in a folder
+/// with no sticky profile). Advertised alongside `profile.local_create.v1`;
+/// purely additive. Gates the onboarding "Make this your default brain?" prompt.
+const APPUI_FEATURE_PROFILE_LOCAL_CREATE_DEFAULT_V1: &str = "profile.local_create.default.v1";
 const APPUI_FEATURE_PERMISSION_PROFILE_V1: &str = "permission.profile.v1";
 const APPUI_FEATURE_RUNTIME_POLICY_STAMP_V1: &str = "runtime.policy_stamp.v1";
 const APPUI_FEATURE_CONTEXT_LIFECYCLE_V1: &str = "context.lifecycle.v1";
@@ -258,6 +285,8 @@ const APPUI_EXTRA_METHODS: &[&str] = &[
     APPUI_METHOD_SKILL_ACTION_JOB_READ,
     APPUI_METHOD_ONBOARDING_WORKSPACE_PROBE,
     octos_core::ui_protocol::methods::SESSION_BTW,
+    APPUI_METHOD_SESSION_COMPACT,
+    APPUI_METHOD_SESSION_COMPACT_MODE_SET,
 ];
 const APPUI_STDIO_AUTH_BOUND_UNAVAILABLE_METHODS: &[&str] = &[
     APPUI_METHOD_AUTH_ME,
@@ -1620,6 +1649,21 @@ impl ConnectionUiFeatures {
                 &mut capabilities.supported_features,
                 APPUI_FEATURE_PROFILE_LOCAL_CREATE_V1,
             );
+            // Nameable profiles: advertise that this server honors the optional
+            // `requested_id` field (and optional username/email). Additive on
+            // top of the v1 flag, so older clients that negotiate only v1 keep
+            // working with the legacy `{name, username, email}` shape.
+            push_capability_feature(
+                &mut capabilities.supported_features,
+                APPUI_FEATURE_PROFILE_LOCAL_CREATE_REQUESTED_ID_V1,
+            );
+            // Nameable profiles: advertise that this server honors the optional
+            // `make_default` field, recording the created profile as the global
+            // default. Additive; gates the onboarding make-default prompt.
+            push_capability_feature(
+                &mut capabilities.supported_features,
+                APPUI_FEATURE_PROFILE_LOCAL_CREATE_DEFAULT_V1,
+            );
             // #1057: workspace probe ships next to local-solo onboarding so
             // the TUI can advertise the recovery UX only when the backend
             // can answer canonical-path / workspace-policy questions.
@@ -2165,6 +2209,45 @@ fn appui_context_compact_keep_items() -> usize {
         .unwrap_or(APPUI_CONTEXT_COMPACT_KEEP_ITEMS)
 }
 
+/// Per-session compaction-mode override, set from the `/context` menu via
+/// `session/compact/mode/set`. `true` = force the LLM summary path, `false` =
+/// force the heuristic. Absent = follow the server `--llm-compaction` default.
+/// In-memory per serve process (resets on restart), like the other per-session
+/// runtime maps in this module.
+fn session_compaction_llm_override() -> &'static std::sync::RwLock<HashMap<SessionKey, bool>> {
+    static OVERRIDE: OnceLock<std::sync::RwLock<HashMap<SessionKey, bool>>> = OnceLock::new();
+    OVERRIDE.get_or_init(|| std::sync::RwLock::new(HashMap::new()))
+}
+
+/// Effective LLM-vs-heuristic decision for a session: the per-session `/context`
+/// override if set, else the server `--llm-compaction` default. Read by all
+/// three compaction sites (auto pre-turn, auto in-loop, manual `session/compact`).
+fn session_compaction_llm_enabled(session_id: &SessionKey, state: &AppState) -> bool {
+    session_compaction_llm_override()
+        .read()
+        .ok()
+        .and_then(|map| map.get(session_id).copied())
+        .unwrap_or(state.llm_compaction)
+}
+
+/// Persist a per-session compaction-mode override.
+fn set_session_compaction_llm(session_id: &SessionKey, llm: bool) {
+    if let Ok(mut map) = session_compaction_llm_override().write() {
+        map.insert(session_id.clone(), llm);
+    }
+}
+
+/// Effective compaction mode as a wire string (`"llm"` / `"heuristic"`), for the
+/// `session/status/read` payload and the `session/compact*` RPC replies so the
+/// `/context` menu can render + reflect the current selection.
+fn session_compaction_mode_str(session_id: &SessionKey, state: &AppState) -> &'static str {
+    if session_compaction_llm_enabled(session_id, state) {
+        "llm"
+    } else {
+        "heuristic"
+    }
+}
+
 /// Produce an LLM-summarization compaction summary for the AppUI path, falling
 /// back to the deterministic [`compact_messages`] heuristic whenever the LLM
 /// summary errors, times out, or the runtime is unsupported — so it can never
@@ -2179,13 +2262,13 @@ fn appui_compaction_summary(
     if let Some(summary) = octos_agent::compaction::llm_compaction_summary(
         llm_provider,
         messages,
-        budget_tokens,
         std::time::Duration::from_secs(
             octos_agent::compaction::DEFAULT_LLM_COMPACTION_TIMEOUT_SECS,
         ),
     ) {
         return summary;
     }
+    // Heuristic fallback still uses the summary-size budget (correct there).
     octos_agent::compaction::compact_messages(messages, budget_tokens)
 }
 
@@ -2284,6 +2367,186 @@ fn appui_context_history_for_agent(
         Arc::new(StdMutex::new(manager)),
         lifecycle_notifications,
     )
+}
+
+/// Force a context-compaction pass on a session's ledger, bypassing the
+/// auto-compaction threshold. Powers the manual `session/compact` UI method.
+///
+/// Mirrors the pre-turn path [`appui_context_history_for_agent`] but always runs
+/// the compaction body (no `token_estimate > threshold` gate). Returns the
+/// lifecycle notifications to emit (`ContextCompactionStarted` + `Completed`)
+/// and a small result value (`token_estimate` before/after) for the RPC reply.
+fn appui_force_compact_context(
+    data_dir: &Path,
+    session_id: &SessionKey,
+    history: &[Message],
+    llm_provider: &Arc<dyn octos_llm::LlmProvider>,
+    llm_compaction_enabled: bool,
+) -> (Vec<UiNotification>, serde_json::Value) {
+    const TRIGGER: &str = "appui_manual_compact";
+    let (mut manager, ledger_status) =
+        load_or_rebuild_context_manager(data_dir, session_id.to_string(), None, history);
+    tracing::debug!(
+        session = %session_id.0,
+        ledger_status = ?ledger_status,
+        "appui context manager loaded for manual compaction"
+    );
+    let threshold = appui_context_compact_threshold_tokens(llm_provider.as_ref());
+    let policy = appui_context_prompt_policy(llm_provider.as_ref());
+    let mut lifecycle_notifications = Vec::new();
+    // Forced: unlike the pre-turn path there is no `token_estimate > threshold`
+    // gate — the user explicitly asked to compact now.
+    lifecycle_notifications.push(UiNotification::ContextCompactionStarted(
+        ContextCompactionStartedEvent {
+            session_id: session_id.clone(),
+            context_state: ui_context_state_for(session_id, &manager),
+            trigger: TRIGGER.to_owned(),
+            threshold_tokens: threshold,
+        },
+    ));
+    let before = manager.for_prompt(&policy);
+    let summary_budget = threshold.clamp(256, 4096) as u32;
+    let summary = if llm_compaction_enabled {
+        appui_compaction_summary(llm_provider, &before.messages, summary_budget)
+    } else {
+        octos_agent::compaction::compact_messages(&before.messages, summary_budget)
+    };
+    let record = manager.compact_context(
+        summary,
+        CompactContextPolicy {
+            trigger: TRIGGER.to_owned(),
+            keep_recent_items: appui_context_compact_keep_items(),
+            ..CompactContextPolicy::default()
+        },
+    );
+    info!(
+        session = %session_id.0,
+        compaction_id = %record.compaction_id.as_str(),
+        token_estimate_before = record.token_estimate_before,
+        token_estimate_after = ?record.token_estimate_after,
+        trigger = TRIGGER,
+        "appui manual compact_context installed"
+    );
+    let result = serde_json::json!({
+        "session_id": session_id.to_string(),
+        "compacted": true,
+        "token_estimate_before": record.token_estimate_before,
+        "token_estimate_after": record.token_estimate_after,
+    });
+    lifecycle_notifications.push(appui_context_compaction_notification(
+        session_id, &manager, &record,
+    ));
+    publish_appui_context_status(session_id, &manager);
+    if let Err(error) =
+        persist_context_manager_snapshot(data_dir, &session_id.to_string(), &manager)
+    {
+        warn!(
+            session = %session_id.0,
+            error = %error,
+            "failed to persist appui context manager snapshot after manual compaction"
+        );
+    }
+    (lifecycle_notifications, result)
+}
+
+/// `session/compact/mode/set`: set the per-session compaction-mode override
+/// from the `/context` menu. Params `{ session_id, mode: "llm" | "heuristic" }`.
+/// The override wins over the server `--llm-compaction` default for BOTH the
+/// automatic compaction and manual `session/compact`.
+fn handle_session_compact_mode_set(
+    state: &Arc<AppState>,
+    request: &RpcRequest<Value>,
+) -> Result<Value, RpcError> {
+    let params: RawProfileParams = parse_raw_params(request)?;
+    let Some(session_id) = params.session_id.clone() else {
+        return Err(RpcError::invalid_params("session_id is required"));
+    };
+    let llm = match request.params.get("mode").and_then(Value::as_str) {
+        Some("llm") => true,
+        Some("heuristic") => false,
+        _ => {
+            return Err(RpcError::invalid_params(
+                "mode is required and must be \"llm\" or \"heuristic\"",
+            ));
+        }
+    };
+    set_session_compaction_llm(&session_id, llm);
+    Ok(json!({
+        "session_id": session_id,
+        "mode": session_compaction_mode_str(&session_id, state),
+    }))
+}
+
+/// `session/compact`: force a context-compaction pass on an open session,
+/// bypassing the auto-compaction threshold (powers the manual `/compact`
+/// command). Resolves the already-open session runtime — a cache hit for the
+/// active session — mirroring [`tool_status_list_result`]'s resolution, then
+/// runs [`appui_force_compact_context`] and emits its lifecycle notifications
+/// so clients render the compaction the same way they do the automatic pass.
+async fn handle_session_compact(
+    ws: &WsConnection,
+    state: &Arc<AppState>,
+    ledger: &Arc<UiProtocolLedger>,
+    features: ConnectionUiFeatures,
+    connection_profile_id: Option<&str>,
+    request: &RpcRequest<Value>,
+) -> Result<Value, RpcError> {
+    let params: RawProfileParams = parse_raw_params(request)?;
+    let Some(session_id) = params.session_id.clone() else {
+        return Err(RpcError::invalid_params("session_id is required"));
+    };
+    let profile_id = raw_profile_id(&params, connection_profile_id);
+    let Some(profile_runtime) = ensure_session_profile_runtime(state, Some(&profile_id)).await?
+    else {
+        return Err(runtime_unavailable_error(format!(
+            "no runtime for profile {profile_id}; cannot compact session {session_id}"
+        )));
+    };
+    // Epoch BEFORE permission resolution (codex #1639). For an already-open
+    // session this is a cache hit that returns the existing runtime.
+    let permissions_epoch = state.session_cache.session_generation(&session_id);
+    let permissions = effective_permissions_for_session(state, &session_id)?;
+    let workspace_hint = session_workspaces().get(&session_id);
+    let session_runtime = state
+        .session_cache
+        .get_or_init_with_permissions(
+            &profile_runtime,
+            session_id.clone(),
+            workspace_hint,
+            permissions,
+            permissions_epoch,
+        )
+        .await
+        .map_err(|error| {
+            runtime_unavailable_error(format!("failed to resolve session runtime: {error}"))
+        })?;
+
+    let llm_provider = session_runtime.profile.llm.clone();
+    // #1666: the per-project ledger lives under `sessions_root`, not
+    // `profile.data_dir` — the forced path must touch the SAME ledger the
+    // pre-turn path uses.
+    let data_dir = session_runtime.sessions_root.clone();
+    let history: Vec<Message> = {
+        let mut sessions = session_runtime.sessions.lock().await;
+        let session = sessions.get_or_create(&session_id).await;
+        session.get_history(50).to_vec()
+    };
+
+    let (notifications, result) = appui_force_compact_context(
+        &data_dir,
+        &session_id,
+        &history,
+        &llm_provider,
+        session_compaction_llm_enabled(&session_id, state),
+    );
+    for notification in notifications {
+        if features.context_lifecycle_available() {
+            let _ = send_notification_durable(ws, ledger, notification);
+        } else {
+            let _ = ledger.append_notification_from(notification, ws.connection_id);
+        }
+    }
+    Ok(result)
 }
 
 fn prompt_message_matches(left: &Message, right: &Message) -> bool {
@@ -2771,6 +3034,50 @@ fn combine_typed_prompt_with_transcript(typed_prompt: &str, transcript: &str) ->
         transcript.to_owned()
     } else {
         format!("{typed_prompt}\n{transcript}")
+    }
+}
+
+/// Register the per-project ledger storage scope for a just-materialized
+/// [`SessionRuntime`] — the UI-protocol half of `appui.sessions_in_cwd`
+/// isolation (#1666).
+///
+/// The ledger is a process-global singleton rooted at the serve data dir, and
+/// it keys each session's ring/dir by the session id alone. With
+/// `sessions_in_cwd` the SAME wire id can belong to different projects, so a
+/// relocated session (`sessions_root != profile.data_dir`) registers a
+/// 16-hex digest of its canonical `sessions_root`; the ledger then keeps that
+/// project's events under a distinct storage identity. Flag-OFF (or no cwd
+/// hint) resolves `sessions_root == profile.data_dir` → scope `None` →
+/// byte-identical legacy behavior (and clears a stale registration if the
+/// flag was toggled off).
+///
+/// MUST be called before the flow replays the session (`session/open` calls
+/// it right after the runtime cache materializes, before
+/// `replay_after_with_head`) so replay and subsequent appends agree.
+fn register_session_ledger_scope(
+    ledger: &UiProtocolLedger,
+    runtime: &crate::runtime::SessionRuntime,
+) {
+    let scope = (runtime.sessions_root != runtime.profile.data_dir).then(|| {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(runtime.sessions_root.as_os_str().as_encoded_bytes());
+        hasher.finalize()[..8]
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    });
+    ledger.set_session_scope(&runtime.session_key, scope.clone());
+    // Topic-suffixed sessions also emit ledger events under their BASE key:
+    // the alpha-9 file/visual bridges deliberately strip the `#topic` before
+    // appending so base-bucket subscribers see them (see
+    // `ui_protocol_alpha9_bridge.rs`). Register the base alias with the same
+    // scope so those appends land in the same per-project dir instead of the
+    // unscoped legacy one (codex v2 P2). Same cwd → same scope, so this can
+    // never mis-route a different project's base-key session.
+    let base = runtime.session_key.base_key();
+    if base != runtime.session_key.0 {
+        ledger.set_session_scope(&SessionKey(base.to_owned()), scope);
     }
 }
 
@@ -4543,6 +4850,10 @@ async fn ui_protocol_connection(
                     }
                 }
             }
+            UiCommand::LaunchResolve(params) => {
+                handle_launch_resolve(&ws, &state, connection_profile_id, features, id, params)
+                    .await;
+            }
             UiCommand::SessionOpen(params) => {
                 // gap #2 (codex P2): record the profile this open RESOLVES to so
                 // a None-scoped (admin) connection's later turn/start +
@@ -4787,6 +5098,7 @@ async fn ui_protocol_connection(
                     &connection_headers,
                     connection_identity.as_ref(),
                     connection_profile_id,
+                    features,
                     id,
                     params,
                 )
@@ -5238,6 +5550,17 @@ where
                     }
                 }
             }
+            UiCommand::LaunchResolve(params) => {
+                handle_launch_resolve(
+                    &ws,
+                    &state,
+                    connection_profile_id_owned.as_deref(),
+                    features,
+                    id,
+                    params,
+                )
+                .await;
+            }
             UiCommand::SessionOpen(params) => {
                 let next_connection_profile_id = stdio_session_open_candidate_profile(
                     &params,
@@ -5501,6 +5824,7 @@ where
                     &connection_headers,
                     None,
                     connection_profile_id_owned.as_deref(),
+                    features,
                     id,
                     params,
                 )
@@ -6610,6 +6934,360 @@ fn ensure_existing_local_profile_matches(
     Ok(())
 }
 
+/// Maximum profile-id slug length (mirrors `profiles::validate_slug_shape`).
+const LOCAL_PROFILE_ID_MAX_LEN: usize = 64;
+
+/// Upper bound on the numeric suffix tried when auto-suffixing a requested
+/// profile id (`glm`, `glm-2`, …, `glm-10000`). A store with more collisions
+/// than this falls back to a uuid-based id, so id assignment always
+/// terminates instead of spinning on a pathological store.
+const MAX_LOCAL_PROFILE_ID_SUFFIX: u32 = 10_000;
+
+/// Serializes local-solo profile CREATION (id + email assignment through
+/// persistence). Without it, two concurrent REST/WS creates for the same
+/// `requested_id` can BOTH pass the free-id / free-email checks before either
+/// save runs, then write the same records and clash on the shared
+/// `.json.tmp` paths instead of one getting `glm` and the other `glm-2`. A
+/// single serve process shares one profiles dir, so a process-wide lock is
+/// the reservation boundary that makes find-free + create atomic. Held only
+/// across synchronous store I/O (never across an `.await`); poison is
+/// recovered because one panicking creator must not brick all future ones.
+static LOCAL_PROFILE_CREATE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Normalize a user-requested profile id into slug shape: lowercase ASCII
+/// alphanumerics are kept, every other run collapses to a single `-`, edge
+/// `-` are trimmed, and the result is capped at 64 bytes. Returns `None` when
+/// nothing usable remains, or when the result would collide with a reserved
+/// id (a session-key channel name or the synthetic `MAIN_PROFILE_ID`), so the
+/// caller falls back to a generated id. The output always satisfies
+/// `profiles::validate_profile_id`.
+fn normalize_requested_profile_id(requested: &str) -> Option<String> {
+    let mut slug = String::with_capacity(requested.len());
+    let mut last_hyphen = false;
+    for c in requested.chars() {
+        if c.is_ascii_alphanumeric() {
+            slug.push(c.to_ascii_lowercase());
+            last_hyphen = false;
+        } else if !last_hyphen {
+            slug.push('-');
+            last_hyphen = true;
+        }
+    }
+    // All bytes are ASCII, so `truncate` never splits a char; trim any hyphen
+    // the cut (or the edges) left behind.
+    slug.truncate(LOCAL_PROFILE_ID_MAX_LEN);
+    let slug = slug.trim_matches('-').to_owned();
+    if slug.is_empty()
+        || slug == octos_core::MAIN_PROFILE_ID
+        || octos_core::is_reserved_channel_name(&slug)
+    {
+        return None;
+    }
+    Some(slug)
+}
+
+/// The synthesized login-ready email for a no-email local profile:
+/// `<id>@solo.local`. The id is already a lowercase slug ≤64 chars, so the
+/// local part (= the id) is ≤64 bytes — within lettre's RFC-5321 limit — with
+/// no separate email suffix that could overflow it.
+fn synthesized_local_email(profile_id: &str) -> String {
+    format!("{profile_id}@solo.local")
+}
+
+/// Snapshot every already-claimed email (lowercased) in ONE `UserStore::list()`
+/// pass so the id-selection loop can require a free `<id>@solo.local` via O(1)
+/// set membership instead of an O(n) `get_by_email` scan per candidate. Taken
+/// under [`LOCAL_PROFILE_CREATE_LOCK`], so no concurrent creator mutates it
+/// mid-selection.
+fn claimed_email_set(
+    user_store: &crate::user_store::UserStore,
+) -> Result<std::collections::HashSet<String>, RpcError> {
+    Ok(user_store
+        .list()
+        .map_err(|error| runtime_unavailable_error(format!("failed to read users: {error}")))?
+        .into_iter()
+        .map(|user| user.email.to_lowercase())
+        .collect())
+}
+
+/// Whether `id` is free to claim, considering BOTH the id itself (reserved /
+/// profile file / user record) AND — when `claimed_emails` is `Some` (the
+/// no-user-email case) — its synthesized `<id>@solo.local`. Folding the email
+/// check in here (against a set snapshotted once) lets the id-selection loop
+/// pick an id whose synthesized email is also free, so the final
+/// `<id>@solo.local` is unique AND length-safe by construction (local part =
+/// id, already ≤64). Normalized slug input assumed; an unreadable user record
+/// is treated as taken (fail closed) so assignment never overwrites it.
+fn local_profile_candidate_is_free(
+    id: &str,
+    profile_store: &crate::profiles::ProfileStore,
+    user_store: &crate::user_store::UserStore,
+    claimed_emails: Option<&std::collections::HashSet<String>>,
+) -> bool {
+    if id == octos_core::MAIN_PROFILE_ID || octos_core::is_reserved_channel_name(id) {
+        return false;
+    }
+    if profile_store.profile_path(id).exists() {
+        return false;
+    }
+    if !matches!(user_store.get(id), Ok(None)) {
+        return false;
+    }
+    match claimed_emails {
+        Some(claimed) => !claimed.contains(&synthesized_local_email(id)),
+        None => true,
+    }
+}
+
+/// Assign a unique local profile id from a normalized `base` slug by trying
+/// `base`, then `base-2`, `base-3`, … until a free id is found (bounded by
+/// [`MAX_LOCAL_PROFILE_ID_SUFFIX`]). When `claimed_emails` is `Some`, a
+/// candidate must ALSO have a free `<candidate>@solo.local`, so the id and its
+/// synthesized email are chosen together. Returns `None` if the bound is
+/// exhausted, so the caller can fall back to a uuid-based id.
+fn assign_unique_local_profile_id(
+    base: &str,
+    profile_store: &crate::profiles::ProfileStore,
+    user_store: &crate::user_store::UserStore,
+    claimed_emails: Option<&std::collections::HashSet<String>>,
+) -> Option<String> {
+    for n in 1..=MAX_LOCAL_PROFILE_ID_SUFFIX {
+        let candidate = if n == 1 {
+            base.to_owned()
+        } else {
+            // Keep `base-N` within the slug budget by trimming the base (not
+            // the numeric tag), then drop any hyphen the trim exposed. Because
+            // the synthesized email's local part IS this id, staying ≤64 here
+            // also keeps `<id>@solo.local` within lettre's local-part limit.
+            let tag = format!("-{n}");
+            let budget = LOCAL_PROFILE_ID_MAX_LEN.saturating_sub(tag.len());
+            let mut trimmed = base.to_owned();
+            trimmed.truncate(budget);
+            let trimmed = trimmed.trim_end_matches('-');
+            if trimmed.is_empty() {
+                continue;
+            }
+            format!("{trimmed}{tag}")
+        };
+        if local_profile_candidate_is_free(&candidate, profile_store, user_store, claimed_emails) {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+/// Generate a guaranteed-unique, slug-valid local profile id when no usable
+/// requested id or username is available: derive a slug from `seed` (a display
+/// name) when possible, else a uuid-based id. Always collision-free.
+fn generated_local_profile_id(
+    seed: &str,
+    profile_store: &crate::profiles::ProfileStore,
+    user_store: &crate::user_store::UserStore,
+    claimed_emails: Option<&std::collections::HashSet<String>>,
+) -> String {
+    if let Some(id) = normalize_requested_profile_id(seed).and_then(|base| {
+        assign_unique_local_profile_id(&base, profile_store, user_store, claimed_emails)
+    }) {
+        return id;
+    }
+    loop {
+        // A v7 UUID renders as lowercase hex + hyphens with no leading/trailing
+        // hyphen, so `profile-<uuid>` is always slug-valid and well within 64
+        // chars. The loop guards the (practically impossible) collision.
+        let candidate = format!("profile-{}", uuid::Uuid::now_v7());
+        if local_profile_candidate_is_free(&candidate, profile_store, user_store, claimed_emails) {
+            return candidate;
+        }
+    }
+}
+
+/// Resolve the display name for a nameable local profile without erroring: the
+/// provided `name` when it is a valid 1-128 printable string, else the trimmed
+/// original `requested_id` when valid, else the assigned `profile_id`. A
+/// profile therefore always ends up with SOME display name.
+fn resolve_local_display_name(
+    params: &octos_core::ui_protocol::ProfileLocalCreateParams,
+    profile_id: &str,
+) -> String {
+    let is_displayable = |candidate: &str| {
+        let trimmed = candidate.trim();
+        !trimmed.is_empty() && trimmed.len() <= 128 && !trimmed.chars().any(char::is_control)
+    };
+    if is_displayable(&params.name) {
+        return params.name.trim().to_owned();
+    }
+    if let Some(requested) = params.requested_id.as_deref() {
+        if is_displayable(requested) {
+            return requested.trim().to_owned();
+        }
+    }
+    profile_id.to_owned()
+}
+
+/// Resolve the optional owner email: validated when the client provides one,
+/// else `None` (a solo local profile does not require an email).
+fn resolve_optional_local_email(
+    params: &octos_core::ui_protocol::ProfileLocalCreateParams,
+) -> Result<Option<String>, RpcError> {
+    if params.email.trim().is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(validate_local_email(&params.email)?))
+    }
+}
+
+/// Create a fresh, uniquely-named local solo profile. Used when the client
+/// sends a `requested_id` (normalized + collision-suffixed) or omits the legacy
+/// `username` entirely (id derived from the display name, else generated).
+/// Unlike the legacy username path this always creates a NEW profile: the
+/// assigned id is guaranteed free, so there is never an existing record to
+/// reconcile.
+///
+/// When the client sends NO email we synthesize `<id>@solo.local`. Because the
+/// id and its synthesized email must BOTH be unique, the id-selection loop is
+/// given a one-shot snapshot of claimed emails and picks the id and its
+/// `<id>@solo.local` together — so the synthesized address is unique and
+/// length-safe (local part = id, ≤64) by construction, with no per-candidate
+/// email rescan. A client-PROVIDED email keeps its hard-error-on-collision
+/// behavior and does not influence id selection. A final `get_by_email`
+/// revalidation runs immediately before the write to also catch an email
+/// claimed by a writer OUTSIDE `LOCAL_PROFILE_CREATE_LOCK` after the snapshot
+/// (see the residual-race note at that check).
+fn create_fresh_local_solo_profile(
+    profile_store: &crate::profiles::ProfileStore,
+    user_store: &crate::user_store::UserStore,
+    params: &octos_core::ui_protocol::ProfileLocalCreateParams,
+    requested_slug: Option<String>,
+) -> Result<octos_core::ui_protocol::ProfileLocalCreateResult, RpcError> {
+    // Resolve the optional client email up front: when absent we must also pick
+    // an id whose synthesized `<id>@solo.local` is free, so snapshot claimed
+    // emails ONCE and thread the set through id selection.
+    let provided_email = resolve_optional_local_email(params)?;
+    let claimed_emails = if provided_email.is_none() {
+        Some(claimed_email_set(user_store)?)
+    } else {
+        None
+    };
+    let claimed_ref = claimed_emails.as_ref();
+
+    let profile_id = match requested_slug {
+        Some(base) => assign_unique_local_profile_id(&base, profile_store, user_store, claimed_ref)
+            .unwrap_or_else(|| {
+                generated_local_profile_id(&base, profile_store, user_store, claimed_ref)
+            }),
+        None => {
+            generated_local_profile_id(params.name.trim(), profile_store, user_store, claimed_ref)
+        }
+    };
+
+    let name = resolve_local_display_name(params, &profile_id);
+    // The client's email when supplied, else the synthesized `<id>@solo.local`
+    // (chosen free from the snapshot during id selection).
+    let email_provided = provided_email.is_some();
+    let email = provided_email.unwrap_or_else(|| synthesized_local_email(&profile_id));
+
+    // Final email-uniqueness gate, re-read from the live store immediately
+    // before the write. Our earlier snapshot (and the id-selection folding) is
+    // only consistent w.r.t. other creators that hold LOCAL_PROFILE_CREATE_LOCK;
+    // a writer OUTSIDE that lock (e.g. `admin::update_profile`, which sets a
+    // user's email directly) could claim `email` AFTER the snapshot. Re-reading
+    // here shrinks that cross-writer window to the sub-microsecond gap between
+    // this check and `save`.
+    //
+    // RESIDUAL (accepted): an admin/OTP email-write that lands in that tiny gap
+    // can still produce a duplicate top-level email. It is rare and adversarial
+    // (an admin setting some user's email to exactly a concurrently-minted
+    // `<id>@solo.local`) and self-heals — `resolve_solo_user` resolves by newest
+    // `created_at`, and the next create observes the claim. Fully closing it
+    // would require enforcing email uniqueness inside `UserStore::save` itself
+    // (so admin/OTP writers are covered too), a broader change than this
+    // onboarding path warrants; see the codex thread on this file.
+    if let Some(existing) = user_store
+        .get_by_email(&email)
+        .map_err(|error| runtime_unavailable_error(format!("failed to read users: {error}")))?
+    {
+        if existing.id != profile_id {
+            return Err(if email_provided {
+                // Client chose a duplicate address → durable conflict.
+                profile_collision_error(&profile_id, "email")
+            } else {
+                // A synthesized address was raced by an outside writer →
+                // recoverable: a retry mints a fresh id + `<id>@solo.local`.
+                local_profile_error(
+                    "profile_local_collision",
+                    format!("email '{email}' was claimed during creation; retry"),
+                )
+                .with_data(json!({
+                    "kind": "profile_local_collision",
+                    "profile_id": profile_id,
+                    "reason": "email",
+                    "recoverable": true,
+                }))
+            });
+        }
+    }
+    let username = profile_id.clone();
+
+    let now = Utc::now();
+    let user = crate::user_store::User {
+        id: profile_id.clone(),
+        email: email.clone(),
+        name: name.clone(),
+        role: crate::user_store::UserRole::Admin,
+        created_at: now,
+        last_login_at: None,
+    };
+    user_store
+        .save(&user)
+        .map_err(|error| runtime_unavailable_error(format!("failed to save user: {error}")))?;
+
+    let profile = crate::profiles::UserProfile {
+        id: profile_id.clone(),
+        name: name.clone(),
+        public_subdomain: None,
+        enabled: true,
+        data_dir: None,
+        parent_id: None,
+        config: crate::profiles::ProfileConfig::default(),
+        created_at: now,
+        updated_at: now,
+    };
+    profile_store
+        .save(&profile)
+        .map_err(|error| runtime_unavailable_error(format!("failed to save profile: {error}")))?;
+    write_local_profile_metadata(profile_store, &profile, &username, &email)?;
+    persist_default_if_requested(profile_store, params, &profile_id)?;
+
+    Ok(octos_core::ui_protocol::ProfileLocalCreateResult {
+        profile_id: profile_id.clone(),
+        user_id: profile_id,
+        name,
+        username,
+        email,
+        created: true,
+        runtime_mode: "solo".to_owned(),
+    })
+}
+
+/// Record the just-created/resolved profile as the machine's global default
+/// when the client set `make_default`. A no-op when the flag is absent or
+/// false. Called on every `profile/local/create` success path so "make default"
+/// applies whether the profile was freshly minted or already existed.
+fn persist_default_if_requested(
+    profile_store: &crate::profiles::ProfileStore,
+    params: &octos_core::ui_protocol::ProfileLocalCreateParams,
+    profile_id: &str,
+) -> Result<(), RpcError> {
+    if params.make_default.unwrap_or(false) {
+        profile_store
+            .set_default_profile(profile_id)
+            .map_err(|error| {
+                runtime_unavailable_error(format!("failed to set default profile: {error}"))
+            })?;
+    }
+    Ok(())
+}
+
 pub(crate) fn create_or_get_local_solo_profile(
     state: &AppState,
     params: octos_core::ui_protocol::ProfileLocalCreateParams,
@@ -6622,12 +7300,47 @@ pub(crate) fn create_or_get_local_solo_profile(
         ));
     }
 
+    let profile_store = profile_store(state)?;
+    let user_store = user_store(state)?;
+
+    // Reserve the id + email and persist under one process-wide lock so a
+    // concurrent REST/WS double-submit cannot both pass the free-id / free-email
+    // checks before either save runs. Covers BOTH the fresh (requested_id /
+    // generated) path and the legacy username path (whose `.json.tmp`
+    // write-then-rename would otherwise race a same-username peer). Held only
+    // across synchronous store I/O below — the function returns (dropping the
+    // guard) before any caller `.await`s.
+    let _create_guard = LOCAL_PROFILE_CREATE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+    // User-nameable onboarding: an explicit `requested_id` assigns a fresh,
+    // collision-suffixed id; a request that omits the legacy `username` derives
+    // the id from the display name (or generates one). Both create a NEW
+    // profile — the assigned id is guaranteed free — instead of reconciling
+    // against an existing username the way the legacy path below does. A
+    // requested_id that normalizes to nothing usable (empty / reserved) is
+    // treated as absent, deferring to the username path when one was sent.
+    let requested_slug = params
+        .requested_id
+        .as_deref()
+        .and_then(normalize_requested_profile_id);
+    let has_legacy_username = !params.username.trim().is_empty();
+    if requested_slug.is_some() || !has_legacy_username {
+        return create_fresh_local_solo_profile(
+            &profile_store,
+            &user_store,
+            &params,
+            requested_slug,
+        );
+    }
+
+    // ---- Legacy path: id derived from the provided username (idempotent
+    // create-or-get; behavior unchanged). ----
     let name = validate_local_name(&params.name)?;
     let profile_id = normalize_local_username(&params.username)?;
     let email = validate_local_email(&params.email)?;
     let username = profile_id.clone();
-    let profile_store = profile_store(state)?;
-    let user_store = user_store(state)?;
 
     if let Some(existing_email_user) = user_store
         .get_by_email(&email)
@@ -6670,6 +7383,7 @@ pub(crate) fn create_or_get_local_solo_profile(
         }
         if existing_user.is_some() {
             write_local_profile_metadata(&profile_store, profile, &username, &email)?;
+            persist_default_if_requested(&profile_store, &params, &profile_id)?;
             return Ok(octos_core::ui_protocol::ProfileLocalCreateResult {
                 profile_id: profile_id.clone(),
                 user_id: profile_id,
@@ -6719,6 +7433,7 @@ pub(crate) fn create_or_get_local_solo_profile(
         .save(&profile)
         .map_err(|error| runtime_unavailable_error(format!("failed to save profile: {error}")))?;
     write_local_profile_metadata(&profile_store, &profile, &username, &email)?;
+    persist_default_if_requested(&profile_store, &params, &profile_id)?;
 
     Ok(octos_core::ui_protocol::ProfileLocalCreateResult {
         profile_id: profile_id.clone(),
@@ -7496,61 +8211,81 @@ fn model_list_result(
     json!({ "session_id": session_id, "models": models })
 }
 
-fn raw_catalog_result(state: &AppState, profile_id: Option<&str>) -> Result<Value, RpcError> {
-    let mut families = serde_json::from_str::<Value>(DASHBOARD_PROVIDERS_JSON).map_err(|err| {
-        RpcError::internal_error(format!("dashboard provider catalog was not JSON: {err}"))
-    })?;
-    // Union in the QoS model catalog (model_catalog.json): it tracks the LIVE
-    // model lineup per provider (e.g. new zai GLM releases) while the bundled
-    // dashboard catalog is hand-maintained and lags. Only models are merged —
-    // a family absent from the bundled catalog has no key-env/route metadata,
-    // so it cannot be onboarded and is skipped.
-    // Per-profile QoS catalogs live under `profiles/<id>/data`
-    // (`ProfileRuntime::bootstrap` exports them there); the octos-home file
-    // is the shared seed. Merge the requesting profile's catalog first, then
-    // the home seed (`load_seed_qos_catalog` also falls back to `~/.octos`).
-    let mut sources = Vec::new();
-    if let Some(store) = state.profile_store.as_ref() {
-        if let Some(profile) =
-            profile_id.and_then(|profile_id| store.get(profile_id).ok().flatten())
-        {
-            // Honors `UserProfile.data_dir` overrides — the same resolution
-            // `ProfileRuntime::bootstrap` uses when it exports the catalog.
-            sources.push(store.resolve_data_dir(&profile));
-        }
-        sources.push(store.octos_home_dir().to_path_buf());
-    }
-    for qos in sources
-        .iter()
-        .filter_map(|dir| crate::qos_catalog::load_seed_qos_catalog(dir))
-    {
-        if let Some(families_map) = families.as_object_mut() {
-            for entry in &qos.models {
-                let Some((family_id, model_id)) = entry.provider.split_once('/') else {
-                    continue;
-                };
-                let Some(models) = families_map
-                    .get_mut(family_id)
-                    .and_then(|family| family.get_mut("models"))
-                    .and_then(Value::as_array_mut)
-                else {
-                    continue;
-                };
-                let known = models
-                    .iter()
-                    .any(|model| model.get("id").and_then(Value::as_str) == Some(model_id));
-                if !known {
-                    models.push(json!({
-                        "id": model_id,
-                        "input": entry.cost_in,
-                        "output": entry.cost_out,
-                        "max_output": entry.max_output,
-                    }));
-                }
+fn raw_catalog_result(_state: &AppState, _profile_id: Option<&str>) -> Result<Value, RpcError> {
+    // The onboarding catalog is the compiled-in canonical model_catalog.json
+    // (the model-provisioning SSOT) projected through the provider REGISTRY for
+    // family key-env metadata. providers.json is retired (now a derived,
+    // web-only artifact).
+    //
+    // The runtime QoS catalogs (per-profile data-dir + `~/.octos` seed) are
+    // deliberately NOT unioned here. Configured providers are a *subset* of the
+    // catalog, so a live QoS catalog can only ever (a) re-introduce a model that
+    // was deliberately curated out — it still lists whatever was once
+    // configured — or (b) zero out a researched context window with a QoS entry
+    // that never carried one. Neither is desirable: the canonical catalog is the
+    // single source of truth for what is provisionable, and new models are added
+    // by editing it (and shipping the updated file), which is the whole point of
+    // an SSOT. Live QoS still drives *routing* via the adaptive chain; that path
+    // is untouched.
+    //
+    // Families with no registry entry have no key-env/route metadata and can't
+    // be onboarded, so they're skipped.
+    let canonical: octos_llm::QosCatalog = serde_json::from_str(CANONICAL_MODEL_CATALOG)
+        .map_err(|error| RpcError::internal_error(format!("canonical model catalog: {error}")))?;
+
+    // `endpoints` (alternative provisioning routes — e.g. AutoDL/WiseModel) is
+    // onboarding metadata that `ModelCatalogEntry` doesn't model, so read it
+    // straight from the canonical JSON keyed by `provider`. This keeps the TUI
+    // onboarding route-picker (Official + alternatives) that the retired
+    // providers.json used to supply, without polluting the routing catalog type.
+    let endpoints_by_provider: std::collections::HashMap<String, Value> =
+        serde_json::from_str::<Value>(CANONICAL_MODEL_CATALOG)
+            .ok()
+            .and_then(|catalog| catalog.get("models").and_then(Value::as_array).cloned())
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|model| {
+                let provider = model.get("provider")?.as_str()?.to_owned();
+                let endpoints = model.get("endpoints")?.clone();
+                Some((provider, endpoints))
+            })
+            .collect();
+
+    let mut families = serde_json::Map::new();
+    for entry in &canonical.models {
+        let Some((family_id, model_id)) = entry.provider.split_once('/') else {
+            continue;
+        };
+        // Canonicalize the family via the registry (handles aliases:
+        // google->gemini, qwen->dashscope, glm->zhipu). A family with no
+        // registry entry has no key-env/route and can't be onboarded.
+        let Some(reg) = octos_llm::registry::lookup(family_id) else {
+            continue;
+        };
+        let family = families
+            .entry(reg.name.to_owned())
+            .or_insert_with(|| json!({ "env": reg.api_key_env.unwrap_or(""), "models": [] }));
+        let Some(models) = family.get_mut("models").and_then(Value::as_array_mut) else {
+            continue;
+        };
+        let known = models
+            .iter()
+            .any(|model| model.get("id").and_then(Value::as_str) == Some(model_id));
+        if !known {
+            let mut model_json = json!({
+                "id": model_id,
+                "input": entry.cost_in,
+                "output": entry.cost_out,
+                "max_output": entry.max_output,
+                "context_window": entry.context_window,
+            });
+            if let Some(endpoints) = endpoints_by_provider.get(&entry.provider) {
+                model_json["endpoints"] = endpoints.clone();
             }
+            models.push(model_json);
         }
     }
-    Ok(json!({ "families": families }))
+    Ok(json!({ "families": Value::Object(families) }))
 }
 
 async fn raw_session_status_result(
@@ -9800,15 +10535,11 @@ fn build_test_llm_provider(
 }
 
 fn dashboard_family_api_key_env(family_id: &str) -> Option<String> {
-    serde_json::from_str::<Value>(DASHBOARD_PROVIDERS_JSON)
-        .ok()
-        .and_then(|catalog| {
-            catalog
-                .get(family_id)?
-                .get("env")?
-                .as_str()
-                .map(str::to_owned)
-        })
+    // Key-env now comes from the provider registry (single source of truth),
+    // not the retired dashboard providers.json. `lookup` resolves aliases too.
+    octos_llm::registry::lookup(family_id)
+        .and_then(|entry| entry.api_key_env)
+        .map(str::to_owned)
         .and_then(|env| nonempty(Some(env)))
 }
 
@@ -10232,6 +10963,11 @@ async fn handle_raw_appui_rpc(
         APPUI_METHOD_SESSION_STATUS_READ => {
             raw_session_status_result(state, request, features, connection_profile_id).await
         }
+        APPUI_METHOD_SESSION_COMPACT => {
+            handle_session_compact(ws, state, ledger, features, connection_profile_id, request)
+                .await
+        }
+        APPUI_METHOD_SESSION_COMPACT_MODE_SET => handle_session_compact_mode_set(state, request),
         APPUI_METHOD_PROFILE_LLM_CATALOG => raw_catalog_result(state, connection_profile_id),
         APPUI_METHOD_PROFILE_LLM_LIST => {
             let params: RawProfileParams = match parse_raw_params(request) {
@@ -10701,6 +11437,8 @@ fn raw_method_is_dispatched(method: &str, stdio_transport: bool) -> bool {
             | APPUI_METHOD_MCP_STATUS_LIST
             | APPUI_METHOD_TOOL_STATUS_LIST
             | APPUI_METHOD_ONBOARDING_WORKSPACE_PROBE
+            | APPUI_METHOD_SESSION_COMPACT
+            | APPUI_METHOD_SESSION_COMPACT_MODE_SET
     ) {
         return true;
     }
@@ -10762,6 +11500,7 @@ fn validate_session_ingress_command_scope(
 ) -> Result<(), RpcError> {
     let actual = match command {
         UiCommand::ProfileLocalCreate(_)
+        | UiCommand::LaunchResolve(_)
         | UiCommand::SessionList(_)
         | UiCommand::SystemStatusGet(_)
         | UiCommand::ContentList(_)
@@ -11597,7 +12336,29 @@ async fn open_session_result(
             .await
         {
             Ok(runtime) => {
+                // Per-project ledger isolation (#1666): registered BEFORE the
+                // `replay_after_with_head` below, so this open replays (and
+                // this session's turns later append) under the per-cwd
+                // storage identity. No-op when the store wasn't relocated.
+                register_session_ledger_scope(ledger, &runtime);
                 effective_workspace_root = Some(runtime.workspace_root.clone());
+                // Sticky marker: record this profile as the folder's active one
+                // so a later bare launch resumes it deterministically (beats the
+                // store-mtime recency fallback in `derive_sticky_profile`). Gated
+                // on the SAME condition `resolve_sessions_root_from_hint` uses to
+                // relocate the store — `sessions_in_cwd && effective hint present`
+                // — so the marker lands in the same `<cwd>/.octos` the store did
+                // (client cwd OR operator `appui_default_session_cwd`), and a
+                // no-hint (web/gateway) session that stays in its data-dir
+                // workspace never drops a stray marker there. Written to the
+                // runtime's canonical `workspace_root` (the store's actual parent,
+                // post-canonicalize), not the raw hint. Best-effort in the helper.
+                if state.session_cache.sessions_in_cwd() && effective_workspace_hint.is_some() {
+                    crate::runtime::session::write_active_profile_marker(
+                        &runtime.workspace_root,
+                        &profile_runtime.profile_id,
+                    );
+                }
             }
             Err(error) => {
                 tracing::error!(
@@ -11606,6 +12367,13 @@ async fn open_session_result(
                     session = %params.session_id,
                     "session/open: SessionRuntime::bootstrap failed",
                 );
+                // The most common bootstrap failure is a non-writable workspace
+                // folder — the session can't create its `.octos-workspace.toml`
+                // there. Surface a clear, actionable message naming the folder
+                // instead of the opaque "failed to bootstrap session runtime".
+                if is_permission_denied_error(&error) {
+                    return Err(workspace_not_writable_error(params.cwd.as_deref()));
+                }
                 return Err(runtime_unavailable_error(format!(
                     "failed to bootstrap session runtime: {error}"
                 )));
@@ -16666,15 +17434,29 @@ async fn handle_session_list(
     headers: &HeaderMap,
     identity: Option<&AuthIdentity>,
     connection_profile_id: Option<&str>,
+    features: ConnectionUiFeatures,
     id: String,
-    _params: SessionListParams,
+    params: SessionListParams,
 ) {
+    // Per-project (`appui.sessions_in_cwd`) scoping. When the client sends a
+    // `cwd` AND the server flag is on AND the connection negotiated
+    // `session.workspace_cwd.v1`, the listing is scoped to `<cwd>/.octos`.
+    // Absent cwd / flag off → `None` → byte-identical legacy listing.
+    let cwd_sessions_root =
+        match resolve_session_list_cwd_root(state, features, connection_profile_id, &params) {
+            Ok(root) => root,
+            Err(error) => {
+                let _ = send_rpc_error(ws, Some(id), error);
+                return;
+            }
+        };
     let identity_ext = identity.cloned().map(Extension);
     let response = super::handlers::list_sessions(
         State(state.clone()),
         headers.clone(),
         identity_ext,
         connection_profile_id,
+        cwd_sessions_root,
     )
     .await;
     let method = octos_core::ui_protocol::methods::SESSION_LIST;
@@ -16690,6 +17472,228 @@ async fn handle_session_list(
             let _ = send_rpc_error(ws, Some(id), error);
         }
     }
+}
+
+/// Resolve an optional `session/list` `cwd` into the per-project, per-profile
+/// session-store root (`<cwd>/.octos/<profile_id>`), applying the same gates
+/// the write path uses so list and open agree on where a project's sessions
+/// live:
+///
+/// 1. **Flag** — when `appui.sessions_in_cwd` is off, the `cwd` is ignored
+///    entirely (`Ok(None)` → legacy per-profile/global listing). This keeps a
+///    flag-off server byte-identical: nothing was ever written under
+///    `<cwd>/.octos`, so scoping to it would only ever return an empty list.
+/// 2. **Capability** — a `cwd` under the flag requires the connection to have
+///    negotiated `session.workspace_cwd.v1` (mirrors `session/open`'s cwd
+///    gate). A client that sends `cwd` without it gets a typed error rather
+///    than a silently-global list.
+/// 3. **Workspace safety** — the SAME [`validate_session_workspace_allowed`]
+///    gate `session/open` runs: the cwd must canonicalize to a directory AND
+///    must not be rooted under a banned system path. Without this a client
+///    could point the listing at `/etc` (or any service-writable path) and
+///    `SessionManager::open` would CREATE `<cwd>/.octos/…` there and enumerate
+///    it. On rejection we surface the typed error (consistent with
+///    `session/open`) rather than silently degrading.
+/// 4. **Profile namespace** — the store root is
+///    `<cwd>/.octos/<profile_id>` (via [`project_sessions_root`]), matching
+///    the write path so two profiles that share a project cwd never read each
+///    other's transcripts.
+///
+/// A trimmed-empty or absent `cwd` is always `Ok(None)` (legacy listing).
+fn resolve_session_list_cwd_root(
+    state: &AppState,
+    features: ConnectionUiFeatures,
+    connection_profile_id: Option<&str>,
+    params: &SessionListParams,
+) -> Result<Option<PathBuf>, RpcError> {
+    let Some(cwd) = params
+        .cwd
+        .as_deref()
+        .map(str::trim)
+        .filter(|cwd| !cwd.is_empty())
+    else {
+        return Ok(None);
+    };
+    // Flag off → the store was never relocated; ignore the cwd (legacy).
+    if !state.session_cache.sessions_in_cwd() {
+        return Ok(None);
+    }
+    if !features.session_workspace_cwd {
+        return Err(RpcError::invalid_params(
+            "session/list cwd requires feature session.workspace_cwd.v1",
+        )
+        .with_data(json!({
+            "kind": "feature_required",
+            "feature": UI_PROTOCOL_FEATURE_SESSION_WORKSPACE_CWD_V1,
+        })));
+    }
+    let workspace_root = canonical_existing_dir(cwd)?;
+    // SAME safety gate as session/open — reject banned system roots (and the
+    // missing-profile-runtime case) BEFORE opening a SessionManager that would
+    // otherwise materialize `<cwd>/.octos` at an arbitrary path.
+    validate_session_workspace_allowed(state, connection_profile_id, &workspace_root)?;
+    // Namespace by the SAME profile the write path uses so the listing reads
+    // exactly the connection's own project store.
+    let profile_id = resolve_session_profile_runtime(state, connection_profile_id)
+        .map(|runtime| runtime.profile_id.clone())
+        .unwrap_or_else(|| connection_profile_id.unwrap_or(MAIN_PROFILE_ID).to_string());
+    Ok(Some(crate::runtime::session::project_sessions_root(
+        &workspace_root,
+        &profile_id,
+    )))
+}
+
+/// `launch/resolve` — the pre-session launch probe. Resolves the launching
+/// profile (requested `--profile` → folder-sticky → global default) and reports
+/// whether the client should resume the folder's conversation, activate a new
+/// one, or choose among profiles. Delegates to the tested
+/// [`crate::runtime::launch`] decision core.
+async fn handle_launch_resolve(
+    ws: &WsConnection,
+    state: &Arc<AppState>,
+    connection_profile_id: Option<&str>,
+    features: ConnectionUiFeatures,
+    id: String,
+    params: octos_core::ui_protocol::LaunchResolveParams,
+) {
+    match resolve_launch_result(state, connection_profile_id, features, &params) {
+        Ok(result) => {
+            let body = serde_json::to_value(&result).unwrap_or_else(|_| json!({}));
+            send_aux_rpc_result(
+                ws,
+                id,
+                octos_core::ui_protocol::methods::LAUNCH_RESOLVE,
+                body,
+            );
+        }
+        Err(error) => {
+            let _ = send_rpc_error(ws, Some(id), error);
+        }
+    }
+}
+
+/// Resolution core for [`handle_launch_resolve`], split out so the error paths
+/// are a single `?`-chain. Applies the SAME cwd safety gates as `session/open`
+/// and `session/list` before scanning the project's `.octos` store.
+fn resolve_launch_result(
+    state: &Arc<AppState>,
+    connection_profile_id: Option<&str>,
+    features: ConnectionUiFeatures,
+    params: &octos_core::ui_protocol::LaunchResolveParams,
+) -> Result<octos_core::ui_protocol::LaunchResolveResult, RpcError> {
+    use crate::runtime::launch::{LaunchDecision, resolve_launch_decision, scan_folder_sessions};
+    use octos_core::ui_protocol::{LaunchDecisionKind, LaunchResolveResult};
+
+    // The method is advertised only when `session.workspace_cwd.v1` is
+    // negotiated; reject a client that calls it without the feature.
+    if !features.session_workspace_cwd {
+        return Err(RpcError::invalid_params(
+            "launch/resolve requires feature session.workspace_cwd.v1",
+        )
+        .with_data(json!({
+            "kind": "feature_required",
+            "feature": UI_PROTOCOL_FEATURE_SESSION_WORKSPACE_CWD_V1,
+        })));
+    }
+
+    let cwd = params.cwd.trim();
+    if cwd.is_empty() {
+        return Err(RpcError::invalid_params(
+            "launch/resolve requires a non-empty cwd",
+        ));
+    }
+    // Path-safety ONLY (canonicalize + banned-root reject) — the SAME check the
+    // write path runs before materializing `<cwd>/.octos`. Crucially NOT the
+    // full `validate_session_workspace_allowed`, which additionally requires a
+    // materialized `SessionRuntime` for the routed profile: launch/resolve is a
+    // read-only decision that runs BEFORE any session is opened (and, in solo
+    // `--stdio`, before any profile runtime is lazily bootstrapped), so gating
+    // it on a loaded runtime made every Resume / CrossProfile / NoProfile
+    // outcome unreachable — the folder always fell through to `activate`, or a
+    // bare launch got a spurious `cwd_runtime_unavailable`. Found by the
+    // launch-flow soak against a real `octos serve --stdio`.
+    let workspace_root = canonical_existing_dir(cwd)?;
+    validate_session_workspace_path_safety(&workspace_root)?;
+
+    // Known profiles = every launchable brain that EXISTS, sourced from the
+    // persistent `ProfileStore` (enabled, top-level), NOT just `state.profiles`
+    // — the in-memory runtime map, which in solo `--stdio` is populated lazily
+    // on `session/open` and so is EMPTY at bare-launch time. A profile is
+    // launchable whether or not its runtime is loaded yet, so the scanner must
+    // see its folder store and the default resolver must be able to name it.
+    // Unioned with `state.profiles.keys()` so eager-load deployments stay
+    // covered. A since-deleted profile's leftover store dir is ignored (the
+    // scanner is bounded by this set). `BTreeSet` yields a sorted, deduped
+    // listing for a deterministic default + cross-profile result. Empty (no
+    // profiles) → `NoProfile`.
+    let mut known_set: std::collections::BTreeSet<String> =
+        state.profiles.keys().cloned().collect();
+    if let Some(store) = state.profile_store.as_ref() {
+        if let Ok(profiles) = store.list() {
+            for profile in profiles {
+                if profile.enabled && profile.parent_id.is_none() {
+                    known_set.insert(profile.id);
+                }
+            }
+        }
+    }
+    let known_profiles: Vec<String> = known_set.into_iter().collect();
+
+    // Global default. An explicit user-chosen `default-profile` pointer (set via
+    // the onboarding "make default" flow) wins when it still names a known
+    // profile; otherwise fall back to the connection's own profile when
+    // registered, else `_main` when present, else the first known profile.
+    // `None` (→ `NoProfile`) only when no profile exists at all.
+    let persisted_default = profile_store(state)
+        .ok()
+        .and_then(|store| store.default_profile())
+        .filter(|candidate| known_profiles.iter().any(|known| known == candidate));
+    let default_profile: Option<String> = persisted_default
+        .or_else(|| {
+            connection_profile_id
+                .map(str::to_string)
+                .filter(|candidate| known_profiles.iter().any(|known| known == candidate))
+        })
+        .or_else(|| {
+            known_profiles
+                .iter()
+                .find(|known| known.as_str() == MAIN_PROFILE_ID)
+                .cloned()
+        })
+        .or_else(|| known_profiles.first().cloned());
+
+    let folder = scan_folder_sessions(&workspace_root, &known_profiles);
+    let decision = resolve_launch_decision(
+        params.profile_id.as_deref(),
+        default_profile.as_deref(),
+        &folder,
+    );
+
+    Ok(match decision {
+        LaunchDecision::Resume { profile_id } => LaunchResolveResult {
+            decision: LaunchDecisionKind::Resume,
+            resolved_profile: Some(profile_id),
+            existing_profiles: Vec::new(),
+        },
+        LaunchDecision::NeedsActivation { profile_id } => LaunchResolveResult {
+            decision: LaunchDecisionKind::Activate,
+            resolved_profile: Some(profile_id),
+            existing_profiles: Vec::new(),
+        },
+        LaunchDecision::CrossProfile {
+            launching_profile,
+            existing_profiles,
+        } => LaunchResolveResult {
+            decision: LaunchDecisionKind::CrossProfile,
+            resolved_profile: Some(launching_profile),
+            existing_profiles,
+        },
+        LaunchDecision::NoProfile => LaunchResolveResult {
+            decision: LaunchDecisionKind::NoProfile,
+            resolved_profile: None,
+            existing_profiles: Vec::new(),
+        },
+    })
 }
 
 async fn handle_session_status_get(
@@ -19407,12 +20411,45 @@ struct M15LiveSubagentResult {
 
 struct WsSupervisorEventSink {
     ws: WsConnection,
+    ledger: Arc<UiProtocolLedger>,
 }
 
 impl AppUiSupervisorEventSink for WsSupervisorEventSink {
     fn emit_supervisor_event(&self, method: &'static str, params: Value) {
+        // Stuck-chip fix (specialist lane): a TERMINAL `agent/updated` must
+        // survive the emitting connection — ephemeral delivery is dropped if
+        // the client blips or the frame races a reconnect, leaving the chip
+        // on the last non-terminal status forever. Mirror the background-task
+        // lane (`forward_terminal_agent_update_durable`): append terminal
+        // flips to the durable per-session ledger so cursor replay and the
+        // live broadcast forwarder both observe them. Non-terminal updates
+        // (spawned/running/heartbeats) stay ephemeral — appending each would
+        // bloat replay history with redundant in-flight states.
+        if method == octos_core::ui_protocol::methods::AGENT_UPDATED {
+            if let Some(event) = terminal_agent_updated_event(&params) {
+                let _ = send_notification_durable(
+                    &self.ws,
+                    self.ledger.as_ref(),
+                    UiNotification::AgentUpdated(event),
+                );
+                return;
+            }
+        }
         let _ = send_raw_notification_ephemeral(&self.ws, method, params);
     }
+}
+
+/// Parse a supervisor `agent/updated` payload and return it ONLY when the
+/// carried agent status is terminal (`completed` / `failed` / `interrupted` /
+/// `cancelled` / `closed`). Non-terminal or unparseable payloads return `None`
+/// and stay on the ephemeral path.
+fn terminal_agent_updated_event(params: &Value) -> Option<AgentUpdatedEvent> {
+    let event: AgentUpdatedEvent = serde_json::from_value(params.clone()).ok()?;
+    matches!(
+        event.agent.status.as_str(),
+        "completed" | "failed" | "interrupted" | "cancelled" | "closed"
+    )
+    .then_some(event)
 }
 
 const REVIEW_NATIVE_SPECIALISTS_ENV: &str = "OCTOS_REVIEW_NATIVE_SPECIALISTS_JSON";
@@ -19725,6 +20762,11 @@ async fn run_native_code_review_turn(
             return;
         }
     };
+    // Per-project ledger isolation (#1666): the review turn appends durable
+    // task/turn events for this session — same idempotent registration as
+    // `run_standalone_turn`, covering runtimes that re-materialized without
+    // a fresh `session/open`.
+    register_session_ledger_scope(&ledger, &session_runtime);
 
     let profile_id = session_id
         .profile_id()
@@ -19870,6 +20912,7 @@ async fn run_native_code_review_turn(
     maybe_spawn_cli_review_specialist(
         &mut joins,
         &ws,
+        &ledger,
         &session_id,
         &profile_id,
         &workspace_root,
@@ -19882,6 +20925,7 @@ async fn run_native_code_review_turn(
         &mut joins,
         &state,
         &ws,
+        &ledger,
         &session_id,
         &profile_id,
         &workspace_root,
@@ -20132,6 +21176,7 @@ fn native_review_task(objective: &str, target: &str, spec: &NativeCodeReviewSpec
 fn maybe_spawn_cli_review_specialist(
     joins: &mut tokio::task::JoinSet<NativeCodeReviewResult>,
     ws: &WsConnection,
+    ledger: &Arc<UiProtocolLedger>,
     session_id: &SessionKey,
     profile_id: &str,
     workspace_root: &Path,
@@ -20179,7 +21224,10 @@ fn maybe_spawn_cli_review_specialist(
         )
         .timeout(std::time::Duration::from_secs(90))
         .declared_artifact(&artifact_path);
-    let sink = WsSupervisorEventSink { ws: ws.clone() };
+    let sink = WsSupervisorEventSink {
+        ws: ws.clone(),
+        ledger: ledger.clone(),
+    };
     joins.spawn(async move {
         match run_supervised_cli_specialist(
             default_agent_orchestrator(),
@@ -20213,6 +21261,7 @@ fn maybe_spawn_mcp_review_specialist(
     joins: &mut tokio::task::JoinSet<NativeCodeReviewResult>,
     state: &AppState,
     ws: &WsConnection,
+    ledger: &Arc<UiProtocolLedger>,
     session_id: &SessionKey,
     profile_id: &str,
     workspace_root: &Path,
@@ -20253,7 +21302,10 @@ fn maybe_spawn_mcp_review_specialist(
         "artifact_path": artifact_path.to_string_lossy().into_owned(),
         "instructions": "Run a focused code review specialist task and return concise findings first.",
     });
-    let sink = WsSupervisorEventSink { ws: ws.clone() };
+    let sink = WsSupervisorEventSink {
+        ws: ws.clone(),
+        ledger: ledger.clone(),
+    };
     let backend = swarm_state.swarm.backend();
     let dispatch_policy = swarm_state.swarm.dispatch_policy();
     let timeout = review_mcp_timeout();
@@ -20877,7 +21929,10 @@ print(f"{agent_id}: {finding}")
             path: artifact_path.clone(),
         }],
     };
-    let sink = WsSupervisorEventSink { ws: ws.clone() };
+    let sink = WsSupervisorEventSink {
+        ws: ws.clone(),
+        ledger: ledger.clone(),
+    };
     let summary = run_supervised_cli_specialist(
         default_agent_orchestrator(),
         &sink,
@@ -21315,6 +22370,12 @@ async fn run_standalone_turn(
             return;
         }
     };
+    // Per-project ledger isolation (#1666): every event this turn appends
+    // must land under the session's per-cwd storage identity. `session/open`
+    // registered it already for the normal flow; re-registering here is an
+    // idempotent no-op that also covers turns whose runtime re-materialized
+    // (e.g. after cache eviction) without a fresh open.
+    register_session_ledger_scope(&ledger, &session_runtime);
     let usage_profile_id = active_profile_id
         .clone()
         .or_else(|| session_id.profile_id().map(ToOwned::to_owned))
@@ -21623,11 +22684,19 @@ async fn run_standalone_turn(
     };
     let (history, context_manager, context_lifecycle_notifications) =
         appui_context_history_for_agent(
-            &session_runtime.profile.data_dir,
+            // Root the context ledger at the session's TRANSCRIPT root, not the
+            // profile-global data dir: with `appui.sessions_in_cwd` the
+            // transcript relocates to `<cwd>/.octos/<profile>` and a
+            // profile-rooted context ledger is SHARED across projects that
+            // reuse the same session key — project B's snapshot would beat
+            // project A's raw history on rebuild and leak B's conversation
+            // into A's LLM context (#1666). Flag-OFF: `sessions_root ==
+            // profile.data_dir`, byte-identical.
+            &session_runtime.sessions_root,
             &session_id,
             &raw_history,
             &llm_provider,
-            state.llm_compaction,
+            session_compaction_llm_enabled(&session_id, &state),
             "appui_pre_turn",
         );
     for notification in context_lifecycle_notifications {
@@ -22217,7 +23286,11 @@ async fn run_standalone_turn(
             spawn_tool = spawn_tool.with_parent_subagent_summary_generator(generator);
         }
         let child_context_parent = context_manager.clone();
-        let child_context_data_dir = session_runtime.profile.data_dir.clone();
+        // Child (forked sub-agent) context ledgers belong to the parent's
+        // project store: with `appui.sessions_in_cwd` on, `sessions_root` is
+        // the per-cwd root; profile-rooting them would leak child context
+        // across projects sharing a child key (#1666). Flag-OFF: identical.
+        let child_context_data_dir = session_runtime.sessions_root.clone();
         let child_context_parent_session = session_id.clone();
         spawn_tool = spawn_tool.with_child_prompt_context_manager_factory(Arc::new(
             move |request: octos_agent::tools::spawn::ChildPromptContextRequest| {
@@ -22513,14 +23586,17 @@ async fn run_standalone_turn(
     };
     let mut prompt_context_bridge_inner = AppUiPromptContextBridge::new(
         session_id.clone(),
-        session_runtime.profile.data_dir.clone(),
+        // Mid-turn (compaction-bridge) context persists share the transcript
+        // root — per-cwd under `appui.sessions_in_cwd` — for the same
+        // cross-project isolation as the pre/post-turn sites above (#1666).
+        session_runtime.sessions_root.clone(),
         context_manager.clone(),
         voice_turn_hint,
     )
     .with_context_lifecycle_notify(context_lifecycle_notify);
     // Only wire the provider when `--llm-compaction` is on; a present provider
     // is what flips the in-loop bridge to the LLM-summarization path.
-    if state.llm_compaction {
+    if session_compaction_llm_enabled(&session_id, &state) {
         prompt_context_bridge_inner =
             prompt_context_bridge_inner.with_llm_compaction_provider(llm_provider.clone());
     }
@@ -22648,7 +23724,10 @@ async fn run_standalone_turn(
     let turn_thread_id_for_persist = turn_id.0.to_string();
     let turn_thread_id_for_done = turn_thread_id_for_persist.clone();
     let context_manager_for_result = context_manager.clone();
-    let context_data_dir_for_result = session_runtime.profile.data_dir.clone();
+    // Post-turn context persists go to the session's transcript root (per-cwd
+    // when `appui.sessions_in_cwd` is on) so the snapshot the NEXT turn's
+    // `appui_context_history_for_agent` loads is the same project's (#1666).
+    let context_data_dir_for_result = session_runtime.sessions_root.clone();
     let usage_ledger_for_result = usage_ledger.clone();
     let usage_profile_id_for_result = usage_profile_id.clone();
     let usage_session_id_for_result = session_id.to_string();
@@ -25586,6 +26665,41 @@ fn runtime_unavailable_error(message: impl Into<String>) -> RpcError {
     }))
 }
 
+/// True when `error` (anywhere in its eyre chain) is an OS permission-denied
+/// failure. The common trigger is session bootstrap failing to create
+/// `<workspace>/.octos-workspace.toml` in a folder the user can't write to.
+/// Structural — downcasts to `std::io::Error` — not string matching.
+fn is_permission_denied_error(error: &eyre::Report) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io| io.kind() == std::io::ErrorKind::PermissionDenied)
+    })
+}
+
+/// Clear, actionable RPC error for the "session workspace folder isn't writable"
+/// case (a session/open bootstrap denied writing its `.octos-workspace.toml`).
+/// Names the folder so the user can act; the client renders `data.message`
+/// verbatim (preferred over the numeric code), so it reads as a plain sentence
+/// instead of an opaque "failed to bootstrap session runtime".
+fn workspace_not_writable_error(workspace: Option<&str>) -> RpcError {
+    let sentence = match workspace {
+        Some(path) => format!(
+            "Can't start a session in {path} — the folder isn't writable (permission denied). \
+             octos needs to create a .octos-workspace.toml there. Start octos in a folder you \
+             own, or make this one writable."
+        ),
+        None => "Can't start a session — the workspace folder isn't writable (permission denied). \
+                 Start octos in a folder you own, or make it writable."
+            .to_string(),
+    };
+    RpcError::internal_error(sentence.clone()).with_data(json!({
+        "kind": "workspace_not_writable",
+        "workspace": workspace,
+        "message": sentence,
+    }))
+}
+
 fn final_assistant_message(
     messages: &[Message],
     content: &str,
@@ -28170,6 +29284,50 @@ mod tests {
         }
     }
 
+    #[test]
+    fn profile_local_create_make_default_persists_pointer() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = local_profile_state(dir.path());
+
+        // Create with make_default → the assigned profile becomes the global
+        // default pointer.
+        let created = create_or_get_local_solo_profile(
+            &state,
+            octos_core::ui_protocol::ProfileLocalCreateParams {
+                requested_id: Some("glm".into()),
+                name: String::new(),
+                username: String::new(),
+                email: String::new(),
+                make_default: Some(true),
+            },
+        )
+        .expect("create with make_default");
+        let store = state.profile_store.as_ref().unwrap();
+        assert_eq!(
+            store.default_profile().as_deref(),
+            Some(created.profile_id.as_str())
+        );
+
+        // A later create WITHOUT make_default must not steal the default.
+        let other = create_or_get_local_solo_profile(
+            &state,
+            octos_core::ui_protocol::ProfileLocalCreateParams {
+                requested_id: Some("deepseek".into()),
+                name: String::new(),
+                username: String::new(),
+                email: String::new(),
+                make_default: None,
+            },
+        )
+        .expect("create without make_default");
+        assert_ne!(other.profile_id, created.profile_id);
+        assert_eq!(
+            store.default_profile().as_deref(),
+            Some(created.profile_id.as_str()),
+            "a create without make_default must leave the default pointer intact"
+        );
+    }
+
     /// Multi-model profiles: `profile/llm/list`-backed model list exposes the
     /// primary AND every fallback; `profile/llm/select` promotes a fallback to
     /// the active primary (demoting the old primary to a fallback), persists,
@@ -29093,45 +30251,35 @@ mod tests {
         );
     }
 
-    /// The onboarding catalog unions the QoS model catalog into the bundled
-    /// families — new provider releases (e.g. zai GLM updates) appear without
-    /// waiting for the hand-maintained dashboard list; families with no
-    /// onboarding metadata (key env/route) are skipped.
+    /// The onboarding catalog is the canonical model_catalog.json — the SSOT —
+    /// and is NOT unioned with the runtime QoS catalog. A live QoS catalog only
+    /// reflects already-configured providers (a subset of the catalog), so
+    /// unioning it could only re-introduce curated-out models or zero out
+    /// researched context windows. This guards that regression: a model present
+    /// in the runtime QoS catalog but absent from the canonical catalog must NOT
+    /// appear in onboarding.
     #[test]
-    fn catalog_result_unions_qos_models_into_families() {
+    fn catalog_result_ignores_runtime_qos_not_in_canonical() {
         let dir = tempfile::tempdir().unwrap();
+        // `octos_home_dir()` resolves to `dir` for this store, so this file is
+        // the seed QoS catalog the OLD union path would have read.
         std::fs::write(
             dir.path().join("model_catalog.json"),
             serde_json::to_string(&json!({
                 "updated_at": "2026-07-10T00:00:00Z",
-                "models": [
-                    {
-                        "provider": "zai/glm-9.9-test",
-                        "type": "strong",
-                        "stability": 0.7,
-                        "tool_avg_ms": 1,
-                        "p95_ms": 1,
-                        "score": 0.1,
-                        "cost_in": 1.0,
-                        "cost_out": 4.0,
-                        "ds_output": 1,
-                        "context_window": 1000,
-                        "max_output": 99
-                    },
-                    {
-                        "provider": "unknownfam/mystery-1",
-                        "type": "fast",
-                        "stability": 0.5,
-                        "tool_avg_ms": 1,
-                        "p95_ms": 1,
-                        "score": 0.2,
-                        "cost_in": 0.1,
-                        "cost_out": 0.2,
-                        "ds_output": 1,
-                        "context_window": 1000,
-                        "max_output": 9
-                    }
-                ]
+                "models": [{
+                    "provider": "zai/glm-9.9-not-in-catalog",
+                    "type": "strong",
+                    "stability": 0.7,
+                    "tool_avg_ms": 1,
+                    "p95_ms": 1,
+                    "score": 0.1,
+                    "cost_in": 1.0,
+                    "cost_out": 4.0,
+                    "ds_output": 1,
+                    "context_window": 1000,
+                    "max_output": 99
+                }]
             }))
             .unwrap(),
         )
@@ -29141,17 +30289,86 @@ mod tests {
         let catalog = raw_catalog_result(&state, None).expect("catalog");
         let families = &catalog["families"];
         let zai_models = families["zai"]["models"].as_array().unwrap();
-        assert!(
-            zai_models.iter().any(|model| model["id"] == "glm-9.9-test"),
-            "QoS-only zai model unioned in: {zai_models:?}"
-        );
+        // Canonical lineup is present …
         assert!(
             zai_models.iter().any(|model| model["id"] == "glm-5.2"),
-            "bundled zai lineup still present"
+            "canonical zai lineup present: {zai_models:?}"
+        );
+        // … but the runtime-QoS-only model does NOT leak into onboarding: the
+        // canonical catalog is the single source of truth for what's
+        // provisionable.
+        assert!(
+            !zai_models
+                .iter()
+                .any(|model| model["id"] == "glm-9.9-not-in-catalog"),
+            "runtime-QoS-only model must not appear in onboarding: {zai_models:?}"
+        );
+    }
+
+    #[test]
+    fn catalog_result_sourced_from_registry_and_canonical_catalog() {
+        // With no runtime data-dir catalog, the onboarding catalog is fully
+        // populated from the compiled-in canonical model_catalog.json (the SSOT)
+        // with family key-env from the provider registry — providers.json is no
+        // longer the source.
+        let dir = tempfile::tempdir().unwrap();
+        let state = local_profile_state(dir.path());
+        let catalog = raw_catalog_result(&state, None).expect("catalog");
+        let families = catalog["families"].as_object().expect("families object");
+
+        let ids = |fam: &str| -> Vec<String> {
+            families[fam]["models"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|m| m["id"].as_str().map(str::to_owned))
+                .collect()
+        };
+
+        // Key-env comes from the registry, not a hand-maintained env map.
+        assert_eq!(families["zai"]["env"], "ZAI_API_KEY");
+        // Curation: glm-5.2 + kimi-k2.6 present; deepseek-chat removed.
+        assert!(
+            ids("zai").contains(&"glm-5.2".to_owned()),
+            "{:?}",
+            ids("zai")
         );
         assert!(
-            families.get("unknownfam").is_none(),
-            "families without onboarding metadata are skipped"
+            ids("moonshot").contains(&"kimi-k2.6".to_owned()),
+            "{:?}",
+            ids("moonshot")
+        );
+        assert!(
+            !ids("deepseek").contains(&"deepseek-chat".to_owned()),
+            "deepseek-chat curated out: {:?}",
+            ids("deepseek")
+        );
+        assert!(ids("deepseek").contains(&"deepseek-v4-pro".to_owned()));
+
+        // Researched context window flows through to the catalog (glm-5.2 = 1M).
+        let glm52 = families["zai"]["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["id"] == "glm-5.2")
+            .unwrap();
+        assert_eq!(glm52["context_window"], 1_000_000);
+
+        // Alternative provisioning endpoints (AutoDL/WiseModel) survive into the
+        // onboarding catalog so the TUI route-picker keeps its choices — this was
+        // supplied by the retired providers.json and must not be lost.
+        let v4pro = families["deepseek"]["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["id"] == "deepseek-v4-pro")
+            .unwrap();
+        let endpoints = v4pro["endpoints"].as_array().expect("v4-pro has endpoints");
+        assert!(
+            endpoints
+                .iter()
+                .any(|e| e["id"] == "autodl" && e["api_key_env"] == "AUTODL_API_KEY"),
+            "AutoDL alternative endpoint present: {endpoints:?}"
         );
     }
 
@@ -29170,9 +30387,11 @@ mod tests {
         email: &str,
     ) -> octos_core::ui_protocol::ProfileLocalCreateParams {
         octos_core::ui_protocol::ProfileLocalCreateParams {
+            requested_id: None,
             name: name.into(),
             username: username.into(),
             email: email.into(),
+            make_default: None,
         }
     }
 
@@ -29387,6 +30606,11 @@ mod tests {
                 "mode": "off",
             }),
             methods::ROUTER_GET_METRICS => json!({ "session_id": session_id }),
+            methods::LAUNCH_RESOLVE => json!({ "cwd": "/tmp/probe-launch-resolve" }),
+            APPUI_METHOD_SESSION_COMPACT => json!({ "session_id": session_id }),
+            APPUI_METHOD_SESSION_COMPACT_MODE_SET => {
+                json!({ "session_id": session_id, "mode": "heuristic" })
+            }
             other => panic!("missing AppUI dispatch probe params for {other}"),
         };
 
@@ -30318,6 +31542,421 @@ mod tests {
         assert_eq!(
             state.profile_store.as_ref().unwrap().list().unwrap().len(),
             1
+        );
+    }
+
+    #[test]
+    fn should_honor_requested_id_when_present_without_username_or_email() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = local_profile_state(dir.path());
+
+        let result = create_or_get_local_solo_profile(
+            &state,
+            octos_core::ui_protocol::ProfileLocalCreateParams {
+                requested_id: Some("glm".into()),
+                ..Default::default()
+            },
+        )
+        .expect("requested_id create should succeed with no username/email");
+
+        assert_eq!(result.profile_id, "glm");
+        assert_eq!(result.user_id, "glm");
+        assert!(result.created);
+        assert_eq!(result.runtime_mode, "solo");
+        // Display name falls back to the requested id when no name is sent.
+        assert_eq!(result.name, "glm");
+        // A login-ready placeholder email is synthesized so solo re-login works.
+        assert_eq!(result.email, "glm@solo.local");
+
+        assert!(
+            state
+                .profile_store
+                .as_ref()
+                .unwrap()
+                .get("glm")
+                .unwrap()
+                .is_some(),
+            "a profile file should exist under the requested id"
+        );
+        assert!(
+            state
+                .user_store
+                .as_ref()
+                .unwrap()
+                .get("glm")
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn should_suffix_requested_id_on_collision() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = local_profile_state(dir.path());
+
+        let mk = |state: &AppState| {
+            create_or_get_local_solo_profile(
+                state,
+                octos_core::ui_protocol::ProfileLocalCreateParams {
+                    requested_id: Some("glm".into()),
+                    ..Default::default()
+                },
+            )
+            .expect("requested_id create")
+        };
+
+        assert_eq!(mk(&state).profile_id, "glm");
+        assert_eq!(mk(&state).profile_id, "glm-2");
+        assert_eq!(mk(&state).profile_id, "glm-3");
+        assert_eq!(
+            state.profile_store.as_ref().unwrap().list().unwrap().len(),
+            3,
+            "each requested_id create makes a distinct suffixed profile"
+        );
+    }
+
+    #[test]
+    fn should_normalize_requested_id_into_slug() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = local_profile_state(dir.path());
+
+        let result = create_or_get_local_solo_profile(
+            &state,
+            octos_core::ui_protocol::ProfileLocalCreateParams {
+                requested_id: Some("My GLM!!".into()),
+                ..Default::default()
+            },
+        )
+        .expect("normalized requested_id create");
+        assert_eq!(result.profile_id, "my-glm");
+    }
+
+    #[test]
+    fn should_generate_id_when_requested_id_and_username_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = local_profile_state(dir.path());
+
+        // A display name but no requested_id/username/email → the id is derived
+        // from the name when that yields a free slug.
+        let named = create_or_get_local_solo_profile(
+            &state,
+            octos_core::ui_protocol::ProfileLocalCreateParams {
+                name: "Robo".into(),
+                ..Default::default()
+            },
+        )
+        .expect("generated create from a display name");
+        assert!(named.created);
+        assert_eq!(named.profile_id, "robo");
+        assert_eq!(named.name, "Robo");
+
+        // Fully empty params still create a valid profile with a non-empty
+        // generated id.
+        let empty = create_or_get_local_solo_profile(
+            &state,
+            octos_core::ui_protocol::ProfileLocalCreateParams::default(),
+        )
+        .expect("generated create from empty params");
+        assert!(empty.created);
+        assert!(!empty.profile_id.is_empty());
+        assert!(
+            state
+                .profile_store
+                .as_ref()
+                .unwrap()
+                .get(&empty.profile_id)
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn should_avoid_reserved_id_when_requested_id_is_reserved_channel_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = local_profile_state(dir.path());
+
+        // "slack" is a reserved session-key channel name → it must NOT become a
+        // profile id; the server falls back to a generated id instead.
+        let result = create_or_get_local_solo_profile(
+            &state,
+            octos_core::ui_protocol::ProfileLocalCreateParams {
+                requested_id: Some("slack".into()),
+                ..Default::default()
+            },
+        )
+        .expect("reserved requested_id falls back to a generated id");
+        assert!(result.created);
+        assert_ne!(result.profile_id, "slack");
+        assert!(!octos_core::is_reserved_channel_name(&result.profile_id));
+    }
+
+    #[test]
+    fn should_fall_back_to_generated_when_requested_id_is_pathological() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = local_profile_state(dir.path());
+
+        // Punctuation-only requested_id normalizes to nothing; with no username
+        // to fall back on, the server generates a valid id rather than erroring.
+        let result = create_or_get_local_solo_profile(
+            &state,
+            octos_core::ui_protocol::ProfileLocalCreateParams {
+                requested_id: Some("!!!".into()),
+                ..Default::default()
+            },
+        )
+        .expect("pathological requested_id falls back to a generated id");
+        assert!(result.created);
+        assert!(!result.profile_id.is_empty());
+    }
+
+    #[test]
+    fn should_keep_legacy_username_path_when_no_requested_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = local_profile_state(dir.path());
+
+        // requested_id absent + username present → legacy id == username, and
+        // the path stays idempotent (create-or-get), never suffixed.
+        let first = create_or_get_local_solo_profile(
+            &state,
+            local_profile_params("Ada Lovelace", "ada", "ada@example.com"),
+        )
+        .expect("legacy create");
+        assert_eq!(first.profile_id, "ada");
+        assert!(first.created);
+
+        let second = create_or_get_local_solo_profile(
+            &state,
+            local_profile_params("Ada Lovelace", "ada", "ada@example.com"),
+        )
+        .expect("legacy get");
+        assert_eq!(second.profile_id, "ada");
+        assert!(
+            !second.created,
+            "same owner is a no-op create, never suffixed"
+        );
+    }
+
+    #[test]
+    fn should_reserve_requested_id_atomically_under_concurrency() {
+        // P1: concurrent creates for the same requested_id must each get a
+        // DISTINCT suffixed id (glm, glm-2, …) — never both write "glm" and
+        // overwrite / clash on the shared `.json.tmp`. The reservation lock
+        // makes find-free-id + save atomic, so this is deterministic.
+        let dir = tempfile::tempdir().unwrap();
+        let state = local_profile_state(dir.path());
+
+        let n = 8usize;
+        let barrier = std::sync::Barrier::new(n);
+        let ids: Vec<String> = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..n)
+                .map(|_| {
+                    scope.spawn(|| {
+                        // Release all threads together to maximize contention.
+                        barrier.wait();
+                        create_or_get_local_solo_profile(
+                            &state,
+                            octos_core::ui_protocol::ProfileLocalCreateParams {
+                                requested_id: Some("glm".into()),
+                                ..Default::default()
+                            },
+                        )
+                        .expect("concurrent requested_id create")
+                        .profile_id
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+
+        let unique: std::collections::BTreeSet<&str> = ids.iter().map(String::as_str).collect();
+        assert_eq!(
+            unique.len(),
+            n,
+            "each concurrent create must get a distinct id, got {ids:?}"
+        );
+        let expected: std::collections::BTreeSet<String> = std::iter::once("glm".to_owned())
+            .chain((2..=n).map(|i| format!("glm-{i}")))
+            .collect();
+        assert_eq!(
+            unique
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<std::collections::BTreeSet<_>>(),
+            expected,
+            "ids must be exactly glm, glm-2, … glm-{n}"
+        );
+        assert_eq!(
+            state.profile_store.as_ref().unwrap().list().unwrap().len(),
+            n,
+            "no concurrent create overwrote another profile"
+        );
+        assert_eq!(
+            state.user_store.as_ref().unwrap().list().unwrap().len(),
+            n,
+            "no concurrent create overwrote another user"
+        );
+    }
+
+    #[test]
+    fn should_disambiguate_synthesized_email_on_collision() {
+        // P2: a no-email create synthesizes `<id>@solo.local`. If some other
+        // user EXPLICITLY claimed that exact address, reusing it would create a
+        // duplicate top-level email (ambiguous OTP login). The id and its
+        // synthesized email are chosen TOGETHER, so the id bumps to `glm-2`
+        // (keeping id == email local-part) rather than issuing a mismatched
+        // email — leaving the explicit address intact.
+        let dir = tempfile::tempdir().unwrap();
+        let state = local_profile_state(dir.path());
+
+        // A different profile already holds glm@solo.local explicitly.
+        state
+            .user_store
+            .as_ref()
+            .unwrap()
+            .save(&crate::user_store::User {
+                id: "zai".into(),
+                email: "glm@solo.local".into(),
+                name: "Zai".into(),
+                role: crate::user_store::UserRole::Admin,
+                created_at: chrono::Utc::now(),
+                last_login_at: None,
+            })
+            .unwrap();
+
+        let result = create_or_get_local_solo_profile(
+            &state,
+            octos_core::ui_protocol::ProfileLocalCreateParams {
+                requested_id: Some("glm".into()),
+                ..Default::default()
+            },
+        )
+        .expect("create with a colliding synthesized email");
+
+        // Id and email move together: the claimed glm@solo.local pushes the id
+        // to glm-2, whose email glm-2@solo.local is free.
+        assert_eq!(result.profile_id, "glm-2");
+        assert_eq!(result.email, "glm-2@solo.local");
+        assert_eq!(
+            result.email,
+            format!("{}@solo.local", result.profile_id),
+            "synthesized email local-part must equal the assigned id"
+        );
+
+        let users = state.user_store.as_ref().unwrap().list().unwrap();
+        assert_eq!(
+            users.iter().filter(|u| u.email == result.email).count(),
+            1,
+            "the synthesized email must be unique among top-level users"
+        );
+        assert_eq!(
+            users.iter().filter(|u| u.email == "glm@solo.local").count(),
+            1,
+            "the pre-existing explicit email must be untouched"
+        );
+    }
+
+    #[test]
+    fn should_keep_synthesized_email_local_part_within_64_bytes() {
+        // P2 (length): a max-length (64-char) slug whose `<slug>@solo.local` is
+        // already claimed must NOT produce a 66-byte local part by suffixing the
+        // email separately (`<slug>-2@…` > lettre's 64-byte limit). Choosing the
+        // id and email together instead bumps the ID within the 64-char budget,
+        // so the local part (= the id) stays ≤64.
+        let dir = tempfile::tempdir().unwrap();
+        let state = local_profile_state(dir.path());
+
+        let base = "a".repeat(LOCAL_PROFILE_ID_MAX_LEN); // 64-char slug
+        // Force the synthesized-email collision: a different user explicitly
+        // holds <base>@solo.local.
+        state
+            .user_store
+            .as_ref()
+            .unwrap()
+            .save(&crate::user_store::User {
+                id: "other".into(),
+                email: format!("{base}@solo.local"),
+                name: "Other".into(),
+                role: crate::user_store::UserRole::Admin,
+                created_at: chrono::Utc::now(),
+                last_login_at: None,
+            })
+            .unwrap();
+
+        let result = create_or_get_local_solo_profile(
+            &state,
+            octos_core::ui_protocol::ProfileLocalCreateParams {
+                requested_id: Some(base.clone()),
+                ..Default::default()
+            },
+        )
+        .expect("create with a max-length slug and colliding synthesized email");
+
+        let local_part = result
+            .email
+            .strip_suffix("@solo.local")
+            .expect("synthesized @solo.local email");
+        assert!(
+            local_part.len() <= LOCAL_PROFILE_ID_MAX_LEN,
+            "email local part is {} bytes, exceeds the 64-byte limit",
+            local_part.len()
+        );
+        assert_eq!(
+            local_part, result.profile_id,
+            "email local-part must equal the assigned id"
+        );
+        assert!(result.profile_id.len() <= LOCAL_PROFILE_ID_MAX_LEN);
+        assert_ne!(
+            result.email,
+            format!("{base}@solo.local"),
+            "must not reuse the explicitly-claimed email"
+        );
+    }
+
+    #[test]
+    fn should_reject_when_provided_email_belongs_to_another_user() {
+        // The pre-save email-uniqueness gate (which also closes the cross-writer
+        // race window) rejects a create whose CLIENT-PROVIDED email is already
+        // held by a different user.
+        let dir = tempfile::tempdir().unwrap();
+        let state = local_profile_state(dir.path());
+
+        state
+            .user_store
+            .as_ref()
+            .unwrap()
+            .save(&crate::user_store::User {
+                id: "zai".into(),
+                email: "taken@example.com".into(),
+                name: "Zai".into(),
+                role: crate::user_store::UserRole::Admin,
+                created_at: chrono::Utc::now(),
+                last_login_at: None,
+            })
+            .unwrap();
+
+        let err = create_or_get_local_solo_profile(
+            &state,
+            octos_core::ui_protocol::ProfileLocalCreateParams {
+                requested_id: Some("glm".into()),
+                email: "taken@example.com".into(),
+                ..Default::default()
+            },
+        )
+        .expect_err("a provided email held by another user must be rejected");
+        assert_eq!(err.code, rpc_error_codes::INVALID_PARAMS);
+        assert_eq!(
+            err.data.as_ref().and_then(|data| data.get("kind")),
+            Some(&json!("profile_local_collision"))
+        );
+        // No half-written profile: the create was rejected before persistence.
+        assert!(
+            state
+                .profile_store
+                .as_ref()
+                .unwrap()
+                .get("glm")
+                .unwrap()
+                .is_none()
         );
     }
 
@@ -31494,6 +33133,9 @@ ignore = []
                 .any(|method| method == methods::PROFILE_LOCAL_CREATE)
         );
         assert!(local_capabilities.supports_feature(APPUI_FEATURE_PROFILE_LOCAL_CREATE_V1));
+        assert!(
+            local_capabilities.supports_feature(APPUI_FEATURE_PROFILE_LOCAL_CREATE_REQUESTED_ID_V1)
+        );
         assert!(local_capabilities.supports_feature(APPUI_FEATURE_PERMISSION_PROFILE_V1));
         assert!(local_capabilities.supports_feature(APPUI_FEATURE_RUNTIME_POLICY_STAMP_V1));
         assert!(local_capabilities.supports_feature(APPUI_FEATURE_CONTEXT_LIFECYCLE_V1));
@@ -31537,6 +33179,10 @@ ignore = []
                 .any(|method| method == methods::PROFILE_LOCAL_CREATE)
         );
         assert!(!tenant_capabilities.supports_feature(APPUI_FEATURE_PROFILE_LOCAL_CREATE_V1));
+        assert!(
+            !tenant_capabilities
+                .supports_feature(APPUI_FEATURE_PROFILE_LOCAL_CREATE_REQUESTED_ID_V1)
+        );
     }
 
     #[test]
@@ -31917,6 +33563,410 @@ ignore = []
             dir.path(),
         )))
         .await;
+    }
+
+    #[tokio::test]
+    async fn session_list_cwd_root_honors_flag_and_capability() {
+        // The `session/list` cwd gate: flag OFF ignores cwd (legacy listing);
+        // flag ON honors it only with the `session.workspace_cwd.v1`
+        // capability; and it runs the SAME workspace-safety gate as
+        // session/open before resolving a root (proven here by the no-runtime
+        // rejection — see `session_list_cwd_root_gates_path_and_namespaces_by_profile`
+        // for the safe-path happy case + banned-path rejection).
+        use octos_core::ui_protocol::SessionListParams;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let cwd = tmp.path().join("proj");
+        std::fs::create_dir_all(&cwd).unwrap();
+
+        let has_cap = ConnectionUiFeatures::stdio_defaults(); // workspace_cwd = true
+        let no_cap = ConnectionUiFeatures {
+            session_workspace_cwd: false,
+            ..ConnectionUiFeatures::stdio_defaults()
+        };
+        let with_cwd = SessionListParams {
+            cwd: Some(cwd.to_string_lossy().into_owned()),
+        };
+        let no_cwd = SessionListParams { cwd: None };
+
+        let state_off = {
+            let mut s = AppState::empty_for_tests();
+            s.session_cache = Arc::new(
+                crate::runtime::SessionRuntimeCache::new(4, std::time::Duration::from_secs(60))
+                    .with_sessions_in_cwd(false),
+            );
+            s
+        };
+        // Flag OFF → cwd ignored even with the capability (byte-identical legacy).
+        assert_eq!(
+            resolve_session_list_cwd_root(&state_off, has_cap, None, &with_cwd).unwrap(),
+            None,
+        );
+
+        let state_on = {
+            let mut s = AppState::empty_for_tests();
+            s.session_cache = Arc::new(
+                crate::runtime::SessionRuntimeCache::new(4, std::time::Duration::from_secs(60))
+                    .with_sessions_in_cwd(true),
+            );
+            s
+        };
+        // Flag ON + no cwd → None (legacy listing).
+        assert_eq!(
+            resolve_session_list_cwd_root(&state_on, has_cap, None, &no_cwd).unwrap(),
+            None,
+        );
+        // Flag ON + cwd but NO capability → typed error (mirrors session/open).
+        assert!(resolve_session_list_cwd_root(&state_on, no_cap, None, &with_cwd).is_err());
+        // Flag ON + capability + a valid cwd but NO registered profile runtime
+        // → the workspace-safety gate (`validate_session_workspace_allowed`)
+        // rejects. This proves the gate is wired BEFORE any SessionManager is
+        // opened at the cwd (the P1 the codex review flagged).
+        assert!(resolve_session_list_cwd_root(&state_on, has_cap, None, &with_cwd).is_err());
+    }
+
+    #[tokio::test]
+    async fn session_list_cwd_root_gates_path_and_namespaces_by_profile() {
+        // With a registered profile runtime: a SAFE cwd resolves to the
+        // per-project, per-PROFILE store `<cwd>/.octos/<profile_id>` (so two
+        // profiles sharing a cwd can't read each other's transcripts), and a
+        // banned system path is rejected by the shared safety gate.
+        use octos_core::ui_protocol::SessionListParams;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let profile = crate::profiles::UserProfile {
+            id: "dev".to_string(),
+            name: "Dev".to_string(),
+            enabled: true,
+            data_dir: None,
+            parent_id: None,
+            public_subdomain: None,
+            config: crate::profiles::ProfileConfig {
+                llm: Some(crate::profiles::LlmProfileConfig {
+                    primary: Some(crate::profiles::LlmModelSelectionConfig {
+                        family_id: Some("openai".to_string()),
+                        model_id: Some("gpt-4o-mini".to_string()),
+                        route: Some(crate::profiles::LlmRouteConfig {
+                            route_id: None,
+                            label: None,
+                            base_url: None,
+                            api_key_env: Some("SESS_CWD_TEST_KEY".to_string()),
+                            api_type: None,
+                        }),
+                        ..Default::default()
+                    }),
+                    fallbacks: Vec::new(),
+                }),
+                env_vars: [("SESS_CWD_TEST_KEY".to_string(), "test-key".to_string())]
+                    .into_iter()
+                    .collect(),
+                ..Default::default()
+            },
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        let data_dir = tmp.path().join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let runtime = crate::runtime::ProfileRuntime::bootstrap(
+            &profile,
+            &data_dir,
+            None,
+            crate::runtime::BootstrapRole::Serve,
+        )
+        .await
+        .expect("bootstrap dev runtime");
+
+        let mut state = AppState::empty_for_tests();
+        state.profiles.insert("dev".to_string(), runtime);
+        state.session_cache = Arc::new(
+            crate::runtime::SessionRuntimeCache::new(4, std::time::Duration::from_secs(60))
+                .with_sessions_in_cwd(true),
+        );
+
+        let cap = ConnectionUiFeatures::stdio_defaults();
+
+        // Safe cwd → `<cwd>/.octos/dev` (profile-namespaced).
+        let good = tmp.path().join("project");
+        std::fs::create_dir_all(&good).unwrap();
+        let good_canon = std::fs::canonicalize(&good).unwrap();
+        let good_params = SessionListParams {
+            cwd: Some(good.to_string_lossy().into_owned()),
+        };
+        let resolved =
+            resolve_session_list_cwd_root(&state, cap, Some("dev"), &good_params).unwrap();
+        assert_eq!(
+            resolved,
+            Some(crate::runtime::session::project_sessions_root(
+                &good_canon,
+                "dev"
+            )),
+        );
+        assert_eq!(resolved, Some(good_canon.join(".octos").join("dev")));
+
+        // Banned system root (`/usr` is a real dir on Linux and macOS that
+        // canonicalizes to `/usr`) → rejected by the safety gate.
+        let banned = SessionListParams {
+            cwd: Some("/usr".to_string()),
+        };
+        assert!(resolve_session_list_cwd_root(&state, cap, Some("dev"), &banned).is_err());
+    }
+
+    #[tokio::test]
+    async fn launch_resolve_activates_empty_folder_then_resumes_after_store_exists() {
+        use octos_core::ui_protocol::{LaunchDecisionKind, LaunchResolveParams};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let profile = crate::profiles::UserProfile {
+            id: "dev".to_string(),
+            name: "Dev".to_string(),
+            enabled: true,
+            data_dir: None,
+            parent_id: None,
+            public_subdomain: None,
+            config: crate::profiles::ProfileConfig {
+                llm: Some(crate::profiles::LlmProfileConfig {
+                    primary: Some(crate::profiles::LlmModelSelectionConfig {
+                        family_id: Some("openai".to_string()),
+                        model_id: Some("gpt-4o-mini".to_string()),
+                        route: Some(crate::profiles::LlmRouteConfig {
+                            route_id: None,
+                            label: None,
+                            base_url: None,
+                            api_key_env: Some("LAUNCH_RESOLVE_TEST_KEY".to_string()),
+                            api_type: None,
+                        }),
+                        ..Default::default()
+                    }),
+                    fallbacks: Vec::new(),
+                }),
+                env_vars: [(
+                    "LAUNCH_RESOLVE_TEST_KEY".to_string(),
+                    "test-key".to_string(),
+                )]
+                .into_iter()
+                .collect(),
+                ..Default::default()
+            },
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        let data_dir = tmp.path().join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let runtime = crate::runtime::ProfileRuntime::bootstrap(
+            &profile,
+            &data_dir,
+            None,
+            crate::runtime::BootstrapRole::Serve,
+        )
+        .await
+        .expect("bootstrap dev runtime");
+
+        let mut state = AppState::empty_for_tests();
+        state.profiles.insert("dev".to_string(), runtime);
+        state.session_cache = Arc::new(
+            crate::runtime::SessionRuntimeCache::new(4, std::time::Duration::from_secs(60))
+                .with_sessions_in_cwd(true),
+        );
+        let state = Arc::new(state);
+        let cap = ConnectionUiFeatures::stdio_defaults();
+
+        let project = tmp.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let params = LaunchResolveParams {
+            cwd: project.to_string_lossy().into_owned(),
+            profile_id: Some("dev".to_string()),
+        };
+
+        // Empty folder → activate a new session for the launching profile.
+        let activate = resolve_launch_result(&state, Some("dev"), cap, &params).unwrap();
+        assert_eq!(activate.decision, LaunchDecisionKind::Activate);
+        assert_eq!(activate.resolved_profile.as_deref(), Some("dev"));
+
+        // Once dev has a store here, a relaunch resumes it.
+        let canon = std::fs::canonicalize(&project).unwrap();
+        std::fs::create_dir_all(
+            crate::runtime::session::project_sessions_root(&canon, "dev").join("sessions"),
+        )
+        .unwrap();
+        let resume = resolve_launch_result(&state, Some("dev"), cap, &params).unwrap();
+        assert_eq!(resume.decision, LaunchDecisionKind::Resume);
+        assert_eq!(resume.resolved_profile.as_deref(), Some("dev"));
+
+        // Without the workspace-cwd feature the probe is rejected.
+        let no_cap = ConnectionUiFeatures::default();
+        assert!(resolve_launch_result(&state, Some("dev"), no_cap, &params).is_err());
+    }
+
+    /// The persisted `default-profile` pointer drives a bare launch: with no
+    /// `--profile` and no folder-sticky profile, `launch/resolve` resolves to
+    /// the pointer even when it is not the first-sorted profile. A stale pointer
+    /// (naming a profile that no longer exists) is ignored, falling back to the
+    /// derived default.
+    #[tokio::test]
+    async fn launch_resolve_prefers_persisted_default_profile() {
+        use octos_core::ui_protocol::{LaunchDecisionKind, LaunchResolveParams};
+
+        let tmp = tempfile::tempdir().unwrap();
+        // The default-profile pointer lives in its own octos home; each profile
+        // bootstraps in a separate data dir because the redb episode store takes
+        // an exclusive lock and two profiles cannot share one.
+        let home = tmp.path().join("home");
+
+        let make_profile = |id: &str| crate::profiles::UserProfile {
+            id: id.to_string(),
+            name: id.to_string(),
+            enabled: true,
+            data_dir: None,
+            parent_id: None,
+            public_subdomain: None,
+            config: crate::profiles::ProfileConfig {
+                llm: Some(crate::profiles::LlmProfileConfig {
+                    primary: Some(crate::profiles::LlmModelSelectionConfig {
+                        family_id: Some("openai".to_string()),
+                        model_id: Some("gpt-4o-mini".to_string()),
+                        route: Some(crate::profiles::LlmRouteConfig {
+                            route_id: None,
+                            label: None,
+                            base_url: None,
+                            api_key_env: Some("LAUNCH_DEFAULT_TEST_KEY".to_string()),
+                            api_type: None,
+                        }),
+                        ..Default::default()
+                    }),
+                    fallbacks: Vec::new(),
+                }),
+                env_vars: [(
+                    "LAUNCH_DEFAULT_TEST_KEY".to_string(),
+                    "test-key".to_string(),
+                )]
+                .into_iter()
+                .collect(),
+                ..Default::default()
+            },
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+
+        let mut state = AppState::empty_for_tests();
+        for id in ["alpha", "zeta"] {
+            let profile_dir = tmp.path().join(format!("profile-{id}"));
+            std::fs::create_dir_all(&profile_dir).unwrap();
+            let runtime = crate::runtime::ProfileRuntime::bootstrap(
+                &make_profile(id),
+                &profile_dir,
+                None,
+                crate::runtime::BootstrapRole::Serve,
+            )
+            .await
+            .expect("bootstrap profile");
+            state.profiles.insert(id.to_string(), runtime);
+        }
+        let store = Arc::new(crate::profiles::ProfileStore::open(&home).unwrap());
+        // Point the global default at "zeta" — NOT the first-sorted profile.
+        store.set_default_profile("zeta").unwrap();
+        state.profile_store = Some(store.clone());
+        state.session_cache = Arc::new(
+            crate::runtime::SessionRuntimeCache::new(4, std::time::Duration::from_secs(60))
+                .with_sessions_in_cwd(true),
+        );
+        let state = Arc::new(state);
+        let cap = ConnectionUiFeatures::stdio_defaults();
+
+        let project = tmp.path().join("fresh");
+        std::fs::create_dir_all(&project).unwrap();
+        // Bare launch (no `--profile`) in an empty folder. The connection
+        // authenticated as "alpha"; the persisted default is "zeta". The default
+        // pointer must win over BOTH the connection profile and sort order.
+        let params = LaunchResolveParams {
+            cwd: project.to_string_lossy().into_owned(),
+            profile_id: None,
+        };
+        let decision = resolve_launch_result(&state, Some("alpha"), cap, &params).unwrap();
+        assert_eq!(decision.decision, LaunchDecisionKind::Activate);
+        assert_eq!(
+            decision.resolved_profile.as_deref(),
+            Some("zeta"),
+            "the persisted default must win over the connection profile"
+        );
+
+        // A stale pointer (unknown profile) is ignored → falls back to the
+        // connection profile (alpha).
+        store.set_default_profile("ghost").unwrap();
+        let stale = resolve_launch_result(&state, Some("alpha"), cap, &params).unwrap();
+        assert_eq!(stale.resolved_profile.as_deref(), Some("alpha"));
+    }
+
+    #[tokio::test]
+    async fn launch_resolve_uses_stored_profiles_without_a_loaded_runtime() {
+        // Regression (launch-flow soak against a real `octos serve --stdio`): in
+        // solo `--stdio`, profile runtimes materialize LAZILY on `session/open`,
+        // so `state.profiles` is EMPTY at bare-launch time. launch/resolve must
+        // still see a profile that EXISTS in the persistent `ProfileStore` and
+        // must NOT require a loaded runtime — otherwise every folder falls
+        // through to `activate` (Resume/CrossProfile unreachable) and a
+        // zero-profile machine gets a spurious `cwd_runtime_unavailable` instead
+        // of `NoProfile`. `state.profiles` stays empty for the WHOLE test.
+        use octos_core::ui_protocol::{LaunchDecisionKind, LaunchResolveParams};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let mut state = AppState::empty_for_tests();
+        state.profile_store = Some(Arc::new(
+            crate::profiles::ProfileStore::open(&home).unwrap(),
+        ));
+        let state = Arc::new(state);
+        let cap = ConnectionUiFeatures::stdio_defaults();
+        let resolve = |cwd: &std::path::Path| {
+            resolve_launch_result(
+                &state,
+                None,
+                cap,
+                &LaunchResolveParams {
+                    cwd: cwd.to_string_lossy().into_owned(),
+                    profile_id: None,
+                },
+            )
+        };
+
+        // A valid folder with ZERO stored profiles → NoProfile, NOT an error.
+        let empty = tmp.path().join("empty");
+        std::fs::create_dir_all(&empty).unwrap();
+        let no_profile = resolve(&empty).unwrap();
+        assert_eq!(no_profile.decision, LaunchDecisionKind::NoProfile);
+        assert_eq!(no_profile.resolved_profile, None);
+
+        // Persist a launchable brain to the STORE only — no runtime loaded.
+        state
+            .profile_store
+            .as_ref()
+            .unwrap()
+            .save(&crate::profiles::UserProfile {
+                id: "ghost".to_string(),
+                name: "Ghost".to_string(),
+                enabled: true,
+                data_dir: None,
+                parent_id: None,
+                public_subdomain: None,
+                config: crate::profiles::ProfileConfig::default(),
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+            })
+            .unwrap();
+
+        // Empty folder + the sole stored profile is ghost → Activate{ghost}
+        // (default falls back to the only known profile), NOT an error.
+        let activate = resolve(&empty).unwrap();
+        assert_eq!(activate.decision, LaunchDecisionKind::Activate);
+        assert_eq!(activate.resolved_profile.as_deref(), Some("ghost"));
+
+        // A folder holding ghost's activated store + sticky marker → Resume{ghost},
+        // even though ghost's runtime was never loaded into `state.profiles`.
+        let project = tmp.path().join("proj");
+        std::fs::create_dir_all(project.join(".octos").join("ghost").join("sessions")).unwrap();
+        std::fs::write(project.join(".octos").join("active-profile"), "ghost").unwrap();
+        let resume = resolve(&project).unwrap();
+        assert_eq!(resume.decision, LaunchDecisionKind::Resume);
+        assert_eq!(resume.resolved_profile.as_deref(), Some("ghost"));
     }
 
     async fn assert_advertised_stdio_methods_have_dispatch_path(state: Arc<AppState>) {
@@ -32372,6 +34422,122 @@ ignore = []
         assert_eq!(
             grace_status["runtime_policy_stamp"]["profile_id"],
             json!("grace")
+        );
+    }
+
+    /// End-to-end sticky-marker contract through the real `session/open`
+    /// dispatcher: a cwd-hinted open under the per-project flag records the
+    /// folder's active profile; reopening a different brain in the same folder
+    /// flips it (last-writer-wins); a no-cwd open never touches the marker.
+    #[tokio::test]
+    async fn session_open_writes_active_profile_marker_only_with_flag_and_cwd() {
+        let dir = tempfile::tempdir().unwrap();
+        // Two LLM-configured runtimes (each with its own data dir → its own
+        // redb episode store, no exclusive-lock clash) so a cwd-hinted
+        // `session/open` clears the `profile_unconfigured` LLM gate. Flag-ON
+        // cache so a cwd hint relocates the store to `<cwd>/.octos`.
+        let mut profiles = HashMap::new();
+        for id in ["grace", "ada"] {
+            let profile_data_dir = dir.path().join("profiles").join(id).join("data");
+            let runtime = make_m11e_profile_with_llm_and_sandbox(
+                id,
+                &profile_data_dir,
+                Arc::new(M11EStubLlm),
+                octos_agent::SandboxConfig::default(),
+            )
+            .await;
+            profiles.insert(id.to_string(), runtime);
+        }
+        let state = Arc::new(AppState {
+            profiles,
+            sessions: Some(Arc::new(tokio::sync::Mutex::new(
+                octos_bus::SessionManager::open(dir.path()).expect("session manager"),
+            ))),
+            session_cache: Arc::new(
+                crate::runtime::SessionRuntimeCache::new(4, std::time::Duration::from_secs(60))
+                    .with_sessions_in_cwd(true),
+            ),
+            ..AppState::empty_for_tests()
+        });
+
+        let ledger = UiProtocolLedger::new(16);
+        let approvals = PendingApprovalStore::default();
+        let questions = PendingQuestionStore::default();
+        let features = ConnectionUiFeatures::stdio_defaults();
+
+        // A separate project folder (NOT the data dir) the session opens against.
+        let workspace = tempfile::tempdir().unwrap();
+        let workspace_canon = std::fs::canonicalize(workspace.path()).unwrap();
+        let marker = workspace_canon.join(".octos").join("active-profile");
+        let cwd_hint = || Some(workspace.path().to_string_lossy().into_owned());
+        assert!(!marker.exists(), "marker must not pre-exist the first open");
+
+        let open = |session_id: SessionKey, profile: &'static str, cwd: Option<String>| {
+            let state = state.clone();
+            let ledger = &ledger;
+            let approvals = &approvals;
+            let questions = &questions;
+            async move {
+                open_session_result(
+                    &state,
+                    ledger,
+                    approvals,
+                    questions,
+                    ConnectionId::next(),
+                    Some(profile),
+                    features,
+                    SessionOpenParams {
+                        session_id,
+                        topic: None,
+                        profile_id: None,
+                        cwd,
+                        sandbox: None,
+                        after: None,
+                    },
+                )
+                .await
+                .expect("session/open succeeds")
+            }
+        };
+
+        // Open grace WITH a cwd hint → store relocates, marker records "grace".
+        open(
+            SessionKey::with_profile_topic("grace", "local", "tui", "coding"),
+            "grace",
+            cwd_hint(),
+        )
+        .await;
+        assert_eq!(
+            std::fs::read_to_string(&marker).unwrap().trim(),
+            "grace",
+            "session/open with flag+cwd records the folder's active profile",
+        );
+
+        // Reopen a DIFFERENT brain in the SAME folder → last-writer-wins: the
+        // sticky marker flips to "ada" (the "switch brains here" semantics).
+        open(
+            SessionKey::with_profile_topic("ada", "local", "tui", "coding"),
+            "ada",
+            cwd_hint(),
+        )
+        .await;
+        assert_eq!(
+            std::fs::read_to_string(&marker).unwrap().trim(),
+            "ada",
+            "reopening a different brain in the folder updates the sticky marker",
+        );
+
+        // A no-cwd open (web/gateway shape) must NOT touch the folder marker.
+        open(
+            SessionKey::with_profile_topic("grace", "local", "tui", "review"),
+            "grace",
+            None,
+        )
+        .await;
+        assert_eq!(
+            std::fs::read_to_string(&marker).unwrap().trim(),
+            "ada",
+            "a no-cwd session/open leaves the existing folder marker intact",
         );
     }
 
@@ -41540,6 +43706,48 @@ ignore = []
     }
 
     #[test]
+    fn permission_denied_workspace_yields_a_clear_actionable_error() {
+        // A session/open bootstrap failure caused by a non-writable workspace
+        // folder must be recognized structurally (through the eyre wrap chain)
+        // and rendered as a clear, folder-named message the client shows
+        // verbatim — not the opaque "failed to bootstrap session runtime".
+        let io_err = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "Permission denied");
+        let report = eyre::Report::new(io_err)
+            .wrap_err("write workspace policy failed: /Users/dev/.octos-workspace.toml")
+            .wrap_err("failed to bootstrap session workspace policy");
+        assert!(
+            is_permission_denied_error(&report),
+            "permission denial must be detected through the eyre wrap chain"
+        );
+
+        let error = workspace_not_writable_error(Some("/Users/dev"));
+        assert_eq!(
+            error.data.as_ref().and_then(|d| d.get("kind")),
+            Some(&json!("workspace_not_writable"))
+        );
+        let message = error
+            .data
+            .as_ref()
+            .and_then(|d| d.get("message"))
+            .and_then(|m| m.as_str())
+            .unwrap_or_default();
+        assert!(
+            message.contains("/Users/dev"),
+            "message must name the folder: {message}"
+        );
+        assert!(
+            message.contains("writable"),
+            "message must explain the cause: {message}"
+        );
+    }
+
+    #[test]
+    fn non_permission_bootstrap_error_is_not_misclassified_as_writability() {
+        let report = eyre::eyre!("some other failure: database corrupt");
+        assert!(!is_permission_denied_error(&report));
+    }
+
+    #[test]
     fn final_assistant_message_persists_content_when_response_messages_omit_it() {
         let message = final_assistant_message(&[Message::user("hello")], "world", Some("r".into()))
             .expect("assistant message");
@@ -46443,8 +48651,17 @@ ignore = []
         let observed: Arc<std::sync::Mutex<Vec<(SessionKey, Message, usize)>>> =
             Arc::new(std::sync::Mutex::new(Vec::new()));
         let observed_clone = observed.clone();
+        // Filter to THIS test's session id: the commit observer is
+        // process-global, so a concurrently-running suite test that commits a
+        // message to a DIFFERENT session would otherwise pollute this sink and
+        // make `observed.len()` exceed 3 (the `message_commit_observer_test_lock`
+        // only serialises observer-MUTATING tests, not every committer).
+        let filter_key = "local:persisted-order";
         let prev =
             octos_bus::set_message_commit_observer(Some(Arc::new(move |key, message, seq| {
+                if key.0 != filter_key {
+                    return;
+                }
                 observed_clone
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
@@ -46454,7 +48671,7 @@ ignore = []
         let tmp = tempfile::tempdir().expect("tempdir");
         let mut manager =
             octos_bus::SessionManager::open(tmp.path()).expect("session manager open");
-        let session_id = SessionKey("local:persisted-order".into());
+        let session_id = SessionKey(filter_key.into());
         for content in ["one", "two", "three"] {
             let msg = Message {
                 role: MessageRole::User,
@@ -46533,8 +48750,13 @@ ignore = []
         assert!(observed.lock().unwrap().is_empty());
 
         // Install the sink and run a second commit. Sink must contain
-        // exactly one event (the second), not two.
-        octos_bus::set_message_commit_observer(Some(Arc::new(move |_key, _message, _seq| {
+        // exactly one event (the second), not two. Filter to this test's
+        // session id so a concurrent suite committer (the observer is
+        // process-global) cannot inflate the count past 1.
+        octos_bus::set_message_commit_observer(Some(Arc::new(move |key, _message, _seq| {
+            if key.0 != "local:persisted-failure" {
+                return;
+            }
             observed_clone.lock().unwrap().push(());
         })));
         let msg2 = Message {
@@ -49289,6 +51511,81 @@ ignore = []
 
         abort_live_forwarders(&forwarders, &ledger).await;
         abort_live_forwarders(&forwarders_other, &ledger).await;
+    }
+
+    /// Stuck-chip fix (specialist lane): a TERMINAL `agent/updated` emitted
+    /// through the supervisor sink must be appended to the durable per-session
+    /// ledger (so reconnect replay observes the flip), while non-terminal
+    /// updates stay ephemeral (never ledgered — they'd bloat replay history).
+    #[tokio::test]
+    async fn supervisor_sink_ledgers_terminal_agent_updates_only() {
+        let (ws, mut rx) = ws_connection_for_test(16);
+        let ledger = Arc::new(UiProtocolLedger::new(16));
+        let session_id = SessionKey("local:sink-durable".into());
+        let sink = WsSupervisorEventSink {
+            ws: ws.clone(),
+            ledger: ledger.clone(),
+        };
+
+        let agent_json = |status: &str| {
+            json!({
+                "session_id": session_id.0,
+                "agent": {
+                    "agent_id": "edison",
+                    "session_id": session_id.0,
+                    "path": "master/edison",
+                    "role": "worker",
+                    "nickname": "Edison",
+                    "backend_kind": "cli_process",
+                    "status": status,
+                    "profile_id": "dev",
+                    "created_at_ms": 1,
+                    "updated_at_ms": 1,
+                }
+            })
+        };
+
+        // Non-terminal: delivered live, but must NOT be appended durably.
+        sink.emit_supervisor_event(
+            octos_core::ui_protocol::methods::AGENT_UPDATED,
+            agent_json("running"),
+        );
+        // Terminal: must be appended to the durable ledger.
+        sink.emit_supervisor_event(
+            octos_core::ui_protocol::methods::AGENT_UPDATED,
+            agent_json("failed"),
+        );
+
+        // Both frames still reach the live connection exactly once each.
+        for expected_status in ["running", "failed"] {
+            let frame = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+                .await
+                .expect("live frame")
+                .expect("ws open");
+            assert_eq!(
+                frame_method(&frame).as_deref(),
+                Some(octos_core::ui_protocol::methods::AGENT_UPDATED),
+                "live delivery must be preserved for {expected_status}"
+            );
+        }
+
+        let (events, _) = ledger
+            .snapshot_with_cursor(&session_id, None)
+            .expect("ledger snapshot");
+        let ledgered_statuses: Vec<&str> = events
+            .iter()
+            .filter_map(|event| match &event.event {
+                UiProtocolLedgerEvent::Notification(UiNotification::AgentUpdated(update)) => {
+                    Some(update.agent.status.as_str())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            ledgered_statuses,
+            vec!["failed"],
+            "exactly the terminal update must be ledgered — non-terminal stays ephemeral"
+        );
     }
 
     /// MUST-FIX-3: a `subscribe()` call followed by dropping the

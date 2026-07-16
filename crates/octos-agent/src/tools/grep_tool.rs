@@ -238,6 +238,16 @@ fn run_grep(
         .build()
         .wrap_err_with(|| format!("invalid regex: {}", pattern_str))?;
 
+    // Compile the file-name glob once and fail loudly on an invalid pattern.
+    // Previously an uncompilable glob was silently ignored, causing grep to
+    // search *every* file instead of the intended subset.
+    let file_glob = match file_pattern {
+        Some(ref fp) => Some(
+            glob::Pattern::new(fp).wrap_err_with(|| format!("invalid file_pattern glob: {fp}"))?,
+        ),
+        None => None,
+    };
+
     let mut matches: Vec<String> = Vec::new();
     let mut match_count = 0;
 
@@ -302,13 +312,10 @@ fn run_grep(
         }
 
         // Apply file pattern filter.
-        if let Some(ref fp) = file_pattern {
+        if let Some(ref p) = file_glob {
             let file_name = path.file_name().unwrap_or_default().to_string_lossy();
-            let pattern = glob::Pattern::new(fp);
-            if let Ok(p) = pattern {
-                if !p.matches(&file_name) {
-                    continue;
-                }
+            if !p.matches(&file_name) {
+                continue;
             }
         }
 
@@ -421,6 +428,25 @@ mod tests {
         assert!(result.success);
         // Should find matches in .rs files but not readme.txt
         assert!(!result.output.contains("readme.txt"));
+    }
+
+    #[tokio::test]
+    async fn test_grep_invalid_file_pattern_errors() {
+        // Regression: an uncompilable file_pattern glob used to be silently
+        // ignored, searching every file. It must now error loudly.
+        let dir = tempfile::tempdir().unwrap();
+        setup_project(dir.path());
+
+        let tool = GrepTool::new(dir.path());
+        let result = tool
+            .execute(&serde_json::json!({"pattern": "hello", "file_pattern": "[bad"}))
+            .await;
+
+        let err = match result {
+            Ok(_) => panic!("expected an error for an invalid file_pattern glob"),
+            Err(e) => e.to_string(),
+        };
+        assert!(err.contains("invalid file_pattern glob"), "got: {err}");
     }
 
     #[tokio::test]

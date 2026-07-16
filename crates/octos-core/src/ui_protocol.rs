@@ -307,6 +307,7 @@ fn method_capability_gate(method: &str) -> Option<&'static str> {
         methods::SESSION_HYDRATE => Some(UI_PROTOCOL_FEATURE_SESSION_HYDRATE_V1),
         methods::THREAD_GRAPH_GET => Some(UI_PROTOCOL_FEATURE_THREAD_GRAPH_V1),
         methods::TURN_STATE_GET => Some(UI_PROTOCOL_FEATURE_TURN_STATE_GET_V1),
+        methods::LAUNCH_RESOLVE => Some(UI_PROTOCOL_FEATURE_SESSION_WORKSPACE_CWD_V1),
         methods::SESSION_LIST
         | methods::SESSION_SNAPSHOT
         | methods::SESSION_MESSAGES_PAGE
@@ -1169,6 +1170,13 @@ pub mod methods {
     /// Replaces `PUT /api/my/cron/{job_id}/enabled` — cron job toggle.
     pub const CRON_TOGGLE: &str = "cron/toggle";
 
+    /// Pre-session launch probe. Given the project cwd + optional requested
+    /// profile, the server decides whether to resume the folder's
+    /// conversation, activate a new one, or surface a cross-profile choice.
+    /// Capability-gated on
+    /// [`UI_PROTOCOL_FEATURE_SESSION_WORKSPACE_CWD_V1`].
+    pub const LAUNCH_RESOLVE: &str = "launch/resolve";
+
     // ---- Wave4-A: adaptive routing + queue state ----
 
     /// Wave4-A `router/status` — adaptive routing snapshot notification.
@@ -1277,6 +1285,7 @@ pub const UI_PROTOCOL_COMMAND_METHODS: &[&str] = &[
     methods::CRON_TOGGLE,
     methods::ROUTER_SET_MODE,
     methods::ROUTER_GET_METRICS,
+    methods::LAUNCH_RESOLVE,
 ];
 
 /// Notification methods defined by the v1alpha1 protocol model.
@@ -1387,6 +1396,7 @@ pub const UI_PROTOCOL_FIRST_SERVER_METHODS: &[&str] = &[
     methods::CRON_TOGGLE,
     methods::ROUTER_SET_MODE,
     methods::ROUTER_GET_METRICS,
+    methods::LAUNCH_RESOLVE,
 ];
 
 /// Protocol methods known but not implemented by the first server/runtime slice.
@@ -2221,11 +2231,48 @@ pub struct PermissionProfileSetResult {
     pub applied: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Parameters for `profile/local/create` (solo local onboarding).
+///
+/// Backward compatible: an older client that sends `{name, username, email}`
+/// with no `requested_id` still deserializes and works — the server derives
+/// the profile id from `username`, exactly as before. A newer client may
+/// instead send a meaningful `requested_id` (e.g. `"glm"`, `"deepseek"`) and
+/// omit `username`/`email`, because a solo local profile does not require an
+/// owner username or email. The server normalizes `requested_id` into a slug
+/// and collision-suffixes it (`glm`, `glm-2`, `glm-3`, …) to derive the
+/// assigned [`ProfileLocalCreateResult::profile_id`].
+///
+/// Servers that understand `requested_id` advertise the additive capability
+/// feature `profile.local_create.requested_id.v1`; a client can negotiate on
+/// that flag before sending the new shape.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProfileLocalCreateParams {
+    /// Meaningful profile id the user typed during onboarding. Normalized
+    /// (lowercased, non-`[a-z0-9-]` collapsed to `-`) and uniqueness-suffixed
+    /// server-side. Absent / empty / pathological → the server derives the id
+    /// from `username` (legacy shape) or generates one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_id: Option<String>,
+    /// Display name. Optional; when empty the server falls back to
+    /// `requested_id` (then the assigned id) so a profile always has some
+    /// display name.
+    #[serde(default)]
     pub name: String,
+    /// Legacy owner username. Optional now that `requested_id` can name a solo
+    /// profile. When present and `requested_id` is absent it still derives the
+    /// profile id, preserving the pre-existing behavior.
+    #[serde(default)]
     pub username: String,
+    /// Legacy owner email. Optional for a solo local profile.
+    #[serde(default)]
     pub email: String,
+    /// When `Some(true)`, the server records this profile as the machine's
+    /// global default — the brain a bare launch resolves to in a folder with no
+    /// sticky profile yet (Model A launch flow). Omitted from the wire when
+    /// `None` so older servers receive the unchanged shape. Clients only send it
+    /// when the server advertises `profile.local_create.default.v1`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub make_default: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2960,9 +3007,26 @@ pub struct TurnStateGetResult {
 // `StatusResponse`, `ContentEntry`) into the protocol crate. The shapes
 // are unchanged from the REST contract — only the transport flips.
 
-/// Params for `session/list` — empty request.
+/// Params for `session/list`.
+///
+/// Historically an empty request (`{}`). The optional `cwd` field is an
+/// **additive** extension for per-project session storage
+/// (`appui.sessions_in_cwd`): when a client supplies it (and has negotiated
+/// [`UI_PROTOCOL_FEATURE_SESSION_WORKSPACE_CWD_V1`]), a server with the flag
+/// enabled lists the sessions stored under `<cwd>/.octos` instead of the
+/// per-profile global store. It is `#[serde(default, skip_serializing_if =
+/// "Option::is_none")]` so old clients that send `{}` still deserialize
+/// (→ `cwd: None` → legacy global listing) and the wire shape of a
+/// no-cwd request is byte-identical to the historical empty object.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SessionListParams {}
+pub struct SessionListParams {
+    /// Optional project working directory. When present, honored by a
+    /// server with `appui.sessions_in_cwd` enabled to scope the listing to
+    /// that project's `<cwd>/.octos` session store. Absent → legacy
+    /// per-profile/global listing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+}
 
 /// Result for `session/list`. `sessions` is the JSON array the existing
 /// `GET /api/sessions` handler emits (one `SessionInfo` per entry, per
@@ -2970,6 +3034,53 @@ pub struct SessionListParams {}
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SessionListResult {
     pub sessions: Value,
+}
+
+/// Params for `launch/resolve` — the pre-session launch probe. Given the
+/// project `cwd` and the optionally requested profile, the server decides
+/// whether to resume the folder's conversation, activate a new one, or surface
+/// a cross-profile choice. Gated on
+/// [`UI_PROTOCOL_FEATURE_SESSION_WORKSPACE_CWD_V1`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LaunchResolveParams {
+    /// Absolute project directory the client launched in.
+    pub cwd: String,
+    /// The profile the client was launched with (`--profile`), if any. Absent
+    /// → the server resolves the folder's sticky profile, else its global
+    /// default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<String>,
+}
+
+/// The action a [`LaunchResolveResult`] tells the client to take.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LaunchDecisionKind {
+    /// The resolved profile already has a conversation in the folder — open it.
+    Resume,
+    /// The folder has no conversation for any known profile — prompt to
+    /// activate (create) one for the resolved profile.
+    Activate,
+    /// The folder holds conversation(s) for other profile(s) but not the
+    /// resolved one — offer switch-and-resume or start-fresh.
+    CrossProfile,
+    /// No profile exists on the machine — send the user to `octos-tui onboard`.
+    NoProfile,
+}
+
+/// Result for `launch/resolve`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LaunchResolveResult {
+    /// What the client should do next.
+    pub decision: LaunchDecisionKind,
+    /// The canonical (server-finalized) profile id to use — present for every
+    /// decision except [`LaunchDecisionKind::NoProfile`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_profile: Option<String>,
+    /// The other profiles that already have a conversation in the folder —
+    /// present (and non-empty) only for [`LaunchDecisionKind::CrossProfile`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub existing_profiles: Vec<String>,
 }
 
 /// Params for `session/snapshot` — combined bootstrap fetch.
@@ -3889,6 +4000,8 @@ pub enum UiCommand {
     // ---- Wave4-A: adaptive router controls ----
     RouterSetMode(RouterSetModeParams),
     RouterGetMetrics(RouterGetMetricsParams),
+    // ---- launch/resolve: pre-session launch probe ----
+    LaunchResolve(LaunchResolveParams),
 }
 
 impl UiCommand {
@@ -3935,6 +4048,7 @@ impl UiCommand {
             Self::CronToggle(_) => methods::CRON_TOGGLE,
             Self::RouterSetMode(_) => methods::ROUTER_SET_MODE,
             Self::RouterGetMetrics(_) => methods::ROUTER_GET_METRICS,
+            Self::LaunchResolve(_) => methods::LAUNCH_RESOLVE,
         }
     }
 
@@ -3985,6 +4099,7 @@ impl UiCommand {
             Self::CronToggle(params) => serde_json::to_value(params),
             Self::RouterSetMode(params) => serde_json::to_value(params),
             Self::RouterGetMetrics(params) => serde_json::to_value(params),
+            Self::LaunchResolve(params) => serde_json::to_value(params),
         }?;
 
         Ok(RpcRequest::new(id, method, params))
@@ -4043,6 +4158,7 @@ impl UiCommand {
             methods::TURN_STATE_GET => Ok(Self::TurnStateGet(decode_params(method, params)?)),
             methods::SESSION_BTW => Ok(Self::SessionBtw(decode_params(method, params)?)),
             methods::SESSION_LIST => Ok(Self::SessionList(decode_optional_params(method, params)?)),
+            methods::LAUNCH_RESOLVE => Ok(Self::LaunchResolve(decode_params(method, params)?)),
             methods::SESSION_SNAPSHOT => Ok(Self::SessionSnapshot(decode_params(method, params)?)),
             methods::SESSION_MESSAGES_PAGE => {
                 Ok(Self::SessionMessagesPage(decode_params(method, params)?))
@@ -6876,6 +6992,57 @@ mod tests {
     }
 
     #[test]
+    fn profile_local_create_params_new_shape_requested_id_round_trips() {
+        // New shape: a meaningful requested_id, NO username/email/name.
+        let params = ProfileLocalCreateParams {
+            requested_id: Some("glm".into()),
+            name: String::new(),
+            username: String::new(),
+            email: String::new(),
+            make_default: None,
+        };
+        let wire = serde_json::to_value(&params).expect("serialize profile/local/create params");
+        assert_eq!(wire["requested_id"], json!("glm"));
+        let decoded: ProfileLocalCreateParams =
+            serde_json::from_value(wire).expect("round-trip decode");
+        assert_eq!(decoded, params);
+
+        // Raw new-shape JSON that omits username/email/name entirely still
+        // deserializes (the newly-optional fields default to empty).
+        let new_shape = json!({ "requested_id": "deepseek" });
+        let decoded_new: ProfileLocalCreateParams =
+            serde_json::from_value(new_shape).expect("new-shape decode without username/email");
+        assert_eq!(decoded_new.requested_id.as_deref(), Some("deepseek"));
+        assert!(decoded_new.name.is_empty());
+        assert!(decoded_new.username.is_empty());
+        assert!(decoded_new.email.is_empty());
+    }
+
+    #[test]
+    fn profile_local_create_params_legacy_shape_still_deserializes() {
+        // Old client shape: {name, username, email}, NO requested_id.
+        let legacy = json!({
+            "name": "Ada Lovelace",
+            "username": "ada",
+            "email": "ada@example.com"
+        });
+        let decoded: ProfileLocalCreateParams =
+            serde_json::from_value(legacy).expect("legacy profile/local/create params decode");
+        assert!(decoded.requested_id.is_none());
+        assert_eq!(decoded.name, "Ada Lovelace");
+        assert_eq!(decoded.username, "ada");
+        assert_eq!(decoded.email, "ada@example.com");
+
+        // A `None` requested_id serializes to exactly the legacy wire shape
+        // (the key is skipped), so an OLDER server sees the bytes unchanged.
+        let wire = serde_json::to_value(&decoded).expect("serialize legacy-shaped params");
+        assert!(wire.get("requested_id").is_none());
+        assert_eq!(wire["name"], json!("Ada Lovelace"));
+        assert_eq!(wire["username"], json!("ada"));
+        assert_eq!(wire["email"], json!("ada@example.com"));
+    }
+
+    #[test]
     fn session_opened_pane_snapshot_round_trips() {
         let session_id = SessionKey("local:demo".into());
         let opened = SessionOpened {
@@ -7251,6 +7418,7 @@ mod tests {
                 "cron/toggle",
                 "router/set_mode",
                 "router/get_metrics",
+                "launch/resolve",
             ]
         );
         assert_eq!(
@@ -7363,6 +7531,7 @@ mod tests {
                 "cron/toggle",
                 "router/set_mode",
                 "router/get_metrics",
+                "launch/resolve",
             ]
         );
         assert_eq!(UI_PROTOCOL_FIRST_SERVER_UNSUPPORTED_METHODS.len(), 0);
@@ -7442,7 +7611,8 @@ mod tests {
                     "cron/list",
                     "cron/toggle",
                     "router/set_mode",
-                    "router/get_metrics"
+                    "router/get_metrics",
+                    "launch/resolve"
                 ],
                 "supported_notifications": [
                     "session/open",
@@ -11184,6 +11354,50 @@ mod tests {
     }
 
     #[test]
+    fn launch_resolve_round_trips_through_rpc_envelope() {
+        let command = UiCommand::LaunchResolve(LaunchResolveParams {
+            cwd: "/tmp/project".into(),
+            profile_id: Some("glm".into()),
+        });
+        let rpc = command
+            .clone()
+            .into_rpc_request("req")
+            .expect("serialize command");
+        assert_eq!(rpc.method, methods::LAUNCH_RESOLVE);
+        let decoded = UiCommand::from_rpc_request(rpc).expect("decode command");
+        assert_eq!(decoded, command);
+    }
+
+    #[test]
+    fn launch_resolve_is_gated_on_session_workspace_cwd_v1() {
+        let none = UiProtocolCapabilities::for_negotiated_features(Vec::<String>::new());
+        assert!(
+            !none.supports_method(methods::LAUNCH_RESOLVE),
+            "launch/resolve must NOT be advertised without session.workspace_cwd.v1"
+        );
+        let with_feature = UiProtocolCapabilities::for_negotiated_features([
+            UI_PROTOCOL_FEATURE_SESSION_WORKSPACE_CWD_V1,
+        ]);
+        assert!(
+            with_feature.supports_method(methods::LAUNCH_RESOLVE),
+            "launch/resolve must be advertised once session.workspace_cwd.v1 is negotiated"
+        );
+    }
+
+    #[test]
+    fn launch_resolve_result_serializes_snake_case_decision() {
+        let result = LaunchResolveResult {
+            decision: LaunchDecisionKind::CrossProfile,
+            resolved_profile: Some("deepseek".into()),
+            existing_profiles: vec!["glm".into()],
+        };
+        let value = serde_json::to_value(&result).expect("serialize");
+        assert_eq!(value["decision"], "cross_profile");
+        let decoded: LaunchResolveResult = serde_json::from_value(value).expect("deserialize");
+        assert_eq!(decoded, result);
+    }
+
+    #[test]
     fn aux_rest_to_ws_v1_methods_are_capability_gated() {
         // The 12 new methods must gate on
         // `auxiliary.rest_to_ws.v1`. A connection that does not
@@ -11277,14 +11491,32 @@ mod tests {
     /// REST DTO to fail this test before it lands.
     #[test]
     fn aux_rest_to_ws_v1_request_dtos_match_json_goldens() {
-        // session/list — empty params
+        // session/list — default (no cwd) params still serialize to the
+        // historical empty object. The `cwd` field is
+        // `skip_serializing_if = "Option::is_none"`, so an additive optional
+        // field does NOT break the pinned wire shape: a no-cwd request is
+        // byte-identical to the legacy `{}`.
         assert_eq!(
             serde_json::to_value(SessionListParams::default()).expect("serialize"),
             serde_json::json!({}),
         );
+        // Old clients that send a bare `{}` still deserialize (→ cwd: None).
         let parsed: SessionListParams =
             serde_json::from_value(serde_json::json!({})).expect("decode");
         assert_eq!(parsed, SessionListParams::default());
+        assert_eq!(parsed.cwd, None);
+        // session/list — WITH the additive cwd (per-project storage). Pin the
+        // new wire shape so a rename/type-flip of the field fails here.
+        let with_cwd = SessionListParams {
+            cwd: Some("/home/me/proj".into()),
+        };
+        assert_eq!(
+            serde_json::to_value(&with_cwd).expect("serialize"),
+            serde_json::json!({ "cwd": "/home/me/proj" }),
+        );
+        let parsed_cwd: SessionListParams =
+            serde_json::from_value(serde_json::json!({ "cwd": "/home/me/proj" })).expect("decode");
+        assert_eq!(parsed_cwd, with_cwd);
 
         // session/snapshot
         let p = SessionSnapshotParams {

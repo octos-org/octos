@@ -12,6 +12,7 @@ pub const ENTRY: ProviderEntry = ProviderEntry {
     aliases: &["kimi"],
     default_model: Some("kimi-k2.5"),
     api_key_env: Some("MOONSHOT_API_KEY"),
+    key_env_aliases: &["KIMI_API_KEY"],
     default_base_url: Some("https://api.moonshot.ai/v1"),
     requires_api_key: true,
     requires_base_url: false,

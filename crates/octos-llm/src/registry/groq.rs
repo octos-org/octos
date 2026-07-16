@@ -12,6 +12,7 @@ pub const ENTRY: ProviderEntry = ProviderEntry {
     aliases: &[],
     default_model: Some("llama-3.3-70b-versatile"),
     api_key_env: Some("GROQ_API_KEY"),
+    key_env_aliases: &[],
     default_base_url: Some("https://api.groq.com/openai/v1"),
     requires_api_key: true,
     requires_base_url: false,

@@ -168,3 +168,6 @@ tsconfig.tsbuildinfo
 **/.crew/
 # Stray Astro scaffold guard (no Astro project in this repo)
 .astro/
+
+# Local audit artifacts (personal, not tracked)
+/audit/

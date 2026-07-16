@@ -23,6 +23,7 @@ pub const ENTRY: ProviderEntry = ProviderEntry {
     aliases: &["vertex-ai", "vertexai"],
     default_model: Some("gemini-2.5-flash"),
     api_key_env: Some("VERTEX_SA_JSON"),
+    key_env_aliases: &[],
     default_base_url: None,
     requires_api_key: true,
     requires_base_url: false,
