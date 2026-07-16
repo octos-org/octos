@@ -318,6 +318,61 @@ fn stdio_task_query_store(stdio: bool) -> Option<crate::session_actor::SessionTa
     stdio.then(crate::session_actor::SessionTaskQueryStore::default)
 }
 
+/// Stable, machine-greppable marker embedded in the "data directory is already
+/// owned by another serve" error. octos-tui (a separate repo) spawns
+/// `octos serve --stdio` as a child and greps its stderr for this exact token
+/// on child-exit to recognize the single-writer conflict and STOP relaunching —
+/// instead of the silent ~5s crash-loop it used to hit when the second serve
+/// died mid-startup opening `admin_audit.redb`. MUST stay byte-stable: the
+/// client matches it verbatim (octos-tui `transport.rs` DATA_DIR_LOCKED_MARKER).
+pub(crate) const DATA_DIR_LOCKED_MARKER: &str = "OCTOS_DATA_DIR_LOCKED";
+
+/// Held for the serve process's whole lifetime: an exclusive OS advisory lock
+/// (flock / LockFileEx via `fs2`) on `<data_dir>/.octos-serve.lock`. redb is
+/// single-writer-single-process, so two `octos serve` against one data dir can
+/// never coexist — the second used to crash mid-startup opening the first
+/// data-dir-level redb store (`admin_audit.redb`) with `DatabaseAlreadyOpen`,
+/// which a stdio client silently respawned in a loop. Taking this lock BEFORE
+/// any store open turns that into one clean, greppable refusal. The lock is
+/// released on process exit (fd close), so a legitimate relaunch AFTER the
+/// previous serve has exited acquires it cleanly (no stale-lock hazard).
+struct ServeDataDirLock {
+    _file: std::fs::File,
+}
+
+/// Acquire the serve single-writer lock for `data_dir`, or return a clear error
+/// carrying [`DATA_DIR_LOCKED_MARKER`] when another serve already holds it.
+/// Contention is detected structurally via the platform's canonical
+/// lock-contended errno (`fs2::lock_contended_error`), never string matching.
+/// Fully-qualified `fs2::FileExt` calls: std 1.89 grew inherent methods of the
+/// same names and the workspace MSRV is 1.85.
+fn acquire_serve_data_dir_lock(data_dir: &std::path::Path) -> Result<ServeDataDirLock> {
+    std::fs::create_dir_all(data_dir)
+        .wrap_err_with(|| format!("failed to create data dir: {}", data_dir.display()))?;
+    let lock_path = data_dir.join(".octos-serve.lock");
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(&lock_path)
+        .wrap_err_with(|| format!("failed to open serve lockfile: {}", lock_path.display()))?;
+    match fs2::FileExt::try_lock_exclusive(&file) {
+        Ok(()) => Ok(ServeDataDirLock { _file: file }),
+        Err(error) if error.raw_os_error() == fs2::lock_contended_error().raw_os_error() => {
+            Err(eyre::eyre!(
+                "{DATA_DIR_LOCKED_MARKER}: another octos server is already running for this data \
+                 directory ({}). Close the other octos-tui (or `octos serve`), or start this one \
+                 against a different --data-dir.",
+                data_dir.display()
+            ))
+        }
+        Err(error) => Err(eyre::Report::new(error).wrap_err(format!(
+            "failed to acquire serve single-writer lock: {}",
+            lock_path.display()
+        ))),
+    }
+}
+
 impl Executable for ServeCommand {
     fn execute(self) -> Result<()> {
         tokio::runtime::Builder::new_multi_thread()
@@ -347,6 +402,30 @@ impl ServeCommand {
             Config::load_with_context_path(&cwd, &ctx)?
         };
         tracing::info!(data_dir = %data_dir.display(), "data directory resolved");
+
+        // Single-writer guard: redb is single-process, so a second `octos serve`
+        // on this data dir can't coexist. Fail FAST here with one clean,
+        // client-greppable refusal instead of crashing mid-startup opening
+        // `admin_audit.redb` (which a stdio client silently respawned in a
+        // ~5s loop). Held for the whole process via `_data_dir_lock`; released
+        // on exit so a relaunch after the prior serve quits still starts.
+        let _data_dir_lock = match acquire_serve_data_dir_lock(&data_dir) {
+            Ok(guard) => guard,
+            Err(error) => {
+                if error.to_string().contains(DATA_DIR_LOCKED_MARKER) {
+                    // A guaranteed clean, un-colored stderr line the octos-tui
+                    // client greps on child-exit (color-eyre's rendering of the
+                    // returned error may interleave ANSI, so don't rely on it).
+                    eprintln!(
+                        "{DATA_DIR_LOCKED_MARKER}: another octos server already owns data \
+                         directory {}",
+                        data_dir.display()
+                    );
+                }
+                return Err(error);
+            }
+        };
+
         if let Err(error) = crate::api::agent_orchestrator::default_agent_orchestrator()
             .configure_supervisor_store(data_dir.join("supervisor"))
         {
@@ -1283,6 +1362,36 @@ mod tests {
             stdio_task_query_store(false).is_none(),
             "gateway/http serve must leave task_query_store None"
         );
+    }
+
+    /// Two `octos serve` against one data dir can't coexist (redb is
+    /// single-process). The second must be refused FAST with a stable,
+    /// client-greppable marker — not crash mid-startup opening `admin_audit.redb`
+    /// (which a stdio client respawned in a silent ~5s loop). Releasing the first
+    /// (process exit) must free the lock so a legitimate relaunch still starts.
+    #[test]
+    fn second_serve_on_same_data_dir_is_refused_with_a_greppable_marker() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let first = acquire_serve_data_dir_lock(dir.path()).expect("first serve acquires the lock");
+
+        let err = acquire_serve_data_dir_lock(dir.path())
+            .err()
+            .expect("a second serve must be refused while the first holds the lock");
+        assert!(
+            err.to_string().contains(DATA_DIR_LOCKED_MARKER),
+            "refusal must carry the stable client-greppable marker; got: {err}"
+        );
+        assert!(
+            err.to_string().contains(&dir.path().display().to_string()),
+            "refusal must name the contended data dir; got: {err}"
+        );
+
+        // Prior serve exits → lock released → a fresh relaunch acquires it. This
+        // pins that the guard never false-positives a normal client relaunch.
+        drop(first);
+        let _relaunch = acquire_serve_data_dir_lock(dir.path())
+            .expect("after the holder exits, a fresh serve acquires the lock");
     }
 
     fn dashboard_smtp_test_env_lock() -> &'static std::sync::Mutex<()> {
