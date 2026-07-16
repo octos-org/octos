@@ -260,6 +260,16 @@ pub struct BackgroundTask {
     pub completed_at: Option<DateTime<Utc>>,
     pub output_files: Vec<String>,
     pub error: Option<String>,
+    /// True when the current `Failed` status came from an OBSERVER — the
+    /// harness-event bridge (`apply_harness_event`) classifying a mid-run
+    /// error as fatal — rather than from the task's owner (the spawn join /
+    /// completer that actually watches the worker finish). Observer verdicts
+    /// are provisional: the owner's `mark_completed` may override them (the
+    /// worker demonstrably survived), while owner-reported failures and
+    /// `Cancelled` stay final. `#[serde(default)]` so pre-existing persisted
+    /// snapshots deserialize unchanged.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub failed_by_observer: bool,
     /// Session that owns this task (for per-session filtering).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_key: Option<String>,
@@ -2112,6 +2122,7 @@ impl TaskSupervisor {
             completed_at: None,
             output_files: Vec::new(),
             error: None,
+            failed_by_observer: false,
             session_key: session_key.map(|s| s.to_string()),
             tool_input,
             originating_client_message_id,
@@ -2343,25 +2354,56 @@ impl TaskSupervisor {
     /// Mark a task as completed with output files.
     ///
     /// **M8 DoD gate (Req #4)**: this is a no-op when the task is already in a
-    /// terminal state (`Completed`/`Failed`/`Cancelled`). The check + write
-    /// happen under the same lock as the rest of the supervisor so the guard
-    /// is a CAS-style atomic transition. A late-arriving worker that finishes
-    /// after the user has cancelled the task therefore *cannot* resurrect it
-    /// to `Completed`. The race is logged at `warn` so operators can observe
-    /// it.
+    /// terminal state (`Completed`/`Cancelled`/owner-reported `Failed`). The
+    /// check + write happen under the same lock as the rest of the supervisor
+    /// so the guard is a CAS-style atomic transition. A late-arriving worker
+    /// that finishes after the user has cancelled the task therefore *cannot*
+    /// resurrect it to `Completed`. The race is logged at `warn` so operators
+    /// can observe it.
+    ///
+    /// One exception: an OBSERVER-derived `Failed`
+    /// ([`Self::mark_failed_observed`], set by the harness-event bridge for a
+    /// mid-run fail-fast classification) IS overridden — the caller here is
+    /// the owner that watched the worker actually finish, so its completion
+    /// corrects the premature verdict.
     pub fn mark_completed(&self, task_id: &str, output_files: Vec<String>) {
         let snapshot = {
             let mut tasks = self.tasks.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(task) = tasks.get_mut(task_id) {
                 if task.status.is_terminal() {
-                    tracing::warn!(
+                    // An OBSERVER-derived `Failed` (harness-event bridge
+                    // classified a mid-run error as fatal while the worker
+                    // loop kept running) is provisional, not authoritative —
+                    // the caller of mark_completed IS the owner watching the
+                    // worker actually finish, so its verdict corrects the
+                    // premature failure (mini4 `review-octos-web-v3`: chip
+                    // stuck "failed: unknown tool: write_file" although the
+                    // worker completed). `Cancelled`, `Completed`, and
+                    // owner-reported `Failed` remain final: a late worker
+                    // cannot resurrect a cancelled task.
+                    let observer_failed =
+                        task.status == TaskStatus::Failed && task.failed_by_observer;
+                    if !observer_failed {
+                        tracing::warn!(
+                            task_id = %task_id,
+                            current_status = task.status.as_str(),
+                            current_runtime_state = ?task.runtime_state,
+                            attempted_status = TaskStatus::Completed.as_str(),
+                            "ignoring late mark_completed: task already in terminal state",
+                        );
+                        return;
+                    }
+                    tracing::info!(
                         task_id = %task_id,
-                        current_status = task.status.as_str(),
-                        current_runtime_state = ?task.runtime_state,
-                        attempted_status = TaskStatus::Completed.as_str(),
-                        "ignoring late mark_completed: task already in terminal state",
+                        observed_error = task.error.as_deref().unwrap_or_default(),
+                        "owner completion overrides observer-derived failure",
                     );
-                    return;
+                    task.failed_by_observer = false;
+                    task.error = None;
+                    // The failure stamped its message as the summary; drop it
+                    // so the completion summary below reflects the real
+                    // outcome instead of the transient error.
+                    task.summary = None;
                 }
                 task.status = TaskStatus::Completed;
                 task.runtime_state = TaskRuntimeState::Completed;
@@ -2424,6 +2466,21 @@ impl TaskSupervisor {
     /// an already-`Failed` task is still allowed (idempotent) so existing
     /// `was_already_failed` semantics are preserved.
     pub fn mark_failed(&self, task_id: &str, error: String) {
+        self.mark_failed_inner(task_id, error, false)
+    }
+
+    /// [`Self::mark_failed`] for OBSERVERS — reporters that classified a
+    /// mid-run signal as fatal without watching the worker actually stop
+    /// (today: the harness-event bridge in [`Self::apply_harness_event`]).
+    /// The failure is recorded and propagated exactly like an owner failure,
+    /// but stamped `failed_by_observer` so the owner's later
+    /// [`Self::mark_completed`] may override it when the worker demonstrably
+    /// survived and finished (mini4 `review-octos-web-v3` regression).
+    pub fn mark_failed_observed(&self, task_id: &str, error: String) {
+        self.mark_failed_inner(task_id, error, true)
+    }
+
+    fn mark_failed_inner(&self, task_id: &str, error: String, observed: bool) {
         let (snapshot, was_already_failed) = {
             let mut tasks = self.tasks.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(task) = tasks.get_mut(task_id) {
@@ -2440,6 +2497,17 @@ impl TaskSupervisor {
                 let already_failed = task.status == TaskStatus::Failed;
                 task.status = TaskStatus::Failed;
                 task.runtime_state = TaskRuntimeState::Failed;
+                // Owner verdicts are authoritative: an owner (re-)mark
+                // clears the provisional stamp so a stray late completion
+                // can no longer flip the task. An observer's FIRST failure
+                // stamps it provisional; an observer re-mark of an
+                // already-failed task keeps the existing stamp (it must not
+                // soften an owner-reported failure).
+                if !observed {
+                    task.failed_by_observer = false;
+                } else if !already_failed {
+                    task.failed_by_observer = true;
+                }
                 task.updated_at = Utc::now();
                 task.completed_at = Some(Utc::now());
                 if task.summary.is_none() {
@@ -2901,8 +2969,22 @@ impl TaskSupervisor {
                     TaskRuntimeState::ExecutingTool,
                     Some(runtime_detail.to_string()),
                 );
-                if matches!(data.recovery.as_str(), "fail_fast" | "bug") {
-                    self.mark_failed(task_id, data.message.clone());
+                // Tool-scoped errors (a tool CALL errored — `tool_execution`,
+                // `plugin_*`) are loop-recoverable by design: the agent loop
+                // feeds the error back to the model and KEEPS RUNNING, so
+                // their `fail_fast` hint scopes to the call, not the task.
+                // Failing the task here painted healthy workers as dead
+                // (mini4 `unknown tool: write_file` — chip went red while the
+                // worker went on to complete successfully). The owner join
+                // path reports the true terminal state; the detail above
+                // keeps the error visible to operators.
+                let tool_scoped =
+                    crate::harness_errors::HarnessError::variant_is_tool_scoped(&data.variant);
+                if !tool_scoped && matches!(data.recovery.as_str(), "fail_fast" | "bug") {
+                    // This is an OBSERVER verdict — the loop may still
+                    // survive (retry lanes, non-streaming fallback), so mark
+                    // it overridable by the owner's completion.
+                    self.mark_failed_observed(task_id, data.message.clone());
                 }
             }
         }
@@ -5337,6 +5419,113 @@ mod tests {
             1,
             "expected exactly one 'completed' progress emission, got: {tool_progress:?}"
         );
+    }
+
+    /// mini4 RC2/RC3 regression (`review-octos-web-v3`): a worker's failed
+    /// TOOL CALL (`unknown tool: write_file`, classified
+    /// `tool_execution`/`fail_fast`) reaches the supervisor via the
+    /// harness-event sink. The agent loop treats that error as feedback and
+    /// KEEPS RUNNING — so the supervisor must not declare the task dead.
+    /// Pre-fix, the Error arm called `mark_failed`, the chip went red, and
+    /// the worker's real completion 10 minutes later was refused by the
+    /// terminal-state guard ("ignoring late mark_completed").
+    #[test]
+    fn tool_scoped_error_event_keeps_task_alive_and_completion_lands() {
+        let supervisor = TaskSupervisor::new();
+        let id = supervisor.register("spawn", "call-web-v3", Some("api:session"));
+        supervisor.mark_running(&id);
+
+        let event = crate::harness_errors::HarnessError::ToolExecution {
+            tool_name: "write_file".to_string(),
+            message: "unknown tool: write_file".to_string(),
+        }
+        .to_event("api:session", id.clone(), None, None);
+        supervisor.apply_harness_event(&id, &event).unwrap();
+
+        let task = supervisor.get_task(&id).expect("task missing");
+        assert_eq!(
+            task.status,
+            TaskStatus::Running,
+            "a tool-call error is loop-recoverable; it must not kill the task"
+        );
+        // The error is still surfaced to operators via runtime detail.
+        let detail = task.runtime_detail.as_deref().unwrap_or_default();
+        assert!(
+            detail.contains("unknown tool: write_file"),
+            "tool error must remain visible in runtime_detail: {detail:?}"
+        );
+
+        // The owner (spawn join) reports the true outcome.
+        supervisor.mark_completed(&id, vec!["review.md".to_string()]);
+        let task = supervisor.get_task(&id).expect("task missing");
+        assert_eq!(
+            task.status,
+            TaskStatus::Completed,
+            "the worker finished successfully; the chip must say so"
+        );
+        assert_eq!(task.output_files, vec!["review.md".to_string()]);
+    }
+
+    /// Defense in depth for the same class: a NON-tool-scoped fail-fast error
+    /// (e.g. `invalid_request`) observed mid-run still marks the task failed
+    /// eagerly — but that verdict is OBSERVER-derived, not the owner's. If
+    /// the loop survives (retry / non-streaming fallback) and the owner join
+    /// later reports success, the completion must override the premature
+    /// failure instead of being dropped by the terminal guard.
+    #[test]
+    fn owner_completion_overrides_observer_derived_failure() {
+        let supervisor = TaskSupervisor::new();
+        let id = supervisor.register("spawn", "call-observer", Some("api:session"));
+        supervisor.mark_running(&id);
+
+        let event = crate::harness_errors::HarnessError::InvalidRequest {
+            detail: "http_400".to_string(),
+            message: "The supported API model names are ...".to_string(),
+        }
+        .to_event("api:session", id.clone(), None, None);
+        supervisor.apply_harness_event(&id, &event).unwrap();
+
+        let task = supervisor.get_task(&id).expect("task missing");
+        assert_eq!(
+            task.status,
+            TaskStatus::Failed,
+            "non-tool-scoped fail_fast errors still fail the task eagerly"
+        );
+
+        supervisor.mark_completed(&id, vec!["out.txt".to_string()]);
+        let task = supervisor.get_task(&id).expect("task missing");
+        assert_eq!(
+            task.status,
+            TaskStatus::Completed,
+            "the owner's completion is authoritative over an observer-derived failure"
+        );
+        assert_eq!(task.output_files, vec!["out.txt".to_string()]);
+        assert!(
+            task.error.is_none(),
+            "the premature failure's error must be cleared on override: {:?}",
+            task.error
+        );
+    }
+
+    /// The owner's own failure verdict stays final: `mark_failed` from the
+    /// spawn join path (worker really died) is NOT overridable by a stray
+    /// late completion — only OBSERVER-derived failures are.
+    #[test]
+    fn owner_reported_failure_still_blocks_late_completion() {
+        let supervisor = TaskSupervisor::new();
+        let id = supervisor.register("spawn", "call-owner-fail", Some("api:session"));
+        supervisor.mark_running(&id);
+
+        supervisor.mark_failed(&id, "did not complete within 50 iterations".to_string());
+        supervisor.mark_completed(&id, vec!["late.bin".to_string()]);
+
+        let task = supervisor.get_task(&id).expect("task missing");
+        assert_eq!(
+            task.status,
+            TaskStatus::Failed,
+            "an owner-reported failure must not be resurrected by a late completion"
+        );
+        assert!(task.output_files.is_empty());
     }
 
     /// Race regression: a worker that calls `mark_running` AFTER the user has

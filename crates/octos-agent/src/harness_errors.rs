@@ -215,6 +215,26 @@ impl HarnessError {
         }
     }
 
+    /// True for variants raised INSIDE a tool-call batch (`tool_execution`,
+    /// `plugin_*`). The agent loop converts these into a tool-result message
+    /// and CONTINUES the task (see `execution.rs`: the error is fed back to
+    /// the model as feedback), so their `fail_fast` recovery hint scopes to
+    /// the individual tool CALL — "don't retry this call" — not to the task.
+    /// Observers bridging harness events into task lifecycle (the sink →
+    /// `TaskSupervisor::apply_harness_event` path) must NOT treat these as
+    /// task-terminal; the owner join path reports the true terminal state.
+    ///
+    /// Takes the serialized `variant` string (from
+    /// [`HarnessErrorEvent::variant`](crate::harness_events::HarnessErrorEvent))
+    /// so consumers of persisted/wire events can classify without
+    /// reconstructing a `HarnessError`.
+    pub fn variant_is_tool_scoped(variant: &str) -> bool {
+        matches!(
+            variant,
+            "tool_execution" | "plugin_spawn" | "plugin_timeout" | "plugin_protocol"
+        )
+    }
+
     /// Primary recovery hint for this variant. Each variant maps to exactly
     /// one hint — this is an invariant, not a heuristic.
     pub fn recovery_hint(&self) -> RecoveryHint {
