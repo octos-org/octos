@@ -43872,6 +43872,7 @@ ignore = []
             completed_at: Some(now),
             output_files: vec![],
             error: error.map(str::to_owned),
+            failed_by_observer: false,
             session_key: Some(session.to_string()),
             tool_input: Some(serde_json::json!({"topic": "rust"})),
             originating_client_message_id: Some("cmid-unified".into()),
