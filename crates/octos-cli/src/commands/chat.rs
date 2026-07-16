@@ -130,6 +130,25 @@ pub struct ChatCommand {
     /// boundary instead of prompting.
     #[arg(long, value_enum)]
     pub ask_for_approval: Option<ChatApprovalMode>,
+
+    /// Reasoning effort for thinking models: `low`, `medium`, `high`, or
+    /// `max` (claude/codex parity). Overrides the config
+    /// `gateway.reasoning_effort`; non-thinking models ignore it, and
+    /// providers without a distinct `max` tier clamp it to `high`.
+    #[arg(long, value_enum)]
+    pub effort: Option<ChatEffort>,
+
+    /// Do NOT persist this run as an episode (ephemeral). Mirrors
+    /// `claude --no-session-persistence`: by default a completed turn is
+    /// saved to the episode store for future recall; this skips that write.
+    #[arg(long)]
+    pub no_session_persistence: bool,
+
+    /// One-shot PROMPT (positional): `octos chat "…"` runs a single turn and
+    /// exits, matching `claude -p "…"`. Sugar for `--message`; supplying the
+    /// prompt both positionally and via `--message` is an error.
+    #[arg(value_name = "PROMPT")]
+    pub prompt: Option<String>,
 }
 
 /// `--sandbox` choices, mirroring codex's sandbox modes and octos's
@@ -157,6 +176,48 @@ pub enum ChatApprovalMode {
     Ask,
     /// Never prompt; risky commands fail closed at the tool boundary.
     Never,
+}
+
+/// `--effort` choices, mirroring claude/codex reasoning-effort tiers. Maps
+/// 1:1 to [`octos_llm::ReasoningEffort`]. For these single-word variants
+/// clap's default `ValueEnum` naming and serde's `kebab-case` agree
+/// (`low`/`medium`/`high`/`max`), so a `config.cli.chat.effort` round-trips
+/// losslessly — matching [`ChatSandboxMode`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ChatEffort {
+    Low,
+    Medium,
+    High,
+    Max,
+}
+
+impl From<ChatEffort> for octos_llm::ReasoningEffort {
+    fn from(effort: ChatEffort) -> Self {
+        match effort {
+            ChatEffort::Low => octos_llm::ReasoningEffort::Low,
+            ChatEffort::Medium => octos_llm::ReasoningEffort::Medium,
+            ChatEffort::High => octos_llm::ReasoningEffort::High,
+            ChatEffort::Max => octos_llm::ReasoningEffort::Max,
+        }
+    }
+}
+
+/// `claude -p "…"` parity: fold a positional PROMPT into `--message`. The two
+/// are two spellings of the same one-shot prompt, so supplying both is
+/// contradictory — fail closed. Returns the single effective one-shot message,
+/// or `None` for interactive mode (neither given).
+fn reconcile_one_shot_prompt(
+    message: Option<String>,
+    prompt: Option<String>,
+) -> Result<Option<String>> {
+    match (message, prompt) {
+        (Some(_), Some(_)) => Err(eyre!(
+            "provide the prompt positionally OR via --message/-m, not both"
+        )),
+        (Some(message), None) => Ok(Some(message)),
+        (None, prompt) => Ok(prompt),
+    }
 }
 
 /// Resolve the chat session's [`EffectivePermissions`] from the CLI flags.
@@ -643,7 +704,12 @@ impl Executable for ChatCommand {
 }
 
 impl ChatCommand {
-    async fn run_async(self) -> Result<()> {
+    async fn run_async(mut self) -> Result<()> {
+        // `claude -p "…"` parity: fold a positional PROMPT into `--message` up
+        // front so every downstream `self.message` check (the `--json` guard
+        // just below and the one-shot dispatch) sees a single source of truth.
+        self.message = reconcile_one_shot_prompt(self.message.take(), self.prompt.take())?;
+
         // `--json` is a one-shot, machine-readable mode: exactly one JSON
         // object on stdout, and it requires `--message`. An interactive REPL
         // cannot keep stdout pure (the readline prompt and per-turn framing
@@ -1047,9 +1113,14 @@ impl ChatCommand {
         };
         let agent_config = AgentConfig {
             max_iterations: self.max_iterations,
-            save_episodes: true,
+            // `--no-session-persistence` (claude parity): skip the episode write.
+            save_episodes: !self.no_session_persistence,
             chat_max_tokens: config.gateway.as_ref().and_then(|g| g.max_output_tokens),
-            reasoning_effort: config.gateway.as_ref().and_then(|g| g.reasoning_effort),
+            // `--effort` (claude/codex parity) overrides `gateway.reasoning_effort`.
+            reasoning_effort: self
+                .effort
+                .map(octos_llm::ReasoningEffort::from)
+                .or_else(|| config.gateway.as_ref().and_then(|g| g.reasoning_effort)),
             ..Default::default()
         };
         // M8.2: load sub-agent manifests from `<cwd>/agents/` layered on
@@ -1763,6 +1834,86 @@ mod tests {
         assert!(!bare.dangerously_bypass_approvals_and_sandbox);
         assert_eq!(bare.sandbox, None);
         assert_eq!(bare.ask_for_approval, None);
+    }
+
+    #[test]
+    fn should_map_chat_effort_to_reasoning_effort() {
+        use octos_llm::ReasoningEffort;
+        assert_eq!(ReasoningEffort::from(ChatEffort::Low), ReasoningEffort::Low);
+        assert_eq!(
+            ReasoningEffort::from(ChatEffort::Medium),
+            ReasoningEffort::Medium
+        );
+        assert_eq!(
+            ReasoningEffort::from(ChatEffort::High),
+            ReasoningEffort::High
+        );
+        assert_eq!(ReasoningEffort::from(ChatEffort::Max), ReasoningEffort::Max);
+    }
+
+    #[test]
+    fn should_reconcile_positional_prompt_with_message() {
+        // Positional-only → used as the one-shot message.
+        assert_eq!(
+            reconcile_one_shot_prompt(None, Some("hi".into())).unwrap(),
+            Some("hi".to_string())
+        );
+        // --message-only → passthrough.
+        assert_eq!(
+            reconcile_one_shot_prompt(Some("hi".into()), None).unwrap(),
+            Some("hi".to_string())
+        );
+        // Neither → interactive (None).
+        assert_eq!(reconcile_one_shot_prompt(None, None).unwrap(), None);
+        // Both → contradictory, fail closed.
+        let err = reconcile_one_shot_prompt(Some("a".into()), Some("b".into()))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not both"), "{err}");
+    }
+
+    #[test]
+    fn should_parse_effort_no_persistence_and_positional_prompt_via_clap() {
+        // `claude -p` parity: --effort, --no-session-persistence, and a bare
+        // positional PROMPT all parse into the expected fields.
+        use clap::Parser;
+
+        #[derive(Parser)]
+        struct Wrap {
+            #[command(flatten)]
+            chat: ChatCommand,
+        }
+
+        let full = Wrap::parse_from([
+            "prog",
+            "--effort",
+            "max",
+            "--no-session-persistence",
+            "Review the diff",
+        ])
+        .chat;
+        assert_eq!(full.effort, Some(ChatEffort::Max));
+        assert!(full.no_session_persistence);
+        // The positional prompt lands in `prompt`, distinct from `--message`.
+        assert_eq!(full.prompt.as_deref(), Some("Review the diff"));
+        assert_eq!(full.message, None);
+
+        // Every effort tier parses (clap's default kebab/lower naming).
+        for (arg, want) in [
+            ("low", ChatEffort::Low),
+            ("medium", ChatEffort::Medium),
+            ("high", ChatEffort::High),
+            ("max", ChatEffort::Max),
+        ] {
+            let c = Wrap::parse_from(["prog", "--effort", arg]).chat;
+            assert_eq!(c.effort, Some(want));
+        }
+
+        // Defaults: no effort, persistence ON, no positional prompt.
+        let bare = Wrap::parse_from(["prog"]).chat;
+        assert_eq!(bare.effort, None);
+        assert!(!bare.no_session_persistence);
+        assert_eq!(bare.prompt, None);
     }
 
     #[test]
