@@ -808,8 +808,7 @@ pub async fn run_stream_forwarder(
                     }
                 });
                 if let Some(uid) = sender_user_id.as_deref() {
-                    metadata[METADATA_SENDER_USER_ID] =
-                        serde_json::Value::String(uid.to_string());
+                    metadata[METADATA_SENDER_USER_ID] = serde_json::Value::String(uid.to_string());
                 }
                 let msg = OutboundMessage {
                     channel: channel.name().to_string(),
@@ -1431,9 +1430,7 @@ mod tests {
             !cards.contains_key("tool_call"),
             "must not emit per-tool tool_call cards"
         );
-        let tools = cards
-            .get("tool_activity")
-            .expect("tool_activity card")["tools"]
+        let tools = cards.get("tool_activity").expect("tool_activity card")["tools"]
             .as_array()
             .expect("tools array")
             .clone();
