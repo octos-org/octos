@@ -596,6 +596,19 @@
       "max_output": 98304
     },
     {
+      "provider": "moonshot/kimi-k3",
+      "type": "strong",
+      "stability": 1.0,
+      "tool_avg_ms": 0,
+      "p95_ms": 0,
+      "score": 0.0,
+      "ds_output": 0,
+      "cost_in": 3.0,
+      "cost_out": 15.0,
+      "context_window": 1048576,
+      "max_output": 131072
+    },
+    {
       "provider": "nvidia/deepseek-ai/deepseek-v3.2",
       "type": "fast",
       "cost_in": 0.0,

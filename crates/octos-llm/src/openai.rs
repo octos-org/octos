@@ -78,8 +78,13 @@ impl ModelHints {
         let uses_completion_tokens =
             is_o_series || m.starts_with("gpt-5") || m.starts_with("gpt-4.1");
 
-        let fixed_temperature =
-            is_o_series || m.starts_with("gpt-5") || m.contains("kimi-k2") || m == "gpt-4.1-nano";
+        // kimi-k3 pins its sampling params server-side (temperature=1.0,
+        // top_p=0.95, …) and rejects overrides, so never send temperature.
+        let fixed_temperature = is_o_series
+            || m.starts_with("gpt-5")
+            || m.contains("kimi-k2")
+            || m.contains("kimi-k3")
+            || m == "gpt-4.1-nano";
 
         // Vision capability is NO LONGER inferred from the model name. The old
         // allow/deny list wrongly stripped images from vision-capable models —
@@ -102,7 +107,10 @@ impl ModelHints {
         // Reasoning-control style on the chat/completions path. DeepSeek V4
         // (incl. `deepseek-reasoner`, a V4-Flash thinking alias) wants
         // `reasoning_effort` + a `thinking` toggle; OpenAI reasoning models and
-        // grok-4.x take a plain `reasoning_effort`. Everything else emits nothing.
+        // grok-4.x take a plain `reasoning_effort`; Kimi K3 takes a top-level
+        // `reasoning_effort` whose only accepted value is `"max"` (thinking is
+        // always on and K3 rejects the K2.x `thinking` object). Everything else
+        // emits nothing.
         // Effort/thinking is only EMITTED when an operator sets `reasoning_effort`
         // (opt-in), and the style is config-overridable per route — important
         // because the same `deepseek-v4` name fronts endpoints that differ
@@ -111,6 +119,8 @@ impl ModelHints {
         // families can reject `reasoning_effort`.
         let reasoning_style = if m.contains("deepseek-v4") || m.contains("deepseek-reasoner") {
             ReasoningStyle::EffortAndThinkingToggle
+        } else if m.contains("kimi-k3") {
+            ReasoningStyle::EffortMaxOnly
         } else if m.starts_with("grok-4") || is_o_series || m.starts_with("gpt-5") {
             ReasoningStyle::Effort
         } else {
@@ -143,6 +153,12 @@ pub enum ReasoningStyle {
     Effort,
     /// `reasoning_effort` plus `thinking: {"type": "enabled"}` — DeepSeek V4.
     EffortAndThinkingToggle,
+    /// Top-level `reasoning_effort` whose only accepted value is `"max"` —
+    /// Kimi K3, where thinking is always on and per K3's docs the K2.x
+    /// `thinking` object must NOT be sent. Every configured effort level maps
+    /// to `"max"`; when no effort is configured nothing is emitted (the model
+    /// still thinks — that is its server-side default).
+    EffortMaxOnly,
 }
 
 /// OpenAI GPT provider.
@@ -336,19 +352,24 @@ impl OpenAIProvider {
                 // pure context bloat (and grows unboundedly across a tool loop) —
                 // OpenAI's own API and codex both drop it.
                 //
-                // kimi-k2 is the exception. With thinking enabled it (a) returns 400
-                // "reasoning_content is missing in assistant tool call message" if the
-                // field is absent, AND (b) per kimi's docs preserves historical
-                // assistant reasoning for multi-step tool-use continuity. So for
-                // kimi-k2 we keep the REAL reasoning when present, and fall back to a
-                // minimal "." stub only to satisfy the presence check when it's absent.
+                // kimi-k2/k3 are the exception. With thinking enabled kimi-k2 (a)
+                // returns 400 "reasoning_content is missing in assistant tool call
+                // message" if the field is absent, AND (b) per kimi's docs preserves
+                // historical assistant reasoning for multi-step tool-use continuity
+                // (K3's quickstart likewise mandates "add the complete assistant
+                // message returned by the API to the next request. Do not keep only
+                // `content`"). So for kimi-k2/k3 we keep the REAL reasoning when
+                // present, and fall back to a minimal "." stub only to satisfy the
+                // presence check when it's absent.
                 //
-                // kimi-k2 is detected via fixed_temperature + model name containing
-                // "kimi-k2". Other models (e.g. deepseek-v4, verified live to return
-                // 200 without the field, and non-official nvidia/vllm endpoints that
-                // don't expect it) get no reasoning_content at all.
-                let needs_reasoning_stub =
-                    self.hints.fixed_temperature && self.model.to_lowercase().contains("kimi-k2");
+                // kimi-k2/k3 are detected via fixed_temperature + model name
+                // containing "kimi-k2"/"kimi-k3". Other models (e.g. deepseek-v4,
+                // verified live to return 200 without the field, and non-official
+                // nvidia/vllm endpoints that don't expect it) get no
+                // reasoning_content at all.
+                let model_lower = self.model.to_lowercase();
+                let needs_reasoning_stub = self.hints.fixed_temperature
+                    && (model_lower.contains("kimi-k2") || model_lower.contains("kimi-k3"));
                 let reasoning = if role == "assistant" && needs_reasoning_stub {
                     match m.reasoning_content.as_deref() {
                         Some(r) if !r.is_empty() => Some(r),
@@ -430,6 +451,9 @@ impl OpenAIProvider {
                 (Some(effort), style) if style != ReasoningStyle::None => {
                     use crate::config::ReasoningEffort as RE;
                     let effort_str = match (effort, style) {
+                        // Kimi K3 accepts exactly one value ("max"): thinking
+                        // is always on, so every configured level clamps to it.
+                        (_, ReasoningStyle::EffortMaxOnly) => "max",
                         (RE::Low, _) => "low",
                         (RE::Medium, _) => "medium",
                         (RE::High, _) => "high",
@@ -1291,6 +1315,15 @@ mod tests {
             ModelHints::detect("gpt-5.3-codex").reasoning_style,
             ReasoningStyle::Effort
         );
+        // Kimi K3 (incl. provider-prefixed) -> max-only reasoning_effort.
+        assert_eq!(
+            ModelHints::detect("kimi-k3").reasoning_style,
+            ReasoningStyle::EffortMaxOnly
+        );
+        assert_eq!(
+            ModelHints::detect("moonshotai/kimi-k3").reasoning_style,
+            ReasoningStyle::EffortMaxOnly
+        );
         // Non-thinking / unknown-control models emit nothing. grok-3 is
         // excluded (only grok-4.x is known to accept reasoning_effort).
         for m in [
@@ -1498,6 +1531,103 @@ mod tests {
             a2.get("reasoning_content").and_then(|r| r.as_str()),
             Some("."),
             "kimi-k2 must get the \".\" stub when reasoning_content is absent"
+        );
+    }
+
+    #[test]
+    fn kimi_k3_hints_survive_official_endpoint_and_pin_temperature() {
+        // K3 pins sampling params server-side -> never send temperature.
+        assert!(ModelHints::detect("kimi-k3").fixed_temperature);
+        // Unlike the DeepSeek-specific thinking toggle, K3's max-only
+        // reasoning_effort is a plain top-level field, so with_base_url must
+        // not downgrade it on the official moonshot endpoint.
+        let p = OpenAIProvider::new("k", "kimi-k3")
+            .with_provider_label("moonshot")
+            .with_base_url("https://api.moonshot.ai/v1");
+        assert_eq!(p.hints.reasoning_style, ReasoningStyle::EffortMaxOnly);
+        // Explicit config override still wins (with_hints runs after
+        // with_base_url), e.g. for a proxy that rejects reasoning_effort.
+        let overridden = OpenAIProvider::new("k", "kimi-k3")
+            .with_base_url("https://api.moonshot.ai/v1")
+            .with_hints(ModelHints {
+                reasoning_style: ReasoningStyle::None,
+                fixed_temperature: true,
+                ..Default::default()
+            });
+        assert_eq!(overridden.hints.reasoning_style, ReasoningStyle::None);
+    }
+
+    #[test]
+    fn build_request_maps_every_effort_to_max_for_kimi_k3() {
+        // K3's only accepted reasoning_effort value is "max" (thinking is
+        // always on), and the K2.x thinking object must NOT be sent.
+        let p = OpenAIProvider::new("key", "kimi-k3");
+        let msgs = [msg("hi")];
+        use crate::config::ReasoningEffort as RE;
+        for effort in [RE::Low, RE::Medium, RE::High, RE::Max] {
+            let cfg = ChatConfig {
+                reasoning_effort: Some(effort),
+                ..Default::default()
+            };
+            let v = serde_json::to_value(p.build_request(&msgs, &[], &cfg, false)).unwrap();
+            assert_eq!(v["reasoning_effort"], "max", "{effort:?} must clamp to max");
+            assert!(
+                v.get("thinking").is_none(),
+                "kimi-k3 must not emit the K2.x thinking object"
+            );
+            assert!(
+                v.get("temperature").is_none(),
+                "kimi-k3 pins temperature server-side"
+            );
+        }
+        // No configured effort -> nothing emitted (K3 thinks by default).
+        let v = serde_json::to_value(p.build_request(&msgs, &[], &ChatConfig::default(), false))
+            .unwrap();
+        assert!(v.get("reasoning_effort").is_none());
+        assert!(v.get("thinking").is_none());
+    }
+
+    #[test]
+    fn build_request_preserves_reasoning_for_kimi_k3() {
+        // K3's quickstart mandates the same round-trip contract as kimi-k2:
+        // "add the complete assistant message returned by the API to the next
+        // request. Do not keep only `content`". Auto-detected hints (no
+        // with_hints) must be enough to get it.
+        let p = OpenAIProvider::new("key", "kimi-k3");
+        let mut assistant = msg("the answer");
+        assistant.role = MessageRole::Assistant;
+        assistant.reasoning_content = Some("prior k3 reasoning".to_string());
+        let msgs = [assistant];
+        let v = serde_json::to_value(p.build_request(&msgs, &[], &ChatConfig::default(), false))
+            .unwrap();
+        let a = v["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["role"] == "assistant")
+            .expect("assistant message present");
+        assert_eq!(
+            a.get("reasoning_content").and_then(|r| r.as_str()),
+            Some("prior k3 reasoning"),
+            "kimi-k3 must round-trip prior assistant reasoning_content"
+        );
+        // Absent reasoning -> "." stub (same presence contract as kimi-k2).
+        let mut assistant2 = msg("the answer");
+        assistant2.role = MessageRole::Assistant;
+        assistant2.reasoning_content = None;
+        let msgs2 = [assistant2];
+        let v2 = serde_json::to_value(p.build_request(&msgs2, &[], &ChatConfig::default(), false))
+            .unwrap();
+        let a2 = v2["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["role"] == "assistant")
+            .expect("assistant message present");
+        assert_eq!(
+            a2.get("reasoning_content").and_then(|r| r.as_str()),
+            Some("."),
+            "kimi-k3 must get the \".\" stub when reasoning_content is absent"
         );
     }
 
