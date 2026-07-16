@@ -468,6 +468,7 @@ mod tests {
                     name: t.into(),
                     description: "desc".into(),
                     input_schema: serde_json::json!({"type": "object"}),
+                    contexts: vec![],
                     spawn_only: any_spawn_only,
                     env: vec![],
                     risk: None,

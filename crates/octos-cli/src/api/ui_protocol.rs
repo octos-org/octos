@@ -2506,7 +2506,7 @@ async fn handle_session_compact(
     // session this is a cache hit that returns the existing runtime.
     let permissions_epoch = state.session_cache.session_generation(&session_id);
     let permissions = effective_permissions_for_session(state, &session_id)?;
-    let workspace_hint = session_workspaces().get(&session_id);
+    let workspace_hint = session_workspaces().get(&profile_id, &session_id);
     let session_runtime = state
         .session_cache
         .get_or_init_with_permissions(
@@ -14143,6 +14143,7 @@ async fn maybe_spawn_appui_master_continuation_runner(
         topic: None,
         rewrite_for: None,
         reasoning_effort: None,
+        tool_context: None,
         live_video: false,
     };
     let prompt = prompt_text(&params.input).unwrap_or_default();
@@ -22185,6 +22186,19 @@ fn drain_should_skip_event(event_type: Option<&str>) -> bool {
     )
 }
 
+fn normalize_tool_context(value: Option<&str>) -> Option<String> {
+    let value = value?.trim();
+    if value.is_empty()
+        || value.len() > 64
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    {
+        return None;
+    }
+    Some(value.to_string())
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_standalone_turn(
     ws: WsConnection,
@@ -22483,6 +22497,7 @@ async fn run_standalone_turn(
         .iter()
         .any(|file_ref| octos_bus::media::is_audio(&file_ref.path));
     let mut tool_registry = session_runtime.tools.snapshot_excluding(&[]);
+    tool_registry.set_active_context(normalize_tool_context(params.tool_context.as_deref()));
     // Stamp the per-turn snapshot with this session's key so
     // `spawn::register_with_lineage` writes `session_key:
     // Some(<session_id.0>)` onto every `BackgroundTask` it tracks
@@ -29031,6 +29046,18 @@ mod tests {
         QuestionId, ReasoningDeltaEvent, SessionSandboxParams, approval_scopes, methods,
         rpc_error_codes,
     };
+
+    #[test]
+    fn should_normalize_safe_tool_context_at_protocol_boundary() {
+        assert_eq!(
+            normalize_tool_context(Some("  notebook  ")),
+            Some("notebook".to_string())
+        );
+        assert_eq!(normalize_tool_context(None), None);
+        assert_eq!(normalize_tool_context(Some("")), None);
+        assert_eq!(normalize_tool_context(Some("notebook/other")), None);
+        assert_eq!(normalize_tool_context(Some(&"a".repeat(65))), None);
+    }
 
     /// The §6 "Envelope Model" catalog in
     /// `api/OCTOS_UI_PROTOCOL_V1_SPEC_2026-04-24.md` is a hand-maintained
@@ -36988,6 +37015,7 @@ ignore = []
             topic: None,
             rewrite_for: None,
             reasoning_effort: None,
+            tool_context: None,
             live_video: false,
         })
         .into_rpc_request("1")
@@ -43270,6 +43298,7 @@ ignore = []
             topic: Some("coding".into()),
             live_video: false,
             reasoning_effort: None,
+            tool_context: None,
             rewrite_for: None,
         });
         validate_session_ingress_command_scope(&command, &allowed).expect("scope matches");
@@ -45277,6 +45306,7 @@ ignore = []
             topic: None,
             rewrite_for: None,
             reasoning_effort: None,
+            tool_context: None,
             live_video: false,
         };
         let turn_state = Arc::new(TokioMutex::new(TurnState::Active));

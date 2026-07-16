@@ -444,6 +444,10 @@ pub struct PluginToolDef {
     /// JSON Schema for input parameters.
     #[serde(default = "default_schema")]
     pub input_schema: serde_json::Value,
+    /// Model contexts in which this tool may be advertised.
+    /// Empty means the tool remains available in every context.
+    #[serde(default)]
+    pub contexts: Vec<String>,
     /// If true, the tool runs in a background task automatically when called.
     /// The execution loop returns immediately with `spawn_only_message`.
     #[serde(default)]
@@ -754,6 +758,22 @@ mod tests {
         );
         assert!(manifest.tools[0].env.is_empty());
         assert_eq!(manifest.tools[0].risk, None);
+        assert!(manifest.tools[0].contexts.is_empty());
+    }
+
+    #[test]
+    fn should_parse_tool_model_contexts() {
+        let json = r#"{
+            "name": "notebook-plugin",
+            "version": "1.0.0",
+            "tools": [{
+                "name": "source_search",
+                "description": "Search notebook sources",
+                "contexts": ["notebook"]
+            }]
+        }"#;
+        let manifest: PluginManifest = serde_json::from_str(json).unwrap();
+        assert_eq!(manifest.tools[0].contexts, vec!["notebook"]);
     }
 
     #[test]
@@ -1006,6 +1026,7 @@ mod tests {
             name: "t".to_string(),
             description: "d".to_string(),
             input_schema: default_schema(),
+            contexts: vec![],
             spawn_only: false,
             env: env.into_iter().map(str::to_string).collect(),
             risk: None,
@@ -1158,6 +1179,7 @@ mod tests {
             name: "t".to_string(),
             description: "d".to_string(),
             input_schema: default_schema(),
+            contexts: vec![],
             spawn_only: false,
             env: vec![],
             risk: None,
@@ -1229,6 +1251,7 @@ mod tests {
             name: name.into(),
             description: "x".into(),
             input_schema: default_schema(),
+            contexts: vec![],
             spawn_only,
             env: vec![],
             risk: None,

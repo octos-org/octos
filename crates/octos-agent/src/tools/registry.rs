@@ -127,6 +127,9 @@ pub struct ToolRegistry {
     /// Context-based tag filter: only tools with matching tags appear in specs().
     /// Tools with empty tags always pass.
     context_filter: Option<Vec<String>>,
+    /// Per-turn model context used to expose context-scoped plugin tools.
+    /// `None` is the ordinary/default context.
+    active_context: Option<String>,
     /// Cached specs output, invalidated on registry mutations.
     cached_specs: std::sync::Mutex<Option<Vec<ToolSpec>>>,
     /// Tool names that came from plugin binaries (for auto-send hook filtering).
@@ -218,6 +221,7 @@ impl ToolRegistry {
             workspace_root: None,
             provider_policy: None,
             context_filter: None,
+            active_context: None,
             cached_specs: std::sync::Mutex::new(None),
             plugin_tools: HashSet::new(),
             spawn_only: HashSet::new(),
@@ -649,7 +653,19 @@ impl ToolRegistry {
                 return false;
             }
         }
+        if !self.active_context_allows(tool.as_ref()) {
+            return false;
+        }
         true
+    }
+
+    fn active_context_allows(&self, tool: &dyn Tool) -> bool {
+        let contexts = tool.contexts();
+        contexts.is_empty()
+            || self
+                .active_context
+                .as_ref()
+                .is_some_and(|active| contexts.iter().any(|allowed| allowed == active))
     }
 
     pub fn specs(&self) -> Vec<ToolSpec> {
@@ -683,6 +699,7 @@ impl ToolRegistry {
                         || tool_tags.iter().any(|tag| tags.contains(&tag.to_string()))
                 })
             })
+            .filter(|t| self.active_context_allows(t.as_ref()))
             .map(|t| ToolSpec {
                 name: t.name().to_string(),
                 description: t.description().to_string(),
@@ -930,6 +947,18 @@ impl ToolRegistry {
         self.invalidate_cache();
     }
 
+    /// Set the model context for this registry snapshot.
+    pub fn set_active_context(&mut self, context: Option<String>) {
+        let normalized = context
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+        if self.active_context == normalized {
+            return;
+        }
+        self.active_context = normalized;
+        self.invalidate_cache();
+    }
+
     /// Create a new ToolRegistry by cloning all tools except the named exclusions.
     ///
     /// The new registry shares the same `Arc<dyn Tool>` instances (cheap).
@@ -949,6 +978,7 @@ impl ToolRegistry {
             workspace_root: self.workspace_root.clone(),
             provider_policy: self.provider_policy.clone(),
             context_filter: self.context_filter.clone(),
+            active_context: self.active_context.clone(),
             cached_specs: std::sync::Mutex::new(None),
             plugin_tools: self.plugin_tools.clone(),
             spawn_only: self.spawn_only.clone(),
@@ -1306,6 +1336,7 @@ impl ToolRegistry {
                         || tool_tags.iter().any(|tag| tags.contains(&tag.to_string()))
                 })
             })
+            .filter(|tool| self.active_context_allows(tool.as_ref()))
             .map(|tool| {
                 ToolCatalogEntry::new(
                     tool.name(),
@@ -3162,6 +3193,7 @@ mod spec_order_tests {
 
     struct NamedTool {
         name: String,
+        contexts: Vec<String>,
     }
 
     #[async_trait]
@@ -3174,6 +3206,9 @@ mod spec_order_tests {
         }
         fn input_schema(&self) -> Value {
             serde_json::json!({"type": "object"})
+        }
+        fn contexts(&self) -> &[String] {
+            &self.contexts
         }
         async fn execute(&self, _args: &Value) -> Result<ToolResult> {
             Ok(ToolResult {
@@ -3189,6 +3224,7 @@ mod spec_order_tests {
         for name in names {
             registry.register(NamedTool {
                 name: (*name).to_string(),
+                contexts: Vec::new(),
             });
         }
         registry
@@ -3218,5 +3254,70 @@ mod spec_order_tests {
             a_names, b_names,
             "two registries with the same tools must serialize identically"
         );
+    }
+
+    #[test]
+    fn should_expose_context_scoped_tools_only_in_matching_turn_context() {
+        let mut registry = ToolRegistry::new();
+        registry.register(NamedTool {
+            name: "always_available".to_string(),
+            contexts: Vec::new(),
+        });
+        registry.register(NamedTool {
+            name: "notebook_only".to_string(),
+            contexts: vec!["notebook".to_string()],
+        });
+
+        let default_names: Vec<String> =
+            registry.specs().into_iter().map(|spec| spec.name).collect();
+        assert_eq!(default_names, vec!["always_available"]);
+        assert!(!registry.is_tool_visible("notebook_only"));
+        assert!(
+            registry
+                .catalog_snapshot()
+                .iter()
+                .all(|entry| entry.name != "notebook_only")
+        );
+
+        registry.set_active_context(Some("notebook".to_string()));
+
+        let notebook_names: Vec<String> =
+            registry.specs().into_iter().map(|spec| spec.name).collect();
+        assert_eq!(notebook_names, vec!["always_available", "notebook_only"]);
+        assert!(registry.is_tool_visible("notebook_only"));
+        assert!(
+            registry
+                .catalog_snapshot()
+                .iter()
+                .any(|entry| entry.name == "notebook_only")
+        );
+
+        registry.set_active_context(Some("voice".to_string()));
+        assert!(!registry.is_tool_visible("notebook_only"));
+        assert_eq!(
+            registry
+                .specs()
+                .into_iter()
+                .map(|spec| spec.name)
+                .collect::<Vec<_>>(),
+            vec!["always_available"]
+        );
+    }
+
+    #[test]
+    fn should_isolate_active_context_between_registry_snapshots() {
+        let mut base = ToolRegistry::new();
+        base.register(NamedTool {
+            name: "notebook_only".to_string(),
+            contexts: vec!["notebook".to_string()],
+        });
+
+        let mut notebook_turn = base.snapshot_excluding(&[]);
+        notebook_turn.set_active_context(Some("notebook".to_string()));
+        let ordinary_turn = base.snapshot_excluding(&[]);
+
+        assert!(notebook_turn.is_tool_visible("notebook_only"));
+        assert!(!ordinary_turn.is_tool_visible("notebook_only"));
+        assert!(!base.is_tool_visible("notebook_only"));
     }
 }

@@ -1878,6 +1878,11 @@ pub struct TurnStartParams {
     /// overrides the turn's effort. No-op for models without a reasoning style.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<ReasoningEffortLevel>,
+    /// Optional per-turn model tool context. Context-scoped tools are only
+    /// advertised when this value exactly matches one of their manifest
+    /// contexts. Omitted for ordinary chat and voice turns.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_context: Option<String>,
     /// Explicit "this turn is a live video call" signal — the attached image
     /// (if any) is the user's current camera frame, not an uploaded file. Set
     /// by video-call surfaces (the voice screen with the camera on). The server
@@ -6763,6 +6768,7 @@ mod tests {
             topic: None,
             rewrite_for: None,
             reasoning_effort: Some(ReasoningEffortLevel::Max),
+            tool_context: None,
             live_video: false,
         };
         let wire = serde_json::to_value(&params).unwrap();
@@ -6801,10 +6807,33 @@ mod tests {
             topic: None,
             rewrite_for: None,
             reasoning_effort: None,
+            tool_context: None,
             live_video: false,
         };
         let wire = serde_json::to_value(&params).unwrap();
         assert!(wire.get("live_video").is_none());
+    }
+
+    #[test]
+    fn should_roundtrip_optional_turn_tool_context() {
+        let notebook = json!({
+            "session_id": "local:demo",
+            "turn_id": "00000000-0000-0000-0000-000000000001",
+            "input": [],
+            "tool_context": "notebook"
+        });
+        let parsed: TurnStartParams = serde_json::from_value(notebook).unwrap();
+        assert_eq!(parsed.tool_context.as_deref(), Some("notebook"));
+        let wire = serde_json::to_value(parsed).unwrap();
+        assert_eq!(wire["tool_context"], json!("notebook"));
+
+        let ordinary: TurnStartParams = serde_json::from_value(json!({
+            "session_id": "local:demo",
+            "turn_id": "00000000-0000-0000-0000-000000000002",
+            "input": []
+        }))
+        .unwrap();
+        assert_eq!(ordinary.tool_context, None);
     }
 
     #[test]
@@ -7700,6 +7729,7 @@ mod tests {
             topic: None,
             rewrite_for: None,
             reasoning_effort: None,
+            tool_context: None,
             live_video: false,
         })
         .into_rpc_request("req-turn-start")
@@ -8458,6 +8488,7 @@ mod tests {
             topic: None,
             rewrite_for: None,
             reasoning_effort: None,
+            tool_context: None,
             live_video: false,
         });
 
@@ -8525,6 +8556,7 @@ mod tests {
             topic: None,
             rewrite_for: None,
             reasoning_effort: None,
+            tool_context: None,
             live_video: false,
         });
 
@@ -8566,6 +8598,7 @@ mod tests {
             topic: Some("slides".into()),
             rewrite_for: None,
             reasoning_effort: None,
+            tool_context: None,
             live_video: false,
         });
 
@@ -8607,6 +8640,7 @@ mod tests {
             topic: None,
             rewrite_for: Some("cmid-queued-original".into()),
             reasoning_effort: None,
+            tool_context: None,
             live_video: false,
         });
 
@@ -8653,6 +8687,7 @@ mod tests {
             topic: Some("research".into()),
             rewrite_for: Some("cmid-original".into()),
             reasoning_effort: None,
+            tool_context: None,
             live_video: false,
         });
 

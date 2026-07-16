@@ -2343,6 +2343,10 @@ impl Tool for PluginTool {
         &self.tool_def.description
     }
 
+    fn contexts(&self) -> &[String] {
+        &self.tool_def.contexts
+    }
+
     fn concurrency_class(&self) -> super::super::tools::ConcurrencyClass {
         // Item 6 of OCTOS_M8_FIX_FIRST_CHECKLIST_2026-04-24:
         // honour the plugin manifest's optional `concurrency_class`
@@ -3113,6 +3117,7 @@ mod tests {
             name: name.to_string(),
             description: desc.to_string(),
             input_schema: json!({"type": "object", "properties": {"msg": {"type": "string"}}}),
+            contexts: vec![],
             spawn_only: false,
             env: vec![],
             risk: None,
@@ -3130,6 +3135,15 @@ mod tests {
         assert_eq!(tool.timeout, PluginTool::DEFAULT_TIMEOUT);
         assert_eq!(tool.timeout, Duration::from_secs(600));
         assert!(tool.blocked_env.is_empty());
+    }
+
+    #[test]
+    fn should_expose_manifest_contexts_through_tool_trait() {
+        let mut def = make_tool_def("source_search", "Search notebook sources");
+        def.contexts = vec!["notebook".to_string()];
+        let tool = PluginTool::new("notebook".into(), def, PathBuf::from("/bin/echo"));
+
+        assert_eq!(tool.contexts(), &["notebook".to_string()]);
     }
 
     #[test]
@@ -3197,6 +3211,7 @@ mod tests {
                     "file_path": {"type": "string"}
                 }
             }),
+            contexts: vec![],
             spawn_only: false,
             env: vec![],
             risk: None,
@@ -3244,6 +3259,7 @@ mod tests {
                     "slide_dir": {"type": "string"}
                 }
             }),
+            contexts: vec![],
             spawn_only: false,
             env: vec![],
             risk: None,
@@ -3304,6 +3320,7 @@ mod tests {
                 "type": "object",
                 "properties": {"audio_path": {"type": "string"}}
             }),
+            contexts: vec![],
             spawn_only: false,
             env: vec![],
             risk: None,
@@ -3352,6 +3369,7 @@ mod tests {
                     "script_path": {"type": "string"}
                 }
             }),
+            contexts: vec![],
             spawn_only: true,
             env: vec![],
             risk: None,
@@ -3398,6 +3416,7 @@ mod tests {
                 "type": "object",
                 "properties": {"script_path": {"type": "string"}}
             }),
+            contexts: vec![],
             spawn_only: true,
             env: vec![],
             risk: None,
@@ -3530,6 +3549,7 @@ mod tests {
                 "type": "object",
                 "properties": {"script_path": {"type": "string"}}
             }),
+            contexts: vec![],
             spawn_only: true,
             env: vec![],
             risk: None,
@@ -3589,6 +3609,7 @@ mod tests {
                     "slide_dir": {"type": "string"}
                 }
             }),
+            contexts: vec![],
             spawn_only: true,
             env: vec![],
             risk: None,
@@ -3716,6 +3737,7 @@ mod tests {
                 "type": "object",
                 "properties": {"script_path": {"type": "string"}}
             }),
+            contexts: vec![],
             spawn_only: true,
             env: vec![],
             risk: None,
@@ -3981,6 +4003,7 @@ mod tests {
                     "text_path": {"type": "string"}
                 }
             }),
+            contexts: vec![],
             spawn_only: false,
             env: vec![],
             risk: None,
@@ -4026,6 +4049,7 @@ mod tests {
                     "style": {"type": "string"}
                 }
             }),
+            contexts: vec![],
             spawn_only: false,
             env: vec![],
             risk: None,
@@ -4061,6 +4085,7 @@ mod tests {
                     "style": {"type": "string"}
                 }
             }),
+            contexts: vec![],
             spawn_only: false,
             env: vec![],
             risk: None,
@@ -4092,6 +4117,7 @@ mod tests {
                     "style": {"type": "string"}
                 }
             }),
+            contexts: vec![],
             spawn_only: false,
             env: vec![],
             risk: None,
@@ -4122,6 +4148,7 @@ mod tests {
                     "file_path": {"type": "string"}
                 }
             }),
+            contexts: vec![],
             spawn_only: false,
             env: vec![],
             risk: None,
@@ -4160,6 +4187,7 @@ mod tests {
                 },
                 "x-octos-host-config-keys": ["synthesis_config"]
             }),
+            contexts: vec![],
             spawn_only: false,
             env: vec![],
             risk: None,
@@ -4180,6 +4208,7 @@ mod tests {
                 },
                 "x-octos-host-config-keys": ["workspace_root"]
             }),
+            contexts: vec![],
             spawn_only: false,
             env: vec![],
             risk: None,
@@ -4679,6 +4708,7 @@ mod tests {
                     "out": {"type": "string"}
                 }
             }),
+            contexts: vec![],
             spawn_only: false,
             env: vec![],
             risk: None,
@@ -4721,6 +4751,7 @@ mod tests {
                     "out": {"type": "string"}
                 }
             }),
+            contexts: vec![],
             spawn_only: false,
             env: vec![],
             risk: None,
@@ -4766,6 +4797,7 @@ mod tests {
                     "out": {"type": "string"}
                 }
             }),
+            contexts: vec![],
             spawn_only: false,
             env: vec![],
             risk: None,
@@ -6025,6 +6057,7 @@ mod tests {
                 "type": "object",
                 "properties": {key: {"type": "string"}}
             }),
+            contexts: vec![],
             spawn_only: false,
             env: vec![],
             risk: None,
@@ -6443,6 +6476,7 @@ mod tests {
                     "slide_dir": {"type": "string"}
                 }
             }),
+            contexts: vec![],
             spawn_only: false,
             env: vec![],
             risk: None,
@@ -6531,6 +6565,7 @@ mod tests {
                 "type": "object",
                 "properties": {"out": {"type": "string"}}
             }),
+            contexts: vec![],
             spawn_only: false,
             env: vec![],
             risk: None,
@@ -6657,6 +6692,7 @@ mod tests {
                 "type": "object",
                 "properties": {"out": {"type": "string"}}
             }),
+            contexts: vec![],
             spawn_only: false,
             env: vec![],
             risk: None,
@@ -6836,6 +6872,7 @@ mod tests {
                 "type": "object",
                 "properties": {"script_path": {"type": "string"}}
             }),
+            contexts: vec![],
             spawn_only: true,
             env: vec![],
             risk: None,
@@ -6984,6 +7021,7 @@ mod tests {
                 "type": "object",
                 "properties": {"style": {"type": "string"}}
             }),
+            contexts: vec![],
             spawn_only: true,
             env: vec![],
             risk: None,
@@ -7005,6 +7043,7 @@ mod tests {
             name: "mofa_slides".to_string(),
             description: "Slides".to_string(),
             input_schema: json!({"type": "object", "properties": {"style": {"type": "string"}}}),
+            contexts: vec![],
             spawn_only: true,
             env: vec![],
             risk: None,
@@ -7230,6 +7269,7 @@ mod tests {
                 "type": "object",
                 "properties": {"out": {"type": "string"}}
             }),
+            contexts: vec![],
             spawn_only: false,
             env: vec![],
             risk: None,

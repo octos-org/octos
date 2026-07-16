@@ -529,6 +529,15 @@ pub trait Tool: Send + Sync {
         &[]
     }
 
+    /// Model contexts in which this tool may be advertised.
+    ///
+    /// An empty list keeps the existing behavior: the tool is visible in
+    /// every context. A non-empty list requires an exact match with the
+    /// active per-turn context.
+    fn contexts(&self) -> &[String] {
+        &[]
+    }
+
     /// Execute the tool with the given arguments.
     ///
     /// Kept as the primary entry point so existing tools, tests, and
