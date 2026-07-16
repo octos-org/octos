@@ -1795,16 +1795,15 @@ mod registry_dispatch_tests {
     use super::*;
     use std::path::PathBuf;
 
-    // RFC-0 (#1289): LRU lifecycle was removed. `make_registry` keeps its
-    // two-argument shape purely so the surviving dispatch/spawn_only/policy
-    // tests below compile unchanged; the arguments are ignored.
-    fn make_registry(_max_active: usize, _idle_threshold: u32) -> ToolRegistry {
+    // RFC-0 (#1289): LRU tool-lifecycle deferral was removed, so this helper no
+    // longer carries the old `(max_active, idle_threshold)` tuning knobs.
+    fn make_registry() -> ToolRegistry {
         ToolRegistry::with_builtins(PathBuf::from("/tmp"))
     }
 
     #[test]
     fn spawn_only_message_uses_runtime_output_dir_hint() {
-        let mut reg = make_registry(5, 3);
+        let mut reg = make_registry();
         reg.mark_spawn_only("mofa_slides", None);
         reg.set_output_dir_hint("/tmp/octos-profile/skill-output");
 
@@ -1815,7 +1814,7 @@ mod registry_dispatch_tests {
 
     #[test]
     fn spawn_only_handle_message_returns_task_handle_envelope() {
-        let mut reg = make_registry(5, 3);
+        let mut reg = make_registry();
         reg.mark_spawn_only("search", None);
         reg.set_output_dir_hint("/tmp/octos/skill-output");
 
@@ -1852,7 +1851,7 @@ mod registry_dispatch_tests {
         // Codex round 2 P2: visibility helper must mirror the same filters
         // `specs()` applies, so the spawn_only intercept does not advertise
         // a tool the provider policy hid from the LLM's tool list.
-        let mut reg = make_registry(5, 3);
+        let mut reg = make_registry();
         // After make_registry, "shell" exists.
         assert!(reg.is_tool_visible("shell"));
 
@@ -1870,7 +1869,7 @@ mod registry_dispatch_tests {
 
     #[tokio::test]
     async fn spawn_agent_execution_policy_is_equivalent_to_spawn_alias() {
-        let mut reg = make_registry(5, 3);
+        let mut reg = make_registry();
         reg.set_provider_policy(ToolPolicy {
             deny: vec!["spawn".to_owned()],
             ..Default::default()
@@ -1891,7 +1890,7 @@ mod registry_dispatch_tests {
         };
         assert!(denied.to_string().contains("denied by provider policy"));
 
-        let mut reg = make_registry(5, 3);
+        let mut reg = make_registry();
         reg.set_provider_policy(ToolPolicy {
             allow: vec!["spawn".to_owned()],
             ..Default::default()
@@ -1913,7 +1912,7 @@ mod registry_dispatch_tests {
 
     #[test]
     fn is_tool_visible_returns_false_for_unregistered_tools() {
-        let reg = make_registry(5, 3);
+        let reg = make_registry();
         assert!(!reg.is_tool_visible("nope_does_not_exist"));
     }
 
@@ -1923,7 +1922,7 @@ mod registry_dispatch_tests {
         // the getter the project-root validator path calls must return a no-op
         // sandbox — `ValidatorRunner` then runs command validators' argv
         // directly, keeping host behavior unchanged where no backend exists.
-        let reg = make_registry(5, 3);
+        let reg = make_registry();
         assert!(
             reg.sandbox().is_noop(),
             "registry built without a real sandbox must expose a no-op sandbox"
@@ -1965,7 +1964,7 @@ mod registry_dispatch_tests {
     fn should_permit_all_tools_when_no_provider_policy_is_set() {
         // #1607 (P2): with no provider policy the permit predicate is a no-op,
         // so `MapToolDispatcher::from_registry` snapshots every tool.
-        let reg = make_registry(5, 3);
+        let reg = make_registry();
         assert!(reg.provider_policy_permits("shell"));
         assert!(reg.provider_policy_permits("read_file"));
     }
@@ -1975,7 +1974,7 @@ mod registry_dispatch_tests {
         // #1607 (P2): the permit predicate must mirror the deny-wins semantics
         // (with alias equivalence) that `execute` enforces, so a project-root
         // ToolCall validator can't reach a denied tool via the snapshot.
-        let mut reg = make_registry(5, 3);
+        let mut reg = make_registry();
         reg.set_provider_policy(ToolPolicy {
             deny: vec!["spawn".to_string()],
             ..Default::default()
@@ -1993,7 +1992,7 @@ mod registry_dispatch_tests {
     fn should_permit_only_allowlisted_tools_when_allow_list_is_set() {
         // #1607 (P2): a non-empty allow list means only listed (or
         // alias-equivalent) tools are permitted.
-        let mut reg = make_registry(5, 3);
+        let mut reg = make_registry();
         reg.set_provider_policy(ToolPolicy {
             allow: vec!["read_file".to_string()],
             ..Default::default()
@@ -2009,7 +2008,7 @@ mod registry_dispatch_tests {
     fn spawn_only_handle_message_payload_stays_under_one_kb() {
         // Phase 4 acceptance criterion: spawn_only tool result in agent
         // context is < 1KB (was 50KB+).
-        let mut reg = make_registry(5, 3);
+        let mut reg = make_registry();
         reg.mark_spawn_only("search", None);
 
         let payload = reg.spawn_only_handle_message("search", "task_xyz", &[]);

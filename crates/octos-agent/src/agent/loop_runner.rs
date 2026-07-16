@@ -928,6 +928,9 @@ impl Agent {
                     PersistentRetryStateGuard::new(self.persistent_retry_state.clone());
                 let mut loop_detector = LoopDetector::new(12);
                 let mut turn_ledger = self.new_turn_ledger();
+                // #1691 (codex gap G6): fire the in-band budget reminder once,
+                // when the run first crosses ~80% of its iteration cap.
+                let mut budget_reminder_sent = false;
 
                 // Labeled so the loop-detector recovery arms below can re-enter
                 // the AGENT loop (skip tool execution for this spiraling
@@ -959,9 +962,38 @@ impl Agent {
                                 pending_approval: None,
                             });
                         }
+                        // #1691: grace was granted (we did not return) — this is
+                        // the FINAL iteration. Tell the model to deliver now
+                        // rather than start new work, so a grace call is not
+                        // wasted on more exploration (the mini4 failure mode).
+                        messages.push(Message::user(
+                            "[budget notice] This is your FINAL iteration — the run stops \
+                             immediately after it. Do NOT start new exploration; write your \
+                             deliverable (write_file / edit_file) or give your final answer \
+                             in THIS response.",
+                        ));
                     }
 
                     let iteration = turn.advance_iteration();
+                    // #1691 (codex gap G6): as the run approaches its iteration
+                    // cap, warn the model in-band ONCE (~80%) so a long task
+                    // converges on a written deliverable instead of silently
+                    // hitting the wall with nothing produced (the mini4
+                    // review-worker failure mode). Non-forcing — it only nudges.
+                    let max_iters = self.config.max_iterations;
+                    if !budget_reminder_sent
+                        && max_iters > 0
+                        && iteration.saturating_mul(5) >= max_iters.saturating_mul(4)
+                    {
+                        let remaining = max_iters.saturating_sub(iteration);
+                        messages.push(Message::user(format!(
+                            "[budget notice] ~{remaining} tool iteration(s) left before this \
+                             run is force-stopped at {max_iters}. Stop exploring now and \
+                             deliver: write your result with write_file / edit_file (or state \
+                             your final answer) before you run out."
+                        )));
+                        budget_reminder_sent = true;
+                    }
                     // Realtime heartbeat: beat first, then abort the iteration
                     // with a typed error if the controller reports stalled.
                     // A None controller / disabled config is a no-op so the
@@ -3421,6 +3453,87 @@ mod tests {
                 ..Default::default()
             })
         }
+    }
+
+    /// Planner that keeps requesting a tool call (so the loop runs to its
+    /// iteration cap) and records whether it ever received the in-band budget
+    /// reminder (#1691).
+    struct BudgetProbePlanner {
+        calls: Arc<AtomicUsize>,
+        saw_notice: Arc<AtomicBool>,
+    }
+
+    #[async_trait]
+    impl LlmProvider for BudgetProbePlanner {
+        async fn chat(
+            &self,
+            messages: &[Message],
+            _tools: &[octos_llm::ToolSpec],
+            _config: &ChatConfig,
+        ) -> Result<ChatResponse> {
+            if messages
+                .iter()
+                .any(|m| m.content.contains("[budget notice]"))
+            {
+                self.saw_notice.store(true, AtomicOrdering::SeqCst);
+            }
+            let n = self.calls.fetch_add(1, AtomicOrdering::SeqCst);
+            // Never end the turn — force the loop toward its iteration cap.
+            Ok(tool_use(
+                vec![ToolCall {
+                    id: format!("call_{n}"),
+                    name: "noop_tool".to_string(),
+                    arguments: serde_json::json!({ "n": n }),
+                    metadata: None,
+                }],
+                10,
+                5,
+            ))
+        }
+
+        fn model_id(&self) -> &str {
+            "budget-probe"
+        }
+
+        fn provider_name(&self) -> &str {
+            "mock"
+        }
+    }
+
+    #[tokio::test]
+    async fn budget_reminder_injected_before_iteration_cap() {
+        // #1691: as a run approaches its iteration cap the model must receive an
+        // in-band "wrap up and deliver" reminder, so it converges on a
+        // deliverable instead of silently hitting the wall (the mini4 review
+        // worker burned all 50 iterations and wrote nothing).
+        let dir = tempfile::tempdir().unwrap();
+        let saw_notice = Arc::new(AtomicBool::new(false));
+        let planner = Arc::new(BudgetProbePlanner {
+            calls: Arc::new(AtomicUsize::new(0)),
+            saw_notice: saw_notice.clone(),
+        });
+        let mut tools = ToolRegistry::new();
+        tools.register(StaticResultTool::new(
+            "noop_tool",
+            "ok",
+            true,
+            Arc::new(AtomicUsize::new(0)),
+        ));
+        let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+        let agent = Agent::new(AgentId::new("budget-probe"), planner, tools, memory).with_config(
+            AgentConfig {
+                max_iterations: 5,
+                save_episodes: false,
+                ..Default::default()
+            },
+        );
+
+        let _ = agent.process_message("do a long task", &[], vec![]).await;
+
+        assert!(
+            saw_notice.load(AtomicOrdering::SeqCst),
+            "the model never received the pre-cap budget reminder (#1691)"
+        );
     }
 
     struct NoCallVerifier {

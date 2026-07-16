@@ -1465,7 +1465,9 @@ struct Input {
     /// worktree gives the child a dedicated git worktree under `.octos/work`.
     #[serde(default)]
     isolation: WorkerIsolation,
-    /// Tool names the subagent is allowed to use. Empty = all builtins.
+    /// Tool names the subagent is allowed to use. Empty — with no role template
+    /// and no manifest — falls back to a lean coding/review surface (see
+    /// [`DEFAULT_SUBAGENT_TOOLS`]), NOT every builtin. `group:*` tokens allowed.
     #[serde(default)]
     allowed_tools: Vec<String>,
     /// Extra context injected as a system-level prefix.
@@ -2008,6 +2010,35 @@ fn effective_allowed_tools(allowed_tools: &[String], disallowed_tools: &[String]
         .collect()
 }
 
+/// Lean default tool surface for a spawned worker that constrained nothing —
+/// no inline `allowed_tools`, no manifest (`apply_agent_definition`), and no
+/// role template (`apply_role_template`). RFC-0 (#1289) removed LRU tool
+/// deferral, so an empty allow-list otherwise exposes every registered tool
+/// (~43 schemas on a bare `octos serve` worker), which reliably degenerates
+/// weaker models into empty / reflexive single-tool responses that never
+/// produce a deliverable (issue #1689). Mirrors the `#1641` lean coding
+/// profile: file ops (read **and write/edit**, so the worker can actually
+/// write its result), shell, file search, and web fetch. `spawn` is denied for
+/// children regardless (see [`build_subagent_tool_policy`]); `group:*` tokens
+/// expand via [`ToolPolicy`]. An explicit allow-list / role / manifest wins.
+const DEFAULT_SUBAGENT_TOOLS: &[&str] = &["group:fs", "group:runtime", "group:search", "group:web"];
+
+/// Resolve the allow-list for a spawned worker: an explicit list (inline,
+/// manifest, or role template — all resolved before this point) is honoured
+/// verbatim; an empty list falls back to [`DEFAULT_SUBAGENT_TOOLS`] instead of
+/// the RFC-0 "every registered tool" behaviour that degenerates weaker models
+/// (issue #1689).
+fn subagent_allowed_tools_or_default(allowed_tools: Vec<String>) -> Vec<String> {
+    if allowed_tools.is_empty() {
+        DEFAULT_SUBAGENT_TOOLS
+            .iter()
+            .map(|tool| (*tool).to_string())
+            .collect()
+    } else {
+        allowed_tools
+    }
+}
+
 fn build_subagent_tool_policy(
     allowed_tools: Vec<String>,
     disallowed_tools: Vec<String>,
@@ -2038,9 +2069,15 @@ fn ensure_subagent_tools_available(
     allowed_tools: &[String],
 ) -> std::result::Result<(), String> {
     // RFC-0 (#1289): tool deferral was removed — every registered tool is
-    // available. Just verify the allowed tools are actually present.
+    // available. Verify the requested CONCRETE tools are present. Skip policy
+    // EXPRESSIONS — `group:*` named groups and `*` wildcards — which are
+    // allow-list patterns that expand against whatever is registered rather
+    // than concrete tool names: `tools.get("group:fs")` is always None, so a
+    // caller / role template using group tokens (or the lean default) would
+    // otherwise be falsely rejected as "not available on this host" (#1689).
     let missing = allowed_tools
         .iter()
+        .filter(|entry| !entry.starts_with("group:") && !entry.contains('*'))
         .filter(|tool_name| tools.get(tool_name).is_none())
         .cloned()
         .collect::<Vec<_>>();
@@ -2553,8 +2590,18 @@ impl Tool for SpawnTool {
             });
         }
 
-        let mut input: Input =
-            serde_json::from_value(args.clone()).wrap_err("invalid spawn tool input")?;
+        // #1690: surface the serde detail AND the schema so the model can
+        // self-repair next turn, and return a typed `ToolInputError` — a
+        // no-side-effect failure that must NOT cancel well-formed sibling
+        // spawns in a serial batch (see the M8.8 cascade in `execution.rs`).
+        let mut input: Input = serde_json::from_value(args.clone()).map_err(|e| {
+            super::ToolInputError::new(format!(
+                "invalid spawn tool input: {e}. Required: `task` (string — the \
+                 worker's instructions). Optional: `allowed_tools` (string[], \
+                 e.g. [\"group:fs\",\"shell\"]), `role`, `mode` \
+                 (\"background\"|\"sync\"), `context`, `model`, `label`."
+            ))
+        })?;
         // M8.2: if the caller referenced an AgentDefinition manifest by id,
         // layer the manifest's fields onto the inline Input with "inline
         // wins" semantics. Unknown ids are a hard error — silently ignoring
@@ -2578,7 +2625,16 @@ impl Tool for SpawnTool {
             None => input.task.clone(),
         };
 
-        let allowed_tools = input.allowed_tools.clone();
+        // RFC-0 (#1289) removed LRU tool deferral, so an EMPTY allow-list now
+        // means "every registered tool" (~43 schemas), which reliably
+        // degenerates weaker models into empty / reflexive single-tool
+        // responses that never produce a deliverable (issue #1689). By this
+        // point an inline list, a manifest (`apply_agent_definition`), and a
+        // role template (`apply_role_template`) have all had their chance to
+        // fill `allowed_tools`; if it is STILL empty the caller constrained
+        // nothing, so fall back to a lean coding/review surface rather than
+        // everything. An explicit list / role / manifest always wins.
+        let allowed_tools = subagent_allowed_tools_or_default(input.allowed_tools.clone());
         // Effective allow-list = `allowed_tools` minus the manifest's
         // `disallowed_tools`, for the two consumers that cannot apply the local
         // deny-list policy: the `agent_mcp` dispatch payload (codex P1) and the
@@ -5334,6 +5390,93 @@ mod tests {
 
         assert!(error.contains("required tool(s) not available on this host"));
         assert!(error.contains("podcast_generate"));
+    }
+
+    #[test]
+    fn subagent_defaults_to_lean_toolset_when_unconstrained() {
+        // #1689: an empty allow-list (no inline list, no role, no manifest —
+        // all resolved before this point) must NOT mean "every registered
+        // tool"; it falls back to the lean coding/review surface.
+        let resolved = subagent_allowed_tools_or_default(Vec::new());
+        assert_eq!(
+            resolved,
+            DEFAULT_SUBAGENT_TOOLS
+                .iter()
+                .map(|t| t.to_string())
+                .collect::<Vec<_>>()
+        );
+        assert!(resolved.iter().any(|t| t == "group:fs"));
+
+        // An explicit list is honoured verbatim (the escape hatch).
+        let explicit = vec!["shell".to_string()];
+        assert_eq!(
+            subagent_allowed_tools_or_default(explicit.clone()),
+            explicit
+        );
+    }
+
+    #[test]
+    fn lean_default_policy_keeps_core_tools_and_shrinks_the_surface() {
+        // End-to-end: the lean default, applied as a policy to a full builtin
+        // registry, retains the read/WRITE/shell/search surface (so a worker
+        // can actually produce a deliverable) while shrinking the ~43-tool
+        // surface that degenerates weak models (#1689).
+        let full = ToolRegistry::with_builtins("/tmp").specs().len();
+        let mut tools = ToolRegistry::with_builtins("/tmp");
+        let policy = build_subagent_tool_policy(
+            subagent_allowed_tools_or_default(Vec::new()),
+            Vec::new(),
+            None,
+        );
+        tools.apply_policy(&policy);
+        let names: Vec<String> = tools.specs().into_iter().map(|s| s.name).collect();
+        for kept in [
+            "read_file",
+            "write_file",
+            "edit_file",
+            "shell",
+            "grep",
+            "list_dir",
+        ] {
+            assert!(
+                names.contains(&kept.to_string()),
+                "lean default dropped core tool {kept}: {names:?}"
+            );
+        }
+        assert!(
+            names.len() < full,
+            "lean default must shrink the {full}-tool surface, got {}",
+            names.len()
+        );
+        assert!(
+            names.len() <= 18,
+            "lean default should be ~15 tools, got {}: {names:?}",
+            names.len()
+        );
+    }
+
+    #[test]
+    fn preflight_skips_group_and_wildcard_tokens() {
+        // #1689: `group:*` / `*` are policy EXPRESSIONS, not concrete tool
+        // names — `tools.get("group:fs")` is always None — so they must be
+        // skipped, not reported "not available on this host". Otherwise the lean
+        // default (and any role using group tokens) could never spawn.
+        let tools = ToolRegistry::with_builtins("/tmp");
+        ensure_subagent_tools_available(
+            &tools,
+            &["group:fs".into(), "group:web".into(), "exec*".into()],
+        )
+        .expect("group / wildcard tokens must not be treated as missing tools");
+
+        // A concrete missing tool alongside a group token is still reported —
+        // but only the concrete name.
+        let err = ensure_subagent_tools_available(
+            &tools,
+            &["group:fs".into(), "definitely_not_a_tool".into()],
+        )
+        .unwrap_err();
+        assert!(err.contains("definitely_not_a_tool"));
+        assert!(!err.contains("group:fs"));
     }
 
     struct StaticTestTool {
