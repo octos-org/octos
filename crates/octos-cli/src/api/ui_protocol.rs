@@ -10881,6 +10881,13 @@ async fn open_session_result(
                     session = %params.session_id,
                     "session/open: SessionRuntime::bootstrap failed",
                 );
+                // The most common bootstrap failure is a non-writable workspace
+                // folder — the session can't create its `.octos-workspace.toml`
+                // there. Surface a clear, actionable message naming the folder
+                // instead of the opaque "failed to bootstrap session runtime".
+                if is_permission_denied_error(&error) {
+                    return Err(workspace_not_writable_error(params.cwd.as_deref()));
+                }
                 return Err(runtime_unavailable_error(format!(
                     "failed to bootstrap session runtime: {error}"
                 )));
@@ -25084,6 +25091,41 @@ fn string_field(value: &Value, keys: &[&str]) -> Option<String> {
 fn runtime_unavailable_error(message: impl Into<String>) -> RpcError {
     RpcError::internal_error(message).with_data(json!({
         "kind": "runtime_unavailable",
+    }))
+}
+
+/// True when `error` (anywhere in its eyre chain) is an OS permission-denied
+/// failure. The common trigger is session bootstrap failing to create
+/// `<workspace>/.octos-workspace.toml` in a folder the user can't write to.
+/// Structural — downcasts to `std::io::Error` — not string matching.
+fn is_permission_denied_error(error: &eyre::Report) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io| io.kind() == std::io::ErrorKind::PermissionDenied)
+    })
+}
+
+/// Clear, actionable RPC error for the "session workspace folder isn't writable"
+/// case (a session/open bootstrap denied writing its `.octos-workspace.toml`).
+/// Names the folder so the user can act; the client renders `data.message`
+/// verbatim (preferred over the numeric code), so it reads as a plain sentence
+/// instead of an opaque "failed to bootstrap session runtime".
+fn workspace_not_writable_error(workspace: Option<&str>) -> RpcError {
+    let sentence = match workspace {
+        Some(path) => format!(
+            "Can't start a session in {path} — the folder isn't writable (permission denied). \
+             octos needs to create a .octos-workspace.toml there. Start octos in a folder you \
+             own, or make this one writable."
+        ),
+        None => "Can't start a session — the workspace folder isn't writable (permission denied). \
+                 Start octos in a folder you own, or make it writable."
+            .to_string(),
+    };
+    RpcError::internal_error(sentence.clone()).with_data(json!({
+        "kind": "workspace_not_writable",
+        "workspace": workspace,
+        "message": sentence,
     }))
 }
 
@@ -40452,6 +40494,48 @@ ignore = []
             error.data.as_ref().and_then(|data| data.get("kind")),
             Some(&json!("runtime_unavailable"))
         );
+    }
+
+    #[test]
+    fn permission_denied_workspace_yields_a_clear_actionable_error() {
+        // A session/open bootstrap failure caused by a non-writable workspace
+        // folder must be recognized structurally (through the eyre wrap chain)
+        // and rendered as a clear, folder-named message the client shows
+        // verbatim — not the opaque "failed to bootstrap session runtime".
+        let io_err = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "Permission denied");
+        let report = eyre::Report::new(io_err)
+            .wrap_err("write workspace policy failed: /Users/dev/.octos-workspace.toml")
+            .wrap_err("failed to bootstrap session workspace policy");
+        assert!(
+            is_permission_denied_error(&report),
+            "permission denial must be detected through the eyre wrap chain"
+        );
+
+        let error = workspace_not_writable_error(Some("/Users/dev"));
+        assert_eq!(
+            error.data.as_ref().and_then(|d| d.get("kind")),
+            Some(&json!("workspace_not_writable"))
+        );
+        let message = error
+            .data
+            .as_ref()
+            .and_then(|d| d.get("message"))
+            .and_then(|m| m.as_str())
+            .unwrap_or_default();
+        assert!(
+            message.contains("/Users/dev"),
+            "message must name the folder: {message}"
+        );
+        assert!(
+            message.contains("writable"),
+            "message must explain the cause: {message}"
+        );
+    }
+
+    #[test]
+    fn non_permission_bootstrap_error_is_not_misclassified_as_writability() {
+        let report = eyre::eyre!("some other failure: database corrupt");
+        assert!(!is_permission_denied_error(&report));
     }
 
     #[test]
