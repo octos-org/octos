@@ -285,7 +285,16 @@ pub fn model_pricing(model_id: &str) -> Option<ModelPricing> {
         });
     }
 
-    // Kimi / Moonshot
+    // Kimi / Moonshot — NOTE: kimi-k3 MUST be checked before the generic
+    // kimi-k2/moonshot branch: the full provider key ("moonshot/kimi-k3")
+    // contains both substrings. K3 official rates: $3.00/M input (cache
+    // miss) / $15.00/M output.
+    if m.contains("kimi-k3") {
+        return Some(ModelPricing {
+            input_per_million: 3.00,
+            output_per_million: 15.0,
+        });
+    }
     if m.contains("kimi-k2") || m.contains("moonshot") {
         return Some(ModelPricing {
             input_per_million: 0.60,
@@ -395,6 +404,22 @@ mod tests {
     fn test_unknown_model_returns_none() {
         assert!(model_pricing("my-local-model").is_none());
         assert!(model_pricing("ollama/phi-custom").is_none());
+    }
+
+    #[test]
+    fn should_price_kimi_k3_before_generic_moonshot_branch() {
+        // kimi-k3 ($3.00/M in, $15.00/M out) must match before the generic
+        // kimi-k2/moonshot branch — the full provider key contains BOTH
+        // "kimi-k3" and "moonshot", and last-writer semantics would misprice
+        // it at the k2 rates ($0.60/$2.40).
+        for id in ["kimi-k3", "moonshot/kimi-k3"] {
+            let p = model_pricing(id).unwrap();
+            assert!((p.input_per_million - 3.0).abs() < f64::EPSILON, "{id}");
+            assert!((p.output_per_million - 15.0).abs() < f64::EPSILON, "{id}");
+        }
+        // The k2 family keeps its own rates.
+        let k2 = model_pricing("kimi-k2.6").unwrap();
+        assert!((k2.input_per_million - 0.60).abs() < f64::EPSILON);
     }
 
     #[test]

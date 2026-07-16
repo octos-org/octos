@@ -120,9 +120,10 @@ pub fn context_window_tokens(model_id: &str) -> u32 {
     }
     // Model-specific defaults for known long-context models when the catalog
     // is unavailable or lacks the exact variant (e.g. deepseek-v4-flash, which
-    // has no dedicated catalog lane). DeepSeek V4 and MiniMax M3 are 1M-context.
+    // has no dedicated catalog lane). DeepSeek V4, MiniMax M3 and Kimi K3 are
+    // 1M-context.
     let m = model_id.to_lowercase();
-    if m.contains("deepseek-v4") || m.contains("minimax-m3") {
+    if m.contains("deepseek-v4") || m.contains("minimax-m3") || m.contains("kimi-k3") {
         return 1_048_576;
     }
     // Conservative default for unknown models
@@ -143,7 +144,9 @@ pub fn max_output_tokens(model_id: &str) -> u32 {
     // substring branches below (e.g. minimax-m3 before the generic minimax).
     if m.contains("deepseek-v4") {
         384_000
-    } else if m.contains("minimax-m3") {
+    } else if m.contains("minimax-m3") || m.contains("kimi-k3") {
+        // kimi-k3 default max completion is 131072 (settable up to 1M);
+        // must win over the broader "kimi" branch below.
         131_072
     } else if m.contains("kimi") || m.contains("qwen") || m.contains("gemini") {
         65_535
@@ -216,6 +219,18 @@ mod tests {
         assert_eq!(max_output_tokens("deepseek-v4-pro"), 384_000);
         assert_eq!(max_output_tokens("deepseek-v4-flash"), 384_000);
         assert_eq!(max_output_tokens("minimax-m3"), 131_072);
+    }
+
+    #[test]
+    fn should_use_1m_context_for_kimi_k3_when_not_in_catalog() {
+        // kimi-k3 is never seeded by the unit-test catalog fixtures, so this
+        // exercises the hardcoded fallbacks regardless of CATALOG state:
+        // 1M window and 131072 default max completion, checked before the
+        // broader "kimi" substring branch (65_535).
+        assert_eq!(context_window_tokens("kimi-k3"), 1_048_576);
+        assert_eq!(context_window_tokens("moonshot/kimi-k3"), 1_048_576);
+        assert_eq!(max_output_tokens("kimi-k3"), 131_072);
+        assert_eq!(max_output_tokens("moonshot/kimi-k3"), 131_072);
     }
 
     #[test]
