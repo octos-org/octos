@@ -61,6 +61,13 @@ const LOOP_DEFAULT_MAX_FIRES: u32 = 10_000;
 /// `apply_self_paced_response` once richer config lands. (#977 bullet 4)
 const SELF_PACED_DEFAULT_DELAY_SECONDS: u64 = 60 * 15;
 const MAX_OBJECTIVE_BYTES: usize = 8_192;
+
+/// #1693 — error→blocked circuit breaker: consecutive zero-token
+/// continuation turns before an active goal is parked as `blocked`.
+/// codex blocks on the FIRST terminal turn error; three tolerates a
+/// transient provider blip without letting a permanently failing goal
+/// loop forever.
+const GOAL_MAX_CONSECUTIVE_FAILED_TURNS: u32 = 3;
 const MAX_LOOP_PROMPT_BYTES: usize = 8_192;
 const MAX_LOOPS_PER_SESSION: usize = 16;
 const AGENT_OUTPUT_CURSOR_INVALID: &str = "agent_output_cursor_invalid";
@@ -702,6 +709,64 @@ impl InProcessAgentOrchestrator {
                 loop_id = ?loop_id.as_ref().map(|id| id.as_str()),
                 dedupe_key = %dedupe_key.as_str(),
                 "solo boot: retired queued loop fire alongside its parked loop"
+            );
+        }
+        paused
+    }
+
+    /// Solo-boot GOAL safety (#1694) — the loops rationale above applies
+    /// verbatim: a goal restored `active` from a prior process's store
+    /// resumes firing REAL model turns (12/hour) with nobody having asked
+    /// this process for them. Park restored active goals as `paused`
+    /// (persisted), retire their boot-restored queued `GoalContinue`
+    /// entries (same zombie mechanics as parked loop fires — and
+    /// `/goal resume` re-enqueues a fresh continuation via `set_goal`
+    /// anyway), and return the parked `(goal_id, session_id)` pairs for
+    /// the boot log. Wrap-ups are untouched: a `budget_limited` goal is
+    /// not active, so it is never parked and its one-shot wrap-up still
+    /// drains.
+    pub(crate) fn pause_restored_goals_for_solo_boot(&self) -> Vec<(String, SessionKey)> {
+        let mut state = self.state();
+        let state = &mut *state;
+        let supervisor_store = state.supervisor_store.as_ref();
+        let now = now_ms();
+        let mut paused = Vec::new();
+        for (session_id, goal) in state.goals.iter_mut() {
+            if goal.status != "active" {
+                continue;
+            }
+            goal.status = "paused".to_owned();
+            goal.updated_at_ms = now;
+            persist_goal_state_with_store(supervisor_store, session_id, goal, false);
+            paused.push((goal.goal_id.clone(), session_id.clone()));
+        }
+        let parked: std::collections::HashSet<&str> =
+            paused.iter().map(|(goal_id, _)| goal_id.as_str()).collect();
+        let orphaned: Vec<_> = state
+            .continuations
+            .pending_items()
+            .filter(|item| {
+                item.reason == MasterContinuationReason::GoalContinue
+                    && item
+                        .goal_id
+                        .as_ref()
+                        .is_some_and(|goal_id| parked.contains(goal_id.as_str()))
+            })
+            .map(|item| (item.group_id.clone(), item.dedupe_key.clone()))
+            .collect();
+        for (group_id, dedupe_key) in orphaned {
+            state.continuations.cancel(&dedupe_key);
+            if let Some(store) = supervisor_store {
+                let _ = store.record_continuation_completed(
+                    group_id.as_str(),
+                    dedupe_key.as_str(),
+                    now_ms_u64(),
+                    Some("discarded:solo_boot_parked_goal".into()),
+                );
+            }
+            tracing::info!(
+                dedupe_key = %dedupe_key.as_str(),
+                "solo boot: retired queued goal continuation alongside its parked goal"
             );
         }
         paused
@@ -2711,7 +2776,10 @@ impl AgentOrchestrator for InProcessAgentOrchestrator {
         }
         let requested_status = request.status.as_deref();
         if requested_status.is_some_and(|status| {
-            !matches!(status, "active" | "paused" | "budget_limited" | "complete")
+            !matches!(
+                status,
+                "active" | "paused" | "budget_limited" | "complete" | "blocked"
+            )
         }) {
             return Err(autonomy_error(
                 kinds::GOAL_INVALID_STATE,
@@ -2774,6 +2842,9 @@ impl AgentOrchestrator for InProcessAgentOrchestrator {
             // active window silently never emits its summary turn.
             if goal.status == "active" && prior_status != "active" {
                 goal.wrap_up_emitted = false;
+                // Re-activation forgives the failure streak (#1693) —
+                // the user explicitly asked for another attempt.
+                goal.consecutive_failed_turns = 0;
                 if goal.tokens_used < goal.token_budget {
                     // user-driven re-activation also restarts the
                     // sliding rate-limit window so the prior burst
@@ -2800,6 +2871,7 @@ impl AgentOrchestrator for InProcessAgentOrchestrator {
                 rate_window_start_ms: now,
                 rate_window_count: 0,
                 wrap_up_emitted: false,
+                consecutive_failed_turns: 0,
             };
             state.goals.insert(request.session_id.clone(), goal.clone());
             goal
@@ -3304,6 +3376,14 @@ struct AutonomyGoalRecord {
     /// does not re-emit duplicate wrap-ups on every subsequent
     /// continuation attempt.
     wrap_up_emitted: bool,
+    /// #1693 — consecutive autonomous continuation turns that consumed
+    /// ZERO tokens (turn error / interrupt before the model ran). A
+    /// failing goal charges nothing, so its budget never exhausts and
+    /// the scheduler would retry 12×/hour forever; at
+    /// [`GOAL_MAX_CONSECUTIVE_FAILED_TURNS`] the goal flips to
+    /// `blocked` (user-resumable). Reset by any token-consuming turn
+    /// and by user re-activation.
+    consecutive_failed_turns: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -4113,6 +4193,26 @@ fn record_goal_turn_internal(
     goal.updated_at_ms = now_ms_value;
     goal.tokens_used = goal.tokens_used.saturating_add(tokens_consumed);
     goal.time_used_seconds = goal.time_used_seconds.saturating_add(elapsed_seconds);
+    // #1693 — error→blocked circuit breaker. A continuation turn that
+    // consumed zero tokens did no model work (turn error or interrupt
+    // before the model ran; any real turn spends thousands of input
+    // tokens). Such turns charge nothing, so the token budget can never
+    // stop a permanently failing goal — the rate limiter bounds the
+    // RATE, this bounds the DURATION. `blocked` is denied by
+    // `goal_policy_allows_fire` (active-only) and by the drain-time
+    // schedulability check; `/goal resume` re-activates and resets the
+    // streak via `set_goal`.
+    if tokens_consumed == 0 {
+        goal.consecutive_failed_turns = goal.consecutive_failed_turns.saturating_add(1);
+        if goal.consecutive_failed_turns >= GOAL_MAX_CONSECUTIVE_FAILED_TURNS
+            && goal.status == "active"
+        {
+            goal.status = "blocked".to_owned();
+            return None;
+        }
+    } else {
+        goal.consecutive_failed_turns = 0;
+    }
     let window_age = now_ms_value.saturating_sub(goal.rate_window_start_ms);
     if window_age >= GOAL_RATE_WINDOW_MS {
         goal.rate_window_start_ms = now_ms_value;
@@ -4676,6 +4776,12 @@ fn restore_goal_from_group(state: &mut AutonomyRuntimeState, group: &SupervisedG
             .min(u32::MAX as u64) as u32,
         wrap_up_emitted: supervisor_metadata_bool(&group.metadata, "wrap_up_emitted")
             .unwrap_or(false),
+        consecutive_failed_turns: supervisor_metadata_u64(
+            &group.metadata,
+            "consecutive_failed_turns",
+        )
+        .unwrap_or(0)
+        .min(u32::MAX as u64) as u32,
     };
     state.next_goal_seq = state.next_goal_seq.max(sequence_suffix(&goal.goal_id));
     state.goals.insert(session_id, goal);
@@ -4880,6 +4986,7 @@ fn persist_goal_cleared(state: &AutonomyRuntimeState, session_id: &SessionKey, p
         rate_window_start_ms: now,
         rate_window_count: 0,
         wrap_up_emitted: false,
+        consecutive_failed_turns: 0,
     };
     persist_goal_state(state, session_id, &goal, true);
 }
@@ -4954,6 +5061,10 @@ fn persist_goal_state_with_store(
     group
         .metadata
         .insert("wrap_up_emitted".into(), json!(goal.wrap_up_emitted));
+    group.metadata.insert(
+        "consecutive_failed_turns".into(),
+        json!(goal.consecutive_failed_turns),
+    );
     let event_id = format!(
         "autonomy_goal_state:{}:{}",
         group.group_id,
@@ -8457,6 +8568,128 @@ mod tests {
     /// Bullet 3: budget exhaustion → enqueue a wrap-up turn AND
     /// transition the goal to `budget_limited`. Subsequent calls must
     /// be idempotent (no duplicate wrap-up).
+    #[test]
+    /// #1693 — three consecutive zero-token continuation turns (a
+    /// permanently failing goal charges nothing, so the budget never
+    /// stops it) flip the goal to `blocked`; one token-consuming turn
+    /// resets the streak; user re-activation forgives it.
+    #[test]
+    fn goal_blocks_after_consecutive_failed_turns_and_resume_forgives() {
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let session_id = SessionKey::with_profile("tenant-a", "api", "goal-breaker");
+        orchestrator
+            .set_goal(GoalSetRequest {
+                session_id: session_id.clone(),
+                profile_id: "tenant-a".into(),
+                objective: "keep failing".into(),
+                status: Some("active".into()),
+                token_budget: Some(2_000_000),
+                transition_actor: None,
+            })
+            .expect("set active goal");
+
+        // Two failures then a real turn: streak resets, goal stays active.
+        orchestrator.record_goal_turn(&session_id, "tenant-a", 0, 1);
+        orchestrator.record_goal_turn(&session_id, "tenant-a", 0, 1);
+        orchestrator.record_goal_turn(&session_id, "tenant-a", 50_000, 30);
+        assert_eq!(
+            orchestrator.goal_status_for_test(&session_id).as_deref(),
+            Some("active"),
+            "a token-consuming turn resets the failure streak"
+        );
+
+        // Three consecutive failures: blocked.
+        orchestrator.record_goal_turn(&session_id, "tenant-a", 0, 1);
+        orchestrator.record_goal_turn(&session_id, "tenant-a", 0, 1);
+        orchestrator.record_goal_turn(&session_id, "tenant-a", 0, 1);
+        assert_eq!(
+            orchestrator.goal_status_for_test(&session_id).as_deref(),
+            Some("blocked"),
+            "three zero-token turns park the goal"
+        );
+
+        // Blocked is not schedulable: nothing drains for this session.
+        let drained = orchestrator.drain_ready_continuations_for_session(
+            &session_id,
+            "tenant-a",
+            MasterContinuationRuntimeState::idle(),
+            usize::MAX,
+        );
+        assert!(
+            drained.is_empty(),
+            "blocked goal must not fire continuations: {drained:?}"
+        );
+
+        // User resume re-activates and forgives the streak: two further
+        // failures do NOT immediately re-block.
+        orchestrator
+            .set_goal(GoalSetRequest {
+                session_id: session_id.clone(),
+                profile_id: "tenant-a".into(),
+                objective: "keep failing".into(),
+                status: Some("active".into()),
+                token_budget: None,
+                transition_actor: Some("user".into()),
+            })
+            .expect("resume");
+        assert_eq!(
+            orchestrator.goal_status_for_test(&session_id).as_deref(),
+            Some("active")
+        );
+        orchestrator.record_goal_turn(&session_id, "tenant-a", 0, 1);
+        orchestrator.record_goal_turn(&session_id, "tenant-a", 0, 1);
+        assert_eq!(
+            orchestrator.goal_status_for_test(&session_id).as_deref(),
+            Some("active"),
+            "resume must reset the streak, not inherit the old one"
+        );
+    }
+
+    /// #1694 — solo boot parks restored ACTIVE goals as paused (mirroring
+    /// the loops parking) and retires their queued continuations; paused/
+    /// blocked/complete goals are untouched.
+    #[test]
+    fn solo_boot_parks_restored_active_goals() {
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let active = SessionKey::with_profile("tenant-a", "api", "goal-park-active");
+        let paused = SessionKey::with_profile("tenant-a", "api", "goal-park-paused");
+        for (session, status) in [(&active, "active"), (&paused, "paused")] {
+            orchestrator
+                .set_goal(GoalSetRequest {
+                    session_id: (*session).clone(),
+                    profile_id: "tenant-a".into(),
+                    objective: "restored goal".into(),
+                    status: Some(status.into()),
+                    token_budget: None,
+                    transition_actor: None,
+                })
+                .expect("seed goal");
+        }
+
+        let parked = orchestrator.pause_restored_goals_for_solo_boot();
+
+        assert_eq!(parked.len(), 1, "only the active goal parks: {parked:?}");
+        assert_eq!(
+            orchestrator.goal_status_for_test(&active).as_deref(),
+            Some("paused")
+        );
+        assert_eq!(
+            orchestrator.goal_status_for_test(&paused).as_deref(),
+            Some("paused")
+        );
+        // The active goal's initial queued continuation was retired with it.
+        let drained = orchestrator.drain_ready_continuations_for_session(
+            &active,
+            "tenant-a",
+            MasterContinuationRuntimeState::idle(),
+            usize::MAX,
+        );
+        assert!(
+            drained.is_empty(),
+            "parked goal's queued continuation must be retired: {drained:?}"
+        );
+    }
+
     #[test]
     fn record_goal_turn_emits_wrap_up_on_budget_exhaustion() {
         let orchestrator = InProcessAgentOrchestrator::default();
