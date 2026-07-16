@@ -6243,6 +6243,17 @@ struct RawProfileLlmUpsertParams {
     set_primary: bool,
 }
 
+/// `profile/llm/delete`: remove one configured model (primary or fallback) by
+/// its address (family + model + route).
+#[derive(Debug, Deserialize)]
+struct RawProfileLlmDeleteParams {
+    #[serde(default)]
+    profile_id: Option<String>,
+    family_id: String,
+    model_id: String,
+    route_id: String,
+}
+
 #[derive(Debug, Default, Deserialize)]
 struct RawAutonomyListParams {
     #[serde(default)]
@@ -8755,6 +8766,96 @@ async fn raw_profile_llm_upsert(
     ))
 }
 
+/// `profile/llm/delete`: remove one configured model — primary or fallback —
+/// addressed by family + model + route (the same address comparison the
+/// upsert/select paths use). Deleting the primary promotes the first fallback
+/// so the profile keeps a working model whenever one exists; deleting the
+/// last model leaves `llm.primary` empty (recoverable via `/model` → Add).
+/// A non-matching address returns the unchanged state with `applied: false`.
+fn raw_profile_llm_delete(
+    state: &Arc<AppState>,
+    request: &RpcRequest<Value>,
+    connection_profile_id: Option<&str>,
+) -> Result<Value, RpcError> {
+    let params: RawProfileLlmDeleteParams = parse_raw_params(request)?;
+    let profile_id =
+        raw_scoped_llm_profile_id(params.profile_id.clone(), None, connection_profile_id)?;
+    let store = profile_store(state)?;
+    let Some(mut profile) = store
+        .get(&profile_id)
+        .map_err(|err| RpcError::internal_error(format!("failed to read profile: {err}")))?
+    else {
+        return Ok(profile_llm_mutation_result(state, &profile_id, None, false));
+    };
+
+    let family_id = nonempty(Some(params.family_id))
+        .ok_or_else(|| RpcError::invalid_params("family_id is required"))?;
+    let model_id = nonempty(Some(params.model_id))
+        .ok_or_else(|| RpcError::invalid_params("model_id is required"))?;
+    let route_id = nonempty(Some(params.route_id))
+        .ok_or_else(|| RpcError::invalid_params("route_id is required"))?;
+    let target = crate::profiles::LlmModelSelectionConfig {
+        family_id: Some(family_id),
+        model_id: Some(model_id),
+        route: Some(crate::profiles::LlmRouteConfig {
+            route_id: Some(route_id),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+
+    let Some(mut llm) = profile.config.llm.take() else {
+        return Ok(profile_llm_mutation_result(
+            state,
+            &profile_id,
+            Some(&profile),
+            false,
+        ));
+    };
+
+    let mut applied = false;
+    if llm
+        .primary
+        .as_ref()
+        .is_some_and(|primary| same_llm_selection_address(primary, &target))
+    {
+        llm.primary = None;
+        // Keep the profile on a working model whenever one exists: the first
+        // fallback is the failover chain's next-in-line, so it inherits the
+        // primary slot.
+        if !llm.fallbacks.is_empty() {
+            llm.primary = Some(llm.fallbacks.remove(0));
+        }
+        applied = true;
+    } else {
+        let before = llm.fallbacks.len();
+        llm.fallbacks
+            .retain(|fallback| !same_llm_selection_address(fallback, &target));
+        applied = llm.fallbacks.len() != before;
+    }
+    profile.config.llm = Some(llm);
+
+    if !applied {
+        return Ok(profile_llm_mutation_result(
+            state,
+            &profile_id,
+            Some(&profile),
+            false,
+        ));
+    }
+
+    profile.updated_at = Utc::now();
+    store
+        .save_with_merge(&mut profile)
+        .map_err(|err| RpcError::internal_error(format!("failed to save profile: {err}")))?;
+    Ok(profile_llm_mutation_result(
+        state,
+        &profile_id,
+        Some(&profile),
+        true,
+    ))
+}
+
 fn upsert_llm_fallback(
     fallbacks: &mut Vec<crate::profiles::LlmModelSelectionConfig>,
     selection: crate::profiles::LlmModelSelectionConfig,
@@ -9577,24 +9678,7 @@ async fn handle_raw_appui_rpc(
             raw_profile_llm_select(state, request, connection_profile_id).await
         }
         APPUI_METHOD_PROFILE_LLM_DELETE => {
-            let params: RawProfileParams = match parse_raw_params(request) {
-                Ok(params) => params,
-                Err(error) => {
-                    let _ = send_rpc_error(ws, Some(id), error);
-                    return true;
-                }
-            };
-            let profile_id = raw_profile_id(&params, connection_profile_id);
-            let profile = state
-                .profile_store
-                .as_ref()
-                .and_then(|store| store.get(&profile_id).ok().flatten());
-            Ok(profile_llm_mutation_result(
-                state,
-                &profile_id,
-                profile.as_ref(),
-                false,
-            ))
+            raw_profile_llm_delete(state, request, connection_profile_id)
         }
         APPUI_METHOD_PROFILE_LLM_FETCH_MODELS => {
             raw_profile_llm_fetch_models(state, request, connection_profile_id).await
@@ -28271,6 +28355,108 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![Some("glm-5.2")],
             "round-trip must neither duplicate the promoted model nor drop the demoted one"
+        );
+    }
+
+    /// `profile/llm/delete` semantics: an unmatched address is a no-op
+    /// (`applied: false`); deleting a fallback removes exactly that entry;
+    /// deleting the primary promotes the first fallback (the profile keeps a
+    /// working model whenever one exists); deleting the last model leaves the
+    /// primary empty rather than erroring — `/model` → Add recovers.
+    #[tokio::test]
+    async fn llm_delete_removes_entries_and_promotes_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = Arc::new(local_profile_state(dir.path()));
+        for (family, model) in [("deepseek", "deepseek-v4-pro"), ("zai", "glm-5.2")] {
+            let request = RpcRequest::new(
+                format!("u-{model}"),
+                APPUI_METHOD_PROFILE_LLM_UPSERT.to_string(),
+                json!({
+                    "profile_id": "dev",
+                    "selection": {
+                        "family_id": family,
+                        "model_id": model,
+                        "route": { "route_id": "official" },
+                    },
+                    "set_primary": true,
+                }),
+            );
+            raw_profile_llm_upsert(&state, &request, None)
+                .await
+                .expect("upsert");
+        }
+        // State now: primary glm-5.2, fallback deepseek-v4-pro.
+
+        let delete = |family: &str, model: &str, route: &str, id: &str| {
+            RpcRequest::new(
+                id.to_string(),
+                APPUI_METHOD_PROFILE_LLM_DELETE.to_string(),
+                json!({
+                    "profile_id": "dev",
+                    "family_id": family,
+                    "model_id": model,
+                    "route_id": route,
+                }),
+            )
+        };
+
+        // (a) Unmatched address -> applied=false, nothing changes.
+        let result = raw_profile_llm_delete(
+            &state,
+            &delete("openai", "gpt-4o", "official", "d-miss"),
+            None,
+        )
+        .expect("delete miss");
+        assert_eq!(result["applied"], json!(false));
+
+        // (b) Delete the PRIMARY -> the fallback is promoted.
+        let result = raw_profile_llm_delete(
+            &state,
+            &delete("zai", "glm-5.2", "official", "d-primary"),
+            None,
+        )
+        .expect("delete primary");
+        assert_eq!(result["applied"], json!(true));
+        let profile = state
+            .profile_store
+            .as_ref()
+            .unwrap()
+            .get("dev")
+            .unwrap()
+            .unwrap();
+        let llm = profile.config.llm.as_ref().unwrap();
+        assert_eq!(
+            llm.primary.as_ref().unwrap().model_id.as_deref(),
+            Some("deepseek-v4-pro"),
+            "first fallback must inherit the primary slot"
+        );
+        assert!(llm.fallbacks.is_empty());
+
+        // (c) Delete the LAST model -> primary empty, still applied.
+        let result = raw_profile_llm_delete(
+            &state,
+            &delete("deepseek", "deepseek-v4-pro", "official", "d-last"),
+            None,
+        )
+        .expect("delete last");
+        assert_eq!(result["applied"], json!(true));
+        let profile = state
+            .profile_store
+            .as_ref()
+            .unwrap()
+            .get("dev")
+            .unwrap()
+            .unwrap();
+        let llm_empty = profile
+            .config
+            .llm
+            .as_ref()
+            .map(|llm| llm.primary.is_none() && llm.fallbacks.is_empty())
+            .unwrap_or(true);
+        assert!(
+            llm_empty,
+            "last model removed (an emptied llm block may serialize away): {:?}",
+            profile.config.llm
         );
     }
 
