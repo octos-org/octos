@@ -16892,6 +16892,7 @@ mod tests {
             completed_at: None,
             output_files: Vec::new(),
             error: None,
+            failed_by_observer: false,
             session_key: Some("local:test".into()),
             tool_input: None,
             originating_client_message_id: None,
