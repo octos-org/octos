@@ -389,12 +389,19 @@ impl SessionRuntimeCache {
             // replacement intentionally keeps that stable.
             {
                 let mut guard = self.inner.write().await;
+                // A replacement ProfileRuntime may also move the profile's
+                // data directory, which changes the sessions-root component
+                // of every cache key. Remove entries owned by the previous
+                // allocation across all roots before probing the new key.
+                guard.retain(|(profile_id, _, _), entry| {
+                    profile_id != &profile.profile_id
+                        || Arc::ptr_eq(&entry.runtime.profile, profile)
+                });
                 if let Some(entry) = guard.get_mut(&key) {
                     if Arc::ptr_eq(&entry.runtime.profile, profile) {
                         entry.last_used = Instant::now();
                         return Ok(Arc::clone(&entry.runtime));
                     }
-                    guard.remove(&key);
                 }
             }
 
@@ -548,6 +555,14 @@ impl SessionRuntimeCache {
             return runtime;
         }
 
+        // The profile allocation may have changed while this key was being
+        // bootstrapped. Its sessions root is part of the key, so evict stale
+        // allocations across every root rather than only the exact key below.
+        guard.retain(|(profile_id, _, _), entry| {
+            profile_id != &runtime.profile.profile_id
+                || Arc::ptr_eq(&entry.runtime.profile, &runtime.profile)
+        });
+
         // If a runtime is already present (e.g. another task
         // bootstrapped in a prior single-flight era and inserted
         // before our claim), bump its timestamp and return its
@@ -558,7 +573,6 @@ impl SessionRuntimeCache {
                 entry.last_used = Instant::now();
                 return Arc::clone(&entry.runtime);
             }
-            guard.remove(&key);
         }
 
         // Soft-cap eviction: if we're at capacity, drop the LRU

@@ -1,6 +1,6 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
@@ -8,6 +8,9 @@ use eyre::{Context, Result};
 use octos_core::SessionKey;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+
+const MAX_JOB_STORE_BYTES: u64 = 4 * 1024 * 1024;
+const MAX_RETAINED_JOBS_PER_SESSION: usize = 256;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -53,12 +56,29 @@ pub(crate) struct SkillActionJobRecord {
 #[derive(Debug, Clone)]
 pub(crate) struct SkillActionJobStore {
     profile_data_dir: PathBuf,
+    max_store_bytes: u64,
+    max_retained_jobs: usize,
 }
 
 impl SkillActionJobStore {
     pub(crate) fn open(profile_data_dir: impl AsRef<Path>) -> Self {
         Self {
             profile_data_dir: profile_data_dir.as_ref().to_path_buf(),
+            max_store_bytes: MAX_JOB_STORE_BYTES,
+            max_retained_jobs: MAX_RETAINED_JOBS_PER_SESSION,
+        }
+    }
+
+    #[cfg(test)]
+    fn open_with_limits(
+        profile_data_dir: impl AsRef<Path>,
+        max_store_bytes: u64,
+        max_retained_jobs: usize,
+    ) -> Self {
+        Self {
+            profile_data_dir: profile_data_dir.as_ref().to_path_buf(),
+            max_store_bytes,
+            max_retained_jobs,
         }
     }
 
@@ -73,14 +93,25 @@ impl SkillActionJobStore {
         payload.push(b'\n');
         let mut file = OpenOptions::new()
             .create(true)
+            .read(true)
             .append(true)
             .open(&path)
             .wrap_err_with(|| format!("failed to open job store {}", path.display()))?;
         fs2::FileExt::lock_exclusive(&file)
             .wrap_err_with(|| format!("failed to lock job store {}", path.display()))?;
-        let write_result = file
-            .write_all(&payload)
-            .wrap_err_with(|| format!("failed to append job {}", job.job_id));
+        let write_result = (|| -> Result<()> {
+            file.write_all(&payload)
+                .wrap_err_with(|| format!("failed to append job {}", job.job_id))?;
+            if file
+                .metadata()
+                .wrap_err_with(|| format!("failed to stat job store {}", path.display()))?
+                .len()
+                > self.max_store_bytes
+            {
+                self.compact_locked_file(&mut file, &path)?;
+            }
+            Ok(())
+        })();
         let unlock_result = fs2::FileExt::unlock(&file)
             .wrap_err_with(|| format!("failed to unlock job store {}", path.display()));
         write_result?;
@@ -89,13 +120,10 @@ impl SkillActionJobStore {
     }
 
     pub(crate) fn list(&self, session_id: &SessionKey) -> Result<Vec<SkillActionJobRecord>> {
-        let mut jobs = latest_by_job_id(self.read_session_snapshots(session_id)?);
-        jobs.sort_by(|left, right| {
-            left.updated_at
-                .cmp(&right.updated_at)
-                .then_with(|| left.job_id.cmp(&right.job_id))
-        });
-        Ok(jobs)
+        Ok(retain_recent_jobs(
+            latest_by_job_id(self.read_session_snapshots(session_id)?),
+            self.max_retained_jobs,
+        ))
     }
 
     pub(crate) fn read(
@@ -182,38 +210,73 @@ impl SkillActionJobStore {
         read_result?;
         unlock_result?;
 
-        let lines = contents.split(|byte| *byte == b'\n').collect::<Vec<_>>();
-        let last_non_empty = lines
-            .iter()
-            .rposition(|line| !line.iter().all(u8::is_ascii_whitespace));
-        let mut records = Vec::new();
-        for (index, line) in lines.into_iter().enumerate() {
-            if line.iter().all(u8::is_ascii_whitespace) {
-                continue;
+        parse_snapshot_contents(path, &contents)
+    }
+
+    fn compact_locked_file(&self, file: &mut File, path: &Path) -> Result<()> {
+        file.flush()
+            .wrap_err_with(|| format!("failed to flush job store {}", path.display()))?;
+        file.seek(SeekFrom::Start(0))
+            .wrap_err_with(|| format!("failed to seek job store {}", path.display()))?;
+        let mut contents = Vec::new();
+        file.read_to_end(&mut contents)
+            .wrap_err_with(|| format!("failed to read job store {}", path.display()))?;
+
+        let retained = retain_recent_jobs(
+            latest_by_job_id(parse_snapshot_contents(path, &contents)?),
+            self.max_retained_jobs,
+        );
+        let mut compacted = Vec::new();
+        for job in retained {
+            serde_json::to_writer(&mut compacted, &job)
+                .wrap_err_with(|| format!("failed to compact job {}", job.job_id))?;
+            compacted.push(b'\n');
+        }
+
+        file.set_len(0)
+            .wrap_err_with(|| format!("failed to truncate job store {}", path.display()))?;
+        file.seek(SeekFrom::Start(0))
+            .wrap_err_with(|| format!("failed to rewind job store {}", path.display()))?;
+        file.write_all(&compacted)
+            .wrap_err_with(|| format!("failed to rewrite job store {}", path.display()))?;
+        file.flush()
+            .wrap_err_with(|| format!("failed to flush job store {}", path.display()))?;
+        Ok(())
+    }
+}
+
+fn parse_snapshot_contents(path: &Path, contents: &[u8]) -> Result<Vec<SkillActionJobRecord>> {
+    let lines = contents.split(|byte| *byte == b'\n').collect::<Vec<_>>();
+    let last_non_empty = lines
+        .iter()
+        .rposition(|line| !line.iter().all(u8::is_ascii_whitespace));
+    let mut records = Vec::new();
+    for (index, line) in lines.into_iter().enumerate() {
+        if line.iter().all(u8::is_ascii_whitespace) {
+            continue;
+        }
+        match serde_json::from_slice(line) {
+            Ok(record) => records.push(record),
+            Err(error) if Some(index) == last_non_empty => {
+                tracing::warn!(
+                    path = %path.display(),
+                    line = index + 1,
+                    %error,
+                    "ignoring malformed trailing skill action job snapshot"
+                );
             }
-            match serde_json::from_slice(line) {
-                Ok(record) => records.push(record),
-                Err(error) if Some(index) == last_non_empty => {
-                    tracing::warn!(
-                        path = %path.display(),
-                        line = index + 1,
-                        %error,
-                        "ignoring malformed trailing skill action job snapshot"
-                    );
-                }
-                Err(error) => {
-                    return Err(error).wrap_err_with(|| {
-                        format!(
-                            "failed to parse job store line {} in {}",
-                            index + 1,
-                            path.display()
-                        )
-                    });
-                }
+            Err(error) => {
+                return Err(error).wrap_err_with(|| {
+                    format!(
+                        "failed to parse job store line {} in {}",
+                        index + 1,
+                        path.display()
+                    )
+                });
             }
         }
-        Ok(records)
     }
+    Ok(records)
 }
 
 fn latest_by_job_id(snapshots: Vec<SkillActionJobRecord>) -> Vec<SkillActionJobRecord> {
@@ -222,6 +285,32 @@ fn latest_by_job_id(snapshots: Vec<SkillActionJobRecord>) -> Vec<SkillActionJobR
         latest.insert(snapshot.job_id.clone(), snapshot);
     }
     latest.into_values().collect()
+}
+
+fn retain_recent_jobs(
+    mut jobs: Vec<SkillActionJobRecord>,
+    max_jobs: usize,
+) -> Vec<SkillActionJobRecord> {
+    jobs.sort_by(|left, right| {
+        left.updated_at
+            .cmp(&right.updated_at)
+            .then_with(|| left.job_id.cmp(&right.job_id))
+    });
+    if jobs.len() <= max_jobs {
+        return jobs;
+    }
+
+    let active_count = jobs.iter().filter(|job| job.status.is_active()).count();
+    let terminal_budget = max_jobs.saturating_sub(active_count);
+    let retained_terminal_ids = jobs
+        .iter()
+        .rev()
+        .filter(|job| !job.status.is_active())
+        .take(terminal_budget)
+        .map(|job| job.job_id.clone())
+        .collect::<HashSet<_>>();
+    jobs.retain(|job| job.status.is_active() || retained_terminal_ids.contains(&job.job_id));
+    jobs
 }
 
 pub(crate) fn recover_skill_action_jobs_for_profile_start(
@@ -478,6 +567,41 @@ mod tests {
 
         let snapshots = store.read_session_snapshots_for_test(&session_id).unwrap();
         assert_eq!(snapshots.len(), 32);
+    }
+
+    #[test]
+    fn should_compact_history_without_dropping_active_jobs() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SkillActionJobStore::open_with_limits(dir.path(), 1, 3);
+        let session_id = SessionKey("local:bounded".to_string());
+
+        store
+            .append(&record(
+                &session_id,
+                "job-active",
+                SkillActionJobStatus::Running,
+                0,
+            ))
+            .unwrap();
+        for index in 1..=4 {
+            store
+                .append(&record(
+                    &session_id,
+                    &format!("job-{index}"),
+                    SkillActionJobStatus::Succeeded,
+                    index,
+                ))
+                .unwrap();
+        }
+
+        let snapshots = store.read_session_snapshots_for_test(&session_id).unwrap();
+        let jobs = store.list(&session_id).unwrap();
+
+        assert_eq!(snapshots.len(), 3);
+        assert_eq!(jobs.len(), 3);
+        assert!(jobs.iter().any(|job| job.job_id == "job-active"));
+        assert!(jobs.iter().any(|job| job.job_id == "job-3"));
+        assert!(jobs.iter().any(|job| job.job_id == "job-4"));
     }
 
     #[test]
