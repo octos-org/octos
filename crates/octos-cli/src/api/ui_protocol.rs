@@ -18888,12 +18888,45 @@ struct M15LiveSubagentResult {
 
 struct WsSupervisorEventSink {
     ws: WsConnection,
+    ledger: Arc<UiProtocolLedger>,
 }
 
 impl AppUiSupervisorEventSink for WsSupervisorEventSink {
     fn emit_supervisor_event(&self, method: &'static str, params: Value) {
+        // Stuck-chip fix (specialist lane): a TERMINAL `agent/updated` must
+        // survive the emitting connection — ephemeral delivery is dropped if
+        // the client blips or the frame races a reconnect, leaving the chip
+        // on the last non-terminal status forever. Mirror the background-task
+        // lane (`forward_terminal_agent_update_durable`): append terminal
+        // flips to the durable per-session ledger so cursor replay and the
+        // live broadcast forwarder both observe them. Non-terminal updates
+        // (spawned/running/heartbeats) stay ephemeral — appending each would
+        // bloat replay history with redundant in-flight states.
+        if method == octos_core::ui_protocol::methods::AGENT_UPDATED {
+            if let Some(event) = terminal_agent_updated_event(&params) {
+                let _ = send_notification_durable(
+                    &self.ws,
+                    self.ledger.as_ref(),
+                    UiNotification::AgentUpdated(event),
+                );
+                return;
+            }
+        }
         let _ = send_raw_notification_ephemeral(&self.ws, method, params);
     }
+}
+
+/// Parse a supervisor `agent/updated` payload and return it ONLY when the
+/// carried agent status is terminal (`completed` / `failed` / `interrupted` /
+/// `cancelled` / `closed`). Non-terminal or unparseable payloads return `None`
+/// and stay on the ephemeral path.
+fn terminal_agent_updated_event(params: &Value) -> Option<AgentUpdatedEvent> {
+    let event: AgentUpdatedEvent = serde_json::from_value(params.clone()).ok()?;
+    matches!(
+        event.agent.status.as_str(),
+        "completed" | "failed" | "interrupted" | "cancelled" | "closed"
+    )
+    .then_some(event)
 }
 
 const REVIEW_NATIVE_SPECIALISTS_ENV: &str = "OCTOS_REVIEW_NATIVE_SPECIALISTS_JSON";
@@ -19355,6 +19388,7 @@ async fn run_native_code_review_turn(
     maybe_spawn_cli_review_specialist(
         &mut joins,
         &ws,
+        &ledger,
         &session_id,
         &profile_id,
         &workspace_root,
@@ -19367,6 +19401,7 @@ async fn run_native_code_review_turn(
         &mut joins,
         &state,
         &ws,
+        &ledger,
         &session_id,
         &profile_id,
         &workspace_root,
@@ -19617,6 +19652,7 @@ fn native_review_task(objective: &str, target: &str, spec: &NativeCodeReviewSpec
 fn maybe_spawn_cli_review_specialist(
     joins: &mut tokio::task::JoinSet<NativeCodeReviewResult>,
     ws: &WsConnection,
+    ledger: &Arc<UiProtocolLedger>,
     session_id: &SessionKey,
     profile_id: &str,
     workspace_root: &Path,
@@ -19664,7 +19700,10 @@ fn maybe_spawn_cli_review_specialist(
         )
         .timeout(std::time::Duration::from_secs(90))
         .declared_artifact(&artifact_path);
-    let sink = WsSupervisorEventSink { ws: ws.clone() };
+    let sink = WsSupervisorEventSink {
+        ws: ws.clone(),
+        ledger: ledger.clone(),
+    };
     joins.spawn(async move {
         match run_supervised_cli_specialist(
             default_agent_orchestrator(),
@@ -19698,6 +19737,7 @@ fn maybe_spawn_mcp_review_specialist(
     joins: &mut tokio::task::JoinSet<NativeCodeReviewResult>,
     state: &AppState,
     ws: &WsConnection,
+    ledger: &Arc<UiProtocolLedger>,
     session_id: &SessionKey,
     profile_id: &str,
     workspace_root: &Path,
@@ -19738,7 +19778,10 @@ fn maybe_spawn_mcp_review_specialist(
         "artifact_path": artifact_path.to_string_lossy().into_owned(),
         "instructions": "Run a focused code review specialist task and return concise findings first.",
     });
-    let sink = WsSupervisorEventSink { ws: ws.clone() };
+    let sink = WsSupervisorEventSink {
+        ws: ws.clone(),
+        ledger: ledger.clone(),
+    };
     let backend = swarm_state.swarm.backend();
     let dispatch_policy = swarm_state.swarm.dispatch_policy();
     let timeout = review_mcp_timeout();
@@ -20362,7 +20405,10 @@ print(f"{agent_id}: {finding}")
             path: artifact_path.clone(),
         }],
     };
-    let sink = WsSupervisorEventSink { ws: ws.clone() };
+    let sink = WsSupervisorEventSink {
+        ws: ws.clone(),
+        ledger: ledger.clone(),
+    };
     let summary = run_supervised_cli_specialist(
         default_agent_orchestrator(),
         &sink,
@@ -48302,6 +48348,81 @@ ignore = []
 
         abort_live_forwarders(&forwarders, &ledger).await;
         abort_live_forwarders(&forwarders_other, &ledger).await;
+    }
+
+    /// Stuck-chip fix (specialist lane): a TERMINAL `agent/updated` emitted
+    /// through the supervisor sink must be appended to the durable per-session
+    /// ledger (so reconnect replay observes the flip), while non-terminal
+    /// updates stay ephemeral (never ledgered — they'd bloat replay history).
+    #[tokio::test]
+    async fn supervisor_sink_ledgers_terminal_agent_updates_only() {
+        let (ws, mut rx) = ws_connection_for_test(16);
+        let ledger = Arc::new(UiProtocolLedger::new(16));
+        let session_id = SessionKey("local:sink-durable".into());
+        let sink = WsSupervisorEventSink {
+            ws: ws.clone(),
+            ledger: ledger.clone(),
+        };
+
+        let agent_json = |status: &str| {
+            json!({
+                "session_id": session_id.0,
+                "agent": {
+                    "agent_id": "edison",
+                    "session_id": session_id.0,
+                    "path": "master/edison",
+                    "role": "worker",
+                    "nickname": "Edison",
+                    "backend_kind": "cli_process",
+                    "status": status,
+                    "profile_id": "dev",
+                    "created_at_ms": 1,
+                    "updated_at_ms": 1,
+                }
+            })
+        };
+
+        // Non-terminal: delivered live, but must NOT be appended durably.
+        sink.emit_supervisor_event(
+            octos_core::ui_protocol::methods::AGENT_UPDATED,
+            agent_json("running"),
+        );
+        // Terminal: must be appended to the durable ledger.
+        sink.emit_supervisor_event(
+            octos_core::ui_protocol::methods::AGENT_UPDATED,
+            agent_json("failed"),
+        );
+
+        // Both frames still reach the live connection exactly once each.
+        for expected_status in ["running", "failed"] {
+            let frame = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+                .await
+                .expect("live frame")
+                .expect("ws open");
+            assert_eq!(
+                frame_method(&frame).as_deref(),
+                Some(octos_core::ui_protocol::methods::AGENT_UPDATED),
+                "live delivery must be preserved for {expected_status}"
+            );
+        }
+
+        let (events, _) = ledger
+            .snapshot_with_cursor(&session_id, None)
+            .expect("ledger snapshot");
+        let ledgered_statuses: Vec<&str> = events
+            .iter()
+            .filter_map(|event| match &event.event {
+                UiProtocolLedgerEvent::Notification(UiNotification::AgentUpdated(update)) => {
+                    Some(update.agent.status.as_str())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            ledgered_statuses,
+            vec!["failed"],
+            "exactly the terminal update must be ledgered — non-terminal stays ephemeral"
+        );
     }
 
     /// MUST-FIX-3: a `subscribe()` call followed by dropping the

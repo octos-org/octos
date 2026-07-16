@@ -4790,7 +4790,15 @@ fn restored_agent_status(child: &ChildAgentRecord) -> String {
         .to_owned();
     }
     match &child.status {
-        ChildStatus::Starting | ChildStatus::Running => "running",
+        // Ghost-agent fix: this replay runs at process boot, before this
+        // server has spawned anything. A child persisted as Starting/Running
+        // was live in the PREVIOUS server process and died with it (children
+        // are in-process tasks / child processes of the server) — nothing will
+        // ever move its status again. Restoring it as "running" resurrected
+        // permanently-active ghosts: `list_agents` kept returning them and the
+        // TUI showed the chips as active forever. Restore as terminal
+        // "interrupted" so rehydration tells clients the truth.
+        ChildStatus::Starting | ChildStatus::Running => "interrupted",
         ChildStatus::Completed => "completed",
         ChildStatus::Failed => "failed",
         ChildStatus::Cancelled => "interrupted",
@@ -10297,12 +10305,32 @@ mod tests {
                 }],
             )
             .expect("persist artifact");
+        // A sibling that finished BEFORE the restart must keep its real
+        // terminal status through the replay.
+        orchestrator.upsert_agent(AgentUpsert {
+            agent_id: "child-done".into(),
+            parent_agent_id: Some("master".into()),
+            session_id: session_id.clone(),
+            task_id: None,
+            path: "master/child-done".into(),
+            role: "reviewer".into(),
+            nickname: "Noether".into(),
+            backend_kind: "native".into(),
+            status: "completed".into(),
+            last_task: Some("review persistence module".into()),
+            cwd: Some("/tmp/project".into()),
+            profile_id: "tenant-a".into(),
+        });
 
         let restarted = InProcessAgentOrchestrator::default();
         restarted
             .configure_supervisor_store(&store_dir)
             .expect("replay store");
 
+        // Ghost-agent fix: the child persisted as "running" was live in the
+        // OLD process and died with it — the replay must restore it as
+        // terminal "interrupted", not resurrect a permanently-"running"
+        // ghost the TUI would show as active forever.
         let status = restarted
             .read_agent_status(AgentRequest {
                 agent_id: "child-restore".into(),
@@ -10310,8 +10338,17 @@ mod tests {
                 profile_id: "tenant-a".into(),
             })
             .expect("restored status");
-        assert_eq!(status["agent"]["status"], json!("running"));
+        assert_eq!(status["agent"]["status"], json!("interrupted"));
         assert_eq!(status["agent"]["nickname"], json!("Curie"));
+
+        let done = restarted
+            .read_agent_status(AgentRequest {
+                agent_id: "child-done".into(),
+                session_id: Some(session_id.clone()),
+                profile_id: "tenant-a".into(),
+            })
+            .expect("restored terminal status");
+        assert_eq!(done["agent"]["status"], json!("completed"));
 
         let artifacts = restarted
             .list_agent_artifacts(AgentRequest {
