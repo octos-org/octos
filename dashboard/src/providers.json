@@ -142,7 +142,8 @@
         { "id": "moonshot", "label": "Official API" },
         { "id": "autodl", "label": "AutoDL", "base_url": "https://www.autodl.art/api/v1", "api_key_env": "AUTODL_API_KEY" }
       ] },
-      { "id": "kimi-k2.6", "input": 0.6, "output": 2.4, "max_output": 65535 }
+      { "id": "kimi-k2.6", "input": 0.6, "output": 2.4, "max_output": 65535 },
+      { "id": "kimi-k3", "input": 3.0, "output": 15.0, "max_output": 131072 }
     ]
   },
   "dashscope": {
