@@ -685,6 +685,62 @@ fn background_result_kind_label(kind: BackgroundResultKind) -> &'static str {
     }
 }
 
+/// Streams a background spawn child's transcript — assistant text, tool
+/// starts/completions, file modifications — into the parent's
+/// [`SubAgentOutputRouter`] file for its task.
+///
+/// Without this the detached child runs with the default `SilentReporter`
+/// and its entire transcript is dropped: the router file only ever received
+/// spawn_only TOOL output (`execution.rs`), never a spawn CHILD's loop
+/// events, so `read_task_output` on a running child read an absent file and
+/// the agent view could show status but no work (mini4 re-review forensic,
+/// 2026-07-17). The router enforces per-task and total byte caps, so a
+/// chatty child is bounded.
+///
+/// The `router_session_id` must mirror `read_task_output`'s lookup:
+/// `agent:{task.tool_call_id}` where the spawn registers with
+/// `tool_call_id = "spawn-{worker_id}"`.
+struct SpawnChildTranscriptReporter {
+    router: Arc<SubAgentOutputRouter>,
+    router_session_id: String,
+    task_id: String,
+}
+
+impl crate::progress::ProgressReporter for SpawnChildTranscriptReporter {
+    fn report(&self, event: crate::progress::ProgressEvent) {
+        use crate::progress::ProgressEvent;
+        let line = match event {
+            ProgressEvent::Response { content, .. } => {
+                if content.trim().is_empty() {
+                    return;
+                }
+                format!("{content}\n")
+            }
+            ProgressEvent::ToolStarted { name, .. } => format!("[tool] {name}\n"),
+            ProgressEvent::ToolCompleted {
+                name,
+                success,
+                output_preview,
+                ..
+            } => {
+                let status = if success { "ok" } else { "FAILED" };
+                let first = output_preview.lines().next().unwrap_or_default();
+                let first = octos_core::truncated_utf8(first, 200, "…");
+                format!("[tool {status}] {name} — {first}\n")
+            }
+            ProgressEvent::FileModified { path } => format!("[file modified] {path}\n"),
+            // StreamChunk would duplicate the Response event's final content;
+            // Thinking/LlmStatus/etc. are cadence noise for a transcript.
+            _ => return,
+        };
+        // Best-effort: a full router (byte caps) or IO error must never
+        // disturb the child's run.
+        let _ = self
+            .router
+            .append(&self.router_session_id, &self.task_id, line.as_bytes());
+    }
+}
+
 fn record_result_delivery(path: &'static str, outcome: &'static str, kind: BackgroundResultKind) {
     counter!(
         "octos_result_delivery_total",
@@ -3524,6 +3580,12 @@ impl Tool for SpawnTool {
             let working_dir = child_working_dir.clone();
             let inbound_tx = self.inbound_tx.clone();
             let wid = worker_id.clone();
+            // Fix 3 (mini4 re-review): the child's transcript reporter needs
+            // the PARENT's output router and the exact router session id
+            // `read_task_output` derives (`agent:{tool_call_id}` with
+            // `tool_call_id = "spawn-{worker_id}"` from the register above).
+            let parent_output_router = self.parent_subagent_output_router.clone();
+            let child_router_session_id = format!("agent:spawn-{worker_id}");
             // PR #1250 finding 1: the fanout-cap refusal above was the last
             // refusal point on the background path — the detached worker is
             // definitely dispatched below. Disarm the prune guard and move
@@ -3819,11 +3881,30 @@ impl Tool for SpawnTool {
                 // Agent takes ownership so it can also back an LLM-iterative
                 // compaction summarizer if the parent policy requests one.
                 let child_llm_for_compaction = llm.clone();
+                // Fix 3 (mini4 re-review): stream the child's transcript into
+                // the parent's router so `read_task_output` is a LIVE window
+                // into the running child. Default was `SilentReporter` — the
+                // child's assistant text and tool activity were dropped, and
+                // the agent view could only ever show status.
+                let child_transcript_reporter: Option<Arc<dyn crate::progress::ProgressReporter>> =
+                    match (parent_output_router.as_ref(), tracked_task_id.as_ref()) {
+                        (Some(router), Some(task_id)) => {
+                            Some(Arc::new(SpawnChildTranscriptReporter {
+                                router: router.clone(),
+                                router_session_id: child_router_session_id.clone(),
+                                task_id: task_id.clone(),
+                            }))
+                        }
+                        _ => None,
+                    };
                 let mut worker = Agent::new(wid.clone(), llm, tools, memory)
                     // Guard C (issue #607): inherit the parent's spawn
                     // nesting depth + 1 so the detached child sees the
                     // higher value when its own spawn calls run.
                     .with_spawn_depth(child_spawn_depth);
+                if let Some(reporter) = child_transcript_reporter {
+                    worker = worker.with_reporter(reporter);
+                }
                 // Phase 2-D: inherit the parent's SessionScope so the
                 // detached child sees the same filesystem contract as
                 // the sync spawn path (see `child_session_scope`
@@ -4344,6 +4425,18 @@ impl Tool for SpawnTool {
                     ),
                     (Err(e), _) => format!("Status: FAILED\nError: {e}"),
                 };
+                // Durably record the child's FULL result on the task record
+                // before any delivery preview/truncation downstream. This is
+                // what `read_task_output` falls back to for spawn children
+                // (whose transcript never flows through the output router) —
+                // without it, the parent's only copies were a truncated
+                // announce and an empty router read, and models concluded
+                // the child's result "was lost" (mini4 re-review forensic).
+                if let (Some(supervisor), Some(task_id)) =
+                    (task_supervisor.as_ref(), tracked_task_id.as_ref())
+                {
+                    supervisor.record_final_output(task_id, &content);
+                }
                 let (result_kind, result_media) = match (&result, contract_failure.as_ref()) {
                     (Ok(_), Some(_)) => {
                         record_terminal_result_reason(
@@ -6179,6 +6272,145 @@ PY
         // Leak the dir so it stays alive for the test
         let dir = Box::leak(Box::new(dir));
         EpisodeStore::open(dir.path()).await.unwrap()
+    }
+
+    /// Emits assistant text + a `list_dir` call, then a final text answer —
+    /// the minimal shape of a child that plans, uses a tool, and reports.
+    struct ContentThenToolProvider {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait]
+    impl LlmProvider for ContentThenToolProvider {
+        async fn chat(
+            &self,
+            _messages: &[octos_core::Message],
+            _tools: &[octos_llm::ToolSpec],
+            _config: &octos_llm::ChatConfig,
+        ) -> Result<octos_llm::ChatResponse> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            if call == 0 {
+                return Ok(octos_llm::ChatResponse {
+                    content: Some("PLAN: scan the tree".into()),
+                    reasoning_content: None,
+                    tool_calls: vec![octos_core::ToolCall {
+                        id: "call_ls".into(),
+                        name: "list_dir".into(),
+                        arguments: serde_json::json!({"path": "."}),
+                        metadata: None,
+                    }],
+                    stop_reason: octos_llm::StopReason::ToolUse,
+                    usage: octos_llm::TokenUsage::default(),
+                    provider_index: None,
+                });
+            }
+            Ok(octos_llm::ChatResponse {
+                content: Some("FINAL: transcript test done".into()),
+                reasoning_content: None,
+                tool_calls: vec![],
+                stop_reason: octos_llm::StopReason::EndTurn,
+                usage: octos_llm::TokenUsage::default(),
+                provider_index: None,
+            })
+        }
+
+        fn model_id(&self) -> &str {
+            "mock"
+        }
+
+        fn provider_name(&self) -> &str {
+            "mock"
+        }
+    }
+
+    #[tokio::test]
+    async fn background_child_transcript_streams_to_router_and_final_output_is_recorded() {
+        // Mini4 re-review pipeline fix, end-to-end through a REAL detached
+        // background child:
+        //  (a) the child's transcript (assistant text + tool activity) must
+        //      stream into the parent's SubAgentOutputRouter file — the
+        //      live window `read_task_output` reads (old behaviour:
+        //      SilentReporter dropped everything);
+        //  (b) the child's full final result must be recorded on the task
+        //      (`final_output`) through the real completion path.
+        let (in_tx, _in_rx) = tokio::sync::mpsc::channel(16);
+        let temp = tempfile::tempdir().unwrap();
+        let ledger = temp.path().join("tasks.jsonl");
+        let workspace = temp.path().join("ws");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let supervisor = Arc::new(TaskSupervisor::new());
+        supervisor.enable_persistence(&ledger).unwrap();
+        let router = Arc::new(crate::subagent_output::SubAgentOutputRouter::new(
+            temp.path().join("router"),
+        ));
+        let tool = SpawnTool::new(
+            Arc::new(ContentThenToolProvider {
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            }),
+            Arc::new(create_test_store().await),
+            workspace.clone(),
+            in_tx,
+        )
+        .with_task_supervisor(supervisor.clone(), "api:test-session", ledger.clone())
+        .with_parent_subagent_output_router(router.clone());
+
+        let result = tool
+            .execute(&serde_json::json!({
+                "task": "scan the workspace and report",
+                "label": "transcripter",
+                "mode": "background",
+                "allowed_tools": ["list_dir"]
+            }))
+            .await
+            .unwrap();
+        assert!(result.success, "dispatch failed: {}", result.output);
+
+        let started = std::time::Instant::now();
+        let task = loop {
+            let tasks = supervisor.get_tasks_for_session("api:test-session");
+            if let Some(task) = tasks.first() {
+                if task.status == crate::task_supervisor::TaskStatus::Completed {
+                    break task.clone();
+                }
+                if task.status == crate::task_supervisor::TaskStatus::Failed {
+                    panic!("background child failed: {:?}", task.error);
+                }
+            }
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(5),
+                "background child did not complete in time"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        };
+
+        // (b) full final result recorded on the task record.
+        let final_output = task
+            .final_output
+            .as_deref()
+            .expect("final_output must be recorded at completion");
+        assert!(
+            final_output.contains("FINAL: transcript test done"),
+            "final_output must carry the child's answer: {final_output:?}"
+        );
+        assert!(final_output.contains("Status: SUCCESS"));
+
+        // (a) the transcript reached the parent's router file.
+        let transcript = router
+            .preview(&task.id)
+            .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+            .unwrap_or_default();
+        assert!(
+            transcript.contains("[tool] list_dir"),
+            "tool start must stream to the router: {transcript:?}"
+        );
+        assert!(
+            transcript.contains("[tool ok] list_dir"),
+            "tool completion must stream to the router: {transcript:?}"
+        );
+        assert!(
+            transcript.contains("FINAL: transcript test done"),
+            "assistant text must stream to the router: {transcript:?}"
+        );
     }
 
     /// Build a minimal `Input` from a JSON value with the defaults the

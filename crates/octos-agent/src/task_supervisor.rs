@@ -54,6 +54,13 @@ pub const MAX_CHILDREN_PER_PARENT: usize = 200;
 /// logged so operators can spot stuck flows.
 const MAX_PENDING_FAILURES: usize = 256;
 
+/// Cap on the bytes of worker final-output text stored on a
+/// [`BackgroundTask`] (and thus persisted per task-ledger snapshot line).
+/// 128 KiB comfortably holds a multi-page report while bounding ledger
+/// growth; longer outputs are truncated with a marker by
+/// [`TaskSupervisor::record_final_output`].
+const FINAL_OUTPUT_CAP_BYTES: usize = 128 * 1024;
+
 /// Codex round-2 MAJOR (PR #1324): upper bound on
 /// `AckAndPending::emitted_task_ids` before the oldest entry is evicted.
 /// Sized at 4× the pending cap so a long-running supervisor that never
@@ -260,6 +267,18 @@ pub struct BackgroundTask {
     pub completed_at: Option<DateTime<Utc>>,
     pub output_files: Vec<String>,
     pub error: Option<String>,
+    /// Full final output text of the worker, recorded via
+    /// [`TaskSupervisor::record_final_output`] just before the terminal
+    /// transition and capped at [`FINAL_OUTPUT_CAP_BYTES`]. A background
+    /// spawn child's transcript never flows through the
+    /// `SubAgentOutputRouter` (only spawn_only tools append to it), so
+    /// without this field `read_task_output` on such a task read an absent
+    /// router file and returned an empty string — models concluded the
+    /// child's result "was lost" and re-did or overwrote its work.
+    /// `#[serde(default)]` so pre-existing persisted snapshots deserialize
+    /// unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub final_output: Option<String>,
     /// True when the current `Failed` status came from an OBSERVER — the
     /// harness-event bridge (`apply_harness_event`) classifying a mid-run
     /// error as fatal — rather than from the task's owner (the spawn join /
@@ -2122,6 +2141,7 @@ impl TaskSupervisor {
             completed_at: None,
             output_files: Vec::new(),
             error: None,
+            final_output: None,
             failed_by_observer: false,
             session_key: session_key.map(|s| s.to_string()),
             tool_input,
@@ -2448,6 +2468,41 @@ impl TaskSupervisor {
             // task's `mark_synth_ack_emitted` arrives on the same
             // tool_call_id.
             self.drain_pending_failure_for_task(&task.id);
+        }
+    }
+
+    /// Record the worker's full final output text on the task, capped at
+    /// [`FINAL_OUTPUT_CAP_BYTES`]. Called by the spawn completion path just
+    /// before the terminal transition (success AND failure) so
+    /// `read_task_output` — and any announce/recovery flow — can serve the
+    /// child's actual result. Without this, a spawn child's result existed
+    /// only in its in-memory context: the SubAgentOutputRouter file is never
+    /// fed by a spawn child's loop, so `read_task_output` returned an empty
+    /// string and models concluded the result "was lost".
+    ///
+    /// Deliberately NOT gated on terminal status: it records payload, not a
+    /// state transition, and must land whether the record is still `Running`
+    /// or an observer already flipped it. No `notify_change`: dashboards key
+    /// on state transitions, and the subsequent `mark_completed`/`mark_failed`
+    /// snapshot (same lock domain) carries the field to persistence again.
+    pub fn record_final_output(&self, task_id: &str, output: &str) {
+        let snapshot = {
+            let mut tasks = self.tasks.lock().unwrap_or_else(|e| e.into_inner());
+            match tasks.get_mut(task_id) {
+                Some(task) => {
+                    task.final_output = Some(octos_core::truncated_utf8(
+                        output,
+                        FINAL_OUTPUT_CAP_BYTES,
+                        "\n…[final output truncated]",
+                    ));
+                    task.updated_at = Utc::now();
+                    Some(task.clone())
+                }
+                None => None,
+            }
+        };
+        if let Some(ref task) = snapshot {
+            self.persist_snapshot(task);
         }
     }
 

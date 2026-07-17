@@ -1915,6 +1915,21 @@ impl Agent {
                     duration_ms = iter_start.elapsed().as_millis() as u64,
                     "task LLM response"
                 );
+                // Mirror the conversation loop (`process_message_inner`):
+                // surface the assistant's text to the reporter. The task loop
+                // never emitted `Response`, so a task-run agent's reporter —
+                // e.g. the spawn child's transcript reporter streaming into
+                // the SubAgentOutputRouter — saw tool events but none of the
+                // model's own words (mini4 re-review: the agent view showed
+                // status with "nothing coming out").
+                if let Some(content) = response.content.as_deref() {
+                    if !content.trim().is_empty() {
+                        self.reporter().report(ProgressEvent::Response {
+                            content: content.to_string(),
+                            iteration,
+                        });
+                    }
+                }
 
                 match response.stop_reason {
                     StopReason::EndTurn | StopReason::StopSequence => {
