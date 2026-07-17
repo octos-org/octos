@@ -685,6 +685,78 @@ fn background_result_kind_label(kind: BackgroundResultKind) -> &'static str {
     }
 }
 
+/// Frame a child's task with an unambiguous sub-agent identity so a weaker
+/// model does not adopt the parent's perspective from the forked
+/// conversation context (#1704). Leads with WHO the child is and that the
+/// surrounding history is background, then the task itself.
+fn frame_subagent_task(label: &str, task: &str) -> String {
+    format!(
+        "You are a delegated SUB-AGENT named \"{label}\". Any conversation \
+         history in your context is BACKGROUND from the parent that spawned \
+         you — do NOT respond to it, summarize it, or adopt its point of \
+         view. Your ONE job is the task below; execute it and produce its \
+         deliverable.\n\n=== YOUR TASK ===\n{task}"
+    )
+}
+
+/// Detect a role/task capability mismatch (#1704 item 3, #1707 follow-up):
+/// a read-only role (its allow-list has no write/exec surface) paired with a
+/// task that demands writing a file or running a command. Returns a note to
+/// append to the child's instructions so it delivers findings as its final
+/// TEXT instead of silently "completing" without the impossible artifact
+/// (mini4: `role:"reviewer"` children asked to "clone and write a review"
+/// burned whole runs, then the parent hallucinated a fix).
+///
+/// `effective_tools` is the post-role, post-manifest allow-list. An empty
+/// list means "all builtins" — no restriction — so no mismatch.
+fn role_task_capability_warning(effective_tools: &[String], task: &str) -> Option<String> {
+    if effective_tools.is_empty() {
+        return None; // unconstrained: has everything
+    }
+    let has = |names: &[&str]| {
+        effective_tools.iter().any(|t| {
+            names.contains(&t.as_str())
+                || t == "group:fs"
+                || t == "group:runtime"
+                || t.contains('*')
+        })
+    };
+    let can_write = has(&["write_file", "edit_file", "apply_patch", "diff_edit"]);
+    let can_exec = has(&["shell", "bash", "exec_command"]);
+    let lower = task.to_lowercase();
+    let wants_write = [
+        "write ",
+        "save ",
+        "create ",
+        "emit ",
+        "produce ",
+        ".md",
+        "report to",
+    ]
+    .iter()
+    .any(|kw| lower.contains(kw));
+    let wants_exec = ["clone", "git ", "run ", "install", "build", "compile"]
+        .iter()
+        .any(|kw| lower.contains(kw));
+    let mut gaps = Vec::new();
+    if wants_write && !can_write {
+        gaps.push("write files (no write_file/edit_file)");
+    }
+    if wants_exec && !can_exec {
+        gaps.push("run shell commands such as `git clone` (no shell/bash)");
+    }
+    if gaps.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "CAPABILITY NOTE: your task implies actions you cannot perform — you cannot {}. \
+         Do NOT pretend to; instead do everything your tools DO allow (read, search, \
+         fetch) and deliver your full result as your FINAL TEXT ANSWER so the parent \
+         can capture it. State plainly which steps you could not perform.",
+        gaps.join(" and ")
+    ))
+}
+
 fn record_result_delivery(path: &'static str, outcome: &'static str, kind: BackgroundResultKind) {
     counter!(
         "octos_result_delivery_total",
@@ -2573,10 +2645,19 @@ impl Tool for SpawnTool {
             .unwrap_or_else(|| input.task.chars().take(60).collect());
 
         // Build the task prompt (optionally prepend context)
-        let task_desc = match &input.context {
+        let raw_task = match &input.context {
             Some(ctx) => format!("{ctx}\n\n{}", input.task),
             None => input.task.clone(),
         };
+        // #1704: the child's forked context is the parent's whole
+        // conversation with this task appended LAST. A weaker model
+        // pattern-matches the dominant conversation and answers AS THE
+        // PARENT (mini4: a reviewer child's first token was "The user is
+        // asking me to check on the status of two agents…" — it ran ls
+        // probes and delivered a status table instead of cloning/reviewing).
+        // Lead the task with an unambiguous identity + "the history is
+        // background, do only this" directive so the actual objective wins.
+        let task_desc = frame_subagent_task(&label, &raw_task);
 
         let allowed_tools = input.allowed_tools.clone();
         // Effective allow-list = `allowed_tools` minus the manifest's
@@ -2587,6 +2668,21 @@ impl Tool for SpawnTool {
         // relies on deny-wins.
         let effective_allowed_tools =
             effective_allowed_tools(&allowed_tools, &manifest_disallowed_tools);
+        // #1704 item 3: a read-only role (e.g. "reviewer") handed a
+        // clone-and-write task cannot succeed. Warn, and tell the child to
+        // deliver findings as text rather than silently failing to produce
+        // an impossible artifact.
+        if let Some(note) = role_task_capability_warning(&effective_allowed_tools, &input.task) {
+            warn!(
+                worker = %worker_id,
+                role = input.role.as_deref().unwrap_or("<none>"),
+                "spawn role/task capability mismatch; injecting deliver-as-text note"
+            );
+            input.additional_instructions = Some(match input.additional_instructions.take() {
+                Some(existing) if !existing.trim().is_empty() => format!("{existing}\n\n{note}"),
+                _ => note,
+            });
+        }
         let workflow = input.workflow.clone();
         let is_sync = input.mode == "sync";
         let is_agent_mcp = input.backend == "agent_mcp";
@@ -4476,6 +4572,68 @@ impl Tool for SpawnTool {
 mod tests {
     use super::*;
     use crate::{HookConfig, HookEvent};
+
+    #[test]
+    fn frame_subagent_task_leads_with_identity_and_directive() {
+        let out = frame_subagent_task("review-octos-web", "Clone and review the repo.");
+        assert!(out.starts_with("You are a delegated SUB-AGENT named \"review-octos-web\""));
+        assert!(out.contains("do NOT respond to it"));
+        // The real task is present and clearly delimited AFTER the framing.
+        let task_pos = out.find("=== YOUR TASK ===").expect("task delimiter");
+        assert!(out[task_pos..].contains("Clone and review the repo."));
+    }
+
+    #[test]
+    fn role_task_warning_fires_for_readonly_role_with_clone_and_write_task() {
+        // The mini4 reviewer case: read-only allow-list + "clone and write".
+        let reviewer = [
+            "read_file".to_string(),
+            "group:search".to_string(),
+            "web_fetch".to_string(),
+        ];
+        let note = role_task_capability_warning(
+            &reviewer,
+            "Clone the repo and write a review to octos-web-review.md",
+        )
+        .expect("mismatch must warn");
+        assert!(
+            note.contains("git clone"),
+            "flags the missing shell: {note}"
+        );
+        assert!(
+            note.contains("write_file"),
+            "flags the missing writer: {note}"
+        );
+        assert!(note.contains("FINAL TEXT ANSWER"));
+    }
+
+    #[test]
+    fn role_task_warning_silent_when_tools_are_sufficient() {
+        let equipped = [
+            "shell".to_string(),
+            "write_file".to_string(),
+            "read_file".to_string(),
+        ];
+        assert!(
+            role_task_capability_warning(
+                &equipped,
+                "Clone the repo and write a review to octos-web-review.md"
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn role_task_warning_silent_for_unconstrained_and_for_pure_read_task() {
+        // Empty allow-list = all builtins → no restriction.
+        assert!(role_task_capability_warning(&[], "clone and write a report").is_none());
+        // Read-only role + a pure read/summarize task → no mismatch.
+        let reviewer = ["read_file".to_string(), "group:search".to_string()];
+        assert!(
+            role_task_capability_warning(&reviewer, "Summarize the architecture of this diff")
+                .is_none()
+        );
+    }
 
     /// Stub embedder — never invoked; these tests only assert the Arc
     /// is threaded through (mirrors
