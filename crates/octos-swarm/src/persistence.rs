@@ -18,7 +18,7 @@ use eyre::{Result, WrapErr};
 use redb::{Database, TableDefinition};
 use serde::{Deserialize, Serialize};
 
-use crate::result::SubtaskOutcome;
+use crate::result::{SubtaskOutcome, SwarmResult};
 use crate::topology::SwarmTopology;
 
 /// Current schema for the persisted dispatch record. Bumping this
@@ -46,6 +46,14 @@ pub struct DispatchRecord {
     /// `true` once [`crate::Swarm::dispatch`] returns. Restart logic
     /// treats finalized dispatches as idempotent no-ops.
     pub finalized: bool,
+    /// #1718: snapshot of the exact [`SwarmResult`] returned when the
+    /// dispatch finalized — validator verdicts and cost roll-up
+    /// included. Replays return this verbatim instead of recomputing
+    /// from subtask state (recomputation silently dropped validator
+    /// failures). `None` on records persisted before this field
+    /// existed; those replays fall back to recomputation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub final_result: Option<SwarmResult>,
 }
 
 impl DispatchRecord {
@@ -65,6 +73,7 @@ impl DispatchRecord {
             subtasks,
             retry_rounds_used: 0,
             finalized: false,
+            final_result: None,
         }
     }
 }
