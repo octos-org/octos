@@ -144,6 +144,17 @@ impl Agent {
             || msg.contains("connection reset")
             || msg.contains("broken pipe")
     }
+
+    /// Whether an error is specifically a truncated tool call (`#1712`): the
+    /// turn hit the output cap mid-call. The retry loop uses this to raise the
+    /// output budget for the next attempt (a plain retry at the same cap would
+    /// re-truncate). Distinct from a genuinely malformed call.
+    pub(super) fn is_truncated_tool_call_error(err: &eyre::Report) -> bool {
+        matches!(
+            err.downcast_ref::<octos_llm::StreamError>(),
+            Some(octos_llm::StreamError::TruncatedToolCall { .. })
+        )
+    }
 }
 
 fn extract_inline_invokes(content: &str) -> (String, Vec<ToolCall>) {
