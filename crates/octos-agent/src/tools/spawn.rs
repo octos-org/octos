@@ -1504,6 +1504,19 @@ struct Input {
     /// Inline always wins.
     #[serde(default)]
     agent_definition_id: Option<String>,
+    /// Glob (relative to a dedicated per-task output directory) matching the
+    /// deliverable file(s) this spawn is expected to produce. When set, the
+    /// child runs in a FRESH output directory seeded with a workspace-contract
+    /// artifact declaration and is told to write its deliverable there; any
+    /// matching file it leaves — written by ANY means, including a raw `shell`
+    /// heredoc that reports no `file_modified` — is surfaced as the task's
+    /// `output_files` via the existing workspace-contract artifact resolver.
+    /// Empty string is treated as `*` (top-level files). Absent = legacy
+    /// behaviour: `output_files` come only from `write_file`/`edit_file` tool
+    /// records, so a shell-written deliverable would not surface (issue: the
+    /// mini4 code reviews wrote via shell and reported no output_files).
+    #[serde(default)]
+    deliverable: Option<String>,
 }
 
 fn default_backend() -> String {
@@ -2162,6 +2175,94 @@ fn resolve_contract_workspace_root(
     }
 }
 
+/// Glob used when a spawn requests deliverable collection with an empty
+/// pattern: top-level files only (not `**/*`, which would also sweep up a
+/// repository the worker cloned into its output dir).
+const DEFAULT_DELIVERABLE_GLOB: &str = "*";
+
+/// Appended to the worker's system prompt when a `deliverable` is declared, so
+/// the child writes its output where the seeded contract will find it. Kept
+/// tool-agnostic on purpose: the whole point is that a `shell` heredoc into the
+/// CWD works just as well as `write_file`.
+const DELIVERABLE_WORKER_DIRECTIVE: &str = "DELIVERABLE — IMPORTANT: write your final deliverable file(s) into the CURRENT WORKING DIRECTORY (the process cwd). Anything you leave there is automatically collected as this task's output; you do NOT need a write_file tool — a shell redirect or heredoc into the cwd (e.g. `cat > report.md <<'EOF'`) is fine. Do NOT write your deliverable outside the cwd (for example, do not write it under /tmp), or it will not be collected.";
+
+/// Normalize a caller-supplied `deliverable` value into an artifact glob, or
+/// `None` when the spawn did not request deliverable collection. An empty
+/// string means "collect the top-level files I leave behind".
+fn deliverable_artifact_glob(deliverable: Option<&str>) -> Option<String> {
+    deliverable.map(|glob| {
+        let trimmed = glob.trim();
+        if trimmed.is_empty() {
+            DEFAULT_DELIVERABLE_GLOB.to_string()
+        } else {
+            trimmed.to_string()
+        }
+    })
+}
+
+/// Seed a minimal workspace-contract policy in `output_dir` declaring a single
+/// `primary` artifact matching `artifact_glob`.
+///
+/// This reuses the existing workspace-contract harness rather than inventing a
+/// bespoke scan: [`resolve_workspace_contract_artifact_paths`] reads this
+/// policy's declared glob and resolves matches on disk — the SAME artifact
+/// resolver the slides/sites contracts use — so a deliverable written by ANY
+/// means (a `shell` heredoc, `write_file`, a plugin) is surfaced, not just
+/// files reported through a tracked write tool. The seeded policy is `Session`
+/// kind with no validators or git auto-init: we want the artifact-glob
+/// resolution, not the slides/sites content validators (which would reject a
+/// plain document) or `inspect_workspace_contract_at_root`'s project-kind gate.
+fn seed_deliverable_contract(output_dir: &Path, artifact_glob: &str) -> Result<()> {
+    use crate::workspace_policy::{
+        ValidationPolicy, WorkspaceArtifactsPolicy, WorkspacePolicy, WorkspacePolicyKind,
+        WorkspacePolicyWorkspace, WorkspaceSnapshotTrigger, WorkspaceTrackingPolicy,
+        WorkspaceVersionControlPolicy, WorkspaceVersionControlProvider, write_workspace_policy,
+    };
+    use std::collections::BTreeMap;
+
+    std::fs::create_dir_all(output_dir).wrap_err_with(|| {
+        format!(
+            "failed to create deliverable output dir {}",
+            output_dir.display()
+        )
+    })?;
+
+    let policy = WorkspacePolicy {
+        schema_version: crate::abi_schema::WORKSPACE_POLICY_SCHEMA_VERSION,
+        workspace: WorkspacePolicyWorkspace {
+            kind: WorkspacePolicyKind::Session,
+        },
+        version_control: WorkspaceVersionControlPolicy {
+            provider: WorkspaceVersionControlProvider::Git,
+            auto_init: false,
+            trigger: WorkspaceSnapshotTrigger::TurnEnd,
+            fail_on_error: false,
+        },
+        tracking: WorkspaceTrackingPolicy { ignore: Vec::new() },
+        validation: ValidationPolicy::default(),
+        artifacts: WorkspaceArtifactsPolicy {
+            entries: BTreeMap::from([(
+                PRIMARY_CONTRACT_ARTIFACT.to_string(),
+                artifact_glob.to_string(),
+            )]),
+        },
+        spawn_tasks: BTreeMap::new(),
+        compaction: None,
+    };
+    write_workspace_policy(output_dir, &policy)
+        .wrap_err("failed to seed deliverable workspace contract")
+}
+
+/// Resolve the files a deliverable spawn produced by consulting the seeded
+/// workspace contract in `output_dir`. Returns whatever matches the declared
+/// `primary` artifact glob on disk — independent of which tool (if any) wrote
+/// them. Because the output dir is created fresh per task, no mtime baseline is
+/// needed: every match is something the worker left behind this run.
+fn resolve_deliverable_terminal_files(output_dir: &Path) -> Vec<PathBuf> {
+    resolve_workspace_contract_artifact_paths(output_dir, PRIMARY_CONTRACT_ARTIFACT)
+        .unwrap_or_default()
+}
+
 fn resolve_background_terminal_files(
     working_dir: &std::path::Path,
     files_to_send: &[PathBuf],
@@ -2506,6 +2607,10 @@ impl Tool for SpawnTool {
                 "agent_definition_id": {
                     "type": "string",
                     "description": "Optional id of an AgentDefinition manifest (see crates/octos-agent/src/agents). The manifest's fields (tools, model, max_turns, etc.) become defaults for this spawn; any inline field on the spawn args overrides the manifest (inline wins)."
+                },
+                "deliverable": {
+                    "type": "string",
+                    "description": "Glob for the file(s) this spawn should produce (e.g. '*-review.md', 'report.md'). When set, the child runs in a fresh output directory and is told to write its deliverable there; whatever matches the glob is collected as this task's output_files — even if the worker wrote it with a shell heredoc rather than write_file. Empty string means '*' (top-level files). Use a PRECISE glob (avoid '**/*') so a repo the worker clones into its output dir is not swept in."
                 }
             },
             "required": ["task"]
@@ -2593,6 +2698,18 @@ impl Tool for SpawnTool {
         if is_agent_mcp && input.isolation == WorkerIsolation::Worktree {
             return Ok(ToolResult {
                 output: "Status: FAILED\nworktree isolation is currently supported only for builtin subagents".to_string(),
+                success: false,
+                ..Default::default()
+            });
+        }
+        // `deliverable` already gives the child a dedicated, scanned output
+        // directory. Combined with worktree isolation the child's session scope
+        // would be rooted at the worktree while its cwd is the deliverable dir,
+        // so the scope would reject the very writes we want to collect. Reject
+        // the combination rather than silently drop the deliverable.
+        if input.deliverable.is_some() && input.isolation == WorkerIsolation::Worktree {
+            return Ok(ToolResult {
+                output: "Status: FAILED\n`deliverable` collection is not supported with worktree isolation; it already provides an isolated output directory".to_string(),
                 success: false,
                 ..Default::default()
             });
@@ -3108,10 +3225,51 @@ impl Tool for SpawnTool {
                 }
             }
         };
-        let child_working_dir = worker_worktree_guard
-            .as_ref()
-            .map(|guard| guard.worktree().path.clone())
-            .unwrap_or_else(|| self.working_dir.clone());
+        // Deliverable contract (option 2): when a spawn declares a
+        // `deliverable` glob, give the child a FRESH per-task output directory
+        // seeded with a workspace-contract artifact declaration, tell it to
+        // write its deliverable into that directory, and surface whatever
+        // matches on completion — even a raw `shell` heredoc that reports no
+        // `file_modified`. This reuses the workspace-contract artifact resolver
+        // (`resolve_workspace_contract_artifact_paths`) rather than the
+        // tool-record-only path, which is blind to shell writes.
+        let deliverable_glob = deliverable_artifact_glob(input.deliverable.as_deref());
+        if deliverable_glob.is_some() {
+            input.additional_instructions = Some(match input.additional_instructions.take() {
+                Some(existing) if !existing.trim().is_empty() => {
+                    format!("{existing}\n\n{DELIVERABLE_WORKER_DIRECTIVE}")
+                }
+                _ => DELIVERABLE_WORKER_DIRECTIVE.to_string(),
+            });
+        }
+        let child_working_dir = match deliverable_glob.as_deref() {
+            Some(glob) => {
+                let out = self
+                    .working_dir
+                    .join(".octos")
+                    .join("spawn-deliverables")
+                    .join(worker_id.to_string());
+                // worker_id ("subagent-N") can repeat across turns, so start
+                // from a clean directory — otherwise a stale deliverable from a
+                // prior run would be surfaced (the output dir has no mtime
+                // baseline because it is meant to be fresh).
+                let _ = std::fs::remove_dir_all(&out);
+                if let Err(error) = seed_deliverable_contract(&out, glob) {
+                    return Ok(ToolResult {
+                        output: format!(
+                            "Status: FAILED\nfailed to seed deliverable output dir: {error}"
+                        ),
+                        success: false,
+                        ..Default::default()
+                    });
+                }
+                out
+            }
+            None => worker_worktree_guard
+                .as_ref()
+                .map(|guard| guard.worktree().path.clone())
+                .unwrap_or_else(|| self.working_dir.clone()),
+        };
 
         let sub_llm = self.resolve_sub_provider(input.model.as_deref(), input.context_window)?;
 
@@ -3522,6 +3680,9 @@ impl Tool for SpawnTool {
             let llm = sub_llm;
             let memory = self.memory.clone();
             let working_dir = child_working_dir.clone();
+            // When a deliverable contract was seeded, `working_dir` IS the
+            // per-task output dir; surface its declared artifacts on completion.
+            let deliverable_declared = deliverable_glob.is_some();
             let inbound_tx = self.inbound_tx.clone();
             let wid = worker_id.clone();
             // PR #1250 finding 1: the fanout-cap refusal above was the last
@@ -4031,6 +4192,19 @@ impl Tool for SpawnTool {
                     }
                     _ => Vec::new(),
                 };
+                // Deliverable contract: surface whatever the worker left in its
+                // seeded output dir, however it was written (a `shell` heredoc
+                // reports no `file_modified`, so the tool-record path above
+                // misses it). `working_dir` IS that output dir when a
+                // deliverable was declared. Only on success.
+                if deliverable_declared && matches!(&result, Ok(task_result) if task_result.success)
+                {
+                    for path in resolve_deliverable_terminal_files(&working_dir) {
+                        if !terminal_files.contains(&path) {
+                            terminal_files.push(path);
+                        }
+                    }
+                }
                 let workflow_kind = workflow_metadata
                     .as_ref()
                     .map(|workflow| workflow.workflow_kind.clone());
@@ -5209,6 +5383,70 @@ mod tests {
     }
 
     #[test]
+    fn deliverable_contract_surfaces_a_shell_written_file_no_tool_reported_it() {
+        // Reproduces the mini4 "zero deliverable" bug: a worker with no
+        // write_file in its toolset wrote its review via a shell heredoc, so
+        // the tool-record path saw nothing. The seeded workspace contract must
+        // surface the file regardless of how it was written.
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        seed_deliverable_contract(root, "*.md").expect("seed deliverable contract");
+
+        // Simulate `cat > octos-review.md <<EOF ...` — no write_file ran, so
+        // files_modified / files_to_send are both empty.
+        std::fs::write(root.join("octos-review.md"), "# Review\n").unwrap();
+
+        // Control: the pre-existing tool-record path is blind to it (the bug).
+        let via_tool_record = resolve_background_terminal_files(root, &[], &[], None).unwrap();
+        assert!(
+            via_tool_record.is_empty(),
+            "tool-record path should see nothing: {via_tool_record:?}"
+        );
+
+        // Fix: the workspace contract surfaces the shell-written deliverable.
+        let via_contract = resolve_deliverable_terminal_files(root);
+        assert_eq!(via_contract.len(), 1, "contract surfaced: {via_contract:?}");
+        assert!(via_contract[0].ends_with("octos-review.md"));
+    }
+
+    #[test]
+    fn deliverable_contract_only_surfaces_the_declared_glob() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        seed_deliverable_contract(root, "*.md").unwrap();
+        std::fs::write(root.join("keep.md"), "deliverable").unwrap();
+        std::fs::write(root.join("scratch.log"), "noise").unwrap();
+        // A nested clone dir must not be swept in by the top-level `*.md` glob.
+        std::fs::create_dir_all(root.join("cloned-repo")).unwrap();
+        std::fs::write(root.join("cloned-repo").join("README.md"), "upstream").unwrap();
+
+        let files = resolve_deliverable_terminal_files(root);
+        assert_eq!(
+            files.len(),
+            1,
+            "only the top-level .md deliverable: {files:?}"
+        );
+        assert!(files[0].ends_with("keep.md"));
+    }
+
+    #[test]
+    fn deliverable_artifact_glob_normalizes_empty_and_absent() {
+        assert_eq!(deliverable_artifact_glob(None), None);
+        assert_eq!(
+            deliverable_artifact_glob(Some("")).as_deref(),
+            Some(DEFAULT_DELIVERABLE_GLOB)
+        );
+        assert_eq!(
+            deliverable_artifact_glob(Some("  ")).as_deref(),
+            Some(DEFAULT_DELIVERABLE_GLOB)
+        );
+        assert_eq!(
+            deliverable_artifact_glob(Some("*-review.md")).as_deref(),
+            Some("*-review.md")
+        );
+    }
+
+    #[test]
     fn workflow_terminal_output_prefers_final_presentation_and_skips_scratch_files() {
         let workflow = WorkflowMetadata {
             workflow_kind: "slides".to_string(),
@@ -6179,6 +6417,197 @@ PY
         // Leak the dir so it stays alive for the test
         let dir = Box::leak(Box::new(dir));
         EpisodeStore::open(dir.path()).await.unwrap()
+    }
+
+    /// Emits one `shell` call that writes a deliverable via a redirect —
+    /// reporting no `file_modified`, exactly like the mini4 heredoc reviews —
+    /// then ends the turn.
+    struct ShellDeliverableProvider {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait]
+    impl LlmProvider for ShellDeliverableProvider {
+        async fn chat(
+            &self,
+            _messages: &[octos_core::Message],
+            _tools: &[octos_llm::ToolSpec],
+            _config: &octos_llm::ChatConfig,
+        ) -> Result<octos_llm::ChatResponse> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            if call == 0 {
+                return Ok(octos_llm::ChatResponse {
+                    content: None,
+                    reasoning_content: None,
+                    tool_calls: vec![octos_core::ToolCall {
+                        id: "call_shell".into(),
+                        name: "shell".into(),
+                        arguments: serde_json::json!({
+                            "command": "printf '# Review\\n' > octos-review.md",
+                        }),
+                        metadata: None,
+                    }],
+                    stop_reason: octos_llm::StopReason::ToolUse,
+                    usage: octos_llm::TokenUsage::default(),
+                    provider_index: None,
+                });
+            }
+            Ok(octos_llm::ChatResponse {
+                content: Some("wrote the review".into()),
+                reasoning_content: None,
+                tool_calls: vec![],
+                stop_reason: octos_llm::StopReason::EndTurn,
+                usage: octos_llm::TokenUsage::default(),
+                provider_index: None,
+            })
+        }
+
+        fn model_id(&self) -> &str {
+            "mock"
+        }
+
+        fn provider_name(&self) -> &str {
+            "mock"
+        }
+    }
+
+    #[tokio::test]
+    async fn background_deliverable_surfaces_shell_written_file_in_output_files() {
+        // End-to-end reproduction of the mini4 "zero deliverable" flow: a
+        // background spawn whose worker writes its deliverable with a raw
+        // `shell` redirect — NO write_file, so no `file_modified` — must still
+        // land in the task ledger's `output_files`, surfaced by the seeded
+        // workspace contract rather than the tool-record path.
+        let (in_tx, _in_rx) = tokio::sync::mpsc::channel(16);
+        let temp = tempfile::tempdir().unwrap();
+        let ledger = temp.path().join("tasks.jsonl");
+        let workspace = temp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let supervisor = Arc::new(TaskSupervisor::new());
+        supervisor.enable_persistence(&ledger).unwrap();
+        let tool = SpawnTool::new(
+            Arc::new(ShellDeliverableProvider {
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            }),
+            Arc::new(create_test_store().await),
+            workspace.clone(),
+            in_tx,
+        )
+        .with_task_supervisor(supervisor.clone(), "api:test-session", ledger.clone())
+        .with_sandbox(SandboxConfig {
+            mode: crate::sandbox::SandboxMode::None,
+            ..Default::default()
+        });
+
+        let result = tool
+            .execute(&serde_json::json!({
+                "task": "Review the repo, then write octos-review.md",
+                "label": "reviewer",
+                "mode": "background",
+                "allowed_tools": ["shell"],
+                "deliverable": "*.md"
+            }))
+            .await
+            .unwrap();
+        assert!(result.success, "spawn dispatch failed: {}", result.output);
+
+        let started = std::time::Instant::now();
+        loop {
+            let tasks = supervisor.get_tasks_for_session("api:test-session");
+            if let Some(task) = tasks.first() {
+                match task.status {
+                    crate::task_supervisor::TaskStatus::Completed => {
+                        assert_eq!(
+                            task.output_files.len(),
+                            1,
+                            "the shell-written deliverable must surface in output_files: {:?}",
+                            task.output_files
+                        );
+                        assert!(
+                            task.output_files[0].ends_with("octos-review.md"),
+                            "output_files[0] = {:?}",
+                            task.output_files[0]
+                        );
+                        break;
+                    }
+                    crate::task_supervisor::TaskStatus::Failed => {
+                        panic!("background deliverable spawn failed: {:?}", task.error);
+                    }
+                    _ => {}
+                }
+            }
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(5),
+                "background deliverable spawn did not complete in time"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn background_without_deliverable_does_not_surface_shell_write() {
+        // Control for the test above: the SAME shell-written file does NOT
+        // surface without `deliverable` — confirming the deliverable contract
+        // (not some other path) is what closes the gap.
+        let (in_tx, _in_rx) = tokio::sync::mpsc::channel(16);
+        let temp = tempfile::tempdir().unwrap();
+        let ledger = temp.path().join("tasks.jsonl");
+        let workspace = temp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let supervisor = Arc::new(TaskSupervisor::new());
+        supervisor.enable_persistence(&ledger).unwrap();
+        let tool = SpawnTool::new(
+            Arc::new(ShellDeliverableProvider {
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            }),
+            Arc::new(create_test_store().await),
+            workspace.clone(),
+            in_tx,
+        )
+        .with_task_supervisor(supervisor.clone(), "api:test-session", ledger.clone())
+        .with_sandbox(SandboxConfig {
+            mode: crate::sandbox::SandboxMode::None,
+            ..Default::default()
+        });
+
+        let result = tool
+            .execute(&serde_json::json!({
+                "task": "Review the repo, then write octos-review.md",
+                "label": "reviewer",
+                "mode": "background",
+                "allowed_tools": ["shell"]
+                // no `deliverable`
+            }))
+            .await
+            .unwrap();
+        assert!(result.success, "spawn dispatch failed: {}", result.output);
+
+        let started = std::time::Instant::now();
+        loop {
+            let tasks = supervisor.get_tasks_for_session("api:test-session");
+            if let Some(task) = tasks.first() {
+                match task.status {
+                    crate::task_supervisor::TaskStatus::Completed => {
+                        assert!(
+                            task.output_files.is_empty(),
+                            "without a deliverable contract the shell write must NOT surface \
+                             (the bug being fixed): {:?}",
+                            task.output_files
+                        );
+                        break;
+                    }
+                    crate::task_supervisor::TaskStatus::Failed => {
+                        panic!("spawn failed: {:?}", task.error);
+                    }
+                    _ => {}
+                }
+            }
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(5),
+                "background spawn did not complete in time"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
     }
 
     /// Build a minimal `Input` from a JSON value with the defaults the
