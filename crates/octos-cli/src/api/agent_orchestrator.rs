@@ -481,6 +481,20 @@ pub(crate) fn upsert_background_task_agent(
             agent = updated;
         }
     }
+    // Mini4 re-review follow-up: surface the child's supervisor-recorded
+    // final output on the mirrored agent record so `agent/output/read` (the
+    // TUI Tab agent view) has something to render. Idempotent — only fills
+    // an empty record, and only once the task carries a final output.
+    if let Some(final_output) = task.final_output.as_deref() {
+        if !final_output.trim().is_empty() {
+            let _ = orchestrator.set_agent_output_if_empty(
+                &agent_id,
+                &session_id,
+                &profile_id,
+                final_output,
+            );
+        }
+    }
     Some((session_id, agent))
 }
 
@@ -1327,6 +1341,42 @@ impl InProcessAgentOrchestrator {
         agent.output.push_str(text);
         agent.updated_at_ms = now_ms();
         Ok(())
+    }
+
+    /// Set the agent record's output ONCE — only while it is still empty.
+    ///
+    /// Used by the background-task mirror at completion: a spawn child's
+    /// supervisor-recorded `final_output` becomes the agent's readable
+    /// output so `agent/output/read` (the TUI Tab agent view) renders the
+    /// child's actual result instead of empty text (mini4 re-review:
+    /// "sub-agent status shows, but nothing comes out"). Upserts fire on
+    /// every status transition, so this must be idempotent; specialist
+    /// agents that stream via `append_agent_output` are never empty here
+    /// and are left untouched.
+    pub(crate) fn set_agent_output_if_empty(
+        &self,
+        agent_id: &str,
+        session_id: &SessionKey,
+        profile_id: &str,
+        text: &str,
+    ) -> Result<bool, RpcError> {
+        let mut state = self.state();
+        let request = AgentRequest {
+            agent_id: agent_id.to_owned(),
+            session_id: Some(session_id.clone()),
+            profile_id: profile_id.to_owned(),
+        };
+        let agent = state
+            .agents
+            .get_mut(agent_id)
+            .ok_or_else(|| agent_not_found_error(&request))?;
+        ensure_agent_control_scope(agent, Some(session_id), profile_id)?;
+        if !agent.output.is_empty() {
+            return Ok(false);
+        }
+        agent.output.push_str(text);
+        agent.updated_at_ms = now_ms();
+        Ok(true)
     }
 
     pub(crate) fn set_agent_artifacts(
@@ -7681,6 +7731,71 @@ mod tests {
                 MasterContinuationReason::ChildCompleted,
                 MasterContinuationReason::ScatterJoinComplete
             ]
+        );
+    }
+
+    #[test]
+    fn background_task_mirror_surfaces_final_output_for_agent_output_read() {
+        // Mini4 re-review follow-up: a spawn child's recorded final_output
+        // must become the mirrored agent's readable output so the TUI Tab
+        // agent view (AGENT_OUTPUT_READ) renders the child's result instead
+        // of empty text — idempotently across repeated upserts.
+        let session_id = SessionKey::with_profile("tenant-a", "api", "bg-final-output");
+        let now = Utc::now();
+        let task = octos_agent::BackgroundTask {
+            id: "bg-fo-1".into(),
+            tool_name: "review-child".into(),
+            tool_call_id: "call-fo-1".into(),
+            parent_session_key: Some(session_id.to_string()),
+            child_session_key: None,
+            child_terminal_state: None,
+            child_join_state: None,
+            child_joined_at: None,
+            child_failure_action: None,
+            task_ledger_path: None,
+            status: octos_agent::TaskStatus::Completed,
+            runtime_state: octos_agent::TaskRuntimeState::Completed,
+            runtime_detail: None,
+            started_at: now,
+            updated_at: now,
+            completed_at: Some(now),
+            output_files: Vec::new(),
+            error: None,
+            final_output: Some("Status: SUCCESS\n\nREVIEW BODY: token in localStorage".into()),
+            failed_by_observer: false,
+            session_key: Some(session_id.to_string()),
+            tool_input: None,
+            originating_client_message_id: None,
+            source: None,
+            role: None,
+            summary: None,
+            artifact_count: None,
+            runtime_policy_stamp: None,
+        };
+
+        let (_, agent) = upsert_background_task_agent(&task, None).expect("task should mirror");
+        // Second upsert (status refresh) must not duplicate the output.
+        upsert_background_task_agent(&task, None).expect("re-upsert mirrors");
+
+        let agent_id = agent["agent_id"].as_str().expect("agent id").to_owned();
+        let output = default_agent_orchestrator()
+            .read_agent_output(AgentOutputRequest {
+                agent_id,
+                session_id: Some(session_id.clone()),
+                profile_id: "tenant-a".to_owned(),
+                cursor: None,
+                limit: None,
+            })
+            .expect("agent output readable");
+        let text = output["text"].as_str().expect("text");
+        assert!(
+            text.contains("REVIEW BODY: token in localStorage"),
+            "final_output must be readable via agent/output/read: {text:?}"
+        );
+        assert_eq!(
+            text.matches("REVIEW BODY").count(),
+            1,
+            "repeated upserts must not duplicate the output: {text:?}"
         );
     }
 

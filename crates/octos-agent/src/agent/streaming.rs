@@ -135,6 +135,13 @@ impl Agent {
 
         let mut text = String::new();
         let mut reasoning = String::new();
+        // MiniMax/Qwen-style models embed chain-of-thought INLINE as
+        // <think>…</think> in content deltas (no structured reasoning
+        // lane). Route those spans to ReasoningChunk as they arrive so the
+        // client's thinking-display toggle governs them — otherwise the raw
+        // tags render live in transcripts even though the post-stream strip
+        // below cleans the FINAL content (mini4, 2026-07-17).
+        let mut think_splitter = octos_llm::ThinkTagStreamSplitter::new();
         // (id, name, args_json, metadata)
         let mut tool_calls: Vec<(String, String, String, Option<serde_json::Value>)> = Vec::new();
         let mut usage = octos_llm::TokenUsage::default();
@@ -278,11 +285,21 @@ impl Agent {
                 }
                 StreamEvent::TextDelta(delta) => {
                     got_first_chunk = true;
-                    self.reporter().report(ProgressEvent::StreamChunk {
-                        text: delta.clone(),
-                        iteration,
-                    });
-                    text.push_str(&delta);
+                    let (content_part, reasoning_part) = think_splitter.feed(&delta);
+                    if !reasoning_part.is_empty() {
+                        reasoning.push_str(&reasoning_part);
+                        self.reporter().report(ProgressEvent::ReasoningChunk {
+                            text: reasoning_part,
+                            iteration,
+                        });
+                    }
+                    if !content_part.is_empty() {
+                        self.reporter().report(ProgressEvent::StreamChunk {
+                            text: content_part.clone(),
+                            iteration,
+                        });
+                        text.push_str(&content_part);
+                    }
                 }
                 StreamEvent::ToolCallDelta {
                     index,
@@ -335,7 +352,19 @@ impl Agent {
             }
         }
 
-        let streamed = !text.is_empty();
+        // Flush the splitter's holdback (a trailing partial tag was literal
+        // text; an unclosed <think> tail is reasoning).
+        {
+            let (content_tail, reasoning_tail) = think_splitter.finish();
+            if !reasoning_tail.is_empty() {
+                reasoning.push_str(&reasoning_tail);
+            }
+            if !content_tail.is_empty() {
+                text.push_str(&content_tail);
+            }
+        }
+
+        let streamed = !text.is_empty() || !reasoning.is_empty();
         if streamed {
             self.reporter()
                 .report(ProgressEvent::StreamDone { iteration });
