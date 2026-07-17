@@ -866,6 +866,12 @@ impl ProfileRuntime {
         let cron_service = Arc::new(CronService::new(data_dir.join("cron.json"), cron_tx));
         cron_service.start();
         tools.register(CronTool::with_context(cron_service.clone(), "api", ""));
+        // #1696 — structured goal tools: goal_get (objective + remaining
+        // budget) and goal_update (model-owned complete|blocked ONLY,
+        // executor-enforced). Session resolved per-call from
+        // ToolContext::parent_session_key; profile scope pinned here.
+        tools.register(crate::goal_tool::GoalGetTool::new(profile.id.clone()));
+        tools.register(crate::goal_tool::GoalUpdateTool::new(profile.id.clone()));
 
         // Step 17: re-apply tool policy AFTER plugin / memory-bank
         // registration so deny entries can target plugin-declared
