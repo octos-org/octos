@@ -2184,7 +2184,50 @@ const DEFAULT_DELIVERABLE_GLOB: &str = "*";
 /// the child writes its output where the seeded contract will find it. Kept
 /// tool-agnostic on purpose: the whole point is that a `shell` heredoc into the
 /// CWD works just as well as `write_file`.
-const DELIVERABLE_WORKER_DIRECTIVE: &str = "DELIVERABLE — IMPORTANT: write your final deliverable file(s) into the CURRENT WORKING DIRECTORY (the process cwd). Anything you leave there is automatically collected as this task's output; you do NOT need a write_file tool — a shell redirect or heredoc into the cwd (e.g. `cat > report.md <<'EOF'`) is fine. Do NOT write your deliverable outside the cwd (for example, do not write it under /tmp), or it will not be collected.";
+const DELIVERABLE_WORKER_DIRECTIVE: &str = "DELIVERABLE — IMPORTANT: your job is to WRITE a deliverable FILE into the CURRENT WORKING DIRECTORY, not to explore forever. Do a focused amount of exploration, then WRITE the file EARLY (a solid first draft) and refine it if you have budget left — do NOT run dozens of shell/read commands before writing anything. Anything you leave in the cwd is automatically collected as this task's output; you do NOT need a write_file tool — a shell redirect or heredoc into the cwd (e.g. `cat > report.md <<'EOF'`) works. Do NOT write your deliverable outside the cwd (e.g. not under /tmp). If you finish your run without a written file, your work is LOST — so writing the file is the single most important step, more important than completeness.";
+
+/// A child's final text must be at least this many bytes to be worth
+/// salvaging into its declared-but-unwritten deliverable file. Filters out
+/// terse "done"/status replies while catching real inline deliveries.
+const DELIVERABLE_AUTOMATERIALIZE_MIN_BYTES: usize = 400;
+
+/// Derive a concrete deliverable filename from the declared glob and the
+/// task label, for the auto-materialize salvage. The result must MATCH the
+/// glob so [`resolve_deliverable_terminal_files`] then surfaces it.
+///
+/// - single-`*` glob (`*-review.md`, `*.md`, `report-*.txt`) → replace `*`
+///   with a slug of the label's first word (`octos-web review` → `octos-web`
+///   → `octos-web-review.md`);
+/// - literal filename (no `*`) → use it verbatim;
+/// - anything else → `<slug>-review.md` (matches the common `*-review.md` /
+///   `*.md` review globs).
+fn derive_deliverable_filename(glob: &str, label: &str) -> String {
+    let slug: String = label
+        .split_whitespace()
+        .next()
+        .unwrap_or("output")
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let slug = if slug.trim_matches('-').is_empty() {
+        "output".to_string()
+    } else {
+        slug
+    };
+    if glob.matches('*').count() == 1 {
+        glob.replacen('*', &slug, 1)
+    } else if !glob.contains('*') && glob.contains('.') && !glob.contains('/') {
+        glob.to_string()
+    } else {
+        format!("{slug}-review.md")
+    }
+}
 
 /// Normalize a caller-supplied `deliverable` value into an artifact glob, or
 /// `None` when the spawn did not request deliverable collection. An empty
@@ -3683,6 +3726,8 @@ impl Tool for SpawnTool {
             // When a deliverable contract was seeded, `working_dir` IS the
             // per-task output dir; surface its declared artifacts on completion.
             let deliverable_declared = deliverable_glob.is_some();
+            // Kept for the completion-time auto-materialize salvage (below).
+            let deliverable_glob_for_completion = deliverable_glob.clone();
             let inbound_tx = self.inbound_tx.clone();
             let wid = worker_id.clone();
             // PR #1250 finding 1: the fanout-cap refusal above was the last
@@ -4204,6 +4249,43 @@ impl Tool for SpawnTool {
                             terminal_files.push(path);
                         }
                     }
+                    // Auto-materialize salvage: the child declared a deliverable
+                    // but wrote NO matching file, yet returned substantial final
+                    // text — it delivered the work INLINE instead of to a file
+                    // (mini4 live soak: a MiniMax reviewer returned a 14 KB
+                    // review as its final answer, files_modified=0; another
+                    // explore-looped to the iteration cap). Write that text to
+                    // the declared deliverable path so the artifact exists and
+                    // the parent's output pipeline surfaces it, instead of the
+                    // work being lost.
+                    if terminal_files.is_empty() {
+                        if let Ok(task_result) = &result {
+                            let body = task_result.output.trim();
+                            if body.len() >= DELIVERABLE_AUTOMATERIALIZE_MIN_BYTES {
+                                let name = derive_deliverable_filename(
+                                    deliverable_glob_for_completion.as_deref().unwrap_or("*.md"),
+                                    &task_label,
+                                );
+                                let path = working_dir.join(&name);
+                                match std::fs::write(&path, task_result.output.as_bytes()) {
+                                    Ok(()) => {
+                                        info!(
+                                            worker = %wid,
+                                            file = %path.display(),
+                                            bytes = body.len(),
+                                            "auto-materialized deliverable from child final output"
+                                        );
+                                        terminal_files.push(path);
+                                    }
+                                    Err(error) => warn!(
+                                        worker = %wid,
+                                        %error,
+                                        "failed to auto-materialize deliverable from final output"
+                                    ),
+                                }
+                            }
+                        }
+                    }
                 }
                 let workflow_kind = workflow_metadata
                     .as_ref()
@@ -4651,6 +4733,132 @@ mod tests {
     use super::*;
     use crate::{HookConfig, HookEvent};
 
+    #[test]
+    fn derive_deliverable_filename_matches_the_declared_glob() {
+        // The single-* review glob → slug from label's first word.
+        assert_eq!(
+            derive_deliverable_filename("*-review.md", "octos-web review"),
+            "octos-web-review.md"
+        );
+        assert_eq!(
+            derive_deliverable_filename("*.md", "octos-one review"),
+            "octos-one.md"
+        );
+        // Literal filename → verbatim.
+        assert_eq!(
+            derive_deliverable_filename("report.md", "anything"),
+            "report.md"
+        );
+        // Odd/multi-* glob → sensible fallback that matches *-review.md / *.md.
+        let fb = derive_deliverable_filename("**/*.md", "octos-web review");
+        assert_eq!(fb, "octos-web-review.md");
+        // Non-alnum label sanitized; empty → output.
+        assert_eq!(
+            derive_deliverable_filename("*-review.md", "  "),
+            "output-review.md"
+        );
+    }
+
+    #[tokio::test]
+    async fn background_deliverable_auto_materializes_inline_final_output() {
+        // Live-soak fix: a child that declared a deliverable but returned its
+        // work as FINAL TEXT (no file) must have that text written to the
+        // deliverable path so it surfaces in output_files instead of being
+        // lost. Uses a mock provider that ends with a long text answer and
+        // never writes a file.
+        struct InlineReviewProvider;
+        #[async_trait]
+        impl LlmProvider for InlineReviewProvider {
+            async fn chat(
+                &self,
+                _m: &[octos_core::Message],
+                _t: &[octos_llm::ToolSpec],
+                _c: &octos_llm::ChatConfig,
+            ) -> Result<octos_llm::ChatResponse> {
+                Ok(octos_llm::ChatResponse {
+                    content: Some(format!(
+                        "# Code Review\n\n{}",
+                        "detailed finding. ".repeat(60)
+                    )),
+                    reasoning_content: None,
+                    tool_calls: vec![],
+                    stop_reason: octos_llm::StopReason::EndTurn,
+                    usage: octos_llm::TokenUsage::default(),
+                    provider_index: None,
+                })
+            }
+            fn model_id(&self) -> &str {
+                "mock"
+            }
+            fn provider_name(&self) -> &str {
+                "mock"
+            }
+        }
+
+        let (in_tx, _in_rx) = tokio::sync::mpsc::channel(16);
+        let temp = tempfile::tempdir().unwrap();
+        let ledger = temp.path().join("tasks.jsonl");
+        let workspace = temp.path().join("ws");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let supervisor = Arc::new(TaskSupervisor::new());
+        supervisor.enable_persistence(&ledger).unwrap();
+        let tool = SpawnTool::new(
+            Arc::new(InlineReviewProvider),
+            Arc::new(create_test_store().await),
+            workspace.clone(),
+            in_tx,
+        )
+        .with_task_supervisor(supervisor.clone(), "api:test-session", ledger.clone())
+        .with_sandbox(SandboxConfig {
+            mode: crate::sandbox::SandboxMode::None,
+            ..Default::default()
+        });
+
+        let result = tool
+            .execute(&serde_json::json!({
+                "task": "review the repo and write octos-web-review.md",
+                "label": "octos-web review",
+                "mode": "background",
+                "allowed_tools": ["read_file"],
+                "deliverable": "*-review.md"
+            }))
+            .await
+            .unwrap();
+        assert!(result.success, "{}", result.output);
+
+        let started = std::time::Instant::now();
+        let task = loop {
+            let tasks = supervisor.get_tasks_for_session("api:test-session");
+            if let Some(t) = tasks.first() {
+                if t.status == crate::task_supervisor::TaskStatus::Completed {
+                    break t.clone();
+                }
+                if t.status == crate::task_supervisor::TaskStatus::Failed {
+                    panic!("spawn failed: {:?}", t.error);
+                }
+            }
+            if started.elapsed() >= std::time::Duration::from_secs(15) {
+                let tasks = supervisor.get_tasks_for_session("api:test-session");
+                panic!(
+                    "did not complete in 15s; tasks = {:?}",
+                    tasks
+                        .iter()
+                        .map(|t| (t.status.as_str(), t.error.clone()))
+                        .collect::<Vec<_>>()
+                );
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        };
+        assert_eq!(
+            task.output_files.len(),
+            1,
+            "inline review must be auto-materialized into a deliverable file: {:?}",
+            task.output_files
+        );
+        assert!(task.output_files[0].ends_with("octos-web-review.md"));
+        let written = std::fs::read_to_string(&task.output_files[0]).unwrap();
+        assert!(written.contains("# Code Review"));
+    }
     /// Stub embedder — never invoked; these tests only assert the Arc
     /// is threaded through (mirrors
     /// `octos-pipeline/tests/embedder_propagation.rs`).
