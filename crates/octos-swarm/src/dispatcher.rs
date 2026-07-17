@@ -284,25 +284,34 @@ impl Swarm {
                     None => self.result_from_record(&existing, Vec::new(), None).await,
                 });
             }
-            Some(existing) => {
+            Some(mut existing) => {
                 ensure_record_matches_dispatch(&existing, &resolved, &topology)?;
+                // Legacy rows predate the payload fingerprint —
+                // unverifiable, so trust-on-first-resume and backfill.
+                if existing.contracts_fingerprint.is_none() {
+                    existing.contracts_fingerprint = Some(contracts_fingerprint(&resolved));
+                }
                 existing
             }
-            None => DispatchRecord::new(
-                dispatch_id.clone(),
-                context.session_id.clone(),
-                context.task_id.clone(),
-                topology.clone(),
-                resolved
-                    .iter()
-                    .map(|contract| {
-                        SubtaskOutcome::pending(
-                            contract.contract_id.clone(),
-                            contract.label.clone(),
-                        )
-                    })
-                    .collect(),
-            ),
+            None => {
+                let mut record = DispatchRecord::new(
+                    dispatch_id.clone(),
+                    context.session_id.clone(),
+                    context.task_id.clone(),
+                    topology.clone(),
+                    resolved
+                        .iter()
+                        .map(|contract| {
+                            SubtaskOutcome::pending(
+                                contract.contract_id.clone(),
+                                contract.label.clone(),
+                            )
+                        })
+                        .collect(),
+                );
+                record.contracts_fingerprint = Some(contracts_fingerprint(&resolved));
+                record
+            }
         };
 
         // Persist the freshly-initialised record before doing any work
@@ -327,12 +336,22 @@ impl Swarm {
                 break;
             }
 
+            // Review finding 2 on #1717: enforce the cap BEFORE
+            // dispatching. Checking only after a round ran handed a
+            // record checkpointed at the cap one extra round per
+            // crash/cancel resume — unbounded across repeated cycles.
+            if round >= max_rounds {
+                break;
+            }
+
             debug!(
                 dispatch_id = %dispatch_id,
                 round,
                 pending = pending_indices.len(),
                 "dispatching swarm round"
             );
+
+            let completed_before = completed_count(&record);
 
             match topology {
                 SwarmTopology::Parallel { .. } | SwarmTopology::Fanout { .. } => {
@@ -359,13 +378,19 @@ impl Swarm {
                 }
             }
 
-            record.retry_rounds_used = round + 1;
-            self.store.store(&record).await?;
-
-            round += 1;
-            if round >= max_rounds {
-                break;
+            // Review finding 5 on #1717: only rounds that made NO
+            // progress consume the retry budget. The early pipeline
+            // stop means a round can complete upstream stages and end
+            // at a fresh downstream failure — charging that round would
+            // starve later stages of retries they never used. Progress
+            // rounds are bounded by the subtask count, so the loop
+            // still terminates.
+            let progressed = completed_count(&record) > completed_before;
+            if !progressed {
+                round += 1;
             }
+            record.retry_rounds_used = round;
+            self.store.store(&record).await?;
         }
 
         // Aggregate validator (M4.3) runs AFTER every sub-contract
@@ -457,6 +482,16 @@ impl Swarm {
         pending: &[usize],
     ) -> Result<bool> {
         for idx in pending {
+            // Review finding 1 sibling: invariant 3 says the dispatch
+            // aborted at the first terminal failure. A record resumed
+            // after a crash/cancel still carries that terminal marker —
+            // the contracts behind it must stay `not_run`.
+            if record.subtasks[..*idx]
+                .iter()
+                .any(|subtask| subtask.status == SubtaskStatus::TerminalFailed)
+            {
+                return Ok(true);
+            }
             let contract = &contracts[*idx];
             let attempts = record.subtasks[*idx].attempts;
             let mut outcome = dispatch_with_budget(
@@ -487,14 +522,28 @@ impl Swarm {
         pending: &[usize],
     ) -> Result<bool> {
         for idx in pending {
+            // #1717 + review finding 1: never dispatch a stage whose
+            // predecessor is not Completed. This covers a fresh failure
+            // earlier in THIS round and — critically — a resumed record
+            // whose upstream stage already failed before a crash or
+            // cancellation: the tail must not run input-less. A terminal
+            // predecessor aborts the dispatch (invariant 3 semantics);
+            // a retryable one just ends the round so the upstream stage
+            // retries first.
+            if *idx > 0 {
+                match record.subtasks[*idx - 1].status {
+                    SubtaskStatus::Completed => {}
+                    SubtaskStatus::TerminalFailed => return Ok(true),
+                    SubtaskStatus::RetryableFailed => return Ok(false),
+                }
+            }
             let mut contract = contracts[*idx].clone();
             // Pipeline invariant 4: fold the previous completed
             // subtask's output into this task's `pipeline_input` key.
+            // The precondition above guarantees the predecessor is
+            // Completed, so every stage after the first sees its input.
             let prior_output = if *idx > 0 {
-                match record.subtasks[*idx - 1].status {
-                    SubtaskStatus::Completed => Some(record.subtasks[*idx - 1].output.clone()),
-                    _ => None,
-                }
+                Some(record.subtasks[*idx - 1].output.clone())
             } else {
                 None
             };
@@ -524,19 +573,12 @@ impl Swarm {
             // Forward attribution to the wired ledger adapter.
             self.attribute_cost(record, contracts, *idx, &outcome).await;
             let is_terminal = outcome.status == SubtaskStatus::TerminalFailed;
-            let completed = outcome.status == SubtaskStatus::Completed;
             record.subtasks[*idx] = outcome;
             if is_terminal {
                 return Ok(true);
             }
-            // #1717: a retryable failure also ends the round — the next
-            // stage's `pipeline_input` requires THIS stage's output.
-            // Continuing would dispatch downstream stages without input
-            // and mark them Completed against a broken chain. They stay
-            // pending and re-enter after the upstream stage retries.
-            if !completed {
-                return Ok(false);
-            }
+            // A retryable failure ends the round via the predecessor
+            // precondition on the next iteration (or the loop end).
         }
         Ok(false)
     }
@@ -859,7 +901,53 @@ fn ensure_record_matches_dispatch(
             );
         }
     }
+    // Review finding 4: matching ids are not enough — the same
+    // contract_id with a changed tool_name/task would replay stale
+    // results (finalized) or graft old outcomes onto new work (resume).
+    // Legacy rows carry no fingerprint and are accepted as-is. The
+    // error exposes hashes only, never payload content, matching the
+    // REST layer's scrubbing posture.
+    if let Some(ref recorded) = record.contracts_fingerprint {
+        let supplied = contracts_fingerprint(resolved);
+        if *recorded != supplied {
+            eyre::bail!(
+                "swarm dispatch `{}` contract payload mismatch (recorded fingerprint {}, caller \
+                 supplied {}) — reusing a dispatch_id requires identical tool_name/task payloads",
+                record.dispatch_id,
+                recorded,
+                supplied
+            );
+        }
+    }
     Ok(())
+}
+
+/// Review finding 4: order-sensitive sha-256 over each resolved
+/// contract's `(contract_id, tool_name, task)`. `label` is display-only
+/// and deliberately excluded. `serde_json::Value` renders object keys
+/// in sorted (BTreeMap) order, so semantically-identical payloads hash
+/// identically regardless of the caller's key order.
+fn contracts_fingerprint(resolved: &[ContractSpec]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    for contract in resolved {
+        hasher.update(contract.contract_id.as_bytes());
+        hasher.update([0u8]);
+        hasher.update(contract.tool_name.as_bytes());
+        hasher.update([0u8]);
+        hasher.update(contract.task.to_string().as_bytes());
+        hasher.update([0u8]);
+    }
+    format!("{:x}", hasher.finalize())
+}
+
+/// Completed-subtask count for the round loop's progress accounting.
+fn completed_count(record: &DispatchRecord) -> usize {
+    record
+        .subtasks
+        .iter()
+        .filter(|subtask| subtask.status == SubtaskStatus::Completed)
+        .count()
 }
 
 /// Review A F-004: wrap [`dispatch_once`] with a
