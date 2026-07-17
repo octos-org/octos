@@ -2185,6 +2185,30 @@ impl InProcessAgentOrchestrator {
         true
     }
 
+    /// #1696/#1698 — `SessionGoalUpdated`-shaped snapshot of the session's
+    /// CURRENT goal, for the autonomous post-turn accountant to push to the
+    /// owning connection after `record_goal_turn` / a model `goal_update`.
+    /// Without this push, autonomous transitions (complete via the goal
+    /// tool, blocked via the circuit breaker, budget_limited) repainted
+    /// nothing until an explicit `goal/get`.
+    pub(crate) fn session_goal_updated_event_json(
+        &self,
+        session_id: &SessionKey,
+        profile_id: &str,
+    ) -> Option<Value> {
+        let state = self.state();
+        let goal = state
+            .goals
+            .get(session_id)
+            .filter(|goal| goal.profile_id == profile_id)?;
+        Some(json!({
+            "session_id": session_id,
+            "profile_id": profile_id,
+            "goal": autonomy_goal_json(goal),
+            "transition_actor": "backend",
+        }))
+    }
+
     /// #1696 — read-only goal snapshot for the model's `goal_get` tool.
     /// Never errors: no goal (or a goal outside the profile scope) renders
     /// as `status: "none"` so the model gets a stable shape either way.
