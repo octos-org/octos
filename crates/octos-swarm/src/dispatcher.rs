@@ -25,8 +25,9 @@
 //!    event and increments
 //!    `octos_swarm_dispatch_total{topology,outcome}`.
 
+use std::collections::HashSet;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use eyre::Result;
 use metrics::counter;
@@ -189,6 +190,13 @@ pub struct Swarm {
     /// be `Clone`-cheap. A default policy (`is_noop()`) short-circuits
     /// the gate so existing callers see no behavioural change.
     dispatch_policy: Arc<DispatchPolicy>,
+    /// #1719: per-dispatch-id in-flight registry. Two concurrent
+    /// [`Swarm::dispatch`] calls with the same id would race the
+    /// load/store pair — double-dispatching subtasks and clobbering
+    /// each other's round state — so the second caller is rejected
+    /// while the first holds the id. RAII guard, released on every
+    /// exit path.
+    in_flight: Arc<Mutex<HashSet<String>>>,
 }
 
 impl Swarm {
@@ -223,12 +231,15 @@ impl Swarm {
     /// # Invariants
     /// - Idempotent given same `(contracts, topology, budget)` +
     ///   `dispatch_id`: a second call finds the existing record and
-    ///   returns the finalized result without re-dispatching completed
-    ///   contracts.
+    ///   returns the finalized result verbatim without re-dispatching
+    ///   completed contracts. Reusing a dispatch_id with a different
+    ///   contract list or topology errors, and a concurrent dispatch
+    ///   of an in-flight id errors.
     /// - Fan-out is bounded by [`SwarmTopology::max_concurrency`].
     /// - Sequential aborts on the first terminal failure.
     /// - Pipeline chains `output -> task.pipeline_input` for the next
-    ///   contract.
+    ///   contract; a round ends at the first non-completed stage so a
+    ///   downstream stage never dispatches without its upstream input.
     /// - Retry budget honours [`SwarmBudget::effective_max_retry_rounds`].
     /// - The aggregate validator runs once, after every sub-contract
     ///   reaches terminal state.
@@ -254,14 +265,29 @@ impl Swarm {
             );
         }
 
+        // #1719: serialize dispatches per id. The second concurrent
+        // caller is rejected instead of racing the load/store pair.
+        let _in_flight = InFlightGuard::acquire(&self.in_flight, &dispatch_id)?;
+
         // Load or initialise the durable record. Idempotency invariant:
         // a prior finalized record short-circuits the whole loop.
         let mut record = match self.store.load(&dispatch_id).await? {
             Some(existing) if existing.finalized => {
+                ensure_record_matches_dispatch(&existing, &resolved, &topology)?;
                 debug!(dispatch_id = %dispatch_id, "reusing finalized swarm record");
-                return Ok(self.result_from_record(&existing, Vec::new(), None).await);
+                // #1718: return the exact result computed at
+                // finalization — validator verdicts + cost included.
+                // Legacy records without the snapshot fall back to
+                // recomputing from subtask state.
+                return Ok(match existing.final_result {
+                    Some(result) => result,
+                    None => self.result_from_record(&existing, Vec::new(), None).await,
+                });
             }
-            Some(existing) => existing,
+            Some(existing) => {
+                ensure_record_matches_dispatch(&existing, &resolved, &topology)?;
+                existing
+            }
             None => DispatchRecord::new(
                 dispatch_id.clone(),
                 context.session_id.clone(),
@@ -361,6 +387,9 @@ impl Swarm {
         );
 
         // Mark the record finalized so a future restart short-circuits.
+        // #1718: snapshot the computed result verbatim so the replay
+        // path returns exactly what this call returned.
+        record.final_result = Some(result.clone());
         record.finalized = true;
         self.store.store(&record).await?;
 
@@ -495,9 +524,18 @@ impl Swarm {
             // Forward attribution to the wired ledger adapter.
             self.attribute_cost(record, contracts, *idx, &outcome).await;
             let is_terminal = outcome.status == SubtaskStatus::TerminalFailed;
+            let completed = outcome.status == SubtaskStatus::Completed;
             record.subtasks[*idx] = outcome;
             if is_terminal {
                 return Ok(true);
+            }
+            // #1717: a retryable failure also ends the round — the next
+            // stage's `pipeline_input` requires THIS stage's output.
+            // Continuing would dispatch downstream stages without input
+            // and mark them Completed against a broken chain. They stay
+            // pending and re-enter after the upstream stage retries.
+            if !completed {
+                return Ok(false);
             }
         }
         Ok(false)
@@ -742,8 +780,86 @@ impl SwarmBuilder {
             event_sink: self.event_sink,
             cost_budget: self.cost_budget,
             dispatch_policy: self.dispatch_policy,
+            in_flight: Arc::new(Mutex::new(HashSet::new())),
         })
     }
+}
+
+/// #1719: RAII in-flight marker for one dispatch id. Construction
+/// registers the id — rejecting a concurrent holder — and drop releases
+/// it on every exit path, error paths included.
+struct InFlightGuard {
+    registry: Arc<Mutex<HashSet<String>>>,
+    dispatch_id: String,
+}
+
+impl InFlightGuard {
+    fn acquire(registry: &Arc<Mutex<HashSet<String>>>, dispatch_id: &str) -> Result<Self> {
+        let mut held = registry
+            .lock()
+            .map_err(|_| eyre::eyre!("swarm in-flight registry poisoned"))?;
+        if !held.insert(dispatch_id.to_string()) {
+            eyre::bail!(
+                "swarm dispatch `{dispatch_id}` is already in flight; \
+                 wait for the active dispatch to finish before re-dispatching"
+            );
+        }
+        Ok(Self {
+            registry: Arc::clone(registry),
+            dispatch_id: dispatch_id.to_string(),
+        })
+    }
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        if let Ok(mut held) = self.registry.lock() {
+            held.remove(&self.dispatch_id);
+        }
+    }
+}
+
+/// #1719: a reused dispatch_id must present the identical dispatch
+/// shape. Silently resuming against a different one either panicked
+/// (`contracts[idx]` out of bounds when the record had more subtasks
+/// than the caller supplied contracts) or attributed slot outputs to
+/// the wrong contract; a finalized replay with different contracts
+/// silently returned a result for work that never ran.
+fn ensure_record_matches_dispatch(
+    record: &DispatchRecord,
+    resolved: &[ContractSpec],
+    topology: &SwarmTopology,
+) -> Result<()> {
+    if record.topology != *topology {
+        eyre::bail!(
+            "swarm dispatch `{}` topology mismatch: record has `{}`, caller supplied `{}` — \
+             reusing a dispatch_id requires the identical dispatch shape",
+            record.dispatch_id,
+            record.topology.as_str(),
+            topology.as_str()
+        );
+    }
+    if record.subtasks.len() != resolved.len() {
+        eyre::bail!(
+            "swarm dispatch `{}` contract-count mismatch: record has {} subtasks, caller \
+             supplied {} contracts — reusing a dispatch_id requires the identical contract list",
+            record.dispatch_id,
+            record.subtasks.len(),
+            resolved.len()
+        );
+    }
+    for (slot, (subtask, contract)) in record.subtasks.iter().zip(resolved).enumerate() {
+        if subtask.contract_id != contract.contract_id {
+            eyre::bail!(
+                "swarm dispatch `{}` contract mismatch at slot {slot}: record has `{}`, caller \
+                 supplied `{}` — reusing a dispatch_id requires the identical contract list",
+                record.dispatch_id,
+                subtask.contract_id,
+                contract.contract_id
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Review A F-004: wrap [`dispatch_once`] with a

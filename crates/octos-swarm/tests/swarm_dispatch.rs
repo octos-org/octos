@@ -740,6 +740,392 @@ async fn should_expand_fanout_pattern_into_variant_contracts() {
 }
 
 #[tokio::test]
+async fn should_stop_pipeline_round_at_retryable_stage_and_resume_with_input() {
+    // #1717: a retryable mid-pipeline failure must end the round. With
+    // the old behaviour stage-3 dispatched in the same round with NO
+    // `pipeline_input` (stage-2 had not completed) and was marked
+    // Completed against a silently-broken chain.
+    let backend = FakeBackend::new();
+    backend.script("stage-1", vec![success("s1-out")]);
+    backend.script(
+        "stage-2",
+        vec![timeout_failure("s2-flaky"), success("s2-out")],
+    );
+    backend.script("stage-3", vec![success("s3-out")]);
+
+    let dir = tempfile::tempdir().unwrap();
+    let swarm = Swarm::builder(backend.clone(), dir.path())
+        .build()
+        .await
+        .unwrap();
+
+    let result = swarm
+        .dispatch(
+            "d11",
+            vec![
+                contract("stage-1"),
+                contract("stage-2"),
+                contract("stage-3"),
+            ],
+            SwarmTopology::Pipeline,
+            SwarmBudget::default(),
+            context(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(result.outcome, SwarmOutcomeKind::Success);
+    let history = backend.history();
+    // stage-2 was attempted twice, both times chained to stage-1.
+    let stage_2: Vec<_> = history.iter().filter(|(id, _)| id == "stage-2").collect();
+    assert_eq!(stage_2.len(), 2);
+    for (_, task) in &stage_2 {
+        assert_eq!(task["pipeline_input"], "s1-out");
+    }
+    // stage-3 ran exactly once — AFTER stage-2 recovered — and saw its
+    // output. The old behaviour dispatched it early with no input key.
+    let stage_3: Vec<_> = history.iter().filter(|(id, _)| id == "stage-3").collect();
+    assert_eq!(
+        stage_3.len(),
+        1,
+        "stage-3 must not run before stage-2 completes"
+    );
+    assert_eq!(
+        stage_3[0].1.get("pipeline_input").and_then(|v| v.as_str()),
+        Some("s2-out"),
+        "stage-3 must chain the recovered stage-2 output"
+    );
+}
+
+#[tokio::test]
+async fn should_replay_finalized_result_verbatim_including_validator_verdicts() {
+    // #1718: replaying a finalized dispatch must return the ORIGINAL
+    // computed result — validator verdicts and outcome included. The
+    // old short-circuit recomputed from subtask state with empty
+    // validator results, upgrading a validator-failed Partial to
+    // Success on re-POST.
+    use octos_agent::validators::{ValidatorInvocation, ValidatorPhase, ValidatorRunner};
+    use octos_agent::workspace_policy::{Validator, ValidatorPhaseKind, ValidatorSpec};
+    use octos_swarm::AggregateValidator;
+    use std::sync::Arc as StdArc;
+
+    let backend = FakeBackend::new();
+    backend.script("only", vec![success("payload")]);
+
+    let workspace_dir = tempfile::tempdir().unwrap();
+    // Deliberately do NOT create the file the validator requires — the
+    // aggregate validator must fail and demote the outcome.
+    let tools = StdArc::new(octos_agent::tools::ToolRegistry::new());
+    let runner = ValidatorRunner::new(tools, workspace_dir.path().to_path_buf());
+    let invocation = ValidatorInvocation {
+        phase: ValidatorPhase::Completion,
+        workspace_root: workspace_dir.path().to_path_buf(),
+        repo_label: "swarm-replay-test".into(),
+        input_args: None,
+        tool_output: None,
+        spawn_only_files: Vec::new(),
+    };
+    let validator = Validator {
+        id: "missing_artifact".into(),
+        required: true,
+        soft_fail: false,
+        timeout_ms: None,
+        phase: ValidatorPhaseKind::Completion,
+        spec: ValidatorSpec::FileExists {
+            path: "never-written.txt".into(),
+            min_bytes: None,
+        },
+    };
+    let aggregate = AggregateValidator {
+        runner,
+        invocation,
+        validators: vec![validator],
+    };
+
+    let state_dir = tempfile::tempdir().unwrap();
+    let original = {
+        let swarm = Swarm::builder(backend.clone(), state_dir.path())
+            .with_validator(aggregate)
+            .build()
+            .await
+            .unwrap();
+        swarm
+            .dispatch(
+                "d12",
+                vec![contract("only")],
+                SwarmTopology::Sequential,
+                SwarmBudget::default(),
+                context(),
+            )
+            .await
+            .unwrap()
+    };
+    // Required validator failed → the subtask is demoted, so the
+    // original result must NOT be Success and must carry the verdict.
+    assert_ne!(original.outcome, SwarmOutcomeKind::Success);
+    assert!(
+        !original.validator_results.is_empty()
+            || original
+                .per_task_outcomes
+                .iter()
+                .any(|o| o.status != octos_swarm::SubtaskStatus::Completed),
+        "validator failure must be visible in the original result"
+    );
+
+    // Replay on a fresh swarm (no validator configured, counting
+    // backend): must return the stored result verbatim, not recompute.
+    let spy_counter = Arc::new(AtomicUsize::new(0));
+    let second_backend = Arc::new(CountingBackend {
+        counter: spy_counter.clone(),
+    });
+    let swarm_v2 = Swarm::builder(second_backend, state_dir.path())
+        .build()
+        .await
+        .unwrap();
+    let replay = swarm_v2
+        .dispatch(
+            "d12",
+            vec![contract("only")],
+            SwarmTopology::Sequential,
+            SwarmBudget::default(),
+            context(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(spy_counter.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        replay, original,
+        "finalized replay must return the original result verbatim"
+    );
+}
+
+#[tokio::test]
+async fn should_error_not_panic_when_resume_contracts_fewer_than_recorded() {
+    // #1719: a non-finalized record with MORE subtasks than the caller's
+    // contract list used to drive `contracts[idx]` out of bounds — a
+    // panic in production. It must surface as a typed error instead.
+    use octos_swarm::{DispatchRecord, DispatchStore, SubtaskOutcome, SubtaskStatus};
+
+    let state_dir = tempfile::tempdir().unwrap();
+    let pending = |id: &str| SubtaskOutcome {
+        contract_id: id.into(),
+        label: None,
+        status: SubtaskStatus::RetryableFailed,
+        attempts: 0,
+        last_dispatch_outcome: "not_run".into(),
+        output: String::new(),
+        files_to_send: Vec::new(),
+        error: None,
+    };
+    {
+        let store = DispatchStore::open(state_dir.path()).await.unwrap();
+        let record = DispatchRecord::new(
+            "d13",
+            "api:test",
+            "task-1",
+            SwarmTopology::Parallel {
+                max_concurrency: NonZeroUsize::new(2).unwrap(),
+            },
+            vec![pending("a"), pending("b"), pending("c")],
+        );
+        store.store(&record).await.unwrap();
+    }
+
+    let backend = FakeBackend::new();
+    let swarm = Swarm::builder(backend.clone(), state_dir.path())
+        .build()
+        .await
+        .unwrap();
+    let error = swarm
+        .dispatch(
+            "d13",
+            vec![contract("a"), contract("b")],
+            SwarmTopology::Parallel {
+                max_concurrency: NonZeroUsize::new(2).unwrap(),
+            },
+            SwarmBudget::default(),
+            context(),
+        )
+        .await
+        .expect_err("mismatched resume must error, not panic");
+    assert!(
+        error.to_string().contains("d13"),
+        "error should name the dispatch id: {error}"
+    );
+    // The in-flight guard must be released on the error path: a
+    // correctly-shaped dispatch with a fresh id still works.
+    let ok = swarm
+        .dispatch(
+            "d13-fresh",
+            vec![contract("a")],
+            SwarmTopology::Parallel {
+                max_concurrency: NonZeroUsize::new(1).unwrap(),
+            },
+            SwarmBudget::default(),
+            context(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(ok.outcome, SwarmOutcomeKind::Success);
+}
+
+#[tokio::test]
+async fn should_error_when_resume_contract_ids_mismatch_recorded() {
+    // #1719: same count but different contract ids — silently retrying
+    // slot N against a DIFFERENT contract would attribute outputs to
+    // the wrong contract. Must be rejected.
+    use octos_swarm::{DispatchRecord, DispatchStore, SubtaskOutcome, SubtaskStatus};
+
+    let state_dir = tempfile::tempdir().unwrap();
+    {
+        let store = DispatchStore::open(state_dir.path()).await.unwrap();
+        let record = DispatchRecord::new(
+            "d14",
+            "api:test",
+            "task-1",
+            SwarmTopology::Sequential,
+            vec![SubtaskOutcome {
+                contract_id: "original".into(),
+                label: None,
+                status: SubtaskStatus::RetryableFailed,
+                attempts: 0,
+                last_dispatch_outcome: "not_run".into(),
+                output: String::new(),
+                files_to_send: Vec::new(),
+                error: None,
+            }],
+        );
+        store.store(&record).await.unwrap();
+    }
+
+    let backend = FakeBackend::new();
+    let swarm = Swarm::builder(backend.clone(), state_dir.path())
+        .build()
+        .await
+        .unwrap();
+    let error = swarm
+        .dispatch(
+            "d14",
+            vec![contract("different")],
+            SwarmTopology::Sequential,
+            SwarmBudget::default(),
+            context(),
+        )
+        .await
+        .expect_err("contract id mismatch must be rejected");
+    let message = error.to_string();
+    assert!(
+        message.contains("original") && message.contains("different"),
+        "error should name both contract ids: {message}"
+    );
+    assert!(backend.history().is_empty(), "backend must not be touched");
+}
+
+#[tokio::test]
+async fn should_error_when_finalized_replay_contracts_mismatch() {
+    // #1719: a finalized record replayed with a DIFFERENT contract list
+    // used to silently return the old result — the caller believes the
+    // new contracts ran. Must be rejected instead.
+    let backend = FakeBackend::new();
+    backend.script("a", vec![success("a-out")]);
+
+    let state_dir = tempfile::tempdir().unwrap();
+    let swarm = Swarm::builder(backend.clone(), state_dir.path())
+        .build()
+        .await
+        .unwrap();
+    swarm
+        .dispatch(
+            "d15",
+            vec![contract("a")],
+            SwarmTopology::Sequential,
+            SwarmBudget::default(),
+            context(),
+        )
+        .await
+        .unwrap();
+
+    let error = swarm
+        .dispatch(
+            "d15",
+            vec![contract("a"), contract("b")],
+            SwarmTopology::Sequential,
+            SwarmBudget::default(),
+            context(),
+        )
+        .await
+        .expect_err("finalized replay with different contracts must be rejected");
+    assert!(
+        error.to_string().contains("d15"),
+        "error should name the dispatch id: {error}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn should_reject_concurrent_dispatch_with_same_id() {
+    // #1719: two concurrent dispatches with the same id used to race
+    // the load/store pair — double-dispatching subtasks and clobbering
+    // each other's rounds. The second caller must be rejected while the
+    // first is in flight, and the id must be usable again afterwards.
+    let backend = FakeBackend::new();
+    backend.script("slow", vec![success("slow-out")]);
+    backend.set_delay(Duration::from_millis(200));
+
+    let dir = tempfile::tempdir().unwrap();
+    let swarm = Swarm::builder(backend.clone(), dir.path())
+        .build()
+        .await
+        .unwrap();
+
+    let contracts = || vec![contract("slow")];
+    let topology = || SwarmTopology::Parallel {
+        max_concurrency: NonZeroUsize::new(1).unwrap(),
+    };
+    let (first, second) = tokio::join!(
+        swarm.dispatch(
+            "d16",
+            contracts(),
+            topology(),
+            SwarmBudget::default(),
+            context()
+        ),
+        swarm.dispatch(
+            "d16",
+            contracts(),
+            topology(),
+            SwarmBudget::default(),
+            context()
+        ),
+    );
+
+    let error = match (first, second) {
+        (Ok(_), Err(error)) | (Err(error), Ok(_)) => error,
+        (Ok(_), Ok(_)) => panic!("both concurrent dispatches succeeded"),
+        (Err(first), Err(second)) => panic!("both dispatches failed: {first}; {second}"),
+    };
+    assert!(
+        error.to_string().contains("in flight"),
+        "loser should be told the id is in flight: {error}"
+    );
+    // Only one dispatch reached the backend.
+    assert_eq!(backend.history().len(), 1);
+
+    // Guard released: the same id now replays the finalized result.
+    let replay = swarm
+        .dispatch(
+            "d16",
+            contracts(),
+            topology(),
+            SwarmBudget::default(),
+            context(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(replay.outcome, SwarmOutcomeKind::Success);
+}
+
+#[tokio::test]
 async fn should_record_cost_attribution_via_ledger_stub() {
     use octos_swarm::{CostLedger, SwarmCostAttribution};
 

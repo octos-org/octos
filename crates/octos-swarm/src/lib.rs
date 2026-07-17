@@ -57,13 +57,18 @@
 //!
 //! 1. [`Swarm::dispatch`] is idempotent given the same
 //!    `(dispatch_id, contracts, topology, budget)`: a finalized record
-//!    in the redb ledger short-circuits re-dispatch.
+//!    in the redb ledger short-circuits re-dispatch and returns the
+//!    stored result verbatim. Reusing a dispatch_id with a different
+//!    contract list or topology is rejected, and a second concurrent
+//!    dispatch of an in-flight id is rejected.
 //! 2. [`SwarmTopology::Parallel`] fans out up to `max_concurrency`
 //!    contracts, aggregation is arrival order.
 //! 3. [`SwarmTopology::Sequential`] runs one-at-a-time and aborts on
 //!    the first terminal (non-retryable) failure.
 //! 4. [`SwarmTopology::Pipeline`] chains output of contract `i` as
-//!    `pipeline_input` into contract `i + 1`.
+//!    `pipeline_input` into contract `i + 1`; a round stops at the
+//!    first non-completed stage so a downstream stage never runs
+//!    without its upstream input.
 //! 5. Retry budget bounded at [`MAX_RETRY_ROUNDS`] (3).
 //! 6. Aggregate M4.3 validator runs AFTER every sub-contract reaches
 //!    terminal state.
