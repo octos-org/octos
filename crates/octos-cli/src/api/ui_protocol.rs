@@ -22131,6 +22131,12 @@ async fn run_standalone_turn(
         workspace_root.as_deref(),
     ))
     .with_session_usage_base(session_usage_base.clone())
+    // #1696 soak fix: thread the session key into every ToolContext this
+    // turn builds. Without it the goal tools (and anything else reading
+    // `ToolContext::parent_session_key`) see no session on AppUI turns —
+    // the live goal continuation failed with "no session context" while
+    // the gateway actor path carried it fine.
+    .with_parent_session_key(session_id.to_string())
     .with_reporter(reporter);
     // In-loop compaction delivery (UPCR-2026-026 follow-up): mirror the
     // pre-turn lifecycle delivery — durable direct send for clients that
@@ -24389,6 +24395,35 @@ async fn run_standalone_turn(
                 &goal_ctx.profile_id,
                 &reply,
             );
+        }
+        // #1696/#1698 — push the post-turn goal snapshot to the OWNING
+        // connection so autonomous transitions repaint the chip live:
+        // complete (goal_update tool or sentinel), blocked (circuit
+        // breaker), budget_limited, and plain token-count growth. Same
+        // ephemeral owning-connection delivery as the interactive charge
+        // above — a durable append would fan the goal to every subscriber
+        // of an unprofiled shared session id regardless of profile.
+        if let Some(goal_event_json) =
+            orchestrator.session_goal_updated_event_json(&session_id, &goal_ctx.profile_id)
+        {
+            match serde_json::from_value::<octos_core::ui_protocol::SessionGoalUpdatedEvent>(
+                goal_event_json,
+            ) {
+                Ok(event) => {
+                    let _ = send_notification_ephemeral(
+                        &ws,
+                        &ledger,
+                        UiNotification::SessionGoalUpdated(event),
+                    );
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        error = %err,
+                        session_id = %session_id,
+                        "autonomous goal accountant produced an unparseable update event",
+                    );
+                }
+            }
         }
         // #1140 codex P2 re-review #5: do NOT call
         // `clear_goal_dispatch_in_flight` explicitly here. The RAII

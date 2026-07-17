@@ -578,6 +578,10 @@ impl SessionRuntime {
         .with_subagent_output_router(subagent_output_router)
         .with_subagent_summary_generator(subagent_summary_generator)
         .with_sandbox_config(sandbox.clone())
+        // #1696: session-scoped tools (goal_get/goal_update) resolve their
+        // session from ToolContext::parent_session_key — thread it on the
+        // runtime-held agent exactly like the per-turn AppUI rebuild does.
+        .with_parent_session_key(session_key.to_string())
         .with_workspace_root(workspace_root.clone());
 
         // Phase 1 of the SessionScope migration: attach the constructed
