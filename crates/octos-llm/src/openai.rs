@@ -180,6 +180,10 @@ fn tool_call_arguments_to_wire(arguments: &serde_json::Value) -> String {
     {
         return parsed.to_string();
     }
+    tracing::warn!(
+        target: "octos::toolcall_repair",
+        "coerced non-object tool-call arguments to empty object at request boundary (#1711)"
+    );
     "{}".to_string()
 }
 

@@ -238,9 +238,19 @@ fn repair_tool_arguments_to_object(raw: &str) -> serde_json::Value {
     if let Ok(value) = serde_json::from_str::<serde_json::Value>(&repaired)
         && value.is_object()
     {
+        tracing::warn!(
+            target: "octos::toolcall_repair",
+            original_len = trimmed.len(),
+            "repaired malformed/truncated inline tool-call arguments (#1711)"
+        );
         return value;
     }
     // Unrepairable → empty object (never a fatal non-object on the wire).
+    tracing::warn!(
+        target: "octos::toolcall_repair",
+        preview = %trimmed.chars().take(80).collect::<String>(),
+        "unrepairable inline tool-call arguments; using empty object (#1711)"
+    );
     serde_json::json!({})
 }
 
@@ -345,8 +355,17 @@ fn build_tool_call_from_invoke(attrs: &str, body: &str) -> Option<ToolCall> {
     // Some models emit args as Anthropic-style `<parameter name="x">…</parameter>`
     // sub-tags inside the invoke body rather than a JSON object; parse those
     // first, otherwise fall back to JSON (with repair).
-    let arguments = parse_invoke_parameter_tags(raw_args)
-        .unwrap_or_else(|| repair_tool_arguments_to_object(raw_args));
+    let arguments = match parse_invoke_parameter_tags(raw_args) {
+        Some(params) => {
+            tracing::warn!(
+                target: "octos::toolcall_repair",
+                tool = name,
+                "recovered inline tool-call from <parameter> tags (#1711)"
+            );
+            params
+        }
+        None => repair_tool_arguments_to_object(raw_args),
+    };
 
     Some(ToolCall {
         id: format!(
