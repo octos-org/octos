@@ -161,6 +161,28 @@ pub enum ReasoningStyle {
     EffortMaxOnly,
 }
 
+/// Serialize tool-call arguments for the request wire as a JSON **object**
+/// string. Chat/completions providers validate `function.arguments` and reject
+/// the ENTIRE request with a non-retryable HTTP 400 when it does not decode to
+/// an object — which a tool call recovered from inline/malformed model output
+/// can be (a bare string, or a truncated fragment). Coercing a non-object to
+/// `{}` keeps the request valid; the model then sees an ordinary empty-arg call
+/// and can retry, instead of the whole turn/task dying. Objects pass through
+/// byte-identically, so this is a no-op on the normal path. See #1711.
+fn tool_call_arguments_to_wire(arguments: &serde_json::Value) -> String {
+    if arguments.is_object() {
+        return arguments.to_string();
+    }
+    // Recover a stringified object (e.g. `"{\"command\":\"ls\"}"`).
+    if let serde_json::Value::String(inner) = arguments
+        && let Ok(parsed) = serde_json::from_str::<serde_json::Value>(inner)
+        && parsed.is_object()
+    {
+        return parsed.to_string();
+    }
+    "{}".to_string()
+}
+
 /// OpenAI GPT provider.
 pub struct OpenAIProvider {
     client: Client,
@@ -341,7 +363,7 @@ impl OpenAIProvider {
                             call_type: "function".to_string(),
                             function: FunctionCall {
                                 name: tc.name.clone(),
-                                arguments: tc.arguments.to_string(),
+                                arguments: tool_call_arguments_to_wire(&tc.arguments),
                             },
                         })
                         .collect()
@@ -1100,6 +1122,40 @@ mod tests {
     use crate::config::ChatConfig;
     use crate::provider::LlmProvider;
     use octos_core::{Message, MessageRole};
+
+    #[test]
+    fn tool_call_arguments_wire_passes_objects_through() {
+        let obj = serde_json::json!({"command": "ls -la"});
+        let wire = tool_call_arguments_to_wire(&obj);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&wire).unwrap(),
+            obj
+        );
+    }
+
+    #[test]
+    fn tool_call_arguments_wire_coerces_non_object_to_empty_object() {
+        // A bare string is what the old inline fallback produced; serialized
+        // verbatim it caused the provider HTTP 400. It must become `{}`.
+        let bare = serde_json::Value::String("git clone https://x".to_string());
+        assert_eq!(tool_call_arguments_to_wire(&bare), "{}");
+        // Arrays/numbers/null are also not valid arguments objects.
+        assert_eq!(
+            tool_call_arguments_to_wire(&serde_json::json!([1, 2])),
+            "{}"
+        );
+        assert_eq!(tool_call_arguments_to_wire(&serde_json::Value::Null), "{}");
+    }
+
+    #[test]
+    fn tool_call_arguments_wire_recovers_a_stringified_object() {
+        let stringified = serde_json::Value::String(r#"{"command":"ls"}"#.to_string());
+        let wire = tool_call_arguments_to_wire(&stringified);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&wire).unwrap(),
+            serde_json::json!({"command": "ls"})
+        );
+    }
 
     fn msg(content: &str) -> Message {
         Message {
