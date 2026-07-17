@@ -4433,12 +4433,27 @@ fn enqueue_agent_terminal_continuations(
     .with_metadata("status", agent.status.clone())
     .with_metadata("nickname", agent.nickname.clone())
     .with_metadata("role", agent.role.clone());
+    // #1707: stamp the child's workspace so a future drain-site guard can drop
+    // a continuation replayed under a wire session key that has since been
+    // rebound to a DIFFERENT project (sessions_in_cwd reuse). Self-describing;
+    // no behavior change on its own.
+    if let Some(cwd) = agent.cwd.as_deref().filter(|value| !value.is_empty()) {
+        child = child.with_metadata("workspace", cwd.to_owned());
+    }
     if let Some(last_task) = agent.last_task.as_deref().filter(|value| !value.is_empty()) {
         child = child.with_metadata("summary", last_task.chars().take(1200).collect::<String>());
     }
     enqueue_and_persist_continuation(state, child);
     persist_agent_terminal(state, agent);
 
+    // #1707: siblings for the scatter/gather join MUST share a workspace. Two
+    // agents that merely reuse the same wire `session_id` across different
+    // project cwds (sessions_in_cwd) are NOT siblings — counting a prior
+    // project's terminal children here fired a false `ScatterJoinComplete`
+    // (and an inflated `terminal_children` count) into the reused session.
+    // `cwd == cwd` keeps the legacy behavior byte-identical when the workspace
+    // is unknown (both `None`), and same-workspace restart recovery still joins
+    // (the restored siblings carry the same cwd).
     let siblings = state
         .agents
         .values()
@@ -4446,6 +4461,7 @@ fn enqueue_agent_terminal_continuations(
             candidate.session_id == agent.session_id
                 && candidate.profile_id == agent.profile_id
                 && candidate.parent_agent_id == agent.parent_agent_id
+                && candidate.cwd == agent.cwd
         })
         .collect::<Vec<_>>();
     if siblings.is_empty()
@@ -4477,6 +4493,11 @@ fn enqueue_agent_terminal_continuations(
             .unwrap_or_else(|| "master".to_owned()),
     )
     .with_metadata("terminal_children", siblings.len().to_string());
+    // #1707: same workspace stamp as the per-child ChildCompleted above.
+    let scatter = match agent.cwd.as_deref().filter(|value| !value.is_empty()) {
+        Some(cwd) => scatter.with_metadata("workspace", cwd.to_owned()),
+        None => scatter,
+    };
     enqueue_and_persist_continuation(state, scatter);
 }
 
@@ -7681,6 +7702,86 @@ mod tests {
                 MasterContinuationReason::ChildCompleted,
                 MasterContinuationReason::ScatterJoinComplete
             ]
+        );
+    }
+
+    /// #1707: the scatter/gather join is workspace-scoped. A stale terminal
+    /// child left in the roster under the SAME wire `session_id` but a
+    /// DIFFERENT project cwd (sessions_in_cwd reuse) must NOT be counted as a
+    /// sibling of a freshly-completing child — otherwise it fires a false
+    /// `ScatterJoinComplete` and inflates `terminal_children` into the reused
+    /// session.
+    #[test]
+    fn scatter_join_excludes_cross_workspace_siblings() {
+        let orchestrator = InProcessAgentOrchestrator::default();
+        // Live child in project A.
+        let mut child_a = sample_agent("child-a", "tenant-a");
+        child_a.parent_agent_id = Some("master".into());
+        child_a.cwd = Some("/projects/a".into());
+        let session_id = child_a.session_id.clone();
+        // Stale terminal child from project B, already in the roster under the
+        // SAME session key (a prior lifetime's workspace binding of the reused
+        // wire id). Inserted pre-terminal so it enqueues nothing on its own.
+        let mut stale_b = sample_agent("stale-b", "tenant-a");
+        stale_b.parent_agent_id = Some("master".into());
+        stale_b.cwd = Some("/projects/b".into());
+        stale_b.status = "completed".into();
+        assert_eq!(stale_b.session_id, session_id, "same wire session key");
+        orchestrator
+            .state()
+            .agents
+            .insert(child_a.agent_id.clone(), child_a);
+        orchestrator
+            .state()
+            .agents
+            .insert(stale_b.agent_id.clone(), stale_b);
+
+        orchestrator
+            .set_agent_status(
+                "child-a",
+                &session_id,
+                "tenant-a",
+                "completed",
+                Some("project A review done".into()),
+            )
+            .expect("complete project-A child");
+
+        let drained = orchestrator.drain_ready_continuations_for_session(
+            &session_id,
+            "tenant-a",
+            MasterContinuationRuntimeState::idle(),
+            usize::MAX,
+        );
+        let reasons = drained
+            .iter()
+            .map(|item| item.reason.clone())
+            .collect::<Vec<_>>();
+        // The join fires (child-a's own workspace group is all-terminal)...
+        assert_eq!(
+            reasons,
+            vec![
+                MasterContinuationReason::ChildCompleted,
+                MasterContinuationReason::ScatterJoinComplete
+            ]
+        );
+        // ...but scoped to project A ONLY: terminal_children == 1, NOT 2. The
+        // cross-workspace `stale-b` is excluded from the sibling set.
+        let scatter = drained
+            .iter()
+            .find(|item| item.reason == MasterContinuationReason::ScatterJoinComplete)
+            .expect("scatter join present");
+        assert_eq!(
+            scatter
+                .metadata
+                .get("terminal_children")
+                .map(String::as_str),
+            Some("1"),
+            "cross-workspace stale sibling must not inflate the join count"
+        );
+        assert_eq!(
+            scatter.metadata.get("workspace").map(String::as_str),
+            Some("/projects/a"),
+            "the join is stamped with the completing child's workspace"
         );
     }
 
