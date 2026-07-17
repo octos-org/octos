@@ -1453,6 +1453,18 @@ impl SpawnTool {
     }
 }
 
+/// Upper bound for a spawn's `max_iterations` override. A repo-scale review or
+/// deep research legitimately needs well over the default 50 one-tool-call-at-a-
+/// time steps, but an unbounded value is a runaway-loop / cost footgun, so the
+/// caller-supplied value is clamped to this ceiling.
+const MAX_SPAWN_MAX_ITERATIONS: u32 = 300;
+
+/// Clamp a caller-supplied `max_iterations` override into `[1, MAX]`. `None`
+/// (not requested) stays `None` so the worker keeps its configured default.
+fn clamp_spawn_max_iterations(requested: Option<u32>) -> Option<u32> {
+    requested.map(|value| value.clamp(1, MAX_SPAWN_MAX_ITERATIONS))
+}
+
 #[derive(Clone, Deserialize)]
 struct Input {
     task: String,
@@ -1477,6 +1489,11 @@ struct Input {
     /// Override context window size (tokens) for the sub-agent.
     #[serde(default)]
     context_window: Option<u32>,
+    /// Override the sub-agent's tool-call iteration budget (default 50).
+    /// Clamped to [`MAX_SPAWN_MAX_ITERATIONS`]. Raise it for repo-scale reviews
+    /// / research that need many one-tool-call-at-a-time steps.
+    #[serde(default)]
+    max_iterations: Option<u32>,
     /// Additional instructions appended to the subagent's system prompt.
     /// These are added after the parent's worker prompt, never replacing it.
     #[serde(default, alias = "system_prompt")]
@@ -2460,6 +2477,11 @@ impl Tool for SpawnTool {
                     "type": "integer",
                     "description": "Override the context window size (tokens) for the subagent."
                 },
+                "max_iterations": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "Override the subagent's tool-call iteration budget (default 50). Raise it for repo-scale reviews or research that need many read/shell steps one at a time; a broad from-scratch review often needs ~100-150. Clamped to a safe ceiling to prevent runaway loops."
+                },
                 "additional_instructions": {
                     "type": "string",
                     "description": "Extra instructions appended to the subagent's system prompt. Use to specialize behavior (e.g. 'Focus on OWASP Top 10 security issues.'). Cannot override or replace the base system prompt."
@@ -3252,8 +3274,18 @@ impl Tool for SpawnTool {
             // Keep an Arc handle to the child's tool registry so we can run
             // declared validators against it after `run_task` returns.
             let child_tools_handle = worker.tool_registry().clone();
-            if let Some(ref config) = self.worker_config {
-                worker = worker.with_config(config.clone());
+            // Apply the worker config plus an optional per-spawn iteration-budget
+            // override. Only override the worker's own config when there is a
+            // reason to (a configured worker_config OR a caller override), so
+            // the no-config path keeps the worker's default behavior byte-for-
+            // byte.
+            let sync_max_iters = clamp_spawn_max_iterations(input.max_iterations);
+            if self.worker_config.is_some() || sync_max_iters.is_some() {
+                let mut config = self.worker_config.clone().unwrap_or_default();
+                if let Some(mi) = sync_max_iters {
+                    config.max_iterations = mi;
+                }
+                worker = worker.with_config(config);
             }
             if let Some(factory) = self.child_prompt_context_manager_factory.as_ref() {
                 if let Some(manager) = factory(ChildPromptContextRequest {
@@ -3539,6 +3571,9 @@ impl Tool for SpawnTool {
             // workspace-declared command validator could escape to the host.
             let child_sandbox = self.sandbox.clone();
             let additional_instructions = input.additional_instructions;
+            // Per-spawn iteration-budget override, clamped, captured for the
+            // detached closure (`input` is not `'static`/available inside it).
+            let bg_max_iters = clamp_spawn_max_iterations(input.max_iterations);
             let default_worker_prompt = self.worker_prompt.clone();
             let bg_sender = self.background_result_sender.clone();
             let child_session_sender = self.child_session_sender.clone();
@@ -3836,6 +3871,9 @@ impl Tool for SpawnTool {
                 let child_tools_handle = worker.tool_registry().clone();
                 let mut effective_config = worker_config.clone().unwrap_or_default();
                 effective_config.suppress_auto_send_files = true;
+                if let Some(mi) = bg_max_iters {
+                    effective_config.max_iterations = mi;
+                }
                 worker = worker.with_config(effective_config);
                 // M8 Runtime Parity W2.B1: apply parent caches to the
                 // detached background child before it consumes any
@@ -6186,6 +6224,70 @@ PY
     /// independent of future serde changes.
     fn parse_spawn_input(value: serde_json::Value) -> Input {
         serde_json::from_value(value).expect("input parses")
+    }
+
+    #[test]
+    fn clamp_spawn_max_iterations_bounds_the_request() {
+        // Not requested → keep the worker's default (None).
+        assert_eq!(clamp_spawn_max_iterations(None), None);
+        // Normal value passes through.
+        assert_eq!(clamp_spawn_max_iterations(Some(120)), Some(120));
+        // 0 is nonsensical → clamped up to 1.
+        assert_eq!(clamp_spawn_max_iterations(Some(0)), Some(1));
+        // Over the ceiling → clamped down (runaway-loop guard).
+        assert_eq!(
+            clamp_spawn_max_iterations(Some(100_000)),
+            Some(MAX_SPAWN_MAX_ITERATIONS)
+        );
+        assert_eq!(
+            clamp_spawn_max_iterations(Some(MAX_SPAWN_MAX_ITERATIONS)),
+            Some(MAX_SPAWN_MAX_ITERATIONS)
+        );
+    }
+
+    #[test]
+    fn input_parses_max_iterations_and_defaults_to_none() {
+        let with = parse_spawn_input(serde_json::json!({
+            "task": "review the repo",
+            "max_iterations": 150
+        }));
+        assert_eq!(with.max_iterations, Some(150));
+
+        // Absent → None → worker keeps its default 50.
+        let without = parse_spawn_input(serde_json::json!({ "task": "quick task" }));
+        assert_eq!(without.max_iterations, None);
+    }
+
+    #[tokio::test]
+    async fn spawn_spec_exposes_max_iterations() {
+        let (in_tx, _in_rx) = tokio::sync::mpsc::channel(16);
+        let tool = SpawnTool::new(
+            Arc::new(MockProvider),
+            Arc::new(create_test_store().await),
+            PathBuf::from("/tmp"),
+            in_tx,
+        );
+        let schema = tool.input_schema();
+        let props = schema["properties"].as_object().expect("properties object");
+        assert!(
+            props.contains_key("max_iterations"),
+            "spawn schema must expose max_iterations so the model can raise the budget"
+        );
+        assert_eq!(props["max_iterations"]["type"], "integer");
+    }
+
+    #[test]
+    fn apply_agent_definition_preserves_inline_max_iterations() {
+        // An inline max_iterations must survive manifest layering (inline wins /
+        // is untouched — the manifest carries no iteration budget).
+        let registry = crate::agents::AgentDefinitions::with_builtins();
+        let mut input = parse_spawn_input(serde_json::json!({
+            "task": "research this topic",
+            "agent_definition_id": "research-worker",
+            "max_iterations": 200
+        }));
+        apply_agent_definition(&mut input, &registry).expect("apply");
+        assert_eq!(input.max_iterations, Some(200));
     }
 
     #[test]
