@@ -157,7 +157,7 @@ impl Tool for GoalUpdateTool {
         if !MODEL_ALLOWED_TRANSITIONS.contains(&status) {
             return Ok(ToolResult {
                 output: format!(
-                    "goal_update: status `{status}` is not model-transitionable — only \
+                    "goal_update: status `{status}` is not a model-allowed transition — only \
                      `complete` and `blocked` are. Pause/resume/budget changes belong to the user."
                 ),
                 success: false,

@@ -25,6 +25,7 @@ pub mod content_catalog;
 pub(crate) mod context_manager;
 pub mod cron_tool;
 pub mod gateway_dispatcher;
+#[cfg(feature = "api")]
 pub mod goal_tool;
 #[cfg(feature = "api")]
 pub mod login_allowlist;

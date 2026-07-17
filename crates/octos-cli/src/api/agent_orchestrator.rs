@@ -2247,7 +2247,7 @@ impl InProcessAgentOrchestrator {
     ) -> Result<Value, String> {
         if !matches!(status, "complete" | "blocked") {
             return Err(format!(
-                "status `{status}` is not model-transitionable (only complete|blocked)"
+                "status `{status}` is not a model-allowed transition (only complete|blocked)"
             ));
         }
         let mut state = self.state();
@@ -8688,7 +8688,7 @@ mod tests {
                 orchestrator
                     .model_transition_goal(&session_id, "tenant-a", status, "nope")
                     .is_err(),
-                "{status} must not be model-transitionable"
+                "{status} must not be a model-allowed transition"
             );
         }
         // Wrong profile is rejected.

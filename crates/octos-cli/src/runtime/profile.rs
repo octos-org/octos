@@ -870,8 +870,13 @@ impl ProfileRuntime {
         // budget) and goal_update (model-owned complete|blocked ONLY,
         // executor-enforced). Session resolved per-call from
         // ToolContext::parent_session_key; profile scope pinned here.
-        tools.register(crate::goal_tool::GoalGetTool::new(profile.id.clone()));
-        tools.register(crate::goal_tool::GoalUpdateTool::new(profile.id.clone()));
+        // Goals live in the AppUI orchestrator, so the tools exist only
+        // with the `api` feature (like the orchestrator itself).
+        #[cfg(feature = "api")]
+        {
+            tools.register(crate::goal_tool::GoalGetTool::new(profile.id.clone()));
+            tools.register(crate::goal_tool::GoalUpdateTool::new(profile.id.clone()));
+        }
 
         // Step 17: re-apply tool policy AFTER plugin / memory-bank
         // registration so deny entries can target plugin-declared
