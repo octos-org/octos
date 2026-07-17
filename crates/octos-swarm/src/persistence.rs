@@ -54,6 +54,14 @@ pub struct DispatchRecord {
     /// existed; those replays fall back to recomputation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub final_result: Option<SwarmResult>,
+    /// #1719 follow-up: sha-256 over the resolved contracts'
+    /// `(contract_id, tool_name, task)` triples, in slot order. A
+    /// reused dispatch_id must present byte-identical payloads —
+    /// contract-id equality alone let a re-POST with the same ids but
+    /// different task payloads replay stale results. `None` on legacy
+    /// rows (unverifiable — accepted and backfilled on next store).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub contracts_fingerprint: Option<String>,
 }
 
 impl DispatchRecord {
@@ -74,6 +82,7 @@ impl DispatchRecord {
             retry_rounds_used: 0,
             finalized: false,
             final_result: None,
+            contracts_fingerprint: None,
         }
     }
 }
@@ -84,6 +93,14 @@ impl DispatchRecord {
 pub struct DispatchStore {
     db: Arc<Database>,
     path: Arc<PathBuf>,
+    /// #1719 follow-up: orders every load/store on this ledger. The
+    /// owned guard MOVES INTO the `spawn_blocking` closure, so a caller
+    /// future cancelled mid-await (REST client disconnect) cannot leave
+    /// its blocking write unordered against the next caller's read —
+    /// `spawn_blocking` work is not abortable, and without this gate a
+    /// re-dispatch could load pre-write state and then be clobbered by
+    /// the cancelled write landing late.
+    io_gate: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl DispatchStore {
@@ -115,6 +132,7 @@ impl DispatchStore {
         Ok(Self {
             db: Arc::new(db),
             path: Arc::new(db_path),
+            io_gate: Arc::new(tokio::sync::Mutex::new(())),
         })
     }
 
@@ -129,7 +147,11 @@ impl DispatchStore {
     pub async fn load(&self, dispatch_id: &str) -> Result<Option<DispatchRecord>> {
         let db = self.db.clone();
         let dispatch_id = dispatch_id.to_string();
+        // Waits for any in-flight (possibly cancellation-orphaned)
+        // write to land before reading — see `io_gate`.
+        let held = self.io_gate.clone().lock_owned().await;
         tokio::task::spawn_blocking(move || {
+            let _held = held;
             let read_txn = db.begin_read().wrap_err("begin swarm state read")?;
             let table = read_txn
                 .open_table(DISPATCH_TABLE)
@@ -157,7 +179,12 @@ impl DispatchStore {
         let db = self.db.clone();
         let key = record.dispatch_id.clone();
         let json = serde_json::to_string(record).wrap_err("serialize swarm dispatch row")?;
+        // The guard moves into the closure: if this future is cancelled
+        // while awaiting the join handle, the write still completes
+        // under the gate, and the next load/store waits for it.
+        let held = self.io_gate.clone().lock_owned().await;
         tokio::task::spawn_blocking(move || {
+            let _held = held;
             let write_txn = db.begin_write().wrap_err("begin swarm state write")?;
             {
                 let mut table = write_txn
