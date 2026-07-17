@@ -1454,15 +1454,29 @@ impl SpawnTool {
 }
 
 /// Upper bound for a spawn's `max_iterations` override. A repo-scale review or
-/// deep research legitimately needs well over the default 50 one-tool-call-at-a-
-/// time steps, but an unbounded value is a runaway-loop / cost footgun, so the
-/// caller-supplied value is clamped to this ceiling.
+/// deep research legitimately needs well over the interactive default 50
+/// one-tool-call-at-a-time steps, but an unbounded value is a runaway-loop /
+/// cost footgun, so the caller-supplied value is clamped to this ceiling.
 const MAX_SPAWN_MAX_ITERATIONS: u32 = 300;
 
-/// Clamp a caller-supplied `max_iterations` override into `[1, MAX]`. `None`
-/// (not requested) stays `None` so the worker keeps its configured default.
-fn clamp_spawn_max_iterations(requested: Option<u32>) -> Option<u32> {
-    requested.map(|value| value.clamp(1, MAX_SPAWN_MAX_ITERATIONS))
+/// Default iteration budget for a spawned sub-agent when the caller does not set
+/// `max_iterations`. The bare `AgentConfig` default (50) is tuned for a snappy
+/// *interactive* turn; a background sub-agent does bounded-but-substantive work
+/// (a from-scratch repo review runs ~100–150 one-tool-call-at-a-time steps), so
+/// blindly inheriting 50 starved real work (agents capped on their first
+/// exploration pass, producing nothing). The token budget and loop detection
+/// remain the real runaway guards; the iteration cap is a secondary backstop, so
+/// a more generous spawn default trades a little worst-case runaway headroom for
+/// first-try success on the common substantive-task case. Callers can still
+/// raise it up to [`MAX_SPAWN_MAX_ITERATIONS`] or lower it explicitly.
+const DEFAULT_SPAWN_MAX_ITERATIONS: u32 = 150;
+
+/// Resolve the effective iteration budget for a spawn: a caller-supplied value
+/// clamped into `[1, MAX]`, or [`DEFAULT_SPAWN_MAX_ITERATIONS`] when unset.
+fn resolve_spawn_max_iterations(requested: Option<u32>) -> u32 {
+    requested
+        .map(|value| value.clamp(1, MAX_SPAWN_MAX_ITERATIONS))
+        .unwrap_or(DEFAULT_SPAWN_MAX_ITERATIONS)
 }
 
 #[derive(Clone, Deserialize)]
@@ -3274,17 +3288,13 @@ impl Tool for SpawnTool {
             // Keep an Arc handle to the child's tool registry so we can run
             // declared validators against it after `run_task` returns.
             let child_tools_handle = worker.tool_registry().clone();
-            // Apply the worker config plus an optional per-spawn iteration-budget
-            // override. Only override the worker's own config when there is a
-            // reason to (a configured worker_config OR a caller override), so
-            // the no-config path keeps the worker's default behavior byte-for-
-            // byte.
-            let sync_max_iters = clamp_spawn_max_iterations(input.max_iterations);
-            if self.worker_config.is_some() || sync_max_iters.is_some() {
+            // Apply the worker config plus the spawn's iteration budget: the
+            // caller's `max_iterations` (clamped) or the generous spawn default
+            // (`DEFAULT_SPAWN_MAX_ITERATIONS`) — a sub-agent does more than an
+            // interactive turn, so it must not inherit the bare 50 default.
+            {
                 let mut config = self.worker_config.clone().unwrap_or_default();
-                if let Some(mi) = sync_max_iters {
-                    config.max_iterations = mi;
-                }
+                config.max_iterations = resolve_spawn_max_iterations(input.max_iterations);
                 worker = worker.with_config(config);
             }
             if let Some(factory) = self.child_prompt_context_manager_factory.as_ref() {
@@ -3571,9 +3581,10 @@ impl Tool for SpawnTool {
             // workspace-declared command validator could escape to the host.
             let child_sandbox = self.sandbox.clone();
             let additional_instructions = input.additional_instructions;
-            // Per-spawn iteration-budget override, clamped, captured for the
-            // detached closure (`input` is not `'static`/available inside it).
-            let bg_max_iters = clamp_spawn_max_iterations(input.max_iterations);
+            // Spawn iteration budget (caller's clamped value or the generous
+            // spawn default), captured for the detached closure (`input` is not
+            // `'static`/available inside it).
+            let bg_max_iters = resolve_spawn_max_iterations(input.max_iterations);
             let default_worker_prompt = self.worker_prompt.clone();
             let bg_sender = self.background_result_sender.clone();
             let child_session_sender = self.child_session_sender.clone();
@@ -3871,9 +3882,7 @@ impl Tool for SpawnTool {
                 let child_tools_handle = worker.tool_registry().clone();
                 let mut effective_config = worker_config.clone().unwrap_or_default();
                 effective_config.suppress_auto_send_files = true;
-                if let Some(mi) = bg_max_iters {
-                    effective_config.max_iterations = mi;
-                }
+                effective_config.max_iterations = bg_max_iters;
                 worker = worker.with_config(effective_config);
                 // M8 Runtime Parity W2.B1: apply parent caches to the
                 // detached background child before it consumes any
@@ -6227,21 +6236,28 @@ PY
     }
 
     #[test]
-    fn clamp_spawn_max_iterations_bounds_the_request() {
-        // Not requested → keep the worker's default (None).
-        assert_eq!(clamp_spawn_max_iterations(None), None);
+    fn resolve_spawn_max_iterations_defaults_and_bounds() {
+        // Not requested → the generous spawn default (NOT the interactive 50).
+        assert_eq!(
+            resolve_spawn_max_iterations(None),
+            DEFAULT_SPAWN_MAX_ITERATIONS
+        );
+        assert!(
+            DEFAULT_SPAWN_MAX_ITERATIONS > 50,
+            "must exceed the interactive default"
+        );
         // Normal value passes through.
-        assert_eq!(clamp_spawn_max_iterations(Some(120)), Some(120));
+        assert_eq!(resolve_spawn_max_iterations(Some(120)), 120);
         // 0 is nonsensical → clamped up to 1.
-        assert_eq!(clamp_spawn_max_iterations(Some(0)), Some(1));
+        assert_eq!(resolve_spawn_max_iterations(Some(0)), 1);
         // Over the ceiling → clamped down (runaway-loop guard).
         assert_eq!(
-            clamp_spawn_max_iterations(Some(100_000)),
-            Some(MAX_SPAWN_MAX_ITERATIONS)
+            resolve_spawn_max_iterations(Some(100_000)),
+            MAX_SPAWN_MAX_ITERATIONS
         );
         assert_eq!(
-            clamp_spawn_max_iterations(Some(MAX_SPAWN_MAX_ITERATIONS)),
-            Some(MAX_SPAWN_MAX_ITERATIONS)
+            resolve_spawn_max_iterations(Some(MAX_SPAWN_MAX_ITERATIONS)),
+            MAX_SPAWN_MAX_ITERATIONS
         );
     }
 
