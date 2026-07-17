@@ -296,11 +296,40 @@ fn git_ref_exists(repo: &Path, refname: &str) -> Result<bool> {
 /// plus the child scope precomputed from the validated path. The caller must
 /// [`WorkerWorktreeGuard::disarm`] at the real worker handoff; any earlier
 /// refusal drops the guard and prunes the worktree + branch.
+/// Whether `dir` is inside a git work tree. Used to preflight worktree
+/// isolation so a non-git workspace produces a clear, actionable error instead
+/// of leaking git's raw `fatal: not a git repository`. Any failure to run git
+/// (missing binary, permissions) resolves to `false` here — the caller's error
+/// message covers "not a git repository" as the actionable remedy, and a truly
+/// missing git surfaces its own error on the subsequent `git worktree add`.
+fn is_inside_git_work_tree(dir: &Path) -> bool {
+    Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(["rev-parse", "--is-inside-work-tree"])
+        .output()
+        .map(|out| out.status.success() && String::from_utf8_lossy(&out.stdout).trim() == "true")
+        .unwrap_or(false)
+}
+
 fn allocate_worker_worktree(
     parent_working_dir: &Path,
     worker_id: &AgentId,
     parent_scope: Option<&Arc<SessionScope>>,
 ) -> Result<(WorkerWorktreeGuard, Option<Arc<SessionScope>>)> {
+    // Preflight: worktree isolation is only possible inside a git repository.
+    // Without this, a non-git workspace fell straight into
+    // `git rev-parse --show-toplevel` and surfaced the raw
+    // `fatal: not a git repository` — cryptic, and the model wasted a spawn
+    // round reverse-engineering the remedy. Give it an actionable message so it
+    // re-dispatches with `isolation: shared`/`none` on the first try.
+    if !is_inside_git_work_tree(parent_working_dir) {
+        return Err(eyre::eyre!(
+            "worktree isolation requires the workspace ({}) to be a git repository, but it is not. \
+             Re-dispatch the spawn with isolation: shared (or none), or start the session inside a git repo.",
+            parent_working_dir.display()
+        ));
+    }
     let repo_root = PathBuf::from(git_stdout(
         parent_working_dir,
         &["rev-parse", "--show-toplevel"],
@@ -7152,6 +7181,47 @@ PY
 
     /// `git init` + one commit at `repo`, so worktree tests have a HEAD to
     /// branch worker worktrees from.
+    #[test]
+    fn is_inside_git_work_tree_detects_repo_vs_plain_dir() {
+        let git_dir = tempfile::tempdir().unwrap();
+        init_worktree_test_repo(git_dir.path());
+        assert!(
+            is_inside_git_work_tree(git_dir.path()),
+            "an initialized repo must be detected as a work tree"
+        );
+
+        let plain = tempfile::tempdir().unwrap();
+        assert!(
+            !is_inside_git_work_tree(plain.path()),
+            "a non-git directory must not be detected as a work tree"
+        );
+    }
+
+    #[test]
+    fn allocate_worker_worktree_gives_actionable_error_outside_a_git_repo() {
+        // The live gap: a non-git workspace fell into `git rev-parse
+        // --show-toplevel` and leaked `fatal: not a git repository`. Now it
+        // returns an actionable message naming the remedy.
+        let plain = tempfile::tempdir().unwrap();
+        let worker = AgentId::new("subagent-0");
+        let msg = match allocate_worker_worktree(plain.path(), &worker, None) {
+            Ok(_) => panic!("worktree isolation must be refused outside a git repo"),
+            Err(err) => err.to_string(),
+        };
+        assert!(
+            msg.contains("git repository"),
+            "error must explain the git-repo requirement: {msg}"
+        );
+        assert!(
+            msg.contains("isolation: shared"),
+            "error must name the actionable remedy: {msg}"
+        );
+        assert!(
+            !msg.contains("show-toplevel"),
+            "the raw git plumbing error must not leak: {msg}"
+        );
+    }
+
     fn init_worktree_test_repo(repo: &std::path::Path) {
         std::fs::create_dir_all(repo).unwrap();
         run_git(repo, &["init"]);
