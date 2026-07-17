@@ -12733,9 +12733,15 @@ async fn maybe_spawn_appui_master_continuation_runner(
     // than `GoalContinue` pass `None` (the post-accountant is a no-op
     // for them).
     let goal_context_for_appui = match continuation.reason {
-        MasterContinuationReason::GoalContinue => Some(GoalContinuationContext {
-            profile_id: continuation.profile_id.as_str().to_owned(),
-        }),
+        // #1695 — GoalWrapUp included: the wrap-up turn's tokens (easily
+        // 100K+) must land in `tokens_used` on this path too. The gateway
+        // session-actor accountant already charges wrap-up turns; without
+        // this the two paths disagree and the WS wrap-up spend vanishes.
+        MasterContinuationReason::GoalContinue | MasterContinuationReason::GoalWrapUp => {
+            Some(GoalContinuationContext {
+                profile_id: continuation.profile_id.as_str().to_owned(),
+            })
+        }
         _ => None,
     };
     let handle = tokio::spawn(async move {

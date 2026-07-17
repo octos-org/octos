@@ -448,6 +448,22 @@ impl ServeCommand {
                     "solo boot: restored loop parked as paused (resume with /loop resume)"
                 );
             }
+            // Same safety for GOALS (#1694): a goal restored `active`
+            // resumes autonomous model turns nobody asked this process
+            // for. Park paused; `/goal resume` re-arms,
+            // OCTOS_SOLO_RESUME_GOALS=1 opts out.
+            if std::env::var("OCTOS_SOLO_RESUME_GOALS").ok().as_deref() != Some("1") {
+                for (goal_id, session_id) in
+                    crate::api::agent_orchestrator::default_agent_orchestrator()
+                        .pause_restored_goals_for_solo_boot()
+                {
+                    tracing::info!(
+                        goal_id = %goal_id,
+                        session_id = %session_id.0,
+                        "solo boot: restored goal parked as paused (resume with /goal resume)"
+                    );
+                }
+            }
         }
 
         let broadcaster = Arc::new(EventBroadcaster::new(256));
