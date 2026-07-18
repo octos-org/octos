@@ -79,11 +79,17 @@ impl ModelHints {
             is_o_series || m.starts_with("gpt-5") || m.starts_with("gpt-4.1");
 
         // kimi-k3 pins its sampling params server-side (temperature=1.0,
-        // top_p=0.95, …) and rejects overrides, so never send temperature.
+        // top_p=0.95, …) and rejects overrides, so never send temperature. The
+        // Kimi *coding plan* (family `moonshot-coding`) exposes the SAME K3
+        // model under the bare ids `k3` / `kimi-for-coding*`, which don't
+        // contain `kimi-k3` — match them too, or the endpoint 400s with
+        // "invalid temperature: only 1 is allowed for this model".
         let fixed_temperature = is_o_series
             || m.starts_with("gpt-5")
             || m.contains("kimi-k2")
             || m.contains("kimi-k3")
+            || m == "k3"
+            || m.starts_with("kimi-for-coding")
             || m == "gpt-4.1-nano";
 
         // Vision capability is NO LONGER inferred from the model name. The old
@@ -119,7 +125,9 @@ impl ModelHints {
         // families can reject `reasoning_effort`.
         let reasoning_style = if m.contains("deepseek-v4") || m.contains("deepseek-reasoner") {
             ReasoningStyle::EffortAndThinkingToggle
-        } else if m.contains("kimi-k3") {
+        } else if m.contains("kimi-k3") || m == "k3" {
+            // K3, incl. the coding plan's bare `k3` id — thinking is always on
+            // and effort maps to `max` (the K2.x `thinking` object is rejected).
             ReasoningStyle::EffortMaxOnly
         } else if m.starts_with("grok-4") || is_o_series || m.starts_with("gpt-5") {
             ReasoningStyle::Effort
@@ -1555,6 +1563,29 @@ mod tests {
                 ..Default::default()
             });
         assert_eq!(overridden.hints.reasoning_style, ReasoningStyle::None);
+    }
+
+    /// The Kimi coding plan (family `moonshot-coding`) exposes K3 under the bare
+    /// ids `k3` / `kimi-for-coding*`, which don't contain `kimi-k3`. They MUST
+    /// still pin temperature (else the endpoint 400s "only 1 is allowed") and
+    /// get K3's max-only reasoning.
+    #[test]
+    fn coding_plan_k3_ids_pin_temperature_and_max_reasoning() {
+        for id in ["k3", "kimi-for-coding", "kimi-for-coding-highspeed"] {
+            let h = ModelHints::detect(id);
+            assert!(
+                h.fixed_temperature,
+                "{id} must pin temperature (K3 rejects any temperature != 1)"
+            );
+        }
+        // Bare `k3` also gets K3's max-only reasoning.
+        assert_eq!(
+            ModelHints::detect("k3").reasoning_style,
+            ReasoningStyle::EffortMaxOnly
+        );
+        // Guard: an unrelated model containing "k3" as a substring is NOT the
+        // coding plan (exact match only), so it is unaffected.
+        assert!(!ModelHints::detect("mock-k3000").fixed_temperature);
     }
 
     #[test]
