@@ -18,7 +18,7 @@ pub use octos_services::cli_agent_adapter;
 pub mod commands;
 pub use octos_services::compaction;
 pub mod config;
-pub mod config_context;
+pub use octos_services::config_context;
 pub mod config_layer;
 pub mod config_watcher;
 #[cfg(feature = "api")]

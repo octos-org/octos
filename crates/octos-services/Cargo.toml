@@ -23,6 +23,12 @@ tar = { workspace = true }
 dirs = { workspace = true }
 futures = { workspace = true }
 
+[features]
+# Exposes the crate-wide env-test lock (config_context::TEST_ENV_LOCK) to
+# downstream crates' test builds, so octos-cli's env-pivoting tests serialize
+# on one mutex per test binary. Never enable in production.
+test-util = []
+
 [dev-dependencies]
 tempfile = { workspace = true }
 

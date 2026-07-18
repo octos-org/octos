@@ -375,8 +375,8 @@ pub fn run_migrations(ctx: &ConfigContext) {
 /// EVERY env-pivoting test in the crate (here and in `config.rs`) must
 /// serialize against this single mutex — separate per-module locks would let
 /// tests in different modules race each other and flake.
-#[cfg(test)]
-pub(crate) static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+#[cfg(any(test, feature = "test-util"))]
+pub static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[cfg(test)]
 mod tests {
