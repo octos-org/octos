@@ -122,8 +122,16 @@ pub fn context_window_tokens(model_id: &str) -> u32 {
     // is unavailable or lacks the exact variant (e.g. deepseek-v4-flash, which
     // has no dedicated catalog lane). DeepSeek V4, MiniMax M3 and Kimi K3 are
     // 1M-context.
+    // The Kimi coding plan (family `moonshot-coding`) exposes K3 under the bare
+    // ids `k3` / `kimi-for-coding*`, which don't contain `kimi-k3` — match them
+    // too so the `ctx N%` gauge shows K3's real ~1M window, not the 128K default.
     let m = model_id.to_lowercase();
-    if m.contains("deepseek-v4") || m.contains("minimax-m3") || m.contains("kimi-k3") {
+    if m.contains("deepseek-v4")
+        || m.contains("minimax-m3")
+        || m.contains("kimi-k3")
+        || m == "k3"
+        || m.starts_with("kimi-for-coding")
+    {
         return 1_048_576;
     }
     // Conservative default for unknown models
@@ -231,6 +239,14 @@ mod tests {
         assert_eq!(context_window_tokens("moonshot/kimi-k3"), 1_048_576);
         assert_eq!(max_output_tokens("kimi-k3"), 131_072);
         assert_eq!(max_output_tokens("moonshot/kimi-k3"), 131_072);
+        // The coding plan's bare `k3` / `kimi-for-coding*` ids are also 1M.
+        assert_eq!(context_window_tokens("k3"), 1_048_576);
+        assert_eq!(
+            context_window_tokens("kimi-for-coding-highspeed"),
+            1_048_576
+        );
+        // Guard: a substring `k3` in an unrelated model is NOT the coding plan.
+        assert_eq!(context_window_tokens("mock-k3000"), 128_000);
     }
 
     #[test]
