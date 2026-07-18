@@ -15,6 +15,87 @@ use crate::config::{ChannelEntry, CloudTtsConfig, Config, FallbackModel, Gateway
 
 pub const MAX_SUB_ACCOUNTS_PER_PARENT: usize = 10;
 
+pub const SUPPORTED_ASR_LANGUAGES: &[&str] = &[
+    "Chinese",
+    "English",
+    "Cantonese",
+    "Arabic",
+    "German",
+    "French",
+    "Spanish",
+    "Portuguese",
+    "Indonesian",
+    "Italian",
+    "Korean",
+    "Russian",
+    "Thai",
+    "Vietnamese",
+    "Japanese",
+    "Turkish",
+    "Hindi",
+    "Malay",
+    "Dutch",
+    "Swedish",
+    "Danish",
+    "Finnish",
+    "Polish",
+    "Czech",
+    "Filipino",
+    "Persian",
+    "Greek",
+    "Romanian",
+    "Hungarian",
+    "Macedonian",
+];
+
+pub fn canonical_asr_language(language: &str) -> Option<&'static str> {
+    let requested = language.trim();
+    SUPPORTED_ASR_LANGUAGES
+        .iter()
+        .copied()
+        .find(|supported| supported.eq_ignore_ascii_case(requested))
+}
+
+/// Resolve the language used by Qwen3-ASR. A per-profile setting wins over
+/// the serve-level default. Legacy ISO-style `zh` / `en` values are accepted
+/// for existing config files; Qwen3-ASR has no supported `auto` prompt, so an
+/// absent or invalid inherited value safely defaults to Chinese.
+pub fn effective_asr_language(
+    profile_override: Option<&str>,
+    serve_default: Option<&str>,
+) -> &'static str {
+    fn canonical_or_legacy(value: &str) -> Option<&'static str> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "zh" | "zh-cn" | "zh-hans" => Some("Chinese"),
+            "en" | "en-us" | "en-gb" => Some("English"),
+            _ => canonical_asr_language(value),
+        }
+    }
+
+    profile_override
+        .and_then(canonical_or_legacy)
+        .or_else(|| serve_default.and_then(canonical_or_legacy))
+        .unwrap_or("Chinese")
+}
+
+fn deserialize_profile_asr_language<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Option::<String>::deserialize(deserializer)?;
+    value
+        .map(|language| {
+            canonical_asr_language(&language)
+                .map(ToOwned::to_owned)
+                .ok_or_else(|| {
+                    serde::de::Error::custom(format!("unsupported ASR language '{language}'"))
+                })
+        })
+        .transpose()
+}
+
 /// A user profile with all configuration needed to run a gateway.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UserProfile {
@@ -70,6 +151,14 @@ pub struct ProfileConfig {
     /// `env_vars["VOLC_TTS_TOKEN"]`. `None` → inherit serve / env defaults.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tts_cloud: Option<CloudTtsConfig>,
+    /// Per-profile ASR language override. `None` inherits the serve-level voice
+    /// setting; values are canonical Qwen3-ASR language names.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_profile_asr_language"
+    )]
+    pub asr_language: Option<String>,
     /// Coding review specialist template. When omitted, `/review`
     /// uses the server's built-in default specialists. Operators may
     /// configure this per profile to change the native reviewer fanout
@@ -4645,5 +4734,46 @@ mod tests {
         let cfg: ProfileConfig = serde_json::from_str("{}").unwrap();
         assert!(cfg.tts_provider.is_none());
         assert!(cfg.tts_cloud.is_none());
+    }
+
+    #[test]
+    fn should_roundtrip_canonical_asr_language_on_profile_config() {
+        let cfg: ProfileConfig = serde_json::from_str(r#"{ "asr_language": "chinese" }"#).unwrap();
+        assert_eq!(cfg.asr_language.as_deref(), Some("Chinese"));
+        assert_eq!(
+            serde_json::to_value(&cfg).unwrap()["asr_language"],
+            "Chinese"
+        );
+    }
+
+    #[test]
+    fn should_inherit_asr_language_when_absent_or_null() {
+        let absent: ProfileConfig = serde_json::from_str("{}").unwrap();
+        let null: ProfileConfig = serde_json::from_str(r#"{ "asr_language": null }"#).unwrap();
+        assert!(absent.asr_language.is_none());
+        assert!(null.asr_language.is_none());
+    }
+
+    #[test]
+    fn should_reject_auto_as_profile_asr_language() {
+        let error =
+            serde_json::from_str::<ProfileConfig>(r#"{ "asr_language": "auto" }"#).unwrap_err();
+        assert!(error.to_string().contains("unsupported ASR language"));
+    }
+
+    #[test]
+    fn should_prefer_profile_asr_language_over_serve_default() {
+        assert_eq!(
+            effective_asr_language(Some("English"), Some("zh")),
+            "English"
+        );
+    }
+
+    #[test]
+    fn should_keep_legacy_asr_aliases_and_default_to_chinese() {
+        assert_eq!(effective_asr_language(None, Some("zh")), "Chinese");
+        assert_eq!(effective_asr_language(None, Some("en-US")), "English");
+        assert_eq!(effective_asr_language(None, Some("auto")), "Chinese");
+        assert_eq!(effective_asr_language(None, None), "Chinese");
     }
 }

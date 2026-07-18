@@ -1508,6 +1508,110 @@ pub struct VoiceReadiness {
     pub tts: VoiceTtsLeg,
 }
 
+#[derive(Serialize)]
+pub struct VoiceTranscriptionResponse {
+    pub accepted: bool,
+    pub transcript: String,
+    pub language: String,
+}
+
+/// POST /api/voice/transcribe — ASR-only preflight for a possible barge-in.
+///
+/// This deliberately does not create a turn. The browser can therefore verify
+/// that a VAD hit contains meaningful speech while the incumbent AI turn keeps
+/// running, and commit the interruption only after this returns `accepted`.
+pub async fn transcribe_voice_candidate(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    axum::Extension(identity): axum::Extension<AuthIdentity>,
+    mut multipart: axum::extract::Multipart,
+) -> Result<Json<VoiceTranscriptionResponse>, (StatusCode, String)> {
+    const MAX_CANDIDATE_BYTES: usize = 20 * 1024 * 1024;
+
+    let ps = state.profile_store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "profile store unavailable".to_owned(),
+    ))?;
+    let profile = resolve_my_profile(&identity, ps, &state, &headers)
+        .map_err(|status| (status, "profile not found".to_owned()))?;
+
+    let runtime =
+        crate::api::ui_protocol::resolve_session_profile_runtime(&state, Some(profile.id.as_str()));
+    let language = crate::profiles::effective_asr_language(
+        profile.config.asr_language.as_deref(),
+        runtime
+            .as_ref()
+            .and_then(|runtime| runtime.voice.asr_language.as_deref()),
+    );
+
+    let mut audio = None;
+    while let Some(field) = multipart.next_field().await.map_err(|error| {
+        (
+            StatusCode::BAD_REQUEST,
+            format!("invalid multipart body: {error}"),
+        )
+    })? {
+        if field.name() != Some("file") {
+            continue;
+        }
+        let filename = field.file_name().unwrap_or("utterance.wav").to_owned();
+        let bytes = field.bytes().await.map_err(|error| {
+            (
+                StatusCode::BAD_REQUEST,
+                format!("failed to read audio: {error}"),
+            )
+        })?;
+        if bytes.len() > MAX_CANDIDATE_BYTES {
+            return Err((
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "voice candidate exceeds 20 MiB".to_owned(),
+            ));
+        }
+        audio = Some((filename, bytes));
+        break;
+    }
+    let (filename, bytes) = audio.ok_or((
+        StatusCode::BAD_REQUEST,
+        "multipart field 'file' is required".to_owned(),
+    ))?;
+
+    let suffix = std::path::Path::new(&filename)
+        .extension()
+        .and_then(|value| value.to_str())
+        .filter(|value| value.len() <= 8 && value.chars().all(|ch| ch.is_ascii_alphanumeric()))
+        .map(|value| format!(".{value}"))
+        .unwrap_or_else(|| ".wav".to_owned());
+    let mut temp = tempfile::Builder::new()
+        .prefix("octos-voice-candidate-")
+        .suffix(&suffix)
+        .tempfile()
+        .map_err(|error| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to stage voice candidate: {error}"),
+            )
+        })?;
+    std::io::Write::write_all(temp.as_file_mut(), &bytes).map_err(|error| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("failed to stage voice candidate: {error}"),
+        )
+    })?;
+
+    let raw = crate::api::voice_turn::transcribe_audio_path(temp.path(), Some(language))
+        .await
+        .map_err(|error| {
+            tracing::warn!(profile = %profile.id, error = %error, "voice candidate ASR failed");
+            (StatusCode::BAD_GATEWAY, "ASR unavailable".to_owned())
+        })?;
+    let transcript = crate::api::voice_turn::meaningful_transcript(&raw).unwrap_or_default();
+    Ok(Json(VoiceTranscriptionResponse {
+        accepted: !transcript.is_empty(),
+        transcript,
+        language: language.to_owned(),
+    }))
+}
+
 /// GET /api/voice/readiness — per-tenant pre-flight for the voice assistant.
 ///
 /// Confirms the whole pipeline can run under THIS profile's current config:

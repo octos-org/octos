@@ -217,6 +217,12 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/my/voice", put(auth_handlers::set_my_voice))
         // Per-tenant voice-assistant pre-flight: ASR + LLM + (route-aware) TTS.
         .route("/api/voice/readiness", get(auth_handlers::voice_readiness))
+        // ASR-only candidate validation used by transactional voice barge-in.
+        .route(
+            "/api/voice/transcribe",
+            post(auth_handlers::transcribe_voice_candidate)
+                .layer(DefaultBodyLimit::max(20 * 1024 * 1024)),
+        )
         // Memory + Cron panel REST routes retired in favor of the UI Protocol
         // methods (`memory/overview`, `memory/entity`, `cron/list`,
         // `cron/toggle`, gated by `auxiliary.rest_to_ws.v1`), which wrap the

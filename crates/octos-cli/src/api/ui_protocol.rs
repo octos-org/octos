@@ -12707,6 +12707,7 @@ async fn maybe_spawn_appui_master_continuation_runner(
             text: master_continuation_prompt(&continuation),
         }],
         media: Vec::new(),
+        voice_transcript: None,
         topic: None,
         rewrite_for: None,
         reasoning_effort: None,
@@ -22413,9 +22414,24 @@ async fn run_standalone_turn(
     // ── 语音轮 STT（serve 路径）────────────────────────────────────
     // 若 turn 媒体含音频，转写并并入 prompt；并记录"本轮含音频输入"，
     // 供下方决定是否合成语音回复。
-    // ASR language hint from the profile's resolved voice config (captured at
-    // bootstrap from the host config.json `voice` block). `None` → auto-detect.
-    let asr_language: Option<String> = session_runtime.profile.voice.asr_language.clone();
+    // Read the profile override for every turn instead of freezing it in the
+    // cached SessionRuntime. A Settings save therefore affects the very next
+    // utterance without restarting `octos serve`. The serve-level voice value
+    // remains the inherited fallback for profiles without an override.
+    let profile_asr_language = state
+        .profile_store
+        .as_ref()
+        .and_then(|store| {
+            store
+                .get(&session_runtime.profile.profile_id)
+                .ok()
+                .flatten()
+        })
+        .and_then(|profile| profile.config.asr_language);
+    let asr_language = crate::profiles::effective_asr_language(
+        profile_asr_language.as_deref(),
+        session_runtime.profile.voice.asr_language.as_deref(),
+    );
     // `materialize_turn_uploads` returns workspace-RELATIVE paths
     // ("uploads/<name>"). That works for the agent's own tools (cwd =
     // workspace_root), but ominix-api is a SEPARATE process that reads
@@ -22437,8 +22453,17 @@ async fn run_standalone_turn(
         })
         .collect();
     tracing::debug!(media = ?asr_media, "voice_turn: STT input media");
-    let voice_transcripts =
-        crate::api::voice_turn::transcribe_audio_media(&asr_media, asr_language.as_deref()).await;
+    let voice_transcripts = params
+        .voice_transcript
+        .as_deref()
+        .and_then(crate::api::voice_turn::meaningful_transcript)
+        .map(|transcript| vec![transcript])
+        .unwrap_or_else(Vec::new);
+    let voice_transcripts = if voice_transcripts.is_empty() {
+        crate::api::voice_turn::transcribe_audio_media(&asr_media, Some(asr_language)).await
+    } else {
+        voice_transcripts
+    };
     let had_audio_input = !voice_transcripts.is_empty();
     tracing::debug!(
         transcripts = voice_transcripts.len(),
@@ -34203,6 +34228,7 @@ ignore = []
                 text: "hello".into(),
             }],
             media: Vec::new(),
+            voice_transcript: None,
             topic: None,
             rewrite_for: None,
             reasoning_effort: None,
@@ -40457,6 +40483,7 @@ ignore = []
                 text: "hello".into(),
             }],
             media: Vec::new(),
+            voice_transcript: None,
             topic: Some("coding".into()),
             live_video: false,
             reasoning_effort: None,
@@ -42464,6 +42491,7 @@ ignore = []
                 text: "m9 slow fixture".into(),
             }],
             media: Vec::new(),
+            voice_transcript: None,
             topic: None,
             rewrite_for: None,
             reasoning_effort: None,
