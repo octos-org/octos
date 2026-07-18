@@ -57,7 +57,11 @@ impl BudgetStop {
                      research/multi-step task, ask the agent to use \
                      `run_pipeline` (deep research) which delegates the \
                      work to specialised sub-agents instead of iterating \
-                     one tool call at a time."
+                     one tool call at a time. If this ran as a spawned \
+                     sub-agent (e.g. a repo-scale review), re-spawn it with a \
+                     higher `max_iterations` — the spawn tool accepts a \
+                     `max_iterations` field (up to 300); a broad from-scratch \
+                     review typically needs ~100–150."
                 )
             }
             Self::MaxTokens { used, limit } => {
@@ -275,6 +279,13 @@ mod tests {
             msg.contains("run_pipeline"),
             "expected a hint about 'run_pipeline' (the canonical \
              multi-step research path) in: {msg}"
+        );
+        // Self-correcting hint: a capped SPAWNED sub-agent's parent must learn
+        // it can re-spawn with a higher budget — otherwise the `max_iterations`
+        // lever is invisible and the orchestrator keeps starving review lanes.
+        assert!(
+            msg.contains("max_iterations"),
+            "expected the message to point at the `max_iterations` lever: {msg}"
         );
     }
 
