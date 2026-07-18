@@ -113,11 +113,15 @@ impl Tool for GoalUpdateTool {
     }
 
     fn description(&self) -> &str {
-        "Transition this session's goal. Allowed ONLY when justified: status=\"complete\" once \
-         the goal's success criteria are demonstrably met (verify against evidence first), or \
-         status=\"blocked\" when the same blocker has persisted across turns and you cannot \
-         advance. Include a short evidence-based reason. Pause/resume/budget changes are \
-         user-owned and will be rejected."
+        "Transition this session's goal — use ONLY to mark it genuinely achieved or blocked. \
+         Set status=\"complete\" ONLY when the objective has actually been achieved and no \
+         required work remains (verify against evidence, not intent). Do NOT mark complete \
+         merely because the token budget is nearly exhausted or because you are stopping work. \
+         Set status=\"blocked\" ONLY when the same blocking condition has persisted across \
+         multiple consecutive goal turns and you cannot make meaningful progress without user \
+         input or an external state change — not because the work is merely hard, slow, \
+         uncertain, or incomplete. Include a short evidence-based reason. Pause/resume/budget \
+         changes are user-owned and will be rejected."
     }
 
     fn input_schema(&self) -> Value {
@@ -184,6 +188,113 @@ impl Tool for GoalUpdateTool {
             }),
             Err(message) => Ok(ToolResult {
                 output: format!("goal_update: {message}"),
+                success: false,
+                ..Default::default()
+            }),
+        }
+    }
+}
+
+/// `goal_create` — model-owned goal creation (codex parity). Gated by its
+/// description to "only when explicitly requested"; the orchestrator rejects the
+/// call if this session already has an unfinished goal.
+pub struct GoalCreateTool {
+    profile_id: String,
+}
+
+impl GoalCreateTool {
+    pub fn new(profile_id: impl Into<String>) -> Self {
+        Self {
+            profile_id: profile_id.into(),
+        }
+    }
+}
+
+#[async_trait]
+impl Tool for GoalCreateTool {
+    fn name(&self) -> &str {
+        "goal_create"
+    }
+
+    fn description(&self) -> &str {
+        "Create a persistent goal for this session — ONLY when the user or system/developer \
+         instructions explicitly ask for a goal; do NOT infer one from an ordinary task. Starts \
+         a new active goal when none exists, or replaces the current goal only when it is \
+         already complete. Fails if an unfinished goal exists (complete or clear it first). Set \
+         token_budget only when an explicit token budget is requested."
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "objective": {
+                    "type": "string",
+                    "description": "The concrete objective to start pursuing."
+                },
+                "token_budget": {
+                    "type": "integer",
+                    "description": "Optional positive token budget. Omit unless explicitly requested."
+                }
+            },
+            "required": ["objective"],
+            "additionalProperties": false
+        })
+    }
+
+    async fn execute(&self, args: &Value) -> Result<ToolResult> {
+        self.execute_with_context(&ToolContext::zero(), args).await
+    }
+
+    async fn execute_with_context(&self, ctx: &ToolContext, args: &Value) -> Result<ToolResult> {
+        let Some(session_id) = session_from_ctx(ctx) else {
+            return Ok(ToolResult {
+                output: "goal_create: no session context for this turn".into(),
+                success: false,
+                ..Default::default()
+            });
+        };
+        let objective = args
+            .get("objective")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .trim();
+        if objective.is_empty() {
+            return Ok(ToolResult {
+                output: "goal_create: `objective` is required".into(),
+                success: false,
+                ..Default::default()
+            });
+        }
+        let token_budget = match args.get("token_budget") {
+            None | Some(Value::Null) => None,
+            Some(value) => match value.as_u64() {
+                Some(budget) if budget > 0 => Some(budget),
+                _ => {
+                    return Ok(ToolResult {
+                        output: "goal_create: token_budget must be a positive integer".into(),
+                        success: false,
+                        ..Default::default()
+                    });
+                }
+            },
+        };
+        match default_agent_orchestrator().model_create_goal(
+            &session_id,
+            &self.profile_id,
+            objective,
+            token_budget,
+        ) {
+            Ok(goal) => Ok(ToolResult {
+                output: format!(
+                    "goal created:\n{}",
+                    serde_json::to_string_pretty(&goal).unwrap_or_else(|_| goal.to_string())
+                ),
+                success: true,
+                ..Default::default()
+            }),
+            Err(message) => Ok(ToolResult {
+                output: format!("goal_create: {message}"),
                 success: false,
                 ..Default::default()
             }),
