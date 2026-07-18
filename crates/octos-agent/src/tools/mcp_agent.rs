@@ -260,26 +260,26 @@ impl DispatchRequest {
         self
     }
 
-    fn arguments_payload(&self) -> serde_json::Value {
-        let Some(contract) = &self.context_contract else {
-            return self.task.clone();
-        };
+    /// Tool arguments exactly as the caller supplied them. The context
+    /// contract must NOT be merged in here: strict-schema MCP servers
+    /// (codex mcp-server among them) validate `arguments` against the
+    /// tool's inputSchema and reject unknown fields.
+    fn wire_arguments(&self) -> serde_json::Value {
+        self.task.clone()
+    }
+
+    /// Context contract for the wire, wrapped for `params._meta` — the
+    /// MCP-sanctioned extension point servers must tolerate. Namespaced
+    /// key so it cannot collide with other _meta producers.
+    fn meta_payload(&self) -> Option<serde_json::Value> {
+        let contract = self.context_contract.as_ref()?;
         let contract_value = serde_json::to_value(contract).unwrap_or_else(|_| {
             serde_json::json!({
                 "mode": "external_context_unmanaged",
                 "reason": "context_contract_serialization_failed"
             })
         });
-        match self.task.clone() {
-            serde_json::Value::Object(mut obj) => {
-                obj.insert("context_contract".to_string(), contract_value);
-                serde_json::Value::Object(obj)
-            }
-            other => serde_json::json!({
-                "task": other,
-                "context_contract": contract_value,
-            }),
-        }
+        Some(serde_json::json!({ "octos/contextContract": contract_value }))
     }
 }
 
@@ -614,36 +614,51 @@ async fn perform_stdio_handshake_and_call(
             format!("MCP initialize write failed: {error}"),
         )
     })?;
-    let _init = read_json_rpc_response(&mut reader).await.map_err(|error| {
-        (
-            DispatchOutcome::ProtocolError,
-            format!("MCP initialize response invalid: {error}"),
-        )
-    })?;
+    let _init = read_json_rpc_response(&mut reader, 1)
+        .await
+        .map_err(|error| {
+            (
+                DispatchOutcome::ProtocolError,
+                format!("MCP initialize response invalid: {error}"),
+            )
+        })?;
 
-    send_json_rpc(
-        &mut stdin,
-        2,
-        "tools/call",
-        serde_json::json!({
-            "name": request.tool_name,
-            "arguments": request.arguments_payload(),
-        }),
-    )
-    .await
-    .map_err(|error| {
-        (
-            DispatchOutcome::TransportError,
-            format!("MCP tools/call write failed: {error}"),
-        )
-    })?;
+    // Spec-required handshake completion. Real servers (codex
+    // mcp-server) are within their rights to hold requests until this
+    // arrives; lenient ones ignore duplicates.
+    send_json_rpc_notification(&mut stdin, "notifications/initialized")
+        .await
+        .map_err(|error| {
+            (
+                DispatchOutcome::TransportError,
+                format!("MCP initialized notification write failed: {error}"),
+            )
+        })?;
 
-    let response = read_json_rpc_response(&mut reader).await.map_err(|error| {
-        (
-            DispatchOutcome::ProtocolError,
-            format!("MCP tools/call response invalid: {error}"),
-        )
-    })?;
+    let mut call_params = serde_json::json!({
+        "name": request.tool_name,
+        "arguments": request.wire_arguments(),
+    });
+    if let Some(meta) = request.meta_payload() {
+        call_params["_meta"] = meta;
+    }
+    send_json_rpc(&mut stdin, 2, "tools/call", call_params)
+        .await
+        .map_err(|error| {
+            (
+                DispatchOutcome::TransportError,
+                format!("MCP tools/call write failed: {error}"),
+            )
+        })?;
+
+    let response = read_json_rpc_response(&mut reader, 2)
+        .await
+        .map_err(|error| {
+            (
+                DispatchOutcome::ProtocolError,
+                format!("MCP tools/call response invalid: {error}"),
+            )
+        })?;
 
     Ok(parse_tools_call_response(response))
 }
@@ -666,31 +681,87 @@ async fn send_json_rpc(
     stdin.flush().await
 }
 
-async fn read_json_rpc_response(
-    reader: &mut BufReader<ChildStdout>,
-) -> std::result::Result<serde_json::Value, String> {
-    let line = read_line_limited(reader, MAX_LINE_BYTES)
-        .await
-        .map_err(|error| error.to_string())?;
-    let envelope: serde_json::Value = serde_json::from_str(&line)
-        .map_err(|error| format!("invalid JSON-RPC response: {error}"))?;
-
-    if let Some(err) = envelope.get("error").and_then(|v| v.as_object()) {
-        let code = err.get("code").and_then(|v| v.as_i64()).unwrap_or(-32603);
-        let message = err
-            .get("message")
-            .and_then(|v| v.as_str())
-            .unwrap_or("unknown error");
-        return Err(format!("remote error {code}: {message}"));
-    }
-
-    envelope
-        .get("result")
-        .cloned()
-        .ok_or_else(|| "JSON-RPC response missing 'result'".to_string())
+/// Fire-and-forget JSON-RPC notification (no `id`, no response).
+async fn send_json_rpc_notification(stdin: &mut ChildStdin, method: &str) -> std::io::Result<()> {
+    let request = serde_json::json!({
+        "jsonrpc": "2.0",
+        "method": method,
+    });
+    let mut line = serde_json::to_string(&request).map_err(std::io::Error::other)?;
+    line.push('\n');
+    stdin.write_all(line.as_bytes()).await?;
+    stdin.flush().await
 }
 
-async fn read_line_limited(reader: &mut BufReader<ChildStdout>, limit: usize) -> Result<String> {
+/// Frames a server may interleave before the response the client is
+/// waiting for. Bounded so a server spraying notifications cannot pin
+/// the read loop forever (the dispatch wallclock timeout is the outer
+/// guard; this is the inner sanity bound).
+const MAX_SKIPPED_FRAMES: usize = 10_000;
+
+/// Read frames until the response for `expect_id` arrives. Real MCP
+/// servers interleave notifications on stdout — codex mcp-server
+/// streams `codex/event` frames while a session runs — and the old
+/// single-line read treated the first such frame as a protocol error.
+/// Notifications (a `method`, no `id`) and server-initiated requests
+/// (a `method` AND an `id`) are skipped; requests are logged since an
+/// unanswered blocking request (e.g. an elicitation) will surface as a
+/// dispatch timeout rather than a hang.
+async fn read_json_rpc_response<R: tokio::io::AsyncRead + Unpin>(
+    reader: &mut BufReader<R>,
+    expect_id: u64,
+) -> std::result::Result<serde_json::Value, String> {
+    for _ in 0..MAX_SKIPPED_FRAMES {
+        let line = read_line_limited(reader, MAX_LINE_BYTES)
+            .await
+            .map_err(|error| error.to_string())?;
+        let envelope: serde_json::Value = serde_json::from_str(&line)
+            .map_err(|error| format!("invalid JSON-RPC response: {error}"))?;
+
+        if envelope.get("method").is_some() {
+            if let Some(id) = envelope.get("id") {
+                warn!(
+                    method = envelope["method"].as_str().unwrap_or("?"),
+                    id = %id,
+                    "skipping server-initiated MCP request; if the server blocks on it \
+                     the dispatch will time out"
+                );
+            }
+            continue;
+        }
+
+        let matches_expected = envelope
+            .get("id")
+            .and_then(|v| v.as_u64())
+            .is_some_and(|id| id == expect_id);
+        if !matches_expected {
+            // Response to some other id (stale or duplicate) — skip.
+            continue;
+        }
+
+        if let Some(err) = envelope.get("error").and_then(|v| v.as_object()) {
+            let code = err.get("code").and_then(|v| v.as_i64()).unwrap_or(-32603);
+            let message = err
+                .get("message")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown error");
+            return Err(format!("remote error {code}: {message}"));
+        }
+
+        return envelope
+            .get("result")
+            .cloned()
+            .ok_or_else(|| "JSON-RPC response missing 'result'".to_string());
+    }
+    Err(format!(
+        "no response for id {expect_id} within {MAX_SKIPPED_FRAMES} frames"
+    ))
+}
+
+async fn read_line_limited<R: tokio::io::AsyncRead + Unpin>(
+    reader: &mut BufReader<R>,
+    limit: usize,
+) -> Result<String> {
     let mut buf = Vec::with_capacity(4096);
     loop {
         let available = reader.fill_buf().await?;
@@ -902,14 +973,18 @@ impl HttpMcpAgent {
     ) -> DispatchResponse {
         // JSON-RPC body — same shape as the stdio path so the remote
         // agent's dispatcher can treat both transports uniformly.
+        let mut call_params = serde_json::json!({
+            "name": request.tool_name,
+            "arguments": request.wire_arguments(),
+        });
+        if let Some(meta) = request.meta_payload() {
+            call_params["_meta"] = meta;
+        }
         let body = serde_json::json!({
             "jsonrpc": "2.0",
             "id": 1,
             "method": "tools/call",
-            "params": {
-                "name": request.tool_name,
-                "arguments": request.arguments_payload(),
-            },
+            "params": call_params,
         });
 
         let mut req = client
@@ -1147,7 +1222,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn dispatch_request_injects_context_contract_into_arguments() {
+    fn dispatch_request_keeps_arguments_pristine_and_carries_contract_in_meta() {
+        // Strict-schema MCP servers (codex mcp-server rejects with
+        // "unknown field `context_contract`") validate `arguments`
+        // against the tool's inputSchema, so the context contract must
+        // ride in `params._meta` — the MCP-sanctioned extension point —
+        // and never leak into the tool arguments.
         let request = DispatchRequest::new("run_task", serde_json::json!({"task": "review"}))
             .with_context_contract(
                 DispatchContextContract::external_unmanaged("fixture")
@@ -1155,15 +1235,77 @@ mod tests {
                     .with_child_session_key(Some("child".to_string())),
             );
 
-        let args = request.arguments_payload();
-        assert_eq!(args["task"], "review");
+        let args = request.wire_arguments();
+        assert_eq!(args, serde_json::json!({"task": "review"}));
+        assert!(args.get("context_contract").is_none());
+
+        let meta = request.meta_payload().expect("contract present -> meta");
+        let contract = &meta["octos/contextContract"];
+        assert_eq!(contract["mode"], "external_context_unmanaged");
+        assert_eq!(contract["reason"], "fixture");
+        assert_eq!(contract["parent_session_key"], "parent");
+        assert_eq!(contract["child_session_key"], "child");
+    }
+
+    #[test]
+    fn dispatch_request_without_contract_has_no_meta() {
+        let request = DispatchRequest::new("run_task", serde_json::json!({"task": "review"}));
         assert_eq!(
-            args["context_contract"]["mode"],
-            "external_context_unmanaged"
+            request.wire_arguments(),
+            serde_json::json!({"task": "review"})
         );
-        assert_eq!(args["context_contract"]["reason"], "fixture");
-        assert_eq!(args["context_contract"]["parent_session_key"], "parent");
-        assert_eq!(args["context_contract"]["child_session_key"], "child");
+        assert!(request.meta_payload().is_none());
+    }
+
+    /// Real MCP servers (codex mcp-server) interleave `codex/event`
+    /// notifications on stdout while a session runs. The reader must
+    /// skip them and return the response frame for the expected id.
+    #[tokio::test]
+    async fn read_response_skips_notification_frames() {
+        let stream = concat!(
+            "{\"jsonrpc\":\"2.0\",\"method\":\"codex/event\",\"params\":{\"msg\":\"thinking\"}}\n",
+            "{\"jsonrpc\":\"2.0\",\"method\":\"codex/event\",\"params\":{\"msg\":\"running\"}}\n",
+            "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"done\"}]}}\n",
+        );
+        let mut reader = BufReader::new(stream.as_bytes());
+        let result = read_json_rpc_response(&mut reader, 2)
+            .await
+            .expect("response after notifications");
+        assert_eq!(result["content"][0]["text"], "done");
+    }
+
+    /// A server-initiated request (has both `method` and `id`) must be
+    /// skipped, not mistaken for our response — and a response for a
+    /// DIFFERENT id must not satisfy the wait.
+    #[tokio::test]
+    async fn read_response_skips_server_requests_and_foreign_ids() {
+        let stream = concat!(
+            "{\"jsonrpc\":\"2.0\",\"id\":77,\"method\":\"elicitation/create\",\"params\":{}}\n",
+            "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"stale\":true}}\n",
+            "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"fresh\":true}}\n",
+        );
+        let mut reader = BufReader::new(stream.as_bytes());
+        let result = read_json_rpc_response(&mut reader, 2)
+            .await
+            .expect("expected-id response");
+        assert_eq!(result["fresh"], true);
+    }
+
+    /// Error envelopes for the expected id still surface as errors.
+    #[tokio::test]
+    async fn read_response_surfaces_remote_error_for_expected_id() {
+        let stream = concat!(
+            "{\"jsonrpc\":\"2.0\",\"method\":\"codex/event\",\"params\":{}}\n",
+            "{\"jsonrpc\":\"2.0\",\"id\":2,\"error\":{\"code\":-32000,\"message\":\"boom\"}}\n",
+        );
+        let mut reader = BufReader::new(stream.as_bytes());
+        let error = read_json_rpc_response(&mut reader, 2)
+            .await
+            .expect_err("error envelope");
+        assert!(
+            error.contains("-32000") && error.contains("boom"),
+            "{error}"
+        );
     }
 
     /// #1021 / M17-C — backend_kind, agent_id, and risk are all
