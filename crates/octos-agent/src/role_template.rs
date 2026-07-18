@@ -453,21 +453,27 @@ const ROLE_TEMPLATES: &[RoleTemplate] = &[
     RoleTemplate {
         name: ROLE_REVIEWER,
         display_name: "Reviewer",
-        description: "Repository / code reviewer. Walks the diff and emits structured findings; \
-                      does not mutate workspace files.",
-        // Reviewers READ files, search, and may fetch reference docs.
-        // Every entry below is either an exact read-only tool name or
-        // a group that contains ONLY read-only tools — because if a
-        // future caller pipes `allowed_tools` straight into
-        // `ToolPolicy.allow`, group expansion would silently grant
-        // every member tool. The set below deliberately excludes:
-        // `group:fs` (`write_file`/`edit_file`/...), `group:memory`
-        // (`save_memory`), `group:web` (`browser` persists
-        // screenshots), and `group:research` (`deep_crawl` /
-        // `search` persist crawled pages and research dirs to disk).
-        // Reviewers stay strictly stateless.
+        description: "Repository / code reviewer. Walks the diff and emits structured findings, \
+                      and may WRITE its review report to a file; does not modify the code under \
+                      review.",
+        // Reviewers READ files, search, fetch reference docs, and WRITE
+        // their own review report. `write_file` is listed as an EXACT
+        // tool name (never `group:fs`): a reviewer needs to produce a
+        // written deliverable (e.g. `security-review.md`), but must not
+        // gain the code-mutating tools that `group:fs` expands to
+        // (`edit_file`/`apply_patch`/`diff_edit`). Every OTHER entry is
+        // an exact read-only tool name or a group that contains ONLY
+        // read-only tools — because if a future caller pipes
+        // `allowed_tools` straight into `ToolPolicy.allow`, group
+        // expansion would silently grant every member tool. The set
+        // deliberately excludes: `group:fs` (the code-patching tools),
+        // `group:memory` (`save_memory`), `group:web` (`browser`
+        // persists screenshots), and `group:research` (`deep_crawl` /
+        // `search` persist crawled pages and research dirs). A reviewer
+        // writes its REPORT, not the reviewed code.
         allowed_tools: &[
             "read_file",
+            "write_file",
             "group:search",
             "web_search",
             "web_fetch",
@@ -478,8 +484,9 @@ const ROLE_TEMPLATES: &[RoleTemplate] = &[
         default_approval_policy: APPROVAL_NEVER,
         model_preference: ModelPreference::Coding,
         prompt_prefix: "You are a code reviewer. Read the diff and the surrounding context, \
-                        then emit findings as a bounded list. Do not edit files, do not run \
-                        the test suite, do not spawn further agents. Prefer concrete file:line \
+                        then emit findings as a bounded list. WRITE your review to the requested \
+                        report file (use write_file), but do NOT edit the code under review, run \
+                        the test suite, or spawn further agents. Prefer concrete file:line \
                         references and explain the WHY of each finding.",
     },
     RoleTemplate {
@@ -512,13 +519,16 @@ const ROLE_TEMPLATES: &[RoleTemplate] = &[
         display_name: "Test Worker",
         description: "Verification worker. Runs the test / lint / build suite the upstream \
                       task implies and reports concrete failures.",
-        // Test workers run commands and read files. They should not
-        // edit files (a fix is the implementer's job) and should not
-        // spawn further children. Same as reviewer: explicit
-        // `read_file` + `recall_memory` so `group:fs` / `group:memory`
+        // Test workers run commands, read files, and WRITE their
+        // verification report. `write_file` is listed as an EXACT tool
+        // name (never `group:fs`): the worker persists its report but
+        // must not gain the code-patching tools `group:fs` expands to
+        // (`edit_file`/`apply_patch`) — fixing is the implementer's job.
+        // Explicit `read_file` + `recall_memory` so `group:memory`
         // mutating tools do NOT leak in.
         allowed_tools: &[
             "read_file",
+            "write_file",
             "group:search",
             "group:runtime",
             "recall_memory",
@@ -527,24 +537,29 @@ const ROLE_TEMPLATES: &[RoleTemplate] = &[
         default_approval_policy: APPROVAL_ASK,
         model_preference: ModelPreference::Analyst,
         prompt_prefix: "You are a verification worker. Run the test, lint, and build commands \
-                        implied by the brief. Do not edit source files. Report concrete \
-                        failures with the offending command, exit code, and the most \
-                        diagnostic 20-40 lines of output.",
+                        implied by the brief. Do NOT edit source files. WRITE your verification \
+                        report to the requested file (use write_file). Report concrete failures \
+                        with the offending command, exit code, and the most diagnostic 20-40 \
+                        lines of output.",
     },
     RoleTemplate {
         name: ROLE_EXPLORER,
         display_name: "Explorer",
         description: "Read-only codebase analyst. Gathers context (files, call sites, prior \
-                      art) for an upstream planner; never mutates state.",
-        // Explorers are STRICTLY READ-ONLY. Same caveats as reviewer:
-        // every entry is either an exact read-only tool name or a
-        // group containing only read-only tools. `group:web` is NOT
-        // used (browser persists screenshots); `group:research` is
-        // NOT used (deep_crawl / search persist crawled pages). The
-        // explorer can still fetch a page via `web_fetch` and
-        // summarise via `synthesize_research` without writing files.
+                      art) for an upstream planner and may WRITE its findings to a report file; \
+                      does not mutate the code it analyses.",
+        // Explorers analyse code read-only and WRITE their context
+        // report. `write_file` is listed as an EXACT tool name (never
+        // `group:fs`): the explorer persists its summary but must not
+        // gain the code-mutating tools `group:fs` expands to. Every
+        // OTHER entry is an exact read-only tool name or a group of
+        // read-only tools. `group:web` is NOT used (browser persists
+        // screenshots); `group:research` is NOT used (deep_crawl /
+        // search persist crawled pages). The explorer writes its
+        // REPORT, not the analysed code.
         allowed_tools: &[
             "read_file",
+            "write_file",
             "group:search",
             "web_search",
             "web_fetch",
@@ -555,8 +570,9 @@ const ROLE_TEMPLATES: &[RoleTemplate] = &[
         default_approval_policy: APPROVAL_NEVER,
         model_preference: ModelPreference::Cheap,
         prompt_prefix: "You are a codebase explorer. Read files, search, and summarise. Do \
-                        not edit, do not run commands, do not spawn further agents. Return \
-                        a bounded summary plus absolute file paths the upstream planner \
+                        not edit the code, do not run commands, do not spawn further agents. \
+                        WRITE your findings to the requested report file (use write_file), and \
+                        return a bounded summary plus absolute file paths the upstream planner \
                         should consult next.",
     },
 ];
@@ -607,28 +623,30 @@ mod tests {
         assert!(RoleTemplate::for_name("planner").is_none());
     }
 
-    /// Guard: reviewer is read-only. The budget MUST NOT include
-    /// `group:fs` (which expands to write_file / apply_patch /
-    /// edit_file / diff_edit), `group:memory` (which expands to
-    /// save_memory), or `group:runtime` / `group:sessions`. Catches
-    /// the codex P1 from review: granting `group:fs` to a role
-    /// documented as non-mutating silently smuggles in write tools
-    /// once the registry is wired into `ToolPolicy.allow`.
+    /// Guard: a reviewer can WRITE its review report (`write_file`, an
+    /// exact tool name) but MUST NOT gain the code-patching tools —
+    /// `edit_file` and the `group:fs` expansion (`apply_patch` /
+    /// `diff_edit` / `edit_file`) — so it produces a report without
+    /// mutating the code under review. This is the deliberate
+    /// relaxation of the old strictly-read-only budget: reviewers kept
+    /// returning findings as text because they had no way to persist a
+    /// deliverable. `group:fs` stays out (its expansion would smuggle
+    /// the patching tools back in — the codex P1).
     #[test]
-    fn reviewer_is_read_only() {
+    fn reviewer_writes_report_but_not_code() {
         let tpl = RoleTemplate::for_name(ROLE_REVIEWER).expect("reviewer must be registered");
-        // Permitted: explicit read tools + non-mutating groups only.
+        // Permitted: explicit read tools, the report writer, and
+        // non-mutating groups.
         assert!(tpl.permits("read_file"));
+        assert!(tpl.permits("write_file")); // writes its REVIEW REPORT
         assert!(tpl.permits("group:search"));
         assert!(tpl.permits("web_search"));
         assert!(tpl.permits("web_fetch"));
         assert!(tpl.permits("recall_memory"));
         assert!(tpl.permits("synthesize_research"));
-        // Denied: every mutating group AND every group that contains
-        // at least one disk-writing tool. The reviewer prompt promises
-        // "do not edit files, do not run the test suite, do not spawn
-        // further agents" — group expansion would silently smuggle in
-        // write tools that violate the promise.
+        // Denied: the code-patching tool + every mutating group. A
+        // reviewer writes its report, never edits the reviewed code.
+        assert!(!tpl.permits("edit_file"));
         assert!(!tpl.permits("group:fs"));
         assert!(!tpl.permits("group:memory"));
         assert!(!tpl.permits("group:runtime"));
@@ -636,8 +654,6 @@ mod tests {
         assert!(!tpl.permits("group:web"));
         assert!(!tpl.permits("group:research"));
         assert!(!tpl.permits("save_memory"));
-        assert!(!tpl.permits("write_file"));
-        assert!(!tpl.permits("edit_file"));
         assert!(!tpl.permits("browser"));
         assert!(!tpl.permits("deep_crawl"));
         assert_eq!(tpl.default_sandbox_mode, SANDBOX_NONE);
@@ -665,41 +681,47 @@ mod tests {
         assert_eq!(tpl.model_preference, ModelPreference::Coding);
     }
 
-    /// Guard: test_worker can run commands but cannot edit files or
-    /// spawn further children. Same safety property as reviewer:
-    /// `group:fs` and `group:memory` MUST NOT appear in the budget
-    /// because they expand to mutating tools the role's prompt
-    /// explicitly forbids.
+    /// Guard: test_worker runs commands and WRITES its verification
+    /// report (`write_file`, exact), but cannot patch code (`edit_file`
+    /// / `group:fs`) or spawn further children. `group:fs` and
+    /// `group:memory` MUST NOT appear — their expansion would smuggle
+    /// the code-patching tools the role's prompt forbids (a fix is the
+    /// implementer's job).
     #[test]
-    fn test_worker_runs_commands_but_does_not_spawn() {
+    fn test_worker_runs_commands_and_writes_report_but_does_not_patch() {
         let tpl = RoleTemplate::for_name(ROLE_TEST_WORKER).expect("test_worker must be registered");
         assert!(tpl.permits("group:runtime"));
         assert!(tpl.permits("read_file"));
+        assert!(tpl.permits("write_file")); // writes its VERIFICATION REPORT
         assert!(tpl.permits("recall_memory"));
+        assert!(!tpl.permits("edit_file"));
         assert!(!tpl.permits("group:fs"));
         assert!(!tpl.permits("group:memory"));
         assert!(!tpl.permits("group:sessions"));
         assert!(!tpl.permits("group:web"));
         assert!(!tpl.permits("save_memory"));
-        assert!(!tpl.permits("write_file"));
         assert_eq!(tpl.default_sandbox_mode, SANDBOX_AUTO);
         assert_eq!(tpl.default_approval_policy, APPROVAL_ASK);
         assert_eq!(tpl.model_preference, ModelPreference::Analyst);
     }
 
-    /// Guard: explorer is strictly read-only AND cheap-lane. Pins
-    /// both the no-runtime / no-sessions / no-mutating-groups budget
-    /// AND the model preference, because the UX uses the cheap-lane
-    /// hint to route fanout.
+    /// Guard: explorer writes its context report (`write_file`, exact)
+    /// but does not run commands (`group:runtime`) or patch code
+    /// (`edit_file` / `group:fs`), and stays cheap-lane. Pins the
+    /// no-runtime / no-sessions / no-mutating-groups budget AND the
+    /// model preference, because the UX uses the cheap-lane hint to
+    /// route fanout.
     #[test]
-    fn explorer_is_strictly_read_only_and_cheap() {
+    fn explorer_writes_report_no_runtime_and_cheap() {
         let tpl = RoleTemplate::for_name(ROLE_EXPLORER).expect("explorer must be registered");
         assert!(tpl.permits("read_file"));
+        assert!(tpl.permits("write_file")); // writes its CONTEXT REPORT
         assert!(tpl.permits("group:search"));
         assert!(tpl.permits("web_search"));
         assert!(tpl.permits("web_fetch"));
         assert!(tpl.permits("recall_memory"));
         assert!(tpl.permits("synthesize_research"));
+        assert!(!tpl.permits("edit_file"));
         assert!(!tpl.permits("group:fs"));
         assert!(!tpl.permits("group:memory"));
         assert!(!tpl.permits("group:runtime"));
@@ -707,7 +729,6 @@ mod tests {
         assert!(!tpl.permits("group:web"));
         assert!(!tpl.permits("group:research"));
         assert!(!tpl.permits("save_memory"));
-        assert!(!tpl.permits("write_file"));
         assert!(!tpl.permits("browser"));
         assert!(!tpl.permits("deep_crawl"));
         assert_eq!(tpl.default_sandbox_mode, SANDBOX_NONE);
@@ -922,6 +943,7 @@ mod tests {
             stamp["allowed_tools"],
             json!([
                 "read_file",
+                "write_file",
                 "group:search",
                 "web_search",
                 "web_fetch",
@@ -1129,8 +1151,10 @@ mod tests {
             allow: tpl.allowed_tools_vec(),
             ..Default::default()
         };
+        // `write_file` is deliberately NOT here — a reviewer writes its
+        // report. The CODE-PATCHING tools stay denied so it can't mutate
+        // the reviewed code.
         for mutator in [
-            "write_file",
             "edit_file",
             "diff_edit",
             "apply_patch",
@@ -1151,10 +1175,11 @@ mod tests {
                 policy.allow
             );
         }
-        // Sanity: the read-only tools the template DOES advertise stay
-        // allowed once the same allow list is piped through ToolPolicy.
+        // Sanity: the read tools the template advertises PLUS its report
+        // writer stay allowed once the allow list is piped through ToolPolicy.
         for permitted in [
             "read_file",
+            "write_file",
             "glob",
             "grep",
             "list_dir",
@@ -1210,8 +1235,13 @@ mod tests {
                 "test_worker must allow runtime tool {runtime:?}"
             );
         }
+        // Writes its verification report...
+        assert!(
+            policy.is_allowed("write_file"),
+            "test_worker must allow write_file for its report"
+        );
+        // ...but never patches code or spawns children.
         for mutator in [
-            "write_file",
             "edit_file",
             "diff_edit",
             "apply_patch",
