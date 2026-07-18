@@ -2503,6 +2503,17 @@ impl TaskSupervisor {
         };
         if let Some(ref task) = snapshot {
             self.persist_snapshot(task);
+            // #1723: `record_final_output` runs AFTER `mark_completed` (the
+            // content isn't assembled until the child's turn ends), so the
+            // terminal `on_change` → `upsert_background_task_agent` mirror that
+            // copies `final_output` → the roster agent's readable output already
+            // fired while `final_output` was still `None` — leaving the agent
+            // view empty despite a captured result. Fire `on_change` again now
+            // that `final_output` is set so the mirror (idempotent
+            // `set_agent_output_if_empty`) runs with it present and re-emits an
+            // `agent/updated` carrying the output. Without this the TUI agent
+            // view / `/ps` detail shows "no output" for a completed child.
+            self.notify_change(task);
         }
     }
 
@@ -3398,6 +3409,48 @@ impl Drop for TaskTerminalGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    /// #1723: `record_final_output` fires `on_change` so the roster mirror
+    /// (`upsert_background_task_agent` → `set_agent_output_if_empty`) re-runs
+    /// with `final_output` present. It is called AFTER `mark_completed`, so the
+    /// terminal on_change already fired while `final_output` was `None`; without
+    /// this second notification the agent view / `/ps` detail stays empty.
+    #[test]
+    fn record_final_output_fires_on_change_with_the_output() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let supervisor = TaskSupervisor::new();
+        let id = supervisor.register("spawn", "call-fo", None);
+        supervisor.mark_completed(&id, vec![]);
+
+        // Only observe changes AFTER completion, so we isolate the
+        // record_final_output notification.
+        let seen_output = Arc::new(std::sync::Mutex::new(Option::<String>::None));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let seen_c = seen_output.clone();
+        let calls_c = calls.clone();
+        supervisor.set_on_change(move |task| {
+            calls_c.fetch_add(1, Ordering::SeqCst);
+            if let Some(fo) = task.final_output.clone() {
+                *seen_c.lock().unwrap() = Some(fo);
+            }
+        });
+
+        supervisor.record_final_output(&id, "the child's full result");
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "record_final_output must fire on_change exactly once"
+        );
+        assert_eq!(
+            seen_output.lock().unwrap().as_deref(),
+            Some("the child's full result"),
+            "the on_change snapshot must carry the recorded final_output"
+        );
+    }
 
     #[test]
     fn should_register_task_with_spawned_status() {
