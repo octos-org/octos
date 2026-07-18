@@ -232,8 +232,31 @@ impl Tool for ReadTaskOutputTool {
             // sample the END of the file, not the first 1 MiB. Pass the
             // mode hint into the read helper so it can seek-from-end.
             inline_mode => {
-                let text = self.read_router_text(&task, mode_hint(&inline_mode))?;
-                apply_mode(&text, inline_mode)?
+                let mut text = self.read_router_text(&task, mode_hint(&inline_mode))?;
+                // Black-hole fix: a background `spawn` child's transcript
+                // never flows through the SubAgentOutputRouter (only
+                // spawn_only tools append to it), so for such tasks the
+                // router file is absent and this tool silently returned an
+                // empty string — models concluded the child's result "was
+                // lost" and re-did (or overwrote) its work. Fall back to the
+                // supervisor-recorded final output so head/tail/grep operate
+                // on the child's actual result.
+                if text.is_empty() {
+                    if let Some(final_output) = task.final_output.as_deref() {
+                        text = final_output.to_string();
+                    }
+                }
+                if text.is_empty() {
+                    // Say WHY there is nothing rather than returning "".
+                    format!(
+                        "(no captured output for task '{}' yet; status={} — a \
+                         running task's result is recorded when it finishes)",
+                        task.id,
+                        task.status.as_str()
+                    )
+                } else {
+                    apply_mode(&text, inline_mode)?
+                }
             }
         };
 
@@ -709,6 +732,92 @@ mod tests {
             .unwrap();
         assert!(result.success);
         assert_eq!(result.output, "c\nd\ne");
+    }
+
+    #[tokio::test]
+    async fn falls_back_to_recorded_final_output_when_router_has_nothing() {
+        // Black-hole regression: a background `spawn` child never appends to
+        // the router (only spawn_only tools do), so this tool returned "" for
+        // such tasks and the parent model concluded the result "was lost".
+        // With a supervisor-recorded final output, head/grep must serve it.
+        let dir = tempdir().unwrap();
+        let (supervisor, _router, tool) = make_tool(dir.path());
+        let task_id = supervisor.register("review-child", "tc-final", Some("session-A"));
+        supervisor.mark_running(&task_id);
+        // NO router.append — mirrors a spawn child.
+        supervisor.record_final_output(
+            &task_id,
+            "Status: SUCCESS\n\nREVIEW 1: octos-web\nfinding: token in localStorage\n",
+        );
+
+        let head = tool
+            .execute(&json!({
+                "task_handle": task_id,
+                "mode": {"kind": "head", "lines": 2}
+            }))
+            .await
+            .unwrap();
+        assert!(head.success);
+        assert_eq!(head.output, "Status: SUCCESS\n");
+
+        let grep = tool
+            .execute(&json!({
+                "task_handle": task_id,
+                "mode": {"kind": "grep", "pattern": "localStorage"}
+            }))
+            .await
+            .unwrap();
+        assert!(grep.success);
+        assert!(
+            grep.output.contains("localStorage"),
+            "grep must operate on the recorded final output: {:?}",
+            grep.output
+        );
+    }
+
+    #[tokio::test]
+    async fn explains_when_no_output_captured_instead_of_silent_empty() {
+        // A still-running spawn child has neither router bytes nor a
+        // recorded final output. The old behaviour returned "" — a silent
+        // black hole. Now the tool says why there is nothing.
+        let dir = tempdir().unwrap();
+        let (supervisor, _router, tool) = make_tool(dir.path());
+        let task_id = supervisor.register("review-child", "tc-empty", Some("session-A"));
+        supervisor.mark_running(&task_id);
+
+        let result = tool
+            .execute(&json!({
+                "task_handle": task_id,
+                "mode": {"kind": "tail", "lines": 10}
+            }))
+            .await
+            .unwrap();
+        assert!(result.success);
+        assert!(
+            result.output.contains("no captured output") && result.output.contains(&task_id),
+            "must explain the absence, not return an empty string: {:?}",
+            result.output
+        );
+    }
+
+    #[tokio::test]
+    async fn record_final_output_caps_oversized_text() {
+        let dir = tempdir().unwrap();
+        let (supervisor, _router, _tool) = make_tool(dir.path());
+        let task_id = supervisor.register("big-child", "tc-big", Some("session-A"));
+        supervisor.mark_running(&task_id);
+        let huge = "x".repeat(1024 * 1024);
+        supervisor.record_final_output(&task_id, &huge);
+        let stored = supervisor
+            .get_task(&task_id)
+            .and_then(|t| t.final_output)
+            .expect("final output recorded");
+        assert!(
+            stored.len() <= 128 * 1024 + 64,
+            "stored final output must be capped: {} bytes",
+            stored.len()
+        );
+        assert!(stored.ends_with("…[final output truncated]"));
     }
 
     #[tokio::test]

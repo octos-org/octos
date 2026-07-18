@@ -20747,6 +20747,42 @@ fn reasoning_effort_from_wire(
 ///   forwarded), never via raw foreground tokens, so dropping these loses
 ///   nothing user-facing. Pairs with the octos-tui client guard that ignores
 ///   deltas for already-terminal turns (belt + suspenders).
+/// Chars of a background REPORT result inlined into the parent conversation.
+/// At or below this, the full text is inlined; above it, a preview of this
+/// size is inlined plus a recovery pointer. The old behaviour (300-char
+/// preview, no pointer) starved the parent of multi-KB child reports — and
+/// with `read_task_output` returning empty for spawn children at the time,
+/// models concluded the result "was lost" and re-did or overwrote the
+/// child's work (mini4 re-review forensic, 2026-07-17).
+const SPAWN_REPORT_INLINE_CAP_CHARS: usize = 4000;
+
+/// Format a completed background task's REPORT result for injection into the
+/// parent conversation: full text when small, else a bounded preview plus an
+/// actionable pointer at `read_task_output` (which serves the
+/// supervisor-recorded full text — see `TaskSupervisor::record_final_output`).
+fn format_spawn_report_announcement(
+    task_label: &str,
+    raw_content: &str,
+    task_id: Option<&str>,
+) -> String {
+    let mut chars = raw_content.chars();
+    let preview: String = chars.by_ref().take(SPAWN_REPORT_INLINE_CAP_CHARS).collect();
+    if chars.next().is_none() {
+        // Fits under the cap — inline the whole thing.
+        return format!("✅ **{task_label}** completed.\n\n{raw_content}");
+    }
+    let recovery = match task_id {
+        Some(id) => format!("`read_task_output(task_handle=\"{id}\")`"),
+        None => {
+            "`read_task_output` with this task's handle from `check_background_tasks`".to_string()
+        }
+    };
+    format!(
+        "✅ **{task_label}** completed.\n\n{preview}…\n\n_[preview truncated at \
+         {SPAWN_REPORT_INLINE_CAP_CHARS} chars — retrieve the FULL result with {recovery}]_"
+    )
+}
+
 fn drain_should_skip_event(event_type: Option<&str>) -> bool {
     matches!(
         event_type,
@@ -21572,11 +21608,19 @@ async fn run_standalone_turn(
                         BackgroundResultKind::Report => {
                             if raw_content.trim().is_empty() && !media.is_empty() {
                                 format!("✅ {} completed.", task_label)
-                            } else if raw_content.len() > 1000 {
-                                let preview: String = raw_content.chars().take(300).collect();
-                                format!("✅ **{}** completed.\n\n{}…", task_label, preview,)
                             } else {
-                                format!("✅ **{}** completed.\n\n{}", task_label, raw_content,)
+                                // Mini4 re-review forensic: the old
+                                // `take(300) + "…"` preview (no pointer, no
+                                // recovery path) starved the parent of a
+                                // child's multi-KB report — combined with the
+                                // then-empty `read_task_output`, models
+                                // concluded the result "was lost" and re-did
+                                // or overwrote the child's work.
+                                format_spawn_report_announcement(
+                                    &task_label,
+                                    &raw_content,
+                                    task_id.as_deref(),
+                                )
                             }
                         }
                     };
@@ -27675,6 +27719,40 @@ mod tests {
     /// server advertises (`ui_protocol_server_supported_methods` builds from
     /// `FIRST_SERVER ∪ APPUI_EXTRA`) — so the catalog can no longer silently
     /// fall behind, even for a future server-only method.
+    #[test]
+    fn spawn_report_announcement_inlines_small_reports_in_full() {
+        let body = "Status: SUCCESS\n\nshort review body";
+        let out = format_spawn_report_announcement("review-octos-web", body, Some("task-1"));
+        assert!(out.contains(body), "small report must be inlined verbatim");
+        assert!(!out.contains("preview truncated"));
+    }
+
+    #[test]
+    fn spawn_report_announcement_previews_large_reports_with_recovery_pointer() {
+        // Mini4 re-review regression: the old 300-char preview with no
+        // pointer left the parent no way to recover a child's multi-KB
+        // report; it concluded the result "was lost".
+        let body = "x".repeat(SPAWN_REPORT_INLINE_CAP_CHARS + 500);
+        let out =
+            format_spawn_report_announcement("review-octos-web", &body, Some("019f6e66-f94c"));
+        assert!(out.contains("preview truncated"));
+        assert!(
+            out.contains("read_task_output(task_handle=\"019f6e66-f94c\")"),
+            "must point at the working recovery path: {out}"
+        );
+        // The preview itself must be the big cap, not the old 300.
+        assert!(out.len() > SPAWN_REPORT_INLINE_CAP_CHARS);
+    }
+
+    #[test]
+    fn spawn_report_announcement_cap_boundary_is_exact() {
+        // Exactly at the cap → inline full, no pointer (chars, not bytes).
+        let body = "y".repeat(SPAWN_REPORT_INLINE_CAP_CHARS);
+        let out = format_spawn_report_announcement("t", &body, None);
+        assert!(!out.contains("preview truncated"));
+        assert!(out.contains(&body));
+    }
+
     #[test]
     fn spec_section6_catalog_lists_every_advertised_method() {
         fn is_method_char(c: char) -> bool {
@@ -43555,6 +43633,7 @@ ignore = []
             completed_at: None,
             output_files: Vec::new(),
             error: None,
+            final_output: None,
             failed_by_observer: false,
             session_key: Some("local:test".into()),
             tool_input: None,
@@ -43834,6 +43913,7 @@ ignore = []
             completed_at: Some(now),
             output_files: vec!["/Users/cloud/tmp/deep_research/synthesis.md".into()],
             error: None,
+            final_output: None,
             failed_by_observer: false,
             session_key: Some(session_id.to_string()),
             tool_input: Some(serde_json::json!({"pipeline": "deep_research"})),
@@ -43945,6 +44025,7 @@ ignore = []
             completed_at: Some(now),
             output_files: vec![],
             error: error.map(str::to_owned),
+            final_output: None,
             failed_by_observer: false,
             session_key: Some(session.to_string()),
             tool_input: Some(serde_json::json!({"topic": "rust"})),
