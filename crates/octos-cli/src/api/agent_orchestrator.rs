@@ -481,6 +481,20 @@ pub(crate) fn upsert_background_task_agent(
             agent = updated;
         }
     }
+    // Mini4 re-review follow-up: surface the child's supervisor-recorded
+    // final output on the mirrored agent record so `agent/output/read` (the
+    // TUI Tab agent view) has something to render. Idempotent — only fills
+    // an empty record, and only once the task carries a final output.
+    if let Some(final_output) = task.final_output.as_deref() {
+        if !final_output.trim().is_empty() {
+            let _ = orchestrator.set_agent_output_if_empty(
+                &agent_id,
+                &session_id,
+                &profile_id,
+                final_output,
+            );
+        }
+    }
     Some((session_id, agent))
 }
 
@@ -1327,6 +1341,42 @@ impl InProcessAgentOrchestrator {
         agent.output.push_str(text);
         agent.updated_at_ms = now_ms();
         Ok(())
+    }
+
+    /// Set the agent record's output ONCE — only while it is still empty.
+    ///
+    /// Used by the background-task mirror at completion: a spawn child's
+    /// supervisor-recorded `final_output` becomes the agent's readable
+    /// output so `agent/output/read` (the TUI Tab agent view) renders the
+    /// child's actual result instead of empty text (mini4 re-review:
+    /// "sub-agent status shows, but nothing comes out"). Upserts fire on
+    /// every status transition, so this must be idempotent; specialist
+    /// agents that stream via `append_agent_output` are never empty here
+    /// and are left untouched.
+    pub(crate) fn set_agent_output_if_empty(
+        &self,
+        agent_id: &str,
+        session_id: &SessionKey,
+        profile_id: &str,
+        text: &str,
+    ) -> Result<bool, RpcError> {
+        let mut state = self.state();
+        let request = AgentRequest {
+            agent_id: agent_id.to_owned(),
+            session_id: Some(session_id.clone()),
+            profile_id: profile_id.to_owned(),
+        };
+        let agent = state
+            .agents
+            .get_mut(agent_id)
+            .ok_or_else(|| agent_not_found_error(&request))?;
+        ensure_agent_control_scope(agent, Some(session_id), profile_id)?;
+        if !agent.output.is_empty() {
+            return Ok(false);
+        }
+        agent.output.push_str(text);
+        agent.updated_at_ms = now_ms();
+        Ok(true)
     }
 
     pub(crate) fn set_agent_artifacts(
@@ -4433,12 +4483,27 @@ fn enqueue_agent_terminal_continuations(
     .with_metadata("status", agent.status.clone())
     .with_metadata("nickname", agent.nickname.clone())
     .with_metadata("role", agent.role.clone());
+    // #1707: stamp the child's workspace so a future drain-site guard can drop
+    // a continuation replayed under a wire session key that has since been
+    // rebound to a DIFFERENT project (sessions_in_cwd reuse). Self-describing;
+    // no behavior change on its own.
+    if let Some(cwd) = agent.cwd.as_deref().filter(|value| !value.is_empty()) {
+        child = child.with_metadata("workspace", cwd.to_owned());
+    }
     if let Some(last_task) = agent.last_task.as_deref().filter(|value| !value.is_empty()) {
         child = child.with_metadata("summary", last_task.chars().take(1200).collect::<String>());
     }
     enqueue_and_persist_continuation(state, child);
     persist_agent_terminal(state, agent);
 
+    // #1707: siblings for the scatter/gather join MUST share a workspace. Two
+    // agents that merely reuse the same wire `session_id` across different
+    // project cwds (sessions_in_cwd) are NOT siblings — counting a prior
+    // project's terminal children here fired a false `ScatterJoinComplete`
+    // (and an inflated `terminal_children` count) into the reused session.
+    // `cwd == cwd` keeps the legacy behavior byte-identical when the workspace
+    // is unknown (both `None`), and same-workspace restart recovery still joins
+    // (the restored siblings carry the same cwd).
     let siblings = state
         .agents
         .values()
@@ -4446,6 +4511,7 @@ fn enqueue_agent_terminal_continuations(
             candidate.session_id == agent.session_id
                 && candidate.profile_id == agent.profile_id
                 && candidate.parent_agent_id == agent.parent_agent_id
+                && candidate.cwd == agent.cwd
         })
         .collect::<Vec<_>>();
     if siblings.is_empty()
@@ -4477,6 +4543,11 @@ fn enqueue_agent_terminal_continuations(
             .unwrap_or_else(|| "master".to_owned()),
     )
     .with_metadata("terminal_children", siblings.len().to_string());
+    // #1707: same workspace stamp as the per-child ChildCompleted above.
+    let scatter = match agent.cwd.as_deref().filter(|value| !value.is_empty()) {
+        Some(cwd) => scatter.with_metadata("workspace", cwd.to_owned()),
+        None => scatter,
+    };
     enqueue_and_persist_continuation(state, scatter);
 }
 
@@ -7684,6 +7755,151 @@ mod tests {
         );
     }
 
+    /// #1707: the scatter/gather join is workspace-scoped. A stale terminal
+    /// child left in the roster under the SAME wire `session_id` but a
+    /// DIFFERENT project cwd (sessions_in_cwd reuse) must NOT be counted as a
+    /// sibling of a freshly-completing child — otherwise it fires a false
+    /// `ScatterJoinComplete` and inflates `terminal_children` into the reused
+    /// session.
+    #[test]
+    fn scatter_join_excludes_cross_workspace_siblings() {
+        let orchestrator = InProcessAgentOrchestrator::default();
+        // Live child in project A.
+        let mut child_a = sample_agent("child-a", "tenant-a");
+        child_a.parent_agent_id = Some("master".into());
+        child_a.cwd = Some("/projects/a".into());
+        let session_id = child_a.session_id.clone();
+        // Stale terminal child from project B, already in the roster under the
+        // SAME session key (a prior lifetime's workspace binding of the reused
+        // wire id). Inserted pre-terminal so it enqueues nothing on its own.
+        let mut stale_b = sample_agent("stale-b", "tenant-a");
+        stale_b.parent_agent_id = Some("master".into());
+        stale_b.cwd = Some("/projects/b".into());
+        stale_b.status = "completed".into();
+        assert_eq!(stale_b.session_id, session_id, "same wire session key");
+        orchestrator
+            .state()
+            .agents
+            .insert(child_a.agent_id.clone(), child_a);
+        orchestrator
+            .state()
+            .agents
+            .insert(stale_b.agent_id.clone(), stale_b);
+
+        orchestrator
+            .set_agent_status(
+                "child-a",
+                &session_id,
+                "tenant-a",
+                "completed",
+                Some("project A review done".into()),
+            )
+            .expect("complete project-A child");
+
+        let drained = orchestrator.drain_ready_continuations_for_session(
+            &session_id,
+            "tenant-a",
+            MasterContinuationRuntimeState::idle(),
+            usize::MAX,
+        );
+        let reasons = drained
+            .iter()
+            .map(|item| item.reason.clone())
+            .collect::<Vec<_>>();
+        // The join fires (child-a's own workspace group is all-terminal)...
+        assert_eq!(
+            reasons,
+            vec![
+                MasterContinuationReason::ChildCompleted,
+                MasterContinuationReason::ScatterJoinComplete
+            ]
+        );
+        // ...but scoped to project A ONLY: terminal_children == 1, NOT 2. The
+        // cross-workspace `stale-b` is excluded from the sibling set.
+        let scatter = drained
+            .iter()
+            .find(|item| item.reason == MasterContinuationReason::ScatterJoinComplete)
+            .expect("scatter join present");
+        assert_eq!(
+            scatter
+                .metadata
+                .get("terminal_children")
+                .map(String::as_str),
+            Some("1"),
+            "cross-workspace stale sibling must not inflate the join count"
+        );
+        assert_eq!(
+            scatter.metadata.get("workspace").map(String::as_str),
+            Some("/projects/a"),
+            "the join is stamped with the completing child's workspace"
+        );
+    }
+
+    #[test]
+    fn background_task_mirror_surfaces_final_output_for_agent_output_read() {
+        // Mini4 re-review follow-up: a spawn child's recorded final_output
+        // must become the mirrored agent's readable output so the TUI Tab
+        // agent view (AGENT_OUTPUT_READ) renders the child's result instead
+        // of empty text — idempotently across repeated upserts.
+        let session_id = SessionKey::with_profile("tenant-a", "api", "bg-final-output");
+        let now = Utc::now();
+        let task = octos_agent::BackgroundTask {
+            id: "bg-fo-1".into(),
+            tool_name: "review-child".into(),
+            tool_call_id: "call-fo-1".into(),
+            parent_session_key: Some(session_id.to_string()),
+            child_session_key: None,
+            child_terminal_state: None,
+            child_join_state: None,
+            child_joined_at: None,
+            child_failure_action: None,
+            task_ledger_path: None,
+            status: octos_agent::TaskStatus::Completed,
+            runtime_state: octos_agent::TaskRuntimeState::Completed,
+            runtime_detail: None,
+            started_at: now,
+            updated_at: now,
+            completed_at: Some(now),
+            output_files: Vec::new(),
+            error: None,
+            final_output: Some("Status: SUCCESS\n\nREVIEW BODY: token in localStorage".into()),
+            failed_by_observer: false,
+            session_key: Some(session_id.to_string()),
+            tool_input: None,
+            originating_client_message_id: None,
+            source: None,
+            role: None,
+            summary: None,
+            artifact_count: None,
+            runtime_policy_stamp: None,
+        };
+
+        let (_, agent) = upsert_background_task_agent(&task, None).expect("task should mirror");
+        // Second upsert (status refresh) must not duplicate the output.
+        upsert_background_task_agent(&task, None).expect("re-upsert mirrors");
+
+        let agent_id = agent["agent_id"].as_str().expect("agent id").to_owned();
+        let output = default_agent_orchestrator()
+            .read_agent_output(AgentOutputRequest {
+                agent_id,
+                session_id: Some(session_id.clone()),
+                profile_id: "tenant-a".to_owned(),
+                cursor: None,
+                limit: None,
+            })
+            .expect("agent output readable");
+        let text = output["text"].as_str().expect("text");
+        assert!(
+            text.contains("REVIEW BODY: token in localStorage"),
+            "final_output must be readable via agent/output/read: {text:?}"
+        );
+        assert_eq!(
+            text.matches("REVIEW BODY").count(),
+            1,
+            "repeated upserts must not duplicate the output: {text:?}"
+        );
+    }
+
     #[test]
     fn background_task_mirror_uses_agent_orchestrator_and_queues_continuations() {
         let session_id = SessionKey::with_profile("tenant-a", "api", "background-task");
@@ -7714,6 +7930,7 @@ mod tests {
             completed_at: Some(now),
             output_files: vec!["/tmp/octos-review/report.md".into()],
             error: None,
+            final_output: None,
             failed_by_observer: false,
             session_key: Some(session_id.to_string()),
             tool_input: Some(json!({"task": "review"})),
@@ -7847,6 +8064,7 @@ mod tests {
                 completed_at: Some(now),
                 output_files: vec![],
                 error: Some("plugin exited 137".into()),
+                final_output: None,
                 failed_by_observer: false,
                 session_key: Some(session.to_string()),
                 tool_input: Some(json!({"topic": "rust"})),
@@ -7935,6 +8153,7 @@ mod tests {
             completed_at: Some(now),
             output_files: vec![],
             error: Some("plugin exited 137".into()),
+            final_output: None,
             failed_by_observer: false,
             session_key: Some(session_id.to_string()),
             tool_input: Some(json!({"topic": "rust"})),
@@ -8035,6 +8254,7 @@ mod tests {
             completed_at: Some(now),
             output_files: vec![],
             error: Some("plugin binary missing".into()),
+            final_output: None,
             failed_by_observer: false,
             session_key: Some(session_id.to_string()),
             tool_input: Some(json!({"topic": "rust"})),
@@ -8151,6 +8371,7 @@ mod tests {
             completed_at: Some(now),
             output_files: Vec::new(),
             error: None,
+            final_output: None,
             failed_by_observer: false,
             session_key: Some(session_id.to_string()),
             tool_input: None,

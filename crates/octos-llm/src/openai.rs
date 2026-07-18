@@ -79,11 +79,17 @@ impl ModelHints {
             is_o_series || m.starts_with("gpt-5") || m.starts_with("gpt-4.1");
 
         // kimi-k3 pins its sampling params server-side (temperature=1.0,
-        // top_p=0.95, …) and rejects overrides, so never send temperature.
+        // top_p=0.95, …) and rejects overrides, so never send temperature. The
+        // Kimi *coding plan* (family `moonshot-coding`) exposes the SAME K3
+        // model under the bare ids `k3` / `kimi-for-coding*`, which don't
+        // contain `kimi-k3` — match them too, or the endpoint 400s with
+        // "invalid temperature: only 1 is allowed for this model".
         let fixed_temperature = is_o_series
             || m.starts_with("gpt-5")
             || m.contains("kimi-k2")
             || m.contains("kimi-k3")
+            || m == "k3"
+            || m.starts_with("kimi-for-coding")
             || m == "gpt-4.1-nano";
 
         // Vision capability is NO LONGER inferred from the model name. The old
@@ -119,7 +125,9 @@ impl ModelHints {
         // families can reject `reasoning_effort`.
         let reasoning_style = if m.contains("deepseek-v4") || m.contains("deepseek-reasoner") {
             ReasoningStyle::EffortAndThinkingToggle
-        } else if m.contains("kimi-k3") {
+        } else if m.contains("kimi-k3") || m == "k3" {
+            // K3, incl. the coding plan's bare `k3` id — thinking is always on
+            // and effort maps to `max` (the K2.x `thinking` object is rejected).
             ReasoningStyle::EffortMaxOnly
         } else if m.starts_with("grok-4") || is_o_series || m.starts_with("gpt-5") {
             ReasoningStyle::Effort
@@ -159,6 +167,32 @@ pub enum ReasoningStyle {
     /// to `"max"`; when no effort is configured nothing is emitted (the model
     /// still thinks — that is its server-side default).
     EffortMaxOnly,
+}
+
+/// Serialize tool-call arguments for the request wire as a JSON **object**
+/// string. Chat/completions providers validate `function.arguments` and reject
+/// the ENTIRE request with a non-retryable HTTP 400 when it does not decode to
+/// an object — which a tool call recovered from inline/malformed model output
+/// can be (a bare string, or a truncated fragment). Coercing a non-object to
+/// `{}` keeps the request valid; the model then sees an ordinary empty-arg call
+/// and can retry, instead of the whole turn/task dying. Objects pass through
+/// byte-identically, so this is a no-op on the normal path. See #1711.
+fn tool_call_arguments_to_wire(arguments: &serde_json::Value) -> String {
+    if arguments.is_object() {
+        return arguments.to_string();
+    }
+    // Recover a stringified object (e.g. `"{\"command\":\"ls\"}"`).
+    if let serde_json::Value::String(inner) = arguments
+        && let Ok(parsed) = serde_json::from_str::<serde_json::Value>(inner)
+        && parsed.is_object()
+    {
+        return parsed.to_string();
+    }
+    tracing::warn!(
+        target: "octos::toolcall_repair",
+        "coerced non-object tool-call arguments to empty object at request boundary (#1711)"
+    );
+    "{}".to_string()
 }
 
 /// OpenAI GPT provider.
@@ -341,7 +375,7 @@ impl OpenAIProvider {
                             call_type: "function".to_string(),
                             function: FunctionCall {
                                 name: tc.name.clone(),
-                                arguments: tc.arguments.to_string(),
+                                arguments: tool_call_arguments_to_wire(&tc.arguments),
                             },
                         })
                         .collect()
@@ -1101,6 +1135,40 @@ mod tests {
     use crate::provider::LlmProvider;
     use octos_core::{Message, MessageRole};
 
+    #[test]
+    fn tool_call_arguments_wire_passes_objects_through() {
+        let obj = serde_json::json!({"command": "ls -la"});
+        let wire = tool_call_arguments_to_wire(&obj);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&wire).unwrap(),
+            obj
+        );
+    }
+
+    #[test]
+    fn tool_call_arguments_wire_coerces_non_object_to_empty_object() {
+        // A bare string is what the old inline fallback produced; serialized
+        // verbatim it caused the provider HTTP 400. It must become `{}`.
+        let bare = serde_json::Value::String("git clone https://x".to_string());
+        assert_eq!(tool_call_arguments_to_wire(&bare), "{}");
+        // Arrays/numbers/null are also not valid arguments objects.
+        assert_eq!(
+            tool_call_arguments_to_wire(&serde_json::json!([1, 2])),
+            "{}"
+        );
+        assert_eq!(tool_call_arguments_to_wire(&serde_json::Value::Null), "{}");
+    }
+
+    #[test]
+    fn tool_call_arguments_wire_recovers_a_stringified_object() {
+        let stringified = serde_json::Value::String(r#"{"command":"ls"}"#.to_string());
+        let wire = tool_call_arguments_to_wire(&stringified);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&wire).unwrap(),
+            serde_json::json!({"command": "ls"})
+        );
+    }
+
     fn msg(content: &str) -> Message {
         Message {
             role: MessageRole::User,
@@ -1555,6 +1623,29 @@ mod tests {
                 ..Default::default()
             });
         assert_eq!(overridden.hints.reasoning_style, ReasoningStyle::None);
+    }
+
+    /// The Kimi coding plan (family `moonshot-coding`) exposes K3 under the bare
+    /// ids `k3` / `kimi-for-coding*`, which don't contain `kimi-k3`. They MUST
+    /// still pin temperature (else the endpoint 400s "only 1 is allowed") and
+    /// get K3's max-only reasoning.
+    #[test]
+    fn coding_plan_k3_ids_pin_temperature_and_max_reasoning() {
+        for id in ["k3", "kimi-for-coding", "kimi-for-coding-highspeed"] {
+            let h = ModelHints::detect(id);
+            assert!(
+                h.fixed_temperature,
+                "{id} must pin temperature (K3 rejects any temperature != 1)"
+            );
+        }
+        // Bare `k3` also gets K3's max-only reasoning.
+        assert_eq!(
+            ModelHints::detect("k3").reasoning_style,
+            ReasoningStyle::EffortMaxOnly
+        );
+        // Guard: an unrelated model containing "k3" as a substring is NOT the
+        // coding plan (exact match only), so it is unaffected.
+        assert!(!ModelHints::detect("mock-k3000").fixed_temperature);
     }
 
     #[test]

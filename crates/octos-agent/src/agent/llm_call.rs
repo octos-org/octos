@@ -59,6 +59,13 @@ impl Agent {
         let fail_fast = octos_llm::current_llm_call_policy() == LlmCallPolicy::FailFast;
         let retry_max = if fail_fast { 0 } else { Self::LLM_RETRY_MAX };
 
+        // #1712: after a truncated tool call (the turn hit the output cap
+        // mid-call), the NEXT attempt requests with the model's full output
+        // budget so the call has room to complete — retrying the same capped
+        // request would just re-truncate. Only populated on a truncation retry;
+        // the happy path never clones the config.
+        let mut bumped_config: Option<ChatConfig> = None;
+
         for attempt in 0..=retry_max {
             let call_start = Instant::now();
             // Try the full LLM call (stream creation + consumption)
@@ -67,8 +74,12 @@ impl Agent {
             let input_bytes: usize = messages.iter().map(|m| m.content.len()).sum();
             let input_estimate = (input_bytes / 3) as u32;
 
+            let attempt_config: &ChatConfig = bumped_config.as_ref().unwrap_or(config);
             let build_and_consume = async {
-                let stream = self.llm.chat_stream(messages, tools_spec, config).await?;
+                let stream = self
+                    .llm
+                    .chat_stream(messages, tools_spec, attempt_config)
+                    .await?;
                 self.consume_stream_with_input_estimate(stream, iteration, input_estimate)
                     .await
             };
@@ -261,6 +272,25 @@ impl Agent {
                 Err(e) => {
                     if attempt < retry_max && Self::is_retryable_stream_error(&e) {
                         let delay = Duration::from_secs(1 << attempt);
+                        // #1712: a truncated tool call means the model needed
+                        // more output room than the per-turn cap allowed. Retry
+                        // with the model's full output budget so the next
+                        // attempt can complete the call. Only bump upward.
+                        if Self::is_truncated_tool_call_error(&e) {
+                            let model_max = self.llm.max_output_tokens();
+                            let current = config.max_tokens.unwrap_or(0);
+                            if model_max > current {
+                                let mut c = config.clone();
+                                c.max_tokens = Some(model_max);
+                                warn!(
+                                    from = current,
+                                    to = model_max,
+                                    iteration,
+                                    "truncated tool call — raising output budget for retry (#1712)"
+                                );
+                                bumped_config = Some(c);
+                            }
+                        }
                         turn.record_retry(LoopRetryReason::StreamError {
                             attempt: attempt + 1,
                             error: e.to_string(),
@@ -501,6 +531,76 @@ mod tests {
         }
     }
 
+    // ── Provider that truncates a tool call on attempt 1, succeeds on 2 ───────
+    // #1712: models the real failure — a native streaming tool call cut off by
+    // the output cap (Done(MaxTokens) + unterminated args) on the first attempt,
+    // then a clean call on the retry. Records the `max_tokens` it saw each call
+    // so the test can assert the retry was issued with a RAISED budget.
+
+    struct TruncateThenSucceedProvider {
+        counters: Arc<CallCounters>,
+        seen_max_tokens: Arc<std::sync::Mutex<Vec<Option<u32>>>>,
+    }
+
+    #[async_trait]
+    impl LlmProvider for TruncateThenSucceedProvider {
+        async fn chat(
+            &self,
+            _messages: &[Message],
+            _tools: &[ToolSpec],
+            _config: &ChatConfig,
+        ) -> eyre::Result<ChatResponse> {
+            self.counters.chat.fetch_add(1, Ordering::SeqCst);
+            eyre::bail!("non-streaming fallback should not be reached in this test")
+        }
+
+        async fn chat_stream(
+            &self,
+            _messages: &[Message],
+            _tools: &[ToolSpec],
+            config: &ChatConfig,
+        ) -> eyre::Result<ChatStream> {
+            let n = self.counters.chat_stream.fetch_add(1, Ordering::SeqCst);
+            self.seen_max_tokens.lock().unwrap().push(config.max_tokens);
+            if n == 0 {
+                // Attempt 1: truncated mid-args, finished on the output cap.
+                let events = vec![
+                    StreamEvent::ToolCallDelta {
+                        index: 0,
+                        id: Some("write_file_26".to_string()),
+                        name: Some("write_file".to_string()),
+                        arguments_delta: "{\"path\":\"r.md\",\"content\":\"# Rev".to_string(),
+                    },
+                    StreamEvent::Usage(LlmTokenUsage::default()),
+                    StreamEvent::Done(StopReason::MaxTokens),
+                ];
+                Ok(Box::pin(stream::iter(events)))
+            } else {
+                // Attempt 2 (bumped budget): a clean, complete tool call.
+                let events = vec![
+                    StreamEvent::ToolCallDelta {
+                        index: 0,
+                        id: Some("write_file_27".to_string()),
+                        name: Some("write_file".to_string()),
+                        arguments_delta: "{\"path\":\"r.md\",\"content\":\"# Review\"}".to_string(),
+                    },
+                    StreamEvent::Usage(LlmTokenUsage::default()),
+                    StreamEvent::Done(StopReason::ToolUse),
+                ];
+                Ok(Box::pin(stream::iter(events)))
+            }
+        }
+
+        fn model_id(&self) -> &str {
+            // Resolves to a large max_output_tokens via context::max_output_tokens.
+            "minimax-m3"
+        }
+
+        fn provider_name(&self) -> &str {
+            "mock"
+        }
+    }
+
     // ── Test helpers ──────────────────────────────────────────────────────────
 
     async fn build_agent(provider: Arc<dyn LlmProvider>) -> (Agent, tempfile::TempDir) {
@@ -556,6 +656,60 @@ mod tests {
             counters.chat.load(Ordering::SeqCst),
             0,
             "non-streaming fallback must NOT be called under FailFast"
+        );
+    }
+
+    /// #1712: a truncated tool call (Done(MaxTokens) + unterminated args) is
+    /// RETRYABLE — the loop retries (not instant death) AND raises the output
+    /// budget for the retry so it can complete. Asserts: two stream attempts,
+    /// the second issued with a bumped max_tokens, and the call ultimately
+    /// succeeds with the completed tool call.
+    #[tokio::test]
+    async fn truncated_tool_call_retries_with_raised_output_budget() {
+        let counters = Arc::new(CallCounters::default());
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider = Arc::new(TruncateThenSucceedProvider {
+            counters: counters.clone(),
+            seen_max_tokens: seen.clone(),
+        });
+        let (agent, _dir) = build_agent(provider).await;
+
+        // Start with a small per-turn cap (what cuts the call off).
+        let small_cap = 1200u32;
+        let config = ChatConfig {
+            max_tokens: Some(small_cap),
+            ..Default::default()
+        };
+
+        let result = agent
+            .call_llm_with_hooks(
+                &msgs(),
+                &[],
+                &config,
+                1,
+                &octos_core::TokenUsage::default(),
+                &mut turn(),
+            )
+            .await;
+
+        let (response, _streamed, _cost) = result.expect("truncation must recover, not fail");
+        assert_eq!(
+            counters.chat_stream.load(Ordering::SeqCst),
+            2,
+            "must retry once after the truncated call"
+        );
+        assert_eq!(
+            response.tool_calls.len(),
+            1,
+            "the retry's completed tool call must surface"
+        );
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 2, "two stream attempts");
+        assert_eq!(seen[0], Some(small_cap), "attempt 1 uses the small cap");
+        assert!(
+            seen[1].unwrap() > small_cap,
+            "attempt 2 must raise the output budget (was {:?})",
+            seen[1]
         );
     }
 

@@ -40,6 +40,12 @@ static ATTR_RE: LazyLock<Regex> = LazyLock::new(|| {
     )
     .unwrap()
 });
+static PARAM_TAG_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r#"(?is)<parameter\b[^>]*?\bname\s*=\s*["']?(?P<name>[^"'>\s]+)["']?[^>]*>(?P<value>.*?)</parameter\s*>"#,
+    )
+    .unwrap()
+});
 
 impl Agent {
     /// Check if an LLM response is empty or abnormal and should be retried.
@@ -144,6 +150,17 @@ impl Agent {
             || msg.contains("connection reset")
             || msg.contains("broken pipe")
     }
+
+    /// Whether an error is specifically a truncated tool call (`#1712`): the
+    /// turn hit the output cap mid-call. The retry loop uses this to raise the
+    /// output budget for the next attempt (a plain retry at the same cap would
+    /// re-truncate). Distinct from a genuinely malformed call.
+    pub(super) fn is_truncated_tool_call_error(err: &eyre::Report) -> bool {
+        matches!(
+            err.downcast_ref::<octos_llm::StreamError>(),
+            Some(octos_llm::StreamError::TruncatedToolCall { .. })
+        )
+    }
 }
 
 fn extract_inline_invokes(content: &str) -> (String, Vec<ToolCall>) {
@@ -170,6 +187,167 @@ fn extract_inline_invokes(content: &str) -> (String, Vec<ToolCall>) {
     (cleaned, calls)
 }
 
+/// Parse Anthropic-style `<parameter name="x">value</parameter>` sub-tags into
+/// a JSON arguments object. Some models (e.g. Kimi-K3) emit inline tool calls as
+/// `<invoke name="shell"><parameter name="command">…</parameter></invoke>`
+/// instead of a JSON body; without this the arguments would be lost (repaired to
+/// `{}`). Values that parse cleanly as a JSON number or boolean are typed as
+/// such; everything else (including multi-line heredoc commands) is kept as a
+/// trimmed string. Returns `None` when the text contains no `<parameter>` tags,
+/// so the caller falls back to the JSON path. See #1711.
+fn parse_invoke_parameter_tags(body: &str) -> Option<serde_json::Value> {
+    let mut map = serde_json::Map::new();
+    for caps in PARAM_TAG_RE.captures_iter(body) {
+        let Some(name) = caps.name("name").map(|m| m.as_str().trim()) else {
+            continue;
+        };
+        if name.is_empty() {
+            continue;
+        }
+        let raw = caps.name("value").map(|m| m.as_str()).unwrap_or("").trim();
+        // Only promote unambiguous scalar types; keep everything else (commands,
+        // paths, JSON-looking strings) verbatim so shell payloads are untouched.
+        let value = match serde_json::from_str::<serde_json::Value>(raw) {
+            Ok(v @ serde_json::Value::Number(_)) | Ok(v @ serde_json::Value::Bool(_)) => v,
+            _ => serde_json::Value::String(raw.to_string()),
+        };
+        map.insert(name.to_string(), value);
+    }
+    if map.is_empty() {
+        None
+    } else {
+        Some(serde_json::Value::Object(map))
+    }
+}
+
+/// Coerce inline tool-call argument text into a JSON **object**, repairing the
+/// malformations that in-band-reasoning models produce under a tight output
+/// budget: JSON truncated mid-object or mid-string (`finish_reason=length`),
+/// trailing commas, and literal (unescaped) control characters inside string
+/// values (common with heredoc `command` payloads).
+///
+/// The result is ALWAYS a JSON object. A valid object echoed back to a provider
+/// can never trigger the "invalid function arguments json string" HTTP 400 that
+/// a bare string or truncated fragment would (that 400 is non-retryable and
+/// kills the whole task). An unrepairable arg degrades to `{}`, which surfaces
+/// as an ordinary tool-input error the model can retry — never a fatal request
+/// rejection. See #1711.
+fn repair_tool_arguments_to_object(raw: &str) -> serde_json::Value {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return serde_json::json!({});
+    }
+    // Fast path: already a valid object.
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed)
+        && value.is_object()
+    {
+        return value;
+    }
+    // Repair pass: escape literal control chars, drop trailing commas, and
+    // close any structure/string left open by truncation, then re-parse.
+    let repaired = repair_json_fragment(trimmed);
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(&repaired)
+        && value.is_object()
+    {
+        tracing::warn!(
+            target: "octos::toolcall_repair",
+            original_len = trimmed.len(),
+            "repaired malformed/truncated inline tool-call arguments (#1711)"
+        );
+        return value;
+    }
+    // Unrepairable → empty object (never a fatal non-object on the wire).
+    tracing::warn!(
+        target: "octos::toolcall_repair",
+        preview = %trimmed.chars().take(80).collect::<String>(),
+        "unrepairable inline tool-call arguments; using empty object (#1711)"
+    );
+    serde_json::json!({})
+}
+
+/// String-aware JSON repair for [`repair_tool_arguments_to_object`]. Single
+/// left-to-right scan that (1) escapes literal control chars inside string
+/// values, (2) removes trailing commas before `}`/`]`, and (3) closes any
+/// string/object/array left open by mid-stream truncation. Operates only
+/// outside string literals for structural edits so it never corrupts content.
+fn repair_json_fragment(input: &str) -> String {
+    let chars: Vec<char> = input.chars().collect();
+    let mut out = String::with_capacity(input.len() + 8);
+    let mut stack: Vec<char> = Vec::new();
+    let mut in_string = false;
+    let mut escaped = false;
+    for i in 0..chars.len() {
+        let c = chars[i];
+        if in_string {
+            if escaped {
+                out.push(c);
+                escaped = false;
+            } else if c == '\\' {
+                out.push(c);
+                escaped = true;
+            } else if c == '"' {
+                out.push(c);
+                in_string = false;
+            } else if (c as u32) < 0x20 {
+                // Literal control char inside a string → escape it so the
+                // fragment is wire-valid (heredoc newlines, tabs, etc.).
+                match c {
+                    '\n' => out.push_str("\\n"),
+                    '\t' => out.push_str("\\t"),
+                    '\r' => out.push_str("\\r"),
+                    other => out.push_str(&format!("\\u{:04x}", other as u32)),
+                }
+            } else {
+                out.push(c);
+            }
+            continue;
+        }
+        match c {
+            '"' => {
+                in_string = true;
+                out.push(c);
+            }
+            '{' => {
+                stack.push('}');
+                out.push(c);
+            }
+            '[' => {
+                stack.push(']');
+                out.push(c);
+            }
+            '}' | ']' => {
+                if stack.last() == Some(&c) {
+                    stack.pop();
+                }
+                out.push(c);
+            }
+            ',' => {
+                // Drop a trailing comma: peek the next non-whitespace char.
+                let mut j = i + 1;
+                while j < chars.len() && chars[j].is_whitespace() {
+                    j += 1;
+                }
+                if !(j < chars.len() && (chars[j] == '}' || chars[j] == ']')) {
+                    out.push(c);
+                }
+            }
+            _ => out.push(c),
+        }
+    }
+    // Close a string left open by truncation (drop a dangling escape first).
+    if in_string {
+        if escaped {
+            out.pop();
+        }
+        out.push('"');
+    }
+    // Close structures left open by truncation, innermost first.
+    while let Some(closer) = stack.pop() {
+        out.push(closer);
+    }
+    out
+}
+
 fn build_tool_call_from_invoke(attrs: &str, body: &str) -> Option<ToolCall> {
     let attr_map = parse_attrs(attrs);
     let name = attr_map.get("name")?.trim();
@@ -185,11 +363,19 @@ fn build_tool_call_from_invoke(attrs: &str, body: &str) -> Option<ToolCall> {
         .unwrap_or_else(|| body.trim());
 
     let raw_args = strip_code_fence(raw_args.trim());
-    let arguments = if raw_args.is_empty() {
-        serde_json::json!({})
-    } else {
-        serde_json::from_str(raw_args)
-            .unwrap_or_else(|_| serde_json::Value::String(raw_args.into()))
+    // Some models emit args as Anthropic-style `<parameter name="x">…</parameter>`
+    // sub-tags inside the invoke body rather than a JSON object; parse those
+    // first, otherwise fall back to JSON (with repair).
+    let arguments = match parse_invoke_parameter_tags(raw_args) {
+        Some(params) => {
+            tracing::warn!(
+                target: "octos::toolcall_repair",
+                tool = name,
+                "recovered inline tool-call from <parameter> tags (#1711)"
+            );
+            params
+        }
+        None => repair_tool_arguments_to_object(raw_args),
     };
 
     Some(ToolCall {
@@ -278,6 +464,161 @@ mod tests {
             },
             provider_index: None,
         }
+    }
+
+    // ---------- repair_tool_arguments_to_object (#1711) ----------
+
+    #[test]
+    fn repair_passes_through_a_valid_object() {
+        let v = repair_tool_arguments_to_object(r#"{"command":"ls -la /tmp"}"#);
+        assert_eq!(v["command"], "ls -la /tmp");
+        assert!(v.is_object());
+    }
+
+    #[test]
+    fn repair_empty_or_blank_is_empty_object() {
+        assert_eq!(repair_tool_arguments_to_object(""), serde_json::json!({}));
+        assert_eq!(
+            repair_tool_arguments_to_object("   "),
+            serde_json::json!({})
+        );
+    }
+
+    #[test]
+    fn repair_never_returns_a_bare_string() {
+        // The old fallback stored `Value::String(raw)`, which serialized back to
+        // the provider as an invalid `function.arguments` → fatal HTTP 400.
+        let v = repair_tool_arguments_to_object("not json at all");
+        assert!(v.is_object(), "must coerce to an object, got {v}");
+        assert_eq!(v, serde_json::json!({}));
+    }
+
+    #[test]
+    fn repair_closes_a_truncated_object() {
+        // finish_reason=length cut the JSON mid-value.
+        let v = repair_tool_arguments_to_object(r#"{"command":"cat report.md"#);
+        assert!(v.is_object());
+        assert_eq!(v["command"], "cat report.md");
+    }
+
+    #[test]
+    fn repair_closes_a_string_and_object_truncated_mid_heredoc() {
+        // Truncated in the middle of a heredoc command string.
+        let v = repair_tool_arguments_to_object("{\"command\":\"cat > f <<EOF\nline1\nline2");
+        assert!(v.is_object());
+        assert!(
+            v["command"].as_str().unwrap().contains("line1"),
+            "salvaged command: {}",
+            v["command"]
+        );
+    }
+
+    #[test]
+    fn repair_escapes_literal_control_chars_in_strings() {
+        // A heredoc payload with LITERAL newlines/tabs (unescaped) is invalid
+        // JSON; the repair escapes them instead of failing.
+        let v = repair_tool_arguments_to_object("{\"command\":\"echo a\nb\tc\"}");
+        assert!(v.is_object());
+        assert_eq!(v["command"], "echo a\nb\tc");
+    }
+
+    #[test]
+    fn repair_strips_trailing_commas() {
+        let v = repair_tool_arguments_to_object(r#"{"a":1,"b":2,}"#);
+        assert_eq!(v["a"], 1);
+        assert_eq!(v["b"], 2);
+    }
+
+    #[test]
+    fn repair_of_a_json_non_object_degrades_to_empty_object() {
+        // A bare JSON array/string/number is not valid tool arguments.
+        assert_eq!(
+            repair_tool_arguments_to_object("[1,2,3]"),
+            serde_json::json!({})
+        );
+        assert_eq!(
+            repair_tool_arguments_to_object("\"just a string\""),
+            serde_json::json!({})
+        );
+    }
+
+    #[test]
+    fn inline_invoke_with_malformed_args_yields_object_not_bare_string() {
+        // End-to-end through the inline detector: an `<invoke>` whose body is a
+        // truncated/unclosed JSON object (what in-band-reasoning models emit
+        // under budget pressure) must still recover to a JSON *object* — never a
+        // bare string that would round-trip as a fatal HTTP 400.
+        let (_, calls) =
+            extract_inline_invokes("<invoke name=\"shell\">{\"command\":\"git clone</invoke>");
+        assert_eq!(calls.len(), 1);
+        assert!(
+            calls[0].arguments.is_object(),
+            "arguments must be an object, got {}",
+            calls[0].arguments
+        );
+        assert!(
+            calls[0].arguments["command"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("git clone")
+        );
+    }
+
+    // ---------- parse_invoke_parameter_tags (#1711) ----------
+
+    #[test]
+    fn parameter_tags_parse_a_single_string_param() {
+        let v = parse_invoke_parameter_tags("<parameter name=\"command\">ls -la /tmp</parameter>")
+            .expect("params");
+        assert_eq!(v["command"], "ls -la /tmp");
+    }
+
+    #[test]
+    fn parameter_tags_type_numbers_and_bools_but_keep_commands_as_strings() {
+        let v = parse_invoke_parameter_tags(
+            "<parameter name=\"command\">grep -r foo .</parameter>\
+             <parameter name=\"timeout_seconds\">30</parameter>\
+             <parameter name=\"recursive\">true</parameter>",
+        )
+        .expect("params");
+        assert_eq!(v["command"], "grep -r foo .");
+        assert_eq!(v["timeout_seconds"], 30);
+        assert_eq!(v["recursive"], true);
+    }
+
+    #[test]
+    fn parameter_tags_preserve_multiline_heredoc_value() {
+        let body =
+            "<parameter name=\"command\">cat > /tmp/r.md <<'EOF'\n# Review\nline\nEOF</parameter>";
+        let v = parse_invoke_parameter_tags(body).expect("params");
+        let cmd = v["command"].as_str().unwrap();
+        assert!(cmd.contains("<<'EOF'"), "cmd: {cmd}");
+        assert!(cmd.contains("# Review"));
+    }
+
+    #[test]
+    fn parameter_tags_absent_returns_none() {
+        assert!(parse_invoke_parameter_tags(r#"{"command":"ls"}"#).is_none());
+        assert!(parse_invoke_parameter_tags("plain text").is_none());
+    }
+
+    #[test]
+    fn inline_invoke_with_parameter_tags_recovers_real_args() {
+        // The Kimi-K3 shape: <invoke><parameter name="command">…</parameter></invoke>
+        let (_, calls) = extract_inline_invokes(
+            "<invoke name=\"shell\"><parameter name=\"command\">cat > f <<'EOF'\nhi\nEOF</parameter></invoke>",
+        );
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "shell");
+        assert!(calls[0].arguments.is_object());
+        assert!(
+            calls[0].arguments["command"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("<<'EOF'"),
+            "recovered args: {}",
+            calls[0].arguments
+        );
     }
 
     // ---------- Agent::is_retriable_response ----------

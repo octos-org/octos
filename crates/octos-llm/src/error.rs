@@ -340,6 +340,24 @@ pub enum StreamError {
         /// Parse error rendered with truncated raw input for log brevity.
         error: String,
     },
+    /// Tool call arguments failed to parse because the turn hit the output
+    /// token cap (`finish_reason=length` → [`StopReason::MaxTokens`]) mid-call,
+    /// truncating the JSON. Unlike [`StreamError::MalformedArgs`], this is NOT a
+    /// model bug — the model was cut off, not wrong — so it is **retryable**:
+    /// the existing retry machinery re-requests the turn (reasoning-length
+    /// variance and the non-streaming fallback often complete the call on a
+    /// second attempt). Distinguishing this from `MalformedArgs` preserves the
+    /// #1355 invariant (a syntactically bad call after a *clean* finish stays
+    /// non-retryable so the model self-corrects) while stopping a truncated
+    /// call from instantly killing a background task, which has no "next turn".
+    TruncatedToolCall {
+        /// Tool call id (provider-assigned or synthesized).
+        tool_id: String,
+        /// Tool name as declared in the stream.
+        tool_name: String,
+        /// Parse error rendered with truncated raw input for log brevity.
+        error: String,
+    },
     /// Underlying transport failure (connection reset, broken pipe, etc.).
     Transport { detail: String },
 }
@@ -351,6 +369,7 @@ impl StreamError {
         match self {
             StreamError::IdleTimeout { .. }
             | StreamError::Incomplete { .. }
+            | StreamError::TruncatedToolCall { .. }
             | StreamError::Transport { .. } => true,
             StreamError::MalformedArgs { .. } => false,
         }
@@ -379,6 +398,16 @@ impl fmt::Display for StreamError {
                     "malformed tool_call arguments (tool={tool_name}, id={tool_id}): {error}"
                 )
             }
+            StreamError::TruncatedToolCall {
+                tool_id,
+                tool_name,
+                error,
+            } => {
+                write!(
+                    f,
+                    "truncated tool_call arguments (tool={tool_name}, id={tool_id}) — output token cap hit mid-call: {error}"
+                )
+            }
             StreamError::Transport { detail } => write!(f, "stream transport error: {detail}"),
         }
     }
@@ -394,6 +423,7 @@ impl From<StreamError> for LlmError {
     /// * `IdleTimeout` → `Timeout` (retryable in `LlmError::is_retryable`)
     /// * `Incomplete` → `StreamError` (retryable)
     /// * `MalformedArgs` → `InvalidRequest` (NOT retryable — model needs to see)
+    /// * `TruncatedToolCall` → `StreamError` (retryable — cut off, not wrong)
     /// * `Transport` → `Network` (retryable)
     fn from(err: StreamError) -> Self {
         let message = err.to_string();
@@ -403,6 +433,7 @@ impl From<StreamError> for LlmError {
             StreamError::MalformedArgs { .. } => LlmErrorKind::InvalidRequest {
                 detail: message.chars().take(200).collect(),
             },
+            StreamError::TruncatedToolCall { .. } => LlmErrorKind::StreamError,
             StreamError::Transport { .. } => LlmErrorKind::Network,
         };
         LlmError::new(kind, message).with_source(err)
@@ -649,6 +680,43 @@ mod tests {
             error: "EOF while parsing a string".to_string(),
         };
         assert!(!err.is_retryable());
+    }
+
+    #[test]
+    fn is_retryable_truncated_toolcall_true() {
+        // #1712: TruncatedToolCall IS retryable — the model was cut off by the
+        // output cap mid-call, not wrong. Distinct from MalformedArgs.
+        let err = StreamError::TruncatedToolCall {
+            tool_id: "write_file_26".to_string(),
+            tool_name: "write_file".to_string(),
+            error: "EOF while parsing a string at column 4973".to_string(),
+        };
+        assert!(err.is_retryable());
+    }
+
+    #[test]
+    fn stream_error_truncated_toolcall_into_llm_error_retryable() {
+        let err = StreamError::TruncatedToolCall {
+            tool_id: "write_file_26".to_string(),
+            tool_name: "write_file".to_string(),
+            error: "EOF while parsing a string".to_string(),
+        };
+        let llm: LlmError = err.into();
+        assert!(matches!(llm.kind, LlmErrorKind::StreamError));
+        assert!(llm.is_retryable());
+    }
+
+    #[test]
+    fn stream_error_truncated_toolcall_display_names_tool_and_cap() {
+        let err = StreamError::TruncatedToolCall {
+            tool_id: "write_file_26".to_string(),
+            tool_name: "write_file".to_string(),
+            error: "EOF while parsing a string at column 4973".to_string(),
+        };
+        let rendered = err.to_string();
+        assert!(rendered.contains("write_file"), "got: {rendered}");
+        assert!(rendered.contains("truncated"), "got: {rendered}");
+        assert!(rendered.contains("token cap"), "got: {rendered}");
     }
 
     #[test]
