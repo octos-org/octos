@@ -6,13 +6,13 @@
 //! narrow — only items that integration tests or sibling crates consume.
 
 #[cfg(feature = "api")]
-pub mod admin_audit_store;
+pub use octos_store::admin_audit_store;
 // Extracted to the `octos-store` crate; re-exported so `crate::admin_token_store::…`
 // keeps resolving unchanged.
 pub use octos_store::admin_token_store;
 #[cfg(feature = "api")]
 pub mod api;
-pub mod approvals_audit;
+pub use octos_store::approvals_audit;
 pub mod auth;
 pub mod cli_agent_adapter;
 pub mod commands;
@@ -48,7 +48,7 @@ pub mod runtime;
 pub mod session_actor;
 pub use octos_store::setup_state_store;
 pub mod skills_scope;
-pub mod smtp_secret_store;
+pub use octos_store::smtp_secret_store;
 pub mod soul_service;
 pub mod status_indicator;
 pub mod status_layers;
@@ -57,8 +57,8 @@ pub mod tenant;
 pub mod tools;
 #[cfg(feature = "api")]
 pub mod updater;
-pub mod usage_ledger;
+pub use octos_store::usage_ledger;
 #[cfg(feature = "api")]
-pub mod user_store;
+pub use octos_store::user_store;
 pub mod workflow_runtime;
 pub mod workflows;

@@ -167,6 +167,10 @@ axum = { workspace = true }
 # failover-surfacing tests can call `publish_failover_for_subscribers`.
 # Production builds don't see this; only `cargo test -p octos-cli`.
 octos-llm = { workspace = true, features = ["test-utils"] }
+# Exposes `octos-store`'s test-only helpers (e.g. `read_audit_lines`, reached via
+# the `api::ui_protocol_audit` alias) to octos-cli's tests. Production builds
+# don't see it; only `cargo test -p octos-cli`.
+octos-store = { workspace = true, features = ["test-util"] }
 tokio-tungstenite.workspace = true
 
 [[test]]

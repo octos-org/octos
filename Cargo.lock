@@ -4571,11 +4571,15 @@ dependencies = [
  "constant_time_eq",
  "eyre",
  "getrandom 0.2.17",
+ "octos-core",
+ "redb",
  "serde",
  "serde_json",
  "sha2",
  "tempfile",
+ "tokio",
  "tracing",
+ "uuid",
 ]
 
 [[package]]
