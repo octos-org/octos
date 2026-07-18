@@ -322,8 +322,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # `lib` runs `--lib` only. `integration` runs `--tests` (every
-        # integration test binary).
+        # `lib` runs `--lib` only. `integration` selects every integration
+        # test target with `--test '*'` without rebuilding the lib unit-test
+        # harness, which `--tests` includes by default.
         # Splitting these onto separate runners means each gets a fresh
         # 16GB allocation and neither inherits residual RAM from the
         # other's compile phase.
@@ -351,6 +352,14 @@ jobs:
 
       - name: Test octos-agent (integration)
         if: matrix.test-mode == 'integration'
+        env:
+          # Keep a cache miss viable on the standard runner. This shard links
+          # many test binaries, so omit debug info to reduce disk and peak RSS.
+          CARGO_PROFILE_TEST_DEBUG: "0"
+          CARGO_PROFILE_DEV_DEBUG: "0"
+        # `--tests` also builds and runs the lib unit-test harness, duplicating
+        # the lib matrix job. The quoted target glob selects integration tests
+        # only and prevents the shell from expanding it before Cargo sees it.
         # --test-threads=1: validator_runner.rs::should_kill_child_process_on_validator_timeout
         # spawns a `sh -c "... sleep 30"` child to test the kill path. Under the
         # default thread-per-core parallelism, multiple validator-timeout tests
@@ -359,7 +368,7 @@ jobs:
         # after the preceding test passes). Serialising the integration tests
         # eliminates the pileup. The full integration suite still finishes
         # comfortably within the runner's 6h budget.
-        run: cargo test -p octos-agent --tests -- --test-threads=1
+        run: cargo test -p octos-agent --test '*' -- --test-threads=1
 
 
   test-octos-cli:
