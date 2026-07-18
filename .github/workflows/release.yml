@@ -48,6 +48,7 @@ jobs:
           cd ..
           git submodule update --init octos-web
           bash scripts/build-web-app.sh
+          bash scripts/build-swarm-app.sh
 
       - name: Build
         run: |
@@ -92,6 +93,7 @@ jobs:
           cd ..
           git submodule update --init octos-web
           bash scripts/build-web-app.sh
+          bash scripts/build-swarm-app.sh
 
       - name: Build
         run: |
@@ -138,6 +140,7 @@ jobs:
           cd ..
           git submodule update --init octos-web
           bash scripts/build-web-app.sh
+          bash scripts/build-swarm-app.sh
 
       - name: Build
         run: |
@@ -186,6 +189,7 @@ jobs:
           cd ..
           git submodule update --init octos-web
           bash scripts/build-web-app.sh
+          bash scripts/build-swarm-app.sh
 
       - name: Build
         run: |
