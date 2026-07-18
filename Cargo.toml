@@ -8,6 +8,7 @@ members = [
     "crates/octos-agent",
     "crates/octos-bus",
     "crates/octos-workflows",
+    "crates/octos-server",
     "crates/octos-store",
     "crates/octos-services",
     "crates/octos-cli",
@@ -52,6 +53,7 @@ octos-llm = { path = "crates/octos-llm" }
 octos-agent = { path = "crates/octos-agent" }
 octos-bus = { path = "crates/octos-bus" }
 octos-workflows = { path = "crates/octos-workflows" }
+octos-server = { path = "crates/octos-server" }
 octos-store = { path = "crates/octos-store" }
 octos-services = { path = "crates/octos-services" }
 octos-pipeline = { path = "crates/octos-pipeline" }
