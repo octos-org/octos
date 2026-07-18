@@ -1,0 +1,21 @@
+[package]
+name = "octos-workflows"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Workflow execution subsystem (workflow_runtime + families + delivery workflows) extracted from octos-cli"
+
+[dependencies]
+octos-core = { workspace = true }
+octos-agent = { workspace = true }
+octos-pipeline = { workspace = true }
+chrono = { workspace = true }
+eyre = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+[lints]
+workspace = true
