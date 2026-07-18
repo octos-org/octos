@@ -4397,6 +4397,7 @@ dependencies = [
  "octos-services",
  "octos-store",
  "octos-swarm",
+ "octos-workflows",
  "open",
  "percent-encoding",
  "qrcode",
@@ -4622,6 +4623,21 @@ dependencies = [
  "tokio-test",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "octos-workflows"
+version = "2.0.2-rc.11"
+dependencies = [
+ "chrono",
+ "eyre",
+ "octos-agent",
+ "octos-core",
+ "octos-pipeline",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

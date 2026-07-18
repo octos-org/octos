@@ -20,6 +20,7 @@ octos-agent = { workspace = true }
 octos-memory = { workspace = true }
 octos-llm = { workspace = true }
 octos-bus = { workspace = true }
+octos-workflows = { workspace = true }
 octos-store = { workspace = true }
 octos-services = { workspace = true }
 octos-pipeline = { workspace = true }

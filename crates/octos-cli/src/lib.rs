@@ -60,5 +60,5 @@ pub use octos_services::updater;
 pub use octos_store::usage_ledger;
 #[cfg(feature = "api")]
 pub use octos_store::user_store;
-pub mod workflow_runtime;
-pub mod workflows;
+pub use octos_workflows::workflow_runtime;
+pub use octos_workflows::workflows;
