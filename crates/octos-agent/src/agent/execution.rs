@@ -63,6 +63,12 @@ type ToolCallResult = (
     Option<TokenUsage>,
     bool,
     Option<(String, serde_json::Value)>,
+    // field 6 — `cascades`: when this call failed (field 4 == `false`), should
+    // it cancel the remaining peers in a serial (M8.8) batch? `true` preserves
+    // the legacy stop-on-error behaviour; `false` marks a no-side-effect
+    // failure — a [`crate::tools::ToolInputError`] from malformed model
+    // arguments — that must NOT nuke well-formed sibling calls (#1690).
+    bool,
 );
 
 fn should_auto_send_tool_files(
@@ -588,6 +594,8 @@ impl Agent {
                             None,
                             false, // hook denial is a failure — cascade in serial mode
                             None,
+                            // hook denial is an intentional stop — cascade to peers
+                            true,
                         );
                     }
                     HookResult::Modified(new_args) => {
@@ -655,6 +663,8 @@ impl Agent {
                             None,
                             false, // policy denial is a failure — cascade in serial mode
                             None,
+                            // policy denial is an intentional stop — cascade to peers
+                            true,
                         );
                     }
                 }
@@ -709,6 +719,8 @@ impl Agent {
                             None,
                             false,
                             None,
+                            // pre-execution denial is an intentional stop — cascade
+                            true,
                         );
                     }
                 }
@@ -801,6 +813,8 @@ impl Agent {
                         None,
                         false,
                         None,
+                        // fanout-cap denial is an intentional stop — cascade
+                        true,
                     );
                 }
                 tools.mark_spawn_only_invoked();
@@ -1933,6 +1947,8 @@ impl Agent {
                     None,
                     true, // spawn_only placeholder is reported as success
                     None,
+                    // spawn_only success — cascade flag is moot when success=true
+                    true,
                 );
             }
 
@@ -2023,6 +2039,7 @@ impl Agent {
                 tool_tokens,
                 tool_success,
                 tool_structured_metadata,
+                tool_cascades,
             ) = match result {
                 Ok(tool_result) => {
                     debug!(
@@ -2104,6 +2121,10 @@ impl Agent {
                         tool_result.tokens_used,
                         success,
                         tool_result.structured_metadata,
+                        // A tool that RAN and reported failure still cascades
+                        // (legacy behaviour); only never-ran input errors below
+                        // opt out.
+                        true,
                     )
                 }
                 Err(e) => {
@@ -2142,6 +2163,14 @@ impl Agent {
                         duration,
                     });
 
+                    // #1690: a malformed-arguments failure (`ToolInputError`)
+                    // has no side effects and must not cancel well-formed
+                    // sibling calls in a serial batch; genuine execution errors
+                    // still cascade. Scan the whole chain so a `wrap_err` in the
+                    // dispatch path cannot hide the marker.
+                    let cascades = !e
+                        .chain()
+                        .any(|src| src.is::<crate::tools::ToolInputError>());
                     (
                         format!("Error: {e}"),
                         Vec::new(),
@@ -2149,6 +2178,7 @@ impl Agent {
                         None,
                         false,
                         None,
+                        cascades,
                     )
                 }
             };
@@ -2193,6 +2223,7 @@ impl Agent {
                 tool_tokens,
                 tool_success,
                 structured_metadata,
+                tool_cascades,
             )
         })
     }
@@ -2367,7 +2398,7 @@ impl Agent {
         // Log completion of the tool batch.
         let result_sizes: Vec<usize> = results
             .iter()
-            .map(|(m, _, _, _, _, _)| m.content.len())
+            .map(|(m, _, _, _, _, _, _)| m.content.len())
             .collect();
         let total_result_bytes: usize = result_sizes.iter().sum();
         tracing::info!(
@@ -2397,6 +2428,7 @@ impl Agent {
             tool_tokens,
             success,
             tool_structured_metadata,
+            _cascades,
         ) in results
         {
             // Pair every executed tool result with its `tool_call_id` so
@@ -2510,13 +2542,17 @@ impl Agent {
                 }
             };
 
-            // The per-call success bit (the 5-th tuple element) drives the
-            // cascade. Every failure path in `spawn_tool_task` — tool error,
-            // hook denial, panic, timeout — sets it to `false`, so we do not
-            // need to peek at the message content.
+            // The per-call success bit (tuple field 4) marks failure; field 6
+            // (`cascades`) decides whether that failure cancels the remaining
+            // peers. Every failure path in `spawn_tool_task` — tool error, hook
+            // denial, panic, timeout — sets success `false`; only a
+            // no-side-effect `ToolInputError` (malformed model arguments) sets
+            // `cascades = false`, so one bad call cannot nuke well-formed
+            // siblings (#1690). No need to peek at message content.
             let failed = !outcome.4;
+            let cascades = outcome.6;
             results.push(outcome);
-            if failed {
+            if failed && cascades {
                 cancelled = true;
             }
         }
@@ -2548,6 +2584,8 @@ fn cancelled_result(tool_call: &octos_core::ToolCall) -> ToolCallResult {
         None,
         false,
         None,
+        // a cancelled peer raised no error of its own — do not further cascade
+        false,
     )
 }
 
@@ -2578,6 +2616,8 @@ fn timed_out_result(tool_call: &octos_core::ToolCall, elapsed_secs: u64) -> Tool
         None,
         false,
         None,
+        // a timeout cascades to peers the same way a regular error does
+        true,
     )
 }
 
@@ -2600,6 +2640,8 @@ fn panic_result(tool_call: &octos_core::ToolCall, reason: &str) -> ToolCallResul
         None,
         false,
         None,
+        // a panic is an unexpected hard failure — cascade to peers
+        true,
     )
 }
 
@@ -3119,6 +3161,171 @@ mod tests {
             arguments: serde_json::json!({}),
             metadata: None,
         }
+    }
+
+    /// Exclusive tool that fails with a `ToolInputError` (malformed model
+    /// arguments). Its failure must NOT cancel well-formed siblings (#1690).
+    struct InputErrorTool;
+
+    #[async_trait]
+    impl Tool for InputErrorTool {
+        fn name(&self) -> &str {
+            "bad_input_tool"
+        }
+        fn description(&self) -> &str {
+            "always fails input validation"
+        }
+        fn input_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+        fn concurrency_class(&self) -> crate::tools::ConcurrencyClass {
+            crate::tools::ConcurrencyClass::Exclusive
+        }
+        async fn execute(&self, _args: &serde_json::Value) -> eyre::Result<ToolResult> {
+            Err(crate::tools::ToolInputError::new(
+                "invalid bad_input_tool input: missing field `target`",
+            )
+            .into())
+        }
+    }
+
+    /// Exclusive tool that HARD-errors (a genuine execution failure, not an
+    /// input error) — this MUST still cascade to peers.
+    struct HardErrorTool;
+
+    #[async_trait]
+    impl Tool for HardErrorTool {
+        fn name(&self) -> &str {
+            "hard_error_tool"
+        }
+        fn description(&self) -> &str {
+            "always errors mid-execution"
+        }
+        fn input_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+        fn concurrency_class(&self) -> crate::tools::ConcurrencyClass {
+            crate::tools::ConcurrencyClass::Exclusive
+        }
+        async fn execute(&self, _args: &serde_json::Value) -> eyre::Result<ToolResult> {
+            Err(eyre::eyre!("boom: unexpected runtime failure"))
+        }
+    }
+
+    /// Exclusive tool that succeeds with a distinctive output — the
+    /// well-formed sibling behind a failing peer.
+    struct GoodExclusiveTool;
+
+    #[async_trait]
+    impl Tool for GoodExclusiveTool {
+        fn name(&self) -> &str {
+            "good_tool"
+        }
+        fn description(&self) -> &str {
+            "succeeds with distinctive output"
+        }
+        fn input_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+        fn concurrency_class(&self) -> crate::tools::ConcurrencyClass {
+            crate::tools::ConcurrencyClass::Exclusive
+        }
+        async fn execute(&self, _args: &serde_json::Value) -> eyre::Result<ToolResult> {
+            Ok(ToolResult {
+                output: "GOOD_REAL_OUTPUT".to_string(),
+                success: true,
+                ..Default::default()
+            })
+        }
+    }
+
+    async fn run_serial_pair(
+        first: &str,
+        second: &str,
+        tools: ToolRegistry,
+    ) -> Vec<octos_core::Message> {
+        let dir = tempfile::tempdir().unwrap();
+        let provider: Arc<dyn LlmProvider> = Arc::new(NoChatProvider);
+        let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+        let agent =
+            Agent::new(AgentId::new("cascade"), provider, tools, memory).with_config(AgentConfig {
+                save_episodes: false,
+                ..Default::default()
+            });
+        let response = ChatResponse {
+            content: None,
+            reasoning_content: None,
+            tool_calls: vec![
+                tool_call("call_first", first),
+                tool_call("call_second", second),
+            ],
+            stop_reason: StopReason::ToolUse,
+            usage: LlmTokenUsage::default(),
+            provider_index: None,
+        };
+        let (messages, _fm, _fs, _tok, _st, _sid) = agent
+            .execute_tools(&response)
+            .await
+            .expect("execute_tools must not error");
+        messages
+    }
+
+    #[tokio::test]
+    async fn input_error_does_not_cancel_well_formed_sibling() {
+        // #1690: a malformed-arguments failure has no side effects, so the
+        // well-formed sibling behind it in the serial batch must still run.
+        let mut tools = ToolRegistry::new();
+        tools.register(InputErrorTool);
+        tools.register(GoodExclusiveTool);
+        let messages = run_serial_pair("bad_input_tool", "good_tool", tools).await;
+
+        let second = messages
+            .iter()
+            .find(|m| m.tool_call_id.as_deref() == Some("call_second"))
+            .expect("sibling result present");
+        assert!(
+            second.content.contains("GOOD_REAL_OUTPUT"),
+            "well-formed sibling was cancelled by an input-error peer: {:?}",
+            second.content
+        );
+        assert!(
+            !second
+                .content
+                .contains("cancelled due to earlier sibling error")
+        );
+
+        // And the input error's DETAIL reaches the model (#1690 repair hint).
+        let first = messages
+            .iter()
+            .find(|m| m.tool_call_id.as_deref() == Some("call_first"))
+            .expect("failed call result present");
+        assert!(
+            first.content.contains("missing field `target`"),
+            "input-error detail must reach the model: {:?}",
+            first.content
+        );
+    }
+
+    #[tokio::test]
+    async fn hard_error_still_cancels_sibling() {
+        // Contrapositive: a genuine execution error must STILL cascade so a
+        // real mid-batch failure stops dependent work.
+        let mut tools = ToolRegistry::new();
+        tools.register(HardErrorTool);
+        tools.register(GoodExclusiveTool);
+        let messages = run_serial_pair("hard_error_tool", "good_tool", tools).await;
+
+        let second = messages
+            .iter()
+            .find(|m| m.tool_call_id.as_deref() == Some("call_second"))
+            .expect("sibling result present");
+        assert!(
+            second
+                .content
+                .contains("cancelled due to earlier sibling error"),
+            "a genuine execution error must still cancel siblings: {:?}",
+            second.content
+        );
     }
 
     #[tokio::test]

@@ -2046,24 +2046,50 @@ fn build_subagent_tool_policy(
     }
 }
 
+/// Preflight the child's allow-list against what is actually registered.
+///
+/// `strict` distinguishes who asked for the tools:
+/// - `true`  — the CALLER named them explicitly (inline `allowed_tools`). An
+///   absent one is a hard error (a typo, or the wrong host): return `Err`.
+/// - `false` — a role template or manifest SUGGESTED them (they only fill the
+///   allow-list when the caller left it empty). Some are runtime-gated — e.g.
+///   the `reviewer` role lists `recall_memory` / `synthesize_research`, which
+///   need a memory-store / research provider — so an unwired one must be
+///   dropped-with-a-warning, not fail the whole spawn (the mini4 reviewer-role
+///   failure: the role required tools that aren't wired on that host).
 fn ensure_subagent_tools_available(
     tools: &ToolRegistry,
     allowed_tools: &[String],
+    strict: bool,
 ) -> std::result::Result<(), String> {
     // RFC-0 (#1289): tool deferral was removed — every registered tool is
-    // available. Just verify the allowed tools are actually present.
+    // available. Verify the requested CONCRETE tools are present. Skip policy
+    // EXPRESSIONS — `group:*` named groups and `*` wildcards — which are
+    // allow-list patterns that expand against whatever is registered rather
+    // than concrete tool names: `tools.get("group:fs")` is always None, so a
+    // caller / role template using group tokens would otherwise be falsely
+    // rejected as "not available on this host" (#1689).
     let missing = allowed_tools
         .iter()
+        .filter(|entry| !entry.starts_with("group:") && !entry.contains('*'))
         .filter(|tool_name| tools.get(tool_name).is_none())
         .cloned()
         .collect::<Vec<_>>();
     if missing.is_empty() {
         Ok(())
-    } else {
+    } else if strict {
         Err(format!(
             "required tool(s) not available on this host: {}",
             missing.join(", ")
         ))
+    } else {
+        // Role-/manifest-suggested tools that aren't wired here: drop and run
+        // with whatever IS available rather than failing the spawn.
+        warn!(
+            dropped = %missing.join(", "),
+            "subagent role/manifest suggested tools not available on this host; dropping them and proceeding"
+        );
+        Ok(())
     }
 }
 
@@ -2701,8 +2727,24 @@ impl Tool for SpawnTool {
             });
         }
 
-        let mut input: Input =
-            serde_json::from_value(args.clone()).wrap_err("invalid spawn tool input")?;
+        // #1690: surface the serde detail AND the schema so the model can
+        // self-repair next turn, and return a typed `ToolInputError` — a
+        // no-side-effect failure that must NOT cancel well-formed sibling
+        // spawns in a serial batch (see the M8.8 cascade in `execution.rs`).
+        let mut input: Input = serde_json::from_value(args.clone()).map_err(|e| {
+            super::ToolInputError::new(format!(
+                "invalid spawn tool input: {e}. Required: `task` (string — the \
+                 worker's instructions). Optional: `allowed_tools` (string[], \
+                 e.g. [\"group:fs\",\"shell\"]), `role`, `mode` \
+                 (\"background\"|\"sync\"), `context`, `model`, `label`."
+            ))
+        })?;
+        // Bug A (reviewer-role preflight): capture whether the CALLER named the
+        // tools before a manifest / role template can fill the allow-list (they
+        // only fill it when it is empty). A caller-explicit tool that is absent
+        // hard-fails the spawn; a role-/manifest-suggested one that is unwired
+        // is dropped with a warning (see `ensure_subagent_tools_available`).
+        let allow_list_is_caller_explicit = !input.allowed_tools.is_empty();
         // M8.2: if the caller referenced an AgentDefinition manifest by id,
         // layer the manifest's fields onto the inline Input with "inline
         // wins" semantics. Unknown ids are a hard error — silently ignoring
@@ -2726,6 +2768,12 @@ impl Tool for SpawnTool {
             None => input.task.clone(),
         };
 
+        // An inline list, a manifest (`apply_agent_definition`), and a role
+        // template (`apply_role_template`) have each had their chance to fill
+        // `allowed_tools`. Empty here means the caller deliberately left the
+        // worker unconstrained (every builtin) — honor that; do not synthesize
+        // a default surface (tool count is not what makes a worker fail —
+        // see the benchmark refutation on #1689).
         let allowed_tools = input.allowed_tools.clone();
         // Effective allow-list = `allowed_tools` minus the manifest's
         // `disallowed_tools`, for the two consumers that cannot apply the local
@@ -3424,8 +3472,12 @@ impl Tool for SpawnTool {
             // Preflight against the EFFECTIVE (post-deny) allow-list: a tool
             // the manifest forbids must not gate the spawn on availability,
             // since the policy below denies it regardless (codex P2).
-            ensure_subagent_tools_available(&tools, &effective_allowed_tools)
-                .map_err(|error| eyre::eyre!(error))?;
+            ensure_subagent_tools_available(
+                &tools,
+                &effective_allowed_tools,
+                allow_list_is_caller_explicit,
+            )
+            .map_err(|error| eyre::eyre!(error))?;
             let policy = build_subagent_tool_policy(
                 allowed_tools,
                 manifest_disallowed_tools,
@@ -4009,9 +4061,12 @@ impl Tool for SpawnTool {
                 // Preflight against the EFFECTIVE (post-deny) allow-list —
                 // mirror the sync path so a manifest-forbidden tool that is
                 // absent from this registry does not fail the spawn (codex P2).
-                let availability_check =
-                    ensure_subagent_tools_available(&tools, &effective_allowed_tools)
-                        .map_err(|error| eyre::eyre!(error));
+                let availability_check = ensure_subagent_tools_available(
+                    &tools,
+                    &effective_allowed_tools,
+                    allow_list_is_caller_explicit,
+                )
+                .map_err(|error| eyre::eyre!(error));
                 let policy = build_subagent_tool_policy(
                     allowed_tools,
                     manifest_disallowed_tools,
@@ -5768,18 +5823,107 @@ mod tests {
         // RFC-0 (#1289): `shell` is always registered and visible — no
         // deferral to un-hide.
         assert!(tools.specs().iter().any(|spec| spec.name == "shell"));
-        ensure_subagent_tools_available(&tools, &[String::from("shell")]).unwrap();
+        ensure_subagent_tools_available(&tools, &[String::from("shell")], true).unwrap();
     }
 
     #[test]
     fn subagent_tool_preflight_reports_missing_allowed_tool() {
         let tools = ToolRegistry::with_builtins("/tmp");
 
-        let error = ensure_subagent_tools_available(&tools, &[String::from("podcast_generate")])
-            .unwrap_err();
+        let error =
+            ensure_subagent_tools_available(&tools, &[String::from("podcast_generate")], true)
+                .unwrap_err();
 
         assert!(error.contains("required tool(s) not available on this host"));
         assert!(error.contains("podcast_generate"));
+    }
+
+    #[test]
+    fn preflight_skips_group_and_wildcard_tokens() {
+        // #1689 (retained sub-fix): `group:*` / `*` are policy EXPRESSIONS,
+        // not concrete tool names — `tools.get("group:fs")` is always None —
+        // so they must be skipped, not reported "not available on this host".
+        // Otherwise any role / caller using group tokens could never spawn.
+        let tools = ToolRegistry::with_builtins("/tmp");
+        ensure_subagent_tools_available(
+            &tools,
+            &["group:fs".into(), "group:web".into(), "exec*".into()],
+            true,
+        )
+        .expect("group / wildcard tokens must not be treated as missing tools");
+
+        // A concrete missing tool alongside a group token is still reported —
+        // but only the concrete name.
+        let err = ensure_subagent_tools_available(
+            &tools,
+            &["group:fs".into(), "definitely_not_a_tool".into()],
+            true,
+        )
+        .unwrap_err();
+        assert!(err.contains("definitely_not_a_tool"));
+        assert!(!err.contains("group:fs"));
+    }
+
+    #[test]
+    fn preflight_soft_drops_suggested_missing_tools_but_hard_fails_caller_named() {
+        // Bug A (reviewer-role preflight): when the allow-list came from a role
+        // template / manifest (strict = false), a tool that isn't wired here —
+        // like the reviewer role's runtime-gated recall_memory /
+        // synthesize_research — must be DROPPED with a warning, not fail the
+        // spawn. The SAME missing tool is a hard error when the caller named it.
+        let tools = ToolRegistry::with_builtins("/tmp");
+        let list = [
+            String::from("read_file"),
+            String::from("definitely_not_a_tool"),
+        ];
+
+        ensure_subagent_tools_available(&tools, &list, false)
+            .expect("role/manifest-suggested missing tools must be dropped, not fail the spawn");
+
+        let err = ensure_subagent_tools_available(&tools, &list, true).unwrap_err();
+        assert!(err.contains("definitely_not_a_tool"));
+    }
+
+    #[tokio::test]
+    async fn reviewer_role_spawn_does_not_fail_on_unwired_role_tools() {
+        // Bug A end-to-end (the exact mini4 reviewer failure): a
+        // `role: "reviewer"` spawn with no inline allowed_tools has the role
+        // template fill the allow-list with `recall_memory` / `synthesize_research`
+        // — runtime-gated tools that are NOT registered without a memory /
+        // research provider. Before the fix the availability preflight
+        // hard-failed with "not available on this host: ... recall_memory,
+        // synthesize_research". Now those role-SUGGESTED tools are dropped and
+        // the spawn runs.
+        let (in_tx, _in_rx) = tokio::sync::mpsc::channel(16);
+        let tool = SpawnTool::new(
+            Arc::new(MockProvider),
+            Arc::new(create_test_store().await),
+            PathBuf::from("/tmp"),
+            in_tx,
+        );
+
+        let result = tool
+            .execute(&serde_json::json!({
+                "task": "review the diff",
+                "label": "reviewer",
+                "mode": "sync",
+                "role": "reviewer"
+                // no allowed_tools — the role template fills it with tools that
+                // include unwired recall_memory / synthesize_research
+            }))
+            .await
+            .unwrap();
+
+        assert!(
+            !result.output.contains("not available on this host"),
+            "the preflight must not hard-fail on role-suggested unwired tools: {}",
+            result.output
+        );
+        assert!(
+            result.success,
+            "reviewer-role spawn must run despite unwired role tools: {}",
+            result.output
+        );
     }
 
     struct StaticTestTool {
@@ -7083,13 +7227,13 @@ PY
         // The OLD ordering (preflight on the raw allow-list) rejects the spawn
         // because `podcast_generate` is not available on this host:
         assert!(
-            ensure_subagent_tools_available(&tools, &allowed).is_err(),
+            ensure_subagent_tools_available(&tools, &allowed, true).is_err(),
             "sanity: the unfiltered allow-list still trips the missing-tool guard"
         );
         // The FIX: preflight the EFFECTIVE set — the forbidden-and-missing tool
         // is gone, so the otherwise-valid `shell`-only spawn is admitted.
         let effective = effective_allowed_tools(&allowed, &disallowed);
-        ensure_subagent_tools_available(&tools, &effective)
+        ensure_subagent_tools_available(&tools, &effective, true)
             .expect("a disallowed-and-missing tool must not fail the preflight");
     }
 
