@@ -42,7 +42,7 @@ pub(crate) const CODING_SUBAGENT_ALIASES_CAPABILITY_V1: &str = "coding.subagent_
 // `image_view` and `dynamic_tool_search` are wired in by #972 / M14-B P1 and
 // are advertised whenever the server's `with_builtins` registers
 // `view_image`, `tool_search`, and `tool_suggest` (see
-// `ui_protocol::derived_capabilities`).
+// `ui_protocol_transport::derived_capabilities`).
 //
 // `image_generation` has no native or skill backend bound to it yet, so the
 // constant exists for vocabulary parity but the capability is not
@@ -556,7 +556,7 @@ const OCTOS_TOOL_SPECS: &[OctosToolSpec] = &[
     // complete; the tool currently returns `coding_tool_unsupported` for
     // every call because no native or skill backend is bound yet. The
     // `coding.image_generation.v1` capability is intentionally NOT
-    // advertised in `ui_protocol::advertised_capabilities` so clients
+    // advertised in `ui_protocol_transport::advertised_capabilities` so clients
     // don't render it as usable (UPCR-2026-020 §5: capability-gated
     // fields are omitted when the implementation isn't bound). Follow-up
     // to wire a real backend tracked in #1149.

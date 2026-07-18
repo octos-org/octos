@@ -369,7 +369,7 @@ fn context_manager_status_value(manager: &ContextManager) -> serde_json::Value {
 
 fn publish_context_manager_status(session_key: &SessionKey, manager: &ContextManager) {
     #[cfg(feature = "api")]
-    crate::api::ui_protocol::update_session_context_status(
+    crate::api::ui_protocol_transport::update_session_context_status(
         session_key,
         context_manager_status_value(manager),
     );
@@ -553,7 +553,7 @@ fn record_prompt_messages_not_covered_by_context(
             continue;
         }
         // Mirror of the same exemption in
-        // `api::ui_protocol::record_prompt_messages_not_covered_by_context`:
+        // `api::ui_protocol_transport::record_prompt_messages_not_covered_by_context`:
         // skip System messages. The agent's runtime System prompt is
         // re-composed on every turn and prepended fresh to
         // `messages[0]`; recording it here makes the manager stack one
@@ -733,7 +733,7 @@ impl PromptContextManager for SessionActorPromptContextBridge {
 
         // Capture runtime System once per turn at TurnStart, reuse on
         // every Iteration. See the AppUI analogue in
-        // `api::ui_protocol::AppUiPromptContextBridge::prepare_prompt`
+        // `api::ui_protocol_transport::AppUiPromptContextBridge::prepare_prompt`
         // for the duplication concern that motivates the cache.
         if request.phase == PromptContextPhase::TurnStart {
             scratch.runtime_system = messages
@@ -757,7 +757,7 @@ impl PromptContextManager for SessionActorPromptContextBridge {
             // multi-System payloads produced here would reach the
             // provider unmerged. Anthropic in particular rejects them
             // outright. See the AppUI analogue in
-            // `api::ui_protocol::AppUiPromptContextBridge::prepare_prompt`
+            // `api::ui_protocol_transport::AppUiPromptContextBridge::prepare_prompt`
             // for the rationale.
             match messages.first_mut() {
                 Some(first) if first.role == MessageRole::System => {

@@ -109,7 +109,7 @@ async fn gateway_running(state: &AppState, profile_id: &str) -> bool {
 /// it holds the store in memory and its next save would silently
 /// overwrite a bare file edit.
 fn live_cron_service(state: &AppState, profile_id: &str) -> Option<Arc<CronService>> {
-    crate::api::ui_protocol::resolve_session_profile_runtime(state, Some(profile_id))
+    crate::api::ui_protocol_transport::resolve_session_profile_runtime(state, Some(profile_id))
         .and_then(|runtime| runtime.cron_service.clone())
 }
 
