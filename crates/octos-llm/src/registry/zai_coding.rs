@@ -10,14 +10,14 @@ use super::{CreateParams, ProviderEntry};
 /// Z.AI **GLM Coding Plan** family. Like the regular `zai` family it speaks the
 /// Anthropic Messages protocol against `https://api.z.ai/api/anthropic` (the
 /// Claude-Code integration endpoint), but it defaults to the GLM coding model
-/// (`glm-4.6`) and takes the coding-plan key, so the plan is a first-class,
+/// (`glm-5.2`) and takes the coding-plan key, so the plan is a first-class,
 /// pre-wired option rather than a manual base-url + model override. Validated
-/// end-to-end (`glm-4.6` completes turns through this family); a profile route
+/// end-to-end (`glm-5.2` completes turns through this family); a profile route
 /// can still override `base_url` / `model` for a different GLM coding model.
 pub const ENTRY: ProviderEntry = ProviderEntry {
     name: "zai-coding",
     aliases: &["z.ai-coding", "glm-coding"],
-    default_model: Some("glm-4.6"),
+    default_model: Some("glm-5.2"),
     api_key_env: Some("ZAI_CODING_API_KEY"),
     key_env_aliases: &["ZAI_API_KEY"],
     default_base_url: Some("https://api.z.ai/api/anthropic"),
@@ -35,7 +35,7 @@ fn create(p: CreateParams) -> Result<Arc<dyn LlmProvider>> {
     let key = p
         .api_key
         .ok_or_else(|| eyre::eyre!("ZAI_CODING_API_KEY (Z.AI GLM coding plan) not set"))?;
-    let model = p.model.unwrap_or_else(|| "glm-4.6".into());
+    let model = p.model.unwrap_or_else(|| "glm-5.2".into());
     let url = p
         .base_url
         .unwrap_or_else(|| "https://api.z.ai/api/anthropic".into());

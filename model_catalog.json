@@ -2029,7 +2029,7 @@
       ]
     },
     {
-      "provider": "zai-coding/glm-4.6",
+      "provider": "zai-coding/glm-5.2",
       "type": "strong",
       "stability": 1.0,
       "tool_avg_ms": 0,
