@@ -1458,6 +1458,71 @@ async fn should_not_burn_retry_budget_on_progress_rounds() {
 }
 
 #[tokio::test]
+async fn should_dispatch_through_cli_backend_with_retry_on_nonzero_exit() {
+    // The CLI backend lane end-to-end through the real dispatcher: a
+    // one-shot script that fails on its first invocation (non-zero
+    // exit → RemoteError → retryable) and echoes the prompt on the
+    // retry. Proves exit-code → outcome classification drives the
+    // swarm retry loop exactly like MCP isError does.
+    use octos_agent::tools::mcp_agent::{CliAgentBackend, McpAgentBackendConfig};
+
+    let script_dir = tempfile::tempdir().unwrap();
+    let marker = script_dir.path().join("attempted");
+    let script_path = script_dir.path().join("flaky-cli.sh");
+    std::fs::write(
+        &script_path,
+        format!(
+            "#!/bin/sh\nif [ ! -f {marker} ]; then\n  touch {marker}\n  echo 'transient' >&2\n  exit 1\nfi\nprintf 'cli-answer:%s' \"$1\"\n",
+            marker = marker.display()
+        ),
+    )
+    .unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&script_path).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script_path, perms).unwrap();
+    }
+
+    let backend = Arc::new(
+        CliAgentBackend::from_config(&McpAgentBackendConfig::Cli {
+            cmd: script_path.display().to_string(),
+            args: Vec::new(),
+            env: HashMap::new(),
+            dispatch_timeout_secs: Some(10),
+            prompt_via_stdin: false,
+        })
+        .unwrap(),
+    );
+
+    let state_dir = tempfile::tempdir().unwrap();
+    let swarm = Swarm::builder(backend, state_dir.path())
+        .build()
+        .await
+        .unwrap();
+    let result = swarm
+        .dispatch(
+            "d-cli",
+            vec![ContractSpec {
+                contract_id: "c1".into(),
+                tool_name: "ignored".into(),
+                task: serde_json::json!({ "prompt": "do the thing" }),
+                label: None,
+            }],
+            SwarmTopology::Sequential,
+            SwarmBudget::default(),
+            context(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(result.outcome, SwarmOutcomeKind::Success);
+    let subtask = &result.per_task_outcomes[0];
+    assert_eq!(subtask.attempts, 2, "first attempt fails, retry succeeds");
+    assert_eq!(subtask.output, "cli-answer:do the thing");
+}
+
+#[tokio::test]
 async fn should_record_cost_attribution_via_ledger_stub() {
     use octos_swarm::{CostLedger, SwarmCostAttribution};
 
