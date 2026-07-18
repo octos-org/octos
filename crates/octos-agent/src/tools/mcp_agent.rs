@@ -614,12 +614,26 @@ async fn perform_stdio_handshake_and_call(
             format!("MCP initialize write failed: {error}"),
         )
     })?;
-    let _init = read_json_rpc_response(&mut reader).await.map_err(|error| {
-        (
-            DispatchOutcome::ProtocolError,
-            format!("MCP initialize response invalid: {error}"),
-        )
-    })?;
+    let _init = read_json_rpc_response(&mut reader, 1)
+        .await
+        .map_err(|error| {
+            (
+                DispatchOutcome::ProtocolError,
+                format!("MCP initialize response invalid: {error}"),
+            )
+        })?;
+
+    // Spec-required handshake completion. Real servers (codex
+    // mcp-server) are within their rights to hold requests until this
+    // arrives; lenient ones ignore duplicates.
+    send_json_rpc_notification(&mut stdin, "notifications/initialized")
+        .await
+        .map_err(|error| {
+            (
+                DispatchOutcome::TransportError,
+                format!("MCP initialized notification write failed: {error}"),
+            )
+        })?;
 
     let mut call_params = serde_json::json!({
         "name": request.tool_name,
@@ -637,12 +651,14 @@ async fn perform_stdio_handshake_and_call(
             )
         })?;
 
-    let response = read_json_rpc_response(&mut reader).await.map_err(|error| {
-        (
-            DispatchOutcome::ProtocolError,
-            format!("MCP tools/call response invalid: {error}"),
-        )
-    })?;
+    let response = read_json_rpc_response(&mut reader, 2)
+        .await
+        .map_err(|error| {
+            (
+                DispatchOutcome::ProtocolError,
+                format!("MCP tools/call response invalid: {error}"),
+            )
+        })?;
 
     Ok(parse_tools_call_response(response))
 }
@@ -665,31 +681,87 @@ async fn send_json_rpc(
     stdin.flush().await
 }
 
-async fn read_json_rpc_response(
-    reader: &mut BufReader<ChildStdout>,
-) -> std::result::Result<serde_json::Value, String> {
-    let line = read_line_limited(reader, MAX_LINE_BYTES)
-        .await
-        .map_err(|error| error.to_string())?;
-    let envelope: serde_json::Value = serde_json::from_str(&line)
-        .map_err(|error| format!("invalid JSON-RPC response: {error}"))?;
-
-    if let Some(err) = envelope.get("error").and_then(|v| v.as_object()) {
-        let code = err.get("code").and_then(|v| v.as_i64()).unwrap_or(-32603);
-        let message = err
-            .get("message")
-            .and_then(|v| v.as_str())
-            .unwrap_or("unknown error");
-        return Err(format!("remote error {code}: {message}"));
-    }
-
-    envelope
-        .get("result")
-        .cloned()
-        .ok_or_else(|| "JSON-RPC response missing 'result'".to_string())
+/// Fire-and-forget JSON-RPC notification (no `id`, no response).
+async fn send_json_rpc_notification(stdin: &mut ChildStdin, method: &str) -> std::io::Result<()> {
+    let request = serde_json::json!({
+        "jsonrpc": "2.0",
+        "method": method,
+    });
+    let mut line = serde_json::to_string(&request).map_err(std::io::Error::other)?;
+    line.push('\n');
+    stdin.write_all(line.as_bytes()).await?;
+    stdin.flush().await
 }
 
-async fn read_line_limited(reader: &mut BufReader<ChildStdout>, limit: usize) -> Result<String> {
+/// Frames a server may interleave before the response the client is
+/// waiting for. Bounded so a server spraying notifications cannot pin
+/// the read loop forever (the dispatch wallclock timeout is the outer
+/// guard; this is the inner sanity bound).
+const MAX_SKIPPED_FRAMES: usize = 10_000;
+
+/// Read frames until the response for `expect_id` arrives. Real MCP
+/// servers interleave notifications on stdout — codex mcp-server
+/// streams `codex/event` frames while a session runs — and the old
+/// single-line read treated the first such frame as a protocol error.
+/// Notifications (a `method`, no `id`) and server-initiated requests
+/// (a `method` AND an `id`) are skipped; requests are logged since an
+/// unanswered blocking request (e.g. an elicitation) will surface as a
+/// dispatch timeout rather than a hang.
+async fn read_json_rpc_response<R: tokio::io::AsyncRead + Unpin>(
+    reader: &mut BufReader<R>,
+    expect_id: u64,
+) -> std::result::Result<serde_json::Value, String> {
+    for _ in 0..MAX_SKIPPED_FRAMES {
+        let line = read_line_limited(reader, MAX_LINE_BYTES)
+            .await
+            .map_err(|error| error.to_string())?;
+        let envelope: serde_json::Value = serde_json::from_str(&line)
+            .map_err(|error| format!("invalid JSON-RPC response: {error}"))?;
+
+        if envelope.get("method").is_some() {
+            if let Some(id) = envelope.get("id") {
+                warn!(
+                    method = envelope["method"].as_str().unwrap_or("?"),
+                    id = %id,
+                    "skipping server-initiated MCP request; if the server blocks on it \
+                     the dispatch will time out"
+                );
+            }
+            continue;
+        }
+
+        let matches_expected = envelope
+            .get("id")
+            .and_then(|v| v.as_u64())
+            .is_some_and(|id| id == expect_id);
+        if !matches_expected {
+            // Response to some other id (stale or duplicate) — skip.
+            continue;
+        }
+
+        if let Some(err) = envelope.get("error").and_then(|v| v.as_object()) {
+            let code = err.get("code").and_then(|v| v.as_i64()).unwrap_or(-32603);
+            let message = err
+                .get("message")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown error");
+            return Err(format!("remote error {code}: {message}"));
+        }
+
+        return envelope
+            .get("result")
+            .cloned()
+            .ok_or_else(|| "JSON-RPC response missing 'result'".to_string());
+    }
+    Err(format!(
+        "no response for id {expect_id} within {MAX_SKIPPED_FRAMES} frames"
+    ))
+}
+
+async fn read_line_limited<R: tokio::io::AsyncRead + Unpin>(
+    reader: &mut BufReader<R>,
+    limit: usize,
+) -> Result<String> {
     let mut buf = Vec::with_capacity(4096);
     loop {
         let available = reader.fill_buf().await?;
@@ -1183,6 +1255,57 @@ mod tests {
             serde_json::json!({"task": "review"})
         );
         assert!(request.meta_payload().is_none());
+    }
+
+    /// Real MCP servers (codex mcp-server) interleave `codex/event`
+    /// notifications on stdout while a session runs. The reader must
+    /// skip them and return the response frame for the expected id.
+    #[tokio::test]
+    async fn read_response_skips_notification_frames() {
+        let stream = concat!(
+            "{\"jsonrpc\":\"2.0\",\"method\":\"codex/event\",\"params\":{\"msg\":\"thinking\"}}\n",
+            "{\"jsonrpc\":\"2.0\",\"method\":\"codex/event\",\"params\":{\"msg\":\"running\"}}\n",
+            "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"done\"}]}}\n",
+        );
+        let mut reader = BufReader::new(stream.as_bytes());
+        let result = read_json_rpc_response(&mut reader, 2)
+            .await
+            .expect("response after notifications");
+        assert_eq!(result["content"][0]["text"], "done");
+    }
+
+    /// A server-initiated request (has both `method` and `id`) must be
+    /// skipped, not mistaken for our response — and a response for a
+    /// DIFFERENT id must not satisfy the wait.
+    #[tokio::test]
+    async fn read_response_skips_server_requests_and_foreign_ids() {
+        let stream = concat!(
+            "{\"jsonrpc\":\"2.0\",\"id\":77,\"method\":\"elicitation/create\",\"params\":{}}\n",
+            "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"stale\":true}}\n",
+            "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"fresh\":true}}\n",
+        );
+        let mut reader = BufReader::new(stream.as_bytes());
+        let result = read_json_rpc_response(&mut reader, 2)
+            .await
+            .expect("expected-id response");
+        assert_eq!(result["fresh"], true);
+    }
+
+    /// Error envelopes for the expected id still surface as errors.
+    #[tokio::test]
+    async fn read_response_surfaces_remote_error_for_expected_id() {
+        let stream = concat!(
+            "{\"jsonrpc\":\"2.0\",\"method\":\"codex/event\",\"params\":{}}\n",
+            "{\"jsonrpc\":\"2.0\",\"id\":2,\"error\":{\"code\":-32000,\"message\":\"boom\"}}\n",
+        );
+        let mut reader = BufReader::new(stream.as_bytes());
+        let error = read_json_rpc_response(&mut reader, 2)
+            .await
+            .expect_err("error envelope");
+        assert!(
+            error.contains("-32000") && error.contains("boom"),
+            "{error}"
+        );
     }
 
     /// #1021 / M17-C — backend_kind, agent_id, and risk are all
