@@ -4784,8 +4784,13 @@ mod tests {
                  got {allowed:?}"
             );
         }
-        // And the reviewer's deny set MUST NOT leak through.
-        for forbidden in ["write_file", "edit_file", "shell", "exec_command"] {
+        // A reviewer WRITES its report, so `write_file` is present...
+        assert!(
+            allowed.contains(&"write_file"),
+            "reviewer spawn payload must include write_file (its report writer); got {allowed:?}"
+        );
+        // ...but the code-patching / exec tools MUST NOT leak through.
+        for forbidden in ["edit_file", "shell", "exec_command"] {
             assert!(
                 !allowed.contains(&forbidden),
                 "reviewer spawn payload MUST NOT include {forbidden:?} after \

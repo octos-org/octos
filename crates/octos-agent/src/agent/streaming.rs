@@ -430,6 +430,32 @@ impl Agent {
                 }),
                 Err(e) => {
                     let truncated_raw = octos_core::truncated_utf8(&args, 200, "...");
+                    // #1712: distinguish a TRUNCATED call from a genuinely
+                    // malformed one. When the turn hit the output token cap
+                    // (`finish_reason=length` → StopReason::MaxTokens), the
+                    // model was cut off mid-call — the JSON is an unterminated
+                    // prefix, not a syntax error. That is retryable
+                    // (StreamError::TruncatedToolCall): the retry machinery
+                    // re-requests instead of the non-retryable MalformedArgs
+                    // killing the turn (which, for a background task with no
+                    // "next turn", is instant death). A parse failure after a
+                    // CLEAN finish stays MalformedArgs — the #1355 invariant
+                    // (let the model see the diagnostic and self-correct) is
+                    // preserved.
+                    if stop_reason == StopReason::MaxTokens {
+                        tracing::warn!(
+                            tool = %name,
+                            tool_id = %id,
+                            error = %e,
+                            raw = %truncated_raw,
+                            "truncated tool call JSON (output token cap hit mid-call) — surfacing as retryable StreamError::TruncatedToolCall (#1712)"
+                        );
+                        return Err(eyre::Report::new(StreamError::TruncatedToolCall {
+                            tool_id: id,
+                            tool_name: name,
+                            error: format!("{e} (raw: {truncated_raw})"),
+                        }));
+                    }
                     tracing::warn!(
                         tool = %name,
                         tool_id = %id,
@@ -1074,6 +1100,48 @@ mod tests {
         assert!(
             !typed.is_retryable(),
             "MalformedArgs must NOT be retryable — the model needs to see the diagnostic"
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_truncated_toolcall_at_max_tokens_is_retryable() {
+        // #1712: the SAME unparseable-args condition, but the stream finished
+        // because it hit the output token cap (Done(MaxTokens)) — the JSON is a
+        // truncated prefix, not a model bug. It must surface as the RETRYABLE
+        // `TruncatedToolCall`, not the non-retryable `MalformedArgs`, so a
+        // background task retries instead of dying.
+        let (agent, _dir) = build_test_agent().await;
+
+        let stream = into_chat_stream(vec![
+            StreamEvent::ToolCallDelta {
+                index: 0,
+                id: Some("write_file_26".to_string()),
+                name: Some("write_file".to_string()),
+                // Truncated mid-string: a valid prefix cut off by the cap.
+                arguments_delta: "{\"path\":\"r.md\",\"content\":\"# Review\nline".to_string(),
+            },
+            StreamEvent::Usage(LlmTokenUsage::default()),
+            StreamEvent::Done(StopReason::MaxTokens),
+        ]);
+
+        let result = agent
+            .consume_stream_with_input_estimate(stream, 1, 100)
+            .await;
+
+        let err = result.expect_err("truncated args must surface as Err");
+        let typed = as_stream_error(&err).expect("err must be StreamError typed");
+        match typed {
+            StreamError::TruncatedToolCall {
+                tool_id, tool_name, ..
+            } => {
+                assert_eq!(tool_id, "write_file_26");
+                assert_eq!(tool_name, "write_file");
+            }
+            other => panic!("expected TruncatedToolCall, got {other:?}"),
+        }
+        assert!(
+            typed.is_retryable(),
+            "TruncatedToolCall MUST be retryable — the model was cut off, not wrong"
         );
     }
 

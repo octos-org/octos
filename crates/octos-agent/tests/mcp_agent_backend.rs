@@ -41,6 +41,12 @@ read init
 # Respond to initialize
 printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"serverInfo":{"name":"fake"}}}'
 read call
+# Spec-compliant clients send notifications/initialized between the
+# initialize response and the first request; skip notification frames
+# (no "id") until the actual tools/call arrives.
+while printf '%s' "$call" | grep -q '"method":"notifications/'; do
+  read call
+done
 # Extract the tool name out of the call for assertion.
 tool=$(printf '%s' "$call" | sed -n 's/.*"name":"\([^"]*\)".*/\1/p')
 printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"fake-agent:$tool\"}],\"files_to_send\":[\"/tmp/artifact.md\"]}}"

@@ -40,6 +40,31 @@ use octos_core::TokenUsage;
 use crate::progress::ProgressReporter;
 use octos_core::{PathClassification, SessionScope};
 
+/// Error a tool returns when the MODEL supplied malformed arguments — a schema
+/// / deserialize failure, as opposed to a genuine execution error. Such
+/// failures have no side effects, so the serial-batch (M8.8) scheduler treats
+/// them as NON-cascading: one malformed call must not cancel its well-formed
+/// siblings (#1690). The `Display` text is delivered verbatim to the model, so
+/// callers should include the underlying detail plus a schema hint the model
+/// can use to self-repair on the next turn.
+#[derive(Debug, Clone)]
+pub struct ToolInputError(String);
+
+impl ToolInputError {
+    /// Build an input-validation error from a model-facing message.
+    pub fn new(message: impl Into<String>) -> Self {
+        Self(message.into())
+    }
+}
+
+impl std::fmt::Display for ToolInputError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for ToolInputError {}
+
 /// Registry of [`AgentDefinition`]-style manifests available to tools.
 ///
 /// Re-exported from [`crate::agents`] where the schema and loader live. M8.2
