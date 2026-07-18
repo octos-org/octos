@@ -8,6 +8,7 @@
 
 pub mod cli_agent_adapter;
 pub mod compaction;
+pub mod config_context;
 pub mod persona_service;
 pub mod soul_service;
 pub mod tenant;

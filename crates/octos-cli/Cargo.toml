@@ -172,6 +172,7 @@ octos-llm = { workspace = true, features = ["test-utils"] }
 # the `api::ui_protocol_audit` alias) to octos-cli's tests. Production builds
 # don't see it; only `cargo test -p octos-cli`.
 octos-store = { workspace = true, features = ["test-util"] }
+octos-services = { workspace = true, features = ["test-util"] }
 tokio-tungstenite.workspace = true
 
 [[test]]
