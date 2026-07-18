@@ -36,8 +36,6 @@ pub(crate) mod supervisor_store;
 pub mod swarm;
 pub(crate) mod ui_protocol;
 mod ui_protocol_alpha2_bridge;
-mod ui_protocol_alpha3_bridge;
-mod ui_protocol_alpha4_bridge;
 mod ui_protocol_alpha9_bridge;
 mod ui_protocol_approvals;
 // Relocated to crate::approvals_audit (Phase 4, ROBRIX-PHASE4 ADR) so the
