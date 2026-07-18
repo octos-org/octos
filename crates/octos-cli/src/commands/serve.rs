@@ -1689,7 +1689,10 @@ mod tests {
                         smtp_host: Some("smtp.gmail.com".into()),
                         smtp_port: Some(587),
                         username: Some("dspfac@gmail.com".into()),
-                        password_env: Some("eqepkfbyfymwfhnv".into()),
+                        // Env var NAME, not a password. This field previously
+                        // held a 16-lowercase-char literal — the exact shape of
+                        // a Gmail App Password — next to a real gmail username.
+                        password_env: Some("SMTP_PASSWORD".into()),
                         password: Some("app-password".into()),
                         from_address: Some("dspfac@gmail.com".into()),
                         feishu_app_id: None,
