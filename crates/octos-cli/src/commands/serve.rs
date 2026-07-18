@@ -282,18 +282,26 @@ pub struct ServeCommand {
     pub no_retry: bool,
 
     /// ── swarm ── (M7.6 contract-authoring dashboard)
-    /// Backend transport for the swarm MCP agent. When unset the
+    /// Backend transport for the swarm agent. When unset the
     /// `/api/swarm/*` endpoints return 503 (legacy opt-out behaviour).
-    /// `stdio` pairs with `--swarm-backend-cmd`; `http` pairs with
-    /// `--swarm-backend-url`.
-    #[arg(long, value_name = "stdio|http")]
+    /// `stdio` (MCP subprocess) and `cli` (one-shot headless CLI, e.g.
+    /// `claude -p` / `codex exec`) pair with `--swarm-backend-cmd`;
+    /// `http` pairs with `--swarm-backend-url`.
+    #[arg(long, value_name = "stdio|http|cli")]
     pub swarm_backend: Option<String>,
 
-    /// Stdio MCP agent executable (e.g. `claude`). Required when
-    /// `--swarm-backend stdio` is set. Forwarded to
-    /// [`octos_agent::tools::mcp_agent::StdioMcpAgent`].
+    /// Agent executable (e.g. `claude`). Required when
+    /// `--swarm-backend stdio` or `cli` is set. Forwarded to
+    /// [`octos_agent::tools::mcp_agent::StdioMcpAgent`] /
+    /// [`octos_agent::tools::mcp_agent::CliAgentBackend`].
     #[arg(long, value_name = "CMD")]
     pub swarm_backend_cmd: Option<String>,
+
+    /// Arguments passed to the backend executable before the prompt
+    /// (comma-separated, e.g. `-p` or `exec,--json`). Applies to the
+    /// `stdio` and `cli` backends.
+    #[arg(long, value_name = "ARGS", value_delimiter = ',')]
+    pub swarm_backend_args: Vec<String>,
 
     /// HTTPS URL for a remote MCP agent. Required when
     /// `--swarm-backend http` is set. Forwarded to
@@ -777,6 +785,7 @@ impl ServeCommand {
         let swarm_state_init = Self::build_swarm_state_from_flags(
             self.swarm_backend.as_deref(),
             self.swarm_backend_cmd.as_deref(),
+            &self.swarm_backend_args,
             self.swarm_backend_url.as_deref(),
             &data_dir,
             broadcaster.clone(),
@@ -1257,6 +1266,7 @@ impl ServeCommand {
     async fn build_swarm_state_from_flags(
         swarm_backend: Option<&str>,
         swarm_backend_cmd: Option<&str>,
+        swarm_backend_args: &[String],
         swarm_backend_url: Option<&str>,
         data_dir: &std::path::Path,
         broadcaster: Arc<crate::api::EventBroadcaster>,
@@ -1265,7 +1275,7 @@ impl ServeCommand {
     ) -> Result<Option<Arc<crate::api::SwarmState>>> {
         use octos_agent::cost_ledger::PersistentCostLedger;
         use octos_agent::tools::mcp_agent::{
-            HttpMcpAgent, McpAgentBackend, McpAgentBackendConfig, StdioMcpAgent,
+            CliAgentBackend, HttpMcpAgent, McpAgentBackend, McpAgentBackendConfig, StdioMcpAgent,
         };
 
         let Some(kind) = swarm_backend else {
@@ -1280,11 +1290,26 @@ impl ServeCommand {
                     ))?;
                 let config = McpAgentBackendConfig::Local {
                     cmd,
-                    args: Vec::new(),
+                    args: swarm_backend_args.to_vec(),
                     env: Default::default(),
                     dispatch_timeout_secs: None,
                 };
                 Arc::new(StdioMcpAgent::from_config(&config)?)
+            }
+            "cli" => {
+                let cmd = swarm_backend_cmd
+                    .map(str::to_owned)
+                    .ok_or_else(|| eyre::eyre!(
+                        "`--swarm-backend cli` requires `--swarm-backend-cmd <path>` (path to a one-shot agent CLI, e.g. `claude`)"
+                    ))?;
+                let config = McpAgentBackendConfig::Cli {
+                    cmd,
+                    args: swarm_backend_args.to_vec(),
+                    env: Default::default(),
+                    dispatch_timeout_secs: None,
+                    prompt_via_stdin: false,
+                };
+                Arc::new(CliAgentBackend::from_config(&config)?)
             }
             "http" => {
                 let url = swarm_backend_url
@@ -1303,7 +1328,9 @@ impl ServeCommand {
                 Arc::new(HttpMcpAgent::from_config(&config)?)
             }
             other => {
-                eyre::bail!("unknown --swarm-backend value `{other}` (expected `stdio` or `http`)");
+                eyre::bail!(
+                    "unknown --swarm-backend value `{other}` (expected `stdio`, `http`, or `cli`)"
+                );
             }
         };
 
@@ -1708,6 +1735,7 @@ mod tests {
         let state = ServeCommand::build_swarm_state_from_flags(
             None,
             None,
+            &[],
             None,
             dir.path(),
             broadcaster,
@@ -1734,6 +1762,7 @@ mod tests {
         let state = ServeCommand::build_swarm_state_from_flags(
             Some("stdio"),
             Some("/bin/cat"),
+            &[],
             None,
             dir.path(),
             broadcaster,
@@ -1758,6 +1787,60 @@ mod tests {
         let result = ServeCommand::build_swarm_state_from_flags(
             Some("stdio"),
             None,
+            &[],
+            None,
+            dir.path(),
+            broadcaster,
+            None,
+            None,
+        )
+        .await;
+        let err = match result {
+            Ok(_) => panic!("missing cmd must be rejected, got Ok"),
+            Err(e) => e,
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("--swarm-backend-cmd"),
+            "error must point at the missing flag, got: {msg}"
+        );
+    }
+
+    /// CLI backend: `--swarm-backend cli --swarm-backend-cmd <bin>`
+    /// builds a SwarmState around [`CliAgentBackend`]; args are
+    /// forwarded so `claude` + `-p` compose.
+    #[tokio::test]
+    async fn should_populate_swarm_state_for_cli_backend() {
+        let dir = tempfile::tempdir().unwrap();
+        let broadcaster = Arc::new(EventBroadcaster::new(16));
+        let state = ServeCommand::build_swarm_state_from_flags(
+            Some("cli"),
+            Some("/bin/echo"),
+            &["-n".to_string()],
+            None,
+            dir.path(),
+            broadcaster,
+            None,
+            None,
+        )
+        .await
+        .expect("helper must succeed when cli backend is configured");
+        assert!(
+            state.is_some(),
+            "swarm state must be Some with --swarm-backend cli"
+        );
+    }
+
+    /// CLI backend without `--swarm-backend-cmd` fails at startup like
+    /// the stdio variant.
+    #[tokio::test]
+    async fn should_reject_cli_backend_without_cmd() {
+        let dir = tempfile::tempdir().unwrap();
+        let broadcaster = Arc::new(EventBroadcaster::new(16));
+        let result = ServeCommand::build_swarm_state_from_flags(
+            Some("cli"),
+            None,
+            &[],
             None,
             dir.path(),
             broadcaster,
@@ -1785,6 +1868,7 @@ mod tests {
         let result = ServeCommand::build_swarm_state_from_flags(
             Some("http"),
             None,
+            &[],
             None,
             dir.path(),
             broadcaster,
@@ -1812,6 +1896,7 @@ mod tests {
         let result = ServeCommand::build_swarm_state_from_flags(
             Some("ouija"),
             None,
+            &[],
             None,
             dir.path(),
             broadcaster,
@@ -1825,7 +1910,7 @@ mod tests {
         };
         let msg = err.to_string();
         assert!(
-            msg.contains("stdio") && msg.contains("http"),
+            msg.contains("stdio") && msg.contains("http") && msg.contains("cli"),
             "error must list accepted backends, got: {msg}"
         );
     }
@@ -1851,6 +1936,7 @@ mod tests {
         let state = ServeCommand::build_swarm_state_from_flags(
             Some("stdio"),
             Some("/bin/cat"),
+            &[],
             None,
             dir.path(),
             broadcaster,
@@ -1913,6 +1999,7 @@ mod tests {
         let state = ServeCommand::build_swarm_state_from_flags(
             Some("stdio"),
             Some("/bin/cat"),
+            &[],
             None,
             dir.path(),
             broadcaster,

@@ -104,6 +104,31 @@ pub enum McpAgentBackendConfig {
         #[serde(default)]
         dispatch_timeout_secs: Option<u64>,
     },
+    /// Invoke a one-shot headless CLI agent per dispatch (for example
+    /// `claude -p` or `codex exec`) instead of speaking MCP. Simpler
+    /// and more robust for fire-and-forget contracts: no handshake, no
+    /// notification stream — but also no approvals, no mid-run events,
+    /// no cancellation short of killing the process.
+    Cli {
+        /// Absolute or PATH-resolved executable to invoke.
+        cmd: String,
+        /// Arguments passed before the prompt (e.g. `["-p"]`).
+        #[serde(default)]
+        args: Vec<String>,
+        /// Extra environment variables the child is allowed to see.
+        /// [`BLOCKED_ENV_VARS`] always win.
+        #[serde(default)]
+        env: HashMap<String, String>,
+        /// Per-dispatch wallclock budget in seconds. Defaults to
+        /// [`DEFAULT_DISPATCH_TIMEOUT_SECS`].
+        #[serde(default)]
+        dispatch_timeout_secs: Option<u64>,
+        /// Deliver the prompt on the child's stdin instead of as the
+        /// final argv entry. Avoids argv size limits and keeps the
+        /// prompt out of process listings.
+        #[serde(default)]
+        prompt_via_stdin: bool,
+    },
 }
 
 impl McpAgentBackendConfig {
@@ -114,6 +139,7 @@ impl McpAgentBackendConfig {
         match self {
             Self::Local { .. } => "local",
             Self::Remote { .. } => "remote",
+            Self::Cli { .. } => "cli",
         }
     }
 
@@ -121,7 +147,7 @@ impl McpAgentBackendConfig {
     /// dispatch events so operators can tell backends apart.
     pub fn endpoint_label(&self) -> String {
         match self {
-            Self::Local { cmd, .. } => cmd.clone(),
+            Self::Local { cmd, .. } | Self::Cli { cmd, .. } => cmd.clone(),
             Self::Remote { url, .. } => url.clone(),
         }
     }
@@ -137,6 +163,10 @@ impl McpAgentBackendConfig {
                 ..
             } => dispatch_timeout_secs,
             Self::Remote {
+                dispatch_timeout_secs,
+                ..
+            } => dispatch_timeout_secs,
+            Self::Cli {
                 dispatch_timeout_secs,
                 ..
             } => dispatch_timeout_secs,
@@ -524,6 +554,231 @@ impl StdioMcpAgent {
 impl McpAgentBackend for StdioMcpAgent {
     fn backend_label(&self) -> &'static str {
         "local"
+    }
+
+    fn endpoint_label(&self) -> String {
+        self.cmd.clone()
+    }
+
+    async fn dispatch(&self, request: DispatchRequest) -> DispatchResponse {
+        self.dispatch_inner(request).await
+    }
+}
+
+// ── CLI backend ───────────────────────────────────────────────────────────
+
+/// One-shot headless CLI agent backend (`claude -p`, `codex exec`, or
+/// any command that takes a prompt and prints the result). No MCP
+/// framing: the prompt goes in as the final argv entry (or on stdin),
+/// stdout comes back as the dispatch output, and the exit code drives
+/// the [`DispatchOutcome`] mapping — `0` → `Success`, non-zero →
+/// `RemoteError` (retryable, mirroring MCP `isError` semantics), spawn
+/// failure → `TransportError`, wallclock overrun → `Timeout` with the
+/// child killed via `kill_on_drop`.
+///
+/// Prompt convention: `task["prompt"]` when present, else the whole
+/// task JSON serialized — so swarm contracts written for MCP backends
+/// degrade gracefully. `tool_name` and the context contract are not
+/// transmitted (a CLI has no `_meta` channel); the context contract
+/// still tags the response for the local evidence ledger.
+pub struct CliAgentBackend {
+    cmd: String,
+    args: Vec<String>,
+    env: HashMap<String, String>,
+    cwd: Option<PathBuf>,
+    dispatch_timeout: Duration,
+    prompt_via_stdin: bool,
+}
+
+/// Cap on captured CLI stdout/stderr, mirroring [`MAX_LINE_BYTES`] so a
+/// runaway transcript cannot OOM the parent.
+const MAX_CLI_CAPTURE_BYTES: usize = MAX_LINE_BYTES;
+
+impl CliAgentBackend {
+    /// Construct a CLI backend from typed config.
+    pub fn from_config(config: &McpAgentBackendConfig) -> Result<Self> {
+        let McpAgentBackendConfig::Cli {
+            cmd,
+            args,
+            env,
+            dispatch_timeout_secs,
+            prompt_via_stdin,
+        } = config
+        else {
+            eyre::bail!("CliAgentBackend requires a Cli backend config");
+        };
+        if cmd.trim().is_empty() {
+            eyre::bail!("CLI agent requires a non-empty command");
+        }
+        Ok(Self {
+            cmd: cmd.clone(),
+            args: args.clone(),
+            env: env.clone(),
+            cwd: None,
+            dispatch_timeout: Duration::from_secs(
+                dispatch_timeout_secs.unwrap_or(DEFAULT_DISPATCH_TIMEOUT_SECS),
+            ),
+            prompt_via_stdin: *prompt_via_stdin,
+        })
+    }
+
+    /// Set the working directory for spawned children.
+    pub fn with_cwd(mut self, cwd: impl Into<PathBuf>) -> Self {
+        self.cwd = Some(cwd.into());
+        self
+    }
+
+    /// Override the dispatch timeout (useful in tests).
+    pub fn with_dispatch_timeout(mut self, timeout: Duration) -> Self {
+        self.dispatch_timeout = timeout;
+        self
+    }
+
+    /// Extract the prompt the CLI receives. `task["prompt"]` when it is
+    /// a string; otherwise the whole task JSON so structured contracts
+    /// still reach the agent verbatim.
+    fn prompt_for(task: &serde_json::Value) -> String {
+        match task.get("prompt").and_then(|value| value.as_str()) {
+            Some(prompt) => prompt.to_string(),
+            None => task.to_string(),
+        }
+    }
+
+    fn build_command(&self, prompt: &str) -> Command {
+        let mut cmd = Command::new(&self.cmd);
+        cmd.args(&self.args);
+        if !self.prompt_via_stdin {
+            cmd.arg(prompt);
+        }
+        cmd.stdin(if self.prompt_via_stdin {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stdout(Stdio::piped())
+        // Unlike the MCP stdio backend (which inherits stderr for
+        // operator logs), a CLI's stderr is the primary diagnostic on
+        // failure — capture it for the error message.
+        .stderr(Stdio::piped());
+
+        if let Some(cwd) = &self.cwd {
+            cmd.current_dir(cwd);
+        }
+
+        // Same env hygiene as the MCP stdio backend: scrub the parent
+        // env down to the configured allowlist, then strip
+        // [`BLOCKED_ENV_VARS`] last so they win regardless.
+        let allowlist = EnvAllowlist::from_names(self.env.keys().map(|key| key.as_str()));
+        sanitize_command_env(&mut cmd, &allowlist);
+        for (key, value) in &self.env {
+            if BLOCKED_ENV_VARS
+                .iter()
+                .any(|blocked| key.eq_ignore_ascii_case(blocked))
+            {
+                warn!(
+                    key = key.as_str(),
+                    "blocked dangerous CLI agent environment variable"
+                );
+                continue;
+            }
+            if !should_forward_env_name(key, &allowlist) {
+                warn!(
+                    key = key.as_str(),
+                    "blocked non-allowlisted CLI agent environment variable"
+                );
+                continue;
+            }
+            cmd.env(key, value);
+        }
+        for blocked in BLOCKED_ENV_VARS {
+            cmd.env_remove(blocked);
+        }
+
+        cmd.kill_on_drop(true);
+        cmd
+    }
+
+    async fn dispatch_inner(&self, request: DispatchRequest) -> DispatchResponse {
+        let prompt = Self::prompt_for(&request.task);
+        let mut command = self.build_command(&prompt);
+        let mut child = match command.spawn() {
+            Ok(child) => child,
+            Err(error) => {
+                return DispatchResponse::failure(
+                    DispatchOutcome::TransportError,
+                    format!("failed to spawn CLI agent '{}': {error}", self.cmd),
+                );
+            }
+        };
+
+        if self.prompt_via_stdin {
+            if let Some(mut stdin) = child.stdin.take() {
+                let mut payload = prompt.clone();
+                payload.push('\n');
+                if let Err(error) = stdin.write_all(payload.as_bytes()).await {
+                    return DispatchResponse::failure(
+                        DispatchOutcome::TransportError,
+                        format!(
+                            "failed to write prompt to CLI agent '{}': {error}",
+                            self.cmd
+                        ),
+                    );
+                }
+                // Drop closes the pipe so line-readers see EOF.
+            }
+        }
+
+        // `wait_with_output` owns the child; on timeout the dropped
+        // future releases it and `kill_on_drop(true)` reaps the process.
+        match tokio::time::timeout(self.dispatch_timeout, child.wait_with_output()).await {
+            Ok(Ok(output)) => {
+                let mut stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+                octos_core::truncate_utf8(&mut stdout, MAX_CLI_CAPTURE_BYTES, "\n[truncated]");
+                let trimmed = stdout.trim_end().to_string();
+                if output.status.success() {
+                    DispatchResponse::success(trimmed, Vec::new())
+                } else {
+                    let mut stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+                    octos_core::truncate_utf8(&mut stderr, MAX_CLI_CAPTURE_BYTES, "\n[truncated]");
+                    let code = output
+                        .status
+                        .code()
+                        .map(|code| code.to_string())
+                        .unwrap_or_else(|| "signal".to_string());
+                    let mut response = DispatchResponse::failure(
+                        DispatchOutcome::RemoteError,
+                        format!(
+                            "CLI agent '{}' exited with status {code}: {}",
+                            self.cmd,
+                            stderr.trim_end()
+                        ),
+                    );
+                    // Preserve any partial stdout for diagnostics.
+                    if !trimmed.is_empty() {
+                        response.output = trimmed;
+                    }
+                    response
+                }
+            }
+            Ok(Err(error)) => DispatchResponse::failure(
+                DispatchOutcome::TransportError,
+                format!("failed to collect CLI agent '{}' output: {error}", self.cmd),
+            ),
+            Err(_) => DispatchResponse::failure(
+                DispatchOutcome::Timeout,
+                format!(
+                    "CLI agent '{}' did not finish within {:?}",
+                    self.cmd, self.dispatch_timeout
+                ),
+            ),
+        }
+    }
+}
+
+#[async_trait]
+impl McpAgentBackend for CliAgentBackend {
+    fn backend_label(&self) -> &'static str {
+        "cli"
     }
 
     fn endpoint_label(&self) -> String {
@@ -1180,6 +1435,13 @@ pub fn build_backend_from_config(
             Ok(Arc::new(backend))
         }
         McpAgentBackendConfig::Remote { .. } => Ok(Arc::new(HttpMcpAgent::from_config(config)?)),
+        McpAgentBackendConfig::Cli { .. } => {
+            let mut backend = CliAgentBackend::from_config(config)?;
+            if let Some(cwd) = cwd {
+                backend = backend.with_cwd(cwd.to_path_buf());
+            }
+            Ok(Arc::new(backend))
+        }
     }
 }
 
