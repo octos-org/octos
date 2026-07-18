@@ -21,6 +21,7 @@ octos-memory = { workspace = true }
 octos-llm = { workspace = true }
 octos-bus = { workspace = true }
 octos-store = { workspace = true }
+octos-services = { workspace = true }
 octos-pipeline = { workspace = true }
 octos-swarm = { workspace = true }
 # RFC-2 (issue #1291): `octos skills install` runs the manifest schema

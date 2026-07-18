@@ -4394,6 +4394,7 @@ dependencies = [
  "octos-memory",
  "octos-pipeline",
  "octos-plugin",
+ "octos-services",
  "octos-store",
  "octos-swarm",
  "open",
@@ -4560,6 +4561,27 @@ dependencies = [
  "rappct",
  "seccompiler",
  "windows 0.62.2",
+]
+
+[[package]]
+name = "octos-services"
+version = "2.0.2-rc.11"
+dependencies = [
+ "chrono",
+ "dirs",
+ "eyre",
+ "flate2",
+ "futures",
+ "octos-bus",
+ "octos-core",
+ "octos-llm",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "tar",
+ "tempfile",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
