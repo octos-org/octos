@@ -260,26 +260,26 @@ impl DispatchRequest {
         self
     }
 
-    fn arguments_payload(&self) -> serde_json::Value {
-        let Some(contract) = &self.context_contract else {
-            return self.task.clone();
-        };
+    /// Tool arguments exactly as the caller supplied them. The context
+    /// contract must NOT be merged in here: strict-schema MCP servers
+    /// (codex mcp-server among them) validate `arguments` against the
+    /// tool's inputSchema and reject unknown fields.
+    fn wire_arguments(&self) -> serde_json::Value {
+        self.task.clone()
+    }
+
+    /// Context contract for the wire, wrapped for `params._meta` — the
+    /// MCP-sanctioned extension point servers must tolerate. Namespaced
+    /// key so it cannot collide with other _meta producers.
+    fn meta_payload(&self) -> Option<serde_json::Value> {
+        let contract = self.context_contract.as_ref()?;
         let contract_value = serde_json::to_value(contract).unwrap_or_else(|_| {
             serde_json::json!({
                 "mode": "external_context_unmanaged",
                 "reason": "context_contract_serialization_failed"
             })
         });
-        match self.task.clone() {
-            serde_json::Value::Object(mut obj) => {
-                obj.insert("context_contract".to_string(), contract_value);
-                serde_json::Value::Object(obj)
-            }
-            other => serde_json::json!({
-                "task": other,
-                "context_contract": contract_value,
-            }),
-        }
+        Some(serde_json::json!({ "octos/contextContract": contract_value }))
     }
 }
 
@@ -621,22 +621,21 @@ async fn perform_stdio_handshake_and_call(
         )
     })?;
 
-    send_json_rpc(
-        &mut stdin,
-        2,
-        "tools/call",
-        serde_json::json!({
-            "name": request.tool_name,
-            "arguments": request.arguments_payload(),
-        }),
-    )
-    .await
-    .map_err(|error| {
-        (
-            DispatchOutcome::TransportError,
-            format!("MCP tools/call write failed: {error}"),
-        )
-    })?;
+    let mut call_params = serde_json::json!({
+        "name": request.tool_name,
+        "arguments": request.wire_arguments(),
+    });
+    if let Some(meta) = request.meta_payload() {
+        call_params["_meta"] = meta;
+    }
+    send_json_rpc(&mut stdin, 2, "tools/call", call_params)
+        .await
+        .map_err(|error| {
+            (
+                DispatchOutcome::TransportError,
+                format!("MCP tools/call write failed: {error}"),
+            )
+        })?;
 
     let response = read_json_rpc_response(&mut reader).await.map_err(|error| {
         (
@@ -902,14 +901,18 @@ impl HttpMcpAgent {
     ) -> DispatchResponse {
         // JSON-RPC body — same shape as the stdio path so the remote
         // agent's dispatcher can treat both transports uniformly.
+        let mut call_params = serde_json::json!({
+            "name": request.tool_name,
+            "arguments": request.wire_arguments(),
+        });
+        if let Some(meta) = request.meta_payload() {
+            call_params["_meta"] = meta;
+        }
         let body = serde_json::json!({
             "jsonrpc": "2.0",
             "id": 1,
             "method": "tools/call",
-            "params": {
-                "name": request.tool_name,
-                "arguments": request.arguments_payload(),
-            },
+            "params": call_params,
         });
 
         let mut req = client
@@ -1147,7 +1150,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn dispatch_request_injects_context_contract_into_arguments() {
+    fn dispatch_request_keeps_arguments_pristine_and_carries_contract_in_meta() {
+        // Strict-schema MCP servers (codex mcp-server rejects with
+        // "unknown field `context_contract`") validate `arguments`
+        // against the tool's inputSchema, so the context contract must
+        // ride in `params._meta` — the MCP-sanctioned extension point —
+        // and never leak into the tool arguments.
         let request = DispatchRequest::new("run_task", serde_json::json!({"task": "review"}))
             .with_context_contract(
                 DispatchContextContract::external_unmanaged("fixture")
@@ -1155,15 +1163,26 @@ mod tests {
                     .with_child_session_key(Some("child".to_string())),
             );
 
-        let args = request.arguments_payload();
-        assert_eq!(args["task"], "review");
+        let args = request.wire_arguments();
+        assert_eq!(args, serde_json::json!({"task": "review"}));
+        assert!(args.get("context_contract").is_none());
+
+        let meta = request.meta_payload().expect("contract present -> meta");
+        let contract = &meta["octos/contextContract"];
+        assert_eq!(contract["mode"], "external_context_unmanaged");
+        assert_eq!(contract["reason"], "fixture");
+        assert_eq!(contract["parent_session_key"], "parent");
+        assert_eq!(contract["child_session_key"], "child");
+    }
+
+    #[test]
+    fn dispatch_request_without_contract_has_no_meta() {
+        let request = DispatchRequest::new("run_task", serde_json::json!({"task": "review"}));
         assert_eq!(
-            args["context_contract"]["mode"],
-            "external_context_unmanaged"
+            request.wire_arguments(),
+            serde_json::json!({"task": "review"})
         );
-        assert_eq!(args["context_contract"]["reason"], "fixture");
-        assert_eq!(args["context_contract"]["parent_session_key"], "parent");
-        assert_eq!(args["context_contract"]["child_session_key"], "child");
+        assert!(request.meta_payload().is_none());
     }
 
     /// #1021 / M17-C — backend_kind, agent_id, and risk are all
