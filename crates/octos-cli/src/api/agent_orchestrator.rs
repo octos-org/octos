@@ -7844,9 +7844,9 @@ mod tests {
         let session_id = SessionKey::with_profile("tenant-a", "api", "bg-final-output");
         let now = Utc::now();
         let task = octos_agent::BackgroundTask {
-            id: "bg-fo-1".into(),
+            id: "bg-final-1".into(),
             tool_name: "review-child".into(),
-            tool_call_id: "call-fo-1".into(),
+            tool_call_id: "call-final-1".into(),
             parent_session_key: Some(session_id.to_string()),
             child_session_key: None,
             child_terminal_state: None,

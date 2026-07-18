@@ -1628,6 +1628,13 @@ const MAX_SPAWN_MAX_ITERATIONS: u32 = 300;
 /// raise it up to [`MAX_SPAWN_MAX_ITERATIONS`] or lower it explicitly.
 const DEFAULT_SPAWN_MAX_ITERATIONS: u32 = 150;
 
+/// The whole point of the constant above is that it exceeds the interactive
+/// default of 50 (`AgentConfig::max_iterations`). Asserted at compile time:
+/// both sides are consts, so a runtime `assert!` in a test is really a
+/// `clippy::assertions_on_constants` — and this way an edit that breaks the
+/// invariant fails the build instead of a test run.
+const _: () = assert!(DEFAULT_SPAWN_MAX_ITERATIONS > 50);
+
 /// Resolve the effective iteration budget for a spawn: a caller-supplied value
 /// clamped into `[1, MAX]`, or [`DEFAULT_SPAWN_MAX_ITERATIONS`] when unset.
 fn resolve_spawn_max_iterations(requested: Option<u32>) -> u32 {
@@ -7442,10 +7449,8 @@ PY
             resolve_spawn_max_iterations(None),
             DEFAULT_SPAWN_MAX_ITERATIONS
         );
-        assert!(
-            DEFAULT_SPAWN_MAX_ITERATIONS > 50,
-            "must exceed the interactive default"
-        );
+        // (That it exceeds the interactive 50 is asserted at compile time
+        // beside the constant itself.)
         // Normal value passes through.
         assert_eq!(resolve_spawn_max_iterations(Some(120)), 120);
         // 0 is nonsensical → clamped up to 1.
