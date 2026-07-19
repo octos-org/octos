@@ -2360,7 +2360,7 @@ impl InProcessAgentOrchestrator {
         // unfinished goal exists"). Scope the state guard so `set_goal` can
         // re-lock below without deadlocking.
         {
-            let state = self.state();
+            let mut state = self.state();
             if let Some(existing) = state.goals.get(session_id) {
                 if existing.profile_id != profile_id {
                     return Err(
@@ -2376,6 +2376,19 @@ impl InProcessAgentOrchestrator {
                     ));
                 }
             }
+            // Fix B (codex HIGH): replacing a COMPLETE goal must mint a FRESH
+            // goal identity, not reuse the finished record. `set_goal` reuses
+            // the existing record in place — carrying the old goal_id, token /
+            // continuation counters, rate window, and wrap_up_emitted flag —
+            // so delegating to it over a complete goal would resurrect the old
+            // goal_id and its spent counters (and any queued continuations
+            // keyed on it). Drop the completed record here so `set_goal`'s
+            // create branch runs instead: a new goal_id and all counters
+            // zeroed. Stale continuations still keyed on the old goal_id then
+            // fail the goal-id identity check in
+            // `pending_continuation_is_schedulable`. (`remove` is a no-op when
+            // no goal exists, so the fresh-goal path is unaffected.)
+            state.goals.remove(session_id);
         }
         self.set_goal(GoalSetRequest {
             session_id: session_id.clone(),
@@ -9104,6 +9117,7 @@ mod tests {
             )
             .expect("create when none exists");
         assert_eq!(goal["status"], json!("active"));
+        let first_goal_id = goal["goal_id"].as_str().expect("goal_id").to_owned();
 
         // An UNFINISHED goal blocks a second create (codex parity).
         let err = orchestrator
@@ -9123,6 +9137,10 @@ mod tests {
                 .is_err()
         );
 
+        // Spend tokens on the first goal so the reuse bug (carried-over
+        // counters) would be observable if it regressed.
+        orchestrator.force_goal_tokens_used_for_test(&session_id, 1_500);
+
         // Once COMPLETE, the model may replace it with a fresh active goal.
         orchestrator
             .model_transition_goal(&session_id, "tenant-a", "complete", "done")
@@ -9131,6 +9149,23 @@ mod tests {
             .model_create_goal(&session_id, "tenant-a", "next objective", None)
             .expect("replace a complete goal");
         assert_eq!(replaced["status"], json!("active"));
+        // Fix B: replacing a complete goal MUST mint a fresh goal identity and
+        // reset the counters, not reuse the finished record's goal_id / spend.
+        let second_goal_id = replaced["goal_id"].as_str().expect("goal_id");
+        assert_ne!(
+            second_goal_id, first_goal_id,
+            "a replacement goal must get a fresh goal_id, not reuse the completed one"
+        );
+        assert_eq!(
+            replaced["tokens_used"],
+            json!(0),
+            "the replacement goal's token counter must be reset to zero"
+        );
+        assert_eq!(
+            replaced["objective"],
+            json!("next objective"),
+            "the replacement carries the new objective"
+        );
     }
 
     #[test]
