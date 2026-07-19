@@ -87,7 +87,7 @@ use super::agent_orchestrator::{
     AgentRequest, AgentUpsert, GoalSessionRequest, GoalSetRequest, LoopControlKind,
     LoopControlRequest, LoopCreateRequest, LoopListRequest, NativeSpecialistAppUiEvent,
     NativeSpecialistLaunchRequest, default_agent_orchestrator, master_continuation_prompt,
-    master_continuation_reason_name, upsert_background_task_agent,
+    master_continuation_reason_name, upsert_background_task_agent, wire_key_from_goal_key,
 };
 #[cfg(test)]
 use super::agent_orchestrator::{
@@ -2987,6 +2987,16 @@ fn register_session_ledger_scope(
             .collect::<String>()
     });
     ledger.set_session_scope(&runtime.session_key, scope.clone());
+    // #1666 residue — mirror the SAME cwd scope into the goal/autonomy store so
+    // a goal set in one folder does not leak into a fresh session that reuses
+    // this wire key in another folder. The goal store was keyed by the bare
+    // wire key while #1666 only cwd-scoped the ledger, so the goal chip leaked
+    // across folders (same profile). Keeping the two scope maps in lock-step
+    // (registered at the same site, cleared together when the flag is off) is
+    // what makes the goal store isolate cwds exactly as the transcript already
+    // does. The goal continuation dispatch strips this scope back to the wire
+    // key when it reaches the session runtime / actor.
+    default_agent_orchestrator().set_goal_scope(&runtime.session_key, scope.clone());
     // Topic-suffixed sessions also emit ledger events under their BASE key:
     // the alpha-9 file/visual bridges deliberately strip the `#topic` before
     // appending so base-bucket subscribers see them (see
@@ -2996,7 +3006,8 @@ fn register_session_ledger_scope(
     // never mis-route a different project's base-key session.
     let base = runtime.session_key.base_key();
     if base != runtime.session_key.0 {
-        ledger.set_session_scope(&SessionKey(base.to_owned()), scope);
+        ledger.set_session_scope(&SessionKey(base.to_owned()), scope.clone());
+        default_agent_orchestrator().set_goal_scope(&SessionKey(base.to_owned()), scope);
     }
 }
 
@@ -9856,6 +9867,9 @@ async fn handle_raw_appui_rpc(
             }
             let _ = send_rpc_result(ws, id, result);
             if let Some((session_id, profile_id)) = continuation_target {
+                // This immediate-drain path is `loop/fire_now` only (see
+                // `appui_continuation_target_from_raw_result`); loops are not
+                // cwd-scoped, so the goal store key equals the wire id.
                 let _ = maybe_spawn_appui_master_continuation_runner(
                     ws,
                     state,
@@ -9863,6 +9877,7 @@ async fn handle_raw_appui_rpc(
                     contracts,
                     active_turns,
                     connection_turns,
+                    session_id.clone(),
                     session_id,
                     profile_id,
                     features,
@@ -12974,7 +12989,16 @@ async fn maybe_spawn_appui_master_continuation_runner(
     contracts: &Arc<UiProtocolContractStores>,
     active_turns: &SharedActiveTurns,
     connection_turns: &SharedConnectionTurns,
+    // The PLAIN WIRE session id: the turn runs, the ledger/runtime resolve, and
+    // the active-turn/connection bookkeeping key on this.
     session_id: SessionKey,
+    // #1666 residue — the goal STORE identity (cwd-scoped for AppUI folders,
+    // == `session_id` for loops / gateway sessions). The continuation queue,
+    // the goal in-flight set, and the post-turn goal accountant all key on
+    // THIS; a scoped goal enqueued its continuation under this key and must be
+    // drained + charged under it. For unscoped targets it equals `session_id`,
+    // so the loop/gateway path is byte-identical to before.
+    goal_storage_key: SessionKey,
     profile_id: String,
     features: ConnectionUiFeatures,
 ) -> bool {
@@ -12995,7 +13019,7 @@ async fn maybe_spawn_appui_master_continuation_runner(
     // tick would drain + spawn a SECOND concurrent turn on the same session
     // while the actor's turn runs. The actor clears the marker (RAII guard)
     // when its turn ends, so the next tick re-dispatches normally.
-    if default_agent_orchestrator().is_goal_dispatch_in_flight(&session_id) {
+    if default_agent_orchestrator().is_goal_dispatch_in_flight(&goal_storage_key) {
         return false;
     }
 
@@ -13006,7 +13030,7 @@ async fn maybe_spawn_appui_master_continuation_runner(
             .is_empty(),
     );
     let Some(continuation) = default_agent_orchestrator()
-        .drain_ready_continuations_for_session(&session_id, &profile_id, runtime_state, 1)
+        .drain_ready_continuations_for_session(&goal_storage_key, &profile_id, runtime_state, 1)
         .into_iter()
         .next()
     else {
@@ -13082,6 +13106,10 @@ async fn maybe_spawn_appui_master_continuation_runner(
         MasterContinuationReason::GoalContinue | MasterContinuationReason::GoalWrapUp => {
             Some(GoalContinuationContext {
                 profile_id: continuation.profile_id.as_str().to_owned(),
+                // The continuation carries the cwd-scoped goal store key it was
+                // enqueued under; the post-turn accountant must charge THAT
+                // record, not the plain wire id.
+                goal_session_key: SessionKey(continuation.session_id.as_str().to_owned()),
             })
         }
         _ => None,
@@ -13186,8 +13214,18 @@ async fn drain_appui_due_master_continuations(
     profile_filter: Option<&str>,
     features: ConnectionUiFeatures,
 ) {
-    for (session_id, profile_id) in default_agent_orchestrator().due_loop_targets(profile_filter, 8)
-    {
+    let orchestrator = default_agent_orchestrator();
+    for (storage_key, profile_id) in orchestrator.due_loop_targets(profile_filter, 8) {
+        // #1666 residue — a scoped goal target fires only for the currently
+        // active folder of its wire id (a backgrounded folder's goal is
+        // skipped until it is re-opened), so a stale-cwd continuation can never
+        // run against the wrong workspace. Unscoped targets (loops, gateway)
+        // always pass. The turn dispatches on the plain WIRE id while the goal
+        // record/queue/accountant stay on the scoped `storage_key`.
+        if !orchestrator.goal_target_is_dispatchable(&storage_key) {
+            continue;
+        }
+        let wire_key = wire_key_from_goal_key(&storage_key);
         let _ = maybe_spawn_appui_master_continuation_runner(
             ws,
             state,
@@ -13195,7 +13233,8 @@ async fn drain_appui_due_master_continuations(
             contracts,
             active_turns,
             connection_turns,
-            session_id,
+            wire_key,
+            storage_key,
             profile_id,
             features,
         )
@@ -13437,17 +13476,32 @@ pub(crate) fn spawn_global_master_continuation_drain(state: Arc<AppState>) {
             // sessions is not operationally reachable on a single serve.
             const DRAIN_SPAWN_CAP: usize = 8;
             const DRAIN_CANDIDATE_WINDOW: usize = 64;
-            let runnable = |session: &SessionKey| session_workspaces().get(session).is_some();
-            let due = default_agent_orchestrator().due_loop_targets_with_filter(
+            // #1666 residue — a goal target is cwd-scoped (`<wire>\u{0}~cwd-…`)
+            // while `session_workspaces()` is keyed by the plain wire id, so
+            // the workspace-known gate must strip the scope before probing.
+            let runnable = |session: &SessionKey| {
+                session_workspaces()
+                    .get(&wire_key_from_goal_key(session))
+                    .is_some()
+            };
+            let orchestrator = default_agent_orchestrator();
+            let due = orchestrator.due_loop_targets_with_filter(
                 None,
                 DRAIN_CANDIDATE_WINDOW,
                 Some(&runnable),
             );
             let mut advanced = 0usize;
-            for (session_id, profile_id) in due {
+            for (storage_key, profile_id) in due {
                 if advanced >= DRAIN_SPAWN_CAP {
                     break;
                 }
+                // Only fire a scoped goal for the currently-active folder of
+                // its wire id (see `goal_target_is_dispatchable`); dispatch on
+                // the plain WIRE id, account on the scoped `storage_key`.
+                if !orchestrator.goal_target_is_dispatchable(&storage_key) {
+                    continue;
+                }
+                let wire_key = wire_key_from_goal_key(&storage_key);
                 if maybe_spawn_appui_master_continuation_runner(
                     &ws,
                     &state,
@@ -13455,7 +13509,8 @@ pub(crate) fn spawn_global_master_continuation_drain(state: Arc<AppState>) {
                     &contracts,
                     &active_turns,
                     &connection_turns,
-                    session_id,
+                    wire_key,
+                    storage_key,
                     profile_id,
                     features,
                 )
@@ -21000,6 +21055,16 @@ async fn seed_m9_task_output_fixture(
 #[derive(Debug, Clone)]
 struct GoalContinuationContext {
     profile_id: String,
+    /// #1666 residue — the cwd-scoped goal STORE identity this continuation was
+    /// enqueued under (`<wire>\u{0}~cwd-<scope>`, or the plain wire id for an
+    /// unscoped/gateway session). The turn itself runs keyed by the plain wire
+    /// id (`params.session_id`) so the ledger/runtime/workspace all resolve
+    /// correctly, but the post-turn accountant (`record_goal_turn`,
+    /// `record_goal_dispatch_timestamp_only`, `maybe_complete_goal_from_model`)
+    /// must address the goal record under THIS scoped key — otherwise a folder
+    /// A goal turn would charge nothing (the wire key finds no scoped goal) and
+    /// recur forever without ever hitting its budget.
+    goal_session_key: SessionKey,
 }
 
 /// #1134 — pick the LAST non-empty assistant row after `pre` from a
@@ -24773,8 +24838,16 @@ async fn run_standalone_turn(
         // `record_goal_turn` below also stamps `last_continued_at_ms
         // = now`, but the await on `sessions_for_reschedule.lock()`
         // is the exact yield point we need to guard.
+        // #1666 residue — the goal record lives under the cwd-scoped store key
+        // (`goal_ctx.goal_session_key`), NOT the plain wire `session_id` the
+        // turn runs under. Charge/complete the goal via the scoped key so a
+        // folder-A goal turn actually accrues its spend (a wire-keyed lookup
+        // would find nothing and the goal would recur past its budget forever).
+        // The session-history read below stays on the wire `session_id` (that
+        // is how the runtime/transcript is keyed).
+        let goal_key = &goal_ctx.goal_session_key;
         default_agent_orchestrator()
-            .record_goal_dispatch_timestamp_only(&session_id, &goal_ctx.profile_id);
+            .record_goal_dispatch_timestamp_only(goal_key, &goal_ctx.profile_id);
         let pre = pre_assistant_count_for_post_turn.unwrap_or(0);
         let assistant_reply: Option<String> = {
             let mut guard = sessions_for_reschedule.lock().await;
@@ -24794,7 +24867,7 @@ async fn run_standalone_turn(
             .unwrap_or(0);
         let orchestrator = default_agent_orchestrator();
         orchestrator.record_goal_turn(
-            &session_id,
+            goal_key,
             &goal_ctx.profile_id,
             final_tokens_consumed,
             elapsed_seconds,
@@ -24805,11 +24878,8 @@ async fn run_standalone_turn(
             // tail of the reply. The return value is intentionally
             // unused — the goal is either complete now or stays active
             // and the next scheduler tick decides whether to re-queue.
-            let _ = orchestrator.maybe_complete_goal_from_model(
-                &session_id,
-                &goal_ctx.profile_id,
-                &reply,
-            );
+            let _ =
+                orchestrator.maybe_complete_goal_from_model(goal_key, &goal_ctx.profile_id, &reply);
         }
         // #1696/#1698 — push the post-turn goal snapshot to the OWNING
         // connection so autonomous transitions repaint the chip live:
@@ -24819,7 +24889,7 @@ async fn run_standalone_turn(
         // above — a durable append would fan the goal to every subscriber
         // of an unprofiled shared session id regardless of profile.
         if let Some(goal_event_json) =
-            orchestrator.session_goal_updated_event_json(&session_id, &goal_ctx.profile_id)
+            orchestrator.session_goal_updated_event_json(goal_key, &goal_ctx.profile_id)
         {
             match serde_json::from_value::<octos_core::ui_protocol::SessionGoalUpdatedEvent>(
                 goal_event_json,
