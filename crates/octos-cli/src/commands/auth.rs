@@ -231,7 +231,7 @@ fn status() -> Result<()> {
 
 fn open_profile_store() -> Result<ProfileStore> {
     let home = dirs::home_dir().ok_or_else(|| eyre::eyre!("cannot determine home directory"))?;
-    ProfileStore::open(&home.join(".octos"))
+    ProfileStore::open_unified(&home.join(".octos"))
 }
 
 /// Whether storing `secret` under `name` must be scoped per profile: a declared
