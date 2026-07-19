@@ -208,6 +208,13 @@ impl UiProtocolLedgerEvent {
                 UiNotification::TurnSpawnComplete(spawn_complete) => {
                     spawn_complete.cursor = cursor;
                 }
+                // V2 normally projects an existing durable source event at
+                // the wire boundary instead of appending a second ledger row.
+                // Stamp it nevertheless if a test or future producer stores a
+                // concrete V2 notification directly.
+                UiNotification::EnvelopeV2(envelope) => {
+                    envelope.envelope.cursor = Some(cursor);
+                }
                 _ => {}
             }
         }
@@ -1092,6 +1099,185 @@ impl UiProtocolLedger {
             .filter(|t| !t.is_empty())
             .map(ToOwned::to_owned);
         self.emit_envelope_inner(session_id, thread_id, payload, client_message_id, topic)
+    }
+
+    /// Return the stable one-based assistant-segment ordinal for a v1
+    /// envelope being projected into Stage-1 v2.
+    ///
+    /// A persisted assistant row closes one iteration. Therefore all deltas
+    /// before the first persisted row are segment 1, the next iteration is
+    /// segment 2, and so on. The calculation reads existing durable ledger
+    /// entries only; it never appends a v2 row, which keeps legacy cursor
+    /// sequences byte-for-byte stable.
+    pub(crate) fn projection_v2_assistant_segment_index(
+        &self,
+        session_id: &SessionKey,
+        thread_id: &str,
+        envelope_seq: u64,
+    ) -> u64 {
+        let storage_id = self.storage_session_id(session_id);
+        let inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let prior_persisted = inner
+            .sessions
+            .get(&storage_id)
+            .into_iter()
+            .flat_map(|state| state.entries.iter())
+            .filter(|entry| {
+                matches!(
+                    &entry.event,
+                    UiProtocolLedgerEvent::Notification(UiNotification::Envelope(envelope))
+                        if envelope.envelope.thread_id == thread_id
+                            && envelope.envelope.seq < envelope_seq
+                            && matches!(
+                                &envelope.envelope.payload,
+                                Payload::AssistantPersisted { .. }
+                            )
+                )
+            })
+            .count() as u64;
+        prior_persisted.saturating_add(1)
+    }
+
+    /// Segment currently owning a late attachment as of a particular ledger
+    /// cursor. If no assistant row had persisted yet, retain the first segment
+    /// as the deterministic fallback. Restricting the scan to source entries
+    /// preceding the attachment makes replay stable even after later assistant
+    /// iterations have been appended.
+    pub(crate) fn projection_v2_current_assistant_segment_index(
+        &self,
+        session_id: &SessionKey,
+        thread_id: &str,
+        before_cursor_seq: u64,
+    ) -> u64 {
+        let storage_id = self.storage_session_id(session_id);
+        let inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        inner
+            .sessions
+            .get(&storage_id)
+            .into_iter()
+            .flat_map(|state| state.entries.iter())
+            .filter(|entry| {
+                entry.seq < before_cursor_seq
+                    && matches!(
+                        &entry.event,
+                        UiProtocolLedgerEvent::Notification(UiNotification::Envelope(envelope))
+                            if envelope.envelope.thread_id == thread_id
+                                && matches!(
+                                    &envelope.envelope.payload,
+                                    Payload::AssistantPersisted { .. }
+                                )
+                    )
+            })
+            .count()
+            .max(1) as u64
+    }
+
+    /// Next per-thread v1 sequence, used when a legacy terminal or attachment
+    /// is projected directly into a v2 envelope before its v1 dual-emit is
+    /// appended. Only source rows preceding this event's ledger cursor count;
+    /// otherwise a replay after later writes could assign a different v2 seq.
+    /// This is read-only and does not reserve or mutate sequence state.
+    pub(crate) fn projection_v2_next_envelope_seq(
+        &self,
+        session_id: &SessionKey,
+        thread_id: &str,
+        before_cursor_seq: u64,
+    ) -> u64 {
+        let storage_id = self.storage_session_id(session_id);
+        let inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        inner
+            .sessions
+            .get(&storage_id)
+            .into_iter()
+            .flat_map(|state| state.entries.iter())
+            .filter_map(|entry| match &entry.event {
+                UiProtocolLedgerEvent::Notification(UiNotification::Envelope(envelope))
+                    if entry.seq < before_cursor_seq
+                        && envelope.envelope.thread_id == thread_id =>
+                {
+                    Some(envelope.envelope.seq)
+                }
+                _ => None,
+            })
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1)
+    }
+
+    /// Whether a persisted assistant envelope belongs to the background
+    /// completion path. Those rows project only through their linked v2 child
+    /// completion, never after the parent's terminal stream.
+    pub(crate) fn projection_v2_is_background_message(
+        &self,
+        session_id: &SessionKey,
+        message_id: &str,
+    ) -> bool {
+        let storage_id = self.storage_session_id(session_id);
+        let inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        inner
+            .sessions
+            .get(&storage_id)
+            .into_iter()
+            .flat_map(|state| state.entries.iter())
+            .any(|entry| {
+                matches!(
+                    &entry.event,
+                    UiProtocolLedgerEvent::Notification(UiNotification::MessagePersisted(
+                        persisted,
+                    )) if persisted.message_id == message_id
+                        && matches!(
+                            persisted.source,
+                            octos_core::ui_protocol::MessagePersistedSource::Background
+                        )
+                )
+            })
+    }
+
+    /// Whether this parent turn has already opened a linked background child
+    /// stream. The legacy background sender appends its per-file
+    /// `file/attached` signals *after* `turn/spawn_complete`; v2 must not
+    /// replay those files onto the already-terminal parent stream because the
+    /// child completion already carries their media.
+    pub(crate) fn projection_v2_has_background_child(
+        &self,
+        session_id: &SessionKey,
+        parent_turn_id: &str,
+        before_cursor_seq: u64,
+    ) -> bool {
+        let storage_id = self.storage_session_id(session_id);
+        let inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        inner
+            .sessions
+            .get(&storage_id)
+            .into_iter()
+            .flat_map(|state| state.entries.iter())
+            .any(|entry| {
+                matches!(
+                    &entry.event,
+                    UiProtocolLedgerEvent::Notification(UiNotification::TurnSpawnComplete(spawn))
+                        if entry.seq < before_cursor_seq
+                            && spawn
+                            .turn_id
+                            .as_ref()
+                            .map(|turn_id| turn_id.0.to_string())
+                            == Some(parent_turn_id.to_owned())
+                )
+            })
     }
 
     fn emit_envelope_inner(
@@ -2489,6 +2675,7 @@ fn notification_session_id(notification: &UiNotification) -> &SessionKey {
         UiNotification::SessionOrchestration(event) => &event.session_id,
         UiNotification::UserQuestionRequested(event) => &event.session_id,
         UiNotification::Envelope(event) => &event.session_id,
+        UiNotification::EnvelopeV2(event) => &event.session_id,
     }
 }
 
@@ -2498,6 +2685,7 @@ fn notification_cursor_seq(notification: &UiNotification) -> Option<u64> {
         | UiNotification::TurnCompleted(TurnCompletedEvent { cursor, .. }) => {
             cursor.as_ref().map(|c| c.seq)
         }
+        UiNotification::EnvelopeV2(envelope) => envelope.envelope.cursor.as_ref().map(|c| c.seq),
         _ => None,
     }
 }
