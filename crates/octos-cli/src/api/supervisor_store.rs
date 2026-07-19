@@ -31,6 +31,18 @@ pub enum GroupStatus {
     Completed,
     Failed,
     Cancelled,
+    // Precise non-running goal states (codex MED). Mapping a paused goal to
+    // `Cancelled` or a blocked goal to `Failed` misleads a roster that renders
+    // GroupStatus — a paused goal is not cancelled and a budget-capped goal is
+    // not a hard failure. These variants keep the roster honest. They are only
+    // ever produced by `group_status_for_goal`; no exhaustive `match` on
+    // `GroupStatus` exists, and GroupStatus never crosses the wire protocol
+    // (the roster's "orchestrating" indicator derives from live orchestration
+    // counts, and the goal's precise status string is also carried in the
+    // group metadata), so adding them is contained to this crate.
+    Paused,
+    Blocked,
+    BudgetLimited,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
