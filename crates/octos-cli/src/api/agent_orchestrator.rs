@@ -358,6 +358,32 @@ pub(crate) fn method_not_supported_error(
 #[derive(Debug, Default)]
 pub(crate) struct InProcessAgentOrchestrator {
     state: StdMutex<AutonomyRuntimeState>,
+    /// #1666 residue — per-project (cwd) scope for the goal/autonomy store,
+    /// mirroring the ledger's `scopes` map (`ui_protocol_ledger.rs`).
+    /// Registered on `session/open` alongside `ledger.set_session_scope` so a
+    /// goal set in one folder does NOT leak into a fresh session that reuses
+    /// the same WIRE session key in another folder (same profile). Keyed by
+    /// the plain wire session id; held under a SEPARATE lock from `state` so
+    /// [`Self::scoped_goal_key`] can be resolved without re-entering the state
+    /// mutex the goal handlers already hold. Empty (no scope) → the goal store
+    /// keys by the plain wire id, byte-identical to the legacy behavior and to
+    /// the gateway/session-actor path (which never registers a scope).
+    goal_scopes: StdMutex<HashMap<String, String>>,
+}
+
+/// The plain WIRE session id underlying a (possibly cwd-scoped) goal-store
+/// key: strips a `\u{0}~cwd-<scope>` suffix if present, else returns the key
+/// unchanged. Used at the continuation-dispatch boundary so a goal enqueued
+/// under a scoped key is still delivered to the session runtime / actor keyed
+/// by the plain wire id (which is how `session_workspaces()`, `active_turns`,
+/// and the ledger's live-subscriber map are all keyed). The NUL separator is
+/// the same injective marker `storage_session_id` uses, so a legitimate wire
+/// id can never be mistaken for a scoped key.
+pub(crate) fn wire_key_from_goal_key(key: &SessionKey) -> SessionKey {
+    match key.0.split_once("\u{0}~cwd-") {
+        Some((wire, _)) => SessionKey(wire.to_owned()),
+        None => key.clone(),
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -637,6 +663,65 @@ impl InProcessAgentOrchestrator {
     #[cfg(test)]
     pub(crate) fn clear_for_test(&self) {
         *self.state() = AutonomyRuntimeState::default();
+        self.goal_scopes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+    }
+
+    /// #1666 residue — register (or clear) the per-project goal-store scope
+    /// for a wire session id. The goal/autonomy half of `appui.sessions_in_cwd`
+    /// isolation, called from `register_session_ledger_scope` right beside
+    /// `ledger.set_session_scope` so the goal store and the ledger agree on
+    /// each session's cwd scope. Mirrors
+    /// [`UiProtocolLedger::set_session_scope`].
+    pub(crate) fn set_goal_scope(&self, session_id: &SessionKey, scope: Option<String>) {
+        let mut scopes = self
+            .goal_scopes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match scope {
+            Some(scope) => {
+                scopes.insert(session_id.0.clone(), scope);
+            }
+            None => {
+                scopes.remove(session_id.0.as_str());
+            }
+        }
+    }
+
+    /// #1666 residue — the STORAGE identity for a wire session id in the goal
+    /// store: the id itself, or `<id>\u{0}~cwd-<scope>` when a per-project
+    /// scope is registered. Mirrors [`UiProtocolLedger::storage_session_id`]
+    /// byte-for-byte (same NUL-separated, injective encoding) so the goal store
+    /// isolates cwds exactly as the ledger already isolates transcripts.
+    pub(crate) fn scoped_goal_key(&self, session_id: &SessionKey) -> SessionKey {
+        let scopes = self
+            .goal_scopes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match scopes.get(session_id.0.as_str()) {
+            Some(scope) => SessionKey(format!("{}\u{0}~cwd-{scope}", session_id.0)),
+            None => session_id.clone(),
+        }
+    }
+
+    /// #1666 residue — whether a (possibly cwd-scoped) goal-continuation
+    /// target is safe to dispatch on the AppUI tick path. A SCOPED goal target
+    /// fires ONLY when its cwd scope is the one CURRENTLY registered for its
+    /// wire id (the most-recently-opened folder — the same last-write-wins
+    /// scope the ledger and `session_workspaces()` resolve by). This stops a
+    /// backgrounded folder's goal from firing a continuation that
+    /// `run_standalone_turn` would then execute against the currently-active
+    /// folder's workspace (which resolves by the plain wire id), i.e. the
+    /// continuation-side twin of the get/set leak. Unscoped targets (loops,
+    /// gateway sessions) are always dispatchable.
+    pub(crate) fn goal_target_is_dispatchable(&self, target: &SessionKey) -> bool {
+        if !target.0.contains("\u{0}~cwd-") {
+            return true;
+        }
+        let wire = wire_key_from_goal_key(target);
+        self.scoped_goal_key(&wire) == *target
     }
 
     pub(crate) fn configure_supervisor_store(
@@ -2262,8 +2347,14 @@ impl InProcessAgentOrchestrator {
             .goals
             .get(session_id)
             .filter(|goal| goal.profile_id == profile_id)?;
+        // #1666 residue — `session_id` here is the goal STORE identity (the
+        // cwd-scoped key for an AppUI folder), but the client keys the goal
+        // chip by the plain WIRE id and would drop an event carrying a scoped
+        // key. Emit the wire id in the event while looking up under the scoped
+        // key. Unscoped/gateway keys strip to themselves (no-op).
+        let wire_id = wire_key_from_goal_key(session_id);
         Some(json!({
-            "session_id": session_id,
+            "session_id": wire_id,
             "profile_id": profile_id,
             "goal": autonomy_goal_json(goal),
             "transition_actor": "backend",
@@ -2274,10 +2365,14 @@ impl InProcessAgentOrchestrator {
     /// Never errors: no goal (or a goal outside the profile scope) renders
     /// as `status: "none"` so the model gets a stable shape either way.
     pub(crate) fn model_goal_snapshot(&self, session_id: &SessionKey, profile_id: &str) -> Value {
+        // #1666 residue — the `goal_get` tool runs inside a turn keyed by the
+        // plain wire session id; resolve it to the cwd-scoped store identity so
+        // the model reads THIS folder's goal, not another folder's.
+        let key = self.scoped_goal_key(session_id);
         let state = self.state();
         match state
             .goals
-            .get(session_id)
+            .get(&key)
             .filter(|goal| goal.profile_id == profile_id)
         {
             Some(goal) => json!({
@@ -2311,8 +2406,10 @@ impl InProcessAgentOrchestrator {
                 "status `{status}` is not a model-allowed transition (only complete|blocked)"
             ));
         }
+        // #1666 residue — the `goal_update` tool addresses THIS folder's goal.
+        let key = self.scoped_goal_key(session_id);
         let mut state = self.state();
-        let Some(goal) = state.goals.get_mut(session_id) else {
+        let Some(goal) = state.goals.get_mut(&key) else {
             return Err("no goal is set for this session".to_owned());
         };
         if goal.profile_id != profile_id {
@@ -2324,7 +2421,7 @@ impl InProcessAgentOrchestrator {
         goal.status = status.to_owned();
         goal.updated_at_ms = now_ms();
         let snapshot = goal.clone();
-        persist_goal_state(&state, session_id, &snapshot, false);
+        persist_goal_state(&state, &key, &snapshot, false);
         tracing::info!(
             session = %session_id,
             goal_id = %snapshot.goal_id,
@@ -2359,9 +2456,13 @@ impl InProcessAgentOrchestrator {
         // Reject when an unfinished goal already exists (codex: "Fails if an
         // unfinished goal exists"). Scope the state guard so `set_goal` can
         // re-lock below without deadlocking.
+        // #1666 residue — inspect/replace THIS folder's goal under the
+        // cwd-scoped store identity. `set_goal` below is handed the plain wire
+        // `session_id` and re-resolves the same scope, so the two agree.
+        let key = self.scoped_goal_key(session_id);
         {
             let mut state = self.state();
-            if let Some(existing) = state.goals.get(session_id) {
+            if let Some(existing) = state.goals.get(&key) {
                 if existing.profile_id != profile_id {
                     return Err(
                         "a goal outside this profile's scope already exists for this session"
@@ -2388,7 +2489,7 @@ impl InProcessAgentOrchestrator {
             // fail the goal-id identity check in
             // `pending_continuation_is_schedulable`. (`remove` is a no-op when
             // no goal exists, so the fresh-goal path is unaffected.)
-            state.goals.remove(session_id);
+            state.goals.remove(&key);
         }
         self.set_goal(GoalSetRequest {
             session_id: session_id.clone(),
@@ -2520,7 +2621,15 @@ impl InProcessAgentOrchestrator {
             if !pending_continuation_is_schedulable(state, item) {
                 continue;
             }
-            sessions.insert(SessionKey(item.session_id.as_str().to_owned()));
+            // #1666 residue — a goal continuation is enqueued under the
+            // cwd-scoped store identity, but the client's orchestration
+            // indicator (and the `subscribed`/`live_forwarders` set it is
+            // reconciled against) is keyed by the plain wire id. Strip the cwd
+            // scope so a scoped goal still lights the "orchestrating" chip on
+            // its wire session instead of being dropped as an unknown key.
+            sessions.insert(wire_key_from_goal_key(&SessionKey(
+                item.session_id.as_str().to_owned(),
+            )));
         }
         sessions
     }
@@ -2966,10 +3075,15 @@ impl AgentOrchestrator for InProcessAgentOrchestrator {
     }
 
     fn get_goal(&self, request: GoalSessionRequest) -> Result<Value, RpcError> {
+        // #1666 residue — resolve the wire session id to its cwd-scoped store
+        // identity so a `goal_get` in folder B never returns folder A's goal
+        // (both reuse the same wire key `<profile>:local:tui#coding`). The
+        // response still echoes the plain wire `request.session_id`.
+        let key = self.scoped_goal_key(&request.session_id);
         let state = self.state();
         let goal = state
             .goals
-            .get(&request.session_id)
+            .get(&key)
             .filter(|goal| goal.profile_id == request.profile_id)
             .map(autonomy_goal_json);
         Ok(json!({
@@ -3050,13 +3164,21 @@ impl AgentOrchestrator for InProcessAgentOrchestrator {
             ));
         }
         let now = now_ms();
+        // #1666 residue — resolve the wire session id to its cwd-scoped store
+        // identity BEFORE touching `state.goals`, so a goal set in folder A is
+        // stored under a key distinct from folder B's even though both reuse
+        // the same wire key. Every store op below (get/insert, continuation
+        // enqueue, wrap-up enqueue, persistence) uses `key`; the wire
+        // `request.session_id` is kept only for the wire-facing response /
+        // error payloads. Resolved before the state lock (separate scope lock).
+        let key = self.scoped_goal_key(&request.session_id);
         let mut state = self.state();
         // Fix A: an over-budget mutation that would leave the goal `active`
         // must instead flip it to `budget_limited` and emit the wrap-up. We
         // stage the wrap-up prompt here and enqueue it AFTER the mutable
         // `goal` borrow ends (the wrap-up enqueue needs `&mut state`).
         let mut pending_wrap_up: Option<String> = None;
-        let goal = if let Some(goal) = state.goals.get_mut(&request.session_id) {
+        let goal = if let Some(goal) = state.goals.get_mut(&key) {
             if goal.profile_id != request.profile_id {
                 return Err(autonomy_error(
                     kinds::GOAL_UNAVAILABLE,
@@ -3161,11 +3283,11 @@ impl AgentOrchestrator for InProcessAgentOrchestrator {
                 wrap_up_emitted: false,
                 consecutive_failed_turns: 0,
             };
-            state.goals.insert(request.session_id.clone(), goal.clone());
+            state.goals.insert(key.clone(), goal.clone());
             goal
         };
         if goal.status == "active" {
-            enqueue_goal_continuation(&mut state, &request.session_id, &request.profile_id, &goal);
+            enqueue_goal_continuation(&mut state, &key, &request.profile_id, &goal);
         }
         // Fix A: if the mutation crossed the goal over its budget, enqueue the
         // one-shot wrap-up now that the mutable `goal` borrow is released. The
@@ -3174,7 +3296,7 @@ impl AgentOrchestrator for InProcessAgentOrchestrator {
         if let Some(prompt) = pending_wrap_up {
             enqueue_goal_wrap_up(
                 &mut state,
-                &request.session_id,
+                &key,
                 &request.profile_id,
                 &goal.goal_id,
                 &goal.objective,
@@ -3182,7 +3304,7 @@ impl AgentOrchestrator for InProcessAgentOrchestrator {
                 SystemTime::now(),
             );
         }
-        persist_goal_state(&state, &request.session_id, &goal, false);
+        persist_goal_state(&state, &key, &goal, false);
         Ok(json!({
             "session_id": request.session_id,
             "profile_id": request.profile_id,
@@ -3192,10 +3314,13 @@ impl AgentOrchestrator for InProcessAgentOrchestrator {
     }
 
     fn clear_goal(&self, request: GoalSessionRequest) -> Result<Value, RpcError> {
+        // #1666 residue — clear the cwd-scoped goal for this wire session id so
+        // `goal_clear` in folder B never removes folder A's goal.
+        let key = self.scoped_goal_key(&request.session_id);
         let mut state = self.state();
-        let cleared = match state.goals.get(&request.session_id) {
+        let cleared = match state.goals.get(&key) {
             Some(goal) if goal.profile_id == request.profile_id => {
-                state.goals.remove(&request.session_id).is_some()
+                state.goals.remove(&key).is_some()
             }
             Some(_) => {
                 return Err(autonomy_error(
@@ -3210,7 +3335,7 @@ impl AgentOrchestrator for InProcessAgentOrchestrator {
             None => false,
         };
         if cleared {
-            persist_goal_cleared(&state, &request.session_id, &request.profile_id);
+            persist_goal_cleared(&state, &key, &request.profile_id);
         }
         Ok(json!({
             "session_id": request.session_id,
@@ -12861,6 +12986,223 @@ mod tests {
         assert_eq!(
             window_after, 1,
             "AppUI option (b) must produce exactly ONE rate_window_count increment per turn"
+        );
+    }
+
+    /// #1666 residue — the goal STORE must isolate two folders (cwds) that
+    /// share the same WIRE session key, exactly as the ledger already isolates
+    /// their transcripts (mirror of
+    /// `ui_protocol_ledger::should_isolate_ledger_storage_between_cwd_scopes_sharing_a_wire_key`).
+    /// Before this fix the goal store keyed on the bare wire key, so a goal set
+    /// in folder A leaked into a fresh session reusing the key in folder B (the
+    /// leaked "orchestrating" chip in the live mini2 repro).
+    #[test]
+    fn should_isolate_goal_store_between_cwd_scopes_sharing_a_wire_key() {
+        let orchestrator = InProcessAgentOrchestrator::default();
+        // Both folders open the SAME wire key (the TUI hardcodes `#coding`).
+        let key = SessionKey("octos:local:tui#coding".into());
+
+        // Folder A registers its cwd scope and sets a goal.
+        orchestrator.set_goal_scope(&key, Some("aaaa111122223333".into()));
+        orchestrator
+            .set_goal(GoalSetRequest {
+                session_id: key.clone(),
+                profile_id: "octos".into(),
+                objective: "objective-a".into(),
+                status: Some("active".into()),
+                token_budget: None,
+                transition_actor: None,
+            })
+            .expect("set goal A");
+
+        // Folder B re-registers the SAME wire key under its own scope. A fresh
+        // `goal_get` must NOT surface folder A's goal — this is the leak.
+        orchestrator.set_goal_scope(&key, Some("bbbb444455556666".into()));
+        let got_b = orchestrator
+            .get_goal(GoalSessionRequest {
+                session_id: key.clone(),
+                profile_id: "octos".into(),
+            })
+            .expect("get goal B");
+        assert!(
+            got_b["goal"].is_null(),
+            "folder B must not read folder A's goal (got {got_b:?})"
+        );
+
+        // Folder B sets its own goal; the two coexist under distinct keys.
+        orchestrator
+            .set_goal(GoalSetRequest {
+                session_id: key.clone(),
+                profile_id: "octos".into(),
+                objective: "objective-b".into(),
+                status: Some("active".into()),
+                token_budget: None,
+                transition_actor: None,
+            })
+            .expect("set goal B");
+        let got_b2 = orchestrator
+            .get_goal(GoalSessionRequest {
+                session_id: key.clone(),
+                profile_id: "octos".into(),
+            })
+            .expect("get goal B2");
+        assert_eq!(
+            got_b2["goal"]["objective"],
+            json!("objective-b"),
+            "folder B reads its own goal"
+        );
+
+        // Back to folder A: its goal is intact under its own scope, wholly
+        // unaffected by folder B's goal.
+        orchestrator.set_goal_scope(&key, Some("aaaa111122223333".into()));
+        let got_a = orchestrator
+            .get_goal(GoalSessionRequest {
+                session_id: key.clone(),
+                profile_id: "octos".into(),
+            })
+            .expect("get goal A");
+        assert_eq!(
+            got_a["goal"]["objective"],
+            json!("objective-a"),
+            "folder A still reads objective-a, never folder B's objective-b"
+        );
+        // The response echoes the PLAIN wire id, never the scoped store id.
+        assert_eq!(got_a["session_id"], json!(key.0));
+
+        // Under the hood the two goals occupy two distinct, NUL-separated store
+        // keys (the same injective encoding the ledger uses), and the bare wire
+        // key holds nothing — the leak vector is closed.
+        let scoped_a = SessionKey(format!("{}\u{0}~cwd-aaaa111122223333", key.0));
+        let scoped_b = SessionKey(format!("{}\u{0}~cwd-bbbb444455556666", key.0));
+        {
+            let state = orchestrator.state();
+            assert_eq!(
+                state.goals.get(&scoped_a).map(|g| g.objective.as_str()),
+                Some("objective-a"),
+            );
+            assert_eq!(
+                state.goals.get(&scoped_b).map(|g| g.objective.as_str()),
+                Some("objective-b"),
+            );
+            assert!(
+                state.goals.get(&key).is_none(),
+                "the bare wire key must hold no goal — nothing to leak",
+            );
+        }
+
+        // Clearing the scope falls back to the (empty) plain wire identity.
+        orchestrator.set_goal_scope(&key, None);
+        let got_none = orchestrator
+            .get_goal(GoalSessionRequest {
+                session_id: key.clone(),
+                profile_id: "octos".into(),
+            })
+            .expect("get unscoped");
+        assert!(
+            got_none["goal"].is_null(),
+            "no scope registered → plain wire identity, which holds no goal",
+        );
+    }
+
+    /// #1666 residue — the CONSTRAINT: store-scoping the goal must NOT break
+    /// autonomous continuations. A goal set in a cwd-scoped session is (1)
+    /// surfaced by the continuation sweep under its SCOPED store key, (2)
+    /// dispatchable only while its folder is the active one, (3) stripped back
+    /// to the plain WIRE key the session actor / runtime is keyed by, and (4)
+    /// drained + charged under the SCOPED key. Adapts
+    /// `appui_goal_dispatch_path_does_not_double_count_continuations` for the
+    /// scoped path.
+    #[test]
+    fn scoped_goal_continuation_is_swept_and_strips_to_wire_key_for_dispatch() {
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let wire = SessionKey::with_profile("tenant-a", "api", "goal-scoped-dispatch");
+        orchestrator.set_goal_scope(&wire, Some("aaaa111122223333".into()));
+        orchestrator
+            .set_goal(GoalSetRequest {
+                session_id: wire.clone(),
+                profile_id: "tenant-a".into(),
+                objective: "keep firing per folder".into(),
+                status: Some("active".into()),
+                token_budget: None,
+                transition_actor: None,
+            })
+            .expect("set active scoped goal");
+
+        // The goal record lives under the SCOPED store key, not the wire key.
+        let scoped = SessionKey(format!("{}\u{0}~cwd-aaaa111122223333", wire.0));
+        assert!(
+            orchestrator.state().goals.contains_key(&scoped),
+            "goal stored under the scoped key",
+        );
+        assert!(
+            !orchestrator.state().goals.contains_key(&wire),
+            "the bare wire key must be empty",
+        );
+
+        // (1) The sweep surfaces the SCOPED key as the continuation target.
+        let targets = orchestrator.due_loop_targets(Some("tenant-a"), 8);
+        let target = targets
+            .iter()
+            .find(|(session_id, _)| session_id == &scoped)
+            .map(|(session_id, _)| session_id.clone())
+            .unwrap_or_else(|| {
+                panic!("sweep must surface the scoped goal target (got {targets:?})")
+            });
+
+        // (2) + (3): while folder A's scope is current, the target is
+        // dispatchable and strips back to the plain wire key for the actor.
+        assert!(
+            orchestrator.goal_target_is_dispatchable(&target),
+            "the currently-scoped folder's goal must be dispatchable",
+        );
+        assert_eq!(
+            wire_key_from_goal_key(&target),
+            wire,
+            "dispatch strips the cwd scope back to the wire key the actor is keyed by",
+        );
+
+        // (4) The continuation drains under the SCOPED key and carries it.
+        let drained = orchestrator.drain_ready_continuations_for_session(
+            &scoped,
+            "tenant-a",
+            MasterContinuationRuntimeState::idle(),
+            usize::MAX,
+        );
+        assert!(
+            drained
+                .iter()
+                .any(|c| matches!(c.reason, MasterContinuationReason::GoalContinue)),
+            "the scoped goal's continuation drains under the scoped key",
+        );
+        assert!(
+            drained.iter().all(|c| c.session_id.as_str() == scoped.0),
+            "every drained continuation carries the scoped session id",
+        );
+
+        // A DIFFERENT folder becoming current makes folder A's goal
+        // NON-dispatchable — the continuation-side leak is closed — but the
+        // record still exists, so re-opening folder A resumes it.
+        orchestrator.set_goal_scope(&wire, Some("bbbb444455556666".into()));
+        assert!(
+            !orchestrator.goal_target_is_dispatchable(&scoped),
+            "a backgrounded folder's goal must not fire into the now-active folder",
+        );
+        orchestrator.set_goal_scope(&wire, Some("aaaa111122223333".into()));
+        assert!(
+            orchestrator.goal_target_is_dispatchable(&scoped),
+            "re-activating folder A's scope makes its goal dispatchable again",
+        );
+
+        // Post-turn accounting addresses the scoped key (what the AppUI
+        // dispatch passes via `goal_context.goal_session_key`) and charges the
+        // scoped goal exactly once — the fire path stays intact end-to-end.
+        orchestrator.record_goal_turn(&scoped, "tenant-a", 500, 3);
+        let (_, continuations_after, _) = orchestrator
+            .goal_counters_for_test(&scoped)
+            .expect("scoped goal exists");
+        assert_eq!(
+            continuations_after, 1,
+            "one recorded turn charges the scoped goal exactly once",
         );
     }
 

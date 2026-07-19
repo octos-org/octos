@@ -269,6 +269,15 @@ pub struct ServeCommand {
     #[arg(long)]
     pub danger_full_access: bool,
 
+    /// Opt OUT of the network-on default. By default a fresh Local session with
+    /// no explicit `/permissions` choice runs Workspace-Write with network
+    /// ALLOWED (filesystem still sandboxed) so `npm install` / git / fetch work
+    /// out of the box. Pass `--no-network` (or `OCTOS_NO_NETWORK=1`) to revert
+    /// the default to network DENIED. Cloud/tenant deployments always default to
+    /// network-denied regardless. An explicit `/permissions` choice still wins.
+    #[arg(long)]
+    pub no_network: bool,
+
     /// Use LLM-summarization for AppUI context compaction: when a session's
     /// context fills, ask the model for a high-quality handoff summary (a real
     /// model call — slower, a few seconds) instead of the instant deterministic
@@ -816,6 +825,10 @@ impl ServeCommand {
             || std::env::var("OCTOS_DANGER_FULL_ACCESS")
                 .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
                 .unwrap_or(false);
+        let default_network_denied_flag = self.no_network
+            || std::env::var("OCTOS_NO_NETWORK")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false);
         // SECURITY KEYSTONE: the dangerous default rides the SAME solo
         // opt-in that gates selecting Full Access from the menu — a fleet
         // config that never sets --solo can reach neither surface.
@@ -891,6 +904,7 @@ impl ServeCommand {
             host_memory: config.memory.clone(),
             solo_login_enabled: solo_login_enabled_flag,
             dangerous_default_permissions: dangerous_default_permissions_flag,
+            default_network_denied: default_network_denied_flag,
             llm_compaction: self.llm_compaction,
             allow_admin_shell: config.allow_admin_shell,
             content_catalog_mgr: Some(Arc::new(
