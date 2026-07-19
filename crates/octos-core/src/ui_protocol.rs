@@ -122,21 +122,11 @@ pub const UI_PROTOCOL_FEATURE_THREAD_GRAPH_V1: &str = "state.thread_graph.v1";
 /// Feature flag for UPCR-2026-011 `turn/state/get` turn lifecycle RPC.
 pub const UI_PROTOCOL_FEATURE_TURN_STATE_GET_V1: &str = "state.turn_state_get.v1";
 
-/// Feature flag for UPCR-2026-012 `message/persisted` durable-commit
-/// notification.
-pub const UI_PROTOCOL_FEATURE_MESSAGE_PERSISTED_V1: &str = "event.message_persisted.v1";
-
 /// Feature flag for M10 Phase 1 `turn/spawn_complete` envelope event.
 ///
-/// Negotiated by clients that understand the new "completion-as-new-envelope"
-/// wire shape for `spawn_only` background tool results. Clients that
-/// negotiate this capability receive `turn/spawn_complete` notifications in
-/// place of the `message/persisted` row that carries the late assistant
-/// content (the legacy splice-merge target). Clients that do NOT negotiate
-/// it continue to see `message/persisted` for the same row.
-///
-/// The persistence path is unchanged — the durability ledger still records
-/// the message — only the wire event the connected client observes flips.
+/// Retained to identify historic `turn/spawn_complete` durable records during
+/// migration. New background-result writes use
+/// [`PayloadV2::BackgroundChildCompleted`] on a canonical v2 child stream.
 pub const UI_PROTOCOL_FEATURE_SPAWN_COMPLETE_V1: &str = "event.spawn_complete.v1";
 
 /// Feature flag for the explicit `file/attached` envelope (UPCR-2026-014
@@ -146,8 +136,8 @@ pub const UI_PROTOCOL_FEATURE_SPAWN_COMPLETE_V1: &str = "event.spawn_complete.v1
 /// when a `spawn_only` background tool (`mofa_slides`, `podcast_generate`,
 /// `fm_tts`, `deep_search`) — or any code path that drains a
 /// `BackgroundResultPayload` with non-empty `media` / `envelope_media` —
-/// commits to the canonical session ledger. Mirrors the per-file media
-/// already carried on `message/persisted` and `turn/spawn_complete`, but
+/// commits to the canonical session ledger. Mirrors per-file media carried by
+/// the background child payload (and by historic `turn/spawn_complete` rows), but
 /// as an isolated wire signal so SPA reducers (and admin / debug
 /// clients) can subscribe to file deliveries without parsing the
 /// content-bearing envelopes.
@@ -158,7 +148,7 @@ pub const UI_PROTOCOL_FEATURE_SPAWN_COMPLETE_V1: &str = "event.spawn_complete.v1
 /// the dedicated per-connection wire filter drops the frame so legacy
 /// clients see no behaviour change. Clients that advertise this
 /// capability receive a `file/attached` per artefact in addition to the
-/// existing `message/persisted` / `turn/spawn_complete` envelopes.
+/// canonical background child completion payload.
 ///
 /// Wired by the AppUI WS path's `BackgroundResultSender` closure (see
 /// `ui_protocol.rs::install_message_commit_observer` adjacent helpers)
@@ -174,20 +164,21 @@ pub const UI_PROTOCOL_FEATURE_FILE_ATTACHED_V1: &str = "event.file_attached.v1";
 ///
 /// Capability-gated — servers advertise it only when they emit the
 /// canonical [`Envelope`] shape (see § 14 of the spec). Legacy
-/// `message/delta`, `message/persisted`, `tool/*`, and `turn/completed`
+/// `message/delta`, `tool/*`, and `turn/completed`
 /// notifications continue to flow on connections that do not negotiate
 /// this feature, until M9-γ-3 deletes them.
 pub const UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V1: &str = "projection.envelope.v1";
 
 /// Feature flag for the Stage 1 canonical projection envelope contract.
 ///
-/// This is a strict opt-in alongside (not a replacement for)
-/// [`UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V1`]. A connection that does
-/// not negotiate this feature continues to receive exactly its existing
-/// legacy or v1-projection wire frames. V2 retains the flattened
-/// `projection/envelope` method shape while adding a durable ledger cursor,
-/// an explicit turn id, assistant-segment identity, terminal outcomes, and
-/// linked background-child completions.
+/// This remains the request token for projecting historical source records
+/// into v2 alongside (not a replacement for)
+/// [`UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V1`]. Stage 5 writes canonical
+/// [`EnvelopeV2`] rows directly, and those rows are delivered regardless of
+/// feature negotiation. V2 retains the flattened `projection/envelope`
+/// method shape while adding a durable ledger cursor, an explicit turn id,
+/// assistant-segment identity, terminal outcomes, and linked
+/// background-child completions.
 pub const UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V2: &str = "projection.envelope.v2";
 
 /// Feature flag for M12 Phase D-1 auxiliary REST→WS migration.
@@ -279,7 +270,6 @@ pub const UI_PROTOCOL_KNOWN_FEATURES: &[&str] = &[
     UI_PROTOCOL_FEATURE_SESSION_HYDRATE_V1,
     UI_PROTOCOL_FEATURE_THREAD_GRAPH_V1,
     UI_PROTOCOL_FEATURE_TURN_STATE_GET_V1,
-    UI_PROTOCOL_FEATURE_MESSAGE_PERSISTED_V1,
     UI_PROTOCOL_FEATURE_SPAWN_COMPLETE_V1,
     UI_PROTOCOL_FEATURE_FILE_ATTACHED_V1,
     UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V1,
@@ -1074,8 +1064,6 @@ pub mod methods {
     /// rehydrate via `session/open` (or REST). Carries the last known durable
     /// cursor so the client can resume cleanly.
     pub const REPLAY_LOSSY: &str = "protocol/replay_lossy";
-    /// UPCR-2026-012 `message/persisted` — durable-commit confirmation.
-    pub const MESSAGE_PERSISTED: &str = "message/persisted";
     /// M10 Phase 1 `turn/spawn_complete` — completion-as-new-envelope event
     /// for `spawn_only` background tool results. Carries the late assistant
     /// `content` + `media` plus the originating user prompt's
@@ -1124,7 +1112,7 @@ pub mod methods {
     /// in the notification methods list as part of capability negotiation
     /// wire-up; γ-2 (follow-up) will gate emission on the
     /// `projection.envelope.v1` feature and delete the legacy
-    /// `message/delta`, `message/persisted`, `tool/*`, and
+    /// `message/delta`, `tool/*`, and
     /// `turn/completed` notifications it supersedes.
     pub const PROJECTION_ENVELOPE: &str = "projection/envelope";
     /// UPCR-2026-014 (M9-α-9) `session/event` — wrapper envelope for
@@ -1319,7 +1307,6 @@ pub const UI_PROTOCOL_NOTIFICATION_METHODS: &[&str] = &[
     methods::PROGRESS_UPDATED,
     methods::WARNING,
     methods::REPLAY_LOSSY,
-    methods::MESSAGE_PERSISTED,
     methods::TURN_SPAWN_COMPLETE,
     methods::FILE_ATTACHED,
     methods::VISUAL_GENERATING,
@@ -1474,7 +1461,6 @@ impl UiProtocolCapabilities {
             UI_PROTOCOL_FEATURE_SESSION_HYDRATE_V1,
             UI_PROTOCOL_FEATURE_THREAD_GRAPH_V1,
             UI_PROTOCOL_FEATURE_TURN_STATE_GET_V1,
-            UI_PROTOCOL_FEATURE_MESSAGE_PERSISTED_V1,
             UI_PROTOCOL_FEATURE_SPAWN_COMPLETE_V1,
             UI_PROTOCOL_FEATURE_AUXILIARY_REST_TO_WS_V1,
             UI_PROTOCOL_FEATURE_CODING_AUTONOMY_V1,
@@ -2701,48 +2687,27 @@ pub struct HydratedMessage {
     /// Reasoning/thinking text captured for this message (#1502), when the
     /// provider emitted it. Surfaced on hydrate so the "· reasoning" block
     /// survives a client restart instead of silently vanishing — the store
-    /// has persisted it all along. Gated on `event.spawn_complete.v1` like
-    /// `message_id`/`source`, so non-negotiated clients keep the pre-fix
-    /// wire byte-identical.
+    /// has persisted it all along. It is carried with the same hydrate
+    /// projection as `message_id` and `source`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_content: Option<String>,
     /// Stable per-row identity, derived from `(session_id, seq,
-    /// timestamp_nanos)` — identical to what
-    /// [`MessagePersistedEvent::message_id`] and
-    /// [`TurnSpawnCompleteEvent::message_id`] carry on the live wire
-    /// (see `persist_assistant_with_media`'s `PersistedMessageMeta`).
-    /// M10 Phase 6.2 (Bug C): negotiated clients use this to match
-    /// rows against [`SessionHydrateResult::replayed_envelopes`]
-    /// envelope `message_id`s when deciding which legacy
-    /// `Background`-source rows to render and which to coalesce
-    /// behind a single envelope bubble. Server populates this only
-    /// for connections that negotiated
-    /// [`UI_PROTOCOL_FEATURE_SPAWN_COMPLETE_V1`]; otherwise omitted
-    /// so non-negotiated clients see the pre-fix wire shape
-    /// bit-for-bit.
+    /// timestamp_nanos)` — identical to the `MessageMeta.message_id` on
+    /// `assistant_persisted` envelopes and to the `message_id` on a
+    /// `background_child_completed` envelope. Hydrated clients use it to
+    /// coalesce durable transcript rows with their canonical v2 projection.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message_id: Option<String>,
-    /// M10 Phase 6.2 (Bug C). Wire-form
-    /// [`MessagePersistedSource`] for the row, captured from the
-    /// retained `message/persisted` ledger event matching this row's
-    /// `seq`. Negotiated clients use this in combination with
-    /// [`SessionHydrateResult::replayed_envelopes`] to coalesce the
-    /// per-file `send_file` companion rows behind a single envelope
-    /// bubble: a row with `source == "background"` whose
-    /// `message_id` does NOT match any envelope's `message_id` is
-    /// the kind the live wire suppresses for negotiated clients.
-    /// Omitted when the row's commit ledger event has aged out of
-    /// the retention window OR the connection didn't negotiate
-    /// `event.spawn_complete.v1` — in those cases the client falls
-    /// back to the legacy multi-row render (one extra bubble vs
-    /// live, but never lossy).
+    /// Provenance inferred from retained v2 envelopes. A `"background"`
+    /// value identifies transcript rows coalesced by a linked
+    /// `background_child_completed` envelope; absent means no retained v2
+    /// projection establishes special provenance for the row.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
     /// File attachments stored with this row in the canonical session
     /// JSONL — surfaced so clients reconstructing history after a
-    /// disconnect can render the same attachment they would have rendered
-    /// on the original `message/persisted` push (cf. the `media` field
-    /// on `MessagePersistedEvent`).
+    /// disconnect can render the same attachment represented by the
+    /// corresponding canonical v2 projection.
     ///
     /// Backwards-compatible: omitted from the wire when empty so clients
     /// running older protocol versions see the same shape they used to.
@@ -2819,53 +2784,19 @@ pub struct SessionHydrateResult {
     /// capability.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending_questions: Option<Vec<UserQuestionRequestedEvent>>,
-    /// M10 Phase 6.2 (Bug C). Retained `turn/spawn_complete` envelopes
-    /// from the ledger replay window for clients that negotiated
-    /// [`UI_PROTOCOL_FEATURE_SPAWN_COMPLETE_V1`]. Populated only when
-    /// the request asks for `messages` (the dedup target) and the
-    /// connection has the capability negotiated; absent otherwise so
-    /// the legacy wire shape is preserved bit-for-bit for older
-    /// clients.
-    ///
-    /// Semantics for negotiated clients on a full reload (where
-    /// `session/open` with no `after` returns no historical replay
-    /// and the `messages` list necessarily includes the legacy
-    /// `Background`-source rows):
-    ///
-    ///   * Each envelope's `message_id` matches exactly one Background
-    ///     row in `messages` — that row is the spawn-ack, the
-    ///     canonical visible bubble for the completion.
-    ///   * Per-file `send_file` companion rows (Background source,
-    ///     emitted before the ack) are NOT carried on the envelope as
-    ///     individual `message_id`s; their content is summarised by
-    ///     the envelope's `media` array.
-    ///
-    /// A reducer that wants the "single bubble per completion" wire
-    /// shape on reload should: (a) render the envelope, (b) drop the
-    /// matching spawn-ack row (`message_id` match) plus any Background
-    /// rows in the envelope's thread that precede the spawn-ack and
-    /// don't match any retained envelope's `message_id`. The server
-    /// declines to make this decision because it has no way to
-    /// distinguish "row covered by an envelope that has aged out" from
-    /// "row covered by an envelope that never landed (persist
-    /// failed)" — see the multi-task per-turn and orphan-companion
-    /// edge cases codex flagged on PR landing.
+    /// Canonical v2 background-child envelopes retained in the ledger replay
+    /// window. Populated only when the request asks for `messages` and the
+    /// connection negotiated `projection.envelope.v2`; omitted otherwise.
+    /// Their `message_id` values match the durable transcript row so a client
+    /// can coalesce a background completion without consulting a second
+    /// persisted-message wire lane.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub replayed_envelopes: Option<Vec<TurnSpawnCompleteEvent>>,
-    /// Additive reload-recovery lane for tool-call UI state. These are
-    /// canonical M9-gamma projection envelopes filtered to tool_* payloads
-    /// from the hydrate replay window. They let clients that still render via
-    /// the legacy ThreadStore rebuild the same tool cards that live
-    /// `tool/started`, `tool/progress`, and `tool/completed` notifications
-    /// produced before the page refresh.
-    ///
-    /// This intentionally does not make `messages_page` equivalent to
-    /// `session/hydrate`: message rows remain the durable transcript, while
-    /// hydrate carries replayable UI projection facts. Omitted unless the
-    /// client requested `messages` and negotiated the same refresh-recovery
-    /// capability used by `replayed_envelopes`.
+    pub replayed_envelopes: Option<Vec<EnvelopeV2>>,
+    /// Canonical v2 tool envelopes from the hydrate replay window. This keeps
+    /// a reload's tool-card reconstruction on the same projection protocol as
+    /// live delivery.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub replayed_tool_envelopes: Option<Vec<Envelope>>,
+    pub replayed_tool_envelopes: Option<Vec<EnvelopeV2>>,
 }
 
 /// Params for `session/rollback` — conversation-only rewind. Drops the last
@@ -3452,136 +3383,21 @@ pub struct RouterGetMetricsResult {
     pub circuit_breakers: BTreeMap<String, String>,
 }
 
-// ----- UPCR-2026-012 `message/persisted` -----
-
-/// Open registry for `MessagePersistedEvent.source`. Future variants must be
-/// added via a follow-up UPCR. Wire form is snake_case.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum MessagePersistedSource {
-    /// Direct API ingress (web `POST /api/chat`, `turn/start`, telegram, ...).
-    User,
-    /// Primary turn assistant output.
-    Assistant,
-    /// Tool invocation result attached to a turn.
-    Tool,
-    /// `spawn_only` background result row that commits after the parent
-    /// turn's `turn/completed`.
-    Background,
-    /// Synthetic recovery turn row (M8.9 path).
-    Recovery,
-}
-
-impl MessagePersistedSource {
-    /// Best-effort mapping from `MessageRole` for write paths that lack a
-    /// dedicated source discriminator. The result is a sensible default the
-    /// caller can override before emit when richer provenance is known
-    /// (e.g. `Background` for spawn-only commits).
-    pub fn from_role(role: crate::types::MessageRole) -> Self {
-        match role {
-            crate::types::MessageRole::User => Self::User,
-            crate::types::MessageRole::Assistant => Self::Assistant,
-            crate::types::MessageRole::Tool => Self::Tool,
-            // System messages rarely commit through the persistence path
-            // covered by `message/persisted`; treat as assistant for the
-            // typed enum since `system` is not a registered source.
-            crate::types::MessageRole::System => Self::Assistant,
-        }
-    }
-
-    /// Wire-form discriminant string. Mirrors the snake_case serde
-    /// rename and matches what serializing the enum to a JSON string
-    /// would produce. Used by the `session/hydrate` projection to
-    /// surface per-row provenance on `HydratedMessage.source`.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::User => "user",
-            Self::Assistant => "assistant",
-            Self::Tool => "tool",
-            Self::Background => "background",
-            Self::Recovery => "recovery",
-        }
-    }
-}
-
-/// Notification params for `message/persisted` (UPCR-2026-012). Emitted once
-/// per durable commit of a row by `Session::add_message_with_seq` AFTER the
-/// row is fsynced to the JSONL ledger. Strict-ordered per session: a client
-/// that consumes the notification and tracks the latest cursor has an
-/// authoritative replay-safe view of the session message log.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct MessagePersistedEvent {
-    pub session_id: SessionKey,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub topic: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub turn_id: Option<TurnId>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub thread_id: Option<String>,
-    pub seq: u64,
-    pub role: String,
-    pub message_id: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub client_message_id: Option<String>,
-    pub source: MessagePersistedSource,
-    pub cursor: UiCursor,
-    pub persisted_at: DateTime<Utc>,
-    /// File attachments persisted with this message — typically a single
-    /// `.md` / `.mp3` / `.pptx` artefact path emitted by `spawn_only`
-    /// background tools (`deep_search`, `mofa_*`, `fm_tts`) or an explicit
-    /// `send_file` call. Clients that advertise `event.message_persisted.v1`
-    /// AND understand a non-empty `media` field should render the attachment
-    /// inline (e.g. an `<a href>` to the file URL); legacy clients that only
-    /// know about `content` continue to render the text.
-    ///
-    /// Backwards-compatible: serialized as omitted when empty so clients
-    /// running older protocol versions see the same wire shape they used to.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub media: Vec<String>,
-    /// Optional text content of the persisted row.
-    ///
-    /// Pre-fix this field was omitted from the wire: `message/persisted`
-    /// carried only metadata alongside `media`, and the SPA hardcoded
-    /// `content: ""` when rebuilding the message. That dropped the
-    /// assistant's caption or summary text whenever a row carried BOTH
-    /// text and a file (e.g. `send_file` with a caption, mofa_slides
-    /// delivery with a summary). Carrying the content here when non-empty
-    /// lets clients render the bubble with text + file together.
-    ///
-    /// Wire compatibility: serialized as omitted when empty, so legacy
-    /// clients that don't read the field continue to behave as before.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub content: Option<String>,
-}
-
 // ----- M10 Phase 1 `turn/spawn_complete` -----
 
-/// Notification params for `turn/spawn_complete` (M10 Phase 1). Emitted once
-/// per `spawn_only` background tool completion AFTER the late assistant row
-/// is durably persisted, in addition to (and as the wire-level replacement
-/// of) the corresponding `message/persisted` event for clients that
-/// negotiated [`UI_PROTOCOL_FEATURE_SPAWN_COMPLETE_V1`].
-///
-/// The wire shape mirrors [`MessagePersistedEvent`] (durable cursor, seq,
-/// `message_id`, `persisted_at`) so a client that already has a
-/// `MessagePersisted` reducer can route this through the same persistence
-/// confirmation path. It adds two distinguishing fields:
+/// Notification params for legacy `turn/spawn_complete` records (M10 Phase
+/// 1). New writes use [`PayloadV2::BackgroundChildCompleted`]; this shape is
+/// retained only so older durable ledger records can be decoded and projected
+/// during migration. It carries durable identity plus these distinguishing
+/// fields:
 ///
 /// - `task_id` — which `spawn_only` task the completion came from.
 /// - `response_to_client_message_id` — the originating user message's
 ///   `client_message_id`, telling the client which user prompt's thread
-///   the new assistant bubble belongs under (analogous to the existing
-///   `MessagePersistedEvent.thread_id`, but specifically the *user-prompt*
-///   anchor; the splice-merge logic in legacy clients was the bug surface
-///   the new envelope replaces).
+///   the new assistant bubble belongs under.
 ///
-/// Unlike `message/persisted` (which carries optional `content` alongside
-/// streamed `message/delta` deltas — see [`MessagePersistedEvent::content`]
-/// — and is primarily a durable commit confirmation), this event carries
-/// the full `content` and `media` for the late completion in one frame as
-/// a REQUIRED field — by design, the client never needs to splice-merge or
-/// wait for further deltas. `media` mirrors the convention in
-/// `MessagePersistedEvent`.
+/// The full `content` and `media` are required so an old durable record can
+/// still be projected atomically to the v2 child stream.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TurnSpawnCompleteEvent {
     pub session_id: SessionKey,
@@ -3618,13 +3434,10 @@ pub struct TurnSpawnCompleteEvent {
     pub source: String,
     pub cursor: UiCursor,
     pub persisted_at: DateTime<Utc>,
-    /// REQUIRED. The full assistant text for the completion bubble. Unlike
-    /// [`MessagePersistedEvent::content`] (optional and omitted when
-    /// empty), this event ALWAYS carries the text inline so the client
-    /// can render the new bubble atomically without a follow-up fetch.
+    /// REQUIRED. The full assistant text for the completion bubble.
     pub content: String,
     /// File attachments for this completion (e.g. `_report.md`,
-    /// `output.mp3`). Same convention as `MessagePersistedEvent.media`.
+    /// `output.mp3`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub media: Vec<String>,
 }
@@ -3664,7 +3477,7 @@ fn is_zero_u64(value: &u64) -> bool {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MessageMeta {
     /// Server-assigned UUID of the durable row (mirrors
-    /// [`MessagePersistedEvent::message_id`]). Stable across replays.
+    /// `MessageMeta.message_id`). Stable across replays.
     pub message_id: String,
     /// RFC 3339 wall-clock time the row committed.
     pub persisted_at: DateTime<Utc>,
@@ -6335,12 +6148,8 @@ pub enum UiNotification {
     TurnCompleted(TurnCompletedEvent),
     TurnError(TurnErrorEvent),
     ReplayLossy(ReplayLossyEvent),
-    /// UPCR-2026-012: durable-commit confirmation per session row.
-    MessagePersisted(MessagePersistedEvent),
-    /// M10 Phase 1: completion-as-new-envelope event for `spawn_only`
-    /// background results. Emitted in addition to `MessagePersisted` for
-    /// the same row; per-connection capability filtering (the
-    /// `event.spawn_complete.v1` flag) decides which one the client sees.
+    /// Legacy completion event for durable records written before the v2-only
+    /// background-child projection migration. New writes use `EnvelopeV2`.
     TurnSpawnComplete(TurnSpawnCompleteEvent),
     /// UPCR-2026-014 (M9-α-9): per-turn file attachment event.
     FileAttached(FileAttachedEvent),
@@ -6393,12 +6202,13 @@ pub enum UiNotification {
     /// per-connection live filter keeps legacy and envelope deliveries
     /// mutually exclusive (legacy clients never see this variant,
     /// negotiated clients see ONLY this variant for the events it
-    /// supersedes — `message/delta`, `message/persisted`, `tool/*`,
+    /// supersedes — `message/delta`, `tool/*`,
     /// `turn/completed`, `file/attached`).
     Envelope(EnvelopeNotification),
     /// Stage-1 canonical projection envelope. Uses the same flattened
-    /// `projection/envelope` method as v1, selected exclusively by the
-    /// `projection.envelope.v2` capability.
+    /// `projection/envelope` method as v1. New canonical rows are delivered
+    /// unconditionally; `projection.envelope.v2` still requests v2
+    /// projection of historical source records.
     EnvelopeV2(EnvelopeV2Notification),
 }
 
@@ -6440,7 +6250,6 @@ impl UiNotification {
             Self::TurnCompleted(_) => methods::TURN_COMPLETED,
             Self::TurnError(_) => methods::TURN_ERROR,
             Self::ReplayLossy(_) => methods::REPLAY_LOSSY,
-            Self::MessagePersisted(_) => methods::MESSAGE_PERSISTED,
             Self::TurnSpawnComplete(_) => methods::TURN_SPAWN_COMPLETE,
             Self::FileAttached(_) => methods::FILE_ATTACHED,
             Self::VoiceAudioChunk(_) => methods::VOICE_AUDIO_CHUNK,
@@ -6491,7 +6300,6 @@ impl UiNotification {
             Self::TurnCompleted(event) => &event.session_id,
             Self::TurnError(event) => &event.session_id,
             Self::ReplayLossy(event) => &event.session_id,
-            Self::MessagePersisted(event) => &event.session_id,
             Self::TurnSpawnComplete(event) => &event.session_id,
             Self::FileAttached(event) => &event.session_id,
             Self::VoiceAudioChunk(event) => &event.session_id,
@@ -6566,9 +6374,6 @@ impl UiNotification {
                 event.topic.as_deref().or_else(|| event.session_id.topic())
             }
             Self::TurnError(event) => event.topic.as_deref().or_else(|| event.session_id.topic()),
-            Self::MessagePersisted(event) => {
-                event.topic.as_deref().or_else(|| event.session_id.topic())
-            }
             Self::TurnSpawnComplete(event) => {
                 event.topic.as_deref().or_else(|| event.session_id.topic())
             }
@@ -6612,7 +6417,6 @@ impl UiNotification {
             Self::TaskOutputDelta(event) => set_topic_if_absent(&mut event.topic, &topic),
             Self::TurnCompleted(event) => set_topic_if_absent(&mut event.topic, &topic),
             Self::TurnError(event) => set_topic_if_absent(&mut event.topic, &topic),
-            Self::MessagePersisted(event) => set_topic_if_absent(&mut event.topic, &topic),
             Self::TurnSpawnComplete(event) => set_topic_if_absent(&mut event.topic, &topic),
             Self::FileAttached(event) => set_topic_if_absent(&mut event.topic, &topic),
             Self::VoiceAudioChunk(event) => set_topic_if_absent(&mut event.topic, &topic),
@@ -6651,7 +6455,6 @@ impl UiNotification {
             Self::TurnCompleted(params) => serde_json::to_value(params),
             Self::TurnError(params) => serde_json::to_value(params),
             Self::ReplayLossy(params) => serde_json::to_value(params),
-            Self::MessagePersisted(params) => serde_json::to_value(params),
             Self::TurnSpawnComplete(params) => serde_json::to_value(params),
             Self::FileAttached(params) => serde_json::to_value(params),
             Self::VoiceAudioChunk(params) => serde_json::to_value(params),
@@ -6777,9 +6580,6 @@ impl UiNotification {
             methods::TURN_COMPLETED => Ok(Self::TurnCompleted(decode_params(method, params)?)),
             methods::TURN_ERROR => Ok(Self::TurnError(decode_params(method, params)?)),
             methods::REPLAY_LOSSY => Ok(Self::ReplayLossy(decode_params(method, params)?)),
-            methods::MESSAGE_PERSISTED => {
-                Ok(Self::MessagePersisted(decode_params(method, params)?))
-            }
             methods::TURN_SPAWN_COMPLETE => {
                 Ok(Self::TurnSpawnComplete(decode_params(method, params)?))
             }
@@ -7525,10 +7325,6 @@ mod tests {
             "state.turn_state_get.v1"
         );
         assert_eq!(
-            UI_PROTOCOL_FEATURE_MESSAGE_PERSISTED_V1,
-            "event.message_persisted.v1"
-        );
-        assert_eq!(
             UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V1,
             "projection.envelope.v1"
         );
@@ -7654,7 +7450,6 @@ mod tests {
                 "progress/updated",
                 "warning",
                 "protocol/replay_lossy",
-                "message/persisted",
                 "turn/spawn_complete",
                 "file/attached",
                 "visual/generating",
@@ -7844,7 +7639,6 @@ mod tests {
                     "progress/updated",
                     "warning",
                     "protocol/replay_lossy",
-                    "message/persisted",
                     "turn/spawn_complete",
                     "file/attached",
                     "visual/generating",
@@ -7878,7 +7672,6 @@ mod tests {
                     "state.session_hydrate.v1",
                     "state.thread_graph.v1",
                     "state.turn_state_get.v1",
-                    "event.message_persisted.v1",
                     "event.spawn_complete.v1",
                     "event.file_attached.v1",
                     "projection.envelope.v1",
@@ -10887,90 +10680,6 @@ mod tests {
     }
 
     #[test]
-    fn golden_message_persisted_event_serde() {
-        let event = MessagePersistedEvent {
-            session_id: sample_session_id(),
-            topic: None,
-            turn_id: Some(sample_turn_id()),
-            thread_id: Some("thread-1".into()),
-            seq: 18,
-            role: "assistant".into(),
-            message_id: "msg-1".into(),
-            client_message_id: Some("cmid-1".into()),
-            source: MessagePersistedSource::Assistant,
-            cursor: UiCursor {
-                stream: "local:demo".into(),
-                seq: 18,
-            },
-            persisted_at: sample_persisted_at(),
-            media: vec!["report.md".into()],
-            content: Some("Here is the report.".into()),
-        };
-        let value = serde_json::to_value(&event).expect("serialize");
-        assert_eq!(value.get("source"), Some(&json!("assistant")));
-        assert_eq!(value.get("content"), Some(&json!("Here is the report.")));
-        let parsed: MessagePersistedEvent = serde_json::from_value(value).expect("deserialize");
-        assert_eq!(parsed, event);
-
-        // content=None must be omitted from the wire (legacy compat
-        // for clients that don't read the field).
-        let event_no_content = MessagePersistedEvent {
-            content: None,
-            ..event.clone()
-        };
-        let value_no_content = serde_json::to_value(&event_no_content).expect("serialize");
-        assert_eq!(
-            value_no_content.get("content"),
-            None,
-            "content=None must be omitted from the wire"
-        );
-        let parsed_no_content: MessagePersistedEvent =
-            serde_json::from_value(value_no_content).expect("deserialize none");
-        assert_eq!(parsed_no_content, event_no_content);
-
-        // All five source variants round-trip.
-        for source in [
-            MessagePersistedSource::User,
-            MessagePersistedSource::Assistant,
-            MessagePersistedSource::Tool,
-            MessagePersistedSource::Background,
-            MessagePersistedSource::Recovery,
-        ] {
-            let e = MessagePersistedEvent {
-                session_id: sample_session_id(),
-                topic: None,
-                turn_id: None,
-                thread_id: None,
-                seq: 1,
-                role: "tool".into(),
-                message_id: "msg-x".into(),
-                client_message_id: None,
-                source,
-                cursor: UiCursor {
-                    stream: "local:demo".into(),
-                    seq: 1,
-                },
-                persisted_at: sample_persisted_at(),
-                media: vec![],
-                content: None,
-            };
-            let v = serde_json::to_value(&e).expect("serialize source");
-            let p: MessagePersistedEvent = serde_json::from_value(v).expect("deserialize source");
-            assert_eq!(p, e);
-        }
-
-        // Wire-level: round-trip via the JSON-RPC notification envelope.
-        let notif = UiNotification::MessagePersisted(event.clone());
-        let rpc = notif
-            .clone()
-            .into_rpc_notification()
-            .expect("notification serialize");
-        assert_eq!(rpc.method, methods::MESSAGE_PERSISTED);
-        let decoded = UiNotification::from_rpc_notification(rpc).expect("notification deserialize");
-        assert_eq!(decoded, notif);
-    }
-
-    #[test]
     fn golden_turn_spawn_complete_event_serde() {
         let event = TurnSpawnCompleteEvent {
             session_id: sample_session_id(),
@@ -11009,9 +10718,7 @@ mod tests {
         let parsed: TurnSpawnCompleteEvent = serde_json::from_value(value).expect("deserialize");
         assert_eq!(parsed, event);
 
-        // Empty media + absent optionals omit on the wire (legacy
-        // clients see the same shape as `MessagePersistedEvent`'s
-        // optional-fields convention).
+        // Empty media and absent optionals omit on the wire.
         let bare = TurnSpawnCompleteEvent {
             session_id: sample_session_id(),
             topic: None,
@@ -11189,14 +10896,9 @@ mod tests {
             UI_PROTOCOL_FEATURE_SPAWN_COMPLETE_V1,
         ]);
         assert!(only_spawn.supports_feature(UI_PROTOCOL_FEATURE_SPAWN_COMPLETE_V1));
-        assert!(
-            !only_spawn.supports_feature(UI_PROTOCOL_FEATURE_MESSAGE_PERSISTED_V1),
-            "non-requested feature must NOT be advertised",
-        );
 
         // The notification method is advertised regardless of negotiated
-        // gating today (mirrors how `message/persisted` is unconditionally
-        // listed in `UI_PROTOCOL_NOTIFICATION_METHODS`); per-connection
+        // gating today; per-connection
         // emit-time filtering is what enforces the capability.
         assert!(
             UI_PROTOCOL_NOTIFICATION_METHODS.contains(&methods::TURN_SPAWN_COMPLETE),
@@ -11212,7 +10914,6 @@ mod tests {
         assert!(full.supports_feature(UI_PROTOCOL_FEATURE_SESSION_HYDRATE_V1));
         assert!(full.supports_feature(UI_PROTOCOL_FEATURE_THREAD_GRAPH_V1));
         assert!(full.supports_feature(UI_PROTOCOL_FEATURE_TURN_STATE_GET_V1));
-        assert!(full.supports_feature(UI_PROTOCOL_FEATURE_MESSAGE_PERSISTED_V1));
         // And the gated methods are visible.
         assert!(full.supports_method(methods::SESSION_HYDRATE));
         assert!(full.supports_method(methods::THREAD_GRAPH_GET));
@@ -11233,17 +10934,15 @@ mod tests {
         );
         assert!(!only_thread_graph.supports_method(methods::TURN_STATE_GET));
 
-        // Negotiated subset: all four UPCR-2026-009..012 flags requested.
+        // Negotiated subset: all state-query capabilities requested.
         let all_new = UiProtocolCapabilities::for_negotiated_features([
             UI_PROTOCOL_FEATURE_SESSION_HYDRATE_V1,
             UI_PROTOCOL_FEATURE_THREAD_GRAPH_V1,
             UI_PROTOCOL_FEATURE_TURN_STATE_GET_V1,
-            UI_PROTOCOL_FEATURE_MESSAGE_PERSISTED_V1,
         ]);
         assert!(all_new.supports_feature(UI_PROTOCOL_FEATURE_SESSION_HYDRATE_V1));
         assert!(all_new.supports_feature(UI_PROTOCOL_FEATURE_THREAD_GRAPH_V1));
         assert!(all_new.supports_feature(UI_PROTOCOL_FEATURE_TURN_STATE_GET_V1));
-        assert!(all_new.supports_feature(UI_PROTOCOL_FEATURE_MESSAGE_PERSISTED_V1));
         assert!(all_new.supports_method(methods::SESSION_HYDRATE));
         assert!(all_new.supports_method(methods::THREAD_GRAPH_GET));
         assert!(all_new.supports_method(methods::TURN_STATE_GET));
