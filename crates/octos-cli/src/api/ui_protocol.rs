@@ -27,13 +27,14 @@ use octos_core::app_ui_codec::{self, AppUiFrame, MAX_TEXT_FRAME_BYTES};
 use octos_core::ui_protocol::{
     AgentUpdatedEvent, ApprovalAutoResolvedEvent, ApprovalCancelledEvent, ApprovalCommandDetails,
     ApprovalDecidedEvent, ApprovalDecision, ApprovalId, ApprovalRenderHints,
-    ApprovalRequestedEvent, ApprovalTypedDetails, ContentBulkDeleteParams, ContentDeleteParams,
-    ContentListParams, ContextCompactionCompletedEvent, ContextCompactionStartedEvent,
-    ContextNormalizationReportedEvent, CronListParams, CronToggleParams, Envelope,
-    EnvelopeTokenUsage, FileRef, HydratedMessage, HydratedTurn, InputItem, MemoryEntityParams,
-    MemoryOverviewParams, MessageDeltaEvent, MessageMeta, MessagePersistedEvent,
-    MessagePersistedSource, OutputCursor, Payload, ReplayLossyEvent, RpcError, RpcErrorResponse,
-    RpcRequest, RpcResponse, SESSION_HYDRATE_INCLUDE_MAX, SESSION_MESSAGES_PAGE_DEFAULT_LIMIT,
+    ApprovalRequestedEvent, ApprovalTypedDetails, AttachmentOwnerV2, ContentBulkDeleteParams,
+    ContentDeleteParams, ContentListParams, ContextCompactionCompletedEvent,
+    ContextCompactionStartedEvent, ContextNormalizationReportedEvent, CronListParams,
+    CronToggleParams, Envelope, EnvelopeTokenUsage, EnvelopeV2, EnvelopeV2Notification, FileRef,
+    HydratedMessage, HydratedTurn, InputItem, MemoryEntityParams, MemoryOverviewParams,
+    MessageDeltaEvent, MessageMeta, MessagePersistedEvent, MessagePersistedSource, OutputCursor,
+    Payload, PayloadV2, ReplayLossyEvent, RpcError, RpcErrorResponse, RpcRequest, RpcResponse,
+    SESSION_HYDRATE_INCLUDE_MAX, SESSION_MESSAGES_PAGE_DEFAULT_LIMIT,
     SESSION_MESSAGES_PAGE_MAX_LIMIT, SESSION_MESSAGES_PAGE_MAX_OFFSET, SESSION_TITLE_SET_MAX_CHARS,
     SessionBtwParams, SessionDeleteParams, SessionFilesListParams, SessionHydrateParams,
     SessionHydrateResult, SessionListParams, SessionMessagesPageParams, SessionOpenParams,
@@ -47,25 +48,27 @@ use octos_core::ui_protocol::{
     ThreadGraphGetParams, ThreadGraphGetResult, ToolCompletedEvent, ToolProgressEvent,
     ToolStartedEvent, TurnCompletedEvent, TurnErrorEvent, TurnId, TurnInterruptParams,
     TurnInterruptResult, TurnLifecycleState, TurnSessionResult, TurnSpawnCompleteEvent,
-    TurnStartParams, TurnStateGetParams, TurnStateGetResult, UI_PROTOCOL_FEATURE_APPROVAL_TYPED_V1,
+    TurnStartParams, TurnStateGetParams, TurnStateGetResult, TurnTerminalError,
+    TurnTerminalOutcome, UI_PROTOCOL_FEATURE_APPROVAL_TYPED_V1,
     UI_PROTOCOL_FEATURE_AUXILIARY_REST_TO_WS_V1, UI_PROTOCOL_FEATURE_CODING_AGENT_CONTROL_V1,
     UI_PROTOCOL_FEATURE_CODING_AUTONOMY_V1, UI_PROTOCOL_FEATURE_CODING_GOAL_RUNTIME_V1,
     UI_PROTOCOL_FEATURE_CODING_LOOP_RUNTIME_V1, UI_PROTOCOL_FEATURE_CONTEXT_LIFECYCLE_V1,
     UI_PROTOCOL_FEATURE_FILE_ATTACHED_V1, UI_PROTOCOL_FEATURE_HARNESS_TASK_ARTIFACTS_V1,
     UI_PROTOCOL_FEATURE_HARNESS_TASK_CONTROL_V1, UI_PROTOCOL_FEATURE_MESSAGE_PERSISTED_V1,
     UI_PROTOCOL_FEATURE_PANE_SNAPSHOTS_V1, UI_PROTOCOL_FEATURE_PLAN_TODOS_V1,
-    UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V1, UI_PROTOCOL_FEATURE_REVIEW_START_V1,
-    UI_PROTOCOL_FEATURE_SESSION_HYDRATE_V1, UI_PROTOCOL_FEATURE_SESSION_SANDBOX_V1,
-    UI_PROTOCOL_FEATURE_SESSION_WORKSPACE_CWD_V1, UI_PROTOCOL_FEATURE_SPAWN_COMPLETE_V1,
-    UI_PROTOCOL_FEATURE_THREAD_GRAPH_V1, UI_PROTOCOL_FEATURE_TURN_STATE_GET_V1,
-    UI_PROTOCOL_FEATURE_USER_QUESTION_V1, UI_PROTOCOL_FEATURE_VOICE_AUDIO_V1, UiAgentRecord,
-    UiArtifactPaneItem, UiArtifactPaneSnapshot, UiCommand, UiContextCompactionRecord,
-    UiContextNormalizationReport, UiContextState, UiCursor, UiFileMutationNotice, UiGitHistoryItem,
-    UiGitPaneSnapshot, UiGitStatusItem, UiNotification, UiPaneSnapshot, UiPaneSnapshotLimitation,
-    UiProgressEvent, UiProgressMetadata, UiProtocolCapabilities, UiRpcResult, UiWorkspacePaneEntry,
-    UiWorkspacePaneSnapshot, UnsupportedCapabilityReport, UserQuestionRequestedEvent,
-    UserQuestionRespondParams, VoiceAudioChunkEvent, approval_cancelled_reasons, approval_kinds,
-    hydrate_sections, progress_kinds, thread_status,
+    UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V1, UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V2,
+    UI_PROTOCOL_FEATURE_REVIEW_START_V1, UI_PROTOCOL_FEATURE_SESSION_HYDRATE_V1,
+    UI_PROTOCOL_FEATURE_SESSION_SANDBOX_V1, UI_PROTOCOL_FEATURE_SESSION_WORKSPACE_CWD_V1,
+    UI_PROTOCOL_FEATURE_SPAWN_COMPLETE_V1, UI_PROTOCOL_FEATURE_THREAD_GRAPH_V1,
+    UI_PROTOCOL_FEATURE_TURN_STATE_GET_V1, UI_PROTOCOL_FEATURE_USER_QUESTION_V1,
+    UI_PROTOCOL_FEATURE_VOICE_AUDIO_V1, UiAgentRecord, UiArtifactPaneItem, UiArtifactPaneSnapshot,
+    UiCommand, UiContextCompactionRecord, UiContextNormalizationReport, UiContextState, UiCursor,
+    UiFileMutationNotice, UiGitHistoryItem, UiGitPaneSnapshot, UiGitStatusItem, UiNotification,
+    UiPaneSnapshot, UiPaneSnapshotLimitation, UiProgressEvent, UiProgressMetadata,
+    UiProtocolCapabilities, UiRpcResult, UiWorkspacePaneEntry, UiWorkspacePaneSnapshot,
+    UnsupportedCapabilityReport, UserQuestionRequestedEvent, UserQuestionRespondParams,
+    VoiceAudioChunkEvent, approval_cancelled_reasons, approval_kinds, hydrate_sections,
+    progress_kinds, thread_status,
 };
 use octos_core::{
     AgentId, InboundMessage, MAIN_PROFILE_ID, Message, MessageRole, SessionKey, TaskId,
@@ -1133,6 +1136,11 @@ struct ConnectionUiFeatures {
     /// γ-2 (follow-up) gates emission on this flag; γ-3 deletes the
     /// legacy notifications.
     projection_envelope: bool,
+    /// Stage 1 `projection.envelope.v2` negotiated. This is deliberately
+    /// independent from the v1 flag and defaults to false on every transport.
+    /// When set, the connection receives the cursor-stamped v2 projection
+    /// wire shape and neither legacy nor v1 projection frames.
+    projection_envelope_v2: bool,
     /// M12 Phase D-1 `auxiliary.rest_to_ws.v1` negotiated. Unlocks the
     /// thirteen auxiliary JSON-RPC methods (`session/list`,
     /// `session/snapshot`, `session/messages_page`, `session/status.get`,
@@ -1221,6 +1229,11 @@ impl ConnectionUiFeatures {
                 query,
                 UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V1,
             ),
+            projection_envelope_v2: has_ui_feature(
+                headers,
+                query,
+                UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V2,
+            ),
             auxiliary_rest_to_ws_v1: has_ui_feature(
                 headers,
                 query,
@@ -1289,6 +1302,7 @@ impl ConnectionUiFeatures {
             // `client_hello` (`from_requested_feature_tokens`), so this is a
             // default-only change, not a capability removal.
             projection_envelope: false,
+            projection_envelope_v2: false,
             auxiliary_rest_to_ws_v1: true,
             coding_autonomy_v1: true,
             coding_agent_control_v1: true,
@@ -1329,6 +1343,7 @@ impl ConnectionUiFeatures {
             voice_audio: has(UI_PROTOCOL_FEATURE_VOICE_AUDIO_V1),
             plan_todos: has(UI_PROTOCOL_FEATURE_PLAN_TODOS_V1),
             projection_envelope: has(UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V1),
+            projection_envelope_v2: has(UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V2),
             auxiliary_rest_to_ws_v1: has(UI_PROTOCOL_FEATURE_AUXILIARY_REST_TO_WS_V1),
             coding_autonomy_v1: has(UI_PROTOCOL_FEATURE_CODING_AUTONOMY_V1),
             coding_agent_control_v1: has(UI_PROTOCOL_FEATURE_CODING_AGENT_CONTROL_V1),
@@ -1400,6 +1415,9 @@ impl ConnectionUiFeatures {
         }
         if self.projection_envelope {
             requested.push(UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V1);
+        }
+        if self.projection_envelope_v2 {
+            requested.push(UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V2);
         }
         if self.auxiliary_rest_to_ws_v1 {
             requested.push(UI_PROTOCOL_FEATURE_AUXILIARY_REST_TO_WS_V1);
@@ -10430,10 +10448,15 @@ async fn handle_session_open(
     // `turn/spawn_complete`, never both). Reusing the helper keeps replay
     // and live in lockstep.
     for event in outcome.replay {
-        if !live_event_passes_capability_filter(&event.event, features) {
+        let projected = features
+            .projection_envelope_v2
+            .then(|| project_v2_ledger_event(ledger, &event.event, &event.cursor))
+            .flatten();
+        let event_for_wire = projected.unwrap_or(event.event);
+        if !live_event_passes_capability_filter(&event_for_wire, features) {
             continue;
         }
-        let _ = send_ledger_event_durable(ws, ledger, event.event);
+        let _ = send_ledger_event_durable(ws, ledger, event_for_wire);
     }
     for event in outcome.pending_approvals {
         let _ = send_ledger_event_durable(
@@ -10634,10 +10657,19 @@ async fn spawn_live_forwarder(
                     if !ledger_event_matches_topic_scope(&event.event, topic_scope.as_deref()) {
                         continue;
                     }
-                    if !live_event_passes_capability_filter(&event.event, features) {
+                    // Stage 1 v2 is a wire projection of this existing
+                    // durable record. Do this before filtering so the v2
+                    // gate sees `EnvelopeV2`, while legacy/v1 connections
+                    // keep evaluating the original event byte-for-byte.
+                    let projected = features
+                        .projection_envelope_v2
+                        .then(|| project_v2_ledger_event(&ledger, &event.event, &event.cursor))
+                        .flatten();
+                    let event_for_wire = projected.unwrap_or(event.event);
+                    if !live_event_passes_capability_filter(&event_for_wire, features) {
                         continue;
                     }
-                    match send_ledger_event_durable(&ws, &ledger, event.event) {
+                    match send_ledger_event_durable(&ws, &ledger, event_for_wire) {
                         Ok(()) => {}
                         // #924 BLOCK 2: a closed writer OR a latched
                         // failure both mean further pumps will produce
@@ -10678,6 +10710,265 @@ async fn spawn_live_forwarder(
     }
 }
 
+/// Build the Stage-1 v2 projection for one already-durable source event.
+///
+/// The returned notification is a *wire projection*, not a second ledger
+/// append. Its cursor is the cursor of `event`, so enabling v2 cannot shift a
+/// legacy client's cursor sequence or otherwise alter its bytes. V1 envelope
+/// rows remain the durable source for streamed content; legacy terminal,
+/// attachment, and background-completion rows fill the v2 gaps that v1 could
+/// not represent canonically.
+fn project_v2_ledger_event(
+    ledger: &UiProtocolLedger,
+    event: &UiProtocolLedgerEvent,
+    cursor: &UiCursor,
+) -> Option<UiProtocolLedgerEvent> {
+    let UiProtocolLedgerEvent::Notification(notification) = event else {
+        return None;
+    };
+
+    let projection = match notification {
+        UiNotification::EnvelopeV2(envelope) => envelope.clone(),
+        UiNotification::Envelope(envelope) => {
+            let source = &envelope.envelope;
+            let assistant_segment_id = || {
+                format!(
+                    "{}:assistant:{}",
+                    source.thread_id,
+                    ledger.projection_v2_assistant_segment_index(
+                        &envelope.session_id,
+                        &source.thread_id,
+                        source.seq,
+                    )
+                )
+            };
+            let payload = match &source.payload {
+                Payload::UserMessage { text, files } => PayloadV2::UserMessage {
+                    text: text.clone(),
+                    files: files.clone(),
+                },
+                Payload::AssistantDelta { text } => PayloadV2::AssistantDelta {
+                    text: text.clone(),
+                    assistant_segment_id: assistant_segment_id(),
+                },
+                Payload::ReasoningDelta { text } => {
+                    PayloadV2::ReasoningDelta { text: text.clone() }
+                }
+                Payload::AssistantPersisted { text, meta } => {
+                    // Background rows are represented only by the linked child
+                    // stream below. Never append them after the foreground
+                    // parent's terminal stream.
+                    if ledger
+                        .projection_v2_is_background_message(&envelope.session_id, &meta.message_id)
+                    {
+                        return None;
+                    }
+                    PayloadV2::AssistantPersisted {
+                        text: text.clone(),
+                        assistant_segment_id: assistant_segment_id(),
+                        meta: meta.clone(),
+                    }
+                }
+                Payload::ToolStart {
+                    tool_call_id,
+                    name,
+                    arguments_preview,
+                } => PayloadV2::ToolStart {
+                    tool_call_id: tool_call_id.clone(),
+                    name: name.clone(),
+                    arguments_preview: arguments_preview.clone(),
+                },
+                Payload::ToolProgress {
+                    tool_call_id,
+                    message,
+                } => PayloadV2::ToolProgress {
+                    tool_call_id: tool_call_id.clone(),
+                    message: message.clone(),
+                },
+                Payload::ToolEnd {
+                    tool_call_id,
+                    status,
+                    error,
+                    reason,
+                    output_preview,
+                    duration_ms,
+                } => PayloadV2::ToolEnd {
+                    tool_call_id: tool_call_id.clone(),
+                    status: *status,
+                    error: error.clone(),
+                    reason: reason.clone(),
+                    output_preview: output_preview.clone(),
+                    duration_ms: *duration_ms,
+                },
+                // File ownership and all terminal outcomes originate from
+                // their richer legacy source events below. Mapping these v1
+                // payloads too would create duplicates and lose ownership /
+                // errored / interrupted information.
+                Payload::FileAttached { .. } | Payload::TurnCompleted { .. } => return None,
+            };
+            EnvelopeV2Notification {
+                session_id: envelope.session_id.clone(),
+                topic: envelope.topic.clone(),
+                envelope: EnvelopeV2 {
+                    thread_id: source.thread_id.clone(),
+                    seq: source.seq,
+                    cursor: Some(cursor.clone()),
+                    turn_id: source.thread_id.clone(),
+                    client_message_id: source.client_message_id.clone(),
+                    payload,
+                },
+            }
+        }
+        UiNotification::TurnCompleted(completed) => {
+            let thread_id = completed.turn_id.0.to_string();
+            EnvelopeV2Notification {
+                session_id: completed.session_id.clone(),
+                topic: completed.topic.clone(),
+                envelope: EnvelopeV2 {
+                    seq: ledger.projection_v2_next_envelope_seq(
+                        &completed.session_id,
+                        &thread_id,
+                        cursor.seq,
+                    ),
+                    thread_id: thread_id.clone(),
+                    cursor: Some(cursor.clone()),
+                    turn_id: thread_id,
+                    client_message_id: None,
+                    payload: PayloadV2::TurnTerminal {
+                        outcome: TurnTerminalOutcome::Completed,
+                        error: None,
+                        token_usage: Some(EnvelopeTokenUsage {
+                            input_tokens: completed.tokens_in.map(u64::from).unwrap_or(0),
+                            output_tokens: completed.tokens_out.map(u64::from).unwrap_or(0),
+                            reasoning_tokens: 0,
+                            cache_read_tokens: 0,
+                            cache_write_tokens: 0,
+                        }),
+                    },
+                },
+            }
+        }
+        UiNotification::TurnError(error) => {
+            let thread_id = error.turn_id.0.to_string();
+            let outcome = if error.code == "interrupted" {
+                TurnTerminalOutcome::Interrupted
+            } else {
+                TurnTerminalOutcome::Errored
+            };
+            EnvelopeV2Notification {
+                session_id: error.session_id.clone(),
+                topic: error.topic.clone(),
+                envelope: EnvelopeV2 {
+                    seq: ledger.projection_v2_next_envelope_seq(
+                        &error.session_id,
+                        &thread_id,
+                        cursor.seq,
+                    ),
+                    thread_id: thread_id.clone(),
+                    cursor: Some(cursor.clone()),
+                    turn_id: thread_id,
+                    client_message_id: None,
+                    payload: PayloadV2::TurnTerminal {
+                        outcome,
+                        error: Some(TurnTerminalError {
+                            code: error.code.clone(),
+                            message: error.message.clone(),
+                            data: None,
+                        }),
+                        token_usage: None,
+                    },
+                },
+            }
+        }
+        UiNotification::FileAttached(file) => {
+            let thread_id = file.turn_id.0.to_string();
+            // The existing background sender emits its per-file legacy
+            // notifications after `turn/spawn_complete`. That completion is
+            // a linked v2 child stream and already carries its media, so
+            // never append a file envelope after the parent's terminal.
+            if ledger.projection_v2_has_background_child(&file.session_id, &thread_id, cursor.seq) {
+                return None;
+            }
+            let size_bytes = std::fs::metadata(&file.path)
+                .map(|meta| meta.len())
+                .unwrap_or(0);
+            let mime = file
+                .mime
+                .as_deref()
+                .filter(|mime| !mime.trim().is_empty())
+                .unwrap_or("application/octet-stream")
+                .to_owned();
+            EnvelopeV2Notification {
+                session_id: file.session_id.clone(),
+                topic: file.topic.clone(),
+                envelope: EnvelopeV2 {
+                    seq: ledger.projection_v2_next_envelope_seq(
+                        &file.session_id,
+                        &thread_id,
+                        cursor.seq,
+                    ),
+                    thread_id: thread_id.clone(),
+                    cursor: Some(cursor.clone()),
+                    turn_id: thread_id.clone(),
+                    client_message_id: None,
+                    payload: PayloadV2::FileAttached {
+                        path: file.path.clone(),
+                        mime,
+                        size_bytes,
+                        attachment_owner: AttachmentOwnerV2 {
+                            assistant_segment_id: Some(format!(
+                                "{}:assistant:{}",
+                                thread_id,
+                                ledger.projection_v2_current_assistant_segment_index(
+                                    &file.session_id,
+                                    &thread_id,
+                                    cursor.seq,
+                                )
+                            )),
+                            tool_call_id: file.tool_call_id.clone(),
+                        },
+                    },
+                },
+            }
+        }
+        UiNotification::TurnSpawnComplete(spawn) => {
+            let parent_turn_id = spawn
+                .turn_id
+                .as_ref()
+                .map(|turn_id| turn_id.0.to_string())
+                .or_else(|| spawn.thread_id.clone())?;
+            let child_stream_id = format!("{parent_turn_id}:background:{}", spawn.task_id);
+            EnvelopeV2Notification {
+                session_id: spawn.session_id.clone(),
+                topic: spawn.topic.clone(),
+                envelope: EnvelopeV2 {
+                    thread_id: child_stream_id.clone(),
+                    seq: 1,
+                    cursor: Some(cursor.clone()),
+                    turn_id: child_stream_id,
+                    client_message_id: None,
+                    payload: PayloadV2::BackgroundChildCompleted {
+                        parent_turn_id,
+                        response_to_client_message_id: spawn.response_to_client_message_id.clone(),
+                        task_id: spawn.task_id.clone(),
+                        content: spawn.content.clone(),
+                        tool_call_id: spawn.tool_call_id.clone(),
+                        message_id: spawn.message_id.clone(),
+                        source: spawn.source.clone(),
+                        persisted_at: spawn.persisted_at,
+                        media: spawn.media.clone(),
+                    },
+                },
+            }
+        }
+        _ => return None,
+    };
+
+    Some(UiProtocolLedgerEvent::Notification(
+        UiNotification::EnvelopeV2(projection),
+    ))
+}
+
 /// Mirror the capability filter at `ui_protocol.rs` session/open replay
 /// loop (UPCR-2026-012): a connection that did not negotiate
 /// `event.message_persisted.v1` must not receive `message/persisted`
@@ -10700,6 +10991,30 @@ fn live_event_passes_capability_filter(
     event: &UiProtocolLedgerEvent,
     features: ConnectionUiFeatures,
 ) -> bool {
+    // Stage 1 v2 has strict precedence over v1. A v2-capable connection
+    // receives the cursor-stamped projection only; it must never receive a
+    // v1 envelope or one of the legacy source notifications that the v2
+    // projector translates. Keep this branch first so its contract does not
+    // accidentally depend on the older, individual legacy capability gates.
+    if features.projection_envelope_v2 {
+        if let UiProtocolLedgerEvent::Notification(notification) = event {
+            match notification {
+                UiNotification::EnvelopeV2(_) => return true,
+                UiNotification::Envelope(_)
+                | UiNotification::MessageDelta(_)
+                | UiNotification::ReasoningDelta(_)
+                | UiNotification::MessagePersisted(_)
+                | UiNotification::ToolStarted(_)
+                | UiNotification::ToolProgress(_)
+                | UiNotification::ToolCompleted(_)
+                | UiNotification::FileAttached(_)
+                | UiNotification::TurnCompleted(_)
+                | UiNotification::TurnError(_)
+                | UiNotification::TurnSpawnComplete(_) => return false,
+                _ => {}
+            }
+        }
+    }
     if !features.message_persisted {
         if let UiProtocolLedgerEvent::Notification(UiNotification::MessagePersisted(_)) = event {
             return false;
@@ -10797,7 +11112,8 @@ fn live_event_passes_capability_filter(
     // changes is the per-connection wire delivery.
     if features.projection_envelope {
         if let UiProtocolLedgerEvent::Notification(
-            UiNotification::MessageDelta(_)
+            UiNotification::EnvelopeV2(_)
+            | UiNotification::MessageDelta(_)
             | UiNotification::ReasoningDelta(_)
             | UiNotification::MessagePersisted(_)
             | UiNotification::ToolStarted(_)
@@ -10809,7 +11125,10 @@ fn live_event_passes_capability_filter(
         {
             return false;
         }
-    } else if let UiProtocolLedgerEvent::Notification(UiNotification::Envelope(_)) = event {
+    } else if let UiProtocolLedgerEvent::Notification(
+        UiNotification::Envelope(_) | UiNotification::EnvelopeV2(_),
+    ) = event
+    {
         return false;
     }
     true
@@ -27318,7 +27637,6 @@ fn send_notification_lifecycle(
     // connection's own live forwarder skips the duplicate copy.
     let event = ledger.append_notification_from(notification, ws.connection_id);
     let cursor = event.cursor.clone();
-    let method = ledger_event_method(&event.event).to_string();
     // Codex #1336 round-2 BLOCKER 1: apply the per-connection
     // capability filter at the direct-send boundary. Without this, a
     // connection that negotiated `projection.envelope.v1` would still
@@ -27327,10 +27645,17 @@ fn send_notification_lifecycle(
     // ledger append above still happens so the canonical envelope
     // emit (via `ledger.emit_envelope` on the same handler path)
     // delivers via the broadcast forwarder.
-    if !direct_send_passes_capability_filter(ws, &event.event) {
+    let features = ws.snapshot_live_features();
+    let projected = features
+        .projection_envelope_v2
+        .then(|| project_v2_ledger_event(ledger, &event.event, &event.cursor))
+        .flatten();
+    let event_for_wire = projected.unwrap_or(event.event);
+    let method = ledger_event_method(&event_for_wire).to_string();
+    if !live_event_passes_capability_filter(&event_for_wire, features) {
         return Ok(());
     }
-    let frame = frame_from_ledger(event.event)
+    let frame = frame_from_ledger(event_for_wire)
         .ok_or_else(|| SendError::LifecycleFailure(format!("serialize {method}")))?;
     match ws.send_lifecycle(frame) {
         Ok(()) => {
@@ -27395,7 +27720,6 @@ fn send_notification_durable(
     record_task_evidence(&notification);
     let event = ledger.append_notification_from(notification, ws.connection_id);
     let cursor = event.cursor.clone();
-    let method = ledger_event_method(&event.event).to_string();
     // Codex #1336 round-2 BLOCKER 1: apply the per-connection
     // capability filter at the direct-send boundary. A connection
     // that negotiated `projection.envelope.v1` must not receive
@@ -27406,10 +27730,17 @@ fn send_notification_durable(
     // forwarder. Ledger append still occurs above so OTHER
     // connections (without the feature) receive the legacy shape via
     // their own forwarders.
-    if !direct_send_passes_capability_filter(ws, &event.event) {
+    let features = ws.snapshot_live_features();
+    let projected = features
+        .projection_envelope_v2
+        .then(|| project_v2_ledger_event(ledger, &event.event, &event.cursor))
+        .flatten();
+    let event_for_wire = projected.unwrap_or(event.event);
+    let method = ledger_event_method(&event_for_wire).to_string();
+    if !live_event_passes_capability_filter(&event_for_wire, features) {
         return Ok(());
     }
-    let frame = match frame_from_ledger(event.event) {
+    let frame = match frame_from_ledger(event_for_wire) {
         Some(frame) => frame,
         None => {
             return Err(SendError::BackpressureDrop);
@@ -27558,6 +27889,7 @@ fn ledger_event_cursor(event: &UiProtocolLedgerEvent) -> Option<UiCursor> {
             UiNotification::TurnCompleted(TurnCompletedEvent { cursor, .. }) => cursor.clone(),
             UiNotification::MessagePersisted(persisted) => Some(persisted.cursor.clone()),
             UiNotification::TurnSpawnComplete(spawn) => Some(spawn.cursor.clone()),
+            UiNotification::EnvelopeV2(envelope) => envelope.envelope.cursor.clone(),
             // Non-cursor-bearing variants — exhaustively enumerated so a
             // future addition forces an explicit decision here.
             UiNotification::TurnStarted(_)
@@ -35333,6 +35665,7 @@ ignore = []
                 voice_audio: false,
                 plan_todos: false,
                 projection_envelope: false,
+                projection_envelope_v2: false,
                 auxiliary_rest_to_ws_v1: false,
                 coding_autonomy_v1: false,
                 coding_agent_control_v1: false,
@@ -35398,6 +35731,7 @@ ignore = []
                 voice_audio: false,
                 plan_todos: false,
                 projection_envelope: false,
+                projection_envelope_v2: false,
                 auxiliary_rest_to_ws_v1: false,
                 coding_autonomy_v1: false,
                 coding_agent_control_v1: false,
@@ -35508,6 +35842,7 @@ ignore = []
                 voice_audio: false,
                 plan_todos: false,
                 projection_envelope: false,
+                projection_envelope_v2: false,
                 auxiliary_rest_to_ws_v1: false,
                 coding_autonomy_v1: false,
                 coding_agent_control_v1: false,
@@ -35573,6 +35908,7 @@ ignore = []
                 voice_audio: false,
                 plan_todos: false,
                 projection_envelope: false,
+                projection_envelope_v2: false,
                 auxiliary_rest_to_ws_v1: false,
                 coding_autonomy_v1: false,
                 coding_agent_control_v1: false,
@@ -35631,6 +35967,7 @@ ignore = []
                 voice_audio: false,
                 plan_todos: false,
                 projection_envelope: false,
+                projection_envelope_v2: false,
                 auxiliary_rest_to_ws_v1: false,
                 coding_autonomy_v1: false,
                 coding_agent_control_v1: false,
@@ -35732,6 +36069,7 @@ ignore = []
                 voice_audio: false,
                 plan_todos: false,
                 projection_envelope: false,
+                projection_envelope_v2: false,
                 auxiliary_rest_to_ws_v1: false,
                 coding_autonomy_v1: false,
                 coding_agent_control_v1: false,
@@ -38144,6 +38482,7 @@ ignore = []
                 voice_audio: false,
                 plan_todos: false,
                 projection_envelope: false,
+                projection_envelope_v2: false,
                 auxiliary_rest_to_ws_v1: false,
                 coding_autonomy_v1: false,
                 coding_agent_control_v1: false,
@@ -38551,6 +38890,45 @@ ignore = []
         assert!(!features.projection_envelope);
         let capabilities = features.negotiated_capabilities();
         assert!(!capabilities.supports_feature(UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V1));
+    }
+
+    #[test]
+    fn projection_envelope_v2_is_strictly_negotiated_and_off_by_default() {
+        assert!(!ConnectionUiFeatures::default().projection_envelope_v2);
+        assert!(!ConnectionUiFeatures::stdio_defaults().projection_envelope_v2);
+        assert!(
+            !ConnectionUiFeatures::default()
+                .negotiated_capabilities()
+                .supports_feature(UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V2),
+            "the no-header capability baseline must not advertise v2"
+        );
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            UI_FEATURES_HEADER,
+            UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V2
+                .parse()
+                .expect("header value"),
+        );
+        let features = ConnectionUiFeatures::from_headers_and_query(&headers, None);
+        assert!(features.projection_envelope_v2);
+        assert!(!features.projection_envelope);
+        assert!(
+            features
+                .negotiated_capabilities()
+                .supports_feature(UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V2)
+        );
+
+        let client_hello = ConnectionUiFeatures::from_requested_feature_tokens(
+            [UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V2],
+            false,
+        );
+        assert!(client_hello.projection_envelope_v2);
+        assert!(
+            client_hello
+                .negotiated_capabilities()
+                .supports_feature(UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V2)
+        );
     }
 
     /// Over a stdio-default connection (`projection_envelope == false`),
@@ -47167,6 +47545,27 @@ ignore = []
         })
     }
 
+    fn projection_envelope_v2_event_for(session: &SessionKey) -> UiNotification {
+        UiNotification::EnvelopeV2(octos_core::ui_protocol::EnvelopeV2Notification {
+            session_id: session.clone(),
+            topic: None,
+            envelope: octos_core::ui_protocol::EnvelopeV2 {
+                thread_id: "thread-v2".into(),
+                seq: 1,
+                cursor: Some(UiCursor {
+                    stream: session.0.clone(),
+                    seq: 1,
+                }),
+                turn_id: "turn-v2".into(),
+                client_message_id: None,
+                payload: octos_core::ui_protocol::PayloadV2::AssistantDelta {
+                    text: "v2".into(),
+                    assistant_segment_id: "turn-v2:assistant:1".into(),
+                },
+            },
+        })
+    }
+
     fn features_for_projection_envelope_test(projection_envelope: bool) -> ConnectionUiFeatures {
         ConnectionUiFeatures {
             // Pre-existing capability flags are enabled so the *only*
@@ -47174,6 +47573,17 @@ ignore = []
             // mutual exclusion — the test would otherwise be polluted by
             // the `message_persisted` and `spawn_complete` gates above.
             projection_envelope,
+            message_persisted: true,
+            spawn_complete: true,
+            file_attached: true,
+            header_present: true,
+            ..ConnectionUiFeatures::default()
+        }
+    }
+
+    fn features_for_projection_envelope_v2_test() -> ConnectionUiFeatures {
+        ConnectionUiFeatures {
+            projection_envelope_v2: true,
             message_persisted: true,
             spawn_complete: true,
             file_attached: true,
@@ -47287,6 +47697,401 @@ ignore = []
                 !live_event_passes_capability_filter(ev, envelope_client),
                 "envelope client must NOT receive legacy {label} notifications",
             );
+        }
+    }
+
+    #[test]
+    fn capability_filter_routes_v2_without_leaking_v1_or_legacy() {
+        let session = SessionKey("local:envelope-v2-gate".into());
+        let legacy_delta =
+            UiProtocolLedgerEvent::Notification(UiNotification::MessageDelta(MessageDeltaEvent {
+                session_id: session.clone(),
+                topic: None,
+                turn_id: TurnId::new(),
+                text: "legacy delta".into(),
+            }));
+        let v1 = UiProtocolLedgerEvent::Notification(projection_envelope_event_for(&session));
+        let v2 = UiProtocolLedgerEvent::Notification(projection_envelope_v2_event_for(&session));
+
+        let legacy = features_for_projection_envelope_test(false);
+        assert!(live_event_passes_capability_filter(&legacy_delta, legacy));
+        assert!(!live_event_passes_capability_filter(&v1, legacy));
+        assert!(!live_event_passes_capability_filter(&v2, legacy));
+
+        let v1_features = features_for_projection_envelope_test(true);
+        assert!(!live_event_passes_capability_filter(
+            &legacy_delta,
+            v1_features
+        ));
+        assert!(live_event_passes_capability_filter(&v1, v1_features));
+        assert!(!live_event_passes_capability_filter(&v2, v1_features));
+
+        let v2_features = features_for_projection_envelope_v2_test();
+        assert!(!live_event_passes_capability_filter(
+            &legacy_delta,
+            v2_features
+        ));
+        assert!(!live_event_passes_capability_filter(&v1, v2_features));
+        assert!(live_event_passes_capability_filter(&v2, v2_features));
+    }
+
+    #[tokio::test]
+    async fn v2_connection_receives_v2_envelopes_with_stage_one_fields() {
+        let (ws, mut rx) = ws_connection_for_test(16);
+        let ledger = Arc::new(UiProtocolLedger::new(32));
+        let session_id = SessionKey("local:envelope-v2-wire".into());
+        let turn_id = TurnId::new();
+        let forwarders: SharedLiveForwarders = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        let live_rx = ledger.subscribe(&session_id);
+        spawn_live_forwarder(
+            ws.clone(),
+            ledger.clone(),
+            session_id.clone(),
+            0,
+            ws.connection_id(),
+            features_for_projection_envelope_v2_test(),
+            None,
+            live_rx,
+            forwarders,
+        )
+        .await;
+
+        let first = ledger
+            .emit_envelope(
+                &session_id,
+                turn_id.0.to_string(),
+                Payload::AssistantPersisted {
+                    text: "first assistant iteration".into(),
+                    meta: MessageMeta {
+                        message_id: "msg-v2-first".into(),
+                        persisted_at: Utc::now(),
+                        media: vec![],
+                    },
+                },
+                None,
+            )
+            .expect("v1 source envelope is durable");
+        let second = ledger
+            .emit_envelope(
+                &session_id,
+                turn_id.0.to_string(),
+                Payload::AssistantPersisted {
+                    text: "second assistant iteration".into(),
+                    meta: MessageMeta {
+                        message_id: "msg-v2-second".into(),
+                        persisted_at: Utc::now(),
+                        media: vec![],
+                    },
+                },
+                None,
+            )
+            .expect("later v1 source envelope is durable");
+        ledger.append_notification(UiNotification::FileAttached(
+            octos_core::ui_protocol::FileAttachedEvent {
+                session_id: session_id.clone(),
+                topic: None,
+                turn_id: turn_id.clone(),
+                path: "artifacts/result.md".into(),
+                tool_call_id: Some("call-v2-file".into()),
+                mime: Some("text/markdown".into()),
+            },
+        ));
+        ledger.append_notification(UiNotification::TurnCompleted(TurnCompletedEvent {
+            session_id: session_id.clone(),
+            topic: None,
+            turn_id: turn_id.clone(),
+            cursor: None,
+            tokens_in: Some(11),
+            tokens_out: Some(7),
+            session_result: None,
+        }));
+        ledger.append_notification(UiNotification::TurnSpawnComplete(TurnSpawnCompleteEvent {
+            session_id: session_id.clone(),
+            topic: None,
+            turn_id: Some(turn_id.clone()),
+            thread_id: Some(turn_id.0.to_string()),
+            task_id: "task-v2-child".into(),
+            tool_call_id: Some("call-v2-child".into()),
+            response_to_client_message_id: Some("cmid-v2-parent".into()),
+            seq: 9,
+            message_id: "msg-v2-child".into(),
+            source: "background".into(),
+            cursor: UiCursor {
+                stream: session_id.0.clone(),
+                seq: 0,
+            },
+            persisted_at: Utc::now(),
+            content: "background result".into(),
+            media: vec!["artifacts/child.md".into()],
+        }));
+
+        let mut received = Vec::new();
+        for _ in 0..5 {
+            let frame = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+                .await
+                .expect("v2 frame arrives")
+                .expect("writer remains open");
+            let WsMessage::Text(text) = frame else {
+                panic!("expected JSON text frame");
+            };
+            received.push(serde_json::from_str::<Value>(text.as_str()).expect("valid JSON"));
+        }
+
+        for frame in &received {
+            assert_eq!(frame["method"], "projection/envelope");
+            assert!(frame["params"]["cursor"].is_object());
+        }
+
+        let assistant_segments: Vec<&Value> = received
+            .iter()
+            .filter(|frame| frame["params"]["payload"]["type"] == "assistant_persisted")
+            .map(|frame| &frame["params"]["payload"]["data"]["assistant_segment_id"])
+            .collect();
+        assert_eq!(assistant_segments.len(), 2);
+        assert!(assistant_segments.iter().all(|id| id.is_string()));
+        assert_ne!(assistant_segments[0], assistant_segments[1]);
+
+        let attachment = received
+            .iter()
+            .find(|frame| frame["params"]["payload"]["type"] == "file_attached")
+            .expect("attachment v2 envelope");
+        assert_eq!(
+            attachment["params"]["payload"]["data"]["attachment_owner"]["tool_call_id"],
+            "call-v2-file",
+        );
+
+        let terminal = received
+            .iter()
+            .find(|frame| frame["params"]["payload"]["type"] == "turn_terminal")
+            .expect("terminal v2 envelope");
+        assert_eq!(
+            terminal["params"]["payload"]["data"]["outcome"],
+            "completed"
+        );
+        assert_eq!(
+            terminal["params"]["payload"]["data"]["token_usage"]["input_tokens"],
+            11,
+        );
+
+        let child = received
+            .iter()
+            .find(|frame| frame["params"]["payload"]["type"] == "background/spawn_complete")
+            .expect("linked child completion v2 envelope");
+        assert_eq!(
+            child["params"]["payload"]["data"]["parent_turn_id"],
+            turn_id.0.to_string(),
+        );
+        assert_eq!(
+            child["params"]["payload"]["data"]["response_to_client_message_id"],
+            "cmid-v2-parent",
+        );
+        assert_ne!(child["params"]["thread_id"], turn_id.0.to_string());
+        assert_ne!(child["params"]["turn_id"], turn_id.0.to_string());
+
+        for frame in received
+            .iter()
+            .filter(|frame| frame["params"]["payload"]["type"] != "background/spawn_complete")
+        {
+            assert_eq!(frame["params"]["turn_id"], turn_id.0.to_string());
+        }
+
+        assert!(first.cursor.seq < second.cursor.seq);
+    }
+
+    #[tokio::test]
+    async fn v2_background_child_never_appends_to_parent_after_terminal() {
+        let (ws, mut rx) = ws_connection_for_test(16);
+        let ledger = Arc::new(UiProtocolLedger::new(32));
+        let session_id = SessionKey("local:envelope-v2-child-order".into());
+        let turn_id = TurnId::new();
+        let forwarders: SharedLiveForwarders = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        let live_rx = ledger.subscribe(&session_id);
+        spawn_live_forwarder(
+            ws.clone(),
+            ledger.clone(),
+            session_id.clone(),
+            0,
+            ws.connection_id(),
+            features_for_projection_envelope_v2_test(),
+            None,
+            live_rx,
+            forwarders,
+        )
+        .await;
+
+        ledger.append_notification(UiNotification::TurnCompleted(TurnCompletedEvent {
+            session_id: session_id.clone(),
+            topic: None,
+            turn_id: turn_id.clone(),
+            cursor: None,
+            tokens_in: None,
+            tokens_out: None,
+            session_result: None,
+        }));
+        ledger.append_notification(UiNotification::TurnSpawnComplete(TurnSpawnCompleteEvent {
+            session_id: session_id.clone(),
+            topic: None,
+            turn_id: Some(turn_id.clone()),
+            thread_id: Some(turn_id.0.to_string()),
+            task_id: "task-v2-after-terminal".into(),
+            tool_call_id: Some("call-v2-after-terminal".into()),
+            response_to_client_message_id: Some("cmid-v2-parent".into()),
+            seq: 1,
+            message_id: "msg-v2-after-terminal".into(),
+            source: "background".into(),
+            cursor: UiCursor {
+                stream: session_id.0.clone(),
+                seq: 0,
+            },
+            persisted_at: Utc::now(),
+            content: "background result".into(),
+            media: vec!["artifacts/child.md".into()],
+        }));
+        // Existing background code emits this legacy file event after the
+        // spawn-complete notification. V2 keeps it inside the child stream's
+        // media rather than appending it to the terminal parent stream.
+        ledger.append_notification(UiNotification::FileAttached(
+            octos_core::ui_protocol::FileAttachedEvent {
+                session_id: session_id.clone(),
+                topic: None,
+                turn_id: turn_id.clone(),
+                path: "artifacts/child.md".into(),
+                tool_call_id: Some("call-v2-after-terminal".into()),
+                mime: Some("text/markdown".into()),
+            },
+        ));
+
+        let mut received = Vec::new();
+        for _ in 0..2 {
+            let frame = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+                .await
+                .expect("v2 terminal or child frame arrives")
+                .expect("writer remains open");
+            let WsMessage::Text(text) = frame else {
+                panic!("expected JSON text frame");
+            };
+            received.push(serde_json::from_str::<Value>(text.as_str()).expect("valid JSON"));
+        }
+
+        assert!(received.iter().any(|frame| {
+            frame["params"]["payload"]["type"] == "turn_terminal"
+                && frame["params"]["turn_id"] == turn_id.0.to_string()
+        }));
+        let child = received
+            .iter()
+            .find(|frame| frame["params"]["payload"]["type"] == "background/spawn_complete")
+            .expect("linked background child completion");
+        assert_ne!(child["params"]["thread_id"], turn_id.0.to_string());
+        assert_eq!(
+            child["params"]["payload"]["data"]["parent_turn_id"],
+            turn_id.0.to_string(),
+        );
+        assert!(
+            !received
+                .iter()
+                .any(|frame| frame["params"]["payload"]["type"] == "file_attached"),
+            "a background file cannot be appended to the terminal parent stream",
+        );
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), rx.recv())
+                .await
+                .is_err(),
+            "no parent-stream file envelope may follow the child completion",
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_connection_wire_remains_byte_identical_when_v2_exists() {
+        let (ws, mut rx) = ws_connection_for_test(8);
+        let ledger = Arc::new(UiProtocolLedger::new(8));
+        let session_id = SessionKey("local:envelope-v2-legacy".into());
+        let forwarders: SharedLiveForwarders = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        let live_rx = ledger.subscribe(&session_id);
+        let legacy_features = ConnectionUiFeatures {
+            message_persisted: true,
+            header_present: true,
+            ..ConnectionUiFeatures::default()
+        };
+        spawn_live_forwarder(
+            ws.clone(),
+            ledger.clone(),
+            session_id.clone(),
+            0,
+            ws.connection_id(),
+            legacy_features,
+            None,
+            live_rx,
+            forwarders,
+        )
+        .await;
+
+        let notification = UiNotification::ToolStarted(ToolStartedEvent {
+            session_id: session_id.clone(),
+            topic: None,
+            turn_id: TurnId::new(),
+            tool_call_id: "call-legacy".into(),
+            tool_name: "shell".into(),
+            arguments: Some(json!({ "command": "pwd" })),
+        });
+        let expected = serde_json::to_string(
+            &notification
+                .clone()
+                .into_rpc_notification()
+                .expect("legacy notification serializes"),
+        )
+        .expect("legacy rpc text serializes");
+        ledger.append_notification(notification);
+
+        let frame = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+            .await
+            .expect("legacy frame arrives")
+            .expect("writer remains open");
+        let WsMessage::Text(text) = frame else {
+            panic!("expected JSON text frame");
+        };
+        assert_eq!(text.as_str(), expected, "v2 must not alter legacy bytes");
+    }
+
+    #[test]
+    fn v2_projects_errored_and_interrupted_terminals() {
+        let ledger = UiProtocolLedger::new(16);
+        let session_id = SessionKey("local:envelope-v2-errors".into());
+
+        for (code, expected_outcome) in [
+            ("provider_failed", TurnTerminalOutcome::Errored),
+            ("interrupted", TurnTerminalOutcome::Interrupted),
+        ] {
+            let turn_id = TurnId::new();
+            let source = ledger.append_notification(UiNotification::TurnError(TurnErrorEvent {
+                session_id: session_id.clone(),
+                topic: None,
+                turn_id: turn_id.clone(),
+                code: code.into(),
+                message: format!("{code} terminal"),
+            }));
+            let projected = project_v2_ledger_event(&ledger, &source.event, &source.cursor)
+                .expect("turn/error has a v2 terminal projection");
+            let UiProtocolLedgerEvent::Notification(UiNotification::EnvelopeV2(envelope)) =
+                projected
+            else {
+                panic!("turn/error must project to EnvelopeV2");
+            };
+
+            assert_eq!(envelope.envelope.cursor.as_ref(), Some(&source.cursor));
+            assert_eq!(envelope.envelope.turn_id, turn_id.0.to_string());
+            match envelope.envelope.payload {
+                PayloadV2::TurnTerminal {
+                    outcome,
+                    error: Some(error),
+                    token_usage,
+                } => {
+                    assert_eq!(outcome, expected_outcome);
+                    assert_eq!(error.code, code);
+                    assert_eq!(error.message, format!("{code} terminal"));
+                    assert!(token_usage.is_none());
+                }
+                other => panic!("expected v2 terminal, got {other:?}"),
+            }
         }
     }
 

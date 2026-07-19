@@ -62,7 +62,10 @@ use std::path::{Path, PathBuf};
 
 use clap::Args;
 use eyre::Result;
-use octos_core::ui_protocol::{UI_PROTOCOL_KNOWN_FEATURES, UI_PROTOCOL_V1, UiProtocolCapabilities};
+use octos_core::ui_protocol::{
+    UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V2, UI_PROTOCOL_KNOWN_FEATURES, UI_PROTOCOL_V1,
+    UiProtocolCapabilities,
+};
 use octos_diagnostics::{
     Check, CheckStatus, InstallMethod, ProductSpec, Reachability, Report, UpdatePlan,
     config_writability_check, data_writability_check, detect, locate, on_path_check,
@@ -303,9 +306,9 @@ fn build_report(cmd: &DoctorCommand, with_network: bool) -> Result<Report> {
     // --- Backend / protocol skew ------------------------------------------
     // The server's own compiled-in capabilities are authoritative for the
     // structural skew check. `first_server_slice()` advertises the protocol's
-    // full known-feature registry (what `octos serve` actually negotiates), so
-    // comparing it against that same registry confirms the build's octos-core
-    // matches the protocol it ships — a divergence would surface here.
+    // no-header compatibility baseline. `projection.envelope.v2` is known but
+    // strictly opt-in, so exclude it here; otherwise doctor would mistake the
+    // deliberately absent default advertisement for protocol skew.
     // TODO Stage 2.5: replace the compiled-in caps with a LIVE WS
     // `config/capabilities/list` probe against a configured/running server (it
     // needs a client WS connection, deliberately out of Stage 2 scope). Until
@@ -313,7 +316,10 @@ fn build_report(cmd: &DoctorCommand, with_network: bool) -> Result<Report> {
     let server_caps = UiProtocolCapabilities::first_server_slice();
     report.push(protocol_skew_check(
         &server_caps,
-        UI_PROTOCOL_KNOWN_FEATURES.iter().copied(),
+        UI_PROTOCOL_KNOWN_FEATURES
+            .iter()
+            .copied()
+            .filter(|feature| *feature != UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V2),
     ));
 
     Ok(report)
@@ -1638,8 +1644,8 @@ mod tests {
         assert!(text.contains("Terminal environment"));
         assert!(text.contains("Config & data"));
         assert!(text.contains("Backend"));
-        // The server's own build advertises every known feature, so the
-        // structural skew check must pass.
+        // The server's own build advertises every default feature (v2 is
+        // intentionally strict opt-in), so the structural skew check passes.
         let skew = report
             .checks
             .iter()
