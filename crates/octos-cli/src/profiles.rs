@@ -1418,6 +1418,17 @@ impl ProfileStore {
                     restore_masked_channel_secrets(new_channel, old_channel);
                 }
             }
+            // Same contract as channels: a client that GETs a masked profile and
+            // PUTs it back must not overwrite the stored secret with `ab***xyz`.
+            if let (Some(new_email), Some(old_email)) =
+                (&mut profile.config.email, &existing.config.email)
+            {
+                restore_masked_optional_secret(&mut new_email.password, &old_email.password);
+                restore_masked_optional_secret(
+                    &mut new_email.feishu_app_secret,
+                    &old_email.feishu_app_secret,
+                );
+            }
         }
         self.save(profile)
     }
@@ -1738,8 +1749,29 @@ pub fn mask_secrets(profile: &UserProfile) -> UserProfile {
     for channel in &mut masked.config.channels {
         mask_channel_secrets(channel);
     }
+    if let Some(email) = &mut masked.config.email {
+        mask_email_secrets(email);
+    }
     masked.config.normalize_llm_contract();
     masked
+}
+
+/// Mask the literal secrets in `config.email`.
+///
+/// `password` and `feishu_app_secret` hold real credentials. Their `*_env`
+/// twins hold only env var NAMES, so those stay in the clear — masking them
+/// would hide which variable to set without protecting anything.
+///
+/// Until this existed `mask_secrets` covered `env_vars` and `channels` but not
+/// `config.email`, so `GET /api/me` handed every authenticated caller their own
+/// SMTP password and Feishu app secret in plaintext.
+fn mask_email_secrets(email: &mut EmailSettings) {
+    if let Some(password) = &mut email.password {
+        *password = mask_value(password);
+    }
+    if let Some(secret) = &mut email.feishu_app_secret {
+        *secret = mask_value(secret);
+    }
 }
 
 /// Display string for keychain-backed values in API responses.
@@ -3443,6 +3475,107 @@ mod tests {
         assert_eq!(loaded.config.env_vars["API_KEY"], "sk-real-secret-key");
         assert_eq!(loaded.config.env_vars["OTHER"], "new-value");
         assert_eq!(loaded.config.env_vars["NEW_KEY"], "brand-new");
+    }
+
+    /// Build a profile whose `config.email` carries both literal secrets.
+    fn email_secret_profile(id: &str) -> UserProfile {
+        UserProfile {
+            id: id.into(),
+            name: "Email Secrets".into(),
+            enabled: false,
+            data_dir: None,
+            parent_id: None,
+            public_subdomain: None,
+            config: ProfileConfig {
+                email: Some(EmailSettings {
+                    provider: "smtp".into(),
+                    smtp_host: Some("smtp.example.org".into()),
+                    smtp_port: Some(587),
+                    username: Some("bot@example.org".into()),
+                    password_env: Some("SMTP_PASSWORD".into()),
+                    password: Some("real-smtp-password".into()),
+                    from_address: Some("bot@example.org".into()),
+                    feishu_app_id: Some("cli_realappid".into()),
+                    feishu_app_secret_env: Some("FEISHU_APP_SECRET".into()),
+                    feishu_app_secret: Some("real-feishu-app-secret".into()),
+                    feishu_from_address: None,
+                    feishu_region: None,
+                }),
+                ..Default::default()
+            },
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn test_mask_secrets_masks_email_password_and_feishu_secret() {
+        let masked = mask_secrets(&email_secret_profile("email-mask"));
+        let email = masked.config.email.expect("email settings survive masking");
+
+        // The literal credentials must never reach the wire.
+        assert!(is_display_secret_value(email.password.as_deref().unwrap()));
+        assert!(is_display_secret_value(
+            email.feishu_app_secret.as_deref().unwrap()
+        ));
+        assert_ne!(email.password.as_deref(), Some("real-smtp-password"));
+        assert_ne!(
+            email.feishu_app_secret.as_deref(),
+            Some("real-feishu-app-secret")
+        );
+
+        // The `*_env` twins name env vars, not secrets — they stay readable, or
+        // the settings page cannot tell you which variable to set.
+        assert_eq!(email.password_env.as_deref(), Some("SMTP_PASSWORD"));
+        assert_eq!(
+            email.feishu_app_secret_env.as_deref(),
+            Some("FEISHU_APP_SECRET")
+        );
+        assert_eq!(email.username.as_deref(), Some("bot@example.org"));
+    }
+
+    #[test]
+    fn test_save_with_merge_preserves_masked_email_secrets() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ProfileStore::open(dir.path()).unwrap();
+        store.save(&email_secret_profile("email-merge")).unwrap();
+
+        // A client GETs the masked profile and PUTs it straight back.
+        let mut round_tripped = mask_secrets(&store.get("email-merge").unwrap().unwrap());
+        store.save_with_merge(&mut round_tripped).unwrap();
+
+        let loaded = store.get("email-merge").unwrap().unwrap();
+        let email = loaded
+            .config
+            .email
+            .expect("email settings survive the merge");
+        assert_eq!(email.password.as_deref(), Some("real-smtp-password"));
+        assert_eq!(
+            email.feishu_app_secret.as_deref(),
+            Some("real-feishu-app-secret")
+        );
+    }
+
+    #[test]
+    fn test_save_with_merge_allows_changing_email_secrets() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ProfileStore::open(dir.path()).unwrap();
+        store.save(&email_secret_profile("email-change")).unwrap();
+
+        // A genuinely new value is NOT a display artifact, so it must land.
+        let mut updated = email_secret_profile("email-change");
+        let email = updated.config.email.as_mut().unwrap();
+        email.password = Some("rotated-smtp-password".into());
+        email.feishu_app_secret = Some("rotated-feishu-secret".into());
+        store.save_with_merge(&mut updated).unwrap();
+
+        let loaded = store.get("email-change").unwrap().unwrap();
+        let email = loaded.config.email.unwrap();
+        assert_eq!(email.password.as_deref(), Some("rotated-smtp-password"));
+        assert_eq!(
+            email.feishu_app_secret.as_deref(),
+            Some("rotated-feishu-secret")
+        );
     }
 
     #[test]

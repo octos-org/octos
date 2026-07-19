@@ -4258,7 +4258,7 @@ dependencies = [
 
 [[package]]
 name = "octos-agent"
-version = "2.0.2-rc.11"
+version = "2.0.2-rc.12"
 dependencies = [
  "async-trait",
  "base64",
@@ -4317,7 +4317,7 @@ dependencies = [
 
 [[package]]
 name = "octos-bus"
-version = "2.0.2-rc.11"
+version = "2.0.2-rc.12"
 dependencies = [
  "aes",
  "async-imap",
@@ -4359,7 +4359,7 @@ dependencies = [
 
 [[package]]
 name = "octos-cli"
-version = "2.0.2-rc.11"
+version = "2.0.2-rc.12"
 dependencies = [
  "agent-client-protocol",
  "argon2",
@@ -4394,7 +4394,10 @@ dependencies = [
  "octos-memory",
  "octos-pipeline",
  "octos-plugin",
+ "octos-services",
+ "octos-store",
  "octos-swarm",
+ "octos-workflows",
  "open",
  "percent-encoding",
  "qrcode",
@@ -4432,7 +4435,7 @@ dependencies = [
 
 [[package]]
 name = "octos-core"
-version = "2.0.2-rc.11"
+version = "2.0.2-rc.12"
 dependencies = [
  "chrono",
  "eyre",
@@ -4447,7 +4450,7 @@ dependencies = [
 
 [[package]]
 name = "octos-diagnostics"
-version = "2.0.2-rc.11"
+version = "2.0.2-rc.12"
 dependencies = [
  "eyre",
  "octos-core",
@@ -4459,14 +4462,14 @@ dependencies = [
 
 [[package]]
 name = "octos-dora-mcp"
-version = "2.0.2-rc.11"
+version = "2.0.2-rc.12"
 dependencies = [
  "octos-agent",
 ]
 
 [[package]]
 name = "octos-llm"
-version = "2.0.2-rc.11"
+version = "2.0.2-rc.12"
 dependencies = [
  "async-trait",
  "base64",
@@ -4490,7 +4493,7 @@ dependencies = [
 
 [[package]]
 name = "octos-memory"
-version = "2.0.2-rc.11"
+version = "2.0.2-rc.12"
 dependencies = [
  "bincode",
  "chrono",
@@ -4510,7 +4513,7 @@ dependencies = [
 
 [[package]]
 name = "octos-pipeline"
-version = "2.0.2-rc.11"
+version = "2.0.2-rc.12"
 dependencies = [
  "async-trait",
  "chrono",
@@ -4534,7 +4537,7 @@ dependencies = [
 
 [[package]]
 name = "octos-plugin"
-version = "2.0.2-rc.11"
+version = "2.0.2-rc.12"
 dependencies = [
  "eyre",
  "metrics",
@@ -4562,8 +4565,86 @@ dependencies = [
 ]
 
 [[package]]
+name = "octos-server"
+version = "2.0.2-rc.12"
+dependencies = [
+ "async-trait",
+ "axum",
+ "chrono",
+ "eyre",
+ "futures",
+ "lettre",
+ "metrics",
+ "metrics-exporter-prometheus",
+ "octos-agent",
+ "octos-bus",
+ "octos-core",
+ "octos-llm",
+ "octos-pipeline",
+ "octos-plugin",
+ "octos-services",
+ "octos-store",
+ "octos-workflows",
+ "rand 0.8.5",
+ "rust-embed",
+ "rustls 0.23.36",
+ "rustls-native-certs",
+ "serde",
+ "serde_json",
+ "subtle",
+ "sysinfo",
+ "tokio",
+ "tokio-tungstenite 0.26.2",
+ "tokio-util",
+ "tower-http",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "octos-services"
+version = "2.0.2-rc.12"
+dependencies = [
+ "chrono",
+ "dirs",
+ "eyre",
+ "flate2",
+ "futures",
+ "octos-bus",
+ "octos-core",
+ "octos-llm",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "tar",
+ "tempfile",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "octos-store"
+version = "2.0.2-rc.12"
+dependencies = [
+ "base64",
+ "chrono",
+ "constant_time_eq",
+ "eyre",
+ "getrandom 0.2.17",
+ "octos-core",
+ "redb",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "octos-swarm"
-version = "2.0.2-rc.11"
+version = "2.0.2-rc.12"
 dependencies = [
  "async-trait",
  "chrono",
@@ -4579,6 +4660,21 @@ dependencies = [
  "tokio-test",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "octos-workflows"
+version = "2.0.2-rc.12"
+dependencies = [
+ "chrono",
+ "eyre",
+ "octos-agent",
+ "octos-core",
+ "octos-pipeline",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -7651,7 +7747,7 @@ dependencies = [
 
 [[package]]
 name = "wechat-bridge"
-version = "2.0.2-rc.11"
+version = "2.0.2-rc.12"
 dependencies = [
  "clap",
  "futures-util",

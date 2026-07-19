@@ -3410,7 +3410,6 @@ impl Drop for TaskTerminalGuard {
 mod tests {
     use super::*;
 
-    #[test]
     /// #1723: `record_final_output` fires `on_change` so the roster mirror
     /// (`upsert_background_task_agent` → `set_agent_output_if_empty`) re-runs
     /// with `final_output` present. It is called AFTER `mark_completed`, so the

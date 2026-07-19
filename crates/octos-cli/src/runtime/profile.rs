@@ -875,6 +875,7 @@ impl ProfileRuntime {
         #[cfg(feature = "api")]
         {
             tools.register(crate::goal_tool::GoalGetTool::new(profile.id.clone()));
+            tools.register(crate::goal_tool::GoalCreateTool::new(profile.id.clone()));
             tools.register(crate::goal_tool::GoalUpdateTool::new(profile.id.clone()));
         }
 

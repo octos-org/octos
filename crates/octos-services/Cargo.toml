@@ -1,0 +1,36 @@
+[package]
+name = "octos-services"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Self-contained support services extracted from octos-cli (personas, souls, compaction, self-update, CLI-agent adapter, tenancy, workflow runtime)"
+
+[dependencies]
+octos-core = { workspace = true }
+octos-llm = { workspace = true }
+octos-bus = { workspace = true }
+chrono = { workspace = true }
+eyre = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+# `updater` self-update: download + extract release archives.
+reqwest = { workspace = true }
+flate2 = { workspace = true }
+tar = { workspace = true }
+dirs = { workspace = true }
+futures = { workspace = true }
+
+[features]
+# Exposes the crate-wide env-test lock (config_context::TEST_ENV_LOCK) to
+# downstream crates' test builds, so octos-cli's env-pivoting tests serialize
+# on one mutex per test binary. Never enable in production.
+test-util = []
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

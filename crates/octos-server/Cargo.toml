@@ -1,0 +1,85 @@
+[package]
+name = "octos-server"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "HTTP/WebSocket API server + session runtime for octos (extracted from octos-cli). Server-core is ungated; the HTTP layer is behind the `api` feature."
+
+[dependencies]
+# --- ungated server-core: the session actor + gateway runtime build WITHOUT the
+# `api` feature (non-API `octos gateway` needs them). ---
+octos-core = { workspace = true }
+octos-agent = { workspace = true }
+octos-llm = { workspace = true }
+octos-bus = { workspace = true }
+octos-store = { workspace = true }
+octos-services = { workspace = true }
+octos-workflows = { workspace = true }
+octos-pipeline = { workspace = true }
+octos-plugin = { workspace = true }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+chrono = { workspace = true }
+eyre = { workspace = true }
+uuid = { workspace = true }
+metrics = { workspace = true }
+
+# --- HTTP/WS layer, gated behind `api` (mirrors octos-cli's `api` optional deps) ---
+axum = { workspace = true, optional = true }
+tower-http = { workspace = true, optional = true }
+tokio-util = { version = "0.7", optional = true }
+futures = { workspace = true, optional = true }
+tokio-tungstenite = { workspace = true, optional = true }
+rustls = { workspace = true, optional = true }
+rustls-native-certs = { workspace = true, optional = true }
+rust-embed = { workspace = true, optional = true }
+metrics-exporter-prometheus = { workspace = true, optional = true }
+lettre = { workspace = true, optional = true }
+rand = { workspace = true, optional = true }
+sysinfo = { version = "0.34", optional = true }
+subtle = { workspace = true, optional = true }
+
+[features]
+default = []
+# HTTP/WS API layer. Mirrors octos-cli's `api` feature; octos-cli's `api` will
+# forward here in Stage 4. `matrix` is required — handlers reference matrix types.
+api = [
+    "dep:axum",
+    "dep:tower-http",
+    "dep:tokio-util",
+    "dep:futures",
+    "dep:tokio-tungstenite",
+    "dep:rustls",
+    "dep:rustls-native-certs",
+    "dep:rust-embed",
+    "dep:metrics-exporter-prometheus",
+    "dep:lettre",
+    "dep:rand",
+    "dep:sysinfo",
+    "dep:subtle",
+    "octos-bus/api",
+    "matrix",
+]
+# Channel features forward to octos-bus (the gateway runtime dispatches them
+# without the HTTP `api` layer).
+matrix = ["octos-bus/matrix"]
+telegram = ["octos-bus/telegram"]
+discord = ["octos-bus/discord"]
+dingtalk = ["octos-bus/dingtalk"]
+slack = ["octos-bus/slack"]
+whatsapp = ["octos-bus/whatsapp"]
+email = ["octos-bus/email"]
+feishu = ["octos-bus/feishu"]
+twilio = ["octos-bus/twilio"]
+wecom = ["octos-bus/wecom"]
+line = ["octos-bus/line"]
+wecom-bot = ["octos-bus/wecom-bot"]
+qq-bot = ["octos-bus/qq-bot"]
+wechat = ["octos-bus/wechat"]
+
+[lints]
+workspace = true

@@ -179,6 +179,17 @@ pub const UI_PROTOCOL_FEATURE_FILE_ATTACHED_V1: &str = "event.file_attached.v1";
 /// this feature, until M9-γ-3 deletes them.
 pub const UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V1: &str = "projection.envelope.v1";
 
+/// Feature flag for the Stage 1 canonical projection envelope contract.
+///
+/// This is a strict opt-in alongside (not a replacement for)
+/// [`UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V1`]. A connection that does
+/// not negotiate this feature continues to receive exactly its existing
+/// legacy or v1-projection wire frames. V2 retains the flattened
+/// `projection/envelope` method shape while adding a durable ledger cursor,
+/// an explicit turn id, assistant-segment identity, terminal outcomes, and
+/// linked background-child completions.
+pub const UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V2: &str = "projection.envelope.v2";
+
 /// Feature flag for M12 Phase D-1 auxiliary REST→WS migration.
 ///
 /// Negotiated by clients that route auxiliary panel traffic (sidebar
@@ -272,6 +283,7 @@ pub const UI_PROTOCOL_KNOWN_FEATURES: &[&str] = &[
     UI_PROTOCOL_FEATURE_SPAWN_COMPLETE_V1,
     UI_PROTOCOL_FEATURE_FILE_ATTACHED_V1,
     UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V1,
+    UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V2,
     UI_PROTOCOL_FEATURE_AUXILIARY_REST_TO_WS_V1,
     UI_PROTOCOL_FEATURE_CODING_AUTONOMY_V1,
     UI_PROTOCOL_FEATURE_CODING_AGENT_CONTROL_V1,
@@ -1481,7 +1493,17 @@ impl UiProtocolCapabilities {
             UI_PROTOCOL_FIRST_SERVER_METHODS,
             UI_PROTOCOL_NOTIFICATION_METHODS,
         )
-        .with_supported_features(UI_PROTOCOL_KNOWN_FEATURES.iter().copied());
+        // `first_server_slice` is the no-header compatibility baseline. V2
+        // is known to the server (and is advertised after explicit
+        // negotiation) but must not appear here: doing so would alter the
+        // byte-level `session/open` response for legacy clients that never
+        // requested it.
+        .with_supported_features(
+            UI_PROTOCOL_KNOWN_FEATURES
+                .iter()
+                .copied()
+                .filter(|feature| *feature != UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V2),
+        );
         capabilities.unsupported = UI_PROTOCOL_FIRST_SERVER_UNSUPPORTED_METHODS
             .iter()
             .map(|method| {
@@ -3943,6 +3965,181 @@ struct EnvelopeWire {
     envelope: Envelope,
 }
 
+// ----- projection.envelope.v2 canonical contract -----
+
+/// Closed outcome set for [`PayloadV2::TurnTerminal`].
+///
+/// V1 represented only successful projection completion. V2 makes every
+/// terminal turn outcome explicit, so a refresh/replay projection can settle
+/// an errored or interrupted turn without consulting a legacy side channel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnTerminalOutcome {
+    Completed,
+    Errored,
+    Interrupted,
+}
+
+/// Structured error carried by an errored or interrupted v2 terminal.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TurnTerminalError {
+    pub code: String,
+    pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data: Option<Value>,
+}
+
+/// Ownership binding for a v2 `file_attached` payload.
+///
+/// At least one identity should normally be present. `assistant_segment_id`
+/// anchors an attachment to a rendered assistant segment, while
+/// `tool_call_id` anchors it to a tool card. Both are retained because a file
+/// can be owned by a tool result rendered in an assistant segment.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AttachmentOwnerV2 {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assistant_segment_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+}
+
+/// Tagged payload union for [`EnvelopeV2`].
+///
+/// This deliberately mirrors [`Payload`] as a NEW type rather than extending
+/// it: `projection.envelope.v1` remains frozen. The wire stays
+/// `{ "type": "…", "data": { … } }`, which is the flattened boundary
+/// shape accepted by the Stage-0 octos-web parser.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", content = "data", rename_all = "snake_case")]
+pub enum PayloadV2 {
+    UserMessage {
+        text: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        files: Vec<FileRef>,
+    },
+    /// Every streamed assistant fragment carries the segment it appends to.
+    AssistantDelta {
+        text: String,
+        assistant_segment_id: String,
+    },
+    ReasoningDelta {
+        text: String,
+    },
+    /// A persisted assistant iteration finalizes the same segment as its
+    /// deltas. A later assistant iteration receives a new segment id.
+    AssistantPersisted {
+        text: String,
+        assistant_segment_id: String,
+        meta: MessageMeta,
+    },
+    ToolStart {
+        tool_call_id: String,
+        name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        arguments_preview: Option<String>,
+    },
+    ToolProgress {
+        tool_call_id: String,
+        message: String,
+    },
+    ToolEnd {
+        tool_call_id: String,
+        status: EnvelopeToolEndStatus,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        output_preview: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        duration_ms: Option<u64>,
+    },
+    /// A file stays explicit about the assistant/tool owner rather than
+    /// relying on "most recent bubble" placement heuristics.
+    FileAttached {
+        path: String,
+        mime: String,
+        size_bytes: u64,
+        attachment_owner: AttachmentOwnerV2,
+    },
+    /// Canonical terminal for completed, errored, and interrupted turns.
+    TurnTerminal {
+        outcome: TurnTerminalOutcome,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<TurnTerminalError>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        token_usage: Option<EnvelopeTokenUsage>,
+    },
+    /// Late completion from a spawned/background task. It is emitted on its
+    /// own child stream (the carrying [`EnvelopeV2::thread_id`]), linked back
+    /// to the already-settled foreground turn by `parent_turn_id`.
+    ///
+    /// The wire tag retains the Stage-0 parser's compatible
+    /// `background/spawn_complete` spelling while the Rust variant makes the
+    /// child-stream semantics explicit.
+    #[serde(rename = "background/spawn_complete")]
+    BackgroundChildCompleted {
+        parent_turn_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        response_to_client_message_id: Option<String>,
+        task_id: String,
+        content: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tool_call_id: Option<String>,
+        message_id: String,
+        source: String,
+        persisted_at: DateTime<Utc>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        media: Vec<String>,
+    },
+}
+
+/// Canonical Stage-1 projection envelope.
+///
+/// This is intentionally independent from [`Envelope`]. All server v2 emits
+/// stamp `cursor` with the durable [`UiCursor`] of the source ledger record.
+/// The field remains optional on deserialize so the Stage-0 web parser can
+/// continue accepting the cursor-absent fixture shape during mixed-version
+/// replay; server v2 emission always supplies `Some`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EnvelopeV2 {
+    pub thread_id: String,
+    pub seq: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<UiCursor>,
+    /// Explicit turn identity. For a background child stream this is the
+    /// child stream identity; its payload carries `parent_turn_id`.
+    pub turn_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_message_id: Option<String>,
+    pub payload: PayloadV2,
+}
+
+/// Ledger/routing wrapper for an [`EnvelopeV2`].
+///
+/// Like [`EnvelopeNotification`], this stays nested on disk and uses a
+/// separate flattened wire DTO only at the RPC boundary.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EnvelopeV2Notification {
+    pub session_id: SessionKey,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub topic: Option<String>,
+    pub envelope: EnvelopeV2,
+}
+
+/// Flattened wire DTO for the v2 contract. The field layout intentionally
+/// remains compatible with the Stage-0 parser: routing keys plus the bare
+/// envelope fields at the top level, never a nested `envelope` object.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct EnvelopeWireV2 {
+    #[serde(default = "empty_session_key")]
+    session_id: SessionKey,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    topic: Option<String>,
+    #[serde(flatten)]
+    envelope: EnvelopeV2,
+}
+
 /// Serde default for the wire `session_id`: the empty session key, used
 /// when an OLD bare-envelope frame (no routing keys) is decoded.
 fn empty_session_key() -> SessionKey {
@@ -6199,6 +6396,10 @@ pub enum UiNotification {
     /// supersedes — `message/delta`, `message/persisted`, `tool/*`,
     /// `turn/completed`, `file/attached`).
     Envelope(EnvelopeNotification),
+    /// Stage-1 canonical projection envelope. Uses the same flattened
+    /// `projection/envelope` method as v1, selected exclusively by the
+    /// `projection.envelope.v2` capability.
+    EnvelopeV2(EnvelopeV2Notification),
 }
 
 fn set_topic_if_absent(slot: &mut Option<String>, topic: &str) {
@@ -6260,6 +6461,7 @@ impl UiNotification {
             Self::ContextNormalizationReported(_) => methods::CONTEXT_NORMALIZATION_REPORTED,
             Self::SessionOrchestration(_) => methods::SESSION_ORCHESTRATION,
             Self::Envelope(_) => methods::PROJECTION_ENVELOPE,
+            Self::EnvelopeV2(_) => methods::PROJECTION_ENVELOPE,
         }
     }
 
@@ -6310,6 +6512,7 @@ impl UiNotification {
             Self::ContextNormalizationReported(event) => &event.session_id,
             Self::SessionOrchestration(event) => &event.session_id,
             Self::Envelope(event) => &event.session_id,
+            Self::EnvelopeV2(event) => &event.session_id,
         }
     }
 
@@ -6379,6 +6582,7 @@ impl UiNotification {
                 event.topic.as_deref().or_else(|| event.session_id.topic())
             }
             Self::Envelope(event) => event.topic.as_deref().or_else(|| event.session_id.topic()),
+            Self::EnvelopeV2(event) => event.topic.as_deref().or_else(|| event.session_id.topic()),
             _ => self.session_id().topic(),
         }
     }
@@ -6414,6 +6618,7 @@ impl UiNotification {
             Self::VoiceAudioChunk(event) => set_topic_if_absent(&mut event.topic, &topic),
             Self::SessionEventBridged(event) => set_topic_if_absent(&mut event.topic, &topic),
             Self::Envelope(event) => set_topic_if_absent(&mut event.topic, &topic),
+            Self::EnvelopeV2(event) => set_topic_if_absent(&mut event.topic, &topic),
             _ => {}
         }
     }
@@ -6500,6 +6705,17 @@ impl UiNotification {
             // suffix when the explicit `topic` field is empty so it is
             // never lost.
             Self::Envelope(params) => serde_json::to_value(&EnvelopeWire {
+                session_id: SessionKey(params.session_id.base_key().to_owned()),
+                topic: params
+                    .topic
+                    .clone()
+                    .or_else(|| params.session_id.topic().map(str::to_owned)),
+                envelope: params.envelope,
+            }),
+            // Stage 1 v2 deliberately reuses the same flattened method
+            // boundary as v1. The capability selects the contract; `turn_id`
+            // makes the two wire DTOs unambiguous on decode.
+            Self::EnvelopeV2(params) => serde_json::to_value(&EnvelopeWireV2 {
                 session_id: SessionKey(params.session_id.base_key().to_owned()),
                 topic: params
                     .topic
@@ -6612,12 +6828,21 @@ impl UiNotification {
             // `session_id`; for a legacy empty key it falls back to its
             // ambient connection context.
             methods::PROJECTION_ENVELOPE => {
-                let wire: EnvelopeWire = decode_params(method, params)?;
-                Ok(Self::Envelope(EnvelopeNotification {
-                    session_id: wire.session_id,
-                    topic: wire.topic,
-                    envelope: wire.envelope,
-                }))
+                if params.get("turn_id").is_some() {
+                    let wire: EnvelopeWireV2 = decode_params(method, params)?;
+                    Ok(Self::EnvelopeV2(EnvelopeV2Notification {
+                        session_id: wire.session_id,
+                        topic: wire.topic,
+                        envelope: wire.envelope,
+                    }))
+                } else {
+                    let wire: EnvelopeWire = decode_params(method, params)?;
+                    Ok(Self::Envelope(EnvelopeNotification {
+                        session_id: wire.session_id,
+                        topic: wire.topic,
+                        envelope: wire.envelope,
+                    }))
+                }
             }
             _ => Err(RpcError::method_not_found(method)),
         }
@@ -7131,6 +7356,9 @@ mod tests {
             .as_array()
             .expect("supported_features array");
         for feature in UI_PROTOCOL_KNOWN_FEATURES {
+            if *feature == UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V2 {
+                continue;
+            }
             assert!(
                 supported_features
                     .iter()
@@ -7138,6 +7366,12 @@ mod tests {
                 "first_server_slice must advertise {feature}"
             );
         }
+        assert!(
+            !supported_features
+                .iter()
+                .any(|advertised| advertised == &json!(UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V2)),
+            "strictly opt-in v2 must not change the no-header SessionOpened wire"
+        );
 
         // Older payloads (e.g. ledger replays from before the field
         // existed) decode successfully because the field carries
@@ -7297,6 +7531,10 @@ mod tests {
         assert_eq!(
             UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V1,
             "projection.envelope.v1"
+        );
+        assert_eq!(
+            UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V2,
+            "projection.envelope.v2"
         );
         assert_eq!(
             UI_PROTOCOL_FEATURE_AUXILIARY_REST_TO_WS_V1,
@@ -12277,12 +12515,175 @@ mod tests {
     }
 
     #[test]
+    fn projection_envelope_v2_is_flattened_and_carries_the_stage_one_contract() {
+        let persisted_at = sample_persisted_at();
+        let notification = UiNotification::EnvelopeV2(EnvelopeV2Notification {
+            session_id: SessionKey("local:v2-contract#planning".into()),
+            topic: Some("planning".into()),
+            envelope: EnvelopeV2 {
+                thread_id: "thread-v2-parent".into(),
+                seq: 7,
+                cursor: Some(UiCursor {
+                    stream: "local:v2-contract".into(),
+                    seq: 412,
+                }),
+                turn_id: "turn-v2-parent".into(),
+                client_message_id: None,
+                payload: PayloadV2::AssistantPersisted {
+                    text: "final segment".into(),
+                    assistant_segment_id: "turn-v2-parent:assistant:2".into(),
+                    meta: MessageMeta {
+                        message_id: "msg-v2-7".into(),
+                        persisted_at,
+                        media: vec!["artifacts/plan.md".into()],
+                    },
+                },
+            },
+        });
+
+        let rpc = notification
+            .clone()
+            .into_rpc_notification()
+            .expect("v2 wire serializes");
+        assert_eq!(rpc.method, methods::PROJECTION_ENVELOPE);
+        assert!(rpc.params.get("envelope").is_none(), "wire stays flattened");
+        assert_eq!(rpc.params.get("turn_id"), Some(&json!("turn-v2-parent")));
+        assert_eq!(
+            rpc.params
+                .get("cursor")
+                .and_then(|cursor| cursor.get("seq")),
+            Some(&json!(412)),
+            "v2 emit always carries its durable ledger cursor",
+        );
+        assert_eq!(
+            rpc.params
+                .get("payload")
+                .and_then(|payload| payload.get("type")),
+            Some(&json!("assistant_persisted")),
+        );
+        assert_eq!(
+            rpc.params
+                .get("payload")
+                .and_then(|payload| payload.get("data"))
+                .and_then(|data| data.get("assistant_segment_id")),
+            Some(&json!("turn-v2-parent:assistant:2")),
+        );
+
+        let expected_envelope = match &notification {
+            UiNotification::EnvelopeV2(notification) => notification.envelope.clone(),
+            _ => unreachable!("test constructed an EnvelopeV2"),
+        };
+        let mut cursor_absent_rpc = rpc.clone();
+        cursor_absent_rpc
+            .params
+            .as_object_mut()
+            .expect("v2 params are an object")
+            .remove("cursor");
+        let cursor_absent = UiNotification::from_rpc_notification(cursor_absent_rpc)
+            .expect("cursor-absent v2 wire still decodes");
+        assert!(matches!(
+            cursor_absent,
+            UiNotification::EnvelopeV2(EnvelopeV2Notification {
+                envelope: EnvelopeV2 { cursor: None, .. },
+                ..
+            })
+        ));
+
+        let decoded = UiNotification::from_rpc_notification(rpc).expect("v2 wire decodes");
+        match decoded {
+            UiNotification::EnvelopeV2(decoded) => {
+                // Mirrors v1's established wire behavior: a topic-suffixed
+                // storage/session key is normalized to its bare routing key,
+                // while the topic stays explicit.
+                assert_eq!(decoded.session_id, SessionKey("local:v2-contract".into()));
+                assert_eq!(decoded.topic.as_deref(), Some("planning"));
+                assert_eq!(decoded.envelope, expected_envelope);
+            }
+            other => panic!("expected EnvelopeV2, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn projection_envelope_v2_payloads_cover_terminal_attachment_and_child_completion() {
+        let error = TurnTerminalError {
+            code: "runtime_error".into(),
+            message: "provider stopped the turn".into(),
+            data: Some(json!({ "retryable": true })),
+        };
+        let terminal = PayloadV2::TurnTerminal {
+            outcome: TurnTerminalOutcome::Errored,
+            error: Some(error),
+            token_usage: None,
+        };
+        let terminal_value = serde_json::to_value(&terminal).expect("terminal serializes");
+        assert_eq!(terminal_value.get("type"), Some(&json!("turn_terminal")));
+        assert_eq!(
+            terminal_value
+                .get("data")
+                .and_then(|data| data.get("outcome")),
+            Some(&json!("errored")),
+        );
+
+        let attached = PayloadV2::FileAttached {
+            path: "artifacts/report.md".into(),
+            mime: "text/markdown".into(),
+            size_bytes: 42,
+            attachment_owner: AttachmentOwnerV2 {
+                assistant_segment_id: Some("turn-v2-parent:assistant:2".into()),
+                tool_call_id: Some("call-v2-1".into()),
+            },
+        };
+        let attached_value = serde_json::to_value(&attached).expect("attachment serializes");
+        assert_eq!(
+            attached_value
+                .get("data")
+                .and_then(|data| data.get("attachment_owner"))
+                .and_then(|owner| owner.get("tool_call_id")),
+            Some(&json!("call-v2-1")),
+        );
+
+        let child = PayloadV2::BackgroundChildCompleted {
+            parent_turn_id: "turn-v2-parent".into(),
+            response_to_client_message_id: Some("cmid-v2-parent".into()),
+            task_id: "task-v2-child".into(),
+            content: "background result".into(),
+            tool_call_id: Some("call-v2-1".into()),
+            message_id: "msg-v2-child".into(),
+            source: "background".into(),
+            persisted_at: sample_persisted_at(),
+            media: vec!["artifacts/report.md".into()],
+        };
+        let child_value = serde_json::to_value(&child).expect("child completion serializes");
+        assert_eq!(
+            child_value
+                .get("data")
+                .and_then(|data| data.get("parent_turn_id")),
+            Some(&json!("turn-v2-parent")),
+        );
+        assert_eq!(
+            child_value
+                .get("data")
+                .and_then(|data| data.get("response_to_client_message_id")),
+            Some(&json!("cmid-v2-parent")),
+        );
+    }
+
+    #[test]
     fn golden_envelope_capability_feature_flag_registered() {
         // The projection feature flag must be in the known-features
         // registry so capability negotiation honours it.
         assert!(
             UI_PROTOCOL_KNOWN_FEATURES.contains(&UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V1),
             "projection.envelope.v1 must be registered for capability negotiation"
+        );
+        assert!(
+            UI_PROTOCOL_KNOWN_FEATURES.contains(&UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V2),
+            "projection.envelope.v2 must be registered for capability negotiation"
+        );
+        assert!(
+            !UiProtocolCapabilities::first_server_slice()
+                .supports_feature(UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V2),
+            "v2 is strictly opt-in and must not alter the no-header capability baseline"
         );
     }
 

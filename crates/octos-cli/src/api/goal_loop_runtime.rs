@@ -405,8 +405,14 @@ impl GoalRuntime {
         Some(GoalBudgetResolution {
             goal_id: self.goal_id.clone(),
             reason: DenyReason::ExhaustedBudget,
+            // Fix F (codex LOW): echo the SAME resume guidance the orchestrator
+            // wrap-up uses (`goal_budget_wrap_up_prompt`), including the
+            // `N > tokens already used` floor. This runtime tracks continuation
+            // counts, not the raw token count, so it states the floor
+            // qualitatively rather than substituting an exact number — but the
+            // user still learns a new budget must clear what was already spent.
             wrap_up_prompt: format!(
-                "Goal `{}` has exhausted its continuation budget. Summarize the current state, call out remaining work, and stop starting new work.",
+                "Goal `{}` has exhausted its continuation budget. Summarize the current state, call out remaining work, and stop starting new work. Then tell the user how to resume: reply `/goal <objective> --budget <N>` (with N greater than the tokens already used) to raise the budget and continue, or `/goal stop` to end the goal.",
                 self.goal_id
             ),
         })
@@ -1323,6 +1329,27 @@ mod tests {
         assert_eq!(resolution.reason, DenyReason::ExhaustedBudget);
         assert!(resolution.wrap_up_prompt.contains("exhausted"));
         assert!(resolution.wrap_up_prompt.contains("stop starting new work"));
+        // The wrap-up must hand the user an actionable resume path, not just
+        // stop silently (mini5 symptom).
+        assert!(
+            resolution.wrap_up_prompt.contains("/goal"),
+            "wrap-up must tell the user how to resume: {}",
+            resolution.wrap_up_prompt
+        );
+        assert!(
+            resolution.wrap_up_prompt.contains("--budget"),
+            "wrap-up must mention raising the budget: {}",
+            resolution.wrap_up_prompt
+        );
+        // Fix F: it must echo the resume FLOOR (a new budget must exceed what
+        // was already spent), matching the orchestrator wrap-up guidance.
+        assert!(
+            resolution
+                .wrap_up_prompt
+                .contains("greater than the tokens already used"),
+            "wrap-up must state the resume floor (N > tokens used): {}",
+            resolution.wrap_up_prompt
+        );
     }
 
     #[test]
