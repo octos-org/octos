@@ -927,6 +927,26 @@ fn effective_session_permission_state(
             approval_policy: Some(octos_agent::ApprovalPolicy::Never),
         };
     }
+    // Network-on default: a fresh Local session with no explicit selection gets
+    // Workspace-Write with network ALLOWED (filesystem still sandboxed, approvals
+    // unchanged) so `npm install` / git / fetch work out of the box — the macOS
+    // SBPL otherwise emits `(deny network*)` and silently breaks the most common
+    // dev workflow. Scoped exactly like the dangerous default (Local deployment +
+    // a session key that doesn't encode a tenant/cloud scope) so cloud/tenant
+    // stays network-denied. Opt OUT with `--no-network` (`OCTOS_NO_NETWORK=1`).
+    // An explicit `/permissions` choice still overrides this.
+    if !state.default_network_denied
+        && state.deployment_mode == crate::config::DeploymentMode::Local
+        && !session_id_encodes_non_solo_scope(session_id)
+    {
+        return StoredSessionPermissionProfile {
+            selection: octos_core::ui_protocol::PermissionProfileSelection {
+                mode: octos_core::ui_protocol::PermissionProfileMode::WorkspaceWrite,
+                network: octos_core::ui_protocol::PermissionNetworkPolicy::Allow,
+            },
+            approval_policy: None,
+        };
+    }
     StoredSessionPermissionProfile::default()
 }
 
@@ -34381,28 +34401,40 @@ ignore = []
             Some(octos_agent::ApprovalPolicy::Never)
         );
 
-        // Flag off -> the gated workspace-write default, approvals unset.
+        // Danger flag off, Local, solo -> the NETWORK-ON default: Workspace-Write
+        // (filesystem still sandboxed) with network ALLOWED and approvals unset,
+        // so npm/git/fetch work out of the box.
         let plain = AppState::empty_for_tests();
         let resolved = effective_session_permission_state(&plain, &session_id);
         assert_eq!(resolved.selection.mode, Mode::WorkspaceWrite);
-        assert_eq!(resolved.selection.network, Network::Deny);
+        assert_eq!(resolved.selection.network, Network::Allow);
         assert_eq!(resolved.approval_policy, None);
 
-        // Flag on but NON-Local deployment -> gated default (codex P2): the
-        // full-access profile is not grantable outside Local mode.
+        // `--no-network` opt-out -> Workspace-Write with network DENIED.
+        let mut no_net = AppState::empty_for_tests();
+        no_net.default_network_denied = true;
+        let resolved = effective_session_permission_state(&no_net, &session_id);
+        assert_eq!(resolved.selection.mode, Mode::WorkspaceWrite);
+        assert_eq!(resolved.selection.network, Network::Deny);
+
+        // NON-Local deployment -> network stays DENIED (the network-on default is
+        // Local-only; cloud/tenant is never widened). Danger flag also ignored
+        // outside Local (codex P2).
         let mut tenant = AppState::empty_for_tests();
         tenant.dangerous_default_permissions = true;
         tenant.deployment_mode = crate::config::DeploymentMode::Tenant;
         let resolved = effective_session_permission_state(&tenant, &session_id);
         assert_eq!(resolved.selection.mode, Mode::WorkspaceWrite);
+        assert_eq!(resolved.selection.network, Network::Deny);
 
-        // Flag on, Local, but a NON-SOLO-scoped session key -> gated default
-        // (codex P1): the fallback must not hand a tenant-scoped session the
-        // host access the explicit path would reject.
+        // Local, but a NON-SOLO-scoped session key -> gated default with network
+        // DENIED (codex P1): neither the danger fallback NOR the network-on
+        // default may widen a tenant/cloud-scoped session.
         let scoped = SessionKey("coding:tenant:m12-danger-default".into());
         assert!(session_id_encodes_non_solo_scope(&scoped));
         let resolved = effective_session_permission_state(&state, &scoped);
         assert_eq!(resolved.selection.mode, Mode::WorkspaceWrite);
+        assert_eq!(resolved.selection.network, Network::Deny);
     }
 
     #[test]
