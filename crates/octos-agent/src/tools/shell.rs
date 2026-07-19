@@ -17,6 +17,13 @@ use super::{
 use crate::policy::{ApprovalPolicy, CommandPolicy, Decision, SafePolicy};
 use crate::sandbox::{NoSandbox, Sandbox};
 use crate::subprocess_env::{EnvAllowlist, sanitize_command_env};
+use crate::task_supervisor::TaskSupervisor;
+
+/// Monotonic sequence used to synthesise a `tool_call_id` for background shell
+/// tasks when the caller did not thread one through `ToolContext` (e.g. the
+/// legacy `execute()` entry point used by tests). Production callers always
+/// carry a real tool id, so this only fires off the hot path.
+static SHELL_BG_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Tool for executing shell commands.
 pub struct ShellTool {
@@ -30,6 +37,19 @@ pub struct ShellTool {
     approval_policy: ApprovalPolicy,
     /// Sandbox for command isolation.
     sandbox: Arc<dyn Sandbox>,
+    /// Optional shared task supervisor. When set (or supplied via
+    /// [`ToolContext::task_supervisor`]), background shell commands — a
+    /// trailing `&` or an explicit `background: true` arg — are registered as
+    /// tracked tasks so they surface in `/ps` and the sub-agent dock. Mirrors
+    /// [`crate::tools::spawn::SpawnTool`]'s supervisor wiring.
+    task_supervisor: Option<Arc<TaskSupervisor>>,
+    /// Session key used to tag registered background tasks (links the task to
+    /// its owning session in `/ps`). Falls back to
+    /// [`ToolContext::parent_session_key`] when unset.
+    session_key: Option<String>,
+    /// Task-ledger path recorded as lineage on registered background tasks so
+    /// they can be restored across a restart, mirroring the spawn tool.
+    task_ledger_path: Option<PathBuf>,
 }
 
 impl ShellTool {
@@ -41,6 +61,9 @@ impl ShellTool {
             policy: Arc::new(SafePolicy::default()),
             approval_policy: ApprovalPolicy::Ask,
             sandbox: Arc::new(NoSandbox),
+            task_supervisor: None,
+            session_key: None,
+            task_ledger_path: None,
         }
     }
 
@@ -72,6 +95,164 @@ impl ShellTool {
     pub fn with_shared_sandbox(mut self, sandbox: Arc<dyn Sandbox>) -> Self {
         self.sandbox = sandbox;
         self
+    }
+
+    /// Register background shell commands (a trailing `&` or an explicit
+    /// `background: true` arg) as tracked tasks in the shared
+    /// [`TaskSupervisor`] so they surface in `/ps` and the sub-agent dock.
+    ///
+    /// Mirrors [`crate::tools::spawn::SpawnTool::with_task_supervisor`]: the
+    /// same three-tuple of supervisor + session key + task-ledger path. In
+    /// production the foreground executor already threads the SSOT supervisor
+    /// and session key onto every tool call via
+    /// [`ToolContext::task_supervisor`] / [`ToolContext::parent_session_key`],
+    /// so this builder is primarily for explicit construction and tests; at
+    /// execute time the explicit handle wins and the context is the fallback.
+    pub fn with_task_supervisor(
+        mut self,
+        supervisor: Arc<TaskSupervisor>,
+        session_key: impl Into<String>,
+        task_ledger_path: impl Into<PathBuf>,
+    ) -> Self {
+        self.task_supervisor = Some(supervisor);
+        self.session_key = Some(session_key.into());
+        self.task_ledger_path = Some(task_ledger_path.into());
+        self
+    }
+
+    /// Run a background command detached and return immediately.
+    ///
+    /// The command still runs through the same sandbox/env path as a
+    /// foreground command (policy/approval were already enforced by the
+    /// caller). When a supervisor is available — the explicit builder handle
+    /// or [`ToolContext::task_supervisor`] — the command is registered as a
+    /// tracked task (status `running`) and a lightweight watcher flips it to
+    /// terminal (`completed`/`failed`) when the child exits, so `/ps` shows
+    /// the running→done transition. Without a supervisor the command still
+    /// runs detached and is reaped, but is untracked.
+    async fn execute_background(
+        &self,
+        ctx: &ToolContext,
+        raw_command: &str,
+        effective_cwd: &Path,
+    ) -> ToolResult {
+        // Strip the trailing `&` so OUR child is the actual work (see
+        // `strip_trailing_ampersand`).
+        let command = strip_trailing_ampersand(raw_command);
+
+        let mut cmd = self.sandbox.wrap_command(&command, effective_cwd);
+        // We return immediately and never read the pipes, so piping stdout/
+        // stderr risks a full-buffer deadlock in a chatty child. Discard the
+        // std streams (in-command redirects like `> log 2>&1` still win).
+        cmd.stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        apply_frontend_tool_env(&mut cmd, effective_cwd);
+        apply_quarto_tool_env(&mut cmd, &command, effective_cwd);
+        apply_git_tool_env(&mut cmd, &command);
+        sanitize_command_env(&mut cmd, &EnvAllowlist::empty());
+        apply_harness_event_sink_env(&mut cmd, ctx);
+
+        let child = match cmd.spawn() {
+            Ok(c) => c,
+            Err(e) => {
+                return ToolResult {
+                    output: format!("Failed to start background command: {e}"),
+                    success: false,
+                    ..Default::default()
+                };
+            }
+        };
+        let child_pid = child.id();
+        let label = background_label(&command);
+
+        // Resolve the supervisor + session key: an explicit builder handle
+        // wins, else fall back to the per-turn ToolContext (the foreground
+        // executor threads the SSOT supervisor here).
+        let supervisor = self
+            .task_supervisor
+            .clone()
+            .or_else(|| ctx.task_supervisor.clone());
+        let session_key = self
+            .session_key
+            .clone()
+            .or_else(|| ctx.parent_session_key.clone());
+
+        // Register a tracked task (mirrors spawn's `register_with_lineage`).
+        let task_id = supervisor.as_ref().map(|sup| {
+            let tool_call_id = if ctx.tool_id.is_empty() {
+                let seq = SHELL_BG_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                format!("shell-bg-{seq}")
+            } else {
+                ctx.tool_id.clone()
+            };
+            let ledger = self
+                .task_ledger_path
+                .as_ref()
+                .map(|path| path.to_string_lossy().into_owned());
+            sup.register_with_lineage(
+                &label,
+                &tool_call_id,
+                session_key.as_deref(),
+                ledger.as_deref(),
+            )
+        });
+
+        match (supervisor, task_id) {
+            // Tracked: spawn a watcher that flips the task terminal on exit.
+            (Some(sup), Some(id)) if !id.is_empty() => {
+                // Flip Spawned → Running (the child is already executing), so
+                // `/ps` shows an active task, mirroring the spawn tool.
+                sup.mark_running(&id);
+                let watch_id = id.clone();
+                let watch_label = label.clone();
+                tokio::spawn(async move {
+                    let mut child = child;
+                    match child.wait().await {
+                        Ok(status) if status.success() => sup.mark_completed(&watch_id, vec![]),
+                        Ok(status) => sup.mark_failed(
+                            &watch_id,
+                            format!(
+                                "{watch_label} exited with status {}",
+                                status.code().unwrap_or(-1)
+                            ),
+                        ),
+                        Err(e) => sup.mark_failed(
+                            &watch_id,
+                            format!("failed to wait on background command: {e}"),
+                        ),
+                    }
+                });
+                ToolResult {
+                    output: format!(
+                        "Started background task {id} (pid {}): {label}",
+                        child_pid
+                            .map(|p| p.to_string())
+                            .unwrap_or_else(|| "?".to_string())
+                    ),
+                    success: true,
+                    ..Default::default()
+                }
+            }
+            // Untracked (no supervisor, or fan-out cap refused the register):
+            // still run detached, but reap the child so it doesn't zombie.
+            _ => {
+                tokio::spawn(async move {
+                    let mut child = child;
+                    let _ = child.wait().await;
+                });
+                ToolResult {
+                    output: format!(
+                        "Started background command (untracked, pid {}): {label}",
+                        child_pid
+                            .map(|p| p.to_string())
+                            .unwrap_or_else(|| "?".to_string())
+                    ),
+                    success: true,
+                    ..Default::default()
+                }
+            }
+        }
     }
 }
 
@@ -333,6 +514,60 @@ struct ShellInput {
     command: String,
     #[serde(default)]
     timeout_secs: Option<u64>,
+    /// Explicit request to run the command detached (in addition to the
+    /// trailing-`&` heuristic). When true, the command is registered as a
+    /// tracked background task and control returns immediately.
+    #[serde(default)]
+    background: Option<bool>,
+}
+
+/// True when the shell command should run in the background: either an
+/// explicit `background: true` arg, or a trailing `&` (the command backgrounds
+/// itself). A trailing `&&` is the logical-AND operator, not a background
+/// request, so it is excluded.
+fn is_background_command(command: &str, explicit: Option<bool>) -> bool {
+    explicit == Some(true) || has_trailing_ampersand(command)
+}
+
+/// True when `command` ends with a single background `&` (ignoring trailing
+/// whitespace) that is not part of a `&&` operator.
+fn has_trailing_ampersand(command: &str) -> bool {
+    let trimmed = command.trim_end();
+    trimmed.ends_with('&') && !trimmed.ends_with("&&")
+}
+
+/// Strip a single trailing `&` (and surrounding whitespace) so the command
+/// runs as OUR detached child rather than being re-backgrounded by the wrapper
+/// shell — which would `fork` the real work, exit immediately, and orphan the
+/// grandchild (reparented to PID 1), defeating lifecycle tracking. With the
+/// `&` removed, our `sh -c "<cmd>"` child IS the work, so the watcher's
+/// `child.wait()` observes the real completion.
+fn strip_trailing_ampersand(command: &str) -> String {
+    let trimmed = command.trim_end();
+    if let Some(stripped) = trimmed.strip_suffix('&') {
+        let stripped = stripped.trim_end();
+        // Guard against `&&` (invalid at end anyway): only strip a lone `&`.
+        if !stripped.ends_with('&') {
+            return stripped.to_string();
+        }
+    }
+    command.to_string()
+}
+
+/// Build a short, single-line human label for a background command, used as
+/// the supervisor task's display name in `/ps`. Mirrors how the spawn tool
+/// passes a human label as the registered task's `tool_name`.
+fn background_label(command: &str) -> String {
+    let one_line: String = command.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut label = String::from("shell: ");
+    const MAX: usize = 80;
+    if one_line.chars().count() > MAX {
+        label.extend(one_line.chars().take(MAX));
+        label.push('…');
+    } else {
+        label.push_str(&one_line);
+    }
+    label
 }
 
 #[async_trait]
@@ -368,6 +603,10 @@ impl Tool for ShellTool {
                 "timeout_secs": {
                     "type": "integer",
                     "description": "Optional timeout in seconds (default: 120)"
+                },
+                "background": {
+                    "type": "boolean",
+                    "description": "Run the command detached in the background. A trailing `&` also backgrounds the command. Background commands are tracked as tasks (visible in `/ps`) and return immediately."
                 }
             },
             "required": ["command"]
@@ -484,6 +723,17 @@ impl Tool for ShellTool {
                 }
             }
             Decision::Allow => {}
+        }
+
+        // Background execution: a trailing `&` or an explicit `background: true`
+        // arg asks the command to run detached. Register it as a tracked
+        // supervisor task (so it surfaces in `/ps` and the sub-agent dock),
+        // spawn it detached through the same sandbox, and return immediately
+        // without waiting. Foreground commands (no `&`) are unchanged.
+        if is_background_command(&input.command, input.background) {
+            return Ok(self
+                .execute_background(ctx, &input.command, effective_cwd)
+                .await);
         }
 
         // Clamp timeout to [1, 600] seconds to prevent abuse
@@ -1014,6 +1264,252 @@ mod tests {
             "expected legacy cwd ({}) in shell output, got: {}",
             canonical_legacy.display(),
             result.output
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Background shell task tracking: a trailing `&` (or `background: true`)
+    // registers a supervisor task so the command surfaces in `/ps`, and a
+    // watcher flips it terminal when the detached child exits. Mirrors the
+    // spawn tool's `with_task_supervisor` + `register_with_lineage` pattern.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn detects_background_via_trailing_ampersand() {
+        assert!(is_background_command("sleep 5 &", None));
+        assert!(is_background_command("python fetch.py  &", None));
+        assert!(is_background_command("vite preview > log 2>&1 &", None));
+        // Not background:
+        assert!(!is_background_command("npm run build", None));
+        assert!(!is_background_command("a && b", None));
+        assert!(!is_background_command("echo 2>&1", None));
+        assert!(!is_background_command("foo & echo done", None));
+        // Explicit arg wins even without a trailing `&`.
+        assert!(is_background_command("sleep 5", Some(true)));
+        assert!(!is_background_command("sleep 5", Some(false)));
+    }
+
+    #[test]
+    fn strips_trailing_ampersand_for_own_child() {
+        assert_eq!(strip_trailing_ampersand("sleep 5 &"), "sleep 5");
+        assert_eq!(strip_trailing_ampersand("sleep 5&"), "sleep 5");
+        assert_eq!(
+            strip_trailing_ampersand("cmd > log 2>&1 &"),
+            "cmd > log 2>&1"
+        );
+        // No trailing `&` — unchanged.
+        assert_eq!(strip_trailing_ampersand("npm run build"), "npm run build");
+        // `&&` operator is left intact (not a background request).
+        assert_eq!(strip_trailing_ampersand("a && b"), "a && b");
+    }
+
+    #[test]
+    fn background_label_is_short_and_prefixed() {
+        assert_eq!(background_label("npm  run   build"), "shell: npm run build");
+        let long = "echo ".to_string() + &"x".repeat(200);
+        let label = background_label(&long);
+        assert!(label.starts_with("shell: "));
+        assert!(label.chars().count() <= "shell: ".chars().count() + 81);
+        assert!(label.ends_with('…'));
+    }
+
+    #[tokio::test]
+    async fn background_command_registers_and_flips_terminal_with_supervisor() {
+        use crate::task_supervisor::{TaskStatus, TaskSupervisor};
+
+        let temp = tempfile::tempdir().unwrap();
+        let ledger = temp.path().join("tasks.jsonl");
+        let supervisor = Arc::new(TaskSupervisor::new());
+        supervisor.enable_persistence(&ledger).unwrap();
+
+        let tool = ShellTool::new(std::env::temp_dir()).with_task_supervisor(
+            supervisor.clone(),
+            "api:test-session",
+            ledger.clone(),
+        );
+
+        // Trailing `&` → background. Returns immediately.
+        let result = tool
+            .execute(&serde_json::json!({"command": "sleep 1 &"}))
+            .await
+            .unwrap();
+        assert!(result.success, "{}", result.output);
+        assert!(
+            result.output.contains("Started background task"),
+            "unexpected output: {}",
+            result.output
+        );
+
+        // The task is registered as active (running) right away — before the
+        // 1s sleep exits — which is exactly what makes it visible in `/ps`.
+        let tasks = supervisor.get_tasks_for_session("api:test-session");
+        assert_eq!(
+            tasks.len(),
+            1,
+            "expected one registered task, got {tasks:?}"
+        );
+        assert!(
+            tasks[0].status.is_active(),
+            "task should be active immediately, got {:?}",
+            tasks[0].status
+        );
+        assert!(
+            tasks[0].tool_name.contains("sleep 1"),
+            "label should reflect the command, got {:?}",
+            tasks[0].tool_name
+        );
+
+        // Poll until the watcher flips it terminal after the child exits.
+        let started = std::time::Instant::now();
+        loop {
+            let tasks = supervisor.get_tasks_for_session("api:test-session");
+            if let Some(t) = tasks.first() {
+                if t.status == TaskStatus::Completed {
+                    break;
+                }
+                if t.status == TaskStatus::Failed {
+                    panic!("background task failed: {:?}", t.error);
+                }
+            }
+            if started.elapsed() > std::time::Duration::from_secs(15) {
+                let statuses: Vec<_> = supervisor
+                    .get_tasks_for_session("api:test-session")
+                    .iter()
+                    .map(|t| t.status.as_str().to_string())
+                    .collect();
+                panic!("background task did not complete in 15s: {statuses:?}");
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn explicit_background_arg_registers_task() {
+        use crate::task_supervisor::TaskSupervisor;
+
+        let temp = tempfile::tempdir().unwrap();
+        let ledger = temp.path().join("tasks.jsonl");
+        let supervisor = Arc::new(TaskSupervisor::new());
+        supervisor.enable_persistence(&ledger).unwrap();
+
+        let tool = ShellTool::new(std::env::temp_dir()).with_task_supervisor(
+            supervisor.clone(),
+            "api:bg-arg",
+            ledger.clone(),
+        );
+
+        // No trailing `&`; the explicit `background: true` arg drives it.
+        let result = tool
+            .execute(&serde_json::json!({"command": "sleep 1", "background": true}))
+            .await
+            .unwrap();
+        assert!(result.success, "{}", result.output);
+        assert!(
+            result.output.contains("Started background task"),
+            "{}",
+            result.output
+        );
+        assert_eq!(
+            supervisor.get_tasks_for_session("api:bg-arg").len(),
+            1,
+            "explicit background arg must register a task"
+        );
+    }
+
+    #[tokio::test]
+    async fn background_command_failure_flips_task_failed() {
+        use crate::task_supervisor::{TaskStatus, TaskSupervisor};
+
+        let temp = tempfile::tempdir().unwrap();
+        let ledger = temp.path().join("tasks.jsonl");
+        let supervisor = Arc::new(TaskSupervisor::new());
+        supervisor.enable_persistence(&ledger).unwrap();
+
+        let tool = ShellTool::new(std::env::temp_dir()).with_task_supervisor(
+            supervisor.clone(),
+            "api:bg-fail",
+            ledger.clone(),
+        );
+
+        // A non-zero exit must flip the tracked task to Failed.
+        let result = tool
+            .execute(&serde_json::json!({"command": "false", "background": true}))
+            .await
+            .unwrap();
+        assert!(result.success, "start should succeed: {}", result.output);
+
+        let started = std::time::Instant::now();
+        loop {
+            let tasks = supervisor.get_tasks_for_session("api:bg-fail");
+            if let Some(t) = tasks.first() {
+                if t.status == TaskStatus::Failed {
+                    assert!(
+                        t.error.as_deref().unwrap_or_default().contains("status"),
+                        "failure error should mention exit status, got {:?}",
+                        t.error
+                    );
+                    break;
+                }
+                if t.status == TaskStatus::Completed {
+                    panic!("expected failure, task completed");
+                }
+            }
+            if started.elapsed() > std::time::Duration::from_secs(15) {
+                panic!("background failure not observed in 15s");
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn background_command_without_supervisor_runs_without_panic() {
+        // No supervisor wired (and ToolContext::zero() carries none): the
+        // background command must still run detached and return gracefully,
+        // reporting it is untracked rather than panicking on a missing handle.
+        let tool = ShellTool::new(std::env::temp_dir());
+        let result = tool
+            .execute(&serde_json::json!({"command": "true &"}))
+            .await
+            .unwrap();
+        assert!(result.success, "{}", result.output);
+        assert!(
+            result.output.contains("untracked"),
+            "expected untracked note, got: {}",
+            result.output
+        );
+        // Give the detached reaper a moment; no panic expected.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+
+    #[tokio::test]
+    async fn background_command_reads_supervisor_from_tool_context() {
+        // Production wiring: the foreground executor threads the SSOT
+        // supervisor + session key onto ToolContext (execution.rs). A shell
+        // tool with NO explicit builder handle must still register the task by
+        // reading `ctx.task_supervisor` / `ctx.parent_session_key`.
+        use crate::task_supervisor::TaskSupervisor;
+
+        let supervisor = Arc::new(TaskSupervisor::new());
+        let temp = tempfile::tempdir().unwrap();
+        supervisor
+            .enable_persistence(temp.path().join("tasks.jsonl"))
+            .unwrap();
+
+        let tool = ShellTool::new(std::env::temp_dir());
+        let mut ctx = ToolContext::zero();
+        ctx.tool_id = "shell-ctx-bg".to_string();
+        ctx.task_supervisor = Some(supervisor.clone());
+        ctx.parent_session_key = Some("api:ctx-session".to_string());
+
+        let result = tool
+            .execute_with_context(&ctx, &serde_json::json!({"command": "sleep 1 &"}))
+            .await
+            .unwrap();
+        assert!(result.success, "{}", result.output);
+        assert_eq!(
+            supervisor.get_tasks_for_session("api:ctx-session").len(),
+            1,
+            "task must be registered via ToolContext supervisor"
         );
     }
 
