@@ -1602,6 +1602,81 @@ impl ConnectionUiFeatures {
     }
 }
 
+/// Stage 4 telemetry contract and Stage 5 deletion gate.
+///
+/// Stage 5 may delete the legacy message/persisted lane only after
+/// `octos_ui_protocol_legacy_persisted_delivered_total` stops increasing and
+/// `octos_ui_protocol_connection_total{mode="legacy"}` is approximately zero
+/// over the observation window (summed across transports). Until then, at
+/// least one live client may still require the legacy lane.
+fn record_ui_protocol_connection_mode(features: ConnectionUiFeatures, transport: &'static str) {
+    let mode = if features.projection_envelope_v2 {
+        "v2"
+    } else {
+        "legacy"
+    };
+    metrics::counter!(
+        "octos_ui_protocol_connection_total",
+        "mode" => mode,
+        "transport" => transport,
+    )
+    .increment(1);
+}
+
+/// A delivery shape that has a Stage-4 telemetry counter. This is classified
+/// before serializing a frame and recorded only after its enqueue succeeds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UiProtocolDeliveryMetric {
+    LegacyPersistedContent,
+    V2Envelope,
+}
+
+fn ui_protocol_delivery_metric(event: &UiProtocolLedgerEvent) -> Option<UiProtocolDeliveryMetric> {
+    match event {
+        UiProtocolLedgerEvent::Notification(UiNotification::MessagePersisted(persisted))
+            if persisted
+                .content
+                .as_ref()
+                .is_some_and(|content| !content.is_empty()) =>
+        {
+            Some(UiProtocolDeliveryMetric::LegacyPersistedContent)
+        }
+        UiProtocolLedgerEvent::Notification(UiNotification::EnvelopeV2(_)) => {
+            Some(UiProtocolDeliveryMetric::V2Envelope)
+        }
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static UI_PROTOCOL_DELIVERY_METRICS_FOR_TEST: std::cell::RefCell<Vec<UiProtocolDeliveryMetric>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+fn record_ui_protocol_delivery_metric(metric: Option<UiProtocolDeliveryMetric>) {
+    let Some(metric) = metric else {
+        return;
+    };
+
+    #[cfg(test)]
+    UI_PROTOCOL_DELIVERY_METRICS_FOR_TEST.with(|metrics| metrics.borrow_mut().push(metric));
+
+    match metric {
+        UiProtocolDeliveryMetric::LegacyPersistedContent => {
+            metrics::counter!("octos_ui_protocol_legacy_persisted_delivered_total").increment(1);
+        }
+        UiProtocolDeliveryMetric::V2Envelope => {
+            metrics::counter!("octos_ui_protocol_v2_envelope_delivered_total").increment(1);
+        }
+    }
+}
+
+#[cfg(test)]
+fn take_ui_protocol_delivery_metrics_for_test() -> Vec<UiProtocolDeliveryMetric> {
+    UI_PROTOCOL_DELIVERY_METRICS_FOR_TEST.with(|metrics| std::mem::take(&mut *metrics.borrow_mut()))
+}
+
 fn apply_stdio_auth_bound_capability_policy(capabilities: &mut UiProtocolCapabilities) {
     for method in APPUI_STDIO_AUTH_BOUND_UNAVAILABLE_METHODS {
         capabilities
@@ -4504,6 +4579,10 @@ async fn ui_protocol_connection(
         identity: connection_identity,
         session_ingress_scope,
     } = options;
+    // Count the negotiated mode once for this successfully upgraded UI
+    // Protocol connection. Later client_hello renegotiation does not create a
+    // second connection and therefore must not increment this counter again.
+    record_ui_protocol_connection_mode(features, "ws");
     let (ws_sink, mut ws_rx) = socket.split();
     // Decouple the network sink from request handlers via a bounded channel
     // and a dedicated drainer task. No handler ever holds a lock across an
@@ -5311,6 +5390,11 @@ where
     let ledger = event_ledger(&state).await;
     let _ = diff_preview_store(&state, contracts.as_ref()).await;
     let mut features = ConnectionUiFeatures::stdio_defaults();
+    // A stdio client may send client_hello as its first request. Defer the
+    // one connection sample until that first request so a v2 hello is counted
+    // as v2 rather than as the temporary legacy default. A non-hello first
+    // request resolves to the stdio defaults and is recorded as legacy.
+    let mut connection_mode_recorded = false;
     // See the ws loop's twin: detached asides must not outlive this stdio
     // connection (they hold the writer sender → EOF shutdown would block).
     let mut btw_aside_tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();
@@ -5408,7 +5492,15 @@ where
         let id = request.id.clone();
         // stdio transport is never a session-ingress socket.
         if handle_client_hello_rpc(&ws, &state, id.clone(), &request, &mut features, false) {
+            if !connection_mode_recorded {
+                record_ui_protocol_connection_mode(features, "stdio");
+                connection_mode_recorded = true;
+            }
             continue;
+        }
+        if !connection_mode_recorded {
+            record_ui_protocol_connection_mode(features, "stdio");
+            connection_mode_recorded = true;
         }
         let connection_profile_id = connection_profile_id_owned.as_deref();
 
@@ -10686,6 +10778,12 @@ async fn spawn_live_forwarder(
                     // client's cursor is the source of truth and a follow-up
                     // session/hydrate or reconnect with the last cursor
                     // catches them up. Log and keep pumping new events.
+                    // This is the server-side gap detection point for v2:
+                    // the live projection stream skipped durable records and
+                    // the client must rehydrate from its cursor.
+                    if features.projection_envelope_v2 {
+                        metrics::counter!("octos_ui_protocol_v2_replay_gap_total").increment(1);
+                    }
                     tracing::warn!(
                         target: "octos::ui_protocol::ws",
                         session_id = %session_for_log.0,
@@ -27651,6 +27749,7 @@ fn send_notification_lifecycle(
         .then(|| project_v2_ledger_event(ledger, &event.event, &event.cursor))
         .flatten();
     let event_for_wire = projected.unwrap_or(event.event);
+    let delivery_metric = ui_protocol_delivery_metric(&event_for_wire);
     let method = ledger_event_method(&event_for_wire).to_string();
     if !live_event_passes_capability_filter(&event_for_wire, features) {
         return Ok(());
@@ -27659,6 +27758,7 @@ fn send_notification_lifecycle(
         .ok_or_else(|| SendError::LifecycleFailure(format!("serialize {method}")))?;
     match ws.send_lifecycle(frame) {
         Ok(()) => {
+            record_ui_protocol_delivery_metric(delivery_metric);
             ws.metrics.record_durable_cursor(&cursor);
             Ok(())
         }
@@ -27736,6 +27836,7 @@ fn send_notification_durable(
         .then(|| project_v2_ledger_event(ledger, &event.event, &event.cursor))
         .flatten();
     let event_for_wire = projected.unwrap_or(event.event);
+    let delivery_metric = ui_protocol_delivery_metric(&event_for_wire);
     let method = ledger_event_method(&event_for_wire).to_string();
     if !live_event_passes_capability_filter(&event_for_wire, features) {
         return Ok(());
@@ -27748,6 +27849,7 @@ fn send_notification_durable(
     };
     match ws.send_durable(frame, &method) {
         Ok(()) => {
+            record_ui_protocol_delivery_metric(delivery_metric);
             ws.metrics.record_durable_cursor(&cursor);
             Ok(())
         }
@@ -27787,6 +27889,7 @@ fn send_notification_ephemeral(
     // only (it never reaches disk). This keeps the filter helper
     // signature uniform across direct-send paths.
     let filter_event = UiProtocolLedgerEvent::Notification(notification.clone());
+    let delivery_metric = ui_protocol_delivery_metric(&filter_event);
     if !direct_send_passes_capability_filter(ws, &filter_event) {
         return Ok(());
     }
@@ -27804,7 +27907,13 @@ fn send_notification_ephemeral(
     };
     let frame = frame_for(&rpc).ok_or(SendError::BackpressureDrop)?;
     let _ = ledger; // unused for ephemeral, kept for symmetry with durable
-    ws.send_ephemeral(frame, &method)
+    match ws.send_ephemeral(frame, &method) {
+        Ok(()) => {
+            record_ui_protocol_delivery_metric(delivery_metric);
+            Ok(())
+        }
+        Err(error) => Err(error),
+    }
 }
 
 fn send_ledger_event_durable(
@@ -27813,6 +27922,7 @@ fn send_ledger_event_durable(
     event: UiProtocolLedgerEvent,
 ) -> Result<(), SendError> {
     let method = ledger_event_method(&event).to_string();
+    let delivery_metric = ui_protocol_delivery_metric(&event);
     // `event` already carries its cursor (set by the ledger before storage)
     // — pull a copy out before consuming the event into a frame.
     let cursor = ledger_event_cursor(&event);
@@ -27836,6 +27946,7 @@ fn send_ledger_event_durable(
     };
     match ws.send_durable(frame, &method) {
         Ok(()) => {
+            record_ui_protocol_delivery_metric(delivery_metric);
             if let Some(cursor) = cursor {
                 ws.metrics.record_durable_cursor(&cursor);
             }
@@ -47733,6 +47844,85 @@ ignore = []
         ));
         assert!(!live_event_passes_capability_filter(&v1, v2_features));
         assert!(live_event_passes_capability_filter(&v2, v2_features));
+    }
+
+    #[test]
+    fn stage_four_delivery_telemetry_tracks_only_the_delivered_protocol_family() {
+        // Metrics are process-global and this crate has no isolated recorder
+        // fixture. The thread-local test probe is written at the same
+        // successful-enqueue site as the real counter, so this test verifies
+        // the actual direct-delivery path without racing unrelated tests.
+        let _ = take_ui_protocol_delivery_metrics_for_test();
+        let session = SessionKey("local:stage-four-delivery-metrics".into());
+        let persisted_with_content = |session: &SessionKey| {
+            let mut notification = message_persisted_for(session);
+            let UiNotification::MessagePersisted(persisted) = &mut notification else {
+                unreachable!("message_persisted_for must return message/persisted");
+            };
+            persisted.content = Some("legacy content".into());
+            notification
+        };
+
+        // A v2 connection suppresses the legacy persisted source event, then
+        // delivers its v2 envelope. The telemetry must record only v2.
+        let (v2_ws, mut v2_rx) = ws_connection_for_test(4);
+        v2_ws.update_live_features(features_for_projection_envelope_v2_test());
+        let v2_ledger = UiProtocolLedger::new(8);
+        assert!(
+            send_notification_durable(&v2_ws, &v2_ledger, persisted_with_content(&session),)
+                .is_ok()
+        );
+        assert!(
+            v2_rx.try_recv().is_err(),
+            "v2 capability filter must suppress legacy message/persisted"
+        );
+        assert!(
+            take_ui_protocol_delivery_metrics_for_test().is_empty(),
+            "a suppressed legacy event must not increment either delivery counter"
+        );
+
+        assert!(
+            send_notification_durable(
+                &v2_ws,
+                &v2_ledger,
+                projection_envelope_v2_event_for(&session),
+            )
+            .is_ok()
+        );
+        let v2_frame = v2_rx.try_recv().expect("v2 envelope was enqueued");
+        assert_eq!(
+            frame_method(&v2_frame).as_deref(),
+            Some("projection/envelope")
+        );
+        assert_eq!(
+            take_ui_protocol_delivery_metrics_for_test(),
+            vec![UiProtocolDeliveryMetric::V2Envelope],
+            "v2 delivery increments the v2 counter path and not the legacy path"
+        );
+
+        // A legacy connection receives the content-bearing message/persisted
+        // frame and increments only the legacy delivery counter path.
+        let (legacy_ws, mut legacy_rx) = ws_connection_for_test(4);
+        legacy_ws.update_live_features(features_for_projection_envelope_test(false));
+        let legacy_ledger = UiProtocolLedger::new(8);
+        assert!(send_notification_durable(
+            &legacy_ws,
+            &legacy_ledger,
+            persisted_with_content(&session),
+        )
+        .is_ok());
+        let legacy_frame = legacy_rx
+            .try_recv()
+            .expect("legacy message/persisted was enqueued");
+        assert_eq!(
+            frame_method(&legacy_frame).as_deref(),
+            Some("message/persisted")
+        );
+        assert_eq!(
+            take_ui_protocol_delivery_metrics_for_test(),
+            vec![UiProtocolDeliveryMetric::LegacyPersistedContent],
+            "legacy delivery increments the legacy counter path"
+        );
     }
 
     #[tokio::test]
