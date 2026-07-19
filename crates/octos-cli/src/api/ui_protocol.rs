@@ -30,31 +30,30 @@ use octos_core::ui_protocol::{
     ApprovalRequestedEvent, ApprovalTypedDetails, AttachmentOwnerV2, ContentBulkDeleteParams,
     ContentDeleteParams, ContentListParams, ContextCompactionCompletedEvent,
     ContextCompactionStartedEvent, ContextNormalizationReportedEvent, CronListParams,
-    CronToggleParams, Envelope, EnvelopeTokenUsage, EnvelopeV2, EnvelopeV2Notification, FileRef,
+    CronToggleParams, EnvelopeTokenUsage, EnvelopeV2, EnvelopeV2Notification, FileRef,
     HydratedMessage, HydratedTurn, InputItem, MemoryEntityParams, MemoryOverviewParams,
-    MessageDeltaEvent, MessageMeta, MessagePersistedEvent, MessagePersistedSource, OutputCursor,
-    Payload, PayloadV2, ReplayLossyEvent, RpcError, RpcErrorResponse, RpcRequest, RpcResponse,
-    SESSION_HYDRATE_INCLUDE_MAX, SESSION_MESSAGES_PAGE_DEFAULT_LIMIT,
-    SESSION_MESSAGES_PAGE_MAX_LIMIT, SESSION_MESSAGES_PAGE_MAX_OFFSET, SESSION_TITLE_SET_MAX_CHARS,
-    SessionBtwParams, SessionDeleteParams, SessionFilesListParams, SessionHydrateParams,
-    SessionHydrateResult, SessionListParams, SessionMessagesPageParams, SessionOpenParams,
-    SessionOpenResult, SessionOpened, SessionOrchestrationEvent, SessionRollbackParams,
-    SessionRollbackResult, SessionSnapshotParams, SessionStatusGetParams, SessionTasksListParams,
-    SessionTitleSetParams, SessionWorkspaceGetParams, SystemStatusGetParams,
-    TaskArtifactListParams, TaskArtifactListResult, TaskArtifactReadParams, TaskArtifactReadResult,
-    TaskArtifactRecord, TaskCancelParams, TaskCancelResult, TaskListEntry, TaskListParams,
-    TaskListResult, TaskOutputDeltaEvent, TaskRestartFromNodeParams, TaskRestartFromNodeResult,
+    MessageDeltaEvent, MessageMeta, OutputCursor, Payload, PayloadV2, ReplayLossyEvent, RpcError,
+    RpcErrorResponse, RpcRequest, RpcResponse, SESSION_HYDRATE_INCLUDE_MAX,
+    SESSION_MESSAGES_PAGE_DEFAULT_LIMIT, SESSION_MESSAGES_PAGE_MAX_LIMIT,
+    SESSION_MESSAGES_PAGE_MAX_OFFSET, SESSION_TITLE_SET_MAX_CHARS, SessionBtwParams,
+    SessionDeleteParams, SessionFilesListParams, SessionHydrateParams, SessionHydrateResult,
+    SessionListParams, SessionMessagesPageParams, SessionOpenParams, SessionOpenResult,
+    SessionOpened, SessionOrchestrationEvent, SessionRollbackParams, SessionRollbackResult,
+    SessionSnapshotParams, SessionStatusGetParams, SessionTasksListParams, SessionTitleSetParams,
+    SessionWorkspaceGetParams, SystemStatusGetParams, TaskArtifactListParams,
+    TaskArtifactListResult, TaskArtifactReadParams, TaskArtifactReadResult, TaskArtifactRecord,
+    TaskCancelParams, TaskCancelResult, TaskListEntry, TaskListParams, TaskListResult,
+    TaskOutputDeltaEvent, TaskRestartFromNodeParams, TaskRestartFromNodeResult,
     TaskRuntimeState as UiTaskRuntimeState, TaskUpdatedEvent, ThreadGraphEntry,
     ThreadGraphGetParams, ThreadGraphGetResult, ToolCompletedEvent, ToolProgressEvent,
     ToolStartedEvent, TurnCompletedEvent, TurnErrorEvent, TurnId, TurnInterruptParams,
-    TurnInterruptResult, TurnLifecycleState, TurnSessionResult, TurnSpawnCompleteEvent,
-    TurnStartParams, TurnStateGetParams, TurnStateGetResult, TurnTerminalError,
-    TurnTerminalOutcome, UI_PROTOCOL_FEATURE_APPROVAL_TYPED_V1,
-    UI_PROTOCOL_FEATURE_AUXILIARY_REST_TO_WS_V1, UI_PROTOCOL_FEATURE_CODING_AGENT_CONTROL_V1,
-    UI_PROTOCOL_FEATURE_CODING_AUTONOMY_V1, UI_PROTOCOL_FEATURE_CODING_GOAL_RUNTIME_V1,
-    UI_PROTOCOL_FEATURE_CODING_LOOP_RUNTIME_V1, UI_PROTOCOL_FEATURE_CONTEXT_LIFECYCLE_V1,
-    UI_PROTOCOL_FEATURE_FILE_ATTACHED_V1, UI_PROTOCOL_FEATURE_HARNESS_TASK_ARTIFACTS_V1,
-    UI_PROTOCOL_FEATURE_HARNESS_TASK_CONTROL_V1, UI_PROTOCOL_FEATURE_MESSAGE_PERSISTED_V1,
+    TurnInterruptResult, TurnLifecycleState, TurnSessionResult, TurnStartParams,
+    TurnStateGetParams, TurnStateGetResult, TurnTerminalError, TurnTerminalOutcome,
+    UI_PROTOCOL_FEATURE_APPROVAL_TYPED_V1, UI_PROTOCOL_FEATURE_AUXILIARY_REST_TO_WS_V1,
+    UI_PROTOCOL_FEATURE_CODING_AGENT_CONTROL_V1, UI_PROTOCOL_FEATURE_CODING_AUTONOMY_V1,
+    UI_PROTOCOL_FEATURE_CODING_GOAL_RUNTIME_V1, UI_PROTOCOL_FEATURE_CODING_LOOP_RUNTIME_V1,
+    UI_PROTOCOL_FEATURE_CONTEXT_LIFECYCLE_V1, UI_PROTOCOL_FEATURE_FILE_ATTACHED_V1,
+    UI_PROTOCOL_FEATURE_HARNESS_TASK_ARTIFACTS_V1, UI_PROTOCOL_FEATURE_HARNESS_TASK_CONTROL_V1,
     UI_PROTOCOL_FEATURE_PANE_SNAPSHOTS_V1, UI_PROTOCOL_FEATURE_PLAN_TODOS_V1,
     UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V1, UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V2,
     UI_PROTOCOL_FEATURE_REVIEW_START_V1, UI_PROTOCOL_FEATURE_SESSION_HYDRATE_V1,
@@ -425,7 +424,7 @@ pub(crate) struct WsConnection {
     /// to DIRECT sends, mirroring what the replay/live-forwarder
     /// paths already do. Without it, a connection that negotiated
     /// `projection.envelope.v1` still received the legacy
-    /// `MessageDelta` / `TurnCompleted` / tool / `MessagePersisted`
+    /// `MessageDelta` / `TurnCompleted` / tool / canonical projection
     /// frames directly from handler code — violating the mutual
     /// exclusion the γ cutover gate is supposed to enforce.
     ///
@@ -1098,21 +1097,15 @@ struct ConnectionUiFeatures {
     thread_graph: bool,
     /// UPCR-2026-011 `state.turn_state_get.v1` negotiated.
     turn_state_get: bool,
-    /// UPCR-2026-012 `event.message_persisted.v1` negotiated.
-    message_persisted: bool,
-    /// M10 Phase 1 `event.spawn_complete.v1` negotiated. When set, the
-    /// connection receives `turn/spawn_complete` envelope events for
-    /// `spawn_only` background completions and the corresponding
-    /// `message/persisted` row (with `source: background`) is suppressed
-    /// at the per-connection wire-emit gate. When unset, the legacy
-    /// `message/persisted` shape is preserved and `turn/spawn_complete`
-    /// is suppressed.
+    /// M10 Phase 1 `event.spawn_complete.v1` negotiated. Retained solely for
+    /// historic durable-record compatibility; new background completions use
+    /// unconditional canonical v2 child envelopes.
     spawn_complete: bool,
     /// UPCR-2026-014 M9-α-9 `event.file_attached.v1` negotiated. When
     /// set, the connection receives one `file/attached` envelope per
     /// artefact delivered by a `spawn_only` background tool — a
-    /// dedicated wire signal that runs alongside (not replacing) the
-    /// `message/persisted` / `turn/spawn_complete` media carriers.
+    /// dedicated wire signal that runs alongside the canonical v2 child
+    /// payload's media.
     /// Defensive against the slides soak (2026-05-24) failure mode
     /// where the richer envelopes' placement logic dropped PPTX
     /// deliveries on the SPA's chat thread.
@@ -1128,10 +1121,10 @@ struct ConnectionUiFeatures {
     /// out only on the legacy `tool/completed` `structured_metadata` path.
     plan_todos: bool,
     /// UPCR-2026-014 M9-γ `projection.envelope.v1` negotiated. When set,
-    /// the client opts in to the canonical [`Envelope`] shape (spec
+    /// the client opts in to the historical v1 envelope shape (spec
     /// § 14) for projected events. γ-1 wires capability negotiation
     /// only — no emit site references this flag yet, and legacy
-    /// `message/delta`, `message/persisted`, `tool/*`, and
+    /// `message/delta`, `tool/*`, and
     /// `turn/completed` notifications continue to flow on the wire.
     /// γ-2 (follow-up) gates emission on this flag; γ-3 deletes the
     /// legacy notifications.
@@ -1215,11 +1208,6 @@ impl ConnectionUiFeatures {
             session_hydrate: has_ui_feature(headers, query, UI_PROTOCOL_FEATURE_SESSION_HYDRATE_V1),
             thread_graph: has_ui_feature(headers, query, UI_PROTOCOL_FEATURE_THREAD_GRAPH_V1),
             turn_state_get: has_ui_feature(headers, query, UI_PROTOCOL_FEATURE_TURN_STATE_GET_V1),
-            message_persisted: has_ui_feature(
-                headers,
-                query,
-                UI_PROTOCOL_FEATURE_MESSAGE_PERSISTED_V1,
-            ),
             spawn_complete: has_ui_feature(headers, query, UI_PROTOCOL_FEATURE_SPAWN_COMPLETE_V1),
             file_attached: has_ui_feature(headers, query, UI_PROTOCOL_FEATURE_FILE_ATTACHED_V1),
             voice_audio: has_ui_feature(headers, query, UI_PROTOCOL_FEATURE_VOICE_AUDIO_V1),
@@ -1282,7 +1270,6 @@ impl ConnectionUiFeatures {
             session_hydrate: true,
             thread_graph: true,
             turn_state_get: true,
-            message_persisted: true,
             spawn_complete: true,
             file_attached: true,
             voice_audio: true,
@@ -1337,7 +1324,6 @@ impl ConnectionUiFeatures {
             session_hydrate: has(UI_PROTOCOL_FEATURE_SESSION_HYDRATE_V1),
             thread_graph: has(UI_PROTOCOL_FEATURE_THREAD_GRAPH_V1),
             turn_state_get: has(UI_PROTOCOL_FEATURE_TURN_STATE_GET_V1),
-            message_persisted: has(UI_PROTOCOL_FEATURE_MESSAGE_PERSISTED_V1),
             spawn_complete: has(UI_PROTOCOL_FEATURE_SPAWN_COMPLETE_V1),
             file_attached: has(UI_PROTOCOL_FEATURE_FILE_ATTACHED_V1),
             voice_audio: has(UI_PROTOCOL_FEATURE_VOICE_AUDIO_V1),
@@ -1397,9 +1383,6 @@ impl ConnectionUiFeatures {
         }
         if self.turn_state_get {
             requested.push(UI_PROTOCOL_FEATURE_TURN_STATE_GET_V1);
-        }
-        if self.message_persisted {
-            requested.push(UI_PROTOCOL_FEATURE_MESSAGE_PERSISTED_V1);
         }
         if self.spawn_complete {
             requested.push(UI_PROTOCOL_FEATURE_SPAWN_COMPLETE_V1);
@@ -1602,13 +1585,11 @@ impl ConnectionUiFeatures {
     }
 }
 
-/// Stage 4 telemetry contract and Stage 5 deletion gate.
+/// Stage 4 telemetry retained after the Stage 5 deletion gate.
 ///
-/// Stage 5 may delete the legacy message/persisted lane only after
-/// `octos_ui_protocol_legacy_persisted_delivered_total` stops increasing and
-/// `octos_ui_protocol_connection_total{mode="legacy"}` is approximately zero
-/// over the observation window (summed across transports). Until then, at
-/// least one live client may still require the legacy lane.
+/// The legacy persisted-delivery counter was removed with the legacy lane:
+/// new server delivery samples cover canonical v2 envelopes only. Connection
+/// mode and v2 replay-gap counters remain useful operational signals.
 fn record_ui_protocol_connection_mode(features: ConnectionUiFeatures, transport: &'static str) {
     let mode = if features.projection_envelope_v2 {
         "v2"
@@ -1627,20 +1608,11 @@ fn record_ui_protocol_connection_mode(features: ConnectionUiFeatures, transport:
 /// before serializing a frame and recorded only after its enqueue succeeds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum UiProtocolDeliveryMetric {
-    LegacyPersistedContent,
     V2Envelope,
 }
 
 fn ui_protocol_delivery_metric(event: &UiProtocolLedgerEvent) -> Option<UiProtocolDeliveryMetric> {
     match event {
-        UiProtocolLedgerEvent::Notification(UiNotification::MessagePersisted(persisted))
-            if persisted
-                .content
-                .as_ref()
-                .is_some_and(|content| !content.is_empty()) =>
-        {
-            Some(UiProtocolDeliveryMetric::LegacyPersistedContent)
-        }
         UiProtocolLedgerEvent::Notification(UiNotification::EnvelopeV2(_)) => {
             Some(UiProtocolDeliveryMetric::V2Envelope)
         }
@@ -1663,9 +1635,6 @@ fn record_ui_protocol_delivery_metric(metric: Option<UiProtocolDeliveryMetric>) 
     UI_PROTOCOL_DELIVERY_METRICS_FOR_TEST.with(|metrics| metrics.borrow_mut().push(metric));
 
     match metric {
-        UiProtocolDeliveryMetric::LegacyPersistedContent => {
-            metrics::counter!("octos_ui_protocol_legacy_persisted_delivered_total").increment(1);
-        }
         UiProtocolDeliveryMetric::V2Envelope => {
             metrics::counter!("octos_ui_protocol_v2_envelope_delivered_total").increment(1);
         }
@@ -3097,9 +3066,9 @@ pub(super) async fn event_ledger(state: &AppState) -> Arc<UiProtocolLedger> {
     // the sweep.
     if Arc::ptr_eq(&installed, &ledger) {
         let _handle = spawn_eviction_task(installed.clone());
-        // UPCR-2026-012: install the post-fsync observer that converts
-        // every successful `add_message_with_seq` commit into a
-        // `message/persisted` ledger append. We install on the same
+        // Install the post-fsync observer that converts every successful
+        // `add_message_with_seq` commit into a canonical v2 projection
+        // envelope. We install on the same
         // path that wins the ledger get_or_init so a process never has
         // two competing observers.
         install_message_commit_observer(installed.clone());
@@ -3108,7 +3077,7 @@ pub(super) async fn event_ledger(state: &AppState) -> Arc<UiProtocolLedger> {
 }
 
 /// Install the durable-commit observer that records every successful
-/// `add_message_with_seq` commit as a `message/persisted` ledger entry.
+/// `add_message_with_seq` commit as a canonical v2 projection envelope.
 ///
 /// Per UPCR-2026-012 the observer fires AFTER `add_message_with_seq`'s
 /// disk write returned Ok and the in-memory mirror was updated, so any
@@ -3117,17 +3086,11 @@ pub(super) async fn event_ledger(state: &AppState) -> Arc<UiProtocolLedger> {
 /// `append_to_disk` and the observer is skipped — the
 /// "MUST NOT emit on commit failure" invariant.
 ///
-/// The ledger's `append_notification` takes the per-session global lock
-/// and stamps a strict-monotonic seq via the
-/// [`UiProtocolLedgerEvent::with_cursor`] hook — that hook also patches
-/// `MessagePersistedEvent.cursor` so the wire payload's `cursor` field
-/// carries the same authoritative seq the ledger envelope assigned.
-/// Two concurrent commits to the same session serialise on the ledger
-/// lock, so notifications are strict-ordered per session per
-/// UPCR-2026-012's ordering invariant.
+/// The v2 emitter takes the per-session global lock, assigns the durable
+/// cursor during append, and serializes concurrent commits in commit order.
 ///
-/// Delivery model: the entry is persisted to the ledger ring (disk +
-/// in-memory). Clients receive `message/persisted` via two paths,
+/// Delivery model: the envelope is persisted to the ledger ring (disk +
+/// in-memory). Clients receive the canonical v2 projection via two paths,
 /// whichever wins the race: (a) cursor-based replay on
 /// `session/open { after: <cursor> }`, or (b) the per-session live
 /// publish-subscribe broadcast (`UiProtocolLedger::subscribe`) drained
@@ -3143,35 +3106,31 @@ pub(super) async fn event_ledger(state: &AppState) -> Arc<UiProtocolLedger> {
 /// rather backpressure the agent loop than balloon memory.
 const SEND_FILE_CHANNEL_CAPACITY: usize = 64;
 
-tokio::task_local! {
-    /// M10 Phase 1: task-local override for `MessagePersistedSource` read
-    /// by `install_message_commit_observer`. The
-    /// [`BackgroundResultSender`] callback enters this scope before
-    /// invoking [`persist_assistant_with_media`] so the resulting
-    /// `MessagePersistedEvent` carries `source: background` instead of
-    /// the role-derived `assistant` default. The per-connection
-    /// capability filter then identifies "this is a duplicate of a
-    /// `turn/spawn_complete`" and suppresses it for clients that
-    /// negotiated the new wire shape.
-    ///
-    /// Without this override the `Message` role is `Assistant`, the
-    /// observer maps it to `MessagePersistedSource::Assistant`, and
-    /// the duplicate-suppression branch at
-    /// `live_event_passes_capability_filter` never fires — which
-    /// codex flagged as a P1 against the Phase 1 wire contract.
-    static MESSAGE_PERSISTED_SOURCE_OVERRIDE: Option<MessagePersistedSource>;
+/// Context supplied by the background-result path to the post-commit
+/// observer. The observer is the only place that can turn a successful
+/// canonical session write into a durable UI event, so this avoids a second
+/// post-persist notification lane and keeps commit ordering authoritative.
+#[derive(Clone)]
+struct BackgroundChildProjection {
+    parent_turn_id: String,
+    response_to_client_message_id: Option<String>,
+    task_id: Option<String>,
+    tool_call_id: Option<String>,
+    media: Vec<String>,
 }
 
-/// Resolve the source for an upcoming `MessagePersistedEvent`. Returns the
-/// task-local override when one is set (e.g. inside the `BackgroundResultSender`
-/// scope), otherwise falls back to the role-derived default — preserving
-/// the pre-M10 behaviour for every other persist path.
-fn current_message_persisted_source(role: octos_core::MessageRole) -> MessagePersistedSource {
-    MESSAGE_PERSISTED_SOURCE_OVERRIDE
-        .try_with(|override_value| *override_value)
-        .ok()
-        .flatten()
-        .unwrap_or_else(|| MessagePersistedSource::from_role(role))
+/// Projection disposition for one canonical message commit.
+#[derive(Clone)]
+enum MessageProjectionOverride {
+    /// Emit the committed row as a linked v2 background child stream.
+    BackgroundChild(BackgroundChildProjection),
+    /// The persisted row is a per-file companion already represented by the
+    /// following background-child envelope, so keep it transcript-only.
+    Suppress,
+}
+
+tokio::task_local! {
+    static MESSAGE_PROJECTION_OVERRIDE: Option<MessageProjectionOverride>;
 }
 
 /// Pre-stamp `thread_id` on a row about to be persisted by the standalone
@@ -3214,14 +3173,10 @@ fn pre_stamp_turn_thread_id(message: Message, turn_thread_id: &str) -> Message {
 /// `session_actor.rs::deliver_background_notification` post-write
 /// invalidate at `api_channel.rs:1503`.
 ///
-/// Returns `Some(PersistedMessageMeta)` on success — the row's committed
-/// seq plus the wire `message_id` derived the same way `MessageCommitObserver`
-/// computes it (`session:seq:timestamp_ns`). The shared id lets the
-/// `BackgroundResultSender` callback emit a `turn/spawn_complete`
-/// envelope whose `message_id` matches the parallel `message/persisted`
-/// event — clients that key dedup or confirmation off `message_id`
-/// then see one logical row, regardless of which wire shape they
-/// negotiated. `None` signals a persist failure (already logged).
+/// Returns `true` on success. The post-commit observer derives the stable
+/// message id and appends the linked v2 background-child envelope in the
+/// same successful-commit path; `false` signals a persist failure (already
+/// logged).
 async fn persist_assistant_with_media(
     sessions: &Arc<TokioMutex<octos_bus::SessionManager>>,
     data_dir: &Path,
@@ -3230,22 +3185,17 @@ async fn persist_assistant_with_media(
     media: Vec<String>,
     thread_id: String,
     label: &str,
-) -> Option<PersistedMessageMeta> {
+) -> bool {
     let mut message = Message::assistant_with_thread(content, octos_core::ThreadId::new(thread_id));
     message.media = media;
     // Capture the stamped timestamp BEFORE the canonical persist
     // consumes the message — `MessageCommitObserver` derives the wire
-    // `message_id` from `(session_id, committed_seq, message.timestamp)`,
-    // and we need that same value here so the spawn_complete envelope
-    // can advertise the identical id.
-    let timestamp_ns = message.timestamp.timestamp_nanos_opt().unwrap_or(0);
-
-    let committed_seq = match octos_bus::session::persist_message_through_canonical_path(
-        data_dir, session_id, message,
-    )
-    .await
+    // `message_id` from `(session_id, committed_seq, message.timestamp)`
+    // for the canonical background-child payload.
+    match octos_bus::session::persist_message_through_canonical_path(data_dir, session_id, message)
+        .await
     {
-        Ok(seq) => seq,
+        Ok(_) => {}
         Err(error) => {
             tracing::warn!(
                 session = %session_id.0,
@@ -3253,24 +3203,12 @@ async fn persist_assistant_with_media(
                 error = %error,
                 "api/serve: failed to persist background-delivered message"
             );
-            return None;
+            return false;
         }
-    };
+    }
 
     sessions.lock().await.invalidate_cache(session_id);
-    Some(PersistedMessageMeta {
-        committed_seq,
-        message_id: format!("{}:{committed_seq}:{timestamp_ns}", session_id.0),
-    })
-}
-
-/// Metadata returned by [`persist_assistant_with_media`] so callers can
-/// emit wire events whose identity matches the durable row written by
-/// `MessageCommitObserver`. See the helper's doc comment for rationale.
-#[derive(Debug, Clone)]
-struct PersistedMessageMeta {
-    committed_seq: usize,
-    message_id: String,
+    true
 }
 
 /// M9-γ-7 (issue #844): the agent loop's iterative tool-calling pattern
@@ -3279,15 +3217,15 @@ struct PersistedMessageMeta {
 /// shape that bracketed every `tool/started` → `tool/completed` cycle —
 /// the persisted row is invisible to the user but still triggers
 /// `MessageCommitObserver`. Pre-fix the ledger emitted N
-/// `message/persisted` envelopes per turn for an N-iteration loop, all
+/// assistant-persisted projection envelopes per turn for an N-iteration loop, all
 /// carrying the same `thread_id`. The web reducer keyed off `thread_id`
 /// merged them into a "phantom" empty assistant bubble that briefly
 /// flickered into the chat pane (the 2026-05-09 phantom-bubble bug).
 ///
 /// The defensive web-side fix in octos-web #92 hid those bubbles. The
-/// authoritative server-side fix is to suppress the `message/persisted`
+/// authoritative server-side fix is to suppress the v2 assistant-persisted
 /// emit for these intermediate metadata-only assistant rows so the wire
-/// surface emits exactly one `message/persisted` per turn for the final
+/// surface emits exactly one canonical assistant-persisted envelope per turn for the final
 /// user-visible assistant text.
 ///
 /// Filter: skip emission when the row is `Assistant`, content is
@@ -3306,140 +3244,76 @@ fn is_metadata_only_assistant_row(message: &octos_core::Message) -> bool {
 fn install_message_commit_observer(ledger: Arc<UiProtocolLedger>) {
     let observer: octos_bus::MessageCommitObserver =
         Arc::new(move |session_key, message, committed_seq| {
-            // M9-γ-7: drop intermediate metadata-only assistant rows
-            // (LLM returned only `tool_calls`, no rendered text). See
-            // [`is_metadata_only_assistant_row`] for the rationale.
             if is_metadata_only_assistant_row(message) {
                 return;
             }
-            let event = MessagePersistedEvent {
-                session_id: session_key.clone(),
-                topic: None,
-                // The `Message` struct does not yet carry a typed
-                // turn_id (PR-F in the structural plan adds it). Emit
-                // `None` for now per UPCR-2026-012 ("absent on legacy
-                // rows that pre-date the field").
-                turn_id: None,
-                thread_id: message.thread_id.clone(),
-                seq: committed_seq as u64,
-                role: message.role.as_str().to_owned(),
-                // Stable per-row id derived from (session, seq,
-                // timestamp). Once the typed-identity work in PR-A
-                // propagates `message_id` onto `Message` itself we'll
-                // plumb that value through directly.
-                message_id: format!(
-                    "{}:{committed_seq}:{}",
-                    session_key.0,
-                    message.timestamp.timestamp_nanos_opt().unwrap_or(0)
-                ),
-                client_message_id: message.client_message_id.clone(),
-                // M10 Phase 1: read the task-local source override
-                // first so a `BackgroundResultSender` persist (which
-                // duplicates a `turn/spawn_complete` envelope) emits
-                // `source: background`. The per-connection wire
-                // filter keys off this to suppress the duplicate for
-                // clients that negotiated `event.spawn_complete.v1`.
-                source: current_message_persisted_source(message.role),
-                // Placeholder; the ledger's `with_cursor` hook
-                // overwrites this with the assigned seq.
-                cursor: UiCursor {
-                    stream: session_key.0.clone(),
-                    seq: 0,
-                },
-                persisted_at: Utc::now(),
-                // P1.3 fix: surface the persisted message's `media`
-                // attachments on the wire so spawn_only / send_file
-                // deliveries reach the chat bubble. Empty Vec
-                // serialises to omitted (back-compat for clients
-                // that don't yet understand the field).
-                media: message.media.clone(),
-                // PR-content-on-persist (2026-05-19): carry text on
-                // the wire so a media-bearing row's caption / summary
-                // reaches the SPA, AND so multi-iter assistant rows
-                // (assistant → tool → assistant) whose streamed
-                // `message/delta` text would be dropped by the SPA's
-                // `isFinalizedAndIdle` guard still surface in the UI.
-                // Pre-fix the SPA hardcoded `content: ""`
-                // (`ui-protocol-event-router.ts`), and any text
-                // accompanying a `send_file` / mofa_slides / fm_tts
-                // delivery — plus any iter-2+ assistant text after the
-                // first persist finalised the streamed pending — was
-                // lost. We emit `None` only for empty/whitespace
-                // content (true bookkeeping commits with no
-                // renderable text); ALL non-empty rows surface their
-                // body here. That includes ordinary text-only rows
-                // whose body also streamed via `message/delta`; the
-                // SPA seq-dedupes them in `appendPersistedMessage` so
-                // there is no double-rendering, and the bandwidth
-                // cost is bounded by the size of an assistant turn's
-                // content (already paid once via deltas).
-                content: {
-                    let trimmed = message.content.trim();
-                    if trimmed.is_empty() {
-                        None
-                    } else {
-                        Some(message.content.clone())
-                    }
-                },
-            };
-            // Append to the ledger; the ledger stamps the cursor onto
-            // both the envelope AND the `MessagePersistedEvent.cursor`
-            // payload field (see `with_cursor` in
-            // `ui_protocol_ledger.rs`). Wire delivery to subscribed
-            // connections happens via the `send_ledger_event_durable`
-            // path that the standard notification fan-out already
-            // exercises.
-            let event_for_envelope = event.clone();
-            let message_for_envelope = message.clone();
-            let _appended = ledger.append_notification(UiNotification::MessagePersisted(event));
+            let projection_override = MESSAGE_PROJECTION_OVERRIDE
+                .try_with(|value| value.clone())
+                .ok()
+                .flatten();
+            if matches!(
+                &projection_override,
+                Some(MessageProjectionOverride::Suppress)
+            ) {
+                return;
+            }
 
-            // UPCR-2026-014 M9-γ dual-emit: in parallel with the legacy
-            // `message/persisted` envelope, append a canonical
-            // `projection/envelope` event. For Assistant rows we emit
-            // `Payload::AssistantPersisted` (carries the durable
-            // `MessageMeta`). For User rows we emit `Payload::UserMessage`
-            // — the turn root — including `client_message_id` so the
-            // optimistic `<GhostBubble>` overlay can match its server
-            // reflection. Tool rows are NOT rendered as envelopes (they
-            // appear as `Payload::ToolEnd` via `forward_progress_event`).
-            //
-            // Note: we resist the temptation to inspect
-            // `MessagePersistedSource::Background` here and suppress the
-            // envelope dual-emit for `BackgroundResultSender` persists —
-            // the per-connection live filter
-            // (`live_event_passes_capability_filter`) already routes
-            // legacy and envelope deliveries into mutually exclusive
-            // wire shapes, so the envelope is what
-            // `projection.envelope.v1` clients see; legacy clients see
-            // the suppressed-or-not `message/persisted` row.
-            let Some(thread_id) = message_for_envelope.thread_id.clone() else {
+            let message_id = format!(
+                "{}:{committed_seq}:{}",
+                session_key.0,
+                message.timestamp.timestamp_nanos_opt().unwrap_or(0)
+            );
+            if let Some(MessageProjectionOverride::BackgroundChild(context)) = projection_override {
+                let task_id = context
+                    .task_id
+                    .unwrap_or_else(|| format!("untracked-{message_id}"));
+                let child_stream_id = format!("{}:background:{task_id}", context.parent_turn_id);
+                let _ = ledger.emit_envelope_v2(
+                    session_key,
+                    child_stream_id,
+                    PayloadV2::BackgroundChildCompleted {
+                        parent_turn_id: context.parent_turn_id,
+                        response_to_client_message_id: context.response_to_client_message_id,
+                        task_id,
+                        content: message.content.clone(),
+                        tool_call_id: context.tool_call_id,
+                        message_id,
+                        source: "background".to_owned(),
+                        persisted_at: message.timestamp,
+                        media: context.media,
+                    },
+                    None,
+                );
+                return;
+            }
+
+            let Some(thread_id) = message.thread_id.clone() else {
                 return;
             };
-            let media_for_meta = event_for_envelope.media.clone();
-            let message_id = event_for_envelope.message_id.clone();
-            let persisted_at = event_for_envelope.persisted_at;
-            let cmid = event_for_envelope.client_message_id.clone();
-            match message_for_envelope.role {
+            match message.role {
                 MessageRole::Assistant => {
-                    let text = event_for_envelope.content.unwrap_or_default();
-                    let payload = Payload::AssistantPersisted {
-                        text,
+                    let assistant_segment_id = format!(
+                        "{thread_id}:assistant:{}",
+                        ledger.projection_v2_assistant_segment_index(
+                            session_key,
+                            &thread_id,
+                            u64::MAX,
+                        )
+                    );
+                    let payload = PayloadV2::AssistantPersisted {
+                        text: message.content.clone(),
+                        assistant_segment_id,
                         meta: MessageMeta {
                             message_id,
-                            persisted_at,
-                            media: media_for_meta,
+                            persisted_at: message.timestamp,
+                            media: message.media.clone(),
                         },
                     };
-                    let _ = ledger.emit_envelope(&session_key, thread_id, payload, None);
+                    let _ = ledger.emit_envelope_v2(session_key, thread_id, payload, None);
                 }
                 MessageRole::User => {
-                    let text = event_for_envelope.content.unwrap_or_default();
-                    // `UserMessage` MUST carry the `files: Vec<FileRef>`
-                    // turn-root shape. We don't have IANA mime + size
-                    // metadata on the legacy `media` field — populate a
-                    // best-effort `FileRef` per attachment so the
-                    // projection's UserView renders the attachment chip.
-                    let files: Vec<FileRef> = media_for_meta
+                    let files: Vec<FileRef> = message
+                        .media
                         .iter()
                         .map(|path| {
                             let size_bytes = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
@@ -3450,12 +3324,21 @@ fn install_message_commit_observer(ledger: Arc<UiProtocolLedger>) {
                             }
                         })
                         .collect();
-                    let payload = Payload::UserMessage { text, files };
-                    let _ = ledger.emit_envelope(&session_key, thread_id, payload, cmid);
+                    let payload = PayloadV2::UserMessage {
+                        text: message.content.clone(),
+                        files,
+                    };
+                    let _ = ledger.emit_envelope_v2(
+                        session_key,
+                        thread_id,
+                        payload,
+                        message.client_message_id.clone(),
+                    );
                 }
                 MessageRole::Tool | MessageRole::System => {
-                    // Tool persists surface as `Payload::ToolEnd` via the
-                    // progress mapper; system rows don't render in chat.
+                    // Tool lifecycle remains represented by its canonical
+                    // ToolStart/ToolProgress/ToolEnd projection path; system
+                    // rows do not render in chat.
                 }
             }
         });
@@ -10522,23 +10405,15 @@ async fn handle_session_open(
     // Replay frames are durable: drops surface as `protocol/replay_lossy`
     // and the client can refetch via REST.
     //
-    // Capability filtering: UPCR-2026-012 requires that `message/persisted`
-    // notifications are emitted ONLY to clients that negotiated
-    // `event.message_persisted.v1`. The live handler path enforces this,
-    // but replay during session/open must enforce it too — otherwise a
-    // client that did NOT request the feature still receives the events
-    // during reconnect-replay, violating the wire contract.
+    // Capability filtering is shared between live and reconnect replay. Canonical
+    // v2 envelopes bypass obsolete feature gates; historical source records still
+    // use their relevant compatibility gates.
     //
     // We silently skip filtered events rather than emitting
     // `protocol/replay_lossy`. The client never asked for these events,
     // so dropping them is not lossy from their perspective.
     //
-    // M10 Phase 1: the same dual filter that `live_event_passes_capability_filter`
-    // applies for the live broadcast must apply during replay so a
-    // reconnecting client sees exactly one shape per `spawn_only`
-    // completion (either the legacy `message/persisted` OR the new
-    // `turn/spawn_complete`, never both). Reusing the helper keeps replay
-    // and live in lockstep.
+    // Reusing the helper keeps replay and live capability behavior in lockstep.
     for event in outcome.replay {
         let projected = features
             .projection_envelope_v2
@@ -10562,7 +10437,7 @@ async fn handle_session_open(
     // received a `user_question/requested` it could answer, so it must not
     // get one on reconnect either — run each through the same per-connection
     // capability filter the live broadcast uses so replay and live stay in
-    // lockstep (mirrors the `message/persisted` replay-gate rationale above).
+    // lockstep with the other replay gates above).
     for event in outcome.pending_questions {
         let ledger_event =
             UiProtocolLedgerEvent::Notification(UiNotification::UserQuestionRequested(event));
@@ -10665,7 +10540,7 @@ fn ledger_event_matches_topic_scope(
     // explicit `topic` field carried on every variant whose emit site
     // can drop the topic suffix from `session_id` (TurnStarted,
     // MessageDelta, ToolStarted/Progress/Completed, Approval*, Task*,
-    // TurnCompleted/Error/SpawnComplete, MessagePersisted,
+    // TurnCompleted/Error/SpawnComplete, projection envelopes,
     // FileAttached, SessionEventBridged). #1329 closes the P0-A class
     // routing drop: emitters populate `topic` from the upstream
     // SessionKey BEFORE any `base_key()` strip, so a topic-scoped
@@ -10852,21 +10727,11 @@ fn project_v2_ledger_event(
                 Payload::ReasoningDelta { text } => {
                     PayloadV2::ReasoningDelta { text: text.clone() }
                 }
-                Payload::AssistantPersisted { text, meta } => {
-                    // Background rows are represented only by the linked child
-                    // stream below. Never append them after the foreground
-                    // parent's terminal stream.
-                    if ledger
-                        .projection_v2_is_background_message(&envelope.session_id, &meta.message_id)
-                    {
-                        return None;
-                    }
-                    PayloadV2::AssistantPersisted {
-                        text: text.clone(),
-                        assistant_segment_id: assistant_segment_id(),
-                        meta: meta.clone(),
-                    }
-                }
+                Payload::AssistantPersisted { text, meta } => PayloadV2::AssistantPersisted {
+                    text: text.clone(),
+                    assistant_segment_id: assistant_segment_id(),
+                    meta: meta.clone(),
+                },
                 Payload::ToolStart {
                     tool_call_id,
                     name,
@@ -11067,41 +10932,35 @@ fn project_v2_ledger_event(
     ))
 }
 
-/// Mirror the capability filter at `ui_protocol.rs` session/open replay
-/// loop (UPCR-2026-012): a connection that did not negotiate
-/// `event.message_persisted.v1` must not receive `message/persisted`
-/// notifications via the live broadcast either. Other notifications pass
-/// unchanged today; future capability-gated kinds get added here.
+/// Apply per-connection capability gates to durable UI events.
 ///
-/// M10 Phase 1 extends this with two intertwined gates for the
-/// `event.spawn_complete.v1` capability:
-///
-/// 1. Clients that did NOT negotiate `event.spawn_complete.v1` must not
-///    receive `turn/spawn_complete` notifications. They continue to see
-///    the legacy `message/persisted` row for the same `spawn_only`
-///    completion, preserving the wire shape they shipped with.
-/// 2. Clients that DID negotiate `event.spawn_complete.v1` see
-///    `turn/spawn_complete` instead — and the corresponding
-///    `message/persisted` row (carrying `source: background`) is
-///    suppressed at this gate so the same logical event is not
-///    delivered twice in two different shapes.
+/// Canonical v2 envelopes are never capability-filtered: the Stage-5 server
+/// contract delivers `projection/envelope` v2 whenever one is present. The
+/// remaining gates cover unrelated additive notifications and historical
+/// source records that can still be projected for replay compatibility.
 fn live_event_passes_capability_filter(
     event: &UiProtocolLedgerEvent,
     features: ConnectionUiFeatures,
 ) -> bool {
-    // Stage 1 v2 has strict precedence over v1. A v2-capable connection
-    // receives the cursor-stamped projection only; it must never receive a
-    // v1 envelope or one of the legacy source notifications that the v2
-    // projector translates. Keep this branch first so its contract does not
-    // accidentally depend on the older, individual legacy capability gates.
+    // Stage 5: a persisted v2 envelope is the sole canonical delivery lane.
+    // It must reach every connection independently of an obsolete capability
+    // bit, including direct sends and replay.
+    if matches!(
+        event,
+        UiProtocolLedgerEvent::Notification(UiNotification::EnvelopeV2(_))
+    ) {
+        return true;
+    }
+
+    // A v2-capable connection receives only projections for source records.
+    // Keep this branch before the historical capability gates below so a
+    // replayed source event cannot leak beside its v2 projection.
     if features.projection_envelope_v2 {
         if let UiProtocolLedgerEvent::Notification(notification) = event {
             match notification {
-                UiNotification::EnvelopeV2(_) => return true,
                 UiNotification::Envelope(_)
                 | UiNotification::MessageDelta(_)
                 | UiNotification::ReasoningDelta(_)
-                | UiNotification::MessagePersisted(_)
                 | UiNotification::ToolStarted(_)
                 | UiNotification::ToolProgress(_)
                 | UiNotification::ToolCompleted(_)
@@ -11111,11 +10970,6 @@ fn live_event_passes_capability_filter(
                 | UiNotification::TurnSpawnComplete(_) => return false,
                 _ => {}
             }
-        }
-    }
-    if !features.message_persisted {
-        if let UiProtocolLedgerEvent::Notification(UiNotification::MessagePersisted(_)) = event {
-            return false;
         }
     }
     if !features.context_lifecycle_available() {
@@ -11129,25 +10983,14 @@ fn live_event_passes_capability_filter(
         }
     }
     if !features.spawn_complete {
-        // Old client: never deliver the new envelope.
+        // Clients that did not negotiate this historical notification never
+        // receive it. New background results are v2 envelopes instead.
         if let UiProtocolLedgerEvent::Notification(UiNotification::TurnSpawnComplete(_)) = event {
             return false;
         }
-    } else {
-        // New client: suppress the `message/persisted` row that
-        // duplicates a `turn/spawn_complete` envelope. The row is
-        // identified by `source: background` — the only path through
-        // `MessageCommitObserver` that fires from `BackgroundResultSender`.
-        if let UiProtocolLedgerEvent::Notification(UiNotification::MessagePersisted(event)) = event
-        {
-            if matches!(event.source, MessagePersistedSource::Background) {
-                return false;
-            }
-        }
     }
     // UPCR-2026-014 M9-α-9: `event.file_attached.v1` gate. Old clients
-    // never see the new `file/attached` envelope — they keep relying on
-    // `media` on `message/persisted` / `turn/spawn_complete`. New
+    // never see the new `file/attached` envelope. New
     // clients see `file/attached` as an additional dedicated signal.
     if !features.file_attached {
         if let UiProtocolLedgerEvent::Notification(UiNotification::FileAttached(_)) = event {
@@ -11187,8 +11030,8 @@ fn live_event_passes_capability_filter(
     }
     // UPCR-2026-014 M9-γ cutover: per-connection mutual exclusion.
     //
-    // Connections that NEGOTIATED `projection.envelope.v1` see canonical
-    // `projection/envelope` envelopes ONLY — the legacy notifications
+    // Connections that NEGOTIATED `projection.envelope.v1` see historical
+    // v1 projection envelopes only — the legacy notifications
     // they supersede are filtered out on this side. Connections that did
     // NOT negotiate see legacy notifications ONLY — envelopes are
     // filtered out. This is the cutover gate that makes the M9-γ
@@ -11198,7 +11041,6 @@ fn live_event_passes_capability_filter(
     // Legacy events superseded by envelopes per spec § 14.7:
     //   - message/delta             → assistant_delta envelope
     //   - message/reasoning_delta   → reasoning_delta envelope
-    //   - message/persisted         → assistant_persisted or user_message envelope
     //   - tool/started              → tool_start envelope
     //   - tool/progress             → tool_progress envelope
     //   - tool/completed            → tool_end envelope
@@ -11210,10 +11052,8 @@ fn live_event_passes_capability_filter(
     // changes is the per-connection wire delivery.
     if features.projection_envelope {
         if let UiProtocolLedgerEvent::Notification(
-            UiNotification::EnvelopeV2(_)
-            | UiNotification::MessageDelta(_)
+            UiNotification::MessageDelta(_)
             | UiNotification::ReasoningDelta(_)
-            | UiNotification::MessagePersisted(_)
             | UiNotification::ToolStarted(_)
             | UiNotification::ToolProgress(_)
             | UiNotification::ToolCompleted(_)
@@ -11223,10 +11063,7 @@ fn live_event_passes_capability_filter(
         {
             return false;
         }
-    } else if let UiProtocolLedgerEvent::Notification(
-        UiNotification::Envelope(_) | UiNotification::EnvelopeV2(_),
-    ) = event
-    {
+    } else if let UiProtocolLedgerEvent::Notification(UiNotification::Envelope(_)) = event {
         return false;
     }
     true
@@ -14560,50 +14397,42 @@ async fn handle_session_hydrate(
             return;
         }
     }
-    // M10 Phase 6.2 (Bug C). Closes the Phase 5a documented punt by
-    // surfacing every retained `turn/spawn_complete` envelope from the
-    // ledger replay window on the hydrate response when (and only
-    // when) the client negotiated `event.spawn_complete.v1`. Server
-    // does NOT suppress the legacy `Background`-source rows in
-    // `messages` — the `SessionHydrateResult` payload has no
-    // alternative channel for the envelope's `content`/`media`, and
-    // codex's review rounds on the suppression-side designs surfaced
-    // multiple correctness regressions (NotConfigured-branch empty
-    // media, multi-task per-turn ambiguity, orphan companions from
-    // failed final-ack persists). Negotiated clients dedup against
-    // `replayed_envelopes` on their side using `message_id` —
-    // mirroring the live wire's split: producer emits both shapes,
-    // consumer chooses one per `event.spawn_complete.v1` capability.
-    //
-    // Non-negotiated clients receive `replayed_envelopes: None`
-    // (omitted via `skip_serializing_if`); the `messages` payload they
-    // see is byte-identical to pre-fix.
-    let replayed_envelopes = if features.spawn_complete && include_set.messages {
+    // Hydrate carries the same canonical v2 records as live delivery. Route
+    // historical retained source records through the projector too, so an old
+    // on-disk turn/spawn_complete row remains readable without restoring a
+    // legacy wire lane.
+    let replayed_envelopes = if features.projection_envelope_v2 && include_set.messages {
         Some(
             replayed
                 .iter()
-                .filter_map(|event| match &event.event {
-                    UiProtocolLedgerEvent::Notification(UiNotification::TurnSpawnComplete(ev)) => {
-                        Some(ev.clone())
-                    }
-                    _ => None,
+                .filter_map(|event| {
+                    let UiProtocolLedgerEvent::Notification(UiNotification::EnvelopeV2(envelope)) =
+                        project_v2_ledger_event(ledger, &event.event, &event.cursor)?
+                    else {
+                        return None;
+                    };
+                    matches!(
+                        &envelope.envelope.payload,
+                        PayloadV2::BackgroundChildCompleted { .. }
+                    )
+                    .then_some(envelope.envelope)
                 })
                 .collect::<Vec<_>>(),
         )
     } else {
         None
     };
-    let replayed_tool_envelopes = if features.spawn_complete && include_set.messages {
+    let replayed_tool_envelopes = if features.projection_envelope_v2 && include_set.messages {
         Some(
             replayed
                 .iter()
-                .filter_map(|event| match &event.event {
-                    UiProtocolLedgerEvent::Notification(UiNotification::Envelope(ev))
-                        if hydrate_replays_tool_payload(&ev.envelope) =>
-                    {
-                        Some(ev.envelope.clone())
-                    }
-                    _ => None,
+                .filter_map(|event| {
+                    let UiProtocolLedgerEvent::Notification(UiNotification::EnvelopeV2(envelope)) =
+                        project_v2_ledger_event(ledger, &event.event, &event.cursor)?
+                    else {
+                        return None;
+                    };
+                    hydrate_replays_tool_payload(&envelope.envelope).then_some(envelope.envelope)
                 })
                 .collect::<Vec<_>>(),
         )
@@ -14611,31 +14440,31 @@ async fn handle_session_hydrate(
         None
     };
 
-    // Codex Bug C round-6: gate the new identity/provenance fields
-    // on `features.spawn_complete`. Without negotiation we leave
-    // `HydratedMessage.message_id` and `HydratedMessage.source` as
-    // `None` so legacy clients (TUI, pre-spawn_complete SPA bundles,
-    // strict-codegen consumers) see byte-identical wire. With
-    // negotiation we synthesize `message_id` (mirrors
-    // `MessageCommitObserver`'s formula) and lift `source` from the
-    // retained `MessagePersisted` events — giving the client the
-    // identity AND provenance signals it needs to drop both the
-    // spawn-ack row AND the per-file companion rows in favour of the
-    // envelope on hydrate-time dedup.
-    let row_sources: HashMap<u64, String> = if features.spawn_complete && include_set.messages {
-        replayed
-            .iter()
-            .filter_map(|event| match &event.event {
-                UiProtocolLedgerEvent::Notification(UiNotification::MessagePersisted(ev)) => {
-                    Some((ev.seq, ev.source.as_str().to_owned()))
-                }
-                _ => None,
-            })
-            .collect()
-    } else {
-        HashMap::new()
-    };
-    let expose_message_id = features.spawn_complete && include_set.messages;
+    // The background-child payload is now the authoritative provenance
+    // record. Its message_id is the same stable identifier used by the
+    // transcript row, avoiding a legacy wire-source tag.
+    let background_message_ids: HashSet<String> =
+        if features.projection_envelope_v2 && include_set.messages {
+            replayed
+                .iter()
+                .filter_map(|event| {
+                    let UiProtocolLedgerEvent::Notification(UiNotification::EnvelopeV2(envelope)) =
+                        project_v2_ledger_event(ledger, &event.event, &event.cursor)?
+                    else {
+                        return None;
+                    };
+                    let PayloadV2::BackgroundChildCompleted { message_id, .. } =
+                        envelope.envelope.payload
+                    else {
+                        return None;
+                    };
+                    Some(message_id)
+                })
+                .collect()
+        } else {
+            HashSet::new()
+        };
+    let expose_message_id = features.projection_envelope_v2 && include_set.messages;
 
     // Lock once; gather all the in-memory chat state we need so the
     // result reflects a single sessions-side snapshot.
@@ -14662,12 +14491,8 @@ async fn handle_session_hydrate(
                     })
                     .map(|(seq, msg)| {
                         let seq = seq as u64;
-                        // M10 Phase 6.2 (Bug C). Negotiated clients
-                        // get `(message_id, source)` so they can
-                        // dedup the hydrated rows against
-                        // `replayed_envelopes`. Non-negotiated
-                        // clients keep the pre-fix shape (both
-                        // fields `None`, omitted from the wire).
+                        // V2 clients get a transcript identity that matches
+                        // assistant_persisted/background_child_completed.
                         let message_id = if expose_message_id {
                             Some(format!(
                                 "{}:{seq}:{}",
@@ -14677,7 +14502,10 @@ async fn handle_session_hydrate(
                         } else {
                             None
                         };
-                        let source = row_sources.get(&seq).cloned();
+                        let source = message_id
+                            .as_ref()
+                            .filter(|message_id| background_message_ids.contains(*message_id))
+                            .map(|_| "background".to_owned());
                         HydratedMessage {
                             seq,
                             role: msg.role.as_str().to_owned(),
@@ -14690,7 +14518,7 @@ async fn handle_session_hydrate(
                             source,
                             // The store persists reasoning; without this the
                             // "· reasoning" block vanishes on every client
-                            // restart. Same gate as message_id/source.
+                            // restart. Same v2 gate as message_id/source.
                             reasoning_content: if expose_message_id {
                                 msg.reasoning_content.clone()
                             } else {
@@ -14699,9 +14527,7 @@ async fn handle_session_hydrate(
                             // P1.3 fix: surface canonical-ledger media so a
                             // client reconnecting after a disconnect can
                             // re-render the same `.md` / `.mp3` / `.pptx`
-                            // attachment it would have seen via the live
-                            // `message/persisted` push (`media` field on
-                            // MessagePersistedEvent).
+                            // attachment carried by the v2 projection.
                             media: msg.media.clone(),
                         }
                     })
@@ -14783,10 +14609,10 @@ async fn handle_session_hydrate(
     );
 }
 
-fn hydrate_replays_tool_payload(envelope: &Envelope) -> bool {
+fn hydrate_replays_tool_payload(envelope: &EnvelopeV2) -> bool {
     matches!(
         envelope.payload,
-        Payload::ToolStart { .. } | Payload::ToolProgress { .. } | Payload::ToolEnd { .. }
+        PayloadV2::ToolStart { .. } | PayloadV2::ToolProgress { .. } | PayloadV2::ToolEnd { .. }
     )
 }
 
@@ -14957,10 +14783,10 @@ async fn handle_session_rollback(
 
     // Turn projection reuses the exact hydrate helper over the trimmed threads.
     // The `replayed` snapshot was taken PRE-trim, so it still carries lifecycle
-    // + `message/persisted` events for the just-rolled-back turns. Scope the
+    // + canonical projection events for the just-rolled-back turns. Scope the
     // projected turns to the SURVIVING threads (codex P2): a turn belongs to the
     // trimmed thread iff its `thread_id` — surfaced from the ledger's
-    // `message/persisted` rows — is still present among the trimmed threads.
+    // projection envelope rows — is still present among the trimmed threads.
     // Without this, `thread.turns` would leak lifecycle state for dropped turns
     // even though `messages`/`threads` are trimmed.
     let surviving_thread_ids: std::collections::HashSet<&str> = threads
@@ -16101,9 +15927,9 @@ struct TurnLedgerProjection {
 }
 
 /// Project a turn's lifecycle from the durable ledger event stream. Walks
-/// the events for the session looking for `turn/started`, `turn/completed`,
-/// `turn/error`, and `message/persisted` notifications referencing the
-/// target `turn_id`. Returns `state = None` when the ledger has no record.
+/// the events for the session looking for lifecycle notifications and
+/// canonical v2 envelopes referencing the target `turn_id`. Returns
+/// `state = None` when the ledger has no record.
 fn project_turn_from_ledger(
     target: &TurnId,
     events: &[LedgeredUiProtocolEvent],
@@ -16132,11 +15958,11 @@ fn project_turn_from_ledger(
                     TurnLifecycleState::Errored
                 });
             }
-            UiNotification::MessagePersisted(persisted)
-                if persisted.turn_id.as_ref() == Some(target) =>
+            UiNotification::EnvelopeV2(envelope)
+                if envelope.envelope.turn_id == target.0.to_string() =>
             {
                 if projection.thread_id.is_none() {
-                    projection.thread_id = persisted.thread_id.clone();
+                    projection.thread_id = Some(envelope.envelope.thread_id.clone());
                 }
             }
             _ => {}
@@ -16166,7 +15992,6 @@ async fn collect_session_turns(
             UiNotification::TurnStarted(e) => Some(e.turn_id.clone()),
             UiNotification::TurnCompleted(e) => Some(e.turn_id.clone()),
             UiNotification::TurnError(e) => Some(e.turn_id.clone()),
-            UiNotification::MessagePersisted(e) => e.turn_id.clone(),
             _ => None,
         };
         let Some(turn_id) = turn_id else {
@@ -16196,8 +16021,7 @@ async fn collect_session_turns(
     }
 
     // Backfill thread_id from the thread graph when the ledger projection
-    // didn't surface one (legacy rows / no `message/persisted` recorded
-    // yet for this turn).
+    // didn't surface one yet for this turn.
     let mut turns: Vec<HydratedTurn> = projections
         .into_iter()
         .map(|(turn_id, proj)| {
@@ -21761,12 +21585,11 @@ async fn run_standalone_turn(
         tokio::sync::mpsc::channel::<String>(PROGRESS_CHANNEL_CAPACITY);
     let progress_dropped = Arc::new(AtomicU64::new(0));
 
-    // β: wire `BackgroundResultSender` + `SendFileTool` so spawn_only tool
+    // Wire `BackgroundResultSender` + `SendFileTool` so spawn_only tool
     // completions and explicit `send_file` calls persist as assistant
-    // messages on the session and reach connected WS clients via the
-    // existing `MessageCommitObserver` -> `message/persisted` ledger append
-    // (#761 live publish-subscribe). Without this, the api/serve path drops
-    // spawn_only file deliveries on the floor — gateway wires the
+    // messages on the session and reach connected clients through the
+    // post-commit canonical v2 envelope path. Without this, the api/serve
+    // path drops spawn_only file deliveries on the floor — gateway wires the
     // equivalent in `session_actor.rs::deliver_background_notification`.
     //
     // The canonical persist
@@ -21779,16 +21602,9 @@ async fn run_standalone_turn(
     // the pre-persist snapshot (matches `ApiChannel::persist_to_session`'s
     // post-write invalidate at `api_channel.rs:1503`).
     //
-    // M10 Phase 1: in addition to persisting (which still fires
-    // `message/persisted` via `MessageCommitObserver` for ledger
-    // durability + `event.message_persisted.v1` clients), the closure
-    // now appends a `turn/spawn_complete` envelope event to the ledger
-    // for clients that negotiated `event.spawn_complete.v1`. The
-    // per-connection capability filter (`live_event_passes_capability_filter`)
-    // routes each connection to exactly one wire shape — old clients
-    // see `message/persisted` as before, new clients see
-    // `turn/spawn_complete` and the duplicate `message/persisted`
-    // (with `source: background`) is suppressed.
+    // A background commit carries task context through the task-local observer
+    // override, which emits exactly one `background_child_completed` payload
+    // after the canonical session write succeeds.
     {
         let bg_data_dir = sessions.lock().await.data_dir().to_path_buf();
         let bg_sessions = sessions.clone();
@@ -21961,7 +21777,6 @@ async fn run_standalone_turn(
         let payload_session_id = bg_session_id.clone();
         let payload_thread_id = bg_thread_id.clone();
         let payload_turn_id = bg_turn_id.clone();
-        let payload_ledger = ledger.clone();
         let background_result_sender: octos_agent::tools::spawn::BackgroundResultSender =
             std::sync::Arc::new(move |payload: BackgroundResultPayload| {
                 let sessions = payload_sessions.clone();
@@ -21976,31 +21791,19 @@ async fn run_standalone_turn(
                     .unwrap_or_else(|| payload_thread_id.clone());
                 let task_label = payload.task_label.clone();
                 let media = payload.media.clone();
-                // M10 Phase 5a: envelope_media is the media list to surface
-                // ONLY on the `turn/spawn_complete` envelope. The
-                // `NotConfigured` `send_file` fallback populates this with
-                // its `sent_files` paths so dual-negotiated clients see the
-                // file URLs on the envelope; the persisted row keeps
-                // `media: vec![]` (no double-render on old clients that DO
-                // see the per-file `message/persisted` companions). The
-                // contract-`Satisfied` path leaves `envelope_media` as the
-                // empty default; in that case the envelope falls back to
-                // `media`. Centralised in `effective_envelope_media` so the
-                // `file/attached` consumer below (and any future caller)
-                // sees the same coalesced list — see helper doc for the
-                // round-13 slides soak regression that motivated extracting
-                // this from an inline `if`.
+                // `effective_envelope_media` carries the artifact list on
+                // the background-child payload. The `NotConfigured`
+                // `send_file` fallback contributes its sent-file paths;
+                // contract-satisfied payloads use their direct media list.
                 let envelope_media =
                     super::ui_protocol_alpha9_bridge::effective_envelope_media(&payload);
                 let kind = payload.kind;
                 let raw_content = payload.content.clone();
                 let task_id = payload.task_id.clone();
-                // Issue #960 fix: pull the originating user cmid out of
-                // the payload BEFORE we move into the async block so the
-                // `TurnSpawnCompleteEvent` consumer can stamp
+                // Pull the originating user cmid out before the async block
+                // so `background_child_completed` can set
                 // `response_to_client_message_id`. Empty strings collapse
-                // to `None` so the SPA reducer never sees an `""` cmid
-                // that would silently fail an `===` thread-map lookup.
+                // to `None` so the reducer never sees an unusable id.
                 let originating_client_message_id = payload
                     .originating_client_message_id
                     .clone()
@@ -22008,7 +21811,6 @@ async fn run_standalone_turn(
                 let originating_tool_call_id =
                     payload.tool_call_id.clone().filter(|s| !s.is_empty());
                 let turn_id = payload_turn_id.clone();
-                let ledger = payload_ledger.clone();
                 Box::pin(async move {
                     // `trim().is_empty()` so a whitespace-only `raw_content`
                     // (e.g. an emitter that printed just "\n") gets the
@@ -22041,203 +21843,40 @@ async fn run_standalone_turn(
                             }
                         }
                     };
-                    // M10 Phase 1 (codex P1): scope the persist call in
-                    // the `MESSAGE_PERSISTED_SOURCE_OVERRIDE` task-local
-                    // so `install_message_commit_observer` emits
-                    // `source: background` for this row. Without this,
-                    // `MessagePersistedSource::from_role(Assistant)`
-                    // would return `Assistant` and the per-connection
-                    // duplicate-suppression filter would never fire,
-                    // delivering both `message/persisted` AND
-                    // `turn/spawn_complete` to upgraded clients.
-                    // M10 Phase 1 (codex round 4): only mark this row as
-                    // `source: background` if we will emit a replacement
-                    // `turn/spawn_complete` envelope for it. Otherwise
-                    // upgraded clients filter the legacy
-                    // `message/persisted` row AND see no envelope —
-                    // they receive nothing for the completion. The
-                    // marker has to stay coupled to the envelope emit
-                    // for the dual-gate invariant to hold.
-                    //
-                    // Empty `Some("")` — the legacy register sentinel
-                    // returned when the supervisor's fan-out cap refuses
-                    // a task — is treated like `None` (codex round 3 P3).
                     let task_id_clean = task_id
                         .as_deref()
                         .filter(|s| !s.is_empty())
                         .map(str::to_string);
-                    let will_emit_envelope = task_id_clean.is_some();
-                    let persisted_meta = if will_emit_envelope {
-                        MESSAGE_PERSISTED_SOURCE_OVERRIDE
-                            .scope(
-                                Some(MessagePersistedSource::Background),
-                                persist_assistant_with_media(
-                                    &sessions,
-                                    &data_dir,
-                                    &session_id,
-                                    content_text.clone(),
-                                    media.clone(),
-                                    thread_id.clone(),
-                                    &task_label,
-                                ),
-                            )
-                            .await
-                    } else {
-                        // No envelope incoming → leave the source as
-                        // role-derived (Assistant) so upgraded clients
-                        // still receive the `message/persisted` row.
-                        // This degrades to legacy behaviour for the
-                        // edge cases (no tracked task, empty sentinel)
-                        // rather than silently dropping the completion.
-                        persist_assistant_with_media(
-                            &sessions,
-                            &data_dir,
-                            &session_id,
-                            content_text.clone(),
-                            media.clone(),
-                            thread_id.clone(),
-                            &task_label,
-                        )
-                        .await
-                    };
-                    if let (Some(task_id_value), Some(meta)) =
-                        (task_id_clean.clone(), persisted_meta.as_ref())
-                    {
-                        let event = TurnSpawnCompleteEvent {
-                            session_id: session_id.clone(),
-                            topic: None,
-                            turn_id: Some(turn_id.clone()),
-                            thread_id: Some(thread_id.clone()),
-                            task_id: task_id_value,
-                            tool_call_id: originating_tool_call_id.clone(),
-                            // Issue #960 fix: M10 Phase 4 plumbing —
-                            // surface the originating user prompt's
-                            // `client_message_id` (captured at the
-                            // spawn_only intercept in
-                            // `agent/execution.rs` from
-                            // `bg_reporter.thread_id()`) so the SPA's
-                            // `subSpawnComplete` handler can anchor the
-                            // new assistant bubble against the parent
-                            // prompt. Without this, the bundle's
-                            // thread-map lookup misses and the
-                            // background-completion bubble (e.g.
-                            // `"Background work started for
-                            // run_pipeline…"`) is silently dropped from
-                            // the rendered chat even though the row was
-                            // persisted to the session ledger. On the
-                            // gateway/cmid-bound path the value IS the
-                            // user's cmid directly; on the WS
-                            // standalone-turn path the reporter binds
-                            // `turn_id.0.to_string()` and the SPA keys
-                            // its thread-map on that same UUID, so the
-                            // wire identity round-trips correctly in
-                            // both shapes.
+                    let projection =
+                        MessageProjectionOverride::BackgroundChild(BackgroundChildProjection {
+                            parent_turn_id: turn_id.0.to_string(),
                             response_to_client_message_id: originating_client_message_id.clone(),
-                            seq: meta.committed_seq as u64,
-                            // Reuse the `MessageCommitObserver`-style
-                            // wire id for the same durable row — see
-                            // `PersistedMessageMeta` doc.
-                            message_id: meta.message_id.clone(),
-                            source: "background".to_owned(),
-                            cursor: UiCursor {
-                                stream: session_id.0.clone(),
-                                seq: 0,
-                            },
-                            persisted_at: Utc::now(),
-                            content: content_text,
-                            media: envelope_media.clone(),
-                        };
-                        ledger.append_notification(UiNotification::TurnSpawnComplete(event));
-
-                        // UPCR-2026-014 M9-α-9: emit one `file/attached`
-                        // envelope per delivered artefact in addition to
-                        // the content-bearing envelopes above. Clients
-                        // that negotiated `event.file_attached.v1`
-                        // receive a dedicated wire signal per file —
-                        // independent of the `turn/spawn_complete` /
-                        // `message/persisted` placement heuristics —
-                        // and can render a download button without
-                        // having to parse the rich envelope. The slides
-                        // soak (2026-05-24) captured PPTX artefacts on
-                        // disk that never surfaced a clickable button
-                        // on the SPA; the redundant signal closes that
-                        // gap. Helper retains the legacy guard against
-                        // empty media (no-op when both lists are
-                        // empty), so this stays cheap on text-only
-                        // background completions.
-                        super::ui_protocol_alpha9_bridge::emit_files_attached_from_background(
-                            &ledger,
-                            &session_id,
-                            &turn_id,
-                            &media,
-                            &envelope_media,
-                            originating_tool_call_id.clone(),
-                        );
-                    } else if task_id_clean.is_none() {
-                        // Best-effort: a payload without `task_id` (or
-                        // with the empty-string sentinel returned by
-                        // the legacy register-task path under fan-out
-                        // pressure) arrives only from edge-case
-                        // callers. Old clients see `message/persisted`
-                        // as before; new clients miss this single
-                        // completion. Logging surfaces the gap so we
-                        // can fix upstream callers.
-                        tracing::debug!(
-                            session_id = %session_id.0,
-                            task_label,
-                            had_empty_task_id = task_id.as_deref() == Some(""),
-                            "background result missing task_id; turn/spawn_complete suppressed"
-                        );
-                        // UPCR-2026-014 M9-α-9: the `turn/spawn_complete`
-                        // envelope was suppressed (no task_id) but a
-                        // file delivery still happened. Surface
-                        // `file/attached` so dual-negotiated clients
-                        // can still render a download button — old
-                        // clients fall back to the legacy
-                        // `message/persisted` row with `media`. Without
-                        // this, an envelope-only-negotiating client
-                        // sees nothing for the file.
-                        super::ui_protocol_alpha9_bridge::emit_files_attached_from_background(
-                            &ledger,
-                            &session_id,
-                            &turn_id,
-                            &media,
-                            &envelope_media,
-                            originating_tool_call_id.clone(),
-                        );
-                    } else {
-                        // Persist of the spawn-ack/completion row failed.
-                        // The agent's task_supervisor records the failure
-                        // for operator visibility.
-                        //
-                        // M10 Phase 5a coalesce: the per-file `send_file`
-                        // companion rows for the NotConfigured branch
-                        // were already committed *before* this final
-                        // persist (the consumer drains them off
-                        // `out_rx` independently). Those companion rows
-                        // are tagged `MessagePersistedSource::Background`
-                        // so dual-negotiated clients suppress them at
-                        // `live_event_passes_capability_filter` —
-                        // meaning a new client whose envelope persist
-                        // failed sees ZERO file rows for the completion
-                        // (the per-file rows are filtered, the envelope
-                        // never fired). Old clients see the per-file
-                        // rows unchanged (they pass the legacy gate
-                        // regardless of source). Accepted as a
-                        // low-probability degradation: persist is
-                        // durable, this branch fires only when the
-                        // session ledger cannot accept a write, and the
-                        // task_supervisor captures the failure for
-                        // recovery follow-ups. Phase 6 will reorder the
-                        // companion rows AFTER the envelope persist
-                        // commits to close this window.
+                            task_id: task_id_clean,
+                            tool_call_id: originating_tool_call_id.clone(),
+                            media: envelope_media,
+                        });
+                    let persisted_meta = MESSAGE_PROJECTION_OVERRIDE
+                        .scope(
+                            Some(projection),
+                            persist_assistant_with_media(
+                                &sessions,
+                                &data_dir,
+                                &session_id,
+                                content_text,
+                                media,
+                                thread_id,
+                                &task_label,
+                            ),
+                        )
+                        .await;
+                    if !persisted_meta {
                         tracing::warn!(
                             session_id = %session_id.0,
                             task_label,
-                            "background result persist failed; new clients miss this completion (per-file companion rows already committed under source: background and are suppressed)"
+                            "background result persist failed; no canonical child envelope emitted"
                         );
                     }
-                    persisted_meta.is_some()
+                    persisted_meta
                 })
             });
         tool_registry.set_background_result_sender(background_result_sender.clone());
@@ -22460,15 +22099,8 @@ async fn run_standalone_turn(
         // (the `out_tx` half is dropped along with the registry / agent
         // when the turn-scoped state is freed).
         //
-        // M10 Phase 5a coalesce: when the outbound carries
-        // `metadata.spawn_complete_companion = true`, persist the row with
-        // `MessagePersistedSource::Background` (via the
-        // `MESSAGE_PERSISTED_SOURCE_OVERRIDE` task-local). This marks each
-        // per-file row from a spawn_only completion as a duplicate of the
-        // forthcoming `turn/spawn_complete` envelope so dual-negotiated
-        // clients suppress it at `live_event_passes_capability_filter`.
-        // Without the capability the override has no wire-visible effect —
-        // the row still reaches old clients as `message/persisted`.
+        // A spawn-only companion is transcript-only: the following linked v2
+        // background-child payload owns its media and visible completion.
         let consumer_sessions = bg_sessions.clone();
         let consumer_data_dir = bg_data_dir.clone();
         let consumer_session_id = bg_session_id.clone();
@@ -22497,8 +22129,8 @@ async fn run_standalone_turn(
                     "send_file",
                 );
                 if is_spawn_complete_companion {
-                    let _ = MESSAGE_PERSISTED_SOURCE_OVERRIDE
-                        .scope(Some(MessagePersistedSource::Background), persist)
+                    let _ = MESSAGE_PROJECTION_OVERRIDE
+                        .scope(Some(MessageProjectionOverride::Suppress), persist)
                         .await;
                 } else {
                     let _ = persist.await;
@@ -23121,7 +22753,7 @@ async fn run_standalone_turn(
                 // `response.content` AND every Assistant carrier in
                 // `response.messages` BEFORE capture / persist / done, so the
                 // internal control protocol never reaches the wire
-                // (`message/delta` from `done`, `message/persisted`) or storage
+                // (`message/delta` from `done`, canonical projection envelopes) or storage
                 // (session JSONL). Stacked markers in either order are both
                 // peeled (review fix). The directives are dispatched post-turn
                 // from the oneshots below; the client learns a visual is coming
@@ -23202,12 +22834,8 @@ async fn run_standalone_turn(
                         response.reasoning_content.clone(),
                     );
                     // Fleet-UX soak NEW-03 (mini3/mini5, 2026-05-23):
-                    // the #1183 fix tagged the synthesised spawn_only
-                    // ack's WIRE envelope with `source: background`
-                    // so the per-connection capability filter at
-                    // `live_event_passes_capability_filter` suppresses
-                    // the LIVE `message/persisted` for dual-negotiated
-                    // clients — but the JSONL row was still committed
+                    // the #1183 fix hid the synthesised spawn_only ack
+                    // from the old wire surface, but the JSONL row was still committed
                     // with `role: assistant`. The page handler at
                     // `handle_session_messages_page` walks JSONL
                     // directly with NO source filter, so any SPA
@@ -23220,12 +22848,11 @@ async fn run_standalone_turn(
                     // is set, skip the ack persist entirely. The
                     // background task's real outcome still flows via
                     // `BackgroundResultSender` (its own persist +
-                    // `turn/spawn_complete` envelope), so the
+                    // canonical v2 child envelope), so the
                     // legitimate "task finished" signal is unaffected.
                     // Only the foreground synthesised "started" bubble
                     // — which the foreground cannot actually verify
-                    // and which dual-negotiated clients already
-                    // suppress on the live channel — is dropped.
+                    // is dropped.
                     let skip_synthesized_spawn_only_ack =
                         should_skip_synthesized_spawn_only_ack_persist(
                             response.synthesized_from_spawn_only,
@@ -26163,7 +25790,7 @@ fn frame_text_within_cap(text: String) -> Option<String> {
 ///
 /// Because EVERY outbound frame flows through [`frame_for`], this covers
 /// every oversized frame type: `assistant_persisted` / `message_delta`
-/// notifications, `tool_end` errors, the legacy `MessagePersisted` /
+/// notifications, `tool_end` errors, the retired persisted-message /
 /// `ToolCompleted` notifications, and `session/hydrate` RPC results.
 ///
 /// Algorithm (serialized frame `> MAX_TEXT_FRAME_BYTES`):
@@ -27348,7 +26975,6 @@ fn send_raw_notification_ephemeral(
         method,
         ui_methods::MESSAGE_DELTA
             | ui_methods::MESSAGE_REASONING_DELTA
-            | ui_methods::MESSAGE_PERSISTED
             | ui_methods::TOOL_STARTED
             | ui_methods::TOOL_PROGRESS
             | ui_methods::TOOL_COMPLETED
@@ -27823,7 +27449,7 @@ fn send_notification_durable(
     // Codex #1336 round-2 BLOCKER 1: apply the per-connection
     // capability filter at the direct-send boundary. A connection
     // that negotiated `projection.envelope.v1` must not receive
-    // direct-sent legacy notifications (`MessagePersisted`,
+    // direct-sent legacy notifications (for example,
     // `ToolStarted` / `ToolProgress` / `ToolCompleted`,
     // `FileAttached`, etc.) — the canonical envelopes emitted by
     // `ledger.emit_envelope` reach the same connection via the live
@@ -27989,7 +27615,7 @@ fn ledger_event_cursor(event: &UiProtocolLedgerEvent) -> Option<UiCursor> {
     // inner `UiNotification`. A `_ => None` catchall would let a
     // future cursor-bearing variant compile cleanly while silently
     // being skipped for replay-lossy cursor extraction (#921 was
-    // exactly that bug for `MessagePersisted` / `TurnSpawnComplete`).
+    // exactly that bug for cursor-bearing notification variants).
     // The rule for new variants: if you add a `cursor: UiCursor` or
     // `cursor: Option<UiCursor>` field, add it here too. Variants
     // whose "cursor" is an `OutputCursor` (task output stream) are
@@ -27998,7 +27624,6 @@ fn ledger_event_cursor(event: &UiProtocolLedgerEvent) -> Option<UiCursor> {
         UiProtocolLedgerEvent::Notification(notification) => match notification {
             UiNotification::SessionOpened(SessionOpened { cursor, .. }) => cursor.clone(),
             UiNotification::TurnCompleted(TurnCompletedEvent { cursor, .. }) => cursor.clone(),
-            UiNotification::MessagePersisted(persisted) => Some(persisted.cursor.clone()),
             UiNotification::TurnSpawnComplete(spawn) => Some(spawn.cursor.clone()),
             UiNotification::EnvelopeV2(envelope) => envelope.envelope.cursor.clone(),
             // Non-cursor-bearing variants — exhaustively enumerated so a
@@ -34409,9 +34034,14 @@ ignore = []
     async fn newly_configured_local_profile_allows_session_open_cwd_validation() {
         let dir = tempfile::tempdir().unwrap();
         let state = Arc::new(local_profile_state(dir.path()));
+        // Profile-runtime bootstrap uses process-wide caches. Keep this
+        // parallel test's profile identity distinct from other local-profile
+        // fixtures, just as its temporary store is distinct.
+        let profile_id = format!("ada-cwd-{}", uuid::Uuid::now_v7());
+        let email = format!("{profile_id}@example.com");
         create_or_get_local_solo_profile(
             &state,
-            local_profile_params("Ada Lovelace", "ada", "ada@example.com"),
+            local_profile_params("Ada Lovelace", &profile_id, &email),
         )
         .expect("create profile");
 
@@ -34419,7 +34049,7 @@ ignore = []
             "1",
             APPUI_METHOD_PROFILE_LLM_UPSERT,
             json!({
-                "profile_id": "ada",
+                "profile_id": profile_id.clone(),
                 "set_primary": true,
                 "selection": {
                     "family_id": "deepseek",
@@ -34436,12 +34066,22 @@ ignore = []
         raw_profile_llm_upsert(&state, &primary, None)
             .await
             .expect("primary upsert registers runtime");
+        // `open_session_result` performs this bootstrap before validating the
+        // requested cwd. Mirror that ordering instead of relying on the
+        // upsert's best-effort bootstrap side effect.
+        assert!(
+            ensure_session_profile_runtime(&state, Some(&profile_id))
+                .await
+                .expect("configured profile runtime bootstraps")
+                .is_some(),
+            "configured local profile has a runtime before cwd validation",
+        );
 
         let workspace = tempfile::tempdir().unwrap();
         let params = SessionOpenParams {
-            session_id: SessionKey::with_profile_topic("ada", "local", "tui", "coding"),
+            session_id: SessionKey::with_profile_topic(&profile_id, "local", "tui", "coding"),
             topic: None,
-            profile_id: Some("ada".into()),
+            profile_id: Some(profile_id.clone()),
             cwd: Some(workspace.path().to_string_lossy().into_owned()),
             sandbox: None,
             after: None,
@@ -34450,7 +34090,7 @@ ignore = []
         let requested_workspace = validate_requested_session_cwd(
             &state,
             ConnectionUiFeatures::stdio_defaults(),
-            Some("ada"),
+            Some(&profile_id),
             &params,
         )
         .expect("newly created local profile has registered runtime");
@@ -34738,7 +34378,7 @@ ignore = []
     /// #921: every cursor-bearing durable notification variant must
     /// surface its cursor through `ledger_event_cursor` so dropped
     /// sends trigger `protocol/replay_lossy`. Asserts the positive
-    /// extraction for the four variants and a negative for a non-
+    /// extraction for the three variants and a negative for a non-
     /// cursor-bearing one (sanity).
     #[test]
     fn ledger_event_cursor_covers_every_cursor_bearing_variant() {
@@ -34775,44 +34415,29 @@ ignore = []
         ));
         assert_eq!(ledger_event_cursor(&completed), Some(cursor.clone()));
 
-        let persisted = UiProtocolLedgerEvent::Notification(UiNotification::MessagePersisted(
-            MessagePersistedEvent {
+        let envelope = UiProtocolLedgerEvent::Notification(UiNotification::EnvelopeV2(
+            EnvelopeV2Notification {
                 session_id: session_id.clone(),
                 topic: None,
-                turn_id: None,
-                thread_id: None,
-                seq: 1,
-                role: "assistant".into(),
-                message_id: "msg-1".into(),
-                client_message_id: None,
-                source: MessagePersistedSource::Assistant,
-                cursor: cursor.clone(),
-                persisted_at: chrono::Utc::now(),
-                media: Vec::new(),
-                content: None,
+                envelope: EnvelopeV2 {
+                    thread_id: "thread-1".into(),
+                    seq: 1,
+                    cursor: Some(cursor.clone()),
+                    turn_id: "thread-1".into(),
+                    client_message_id: None,
+                    payload: PayloadV2::AssistantPersisted {
+                        text: "done".into(),
+                        assistant_segment_id: "thread-1:assistant:1".into(),
+                        meta: MessageMeta {
+                            message_id: "msg-1".into(),
+                            persisted_at: chrono::Utc::now(),
+                            media: Vec::new(),
+                        },
+                    },
+                },
             },
         ));
-        assert_eq!(ledger_event_cursor(&persisted), Some(cursor.clone()));
-
-        let spawn = UiProtocolLedgerEvent::Notification(UiNotification::TurnSpawnComplete(
-            TurnSpawnCompleteEvent {
-                session_id: session_id.clone(),
-                topic: None,
-                turn_id: None,
-                thread_id: None,
-                task_id: "task-1".into(),
-                tool_call_id: None,
-                response_to_client_message_id: None,
-                seq: 1,
-                message_id: "msg-1".into(),
-                source: "background".into(),
-                cursor: cursor.clone(),
-                persisted_at: chrono::Utc::now(),
-                content: "done".into(),
-                media: Vec::new(),
-            },
-        ));
-        assert_eq!(ledger_event_cursor(&spawn), Some(cursor.clone()));
+        assert_eq!(ledger_event_cursor(&envelope), Some(cursor.clone()));
 
         // Sanity: a non-cursor-bearing variant returns None.
         let delta =
@@ -35770,7 +35395,6 @@ ignore = []
                 session_hydrate: false,
                 thread_graph: false,
                 turn_state_get: false,
-                message_persisted: false,
                 spawn_complete: false,
                 file_attached: false,
                 voice_audio: false,
@@ -35836,7 +35460,6 @@ ignore = []
                 session_hydrate: false,
                 thread_graph: false,
                 turn_state_get: false,
-                message_persisted: false,
                 spawn_complete: false,
                 file_attached: false,
                 voice_audio: false,
@@ -35947,7 +35570,6 @@ ignore = []
                 session_hydrate: false,
                 thread_graph: false,
                 turn_state_get: false,
-                message_persisted: false,
                 spawn_complete: false,
                 file_attached: false,
                 voice_audio: false,
@@ -36013,7 +35635,6 @@ ignore = []
                 session_hydrate: false,
                 thread_graph: false,
                 turn_state_get: false,
-                message_persisted: false,
                 spawn_complete: false,
                 file_attached: false,
                 voice_audio: false,
@@ -36072,7 +35693,6 @@ ignore = []
                 session_hydrate: false,
                 thread_graph: false,
                 turn_state_get: false,
-                message_persisted: false,
                 spawn_complete: false,
                 file_attached: false,
                 voice_audio: false,
@@ -36174,7 +35794,6 @@ ignore = []
                 session_hydrate: false,
                 thread_graph: false,
                 turn_state_get: false,
-                message_persisted: false,
                 spawn_complete: false,
                 file_attached: false,
                 voice_audio: false,
@@ -38587,7 +38206,6 @@ ignore = []
                 session_hydrate: false,
                 thread_graph: false,
                 turn_state_get: false,
-                message_persisted: false,
                 spawn_complete: false,
                 file_attached: false,
                 voice_audio: false,
@@ -39201,7 +38819,7 @@ ignore = []
 
     /// Mirror of the above for `send_notification_durable`. The γ
     /// cutover gate filters `ToolStarted` / `ToolCompleted` /
-    /// `MessagePersisted` / `FileAttached` / `TurnCompleted` — the
+    /// legacy persisted-message / `FileAttached` / `TurnCompleted` — the
     /// canonical envelopes emitted by `ledger.emit_envelope` cover
     /// the same logical events via the broadcast forwarder.
     #[tokio::test]
@@ -45068,8 +44686,8 @@ ignore = []
     }
 
     /// Codex P2: the ledger snapshot handed to `collect_session_turns` is taken
-    /// BEFORE the trim, so it still carries lifecycle + `message/persisted`
-    /// events for the rolled-back turns. The returned `thread.turns` must scope
+    /// BEFORE the trim, so it still carries lifecycle + v2 projection events
+    /// for the rolled-back turns. The returned `thread.turns` must scope
     /// to the SURVIVING threads — a dropped turn must not linger in the turn
     /// projection even though its ledger rows persist.
     #[tokio::test(flavor = "current_thread")]
@@ -45081,8 +44699,7 @@ ignore = []
         let ledger = event_ledger(&state).await;
 
         // Full lifecycle for BOTH turns in the ledger, thread-linked to the
-        // persisted turns (thread_ids surfaced via `message/persisted.thread_id`
-        // are what `collect_session_turns` keys the projection on).
+        // persisted turns by canonical v2 envelopes.
         let turn_keep = TurnId::new(); // turn 1 -> thread "t1" (survives)
         let turn_drop = TurnId::new(); // turn 2 -> thread "t2" (rolled back)
         for (turn_id, thread_id, seq) in [(&turn_keep, "t1", 1_u64), (&turn_drop, "t2", 3_u64)] {
@@ -45094,26 +44711,22 @@ ignore = []
                     topic: None,
                 },
             ));
-            let _ = ledger.append_notification(UiNotification::MessagePersisted(
-                MessagePersistedEvent {
+            let _ =
+                ledger.append_notification(UiNotification::EnvelopeV2(EnvelopeV2Notification {
                     session_id: session_id.clone(),
                     topic: None,
-                    turn_id: Some(turn_id.clone()),
-                    thread_id: Some(thread_id.to_string()),
-                    seq,
-                    role: "user".into(),
-                    message_id: format!("{}:{seq}:0", session_id.0),
-                    client_message_id: None,
-                    source: MessagePersistedSource::User,
-                    cursor: UiCursor {
-                        stream: session_id.0.clone(),
+                    envelope: EnvelopeV2 {
+                        thread_id: thread_id.to_string(),
                         seq,
+                        cursor: None,
+                        turn_id: turn_id.0.to_string(),
+                        client_message_id: None,
+                        payload: PayloadV2::UserMessage {
+                            text: "user".into(),
+                            files: vec![],
+                        },
                     },
-                    persisted_at: Utc::now(),
-                    media: vec![],
-                    content: None,
-                },
-            ));
+                }));
             let _ = ledger.append_notification(UiNotification::TurnCompleted(TurnCompletedEvent {
                 session_id: session_id.clone(),
                 topic: None,
@@ -45922,16 +45535,10 @@ ignore = []
         assert_eq!(frame["error"]["data"]["kind"], "unknown_session");
     }
 
-    /// M10 Phase 6.2 / Bug C: a negotiated client receives the
-    /// retained `turn/spawn_complete` envelopes on the hydrate
-    /// response so it can dedup against the legacy `Background`-source
-    /// rows in `messages` on its side. The server itself does NOT
-    /// suppress rows — codex flagged multiple correctness regressions
-    /// in every server-side suppression design (NotConfigured-branch
-    /// empty media, multi-task per-turn ambiguity, orphan companions
-    /// from failed final-ack persists). Surfacing both signals lets
-    /// the client mirror the live wire's "consumer chooses one shape"
-    /// semantics without server-side guesswork.
+    /// A v2 client receives retained background-child and tool envelopes on
+    /// hydrate, with the same payloads it receives live. The transcript row's
+    /// stable message id links the background child without a legacy source
+    /// notification.
     #[tokio::test(flavor = "current_thread")]
     async fn session_hydrate_surfaces_replayed_envelopes_for_negotiated_client() {
         let session_id = SessionKey("local:hydrate-envelopes".into());
@@ -45953,7 +45560,8 @@ ignore = []
                 thread_id: Some("cmid-user-1".into()),
                 timestamp: now,
             });
-            // Background companion (legacy `send_file` per-file row).
+            // Historical companion row; current producer paths carry its
+            // media on the background-child payload instead.
             session.messages.push(Message {
                 role: MessageRole::Assistant,
                 content: String::new(),
@@ -45965,7 +45573,7 @@ ignore = []
                 thread_id: Some("cmid-user-1".into()),
                 timestamp: now + chrono::Duration::milliseconds(5),
             });
-            // Background spawn-ack.
+            // Background completion row.
             session.messages.push(Message {
                 role: MessageRole::Assistant,
                 content: "deep_research delivered.".into(),
@@ -45990,76 +45598,37 @@ ignore = []
             session_id.0,
             spawn_ack_ts.timestamp_nanos_opt().unwrap_or(0),
         );
-        // Append the matching `MessagePersisted` events so the
-        // hydrate handler can surface `source: background` on the
-        // hydrated rows (mirrors what `MessageCommitObserver` would
-        // emit at live persist time under the
-        // `MESSAGE_PERSISTED_SOURCE_OVERRIDE` task-local).
-        ledger.append_notification(UiNotification::MessagePersisted(MessagePersistedEvent {
-            session_id: session_id.clone(),
-            topic: None,
-            turn_id: None,
-            thread_id: Some("cmid-user-1".into()),
-            seq: 1,
-            role: "assistant".into(),
-            message_id: format!("{}:1:0", session_id.0),
-            client_message_id: None,
-            source: MessagePersistedSource::Background,
-            cursor: UiCursor {
-                stream: session_id.0.clone(),
-                seq: 0,
-            },
-            persisted_at: Utc::now(),
-            media: vec!["research/_report.md".into()],
-            content: None,
-        }));
-        ledger.append_notification(UiNotification::MessagePersisted(MessagePersistedEvent {
-            session_id: session_id.clone(),
-            topic: None,
-            turn_id: None,
-            thread_id: Some("cmid-user-1".into()),
-            seq: 2,
-            role: "assistant".into(),
-            message_id: spawn_ack_message_id.clone(),
-            client_message_id: None,
-            source: MessagePersistedSource::Background,
-            cursor: UiCursor {
-                stream: session_id.0.clone(),
-                seq: 0,
-            },
-            persisted_at: Utc::now(),
-            media: vec!["research/_report.md".into()],
-            content: None,
-        }));
-        ledger.append_notification(UiNotification::TurnSpawnComplete(TurnSpawnCompleteEvent {
-            session_id: session_id.clone(),
-            topic: None,
-            turn_id: None,
-            thread_id: Some("cmid-user-1".into()),
-            task_id: "task_abc".into(),
-            tool_call_id: None,
-            response_to_client_message_id: Some("cmid-user-1".into()),
-            seq: 2,
-            message_id: spawn_ack_message_id.clone(),
-            source: "background".into(),
-            cursor: UiCursor {
-                stream: session_id.0.clone(),
-                seq: 0,
-            },
-            persisted_at: Utc::now(),
-            content: "deep_research delivered.".into(),
-            media: vec!["research/_report.md".into()],
-        }));
-        ledger.emit_envelope(
-            &session_id,
-            "cmid-user-1".into(),
-            Payload::ToolStart {
-                tool_call_id: "tc-shell-1".into(),
-                name: "shell".into(),
-                arguments_preview: None,
-            },
-            None,
-        );
+        let parent_turn_id = "turn-parent";
+        ledger
+            .emit_envelope_v2(
+                &session_id,
+                format!("{parent_turn_id}:background:task_abc"),
+                PayloadV2::BackgroundChildCompleted {
+                    parent_turn_id: parent_turn_id.into(),
+                    response_to_client_message_id: Some("cmid-user-1".into()),
+                    task_id: "task_abc".into(),
+                    content: "deep_research delivered.".into(),
+                    tool_call_id: None,
+                    message_id: spawn_ack_message_id.clone(),
+                    source: "background".into(),
+                    persisted_at: spawn_ack_ts,
+                    media: vec!["research/_report.md".into()],
+                },
+                None,
+            )
+            .expect("background child envelope");
+        ledger
+            .emit_envelope_v2(
+                &session_id,
+                "cmid-user-1".into(),
+                PayloadV2::ToolStart {
+                    tool_call_id: "tc-shell-1".into(),
+                    name: "shell".into(),
+                    arguments_preview: None,
+                },
+                None,
+            )
+            .expect("tool envelope");
 
         // 1) Negotiated client: messages list is byte-identical to
         // the legacy shape (3 rows), AND the new
@@ -46075,7 +45644,7 @@ ignore = []
             &active_turns,
             None,
             None,
-            features_for_spawn_complete_test(true, true),
+            features_for_projection_envelope_v2_test(),
             "h-new".into(),
             SessionHydrateParams {
                 session_id: session_id.clone(),
@@ -46091,7 +45660,7 @@ ignore = []
         assert_eq!(
             messages_new.len(),
             3,
-            "server does NOT suppress rows; negotiated client dedups using replayed_envelopes",
+            "hydrate keeps the durable transcript alongside its v2 replay facts",
         );
         // Codex Bug C round-5: the spawn-ack row's `message_id` must
         // be present on the hydrated wire so the client can match it
@@ -46105,17 +45674,19 @@ ignore = []
             spawn_ack_row["message_id"], spawn_ack_message_id,
             "spawn-ack row must expose message_id matching the envelope",
         );
-        // Codex Bug C round-6: per-row provenance. The companion
-        // and spawn-ack rows surface `source: "background"` so the
-        // client can drop them in favour of the envelope. Without
-        // `source`, the client could only dedup the spawn-ack and
-        // companion rows would still render as duplicate bubbles.
+        // The matching v2 child marks the completion row as background.
         let companion_row = messages_new
             .iter()
             .find(|m| m["seq"] == 1)
             .expect("seq=1 companion row");
-        assert_eq!(companion_row["source"], "background");
         assert_eq!(spawn_ack_row["source"], "background");
+        assert!(
+            companion_row
+                .get("source")
+                .map(Value::is_null)
+                .unwrap_or(true),
+            "only a v2 payload with the exact message id establishes provenance",
+        );
         // Negotiated hydrate carries the persisted reasoning so the
         // "· reasoning" block survives a client restart.
         assert_eq!(
@@ -46133,27 +45704,30 @@ ignore = []
             .iter()
             .find(|m| m["seq"] == 0)
             .expect("seq=0 user row");
-        // The user row never had a `MessagePersisted` ledger event in
-        // this test (we only seeded background events), so its
-        // `source` is omitted. That's fine: the client doesn't need
-        // provenance for non-coalescible rows.
+        // The user row has no background-child payload, so provenance is
+        // omitted.
         assert!(
             user_row.get("source").map(|v| v.is_null()).unwrap_or(true),
-            "user row's source field is omitted absent a matching ledger event; got: {user_row:?}",
+            "user row's source field is omitted absent a matching v2 payload; got: {user_row:?}",
         );
         let envelopes = frame_new["result"]["replayed_envelopes"]
             .as_array()
             .expect("replayed_envelopes array");
         assert_eq!(envelopes.len(), 1, "single envelope retained");
         assert_eq!(
-            envelopes[0]["message_id"], spawn_ack_message_id,
-            "envelope's message_id matches the spawn-ack row's id by construction",
+            envelopes[0]["payload"]["data"]["message_id"], spawn_ack_message_id,
+            "child payload message_id matches the durable completion row",
         );
-        assert_eq!(envelopes[0]["task_id"], "task_abc");
-        assert_eq!(envelopes[0]["thread_id"], "cmid-user-1");
-        assert_eq!(envelopes[0]["seq"], 2);
-        assert_eq!(envelopes[0]["content"], "deep_research delivered.");
-        assert_eq!(envelopes[0]["media"], json!(["research/_report.md"]));
+        assert_eq!(envelopes[0]["payload"]["type"], "background/spawn_complete");
+        assert_eq!(envelopes[0]["payload"]["data"]["task_id"], "task_abc");
+        assert_eq!(
+            envelopes[0]["payload"]["data"]["content"],
+            "deep_research delivered."
+        );
+        assert_eq!(
+            envelopes[0]["payload"]["data"]["media"],
+            json!(["research/_report.md"])
+        );
         let tool_envelopes = frame_new["result"]["replayed_tool_envelopes"]
             .as_array()
             .expect("replayed_tool_envelopes array");
@@ -46166,9 +45740,7 @@ ignore = []
         );
         assert_eq!(tool_envelopes[0]["payload"]["data"]["name"], "shell");
 
-        // 2) Non-negotiated client: legacy wire shape — messages
-        // list intact, and `replayed_envelopes` field is OMITTED
-        // (not `null`) so the JSON shape matches pre-fix exactly.
+        // 2) A non-v2 hydrate request gets no v2 replay fields.
         let (ws_legacy, mut rx_legacy) = ws_connection_for_test(8);
         handle_session_hydrate(
             &ws_legacy,
@@ -46192,31 +45764,29 @@ ignore = []
         let messages_legacy = frame_legacy["result"]["messages"]
             .as_array()
             .expect("messages array");
-        assert_eq!(messages_legacy.len(), 3, "legacy unchanged");
+        assert_eq!(messages_legacy.len(), 3, "transcript remains available");
         let result = frame_legacy["result"].as_object().expect("result object");
         assert!(
             !result.contains_key("replayed_envelopes"),
-            "legacy clients see byte-identical wire (no replayed_envelopes key); got keys: {:?}",
+            "non-v2 hydrate omits replayed_envelopes; got keys: {:?}",
             result.keys().collect::<Vec<_>>(),
         );
         assert!(
             !result.contains_key("replayed_tool_envelopes"),
-            "legacy clients see no tool replay field; got keys: {:?}",
+            "non-v2 hydrate omits tool replay field; got keys: {:?}",
             result.keys().collect::<Vec<_>>(),
         );
-        // Codex Bug C round-6: non-negotiated clients also see the
-        // pre-fix `messages` shape — no `message_id`, no `source`
-        // keys. This protects strict-codegen consumers that have no
-        // `replayed_envelopes` to bind to.
+        // Without v2 negotiation, hydrate does not expose v2 correlation
+        // metadata on transcript rows.
         for msg in messages_legacy {
             let msg_obj = msg.as_object().expect("message object");
             assert!(
                 !msg_obj.contains_key("message_id"),
-                "legacy client message MUST NOT carry message_id; got: {msg_obj:?}",
+                "non-v2 hydrate message must omit message_id; got: {msg_obj:?}",
             );
             assert!(
                 !msg_obj.contains_key("source"),
-                "legacy client message MUST NOT carry source; got: {msg_obj:?}",
+                "non-v2 hydrate message must omit source; got: {msg_obj:?}",
             );
         }
     }
@@ -46233,25 +45803,24 @@ ignore = []
         let approvals = PendingApprovalStore::default();
         let active_turns = active_turns_registry();
         let ledger = event_ledger(&state).await;
-        ledger.append_notification(UiNotification::TurnSpawnComplete(TurnSpawnCompleteEvent {
-            session_id: session_id.clone(),
-            topic: None,
-            turn_id: None,
-            thread_id: Some("cmid-user-1".into()),
-            task_id: "task_x".into(),
-            tool_call_id: None,
-            response_to_client_message_id: Some("cmid-user-1".into()),
-            seq: 1,
-            message_id: format!("{}:1:0", session_id.0),
-            source: "background".into(),
-            cursor: UiCursor {
-                stream: session_id.0.clone(),
-                seq: 0,
-            },
-            persisted_at: Utc::now(),
-            content: "done".into(),
-            media: vec![],
-        }));
+        ledger
+            .emit_envelope_v2(
+                &session_id,
+                "turn-parent:background:task_x".into(),
+                PayloadV2::BackgroundChildCompleted {
+                    parent_turn_id: "turn-parent".into(),
+                    response_to_client_message_id: Some("cmid-user-1".into()),
+                    task_id: "task_x".into(),
+                    content: "done".into(),
+                    tool_call_id: None,
+                    message_id: format!("{}:1:0", session_id.0),
+                    source: "background".into(),
+                    persisted_at: Utc::now(),
+                    media: vec![],
+                },
+                None,
+            )
+            .expect("background child envelope");
 
         let (ws, mut rx) = ws_connection_for_test(8);
         handle_session_hydrate(
@@ -46263,7 +45832,7 @@ ignore = []
             &active_turns,
             None,
             None,
-            features_for_spawn_complete_test(true, true),
+            features_for_projection_envelope_v2_test(),
             "h-no-msgs".into(),
             SessionHydrateParams {
                 session_id: session_id.clone(),
@@ -46327,7 +45896,7 @@ ignore = []
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn message_persisted_emitted_after_each_commit_in_order() {
+    async fn message_commit_observer_runs_after_each_commit_in_order() {
         // Wires the bus-level observer hook to a local sink and asserts
         // notifications fire in commit order, with strictly monotonic seqs.
         let _guard = message_commit_observer_test_lock()
@@ -46389,7 +45958,7 @@ ignore = []
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn message_persisted_not_emitted_on_commit_failure() {
+    async fn message_commit_observer_is_not_retroactive_after_installation() {
         let _guard = message_commit_observer_test_lock()
             .lock()
             .unwrap_or_else(|e| e.into_inner());
@@ -46532,18 +46101,10 @@ ignore = []
         assert!(!is_metadata_only_assistant_row(&user_message));
     }
 
-    /// M9-γ-7 (issue #844): a 3-iteration agent loop that commits
-    /// (assistant tool-call only) -> tool result -> (assistant tool-call
-    /// only) -> tool result -> (assistant final text) MUST surface
-    /// EXACTLY ONE `message/persisted` envelope for the assistant turn
-    /// (the final text row), plus the per-tool rows, on the M9 ledger.
-    /// Pre-fix this emitted three assistant `message/persisted`
-    /// envelopes, all under the same `thread_id` — the phantom-bubble
-    /// shape the web reducer collapsed (octos-web #92).
+    /// Metadata-only assistant commits must not create projection rows; the
+    /// final visible assistant commit produces one canonical v2 envelope.
     #[tokio::test(flavor = "current_thread")]
-    async fn gamma_7_dedup_one_assistant_persisted_per_turn() {
-        use octos_core::ui_protocol::{MessagePersistedSource, methods};
-
+    async fn metadata_only_commits_emit_one_v2_assistant_persisted_row() {
         let _guard = message_commit_observer_test_lock()
             .lock()
             .unwrap_or_else(|e| e.into_inner());
@@ -46621,18 +46182,14 @@ ignore = []
             .await
             .expect("commit it3 assistant");
 
-        // Drain the broadcast and bucket by role on the
-        // `MessagePersistedEvent` payload.
+        // Drain the canonical v2 projection stream.
         let mut assistant_persisted = Vec::new();
-        let mut tool_persisted = Vec::new();
         while let Ok(event) = subscriber.try_recv() {
-            if let UiProtocolLedgerEvent::Notification(UiNotification::MessagePersisted(ev)) =
+            if let UiProtocolLedgerEvent::Notification(UiNotification::EnvelopeV2(envelope)) =
                 &event.event
             {
-                if ev.role == octos_core::MessageRole::Assistant.as_str() {
-                    assistant_persisted.push(ev.clone());
-                } else if ev.role == octos_core::MessageRole::Tool.as_str() {
-                    tool_persisted.push(ev.clone());
+                if let PayloadV2::AssistantPersisted { text, .. } = &envelope.envelope.payload {
+                    assistant_persisted.push(text.clone());
                 }
             }
         }
@@ -46640,29 +46197,11 @@ ignore = []
         assert_eq!(
             assistant_persisted.len(),
             1,
-            "exactly ONE assistant message/persisted per turn (the final text); \
+            "exactly ONE assistant_persisted v2 envelope per turn (the final text); \
              got {} envelopes (phantom-bubble regression)",
             assistant_persisted.len(),
         );
-        let final_envelope = &assistant_persisted[0];
-        assert_eq!(final_envelope.role, "assistant");
-        assert_eq!(
-            final_envelope.source,
-            MessagePersistedSource::Assistant,
-            "assistant rows carry source=assistant"
-        );
-        // Method name matches the wire spec.
-        assert_eq!(
-            UiNotification::MessagePersisted(final_envelope.clone()).method(),
-            methods::MESSAGE_PERSISTED,
-        );
-
-        // Tool rows are unaffected — both intermediate tool results land.
-        assert_eq!(
-            tool_persisted.len(),
-            2,
-            "tool rows must NOT be filtered (they always carry content)"
-        );
+        assert_eq!(assistant_persisted, vec!["here is your answer"]);
 
         // Restore the global observer slot to None so subsequent tests
         // see a clean state.
@@ -46771,54 +46310,40 @@ ignore = []
     // Live ledger publish-subscribe (issue #760, Phase C blocker)
     // ========================================================================
 
-    fn message_persisted_for(session: &SessionKey) -> UiNotification {
-        UiNotification::MessagePersisted(MessagePersistedEvent {
+    fn assistant_persisted_v2_for(session: &SessionKey) -> UiNotification {
+        UiNotification::EnvelopeV2(EnvelopeV2Notification {
             session_id: session.clone(),
             topic: None,
-            turn_id: Some(TurnId::new()),
-            thread_id: None,
-            seq: 0,
-            role: "assistant".into(),
-            message_id: "msg-1".into(),
-            client_message_id: None,
-            source: MessagePersistedSource::Tool,
-            cursor: UiCursor {
-                stream: session.0.clone(),
-                seq: 0,
+            envelope: EnvelopeV2 {
+                thread_id: "thread-1".into(),
+                seq: 1,
+                cursor: None,
+                turn_id: "thread-1".into(),
+                client_message_id: None,
+                payload: PayloadV2::AssistantPersisted {
+                    text: "assistant".into(),
+                    assistant_segment_id: "thread-1:assistant:1".into(),
+                    meta: MessageMeta {
+                        message_id: "msg-1".into(),
+                        persisted_at: Utc::now(),
+                        media: vec![],
+                    },
+                },
             },
-            persisted_at: Utc::now(),
-            media: vec![],
-            content: None,
         })
     }
 
-    fn features_with_message_persisted(enabled: bool) -> ConnectionUiFeatures {
+    /// V2 envelopes are delivered even with `projection_envelope_v2` unset;
+    /// this fixture exercises that Stage-5 unconditional route.
+    fn features_for_v2_delivery() -> ConnectionUiFeatures {
         ConnectionUiFeatures {
-            message_persisted: enabled,
-            header_present: true,
-            ..ConnectionUiFeatures::default()
-        }
-    }
-
-    /// Build a `ConnectionUiFeatures` with the M10 Phase 1 dual gating
-    /// flags set as requested. `message_persisted` is independent so the
-    /// test can simulate clients that negotiated only one or both.
-    fn features_for_spawn_complete_test(
-        message_persisted: bool,
-        spawn_complete: bool,
-    ) -> ConnectionUiFeatures {
-        ConnectionUiFeatures {
-            message_persisted,
-            spawn_complete,
             header_present: true,
             ..ConnectionUiFeatures::default()
         }
     }
 
     /// Build a `ConnectionUiFeatures` for the UPCR-2026-014 M9-α-9
-    /// `event.file_attached.v1` capability gate. Independent of the
-    /// message_persisted / spawn_complete flags so old clients and
-    /// new-shape-only clients can both be modelled.
+    /// `event.file_attached.v1` capability gate.
     fn features_for_file_attached_test(file_attached: bool) -> ConnectionUiFeatures {
         ConnectionUiFeatures {
             file_attached,
@@ -46903,54 +46428,30 @@ ignore = []
         })
     }
 
-    /// Builds a minimal `MessagePersistedEvent` with `source: background`,
-    /// matching what `BackgroundResultSender`'s persist path produces
-    /// via `MessageCommitObserver`. M10 Phase 1's per-connection filter
-    /// suppresses this exact shape for new clients (which receive
-    /// `turn/spawn_complete` instead).
-    fn background_message_persisted_for(session: &SessionKey) -> UiNotification {
-        UiNotification::MessagePersisted(MessagePersistedEvent {
+    /// Builds the canonical background-result projection emitted by the
+    /// post-commit observer.
+    fn background_child_v2_for(session: &SessionKey) -> UiNotification {
+        UiNotification::EnvelopeV2(EnvelopeV2Notification {
             session_id: session.clone(),
             topic: None,
-            turn_id: Some(TurnId::new()),
-            thread_id: Some("thread-1".into()),
-            seq: 0,
-            role: "assistant".into(),
-            message_id: "msg-bg".into(),
-            client_message_id: None,
-            source: MessagePersistedSource::Background,
-            cursor: UiCursor {
-                stream: session.0.clone(),
-                seq: 0,
+            envelope: EnvelopeV2 {
+                thread_id: "turn-parent:background:task_abc123".into(),
+                seq: 1,
+                cursor: None,
+                turn_id: "turn-parent:background:task_abc123".into(),
+                client_message_id: None,
+                payload: PayloadV2::BackgroundChildCompleted {
+                    parent_turn_id: "turn-parent".into(),
+                    response_to_client_message_id: Some("cmid-user-1".into()),
+                    task_id: "task_abc123".into(),
+                    content: "Background research complete.".into(),
+                    tool_call_id: None,
+                    message_id: "msg-bg".into(),
+                    source: "background".into(),
+                    persisted_at: Utc::now(),
+                    media: vec!["research/_report.md".into()],
+                },
             },
-            persisted_at: Utc::now(),
-            media: vec!["research/_report.md".into()],
-            content: None,
-        })
-    }
-
-    /// Build a representative `TurnSpawnCompleteEvent` that mirrors what
-    /// `BackgroundResultSender` emits when a `spawn_only` task contracts
-    /// and the originating `client_message_id` was tracked.
-    fn turn_spawn_complete_for(session: &SessionKey) -> UiNotification {
-        UiNotification::TurnSpawnComplete(TurnSpawnCompleteEvent {
-            session_id: session.clone(),
-            topic: None,
-            turn_id: Some(TurnId::new()),
-            thread_id: Some("thread-1".into()),
-            task_id: "task_abc123".into(),
-            tool_call_id: None,
-            response_to_client_message_id: Some("cmid-user-1".into()),
-            seq: 0,
-            message_id: "msg-spawn".into(),
-            source: "background".into(),
-            cursor: UiCursor {
-                stream: session.0.clone(),
-                seq: 0,
-            },
-            persisted_at: Utc::now(),
-            content: "Background research complete.".into(),
-            media: vec!["research/_report.md".into()],
         })
     }
 
@@ -47364,7 +46865,7 @@ ignore = []
     }
 
     #[tokio::test]
-    async fn live_forwarder_pushes_message_persisted_to_subscribed_ws() {
+    async fn live_forwarder_pushes_v2_assistant_persisted_to_subscribed_ws() {
         let (ws, mut rx) = ws_connection_for_test(16);
         let ledger = Arc::new(UiProtocolLedger::new(16));
         let session_id = SessionKey("local:livefwd".into());
@@ -47377,7 +46878,7 @@ ignore = []
             session_id.clone(),
             0,
             ws.connection_id(),
-            features_with_message_persisted(true),
+            features_for_v2_delivery(),
             None,
             live_rx,
             forwarders.clone(),
@@ -47385,7 +46886,7 @@ ignore = []
         .await;
 
         // Background-task path appends late artifact AFTER the WS is wired up.
-        ledger.append_notification(message_persisted_for(&session_id));
+        ledger.append_notification(assistant_persisted_v2_for(&session_id));
 
         let frame = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
             .await
@@ -47393,8 +46894,8 @@ ignore = []
             .expect("ws channel still open");
         assert_eq!(
             frame_method(&frame).as_deref(),
-            Some(octos_core::ui_protocol::methods::MESSAGE_PERSISTED),
-            "live forwarder must emit message/persisted; frame={frame:?}"
+            Some("projection/envelope"),
+            "live forwarder must emit a v2 projection envelope; frame={frame:?}"
         );
 
         // Cleanup: aborting the forwarder must not panic and must release
@@ -47411,7 +46912,7 @@ ignore = []
 
         // Pre-existing event so baseline_seq=1 represents "we already sent
         // this in replay; do not re-emit live."
-        let baseline = ledger.append_notification(message_persisted_for(&session_id));
+        let baseline = ledger.append_notification(assistant_persisted_v2_for(&session_id));
         assert_eq!(baseline.cursor.seq, 1);
 
         let live_rx = ledger.subscribe(&session_id);
@@ -47421,7 +46922,7 @@ ignore = []
             session_id.clone(),
             baseline.cursor.seq,
             ws.connection_id(),
-            features_with_message_persisted(true),
+            features_for_v2_delivery(),
             None,
             live_rx,
             forwarders.clone(),
@@ -47430,7 +46931,7 @@ ignore = []
 
         // A new append must surface; the forwarder filters strictly on
         // seq > baseline.
-        let next = ledger.append_notification(message_persisted_for(&session_id));
+        let next = ledger.append_notification(assistant_persisted_v2_for(&session_id));
         assert_eq!(next.cursor.seq, 2);
 
         let frame = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
@@ -47443,7 +46944,7 @@ ignore = []
         };
         assert_eq!(
             v.get("method").and_then(Value::as_str),
-            Some(octos_core::ui_protocol::methods::MESSAGE_PERSISTED)
+            Some("projection/envelope")
         );
 
         // No further frames are queued (only one live event emitted).
@@ -47453,7 +46954,7 @@ ignore = []
     }
 
     #[tokio::test]
-    async fn live_forwarder_respects_message_persisted_capability_filter() {
+    async fn live_forwarder_delivers_v2_without_a_capability_flag() {
         let (ws, mut rx) = ws_connection_for_test(16);
         let ledger = Arc::new(UiProtocolLedger::new(16));
         let session_id = SessionKey("local:nofeat".into());
@@ -47466,103 +46967,45 @@ ignore = []
             session_id.clone(),
             0,
             ws.connection_id(),
-            features_with_message_persisted(false),
+            features_for_v2_delivery(),
             None,
             live_rx,
             forwarders.clone(),
         )
         .await;
 
-        ledger.append_notification(message_persisted_for(&session_id));
-        // Give the forwarder a chance to observe + filter.
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        assert!(
-            rx.try_recv().is_err(),
-            "client without event.message_persisted.v1 must not receive message/persisted"
-        );
+        ledger.append_notification(assistant_persisted_v2_for(&session_id));
+        let frame = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+            .await
+            .expect("v2 envelope arrives without an obsolete capability")
+            .expect("ws remains open");
+        assert_eq!(frame_method(&frame).as_deref(), Some("projection/envelope"));
 
         abort_live_forwarders(&forwarders, &ledger).await;
     }
 
-    // ========================================================================
-    // M10 Phase 1: `event.spawn_complete.v1` capability gating
-    // ========================================================================
-
-    /// Pure unit-level coverage of the dual filter — no WS / forwarder
-    /// machinery. Documents the four corners of the negotiation matrix
-    /// against the two relevant event shapes.
     #[test]
-    fn capability_filter_routes_spawn_complete_dual_gating() {
+    fn capability_filter_delivers_v2_background_children_unconditionally() {
         let session = SessionKey("local:filter".into());
-        let bg_persisted =
-            UiProtocolLedgerEvent::Notification(background_message_persisted_for(&session));
-        let spawn_complete = UiProtocolLedgerEvent::Notification(turn_spawn_complete_for(&session));
+        let child = UiProtocolLedgerEvent::Notification(background_child_v2_for(&session));
 
-        // Old client (no spawn_complete capability, has message_persisted):
-        // sees `message/persisted` (Background source preserved); does NOT
-        // see `turn/spawn_complete`.
-        let old = features_for_spawn_complete_test(true, false);
-        assert!(
-            live_event_passes_capability_filter(&bg_persisted, old),
-            "old client must keep receiving the legacy message/persisted shape",
-        );
-        assert!(
-            !live_event_passes_capability_filter(&spawn_complete, old),
-            "old client must not receive the new turn/spawn_complete shape",
-        );
-
-        // New client (has both capabilities): sees `turn/spawn_complete`;
-        // the duplicate `message/persisted` (source: background) is
-        // suppressed so the same logical event is delivered exactly once.
-        let new = features_for_spawn_complete_test(true, true);
-        assert!(
-            !live_event_passes_capability_filter(&bg_persisted, new),
-            "new client must NOT receive the duplicate message/persisted background row",
-        );
-        assert!(
-            live_event_passes_capability_filter(&spawn_complete, new),
-            "new client must receive the turn/spawn_complete envelope",
-        );
-
-        // New client without message_persisted negotiation: still gets
-        // turn/spawn_complete. (The two capabilities are independent —
-        // a forward-only client can opt into the new shape without ever
-        // having shipped the older one.)
-        let new_only = features_for_spawn_complete_test(false, true);
-        assert!(
-            !live_event_passes_capability_filter(&bg_persisted, new_only),
-            "client without message_persisted does not see message/persisted regardless",
-        );
-        assert!(
-            live_event_passes_capability_filter(&spawn_complete, new_only),
-            "spawn_complete-only client receives turn/spawn_complete",
-        );
-
-        // Legacy client with NO negotiated features at all: sees neither
-        // (the old gate already blocks message/persisted; the new gate
-        // blocks turn/spawn_complete).
-        let neither = features_for_spawn_complete_test(false, false);
-        assert!(!live_event_passes_capability_filter(&bg_persisted, neither));
-        assert!(!live_event_passes_capability_filter(
-            &spawn_complete,
-            neither
-        ));
-
-        // Sanity: a non-spawn `message/persisted` (source != background,
-        // e.g. a regular assistant row) is unaffected by the spawn_complete
-        // gate. Only the duplicate-suppression branch keys on
-        // `MessagePersistedSource::Background`.
-        let regular = UiProtocolLedgerEvent::Notification(message_persisted_for(&session));
-        assert!(
-            live_event_passes_capability_filter(&regular, new),
-            "non-background message/persisted must still flow to new clients",
-        );
+        for features in [
+            ConnectionUiFeatures::default(),
+            features_for_projection_envelope_test(false),
+            features_for_projection_envelope_test(true),
+            features_for_projection_envelope_v2_test(),
+        ] {
+            assert!(
+                live_event_passes_capability_filter(&child, features),
+                "a canonical v2 child must never be capability-filtered",
+            );
+        }
     }
 
     /// UPCR-2026-014 M9-α-9 `event.file_attached.v1` capability gate.
     /// Old clients that never advertised the feature MUST NOT receive
     /// `file/attached` envelopes — they keep relying on `media` on
-    /// `message/persisted` / `turn/spawn_complete`. New clients that
+    /// historic persisted-message / `turn/spawn_complete` lanes. New clients that
     /// negotiated the feature MUST receive the dedicated envelope so
     /// the slides soak's "PPTX on disk but no button on SPA" regression
     /// can be closed by a redundant wire signal.
@@ -47586,7 +47029,7 @@ ignore = []
         );
 
         // Independence from spawn_complete: a new client that
-        // negotiated ONLY file_attached (no message_persisted, no
+        // negotiated ONLY file_attached (no retired persisted-message feature, no
         // spawn_complete) still sees the file delivery. This matches
         // the redundancy goal — file_attached is the safety net for
         // clients whose richer-envelope reducers might drop the
@@ -47598,7 +47041,7 @@ ignore = []
         };
         assert!(
             live_event_passes_capability_filter(&file_attached, only_file_attached),
-            "file_attached gate is independent of spawn_complete / message_persisted",
+            "file_attached gate is independent of spawn_complete / retired persisted-message feature",
         );
     }
 
@@ -47682,9 +47125,8 @@ ignore = []
             // Pre-existing capability flags are enabled so the *only*
             // gate being exercised is the M9-γ projection.envelope.v1
             // mutual exclusion — the test would otherwise be polluted by
-            // the `message_persisted` and `spawn_complete` gates above.
+            // unrelated additive capability gates.
             projection_envelope,
-            message_persisted: true,
             spawn_complete: true,
             file_attached: true,
             header_present: true,
@@ -47695,7 +47137,6 @@ ignore = []
     fn features_for_projection_envelope_v2_test() -> ConnectionUiFeatures {
         ConnectionUiFeatures {
             projection_envelope_v2: true,
-            message_persisted: true,
             spawn_complete: true,
             file_attached: true,
             header_present: true,
@@ -47761,8 +47202,6 @@ ignore = []
                 session_result: None,
             },
         ));
-        let message_persisted =
-            UiProtocolLedgerEvent::Notification(message_persisted_for(&session));
         let file_attached = UiProtocolLedgerEvent::Notification(file_attached_for(&session));
 
         // Legacy client (projection_envelope=false): receives ALL legacy
@@ -47778,7 +47217,6 @@ ignore = []
             ("ToolProgress", &tool_progress),
             ("ToolCompleted", &tool_completed),
             ("TurnCompleted", &turn_completed),
-            ("MessagePersisted", &message_persisted),
             ("FileAttached", &file_attached),
         ] {
             assert!(
@@ -47801,7 +47239,6 @@ ignore = []
             ("ToolProgress", &tool_progress),
             ("ToolCompleted", &tool_completed),
             ("TurnCompleted", &turn_completed),
-            ("MessagePersisted", &message_persisted),
             ("FileAttached", &file_attached),
         ] {
             assert!(
@@ -47812,7 +47249,7 @@ ignore = []
     }
 
     #[test]
-    fn capability_filter_routes_v2_without_leaking_v1_or_legacy() {
+    fn capability_filter_routes_v2_unconditionally_without_leaking_sources() {
         let session = SessionKey("local:envelope-v2-gate".into());
         let legacy_delta =
             UiProtocolLedgerEvent::Notification(UiNotification::MessageDelta(MessageDeltaEvent {
@@ -47827,7 +47264,7 @@ ignore = []
         let legacy = features_for_projection_envelope_test(false);
         assert!(live_event_passes_capability_filter(&legacy_delta, legacy));
         assert!(!live_event_passes_capability_filter(&v1, legacy));
-        assert!(!live_event_passes_capability_filter(&v2, legacy));
+        assert!(live_event_passes_capability_filter(&v2, legacy));
 
         let v1_features = features_for_projection_envelope_test(true);
         assert!(!live_event_passes_capability_filter(
@@ -47835,7 +47272,7 @@ ignore = []
             v1_features
         ));
         assert!(live_event_passes_capability_filter(&v1, v1_features));
-        assert!(!live_event_passes_capability_filter(&v2, v1_features));
+        assert!(live_event_passes_capability_filter(&v2, v1_features));
 
         let v2_features = features_for_projection_envelope_v2_test();
         assert!(!live_event_passes_capability_filter(
@@ -47847,81 +47284,25 @@ ignore = []
     }
 
     #[test]
-    fn stage_four_delivery_telemetry_tracks_only_the_delivered_protocol_family() {
-        // Metrics are process-global and this crate has no isolated recorder
-        // fixture. The thread-local test probe is written at the same
-        // successful-enqueue site as the real counter, so this test verifies
-        // the actual direct-delivery path without racing unrelated tests.
+    fn delivery_telemetry_tracks_canonical_v2_only() {
+        // The Stage-4 legacy counter was deliberately removed in Stage 5.
+        // This probe exercises the successful direct-delivery site and proves
+        // the only remaining family metric is v2.
         let _ = take_ui_protocol_delivery_metrics_for_test();
-        let session = SessionKey("local:stage-four-delivery-metrics".into());
-        let persisted_with_content = |session: &SessionKey| {
-            let mut notification = message_persisted_for(session);
-            let UiNotification::MessagePersisted(persisted) = &mut notification else {
-                unreachable!("message_persisted_for must return message/persisted");
-            };
-            persisted.content = Some("legacy content".into());
-            notification
-        };
-
-        // A v2 connection suppresses the legacy persisted source event, then
-        // delivers its v2 envelope. The telemetry must record only v2.
-        let (v2_ws, mut v2_rx) = ws_connection_for_test(4);
-        v2_ws.update_live_features(features_for_projection_envelope_v2_test());
-        let v2_ledger = UiProtocolLedger::new(8);
-        assert!(
-            send_notification_durable(&v2_ws, &v2_ledger, persisted_with_content(&session),)
-                .is_ok()
-        );
-        assert!(
-            v2_rx.try_recv().is_err(),
-            "v2 capability filter must suppress legacy message/persisted"
-        );
-        assert!(
-            take_ui_protocol_delivery_metrics_for_test().is_empty(),
-            "a suppressed legacy event must not increment either delivery counter"
-        );
+        let session = SessionKey("local:v2-delivery-metrics".into());
+        let (ws, mut rx) = ws_connection_for_test(4);
+        ws.update_live_features(ConnectionUiFeatures::default());
+        let ledger = UiProtocolLedger::new(8);
 
         assert!(
-            send_notification_durable(
-                &v2_ws,
-                &v2_ledger,
-                projection_envelope_v2_event_for(&session),
-            )
-            .is_ok()
+            send_notification_durable(&ws, &ledger, assistant_persisted_v2_for(&session),).is_ok()
         );
-        let v2_frame = v2_rx.try_recv().expect("v2 envelope was enqueued");
-        assert_eq!(
-            frame_method(&v2_frame).as_deref(),
-            Some("projection/envelope")
-        );
+        let frame = rx.try_recv().expect("v2 envelope was enqueued");
+        assert_eq!(frame_method(&frame).as_deref(), Some("projection/envelope"));
         assert_eq!(
             take_ui_protocol_delivery_metrics_for_test(),
             vec![UiProtocolDeliveryMetric::V2Envelope],
-            "v2 delivery increments the v2 counter path and not the legacy path"
-        );
-
-        // A legacy connection receives the content-bearing message/persisted
-        // frame and increments only the legacy delivery counter path.
-        let (legacy_ws, mut legacy_rx) = ws_connection_for_test(4);
-        legacy_ws.update_live_features(features_for_projection_envelope_test(false));
-        let legacy_ledger = UiProtocolLedger::new(8);
-        assert!(send_notification_durable(
-            &legacy_ws,
-            &legacy_ledger,
-            persisted_with_content(&session),
-        )
-        .is_ok());
-        let legacy_frame = legacy_rx
-            .try_recv()
-            .expect("legacy message/persisted was enqueued");
-        assert_eq!(
-            frame_method(&legacy_frame).as_deref(),
-            Some("message/persisted")
-        );
-        assert_eq!(
-            take_ui_protocol_delivery_metrics_for_test(),
-            vec![UiProtocolDeliveryMetric::LegacyPersistedContent],
-            "legacy delivery increments the legacy counter path"
+            "every successful projection delivery records the v2 counter"
         );
     }
 
@@ -47947,11 +47328,12 @@ ignore = []
         .await;
 
         let first = ledger
-            .emit_envelope(
+            .emit_envelope_v2(
                 &session_id,
                 turn_id.0.to_string(),
-                Payload::AssistantPersisted {
+                PayloadV2::AssistantPersisted {
                     text: "first assistant iteration".into(),
+                    assistant_segment_id: format!("{}:assistant:1", turn_id.0),
                     meta: MessageMeta {
                         message_id: "msg-v2-first".into(),
                         persisted_at: Utc::now(),
@@ -47960,13 +47342,14 @@ ignore = []
                 },
                 None,
             )
-            .expect("v1 source envelope is durable");
+            .expect("first canonical v2 envelope is durable");
         let second = ledger
-            .emit_envelope(
+            .emit_envelope_v2(
                 &session_id,
                 turn_id.0.to_string(),
-                Payload::AssistantPersisted {
+                PayloadV2::AssistantPersisted {
                     text: "second assistant iteration".into(),
+                    assistant_segment_id: format!("{}:assistant:2", turn_id.0),
                     meta: MessageMeta {
                         message_id: "msg-v2-second".into(),
                         persisted_at: Utc::now(),
@@ -47975,45 +47358,53 @@ ignore = []
                 },
                 None,
             )
-            .expect("later v1 source envelope is durable");
-        ledger.append_notification(UiNotification::FileAttached(
-            octos_core::ui_protocol::FileAttachedEvent {
-                session_id: session_id.clone(),
-                topic: None,
-                turn_id: turn_id.clone(),
-                path: "artifacts/result.md".into(),
-                tool_call_id: Some("call-v2-file".into()),
-                mime: Some("text/markdown".into()),
-            },
-        ));
-        ledger.append_notification(UiNotification::TurnCompleted(TurnCompletedEvent {
-            session_id: session_id.clone(),
-            topic: None,
-            turn_id: turn_id.clone(),
-            cursor: None,
-            tokens_in: Some(11),
-            tokens_out: Some(7),
-            session_result: None,
-        }));
-        ledger.append_notification(UiNotification::TurnSpawnComplete(TurnSpawnCompleteEvent {
-            session_id: session_id.clone(),
-            topic: None,
-            turn_id: Some(turn_id.clone()),
-            thread_id: Some(turn_id.0.to_string()),
-            task_id: "task-v2-child".into(),
-            tool_call_id: Some("call-v2-child".into()),
-            response_to_client_message_id: Some("cmid-v2-parent".into()),
-            seq: 9,
-            message_id: "msg-v2-child".into(),
-            source: "background".into(),
-            cursor: UiCursor {
-                stream: session_id.0.clone(),
-                seq: 0,
-            },
-            persisted_at: Utc::now(),
-            content: "background result".into(),
-            media: vec!["artifacts/child.md".into()],
-        }));
+            .expect("later canonical v2 envelope is durable");
+        ledger
+            .emit_envelope_v2(
+                &session_id,
+                turn_id.0.to_string(),
+                PayloadV2::ToolStart {
+                    tool_call_id: "call-v2-tool".into(),
+                    name: "shell".into(),
+                    arguments_preview: Some("command: \"cargo test\"".into()),
+                },
+                None,
+            )
+            .expect("canonical v2 tool envelope is durable");
+        ledger
+            .emit_envelope_v2(
+                &session_id,
+                turn_id.0.to_string(),
+                PayloadV2::TurnTerminal {
+                    outcome: TurnTerminalOutcome::Completed,
+                    error: None,
+                    token_usage: Some(EnvelopeTokenUsage {
+                        input_tokens: 11,
+                        output_tokens: 7,
+                        ..EnvelopeTokenUsage::default()
+                    }),
+                },
+                None,
+            )
+            .expect("canonical v2 terminal is durable");
+        ledger
+            .emit_envelope_v2(
+                &session_id,
+                format!("{}:background:task-v2-child", turn_id.0),
+                PayloadV2::BackgroundChildCompleted {
+                    parent_turn_id: turn_id.0.to_string(),
+                    response_to_client_message_id: Some("cmid-v2-parent".into()),
+                    task_id: "task-v2-child".into(),
+                    content: "background result".into(),
+                    tool_call_id: Some("call-v2-child".into()),
+                    message_id: "msg-v2-child".into(),
+                    source: "background".into(),
+                    persisted_at: Utc::now(),
+                    media: vec!["artifacts/child.md".into()],
+                },
+                None,
+            )
+            .expect("canonical v2 background child is durable");
 
         let mut received = Vec::new();
         for _ in 0..5 {
@@ -48024,6 +47415,10 @@ ignore = []
             let WsMessage::Text(text) = frame else {
                 panic!("expected JSON text frame");
             };
+            assert!(
+                !text.contains("message/persisted"),
+                "a Stage-5 full-turn frame cannot use the retired wire method",
+            );
             received.push(serde_json::from_str::<Value>(text.as_str()).expect("valid JSON"));
         }
 
@@ -48041,13 +47436,13 @@ ignore = []
         assert!(assistant_segments.iter().all(|id| id.is_string()));
         assert_ne!(assistant_segments[0], assistant_segments[1]);
 
-        let attachment = received
+        let tool = received
             .iter()
-            .find(|frame| frame["params"]["payload"]["type"] == "file_attached")
-            .expect("attachment v2 envelope");
+            .find(|frame| frame["params"]["payload"]["type"] == "tool_start")
+            .expect("tool v2 envelope");
         assert_eq!(
-            attachment["params"]["payload"]["data"]["attachment_owner"]["tool_call_id"],
-            "call-v2-file",
+            tool["params"]["payload"]["data"]["tool_call_id"],
+            "call-v2-tool",
         );
 
         let terminal = received
@@ -48109,47 +47504,39 @@ ignore = []
         )
         .await;
 
-        ledger.append_notification(UiNotification::TurnCompleted(TurnCompletedEvent {
-            session_id: session_id.clone(),
-            topic: None,
-            turn_id: turn_id.clone(),
-            cursor: None,
-            tokens_in: None,
-            tokens_out: None,
-            session_result: None,
-        }));
-        ledger.append_notification(UiNotification::TurnSpawnComplete(TurnSpawnCompleteEvent {
-            session_id: session_id.clone(),
-            topic: None,
-            turn_id: Some(turn_id.clone()),
-            thread_id: Some(turn_id.0.to_string()),
-            task_id: "task-v2-after-terminal".into(),
-            tool_call_id: Some("call-v2-after-terminal".into()),
-            response_to_client_message_id: Some("cmid-v2-parent".into()),
-            seq: 1,
-            message_id: "msg-v2-after-terminal".into(),
-            source: "background".into(),
-            cursor: UiCursor {
-                stream: session_id.0.clone(),
-                seq: 0,
-            },
-            persisted_at: Utc::now(),
-            content: "background result".into(),
-            media: vec!["artifacts/child.md".into()],
-        }));
-        // Existing background code emits this legacy file event after the
-        // spawn-complete notification. V2 keeps it inside the child stream's
-        // media rather than appending it to the terminal parent stream.
-        ledger.append_notification(UiNotification::FileAttached(
-            octos_core::ui_protocol::FileAttachedEvent {
-                session_id: session_id.clone(),
-                topic: None,
-                turn_id: turn_id.clone(),
-                path: "artifacts/child.md".into(),
-                tool_call_id: Some("call-v2-after-terminal".into()),
-                mime: Some("text/markdown".into()),
-            },
-        ));
+        ledger
+            .emit_envelope_v2(
+                &session_id,
+                turn_id.0.to_string(),
+                PayloadV2::TurnTerminal {
+                    outcome: TurnTerminalOutcome::Completed,
+                    error: None,
+                    token_usage: None,
+                },
+                None,
+            )
+            .expect("parent terminal is durable");
+        // A background result is a terminal event in its own child stream;
+        // its media stays on that payload and never targets the settled
+        // foreground stream.
+        ledger
+            .emit_envelope_v2(
+                &session_id,
+                format!("{}:background:task-v2-after-terminal", turn_id.0),
+                PayloadV2::BackgroundChildCompleted {
+                    parent_turn_id: turn_id.0.to_string(),
+                    response_to_client_message_id: Some("cmid-v2-parent".into()),
+                    task_id: "task-v2-after-terminal".into(),
+                    content: "background result".into(),
+                    tool_call_id: Some("call-v2-after-terminal".into()),
+                    message_id: "msg-v2-after-terminal".into(),
+                    source: "background".into(),
+                    persisted_at: Utc::now(),
+                    media: vec!["artifacts/child.md".into()],
+                },
+                None,
+            )
+            .expect("child terminal is durable");
 
         let mut received = Vec::new();
         for _ in 0..2 {
@@ -48177,10 +47564,8 @@ ignore = []
             turn_id.0.to_string(),
         );
         assert!(
-            !received
-                .iter()
-                .any(|frame| frame["params"]["payload"]["type"] == "file_attached"),
-            "a background file cannot be appended to the terminal parent stream",
+            child["params"]["payload"]["data"]["media"] == json!(["artifacts/child.md"]),
+            "background media belongs to the child payload",
         );
         assert!(
             tokio::time::timeout(std::time::Duration::from_millis(100), rx.recv())
@@ -48191,55 +47576,43 @@ ignore = []
     }
 
     #[tokio::test]
-    async fn legacy_connection_wire_remains_byte_identical_when_v2_exists() {
+    async fn unnegotiated_connection_receives_only_canonical_v2_wire_shape() {
         let (ws, mut rx) = ws_connection_for_test(8);
         let ledger = Arc::new(UiProtocolLedger::new(8));
-        let session_id = SessionKey("local:envelope-v2-legacy".into());
+        let session_id = SessionKey("local:envelope-v2-default".into());
         let forwarders: SharedLiveForwarders = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
         let live_rx = ledger.subscribe(&session_id);
-        let legacy_features = ConnectionUiFeatures {
-            message_persisted: true,
-            header_present: true,
-            ..ConnectionUiFeatures::default()
-        };
         spawn_live_forwarder(
             ws.clone(),
             ledger.clone(),
             session_id.clone(),
             0,
             ws.connection_id(),
-            legacy_features,
+            ConnectionUiFeatures::default(),
             None,
             live_rx,
-            forwarders,
+            forwarders.clone(),
         )
         .await;
 
-        let notification = UiNotification::ToolStarted(ToolStartedEvent {
-            session_id: session_id.clone(),
-            topic: None,
-            turn_id: TurnId::new(),
-            tool_call_id: "call-legacy".into(),
-            tool_name: "shell".into(),
-            arguments: Some(json!({ "command": "pwd" })),
-        });
-        let expected = serde_json::to_string(
-            &notification
-                .clone()
-                .into_rpc_notification()
-                .expect("legacy notification serializes"),
-        )
-        .expect("legacy rpc text serializes");
-        ledger.append_notification(notification);
+        ledger.append_notification(assistant_persisted_v2_for(&session_id));
 
         let frame = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
             .await
-            .expect("legacy frame arrives")
+            .expect("canonical frame arrives")
             .expect("writer remains open");
         let WsMessage::Text(text) = frame else {
             panic!("expected JSON text frame");
         };
-        assert_eq!(text.as_str(), expected, "v2 must not alter legacy bytes");
+        let json: Value = serde_json::from_str(text.as_str()).expect("canonical JSON frame");
+        assert_eq!(json["method"], "projection/envelope");
+        assert_eq!(json["params"]["payload"]["type"], "assistant_persisted");
+        assert!(
+            !text.contains("message/persisted"),
+            "the retired wire method cannot appear in a Stage-5 frame",
+        );
+
+        abort_live_forwarders(&forwarders, &ledger).await;
     }
 
     #[test]
@@ -48609,13 +47982,10 @@ ignore = []
         assert!(cursors.contains(&raw_appended.cursor.seq));
     }
 
-    /// End-to-end through the live forwarder for a NEW client (negotiated
-    /// `event.spawn_complete.v1`): asserts they receive `turn/spawn_complete`
-    /// AND the duplicate `message/persisted` (source: background) is
-    /// suppressed. The combination is what kills the splice-merge
-    /// double-render.
+    /// A background result is delivered as one canonical child envelope,
+    /// independent of any obsolete capability negotiation.
     #[tokio::test]
-    async fn live_forwarder_routes_spawn_complete_to_new_client() {
+    async fn live_forwarder_routes_background_child_as_canonical_v2() {
         let (ws, mut rx) = ws_connection_for_test(16);
         let ledger = Arc::new(UiProtocolLedger::new(16));
         let session_id = SessionKey("local:newfeat".into());
@@ -48628,72 +47998,69 @@ ignore = []
             session_id.clone(),
             0,
             ws.connection_id(),
-            features_for_spawn_complete_test(true, true),
+            ConnectionUiFeatures::default(),
             None,
             live_rx,
             forwarders.clone(),
         )
         .await;
 
-        // Producer side fires both — the persistence-driven
-        // `message/persisted` (via `MessageCommitObserver`) AND the new
-        // envelope (direct ledger append from `BackgroundResultSender`).
-        ledger.append_notification(background_message_persisted_for(&session_id));
-        ledger.append_notification(turn_spawn_complete_for(&session_id));
+        // The post-commit observer emits one child completion envelope.
+        ledger.append_notification(background_child_v2_for(&session_id));
 
-        // The new client must observe exactly one frame: the spawn_complete
-        // envelope. The duplicate background message/persisted is filtered.
         let frame = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
             .await
-            .expect("expected the spawn_complete envelope within 1s")
+            .expect("expected the background child envelope within 1s")
             .expect("ws still open");
         assert_eq!(
             frame_method(&frame).as_deref(),
-            Some(octos_core::ui_protocol::methods::TURN_SPAWN_COMPLETE),
-            "first frame must be turn/spawn_complete (background message/persisted suppressed)",
+            Some("projection/envelope"),
+            "background completion is always a projection envelope",
+        );
+        let frame: Value = match frame {
+            WsMessage::Text(text) => serde_json::from_str(&text).expect("valid child JSON"),
+            other => panic!("expected text frame, got {other:?}"),
+        };
+        assert_eq!(
+            frame["params"]["payload"]["type"],
+            "background/spawn_complete",
         );
 
-        // No further frames should arrive — the background message/persisted
-        // was filtered.
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         assert!(
             rx.try_recv().is_err(),
-            "no second frame: background message/persisted is suppressed for new clients",
+            "one committed child result produces one wire envelope",
         );
 
         abort_live_forwarders(&forwarders, &ledger).await;
     }
 
-    /// Codex P1: when the BackgroundResultSender persist scope is
-    /// active, `current_message_persisted_source` must report
-    /// `Background` regardless of the `Message` role. Outside the scope
-    /// it falls back to the role-derived default — the pre-M10
-    /// behaviour stays intact for every other persist path.
+    /// Background persistence carries explicit projection context only within
+    /// its task-local scope; ordinary commits remain foreground projections.
     #[tokio::test]
-    async fn message_persisted_source_override_routes_through_task_local() {
-        // Outside any scope: role-derived default.
-        let default_for_assistant = current_message_persisted_source(MessageRole::Assistant);
-        assert_eq!(default_for_assistant, MessagePersistedSource::Assistant);
-        let default_for_tool = current_message_persisted_source(MessageRole::Tool);
-        assert_eq!(default_for_tool, MessagePersistedSource::Tool);
-
-        // Inside the override scope (mirrors what the
-        // `BackgroundResultSender` closure does): every role maps to
-        // `Background`.
-        let bg = MESSAGE_PERSISTED_SOURCE_OVERRIDE
-            .scope(Some(MessagePersistedSource::Background), async {
-                (
-                    current_message_persisted_source(MessageRole::Assistant),
-                    current_message_persisted_source(MessageRole::Tool),
-                )
-            })
+    async fn background_projection_override_is_task_local() {
+        assert!(MESSAGE_PROJECTION_OVERRIDE.try_with(Clone::clone).is_err());
+        let context = BackgroundChildProjection {
+            parent_turn_id: "parent-turn".into(),
+            response_to_client_message_id: Some("cmid-parent".into()),
+            task_id: Some("task-child".into()),
+            tool_call_id: Some("call-child".into()),
+            media: vec!["artifact.md".into()],
+        };
+        let observed = MESSAGE_PROJECTION_OVERRIDE
+            .scope(
+                Some(MessageProjectionOverride::BackgroundChild(context.clone())),
+                async { MESSAGE_PROJECTION_OVERRIDE.with(Clone::clone) },
+            )
             .await;
-        assert_eq!(bg.0, MessagePersistedSource::Background);
-        assert_eq!(bg.1, MessagePersistedSource::Background);
-
-        // After the scope ends, the default behaviour is restored.
-        let after = current_message_persisted_source(MessageRole::Assistant);
-        assert_eq!(after, MessagePersistedSource::Assistant);
+        assert!(matches!(
+            observed,
+            Some(MessageProjectionOverride::BackgroundChild(actual))
+                if actual.parent_turn_id == context.parent_turn_id
+                    && actual.task_id == context.task_id
+                    && actual.media == context.media
+        ));
+        assert!(MESSAGE_PROJECTION_OVERRIDE.try_with(Clone::clone).is_err());
     }
 
     /// Issue #889: a contract-verified `fm_tts` spawn result must persist
@@ -48721,9 +48088,17 @@ ignore = []
         let thread_id = "turn-issue-889";
         let media = vec![mp3_path.to_string_lossy().into_owned()];
 
-        let persisted = MESSAGE_PERSISTED_SOURCE_OVERRIDE
+        let persisted = MESSAGE_PROJECTION_OVERRIDE
             .scope(
-                Some(MessagePersistedSource::Background),
+                Some(MessageProjectionOverride::BackgroundChild(
+                    BackgroundChildProjection {
+                        parent_turn_id: thread_id.to_owned(),
+                        response_to_client_message_id: None,
+                        task_id: Some("task-fm-tts".into()),
+                        tool_call_id: None,
+                        media: media.clone(),
+                    },
+                )),
                 persist_assistant_with_media(
                     &sessions,
                     tmp.path(),
@@ -48736,8 +48111,7 @@ ignore = []
             )
             .await;
 
-        let persisted = persisted.expect("background result row should persist");
-        assert_eq!(persisted.committed_seq, 0);
+        assert!(persisted, "background result row should persist");
 
         let handle = octos_bus::SessionHandle::open(tmp.path(), &session_id);
         let history = handle.session().messages.clone();
@@ -48751,8 +48125,7 @@ ignore = []
 
     /// Fleet-UX soak NEW-03 (mini3 / mini5, 2026-05-23): the #1183 fix
     /// suppressed the synthesised "Background work started for `<tool>`."
-    /// ack on the LIVE `message/persisted` broadcast for dual-negotiated
-    /// clients by tagging the wire envelope `source: background`, but
+    /// ack on the old live persisted-message broadcast, but
     /// the JSONL row was still committed with `role: assistant`. The
     /// page handler at `handle_session_messages_page` walks JSONL
     /// directly with NO source filter, so any SPA refresh / replay
@@ -48764,21 +48137,18 @@ ignore = []
     /// The preamble (carrying `tool_calls` + preamble text) still
     /// persists as a normal assistant row. The background task's real
     /// outcome still flows via `BackgroundResultSender` (its own
-    /// persist + `turn/spawn_complete` envelope), so the legitimate
+    /// persist + canonical child envelope), so the legitimate
     /// "task finished" signal is unaffected.
     ///
     /// This test simulates the full production persist sequence and
     /// asserts both invariants:
     ///   1. JSONL contains exactly ONE row (the preamble) — the ack
     ///      row is absent, so messages_page replay can NEVER ghost it.
-    ///   2. Exactly ONE `message/persisted` envelope fires (the
-    ///      preamble with `source: assistant`) — no Background
-    ///      envelope appears because the persist that would have
+    ///   2. Exactly ONE `assistant_persisted` v2 envelope fires for the
+    ///      preamble — no child envelope appears because the persist that would have
     ///      triggered the observer never happens.
     #[tokio::test(flavor = "current_thread")]
     async fn synth_ack_not_persisted_to_jsonl_when_spawn_only() {
-        use octos_core::ui_protocol::MessagePersistedSource;
-
         let _guard = message_commit_observer_test_lock()
             .lock()
             .unwrap_or_else(|e| e.into_inner());
@@ -48866,38 +48236,39 @@ ignore = []
             "no row may carry the synthesised ack text — that was the ghost-ack signature",
         );
 
-        // Invariant 2: exactly ONE `message/persisted` envelope fires
-        // (the preamble with `source: assistant`). The ack persist is
-        // skipped, so the `MessageCommitObserver` never fires for it
-        // — no Background envelope is emitted either.
-        let mut assistant_envelopes: Vec<MessagePersistedEvent> = Vec::new();
+        // Invariant 2: exactly ONE canonical assistant-persisted envelope
+        // fires. The skipped ack has no post-commit projection at all.
+        let mut assistant_envelopes = Vec::new();
+        let mut background_children = 0usize;
         while let Ok(event) = subscriber.try_recv() {
-            if let UiProtocolLedgerEvent::Notification(UiNotification::MessagePersisted(ev)) =
+            if let UiProtocolLedgerEvent::Notification(UiNotification::EnvelopeV2(envelope)) =
                 &event.event
             {
-                if ev.role == octos_core::MessageRole::Assistant.as_str() {
-                    assistant_envelopes.push(ev.clone());
+                match &envelope.envelope.payload {
+                    PayloadV2::AssistantPersisted { text, .. } => {
+                        assistant_envelopes.push(text.clone());
+                    }
+                    PayloadV2::BackgroundChildCompleted { .. } => {
+                        background_children += 1;
+                    }
+                    _ => {}
                 }
             }
         }
         assert_eq!(
             assistant_envelopes.len(),
             1,
-            "exactly ONE `message/persisted` envelope must fire (the preamble); \
-             pre-fix TWO fired (preamble Assistant + ack Background); got {}",
+            "exactly ONE assistant-persisted envelope must fire (the preamble); \
+             pre-fix TWO persisted rows existed; got {}",
             assistant_envelopes.len(),
         );
         assert_eq!(
-            assistant_envelopes[0].source,
-            MessagePersistedSource::Assistant,
-            "the surviving envelope must be the preamble with source=Assistant",
+            assistant_envelopes[0], preamble_text,
+            "the surviving envelope must be the preamble",
         );
-        assert!(
-            !assistant_envelopes
-                .iter()
-                .any(|env| matches!(env.source, MessagePersistedSource::Background)),
-            "NO Background envelope may fire — the ack persist is skipped \
-             entirely so the observer never fabricates a Background source row",
+        assert_eq!(
+            background_children, 0,
+            "the skipped ack cannot fabricate a background child",
         );
 
         // Restore the global observer slot to None so subsequent tests
@@ -48990,14 +48361,11 @@ ignore = []
     /// Per iteration:
     ///   1. JSONL contains exactly ONE row (the preamble) — the ack
     ///      row is absent so messages_page replay cannot ghost-render.
-    ///   2. Exactly ONE `message/persisted` envelope fires (the
-    ///      preamble with `source: Assistant`) — no Background
-    ///      envelope appears because the persist that would have
+    ///   2. Exactly ONE v2 `assistant_persisted` envelope fires for the
+    ///      preamble — no child envelope appears because the persist that would have
     ///      triggered the observer never happens.
     #[tokio::test(flavor = "current_thread")]
     async fn synth_ack_skip_invariants_hold_for_each_spawn_only_tool_name() {
-        use octos_core::ui_protocol::MessagePersistedSource;
-
         // Cover every spawn_only tool name observed in the round-2 soak
         // (mini1 / mini3 / mini5 evidence in
         // `e2e/test-results-fleet-ux-soak/`) plus a couple of names that
@@ -49129,39 +48497,40 @@ ignore = []
                  that was the round-1 ghost-ack signature",
             );
 
-            // Invariant B: exactly ONE `message/persisted` envelope
-            // fires (the preamble with `source: assistant`) — regardless
-            // of `<tool_name>`. The ack persist is skipped, so the
-            // `MessageCommitObserver` never fires for it.
-            let mut assistant_envelopes: Vec<MessagePersistedEvent> = Vec::new();
+            // Invariant B: exactly one assistant-persisted v2 envelope fires
+            // regardless of `<tool_name>`. The ack persist is skipped, so the
+            // `MessageCommitObserver` never receives it.
+            let mut assistant_envelopes = Vec::new();
+            let mut background_children = 0usize;
             while let Ok(event) = subscriber.try_recv() {
-                if let UiProtocolLedgerEvent::Notification(UiNotification::MessagePersisted(ev)) =
+                if let UiProtocolLedgerEvent::Notification(UiNotification::EnvelopeV2(envelope)) =
                     &event.event
                 {
-                    if ev.role == octos_core::MessageRole::Assistant.as_str() {
-                        assistant_envelopes.push(ev.clone());
+                    match &envelope.envelope.payload {
+                        PayloadV2::AssistantPersisted { text, .. } => {
+                            assistant_envelopes.push(text.clone());
+                        }
+                        PayloadV2::BackgroundChildCompleted { .. } => {
+                            background_children += 1;
+                        }
+                        _ => {}
                     }
                 }
             }
             assert_eq!(
                 assistant_envelopes.len(),
                 1,
-                "exactly ONE `message/persisted` envelope must fire for spawn_only \
+                "exactly ONE assistant-persisted envelope must fire for spawn_only \
                  tool `{tool_name}`; got {}",
                 assistant_envelopes.len(),
             );
             assert_eq!(
-                assistant_envelopes[0].source,
-                MessagePersistedSource::Assistant,
-                "the surviving envelope for `{tool_name}` must be the preamble \
-                 with source=Assistant",
+                assistant_envelopes[0], preamble_text,
+                "the surviving envelope for `{tool_name}` must be the preamble",
             );
-            assert!(
-                !assistant_envelopes
-                    .iter()
-                    .any(|env| matches!(env.source, MessagePersistedSource::Background)),
-                "NO Background envelope may fire for `{tool_name}` — the ack \
-                 persist is skipped entirely",
+            assert_eq!(
+                background_children, 0,
+                "no child can be emitted for `{tool_name}` because the ack is skipped",
             );
 
             // Restore the global observer slot between iterations.
@@ -49352,67 +48721,62 @@ ignore = []
         );
     }
 
-    /// Codex P2 follow-up: the `turn/spawn_complete` envelope's flat
-    /// `seq` field carries the COMMITTED-ROW seq (the index in the
-    /// session message log, identical to `MessagePersistedEvent.seq`)
-    /// — NOT the UI-ledger cursor seq. The two scales differ in any
-    /// turn that has prior ledger notifications, so upgraded clients
-    /// reusing their `MessagePersisted` reducer for spawn completions
-    /// MUST observe the persisted-row seq the producer wrote, not the
-    /// ledger-assigned cursor seq.
+    /// V2 projection sequence is per thread while cursor sequencing is per
+    /// durable session stream. A pre-existing ledger row proves the two are
+    /// stamped independently.
     #[tokio::test]
-    async fn ledger_preserves_producer_seq_and_stamps_only_cursor() {
+    async fn ledger_stamps_v2_projection_seq_and_cursor_independently() {
         let ledger = UiProtocolLedger::new(8);
         let session_id = SessionKey("local:seq".into());
 
-        // Producer sets `seq = 7` (the committed-row index from the
-        // persist path). Ledger appends and stamps cursor.seq, but
-        // must leave `seq` untouched.
-        let mut event = match turn_spawn_complete_for(&session_id) {
-            UiNotification::TurnSpawnComplete(ev) => ev,
-            _ => unreachable!("test fixture is turn/spawn_complete"),
-        };
-        event.seq = 7;
-        event.cursor.seq = 0; // producer seeds 0; ledger stamps the real cursor.
-        let appended = ledger.append_notification(UiNotification::TurnSpawnComplete(event));
+        let seed = ledger.append_notification(assistant_persisted_v2_for(&session_id));
+        let first = ledger
+            .emit_envelope_v2(
+                &session_id,
+                "thread-seq".into(),
+                PayloadV2::AssistantDelta {
+                    text: "one".into(),
+                    assistant_segment_id: "thread-seq:assistant:1".into(),
+                },
+                None,
+            )
+            .expect("first v2 envelope");
+        let second = ledger
+            .emit_envelope_v2(
+                &session_id,
+                "thread-seq".into(),
+                PayloadV2::AssistantDelta {
+                    text: "two".into(),
+                    assistant_segment_id: "thread-seq:assistant:1".into(),
+                },
+                None,
+            )
+            .expect("second v2 envelope");
 
-        let stamped = match &appended.event {
-            UiProtocolLedgerEvent::Notification(UiNotification::TurnSpawnComplete(ev)) => ev,
-            _ => panic!("expected turn/spawn_complete back from the ledger"),
+        let first_envelope = match &first.event {
+            UiProtocolLedgerEvent::Notification(UiNotification::EnvelopeV2(event)) => {
+                &event.envelope
+            }
+            other => panic!("expected v2 envelope, got {other:?}"),
         };
-        assert_eq!(
-            stamped.seq, 7,
-            "ledger must NOT overwrite the producer's committed-row seq",
-        );
-        assert!(
-            stamped.cursor.seq > 0,
-            "cursor.seq must be the ledger-assigned non-zero cursor",
-        );
-
-        // Cursor is strictly monotonic across appends (same contract
-        // as the existing MessagePersisted path); flat `seq` is
-        // independent and tracked by the producer.
-        let mut event2 = match turn_spawn_complete_for(&session_id) {
-            UiNotification::TurnSpawnComplete(ev) => ev,
-            _ => unreachable!(),
+        let second_envelope = match &second.event {
+            UiProtocolLedgerEvent::Notification(UiNotification::EnvelopeV2(event)) => {
+                &event.envelope
+            }
+            other => panic!("expected v2 envelope, got {other:?}"),
         };
-        event2.seq = 8;
-        let appended2 = ledger.append_notification(UiNotification::TurnSpawnComplete(event2));
-        let stamped2 = match &appended2.event {
-            UiProtocolLedgerEvent::Notification(UiNotification::TurnSpawnComplete(ev)) => ev,
-            _ => panic!("turn/spawn_complete"),
-        };
-        assert!(stamped2.cursor.seq > stamped.cursor.seq);
-        assert_eq!(stamped2.seq, 8);
+        assert_eq!(first_envelope.seq, 1);
+        assert_eq!(second_envelope.seq, 2);
+        assert_eq!(first_envelope.cursor.as_ref(), Some(&first.cursor));
+        assert_eq!(second_envelope.cursor.as_ref(), Some(&second.cursor));
+        assert!(seed.cursor.seq < first.cursor.seq);
+        assert!(first.cursor.seq < second.cursor.seq);
     }
 
-    /// End-to-end through the live forwarder for an OLD client (did NOT
-    /// negotiate `event.spawn_complete.v1`): they see `message/persisted`
-    /// (Background source preserved) and do NOT see `turn/spawn_complete`.
-    /// This is the back-compat path that keeps existing TUI/CLI consumers
-    /// working unchanged.
+    /// There is no old-client persisted-message fallback: background results
+    /// remain deliverable as the canonical v2 child frame.
     #[tokio::test]
-    async fn live_forwarder_falls_back_to_message_persisted_for_old_client() {
+    async fn live_forwarder_delivers_background_child_without_legacy_fallback() {
         let (ws, mut rx) = ws_connection_for_test(16);
         let ledger = Arc::new(UiProtocolLedger::new(16));
         let session_id = SessionKey("local:oldfeat".into());
@@ -49425,32 +48789,29 @@ ignore = []
             session_id.clone(),
             0,
             ws.connection_id(),
-            // Old client: has message_persisted but NOT spawn_complete.
-            features_for_spawn_complete_test(true, false),
+            ConnectionUiFeatures::default(),
             None,
             live_rx,
             forwarders.clone(),
         )
         .await;
 
-        ledger.append_notification(background_message_persisted_for(&session_id));
-        ledger.append_notification(turn_spawn_complete_for(&session_id));
+        ledger.append_notification(background_child_v2_for(&session_id));
 
         let frame = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
             .await
-            .expect("expected the legacy message/persisted within 1s")
+            .expect("expected the canonical background child within 1s")
             .expect("ws still open");
         assert_eq!(
             frame_method(&frame).as_deref(),
-            Some(octos_core::ui_protocol::methods::MESSAGE_PERSISTED),
-            "first frame must be the legacy message/persisted shape for old clients",
+            Some("projection/envelope"),
+            "first frame must be the canonical projection envelope",
         );
 
-        // The new envelope must NOT be delivered to an un-negotiated client.
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         assert!(
             rx.try_recv().is_err(),
-            "no second frame: turn/spawn_complete is suppressed for old clients",
+            "background completion has no legacy companion frame",
         );
 
         abort_live_forwarders(&forwarders, &ledger).await;
@@ -49472,7 +48833,7 @@ ignore = []
             session_id.clone(),
             0,
             ws_a.connection_id(),
-            features_with_message_persisted(true),
+            features_for_v2_delivery(),
             None,
             rx_a_live,
             forwarders_a.clone(),
@@ -49485,14 +48846,14 @@ ignore = []
             session_id.clone(),
             0,
             ws_b.connection_id(),
-            features_with_message_persisted(true),
+            features_for_v2_delivery(),
             None,
             rx_b_live,
             forwarders_b.clone(),
         )
         .await;
 
-        ledger.append_notification(message_persisted_for(&session_id));
+        ledger.append_notification(assistant_persisted_v2_for(&session_id));
 
         let frame_a = tokio::time::timeout(std::time::Duration::from_secs(1), rx_a.recv())
             .await
@@ -49504,24 +48865,24 @@ ignore = []
             .expect("ws_b open");
         assert_eq!(
             frame_method(&frame_a).as_deref(),
-            Some(octos_core::ui_protocol::methods::MESSAGE_PERSISTED)
+            Some("projection/envelope")
         );
         assert_eq!(
             frame_method(&frame_b).as_deref(),
-            Some(octos_core::ui_protocol::methods::MESSAGE_PERSISTED)
+            Some("projection/envelope")
         );
 
         // Disconnect ws_a; ws_b must continue receiving subsequent events.
         abort_live_forwarders(&forwarders_a, &ledger).await;
         drop(rx_a);
-        ledger.append_notification(message_persisted_for(&session_id));
+        ledger.append_notification(assistant_persisted_v2_for(&session_id));
         let frame_b2 = tokio::time::timeout(std::time::Duration::from_secs(1), rx_b.recv())
             .await
             .expect("ws_b frame after sibling drop")
             .expect("ws_b still open");
         assert_eq!(
             frame_method(&frame_b2).as_deref(),
-            Some(octos_core::ui_protocol::methods::MESSAGE_PERSISTED)
+            Some("projection/envelope")
         );
 
         abort_live_forwarders(&forwarders_b, &ledger).await;
@@ -49544,7 +48905,7 @@ ignore = []
         let forwarders: SharedLiveForwarders = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
 
         // Pre-existing event at seq=1 — would be in replay history.
-        let initial = ledger.append_notification(message_persisted_for(&session_id));
+        let initial = ledger.append_notification(assistant_persisted_v2_for(&session_id));
         assert_eq!(initial.cursor.seq, 1);
 
         // Snapshot replay (head=1) + subscribe in the same order
@@ -49566,7 +48927,7 @@ ignore = []
         // be filtered out (baseline shifted to session/open's seq=H+2);
         // with the fix the broadcast buffer holds it and the forwarder
         // emits it once installed.
-        let gap = ledger.append_notification(message_persisted_for(&session_id));
+        let gap = ledger.append_notification(assistant_persisted_v2_for(&session_id));
         assert_eq!(gap.cursor.seq, 2);
 
         // Append session/open AFTER the gap event — exactly the
@@ -49596,7 +48957,7 @@ ignore = []
             session_id.clone(),
             replay_head,
             ws.connection_id(),
-            features_with_message_persisted(true),
+            features_for_v2_delivery(),
             None,
             live_rx,
             forwarders.clone(),
@@ -49609,7 +48970,7 @@ ignore = []
             .expect("ws still open");
         assert_eq!(
             frame_method(&frame).as_deref(),
-            Some(octos_core::ui_protocol::methods::MESSAGE_PERSISTED),
+            Some("projection/envelope"),
             "the H+1 gap event must reach the WS, not be silently filtered"
         );
 
@@ -49642,7 +49003,7 @@ ignore = []
             session_id.clone(),
             0,
             ws.connection_id(),
-            features_with_message_persisted(true),
+            features_for_v2_delivery(),
             None,
             live_rx,
             forwarders.clone(),
@@ -49651,7 +49012,7 @@ ignore = []
 
         // Direct-send via the standard handler path. This both persists
         // (with our connection_id stamped) and direct-sends inline.
-        send_notification_durable(&ws, &ledger, message_persisted_for(&session_id))
+        send_notification_durable(&ws, &ledger, assistant_persisted_v2_for(&session_id))
             .expect("direct send succeeds");
 
         // Exactly one frame must arrive.
@@ -49659,10 +49020,7 @@ ignore = []
             .await
             .expect("first frame")
             .expect("ws open");
-        assert_eq!(
-            frame_method(&first).as_deref(),
-            Some(octos_core::ui_protocol::methods::MESSAGE_PERSISTED)
-        );
+        assert_eq!(frame_method(&first).as_deref(), Some("projection/envelope"));
         // Give the forwarder time to (incorrectly) re-emit if the fix
         // regresses; with self-suppression nothing further must arrive.
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -49683,13 +49041,13 @@ ignore = []
             session_id.clone(),
             0,
             ws_other.connection_id(),
-            features_with_message_persisted(true),
+            features_for_v2_delivery(),
             None,
             live_rx_other,
             forwarders_other.clone(),
         )
         .await;
-        send_notification_durable(&ws, &ledger, message_persisted_for(&session_id))
+        send_notification_durable(&ws, &ledger, assistant_persisted_v2_for(&session_id))
             .expect("second send");
         let frame_other = tokio::time::timeout(std::time::Duration::from_secs(1), rx_other.recv())
             .await
@@ -49697,7 +49055,7 @@ ignore = []
             .expect("ws_other open");
         assert_eq!(
             frame_method(&frame_other).as_deref(),
-            Some(octos_core::ui_protocol::methods::MESSAGE_PERSISTED)
+            Some("projection/envelope")
         );
 
         abort_live_forwarders(&forwarders, &ledger).await;
@@ -49832,7 +49190,7 @@ ignore = []
         // (LIVE_BROADCAST_CAPACITY = 256) so the receiver lags.
         let live_rx = ledger.subscribe(&session_id);
         for _ in 0..512 {
-            ledger.append_notification(message_persisted_for(&session_id));
+            ledger.append_notification(assistant_persisted_v2_for(&session_id));
         }
 
         // Now install the forwarder — its first recv() will see
@@ -49843,7 +49201,7 @@ ignore = []
             session_id.clone(),
             0,
             ws.connection_id(),
-            features_with_message_persisted(true),
+            features_for_v2_delivery(),
             None,
             live_rx,
             forwarders.clone(),
@@ -49851,15 +49209,12 @@ ignore = []
         .await;
 
         // A fresh append after lag must be delivered.
-        ledger.append_notification(message_persisted_for(&session_id));
+        ledger.append_notification(assistant_persisted_v2_for(&session_id));
         let frame = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
             .await
             .expect("post-lag frame must arrive — forwarder kept pumping")
             .expect("ws still open");
-        assert_eq!(
-            frame_method(&frame).as_deref(),
-            Some(octos_core::ui_protocol::methods::MESSAGE_PERSISTED)
-        );
+        assert_eq!(frame_method(&frame).as_deref(), Some("projection/envelope"));
 
         abort_live_forwarders(&forwarders, &ledger).await;
     }

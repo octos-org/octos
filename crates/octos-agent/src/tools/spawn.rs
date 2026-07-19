@@ -493,30 +493,23 @@ pub struct BackgroundResultPayload {
     pub task_label: String,
     pub content: String,
     pub kind: BackgroundResultKind,
-    /// Media to attach to the persisted ledger row that mirrors this
-    /// completion (legacy `message/persisted` shape). For the
-    /// `NotConfigured` `send_file` fallback this stays `vec![]` because
-    /// each file already has its own per-file `message/persisted` row
-    /// — adding the same paths here would double-render attachments on
-    /// old clients that don't negotiate `event.spawn_complete.v1`.
-    /// For the `Satisfied` workspace-contract path it carries
-    /// `output_files` directly (no separate per-file rows on that path).
+    /// Media to retain on the durable transcript row for this completion.
+    /// For the `NotConfigured` `send_file` fallback this stays `vec![]`
+    /// because each file already has its own per-file transcript companion.
+    /// For the `Satisfied` workspace-contract path it carries `output_files`
+    /// directly (no separate per-file rows on that path).
     pub media: Vec<String>,
-    /// M10 Phase 5a: media to surface ONLY on the `turn/spawn_complete`
-    /// envelope, never on the persisted row.
+    /// M10 Phase 5a: media to surface on the canonical v2
+    /// background-child envelope, independently of the transcript row.
     ///
-    /// Why two fields: dual-negotiated clients (capability
-    /// `event.spawn_complete.v1`) receive the envelope; the
-    /// per-file `message/persisted` companions are filtered as
-    /// `MessagePersistedSource::Background`. So the envelope MUST
-    /// carry the file URLs or the new client renders a text-only bubble.
-    /// Old clients DO see the per-file rows; if the envelope's media
-    /// also leaked into the persisted row they'd double-render.
-    /// Splitting persist-media from envelope-media keeps the two wire
-    /// shapes independent.
+    /// Why two fields: the per-file companions remain durable transcript
+    /// data but are suppressed from UI projection; the child envelope MUST
+    /// carry the file URLs or the completion renders as text-only. Splitting
+    /// transcript media from projection media keeps the durable record and
+    /// canonical presentation independent.
     ///
-    /// Empty `Vec` (default) means "no envelope-only attachments";
-    /// the envelope falls back to `media` for compatibility with the
+    /// Empty `Vec` (default) means "no projection-only attachments";
+    /// the canonical child envelope falls back to `media` for the
     /// `Satisfied` path. Populated explicitly only by the
     /// `NotConfigured` success branch in `execution.rs`.
     pub envelope_media: Vec<String>,

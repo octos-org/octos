@@ -360,6 +360,8 @@ async fn should_accumulate_conversation_history_across_multiple_prompts() {
 fn should_emit_only_valid_json_on_stdout_when_running_acp() {
     use std::io::{BufRead, BufReader, Write};
     use std::process::{Command, Stdio};
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
 
     let tmp = tempfile::tempdir().expect("tempdir");
     // Fully isolate the child from the developer/CI account: its data, config,
@@ -402,24 +404,37 @@ fn should_emit_only_valid_json_on_stdout_when_running_acp() {
         .unwrap();
     stdin.flush().unwrap();
 
-    // Read stdout in a thread; stop after a couple of responses or a short wait.
+    // Read stdout in a thread and report each response promptly. Waiting for
+    // a response rather than sleeping for a fixed startup interval avoids
+    // racing a cold binary start on loaded CI workers.
     let stdout = child.stdout.take().unwrap();
+    let (line_tx, line_rx) = mpsc::channel();
     let handle = std::thread::spawn(move || {
-        let mut lines = Vec::new();
         for line in BufReader::new(stdout).lines().map_while(Result::ok) {
-            if !line.trim().is_empty() {
-                lines.push(line);
-            }
-            if lines.len() >= 2 {
+            if !line.trim().is_empty() && line_tx.send(line).is_err() {
                 break;
             }
         }
-        lines
     });
-    std::thread::sleep(std::time::Duration::from_secs(3));
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut lines = Vec::new();
+    while lines.len() < 2 {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        match line_rx.recv_timeout(remaining) {
+            Ok(line) => lines.push(line),
+            Err(mpsc::RecvTimeoutError::Timeout | mpsc::RecvTimeoutError::Disconnected) => {
+                break;
+            }
+        }
+    }
     let _ = child.kill();
     let _ = child.wait(); // reap the child so it can't linger as a zombie
-    let lines = handle.join().unwrap_or_default();
+    drop(line_rx);
+    let _ = handle.join();
 
     assert!(
         !lines.is_empty(),

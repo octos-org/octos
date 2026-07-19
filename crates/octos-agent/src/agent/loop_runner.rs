@@ -1732,14 +1732,10 @@ impl Agent {
                                         // branch synthesises `content` as the
                                         // "Background work started for `<tool>`..."
                                         // acknowledgement. The API persist site
-                                        // reads this flag and tags the wire
-                                        // envelope for the synthesised row with
-                                        // `MessagePersistedSource::Background`,
-                                        // which the existing capability filter
-                                        // for `event.spawn_complete.v1` clients
-                                        // suppresses. Legacy clients (without
-                                        // the capability) still see the ack as
-                                        // an assistant row — backward-compatible.
+                                        // reads this flag and skips that
+                                        // synthesized row entirely; the actual
+                                        // background result later emits its
+                                        // canonical v2 child envelope.
                                         synthesized_from_spawn_only: true,
                                 pending_approval: None,
                                     });
