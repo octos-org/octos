@@ -5328,11 +5328,17 @@ fn group_status_for_goal(status: &str) -> GroupStatus {
         "active" => GroupStatus::Running,
         // Reached the objective (or was cleared) — a clean terminal.
         "complete" | "completed" | "cleared" => GroupStatus::Completed,
-        // Circuit-breaker impasse — the goal failed to make progress.
-        "blocked" => GroupStatus::Failed,
-        // Stopped short of the objective (budget cap or user pause): a
-        // non-running, non-failure stop. Anything unrecognised is treated
-        // conservatively as stopped rather than Running.
+        // Codex MED (lossy mapping): map to PRECISE non-running states rather
+        // than collapsing a paused goal onto `Cancelled` or a blocked goal
+        // onto `Failed`, both of which misrepresent the goal on a roster that
+        // renders GroupStatus. A blocked goal is a recoverable impasse, a
+        // budget-capped goal stopped on its cap, and a paused goal is a
+        // user hold — none of which is a hard failure or a cancellation.
+        "blocked" => GroupStatus::Blocked,
+        "budget_limited" => GroupStatus::BudgetLimited,
+        "paused" => GroupStatus::Paused,
+        // Anything unrecognised is treated conservatively as a stopped,
+        // non-running state rather than Running.
         _ => GroupStatus::Cancelled,
     }
 }
@@ -9312,31 +9318,39 @@ mod tests {
         );
     }
 
-    /// Task 1 (mini5 seq-454 "orchestrating while idle"): the supervised
-    /// group status must MIRROR the goal's real lifecycle status. Only an
-    /// `active` goal is `Running`; a `budget_limited` / `paused` / `blocked`
-    /// goal must read as a non-Running, stopped status so the roster does
-    /// not render "Orchestrating…" on an idle session.
+    /// Task 1 (mini5 seq-454 "orchestrating while idle") + codex MED (lossy
+    /// mapping): the supervised group status must MIRROR the goal's real
+    /// lifecycle status. Only an `active` goal is `Running`; a `budget_limited`
+    /// / `paused` / `blocked` goal must read as a PRECISE non-Running state so
+    /// the roster neither renders "Orchestrating…" on an idle session nor
+    /// mislabels a paused goal as cancelled or a blocked goal as failed.
     #[test]
     fn group_status_mirrors_goal_lifecycle_status() {
         assert_eq!(group_status_for_goal("active"), GroupStatus::Running);
         assert_eq!(group_status_for_goal("complete"), GroupStatus::Completed);
         assert_eq!(group_status_for_goal("cleared"), GroupStatus::Completed);
-        assert_eq!(group_status_for_goal("blocked"), GroupStatus::Failed);
-        // The core regression: a budget-limited / paused goal is NOT Running.
-        for stopped in ["budget_limited", "paused"] {
-            let status = group_status_for_goal(stopped);
+        // Precise non-running states, not lossy Failed/Cancelled collapses.
+        assert_eq!(group_status_for_goal("blocked"), GroupStatus::Blocked);
+        assert_eq!(
+            group_status_for_goal("budget_limited"),
+            GroupStatus::BudgetLimited
+        );
+        assert_eq!(group_status_for_goal("paused"), GroupStatus::Paused);
+        // The core regression across every non-active state: NOT Running.
+        for stopped in ["budget_limited", "paused", "blocked"] {
             assert_ne!(
-                status,
+                group_status_for_goal(stopped),
                 GroupStatus::Running,
                 "{stopped} goal must not read as orchestrating/Running"
             );
         }
-        assert_eq!(
-            group_status_for_goal("budget_limited"),
-            GroupStatus::Cancelled
-        );
-        assert_eq!(group_status_for_goal("paused"), GroupStatus::Cancelled);
+        // A paused goal must not masquerade as a cancellation, and a blocked
+        // goal must not masquerade as a hard failure.
+        assert_ne!(group_status_for_goal("paused"), GroupStatus::Cancelled);
+        assert_ne!(group_status_for_goal("blocked"), GroupStatus::Failed);
+        // Unknown states fall back conservatively to a stopped, non-running
+        // status.
+        assert_eq!(group_status_for_goal("wat"), GroupStatus::Cancelled);
     }
 
     /// Task 2 (mini5 seq-454 over-budget re-activation): a goal that has
