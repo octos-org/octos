@@ -3018,8 +3018,31 @@ impl AgentOrchestrator for InProcessAgentOrchestrator {
                 true,
             ));
         }
+        // Zero-budget consistency (codex LOW): a token_budget of 0 is NOT
+        // "unlimited" — `RuntimeBudget::is_exhausted()` (used >= max) and
+        // `goal_total_continuation_budget` both treat 0 as immediately
+        // exhausted, and `GOAL_DEFAULT_TOKEN_BUDGET` is a finite 2M, so the
+        // code's single intended meaning of 0 is "no runnable budget". An
+        // `active`/`Running` goal that can never fire is a contradiction, so
+        // reject 0 at set time rather than admit that state. This also keeps
+        // the over-budget guards below well-defined (budget > 0 everywhere).
+        if request.token_budget == Some(0) {
+            return Err(autonomy_error(
+                kinds::GOAL_INVALID_STATE,
+                "goal token budget must be greater than zero",
+                Some(&request.session_id),
+                Some(&request.profile_id),
+                None,
+                true,
+            ));
+        }
         let now = now_ms();
         let mut state = self.state();
+        // Fix A: an over-budget mutation that would leave the goal `active`
+        // must instead flip it to `budget_limited` and emit the wrap-up. We
+        // stage the wrap-up prompt here and enqueue it AFTER the mutable
+        // `goal` borrow ends (the wrap-up enqueue needs `&mut state`).
+        let mut pending_wrap_up: Option<String> = None;
         let goal = if let Some(goal) = state.goals.get_mut(&request.session_id) {
             if goal.profile_id != request.profile_id {
                 return Err(autonomy_error(
@@ -3081,6 +3104,30 @@ impl AgentOrchestrator for InProcessAgentOrchestrator {
                     goal.rate_window_count = 0;
                 }
             }
+            // Fix A (codex HIGH): enforce the over-budget invariant on EVERY
+            // mutation of an existing goal, not just non-active → active. The
+            // reactivation guard above only rejects a transition INTO active;
+            // an ALREADY-active goal could still be left `active` here after
+            // the user lowers its budget below tokens already used (status
+            // "active" or omitted), persisting as `Running` and emitting no
+            // wrap-up — recreating "orchestrating while idle". If the resulting
+            // record would be active but has spent its (possibly just-lowered)
+            // budget, flip it to `budget_limited` and enqueue the wrap-up, the
+            // same terminal the post-turn accountant reaches.
+            if goal.status == "active"
+                && goal.token_budget > 0
+                && goal.tokens_used >= goal.token_budget
+            {
+                goal.status = "budget_limited".to_owned();
+                if !goal.wrap_up_emitted {
+                    goal.wrap_up_emitted = true;
+                    pending_wrap_up = Some(goal_budget_wrap_up_prompt(
+                        &goal.goal_id,
+                        goal.tokens_used,
+                        goal.token_budget,
+                    ));
+                }
+            }
             goal.clone()
         } else {
             state.next_goal_seq += 1;
@@ -3106,6 +3153,21 @@ impl AgentOrchestrator for InProcessAgentOrchestrator {
         };
         if goal.status == "active" {
             enqueue_goal_continuation(&mut state, &request.session_id, &request.profile_id, &goal);
+        }
+        // Fix A: if the mutation crossed the goal over its budget, enqueue the
+        // one-shot wrap-up now that the mutable `goal` borrow is released. The
+        // goal is `budget_limited` here, so the active-continuation branch
+        // above did NOT fire — the only queued turn is this summarize-and-stop.
+        if let Some(prompt) = pending_wrap_up {
+            enqueue_goal_wrap_up(
+                &mut state,
+                &request.session_id,
+                &request.profile_id,
+                &goal.goal_id,
+                &goal.objective,
+                prompt,
+                SystemTime::now(),
+            );
         }
         persist_goal_state(&state, &request.session_id, &goal, false);
         Ok(json!({
@@ -9310,6 +9372,146 @@ mod tests {
             .expect("raising the budget above tokens_used resumes the goal");
         assert_eq!(resumed["goal"]["status"], json!("active"));
         assert_eq!(resumed["goal"]["token_budget"].as_u64(), Some(5_000));
+    }
+
+    /// Fix A (codex HIGH): the reactivation guard only covers non-active →
+    /// active. An ALREADY-active goal whose budget is lowered below the tokens
+    /// already used (status "active" or omitted) must NOT stay active — it
+    /// would persist as `Running` and emit no wrap-up ("orchestrating while
+    /// idle"). The mutation must flip it to `budget_limited` and enqueue the
+    /// summarize-and-stop wrap-up.
+    #[test]
+    fn set_goal_flips_active_goal_to_budget_limited_when_budget_lowered_below_used() {
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let session_id = SessionKey::with_profile("tenant-a", "api", "goal-lower-budget");
+        orchestrator
+            .set_goal(GoalSetRequest {
+                session_id: session_id.clone(),
+                profile_id: "tenant-a".into(),
+                objective: "sprawling build".into(),
+                status: Some("active".into()),
+                token_budget: Some(10_000),
+                transition_actor: None,
+            })
+            .expect("set active goal");
+        // Spend 6k of the 10k budget — still under, still legitimately active.
+        orchestrator.force_goal_tokens_used_for_test(&session_id, 6_000);
+
+        // Lower the budget BELOW tokens_used while keeping status active. The
+        // guard for non-active→active does not fire (prior status is active),
+        // so without Fix A the goal would stay `active` and over budget.
+        let updated = orchestrator
+            .set_goal(GoalSetRequest {
+                session_id: session_id.clone(),
+                profile_id: "tenant-a".into(),
+                objective: "sprawling build".into(),
+                status: Some("active".into()),
+                token_budget: Some(4_000),
+                transition_actor: Some("user".into()),
+            })
+            .expect("lowering the budget is accepted but flips the status");
+        assert_eq!(
+            updated["goal"]["status"],
+            json!("budget_limited"),
+            "an over-budget active goal must flip to budget_limited, not stay active"
+        );
+        assert_eq!(
+            orchestrator.goal_status_for_test(&session_id).as_deref(),
+            Some("budget_limited"),
+            "the persisted record must be budget_limited"
+        );
+
+        // A wrap-up (summarize-and-stop) turn must be queued, and NO fresh
+        // active continuation may be schedulable for the now budget_limited
+        // goal. Drain is filtered by `pending_continuation_is_schedulable`, so
+        // any stale GoalContinue is dropped — the wrap-up is the only turn.
+        let drained = orchestrator.drain_ready_continuations_for_session(
+            &session_id,
+            "tenant-a",
+            MasterContinuationRuntimeState::idle(),
+            usize::MAX,
+        );
+        let wrap_ups: Vec<_> = drained
+            .iter()
+            .filter(|c| matches!(c.reason, MasterContinuationReason::GoalWrapUp))
+            .collect();
+        assert_eq!(
+            wrap_ups.len(),
+            1,
+            "exactly one wrap-up turn must be queued after the over-budget flip"
+        );
+        assert!(
+            !drained
+                .iter()
+                .any(|c| matches!(c.reason, MasterContinuationReason::GoalContinue)),
+            "no active continuation may be scheduled for a budget_limited goal"
+        );
+        let prompt = master_continuation_prompt(wrap_ups[0]);
+        assert!(
+            prompt.contains("stop starting") || prompt.contains("Summarize"),
+            "wrap-up prompt must be summarize-and-stop: {prompt}"
+        );
+
+        // Idempotence: re-issuing the same lowered-budget request must not
+        // enqueue a SECOND wrap-up (the wrap_up_emitted latch holds).
+        orchestrator
+            .set_goal(GoalSetRequest {
+                session_id: session_id.clone(),
+                profile_id: "tenant-a".into(),
+                objective: "sprawling build".into(),
+                status: None,
+                token_budget: Some(4_000),
+                transition_actor: Some("user".into()),
+            })
+            .expect("a no-op re-issue is accepted");
+        let again = orchestrator.drain_ready_continuations_for_session(
+            &session_id,
+            "tenant-a",
+            MasterContinuationRuntimeState::idle(),
+            usize::MAX,
+        );
+        assert!(
+            !again
+                .iter()
+                .any(|c| matches!(c.reason, MasterContinuationReason::GoalWrapUp)),
+            "no second wrap-up may be queued once one was already emitted"
+        );
+    }
+
+    /// Codex LOW (zero-budget consistency): a `token_budget` of 0 is not a
+    /// legitimate "unlimited" budget — it would produce an `active` goal that
+    /// `is_exhausted()` denies immediately. `set_goal` must reject it so the
+    /// only meaning of 0 in the system is "invalid, never set".
+    #[test]
+    fn set_goal_rejects_zero_token_budget() {
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let session_id = SessionKey::with_profile("tenant-a", "api", "goal-zero");
+        let err = orchestrator
+            .set_goal(GoalSetRequest {
+                session_id: session_id.clone(),
+                profile_id: "tenant-a".into(),
+                objective: "cannot run on zero".into(),
+                status: Some("active".into()),
+                token_budget: Some(0),
+                transition_actor: None,
+            })
+            .expect_err("a zero token budget must be rejected");
+        assert!(
+            err.message.contains("greater than zero"),
+            "explicit zero-budget reason: {}",
+            err.message
+        );
+        // No goal must have been created by the rejected request.
+        assert_eq!(orchestrator.goal_status_for_test(&session_id), None);
+        // The model-facing create path (which delegates to set_goal) rejects
+        // it too, surfacing the message as a plain string.
+        let model_err = orchestrator
+            .model_create_goal(&session_id, "tenant-a", "cannot run on zero", Some(0))
+            .expect_err("model create must reject a zero budget");
+        assert!(
+            model_err.contains("greater than zero"),
+            "model-facing zero-budget reason: {model_err}"
+        );
     }
 
     /// #1697 — the objective is USER data: it must be escaped and fenced in
