@@ -231,9 +231,9 @@ pub(super) fn emit_file_attached(
 /// `spawn_only` background tool's `BackgroundResultPayload` lands on
 /// the AppUI WS path.
 ///
-/// Coalesces the payload's persist-media (`media`, lives on the
-/// `message/persisted` row) and envelope-only-media (`envelope_media`,
-/// surfaced on the `turn/spawn_complete` envelope) into a single
+/// Coalesces the payload's persisted-row media (`media`) and
+/// projection-only media (`envelope_media`, surfaced on the canonical
+/// background-child envelope) into a single
 /// deduplicated stream of paths — clients receive ONE `file/attached`
 /// per unique artefact regardless of which path source carried it. A
 /// path that appears in both sources still emits exactly one envelope.
@@ -241,8 +241,8 @@ pub(super) fn emit_file_attached(
 /// Defensive against the production failure mode the slides soak
 /// captured (2026-05-24): PPTX artefacts that landed on disk and were
 /// verified by the workspace contract never surfaced a clickable
-/// button on the SPA because `turn/spawn_complete` and the
-/// `message/persisted` row's `media` field both required the SPA's
+/// button on the SPA because the old background completion carriers
+/// both required the SPA's
 /// content-bearing-envelope reducers to fire correctly. A dedicated
 /// per-file envelope is the redundant signal that keeps the user-
 /// visible delivery resilient against placement / sticky-thread bugs
@@ -250,7 +250,7 @@ pub(super) fn emit_file_attached(
 ///
 /// Best-effort: ledger append failures are logged inside the ledger
 /// and do not propagate. Callers MUST run this after the persist /
-/// `turn/spawn_complete` block so the placement context (turn_id,
+/// canonical background-child projection block so the placement context (turn_id,
 /// session_id) is stable. No-op when both source lists are empty.
 ///
 /// **P0-A wire-gap (2026-05-26):** the helper strips any `#<topic>`
@@ -428,29 +428,26 @@ fn mime_from_path(path: &str) -> Option<String> {
 /// The `BackgroundResultPayload` shape carries TWO media lists by design
 /// (see `BackgroundResultPayload::envelope_media` doc):
 ///
-/// - `media` lands on the `message/persisted` row for the completion
-///   (legacy carrier old clients render). Populated by the contract
+/// - `media` lands on the durable completion row. Populated by the contract
 ///   `Satisfied` path with `output_files`; left empty by the
 ///   `NotConfigured` `send_file` fallback because each delivered file
-///   already has its own per-file `message/persisted` companion row.
-/// - `envelope_media` surfaces ONLY on the `turn/spawn_complete`
-///   envelope (the wire signal dual-negotiated clients consume after
-///   they suppress the per-file companions). Populated by the
+///   already has its own per-file durable companion row.
+/// - `envelope_media` surfaces on the canonical background-child
+///   envelope. Populated by the
 ///   `NotConfigured` `send_file` fallback with `sent_files`; left
 ///   empty by the `Satisfied` path because `media` already carries the
 ///   list.
 ///
-/// The two carriers were split so the same producer can serve old and
-/// new clients without one shape double-rendering the artefacts the
-/// other already covered. The cost is that EVERY consumer that needs
+/// The two media lists let the producer preserve durable transcript data
+/// while placing artifacts on the canonical projection. The cost is that EVERY consumer that needs
 /// to render attachments has to coalesce the two: pre-helper, the
 /// `BackgroundResultSender` closure inlined an `if envelope_media
 /// is_empty { media } else { envelope_media }` fallback, and a future
 /// caller that forgot to mirror that fallback would silently drop
 /// half of the live spawn-only completion shapes.
 ///
-/// This helper centralises the fallback so the `turn/spawn_complete`
-/// envelope builder, the `emit_files_attached_from_background` caller,
+/// This helper centralises the fallback so the canonical child-envelope
+/// builder, the `emit_files_attached_from_background` caller,
 /// and future consumers all see the same effective list. Returning a
 /// fresh `Vec<String>` (rather than a borrowed slice) keeps callers
 /// free to retain ownership when both sources outlive the call site.
@@ -458,7 +455,7 @@ fn mime_from_path(path: &str) -> Option<String> {
 /// The slides soak round-13 (2026-05-25) confirmed the production
 /// shape: `mofa_slides` enters the `Satisfied` branch with
 /// `media: [deck.pptx]` and `envelope_media: []`. Without the
-/// fallback, `turn/spawn_complete` and `file/attached` consumers both
+/// fallback, background-child and `file/attached` consumers both
 /// see an empty list and the SPA never renders a download button.
 pub(super) fn effective_envelope_media(payload: &BackgroundResultPayload) -> Vec<String> {
     if payload.envelope_media.is_empty() {
@@ -1071,15 +1068,12 @@ mod tests {
 
     /// NotConfigured-with-files shape — `execution.rs` ran the per-file
     /// `send_file` retry loop and built the payload with `media: vec![]`
-    /// (no persist-media; per-file companion rows already cover the
-    /// `message/persisted` carrier) and `envelope_media:
+    /// (no persist-media; per-file companion rows already exist) and `envelope_media:
     /// sent_files.clone()`. The fallback is a no-op in this shape
     /// (envelope_media already non-empty) and the helper must still emit
     /// one `file/attached` per delivered file. The per-file
-    /// `message/persisted` companion rows the `send_file` consumer
-    /// already committed are out of scope here — the new envelope is the
-    /// dedicated wire signal dual-negotiated clients consume regardless
-    /// of those companions.
+    /// durable companion rows the `send_file` consumer already committed are
+    /// out of scope here — the projection is the dedicated wire signal.
     #[test]
     fn should_emit_file_attached_for_not_configured_send_file_shape() {
         let pptx_path =
@@ -1087,10 +1081,9 @@ mod tests {
         let payload = build_payload(
             "mofa_slides",
             "tc-slides-notconfigured",
-            // NotConfigured `send_file` fallback: media empty, sent_files
-            // surface only on envelope_media so the `message/persisted`
-            // row stays byte-identical to the legacy "spawn-ack with
-            // text only" shape old clients render.
+            // NotConfigured `send_file` fallback: media is empty and
+            // sent_files surface only on envelope_media for the canonical
+            // background-child projection.
             vec![],
             vec![pptx_path.clone()],
         );
