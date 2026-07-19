@@ -406,7 +406,7 @@ impl GoalRuntime {
             goal_id: self.goal_id.clone(),
             reason: DenyReason::ExhaustedBudget,
             wrap_up_prompt: format!(
-                "Goal `{}` has exhausted its continuation budget. Summarize the current state, call out remaining work, and stop starting new work.",
+                "Goal `{}` has exhausted its continuation budget. Summarize the current state, call out remaining work, and stop starting new work. Then tell the user how to resume: reply `/goal <objective> --budget <N>` to raise the budget and continue, or `/goal stop` to end the goal.",
                 self.goal_id
             ),
         })
@@ -1323,6 +1323,18 @@ mod tests {
         assert_eq!(resolution.reason, DenyReason::ExhaustedBudget);
         assert!(resolution.wrap_up_prompt.contains("exhausted"));
         assert!(resolution.wrap_up_prompt.contains("stop starting new work"));
+        // The wrap-up must hand the user an actionable resume path, not just
+        // stop silently (mini5 symptom).
+        assert!(
+            resolution.wrap_up_prompt.contains("/goal"),
+            "wrap-up must tell the user how to resume: {}",
+            resolution.wrap_up_prompt
+        );
+        assert!(
+            resolution.wrap_up_prompt.contains("--budget"),
+            "wrap-up must mention raising the budget: {}",
+            resolution.wrap_up_prompt
+        );
     }
 
     #[test]
