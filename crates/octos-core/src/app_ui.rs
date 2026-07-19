@@ -272,7 +272,6 @@ mod tests {
                 text: "hello".into(),
             }],
             media: Vec::new(),
-            voice_transcript: None,
             topic: None,
             rewrite_for: None,
             reasoning_effort: None,

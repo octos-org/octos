@@ -31,17 +31,6 @@ pub(crate) fn audio_paths(media: &[String]) -> Vec<String> {
         .collect()
 }
 
-/// Transcribe one already-local audio file, preserving engine errors for API
-/// callers that need to distinguish "no speech" from "ASR unavailable".
-pub(crate) async fn transcribe_audio_path(
-    path: &Path,
-    language: Option<&str>,
-) -> eyre::Result<String> {
-    let client =
-        OminixClient::new(&ominix_base_url()).with_language(language.map(ToOwned::to_owned));
-    client.transcribe(path).await
-}
-
 /// 转写 turn 内全部音频媒体。无音频时返回空 vec（调用方据此判定是否"语音轮"）。
 /// 单条转写失败只记日志并跳过，不让整轮失败。
 // TODO(later-tasks): remove dead_code allow once callers are wired up.
@@ -54,10 +43,12 @@ pub(crate) async fn transcribe_audio_media(
     if audios.is_empty() {
         return Vec::new();
     }
+    let client =
+        OminixClient::new(&ominix_base_url()).with_language(language.map(|s| s.to_string()));
     let asr_t = std::time::Instant::now();
     let mut out = Vec::new();
     for path in audios {
-        match transcribe_audio_path(Path::new(&path), language).await {
+        match client.transcribe(Path::new(&path)).await {
             Ok(text) if !text.trim().is_empty() => out.push(text),
             Ok(_) => tracing::warn!(audio = %path, "voice_turn: empty transcript, skipping"),
             Err(e) => tracing::warn!(audio = %path, error = %e, "voice_turn: transcription failed"),
@@ -69,17 +60,6 @@ pub(crate) async fn transcribe_audio_media(
         now_ms()
     );
     out
-}
-
-/// Normalize a candidate transcript before it is allowed to commit a barge-in.
-/// Punctuation-only ASR output is treated as no speech so fan/keyboard noise
-/// cannot cancel a valid incumbent turn.
-pub(crate) fn meaningful_transcript(text: &str) -> Option<String> {
-    let trimmed = text.trim();
-    trimmed
-        .chars()
-        .any(char::is_alphanumeric)
-        .then(|| trimmed.to_owned())
 }
 
 /// Whether a char is safe to hand to TTS: letters/digits (incl. CJK),
@@ -1245,17 +1225,6 @@ mod voice_error_speech_tests {
 mod tests {
     use super::*;
     use crate::config::CloudTtsConfig;
-
-    #[test]
-    fn should_accept_spoken_text_but_reject_empty_or_punctuation_only_asr() {
-        assert_eq!(
-            meaningful_transcript("  你好。  ").as_deref(),
-            Some("你好。")
-        );
-        assert_eq!(meaningful_transcript(" yes ").as_deref(), Some("yes"));
-        assert_eq!(meaningful_transcript("   "), None);
-        assert_eq!(meaningful_transcript("，……！"), None);
-    }
 
     #[test]
     fn should_want_cloud_for_auto_cloud_and_legacy_volcano() {

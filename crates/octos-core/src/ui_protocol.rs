@@ -1851,13 +1851,6 @@ pub struct TurnStartParams {
     /// restores attachment delivery on the WS path.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub media: Vec<FileRef>,
-    /// Transcript already validated by the authenticated ASR-only candidate
-    /// endpoint. Voice clients use this to commit a transactional barge-in
-    /// without running the same audio through ASR a second time. It remains a
-    /// regular user-supplied prompt value; the attached audio is still kept as
-    /// the turn's media evidence.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub voice_transcript: Option<String>,
     /// UPCR-2026-015 (M9-β-1): optional sub-topic suffix that scopes
     /// this send to a per-topic session bucket (`<session>#<topic>`
     /// shape). Mirrors the legacy SSE `topic` query/body field. The
@@ -6739,7 +6732,6 @@ mod tests {
             turn_id: TurnId::new(),
             input: vec![],
             media: vec![],
-            voice_transcript: None,
             topic: None,
             rewrite_for: None,
             reasoning_effort: Some(ReasoningEffortLevel::Max),
@@ -6778,7 +6770,6 @@ mod tests {
             turn_id: TurnId(Uuid::from_u128(1)),
             input: vec![],
             media: vec![],
-            voice_transcript: None,
             topic: None,
             rewrite_for: None,
             reasoning_effort: None,
@@ -7676,7 +7667,6 @@ mod tests {
                 text: "hello".into(),
             }],
             media: Vec::new(),
-            voice_transcript: None,
             topic: None,
             rewrite_for: None,
             reasoning_effort: None,
@@ -8435,7 +8425,6 @@ mod tests {
                 text: "hello".into(),
             }],
             media: Vec::new(),
-            voice_transcript: None,
             topic: None,
             rewrite_for: None,
             reasoning_effort: None,
@@ -8503,7 +8492,6 @@ mod tests {
                     size_bytes: 32_768,
                 },
             ],
-            voice_transcript: None,
             topic: None,
             rewrite_for: None,
             reasoning_effort: None,
@@ -8533,34 +8521,6 @@ mod tests {
         assert_eq!(decoded, command);
     }
 
-    #[test]
-    fn turn_start_round_trips_with_prevalidated_voice_transcript() {
-        let params = TurnStartParams {
-            session_id: SessionKey("local:voice".into()),
-            turn_id: TurnId(Uuid::from_u128(22)),
-            input: Vec::new(),
-            media: vec![FileRef {
-                path: "/tmp/utterance.wav".into(),
-                mime: "audio/wav".into(),
-                size_bytes: 1024,
-            }],
-            voice_transcript: Some("继续说下一点".into()),
-            topic: None,
-            rewrite_for: None,
-            reasoning_effort: None,
-            live_video: false,
-        };
-        let wire = serde_json::to_value(&params).unwrap();
-        assert_eq!(wire["voice_transcript"], json!("继续说下一点"));
-        assert_eq!(
-            serde_json::from_value::<TurnStartParams>(wire)
-                .unwrap()
-                .voice_transcript
-                .as_deref(),
-            Some("继续说下一点")
-        );
-    }
-
     /// UPCR-2026-015 (M9-β-1): `topic` field surfaces as a flat string
     /// on the wire (parallel to `task/list.topic`). The server folds
     /// it into the resolved `SessionKey` before scope validation.
@@ -8573,7 +8533,6 @@ mod tests {
                 text: "build me a deck".into(),
             }],
             media: Vec::new(),
-            voice_transcript: None,
             topic: Some("slides".into()),
             rewrite_for: None,
             reasoning_effort: None,
@@ -8615,7 +8574,6 @@ mod tests {
                 text: "edited prompt".into(),
             }],
             media: Vec::new(),
-            voice_transcript: None,
             topic: None,
             rewrite_for: Some("cmid-queued-original".into()),
             reasoning_effort: None,
@@ -8662,7 +8620,6 @@ mod tests {
                 mime: "image/png".into(),
                 size_bytes: 8192,
             }],
-            voice_transcript: None,
             topic: Some("research".into()),
             rewrite_for: Some("cmid-original".into()),
             reasoning_effort: None,

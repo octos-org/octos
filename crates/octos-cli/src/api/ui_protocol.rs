@@ -12707,7 +12707,6 @@ async fn maybe_spawn_appui_master_continuation_runner(
             text: master_continuation_prompt(&continuation),
         }],
         media: Vec::new(),
-        voice_transcript: None,
         topic: None,
         rewrite_for: None,
         reasoning_effort: None,
@@ -22453,17 +22452,8 @@ async fn run_standalone_turn(
         })
         .collect();
     tracing::debug!(media = ?asr_media, "voice_turn: STT input media");
-    let voice_transcripts = params
-        .voice_transcript
-        .as_deref()
-        .and_then(crate::api::voice_turn::meaningful_transcript)
-        .map(|transcript| vec![transcript])
-        .unwrap_or_else(Vec::new);
-    let voice_transcripts = if voice_transcripts.is_empty() {
-        crate::api::voice_turn::transcribe_audio_media(&asr_media, Some(asr_language)).await
-    } else {
-        voice_transcripts
-    };
+    let voice_transcripts =
+        crate::api::voice_turn::transcribe_audio_media(&asr_media, Some(asr_language)).await;
     let had_audio_input = !voice_transcripts.is_empty();
     tracing::debug!(
         transcripts = voice_transcripts.len(),
@@ -34228,7 +34218,6 @@ ignore = []
                 text: "hello".into(),
             }],
             media: Vec::new(),
-            voice_transcript: None,
             topic: None,
             rewrite_for: None,
             reasoning_effort: None,
@@ -40483,7 +40472,6 @@ ignore = []
                 text: "hello".into(),
             }],
             media: Vec::new(),
-            voice_transcript: None,
             topic: Some("coding".into()),
             live_video: false,
             reasoning_effort: None,
@@ -42491,7 +42479,6 @@ ignore = []
                 text: "m9 slow fixture".into(),
             }],
             media: Vec::new(),
-            voice_transcript: None,
             topic: None,
             rewrite_for: None,
             reasoning_effort: None,
