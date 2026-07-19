@@ -503,7 +503,7 @@ mod tests {
     #[test]
     fn profile_monitor_overrides_fall_back_to_system_defaults() {
         let dir = tempfile::tempdir().unwrap();
-        let store = ProfileStore::open(dir.path()).unwrap();
+        let store = ProfileStore::open_unified(dir.path()).unwrap();
         store
             .save(&profile("alpha", Some(false), Some(true)))
             .unwrap();

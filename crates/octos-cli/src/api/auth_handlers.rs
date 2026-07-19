@@ -4162,7 +4162,7 @@ mod tests {
 
     fn temp_profile_store() -> (tempfile::TempDir, ProfileStore) {
         let dir = tempfile::tempdir().unwrap();
-        let ps = ProfileStore::open(dir.path()).unwrap();
+        let ps = ProfileStore::open_unified(dir.path()).unwrap();
         (dir, ps)
     }
 
@@ -4188,7 +4188,7 @@ mod tests {
     ) {
         let dir = tempfile::tempdir().unwrap();
         let user_store = Arc::new(UserStore::open(dir.path()).unwrap());
-        let profile_store = Arc::new(ProfileStore::open(dir.path()).unwrap());
+        let profile_store = Arc::new(ProfileStore::open_unified(dir.path()).unwrap());
         let allowlist_store = Arc::new(LoginAllowlistStore::open(dir.path()).unwrap());
         // Tests that exercise per-email send_code/verify branches expect the
         // SMTP precheck to pass; populate a synthetic config so the common

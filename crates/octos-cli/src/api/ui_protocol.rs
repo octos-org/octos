@@ -28516,7 +28516,9 @@ mod tests {
 
     fn local_profile_state(dir: &Path) -> AppState {
         AppState {
-            profile_store: Some(Arc::new(crate::profiles::ProfileStore::open(dir).unwrap())),
+            profile_store: Some(Arc::new(
+                crate::profiles::ProfileStore::open_unified(dir).unwrap(),
+            )),
             user_store: Some(Arc::new(crate::user_store::UserStore::open(dir).unwrap())),
             deployment_mode: crate::config::DeploymentMode::Local,
             // Solo profile creation is opt-in; the TUI/WS tests exercise the
@@ -32935,7 +32937,7 @@ ignore = []
             .expect("bootstrap profile");
             state.profiles.insert(id.to_string(), runtime);
         }
-        let store = Arc::new(crate::profiles::ProfileStore::open(&home).unwrap());
+        let store = Arc::new(crate::profiles::ProfileStore::open_unified(&home).unwrap());
         // Point the global default at "zeta" — NOT the first-sorted profile.
         store.set_default_profile("zeta").unwrap();
         state.profile_store = Some(store.clone());
@@ -32986,7 +32988,7 @@ ignore = []
         let home = tmp.path().join("home");
         let mut state = AppState::empty_for_tests();
         state.profile_store = Some(Arc::new(
-            crate::profiles::ProfileStore::open(&home).unwrap(),
+            crate::profiles::ProfileStore::open_unified(&home).unwrap(),
         ));
         let state = Arc::new(state);
         let cap = ConnectionUiFeatures::stdio_defaults();
@@ -33815,7 +33817,8 @@ ignore = []
     #[tokio::test]
     async fn memory_and_cron_rpc_methods_forward_rest_panel_bodies() {
         let dir = tempfile::tempdir().unwrap();
-        let profile_store = Arc::new(crate::profiles::ProfileStore::open(dir.path()).unwrap());
+        let profile_store =
+            Arc::new(crate::profiles::ProfileStore::open_unified(dir.path()).unwrap());
         let profile = panel_user_profile("tenant");
         profile_store.save(&profile).unwrap();
         let data_dir = profile_store.resolve_data_dir(&profile);
@@ -33998,7 +34001,8 @@ ignore = []
     #[tokio::test]
     async fn memory_rpc_methods_declare_truncation_when_over_budget() {
         let dir = tempfile::tempdir().unwrap();
-        let profile_store = Arc::new(crate::profiles::ProfileStore::open(dir.path()).unwrap());
+        let profile_store =
+            Arc::new(crate::profiles::ProfileStore::open_unified(dir.path()).unwrap());
         let profile = panel_user_profile("tenant");
         profile_store.save(&profile).unwrap();
         let data_dir = profile_store.resolve_data_dir(&profile);

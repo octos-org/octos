@@ -191,7 +191,7 @@ mod tests {
         let user_store = Arc::new(UserStore::open(dir).unwrap());
         let auth_manager = Arc::new(AuthManager::new(None, user_store.clone()));
         Arc::new(AppState {
-            profile_store: Some(Arc::new(ProfileStore::open(dir).unwrap())),
+            profile_store: Some(Arc::new(ProfileStore::open_unified(dir).unwrap())),
             user_store: Some(user_store),
             auth_manager: Some(auth_manager),
             deployment_mode: mode,

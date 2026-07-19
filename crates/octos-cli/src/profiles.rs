@@ -1156,24 +1156,70 @@ pub struct GatewaySettings {
 }
 
 /// Manages profile storage as individual JSON files.
+///
+/// The store has two roots so multi-instance stdio can share one profile
+/// REGISTRY while each instance owns private per-profile runtime state:
+///
+/// * `registry_dir` (`<registry_root>/profiles`) — where the `<id>.json`
+///   registry files are read/written/listed, plus config-like siblings under
+///   the registry parent (the `default-profile` pointer, platform-model
+///   allowlist). Shared across instances.
+/// * `data_profiles_dir` (`<data_root>/profiles`) — where [`resolve_data_dir`]
+///   roots the per-profile `<id>/data` runtime tree when a profile carries no
+///   explicit `data_dir` override. Per-instance.
+///
+/// [`resolve_data_dir`]: ProfileStore::resolve_data_dir
 pub struct ProfileStore {
-    profiles_dir: PathBuf,
+    /// Root for the `<id>.json` registry (shared/config-like).
+    registry_dir: PathBuf,
+    /// Root for the per-profile `<id>/data` runtime tree (per-instance).
+    data_profiles_dir: PathBuf,
 }
 
 impl ProfileStore {
-    /// Open (or create) the profile store at `data_dir/profiles/`.
-    pub fn open(data_dir: &Path) -> Result<Self> {
-        let profiles_dir = data_dir.join("profiles");
-        std::fs::create_dir_all(&profiles_dir).wrap_err_with(|| {
-            format!("failed to create profiles dir: {}", profiles_dir.display())
+    /// Open (or create) the profile store with a split registry / data root.
+    ///
+    /// * `registry_root` — the `<id>.json` registry lives under
+    ///   `registry_root/profiles`.
+    /// * `data_root` — the per-profile `<id>/data` fallback tree roots under
+    ///   `data_root/profiles`.
+    ///
+    /// When `registry_root == data_root` this is byte-identical to the legacy
+    /// single-root behavior; see [`ProfileStore::open_unified`].
+    pub fn open(registry_root: &Path, data_root: &Path) -> Result<Self> {
+        let registry_dir = registry_root.join("profiles");
+        std::fs::create_dir_all(&registry_dir).wrap_err_with(|| {
+            format!(
+                "failed to create profiles registry dir: {}",
+                registry_dir.display()
+            )
         })?;
-        Ok(Self { profiles_dir })
+        let data_profiles_dir = data_root.join("profiles");
+        std::fs::create_dir_all(&data_profiles_dir).wrap_err_with(|| {
+            format!(
+                "failed to create profiles data dir: {}",
+                data_profiles_dir.display()
+            )
+        })?;
+        Ok(Self {
+            registry_dir,
+            data_profiles_dir,
+        })
+    }
+
+    /// Open (or create) the profile store with a single unified root — the
+    /// registry and per-profile data both live under `data_dir/profiles/`.
+    ///
+    /// This preserves the pre-split behavior exactly (registry == data) and is
+    /// the right entry point for every caller that is not multi-instance-aware.
+    pub fn open_unified(data_dir: &Path) -> Result<Self> {
+        Self::open(data_dir, data_dir)
     }
 
     /// List all profiles sorted by name.
     pub fn list(&self) -> Result<Vec<UserProfile>> {
         let mut profiles = Vec::new();
-        let entries = match std::fs::read_dir(&self.profiles_dir) {
+        let entries = match std::fs::read_dir(&self.registry_dir) {
             Ok(entries) => entries,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(profiles),
             Err(e) => return Err(e).wrap_err("failed to read profiles directory"),
@@ -1359,12 +1405,12 @@ impl ProfileStore {
         if let Some(ref dir) = profile.data_dir {
             PathBuf::from(dir)
         } else {
-            self.profiles_dir.join(&profile.id).join("data")
+            self.data_profiles_dir.join(&profile.id).join("data")
         }
     }
 
     pub(crate) fn profile_path(&self, id: &str) -> PathBuf {
-        self.profiles_dir.join(format!("{id}.json"))
+        self.registry_dir.join(format!("{id}.json"))
     }
 
     /// Registration-id reservation policy (codex #1613 r6/r8), wired
@@ -1393,9 +1439,15 @@ impl ProfileStore {
         !matches!(self.get(id), Ok(Some(_)))
     }
 
-    /// Return the parent directory of the profiles dir (i.e. the octos home dir).
+    /// Return the parent directory of the registry profiles dir (i.e. the octos
+    /// home dir). This is the REGISTRY root — the config-like siblings that live
+    /// beside the profiles tree (the `default-profile` pointer, the platform-
+    /// model allowlist, and the `--octos-home` a spawned gateway opens its own
+    /// `ProfileStore` from) all resolve from here, so they stay shared across
+    /// per-instance runtime dirs. With a unified store this is the data dir,
+    /// exactly as before.
     pub fn octos_home_dir(&self) -> &Path {
-        self.profiles_dir.parent().unwrap_or(&self.profiles_dir)
+        self.registry_dir.parent().unwrap_or(&self.registry_dir)
     }
 
     /// Path to the persisted global default-profile pointer
@@ -2552,7 +2604,7 @@ mod tests {
         // the verify path's auto-create (get error → None → save)
         // would overwrite it with a default profile (r8 P2).
         let dir = tempfile::tempdir().unwrap();
-        let store = ProfileStore::open(dir.path()).unwrap();
+        let store = ProfileStore::open_unified(dir.path()).unwrap();
 
         // Absent: free for anyone.
         assert!(!store.id_reserved_for_registration("ghost", false));
@@ -2584,7 +2636,7 @@ mod tests {
     #[test]
     fn default_profile_pointer_round_trips_and_defaults_to_none() {
         let dir = tempfile::tempdir().unwrap();
-        let store = ProfileStore::open(dir.path()).unwrap();
+        let store = ProfileStore::open_unified(dir.path()).unwrap();
 
         // Unset: no pointer file yet.
         assert_eq!(store.default_profile(), None);
@@ -2615,7 +2667,7 @@ mod tests {
         // precedent as unparsable profile JSON) so one legacy record
         // cannot brick a multi-profile deployment.
         let dir = tempfile::tempdir().unwrap();
-        let store = ProfileStore::open(dir.path()).unwrap();
+        let store = ProfileStore::open_unified(dir.path()).unwrap();
 
         // Plant the legacy record directly on disk, bypassing save().
         let legacy = serde_json::json!({
@@ -2668,7 +2720,7 @@ mod tests {
     #[test]
     fn test_profile_roundtrip() {
         let dir = tempfile::tempdir().unwrap();
-        let store = ProfileStore::open(dir.path()).unwrap();
+        let store = ProfileStore::open_unified(dir.path()).unwrap();
 
         let profile = UserProfile {
             // Not "test" — a reserved channel name (codex #1613 r4).
@@ -2718,7 +2770,7 @@ mod tests {
     #[test]
     fn test_save_preserves_local_owner_metadata_fields() {
         let dir = tempfile::tempdir().unwrap();
-        let store = ProfileStore::open(dir.path()).unwrap();
+        let store = ProfileStore::open_unified(dir.path()).unwrap();
         let mut profile = UserProfile {
             id: "ada".into(),
             name: "Ada Lovelace".into(),
@@ -2826,7 +2878,7 @@ mod tests {
     #[test]
     fn test_save_persists_structured_llm_contract() {
         let dir = tempfile::tempdir().unwrap();
-        let store = ProfileStore::open(dir.path()).unwrap();
+        let store = ProfileStore::open_unified(dir.path()).unwrap();
 
         let profile = UserProfile {
             id: "legacy-llm".into(),
@@ -3210,7 +3262,7 @@ mod tests {
     #[test]
     fn test_resolve_data_dir() {
         let dir = tempfile::tempdir().unwrap();
-        let store = ProfileStore::open(dir.path()).unwrap();
+        let store = ProfileStore::open_unified(dir.path()).unwrap();
 
         let mut profile = UserProfile {
             id: "alice".into(),
@@ -3232,6 +3284,78 @@ mod tests {
         profile.data_dir = Some("/custom/path".into());
         let custom_dir = store.resolve_data_dir(&profile);
         assert_eq!(custom_dir, PathBuf::from("/custom/path"));
+    }
+
+    #[test]
+    fn should_read_registry_from_config_root_and_data_from_data_root() {
+        // Multi-instance stdio: a split store reads/writes the `<id>.json`
+        // REGISTRY under the SHARED registry_root while the per-profile
+        // `<id>/data` runtime tree roots under the PER-INSTANCE data_root.
+        let registry_root = tempfile::tempdir().unwrap();
+        let data_root = tempfile::tempdir().unwrap();
+        let store = ProfileStore::open(registry_root.path(), data_root.path()).unwrap();
+
+        let profile = UserProfile {
+            id: "alice".into(),
+            name: "Alice".into(),
+            enabled: false,
+            data_dir: None,
+            parent_id: None,
+            public_subdomain: None,
+            config: ProfileConfig::default(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        store.save(&profile).unwrap();
+
+        // Registry json lands under registry_root/profiles — NOT data_root.
+        let registry_json = registry_root.path().join("profiles").join("alice.json");
+        assert!(
+            registry_json.exists(),
+            "registry <id>.json must live under registry_root/profiles"
+        );
+        assert!(
+            !data_root
+                .path()
+                .join("profiles")
+                .join("alice.json")
+                .exists(),
+            "registry <id>.json must NOT live under data_root/profiles"
+        );
+        // The store must be able to read the profile back through the registry.
+        assert!(store.get("alice").unwrap().is_some());
+        assert_eq!(store.list().unwrap().len(), 1);
+
+        // Per-profile data roots under data_root/profiles — NOT registry_root.
+        let resolved = store.resolve_data_dir(&profile);
+        assert!(
+            resolved.starts_with(data_root.path().join("profiles")),
+            "resolve_data_dir must root under data_root/profiles, got {}",
+            resolved.display()
+        );
+        assert!(resolved.ends_with("alice/data"));
+
+        // octos_home_dir points at the REGISTRY root (shared, config-like).
+        assert_eq!(store.octos_home_dir(), registry_root.path());
+
+        // Regression guard: open_unified(x) collapses both roots under x.
+        let unified_dir = tempfile::tempdir().unwrap();
+        let unified = ProfileStore::open_unified(unified_dir.path()).unwrap();
+        unified.save(&profile).unwrap();
+        assert!(
+            unified_dir
+                .path()
+                .join("profiles")
+                .join("alice.json")
+                .exists(),
+            "open_unified registry must live under x/profiles"
+        );
+        assert!(
+            unified
+                .resolve_data_dir(&profile)
+                .starts_with(unified_dir.path().join("profiles")),
+            "open_unified data must root under x/profiles"
+        );
     }
 
     #[test]
@@ -3312,7 +3436,7 @@ mod tests {
     #[test]
     fn test_file_permissions() {
         let dir = tempfile::tempdir().unwrap();
-        let store = ProfileStore::open(dir.path()).unwrap();
+        let store = ProfileStore::open_unified(dir.path()).unwrap();
         let profile = UserProfile {
             id: "perms-test".into(),
             name: "Perms".into(),
@@ -3337,7 +3461,7 @@ mod tests {
     #[test]
     fn test_save_with_merge_preserves_masked_secrets() {
         let dir = tempfile::tempdir().unwrap();
-        let store = ProfileStore::open(dir.path()).unwrap();
+        let store = ProfileStore::open_unified(dir.path()).unwrap();
 
         // Save a profile with real secrets
         let original = UserProfile {
@@ -3448,7 +3572,7 @@ mod tests {
     #[test]
     fn test_save_with_merge_preserves_masked_email_secrets() {
         let dir = tempfile::tempdir().unwrap();
-        let store = ProfileStore::open(dir.path()).unwrap();
+        let store = ProfileStore::open_unified(dir.path()).unwrap();
         store.save(&email_secret_profile("email-merge")).unwrap();
 
         // A client GETs the masked profile and PUTs it straight back.
@@ -3470,7 +3594,7 @@ mod tests {
     #[test]
     fn test_save_with_merge_allows_changing_email_secrets() {
         let dir = tempfile::tempdir().unwrap();
-        let store = ProfileStore::open(dir.path()).unwrap();
+        let store = ProfileStore::open_unified(dir.path()).unwrap();
         store.save(&email_secret_profile("email-change")).unwrap();
 
         // A genuinely new value is NOT a display artifact, so it must land.
@@ -3492,7 +3616,7 @@ mod tests {
     #[test]
     fn test_save_with_merge_preserves_masked_channel_secrets() {
         let dir = tempfile::tempdir().unwrap();
-        let store = ProfileStore::open(dir.path()).unwrap();
+        let store = ProfileStore::open_unified(dir.path()).unwrap();
 
         let original = UserProfile {
             id: "channel-merge".into(),
@@ -3588,7 +3712,7 @@ mod tests {
     #[test]
     fn test_save_with_merge_allows_clearing_channel_secret() {
         let dir = tempfile::tempdir().unwrap();
-        let store = ProfileStore::open(dir.path()).unwrap();
+        let store = ProfileStore::open_unified(dir.path()).unwrap();
 
         let original = UserProfile {
             id: "channel-clear".into(),
@@ -3654,7 +3778,7 @@ mod tests {
     #[test]
     fn test_save_with_merge_preserves_channel_secret_after_delete() {
         let dir = tempfile::tempdir().unwrap();
-        let store = ProfileStore::open(dir.path()).unwrap();
+        let store = ProfileStore::open_unified(dir.path()).unwrap();
 
         let matrix_channel = |user_id: &str, token: &str| ChannelCredentials::Matrix {
             homeserver: "https://matrix.example.org".into(),
@@ -4063,7 +4187,7 @@ mod tests {
     #[test]
     fn test_create_sub_account() {
         let dir = tempfile::tempdir().unwrap();
-        let store = ProfileStore::open(dir.path()).unwrap();
+        let store = ProfileStore::open_unified(dir.path()).unwrap();
 
         // Create parent with LLM config
         let parent = UserProfile {
@@ -4133,7 +4257,7 @@ mod tests {
     #[test]
     fn test_public_subdomain_must_be_unique() {
         let dir = tempfile::tempdir().unwrap();
-        let store = ProfileStore::open(dir.path()).unwrap();
+        let store = ProfileStore::open_unified(dir.path()).unwrap();
 
         let first = UserProfile {
             id: "top-level".into(),
@@ -4165,7 +4289,7 @@ mod tests {
     #[test]
     fn test_resolve_routable_profile_id_prefers_public_subdomain() {
         let dir = tempfile::tempdir().unwrap();
-        let store = ProfileStore::open(dir.path()).unwrap();
+        let store = ProfileStore::open_unified(dir.path()).unwrap();
 
         let parent = UserProfile {
             id: "tenant".into(),
@@ -4219,7 +4343,7 @@ mod tests {
     #[test]
     fn test_resolve_effective_profile() {
         let dir = tempfile::tempdir().unwrap();
-        let store = ProfileStore::open(dir.path()).unwrap();
+        let store = ProfileStore::open_unified(dir.path()).unwrap();
 
         // Create parent
         let parent = UserProfile {
@@ -4324,7 +4448,7 @@ mod tests {
     #[test]
     fn test_resolve_effective_profile_inherits_structured_sections() {
         let dir = tempfile::tempdir().unwrap();
-        let store = ProfileStore::open(dir.path()).unwrap();
+        let store = ProfileStore::open_unified(dir.path()).unwrap();
 
         let parent = UserProfile {
             id: "parent".into(),
@@ -4568,7 +4692,7 @@ mod tests {
     #[test]
     fn test_save_with_merge_preserves_keychain_marker() {
         let dir = tempfile::tempdir().unwrap();
-        let store = ProfileStore::open(dir.path()).unwrap();
+        let store = ProfileStore::open_unified(dir.path()).unwrap();
 
         // Save profile with keychain marker
         let original = UserProfile {
@@ -4617,7 +4741,7 @@ mod tests {
     #[test]
     fn test_save_with_merge_allows_setting_keychain_marker() {
         let dir = tempfile::tempdir().unwrap();
-        let store = ProfileStore::open(dir.path()).unwrap();
+        let store = ProfileStore::open_unified(dir.path()).unwrap();
 
         // Profile with plaintext secret
         let original = UserProfile {
@@ -4654,7 +4778,7 @@ mod tests {
     #[test]
     fn test_save_with_merge_empty_does_not_overwrite_keychain() {
         let dir = tempfile::tempdir().unwrap();
-        let store = ProfileStore::open(dir.path()).unwrap();
+        let store = ProfileStore::open_unified(dir.path()).unwrap();
 
         let original = UserProfile {
             id: "kc-empty".into(),

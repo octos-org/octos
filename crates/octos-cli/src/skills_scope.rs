@@ -109,7 +109,7 @@ mod tests {
     #[test]
     fn resolve_account_skills_dir_keeps_sub_account_isolated() {
         let dir = tempfile::tempdir().unwrap();
-        let store = ProfileStore::open(dir.path()).unwrap();
+        let store = ProfileStore::open_unified(dir.path()).unwrap();
 
         let parent = UserProfile {
             id: "dspfac".into(),
