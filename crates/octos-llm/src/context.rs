@@ -27,6 +27,15 @@ pub fn seed_from_catalog(entries: &[(String, u64, u64)]) {
     *CATALOG.write().unwrap_or_else(|e| e.into_inner()) = Some(build_catalog_map(entries));
 }
 
+/// The provider/host prefix of a catalog key: everything before the first `/`
+/// (or the whole key when unqualified). Used to break bare-alias ties on the
+/// native HOST rather than the raw key, so a `zai-coding/…` re-host cannot
+/// out-sort the native `zai/…` row just because `-` sorts before `/`. Shared
+/// with `pricing::seed_pricing_catalog` so the two catalogs agree.
+pub(crate) fn provider_prefix(key: &str) -> &str {
+    key.split_once('/').map(|(prefix, _)| prefix).unwrap_or(key)
+}
+
 /// Build the runtime catalog lookup map from `(provider/model, ctx, max_out)`
 /// entries. Pure (touches no global state) so the alias-selection rules below
 /// are unit-testable without racing the shared `CATALOG`.
@@ -35,9 +44,15 @@ fn build_catalog_map(entries: &[(String, u64, u64)]) -> HashMap<String, CatalogM
     // See `pricing::seed_pricing_catalog`: a bare model id can be shared by the
     // native provider and its re-hosts, so award the bare alias to the row with
     // the FEWEST path segments (most canonical/native), deterministically. On an
-    // EQUAL segment count the lexicographically-smaller lowercased full key wins
-    // (e.g. `minimax/MiniMax-M3` beats `r9s/minimax-m3`, both one slash), so the
-    // bare alias does not depend on seed/export order.
+    // EQUAL segment count the more-native HOST wins: compare the provider prefix
+    // (the segment before the first `/`) FIRST, then the full lowercased key. A
+    // plain full-key comparison is wrong when one host is a lexical prefix of
+    // another — `zai-coding/glm-5.2` (200K) sorts BEFORE `zai/glm-5.2` (1M)
+    // because `-` (0x2D) < `/` (0x2F), so the coding-plan re-host would steal the
+    // bare `glm-5.2` alias from the native `zai` row. Splitting on the separator
+    // makes `zai` < `zai-coding` (the shorter native prefix wins), keeping the
+    // 1M window for a bare `glm-5.2` lookup. `minimax/MiniMax-M3` still beats
+    // `r9s/minimax-m3` (both one slash), so the bare alias stays order-independent.
     let mut bare_owner: HashMap<String, (usize, String)> = HashMap::new();
     for (key, ctx, max_out) in entries {
         // Store by full key ("dashscope/qwen3.5-plus") and by model name alone ("qwen3.5-plus")
@@ -56,7 +71,9 @@ fn build_catalog_map(entries: &[(String, u64, u64)]) -> HashMap<String, CatalogM
                 None => true,
                 Some((owned_seg, owner_key)) => {
                     segments < *owned_seg
-                        || (segments == *owned_seg && key_lower.as_str() < owner_key.as_str())
+                        || (segments == *owned_seg
+                            && (provider_prefix(&key_lower), key_lower.as_str())
+                                < (provider_prefix(owner_key), owner_key.as_str()))
                 }
             };
             if take {
@@ -387,6 +404,53 @@ mod tests {
             "equal-depth bare alias resolves to the lexicographically-smaller key"
         );
         assert_eq!(bare.max_output, 8_192);
+    }
+
+    #[test]
+    fn build_catalog_map_prefers_native_host_over_prefix_rehost() {
+        // Regression (#k3-ctx): a `zai-coding/…` re-host must NOT steal the bare
+        // alias from the native `zai/…` row. A raw full-key compare picks
+        // `zai-coding/glm-5.2` because `-` (0x2D) sorts before `/` (0x2F), which
+        // mislabelled a bare `glm-5.2` lookup as a 200K window instead of the
+        // native Z.AI 1M window. The provider-prefix tie-break (`zai` <
+        // `zai-coding`) keeps the alias on the native row, regardless of order.
+        for entries in [
+            [
+                ("zai/glm-5.2".to_string(), 1_000_000u64, 131_072u64),
+                ("zai-coding/glm-5.2".to_string(), 200_000, 131_072),
+            ],
+            [
+                ("zai-coding/glm-5.2".to_string(), 200_000, 131_072),
+                ("zai/glm-5.2".to_string(), 1_000_000, 131_072),
+            ],
+        ] {
+            let map = build_catalog_map(&entries);
+            assert_eq!(
+                map.get("glm-5.2").unwrap().context_window,
+                1_000_000,
+                "bare glm-5.2 must resolve to native zai/glm-5.2 (1M), not the \
+                 zai-coding re-host (200K)"
+            );
+            // The re-host still resolves to its 200K window under its full key.
+            // (`map.get("glm-5.2")` is exactly what `catalog_lookup` /
+            // `context_window_tokens` hit for a bare `glm-5.2` request, so this
+            // covers the public path without racing the shared CATALOG.)
+            assert_eq!(
+                map.get("zai-coding/glm-5.2").unwrap().context_window,
+                200_000
+            );
+        }
+    }
+
+    #[test]
+    fn provider_prefix_splits_on_first_slash() {
+        assert_eq!(provider_prefix("zai/glm-5.2"), "zai");
+        assert_eq!(provider_prefix("zai-coding/glm-5.2"), "zai-coding");
+        assert_eq!(
+            provider_prefix("openrouter/moonshotai/kimi-k2.5"),
+            "openrouter"
+        );
+        assert_eq!(provider_prefix("glm-5.2"), "glm-5.2");
     }
 
     #[test]
