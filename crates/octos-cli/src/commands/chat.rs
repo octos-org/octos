@@ -98,6 +98,12 @@ pub struct ChatCommand {
     /// `~/.octos/profiles/<id>/`, or an explicit path to a profile
     /// JSON/TOML file.
     ///
+    /// If the id names a stored serve/onboarding profile (one created by
+    /// `octos serve` or octos-tui, saved as `~/.octos/profiles/<id>.json`),
+    /// its LLM provider/model, route, and API key (`env_vars`) are reused too —
+    /// so you don't re-enter a model or key that a profile already holds.
+    /// `--config`, `--provider`, and `--model` still override.
+    ///
     /// Defaults to `coding`, the lean core-coding tool surface (files,
     /// shell, search, memory, spawn, user questions). Use `coding-full`
     /// for the unfiltered pre-lean tool set (web, research, pipelines,
@@ -731,9 +737,18 @@ impl ChatCommand {
         let ctx = super::resolve_command_context(self.data_dir)?;
         let data_dir = ctx.data_dir.clone();
 
-        // Load config
+        // Load config. Precedence: an explicit `--config` wins; otherwise a
+        // stored serve/onboarding profile named by `--profile <id>` supplies its
+        // LLM provider/model + route + `env_vars` API key (so `octos chat
+        // --profile <id>` reuses an octos-tui / `serve` profile without a
+        // separate flat config or a duplicated key); otherwise the ambient
+        // config context.
+        let serve_profile_config = load_serve_profile_config(self.profile.as_deref(), &data_dir)?;
+        let profile_is_serve = serve_profile_config.is_some();
         let config = if let Some(config_path) = &self.config {
             Config::from_file(config_path)?
+        } else if let Some(profile_config) = serve_profile_config {
+            profile_config
         } else {
             Config::load_with_context(&cwd, &ctx)?
         };
@@ -825,7 +840,28 @@ impl ChatCommand {
         // The resolved profile's tool filter is applied after the full
         // registry has been assembled, preserving the existing bootstrap
         // path (plugins, MCP, pipelines etc. all register first).
-        let (profile, profile_source_label) = resolve_profile(&self.profile)?;
+        // Tool surface: normal runtime-profile resolution. A stored serve profile
+        // (named by `--profile`, whose LLM config was loaded above) has no runtime
+        // tool-surface definition, so fall back to the default `coding` surface
+        // instead of erroring — gated on `profile_is_serve` so an actually-unknown
+        // profile name still fails loudly.
+        let (profile, profile_source_label) = match resolve_profile(&self.profile) {
+            Ok(resolved) => resolved,
+            Err(_) if profile_is_serve => {
+                tracing::info!(
+                    profile = self.profile.as_deref().unwrap_or_default(),
+                    "serve profile has no runtime tool-surface definition; \
+                     using the default `coding` tool surface"
+                );
+                (
+                    octos_agent::profile::ProfileDefinition::load("coding")
+                        .wrap_err("failed to load built-in coding profile")?
+                        .0,
+                    "coding (serve-profile default)",
+                )
+            }
+            Err(err) => return Err(err),
+        };
         tracing::info!(
             "profile resolved: name={} source={}",
             profile.name,
@@ -1566,6 +1602,51 @@ pub(crate) fn resolve_profile(
     Ok((def, "default"))
 }
 
+/// Load the LLM config from a stored serve/onboarding profile so
+/// `octos chat --profile <id>` can reuse an octos-tui / `serve` profile's
+/// provider, model, route (base URL + API type), API key (`config.env_vars`),
+/// and fallbacks — without a separate flat config or a duplicated key.
+///
+/// Returns `Ok(None)` when no `--profile` is given, the arg is a path (a runtime
+/// [`octos_agent::profile::ProfileDefinition`] file, left to [`resolve_profile`]),
+/// or the id does not name a stored profile (e.g. a built-in runtime profile like
+/// `coding`) — leaving the caller on its normal config path. An explicit
+/// `--config` still takes precedence (handled by the caller), and CLI
+/// `--provider`/`--model`/… continue to override the profile's values downstream.
+///
+/// [`ProfileStore::get`](crate::profiles::ProfileStore::get) is a lock-free JSON
+/// read, so this is safe to call while a `serve` process holds the same data dir.
+fn load_serve_profile_config(
+    profile_arg: Option<&str>,
+    data_dir: &std::path::Path,
+) -> Result<Option<Config>> {
+    let Some(id) = profile_arg else {
+        return Ok(None);
+    };
+    // A path-form `--profile` names a runtime ProfileDefinition file, not a stored
+    // serve-profile id; leave those to `resolve_profile`.
+    if id.contains('/') || id.contains(std::path::MAIN_SEPARATOR) {
+        return Ok(None);
+    }
+    let store = crate::profiles::ProfileStore::open_unified(data_dir)
+        .wrap_err("failed to open profile store")?;
+    let Some(profile) = store.get(id)? else {
+        return Ok(None);
+    };
+    // Apply parent inheritance + global profile-defaults exactly like serve's
+    // per-profile loop, then flatten `llm.primary` into the flat provider/model/
+    // route fields the chat provider builder reads.
+    let resolved = store.resolve_runtime_profile(&profile);
+    let config = crate::profiles::config_from_profile(&resolved, None, None);
+    tracing::info!(
+        profile = id,
+        provider = config.provider.as_deref().unwrap_or("<unset>"),
+        model = config.model.as_deref().unwrap_or("<unset>"),
+        "using LLM config from stored profile",
+    );
+    Ok(Some(config))
+}
+
 /// Find the matching provider-specific tool policy for the active model.
 /// Checks model ID first (e.g. "claude-sonnet-4-20250514"), then provider name (e.g. "gemini").
 pub(crate) fn resolve_provider_policy(
@@ -1709,6 +1790,83 @@ pub(crate) fn build_run_pipeline_tool(
 #[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn chat_profile_loads_llm_config_from_stored_serve_profile() {
+        use crate::profiles::{
+            LlmModelSelectionConfig, LlmProfileConfig, LlmRouteConfig, ProfileConfig, ProfileStore,
+            UserProfile,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = ProfileStore::open_unified(dir.path()).unwrap();
+        let profile = UserProfile {
+            id: "dev".to_string(),
+            name: "Dev".to_string(),
+            public_subdomain: None,
+            enabled: true,
+            data_dir: None,
+            parent_id: None,
+            config: ProfileConfig {
+                llm: Some(LlmProfileConfig {
+                    primary: Some(LlmModelSelectionConfig {
+                        family_id: Some("moonshot".to_string()),
+                        model_id: Some("kimi-k2.5".to_string()),
+                        route: Some(LlmRouteConfig {
+                            base_url: Some("https://api.kimi.com/coding/v1".to_string()),
+                            api_key_env: Some("KIMI_API_KEY".to_string()),
+                            api_type: Some("openai".to_string()),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }),
+                    fallbacks: vec![],
+                }),
+                env_vars: [("KIMI_API_KEY".to_string(), "sk-from-profile".to_string())].into(),
+                ..Default::default()
+            },
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        store.save(&profile).unwrap();
+
+        // `--profile dev` names a stored serve profile → flattened LLM config,
+        // including the API key carried in the profile's own `env_vars` (so the
+        // chat run reuses the profile's model AND key with no separate setup).
+        let config = load_serve_profile_config(Some("dev"), dir.path())
+            .unwrap()
+            .expect("stored profile should produce a config");
+        assert_eq!(config.provider.as_deref(), Some("moonshot"));
+        assert_eq!(config.model.as_deref(), Some("kimi-k2.5"));
+        assert_eq!(
+            config.base_url.as_deref(),
+            Some("https://api.kimi.com/coding/v1")
+        );
+        assert_eq!(config.api_type.as_deref(), Some("openai"));
+        assert_eq!(config.api_key_env.as_deref(), Some("KIMI_API_KEY"));
+        assert_eq!(
+            config.env_vars.get("KIMI_API_KEY").map(String::as_str),
+            Some("sk-from-profile")
+        );
+
+        // A built-in runtime-profile name, a path-form arg, and an absent arg all
+        // fall through (Ok(None)) so the caller keeps its normal config path.
+        assert!(
+            load_serve_profile_config(Some("coding"), dir.path())
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            load_serve_profile_config(Some("./some/path.json"), dir.path())
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            load_serve_profile_config(None, dir.path())
+                .unwrap()
+                .is_none()
+        );
+    }
 
     // ---- yolo GAP #3: chat permission flags → EffectivePermissions ----
 
