@@ -56,7 +56,10 @@ fn sanitize_label_for_filename(label: &str) -> String {
     if trimmed.is_empty() {
         "task".to_string()
     } else {
-        trimmed.to_string()
+        // Cap the length (by chars, UTF-8-safe) so a pathological label can't
+        // produce a filename-too-long error. Per-worker uniqueness is added by
+        // the caller (the fan-out index), so truncation can't collide two lanes.
+        trimmed.chars().take(48).collect()
     }
 }
 
@@ -3257,7 +3260,16 @@ impl PipelineExecutor {
                     // file-pointer contract was unreliable).
                     let prompt = worker_prompt_template
                         .replace("{task}", &task.task)
-                        .replace("{label}", &sanitize_label_for_filename(&label));
+                        // Append the fan-out index so two labels that sanitize to
+                        // the same token (e.g. "Official Docs" / "official docs",
+                        // or duplicate CJK labels) don't both write the SAME
+                        // findings file and silently overwrite each other. The
+                        // analyze node reads `findings-*.md`, so uniqueness here
+                        // doesn't break its glob.
+                        .replace(
+                            "{label}",
+                            &format!("{}-{i}", sanitize_label_for_filename(&label)),
+                        );
 
                     // Round-robin model from pool
                     let worker_model = Some(model_pool[i % model_pool.len()].to_string());
