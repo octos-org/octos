@@ -193,6 +193,25 @@ impl PluginLoader {
         extra_env: &[(String, String)],
         options: PluginLoadOptions<'_>,
     ) -> Result<PluginLoadResult> {
+        Self::load_into_with_options_and_filter(registry, dirs, extra_env, options, None)
+    }
+
+    /// Like [`load_into_with_options`](Self::load_into_with_options), but applies
+    /// a skill-layering (v1) selection filter: a plugin whose manifest id is
+    /// not permitted by `skill_filter` is skipped entirely (no tools, hooks,
+    /// MCP servers, or prompt fragments registered).
+    ///
+    /// `skill_filter == None` ⇒ no filtering: every discovered plugin loads
+    /// exactly as before this feature existed (backwards-compatible). The
+    /// filter matches on `DiscoveredPlugin.manifest.id`, which equals the
+    /// skill's `SKILL.md` name and directory name.
+    pub fn load_into_with_options_and_filter(
+        registry: &mut ToolRegistry,
+        dirs: &[PathBuf],
+        extra_env: &[(String, String)],
+        options: PluginLoadOptions<'_>,
+        skill_filter: Option<&crate::skills::SkillFilter>,
+    ) -> Result<PluginLoadResult> {
         let mut result = PluginLoadResult::default();
 
         // Delegate dir scanning + dedup to octos_plugin::discovery so the
@@ -228,6 +247,18 @@ impl PluginLoader {
         let discovered = octos_plugin::discover_plugins(&sources, &extra_env_map);
 
         for plugin in discovered {
+            // Skill layering v1: skip plugins whose skill id is disabled (or
+            // not allow-listed) by the profile's inherited selection. Matched
+            // on the manifest id (== SKILL.md name == skill dir name).
+            if let Some(filter) = skill_filter {
+                if !filter.allows(&plugin.manifest.id) {
+                    info!(
+                        skill = %plugin.manifest.id,
+                        "skill layering: skipping plugin disabled by profile config"
+                    );
+                    continue;
+                }
+            }
             let path = plugin.path;
             // Re-parse via the agent-side manifest type below: octos_plugin's
             // PluginManifest is a structural subset and doesn't model
@@ -1207,6 +1238,66 @@ mod tests {
             PluginLoader::load_into(&mut registry, &[dir.path().to_path_buf()], &[]).unwrap();
         assert_eq!(result.tool_count, 1);
         assert_eq!(registry.len(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn skill_filter_skips_disabled_plugin_tools() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["keep-plugin", "drop-plugin"] {
+            let plugin_dir = dir.path().join(name);
+            std::fs::create_dir(&plugin_dir).unwrap();
+            let tool = format!("{}_tool", name.replace('-', "_"));
+            std::fs::write(
+                plugin_dir.join("manifest.json"),
+                format!(
+                    r#"{{"name": "{name}", "version": "1.0", "tools": [{{"name": "{tool}", "description": "d", "input_schema": {{"type": "object", "properties": {{}}}}}}]}}"#
+                ),
+            )
+            .unwrap();
+            let exec_path = plugin_dir.join(name);
+            std::fs::write(
+                &exec_path,
+                "#!/bin/sh\necho '{\"output\": \"hi\", \"success\": true}'",
+            )
+            .unwrap();
+            std::fs::set_permissions(&exec_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        // AllDiscovered with `drop-plugin` disabled: only keep-plugin loads.
+        let filter = crate::skills::SkillFilter::AllExcept(std::collections::HashSet::from([
+            "drop-plugin".to_string(),
+        ]));
+        let mut registry = ToolRegistry::new();
+        let result = PluginLoader::load_into_with_options_and_filter(
+            &mut registry,
+            &[dir.path().to_path_buf()],
+            &[],
+            PluginLoadOptions::default(),
+            Some(&filter),
+        )
+        .unwrap();
+
+        assert_eq!(result.tool_count, 1, "only the enabled plugin's tool loads");
+        assert!(registry.get("keep_plugin_tool").is_some());
+        assert!(
+            registry.get("drop_plugin_tool").is_none(),
+            "a disabled skill must not register tools"
+        );
+
+        // No filter ⇒ both plugins load (backwards-compatible).
+        let mut registry_all = ToolRegistry::new();
+        let result_all = PluginLoader::load_into_with_options_and_filter(
+            &mut registry_all,
+            &[dir.path().to_path_buf()],
+            &[],
+            PluginLoadOptions::default(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(result_all.tool_count, 2);
     }
 
     #[test]

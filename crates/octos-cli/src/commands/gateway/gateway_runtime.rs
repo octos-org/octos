@@ -622,7 +622,14 @@ impl GatewayRuntime {
         // is profile-driven by design.
 
         // Customer-installed skills are strictly account-scoped.
-        let skills_loader = crate::skills_scope::build_account_skills_loader(&data_dir);
+        // Skill layering v1: inherit the resolved profile's skill selection.
+        // `None` ⇒ no skills layer ⇒ every discovered skill loads (as before).
+        let skill_filter = resolved_profile
+            .as_ref()
+            .and_then(|p| p.config.skills.as_ref())
+            .map(|s| s.to_agent_filter());
+        let skills_loader = crate::skills_scope::build_account_skills_loader(&data_dir)
+            .with_skill_filter(skill_filter.clone());
 
         // Create message bus (before publisher is consumed by channel manager)
         let (agent_handle, publisher) = create_bus();
@@ -838,7 +845,7 @@ impl GatewayRuntime {
                 plugin_result = octos_agent::PluginLoadResult::default();
                 if !plugin_dirs.is_empty() {
                     let synthesis_config = build_synthesis_config(&config, &provider_name);
-                    match octos_agent::PluginLoader::load_into_with_options(
+                    match octos_agent::PluginLoader::load_into_with_options_and_filter(
                         &mut tools,
                         &plugin_dirs,
                         &plugin_env,
@@ -852,6 +859,7 @@ impl GatewayRuntime {
                             require_signed: config.plugins.require_signed,
                             verified_cache_dir: None,
                         },
+                        skill_filter.as_ref(),
                     ) {
                         Ok(result) => plugin_result = result,
                         Err(e) => warn!("plugin loading failed: {e}"),

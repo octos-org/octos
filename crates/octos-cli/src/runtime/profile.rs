@@ -637,9 +637,34 @@ impl ProfileRuntime {
                 plugin_dirs.push(dir.clone());
             }
         }
+        // --- Skill layering v1 ---
+        // Resolve the profile's inherited skill-selection layer (parent +
+        // global defaults already merged by `resolve_runtime_profile`) into a
+        // crate-agnostic filter handed to BOTH the plugin loader (tool specs)
+        // and the SkillsLoader (prompt / content injection) below. `None` ⇒ no
+        // skills layer ⇒ every discovered skill loads, exactly as before.
+        let skill_filter = profile.config.skills.as_ref().map(|s| s.to_agent_filter());
+        if profile.config.skills.is_some() {
+            let discovered_skill_ids: Vec<String> = build_account_skills_loader(data_dir)
+                .list_skills()
+                .await
+                .map(|skills| skills.into_iter().map(|s| s.name).collect())
+                .unwrap_or_default();
+            let catalog =
+                crate::skills_scope::resolve_profile_skills(profile, &discovered_skill_ids);
+            if catalog.has_disabled() {
+                info!(
+                    profile_id = %profile.id,
+                    mode = ?catalog.mode,
+                    disabled = ?catalog.disabled,
+                    "skill layering: installed skills disabled by profile config"
+                );
+            }
+        }
+
         let mut plugin_result = PluginLoadResult::default();
         if !plugin_dirs.is_empty() {
-            match PluginLoader::load_into_with_options(
+            match PluginLoader::load_into_with_options_and_filter(
                 &mut tools,
                 &plugin_dirs,
                 &plugin_env_template,
@@ -655,6 +680,7 @@ impl ProfileRuntime {
                     require_signed: config.plugins.require_signed,
                     verified_cache_dir: Some(effective_octos_home.join("cache").join("verified")),
                 },
+                skill_filter.as_ref(),
             ) {
                 Ok(result) => plugin_result = result,
                 Err(e) => warn!(profile_id = %profile.id, error = %e, "plugin loading failed"),
@@ -916,7 +942,7 @@ impl ProfileRuntime {
         // can hand to the helper. Operators who want per-profile
         // bootstrap files drop them in `<data_dir>/`, which matches the
         // pre-M11-F serve-mode behavior.
-        let skills_loader = build_account_skills_loader(data_dir);
+        let skills_loader = build_account_skills_loader(data_dir).with_skill_filter(skill_filter);
         let max_inject_tokens =
             crate::config::MemoryConfig::effective_max_inject_tokens(config.memory.as_ref());
         let memory_refresh_enabled =

@@ -663,7 +663,15 @@ impl ProfileActorFactoryBuilder {
         let model_id = llm.model_id().to_string();
 
         let profile_data_dir = self.profile_store.resolve_data_dir(&effective_profile);
-        let skills_loader = crate::skills_scope::build_account_skills_loader(&profile_data_dir);
+        // Skill layering v1: the child bot inherits the resolved profile's skill
+        // selection. `None` ⇒ no skills layer ⇒ every discovered skill loads.
+        let skill_filter = effective_profile
+            .config
+            .skills
+            .as_ref()
+            .map(|s| s.to_agent_filter());
+        let skills_loader = crate::skills_scope::build_account_skills_loader(&profile_data_dir)
+            .with_skill_filter(skill_filter.clone());
 
         let mut child_plugin_prompt_fragments = Vec::new();
         let mut child_plugin_hooks: Vec<octos_agent::HookConfig> = Vec::new();
@@ -754,7 +762,7 @@ impl ProfileActorFactoryBuilder {
                 // S2 plumbing: pass profile-scoped synthesis config so per-tenant
                 // routing of synthesis credentials works.
                 let synthesis_config = build_synthesis_config(&profile_config, &provider_name);
-                match octos_agent::PluginLoader::load_into_with_options(
+                match octos_agent::PluginLoader::load_into_with_options_and_filter(
                     &mut tools,
                     &plugin_dirs,
                     &plugin_env,
@@ -769,6 +777,7 @@ impl ProfileActorFactoryBuilder {
                         require_signed: profile_config.plugins.require_signed,
                         verified_cache_dir: None,
                     },
+                    skill_filter.as_ref(),
                 ) {
                     Ok(result) => {
                         child_plugin_prompt_fragments = result.prompt_fragments;

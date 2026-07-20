@@ -172,6 +172,108 @@ pub struct ProfileConfig {
     /// **overrides**.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lane_routing: Option<octos_llm::LaneRoutingConfig>,
+    /// Skill-layering (v1) selection layer. Merged through
+    /// [`ProfileStore::effective_config`] alongside hooks / env / sandbox /
+    /// plugins so a profile inherits the operator's default skill selection
+    /// and may narrow or extend it.
+    ///
+    /// `None` ⇒ "no local skills layer" (inherit the defaults' layer, if
+    /// any). When both the defaults and the profile omit it, the merge yields
+    /// `None` and every discovered skill loads exactly as before this feature
+    /// existed (backwards-compatible). See [`ProfileSkillsConfig`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skills: Option<ProfileSkillsConfig>,
+}
+
+/// How a profile selects which discovered skills to load.
+///
+/// This is ordinary selection, NOT a security policy — a profile may
+/// re-enable a skill that an inherited rule disabled (enforced denies would be
+/// a separate future policy layer, out of scope for v1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SkillSelectionMode {
+    /// Load every discovered skill except those with an `enabled: false` rule.
+    /// This is the default and matches pre-skill-layering behavior.
+    #[default]
+    AllDiscovered,
+    /// Load only skills that have an explicit `enabled: true` rule.
+    AllowList,
+}
+
+/// A single per-skill selection rule, keyed by the skill's identifier.
+///
+/// `id` is the skill package identifier: the `manifest.json` `name`/`id`
+/// field, which equals the `SKILL.md` `name` and the skill directory name.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SkillRule {
+    /// Skill identifier (manifest `name`/`id` == `SKILL.md` `name`).
+    pub id: String,
+    /// Whether this skill is enabled.
+    pub enabled: bool,
+}
+
+/// Per-profile skill selection layer.
+///
+/// Absent (`ProfileConfig::skills == None`) ⇒ [`SkillSelectionMode::AllDiscovered`]
+/// with no rules ⇒ every discovered skill loads (backwards-compatible).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProfileSkillsConfig {
+    /// Selection mode. `None` preserves "inherit mode" through the merge
+    /// (`profile.mode.or(defaults.mode)`); an absent mode resolves to
+    /// [`SkillSelectionMode::AllDiscovered`] at load time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<SkillSelectionMode>,
+    /// Per-skill rules. Keyed by `id`; the last rule for a given id wins.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rules: Vec<SkillRule>,
+}
+
+impl ProfileSkillsConfig {
+    /// The effective selection mode (absent ⇒ [`SkillSelectionMode::AllDiscovered`]).
+    pub fn effective_mode(&self) -> SkillSelectionMode {
+        self.mode.unwrap_or_default()
+    }
+
+    /// Whether a skill with `id` should load under this selection layer.
+    ///
+    /// Rules are last-wins per id. In [`SkillSelectionMode::AllDiscovered`] a
+    /// skill loads unless a rule disables it; in
+    /// [`SkillSelectionMode::AllowList`] a skill loads only when a rule
+    /// enables it.
+    pub fn allows(&self, id: &str) -> bool {
+        let last = self.rules.iter().rev().find(|rule| rule.id == id);
+        match self.effective_mode() {
+            SkillSelectionMode::AllDiscovered => last.map(|rule| rule.enabled).unwrap_or(true),
+            SkillSelectionMode::AllowList => last.map(|rule| rule.enabled).unwrap_or(false),
+        }
+    }
+
+    /// Lower this selection layer into the crate-agnostic
+    /// [`octos_agent::SkillFilter`] handed to the plugin loader and the
+    /// [`octos_agent::SkillsLoader`]. Rules are collapsed last-wins per id.
+    pub fn to_agent_filter(&self) -> octos_agent::SkillFilter {
+        let mut last: std::collections::HashMap<&str, bool> = std::collections::HashMap::new();
+        for rule in &self.rules {
+            last.insert(rule.id.as_str(), rule.enabled);
+        }
+        match self.effective_mode() {
+            SkillSelectionMode::AllDiscovered => octos_agent::SkillFilter::AllExcept(
+                last.into_iter()
+                    .filter(|(_, enabled)| !*enabled)
+                    .map(|(id, _)| id.to_string())
+                    .collect(),
+            ),
+            SkillSelectionMode::AllowList => octos_agent::SkillFilter::Only(
+                last.into_iter()
+                    .filter(|(_, enabled)| *enabled)
+                    .map(|(id, _)| id.to_string())
+                    .collect(),
+            ),
+        }
+    }
 }
 
 /// Profile-owned review workflow configuration.
@@ -1803,6 +1905,9 @@ pub(crate) fn merge_profile_defaults(
     effective.plugins = merge_plugins_defaults(&base.plugins, &defaults.plugins);
     effective.sandbox = merge_sandbox_defaults(&base.sandbox, &defaults.sandbox);
 
+    // skills: inherited selection layer (union of rules, last-wins per id).
+    effective.skills = merge_skills(&defaults.skills, &base.skills);
+
     // memory / approval_policy / cost_budget: profile wins, else defaults.
     if effective.memory.is_none() {
         effective.memory = defaults.memory.clone();
@@ -1815,6 +1920,43 @@ pub(crate) fn merge_profile_defaults(
     }
 
     effective
+}
+
+/// Merge the inherited skill-selection layer.
+///
+/// This is ordinary selection inheritance (NOT a security floor): a profile
+/// rule for the same id fully REPLACES the defaults' rule (last-wins per id),
+/// so a profile may re-enable a skill the defaults disabled. The result's id
+/// set is the union of both layers' ids.
+///
+/// - `rules`: defaults' rules first (order preserved); each profile rule either
+///   replaces the defaults' rule for the same id in place or is appended.
+/// - `mode`: `profile.mode.or(defaults.mode)` — the profile's explicit mode
+///   wins, else the defaults' mode is inherited, else `None` (⇒ AllDiscovered).
+/// - `None` + `None` ⇒ `None` (byte-identical to pre-skill-layering configs).
+pub(crate) fn merge_skills(
+    defaults: &Option<ProfileSkillsConfig>,
+    profile: &Option<ProfileSkillsConfig>,
+) -> Option<ProfileSkillsConfig> {
+    match (defaults, profile) {
+        (None, None) => None,
+        (Some(defaults), None) => Some(defaults.clone()),
+        (None, Some(profile)) => Some(profile.clone()),
+        (Some(defaults), Some(profile)) => {
+            let mut rules = defaults.rules.clone();
+            for profile_rule in &profile.rules {
+                if let Some(existing) = rules.iter_mut().find(|rule| rule.id == profile_rule.id) {
+                    *existing = profile_rule.clone();
+                } else {
+                    rules.push(profile_rule.clone());
+                }
+            }
+            Some(ProfileSkillsConfig {
+                mode: profile.mode.or(defaults.mode),
+                rules,
+            })
+        }
+    }
 }
 
 /// Presence-aware merge of `plugins` with a security floor on `require_signed`.
@@ -5509,6 +5651,159 @@ mod tests {
             eff.sandbox.allow_network,
             "omitted allow_network must inherit the default"
         );
+    }
+
+    // ---- skill layering v1 ----
+
+    fn skill_rule(id: &str, enabled: bool) -> SkillRule {
+        SkillRule {
+            id: id.to_string(),
+            enabled,
+        }
+    }
+
+    #[test]
+    fn merge_skills_none_and_none_is_none() {
+        // Byte-identical to pre-skill-layering configs: absent on both sides
+        // yields absent, so nothing changes for existing deployments.
+        assert_eq!(merge_skills(&None, &None), None);
+    }
+
+    #[test]
+    fn merge_skills_inherits_defaults_when_profile_absent() {
+        let defaults = Some(ProfileSkillsConfig {
+            mode: Some(SkillSelectionMode::AllowList),
+            rules: vec![skill_rule("news", true)],
+        });
+        let merged = merge_skills(&defaults, &None).unwrap();
+        assert_eq!(merged.mode, Some(SkillSelectionMode::AllowList));
+        assert_eq!(merged.rules, vec![skill_rule("news", true)]);
+    }
+
+    #[test]
+    fn merge_skills_uses_profile_when_defaults_absent() {
+        let profile = Some(ProfileSkillsConfig {
+            mode: None,
+            rules: vec![skill_rule("weather", false)],
+        });
+        let merged = merge_skills(&None, &profile).unwrap();
+        assert_eq!(merged.mode, None);
+        assert_eq!(merged.rules, vec![skill_rule("weather", false)]);
+    }
+
+    #[test]
+    fn merge_skills_replaces_rule_by_id_and_unions() {
+        // defaults disable `news` and `weather`; the profile re-enables `news`
+        // (replace-by-id) and adds `time` (union). `weather` survives untouched.
+        let defaults = Some(ProfileSkillsConfig {
+            mode: Some(SkillSelectionMode::AllDiscovered),
+            rules: vec![skill_rule("news", false), skill_rule("weather", false)],
+        });
+        let profile = Some(ProfileSkillsConfig {
+            mode: None,
+            rules: vec![skill_rule("news", true), skill_rule("time", true)],
+        });
+        let merged = merge_skills(&defaults, &profile).unwrap();
+
+        // Order: defaults first (news replaced in place, weather kept), then the
+        // profile-only `time` appended.
+        assert_eq!(
+            merged.rules,
+            vec![
+                skill_rule("news", true), // profile re-enabled (replace-by-id)
+                skill_rule("weather", false),
+                skill_rule("time", true), // profile-only (union)
+            ]
+        );
+        // A profile may re-enable an inherited disabled rule (ordinary
+        // selection, not a security floor).
+        assert!(merged.allows("news"));
+        assert!(!merged.allows("weather"));
+        assert!(merged.allows("time"));
+    }
+
+    #[test]
+    fn merge_skills_mode_falls_back_to_defaults() {
+        // profile.mode None ⇒ inherit defaults' mode.
+        let defaults = Some(ProfileSkillsConfig {
+            mode: Some(SkillSelectionMode::AllowList),
+            rules: vec![],
+        });
+        let profile = Some(ProfileSkillsConfig {
+            mode: None,
+            rules: vec![skill_rule("news", true)],
+        });
+        let merged = merge_skills(&defaults, &profile).unwrap();
+        assert_eq!(merged.mode, Some(SkillSelectionMode::AllowList));
+
+        // profile.mode Some ⇒ profile wins.
+        let profile_wins = Some(ProfileSkillsConfig {
+            mode: Some(SkillSelectionMode::AllDiscovered),
+            rules: vec![],
+        });
+        let merged = merge_skills(&defaults, &profile_wins).unwrap();
+        assert_eq!(merged.mode, Some(SkillSelectionMode::AllDiscovered));
+    }
+
+    #[test]
+    fn effective_config_merges_skills_layer() {
+        let registry_root = tempfile::tempdir().unwrap();
+        let data_root = tempfile::tempdir().unwrap();
+
+        let defaults = ProfileConfig {
+            skills: Some(ProfileSkillsConfig {
+                mode: Some(SkillSelectionMode::AllDiscovered),
+                rules: vec![skill_rule("news", false)],
+            }),
+            ..Default::default()
+        };
+        write_profile_defaults(registry_root.path(), &defaults);
+        let store = ProfileStore::open(registry_root.path(), data_root.path()).unwrap();
+
+        let mut profile = inheritance_profile("skilluser");
+        profile.config.skills = Some(ProfileSkillsConfig {
+            mode: None,
+            rules: vec![skill_rule("news", true)], // re-enable inherited disable
+        });
+
+        let eff = store.effective_config(&profile);
+        let skills = eff
+            .skills
+            .expect("skills layer must be present after merge");
+        // profile.mode None ⇒ inherit defaults' AllDiscovered.
+        assert_eq!(skills.mode, Some(SkillSelectionMode::AllDiscovered));
+        // profile re-enabled `news`.
+        assert!(skills.allows("news"));
+    }
+
+    #[test]
+    fn effective_config_skills_none_when_neither_sets_it() {
+        // No skills anywhere ⇒ None ⇒ every discovered skill loads as before.
+        let registry_root = tempfile::tempdir().unwrap();
+        let data_root = tempfile::tempdir().unwrap();
+        let defaults = ProfileConfig {
+            hooks: vec![tool_hook("d")],
+            ..Default::default()
+        };
+        write_profile_defaults(registry_root.path(), &defaults);
+        let store = ProfileStore::open(registry_root.path(), data_root.path()).unwrap();
+
+        let profile = inheritance_profile("noskills");
+        assert!(store.effective_config(&profile).skills.is_none());
+    }
+
+    #[test]
+    fn skills_config_roundtrips_and_defaults_to_absent() {
+        // Absent field deserializes to None (backwards-compatible).
+        let cfg: ProfileConfig = serde_json::from_str("{}").unwrap();
+        assert!(cfg.skills.is_none());
+
+        // snake_case mode + rules roundtrip.
+        let json = r#"{ "skills": { "mode": "allow_list", "rules": [ { "id": "news", "enabled": true } ] } }"#;
+        let cfg: ProfileConfig = serde_json::from_str(json).unwrap();
+        let skills = cfg.skills.unwrap();
+        assert_eq!(skills.mode, Some(SkillSelectionMode::AllowList));
+        assert_eq!(skills.rules, vec![skill_rule("news", true)]);
     }
 
     #[test]
