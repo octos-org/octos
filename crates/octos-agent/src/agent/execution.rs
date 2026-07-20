@@ -379,6 +379,9 @@ impl Agent {
                         Err("tool arguments changed since approval request was created".to_string())
                     }
                 }
+                // Context injection is a `user_prompt_submit`-only outcome and
+                // never arises for a before-tool re-validation; allow the call.
+                HookResult::Context(_) => Ok(()),
                 HookResult::Deny(reason) => {
                     if reason.is_empty() {
                         Err("current policy denied the approved tool call".to_string())
@@ -1527,24 +1530,19 @@ impl Agent {
                                         // `metadata.spawn_complete_companion =
                                         // true`. The api/serve consumer reads
                                         // the flag and persists each per-file
-                                        // row with
-                                        // `MessagePersistedSource::Background`,
-                                        // letting dual-negotiated clients
-                                        // suppress the duplicate at the
-                                        // `live_event_passes_capability_filter`
-                                        // gate in favour of the single
-                                        // `turn/spawn_complete` envelope (which
-                                        // carries the same media via
-                                        // `BackgroundResultPayload.envelope_media`
-                                        // populated below). Internal-only by
+                                        // row as a transcript-only companion.
+                                        // The api/serve consumer suppresses
+                                        // that companion's UI projection; the
+                                        // subsequent background-result commit
+                                        // emits the single canonical v2 child
+                                        // envelope, carrying the same media
+                                        // via `BackgroundResultPayload
+                                        // .envelope_media` populated below.
+                                        // Internal-only by
                                         // design: the scope is keyed on a
                                         // `tokio::task_local!`, NOT on tool
                                         // args, so an LLM cannot spoof the
-                                        // flag through generated JSON. Old
-                                        // clients without
-                                        // `event.spawn_complete.v1` still
-                                        // receive the per-file rows
-                                        // unchanged.
+                                        // flag through generated JSON.
                                         let mut delivered = false;
                                         for attempt in 0..3 {
                                             match crate::tools::send_file::with_spawn_complete_companion_scope(
@@ -1647,47 +1645,24 @@ impl Agent {
                                             );
                                             if let Some(ref sender) = bg_sender {
                                                 // M10 Phase 5a (coalesce):
-                                                // - `media: vec![]` keeps
-                                                //   the persisted row's
-                                                //   wire shape
-                                                //   byte-identical to the
-                                                //   pre-Phase-5a
-                                                //   "spawn-ack with text
-                                                //   only" row that old
-                                                //   clients already render.
-                                                //   Each `sent_files`
-                                                //   entry has its OWN
-                                                //   per-file
-                                                //   `message/persisted`
-                                                //   row from the
-                                                //   `send_file` consumer
-                                                //   above; double-listing
-                                                //   them here would render
-                                                //   the same attachments
-                                                //   twice for old clients.
+                                                // - `media: vec![]` keeps the
+                                                //   background-result transcript
+                                                //   row separate from the
+                                                //   per-file `send_file`
+                                                //   transcript companions.
                                                 // - `envelope_media:
-                                                //   sent_files.clone()`
-                                                //   surfaces those files
-                                                //   on the
-                                                //   `turn/spawn_complete`
-                                                //   envelope so
-                                                //   dual-negotiated
-                                                //   clients (which
-                                                //   suppress the per-file
-                                                //   `Background` rows in
-                                                //   `live_event_passes_capability_filter`)
-                                                //   still see the
-                                                //   attachments inline on
-                                                //   the single completion
-                                                //   bubble.
+                                                //   sent_files.clone()` puts
+                                                //   those files on the single
+                                                //   canonical v2
+                                                //   background-child envelope.
                                                 //
-                                                // Splitting persist-media
-                                                // from envelope-media is
-                                                // what lets the same
-                                                // producer serve both
-                                                // wire shapes correctly
-                                                // without regressing
-                                                // either.
+                                                // The api/serve consumer
+                                                // suppresses UI projection for
+                                                // the per-file companions, so
+                                                // this split preserves durable
+                                                // history while avoiding
+                                                // duplicate attachments on the
+                                                // one visible completion.
                                                 // Mirror the
                                                 // `Satisfied`-branch fix
                                                 // above: when the tool has

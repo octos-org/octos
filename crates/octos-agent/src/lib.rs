@@ -159,7 +159,7 @@ pub use role_template::{
 pub use sandbox::{Sandbox, SandboxConfig, SandboxMode, create_sandbox};
 pub use session::{SessionLimits, SessionState, SessionStateHandle, SessionUsage};
 pub use session_usage::{SessionUsageHandle, SessionUsageSnapshot, SharedSessionUsage};
-pub use skills::{SkillInfo, SkillsLoader};
+pub use skills::{SkillFilter, SkillInfo, SkillsLoader};
 pub use steering::{SteeringMessage, SteeringReceiver, SteeringSender};
 pub use subagent_output::{
     AppendResult, DEFAULT_GC_AGE, DEFAULT_MAX_BYTES_PER_TASK, DEFAULT_MAX_BYTES_TOTAL,

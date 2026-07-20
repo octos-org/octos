@@ -635,8 +635,13 @@ impl ProfileActorFactoryBuilder {
             .profile_store
             .get(profile_id)?
             .ok_or_else(|| eyre::eyre!("target profile '{profile_id}' not found"))?;
-        let effective_profile =
-            crate::profiles::resolve_effective_profile(&self.profile_store, &profile)?;
+        // Resolve through the single shared resolver so routed child bots get
+        // BOTH parent/sub-account inheritance AND the store's global
+        // `profile-defaults.json` base (hooks / sandbox / plugin signing /
+        // memory). `resolve_effective_profile` alone dropped the defaults
+        // layer, so a child bot silently missed operator-mandated hooks and
+        // sandbox restrictions.
+        let effective_profile = self.profile_store.resolve_runtime_profile(&profile);
         let mut profile_config =
             crate::profiles::config_from_profile(&effective_profile, None, None);
         // Section B (codex review round-4): OR-merge the host's
@@ -658,7 +663,15 @@ impl ProfileActorFactoryBuilder {
         let model_id = llm.model_id().to_string();
 
         let profile_data_dir = self.profile_store.resolve_data_dir(&effective_profile);
-        let skills_loader = crate::skills_scope::build_account_skills_loader(&profile_data_dir);
+        // Skill layering v1: the child bot inherits the resolved profile's skill
+        // selection. `None` ⇒ no skills layer ⇒ every discovered skill loads.
+        let skill_filter = effective_profile
+            .config
+            .skills
+            .as_ref()
+            .map(|s| s.to_agent_filter());
+        let skills_loader = crate::skills_scope::build_account_skills_loader(&profile_data_dir)
+            .with_skill_filter(skill_filter.clone());
 
         let mut child_plugin_prompt_fragments = Vec::new();
         let mut child_plugin_hooks: Vec<octos_agent::HookConfig> = Vec::new();
@@ -749,7 +762,7 @@ impl ProfileActorFactoryBuilder {
                 // S2 plumbing: pass profile-scoped synthesis config so per-tenant
                 // routing of synthesis credentials works.
                 let synthesis_config = build_synthesis_config(&profile_config, &provider_name);
-                match octos_agent::PluginLoader::load_into_with_options(
+                match octos_agent::PluginLoader::load_into_with_options_and_filter(
                     &mut tools,
                     &plugin_dirs,
                     &plugin_env,
@@ -764,6 +777,7 @@ impl ProfileActorFactoryBuilder {
                         require_signed: profile_config.plugins.require_signed,
                         verified_cache_dir: None,
                     },
+                    skill_filter.as_ref(),
                 ) {
                     Ok(result) => {
                         child_plugin_prompt_fragments = result.prompt_fragments;
@@ -1426,7 +1440,7 @@ mod tests {
             "test precondition: standalone roots must differ"
         );
 
-        let store = Arc::new(crate::profiles::ProfileStore::open(tmp.path()).unwrap());
+        let store = Arc::new(crate::profiles::ProfileStore::open_unified(tmp.path()).unwrap());
         let tool_config = Arc::new(
             octos_agent::ToolConfigStore::open(&effective_octos_home)
                 .await
