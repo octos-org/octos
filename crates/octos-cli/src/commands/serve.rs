@@ -663,6 +663,14 @@ impl ServeCommand {
                 continue;
             }
             let profile_data_dir = profile_store.resolve_data_dir(profile);
+            // Layer the store's global `profile-defaults.json` base UNDER this
+            // profile so inherited hooks / plugins / sandbox / memory settings
+            // reach the per-profile bootstrap. Absent defaults ⇒ effective
+            // config == `profile.config` (no behavior change).
+            let effective = profile_store.effective_config(profile);
+            let mut profile = profile.clone();
+            profile.config = effective;
+            let profile = &profile;
             // Section B (codex review round-3): thread the host's
             // strict-signing policy so the per-profile plugin load honors
             // `plugins.require_signed = true` from the top-level config

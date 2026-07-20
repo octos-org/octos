@@ -382,8 +382,22 @@ impl GatewayRuntime {
             // for the `--config` path. We forward `config.plugins` here
             // and `bootstrap_with_host_plugins` then OR-merges it onto
             // the profile-derived config, closing the loop.
+            //
+            // Layer the store's global `profile-defaults.json` base UNDER this
+            // profile so inherited hooks / plugins / sandbox / memory settings
+            // reach the per-profile bootstrap, matching `octos serve`. When the
+            // store failed to open (or has no defaults file) this is the raw
+            // profile — no behavior change.
+            let effective_profile = match profile_store.as_ref() {
+                Some(store) => {
+                    let mut p = profile.clone();
+                    p.config = store.effective_config(profile);
+                    p
+                }
+                None => profile.clone(),
+            };
             match ProfileRuntime::bootstrap_with_host_plugins(
-                profile,
+                &effective_profile,
                 &data_dir,
                 Some(&effective_octos_home),
                 crate::runtime::BootstrapRole::Gateway,
