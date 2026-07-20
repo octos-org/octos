@@ -159,11 +159,13 @@ pub fn contract_for(kind: &IrNodeKind) -> PaletteContract {
         },
         IrNodeKind::Fanout { .. } => PaletteContract {
             handler: HandlerKind::DynamicParallel,
-            // Fan-out research workers can search the web + read sources. (The
-            // builtin `web_search`/`web_fetch`; the richer `search` skill is
-            // resolved via discovery when installed, but is not advertised here
-            // so the contract resolves on any profile.)
-            allowed_tools: &["web_search", "web_fetch", "read_file"],
+            // Fan-out research workers search the web + read sources, and WRITE a
+            // per-worker findings file (`findings-<label>.md`) so the converge
+            // node reads full detail from disk instead of a size-truncated inline
+            // summary. (The builtin `web_search`/`web_fetch`; the richer `search`
+            // skill is resolved via discovery when installed, but is not
+            // advertised here so the contract resolves on any profile.)
+            allowed_tools: &["web_search", "web_fetch", "read_file", "write_file"],
             model: Some("cheap"),
         },
     }
@@ -343,7 +345,11 @@ mod tests {
 
         let f = &g.nodes["f"];
         assert_eq!(f.handler, HandlerKind::DynamicParallel);
-        assert_eq!(f.tools, vec!["web_search", "web_fetch", "read_file"]);
+        // Fan-out workers may write their per-worker findings deliverable.
+        assert_eq!(
+            f.tools,
+            vec!["web_search", "web_fetch", "read_file", "write_file"]
+        );
         assert_eq!(f.prompt.as_deref(), Some("plan"), "plan_prompt threaded");
         assert_eq!(f.converge.as_deref(), Some("a"));
 
