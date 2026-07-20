@@ -1174,6 +1174,12 @@ pub struct ProfileStore {
     registry_dir: PathBuf,
     /// Root for the per-profile `<id>/data` runtime tree (per-instance).
     data_profiles_dir: PathBuf,
+    /// Optional global base config layer loaded from
+    /// `<registry_root>/profile-defaults.json`. When present, every profile
+    /// inherits a curated subset of these fields as a base layer, with the
+    /// profile's own config overriding — see [`ProfileStore::effective_config`].
+    /// Absent file ⇒ `None` ⇒ zero behavior change (backward compatible).
+    defaults: Option<ProfileConfig>,
 }
 
 impl ProfileStore {
@@ -1201,10 +1207,120 @@ impl ProfileStore {
                 data_profiles_dir.display()
             )
         })?;
+        let defaults = Self::load_defaults(registry_root);
         Ok(Self {
             registry_dir,
             data_profiles_dir,
+            defaults,
         })
+    }
+
+    /// Read the optional `<registry_root>/profile-defaults.json` global base
+    /// layer. A missing file yields `None`; a read or parse error is logged as
+    /// a warning and also yields `None` — a malformed defaults file must never
+    /// fail store open. Because [`ProfileConfig`] fields all carry
+    /// `#[serde(default)]`, a partial file (e.g. `{"hooks":[...]}`) parses with
+    /// the named fields set and every other field at its `Default`/`None`/empty
+    /// value.
+    fn load_defaults(registry_root: &Path) -> Option<ProfileConfig> {
+        let path = registry_root.join("profile-defaults.json");
+        let content = match std::fs::read_to_string(&path) {
+            Ok(content) => content,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+            Err(e) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %e,
+                    "failed to read profile-defaults.json; ignoring global profile defaults"
+                );
+                return None;
+            }
+        };
+        match serde_json::from_str::<ProfileConfig>(&content) {
+            Ok(defaults) => Some(defaults),
+            Err(e) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %e,
+                    "malformed profile-defaults.json; ignoring global profile defaults"
+                );
+                None
+            }
+        }
+    }
+
+    /// Compute a profile's effective [`ProfileConfig`] by layering the store's
+    /// global `profile-defaults.json` base UNDER the profile's own config.
+    ///
+    /// When no defaults file is present (`self.defaults == None`) this returns
+    /// a byte-identical clone of `profile.config` — absent defaults ⇒ zero
+    /// behavior change (backward compatible).
+    ///
+    /// # Inherited fields (defaults act as a base layer)
+    /// Only these fields inherit; every other field is taken verbatim from the
+    /// profile:
+    /// * `hooks` — additive: `defaults.hooks` followed by the profile's hooks
+    ///   (defaults first, order preserved).
+    /// * `env_vars` — merged: defaults form the base, then the profile's keys
+    ///   are inserted so the profile wins on any duplicate key.
+    /// * `plugins`, `sandbox` — "profile-if-set-else-default": inherited from
+    ///   the defaults only when the profile left the field at its
+    ///   `Default::default()` value.
+    /// * `memory`, `approval_policy`, `cost_budget` — `Option` fallback: the
+    ///   profile's value wins; a `None` falls back to the defaults'.
+    ///
+    /// # Excluded fields (always the profile's own value)
+    /// Identity / channel / instance-specific fields never inherit, because a
+    /// value shared across every profile would leak one tenant's identity or
+    /// wiring into another (e.g. an LLM contract, channel credentials, an email
+    /// account, a public subdomain's routing, admin privileges): `llm`,
+    /// `api_type`, `channels`, `gateway`, `email`, `matrix`, `credential_pool`,
+    /// `voice_default`, `tts_provider`, `tts_cloud`, `review`, `search`,
+    /// `deep_crawl`, `apps`, `home`, `robot`, `content_routing`,
+    /// `adaptive_routing`, `lane_routing`, `admin_mode`.
+    ///
+    /// The implementation clones `profile.config` and overwrites ONLY the
+    /// inherited fields, so any field added to [`ProfileConfig`] in the future
+    /// is profile-only by default — fail-safe against accidentally leaking a
+    /// new identity/channel field through the shared defaults.
+    pub fn effective_config(&self, profile: &UserProfile) -> ProfileConfig {
+        let Some(defaults) = self.defaults.as_ref() else {
+            // Backward compatible: no defaults file ⇒ exact profile config.
+            return profile.config.clone();
+        };
+
+        let mut effective = profile.config.clone();
+
+        // hooks: defaults first, then the profile's own (additive, ordered).
+        let mut hooks = defaults.hooks.clone();
+        hooks.extend(std::mem::take(&mut effective.hooks));
+        effective.hooks = hooks;
+
+        // env_vars: defaults as the base; profile keys override per key.
+        let mut env_vars = defaults.env_vars.clone();
+        env_vars.extend(std::mem::take(&mut effective.env_vars));
+        effective.env_vars = env_vars;
+
+        // plugins / sandbox: inherit only when the profile left them default.
+        if effective.plugins == crate::config::PluginsConfig::default() {
+            effective.plugins = defaults.plugins.clone();
+        }
+        if effective.sandbox == octos_agent::SandboxConfig::default() {
+            effective.sandbox = defaults.sandbox.clone();
+        }
+
+        // memory / approval_policy / cost_budget: profile wins, else defaults.
+        if effective.memory.is_none() {
+            effective.memory = defaults.memory.clone();
+        }
+        if effective.approval_policy.is_none() {
+            effective.approval_policy = defaults.approval_policy.clone();
+        }
+        if effective.cost_budget.is_none() {
+            effective.cost_budget = defaults.cost_budget.clone();
+        }
+
+        effective
     }
 
     /// Open (or create) the profile store with a single unified root — the
@@ -4902,5 +5018,285 @@ mod tests {
         let cfg: ProfileConfig = serde_json::from_str("{}").unwrap();
         assert!(cfg.tts_provider.is_none());
         assert!(cfg.tts_cloud.is_none());
+    }
+
+    // ---- profile config inheritance (global `profile-defaults.json`) ----
+
+    fn inheritance_profile(id: &str) -> UserProfile {
+        UserProfile {
+            id: id.into(),
+            name: id.into(),
+            enabled: true,
+            data_dir: None,
+            parent_id: None,
+            public_subdomain: None,
+            config: ProfileConfig::default(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+
+    fn tool_hook(cmd: &str) -> octos_agent::HookConfig {
+        octos_agent::HookConfig {
+            event: octos_agent::HookEvent::BeforeToolCall,
+            command: vec![cmd.to_string()],
+            timeout_ms: 5000,
+            tool_filter: Vec::new(),
+            path_filter: Vec::new(),
+            requires_bin: None,
+        }
+    }
+
+    fn write_profile_defaults(registry_root: &Path, config: &ProfileConfig) {
+        std::fs::write(
+            registry_root.join("profile-defaults.json"),
+            serde_json::to_string_pretty(config).unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn effective_config_inherits_when_profile_leaves_fields_unset() {
+        let registry_root = tempfile::tempdir().unwrap();
+        let data_root = tempfile::tempdir().unwrap();
+
+        let defaults = ProfileConfig {
+            hooks: vec![tool_hook("default-hook")],
+            env_vars: HashMap::from([
+                ("SHARED".to_string(), "from-default".to_string()),
+                ("ONLY_DEFAULT".to_string(), "d".to_string()),
+            ]),
+            memory: Some(crate::config::MemoryConfig {
+                max_inject_tokens: Some(4242),
+                refresh: None,
+            }),
+            approval_policy: Some(crate::config::ApprovalPolicyConfig::default()),
+            plugins: crate::config::PluginsConfig {
+                require_signed: true,
+            },
+            sandbox: octos_agent::SandboxConfig {
+                allow_network: true,
+                ..Default::default()
+            },
+            // Identity / channel fields on the defaults must NEVER leak into a
+            // profile that omits them.
+            api_type: Some("anthropic".to_string()),
+            admin_mode: true,
+            channels: vec![ChannelCredentials::Discord {
+                token_env: "DEFAULT_DISCORD".to_string(),
+            }],
+            ..Default::default()
+        };
+        write_profile_defaults(registry_root.path(), &defaults);
+
+        let store = ProfileStore::open(registry_root.path(), data_root.path()).unwrap();
+
+        let mut profile = inheritance_profile("alice");
+        profile.config.hooks = vec![tool_hook("profile-hook")];
+        profile
+            .config
+            .env_vars
+            .insert("SHARED".to_string(), "from-profile".to_string());
+        profile
+            .config
+            .env_vars
+            .insert("ONLY_PROFILE".to_string(), "p".to_string());
+        profile.config.api_type = Some("openai".to_string());
+        // plugins, sandbox, memory, approval_policy left at Default/None.
+
+        let eff = store.effective_config(&profile);
+
+        // hooks: defaults first, then the profile's own (order preserved).
+        assert_eq!(eff.hooks.len(), 2);
+        assert_eq!(eff.hooks[0].command, vec!["default-hook".to_string()]);
+        assert_eq!(eff.hooks[1].command, vec!["profile-hook".to_string()]);
+
+        // env_vars: merged; profile key wins on collision.
+        assert_eq!(
+            eff.env_vars.get("SHARED").map(String::as_str),
+            Some("from-profile")
+        );
+        assert_eq!(
+            eff.env_vars.get("ONLY_DEFAULT").map(String::as_str),
+            Some("d")
+        );
+        assert_eq!(
+            eff.env_vars.get("ONLY_PROFILE").map(String::as_str),
+            Some("p")
+        );
+
+        // memory + approval_policy inherited (profile left them None).
+        assert_eq!(eff.memory.as_ref().unwrap().max_inject_tokens, Some(4242));
+        assert!(eff.approval_policy.is_some());
+
+        // plugins + sandbox inherited (profile left them at Default).
+        assert!(eff.plugins.require_signed);
+        assert!(eff.sandbox.allow_network);
+
+        // Identity / channel fields NEVER inherit.
+        assert_eq!(eff.api_type.as_deref(), Some("openai"));
+        assert!(!eff.admin_mode);
+        assert!(
+            eff.channels.is_empty(),
+            "channels are identity/instance-specific and must not inherit from defaults"
+        );
+    }
+
+    #[test]
+    fn effective_config_prefers_profile_value_over_defaults() {
+        let registry_root = tempfile::tempdir().unwrap();
+        let data_root = tempfile::tempdir().unwrap();
+
+        let defaults = ProfileConfig {
+            memory: Some(crate::config::MemoryConfig {
+                max_inject_tokens: Some(1),
+                refresh: None,
+            }),
+            approval_policy: Some(crate::config::ApprovalPolicyConfig::default()),
+            // Non-default sandbox: workspace_write=false differs from the
+            // profile's own non-default sandbox below.
+            sandbox: octos_agent::SandboxConfig {
+                workspace_write: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        write_profile_defaults(registry_root.path(), &defaults);
+
+        let store = ProfileStore::open(registry_root.path(), data_root.path()).unwrap();
+
+        let mut profile = inheritance_profile("bob");
+        profile.config.memory = Some(crate::config::MemoryConfig {
+            max_inject_tokens: Some(999),
+            refresh: None,
+        });
+        profile.config.approval_policy = None; // will inherit
+        // Non-default plugins + sandbox → the profile's own must be kept whole.
+        profile.config.plugins = crate::config::PluginsConfig {
+            require_signed: true,
+        };
+        profile.config.sandbox = octos_agent::SandboxConfig {
+            allow_network: true,
+            ..Default::default()
+        };
+
+        let eff = store.effective_config(&profile);
+
+        // memory: profile's Some wins over the defaults'.
+        assert_eq!(eff.memory.as_ref().unwrap().max_inject_tokens, Some(999));
+        // approval_policy: None → inherits the defaults'.
+        assert!(eff.approval_policy.is_some());
+        // plugins: profile's non-default value is kept, NOT overwritten.
+        assert!(eff.plugins.require_signed);
+        // sandbox: the profile's WHOLE value is kept — allow_network stays true
+        // and workspace_write stays the profile's default (true), NOT the
+        // defaults' false.
+        assert!(eff.sandbox.allow_network);
+        assert!(
+            eff.sandbox.workspace_write,
+            "a non-default profile sandbox must be kept whole, not merged with defaults"
+        );
+    }
+
+    #[test]
+    fn effective_config_without_defaults_equals_profile_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ProfileStore::open_unified(dir.path()).unwrap();
+
+        let mut profile = inheritance_profile("carol");
+        profile.config.hooks = vec![tool_hook("profile-hook")];
+        profile
+            .config
+            .env_vars
+            .insert("K".to_string(), "v".to_string());
+        profile.config.plugins = crate::config::PluginsConfig {
+            require_signed: true,
+        };
+
+        // No `profile-defaults.json` ⇒ byte-identical clone (backward compat).
+        assert_eq!(store.effective_config(&profile), profile.config);
+    }
+
+    #[test]
+    fn empty_profile_inherits_default_hooks() {
+        let registry_root = tempfile::tempdir().unwrap();
+        let data_root = tempfile::tempdir().unwrap();
+
+        let defaults = ProfileConfig {
+            hooks: vec![tool_hook("default-hook")],
+            ..Default::default()
+        };
+        write_profile_defaults(registry_root.path(), &defaults);
+
+        let store = ProfileStore::open(registry_root.path(), data_root.path()).unwrap();
+
+        // A freshly-created profile with an empty config already inherits the
+        // defaults' hooks at consumption time — no create-time seeding needed.
+        let profile = inheritance_profile("frank");
+        assert!(profile.config.hooks.is_empty());
+
+        let eff = store.effective_config(&profile);
+        assert_eq!(eff.hooks.len(), 1);
+        assert_eq!(eff.hooks[0].command, vec!["default-hook".to_string()]);
+    }
+
+    #[test]
+    fn save_persists_raw_profile_config_not_inherited_defaults() {
+        let registry_root = tempfile::tempdir().unwrap();
+        let data_root = tempfile::tempdir().unwrap();
+
+        let defaults = ProfileConfig {
+            hooks: vec![tool_hook("default-hook")],
+            ..Default::default()
+        };
+        write_profile_defaults(registry_root.path(), &defaults);
+
+        let store = ProfileStore::open(registry_root.path(), data_root.path()).unwrap();
+
+        let mut profile = inheritance_profile("dave");
+        profile.config.hooks = vec![tool_hook("profile-hook")];
+
+        // Sanity: the effective view merges both hooks.
+        assert_eq!(store.effective_config(&profile).hooks.len(), 2);
+
+        store.save(&profile).unwrap();
+
+        // On-disk JSON must carry ONLY the profile's own hook — the inherited
+        // default hook must never be persisted into the profile record.
+        let raw = std::fs::read_to_string(store.profile_path("dave")).unwrap();
+        assert!(raw.contains("profile-hook"));
+        assert!(
+            !raw.contains("default-hook"),
+            "save() must persist the raw profile config, not the merged effective config"
+        );
+
+        // Reload confirms the persisted record still has exactly one hook.
+        let reloaded = store.get("dave").unwrap().unwrap();
+        assert_eq!(reloaded.config.hooks.len(), 1);
+        assert_eq!(
+            reloaded.config.hooks[0].command,
+            vec!["profile-hook".to_string()]
+        );
+    }
+
+    #[test]
+    fn malformed_defaults_file_opens_store_and_is_ignored() {
+        let registry_root = tempfile::tempdir().unwrap();
+        let data_root = tempfile::tempdir().unwrap();
+
+        std::fs::write(
+            registry_root.path().join("profile-defaults.json"),
+            "{ this is not valid json",
+        )
+        .unwrap();
+
+        // Store still opens despite the malformed defaults file.
+        let store = ProfileStore::open(registry_root.path(), data_root.path()).unwrap();
+
+        let mut profile = inheritance_profile("erin");
+        profile.config.hooks = vec![tool_hook("profile-hook")];
+
+        // Defaults treated as absent ⇒ effective == profile.config.
+        assert_eq!(store.effective_config(&profile), profile.config);
     }
 }
