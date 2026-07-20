@@ -365,7 +365,29 @@ async fn sub_providers_upsert_list_and_remove_round_trip() {
             .await
             .expect("upsert");
         assert_eq!(res["applied"], true);
+        // A persisted change is not live until restart — the client must be told.
+        assert_eq!(res["restart_required"], true);
     }
+
+    // A pasted api_key with no api_key_env must be REJECTED (was silently
+    // dropped, leaving the lane to grab ambient/primary credentials).
+    let no_env = RpcRequest::new(
+        "u-noenv".to_string(),
+        APPUI_METHOD_PROFILE_SUB_PROVIDERS_UPSERT.to_string(),
+        json!({
+            "profile_id": "dev",
+            "sub_provider": { "key": "x", "provider": "openai" },
+            "api_key": "sk-secret",
+        }),
+    );
+    let err = raw_profile_sub_providers_upsert(&state, &no_env, None)
+        .await
+        .expect_err("api_key without api_key_env must be rejected");
+    assert!(
+        err.message.contains("api_key_env"),
+        "reject reason should name api_key_env; got {}",
+        err.message
+    );
 
     // List reflects both lanes in insertion order.
     let list_req = RpcRequest::new(
