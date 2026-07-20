@@ -125,17 +125,29 @@ impl ModelHints {
         // families can reject `reasoning_effort`.
         let reasoning_style = if m.contains("deepseek-v4") || m.contains("deepseek-reasoner") {
             ReasoningStyle::EffortAndThinkingToggle
-        } else if m.contains("kimi-k3") || m == "k3" {
-            // K3 (incl. the coding plan's bare `k3` id): per its quickstart docs
-            // `reasoning_effort` accepts low|high|max (default max); thinking is
-            // always on and the K2.x `thinking` object is rejected. Graded effort
-            // IS honored — do NOT collapse everything to "max".
+        } else if m.contains("kimi-k3") || m == "k3" || m.starts_with("kimi-for-coding") {
+            // K3, incl. the coding plan's bare `k3` and `kimi-for-coding*` ids
+            // (same K3 model, different ids that don't contain `kimi-k3`): per
+            // its quickstart docs `reasoning_effort` accepts low|high|max
+            // (default max); thinking is always on and the K2.x `thinking`
+            // object is rejected. Graded effort IS honored — do NOT collapse
+            // everything to "max". (These ids already pin temperature above;
+            // they must get the graded style too or `/thinking` is a no-op.)
             ReasoningStyle::EffortLowHighMax
-        } else if m.contains("glm") {
-            // GLM-4.5+/5.x (Zhipu / Z.ai, e.g. `glm-5.2`): thinking is a binary
-            // `thinking:{"type":"enabled"}` toggle, no graded effort. Any set
-            // effort level enables thinking (previously fell to None → /thinking
-            // was a no-op for GLM).
+        } else if m.contains("glm-4.5")
+            || m.contains("glm-4.6")
+            || m.contains("glm-5")
+            || m.contains("glm-z")
+        {
+            // GLM-4.5+/4.6/5.x + the z-reasoning line (Zhipu / Z.ai, e.g.
+            // `glm-5.2`): thinking is a binary `thinking:{"type":"enabled"}`
+            // toggle, no graded effort. Any set effort level enables thinking.
+            // Narrowed from a bare `contains("glm")`: legacy `glm-4`/`glm-4-plus`/
+            // `glm-3` REJECT the thinking object (400), so they must not match.
+            // NOTE: the SHIPPED `glm-5.2` route runs through AnthropicProvider
+            // (Z.ai's Anthropic-compatible endpoint), which maps `/thinking` via
+            // `build_anthropic_thinking`; this arm only governs a GLM added
+            // through an OpenAI-compatible endpoint.
             ReasoningStyle::ThinkingToggle
         } else if m.starts_with("grok-4") || is_o_series || m.starts_with("gpt-5") {
             ReasoningStyle::Effort
@@ -1439,6 +1451,16 @@ mod tests {
             ModelHints::detect("zai-org/glm-4.6").reasoning_style,
             ReasoningStyle::ThinkingToggle
         );
+        // Legacy GLM (pre-4.5) REJECTS the `thinking` object — it must NOT get
+        // the toggle style (a bare `contains("glm")` used to misfire here and
+        // send an unsupported field → 400).
+        for legacy in ["glm-4", "glm-4-plus", "zhipu/glm-4-air", "glm-3-turbo"] {
+            assert_eq!(
+                ModelHints::detect(legacy).reasoning_style,
+                ReasoningStyle::None,
+                "{legacy} predates the thinking toggle and must emit no reasoning control"
+            );
+        }
         // Non-thinking / unknown-control models emit nothing. grok-3 is
         // excluded (only grok-4.x is known to accept reasoning_effort).
         for m in [
@@ -1684,12 +1706,15 @@ mod tests {
                 h.fixed_temperature,
                 "{id} must pin temperature (K3 rejects any temperature != 1)"
             );
+            // These ids ARE the K3 model, so they must also get K3's graded
+            // low|high|max reasoning — otherwise `/thinking` is silently a
+            // no-op for the coding-plan aliases even though temperature is pinned.
+            assert_eq!(
+                h.reasoning_style,
+                ReasoningStyle::EffortLowHighMax,
+                "{id} is the K3 model and must get K3's graded low|high|max reasoning"
+            );
         }
-        // Bare `k3` also gets K3's low|high|max reasoning.
-        assert_eq!(
-            ModelHints::detect("k3").reasoning_style,
-            ReasoningStyle::EffortLowHighMax
-        );
         // Guard: an unrelated model containing "k3" as a substring is NOT the
         // coding plan (exact match only), so it is unaffected.
         assert!(!ModelHints::detect("mock-k3000").fixed_temperature);
