@@ -71,7 +71,7 @@ fn with_connect_info(mut req: Request<Body>, addr: SocketAddr) -> Request<Body> 
 /// can grant sessions for these ids) and the X-Profile-Id branch in
 /// `is_authorized_for_profile` can resolve sub-account parentage.
 fn build_state(_dir: &TempDir, profiles: &[(&str, Option<&str>)]) -> Arc<AppState> {
-    let store = Arc::new(octos_cli::profiles::ProfileStore::open(_dir.path()).unwrap());
+    let store = Arc::new(octos_cli::profiles::ProfileStore::open_unified(_dir.path()).unwrap());
     for (id, parent) in profiles {
         let profile = octos_cli::profiles::UserProfile {
             id: (*id).into(),
@@ -104,7 +104,8 @@ fn build_state_with_users(
     users: &[(&str, &str, octos_cli::user_store::UserRole)],
     profiles: &[(&str, Option<&str>)],
 ) -> (Arc<AppState>, Arc<octos_cli::otp::AuthManager>) {
-    let profile_store = Arc::new(octos_cli::profiles::ProfileStore::open(dir.path()).unwrap());
+    let profile_store =
+        Arc::new(octos_cli::profiles::ProfileStore::open_unified(dir.path()).unwrap());
     for (id, parent) in profiles {
         let profile = octos_cli::profiles::UserProfile {
             id: (*id).into(),
@@ -649,7 +650,8 @@ async fn build_state_with_sessions_for_tenant_b(
     tenant_b_id: &str,
     session_id: &str,
 ) -> Arc<AppState> {
-    let profile_store = Arc::new(octos_cli::profiles::ProfileStore::open(dir.path()).unwrap());
+    let profile_store =
+        Arc::new(octos_cli::profiles::ProfileStore::open_unified(dir.path()).unwrap());
     for (id, parent) in profiles {
         let profile = octos_cli::profiles::UserProfile {
             id: (*id).into(),

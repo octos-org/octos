@@ -1426,7 +1426,7 @@ mod tests {
             "test precondition: standalone roots must differ"
         );
 
-        let store = Arc::new(crate::profiles::ProfileStore::open(tmp.path()).unwrap());
+        let store = Arc::new(crate::profiles::ProfileStore::open_unified(tmp.path()).unwrap());
         let tool_config = Arc::new(
             octos_agent::ToolConfigStore::open(&effective_octos_home)
                 .await

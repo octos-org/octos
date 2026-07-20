@@ -504,6 +504,14 @@ mod tests {
             profile.contains(r#"(allow file-read* (subpath "/custom/path"))"#),
             "should allow reading custom path"
         );
+        // `/private/etc` must reach the restricted profile by its CANONICAL path
+        // (macOS `/etc` symlink) so system curl/LibreSSL can read
+        // `/private/etc/ssl/openssl.cnf` + `cert.pem` under the network-on
+        // default — otherwise TLS clients fast-fail "Operation not permitted".
+        assert!(
+            profile.contains(r#"(allow file-read* (subpath "/private/etc"))"#),
+            "should allow reading /private/etc (canonical of /etc) for TLS config, profile:\n{profile}"
+        );
     }
 
     #[cfg(target_os = "macos")]

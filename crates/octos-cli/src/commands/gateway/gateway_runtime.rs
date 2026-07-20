@@ -334,7 +334,7 @@ impl GatewayRuntime {
         // resolves --data-dir > $OCTOS_HOME > ~/.octos).
         let effective_octos_home = cmd.octos_home.clone().unwrap_or_else(|| data_dir.clone());
         let profile_store: Option<Arc<crate::profiles::ProfileStore>> =
-            crate::profiles::ProfileStore::open(&effective_octos_home)
+            crate::profiles::ProfileStore::open_unified(&effective_octos_home)
                 .ok()
                 .map(Arc::new);
 

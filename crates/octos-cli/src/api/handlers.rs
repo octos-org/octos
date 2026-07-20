@@ -4698,7 +4698,7 @@ mod tests {
         use crate::profiles::{ProfileStore, UserProfile};
 
         let home = tempfile::tempdir().unwrap();
-        let store = ProfileStore::open(home.path()).unwrap();
+        let store = ProfileStore::open_unified(home.path()).unwrap();
         let tenant_data_dir = home.path().join("tenant-data");
         store
             .save(&UserProfile {
@@ -4802,7 +4802,7 @@ mod tests {
         use crate::profiles::{ProfileStore, UserProfile};
 
         let home = tempfile::tempdir().unwrap();
-        let store = ProfileStore::open(home.path()).unwrap();
+        let store = ProfileStore::open_unified(home.path()).unwrap();
 
         // A profile whose sessions live at an explicit data dir — the
         // directory the running solo/stdio session persists turns to.
@@ -6159,7 +6159,7 @@ mod tests {
     /// tests with a profile_store containing the listed profiles.
     fn state_with_profiles(profiles: &[(&str, Option<&str>)]) -> (tempfile::TempDir, AppState) {
         let dir = tempfile::tempdir().unwrap();
-        let ps = ProfileStore::open(dir.path()).unwrap();
+        let ps = ProfileStore::open_unified(dir.path()).unwrap();
         for (id, parent) in profiles {
             ps.save(&make_profile(id, *parent)).unwrap();
         }

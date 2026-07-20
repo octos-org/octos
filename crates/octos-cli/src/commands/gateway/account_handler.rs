@@ -404,7 +404,7 @@ mod tests {
 
     fn create_store_with_sub_account() -> (tempfile::TempDir, Arc<ProfileStore>, String) {
         let dir = tempfile::tempdir().expect("tempdir");
-        let store = Arc::new(ProfileStore::open(dir.path()).expect("profile store"));
+        let store = Arc::new(ProfileStore::open_unified(dir.path()).expect("profile store"));
 
         let now = Utc::now();
         let parent = UserProfile {

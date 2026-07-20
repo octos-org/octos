@@ -232,7 +232,7 @@ mod tests {
     fn build_test_state() -> (TempDir, Arc<AppState>) {
         let temp = TempDir::new().expect("tempdir");
         let data_dir = temp.path();
-        let profile_store = Arc::new(ProfileStore::open(data_dir).expect("profile store"));
+        let profile_store = Arc::new(ProfileStore::open_unified(data_dir).expect("profile store"));
         let user_store = Arc::new(UserStore::open(data_dir).expect("user store"));
         let tenant_store = Arc::new(TenantStore::open(data_dir).expect("tenant store"));
 

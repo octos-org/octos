@@ -229,7 +229,7 @@ mod tests {
             std::env::set_var("OPENAI_API_KEY", "test-key");
         }
 
-        let store = Arc::new(crate::profiles::ProfileStore::open(dir.path()).unwrap());
+        let store = Arc::new(crate::profiles::ProfileStore::open_unified(dir.path()).unwrap());
 
         let mut parent = make_profile("botfather", Some("admin parent"));
         parent.config.llm = Some(crate::profiles::LlmProfileConfig {
@@ -572,7 +572,7 @@ mod tests {
     #[test]
     fn test_dispatch_unknown_profile_falls_back() {
         let dir = tempfile::TempDir::new().unwrap();
-        let store = crate::profiles::ProfileStore::open(dir.path()).unwrap();
+        let store = crate::profiles::ProfileStore::open_unified(dir.path()).unwrap();
         store
             .save(&make_profile("weather", Some("weather prompt")))
             .unwrap();
@@ -587,7 +587,7 @@ mod tests {
     #[test]
     fn test_dispatch_known_profile_keeps_target() {
         let dir = tempfile::TempDir::new().unwrap();
-        let store = crate::profiles::ProfileStore::open(dir.path()).unwrap();
+        let store = crate::profiles::ProfileStore::open_unified(dir.path()).unwrap();
         store
             .save(&make_profile("weather", Some("weather prompt")))
             .unwrap();
@@ -625,7 +625,7 @@ mod tests {
     #[tokio::test]
     async fn test_delete_bot_keeps_route_when_profile_delete_fails() {
         let dir = tempfile::TempDir::new().unwrap();
-        let store = Arc::new(crate::profiles::ProfileStore::open(dir.path()).unwrap());
+        let store = Arc::new(crate::profiles::ProfileStore::open_unified(dir.path()).unwrap());
         let mut parent = make_profile("botfather", None);
         parent
             .config
@@ -721,7 +721,7 @@ mod tests {
     #[tokio::test]
     async fn test_delete_bot_rejects_non_owner() {
         let dir = tempfile::TempDir::new().unwrap();
-        let store = Arc::new(crate::profiles::ProfileStore::open(dir.path()).unwrap());
+        let store = Arc::new(crate::profiles::ProfileStore::open_unified(dir.path()).unwrap());
         let mut parent = make_profile("botfather", None);
         parent
             .config
@@ -804,7 +804,7 @@ mod tests {
     #[tokio::test]
     async fn test_delete_bot_allows_operator_override() {
         let dir = tempfile::TempDir::new().unwrap();
-        let store = Arc::new(crate::profiles::ProfileStore::open(dir.path()).unwrap());
+        let store = Arc::new(crate::profiles::ProfileStore::open_unified(dir.path()).unwrap());
         let mut parent = make_profile("botfather", None);
         parent
             .config
