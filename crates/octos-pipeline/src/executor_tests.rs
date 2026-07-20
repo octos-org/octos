@@ -26,6 +26,13 @@ fn sanitize_label_for_filename_yields_a_deterministic_fs_safe_token() {
     assert_eq!(sanitize_label_for_filename("///"), "task");
     // CJK (and other alphanumeric scripts) are preserved.
     assert_eq!(sanitize_label_for_filename("技术架构"), "技术架构");
+    // Length is capped (by chars, UTF-8-safe) so a pathological label can't
+    // overflow the filename; per-worker uniqueness comes from the index suffix
+    // the caller appends, not from the full label.
+    let long = "a".repeat(200);
+    assert_eq!(sanitize_label_for_filename(&long).chars().count(), 48);
+    let long_cjk = "中".repeat(100);
+    assert_eq!(sanitize_label_for_filename(&long_cjk).chars().count(), 48);
 }
 
 #[test]

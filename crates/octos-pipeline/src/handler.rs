@@ -666,9 +666,23 @@ impl Handler for CodergenHandler {
         // reads `self.tools.sandbox()`). `with_builtins` would store `NoSandbox`,
         // letting such a command validator escape to the host from a sandboxed
         // pipeline. A no-op backend runs the argv directly (unchanged).
-        let mut tools = octos_agent::ToolRegistry::with_builtins_and_sandbox(
+        // Research review (BLOCKER): the worker registry MUST inherit the
+        // session's write permission, not hardcode workspace_write.
+        // `with_builtins_and_sandbox` pins `EffectivePermissions::workspace_write()`,
+        // so once the Fanout palette grants `write_file`, a worker in a READ-ONLY
+        // session could write files (a permission escalation — worse because
+        // search workers run web_search/web_fetch on untrusted pages that can
+        // prompt-inject a write). Derive permissions from the session sandbox so a
+        // read-only session's workers get read-only file access.
+        let permissions = if self.sandbox.workspace_write {
+            octos_agent::EffectivePermissions::workspace_write()
+        } else {
+            octos_agent::EffectivePermissions::read_only()
+        };
+        let mut tools = octos_agent::ToolRegistry::with_builtins_and_permissions(
             &self.working_dir,
             octos_agent::create_sandbox(&self.sandbox),
+            permissions,
         );
 
         // Backend bug #1: load plugin tools from a process-shared cache.
@@ -753,7 +767,14 @@ impl Handler for CodergenHandler {
         // to a file in ONE call and return a concise executive summary as text.
         // Without explicit "single call" instruction, some models (e.g. kimi-k2.5)
         // chunk output into ~4K token pieces across many iterations, causing timeouts.
-        if node.tools.iter().any(|t| t == "write_file") {
+        //
+        // Only genuine final-report nodes get this. Fan-out workers (synthetic id
+        // `<parent>_task_<i>`) now also carry write_file, but they follow their own
+        // deliverable prompt (write `findings-<label>.md`, return a short summary);
+        // the generic report injection (descriptive filename, ~1000-word body,
+        // "delivered to the user") would contradict it and let a worker write an
+        // arbitrarily-named file the analyze node can't find.
+        if node.tools.iter().any(|t| t == "write_file") && !node.id.contains("_task_") {
             system_prompt.push_str(
                 "\n\nIMPORTANT: You MUST do two things:\n\
                  1. Save your COMPLETE report in ONE SINGLE write_file call (choose a descriptive \
