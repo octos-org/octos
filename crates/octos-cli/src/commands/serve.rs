@@ -663,13 +663,13 @@ impl ServeCommand {
                 continue;
             }
             let profile_data_dir = profile_store.resolve_data_dir(profile);
-            // Layer the store's global `profile-defaults.json` base UNDER this
-            // profile so inherited hooks / plugins / sandbox / memory settings
-            // reach the per-profile bootstrap. Absent defaults ⇒ effective
-            // config == `profile.config` (no behavior change).
-            let effective = profile_store.effective_config(profile);
-            let mut profile = profile.clone();
-            profile.config = effective;
+            // Resolve the full runtime profile through the single shared
+            // resolver: parent/sub-account inheritance THEN the store's global
+            // `profile-defaults.json` base, so inherited hooks / plugins /
+            // sandbox / memory settings reach the per-profile bootstrap. Absent
+            // parent + defaults ⇒ effective config == `profile.config` (no
+            // behavior change).
+            let profile = profile_store.resolve_runtime_profile(profile);
             let profile = &profile;
             // Section B (codex review round-3): thread the host's
             // strict-signing policy so the per-profile plugin load honors

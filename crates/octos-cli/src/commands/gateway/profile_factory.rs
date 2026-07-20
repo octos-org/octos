@@ -635,8 +635,13 @@ impl ProfileActorFactoryBuilder {
             .profile_store
             .get(profile_id)?
             .ok_or_else(|| eyre::eyre!("target profile '{profile_id}' not found"))?;
-        let effective_profile =
-            crate::profiles::resolve_effective_profile(&self.profile_store, &profile)?;
+        // Resolve through the single shared resolver so routed child bots get
+        // BOTH parent/sub-account inheritance AND the store's global
+        // `profile-defaults.json` base (hooks / sandbox / plugin signing /
+        // memory). `resolve_effective_profile` alone dropped the defaults
+        // layer, so a child bot silently missed operator-mandated hooks and
+        // sandbox restrictions.
+        let effective_profile = self.profile_store.resolve_runtime_profile(&profile);
         let mut profile_config =
             crate::profiles::config_from_profile(&effective_profile, None, None);
         // Section B (codex review round-4): OR-merge the host's

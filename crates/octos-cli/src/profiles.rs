@@ -1256,71 +1256,47 @@ impl ProfileStore {
     /// a byte-identical clone of `profile.config` — absent defaults ⇒ zero
     /// behavior change (backward compatible).
     ///
-    /// # Inherited fields (defaults act as a base layer)
-    /// Only these fields inherit; every other field is taken verbatim from the
-    /// profile:
-    /// * `hooks` — additive: `defaults.hooks` followed by the profile's hooks
-    ///   (defaults first, order preserved).
-    /// * `env_vars` — merged: defaults form the base, then the profile's keys
-    ///   are inserted so the profile wins on any duplicate key.
-    /// * `plugins`, `sandbox` — "profile-if-set-else-default": inherited from
-    ///   the defaults only when the profile left the field at its
-    ///   `Default::default()` value.
-    /// * `memory`, `approval_policy`, `cost_budget` — `Option` fallback: the
-    ///   profile's value wins; a `None` falls back to the defaults'.
-    ///
-    /// # Excluded fields (always the profile's own value)
-    /// Identity / channel / instance-specific fields never inherit, because a
-    /// value shared across every profile would leak one tenant's identity or
-    /// wiring into another (e.g. an LLM contract, channel credentials, an email
-    /// account, a public subdomain's routing, admin privileges): `llm`,
-    /// `api_type`, `channels`, `gateway`, `email`, `matrix`, `credential_pool`,
-    /// `voice_default`, `tts_provider`, `tts_cloud`, `review`, `search`,
-    /// `deep_crawl`, `apps`, `home`, `robot`, `content_routing`,
-    /// `adaptive_routing`, `lane_routing`, `admin_mode`.
-    ///
-    /// The implementation clones `profile.config` and overwrites ONLY the
-    /// inherited fields, so any field added to [`ProfileConfig`] in the future
-    /// is profile-only by default — fail-safe against accidentally leaking a
-    /// new identity/channel field through the shared defaults.
+    /// See [`merge_profile_defaults`] for the field-by-field merge rules and
+    /// the security-floor semantics applied to `sandbox` and `plugins`.
     pub fn effective_config(&self, profile: &UserProfile) -> ProfileConfig {
-        let Some(defaults) = self.defaults.as_ref() else {
+        match self.defaults.as_ref() {
+            Some(defaults) => merge_profile_defaults(&profile.config, defaults),
             // Backward compatible: no defaults file ⇒ exact profile config.
-            return profile.config.clone();
+            None => profile.config.clone(),
+        }
+    }
+
+    /// Resolve a profile into the fully-inherited config a consumer should run
+    /// with: parent / sub-account inheritance ([`resolve_effective_profile`])
+    /// THEN the store's global `profile-defaults.json` base
+    /// ([`effective_config`](Self::effective_config)) applied on top.
+    ///
+    /// This is the SINGLE source of a profile's runtime config — every place
+    /// that reads a profile's sandbox / hooks / approvals / memory / plugin
+    /// signing at runtime (serve's per-profile loop, the gateway, routed
+    /// child bots) must resolve through here so both inheritance layers apply
+    /// uniformly. Reading `profile.config` raw silently drops one or both
+    /// layers.
+    ///
+    /// Infallible by design: a broken parent link is logged and the profile is
+    /// used without parent inheritance, but the global-defaults layer is still
+    /// applied (fail-safe — a missing parent must not drop the operator's base
+    /// hooks / sandbox restrictions / signing floor).
+    pub fn resolve_runtime_profile(&self, profile: &UserProfile) -> UserProfile {
+        let mut resolved = match resolve_effective_profile(self, profile) {
+            Ok(resolved) => resolved,
+            Err(error) => {
+                tracing::warn!(
+                    profile_id = %profile.id,
+                    %error,
+                    "failed to resolve parent inheritance; applying global defaults to the \
+                     profile without parent inheritance",
+                );
+                profile.clone()
+            }
         };
-
-        let mut effective = profile.config.clone();
-
-        // hooks: defaults first, then the profile's own (additive, ordered).
-        let mut hooks = defaults.hooks.clone();
-        hooks.extend(std::mem::take(&mut effective.hooks));
-        effective.hooks = hooks;
-
-        // env_vars: defaults as the base; profile keys override per key.
-        let mut env_vars = defaults.env_vars.clone();
-        env_vars.extend(std::mem::take(&mut effective.env_vars));
-        effective.env_vars = env_vars;
-
-        // plugins / sandbox: inherit only when the profile left them default.
-        if effective.plugins == crate::config::PluginsConfig::default() {
-            effective.plugins = defaults.plugins.clone();
-        }
-        if effective.sandbox == octos_agent::SandboxConfig::default() {
-            effective.sandbox = defaults.sandbox.clone();
-        }
-
-        // memory / approval_policy / cost_budget: profile wins, else defaults.
-        if effective.memory.is_none() {
-            effective.memory = defaults.memory.clone();
-        }
-        if effective.approval_policy.is_none() {
-            effective.approval_policy = defaults.approval_policy.clone();
-        }
-        if effective.cost_budget.is_none() {
-            effective.cost_budget = defaults.cost_budget.clone();
-        }
-
-        effective
+        resolved.config = self.effective_config(&resolved);
+        resolved
     }
 
     /// Open (or create) the profile store with a single unified root — the
@@ -1747,6 +1723,195 @@ fn preserve_local_owner_metadata(path: &Path, serialized: &mut serde_json::Value
             object.insert(key.to_owned(), value.clone());
         }
     }
+}
+
+/// Layer a global `profile-defaults.json` base UNDER a profile's own
+/// [`ProfileConfig`], returning the effective config a consumer should run
+/// with. `base` is the profile's own config; `defaults` is the global base.
+///
+/// # Inherited fields (defaults act as a base layer)
+/// * `hooks` — additive: `defaults.hooks` followed by the profile's hooks
+///   (defaults first, order preserved).
+/// * `env_vars` — merged: defaults form the base, the profile's keys win on
+///   any duplicate key.
+///
+///   TRUST BOUNDARY: inherited `env_vars` intentionally SHARE the operator's
+///   credentials across every profile — a `profile-defaults.json` API key is
+///   visible to all profiles by design. This is acceptable for a
+///   single-operator deployment; it is NOT tenant isolation. Do not place one
+///   tenant's secrets in the defaults expecting another tenant not to receive
+///   them; per-tenant credentials belong on each profile's own `env_vars`.
+/// * `plugins`, `sandbox` — presence-aware, field-by-field (see below).
+/// * `memory`, `approval_policy`, `cost_budget` — `Option` fallback: the
+///   profile's value wins; a `None` falls back to the defaults'.
+///
+/// # Presence-aware merge for `sandbox` / `plugins`
+/// A field inherits from `defaults` ONLY when the profile left it at the
+/// type's `Default` value — our proxy for "omitted on disk". (The merge runs
+/// on the typed, already-loaded profile, so a field the profile omitted is
+/// indistinguishable from one it explicitly set to the default.) This means a
+/// profile that sets ONE sandbox field (e.g. `read_allow_paths`) still
+/// inherits every OTHER default sandbox restriction, instead of the whole
+/// struct reverting to type defaults the moment any single field is set — the
+/// bug this replaces.
+///
+/// # Security floors (a profile may tighten, never loosen)
+/// Applied AFTER the merge, and ONLY for fields whose *restrictive* value
+/// differs from the type `Default` — so a `profile-defaults.json` that merely
+/// round-trips the type defaults never spuriously tightens a profile:
+/// * `plugins.require_signed` (restrictive `true` ≠ default `false`): logical
+///   OR. If the defaults require signing, a profile can NOT turn it off.
+/// * `sandbox.workspace_write` (restrictive `false` ≠ default `true`): logical
+///   AND. A defaults `workspace_write: false` (read-only workspace) can NOT be
+///   lifted by a profile.
+/// * `sandbox.read_allow_paths` (restrictive non-empty ≠ default empty): when
+///   the defaults restrict reads, a profile may only pick a SUBSET (paths at or
+///   under an operator-approved root); paths outside every root are dropped and
+///   an emptied/allow-all list is clamped back to the operator's set.
+///
+/// `sandbox.allow_network` / `sandbox.enabled` have a restrictive value that
+/// EQUALS the type default, so a standalone floor would fire on every
+/// round-tripped defaults file. For those the presence-aware merge alone is the
+/// guard: a profile that sets an *unrelated* field can no longer silently drop
+/// a default `allow_network: false` / `enabled: true` (the omitted field is
+/// inherited). An *explicit* profile setting is honored — profiles are
+/// operator-authored (single-operator trust model), not tenant-uploaded.
+///
+/// Every field NOT listed above is taken verbatim from the profile, so any
+/// field added to [`ProfileConfig`] in the future is profile-only by default —
+/// fail-safe against leaking a new identity/channel field through the shared
+/// defaults.
+pub(crate) fn merge_profile_defaults(
+    base: &ProfileConfig,
+    defaults: &ProfileConfig,
+) -> ProfileConfig {
+    let mut effective = base.clone();
+
+    // hooks: defaults first, then the profile's own (additive, ordered).
+    let mut hooks = defaults.hooks.clone();
+    hooks.extend(std::mem::take(&mut effective.hooks));
+    effective.hooks = hooks;
+
+    // env_vars: defaults as the base; profile keys override per key.
+    // Trust boundary: see the fn doc — inherited env_vars share operator
+    // credentials across all profiles (single-operator, NOT tenant isolation).
+    let mut env_vars = defaults.env_vars.clone();
+    env_vars.extend(std::mem::take(&mut effective.env_vars));
+    effective.env_vars = env_vars;
+
+    // plugins / sandbox: presence-aware field merge + security floors.
+    effective.plugins = merge_plugins_defaults(&base.plugins, &defaults.plugins);
+    effective.sandbox = merge_sandbox_defaults(&base.sandbox, &defaults.sandbox);
+
+    // memory / approval_policy / cost_budget: profile wins, else defaults.
+    if effective.memory.is_none() {
+        effective.memory = defaults.memory.clone();
+    }
+    if effective.approval_policy.is_none() {
+        effective.approval_policy = defaults.approval_policy.clone();
+    }
+    if effective.cost_budget.is_none() {
+        effective.cost_budget = defaults.cost_budget.clone();
+    }
+
+    effective
+}
+
+/// Presence-aware merge of `plugins` with a security floor on `require_signed`.
+///
+/// `require_signed` is a one-way ratchet: a profile can turn signing ON, and a
+/// `defaults.require_signed = true` forces it on even when the profile omits or
+/// explicitly disables it (logical OR). The merge (profile-if-set) and the
+/// floor (a required signing can't be disabled) collapse to a single OR, so a
+/// profile can only tighten the operator's signing policy, never loosen it.
+fn merge_plugins_defaults(
+    base: &crate::config::PluginsConfig,
+    defaults: &crate::config::PluginsConfig,
+) -> crate::config::PluginsConfig {
+    crate::config::PluginsConfig {
+        require_signed: base.require_signed || defaults.require_signed,
+    }
+}
+
+/// Presence-aware, field-by-field merge of `sandbox` with security floors.
+///
+/// See [`merge_profile_defaults`] for the full semantics. In short: a field is
+/// inherited from `defaults` when the profile left it at the type default
+/// (proxy for "omitted"); then `workspace_write` (logical AND) and
+/// `read_allow_paths` (subset clamp) enforce a floor a profile can tighten but
+/// not loosen.
+fn merge_sandbox_defaults(
+    base: &octos_agent::SandboxConfig,
+    defaults: &octos_agent::SandboxConfig,
+) -> octos_agent::SandboxConfig {
+    let type_default = octos_agent::SandboxConfig::default();
+    let mut eff = base.clone();
+
+    // Presence-aware fill: inherit a defaults field only where the profile left
+    // it at the type default. This keeps every OTHER default restriction when a
+    // profile sets just one sandbox field.
+    if base.enabled == type_default.enabled {
+        eff.enabled = defaults.enabled;
+    }
+    if base.mode == type_default.mode {
+        eff.mode = defaults.mode.clone();
+    }
+    if base.allow_network == type_default.allow_network {
+        eff.allow_network = defaults.allow_network;
+    }
+    if base.workspace_write == type_default.workspace_write {
+        eff.workspace_write = defaults.workspace_write;
+    }
+    if base.docker == type_default.docker {
+        eff.docker = defaults.docker.clone();
+    }
+    if base.read_allow_paths == type_default.read_allow_paths {
+        eff.read_allow_paths = defaults.read_allow_paths.clone();
+    }
+    if base.profile_name == type_default.profile_name {
+        eff.profile_name = defaults.profile_name.clone();
+    }
+
+    // --- Security floors: a profile may tighten, never loosen. Applied only
+    // where the restrictive value differs from the type default, so a defaults
+    // file that round-trips the type defaults never spuriously tightens.
+
+    // workspace_write: restrictive `false` (type default `true`). A read-only
+    // workspace mandated by the defaults can never be lifted by a profile.
+    eff.workspace_write = eff.workspace_write && defaults.workspace_write;
+
+    // read_allow_paths: a non-empty defaults list restricts reads to those
+    // roots. A profile may only narrow to a subset (paths at/under an operator
+    // root); paths outside every root are dropped, and emptying the list back
+    // to allow-all is clamped to the operator's set.
+    if !defaults.read_allow_paths.is_empty() {
+        let clamped: Vec<String> = eff
+            .read_allow_paths
+            .iter()
+            .filter(|path| sandbox_path_within_any(path, &defaults.read_allow_paths))
+            .cloned()
+            .collect();
+        eff.read_allow_paths = if clamped.is_empty() {
+            defaults.read_allow_paths.clone()
+        } else {
+            clamped
+        };
+    }
+
+    eff
+}
+
+/// True when `path` is exactly one of `roots` or nested beneath one of them.
+/// Enforces the `read_allow_paths` floor: a profile may only keep read roots
+/// that fall within an operator-approved root.
+fn sandbox_path_within_any(path: &str, roots: &[String]) -> bool {
+    roots.iter().any(|root| {
+        let root = root.trim_end_matches('/');
+        path == root
+            || path
+                .strip_prefix(root)
+                .is_some_and(|rest| rest.starts_with('/'))
+    })
 }
 
 /// Resolve the effective config for a profile. If it's a sub-account,
@@ -5171,7 +5336,8 @@ mod tests {
             refresh: None,
         });
         profile.config.approval_policy = None; // will inherit
-        // Non-default plugins + sandbox → the profile's own must be kept whole.
+        // The profile sets ONE sandbox field (allow_network) and turns signing
+        // on, but omits workspace_write.
         profile.config.plugins = crate::config::PluginsConfig {
             require_signed: true,
         };
@@ -5186,15 +5352,19 @@ mod tests {
         assert_eq!(eff.memory.as_ref().unwrap().max_inject_tokens, Some(999));
         // approval_policy: None → inherits the defaults'.
         assert!(eff.approval_policy.is_some());
-        // plugins: profile's non-default value is kept, NOT overwritten.
+        // plugins: profile turned signing on; it stays on.
         assert!(eff.plugins.require_signed);
-        // sandbox: the profile's WHOLE value is kept — allow_network stays true
-        // and workspace_write stays the profile's default (true), NOT the
-        // defaults' false.
+        // sandbox is now a FIELD-BY-FIELD merge, not whole-struct replace:
+        // the profile's explicitly-set allow_network stays true, ...
         assert!(eff.sandbox.allow_network);
+        // ... while workspace_write, which the profile did NOT set, inherits the
+        // defaults' read-only floor (false) instead of reverting to the profile
+        // struct's type default (true). This is the FIX-1a correction — before,
+        // the whole struct reverted the moment any single field was set.
         assert!(
-            eff.sandbox.workspace_write,
-            "a non-default profile sandbox must be kept whole, not merged with defaults"
+            !eff.sandbox.workspace_write,
+            "an omitted sandbox field must inherit the default restriction even \
+             when the profile set a different sandbox field"
         );
     }
 
@@ -5298,5 +5468,198 @@ mod tests {
 
         // Defaults treated as absent ⇒ effective == profile.config.
         assert_eq!(store.effective_config(&profile), profile.config);
+    }
+
+    #[test]
+    fn effective_config_field_merges_sandbox_when_profile_sets_one_field() {
+        // FIX 1a: a profile that sets ONE sandbox field must still inherit
+        // every OTHER default sandbox restriction (not revert the whole struct
+        // to type defaults the moment any single field is set).
+        let registry_root = tempfile::tempdir().unwrap();
+        let data_root = tempfile::tempdir().unwrap();
+
+        let defaults = ProfileConfig {
+            sandbox: octos_agent::SandboxConfig {
+                workspace_write: false, // read-only workspace floor
+                allow_network: true,    // network allowed by default
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        write_profile_defaults(registry_root.path(), &defaults);
+        let store = ProfileStore::open(registry_root.path(), data_root.path()).unwrap();
+
+        let mut profile = inheritance_profile("gwen");
+        // Profile sets ONLY read_allow_paths, leaving every other field unset.
+        profile.config.sandbox = octos_agent::SandboxConfig {
+            read_allow_paths: vec!["/work".into()],
+            ..Default::default()
+        };
+
+        let eff = store.effective_config(&profile);
+
+        // The one field the profile set is preserved ...
+        assert_eq!(eff.sandbox.read_allow_paths, vec!["/work".to_string()]);
+        // ... and the omitted fields inherit the defaults' restrictions.
+        assert!(
+            !eff.sandbox.workspace_write,
+            "omitted workspace_write must inherit the default read-only floor"
+        );
+        assert!(
+            eff.sandbox.allow_network,
+            "omitted allow_network must inherit the default"
+        );
+    }
+
+    #[test]
+    fn require_signed_floor_cannot_be_disabled_by_profile() {
+        // FIX 1b: `plugins.require_signed` is a one-way ratchet — a defaults
+        // `require_signed = true` cannot be turned off by a profile.
+        let registry_root = tempfile::tempdir().unwrap();
+        let data_root = tempfile::tempdir().unwrap();
+
+        let defaults = ProfileConfig {
+            plugins: crate::config::PluginsConfig {
+                require_signed: true,
+            },
+            ..Default::default()
+        };
+        write_profile_defaults(registry_root.path(), &defaults);
+        let store = ProfileStore::open(registry_root.path(), data_root.path()).unwrap();
+
+        let mut profile = inheritance_profile("heidi");
+        // Profile explicitly tries to disable signing.
+        profile.config.plugins = crate::config::PluginsConfig {
+            require_signed: false,
+        };
+
+        let eff = store.effective_config(&profile);
+        assert!(
+            eff.plugins.require_signed,
+            "a profile must not be able to disable a defaults-mandated signing floor"
+        );
+    }
+
+    #[test]
+    fn read_allow_paths_floor_clamps_profile_to_operator_roots() {
+        // A non-empty defaults `read_allow_paths` is a floor: a profile may
+        // only narrow to a subset (paths under an operator root); a path
+        // outside every root is dropped.
+        let registry_root = tempfile::tempdir().unwrap();
+        let data_root = tempfile::tempdir().unwrap();
+
+        let defaults = ProfileConfig {
+            sandbox: octos_agent::SandboxConfig {
+                read_allow_paths: vec!["/srv/data".into()],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        write_profile_defaults(registry_root.path(), &defaults);
+        let store = ProfileStore::open(registry_root.path(), data_root.path()).unwrap();
+
+        // A profile that widens beyond the operator root has the out-of-floor
+        // path dropped, keeping only the subpath under `/srv/data`.
+        let mut widen = inheritance_profile("ivan");
+        widen.config.sandbox = octos_agent::SandboxConfig {
+            read_allow_paths: vec!["/srv/data/tenant".into(), "/etc/secret".into()],
+            ..Default::default()
+        };
+        let eff = store.effective_config(&widen);
+        assert_eq!(
+            eff.sandbox.read_allow_paths,
+            vec!["/srv/data/tenant".to_string()],
+            "paths outside the operator's read roots must be dropped"
+        );
+
+        // A profile whose paths are ALL outside the floor is clamped back to
+        // the operator's set (never silently widened to allow-all).
+        let mut escape = inheritance_profile("judy");
+        escape.config.sandbox = octos_agent::SandboxConfig {
+            read_allow_paths: vec!["/etc/secret".into()],
+            ..Default::default()
+        };
+        let eff = store.effective_config(&escape);
+        assert_eq!(
+            eff.sandbox.read_allow_paths,
+            vec!["/srv/data".to_string()],
+            "an entirely out-of-floor profile list is clamped to the operator's roots"
+        );
+    }
+
+    #[test]
+    fn resolve_runtime_profile_applies_parent_and_defaults() {
+        // FIX 2: the shared resolver applies BOTH parent/sub-account
+        // inheritance AND the global profile-defaults layer.
+        let registry_root = tempfile::tempdir().unwrap();
+        let data_root = tempfile::tempdir().unwrap();
+
+        let defaults = ProfileConfig {
+            hooks: vec![tool_hook("default-hook")],
+            env_vars: HashMap::from([("DEFAULT_ONLY".to_string(), "d".to_string())]),
+            sandbox: octos_agent::SandboxConfig {
+                workspace_write: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        write_profile_defaults(registry_root.path(), &defaults);
+        let store = ProfileStore::open(registry_root.path(), data_root.path()).unwrap();
+
+        let mut parent = inheritance_profile("acct");
+        parent.config.env_vars = HashMap::from([
+            ("PARENT_ONLY".to_string(), "p".to_string()),
+            ("SHARED".to_string(), "parent".to_string()),
+        ]);
+        store.save(&parent).unwrap();
+
+        let mut child = inheritance_profile("acct--work");
+        child.parent_id = Some("acct".into());
+        child.config.hooks = vec![tool_hook("child-hook")];
+        child.config.env_vars = HashMap::from([("SHARED".to_string(), "child".to_string())]);
+        store.save(&child).unwrap();
+
+        let resolved = store.resolve_runtime_profile(&child);
+
+        // Parent layer: the child inherits the parent-only env var.
+        assert_eq!(resolved.config.env_vars.get("PARENT_ONLY").unwrap(), "p");
+        // Child wins on a collision with the parent.
+        assert_eq!(resolved.config.env_vars.get("SHARED").unwrap(), "child");
+        // Defaults layer: the defaults-only env var and hook are present ...
+        assert_eq!(resolved.config.env_vars.get("DEFAULT_ONLY").unwrap(), "d");
+        assert_eq!(resolved.config.hooks.len(), 2);
+        assert_eq!(
+            resolved.config.hooks[0].command,
+            vec!["default-hook".to_string()]
+        );
+        assert_eq!(
+            resolved.config.hooks[1].command,
+            vec!["child-hook".to_string()]
+        );
+        // Defaults sandbox floor applies through the resolver.
+        assert!(!resolved.config.sandbox.workspace_write);
+    }
+
+    #[test]
+    fn resolve_runtime_profile_without_parent_applies_defaults() {
+        // A parentless profile (the serve per-profile-loop shape) still gets
+        // the global defaults layer through the shared resolver.
+        let registry_root = tempfile::tempdir().unwrap();
+        let data_root = tempfile::tempdir().unwrap();
+
+        let defaults = ProfileConfig {
+            hooks: vec![tool_hook("default-hook")],
+            ..Default::default()
+        };
+        write_profile_defaults(registry_root.path(), &defaults);
+        let store = ProfileStore::open(registry_root.path(), data_root.path()).unwrap();
+
+        let profile = inheritance_profile("kate");
+        let resolved = store.resolve_runtime_profile(&profile);
+        assert_eq!(resolved.config.hooks.len(), 1);
+        assert_eq!(
+            resolved.config.hooks[0].command,
+            vec!["default-hook".to_string()]
+        );
     }
 }
