@@ -54,6 +54,16 @@ pub struct ProfileConfig {
     /// First-class structured LLM selection contract.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub llm: Option<LlmProfileConfig>,
+    /// Named provider lanes for per-node pipeline routing (e.g. the
+    /// `deep_research` pipeline's `cheap`/`strong` nodes) and sub-agent model
+    /// selection. These are ISOLATED from the primary coding provider: the serve
+    /// path builds a `ProviderRouter` from these entries ONLY (never the coding
+    /// primary/fallbacks), so a research-lane failover trips its own circuit
+    /// breakers and can never disturb the coding conversation's provider or its
+    /// KV/prompt cache. Empty by default (pipeline nodes then use the shared
+    /// coding provider, unchanged behavior).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sub_providers: Vec<crate::config::SubProviderConfig>,
     /// Per-tenant reply-voice (TTS timbre) choice. Voice route/ASR settings stay
     /// platform-level on the serve config; only the chosen timbre is per-user.
     /// Applied at profile bootstrap over the shared `VoiceConfig.default_voice`
@@ -2511,7 +2521,7 @@ pub(crate) fn config_from_profile(
         hooks: profile.config.hooks.clone(),
         approval_policy: profile.config.approval_policy.clone(),
         context_filter: vec![],
-        sub_providers: vec![],
+        sub_providers: profile.config.sub_providers.clone(),
         email: profile
             .config
             .email
@@ -3261,6 +3271,55 @@ mod tests {
         assert_eq!(saved["username"], serde_json::json!("ada"));
         assert_eq!(saved["email"], serde_json::json!("ada@example.com"));
         assert_eq!(saved["name"], serde_json::json!("Ada Byron"));
+    }
+
+    #[test]
+    fn config_from_profile_maps_sub_providers_for_isolated_pipeline_lanes() {
+        // The `deep_research` pipeline's `cheap`/`strong` nodes resolve through
+        // the profile's `sub_providers`; `config_from_profile` must carry them
+        // into the runtime `Config`. It used to hard-zero them (`vec![]`), so
+        // serve-mode pipelines could never reach an isolated research lane.
+        let sp = |key: &str, provider: &str, model: &str| crate::config::SubProviderConfig {
+            key: key.into(),
+            provider: provider.into(),
+            model: Some(model.into()),
+            api_key_env: None,
+            base_url: None,
+            description: None,
+            default_context_window: None,
+            max_output_tokens: None,
+            api_type: None,
+        };
+        let profile = UserProfile {
+            id: "research-lane".into(),
+            name: "Research Lane".into(),
+            enabled: false,
+            data_dir: None,
+            parent_id: None,
+            public_subdomain: None,
+            config: ProfileConfig {
+                sub_providers: vec![
+                    sp("cheap", "gemini", "gemini-2.5-flash"),
+                    sp("strong", "openai", "gpt-5-mini"),
+                ],
+                ..Default::default()
+            },
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+
+        let config = config_from_profile(&profile, None, None);
+        assert_eq!(
+            config.sub_providers.len(),
+            2,
+            "profile sub_providers must reach the runtime config (was hard-zeroed)"
+        );
+        assert_eq!(config.sub_providers[0].key, "cheap");
+        assert_eq!(
+            config.sub_providers[0].model.as_deref(),
+            Some("gemini-2.5-flash")
+        );
+        assert_eq!(config.sub_providers[1].key, "strong");
     }
 
     #[test]

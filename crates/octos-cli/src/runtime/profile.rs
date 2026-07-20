@@ -32,6 +32,64 @@ use crate::skills_scope::{
     build_account_skills_loader, discover_ominix_url, push_runtime_plugin_env,
 };
 
+/// Build an ISOLATED per-node pipeline provider router from the profile's
+/// `sub_providers` (e.g. the `deep_research` pipeline's `cheap`/`strong`
+/// nodes, resolved via `RunPipelineTool`'s provider router).
+///
+/// Registers ONLY the declared sub-providers — never the coding primary or its
+/// fallbacks — so a research-lane failover (`FallbackProvider` +
+/// `compatible_fallbacks`) trips its OWN circuit breakers and can never disturb
+/// the coding conversation's provider or its KV/prompt cache. Returns `None`
+/// when no sub-providers are configured, in which case pipeline nodes fall back
+/// to the shared coding provider (`self.llm` in `resolve_provider`) exactly as
+/// before. Mirrors the gateway's sub-provider registration
+/// (`gateway_runtime.rs`) but deliberately omits the primary/fallback
+/// auto-registration to keep the research lane isolated.
+fn build_sub_provider_router(config: &Config) -> Option<Arc<octos_llm::ProviderRouter>> {
+    if config.sub_providers.is_empty() {
+        return None;
+    }
+    let router = Arc::new(octos_llm::ProviderRouter::new());
+    let mut registered = 0usize;
+    for sp in &config.sub_providers {
+        // Per-sub-provider key override, matching the gateway path: an explicit
+        // `api_key_env` selects a distinct credential; otherwise inherit the
+        // profile's default for the provider.
+        let sp_config = if sp.api_key_env.is_some() {
+            let mut c = config.clone();
+            c.api_key_env = sp.api_key_env.clone();
+            c
+        } else {
+            config.clone()
+        };
+        match chat::create_provider_with_api_type(
+            &sp.provider,
+            &sp_config,
+            sp.model.clone(),
+            sp.base_url.clone(),
+            sp.api_type.as_deref(),
+        ) {
+            Ok(p) => {
+                router.register_with_full_meta(
+                    &sp.key,
+                    Arc::new(octos_llm::RetryProvider::new(p)),
+                    sp.description.clone(),
+                    sp.default_context_window,
+                    sp.max_output_tokens,
+                );
+                registered += 1;
+            }
+            Err(e) => warn!(
+                key = %sp.key,
+                provider = %sp.provider,
+                error = %e,
+                "skipping isolated pipeline sub-provider (research lane)"
+            ),
+        }
+    }
+    if registered > 0 { Some(router) } else { None }
+}
+
 /// All long-lived state that belongs to a single profile within the
 /// current host process.
 ///
@@ -807,6 +865,12 @@ impl ProfileRuntime {
                 /// agents inherit the contamination-safe hybrid scored
                 /// + filtered memory recall path.
                 embedder: Option<Arc<dyn octos_llm::EmbeddingProvider>>,
+                /// Isolated per-node model router built from the profile's
+                /// `sub_providers` (e.g. `deep_research`'s `cheap`/`strong`
+                /// nodes). Registers ONLY sub-providers, so per-node failover
+                /// trips its own breakers and never disturbs the coding
+                /// provider/cache. `None` ⇒ nodes use the shared coding `llm`.
+                provider_router: Option<Arc<octos_llm::ProviderRouter>>,
             }
 
             impl crate::session_actor::PipelineToolFactory for AppUiPipelineToolFactory {
@@ -831,6 +895,9 @@ impl ProfileRuntime {
                     if let Some(ref embedder) = self.embedder {
                         pt = pt.with_embedder(embedder.clone());
                     }
+                    if let Some(ref router) = self.provider_router {
+                        pt = pt.with_provider_router(router.clone());
+                    }
                     Arc::new(pt)
                 }
             }
@@ -845,6 +912,7 @@ impl ProfileRuntime {
                     octos_home: effective_octos_home.clone(),
                     plugin_require_signed: config.plugins.require_signed,
                     embedder: embedder.clone(),
+                    provider_router: build_sub_provider_router(&config),
                 });
 
             // Register the parent `run_pipeline` via the same factory so the
