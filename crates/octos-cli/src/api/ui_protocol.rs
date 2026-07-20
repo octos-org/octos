@@ -203,6 +203,14 @@ const APPUI_METHOD_PROFILE_LLM_DELETE: &str = "profile/llm/delete";
 const GOAL_SEGMENT_NAME: &str = "session-goal";
 const APPUI_METHOD_PROFILE_LLM_TEST: &str = "profile/llm/test";
 const APPUI_METHOD_PROFILE_LLM_FETCH_MODELS: &str = "profile/llm/fetch_models";
+/// Named provider lanes (`sub_providers`) for per-node pipeline routing (e.g.
+/// `deep_research`'s `cheap`/`strong` lanes). `/research` in the TUI reads +
+/// edits these; they persist to `profile.config.sub_providers` and rebuild the
+/// isolated research router at the next `ProfileRuntime` bootstrap (restart to
+/// apply for a pinned solo profile).
+const APPUI_METHOD_PROFILE_SUB_PROVIDERS_LIST: &str = "profile/sub_providers/list";
+const APPUI_METHOD_PROFILE_SUB_PROVIDERS_UPSERT: &str = "profile/sub_providers/upsert";
+const APPUI_METHOD_PROFILE_SUB_PROVIDERS_REMOVE: &str = "profile/sub_providers/remove";
 const APPUI_METHOD_PROFILE_SKILLS_LIST: &str = "profile/skills/list";
 const APPUI_METHOD_PROFILE_SKILLS_REGISTRY_SEARCH: &str = "profile/skills/registry/search";
 const APPUI_METHOD_PROFILE_SKILLS_INSTALL: &str = "profile/skills/install";
@@ -270,6 +278,9 @@ const APPUI_EXTRA_METHODS: &[&str] = &[
     APPUI_METHOD_PROFILE_LLM_DELETE,
     APPUI_METHOD_PROFILE_LLM_TEST,
     APPUI_METHOD_PROFILE_LLM_FETCH_MODELS,
+    APPUI_METHOD_PROFILE_SUB_PROVIDERS_LIST,
+    APPUI_METHOD_PROFILE_SUB_PROVIDERS_UPSERT,
+    APPUI_METHOD_PROFILE_SUB_PROVIDERS_REMOVE,
     APPUI_METHOD_PROFILE_SKILLS_LIST,
     APPUI_METHOD_PROFILE_SKILLS_REGISTRY_SEARCH,
     APPUI_METHOD_PROFILE_SKILLS_INSTALL,
@@ -6281,6 +6292,50 @@ struct RawProfileLlmDeleteParams {
     route_id: String,
 }
 
+/// One named provider lane on the wire (mirrors [`crate::config::SubProviderConfig`]).
+/// `key` is required; the rest are optional so the TUI can send whatever the
+/// user filled in.
+#[derive(Debug, Default, Deserialize)]
+struct RawSubProvider {
+    key: String,
+    #[serde(default)]
+    provider: Option<String>,
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    api_key_env: Option<String>,
+    #[serde(default)]
+    base_url: Option<String>,
+    #[serde(default)]
+    description: Option<String>,
+    #[serde(default)]
+    default_context_window: Option<u32>,
+    #[serde(default)]
+    max_output_tokens: Option<u32>,
+    #[serde(default)]
+    api_type: Option<String>,
+}
+
+/// `profile/sub_providers/upsert`: add or replace (by `key`) one named lane.
+#[derive(Debug, Default, Deserialize)]
+struct RawProfileSubProvidersUpsertParams {
+    #[serde(default)]
+    profile_id: Option<String>,
+    sub_provider: RawSubProvider,
+    /// Optional secret to store under the lane's `api_key_env` (never persisted
+    /// to plaintext config — relocated to the OS keychain like the llm path).
+    #[serde(default)]
+    api_key: Option<Value>,
+}
+
+/// `profile/sub_providers/remove`: drop the lane with this `key`.
+#[derive(Debug, Deserialize)]
+struct RawProfileSubProvidersRemoveParams {
+    #[serde(default)]
+    profile_id: Option<String>,
+    key: String,
+}
+
 #[derive(Debug, Default, Deserialize)]
 struct RawAutonomyListParams {
     #[serde(default)]
@@ -9262,6 +9317,204 @@ fn profile_llm_mutation_result(
     result
 }
 
+fn sub_provider_json(sp: &crate::config::SubProviderConfig) -> Value {
+    json!({
+        "key": sp.key,
+        "provider": sp.provider,
+        "model": sp.model,
+        "api_key_env": sp.api_key_env,
+        "base_url": sp.base_url,
+        "description": sp.description,
+        "default_context_window": sp.default_context_window,
+        "max_output_tokens": sp.max_output_tokens,
+        "api_type": sp.api_type,
+    })
+}
+
+fn sub_providers_list_result(
+    state: &AppState,
+    profile_id: &str,
+    profile: Option<&crate::profiles::UserProfile>,
+) -> Value {
+    let sub_providers: Vec<Value> = profile
+        .map(|p| {
+            p.config
+                .sub_providers
+                .iter()
+                .map(sub_provider_json)
+                .collect()
+        })
+        .unwrap_or_default();
+    json!({
+        "profile_id": profile_id,
+        "sub_providers": sub_providers,
+        "runtime_policy_stamp": runtime_policy_stamp_for_profile(state, profile_id, None, profile),
+    })
+}
+
+fn sub_providers_mutation_result(
+    state: &AppState,
+    profile_id: &str,
+    profile: Option<&crate::profiles::UserProfile>,
+    applied: bool,
+) -> Value {
+    let mut result = sub_providers_list_result(state, profile_id, profile);
+    if let Value::Object(ref mut object) = result {
+        object.insert("applied".into(), Value::Bool(applied));
+    }
+    result
+}
+
+/// `profile/sub_providers/list`: read the profile's named provider lanes.
+fn raw_profile_sub_providers_list(
+    state: &Arc<AppState>,
+    request: &RpcRequest<Value>,
+    connection_profile_id: Option<&str>,
+) -> Result<Value, RpcError> {
+    let params: RawProfileParams = parse_raw_params(request)?;
+    let profile_id = raw_scoped_llm_profile_id(
+        params.profile_id.clone(),
+        params.session_id.as_ref(),
+        connection_profile_id,
+    )?;
+    let store = profile_store(state)?;
+    let profile = store
+        .get(&profile_id)
+        .map_err(|err| RpcError::internal_error(format!("failed to read profile: {err}")))?;
+    Ok(sub_providers_list_result(
+        state,
+        &profile_id,
+        profile.as_ref(),
+    ))
+}
+
+/// `profile/sub_providers/upsert`: add or replace one lane by `key`.
+async fn raw_profile_sub_providers_upsert(
+    state: &Arc<AppState>,
+    request: &RpcRequest<Value>,
+    connection_profile_id: Option<&str>,
+) -> Result<Value, RpcError> {
+    let params: RawProfileSubProvidersUpsertParams = parse_raw_params(request)?;
+    let profile_id =
+        raw_scoped_llm_profile_id(params.profile_id.clone(), None, connection_profile_id)?;
+    let store = profile_store(state)?;
+    let mut profile = store
+        .get(&profile_id)
+        .map_err(|err| RpcError::internal_error(format!("failed to read profile: {err}")))?
+        .unwrap_or_else(|| default_profile(&profile_id));
+
+    let key = nonempty(Some(params.sub_provider.key))
+        .ok_or_else(|| RpcError::invalid_params("sub_provider.key is required"))?;
+    let provider = nonempty(params.sub_provider.provider)
+        .ok_or_else(|| RpcError::invalid_params("sub_provider.provider is required"))?;
+    let api_key_env = nonempty(params.sub_provider.api_key_env);
+
+    // Store any pasted secret under the lane's api_key_env, never in plaintext.
+    if let (Some(env), Some(secret)) = (api_key_env.as_ref(), secret_from_value(params.api_key)) {
+        profile.config.env_vars.insert(env.clone(), secret);
+    }
+
+    let entry = crate::config::SubProviderConfig {
+        key: key.clone(),
+        provider,
+        model: nonempty(params.sub_provider.model),
+        api_key_env,
+        base_url: nonempty(params.sub_provider.base_url),
+        description: nonempty(params.sub_provider.description),
+        default_context_window: params.sub_provider.default_context_window,
+        max_output_tokens: params.sub_provider.max_output_tokens,
+        api_type: nonempty(params.sub_provider.api_type),
+    };
+    // Replace the lane with the same key, else append.
+    if let Some(existing) = profile
+        .config
+        .sub_providers
+        .iter_mut()
+        .find(|sp| sp.key == key)
+    {
+        *existing = entry;
+    } else {
+        profile.config.sub_providers.push(entry);
+    }
+
+    crate::api::admin::relocate_keychain_backed_secrets(&mut profile.config.env_vars, &profile_id)
+        .map_err(|(_, msg)| RpcError::invalid_params(msg))?;
+    profile.updated_at = Utc::now();
+    store
+        .save_with_merge(&mut profile)
+        .map_err(|err| RpcError::internal_error(format!("failed to save profile: {err}")))?;
+    // A LIVE runtime is NOT rebuilt here — the isolated research router is built
+    // at ProfileRuntime bootstrap, so a pinned solo profile needs a restart to
+    // pick up the change (the TUI surfaces that). This only bootstraps when no
+    // runtime exists yet.
+    if let Err(error) = ensure_session_profile_runtime(state, Some(&profile_id)).await {
+        tracing::warn!(
+            profile_id = %profile_id,
+            error = %error.message,
+            "profile/sub_providers/upsert saved but runtime bootstrap is not ready yet",
+        );
+    }
+    Ok(sub_providers_mutation_result(
+        state,
+        &profile_id,
+        Some(&profile),
+        true,
+    ))
+}
+
+/// `profile/sub_providers/remove`: drop the lane with this `key`.
+async fn raw_profile_sub_providers_remove(
+    state: &Arc<AppState>,
+    request: &RpcRequest<Value>,
+    connection_profile_id: Option<&str>,
+) -> Result<Value, RpcError> {
+    let params: RawProfileSubProvidersRemoveParams = parse_raw_params(request)?;
+    let profile_id =
+        raw_scoped_llm_profile_id(params.profile_id.clone(), None, connection_profile_id)?;
+    let key =
+        nonempty(Some(params.key)).ok_or_else(|| RpcError::invalid_params("key is required"))?;
+    let store = profile_store(state)?;
+    let Some(mut profile) = store
+        .get(&profile_id)
+        .map_err(|err| RpcError::internal_error(format!("failed to read profile: {err}")))?
+    else {
+        return Ok(sub_providers_mutation_result(
+            state,
+            &profile_id,
+            None,
+            false,
+        ));
+    };
+    let before = profile.config.sub_providers.len();
+    profile.config.sub_providers.retain(|sp| sp.key != key);
+    let applied = profile.config.sub_providers.len() != before;
+    if !applied {
+        return Ok(sub_providers_mutation_result(
+            state,
+            &profile_id,
+            Some(&profile),
+            false,
+        ));
+    }
+    profile.updated_at = Utc::now();
+    store
+        .save_with_merge(&mut profile)
+        .map_err(|err| RpcError::internal_error(format!("failed to save profile: {err}")))?;
+    if let Err(error) = ensure_session_profile_runtime(state, Some(&profile_id)).await {
+        tracing::warn!(
+            profile_id = %profile_id,
+            error = %error.message,
+            "profile/sub_providers/remove saved but runtime bootstrap is not ready yet",
+        );
+    }
+    Ok(sub_providers_mutation_result(
+        state,
+        &profile_id,
+        Some(&profile),
+        true,
+    ))
+}
+
 fn profile_llm_test_result(
     state: &AppState,
     profile_id: &str,
@@ -9710,6 +9963,15 @@ async fn handle_raw_appui_rpc(
         APPUI_METHOD_PROFILE_LLM_FETCH_MODELS => {
             raw_profile_llm_fetch_models(state, request, connection_profile_id).await
         }
+        APPUI_METHOD_PROFILE_SUB_PROVIDERS_LIST => {
+            raw_profile_sub_providers_list(state, request, connection_profile_id)
+        }
+        APPUI_METHOD_PROFILE_SUB_PROVIDERS_UPSERT => {
+            raw_profile_sub_providers_upsert(state, request, connection_profile_id).await
+        }
+        APPUI_METHOD_PROFILE_SUB_PROVIDERS_REMOVE => {
+            raw_profile_sub_providers_remove(state, request, connection_profile_id).await
+        }
         APPUI_METHOD_PROFILE_SKILLS_LIST => {
             raw_profile_skills_list(state, request, connection_profile_id)
         }
@@ -10083,6 +10345,9 @@ fn raw_method_is_dispatched(method: &str, stdio_transport: bool) -> bool {
             | APPUI_METHOD_PROFILE_LLM_SELECT
             | APPUI_METHOD_PROFILE_LLM_DELETE
             | APPUI_METHOD_PROFILE_LLM_FETCH_MODELS
+            | APPUI_METHOD_PROFILE_SUB_PROVIDERS_LIST
+            | APPUI_METHOD_PROFILE_SUB_PROVIDERS_UPSERT
+            | APPUI_METHOD_PROFILE_SUB_PROVIDERS_REMOVE
             | APPUI_METHOD_PROFILE_SKILLS_LIST
             | APPUI_METHOD_PROFILE_SKILLS_REGISTRY_SEARCH
             | APPUI_METHOD_PROFILE_SKILLS_INSTALL
