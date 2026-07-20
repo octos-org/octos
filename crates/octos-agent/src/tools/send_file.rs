@@ -123,12 +123,11 @@ struct Input {
 tokio::task_local! {
     /// M10 Phase 5a: scoped flag that marks an in-flight `send_file`
     /// invocation as a per-file companion to a `spawn_only` completion's
-    /// `turn/spawn_complete` envelope. When the scope is active, the
+    /// canonical v2 background-child envelope. When the scope is active, the
     /// emitted [`OutboundMessage`] carries
     /// `metadata.spawn_complete_companion = true`, which the api/serve
-    /// `send_file` consumer reads to persist the row under
-    /// `MessagePersistedSource::Background`. Dual-negotiated clients then
-    /// suppress that row in favour of the single envelope.
+    /// `send_file` consumer reads to persist the row as transcript-only.
+    /// Its UI projection is suppressed in favour of the single child envelope.
     ///
     /// Internal-only by construction: the flag is NEVER read from tool
     /// `args`, so an LLM cannot inject it from a generated JSON payload.
@@ -724,9 +723,9 @@ mod tests {
         // `with_spawn_complete_companion_scope`, the in-flight execute()
         // call sees the task-local flag and stamps the OutboundMessage's
         // metadata with `spawn_complete_companion: true`. The api/serve
-        // consumer reads the flag and persists the resulting row with
-        // `MessagePersistedSource::Background`, letting dual-negotiated
-        // clients suppress the duplicate in favour of `turn/spawn_complete`.
+        // consumer reads the flag and persists the resulting row as
+        // transcript-only, suppressing its UI projection in favour of the
+        // canonical background-child envelope.
         let (tx, mut rx) = mpsc::channel(16);
         let tool = SendFileTool::with_context(tx, "api", "sess-1");
 

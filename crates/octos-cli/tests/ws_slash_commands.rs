@@ -76,8 +76,8 @@ async fn setup_ctx() -> (SlashCommandContext, TempDir, SessionKey) {
 /// "Sure, let me help you with slides…" instead of creating any files.
 ///
 /// Post-fix: the scaffold runs in the workspace + the helper returns a
-/// non-empty reply, which the WS turn path persists as an assistant
-/// `MessagePersisted` event and concludes with `turn/completed`.
+/// non-empty reply, which the WS turn path persists and projects as an
+/// `assistant_persisted` envelope before it concludes with `turn/completed`.
 #[tokio::test]
 async fn should_scaffold_slides_when_new_slides_command_arrives_on_ws() {
     let (ctx, tmp, session_key) = setup_ctx().await;

@@ -243,11 +243,10 @@ pub struct ConversationResponse {
     /// spawn_only branch in `loop_runner::process_message_inner` (the
     /// "Background work started for `<tool>`. The final result will be
     /// delivered automatically when it is ready." string). When `true`,
-    /// the API persist site tags the corresponding wire envelope with
-    /// `MessagePersistedSource::Background` so dual-negotiated clients
-    /// (those carrying `event.spawn_complete.v1`) suppress it via the
-    /// existing capability filter — collapsing the legacy
-    /// "two bubbles per turn" shape into a single preamble row.
+    /// the API persist site skips the synthesized acknowledgement entirely.
+    /// The real background result persists independently and emits its
+    /// canonical v2 background-child envelope, avoiding a duplicate
+    /// foreground bubble.
     /// Defaults to `false`; only set in the spawn_only synthesis path.
     pub synthesized_from_spawn_only: bool,
     /// Set when a tool call matched a [`AgentConfig::human_approval_rules`]
