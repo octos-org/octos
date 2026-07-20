@@ -7,7 +7,7 @@
       "kind": {
         "type": "fanout",
         "plan_prompt": "Generate 4-6 distinct research search angles for the user's query — cover the core topic, alternatives/comparisons, technical detail, and recent developments; do NOT just rephrase the same query. Include at least one angle in Chinese and one in English for cross-language coverage. Respond with ONLY a JSON array of {\"task\",\"label\"} objects, each task under 80 chars.",
-        "worker_prompt": "You are a research search specialist.\n\n{task}\n\nUse web_search to find the most relevant, authoritative sources, then web_fetch/read_file to read at least 3 of them. Include ALL URLs, specific data points, and quotes in your output.",
+        "worker_prompt": "You are a research search specialist.\n\n{task}\n\nUse web_search to find the most relevant, authoritative sources, then web_fetch/read_file to read at least 3 of them.\n\nDELIVERABLE DISCIPLINE (your parent analyst reads this from disk, not from your reply):\n1. Before returning, use write_file to save a complete findings file named EXACTLY findings-{label}.md — use that exact name, do NOT invent a different filename. Include EVERY URL you cited, EVERY specific number/date/name/quote, and a one-line source-credibility note per claim.\n2. Your final reply MUST be a 3-5 sentence summary followed by the literal line: FULL_FINDINGS_FILE: findings-{label}.md . Do NOT paste the full findings inline — the parent reads them from the file.\n3. If you found no authoritative sources, say so explicitly and still write the file with whatever you have plus a GAPS section.",
         "converge": "analyze",
         "max_tasks": 6
       }
@@ -16,7 +16,7 @@
       "id": "analyze",
       "kind": {
         "type": "synthesize",
-        "prompt": "You are a research analyst. Cross-reference the search results from all angles: identify the key facts and data, note where sources agree or disagree, organize findings by subtopic, rate source credibility (official docs > papers > news > blogs), and flag contradictions. Preserve ALL specific numbers, dates, names, quotes, and URLs — do not summarize away detail."
+        "prompt": "You are a research analyst. The parallel search workers each wrote a findings-<label>.md file — use read_file to open EACH of them; do NOT rely only on their short inline summaries. Cross-reference the findings across all angles: identify the key facts and data, note where sources agree or disagree, organize by subtopic, rate source credibility (official docs > papers > news > blogs), and flag contradictions.\n\nROBUSTNESS (the input may be large):\n- Process the findings files one at a time; do not try to load them all into a single reply.\n- Preserve ALL specific numbers, dates, names, quotes, and URLs — never summarize a specific into a generality.\n- If a findings file is missing or empty, note it under GAPS and continue with the others — do not abort.\n- End with a CONTRADICTIONS section and a GAPS section."
       }
     },
     {
@@ -28,7 +28,13 @@
     }
   ],
   "edges": [
-    {"source": "search", "target": "analyze"},
-    {"source": "analyze", "target": "synthesize"}
+    {
+      "source": "search",
+      "target": "analyze"
+    },
+    {
+      "source": "analyze",
+      "target": "synthesize"
+    }
   ]
 }
