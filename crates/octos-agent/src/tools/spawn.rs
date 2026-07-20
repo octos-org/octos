@@ -1654,7 +1654,10 @@ struct Input {
     /// worktree gives the child a dedicated git worktree under `.octos/work`.
     #[serde(default)]
     isolation: WorkerIsolation,
-    /// Tool names the subagent is allowed to use. Empty = all builtins.
+    /// Tool names the subagent is allowed to use. Empty = all builtins. A
+    /// narrowed list that omits `write_file` leaves the child unable to write a
+    /// deliverable except via a shell redirect (which is only captured when a
+    /// `deliverable` glob is set) — see the JSON-schema `description`.
     #[serde(default)]
     allowed_tools: Vec<String>,
     /// Extra context injected as a system-level prefix.
@@ -2808,7 +2811,7 @@ impl Tool for SpawnTool {
                 "allowed_tools": {
                     "type": "array",
                     "items": { "type": "string" },
-                    "description": "Tool names the subagent may use. Empty = all builtins."
+                    "description": "Tool names the subagent may use. Empty = all builtins (the recommended default). CAUTION: if you narrow this list AND the subagent must PRODUCE A FILE (a report, review, generated code, any deliverable), you MUST include `write_file` (and usually `edit_file`) here — OR set the top-level `deliverable` glob. A subagent given `shell` but not `write_file` and no `deliverable` can only write via a shell redirect, and any file it writes outside the working tree (e.g. under /tmp) is LOST (never collected as output_files). When in doubt, leave this empty."
                 },
                 "role": {
                     "type": "string",

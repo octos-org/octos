@@ -2429,6 +2429,32 @@ async fn spawn_spec_exposes_max_iterations() {
     assert_eq!(props["max_iterations"]["type"], "integer");
 }
 
+#[tokio::test]
+async fn spawn_schema_warns_narrowed_allowed_tools_needs_write_file_or_deliverable() {
+    // Guards the guidance that stops the "worker shell-wrote to /tmp, deliverable
+    // lost" failure: if the orchestrator narrows allowed_tools, it must include
+    // write_file OR set a deliverable glob. Keyed loosely so rewording is fine.
+    let (in_tx, _in_rx) = tokio::sync::mpsc::channel(16);
+    let tool = SpawnTool::new(
+        Arc::new(MockProvider),
+        Arc::new(create_test_store().await),
+        PathBuf::from("/tmp"),
+        in_tx,
+    );
+    let desc = tool.input_schema()["properties"]["allowed_tools"]["description"]
+        .as_str()
+        .expect("allowed_tools description present")
+        .to_string();
+    assert!(
+        desc.contains("write_file"),
+        "allowed_tools guidance must mention write_file: {desc}"
+    );
+    assert!(
+        desc.contains("deliverable"),
+        "allowed_tools guidance must point at the deliverable glob: {desc}"
+    );
+}
+
 #[test]
 fn apply_agent_definition_preserves_inline_max_iterations() {
     // An inline max_iterations must survive manifest layering (inline wins /
