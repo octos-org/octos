@@ -340,6 +340,97 @@ fn profile_local_create_make_default_persists_pointer() {
     );
 }
 
+/// `profile/sub_providers/{list,upsert,remove}`: add/replace-by-key/remove the
+/// named provider lanes (`cheap`/`strong` etc.) that back the isolated research
+/// pipeline router; upsert with an existing key REPLACES rather than appends,
+/// removing a missing key reports `applied:false`, and everything persists.
+#[tokio::test]
+async fn sub_providers_upsert_list_and_remove_round_trip() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = Arc::new(local_profile_state(dir.path()));
+
+    for (key, provider, model) in [
+        ("cheap", "gemini", "gemini-2.5-flash"),
+        ("strong", "openai", "gpt-5-mini"),
+    ] {
+        let request = RpcRequest::new(
+            format!("u-{key}"),
+            APPUI_METHOD_PROFILE_SUB_PROVIDERS_UPSERT.to_string(),
+            json!({
+                "profile_id": "dev",
+                "sub_provider": { "key": key, "provider": provider, "model": model },
+            }),
+        );
+        let res = raw_profile_sub_providers_upsert(&state, &request, None)
+            .await
+            .expect("upsert");
+        assert_eq!(res["applied"], true);
+    }
+
+    // List reflects both lanes in insertion order.
+    let list_req = RpcRequest::new(
+        "l1".to_string(),
+        APPUI_METHOD_PROFILE_SUB_PROVIDERS_LIST.to_string(),
+        json!({ "profile_id": "dev" }),
+    );
+    let listed = raw_profile_sub_providers_list(&state, &list_req, None).expect("list");
+    let lanes = listed["sub_providers"].as_array().unwrap();
+    assert_eq!(lanes.len(), 2, "both lanes listed: {listed}");
+    assert_eq!(lanes[0]["key"], "cheap");
+    assert_eq!(lanes[0]["model"], "gemini-2.5-flash");
+    assert_eq!(lanes[1]["key"], "strong");
+
+    // Upsert with an existing key REPLACES (not appends).
+    let replace = RpcRequest::new(
+        "u-cheap-2".to_string(),
+        APPUI_METHOD_PROFILE_SUB_PROVIDERS_UPSERT.to_string(),
+        json!({
+            "profile_id": "dev",
+            "sub_provider": { "key": "cheap", "provider": "deepseek", "model": "deepseek-chat" },
+        }),
+    );
+    let res = raw_profile_sub_providers_upsert(&state, &replace, None)
+        .await
+        .expect("replace");
+    let lanes = res["sub_providers"].as_array().unwrap();
+    assert_eq!(lanes.len(), 2, "same-key upsert replaces, not appends");
+    let cheap = lanes.iter().find(|l| l["key"] == "cheap").unwrap();
+    assert_eq!(cheap["provider"], "deepseek");
+
+    // Persisted to disk.
+    let profile = state
+        .profile_store
+        .as_ref()
+        .unwrap()
+        .get("dev")
+        .unwrap()
+        .unwrap();
+    assert_eq!(profile.config.sub_providers.len(), 2);
+
+    // Remove one lane.
+    let rm = RpcRequest::new(
+        "r1".to_string(),
+        APPUI_METHOD_PROFILE_SUB_PROVIDERS_REMOVE.to_string(),
+        json!({ "profile_id": "dev", "key": "cheap" }),
+    );
+    let res = raw_profile_sub_providers_remove(&state, &rm, None)
+        .await
+        .expect("remove");
+    assert_eq!(res["applied"], true);
+    assert_eq!(res["sub_providers"].as_array().unwrap().len(), 1);
+
+    // Removing a missing key is a no-op with applied:false.
+    let rm2 = RpcRequest::new(
+        "r2".to_string(),
+        APPUI_METHOD_PROFILE_SUB_PROVIDERS_REMOVE.to_string(),
+        json!({ "profile_id": "dev", "key": "nonexistent" }),
+    );
+    let res = raw_profile_sub_providers_remove(&state, &rm2, None)
+        .await
+        .expect("remove-miss");
+    assert_eq!(res["applied"], false);
+}
+
 /// Multi-model profiles: `profile/llm/list`-backed model list exposes the
 /// primary AND every fallback; `profile/llm/select` promotes a fallback to
 /// the active primary (demoting the old primary to a fallback), persists,
@@ -1632,6 +1723,14 @@ fn dispatch_probe_request(method: &str) -> RpcRequest<Value> {
         APPUI_METHOD_SESSION_COMPACT => json!({ "session_id": session_id }),
         APPUI_METHOD_SESSION_COMPACT_MODE_SET => {
             json!({ "session_id": session_id, "mode": "heuristic" })
+        }
+        APPUI_METHOD_PROFILE_SUB_PROVIDERS_LIST => json!({ "profile_id": "dev" }),
+        APPUI_METHOD_PROFILE_SUB_PROVIDERS_UPSERT => json!({
+            "profile_id": "dev",
+            "sub_provider": { "key": "cheap", "provider": "gemini", "model": "gemini-2.5-flash" },
+        }),
+        APPUI_METHOD_PROFILE_SUB_PROVIDERS_REMOVE => {
+            json!({ "profile_id": "dev", "key": "cheap" })
         }
         other => panic!("missing AppUI dispatch probe params for {other}"),
     };

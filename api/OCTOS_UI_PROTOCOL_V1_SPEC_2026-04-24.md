@@ -439,6 +439,9 @@ Runtime, auth, profile, and onboarding inspection (server-handled
 - `profile/llm/catalog`, `profile/llm/list`, `profile/llm/upsert`,
   `profile/llm/select`, `profile/llm/delete`, `profile/llm/test`,
   `profile/llm/fetch_models` (accepted `UPCR-2026-017`)
+- `profile/sub_providers/list`, `profile/sub_providers/upsert`,
+  `profile/sub_providers/remove` (named provider lanes for per-node pipeline
+  routing — e.g. `deep_research`'s isolated `cheap`/`strong` lanes)
 - `profile/skills/list`, `profile/skills/registry/search`,
   `profile/skills/install`, `profile/skills/remove` (server-handled skills
   management)
