@@ -9360,7 +9360,12 @@ fn sub_providers_mutation_result(
 ) -> Value {
     let mut result = sub_providers_list_result(state, profile_id, profile);
     if let Value::Object(ref mut object) = result {
+        // `applied` means PERSISTED, not live: the isolated research router is
+        // built at ProfileRuntime bootstrap, so a persisted change only takes
+        // effect on the next serve restart. Surface `restart_required` so the
+        // client never presents a persisted change as already-live.
         object.insert("applied".into(), Value::Bool(applied));
+        object.insert("restart_required".into(), Value::Bool(applied));
     }
     result
 }
@@ -9388,6 +9393,14 @@ fn raw_profile_sub_providers_list(
     ))
 }
 
+/// Serializes profile `sub_providers` read-modify-write across concurrent
+/// upsert/remove RPCs so two clients adding different lanes don't clobber each
+/// other (a bare get→mutate→save is last-writer-wins because `save_with_merge`
+/// does NOT union `sub_providers`). A single global lock is proportionate —
+/// these mutations are rare + interactive — and it does not serialize with the
+/// profile/llm path, which mutates disjoint fields.
+static SUB_PROVIDERS_MUTATION_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// `profile/sub_providers/upsert`: add or replace one lane by `key`.
 async fn raw_profile_sub_providers_upsert(
     state: &Arc<AppState>,
@@ -9397,35 +9410,52 @@ async fn raw_profile_sub_providers_upsert(
     let params: RawProfileSubProvidersUpsertParams = parse_raw_params(request)?;
     let profile_id =
         raw_scoped_llm_profile_id(params.profile_id.clone(), None, connection_profile_id)?;
-    let store = profile_store(state)?;
-    let mut profile = store
-        .get(&profile_id)
-        .map_err(|err| RpcError::internal_error(format!("failed to read profile: {err}")))?
-        .unwrap_or_else(|| default_profile(&profile_id));
 
     let key = nonempty(Some(params.sub_provider.key))
         .ok_or_else(|| RpcError::invalid_params("sub_provider.key is required"))?;
     let provider = nonempty(params.sub_provider.provider)
         .ok_or_else(|| RpcError::invalid_params("sub_provider.provider is required"))?;
     let api_key_env = nonempty(params.sub_provider.api_key_env);
-
-    // Store any pasted secret under the lane's api_key_env, never in plaintext.
-    if let (Some(env), Some(secret)) = (api_key_env.as_ref(), secret_from_value(params.api_key)) {
-        profile.config.env_vars.insert(env.clone(), secret);
+    let pasted_secret = secret_from_value(params.api_key);
+    // A pasted secret with no target env var used to be silently DROPPED, after
+    // which the lane fell back to ambient/primary credentials — potentially a
+    // DIFFERENT provider's key. Reject instead of losing the secret / sending the
+    // wrong key.
+    if pasted_secret.is_some() && api_key_env.is_none() {
+        return Err(RpcError::invalid_params(
+            "sub_provider.api_key_env is required when an api_key is supplied",
+        ));
     }
-
     let entry = crate::config::SubProviderConfig {
         key: key.clone(),
         provider,
         model: nonempty(params.sub_provider.model),
-        api_key_env,
+        api_key_env: api_key_env.clone(),
         base_url: nonempty(params.sub_provider.base_url),
         description: nonempty(params.sub_provider.description),
         default_context_window: params.sub_provider.default_context_window,
         max_output_tokens: params.sub_provider.max_output_tokens,
         api_type: nonempty(params.sub_provider.api_type),
     };
-    // Replace the lane with the same key, else append.
+
+    // Serialize the read-modify-write so a concurrent lane add isn't lost.
+    let _guard = SUB_PROVIDERS_MUTATION_LOCK.lock().await;
+    let store = profile_store(state)?;
+    let mut profile = store
+        .get(&profile_id)
+        .map_err(|err| RpcError::internal_error(format!("failed to read profile: {err}")))?
+        .unwrap_or_else(|| default_profile(&profile_id));
+
+    // The pasted key is stored under its `api_key_env` in the profile's env_vars.
+    // NOTE: this is the SAME secret-at-rest model as the profile's primary/
+    // fallback provider keys (env_vars in the 0600 profile JSON); JSON credentials
+    // (e.g. a Vertex service-account) are relocated to the OS keychain below,
+    // ordinary API keys are not. Keychaining every key would be a whole-profile
+    // secret-model change (shared with the profile/llm path), not lane-scoped.
+    if let (Some(env), Some(secret)) = (api_key_env.as_ref(), pasted_secret) {
+        profile.config.env_vars.insert(env.clone(), secret);
+    }
+
     if let Some(existing) = profile
         .config
         .sub_providers
@@ -9445,8 +9475,8 @@ async fn raw_profile_sub_providers_upsert(
         .map_err(|err| RpcError::internal_error(format!("failed to save profile: {err}")))?;
     // A LIVE runtime is NOT rebuilt here — the isolated research router is built
     // at ProfileRuntime bootstrap, so a pinned solo profile needs a restart to
-    // pick up the change (the TUI surfaces that). This only bootstraps when no
-    // runtime exists yet.
+    // pick up the change. The result carries `restart_required` so the client
+    // never claims the change is live. This only bootstraps when none exists yet.
     if let Err(error) = ensure_session_profile_runtime(state, Some(&profile_id)).await {
         tracing::warn!(
             profile_id = %profile_id,
@@ -9473,6 +9503,8 @@ async fn raw_profile_sub_providers_remove(
         raw_scoped_llm_profile_id(params.profile_id.clone(), None, connection_profile_id)?;
     let key =
         nonempty(Some(params.key)).ok_or_else(|| RpcError::invalid_params("key is required"))?;
+    // Serialize against concurrent lane mutations (see upsert / the lock doc).
+    let _guard = SUB_PROVIDERS_MUTATION_LOCK.lock().await;
     let store = profile_store(state)?;
     let Some(mut profile) = store
         .get(&profile_id)
