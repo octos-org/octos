@@ -4518,6 +4518,9 @@ impl SessionActor {
                     "lifecycle hook attempted to modify payload; ignoring"
                 );
             }
+            // Context injection is a `user_prompt_submit`-only outcome; these
+            // emitted lifecycle events never produce it. Exhaustive-match arm.
+            HookResult::Context(_) => {}
             HookResult::Deny(reason) => {
                 warn!(
                     session = %self.session_key,
