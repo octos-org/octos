@@ -379,6 +379,9 @@ impl Agent {
                         Err("tool arguments changed since approval request was created".to_string())
                     }
                 }
+                // Context injection is a `user_prompt_submit`-only outcome and
+                // never arises for a before-tool re-validation; allow the call.
+                HookResult::Context(_) => Ok(()),
                 HookResult::Deny(reason) => {
                     if reason.is_empty() {
                         Err("current policy denied the approved tool call".to_string())

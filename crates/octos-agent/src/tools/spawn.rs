@@ -868,6 +868,9 @@ async fn emit_lifecycle_hook(hooks: Option<&Arc<HookExecutor>>, payload: HookPay
         HookResult::Modified(_) => {
             warn!(event = ?event, "lifecycle hook attempted to modify payload; ignoring");
         }
+        // Context injection is a `user_prompt_submit`-only outcome; a spawn
+        // lifecycle event never produces it, but the match must be exhaustive.
+        HookResult::Context(_) => {}
         HookResult::Deny(reason) => {
             warn!(
                 event = ?event,
@@ -927,6 +930,9 @@ async fn run_before_spawn_verify_hook(
     match hooks.run(event, &payload).await {
         HookResult::Allow => Ok(default_files),
         HookResult::Modified(modified) => parse_modified_spawn_verify_output_files(modified),
+        // `before_spawn_verify` never yields context injection (that is a
+        // `user_prompt_submit`-only outcome); treat it like a plain allow.
+        HookResult::Context(_) => Ok(default_files),
         HookResult::Deny(reason) => Err(reason),
         HookResult::Error(error) => {
             warn!(

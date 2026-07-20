@@ -21,6 +21,7 @@ use super::verifier::{TurnLedger, ledger_entry_from_tool_result};
 use super::{Agent, ConversationResponse, TASK_REPORTER, TokenTracker};
 use crate::harness_errors::HarnessError;
 use crate::harness_events::write_event_to_sink;
+use crate::hooks::{HookEvent, HookPayload, HookResult};
 use crate::loop_detect::LoopDetector;
 use crate::progress::ProgressEvent;
 use crate::prompt_context::PromptContextPhase;
@@ -931,6 +932,99 @@ impl Agent {
                 // #1691 (codex gap G6): fire the in-band budget reminder once,
                 // when the run first crosses ~80% of its iteration cap.
                 let mut budget_reminder_sent = false;
+
+                // UserPromptSubmit lifecycle hook. Fires exactly once here —
+                // when a real user-submitted prompt enters the turn, after the
+                // messages are assembled but BEFORE the first LLM call and
+                // before any loop iteration (per-iteration LLM gating is
+                // BeforeLlmCall's job). A before-hook can:
+                //   * DENY the prompt (exit 1) → block the whole turn with the
+                //     hook's stdout as the surfaced reason (mirrors how a
+                //     denied tool call surfaces its reason), or
+                //   * INJECT context (exit 0 + stdout) → prepend the hook's
+                //     stdout as a per-turn system-context note so it reaches
+                //     the model for THIS turn without being persisted as a
+                //     message.
+                // No-op (byte-identical to before) when no `user_prompt_submit`
+                // hook is configured — the executor returns Allow immediately.
+                if let Some(ref hooks) = self.hooks {
+                    let hook_ctx = self.hook_ctx();
+                    let cwd = self.tools.workspace_root().map(|p| p.display().to_string());
+                    let payload = HookPayload::user_prompt_submit(
+                        user_content,
+                        self.llm.model_id(),
+                        cwd.as_deref(),
+                        hook_ctx.as_ref(),
+                    );
+                    match hooks.run(HookEvent::UserPromptSubmit, &payload).await {
+                        HookResult::Deny(reason) => {
+                            let reason = reason.trim();
+                            let message = if reason.is_empty() {
+                                "[HOOK DENIED] Prompt was blocked by a user_prompt_submit hook."
+                                    .to_string()
+                            } else {
+                                format!(
+                                    "[HOOK DENIED] Prompt was blocked by a user_prompt_submit hook: {reason}"
+                                )
+                            };
+                            tracing::warn!(reason = %reason, "user_prompt_submit hook denied prompt");
+                            self.reporter().report(ProgressEvent::LlmStatus {
+                                message: message.clone(),
+                                iteration: 0,
+                            });
+                            // Mirror the budget-stop early return: persist the
+                            // user's message (turn_output_log) and surface the
+                            // deny reason as the assistant content. The LLM is
+                            // never called.
+                            return Ok(ConversationResponse {
+                                content: message,
+                                reasoning_content: None,
+                                provider_metadata: None,
+                                token_usage: turn.total_usage().clone(),
+                                estimated_spend_usd: turn.priced_spend(),
+                                files_modified,
+                                files_to_send,
+                                streamed: false,
+                                messages: turn_output_log.clone(),
+                                tool_results: tool_structured_metadata.clone(),
+                                synthesized_from_spawn_only: false,
+                                pending_approval: None,
+                            });
+                        }
+                        HookResult::Context(contexts) => {
+                            // Inject each hook's stdout as a per-turn System
+                            // context note, placed right after the primary
+                            // system prompt (index 0). The next
+                            // `normalize_system_messages` pass folds these into
+                            // the system context the model sees. They are NOT
+                            // added to `turn_output_log`, so they are never
+                            // persisted as conversation messages.
+                            for context in contexts.into_iter().rev() {
+                                let trimmed = context.trim();
+                                if trimmed.is_empty() {
+                                    continue;
+                                }
+                                messages.insert(
+                                    1,
+                                    Message {
+                                        role: MessageRole::System,
+                                        content: format!(
+                                            "[UserPromptSubmit hook context]\n{trimmed}"
+                                        ),
+                                        media: vec![],
+                                        tool_calls: None,
+                                        tool_call_id: None,
+                                        reasoning_content: None,
+                                        client_message_id: None,
+                                        thread_id: None,
+                                        timestamp: chrono::Utc::now(),
+                                    },
+                                );
+                            }
+                        }
+                        HookResult::Allow | HookResult::Error(_) | HookResult::Modified(_) => {}
+                    }
+                }
 
                 // Labeled so the loop-detector recovery arms below can re-enter
                 // the AGENT loop (skip tool execution for this spiraling
@@ -8515,6 +8609,156 @@ printf '{"output":"voice saved","success":true}\n'
         assert!(
             rx.try_recv().is_err(),
             "hook-deny must NOT emit a TurnFailure (preserve permission behaviour)"
+        );
+    }
+
+    /// Records the message contents of every LLM call and returns EndTurn
+    /// immediately. Used to assert what the model actually saw and that it was
+    /// (or was not) called at all.
+    struct RecordingEndProvider {
+        chat_calls: Arc<AtomicUsize>,
+        observed: Arc<StdMutex<Vec<Vec<String>>>>,
+    }
+
+    #[async_trait]
+    impl LlmProvider for RecordingEndProvider {
+        async fn chat(
+            &self,
+            messages: &[Message],
+            _tools: &[octos_llm::ToolSpec],
+            _config: &ChatConfig,
+        ) -> Result<ChatResponse> {
+            self.chat_calls.fetch_add(1, AtomicOrdering::SeqCst);
+            self.observed
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .push(messages.iter().map(|m| m.content.clone()).collect());
+            Ok(ChatResponse {
+                content: Some("ok".to_string()),
+                reasoning_content: None,
+                tool_calls: vec![],
+                stop_reason: StopReason::EndTurn,
+                usage: LlmTokenUsage::default(),
+                provider_index: None,
+            })
+        }
+
+        fn model_id(&self) -> &str {
+            "mock"
+        }
+
+        fn provider_name(&self) -> &str {
+            "mock"
+        }
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn user_prompt_submit_hook_injects_stdout_as_turn_context() {
+        use crate::hooks::{HookConfig, HookEvent, HookExecutor};
+
+        let dir = tempfile::tempdir().unwrap();
+        let tools = ToolRegistry::with_builtins(dir.path());
+        let chat_calls = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::new(StdMutex::new(Vec::new()));
+        let provider: Arc<dyn LlmProvider> = Arc::new(RecordingEndProvider {
+            chat_calls: chat_calls.clone(),
+            observed: Arc::clone(&observed),
+        });
+        let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+        // Hook prints a context note on stdout (exit 0). It must be injected
+        // into the model's input for this turn.
+        let hooks = Arc::new(HookExecutor::new(vec![HookConfig {
+            event: HookEvent::UserPromptSubmit,
+            command: vec!["sh".into(), "-c".into(), "echo OCTOS_CTX_MARKER_42".into()],
+            timeout_ms: 5000,
+            tool_filter: vec![],
+            path_filter: vec![],
+            requires_bin: None,
+        }]));
+        let agent =
+            Agent::new(AgentId::new("ups-inject"), provider, tools, memory).with_hooks(hooks);
+
+        let result = agent.process_message("do work", &[], vec![]).await.unwrap();
+        assert_eq!(result.content, "ok");
+        assert_eq!(chat_calls.load(AtomicOrdering::SeqCst), 1);
+
+        // The injected context reaches the model input for this turn...
+        let prompts = observed.lock().unwrap_or_else(|error| error.into_inner());
+        assert_eq!(prompts.len(), 1, "exactly one LLM call");
+        assert!(
+            prompts[0]
+                .iter()
+                .any(|content| content.contains("OCTOS_CTX_MARKER_42")),
+            "injected context must reach the model input; got {:?}",
+            prompts[0]
+        );
+        // ...but is NOT persisted as a conversation message.
+        assert!(
+            result
+                .messages
+                .iter()
+                .all(|m| !m.content.contains("OCTOS_CTX_MARKER_42")),
+            "injected context must not be persisted as a message"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn user_prompt_submit_hook_deny_blocks_turn_before_llm() {
+        use crate::hooks::{HookConfig, HookEvent, HookExecutor};
+
+        let dir = tempfile::tempdir().unwrap();
+        let tools = ToolRegistry::with_builtins(dir.path());
+        let chat_calls = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::new(StdMutex::new(Vec::new()));
+        let provider: Arc<dyn LlmProvider> = Arc::new(RecordingEndProvider {
+            chat_calls: chat_calls.clone(),
+            observed: Arc::clone(&observed),
+        });
+        let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+        // Hook writes its reason on stdout and exits 1 → prompt denied.
+        let hooks = Arc::new(HookExecutor::new(vec![HookConfig {
+            event: HookEvent::UserPromptSubmit,
+            command: vec![
+                "sh".into(),
+                "-c".into(),
+                "echo 'no coding on fridays'; exit 1".into(),
+            ],
+            timeout_ms: 5000,
+            tool_filter: vec![],
+            path_filter: vec![],
+            requires_bin: None,
+        }]));
+        let agent = Agent::new(AgentId::new("ups-deny"), provider, tools, memory).with_hooks(hooks);
+
+        let result = agent
+            .process_message("write code", &[], vec![])
+            .await
+            .unwrap();
+
+        // The turn is blocked and the hook's reason is surfaced...
+        assert!(
+            result.content.contains("[HOOK DENIED]"),
+            "deny should be clearly surfaced; got {:?}",
+            result.content
+        );
+        assert!(
+            result.content.contains("no coding on fridays"),
+            "deny reason (hook stdout) should be surfaced; got {:?}",
+            result.content
+        );
+        // ...and the LLM is never reached.
+        assert_eq!(
+            chat_calls.load(AtomicOrdering::SeqCst),
+            0,
+            "denied prompt must not reach the model"
+        );
+        assert!(
+            observed
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .is_empty()
         );
     }
 }
