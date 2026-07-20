@@ -2043,15 +2043,50 @@ fn merge_sandbox_defaults(
     eff
 }
 
+/// Lexically normalize an absolute `/`-rooted path, collapsing `.`/`..`
+/// segments WITHOUT touching the filesystem (the read roots may not exist yet).
+/// Returns `None` for a non-absolute path or one whose `..` segments climb above
+/// the root — such a path can never be a valid subset of an operator root, so
+/// the clamp drops it. This is what closes the `..` traversal that a bare
+/// `strip_prefix` check would wave through (e.g. `/srv/data/../../etc` → `/etc`).
+fn normalize_abs_lexical(path: &str) -> Option<String> {
+    if !path.starts_with('/') {
+        return None;
+    }
+    let mut out: Vec<&str> = Vec::new();
+    for seg in path.split('/') {
+        match seg {
+            "" | "." => {}
+            ".." => {
+                // Escapes above the root — reject the whole path.
+                out.pop()?;
+            }
+            seg => out.push(seg),
+        }
+    }
+    Some(format!("/{}", out.join("/")))
+}
+
 /// True when `path` is exactly one of `roots` or nested beneath one of them.
 /// Enforces the `read_allow_paths` floor: a profile may only keep read roots
-/// that fall within an operator-approved root.
+/// that fall within an operator-approved root. Both sides are lexically
+/// normalized first so a profile CANNOT use `..` (or a non-absolute path) to
+/// escape an operator root and still pass the subset check.
 fn sandbox_path_within_any(path: &str, roots: &[String]) -> bool {
+    let Some(path) = normalize_abs_lexical(path) else {
+        return false;
+    };
     roots.iter().any(|root| {
-        let root = root.trim_end_matches('/');
-        path == root
+        let Some(root) = normalize_abs_lexical(root) else {
+            return false;
+        };
+        // A `/` root allows all absolute paths; otherwise require an exact
+        // match or a `<root>/…` descendant (not a mere string prefix, so
+        // `/srv/database` is NOT within `/srv/data`).
+        root == "/"
+            || path == root
             || path
-                .strip_prefix(root)
+                .strip_prefix(&root)
                 .is_some_and(|rest| rest.starts_with('/'))
     })
 }
@@ -5879,6 +5914,35 @@ mod tests {
             eff.sandbox.read_allow_paths,
             vec!["/srv/data".to_string()],
             "an entirely out-of-floor profile list is clamped to the operator's roots"
+        );
+
+        // A profile using `..` to climb out of the operator root must NOT slip
+        // through the subset check: `/srv/data/../../etc` resolves to `/etc`,
+        // outside the floor, so it is dropped and the list clamps to defaults.
+        let mut traverse = inheritance_profile("mallory");
+        traverse.config.sandbox = octos_agent::SandboxConfig {
+            read_allow_paths: vec!["/srv/data/../../etc".into()],
+            ..Default::default()
+        };
+        let eff = store.effective_config(&traverse);
+        assert_eq!(
+            eff.sandbox.read_allow_paths,
+            vec!["/srv/data".to_string()],
+            "a `..` traversal escaping the operator root must be clamped, not honored"
+        );
+
+        // Sibling-prefix guard: `/srv/database` must not count as within
+        // `/srv/data` (string prefix ≠ path containment).
+        let mut sibling = inheritance_profile("neil");
+        sibling.config.sandbox = octos_agent::SandboxConfig {
+            read_allow_paths: vec!["/srv/database".into()],
+            ..Default::default()
+        };
+        let eff = store.effective_config(&sibling);
+        assert_eq!(
+            eff.sandbox.read_allow_paths,
+            vec!["/srv/data".to_string()],
+            "a sibling dir sharing a string prefix must not pass the containment check"
         );
     }
 
