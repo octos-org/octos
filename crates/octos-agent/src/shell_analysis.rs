@@ -286,6 +286,13 @@ impl Parser {
 fn parse_segments(input: &str) -> Option<Vec<Segment>> {
     let mut p = Parser::default();
     let mut it = input.chars().peekable();
+    // For each open paren group: `true` if it was a `$(` command substitution,
+    // `false` for a plain `(` subshell. A substitution splices its output into
+    // the ENCLOSING command's words, so the continuation after its `)` must be
+    // treated as dynamic; a plain subshell close leaves the continuation
+    // analyzable.
+    let mut paren_is_subst: Vec<bool> = Vec::new();
+    let mut in_backtick = false;
 
     while let Some(c) = it.next() {
         match c {
@@ -362,12 +369,31 @@ fn parse_segments(input: &str) -> Option<Vec<Segment>> {
                 }
                 p.end_segment();
             }
-            '(' | ')' => p.end_segment(),
+            '(' => {
+                paren_is_subst.push(false);
+                p.end_segment();
+            }
+            ')' => {
+                p.end_segment();
+                if paren_is_subst.pop() == Some(true) {
+                    // Text after `$( ... )` still belongs to the enclosing
+                    // simple command, whose words depend on the substitution
+                    // output — keep it on the legacy fallback path.
+                    p.seg.dynamic = true;
+                }
+            }
             '`' => {
-                // Backtick substitution: the enclosing segment is dynamic and
-                // the contents start a fresh command position.
+                // Backtick substitution: the segment being ended (the
+                // enclosing prefix on open, the contents on close) is dynamic,
+                // and after the CLOSING backtick the continuation of the
+                // enclosing command is dynamic too — its words are spliced
+                // from the substitution output.
                 p.seg.dynamic = true;
                 p.end_segment();
+                if in_backtick {
+                    p.seg.dynamic = true;
+                }
+                in_backtick = !in_backtick;
             }
             '$' => {
                 if it.peek() == Some(&'(') {
@@ -377,6 +403,7 @@ fn parse_segments(input: &str) -> Option<Vec<Segment>> {
                     // terminates it via the `)` separator arm).
                     p.seg.dynamic = true;
                     p.end_segment();
+                    paren_is_subst.push(true);
                 } else {
                     p.token_mut().has_dollar = true;
                     p.lit('$');
@@ -673,6 +700,26 @@ mod tests {
     #[test]
     fn should_match_structural_patterns_when_anywhere_in_string() {
         assert_eq!(check(":(){:|:&};:"), Decision::Deny);
+    }
+
+    #[test]
+    fn should_stay_strict_when_text_follows_substitution_close() {
+        // The enclosing simple command is unanalyzable once a command
+        // substitution appears in it; the words AFTER the closing paren /
+        // backtick belong to that same command and must keep the legacy
+        // verdicts too (old matcher denied these), not get the quoted-literal
+        // false-positive fix.
+        assert_eq!(check("echo $(date) safe \"rm -rf /\""), Decision::Deny);
+        assert_eq!(check("echo `date` safe \"rm -rf /\""), Decision::Deny);
+        assert_eq!(check("echo foo$(date) \"rm -rf /\""), Decision::Deny);
+        // A real separator after the close starts a NEW command: the fresh
+        // command has no dynamics, so the quoted-literal fix applies again.
+        assert_eq!(check("echo $(date); echo \"rm -rf /\""), Decision::Allow);
+        // A plain subshell close is not a substitution: no output splices
+        // into the enclosing command, so the continuation stays analyzable.
+        assert_eq!(check("(date) echo \"rm -rf /\""), Decision::Allow);
+        // Harmless dynamics still allowed by the legacy fallback.
+        assert_eq!(check("echo $(date) safe"), Decision::Allow);
     }
 
     #[test]
