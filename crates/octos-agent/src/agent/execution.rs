@@ -449,8 +449,31 @@ impl Agent {
         // own pre-mutation snapshot point.
         self.snapshot_before_mutating_tools(&[pending.request.tool_name.as_str()])
             .await;
+        // #1532: an approved call must run with the SAME agent-level
+        // infrastructure the foreground path (`spawn_tool_task`) provides —
+        // this used to spread `zero()`, silently dropping the file-state
+        // cache, the profile permission envelope, cost tracking, the
+        // sub-agent plumbing, and the session scope for exactly the calls a
+        // human just vetted. Attachment paths stay empty: they are per-turn
+        // batch state, and an approved call resumes outside a turn batch.
         let ctx = ToolContext {
             tool_id: pending.tool_id.clone(),
+            reporter: self.reporter(),
+            harness_event_sink: self.harness_event_sink.clone(),
+            agent_definitions: self.agent_definitions.clone(),
+            file_state_cache: self.file_state_cache.clone(),
+            permissions: self
+                .profile
+                .as_deref()
+                .map(crate::tools::ToolPermissions::from_profile)
+                .unwrap_or_default(),
+            subagent_output_router: self.subagent_output_router.clone(),
+            subagent_summary_generator: self.subagent_summary_generator.clone(),
+            task_supervisor: Some(self.tools.supervisor()),
+            cost_accountant: self.cost_accountant.clone(),
+            parent_session_key: self.parent_session_key.clone(),
+            spawn_depth: self.spawn_depth,
+            session_scope: self.session_scope.clone(),
             // #1774: approval-gated edits still honor the post-edit
             // formatting opt-in.
             format_after_edit: self.config.format_after_edit,
@@ -464,13 +487,22 @@ impl Agent {
         // already-approved call is not re-denied by that inner gate.
         let approver: std::sync::Arc<dyn ToolApprovalRequester> =
             std::sync::Arc::new(ApprovedToolAutoApprover);
+        // #1532 (part 2): dispatch through `execute_with_context` like the
+        // foreground path — the legacy `execute` entry point never hands the
+        // TYPED context to native tools (they receive `zero()` via the
+        // default delegation), so every field above was reaching only
+        // task-local (`TOOL_CTX`) readers. TOOL_CTX stays scoped for plugin
+        // tools that read the task-local.
         let result = TOOL_APPROVAL_CTX
             .scope(
                 approver,
                 TOOL_CTX.scope(
-                    ctx,
-                    self.tools
-                        .execute(&pending.request.tool_name, &pending.tool_args),
+                    ctx.clone(),
+                    self.tools.execute_with_context(
+                        &ctx,
+                        &pending.request.tool_name,
+                        &pending.tool_args,
+                    ),
                 ),
             )
             .await?;
@@ -3587,6 +3619,114 @@ mod tests {
         assert!(
             seen.load(std::sync::atomic::Ordering::SeqCst),
             "AgentConfig.format_after_edit=true must reach the ToolContext"
+        );
+    }
+
+    /// #1532: probe recording whether the approved-call ToolContext carries
+    /// the agent-level infrastructure (it used to be a bare `zero()` spread).
+    struct CtxInfraProbe {
+        supervisor_seen: Arc<std::sync::atomic::AtomicBool>,
+        cache_seen: Arc<std::sync::atomic::AtomicBool>,
+        format_seen: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    #[async_trait]
+    impl Tool for CtxInfraProbe {
+        fn name(&self) -> &str {
+            "ctx_infra_probe"
+        }
+        fn description(&self) -> &str {
+            "records which ToolContext infra fields are populated"
+        }
+        fn input_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+        async fn execute(&self, _args: &serde_json::Value) -> eyre::Result<ToolResult> {
+            self.execute_with_context(&crate::tools::ToolContext::zero(), _args)
+                .await
+        }
+        async fn execute_with_context(
+            &self,
+            ctx: &crate::tools::ToolContext,
+            _args: &serde_json::Value,
+        ) -> eyre::Result<ToolResult> {
+            use std::sync::atomic::Ordering;
+            self.supervisor_seen
+                .store(ctx.task_supervisor.is_some(), Ordering::SeqCst);
+            self.cache_seen
+                .store(ctx.file_state_cache.is_some(), Ordering::SeqCst);
+            self.format_seen
+                .store(ctx.format_after_edit, Ordering::SeqCst);
+            Ok(ToolResult {
+                output: "probe".to_string(),
+                success: true,
+                ..Default::default()
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn approved_tool_context_carries_agent_infrastructure() {
+        // #1532: `execute_approved_tool` must hand the tool the SAME
+        // agent-level infrastructure as the foreground path — a human
+        // approving a call must not silently strip the cache, supervisor,
+        // or config-driven behavior from it.
+        let supervisor_seen = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let cache_seen = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let format_seen = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut tools = ToolRegistry::new();
+        tools.register(CtxInfraProbe {
+            supervisor_seen: supervisor_seen.clone(),
+            cache_seen: cache_seen.clone(),
+            format_seen: format_seen.clone(),
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let provider: Arc<dyn LlmProvider> = Arc::new(NoChatProvider);
+        let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+        let agent = Agent::new(AgentId::new("approved-ctx"), provider, tools, memory)
+            .with_file_state_cache(Arc::new(crate::file_state_cache::FileStateCache::new()))
+            .with_config(AgentConfig {
+                save_episodes: false,
+                format_after_edit: true,
+                ..Default::default()
+            });
+
+        let pending = crate::approval::PendingApproval {
+            request: crate::approval::ApprovalRequestEnvelope {
+                request_id: "req-1".into(),
+                tool_name: "ctx_infra_probe".into(),
+                tool_args_digest: "digest".into(),
+                title: "probe".into(),
+                summary: "probe".into(),
+                risk_level: crate::approval::ApprovalRiskLevel::Normal,
+                authorized_approvers: vec![],
+                expires_at: chrono::Utc::now() + chrono::Duration::minutes(5),
+                on_timeout: crate::approval::ApprovalTimeoutBehavior::Notify,
+            },
+            room_id: "room".into(),
+            requester: "user".into(),
+            tool_id: "call_probe".into(),
+            tool_args: serde_json::json!({}),
+        };
+
+        let result = agent
+            .execute_approved_tool(&pending)
+            .await
+            .expect("approved probe must execute");
+        assert!(result.success);
+        use std::sync::atomic::Ordering;
+        assert!(
+            supervisor_seen.load(Ordering::SeqCst),
+            "approved ctx must carry the task supervisor"
+        );
+        assert!(
+            cache_seen.load(Ordering::SeqCst),
+            "approved ctx must carry the file-state cache"
+        );
+        assert!(
+            format_seen.load(Ordering::SeqCst),
+            "approved ctx must carry config-driven flags (format_after_edit)"
         );
     }
 

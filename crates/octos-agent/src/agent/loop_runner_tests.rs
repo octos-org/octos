@@ -3024,6 +3024,69 @@ async fn dedup_loop_warning_resets_after_reset() {
 }
 
 #[tokio::test]
+async fn shell_spiral_dispatch_marks_loop_detected_recently() {
+    // #1656: a firing shell spiral must mark the two-stage dedup flag, so a
+    // generic loop detection later in the SAME turn is treated as the second
+    // fire (terminal) instead of restarting the warn-then-terminate ladder.
+    let dir = tempfile::tempdir().unwrap();
+    let agent = build_agent_with_mock(dir.path()).await;
+
+    // Four consecutive failing shell exchanges inside the current user turn —
+    // the spiral detector's threshold.
+    let mut messages = vec![Message::user("fix the build")];
+    for i in 0..4 {
+        let call_id = format!("call_shell_{i}");
+        messages.push(Message {
+            role: MessageRole::Assistant,
+            content: String::new(),
+            media: vec![],
+            tool_calls: Some(vec![ToolCall {
+                id: call_id.clone(),
+                name: "shell".into(),
+                arguments: serde_json::json!({"command": "cargo build"}),
+                metadata: None,
+            }]),
+            tool_call_id: None,
+            reasoning_content: None,
+            client_message_id: None,
+            thread_id: None,
+            timestamp: chrono::Utc::now(),
+        });
+        messages.push(Message {
+            role: MessageRole::Tool,
+            content: "error[E0999]: broken\n\nExit code: 101".into(),
+            media: vec![],
+            tool_calls: None,
+            tool_call_id: Some(call_id),
+            reasoning_content: None,
+            client_message_id: None,
+            thread_id: None,
+            timestamp: chrono::Utc::now(),
+        });
+    }
+
+    assert!(!agent.is_loop_detected_recently());
+    let mut retry_state = LoopRetryState::new();
+    let outcome = agent.dispatch_shell_retry_recovery(&messages, &mut retry_state, 1);
+    assert!(
+        outcome.is_some(),
+        "the spiral must fire on 4 failing shells"
+    );
+    assert!(
+        agent.is_loop_detected_recently(),
+        "a firing spiral must mark the loop-detected flag (#1656)"
+    );
+
+    // The NEXT generic loop detection in this turn is the SECOND fire —
+    // terminal, not a fresh warning.
+    let second = agent.dedup_loop_warning("[LOOP DETECTED] generic".to_string());
+    assert!(
+        second.is_err(),
+        "generic detection after a spiral must be terminal, got {second:?}"
+    );
+}
+
+#[tokio::test]
 async fn process_message_resets_loop_detected_flag_at_start() {
     // Pre-set the flag, then run a process_message that does NOT trigger
     // the loop detector. The reset at the start of process_message_inner
