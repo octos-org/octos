@@ -52,6 +52,11 @@ impl Agent {
     /// Catches:
     /// - Empty content with no tool calls and no reasoning (including output_tokens > 0 bug)
     /// - Content filtered by safety/moderation
+    /// - Repetitive output suppressed by the stream consumer (#1507): the
+    ///   placeholder message stands in for degenerate output, so the retry /
+    ///   non-streaming-fallback ladder still gets its chance to recover the
+    ///   real content — only when that ladder is disabled or exhausted does
+    ///   the placeholder reach the user (instead of the old blank bubble).
     pub(super) fn is_retriable_response(response: &ChatResponse) -> bool {
         let has_reasoning = response
             .reasoning_content
@@ -63,7 +68,12 @@ impl Agent {
         let is_abnormal_tool_use =
             response.stop_reason == StopReason::ToolUse && response.tool_calls.is_empty();
         let is_filtered = response.stop_reason == StopReason::ContentFiltered;
-        is_empty || is_filtered || is_abnormal_tool_use
+        let is_suppressed_repetition = response
+            .content
+            .as_deref()
+            .is_some_and(|c| c == super::streaming::REPETITIVE_OUTPUT_MESSAGE)
+            && response.tool_calls.is_empty();
+        is_empty || is_filtered || is_abnormal_tool_use || is_suppressed_repetition
     }
 
     /// Normalize inline XML-style invocations into structured tool calls.

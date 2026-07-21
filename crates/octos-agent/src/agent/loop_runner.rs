@@ -383,6 +383,11 @@ impl Agent {
             return None;
         }
         let recovery = recover_shell_retry(window, SHELL_RETRY_RECOVERY_THRESHOLD)?;
+        // #1656: a firing spiral IS a loop detection — mark the two-stage
+        // dedup flag so a generic loop detection later in the SAME turn is
+        // treated as the second fire (terminal) instead of restarting the
+        // warn-then-terminate ladder with no memory of this one.
+        self.mark_loop_detected_recently();
         let decision = retry_state.observe_shell_spiral();
         tracing::warn!(
             recovery_kind = ?recovery.kind,
