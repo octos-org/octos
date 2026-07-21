@@ -828,28 +828,37 @@ impl Tool for ShellTool {
                 if let Some(pid) = child_pid {
                     use std::process::Command as StdCommand;
 
-                    // 1. Send SIGTERM to process group for graceful shutdown
-                    let _ = StdCommand::new("kill")
-                        .args(["-15", &format!("-{pid}")])
-                        .status();
+                    // 1. Send SIGTERM to process group for graceful shutdown.
+                    // `--` is required before the negative PID: GNU/procps
+                    // `kill` otherwise parses `-<pid>` as an option and the
+                    // group signal is silently never delivered (macOS
+                    // accepted the bare form, Linux did not).
+                    let group = format!("-{pid}");
+                    let _ = StdCommand::new("kill").args(["-15", "--", &group]).status();
                     let _ = StdCommand::new("kill")
                         .args(["-15", &pid.to_string()])
                         .status();
 
-                    // 2. Brief grace period, then SIGKILL only if still alive.
-                    // Check /proc/{pid} (Linux) or kill -0 (portable) to avoid
-                    // killing a recycled PID.
+                    // 2. Brief grace period, then SIGKILL gated on a probe of
+                    // the GROUP — a leader-only probe skipped the escalation
+                    // when the shell died to SIGTERM while backgrounded
+                    // grandchildren lived on (#1781 CI). `kill -0 -- -pgid`
+                    // succeeds while ANY member is alive and cannot hit a
+                    // recycled group while a member remains.
                     tokio::time::sleep(Duration::from_millis(500)).await;
 
-                    let still_alive = StdCommand::new("kill")
+                    let group_alive = StdCommand::new("kill")
+                        .args(["-0", "--", &group])
+                        .status()
+                        .is_ok_and(|s| s.success());
+                    if group_alive {
+                        let _ = StdCommand::new("kill").args(["-9", "--", &group]).status();
+                    }
+                    let leader_alive = StdCommand::new("kill")
                         .args(["-0", &pid.to_string()])
                         .status()
                         .is_ok_and(|s| s.success());
-
-                    if still_alive {
-                        let _ = StdCommand::new("kill")
-                            .args(["-9", &format!("-{pid}")])
-                            .status();
+                    if leader_alive {
                         let _ = StdCommand::new("kill")
                             .args(["-9", &pid.to_string()])
                             .status();
