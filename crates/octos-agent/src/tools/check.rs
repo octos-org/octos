@@ -168,9 +168,23 @@ enum Level {
     Warning,
 }
 
+/// Whether a rustc compiler-message is a run SUMMARY rather than a real
+/// diagnostic: `aborting due to N previous errors[; M warnings emitted]`,
+/// `N warnings emitted`, and the trailing help pointers. These recap
+/// diagnostics already emitted individually.
+fn is_cargo_summary_message(text: &str) -> bool {
+    text.starts_with("aborting due to ")
+        || text.ends_with(" warnings emitted")
+        || text.ends_with(" warning emitted")
+        || text.starts_with("Some errors have detailed explanations")
+        || text.starts_with("For more information about")
+}
+
 /// Parse `cargo check --message-format=json` stdout: one JSON object per
 /// line; keep `compiler-message` entries at level error/warning, rendered
-/// as `file:line: level[code]: message` from the primary span.
+/// as `file:line: level[code]: message` from the primary span. Run-summary
+/// recaps (see [`is_cargo_summary_message`]) are skipped — they are not
+/// diagnostics.
 fn parse_cargo_json(stdout: &str) -> ParsedDiagnostics {
     let mut out = ParsedDiagnostics::default();
     let mut seen = std::collections::HashSet::new();
@@ -199,6 +213,13 @@ fn parse_cargo_json(stdout: &str) -> ParsedDiagnostics {
         let Some(text) = message.get("message").and_then(|m| m.as_str()) else {
             continue;
         };
+        // rustc forwards run SUMMARY lines as compiler-messages too
+        // ("aborting due to N previous errors", "N warnings emitted"). They
+        // describe diagnostics already counted above — rendering them would
+        // double-count ("2 errors" shows 3 entries) and burn cap slots.
+        if is_cargo_summary_message(text) {
+            continue;
+        }
         let code = message
             .get("code")
             .and_then(|c| c.get("code"))
@@ -818,6 +839,45 @@ mod tests {
                 "src/lib.rs:10: warning: unused variable: `x`".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn should_skip_cargo_run_summary_messages() {
+        // #1772 review: rustc forwards run SUMMARIES as compiler-messages
+        // too. Counting them double-reports ("1 error" shows 2+ entries) and
+        // burns cap slots. VERBATIM shapes rustc emits (no spans, no code) —
+        // deliberately NOT built with `cargo_line` so this fixture can't
+        // drift with the helper.
+        let summary = |level: &str, message: &str| {
+            format!(
+                r#"{{"reason":"compiler-message","package_id":"pkg 0.1.0","manifest_path":"Cargo.toml","target":{{"name":"pkg"}},"message":{{"rendered":"{message}\n","level":"{level}","message":"{message}","code":null,"spans":[]}}}}"#
+            )
+        };
+        let fixture = [
+            cargo_line("src/main.rs", 3, "error", Some("E0308"), "mismatched types"),
+            cargo_line("src/lib.rs", 10, "warning", None, "unused variable: `x`"),
+            summary(
+                "error",
+                "aborting due to 1 previous error; 1 warning emitted",
+            ),
+            summary("error", "aborting due to 2 previous errors"),
+            summary("warning", "3 warnings emitted"),
+            summary("warning", "1 warning emitted"),
+            summary(
+                "error",
+                "Some errors have detailed explanations: E0308, E0432.",
+            ),
+            summary(
+                "error",
+                "For more information about an error, try `rustc --explain E0308`.",
+            ),
+        ]
+        .join("\n");
+
+        let parsed = parse_cargo_json(&fixture);
+        assert_eq!(parsed.errors, 1, "summaries must not count as errors");
+        assert_eq!(parsed.warnings, 1, "summaries must not count as warnings");
+        assert_eq!(parsed.lines.len(), 2, "lines: {:?}", parsed.lines);
     }
 
     #[test]
