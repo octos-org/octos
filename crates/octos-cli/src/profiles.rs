@@ -3340,8 +3340,8 @@ mod tests {
         // left serve permanently OFF while chat/gateway/acp honored the
         // opt-in. The profile's flag must reach the runtime Config.
         let profile = UserProfile {
-            id: "fmt-optin".into(),
-            name: "Fmt Optin".into(),
+            id: "fmt-opt-in".into(),
+            name: "Fmt Opt-In".into(),
             enabled: false,
             data_dir: None,
             parent_id: None,

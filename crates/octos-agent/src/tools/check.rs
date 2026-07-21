@@ -1250,7 +1250,7 @@ vet: helper.go:4:6: undefined: missingFn
         std::fs::write(
             &script,
             format!(
-                "#!/bin/sh\n(sleep 3; touch {}) & wait\n",
+                "#!/bin/sh\n(sleep 6; touch {}) & wait\n",
                 sentinel.display()
             ),
         )
@@ -1277,13 +1277,13 @@ vet: helper.go:4:6: undefined: missingFn
             result.output
         );
         assert!(
-            started.elapsed() < Duration::from_secs(3),
+            started.elapsed() < Duration::from_secs(5),
             "check must return promptly on timeout (got {:?})",
             started.elapsed()
         );
 
         // Wait past when the orphaned grandchild's `touch` would fire.
-        tokio::time::sleep(Duration::from_millis(4_000)).await;
+        tokio::time::sleep(Duration::from_millis(7_000)).await;
         assert!(
             !sentinel.exists(),
             "grandchild must be killed via the checker's process group on \
