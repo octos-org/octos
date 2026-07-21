@@ -45,8 +45,12 @@ impl EditFileTool {
 
 #[derive(Debug, Deserialize)]
 struct EditFileInput {
+    /// #1767: `filePath` is the industry-convention alias.
+    #[serde(alias = "filePath")]
     path: String,
+    #[serde(alias = "oldString")]
     old_string: String,
+    #[serde(alias = "newString")]
     new_string: String,
 }
 
@@ -57,7 +61,7 @@ impl Tool for EditFileTool {
     }
 
     fn description(&self) -> &str {
-        "Edit a file by replacing an exact string with a new string. The old_string must match exactly (including whitespace and indentation)."
+        "Edit a file by replacing a string with a new string. An exact match of old_string is preferred; when none exists, whitespace-, indentation- and escape-tolerant fuzzy matching is tried as a fallback. The old_string must identify a single location."
     }
 
     fn tags(&self) -> &[&str] {
@@ -76,15 +80,15 @@ impl Tool for EditFileTool {
             "properties": {
                 "path": {
                     "type": "string",
-                    "description": "Path to the file to edit"
+                    "description": "Path to the file to edit (alias: filePath)"
                 },
                 "old_string": {
                     "type": "string",
-                    "description": "The exact string to find and replace"
+                    "description": "The string to find and replace. An exact match is preferred; minor whitespace/indentation/escape differences are tolerated as a fallback. Must identify a unique location. (alias: oldString)"
                 },
                 "new_string": {
                     "type": "string",
-                    "description": "The string to replace it with"
+                    "description": "The string to replace it with (alias: newString)"
                 }
             },
             "required": ["path", "old_string", "new_string"]
@@ -155,33 +159,75 @@ impl Tool for EditFileTool {
             Err(e) => return Ok(super::file_io_error(e, &input.path)),
         };
 
-        // Check if old_string exists
-        let count = content.matches(&input.old_string).count();
+        if input.old_string.is_empty() {
+            return Ok(ToolResult {
+                output: "old_string must not be empty".to_string(),
+                success: false,
+                ..Default::default()
+            });
+        }
 
-        if count == 0 {
+        // #1771: cascading replacer chain — exact match first, then
+        // increasingly whitespace/indentation/escape-tolerant fallbacks.
+        let (range, replacer_name) = match super::replacer::find_replacement(
+            &content,
+            &input.old_string,
+        ) {
+            super::replacer::ChainOutcome::Match { range, replacer } => (range, replacer),
+            super::replacer::ChainOutcome::Ambiguous { count, replacer } => {
+                return Ok(ToolResult {
+                    output: format!(
+                        "Found {count} occurrences of the string (via {replacer} replacer). Please provide more context to make the match unique.",
+                    ),
+                    success: false,
+                    ..Default::default()
+                });
+            }
+            super::replacer::ChainOutcome::NoMatch => {
+                return Ok(ToolResult {
+                    output: format!(
+                        "String not found in file. No exact match, and no fuzzy match via the line-trimmed, whitespace-normalized, indentation-flexible, escape-normalized or block-anchor replacers.\n\nSearched for:\n```\n{}\n```",
+                        input.old_string
+                    ),
+                    success: false,
+                    ..Default::default()
+                });
+            }
+        };
+
+        // Safety guard: a fuzzy matcher must never silently swallow far more
+        // of the file than the old_string described.
+        let matched_text = &content[range.clone()];
+        if super::replacer::is_disproportionate_match(matched_text, &input.old_string) {
             return Ok(ToolResult {
                 output: format!(
-                    "String not found in file. Make sure the old_string matches exactly.\n\nSearched for:\n```\n{}\n```",
-                    input.old_string
+                    "Fuzzy match rejected as disproportionate: the {replacer_name} replacer matched {} lines / {} bytes for an old_string of {} lines / {} bytes. Provide more context so the match is precise.",
+                    matched_text.lines().count(),
+                    matched_text.len(),
+                    input.old_string.lines().count(),
+                    input.old_string.len(),
                 ),
                 success: false,
                 ..Default::default()
             });
         }
 
-        if count > 1 {
-            return Ok(ToolResult {
-                output: format!(
-                    "Found {} occurrences of the string. Please provide more context to make the match unique.",
-                    count
-                ),
-                success: false,
-                ..Default::default()
-            });
+        if replacer_name != "exact" {
+            tracing::info!(
+                replacer = replacer_name,
+                path = %input.path,
+                "edit_file fuzzy match succeeded"
+            );
         }
 
-        // Perform replacement
-        let new_content = content.replacen(&input.old_string, &input.new_string, 1);
+        // Perform replacement by byte range — the fuzzy-matched span may
+        // occur elsewhere as a plain substring, so a string replacen could
+        // hit the wrong occurrence.
+        let mut new_content =
+            String::with_capacity(content.len() - range.len() + input.new_string.len());
+        new_content.push_str(&content[..range.start]);
+        new_content.push_str(&input.new_string);
+        new_content.push_str(&content[range.end..]);
 
         // Write back (O_NOFOLLOW)
         if let Err(e) = super::write_no_follow(&path, new_content.as_bytes()).await {
@@ -204,8 +250,19 @@ impl Tool for EditFileTool {
             );
         }
 
+        // Report which replacer produced the match. The exact-match wording
+        // is kept identical to the historical output for compatibility.
+        let output = if replacer_name == "exact" {
+            format!("Successfully edited {}", input.path)
+        } else {
+            format!(
+                "Successfully edited {} (fuzzy match via {replacer_name} replacer)",
+                input.path
+            )
+        };
+
         Ok(ToolResult {
-            output: format!("Successfully edited {}", input.path),
+            output,
             success: true,
             file_modified: Some(path),
             ..Default::default()
@@ -593,6 +650,342 @@ mod tests {
             .unwrap();
         assert!(!bad.success);
         assert!(bad.output.contains("outside working directory"));
+    }
+
+    // -----------------------------------------------------------------------
+    // #1771: cascading fuzzy replacer chain.
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn should_match_via_line_trimmed_when_indentation_differs() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("code.rs"),
+            "fn main() {\n    if ready {\n        launch();\n    }\n}\n",
+        )
+        .unwrap();
+
+        let tool = EditFileTool::new(dir.path());
+        // LLM lost the indentation (flush left) but every line's trimmed
+        // content is right — the line_trimmed replacer must recover it.
+        let result = tool
+            .execute(&serde_json::json!({
+                "path": "code.rs",
+                "old_string": "if ready {\nlaunch();\n}",
+                "new_string": "if ready {\n        abort();\n    }"
+            }))
+            .await
+            .unwrap();
+
+        assert!(
+            result.success,
+            "line-trimmed fuzzy match should succeed: {}",
+            result.output
+        );
+        assert!(
+            result.output.contains("line_trimmed"),
+            "success output must report which replacer matched: {}",
+            result.output
+        );
+        let content = std::fs::read_to_string(dir.path().join("code.rs")).unwrap();
+        assert!(content.contains("abort();"));
+        assert!(!content.contains("launch();"));
+    }
+
+    #[tokio::test]
+    async fn should_match_via_whitespace_normalized_when_internal_runs_differ() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("w.rs"), "let x  =  compute( a, b );\n").unwrap();
+
+        let tool = EditFileTool::new(dir.path());
+        let result = tool
+            .execute(&serde_json::json!({
+                "path": "w.rs",
+                "old_string": "let x = compute( a, b );",
+                "new_string": "let x = compute(a, b, c);"
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.success, "{}", result.output);
+        assert!(result.output.contains("whitespace_normalized"));
+        let content = std::fs::read_to_string(dir.path().join("w.rs")).unwrap();
+        assert_eq!(content, "let x = compute(a, b, c);\n");
+    }
+
+    #[tokio::test]
+    async fn should_match_via_indentation_flexible_when_blank_boundary_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("i.rs"),
+            "fn wrapper() {\n    step_one();\n    step_two();\n}\n",
+        )
+        .unwrap();
+
+        let tool = EditFileTool::new(dir.path());
+        // Needle copied with stray blank lines around the block and a
+        // uniformly deeper indent — only the dedent matcher recovers it.
+        let result = tool
+            .execute(&serde_json::json!({
+                "path": "i.rs",
+                "old_string": "\n        step_one();\n        step_two();\n\n",
+                "new_string": "    merged_steps();"
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.success, "{}", result.output);
+        assert!(result.output.contains("indentation_flexible"));
+        let content = std::fs::read_to_string(dir.path().join("i.rs")).unwrap();
+        assert_eq!(content, "fn wrapper() {\n    merged_steps();\n}\n");
+    }
+
+    #[tokio::test]
+    async fn should_match_via_escape_normalized_when_newline_double_escaped() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("e.rs"), "alpha {\n    beta();\n}\n").unwrap();
+
+        let tool = EditFileTool::new(dir.path());
+        // old_string carries a literal backslash-n instead of a newline.
+        let result = tool
+            .execute(&serde_json::json!({
+                "path": "e.rs",
+                "old_string": "alpha {\\n    beta();",
+                "new_string": "alpha {\n    gamma();"
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.success, "{}", result.output);
+        assert!(result.output.contains("escape_normalized"));
+        let content = std::fs::read_to_string(dir.path().join("e.rs")).unwrap();
+        assert_eq!(content, "alpha {\n    gamma();\n}\n");
+    }
+
+    #[tokio::test]
+    async fn should_match_via_block_anchor_when_middle_line_drifted() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("b.rs"),
+            "fn compute() {\n    let total = base + extra;\n    total * 2\n}\n",
+        )
+        .unwrap();
+
+        let tool = EditFileTool::new(dir.path());
+        // Middle line remembered slightly wrong (offset vs extra) — first
+        // and last lines anchor the block, similarity carries the middle.
+        let result = tool
+            .execute(&serde_json::json!({
+                "path": "b.rs",
+                "old_string": "fn compute() {\n    let total = base + offset;\n    total * 2\n}",
+                "new_string": "fn compute() {\n    base * 3\n}"
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.success, "{}", result.output);
+        assert!(result.output.contains("block_anchor"));
+        let content = std::fs::read_to_string(dir.path().join("b.rs")).unwrap();
+        assert_eq!(content, "fn compute() {\n    base * 3\n}\n");
+    }
+
+    #[tokio::test]
+    async fn should_reject_disproportionate_block_anchor_span() {
+        let dir = tempfile::tempdir().unwrap();
+        let original = "fn f() {\n    a();\n    b();\n    c();\n    d();\n    e();\n    g();\n}\n";
+        std::fs::write(dir.path().join("g.rs"), original).unwrap();
+
+        let tool = EditFileTool::new(dir.path());
+        // Anchors would bracket 8 lines for a 3-line old_string (> the
+        // max(3+3, 3*2) = 6 line cap) — the guard must refuse.
+        let result = tool
+            .execute(&serde_json::json!({
+                "path": "g.rs",
+                "old_string": "fn f() {\n    a();\n}",
+                "new_string": "fn f() {}"
+            }))
+            .await
+            .unwrap();
+
+        assert!(!result.success, "guard must reject: {}", result.output);
+        assert!(
+            result.output.contains("disproportionate"),
+            "expected guard message, got: {}",
+            result.output
+        );
+        // File untouched.
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("g.rs")).unwrap(),
+            original
+        );
+    }
+
+    #[tokio::test]
+    async fn should_reject_disproportionate_char_growth() {
+        let dir = tempfile::tempdir().unwrap();
+        let indent = " ".repeat(60);
+        let original = format!("{indent}x();\n{indent}y();\n{indent}z();\n");
+        std::fs::write(dir.path().join("c.rs"), &original).unwrap();
+
+        let tool = EditFileTool::new(dir.path());
+        // line_trimmed would match, but the span is 194 bytes for a
+        // 14-byte old_string (> 4x) — the guard must refuse.
+        let result = tool
+            .execute(&serde_json::json!({
+                "path": "c.rs",
+                "old_string": "x();\ny();\nz();",
+                "new_string": "w();"
+            }))
+            .await
+            .unwrap();
+
+        assert!(!result.success, "guard must reject: {}", result.output);
+        assert!(result.output.contains("disproportionate"));
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("c.rs")).unwrap(),
+            original
+        );
+    }
+
+    #[tokio::test]
+    async fn should_fail_with_count_when_fuzzy_match_is_ambiguous() {
+        let dir = tempfile::tempdir().unwrap();
+        let original = "fn a() {\n    if ready {\n        launch();\n    }\n}\nfn b() {\n  if ready {\n    launch();\n  }\n}\n";
+        std::fs::write(dir.path().join("amb.rs"), original).unwrap();
+
+        let tool = EditFileTool::new(dir.path());
+        // No exact occurrence, but the trimmed block exists at two
+        // different indentation levels — must fail with the count, not
+        // silently pick one or fall through to a fuzzier stage.
+        let result = tool
+            .execute(&serde_json::json!({
+                "path": "amb.rs",
+                "old_string": "if ready {\nlaunch();\n}",
+                "new_string": "abort();"
+            }))
+            .await
+            .unwrap();
+
+        assert!(!result.success, "{}", result.output);
+        assert!(
+            result.output.contains("2 occurrences"),
+            "expected the ambiguity count, got: {}",
+            result.output
+        );
+        assert!(result.output.contains("line_trimmed"));
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("amb.rs")).unwrap(),
+            original
+        );
+    }
+
+    #[tokio::test]
+    async fn should_reject_empty_old_string() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("f.txt"), "content").unwrap();
+
+        let tool = EditFileTool::new(dir.path());
+        let result = tool
+            .execute(&serde_json::json!({
+                "path": "f.txt",
+                "old_string": "",
+                "new_string": "x"
+            }))
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        assert!(result.output.contains("must not be empty"));
+    }
+
+    #[tokio::test]
+    async fn should_keep_exact_success_output_stable() {
+        // Exact matches keep the historical wording — no replacer chatter.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("s.txt"), "hello world\n").unwrap();
+
+        let tool = EditFileTool::new(dir.path());
+        let result = tool
+            .execute(&serde_json::json!({
+                "path": "s.txt",
+                "old_string": "hello",
+                "new_string": "goodbye"
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.success);
+        assert_eq!(result.output, "Successfully edited s.txt");
+    }
+
+    #[tokio::test]
+    async fn should_splice_fuzzy_match_at_located_span_not_first_substring() {
+        // The fuzzy-matched span's exact text ("    a();\n    b();") ALSO
+        // occurs earlier in the file, but mid-line (inside a string-ish
+        // context), where it is not a valid line window. A string replacen
+        // of the matched text would corrupt the earlier occurrence; the
+        // byte-range splice must edit the located window only.
+        let dir = tempfile::tempdir().unwrap();
+        let original = "code(    a();\n    b();x)\nfn late() {\n    a();\n    b();\n}\n";
+        std::fs::write(dir.path().join("span.rs"), original).unwrap();
+
+        let tool = EditFileTool::new(dir.path());
+        let result = tool
+            .execute(&serde_json::json!({
+                "path": "span.rs",
+                // Flush-left needle: line_trimmed matches only the window
+                // inside fn late().
+                "old_string": "a();\nb();",
+                "new_string": "    c();"
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.success, "{}", result.output);
+        let content = std::fs::read_to_string(dir.path().join("span.rs")).unwrap();
+        assert_eq!(
+            content,
+            "code(    a();\n    b();x)\nfn late() {\n    c();\n}\n"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // #1767: industry-convention parameter aliases.
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn should_accept_camel_case_aliases_for_edit_input() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("alias.txt"), "hello world\n").unwrap();
+
+        let tool = EditFileTool::new(dir.path());
+        let result = tool
+            .execute(&serde_json::json!({
+                "filePath": "alias.txt",
+                "oldString": "hello",
+                "newString": "goodbye"
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.success, "aliases must work: {}", result.output);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("alias.txt")).unwrap(),
+            "goodbye world\n"
+        );
+    }
+
+    #[test]
+    fn schema_advertises_canonical_names_only() {
+        let tool = EditFileTool::new("/tmp");
+        let schema = tool.input_schema();
+        let props = schema["properties"].as_object().unwrap();
+        assert!(props.contains_key("path"));
+        assert!(props.contains_key("old_string"));
+        assert!(props.contains_key("new_string"));
+        assert!(!props.contains_key("filePath"));
+        assert!(!props.contains_key("oldString"));
+        assert!(!props.contains_key("newString"));
     }
 
     #[tokio::test]

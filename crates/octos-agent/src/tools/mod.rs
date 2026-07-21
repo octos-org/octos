@@ -711,6 +711,7 @@ pub mod read_file;
 pub mod read_task_output;
 pub mod recall_memory;
 pub mod record_memory_use;
+pub(crate) mod replacer;
 pub mod research_utils;
 pub mod save_memory;
 pub mod send_app_card;
