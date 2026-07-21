@@ -486,6 +486,108 @@ octos init                           # pick a provider + model, then paste that 
 
 Flags mirror `octos chat`: `--provider`, `--model`, `--base-url`, `--config`, `--data-dir`, `--cwd`, `--profile`, and `--max-iterations`. Zed sends a per-session working directory with `session/new`; that's where octos roots tools, skills, and the filesystem scope.
 
+## Headless agent mode & code review (`octos chat`)
+
+`octos chat` is both an interactive REPL and a **one-shot headless agent** — the
+`claude -p "…"` / `codex exec` equivalent. It has file, search, and shell tools,
+so it reads code, runs `git diff`, and runs tests on its own; you just give it a
+task.
+
+```bash
+octos chat                             # interactive REPL
+octos chat "explain crates/octos-agent/src/agent.rs"   # one-shot: run one turn, exit
+octos chat -m "…" --json               # one-shot, machine-readable result on stdout
+```
+
+### Sandbox & approval (codex parity)
+
+Two orthogonal flags decide how much the agent may do unattended:
+
+| Flag | Values | Effect |
+| --- | --- | --- |
+| `--sandbox` | `read-only` \| `workspace-write` (default) \| `danger-full-access` | filesystem / network reach |
+| `--ask-for-approval` | `ask` (default) \| `never` | prompt on risky commands, or fail them closed |
+| `--yolo` | *(flag)* | alias for `--sandbox danger-full-access`: no sandbox, network on, approvals never. **Local single-user boxes only — risk of data loss.** |
+
+- **read-only** — reads files and runs read-only commands (`git diff`, `grep`); write/edit tools fail.
+- **workspace-write** — reads and writes, confined to `--cwd`.
+- **danger-full-access / `--yolo`** — host filesystem + network, no approvals.
+
+Guardrails preserved even under `--yolo`: `before_tool_call` hooks, `ToolPolicy`
+deny lists, SSRF protection, and `BLOCKED_ENV_VARS` still apply.
+
+### Reuse an existing profile (model + API key)
+
+`--profile <id>` reads a stored serve/onboarding profile
+(`~/.octos/profiles/<id>.json`, created by `octos serve` or octos-tui) and
+reuses its provider, model, route, and API key — so you don't re-enter them:
+
+```bash
+octos chat --profile dev --yolo "refactor this module"   # uses dev's model + key
+```
+
+Precedence: `--config` > `--profile <id>` > ambient `config.json`;
+`--provider` / `--model` / `--base-url` / `--api-type` still override.
+
+### Code review
+
+The agent reads the code and returns its findings as its final answer on
+**stdout** — capture it with your shell. (Stdout is outside the sandbox, so a
+`read-only` reviewer, which cannot touch the repo, can still "produce a file".)
+
+```bash
+octos chat --profile dev --cwd ~/repo \
+  --sandbox read-only --ask-for-approval never --effort high \
+  -m "Review the diff of this branch against main. For each issue give file:line,
+      severity, and a concrete failure scenario. Rank most-severe first." \
+  > review.md
+```
+
+If you want the **agent itself** to write files (not shell capture), use
+`--sandbox workspace-write` and tell it to write them — `read-only` blocks the
+write. `workspace-write` lets it write anywhere under `--cwd`, so for a contained
+run point it at a fresh `git worktree` and inspect the diff afterward.
+
+### Run many agents in parallel on one profile
+
+Add `--no-session-persistence` and point N agents at one `--data-dir` (hence one
+shared `--profile`); they run concurrently — the ephemeral flag drops the
+exclusive episode-store lock that would otherwise serialize them.
+
+```bash
+# Review fan-out — one repo, many lenses, each writes its own report
+for lens in correctness security performance; do
+  octos chat --profile dev --cwd ~/repo \
+    --sandbox read-only --ask-for-approval never --no-session-persistence \
+    -m "Review only for $lens. Write findings to REVIEW-$lens.md." &
+done; wait
+
+# Edit fan-out — one agent per folder, each changes its own tree
+for d in svc-a svc-b svc-c; do
+  octos chat --profile dev --cwd ~/work/$d \
+    --sandbox workspace-write --ask-for-approval never --no-session-persistence \
+    -m "Implement the TODOs in this folder." &
+done; wait
+```
+
+Without `--no-session-persistence`, a second `octos chat` on the same
+`--data-dir` fails with `Database already open` — that flag is what makes the
+fan-out non-blocking.
+
+### Other useful flags
+
+| Flag | Purpose |
+| --- | --- |
+| `--effort low\|medium\|high\|max` | reasoning depth for thinking models |
+| `--json` | one JSON result object on stdout (requires `-m`) |
+| `--profile coding-full` | full tool surface (web, pipelines, skills); default `coding` = files / shell / search / memory / spawn |
+| `--no-session-persistence` | ephemeral run (no episode saved); also enables the parallel fan-out above |
+| `--max-iterations N` | raise the per-turn tool-call cap (default 20) |
+| `-v`, `--verbose` | show tool outputs |
+
+Prerequisite: a provider configured (`octos auth login`, or the provider's
+API-key env var), **or** a `--profile` that already carries one.
+
 ## Documentation
 
 📖 **[Full Documentation](https://octos-org.github.io/octos/)** — installation, configuration, channels, providers, memory, skills, advanced features, and more.
