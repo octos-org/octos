@@ -4052,6 +4052,8 @@ mod tests {
                 .contains("cancelled due to earlier sibling error"),
             "later Exclusive peer must be cancelled by the phase-2 cascade: {:?}",
             messages[2].content
+        );
+    }
 
     async fn snapshot_agent(
         tools: ToolRegistry,
