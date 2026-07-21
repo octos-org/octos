@@ -47,6 +47,7 @@ pub mod sandbox;
 mod sanitize;
 pub mod session;
 pub mod session_usage;
+mod shell_analysis;
 pub mod skills;
 pub mod steering;
 pub mod subagent_output;
