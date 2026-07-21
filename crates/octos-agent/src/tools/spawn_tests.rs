@@ -1370,12 +1370,23 @@ async fn child_spawn_clone_is_named_spawn_and_binds_spawn_agent_via_registry_swa
         Arc::new(create_test_store().await),
         PathBuf::from("/tmp"),
         in_tx,
-    );
+    )
+    .with_deliverable_root(PathBuf::from("/runtime/deliverables"))
+    .with_workspace_write_access(false);
 
     let child_id = AgentId::new("child-0");
     let child_spawn = parent.child_spawn_clone(PathBuf::from("/work/child"), &child_id);
     assert_eq!(child_spawn.name(), "spawn");
     assert_eq!(child_spawn.working_dir, PathBuf::from("/work/child"));
+    assert_eq!(
+        child_spawn.deliverable_root,
+        Some(
+            PathBuf::from("/runtime/deliverables")
+                .join("child-0")
+                .join("children")
+        )
+    );
+    assert!(!child_spawn.workspace_write_access);
 
     // A bare builtins registry (what every child registry starts from)
     // carries only the delegate-LESS builtin spawn_agent — the reason a
@@ -2325,6 +2336,7 @@ async fn background_deliverable_uses_configured_root_without_touching_workspace_
     )
     .with_task_supervisor(supervisor.clone(), "api:test-session", ledger)
     .with_deliverable_root(deliverable_root.clone())
+    .with_workspace_write_access(false)
     .with_sandbox(SandboxConfig {
         mode: crate::sandbox::SandboxMode::None,
         ..Default::default()
@@ -2372,6 +2384,41 @@ async fn background_deliverable_uses_configured_root_without_touching_workspace_
         );
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
+}
+
+#[tokio::test]
+async fn read_only_spawn_refuses_deliverable_without_external_root() {
+    let (in_tx, _in_rx) = tokio::sync::mpsc::channel(1);
+    let temp = tempfile::tempdir().unwrap();
+    let workspace = temp.path().join("workspace");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let tool = SpawnTool::new(
+        Arc::new(MockProvider),
+        Arc::new(create_test_store().await),
+        workspace.clone(),
+        in_tx,
+    )
+    .with_workspace_write_access(false);
+
+    let result = tool
+        .execute(&serde_json::json!({
+            "task": "review the workspace",
+            "mode": "sync",
+            "deliverable": "*.md"
+        }))
+        .await
+        .unwrap();
+
+    assert!(!result.success);
+    assert!(
+        result.output.contains("external deliverable root"),
+        "{}",
+        result.output
+    );
+    assert!(
+        !workspace.join(".octos").exists(),
+        "read-only deliverable refusal must leave no workspace state"
+    );
 }
 
 #[tokio::test]

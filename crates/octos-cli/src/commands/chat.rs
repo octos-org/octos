@@ -213,13 +213,14 @@ fn resolve_chat_runtime_paths(
         };
     }
 
-    let runtime_dir = data_dir.join("runtime");
+    // Bootstrap performs direct filesystem writes. Keep every read-only chat
+    // in a private runtime subtree so concurrent sessions cannot race over
+    // generated bundled skills or see each other's plugin state.
+    let run_dir = data_dir.join("runtime").join("runs").join(run_id);
     ChatRuntimePaths {
         project_dir,
-        bootstrap_dir: runtime_dir.clone(),
-        // Worker ids restart at `subagent-0` in every chat process, so the
-        // run id keeps concurrent read-only reviews from clobbering outputs.
-        spawn_deliverable_dir: runtime_dir.join("spawn-deliverables").join(run_id),
+        bootstrap_dir: run_dir.join("bootstrap"),
+        spawn_deliverable_dir: run_dir.join("spawn-deliverables"),
     }
 }
 
@@ -1889,14 +1890,38 @@ mod tests {
         let paths = resolve_chat_runtime_paths(&workspace, &data_dir, permissions, "run-123");
 
         assert_eq!(paths.project_dir, workspace.join(".octos"));
-        assert_eq!(paths.bootstrap_dir, data_dir.join("runtime"));
+        assert_eq!(
+            paths.bootstrap_dir,
+            data_dir
+                .join("runtime")
+                .join("runs")
+                .join("run-123")
+                .join("bootstrap")
+        );
         assert_eq!(
             paths.spawn_deliverable_dir,
             data_dir
                 .join("runtime")
-                .join("spawn-deliverables")
+                .join("runs")
                 .join("run-123")
+                .join("spawn-deliverables")
         );
+    }
+
+    #[test]
+    fn read_only_runtime_paths_are_isolated_per_chat_run() {
+        let workspace = PathBuf::from("/tmp/workspace");
+        let data_dir = PathBuf::from("/tmp/octos-data");
+        let permissions =
+            resolve_chat_permissions(false, Some(ChatSandboxMode::ReadOnly), None).unwrap();
+
+        let first = resolve_chat_runtime_paths(&workspace, &data_dir, permissions, "run-a");
+        let second = resolve_chat_runtime_paths(&workspace, &data_dir, permissions, "run-b");
+
+        assert_ne!(first.bootstrap_dir, second.bootstrap_dir);
+        assert_ne!(first.spawn_deliverable_dir, second.spawn_deliverable_dir);
+        assert!(first.bootstrap_dir.starts_with(&data_dir));
+        assert!(second.bootstrap_dir.starts_with(&data_dir));
     }
 
     #[test]

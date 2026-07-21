@@ -1285,17 +1285,28 @@ impl SpawnTool {
     /// Control host-side workspace state such as git worktree allocation.
     /// This must track the parent session's file-write capability; it is
     /// separate from the child tool sandbox because allocation happens before
-    /// the child registry exists.
+    /// the child registry exists. When disabled, a spawn that requests a
+    /// deliverable must also use [`Self::with_deliverable_root`].
     pub fn with_workspace_write_access(mut self, allowed: bool) -> Self {
         self.workspace_write_access = allowed;
         self
     }
 
-    fn deliverable_output_dir(&self, worker_id: &AgentId) -> PathBuf {
-        self.deliverable_root
-            .clone()
-            .unwrap_or_else(|| self.working_dir.join(".octos").join("spawn-deliverables"))
-            .join(worker_id.to_string())
+    fn deliverable_output_dir(
+        &self,
+        worker_id: &AgentId,
+    ) -> std::result::Result<PathBuf, &'static str> {
+        if let Some(root) = &self.deliverable_root {
+            return Ok(root.join(worker_id.to_string()));
+        }
+        if !self.workspace_write_access {
+            return Err("read-only spawn requires an external deliverable root");
+        }
+        Ok(self
+            .working_dir
+            .join(".octos")
+            .join("spawn-deliverables")
+            .join(worker_id.to_string()))
     }
 
     /// Set a provider router for multi-model sub-agent support.
@@ -3611,7 +3622,16 @@ impl Tool for SpawnTool {
         }
         let child_working_dir = match deliverable_glob.as_deref() {
             Some(glob) => {
-                let out = self.deliverable_output_dir(&worker_id);
+                let out = match self.deliverable_output_dir(&worker_id) {
+                    Ok(out) => out,
+                    Err(error) => {
+                        return Ok(ToolResult {
+                            output: format!("Status: FAILED\n{error}"),
+                            success: false,
+                            ..Default::default()
+                        });
+                    }
+                };
                 // worker_id ("subagent-N") can repeat across turns, so start
                 // from a clean directory — otherwise a stale deliverable from a
                 // prior run would be surfaced (the output dir has no mtime
