@@ -31,6 +31,10 @@ impl ListDirTool {
 }
 
 #[derive(Deserialize)]
+// #1770: unknown keys are usually a typo of a real parameter; rejecting
+// them (with a did-you-mean via `args::parse_tool_args`) lets the model
+// self-correct instead of silently dropping its intent.
+#[serde(deny_unknown_fields)]
 struct Input {
     path: String,
 }
@@ -74,7 +78,7 @@ impl Tool for ListDirTool {
         ctx: &ToolContext,
         args: &serde_json::Value,
     ) -> Result<ToolResult> {
-        let input: Input = serde_json::from_value(args.clone())?;
+        let input: Input = super::args::parse_tool_args(self.name(), &self.input_schema(), args)?;
 
         // Interim mitigation (#1378, superseded by #1377): `up/<base64>/<name>`
         // is an opaque upload handle, not a browsable directory. When the input

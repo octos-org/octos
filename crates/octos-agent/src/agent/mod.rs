@@ -119,6 +119,13 @@ pub struct AgentConfig {
     /// under [`octos_llm::LlmCallPolicy::FailFast`] (voice turns). Default 30s;
     /// env override `OCTOS_VOICE_LLM_DEADLINE_SECS`.
     pub voice_overall_deadline: std::time::Duration,
+    /// Post-edit formatting (issue #1774): when true, a successful
+    /// `edit_file` / `write_file` / `diff_edit` runs the file's language
+    /// formatter (rustfmt / prettier / black / gofmt — see [`crate::format`])
+    /// and echoes the formatted content back in the tool result. Best-effort:
+    /// missing binaries, failures, and timeouts never fail the edit. OFF by
+    /// default — opt in via `format_after_edit: true` in config.json.
+    pub format_after_edit: bool,
 }
 
 /// Default time-to-first-token grace for streaming LLM calls (180s).
@@ -205,6 +212,7 @@ impl Default for AgentConfig {
                 "OCTOS_VOICE_LLM_DEADLINE_SECS",
                 DEFAULT_VOICE_LLM_DEADLINE_SECS,
             ),
+            format_after_edit: false,
         }
     }
 }
@@ -445,6 +453,12 @@ pub struct Agent {
     /// `None` keeps pre-Task-8 behaviour byte-for-byte — the original
     /// `eyre::Report` still flows out of the loop unchanged.
     pub(super) voice_failure_sink: Option<tokio::sync::mpsc::UnboundedSender<crate::TurnFailure>>,
+    /// Git-backed workspace snapshot store (#1768, opt-in). When present,
+    /// `execute_tools` records a snapshot of the workspace before any
+    /// batch containing a mutating tool so the user can restore
+    /// pre-mutation state later. `None` (the default) disables the
+    /// feature entirely — no git subprocess is ever spawned.
+    pub(super) snapshot_manager: Option<Arc<crate::snapshot::SnapshotManager>>,
 }
 
 impl Agent {
@@ -519,6 +533,7 @@ impl Agent {
             session_scope: None,
             verifier_config: None,
             voice_failure_sink: None,
+            snapshot_manager: None,
         }
     }
 
@@ -594,6 +609,7 @@ impl Agent {
             session_scope: None,
             verifier_config: None,
             voice_failure_sink: None,
+            snapshot_manager: None,
         }
     }
 
@@ -928,6 +944,24 @@ impl Agent {
     pub fn with_harness_event_sink(mut self, sink_path: impl Into<String>) -> Self {
         self.harness_event_sink = Some(sink_path.into());
         self
+    }
+
+    /// Attach a workspace [`crate::snapshot::SnapshotManager`] (#1768).
+    /// When present, `execute_tools` records a snapshot before any batch
+    /// containing a mutating tool (see
+    /// [`crate::snapshot::is_mutating_tool`]) so the user can later
+    /// restore pre-mutation state. `None` (the default) disables
+    /// snapshotting entirely — the feature is opt-in.
+    pub fn with_snapshot_manager(mut self, manager: Arc<crate::snapshot::SnapshotManager>) -> Self {
+        self.snapshot_manager = Some(manager);
+        self
+    }
+
+    /// Returns the attached snapshot manager, if any. Lets hosts (and the
+    /// follow-up UI/RPC surface) list/restore snapshots for this agent's
+    /// workspace.
+    pub fn snapshot_manager(&self) -> Option<Arc<crate::snapshot::SnapshotManager>> {
+        self.snapshot_manager.clone()
     }
 
     /// Set per-session runtime limits for tool execution.

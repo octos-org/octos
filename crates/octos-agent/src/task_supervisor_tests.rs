@@ -11,7 +11,7 @@ fn record_final_output_fires_on_change_with_the_output() {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     let supervisor = TaskSupervisor::new();
-    let id = supervisor.register("spawn", "call-fo", None);
+    let id = supervisor.register("spawn", "call-final-output", None);
     supervisor.mark_completed(&id, vec![]);
 
     // Only observe changes AFTER completion, so we isolate the
@@ -22,8 +22,8 @@ fn record_final_output_fires_on_change_with_the_output() {
     let calls_c = calls.clone();
     supervisor.set_on_change(move |task| {
         calls_c.fetch_add(1, Ordering::SeqCst);
-        if let Some(fo) = task.final_output.clone() {
-            *seen_c.lock().unwrap() = Some(fo);
+        if let Some(output) = task.final_output.clone() {
+            *seen_c.lock().unwrap() = Some(output);
         }
     });
 

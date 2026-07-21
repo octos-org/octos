@@ -134,6 +134,10 @@ pub struct ProfileConfig {
     /// (no shell, file, web, browser tools). Used for the admin bot profile.
     #[serde(default)]
     pub admin_mode: bool,
+    /// #1774: opt-in post-edit formatting (rustfmt/prettier/black/gofmt)
+    /// after successful edit_file/write_file/diff_edit. Default OFF.
+    #[serde(default)]
+    pub format_after_edit: bool,
     /// Sandbox configuration for tool isolation.
     #[serde(default)]
     pub sandbox: octos_agent::SandboxConfig,
@@ -2514,6 +2518,9 @@ pub(crate) fn config_from_profile(
         model_hints: primary.and_then(|selection| selection.model_hints.clone()),
         mcp_servers: vec![],
         sandbox: profile.config.sandbox.clone(),
+        // #1768 workspace snapshots: not configurable through profiles yet
+        // (serve-side wiring lands with the UI/RPC follow-up).
+        snapshots: None,
         tool_policy: None,
         tool_policy_by_provider: Default::default(),
         embedding: None,
@@ -2559,6 +2566,10 @@ pub(crate) fn config_from_profile(
         // `profile.config` directly when needed.
         credential_pool: None,
         content_routing: profile.config.content_routing.clone(),
+        // #1774: thread the profile's formatting opt-in so `octos serve`
+        // sessions honor it (review: hardcoding false here left serve
+        // permanently OFF while chat/gateway/acp worked).
+        format_after_edit: profile.config.format_after_edit,
         appui: Default::default(),
         // Carry the profile-declared plugin loader policy through to the
         // flattened `Config` so callers reading
@@ -3320,6 +3331,38 @@ mod tests {
             Some("gemini-2.5-flash")
         );
         assert_eq!(config.sub_providers[1].key, "strong");
+    }
+
+    #[test]
+    fn config_from_profile_threads_format_after_edit() {
+        // #1774 review: `octos serve` builds session configs through
+        // config_from_profile — hardcoding `format_after_edit: false` here
+        // left serve permanently OFF while chat/gateway/acp honored the
+        // opt-in. The profile's flag must reach the runtime Config.
+        let profile = UserProfile {
+            id: "fmt-opt-in".into(),
+            name: "Fmt Opt-In".into(),
+            enabled: false,
+            data_dir: None,
+            parent_id: None,
+            public_subdomain: None,
+            config: ProfileConfig {
+                format_after_edit: true,
+                ..Default::default()
+            },
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        assert!(
+            config_from_profile(&profile, None, None).format_after_edit,
+            "profile opt-in must reach the runtime config (serve path)"
+        );
+        // And the default stays OFF.
+        let off = UserProfile {
+            config: ProfileConfig::default(),
+            ..profile
+        };
+        assert!(!config_from_profile(&off, None, None).format_after_edit);
     }
 
     #[test]

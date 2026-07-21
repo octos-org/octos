@@ -383,6 +383,11 @@ impl Agent {
             return None;
         }
         let recovery = recover_shell_retry(window, SHELL_RETRY_RECOVERY_THRESHOLD)?;
+        // #1656: a firing spiral IS a loop detection — mark the two-stage
+        // dedup flag so a generic loop detection later in the SAME turn is
+        // treated as the second fire (terminal) instead of restarting the
+        // warn-then-terminate ladder with no memory of this one.
+        self.mark_loop_detected_recently();
         let decision = retry_state.observe_shell_spiral();
         tracing::warn!(
             recovery_kind = ?recovery.kind,
@@ -1322,9 +1327,43 @@ impl Agent {
                         StopReason::ToolUse => {
                             // Check for loop detection before executing
                             for tc in &response.tool_calls {
-                                if let Some(warning) = loop_detector.record(&tc.name, &tc.arguments)
+                                // #1765 doom-loop guard: 3+ CONSECUTIVE
+                                // identical tool calls (same name + identical
+                                // arguments JSON) abort the turn before the
+                                // next LLM call. Checked ahead of the cycle
+                                // detector so the tighter threshold owns pure
+                                // identical streaks; the cycle detector keeps
+                                // owning alternating (cycle 2/3) patterns,
+                                // which never build a doom streak. When the
+                                // guard fires, the shell-spiral recovery is
+                                // still consulted first — extracting real
+                                // shell output from a retry spiral is a
+                                // strictly better outcome than a doom abort.
+                                //
+                                // Verifier-configured agents are exempt: the
+                                // verifier lane classifies each repeated
+                                // failure into the turn ledger and injects a
+                                // `verdict: Repeating` note the planner acts
+                                // on at exactly this streak length — a
+                                // strictly richer recovery than an abort
+                                // (see `verifier_repeating_note_changes_
+                                // next_planner_action`). The cycle detector
+                                // below still terminates true thrash there.
+                                let doom_streak = if self.verifier_config.is_some() {
+                                    None
+                                } else {
+                                    loop_detector.record_doom(&tc.name, &tc.arguments)
+                                };
+                                let cycle_warning = if doom_streak.is_some() {
+                                    None
+                                } else {
+                                    loop_detector.record(&tc.name, &tc.arguments)
+                                };
+                                if doom_streak.is_none() && cycle_warning.is_none() {
+                                    continue;
+                                }
+                                warn!("loop detected — breaking agent loop");
                                 {
-                                    warn!("loop detected — breaking agent loop");
                                     let spiral_iteration = turn.iteration();
                                     if let Some(outcome) = self
                                         .dispatch_shell_retry_recovery(
@@ -1414,6 +1453,45 @@ impl Agent {
                                 pending_approval: None,
                                         });
                                     }
+                                    self.emit_cost_update(&turn, &response, attributed_cost);
+                                    // #1765 v1 escalation: the doom guard
+                                    // aborts the turn with a clear model-and-
+                                    // user-facing message — no further LLM
+                                    // call, no execution of the tripping
+                                    // call. (Interactive continue/edit
+                                    // options are follow-up work; v1
+                                    // deliberately avoids a new AppUI
+                                    // approval kind.)
+                                    if let Some(streak) = doom_streak {
+                                        self.mark_loop_detected_recently();
+                                        warn!(
+                                            tool = %tc.name,
+                                            streak,
+                                            "doom loop detected — aborting turn before the next LLM call (#1765)"
+                                        );
+                                        return Ok(ConversationResponse {
+                                            content: doom_loop_terminal_message(
+                                                &tc.name, streak,
+                                            ),
+                                            reasoning_content: None,
+                                            provider_metadata: None,
+                                            token_usage: turn.total_usage().clone(),
+                                            estimated_spend_usd: turn.priced_spend(),
+                                            files_modified,
+                                            files_to_send,
+                                            streamed,
+                                            messages: turn_output_log.clone(),
+                                            tool_results: tool_structured_metadata.clone(),
+                                            synthesized_from_spawn_only: false,
+                                            pending_approval: None,
+                                        });
+                                    }
+                                    let Some(warning) = cycle_warning else {
+                                        // Unreachable: doom returned above and
+                                        // the earlier gate skipped no-signal
+                                        // calls. Kept defensive.
+                                        continue;
+                                    };
                                     // Two-stage loop-detector recovery:
                                     //
                                     // 1. First fire in this turn — inject the
@@ -1443,7 +1521,6 @@ impl Agent {
                                     // returns on second fire is caught and
                                     // converted to a terminal Ok response
                                     // here so callers don't see an error.
-                                    self.emit_cost_update(&turn, &response, attributed_cost);
                                     match self.dedup_loop_warning(warning) {
                                         Ok(warning_content) => {
                                             inject_loop_detected_synthetic_results_with_log(
@@ -3263,6 +3340,22 @@ fn inject_loop_detected_synthetic_results_with_log(
     if let Some(log) = turn_output_log {
         log.extend(rows_for_log);
     }
+}
+
+/// #1765: terminal message returned when the doom-loop guard fires —
+/// the model issued the same tool call (same name + identical arguments
+/// JSON) [`crate::loop_detect::DOOM_LOOP_THRESHOLD`]+ times in a row.
+/// The text is both model-facing (it lands in session history, so the
+/// model can change course next turn) and user-facing (it is the
+/// assistant reply for the aborted turn).
+fn doom_loop_terminal_message(tool_name: &str, streak: usize) -> String {
+    format!(
+        "[DOOM LOOP DETECTED] The `{tool_name}` tool was called {streak} times in a row \
+         with identical arguments, so this turn was stopped before issuing another model \
+         call. Repeating the exact same call cannot produce a different result. Try a \
+         different approach — vary the arguments, use a different tool, or rephrase the \
+         request."
+    )
 }
 
 /// Terminal message returned when the LLM ignores the loop-detector

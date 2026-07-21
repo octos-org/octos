@@ -3024,6 +3024,69 @@ async fn dedup_loop_warning_resets_after_reset() {
 }
 
 #[tokio::test]
+async fn shell_spiral_dispatch_marks_loop_detected_recently() {
+    // #1656: a firing shell spiral must mark the two-stage dedup flag, so a
+    // generic loop detection later in the SAME turn is treated as the second
+    // fire (terminal) instead of restarting the warn-then-terminate ladder.
+    let dir = tempfile::tempdir().unwrap();
+    let agent = build_agent_with_mock(dir.path()).await;
+
+    // Four consecutive failing shell exchanges inside the current user turn —
+    // the spiral detector's threshold.
+    let mut messages = vec![Message::user("fix the build")];
+    for i in 0..4 {
+        let call_id = format!("call_shell_{i}");
+        messages.push(Message {
+            role: MessageRole::Assistant,
+            content: String::new(),
+            media: vec![],
+            tool_calls: Some(vec![ToolCall {
+                id: call_id.clone(),
+                name: "shell".into(),
+                arguments: serde_json::json!({"command": "cargo build"}),
+                metadata: None,
+            }]),
+            tool_call_id: None,
+            reasoning_content: None,
+            client_message_id: None,
+            thread_id: None,
+            timestamp: chrono::Utc::now(),
+        });
+        messages.push(Message {
+            role: MessageRole::Tool,
+            content: "error[E0999]: broken\n\nExit code: 101".into(),
+            media: vec![],
+            tool_calls: None,
+            tool_call_id: Some(call_id),
+            reasoning_content: None,
+            client_message_id: None,
+            thread_id: None,
+            timestamp: chrono::Utc::now(),
+        });
+    }
+
+    assert!(!agent.is_loop_detected_recently());
+    let mut retry_state = LoopRetryState::new();
+    let outcome = agent.dispatch_shell_retry_recovery(&messages, &mut retry_state, 1);
+    assert!(
+        outcome.is_some(),
+        "the spiral must fire on 4 failing shells"
+    );
+    assert!(
+        agent.is_loop_detected_recently(),
+        "a firing spiral must mark the loop-detected flag (#1656)"
+    );
+
+    // The NEXT generic loop detection in this turn is the SECOND fire —
+    // terminal, not a fresh warning.
+    let second = agent.dedup_loop_warning("[LOOP DETECTED] generic".to_string());
+    assert!(
+        second.is_err(),
+        "generic detection after a spiral must be terminal, got {second:?}"
+    );
+}
+
+#[tokio::test]
 async fn process_message_resets_loop_detected_flag_at_start() {
     // Pre-set the flag, then run a process_message that does NOT trigger
     // the loop detector. The reset at the start of process_message_inner
@@ -3490,23 +3553,20 @@ impl LlmProvider for CountingAlwaysSameToolProvider {
 }
 
 #[tokio::test]
-async fn loop_detected_first_fire_continues_then_second_fire_terminates() {
-    // Exercises the full PR `fix/news-fetch-loop-and-detect-recovery`
-    // recovery contract end-to-end:
-    //   1. The looping LLM trips the detector on the 4th call (cycle-1).
-    //   2. First detection MUST NOT terminate — it injects a synthetic
-    //      tool result with the warning and calls the LLM again.
-    //   3. If the LLM repeats the same call, the SECOND detection
-    //      terminates with `loop_detected_terminal_message()`.
+async fn doom_loop_aborts_turn_when_third_identical_call_arrives() {
+    // #1765 doom-loop guard: when the LLM issues the SAME tool call
+    // (same name + identical arguments JSON) 3 times in a row, the
+    // conversation loop must abort the turn with a clear message
+    // instead of issuing the next LLM call.
     //
     // We assert via:
+    //   - The terminal `content` matches `doom_loop_terminal_message`
+    //     (proves the doom guard fired, not the older two-stage
+    //     warn-then-terminate cycle path).
+    //   - The mock LLM was called EXACTLY 3 times: calls 1 and 2
+    //     execute the tool; the 3rd identical call trips the guard and
+    //     no further LLM call is issued.
     //   - The flag (`is_loop_detected_recently`) is set after the run.
-    //   - The terminal `content` matches `loop_detected_terminal_message`
-    //     (proves the second-fire path ran, not the original first-fire
-    //     return-immediately path).
-    //   - The mock LLM was called AT LEAST 5 times (>=4 to trigger first
-    //     fire, +1 for the recovery iteration), confirming the loop
-    //     continued after the first fire.
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("loopy.txt"), b"x").unwrap();
     let provider = Arc::new(CountingAlwaysSameToolProvider {
@@ -3526,25 +3586,107 @@ async fn loop_detected_first_fire_continues_then_second_fire_terminates() {
     let result = agent
         .process_message("please loop", &[], vec![])
         .await
-        .expect("process_message should return Ok even when the loop terminates");
+        .expect("process_message should return Ok even when the doom guard aborts");
 
-    // The terminal message proves the second-fire branch ran. The
-    // pre-fix behaviour would have returned the FIRST-fire warning
-    // text and stopped before issuing another LLM call.
     assert_eq!(
         result.content,
-        loop_detected_terminal_message(),
-        "expected the terminal hard-stop message after the second \
-             loop detection; pre-fix code would have returned the warning \
-             text on the first fire"
+        doom_loop_terminal_message("read_file", 3),
+        "expected the doom-loop abort message when the 3rd identical \
+             call arrives"
     );
     assert!(agent.is_loop_detected_recently());
 
     let total_calls = provider.calls.load(AtomicOrdering::SeqCst);
+    assert_eq!(
+        total_calls, 3,
+        "expected exactly 3 LLM calls — the doom guard must stop the \
+             loop instead of issuing a 4th; got {total_calls}"
+    );
+}
+
+/// LLM mock that alternates between two different argument sets for the
+/// same tool. The doom guard (consecutive identical) must never fire;
+/// the cycle detector (`LoopDetector::record`) owns alternating
+/// patterns and still runs its two-stage warn-then-terminate recovery.
+struct CountingAlternatingArgsProvider {
+    calls: AtomicUsize,
+}
+
+#[async_trait]
+impl LlmProvider for CountingAlternatingArgsProvider {
+    async fn chat(
+        &self,
+        _messages: &[Message],
+        _tools: &[octos_llm::ToolSpec],
+        _config: &octos_llm::ChatConfig,
+    ) -> Result<ChatResponse> {
+        let n = self.calls.fetch_add(1, AtomicOrdering::SeqCst);
+        let path = if n % 2 == 0 { "a.txt" } else { "b.txt" };
+        Ok(ChatResponse {
+            content: None,
+            reasoning_content: None,
+            tool_calls: vec![ToolCall {
+                id: format!("call_alt_{n}"),
+                name: "read_file".to_string(),
+                arguments: serde_json::json!({ "path": path }),
+                metadata: None,
+            }],
+            stop_reason: StopReason::ToolUse,
+            usage: LlmTokenUsage::default(),
+            provider_index: None,
+        })
+    }
+
+    fn model_id(&self) -> &str {
+        "mock"
+    }
+
+    fn provider_name(&self) -> &str {
+        "mock"
+    }
+}
+
+#[tokio::test]
+async fn alternating_cycle_still_uses_two_stage_warning_not_doom_abort() {
+    // #1765: the doom guard counts CONSECUTIVE identical calls only —
+    // an A,B,A,B,… alternation resets the streak every call, so the
+    // existing cycle detector must keep owning that pattern with its
+    // two-stage recovery (first fire injects a warning + one more LLM
+    // iteration; second fire terminates with
+    // `loop_detected_terminal_message`).
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.txt"), b"a").unwrap();
+    std::fs::write(dir.path().join("b.txt"), b"b").unwrap();
+    let provider = Arc::new(CountingAlternatingArgsProvider {
+        calls: AtomicUsize::new(0),
+    });
+    let provider_arc: Arc<dyn LlmProvider> = provider.clone();
+    let tools = ToolRegistry::with_builtins(dir.path());
+    let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+    let agent = Agent::new(AgentId::new("recover"), provider_arc, tools, memory).with_config(
+        crate::AgentConfig {
+            max_iterations: 30,
+            save_episodes: false,
+            ..Default::default()
+        },
+    );
+
+    let result = agent
+        .process_message("please alternate", &[], vec![])
+        .await
+        .expect("process_message should return Ok when the cycle detector terminates");
+
+    assert_eq!(
+        result.content,
+        loop_detected_terminal_message(),
+        "alternating A,B cycles belong to the two-stage cycle detector, \
+             not the doom guard"
+    );
+    let total_calls = provider.calls.load(AtomicOrdering::SeqCst);
     assert!(
-        total_calls >= 5,
-        "expected at least 5 LLM calls (4 to trigger first detection + \
-             1 recovery iteration); got {total_calls}"
+        total_calls >= 7,
+        "expected >= 7 LLM calls (6 to reach a cycle-2 first fire + 1 \
+             recovery iteration before the terminating fire); got {total_calls}"
     );
 }
 
@@ -3589,22 +3731,16 @@ impl LlmProvider for CountingAlwaysNamedToolProvider {
 }
 
 #[tokio::test]
-async fn loop_detected_first_fire_does_not_execute_the_spiraling_tool() {
-    // Regression: the loop-detector `continue` after injecting synthetic
-    // results must re-enter the AGENT loop, not merely the inner
-    // `for tc in &response.tool_calls` loop. When it bound to the `for`,
-    // control fell through to `handle_tool_use` and the spiraling tool
-    // EXECUTED anyway (extra side effects + a duplicate tool_call_id row),
-    // defeating the detector's "inject a warning, do NOT call the tools"
-    // contract.
+async fn doom_loop_does_not_execute_the_tripping_call() {
+    // #1765: the doom guard runs BEFORE tool execution. When the 3rd
+    // identical call arrives it must abort the turn without executing
+    // the call again — re-running an identical call is pure waste (and
+    // possibly a duplicated side effect).
     //
-    // With the same-tool provider the detector trips on the 4th call, so:
-    //   - iterations 1..=3 execute the tool  (3 executions)
-    //   - iteration 4 (FIRST fire) injects synthetic results and re-enters
-    //     the loop WITHOUT executing
-    //   - iteration 5 (SECOND fire) terminates before executing
-    // ⇒ executions == total_llm_calls - 2. The buggy fall-through executed
-    // on the first-fire iteration too (executions == total_llm_calls - 1).
+    // With the same-call provider:
+    //   - iterations 1..=2 execute the tool  (2 executions)
+    //   - iteration 3 trips the doom guard pre-execution and terminates
+    // ⇒ executions == total_llm_calls - 1 == 2.
     let dir = tempfile::tempdir().unwrap();
     let exec_count = Arc::new(AtomicUsize::new(0));
     let provider = Arc::new(CountingAlwaysNamedToolProvider {
@@ -3630,18 +3766,32 @@ async fn loop_detected_first_fire_does_not_execute_the_spiraling_tool() {
     let result = agent
         .process_message("please loop", &[], vec![])
         .await
-        .expect("process_message should return Ok even when the loop terminates");
-    assert_eq!(result.content, loop_detected_terminal_message());
+        .expect("process_message should return Ok even when the doom guard aborts");
+    assert_eq!(result.content, doom_loop_terminal_message("loopy_tool", 3));
 
     let total_calls = provider.calls.load(AtomicOrdering::SeqCst);
     let executions = exec_count.load(AtomicOrdering::SeqCst);
+    assert_eq!(total_calls, 3, "doom aborts before a 4th LLM call");
     assert_eq!(
         executions,
-        total_calls - 2,
-        "the spiraling tool must NOT execute on the first-fire (synthetic-\
-             injection) iteration; got {executions} executions across \
-             {total_calls} LLM calls (buggy fall-through would be {})",
-        total_calls - 1
+        total_calls - 1,
+        "the tripping call must NOT execute; got {executions} executions \
+             across {total_calls} LLM calls"
+    );
+}
+
+#[test]
+fn doom_loop_terminal_message_is_model_and_user_facing() {
+    let msg = doom_loop_terminal_message("read_file", 3);
+    assert!(msg.contains("read_file"), "names the looping tool: {msg}");
+    assert!(msg.contains('3'), "states the streak length: {msg}");
+    assert!(
+        msg.contains("identical arguments"),
+        "explains WHY the turn stopped: {msg}"
+    );
+    assert!(
+        msg.contains("different approach") || msg.contains("rephrase"),
+        "guides the model/user toward a way forward: {msg}"
     );
 }
 

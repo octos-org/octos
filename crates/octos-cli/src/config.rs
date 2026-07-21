@@ -76,6 +76,15 @@ pub struct Config {
     #[serde(default)]
     pub sandbox: octos_agent::SandboxConfig,
 
+    /// Workspace snapshot-undo configuration (#1768). Opt-in: when
+    /// `snapshots.enabled` is true, the agent records a git-backed
+    /// snapshot of the workspace (into a separate git dir under
+    /// `<data_dir>/snapshots/`, never the user's own `.git`) before each
+    /// mutating tool batch. Absent or `enabled: false` (the default) =
+    /// feature off.
+    #[serde(default)]
+    pub snapshots: Option<octos_agent::SnapshotConfig>,
+
     /// Tool access policy (allow/deny lists with group and wildcard support).
     #[serde(default)]
     pub tool_policy: Option<octos_agent::ToolPolicy>,
@@ -101,6 +110,15 @@ pub struct Config {
     /// Maximum agent iterations per message (overridden by --max-iterations).
     #[serde(default)]
     pub max_iterations: Option<u32>,
+
+    /// Post-edit formatting (issue #1774): when true, a successful
+    /// `edit_file` / `write_file` / `diff_edit` runs the file's language
+    /// formatter (rustfmt / prettier / black / gofmt) and returns the
+    /// formatted content in the tool result. Formatters run file-scoped with
+    /// a sanitized environment and a hard 5s timeout; a missing binary or a
+    /// formatter failure never fails the edit. Default: false (opt-in).
+    #[serde(default)]
+    pub format_after_edit: bool,
 
     /// Lifecycle hooks for agent events.
     #[serde(default)]
@@ -2103,6 +2121,26 @@ mod tests {
     use crate::config_context::TEST_ENV_LOCK as HOME_ENV_LOCK;
 
     #[test]
+    fn should_parse_snapshots_config_and_default_to_off_when_absent() {
+        // Absent → None (feature off, #1768 opt-in contract).
+        let config: Config = serde_json::from_str("{}").unwrap();
+        assert!(config.snapshots.is_none());
+
+        let config: Config =
+            serde_json::from_str(r#"{"snapshots": {"enabled": true, "keep_last": 7}}"#).unwrap();
+        let snapshots = config.snapshots.expect("snapshots block parsed");
+        assert!(snapshots.enabled);
+        assert_eq!(snapshots.keep_last, 7);
+
+        // Partial block keeps the documented defaults.
+        let config: Config = serde_json::from_str(r#"{"snapshots": {"enabled": true}}"#).unwrap();
+        assert_eq!(
+            config.snapshots.unwrap().keep_last,
+            octos_agent::DEFAULT_SNAPSHOT_KEEP_LAST
+        );
+    }
+
+    #[test]
     fn write_mutation_creates_file_with_pretty_json() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.json");
@@ -2810,6 +2848,21 @@ mod tests {
         let json = r#"{"provider": "anthropic"}"#;
         let config: Config = serde_json::from_str(json).unwrap();
         assert!(config.tool_policy_by_provider.is_empty());
+    }
+
+    #[test]
+    fn should_default_format_after_edit_to_false_when_absent() {
+        // #1774: post-edit formatting is strictly opt-in.
+        let json = r#"{"provider": "anthropic"}"#;
+        let config: Config = serde_json::from_str(json).unwrap();
+        assert!(!config.format_after_edit);
+    }
+
+    #[test]
+    fn should_deserialize_format_after_edit_opt_in() {
+        let json = r#"{"provider": "anthropic", "format_after_edit": true}"#;
+        let config: Config = serde_json::from_str(json).unwrap();
+        assert!(config.format_after_edit);
     }
 
     #[test]

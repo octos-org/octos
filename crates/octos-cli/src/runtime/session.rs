@@ -561,6 +561,8 @@ impl SessionRuntime {
             save_episodes: true,
             // Phase 4 (docs/ROBRIX-PHASE4-APPROVAL-FLOW-ADR.md)
             human_approval_rules: profile.human_approval_rules.clone(),
+            // #1774: opt-in post-edit formatting (rustfmt/prettier/black/gofmt).
+            format_after_edit: profile.format_after_edit,
             ..Default::default()
         })
         // M11-F regression fix (#891): propagate the pre-assembled
@@ -1128,6 +1130,7 @@ mod tests {
             tool_policy: None,
             default_sandbox: sandbox,
             max_iterations: None,
+            format_after_edit: false,
             tool_specs: Arc::new(base_tools),
             plugin_tool_names: Vec::new(),
             plugin_dirs: Vec::new(),
@@ -1800,6 +1803,7 @@ mod tests {
             tool_policy: None,
             default_sandbox: sandbox,
             max_iterations: None,
+            format_after_edit: false,
             tool_specs: Arc::new(base_tools),
             plugin_tool_names: Vec::new(),
             plugin_dirs: Vec::new(),

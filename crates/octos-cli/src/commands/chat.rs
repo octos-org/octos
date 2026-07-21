@@ -1246,6 +1246,8 @@ impl ChatCommand {
                 .effort
                 .map(octos_llm::ReasoningEffort::from)
                 .or_else(|| config.gateway.as_ref().and_then(|g| g.reasoning_effort)),
+            // #1774: opt-in post-edit formatting (rustfmt/prettier/black/gofmt).
+            format_after_edit: config.format_after_edit,
             ..Default::default()
         };
         // M8.2: load sub-agent manifests from `<cwd>/agents/` layered on
@@ -1444,6 +1446,21 @@ impl ChatCommand {
         all_hooks.extend(plugin_result.hooks);
         if !all_hooks.is_empty() {
             agent = agent.with_hooks(Arc::new(HookExecutor::new(all_hooks)));
+        }
+
+        // #1768: opt-in git-backed workspace snapshots before mutating
+        // tools. Uses a SEPARATE git dir under `<data_dir>/snapshots/` —
+        // the user's own repo/index is never touched. Silently unavailable
+        // when no git binary is on PATH (`SnapshotManager::new` returns
+        // `None` and logs once).
+        if let Some(snapshot_cfg) = config.snapshots.as_ref().filter(|cfg| cfg.enabled) {
+            if let Some(manager) = octos_agent::SnapshotManager::new(
+                data_dir.join("snapshots"),
+                cwd.clone(),
+                snapshot_cfg.keep_last,
+            ) {
+                agent = agent.with_snapshot_manager(Arc::new(manager));
+            }
         }
 
         if let Some(ref embedder) = embedder {
