@@ -1754,6 +1754,10 @@ fn dispatch_probe_request(method: &str) -> RpcRequest<Value> {
         APPUI_METHOD_PROFILE_SUB_PROVIDERS_REMOVE => {
             json!({ "profile_id": "dev", "key": "cheap" })
         }
+        APPUI_METHOD_SNAPSHOT_LIST => json!({ "session_id": session_id }),
+        APPUI_METHOD_SNAPSHOT_RESTORE => {
+            json!({ "session_id": session_id, "snapshot_id": "deadbeef" })
+        }
         other => panic!("missing AppUI dispatch probe params for {other}"),
     };
 
@@ -21555,6 +21559,7 @@ async fn make_m11e_profile_with_llm_and_sandbox(
         default_sandbox: sandbox,
         max_iterations: None,
         format_after_edit: false,
+        snapshots: None,
         tool_specs: Arc::new(base_tools),
         plugin_tool_names: Vec::new(),
         plugin_dirs: Vec::new(),

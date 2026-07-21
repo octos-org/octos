@@ -246,6 +246,10 @@ pub struct ProfileRuntime {
     /// result. Default: false.
     pub format_after_edit: bool,
 
+    /// #1768: opt-in workspace-snapshot config per-session agents use to
+    /// build their `SnapshotManager` (None/disabled = no snapshots).
+    pub snapshots: Option<octos_agent::SnapshotConfig>,
+
     /// The base [`ToolRegistry`] template — builtins + plugins +
     /// MCP agents + the LRU pin set — but **NOT** workspace-bound.
     /// Sessions clone this and call `with_workspace_root` to obtain
@@ -1126,6 +1130,7 @@ impl ProfileRuntime {
             default_sandbox,
             max_iterations: config.max_iterations,
             format_after_edit: config.format_after_edit,
+            snapshots: config.snapshots.clone(),
             tool_specs: Arc::new(tools),
             plugin_tool_names: plugin_result.tool_names.clone(),
             plugin_dirs,

@@ -442,6 +442,10 @@ Runtime, auth, profile, and onboarding inspection (server-handled
 - `profile/sub_providers/list`, `profile/sub_providers/upsert`,
   `profile/sub_providers/remove` (named provider lanes for per-node pipeline
   routing — e.g. `deep_research`'s isolated `cheap`/`strong` lanes)
+- `snapshot/list`, `snapshot/restore` (#1768 workspace snapshot undo: list
+  the session workspace's pre-mutation undo points; restore rolls the
+  workspace back — refused while a turn is in flight, itself undoable via
+  the automatic pre-restore snapshot)
 - `profile/skills/list`, `profile/skills/registry/search`,
   `profile/skills/install`, `profile/skills/remove` (server-handled skills
   management)
