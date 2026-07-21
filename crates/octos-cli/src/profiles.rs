@@ -2514,6 +2514,9 @@ pub(crate) fn config_from_profile(
         model_hints: primary.and_then(|selection| selection.model_hints.clone()),
         mcp_servers: vec![],
         sandbox: profile.config.sandbox.clone(),
+        // #1768 workspace snapshots: not configurable through profiles yet
+        // (serve-side wiring lands with the UI/RPC follow-up).
+        snapshots: None,
         tool_policy: None,
         tool_policy_by_provider: Default::default(),
         embedding: None,

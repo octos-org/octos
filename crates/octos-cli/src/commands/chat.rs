@@ -1386,6 +1386,21 @@ impl ChatCommand {
             agent = agent.with_hooks(Arc::new(HookExecutor::new(all_hooks)));
         }
 
+        // #1768: opt-in git-backed workspace snapshots before mutating
+        // tools. Uses a SEPARATE git dir under `<data_dir>/snapshots/` —
+        // the user's own repo/index is never touched. Silently unavailable
+        // when no git binary is on PATH (`SnapshotManager::new` returns
+        // `None` and logs once).
+        if let Some(snapshot_cfg) = config.snapshots.as_ref().filter(|cfg| cfg.enabled) {
+            if let Some(manager) = octos_agent::SnapshotManager::new(
+                data_dir.join("snapshots"),
+                cwd.clone(),
+                snapshot_cfg.keep_last,
+            ) {
+                agent = agent.with_snapshot_manager(Arc::new(manager));
+            }
+        }
+
         if let Some(ref embedder) = embedder {
             agent = agent.with_embedder(embedder.clone());
         }

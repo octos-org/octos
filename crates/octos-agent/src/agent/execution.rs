@@ -439,6 +439,10 @@ impl Agent {
         pending: &crate::approval::PendingApproval,
     ) -> Result<crate::tools::ToolResult> {
         let tool_start = Instant::now();
+        // #1768: an approved call bypasses `execute_tools`, so it needs its
+        // own pre-mutation snapshot point.
+        self.snapshot_before_mutating_tools(&[pending.request.tool_name.as_str()])
+            .await;
         let ctx = ToolContext {
             tool_id: pending.tool_id.clone(),
             ..ToolContext::zero()
@@ -2237,6 +2241,41 @@ impl Agent {
         })
     }
 
+    /// #1768: take a workspace snapshot when `tool_names` contains a
+    /// mutating tool and a [`crate::snapshot::SnapshotManager`] is
+    /// attached (opt-in, default OFF — `self.snapshot_manager` is `None`
+    /// otherwise and this returns immediately).
+    ///
+    /// The snapshot label records which mutating tools triggered it
+    /// (`pre-tool: write_file,shell`). Failures are logged and swallowed:
+    /// a missed undo point must never fail or delay the tool batch
+    /// beyond the snapshot itself.
+    async fn snapshot_before_mutating_tools(&self, tool_names: &[&str]) {
+        let Some(manager) = &self.snapshot_manager else {
+            return;
+        };
+        let mut mutating: Vec<&str> = Vec::new();
+        for name in tool_names {
+            if crate::snapshot::is_mutating_tool(name) && !mutating.contains(name) {
+                mutating.push(name);
+            }
+        }
+        if mutating.is_empty() {
+            return;
+        }
+        let label = format!("pre-tool: {}", mutating.join(","));
+        match manager.take_snapshot_async(label).await {
+            Ok(id) => {
+                tracing::debug!(snapshot = %id, tools = %mutating.join(","),
+                    "workspace snapshot recorded before mutating tools");
+            }
+            Err(err) => {
+                tracing::warn!(error = %err,
+                    "workspace snapshot failed; continuing without an undo point");
+            }
+        }
+    }
+
     pub(super) async fn execute_tools(
         &self,
         response: &ChatResponse,
@@ -2292,6 +2331,14 @@ impl Agent {
             dispatch = dispatch_mode,
             "executing tool batch"
         );
+
+        // #1768: record a workspace snapshot BEFORE the batch runs when it
+        // contains a mutating tool. Awaited so no tool can touch a file
+        // until the snapshot commit exists; the git work happens on a
+        // blocking thread and a failure only logs (a missed undo point
+        // must never block the batch). No-op unless a manager is attached
+        // (opt-in, default OFF).
+        self.snapshot_before_mutating_tools(&tool_names).await;
 
         let turn_attachment_ctx = TURN_ATTACHMENT_CTX
             .try_with(|ctx| ctx.clone())
@@ -3623,6 +3670,37 @@ mod tests {
         }
     }
 
+    // #1768: pre-mutation workspace snapshots
+    // ------------------------------------------------------------------
+
+    /// Mock carrying the builtin `write_file` name: writes a real file
+    /// into the workspace so tests can prove the snapshot was taken
+    /// BEFORE the mutation (the snapshot must not contain the file).
+    struct MutatingNamedTool {
+        workspace: std::path::PathBuf,
+    }
+
+    #[async_trait]
+    impl Tool for MutatingNamedTool {
+        fn name(&self) -> &str {
+            "write_file"
+        }
+        fn description(&self) -> &str {
+            "test tool that mutates the workspace"
+        }
+        fn input_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+        async fn execute(&self, _args: &serde_json::Value) -> eyre::Result<ToolResult> {
+            std::fs::write(self.workspace.join("mutated.txt"), "mutation").unwrap();
+            Ok(ToolResult {
+                output: "wrote mutated.txt".to_string(),
+                success: true,
+                ..Default::default()
+            })
+        }
+    }
+
     /// Exclusive tool that flips the shared flag `SnapshotReadTool` observes.
     struct MutatingTool {
         mutated: Arc<AtomicBool>,
@@ -3974,6 +4052,98 @@ mod tests {
                 .contains("cancelled due to earlier sibling error"),
             "later Exclusive peer must be cancelled by the phase-2 cascade: {:?}",
             messages[2].content
+
+    async fn snapshot_agent(
+        tools: ToolRegistry,
+        manager: Arc<crate::snapshot::SnapshotManager>,
+        memory_dir: &std::path::Path,
+    ) -> Agent {
+        let provider: Arc<dyn LlmProvider> = Arc::new(NoChatProvider);
+        let memory = Arc::new(EpisodeStore::open(memory_dir.join("memory")).await.unwrap());
+        Agent::new(AgentId::new("snapshotter"), provider, tools, memory)
+            .with_config(AgentConfig {
+                save_episodes: false,
+                ..Default::default()
+            })
+            .with_snapshot_manager(manager)
+    }
+
+    fn batch(calls: Vec<ToolCall>) -> ChatResponse {
+        ChatResponse {
+            content: None,
+            reasoning_content: None,
+            tool_calls: calls,
+            stop_reason: StopReason::ToolUse,
+            usage: LlmTokenUsage::default(),
+            provider_index: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn should_snapshot_before_batch_when_mutating_tool_present() {
+        let data = tempfile::tempdir().unwrap();
+        let ws = tempfile::tempdir().unwrap();
+        std::fs::write(ws.path().join("existing.txt"), "pre-mutation").unwrap();
+        let manager = Arc::new(
+            crate::snapshot::SnapshotManager::new(data.path().join("snapshots"), ws.path(), 20)
+                .expect("git must be installed to run snapshot tests"),
+        );
+
+        let mut tools = ToolRegistry::new();
+        tools.register(MutatingNamedTool {
+            workspace: ws.path().to_path_buf(),
+        });
+        let agent = snapshot_agent(tools, manager.clone(), data.path()).await;
+
+        agent
+            .execute_tools(&batch(vec![tool_call("call_mut", "write_file")]))
+            .await
+            .expect("execute_tools must not error");
+
+        let snaps = manager.list_snapshots().unwrap();
+        assert_eq!(snaps.len(), 1, "one pre-mutation snapshot expected");
+        assert!(
+            snaps[0].label.contains("write_file"),
+            "label must name the mutating tool: {snaps:?}"
+        );
+        assert!(
+            ws.path().join("mutated.txt").exists(),
+            "the tool itself must still have run"
+        );
+        // Ordering proof: restoring the snapshot removes the file the tool
+        // created, so the snapshot predates the mutation.
+        manager.restore(&snaps[0].id).unwrap();
+        assert!(
+            !ws.path().join("mutated.txt").exists(),
+            "snapshot must capture the PRE-mutation state"
+        );
+        assert_eq!(
+            std::fs::read_to_string(ws.path().join("existing.txt")).unwrap(),
+            "pre-mutation"
+        );
+    }
+
+    #[tokio::test]
+    async fn should_not_snapshot_when_batch_is_read_only() {
+        let data = tempfile::tempdir().unwrap();
+        let ws = tempfile::tempdir().unwrap();
+        let manager = Arc::new(
+            crate::snapshot::SnapshotManager::new(data.path().join("snapshots"), ws.path(), 20)
+                .expect("git must be installed to run snapshot tests"),
+        );
+
+        let mut tools = ToolRegistry::new();
+        tools.register(InstantTool);
+        let agent = snapshot_agent(tools, manager.clone(), data.path()).await;
+
+        agent
+            .execute_tools(&batch(vec![tool_call("call_fast", "fast_tool")]))
+            .await
+            .expect("execute_tools must not error");
+
+        assert!(
+            manager.list_snapshots().unwrap().is_empty(),
+            "read-only batches must not create snapshots"
         );
     }
 }
