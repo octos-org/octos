@@ -1,20 +1,24 @@
-//! M8.8 concurrent-safe vs exclusive scheduler integration tests.
+//! M8.8 / #1766 concurrent-safe vs exclusive scheduler integration tests.
 //!
 //! Drives the `Agent` loop through a mock LLM with scripted tool-call batches
 //! and observes the executor's admission decisions via probe tools that
-//! record start/end timestamps on a shared log. The tests assert on two
+//! record start/end timestamps on a shared log. The tests assert on these
 //! invariants:
 //!
 //! 1. A batch composed entirely of [`ConcurrencyClass::Safe`] tools runs in
 //!    parallel (the last start precedes the first end — i.e. windows
 //!    overlap).
-//! 2. A batch that contains *any* [`ConcurrencyClass::Exclusive`] tool runs
-//!    each call serially in LLM call order (every start strictly follows the
-//!    previous end).
+//! 2. A batch composed entirely of [`ConcurrencyClass::Exclusive`] tools
+//!    runs each call serially in LLM call order (every start strictly
+//!    follows the previous end).
+//! 3. A mixed batch (#1766) runs its Safe calls in parallel FIRST (phase 1),
+//!    then its Exclusive calls serially in LLM call order (phase 2) — even
+//!    when the LLM listed an Exclusive call before the Safe ones.
 //!
-//! A third test triggers an error cascade: the first Exclusive call fails
-//! and the remaining peers receive a synthetic "cancelled" tool-result
-//! message without being dispatched.
+//! The cascade tests pin the error semantics: an Exclusive failure cancels
+//! the REMAINING Exclusive peers (synthetic "cancelled" results, never
+//! dispatched) while completed phase-1 Safe results are kept, and every
+//! LLM-issued tool_call_id round-trips regardless of what was cancelled.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -364,9 +368,12 @@ async fn executor_dispatches_exclusive_serially_in_call_order() {
 }
 
 #[tokio::test]
-async fn executor_serializes_mixed_batch_when_any_exclusive() {
-    // One Exclusive + two Safe must serialize the WHOLE batch per the M8.8
-    // admission rule ("if any Exclusive, run the whole batch serially").
+async fn executor_runs_mixed_batch_safe_parallel_then_exclusive_serial() {
+    // #1766: one Exclusive + two Safe. The Safe calls run in parallel FIRST
+    // (phase 1, overlapping windows) and the Exclusive call runs AFTER both
+    // Safe calls completed (phase 2) — even though the LLM listed the
+    // Exclusive call first. Before #1766 the whole batch serialized in LLM
+    // call order.
     let dir = TempDir::new().unwrap();
     let log = CallLog::new();
     let probes = vec![
@@ -379,13 +386,13 @@ async fn executor_serializes_mixed_batch_when_any_exclusive() {
         ProbeTool::new(
             "safe_y",
             ConcurrencyClass::Safe,
-            Duration::from_millis(50),
+            Duration::from_millis(100),
             log.clone(),
         ),
         ProbeTool::new(
             "safe_z",
             ConcurrencyClass::Safe,
-            Duration::from_millis(50),
+            Duration::from_millis(100),
             log.clone(),
         ),
     ];
@@ -407,23 +414,34 @@ async fn executor_serializes_mixed_batch_when_any_exclusive() {
 
     let spans = log.lock().unwrap().snapshot();
     assert_eq!(spans.len(), 3);
+    let span = |name: &str| {
+        spans
+            .iter()
+            .find(|s| s.name == name)
+            .unwrap_or_else(|| panic!("no span for {name}: {spans:?}"))
+    };
+    let (x, y, z) = (span("excl_x"), span("safe_y"), span("safe_z"));
 
-    // No two spans may overlap; each start >= previous end.
-    for pair in spans.windows(2) {
-        assert!(
-            pair[1].started_us >= pair[0].ended_us,
-            "mixed batch was not serialized: {:?}",
-            spans
-        );
-    }
+    // Phase 1: the two Safe windows overlap (parallel dispatch).
+    assert!(
+        y.started_us.max(z.started_us) < y.ended_us.min(z.ended_us),
+        "mixed-batch Safe phase did not overlap: {spans:?}"
+    );
+    // Phase 2: the Exclusive call starts only after BOTH Safe calls ended,
+    // despite being listed first by the LLM.
+    assert!(
+        x.started_us >= y.ended_us && x.started_us >= z.ended_us,
+        "Exclusive call must not start before the Safe phase joined: {spans:?}"
+    );
 }
 
 #[tokio::test]
-async fn executor_cancels_siblings_after_exclusive_tool_error() {
-    // First Exclusive tool fails; the remaining two must not execute. Each
-    // cancelled peer gets a synthetic "cancelled" tool-result message so the
-    // LLM sees every tool_call_id. The spans log records exactly ONE probe
-    // invocation (the failing first call).
+async fn executor_cancels_later_exclusive_but_keeps_safe_phase_after_error() {
+    // #1766 cascade pin: the failing Exclusive call cancels the REMAINING
+    // Exclusive peer (never dispatched), but the Safe call already completed
+    // in phase 1 and keeps its real result — it is NOT retroactively
+    // cancelled. The spans log records exactly TWO probe invocations: the
+    // phase-1 Safe call, then the failing Exclusive call.
     let dir = TempDir::new().unwrap();
     let log = CallLog::new();
     let probes = vec![
@@ -441,8 +459,8 @@ async fn executor_cancels_siblings_after_exclusive_tool_error() {
             log.clone(),
         ),
         ProbeTool::new(
-            "safe_peer2",
-            ConcurrencyClass::Safe,
+            "excl_peer2",
+            ConcurrencyClass::Exclusive,
             Duration::from_millis(20),
             log.clone(),
         ),
@@ -451,7 +469,7 @@ async fn executor_cancels_siblings_after_exclusive_tool_error() {
         tool_use_response(vec![
             tc("call_1", "excl_bad"),
             tc("call_2", "safe_peer1"),
-            tc("call_3", "safe_peer2"),
+            tc("call_3", "excl_peer2"),
         ]),
         end_turn("post-cascade"),
     ];
@@ -463,10 +481,21 @@ async fn executor_cancels_siblings_after_exclusive_tool_error() {
         .expect("agent loop must succeed (cancellation is not an error)");
     assert_eq!(resp.content, "post-cascade");
 
-    // Only the failing probe actually ran.
+    // The Safe call ran (phase 1), then the failing Exclusive call ran
+    // (phase 2); the second Exclusive peer was cancelled and never
+    // dispatched.
     let spans = log.lock().unwrap().snapshot();
-    assert_eq!(spans.len(), 1, "only the failing probe should execute");
-    assert_eq!(spans[0].name, "excl_bad");
+    assert_eq!(
+        spans.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
+        vec!["safe_peer1", "excl_bad"],
+        "phase-1 Safe runs first, failing Exclusive second, victim never"
+    );
+    // Phase separation: the Exclusive call started only after the Safe
+    // phase joined.
+    assert!(
+        spans[1].started_us >= spans[0].ended_us,
+        "Exclusive phase must start after the Safe phase joined: {spans:?}"
+    );
 }
 
 #[tokio::test]
@@ -506,13 +535,13 @@ async fn executor_preserves_tool_call_ids_across_cascade() {
         )
         .with_failure(true),
         ProbeTool::new(
-            "safe_late_a",
-            ConcurrencyClass::Safe,
+            "excl_victim",
+            ConcurrencyClass::Exclusive,
             Duration::from_millis(10),
             log.clone(),
         ),
         ProbeTool::new(
-            "safe_late_b",
+            "safe_survivor",
             ConcurrencyClass::Safe,
             Duration::from_millis(10),
             log.clone(),
@@ -521,8 +550,8 @@ async fn executor_preserves_tool_call_ids_across_cascade() {
     let responses = vec![
         tool_use_response(vec![
             tc("call_alpha", "excl_fail"),
-            tc("call_beta", "safe_late_a"),
-            tc("call_gamma", "safe_late_b"),
+            tc("call_beta", "excl_victim"),
+            tc("call_gamma", "safe_survivor"),
         ]),
         end_turn("ok"),
     ];
@@ -573,12 +602,15 @@ async fn executor_preserves_tool_call_ids_across_cascade() {
     );
     assert!(
         ids.contains(&"call_gamma"),
-        "missing cancelled call_gamma in {:?}",
+        "missing completed call_gamma in {:?}",
         ids
     );
 
-    // 3) The two cancelled peers must carry a "cancelled" marker in their
-    //    content so the LLM can distinguish them from an ordinary failure.
+    // 3) The cancelled Exclusive peer carries a "cancelled" marker so the
+    //    LLM can distinguish it from an ordinary failure, while the Safe
+    //    call — which completed in phase 1 before the Exclusive failure —
+    //    keeps its REAL output (#1766: phase-1 results are never
+    //    retroactively cancelled).
     let find = |id: &str| -> &str {
         tool_msgs
             .iter()
@@ -593,8 +625,13 @@ async fn executor_preserves_tool_call_ids_across_cascade() {
         find("call_beta")
     );
     assert!(
-        find("call_gamma").contains("cancelled"),
-        "call_gamma result should mark cancellation; got {}",
+        find("call_gamma").contains("safe_survivor ok"),
+        "call_gamma (phase-1 Safe) must keep its real output; got {}",
+        find("call_gamma")
+    );
+    assert!(
+        !find("call_gamma").contains("cancelled"),
+        "call_gamma (phase-1 Safe) must not be retroactively cancelled; got {}",
         find("call_gamma")
     );
 }

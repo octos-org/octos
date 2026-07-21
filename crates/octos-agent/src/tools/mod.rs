@@ -468,11 +468,15 @@ pub enum ToolProgress {
 ///
 /// Admission policy (implemented in `agent::execution`):
 /// - If every call in the batch is [`ConcurrencyClass::Safe`], the batch
-///   dispatches in parallel (today's behaviour).
-/// - If *any* call is [`ConcurrencyClass::Exclusive`], the entire batch runs
+///   dispatches in parallel.
+/// - If every call is [`ConcurrencyClass::Exclusive`], the batch runs
 ///   serially in call order. A single error from an exclusive call cancels
 ///   the remaining peers so the LLM sees the cascade instead of continuing
 ///   to mutate state on a doomed path.
+/// - Mixed batches (#1766) run the Safe calls in parallel first, then the
+///   Exclusive calls serially in call order; results are reassembled in the
+///   original call order. See the `agent::execution` module doc for the
+///   pinned visibility and cascade semantics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ConcurrencyClass {

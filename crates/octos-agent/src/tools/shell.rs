@@ -588,7 +588,8 @@ impl Tool for ShellTool {
         // Shell commands can mutate the filesystem or spawn long-lived
         // processes. Running them in parallel with other tool calls races
         // observable state (e.g. `shell: rm foo` vs `read_file foo/x`), so
-        // shell serializes the whole batch. See M8.8.
+        // shell runs in the serialized Exclusive phase — after every Safe
+        // sibling in the batch has completed. See M8.8 and #1766.
         ConcurrencyClass::Exclusive
     }
 
