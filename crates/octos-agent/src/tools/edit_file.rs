@@ -253,6 +253,15 @@ impl Tool for EditFileTool {
             return Ok(super::file_io_error(e, &input.path));
         }
 
+        // #1774: opt-in post-edit formatting. Runs BEFORE cache invalidation
+        // and the git snapshot so both observe the final on-disk content.
+        // Best-effort by contract — a formatter failure never fails the edit.
+        let format_note = if ctx.format_after_edit {
+            crate::format::post_edit_format_note(&path, &new_content).await
+        } else {
+            None
+        };
+
         // M8.4: invalidate any stale cache entry — the file's contents and
         // mtime just changed.
         if let Some(cache) = ctx.file_state_cache.as_ref() {
@@ -281,7 +290,7 @@ impl Tool for EditFileTool {
         };
 
         Ok(ToolResult {
-            output,
+            output: format!("{output}{}", format_note.unwrap_or_default()),
             success: true,
             file_modified: Some(path),
             ..Default::default()
@@ -1099,6 +1108,179 @@ mod tests {
         assert!(!props.contains_key("filePath"));
         assert!(!props.contains_key("oldString"));
         assert!(!props.contains_key("newString"));
+    }
+
+    #[tokio::test]
+    async fn should_edit_file_tool_invalidate_cache_after_edit() {
+        use crate::file_state_cache::{CacheEntry, FileStateCache};
+        use std::sync::Arc;
+        use std::time::SystemTime;
+
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("code.rs");
+        std::fs::write(&file_path, "fn foo() {}\n").unwrap();
+
+        let cache = Arc::new(FileStateCache::new());
+        cache.put(CacheEntry::new(
+            file_path.clone(),
+            SystemTime::now(),
+            0xCAFE,
+            12,
+            false,
+            None,
+        ));
+        assert_eq!(cache.len(), 1);
+
+        let mut ctx = ToolContext::zero();
+        ctx.file_state_cache = Some(cache.clone());
+
+        let tool = EditFileTool::new(dir.path());
+        let result = tool
+            .execute_with_context(
+                &ctx,
+                &serde_json::json!({
+                    "path": "code.rs",
+                    "old_string": "fn foo() {}",
+                    "new_string": "fn bar() {}"
+                }),
+            )
+            .await
+            .unwrap();
+
+        assert!(result.success);
+        assert!(cache.peek(&file_path).is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // #1774: post-edit formatting integration.
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn should_not_run_formatter_when_format_after_edit_disabled() {
+        // OFF by default: even for a .rs file, the on-disk bytes must be
+        // exactly what the edit produced and no formatting note may appear.
+        let dir = tempfile::tempdir().unwrap();
+        let ugly = "fn main(){let x=1;println!(\"{}\",x);}\n";
+        std::fs::write(dir.path().join("code.rs"), ugly).unwrap();
+
+        let tool = EditFileTool::new(dir.path());
+        let ctx = ToolContext::zero();
+        assert!(!ctx.format_after_edit, "formatting must be OFF by default");
+
+        let result = tool
+            .execute_with_context(
+                &ctx,
+                &serde_json::json!({
+                    "path": "code.rs",
+                    "old_string": "let x=1",
+                    "new_string": "let x=2",
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(result.success);
+        assert!(!result.output.contains("reformatted"));
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("code.rs")).unwrap(),
+            ugly.replace("let x=1", "let x=2"),
+            "disabled formatting must leave the written bytes untouched"
+        );
+    }
+
+    #[tokio::test]
+    async fn should_return_formatted_content_when_format_after_edit_enabled() {
+        if !crate::format::binary_on_path("rustfmt") {
+            eprintln!("skipping: rustfmt not on PATH");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("code.rs"),
+            "fn main(){let x=1;println!(\"{}\",x);}\n",
+        )
+        .unwrap();
+
+        let tool = EditFileTool::new(dir.path());
+        let mut ctx = ToolContext::zero();
+        ctx.format_after_edit = true;
+
+        let result = tool
+            .execute_with_context(
+                &ctx,
+                &serde_json::json!({
+                    "path": "code.rs",
+                    "old_string": "let x=1",
+                    "new_string": "let x=2",
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(result.success, "edit must succeed: {}", result.output);
+        // The tool result must state the reformat and echo the REAL on-disk
+        // content so the LLM's mental copy is not stale.
+        assert!(
+            result.output.contains("reformatted"),
+            "output must state the file was reformatted: {}",
+            result.output
+        );
+        assert!(
+            result.output.contains("fn main() {"),
+            "output must echo the formatted content: {}",
+            result.output
+        );
+        let on_disk = std::fs::read_to_string(dir.path().join("code.rs")).unwrap();
+        assert!(
+            on_disk.contains("fn main() {"),
+            "file must be rustfmt-formatted on disk: {on_disk}"
+        );
+        assert!(
+            on_disk.contains("let x = 2;"),
+            "edit must survive: {on_disk}"
+        );
+    }
+
+    #[tokio::test]
+    async fn should_keep_edit_success_when_formatter_fails() {
+        if !crate::format::binary_on_path("rustfmt") {
+            eprintln!("skipping: rustfmt not on PATH");
+            return;
+        }
+        // Syntactically broken Rust: the edit applies (plain string
+        // replacement) but rustfmt exits non-zero. The edit must STAND and
+        // the result must stay success=true with a formatting-failed note.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("broken.rs"), "fn main( { let a=1 \n").unwrap();
+
+        let tool = EditFileTool::new(dir.path());
+        let mut ctx = ToolContext::zero();
+        ctx.format_after_edit = true;
+
+        let result = tool
+            .execute_with_context(
+                &ctx,
+                &serde_json::json!({
+                    "path": "broken.rs",
+                    "old_string": "let a=1",
+                    "new_string": "let a=2",
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(
+            result.success,
+            "formatter failure must NOT fail the edit: {}",
+            result.output
+        );
+        assert!(
+            result.output.contains("failed"),
+            "output must note the formatter failure: {}",
+            result.output
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("broken.rs")).unwrap(),
+            "fn main( { let a=2 \n",
+            "the edit must be kept exactly as written when formatting fails"
+        );
     }
 
     #[tokio::test]

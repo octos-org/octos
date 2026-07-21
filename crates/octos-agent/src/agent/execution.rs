@@ -451,6 +451,9 @@ impl Agent {
             .await;
         let ctx = ToolContext {
             tool_id: pending.tool_id.clone(),
+            // #1774: approval-gated edits still honor the post-edit
+            // formatting opt-in.
+            format_after_edit: self.config.format_after_edit,
             ..ToolContext::zero()
         };
         // The human already approved this exact (digest-bound) call through the
@@ -518,6 +521,9 @@ impl Agent {
         let hooks = self.hooks.clone();
         let hook_ctx = self.hook_ctx();
         let suppress_auto_send_files = self.config.suppress_auto_send_files;
+        // #1774: post-edit formatting opt-in, threaded into the foreground
+        // ToolContext so edit_file/write_file/diff_edit see it.
+        let format_after_edit = self.config.format_after_edit;
         let tc_name = tool_call.name.clone();
         let tc_id = tool_call.id.clone();
         let tc_args = tool_call.arguments.clone();
@@ -2008,6 +2014,8 @@ impl Agent {
                 // scope onto the foreground TOOL_CTX so tools and the
                 // pipeline host context snapshot the same handle.
                 session_scope: session_scope.clone(),
+                // #1774: post-edit formatting opt-in for file tools.
+                format_after_edit,
                 ..ToolContext::zero()
             };
             // Thread the typed context into execute_with_context. Legacy tools
@@ -3498,6 +3506,78 @@ mod tests {
         )
         .await;
         messages
+    }
+
+    /// #1774: probe recording the `format_after_edit` flag its ToolContext
+    /// carried, so the AgentConfig → ToolContext threading is testable
+    /// without any real formatter binary.
+    struct FormatFlagProbe(Arc<std::sync::atomic::AtomicBool>);
+
+    #[async_trait]
+    impl Tool for FormatFlagProbe {
+        fn name(&self) -> &str {
+            "format_flag_probe"
+        }
+        fn description(&self) -> &str {
+            "records ctx.format_after_edit"
+        }
+        fn input_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+        async fn execute(&self, _args: &serde_json::Value) -> eyre::Result<ToolResult> {
+            self.execute_with_context(&crate::tools::ToolContext::zero(), _args)
+                .await
+        }
+        async fn execute_with_context(
+            &self,
+            ctx: &crate::tools::ToolContext,
+            _args: &serde_json::Value,
+        ) -> eyre::Result<ToolResult> {
+            self.0
+                .store(ctx.format_after_edit, std::sync::atomic::Ordering::SeqCst);
+            Ok(ToolResult {
+                output: "probe".to_string(),
+                success: true,
+                ..Default::default()
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn should_thread_format_after_edit_from_agent_config_to_tool_context() {
+        // #1774: `AgentConfig::format_after_edit` must reach the foreground
+        // ToolContext handed to tools — that is the only way the config
+        // opt-in can turn on post-edit formatting in the file tools.
+        let seen = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut tools = ToolRegistry::new();
+        tools.register(FormatFlagProbe(seen.clone()));
+
+        let dir = tempfile::tempdir().unwrap();
+        let provider: Arc<dyn LlmProvider> = Arc::new(NoChatProvider);
+        let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+        let agent = Agent::new(AgentId::new("fmt-flag"), provider, tools, memory).with_config(
+            AgentConfig {
+                save_episodes: false,
+                format_after_edit: true,
+                ..Default::default()
+            },
+        );
+        let response = ChatResponse {
+            content: None,
+            reasoning_content: None,
+            tool_calls: vec![tool_call("call_probe", "format_flag_probe")],
+            stop_reason: StopReason::ToolUse,
+            usage: LlmTokenUsage::default(),
+            provider_index: None,
+        };
+        agent
+            .execute_tools(&response)
+            .await
+            .expect("execute_tools must not error");
+        assert!(
+            seen.load(std::sync::atomic::Ordering::SeqCst),
+            "AgentConfig.format_after_edit=true must reach the ToolContext"
+        );
     }
 
     #[tokio::test]

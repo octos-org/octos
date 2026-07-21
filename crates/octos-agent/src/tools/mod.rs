@@ -314,6 +314,13 @@ pub struct ToolContext {
     /// [`SessionScope::workspace`]. See `octos_core::session_scope`
     /// for the contract and migration notes.
     pub session_scope: Option<Arc<SessionScope>>,
+    /// Post-edit formatting (issue #1774): when true, a successful
+    /// `edit_file` / `write_file` / `diff_edit` runs the language formatter
+    /// for the file (rustfmt / prettier / black / gofmt — see
+    /// [`crate::format`]) and echoes the formatted content back in the tool
+    /// result. OFF by default; threaded from
+    /// [`crate::AgentConfig::format_after_edit`].
+    pub format_after_edit: bool,
 }
 
 impl ToolContext {
@@ -340,6 +347,7 @@ impl ToolContext {
             parent_session_key: None,
             spawn_depth: 0,
             session_scope: None,
+            format_after_edit: false,
         }
     }
 }

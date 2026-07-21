@@ -2562,6 +2562,9 @@ pub(crate) fn config_from_profile(
         // `profile.config` directly when needed.
         credential_pool: None,
         content_routing: profile.config.content_routing.clone(),
+        // #1774: post-edit formatting is not yet surfaced on `ProfileConfig`;
+        // profile-driven gateways keep the default (off).
+        format_after_edit: false,
         appui: Default::default(),
         // Carry the profile-declared plugin loader policy through to the
         // flattened `Config` so callers reading

@@ -1267,6 +1267,8 @@ impl GatewayRuntime {
                 .approval_policy
                 .as_ref()
                 .map(|policy| policy.to_runtime_rules()),
+            // #1774: opt-in post-edit formatting (rustfmt/prettier/black/gofmt).
+            format_after_edit: config.format_after_edit,
             ..Default::default()
         };
 

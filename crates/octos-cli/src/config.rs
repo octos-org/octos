@@ -111,6 +111,15 @@ pub struct Config {
     #[serde(default)]
     pub max_iterations: Option<u32>,
 
+    /// Post-edit formatting (issue #1774): when true, a successful
+    /// `edit_file` / `write_file` / `diff_edit` runs the file's language
+    /// formatter (rustfmt / prettier / black / gofmt) and returns the
+    /// formatted content in the tool result. Formatters run file-scoped with
+    /// a sanitized environment and a hard 5s timeout; a missing binary or a
+    /// formatter failure never fails the edit. Default: false (opt-in).
+    #[serde(default)]
+    pub format_after_edit: bool,
+
     /// Lifecycle hooks for agent events.
     #[serde(default)]
     pub hooks: Vec<octos_agent::HookConfig>,
@@ -2839,6 +2848,21 @@ mod tests {
         let json = r#"{"provider": "anthropic"}"#;
         let config: Config = serde_json::from_str(json).unwrap();
         assert!(config.tool_policy_by_provider.is_empty());
+    }
+
+    #[test]
+    fn should_default_format_after_edit_to_false_when_absent() {
+        // #1774: post-edit formatting is strictly opt-in.
+        let json = r#"{"provider": "anthropic"}"#;
+        let config: Config = serde_json::from_str(json).unwrap();
+        assert!(!config.format_after_edit);
+    }
+
+    #[test]
+    fn should_deserialize_format_after_edit_opt_in() {
+        let json = r#"{"provider": "anthropic", "format_after_edit": true}"#;
+        let config: Config = serde_json::from_str(json).unwrap();
+        assert!(config.format_after_edit);
     }
 
     #[test]
