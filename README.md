@@ -37,7 +37,7 @@ octos serve --solo
 
 Now open **http://localhost:50080/app/**, click the local sign-in button, and say hello. That's the whole setup.
 
-Prefer a hands-off install that runs Octos as a background service (auto-start, bundled skills, dashboard on port 8080)? Use the installer script instead — see [Option 2](#option-2-self-hosted-local-only) below:
+Prefer a hands-off install that runs Octos as a background service (auto-start, bundled skills, dashboard on port 8080)? Use the installer script instead — see [self-hosted install options](https://github.com/octos-org/octos-web#self-hosting--deployment):
 
 ```bash
 # macOS / Linux
@@ -50,7 +50,7 @@ curl -fsSL https://github.com/octos-org/octos/releases/latest/download/install.s
 |---|---|
 | The page doesn't load | Is `octos serve --solo` still running? Solo serve uses port **50080**; the service installer uses port **8080** — check the one you set up. |
 | The agent doesn't reply | No provider credential yet — run `octos auth login --provider <name>` (or export the provider's API key env var, or add the key in the dashboard settings). An `invalid model` error means the provider rejected the configured model name — re-run `octos init` and pick a real one (e.g. `deepseek-v4-flash`). |
-| The dashboard (`/admin/`) asks for a login | Use the **"Login with admin token"** tab with the `Auth token:` the installer printed (also stored in the service file — see *First login to the dashboard* under Option 2). |
+| The dashboard (`/admin/`) asks for a login | Use the **"Login with admin token"** tab with the `Auth token:` the installer printed (also stored in the service file — see *First login to the dashboard* in the [octos-web self-hosting guide](https://github.com/octos-org/octos-web#self-hosting--deployment)). |
 | Not sure what's wrong | `octos status` shows what's running; `octos doctor` checks your environment. |
 
 ### The pieces
@@ -100,270 +100,16 @@ Most agentic systems are single-tenant chat assistants — one user, one model, 
 - **Native office suite**: PPTX/DOCX/XLSX via pure Rust (zip + quick-xml).
 - **Sandbox isolation**: bwrap + Landlock/seccomp + sandbox-exec + Docker + Windows AppContainer. `deny(unsafe_code)` workspace-wide. 67 prompt injection tests.
 
-## Choose a setup path
-
-If you just want an assistant on your own machine, you already have it — the [Start here](#start-here) steps above are Option 2 in its simplest form. The paths below matter when you want a managed signup, a background service, or public internet access.
-
-| Option | Machines involved | Public internet access | Who manages the infrastructure | Best fit |
-| --- | --- | --- | --- | --- |
-| **1. Octos Cloud signup** | Your device + Octos Cloud | Yes | Octos Cloud + you | Hosted accounts — [guide in octos-web](https://github.com/octos-org/octos-web#octos-cloud) |
-| **2. Self-hosted local-only** | One machine | No | You | Local/private use |
-| **3. Self-hosted cloud + tenant pair** | Your VPS + your device | Yes | You | Full self-hosting with remote access |
-
-Visual overview:
-
-<img src="images/octos-options.jpg" alt="Three ways to run Octos: Octos Cloud signup, self-hosted local-only, and self-hosted cloud plus tenant pair" width="100%" />
-
-### Option 1: Sign up on Octos Cloud
-
-Octos Cloud is the hosted, multi-tenant way in: register with your email at
-[octos.cloud](https://octos.cloud) (or a self-hosted operator's portal), pick a
-node name, and run one generated setup command on your device. The signup and account experience is part of the **web client** —
-the walkthrough lives in the
-[octos-web README (Octos Cloud)](https://github.com/octos-org/octos-web#octos-cloud).
-
-This repo's side of that story is the **server infrastructure** an operator
-runs to offer it: see [Option 3](#option-3-self-hosted-cloud--tenant-pair)
-for deploying the cloud host (portal, relay, wildcard TLS) yourself.
-
-### Option 2: Self-hosted local-only
-
-Choose this if you want Octos on your own machine with no public exposure. Your dashboard is available only on the machine itself or your local network.
-
-```bash
-# macOS / Linux
-curl -fsSL https://github.com/octos-org/octos/releases/latest/download/install.sh | bash
-```
-
-```powershell
-# Windows (PowerShell)
-irm https://github.com/octos-org/octos/releases/latest/download/install.ps1 | iex
-```
-
-This installs the binary, sets up `octos serve` as a service, and starts the local dashboard at `http://localhost:8080/admin/`. The end-user web app is served same-origin at `http://localhost:8080/app/` (embedded in the binary — no separate web server needed).
-
-**First login to the dashboard.** The install summary prints your credential once:
-
-```text
-Auth token: 3f2a…64-hex…c9d1
-```
-
-Open `http://localhost:8080/admin/`, switch the login screen to the
-**"Login with admin token"** tab, and paste that token — you're in as the
-admin user. (The email-code tab needs the server's SMTP configured, so the
-token tab is the way in on a fresh local install.)
-
-Lost the token? It's kept in the service definition the installer wrote:
-
-```bash
-# macOS
-grep -A1 OCTOS_AUTH_TOKEN /Library/LaunchDaemons/io.octos.serve.plist
-# Linux
-grep OCTOS_AUTH_TOKEN /etc/systemd/system/octos-serve.service
-```
-
-Alternatively, install just the binaries (the `octos` server plus its bundled skills) via a package manager:
-
-```bash
-# Homebrew (macOS Apple Silicon, Linux x86_64/ARM64) — this repo is its own tap
-brew tap octos-org/octos https://github.com/octos-org/octos
-brew install octos-org/octos/octos
-
-# npm (macOS Apple Silicon, Linux x86_64/ARM64, Windows x64)
-npm install -g @octos-org/octos
-```
-
-Both install the full release bundle — the `octos` server (with the web app and dashboard embedded) and its bundled skills (`news_fetch`, `deep-search`, `deep_crawl`, `send_email`, `account_manager`, `clock`, `weather`, plus the `voice` platform-skill) kept side-by-side so `octos serve` discovers them at startup. Unlike `install.sh`, they do not set up a background service; run `octos serve` yourself.
-
-Supported platforms: **macOS ARM64**, **Linux x86_64**, **Linux ARM64**, and **Windows x64**.
-
-Choose this path if you want:
-
-- the simplest self-hosted setup
-- one machine only
-- local-network access only
-- the option to upgrade later to tenant mode
-
-### Option 3: Self-hosted cloud + tenant pair
-
-Choose this if you want full self-hosting but still want your own device accessible from anywhere on the public internet.
-
-This mode uses two machines:
-
-- a **cloud VPS** that runs the public relay and HTTPS entrypoint
-- your **tenant device** that runs your own Octos instance
-
-The tenant device connects outbound to the VPS using `frpc`. The VPS runs the public components, including TLS and routing. This gives you ngrok-style public access, but through your own infrastructure.
-
-For production use, the VPS also needs wildcard HTTPS. The current setup uses Caddy plus Cloudflare DNS challenge, or another supported DNS provider, to issue and manage certificates for the main domain and tenant subdomains.
-
-Requirements for this option:
-
-1. **Your own hosted domain name**
-   Example: `octos.example.com`
-2. **A DNS provider / authoritative DNS API**
-   Its role here is specifically the ACME `DNS-01` solver used by Caddy's internal ACME client to mint the wildcard certificate for `*.octos.example.com`, which is what tenant subdomains use. If you stay HTTP-only with `--http-only`, or if you only need the apex domain, this wildcard-DNS flow is not required.
-3. **An SMTP service**
-   This is needed so the cloud host can send OTP emails to tenants during portal signup and login.
-
-#### 1. Bootstrap the VPS
-
-On a Linux VPS with DNS already pointed at it, you can either:
-
-- run the script with full flags for a mostly non-interactive flow, or
-- run `bash scripts/cloud-host-deploy.sh` with no flags and let it prompt you interactively
-
-Before running it, export the environment variables needed by your chosen providers. For example:
-
-```bash
-export CF_API_TOKEN=xxx
-export SMTP_PASSWORD=xxx
-```
-
-Notes:
-
-- For Cloudflare, the script expects `CF_API_TOKEN` for the DNS provider token.
-- For SMTP, you can pre-export `SMTP_PASSWORD` so the bootstrap does not need that secret entered later.
-- If you enable SMTP, the script will also prompt for or use the rest of the SMTP settings such as host, port, username, and from-address.
-
-Example using explicit flags:
-
-```bash
-git clone https://github.com/octos-org/octos.git
-cd octos
-bash scripts/cloud-host-deploy.sh \
-    --domain octos.example.com \
-    --https --dns-provider cloudflare
-```
-
-Interactive mode:
-
-```bash
-git clone https://github.com/octos-org/octos.git
-cd octos
-bash scripts/cloud-host-deploy.sh
-```
-
-This wraps three host-side steps:
-
-- `scripts/install.sh` — installs `octos serve` and sets `mode = "cloud"`
-- `scripts/frp/setup-frps.sh` — installs and configures `frps`
-- `scripts/frp/setup-caddy.sh` — configures public routing and wildcard HTTPS
-
-Windows Server targets use the PowerShell deploy script from an operator machine
-with OpenSSH access to the server:
-
-```powershell
-.\scripts\deploy.ps1 `
-    -HostName win.example.com `
-    -User Administrator `
-    -Version latest `
-    -RemoteRoot 'C:\octos' `
-    -ServiceName OctosServe
-```
-
-Run the same command with `-DryRun` first to print the remote commands without
-connecting. The script deploys the `octos-bundle-x86_64-pc-windows-msvc.zip`
-release bundle, installs `octos.exe` under `C:\octos\bin`, stores runtime data in
-`C:\octos\data`, writes logs under `C:\octos\logs`, and registers `OctosServe` as
-an auto-start Windows service through NSSM. Use `-LocalBundle <zip>` to deploy a
-locally built bundle over `scp`, and `-Uninstall [-Purge]` to remove the service
-and optionally delete the remote install root.
-
-Recommended DNS split:
-
-- `octos.example.com` and `*.octos.example.com` for the portal and tenant dashboards
-- `frps.octos.example.com` as `DNS only` so tenant machines can reach the FRP control port
-
-#### 2. Register or create a tenant
-
-Once the VPS is up, the cloud host can issue a personalized tenant setup command. That command includes the tenant name, per-tenant tunnel token, SSH port, dashboard auth token, domain, and relay address. The user receives this command directly in the portal and also by email.
-
-#### 3. Run the tenant setup command on your own device
-
-Use the exact command provided in step 2. The example below is reference only, to show what kind of command the portal issues:
-
-```bash
-curl -fsSL https://github.com/octos-org/octos/releases/latest/download/install.sh | bash -s -- \
-    --tunnel \
-    --tenant-name alice \
-    --frps-token <per-tenant-uuid> \
-    --ssh-port 6001 \
-    --domain octos.example.com \
-    --frps-server frps.octos.example.com \
-    --auth-token <dashboard-token>
-```
-
-The installer writes the tenant tunnel configuration, installs `frpc`, and starts the public tunnel alongside `octos serve`. The `--auth-token` in your personalized command doubles as your dashboard login: open `https://<your-name>.<domain>/admin/` and paste it into the **"Login with admin token"** tab (the same command also arrives by email, so the token is recoverable there).
-
-### Can I start local and upgrade later?
-
-Yes.
-
-A local-only self-hosted machine can be upgraded later to tenant mode once you have a cloud host available. The saved installers support this directly:
-
-```bash
-# macOS / Linux
-~/.octos/bin/install.sh --tunnel
-~/.octos/bin/install.sh --doctor
-```
-
-```powershell
-# Windows
-& "$HOME\.octos\bin\install.ps1" -Tunnel
-& "$HOME\.octos\bin\install.ps1" -Doctor
-```
-
-That upgrade path is intentional: start with one machine, then add a VPS only when you need internet-facing access.
-
-### Optional self-hosted features
-
-```bash
-# Auto-install runtime dependencies (git, node, python, ffmpeg, chromium)
-curl ... | bash -s -- --install-deps
-
-# Set up Caddy reverse proxy with HTTPS for self-hosted local deployments
-curl ... | bash -s -- --caddy-domain crew.example.com
-```
-
-### Uninstall
-
-Use the matching uninstall flag on the machine you want to remove:
-
-```bash
-# Tenant or local machine (macOS / Linux)
-~/.octos/bin/install.sh --uninstall
-
-# Tenant or local machine (Windows PowerShell)
-& "$HOME\.octos\bin\install.ps1" -Uninstall
-
-# Cloud VPS — removes octos serve, frps, and Caddy
-bash scripts/cloud-host-deploy.sh --uninstall
-
-# Cloud VPS + wipe data directory (~/.octos) as well
-bash scripts/cloud-host-deploy.sh --uninstall --purge
-```
-
-### Where config lives
-
-User config + credentials live **outside** the install dir so reinstalls/upgrades never touch them:
-
-- **macOS + Linux:** `~/.config/octos/` (`config.json`, `auth.json`) — honours `$XDG_CONFIG_HOME`
-- **Windows:** `%APPDATA%\octos\`
-- **Override:** set `OCTOS_CONFIG_DIR` to put config/auth anywhere
-- `~/.octos/` holds only the **install + runtime state** (binaries, bundled skills, sessions, logs). The installer writes only there.
-
-An existing `~/.octos/config.json` from older versions is auto-migrated to `~/.config/octos/` on first run (copied, not moved — the original stays as a backup).
-
-### Runtime deployment modes
-
-Octos uses `"mode"` in `config.json` (see *Where config lives* above) to describe how a running node behaves:
-
-- **`local`** — standalone machine
-- **`tenant`** — end-user machine with an optional public tunnel
-- **`cloud`** — VPS relay with tenant management and public signup
-
-`scripts/install.sh` and `scripts/install.ps1` create local or tenant configs. `scripts/cloud-host-deploy.sh` creates or updates cloud-host configs with `mode = "cloud"` plus `tunnel_domain` and `frps_server`.
+## Self-hosting & deployment
+
+The full setup and hosting guide — the three deployment paths (Octos Cloud
+signup, self-hosted local, and self-hosted cloud + tenant pair), the install
+scripts, package-manager installs, first dashboard login, uninstall, config
+locations, and runtime modes — lives in the **[octos-web README →
+Self-hosting & deployment](https://github.com/octos-org/octos-web#self-hosting--deployment)**.
+
+The [Start here](#start-here) steps above are the quickest local install; that
+guide covers the managed-signup, background-service, and public-VPS options.
 
 ## Build from source
 
