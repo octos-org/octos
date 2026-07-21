@@ -5,9 +5,13 @@
 //! feedback-loop motivation as full LSP integration (#1772), without
 //! spawning language servers:
 //!
-//! - `Cargo.toml`                    → `cargo check --message-format=json`
-//! - `tsconfig.json`/`package.json`  → `tsc --noEmit`
-//! - `go.mod`                        → `go vet ./...`
+//! - `Cargo.toml`     → `cargo check --message-format=json`
+//! - `tsconfig.json`  → `tsc --noEmit`
+//! - `go.mod`         → `go vet ./...`
+//!
+//! A bare `package.json` is deliberately NOT a TypeScript marker: `tsc
+//! --noEmit` without a tsconfig only prints help text and exits 1, and it
+//! would shadow `go.mod` in Go repos that carry a tooling-only package.json.
 //!
 //! Output is normalized to `file:line: level: message` lines, capped at
 //! [`MAX_DIAGNOSTICS`] with a `... and N more` trailer. A missing checker
@@ -15,12 +19,22 @@
 //! a tool failure — agents run in environments where toolchains may be
 //! absent, and the model should move on rather than retry.
 //!
-//! The child process is spawned directly (argv array, no shell), with the
-//! working directory pinned to the (optionally `path`-scoped) workspace,
-//! stdin nulled, environment sanitized via the shared
-//! [`crate::sandbox::BLOCKED_ENV_VARS`] denylist
-//! ([`sanitize_command_env`]), and a hard [`DEFAULT_CHECK_TIMEOUT`] with
-//! kill-by-PID on expiry (mirrors `tools/shell.rs`).
+//! The child process runs with the working directory pinned to the
+//! (optionally `path`-scoped) workspace, stdin nulled, environment
+//! sanitized via the shared [`crate::sandbox::BLOCKED_ENV_VARS`] denylist
+//! ([`sanitize_command_env`]), in its own process group, under a hard
+//! [`DEFAULT_CHECK_TIMEOUT`] with an escalating whole-group kill (SIGTERM →
+//! grace → liveness probe → SIGKILL) on expiry — mirrors `tools/shell.rs`.
+//!
+//! A real (non-no-op) session [`Sandbox`] confines the checker via
+//! [`Sandbox::wrap_command`] exactly like the shell/exec/bash tools:
+//! `cargo check` executes build.rs and proc-macros (arbitrary
+//! project-controlled code) and `tsc` is preferred from the
+//! workspace-writable `node_modules/.bin`, so this is precisely the command
+//! class the sandbox exists to confine (#1607). Backends that cannot wrap
+//! safely (Windows `cmd /C`, Docker with host-only checker paths) SKIP the
+//! check as a valid answer instead of escaping to the host. Without a real
+//! sandbox the checker is spawned directly (argv array, no shell).
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -33,6 +47,7 @@ use serde::Deserialize;
 use tokio::time::timeout;
 
 use super::{ConcurrencyClass, Tool, ToolResult};
+use crate::sandbox::{NoSandbox, Sandbox};
 use crate::subprocess_env::{EnvAllowlist, sanitize_command_env};
 
 /// Maximum diagnostics included in the rendered report; the rest are
@@ -104,11 +119,17 @@ struct ParsedDiagnostics {
 
 /// Detect the project kind by marker files directly under `root`.
 /// Priority: Rust, then TypeScript, then Go (first match wins).
+///
+/// The TypeScript lane requires `tsconfig.json` — a bare `package.json` is
+/// NOT enough: `tsc --noEmit` without a tsconfig just prints ~140 lines of
+/// help text and exits 1 (never a useful answer), and treating package.json
+/// as a marker would shadow `go.mod` in the very common "Go service +
+/// tooling-only package.json" repo shape.
 fn detect_project(root: &Path) -> Option<ProjectKind> {
     if root.join("Cargo.toml").is_file() {
         return Some(ProjectKind::Rust);
     }
-    if root.join("tsconfig.json").is_file() || root.join("package.json").is_file() {
+    if root.join("tsconfig.json").is_file() {
         return Some(ProjectKind::TypeScript);
     }
     if root.join("go.mod").is_file() {
@@ -231,12 +252,20 @@ fn parse_tsc_output(stdout: &str) -> ParsedDiagnostics {
 }
 
 /// Parse one tsc diagnostic line; `None` when the line is not a diagnostic.
+///
+/// Anchors on the first `"): "` separator and scans BACK to its matching
+/// `(` — anchoring on the first `(` of the whole line would silently drop
+/// diagnostics whose file path itself contains parentheses (e.g. Next.js
+/// route groups: `app/(group)/page.ts(1,7): error TS2322: ...`).
 fn parse_tsc_line(line: &str) -> Option<(String, Level)> {
     // `src/index.ts(12,5): error TS2304: Cannot find name 'foo'.`
-    let open = line.find('(')?;
-    let close = open + line[open..].find(')')?;
-    let (line_no, _col) = line[open + 1..close].split_once(',')?;
+    let close = line.find("): ")?;
+    let open = line[..close].rfind('(')?;
+    let (line_no, col) = line[open + 1..close].split_once(',')?;
     let line_no: u64 = line_no.trim().parse().ok()?;
+    // Both location fields must be numeric — rejects prose that merely
+    // contains a `(...): ` fragment (help text, watch-mode banners).
+    let _: u64 = col.trim().parse().ok()?;
     let rest = line[close + 1..].strip_prefix(": ")?;
     let level = if rest.starts_with("error") {
         Level::Error
@@ -246,6 +275,9 @@ fn parse_tsc_line(line: &str) -> Option<(String, Level)> {
         return None;
     };
     let file = &line[..open];
+    if file.is_empty() {
+        return None;
+    }
     Some((format!("{file}:{line_no}: {rest}"), level))
 }
 
@@ -374,6 +406,7 @@ pub struct CheckTool {
     working_dir: PathBuf,
     resolve_binary: BinaryResolver,
     timeout: Duration,
+    sandbox: Arc<dyn Sandbox>,
 }
 
 impl CheckTool {
@@ -382,12 +415,23 @@ impl CheckTool {
             working_dir: cwd.into(),
             resolve_binary: Arc::new(default_resolve_binary),
             timeout: DEFAULT_CHECK_TIMEOUT,
+            sandbox: Arc::new(NoSandbox),
         }
     }
 
     /// Override the checker child-process timeout (default 120s).
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
+        self
+    }
+
+    /// Confine the checker to the session sandbox — kept in lockstep with
+    /// the shell/exec/bash tools (see
+    /// `ToolRegistry::with_builtins_and_permissions`). `cargo check` runs
+    /// build.rs/proc-macros, so it must not escape a sandbox that would
+    /// confine the equivalent `shell("cargo check")`.
+    pub fn with_shared_sandbox(mut self, sandbox: Arc<dyn Sandbox>) -> Self {
+        self.sandbox = sandbox;
         self
     }
 
@@ -407,7 +451,7 @@ impl Tool for CheckTool {
 
     fn description(&self) -> &str {
         "Run the project's cheap static check and return compact diagnostics (file:line: level: message). \
-         Detects the project type from marker files: Cargo.toml -> `cargo check`, tsconfig.json/package.json -> `tsc --noEmit`, \
+         Detects the project type from marker files: Cargo.toml -> `cargo check`, tsconfig.json -> `tsc --noEmit`, \
          go.mod -> `go vet ./...`. Reports at most 50 diagnostics and counts the rest. \
          Use after edits to catch compile/type errors early, before running the full test suite."
     }
@@ -459,7 +503,7 @@ impl Tool for CheckTool {
         // Detect the project type from marker files at the scoped root.
         let Some(kind) = detect_project(&scope_dir) else {
             return Ok(ok(format!(
-                "no supported project detected at {} (looked for Cargo.toml, tsconfig.json, package.json, go.mod)",
+                "no supported project detected at {} (looked for Cargo.toml, tsconfig.json, go.mod)",
                 scope_dir.display()
             )));
         };
@@ -473,14 +517,65 @@ impl Tool for CheckTool {
             )));
         };
 
-        // Spawn the checker: argv array (no shell), scoped cwd, nulled
-        // stdin, sanitized environment (BLOCKED_ENV_VARS + secret strip).
-        let mut cmd = tokio::process::Command::new(&binary);
-        cmd.args(kind.checker_args())
-            .current_dir(&scope_dir)
-            .stdin(Stdio::null())
+        // Spawn the checker with scoped cwd, nulled stdin, and a sanitized
+        // environment (BLOCKED_ENV_VARS + secret strip). A real (non-no-op)
+        // session sandbox MUST confine the checker exactly like the
+        // shell/exec/bash tools — `cargo check` executes build.rs and
+        // proc-macros (arbitrary project-controlled code) and `tsc` is
+        // preferred from the workspace-writable node_modules/.bin. Mirrors
+        // the #1607 validator rules: POSIX backends wrap via `sh -c` (argv
+        // shell-quoted with shlex); Windows (`cmd /C` ignores POSIX quoting)
+        // and Docker (host checker paths don't resolve in-container) cannot
+        // wrap safely, so the check is SKIPPED as a valid answer — like a
+        // missing checker — rather than escaping to the host. Without a
+        // real sandbox the argv is spawned directly (no shell,
+        // injection-safe).
+        let real_sandbox = Some(&self.sandbox).filter(|s| !s.is_noop());
+        let mut cmd = match real_sandbox {
+            Some(sandbox) => {
+                if cfg!(windows) || sandbox.is_docker() {
+                    return Ok(ok(format!(
+                        "check skipped: `{}` is not supported under the active sandbox backend \
+                         (Windows/Docker); run the checker via the shell tool instead",
+                        kind.label()
+                    )));
+                }
+                let Some(binary_str) = binary.to_str() else {
+                    return Ok(fail(format!(
+                        "check error: checker path is not valid UTF-8: {}",
+                        binary.display()
+                    )));
+                };
+                let quoted = match shlex::try_join(
+                    std::iter::once(binary_str).chain(kind.checker_args().iter().copied()),
+                ) {
+                    Ok(quoted) => quoted,
+                    Err(_) => {
+                        return Ok(fail(format!(
+                            "check error: checker path contains a NUL byte: {}",
+                            binary.display()
+                        )));
+                    }
+                };
+                sandbox.wrap_command(&quoted, &scope_dir)
+            }
+            None => {
+                let mut cmd = tokio::process::Command::new(&binary);
+                cmd.args(kind.checker_args()).current_dir(&scope_dir);
+                cmd
+            }
+        };
+        cmd.stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        // Own process group so the timeout path can signal the WHOLE tree
+        // (checker + rustc/linker grandchildren) with a negative-PID kill.
+        // Without this the group kill targets a group the child was never
+        // placed in (ESRCH no-op) and grandchildren keep compiling — and
+        // holding the cargo build lock — after the tool reported "timed
+        // out". Same convention as bash/exec_command/validators.
+        #[cfg(unix)]
+        cmd.process_group(0);
         sanitize_command_env(&mut cmd, &EnvAllowlist::empty());
 
         let child = match cmd.spawn() {
@@ -501,7 +596,7 @@ impl Tool for CheckTool {
                 return Ok(fail(format!("failed to run {}: {e}", kind.label())));
             }
             Err(_) => {
-                kill_by_pid(child_pid);
+                kill_by_pid(child_pid).await;
                 return Ok(fail(format!(
                     "{} timed out after {}s",
                     kind.label(),
@@ -568,20 +663,41 @@ fn tail_chars(text: &str, max_chars: usize) -> &str {
     &text[cut..]
 }
 
-/// Kill a timed-out checker by PID (process group first, then the direct
-/// PID) — `wait_with_output` consumed the [`tokio::process::Child`], so
-/// PID-based kill is the only handle left. Mirrors `tools/shell.rs`.
-fn kill_by_pid(pid: Option<u32>) {
+/// Kill a timed-out checker by PID — `wait_with_output` consumed the
+/// [`tokio::process::Child`], so PID-based kill is the only handle left.
+///
+/// The child was spawned in its own process group (`process_group(0)`), so
+/// the negative-PID signals reach the WHOLE tree (cargo's rustc/linker
+/// grandchildren, tsc workers). Mirrors `tools/shell.rs`: SIGTERM to the
+/// group + direct PID first (graceful — lets cargo release the build
+/// lock), 500ms grace, then SIGKILL only if the direct PID is still alive
+/// (`kill -0` liveness probe avoids signalling a recycled PID).
+async fn kill_by_pid(pid: Option<u32>) {
     let Some(pid) = pid else { return };
     #[cfg(unix)]
     {
         use std::process::Command as StdCommand;
         let _ = StdCommand::new("kill")
-            .args(["-9", &format!("-{pid}")])
+            .args(["-15", &format!("-{pid}")])
             .status();
         let _ = StdCommand::new("kill")
-            .args(["-9", &pid.to_string()])
+            .args(["-15", &pid.to_string()])
             .status();
+
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        let still_alive = StdCommand::new("kill")
+            .args(["-0", &pid.to_string()])
+            .status()
+            .is_ok_and(|s| s.success());
+        if still_alive {
+            let _ = StdCommand::new("kill")
+                .args(["-9", &format!("-{pid}")])
+                .status();
+            let _ = StdCommand::new("kill")
+                .args(["-9", &pid.to_string()])
+                .status();
+        }
     }
     #[cfg(windows)]
     {
@@ -625,7 +741,7 @@ mod tests {
     }
 
     #[test]
-    fn should_detect_typescript_project_when_tsconfig_or_package_json_present() {
+    fn should_detect_typescript_only_when_tsconfig_present() {
         let with_tsconfig = tempdir();
         touch(with_tsconfig.path(), "tsconfig.json");
         assert_eq!(
@@ -633,12 +749,23 @@ mod tests {
             Some(ProjectKind::TypeScript)
         );
 
+        // A bare package.json is NOT a TypeScript project: `tsc --noEmit`
+        // without a tsconfig just prints help text and exits 1 — never a
+        // useful answer.
         let with_package_json = tempdir();
         touch(with_package_json.path(), "package.json");
-        assert_eq!(
-            detect_project(with_package_json.path()),
-            Some(ProjectKind::TypeScript)
-        );
+        assert_eq!(detect_project(with_package_json.path()), None);
+    }
+
+    #[test]
+    fn should_detect_go_when_go_mod_with_tooling_only_package_json() {
+        // Very common Go-service repo shape: go.mod plus a husky/prettier-only
+        // package.json at the root. The check must reach `go vet`, not tsc
+        // help-text noise.
+        let dir = tempdir();
+        touch(dir.path(), "go.mod");
+        touch(dir.path(), "package.json");
+        assert_eq!(detect_project(dir.path()), Some(ProjectKind::Go));
     }
 
     #[test]
@@ -771,6 +898,32 @@ Found 2 errors in 2 files.
                     .to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn should_parse_tsc_line_when_path_contains_parentheses() {
+        // Next.js route groups etc.: the file path itself contains parens —
+        // the parser must anchor on the `(line,col): ` location, not on the
+        // first `(` of the line (which silently dropped the diagnostic).
+        let fixture = "app/(group)/bad.ts(1,7): error TS2322: Type 'string' is not assignable to type 'number'.";
+        let parsed = parse_tsc_output(fixture);
+        assert_eq!(parsed.errors, 1, "paren-path diagnostic must parse");
+        assert_eq!(
+            parsed.lines,
+            vec![
+                "app/(group)/bad.ts:1: error TS2322: Type 'string' is not assignable to type 'number'."
+                    .to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn should_skip_tsc_prose_lines_with_parenthesized_fragments() {
+        // Help-text / prose with a `(...): ` shape but a non-numeric location
+        // must not be mistaken for a diagnostic.
+        let fixture = "Watching for file changes (press h, then q): error reporting is enabled.";
+        let parsed = parse_tsc_output(fixture);
+        assert_eq!(parsed.errors + parsed.warnings, 0, "{:?}", parsed.lines);
     }
 
     // ---- go vet parsing ----
@@ -926,6 +1079,156 @@ vet: helper.go:4:6: undefined: missingFn
             result.output.contains("1 error") && result.output.contains("1 warning"),
             "header must count levels: {}",
             result.output
+        );
+    }
+
+    // ---- execute: session-sandbox confinement ----
+
+    /// Review #1772 (high): a real session sandbox must confine the checker
+    /// exactly like shell/exec/bash — `cargo check` runs build.rs and
+    /// proc-macros. The marker sandbox substitutes the wrapped command, so
+    /// seeing the marker (and the shell-quoted argv) in the output proves
+    /// the spawn went through `Sandbox::wrap_command`, not a direct spawn.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn should_run_checker_through_session_sandbox_when_real_sandbox_set() {
+        struct MarkerSandbox;
+        impl Sandbox for MarkerSandbox {
+            fn wrap_command(&self, command: &str, cwd: &Path) -> tokio::process::Command {
+                let mut cmd = tokio::process::Command::new("sh");
+                cmd.arg("-c")
+                    .arg(format!("echo \"SANDBOX-WRAPPED: {command}\"; exit 7"))
+                    .current_dir(cwd);
+                cmd
+            }
+        }
+
+        let dir = tempdir();
+        touch(dir.path(), "Cargo.toml");
+        let tool = CheckTool::new(dir.path())
+            .with_binary_resolver(Arc::new(|name, _| {
+                (name == "cargo").then(|| PathBuf::from("/fake/cargo"))
+            }))
+            .with_shared_sandbox(Arc::new(MarkerSandbox));
+
+        let result = tool.execute(&serde_json::json!({})).await.unwrap();
+        assert!(
+            result.success,
+            "a sandboxed run that exits non-zero is still an answer: {}",
+            result.output
+        );
+        // (shlex may quote individual argv elements — e.g.
+        // `'--message-format=json'` — so match the pieces, not one exact
+        // quoting.)
+        assert!(
+            result.output.contains("SANDBOX-WRAPPED: /fake/cargo check")
+                && result.output.contains("--message-format=json"),
+            "checker must be wrapped by the session sandbox (quoted argv): {}",
+            result.output
+        );
+    }
+
+    /// Review #1772 (high): backends that cannot wrap safely (Docker: host
+    /// checker paths don't resolve in-container; Windows `cmd /C` ignores
+    /// POSIX quoting) must SKIP the check as a valid answer — never fall
+    /// back to an unconfined direct spawn on the host.
+    #[tokio::test]
+    async fn should_skip_check_when_sandbox_backend_cannot_wrap() {
+        struct DockerLikeSandbox;
+        impl Sandbox for DockerLikeSandbox {
+            fn wrap_command(&self, _command: &str, _cwd: &Path) -> tokio::process::Command {
+                panic!("check must not attempt to wrap under a Docker sandbox");
+            }
+            fn is_docker(&self) -> bool {
+                true
+            }
+        }
+
+        let dir = tempdir();
+        touch(dir.path(), "Cargo.toml");
+        let tool = CheckTool::new(dir.path())
+            .with_binary_resolver(Arc::new(|name, _| {
+                (name == "cargo").then(|| PathBuf::from("/fake/cargo"))
+            }))
+            .with_shared_sandbox(Arc::new(DockerLikeSandbox));
+
+        let result = tool.execute(&serde_json::json!({})).await.unwrap();
+        assert!(
+            result.success,
+            "sandbox-unsupported skip is a valid answer, not a tool failure: {}",
+            result.output
+        );
+        assert!(
+            result
+                .output
+                .contains("not supported under the active sandbox backend"),
+            "skip must explain why and point at the shell tool: {}",
+            result.output
+        );
+    }
+
+    // ---- execute: timeout kills the whole checker process tree ----
+
+    /// Review #1772 (high): without `process_group(0)` before spawn, the
+    /// timeout path's negative-PID kill targets a process group the checker
+    /// was never placed in (guaranteed ESRCH no-op) and only the direct PID
+    /// dies — rustc/linker grandchildren keep compiling and hold the cargo
+    /// build lock after the tool has reported "timed out". Mirrors
+    /// `bash_kills_grandchildren_via_process_group_on_timeout`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn should_kill_checker_grandchildren_when_timeout_fires() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempdir();
+        touch(dir.path(), "Cargo.toml");
+        let sentinel = dir.path().join("grandchild-late.txt");
+        // Backgrounded grandchild touches the sentinel after a sleep longer
+        // than the timeout; `wait` keeps the checker alive so the timeout
+        // path is forced to walk the process group.
+        let script = dir.path().join("fake-cargo.sh");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\n(sleep 3; touch {}) & wait\n",
+                sentinel.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let script_for_resolver = script.clone();
+        let tool = CheckTool::new(dir.path())
+            .with_binary_resolver(Arc::new(move |name, _| {
+                (name == "cargo").then(|| script_for_resolver.clone())
+            }))
+            .with_timeout(Duration::from_millis(500));
+
+        let started = std::time::Instant::now();
+        let result = tool.execute(&serde_json::json!({})).await.unwrap();
+        assert!(
+            !result.success,
+            "timeout is a tool failure: {}",
+            result.output
+        );
+        assert!(
+            result.output.contains("timed out"),
+            "timeout must be reported: {}",
+            result.output
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "check must return promptly on timeout (got {:?})",
+            started.elapsed()
+        );
+
+        // Wait past when the orphaned grandchild's `touch` would fire.
+        tokio::time::sleep(Duration::from_millis(4_000)).await;
+        assert!(
+            !sentinel.exists(),
+            "grandchild must be killed via the checker's process group on \
+             timeout — sentinel at {} should NOT exist",
+            sentinel.display()
         );
     }
 

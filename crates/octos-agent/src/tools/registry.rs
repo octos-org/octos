@@ -1248,7 +1248,10 @@ impl ToolRegistry {
         registry.register(WorkspaceShowTool::new(cwd));
         registry.register(WorkspaceDiffTool::new(cwd));
         // #1772 (lite): project static-check with compact diagnostics.
-        registry.register(super::CheckTool::new(cwd));
+        // Shares the session sandbox with shell/exec/bash — `cargo check`
+        // executes build.rs/proc-macros (project-controlled code), so it
+        // must be confined like any shell command (#1607).
+        registry.register(super::CheckTool::new(cwd).with_shared_sandbox(registry.sandbox.clone()));
         #[cfg(feature = "git")]
         registry.register(super::GitTool::new(cwd));
         #[cfg(feature = "ast")]
@@ -1452,8 +1455,10 @@ impl ToolRegistry {
         registry.register(WorkspaceShowTool::new(cwd));
         registry.register(WorkspaceDiffTool::new(cwd));
         // #1772 (lite): `check` detects the project type from the workspace
-        // root, so it must follow `rebind_cwd` like the other cwd-bound tools.
-        registry.register(super::CheckTool::new(cwd));
+        // root, so it must follow `rebind_cwd` like the other cwd-bound
+        // tools — and it re-binds to the NEW session sandbox stored just
+        // above, in lockstep with the shell/exec/bash re-registrations.
+        registry.register(super::CheckTool::new(cwd).with_shared_sandbox(registry.sandbox.clone()));
         #[cfg(feature = "git")]
         registry.register(super::GitTool::new(cwd));
         #[cfg(feature = "ast")]
@@ -1810,6 +1815,59 @@ mod cwd_isolation_tests {
         assert!(
             tr.output.contains("no supported project detected"),
             "rebound check must look at the NEW cwd: {}",
+            tr.output
+        );
+    }
+
+    /// Review #1772 (high): `check` spawns cargo/tsc/go, which execute
+    /// project-controlled code (build.rs / proc-macros), so BOTH registry
+    /// constructors must hand it the session sandbox — same lockstep as
+    /// shell/exec/bash. The marker sandbox replaces the wrapped command
+    /// with an echo, so the marker in the output proves the checker went
+    /// through `Sandbox::wrap_command` instead of a direct host spawn.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn should_confine_check_tool_to_session_sandbox_on_build_and_rebind() {
+        struct MarkerSandbox;
+        impl Sandbox for MarkerSandbox {
+            fn wrap_command(
+                &self,
+                command: &str,
+                cwd: &std::path::Path,
+            ) -> tokio::process::Command {
+                let mut cmd = tokio::process::Command::new("sh");
+                cmd.arg("-c")
+                    .arg(format!("echo \"SANDBOX-WRAPPED: {command}\"; exit 7"))
+                    .current_dir(cwd);
+                cmd
+            }
+        }
+
+        // `cargo` resolves from PATH — always present under `cargo test` —
+        // but the marker sandbox substitutes the command, so no real
+        // checker ever runs.
+        let cwd = tempfile::tempdir().expect("create temp dir");
+        std::fs::write(cwd.path().join("Cargo.toml"), b"[package]").unwrap();
+
+        let registry = ToolRegistry::with_builtins_and_sandbox(cwd.path(), Box::new(MarkerSandbox));
+        let tr = registry
+            .execute("check", &serde_json::json!({}))
+            .await
+            .expect("check dispatch");
+        assert!(
+            tr.output.contains("SANDBOX-WRAPPED"),
+            "with_builtins must confine check to the session sandbox: {}",
+            tr.output
+        );
+
+        let rebound = registry.rebind_cwd(cwd.path(), Box::new(MarkerSandbox));
+        let tr = rebound
+            .execute("check", &serde_json::json!({}))
+            .await
+            .expect("check dispatch");
+        assert!(
+            tr.output.contains("SANDBOX-WRAPPED"),
+            "rebind_cwd must re-hand the session sandbox to check: {}",
             tr.output
         );
     }
