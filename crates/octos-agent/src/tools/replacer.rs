@@ -13,8 +13,9 @@
 //!    minimum indentation from both sides, then compare exactly
 //! 5. `escape_normalized` — unescape literal `\n` / `\t` / `\\` etc. in the
 //!    needle before searching
-//! 6. `block_anchor` — anchor on the first + last trimmed lines, accept when
-//!    the paired middle lines average a Levenshtein similarity >= 0.65
+//! 6. `block_anchor` — anchor on the first + last trimmed lines, score
+//!    candidate spans by average middle-line Levenshtein similarity with
+//!    unpaired lines counting against the score, accept at >= 0.65
 //!
 //! Uniqueness is still enforced: the first stage that matches at all decides
 //! the outcome — exactly one location wins, more than one is an ambiguity
@@ -24,7 +25,7 @@
 
 use std::ops::Range;
 
-/// Minimum average Levenshtein similarity of paired middle lines for the
+/// Minimum block similarity (see [`block_similarity`]) for the
 /// `block_anchor` replacer to accept a candidate block.
 const BLOCK_ANCHOR_SIMILARITY_THRESHOLD: f64 = 0.65;
 
@@ -320,8 +321,10 @@ fn indentation_flexible_matches(
 // ---------------------------------------------------------------------------
 
 /// Unescape literal `\n`, `\t`, `\r`, `\\`, `\"`, `\'` sequences. Unknown
-/// escapes are kept verbatim.
-fn unescape_find(find: &str) -> String {
+/// escapes are kept verbatim. Also used by `edit_file` to interpret the
+/// call's `new_string` (and the guard's needle) consistently when the
+/// `escape_normalized` stage produced the match (#1771 review).
+pub(crate) fn unescape_find(find: &str) -> String {
     let mut out = String::with_capacity(find.len());
     let mut chars = find.chars();
     while let Some(c) = chars.next() {
@@ -391,10 +394,33 @@ fn similarity(a: &str, b: &str) -> f64 {
     1.0 - levenshtein(a, b) as f64 / max_len as f64
 }
 
-/// Anchor on the needle's first and last trimmed lines; between an opening
-/// anchor and the *nearest* closing anchor, pair up the middle lines and
-/// accept when their average trimmed similarity clears the threshold. The
-/// disproportionate-match guard catches spans that ballooned anyway.
+/// Average pairwise similarity of two middle-line sequences, normalized by
+/// the LONGER of the two so unpaired lines on either side drag the score
+/// down instead of being ignored: every line the needle described but the
+/// span lacks — and every span line the needle never described — counts as
+/// a 0-similarity entry (#1771 review).
+fn block_similarity(middle_find: &[&str], middle_content: &[&str]) -> f64 {
+    let total = middle_find.len().max(middle_content.len());
+    if total == 0 {
+        return 1.0;
+    }
+    let paired = middle_find.len().min(middle_content.len());
+    (0..paired)
+        .map(|k| similarity(middle_find[k], middle_content[k]))
+        .sum::<f64>()
+        / total as f64
+}
+
+/// Anchor on the needle's first and last trimmed lines. For each opening
+/// anchor, EVERY closing anchor within reach is considered — a nested block
+/// may close with a line trimmed-equal to the last anchor well before the
+/// real block end, and pairing only the nearest one would splice over a
+/// truncated span (#1771 review). Candidate spans are scored with
+/// [`block_similarity`], so span middle lines the needle never described
+/// count against the score; the best-scoring candidate per opening anchor
+/// that clears the threshold wins. Spans whose middles outnumber the
+/// needle's by more than `1/threshold` are pruned outright: even perfect
+/// pairs cannot lift them over the bar, which also bounds the scan.
 fn block_anchor_matches(content: &str, lines: &[LineSpan], find: &str) -> Vec<Range<usize>> {
     let (find_lines, trailing_newline) = split_find(find);
     if find_lines.len() < 3 {
@@ -409,30 +435,34 @@ fn block_anchor_matches(content: &str, lines: &[LineSpan], find: &str) -> Vec<Ra
         .iter()
         .map(|l| l.trim())
         .collect();
+    // Score is capped by paired/max = middle_find/middle_content once the
+    // span's middles outnumber the needle's — beyond this count it can
+    // never clear the threshold.
+    let max_middle = (middle_find.len() as f64 / BLOCK_ANCHOR_SIMILARITY_THRESHOLD) as usize;
 
     let mut out = Vec::new();
     for (i, line) in lines.iter().enumerate() {
         if line.text(content).trim() != first_anchor {
             continue;
         }
-        // Nearest closing anchor strictly after the opening line.
-        let Some(j) = (i + 1..lines.len()).find(|&j| lines[j].text(content).trim() == last_anchor)
-        else {
-            continue;
-        };
-        let middle_content: Vec<&str> = (i + 1..j).map(|k| lines[k].text(content).trim()).collect();
-        let paired = middle_find.len().min(middle_content.len());
-        let avg = if middle_find.is_empty() && middle_content.is_empty() {
-            1.0
-        } else if paired == 0 {
-            0.0
-        } else {
-            (0..paired)
-                .map(|k| similarity(middle_find[k], middle_content[k]))
-                .sum::<f64>()
-                / paired as f64
-        };
-        if avg >= BLOCK_ANCHOR_SIMILARITY_THRESHOLD {
+        // Best-scoring viable closing anchor for this opening anchor; on a
+        // score tie the nearest one wins (strictly-greater comparison).
+        let mut best: Option<(f64, usize)> = None;
+        for j in i + 1..lines.len() {
+            if j - i - 1 > max_middle {
+                break;
+            }
+            if lines[j].text(content).trim() != last_anchor {
+                continue;
+            }
+            let middle_content: Vec<&str> =
+                (i + 1..j).map(|k| lines[k].text(content).trim()).collect();
+            let score = block_similarity(&middle_find, &middle_content);
+            if score >= BLOCK_ANCHOR_SIMILARITY_THRESHOLD && best.is_none_or(|(s, _)| score > s) {
+                best = Some((score, j));
+            }
+        }
+        if let Some((_, j)) = best {
             let n = j - i + 1;
             out.push(window_range(content, lines, i, n, trailing_newline));
         }
@@ -468,6 +498,21 @@ mod tests {
         assert_eq!(similarity("", ""), 1.0);
         assert_eq!(similarity("same", "same"), 1.0);
         assert!(similarity("abcd", "wxyz") < 0.01);
+    }
+
+    #[test]
+    fn block_similarity_counts_unpaired_lines_in_denominator() {
+        // One extra content line: two perfect pairs over a total of three.
+        let two = ["a();", "b();"];
+        let three = ["a();", "b();", "c();"];
+        assert!((block_similarity(&two, &three) - 2.0 / 3.0).abs() < 1e-9);
+        // Three extra content lines: a single perfect pair over four.
+        let one = ["a();"];
+        let four = ["a();", "x", "y", "z"];
+        assert!((block_similarity(&one, &four) - 0.25).abs() < 1e-9);
+        // Unpaired needle-side lines count identically.
+        assert!((block_similarity(&three, &two) - 2.0 / 3.0).abs() < 1e-9);
+        assert_eq!(block_similarity(&[], &[]), 1.0);
     }
 
     // -- chain precedence + exact ------------------------------------------
@@ -547,6 +592,30 @@ mod tests {
         let (m, name) = matched(content, "let x = compute( a, b );");
         assert_eq!(name, "whitespace_normalized");
         assert_eq!(m, "let x  =  compute( a, b );");
+    }
+
+    #[test]
+    fn should_not_whitespace_normalized_match_when_non_whitespace_differs() {
+        // Collapsing whitespace runs must never paper over a token change.
+        let content = "let x  =  compute( a, b );\n";
+        let lines = index_lines(content);
+        assert!(
+            whitespace_normalized_matches(content, &lines, "let y = compute( a, b );").is_empty()
+        );
+    }
+
+    #[test]
+    fn should_report_ambiguity_when_whitespace_normalized_matches_twice() {
+        // Two lines with different internal spacing both normalize to the
+        // needle — the stage must surface both, not silently pick one.
+        let content = "a  =  f( x );\nother\na =  f( x );\n";
+        assert_eq!(
+            find_replacement(content, "a = f( x );"),
+            ChainOutcome::Ambiguous {
+                count: 2,
+                replacer: "whitespace_normalized"
+            }
+        );
     }
 
     // -- indentation_flexible ----------------------------------------------
@@ -640,6 +709,36 @@ mod tests {
         let (m, name) = matched(content, find);
         assert_eq!(name, "block_anchor");
         assert_eq!(m, "if ok {\n    a();\n    b();\n    c();\n}");
+    }
+
+    #[test]
+    fn should_block_anchor_reach_farther_closing_anchor_past_nested_block() {
+        // #1771 review: the needle spans a whole function whose interior
+        // contains a line trimmed-equal to the last anchor (the nested
+        // match's `}`). Pairing with only the NEAREST closing anchor would
+        // truncate the span to lines 0-3 and corrupt the file on splice —
+        // the farther, better-scoring closing anchor must win.
+        let content = "fn handle() {\n    match x {\n        A => a(),\n    }\n    cleanup();\n}\n";
+        let find = "fn handle() {\n    match x {\n        A => b(),\n    }\n    cleanup();\n}";
+        let (m, name) = matched(content, find);
+        assert_eq!(name, "block_anchor");
+        assert_eq!(
+            m,
+            "fn handle() {\n    match x {\n        A => a(),\n    }\n    cleanup();\n}"
+        );
+    }
+
+    #[test]
+    fn should_block_anchor_refuse_span_with_undescribed_extra_middle_lines() {
+        // #1771 review: unpaired content-side middle lines are part of the
+        // replaced span, so they must count against the similarity score.
+        // Here the anchors bracket four middle lines but the needle only
+        // describes two — most of the span is code the needle never saw
+        // (the old prefix-pair average scored it a perfect 1.0 and deleted
+        // x(); and y(); silently).
+        let content = "if ok {\n    a();\n    b();\n    x();\n    y();\n}\n";
+        let find = "if ok {\n    a();\n    b();\n}";
+        assert_eq!(find_replacement(content, find), ChainOutcome::NoMatch);
     }
 
     // -- disproportionate guard --------------------------------------------

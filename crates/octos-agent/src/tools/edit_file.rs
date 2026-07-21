@@ -195,17 +195,33 @@ impl Tool for EditFileTool {
             }
         };
 
+        // When the match came from the escape_normalized replacer, BOTH call
+        // strings carry the same double-escaping pathology — interpret
+        // new_string (and the guard's needle) with the same unescape rules
+        // that made old_string match. Splicing new_string verbatim would
+        // write literal `\n` text into the file as code, and guarding
+        // against the still-escaped old_string (1 physical line) would
+        // falsely reject every legitimate multi-line match (#1771 review).
+        let (guard_needle, splice_new) = if replacer_name == "escape_normalized" {
+            (
+                super::replacer::unescape_find(&input.old_string),
+                super::replacer::unescape_find(&input.new_string),
+            )
+        } else {
+            (input.old_string.clone(), input.new_string.clone())
+        };
+
         // Safety guard: a fuzzy matcher must never silently swallow far more
         // of the file than the old_string described.
         let matched_text = &content[range.clone()];
-        if super::replacer::is_disproportionate_match(matched_text, &input.old_string) {
+        if super::replacer::is_disproportionate_match(matched_text, &guard_needle) {
             return Ok(ToolResult {
                 output: format!(
                     "Fuzzy match rejected as disproportionate: the {replacer_name} replacer matched {} lines / {} bytes for an old_string of {} lines / {} bytes. Provide more context so the match is precise.",
                     matched_text.lines().count(),
                     matched_text.len(),
-                    input.old_string.lines().count(),
-                    input.old_string.len(),
+                    guard_needle.lines().count(),
+                    guard_needle.len(),
                 ),
                 success: false,
                 ..Default::default()
@@ -223,10 +239,9 @@ impl Tool for EditFileTool {
         // Perform replacement by byte range — the fuzzy-matched span may
         // occur elsewhere as a plain substring, so a string replacen could
         // hit the wrong occurrence.
-        let mut new_content =
-            String::with_capacity(content.len() - range.len() + input.new_string.len());
+        let mut new_content = String::with_capacity(content.len() - range.len() + splice_new.len());
         new_content.push_str(&content[..range.start]);
-        new_content.push_str(&input.new_string);
+        new_content.push_str(&splice_new);
         new_content.push_str(&content[range.end..]);
 
         // Write back (O_NOFOLLOW)
@@ -763,6 +778,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn should_unescape_new_string_when_match_is_escape_normalized() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("e2.rs"), "alpha {\n    beta();\n}\n").unwrap();
+
+        let tool = EditFileTool::new(dir.path());
+        // #1771 review: realistic double-escaping afflicts BOTH strings of
+        // the call. The new_string must be unescaped with the same rules
+        // that made old_string match, or literal backslash-n text is
+        // written into the file as code.
+        let result = tool
+            .execute(&serde_json::json!({
+                "path": "e2.rs",
+                "old_string": "alpha {\\n    beta();",
+                "new_string": "alpha {\\n    gamma();"
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.success, "{}", result.output);
+        assert!(result.output.contains("escape_normalized"));
+        let content = std::fs::read_to_string(dir.path().join("e2.rs")).unwrap();
+        assert_eq!(content, "alpha {\n    gamma();\n}\n");
+    }
+
+    #[tokio::test]
+    async fn should_not_reject_multiline_escape_normalized_match_as_disproportionate() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("m.rs"),
+            "l1();\nl2();\nl3();\nl4();\nl5();\n",
+        )
+        .unwrap();
+
+        let tool = EditFileTool::new(dir.path());
+        // #1771 review: the escaped old_string is ONE physical line but
+        // unescapes to five real lines. The disproportionate guard must
+        // measure against the unescaped needle — with the raw old_string
+        // the line cap is max(1+3, 2) = 4 and every legitimate >= 5-line
+        // escape-normalized match was falsely rejected.
+        let result = tool
+            .execute(&serde_json::json!({
+                "path": "m.rs",
+                "old_string": "l1();\\nl2();\\nl3();\\nl4();\\nl5();",
+                "new_string": "one();\\ntwo();"
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.success, "{}", result.output);
+        assert!(result.output.contains("escape_normalized"));
+        let content = std::fs::read_to_string(dir.path().join("m.rs")).unwrap();
+        assert_eq!(content, "one();\ntwo();\n");
+    }
+
+    #[tokio::test]
     async fn should_match_via_block_anchor_when_middle_line_drifted() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
@@ -790,14 +860,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn should_reject_disproportionate_block_anchor_span() {
+    async fn should_refuse_block_anchor_span_far_exceeding_old_string() {
         let dir = tempfile::tempdir().unwrap();
         let original = "fn f() {\n    a();\n    b();\n    c();\n    d();\n    e();\n    g();\n}\n";
         std::fs::write(dir.path().join("g.rs"), original).unwrap();
 
         let tool = EditFileTool::new(dir.path());
-        // Anchors would bracket 8 lines for a 3-line old_string (> the
-        // max(3+3, 3*2) = 6 line cap) — the guard must refuse.
+        // Anchors would bracket 8 lines for a 3-line old_string. The block
+        // similarity score counts the six undescribed middle lines against
+        // the match, so block_anchor refuses outright (NoMatch) before the
+        // disproportionate guard is even consulted.
         let result = tool
             .execute(&serde_json::json!({
                 "path": "g.rs",
@@ -807,15 +879,52 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(!result.success, "guard must reject: {}", result.output);
         assert!(
-            result.output.contains("disproportionate"),
-            "expected guard message, got: {}",
+            !result.success,
+            "runaway span must be refused: {}",
+            result.output
+        );
+        assert!(
+            result.output.contains("String not found"),
+            "expected NoMatch refusal, got: {}",
             result.output
         );
         // File untouched.
         assert_eq!(
             std::fs::read_to_string(dir.path().join("g.rs")).unwrap(),
+            original
+        );
+    }
+
+    #[tokio::test]
+    async fn should_reject_disproportionate_byte_growth_on_block_anchor_match() {
+        let dir = tempfile::tempdir().unwrap();
+        let indent = " ".repeat(60);
+        let original = format!("{indent}fn deep() {{\n{indent}    b_call();\n{indent}}}\n");
+        std::fs::write(dir.path().join("d.rs"), &original).unwrap();
+
+        let tool = EditFileTool::new(dir.path());
+        // Line counts line up (3 vs 3) and the drifted middle clears the
+        // similarity bar, but the 60-space indentation makes the span more
+        // than 4x the old_string's bytes — the guard must still refuse
+        // block_anchor matches on byte growth.
+        let result = tool
+            .execute(&serde_json::json!({
+                "path": "d.rs",
+                "old_string": "fn deep() {\n    a_call();\n}",
+                "new_string": "fn deep() {}"
+            }))
+            .await
+            .unwrap();
+
+        assert!(
+            !result.success,
+            "byte blowup must be refused: {}",
+            result.output
+        );
+        assert!(result.output.contains("disproportionate"));
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("d.rs")).unwrap(),
             original
         );
     }
