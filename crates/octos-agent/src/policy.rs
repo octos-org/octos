@@ -294,10 +294,15 @@ impl CommandPolicy for AllowAllPolicy {
 /// ([`crate::shell_analysis`]) checks patterns against the command position of
 /// each pipeline segment, so quoted literals (`echo "don't rm -rf /"`) no
 /// longer false-positive while quoted argv laundering (`rm "-rf" "/"`),
-/// wrappers (`xargs rm -rf`) and `sh -c '...'` scripts are still caught.
-/// Unanalyzable constructs (command substitution, `eval`, backslash escapes,
-/// `$VAR` in command position) fall back to the legacy whitespace-normalized
-/// substring match for that segment — never less strict than before.
+/// wrappers (`xargs rm -rf`, `ssh host '...'`) and `sh -c '...'` scripts
+/// (fused `sh -c'...'` included) are still caught. Quoted text that something
+/// executes keeps the legacy verdict: pipes into shells (`echo '...' | sh`),
+/// shells reading stdin or script files, and inline interpreters
+/// (`python -c`, `perl -e`). Unanalyzable constructs (command substitution,
+/// `eval`, backslash escapes, `$VAR` in command position) fall back to the
+/// legacy whitespace-normalized substring match for that segment — never less
+/// strict than before (pinned by a differential corpus test in
+/// `shell_analysis`).
 ///
 /// Real isolation must come from the sandbox layer ([`super::sandbox`]). Treat
 /// `SafePolicy` as defense-in-depth for obvious mistakes, not as a guarantee

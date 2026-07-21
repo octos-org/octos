@@ -12,14 +12,26 @@
 //!   longer hides it.
 //! * **Command position** — deny/ask patterns are anchored at the command
 //!   word of each pipeline segment (split on `;`, `&&`, `||`, `|`, `&`, and
-//!   subshell openers `$(`, `` ` ``, `(`). Wrapper commands (`xargs`, `env`,
-//!   `sudo`, ...) forward their arguments into command position, and
-//!   `sh -c '...'` scripts are analyzed recursively.
+//!   subshell openers `$(`, `` ` ``, `(`; process substitutions `<(`/`>(`
+//!   are treated like `$(`). Wrapper commands (`xargs`, `env`, `sudo`,
+//!   `ssh`, ...) forward their arguments into command position, and
+//!   `sh -c '...'` scripts — including fused `sh -c'...'` argv words — are
+//!   analyzed recursively.
 //! * **Conservative dynamics** — command substitution, `eval`,
 //!   backslash-escapes outside quotes, and `$VAR`/`${VAR}` expansion in
 //!   command position make a segment unanalyzable. Such segments fall back to
 //!   the legacy whitespace-normalized substring match on their raw text, so
 //!   the result is never LESS strict than the old matcher.
+//! * **Executors of opaque code** — quoted text stops being inert data when
+//!   something executes it: a shell without a `-c` script argument (stdin or
+//!   script-file program), anything piped INTO a shell/`ssh`, and inline
+//!   interpreters (`python -c`, `perl -e`, ...) keep the legacy verdict for
+//!   their segment (for pipes, the whole line).
+//!
+//! Known limitation: data flow into consumers not modeled above (e.g.
+//! `docker run img sh -c "$X"` where the payload hides in an env var, or a
+//! custom script that evals its arguments) is treated as data — lexical
+//! analysis cannot track it, and the old matcher missed most such forms too.
 //!
 //! Like `SafePolicy` itself this is **not a security boundary** — it exists
 //! to catch obvious accidents; real isolation comes from the sandbox layer.
@@ -36,10 +48,31 @@ const SHELL_FLAG_WINDOW: usize = 8;
 const SHELLS: &[&str] = &["sh", "bash", "zsh", "dash", "ksh", "fish"];
 
 /// Commands that execute their arguments: the following words are treated as
-/// candidate command positions (`xargs rm -rf`, `env rm -rf /`, ...).
+/// candidate command positions (`xargs rm -rf`, `env rm -rf /`,
+/// `ssh host 'rm -rf /'`, ...).
 const WRAPPERS: &[&str] = &[
     "xargs", "env", "nohup", "exec", "setsid", "timeout", "nice", "ionice", "stdbuf", "command",
-    "builtin", "sudo", "doas", "watch", "parallel", "busybox",
+    "builtin", "sudo", "doas", "watch", "parallel", "busybox", "ssh",
+];
+
+/// Interpreters whose (typically quoted) argument or attached `-c`/`-e` text
+/// is a program in another language. We cannot parse those programs, so a
+/// segment invoking one keeps the full legacy verdict over its raw text —
+/// never less strict than the old matcher, which scanned quoted scripts.
+const INTERPRETERS: &[&str] = &[
+    "python",
+    "python2",
+    "python3",
+    "perl",
+    "ruby",
+    "node",
+    "deno",
+    "bun",
+    "php",
+    "lua",
+    "awk",
+    "gawk",
+    "osascript",
 ];
 
 /// Shell keywords that are transparent for command position
@@ -84,13 +117,19 @@ fn evaluate_at_depth(command: &str, deny: &[String], ask: &[String], depth: usiz
     };
 
     for segment in &segments {
-        let decision = if segment.dynamic {
+        let mut decision = if segment.dynamic {
             // Unanalyzable segment: old substring behavior on the raw text,
             // quotes and all — never less strict than the legacy matcher.
             legacy_decision(&segment.raw, deny, ask)
         } else {
             analyze_clean_segment(segment, deny, ask, depth)
         };
+        if segment.piped_from_prev && is_stdin_executor(segment) {
+            // `... | sh` executes the piped text: upstream quoted literals
+            // are code for the consumer, so the whole line keeps its legacy
+            // verdict — never less strict than the old matcher.
+            decision = worse(decision, legacy_decision(command, deny, ask));
+        }
         worst = worse(worst, decision);
         if worst == Decision::Deny {
             return Decision::Deny;
@@ -203,6 +242,10 @@ struct Token {
     quoted: bool,
     /// The word contains an (unescaped) `$` expansion.
     has_dollar: bool,
+    /// Byte offset into `value` where the first quoted span begins. Lets
+    /// fused flag+script words (`-c'rm -rf /'` -> value `-crm -rf /`) be
+    /// split back into flag prefix and script.
+    quote_offset: Option<usize>,
 }
 
 #[derive(Debug, Default)]
@@ -217,6 +260,8 @@ struct Segment {
     /// Contains a construct we do not analyze (command substitution,
     /// backtick, backslash escape outside quotes).
     dynamic: bool,
+    /// The segment reads the previous segment's output on stdin (`|`/`|&`).
+    piped_from_prev: bool,
 }
 
 #[derive(Default)]
@@ -224,6 +269,8 @@ struct Parser {
     segments: Vec<Segment>,
     seg: Segment,
     token: Option<Token>,
+    /// The segment currently being accumulated is fed by a pipe.
+    piped: bool,
 }
 
 impl Parser {
@@ -249,7 +296,11 @@ impl Parser {
     fn quote_mark(&mut self, c: char) {
         self.seg.raw.push(c);
         self.seg.masked.push(' ');
-        self.token_mut().quoted = true;
+        let token = self.token_mut();
+        if token.quote_offset.is_none() {
+            token.quote_offset = Some(token.value.len());
+        }
+        token.quoted = true;
     }
 
     /// Character inside a quoted span: raw keeps it, masked blanks it,
@@ -272,8 +323,11 @@ impl Parser {
 
     fn end_segment(&mut self) {
         self.end_token();
-        let seg = std::mem::take(&mut self.seg);
+        let mut seg = std::mem::take(&mut self.seg);
         if !seg.tokens.is_empty() || !seg.raw.trim().is_empty() {
+            // Only a real segment consumes the pending pipe flag: an empty
+            // one (e.g. the gap in `a | (b)`) leaves it for the next.
+            seg.piped_from_prev = std::mem::replace(&mut self.piped, false);
             self.segments.push(seg);
         }
     }
@@ -365,9 +419,17 @@ fn parse_segments(input: &str) -> Option<Vec<Segment>> {
             }
             '|' => {
                 if it.peek() == Some(&'|') {
+                    // `||` — logical OR, not a pipe.
                     it.next();
+                    p.end_segment();
+                } else {
+                    // `|` / `|&` — the next segment reads this one's output.
+                    if it.peek() == Some(&'&') {
+                        it.next();
+                    }
+                    p.end_segment();
+                    p.piped = true;
                 }
-                p.end_segment();
             }
             '(' => {
                 paren_is_subst.push(false);
@@ -410,9 +472,20 @@ fn parse_segments(input: &str) -> Option<Vec<Segment>> {
                 }
             }
             '<' | '>' => {
-                // Redirection operators delimit words but not segments.
-                p.end_token();
-                p.raw_only(c);
+                if it.peek() == Some(&'(') {
+                    // Process substitution `<(...)`/`>(...)`: like `$(...)`,
+                    // the enclosing command continues after the close paren
+                    // with words we cannot see through — keep the enclosing
+                    // prefix and continuation on the legacy fallback path.
+                    it.next();
+                    p.seg.dynamic = true;
+                    p.end_segment();
+                    paren_is_subst.push(true);
+                } else {
+                    // Redirection operators delimit words but not segments.
+                    p.end_token();
+                    p.raw_only(c);
+                }
             }
             c if c.is_whitespace() => {
                 // NOTE: newline is deliberately whitespace, not a separator —
@@ -450,6 +523,44 @@ fn is_assignment(token: &Token) -> bool {
 
 fn is_keyword(token: &Token) -> bool {
     !token.quoted && KEYWORDS.contains(&token.value.as_str())
+}
+
+/// A shell flag word that supplies the script as an argument (`-c`,
+/// `-euxc`, fish's `--command`) rather than the shell reading stdin or a
+/// script file.
+fn is_script_flag(v: &str) -> bool {
+    (v.starts_with('-') && !v.starts_with("--") && v.contains('c'))
+        || v == "--command"
+        || v.starts_with("--command=")
+}
+
+/// Path-stripped command name (`/bin/sh` -> `sh`).
+fn basename(value: &str) -> &str {
+    value.rsplit('/').next().unwrap_or(value)
+}
+
+/// Does a piped-into segment execute the text arriving on stdin?
+///
+/// `echo 'rm -rf /' | sh` runs the quoted literal even though it is
+/// lexically data; `ssh` does the same on a remote host, and a `$`-expanded
+/// consumer could resolve to either. A shell given a `-c` script flag takes
+/// its program from the argument (analyzed recursively), not stdin.
+fn is_stdin_executor(segment: &Segment) -> bool {
+    for (i, token) in segment.tokens.iter().enumerate() {
+        if token.has_dollar {
+            return true;
+        }
+        let name = basename(&token.value);
+        if name == "ssh" {
+            return true;
+        }
+        if SHELLS.contains(&name) {
+            return !segment.tokens[i + 1..]
+                .iter()
+                .any(|t| is_script_flag(&t.value));
+        }
+    }
+    false
 }
 
 /// Join token values from `from` with single spaces, stopping once the
@@ -517,10 +628,13 @@ fn analyze_clean_segment(
 
     while let Some(pos) = queue.pop() {
         let token = &tokens[pos];
+        let name = basename(&token.value);
 
-        // Expansion or eval in command position: unanalyzable — fall back to
-        // the legacy behavior over the segment's raw text (never less strict).
-        if token.has_dollar || token.value == "eval" {
+        // Expansion, eval, or an inline interpreter (`python -c`, `perl -e`)
+        // in command position: the code it runs is unanalyzable — fall back
+        // to the legacy behavior over the segment's raw text (never less
+        // strict).
+        if token.has_dollar || name == "eval" || INTERPRETERS.contains(&name) {
             return worse(worst, legacy_decision(&segment.raw, deny, ask));
         }
 
@@ -535,25 +649,57 @@ fn analyze_clean_segment(
             }
         }
 
-        let name = token.value.rsplit('/').next().unwrap_or(&token.value);
         let is_shell = SHELLS.contains(&name);
         if is_shell {
             // `sh -c '<script>'`: the flag's argument is a nested command
             // line — analyze it recursively.
             let window_end = tokens.len().min(pos + 1 + SHELL_FLAG_WINDOW);
+            let mut has_script_flag = false;
             for j in (pos + 1)..window_end {
-                let v = &tokens[j].value;
-                if v.starts_with('-')
-                    && v.contains('c')
-                    && let Some(script) = tokens.get(j + 1)
-                {
+                let flag = &tokens[j];
+                let v = flag.value.as_str();
+                if !is_script_flag(v) {
+                    continue;
+                }
+                has_script_flag = true;
+                // Separate script token: `sh -c 'script'`.
+                if let Some(script) = tokens.get(j + 1) {
                     worst = worse(
                         worst,
                         evaluate_at_depth(&script.value, deny, ask, depth + 1),
                     );
-                    if worst == Decision::Deny {
-                        return Decision::Deny;
-                    }
+                }
+                // Fused script: `sh -c'script'`, `sh -cx'script'`,
+                // `fish --command='script'` — the flag word carries the
+                // script itself, so recurse on every plausible attachment
+                // (the quoted span; the text after the `c` or `=`).
+                let quoted = flag
+                    .quote_offset
+                    .map(|off| &v[off..])
+                    .filter(|s| !s.is_empty());
+                let inline = if let Some(rest) = v.strip_prefix("--command=") {
+                    Some(rest)
+                } else if !v.starts_with("--") {
+                    v.find('c').map(|i| &v[i + 1..])
+                } else {
+                    None
+                };
+                let inline = inline.filter(|s| !s.is_empty() && Some(*s) != quoted);
+                for script in quoted.into_iter().chain(inline) {
+                    worst = worse(worst, evaluate_at_depth(script, deny, ask, depth + 1));
+                }
+                if worst == Decision::Deny {
+                    return Decision::Deny;
+                }
+            }
+            if !has_script_flag {
+                // Shell with no `-c` script argument: its program comes from
+                // stdin or an opaque script-file operand, and quoted
+                // arguments flow into that code — keep the legacy verdict
+                // over the segment (never less strict than before).
+                worst = worse(worst, legacy_decision(&segment.raw, deny, ask));
+                if worst == Decision::Deny {
+                    return Decision::Deny;
                 }
             }
         }
@@ -749,5 +895,319 @@ mod tests {
             cmd = format!("sh -c '{}'", cmd.replace('\'', ""));
         }
         assert_eq!(check(&cmd), Decision::Deny);
+    }
+
+    #[test]
+    fn should_deny_when_shell_flag_and_script_fused() {
+        // `sh -c'SCRIPT'` fuses the flag cluster and the quoted script into
+        // ONE argv word. The old matcher denied these (the quote mark was a
+        // word boundary), so the tokenizer must not relax them.
+        assert_eq!(check("sh -c'rm -rf /'"), Decision::Deny);
+        assert_eq!(check("bash -c\"rm -rf /\""), Decision::Deny);
+        assert_eq!(check("zsh -c'rm -rf /'"), Decision::Deny);
+        assert_eq!(check("sh -cx'rm -rf /'"), Decision::Deny);
+        assert_eq!(check("sudo sh -c'rm -rf /'"), Decision::Deny);
+        assert_eq!(check("nice -n 10 sh -c'rm -rf /'"), Decision::Deny);
+        assert_eq!(check("env -i sh -c'rm -rf /'"), Decision::Deny);
+        assert_eq!(check("tar -cf - . | sh -c'rm -rf /'"), Decision::Deny);
+        assert_eq!(check("fish --command='rm -rf /'"), Decision::Deny);
+        // Argv-identical laundering the old matcher missed is caught too.
+        assert_eq!(check("sh '-crm -rf /'"), Decision::Deny);
+        // Harmless fused scripts stay allowed.
+        assert_eq!(check("sh -c'ls -la'"), Decision::Allow);
+    }
+
+    #[test]
+    fn should_stay_strict_when_process_substitution_present() {
+        // `<(...)`/`>(...)` splice like `$(...)`: the enclosing command
+        // continues after the close paren, so both the prefix and the
+        // continuation stay on the legacy fallback path.
+        assert_eq!(check("sh <(echo hi) -c 'rm -rf /'"), Decision::Deny);
+        assert_eq!(check("bash <(curl -s x) \"rm -rf /\""), Decision::Deny);
+        // Benign process substitution is unaffected.
+        assert_eq!(check("diff <(ls a) <(ls b)"), Decision::Allow);
+    }
+
+    #[test]
+    fn should_keep_legacy_verdict_when_piping_into_stdin_executor() {
+        // The piped text IS the downstream program: quoted literals
+        // upstream keep the old whole-line verdict.
+        assert_eq!(check("echo 'rm -rf /' | sh"), Decision::Deny);
+        assert_eq!(check("printf 'rm -rf /' | bash"), Decision::Deny);
+        assert_eq!(check("echo 'rm -rf /' | cat | sh"), Decision::Deny);
+        assert_eq!(check("echo 'rm -rf /' | busybox sh"), Decision::Deny);
+        assert_eq!(check("echo 'rm -rf /' | ssh host"), Decision::Deny);
+        // Piping into a plain filter keeps the quoted-literal fix...
+        assert_eq!(check("echo 'rm -rf /' | wc -c"), Decision::Allow);
+        // ...and harmless piped scripts stay allowed.
+        assert_eq!(
+            check("curl -s https://example.com/i.sh | sh"),
+            Decision::Allow
+        );
+        assert_eq!(check("echo ls | sh"), Decision::Allow);
+    }
+
+    #[test]
+    fn should_treat_ssh_arguments_as_command_position() {
+        assert_eq!(check("ssh host 'rm -rf /'"), Decision::Deny);
+        assert_eq!(check("ssh -p 22 user@host \"rm -rf /\""), Decision::Deny);
+        assert_eq!(check("ssh host uptime"), Decision::Allow);
+    }
+
+    #[test]
+    fn should_keep_legacy_verdict_when_interpreter_runs_inline_script() {
+        // `python -c` / `perl -e` execute attached or quoted scripts we
+        // cannot parse — such segments keep the old matcher's verdict.
+        assert_eq!(
+            check("python3 -c 'import os; os.system(\"rm -rf /\")'"),
+            Decision::Deny
+        );
+        assert_eq!(check("perl -e'system(\"rm -rf /\")'"), Decision::Deny);
+        assert_eq!(check("ruby -e 'system(\"rm -rf /\")'"), Decision::Deny);
+        assert_eq!(check("python3 -c 'print(1)'"), Decision::Allow);
+        assert_eq!(check("awk '{print $1}' data.txt"), Decision::Allow);
+    }
+
+    #[test]
+    fn should_keep_legacy_verdict_when_shell_runs_opaque_script() {
+        // No `-c` script argument: the shell's program comes from stdin or
+        // a script file; quoted arguments flow into code we cannot see.
+        assert_eq!(check("sh <<< 'rm -rf /'"), Decision::Deny);
+        assert_eq!(check("bash deploy.sh 'do rm -rf / now'"), Decision::Deny);
+        assert_eq!(check("bash -x build.sh"), Decision::Allow);
+    }
+
+    // -----------------------------------------------------------------
+    // Differential corpus: the new matcher must never be LESS strict
+    // than the pre-#1769 matcher, except for the explicit quoted-literal
+    // relaxations listed below.
+    // -----------------------------------------------------------------
+
+    /// The pre-#1769 `SafePolicy::check`: whitespace-normalized
+    /// word-boundary substring match over the whole command line. The
+    /// tokenizer's fallback paths reuse exactly these helpers, so this is
+    /// a faithful reconstruction of the deleted matcher.
+    fn old_check(cmd: &str) -> Decision {
+        legacy_decision(cmd, &deny(), &ask())
+    }
+
+    fn rank(d: Decision) -> u8 {
+        match d {
+            Decision::Allow => 0,
+            Decision::Ask => 1,
+            Decision::Deny => 2,
+        }
+    }
+
+    /// Inputs where the new matcher is deliberately LESS strict than the
+    /// old one: the dangerous text is a quoted literal consumed as data
+    /// (printed, grepped, counted), never executed. These are the PR's
+    /// advertised false-positive fixes — each must keep resolving to
+    /// `Allow`, and each must still be flagged by the old matcher (else
+    /// the entry is stale and should be removed).
+    const QUOTED_LITERAL_RELAXATIONS: &[&str] = &[
+        "echo \"don't rm -rf /\"",
+        "echo 'sudo rm -rf /'",
+        "echo \"rm -rf /\"",
+        "e\"c\"ho \"rm -rf /\"",
+        "echo $'rm -rf /'",
+        "cat <<< \"rm -rf /\"",
+        "git commit -m \"fix: rm -rf / bug\"",
+        "git log --grep='rm -rf /'",
+        "grep 'rm -rf /' README.md",
+        "echo 'rm -rf /' | wc -c",
+        "printf '%s\\n' 'git push --force'",
+        "echo 'dd if=/dev/zero'",
+        "echo 'mkfs.ext4'",
+        "echo \"chmod -R 777 /\"",
+        "echo $(date); echo \"rm -rf /\"",
+    ];
+
+    /// Attack battery + benign corpus fed through both matchers.
+    const DIFFERENTIAL_CORPUS: &[&str] = &[
+        // Every default pattern, verbatim and with whitespace variants.
+        "rm -rf /",
+        "rm -rf /*",
+        "rm  -rf  /",
+        "rm\t-rf\t/",
+        "rm -rf /\nls",
+        "dd if=/dev/zero of=/dev/sda",
+        "mkfs",
+        "mkfs.ext4 /dev/sda",
+        ":(){:|:&};:",
+        "chmod -R 777 /",
+        "sudo apt install foo",
+        "rm -rf build",
+        "git push --force origin main",
+        "git push --force",
+        "git reset --hard",
+        "git reset --hard HEAD~1",
+        // Quote laundering of argv.
+        "rm \"-rf\" \"/\"",
+        "\"rm\" -rf /",
+        "rm '-rf' '/'",
+        "rm -rf \"/\"",
+        "chmod -R \"777\" /",
+        // Wrappers forwarding into command position.
+        "xargs rm -rf /",
+        "find . | xargs \"rm\" \"-rf\" \"/\"",
+        "env PATH=/bin rm -rf /",
+        "timeout 5 rm -rf /",
+        "nice -n 10 rm -rf /",
+        "sudo rm -rf /",
+        "nohup rm -rf / &",
+        "setsid rm -rf /",
+        "busybox rm -rf /",
+        "chroot /x rm -rf /",
+        "xargs -a file sudo rm -rf /",
+        "find . -exec rm -rf / +",
+        // sh -c and friends, separate-token form.
+        "sh -c 'rm -rf /'",
+        "sh -c \"rm -rf /\"",
+        "bash -c 'rm -rf /'",
+        "zsh -c 'rm -rf /'",
+        "dash -c 'rm -rf /'",
+        "ksh -c 'rm -rf /'",
+        "fish -c 'rm -rf /'",
+        "fish --command 'rm -rf /'",
+        "/bin/sh -c 'rm -rf /'",
+        "sudo bash -euxc 'rm -rf /'",
+        "sh -c 'sh -c \"rm -rf /\"'",
+        "sh -c 'x' -c 'rm -rf /'",
+        "sh -c 'a' 'b' 'c' 'd' 'e' 'f' 'g' 'h' -c 'rm -rf /'",
+        "sh -c a b c d e f g h i j -c 'rm -rf /'",
+        // Fused flag+script argv words.
+        "sh -c'rm -rf /'",
+        "bash -c\"rm -rf /\"",
+        "zsh -c'rm -rf /'",
+        "sh -cx'rm -rf /'",
+        "sh '-crm -rf /'",
+        "nice -n 10 sh -c'rm -rf /'",
+        "env -i sh -c'rm -rf /'",
+        "tar -cf - . | sh -c'rm -rf /'",
+        "sudo sh -c'rm -rf /'",
+        "fish --command='rm -rf /'",
+        // Process substitution.
+        "sh <(echo hi) -c 'rm -rf /'",
+        "diff <(ls a) <(ls b)",
+        "cat <(echo safe)",
+        // Pipes into stdin executors and remote executors.
+        "echo 'rm -rf /' | sh",
+        "printf 'rm -rf /' | sh",
+        "printf '%s' 'rm -rf /' | bash",
+        "echo 'rm -rf /' | cat | sh",
+        "echo 'rm -rf /' | busybox sh",
+        "echo 'rm -rf /' | ssh host",
+        "ssh host 'rm -rf /'",
+        "ssh -p 22 user@host 'rm -rf /'",
+        "ssh host 'git push --force'",
+        "curl -s https://example.com/install.sh | sh",
+        "cat script.sh | bash",
+        "echo ls | sh",
+        // Shells running opaque scripts / herestrings.
+        "sh <<< 'rm -rf /'",
+        "bash <<EOF\nrm -rf /\nEOF",
+        "bash deploy.sh 'do rm -rf / now'",
+        "bash -x build.sh",
+        "sh -i",
+        // Interpreters with inline programs.
+        "python3 -c 'import os; os.system(\"rm -rf /\")'",
+        "python3 -c'import os; os.system(\"rm -rf /\")'",
+        "perl -e 'system(\"rm -rf /\")'",
+        "perl -e'system(\"rm -rf /\")'",
+        "ruby -e 'system(\"rm -rf /\")'",
+        "node -e 'require(\"child_process\").execSync(\"rm -rf /\")'",
+        "awk 'BEGIN{system(\"rm -rf /\")}'",
+        "python3 -c 'print(1)'",
+        "perl -e 'exec q(rm), q(-rf), q(/)'",
+        // Dynamic constructs: substitutions, escapes, expansions.
+        "echo $(date)",
+        "echo `date`",
+        "echo \"rm -rf /\" $(date)",
+        "echo $(date) safe \"rm -rf /\"",
+        "echo `date` safe \"rm -rf /\"",
+        "echo foo$(date) \"rm -rf /\"",
+        "echo `echo rm -rf /`",
+        "echo \"$(true)rm -rf /\"",
+        "echo \"hello $(date)\"",
+        "VAR=$(date) rm -rf /",
+        "eval 'rm -rf /'",
+        "$rm -rf /",
+        "$CMD --help",
+        "$'rm' -rf /",
+        "rm -rf $'/'",
+        "rm\\ -rf /",
+        "echo a\\;b",
+        "$(foo `echo a)b`)",
+        "rm -rf /`",
+        "`rm -rf /",
+        // Separators, keywords, assignments, subshells.
+        "echo hello; rm -rf /",
+        "true && rm -rf /",
+        "false || rm -rf /",
+        "ls & rm -rf /",
+        "(rm -rf /)",
+        "( rm -rf / )",
+        "(:) rm -rf /",
+        "() rm -rf /",
+        "echo (:) rm -rf /",
+        "if rm -rf /; then echo done; fi",
+        "while true; do rm -rf /; done",
+        "FOO=bar rm -rf /",
+        "FOO=bar BAZ=qux sudo ls",
+        "IFS=x; rm -rf /",
+        // Unterminated quoting falls back to whole-string legacy.
+        "e'c'h'o \"rm -rf /\"",
+        "rm -rf /; echo \"unterminated",
+        "echo 'oops",
+        // Benign commands must stay benign.
+        "cargo build",
+        "cargo test --workspace",
+        "git status",
+        "ls -la",
+        "echo hello world",
+        "grep -rn pattern src/",
+        "find . -name '*.rs'",
+        "git commit -m 'update'",
+        "make -j8",
+        "npm install",
+        "docker ps",
+        "kubectl get pods",
+        "rsync -av src/ dst/",
+        "tar -czf out.tgz dir",
+        "echo test > /dev/null",
+        "cat file.txt",
+        "sed -i 's/a/b/' file",
+        "awk '{print $1}' file",
+        "format-disk --help",
+        "unmkfs thing",
+        "git push --force-with-lease",
+        "dd \"if=\"x of=y",
+        "ssh host uptime",
+        "ssh host 'ls -la'",
+    ];
+
+    #[test]
+    fn should_never_relax_verdicts_when_compared_with_legacy_matcher() {
+        for case in DIFFERENTIAL_CORPUS.iter().chain(QUOTED_LITERAL_RELAXATIONS) {
+            let old = old_check(case);
+            let new = check(case);
+            if QUOTED_LITERAL_RELAXATIONS.contains(case) {
+                assert_eq!(
+                    new,
+                    Decision::Allow,
+                    "relaxation allowlist entry must stay Allow: {case:?} (old={old:?})"
+                );
+                assert!(
+                    rank(old) > rank(Decision::Allow),
+                    "stale allowlist entry (old matcher already allowed it): {case:?}"
+                );
+                continue;
+            }
+            assert!(
+                rank(new) >= rank(old),
+                "regression (new matcher is less strict): {case:?} old={old:?} new={new:?}"
+            );
+        }
     }
 }
