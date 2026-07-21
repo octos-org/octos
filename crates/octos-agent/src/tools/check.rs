@@ -689,32 +689,41 @@ fn tail_chars(text: &str, max_chars: usize) -> &str {
 ///
 /// The child was spawned in its own process group (`process_group(0)`), so
 /// the negative-PID signals reach the WHOLE tree (cargo's rustc/linker
-/// grandchildren, tsc workers). Mirrors `tools/shell.rs`: SIGTERM to the
-/// group + direct PID first (graceful — lets cargo release the build
-/// lock), 500ms grace, then SIGKILL only if the direct PID is still alive
-/// (`kill -0` liveness probe avoids signalling a recycled PID).
+/// grandchildren, tsc workers). SIGTERM to the group + direct PID first
+/// (graceful — lets cargo release the build lock), 500ms grace, then
+/// SIGKILL gated on a liveness probe of the GROUP (not just the leader:
+/// on Linux `dash` exits to SIGTERM immediately, and a leader-only probe
+/// skipped the escalation while orphaned grandchildren lived on — #1781
+/// CI). Negative PIDs are passed after `--`: GNU/procps `kill` otherwise
+/// parses `-<pid>` as an option and the group signal is silently never
+/// delivered (macOS accepted it, Linux did not).
 async fn kill_by_pid(pid: Option<u32>) {
     let Some(pid) = pid else { return };
     #[cfg(unix)]
     {
         use std::process::Command as StdCommand;
-        let _ = StdCommand::new("kill")
-            .args(["-15", &format!("-{pid}")])
-            .status();
+        let group = format!("-{pid}");
+        let _ = StdCommand::new("kill").args(["-15", "--", &group]).status();
         let _ = StdCommand::new("kill")
             .args(["-15", &pid.to_string()])
             .status();
 
         tokio::time::sleep(Duration::from_millis(500)).await;
 
-        let still_alive = StdCommand::new("kill")
+        // `kill -0 -- -pgid` succeeds while ANY member of the group is
+        // alive, and cannot hit a recycled group while a member remains.
+        let group_alive = StdCommand::new("kill")
+            .args(["-0", "--", &group])
+            .status()
+            .is_ok_and(|s| s.success());
+        if group_alive {
+            let _ = StdCommand::new("kill").args(["-9", "--", &group]).status();
+        }
+        let leader_alive = StdCommand::new("kill")
             .args(["-0", &pid.to_string()])
             .status()
             .is_ok_and(|s| s.success());
-        if still_alive {
-            let _ = StdCommand::new("kill")
-                .args(["-9", &format!("-{pid}")])
-                .status();
+        if leader_alive {
             let _ = StdCommand::new("kill")
                 .args(["-9", &pid.to_string()])
                 .status();
