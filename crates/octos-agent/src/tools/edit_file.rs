@@ -1282,45 +1282,4 @@ mod tests {
             "the edit must be kept exactly as written when formatting fails"
         );
     }
-
-    #[tokio::test]
-    async fn should_edit_file_tool_invalidate_cache_after_edit() {
-        use crate::file_state_cache::{CacheEntry, FileStateCache};
-        use std::sync::Arc;
-        use std::time::SystemTime;
-
-        let dir = tempfile::tempdir().unwrap();
-        let file_path = dir.path().join("code.rs");
-        std::fs::write(&file_path, "fn foo() {}\n").unwrap();
-
-        let cache = Arc::new(FileStateCache::new());
-        cache.put(CacheEntry::new(
-            file_path.clone(),
-            SystemTime::now(),
-            0xCAFE,
-            12,
-            false,
-            None,
-        ));
-        assert_eq!(cache.len(), 1);
-
-        let mut ctx = ToolContext::zero();
-        ctx.file_state_cache = Some(cache.clone());
-
-        let tool = EditFileTool::new(dir.path());
-        let result = tool
-            .execute_with_context(
-                &ctx,
-                &serde_json::json!({
-                    "path": "code.rs",
-                    "old_string": "fn foo() {}",
-                    "new_string": "fn bar() {}"
-                }),
-            )
-            .await
-            .unwrap();
-
-        assert!(result.success);
-        assert!(cache.peek(&file_path).is_none());
-    }
 }

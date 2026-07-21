@@ -912,6 +912,11 @@ impl Agent {
                 // filesystem contract as the parent session. None
                 // keeps pre-Phase-1 behaviour.
                 let bg_session_scope = session_scope.clone();
+                // #1774 review: the formatting opt-in must reach spawn_only
+                // background tools too (pipeline steps editing files). Copy of
+                // the pre-spawn local — `self` cannot cross into the 'static
+                // task.
+                let bg_format_after_edit = format_after_edit;
                 let bg_session_id_for_watcher = format!("agent:{}", tc_id);
                 // M10 Phase 4: keep a copy of the task_id so the synthesized
                 // tool-result message returned to the LLM (built after this
@@ -1002,6 +1007,11 @@ impl Agent {
                         // every background sub-agent sees the same
                         // filesystem contract as the parent.
                         session_scope: bg_session_scope.clone(),
+                        // #1774 review: spawn_only background tools (pipeline
+                        // steps, sub-agent edits) honor the same post-edit
+                        // formatting opt-in as the foreground path — without
+                        // this the flag silently defaulted to false here.
+                        format_after_edit: bg_format_after_edit,
                         ..ToolContext::zero()
                     };
 

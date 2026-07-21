@@ -19,6 +19,17 @@
 //! - **No stale mental copy** — when the formatter changed the file, the tool
 //!   result echoes the re-read, formatted content so the LLM sees exactly
 //!   what is on disk.
+//!
+//! # Trust model
+//!
+//! Enabling `format_after_edit` means **trusting the workspace's formatter
+//! configuration**: the child runs with cwd = the file's parent, and real
+//! formatters discover and honor project config found there (`rustfmt.toml`,
+//! `.prettierrc`, `pyproject.toml`, ...). Prettier in particular can load
+//! project-local plugins — JavaScript that executes with the agent's
+//! privileges. Env sanitization strips secrets from the child, but it cannot
+//! contain code the formatter itself chooses to run. Do not enable this
+//! opt-in on untrusted workspaces.
 
 use std::path::Path;
 use std::process::Stdio;
@@ -90,7 +101,15 @@ impl FormatterKind {
     /// [`format_file_with_command`] keeps this offline-safe.
     pub fn command(self) -> FormatterCommand {
         let (program, args): (&str, &[&str]) = match self {
-            Self::Rustfmt => ("rustfmt", &["--edition", "2024"]),
+            // `skip_children=true` pins the FILE-scoped contract: rustfmt's
+            // default traverses `mod` declarations and silently rewrites
+            // child modules on disk — files the edit never targeted, whose
+            // cache entries and git snapshots would then be stale (#1774
+            // review).
+            Self::Rustfmt => (
+                "rustfmt",
+                &["--edition", "2024", "--config", "skip_children=true"],
+            ),
             Self::Prettier => ("prettier", &["--write"]),
             Self::Black => ("black", &["--quiet"]),
             Self::Gofmt => ("gofmt", &["-w"]),
@@ -348,7 +367,18 @@ mod tests {
     fn should_map_expected_formatter_commands() {
         let rust = FormatterKind::Rustfmt.command();
         assert_eq!(rust.program, "rustfmt");
-        assert_eq!(rust.args, vec!["--edition".to_string(), "2024".to_string()]);
+        // skip_children pins the FILE-scoped contract (#1774 review):
+        // rustfmt's default traverses `mod` declarations and rewrites child
+        // modules the edit never targeted.
+        assert_eq!(
+            rust.args,
+            vec![
+                "--edition".to_string(),
+                "2024".to_string(),
+                "--config".to_string(),
+                "skip_children=true".to_string(),
+            ]
+        );
 
         let prettier = FormatterKind::Prettier.command();
         assert_eq!(prettier.program, "prettier");
