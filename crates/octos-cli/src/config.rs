@@ -76,6 +76,15 @@ pub struct Config {
     #[serde(default)]
     pub sandbox: octos_agent::SandboxConfig,
 
+    /// Workspace snapshot-undo configuration (#1768). Opt-in: when
+    /// `snapshots.enabled` is true, the agent records a git-backed
+    /// snapshot of the workspace (into a separate git dir under
+    /// `<data_dir>/snapshots/`, never the user's own `.git`) before each
+    /// mutating tool batch. Absent or `enabled: false` (the default) =
+    /// feature off.
+    #[serde(default)]
+    pub snapshots: Option<octos_agent::SnapshotConfig>,
+
     /// Tool access policy (allow/deny lists with group and wildcard support).
     #[serde(default)]
     pub tool_policy: Option<octos_agent::ToolPolicy>,
@@ -2101,6 +2110,26 @@ mod tests {
     /// SAME mutex — per-module locks would let env-mutating tests race across
     /// modules (a flaky-failure source).
     use crate::config_context::TEST_ENV_LOCK as HOME_ENV_LOCK;
+
+    #[test]
+    fn should_parse_snapshots_config_and_default_to_off_when_absent() {
+        // Absent → None (feature off, #1768 opt-in contract).
+        let config: Config = serde_json::from_str("{}").unwrap();
+        assert!(config.snapshots.is_none());
+
+        let config: Config =
+            serde_json::from_str(r#"{"snapshots": {"enabled": true, "keep_last": 7}}"#).unwrap();
+        let snapshots = config.snapshots.expect("snapshots block parsed");
+        assert!(snapshots.enabled);
+        assert_eq!(snapshots.keep_last, 7);
+
+        // Partial block keeps the documented defaults.
+        let config: Config = serde_json::from_str(r#"{"snapshots": {"enabled": true}}"#).unwrap();
+        assert_eq!(
+            config.snapshots.unwrap().keep_last,
+            octos_agent::DEFAULT_SNAPSHOT_KEEP_LAST
+        );
+    }
 
     #[test]
     fn write_mutation_creates_file_with_pretty_json() {

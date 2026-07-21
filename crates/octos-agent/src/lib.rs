@@ -49,6 +49,7 @@ pub mod session;
 pub mod session_usage;
 mod shell_analysis;
 pub mod skills;
+pub mod snapshot;
 pub mod steering;
 pub mod subagent_output;
 pub mod subagent_summary;
@@ -161,6 +162,9 @@ pub use sandbox::{Sandbox, SandboxConfig, SandboxMode, create_sandbox};
 pub use session::{SessionLimits, SessionState, SessionStateHandle, SessionUsage};
 pub use session_usage::{SessionUsageHandle, SessionUsageSnapshot, SharedSessionUsage};
 pub use skills::{SkillFilter, SkillInfo, SkillsLoader};
+pub use snapshot::{
+    DEFAULT_SNAPSHOT_KEEP_LAST, SnapshotConfig, SnapshotId, SnapshotInfo, SnapshotManager,
+};
 pub use steering::{SteeringMessage, SteeringReceiver, SteeringSender};
 pub use subagent_output::{
     AppendResult, DEFAULT_GC_AGE, DEFAULT_MAX_BYTES_PER_TASK, DEFAULT_MAX_BYTES_TOTAL,
