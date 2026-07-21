@@ -1247,6 +1247,8 @@ impl ToolRegistry {
         registry.register(WorkspaceLogTool::new(cwd));
         registry.register(WorkspaceShowTool::new(cwd));
         registry.register(WorkspaceDiffTool::new(cwd));
+        // #1772 (lite): project static-check with compact diagnostics.
+        registry.register(super::CheckTool::new(cwd));
         #[cfg(feature = "git")]
         registry.register(super::GitTool::new(cwd));
         #[cfg(feature = "ast")]
@@ -1357,6 +1359,10 @@ impl ToolRegistry {
         "workspace_log",
         "workspace_show",
         "workspace_diff",
+        // #1772 (lite): `check` detects the project (Cargo.toml / tsconfig /
+        // go.mod) at its bound workspace root and runs the checker there, so
+        // a re-scoped session must re-register it against the new root.
+        "check",
         // #972 / M14-B P1: `view_image` reads files from the workspace and
         // must follow `rebind_cwd` so a session targeting a new project root
         // does not leak previously bound paths.
@@ -1445,6 +1451,9 @@ impl ToolRegistry {
         registry.register(WorkspaceLogTool::new(cwd));
         registry.register(WorkspaceShowTool::new(cwd));
         registry.register(WorkspaceDiffTool::new(cwd));
+        // #1772 (lite): `check` detects the project type from the workspace
+        // root, so it must follow `rebind_cwd` like the other cwd-bound tools.
+        registry.register(super::CheckTool::new(cwd));
         #[cfg(feature = "git")]
         registry.register(super::GitTool::new(cwd));
         #[cfg(feature = "ast")]
@@ -1774,6 +1783,34 @@ mod cwd_isolation_tests {
         assert!(
             rebound_task.session_key.is_none(),
             "session key must be supplied by the new session actor, not inherited"
+        );
+    }
+
+    #[tokio::test]
+    async fn should_register_check_tool_and_rebind_its_cwd() {
+        let initial_cwd = tempfile::tempdir().expect("create temp dir");
+        let registry =
+            ToolRegistry::with_builtins_and_sandbox(initial_cwd.path(), Box::new(NoSandbox));
+        assert!(
+            registry.get("check").is_some(),
+            "check must be a builtin tool"
+        );
+
+        // `check` is cwd-bound: after a rebind it must detect the project at
+        // the NEW workspace root (the empty new cwd → "no supported project"),
+        // not the old one.
+        let new_cwd = tempfile::tempdir().expect("create temp dir");
+        std::fs::write(initial_cwd.path().join("go.mod"), "module old").unwrap();
+        let rebound = registry.rebind_cwd(new_cwd.path(), Box::new(NoSandbox));
+        let tr = rebound
+            .execute("check", &serde_json::json!({}))
+            .await
+            .expect("check dispatch");
+        assert!(tr.success, "no-project answer is a success: {}", tr.output);
+        assert!(
+            tr.output.contains("no supported project detected"),
+            "rebound check must look at the NEW cwd: {}",
+            tr.output
         );
     }
 

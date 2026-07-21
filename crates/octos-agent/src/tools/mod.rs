@@ -725,6 +725,7 @@ pub mod write_file;
 
 pub mod admin;
 pub mod browser;
+pub mod check;
 pub mod check_background_tasks;
 pub mod check_workspace_contract;
 pub mod mofa_make;
@@ -780,6 +781,7 @@ pub use web_search::WebSearchTool;
 pub use write_file::WriteFileTool;
 
 pub use browser::BrowserTool;
+pub use check::CheckTool;
 pub use check_background_tasks::CheckBackgroundTasksTool;
 pub use check_workspace_contract::CheckWorkspaceContractTool;
 pub use mofa_make::{
