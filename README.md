@@ -93,7 +93,7 @@ Most agentic systems are single-tenant chat assistants — one user, one model, 
 - **Session control in any channel**: `/new`, `/s <name>`, `/sessions`, `/back` — works in Telegram, Discord, Slack, WhatsApp, DingTalk, Matrix, Feishu.
 - **Sticky thread_id + committed_seq**: Every SSE event is bound to a thread; replay is deterministic by committed sequence number (M8.10).
 - **3-layer memory**: Long-term (entity bank, auto-injected), episodic (task outcomes in redb), session (JSONL + LLM compaction, three-tier).
-- **Autonomy loops & goals**: `/loop` runs fixed-interval or self-paced maintenance loops; goals continue across turns with checkpointed continuations — the agent keeps working between your messages.
+- **Autonomy — goals & loops**: `/goal <objective>` keeps the agent working across turns via checkpointed continuations (under a token budget); `/loop` runs a task on a fixed interval or self-paced. The agent keeps going between your messages — see [Autonomy: goals & loops](#autonomy-goals--loops).
 - **Session time-travel**: `session/rollback` RPC with resume/rewind checkpoint pickers in both clients; every session can be rolled back to any prior user turn.
 - **Live reasoning**: streams the model's thinking as it happens, with per-session `/thinking` effort control.
 - **Voice**: per-profile cloud TTS voices, rich HTML/image voice output, and an OMiniX runtime provider for local ASR/TTS.
@@ -342,6 +342,47 @@ fan-out non-blocking.
 
 Prerequisite: a provider configured (`octos auth login`, or the provider's
 API-key env var), **or** a `--profile` that already carries one.
+
+## Autonomy: goals & loops
+
+Beyond a single turn, octos can keep working on its own — between your messages,
+or on a schedule. Both are driven by slash commands in any client (octos-web,
+octos-tui) or channel session, and run on `octos serve` / `octos gateway`.
+
+### Goals — keep going until it's done
+
+`/goal <objective>` gives the agent a standing objective. After each turn it
+checkpoints a **continuation** and re-fires itself to keep making progress across
+turns — without you prompting again — until the objective is met or its budget
+runs out.
+
+```text
+/goal build a REST API for the todo app, with tests   # start a goal
+/goal <objective> --budget 5000000                    # cap it (default 2,000,000 tokens)
+/goal stop                                            # end the goal
+/goal resume                                          # re-activate a stopped goal
+```
+
+Each goal carries a **token budget** (default **2M**). When it's exhausted the
+goal moves to `budget_limited`, wraps up the current state, and tells you how to
+resume — reply `/goal <objective> --budget <N>` with a higher `N`, or `/goal
+stop`. Continuations are rate-limited (≥30s apart, ≤12/hour) so a goal can't spin.
+
+### Loops — run on a cadence
+
+`/loop <prompt>` runs a recurring task. Give it an interval (`s`/`m`/`h`/`d`) for
+a **fixed-interval** loop, or omit one for a **self-paced** loop where the agent
+decides when to wake itself next:
+
+```text
+/loop 30m check CI and triage new failures        # fixed interval (leading)
+/loop summarize unread email every 1h             # fixed interval (trailing)
+/loop watch the deploy and report when it's green  # self-paced (no interval)
+/loop resume <id>                                 # resume a paused loop
+```
+
+Loops persist across restarts (parked as paused on a solo reboot; you resume
+them explicitly), and can be paused, listed, fired now, or deleted.
 
 ## Documentation
 
