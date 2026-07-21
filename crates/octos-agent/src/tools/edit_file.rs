@@ -3,7 +3,7 @@
 use std::path::PathBuf;
 
 use async_trait::async_trait;
-use eyre::{Result, WrapErr};
+use eyre::Result;
 use serde::Deserialize;
 use tracing::warn;
 
@@ -44,6 +44,10 @@ impl EditFileTool {
 }
 
 #[derive(Debug, Deserialize)]
+// #1770: unknown keys are usually a typo of a real parameter; rejecting
+// them (with a did-you-mean via `args::parse_tool_args`) lets the model
+// self-correct instead of silently dropping its intent.
+#[serde(deny_unknown_fields)]
 struct EditFileInput {
     /// #1767: `filePath` is the industry-convention alias.
     #[serde(alias = "filePath")]
@@ -108,7 +112,7 @@ impl Tool for EditFileTool {
         args: &serde_json::Value,
     ) -> Result<ToolResult> {
         let input: EditFileInput =
-            serde_json::from_value(args.clone()).wrap_err("invalid edit_file tool input")?;
+            super::args::parse_tool_args(self.name(), &self.input_schema(), args)?;
 
         if !self.file_access.allows_write() {
             return Ok(ToolResult {

@@ -44,6 +44,10 @@ impl WriteFileTool {
 }
 
 #[derive(Debug, Deserialize)]
+// #1770: unknown keys are usually a typo of a real parameter; rejecting
+// them (with a did-you-mean via `args::parse_tool_args`) lets the model
+// self-correct instead of silently dropping its intent.
+#[serde(deny_unknown_fields)]
 struct WriteFileInput {
     /// #1767: `filePath` is the industry-convention alias.
     #[serde(alias = "filePath")]
@@ -102,7 +106,7 @@ impl Tool for WriteFileTool {
         args: &serde_json::Value,
     ) -> Result<ToolResult> {
         let input: WriteFileInput =
-            serde_json::from_value(args.clone()).wrap_err("invalid write_file tool input")?;
+            super::args::parse_tool_args(self.name(), &self.input_schema(), args)?;
 
         if !self.file_access.allows_write() {
             return Ok(ToolResult {

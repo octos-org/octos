@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use eyre::{Result, WrapErr};
+use eyre::Result;
 use serde::Deserialize;
 use tokio::time::timeout;
 
@@ -510,6 +510,10 @@ fn apply_harness_event_sink_env(cmd: &mut tokio::process::Command, ctx: &ToolCon
 }
 
 #[derive(Debug, Deserialize)]
+// #1770: unknown keys are usually a typo of a real parameter; rejecting
+// them (with a did-you-mean via `args::parse_tool_args`) lets the model
+// self-correct instead of silently dropping its intent.
+#[serde(deny_unknown_fields)]
 struct ShellInput {
     command: String,
     #[serde(default)]
@@ -627,7 +631,7 @@ impl Tool for ShellTool {
         args: &serde_json::Value,
     ) -> Result<ToolResult> {
         let input: ShellInput =
-            serde_json::from_value(args.clone()).wrap_err("invalid shell tool input")?;
+            super::args::parse_tool_args(self.name(), &self.input_schema(), args)?;
 
         // Phase 2-D of the SessionScope migration: when the host has
         // threaded a scope through `ToolContext`, prefer the scope's

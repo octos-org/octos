@@ -690,6 +690,9 @@ pub use robot_groups::{RobotToolRegistry, install_registry as install_robot_regi
 // Shared SSRF protection
 pub mod ssrf;
 
+// #1770: structured, model-facing tool-argument validation.
+pub mod args;
+
 // Built-in tools
 pub mod apply_patch;
 pub mod ask_user_question;
