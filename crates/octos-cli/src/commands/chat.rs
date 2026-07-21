@@ -147,6 +147,14 @@ pub struct ChatCommand {
     /// Do NOT persist this run as an episode (ephemeral). Mirrors
     /// `claude --no-session-persistence`: by default a completed turn is
     /// saved to the episode store for future recall; this skips that write.
+    ///
+    /// This also lets many `octos chat` agents run CONCURRENTLY against one
+    /// `--data-dir` (hence one shared `--profile`): a normal run takes an
+    /// exclusive lock on the data dir's episode DB, but an ephemeral run falls
+    /// back to an in-memory episode handle when the lock is already held,
+    /// instead of failing. Pass this to fan out parallel agents on a single
+    /// profile — e.g. review agents over one repo, or edit agents each in
+    /// their own `--cwd`.
     #[arg(long)]
     pub no_session_persistence: bool,
 
@@ -826,11 +834,32 @@ impl ChatCommand {
             }
         };
 
-        let memory = Arc::new(
+        // Episode store. Normally strict-open (the canonical single writer of
+        // `episodes.redb`, which takes an exclusive process lock). But an
+        // ephemeral run (`--no-session-persistence`) isn't going to save
+        // episodes anyway, so it opens via `open_or_degraded`: if another
+        // `octos chat` already holds the lock on this data dir, this run falls
+        // back to an in-memory episode handle instead of failing. That lets
+        // many ephemeral `octos chat` agents run concurrently against ONE
+        // `--data-dir` (hence one shared `--profile`) — e.g. a fan-out of
+        // review/edit agents — without the redb lock serializing them.
+        let memory = Arc::new(if self.no_session_persistence {
+            let store = EpisodeStore::open_or_degraded(&data_dir)
+                .await
+                .wrap_err("failed to open episode store")?;
+            if store.is_degraded() {
+                tracing::info!(
+                    "episode store on this data dir is held by another process; \
+                     running with an in-memory episode handle (no persistence/recall) \
+                     — expected when running concurrent `octos chat` agents"
+                );
+            }
+            store
+        } else {
             EpisodeStore::open(&data_dir)
                 .await
-                .wrap_err("failed to open episode store")?,
-        );
+                .wrap_err("failed to open episode store")?
+        });
 
         // Resolve the runtime profile (M8.3). Order:
         //   1. --profile CLI arg, if present;
