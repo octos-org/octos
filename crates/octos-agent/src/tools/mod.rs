@@ -691,6 +691,7 @@ pub use robot_groups::{RobotToolRegistry, install_registry as install_robot_regi
 pub mod ssrf;
 
 // Built-in tools
+pub mod apply_patch;
 pub mod ask_user_question;
 pub mod coding_tools;
 pub mod deep_search;
@@ -738,12 +739,12 @@ pub mod git;
 #[cfg(feature = "ast")]
 pub mod code_structure;
 
+pub use apply_patch::ApplyPatchTool;
 pub use ask_user_question::AskUserQuestionTool;
 pub use coding_tools::{
-    ApplyPatchTool, BashTool, CloseAgentTool, DelegateAliasTool, ExecCommandTool,
-    ImageGenerationTool, RequestUserInputTool, ResumeAgentTool, SendInputTool, SpawnAgentTool,
-    ToolCatalogEntry, ToolSearchTool, ToolSuggestTool, UpdatePlanTool, ViewImageTool,
-    WaitAgentTool, WriteStdinTool,
+    BashTool, CloseAgentTool, DelegateAliasTool, ExecCommandTool, ImageGenerationTool,
+    RequestUserInputTool, ResumeAgentTool, SendInputTool, SpawnAgentTool, ToolCatalogEntry,
+    ToolSearchTool, ToolSuggestTool, UpdatePlanTool, ViewImageTool, WaitAgentTool, WriteStdinTool,
 };
 pub use deep_search::DeepSearchTool;
 pub use delegate::{

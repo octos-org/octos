@@ -192,10 +192,38 @@ struct Hunk {
     lines: Vec<DiffLine>,
 }
 
-enum DiffLine {
+/// One classified line of a unified-diff hunk body. Shared with the
+/// `apply_patch` tool so both editors parse and apply hunk bodies with the
+/// same semantics (#1773).
+#[derive(Debug)]
+pub(crate) enum DiffLine {
     Context(String),
     Remove(String),
     Add(String),
+}
+
+/// Context + Remove lines of a hunk body — the block that must match the
+/// current file content before the hunk may be applied.
+pub(crate) fn pattern_lines(lines: &[DiffLine]) -> Vec<&str> {
+    lines
+        .iter()
+        .filter_map(|l| match l {
+            DiffLine::Context(s) | DiffLine::Remove(s) => Some(s.as_str()),
+            DiffLine::Add(_) => None,
+        })
+        .collect()
+}
+
+/// Context + Add lines of a hunk body — the block that replaces the matched
+/// region.
+pub(crate) fn replacement_lines(lines: &[DiffLine]) -> Vec<String> {
+    lines
+        .iter()
+        .filter_map(|l| match l {
+            DiffLine::Context(s) | DiffLine::Add(s) => Some(s.clone()),
+            DiffLine::Remove(_) => None,
+        })
+        .collect()
 }
 
 fn parse_unified_diff(diff: &str) -> Result<Vec<Hunk>> {
@@ -272,12 +300,7 @@ fn apply_hunks(content: &str, hunks: &[Hunk]) -> Result<String> {
     for window in sorted_hunks.windows(2) {
         let (_, later_hunk) = window[0]; // higher line number
         let (_, earlier_hunk) = window[1]; // lower line number
-        let earlier_end = earlier_hunk.old_start
-            + earlier_hunk
-                .lines
-                .iter()
-                .filter(|l| matches!(l, DiffLine::Context(_) | DiffLine::Remove(_)))
-                .count();
+        let earlier_end = earlier_hunk.old_start + pattern_lines(&earlier_hunk.lines).len();
         if earlier_end > later_hunk.old_start {
             eyre::bail!(
                 "overlapping hunks at lines {} and {}",
@@ -288,15 +311,7 @@ fn apply_hunks(content: &str, hunks: &[Hunk]) -> Result<String> {
     }
 
     for (idx, hunk) in sorted_hunks {
-        let context_lines: Vec<&str> = hunk
-            .lines
-            .iter()
-            .filter_map(|l| match l {
-                DiffLine::Context(s) => Some(s.as_str()),
-                DiffLine::Remove(s) => Some(s.as_str()),
-                _ => None,
-            })
-            .collect();
+        let context_lines = pattern_lines(&hunk.lines);
 
         if context_lines.is_empty() {
             eyre::bail!("hunk {} has no context or remove lines", idx + 1);
@@ -306,21 +321,10 @@ fn apply_hunks(content: &str, hunks: &[Hunk]) -> Result<String> {
         let target = hunk.old_start.saturating_sub(1); // 1-indexed to 0-indexed
         let match_pos = find_match(&lines, &context_lines, target)?;
 
-        // Apply the hunk at match_pos
-        let remove_count = hunk
-            .lines
-            .iter()
-            .filter(|l| matches!(l, DiffLine::Context(_) | DiffLine::Remove(_)))
-            .count();
-
-        let new_lines: Vec<String> = hunk
-            .lines
-            .iter()
-            .filter_map(|l| match l {
-                DiffLine::Context(s) | DiffLine::Add(s) => Some(s.clone()),
-                DiffLine::Remove(_) => None,
-            })
-            .collect();
+        // Apply the hunk at match_pos: replace the matched pattern block with
+        // the replacement block.
+        let remove_count = context_lines.len();
+        let new_lines = replacement_lines(&hunk.lines);
 
         // Replace the matched region
         let end = (match_pos + remove_count).min(lines.len());
@@ -362,7 +366,10 @@ fn find_match(lines: &[String], pattern: &[&str], target: usize) -> Result<usize
     )
 }
 
-fn matches_at(lines: &[String], pattern: &[&str], start: usize) -> bool {
+/// Whether `pattern` matches `lines` starting at `start`, comparing with
+/// trailing whitespace ignored. Shared with the `apply_patch` tool's
+/// sequential hunk matcher (#1773).
+pub(crate) fn matches_at(lines: &[String], pattern: &[&str], start: usize) -> bool {
     if start + pattern.len() > lines.len() {
         return false;
     }
