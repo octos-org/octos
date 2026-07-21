@@ -152,6 +152,7 @@ The full CLI surface (see `octos help`):
 | `auth` / `account` / `admin` | provider login (OAuth/PKCE), sub-accounts, tenant & tunnel admin |
 | `channels` / `cron` / `skills` | messaging channels, scheduled jobs, skill install/remove |
 | `mcp-serve` | run octos as an MCP server, so outer orchestrators can drive it as a sub-agent |
+| `mcp` | `mcp login` / `logout` for OAuth-gated MCP servers octos connects to as a **client** (external MCP tools are declared in `config.json` → `mcp_servers`) |
 | `acp` | run octos as an [Agent Client Protocol](https://agentclientprotocol.com) agent over stdio, so editors like Zed drive it as their coding agent |
 | `office` | PPTX/DOCX/XLSX manipulation from the shell |
 | `update` / `clean` / `completions` / `docs` | release check, cache cleanup, shell completions, doc generation |
@@ -190,6 +191,14 @@ Interactive clients talk to `octos serve` over **UI Protocol v1** — a JSON-RPC
 - **[octos-web](https://github.com/octos-org/octos-web)** — the browser client: chat, voice/video, studio, slides, and sites. A build is embedded in the server binary at `/app/`, so `octos serve` works with zero extra deploys. (The admin dashboard is a separate SPA, embedded at `/admin/`.)
 - **[octos-tui](https://github.com/octos-org/octos-tui)** — the terminal client. Connects to a running server over WebSocket, or spawns `octos serve --stdio` as its own private backend.
 - **`octos mcp-serve`** — the inverse direction: octos as an MCP server, callable as a sub-agent from outer orchestrators.
+- **MCP client** — octos also *consumes* external MCP servers. Declare them in `config.json` under `mcp_servers` and any octos agent (`chat`, `serve`, `gateway`, `acp`) gains their tools in its own registry — stdio (`command` + `args`) or HTTP (`url`); run `octos mcp login <url>` for OAuth-gated servers.
+
+  ```json
+  "mcp_servers": [
+    { "command": "npx", "args": ["-y", "@modelcontextprotocol/server-filesystem", "/data"] },
+    { "url": "https://mcp.example.com/mcp", "oauth": true }
+  ]
+  ```
 - **`octos acp`** — the editor-facing direction: octos as an **[Agent Client Protocol](https://agentclientprotocol.com) (ACP)** agent over stdio, so ACP-speaking editors (Zed and others) run octos as their coding agent — with the **same capabilities as `octos chat`** (your tools + sandbox, long-term memory + `MEMORY.md`, skills/plugins, MCP, hooks, context compaction, provider failover). It appears in the editor's agent picker alongside Claude Code and Gemini CLI. See [Use octos in Zed](#use-octos-in-zed-acp).
 
 ### Use octos in Zed (ACP)
