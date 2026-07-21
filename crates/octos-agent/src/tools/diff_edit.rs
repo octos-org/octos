@@ -160,6 +160,15 @@ impl Tool for DiffEditTool {
             return Ok(super::file_io_error(e, &input.path));
         }
 
+        // #1774: opt-in post-edit formatting. Runs BEFORE cache invalidation
+        // and the git snapshot so both observe the final on-disk content.
+        // Best-effort by contract — a formatter failure never fails the edit.
+        let format_note = if ctx.format_after_edit {
+            crate::format::post_edit_format_note(&path, &new_content).await
+        } else {
+            None
+        };
+
         // M8.4: invalidate any stale cache entry — the file's contents and
         // mtime just changed.
         if let Some(cache) = ctx.file_state_cache.as_ref() {
@@ -177,7 +186,12 @@ impl Tool for DiffEditTool {
         }
 
         Ok(ToolResult {
-            output: format!("Applied {} hunk(s) to {}", hunks.len(), input.path),
+            output: format!(
+                "Applied {} hunk(s) to {}{}",
+                hunks.len(),
+                input.path,
+                format_note.unwrap_or_default()
+            ),
             success: true,
             file_modified: Some(path),
             ..Default::default()
@@ -447,6 +461,50 @@ mod tests {
         assert_eq!(hunks.len(), 2);
         let result = apply_hunks(content, &hunks).unwrap();
         assert_eq!(result, "A\nb\nc\nd\nE\nf\n");
+    }
+
+    // -----------------------------------------------------------------------
+    // #1774: post-edit formatting integration.
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn should_format_after_diff_edit_when_enabled() {
+        if !crate::format::binary_on_path("rustfmt") {
+            eprintln!("skipping: rustfmt not on PATH");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("lib.rs"), "fn a(){let x=1;}\n").unwrap();
+
+        let tool = DiffEditTool::new(dir.path());
+        let mut ctx = super::ToolContext::zero();
+        ctx.format_after_edit = true;
+
+        let result = tool
+            .execute_with_context(
+                &ctx,
+                &serde_json::json!({
+                    "path": "lib.rs",
+                    "diff": "@@ -1,1 +1,1 @@\n-fn a(){let x=1;}\n+fn a(){let x=2;}\n",
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(result.success, "diff must apply: {}", result.output);
+        assert!(
+            result.output.contains("reformatted"),
+            "output must state the file was reformatted: {}",
+            result.output
+        );
+        let on_disk = std::fs::read_to_string(dir.path().join("lib.rs")).unwrap();
+        assert!(
+            on_disk.contains("fn a() {"),
+            "file must be rustfmt-formatted on disk: {on_disk}"
+        );
+        assert!(
+            on_disk.contains("let x = 2;"),
+            "edit must survive: {on_disk}"
+        );
     }
 
     #[test]

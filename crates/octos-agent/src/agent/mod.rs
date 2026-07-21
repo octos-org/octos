@@ -119,6 +119,13 @@ pub struct AgentConfig {
     /// under [`octos_llm::LlmCallPolicy::FailFast`] (voice turns). Default 30s;
     /// env override `OCTOS_VOICE_LLM_DEADLINE_SECS`.
     pub voice_overall_deadline: std::time::Duration,
+    /// Post-edit formatting (issue #1774): when true, a successful
+    /// `edit_file` / `write_file` / `diff_edit` runs the file's language
+    /// formatter (rustfmt / prettier / black / gofmt — see [`crate::format`])
+    /// and echoes the formatted content back in the tool result. Best-effort:
+    /// missing binaries, failures, and timeouts never fail the edit. OFF by
+    /// default — opt in via `format_after_edit: true` in config.json.
+    pub format_after_edit: bool,
 }
 
 /// Default time-to-first-token grace for streaming LLM calls (180s).
@@ -205,6 +212,7 @@ impl Default for AgentConfig {
                 "OCTOS_VOICE_LLM_DEADLINE_SECS",
                 DEFAULT_VOICE_LLM_DEADLINE_SECS,
             ),
+            format_after_edit: false,
         }
     }
 }

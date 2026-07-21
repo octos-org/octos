@@ -239,6 +239,13 @@ pub struct ProfileRuntime {
     /// starved spawned sub-agents doing multi-step work).
     pub max_iterations: Option<u32>,
 
+    /// Post-edit formatting opt-in (`config.format_after_edit`, issue
+    /// #1774) that per-session agents inherit. When true, successful
+    /// `edit_file` / `write_file` / `diff_edit` calls run the file's
+    /// language formatter and echo the formatted content in the tool
+    /// result. Default: false.
+    pub format_after_edit: bool,
+
     /// The base [`ToolRegistry`] template — builtins + plugins +
     /// MCP agents + the LRU pin set — but **NOT** workspace-bound.
     /// Sessions clone this and call `with_workspace_root` to obtain
@@ -1118,6 +1125,7 @@ impl ProfileRuntime {
             tool_policy: config.tool_policy.clone(),
             default_sandbox,
             max_iterations: config.max_iterations,
+            format_after_edit: config.format_after_edit,
             tool_specs: Arc::new(tools),
             plugin_tool_names: plugin_result.tool_names.clone(),
             plugin_dirs,

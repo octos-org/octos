@@ -1186,6 +1186,8 @@ impl ChatCommand {
                 .effort
                 .map(octos_llm::ReasoningEffort::from)
                 .or_else(|| config.gateway.as_ref().and_then(|g| g.reasoning_effort)),
+            // #1774: opt-in post-edit formatting (rustfmt/prettier/black/gofmt).
+            format_after_edit: config.format_after_edit,
             ..Default::default()
         };
         // M8.2: load sub-agent manifests from `<cwd>/agents/` layered on

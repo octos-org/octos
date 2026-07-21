@@ -24,6 +24,7 @@ pub mod dispatch_policy;
 pub mod event_bus;
 pub mod exec_env;
 pub mod file_state_cache;
+pub mod format;
 pub mod harness_errors;
 pub mod harness_events;
 pub mod hooks;
