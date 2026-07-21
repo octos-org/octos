@@ -14,8 +14,11 @@
 //! of path → content), so intra-patch sequences like delete-then-add or
 //! add-then-update validate correctly. Only after the whole plan checks out
 //! are files written. If a write still fails mid-apply (e.g. a permissions
-//! race), the result reports exactly which section failed and which sections
-//! were already applied.
+//! race), the result reports exactly which section failed, which sections
+//! were already applied, and any partial state the failed section itself
+//! left behind (e.g. a move destination that was written before the source
+//! removal failed) — the output never claims an unchanged workspace when
+//! the failed section may have touched a file.
 //!
 //! # Path safety
 //!
@@ -217,10 +220,19 @@ impl ApplyPatchTool {
         };
 
         // Phase 2 — apply. Failures here are unexpected (the plan validated),
-        // but if one happens we report exactly what was already applied.
+        // but if one happens we report exactly what was already applied and
+        // any partial state the failed section itself left on disk.
         let (applied, failure) = self.apply_planned(ctx, &plan).await;
 
-        if let Some(first) = applied.first().and_then(|op| op.touched.first())
+        let snapshot_seed = applied
+            .first()
+            .and_then(|op| op.touched.first())
+            .or_else(|| {
+                failure
+                    .as_ref()
+                    .and_then(|f| f.partial.first().map(|p| &p.resolved))
+            });
+        if let Some(first) = snapshot_seed
             && let Err(error) = crate::workspace_git::snapshot_workspace_change(
                 &self.base_dir,
                 first,
@@ -234,23 +246,53 @@ impl ApplyPatchTool {
         }
 
         let previews: Vec<Value> = applied.iter().map(AppliedOp::preview_entry).collect();
-        let modified_paths: Vec<String> = applied.iter().map(|op| op.display.clone()).collect();
+        let mut modified_paths: Vec<String> = applied.iter().map(|op| op.display.clone()).collect();
         let file_modified = applied.first().and_then(|op| op.touched.first().cloned());
 
         if let Some(failure) = failure {
+            // Honesty invariant: never claim an untouched workspace when the
+            // failed section may have modified a file (a move that wrote its
+            // destination, or a truncate-in-place write that failed partway).
+            let partial_paths: Vec<String> =
+                failure.partial.iter().map(|p| p.display.clone()).collect();
+            for path in &partial_paths {
+                if !modified_paths.contains(path) {
+                    modified_paths.push(path.clone());
+                }
+            }
+            let file_modified =
+                file_modified.or_else(|| failure.partial.first().map(|p| p.resolved.clone()));
+
             let mut output = format!(
                 "Patch failed at section {} ({}): {}\n",
                 failure.section_no, failure.label, failure.error
             );
-            if applied.is_empty() {
+            if applied.is_empty() && failure.partial.is_empty() {
                 output.push_str("No sections were applied; the workspace is unchanged.");
             } else {
-                let summaries: Vec<String> = applied.iter().map(AppliedOp::summary).collect();
+                let mut state = Vec::new();
+                if !applied.is_empty() {
+                    let summaries: Vec<String> = applied.iter().map(AppliedOp::summary).collect();
+                    state.push(format!(
+                        "Already applied before the failure: {}.",
+                        summaries.join(", ")
+                    ));
+                }
+                if !failure.partial.is_empty() {
+                    let notes: Vec<String> = failure
+                        .partial
+                        .iter()
+                        .map(|p| format!("{} ({})", p.display, p.note))
+                        .collect();
+                    state.push(format!(
+                        "The failed section left partial state on disk: {}.",
+                        notes.join(", ")
+                    ));
+                }
                 output.push_str(&format!(
-                    "Already applied before the failure: {}.\n\
-                     Remaining sections were NOT applied — the workspace is \
+                    "{}\nRemaining sections were NOT applied — the workspace is \
                      partially patched; re-read the affected files before retrying.",
-                    summaries.join(", ")
+                    state.join(" ")
                 ));
             }
             return Ok(ToolResult {
@@ -261,6 +303,7 @@ impl ApplyPatchTool {
                     "codex_tool": "apply_patch",
                     "diff_preview": previews,
                     "modified_paths": modified_paths,
+                    "partial_paths": partial_paths,
                     "failed_section": failure.section_no,
                 })),
                 ..Default::default()
@@ -454,49 +497,75 @@ impl ApplyPatchTool {
                 PlannedChange::Move { from, to, .. } => vec![from.clone(), to.clone()],
             };
 
-            let outcome: Result<AppliedOp, String> = match &section.change {
-                PlannedChange::Write {
-                    path,
-                    display,
-                    content,
-                    op,
-                } => write_with_parents(path, content).await.map(|()| AppliedOp {
-                    op,
-                    display: display.clone(),
-                    from_display: None,
-                    touched: vec![path.clone()],
-                }),
-                PlannedChange::Remove { path, display } => tokio::fs::remove_file(path)
-                    .await
-                    .map_err(|e| format!("failed to delete file: {e}"))
-                    .map(|()| AppliedOp {
-                        op: "delete",
-                        display: display.clone(),
-                        from_display: None,
-                        touched: vec![path.clone()],
-                    }),
-                PlannedChange::Move {
-                    from,
-                    from_display,
-                    to,
-                    to_display,
-                    content,
-                } => {
-                    async {
-                        write_with_parents(to, content).await?;
-                        tokio::fs::remove_file(from).await.map_err(|e| {
-                            format!("wrote {to_display} but failed to remove {from_display}: {e}")
-                        })?;
-                        Ok(AppliedOp {
-                            op: "move",
-                            display: to_display.clone(),
-                            from_display: Some(from_display.clone()),
-                            touched: vec![from.clone(), to.clone()],
+            let outcome: Result<AppliedOp, SectionFailure> =
+                match &section.change {
+                    PlannedChange::Write {
+                        path,
+                        display,
+                        content,
+                        op,
+                    } => write_with_parents(path, content)
+                        .await
+                        .map(|()| AppliedOp {
+                            op,
+                            display: display.clone(),
+                            from_display: None,
+                            touched: vec![path.clone()],
                         })
+                        .map_err(|failure| SectionFailure {
+                            partial: write_failure_partial(&failure, display, path),
+                            error: failure.into_message(),
+                        }),
+                    PlannedChange::Remove { path, display } => tokio::fs::remove_file(path)
+                        .await
+                        .map_err(|e| SectionFailure {
+                            error: format!("failed to delete file: {e}"),
+                            // A failed unlink leaves the file as it was.
+                            partial: Vec::new(),
+                        })
+                        .map(|()| AppliedOp {
+                            op: "delete",
+                            display: display.clone(),
+                            from_display: None,
+                            touched: vec![path.clone()],
+                        }),
+                    PlannedChange::Move {
+                        from,
+                        from_display,
+                        to,
+                        to_display,
+                        content,
+                    } => {
+                        async {
+                            write_with_parents(to, content).await.map_err(|failure| {
+                                SectionFailure {
+                                    partial: write_failure_partial(&failure, to_display, to),
+                                    error: failure.into_message(),
+                                }
+                            })?;
+                            tokio::fs::remove_file(from).await.map_err(|e| SectionFailure {
+                            error: format!(
+                                "wrote {to_display} but failed to remove {from_display}: {e}"
+                            ),
+                            // The destination fully exists even though the
+                            // section did not complete — report it so the
+                            // result never claims an unchanged workspace.
+                            partial: vec![PartialPath {
+                                display: to_display.clone(),
+                                resolved: to.clone(),
+                                note: PARTIAL_WRITTEN,
+                            }],
+                        })?;
+                            Ok(AppliedOp {
+                                op: "move",
+                                display: to_display.clone(),
+                                from_display: Some(from_display.clone()),
+                                touched: vec![from.clone(), to.clone()],
+                            })
+                        }
+                        .await
                     }
-                    .await
-                }
-            };
+                };
 
             if let Some(cache) = ctx.file_state_cache.as_ref() {
                 for path in &candidates {
@@ -506,13 +575,14 @@ impl ApplyPatchTool {
 
             match outcome {
                 Ok(op) => applied.push(op),
-                Err(error) => {
+                Err(SectionFailure { error, partial }) => {
                     return (
                         applied,
                         Some(ApplyFailure {
                             section_no: section.section_no,
                             label: section.label.clone(),
                             error,
+                            partial,
                         }),
                     );
                 }
@@ -561,17 +631,50 @@ async fn overlay_entry_exists(
     Ok(!matches!(disk_entry(path).await?, DiskEntry::Absent))
 }
 
+/// Failure from [`write_with_parents`], distinguishing whether the target
+/// file itself may have been touched (drives partial-state reporting).
+enum WriteFailure {
+    /// Parent-directory creation failed — the target file was NOT touched.
+    Parents(String),
+    /// The `O_NOFOLLOW` write failed. The writer opens with truncate, so the
+    /// target may have been created, truncated, or partially written before
+    /// the error.
+    Write(String),
+}
+
+impl WriteFailure {
+    fn into_message(self) -> String {
+        match self {
+            WriteFailure::Parents(message) | WriteFailure::Write(message) => message,
+        }
+    }
+}
+
+/// Partial-state entries for a failed [`write_with_parents`] call: a failed
+/// parent mkdir touched nothing, but a failed write may have left the target
+/// created, truncated, or partially written.
+fn write_failure_partial(failure: &WriteFailure, display: &str, path: &Path) -> Vec<PartialPath> {
+    match failure {
+        WriteFailure::Parents(_) => Vec::new(),
+        WriteFailure::Write(_) => vec![PartialPath {
+            display: display.to_string(),
+            resolved: path.to_path_buf(),
+            note: PARTIAL_UNKNOWN,
+        }],
+    }
+}
+
 /// Create parent directories and write `content` through the shared
 /// `O_NOFOLLOW` writer.
-async fn write_with_parents(path: &Path, content: &str) -> Result<(), String> {
+async fn write_with_parents(path: &Path, content: &str) -> Result<(), WriteFailure> {
     if let Some(parent) = path.parent() {
-        tokio::fs::create_dir_all(parent)
-            .await
-            .map_err(|e| format!("failed to create parent directories: {e}"))?;
+        tokio::fs::create_dir_all(parent).await.map_err(|e| {
+            WriteFailure::Parents(format!("failed to create parent directories: {e}"))
+        })?;
     }
     super::write_no_follow(path, content.as_bytes())
         .await
-        .map_err(|e| format!("failed to write file: {e}"))
+        .map_err(|e| WriteFailure::Write(format!("failed to write file: {e}")))
 }
 
 // ---------------------------------------------------------------------------
@@ -692,10 +795,37 @@ impl AppliedOp {
     }
 }
 
+/// State note for a [`PartialPath`]: the content was fully written (a move
+/// destination whose source removal then failed).
+const PARTIAL_WRITTEN: &str = "written";
+/// State note for a [`PartialPath`]: the truncate-in-place write failed
+/// partway, so the on-disk state is unknown.
+const PARTIAL_UNKNOWN: &str = "may have been created, truncated, or partially written";
+
+/// A path the FAILED section may already have modified on disk before the
+/// failure. Reported so the result never claims an untouched workspace.
+struct PartialPath {
+    /// Workspace-relative display path.
+    display: String,
+    /// Resolved on-disk path.
+    resolved: PathBuf,
+    /// Honest state description ([`PARTIAL_WRITTEN`] / [`PARTIAL_UNKNOWN`]).
+    note: &'static str,
+}
+
+/// Failure of one section during the apply phase.
+struct SectionFailure {
+    error: String,
+    /// Paths the failed section may have modified before failing.
+    partial: Vec<PartialPath>,
+}
+
 struct ApplyFailure {
     section_no: usize,
     label: String,
     error: String,
+    /// Paths the failed section may have modified before failing.
+    partial: Vec<PartialPath>,
 }
 
 // ---------------------------------------------------------------------------
@@ -906,6 +1036,21 @@ fn parse_patch_envelope(input: &str) -> Result<Vec<PatchOp>, String> {
                     }
                 }
                 Section::Update { hunks, .. } => {
+                    // `*** End of File` pins the last hunk to the end of the
+                    // file and closes the section's hunks — silently
+                    // appending later body lines to it would corrupt its
+                    // match semantics. Only blank separator lines and new
+                    // '*** ' directives may follow.
+                    if hunks.last().is_some_and(|h| h.at_eof) {
+                        if line.trim().is_empty() {
+                            continue;
+                        }
+                        return Err(format!(
+                            "line {line_no}: content after '*** End of File' in an \
+                             '*** Update File:' section ('*** End of File' closes the \
+                             section's hunks; only a new '*** ' directive may follow)"
+                        ));
+                    }
                     if let Some(rest) = line.strip_prefix("@@") {
                         hunks.push(UpdateHunk {
                             anchor: normalize_hunk_anchor(rest),
@@ -1075,6 +1220,15 @@ mod tests {
             .expect("apply_patch execute")
     }
 
+    /// Parse an envelope whose first section is an Update and return its hunks.
+    fn parse_update_hunks(patch: &str) -> Vec<UpdateHunk> {
+        let mut ops = parse_patch_envelope(patch).expect("valid envelope");
+        match ops.remove(0) {
+            PatchOp::Update { hunks, .. } => hunks,
+            other => panic!("expected Update, got {other:?}"),
+        }
+    }
+
     // -- Metadata ----------------------------------------------------------
 
     #[test]
@@ -1217,6 +1371,39 @@ mod tests {
         }
     }
 
+    #[test]
+    fn should_reject_content_after_end_of_file_marker() {
+        // A body line silently appended to the EOF-pinned hunk would corrupt
+        // its match-at-end semantics — it must be a parse error instead.
+        let err = parse_patch_envelope(
+            "*** Begin Patch\n*** Update File: f\n@@\n+tail\n*** End of File\n+stray\n*** End Patch\n",
+        )
+        .expect_err("body line after '*** End of File' must be rejected");
+        assert!(err.contains("line 6"), "got: {err}");
+        assert!(err.contains("End of File"), "got: {err}");
+
+        // Same for a new `@@` hunk: nothing can match after the end of file.
+        let err = parse_patch_envelope(
+            "*** Begin Patch\n*** Update File: f\n@@\n+tail\n*** End of File\n@@ more\n-x\n+y\n*** End Patch\n",
+        )
+        .expect_err("new hunk after '*** End of File' must be rejected");
+        assert!(err.contains("End of File"), "got: {err}");
+    }
+
+    #[test]
+    fn should_tolerate_blank_line_after_end_of_file_marker() {
+        let hunks = parse_update_hunks(
+            "*** Begin Patch\n*** Update File: f\n@@\n+tail\n*** End of File\n\n*** End Patch\n",
+        );
+        assert_eq!(hunks.len(), 1);
+        assert!(hunks[0].at_eof);
+        assert_eq!(
+            hunks[0].lines.len(),
+            1,
+            "blank separator must not append a context line to the EOF hunk"
+        );
+    }
+
     // -- Hunk application --------------------------------------------------
 
     #[test]
@@ -1272,6 +1459,66 @@ mod tests {
         let err = apply_codex_hunks("a\nb\n", hunks).expect_err("must fail to locate");
         assert!(err.contains("hunk 1"), "got: {err}");
         assert!(err.contains("not there"), "got: {err}");
+    }
+
+    #[test]
+    fn should_reject_pure_insertion_when_no_context_and_file_nonempty() {
+        // The common model-emitted shape "add an import": a bare '+' hunk
+        // with no '@@' anchor and no '*** End of File'. Against a non-empty
+        // file the position is ambiguous — this implementation deliberately
+        // rejects it with guidance instead of guessing.
+        let hunks =
+            parse_update_hunks("*** Begin Patch\n*** Update File: f\n+import os\n*** End Patch\n");
+        let err =
+            apply_codex_hunks("a\nb\n", &hunks).expect_err("ambiguous insertion must be rejected");
+        assert!(err.contains("hunk 1 has no context lines"), "got: {err}");
+        assert!(err.contains("@@ <anchor>"), "got: {err}");
+        assert!(err.contains("End of File"), "got: {err}");
+    }
+
+    #[test]
+    fn should_insert_after_anchor_when_hunk_is_pure_insertion() {
+        let hunks = parse_update_hunks(
+            "*** Begin Patch\n*** Update File: f\n@@ two\n+two.5\n*** End Patch\n",
+        );
+        let out = apply_codex_hunks("one\ntwo\nthree\n", &hunks).expect("hunks apply");
+        assert_eq!(out, "one\ntwo\ntwo.5\nthree\n");
+    }
+
+    #[test]
+    fn should_insert_at_start_when_pure_insertion_targets_empty_file() {
+        let hunks = parse_update_hunks(
+            "*** Begin Patch\n*** Update File: f\n@@\n+first\n+second\n*** End Patch\n",
+        );
+        let out = apply_codex_hunks("", &hunks).expect("hunks apply");
+        assert_eq!(out, "first\nsecond");
+    }
+
+    #[test]
+    fn should_error_with_search_start_when_anchor_not_found() {
+        let hunks = parse_update_hunks(
+            "*** Begin Patch\n*** Update File: f\n@@\n-a\n+A\n@@ missing anchor\n-b\n+B\n*** End Patch\n",
+        );
+        let err = apply_codex_hunks("a\nb\n", &hunks).expect_err("anchor must not be found");
+        assert!(err.contains("hunk 2"), "got: {err}");
+        assert!(
+            err.contains("context marker '@@ missing anchor' not found"),
+            "got: {err}"
+        );
+        // Hunk 1 consumed line 1, so the anchor search starts at line 2.
+        assert!(err.contains("searched from line 2"), "got: {err}");
+    }
+
+    #[test]
+    fn should_match_anchor_when_indentation_drifts() {
+        // The anchor in the patch lacks the file's leading indentation — the
+        // fully-trimmed fallback comparison must still locate the line.
+        let content = "class A:\n    def greet(self):\n        pass\n";
+        let hunks = parse_update_hunks(
+            "*** Begin Patch\n*** Update File: f\n@@ def greet(self):\n-        pass\n+        return 1\n*** End Patch\n",
+        );
+        let out = apply_codex_hunks(content, &hunks).expect("trimmed anchor fallback must match");
+        assert_eq!(out, "class A:\n    def greet(self):\n        return 1\n");
     }
 
     // -- Tool end-to-end ---------------------------------------------------
@@ -1704,6 +1951,115 @@ mod tests {
         let meta = result.structured_metadata.as_ref().expect("metadata");
         assert_eq!(meta["failed_section"], json!(2));
         assert_eq!(meta["modified_paths"], json!(["ok.txt"]));
+        assert_eq!(meta["partial_paths"], json!([]));
+    }
+
+    #[tokio::test]
+    async fn should_report_unchanged_when_first_section_fails_cleanly() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        // `blocker` is a regular file, so validation passes (stat of
+        // blocker/child.txt ⇒ absent) but the apply-phase create_dir_all
+        // fails BEFORE the target file could be touched — a genuinely clean
+        // first-section failure.
+        std::fs::write(temp.path().join("blocker"), "i am a file\n").unwrap();
+        let tool = ApplyPatchTool::new(temp.path());
+        let result = run(
+            &tool,
+            "*** Begin Patch\n*** Add File: blocker/child.txt\n+never lands\n*** End Patch\n",
+        )
+        .await;
+        assert!(!result.success);
+        assert!(
+            result.output.contains("Patch failed at section 1"),
+            "{}",
+            result.output
+        );
+        assert!(
+            result
+                .output
+                .contains("No sections were applied; the workspace is unchanged."),
+            "{}",
+            result.output
+        );
+        assert!(result.file_modified.is_none());
+        let meta = result.structured_metadata.as_ref().expect("metadata");
+        assert_eq!(meta["failed_section"], json!(1));
+        assert_eq!(meta["modified_paths"], json!([]));
+        assert_eq!(meta["partial_paths"], json!([]));
+    }
+
+    /// Honesty on the Move partial-state shape: the destination was written
+    /// but the source removal failed. The result must NOT claim an unchanged
+    /// workspace, and `modified_paths` must list the created file.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn should_report_partial_move_when_source_removal_fails() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let locked = temp.path().join("locked");
+        std::fs::create_dir(&locked).unwrap();
+        std::fs::write(locked.join("src.txt"), "body\n").unwrap();
+        // Read-only directory: validation can still read the source and the
+        // apply phase can write the destination (workspace root), but
+        // unlinking the source fails.
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o555)).unwrap();
+        if std::fs::write(locked.join("probe.tmp"), b"x").is_ok() {
+            // Running as root (or an ACL overrides the mode bits) — the
+            // setup cannot force the removal failure; skip.
+            let _ = std::fs::remove_file(locked.join("probe.tmp"));
+            std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+            return;
+        }
+
+        let tool = ApplyPatchTool::new(temp.path());
+        let result = run(
+            &tool,
+            "*** Begin Patch\n*** Update File: locked/src.txt\n*** Move to: dest.txt\n*** End Patch\n",
+        )
+        .await;
+
+        // Restore permissions so the tempdir can clean up.
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert!(!result.success);
+        assert!(
+            result.output.contains("Patch failed at section 1"),
+            "{}",
+            result.output
+        );
+        assert!(
+            result
+                .output
+                .contains("wrote dest.txt but failed to remove locked/src.txt"),
+            "{}",
+            result.output
+        );
+        // The destination really exists — partial state, honestly reported.
+        assert_eq!(
+            std::fs::read_to_string(temp.path().join("dest.txt")).expect("dest was written"),
+            "body\n"
+        );
+        assert!(
+            !result.output.contains("workspace is unchanged"),
+            "must not claim an unchanged workspace: {}",
+            result.output
+        );
+        assert!(
+            result
+                .output
+                .contains("The failed section left partial state on disk: dest.txt (written)"),
+            "{}",
+            result.output
+        );
+        assert_eq!(
+            result.file_modified.as_deref(),
+            Some(temp.path().join("dest.txt").as_path())
+        );
+        let meta = result.structured_metadata.as_ref().expect("metadata");
+        assert_eq!(meta["failed_section"], json!(1));
+        assert_eq!(meta["modified_paths"], json!(["dest.txt"]));
+        assert_eq!(meta["partial_paths"], json!(["dest.txt"]));
     }
 
     // -- Modes and fallbacks ----------------------------------------------
