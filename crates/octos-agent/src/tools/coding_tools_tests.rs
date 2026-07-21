@@ -115,51 +115,8 @@ fn builtins_expose_codex_p0_tool_names() {
     }
 }
 
-/// #972 / M14-B acceptance: `apply_patch` MUST produce a diff
-/// preview compatible with the AppUI diff flow. The contract is a
-/// `structured_metadata` envelope with `codex_tool = "apply_patch"`,
-/// a `diff_preview` array of `{ op, path }` entries (one per parsed
-/// patch section), and a flat `modified_paths` list the diff panel
-/// can render without re-parsing the patch envelope.
-#[tokio::test]
-async fn apply_patch_emits_diff_preview_structured_metadata() {
-    use std::path::PathBuf;
-    let temp = tempfile::tempdir().expect("tempdir");
-    let workspace: PathBuf = temp.path().to_path_buf();
-    let tool = ApplyPatchTool::new(workspace.clone());
-    // Add a fresh file via the Codex patch envelope.
-    let patch = concat!(
-        "*** Begin Patch\n",
-        "*** Add File: hello.txt\n",
-        "+hello\n",
-        "+world\n",
-        "*** End Patch\n",
-    );
-    let result = tool
-        .execute(&json!({ "patch": patch }))
-        .await
-        .expect("apply_patch ok");
-    assert!(result.success, "apply_patch must succeed on Add File");
-    let meta = result
-        .structured_metadata
-        .as_ref()
-        .expect("apply_patch must emit structured_metadata");
-    assert_eq!(meta["codex_tool"], json!("apply_patch"));
-    assert_eq!(meta["modified_paths"], json!(["hello.txt"]));
-    let preview = meta["diff_preview"]
-        .as_array()
-        .expect("diff_preview must be an array");
-    assert_eq!(preview.len(), 1);
-    assert_eq!(preview[0]["op"], json!("add"));
-    assert_eq!(preview[0]["path"], json!("hello.txt"));
-    // Sanity: the file we asked for actually exists with the
-    // intended content (this also guards against the metadata
-    // claim drifting from the underlying write).
-    let contents = std::fs::read_to_string(workspace.join("hello.txt"))
-        .expect("created file must be readable");
-    assert!(contents.contains("hello"));
-    assert!(contents.contains("world"));
-}
+// NOTE (#1773): `apply_patch_emits_diff_preview_structured_metadata` moved to
+// `crate::tools::apply_patch::tests` alongside the relocated tool.
 
 /// #972 / M14-B acceptance: `update_plan` MUST generate a structured
 /// UI event so the AppUI layer can render the plan card without
@@ -1429,38 +1386,8 @@ async fn codex_agent_aliases_operate_on_supervisor_state() {
     assert_eq!(closed_task.status, crate::TaskStatus::Cancelled);
 }
 
-#[tokio::test]
-async fn apply_patch_adds_and_updates_file() {
-    let temp = tempfile::tempdir().expect("tempdir");
-    let tool = ApplyPatchTool::new(temp.path());
-    let add = tool
-        .execute(&json!({
-            "patch": "*** Begin Patch\n*** Add File: demo.txt\n+hello\n+world\n*** End Patch\n"
-        }))
-        .await
-        .expect("apply add");
-    assert!(add.success, "{}", add.output);
-    assert_eq!(
-        tokio::fs::read_to_string(temp.path().join("demo.txt"))
-            .await
-            .expect("read added"),
-        "hello\nworld"
-    );
-
-    let update = tool
-            .execute(&json!({
-                "patch": "*** Begin Patch\n*** Update File: demo.txt\n@@\n hello\n-world\n+codex\n*** End Patch\n"
-            }))
-            .await
-            .expect("apply update");
-    assert!(update.success, "{}", update.output);
-    assert_eq!(
-        tokio::fs::read_to_string(temp.path().join("demo.txt"))
-            .await
-            .expect("read updated"),
-        "hello\ncodex"
-    );
-}
+// NOTE (#1773): `apply_patch_adds_and_updates_file` moved to
+// `crate::tools::apply_patch::tests` alongside the relocated tool.
 
 #[tokio::test]
 async fn exec_command_runs_to_completion() {
