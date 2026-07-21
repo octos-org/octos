@@ -182,6 +182,47 @@ pub enum ChatSandboxMode {
     DangerFullAccess,
 }
 
+/// Host-managed paths used by a chat session.
+///
+/// `--sandbox read-only` constrains both agent tools and Octos's own startup
+/// work: bundled-skill bootstrap and spawned-worker deliverables must not
+/// create `cwd/.octos`. Existing project state remains readable for local
+/// plugins and bootstrap prompt files.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ChatRuntimePaths {
+    /// Existing workspace-local state, read-only in a read-only session.
+    project_dir: PathBuf,
+    /// Root for host-generated bundled skills.
+    bootstrap_dir: PathBuf,
+    /// Per-chat root for spawn deliverables.
+    spawn_deliverable_dir: PathBuf,
+}
+
+fn resolve_chat_runtime_paths(
+    cwd: &std::path::Path,
+    data_dir: &std::path::Path,
+    permissions: octos_agent::EffectivePermissions,
+    run_id: &str,
+) -> ChatRuntimePaths {
+    let project_dir = cwd.join(".octos");
+    if permissions.file_access.allows_write() {
+        return ChatRuntimePaths {
+            bootstrap_dir: project_dir.clone(),
+            spawn_deliverable_dir: project_dir.join("spawn-deliverables"),
+            project_dir,
+        };
+    }
+
+    let runtime_dir = data_dir.join("runtime");
+    ChatRuntimePaths {
+        project_dir,
+        bootstrap_dir: runtime_dir.clone(),
+        // Worker ids restart at `subagent-0` in every chat process, so the
+        // run id keeps concurrent read-only reviews from clobbering outputs.
+        spawn_deliverable_dir: runtime_dir.join("spawn-deliverables").join(run_id),
+    }
+}
+
 /// `--ask-for-approval` choices, mirroring codex.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -914,6 +955,12 @@ impl ChatCommand {
             self.sandbox,
             self.ask_for_approval,
         )?;
+        let runtime_paths = resolve_chat_runtime_paths(
+            &cwd,
+            &data_dir,
+            permissions,
+            &uuid::Uuid::now_v7().to_string(),
+        );
         if permissions.is_dangerous() {
             // Codex-style one-line RED warning on stderr.
             eprintln!(
@@ -963,11 +1010,16 @@ impl ChatCommand {
         let mut spawn_tool =
             octos_agent::SpawnTool::new(llm.clone(), memory.clone(), cwd.clone(), spawn_tx)
                 .with_worker_prompt(worker_prompt)
+                .with_workspace_write_access(permissions.file_access.allows_write())
                 // #1607 (codex-review follow-up): thread the same sandbox the
                 // parent registry was built from so the spawn/agent_mcp child
                 // completion path confines workspace-declared `Command`
                 // validators instead of running them on the host.
                 .with_sandbox(effective_sandbox_config.clone());
+        if !permissions.file_access.allows_write() {
+            spawn_tool =
+                spawn_tool.with_deliverable_root(runtime_paths.spawn_deliverable_dir.clone());
+        }
         if let Some(ref embedder) = embedder {
             // Workers save episodes by default; without the embedder those
             // episodes are stored vectorless and worker recall skips.
@@ -1005,13 +1057,13 @@ impl ChatCommand {
         }
 
         // Bootstrap bundled app-skill binaries (deep_search, deep_crawl, etc.)
-        // Must happen BEFORE plugin loading so PluginLoader picks them up.
-        let project_dir = cwd.join(".octos");
-        let n = octos_agent::bootstrap::bootstrap_bundled_skills(&project_dir);
+        // before plugin loading. In a read-only chat this targets the data-dir
+        // runtime root; the workspace's existing `.octos` remains read-only.
+        let n = octos_agent::bootstrap::bootstrap_bundled_skills(&runtime_paths.bootstrap_dir);
         if n > 0 {
             eprintln!("Bootstrapped {n} app-skills");
         }
-        let n = octos_agent::bootstrap::bootstrap_platform_skills(&project_dir);
+        let n = octos_agent::bootstrap::bootstrap_platform_skills(&runtime_paths.bootstrap_dir);
         if n > 0 {
             eprintln!("Bootstrapped {n} platform skills");
         }
@@ -1027,11 +1079,18 @@ impl ChatCommand {
             eprintln!("Bootstrapped {n} bundled pipelines");
         }
 
-        // Load plugins (includes app-skills from .octos/skills/).
+        // Load existing project plugins plus bundled skills from the host
+        // runtime root. Preserve project precedence so an operator-installed
+        // skill still wins over an Octos bundled fallback.
         // Section B (codex review P1.1): honour `plugins.require_signed`
         // from the resolved Config so an operator who opts into strict
         // signing has it enforced on `octos chat` too.
-        let plugin_dirs = Config::plugin_dirs_from_project(&cwd.join(".octos"));
+        let mut plugin_dirs = Config::plugin_dirs_from_project(&runtime_paths.project_dir);
+        for runtime_dir in Config::plugin_dirs_from_project(&runtime_paths.bootstrap_dir) {
+            if !plugin_dirs.contains(&runtime_dir) {
+                plugin_dirs.push(runtime_dir);
+            }
+        }
         let mut plugin_result = octos_agent::PluginLoadResult::default();
         if !plugin_dirs.is_empty() {
             match octos_agent::PluginLoader::load_into_with_options(
@@ -1346,9 +1405,9 @@ impl ChatCommand {
             }
         }
 
-        // Load bootstrap files (AGENTS.md, SOUL.md, etc.) from project .octos/ directory
-        let project_dir = cwd.join(".octos");
-        let bootstrap = super::load_bootstrap_files(&project_dir);
+        // Load operator-provided bootstrap files from the project state. The
+        // runtime bootstrap root only holds generated bundled skills.
+        let bootstrap = super::load_bootstrap_files(&runtime_paths.project_dir);
         if !bootstrap.is_empty() {
             agent.append_system_prompt(&bootstrap);
         }
@@ -1819,6 +1878,43 @@ pub(crate) fn build_run_pipeline_tool(
 #[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn read_only_runtime_paths_keep_host_state_outside_workspace() {
+        let workspace = PathBuf::from("/tmp/workspace");
+        let data_dir = PathBuf::from("/tmp/octos-data");
+        let permissions =
+            resolve_chat_permissions(false, Some(ChatSandboxMode::ReadOnly), None).unwrap();
+
+        let paths = resolve_chat_runtime_paths(&workspace, &data_dir, permissions, "run-123");
+
+        assert_eq!(paths.project_dir, workspace.join(".octos"));
+        assert_eq!(paths.bootstrap_dir, data_dir.join("runtime"));
+        assert_eq!(
+            paths.spawn_deliverable_dir,
+            data_dir
+                .join("runtime")
+                .join("spawn-deliverables")
+                .join("run-123")
+        );
+    }
+
+    #[test]
+    fn workspace_write_runtime_paths_preserve_project_state_locations() {
+        let workspace = PathBuf::from("/tmp/workspace");
+        let data_dir = PathBuf::from("/tmp/octos-data");
+        let permissions =
+            resolve_chat_permissions(false, Some(ChatSandboxMode::WorkspaceWrite), None).unwrap();
+
+        let paths = resolve_chat_runtime_paths(&workspace, &data_dir, permissions, "run-123");
+
+        assert_eq!(paths.project_dir, workspace.join(".octos"));
+        assert_eq!(paths.bootstrap_dir, workspace.join(".octos"));
+        assert_eq!(
+            paths.spawn_deliverable_dir,
+            workspace.join(".octos").join("spawn-deliverables")
+        );
+    }
 
     #[test]
     fn chat_profile_loads_llm_config_from_stored_serve_profile() {

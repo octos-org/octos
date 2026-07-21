@@ -1051,6 +1051,14 @@ pub struct SpawnTool {
     /// argv directly there — behaviour is unchanged on hosts without a real
     /// backend.
     sandbox: SandboxConfig,
+    /// Optional host-owned root for spawned-worker deliverables. When absent,
+    /// retain the legacy `<working_dir>/.octos/spawn-deliverables` location.
+    deliverable_root: Option<PathBuf>,
+    /// Whether Octos itself may create workspace-local state such as a git
+    /// worktree. Agent file access is enforced elsewhere; this covers the
+    /// host-side control plane so a read-only session cannot create
+    /// `.octos/work` before a tool sandbox applies.
+    workspace_write_access: bool,
 }
 
 impl SpawnTool {
@@ -1092,6 +1100,8 @@ impl SpawnTool {
             child_prompt_context_manager_factory: None,
             dispatch_policy: None,
             sandbox: SandboxConfig::default(),
+            deliverable_root: None,
+            workspace_write_access: true,
         }
     }
 
@@ -1136,6 +1146,8 @@ impl SpawnTool {
             child_prompt_context_manager_factory: None,
             dispatch_policy: None,
             sandbox: SandboxConfig::default(),
+            deliverable_root: None,
+            workspace_write_access: true,
         }
     }
 
@@ -1156,7 +1168,7 @@ impl SpawnTool {
     /// works identically at each level; `worker_count` restarts at 0 because
     /// each instance numbers only its own direct children, and `origin` is
     /// snapshotted from the parent's current value.
-    fn child_spawn_clone(&self, working_dir: PathBuf) -> SpawnTool {
+    fn child_spawn_clone(&self, working_dir: PathBuf, child_id: &AgentId) -> SpawnTool {
         SpawnTool {
             llm: self.llm.clone(),
             memory: self.memory.clone(),
@@ -1208,6 +1220,13 @@ impl SpawnTool {
             // `ctx.task_supervisor` a nested `spawn_agent` reads. See the two
             // registration sites in `execute_with_context`.
             sandbox: self.sandbox.clone(),
+            // A child starts its direct worker numbering at `subagent-0`, so
+            // give nested spawns a distinct descendant root.
+            deliverable_root: self
+                .deliverable_root
+                .as_ref()
+                .map(|root| root.join(child_id.to_string()).join("children")),
+            workspace_write_access: self.workspace_write_access,
         }
     }
 
@@ -1253,6 +1272,30 @@ impl SpawnTool {
     pub fn with_sandbox(mut self, sandbox: SandboxConfig) -> Self {
         self.sandbox = sandbox;
         self
+    }
+
+    /// Direct host-created deliverables outside the agent workspace. This is
+    /// used by read-only chat sessions so Octos bookkeeping cannot create a
+    /// `.octos` directory in the reviewed repository.
+    pub fn with_deliverable_root(mut self, root: PathBuf) -> Self {
+        self.deliverable_root = Some(root);
+        self
+    }
+
+    /// Control host-side workspace state such as git worktree allocation.
+    /// This must track the parent session's file-write capability; it is
+    /// separate from the child tool sandbox because allocation happens before
+    /// the child registry exists.
+    pub fn with_workspace_write_access(mut self, allowed: bool) -> Self {
+        self.workspace_write_access = allowed;
+        self
+    }
+
+    fn deliverable_output_dir(&self, worker_id: &AgentId) -> PathBuf {
+        self.deliverable_root
+            .clone()
+            .unwrap_or_else(|| self.working_dir.join(".octos").join("spawn-deliverables"))
+            .join(worker_id.to_string())
     }
 
     /// Set a provider router for multi-model sub-agent support.
@@ -3524,6 +3567,13 @@ impl Tool for SpawnTool {
         let (mut worker_worktree_guard, child_session_scope) = match input.isolation {
             WorkerIsolation::Shared => (None, ctx.session_scope.clone()),
             WorkerIsolation::Worktree => {
+                if !self.workspace_write_access {
+                    return Ok(ToolResult {
+                        output: "Status: FAILED\nworktree isolation is unavailable in a read-only workspace; use shared isolation for a review-only worker".to_string(),
+                        success: false,
+                        ..Default::default()
+                    });
+                }
                 match allocate_worker_worktree(
                     &self.working_dir,
                     &worker_id,
@@ -3561,11 +3611,7 @@ impl Tool for SpawnTool {
         }
         let child_working_dir = match deliverable_glob.as_deref() {
             Some(glob) => {
-                let out = self
-                    .working_dir
-                    .join(".octos")
-                    .join("spawn-deliverables")
-                    .join(worker_id.to_string());
+                let out = self.deliverable_output_dir(&worker_id);
                 // worker_id ("subagent-N") can repeat across turns, so start
                 // from a clean directory — otherwise a stale deliverable from a
                 // prior run would be surfaced (the output dir has no mtime
@@ -3682,7 +3728,7 @@ impl Tool for SpawnTool {
             // fan-out cap is per-subtree, not global. The grandchild's RESULT
             // still flows back via the inherited result sender / inline
             // output; only its task-tracking row stays subtree-local.
-            let mut child_spawn = self.child_spawn_clone(child_working_dir.clone());
+            let mut child_spawn = self.child_spawn_clone(child_working_dir.clone(), &worker_id);
             child_spawn.task_supervisor = Some(tools.supervisor());
             tools.register(child_spawn);
             // In subagent context, spawn_only tools should be regular tools —
@@ -4055,7 +4101,8 @@ impl Tool for SpawnTool {
             // delegate-less builtin. Kept concrete (not `Arc<dyn Tool>`) so the
             // closure can align its supervisor with the child registry before
             // registering (see the sync-path rationale).
-            let child_spawn_template = self.child_spawn_clone(child_working_dir.clone());
+            let child_spawn_template =
+                self.child_spawn_clone(child_working_dir.clone(), &worker_id);
             let task_supervisor = self.task_supervisor.clone();
             let worker_config = self.worker_config.clone();
             let worker_embedder = self.embedder.clone();

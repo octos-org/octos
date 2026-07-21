@@ -366,6 +366,8 @@ async fn test_spawn_returns_immediately() {
             mode: crate::sandbox::SandboxMode::None,
             ..SandboxConfig::default()
         },
+        deliverable_root: None,
+        workspace_write_access: true,
     };
 
     assert_eq!(tool.worker_count.load(Ordering::SeqCst), 0);
@@ -1370,7 +1372,8 @@ async fn child_spawn_clone_is_named_spawn_and_binds_spawn_agent_via_registry_swa
         in_tx,
     );
 
-    let child_spawn = parent.child_spawn_clone(PathBuf::from("/work/child"));
+    let child_id = AgentId::new("child-0");
+    let child_spawn = parent.child_spawn_clone(PathBuf::from("/work/child"), &child_id);
     assert_eq!(child_spawn.name(), "spawn");
     assert_eq!(child_spawn.working_dir, PathBuf::from("/work/child"));
 
@@ -1438,7 +1441,8 @@ async fn nested_spawn_agent_resolves_a_real_agent_id_through_the_bound_delegate(
     );
 
     let mut tools = ToolRegistry::with_builtins(std::env::temp_dir());
-    let mut clone = parent.child_spawn_clone(std::env::temp_dir());
+    let child_id = AgentId::new("child-0");
+    let mut clone = parent.child_spawn_clone(std::env::temp_dir(), &child_id);
     clone.task_supervisor = Some(tools.supervisor());
     tools.register(clone);
 
@@ -2299,6 +2303,106 @@ async fn background_deliverable_surfaces_shell_written_file_in_output_files() {
         );
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
+}
+
+#[tokio::test]
+async fn background_deliverable_uses_configured_root_without_touching_workspace_state() {
+    let (in_tx, _in_rx) = tokio::sync::mpsc::channel(16);
+    let temp = tempfile::tempdir().unwrap();
+    let ledger = temp.path().join("tasks.jsonl");
+    let workspace = temp.path().join("workspace");
+    let deliverable_root = temp.path().join("runtime").join("spawn-deliverables");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let supervisor = Arc::new(TaskSupervisor::new());
+    supervisor.enable_persistence(&ledger).unwrap();
+    let tool = SpawnTool::new(
+        Arc::new(ShellDeliverableProvider {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        }),
+        Arc::new(create_test_store().await),
+        workspace.clone(),
+        in_tx,
+    )
+    .with_task_supervisor(supervisor.clone(), "api:test-session", ledger)
+    .with_deliverable_root(deliverable_root.clone())
+    .with_sandbox(SandboxConfig {
+        mode: crate::sandbox::SandboxMode::None,
+        ..Default::default()
+    });
+
+    let result = tool
+        .execute(&serde_json::json!({
+            "task": "Review the repo, then write octos-review.md",
+            "label": "reviewer",
+            "mode": "background",
+            "allowed_tools": ["shell"],
+            "deliverable": "*.md"
+        }))
+        .await
+        .unwrap();
+    assert!(result.success, "spawn dispatch failed: {}", result.output);
+
+    let started = std::time::Instant::now();
+    loop {
+        let tasks = supervisor.get_tasks_for_session("api:test-session");
+        if let Some(task) = tasks.first() {
+            match task.status {
+                crate::task_supervisor::TaskStatus::Completed => {
+                    assert_eq!(task.output_files.len(), 1, "{:?}", task.output_files);
+                    assert!(
+                        std::path::Path::new(&task.output_files[0]).starts_with(&deliverable_root),
+                        "deliverable must be outside the workspace: {:?}",
+                        task.output_files
+                    );
+                    assert!(
+                        !workspace.join(".octos").exists(),
+                        "deliverable setup must not create workspace state"
+                    );
+                    break;
+                }
+                crate::task_supervisor::TaskStatus::Failed => {
+                    panic!("background deliverable spawn failed: {:?}", task.error);
+                }
+                _ => {}
+            }
+        }
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "background deliverable spawn did not complete in time"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}
+
+#[tokio::test]
+async fn read_only_spawn_refuses_worktree_isolation_without_creating_workspace_state() {
+    let (in_tx, _in_rx) = tokio::sync::mpsc::channel(1);
+    let temp = tempfile::tempdir().unwrap();
+    let workspace = temp.path().join("workspace");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let tool = SpawnTool::new(
+        Arc::new(MockProvider),
+        Arc::new(create_test_store().await),
+        workspace.clone(),
+        in_tx,
+    )
+    .with_workspace_write_access(false);
+
+    let result = tool
+        .execute(&serde_json::json!({
+            "task": "review the workspace",
+            "mode": "sync",
+            "isolation": "worktree"
+        }))
+        .await
+        .unwrap();
+
+    assert!(!result.success);
+    assert!(result.output.contains("read-only"), "{}", result.output);
+    assert!(
+        !workspace.join(".octos").exists(),
+        "read-only worktree refusal must leave no workspace state"
+    );
 }
 
 #[tokio::test]
