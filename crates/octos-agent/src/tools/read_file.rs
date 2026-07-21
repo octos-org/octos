@@ -3,7 +3,7 @@
 use std::path::PathBuf;
 
 use async_trait::async_trait;
-use eyre::{Result, WrapErr};
+use eyre::Result;
 use serde::Deserialize;
 
 use super::{Tool, ToolContext, ToolResult};
@@ -35,6 +35,10 @@ impl ReadFileTool {
 }
 
 #[derive(Debug, Deserialize)]
+// #1770: unknown keys are usually a typo of a real parameter; rejecting
+// them (with a did-you-mean via `args::parse_tool_args`) lets the model
+// self-correct instead of silently dropping its intent.
+#[serde(deny_unknown_fields)]
 struct ReadFileInput {
     /// #1767: `filePath` is the industry-convention alias.
     #[serde(alias = "filePath")]
@@ -127,7 +131,7 @@ impl Tool for ReadFileTool {
         args: &serde_json::Value,
     ) -> Result<ToolResult> {
         let input: ReadFileInput =
-            serde_json::from_value(args.clone()).wrap_err("invalid read_file tool input")?;
+            super::args::parse_tool_args(self.name(), &self.input_schema(), args)?;
 
         // M8.1 permission gate (stub): consult the typed permissions record
         // so the hook is in place before M8.3 wires real allow lists. Today
@@ -371,6 +375,94 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let tool = ReadFileTool::new(dir.path());
         assert_eq!(tool.concurrency_class(), ConcurrencyClass::Safe);
+    }
+
+    #[tokio::test]
+    async fn invalid_args_error_names_each_problem_with_did_you_mean() {
+        // #1770: a misspelled parameter must produce a model-facing
+        // message that (a) names the missing required parameter, (b)
+        // names the unknown parameter, and (c) suggests the correction —
+        // so the LLM can self-correct on the next iteration instead of
+        // retrying blind.
+        let dir = tempfile::tempdir().unwrap();
+        let tool = ReadFileTool::new(dir.path());
+        let err = match tool
+            .execute(&serde_json::json!({"file_path": "a.txt"}))
+            .await
+        {
+            Err(e) => e,
+            Ok(_) => panic!("misspelled parameter must fail"),
+        };
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("Invalid arguments for tool 'read_file'"),
+            "names the tool: {msg}"
+        );
+        assert!(
+            msg.contains("path") && msg.contains("missing required parameter"),
+            "names the missing parameter: {msg}"
+        );
+        assert!(
+            msg.contains("file_path") && msg.contains("unknown parameter"),
+            "names the unknown parameter: {msg}"
+        );
+        assert!(
+            msg.contains("did you mean 'path'?"),
+            "suggests the correction: {msg}"
+        );
+        // #1690 contract: argument errors are ToolInputError so a
+        // malformed call never cascade-cancels well-formed siblings.
+        assert!(
+            err.chain()
+                .any(|src| src.is::<crate::tools::ToolInputError>()),
+            "argument errors must carry the ToolInputError marker"
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_args_error_reports_type_mismatch() {
+        // #1770: wrong-typed values are reported per-parameter with the
+        // expected and actual JSON types.
+        let dir = tempfile::tempdir().unwrap();
+        let tool = ReadFileTool::new(dir.path());
+        let err = match tool
+            .execute(&serde_json::json!({"path": "a.txt", "start_line": "abc"}))
+            .await
+        {
+            Err(e) => e,
+            Ok(_) => panic!("wrong-typed parameter must fail"),
+        };
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("start_line") && msg.contains("expected integer, got string"),
+            "reports the type mismatch: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_extra_parameter_is_rejected_with_suggestion() {
+        // #1770: `deny_unknown_fields` — a stray parameter alongside an
+        // otherwise valid call is rejected (it is usually a typo of a
+        // real parameter, and silently ignoring it hides model bugs).
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("ok.txt"), b"ok").unwrap();
+        let tool = ReadFileTool::new(dir.path());
+        let err = match tool
+            .execute(&serde_json::json!({"path": "ok.txt", "startline": 1}))
+            .await
+        {
+            Err(e) => e,
+            Ok(_) => panic!("unknown parameter must fail"),
+        };
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("startline") && msg.contains("unknown parameter"),
+            "names the unknown parameter: {msg}"
+        );
+        assert!(
+            msg.contains("did you mean 'start_line'?"),
+            "suggests the near-miss known parameter: {msg}"
+        );
     }
 
     #[tokio::test]
