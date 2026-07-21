@@ -131,6 +131,11 @@ fn should_auto_send_tool_files(
 /// - `delegate_task` (`tools/delegate.rs`)
 /// - `search` (`tools/deep_search.rs`), `deep_crawl` (`tools/site_crawl.rs`)
 /// - `synthesize_research` (`tools/synthesize_research.rs`)
+/// - `check` (`tools/check.rs`): a cold `cargo check` legitimately compiles
+///   the dependency graph; the tool enforces its own 120s child timeout,
+///   which must fire BEFORE the batch ceiling (the interactive default is
+///   also 120s and would race it, yielding a generic batch-timeout message
+///   instead of the tool's clean "timed out" answer)
 ///
 /// NOTE: human-wait tools (`ask_user_question`) are deliberately NOT in this
 /// list. A batch containing one gets NO batch-level timeout at all (see
@@ -151,6 +156,7 @@ const LONG_RUNNING_TOOLS: &[&str] = &[
     "deep_crawl",
     "site_crawl",
     "synthesize_research",
+    "check",
 ];
 
 /// Whether `name` is a genuinely long-running tool (keeps the 1800s default).
