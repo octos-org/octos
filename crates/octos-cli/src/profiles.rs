@@ -138,6 +138,10 @@ pub struct ProfileConfig {
     /// after successful edit_file/write_file/diff_edit. Default OFF.
     #[serde(default)]
     pub format_after_edit: bool,
+    /// #1768: opt-in git-backed workspace snapshots before mutating tools
+    /// (`snapshots.enabled` + `keep_last`). Default OFF.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshots: Option<octos_agent::SnapshotConfig>,
     /// Sandbox configuration for tool isolation.
     #[serde(default)]
     pub sandbox: octos_agent::SandboxConfig,
@@ -2518,9 +2522,10 @@ pub(crate) fn config_from_profile(
         model_hints: primary.and_then(|selection| selection.model_hints.clone()),
         mcp_servers: vec![],
         sandbox: profile.config.sandbox.clone(),
-        // #1768 workspace snapshots: not configurable through profiles yet
         // (serve-side wiring lands with the UI/RPC follow-up).
-        snapshots: None,
+        // #1768: thread the profile's snapshot opt-in so serve sessions
+        // honor it (parity with format_after_edit).
+        snapshots: profile.config.snapshots.clone(),
         tool_policy: None,
         tool_policy_by_provider: Default::default(),
         embedding: None,

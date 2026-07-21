@@ -593,6 +593,20 @@ impl SessionRuntime {
             agent = agent.with_session_scope(scope);
         }
 
+        // #1768: opt-in git-backed workspace snapshots before mutating tools
+        // (chat.rs parity). Separate git dir under `<data_dir>/snapshots/` —
+        // the session's own repo/index is never touched; silently unavailable
+        // without a git binary (`SnapshotManager::new` returns None, logs once).
+        if let Some(snapshot_cfg) = profile.snapshots.as_ref().filter(|cfg| cfg.enabled) {
+            if let Some(manager) = octos_agent::SnapshotManager::new(
+                profile.data_dir.join("snapshots"),
+                workspace_root.clone(),
+                snapshot_cfg.keep_last,
+            ) {
+                agent = agent.with_snapshot_manager(std::sync::Arc::new(manager));
+            }
+        }
+
         // Memory rides the per-session agent as a NAMED prompt segment
         // (chat.rs pattern) instead of being frozen into the profile's
         // bootstrap prompt String: serve profiles bootstrapped before any
@@ -1131,6 +1145,7 @@ mod tests {
             default_sandbox: sandbox,
             max_iterations: None,
             format_after_edit: false,
+            snapshots: None,
             tool_specs: Arc::new(base_tools),
             plugin_tool_names: Vec::new(),
             plugin_dirs: Vec::new(),
@@ -1804,6 +1819,7 @@ mod tests {
             default_sandbox: sandbox,
             max_iterations: None,
             format_after_edit: false,
+            snapshots: None,
             tool_specs: Arc::new(base_tools),
             plugin_tool_names: Vec::new(),
             plugin_dirs: Vec::new(),

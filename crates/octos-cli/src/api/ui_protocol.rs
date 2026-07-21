@@ -211,6 +211,10 @@ const APPUI_METHOD_PROFILE_LLM_FETCH_MODELS: &str = "profile/llm/fetch_models";
 const APPUI_METHOD_PROFILE_SUB_PROVIDERS_LIST: &str = "profile/sub_providers/list";
 const APPUI_METHOD_PROFILE_SUB_PROVIDERS_UPSERT: &str = "profile/sub_providers/upsert";
 const APPUI_METHOD_PROFILE_SUB_PROVIDERS_REMOVE: &str = "profile/sub_providers/remove";
+/// `snapshot/list`: list the session workspace's snapshot undo points (#1768).
+const APPUI_METHOD_SNAPSHOT_LIST: &str = "snapshot/list";
+/// `snapshot/restore`: restore the session workspace to a snapshot (#1768).
+const APPUI_METHOD_SNAPSHOT_RESTORE: &str = "snapshot/restore";
 const APPUI_METHOD_PROFILE_SKILLS_LIST: &str = "profile/skills/list";
 const APPUI_METHOD_PROFILE_SKILLS_REGISTRY_SEARCH: &str = "profile/skills/registry/search";
 const APPUI_METHOD_PROFILE_SKILLS_INSTALL: &str = "profile/skills/install";
@@ -281,6 +285,8 @@ const APPUI_EXTRA_METHODS: &[&str] = &[
     APPUI_METHOD_PROFILE_SUB_PROVIDERS_LIST,
     APPUI_METHOD_PROFILE_SUB_PROVIDERS_UPSERT,
     APPUI_METHOD_PROFILE_SUB_PROVIDERS_REMOVE,
+    APPUI_METHOD_SNAPSHOT_LIST,
+    APPUI_METHOD_SNAPSHOT_RESTORE,
     APPUI_METHOD_PROFILE_SKILLS_LIST,
     APPUI_METHOD_PROFILE_SKILLS_REGISTRY_SEARCH,
     APPUI_METHOD_PROFILE_SKILLS_INSTALL,
@@ -9393,6 +9399,120 @@ fn raw_profile_sub_providers_list(
     ))
 }
 
+#[derive(Debug, Deserialize)]
+struct RawSnapshotListParams {
+    session_id: SessionKey,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawSnapshotRestoreParams {
+    session_id: SessionKey,
+    snapshot_id: String,
+}
+
+/// Resolve the snapshot context for a session: the profile's opt-in +
+/// keep-last policy (from the bootstrapped [`ProfileRuntime`]), the profile
+/// data dir the snapshot git-dirs live under, and the session's workspace
+/// root. Listing works even when the opt-in is currently off (snapshots from
+/// an earlier enabled run remain restorable).
+fn snapshot_context_for_session(
+    state: &Arc<AppState>,
+    connection_profile_id: Option<&str>,
+    session_id: &SessionKey,
+) -> Result<(bool, Option<octos_agent::SnapshotManager>), RpcError> {
+    let profile_id = raw_scoped_llm_profile_id(None, Some(session_id), connection_profile_id)?;
+    let runtime = state.profiles.get(&profile_id);
+    let enabled = runtime
+        .and_then(|rt| rt.snapshots.as_ref())
+        .is_some_and(|cfg| cfg.enabled);
+    let keep_last = runtime
+        .and_then(|rt| rt.snapshots.as_ref())
+        .map(|cfg| cfg.keep_last)
+        .unwrap_or(octos_agent::DEFAULT_SNAPSHOT_KEEP_LAST);
+    let Some(workspace_root) = session_workspace_root_for_state(state, session_id) else {
+        return Ok((enabled, None));
+    };
+    let manager = runtime.and_then(|rt| {
+        octos_agent::SnapshotManager::new(rt.data_dir.join("snapshots"), workspace_root, keep_last)
+    });
+    Ok((enabled, manager))
+}
+
+/// Render one wire row per retained snapshot, newest first.
+fn snapshot_rows(manager: &octos_agent::SnapshotManager) -> Vec<Value> {
+    manager
+        .list_snapshots()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|info| {
+            json!({
+                "id": info.id.as_str(),
+                "label": info.label,
+                "timestamp_unix": info.timestamp_unix,
+            })
+        })
+        .collect()
+}
+
+/// `snapshot/list` (#1768): the session workspace's undo points.
+fn raw_snapshot_list(
+    state: &Arc<AppState>,
+    request: &RpcRequest<Value>,
+    connection_profile_id: Option<&str>,
+) -> Result<Value, RpcError> {
+    let params: RawSnapshotListParams = parse_raw_params(request)?;
+    let (enabled, manager) =
+        snapshot_context_for_session(state, connection_profile_id, &params.session_id)?;
+    let (available, snapshots) = match manager.as_ref() {
+        Some(manager) => (true, snapshot_rows(manager)),
+        None => (false, Vec::new()),
+    };
+    Ok(json!({
+        "session_id": params.session_id,
+        "enabled": enabled,
+        "available": available,
+        "snapshots": snapshots,
+    }))
+}
+
+/// `snapshot/restore` (#1768): roll the session workspace back to a
+/// snapshot. Refused while the session has an in-flight turn — restoring
+/// under a running agent would yank files out from under its tools. The
+/// restore itself takes a pre-restore snapshot first, so it is undoable.
+async fn raw_snapshot_restore(
+    state: &Arc<AppState>,
+    request: &RpcRequest<Value>,
+    connection_profile_id: Option<&str>,
+) -> Result<Value, RpcError> {
+    let params: RawSnapshotRestoreParams = parse_raw_params(request)?;
+    let active = active_turn_sessions(&active_turns_registry()).await;
+    if active.contains(&params.session_id) {
+        return Err(RpcError::invalid_params(
+            "cannot restore while a turn is running in this session — interrupt it first",
+        ));
+    }
+    let (_enabled, manager) =
+        snapshot_context_for_session(state, connection_profile_id, &params.session_id)?;
+    let Some(manager) = manager else {
+        return Err(RpcError::invalid_params(
+            "snapshots are not available for this session (no workspace, or git is not installed)",
+        ));
+    };
+    let snapshot_id = octos_agent::SnapshotId::new(params.snapshot_id.clone());
+    // Git work is blocking; keep it off the reactor.
+    let manager = std::sync::Arc::new(manager);
+    let restore_manager = std::sync::Arc::clone(&manager);
+    tokio::task::spawn_blocking(move || restore_manager.restore(&snapshot_id))
+        .await
+        .map_err(|err| RpcError::internal_error(format!("restore task failed: {err}")))?
+        .map_err(|err| RpcError::invalid_params(format!("restore failed: {err}")))?;
+    Ok(json!({
+        "session_id": params.session_id,
+        "restored": params.snapshot_id,
+        "snapshots": snapshot_rows(&manager),
+    }))
+}
+
 /// Serializes profile `sub_providers` read-modify-write across concurrent
 /// upsert/remove RPCs so two clients adding different lanes don't clobber each
 /// other (a bare get→mutate→save is last-writer-wins because `save_with_merge`
@@ -10004,6 +10124,10 @@ async fn handle_raw_appui_rpc(
         APPUI_METHOD_PROFILE_SUB_PROVIDERS_REMOVE => {
             raw_profile_sub_providers_remove(state, request, connection_profile_id).await
         }
+        APPUI_METHOD_SNAPSHOT_LIST => raw_snapshot_list(state, request, connection_profile_id),
+        APPUI_METHOD_SNAPSHOT_RESTORE => {
+            raw_snapshot_restore(state, request, connection_profile_id).await
+        }
         APPUI_METHOD_PROFILE_SKILLS_LIST => {
             raw_profile_skills_list(state, request, connection_profile_id)
         }
@@ -10380,6 +10504,8 @@ fn raw_method_is_dispatched(method: &str, stdio_transport: bool) -> bool {
             | APPUI_METHOD_PROFILE_SUB_PROVIDERS_LIST
             | APPUI_METHOD_PROFILE_SUB_PROVIDERS_UPSERT
             | APPUI_METHOD_PROFILE_SUB_PROVIDERS_REMOVE
+            | APPUI_METHOD_SNAPSHOT_LIST
+            | APPUI_METHOD_SNAPSHOT_RESTORE
             | APPUI_METHOD_PROFILE_SKILLS_LIST
             | APPUI_METHOD_PROFILE_SKILLS_REGISTRY_SEARCH
             | APPUI_METHOD_PROFILE_SKILLS_INSTALL
