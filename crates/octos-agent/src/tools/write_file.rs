@@ -45,6 +45,8 @@ impl WriteFileTool {
 
 #[derive(Debug, Deserialize)]
 struct WriteFileInput {
+    /// #1767: `filePath` is the industry-convention alias.
+    #[serde(alias = "filePath")]
     path: String,
     content: String,
 }
@@ -76,7 +78,7 @@ impl Tool for WriteFileTool {
             "properties": {
                 "path": {
                     "type": "string",
-                    "description": "Path to the file to write"
+                    "description": "Path to the file to write (alias: filePath)"
                 },
                 "content": {
                     "type": "string",
@@ -214,6 +216,36 @@ mod tests {
         assert!(result.output.contains("Successfully wrote"));
         let content = std::fs::read_to_string(dir.path().join("new.txt")).unwrap();
         assert_eq!(content, "hello world\n");
+    }
+
+    #[tokio::test]
+    async fn should_accept_file_path_alias_for_path() {
+        // #1767: `filePath` is the industry-convention alias for `path`.
+        let dir = tempfile::tempdir().unwrap();
+        let tool = WriteFileTool::new(dir.path());
+
+        let result = tool
+            .execute(&serde_json::json!({"filePath": "aliased.txt", "content": "via alias\n"}))
+            .await
+            .unwrap();
+
+        assert!(
+            result.success,
+            "filePath alias must work: {}",
+            result.output
+        );
+        let content = std::fs::read_to_string(dir.path().join("aliased.txt")).unwrap();
+        assert_eq!(content, "via alias\n");
+    }
+
+    #[test]
+    fn schema_advertises_canonical_names_only() {
+        let tool = WriteFileTool::new("/tmp");
+        let schema = tool.input_schema();
+        let props = schema["properties"].as_object().unwrap();
+        assert!(props.contains_key("path"));
+        assert!(props.contains_key("content"));
+        assert!(!props.contains_key("filePath"));
     }
 
     #[tokio::test]
