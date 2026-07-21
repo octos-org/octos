@@ -4,7 +4,7 @@
 //! enabling real-time LLM text streaming to Telegram, WhatsApp, etc.
 //! Text is accumulated and the channel message is edited at a throttled rate.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -18,9 +18,19 @@ use tracing::{debug, warn};
 /// card), so the generic `tool_call` projection would duplicate their output.
 const SELF_CARDING_TOOLS: &[&str] = &["update_plan", "send_app_card"];
 
+/// Max length of a failed tool's error summary embedded in the `run_details`
+/// card (surfaced only when the user expands the card).
+///
+/// Truncated because it enters the room event unencrypted and can carry noise
+/// or secrets. Successful tools carry NO arguments/output at all — only a failed
+/// tool contributes a (truncated) error, so a problem can be diagnosed on expand
+/// without leaking a whole command line or `.env` on every successful call.
+const TOOL_ERROR_PREVIEW_MAX: usize = 200;
+
 /// Accumulates a turn's token/cost figures across the per-response `CostUpdate`
-/// events so a single `run_summary` card can be emitted on `TaskCompleted`
-/// (turn end) rather than one per response.
+/// events so, on `TaskCompleted` (turn end), a single token/cost block can be
+/// folded into the merged `run_details` (attached to the answer message) rather
+/// than emitted per response.
 #[derive(Default)]
 struct RunSummaryAccum {
     model: Option<String>,
@@ -85,21 +95,21 @@ pub enum StreamProgressEvent {
 pub struct ChannelStreamReporter {
     tx: mpsc::UnboundedSender<StreamProgressEvent>,
     thread_id: Option<String>,
-    /// In-flight tool-call arguments keyed by `tool_id`, recorded on
-    /// `ToolStarted` and consumed on `ToolCompleted` so the projected
-    /// `tool_call` card can echo what the tool was asked to do (the
-    /// completion event itself does not carry the arguments).
-    tool_args: Mutex<HashMap<String, serde_json::Value>>,
-    /// Per-turn token/cost accumulator, drained on `TaskCompleted` into a
-    /// single `run_summary` card.
+    /// Per-turn token/cost accumulator, drained on `TaskCompleted` into the
+    /// merged `run_details` card.
     run_accum: Mutex<Option<RunSummaryAccum>>,
     /// Files modified this turn (deduped), drained on `TaskCompleted` into a
     /// single `artifact` card — so N edits never post N cards.
     modified_files: Mutex<Vec<String>>,
-    /// Tool invocations this turn, drained on `TaskCompleted` into a single
-    /// `tool_activity` card — so a research turn with N searches posts ONE
-    /// card, not N `tool_call` cards.
+    /// Tool invocations this turn, drained on `TaskCompleted` into the merged
+    /// `run_details` object — so a research turn with N searches contributes ONE
+    /// embedded detail, not N `tool_call` cards.
     tool_activity: Mutex<Vec<serde_json::Value>>,
+    /// The merged `run_details` (`{tools, tokens, cost, …}`) built on
+    /// `TaskCompleted`, held here for the session actor to drain via
+    /// [`take_run_details`](Self::take_run_details) and attach as
+    /// `org.octos.run` metadata onto the final answer message.
+    run_details: Mutex<Option<serde_json::Value>>,
 }
 
 impl ChannelStreamReporter {
@@ -107,10 +117,10 @@ impl ChannelStreamReporter {
         Self {
             tx,
             thread_id: None,
-            tool_args: Mutex::new(HashMap::new()),
             run_accum: Mutex::new(None),
             modified_files: Mutex::new(Vec::new()),
             tool_activity: Mutex::new(Vec::new()),
+            run_details: Mutex::new(None),
         }
     }
 
@@ -119,6 +129,17 @@ impl ChannelStreamReporter {
     pub fn with_thread_id(mut self, thread_id: Option<String>) -> Self {
         self.thread_id = thread_id.filter(|s| !s.is_empty());
         self
+    }
+
+    /// Take the merged `run_details` (`{tools, tokens, cost, …}`) built on the
+    /// turn's `TaskCompleted`, if any. Returns `None` when the turn ran no tools.
+    /// Callable through a shared handle after the agent task completes; the value
+    /// is cleared so a subsequent turn starts fresh.
+    pub fn take_run_details(&self) -> Option<serde_json::Value> {
+        self.run_details
+            .lock()
+            .ok()
+            .and_then(|mut slot| slot.take())
     }
 }
 
@@ -193,16 +214,11 @@ impl ProgressReporter for ChannelStreamReporter {
             ProgressEvent::ToolStarted {
                 ref name,
                 ref tool_id,
-                ref arguments,
+                arguments: _,
             } => {
-                // Record the call arguments so the `tool_call` card projected on
-                // ToolCompleted can echo them (the completion event omits them).
-                if let Some(args) = arguments {
-                    if let Ok(mut m) = self.tool_args.lock() {
-                        m.insert(tool_id.clone(), args.clone());
-                    }
-                }
-                // Also send raw SSE for web client status indicators
+                // Send raw SSE for web client status indicators. Call arguments
+                // are intentionally not recorded — the `run_details` card never
+                // echoes them (only a failed tool's truncated error is surfaced).
                 let mut payload = serde_json::json!({
                     "type": "tool_start",
                     "tool": name,
@@ -231,34 +247,27 @@ impl ProgressReporter for ChannelStreamReporter {
                 let _ = self.tx.send(StreamProgressEvent::RawSse {
                     json: payload.to_string(),
                 });
-                // Consume any recorded args regardless, so the entry never leaks.
-                let arguments = self
-                    .tool_args
-                    .lock()
-                    .ok()
-                    .and_then(|mut m| m.remove(tool_id));
-                // Accumulate into a per-turn `tool_activity` card (one card at
-                // turn end) instead of one `tool_call` card per tool — except
-                // self-carding tools, which already emit their own card.
+                // Accumulate this tool into the per-turn `run_details` card (one
+                // merged card at turn end) — except self-carding tools, which
+                // emit their own card. A FAILED tool contributes a truncated
+                // error so the failure can be diagnosed when the card is
+                // expanded; a successful tool carries only name/status/duration
+                // (no args/output on the wire — see `TOOL_ERROR_PREVIEW_MAX`).
                 if !SELF_CARDING_TOOLS.contains(&name.as_str()) {
                     let status = if success { "completed" } else { "error" };
-                    // Short "what it did" line: the call args on success, the
-                    // error on failure.
-                    let summary = if success {
-                        arguments
-                            .as_ref()
-                            .map(|a| truncate_card_preview(&a.to_string(), 120))
-                            .unwrap_or_default()
-                    } else {
-                        truncate_card_preview(output_preview, 120)
-                    };
+                    let mut entry = serde_json::json!({
+                        "tool_name": name,
+                        "status": status,
+                        "duration_ms": duration.as_millis() as u64,
+                    });
+                    if !success {
+                        entry["error"] = serde_json::Value::String(truncate_card_preview(
+                            output_preview,
+                            TOOL_ERROR_PREVIEW_MAX,
+                        ));
+                    }
                     if let Ok(mut v) = self.tool_activity.lock() {
-                        v.push(serde_json::json!({
-                            "tool_name": name,
-                            "status": status,
-                            "duration_ms": duration.as_millis() as u64,
-                            "summary": summary,
-                        }));
+                        v.push(entry);
                     }
                 }
                 StreamProgressEvent::ToolCompleted {
@@ -322,8 +331,8 @@ impl ProgressReporter for ChannelStreamReporter {
                 model,
                 context_window,
             } => {
-                // Accumulate the turn's token/cost figures for a single
-                // `run_summary` card emitted on TaskCompleted (turn end).
+                // Accumulate the turn's token/cost figures; folded into the
+                // merged `run_details` on TaskCompleted (turn end).
                 if let Ok(mut acc) = self.run_accum.lock() {
                     let a = acc.get_or_insert_with(RunSummaryAccum::default);
                     a.input_tokens = turn_input_tokens as u64;
@@ -378,57 +387,47 @@ impl ProgressReporter for ChannelStreamReporter {
                 return;
             }
             ProgressEvent::TaskCompleted { duration, .. } => {
-                // Drain this turn's tool invocations into ONE `tool_activity`
-                // card, rather than one `tool_call` card per tool.
-                if let Some(tools) = self
+                // Drain BOTH per-turn accumulators (always, so a turn never
+                // bleeds into the next), then merge tool activity + token/cost
+                // into ONE `run_details` object. Rather than posting a separate
+                // card message, we STASH it so the session actor can attach it as
+                // `org.octos.run` metadata onto the FINAL answer message — the
+                // client renders it embedded + expandable under the answer, not
+                // as its own row. Built only when the turn ran tools (a pure-text
+                // answer stashes nothing). Matrix canonical JSON forbids floats,
+                // so costs are decimal strings.
+                let tools = self
                     .tool_activity
                     .lock()
                     .ok()
                     .map(|mut v| std::mem::take(&mut *v))
-                    .filter(|v| !v.is_empty())
-                {
-                    let n = tools.len();
-                    let failed = tools
-                        .iter()
-                        .filter(|t| t.get("status").and_then(|s| s.as_str()) == Some("error"))
-                        .count();
-                    let body = if failed > 0 {
-                        format!("{n} tools · {failed} failed")
-                    } else {
-                        format!("{n} tools")
-                    };
-                    let _ = self.tx.send(StreamProgressEvent::AppCard {
-                        card_type: "tool_activity".to_string(),
-                        body,
-                        initial_state: serde_json::json!({ "tools": tools }),
-                    });
-                }
-                // Drain the accumulated cost into one per-turn `run_summary`
-                // card. Matrix canonical JSON forbids floats, so costs are sent
-                // as decimal strings.
-                if let Some(acc) = self.run_accum.lock().ok().and_then(|mut a| a.take()) {
+                    .unwrap_or_default();
+                let run = self.run_accum.lock().ok().and_then(|mut a| a.take());
+                if !tools.is_empty() {
                     let mut initial_state = serde_json::json!({
-                        "input_tokens": acc.input_tokens,
-                        "output_tokens": acc.output_tokens,
-                        "total_tokens": acc.input_tokens + acc.output_tokens,
+                        "tools": tools,
                         "duration_ms": duration.as_millis() as u64,
                     });
-                    if let Some(m) = acc.model {
-                        initial_state["model"] = serde_json::Value::String(m);
-                    }
-                    if acc.has_cost {
-                        initial_state["response_cost"] =
-                            serde_json::Value::String(format!("{:.4}", acc.turn_cost));
-                        if let Some(sc) = acc.session_cost {
-                            initial_state["session_cost"] =
-                                serde_json::Value::String(format!("{:.4}", sc));
+                    if let Some(acc) = run {
+                        initial_state["input_tokens"] = acc.input_tokens.into();
+                        initial_state["output_tokens"] = acc.output_tokens.into();
+                        initial_state["total_tokens"] =
+                            acc.input_tokens.saturating_add(acc.output_tokens).into();
+                        if let Some(m) = acc.model {
+                            initial_state["model"] = serde_json::Value::String(m);
+                        }
+                        if acc.has_cost {
+                            initial_state["response_cost"] =
+                                serde_json::Value::String(format!("{:.4}", acc.turn_cost));
+                            if let Some(sc) = acc.session_cost {
+                                initial_state["session_cost"] =
+                                    serde_json::Value::String(format!("{:.4}", sc));
+                            }
                         }
                     }
-                    let _ = self.tx.send(StreamProgressEvent::AppCard {
-                        card_type: "run_summary".to_string(),
-                        body: "Turn complete".to_string(),
-                        initial_state,
-                    });
+                    if let Ok(mut slot) = self.run_details.lock() {
+                        *slot = Some(initial_state);
+                    }
                 }
                 // Emit one `artifact` card listing the files produced this turn.
                 if let Some(files) = self
@@ -991,11 +990,20 @@ pub async fn run_stream_forwarder(
         && let Some(root) = workspace_root.clone()
     {
         let paths = std::mem::take(&mut diff_paths);
-        let initial_state =
-            tokio::task::spawn_blocking(move || crate::api::diff_view_for_paths(&paths, &root))
-                .await
-                .ok()
-                .flatten();
+        // Match the JoinResult explicitly: a panic inside the blocking closure
+        // must be logged, not silently collapsed into `None` (which is also the
+        // legitimate "no diff" result), or a panic here is undiagnosable.
+        let initial_state = match tokio::task::spawn_blocking(move || {
+            crate::api::diff_view_for_paths(&paths, &root)
+        })
+        .await
+        {
+            Ok(state) => state,
+            Err(join_err) => {
+                warn!("diff_view reconstruction task panicked: {join_err}");
+                None
+            }
+        };
         if let Some(initial_state) = initial_state {
             let mut metadata = serde_json::json!({
                 "org.octos.app": {
@@ -1358,13 +1366,15 @@ mod tests {
         }
     }
 
-    /// The reporter projects an `org.octos.app` `tool_call` card on
-    /// `ToolCompleted` (echoing the arguments recorded at `ToolStarted`) and a
-    /// `plan` card on `PlanUpdated`. Capable Matrix clients (Robrix) render
-    /// these as structured cards; `run_stream_forwarder` gates emission on
-    /// matrix + an app-reply-capable tool set.
+    /// A turn's tools (one ok, one failed) coalesce with the turn's token/cost
+    /// into ONE merged `run_details` object — STASHED (via `take_run_details`)
+    /// for attachment to the answer message, NOT posted as a card, and NOT split
+    /// into `tool_call` / `tool_activity` / `run_summary` cards. A failed tool
+    /// carries a truncated `error`; a successful tool carries no args/output. The
+    /// `plan` card still fires immediately on `PlanUpdated`. Costs are decimal
+    /// strings (Matrix canonical JSON forbids floats).
     #[test]
-    fn projects_tool_activity_and_plan_app_cards() {
+    fn projects_run_details_and_plan_app_cards() {
         use octos_agent::progress::ProgressEvent;
         use std::collections::HashMap;
 
@@ -1396,6 +1406,16 @@ mod tests {
             output_preview: "private IP not allowed".into(),
             duration: Duration::from_millis(30),
         });
+        reporter.report(ProgressEvent::CostUpdate {
+            session_input_tokens: 130,
+            session_output_tokens: 70,
+            turn_input_tokens: 70,
+            turn_output_tokens: 40,
+            response_cost: Some(0.003),
+            session_cost: Some(0.013),
+            model: Some("deepseek-chat".into()),
+            context_window: Some(64000),
+        });
         reporter.report(ProgressEvent::PlanUpdated {
             plan: serde_json::json!({
                 "title": "Do the thing",
@@ -1424,35 +1444,129 @@ mod tests {
         let plan = cards.get("plan").expect("plan card");
         assert_eq!(plan["items"][0]["status"].as_str(), Some("in_progress"));
 
-        // The two tools coalesce into ONE tool_activity card at turn end — NOT
-        // two per-tool tool_call cards.
+        // The run detail is NOT a standalone card (it's stashed for the answer
+        // message), and there are no per-tool / tool_activity / run_summary cards.
         assert!(
             !cards.contains_key("tool_call"),
             "must not emit per-tool tool_call cards"
         );
-        let tools = cards.get("tool_activity").expect("tool_activity card")["tools"]
-            .as_array()
-            .expect("tools array")
-            .clone();
+        assert!(
+            !cards.contains_key("tool_activity"),
+            "no tool_activity card"
+        );
+        assert!(!cards.contains_key("run_summary"), "no run_summary card");
+        assert!(
+            !cards.contains_key("run_details"),
+            "run_details is stashed, not posted as a standalone card"
+        );
+
+        // The merged run detail is available for the answer message to carry.
+        let state = reporter
+            .take_run_details()
+            .expect("run_details stashed on TaskCompleted");
+        let tools = state["tools"].as_array().expect("tools array");
         assert_eq!(tools.len(), 2);
+        // Successful tool: name/status/duration, and NO error / NO args leak.
         assert_eq!(tools[0]["tool_name"].as_str(), Some("web_search"));
         assert_eq!(tools[0]["status"].as_str(), Some("completed"));
         assert_eq!(tools[0]["duration_ms"].as_u64(), Some(3800));
-        assert!(tools[0]["summary"].as_str().unwrap().contains("SK Hynix"));
+        assert!(
+            tools[0].get("error").is_none(),
+            "successful tool carries no error/output on the wire"
+        );
+        // Failed tool: a truncated error so the failure can be diagnosed on expand.
         assert_eq!(tools[1]["tool_name"].as_str(), Some("web_fetch"));
         assert_eq!(tools[1]["status"].as_str(), Some("error"));
-        assert!(tools[1]["summary"].as_str().unwrap().contains("private IP"));
+        assert!(
+            tools[1]["error"].as_str().unwrap().contains("private IP"),
+            "failed tool surfaces its (truncated) error"
+        );
+
+        // Token/cost folded into the SAME detail (shown on expand).
+        assert_eq!(state["model"].as_str(), Some("deepseek-chat"));
+        assert_eq!(state["input_tokens"].as_u64(), Some(70));
+        assert_eq!(state["output_tokens"].as_u64(), Some(40));
+        assert_eq!(state["total_tokens"].as_u64(), Some(110));
+        assert_eq!(state["duration_ms"].as_u64(), Some(5000));
+        assert_eq!(state["response_cost"].as_str(), Some("0.0030"));
+        assert_eq!(state["session_cost"].as_str(), Some("0.0130"));
+
+        // Draining clears it so the next turn starts fresh.
+        assert!(
+            reporter.take_run_details().is_none(),
+            "run_details is cleared after being taken"
+        );
     }
 
-    /// The reporter coalesces per-response `CostUpdate`s and emits ONE
-    /// `run_summary` card on `TaskCompleted` (turn end): turn-cumulative tokens,
-    /// summed turn cost, and duration. Costs are decimal strings (Matrix
-    /// canonical JSON forbids floats).
+    /// A `run_details` object is stashed for every turn that ran tools, and the
+    /// per-turn accumulator never bleeds: turn 1 (a successful tool) and turn 2
+    /// (a failing tool) each yield their OWN detail carrying only that turn's
+    /// tool.
     #[test]
-    fn projects_run_summary_on_turn_end() {
+    fn run_details_emits_per_turn_without_bleed() {
         use octos_agent::progress::ProgressEvent;
 
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let reporter = ChannelStreamReporter::new(tx);
+
+        // Turn 1: one successful tool, then turn end.
+        reporter.report(ProgressEvent::ToolStarted {
+            name: "web_search".into(),
+            tool_id: "t1".into(),
+            arguments: None,
+        });
+        reporter.report(ProgressEvent::ToolCompleted {
+            name: "web_search".into(),
+            tool_id: "t1".into(),
+            success: true,
+            output_preview: "ok".into(),
+            duration: Duration::from_millis(1200),
+        });
+        reporter.report(ProgressEvent::TaskCompleted {
+            success: true,
+            iterations: 1,
+            duration: Duration::from_millis(1500),
+        });
+        let t1_state = reporter.take_run_details().expect("turn 1 run_details");
+        let t1 = t1_state["tools"].as_array().expect("turn 1 tools");
+        assert_eq!(t1.len(), 1);
+        assert_eq!(t1[0]["tool_name"].as_str(), Some("web_search"));
+        assert_eq!(t1[0]["status"].as_str(), Some("completed"));
+
+        // Turn 2: one FAILING tool, then turn end.
+        reporter.report(ProgressEvent::ToolStarted {
+            name: "web_fetch".into(),
+            tool_id: "t2".into(),
+            arguments: None,
+        });
+        reporter.report(ProgressEvent::ToolCompleted {
+            name: "web_fetch".into(),
+            tool_id: "t2".into(),
+            success: false,
+            output_preview: "boom".into(),
+            duration: Duration::from_millis(30),
+        });
+        reporter.report(ProgressEvent::TaskCompleted {
+            success: true,
+            iterations: 1,
+            duration: Duration::from_millis(50),
+        });
+        let t2_state = reporter.take_run_details().expect("turn 2 run_details");
+        let t2 = t2_state["tools"].as_array().expect("turn 2 tools");
+        // ONLY turn 2's failing tool — turn 1 did not bleed in.
+        assert_eq!(t2.len(), 1, "turn 1's tool must not bleed into turn 2");
+        assert_eq!(t2[0]["tool_name"].as_str(), Some("web_fetch"));
+        assert_eq!(t2[0]["status"].as_str(), Some("error"));
+    }
+
+    /// A turn with cost updates but NO tools stashes NO run detail: token/cost is
+    /// telemetry that only rides along when the turn actually did tool work. The
+    /// cost accumulator is still drained so it never bleeds into the next turn.
+    #[test]
+    fn run_details_suppressed_on_cost_only_turn() {
+        use octos_agent::progress::ProgressEvent;
+
+        let (tx, _rx) = mpsc::unbounded_channel();
         let reporter = ChannelStreamReporter::new(tx);
 
         reporter.report(ProgressEvent::CostUpdate {
@@ -1465,44 +1579,16 @@ mod tests {
             model: Some("deepseek-chat".into()),
             context_window: Some(64000),
         });
-        reporter.report(ProgressEvent::CostUpdate {
-            session_input_tokens: 130,
-            session_output_tokens: 70,
-            turn_input_tokens: 70, // turn-cumulative -> latest wins
-            turn_output_tokens: 40,
-            response_cost: Some(0.002), // summed with the first -> 0.0030
-            session_cost: Some(0.013),
-            model: Some("deepseek-chat".into()),
-            context_window: Some(64000),
-        });
         reporter.report(ProgressEvent::TaskCompleted {
             success: true,
-            iterations: 2,
+            iterations: 1,
             duration: Duration::from_millis(3400),
         });
 
-        let mut card = None;
-        while let Ok(event) = rx.try_recv() {
-            if let StreamProgressEvent::AppCard {
-                card_type,
-                initial_state,
-                ..
-            } = event
-            {
-                if card_type == "run_summary" {
-                    card = Some(initial_state);
-                }
-            }
-        }
-        let card = card.expect("expected a run_summary card on TaskCompleted");
-
-        assert_eq!(card["model"].as_str(), Some("deepseek-chat"));
-        assert_eq!(card["input_tokens"].as_u64(), Some(70));
-        assert_eq!(card["output_tokens"].as_u64(), Some(40));
-        assert_eq!(card["total_tokens"].as_u64(), Some(110));
-        assert_eq!(card["duration_ms"].as_u64(), Some(3400));
-        assert_eq!(card["response_cost"].as_str(), Some("0.0030"));
-        assert_eq!(card["session_cost"].as_str(), Some("0.0130"));
+        assert!(
+            reporter.take_run_details().is_none(),
+            "a cost-only turn (no tools) stashes no run_details"
+        );
     }
 
     /// Files modified during a turn are deduped and coalesced into ONE
