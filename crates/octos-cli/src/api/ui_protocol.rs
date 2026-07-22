@@ -21774,6 +21774,97 @@ fn drain_should_skip_event(event_type: Option<&str>) -> bool {
     )
 }
 
+/// Child-stream coalescing window (#1799 follow-up). A fast child can fire
+/// the spawn `ChildStreamCallback` 100+ times/sec; every fire used to clone
+/// one `agent/output/delta` notification and try-enqueue it onto the bounded
+/// WS writer channel (lossy drop-on-full), so bursts bought
+/// `BackpressureDrop`s. Merging consecutive fragments for up to ~16ms
+/// (≈ one 60fps frame — indistinguishable for a live tail) cuts the enqueue
+/// rate by an order of magnitude.
+const CHILD_STREAM_COALESCE_WINDOW: Duration = Duration::from_millis(16);
+
+/// Flush a merged child-stream frame as soon as it reaches this many bytes,
+/// even inside the coalescing window, so one chatty child can neither grow
+/// an unbounded in-memory buffer nor emit a single oversized WS frame while
+/// the 16ms deadline is still pending.
+const CHILD_STREAM_COALESCE_MAX_BYTES: usize = 4096;
+
+/// One flushable merged `agent/output/delta` frame: CONSECUTIVE stream
+/// fragments of the SAME child, text concatenated, `first_offset` = the
+/// start offset of the FIRST fragment. Fragment offsets are contiguous by
+/// construction (`SpawnChildTranscriptReporter.stream_offset` increments by
+/// exactly the emitted text length), so the merged frame spans
+/// `first_offset..first_offset + text.len()` and the on-the-wire
+/// `OutputCursor` start-offset semantics are byte-identical to the
+/// unmerged frames.
+struct ChildStreamFrame {
+    agent_id: String,
+    first_offset: u64,
+    text: String,
+}
+
+/// Pure merge core of the child-stream coalescer — unit-testable without
+/// the async plumbing. Folds incoming `(agent_id, offset, text)` fragments
+/// into at most one pending frame and yields the frames that must be
+/// flushed NOW: on a task switch (fragments of different children must not
+/// merge) or when the pending buffer crosses
+/// [`CHILD_STREAM_COALESCE_MAX_BYTES`]. Time-based flushing is the pump's
+/// job ([`Self::take_pending`] on the 16ms deadline).
+#[derive(Default)]
+struct ChildStreamCoalescer {
+    pending: Option<ChildStreamFrame>,
+}
+
+impl ChildStreamCoalescer {
+    /// Fold one fragment; returns the frames (0, 1, or 2) that must be
+    /// flushed immediately, in send order.
+    fn push(&mut self, agent_id: &str, offset: u64, text: &str) -> Vec<ChildStreamFrame> {
+        let mut flush = Vec::new();
+        match self.pending.as_mut() {
+            Some(pending) if pending.agent_id == agent_id => {
+                // Consecutive fragment of the same child: concatenate, keep
+                // the FIRST fragment's start offset.
+                pending.text.push_str(text);
+            }
+            Some(_) => {
+                // Task switch: the pending frame must go out BEFORE the
+                // other child's fragment (a frame is a per-child window).
+                flush.extend(self.pending.take());
+                self.pending = Some(ChildStreamFrame {
+                    agent_id: agent_id.to_string(),
+                    first_offset: offset,
+                    text: text.to_string(),
+                });
+            }
+            None => {
+                self.pending = Some(ChildStreamFrame {
+                    agent_id: agent_id.to_string(),
+                    first_offset: offset,
+                    text: text.to_string(),
+                });
+            }
+        }
+        if self
+            .pending
+            .as_ref()
+            .is_some_and(|pending| pending.text.len() >= CHILD_STREAM_COALESCE_MAX_BYTES)
+        {
+            flush.extend(self.pending.take());
+        }
+        flush
+    }
+
+    /// Take the pending frame for a deadline flush (16ms tick, or the final
+    /// flush when the fragment channel closes).
+    fn take_pending(&mut self) -> Option<ChildStreamFrame> {
+        self.pending.take()
+    }
+
+    fn has_pending(&self) -> bool {
+        self.pending.is_some()
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_standalone_turn(
     ws: WsConnection,
@@ -22710,26 +22801,50 @@ async fn run_standalone_turn(
         // lets clients detect gaps / reorder on reconnect. Ephemeral send:
         // deltas are explicitly non-durable (mirrors `message/delta`).
         //
-        // Delivery note (codex review): no per-token coalescing here, and
-        // the ephemeral send is LOSSY — `send_ephemeral`'s `try_enqueue`
-        // DROPS the frame when the bounded WS channel is full
-        // (BackpressureDrop) instead of blocking the producer. Acceptable
-        // for a live tail (the durable record is the reporter's
-        // Response-arm router append); if N parallel children make the
-        // loss user-visible, add a ~16ms coalescing debounce at this site.
+        // #1799 follow-up — coalescing debounce. The raw callback can fire
+        // 100+ times/sec per child; each fire used to clone one
+        // notification and try-enqueue it onto the bounded WS writer
+        // channel (lossy drop-on-full), so bursts bought
+        // `BackpressureDrop`s. The callback now only pushes the fragment
+        // onto an unbounded channel; the per-turn pump below merges
+        // CONSECUTIVE fragments of the same child and flushes a merged
+        // frame on a ~16ms deadline armed at the window's FIRST buffered
+        // fragment (throttle, not trailing-edge debounce: a steady trickle
+        // cannot postpone the flush past one window), or immediately when
+        // the merged buffer reaches `CHILD_STREAM_COALESCE_MAX_BYTES` or
+        // another child's fragment interleaves. Merged-frame cursor
+        // semantics are unchanged: `cursor.offset` = the FIRST fragment's
+        // start offset, and fragments are contiguous by construction
+        // (`SpawnChildTranscriptReporter.stream_offset` increments by
+        // exactly the text length), so a merged frame spans
+        // `offset..offset + text.len()` just like an unmerged one.
+        //
+        // Lifetime: the pump owns the receiver and exits when every sender
+        // is gone. The only senders live inside the callback `Arc`, held by
+        // this turn's registry (dropped at turn end) and by each spawned
+        // child's `SpawnChildTranscriptReporter` (dropped when that child
+        // finishes) — so post-turn background children keep streaming (the
+        // point of #1799) and the pump always terminates after the last
+        // child. The flush still goes through
+        // `send_notification_ephemeral`: the ephemeral/lossy contract
+        // (drop-on-full, never ledgered) is unchanged.
         {
             let ws_for_stream = ws.clone();
             let ledger_for_stream = ledger.clone();
             let session_id_for_stream = session_id.clone();
-            spawn_tool =
-                spawn_tool.with_child_stream_callback(move |agent_id, cursor_offset, text| {
+            let (child_stream_tx, mut child_stream_rx) =
+                mpsc::unbounded_channel::<(String, u64, String)>();
+            tokio::spawn(async move {
+                let mut coalescer = ChildStreamCoalescer::default();
+                let mut flush_deadline: Option<tokio::time::Instant> = None;
+                let flush = |frame: ChildStreamFrame| {
                     let event = AgentOutputDeltaEvent {
                         session_id: session_id_for_stream.clone(),
-                        agent_id: agent_id.to_string(),
+                        agent_id: frame.agent_id,
                         cursor: OutputCursor {
-                            offset: cursor_offset,
+                            offset: frame.first_offset,
                         },
-                        text: text.to_string(),
+                        text: frame.text,
                     };
                     // Ephemeral: deltas must NOT be appended to the ledger
                     // (per-token persistence is the overhead codex flagged).
@@ -22743,6 +22858,59 @@ async fn run_standalone_turn(
                         &ledger_for_stream,
                         UiNotification::AgentOutputDelta(event),
                     );
+                };
+                loop {
+                    let fragment = match flush_deadline {
+                        Some(deadline) => tokio::select! {
+                            fragment = child_stream_rx.recv() => fragment,
+                            _ = tokio::time::sleep_until(deadline) => {
+                                if let Some(frame) = coalescer.take_pending() {
+                                    flush(frame);
+                                }
+                                flush_deadline = None;
+                                continue;
+                            }
+                        },
+                        // Idle (nothing buffered): park on the channel alone
+                        // — no timer wakeups between child bursts.
+                        None => child_stream_rx.recv().await,
+                    };
+                    let Some((agent_id, offset, text)) = fragment else {
+                        // Every sender dropped (turn registry gone AND all
+                        // child reporters finished): final flush, then exit.
+                        if let Some(frame) = coalescer.take_pending() {
+                            flush(frame);
+                        }
+                        break;
+                    };
+                    let flushed = coalescer.push(&agent_id, offset, &text);
+                    let flushed_any = !flushed.is_empty();
+                    for frame in flushed {
+                        flush(frame);
+                    }
+                    if !coalescer.has_pending() {
+                        flush_deadline = None;
+                    } else if flush_deadline.is_none() || flushed_any {
+                        // The pending window's FIRST fragment landed just
+                        // now (either the buffer was empty, or a task
+                        // switch flushed the old window and this fragment
+                        // opened a new one): arm the deadline from now.
+                        flush_deadline =
+                            Some(tokio::time::Instant::now() + CHILD_STREAM_COALESCE_WINDOW);
+                    }
+                }
+            });
+            spawn_tool =
+                spawn_tool.with_child_stream_callback(move |agent_id, cursor_offset, text| {
+                    // Reporter-thread side: a non-blocking push only.
+                    // Unbounded is safe here — the pump drains continuously
+                    // and flushes at 4KB boundaries, so steady-state
+                    // occupancy is one ~16ms window of fragments.
+                    let _ = child_stream_tx.send((
+                        agent_id.to_string(),
+                        cursor_offset,
+                        text.to_string(),
+                    ));
                 });
         }
         let child_context_parent = context_manager.clone();

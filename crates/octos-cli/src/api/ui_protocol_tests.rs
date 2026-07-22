@@ -24408,3 +24408,116 @@ async fn peer_prepare_stages_brief_and_worktree() {
     .expect_err("oversized brief refused");
     assert!(too_big.message.contains("bytes"));
 }
+
+// ---------------------------------------------------------------------------
+// Child stream delta coalescing (#1799 follow-up)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn should_merge_consecutive_chunks_into_single_frame_when_same_agent() {
+    let mut coalescer = ChildStreamCoalescer::default();
+    // Contiguous fragments (each offset = previous offset + previous byte
+    // length — the invariant `SpawnChildTranscriptReporter.stream_offset`
+    // guarantees by construction).
+    assert!(coalescer.push("task-a", 0, "hel").is_empty());
+    assert!(coalescer.push("task-a", 3, "lo ").is_empty());
+    assert!(coalescer.push("task-a", 6, "world").is_empty());
+    let frame = coalescer
+        .take_pending()
+        .expect("merged frame must be pending");
+    assert_eq!(frame.agent_id, "task-a");
+    assert_eq!(
+        frame.first_offset, 0,
+        "a merged frame carries the FIRST fragment's start offset"
+    );
+    assert_eq!(frame.text, "hello world");
+    assert!(
+        coalescer.take_pending().is_none(),
+        "take_pending drains the buffer"
+    );
+}
+
+#[test]
+fn should_keep_first_fragment_offset_when_window_opens_mid_stream() {
+    // A window that opens mid-stream (earlier fragments already flushed in
+    // previous windows) must anchor at ITS first fragment's offset, so the
+    // wire cursor still spans `offset..offset + text.len()`.
+    let mut coalescer = ChildStreamCoalescer::default();
+    assert!(coalescer.push("task-a", 120, "foo").is_empty());
+    assert!(coalescer.push("task-a", 123, "bar").is_empty());
+    let frame = coalescer.take_pending().expect("pending frame");
+    assert_eq!(frame.first_offset, 120);
+    assert_eq!(frame.text, "foobar");
+}
+
+#[test]
+fn should_flush_pending_frame_when_agent_id_changes() {
+    let mut coalescer = ChildStreamCoalescer::default();
+    assert!(coalescer.push("task-a", 0, "alpha").is_empty());
+    let flushed = coalescer.push("task-b", 0, "beta");
+    assert_eq!(
+        flushed.len(),
+        1,
+        "a task switch forces the pending frame out immediately"
+    );
+    assert_eq!(flushed[0].agent_id, "task-a");
+    assert_eq!(flushed[0].first_offset, 0);
+    assert_eq!(flushed[0].text, "alpha");
+    // The interleaving child's fragment opens the next pending window.
+    let frame = coalescer
+        .take_pending()
+        .expect("new pending window for task-b");
+    assert_eq!(frame.agent_id, "task-b");
+    assert_eq!(frame.first_offset, 0);
+    assert_eq!(frame.text, "beta");
+}
+
+#[test]
+fn should_flush_immediately_when_merged_buffer_reaches_size_cap() {
+    let mut coalescer = ChildStreamCoalescer::default();
+    assert!(coalescer.push("task-a", 0, "start:").is_empty());
+    let big = "x".repeat(CHILD_STREAM_COALESCE_MAX_BYTES);
+    let flushed = coalescer.push("task-a", 6, &big);
+    assert_eq!(
+        flushed.len(),
+        1,
+        "crossing the byte cap flushes inside the 16ms window"
+    );
+    assert_eq!(flushed[0].first_offset, 0);
+    assert_eq!(flushed[0].text.len(), "start:".len() + big.len());
+    assert!(flushed[0].text.starts_with("start:"));
+    assert!(
+        !coalescer.has_pending(),
+        "a cap-triggered flush drains the buffer"
+    );
+}
+
+#[test]
+fn should_flush_oversized_lone_fragment_immediately_when_buffer_empty() {
+    let mut coalescer = ChildStreamCoalescer::default();
+    let big = "y".repeat(CHILD_STREAM_COALESCE_MAX_BYTES + 7);
+    let flushed = coalescer.push("task-a", 42, &big);
+    assert_eq!(flushed.len(), 1);
+    assert_eq!(flushed[0].agent_id, "task-a");
+    assert_eq!(flushed[0].first_offset, 42);
+    assert_eq!(flushed[0].text, big);
+    assert!(!coalescer.has_pending());
+}
+
+#[test]
+fn should_flush_old_window_and_oversized_new_fragment_in_order_when_task_switches() {
+    // Task switch where the NEW fragment alone already crosses the cap:
+    // both frames flush, old window first (send order preserved).
+    let mut coalescer = ChildStreamCoalescer::default();
+    assert!(coalescer.push("task-a", 10, "tail").is_empty());
+    let big = "z".repeat(CHILD_STREAM_COALESCE_MAX_BYTES);
+    let flushed = coalescer.push("task-b", 0, &big);
+    assert_eq!(flushed.len(), 2, "old pending window, then the new frame");
+    assert_eq!(flushed[0].agent_id, "task-a");
+    assert_eq!(flushed[0].first_offset, 10);
+    assert_eq!(flushed[0].text, "tail");
+    assert_eq!(flushed[1].agent_id, "task-b");
+    assert_eq!(flushed[1].first_offset, 0);
+    assert_eq!(flushed[1].text, big);
+    assert!(!coalescer.has_pending());
+}
