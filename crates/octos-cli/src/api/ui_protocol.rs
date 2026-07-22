@@ -9721,6 +9721,20 @@ async fn raw_peer_prepare(
             }
         };
 
+        // Mailbox nudge (#1801 v3 fan-in): when the preparing client names
+        // the session the handoff came from, record it so that session's
+        // later turns can carry a ready-note once this member's result
+        // lands (`peer_results_ready_note`). Best-effort; absent
+        // session_id (profile-scoped prepare) = no originator, no nudge.
+        if let Some(originator) = params.session_id.as_ref() {
+            if let Err(err) = crate::memory_consolidate::apply::atomic_write(
+                &peers_root.join(&member.slug).join("originator"),
+                &originator.to_string(),
+            ) {
+                tracing::warn!(?err, slug = %member.slug, "failed to record peer originator");
+            }
+        }
+
         // Track the member for the fleet-level rollback: the reserved dir is
         // the brief's parent (`peers/<slug>`), same claim `stage_peer` made.
         staged.push((member.slug.clone(), peers_root.join(&member.slug)));
@@ -9931,6 +9945,16 @@ fn build_peer_handoff_callback(
             request.worktree,
         )
         .map_err(|err| err.message)?;
+        // Mailbox nudge (#1801 v3 fan-in): record WHO handed off, so the
+        // originating session's later turns can carry a ready-note once
+        // this peer's result lands (`peer_results_ready_note`). Best-effort
+        // — a missing originator file just means no nudge.
+        if let Err(err) = crate::memory_consolidate::apply::atomic_write(
+            &peers_root.join(&staged.slug).join("originator"),
+            &originating_session.to_string(),
+        ) {
+            tracing::warn!(?err, slug = %staged.slug, "failed to record peer originator");
+        }
         // Durable so reconnect replay still delivers the open request; the
         // client dedups by an already-open session for the topic.
         emit_staged(PeerStagedEvent {
@@ -10034,27 +10058,31 @@ struct RawPeerGatherParams {
 const PEER_GATHER_BRIEF_CAP: usize = 16 * 1024;
 const PEER_GATHER_RESULT_CAP: usize = 48 * 1024;
 
-/// `peer/gather` (#1801 v2): the profile's peer blackboard — per staged peer
-/// its brief + latest result file (if any turn has terminated). Read-only.
-fn raw_peer_gather(
-    state: &Arc<AppState>,
-    request: &RpcRequest<Value>,
-    connection_profile_id: Option<&str>,
-) -> Result<Value, RpcError> {
-    let params: RawPeerGatherParams = parse_optional_raw_params(request)?;
-    let profile_id = raw_scoped_llm_profile_id(
-        params.profile_id.clone(),
-        params.session_id.as_ref(),
-        connection_profile_id,
-    )?;
-    let Some(runtime) = state.profiles.get(&profile_id) else {
-        return Err(RpcError::invalid_params(format!(
-            "profile {profile_id} has no bootstrapped runtime"
-        )));
-    };
-    let peers_root = runtime.data_dir.join("peers");
-    let mut peers: Vec<Value> = Vec::new();
-    if let Ok(read_dir) = std::fs::read_dir(&peers_root) {
+/// One peer blackboard row as read off disk (`peers/<slug>/`), per-field
+/// caps already applied. The shared currency of the `peer/gather` RPC and
+/// the `peer_gather` tool callback — both are views over the SAME read.
+struct PeerBlackboardRow {
+    slug: String,
+    /// `brief.md`, capped at [`PEER_GATHER_BRIEF_CAP`].
+    brief: String,
+    brief_truncated: bool,
+    /// `result.md` when any peer turn has terminated, capped at
+    /// [`PEER_GATHER_RESULT_CAP`]; `None` = still running.
+    result: Option<String>,
+    result_truncated: bool,
+    result_updated_unix: Option<u64>,
+    has_worktree: bool,
+}
+
+/// #1801: row-reading core of the peer blackboard — every staged peer dir
+/// under `peers_root` (a `brief.md` is the staging contract; stray dirs are
+/// skipped), optionally narrowed to `slugs`, sorted by slug, with the
+/// per-field caps applied. Extracted from `raw_peer_gather` verbatim so the
+/// RPC's behavior is unchanged and the `peer_gather` tool reads the exact
+/// same rows.
+fn read_peer_blackboard(peers_root: &Path, slugs: Option<&[String]>) -> Vec<PeerBlackboardRow> {
+    let mut rows: Vec<PeerBlackboardRow> = Vec::new();
+    if let Ok(read_dir) = std::fs::read_dir(peers_root) {
         let mut dirs: Vec<_> = read_dir
             .flatten()
             .filter(|entry| entry.path().is_dir())
@@ -10062,7 +10090,7 @@ fn raw_peer_gather(
         dirs.sort_by_key(|entry| entry.file_name());
         for entry in dirs {
             let slug = entry.file_name().to_string_lossy().into_owned();
-            if let Some(filter) = params.slugs.as_ref() {
+            if let Some(filter) = slugs {
                 if !filter.iter().any(|wanted| wanted == &slug) {
                     continue;
                 }
@@ -10088,19 +10116,243 @@ fn raw_peer_gather(
                 }
                 None => (None, false),
             };
-            peers.push(json!({
-                "slug": slug,
-                "topic": format!("peer-{slug}"),
-                "brief": brief,
-                "brief_truncated": brief_truncated,
-                "result": result,
-                "result_truncated": result_truncated,
-                "result_updated_unix": result_updated_unix,
-                "has_worktree": dir.join("wt").is_dir(),
-            }));
+            rows.push(PeerBlackboardRow {
+                slug,
+                brief,
+                brief_truncated,
+                result,
+                result_truncated,
+                result_updated_unix,
+                has_worktree: dir.join("wt").is_dir(),
+            });
         }
     }
+    rows
+}
+
+/// `peer/gather` (#1801 v2): the profile's peer blackboard — per staged peer
+/// its brief + latest result file (if any turn has terminated). Read-only.
+fn raw_peer_gather(
+    state: &Arc<AppState>,
+    request: &RpcRequest<Value>,
+    connection_profile_id: Option<&str>,
+) -> Result<Value, RpcError> {
+    let params: RawPeerGatherParams = parse_optional_raw_params(request)?;
+    let profile_id = raw_scoped_llm_profile_id(
+        params.profile_id.clone(),
+        params.session_id.as_ref(),
+        connection_profile_id,
+    )?;
+    let Some(runtime) = state.profiles.get(&profile_id) else {
+        return Err(RpcError::invalid_params(format!(
+            "profile {profile_id} has no bootstrapped runtime"
+        )));
+    };
+    let peers_root = runtime.data_dir.join("peers");
+    let peers: Vec<Value> = read_peer_blackboard(&peers_root, params.slugs.as_deref())
+        .into_iter()
+        .map(|row| {
+            json!({
+                "slug": row.slug,
+                "topic": format!("peer-{}", row.slug),
+                "brief": row.brief,
+                "brief_truncated": row.brief_truncated,
+                "result": row.result,
+                "result_truncated": row.result_truncated,
+                "result_updated_unix": row.result_updated_unix,
+                "has_worktree": row.has_worktree,
+            })
+        })
+        .collect();
     Ok(json!({ "profile_id": profile_id, "peers": peers }))
+}
+
+/// Total cap (bytes) on the composed `peer_gather` TOOL output — the model
+/// reads this inline in its context, so the whole blackboard view is
+/// bounded even when every peer maxes its per-field caps.
+const PEER_GATHER_TOOL_OUTPUT_CAP: usize = 48 * 1024;
+
+/// Brief preview length (chars) in the composed `peer_gather` tool text.
+/// The brief is the model's OWN task contract restated back to it — a
+/// header-line reminder, not the payload; the result is the payload.
+const PEER_GATHER_TOOL_BRIEF_PREVIEW_CHARS: usize = 200;
+
+/// Compose the plain-text blackboard view the `peer_gather` tool returns:
+/// one section per peer (done = a result file exists; peers write results
+/// when their turns end), total output capped at
+/// [`PEER_GATHER_TOOL_OUTPUT_CAP`] by truncating evenly across peers with a
+/// note steering the model to per-slug reads.
+fn compose_peer_gather_text(rows: &[PeerBlackboardRow]) -> String {
+    if rows.is_empty() {
+        return "No peers staged for this profile.".to_owned();
+    }
+    let mut sections: Vec<String> = rows
+        .iter()
+        .map(|row| {
+            let status = if row.result.is_some() {
+                "done"
+            } else {
+                "still running"
+            };
+            let brief_preview: String = row
+                .brief
+                .chars()
+                .take(PEER_GATHER_TOOL_BRIEF_PREVIEW_CHARS)
+                .collect();
+            let body = row
+                .result
+                .as_deref()
+                .unwrap_or("(still running — no result yet)");
+            format!(
+                "## peer {slug} ({status})\nBrief: {brief_preview}\n\n{body}\n",
+                slug = row.slug
+            )
+        })
+        .collect();
+    let joined_len =
+        sections.iter().map(String::len).sum::<usize>() + sections.len().saturating_sub(1);
+    if joined_len <= PEER_GATHER_TOOL_OUTPUT_CAP {
+        return sections.join("\n");
+    }
+    // Over budget: split the cap evenly across peers (the tui's compose
+    // approach, simplified) so one verbose peer cannot crowd out the rest.
+    const NOTE: &str = "[peer blackboard exceeds the gather budget; each peer below is \
+                        truncated evenly — pass slugs to read specific peers in full]\n\n";
+    const MARKER: &str = "\n[truncated]\n";
+    let budget = PEER_GATHER_TOOL_OUTPUT_CAP.saturating_sub(NOTE.len() + sections.len());
+    let per_peer = budget / sections.len();
+    for section in &mut sections {
+        if section.len() > per_peer {
+            let (capped, _) = capped_utf8(
+                std::mem::take(section),
+                per_peer.saturating_sub(MARKER.len()),
+            );
+            *section = capped;
+            section.push_str(MARKER);
+        }
+    }
+    format!("{NOTE}{}", sections.join("\n"))
+}
+
+/// #1801 v3 fan-in: `peer_gather` is registered for EVERY serve session —
+/// INCLUDING `peer-` topics. Deliberate contrast with
+/// [`peer_handoff_allowed_for_session`]: peers reading sibling results off
+/// the blackboard is collaboration, and the tool is read-only, so there is
+/// no recursion hazard for a depth guard to contain. The predicate exists
+/// (rather than inlining `true` at the wiring site) to keep that policy
+/// decision explicit at the same seam the handoff depth guard uses — and
+/// locked by the same tests.
+fn peer_gather_allowed_for_session(_session_id: &SessionKey) -> bool {
+    true
+}
+
+/// #1801 v3 fan-in: build the `peer_gather` read callback for ONE turn of
+/// the serve/WS path. The profile's `peers/` root is resolved at wiring
+/// time (exactly like `build_peer_handoff_callback`); the callback reads
+/// the blackboard through the SAME row reader the `peer/gather` RPC uses
+/// ([`read_peer_blackboard`]) and composes plain text for the model.
+fn build_peer_gather_callback(peers_root: PathBuf) -> octos_agent::PeerGatherCallback {
+    Arc::new(move |slugs: Option<Vec<String>>| {
+        Ok(compose_peer_gather_text(&read_peer_blackboard(
+            &peers_root,
+            slugs.as_deref(),
+        )))
+    })
+}
+
+/// Mailbox nudge (#1801 v3 fan-in): slugs named in the ready-note before the
+/// rest fold into "+N more".
+const PEER_RESULTS_NOTE_MAX_SLUGS: usize = 4;
+
+/// Mailbox nudge (#1801 v3 fan-in): one compact turn-start line telling the
+/// model that peers IT handed off have NEW results on the blackboard, so it
+/// gathers without being asked. A peer is "ready" when its
+/// `peers/<slug>/originator` matches this session AND `result.md`'s mtime is
+/// newer than the `.notified` stamp (which stores the mtime the last note
+/// covered) — so each result overwrite nudges at most once, and a result
+/// that advances re-nudges. Stamps are written here, at injection time.
+///
+/// Cheap by construction — this runs every turn: `None` without any IO for
+/// peer sessions and when the peers dir doesn't exist; otherwise one dir
+/// listing + stats, with the tiny `originator`/`.notified` reads only for
+/// dirs that have a result file at all. Never reads briefs or results.
+///
+/// Peer sessions are the WORKERS: they can gather on demand (the tool IS
+/// registered there) but are never nudged — the note belongs to the
+/// originating conversation that will synthesize.
+fn peer_results_ready_note(peers_root: &Path, session_id: &SessionKey) -> Option<String> {
+    if session_id
+        .topic()
+        .is_some_and(|topic| topic.starts_with("peer-"))
+    {
+        return None;
+    }
+    let read_dir = std::fs::read_dir(peers_root).ok()?;
+    let mut dirs: Vec<_> = read_dir
+        .flatten()
+        .filter(|entry| entry.path().is_dir())
+        .collect();
+    dirs.sort_by_key(|entry| entry.file_name());
+    let session = session_id.to_string();
+    // (slug, stamp path, result mtime) per ready peer.
+    let mut ready: Vec<(String, PathBuf, u64)> = Vec::new();
+    for entry in dirs {
+        let dir = entry.path();
+        // Stat-first: no result file means nothing to announce, skip
+        // before touching any other file.
+        let Some(result_mtime) = std::fs::metadata(dir.join("result.md"))
+            .ok()
+            .and_then(|meta| meta.modified().ok())
+            .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|elapsed| elapsed.as_secs())
+        else {
+            continue;
+        };
+        let stamp_path = dir.join(".notified");
+        let covered = std::fs::read_to_string(&stamp_path)
+            .ok()
+            .and_then(|stamp| stamp.trim().parse::<u64>().ok());
+        if covered.is_some_and(|covered| covered >= result_mtime) {
+            continue;
+        }
+        let Ok(originator) = std::fs::read_to_string(dir.join("originator")) else {
+            continue;
+        };
+        if originator.trim() != session {
+            continue;
+        }
+        ready.push((
+            entry.file_name().to_string_lossy().into_owned(),
+            stamp_path,
+            result_mtime,
+        ));
+    }
+    if ready.is_empty() {
+        return None;
+    }
+    // Stamp EVERY peer the note covers — the "+N more" ones included: the
+    // note tells the model results are ready and `peer_gather` reads them
+    // all. Best-effort; a failed stamp only risks one repeat nudge.
+    for (_, stamp_path, result_mtime) in &ready {
+        if let Err(err) =
+            crate::memory_consolidate::apply::atomic_write(stamp_path, &result_mtime.to_string())
+        {
+            tracing::warn!(?err, "failed to write peer .notified stamp");
+        }
+    }
+    let mut list = ready
+        .iter()
+        .take(PEER_RESULTS_NOTE_MAX_SLUGS)
+        .map(|(slug, _, _)| slug.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let more = ready.len().saturating_sub(PEER_RESULTS_NOTE_MAX_SLUGS);
+    if more > 0 {
+        list.push_str(&format!(" +{more} more"));
+    }
+    Some(format!(
+        "[peer results ready: {list} — use peer_gather to read them when relevant]"
+    ))
 }
 
 /// Serializes profile `sub_providers` read-modify-write across concurrent
@@ -23425,6 +23677,18 @@ async fn run_standalone_turn(
             tool_registry.register(octos_agent::PeerHandoffTool::new(stage));
         }
 
+        // #1801 v3 fan-in — `peer_gather`: the read half of the peer loop
+        // (`peer_handoff` fans out, this fans results back in). Registered
+        // NEXT to `peer_handoff` above but WITHOUT its depth guard: ALL
+        // serve sessions get it, INCLUDING peer- topics — peers reading
+        // sibling results off the blackboard is collaboration, and the tool
+        // is read-only (files under the profile's peers/ root), so there is
+        // no recursion hazard for a depth guard to contain.
+        if peer_gather_allowed_for_session(&session_id) {
+            let gather = build_peer_gather_callback(session_runtime.profile.data_dir.join("peers"));
+            tool_registry.register(octos_agent::PeerGatherTool::new(gather));
+        }
+
         // Wire the PARENT `send_file` for the legacy non-contract
         // `files_to_send` path and any explicit agent calls. The
         // spawn_only auto-background branch falls back to `send_file`
@@ -23574,10 +23838,23 @@ async fn run_standalone_turn(
         memory_store.clone(),
     )
     .with_config(agent_config.clone())
-    .with_system_prompt(append_workspace_root_hint(
-        system_prompt_base.clone(),
-        workspace_root.as_deref(),
-    ))
+    .with_system_prompt({
+        let mut prompt =
+            append_workspace_root_hint(system_prompt_base.clone(), workspace_root.as_deref());
+        // Mailbox nudge (#1801 v3 fan-in), same region as the workspace-root
+        // hint: when peers THIS session handed off have new results on the
+        // blackboard, one compact line tells the model to `peer_gather`
+        // without being asked. At most once per new result (`.notified`
+        // stamp), never for peer sessions, stat-cheap when there is nothing
+        // to say.
+        if let Some(note) =
+            peer_results_ready_note(&session_runtime.profile.data_dir.join("peers"), &session_id)
+        {
+            prompt.push_str("\n\n");
+            prompt.push_str(&note);
+        }
+        prompt
+    })
     .with_session_usage_base(session_usage_base.clone())
     // #1696 soak fix: thread the session key into every ToolContext this
     // turn builds. Without it the goal tools (and anything else reading
