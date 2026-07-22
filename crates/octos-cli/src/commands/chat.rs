@@ -276,6 +276,35 @@ fn reconcile_one_shot_prompt(
     }
 }
 
+/// Apply the "explicit `--provider` detaches the inherited route" rule.
+///
+/// When the CLI names a provider that DIFFERS from the one already resolved
+/// into `config` (typically inherited from a `--profile`), the sibling route
+/// fields carried by that config — `base_url`, `api_key_env`, `api_type` — are
+/// cleared so the *new* provider's defaults (or an explicit `--base-url` /
+/// `--api-type` / key env) apply instead of a stale, mismatched route. Without
+/// this, `octos chat --profile p --provider anthropic` keeps `p`'s openai
+/// key-env + endpoint + wire protocol and builds an incoherent client
+/// (anthropic name talking to openai's URL with openai's key). Naming the SAME
+/// provider — or naming none, or having no inherited provider to detach from —
+/// leaves the route untouched.
+///
+/// The model is deliberately NOT cleared: some providers mark the model as
+/// required (`create_provider_with_api_type` bails when it is missing), so
+/// blanking it would turn a provider swap into a hard error. Callers complete a
+/// cross-provider switch by also passing `--model`.
+fn detach_route_on_provider_override(config: &mut Config, cli_provider: Option<&str>) {
+    let detaches = matches!(
+        (cli_provider, config.provider.as_deref()),
+        (Some(cli), Some(cfg)) if cli != cfg
+    );
+    if detaches {
+        config.base_url = None;
+        config.api_key_env = None;
+        config.api_type = None;
+    }
+}
+
 /// Resolve the chat session's [`EffectivePermissions`] from the CLI flags.
 ///
 /// yolo GAP #3 — codex parity. Precedence and conflict rules:
@@ -795,13 +824,20 @@ impl ChatCommand {
         // config context.
         let serve_profile_config = load_serve_profile_config(self.profile.as_deref(), &data_dir)?;
         let profile_is_serve = serve_profile_config.is_some();
-        let config = if let Some(config_path) = &self.config {
+        let mut config = if let Some(config_path) = &self.config {
             Config::from_file(config_path)?
         } else if let Some(profile_config) = serve_profile_config {
             profile_config
         } else {
             Config::load_with_context(&cwd, &ctx)?
         };
+
+        // An explicit `--provider` that names a DIFFERENT provider than the
+        // inherited one does a clean switch: detach the profile's route so the
+        // new provider's defaults (or explicit `--base-url`/`--api-type`/key)
+        // apply, instead of silently keeping the old provider's key-env +
+        // endpoint. No-op when the provider matches or is unset.
+        detach_route_on_provider_override(&mut config, self.provider.as_deref());
 
         let model = self.model.or(config.model.clone());
         let base_url = self.base_url.or(config.base_url.clone());
@@ -1896,6 +1932,70 @@ pub(crate) fn build_run_pipeline_tool(
 #[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
+
+    /// A profile-derived config carrying a full openai route.
+    fn openai_route_config() -> Config {
+        Config {
+            provider: Some("openai".into()),
+            model: Some("gpt-4o".into()),
+            base_url: Some("https://fake.example/v1".into()),
+            api_key_env: Some("MYFAKE_PROFILE_KEY".into()),
+            api_type: Some("openai".into()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn explicit_provider_override_detaches_inherited_route() {
+        // Switching to a DIFFERENT provider must drop the profile's route
+        // siblings so the new provider's defaults / explicit flags apply —
+        // otherwise `--profile p --provider anthropic` builds an incoherent
+        // anthropic client still pointed at openai's key-env + endpoint.
+        let mut config = openai_route_config();
+        detach_route_on_provider_override(&mut config, Some("anthropic"));
+        assert_eq!(config.base_url, None, "base_url must detach");
+        assert_eq!(config.api_key_env, None, "api_key_env must detach");
+        assert_eq!(config.api_type, None, "api_type must detach");
+        // The model is intentionally left inherited (some providers require one;
+        // blanking it would turn a swap into a hard error). Complete the switch
+        // with `--model`.
+        assert_eq!(config.model.as_deref(), Some("gpt-4o"));
+    }
+
+    #[test]
+    fn same_provider_override_keeps_the_route() {
+        // Re-naming the SAME provider is a no-op re-affirmation; keep the route.
+        let mut config = openai_route_config();
+        detach_route_on_provider_override(&mut config, Some("openai"));
+        assert_eq!(config.base_url.as_deref(), Some("https://fake.example/v1"));
+        assert_eq!(config.api_key_env.as_deref(), Some("MYFAKE_PROFILE_KEY"));
+        assert_eq!(config.api_type.as_deref(), Some("openai"));
+    }
+
+    #[test]
+    fn absent_cli_provider_keeps_the_route() {
+        // No `--provider` at all — pure profile reuse — keeps the whole route.
+        let mut config = openai_route_config();
+        detach_route_on_provider_override(&mut config, None);
+        assert_eq!(config.base_url.as_deref(), Some("https://fake.example/v1"));
+        assert_eq!(config.api_key_env.as_deref(), Some("MYFAKE_PROFILE_KEY"));
+        assert_eq!(config.api_type.as_deref(), Some("openai"));
+    }
+
+    #[test]
+    fn provider_override_without_inherited_provider_keeps_route() {
+        // No inherited provider identity to detach from (unusual ambient config
+        // with a bare route): leave it alone rather than clobber it.
+        let mut config = Config {
+            provider: None,
+            base_url: Some("https://amb.example/v1".into()),
+            api_key_env: Some("AMBIENT_KEY".into()),
+            ..Default::default()
+        };
+        detach_route_on_provider_override(&mut config, Some("anthropic"));
+        assert_eq!(config.base_url.as_deref(), Some("https://amb.example/v1"));
+        assert_eq!(config.api_key_env.as_deref(), Some("AMBIENT_KEY"));
+    }
 
     #[test]
     fn read_only_runtime_paths_keep_host_state_outside_workspace() {
