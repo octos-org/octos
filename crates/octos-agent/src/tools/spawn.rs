@@ -3,7 +3,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use async_trait::async_trait;
 use eyre::{Result, WrapErr};
@@ -803,17 +803,28 @@ fn role_task_capability_warning(effective_tools: &[String], task: &str) -> Optio
 /// persistence overhead (codex plan review: "the proposed per-token
 /// persistence/on_change fan-out is too heavy"). The WS layer emits via
 /// `send_notification_ephemeral(UiNotification::AgentOutputDelta(...))`.
+/// Live child-stream callback: `(agent_id, start_offset, text_delta)` —
+/// `start_offset` is the cumulative streamed-bytes offset BEFORE the delta
+/// (the window's first byte), `u64` end to end to match
+/// `OutputCursor::offset` on the wire.
+type ChildStreamCallback = Arc<dyn Fn(&str, u64, &str) + Send + Sync>;
+
 struct SpawnChildTranscriptReporter {
     router: Arc<SubAgentOutputRouter>,
     router_session_id: String,
     task_id: String,
-    /// Cumulative byte offset of streamed text so far. Incremented per
-    /// `StreamChunk` so each `agent/output/delta` carries a monotonically
-    /// increasing `cursor.offset` — clients can then detect gaps / reorder
-    /// if chunks ever arrive out of order (e.g. across reconnects). Atomic
-    /// because `report(&self)` is `&self` and the reporter is shared across
-    /// the child's tokio task(s).
-    stream_offset: AtomicUsize,
+    /// Cumulative byte count of streamed text so far. Incremented per
+    /// `StreamChunk`; the callback receives the value from BEFORE the
+    /// increment, i.e. the START offset of the delta's window — the same
+    /// convention every other `cursor` producer uses
+    /// (`TaskOutputDeltaTracker`, the agent_orchestrator read RPCs all
+    /// report `cursor` = window start). Monotonic, so clients can detect
+    /// gaps / reorder if chunks ever arrive out of order (e.g. across
+    /// reconnects). Atomic because `report(&self)` is `&self` and the
+    /// reporter is shared across the child's tokio task(s). `u64` end to
+    /// end so no lossy narrowing hides between here and
+    /// `OutputCursor::offset` (`u64`) on the wire.
+    stream_offset: AtomicU64,
     /// Optional callback for live `StreamChunk` forwarding. Called directly
     /// from the reporter thread with `(agent_id, cursor_offset, text_delta)`
     /// — the caller owns the emit path (e.g. emitting
@@ -821,11 +832,10 @@ struct SpawnChildTranscriptReporter {
     /// properly-formed `AgentOutputDeltaEvent` keyed on the child's
     /// `agent_id`). The `agent_id` is the spawn's `task_id` (the same id
     /// surfaced via `TurnSpawnCompleteEvent` / the agent dock).
-    /// `cursor_offset` is the cumulative byte offset AFTER this chunk
-    /// (i.e. the end-offset of this delta) — matches `OutputCursor::offset`
-    /// semantics on the wire.
-    on_stream_chunk:
-        Option<Arc<dyn Fn(&str, usize, &str) + Send + Sync>>,
+    /// `cursor_offset` is the cumulative byte offset BEFORE this chunk
+    /// (i.e. the start-offset of this delta's window) — matches the
+    /// start-offset convention of every sibling `OutputCursor` producer.
+    on_stream_chunk: Option<ChildStreamCallback>,
 }
 
 impl crate::progress::ProgressReporter for SpawnChildTranscriptReporter {
@@ -851,56 +861,47 @@ impl crate::progress::ProgressReporter for SpawnChildTranscriptReporter {
                 format!("[tool {status}] {name} — {first}\n")
             }
             ProgressEvent::FileModified { path } => format!("[file modified] {path}\n"),
-            // StreamChunk: forward live text deltas directly to the
+            // StreamChunk: live text goes ONLY to the direct
             // on_stream_chunk callback (if set) so the WS layer can emit
             // agent/output/delta WITHOUT going through on_change (which
             // persists a snapshot on every fire — too heavy per-token per
-            // codex review). The router write is still done so
-            // task/output/delta also gets it (the TUI fallback path).
+            // codex review). Deliberately NO router append here: the
+            // Response arm below already appends each iteration's full
+            // text, so writing the same bytes per-chunk would land every
+            // child message TWICE in `<task_id>.out` (this exact
+            // duplication is what the original drop-comment on this arm
+            // warned about). The router file stays the Response-based
+            // durable record; `task/output/delta` is produced from
+            // supervisor progress events, not router appends, so no live
+            // consumer loses anything.
             //
-            // Backpressure note (codex review): a fast LLM child can fire
-            // this 100+ times/sec. There is no per-token coalescing here —
-            // backpressure is the WS transport's responsibility
-            // (`send_notification_ephemeral` pushes to a bounded channel
-            // which applies natural backpressure on a slow client). If this
-            // proves insufficient under N parallel children, add a ~16ms
-            // coalescing debounce at the callback site.
+            // Delivery note (codex review): a fast LLM child can fire
+            // this 100+ times/sec. There is no per-token coalescing here,
+            // and the ephemeral WS send is LOSSY: `try_enqueue` onto the
+            // bounded channel drops the frame on full (BackpressureDrop)
+            // rather than blocking the producer. Dropped deltas are
+            // acceptable for a live tail (the durable record is the
+            // Response append); if loss under N parallel children proves
+            // user-visible, add a ~16ms coalescing debounce at the
+            // callback site.
             ProgressEvent::StreamChunk { text, .. } => {
                 if !text.is_empty() {
-                    // Advance the cumulative byte offset BEFORE invoking
-                    // the callback so the emitted `cursor.offset` is the
-                    // end-offset of this delta (monotonic, lets clients
-                    // detect gaps / reorder on reconnect).
-                    let new_offset = self
+                    // `fetch_add` returns the PREVIOUS value: the
+                    // cumulative streamed-bytes offset BEFORE this chunk,
+                    // i.e. the START offset of the delta's window —
+                    // matching every sibling `cursor` producer
+                    // (TaskOutputDeltaTracker, the agent_orchestrator
+                    // read RPCs). Monotonic, so clients can detect gaps /
+                    // reorder on reconnect.
+                    let start_offset = self
                         .stream_offset
-                        .fetch_add(text.len(), Ordering::Relaxed)
-                        + text.len();
+                        .fetch_add(text.len() as u64, Ordering::Relaxed);
                     if let Some(ref cb) = self.on_stream_chunk {
                         // Pass `(task_id, cursor_offset, text)` so the WS
                         // layer can construct a properly-keyed
                         // `AgentOutputDeltaEvent` (the dock correlates live
                         // output with the spawned agent by `task_id`).
-                        cb(self.task_id.as_str(), new_offset, text.as_str());
-                    }
-                    // Also append to the router file so task/output/delta
-                    // carries the same content (TUI fallback path). Use
-                    // `text` directly — no need to re-allocate (codex
-                    // review: the previous `format!("{text}")` was a
-                    // redundant per-token allocation on the hot path).
-                    if let Err(error) = self.router.append(
-                        &self.router_session_id,
-                        &self.task_id,
-                        text.as_bytes(),
-                    ) {
-                        // The callback path still delivered the delta to
-                        // WS clients, so this only affects the TUI
-                        // fallback. Log so a failing router (disk full,
-                        // permission, race with cleanup) isn't silent.
-                        tracing::warn!(
-                            task_id = %self.task_id,
-                            error = %error,
-                            "stream chunk router append failed — TUI fallback path will miss this delta"
-                        );
+                        cb(self.task_id.as_str(), start_offset, text.as_str());
                     }
                 }
                 return;
@@ -1102,7 +1103,7 @@ pub struct SpawnTool {
     /// spawn child's `ProgressEvent::StreamChunk` text is forwarded here so
     /// the WS/serve layer can emit `agent/output/delta` directly (bypassing
     /// the heavy `on_change` + per-token persistence path — per codex review).
-    child_stream_callback: Option<Arc<dyn Fn(&str, usize, &str) + Send + Sync>>,
+    child_stream_callback: Option<ChildStreamCallback>,
     /// M8 Runtime Parity W2.B1: parent session's M8.7 summary generator
     /// so the child can spawn periodic-summary watchers under the same
     /// LLM/budget contract.
@@ -1554,12 +1555,16 @@ impl SpawnTool {
     /// `(agent_id, cursor_offset, text)`:
     /// - `agent_id` is the spawn's `task_id` (the same id surfaced via
     ///   `TurnSpawnCompleteEvent` and the agent dock).
-    /// - `cursor_offset` is the cumulative byte offset AFTER this chunk
-    ///   (monotonic; lets clients detect gaps/reorder on reconnect).
+    /// - `cursor_offset` is the cumulative byte offset BEFORE this chunk —
+    ///   the START of the delta's window, matching every sibling
+    ///   `OutputCursor` producer (`TaskOutputDeltaTracker`, the
+    ///   agent_orchestrator read RPCs). Monotonic; lets clients detect
+    ///   gaps/reorder on reconnect. `u64` end to end so no lossy cast
+    ///   hides between here and `OutputCursor::offset` on the wire.
     /// - `text` is the delta text.
     pub fn with_child_stream_callback(
         mut self,
-        cb: impl Fn(&str, usize, &str) + Send + Sync + 'static,
+        cb: impl Fn(&str, u64, &str) + Send + Sync + 'static,
     ) -> Self {
         self.child_stream_callback = Some(Arc::new(cb));
         self
@@ -4510,7 +4515,7 @@ impl Tool for SpawnTool {
                                 router: router.clone(),
                                 router_session_id: child_router_session_id.clone(),
                                 task_id: task_id.clone(),
-                                stream_offset: AtomicUsize::new(0),
+                                stream_offset: AtomicU64::new(0),
                                 on_stream_chunk: child_stream_callback.clone(),
                             }))
                         }

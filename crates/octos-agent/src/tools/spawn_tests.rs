@@ -2192,6 +2192,142 @@ async fn background_child_transcript_streams_to_router_and_final_output_is_recor
     );
 }
 
+/// PR #1799 fix pins, all through a REAL detached background child.
+///
+/// (a) the `child_stream_callback` receives live `(task_id, start_offset,
+///     text)` chunks with START-offset cursor semantics (offset of the
+///     window's first byte — the convention every sibling cursor producer
+///     uses), monotonically: offset[i+1] == offset[i] + len(text[i]).
+/// (b) duplication pin: each child message lands in the router file
+///     EXACTLY once. Before the fix the StreamChunk arm appended live
+///     text to the same `<task_id>.out` the Response arm appends full
+///     iteration text to, doubling every message (the exact duplication
+///     the original drop-comment warned about).
+#[tokio::test]
+async fn child_stream_callback_gets_start_offsets_and_router_file_has_no_duplicates() {
+    let (in_tx, _in_rx) = tokio::sync::mpsc::channel(16);
+    let temp = tempfile::tempdir().unwrap();
+    let ledger = temp.path().join("tasks.jsonl");
+    let workspace = temp.path().join("ws");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let supervisor = Arc::new(TaskSupervisor::new());
+    supervisor.enable_persistence(&ledger).unwrap();
+    let router = Arc::new(crate::subagent_output::SubAgentOutputRouter::new(
+        temp.path().join("router"),
+    ));
+    let chunks: Arc<std::sync::Mutex<Vec<(String, u64, String)>>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
+    let chunks_sink = Arc::clone(&chunks);
+    let tool = SpawnTool::new(
+        Arc::new(ContentThenToolProvider {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        }),
+        Arc::new(create_test_store().await),
+        workspace.clone(),
+        in_tx,
+    )
+    .with_task_supervisor(supervisor.clone(), "api:test-session", ledger.clone())
+    .with_parent_subagent_output_router(router.clone())
+    .with_child_stream_callback(move |task_id, offset, text| {
+        chunks_sink
+            .lock()
+            .unwrap()
+            .push((task_id.to_owned(), offset, text.to_owned()));
+    });
+
+    let result = tool
+        .execute(&serde_json::json!({
+            "task": "scan the workspace and report",
+            "label": "streamer",
+            "mode": "background",
+            "allowed_tools": ["list_dir"]
+        }))
+        .await
+        .unwrap();
+    assert!(result.success, "dispatch failed: {}", result.output);
+
+    let started = std::time::Instant::now();
+    let task = loop {
+        let tasks = supervisor.get_tasks_for_session("api:test-session");
+        if let Some(task) = tasks.first() {
+            if task.status == crate::task_supervisor::TaskStatus::Completed {
+                break task.clone();
+            }
+            if task.status == crate::task_supervisor::TaskStatus::Failed {
+                panic!("background child failed: {:?}", task.error);
+            }
+        }
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "background child did not complete in time"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    };
+
+    // (a) live chunks arrived, keyed by the spawned task id, with
+    // start-offset cursors: first window starts at 0, and each next
+    // window starts where the previous ended.
+    let chunks = chunks.lock().unwrap().clone();
+    assert!(
+        chunks.len() >= 2,
+        "expected a chunk per iteration (plan + final), got {chunks:?}"
+    );
+    for (task_id, _, _) in &chunks {
+        assert_eq!(task_id, &task.id, "chunks are keyed by the child task id");
+    }
+    assert_eq!(chunks[0].1, 0, "the FIRST window starts at offset 0");
+    let mut expected = 0u64;
+    for (_, offset, text) in &chunks {
+        assert_eq!(
+            *offset, expected,
+            "start-offset must be the cumulative streamed bytes BEFORE the chunk: {chunks:?}"
+        );
+        expected += text.len() as u64;
+    }
+
+    // (b) NO duplication in the router file: streamed live text goes only
+    // to the callback; the router transcript is the Response-based durable
+    // record, one copy per message.
+    let transcript = router
+        .preview(&task.id)
+        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+        .unwrap_or_default();
+    assert_eq!(
+        transcript.matches("FINAL: transcript test done").count(),
+        1,
+        "the final text must appear EXACTLY once (StreamChunk must not \
+         double the Response append): {transcript:?}"
+    );
+    assert_eq!(
+        transcript.matches("PLAN: scan the tree").count(),
+        1,
+        "iteration text must appear EXACTLY once: {transcript:?}"
+    );
+}
+
+/// PR #1799 fix pin (c): `child_spawn_clone` preserves the stream callback
+/// so grandchildren keep streaming to the dock (the #1679 lesson: child
+/// registries silently losing parent wiring).
+#[tokio::test]
+async fn child_spawn_clone_preserves_stream_callback() {
+    let (in_tx, _in_rx) = tokio::sync::mpsc::channel(16);
+    let temp = tempfile::tempdir().unwrap();
+    let workspace = temp.path().join("ws");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let tool = SpawnTool::new(
+        Arc::new(MockProvider),
+        Arc::new(create_test_store().await),
+        workspace.clone(),
+        in_tx,
+    )
+    .with_child_stream_callback(|_, _, _| {});
+    let clone = tool.child_spawn_clone(workspace, &AgentId::new("child-1"));
+    assert!(
+        clone.child_stream_callback.is_some(),
+        "the grandchild spawn path must inherit the stream callback"
+    );
+}
+
 /// Emits one `shell` call that writes a deliverable via a redirect —
 /// reporting no `file_modified`, exactly like the mini4 heredoc reviews —
 /// then ends the turn.

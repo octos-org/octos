@@ -26,25 +26,24 @@ use octos_agent::{
 use octos_core::app_ui_codec::{self, AppUiFrame, MAX_TEXT_FRAME_BYTES};
 use octos_core::ui_protocol::{
     AgentOutputDeltaEvent, AgentUpdatedEvent, ApprovalAutoResolvedEvent, ApprovalCancelledEvent,
-    ApprovalCommandDetails,
-    ApprovalDecidedEvent, ApprovalDecision, ApprovalId, ApprovalRenderHints,
-    ApprovalRequestedEvent, ApprovalTypedDetails, AttachmentOwnerV2, ContentBulkDeleteParams,
-    ContentDeleteParams, ContentListParams, ContextCompactionCompletedEvent,
-    ContextCompactionStartedEvent, ContextNormalizationReportedEvent, CronListParams,
-    CronToggleParams, EnvelopeTokenUsage, EnvelopeV2, EnvelopeV2Notification, FileRef,
-    HydratedMessage, HydratedTurn, InputItem, MemoryEntityParams, MemoryOverviewParams,
-    MessageDeltaEvent, MessageMeta, OutputCursor, Payload, PayloadV2, ReplayLossyEvent, RpcError,
-    RpcErrorResponse, RpcRequest, RpcResponse, SESSION_HYDRATE_INCLUDE_MAX,
-    SESSION_MESSAGES_PAGE_DEFAULT_LIMIT, SESSION_MESSAGES_PAGE_MAX_LIMIT,
-    SESSION_MESSAGES_PAGE_MAX_OFFSET, SESSION_TITLE_SET_MAX_CHARS, SessionBtwParams,
-    SessionDeleteParams, SessionFilesListParams, SessionHydrateParams, SessionHydrateResult,
-    SessionListParams, SessionMessagesPageParams, SessionOpenParams, SessionOpenResult,
-    SessionOpened, SessionOrchestrationEvent, SessionRollbackParams, SessionRollbackResult,
-    SessionSnapshotParams, SessionStatusGetParams, SessionTasksListParams, SessionTitleSetParams,
-    SessionWorkspaceGetParams, SystemStatusGetParams, TaskArtifactListParams,
-    TaskArtifactListResult, TaskArtifactReadParams, TaskArtifactReadResult, TaskArtifactRecord,
-    TaskCancelParams, TaskCancelResult, TaskListEntry, TaskListParams, TaskListResult,
-    TaskOutputDeltaEvent, TaskRestartFromNodeParams, TaskRestartFromNodeResult,
+    ApprovalCommandDetails, ApprovalDecidedEvent, ApprovalDecision, ApprovalId,
+    ApprovalRenderHints, ApprovalRequestedEvent, ApprovalTypedDetails, AttachmentOwnerV2,
+    ContentBulkDeleteParams, ContentDeleteParams, ContentListParams,
+    ContextCompactionCompletedEvent, ContextCompactionStartedEvent,
+    ContextNormalizationReportedEvent, CronListParams, CronToggleParams, EnvelopeTokenUsage,
+    EnvelopeV2, EnvelopeV2Notification, FileRef, HydratedMessage, HydratedTurn, InputItem,
+    MemoryEntityParams, MemoryOverviewParams, MessageDeltaEvent, MessageMeta, OutputCursor,
+    Payload, PayloadV2, ReplayLossyEvent, RpcError, RpcErrorResponse, RpcRequest, RpcResponse,
+    SESSION_HYDRATE_INCLUDE_MAX, SESSION_MESSAGES_PAGE_DEFAULT_LIMIT,
+    SESSION_MESSAGES_PAGE_MAX_LIMIT, SESSION_MESSAGES_PAGE_MAX_OFFSET, SESSION_TITLE_SET_MAX_CHARS,
+    SessionBtwParams, SessionDeleteParams, SessionFilesListParams, SessionHydrateParams,
+    SessionHydrateResult, SessionListParams, SessionMessagesPageParams, SessionOpenParams,
+    SessionOpenResult, SessionOpened, SessionOrchestrationEvent, SessionRollbackParams,
+    SessionRollbackResult, SessionSnapshotParams, SessionStatusGetParams, SessionTasksListParams,
+    SessionTitleSetParams, SessionWorkspaceGetParams, SystemStatusGetParams,
+    TaskArtifactListParams, TaskArtifactListResult, TaskArtifactReadParams, TaskArtifactReadResult,
+    TaskArtifactRecord, TaskCancelParams, TaskCancelResult, TaskListEntry, TaskListParams,
+    TaskListResult, TaskOutputDeltaEvent, TaskRestartFromNodeParams, TaskRestartFromNodeResult,
     TaskRuntimeState as UiTaskRuntimeState, TaskUpdatedEvent, ThreadGraphEntry,
     ThreadGraphGetParams, ThreadGraphGetResult, ToolCompletedEvent, ToolProgressEvent,
     ToolStartedEvent, TurnCompletedEvent, TurnErrorEvent, TurnId, TurnInterruptParams,
@@ -22704,37 +22703,47 @@ async fn run_standalone_turn(
         // callback receives `(agent_id, cursor_offset, text)` where
         // `agent_id` is the spawn's `task_id` (the same id surfaced via
         // `TurnSpawnCompleteEvent` and the agent dock) and `cursor_offset`
-        // is the cumulative byte offset AFTER this chunk (monotonic — lets
-        // clients detect gaps / reorder on reconnect). Ephemeral send:
+        // (`u64`, matching `OutputCursor::offset` end to end) is the
+        // cumulative byte offset BEFORE this chunk — the START of the
+        // delta's window, the same convention as every other cursor
+        // producer (`TaskOutputDeltaTracker`, the read RPCs). Monotonic —
+        // lets clients detect gaps / reorder on reconnect. Ephemeral send:
         // deltas are explicitly non-durable (mirrors `message/delta`).
         //
-        // Backpressure note (codex review): no per-token coalescing here —
-        // relies on the WS transport's bounded send channel for natural
-        // backpressure on slow clients. If N parallel children flood the
-        // sink, add a ~16ms coalescing debounce at this site.
+        // Delivery note (codex review): no per-token coalescing here, and
+        // the ephemeral send is LOSSY — `send_ephemeral`'s `try_enqueue`
+        // DROPS the frame when the bounded WS channel is full
+        // (BackpressureDrop) instead of blocking the producer. Acceptable
+        // for a live tail (the durable record is the reporter's
+        // Response-arm router append); if N parallel children make the
+        // loss user-visible, add a ~16ms coalescing debounce at this site.
         {
             let ws_for_stream = ws.clone();
             let ledger_for_stream = ledger.clone();
             let session_id_for_stream = session_id.clone();
-            spawn_tool = spawn_tool.with_child_stream_callback(
-                move |agent_id, cursor_offset, text| {
+            spawn_tool =
+                spawn_tool.with_child_stream_callback(move |agent_id, cursor_offset, text| {
                     let event = AgentOutputDeltaEvent {
                         session_id: session_id_for_stream.clone(),
                         agent_id: agent_id.to_string(),
-                        cursor: OutputCursor { offset: cursor_offset },
+                        cursor: OutputCursor {
+                            offset: cursor_offset,
+                        },
                         text: text.to_string(),
                     };
                     // Ephemeral: deltas must NOT be appended to the ledger
                     // (per-token persistence is the overhead codex flagged).
-                    // The router-file append inside the reporter already
-                    // covers the `task/output/delta` TUI fallback path.
+                    // The durable transcript is the reporter's
+                    // Response-arm append to the SubAgentOutputRouter file
+                    // (the StreamChunk arm deliberately does NOT write the
+                    // router file — doing both doubled every child message
+                    // in `<task_id>.out`).
                     let _ = send_notification_ephemeral(
                         &ws_for_stream,
                         &ledger_for_stream,
                         UiNotification::AgentOutputDelta(event),
                     );
-                },
-            );
+                });
         }
         let child_context_parent = context_manager.clone();
         // Child (forked sub-agent) context ledgers belong to the parent's
