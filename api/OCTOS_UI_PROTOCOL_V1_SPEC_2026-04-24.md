@@ -555,6 +555,17 @@ M16 context lifecycle (gate `context.lifecycle.v1`):
 
 - `context/compaction_completed`, `context/compaction_started`, `context/normalization_reported`
 
+Peer staging (#1801 v3, ungated):
+
+- `peer/staged` — agent-initiated peer staging: the model's `peer_handoff`
+  tool staged a sovereign peer session server-side (durable brief + optional
+  fenced worktree), and the client auto-opens the staged session (topic
+  `peer-<slug>`) in the background. `params` carry the ORIGINATING
+  `session_id` plus `topic`, `slug`, `brief`, `brief_path`, `cwd`,
+  `worktree_branch?`, and `profile_id` — the same facts a `peer/prepare`
+  result entry carries. Durable: reconnect replay redelivers it, so clients
+  dedup by existing session for the topic.
+
 ## 7. Command Semantics
 
 ### `session/open`

@@ -6,7 +6,7 @@ use std::{
     process::Command,
     sync::{
         Arc, Mutex as StdMutex, OnceLock,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicU32, AtomicU64, Ordering},
     },
     time::Duration,
 };
@@ -33,8 +33,8 @@ use octos_core::ui_protocol::{
     ContextNormalizationReportedEvent, CronListParams, CronToggleParams, EnvelopeTokenUsage,
     EnvelopeV2, EnvelopeV2Notification, FileRef, HydratedMessage, HydratedTurn, InputItem,
     MemoryEntityParams, MemoryOverviewParams, MessageDeltaEvent, MessageMeta, OutputCursor,
-    Payload, PayloadV2, ReplayLossyEvent, RpcError, RpcErrorResponse, RpcRequest, RpcResponse,
-    SESSION_HYDRATE_INCLUDE_MAX, SESSION_MESSAGES_PAGE_DEFAULT_LIMIT,
+    Payload, PayloadV2, PeerStagedEvent, ReplayLossyEvent, RpcError, RpcErrorResponse, RpcRequest,
+    RpcResponse, SESSION_HYDRATE_INCLUDE_MAX, SESSION_MESSAGES_PAGE_DEFAULT_LIMIT,
     SESSION_MESSAGES_PAGE_MAX_LIMIT, SESSION_MESSAGES_PAGE_MAX_OFFSET, SESSION_TITLE_SET_MAX_CHARS,
     SessionBtwParams, SessionDeleteParams, SessionFilesListParams, SessionHydrateParams,
     SessionHydrateResult, SessionListParams, SessionMessagesPageParams, SessionOpenParams,
@@ -9688,81 +9688,48 @@ async fn raw_peer_prepare(
         return Err(RpcError::invalid_params("n must be between 1 and 8"));
     }
 
-    // Fleet staging is ALL-OR-NOTHING: reserve every slug up front (create_dir
-    // is the atomic claim), then fence + write briefs; any failure rolls back
-    // every staged dir and (best-effort) any git-side leavings so no slug or
-    // branch is burned by a half-staged fleet.
+    // Fleet staging is ALL-OR-NOTHING: each member goes through `stage_peer`
+    // (reserve → optional worktree fence → atomic brief write; the failing
+    // member rolls ITSELF back inside the helper), and any member failure
+    // rolls back every previously staged member plus (best-effort) its
+    // git-side leavings — so no slug or branch is burned by a half-staged
+    // fleet. Git work is blocking; keep each member off the reactor.
     let mut staged: Vec<(String, PathBuf)> = Vec::new();
+    let mut entries: Vec<Value> = Vec::new();
     for _ in 0..n {
-        match reserve_peer_dir(&peers_root, &seed) {
-            Ok(pair) => staged.push(pair),
+        let member_peers_root = peers_root.clone();
+        let member_workspace_root = workspace_root.clone();
+        let member_seed = seed.clone();
+        let member_brief = brief.to_owned();
+        let member_worktree = params.worktree;
+        let member = tokio::task::spawn_blocking(move || {
+            stage_peer(
+                &member_peers_root,
+                &member_workspace_root,
+                &member_seed,
+                &member_brief,
+                member_worktree,
+            )
+        })
+        .await
+        .map_err(|err| RpcError::internal_error(format!("worktree task failed: {err}")));
+        let member = match member.and_then(|inner| inner) {
+            Ok(member) => member,
             Err(err) => {
                 cleanup_staged_peers(&workspace_root, &staged).await;
                 return Err(err);
             }
-        }
-    }
-
-    let mut entries: Vec<Value> = Vec::new();
-    for (slug, peer_dir) in &staged {
-        // The fence: a worktree on branch `peer/<slug>` under the peer dir.
-        // Git work is blocking; keep it off the reactor.
-        let peer_cwd = if params.worktree {
-            let worktree_path = peer_dir.join("wt");
-            let branch = format!("peer/{slug}");
-            let root = workspace_root.clone();
-            let target = worktree_path.clone();
-            let branch_arg = branch.clone();
-            let output = tokio::task::spawn_blocking(move || {
-                std::process::Command::new("git")
-                    .arg("-C")
-                    .arg(&root)
-                    .arg("worktree")
-                    .arg("add")
-                    .arg("-b")
-                    .arg(&branch_arg)
-                    .arg(&target)
-                    .output()
-            })
-            .await
-            .map_err(|err| RpcError::internal_error(format!("worktree task failed: {err}")));
-            let output = match output.and_then(|inner| {
-                inner.map_err(|err| RpcError::invalid_params(format!("failed to run git: {err}")))
-            }) {
-                Ok(output) => output,
-                Err(err) => {
-                    cleanup_staged_peers(&workspace_root, &staged).await;
-                    return Err(err);
-                }
-            };
-            if !output.status.success() {
-                let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-                cleanup_staged_peers(&workspace_root, &staged).await;
-                return Err(RpcError::invalid_params(format!(
-                    "git worktree add failed (is {} a git repo?): {}",
-                    workspace_root.display(),
-                    stderr
-                )));
-            }
-            worktree_path
-        } else {
-            workspace_root.clone()
         };
 
-        let brief_path = peer_dir.join("brief.md");
-        if let Err(err) = crate::memory_consolidate::apply::atomic_write(&brief_path, brief) {
-            cleanup_staged_peers(&workspace_root, &staged).await;
-            return Err(RpcError::internal_error(format!(
-                "failed to write brief: {err}"
-            )));
-        }
-
+        // Track the member for the fleet-level rollback: the reserved dir is
+        // the brief's parent (`peers/<slug>`), same claim `stage_peer` made.
+        staged.push((member.slug.clone(), peers_root.join(&member.slug)));
         entries.push(json!({
-            "slug": slug,
-            "topic": format!("peer-{slug}"),
-            "brief_path": brief_path.to_string_lossy(),
-            "cwd": peer_cwd.to_string_lossy(),
-            "worktree_branch": params.worktree.then(|| format!("peer/{slug}")),
+            "slug": member.slug,
+            "topic": member.topic,
+            "brief_path": member.brief_path.to_string_lossy(),
+            "cwd": member.cwd.to_string_lossy(),
+            "worktree_branch": member.worktree_branch,
             "profile_id": profile_id.clone(),
         }));
     }
@@ -9805,6 +9772,185 @@ async fn cleanup_staged_peers(workspace_root: &Path, staged: &[(String, PathBuf)
         }
     })
     .await;
+}
+
+/// One staged peer, as produced by [`stage_peer`]: the durable facts a
+/// `peer/prepare` result entry (and the `peer/staged` notification) carry.
+#[derive(Debug)]
+struct StagedPeer {
+    slug: String,
+    /// Session topic the client opens (`peer-<slug>`).
+    topic: String,
+    /// `peers/<slug>/brief.md` under the profile data dir.
+    brief_path: PathBuf,
+    /// Worktree checkout when fenced, else the workspace root.
+    cwd: PathBuf,
+    /// `peer/<slug>` when a worktree fence was created.
+    worktree_branch: Option<String>,
+}
+
+/// #1801 v3: single-peer staging core shared by the `peer/prepare` fleet
+/// loop and the `peer_handoff` tool callback. Reserves the slug dir
+/// (`reserve_peer_dir` — `create_dir` is the atomic claim), optionally
+/// fences a worktree on branch `peer/<slug>`, and writes the brief
+/// atomically. Any failure AFTER the reserve rolls back this member's own
+/// dir plus (best-effort) its git-side leavings so the slug is never
+/// burned. Synchronous by design (git via `std::process`): the RPC fleet
+/// loop keeps it off the reactor via `spawn_blocking`, while the tool
+/// callback — a sync `Fn` — runs it directly on the tool's worker.
+fn stage_peer(
+    peers_root: &Path,
+    workspace_root: &Path,
+    seed: &str,
+    brief: &str,
+    worktree: bool,
+) -> Result<StagedPeer, RpcError> {
+    let (slug, peer_dir) = reserve_peer_dir(peers_root, seed)?;
+    // The fence: a worktree on branch `peer/<slug>` under the peer dir.
+    let cwd = if worktree {
+        let worktree_path = peer_dir.join("wt");
+        let branch = format!("peer/{slug}");
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(workspace_root)
+            .arg("worktree")
+            .arg("add")
+            .arg("-b")
+            .arg(&branch)
+            .arg(&worktree_path)
+            .output();
+        let output = match output {
+            Ok(output) => output,
+            Err(err) => {
+                cleanup_staged_peer(workspace_root, &slug, &peer_dir);
+                return Err(RpcError::invalid_params(format!(
+                    "failed to run git: {err}"
+                )));
+            }
+        };
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+            cleanup_staged_peer(workspace_root, &slug, &peer_dir);
+            return Err(RpcError::invalid_params(format!(
+                "git worktree add failed (is {} a git repo?): {}",
+                workspace_root.display(),
+                stderr
+            )));
+        }
+        worktree_path
+    } else {
+        workspace_root.to_path_buf()
+    };
+
+    let brief_path = peer_dir.join("brief.md");
+    if let Err(err) = crate::memory_consolidate::apply::atomic_write(&brief_path, brief) {
+        cleanup_staged_peer(workspace_root, &slug, &peer_dir);
+        return Err(RpcError::internal_error(format!(
+            "failed to write brief: {err}"
+        )));
+    }
+
+    Ok(StagedPeer {
+        topic: format!("peer-{slug}"),
+        worktree_branch: worktree.then(|| format!("peer/{slug}")),
+        slug,
+        brief_path,
+        cwd,
+    })
+}
+
+/// Roll back ONE half-staged peer: remove its reserved dir, then
+/// best-effort `git worktree prune` + `branch -D peer/<slug>` (both no-ops
+/// for a member that never got a worktree). The single-member synchronous
+/// sibling of [`cleanup_staged_peers`], used inside [`stage_peer`].
+fn cleanup_staged_peer(workspace_root: &Path, slug: &str, dir: &Path) {
+    let _ = std::fs::remove_dir_all(dir);
+    let _ = std::process::Command::new("git")
+        .arg("-C")
+        .arg(workspace_root)
+        .args(["worktree", "prune"])
+        .output();
+    let branch = format!("peer/{slug}");
+    let _ = std::process::Command::new("git")
+        .arg("-C")
+        .arg(workspace_root)
+        .args(["branch", "-D", &branch])
+        .output();
+}
+
+/// #1801 v3: per-turn ceiling on `peer_handoff` staging calls. A runaway
+/// model cannot fan out an unbounded peer fleet in one turn; the 5th call
+/// is rejected with a model-visible error.
+const PEER_HANDOFFS_PER_TURN_MAX: u32 = 4;
+
+/// #1801 v3 depth-1 guard: a peer session (topic `peer-<slug>`) never gets
+/// the `peer_handoff` tool registered at all — peers cannot hand off
+/// recursively, and the tool is not even visible to the model there.
+fn peer_handoff_allowed_for_session(session_id: &SessionKey) -> bool {
+    !session_id
+        .topic()
+        .is_some_and(|topic| topic.starts_with("peer-"))
+}
+
+/// #1801 v3: build the `peer_handoff` staging callback for ONE turn of the
+/// serve/WS path. Turn-scoped state is baked in at wiring time: the
+/// profile's `peers/` root, the session's workspace root, the ORIGINATING
+/// session key stamped onto the emitted `peer/staged` event, and the
+/// per-turn handoff counter enforcing [`PEER_HANDOFFS_PER_TURN_MAX`].
+/// `emit_staged` abstracts the durable notification send so tests can
+/// observe the event without a live WS connection.
+fn build_peer_handoff_callback(
+    peers_root: PathBuf,
+    workspace_root: PathBuf,
+    originating_session: SessionKey,
+    profile_id: String,
+    handoffs_this_turn: Arc<AtomicU32>,
+    emit_staged: Arc<dyn Fn(PeerStagedEvent) + Send + Sync>,
+) -> octos_agent::PeerHandoffCallback {
+    Arc::new(move |request: octos_agent::PeerHandoffRequest| {
+        if handoffs_this_turn.fetch_add(1, Ordering::SeqCst) >= PEER_HANDOFFS_PER_TURN_MAX {
+            return Err(format!(
+                "peer handoff limit reached for this turn ({PEER_HANDOFFS_PER_TURN_MAX})"
+            ));
+        }
+        // Same seed derivation as `raw_peer_prepare`: trimmed title, else
+        // the brief's leading words. The tool already validated/trimmed.
+        let seed = request.title.clone().unwrap_or_else(|| {
+            request
+                .brief
+                .split_whitespace()
+                .take(6)
+                .collect::<Vec<_>>()
+                .join(" ")
+        });
+        let staged = stage_peer(
+            &peers_root,
+            &workspace_root,
+            &seed,
+            &request.brief,
+            request.worktree,
+        )
+        .map_err(|err| err.message)?;
+        // Durable so reconnect replay still delivers the open request; the
+        // client dedups by an already-open session for the topic.
+        emit_staged(PeerStagedEvent {
+            session_id: originating_session.clone(),
+            topic: staged.topic.clone(),
+            slug: staged.slug.clone(),
+            brief: request.brief.clone(),
+            brief_path: staged.brief_path.to_string_lossy().into_owned(),
+            cwd: staged.cwd.to_string_lossy().into_owned(),
+            worktree_branch: staged.worktree_branch.clone(),
+            profile_id: profile_id.clone(),
+        });
+        Ok(octos_agent::PeerHandoffStaged {
+            slug: staged.slug,
+            topic: staged.topic,
+            brief_path: staged.brief_path.to_string_lossy().into_owned(),
+            cwd: staged.cwd.to_string_lossy().into_owned(),
+            worktree_branch: staged.worktree_branch,
+        })
+    })
 }
 
 /// #1801 v2: peer sessions leave a durable result on the blackboard — a
@@ -23246,6 +23392,39 @@ async fn run_standalone_turn(
         tool_registry.register(spawn_tool);
         // RFC-0 (#1289): LRU deferral removed — no base-tool pin needed.
 
+        // #1801 v3 — LLM-initiated peer staging (`peer_handoff`). Mirrors the
+        // per-turn spawn-tool wiring above: the tool is constructed fresh for
+        // THIS turn with turn-scoped state baked into its callback (profile
+        // peers root, session workspace root, originating session key, and a
+        // per-turn `AtomicU32` handoff counter). Registered ONLY on this
+        // serve/WS path — gateway/chat/ACP have no client that can open
+        // sessions, the same verdict as the child stream callback above.
+        // Depth-1: a peer session (topic `peer-<slug>`) is skipped entirely,
+        // so the tool is not even visible to the model there and peers can
+        // never hand off recursively. The staged event is sent DURABLE so a
+        // briefly-disconnected client still opens the peer on replay.
+        if peer_handoff_allowed_for_session(&session_id) {
+            let peer_ws = ws.clone();
+            let peer_ledger = ledger.clone();
+            let emit_staged: Arc<dyn Fn(PeerStagedEvent) + Send + Sync> =
+                Arc::new(move |event: PeerStagedEvent| {
+                    let _ = send_notification_durable(
+                        &peer_ws,
+                        &peer_ledger,
+                        UiNotification::PeerStaged(event),
+                    );
+                });
+            let stage = build_peer_handoff_callback(
+                session_runtime.profile.data_dir.join("peers"),
+                session_runtime.workspace_root.clone(),
+                session_id.clone(),
+                session_runtime.profile.profile_id.clone(),
+                Arc::new(AtomicU32::new(0)),
+                emit_staged,
+            );
+            tool_registry.register(octos_agent::PeerHandoffTool::new(stage));
+        }
+
         // Wire the PARENT `send_file` for the legacy non-contract
         // `files_to_send` path and any explicit agent calls. The
         // spawn_only auto-background branch falls back to `send_file`
@@ -28876,6 +29055,10 @@ fn ledger_event_cursor(event: &UiProtocolLedgerEvent) -> Option<UiCursor> {
             // Whole-job orchestration status is a stateless lifecycle push
             // (no durable cursor of its own).
             | UiNotification::SessionOrchestration(_)
+            // #1801 v3: peer staging carries filesystem facts (brief path /
+            // cwd / branch), not a replay cursor; the durable ledger cursor
+            // on the surrounding LedgeredUiProtocolEvent is authoritative.
+            | UiNotification::PeerStaged(_)
             // UPCR-2026-014 M9-γ: envelopes carry their OWN per-thread
             // `seq` allocated by `ThreadSeqAllocator`, not the per-session
             // `UiCursor` the legacy ledger replay uses. The durable

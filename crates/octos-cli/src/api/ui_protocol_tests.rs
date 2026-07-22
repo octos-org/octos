@@ -24218,6 +24218,189 @@ fn reserve_peer_dir_claims_atomically_and_suffixes_collisions() {
     assert!(!slug_c.is_empty());
 }
 
+/// #1801 v3: `stage_peer` — the single-peer core `peer/prepare` and the
+/// `peer_handoff` callback share — reserves the slug atomically, writes the
+/// brief, fences worktrees, and releases the slug when staging fails.
+#[test]
+fn stage_peer_reserves_slug_writes_brief_and_releases_on_failure() {
+    let tmp = tempfile::tempdir().unwrap();
+    let peers = tmp.path().join("peers");
+    let plain = tmp.path().join("plain");
+    std::fs::create_dir_all(&plain).unwrap();
+
+    // Plain staging: reserved dir + topic + brief on disk, cwd echoes the
+    // workspace root, no fence branch.
+    let staged = stage_peer(
+        &peers,
+        &plain,
+        "CI Fix",
+        "Investigate the flaky test.",
+        false,
+    )
+    .expect("plain staging");
+    assert_eq!(staged.slug, "ci-fix");
+    assert_eq!(staged.topic, "peer-ci-fix");
+    assert_eq!(staged.cwd, plain);
+    assert_eq!(staged.worktree_branch, None);
+    assert!(staged.brief_path.ends_with("peers/ci-fix/brief.md"));
+    assert_eq!(
+        std::fs::read_to_string(&staged.brief_path).unwrap(),
+        "Investigate the flaky test."
+    );
+
+    // Same seed again: the reserve claim suffixes, same as peer/prepare.
+    let second = stage_peer(&peers, &plain, "CI Fix", "Second lane.", false).unwrap();
+    assert_eq!(second.slug, "ci-fix-2");
+
+    // Worktree against a NON-git workspace fails AND releases the slug —
+    // the member cleans its own dir so a retry re-claims the same name.
+    let err = stage_peer(&peers, &plain, "No Repo", "Doomed.", true)
+        .expect_err("worktree without a git repo must fail");
+    assert!(
+        err.message.contains("git repo"),
+        "actionable: {}",
+        err.message
+    );
+    assert!(
+        !peers.join("no-repo").exists(),
+        "failed member removed its dir"
+    );
+    let retry = stage_peer(&peers, &plain, "No Repo", "Fenceless retry.", false)
+        .expect("failed staging must not burn the slug");
+    assert_eq!(retry.slug, "no-repo");
+
+    // Worktree against a real repo: fenced cwd + branch.
+    fn git(dir: &std::path::Path, args: &[&str]) {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    let repo = tmp.path().join("project");
+    std::fs::create_dir_all(&repo).unwrap();
+    git(&repo, &["init", "-q"]);
+    git(
+        &repo,
+        &[
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "user.name=t",
+            "commit",
+            "--allow-empty",
+            "-m",
+            "init",
+        ],
+    );
+    let fenced =
+        stage_peer(&peers, &repo, "Fenced Lane", "Own worktree.", true).expect("worktree staging");
+    assert_eq!(fenced.worktree_branch.as_deref(), Some("peer/fenced-lane"));
+    assert!(fenced.cwd.ends_with("peers/fenced-lane/wt"));
+    assert!(
+        fenced.cwd.join(".git").exists(),
+        "worktree checkout is real"
+    );
+}
+
+/// #1801 v3 depth-1 guard: `peer_handoff` wiring is skipped for sessions
+/// whose topic is `peer-<slug>` — a peer must never see the tool at all.
+#[test]
+fn peer_handoff_wiring_skipped_for_peer_topics() {
+    let peer = octos_core::SessionKey::with_profile_topic("dev", "local", "tui", "peer-ci-fix");
+    assert!(!peer_handoff_allowed_for_session(&peer));
+
+    let plain = octos_core::SessionKey::with_profile("dev", "local", "tui");
+    assert!(peer_handoff_allowed_for_session(&plain));
+
+    let other_topic = octos_core::SessionKey::with_profile_topic("dev", "local", "tui", "coding");
+    assert!(peer_handoff_allowed_for_session(&other_topic));
+
+    // Only the `peer-` PREFIX gates; a topic merely containing it stays on.
+    let contains = octos_core::SessionKey::with_profile_topic("dev", "local", "tui", "my-peer-x");
+    assert!(peer_handoff_allowed_for_session(&contains));
+}
+
+/// #1801 v3 per-turn cap: the staging callback stages at most
+/// [`PEER_HANDOFFS_PER_TURN_MAX`] peers, emits a `peer/staged` event per
+/// success stamped with the ORIGINATING session, and rejects the 5th call
+/// with the model-visible limit error.
+#[test]
+fn peer_handoff_callback_caps_at_four_and_emits_staged_events() {
+    let tmp = tempfile::tempdir().unwrap();
+    let peers_root = tmp.path().join("data").join("peers");
+    let workspace = tmp.path().join("work");
+    std::fs::create_dir_all(&workspace).unwrap();
+
+    let originating = octos_core::SessionKey::with_profile_topic("dev", "local", "tui", "coding");
+    let emitted: Arc<StdMutex<Vec<PeerStagedEvent>>> = Arc::new(StdMutex::new(Vec::new()));
+    let emitted_sink = emitted.clone();
+    let callback = build_peer_handoff_callback(
+        peers_root.clone(),
+        workspace.clone(),
+        originating.clone(),
+        "dev".to_owned(),
+        Arc::new(AtomicU32::new(0)),
+        Arc::new(move |event| emitted_sink.lock().unwrap().push(event)),
+    );
+
+    for n in 1..=PEER_HANDOFFS_PER_TURN_MAX {
+        let staged = callback(octos_agent::PeerHandoffRequest {
+            brief: format!("Lane {n}: fix the flaky bus test."),
+            title: Some("Lane".to_owned()),
+            worktree: false,
+        })
+        .unwrap_or_else(|err| panic!("handoff {n} within the cap must stage: {err}"));
+        assert_eq!(staged.topic, format!("peer-{}", staged.slug));
+        assert!(
+            std::path::Path::new(&staged.brief_path).is_file(),
+            "brief durable on disk: {}",
+            staged.brief_path
+        );
+    }
+
+    let err = callback(octos_agent::PeerHandoffRequest {
+        brief: "One too many.".to_owned(),
+        title: None,
+        worktree: false,
+    })
+    .expect_err("5th handoff must be rejected");
+    assert_eq!(err, "peer handoff limit reached for this turn (4)");
+    assert!(
+        !peers_root.join("one-too-many").exists(),
+        "rejected handoff must not stage anything"
+    );
+
+    let emitted = emitted.lock().unwrap();
+    assert_eq!(emitted.len(), 4, "one peer/staged event per success");
+    let slugs: Vec<&str> = emitted.iter().map(|e| e.slug.as_str()).collect();
+    assert_eq!(slugs, vec!["lane", "lane-2", "lane-3", "lane-4"]);
+    for (i, event) in emitted.iter().enumerate() {
+        assert_eq!(
+            event.session_id, originating,
+            "event routes to the ORIGINATING session"
+        );
+        assert_eq!(event.topic, format!("peer-{}", event.slug));
+        assert_eq!(event.profile_id, "dev");
+        assert_eq!(
+            event.brief,
+            format!("Lane {}: fix the flaky bus test.", i + 1)
+        );
+        assert_eq!(event.worktree_branch, None);
+        assert_eq!(
+            std::path::PathBuf::from(&event.cwd),
+            workspace,
+            "plain peer runs in the originating workspace root"
+        );
+    }
+}
+
 /// End-to-end `peer/prepare`: brief written atomically under the profile
 /// data dir, worktree fenced on branch `peer/<slug>`, failures do not burn
 /// the slug, and validation rejects empty/oversized briefs.

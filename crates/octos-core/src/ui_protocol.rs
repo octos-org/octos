@@ -1213,6 +1213,14 @@ pub mod methods {
     pub const CONTEXT_NORMALIZATION_REPORTED: &str = "context/normalization_reported";
     /// Session-level whole-job orchestration status notification.
     pub const SESSION_ORCHESTRATION: &str = "session/orchestration";
+    /// #1801 v3 `peer/staged` — agent-initiated peer staging. The model's
+    /// `peer_handoff` tool staged a sovereign peer session server-side
+    /// (durable brief + optional fenced worktree); sessions are
+    /// client-connection-coupled, so this durable notification asks the
+    /// user's client to OPEN the staged session (topic `peer-<slug>`) in
+    /// the background. `session_id` is the ORIGINATING session; replayed on
+    /// reconnect, so clients dedup by existing session.
+    pub const PEER_STAGED: &str = "peer/staged";
 }
 
 /// Reason codes for `approval/cancelled` notifications. The registry is
@@ -1330,6 +1338,7 @@ pub const UI_PROTOCOL_NOTIFICATION_METHODS: &[&str] = &[
     methods::CONTEXT_COMPACTION_COMPLETED,
     methods::CONTEXT_COMPACTION_STARTED,
     methods::CONTEXT_NORMALIZATION_REPORTED,
+    methods::PEER_STAGED,
 ];
 
 /// Request methods currently handled by the first server/runtime slice.
@@ -6111,6 +6120,41 @@ pub struct QueueStateEvent {
     pub head_client_message_id: Option<String>,
 }
 
+/// `peer/staged` (#1801 v3) — agent-initiated peer staging. Emitted by the
+/// serve/WS turn path when the model's `peer_handoff` tool staged a peer
+/// through the host callback: the durable brief (and optional fenced
+/// worktree) already exist on disk, and the user's client is asked to open
+/// the staged session in the background. Sessions are
+/// client-connection-coupled — the MODEL stages, the CLIENT opens.
+///
+/// Durable (ledger-appended): reconnect replay redelivers the event, so a
+/// client dedups by an already-open session for `topic`. `topic` here is the
+/// staged PEER's session topic (`peer-<slug>`), a payload field — routing
+/// still keys off `session_id`, the ORIGINATING session.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PeerStagedEvent {
+    /// The ORIGINATING session (the conversation whose turn staged the peer).
+    pub session_id: SessionKey,
+    /// Topic of the staged peer session the client opens (`peer-<slug>`).
+    pub topic: String,
+    /// Directory slug reserved under the profile's `peers/` root.
+    pub slug: String,
+    /// The full task contract handed to the peer (also durable on disk at
+    /// `brief_path` — carried inline so the client can render a preview
+    /// without a filesystem read).
+    pub brief: String,
+    /// Absolute path of the durable brief (`peers/<slug>/brief.md`).
+    pub brief_path: String,
+    /// Working directory for the peer session (worktree checkout when
+    /// fenced, else the originating session's workspace root).
+    pub cwd: String,
+    /// Fence branch (`peer/<slug>`) when a worktree was created.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree_branch: Option<String>,
+    /// Profile the peer session runs under.
+    pub profile_id: String,
+}
+
 /// Draft notification payloads for UI protocol v1.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[allow(clippy::large_enum_variant)]
@@ -6197,6 +6241,10 @@ pub enum UiNotification {
     /// continuation pending), so a client can render a job indicator that stays
     /// live across the sub-agent-complete → master-re-entry gap.
     SessionOrchestration(SessionOrchestrationEvent),
+    /// #1801 v3: the model's `peer_handoff` tool staged a sovereign peer
+    /// session (durable brief + optional fenced worktree); the client opens
+    /// the staged session in the background. See [`PeerStagedEvent`].
+    PeerStaged(PeerStagedEvent),
     /// UPCR-2026-014 (M9-γ) canonical projection envelope (`projection/envelope`).
     /// Spec § 14. Capability-gated on `projection.envelope.v1`; the
     /// per-connection live filter keeps legacy and envelope deliveries
@@ -6269,6 +6317,7 @@ impl UiNotification {
             Self::ContextCompactionStarted(_) => methods::CONTEXT_COMPACTION_STARTED,
             Self::ContextNormalizationReported(_) => methods::CONTEXT_NORMALIZATION_REPORTED,
             Self::SessionOrchestration(_) => methods::SESSION_ORCHESTRATION,
+            Self::PeerStaged(_) => methods::PEER_STAGED,
             Self::Envelope(_) => methods::PROJECTION_ENVELOPE,
             Self::EnvelopeV2(_) => methods::PROJECTION_ENVELOPE,
         }
@@ -6319,6 +6368,7 @@ impl UiNotification {
             Self::ContextCompactionStarted(event) => &event.session_id,
             Self::ContextNormalizationReported(event) => &event.session_id,
             Self::SessionOrchestration(event) => &event.session_id,
+            Self::PeerStaged(event) => &event.session_id,
             Self::Envelope(event) => &event.session_id,
             Self::EnvelopeV2(event) => &event.session_id,
         }
@@ -6474,6 +6524,11 @@ impl UiNotification {
             Self::ContextCompactionStarted(params) => serde_json::to_value(params),
             Self::ContextNormalizationReported(params) => serde_json::to_value(params),
             Self::SessionOrchestration(params) => serde_json::to_value(params),
+            // #1801 v3: `topic` on the payload is the staged PEER's topic
+            // (`peer-<slug>`), NOT this notification's routing topic — the
+            // `stamp_topic_from_session` catch-all above leaves it alone,
+            // and routing keys off `session_id` (the originating session).
+            Self::PeerStaged(params) => serde_json::to_value(params),
             // UPCR-2026-014 (M9-γ) + feat(envelope-wire-routing): the wire
             // shape per spec § 14.1 is the bare `Envelope` fields FLATTENED
             // with the routing keys `session_id` (the bare base key) +
@@ -6617,6 +6672,7 @@ impl UiNotification {
             methods::SESSION_ORCHESTRATION => {
                 Ok(Self::SessionOrchestration(decode_params(method, params)?))
             }
+            methods::PEER_STAGED => Ok(Self::PeerStaged(decode_params(method, params)?)),
             // UPCR-2026-014 (M9-γ) + feat(envelope-wire-routing): decode
             // the FLATTENED wire frame — bare Envelope keys plus the
             // routing keys `session_id` + `topic`. Backward-compatible:
