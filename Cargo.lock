@@ -4258,7 +4258,7 @@ dependencies = [
 
 [[package]]
 name = "octos-agent"
-version = "2.0.2-rc.12"
+version = "2.0.2-rc.13"
 dependencies = [
  "async-trait",
  "base64",
@@ -4317,7 +4317,7 @@ dependencies = [
 
 [[package]]
 name = "octos-bus"
-version = "2.0.2-rc.12"
+version = "2.0.2-rc.13"
 dependencies = [
  "aes",
  "async-imap",
@@ -4359,7 +4359,7 @@ dependencies = [
 
 [[package]]
 name = "octos-cli"
-version = "2.0.2-rc.12"
+version = "2.0.2-rc.13"
 dependencies = [
  "agent-client-protocol",
  "argon2",
@@ -4435,7 +4435,7 @@ dependencies = [
 
 [[package]]
 name = "octos-core"
-version = "2.0.2-rc.12"
+version = "2.0.2-rc.13"
 dependencies = [
  "chrono",
  "eyre",
@@ -4450,7 +4450,7 @@ dependencies = [
 
 [[package]]
 name = "octos-diagnostics"
-version = "2.0.2-rc.12"
+version = "2.0.2-rc.13"
 dependencies = [
  "eyre",
  "octos-core",
@@ -4462,14 +4462,14 @@ dependencies = [
 
 [[package]]
 name = "octos-dora-mcp"
-version = "2.0.2-rc.12"
+version = "2.0.2-rc.13"
 dependencies = [
  "octos-agent",
 ]
 
 [[package]]
 name = "octos-llm"
-version = "2.0.2-rc.12"
+version = "2.0.2-rc.13"
 dependencies = [
  "async-trait",
  "base64",
@@ -4493,7 +4493,7 @@ dependencies = [
 
 [[package]]
 name = "octos-memory"
-version = "2.0.2-rc.12"
+version = "2.0.2-rc.13"
 dependencies = [
  "bincode",
  "chrono",
@@ -4513,7 +4513,7 @@ dependencies = [
 
 [[package]]
 name = "octos-pipeline"
-version = "2.0.2-rc.12"
+version = "2.0.2-rc.13"
 dependencies = [
  "async-trait",
  "chrono",
@@ -4537,7 +4537,7 @@ dependencies = [
 
 [[package]]
 name = "octos-plugin"
-version = "2.0.2-rc.12"
+version = "2.0.2-rc.13"
 dependencies = [
  "eyre",
  "metrics",
@@ -4566,7 +4566,7 @@ dependencies = [
 
 [[package]]
 name = "octos-server"
-version = "2.0.2-rc.12"
+version = "2.0.2-rc.13"
 dependencies = [
  "async-trait",
  "axum",
@@ -4603,7 +4603,7 @@ dependencies = [
 
 [[package]]
 name = "octos-services"
-version = "2.0.2-rc.12"
+version = "2.0.2-rc.13"
 dependencies = [
  "chrono",
  "dirs",
@@ -4624,7 +4624,7 @@ dependencies = [
 
 [[package]]
 name = "octos-store"
-version = "2.0.2-rc.12"
+version = "2.0.2-rc.13"
 dependencies = [
  "base64",
  "chrono",
@@ -4644,7 +4644,7 @@ dependencies = [
 
 [[package]]
 name = "octos-swarm"
-version = "2.0.2-rc.12"
+version = "2.0.2-rc.13"
 dependencies = [
  "async-trait",
  "chrono",
@@ -4664,7 +4664,7 @@ dependencies = [
 
 [[package]]
 name = "octos-workflows"
-version = "2.0.2-rc.12"
+version = "2.0.2-rc.13"
 dependencies = [
  "chrono",
  "eyre",
@@ -7747,7 +7747,7 @@ dependencies = [
 
 [[package]]
 name = "wechat-bridge"
-version = "2.0.2-rc.12"
+version = "2.0.2-rc.13"
 dependencies = [
  "clap",
  "futures-util",
