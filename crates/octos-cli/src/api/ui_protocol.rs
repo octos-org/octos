@@ -9696,12 +9696,31 @@ async fn raw_peer_prepare(
         .map_err(|err| RpcError::internal_error(format!("worktree task failed: {err}")))?
         .map_err(|err| RpcError::invalid_params(format!("failed to run git: {err}")))?;
         if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
             let _ = std::fs::remove_dir_all(&peer_dir);
+            // Best-effort git-side cleanup (K3 review): old-git orderings can
+            // leave a dangling `peer/<slug>` branch or worktree metadata
+            // behind a failed add (modern git creates the branch last, so
+            // both are usually no-ops). Never surfaces its own errors — the
+            // add failure below is the actionable one.
+            let root = workspace_root.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                let _ = std::process::Command::new("git")
+                    .arg("-C")
+                    .arg(&root)
+                    .args(["worktree", "prune"])
+                    .output();
+                let _ = std::process::Command::new("git")
+                    .arg("-C")
+                    .arg(&root)
+                    .args(["branch", "-D", &branch])
+                    .output();
+            })
+            .await;
             return Err(RpcError::invalid_params(format!(
                 "git worktree add failed (is {} a git repo?): {}",
                 workspace_root.display(),
-                stderr.trim()
+                stderr
             )));
         }
         worktree_path
