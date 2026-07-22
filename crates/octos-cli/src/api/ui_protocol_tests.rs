@@ -24401,6 +24401,370 @@ fn peer_handoff_callback_caps_at_four_and_emits_staged_events() {
     }
 }
 
+/// #1801 v3 fan-in: `peer_gather` registers where `peer_handoff` does NOT —
+/// same session-key seam, opposite verdict for `peer-` topics. Peers reading
+/// sibling results is blackboard collaboration, and the tool is read-only,
+/// so there is no recursion hazard for a depth guard to contain.
+#[test]
+fn peer_gather_allowed_for_peer_sessions_unlike_handoff() {
+    let peer = octos_core::SessionKey::with_profile_topic("dev", "local", "tui", "peer-ci-fix");
+    assert!(
+        !peer_handoff_allowed_for_session(&peer),
+        "handoff keeps its depth-1 guard"
+    );
+    assert!(
+        peer_gather_allowed_for_session(&peer),
+        "peers CAN gather sibling results off the blackboard"
+    );
+
+    let plain = octos_core::SessionKey::with_profile("dev", "local", "tui");
+    assert!(peer_handoff_allowed_for_session(&plain));
+    assert!(peer_gather_allowed_for_session(&plain));
+}
+
+/// #1801 v3 fan-in: the gather callback composes one plain-text section per
+/// peer — done peers carry their result text, running peers the placeholder
+/// — the brief appears as a 200-char preview, and the slugs filter narrows.
+#[test]
+fn peer_gather_callback_composes_done_and_running_rows() {
+    let tmp = tempfile::tempdir().unwrap();
+    let peers_root = tmp.path().join("peers");
+    let alpha = peers_root.join("alpha");
+    std::fs::create_dir_all(&alpha).unwrap();
+    // > 200 chars, single line, so the preview cut is observable.
+    let long_brief = format!("Review the auth diff. {}", "pad ".repeat(100));
+    std::fs::write(alpha.join("brief.md"), &long_brief).unwrap();
+    std::fs::write(
+        alpha.join("result.md"),
+        "---\nslug: alpha\nstatus: completed\n---\n\nAuth diff is sound.\n",
+    )
+    .unwrap();
+    let beta = peers_root.join("beta");
+    std::fs::create_dir_all(&beta).unwrap();
+    std::fs::write(beta.join("brief.md"), "Check CI.").unwrap();
+
+    let callback = build_peer_gather_callback(peers_root.clone());
+    let text = callback(None).expect("gather composes");
+    assert!(text.contains("## peer alpha (done)"), "{text}");
+    assert!(
+        text.contains("Auth diff is sound."),
+        "result is the payload"
+    );
+    assert!(text.contains("## peer beta (still running)"), "{text}");
+    assert!(text.contains("(still running — no result yet)"));
+    assert!(text.contains("Brief: Check CI."));
+    let brief_line = text
+        .lines()
+        .find(|line| line.starts_with("Brief: Review the auth diff."))
+        .expect("alpha brief line");
+    assert_eq!(
+        brief_line.chars().count(),
+        "Brief: ".chars().count() + PEER_GATHER_TOOL_BRIEF_PREVIEW_CHARS,
+        "brief is a preview, not the payload"
+    );
+
+    let text = callback(Some(vec!["beta".to_owned()])).expect("filtered gather");
+    assert!(text.contains("## peer beta"));
+    assert!(!text.contains("## peer alpha"), "slugs filter narrows");
+}
+
+/// #1801 v3 fan-in: empty blackboard — peers dir missing entirely, or
+/// present with nothing staged — composes the fixed no-peers message.
+#[test]
+fn peer_gather_callback_reports_empty_blackboard() {
+    let tmp = tempfile::tempdir().unwrap();
+    let missing = build_peer_gather_callback(tmp.path().join("peers"));
+    assert_eq!(
+        missing(None).expect("missing dir is not an error"),
+        "No peers staged for this profile."
+    );
+
+    let empty_root = tmp.path().join("peers2");
+    std::fs::create_dir_all(&empty_root).unwrap();
+    let empty = build_peer_gather_callback(empty_root);
+    assert_eq!(empty(None).unwrap(), "No peers staged for this profile.");
+}
+
+/// #1801 v3 fan-in: the composed tool output is capped at 48KiB total,
+/// truncated EVENLY across peers with a steering note — one verbose peer
+/// cannot crowd out the rest, and every peer stays visible.
+#[test]
+fn peer_gather_callback_caps_total_output_evenly() {
+    let tmp = tempfile::tempdir().unwrap();
+    let peers_root = tmp.path().join("peers");
+    for slug in ["p1", "p2", "p3"] {
+        let dir = peers_root.join(slug);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("brief.md"), format!("Task {slug}.")).unwrap();
+        std::fs::write(dir.join("result.md"), "r".repeat(30 * 1024)).unwrap();
+    }
+    let callback = build_peer_gather_callback(peers_root);
+    let text = callback(None).unwrap();
+    assert!(
+        text.len() <= PEER_GATHER_TOOL_OUTPUT_CAP,
+        "90KiB of results must compose under the {PEER_GATHER_TOOL_OUTPUT_CAP}-byte cap, got {}",
+        text.len()
+    );
+    assert!(text.contains("truncated evenly"), "steering note present");
+    for slug in ["p1", "p2", "p3"] {
+        assert!(
+            text.contains(&format!("## peer {slug} (done)")),
+            "every peer stays visible: {slug}"
+        );
+    }
+    assert_eq!(
+        text.matches("[truncated]").count(),
+        3,
+        "each oversized peer is marked"
+    );
+}
+
+/// Mailbox nudge (#1801 v3): the `peer_handoff` staging callback records the
+/// originating session in `peers/<slug>/originator` so later turns of that
+/// session can be nudged when the result lands.
+#[test]
+fn peer_originator_recorded_by_handoff_callback() {
+    let tmp = tempfile::tempdir().unwrap();
+    let peers_root = tmp.path().join("data").join("peers");
+    let workspace = tmp.path().join("work");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let originating = octos_core::SessionKey::with_profile_topic("dev", "local", "tui", "coding");
+    let callback = build_peer_handoff_callback(
+        peers_root.clone(),
+        workspace,
+        originating.clone(),
+        "dev".to_owned(),
+        Arc::new(AtomicU32::new(0)),
+        Arc::new(|_event| {}),
+    );
+    let staged = callback(octos_agent::PeerHandoffRequest {
+        brief: "Fix the flaky bus test.".to_owned(),
+        title: Some("CI Fix".to_owned()),
+        worktree: false,
+    })
+    .expect("stage");
+    let originator =
+        std::fs::read_to_string(peers_root.join(&staged.slug).join("originator")).unwrap();
+    assert_eq!(originator, originating.to_string());
+}
+
+/// Mailbox nudge (#1801 v3): `peer/prepare` records the originator for every
+/// fleet member when the client passes `session_id`, and records nothing
+/// when it does not (no originator = no nudge, by design).
+#[tokio::test]
+async fn peer_originator_recorded_by_prepare_when_session_id_present() {
+    let tmp = tempfile::tempdir().unwrap();
+    let profile = crate::profiles::UserProfile {
+        id: "dev".to_string(),
+        name: "Dev".to_string(),
+        enabled: true,
+        data_dir: None,
+        parent_id: None,
+        public_subdomain: None,
+        config: crate::profiles::ProfileConfig {
+            llm: Some(crate::profiles::LlmProfileConfig {
+                primary: Some(crate::profiles::LlmModelSelectionConfig {
+                    family_id: Some("openai".to_string()),
+                    model_id: Some("gpt-4o-mini".to_string()),
+                    route: Some(crate::profiles::LlmRouteConfig {
+                        route_id: None,
+                        label: None,
+                        base_url: None,
+                        api_key_env: Some("PEER_ORIG_TEST_KEY".to_string()),
+                        api_type: None,
+                    }),
+                    ..Default::default()
+                }),
+                fallbacks: Vec::new(),
+            }),
+            env_vars: [("PEER_ORIG_TEST_KEY".to_string(), "test-key".to_string())]
+                .into_iter()
+                .collect(),
+            ..Default::default()
+        },
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    };
+    let data_dir = tmp.path().join("data");
+    std::fs::create_dir_all(&data_dir).unwrap();
+    let runtime = crate::runtime::ProfileRuntime::bootstrap(
+        &profile,
+        &data_dir,
+        None,
+        crate::runtime::BootstrapRole::Serve,
+    )
+    .await
+    .expect("bootstrap dev runtime");
+    let peers_root = runtime.data_dir.join("peers");
+    let mut state = AppState::empty_for_tests();
+    state.profiles.insert("dev".to_string(), runtime);
+    let state = Arc::new(state);
+
+    let cwd = tmp.path().join("project");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let originating = octos_core::SessionKey::with_profile_topic("dev", "local", "tui", "coding");
+
+    let result = raw_peer_prepare(
+        &state,
+        &RpcRequest::new(
+            "peer-orig".to_string(),
+            APPUI_METHOD_PEER_PREPARE,
+            json!({
+                "brief": "Track who handed off.",
+                "title": "Orig",
+                "n": 2,
+                "cwd": cwd.to_string_lossy(),
+                "profile_id": "dev",
+                "session_id": originating,
+            }),
+        ),
+        None,
+    )
+    .await
+    .expect("prepare with session_id");
+    let peers = result["peers"].as_array().expect("peers array");
+    assert_eq!(peers.len(), 2);
+    for peer in peers {
+        let slug = peer["slug"].as_str().unwrap();
+        let originator = std::fs::read_to_string(peers_root.join(slug).join("originator")).unwrap();
+        assert_eq!(originator, originating.to_string(), "member {slug}");
+    }
+
+    let result = raw_peer_prepare(
+        &state,
+        &RpcRequest::new(
+            "peer-anon".to_string(),
+            APPUI_METHOD_PEER_PREPARE,
+            json!({
+                "brief": "Nobody to nudge.",
+                "title": "Anon",
+                "cwd": cwd.to_string_lossy(),
+                "profile_id": "dev",
+            }),
+        ),
+        None,
+    )
+    .await
+    .expect("prepare without session_id");
+    let slug = result["slug"].as_str().unwrap();
+    assert!(
+        !peers_root.join(slug).join("originator").exists(),
+        "no session_id = no originator recorded"
+    );
+}
+
+/// Mailbox nudge (#1801 v3): the ready-note fires exactly once per NEW
+/// result — the `.notified` stamp swallows repeats, and a result overwrite
+/// whose mtime advances re-notifies once.
+#[test]
+fn peer_results_ready_note_fires_once_per_new_result() {
+    let tmp = tempfile::tempdir().unwrap();
+    let peers_root = tmp.path().join("peers");
+    let dir = peers_root.join("alpha");
+    std::fs::create_dir_all(&dir).unwrap();
+    let originating = octos_core::SessionKey::with_profile_topic("dev", "local", "tui", "coding");
+    std::fs::write(dir.join("originator"), originating.to_string()).unwrap();
+    std::fs::write(dir.join("result.md"), "first result").unwrap();
+
+    let note = peer_results_ready_note(&peers_root, &originating).expect("first note fires");
+    assert_eq!(
+        note,
+        "[peer results ready: alpha — use peer_gather to read them when relevant]"
+    );
+    assert!(
+        dir.join(".notified").is_file(),
+        "stamp written at injection time"
+    );
+
+    // Same result, next turn: covered — no repeat nudge.
+    assert_eq!(peer_results_ready_note(&peers_root, &originating), None);
+
+    // Result overwritten LATER (mtime advances): re-notify, once.
+    std::fs::write(dir.join("result.md"), "second result").unwrap();
+    let advanced = std::time::SystemTime::now() + std::time::Duration::from_secs(5);
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(dir.join("result.md"))
+        .unwrap()
+        .set_modified(advanced)
+        .unwrap();
+    let note = peer_results_ready_note(&peers_root, &originating)
+        .expect("advanced result mtime re-notifies");
+    assert!(note.contains("alpha"));
+    assert_eq!(
+        peer_results_ready_note(&peers_root, &originating),
+        None,
+        "re-notify happens once, then the stamp covers it again"
+    );
+}
+
+/// Mailbox nudge (#1801 v3): peer sessions never get the note (they are the
+/// workers), other sessions are not nudged for peers they did not hand off
+/// — and scoping misses must NOT stamp, so the true originator still gets
+/// its nudge. A missing peers dir is a free no-op.
+#[test]
+fn peer_results_ready_note_scopes_to_the_originating_session() {
+    let tmp = tempfile::tempdir().unwrap();
+    let peers_root = tmp.path().join("peers");
+    let dir = peers_root.join("alpha");
+    std::fs::create_dir_all(&dir).unwrap();
+    let originating = octos_core::SessionKey::with_profile_topic("dev", "local", "tui", "coding");
+    std::fs::write(dir.join("originator"), originating.to_string()).unwrap();
+    std::fs::write(dir.join("result.md"), "done").unwrap();
+
+    // The guard short-circuits on the topic BEFORE any originator match: a
+    // peer dir naming a peer session as its originator still nudges nobody.
+    let peer_session =
+        octos_core::SessionKey::with_profile_topic("dev", "local", "tui", "peer-beta");
+    let peer_owned = peers_root.join("beta-child");
+    std::fs::create_dir_all(&peer_owned).unwrap();
+    std::fs::write(peer_owned.join("originator"), peer_session.to_string()).unwrap();
+    std::fs::write(peer_owned.join("result.md"), "done").unwrap();
+    assert_eq!(peer_results_ready_note(&peers_root, &peer_session), None);
+
+    let other = octos_core::SessionKey::with_profile_topic("dev", "local", "tui", "other");
+    assert_eq!(peer_results_ready_note(&peers_root, &other), None);
+    assert!(
+        !dir.join(".notified").exists(),
+        "scoping misses must not stamp"
+    );
+    assert!(
+        peer_results_ready_note(&peers_root, &originating).is_some(),
+        "the true originator still gets its nudge"
+    );
+
+    assert_eq!(
+        peer_results_ready_note(&tmp.path().join("nope"), &originating),
+        None,
+        "missing peers dir is a cheap no-op"
+    );
+}
+
+/// Mailbox nudge (#1801 v3): at most 4 slugs are named, the rest fold into
+/// "+N more" — and ALL covered peers are stamped, the folded ones included.
+#[test]
+fn peer_results_ready_note_caps_named_slugs() {
+    let tmp = tempfile::tempdir().unwrap();
+    let peers_root = tmp.path().join("peers");
+    let originating = octos_core::SessionKey::with_profile_topic("dev", "local", "tui", "coding");
+    for i in 1..=6 {
+        let dir = peers_root.join(format!("lane-{i}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("originator"), originating.to_string()).unwrap();
+        std::fs::write(dir.join("result.md"), "done").unwrap();
+    }
+    let note = peer_results_ready_note(&peers_root, &originating).expect("note fires");
+    assert_eq!(
+        note,
+        "[peer results ready: lane-1, lane-2, lane-3, lane-4 +2 more — use peer_gather to read them when relevant]"
+    );
+    assert_eq!(
+        peer_results_ready_note(&peers_root, &originating),
+        None,
+        "the +2 more were stamped too — the note covered the whole ready set"
+    );
+}
+
 /// End-to-end `peer/prepare`: brief written atomically under the profile
 /// data dir, worktree fenced on branch `peer/<slug>`, failures do not burn
 /// the slug, and validation rejects empty/oversized briefs.
