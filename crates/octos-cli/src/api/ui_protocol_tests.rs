@@ -1763,6 +1763,10 @@ fn dispatch_probe_request(method: &str) -> RpcRequest<Value> {
             "session_id": session_id,
         }),
         APPUI_METHOD_PEER_GATHER => json!({ "session_id": session_id }),
+        APPUI_METHOD_TURN_STEER => json!({
+            "session_id": session_id,
+            "input": [{ "kind": "text", "text": "steer probe" }],
+        }),
         other => panic!("missing AppUI dispatch probe params for {other}"),
     };
 
@@ -2033,6 +2037,7 @@ async fn stdio_shutdown_drain_waits_for_turn_finalization() {
             turn_id: turn_id.clone(),
             state: Arc::new(TokioMutex::new(TurnState::Active)),
             interrupt_tx: Arc::new(TokioMutex::new(None)),
+            steer: None,
             abort,
         },
     );
@@ -2074,6 +2079,7 @@ async fn stdio_shutdown_drain_gives_up_at_deadline_and_ignores_foreign_turns() {
             turn_id: TurnId::new(),
             state: Arc::new(TokioMutex::new(TurnState::Active)),
             interrupt_tx: Arc::new(TokioMutex::new(None)),
+            steer: None,
             abort: foreign_abort,
         },
     );
@@ -2097,6 +2103,7 @@ async fn stdio_shutdown_drain_gives_up_at_deadline_and_ignores_foreign_turns() {
             turn_id: turn_id.clone(),
             state: Arc::new(TokioMutex::new(TurnState::Active)),
             interrupt_tx: Arc::new(TokioMutex::new(None)),
+            steer: None,
             abort,
         },
     );
@@ -9777,6 +9784,7 @@ fn test_active_turn(turn_id: TurnId, abort: AbortHandle) -> ActiveTurn {
         profile_id: MAIN_PROFILE_ID.to_owned(),
         state: Arc::new(TokioMutex::new(TurnState::Active)),
         interrupt_tx: Arc::new(TokioMutex::new(Some(tx))),
+        steer: None,
         abort,
     }
 }
@@ -12716,6 +12724,7 @@ async fn session_btw_reads_draft_only_for_a_non_terminal_turn() {
                 TerminalReason::Completed,
             ))),
             interrupt_tx: Arc::new(TokioMutex::new(None)),
+            steer: None,
             abort,
         },
     );
@@ -12748,6 +12757,7 @@ async fn session_btw_reads_draft_only_for_a_non_terminal_turn() {
             turn_id: turn_id.clone(),
             state: Arc::new(TokioMutex::new(TurnState::Active)),
             interrupt_tx: Arc::new(TokioMutex::new(None)),
+            steer: None,
             abort,
         },
     );
@@ -12782,6 +12792,7 @@ async fn session_btw_reads_draft_only_for_a_non_terminal_turn() {
             turn_id: turn_id.clone(),
             state: Arc::new(TokioMutex::new(TurnState::Active)),
             interrupt_tx: Arc::new(TokioMutex::new(None)),
+            steer: None,
             abort,
         },
     );
@@ -16918,6 +16929,7 @@ async fn session_rollback_rejects_when_turn_in_progress() {
                 profile_id: MAIN_PROFILE_ID.to_owned(),
                 state: Arc::new(TokioMutex::new(TurnState::Active)),
                 interrupt_tx: Arc::new(TokioMutex::new(Some(interrupt_tx))),
+                steer: None,
                 abort: dummy_handle.abort_handle(),
             },
         );
@@ -17700,6 +17712,7 @@ async fn turn_state_get_returns_active_for_in_flight() {
                 profile_id: MAIN_PROFILE_ID.to_owned(),
                 state: Arc::new(TokioMutex::new(TurnState::Active)),
                 interrupt_tx: Arc::new(TokioMutex::new(Some(interrupt_tx))),
+                steer: None,
                 abort: dummy_handle.abort_handle(),
             },
         );
@@ -24898,4 +24911,643 @@ async fn peer_fleet_result_writer_and_gather_roundtrip() {
     let rows = filtered["peers"].as_array().unwrap();
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0]["slug"], "lens-review-3");
+}
+
+// --- turn/steer: mid-turn prompt injection (codex parity) ---
+
+fn steer_request(id: &str, params: Value) -> RpcRequest<Value> {
+    RpcRequest::new(id.to_string(), APPUI_METHOD_TURN_STEER, params)
+}
+
+/// Await the RPC response frame carrying `id`, skipping interleaved
+/// notification frames (turn/started, projection envelopes, ...).
+async fn recv_rpc_response_with_id(
+    rx: &mut mpsc::Receiver<axum::extract::ws::Message>,
+    id: &str,
+) -> Value {
+    for _ in 0..256 {
+        let frame = recv_rpc_json(rx).await;
+        if frame.get("id").and_then(Value::as_str) == Some(id) {
+            return frame;
+        }
+    }
+    panic!("no rpc response with id {id} within 256 frames");
+}
+
+/// Synthetic non-terminal registry entry, exactly as `handle_turn_start`
+/// inserts it — with a live steer buffer unless `steerable` is false.
+fn synthetic_active_turn(
+    turn_id: &TurnId,
+    steerable: bool,
+) -> (ActiveTurn, Option<octos_agent::SharedSteerBuffer>) {
+    // The receiver drops here — nothing interrupts these synthetic turns.
+    let (interrupt_tx, _interrupt_rx) = mpsc::channel::<()>(1);
+    let buffer: Option<octos_agent::SharedSteerBuffer> =
+        steerable.then(|| Arc::new(octos_agent::SteerBuffer::default()));
+    let dummy_handle = tokio::spawn(async {});
+    (
+        ActiveTurn {
+            turn_id: turn_id.clone(),
+            profile_id: MAIN_PROFILE_ID.to_owned(),
+            state: Arc::new(TokioMutex::new(TurnState::Active)),
+            interrupt_tx: Arc::new(TokioMutex::new(Some(interrupt_tx))),
+            steer: buffer.clone(),
+            abort: dummy_handle.abort_handle(),
+        },
+        buffer,
+    )
+}
+
+/// Active turn present → the input lands in ITS pending buffer and the
+/// result names the ACTIVE turn id with `steered: true`.
+#[tokio::test(flavor = "current_thread")]
+async fn turn_steer_pushes_into_active_turn_buffer_and_returns_active_id() {
+    let session_id = SessionKey("local:steer-active".into());
+    let active_turn_id = TurnId::new();
+    let active_turns: SharedActiveTurns = Arc::new(TokioMutex::new(HashMap::new()));
+    let (entry, buffer) = synthetic_active_turn(&active_turn_id, true);
+    active_turns.lock().await.insert(session_id.clone(), entry);
+    let buffer = buffer.expect("steerable entry");
+
+    let state = Arc::new(AppState::empty_for_tests());
+    let ledger = Arc::new(UiProtocolLedger::new(32));
+    let contracts = Arc::new(UiProtocolContractStores::default());
+    let connection_turns: SharedConnectionTurns = Arc::new(TokioMutex::new(HashMap::new()));
+    let (ws, mut rx) = ws_connection_for_test(32);
+
+    handle_turn_steer(
+        &ws,
+        &state,
+        &ledger,
+        &contracts,
+        &active_turns,
+        &connection_turns,
+        None,
+        ConnectionUiFeatures::stdio_defaults(),
+        "steer-1".into(),
+        &steer_request(
+            "steer-1",
+            json!({
+                "session_id": session_id,
+                "expected_turn_id": active_turn_id,
+                "input": [{ "kind": "text", "text": "also update the docs" }],
+            }),
+        ),
+    )
+    .await;
+
+    let frame = recv_rpc_json(&mut rx).await;
+    assert_eq!(frame["result"]["steered"], true, "frame: {frame}");
+    assert_eq!(
+        frame["result"]["turn_id"],
+        serde_json::to_value(&active_turn_id).unwrap(),
+        "steer must return the ACTIVE turn id"
+    );
+    assert_eq!(buffer.drain(), vec!["also update the docs".to_string()]);
+}
+
+/// Rapid steers into the same live turn accumulate FIFO in the buffer.
+#[tokio::test(flavor = "current_thread")]
+async fn turn_steer_rapid_calls_accumulate_fifo() {
+    let session_id = SessionKey("local:steer-fifo".into());
+    let active_turn_id = TurnId::new();
+    let active_turns: SharedActiveTurns = Arc::new(TokioMutex::new(HashMap::new()));
+    let (entry, buffer) = synthetic_active_turn(&active_turn_id, true);
+    active_turns.lock().await.insert(session_id.clone(), entry);
+    let buffer = buffer.expect("steerable entry");
+
+    let state = Arc::new(AppState::empty_for_tests());
+    let ledger = Arc::new(UiProtocolLedger::new(32));
+    let contracts = Arc::new(UiProtocolContractStores::default());
+    let connection_turns: SharedConnectionTurns = Arc::new(TokioMutex::new(HashMap::new()));
+    let (ws, mut rx) = ws_connection_for_test(32);
+
+    for (id, text) in [("s-1", "first"), ("s-2", "second"), ("s-3", "third")] {
+        handle_turn_steer(
+            &ws,
+            &state,
+            &ledger,
+            &contracts,
+            &active_turns,
+            &connection_turns,
+            None,
+            ConnectionUiFeatures::stdio_defaults(),
+            id.into(),
+            &steer_request(
+                id,
+                json!({
+                    "session_id": session_id,
+                    "input": [{ "kind": "text", "text": text }],
+                }),
+            ),
+        )
+        .await;
+        let frame = recv_rpc_json(&mut rx).await;
+        assert_eq!(frame["result"]["steered"], true, "frame: {frame}");
+    }
+    assert_eq!(
+        buffer.drain(),
+        vec![
+            "first".to_string(),
+            "second".to_string(),
+            "third".to_string()
+        ],
+        "steers must accumulate in arrival order"
+    );
+}
+
+/// `expected_turn_id` naming a different turn → `invalid_params`, and the
+/// input must NOT land in the buffer (codex `ExpectedTurnMismatch`).
+#[tokio::test(flavor = "current_thread")]
+async fn turn_steer_expected_turn_id_mismatch_returns_invalid_params() {
+    let session_id = SessionKey("local:steer-mismatch".into());
+    let active_turn_id = TurnId::new();
+    let active_turns: SharedActiveTurns = Arc::new(TokioMutex::new(HashMap::new()));
+    let (entry, buffer) = synthetic_active_turn(&active_turn_id, true);
+    active_turns.lock().await.insert(session_id.clone(), entry);
+    let buffer = buffer.expect("steerable entry");
+
+    let state = Arc::new(AppState::empty_for_tests());
+    let ledger = Arc::new(UiProtocolLedger::new(32));
+    let contracts = Arc::new(UiProtocolContractStores::default());
+    let connection_turns: SharedConnectionTurns = Arc::new(TokioMutex::new(HashMap::new()));
+    let (ws, mut rx) = ws_connection_for_test(32);
+
+    handle_turn_steer(
+        &ws,
+        &state,
+        &ledger,
+        &contracts,
+        &active_turns,
+        &connection_turns,
+        None,
+        ConnectionUiFeatures::stdio_defaults(),
+        "steer-mismatch".into(),
+        &steer_request(
+            "steer-mismatch",
+            json!({
+                "session_id": session_id,
+                "expected_turn_id": TurnId::new(),
+                "input": [{ "kind": "text", "text": "wrong turn" }],
+            }),
+        ),
+    )
+    .await;
+
+    let frame = recv_rpc_json(&mut rx).await;
+    let error = frame.get("error").expect("mismatch must error");
+    assert_eq!(
+        error["code"],
+        rpc_error_codes::INVALID_PARAMS,
+        "frame: {frame}"
+    );
+    assert!(
+        error["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("expected_turn_id"),
+        "frame: {frame}"
+    );
+    assert!(buffer.is_empty(), "mismatched steer must not be buffered");
+}
+
+/// A live non-steerable turn (review / M9 fixture — registry entry with no
+/// buffer) is rejected rather than silently swallowed, and does NOT fall
+/// back to a parallel turn (codex `ActiveTurnNotSteerable`).
+#[tokio::test(flavor = "current_thread")]
+async fn turn_steer_rejects_live_non_steerable_turn() {
+    let session_id = SessionKey("local:steer-nonsteerable".into());
+    let active_turn_id = TurnId::new();
+    let active_turns: SharedActiveTurns = Arc::new(TokioMutex::new(HashMap::new()));
+    let (entry, _) = synthetic_active_turn(&active_turn_id, false);
+    active_turns.lock().await.insert(session_id.clone(), entry);
+
+    let state = Arc::new(AppState::empty_for_tests());
+    let ledger = Arc::new(UiProtocolLedger::new(32));
+    let contracts = Arc::new(UiProtocolContractStores::default());
+    let connection_turns: SharedConnectionTurns = Arc::new(TokioMutex::new(HashMap::new()));
+    let (ws, mut rx) = ws_connection_for_test(32);
+
+    handle_turn_steer(
+        &ws,
+        &state,
+        &ledger,
+        &contracts,
+        &active_turns,
+        &connection_turns,
+        None,
+        ConnectionUiFeatures::stdio_defaults(),
+        "steer-ns".into(),
+        &steer_request(
+            "steer-ns",
+            json!({
+                "session_id": session_id,
+                "input": [{ "kind": "text", "text": "steer a review" }],
+            }),
+        ),
+    )
+    .await;
+
+    let frame = recv_rpc_json(&mut rx).await;
+    assert!(frame.get("error").is_some(), "frame: {frame}");
+    assert!(
+        frame["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("does not accept steering"),
+        "frame: {frame}"
+    );
+}
+
+/// Steer without text input → invalid_params (mirrors turn/start's
+/// text-input contract; the fallback path never runs).
+#[tokio::test(flavor = "current_thread")]
+async fn turn_steer_requires_text_input() {
+    let session_id = SessionKey("local:steer-empty".into());
+    let active_turns: SharedActiveTurns = Arc::new(TokioMutex::new(HashMap::new()));
+    let state = Arc::new(AppState::empty_for_tests());
+    let ledger = Arc::new(UiProtocolLedger::new(32));
+    let contracts = Arc::new(UiProtocolContractStores::default());
+    let connection_turns: SharedConnectionTurns = Arc::new(TokioMutex::new(HashMap::new()));
+    let (ws, mut rx) = ws_connection_for_test(32);
+
+    handle_turn_steer(
+        &ws,
+        &state,
+        &ledger,
+        &contracts,
+        &active_turns,
+        &connection_turns,
+        None,
+        ConnectionUiFeatures::stdio_defaults(),
+        "steer-empty".into(),
+        &steer_request(
+            "steer-empty",
+            json!({ "session_id": session_id, "input": [] }),
+        ),
+    )
+    .await;
+
+    let frame = recv_rpc_json(&mut rx).await;
+    assert_eq!(
+        frame["error"]["code"],
+        rpc_error_codes::INVALID_PARAMS,
+        "frame: {frame}"
+    );
+}
+
+/// NO active turn → the call falls back to the ordinary `turn/start`
+/// admission path: a REAL turn starts (LLM runs, registry filled, history
+/// persisted) and the result is `steered: false` + the NEW turn id (codex
+/// `NoActiveTurn` → `spawn_task(RegularTask)`).
+#[tokio::test(flavor = "current_thread")]
+async fn turn_steer_with_no_active_turn_falls_back_to_turn_start() {
+    let temp = tempfile::TempDir::new().expect("temp dir");
+    let provider = Arc::new(AppuiContinuationLlm::new("steer fallback reply"));
+    let (state, profile_runtime) =
+        state_with_profile_llm(temp.path(), MAIN_PROFILE_ID, provider.clone()).await;
+    let session_id = SessionKey::new("api", "steer-fallback");
+    let active_turns: SharedActiveTurns = Arc::new(TokioMutex::new(HashMap::new()));
+    let connection_turns: SharedConnectionTurns = Arc::new(TokioMutex::new(HashMap::new()));
+    let ledger = Arc::new(UiProtocolLedger::new(64));
+    let contracts = Arc::new(UiProtocolContractStores::default());
+    let (ws, mut rx) = ws_connection_for_test(256);
+
+    handle_turn_steer(
+        &ws,
+        &state,
+        &ledger,
+        &contracts,
+        &active_turns,
+        &connection_turns,
+        None,
+        ConnectionUiFeatures::stdio_defaults(),
+        "steer-fb".into(),
+        &steer_request(
+            "steer-fb",
+            json!({
+                "session_id": session_id,
+                "input": [{ "kind": "text", "text": "hello via steer" }],
+            }),
+        ),
+    )
+    .await;
+
+    let frame = recv_rpc_response_with_id(&mut rx, "steer-fb").await;
+    assert_eq!(frame["result"]["steered"], false, "frame: {frame}");
+    let new_turn_id = frame["result"]["turn_id"].clone();
+    assert!(
+        new_turn_id.is_string(),
+        "fallback must mint a turn id: {frame}"
+    );
+
+    // The fallback went through the REAL admission: the registry holds the
+    // new turn for this session.
+    {
+        let registry = active_turns.lock().await;
+        let entry = registry.get(&session_id).expect("registry entry");
+        assert_eq!(serde_json::to_value(&entry.turn_id).unwrap(), new_turn_id);
+        assert!(
+            entry.steer.is_some(),
+            "fallback turn must itself be steerable"
+        );
+    }
+
+    // ...and the turn actually RUNS: the model is called and the exchange
+    // persists into session history.
+    for _ in 0..100 {
+        if provider.call_count.load(Ordering::Relaxed) > 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        provider.call_count.load(Ordering::Relaxed) > 0,
+        "fallback must start a real turn"
+    );
+    for _ in 0..200 {
+        let messages = cached_session_messages(&state, &profile_runtime, &session_id).await;
+        if messages
+            .iter()
+            .any(|m| m.role == MessageRole::Assistant && m.content.contains("steer fallback reply"))
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let messages = cached_session_messages(&state, &profile_runtime, &session_id).await;
+    assert!(
+        messages
+            .iter()
+            .any(|m| m.role == MessageRole::User && m.content == "hello via steer"),
+        "fallback turn must persist the steer text as the prompt: {messages:?}"
+    );
+}
+
+/// The `turn/start` occupied-session rejection is UNCHANGED by the steer
+/// refactor: admitting a second turn while one runs still fails with the
+/// same error string.
+#[tokio::test(flavor = "current_thread")]
+async fn turn_start_still_rejects_when_turn_already_running() {
+    let temp = tempfile::TempDir::new().expect("temp dir");
+    let provider = Arc::new(AppuiContinuationLlm::new("unused"));
+    let (state, _profile_runtime) =
+        state_with_profile_llm(temp.path(), MAIN_PROFILE_ID, provider).await;
+    let session_id = SessionKey::new("api", "steer-occupied");
+    let active_turns: SharedActiveTurns = Arc::new(TokioMutex::new(HashMap::new()));
+    let (entry, _) = synthetic_active_turn(&TurnId::new(), true);
+    active_turns.lock().await.insert(session_id.clone(), entry);
+    let connection_turns: SharedConnectionTurns = Arc::new(TokioMutex::new(HashMap::new()));
+    let ledger = Arc::new(UiProtocolLedger::new(32));
+    let contracts = Arc::new(UiProtocolContractStores::default());
+    let (ws, mut rx) = ws_connection_for_test(32);
+
+    handle_turn_start(
+        &ws,
+        &state,
+        &ledger,
+        &contracts,
+        &active_turns,
+        &connection_turns,
+        None,
+        None,
+        ConnectionUiFeatures::stdio_defaults(),
+        "start-busy".into(),
+        TurnStartParams {
+            session_id: session_id.clone(),
+            turn_id: TurnId::new(),
+            input: vec![InputItem::Text {
+                text: "second turn".into(),
+            }],
+            media: Vec::new(),
+            topic: None,
+            rewrite_for: None,
+            reasoning_effort: None,
+            live_video: false,
+        },
+    )
+    .await;
+
+    let frame = recv_rpc_response_with_id(&mut rx, "start-busy").await;
+    assert!(
+        frame["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("a turn is already running"),
+        "frame: {frame}"
+    );
+}
+
+/// LLM stub for the end-to-end mid-turn steer test. Call 0 announces it
+/// entered (so the test can steer while the model is "streaming"), waits
+/// for the go-signal, then returns a FINAL answer; the pending steer must
+/// force a second round whose request carries the steer as a plain
+/// `role: user` message after the recorded first answer.
+struct GatedSteerLlm {
+    call_count: std::sync::atomic::AtomicUsize,
+    entered: tokio::sync::Notify,
+    proceed: tokio::sync::Notify,
+    observed: StdMutex<Vec<Vec<(MessageRole, String)>>>,
+}
+
+#[async_trait::async_trait]
+impl octos_llm::LlmProvider for GatedSteerLlm {
+    async fn chat(
+        &self,
+        messages: &[Message],
+        _tools: &[octos_llm::ToolSpec],
+        _config: &octos_llm::ChatConfig,
+    ) -> eyre::Result<octos_llm::ChatResponse> {
+        self.observed
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(
+                messages
+                    .iter()
+                    .map(|message| (message.role, message.content.clone()))
+                    .collect(),
+            );
+        let call = self.call_count.fetch_add(1, Ordering::SeqCst);
+        let content = if call == 0 {
+            self.entered.notify_one();
+            self.proceed.notified().await;
+            "first answer"
+        } else {
+            "second answer"
+        };
+        Ok(octos_llm::ChatResponse {
+            content: Some(content.to_string()),
+            reasoning_content: None,
+            tool_calls: Vec::new(),
+            stop_reason: octos_llm::StopReason::EndTurn,
+            usage: octos_llm::TokenUsage {
+                input_tokens: 8,
+                output_tokens: 4,
+                ..Default::default()
+            },
+            provider_index: None,
+        })
+    }
+
+    fn model_id(&self) -> &str {
+        "gated-steer-stub"
+    }
+
+    fn provider_name(&self) -> &str {
+        "stub"
+    }
+}
+
+/// End-to-end over the REAL turn runtime: `turn/start` runs a turn; while
+/// the model produces its final answer a `turn/steer` lands in the ACTIVE
+/// turn; the loop runs ONE more round whose LLM request carries the steer
+/// (drained before the call, plain user role, after the recorded first
+/// answer), and the steer row persists into durable history exactly once,
+/// stamped with the turn's thread id.
+#[tokio::test(flavor = "current_thread")]
+async fn turn_steer_end_to_end_injects_before_next_llm_call_and_persists_once() {
+    let temp = tempfile::TempDir::new().expect("temp dir");
+    let provider = Arc::new(GatedSteerLlm {
+        call_count: std::sync::atomic::AtomicUsize::new(0),
+        entered: tokio::sync::Notify::new(),
+        proceed: tokio::sync::Notify::new(),
+        observed: StdMutex::new(Vec::new()),
+    });
+    let (state, profile_runtime) =
+        state_with_profile_llm(temp.path(), MAIN_PROFILE_ID, provider.clone()).await;
+    let session_id = SessionKey::new("api", "steer-e2e");
+    let turn_id = TurnId::new();
+    let active_turns: SharedActiveTurns = Arc::new(TokioMutex::new(HashMap::new()));
+    let connection_turns: SharedConnectionTurns = Arc::new(TokioMutex::new(HashMap::new()));
+    let ledger = Arc::new(UiProtocolLedger::new(256));
+    let contracts = Arc::new(UiProtocolContractStores::default());
+    let (ws, mut rx) = ws_connection_for_test(256);
+
+    handle_turn_start(
+        &ws,
+        &state,
+        &ledger,
+        &contracts,
+        &active_turns,
+        &connection_turns,
+        None,
+        None,
+        ConnectionUiFeatures::stdio_defaults(),
+        "start-e2e".into(),
+        TurnStartParams {
+            session_id: session_id.clone(),
+            turn_id: turn_id.clone(),
+            input: vec![InputItem::Text {
+                text: "write the summary".into(),
+            }],
+            media: Vec::new(),
+            topic: None,
+            rewrite_for: None,
+            reasoning_effort: None,
+            live_video: false,
+        },
+    )
+    .await;
+    let accept = recv_rpc_response_with_id(&mut rx, "start-e2e").await;
+    assert_eq!(accept["result"]["accepted"], true, "frame: {accept}");
+
+    // Wait until the model is mid-call, then steer the ACTIVE turn.
+    provider.entered.notified().await;
+    handle_turn_steer(
+        &ws,
+        &state,
+        &ledger,
+        &contracts,
+        &active_turns,
+        &connection_turns,
+        None,
+        ConnectionUiFeatures::stdio_defaults(),
+        "steer-e2e".into(),
+        &steer_request(
+            "steer-e2e",
+            json!({
+                "session_id": session_id,
+                "expected_turn_id": turn_id,
+                "input": [{ "kind": "text", "text": "also cover the risks" }],
+            }),
+        ),
+    )
+    .await;
+    let steered = recv_rpc_response_with_id(&mut rx, "steer-e2e").await;
+    assert_eq!(steered["result"]["steered"], true, "frame: {steered}");
+    assert_eq!(
+        steered["result"]["turn_id"],
+        serde_json::to_value(&turn_id).unwrap(),
+        "steer must land in the ACTIVE turn"
+    );
+
+    // Release the model; the pending steer must force a second round.
+    provider.proceed.notify_one();
+    for _ in 0..300 {
+        let terminal = {
+            let registry = active_turns.lock().await;
+            match registry.get(&session_id) {
+                Some(entry) => matches!(*entry.state.lock().await, TurnState::Terminal(_)),
+                None => false,
+            }
+        };
+        if terminal {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        provider.call_count.load(Ordering::SeqCst),
+        2,
+        "steer after the final answer must force exactly one more round"
+    );
+
+    // The second request carries: recorded first answer, then the steer as
+    // a plain role:user message with NO wrapper text.
+    {
+        let observed = provider
+            .observed
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert_eq!(observed.len(), 2);
+        let follow_up = &observed[1];
+        let assistant_idx = follow_up
+            .iter()
+            .position(|(role, content)| {
+                *role == MessageRole::Assistant && content == "first answer"
+            })
+            .unwrap_or_else(|| panic!("first answer must be recorded: {follow_up:?}"));
+        let steer_idx = follow_up
+            .iter()
+            .position(|(role, content)| {
+                *role == MessageRole::User && content == "also cover the risks"
+            })
+            .unwrap_or_else(|| panic!("steer must reach the model verbatim: {follow_up:?}"));
+        assert!(steer_idx > assistant_idx, "steer appends after the answer");
+    }
+
+    // Durable history: the steer row persisted EXACTLY ONCE (drain-time
+    // canonical persist owns it; the end-of-turn pass must not double
+    // write), stamped with the turn's thread id.
+    let messages = cached_session_messages(&state, &profile_runtime, &session_id).await;
+    let steer_rows: Vec<&Message> = messages
+        .iter()
+        .filter(|m| m.role == MessageRole::User && m.content == "also cover the risks")
+        .collect();
+    assert_eq!(
+        steer_rows.len(),
+        1,
+        "steer row must persist exactly once: {messages:?}"
+    );
+    assert_eq!(
+        steer_rows[0].thread_id.as_deref(),
+        Some(turn_id.0.to_string()).as_deref(),
+        "steer row must carry the turn's thread id"
+    );
+    assert!(
+        messages
+            .iter()
+            .any(|m| m.role == MessageRole::Assistant && m.content.contains("second answer")),
+        "the follow-up answer must persist: {messages:?}"
+    );
 }

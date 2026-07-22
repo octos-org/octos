@@ -5520,3 +5520,332 @@ async fn user_prompt_submit_hook_deny_blocks_turn_before_llm() {
             .is_empty()
     );
 }
+
+// --- Mid-turn steer injection (codex `TurnState.pending_input` parity) ---
+
+/// Per-request prompt capture: `(role, content)` per message, one vec per
+/// LLM call.
+type ObservedRolePrompts = Arc<StdMutex<Vec<Vec<(MessageRole, String)>>>>;
+
+/// Records every prompt as `(role, content)` pairs. Call 0 pushes the given
+/// steer inputs into the shared buffer MID-CALL (simulating a `turn/steer`
+/// racing in while the model streams), then returns a tool call; call 1
+/// returns EndTurn.
+struct SteerDuringToolRoundProvider {
+    calls: AtomicUsize,
+    observed: ObservedRolePrompts,
+    buffer: crate::steering::SharedSteerBuffer,
+    steers: Vec<String>,
+}
+
+#[async_trait]
+impl LlmProvider for SteerDuringToolRoundProvider {
+    async fn chat(
+        &self,
+        messages: &[Message],
+        _tools: &[octos_llm::ToolSpec],
+        _config: &octos_llm::ChatConfig,
+    ) -> Result<ChatResponse> {
+        self.observed
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .push(
+                messages
+                    .iter()
+                    .map(|message| (message.role, message.content.clone()))
+                    .collect(),
+            );
+        let call = self.calls.fetch_add(1, AtomicOrdering::SeqCst);
+        Ok(if call == 0 {
+            for steer in &self.steers {
+                self.buffer.push(steer.clone());
+            }
+            tool_use(
+                vec![ToolCall {
+                    id: "call_alpha".to_string(),
+                    name: "alpha".to_string(),
+                    arguments: serde_json::json!({}),
+                    metadata: None,
+                }],
+                1,
+                1,
+            )
+        } else {
+            end_turn("done", 1, 1)
+        })
+    }
+
+    fn model_id(&self) -> &str {
+        "mock"
+    }
+
+    fn provider_name(&self) -> &str {
+        "mock"
+    }
+}
+
+/// Call 0 pushes steer inputs mid-call and returns a FINAL answer
+/// (EndTurn). The pending steer must force one more round; call 1 returns
+/// the follow-up answer.
+struct SteerAfterFinalAnswerProvider {
+    calls: AtomicUsize,
+    observed: ObservedRolePrompts,
+    buffer: crate::steering::SharedSteerBuffer,
+    steers: Vec<String>,
+}
+
+#[async_trait]
+impl LlmProvider for SteerAfterFinalAnswerProvider {
+    async fn chat(
+        &self,
+        messages: &[Message],
+        _tools: &[octos_llm::ToolSpec],
+        _config: &octos_llm::ChatConfig,
+    ) -> Result<ChatResponse> {
+        self.observed
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .push(
+                messages
+                    .iter()
+                    .map(|message| (message.role, message.content.clone()))
+                    .collect(),
+            );
+        let call = self.calls.fetch_add(1, AtomicOrdering::SeqCst);
+        Ok(if call == 0 {
+            for steer in &self.steers {
+                self.buffer.push(steer.clone());
+            }
+            end_turn("first answer", 1, 1)
+        } else {
+            end_turn("second answer", 1, 1)
+        })
+    }
+
+    fn model_id(&self) -> &str {
+        "mock"
+    }
+
+    fn provider_name(&self) -> &str {
+        "mock"
+    }
+}
+
+/// Steer landing between tool rounds is drained at the top of the next
+/// iteration, BEFORE the next LLM call, as a plain `role: user` message
+/// appended after the previous round's tool output — no wrapper text.
+#[tokio::test]
+async fn should_fold_steer_into_next_llm_call_when_injected_between_rounds() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut tools = ToolRegistry::with_builtins(dir.path());
+    tools.register(NamedEchoTool {
+        name: "alpha",
+        output: "alpha ok",
+    });
+    let buffer: crate::steering::SharedSteerBuffer =
+        Arc::new(crate::steering::SteerBuffer::default());
+    let observed = Arc::new(StdMutex::new(Vec::new()));
+    let provider: Arc<dyn LlmProvider> = Arc::new(SteerDuringToolRoundProvider {
+        calls: AtomicUsize::new(0),
+        observed: Arc::clone(&observed),
+        buffer: Arc::clone(&buffer),
+        steers: vec!["also check the tests".to_string()],
+    });
+    let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+    let agent = Agent::new(AgentId::new("steer-agent"), provider, tools, memory)
+        .with_steer_buffer(Arc::clone(&buffer));
+
+    let result = agent.process_message("do work", &[], vec![]).await.unwrap();
+    assert_eq!(result.content, "done");
+
+    let observed = observed.lock().unwrap_or_else(|error| error.into_inner());
+    assert_eq!(observed.len(), 2, "tool round + follow-up round");
+    // First call: no steer yet (it lands mid-call).
+    assert!(
+        !observed[0]
+            .iter()
+            .any(|(_, content)| content.contains("also check the tests")),
+        "steer must not time-travel into the request that was already built"
+    );
+    // Second call: the steer is a plain user message with NO wrapper text,
+    // appended AFTER the previous round's tool output.
+    let steer_idx = observed[1]
+        .iter()
+        .position(|(role, content)| *role == MessageRole::User && content == "also check the tests")
+        .expect("second request must carry the steer as a plain role:user message");
+    let tool_idx = observed[1]
+        .iter()
+        .position(|(role, _)| *role == MessageRole::Tool)
+        .expect("second request must carry the tool result");
+    assert!(
+        steer_idx > tool_idx,
+        "steer must append after the prior round's tool output (append-only history)"
+    );
+    // Buffer fully drained.
+    assert!(buffer.is_empty());
+    // No callback registered → the steer row rides the turn output log so
+    // the host's end-of-turn persistence writes it exactly once.
+    assert!(
+        result
+            .messages
+            .iter()
+            .any(|m| m.role == MessageRole::User && m.content == "also check the tests"),
+        "without a drained-callback the steer row must land in the turn output log"
+    );
+}
+
+/// A steer that lands while the model produces its FINAL answer forces one
+/// more round (`needs_follow_up = model_wants_more || buffer_nonempty`),
+/// and the prior answer is recorded as a normal assistant row the model
+/// sees in the follow-up request.
+#[tokio::test]
+async fn should_run_extra_round_when_steer_lands_after_final_answer() {
+    let dir = tempfile::tempdir().unwrap();
+    let tools = ToolRegistry::with_builtins(dir.path());
+    let buffer: crate::steering::SharedSteerBuffer =
+        Arc::new(crate::steering::SteerBuffer::default());
+    let observed = Arc::new(StdMutex::new(Vec::new()));
+    let provider: Arc<dyn LlmProvider> = Arc::new(SteerAfterFinalAnswerProvider {
+        calls: AtomicUsize::new(0),
+        observed: Arc::clone(&observed),
+        buffer: Arc::clone(&buffer),
+        steers: vec!["one more thing".to_string()],
+    });
+    let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+    let agent = Agent::new(AgentId::new("steer-agent"), provider, tools, memory)
+        .with_steer_buffer(Arc::clone(&buffer));
+
+    let result = agent.process_message("do work", &[], vec![]).await.unwrap();
+
+    // The steer forced a second round and the turn ends on ITS answer.
+    assert_eq!(result.content, "second answer");
+    let observed = observed.lock().unwrap_or_else(|error| error.into_inner());
+    assert_eq!(
+        observed.len(),
+        2,
+        "steer after EndTurn must force another round"
+    );
+    let assistant_idx = observed[1]
+        .iter()
+        .position(|(role, content)| *role == MessageRole::Assistant && content == "first answer")
+        .expect("follow-up request must carry the recorded first answer");
+    let steer_idx = observed[1]
+        .iter()
+        .position(|(role, content)| *role == MessageRole::User && content == "one more thing")
+        .expect("follow-up request must carry the steer as a plain role:user message");
+    assert!(
+        steer_idx > assistant_idx,
+        "steer must follow the recorded final answer in history order"
+    );
+    // Both the intermediate answer and the steer row persist via the log.
+    assert!(
+        result
+            .messages
+            .iter()
+            .any(|m| m.role == MessageRole::Assistant && m.content == "first answer"),
+        "the pre-steer final answer must persist as a normal assistant row"
+    );
+    assert!(
+        result
+            .messages
+            .iter()
+            .any(|m| m.role == MessageRole::User && m.content == "one more thing")
+    );
+}
+
+/// Rapid steers drain together, in FIFO order, at the next boundary.
+#[tokio::test]
+async fn should_preserve_fifo_order_when_multiple_steers_accumulate() {
+    let dir = tempfile::tempdir().unwrap();
+    let tools = ToolRegistry::with_builtins(dir.path());
+    let buffer: crate::steering::SharedSteerBuffer =
+        Arc::new(crate::steering::SteerBuffer::default());
+    let observed = Arc::new(StdMutex::new(Vec::new()));
+    let provider: Arc<dyn LlmProvider> = Arc::new(SteerAfterFinalAnswerProvider {
+        calls: AtomicUsize::new(0),
+        observed: Arc::clone(&observed),
+        buffer: Arc::clone(&buffer),
+        steers: vec!["steer one".to_string(), "steer two".to_string()],
+    });
+    let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+    let agent = Agent::new(AgentId::new("steer-agent"), provider, tools, memory)
+        .with_steer_buffer(Arc::clone(&buffer));
+
+    let result = agent.process_message("do work", &[], vec![]).await.unwrap();
+    assert_eq!(result.content, "second answer");
+
+    let observed = observed.lock().unwrap_or_else(|error| error.into_inner());
+    assert_eq!(observed.len(), 2);
+    let first_idx = observed[1]
+        .iter()
+        .position(|(role, content)| *role == MessageRole::User && content == "steer one")
+        .expect("first steer present");
+    let second_idx = observed[1]
+        .iter()
+        .position(|(role, content)| *role == MessageRole::User && content == "steer two")
+        .expect("second steer present");
+    assert!(
+        first_idx < second_idx,
+        "steers must drain in FIFO (arrival) order"
+    );
+}
+
+/// With a drained-callback registered, the HOST owns steer-row persistence:
+/// the callback sees the drained batch (before the next LLM call) and the
+/// rows stay OUT of the turn output log so end-of-turn persistence cannot
+/// double-write them. The prompt still carries them.
+#[tokio::test]
+async fn should_hand_drained_steers_to_callback_and_skip_output_log() {
+    let dir = tempfile::tempdir().unwrap();
+    let tools = ToolRegistry::with_builtins(dir.path());
+    let buffer: crate::steering::SharedSteerBuffer =
+        Arc::new(crate::steering::SteerBuffer::default());
+    let observed = Arc::new(StdMutex::new(Vec::new()));
+    let provider: Arc<dyn LlmProvider> = Arc::new(SteerAfterFinalAnswerProvider {
+        calls: AtomicUsize::new(0),
+        observed: Arc::clone(&observed),
+        buffer: Arc::clone(&buffer),
+        steers: vec!["persist me host-side".to_string()],
+    });
+    let drained_batches: Arc<StdMutex<Vec<Vec<String>>>> = Arc::new(StdMutex::new(Vec::new()));
+    let drained_for_callback = Arc::clone(&drained_batches);
+    let callback: crate::steering::SteerDrainedCallback = Arc::new(move |batch: Vec<String>| {
+        let drained = Arc::clone(&drained_for_callback);
+        Box::pin(async move {
+            drained
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .push(batch);
+        })
+    });
+    let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+    let agent = Agent::new(AgentId::new("steer-agent"), provider, tools, memory)
+        .with_steer_buffer(Arc::clone(&buffer))
+        .with_steer_drained_callback(callback);
+
+    let result = agent.process_message("do work", &[], vec![]).await.unwrap();
+    assert_eq!(result.content, "second answer");
+
+    let batches = drained_batches
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    assert_eq!(
+        batches.as_slice(),
+        [vec!["persist me host-side".to_string()]]
+    );
+    // Host owns persistence → the row must NOT ride the output log.
+    assert!(
+        !result
+            .messages
+            .iter()
+            .any(|m| m.role == MessageRole::User && m.content == "persist me host-side"),
+        "steer rows must stay out of the turn output log when the host persists them"
+    );
+    // ...but the model did see it.
+    let observed = observed.lock().unwrap_or_else(|error| error.into_inner());
+    assert!(
+        observed[1]
+            .iter()
+            .any(|(role, content)| *role == MessageRole::User && content == "persist me host-side")
+    );
+}

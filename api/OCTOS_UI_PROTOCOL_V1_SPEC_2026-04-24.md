@@ -381,6 +381,22 @@ Session, turn, and approval core:
 - `session/compact/mode/set` (per-session LLM-vs-heuristic compaction mode; the `/context` menu)
 - `turn/start`
 - `turn/interrupt`
+- `turn/steer` (mid-turn prompt injection into the ACTIVE turn, codex
+  app-server parity. Params `{session_id, expected_turn_id?, input}`,
+  result `{turn_id, steered}`. With a live turn the text input items are
+  pushed into that turn's pending-input buffer under the active-turns
+  registry lock; the agent loop drains them FIFO at its next iteration
+  boundary — before the next LLM call — as plain `role: user` messages
+  with no wrapper text, persisting each through the canonical session
+  path so the standard v2 `UserMessage` envelope announces the fold-in;
+  a steer landing after the model's final answer forces one more round
+  in the SAME turn. Returns `steered: true` + the ACTIVE turn id. An
+  `expected_turn_id` naming a different turn → `invalid_params`; a live
+  non-steerable turn (review/fixture) → `invalid_request`. With no live
+  turn the call falls back to the ordinary `turn/start` admission and
+  returns `steered: false` + the NEW turn id. Raw server-handled method
+  — session-ingress credentials cannot call it, and steering is NOT an
+  interrupt: `turn/interrupt` stays the separate cancel op)
 - `turn/state/get` (gate `state.turn_state_get.v1`, accepted `UPCR-2026-011`)
 - `thread/graph/get` (gate `state.thread_graph.v1`, accepted `UPCR-2026-010`)
 - `approval/respond`

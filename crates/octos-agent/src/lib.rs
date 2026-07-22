@@ -166,7 +166,10 @@ pub use skills::{SkillFilter, SkillInfo, SkillsLoader};
 pub use snapshot::{
     DEFAULT_SNAPSHOT_KEEP_LAST, SnapshotConfig, SnapshotId, SnapshotInfo, SnapshotManager,
 };
-pub use steering::{SteeringMessage, SteeringReceiver, SteeringSender};
+pub use steering::{
+    SharedSteerBuffer, SteerBuffer, SteerDrainedCallback, SteeringMessage, SteeringReceiver,
+    SteeringSender,
+};
 pub use subagent_output::{
     AppendResult, DEFAULT_GC_AGE, DEFAULT_MAX_BYTES_PER_TASK, DEFAULT_MAX_BYTES_TOTAL,
     DEFAULT_PREVIEW_BYTES, SubAgentOutputRouter,

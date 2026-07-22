@@ -228,6 +228,19 @@ const APPUI_METHOD_PEER_PREPARE: &str = "peer/prepare";
 /// session. Read-only; results survive client crashes/reconnects because
 /// they are files, not connection state.
 const APPUI_METHOD_PEER_GATHER: &str = "peer/gather";
+/// `turn/steer` — mid-turn prompt injection into the ACTIVE turn (codex
+/// parity: app-server `turn/steer` → `Session::steer_input`). Params
+/// `{session_id, expected_turn_id?, input}`; result `{turn_id, steered}`.
+/// With a live turn, the input is pushed into that turn's pending-input
+/// buffer under the active-turns registry lock and drained by the agent
+/// loop at the next iteration boundary as a plain `role: user` message
+/// (`steered: true` + the ACTIVE turn id). `expected_turn_id` mismatch →
+/// `invalid_params` (codex `ExpectedTurnMismatch`). With NO live turn, the
+/// call falls back to the ordinary `turn/start` admission path and returns
+/// `steered: false` + the NEW turn id (codex `user_input_or_turn_inner`'s
+/// `NoActiveTurn` fallback). Steering is NOT an interrupt — the in-flight
+/// round always completes; `turn/interrupt` stays a separate op.
+const APPUI_METHOD_TURN_STEER: &str = "turn/steer";
 const APPUI_METHOD_PROFILE_SKILLS_LIST: &str = "profile/skills/list";
 const APPUI_METHOD_PROFILE_SKILLS_REGISTRY_SEARCH: &str = "profile/skills/registry/search";
 const APPUI_METHOD_PROFILE_SKILLS_INSTALL: &str = "profile/skills/install";
@@ -302,6 +315,7 @@ const APPUI_EXTRA_METHODS: &[&str] = &[
     APPUI_METHOD_SNAPSHOT_RESTORE,
     APPUI_METHOD_PEER_PREPARE,
     APPUI_METHOD_PEER_GATHER,
+    APPUI_METHOD_TURN_STEER,
     APPUI_METHOD_PROFILE_SKILLS_LIST,
     APPUI_METHOD_PROFILE_SKILLS_REGISTRY_SEARCH,
     APPUI_METHOD_PROFILE_SKILLS_INSTALL,
@@ -1132,6 +1146,13 @@ struct ActiveTurn {
     /// Single-shot wake-up so the turn loop can return from `progress_rx.recv`
     /// promptly when an interrupt arrives. `None` once consumed.
     interrupt_tx: Arc<TokioMutex<Option<mpsc::Sender<()>>>>,
+    /// Per-turn pending-input buffer for `turn/steer` (codex
+    /// `TurnState.pending_input` parity). `Some` for regular standalone
+    /// turns — `turn/steer` pushes into it under the registry lock and the
+    /// agent loop drains at the next iteration boundary. `None` for
+    /// non-steerable turns (code review, M9 protocol fixtures), mirroring
+    /// codex's `ActiveTurnNotSteerable` for review/compact turn kinds.
+    steer: Option<octos_agent::SharedSteerBuffer>,
     abort: AbortHandle,
 }
 
@@ -6548,6 +6569,20 @@ struct RawReviewStartParams {
     delivery: Option<String>,
 }
 
+/// `turn/steer` params: `{session_id, expected_turn_id?, input}` —
+/// mirrors codex `TurnSteerParams { thread_id, expected_turn_id, input }`
+/// with octos's optional-precondition twist: an ABSENT `expected_turn_id`
+/// steers whatever turn is live (a mismatch when present is rejected, codex
+/// `ExpectedTurnMismatch`).
+#[derive(Debug, Clone, Deserialize)]
+struct RawTurnSteerParams {
+    session_id: SessionKey,
+    #[serde(default)]
+    expected_turn_id: Option<TurnId>,
+    #[serde(default)]
+    input: Vec<InputItem>,
+}
+
 fn parse_raw_params<T>(request: &RpcRequest<Value>) -> Result<T, RpcError>
 where
     T: serde::de::DeserializeOwned,
@@ -10646,6 +10681,23 @@ async fn handle_raw_appui_rpc(
         return true;
     }
 
+    if request.method == APPUI_METHOD_TURN_STEER {
+        handle_turn_steer(
+            ws,
+            state,
+            ledger,
+            contracts,
+            active_turns,
+            connection_turns,
+            connection_profile_id,
+            features,
+            id,
+            request,
+        )
+        .await;
+        return true;
+    }
+
     let result = match request.method.as_str() {
         method if is_autonomy_method(method) => {
             raw_autonomy_rpc(request, features, connection_profile_id)
@@ -11079,7 +11131,10 @@ fn string_session_with_optional_topic(session_id: &str, topic: Option<&str>) -> 
 /// adding it here without a matching arm panics the `unreachable!`. Both point
 /// back to this one function.
 fn raw_method_is_dispatched(method: &str, stdio_transport: bool) -> bool {
-    if method == APPUI_METHOD_REVIEW_START || is_autonomy_method(method) {
+    if method == APPUI_METHOD_REVIEW_START
+        || method == APPUI_METHOD_TURN_STEER
+        || is_autonomy_method(method)
+    {
         return true;
     }
     if matches!(
@@ -13631,6 +13686,9 @@ async fn handle_review_start(
                     profile_id: profile_for_stamp.clone(),
                     state: turn_state,
                     interrupt_tx,
+                    // Review turns are non-steerable (codex
+                    // `ActiveTurnNotSteerable` for the Review turn kind).
+                    steer: None,
                     abort: handle.abort_handle(),
                 },
             );
@@ -13682,7 +13740,48 @@ async fn handle_turn_start(
     routed_profile_id: Option<&str>,
     features: ConnectionUiFeatures,
     id: String,
+    params: TurnStartParams,
+) {
+    handle_turn_start_with_accept(
+        ws,
+        state,
+        ledger,
+        contracts,
+        active_turns,
+        connection_turns,
+        connection_profile_id,
+        routed_profile_id,
+        features,
+        id,
+        params,
+        json!({ "accepted": true }),
+    )
+    .await;
+}
+
+/// `handle_turn_start` body with a caller-chosen accept payload.
+///
+/// The lifecycle (admission → registry insert → accept reply → `start_tx`)
+/// is shared verbatim between `turn/start` (accept = `{"accepted": true}`)
+/// and the `turn/steer` no-active-turn fallback (accept =
+/// `{"turn_id": ..., "steered": false}`) — codex parity: `Op::UserInput`
+/// falls back from `steer_input` to `spawn_task(RegularTask)` through the
+/// SAME submission path (`handlers.rs:220-266`); only the RPC result shape
+/// differs on the app-server surface.
+#[allow(clippy::too_many_arguments)]
+async fn handle_turn_start_with_accept(
+    ws: &WsConnection,
+    state: &Arc<AppState>,
+    ledger: &Arc<UiProtocolLedger>,
+    contracts: &Arc<UiProtocolContractStores>,
+    active_turns: &SharedActiveTurns,
+    connection_turns: &SharedConnectionTurns,
+    connection_profile_id: Option<&str>,
+    routed_profile_id: Option<&str>,
+    features: ConnectionUiFeatures,
+    id: String,
     mut params: TurnStartParams,
+    accept_result: Value,
 ) {
     // UPCR-2026-015 (M9-β-1): if the client carried a `topic` field
     // alongside the session_id, fold it into the resolved SessionKey
@@ -13791,6 +13890,14 @@ async fn handle_turn_start(
     let interrupt_tx = Arc::new(TokioMutex::new(Some(interrupt_tx)));
     let turn_state_for_task = turn_state.clone();
     let (start_tx, start_rx) = tokio::sync::oneshot::channel();
+    // `turn/steer` pending-input buffer (codex `TurnState.pending_input`).
+    // Regular standalone turns are steerable; M9 protocol fixture turns are
+    // not (they never run the agent loop, so a pushed input would silently
+    // vanish — advertise that by registering no buffer).
+    let steer_buffer: Option<octos_agent::SharedSteerBuffer> = fixture
+        .is_none()
+        .then(|| Arc::new(octos_agent::SteerBuffer::default()));
+    let steer_buffer_for_turn = steer_buffer.clone();
     let resolved_profile_id = connection_profile_id
         .or(routed_profile_id)
         .map(ToOwned::to_owned);
@@ -13864,6 +13971,7 @@ async fn handle_turn_start(
                 resolved_profile_id,
                 turn_state_for_task,
                 interrupt_rx,
+                steer_buffer_for_turn,
                 false,
                 None,
                 // #1133 — regular `turn/start` path is user-initiated;
@@ -13904,6 +14012,7 @@ async fn handle_turn_start(
                     profile_id: profile_for_stamp.clone(),
                     state: turn_state.clone(),
                     interrupt_tx,
+                    steer: steer_buffer,
                     abort: handle.abort_handle(),
                 },
             );
@@ -13926,11 +14035,176 @@ async fn handle_turn_start(
         .insert(session_id, turn_id.clone());
     // Lifecycle reply: if the client cannot receive the accept, abort the
     // freshly-inserted turn — running an unaccepted turn would be a leak.
-    if send_rpc_result(ws, id, json!({ "accepted": true })).is_err() {
+    if send_rpc_result(ws, id, accept_result).is_err() {
         handle.abort();
         return;
     }
     let _ = start_tx.send(());
+}
+
+/// Outcome of the `turn/steer` registry decision (computed under the
+/// active-turns registry lock — see [`handle_turn_steer`]).
+enum TurnSteerDecision {
+    /// Input pushed into the ACTIVE turn's pending buffer.
+    Steered(TurnId),
+    /// `expected_turn_id` was present and does not name the active turn
+    /// (codex `ExpectedTurnMismatch`). Carries the actual active id for the
+    /// error message.
+    Mismatch(TurnId),
+    /// A live turn exists but registered no steer buffer (code review / M9
+    /// fixture turns) — codex `ActiveTurnNotSteerable`.
+    NotSteerable,
+    /// No live turn — fall back to the ordinary `turn/start` path (codex
+    /// `NoActiveTurn` → `spawn_task(RegularTask)`).
+    NoActiveTurn,
+}
+
+/// `turn/steer` — mid-turn prompt injection into the active turn (see the
+/// [`APPUI_METHOD_TURN_STEER`] doc for the full contract).
+///
+/// The steer-vs-fallback decision and the buffer push happen atomically
+/// under the active-turns registry lock, closing the turn-end race the
+/// codex report calls out (§5): natural completion flips the per-turn
+/// state to `Terminal` before the registry entry is considered dead, and a
+/// non-terminal entry's buffer is still drained by the live loop (an
+/// EndTurn with a pending steer runs another round instead of returning).
+/// Steering never touches the interrupt channel.
+#[allow(clippy::too_many_arguments)]
+async fn handle_turn_steer(
+    ws: &WsConnection,
+    state: &Arc<AppState>,
+    ledger: &Arc<UiProtocolLedger>,
+    contracts: &Arc<UiProtocolContractStores>,
+    active_turns: &SharedActiveTurns,
+    connection_turns: &SharedConnectionTurns,
+    connection_profile_id: Option<&str>,
+    features: ConnectionUiFeatures,
+    id: String,
+    request: &RpcRequest<Value>,
+) {
+    let params: RawTurnSteerParams = match parse_raw_params(request) {
+        Ok(params) => params,
+        Err(error) => {
+            let _ = send_rpc_error(ws, Some(id), error);
+            return;
+        }
+    };
+    if let Err(error) = validate_session_scope(&params.session_id, None, connection_profile_id) {
+        send_scope_error(ws, id, error);
+        return;
+    }
+    let Some(prompt) = prompt_text(&params.input) else {
+        let _ = send_rpc_error(
+            ws,
+            Some(id),
+            RpcError::invalid_params("turn/steer requires at least one text input item"),
+        );
+        return;
+    };
+
+    let decision = {
+        let active = active_turns.lock().await;
+        match active.get(&params.session_id) {
+            Some(existing) => {
+                // A `Terminal` entry is a finished turn kept only so late
+                // `turn/interrupt`s see `terminal_state` — for steering it
+                // counts as "no active turn" (same predicate `turn/start`'s
+                // admission uses for `occupied`). `Interrupting` still
+                // counts as live: the client asked to stop, and a raced
+                // steer behaves like the codex loop-exit race (buffered,
+                // possibly dropped at turn end — logged, never mis-routed).
+                let terminal = matches!(*existing.state.lock().await, TurnState::Terminal(_));
+                if terminal {
+                    TurnSteerDecision::NoActiveTurn
+                } else if params
+                    .expected_turn_id
+                    .as_ref()
+                    .is_some_and(|expected| *expected != existing.turn_id)
+                {
+                    TurnSteerDecision::Mismatch(existing.turn_id.clone())
+                } else {
+                    match existing.steer.as_ref() {
+                        Some(buffer) => {
+                            // Push while still holding the registry lock so
+                            // the accept below can never name a turn that a
+                            // concurrent admission already replaced.
+                            buffer.push(prompt.clone());
+                            TurnSteerDecision::Steered(existing.turn_id.clone())
+                        }
+                        None => TurnSteerDecision::NotSteerable,
+                    }
+                }
+            }
+            None => TurnSteerDecision::NoActiveTurn,
+        }
+    };
+
+    match decision {
+        TurnSteerDecision::Steered(turn_id) => {
+            info!(
+                session = %params.session_id.0,
+                turn = %turn_id.0,
+                "turn/steer accepted into the active turn's pending-input buffer"
+            );
+            let _ = send_rpc_result(ws, id, json!({ "turn_id": turn_id, "steered": true }));
+        }
+        TurnSteerDecision::Mismatch(active_turn_id) => {
+            let _ = send_rpc_error(
+                ws,
+                Some(id),
+                RpcError::invalid_params(format!(
+                    "expected_turn_id does not match the active turn ({})",
+                    active_turn_id.0
+                )),
+            );
+        }
+        TurnSteerDecision::NotSteerable => {
+            let _ = send_rpc_error(
+                ws,
+                Some(id),
+                RpcError::invalid_request("the active turn does not accept steering"),
+            );
+        }
+        TurnSteerDecision::NoActiveTurn => {
+            // Codex fallback (`handlers.rs:233-265`): no active turn — the
+            // input is NOT dropped; it starts an ordinary turn through the
+            // full `turn/start` admission path (scope re-validation,
+            // runtime gate, occupied-race rejection, registry insert). The
+            // accept payload is the steer shape: the NEW server-minted id
+            // plus `steered: false`. A concurrent admission winning the
+            // race surfaces the standard "a turn is already running"
+            // rejection — the caller retries as a steer.
+            let new_turn_id = TurnId::new();
+            let start_params = TurnStartParams {
+                session_id: params.session_id,
+                turn_id: new_turn_id.clone(),
+                input: params.input,
+                media: Vec::new(),
+                topic: None,
+                rewrite_for: None,
+                reasoning_effort: None,
+                live_video: false,
+            };
+            handle_turn_start_with_accept(
+                ws,
+                state,
+                ledger,
+                contracts,
+                active_turns,
+                connection_turns,
+                connection_profile_id,
+                // Raw surface carries no routed profile; the session key /
+                // connection scope dominate resolution (same stance as
+                // `review/start` on this surface).
+                None,
+                features,
+                id,
+                start_params,
+                json!({ "turn_id": new_turn_id, "steered": false }),
+            )
+            .await;
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -14010,6 +14284,11 @@ async fn maybe_spawn_appui_master_continuation_runner(
     let interrupt_tx = Arc::new(TokioMutex::new(Some(interrupt_tx)));
     let turn_state_for_task = turn_state.clone();
     let (start_tx, start_rx) = tokio::sync::oneshot::channel();
+    // Continuation turns run the ordinary agent loop, so they are steerable
+    // like any regular turn (codex steers every RegularTask).
+    let steer_buffer: octos_agent::SharedSteerBuffer =
+        Arc::new(octos_agent::SteerBuffer::default());
+    let steer_buffer_for_turn = steer_buffer.clone();
 
     let ws_for_turn = ws.clone();
     let state_for_turn = state.clone();
@@ -14120,6 +14399,7 @@ async fn maybe_spawn_appui_master_continuation_runner(
             routed_profile_id,
             turn_state_for_task,
             interrupt_rx,
+            Some(steer_buffer_for_turn),
             true,
             loop_id_for_self_paced,
             goal_context_for_appui,
@@ -14143,6 +14423,7 @@ async fn maybe_spawn_appui_master_continuation_runner(
             profile_id: profile_id.clone(),
             state: turn_state,
             interrupt_tx,
+            steer: Some(steer_buffer),
             abort: handle.abort_handle(),
         },
     );
@@ -22238,6 +22519,15 @@ async fn run_standalone_turn(
     routed_profile_id: Option<String>,
     turn_state: Arc<TokioMutex<TurnState>>,
     mut interrupt_rx: mpsc::Receiver<()>,
+    // `turn/steer` pending-input buffer for THIS turn (codex
+    // `TurnState.pending_input`). The RPC pushes into it under the
+    // active-turns registry lock; here it is threaded onto the per-turn
+    // agent, whose loop drains it at each iteration boundary. The drained
+    // callback registered below persists each steer row through the
+    // canonical session path (same commit-observer emit the `turn/start`
+    // prompt row gets) the moment it is folded into the conversation.
+    // `None` for non-steerable turns.
+    steer_buffer: Option<octos_agent::SharedSteerBuffer>,
     internal_master_continuation: bool,
     // #1128 codex P1 re-review #2 — when this turn is draining a
     // self-paced or maintenance LoopFire continuation, pass the loop
@@ -23776,6 +24066,69 @@ async fn run_standalone_turn(
     // when `appui.sessions_in_cwd` is on) so the snapshot the NEXT turn's
     // `appui_context_history_for_agent` loads is the same project's (#1666).
     let context_data_dir_for_result = session_runtime.sessions_root.clone();
+    // `turn/steer` wiring: hand the per-turn pending-input buffer to the
+    // agent loop and register the drained-callback that makes an injected
+    // steer land EXACTLY like the `turn/start` prompt row does — persisted
+    // through the canonical session path (whose `MessageCommitObserver`
+    // emits the standard v2 `UserMessage` envelope, so clients see the
+    // steer fold in the moment it is drained), the SessionManager cache
+    // invalidated, and the row recorded into the context ledger so the
+    // NEXT turn's rebuilt LLM context keeps it. Because the host persists
+    // at drain time, the agent loop keeps steer rows OUT of
+    // `response.messages` — the end-of-turn persist loop below therefore
+    // never double-writes them.
+    if let Some(buffer) = steer_buffer.clone() {
+        let steer_sessions = sessions.clone();
+        let steer_data_dir = sessions.lock().await.data_dir();
+        let steer_session_id = session_id.clone();
+        let steer_thread_id = turn_thread_id_for_persist.clone();
+        let steer_context_dir = context_data_dir_for_result.clone();
+        let steer_context_manager = context_manager.clone();
+        let drained_callback: octos_agent::SteerDrainedCallback = Arc::new(move |texts| {
+            let sessions = steer_sessions.clone();
+            let data_dir = steer_data_dir.clone();
+            let session_id = steer_session_id.clone();
+            let thread_id = steer_thread_id.clone();
+            let context_dir = steer_context_dir.clone();
+            let context_manager = steer_context_manager.clone();
+            Box::pin(async move {
+                for text in texts {
+                    let message = pre_stamp_turn_thread_id(Message::user(text), &thread_id);
+                    match octos_bus::session::persist_message_through_canonical_path(
+                        &data_dir,
+                        &session_id,
+                        message.clone(),
+                    )
+                    .await
+                    {
+                        Ok(seq) => {
+                            sessions.lock().await.invalidate_cache(&session_id);
+                            record_appui_context_manager_message(
+                                &context_dir,
+                                &context_manager,
+                                &session_id,
+                                &message,
+                                seq,
+                            );
+                        }
+                        Err(error) => {
+                            warn!(
+                                session = %session_id.0,
+                                turn = %thread_id,
+                                error = %error,
+                                "failed to persist drained turn/steer input; the model \
+                                 still sees it this turn but it will be missing from \
+                                 durable history"
+                            );
+                        }
+                    }
+                }
+            })
+        });
+        request_agent = request_agent
+            .with_steer_buffer(buffer)
+            .with_steer_drained_callback(drained_callback);
+    }
     let usage_ledger_for_result = usage_ledger.clone();
     let usage_profile_id_for_result = usage_profile_id.clone();
     let usage_session_id_for_result = session_id.to_string();
@@ -25315,6 +25668,25 @@ async fn run_standalone_turn(
     }
 
     let _ = agent_task.await;
+
+    // `turn/steer` turn-end race residual (codex §5 parity): the loop keeps
+    // the turn alive for steers that land BEFORE its final EndTurn check,
+    // but a steer accepted in the narrow window between that check and this
+    // point never drains. Make the drop observable rather than silent — the
+    // registry entry is still keyed to this turn, so no later turn can
+    // consume the leftovers.
+    if let Some(buffer) = steer_buffer.as_ref() {
+        let leftovers = buffer.drain();
+        if !leftovers.is_empty() {
+            warn!(
+                session = %session_id.0,
+                turn = %turn_id.0,
+                dropped = leftovers.len(),
+                "turn/steer input(s) arrived as the turn ended and were dropped; \
+                 the client should re-send (a fresh call now falls back to a new turn)"
+            );
+        }
+    }
 
     // NEW-16 codex round-3 P1+P2: GC moved from here to the
     // TTL-based opportunistic pruner inside the persist block.
