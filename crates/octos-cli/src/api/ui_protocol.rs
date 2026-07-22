@@ -215,6 +215,13 @@ const APPUI_METHOD_PROFILE_SUB_PROVIDERS_REMOVE: &str = "profile/sub_providers/r
 const APPUI_METHOD_SNAPSHOT_LIST: &str = "snapshot/list";
 /// `snapshot/restore`: restore the session workspace to a snapshot (#1768).
 const APPUI_METHOD_SNAPSHOT_RESTORE: &str = "snapshot/restore";
+/// `peer/prepare` (#1800): stage a peer-agent spin-off — write the durable
+/// task brief under the profile data dir (`peers/<slug>/brief.md`) and
+/// optionally create a fenced git worktree for it. Touches NO session state:
+/// the client drives the standard `session/open` + `turn/start` with the
+/// returned cwd/topic, so the peer is an ordinary sovereign session whose
+/// contract survives on disk (reviewable, diffable, respawnable).
+const APPUI_METHOD_PEER_PREPARE: &str = "peer/prepare";
 const APPUI_METHOD_PROFILE_SKILLS_LIST: &str = "profile/skills/list";
 const APPUI_METHOD_PROFILE_SKILLS_REGISTRY_SEARCH: &str = "profile/skills/registry/search";
 const APPUI_METHOD_PROFILE_SKILLS_INSTALL: &str = "profile/skills/install";
@@ -287,6 +294,7 @@ const APPUI_EXTRA_METHODS: &[&str] = &[
     APPUI_METHOD_PROFILE_SUB_PROVIDERS_REMOVE,
     APPUI_METHOD_SNAPSHOT_LIST,
     APPUI_METHOD_SNAPSHOT_RESTORE,
+    APPUI_METHOD_PEER_PREPARE,
     APPUI_METHOD_PROFILE_SKILLS_LIST,
     APPUI_METHOD_PROFILE_SKILLS_REGISTRY_SEARCH,
     APPUI_METHOD_PROFILE_SKILLS_INSTALL,
@@ -9513,6 +9521,212 @@ async fn raw_snapshot_restore(
     }))
 }
 
+#[derive(Debug, Deserialize)]
+struct RawPeerPrepareParams {
+    /// The durable task contract for the peer session.
+    brief: String,
+    /// Optional human title — seeds the slug (else the brief's first words).
+    #[serde(default)]
+    title: Option<String>,
+    /// Create a git worktree (branch `peer/<slug>`) under the profile data
+    /// dir and return it as the peer's cwd — the blast-radius fence.
+    #[serde(default)]
+    worktree: bool,
+    /// Explicit workspace override. Defaults to the calling session's root.
+    #[serde(default)]
+    cwd: Option<String>,
+    /// The calling session — supplies the default workspace root and scopes
+    /// profile resolution exactly like `snapshot/*`.
+    #[serde(default)]
+    session_id: Option<SessionKey>,
+    #[serde(default)]
+    profile_id: Option<String>,
+}
+
+/// Upper bound on a peer brief. Briefs are task contracts, not payloads — a
+/// cap keeps a runaway client from turning the profile dir into blob storage.
+const PEER_BRIEF_MAX_BYTES: usize = 64 * 1024;
+
+/// Derive a unique directory slug for a peer under `peers/`: sanitized from
+/// the title (else the brief's leading words), numeric `-N` suffix on
+/// collision. Returns the reserved (created) directory alongside the slug so
+/// two concurrent prepares can never race into the same dir —
+/// `create_dir` is the atomic claim.
+fn reserve_peer_dir(peers_root: &Path, seed: &str) -> Result<(String, PathBuf), RpcError> {
+    // Dashed-alnum normalization (NOT bare `safe_filename`, which
+    // percent-encodes spaces — `%20` in a slug leaks into branch names and
+    // paths). Unicode alphanumerics survive so CJK titles keep their words;
+    // `safe_filename` stays as the filesystem-safety belt on the result.
+    let mut dashed = String::new();
+    for ch in seed.chars() {
+        if ch.is_alphanumeric() {
+            dashed.extend(ch.to_lowercase());
+        } else if !dashed.ends_with('-') && !dashed.is_empty() {
+            dashed.push('-');
+        }
+    }
+    let base = octos_core::safe_filename(dashed.trim_matches('-'));
+    let mut base = base.chars().take(40).collect::<String>();
+    if base.is_empty() {
+        base = "peer".to_owned();
+    }
+    std::fs::create_dir_all(peers_root)
+        .map_err(|err| RpcError::internal_error(format!("failed to create peers dir: {err}")))?;
+    for attempt in 0..100u32 {
+        let slug = if attempt == 0 {
+            base.clone()
+        } else {
+            format!("{base}-{}", attempt + 1)
+        };
+        let dir = peers_root.join(&slug);
+        match std::fs::create_dir(&dir) {
+            Ok(()) => return Ok((slug, dir)),
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(err) => {
+                return Err(RpcError::internal_error(format!(
+                    "failed to reserve peer dir: {err}"
+                )));
+            }
+        }
+    }
+    Err(RpcError::invalid_params(
+        "too many peers with this title — pick a distinct title",
+    ))
+}
+
+/// `peer/prepare` (#1800): stage a peer-agent spin-off. Writes the durable
+/// brief and (optionally) creates a fenced worktree; the client then opens
+/// the session and starts the kickoff turn through the ordinary core
+/// methods. Pure resource staging — no session state is touched here, so a
+/// crash between prepare and open leaks at most an inert directory.
+async fn raw_peer_prepare(
+    state: &Arc<AppState>,
+    request: &RpcRequest<Value>,
+    connection_profile_id: Option<&str>,
+) -> Result<Value, RpcError> {
+    let params: RawPeerPrepareParams = parse_raw_params(request)?;
+    let brief = params.brief.trim();
+    if brief.is_empty() {
+        return Err(RpcError::invalid_params("brief is required"));
+    }
+    if brief.len() > PEER_BRIEF_MAX_BYTES {
+        return Err(RpcError::invalid_params(format!(
+            "brief exceeds {PEER_BRIEF_MAX_BYTES} bytes — a brief is a task contract, keep the payload in the workspace"
+        )));
+    }
+    let profile_id = raw_scoped_llm_profile_id(
+        params.profile_id.clone(),
+        params.session_id.as_ref(),
+        connection_profile_id,
+    )?;
+    let Some(runtime) = state.profiles.get(&profile_id) else {
+        return Err(RpcError::invalid_params(format!(
+            "profile {profile_id} has no bootstrapped runtime"
+        )));
+    };
+
+    // Workspace root: explicit cwd (validated like a session open) beats the
+    // calling session's root. A worktree needs SOME root; a plain peer does
+    // too (its session open will carry it as cwd).
+    let workspace_root = match params.cwd.as_deref() {
+        Some(cwd) => {
+            let path = PathBuf::from(cwd);
+            let canonical = path.canonicalize().map_err(|err| {
+                RpcError::invalid_params(format!("cwd {cwd} is not usable: {err}"))
+            })?;
+            if !canonical.is_dir() {
+                return Err(RpcError::invalid_params(format!(
+                    "cwd {cwd} is not a directory"
+                )));
+            }
+            validate_session_workspace_path_safety(&canonical)?;
+            canonical
+        }
+        None => {
+            let Some(root) = params
+                .session_id
+                .as_ref()
+                .and_then(|session_id| session_workspace_root_for_state(state, session_id))
+            else {
+                return Err(RpcError::invalid_params(
+                    "no workspace root — pass cwd, or session_id of an open session",
+                ));
+            };
+            root
+        }
+    };
+
+    let seed = params
+        .title
+        .as_deref()
+        .map(str::trim)
+        .filter(|title| !title.is_empty())
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| {
+            brief
+                .split_whitespace()
+                .take(6)
+                .collect::<Vec<_>>()
+                .join(" ")
+        });
+    let peers_root = runtime.data_dir.join("peers");
+    let (slug, peer_dir) = reserve_peer_dir(&peers_root, &seed)?;
+
+    // The fence: a worktree on branch `peer/<slug>` under the peer dir. Git
+    // work is blocking; keep it off the reactor. On failure the reserved dir
+    // is removed so the slug is not burned.
+    let peer_cwd = if params.worktree {
+        let worktree_path = peer_dir.join("wt");
+        let branch = format!("peer/{slug}");
+        let root = workspace_root.clone();
+        let target = worktree_path.clone();
+        let branch_arg = branch.clone();
+        let output = tokio::task::spawn_blocking(move || {
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(&root)
+                .arg("worktree")
+                .arg("add")
+                .arg("-b")
+                .arg(&branch_arg)
+                .arg(&target)
+                .output()
+        })
+        .await
+        .map_err(|err| RpcError::internal_error(format!("worktree task failed: {err}")))?
+        .map_err(|err| RpcError::invalid_params(format!("failed to run git: {err}")))?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let _ = std::fs::remove_dir_all(&peer_dir);
+            return Err(RpcError::invalid_params(format!(
+                "git worktree add failed (is {} a git repo?): {}",
+                workspace_root.display(),
+                stderr.trim()
+            )));
+        }
+        worktree_path
+    } else {
+        workspace_root.clone()
+    };
+
+    let brief_path = peer_dir.join("brief.md");
+    if let Err(err) = crate::memory_consolidate::apply::atomic_write(&brief_path, brief) {
+        let _ = std::fs::remove_dir_all(&peer_dir);
+        return Err(RpcError::internal_error(format!(
+            "failed to write brief: {err}"
+        )));
+    }
+
+    Ok(json!({
+        "slug": slug,
+        "topic": format!("peer-{slug}"),
+        "brief_path": brief_path.to_string_lossy(),
+        "cwd": peer_cwd.to_string_lossy(),
+        "worktree_branch": params.worktree.then(|| format!("peer/{slug}")),
+        "profile_id": profile_id,
+    }))
+}
+
 /// Serializes profile `sub_providers` read-modify-write across concurrent
 /// upsert/remove RPCs so two clients adding different lanes don't clobber each
 /// other (a bare get→mutate→save is last-writer-wins because `save_with_merge`
@@ -10128,6 +10342,7 @@ async fn handle_raw_appui_rpc(
         APPUI_METHOD_SNAPSHOT_RESTORE => {
             raw_snapshot_restore(state, request, connection_profile_id).await
         }
+        APPUI_METHOD_PEER_PREPARE => raw_peer_prepare(state, request, connection_profile_id).await,
         APPUI_METHOD_PROFILE_SKILLS_LIST => {
             raw_profile_skills_list(state, request, connection_profile_id)
         }
@@ -10506,6 +10721,7 @@ fn raw_method_is_dispatched(method: &str, stdio_transport: bool) -> bool {
             | APPUI_METHOD_PROFILE_SUB_PROVIDERS_REMOVE
             | APPUI_METHOD_SNAPSHOT_LIST
             | APPUI_METHOD_SNAPSHOT_RESTORE
+            | APPUI_METHOD_PEER_PREPARE
             | APPUI_METHOD_PROFILE_SKILLS_LIST
             | APPUI_METHOD_PROFILE_SKILLS_REGISTRY_SEARCH
             | APPUI_METHOD_PROFILE_SKILLS_INSTALL

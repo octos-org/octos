@@ -1758,6 +1758,10 @@ fn dispatch_probe_request(method: &str) -> RpcRequest<Value> {
         APPUI_METHOD_SNAPSHOT_RESTORE => {
             json!({ "session_id": session_id, "snapshot_id": "deadbeef" })
         }
+        APPUI_METHOD_PEER_PREPARE => json!({
+            "brief": "probe peer brief",
+            "session_id": session_id,
+        }),
         other => panic!("missing AppUI dispatch probe params for {other}"),
     };
 
@@ -24183,4 +24187,224 @@ fn per_turn_snapshot_creates_fresh_dispatcher() {
              get() and report the parent-side missing target; got: {:?}",
         result.output
     );
+}
+
+// ---------------------------------------------------------------------------
+// peer/prepare (#1800)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn reserve_peer_dir_claims_atomically_and_suffixes_collisions() {
+    let tmp = tempfile::tempdir().unwrap();
+    let peers = tmp.path().join("peers");
+
+    let (slug_a, dir_a) = reserve_peer_dir(&peers, "Fix the CI!! now").unwrap();
+    assert!(dir_a.is_dir(), "reserve creates the claimed dir");
+    assert!(
+        !slug_a.contains('/') && !slug_a.contains(' '),
+        "slug is path-safe: {slug_a}"
+    );
+
+    // Same seed again: the claim is the dir creation, so the second reserve
+    // must land on a distinct suffixed slug instead of sharing the dir.
+    let (slug_b, dir_b) = reserve_peer_dir(&peers, "Fix the CI!! now").unwrap();
+    assert_ne!(slug_a, slug_b, "collision gets a fresh slug");
+    assert!(slug_b.starts_with(slug_a.as_str()), "suffix keeps the base");
+    assert!(dir_b.is_dir());
+
+    // Degenerate seed falls back to a usable slug.
+    let (slug_c, _) = reserve_peer_dir(&peers, "!!!").unwrap();
+    assert!(!slug_c.is_empty());
+}
+
+/// End-to-end `peer/prepare`: brief written atomically under the profile
+/// data dir, worktree fenced on branch `peer/<slug>`, failures do not burn
+/// the slug, and validation rejects empty/oversized briefs.
+#[tokio::test]
+async fn peer_prepare_stages_brief_and_worktree() {
+    let tmp = tempfile::tempdir().unwrap();
+    let profile = crate::profiles::UserProfile {
+        id: "dev".to_string(),
+        name: "Dev".to_string(),
+        enabled: true,
+        data_dir: None,
+        parent_id: None,
+        public_subdomain: None,
+        config: crate::profiles::ProfileConfig {
+            llm: Some(crate::profiles::LlmProfileConfig {
+                primary: Some(crate::profiles::LlmModelSelectionConfig {
+                    family_id: Some("openai".to_string()),
+                    model_id: Some("gpt-4o-mini".to_string()),
+                    route: Some(crate::profiles::LlmRouteConfig {
+                        route_id: None,
+                        label: None,
+                        base_url: None,
+                        api_key_env: Some("PEER_PREP_TEST_KEY".to_string()),
+                        api_type: None,
+                    }),
+                    ..Default::default()
+                }),
+                fallbacks: Vec::new(),
+            }),
+            env_vars: [("PEER_PREP_TEST_KEY".to_string(), "test-key".to_string())]
+                .into_iter()
+                .collect(),
+            ..Default::default()
+        },
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    };
+    let data_dir = tmp.path().join("data");
+    std::fs::create_dir_all(&data_dir).unwrap();
+    let runtime = crate::runtime::ProfileRuntime::bootstrap(
+        &profile,
+        &data_dir,
+        None,
+        crate::runtime::BootstrapRole::Serve,
+    )
+    .await
+    .expect("bootstrap dev runtime");
+    let mut state = AppState::empty_for_tests();
+    state.profiles.insert("dev".to_string(), runtime);
+    let state = Arc::new(state);
+
+    fn git(dir: &std::path::Path, args: &[&str]) {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    let repo = tmp.path().join("project");
+    std::fs::create_dir_all(&repo).unwrap();
+    git(&repo, &["init", "-q"]);
+    git(
+        &repo,
+        &[
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "user.name=t",
+            "commit",
+            "--allow-empty",
+            "-m",
+            "init",
+        ],
+    );
+
+    let request =
+        |params: Value| RpcRequest::new("peer-1".to_string(), APPUI_METHOD_PEER_PREPARE, params);
+
+    // Worktree staging: fenced cwd + branch + brief on disk.
+    let result = raw_peer_prepare(
+        &state,
+        &request(json!({
+            "brief": "Investigate the flaky bus test and fix it.",
+            "title": "CI Fix",
+            "worktree": true,
+            "cwd": repo.to_string_lossy(),
+            "profile_id": "dev",
+        })),
+        None,
+    )
+    .await
+    .expect("prepare with worktree");
+    assert_eq!(result["slug"], "ci-fix");
+    assert_eq!(result["topic"], "peer-ci-fix");
+    assert_eq!(result["worktree_branch"], "peer/ci-fix");
+    let brief_path = std::path::PathBuf::from(result["brief_path"].as_str().unwrap());
+    assert_eq!(
+        std::fs::read_to_string(&brief_path).unwrap(),
+        "Investigate the flaky bus test and fix it."
+    );
+    let cwd = std::path::PathBuf::from(result["cwd"].as_str().unwrap());
+    assert!(
+        cwd.ends_with("peers/ci-fix/wt"),
+        "fenced cwd: {}",
+        cwd.display()
+    );
+    assert!(cwd.join(".git").exists(), "worktree checkout is real");
+
+    // Same title again, no worktree: suffixed slug, cwd echoes the repo root.
+    let result2 = raw_peer_prepare(
+        &state,
+        &request(json!({
+            "brief": "Second lane.",
+            "title": "CI Fix",
+            "cwd": repo.to_string_lossy(),
+            "profile_id": "dev",
+        })),
+        None,
+    )
+    .await
+    .expect("second prepare");
+    assert_eq!(result2["slug"], "ci-fix-2");
+    assert!(result2["worktree_branch"].is_null());
+    assert_eq!(
+        std::path::PathBuf::from(result2["cwd"].as_str().unwrap()),
+        repo.canonicalize().unwrap()
+    );
+
+    // Worktree against a NON-git cwd fails AND releases the reserved slug.
+    let plain = tmp.path().join("plain");
+    std::fs::create_dir_all(&plain).unwrap();
+    let err = raw_peer_prepare(
+        &state,
+        &request(json!({
+            "brief": "Doomed.",
+            "title": "No Repo",
+            "worktree": true,
+            "cwd": plain.to_string_lossy(),
+            "profile_id": "dev",
+        })),
+        None,
+    )
+    .await
+    .expect_err("worktree without a git repo must fail");
+    assert!(
+        err.message.contains("git repo"),
+        "actionable error: {}",
+        err.message
+    );
+    let retry = raw_peer_prepare(
+        &state,
+        &request(json!({
+            "brief": "Now without the fence.",
+            "title": "No Repo",
+            "cwd": plain.to_string_lossy(),
+            "profile_id": "dev",
+        })),
+        None,
+    )
+    .await
+    .expect("failed worktree must not burn the slug");
+    assert_eq!(
+        retry["slug"], "no-repo",
+        "slug released after the failed stage"
+    );
+
+    // Validation: empty and oversized briefs are refused up front.
+    let empty = raw_peer_prepare(
+        &state,
+        &request(json!({ "brief": "   ", "cwd": repo.to_string_lossy(), "profile_id": "dev" })),
+        None,
+    )
+    .await
+    .expect_err("blank brief refused");
+    assert!(empty.message.contains("brief"));
+    let oversized = "x".repeat(PEER_BRIEF_MAX_BYTES + 1);
+    let too_big = raw_peer_prepare(
+        &state,
+        &request(json!({ "brief": oversized, "cwd": repo.to_string_lossy(), "profile_id": "dev" })),
+        None,
+    )
+    .await
+    .expect_err("oversized brief refused");
+    assert!(too_big.message.contains("bytes"));
 }
