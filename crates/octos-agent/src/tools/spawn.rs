@@ -801,10 +801,22 @@ fn role_task_capability_warning(effective_tools: &[String], task: &str) -> Optio
 /// The `router_session_id` must mirror `read_task_output`'s lookup:
 /// `agent:{task.tool_call_id}` where the spawn registers with
 /// `tool_call_id = "spawn-{worker_id}"`.
+///
+/// When an `on_stream_chunk` callback is set, live `StreamChunk` events are
+/// forwarded there so the caller (the WS/serve layer) can emit
+/// `agent/output/delta` directly — bypassing the heavy `on_change` path
+/// (which persists a snapshot on every fire). This gives the TUI agent dock
+/// live streaming output for running background children without per-token
+/// persistence overhead (codex plan review: "the proposed per-token
+/// persistence/on_change fan-out is too heavy").
 struct SpawnChildTranscriptReporter {
     router: Arc<SubAgentOutputRouter>,
     router_session_id: String,
     task_id: String,
+    /// Optional callback for live `StreamChunk` forwarding. Called directly
+    /// from the reporter thread with the text delta — the caller owns the
+    /// emit path (e.g. `emit_supervisor_event(AGENT_OUTPUT_DELTA, ...)`).
+    on_stream_chunk: Option<Arc<dyn Fn(&str) + Send + Sync>>,
 }
 
 impl crate::progress::ProgressReporter for SpawnChildTranscriptReporter {
@@ -830,7 +842,28 @@ impl crate::progress::ProgressReporter for SpawnChildTranscriptReporter {
                 format!("[tool {status}] {name} — {first}\n")
             }
             ProgressEvent::FileModified { path } => format!("[file modified] {path}\n"),
-            // StreamChunk would duplicate the Response event's final content;
+            // StreamChunk: forward live text deltas directly to the
+            // on_stream_chunk callback (if set) so the WS layer can emit
+            // agent/output/delta WITHOUT going through on_change (which
+            // persists a snapshot on every fire — too heavy per-token per
+            // codex review). The router write is still done so
+            // task/output/delta also gets it (the TUI fallback path).
+            ProgressEvent::StreamChunk { text, .. } => {
+                if !text.is_empty() {
+                    if let Some(ref cb) = self.on_stream_chunk {
+                        cb(text.as_str());
+                    }
+                    // Also append to the router file so task/output/delta
+                    // carries the same content (TUI fallback path).
+                    let line = format!("{text}");
+                    let _ = self.router.append(
+                        &self.router_session_id,
+                        &self.task_id,
+                        line.as_bytes(),
+                    );
+                }
+                return;
+            }
             // Thinking/LlmStatus/etc. are cadence noise for a transcript.
             _ => return,
         };
@@ -1018,6 +1051,11 @@ pub struct SpawnTool {
     /// the child Agent's spawn_only background tools route output
     /// through the same on-disk log the dashboard tails.
     parent_subagent_output_router: Option<Arc<SubAgentOutputRouter>>,
+    /// Optional callback for live stream-chunk forwarding. When set, the
+    /// spawn child's `ProgressEvent::StreamChunk` text is forwarded here so
+    /// the WS/serve layer can emit `agent/output/delta` directly (bypassing
+    /// the heavy `on_change` + per-token persistence path — per codex review).
+    child_stream_callback: Option<Arc<dyn Fn(&str) + Send + Sync>>,
     /// M8 Runtime Parity W2.B1: parent session's M8.7 summary generator
     /// so the child can spawn periodic-summary watchers under the same
     /// LLM/budget contract.
@@ -1089,6 +1127,7 @@ impl SpawnTool {
             cost_accountant: None,
             parent_file_state_cache: None,
             parent_subagent_output_router: None,
+            child_stream_callback: None,
             parent_subagent_summary_generator: None,
             child_prompt_context_manager_factory: None,
             dispatch_policy: None,
@@ -1133,6 +1172,7 @@ impl SpawnTool {
             cost_accountant: None,
             parent_file_state_cache: None,
             parent_subagent_output_router: None,
+            child_stream_callback: None,
             parent_subagent_summary_generator: None,
             child_prompt_context_manager_factory: None,
             dispatch_policy: None,
@@ -1191,6 +1231,7 @@ impl SpawnTool {
             cost_accountant: self.cost_accountant.clone(),
             parent_file_state_cache: self.parent_file_state_cache.clone(),
             parent_subagent_output_router: self.parent_subagent_output_router.clone(),
+            child_stream_callback: self.child_stream_callback.clone(),
             parent_subagent_summary_generator: self.parent_subagent_summary_generator.clone(),
             // Depth-1-only wiring, deliberately DROPPED for grandchildren: the
             // AppUI context-fork factory captures the ORIGINAL parent session's
@@ -1401,6 +1442,19 @@ impl SpawnTool {
     /// through the same on-disk log the parent dashboard tails.
     pub fn with_parent_subagent_output_router(mut self, router: Arc<SubAgentOutputRouter>) -> Self {
         self.parent_subagent_output_router = Some(router);
+        self
+    }
+
+    /// Set a callback that receives live `StreamChunk` text deltas from a
+    /// spawned background child. The WS/serve layer uses this to emit
+    /// `agent/output/delta` directly — bypassing the per-token `on_change`
+    /// persistence path (codex plan review: "per-token persistence/on_change
+    /// fan-out is too heavy").
+    pub fn with_child_stream_callback(
+        mut self,
+        cb: impl Fn(&str) + Send + Sync + 'static,
+    ) -> Self {
+        self.child_stream_callback = Some(Arc::new(cb));
         self
     }
 
@@ -4010,6 +4064,7 @@ impl Tool for SpawnTool {
             // `read_task_output` derives (`agent:{tool_call_id}` with
             // `tool_call_id = "spawn-{worker_id}"` from the register above).
             let parent_output_router = self.parent_subagent_output_router.clone();
+            let child_stream_callback = self.child_stream_callback.clone();
             let child_router_session_id = format!("agent:spawn-{worker_id}");
             // PR #1250 finding 1: the fanout-cap refusal above was the last
             // refusal point on the background path — the detached worker is
@@ -4325,6 +4380,7 @@ impl Tool for SpawnTool {
                                 router: router.clone(),
                                 router_session_id: child_router_session_id.clone(),
                                 task_id: task_id.clone(),
+                                on_stream_chunk: child_stream_callback.clone(),
                             }))
                         }
                         _ => None,
@@ -5409,6 +5465,7 @@ mod tests {
             cost_accountant: None,
             parent_file_state_cache: None,
             parent_subagent_output_router: None,
+            child_stream_callback: None,
             parent_subagent_summary_generator: None,
             child_prompt_context_manager_factory: None,
             dispatch_policy: None,
