@@ -254,22 +254,47 @@ octos chat "explain crates/octos-agent/src/agent.rs"   # one-shot: run one turn,
 octos chat -m "…" --json               # one-shot, machine-readable result on stdout
 ```
 
-### Sandbox & approval (codex parity)
+### Modes: interactive, one-shot, JSON
 
-Two orthogonal flags decide how much the agent may do unattended:
+| Invocation | Behavior |
+| --- | --- |
+| `octos chat` | interactive REPL (multi-turn) |
+| `octos chat "PROMPT"` **or** `octos chat -m "PROMPT"` | one-shot: run a single turn and exit (`claude -p` parity) |
+| `octos chat -m "PROMPT" --json` | one-shot, one JSON result object on **stdout** (logs/UI → stderr) |
 
-| Flag | Values | Effect |
-| --- | --- | --- |
-| `--sandbox` | `read-only` \| `workspace-write` (default) \| `danger-full-access` | filesystem / network reach |
-| `--ask-for-approval` | `ask` (default) \| `never` | prompt on risky commands, or fail them closed |
-| `--yolo` | *(flag)* | alias for `--sandbox danger-full-access`: no sandbox, network on, approvals never. **Local single-user boxes only — risk of data loss.** |
+Rules: give the prompt **positionally OR** via `-m`/`--message`, never both (that's
+an error — the positional prompt is otherwise folded into `--message`). `--json`
+needs a **one-shot prompt** (positional *or* `-m`); only **interactive** `--json`
+(no prompt at all) is rejected, since a REPL can't keep stdout clean. On any error
+`--json` still prints `{"error":"…"}` on stdout and exits non-zero, so stdout stays
+machine-parseable.
 
-- **read-only** — reads files and runs read-only commands (`git diff`, `grep`); write/edit tools fail.
-- **workspace-write** — reads and writes, confined to `--cwd`.
-- **danger-full-access / `--yolo`** — host filesystem + network, no approvals.
+### Sandbox × approval — every combination
 
-Guardrails preserved even under `--yolo`: `before_tool_call` hooks, `ToolPolicy`
-deny lists, SSRF protection, and `BLOCKED_ENV_VARS` still apply.
+Two orthogonal axes set what the agent may do unattended: **`--sandbox`**
+(filesystem/network reach) and **`--ask-for-approval`** (whether risky commands
+pause). `--yolo` is a shortcut for the most permissive corner. What each
+combination resolves to:
+
+| `--sandbox` | `--ask-for-approval` | Resolves to | The agent can… |
+| --- | --- | --- | --- |
+| *(omitted)* | *(omitted)* | **workspace-write + ask** — the default | read + write inside `--cwd`; pause for approval on risky commands |
+| `read-only` | *(omitted → `ask`)* | read-only + ask | read + read-only commands (`git diff`, `grep`); write/edit tools fail |
+| `read-only` | `never` | read-only + never | **unattended review** — reads only, never pauses |
+| `workspace-write` | *(omitted → `ask`)* | workspace-write + ask | edit inside `--cwd`, pause on risky |
+| `workspace-write` | `never` | workspace-write + never | **unattended edits** inside `--cwd` |
+| `danger-full-access` | *(forced `never`)* | full access, no prompts | host filesystem + network, no approvals |
+| `--yolo` | — | = `danger-full-access` + `never` | **full autonomy** (the shortcut) |
+
+**Contradictions are rejected — the command errors, it doesn't silently pick one:**
+- `--yolo` (or `--sandbox danger-full-access`) **+** `--ask-for-approval ask` — danger-full-access never asks.
+- `--yolo` **+** `--sandbox read-only`/`workspace-write` — `--yolo` *is* danger-full-access.
+
+`--ask-for-approval never` fails a risky command **closed** at the tool boundary
+(there's no interactive approver in a headless run) rather than prompting.
+Guardrails that stay on even under `danger-full-access`/`--yolo`:
+`before_tool_call` hooks, `ToolPolicy` deny-lists, SSRF protection,
+`BLOCKED_ENV_VARS`.
 
 ### Reuse an existing profile (model + API key)
 
@@ -281,8 +306,13 @@ reuses its provider, model, route, and API key — so you don't re-enter them:
 octos chat --profile dev --yolo "refactor this module"   # uses dev's model + key
 ```
 
-Precedence: `--config` > `--profile <id>` > ambient `config.json`;
-`--provider` / `--model` / `--base-url` / `--api-type` still override.
+Precedence: `--config` > `--profile <id>` > ambient `config.json`.
+`--provider` / `--model` / `--base-url` / `--api-type` each override their own
+field on top. Naming a **different** `--provider` than the profile's does a
+**clean switch** — it detaches the profile's route (base-url, key-env, wire
+protocol) so the new provider's own defaults apply, rather than reusing the old
+provider's key against the new one; add `--model` too, since the profile's model
+won't fit the new provider. Re-naming the *same* provider keeps the route.
 
 ### Code review
 
@@ -329,19 +359,34 @@ Without `--no-session-persistence`, a second `octos chat` on the same
 `--data-dir` fails with `Database already open` — that flag is what makes the
 fan-out non-blocking.
 
-### Other useful flags
+### Full flag reference
 
-| Flag | Purpose |
-| --- | --- |
-| `--effort low\|medium\|high\|max` | reasoning depth for thinking models |
-| `--json` | one JSON result object on stdout (requires `-m`) |
-| `--profile coding-full` | full tool surface (web, pipelines, skills); default `coding` = files / shell / search / memory / spawn |
-| `--no-session-persistence` | ephemeral run (no episode saved); also enables the parallel fan-out above |
-| `--max-iterations N` | raise the per-turn tool-call cap (default 20) |
-| `-v`, `--verbose` | show tool outputs |
+| Flag | Default | Purpose |
+| --- | --- | --- |
+| `PROMPT` *(positional)* / `-m`, `--message <s>` | — | one-shot prompt (two spellings of the same thing; supplying both errors) |
+| `--json` | off | one JSON result object on stdout; needs a one-shot prompt (positional or `-m`) — only interactive `--json` is rejected |
+| `--sandbox <mode>` | `workspace-write` | `read-only` \| `workspace-write` \| `danger-full-access` (see the matrix above) |
+| `--ask-for-approval <mode>` | `ask` | `ask` \| `never` (danger-full-access is always `never`) |
+| `--yolo` | off | shortcut for `--sandbox danger-full-access` (approvals never). Alias of `--dangerously-bypass-approvals-and-sandbox`. **Local single-user boxes only.** |
+| `--profile <id>` | `coding` | runtime **tool surface** (`coding` = files/shell/search/memory/spawn; `coding-full` adds web/pipelines/skills; or a user id). If `<id>` names a stored serve/tui profile, also reuses its **model + API key**. |
+| `--provider <name>` | from config/profile | LLM provider override |
+| `--model <id>` | from config/profile | model override |
+| `--base-url <url>` | from config/profile | custom API endpoint |
+| `--api-type <t>` | from config/profile | wire protocol for `--base-url`: `anthropic` \| `openai` \| `responses` (alias `--api-style`) |
+| `--config <path>` | — | explicit flat config file — **wins over** `--profile` |
+| `--cwd <dir>` | current dir | workspace root the agent reads/writes |
+| `--data-dir <dir>` | `$OCTOS_HOME` / `~/.octos` | episodes / memory / sessions store |
+| `--effort <e>` | provider default | `low` \| `medium` \| `high` \| `max` (thinking models; others ignore it) |
+| `--no-session-persistence` | off | ephemeral run (no episode saved); also **enables parallel agents** on one `--data-dir` |
+| `--max-iterations <n>` | `20` | per-turn tool-call cap |
+| `--no-retry` | off | disable automatic retry on transient LLM errors |
+| `-v`, `--verbose` | off | show tool outputs |
 
-Prerequisite: a provider configured (`octos auth login`, or the provider's
-API-key env var), **or** a `--profile` that already carries one.
+**Model/credential precedence:** `--config` > `--profile <id>` > ambient
+`config.json`; `--provider` / `--model` / `--base-url` / `--api-type` override
+whichever of those supplied them. **Prerequisite:** a configured provider
+(`octos auth login`, or the provider's API-key env var) **or** a `--profile` that
+already carries one.
 
 ## Autonomy: goals & loops
 
