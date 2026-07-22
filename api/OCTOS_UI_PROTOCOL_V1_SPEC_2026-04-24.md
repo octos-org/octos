@@ -446,6 +446,12 @@ Runtime, auth, profile, and onboarding inspection (server-handled
   the session workspace's pre-mutation undo points; restore rolls the
   workspace back — refused while a turn is in flight, itself undoable via
   the automatic pre-restore snapshot)
+- `peer/prepare` (#1800 peer-agent spin-off staging: writes the durable task
+  brief under the profile data dir (`peers/<slug>/brief.md`) and optionally
+  creates a fenced git worktree on branch `peer/<slug>`; returns
+  `{slug, topic, brief_path, cwd, worktree_branch?, profile_id}`. Pure
+  resource staging — the client then opens the peer session and starts the
+  kickoff turn through the ordinary `session/open` + `turn/start`)
 - `profile/skills/list`, `profile/skills/registry/search`,
   `profile/skills/install`, `profile/skills/remove` (server-handled skills
   management)
