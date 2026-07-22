@@ -714,6 +714,63 @@ impl Agent {
         Ok(warning)
     }
 
+    /// Drain the per-turn steer buffer (mid-turn injected user inputs) into
+    /// the live conversation.
+    ///
+    /// Codex parity: `run_turn` drains `TurnState.pending_input` at the TOP
+    /// of each loop iteration, before building the next model request
+    /// (codex-rs `core/src/session/turn.rs:225-233`), and records each item
+    /// as a plain `role: user` message with NO wrapper text
+    /// (`record_user_prompt_and_emit_turn_item`). FIFO order is the
+    /// buffer's append order (`split_off(0)` semantics).
+    ///
+    /// Persistence ownership: when a drained-callback is registered the
+    /// HOST persists each steer row (and emits its standard persisted
+    /// user-message event) at drain time, so the rows stay OUT of
+    /// `turn_output_log` — otherwise the end-of-turn persist pass would
+    /// write them a second time. Without a callback (chat/gateway paths)
+    /// the rows ride the normal end-of-turn persistence via the log.
+    ///
+    /// No-op without a configured buffer — pre-steer loops are
+    /// byte-identical.
+    async fn drain_pending_steer_input(
+        &self,
+        messages: &mut Vec<Message>,
+        turn_output_log: &mut Vec<Message>,
+    ) {
+        let Some(buffer) = self.steer_buffer.as_ref() else {
+            return;
+        };
+        let drained = buffer.drain();
+        if drained.is_empty() {
+            return;
+        }
+        tracing::info!(
+            count = drained.len(),
+            "draining mid-turn steer input into the conversation before the next LLM call"
+        );
+        for text in &drained {
+            let message = Message::user(text.clone());
+            messages.push(message.clone());
+            if self.steer_drained_callback.is_none() {
+                turn_output_log.push(message);
+            }
+        }
+        if let Some(callback) = self.steer_drained_callback.as_ref() {
+            callback(drained).await;
+        }
+    }
+
+    /// Whether a mid-turn steer input is pending (codex `has_pending_input`,
+    /// `turn.rs:304-318`). Read in the EndTurn arm so
+    /// `needs_follow_up = model_wants_more || buffer_nonempty` — a steer
+    /// landing after the model's final answer forces one more round.
+    fn steer_input_pending(&self) -> bool {
+        self.steer_buffer
+            .as_ref()
+            .is_some_and(|buffer| !buffer.is_empty())
+    }
+
     /// Process a single message in conversation mode (chat/gateway).
     /// Takes the user's message, conversation history, and optional media paths.
     pub async fn process_message(
@@ -1037,6 +1094,15 @@ impl Agent {
                 // loop — an unlabeled `continue` there fell through to
                 // `handle_tool_use` and executed the spiraling tools anyway.
                 'agent_loop: loop {
+                    // Codex-parity steer drain (turn.rs:225-233): fold any
+                    // mid-turn injected user inputs into the conversation at
+                    // the TOP of each iteration, BEFORE the next LLM call,
+                    // in FIFO order. Steering never interrupts an in-flight
+                    // round — inputs buffered while the model streams are
+                    // picked up here, after the previous round's tool
+                    // results are recorded.
+                    self.drain_pending_steer_input(&mut messages, &mut turn_output_log)
+                        .await;
                     if let Some(stop) = turn.check_budget(self, activity.as_ref()) {
                         let stop_iteration = turn.iteration();
                         if !self.try_budget_grace_call(
@@ -1305,6 +1371,30 @@ impl Agent {
                                 .await?
                             {
                                 continue;
+                            }
+                            // Codex-parity follow-up gate (turn.rs:304-318):
+                            // `needs_follow_up = model_needs_follow_up ||
+                            // has_pending_input`. The model produced its
+                            // final answer, but a steer landed during this
+                            // round — record that answer as a normal
+                            // assistant row (so the model sees its own
+                            // reply next round and the row persists), then
+                            // loop again; the top-of-loop drain folds the
+                            // steer in as a plain user message and the
+                            // steer gets a response inside the SAME turn.
+                            if self.steer_input_pending() {
+                                if !content.trim().is_empty() {
+                                    let mut assistant_row = Message::assistant(content.clone());
+                                    assistant_row.reasoning_content =
+                                        response.reasoning_content.clone();
+                                    messages.push(assistant_row.clone());
+                                    turn_output_log.push(assistant_row);
+                                }
+                                tracing::info!(
+                                    "steer input pending at EndTurn — running another round \
+                                     instead of terminating the turn"
+                                );
+                                continue 'agent_loop;
                             }
                             self.emit_cost_update(&turn, &response, attributed_cost);
                             return Ok(ConversationResponse {
