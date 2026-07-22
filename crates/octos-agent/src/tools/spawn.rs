@@ -3,7 +3,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
 use async_trait::async_trait;
 use eyre::{Result, WrapErr};
@@ -808,18 +808,31 @@ fn role_task_capability_warning(effective_tools: &[String], task: &str) -> Optio
 /// (which persists a snapshot on every fire). This gives the TUI agent dock
 /// live streaming output for running background children without per-token
 /// persistence overhead (codex plan review: "the proposed per-token
-/// persistence/on_change fan-out is too heavy").
+/// persistence/on_change fan-out is too heavy"). The WS layer emits via
+/// `send_notification_ephemeral(UiNotification::AgentOutputDelta(...))`.
 struct SpawnChildTranscriptReporter {
     router: Arc<SubAgentOutputRouter>,
     router_session_id: String,
     task_id: String,
+    /// Cumulative byte offset of streamed text so far. Incremented per
+    /// `StreamChunk` so each `agent/output/delta` carries a monotonically
+    /// increasing `cursor.offset` — clients can then detect gaps / reorder
+    /// if chunks ever arrive out of order (e.g. across reconnects). Atomic
+    /// because `report(&self)` is `&self` and the reporter is shared across
+    /// the child's tokio task(s).
+    stream_offset: AtomicUsize,
     /// Optional callback for live `StreamChunk` forwarding. Called directly
-    /// from the reporter thread with `(agent_id, text_delta)` — the caller
-    /// owns the emit path (e.g. `emit_supervisor_event(AGENT_OUTPUT_DELTA,
-    /// ...)` with a properly-formed `AgentOutputDeltaEvent` keyed on the
-    /// child's `agent_id`). The `agent_id` is the spawn's `task_id` (the
-    /// same id surfaced via `TurnSpawnCompleteEvent` / the agent dock).
-    on_stream_chunk: Option<Arc<dyn Fn(&str, &str) + Send + Sync>>,
+    /// from the reporter thread with `(agent_id, cursor_offset, text_delta)`
+    /// — the caller owns the emit path (e.g. emitting
+    /// `agent/output/delta` via `send_notification_ephemeral` with a
+    /// properly-formed `AgentOutputDeltaEvent` keyed on the child's
+    /// `agent_id`). The `agent_id` is the spawn's `task_id` (the same id
+    /// surfaced via `TurnSpawnCompleteEvent` / the agent dock).
+    /// `cursor_offset` is the cumulative byte offset AFTER this chunk
+    /// (i.e. the end-offset of this delta) — matches `OutputCursor::offset`
+    /// semantics on the wire.
+    on_stream_chunk:
+        Option<Arc<dyn Fn(&str, usize, &str) + Send + Sync>>,
 }
 
 impl crate::progress::ProgressReporter for SpawnChildTranscriptReporter {
@@ -851,23 +864,51 @@ impl crate::progress::ProgressReporter for SpawnChildTranscriptReporter {
             // persists a snapshot on every fire — too heavy per-token per
             // codex review). The router write is still done so
             // task/output/delta also gets it (the TUI fallback path).
+            //
+            // Backpressure note (codex review): a fast LLM child can fire
+            // this 100+ times/sec. There is no per-token coalescing here —
+            // backpressure is the WS transport's responsibility
+            // (`send_notification_ephemeral` pushes to a bounded channel
+            // which applies natural backpressure on a slow client). If this
+            // proves insufficient under N parallel children, add a ~16ms
+            // coalescing debounce at the callback site.
             ProgressEvent::StreamChunk { text, .. } => {
                 if !text.is_empty() {
+                    // Advance the cumulative byte offset BEFORE invoking
+                    // the callback so the emitted `cursor.offset` is the
+                    // end-offset of this delta (monotonic, lets clients
+                    // detect gaps / reorder on reconnect).
+                    let new_offset = self
+                        .stream_offset
+                        .fetch_add(text.len(), Ordering::Relaxed)
+                        + text.len();
                     if let Some(ref cb) = self.on_stream_chunk {
-                        // Pass the child's `task_id` as `agent_id` so the WS
+                        // Pass `(task_id, cursor_offset, text)` so the WS
                         // layer can construct a properly-keyed
                         // `AgentOutputDeltaEvent` (the dock correlates live
-                        // output with the spawned agent by this id).
-                        cb(self.task_id.as_str(), text.as_str());
+                        // output with the spawned agent by `task_id`).
+                        cb(self.task_id.as_str(), new_offset, text.as_str());
                     }
                     // Also append to the router file so task/output/delta
-                    // carries the same content (TUI fallback path).
-                    let line = format!("{text}");
-                    let _ = self.router.append(
+                    // carries the same content (TUI fallback path). Use
+                    // `text` directly — no need to re-allocate (codex
+                    // review: the previous `format!("{text}")` was a
+                    // redundant per-token allocation on the hot path).
+                    if let Err(error) = self.router.append(
                         &self.router_session_id,
                         &self.task_id,
-                        line.as_bytes(),
-                    );
+                        text.as_bytes(),
+                    ) {
+                        // The callback path still delivered the delta to
+                        // WS clients, so this only affects the TUI
+                        // fallback. Log so a failing router (disk full,
+                        // permission, race with cleanup) isn't silent.
+                        tracing::warn!(
+                            task_id = %self.task_id,
+                            error = %error,
+                            "stream chunk router append failed — TUI fallback path will miss this delta"
+                        );
+                    }
                 }
                 return;
             }
@@ -1062,7 +1103,7 @@ pub struct SpawnTool {
     /// spawn child's `ProgressEvent::StreamChunk` text is forwarded here so
     /// the WS/serve layer can emit `agent/output/delta` directly (bypassing
     /// the heavy `on_change` + per-token persistence path — per codex review).
-    child_stream_callback: Option<Arc<dyn Fn(&str, &str) + Send + Sync>>,
+    child_stream_callback: Option<Arc<dyn Fn(&str, usize, &str) + Send + Sync>>,
     /// M8 Runtime Parity W2.B1: parent session's M8.7 summary generator
     /// so the child can spawn periodic-summary watchers under the same
     /// LLM/budget contract.
@@ -1456,13 +1497,16 @@ impl SpawnTool {
     /// spawned background child. The WS/serve layer uses this to emit
     /// `agent/output/delta` directly — bypassing the per-token `on_change`
     /// persistence path (codex plan review: "per-token persistence/on_change
-    /// fan-out is too heavy"). The callback receives `(agent_id, text)`:
-    /// `agent_id` is the spawn's `task_id` (the same id surfaced via
-    /// `TurnSpawnCompleteEvent` and the agent dock), letting the caller
-    /// construct a properly-keyed `AgentOutputDeltaEvent`.
+    /// fan-out is too heavy"). The callback receives
+    /// `(agent_id, cursor_offset, text)`:
+    /// - `agent_id` is the spawn's `task_id` (the same id surfaced via
+    ///   `TurnSpawnCompleteEvent` and the agent dock).
+    /// - `cursor_offset` is the cumulative byte offset AFTER this chunk
+    ///   (monotonic; lets clients detect gaps/reorder on reconnect).
+    /// - `text` is the delta text.
     pub fn with_child_stream_callback(
         mut self,
-        cb: impl Fn(&str, &str) + Send + Sync + 'static,
+        cb: impl Fn(&str, usize, &str) + Send + Sync + 'static,
     ) -> Self {
         self.child_stream_callback = Some(Arc::new(cb));
         self
@@ -4390,6 +4434,7 @@ impl Tool for SpawnTool {
                                 router: router.clone(),
                                 router_session_id: child_router_session_id.clone(),
                                 task_id: task_id.clone(),
+                                stream_offset: AtomicUsize::new(0),
                                 on_stream_chunk: child_stream_callback.clone(),
                             }))
                         }

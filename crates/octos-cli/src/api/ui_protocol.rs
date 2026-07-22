@@ -21902,31 +21902,40 @@ async fn run_standalone_turn(
         // from a running spawn child are emitted as `agent/output/delta`
         // directly — bypassing the per-token `on_change` persistence path
         // (codex plan review: per-token persistence is too heavy). The
-        // callback receives `(agent_id, text)` where `agent_id` is the
-        // spawn's `task_id` (the same id surfaced via
-        // `TurnSpawnCompleteEvent` and the agent dock). Ephemeral send:
+        // callback receives `(agent_id, cursor_offset, text)` where
+        // `agent_id` is the spawn's `task_id` (the same id surfaced via
+        // `TurnSpawnCompleteEvent` and the agent dock) and `cursor_offset`
+        // is the cumulative byte offset AFTER this chunk (monotonic — lets
+        // clients detect gaps / reorder on reconnect). Ephemeral send:
         // deltas are explicitly non-durable (mirrors `message/delta`).
+        //
+        // Backpressure note (codex review): no per-token coalescing here —
+        // relies on the WS transport's bounded send channel for natural
+        // backpressure on slow clients. If N parallel children flood the
+        // sink, add a ~16ms coalescing debounce at this site.
         {
             let ws_for_stream = ws.clone();
             let ledger_for_stream = ledger.clone();
             let session_id_for_stream = session_id.clone();
-            spawn_tool = spawn_tool.with_child_stream_callback(move |agent_id, text| {
-                let event = AgentOutputDeltaEvent {
-                    session_id: session_id_for_stream.clone(),
-                    agent_id: agent_id.to_string(),
-                    cursor: OutputCursor { offset: 0 },
-                    text: text.to_string(),
-                };
-                // Ephemeral: deltas must NOT be appended to the ledger
-                // (per-token persistence is the overhead codex flagged).
-                // The router-file append inside the reporter already
-                // covers the `task/output/delta` TUI fallback path.
-                let _ = send_notification_ephemeral(
-                    &ws_for_stream,
-                    &ledger_for_stream,
-                    UiNotification::AgentOutputDelta(event),
-                );
-            });
+            spawn_tool = spawn_tool.with_child_stream_callback(
+                move |agent_id, cursor_offset, text| {
+                    let event = AgentOutputDeltaEvent {
+                        session_id: session_id_for_stream.clone(),
+                        agent_id: agent_id.to_string(),
+                        cursor: OutputCursor { offset: cursor_offset },
+                        text: text.to_string(),
+                    };
+                    // Ephemeral: deltas must NOT be appended to the ledger
+                    // (per-token persistence is the overhead codex flagged).
+                    // The router-file append inside the reporter already
+                    // covers the `task/output/delta` TUI fallback path.
+                    let _ = send_notification_ephemeral(
+                        &ws_for_stream,
+                        &ledger_for_stream,
+                        UiNotification::AgentOutputDelta(event),
+                    );
+                },
+            );
         }
         let child_context_parent = context_manager.clone();
         // Child (forked sub-agent) context ledgers belong to the parent's
