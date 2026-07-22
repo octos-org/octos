@@ -25,7 +25,8 @@ use octos_agent::{
 };
 use octos_core::app_ui_codec::{self, AppUiFrame, MAX_TEXT_FRAME_BYTES};
 use octos_core::ui_protocol::{
-    AgentUpdatedEvent, ApprovalAutoResolvedEvent, ApprovalCancelledEvent, ApprovalCommandDetails,
+    AgentOutputDeltaEvent, AgentUpdatedEvent, ApprovalAutoResolvedEvent, ApprovalCancelledEvent,
+    ApprovalCommandDetails,
     ApprovalDecidedEvent, ApprovalDecision, ApprovalId, ApprovalRenderHints,
     ApprovalRequestedEvent, ApprovalTypedDetails, ContentBulkDeleteParams, ContentDeleteParams,
     ContentListParams, ContextCompactionCompletedEvent, ContextCompactionStartedEvent,
@@ -21896,6 +21897,36 @@ async fn run_standalone_turn(
         }
         if let Some(generator) = session_runtime.agent.subagent_summary_generator().cloned() {
             spawn_tool = spawn_tool.with_parent_subagent_summary_generator(generator);
+        }
+        // Wire the child stream-chunk callback so live `StreamChunk` deltas
+        // from a running spawn child are emitted as `agent/output/delta`
+        // directly — bypassing the per-token `on_change` persistence path
+        // (codex plan review: per-token persistence is too heavy). The
+        // callback receives `(agent_id, text)` where `agent_id` is the
+        // spawn's `task_id` (the same id surfaced via
+        // `TurnSpawnCompleteEvent` and the agent dock). Ephemeral send:
+        // deltas are explicitly non-durable (mirrors `message/delta`).
+        {
+            let ws_for_stream = ws.clone();
+            let ledger_for_stream = ledger.clone();
+            let session_id_for_stream = session_id.clone();
+            spawn_tool = spawn_tool.with_child_stream_callback(move |agent_id, text| {
+                let event = AgentOutputDeltaEvent {
+                    session_id: session_id_for_stream.clone(),
+                    agent_id: agent_id.to_string(),
+                    cursor: OutputCursor { offset: 0 },
+                    text: text.to_string(),
+                };
+                // Ephemeral: deltas must NOT be appended to the ledger
+                // (per-token persistence is the overhead codex flagged).
+                // The router-file append inside the reporter already
+                // covers the `task/output/delta` TUI fallback path.
+                let _ = send_notification_ephemeral(
+                    &ws_for_stream,
+                    &ledger_for_stream,
+                    UiNotification::AgentOutputDelta(event),
+                );
+            });
         }
         let child_context_parent = context_manager.clone();
         // Child (forked sub-agent) context ledgers belong to the parent's

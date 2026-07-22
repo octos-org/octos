@@ -814,9 +814,12 @@ struct SpawnChildTranscriptReporter {
     router_session_id: String,
     task_id: String,
     /// Optional callback for live `StreamChunk` forwarding. Called directly
-    /// from the reporter thread with the text delta — the caller owns the
-    /// emit path (e.g. `emit_supervisor_event(AGENT_OUTPUT_DELTA, ...)`).
-    on_stream_chunk: Option<Arc<dyn Fn(&str) + Send + Sync>>,
+    /// from the reporter thread with `(agent_id, text_delta)` — the caller
+    /// owns the emit path (e.g. `emit_supervisor_event(AGENT_OUTPUT_DELTA,
+    /// ...)` with a properly-formed `AgentOutputDeltaEvent` keyed on the
+    /// child's `agent_id`). The `agent_id` is the spawn's `task_id` (the
+    /// same id surfaced via `TurnSpawnCompleteEvent` / the agent dock).
+    on_stream_chunk: Option<Arc<dyn Fn(&str, &str) + Send + Sync>>,
 }
 
 impl crate::progress::ProgressReporter for SpawnChildTranscriptReporter {
@@ -851,7 +854,11 @@ impl crate::progress::ProgressReporter for SpawnChildTranscriptReporter {
             ProgressEvent::StreamChunk { text, .. } => {
                 if !text.is_empty() {
                     if let Some(ref cb) = self.on_stream_chunk {
-                        cb(text.as_str());
+                        // Pass the child's `task_id` as `agent_id` so the WS
+                        // layer can construct a properly-keyed
+                        // `AgentOutputDeltaEvent` (the dock correlates live
+                        // output with the spawned agent by this id).
+                        cb(self.task_id.as_str(), text.as_str());
                     }
                     // Also append to the router file so task/output/delta
                     // carries the same content (TUI fallback path).
@@ -1055,7 +1062,7 @@ pub struct SpawnTool {
     /// spawn child's `ProgressEvent::StreamChunk` text is forwarded here so
     /// the WS/serve layer can emit `agent/output/delta` directly (bypassing
     /// the heavy `on_change` + per-token persistence path — per codex review).
-    child_stream_callback: Option<Arc<dyn Fn(&str) + Send + Sync>>,
+    child_stream_callback: Option<Arc<dyn Fn(&str, &str) + Send + Sync>>,
     /// M8 Runtime Parity W2.B1: parent session's M8.7 summary generator
     /// so the child can spawn periodic-summary watchers under the same
     /// LLM/budget contract.
@@ -1449,10 +1456,13 @@ impl SpawnTool {
     /// spawned background child. The WS/serve layer uses this to emit
     /// `agent/output/delta` directly — bypassing the per-token `on_change`
     /// persistence path (codex plan review: "per-token persistence/on_change
-    /// fan-out is too heavy").
+    /// fan-out is too heavy"). The callback receives `(agent_id, text)`:
+    /// `agent_id` is the spawn's `task_id` (the same id surfaced via
+    /// `TurnSpawnCompleteEvent` and the agent dock), letting the caller
+    /// construct a properly-keyed `AgentOutputDeltaEvent`.
     pub fn with_child_stream_callback(
         mut self,
-        cb: impl Fn(&str) + Send + Sync + 'static,
+        cb: impl Fn(&str, &str) + Send + Sync + 'static,
     ) -> Self {
         self.child_stream_callback = Some(Arc::new(cb));
         self
