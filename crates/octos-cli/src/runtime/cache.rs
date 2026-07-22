@@ -767,6 +767,8 @@ mod tests {
             tool_policy: None,
             default_sandbox: sandbox,
             max_iterations: None,
+            format_after_edit: false,
+            snapshots: None,
             tool_specs: Arc::new(base_tools),
             plugin_tool_names: Vec::new(),
             plugin_dirs: Vec::new(),

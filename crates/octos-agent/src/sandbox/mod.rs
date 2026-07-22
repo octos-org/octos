@@ -112,6 +112,13 @@ pub(crate) const DEFAULT_READ_ALLOW_PATHS: &[&str] = &[
     "/tmp",
     "/var/tmp",
     "/etc", // system config (needed for DNS resolution, etc.)
+    // macOS `/etc` is a symlink to `/private/etc`, and SBPL subpath rules match
+    // the CANONICAL path — so the `/etc` entry above never covers a real read of
+    // `/private/etc/...`. Without this, TLS clients that resolve via the symlink
+    // (system `curl`/LibreSSL reading `/etc/ssl/openssl.cnf` + `cert.pem`) fail at
+    // init with a confusing "Operation not permitted" — very visible now that
+    // network is allowed by default. Mirrors the `/tmp` + `/private/tmp` pairing.
+    "/private/etc",
     "/dev/null",
     "/dev/urandom",
     "/dev/random",

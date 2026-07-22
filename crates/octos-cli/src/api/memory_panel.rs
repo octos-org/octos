@@ -736,7 +736,7 @@ mod tests {
 
     fn temp_state() -> (tempfile::TempDir, Arc<AppState>, Arc<ProfileStore>) {
         let dir = tempfile::tempdir().unwrap();
-        let profile_store = Arc::new(ProfileStore::open(dir.path()).unwrap());
+        let profile_store = Arc::new(ProfileStore::open_unified(dir.path()).unwrap());
         let state = Arc::new(AppState {
             profile_store: Some(profile_store.clone()),
             ..AppState::empty_for_tests()

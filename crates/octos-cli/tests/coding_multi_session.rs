@@ -195,6 +195,7 @@ async fn make_m11g_profile(profile_id: &str, data_dir: &std::path::Path) -> Arc<
     Arc::new(ProfileRuntime {
         profile_id: profile_id.to_string(),
         data_dir: data_dir.to_path_buf(),
+        snapshots: None,
         llm: Arc::new(ReadFileStubLlm),
         adaptive_router: None,
         runtime_qos_catalog: None,
@@ -206,6 +207,7 @@ async fn make_m11g_profile(profile_id: &str, data_dir: &std::path::Path) -> Arc<
         tool_policy: None,
         default_sandbox: sandbox,
         max_iterations: None,
+        format_after_edit: false,
         tool_specs: Arc::new(base_tools),
         plugin_tool_names: Vec::new(),
         plugin_dirs: Vec::new(),

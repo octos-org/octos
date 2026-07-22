@@ -439,6 +439,19 @@ Runtime, auth, profile, and onboarding inspection (server-handled
 - `profile/llm/catalog`, `profile/llm/list`, `profile/llm/upsert`,
   `profile/llm/select`, `profile/llm/delete`, `profile/llm/test`,
   `profile/llm/fetch_models` (accepted `UPCR-2026-017`)
+- `profile/sub_providers/list`, `profile/sub_providers/upsert`,
+  `profile/sub_providers/remove` (named provider lanes for per-node pipeline
+  routing — e.g. `deep_research`'s isolated `cheap`/`strong` lanes)
+- `snapshot/list`, `snapshot/restore` (#1768 workspace snapshot undo: list
+  the session workspace's pre-mutation undo points; restore rolls the
+  workspace back — refused while a turn is in flight, itself undoable via
+  the automatic pre-restore snapshot)
+- `peer/prepare` (#1800 peer-agent spin-off staging: writes the durable task
+  brief under the profile data dir (`peers/<slug>/brief.md`) and optionally
+  creates a fenced git worktree on branch `peer/<slug>`; returns
+  `{slug, topic, brief_path, cwd, worktree_branch?, profile_id}`. Pure
+  resource staging — the client then opens the peer session and starts the
+  kickoff turn through the ordinary `session/open` + `turn/start`)
 - `profile/skills/list`, `profile/skills/registry/search`,
   `profile/skills/install`, `profile/skills/remove` (server-handled skills
   management)

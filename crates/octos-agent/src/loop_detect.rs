@@ -24,6 +24,24 @@ use std::hash::{Hash, Hasher};
 /// background job runs) are unaffected.
 pub const NO_PROGRESS_HINT: &str = "\n\n[NO PROGRESS] You have now called this tool 3 times in a row with identical arguments AND received identical results. Calling it again will produce the same result. To make progress, either switch to a different tool (read_file / list_dir / view_image for file content) or finish the turn with the information you already have.";
 
+/// #1765: number of consecutive identical tool calls (same name +
+/// identical arguments JSON) that trips the doom-loop guard. When the
+/// LLM issues the SAME call this many times in a row, the conversation
+/// loop aborts the turn with a clear model-and-user-facing message
+/// instead of issuing the next LLM call — each further retry would only
+/// burn tokens. Mirrors opencode's `DOOM_LOOP_THRESHOLD = 3`
+/// (`packages/opencode/src/session/processor.ts:29`).
+///
+/// Scope: the guard is wired into the CONVERSATION loop
+/// (`process_message_inner`) only. The background task loop
+/// deliberately keeps its softer treatment (the `record_result`
+/// no-progress hint) because unattended tasks legitimately poll
+/// status tools with identical arguments while a background job runs.
+/// Verifier-configured agents are likewise exempt — the verifier lane
+/// injects a `verdict: Repeating` note at this exact streak length and
+/// the planner self-corrects, which is a richer recovery than an abort.
+pub const DOOM_LOOP_THRESHOLD: usize = 3;
+
 /// Tracks tool call patterns and detects loops.
 pub struct LoopDetector {
     /// Ring buffer of recent tool call signatures (name + args).
@@ -36,6 +54,11 @@ pub struct LoopDetector {
     result_signatures: Vec<u64>,
     /// Maximum window size to check for patterns.
     window: usize,
+    /// #1765: signature of the most recent call recorded by
+    /// [`Self::record_doom`], used to detect consecutive identical calls.
+    doom_last_signature: Option<u64>,
+    /// #1765: length of the current consecutive-identical-call streak.
+    doom_streak: usize,
 }
 
 impl LoopDetector {
@@ -45,7 +68,29 @@ impl LoopDetector {
             signatures: Vec::with_capacity(window * 2),
             result_signatures: Vec::with_capacity(window * 2),
             window,
+            doom_last_signature: None,
+            doom_streak: 0,
         }
+    }
+
+    /// #1765: record a tool call for the doom-loop guard and return the
+    /// streak length when it reaches [`DOOM_LOOP_THRESHOLD`].
+    ///
+    /// A call is "identical" when both the tool name and the exact
+    /// arguments JSON match the previous call; any non-identical call
+    /// resets the streak to 1. Returns `Some(streak)` for every call at
+    /// or past the threshold (not just the first) so a caller that
+    /// defers the abort once — e.g. because the shell-spiral recovery
+    /// path owns the streak — still gets a signal on the next repeat.
+    pub fn record_doom(&mut self, tool_name: &str, args: &serde_json::Value) -> Option<usize> {
+        let sig = Self::signature(tool_name, args);
+        if self.doom_last_signature == Some(sig) {
+            self.doom_streak += 1;
+        } else {
+            self.doom_last_signature = Some(sig);
+            self.doom_streak = 1;
+        }
+        (self.doom_streak >= DOOM_LOOP_THRESHOLD).then_some(self.doom_streak)
     }
 
     /// Record a tool call and check for repeating patterns.
@@ -297,5 +342,70 @@ mod tests {
         // The hard cycle detector picks up anything that survives.
         let second = d.record_result("t", &args, result);
         assert!(second.is_none());
+    }
+
+    // ----- record_doom tests (#1765 doom-loop guard) -----
+
+    #[test]
+    fn should_fire_doom_when_third_identical_call_arrives() {
+        let mut d = LoopDetector::new(10);
+        let args = json!({"path": "a.txt"});
+        assert!(d.record_doom("read_file", &args).is_none());
+        assert!(d.record_doom("read_file", &args).is_none());
+        assert_eq!(d.record_doom("read_file", &args), Some(3));
+    }
+
+    #[test]
+    fn should_stay_quiet_when_only_two_identical_calls() {
+        let mut d = LoopDetector::new(10);
+        let args = json!({"cmd": "ls"});
+        assert!(d.record_doom("shell", &args).is_none());
+        assert!(d.record_doom("shell", &args).is_none());
+    }
+
+    #[test]
+    fn should_reset_doom_streak_when_arguments_differ() {
+        let mut d = LoopDetector::new(10);
+        assert!(d.record_doom("read_file", &json!({"path": "a"})).is_none());
+        assert!(d.record_doom("read_file", &json!({"path": "a"})).is_none());
+        // Different args → streak resets; the 3rd call is NOT doom.
+        assert!(d.record_doom("read_file", &json!({"path": "b"})).is_none());
+        // Two more identical "b" calls: streak is 3 only now.
+        assert!(d.record_doom("read_file", &json!({"path": "b"})).is_none());
+        assert_eq!(d.record_doom("read_file", &json!({"path": "b"})), Some(3));
+    }
+
+    #[test]
+    fn should_reset_doom_streak_when_tool_name_differs() {
+        let mut d = LoopDetector::new(10);
+        let args = json!({"path": "a"});
+        assert!(d.record_doom("read_file", &args).is_none());
+        assert!(d.record_doom("read_file", &args).is_none());
+        // Same args, different tool → reset.
+        assert!(d.record_doom("list_dir", &args).is_none());
+        assert!(d.record_doom("list_dir", &args).is_none());
+        assert_eq!(d.record_doom("list_dir", &args), Some(3));
+    }
+
+    #[test]
+    fn should_keep_firing_doom_past_threshold() {
+        // ">= threshold" semantics: if the caller chooses to continue
+        // (e.g. the shell-spiral recovery path defers the abort), a 4th
+        // identical call must fire again rather than go quiet.
+        let mut d = LoopDetector::new(10);
+        let args = json!({});
+        d.record_doom("t", &args);
+        d.record_doom("t", &args);
+        assert_eq!(d.record_doom("t", &args), Some(3));
+        assert_eq!(d.record_doom("t", &args), Some(4));
+    }
+
+    #[test]
+    fn should_not_fire_doom_for_alternating_calls() {
+        let mut d = LoopDetector::new(10);
+        for _ in 0..10 {
+            assert!(d.record_doom("read_file", &json!({"path": "a"})).is_none());
+            assert!(d.record_doom("read_file", &json!({"path": "b"})).is_none());
+        }
     }
 }

@@ -2,11 +2,39 @@
 //!
 //! Loads skills from `.octos/skills/{name}/SKILL.md` with simple frontmatter.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use eyre::{Result, WrapErr};
 
 use crate::builtin_skills::BUILTIN_SKILLS;
+
+/// Crate-agnostic skill selection filter.
+///
+/// This is the lowered form of the CLI's per-profile skill-selection layer
+/// (`octos_cli::profiles::ProfileSkillsConfig`). It is intentionally free of
+/// any CLI dependency so both the [`SkillsLoader`] (prompt / content injection)
+/// and the plugin loader (tool specs) can consult the same selection decision.
+///
+/// A skill's `id` is its package identifier: the `manifest.json` `name`/`id`,
+/// which equals the `SKILL.md` `name` and the skill directory name.
+#[derive(Debug, Clone)]
+pub enum SkillFilter {
+    /// Load every discovered skill except these ids (`AllDiscovered` mode).
+    AllExcept(HashSet<String>),
+    /// Load only these ids (`AllowList` mode).
+    Only(HashSet<String>),
+}
+
+impl SkillFilter {
+    /// Whether a skill with `id` is permitted to load.
+    pub fn allows(&self, id: &str) -> bool {
+        match self {
+            SkillFilter::AllExcept(disabled) => !disabled.contains(id),
+            SkillFilter::Only(enabled) => enabled.contains(id),
+        }
+    }
+}
 
 /// Information about a loaded skill.
 #[derive(Debug, Clone)]
@@ -30,6 +58,10 @@ pub struct SkillInfo {
 /// Earlier directories take priority over later ones for skills with the same name.
 pub struct SkillsLoader {
     skills_dirs: Vec<PathBuf>,
+    /// Optional skill-selection filter (skill layering v1). `None` ⇒ no
+    /// filtering: every discovered skill is listed / loadable exactly as
+    /// before this feature existed (backwards-compatible).
+    filter: Option<SkillFilter>,
 }
 
 impl SkillsLoader {
@@ -37,7 +69,28 @@ impl SkillsLoader {
     pub fn new(data_dir: impl AsRef<Path>) -> Self {
         Self {
             skills_dirs: vec![data_dir.as_ref().join("skills")],
+            filter: None,
         }
+    }
+
+    /// Attach a skill-selection filter (builder form). Disabled skills are
+    /// absent from `list_skills` (hence `build_skills_summary` /
+    /// `get_always_skills`) and cannot be loaded by name.
+    pub fn with_skill_filter(mut self, filter: Option<SkillFilter>) -> Self {
+        self.filter = filter;
+        self
+    }
+
+    /// Attach a skill-selection filter in place.
+    pub fn set_skill_filter(&mut self, filter: Option<SkillFilter>) {
+        self.filter = filter;
+    }
+
+    /// True when `name` is permitted by the active filter (or no filter).
+    fn skill_allowed(&self, name: &str) -> bool {
+        self.filter
+            .as_ref()
+            .is_none_or(|filter| filter.allows(name))
     }
 
     /// Add an additional skills directory (appends `/skills` to the given dir).
@@ -105,6 +158,13 @@ impl SkillsLoader {
             }
         }
 
+        // Skill layering v1: drop skills disabled by the active selection
+        // filter so they are absent from the prompt summary and never treated
+        // as always-on. A `None` filter retains everything (backwards-compatible).
+        if self.filter.is_some() {
+            skills.retain(|s: &SkillInfo| self.skill_allowed(&s.name));
+        }
+
         skills.sort_by(|a, b| a.name.cmp(&b.name));
         Ok(skills)
     }
@@ -114,6 +174,11 @@ impl SkillsLoader {
     /// Checks skills directories in priority order (first added = highest priority),
     /// then falls back to built-in system skills.
     pub async fn load_skill(&self, name: &str) -> Result<Option<String>> {
+        // Skill layering v1: a disabled skill is not loadable by name — its
+        // content must never be injected into the prompt.
+        if !self.skill_allowed(name) {
+            return Ok(None);
+        }
         // Check workspace directories in priority order
         for skills_dir in &self.skills_dirs {
             let skill_file = skills_dir.join(name).join("SKILL.md");
@@ -684,6 +749,125 @@ mod tests {
         let path = PathBuf::from("/data/skills/my-cool-skill/SKILL.md");
         let info = parse_skill(&path, content, false).unwrap();
         assert_eq!(info.name, "my-cool-skill");
+    }
+
+    // --- skill layering v1: SkillFilter ---
+
+    #[test]
+    fn skill_filter_all_except_and_only_semantics() {
+        let deny = SkillFilter::AllExcept(HashSet::from(["weather".to_string()]));
+        assert!(deny.allows("news"));
+        assert!(!deny.allows("weather"));
+
+        let allow = SkillFilter::Only(HashSet::from(["news".to_string()]));
+        assert!(allow.allows("news"));
+        assert!(!allow.allows("weather"));
+    }
+
+    #[tokio::test]
+    async fn disabled_skill_absent_from_list_summary_always_and_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let skills_dir = setup_skills_dir(&dir).await;
+
+        // Two always-on skills; one will be disabled by the filter.
+        for name in &["keep", "drop"] {
+            let sd = skills_dir.join(name);
+            tokio::fs::create_dir_all(&sd).await.unwrap();
+            tokio::fs::write(
+                sd.join("SKILL.md"),
+                format!("---\nname: {name}\ndescription: d\nalways: true\n---\n{name} body\n"),
+            )
+            .await
+            .unwrap();
+        }
+
+        let loader = SkillsLoader::new(dir.path()).with_skill_filter(Some(SkillFilter::AllExcept(
+            HashSet::from(["drop".to_string()]),
+        )));
+
+        // Absent from list_skills (hence the prompt summary + always set).
+        let names: Vec<String> = loader
+            .list_skills()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|s| s.name)
+            .collect();
+        assert!(names.contains(&"keep".to_string()));
+        assert!(!names.contains(&"drop".to_string()));
+
+        let summary = loader.build_skills_summary().await.unwrap();
+        assert!(summary.contains("<name>keep</name>"));
+        assert!(!summary.contains("<name>drop</name>"));
+
+        let always = loader.get_always_skills().await.unwrap();
+        assert!(always.contains(&"keep".to_string()));
+        assert!(!always.contains(&"drop".to_string()));
+
+        // Content of a disabled skill must never be loadable / injectable.
+        assert!(loader.load_skill("keep").await.unwrap().is_some());
+        assert!(loader.load_skill("drop").await.unwrap().is_none());
+        let ctx = loader
+            .load_skills_for_context(&["keep".into(), "drop".into()])
+            .await
+            .unwrap();
+        assert!(ctx.contains("keep body"));
+        assert!(!ctx.contains("drop body"));
+    }
+
+    #[tokio::test]
+    async fn allow_list_only_loads_listed_skills() {
+        let dir = tempfile::tempdir().unwrap();
+        let skills_dir = setup_skills_dir(&dir).await;
+        for name in &["alpha", "beta"] {
+            let sd = skills_dir.join(name);
+            tokio::fs::create_dir_all(&sd).await.unwrap();
+            tokio::fs::write(
+                sd.join("SKILL.md"),
+                format!("---\nname: {name}\ndescription: d\n---\nbody\n"),
+            )
+            .await
+            .unwrap();
+        }
+        let loader = SkillsLoader::new(dir.path()).with_skill_filter(Some(SkillFilter::Only(
+            HashSet::from(["alpha".to_string()]),
+        )));
+        let names: Vec<String> = loader
+            .list_skills()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|s| s.name)
+            .collect();
+        assert!(names.contains(&"alpha".to_string()));
+        assert!(!names.contains(&"beta".to_string()));
+        // AllowList also drops built-in skills that are not listed.
+        assert!(!names.iter().any(|n| n == "cron"));
+    }
+
+    #[tokio::test]
+    async fn no_filter_loads_every_skill_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let skills_dir = setup_skills_dir(&dir).await;
+        let sd = skills_dir.join("solo");
+        tokio::fs::create_dir_all(&sd).await.unwrap();
+        tokio::fs::write(
+            sd.join("SKILL.md"),
+            "---\nname: solo\ndescription: d\n---\nbody\n",
+        )
+        .await
+        .unwrap();
+        // No filter ⇒ identical to today: the installed skill AND builtins load.
+        let loader = SkillsLoader::new(dir.path());
+        let names: Vec<String> = loader
+            .list_skills()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|s| s.name)
+            .collect();
+        assert!(names.contains(&"solo".to_string()));
+        assert!(names.iter().any(|n| n == "cron"));
     }
 
     #[tokio::test]

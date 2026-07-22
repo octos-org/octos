@@ -10,7 +10,7 @@ use tokio::sync::watch;
 use tracing::{info, warn};
 
 use crate::config::Config;
-use crate::profiles::UserProfile;
+use crate::profiles::{ProfileConfig, UserProfile, merge_profile_defaults};
 
 /// What changed in the config.
 #[derive(Debug, Clone)]
@@ -30,6 +30,14 @@ pub struct ConfigWatcher {
     last_hash: Option<[u8; 32]>,
     last_config: Config,
     tx: watch::Sender<Option<ConfigChange>>,
+    /// Path of the global `profile-defaults.json` base layer, when the gateway
+    /// runs in profile-mode. Watched alongside the main config so an edit to
+    /// the shared defaults triggers the same reload path (FIX 3).
+    defaults_path: Option<PathBuf>,
+    /// Last successfully-parsed defaults. Retained as last-known-good so a
+    /// malformed edit to a previously-valid defaults file does NOT silently
+    /// drop the whole base layer (a fresh never-valid file stays `None`).
+    last_good_defaults: Option<ProfileConfig>,
 }
 
 impl ConfigWatcher {
@@ -45,7 +53,34 @@ impl ConfigWatcher {
             last_hash: hash,
             last_config: initial_config,
             tx,
+            defaults_path: None,
+            last_good_defaults: None,
         }
+    }
+
+    /// Also watch the store's global `profile-defaults.json` at `path` so a
+    /// change to the shared base layer triggers a reload (FIX 3). The current
+    /// contents are parsed now to seed the last-known-good base; the path is
+    /// added to the watched set (a missing file is fine — it is picked up on
+    /// create). Only meaningful in profile-mode, where the effective config is
+    /// `profile.config` layered over these defaults.
+    pub fn with_profile_defaults(mut self, path: PathBuf) -> Self {
+        self.last_good_defaults = Self::parse_defaults(&path);
+        // Watch the defaults file AFTER the main config so `parse_first` still
+        // reads the main config from `buffers.first()`.
+        self.paths.push(path.clone());
+        self.defaults_path = Some(path);
+        // Re-seed the hash so the newly-watched defaults file contributes to
+        // change detection from the first poll onward.
+        self.last_hash = Self::hash_buffers(&Self::read_files(&self.paths));
+        self
+    }
+
+    /// Parse a `profile-defaults.json` into a partial [`ProfileConfig`].
+    /// A missing or malformed file yields `None`.
+    fn parse_defaults(path: &std::path::Path) -> Option<ProfileConfig> {
+        let bytes = std::fs::read(path).ok()?;
+        serde_json::from_slice::<ProfileConfig>(&bytes).ok()
     }
 
     /// Spawn the polling loop. Returns a JoinHandle.
@@ -71,7 +106,12 @@ impl ConfigWatcher {
         }
         self.last_hash = new_hash;
 
-        let new_config = match Self::parse_first(&buffers) {
+        // Refresh the defaults base layer (FIX 3). A malformed edit to a
+        // previously-valid file retains the last-known-good base rather than
+        // dropping it; a deleted file clears it.
+        self.refresh_defaults();
+
+        let new_config = match Self::parse_first(&buffers, self.last_good_defaults.as_ref()) {
             Some(c) => c,
             None => return,
         };
@@ -102,8 +142,28 @@ impl ConfigWatcher {
     /// to false" transitions on a hot edit. Without this, a gateway
     /// spawned with the env-forced policy would emit a bogus restart on
     /// every unrelated edit.
-    fn parse_first(buffers: &[(PathBuf, Vec<u8>)]) -> Option<Config> {
+    ///
+    /// FIX 3: `defaults` is the store's global `profile-defaults.json` base
+    /// (when watching in profile-mode). It is layered UNDER the parsed
+    /// profile's own config so the diff sees the same effective config the
+    /// gateway runs with — an edit to the shared defaults therefore emits the
+    /// correct hot-reload / restart, and an unrelated edit does not spuriously
+    /// diff the inherited hooks / sandbox / plugins / memory.
+    fn parse_first(
+        buffers: &[(PathBuf, Vec<u8>)],
+        defaults: Option<&ProfileConfig>,
+    ) -> Option<Config> {
         let (path, bytes) = buffers.first()?;
+        // Build a flattened `Config` from a profile, layering the global
+        // defaults UNDER the profile's own config first (FIX 3).
+        let profile_to_config = |mut profile: UserProfile| -> Config {
+            if let Some(defaults) = defaults {
+                profile.config = merge_profile_defaults(&profile.config, defaults);
+            }
+            let mut c = crate::profiles::config_from_profile(&profile, None, None);
+            crate::config::merge_env_plugin_policy_pub(&mut c);
+            c
+        };
         // Discrimination: a UserProfile JSON has top-level "id" + "config"
         // keys; a top-level Config does not. Try UserProfile first when the
         // shape matches so the watcher actually sees the profile's nested
@@ -116,9 +176,7 @@ impl ConfigWatcher {
         if looks_like_profile {
             match serde_json::from_slice::<UserProfile>(bytes) {
                 Ok(profile) => {
-                    let mut c = crate::profiles::config_from_profile(&profile, None, None);
-                    crate::config::merge_env_plugin_policy_pub(&mut c);
-                    return Some(c);
+                    return Some(profile_to_config(profile));
                 }
                 Err(e) => {
                     warn!(
@@ -138,14 +196,44 @@ impl ConfigWatcher {
         // preserve legacy behavior if a profile lacks the discriminator
         // keys for some reason.
         match serde_json::from_slice::<UserProfile>(bytes) {
-            Ok(profile) => {
-                let mut c = crate::profiles::config_from_profile(&profile, None, None);
-                crate::config::merge_env_plugin_policy_pub(&mut c);
-                Some(c)
-            }
+            Ok(profile) => Some(profile_to_config(profile)),
             Err(e) => {
                 warn!("config reload failed for {}: {e}", path.display());
                 None
+            }
+        }
+    }
+
+    /// Re-read the watched `profile-defaults.json` (FIX 3). A valid file
+    /// updates the last-known-good base; a malformed edit to a previously-valid
+    /// file keeps the last-known-good base (fail-safe); a deleted file clears
+    /// it.
+    fn refresh_defaults(&mut self) {
+        let Some(path) = self.defaults_path.clone() else {
+            return;
+        };
+        match std::fs::read(&path) {
+            Ok(bytes) => match serde_json::from_slice::<ProfileConfig>(&bytes) {
+                Ok(defaults) => self.last_good_defaults = Some(defaults),
+                Err(e) => {
+                    warn!(
+                        "config reload: malformed profile-defaults.json at {} — retaining \
+                         last-known-good base: {e}",
+                        path.display()
+                    );
+                    // Keep `last_good_defaults` unchanged (fail-safe).
+                }
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // File deleted → the base layer is removed.
+                self.last_good_defaults = None;
+            }
+            Err(e) => {
+                warn!(
+                    "config reload: failed to read profile-defaults.json at {} — retaining \
+                     last-known-good base: {e}",
+                    path.display()
+                );
             }
         }
     }
@@ -174,6 +262,12 @@ impl ConfigWatcher {
         }
         if old.hooks != new.hooks {
             restart_fields.push("hooks".into());
+        }
+        // #1774: post-edit formatting is baked into AgentConfig at startup
+        // (chat / gateway / serve all copy it into their agent configs), so
+        // a live toggle needs a restart to take effect.
+        if old.format_after_edit != new.format_after_edit {
+            restart_fields.push("format_after_edit".into());
         }
         // Section B (codex review round-6 P2): plugin loader policy
         // (`plugins.require_signed`) is consumed only during plugin
@@ -368,6 +462,150 @@ mod tests {
                 "provider change should not require restart, got fields: {:?}",
                 fields
             );
+        }
+    }
+
+    #[test]
+    fn should_require_restart_when_format_after_edit_toggled() {
+        // #1774: `format_after_edit` is baked into AgentConfig at startup, so
+        // a live toggle must surface as restart-required (like `hooks`).
+        let dir = TempDir::new().unwrap();
+        let path = write_config(&dir, r#"{"provider": "anthropic"}"#);
+        let old_config = Config::from_file(&path).unwrap();
+
+        std::fs::write(
+            &path,
+            r#"{"provider": "anthropic", "format_after_edit": true}"#,
+        )
+        .unwrap();
+        let new_config = Config::from_file(&path).unwrap();
+
+        let (tx, rx) = watch::channel(None);
+        let watcher = ConfigWatcher::new(vec![path], old_config, tx);
+        watcher.diff_and_emit(&new_config);
+
+        let change = rx.borrow().clone();
+        match change {
+            Some(ConfigChange::RestartRequired(fields)) => {
+                assert!(
+                    fields.iter().any(|f| f == "format_after_edit"),
+                    "expected format_after_edit in restart fields, got: {fields:?}"
+                );
+            }
+            other => panic!("expected RestartRequired, got: {other:?}"),
+        }
+    }
+
+    // ---- FIX 3: profile-defaults.json watching + fail-safe ----
+
+    fn default_hook(cmd: &str) -> octos_agent::HookConfig {
+        octos_agent::HookConfig {
+            event: octos_agent::HookEvent::BeforeToolCall,
+            command: vec![cmd.to_string()],
+            timeout_ms: 5000,
+            tool_filter: Vec::new(),
+            path_filter: Vec::new(),
+            requires_bin: None,
+        }
+    }
+
+    const PROFILE_JSON: &str = r#"{"id":"p","name":"p","enabled":true,"config":{},"created_at":"2024-01-01T00:00:00Z","updated_at":"2024-01-01T00:00:00Z"}"#;
+
+    #[test]
+    fn parse_first_layers_profile_defaults_under_profile() {
+        let buffers = vec![(PathBuf::from("p.json"), PROFILE_JSON.as_bytes().to_vec())];
+
+        // Without a defaults base, the empty profile has no hooks.
+        let bare = ConfigWatcher::parse_first(&buffers, None).unwrap();
+        assert!(bare.hooks.is_empty());
+
+        // With a defaults base, the profile inherits the default hook.
+        let defaults = ProfileConfig {
+            hooks: vec![default_hook("dh")],
+            ..Default::default()
+        };
+        let merged = ConfigWatcher::parse_first(&buffers, Some(&defaults)).unwrap();
+        assert_eq!(merged.hooks.len(), 1);
+        assert_eq!(merged.hooks[0].command, vec!["dh".to_string()]);
+    }
+
+    #[test]
+    fn malformed_defaults_edit_retains_last_known_good() {
+        let dir = TempDir::new().unwrap();
+        let profile_path = dir.path().join("p.json");
+        std::fs::write(&profile_path, PROFILE_JSON).unwrap();
+        let defaults_path = dir.path().join("profile-defaults.json");
+        let good = ProfileConfig {
+            hooks: vec![default_hook("dh")],
+            ..Default::default()
+        };
+        std::fs::write(&defaults_path, serde_json::to_string(&good).unwrap()).unwrap();
+
+        let (tx, _rx) = watch::channel(None);
+        let mut watcher = ConfigWatcher::new(vec![profile_path], Config::default(), tx)
+            .with_profile_defaults(defaults_path.clone());
+        assert!(
+            watcher.last_good_defaults.is_some(),
+            "valid defaults seeded"
+        );
+
+        // A malformed edit must NOT drop the base layer.
+        std::fs::write(&defaults_path, "{ not valid json").unwrap();
+        watcher.refresh_defaults();
+        assert_eq!(
+            watcher.last_good_defaults.as_ref().map(|d| d.hooks.len()),
+            Some(1),
+            "malformed edit retains last-known-good base"
+        );
+
+        // Deleting the file removes the base layer.
+        std::fs::remove_file(&defaults_path).unwrap();
+        watcher.refresh_defaults();
+        assert!(
+            watcher.last_good_defaults.is_none(),
+            "deleted file clears base"
+        );
+    }
+
+    #[test]
+    fn editing_profile_defaults_emits_restart_required() {
+        let dir = TempDir::new().unwrap();
+        let profile_path = dir.path().join("p.json");
+        std::fs::write(&profile_path, PROFILE_JSON).unwrap();
+        let defaults_path = dir.path().join("profile-defaults.json");
+        let v1 = ProfileConfig {
+            hooks: vec![default_hook("dh")],
+            ..Default::default()
+        };
+        std::fs::write(&defaults_path, serde_json::to_string(&v1).unwrap()).unwrap();
+
+        // Seed the watcher with the effective config it currently runs with.
+        let buffers = ConfigWatcher::read_files(&[profile_path.clone(), defaults_path.clone()]);
+        let initial = ConfigWatcher::parse_first(
+            &buffers,
+            ConfigWatcher::parse_defaults(&defaults_path).as_ref(),
+        )
+        .unwrap();
+        let (tx, mut rx) = watch::channel(None);
+        let mut watcher = ConfigWatcher::new(vec![profile_path], initial, tx)
+            .with_profile_defaults(defaults_path.clone());
+
+        // Change ONLY the shared defaults — the profile file is untouched.
+        let v2 = ProfileConfig {
+            hooks: vec![default_hook("dh2")],
+            ..Default::default()
+        };
+        std::fs::write(&defaults_path, serde_json::to_string(&v2).unwrap()).unwrap();
+        watcher.check();
+
+        match rx.borrow_and_update().clone() {
+            Some(ConfigChange::RestartRequired(fields)) => {
+                assert!(
+                    fields.iter().any(|f| f == "hooks"),
+                    "a defaults hooks change must emit a hooks restart, got {fields:?}"
+                );
+            }
+            other => panic!("expected RestartRequired(hooks) from a defaults edit, got {other:?}"),
         }
     }
 }

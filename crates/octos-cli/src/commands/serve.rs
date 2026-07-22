@@ -234,6 +234,19 @@ pub struct ServeCommand {
     #[arg(long)]
     pub data_dir: Option<PathBuf>,
 
+    /// Per-instance runtime data dir (redb stores, sessions, goals, serve lock,
+    /// per-profile data). When set, the profile REGISTRY + model catalog still
+    /// resolve from the shared state home (the normal
+    /// `--data-dir`/`OCTOS_HOME`/`~/.octos`), so many stdio instances share one
+    /// config/profile while each owns private runtime state. Unset ⇒ identical
+    /// to today (runtime == state home).
+    ///
+    /// Also settable via `OCTOS_INSTANCE_DATA_DIR` (the flag wins; an empty env
+    /// value is treated as unset). Env is resolved in `run_async` because the
+    /// workspace `clap` build does not enable the `env` feature.
+    #[arg(long)]
+    pub instance_data_dir: Option<PathBuf>,
+
     /// Path to config file.
     #[arg(long)]
     pub config: Option<PathBuf>,
@@ -268,6 +281,15 @@ pub struct ServeCommand {
     /// settable via `OCTOS_DANGER_FULL_ACCESS=1`.
     #[arg(long)]
     pub danger_full_access: bool,
+
+    /// Opt OUT of the network-on default. By default a fresh Local session with
+    /// no explicit `/permissions` choice runs Workspace-Write with network
+    /// ALLOWED (filesystem still sandboxed) so `npm install` / git / fetch work
+    /// out of the box. Pass `--no-network` (or `OCTOS_NO_NETWORK=1`) to revert
+    /// the default to network DENIED. Cloud/tenant deployments always default to
+    /// network-denied regardless. An explicit `/permissions` choice still wins.
+    #[arg(long)]
+    pub no_network: bool,
 
     /// Use LLM-summarization for AppUI context compaction: when a session's
     /// context fills, ask the model for a high-quality handoff summary (a real
@@ -403,6 +425,39 @@ impl ServeCommand {
         let ctx = super::resolve_command_context(self.data_dir.clone())?;
         let data_dir = ctx.data_dir.clone();
 
+        // Multi-instance stdio split. `state_home` is the SHARED, config-like
+        // root that holds the profile REGISTRY and the model catalog — always
+        // the normal resolution (`--data-dir`/`OCTOS_HOME`/`~/.octos`), never
+        // the per-instance dir. The `data_dir` used from here on is the
+        // per-instance RUNTIME root (redb stores, sessions, goals, serve lock,
+        // per-profile data): the private per-instance dir when set, else the
+        // state home (byte-identical to today for default installs and for
+        // gateways, which never set a per-instance dir).
+        //
+        // The per-instance dir comes from `--instance-data-dir` (flag wins) or
+        // `OCTOS_INSTANCE_DATA_DIR` (empty ⇒ unset). Env is read here because
+        // the workspace `clap` build omits the `env` feature.
+        let state_home = data_dir.clone();
+        let instance_data_dir = self.instance_data_dir.clone().or_else(|| {
+            std::env::var("OCTOS_INSTANCE_DATA_DIR")
+                .ok()
+                .filter(|v| !v.trim().is_empty())
+                .map(PathBuf::from)
+        });
+        let data_dir = instance_data_dir
+            .clone()
+            .unwrap_or_else(|| state_home.clone());
+        if instance_data_dir.is_some() {
+            // A fresh per-instance dir must exist before the serve lock and
+            // redb stores open under it.
+            std::fs::create_dir_all(&data_dir).wrap_err_with(|| {
+                format!(
+                    "failed to create per-instance data dir: {}",
+                    data_dir.display()
+                )
+            })?;
+        }
+
         let (config, resolved_config_path) = if let Some(config_path) = &self.config {
             tracing::info!(path = %config_path.display(), "loading config (--config)");
             (Config::from_file(config_path)?, Some(config_path.clone()))
@@ -535,10 +590,14 @@ impl ServeCommand {
             None
         };
 
-        // Initialize profile store and process manager for admin dashboard
+        // Initialize profile store and process manager for admin dashboard.
+        // Registry (`<id>.json`) resolves from the SHARED `state_home`; the
+        // per-profile `<id>/data` runtime tree roots under the per-instance
+        // `data_dir`. With no `--instance-data-dir`, `state_home == data_dir`,
+        // so this is byte-identical to `open_unified(&data_dir)`.
         tracing::info!("initializing profile store and process manager");
         let profile_store = Arc::new(
-            crate::profiles::ProfileStore::open(&data_dir)
+            crate::profiles::ProfileStore::open(&state_home, &data_dir)
                 .wrap_err("failed to open profile store")?,
         );
 
@@ -604,6 +663,14 @@ impl ServeCommand {
                 continue;
             }
             let profile_data_dir = profile_store.resolve_data_dir(profile);
+            // Resolve the full runtime profile through the single shared
+            // resolver: parent/sub-account inheritance THEN the store's global
+            // `profile-defaults.json` base, so inherited hooks / plugins /
+            // sandbox / memory settings reach the per-profile bootstrap. Absent
+            // parent + defaults ⇒ effective config == `profile.config` (no
+            // behavior change).
+            let profile = profile_store.resolve_runtime_profile(profile);
+            let profile = &profile;
             // Section B (codex review round-3): thread the host's
             // strict-signing policy so the per-profile plugin load honors
             // `plugins.require_signed = true` from the top-level config
@@ -816,6 +883,10 @@ impl ServeCommand {
             || std::env::var("OCTOS_DANGER_FULL_ACCESS")
                 .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
                 .unwrap_or(false);
+        let default_network_denied_flag = self.no_network
+            || std::env::var("OCTOS_NO_NETWORK")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false);
         // SECURITY KEYSTONE: the dangerous default rides the SAME solo
         // opt-in that gates selecting Full Access from the menu — a fleet
         // config that never sets --solo can reach neither surface.
@@ -891,6 +962,7 @@ impl ServeCommand {
             host_memory: config.memory.clone(),
             solo_login_enabled: solo_login_enabled_flag,
             dangerous_default_permissions: dangerous_default_permissions_flag,
+            default_network_denied: default_network_denied_flag,
             llm_compaction: self.llm_compaction,
             allow_admin_shell: config.allow_admin_shell,
             content_catalog_mgr: Some(Arc::new(
@@ -1497,7 +1569,7 @@ mod tests {
     #[test]
     fn derives_dashboard_auth_from_admin_profile_email_tool() {
         let dir = tempfile::tempdir().unwrap();
-        let store = crate::profiles::ProfileStore::open(dir.path()).unwrap();
+        let store = crate::profiles::ProfileStore::open_unified(dir.path()).unwrap();
         store
             .save(&crate::profiles::UserProfile {
                 id: crate::api::auth_handlers::ADMIN_PROFILE_ID.into(),
@@ -1550,7 +1622,7 @@ mod tests {
         let _guard = dashboard_smtp_test_env_lock().lock().unwrap();
         let _env = EnvVarGuard::remove("OCTOS_TEST_DASHBOARD_AUTH_ADMIN_SMTP_PASSWORD");
         let dir = tempfile::tempdir().unwrap();
-        let store = crate::profiles::ProfileStore::open(dir.path()).unwrap();
+        let store = crate::profiles::ProfileStore::open_unified(dir.path()).unwrap();
         store
             .save(&crate::profiles::UserProfile {
                 id: crate::api::auth_handlers::ADMIN_PROFILE_ID.into(),
@@ -1601,7 +1673,7 @@ mod tests {
     #[test]
     fn derives_dashboard_auth_from_first_usable_non_admin_profile() {
         let dir = tempfile::tempdir().unwrap();
-        let store = crate::profiles::ProfileStore::open(dir.path()).unwrap();
+        let store = crate::profiles::ProfileStore::open_unified(dir.path()).unwrap();
         store
             .save(&crate::profiles::UserProfile {
                 id: crate::api::auth_handlers::ADMIN_PROFILE_ID.into(),
@@ -1674,7 +1746,7 @@ mod tests {
         let _guard = dashboard_smtp_test_env_lock().lock().unwrap();
         let _env = EnvVarGuard::remove("OCTOS_TEST_DASHBOARD_AUTH_PROFILE_SMTP_PASSWORD");
         let dir = tempfile::tempdir().unwrap();
-        let store = crate::profiles::ProfileStore::open(dir.path()).unwrap();
+        let store = crate::profiles::ProfileStore::open_unified(dir.path()).unwrap();
         store
             .save(&crate::profiles::UserProfile {
                 id: "dspfac".into(),
@@ -1689,7 +1761,10 @@ mod tests {
                         smtp_host: Some("smtp.gmail.com".into()),
                         smtp_port: Some(587),
                         username: Some("dspfac@gmail.com".into()),
-                        password_env: Some("eqepkfbyfymwfhnv".into()),
+                        // Env var NAME, not a password. This field previously
+                        // held a 16-lowercase-char literal — the exact shape of
+                        // a Gmail App Password — next to a real gmail username.
+                        password_env: Some("SMTP_PASSWORD".into()),
                         password: Some("app-password".into()),
                         from_address: Some("dspfac@gmail.com".into()),
                         feishu_app_id: None,

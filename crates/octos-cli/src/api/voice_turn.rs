@@ -490,7 +490,7 @@ pub(crate) fn remove_all_visual_markers(s: &str) -> String {
 
 /// Lift the trailing `[[VISUAL:...]]` directive out of the turn's authoritative
 /// reply surfaces and strip it in place, so the internal control protocol never
-/// reaches the WIRE (`message/delta` from `done`, `message/persisted`) or
+/// reaches the WIRE (`message/delta` from `done`, `projection/envelope`) or
 /// STORAGE (session JSONL). Strips both `content` (the final `response.content`)
 /// and every Assistant carrier in `messages` that ends with the same trailing
 /// marker. Returns the parsed directive for background dispatch, or `None` (and
@@ -515,7 +515,7 @@ pub(crate) fn strip_visual_directive(
 
 /// Lift the trailing `[[EXIT]]` control marker out of the turn's authoritative
 /// reply surfaces and strip it in place, so the internal control protocol never
-/// reaches the WIRE (`message/delta`, `message/persisted`) or STORAGE (session
+/// reaches the WIRE (`message/delta`, `projection/envelope`) or STORAGE (session
 /// JSONL). Strips both `content` (the final `response.content`) and every
 /// Assistant carrier in `messages` whose trailing marker matches. Returns `true`
 /// when a real trailing marker was found and removed (the caller then emits the
@@ -544,7 +544,7 @@ pub(crate) fn strip_exit_directive(content: &mut String, messages: &mut [Message
 ///
 /// A reply may end with both markers (e.g. `…[[VISUAL:…]][[EXIT]]`): stripping
 /// only the outermost would leave the inner one trailing on the wire
-/// (`message/delta`, `message/persisted`) and in storage (session JSONL), and —
+/// (`message/delta`, `projection/envelope`) and in storage (session JSONL), and —
 /// for the visual case — never dispatch it. So this loops, peeling whichever
 /// marker is currently trailing, until neither is. Reuses (and supersedes on the
 /// turn path) the per-marker [`strip_visual_directive`] / [`strip_exit_directive`].

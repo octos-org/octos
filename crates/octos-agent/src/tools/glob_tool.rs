@@ -37,6 +37,10 @@ impl GlobTool {
 }
 
 #[derive(Debug, Deserialize)]
+// #1770: unknown keys are usually a typo of a real parameter; rejecting
+// them (with a did-you-mean via `args::parse_tool_args`) lets the model
+// self-correct instead of silently dropping its intent.
+#[serde(deny_unknown_fields)]
 struct GlobInput {
     /// Glob pattern to match (e.g., "**/*.rs", "src/*.py").
     pattern: String,
@@ -140,7 +144,7 @@ impl Tool for GlobTool {
         args: &serde_json::Value,
     ) -> Result<ToolResult> {
         let input: GlobInput =
-            serde_json::from_value(args.clone()).wrap_err("invalid glob tool input")?;
+            super::args::parse_tool_args(self.name(), &self.input_schema(), args)?;
 
         let pattern = input.pattern.clone();
         let limit = input.limit;

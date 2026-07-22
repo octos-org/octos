@@ -160,6 +160,15 @@ impl Tool for DiffEditTool {
             return Ok(super::file_io_error(e, &input.path));
         }
 
+        // #1774: opt-in post-edit formatting. Runs BEFORE cache invalidation
+        // and the git snapshot so both observe the final on-disk content.
+        // Best-effort by contract — a formatter failure never fails the edit.
+        let format_note = if ctx.format_after_edit {
+            crate::format::post_edit_format_note(&path, &new_content).await
+        } else {
+            None
+        };
+
         // M8.4: invalidate any stale cache entry — the file's contents and
         // mtime just changed.
         if let Some(cache) = ctx.file_state_cache.as_ref() {
@@ -177,7 +186,12 @@ impl Tool for DiffEditTool {
         }
 
         Ok(ToolResult {
-            output: format!("Applied {} hunk(s) to {}", hunks.len(), input.path),
+            output: format!(
+                "Applied {} hunk(s) to {}{}",
+                hunks.len(),
+                input.path,
+                format_note.unwrap_or_default()
+            ),
             success: true,
             file_modified: Some(path),
             ..Default::default()
@@ -192,10 +206,38 @@ struct Hunk {
     lines: Vec<DiffLine>,
 }
 
-enum DiffLine {
+/// One classified line of a unified-diff hunk body. Shared with the
+/// `apply_patch` tool so both editors parse and apply hunk bodies with the
+/// same semantics (#1773).
+#[derive(Debug)]
+pub(crate) enum DiffLine {
     Context(String),
     Remove(String),
     Add(String),
+}
+
+/// Context + Remove lines of a hunk body — the block that must match the
+/// current file content before the hunk may be applied.
+pub(crate) fn pattern_lines(lines: &[DiffLine]) -> Vec<&str> {
+    lines
+        .iter()
+        .filter_map(|l| match l {
+            DiffLine::Context(s) | DiffLine::Remove(s) => Some(s.as_str()),
+            DiffLine::Add(_) => None,
+        })
+        .collect()
+}
+
+/// Context + Add lines of a hunk body — the block that replaces the matched
+/// region.
+pub(crate) fn replacement_lines(lines: &[DiffLine]) -> Vec<String> {
+    lines
+        .iter()
+        .filter_map(|l| match l {
+            DiffLine::Context(s) | DiffLine::Add(s) => Some(s.clone()),
+            DiffLine::Remove(_) => None,
+        })
+        .collect()
 }
 
 fn parse_unified_diff(diff: &str) -> Result<Vec<Hunk>> {
@@ -272,12 +314,7 @@ fn apply_hunks(content: &str, hunks: &[Hunk]) -> Result<String> {
     for window in sorted_hunks.windows(2) {
         let (_, later_hunk) = window[0]; // higher line number
         let (_, earlier_hunk) = window[1]; // lower line number
-        let earlier_end = earlier_hunk.old_start
-            + earlier_hunk
-                .lines
-                .iter()
-                .filter(|l| matches!(l, DiffLine::Context(_) | DiffLine::Remove(_)))
-                .count();
+        let earlier_end = earlier_hunk.old_start + pattern_lines(&earlier_hunk.lines).len();
         if earlier_end > later_hunk.old_start {
             eyre::bail!(
                 "overlapping hunks at lines {} and {}",
@@ -288,15 +325,7 @@ fn apply_hunks(content: &str, hunks: &[Hunk]) -> Result<String> {
     }
 
     for (idx, hunk) in sorted_hunks {
-        let context_lines: Vec<&str> = hunk
-            .lines
-            .iter()
-            .filter_map(|l| match l {
-                DiffLine::Context(s) => Some(s.as_str()),
-                DiffLine::Remove(s) => Some(s.as_str()),
-                _ => None,
-            })
-            .collect();
+        let context_lines = pattern_lines(&hunk.lines);
 
         if context_lines.is_empty() {
             eyre::bail!("hunk {} has no context or remove lines", idx + 1);
@@ -306,21 +335,10 @@ fn apply_hunks(content: &str, hunks: &[Hunk]) -> Result<String> {
         let target = hunk.old_start.saturating_sub(1); // 1-indexed to 0-indexed
         let match_pos = find_match(&lines, &context_lines, target)?;
 
-        // Apply the hunk at match_pos
-        let remove_count = hunk
-            .lines
-            .iter()
-            .filter(|l| matches!(l, DiffLine::Context(_) | DiffLine::Remove(_)))
-            .count();
-
-        let new_lines: Vec<String> = hunk
-            .lines
-            .iter()
-            .filter_map(|l| match l {
-                DiffLine::Context(s) | DiffLine::Add(s) => Some(s.clone()),
-                DiffLine::Remove(_) => None,
-            })
-            .collect();
+        // Apply the hunk at match_pos: replace the matched pattern block with
+        // the replacement block.
+        let remove_count = context_lines.len();
+        let new_lines = replacement_lines(&hunk.lines);
 
         // Replace the matched region
         let end = (match_pos + remove_count).min(lines.len());
@@ -362,7 +380,10 @@ fn find_match(lines: &[String], pattern: &[&str], target: usize) -> Result<usize
     )
 }
 
-fn matches_at(lines: &[String], pattern: &[&str], start: usize) -> bool {
+/// Whether `pattern` matches `lines` starting at `start`, comparing with
+/// trailing whitespace ignored. Shared with the `apply_patch` tool's
+/// sequential hunk matcher (#1773).
+pub(crate) fn matches_at(lines: &[String], pattern: &[&str], start: usize) -> bool {
     if start + pattern.len() > lines.len() {
         return false;
     }
@@ -440,6 +461,50 @@ mod tests {
         assert_eq!(hunks.len(), 2);
         let result = apply_hunks(content, &hunks).unwrap();
         assert_eq!(result, "A\nb\nc\nd\nE\nf\n");
+    }
+
+    // -----------------------------------------------------------------------
+    // #1774: post-edit formatting integration.
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn should_format_after_diff_edit_when_enabled() {
+        if !crate::format::binary_on_path("rustfmt") {
+            eprintln!("skipping: rustfmt not on PATH");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("lib.rs"), "fn a(){let x=1;}\n").unwrap();
+
+        let tool = DiffEditTool::new(dir.path());
+        let mut ctx = super::ToolContext::zero();
+        ctx.format_after_edit = true;
+
+        let result = tool
+            .execute_with_context(
+                &ctx,
+                &serde_json::json!({
+                    "path": "lib.rs",
+                    "diff": "@@ -1,1 +1,1 @@\n-fn a(){let x=1;}\n+fn a(){let x=2;}\n",
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(result.success, "diff must apply: {}", result.output);
+        assert!(
+            result.output.contains("reformatted"),
+            "output must state the file was reformatted: {}",
+            result.output
+        );
+        let on_disk = std::fs::read_to_string(dir.path().join("lib.rs")).unwrap();
+        assert!(
+            on_disk.contains("fn a() {"),
+            "file must be rustfmt-formatted on disk: {on_disk}"
+        );
+        assert!(
+            on_disk.contains("let x = 2;"),
+            "edit must survive: {on_disk}"
+        );
     }
 
     #[test]

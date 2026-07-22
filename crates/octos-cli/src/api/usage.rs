@@ -203,7 +203,7 @@ mod tests {
     #[tokio::test]
     async fn aggregate_profiles_usage_reads_every_profile_ledger() {
         let dir = tempfile::tempdir().unwrap();
-        let store = ProfileStore::open(dir.path()).unwrap();
+        let store = ProfileStore::open_unified(dir.path()).unwrap();
         store.save(&profile("alpha")).unwrap();
         store.save(&profile("beta")).unwrap();
 

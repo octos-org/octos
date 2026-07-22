@@ -150,14 +150,16 @@ async fn test_agent_tool_call_loop() {
 async fn test_agent_max_iterations() {
     let dir = TempDir::new().unwrap();
 
-    // Mock always returns tool use — will hit max iterations
+    // Mock always returns tool use — will hit max iterations. The path
+    // varies per call so the #1765 doom-loop guard (3+ consecutive
+    // IDENTICAL calls) stays quiet and the budget stop is what fires.
     let responses: Vec<ChatResponse> = (0..5)
         .map(|i| {
             tool_use(
                 vec![ToolCall {
                     id: format!("call_{i}"),
                     name: "read_file".into(),
-                    arguments: serde_json::json!({"path": "nonexistent.txt"}),
+                    arguments: serde_json::json!({"path": format!("nonexistent_{i}.txt")}),
 
                     metadata: None,
                 }],

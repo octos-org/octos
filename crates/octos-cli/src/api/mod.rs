@@ -36,8 +36,6 @@ pub(crate) mod supervisor_store;
 pub mod swarm;
 pub(crate) mod ui_protocol;
 mod ui_protocol_alpha2_bridge;
-mod ui_protocol_alpha3_bridge;
-mod ui_protocol_alpha4_bridge;
 mod ui_protocol_alpha9_bridge;
 mod ui_protocol_approvals;
 // Relocated to crate::approvals_audit (Phase 4, ROBRIX-PHASE4 ADR) so the
@@ -278,6 +276,15 @@ pub struct AppState {
     /// same keystone that gates selecting the profile from the menu); an
     /// explicit per-session `/permissions` choice always overrides it.
     pub dangerous_default_permissions: bool,
+    /// `--no-network` opt-OUT of the network-on default. By default a fresh
+    /// solo/Local session with NO explicit `/permissions` selection resolves to
+    /// Workspace-Write **with network ALLOWED** (filesystem still sandboxed) so
+    /// the common dev workflow — `npm install`, git, fetch — works out of the
+    /// box. Setting this (via `--no-network` / `OCTOS_NO_NETWORK=1`) reverts the
+    /// default to Workspace-Write with network DENIED. Cloud/tenant deployments
+    /// are unaffected (they always default to network-denied). An explicit
+    /// per-session `/permissions` choice always overrides either default.
+    pub default_network_denied: bool,
     /// `--llm-compaction`: AppUI context compaction asks an LLM for a
     /// higher-quality handoff summary (a real model call — slower, seconds)
     /// instead of the instant deterministic heuristic. Always falls back to the
@@ -408,6 +415,7 @@ impl AppState {
             deployment_mode: crate::config::DeploymentMode::Local,
             solo_login_enabled: false,
             dangerous_default_permissions: false,
+            default_network_denied: false,
             llm_compaction: false,
             host_memory: None,
             allow_admin_shell: false,

@@ -86,7 +86,10 @@ impl LlmProvider for ToolLoopProvider {
                 tool_calls: vec![octos_core::ToolCall {
                     id: format!("call_noop_{call}"),
                     name: "noop".into(),
-                    arguments: serde_json::json!({}),
+                    // Vary the args per call so the #1765 doom-loop guard
+                    // (3+ consecutive IDENTICAL calls) stays quiet — this
+                    // suite exercises heartbeat semantics, not loop stops.
+                    arguments: serde_json::json!({ "i": call }),
                     metadata: None,
                 }],
                 stop_reason: StopReason::ToolUse,

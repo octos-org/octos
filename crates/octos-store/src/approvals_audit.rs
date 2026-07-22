@@ -281,8 +281,12 @@ fn serialize_record(
     Ok(line.into_bytes())
 }
 
-#[cfg(test)]
-pub(crate) fn read_audit_lines(path: &Path) -> Vec<serde_json::Value> {
+/// Read back the JSONL audit lines a test wrote. Available to this crate's own
+/// tests and, via the `test-util` feature, to downstream crates' tests (octos-cli
+/// exercises it through the `api::ui_protocol_audit` alias). Not compiled into
+/// production builds unless a consumer opts into `test-util`.
+#[cfg(any(test, feature = "test-util"))]
+pub fn read_audit_lines(path: &Path) -> Vec<serde_json::Value> {
     std::fs::read_to_string(path)
         .unwrap_or_default()
         .lines()

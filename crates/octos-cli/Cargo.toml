@@ -20,6 +20,9 @@ octos-agent = { workspace = true }
 octos-memory = { workspace = true }
 octos-llm = { workspace = true }
 octos-bus = { workspace = true }
+octos-workflows = { workspace = true }
+octos-store = { workspace = true }
+octos-services = { workspace = true }
 octos-pipeline = { workspace = true }
 octos-swarm = { workspace = true }
 # RFC-2 (issue #1291): `octos skills install` runs the manifest schema
@@ -166,6 +169,11 @@ axum = { workspace = true }
 # failover-surfacing tests can call `publish_failover_for_subscribers`.
 # Production builds don't see this; only `cargo test -p octos-cli`.
 octos-llm = { workspace = true, features = ["test-utils"] }
+# Exposes `octos-store`'s test-only helpers (e.g. `read_audit_lines`, reached via
+# the `api::ui_protocol_audit` alias) to octos-cli's tests. Production builds
+# don't see it; only `cargo test -p octos-cli`.
+octos-store = { workspace = true, features = ["test-util"] }
+octos-services = { workspace = true, features = ["test-util"] }
 tokio-tungstenite.workspace = true
 
 [[test]]

@@ -939,11 +939,14 @@ pub async fn my_profile(
         crate::process_manager::ProcessStatus::stopped()
     };
 
-    Ok(Json(ProfileResponse {
-        email: None,
-        profile: mask_secrets(&profile),
-        status,
-    }))
+    // `with_email_lookup` is the only thing that reads the address out of the
+    // user store. Building the literal with `email: None` instead left the
+    // settings page's "Email (for OTP login)" field blank for everyone — on GET,
+    // and again right after a save on PUT.
+    Ok(Json(
+        ProfileResponse::from(mask_secrets(&profile), status)
+            .with_email_lookup(state.user_store.as_deref()),
+    ))
 }
 
 #[derive(Deserialize, Default)]
@@ -1326,11 +1329,14 @@ pub async fn update_my_profile(
         crate::process_manager::ProcessStatus::stopped()
     };
 
-    Ok(Json(ProfileResponse {
-        email: None,
-        profile: mask_secrets(&profile),
-        status,
-    }))
+    // `with_email_lookup` is the only thing that reads the address out of the
+    // user store. Building the literal with `email: None` instead left the
+    // settings page's "Email (for OTP login)" field blank for everyone — on GET,
+    // and again right after a save on PUT.
+    Ok(Json(
+        ProfileResponse::from(mask_secrets(&profile), status)
+            .with_email_lookup(state.user_store.as_deref()),
+    ))
 }
 
 // ── Voice selection endpoints ────────────────────────────────────────
@@ -4156,7 +4162,7 @@ mod tests {
 
     fn temp_profile_store() -> (tempfile::TempDir, ProfileStore) {
         let dir = tempfile::tempdir().unwrap();
-        let ps = ProfileStore::open(dir.path()).unwrap();
+        let ps = ProfileStore::open_unified(dir.path()).unwrap();
         (dir, ps)
     }
 
@@ -4182,7 +4188,7 @@ mod tests {
     ) {
         let dir = tempfile::tempdir().unwrap();
         let user_store = Arc::new(UserStore::open(dir.path()).unwrap());
-        let profile_store = Arc::new(ProfileStore::open(dir.path()).unwrap());
+        let profile_store = Arc::new(ProfileStore::open_unified(dir.path()).unwrap());
         let allowlist_store = Arc::new(LoginAllowlistStore::open(dir.path()).unwrap());
         // Tests that exercise per-email send_code/verify branches expect the
         // SMTP precheck to pass; populate a synthetic config so the common

@@ -98,6 +98,12 @@ pub struct ChatCommand {
     /// `~/.octos/profiles/<id>/`, or an explicit path to a profile
     /// JSON/TOML file.
     ///
+    /// If the id names a stored serve/onboarding profile (one created by
+    /// `octos serve` or octos-tui, saved as `~/.octos/profiles/<id>.json`),
+    /// its LLM provider/model, route, and API key (`env_vars`) are reused too —
+    /// so you don't re-enter a model or key that a profile already holds.
+    /// `--config`, `--provider`, and `--model` still override.
+    ///
     /// Defaults to `coding`, the lean core-coding tool surface (files,
     /// shell, search, memory, spawn, user questions). Use `coding-full`
     /// for the unfiltered pre-lean tool set (web, research, pipelines,
@@ -141,6 +147,14 @@ pub struct ChatCommand {
     /// Do NOT persist this run as an episode (ephemeral). Mirrors
     /// `claude --no-session-persistence`: by default a completed turn is
     /// saved to the episode store for future recall; this skips that write.
+    ///
+    /// This also lets many `octos chat` agents run CONCURRENTLY against one
+    /// `--data-dir` (hence one shared `--profile`): a normal run takes an
+    /// exclusive lock on the data dir's episode DB, but an ephemeral run falls
+    /// back to an in-memory episode handle when the lock is already held,
+    /// instead of failing. Pass this to fan out parallel agents on a single
+    /// profile — e.g. review agents over one repo, or edit agents each in
+    /// their own `--cwd`.
     #[arg(long)]
     pub no_session_persistence: bool,
 
@@ -166,6 +180,48 @@ pub enum ChatSandboxMode {
     WorkspaceWrite,
     /// No sandbox, host filesystem, network on, approvals never ("yolo").
     DangerFullAccess,
+}
+
+/// Host-managed paths used by a chat session.
+///
+/// `--sandbox read-only` constrains both agent tools and Octos's own startup
+/// work: bundled-skill bootstrap and spawned-worker deliverables must not
+/// create `cwd/.octos`. Existing project state remains readable for local
+/// plugins and bootstrap prompt files.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ChatRuntimePaths {
+    /// Existing workspace-local state, read-only in a read-only session.
+    project_dir: PathBuf,
+    /// Root for host-generated bundled skills.
+    bootstrap_dir: PathBuf,
+    /// Per-chat root for spawn deliverables.
+    spawn_deliverable_dir: PathBuf,
+}
+
+fn resolve_chat_runtime_paths(
+    cwd: &std::path::Path,
+    data_dir: &std::path::Path,
+    permissions: octos_agent::EffectivePermissions,
+    run_id: &str,
+) -> ChatRuntimePaths {
+    let project_dir = cwd.join(".octos");
+    if permissions.file_access.allows_write() {
+        return ChatRuntimePaths {
+            bootstrap_dir: project_dir.clone(),
+            spawn_deliverable_dir: project_dir.join("spawn-deliverables"),
+            project_dir,
+        };
+    }
+
+    // Bootstrap performs direct filesystem writes. Keep every read-only chat
+    // in a private runtime subtree so concurrent sessions cannot race over
+    // generated bundled skills or see each other's plugin state.
+    let run_dir = data_dir.join("runtime").join("runs").join(run_id);
+    ChatRuntimePaths {
+        project_dir,
+        bootstrap_dir: run_dir.join("bootstrap"),
+        spawn_deliverable_dir: run_dir.join("spawn-deliverables"),
+    }
 }
 
 /// `--ask-for-approval` choices, mirroring codex.
@@ -731,9 +787,18 @@ impl ChatCommand {
         let ctx = super::resolve_command_context(self.data_dir)?;
         let data_dir = ctx.data_dir.clone();
 
-        // Load config
+        // Load config. Precedence: an explicit `--config` wins; otherwise a
+        // stored serve/onboarding profile named by `--profile <id>` supplies its
+        // LLM provider/model + route + `env_vars` API key (so `octos chat
+        // --profile <id>` reuses an octos-tui / `serve` profile without a
+        // separate flat config or a duplicated key); otherwise the ambient
+        // config context.
+        let serve_profile_config = load_serve_profile_config(self.profile.as_deref(), &data_dir)?;
+        let profile_is_serve = serve_profile_config.is_some();
         let config = if let Some(config_path) = &self.config {
             Config::from_file(config_path)?
+        } else if let Some(profile_config) = serve_profile_config {
+            profile_config
         } else {
             Config::load_with_context(&cwd, &ctx)?
         };
@@ -811,11 +876,32 @@ impl ChatCommand {
             }
         };
 
-        let memory = Arc::new(
+        // Episode store. Normally strict-open (the canonical single writer of
+        // `episodes.redb`, which takes an exclusive process lock). But an
+        // ephemeral run (`--no-session-persistence`) isn't going to save
+        // episodes anyway, so it opens via `open_or_degraded`: if another
+        // `octos chat` already holds the lock on this data dir, this run falls
+        // back to an in-memory episode handle instead of failing. That lets
+        // many ephemeral `octos chat` agents run concurrently against ONE
+        // `--data-dir` (hence one shared `--profile`) — e.g. a fan-out of
+        // review/edit agents — without the redb lock serializing them.
+        let memory = Arc::new(if self.no_session_persistence {
+            let store = EpisodeStore::open_or_degraded(&data_dir)
+                .await
+                .wrap_err("failed to open episode store")?;
+            if store.is_degraded() {
+                tracing::info!(
+                    "episode store on this data dir is held by another process; \
+                     running with an in-memory episode handle (no persistence/recall) \
+                     — expected when running concurrent `octos chat` agents"
+                );
+            }
+            store
+        } else {
             EpisodeStore::open(&data_dir)
                 .await
-                .wrap_err("failed to open episode store")?,
-        );
+                .wrap_err("failed to open episode store")?
+        });
 
         // Resolve the runtime profile (M8.3). Order:
         //   1. --profile CLI arg, if present;
@@ -825,7 +911,28 @@ impl ChatCommand {
         // The resolved profile's tool filter is applied after the full
         // registry has been assembled, preserving the existing bootstrap
         // path (plugins, MCP, pipelines etc. all register first).
-        let (profile, profile_source_label) = resolve_profile(&self.profile)?;
+        // Tool surface: normal runtime-profile resolution. A stored serve profile
+        // (named by `--profile`, whose LLM config was loaded above) has no runtime
+        // tool-surface definition, so fall back to the default `coding` surface
+        // instead of erroring — gated on `profile_is_serve` so an actually-unknown
+        // profile name still fails loudly.
+        let (profile, profile_source_label) = match resolve_profile(&self.profile) {
+            Ok(resolved) => resolved,
+            Err(_) if profile_is_serve => {
+                tracing::info!(
+                    profile = self.profile.as_deref().unwrap_or_default(),
+                    "serve profile has no runtime tool-surface definition; \
+                     using the default `coding` tool surface"
+                );
+                (
+                    octos_agent::profile::ProfileDefinition::load("coding")
+                        .wrap_err("failed to load built-in coding profile")?
+                        .0,
+                    "coding (serve-profile default)",
+                )
+            }
+            Err(err) => return Err(err),
+        };
         tracing::info!(
             "profile resolved: name={} source={}",
             profile.name,
@@ -849,6 +956,12 @@ impl ChatCommand {
             self.sandbox,
             self.ask_for_approval,
         )?;
+        let runtime_paths = resolve_chat_runtime_paths(
+            &cwd,
+            &data_dir,
+            permissions,
+            &uuid::Uuid::now_v7().to_string(),
+        );
         if permissions.is_dangerous() {
             // Codex-style one-line RED warning on stderr.
             eprintln!(
@@ -898,11 +1011,16 @@ impl ChatCommand {
         let mut spawn_tool =
             octos_agent::SpawnTool::new(llm.clone(), memory.clone(), cwd.clone(), spawn_tx)
                 .with_worker_prompt(worker_prompt)
+                .with_workspace_write_access(permissions.file_access.allows_write())
                 // #1607 (codex-review follow-up): thread the same sandbox the
                 // parent registry was built from so the spawn/agent_mcp child
                 // completion path confines workspace-declared `Command`
                 // validators instead of running them on the host.
                 .with_sandbox(effective_sandbox_config.clone());
+        if !permissions.file_access.allows_write() {
+            spawn_tool =
+                spawn_tool.with_deliverable_root(runtime_paths.spawn_deliverable_dir.clone());
+        }
         if let Some(ref embedder) = embedder {
             // Workers save episodes by default; without the embedder those
             // episodes are stored vectorless and worker recall skips.
@@ -940,13 +1058,13 @@ impl ChatCommand {
         }
 
         // Bootstrap bundled app-skill binaries (deep_search, deep_crawl, etc.)
-        // Must happen BEFORE plugin loading so PluginLoader picks them up.
-        let project_dir = cwd.join(".octos");
-        let n = octos_agent::bootstrap::bootstrap_bundled_skills(&project_dir);
+        // before plugin loading. In a read-only chat this targets the data-dir
+        // runtime root; the workspace's existing `.octos` remains read-only.
+        let n = octos_agent::bootstrap::bootstrap_bundled_skills(&runtime_paths.bootstrap_dir);
         if n > 0 {
             eprintln!("Bootstrapped {n} app-skills");
         }
-        let n = octos_agent::bootstrap::bootstrap_platform_skills(&project_dir);
+        let n = octos_agent::bootstrap::bootstrap_platform_skills(&runtime_paths.bootstrap_dir);
         if n > 0 {
             eprintln!("Bootstrapped {n} platform skills");
         }
@@ -962,11 +1080,18 @@ impl ChatCommand {
             eprintln!("Bootstrapped {n} bundled pipelines");
         }
 
-        // Load plugins (includes app-skills from .octos/skills/).
+        // Load existing project plugins plus bundled skills from the host
+        // runtime root. Preserve project precedence so an operator-installed
+        // skill still wins over an Octos bundled fallback.
         // Section B (codex review P1.1): honour `plugins.require_signed`
         // from the resolved Config so an operator who opts into strict
         // signing has it enforced on `octos chat` too.
-        let plugin_dirs = Config::plugin_dirs_from_project(&cwd.join(".octos"));
+        let mut plugin_dirs = Config::plugin_dirs_from_project(&runtime_paths.project_dir);
+        for runtime_dir in Config::plugin_dirs_from_project(&runtime_paths.bootstrap_dir) {
+            if !plugin_dirs.contains(&runtime_dir) {
+                plugin_dirs.push(runtime_dir);
+            }
+        }
         let mut plugin_result = octos_agent::PluginLoadResult::default();
         if !plugin_dirs.is_empty() {
             match octos_agent::PluginLoader::load_into_with_options(
@@ -1121,6 +1246,8 @@ impl ChatCommand {
                 .effort
                 .map(octos_llm::ReasoningEffort::from)
                 .or_else(|| config.gateway.as_ref().and_then(|g| g.reasoning_effort)),
+            // #1774: opt-in post-edit formatting (rustfmt/prettier/black/gofmt).
+            format_after_edit: config.format_after_edit,
             ..Default::default()
         };
         // M8.2: load sub-agent manifests from `<cwd>/agents/` layered on
@@ -1281,9 +1408,9 @@ impl ChatCommand {
             }
         }
 
-        // Load bootstrap files (AGENTS.md, SOUL.md, etc.) from project .octos/ directory
-        let project_dir = cwd.join(".octos");
-        let bootstrap = super::load_bootstrap_files(&project_dir);
+        // Load operator-provided bootstrap files from the project state. The
+        // runtime bootstrap root only holds generated bundled skills.
+        let bootstrap = super::load_bootstrap_files(&runtime_paths.project_dir);
         if !bootstrap.is_empty() {
             agent.append_system_prompt(&bootstrap);
         }
@@ -1319,6 +1446,21 @@ impl ChatCommand {
         all_hooks.extend(plugin_result.hooks);
         if !all_hooks.is_empty() {
             agent = agent.with_hooks(Arc::new(HookExecutor::new(all_hooks)));
+        }
+
+        // #1768: opt-in git-backed workspace snapshots before mutating
+        // tools. Uses a SEPARATE git dir under `<data_dir>/snapshots/` —
+        // the user's own repo/index is never touched. Silently unavailable
+        // when no git binary is on PATH (`SnapshotManager::new` returns
+        // `None` and logs once).
+        if let Some(snapshot_cfg) = config.snapshots.as_ref().filter(|cfg| cfg.enabled) {
+            if let Some(manager) = octos_agent::SnapshotManager::new(
+                data_dir.join("snapshots"),
+                cwd.clone(),
+                snapshot_cfg.keep_last,
+            ) {
+                agent = agent.with_snapshot_manager(Arc::new(manager));
+            }
         }
 
         if let Some(ref embedder) = embedder {
@@ -1566,6 +1708,51 @@ pub(crate) fn resolve_profile(
     Ok((def, "default"))
 }
 
+/// Load the LLM config from a stored serve/onboarding profile so
+/// `octos chat --profile <id>` can reuse an octos-tui / `serve` profile's
+/// provider, model, route (base URL + API type), API key (`config.env_vars`),
+/// and fallbacks — without a separate flat config or a duplicated key.
+///
+/// Returns `Ok(None)` when no `--profile` is given, the arg is a path (a runtime
+/// [`octos_agent::profile::ProfileDefinition`] file, left to [`resolve_profile`]),
+/// or the id does not name a stored profile (e.g. a built-in runtime profile like
+/// `coding`) — leaving the caller on its normal config path. An explicit
+/// `--config` still takes precedence (handled by the caller), and CLI
+/// `--provider`/`--model`/… continue to override the profile's values downstream.
+///
+/// [`ProfileStore::get`](crate::profiles::ProfileStore::get) is a lock-free JSON
+/// read, so this is safe to call while a `serve` process holds the same data dir.
+fn load_serve_profile_config(
+    profile_arg: Option<&str>,
+    data_dir: &std::path::Path,
+) -> Result<Option<Config>> {
+    let Some(id) = profile_arg else {
+        return Ok(None);
+    };
+    // A path-form `--profile` names a runtime ProfileDefinition file, not a stored
+    // serve-profile id; leave those to `resolve_profile`.
+    if id.contains('/') || id.contains(std::path::MAIN_SEPARATOR) {
+        return Ok(None);
+    }
+    let store = crate::profiles::ProfileStore::open_unified(data_dir)
+        .wrap_err("failed to open profile store")?;
+    let Some(profile) = store.get(id)? else {
+        return Ok(None);
+    };
+    // Apply parent inheritance + global profile-defaults exactly like serve's
+    // per-profile loop, then flatten `llm.primary` into the flat provider/model/
+    // route fields the chat provider builder reads.
+    let resolved = store.resolve_runtime_profile(&profile);
+    let config = crate::profiles::config_from_profile(&resolved, None, None);
+    tracing::info!(
+        profile = id,
+        provider = config.provider.as_deref().unwrap_or("<unset>"),
+        model = config.model.as_deref().unwrap_or("<unset>"),
+        "using LLM config from stored profile",
+    );
+    Ok(Some(config))
+}
+
 /// Find the matching provider-specific tool policy for the active model.
 /// Checks model ID first (e.g. "claude-sonnet-4-20250514"), then provider name (e.g. "gemini").
 pub(crate) fn resolve_provider_policy(
@@ -1709,6 +1896,144 @@ pub(crate) fn build_run_pipeline_tool(
 #[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn read_only_runtime_paths_keep_host_state_outside_workspace() {
+        let workspace = PathBuf::from("/tmp/workspace");
+        let data_dir = PathBuf::from("/tmp/octos-data");
+        let permissions =
+            resolve_chat_permissions(false, Some(ChatSandboxMode::ReadOnly), None).unwrap();
+
+        let paths = resolve_chat_runtime_paths(&workspace, &data_dir, permissions, "run-123");
+
+        assert_eq!(paths.project_dir, workspace.join(".octos"));
+        assert_eq!(
+            paths.bootstrap_dir,
+            data_dir
+                .join("runtime")
+                .join("runs")
+                .join("run-123")
+                .join("bootstrap")
+        );
+        assert_eq!(
+            paths.spawn_deliverable_dir,
+            data_dir
+                .join("runtime")
+                .join("runs")
+                .join("run-123")
+                .join("spawn-deliverables")
+        );
+    }
+
+    #[test]
+    fn read_only_runtime_paths_are_isolated_per_chat_run() {
+        let workspace = PathBuf::from("/tmp/workspace");
+        let data_dir = PathBuf::from("/tmp/octos-data");
+        let permissions =
+            resolve_chat_permissions(false, Some(ChatSandboxMode::ReadOnly), None).unwrap();
+
+        let first = resolve_chat_runtime_paths(&workspace, &data_dir, permissions, "run-a");
+        let second = resolve_chat_runtime_paths(&workspace, &data_dir, permissions, "run-b");
+
+        assert_ne!(first.bootstrap_dir, second.bootstrap_dir);
+        assert_ne!(first.spawn_deliverable_dir, second.spawn_deliverable_dir);
+        assert!(first.bootstrap_dir.starts_with(&data_dir));
+        assert!(second.bootstrap_dir.starts_with(&data_dir));
+    }
+
+    #[test]
+    fn workspace_write_runtime_paths_preserve_project_state_locations() {
+        let workspace = PathBuf::from("/tmp/workspace");
+        let data_dir = PathBuf::from("/tmp/octos-data");
+        let permissions =
+            resolve_chat_permissions(false, Some(ChatSandboxMode::WorkspaceWrite), None).unwrap();
+
+        let paths = resolve_chat_runtime_paths(&workspace, &data_dir, permissions, "run-123");
+
+        assert_eq!(paths.project_dir, workspace.join(".octos"));
+        assert_eq!(paths.bootstrap_dir, workspace.join(".octos"));
+        assert_eq!(
+            paths.spawn_deliverable_dir,
+            workspace.join(".octos").join("spawn-deliverables")
+        );
+    }
+
+    #[test]
+    fn chat_profile_loads_llm_config_from_stored_serve_profile() {
+        use crate::profiles::{
+            LlmModelSelectionConfig, LlmProfileConfig, LlmRouteConfig, ProfileConfig, ProfileStore,
+            UserProfile,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = ProfileStore::open_unified(dir.path()).unwrap();
+        let profile = UserProfile {
+            id: "dev".to_string(),
+            name: "Dev".to_string(),
+            public_subdomain: None,
+            enabled: true,
+            data_dir: None,
+            parent_id: None,
+            config: ProfileConfig {
+                llm: Some(LlmProfileConfig {
+                    primary: Some(LlmModelSelectionConfig {
+                        family_id: Some("moonshot".to_string()),
+                        model_id: Some("kimi-k2.5".to_string()),
+                        route: Some(LlmRouteConfig {
+                            base_url: Some("https://api.kimi.com/coding/v1".to_string()),
+                            api_key_env: Some("KIMI_API_KEY".to_string()),
+                            api_type: Some("openai".to_string()),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }),
+                    fallbacks: vec![],
+                }),
+                env_vars: [("KIMI_API_KEY".to_string(), "sk-from-profile".to_string())].into(),
+                ..Default::default()
+            },
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        store.save(&profile).unwrap();
+
+        // `--profile dev` names a stored serve profile → flattened LLM config,
+        // including the API key carried in the profile's own `env_vars` (so the
+        // chat run reuses the profile's model AND key with no separate setup).
+        let config = load_serve_profile_config(Some("dev"), dir.path())
+            .unwrap()
+            .expect("stored profile should produce a config");
+        assert_eq!(config.provider.as_deref(), Some("moonshot"));
+        assert_eq!(config.model.as_deref(), Some("kimi-k2.5"));
+        assert_eq!(
+            config.base_url.as_deref(),
+            Some("https://api.kimi.com/coding/v1")
+        );
+        assert_eq!(config.api_type.as_deref(), Some("openai"));
+        assert_eq!(config.api_key_env.as_deref(), Some("KIMI_API_KEY"));
+        assert_eq!(
+            config.env_vars.get("KIMI_API_KEY").map(String::as_str),
+            Some("sk-from-profile")
+        );
+
+        // A built-in runtime-profile name, a path-form arg, and an absent arg all
+        // fall through (Ok(None)) so the caller keeps its normal config path.
+        assert!(
+            load_serve_profile_config(Some("coding"), dir.path())
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            load_serve_profile_config(Some("./some/path.json"), dir.path())
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            load_serve_profile_config(None, dir.path())
+                .unwrap()
+                .is_none()
+        );
+    }
 
     // ---- yolo GAP #3: chat permission flags → EffectivePermissions ----
 

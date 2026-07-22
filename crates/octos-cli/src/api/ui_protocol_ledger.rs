@@ -60,9 +60,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use octos_core::SessionKey;
 use octos_core::ui_protocol::{
-    Envelope, EnvelopeNotification, Payload, RpcError, RpcNotification, SessionOpened,
-    TaskRuntimeState, TurnCompletedEvent, TurnErrorEvent, UiCursor, UiNotification,
-    UiProgressEvent, methods,
+    Envelope, EnvelopeNotification, EnvelopeV2, EnvelopeV2Notification, Payload, PayloadV2,
+    RpcError, RpcNotification, SessionOpened, TaskRuntimeState, TurnCompletedEvent, TurnErrorEvent,
+    UiCursor, UiNotification, UiProgressEvent, methods,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -188,25 +188,17 @@ impl UiProtocolLedgerEvent {
                 }) => {
                     *event_cursor = Some(cursor);
                 }
-                // UPCR-2026-012: stamp the assigned cursor onto the
-                // `MessagePersisted` payload so the wire `cursor` field
-                // matches the ledger envelope's cursor.
-                UiNotification::MessagePersisted(persisted) => {
-                    persisted.cursor = cursor;
-                }
-                // M10 Phase 1: stamp the ledger cursor onto the
-                // `turn/spawn_complete` envelope so cursor-driven
-                // clients can resume cleanly. The flat `seq` field is
-                // intentionally NOT overwritten here — it carries the
-                // committed-row index from the persistence path
-                // (matching `MessagePersistedEvent.seq`), which the
-                // producer set before append (codex P2 follow-up).
-                // The persisted-row seq and the UI-ledger cursor seq
-                // are different scales — conflating them would make
-                // upgraded clients dedupe / anchor against a
-                // non-existent message row on hydrate.
+                // Legacy background records retain their original row seq;
+                // only their durable UI-ledger cursor is stamped here.
                 UiNotification::TurnSpawnComplete(spawn_complete) => {
                     spawn_complete.cursor = cursor;
+                }
+                // V2 normally projects an existing durable source event at
+                // the wire boundary instead of appending a second ledger row.
+                // Stamp it nevertheless if a test or future producer stores a
+                // concrete V2 notification directly.
+                UiNotification::EnvelopeV2(envelope) => {
+                    envelope.envelope.cursor = Some(cursor);
                 }
                 _ => {}
             }
@@ -253,6 +245,65 @@ struct LedgerDiskRecord {
 }
 
 const LEDGER_DISK_VERSION: u32 = 1;
+
+/// Result of parsing one disk line. A pre-Stage-5 persisted-message record
+/// has no representation in the v2-only core enum, so it is explicitly
+/// surfaced as a skipped legacy row rather than being mis-routed as a live
+/// notification or treated as a fatal replay error.
+#[derive(Debug)]
+// This is a short-lived parse result; boxing `Record` would allocate once per
+// recovered ledger line, so retain the stack representation used by the
+// canonical record decoder.
+#[allow(clippy::large_enum_variant)]
+enum ParsedLedgerDiskRecord {
+    Record(LedgerDiskRecord),
+    LegacyMessagePersisted { v: u32, seq: u64 },
+}
+
+/// Minimal, derived decoder used only to recognize an on-disk legacy
+/// `message_persisted` notification after the canonical decoder rejects its
+/// removed inner variant. Keeping this typed (rather than probing through a
+/// `serde_json::Value`) preserves serde's duplicate-field checks for the
+/// discriminator fields that establish the record's identity.
+#[derive(Debug, Deserialize)]
+struct LegacyMessagePersistedDiskRecord {
+    v: u32,
+    seq: u64,
+    #[serde(rename = "event")]
+    _event: LegacyMessagePersistedLedgerEvent,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "record_kind", rename_all = "snake_case")]
+enum LegacyMessagePersistedLedgerEvent {
+    Notification(LegacyMessagePersistedNotification),
+}
+
+#[derive(Debug, Deserialize)]
+struct LegacyMessagePersistedNotification {
+    #[serde(rename = "kind")]
+    _kind: LegacyMessagePersistedKind,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum LegacyMessagePersistedKind {
+    MessagePersisted,
+}
+
+#[derive(Debug, Deserialize)]
+struct LegacyTaggedMessagePersistedDiskRecord {
+    v: u32,
+    seq: u64,
+    #[serde(rename = "event")]
+    _event: LegacyTaggedMessagePersistedLedgerEvent,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "envelope", rename_all = "snake_case")]
+enum LegacyTaggedMessagePersistedLedgerEvent {
+    Notification(LegacyMessagePersistedNotification),
+}
 
 /// Back-compat read shim for records written by the *pre-#1358* binary,
 /// whose `event` carried the outer discriminator under the legacy tag key
@@ -329,10 +380,16 @@ impl From<LegacyLedgerDiskRecord> for LedgerDiskRecord {
 ///
 /// On genuine corruption the *canonical* error is returned (it reflects
 /// the format the writer actually emits) so debug logs stay meaningful.
-fn parse_ledger_disk_record(line: &str) -> Result<LedgerDiskRecord, serde_json::Error> {
+fn parse_ledger_disk_record(line: &str) -> Result<ParsedLedgerDiskRecord, serde_json::Error> {
     match serde_json::from_str::<LedgerDiskRecord>(line) {
-        Ok(record) => Ok(record),
+        Ok(record) => Ok(ParsedLedgerDiskRecord::Record(record)),
         Err(canonical_err) => {
+            if let Ok(legacy) = serde_json::from_str::<LegacyMessagePersistedDiskRecord>(line) {
+                return Ok(ParsedLedgerDiskRecord::LegacyMessagePersisted {
+                    v: legacy.v,
+                    seq: legacy.seq,
+                });
+            }
             // Only attempt the legacy `envelope`-tagged shim when the
             // canonical parse failed specifically because the event is
             // missing its `record_kind` discriminator — i.e. a legacy
@@ -341,8 +398,16 @@ fn parse_ledger_disk_record(line: &str) -> Result<LedgerDiskRecord, serde_json::
             // genuine and must surface the canonical error unchanged so
             // strictness is preserved.
             if is_missing_record_kind_tag(&canonical_err) {
+                if let Ok(legacy) =
+                    serde_json::from_str::<LegacyTaggedMessagePersistedDiskRecord>(line)
+                {
+                    return Ok(ParsedLedgerDiskRecord::LegacyMessagePersisted {
+                        v: legacy.v,
+                        seq: legacy.seq,
+                    });
+                }
                 if let Ok(legacy) = serde_json::from_str::<LegacyLedgerDiskRecord>(line) {
-                    return Ok(legacy.into());
+                    return Ok(ParsedLedgerDiskRecord::Record(legacy.into()));
                 }
             }
             Err(canonical_err)
@@ -820,7 +885,7 @@ impl UiProtocolLedger {
         let Some(snapshot) = self.read_session_disk_snapshot(session_id, session_dir, None)? else {
             return Ok(0);
         };
-        if snapshot.retained_entries.is_empty() {
+        if snapshot.retained_entries.is_empty() && snapshot.head_seq == 0 {
             return Ok(0);
         }
 
@@ -882,6 +947,7 @@ impl UiProtocolLedger {
             // scan on pre-#1358 ledgers). Per-record detail stays at
             // `debug!` for when it is needed.
             let mut skipped_unknown_version = 0u64;
+            let mut skipped_legacy_message_persisted = 0u64;
             let mut skipped_malformed = 0u64;
             for line_result in reader.lines() {
                 let line = match line_result {
@@ -907,14 +973,47 @@ impl UiProtocolLedger {
                 // round-trip — so duplicate-key corruption is still
                 // rejected on either path.
                 let record = match parse_ledger_disk_record(&line) {
-                    Ok(record) if record.v == LEDGER_DISK_VERSION => record,
-                    Ok(record) => {
+                    Ok(ParsedLedgerDiskRecord::Record(record))
+                        if record.v == LEDGER_DISK_VERSION =>
+                    {
+                        record
+                    }
+                    Ok(ParsedLedgerDiskRecord::LegacyMessagePersisted { v, seq })
+                        if v == LEDGER_DISK_VERSION =>
+                    {
+                        // Stage 5 deliberately removed the old wire and
+                        // ledger variant. Preserve this row's cursor space so
+                        // a later append cannot reuse its sequence, but do
+                        // not reconstruct or route its obsolete payload.
+                        skipped_legacy_message_persisted += 1;
+                        oldest_seq.get_or_insert(seq);
+                        head_seq = head_seq.max(seq);
+                        debug!(
+                            target = "octos::ledger",
+                            session_id = %session_id.0,
+                            path = %path.display(),
+                            seq,
+                            "skipping removed legacy message/persisted ledger record"
+                        );
+                        continue;
+                    }
+                    Ok(ParsedLedgerDiskRecord::Record(record)) => {
                         skipped_unknown_version += 1;
                         debug!(
                             target = "octos::ledger",
                             version = record.v,
                             path = %path.display(),
                             "skipping ledger record with unknown version"
+                        );
+                        continue;
+                    }
+                    Ok(ParsedLedgerDiskRecord::LegacyMessagePersisted { v, .. }) => {
+                        skipped_unknown_version += 1;
+                        debug!(
+                            target = "octos::ledger",
+                            version = v,
+                            path = %path.display(),
+                            "skipping legacy message/persisted ledger record with unknown version"
                         );
                         continue;
                     }
@@ -964,7 +1063,8 @@ impl UiProtocolLedger {
                     retained_entries.pop_front();
                 }
             }
-            let skipped_total = skipped_unknown_version + skipped_malformed;
+            let skipped_total =
+                skipped_unknown_version + skipped_legacy_message_persisted + skipped_malformed;
             if skipped_total > 0 {
                 skipped_records = skipped_records.saturating_add(skipped_total);
                 warn!(
@@ -973,6 +1073,7 @@ impl UiProtocolLedger {
                     path = %path.display(),
                     skipped = skipped_total,
                     skipped_unknown_version,
+                    skipped_legacy_message_persisted,
                     skipped_malformed,
                     "skipped ledger records during scan (aggregated)"
                 );
@@ -1094,6 +1195,282 @@ impl UiProtocolLedger {
         self.emit_envelope_inner(session_id, thread_id, payload, client_message_id, topic)
     }
 
+    /// Emit one canonical v2 projection envelope under the same per-thread
+    /// sequence and terminal-barrier discipline as the older projection
+    /// writer. The cursor is assigned by the durable append path, never by a
+    /// caller, so live delivery and replay observe the identical envelope.
+    pub(crate) fn emit_envelope_v2(
+        &self,
+        session_id: &SessionKey,
+        thread_id: String,
+        payload: PayloadV2,
+        client_message_id: Option<String>,
+    ) -> Option<LedgeredUiProtocolEvent> {
+        let topic = session_id.topic().map(ToOwned::to_owned);
+        self.emit_envelope_v2_inner(session_id, thread_id, payload, client_message_id, topic)
+    }
+
+    fn emit_envelope_v2_inner(
+        &self,
+        session_id: &SessionKey,
+        thread_id: String,
+        payload: PayloadV2,
+        client_message_id: Option<String>,
+        topic: Option<String>,
+    ) -> Option<LedgeredUiProtocolEvent> {
+        let session_id_clone = session_id.clone();
+        let storage_id = self.storage_session_id(session_id);
+        let preload_snapshot = self.snapshot_if_session_absent(&storage_id);
+        let cursor;
+        let stamped;
+        let on_disk_delta;
+        let ledgered;
+        let broadcast_sender;
+        {
+            let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+            let is_terminal = matches!(
+                &payload,
+                PayloadV2::TurnTerminal { .. } | PayloadV2::BackgroundChildCompleted { .. }
+            );
+            let seq = match self.allocate_projection_seq_locked(
+                &storage_id,
+                &thread_id,
+                is_terminal,
+                &mut inner,
+            ) {
+                Ok(seq) => seq,
+                Err(kind) => {
+                    drop(inner);
+                    metrics::counter!(
+                        "octos_projection_post_completion_drop_total",
+                        "kind" => kind,
+                    )
+                    .increment(1);
+                    return None;
+                }
+            };
+
+            let mut event = UiProtocolLedgerEvent::Notification(UiNotification::EnvelopeV2(
+                EnvelopeV2Notification {
+                    session_id: session_id_clone.clone(),
+                    topic,
+                    envelope: EnvelopeV2 {
+                        thread_id: thread_id.clone(),
+                        seq,
+                        cursor: None,
+                        turn_id: thread_id,
+                        client_message_id,
+                        payload,
+                    },
+                },
+            ));
+            event.stamp_topic_from_session();
+
+            let append_outcome =
+                self.append_locked(&storage_id, event, None, preload_snapshot, &mut inner);
+            cursor = append_outcome.cursor;
+            stamped = append_outcome.stamped;
+            on_disk_delta = append_outcome.on_disk_delta;
+            ledgered = LedgeredUiProtocolEvent {
+                cursor: cursor.clone(),
+                event: stamped.clone(),
+                from_connection: None,
+            };
+
+            if on_disk_delta >= 0 {
+                inner.on_disk_bytes = inner.on_disk_bytes.saturating_add(on_disk_delta as u64);
+            } else {
+                inner.on_disk_bytes = inner.on_disk_bytes.saturating_sub((-on_disk_delta) as u64);
+            }
+            inner.touch_lru(&storage_id);
+            broadcast_sender = inner.subscribers.get(&session_id_clone).cloned();
+            if let Some(sender) = broadcast_sender.as_ref() {
+                let _ = sender.send(ledgered.clone());
+            }
+        }
+        let _ = broadcast_sender;
+        Some(ledgered)
+    }
+
+    /// Return the stable one-based assistant-segment ordinal for a v1
+    /// envelope being projected into Stage-1 v2.
+    ///
+    /// A persisted assistant row closes one iteration. Therefore all deltas
+    /// before the first persisted row are segment 1, the next iteration is
+    /// segment 2, and so on. The calculation reads existing durable ledger
+    /// entries only; it never appends a v2 row, which keeps legacy cursor
+    /// sequences byte-for-byte stable.
+    pub(crate) fn projection_v2_assistant_segment_index(
+        &self,
+        session_id: &SessionKey,
+        thread_id: &str,
+        envelope_seq: u64,
+    ) -> u64 {
+        let storage_id = self.storage_session_id(session_id);
+        let inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let prior_persisted = inner
+            .sessions
+            .get(&storage_id)
+            .into_iter()
+            .flat_map(|state| state.entries.iter())
+            .filter(|entry| match &entry.event {
+                UiProtocolLedgerEvent::Notification(UiNotification::Envelope(envelope)) => {
+                    envelope.envelope.thread_id == thread_id
+                        && envelope.envelope.seq < envelope_seq
+                        && matches!(
+                            &envelope.envelope.payload,
+                            Payload::AssistantPersisted { .. }
+                        )
+                }
+                UiProtocolLedgerEvent::Notification(UiNotification::EnvelopeV2(envelope)) => {
+                    envelope.envelope.thread_id == thread_id
+                        && envelope.envelope.seq < envelope_seq
+                        && matches!(
+                            &envelope.envelope.payload,
+                            PayloadV2::AssistantPersisted { .. }
+                        )
+                }
+                _ => false,
+            })
+            .count() as u64;
+        prior_persisted.saturating_add(1)
+    }
+
+    /// Segment currently owning a late attachment as of a particular ledger
+    /// cursor. If no assistant row had persisted yet, retain the first segment
+    /// as the deterministic fallback. Restricting the scan to source entries
+    /// preceding the attachment makes replay stable even after later assistant
+    /// iterations have been appended.
+    pub(crate) fn projection_v2_current_assistant_segment_index(
+        &self,
+        session_id: &SessionKey,
+        thread_id: &str,
+        before_cursor_seq: u64,
+    ) -> u64 {
+        let storage_id = self.storage_session_id(session_id);
+        let inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        inner
+            .sessions
+            .get(&storage_id)
+            .into_iter()
+            .flat_map(|state| state.entries.iter())
+            .filter(|entry| {
+                if entry.seq >= before_cursor_seq {
+                    return false;
+                }
+                match &entry.event {
+                    UiProtocolLedgerEvent::Notification(UiNotification::Envelope(envelope)) => {
+                        envelope.envelope.thread_id == thread_id
+                            && matches!(
+                                &envelope.envelope.payload,
+                                Payload::AssistantPersisted { .. }
+                            )
+                    }
+                    UiProtocolLedgerEvent::Notification(UiNotification::EnvelopeV2(envelope)) => {
+                        envelope.envelope.thread_id == thread_id
+                            && matches!(
+                                &envelope.envelope.payload,
+                                PayloadV2::AssistantPersisted { .. }
+                            )
+                    }
+                    _ => false,
+                }
+            })
+            .count()
+            .max(1) as u64
+    }
+
+    /// Next per-thread v1 sequence, used when a legacy terminal or attachment
+    /// is projected directly into a v2 envelope before its v1 dual-emit is
+    /// appended. Only source rows preceding this event's ledger cursor count;
+    /// otherwise a replay after later writes could assign a different v2 seq.
+    /// This is read-only and does not reserve or mutate sequence state.
+    pub(crate) fn projection_v2_next_envelope_seq(
+        &self,
+        session_id: &SessionKey,
+        thread_id: &str,
+        before_cursor_seq: u64,
+    ) -> u64 {
+        let storage_id = self.storage_session_id(session_id);
+        let inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        inner
+            .sessions
+            .get(&storage_id)
+            .into_iter()
+            .flat_map(|state| state.entries.iter())
+            .filter_map(|entry| {
+                if entry.seq >= before_cursor_seq {
+                    return None;
+                }
+                match &entry.event {
+                    UiProtocolLedgerEvent::Notification(UiNotification::Envelope(envelope))
+                        if envelope.envelope.thread_id == thread_id =>
+                    {
+                        Some(envelope.envelope.seq)
+                    }
+                    UiProtocolLedgerEvent::Notification(UiNotification::EnvelopeV2(envelope))
+                        if envelope.envelope.thread_id == thread_id =>
+                    {
+                        Some(envelope.envelope.seq)
+                    }
+                    _ => None,
+                }
+            })
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1)
+    }
+
+    /// Whether this parent turn has already opened a linked background child
+    /// stream. The legacy background sender appends its per-file
+    /// `file/attached` signals *after* `turn/spawn_complete`; v2 must not
+    /// replay those files onto the already-terminal parent stream because the
+    /// child completion already carries their media.
+    pub(crate) fn projection_v2_has_background_child(
+        &self,
+        session_id: &SessionKey,
+        parent_turn_id: &str,
+        before_cursor_seq: u64,
+    ) -> bool {
+        let storage_id = self.storage_session_id(session_id);
+        let inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        inner
+            .sessions
+            .get(&storage_id)
+            .into_iter()
+            .flat_map(|state| state.entries.iter())
+            .any(|entry| match &entry.event {
+                UiProtocolLedgerEvent::Notification(UiNotification::EnvelopeV2(envelope)) => {
+                    entry.seq < before_cursor_seq
+                        && matches!(
+                            &envelope.envelope.payload,
+                            PayloadV2::BackgroundChildCompleted {
+                                parent_turn_id: child_parent_turn_id,
+                                ..
+                            } if child_parent_turn_id == parent_turn_id
+                        )
+                }
+                UiProtocolLedgerEvent::Notification(UiNotification::TurnSpawnComplete(spawn)) => {
+                    entry.seq < before_cursor_seq
+                        && spawn.turn_id.as_ref().map(|turn_id| turn_id.0.to_string())
+                            == Some(parent_turn_id.to_owned())
+                }
+                _ => false,
+            })
+    }
+
     fn emit_envelope_inner(
         &self,
         session_id: &SessionKey,
@@ -1136,8 +1513,12 @@ impl UiProtocolLedger {
             // Seq/thread state follows the STORAGE identity so two projects
             // sharing a wire key allocate independent, per-project seq
             // streams consistent with their separate rings/dirs.
-            let alloc =
-                self.allocate_envelope_seq_locked(&storage_id, &thread_id, &payload, &mut inner);
+            let alloc = self.allocate_projection_seq_locked(
+                &storage_id,
+                &thread_id,
+                matches!(&payload, Payload::TurnCompleted { .. }),
+                &mut inner,
+            );
             let seq = match alloc {
                 Ok(seq) => seq,
                 Err(kind) => {
@@ -1221,11 +1602,11 @@ impl UiProtocolLedger {
     /// restart scans the durable ledger for existing envelopes matching
     /// this thread and resumes from `max(seq) + 1` — daemon restart
     /// MUST NOT reissue `seq=1` for a thread the client already saw.
-    fn allocate_envelope_seq_locked(
+    fn allocate_projection_seq_locked(
         &self,
         session_id: &SessionKey,
         thread_id: &str,
-        payload: &Payload,
+        is_terminal: bool,
         inner: &mut LedgerInner,
     ) -> Result<u64, &'static str> {
         let key = (session_id.clone(), thread_id.to_owned());
@@ -1245,9 +1626,8 @@ impl UiProtocolLedger {
             .get_mut(&key)
             .expect("thread_seq entry inserted above");
         // Hard barrier per spec § 14.6.
-        let is_turn_completed = matches!(payload, Payload::TurnCompleted { .. });
         if state.completed {
-            return Err(if is_turn_completed {
+            return Err(if is_terminal {
                 "duplicate_completed"
             } else {
                 "post_completion"
@@ -1258,7 +1638,7 @@ impl UiProtocolLedger {
         }
         let seq = state.next_seq;
         state.next_seq = state.next_seq.saturating_add(1);
-        if is_turn_completed {
+        if is_terminal {
             state.completed = true;
         }
         // Codex #1336 round-2 BLOCKER 3: persist the new watermark to
@@ -1309,9 +1689,10 @@ impl UiProtocolLedger {
             return state;
         };
         for entry in &session_state.entries {
-            if let UiProtocolLedgerEvent::Notification(UiNotification::Envelope(ev)) = &entry.event
-            {
-                if ev.envelope.thread_id == thread_id {
+            match &entry.event {
+                UiProtocolLedgerEvent::Notification(UiNotification::Envelope(ev))
+                    if ev.envelope.thread_id == thread_id =>
+                {
                     if ev.envelope.seq >= state.next_seq {
                         state.next_seq = ev.envelope.seq + 1;
                     }
@@ -1319,6 +1700,20 @@ impl UiProtocolLedger {
                         state.completed = true;
                     }
                 }
+                UiProtocolLedgerEvent::Notification(UiNotification::EnvelopeV2(ev))
+                    if ev.envelope.thread_id == thread_id =>
+                {
+                    if ev.envelope.seq >= state.next_seq {
+                        state.next_seq = ev.envelope.seq + 1;
+                    }
+                    if matches!(
+                        &ev.envelope.payload,
+                        PayloadV2::TurnTerminal { .. } | PayloadV2::BackgroundChildCompleted { .. }
+                    ) {
+                        state.completed = true;
+                    }
+                }
+                _ => {}
             }
         }
         state
@@ -2467,7 +2862,6 @@ fn notification_session_id(notification: &UiNotification) -> &SessionKey {
         UiNotification::TurnCompleted(event) => &event.session_id,
         UiNotification::TurnError(event) => &event.session_id,
         UiNotification::ReplayLossy(event) => &event.session_id,
-        UiNotification::MessagePersisted(event) => &event.session_id,
         UiNotification::TurnSpawnComplete(event) => &event.session_id,
         UiNotification::FileAttached(event) => &event.session_id,
         UiNotification::VoiceAudioChunk(event) => &event.session_id,
@@ -2489,6 +2883,7 @@ fn notification_session_id(notification: &UiNotification) -> &SessionKey {
         UiNotification::SessionOrchestration(event) => &event.session_id,
         UiNotification::UserQuestionRequested(event) => &event.session_id,
         UiNotification::Envelope(event) => &event.session_id,
+        UiNotification::EnvelopeV2(event) => &event.session_id,
     }
 }
 
@@ -2498,6 +2893,7 @@ fn notification_cursor_seq(notification: &UiNotification) -> Option<u64> {
         | UiNotification::TurnCompleted(TurnCompletedEvent { cursor, .. }) => {
             cursor.as_ref().map(|c| c.seq)
         }
+        UiNotification::EnvelopeV2(envelope) => envelope.envelope.cursor.as_ref().map(|c| c.seq),
         _ => None,
     }
 }
@@ -3081,7 +3477,7 @@ mod tests {
             let config = LedgerConfig::durable(temp.path().into());
             let ledger = UiProtocolLedger::with_config(config);
             let task: octos_core::ui_protocol::TaskUpdatedEvent = serde_json::from_value(json!({
-                "session_id": session_id.0,
+                "session_id": session_id.0.clone(),
                 "task_id": ghost_task.to_string(),
                 "title": "astro dev server",
                 "state": "running",
@@ -3542,39 +3938,90 @@ mod tests {
         assert_eq!(outcome.sessions_recovered, sessions.len());
     }
 
-    // ---------- live publish-subscribe (issue #760) ----------
+    #[test]
+    fn recovery_skips_legacy_message_persisted_row_and_preserves_cursor_space() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let session_id = SessionKey("local:legacy-persisted".into());
+        let session_dir = temp
+            .path()
+            .join("ui-protocol")
+            .join(encode_session_dir_name(&session_id));
+        fs::create_dir_all(&session_dir).expect("session dir");
 
-    fn message_persisted_event(session: &SessionKey, role_str: &str) -> UiNotification {
-        use chrono::Utc;
-        use octos_core::ui_protocol::{MessagePersistedEvent, MessagePersistedSource};
-        UiNotification::MessagePersisted(MessagePersistedEvent {
-            session_id: session.clone(),
-            topic: None,
-            turn_id: Some(TurnId::new()),
-            thread_id: None,
-            seq: 0,
-            role: role_str.into(),
-            message_id: "msg-1".into(),
-            client_message_id: None,
-            source: MessagePersistedSource::Tool,
-            media: vec![],
-            cursor: UiCursor {
-                stream: session.0.clone(),
-                seq: 0,
-            },
-            persisted_at: Utc::now(),
-            content: None,
-        })
+        // Authentic pre-Stage-5 ledger shape. The v2-only reader recognizes
+        // the removed discriminator, skips its payload deliberately, and
+        // retains its cursor position so a new append cannot reuse seq 7.
+        let legacy = json!({
+            "v": LEDGER_DISK_VERSION,
+            "seq": 7,
+            "event": {
+                "record_kind": "notification",
+                "kind": "message_persisted",
+                "session_id": session_id.0,
+                "topic": null,
+                "turn_id": null,
+                "thread_id": "thread-legacy",
+                "seq": 3,
+                "role": "assistant",
+                "message_id": "local:legacy-persisted:3:1",
+                "client_message_id": null,
+                "source": "assistant",
+                "media": [],
+                "cursor": { "stream": session_id.0.clone(), "seq": 7 },
+                "persisted_at": "2026-01-01T00:00:00Z",
+                "content": null
+            }
+        });
+        fs::write(
+            session_dir.join(new_log_file_name()),
+            format!(
+                "{}\n",
+                serde_json::to_string(&legacy).expect("serialize legacy row")
+            ),
+        )
+        .expect("write legacy log");
+
+        let recovered = UiProtocolLedger::recover(LedgerConfig::durable(temp.path().into()));
+        let (replay, cursor) = recovered
+            .ledger
+            .snapshot_with_cursor(&session_id, None)
+            .expect("legacy replay must not crash");
+        assert!(replay.is_empty(), "removed payload must never be re-routed");
+        assert_eq!(cursor.seq, 7, "skipped row still reserves its cursor");
+
+        let next = recovered
+            .ledger
+            .append_notification(delta(&session_id, "v2-next"));
+        assert_eq!(
+            next.cursor.seq, 8,
+            "new row must continue after skipped legacy row"
+        );
     }
 
+    // ---------- live publish-subscribe (issue #760) ----------
+
     #[tokio::test]
-    async fn subscribe_delivers_message_persisted_to_live_receiver() {
+    async fn subscribe_delivers_v2_assistant_persisted_to_live_receiver() {
         let ledger = UiProtocolLedger::new(8);
         let session_id = SessionKey("local:live".into());
         let mut rx = ledger.subscribe(&session_id);
 
-        let appended =
-            ledger.append_notification(message_persisted_event(&session_id, "assistant"));
+        let appended = ledger
+            .emit_envelope_v2(
+                &session_id,
+                "thread-live".into(),
+                PayloadV2::AssistantPersisted {
+                    text: "assistant".into(),
+                    assistant_segment_id: "thread-live:assistant:1".into(),
+                    meta: octos_core::ui_protocol::MessageMeta {
+                        message_id: "msg-1".into(),
+                        persisted_at: chrono::Utc::now(),
+                        media: vec![],
+                    },
+                },
+                None,
+            )
+            .expect("v2 envelope emitted");
 
         let received = tokio::time::timeout(StdDuration::from_secs(1), rx.recv())
             .await
@@ -3584,7 +4031,7 @@ mod tests {
         assert_eq!(received.cursor, appended.cursor);
         assert!(matches!(
             received.event,
-            UiProtocolLedgerEvent::Notification(UiNotification::MessagePersisted(_))
+            UiProtocolLedgerEvent::Notification(UiNotification::EnvelopeV2(_))
         ));
     }
 
@@ -4339,6 +4786,9 @@ mod tests {
         let line = legacy_envelope_tagged_record_line(&event, 1);
         let record = parse_ledger_disk_record(&line)
             .unwrap_or_else(|e| panic!("legacy envelope-tagged record MUST deserialize: {e}"));
+        let ParsedLedgerDiskRecord::Record(record) = record else {
+            panic!("legacy envelope-tagged record must remain a canonical record");
+        };
         assert_eq!(
             record.event, event,
             "legacy record must decode to the same variant"
@@ -4373,6 +4823,9 @@ mod tests {
         let line = legacy_envelope_tagged_record_line(&event, 1);
         let record = parse_ledger_disk_record(&line)
             .unwrap_or_else(|e| panic!("legacy envelope-tagged progress MUST deserialize: {e}"));
+        let ParsedLedgerDiskRecord::Record(record) = record else {
+            panic!("legacy envelope-tagged progress must remain a canonical record");
+        };
         assert_eq!(record.event, event);
     }
 
