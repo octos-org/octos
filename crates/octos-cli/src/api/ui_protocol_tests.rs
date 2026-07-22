@@ -1762,6 +1762,7 @@ fn dispatch_probe_request(method: &str) -> RpcRequest<Value> {
             "brief": "probe peer brief",
             "session_id": session_id,
         }),
+        APPUI_METHOD_PEER_GATHER => json!({ "session_id": session_id }),
         other => panic!("missing AppUI dispatch probe params for {other}"),
     };
 
@@ -24520,4 +24521,198 @@ fn should_flush_old_window_and_oversized_new_fragment_in_order_when_task_switche
     assert_eq!(flushed[1].first_offset, 0);
     assert_eq!(flushed[1].text, big);
     assert!(!coalescer.has_pending());
+}
+
+/// #1801 v2: fleet staging (`n`), the peer-result blackboard writer, and
+/// `peer/gather` — end to end on a real profile runtime + git repo.
+#[tokio::test]
+async fn peer_fleet_result_writer_and_gather_roundtrip() {
+    let tmp = tempfile::tempdir().unwrap();
+    let profile = crate::profiles::UserProfile {
+        id: "dev".to_string(),
+        name: "Dev".to_string(),
+        enabled: true,
+        data_dir: None,
+        parent_id: None,
+        public_subdomain: None,
+        config: crate::profiles::ProfileConfig {
+            llm: Some(crate::profiles::LlmProfileConfig {
+                primary: Some(crate::profiles::LlmModelSelectionConfig {
+                    family_id: Some("openai".to_string()),
+                    model_id: Some("gpt-4o-mini".to_string()),
+                    route: Some(crate::profiles::LlmRouteConfig {
+                        route_id: None,
+                        label: None,
+                        base_url: None,
+                        api_key_env: Some("PEER_V2_TEST_KEY".to_string()),
+                        api_type: None,
+                    }),
+                    ..Default::default()
+                }),
+                fallbacks: Vec::new(),
+            }),
+            env_vars: [("PEER_V2_TEST_KEY".to_string(), "test-key".to_string())]
+                .into_iter()
+                .collect(),
+            ..Default::default()
+        },
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    };
+    let data_dir = tmp.path().join("data");
+    std::fs::create_dir_all(&data_dir).unwrap();
+    let runtime = crate::runtime::ProfileRuntime::bootstrap(
+        &profile,
+        &data_dir,
+        None,
+        crate::runtime::BootstrapRole::Serve,
+    )
+    .await
+    .expect("bootstrap dev runtime");
+    let peers_root = runtime.data_dir.join("peers");
+    let mut state = AppState::empty_for_tests();
+    state.profiles.insert("dev".to_string(), runtime);
+    let state = Arc::new(state);
+
+    let repo = tmp.path().join("project");
+    std::fs::create_dir_all(&repo).unwrap();
+    for args in [
+        vec!["init", "-q"],
+        vec![
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "user.name=t",
+            "commit",
+            "--allow-empty",
+            "-m",
+            "init",
+        ],
+    ] {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(&args)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    // Fleet of 3 with worktrees: suffixed slugs, per-peer fences, scalar
+    // fields mirror peers[0].
+    let result = raw_peer_prepare(
+        &state,
+        &RpcRequest::new(
+            "peer-fleet".to_string(),
+            APPUI_METHOD_PEER_PREPARE,
+            json!({
+                "brief": "Review the diff from three lenses.",
+                "title": "Lens Review",
+                "worktree": true,
+                "n": 3,
+                "cwd": repo.to_string_lossy(),
+                "profile_id": "dev",
+            }),
+        ),
+        None,
+    )
+    .await
+    .expect("fleet prepare");
+    let peers = result["peers"].as_array().expect("peers array");
+    assert_eq!(peers.len(), 3);
+    assert_eq!(peers[0]["slug"], "lens-review");
+    assert_eq!(peers[1]["slug"], "lens-review-2");
+    assert_eq!(peers[2]["slug"], "lens-review-3");
+    assert_eq!(result["slug"], peers[0]["slug"], "scalars mirror peers[0]");
+    for peer in peers {
+        let cwd = std::path::PathBuf::from(peer["cwd"].as_str().unwrap());
+        assert!(cwd.join(".git").exists(), "each fleet member gets a fence");
+    }
+
+    // n out of range refused.
+    let err = raw_peer_prepare(
+        &state,
+        &RpcRequest::new(
+            "peer-n0".to_string(),
+            APPUI_METHOD_PEER_PREPARE,
+            json!({ "brief": "x", "n": 0, "cwd": repo.to_string_lossy(), "profile_id": "dev" }),
+        ),
+        None,
+    )
+    .await
+    .expect_err("n=0 refused");
+    assert!(err.message.contains("between 1 and 8"));
+
+    // Result writer: a peer-topic session with a staged dir gets result.md;
+    // an unstaged peer topic writes nothing (no dir creation).
+    let peer_key =
+        octos_core::SessionKey::with_profile_topic("dev", "local", "tui", "peer-lens-review-2");
+    write_peer_result_if_peer_session(&state, &peer_key, "completed", "All three lenses agree.");
+    let written =
+        std::fs::read_to_string(peers_root.join("lens-review-2").join("result.md")).unwrap();
+    assert!(written.contains("status: completed"));
+    assert!(written.contains("All three lenses agree."));
+    let ghost_key =
+        octos_core::SessionKey::with_profile_topic("dev", "local", "tui", "peer-never-staged");
+    write_peer_result_if_peer_session(&state, &ghost_key, "completed", "ghost");
+    assert!(
+        !peers_root.join("never-staged").exists(),
+        "an unstaged peer topic must not create directories"
+    );
+    // A non-peer topic is a no-op.
+    let coding_key = octos_core::SessionKey::with_profile_topic("dev", "local", "tui", "coding");
+    write_peer_result_if_peer_session(&state, &coding_key, "completed", "not a peer");
+
+    // Overwrite = latest state.
+    write_peer_result_if_peer_session(&state, &peer_key, "error", "second turn failed");
+    let rewritten =
+        std::fs::read_to_string(peers_root.join("lens-review-2").join("result.md")).unwrap();
+    assert!(rewritten.contains("status: error"));
+    assert!(!rewritten.contains("All three lenses agree."));
+
+    // Gather: all peers, brief always present, result only where written,
+    // slugs filter narrows.
+    let gathered = raw_peer_gather(
+        &state,
+        &RpcRequest::new(
+            "peer-gather".to_string(),
+            APPUI_METHOD_PEER_GATHER,
+            json!({ "profile_id": "dev" }),
+        ),
+        None,
+    )
+    .expect("gather");
+    let rows = gathered["peers"].as_array().expect("peers");
+    assert_eq!(rows.len(), 3);
+    let with_result: Vec<_> = rows.iter().filter(|row| !row["result"].is_null()).collect();
+    assert_eq!(with_result.len(), 1);
+    assert_eq!(with_result[0]["slug"], "lens-review-2");
+    assert!(
+        with_result[0]["result"]
+            .as_str()
+            .unwrap()
+            .contains("second turn failed")
+    );
+    assert!(with_result[0]["result_updated_unix"].as_u64().is_some());
+    for row in rows {
+        assert!(row["brief"].as_str().unwrap().contains("three lenses"));
+        assert_eq!(row["has_worktree"], true);
+    }
+    let filtered = raw_peer_gather(
+        &state,
+        &RpcRequest::new(
+            "peer-gather-2".to_string(),
+            APPUI_METHOD_PEER_GATHER,
+            json!({ "profile_id": "dev", "slugs": ["lens-review-3"] }),
+        ),
+        None,
+    )
+    .expect("filtered gather");
+    let rows = filtered["peers"].as_array().unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["slug"], "lens-review-3");
 }

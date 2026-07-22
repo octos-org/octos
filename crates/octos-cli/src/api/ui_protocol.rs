@@ -222,6 +222,12 @@ const APPUI_METHOD_SNAPSHOT_RESTORE: &str = "snapshot/restore";
 /// returned cwd/topic, so the peer is an ordinary sovereign session whose
 /// contract survives on disk (reviewable, diffable, respawnable).
 const APPUI_METHOD_PEER_PREPARE: &str = "peer/prepare";
+/// `peer/gather` (#1801 v2): read the profile's peer blackboard — every
+/// staged peer's brief + latest result file (written on the peer's turn
+/// terminals). The manual fan-in: `/gather` composes these into the caller's
+/// session. Read-only; results survive client crashes/reconnects because
+/// they are files, not connection state.
+const APPUI_METHOD_PEER_GATHER: &str = "peer/gather";
 const APPUI_METHOD_PROFILE_SKILLS_LIST: &str = "profile/skills/list";
 const APPUI_METHOD_PROFILE_SKILLS_REGISTRY_SEARCH: &str = "profile/skills/registry/search";
 const APPUI_METHOD_PROFILE_SKILLS_INSTALL: &str = "profile/skills/install";
@@ -295,6 +301,7 @@ const APPUI_EXTRA_METHODS: &[&str] = &[
     APPUI_METHOD_SNAPSHOT_LIST,
     APPUI_METHOD_SNAPSHOT_RESTORE,
     APPUI_METHOD_PEER_PREPARE,
+    APPUI_METHOD_PEER_GATHER,
     APPUI_METHOD_PROFILE_SKILLS_LIST,
     APPUI_METHOD_PROFILE_SKILLS_REGISTRY_SEARCH,
     APPUI_METHOD_PROFILE_SKILLS_INSTALL,
@@ -9525,6 +9532,12 @@ async fn raw_snapshot_restore(
 struct RawPeerPrepareParams {
     /// The durable task contract for the peer session.
     brief: String,
+    /// Fleet size (#1801 v2): stage N peers from ONE brief (identical brief
+    /// files, suffixed slugs, per-peer worktrees when `worktree`). The
+    /// client varies each kickoff (lens/index) — reproducible spawn
+    /// conditions are the point of a shared brief. Default 1, max 8.
+    #[serde(default)]
+    n: Option<u32>,
     /// Optional human title — seeds the slug (else the brief's first words).
     #[serde(default)]
     title: Option<String>,
@@ -9670,80 +9683,278 @@ async fn raw_peer_prepare(
                 .join(" ")
         });
     let peers_root = runtime.data_dir.join("peers");
-    let (slug, peer_dir) = reserve_peer_dir(&peers_root, &seed)?;
-
-    // The fence: a worktree on branch `peer/<slug>` under the peer dir. Git
-    // work is blocking; keep it off the reactor. On failure the reserved dir
-    // is removed so the slug is not burned.
-    let peer_cwd = if params.worktree {
-        let worktree_path = peer_dir.join("wt");
-        let branch = format!("peer/{slug}");
-        let root = workspace_root.clone();
-        let target = worktree_path.clone();
-        let branch_arg = branch.clone();
-        let output = tokio::task::spawn_blocking(move || {
-            std::process::Command::new("git")
-                .arg("-C")
-                .arg(&root)
-                .arg("worktree")
-                .arg("add")
-                .arg("-b")
-                .arg(&branch_arg)
-                .arg(&target)
-                .output()
-        })
-        .await
-        .map_err(|err| RpcError::internal_error(format!("worktree task failed: {err}")))?
-        .map_err(|err| RpcError::invalid_params(format!("failed to run git: {err}")))?;
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-            let _ = std::fs::remove_dir_all(&peer_dir);
-            // Best-effort git-side cleanup (K3 review): old-git orderings can
-            // leave a dangling `peer/<slug>` branch or worktree metadata
-            // behind a failed add (modern git creates the branch last, so
-            // both are usually no-ops). Never surfaces its own errors — the
-            // add failure below is the actionable one.
-            let root = workspace_root.clone();
-            let _ = tokio::task::spawn_blocking(move || {
-                let _ = std::process::Command::new("git")
-                    .arg("-C")
-                    .arg(&root)
-                    .args(["worktree", "prune"])
-                    .output();
-                let _ = std::process::Command::new("git")
-                    .arg("-C")
-                    .arg(&root)
-                    .args(["branch", "-D", &branch])
-                    .output();
-            })
-            .await;
-            return Err(RpcError::invalid_params(format!(
-                "git worktree add failed (is {} a git repo?): {}",
-                workspace_root.display(),
-                stderr
-            )));
-        }
-        worktree_path
-    } else {
-        workspace_root.clone()
-    };
-
-    let brief_path = peer_dir.join("brief.md");
-    if let Err(err) = crate::memory_consolidate::apply::atomic_write(&brief_path, brief) {
-        let _ = std::fs::remove_dir_all(&peer_dir);
-        return Err(RpcError::internal_error(format!(
-            "failed to write brief: {err}"
-        )));
+    let n = params.n.unwrap_or(1);
+    if !(1..=8).contains(&n) {
+        return Err(RpcError::invalid_params("n must be between 1 and 8"));
     }
 
-    Ok(json!({
-        "slug": slug,
-        "topic": format!("peer-{slug}"),
-        "brief_path": brief_path.to_string_lossy(),
-        "cwd": peer_cwd.to_string_lossy(),
-        "worktree_branch": params.worktree.then(|| format!("peer/{slug}")),
-        "profile_id": profile_id,
-    }))
+    // Fleet staging is ALL-OR-NOTHING: reserve every slug up front (create_dir
+    // is the atomic claim), then fence + write briefs; any failure rolls back
+    // every staged dir and (best-effort) any git-side leavings so no slug or
+    // branch is burned by a half-staged fleet.
+    let mut staged: Vec<(String, PathBuf)> = Vec::new();
+    for _ in 0..n {
+        match reserve_peer_dir(&peers_root, &seed) {
+            Ok(pair) => staged.push(pair),
+            Err(err) => {
+                cleanup_staged_peers(&workspace_root, &staged).await;
+                return Err(err);
+            }
+        }
+    }
+
+    let mut entries: Vec<Value> = Vec::new();
+    for (slug, peer_dir) in &staged {
+        // The fence: a worktree on branch `peer/<slug>` under the peer dir.
+        // Git work is blocking; keep it off the reactor.
+        let peer_cwd = if params.worktree {
+            let worktree_path = peer_dir.join("wt");
+            let branch = format!("peer/{slug}");
+            let root = workspace_root.clone();
+            let target = worktree_path.clone();
+            let branch_arg = branch.clone();
+            let output = tokio::task::spawn_blocking(move || {
+                std::process::Command::new("git")
+                    .arg("-C")
+                    .arg(&root)
+                    .arg("worktree")
+                    .arg("add")
+                    .arg("-b")
+                    .arg(&branch_arg)
+                    .arg(&target)
+                    .output()
+            })
+            .await
+            .map_err(|err| RpcError::internal_error(format!("worktree task failed: {err}")));
+            let output = match output.and_then(|inner| {
+                inner.map_err(|err| RpcError::invalid_params(format!("failed to run git: {err}")))
+            }) {
+                Ok(output) => output,
+                Err(err) => {
+                    cleanup_staged_peers(&workspace_root, &staged).await;
+                    return Err(err);
+                }
+            };
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+                cleanup_staged_peers(&workspace_root, &staged).await;
+                return Err(RpcError::invalid_params(format!(
+                    "git worktree add failed (is {} a git repo?): {}",
+                    workspace_root.display(),
+                    stderr
+                )));
+            }
+            worktree_path
+        } else {
+            workspace_root.clone()
+        };
+
+        let brief_path = peer_dir.join("brief.md");
+        if let Err(err) = crate::memory_consolidate::apply::atomic_write(&brief_path, brief) {
+            cleanup_staged_peers(&workspace_root, &staged).await;
+            return Err(RpcError::internal_error(format!(
+                "failed to write brief: {err}"
+            )));
+        }
+
+        entries.push(json!({
+            "slug": slug,
+            "topic": format!("peer-{slug}"),
+            "brief_path": brief_path.to_string_lossy(),
+            "cwd": peer_cwd.to_string_lossy(),
+            "worktree_branch": params.worktree.then(|| format!("peer/{slug}")),
+            "profile_id": profile_id.clone(),
+        }));
+    }
+
+    // Scalar fields mirror the FIRST peer (the n=1 shape older clients read);
+    // `peers` carries the whole fleet.
+    let mut result = entries[0].as_object().cloned().unwrap_or_default();
+    result.insert("peers".into(), Value::Array(entries));
+    Ok(Value::Object(result))
+}
+
+/// Roll back a half-staged peer fleet: remove every reserved dir, then
+/// best-effort `git worktree prune` + `branch -D peer/<slug>` for each (a
+/// worktree that WAS created for an earlier fleet member must not leak when
+/// a later member fails; both are no-ops for members that never got one).
+async fn cleanup_staged_peers(workspace_root: &Path, staged: &[(String, PathBuf)]) {
+    for (_, dir) in staged {
+        let _ = std::fs::remove_dir_all(dir);
+    }
+    if staged.is_empty() {
+        return;
+    }
+    let root = workspace_root.to_path_buf();
+    let branches: Vec<String> = staged
+        .iter()
+        .map(|(slug, _)| format!("peer/{slug}"))
+        .collect();
+    let _ = tokio::task::spawn_blocking(move || {
+        let _ = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&root)
+            .args(["worktree", "prune"])
+            .output();
+        for branch in &branches {
+            let _ = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&root)
+                .args(["branch", "-D", branch])
+                .output();
+        }
+    })
+    .await;
+}
+
+/// #1801 v2: peer sessions leave a durable result on the blackboard — a
+/// `result.md` beside the brief, overwritten on every turn terminal (latest
+/// state). Files, not connection state: `/gather`, the future mailbox, and
+/// post-mortems all survive client crashes, reconnects, and limit outages.
+/// Only a session whose topic is `peer-<slug>` AND whose staged dir exists
+/// gets a write — an unstaged `peer-` topic must not create directories.
+fn write_peer_result_if_peer_session(
+    state: &Arc<AppState>,
+    session_id: &SessionKey,
+    status: &str,
+    content: &str,
+) {
+    let Some(slug) = session_id
+        .topic()
+        .and_then(|topic| topic.strip_prefix("peer-"))
+    else {
+        return;
+    };
+    let Some(profile_id) = session_id.profile_id() else {
+        return;
+    };
+    let Some(runtime) = state.profiles.get(profile_id) else {
+        return;
+    };
+    let peer_dir = runtime.data_dir.join("peers").join(slug);
+    if !peer_dir.is_dir() {
+        return;
+    }
+    const PEER_RESULT_MAX_BYTES: usize = 256 * 1024;
+    let mut body = content;
+    let mut truncated = "";
+    if body.len() > PEER_RESULT_MAX_BYTES {
+        let mut cut = PEER_RESULT_MAX_BYTES;
+        while cut > 0 && !body.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        body = &body[..cut];
+        truncated = "\n\n[truncated]";
+    }
+    let updated_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or(0);
+    let text = format!(
+        "---\nslug: {slug}\nstatus: {status}\nupdated_unix: {updated_unix}\n---\n\n{body}{truncated}\n"
+    );
+    if let Err(err) =
+        crate::memory_consolidate::apply::atomic_write(&peer_dir.join("result.md"), &text)
+    {
+        tracing::warn!(?err, slug, "failed to write peer result");
+    }
+}
+
+/// Cap a string at `cap` bytes on a char boundary; returns (text, truncated).
+fn capped_utf8(text: String, cap: usize) -> (String, bool) {
+    if text.len() <= cap {
+        return (text, false);
+    }
+    let mut cut = cap;
+    while cut > 0 && !text.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    let mut text = text;
+    text.truncate(cut);
+    (text, true)
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct RawPeerGatherParams {
+    /// Restrict to these slugs; omitted = every staged peer.
+    #[serde(default)]
+    slugs: Option<Vec<String>>,
+    #[serde(default)]
+    session_id: Option<SessionKey>,
+    #[serde(default)]
+    profile_id: Option<String>,
+}
+
+const PEER_GATHER_BRIEF_CAP: usize = 16 * 1024;
+const PEER_GATHER_RESULT_CAP: usize = 48 * 1024;
+
+/// `peer/gather` (#1801 v2): the profile's peer blackboard — per staged peer
+/// its brief + latest result file (if any turn has terminated). Read-only.
+fn raw_peer_gather(
+    state: &Arc<AppState>,
+    request: &RpcRequest<Value>,
+    connection_profile_id: Option<&str>,
+) -> Result<Value, RpcError> {
+    let params: RawPeerGatherParams = parse_optional_raw_params(request)?;
+    let profile_id = raw_scoped_llm_profile_id(
+        params.profile_id.clone(),
+        params.session_id.as_ref(),
+        connection_profile_id,
+    )?;
+    let Some(runtime) = state.profiles.get(&profile_id) else {
+        return Err(RpcError::invalid_params(format!(
+            "profile {profile_id} has no bootstrapped runtime"
+        )));
+    };
+    let peers_root = runtime.data_dir.join("peers");
+    let mut peers: Vec<Value> = Vec::new();
+    if let Ok(read_dir) = std::fs::read_dir(&peers_root) {
+        let mut dirs: Vec<_> = read_dir
+            .flatten()
+            .filter(|entry| entry.path().is_dir())
+            .collect();
+        dirs.sort_by_key(|entry| entry.file_name());
+        for entry in dirs {
+            let slug = entry.file_name().to_string_lossy().into_owned();
+            if let Some(filter) = params.slugs.as_ref() {
+                if !filter.iter().any(|wanted| wanted == &slug) {
+                    continue;
+                }
+            }
+            let dir = entry.path();
+            // Only staged peers (a brief is the staging contract) — stray
+            // dirs under peers/ are not part of the blackboard.
+            let Ok(brief) = std::fs::read_to_string(dir.join("brief.md")) else {
+                continue;
+            };
+            let result_path = dir.join("result.md");
+            let result = std::fs::read_to_string(&result_path).ok();
+            let result_updated_unix = std::fs::metadata(&result_path)
+                .ok()
+                .and_then(|meta| meta.modified().ok())
+                .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|elapsed| elapsed.as_secs());
+            let (brief, brief_truncated) = capped_utf8(brief, PEER_GATHER_BRIEF_CAP);
+            let (result, result_truncated) = match result {
+                Some(result) => {
+                    let (capped, truncated) = capped_utf8(result, PEER_GATHER_RESULT_CAP);
+                    (Some(capped), truncated)
+                }
+                None => (None, false),
+            };
+            peers.push(json!({
+                "slug": slug,
+                "topic": format!("peer-{slug}"),
+                "brief": brief,
+                "brief_truncated": brief_truncated,
+                "result": result,
+                "result_truncated": result_truncated,
+                "result_updated_unix": result_updated_unix,
+                "has_worktree": dir.join("wt").is_dir(),
+            }));
+        }
+    }
+    Ok(json!({ "profile_id": profile_id, "peers": peers }))
 }
 
 /// Serializes profile `sub_providers` read-modify-write across concurrent
@@ -10362,6 +10573,7 @@ async fn handle_raw_appui_rpc(
             raw_snapshot_restore(state, request, connection_profile_id).await
         }
         APPUI_METHOD_PEER_PREPARE => raw_peer_prepare(state, request, connection_profile_id).await,
+        APPUI_METHOD_PEER_GATHER => raw_peer_gather(state, request, connection_profile_id),
         APPUI_METHOD_PROFILE_SKILLS_LIST => {
             raw_profile_skills_list(state, request, connection_profile_id)
         }
@@ -10741,6 +10953,7 @@ fn raw_method_is_dispatched(method: &str, stdio_transport: bool) -> bool {
             | APPUI_METHOD_SNAPSHOT_LIST
             | APPUI_METHOD_SNAPSHOT_RESTORE
             | APPUI_METHOD_PEER_PREPARE
+            | APPUI_METHOD_PEER_GATHER
             | APPUI_METHOD_PROFILE_SKILLS_LIST
             | APPUI_METHOD_PROFILE_SKILLS_REGISTRY_SEARCH
             | APPUI_METHOD_PROFILE_SKILLS_INSTALL
@@ -24544,6 +24757,14 @@ async fn run_standalone_turn(
                     tokens_out: Some(u32::try_from(tokens_out).unwrap_or(u32::MAX)),
                     session_result,
                 };
+                // #1801 v2: a peer session's terminal leaves its result on
+                // the blackboard (result.md beside the brief).
+                write_peer_result_if_peer_session(
+                    &state,
+                    &session_id,
+                    "completed",
+                    event.get("content").and_then(Value::as_str).unwrap_or(""),
+                );
                 // FIX-04: flush any accumulated drops before the lifecycle
                 // terminal so the client knows the cursor is incomplete.
                 flush_replay_lossy(&ws, &ledger, &session_id, &progress_dropped);
@@ -24597,6 +24818,7 @@ async fn run_standalone_turn(
                     }
                     None => ("runtime_error", message),
                 };
+                write_peer_result_if_peer_session(&state, &session_id, "error", &wire_msg);
                 flush_replay_lossy(&ws, &ledger, &session_id, &progress_dropped);
                 try_emit_terminal(
                     &turn_state,

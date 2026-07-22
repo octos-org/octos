@@ -451,7 +451,13 @@ Runtime, auth, profile, and onboarding inspection (server-handled
   creates a fenced git worktree on branch `peer/<slug>`; returns
   `{slug, topic, brief_path, cwd, worktree_branch?, profile_id}`. Pure
   resource staging — the client then opens the peer session and starts the
-  kickoff turn through the ordinary `session/open` + `turn/start`)
+  kickoff turn through the ordinary `session/open` + `turn/start`; #1801 v2
+  adds `n` (1..=8) for fleet staging — N suffixed slugs from ONE brief, the
+  scalar result fields mirror the first peer and `peers: [...]` carries all)
+- `peer/gather` (#1801 v2 blackboard read: per staged peer its brief + the
+  latest `result.md` — written server-side on every peer-session turn
+  terminal — with per-field truncation flags and `result_updated_unix`;
+  optional `slugs` filter)
 - `profile/skills/list`, `profile/skills/registry/search`,
   `profile/skills/install`, `profile/skills/remove` (server-handled skills
   management)
