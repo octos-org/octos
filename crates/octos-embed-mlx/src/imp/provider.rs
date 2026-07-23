@@ -62,6 +62,11 @@ impl MlxEmbedder {
         self.native_dim
     }
 
+    /// The active output dimension (== [`EmbeddingProvider::dimension`]).
+    pub fn output_dim(&self) -> usize {
+        self.output_dim
+    }
+
     /// Embed a batch with an explicit role (`is_query`), returning MRL-truncated
     /// (and renormalized) vectors of length [`Self::dimension`].
     pub fn embed_texts(&self, texts: &[&str], is_query: bool) -> Result<Vec<Vec<f32>>> {

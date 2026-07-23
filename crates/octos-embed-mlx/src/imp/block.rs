@@ -51,7 +51,9 @@ impl Block {
     pub fn forward(&self, x: &Array) -> Result<Array> {
         let r = self.attn.forward(&self.input_layernorm.forward(x)?)?;
         let h = clip_residual(x, &self.post_attention_layernorm.forward(&r)?)?;
-        let r = self.mlp.forward(&self.pre_feedforward_layernorm.forward(&h)?)?;
+        let r = self
+            .mlp
+            .forward(&self.pre_feedforward_layernorm.forward(&h)?)?;
         clip_residual(&h, &self.post_feedforward_layernorm.forward(&r)?)
     }
 }
@@ -67,7 +69,12 @@ fn clip_residual(x: &Array, y: &Array) -> Result<Array> {
         return Ok(x.add(y)?);
     }
     let bound = 65504.0_f32; // f16::MAX
-    let sum = x.as_dtype(Dtype::Float32)?.add(&y.as_dtype(Dtype::Float32)?)?;
-    let clipped = minimum(&maximum(&sum, &Array::from_f32(-bound))?, &Array::from_f32(bound))?;
+    let sum = x
+        .as_dtype(Dtype::Float32)?
+        .add(&y.as_dtype(Dtype::Float32)?)?;
+    let clipped = minimum(
+        &maximum(&sum, Array::from_f32(-bound))?,
+        Array::from_f32(bound),
+    )?;
     Ok(clipped.as_dtype(Dtype::Float16)?)
 }

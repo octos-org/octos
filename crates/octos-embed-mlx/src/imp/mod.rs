@@ -19,3 +19,15 @@ pub use provider::MlxEmbedder;
 pub use config::GemmaConfig;
 pub use model::GemmaModel;
 pub use tokenizer::{DOC_PROMPT, GemmaTokenizer, QUERY_PROMPT};
+
+/// Pin MLX's default compute device to the CPU (for the CPU latency benchmark).
+#[doc(hidden)]
+pub fn set_default_device_cpu() {
+    mlx_rs::Device::set_default(&mlx_rs::Device::cpu());
+}
+
+/// Pin MLX's default compute device back to the GPU (Metal).
+#[doc(hidden)]
+pub fn set_default_device_gpu() {
+    mlx_rs::Device::set_default(&mlx_rs::Device::gpu());
+}

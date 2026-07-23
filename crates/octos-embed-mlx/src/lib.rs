@@ -27,4 +27,7 @@ pub use imp::MlxEmbedder;
 // integration tests can tap per-stage activations. Not part of the stable API.
 #[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "embed-mlx"))]
 #[doc(hidden)]
-pub use imp::{DOC_PROMPT, GemmaConfig, GemmaModel, GemmaTokenizer, QUERY_PROMPT};
+pub use imp::{
+    DOC_PROMPT, GemmaConfig, GemmaModel, GemmaTokenizer, QUERY_PROMPT, set_default_device_cpu,
+    set_default_device_gpu,
+};

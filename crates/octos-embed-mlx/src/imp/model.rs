@@ -145,7 +145,7 @@ impl GemmaModel {
 /// L2-normalize along the last axis with eps=1e-9 (matches `normalize_embeddings`).
 fn l2_normalize(x: &Array) -> Result<Array> {
     let norm = x.square()?.sum_axes(&[-1], true)?.sqrt()?;
-    let denom = maximum(&norm, &Array::from_f32(1e-9))?;
+    let denom = maximum(&norm, Array::from_f32(1e-9))?;
     Ok(x.divide(&denom)?)
 }
 
