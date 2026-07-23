@@ -1,0 +1,35 @@
+[package]
+name = "octos-embed-mlx"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "In-process EmbeddingGemma-300M embedding provider on Apple MLX (mlx-rs / Metal)."
+
+[lints]
+workspace = true
+
+[features]
+# Off by default. Enabling pulls the Apple-only mlx-rs/mlx-sys stack, so this is
+# only buildable on macOS + aarch64. `cargo build --workspace` (no feature) stays
+# pure-Rust on every platform because the heavy deps are BOTH optional and
+# target-gated below.
+embed-mlx = ["dep:mlx-rs", "dep:tokenizers", "dep:serde", "dep:serde_json"]
+
+[dependencies]
+eyre = { workspace = true }
+async-trait = { workspace = true }
+octos-llm = { workspace = true }
+
+# Apple-only, and only when `embed-mlx` is enabled. The target gate means a
+# Linux/Windows `--workspace` build never even sees mlx-sys.
+[target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.dependencies]
+mlx-rs = { version = "0.25", optional = true, features = ["metal", "accelerate", "safetensors"] }
+tokenizers = { version = "0.21", optional = true, default-features = false, features = ["onig"] }
+serde = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
+
+[dev-dependencies]
+serde_json.workspace = true
