@@ -1813,6 +1813,44 @@ pub(crate) fn resolve_provider_policy(
 /// Create an embedding provider from config, if configured.
 pub(crate) fn create_embedder(config: &Config) -> Option<Arc<dyn EmbeddingProvider>> {
     let cfg = config.embedding.as_ref()?;
+
+    // In-process MLX EmbeddingGemma provider (Apple Silicon, feature `embed-mlx`).
+    // `provider = "mlx"` + `model_path = "<dir>"` builds an `MlxEmbedder`; the
+    // optional `dimensions` truncates the output via Matryoshka (MRL).
+    if cfg.provider.eq_ignore_ascii_case("mlx") {
+        #[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "embed-mlx"))]
+        {
+            let path = cfg.model_path.as_deref().or(cfg.model.as_deref());
+            let Some(path) = path else {
+                tracing::error!(
+                    "embedding.provider=\"mlx\" requires `model_path` (the local model dir)"
+                );
+                return None;
+            };
+            match octos_embed_mlx::MlxEmbedder::from_model_dir(path) {
+                Ok(mut e) => {
+                    if let Some(d) = cfg.dimensions {
+                        e = e.with_output_dim(d as usize);
+                    }
+                    tracing::info!(model_path = %path, "loaded in-process MLX embedder");
+                    return Some(Arc::new(e));
+                }
+                Err(err) => {
+                    tracing::error!(%err, model_path = %path, "failed to load MLX embedder");
+                    return None;
+                }
+            }
+        }
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64", feature = "embed-mlx")))]
+        {
+            tracing::warn!(
+                "embedding.provider=\"mlx\" needs an Apple-Silicon build with \
+                 `--features embed-mlx`; ignoring and disabling embeddings"
+            );
+            return None;
+        }
+    }
+
     // `api_key_env` was declared on EmbeddingConfig but never honored —
     // it wins over the provider-default var name, resolving through the
     // SAME credential chain as every other key (auth store, env_vars +

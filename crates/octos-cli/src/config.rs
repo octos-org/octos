@@ -614,6 +614,13 @@ pub struct EmbeddingConfig {
     /// output differs or its vectors are dropped to BM25-only.
     #[serde(default)]
     pub dimensions: Option<u32>,
+
+    /// Local model directory for the in-process `mlx` provider (feature
+    /// `embed-mlx`, Apple Silicon only). Must contain `config.json`,
+    /// `model.safetensors` and `tokenizer.json` (e.g. a HuggingFace snapshot of
+    /// `mlx-community/embeddinggemma-300m-8bit`). Ignored by other providers.
+    #[serde(default)]
+    pub model_path: Option<String>,
 }
 
 fn default_embedding_provider() -> String {

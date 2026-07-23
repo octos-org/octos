@@ -124,11 +124,21 @@ rustix = { version = "1.1", features = ["fs"] }
 [target.'cfg(target_os = "macos")'.dependencies]
 keyring = { workspace = true, features = ["apple-native"] }
 
+# In-process MLX EmbeddingGemma provider — Apple-Silicon only, and only pulled
+# in when the `embed-mlx` feature is enabled (it drags in mlx-sys/Metal FFI).
+# Target-gated so non-Apple `--workspace` builds never see it.
+[target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.dependencies]
+octos-embed-mlx = { workspace = true, optional = true }
+
 [target.'cfg(windows)'.dependencies]
 keyring = { workspace = true, features = ["windows-native"] }
 
 [features]
 default = []
+# In-process MLX EmbeddingGemma embedding provider (Apple Silicon only). Wires
+# `embedding.provider = "mlx"` in create_embedder. The `octos-embed-mlx` dep is
+# target-gated to macOS/aarch64, so this feature is a no-op elsewhere.
+embed-mlx = ["dep:octos-embed-mlx", "octos-embed-mlx/embed-mlx"]
 # `matrix` is pulled in unconditionally: the `/api/my/profile/matrix/*`
 # handlers and the admin dashboard's Matrix invite UI reference matrix-only
 # types (e.g. `octos_bus::MatrixInviteStore`), so the API cannot compile

@@ -4753,6 +4753,7 @@ dependencies = [
  "octos-bus",
  "octos-core",
  "octos-diagnostics",
+ "octos-embed-mlx",
  "octos-llm",
  "octos-memory",
  "octos-pipeline",

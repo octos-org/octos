@@ -60,6 +60,7 @@ octos-services = { path = "crates/octos-services" }
 octos-pipeline = { path = "crates/octos-pipeline" }
 octos-plugin = { path = "crates/octos-plugin" }
 octos-swarm = { path = "crates/octos-swarm" }
+octos-embed-mlx = { path = "crates/octos-embed-mlx" }
 
 # codex-rs crates (reused)
 codex-execpolicy = { git = "https://github.com/openai/codex", path = "codex-rs/execpolicy" }
