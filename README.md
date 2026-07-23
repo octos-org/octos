@@ -86,7 +86,7 @@ Most agentic systems are single-tenant chat assistants — one user, one model, 
 - **API-first Agentic OS**: 80+ REST endpoints (chat, sessions, admin, profiles, skills, swarm, pipeline, metrics, webhooks) plus **UI Protocol v1** — a JSON-RPC contract over WebSocket and stdio for interactive clients. Any frontend — web, mobile, CLI, CI/CD — can be built on top.
 - **Multi-tenant by design**: One 31MB binary serves 200+ profiles on a 16GB machine. Each profile is a separate OS process with isolated memory, sessions, and data. Family Plan sub-accounts.
 - **Multi-LLM DOT pipelines**: Define workflows as DOT graphs. Per-node model selection. Dynamic parallel fan-out spawns N concurrent workers at runtime, with bounded concurrency for fleet stability.
-- **Swarm dispatcher**: Fan contracts to N sub-agents, aggregate artifacts, gate through validator, roll up cost — wired into `/api/swarm/dispatch`.
+- **Multi-agent topologies**: sub-agents (in-process children you own), peer agents (sovereign sibling sessions via `peer_handoff`/`peer_gather`), and a **swarm dispatcher** (fan contracts to N workers — native or external `claude -p`/`codex exec` — validator-gated, cost rolled up, at `/api/swarm/dispatch`). See [Agent topologies](#agent-topologies-sub-agents-peers--swarm).
 - **3-layer provider failover**: RetryProvider → ProviderChain → AdaptiveRouter. Hedge racing, lane scoring, circuit breakers.
 - **LRU tool deferral**: ~15 active tools for fast LLM reasoning, ~50 on demand. Idle tools auto-evict. `spawn_only` tools auto-redirect to background execution.
 - **5 queue modes per session**: Followup, Collect, Steer, Interrupt, Speculative — users control agent concurrency via `/queue`.
@@ -454,6 +454,71 @@ decides when to wake itself next:
 
 Loops persist across restarts (parked as paused on a solo reboot; you resume
 them explicitly), and can be paused, listed, fired now, or deleted.
+
+## Agent topologies: sub-agents, peers & swarm
+
+A single `octos chat` or session runs one agent. When work needs *several*
+agents, octos offers three relationships — they differ by **who owns whom** and
+**how results come back**:
+
+| | **Sub-agents** | **Peer agents** | **Agent swarm** |
+| --- | --- | --- | --- |
+| Relationship | hierarchical — a parent **owns** its children | lateral — **sovereign** sibling sessions | a dispatcher fans **contracts** to N workers |
+| Started by | the `spawn_agent` tool, mid-turn | `peer_handoff` stages one; the **client** opens it | `Swarm::dispatch` / `POST /api/swarm/dispatch` |
+| Live where | in-process children of the caller | independent sessions (own history, own client tab) | wherever the backend runs |
+| Results | returned to the parent (final answer only; internals stay private) | fan-in via `peer_gather` over a shared blackboard | aggregated, validator-gated, cost rolled up |
+| Workers | native octos agents | native octos sessions | native **or external CLI/MCP** agents |
+
+### Sub-agents — delegation you own
+
+A running agent calls **`spawn_agent`** (or its MCP-backed `delegate` variant)
+to hand a scoped task to a child that runs **in the same process**. The parent
+supervises the whole tree: status and token cost surface upward, cancelling the
+parent cascade-fails its live children, and each child runs in its own sandbox.
+A child's internal messages never leak back — only its final result. Spawns nest
+(bounded by a max depth). The tools sit in the default `coding` tool surface, so
+any agent with that profile can delegate; background (`spawn_only`) children run
+detached and report when done.
+
+### Peer agents — sovereign siblings
+
+Sometimes you want a *second, equal* session rather than a child — its own tab
+with its own history that a human can watch and steer. Sessions are coupled to a
+client connection, so the model can't open one itself: **`peer_handoff`** instead
+*stages* a peer server-side (a durable brief ≤ 64 KB, optionally fenced in its
+own git worktree) and the host asks your **client** to open it in the background.
+The originating agent later pulls results back with **`peer_gather`** — a shared
+blackboard where handoff fans out and gather fans in. Guardrails live at the
+serve layer: peer sessions can't themselves hand off (depth-1) and a per-turn
+handoff cap applies. This path is **opt-in** and exists only on the
+`serve`/WebSocket turn path (a client that can open sessions) — not `chat`,
+`gateway`, or ACP.
+
+### Agent swarm — a dispatcher over N workers
+
+For fan-out at scale, **`octos-swarm`** runs the PM/supervisor pattern as a
+primitive: a supervisor writes a **contract**, `Swarm::dispatch` fans it into N
+sub-contracts across a **topology** — `Parallel` (bounded concurrency),
+`Sequential` (one-at-a-time, aborts on the first terminal failure, crash/resume
+aware), `Pipeline` (output of *i* feeds *i+1*), or `Fanout` (expand a typed
+pattern, then run it parallel) — aggregates the artifacts, gates the aggregate
+through a **validator**, and rolls up cost in an idempotent redb **ledger**
+(re-dispatching the same id returns the stored result verbatim). Reachable at
+`POST /api/swarm/dispatch`. A swarm worker need **not** be a native octos agent:
+with **`--swarm-backend`**, contracts dispatch to *external* agents — an MCP
+server, or a one-shot CLI like `claude -p` / `codex exec` (`CliAgentBackend`).
+
+### "External agent" points two ways
+
+The term is directional — check who is calling whom:
+
+- **Inbound** — an outside orchestrator drives octos: a Zed/ACP client, or any
+  MCP client via `octos mcp-serve`. Octos is the *callee* (a sub-agent to someone
+  else).
+- **Outbound** — octos drives an outside agent as a **swarm worker** via
+  `--swarm-backend`. Octos is the *caller*.
+
+Same phrase, opposite arrows.
 
 ## Documentation
 
