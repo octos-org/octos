@@ -269,6 +269,32 @@ needs a **one-shot prompt** (positional *or* `-m`); only **interactive** `--json
 `--json` still prints `{"error":"…"}` on stdout and exits non-zero, so stdout stays
 machine-parseable.
 
+### Scripting: the JSON result & exit codes
+
+In `--json` mode stdout carries exactly one object (everything else — logs, the
+status line, approval prompts — goes to stderr). On success:
+
+```json
+{ "text": "…final answer…", "model": "glm-5.2", "input_tokens": 1234, "output_tokens": 567 }
+```
+
+`text` is the final assistant answer; `model` is the model that actually
+produced it (honest about adaptive failover to a fallback lane); the token
+counts cover the whole turn. On any failure the object is `{"error":"…"}`
+instead, so stdout is always parseable:
+
+```bash
+out=$(octos chat --profile dev -m "summarize the branch diff" --json)
+echo "$out" | jq -r '.text'           # the answer
+echo "$out" | jq -r '.output_tokens'  # token usage, e.g. for cost tracking
+```
+
+| Exit | Meaning |
+| --- | --- |
+| `0` | success |
+| `2` | usage error — unknown / conflicting flags, `--json` without `-m`, or the prompt given both positionally and via `-m` |
+| `1` | runtime error (auth / provider / agent). In `--json` mode `{"error":…}` is still written to stdout first, so a caller can read the reason |
+
 ### Sandbox × approval — every combination
 
 Two orthogonal axes set what the agent may do unattended: **`--sandbox`**
