@@ -10021,7 +10021,7 @@ fn build_peer_handoff_callback(
 fn write_peer_result_if_peer_session(
     state: &Arc<AppState>,
     session_id: &SessionKey,
-    status: &str,
+    outcome: TurnTerminalOutcome,
     content: &str,
 ) {
     let Some(slug) = session_id
@@ -10055,8 +10055,14 @@ fn write_peer_result_if_peer_session(
         .duration_since(std::time::UNIX_EPOCH)
         .map(|elapsed| elapsed.as_secs())
         .unwrap_or(0);
+    let outcome_str = match outcome {
+        TurnTerminalOutcome::Completed => "completed",
+        TurnTerminalOutcome::Errored => "errored",
+        TurnTerminalOutcome::Interrupted => "interrupted",
+        TurnTerminalOutcome::RateLimited => "rate_limited",
+    };
     let text = format!(
-        "---\nslug: {slug}\nstatus: {status}\nupdated_unix: {updated_unix}\n---\n\n{body}{truncated}\n"
+        "---\nslug: {slug}\noutcome: {outcome_str}\nupdated_unix: {updated_unix}\n---\n\n{body}{truncated}\n"
     );
     if let Err(err) =
         crate::memory_consolidate::apply::atomic_write(&peer_dir.join("result.md"), &text)
@@ -25565,13 +25571,14 @@ async fn run_standalone_turn(
                     tokens_in: Some(u32::try_from(tokens_in).unwrap_or(u32::MAX)),
                     tokens_out: Some(u32::try_from(tokens_out).unwrap_or(u32::MAX)),
                     session_result,
+                    outcome: Some(TurnTerminalOutcome::Completed),
                 };
                 // #1801 v2: a peer session's terminal leaves its result on
                 // the blackboard (result.md beside the brief).
                 write_peer_result_if_peer_session(
                     &state,
                     &session_id,
-                    "completed",
+                    TurnTerminalOutcome::Completed,
                     event.get("content").and_then(Value::as_str).unwrap_or(""),
                 );
                 // FIX-04: flush any accumulated drops before the lifecycle
@@ -25627,7 +25634,15 @@ async fn run_standalone_turn(
                     }
                     None => ("runtime_error", message),
                 };
-                write_peer_result_if_peer_session(&state, &session_id, "error", &wire_msg);
+                let turn_outcome = if code.contains("rate_limit") || code.contains("rate_limited")
+                    || wire_msg.contains("rate_limit") || wire_msg.contains("rate_limited")
+                    || code.contains("429") || wire_msg.contains("429")
+                {
+                    TurnTerminalOutcome::RateLimited
+                } else {
+                    TurnTerminalOutcome::Errored
+                };
+                write_peer_result_if_peer_session(&state, &session_id, turn_outcome, &wire_msg);
                 flush_replay_lossy(&ws, &ledger, &session_id, &progress_dropped);
                 try_emit_terminal(
                     &turn_state,
@@ -26734,6 +26749,7 @@ struct TurnCompletionDetails {
     tokens_in: Option<u32>,
     tokens_out: Option<u32>,
     session_result: Option<TurnSessionResult>,
+    outcome: Option<TurnTerminalOutcome>,
 }
 
 /// Atomically transition state and emit exactly one terminal event. No-op if

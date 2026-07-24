@@ -3800,6 +3800,7 @@ pub enum TurnTerminalOutcome {
     Completed,
     Errored,
     Interrupted,
+    RateLimited,
 }
 
 /// Structured error carried by an errored or interrupted v2 terminal.
