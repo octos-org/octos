@@ -148,13 +148,12 @@ const FAILOVER_PUSH_DEBOUNCE: Duration = Duration::from_secs(5);
 /// peer session actor spawns; removed on session death / deletion. The
 /// [`PeerSendInputTool`] callback reads this to deliver cross-session
 /// messages without a TUI round-trip.
-static PEER_INBOX_REGISTRY: OnceLock<
-    Arc<StdMutex<HashMap<String, mpsc::Sender<ActorMessage>>>>,
-> = OnceLock::new();
+static PEER_INBOX_REGISTRY: OnceLock<Arc<StdMutex<HashMap<String, mpsc::Sender<ActorMessage>>>>> =
+    OnceLock::new();
 
 /// Get (or init) the global peer inbox registry.
-pub fn peer_inbox_registry(
-) -> &'static Arc<StdMutex<HashMap<String, mpsc::Sender<ActorMessage>>>> {
+pub fn peer_inbox_registry() -> &'static Arc<StdMutex<HashMap<String, mpsc::Sender<ActorMessage>>>>
+{
     PEER_INBOX_REGISTRY.get_or_init(|| Arc::new(StdMutex::new(HashMap::new())))
 }
 
@@ -2574,14 +2573,8 @@ impl ActorRegistry {
             if let Some(topic) = session_key.topic() {
                 if let Some(slug) = topic.strip_prefix("peer-") {
                     let registry = peer_inbox_registry();
-                    let key = peer_inbox_key(
-                        profile_id.unwrap_or(MAIN_PROFILE_ID),
-                        slug,
-                    );
-                    registry
-                        .lock()
-                        .unwrap()
-                        .insert(key, tx.clone());
+                    let key = peer_inbox_key(profile_id.unwrap_or(MAIN_PROFILE_ID), slug);
+                    registry.lock().unwrap().insert(key, tx.clone());
                 }
             }
 

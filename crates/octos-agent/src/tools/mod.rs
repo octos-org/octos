@@ -786,9 +786,7 @@ pub use peer_gather::{PeerGatherCallback, PeerGatherTool};
 pub use peer_handoff::{
     PeerHandoffCallback, PeerHandoffRequest, PeerHandoffStaged, PeerHandoffTool,
 };
-pub use peer_send_input::{
-    PeerSendInputCallback, PeerSendInputRequest, PeerSendInputTool,
-};
+pub use peer_send_input::{PeerSendInputCallback, PeerSendInputRequest, PeerSendInputTool};
 pub use read_file::ReadFileTool;
 pub use read_task_output::ReadTaskOutputTool;
 pub use recall_memory::RecallMemoryTool;

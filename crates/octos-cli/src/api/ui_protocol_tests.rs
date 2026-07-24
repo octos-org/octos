@@ -25212,24 +25212,31 @@ async fn peer_fleet_result_writer_and_gather_roundtrip() {
     // an unstaged peer topic writes nothing (no dir creation).
     let peer_key =
         octos_core::SessionKey::with_profile_topic("dev", "local", "tui", "peer-lens-review-2");
-    write_peer_result_if_peer_session(&state, &peer_key, TurnTerminalOutcome::Completed, "All three lenses agree.");
+    write_peer_result_if_peer_session(
+        &state,
+        &peer_key,
+        TurnTerminalOutcome::Completed,
+        "All three lenses agree.",
+    );
     let written =
         std::fs::read_to_string(peers_root.join("lens-review-2").join("result.md")).unwrap();
-    assert!(written.contains("outcome: completed"), "result.md should contain outcome: completed");
+    assert!(
+        written.contains("outcome: completed"),
+        "result.md should contain outcome: completed"
+    );
     assert!(written.contains("turn: 1"), "first turn should be turn 1");
     assert!(written.contains("All three lenses agree."));
     // #435: versioned result file for historical record.
-    let versioned = std::fs::read_to_string(
-        peers_root.join("lens-review-2").join("result-1.md"),
-    )
-    .unwrap();
+    let versioned =
+        std::fs::read_to_string(peers_root.join("lens-review-2").join("result-1.md")).unwrap();
     assert!(versioned.contains("outcome: completed"));
     // #435: turns.txt index file.
-    let turns = std::fs::read_to_string(
-        peers_root.join("lens-review-2").join("turns.txt"),
-    )
-    .unwrap();
-    assert!(turns.contains("1 completed"), "turns.txt first line should be '1 completed'");
+    let turns =
+        std::fs::read_to_string(peers_root.join("lens-review-2").join("turns.txt")).unwrap();
+    assert!(
+        turns.contains("1 completed"),
+        "turns.txt first line should be '1 completed'"
+    );
     let ghost_key =
         octos_core::SessionKey::with_profile_topic("dev", "local", "tui", "peer-never-staged");
     write_peer_result_if_peer_session(&state, &ghost_key, TurnTerminalOutcome::Completed, "ghost");
@@ -25239,32 +25246,48 @@ async fn peer_fleet_result_writer_and_gather_roundtrip() {
     );
     // A non-peer topic is a no-op.
     let coding_key = octos_core::SessionKey::with_profile_topic("dev", "local", "tui", "coding");
-    write_peer_result_if_peer_session(&state, &coding_key, TurnTerminalOutcome::Completed, "not a peer");
+    write_peer_result_if_peer_session(
+        &state,
+        &coding_key,
+        TurnTerminalOutcome::Completed,
+        "not a peer",
+    );
 
     // Overwrite = latest state on result.md, versioned file for turn 2.
-    write_peer_result_if_peer_session(&state, &peer_key, TurnTerminalOutcome::Errored, "second turn failed");
+    write_peer_result_if_peer_session(
+        &state,
+        &peer_key,
+        TurnTerminalOutcome::Errored,
+        "second turn failed",
+    );
     let rewritten =
         std::fs::read_to_string(peers_root.join("lens-review-2").join("result.md")).unwrap();
     assert!(rewritten.contains("outcome: error"));
-    assert!(rewritten.contains("turn: 2"), "second turn should be turn 2");
+    assert!(
+        rewritten.contains("turn: 2"),
+        "second turn should be turn 2"
+    );
     assert!(!rewritten.contains("All three lenses agree."));
     // #435: historical copy preserved.
-    let turn1 = std::fs::read_to_string(
-        peers_root.join("lens-review-2").join("result-1.md"),
-    )
-    .unwrap();
-    assert!(turn1.contains("All three lenses agree."), "result-1.md must preserve turn 1");
-    let turn2 = std::fs::read_to_string(
-        peers_root.join("lens-review-2").join("result-2.md"),
-    )
-    .unwrap();
-    assert!(turn2.contains("second turn failed"), "result-2.md must have turn 2 result");
+    let turn1 =
+        std::fs::read_to_string(peers_root.join("lens-review-2").join("result-1.md")).unwrap();
+    assert!(
+        turn1.contains("All three lenses agree."),
+        "result-1.md must preserve turn 1"
+    );
+    let turn2 =
+        std::fs::read_to_string(peers_root.join("lens-review-2").join("result-2.md")).unwrap();
+    assert!(
+        turn2.contains("second turn failed"),
+        "result-2.md must have turn 2 result"
+    );
     // #435: turns.txt has both entries.
-    let turns = std::fs::read_to_string(
-        peers_root.join("lens-review-2").join("turns.txt"),
-    )
-    .unwrap();
-    assert!(turns.contains("1 completed"), "turns.txt must contain turn 1");
+    let turns =
+        std::fs::read_to_string(peers_root.join("lens-review-2").join("turns.txt")).unwrap();
+    assert!(
+        turns.contains("1 completed"),
+        "turns.txt must contain turn 1"
+    );
     assert!(turns.contains("2 error"), "turns.txt must contain turn 2");
 
     // Gather: all peers, brief always present, result only where written,

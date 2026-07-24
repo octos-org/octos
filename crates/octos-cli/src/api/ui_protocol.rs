@@ -70,7 +70,8 @@ use octos_core::ui_protocol::{
     progress_kinds, thread_status,
 };
 use octos_core::{
-    AgentId, InboundMessage, MAIN_PROFILE_ID, Message, MessageOrigin, MessageRole, SessionKey, TaskId,
+    AgentId, InboundMessage, MAIN_PROFILE_ID, Message, MessageOrigin, MessageRole, SessionKey,
+    TaskId,
 };
 use octos_llm::pricing::model_pricing;
 use serde::{Deserialize, Serialize};
@@ -10087,10 +10088,13 @@ fn write_peer_result_if_peer_session(
 
     // Versioned copy — historical record for multi-turn persistent peers.
     let versioned_path = peer_dir.join(format!("result-{turn_count}.md"));
-    if let Err(err) =
-        crate::memory_consolidate::apply::atomic_write(&versioned_path, &text)
-    {
-        tracing::warn!(?err, slug, turn_count, "failed to write versioned peer result");
+    if let Err(err) = crate::memory_consolidate::apply::atomic_write(&versioned_path, &text) {
+        tracing::warn!(
+            ?err,
+            slug,
+            turn_count,
+            "failed to write versioned peer result"
+        );
     }
 
     // Append to the turn index so peer_list and dashboard can discover
@@ -10114,12 +10118,7 @@ fn count_peer_result_versions(peer_dir: &std::path::Path) -> u32 {
     };
     read_dir
         .flatten()
-        .filter(|entry| {
-            entry
-                .file_name()
-                .to_string_lossy()
-                .starts_with("result-")
-        })
+        .filter(|entry| entry.file_name().to_string_lossy().starts_with("result-"))
         .count() as u32
 }
 
@@ -24076,8 +24075,8 @@ async fn run_standalone_turn(
         // inbox registry populated by ActorRegistry::dispatch.
         if peer_handoff_allowed_for_session(&session_id) {
             let send_profile_id = session_runtime.profile.profile_id.clone();
-            let send_input: octos_agent::PeerSendInputCallback = Arc::new(
-                move |req: octos_agent::PeerSendInputRequest| {
+            let send_input: octos_agent::PeerSendInputCallback =
+                Arc::new(move |req: octos_agent::PeerSendInputRequest| {
                     let registry = crate::session_actor::peer_inbox_registry();
                     let map = registry.lock().unwrap();
                     let key = format!("{}:peer:{}", send_profile_id, req.slug);
@@ -24114,8 +24113,7 @@ async fn run_standalone_turn(
                             slug = req.slug
                         )
                     })
-                },
-            );
+                });
             tool_registry.register(octos_agent::PeerSendInputTool::new(send_input));
         }
 
@@ -25768,9 +25766,12 @@ async fn run_standalone_turn(
                     }
                     None => ("runtime_error", message),
                 };
-                let turn_outcome = if code.contains("rate_limit") || code.contains("rate_limited")
-                    || wire_msg.contains("rate_limit") || wire_msg.contains("rate_limited")
-                    || code.contains("429") || wire_msg.contains("429")
+                let turn_outcome = if code.contains("rate_limit")
+                    || code.contains("rate_limited")
+                    || wire_msg.contains("rate_limit")
+                    || wire_msg.contains("rate_limited")
+                    || code.contains("429")
+                    || wire_msg.contains("429")
                 {
                     TurnTerminalOutcome::RateLimited
                 } else {
