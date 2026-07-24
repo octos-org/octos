@@ -14491,6 +14491,8 @@ async fn handle_turn_start_with_accept(
                 // #436 — regular user turns already persist their prompt
                 // (they are not internal continuations); no override needed.
                 false,
+                // #436 P1 #2 — regular turns don't gate completion on dispatch.
+                None,
             )
             .await;
         }
@@ -14906,6 +14908,12 @@ async fn maybe_spawn_appui_master_continuation_runner(
         } else {
             None
         };
+        // #436 P1 #2 — for a peer_send_input injection, track whether the turn
+        // actually dispatched the agent, so an UNDELIVERED injection (e.g. a
+        // failed `TurnStarted`) is NOT marked completed and stays durable for
+        // retry/replay. `None` for every other continuation kind (unchanged).
+        let turn_dispatched = persist_peer_input_prompt
+            .then(|| std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)));
         run_standalone_turn(
             ws_for_turn,
             state_for_turn,
@@ -14927,12 +14935,27 @@ async fn maybe_spawn_appui_master_continuation_runner(
             None,
             // #436 — persist a peer_send_input injection as a UserMessage.
             persist_peer_input_prompt,
+            turn_dispatched.clone(),
         )
         .await;
-        default_agent_orchestrator().mark_continuation_completed(
-            &continuation,
-            Some("processed_by_appui_turn_runtime".to_owned()),
-        );
+        // #436 P1 #2 — keep an undelivered peer injection durable; every other
+        // continuation keeps its unconditional completion. `None` (non-peer)
+        // counts as dispatched so the rule is a no-op there.
+        let agent_dispatched = turn_dispatched
+            .as_ref()
+            .is_none_or(|flag| flag.load(std::sync::atomic::Ordering::Acquire));
+        if continuation_may_complete(persist_peer_input_prompt, agent_dispatched) {
+            default_agent_orchestrator().mark_continuation_completed(
+                &continuation,
+                Some("processed_by_appui_turn_runtime".to_owned()),
+            );
+        } else {
+            tracing::warn!(
+                continuation_id = continuation.id.as_u64(),
+                "peer_send_input turn did not dispatch the agent; leaving the \
+                 injection durable for retry/replay"
+            );
+        }
     });
 
     btw_live_draft_clear(&session_id, &turn_id);
@@ -14975,6 +14998,31 @@ fn peer_target_deliverable_on_connection(
         .topic()
         .is_some_and(|topic| topic.starts_with("peer-"));
     !is_peer || open_sessions.contains(wire_key)
+}
+
+/// #436 P1 #3 — a peer continuation is only run by the connection-independent
+/// global drain when its target session is the slug's CURRENT registered wire.
+/// A closed peer (evicted from the registry) or an obsolete wire (superseded by
+/// a reopen the global drain raced) is skipped, so the injection is never run
+/// under a dead/obsolete session — it is re-homed and delivered when the peer
+/// reopens. Non-peer targets always pass.
+fn peer_target_is_current_wire(wire_key: &SessionKey) -> bool {
+    let Some((profile_id, slug)) = peer_slug_and_profile(wire_key) else {
+        return true;
+    };
+    peer_wire_registry()
+        .resolve(&peer_wire_key(profile_id, slug))
+        .as_ref()
+        == Some(wire_key)
+}
+
+/// #436 P1 #2 — decide whether a drained continuation may be marked completed.
+/// A `peer_send_input` injection that did NOT dispatch the agent (its turn
+/// aborted before processing — e.g. a failed `TurnStarted` delivery) must stay
+/// durable for retry/replay, so it is NOT completed. Every other continuation
+/// (and a peer injection that DID dispatch) completes normally.
+fn continuation_may_complete(is_peer_injection: bool, agent_dispatched: bool) -> bool {
+    !is_peer_injection || agent_dispatched
 }
 
 async fn drain_appui_due_master_continuations(
@@ -15283,6 +15331,12 @@ pub(crate) fn spawn_global_master_continuation_drain(state: Arc<AppState>) {
                     continue;
                 }
                 let wire_key = wire_key_from_goal_key(&storage_key);
+                // #436 P1 #3 — never run a peer injection under a closed or
+                // obsolete wire; it is delivered when the peer reopens (which
+                // re-homes it to the current wire).
+                if !peer_target_is_current_wire(&wire_key) {
+                    continue;
+                }
                 if maybe_spawn_appui_master_continuation_runner(
                     &ws,
                     &state,
@@ -23109,6 +23163,13 @@ async fn run_standalone_turn(
     // system-internal continuations (goal/loop/child/recovery), whose
     // `[system-internal]` prompt is intentionally not shown as a user row.
     persist_continuation_prompt_as_user: bool,
+    // #436 P1 #2 — set to `true` right before the agent is dispatched, so the
+    // caller can tell whether the turn ACTUALLY processed the prompt. A turn
+    // that aborts before dispatch (e.g. a failed `TurnStarted` delivery) leaves
+    // it `false`, and the continuation runner then keeps a peer_send_input
+    // injection durable for retry/replay instead of marking it completed.
+    // `None` for the regular `turn/start` path, which doesn't need the signal.
+    turn_dispatched: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 ) {
     let session_id = params.session_id.clone();
     let turn_id = params.turn_id.clone();
@@ -25057,6 +25118,13 @@ async fn run_standalone_turn(
     // client returns home after the farewell audio. `false` for text turns or
     // replies without the marker.
     let (exit_directive_tx, exit_directive_rx) = tokio::sync::oneshot::channel::<bool>();
+    // #436 P1 #2 — we are past every pre-dispatch early-return (failed
+    // `TurnStarted`, runtime-unavailable, etc.); the agent is about to process
+    // the prompt. Record that so the continuation runner knows the injection
+    // was actually consumed and may be marked completed.
+    if let Some(flag) = turn_dispatched.as_ref() {
+        flag.store(true, std::sync::atomic::Ordering::Release);
+    }
     let agent_task = tokio::spawn(async move {
         let start = std::time::Instant::now();
         // RFC-3 (#1292): wrap the agent.process_message future in the

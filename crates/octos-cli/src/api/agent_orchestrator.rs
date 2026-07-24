@@ -2459,6 +2459,20 @@ impl InProcessAgentOrchestrator {
         let mut rehomed = 0;
         for (old_key, occurrence_id, message) in stranded {
             state.continuations.cancel(&old_key);
+            // #436 P1 #3 — TOMBSTONE the old DURABLE record. `cancel` only
+            // drops the in-memory entry; `restore` re-enqueues every
+            // non-`Completed` durable record on restart, so without this the
+            // obsolete-wire injection would resurrect and re-deliver after a
+            // restart. Writing a completed event flips the persisted status so
+            // restore skips it. (No-op when there is no supervisor store.)
+            if let Some(store) = state.supervisor_store.as_ref() {
+                let _ = store.record_continuation_completed(
+                    PEER_SEND_INPUT_GROUP,
+                    old_key.as_str(),
+                    now_ms_u64(),
+                    Some("retargeted_to_reopened_peer_wire".to_owned()),
+                );
+            }
             let request = MasterContinuationRequest::new(
                 PEER_SEND_INPUT_GROUP,
                 new_session_str.clone(),
@@ -2473,8 +2487,8 @@ impl InProcessAgentOrchestrator {
             if let MasterContinuationEnqueueOutcome::Queued(cont) =
                 state.continuations.enqueue(request)
             {
-                // Already persisted once under the old key; a re-home persist
-                // failure only affects restart replay, not in-process delivery.
+                // Re-home under the new wire's key; a persist failure here only
+                // affects restart replay, not in-process delivery.
                 let _ = persist_continuation_queued_checked(&state, &cont);
                 rehomed += 1;
             }

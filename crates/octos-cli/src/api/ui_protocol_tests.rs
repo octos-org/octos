@@ -7809,6 +7809,101 @@ fn peer_wire_registry_evicts_on_close_conditionally() {
     );
 }
 
+/// #436 P1 #2 — a peer_send_input injection is completed only if its turn
+/// dispatched the agent; an undispatched one (e.g. failed `TurnStarted`) stays
+/// durable for retry/replay. Non-peer continuations always complete.
+#[test]
+fn peer_injection_completes_only_when_dispatched() {
+    assert!(
+        continuation_may_complete(true, true),
+        "a dispatched peer injection completes",
+    );
+    assert!(
+        !continuation_may_complete(true, false),
+        "an undispatched peer injection stays durable (not completed)",
+    );
+    // Non-peer continuations are unaffected — completed regardless.
+    assert!(continuation_may_complete(false, true));
+    assert!(continuation_may_complete(false, false));
+}
+
+/// #436 P1 #3 — the connection-independent global drain runs a peer injection
+/// only under the slug's CURRENT registered wire: an obsolete (superseded) or
+/// closed (evicted) wire is skipped and delivered on reopen. Non-peer targets
+/// always pass.
+#[test]
+fn global_drain_skips_obsolete_or_closed_peer_wire() {
+    let profile_id = "test-peer-freshness-gate";
+    let slug = "freshness-peer";
+    let s1 = SessionKey::with_profile_topic(profile_id, "api", "c1", &format!("peer-{slug}"));
+    let s2 = SessionKey::with_profile_topic(profile_id, "api", "c2", &format!("peer-{slug}"));
+
+    register_peer_wire_session(&s1);
+    assert!(peer_target_is_current_wire(&s1), "current wire is runnable");
+
+    // Reopen as S2 → S1 is now obsolete.
+    register_peer_wire_session(&s2);
+    assert!(
+        !peer_target_is_current_wire(&s1),
+        "an obsolete wire must be skipped by the global drain",
+    );
+    assert!(peer_target_is_current_wire(&s2), "the new wire is runnable");
+
+    // Close S2 → no current wire; skipped (delivered on reopen).
+    evict_peer_wire_session(&s2);
+    assert!(
+        !peer_target_is_current_wire(&s2),
+        "a closed peer wire must be skipped",
+    );
+
+    // Non-peer targets are never gated.
+    assert!(peer_target_is_current_wire(&SessionKey::with_profile(
+        profile_id, "api", "master"
+    )));
+}
+
+/// #436 P1 #3 — retarget TOMBSTONES the old durable record, so a restart does
+/// NOT resurrect + re-deliver the obsolete-wire injection. Simulated with two
+/// isolated orchestrators sharing one supervisor store: after retarget, a
+/// fresh orchestrator restoring the store re-enqueues exactly one injection,
+/// under the NEW wire (not the old).
+#[test]
+fn retarget_tombstones_old_durable_record_no_restart_dup() {
+    use crate::api::agent_orchestrator::{InProcessAgentOrchestrator, PeerSendInputEnqueueOutcome};
+    let dir = tempfile::tempdir().unwrap();
+    let profile_id = "tenant-a";
+    let slug = "restart-dup-peer";
+    let s1 = SessionKey::with_profile_topic(profile_id, "api", "c1", &format!("peer-{slug}"));
+    let s2 = SessionKey::with_profile_topic(profile_id, "api", "c2", &format!("peer-{slug}"));
+
+    // Pre-restart orchestrator, durably backed.
+    let orch1 = InProcessAgentOrchestrator::default();
+    orch1.configure_supervisor_store(dir.path()).unwrap();
+    let outcome =
+        orch1.enqueue_peer_send_input_continuation(&s1, profile_id, slug, "call-1", "resume");
+    assert_eq!(outcome, PeerSendInputEnqueueOutcome::Queued);
+    // Peer reopened as S2 → re-home (tombstones the old S1 durable record).
+    assert_eq!(
+        orch1.retarget_peer_send_input_continuations(profile_id, slug, &s2),
+        1,
+        "the stranded S1 injection is re-homed to S2",
+    );
+
+    // Simulate a restart: a fresh orchestrator restores from the SAME store.
+    let orch2 = InProcessAgentOrchestrator::default();
+    orch2.configure_supervisor_store(dir.path()).unwrap();
+    assert_eq!(
+        orch2.pending_continuation_count_for_session_for_test(&s1, profile_id),
+        0,
+        "the tombstoned old record must NOT be resurrected on restart",
+    );
+    assert_eq!(
+        orch2.pending_continuation_count_for_session_for_test(&s2, profile_id),
+        1,
+        "exactly one injection is restored, under the current wire",
+    );
+}
+
 /// Regression: a `mark_failed` driven by the orphan-task sweep
 /// during `enable_persistence` (`task_supervisor.rs:1164-1166`)
 /// MUST reach the recovery callback. This pins the wiring order
