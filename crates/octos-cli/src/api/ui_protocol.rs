@@ -10018,6 +10018,13 @@ fn build_peer_handoff_callback(
 /// post-mortems all survive client crashes, reconnects, and limit outages.
 /// Only a session whose topic is `peer-<slug>` AND whose staged dir exists
 /// gets a write — an unstaged `peer-` topic must not create directories.
+///
+/// #438 persistent peer sessions: peer sessions are persistent by design —
+/// they survive turn completion and only close on WebSocket disconnect
+/// (FIX-06 `evict_session` at connection-close hook, line 27850). There is
+/// no per-turn auto-close. The TUI keeps the session alive across multiple
+/// turns; this function is called at every turn terminal to update the
+/// blackboard with the latest result (and a versioned historical copy).
 fn write_peer_result_if_peer_session(
     state: &Arc<AppState>,
     session_id: &SessionKey,

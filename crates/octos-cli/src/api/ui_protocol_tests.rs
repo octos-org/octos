@@ -6834,6 +6834,7 @@ async fn try_emit_terminal_populates_turn_completed_tokens_and_session_result() 
             message_id: format!("{}:{}:{}", session_id.0, cursor.seq, 99_999),
             client_message_id: Some("cmid-user-1".into()),
         }),
+        outcome: None,
     };
 
     try_emit_terminal(
@@ -25211,7 +25212,7 @@ async fn peer_fleet_result_writer_and_gather_roundtrip() {
     // an unstaged peer topic writes nothing (no dir creation).
     let peer_key =
         octos_core::SessionKey::with_profile_topic("dev", "local", "tui", "peer-lens-review-2");
-    write_peer_result_if_peer_session(&state, &peer_key, "completed", "All three lenses agree.");
+    write_peer_result_if_peer_session(&state, &peer_key, TurnTerminalOutcome::Completed, "All three lenses agree.");
     let written =
         std::fs::read_to_string(peers_root.join("lens-review-2").join("result.md")).unwrap();
     assert!(written.contains("outcome: completed"), "result.md should contain outcome: completed");
@@ -25231,17 +25232,17 @@ async fn peer_fleet_result_writer_and_gather_roundtrip() {
     assert!(turns.contains("1 completed"), "turns.txt first line should be '1 completed'");
     let ghost_key =
         octos_core::SessionKey::with_profile_topic("dev", "local", "tui", "peer-never-staged");
-    write_peer_result_if_peer_session(&state, &ghost_key, "completed", "ghost");
+    write_peer_result_if_peer_session(&state, &ghost_key, TurnTerminalOutcome::Completed, "ghost");
     assert!(
         !peers_root.join("never-staged").exists(),
         "an unstaged peer topic must not create directories"
     );
     // A non-peer topic is a no-op.
     let coding_key = octos_core::SessionKey::with_profile_topic("dev", "local", "tui", "coding");
-    write_peer_result_if_peer_session(&state, &coding_key, "completed", "not a peer");
+    write_peer_result_if_peer_session(&state, &coding_key, TurnTerminalOutcome::Completed, "not a peer");
 
     // Overwrite = latest state on result.md, versioned file for turn 2.
-    write_peer_result_if_peer_session(&state, &peer_key, "error", "second turn failed");
+    write_peer_result_if_peer_session(&state, &peer_key, TurnTerminalOutcome::Errored, "second turn failed");
     let rewritten =
         std::fs::read_to_string(peers_root.join("lens-review-2").join("result.md")).unwrap();
     assert!(rewritten.contains("outcome: error"));
