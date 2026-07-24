@@ -70,7 +70,7 @@ use octos_core::ui_protocol::{
     progress_kinds, thread_status,
 };
 use octos_core::{
-    AgentId, InboundMessage, MAIN_PROFILE_ID, Message, MessageRole, SessionKey, TaskId,
+    AgentId, InboundMessage, MAIN_PROFILE_ID, Message, MessageOrigin, MessageRole, SessionKey, TaskId,
 };
 use octos_llm::pricing::model_pricing;
 use serde::{Deserialize, Serialize};
@@ -24061,6 +24061,55 @@ async fn run_standalone_turn(
         if peer_gather_allowed_for_session(&session_id) {
             let gather = build_peer_gather_callback(session_runtime.profile.data_dir.join("peers"));
             tool_registry.register(octos_agent::PeerGatherTool::new(gather));
+        }
+
+        // #436 — `peer_send_input`: cross-session TurnStart injection.
+        // Same depth-1 guard as peer_handoff: peer sessions cannot send input
+        // to other peers (or themselves). The callback uses the global peer
+        // inbox registry populated by ActorRegistry::dispatch.
+        if peer_handoff_allowed_for_session(&session_id) {
+            let send_profile_id = session_runtime.profile.profile_id.clone();
+            let send_input: octos_agent::PeerSendInputCallback = Arc::new(
+                move |req: octos_agent::PeerSendInputRequest| {
+                    let registry = crate::session_actor::peer_inbox_registry();
+                    let map = registry.lock().unwrap();
+                    let key = format!("{}:peer:{}", send_profile_id, req.slug);
+                    let tx = map.get(&key).ok_or_else(|| {
+                        format!(
+                            "peer session '{slug}' is not running — \
+                             it must be opened by the user first",
+                            slug = req.slug
+                        )
+                    })?;
+
+                    let inbound = InboundMessage {
+                        channel: String::new(),
+                        sender_id: String::new(),
+                        chat_id: String::new(),
+                        content: req.message,
+                        timestamp: chrono::Utc::now(),
+                        media: vec![],
+                        metadata: serde_json::json!({"origin": "peer_send_input"}),
+                        message_id: None,
+                        origin: MessageOrigin::Synthetic,
+                    };
+
+                    let actor_msg = crate::session_actor::ActorMessage::Inbound {
+                        message: inbound,
+                        image_media: vec![],
+                        attachment_media: vec![],
+                        attachment_prompt: None,
+                    };
+
+                    tx.try_send(actor_msg).map_err(|e| {
+                        format!(
+                            "peer session '{slug}' inbox is full or closed: {e}",
+                            slug = req.slug
+                        )
+                    })
+                },
+            );
+            tool_registry.register(octos_agent::PeerSendInputTool::new(send_input));
         }
 
         // Wire the PARENT `send_file` for the legacy non-contract

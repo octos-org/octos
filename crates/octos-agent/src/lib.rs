@@ -199,6 +199,7 @@ pub use tools::{
     McpAgentBackend, McpAgentBackendConfig, MemoryNoteTool, MessageTool,
     MofaDescribeContentTypeTool, MofaMakeTool, PeerGatherCallback, PeerGatherTool,
     PeerHandoffCallback, PeerHandoffRequest, PeerHandoffStaged, PeerHandoffTool, PolicyDecision,
+    PeerSendInputCallback, PeerSendInputRequest, PeerSendInputTool,
     ReadFileTool, ReadTaskOutputTool, RecallMemoryTool, RecordMemoryUseTool, RobotToolRegistry,
     SaveMemoryTool, SendAppCardTool, SendFileTool, SharedBackend, ShellTool, SpawnTool,
     StdioMcpAgent, SynthesizeResearchTool, Tool, ToolApprovalDecision, ToolApprovalRequest,

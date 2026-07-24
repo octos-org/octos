@@ -8,7 +8,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Mutex as StdMutex, Weak};
+use std::sync::{Mutex as StdMutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
 use metrics::counter;
@@ -140,6 +140,30 @@ const BACKGROUND_RESULT_FANOUT_TIMEOUT: Duration = Duration::from_secs(5);
 /// recovery-to-primary inside an incident still surface within a few
 /// seconds; long enough to absorb back-to-back retries on the same lane.
 const FAILOVER_PUSH_DEBOUNCE: Duration = Duration::from_secs(5);
+
+// ── Peer inbox registry (#436) ─────────────────────────────────────────────
+
+/// Global registry mapping `"{profile_id}:peer:{slug}"` → inbox sender for
+/// running peer sessions. Populated by [`ActorRegistry::dispatch`] when a
+/// peer session actor spawns; removed on session death / deletion. The
+/// [`PeerSendInputTool`] callback reads this to deliver cross-session
+/// messages without a TUI round-trip.
+static PEER_INBOX_REGISTRY: OnceLock<
+    Arc<StdMutex<HashMap<String, mpsc::Sender<ActorMessage>>>>,
+> = OnceLock::new();
+
+/// Get (or init) the global peer inbox registry.
+pub fn peer_inbox_registry(
+) -> &'static Arc<StdMutex<HashMap<String, mpsc::Sender<ActorMessage>>>> {
+    PEER_INBOX_REGISTRY.get_or_init(|| Arc::new(StdMutex::new(HashMap::new())))
+}
+
+/// Build the lookup key for a peer session: `"{profile_id}:peer:{slug}"`.
+fn peer_inbox_key(profile_id: &str, slug: &str) -> String {
+    format!("{profile_id}:peer:{slug}")
+}
+
+// ────────────────────────────────────────────────────────────────────────────
 
 const DEFAULT_CONTEXT_COMPACT_RATIO_NUMERATOR: usize = 7;
 const DEFAULT_CONTEXT_COMPACT_RATIO_DENOMINATOR: usize = 10;
@@ -2545,6 +2569,22 @@ impl ActorRegistry {
                 // profile_id which is None for the current-profile gateway.
                 tenant_id: tenant_id.map(|s| s.to_string()),
             });
+            // #436 — register peer inbox for cross-session messaging.
+            // Only peer sessions (topic `peer-<slug>`) get registered.
+            if let Some(topic) = session_key.topic() {
+                if let Some(slug) = topic.strip_prefix("peer-") {
+                    let registry = peer_inbox_registry();
+                    let key = peer_inbox_key(
+                        profile_id.unwrap_or(MAIN_PROFILE_ID),
+                        slug,
+                    );
+                    registry
+                        .lock()
+                        .unwrap()
+                        .insert(key, tx.clone());
+                }
+            }
+
             self.actors.insert(
                 key_str.clone(),
                 ActorHandle {
@@ -2645,6 +2685,11 @@ impl ActorRegistry {
                 true
             }
         });
+        // #436 — purge closed senders from the peer inbox registry
+        peer_inbox_registry()
+            .lock()
+            .unwrap()
+            .retain(|_, tx| !tx.is_closed());
     }
 
     /// Stop and remove a session actor. Drops the sender so the actor's run
@@ -2664,6 +2709,11 @@ impl ActorRegistry {
                 drop(handle.tx); // actor's recv() returns None → run loop exits
             }
         }
+        // #436 — purge closed senders from the peer inbox registry
+        peer_inbox_registry()
+            .lock()
+            .unwrap()
+            .retain(|_, tx| !tx.is_closed());
     }
 
     /// Cancel a specific session actor.
