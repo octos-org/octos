@@ -666,7 +666,7 @@ const MAX_SCHEMA_DEPTH: usize = 64;
 /// Gemini only supports a subset of JSON Schema. This recursively removes
 /// unsupported fields that cause 400 errors or silent empty responses:
 /// - `additionalProperties`
-/// - Empty `items` schemas (`"items": {}`)
+/// - Missing or empty array `items` schemas
 /// - `$schema`, `$ref`, `$id`
 fn sanitize_schema_for_gemini(value: &mut serde_json::Value) {
     sanitize_schema_recursive(value, 0);
@@ -691,12 +691,16 @@ fn sanitize_schema_recursive(value: &mut serde_json::Value, depth: usize) {
         // crash plan_and_search workers when routing lands on Gemini.
         obj.retain(|k, _| !k.starts_with("x-"));
 
-        // Gemini requires `items` to have a type when present.
-        // Replace empty `"items": {}` with `"items": {"type": "string"}`.
-        if let Some(items) = obj.get("items") {
-            if items.as_object().is_some_and(|o| o.is_empty()) {
-                obj.insert("items".to_string(), serde_json::json!({"type": "string"}));
-            }
+        // Gemini rejects array schemas without an element schema before the
+        // request reaches the model. Repair both a missing `items` field and
+        // the equivalent empty-object form emitted by some tool providers.
+        let needs_default_items = obj.get("type").and_then(|value| value.as_str()) == Some("array")
+            && match obj.get("items") {
+                None => true,
+                Some(items) => items.as_object().is_some_and(|items| items.is_empty()),
+            };
+        if needs_default_items {
+            obj.insert("items".to_string(), serde_json::json!({"type": "string"}));
         }
 
         // Recurse into nested objects
@@ -1036,6 +1040,20 @@ mod tests {
         });
         sanitize_schema_for_gemini(&mut schema);
         assert_eq!(schema["items"]["type"], "string");
+    }
+
+    #[test]
+    fn should_add_default_items_when_array_schema_omits_items() {
+        let mut schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "items": {"type": "array"}
+            }
+        });
+
+        sanitize_schema_for_gemini(&mut schema);
+
+        assert_eq!(schema["properties"]["items"]["items"]["type"], "string");
     }
 
     #[test]

@@ -2625,3 +2625,19 @@ mod cancellation_kills_child_group {
         );
     }
 }
+
+#[test]
+fn should_declare_element_schema_when_spawn_agent_items_is_array() {
+    let schema = SpawnAgentTool::new().input_schema();
+    let items = &schema["properties"]["items"];
+
+    assert_eq!(items["type"], json!("array"));
+    assert_eq!(
+        items["items"]["type"],
+        json!("object"),
+        "spawn_agent.items accepts structured Codex content items, so its array \
+         must declare an object element schema"
+    );
+    assert!(items["items"]["properties"]["type"].is_object());
+    assert!(items["items"]["properties"]["text"].is_object());
+}
