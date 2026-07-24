@@ -1966,6 +1966,78 @@ fn session_workspaces() -> Arc<SessionWorkspaceStore> {
         .clone()
 }
 
+/// #436 — serve-side registry mapping `"{profile}:peer:{slug}"` → the peer
+/// session's wire `SessionKey`, populated on `session/open` for `peer-<slug>`
+/// sessions. `peer_send_input` reads this to resolve a slug to the
+/// continuation-queue key it enqueues an injected turn under: the serve
+/// process has no gateway `ActorRegistry` to populate the inbox registry, so
+/// the tool delivers via the master continuation queue instead. A stale entry
+/// (a peer that has since closed) is harmless — the enqueued continuation is
+/// durable and drains when the peer next reconnects — so entries are not
+/// evicted on disconnect; a bounded cap prevents unbounded growth on a
+/// long-lived serve that opens many distinct peers.
+#[derive(Default)]
+struct PeerWireRegistry {
+    by_key: std::sync::Mutex<HashMap<String, SessionKey>>,
+}
+
+/// Soft cap on the peer-wire registry. A new key past the cap is dropped (that
+/// peer is not injectable until re-opened); existing keys still refresh.
+const PEER_WIRE_REGISTRY_MAX: usize = 8192;
+
+impl PeerWireRegistry {
+    fn register(&self, key: String, session_id: SessionKey) {
+        let mut map = self
+            .by_key
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if map.len() >= PEER_WIRE_REGISTRY_MAX && !map.contains_key(&key) {
+            tracing::warn!(
+                key = %key,
+                cap = PEER_WIRE_REGISTRY_MAX,
+                "peer wire registry at capacity; skipping new peer registration"
+            );
+            return;
+        }
+        map.insert(key, session_id);
+    }
+
+    fn resolve(&self, key: &str) -> Option<SessionKey> {
+        self.by_key
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .get(key)
+            .cloned()
+    }
+}
+
+fn peer_wire_registry() -> &'static PeerWireRegistry {
+    static PEER_WIRE_REGISTRY: OnceLock<PeerWireRegistry> = OnceLock::new();
+    PEER_WIRE_REGISTRY.get_or_init(PeerWireRegistry::default)
+}
+
+/// Registry key for a peer session: `"{profile}:peer:{slug}"` (mirrors the
+/// gateway inbox registry's key construction in `session_actor`).
+fn peer_wire_key(profile_id: &str, slug: &str) -> String {
+    format!("{profile_id}:peer:{slug}")
+}
+
+/// Register a `peer-<slug>` session's wire key so `peer_send_input` can
+/// resolve it. No-op for non-peer or unprofiled sessions.
+fn register_peer_wire_session(session_id: &SessionKey) {
+    let Some(slug) = session_id
+        .topic()
+        .and_then(|topic| topic.strip_prefix("peer-"))
+        .filter(|slug| !slug.is_empty())
+    else {
+        return;
+    };
+    let Some(profile_id) = session_id.profile_id() else {
+        return;
+    };
+    peer_wire_registry().register(peer_wire_key(profile_id, slug), session_id.clone());
+}
+
 fn session_permission_profiles() -> Arc<SessionPermissionProfileStore> {
     static SESSION_PERMISSION_PROFILES: OnceLock<Arc<SessionPermissionProfileStore>> =
         OnceLock::new();
@@ -12700,6 +12772,11 @@ async fn open_session_result(
     if let Some(root) = effective_workspace_root.as_ref() {
         session_workspaces().set(params.session_id.clone(), root.clone());
     }
+    // #436 — record a `peer-<slug>` session's wire key so `peer_send_input`
+    // (wired on the master's turn, which cannot know the peer's client-chosen
+    // wire id) can resolve the slug to the continuation-queue key it enqueues
+    // an injected turn under. No-op for non-peer / unprofiled sessions.
+    register_peer_wire_session(&params.session_id);
     let (mut replay, replay_baseline_seq) =
         ledger.replay_after_with_head(&params.session_id, params.after.as_ref())?;
     replay.retain(|event| ledger_event_matches_topic_scope(&event.event, topic_scope.as_deref()));
@@ -14323,6 +14400,9 @@ async fn handle_turn_start_with_accept(
                 None,
                 // #1650 — interactive goal binding snapshotted above.
                 interactive_goal_binding,
+                // #436 — regular user turns already persist their prompt
+                // (they are not internal continuations); no override needed.
+                false,
             )
             .await;
         }
@@ -14687,6 +14767,14 @@ async fn maybe_spawn_appui_master_continuation_runner(
         }
         _ => None,
     };
+    // #436 — a `peer_send_input` continuation's prompt is a real user turn:
+    // persist it as a `UserMessage` (transcript + durable history) rather than
+    // skipping it like a system-internal continuation.
+    let persist_peer_input_prompt = matches!(
+        &continuation.reason,
+        MasterContinuationReason::External(kind)
+            if kind == crate::api::agent_orchestrator::PEER_SEND_INPUT_EXTERNAL_KIND
+    );
     let handle = tokio::spawn(async move {
         if start_rx.await.is_err() {
             return;
@@ -14749,6 +14837,8 @@ async fn maybe_spawn_appui_master_continuation_runner(
             // `goal_context` (a `GoalContinue` charges through
             // `record_goal_turn`); the interactive binding is never used.
             None,
+            // #436 — persist a peer_send_input injection as a UserMessage.
+            persist_peer_input_prompt,
         )
         .await;
         default_agent_orchestrator().mark_continuation_completed(
@@ -22897,6 +22987,12 @@ async fn run_standalone_turn(
     // `None` for master continuations (`goal_context` carries their
     // accounting instead).
     interactive_goal_binding: Option<(String, String)>,
+    // #436 — when a master continuation's prompt IS a user turn that must land
+    // in the transcript + durable history (a `peer_send_input` injection),
+    // persist the internal user message instead of skipping it. `false` for
+    // system-internal continuations (goal/loop/child/recovery), whose
+    // `[system-internal]` prompt is intentionally not shown as a user row.
+    persist_continuation_prompt_as_user: bool,
 ) {
     let session_id = params.session_id.clone();
     let turn_id = params.turn_id.clone();
@@ -24069,50 +24165,86 @@ async fn run_standalone_turn(
             tool_registry.register(octos_agent::PeerGatherTool::new(gather));
         }
 
-        // #436 — `peer_send_input`: cross-session TurnStart injection.
-        // Same depth-1 guard as peer_handoff: peer sessions cannot send input
-        // to other peers (or themselves). The callback uses the global peer
-        // inbox registry populated by ActorRegistry::dispatch.
+        // #436 — `peer_send_input`: cross-session input injection into a
+        // RUNNING peer session. Same depth-1 guard as peer_handoff: peer
+        // sessions cannot send input to other peers (or themselves).
+        //
+        // Two delivery paths, tried in order:
+        //  1. Gateway fast-path — the process-global inbox registry populated
+        //     by `ActorRegistry::dispatch`. Delivers directly to a live
+        //     session actor's inbox. Always EMPTY in the serve process (serve
+        //     spawns `octos gateway` as a separate child and constructs no
+        //     `ActorRegistry`), so it normally falls through.
+        //  2. Serve continuation-queue path — resolve the peer's wire
+        //     `SessionKey` (recorded on `session/open`) and enqueue the
+        //     injection as a master continuation the peer drains on its next
+        //     `appui_continuation_tick` (or the connection-independent global
+        //     drain), rendered verbatim as the peer's next user turn.
         if peer_handoff_allowed_for_session(&session_id) {
             let send_profile_id = session_runtime.profile.profile_id.clone();
+            let send_peers_root = session_runtime.profile.data_dir.join("peers");
             let send_input: octos_agent::PeerSendInputCallback =
                 Arc::new(move |req: octos_agent::PeerSendInputRequest| {
-                    let registry = crate::session_actor::peer_inbox_registry();
-                    let map = registry.lock().unwrap();
-                    let key = format!("{}:peer:{}", send_profile_id, req.slug);
-                    let tx = map.get(&key).ok_or_else(|| {
-                        format!(
-                            "peer session '{slug}' is not running — \
-                             it must be opened by the user first",
+                    let key = peer_wire_key(&send_profile_id, &req.slug);
+
+                    // Path 1: gateway in-process inbox (fast, direct).
+                    let inbox_tx = crate::session_actor::peer_inbox_registry()
+                        .lock()
+                        .unwrap()
+                        .get(&key)
+                        .cloned();
+                    if let Some(tx) = inbox_tx {
+                        let inbound = InboundMessage {
+                            channel: String::new(),
+                            sender_id: String::new(),
+                            chat_id: String::new(),
+                            content: req.message,
+                            timestamp: chrono::Utc::now(),
+                            media: vec![],
+                            metadata: serde_json::json!({"origin": "peer_send_input"}),
+                            message_id: None,
+                            origin: MessageOrigin::Synthetic,
+                        };
+                        let actor_msg = crate::session_actor::ActorMessage::Inbound {
+                            message: inbound,
+                            image_media: vec![],
+                            attachment_media: vec![],
+                            attachment_prompt: None,
+                        };
+                        return tx.try_send(actor_msg).map_err(|e| {
+                            format!(
+                                "peer session '{slug}' inbox is full or closed: {e}",
+                                slug = req.slug
+                            )
+                        });
+                    }
+
+                    // Path 2: serve continuation queue.
+                    let Some(target) = peer_wire_registry().resolve(&key) else {
+                        return Err(format!(
+                            "peer session '{slug}' is not open — the user must open \
+                             the staged peer session before it can receive input",
                             slug = req.slug
-                        )
-                    })?;
-
-                    let inbound = InboundMessage {
-                        channel: String::new(),
-                        sender_id: String::new(),
-                        chat_id: String::new(),
-                        content: req.message,
-                        timestamp: chrono::Utc::now(),
-                        media: vec![],
-                        metadata: serde_json::json!({"origin": "peer_send_input"}),
-                        message_id: None,
-                        origin: MessageOrigin::Synthetic,
+                        ));
                     };
-
-                    let actor_msg = crate::session_actor::ActorMessage::Inbound {
-                        message: inbound,
-                        image_media: vec![],
-                        attachment_media: vec![],
-                        attachment_prompt: None,
-                    };
-
-                    tx.try_send(actor_msg).map_err(|e| {
-                        format!(
-                            "peer session '{slug}' inbox is full or closed: {e}",
+                    // A deleted peer must not silently swallow injections into a
+                    // queue nothing will drain: require the staged dir to exist.
+                    if !send_peers_root.join(&req.slug).is_dir() {
+                        return Err(format!(
+                            "peer '{slug}' no longer exists (its staged directory \
+                             was removed)",
                             slug = req.slug
-                        )
-                    })
+                        ));
+                    }
+                    // Duplicate == already queued for delivery: treat as success
+                    // so an identical re-injection is a no-op, not a spurious
+                    // error (dedupe collapses it onto the pending continuation).
+                    let _ = default_agent_orchestrator().enqueue_peer_send_input_continuation(
+                        &target,
+                        &send_profile_id,
+                        &req.message,
+                    );
+                    Ok(())
                 });
             tool_registry.register(octos_agent::PeerSendInputTool::new(send_input));
         }
@@ -24762,7 +24894,11 @@ async fn run_standalone_turn(
     // since FA-11.
     let auto_escalation_router = session_runtime.profile.adaptive_router.clone();
     let auto_escalation_session_id = session_id.0.clone();
-    let skip_internal_user_persist = internal_master_continuation;
+    // #436 — a `peer_send_input` continuation carries a real user turn: keep
+    // its prompt (persist it as a `UserMessage`) so it reaches the peer's
+    // transcript + durable history via the canonical `MessageCommitObserver`.
+    let skip_internal_user_persist =
+        internal_master_continuation && !persist_continuation_prompt_as_user;
     // #1128 codex P1 re-review #2 — clone the session manager Arc
     // before the agent_task spawn moves the original. We need the
     // clone alive in this outer scope for the post-turn self-paced

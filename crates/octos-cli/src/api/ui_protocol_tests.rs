@@ -7526,6 +7526,102 @@ async fn ws_turn_supervisor_routes_spawn_only_failure_to_master_continuation_que
     drop(tool_registry);
 }
 
+/// #436 — serve `peer_send_input` round-trip through the master continuation
+/// queue. A `peer-<slug>` session records its wire key on `session/open`; the
+/// tool resolves the slug to that key and enqueues the injected text as an
+/// `External(peer_send_input)` continuation which drains FOR the peer session
+/// and renders VERBATIM as the peer's next user turn (no `[system-internal]`
+/// envelope). Dedupe collapses an identical re-injection so the same input is
+/// never delivered twice; a distinct message enqueues a fresh turn.
+#[tokio::test]
+async fn peer_send_input_injects_continuation_for_peer_session() {
+    // Unique profile/session so the shared process-global orchestrator + peer
+    // wire registry never collide with sibling tests running in parallel.
+    let profile_id = "test-peer-send-input-roundtrip";
+    let slug = "harbor-otter";
+    // The peer's WIRE key: profiled, topic `peer-<slug>` — exactly what
+    // `session/open` records and what the queue / tick / drain key on.
+    let peer_key =
+        SessionKey::with_profile_topic(profile_id, "api", "tab-9", &format!("peer-{slug}"));
+
+    // `session/open` glue: registering the peer makes its slug resolvable to
+    // the wire key the master's `peer_send_input` (which cannot know the
+    // client-chosen wire id) must enqueue under.
+    register_peer_wire_session(&peer_key);
+    let resolved = peer_wire_registry()
+        .resolve(&peer_wire_key(profile_id, slug))
+        .expect("an opened peer session's slug resolves to its wire key");
+    assert_eq!(
+        resolved, peer_key,
+        "resolved wire key must match the opened peer session",
+    );
+    // A non-peer session is a no-op (never registered).
+    register_peer_wire_session(&SessionKey::with_profile("other", "web", "plain"));
+
+    let orchestrator = default_agent_orchestrator();
+    let message = "focus on the auth module next; skip the CSS pass";
+    let outcome = orchestrator.enqueue_peer_send_input_continuation(&resolved, profile_id, message);
+    assert!(outcome.queued().is_some(), "first injection must enqueue");
+    assert_eq!(
+        orchestrator.pending_continuation_count_for_session_for_test(&peer_key, profile_id),
+        1,
+        "the injection is queued for the peer session",
+    );
+
+    // Dedupe: an identical re-injection collapses onto the pending item.
+    let dup = orchestrator.enqueue_peer_send_input_continuation(&resolved, profile_id, message);
+    assert!(dup.is_duplicate(), "identical re-injection must dedupe");
+    assert_eq!(
+        orchestrator.pending_continuation_count_for_session_for_test(&peer_key, profile_id),
+        1,
+        "dedupe must not grow the queue",
+    );
+
+    // Drain (what the peer's tick does) + render (what `run_standalone_turn`
+    // feeds the agent): the prompt IS the injected text, verbatim, so the peer
+    // processes it as a user turn.
+    let drained = orchestrator.drain_ready_continuations_for_session(
+        &peer_key,
+        profile_id,
+        crate::api::master_continuation_scheduler::MasterContinuationRuntimeState::idle(),
+        1,
+    );
+    assert_eq!(
+        drained.len(),
+        1,
+        "the peer session drains its injected continuation",
+    );
+    let prompt = master_continuation_prompt(&drained[0]);
+    assert_eq!(
+        prompt, message,
+        "the injected text is delivered verbatim as the peer's user turn",
+    );
+    assert!(
+        !prompt.contains("[system-internal]"),
+        "a user injection must not be wrapped as a system-internal continuation",
+    );
+
+    // A DIFFERENT message is a distinct injection (fresh turn, not deduped).
+    let other = orchestrator.enqueue_peer_send_input_continuation(
+        &resolved,
+        profile_id,
+        "also run the integration tests before you stop",
+    );
+    assert!(
+        other.queued().is_some(),
+        "a distinct message enqueues a fresh turn",
+    );
+    // Housekeeping: drain the residual so the shared static is left clean for
+    // sibling tests (never `clear_default_agent_orchestrator_for_test` — that
+    // would wipe parallel tests' queues).
+    let _ = orchestrator.drain_ready_continuations_for_session(
+        &peer_key,
+        profile_id,
+        crate::api::master_continuation_scheduler::MasterContinuationRuntimeState::idle(),
+        8,
+    );
+}
+
 /// Regression: a `mark_failed` driven by the orphan-task sweep
 /// during `enable_persistence` (`task_supervisor.rs:1164-1166`)
 /// MUST reach the recovery callback. This pins the wiring order

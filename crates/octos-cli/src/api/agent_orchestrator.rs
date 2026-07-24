@@ -129,6 +129,19 @@ const SPAWN_ONLY_FAILURE_META_ORIGINATING_CMID: &str = "originating_client_messa
 /// the persisted queue by group when triaging recovery turns.
 const SPAWN_ONLY_FAILURE_GROUP: &str = "spawn-only-failure-recovery";
 
+/// #436 — kind label for the `External(_)` master continuation reason that
+/// delivers a `peer_send_input` injection into a RUNNING serve peer session.
+/// The serve process has no gateway `ActorRegistry` to populate the inbox
+/// registry, so the tool re-plumbs onto the master continuation queue: the
+/// injected text is enqueued under the peer's wire session key and drained
+/// as the peer's next turn on its `appui_continuation_tick`.
+pub(crate) const PEER_SEND_INPUT_EXTERNAL_KIND: &str = "peer_send_input";
+/// Metadata key carrying the verbatim injected message; the prompt renderer
+/// emits it as the peer turn's user prompt.
+pub(crate) const PEER_SEND_INPUT_META_MESSAGE: &str = "peer_send_input_message";
+/// Group id stamped onto peer_send_input continuations (queue triage filter).
+const PEER_SEND_INPUT_GROUP: &str = "peer-send-input";
+
 #[derive(Debug, Clone)]
 pub(crate) struct AgentListRequest {
     pub(crate) session_id: Option<SessionKey>,
@@ -2299,6 +2312,46 @@ impl InProcessAgentOrchestrator {
         {
             request = request.with_metadata(SPAWN_ONLY_FAILURE_META_ORIGINATING_CMID, cmid.clone());
         }
+        let mut state = self.state();
+        enqueue_and_persist_continuation(&mut state, request)
+    }
+
+    /// #436 — enqueue a `peer_send_input` injection as a master continuation
+    /// on the TARGET peer session's queue. The serve `peer_send_input` tool
+    /// calls this after resolving a slug to the peer's wire `SessionKey`; the
+    /// continuation is drained on the peer's next `appui_continuation_tick`
+    /// (or the connection-independent global drain) and rendered verbatim as
+    /// the peer's next user turn by `master_continuation_prompt`.
+    ///
+    /// Dedupe is content-hashed: an identical re-injection to the same peer
+    /// collapses onto the pending (or just-claimed) continuation so the same
+    /// message is never delivered twice, while a DIFFERENT message enqueues a
+    /// fresh turn. Returns [`MasterContinuationEnqueueOutcome::Duplicate`]
+    /// for a collapsed re-injection (the caller treats that as success — the
+    /// input is already queued for delivery).
+    pub(crate) fn enqueue_peer_send_input_continuation(
+        &self,
+        target_session: &SessionKey,
+        profile_id: &str,
+        message: &str,
+    ) -> MasterContinuationEnqueueOutcome {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        std::hash::Hash::hash(message, &mut hasher);
+        let message_hash = std::hash::Hasher::finish(&hasher);
+        let request = MasterContinuationRequest::new(
+            PEER_SEND_INPUT_GROUP,
+            target_session.to_string(),
+            profile_id.to_owned(),
+            MasterContinuationReason::External(PEER_SEND_INPUT_EXTERNAL_KIND.to_owned()),
+            SystemTime::now(),
+        )
+        .with_metadata(PEER_SEND_INPUT_META_MESSAGE, message.to_owned())
+        .with_dedupe_key(format!(
+            "external/{kind}/{session}/{len}-{message_hash:016x}",
+            kind = PEER_SEND_INPUT_EXTERNAL_KIND,
+            session = target_session,
+            len = message.len(),
+        ));
         let mut state = self.state();
         enqueue_and_persist_continuation(&mut state, request)
     }
@@ -5811,6 +5864,20 @@ pub(crate) fn master_continuation_prompt(continuation: &QueuedMasterContinuation
         }
         MasterContinuationReason::External(kind) if kind == SPAWN_ONLY_FAILURE_EXTERNAL_KIND => {
             render_spawn_only_failure_recovery_prompt(continuation)
+        }
+        // #436 — a `peer_send_input` injection IS the peer's next user turn:
+        // render the injected message verbatim (NOT wrapped in a
+        // `[system-internal]` envelope) so the peer's LLM processes it exactly
+        // as if the operator had typed it into the peer session. The turn
+        // dispatcher persists this prompt as a `UserMessage` (it does not skip
+        // internal-user-persist for this kind), so it lands in the peer's
+        // transcript + durable history.
+        MasterContinuationReason::External(kind) if kind == PEER_SEND_INPUT_EXTERNAL_KIND => {
+            continuation
+                .metadata
+                .get(PEER_SEND_INPUT_META_MESSAGE)
+                .cloned()
+                .unwrap_or_default()
         }
         MasterContinuationReason::External(kind) => format!(
             "[system-internal]\nAn external master continuation was requested.\n\nKind: {kind}\nGroup: {group}\nMetadata:\n{metadata}\n\nHandle the continuation conservatively and summarize the visible state for the user.",
