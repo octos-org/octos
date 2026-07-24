@@ -12,9 +12,9 @@ use super::goal_loop_runtime::{
     resolve_maintenance_prompt,
 };
 use super::master_continuation_scheduler::{
-    MasterContinuationDedupeKey, MasterContinuationEnqueueOutcome, MasterContinuationReason,
-    MasterContinuationRequest, MasterContinuationRuntimeState, MasterContinuationScheduler,
-    QueuedMasterContinuation,
+    MAX_REDELIVERY_ATTEMPTS, MasterContinuationDedupeKey, MasterContinuationEnqueueOutcome,
+    MasterContinuationReason, MasterContinuationRequest, MasterContinuationRuntimeState,
+    MasterContinuationScheduler, QueuedMasterContinuation, ReinsertOutcome,
 };
 use super::supervisor_store::{
     ArtifactRecord as SupervisorArtifactRecord, ChildAgentRecord, ChildStatus, ContinuationStatus,
@@ -2512,9 +2512,33 @@ impl InProcessAgentOrchestrator {
     /// instead of waiting for a server restart's durable replay. The durable
     /// record is still `Queued` (an undelivered turn is never tombstoned), so
     /// this only restores the in-memory queue entry.
+    ///
+    /// #436 follow-up — re-delivery is bounded ([`MAX_REDELIVERY_ATTEMPTS`]) so
+    /// a permanently-undeliverable injection cannot starve newer work. When the
+    /// bound is hit the item is dropped from the live queue; log it so a dropped
+    /// peer message is never silent. In durable-store mode its record is still
+    /// `Queued` and replays on the next restart (a natural point to re-evaluate
+    /// whether the target is back); in pure in-memory serve there is no record,
+    /// so the capped drop is final — which is why the drop is logged.
     pub(crate) fn reinsert_peer_continuation(&self, continuation: QueuedMasterContinuation) {
+        let slug = continuation
+            .metadata
+            .get(PEER_SEND_INPUT_META_SLUG)
+            .cloned()
+            .unwrap_or_default();
+        let session = continuation.session_id.as_str().to_owned();
         let mut state = self.state();
-        state.continuations.reinsert(continuation);
+        if state.continuations.reinsert(continuation) == ReinsertOutcome::Dropped {
+            tracing::warn!(
+                slug = %slug,
+                session = %session,
+                max_attempts = MAX_REDELIVERY_ATTEMPTS,
+                "peer_send_input injection undeliverable after repeated live retries; \
+                 dropped from the in-memory queue (its durable record, if a supervisor \
+                 store is configured, replays on the next restart; in pure in-memory \
+                 serve the drop is final)"
+            );
+        }
     }
 
     /// #979 / M15-C2 — flip the goal to `complete` when the model
@@ -5374,9 +5398,23 @@ fn persist_continuation_queued_checked(
 /// #436 P1 #1 — retire a re-homed peer injection's OLD record: drop the
 /// in-memory entry and TOMBSTONE the durable record so a restart's `restore`
 /// (which re-enqueues every non-`Completed` record) does not resurrect + re-
-/// deliver it. A tombstone-write failure is logged, not swallowed silently;
-/// the worst case is the old record surviving a restart, where the freshness
-/// gate + dedup drop it — never a lost injection.
+/// deliver it.
+///
+/// A tombstone-write failure is logged, not swallowed silently. In that case
+/// the old record stays `Queued` and IS re-enqueued on the next restart, but it
+/// targets the now-obsolete old wire: the post-restart wire registry is empty,
+/// so `peer_target_is_current_wire` is false, the freshness gate re-inserts it,
+/// and the redelivery cap ([`MAX_REDELIVERY_ATTEMPTS`]) drops it in-memory — it
+/// never dispatches, because only the CURRENT wire passes the gate. So a failed
+/// tombstone causes neither a lost injection nor, in the normal single-reopen
+/// case, a duplicate delivery: the live injection still lands via the current
+/// wire while the stale one is dropped. What it DOES leave is a small durable
+/// LEAK — the un-tombstoned old record lingers and is re-restored-then-dropped
+/// on every restart until the store is cleaned. (A genuine duplicate would need
+/// a convoluted multi-reopen sequence in which two different-session records
+/// each become current in turn; occurrence-id dedup does not span the differing
+/// session keys. Non-blocking — a proper fix would retry the tombstone write or
+/// tombstone superseded records on restore. Confirmed by codex + K3 review.)
 fn retire_old_peer_injection(
     state: &mut AutonomyRuntimeState,
     old_key: &MasterContinuationDedupeKey,

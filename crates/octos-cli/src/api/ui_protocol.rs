@@ -14812,6 +14812,28 @@ async fn maybe_spawn_appui_master_continuation_runner(
         return false;
     }
 
+    // KNOWN LIMITATION (#436, accepted — best-effort single-user delivery).
+    // The freshness re-check above is NOT atomic with the dispatch below. A peer
+    // close+reopen that lands in the window between that check and the turn
+    // start can leave us dispatching under a wire that just went obsolete:
+    // the injection is delivered to the closing session (lost to the freshly
+    // reopened peer) or, if the process crashes mid-window before the turn's
+    // durable record completes, replayed on restart (duplicated). Closing this
+    // fully would require an atomic claim-and-dispatch spanning the wire
+    // registry, the continuation scheduler, and the turn spawn — disproportionate
+    // for a best-effort, single-user channel. An occasional lost/dup peer message
+    // under a concurrent close-reopen race is within the delivery semantics
+    // documented on `peer_send_input_authorized`. The window is small but NOT
+    // instantaneous: after this check the dispatch below builds the turn params,
+    // spawns the turn task (which awaits `start_rx`), briefly locks
+    // `connection_turns` to register the turn, then sends on `start_tx` to release
+    // it — a reopen interleaving anywhere in there is the race. It is narrow in
+    // practice (a peer close+reopen must land against a ~2s drain cadence and a
+    // multi-second human close+reopen) but nothing enforces a minimum gap, so it
+    // is a real accepted edge, not an impossibility. (The dup-on-restart case
+    // additionally requires a durable supervisor store; in pure in-memory serve
+    // the same race can only drop, never dup.)
+
     // M15-F5 (#44), Codex P2: a scheduled loop fire (self-paced / fixed /
     // maintenance) or goal continuation reaches the runtime here, NOT through
     // the manual `loop/fire_now` RPC. Emit the `loop/fired` /

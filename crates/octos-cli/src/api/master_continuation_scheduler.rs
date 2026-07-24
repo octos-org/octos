@@ -29,6 +29,18 @@ use std::time::{Duration, SystemTime};
 /// must stay reusable, so they are never guarded.
 pub(crate) const RECENT_CLAIM_GUARD_WINDOW: Duration = Duration::from_secs(30);
 
+/// #436 follow-up — max times a popped-but-UNDISPATCHED continuation may be
+/// re-inserted for a live re-delivery attempt before it is dropped from the
+/// in-memory queue. Without this bound a permanently-undeliverable injection
+/// (its target wire gone for good) would be re-queued every drain tick forever
+/// and — because [`reinsert`](MasterContinuationScheduler::reinsert) advances
+/// the sequence so the item yields to newer work — would churn indefinitely.
+/// At the ~2s drain cadence, 5 attempts is ~10s of live retry: long enough to
+/// ride out a brief peer reopen/reconnect, short enough not to loop. A drop is
+/// in-memory only; the durable record (if any) still replays on the next server
+/// restart, a natural point to re-evaluate whether the target came back.
+pub(crate) const MAX_REDELIVERY_ATTEMPTS: u32 = 5;
+
 macro_rules! string_id {
     ($name:ident) => {
         #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -316,6 +328,13 @@ pub(crate) struct QueuedMasterContinuation {
     pub(crate) metadata: MasterContinuationMetadata,
     pub(crate) created_at: SystemTime,
     pub(crate) enqueued_at: SystemTime,
+    /// #436 follow-up — how many times this item has been re-inserted after a
+    /// popped-but-undispatched delivery attempt. Starts at 0 on enqueue, is
+    /// incremented by [`reinsert`](MasterContinuationScheduler::reinsert), and
+    /// bounds live re-delivery at [`MAX_REDELIVERY_ATTEMPTS`]. It travels with
+    /// the item (pop→reinsert→pop preserves it) and dies when the item is
+    /// consumed or re-homed to a fresh continuation.
+    pub(crate) redelivery_attempts: u32,
 }
 
 impl QueuedMasterContinuation {
@@ -348,6 +367,21 @@ impl MasterContinuationEnqueueOutcome {
     pub(crate) fn is_duplicate(&self) -> bool {
         matches!(self, Self::Duplicate { .. })
     }
+}
+
+/// Result of [`reinsert`](MasterContinuationScheduler::reinsert).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReinsertOutcome {
+    /// Re-queued for another live delivery attempt; its sequence was advanced
+    /// so it yields to newer injections instead of starving them.
+    Requeued,
+    /// The key was already pending (a concurrent path re-queued it first); the
+    /// existing entry was kept and this stale copy discarded.
+    AlreadyPending,
+    /// Exceeded [`MAX_REDELIVERY_ATTEMPTS`] and was dropped from the in-memory
+    /// queue so it can no longer churn or starve newer work. Best-effort by
+    /// design; the durable record (if any) still replays on the next restart.
+    Dropped,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -527,6 +561,7 @@ impl MasterContinuationScheduler {
             metadata: request.metadata,
             created_at: request.created_at,
             enqueued_at,
+            redelivery_attempts: 0,
         };
 
         self.heap.push(HeapEntry {
@@ -553,17 +588,39 @@ impl MasterContinuationScheduler {
     /// racing a claim of a WILL-BE-delivered item; a not-delivered restore is
     /// the opposite and must be redrained, so bypassing the guard here is
     /// correct. Idempotent: a key already pending is left untouched.
-    pub(crate) fn reinsert(&mut self, item: QueuedMasterContinuation) {
+    ///
+    /// #436 follow-up (round-3 starvation regression) — a naive restore that
+    /// preserved the item's original (low) sequence would keep WINNING the
+    /// oldest-first heap every drain tick, so a permanently-undeliverable
+    /// injection would starve every newer injection to its session forever.
+    /// Two coupled bounds fix that: (1) ADVANCE the sequence so a repeatedly
+    /// re-inserted item moves to the BACK of the FIFO and yields to newer work,
+    /// and (2) CAP re-delivery at [`MAX_REDELIVERY_ATTEMPTS`], dropping the item
+    /// past the cap so it cannot churn indefinitely. Returns the outcome so the
+    /// caller can log a drop rather than silently losing a peer message.
+    pub(crate) fn reinsert(&mut self, mut item: QueuedMasterContinuation) -> ReinsertOutcome {
         self.recently_claimed_external.remove(&item.dedupe_key);
         if self.pending_by_key.contains_key(&item.dedupe_key) {
-            return;
+            return ReinsertOutcome::AlreadyPending;
         }
+        item.redelivery_attempts = item.redelivery_attempts.saturating_add(1);
+        if item.redelivery_attempts > MAX_REDELIVERY_ATTEMPTS {
+            return ReinsertOutcome::Dropped;
+        }
+        // Advance to a fresh sequence so a repeatedly-failing item sinks to the
+        // back of the oldest-first heap. The heap entry and the stored item MUST
+        // carry the SAME sequence — `entry_matches_pending` compares them and a
+        // mismatch would discard the entry as stale.
+        let sequence = self.next_sequence;
+        self.next_sequence += 1;
+        item.sequence = sequence;
         self.heap.push(HeapEntry {
             priority: item.priority,
-            sequence: item.sequence,
+            sequence,
             dedupe_key: item.dedupe_key.clone(),
         });
         self.pending_by_key.insert(item.dedupe_key.clone(), item);
+        ReinsertOutcome::Requeued
     }
 
     pub(crate) fn peek_ready(
@@ -875,6 +932,86 @@ mod tests {
         );
         assert!(duplicate.is_duplicate());
         assert_eq!(scheduler.len(), 1);
+    }
+
+    #[test]
+    fn reinsert_advances_sequence_so_a_failing_item_does_not_starve_newer_work() {
+        // Round-3 starvation regression: live-retry re-inserted the item with
+        // its original (low) sequence, so a repeatedly-undispatched injection
+        // kept winning the oldest-first heap and starved every newer injection
+        // to its session. reinsert must now sink the retried item BEHIND newer
+        // queued work.
+        let mut scheduler = MasterContinuationScheduler::new();
+        let older = queued(
+            scheduler.enqueue_at(
+                request(
+                    MasterContinuationReason::External("peer".to_string()),
+                    "older",
+                )
+                .with_dedupe_key("peer/older"),
+                ts(20),
+            ),
+        );
+        scheduler.enqueue_at(
+            request(
+                MasterContinuationReason::External("peer".to_string()),
+                "newer",
+            )
+            .with_dedupe_key("peer/newer"),
+            ts(21),
+        );
+
+        // Pop the older item (a claim whose dispatch then failed).
+        let claimed = scheduler
+            .pop_ready(MasterContinuationRuntimeState::idle())
+            .expect("older item pops first");
+        assert_eq!(claimed.dedupe_key, older.dedupe_key);
+
+        // Re-insert it undelivered — it must yield to the newer item.
+        assert_eq!(scheduler.reinsert(claimed), ReinsertOutcome::Requeued);
+
+        let next = scheduler
+            .pop_ready(MasterContinuationRuntimeState::idle())
+            .expect("a queued item is ready");
+        assert_eq!(
+            next.dedupe_key.as_str(),
+            "peer/newer",
+            "the re-inserted older item must not starve newer work"
+        );
+    }
+
+    #[test]
+    fn reinsert_drops_item_after_max_redelivery_attempts() {
+        // A permanently-undeliverable injection must stop churning: after
+        // MAX_REDELIVERY_ATTEMPTS re-inserts it is dropped from the queue
+        // instead of being re-queued forever.
+        let mut scheduler = MasterContinuationScheduler::new();
+        scheduler.enqueue_at(
+            request(
+                MasterContinuationReason::External("peer".to_string()),
+                "stuck",
+            )
+            .with_dedupe_key("peer/stuck"),
+            ts(20),
+        );
+
+        // The first MAX_REDELIVERY_ATTEMPTS re-inserts each re-queue the item.
+        for attempt in 0..MAX_REDELIVERY_ATTEMPTS {
+            let item = scheduler
+                .pop_ready(MasterContinuationRuntimeState::idle())
+                .unwrap_or_else(|| panic!("item still queued before attempt {attempt}"));
+            assert_eq!(scheduler.reinsert(item), ReinsertOutcome::Requeued);
+        }
+
+        // The next attempt exceeds the cap and drops the item.
+        let item = scheduler
+            .pop_ready(MasterContinuationRuntimeState::idle())
+            .expect("item still queued before the final attempt");
+        assert_eq!(scheduler.reinsert(item), ReinsertOutcome::Dropped);
+        assert!(
+            scheduler.is_empty(),
+            "a dropped injection must not remain queued"
+        );
     }
 
     #[test]
