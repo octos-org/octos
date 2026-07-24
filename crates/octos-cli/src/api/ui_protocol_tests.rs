@@ -7904,6 +7904,105 @@ fn retarget_tombstones_old_durable_record_no_restart_dup() {
     );
 }
 
+/// #436 P1 #1 — retarget must persist the NEW durable record BEFORE tombstoning
+/// the OLD one, so a crash between the two writes can never lose the injection
+/// (worst case both survive, never "neither"). Asserted on the durable event
+/// log: the new record's queue event precedes the old record's completed
+/// (tombstone) event.
+#[test]
+fn retarget_persists_new_before_tombstoning_old_crash_safe() {
+    use crate::api::agent_orchestrator::{InProcessAgentOrchestrator, PeerSendInputEnqueueOutcome};
+    let dir = tempfile::tempdir().unwrap();
+    let orch = InProcessAgentOrchestrator::default();
+    orch.configure_supervisor_store(dir.path()).unwrap();
+    let profile_id = "tenant-a";
+    let slug = "crash-order-peer";
+    let s1 = SessionKey::with_profile_topic(profile_id, "api", "c1", &format!("peer-{slug}"));
+    let s2 = SessionKey::with_profile_topic(profile_id, "api", "c2", &format!("peer-{slug}"));
+    assert_eq!(
+        orch.enqueue_peer_send_input_continuation(&s1, profile_id, slug, "call-1", "work"),
+        PeerSendInputEnqueueOutcome::Queued
+    );
+    assert_eq!(
+        orch.retarget_peer_send_input_continuations(profile_id, slug, &s2),
+        1
+    );
+
+    let events = std::fs::read_to_string(
+        crate::api::supervisor_store::SupervisorStore::new(dir.path()).events_path(),
+    )
+    .unwrap();
+    let lines: Vec<&str> = events.lines().collect();
+    // The NEW record's queue event is the only one mentioning the S2 wire.
+    let new_queued_idx = lines
+        .iter()
+        .position(|l| l.contains("c2#peer-crash-order-peer"))
+        .expect("new record queue event present");
+    // The OLD record's tombstone is the (only) `continuation_completed` event.
+    let old_completed_idx = lines
+        .iter()
+        .position(|l| l.contains("continuation_completed"))
+        .expect("old record tombstone present");
+    assert!(
+        new_queued_idx < old_completed_idx,
+        "the new record must be persisted BEFORE the old is tombstoned \
+         (new_queued={new_queued_idx}, old_completed={old_completed_idx})",
+    );
+}
+
+/// #436 P1 #2/#4 — an injection that was popped (claimed) but NOT delivered
+/// (failed dispatch, or an obsolete wire) is RE-INSERTED so it is retryable
+/// live on the next tick — the recently-claimed guard must not block the
+/// redraw. Without this it would only ever re-deliver at a server restart.
+#[test]
+fn reinsert_makes_popped_injection_drainable_again() {
+    use crate::api::agent_orchestrator::{InProcessAgentOrchestrator, PeerSendInputEnqueueOutcome};
+    use crate::api::master_continuation_scheduler::MasterContinuationRuntimeState;
+    let orch = InProcessAgentOrchestrator::default();
+    let profile_id = "test-peer-reinsert";
+    let slug = "reinsert-peer";
+    let s = SessionKey::with_profile_topic(profile_id, "api", "c1", &format!("peer-{slug}"));
+    assert_eq!(
+        orch.enqueue_peer_send_input_continuation(&s, profile_id, slug, "call-1", "retry me"),
+        PeerSendInputEnqueueOutcome::Queued
+    );
+
+    // Drain (pop) — removes it from pending and records the recently-claimed
+    // guard entry.
+    let drained = orch.drain_ready_continuations_for_session(
+        &s,
+        profile_id,
+        MasterContinuationRuntimeState::idle(),
+        1,
+    );
+    assert_eq!(drained.len(), 1);
+    assert_eq!(
+        orch.pending_continuation_count_for_session_for_test(&s, profile_id),
+        0
+    );
+
+    // Undelivered → re-insert. It must be pending AND drainable again (the
+    // recently-claimed guard is cleared for a not-delivered restore).
+    orch.reinsert_peer_continuation(drained.into_iter().next().unwrap());
+    assert_eq!(
+        orch.pending_continuation_count_for_session_for_test(&s, profile_id),
+        1,
+        "the undelivered injection is re-queued for live retry",
+    );
+    let redrained = orch.drain_ready_continuations_for_session(
+        &s,
+        profile_id,
+        MasterContinuationRuntimeState::idle(),
+        1,
+    );
+    assert_eq!(
+        redrained.len(),
+        1,
+        "the re-inserted injection is retryable on the next tick",
+    );
+    assert_eq!(master_continuation_prompt(&redrained[0]), "retry me");
+}
+
 /// Regression: a `mark_failed` driven by the orphan-task sweep
 /// during `enable_persistence` (`task_supervisor.rs:1164-1166`)
 /// MUST reach the recovery callback. This pins the wiring order

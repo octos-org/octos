@@ -17,6 +17,16 @@
 //!   collapse while a true retry dedups.
 //! - Returns a clear error when the peer session is not open / not authorized /
 //!   could not be durably queued.
+//!
+//! Security model (single-user-per-profile / Option C): authorization is
+//! session-scoped WITHIN one user's own trust domain — in serve, profile ===
+//! user id, so a profile is a single user. Cross-USER injection is blocked by
+//! profile scoping; an LLM cannot cross-session-inject (it can't `session/open`
+//! and the caller session is server-captured), so the originator check blocks
+//! the meaningful in-band threat. The residual same-user cross-session case (a
+//! client deliberately opening the owner session) is the user's own authority
+//! within their own profile, by design. See the host-side
+//! `peer_send_input_authorized` for the full rationale.
 
 use std::sync::Arc;
 

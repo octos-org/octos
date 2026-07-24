@@ -2458,21 +2458,14 @@ impl InProcessAgentOrchestrator {
             .collect();
         let mut rehomed = 0;
         for (old_key, occurrence_id, message) in stranded {
-            state.continuations.cancel(&old_key);
-            // #436 P1 #3 — TOMBSTONE the old DURABLE record. `cancel` only
-            // drops the in-memory entry; `restore` re-enqueues every
-            // non-`Completed` durable record on restart, so without this the
-            // obsolete-wire injection would resurrect and re-deliver after a
-            // restart. Writing a completed event flips the persisted status so
-            // restore skips it. (No-op when there is no supervisor store.)
-            if let Some(store) = state.supervisor_store.as_ref() {
-                let _ = store.record_continuation_completed(
-                    PEER_SEND_INPUT_GROUP,
-                    old_key.as_str(),
-                    now_ms_u64(),
-                    Some("retargeted_to_reopened_peer_wire".to_owned()),
-                );
-            }
+            // #436 P1 #1 — CRASH-ORDER SAFETY. The re-home is three writes
+            // (persist-new / tombstone-old-durable / cancel-old-in-mem) with no
+            // transaction. Order them so no crash window can lose the injection:
+            // persist the NEW record FIRST, and only AFTER it is durable retire
+            // the OLD one. A crash between the two leaves BOTH durable — never
+            // "neither" — and the redundant old is handled by the freshness gate
+            // (+ dedup) on the next drain. `restore`'s completed-only skip means
+            // the tombstone is what prevents a restart re-delivering the old.
             let request = MasterContinuationRequest::new(
                 PEER_SEND_INPUT_GROUP,
                 new_session_str.clone(),
@@ -2484,16 +2477,44 @@ impl InProcessAgentOrchestrator {
             .with_metadata(PEER_SEND_INPUT_META_SLUG, slug.to_owned())
             .with_metadata(PEER_SEND_INPUT_META_OCCURRENCE, occurrence_id.clone())
             .with_dedupe_key(peer_send_input_dedupe_key(new_session, &occurrence_id));
-            if let MasterContinuationEnqueueOutcome::Queued(cont) =
-                state.continuations.enqueue(request)
-            {
-                // Re-home under the new wire's key; a persist failure here only
-                // affects restart replay, not in-process delivery.
-                let _ = persist_continuation_queued_checked(&state, &cont);
-                rehomed += 1;
+            let new_cont = match state.continuations.enqueue(request) {
+                MasterContinuationEnqueueOutcome::Queued(cont) => cont,
+                // Already re-homed (e.g. a prior retarget for the same reopen);
+                // fall through to retire the stale old record.
+                MasterContinuationEnqueueOutcome::Duplicate { .. } => {
+                    retire_old_peer_injection(&mut state, &old_key);
+                    rehomed += 1;
+                    continue;
+                }
+            };
+            // Persist the NEW record before touching the old. On a durable-write
+            // failure, propagate it: roll back the in-mem new and LEAVE the old
+            // intact (still deliverable + durable) rather than risk losing both.
+            if let Err(err) = persist_continuation_queued_checked(&state, &new_cont) {
+                tracing::error!(
+                    ?err,
+                    slug,
+                    "peer_send_input re-home persist failed; leaving the old record \
+                     intact (not re-homed this pass)"
+                );
+                state.continuations.cancel(&new_cont.dedupe_key);
+                continue;
             }
+            // New is durable — NOW retire the old (cancel in-mem + tombstone).
+            retire_old_peer_injection(&mut state, &old_key);
+            rehomed += 1;
         }
         rehomed
+    }
+
+    /// #436 P1 #2/#4 — re-insert a popped-but-UNDELIVERED peer injection so it
+    /// is retried live on the next tick (and re-homed by a reopen's retarget),
+    /// instead of waiting for a server restart's durable replay. The durable
+    /// record is still `Queued` (an undelivered turn is never tombstoned), so
+    /// this only restores the in-memory queue entry.
+    pub(crate) fn reinsert_peer_continuation(&self, continuation: QueuedMasterContinuation) {
+        let mut state = self.state();
+        state.continuations.reinsert(continuation);
     }
 
     /// #979 / M15-C2 — flip the goal to `complete` when the model
@@ -5348,6 +5369,33 @@ fn persist_continuation_queued_checked(
         metadata,
     };
     store.record_continuation_queued(record).map(|_| ())
+}
+
+/// #436 P1 #1 — retire a re-homed peer injection's OLD record: drop the
+/// in-memory entry and TOMBSTONE the durable record so a restart's `restore`
+/// (which re-enqueues every non-`Completed` record) does not resurrect + re-
+/// deliver it. A tombstone-write failure is logged, not swallowed silently;
+/// the worst case is the old record surviving a restart, where the freshness
+/// gate + dedup drop it — never a lost injection.
+fn retire_old_peer_injection(
+    state: &mut AutonomyRuntimeState,
+    old_key: &MasterContinuationDedupeKey,
+) {
+    state.continuations.cancel(old_key);
+    if let Some(store) = state.supervisor_store.as_ref() {
+        if let Err(err) = store.record_continuation_completed(
+            PEER_SEND_INPUT_GROUP,
+            old_key.as_str(),
+            now_ms_u64(),
+            Some("retargeted_to_reopened_peer_wire".to_owned()),
+        ) {
+            tracing::error!(
+                ?err,
+                key = old_key.as_str(),
+                "peer_send_input old-record tombstone write failed"
+            );
+        }
+    }
 }
 
 fn master_continuation_request_from_persisted(

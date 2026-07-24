@@ -545,6 +545,27 @@ impl MasterContinuationScheduler {
         self.pending_by_key.remove(dedupe_key)
     }
 
+    /// #436 P1 #2/#4 — RE-INSERT a continuation that was popped (claimed) but
+    /// NOT consumed: an injection whose turn failed to dispatch, or whose
+    /// target wire went obsolete before dispatch. Restores it to the pending
+    /// set + heap and CLEARS its recently-claimed guard entry so it is
+    /// immediately drainable again. That guard exists to collapse a re-enqueue
+    /// racing a claim of a WILL-BE-delivered item; a not-delivered restore is
+    /// the opposite and must be redrained, so bypassing the guard here is
+    /// correct. Idempotent: a key already pending is left untouched.
+    pub(crate) fn reinsert(&mut self, item: QueuedMasterContinuation) {
+        self.recently_claimed_external.remove(&item.dedupe_key);
+        if self.pending_by_key.contains_key(&item.dedupe_key) {
+            return;
+        }
+        self.heap.push(HeapEntry {
+            priority: item.priority,
+            sequence: item.sequence,
+            dedupe_key: item.dedupe_key.clone(),
+        });
+        self.pending_by_key.insert(item.dedupe_key.clone(), item);
+    }
+
     pub(crate) fn peek_ready(
         &mut self,
         runtime_state: MasterContinuationRuntimeState,

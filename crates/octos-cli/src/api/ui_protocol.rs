@@ -2098,6 +2098,32 @@ fn evict_peer_wire_session(session_id: &SessionKey) {
 /// session, and the target peer's wire may change across reconnects without
 /// affecting this check. Fail-closed: a missing originator record (e.g. a
 /// profile-scoped `peer_prepare` that recorded no originator) is unauthorized.
+///
+/// # Security model (#436 #5 — single-user-per-profile / Option C)
+///
+/// Authorization is SESSION-scoped WITHIN a single user's own trust domain. In
+/// serve, the authenticated identity IS the profile: `authenticated_profile_id`
+/// returns the `AuthIdentity::User { id }` id *as* the profile, so a profile is
+/// exactly one user's own trust domain.
+///
+/// - **Cross-USER injection is blocked by profile scoping.** A connection can
+///   only open / run turns in sessions under its own profile
+///   (`validate_authenticated_session_scope`), so a different user cannot reach
+///   another user's peer at all — the strong isolation boundary.
+/// - **An LLM cannot cross-session-inject.** `caller_session` is the
+///   SERVER-CAPTURED session of the running turn (never a client-supplied
+///   argument), and the LLM cannot call `session/open` — so an LLM in a
+///   non-owner session sees its own session key ≠ the recorded originator and
+///   is rejected. This check blocks LLM-level cross-session injection, the
+///   meaningful in-band threat.
+/// - **The residual same-user, cross-session "spoof" is by design.** A CLIENT
+///   that deliberately `session/open`s the owner session and drives a turn
+///   there satisfies the originator check — but that is the USER exercising
+///   their own authority within their own profile, not a cross-trust breach.
+///   Making it non-spoofable would require a capability / session-access-control
+///   model (a per-peer owner token held outside any session-replayable channel;
+///   Option A), which is OUT OF SCOPE for the single-user serve model. If
+///   serve ever gains sub-user identities or multi-user profiles, revisit here.
 fn peer_send_input_authorized(
     peers_root: &Path,
     slug: &str,
@@ -14775,6 +14801,17 @@ async fn maybe_spawn_appui_master_continuation_runner(
         return false;
     };
 
+    // #436 P1 #4 — re-check peer freshness AFTER the pop (the pre-pop gate in
+    // the global drain is stale under a concurrent reopen). If this peer wire
+    // is no longer the slug's CURRENT registered wire, do NOT dispatch under
+    // the obsolete/closed wire: re-insert the injection so a reopen's retarget
+    // re-homes it (or the next tick redrains it once it is current again).
+    // No-op for non-peer (goal/loop) targets, which are always "current".
+    if !peer_target_is_current_wire(&session_id) {
+        default_agent_orchestrator().reinsert_peer_continuation(continuation);
+        return false;
+    }
+
     // M15-F5 (#44), Codex P2: a scheduled loop fire (self-paced / fixed /
     // maintenance) or goal continuation reaches the runtime here, NOT through
     // the manual `loop/fire_now` RPC. Emit the `loop/fired` /
@@ -14950,11 +14987,16 @@ async fn maybe_spawn_appui_master_continuation_runner(
                 Some("processed_by_appui_turn_runtime".to_owned()),
             );
         } else {
+            // #436 P1 #2 — the injection never reached the agent (e.g. a failed
+            // `TurnStarted`). Keep the durable record AND re-insert it so it is
+            // retried LIVE on the next tick (and re-homed by a reopen's
+            // retarget) — not stranded until a server restart's durable replay.
             tracing::warn!(
                 continuation_id = continuation.id.as_u64(),
-                "peer_send_input turn did not dispatch the agent; leaving the \
-                 injection durable for retry/replay"
+                "peer_send_input turn did not dispatch the agent; re-queuing the \
+                 injection for live retry"
             );
+            default_agent_orchestrator().reinsert_peer_continuation(continuation);
         }
     });
 
@@ -23592,6 +23634,14 @@ async fn run_standalone_turn(
         workspace_root: Some(session_runtime.workspace_root.clone()),
     };
     if let Some(reply) = ws_slash::try_dispatch_slash_command(&prompt, &slash_ctx).await {
+        // #436 P1 #3 — a `/`-prefixed injected message is CONSUMED here (the
+        // command runs + is persisted) and returns before the agent-dispatch
+        // flag point below. Mark it dispatched so the continuation runner
+        // COMPLETES it rather than keeping it durable — otherwise a slash-shaped
+        // peer_send_input injection would be re-delivered after a restart.
+        if let Some(flag) = turn_dispatched.as_ref() {
+            flag.store(true, std::sync::atomic::Ordering::Release);
+        }
         let user_turn_id = turn_id.0.to_string();
         let user_message = pre_stamp_turn_thread_id(Message::user(prompt.clone()), &user_turn_id);
         let assistant_message = pre_stamp_turn_thread_id(Message::assistant(reply), &user_turn_id);
