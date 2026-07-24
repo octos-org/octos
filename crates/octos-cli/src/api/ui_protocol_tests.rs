@@ -7558,23 +7558,50 @@ async fn peer_send_input_injects_continuation_for_peer_session() {
     // A non-peer session is a no-op (never registered).
     register_peer_wire_session(&SessionKey::with_profile("other", "web", "plain"));
 
+    use crate::api::agent_orchestrator::PeerSendInputEnqueueOutcome;
     let orchestrator = default_agent_orchestrator();
     let message = "focus on the auth module next; skip the CSS pass";
-    let outcome = orchestrator.enqueue_peer_send_input_continuation(&resolved, profile_id, message);
-    assert!(outcome.queued().is_some(), "first injection must enqueue");
+    // `call-1` stands in for the LLM `tool_call_id` of the first tool call.
+    let outcome = orchestrator
+        .enqueue_peer_send_input_continuation(&resolved, profile_id, slug, "call-1", message);
+    assert_eq!(
+        outcome,
+        PeerSendInputEnqueueOutcome::Queued,
+        "first injection must enqueue"
+    );
     assert_eq!(
         orchestrator.pending_continuation_count_for_session_for_test(&peer_key, profile_id),
         1,
         "the injection is queued for the peer session",
     );
 
-    // Dedupe: an identical re-injection collapses onto the pending item.
-    let dup = orchestrator.enqueue_peer_send_input_continuation(&resolved, profile_id, message);
-    assert!(dup.is_duplicate(), "identical re-injection must dedupe");
+    // #436 P1 #4 — dedupe keys on the occurrence id, NOT the text: a genuine
+    // retry of the SAME call (same occurrence) collapses...
+    let dup = orchestrator
+        .enqueue_peer_send_input_continuation(&resolved, profile_id, slug, "call-1", message);
+    assert_eq!(
+        dup,
+        PeerSendInputEnqueueOutcome::Duplicate,
+        "same-call retry must dedupe"
+    );
     assert_eq!(
         orchestrator.pending_continuation_count_for_session_for_test(&peer_key, profile_id),
         1,
-        "dedupe must not grow the queue",
+        "a retry must not grow the queue",
+    );
+    // ...while a DISTINCT call (new occurrence) with IDENTICAL text is a
+    // separate injection and enqueues a second turn.
+    let distinct = orchestrator
+        .enqueue_peer_send_input_continuation(&resolved, profile_id, slug, "call-2", message);
+    assert_eq!(
+        distinct,
+        PeerSendInputEnqueueOutcome::Queued,
+        "a distinct tool call with identical text must NOT collapse"
+    );
+    assert_eq!(
+        orchestrator.pending_continuation_count_for_session_for_test(&peer_key, profile_id),
+        2,
+        "two distinct injections must yield two turns",
     );
 
     // Drain (what the peer's tick does) + render (what `run_standalone_turn`
@@ -7601,16 +7628,6 @@ async fn peer_send_input_injects_continuation_for_peer_session() {
         "a user injection must not be wrapped as a system-internal continuation",
     );
 
-    // A DIFFERENT message is a distinct injection (fresh turn, not deduped).
-    let other = orchestrator.enqueue_peer_send_input_continuation(
-        &resolved,
-        profile_id,
-        "also run the integration tests before you stop",
-    );
-    assert!(
-        other.queued().is_some(),
-        "a distinct message enqueues a fresh turn",
-    );
     // Housekeeping: drain the residual so the shared static is left clean for
     // sibling tests (never `clear_default_agent_orchestrator_for_test` — that
     // would wipe parallel tests' queues).
@@ -7619,6 +7636,176 @@ async fn peer_send_input_injects_continuation_for_peer_session() {
         profile_id,
         crate::api::master_continuation_scheduler::MasterContinuationRuntimeState::idle(),
         8,
+    );
+}
+
+/// #436 P1 #6 — only the peer's recorded ORIGINATOR may inject. A different
+/// same-profile session (or a peer with no recorded owner) is rejected.
+#[test]
+fn peer_send_input_authorized_only_for_recorded_originator() {
+    let tmp = tempfile::tempdir().unwrap();
+    let peers_root = tmp.path();
+    let slug = "auth-peer";
+    std::fs::create_dir_all(peers_root.join(slug)).unwrap();
+    let owner = "tenant-a:api:master-1";
+    std::fs::write(peers_root.join(slug).join("originator"), owner).unwrap();
+
+    // The recorded originator is authorized (trailing newline tolerated).
+    assert!(peer_send_input_authorized(peers_root, slug, owner).is_ok());
+    std::fs::write(
+        peers_root.join(slug).join("originator"),
+        format!("{owner}\n"),
+    )
+    .unwrap();
+    assert!(peer_send_input_authorized(peers_root, slug, owner).is_ok());
+
+    // A DIFFERENT same-profile session is rejected with the ownership error.
+    let err = peer_send_input_authorized(peers_root, slug, "tenant-a:api:intruder-2")
+        .expect_err("a non-originator session must be rejected");
+    assert!(err.contains("not the owner"), "reason: {err}");
+
+    // A peer with NO recorded originator is fail-closed.
+    let err2 = peer_send_input_authorized(peers_root, "unstaged", owner)
+        .expect_err("missing originator must be unauthorized");
+    assert!(err2.contains("no recorded owner"), "reason: {err2}");
+}
+
+/// #436 P1 #2 — a peer continuation is only drained by the connection that has
+/// the peer session open, so its live (ephemeral) turn output never renders on
+/// another same-profile client. Non-peer targets are unaffected.
+#[test]
+fn peer_continuation_only_drained_by_owning_connection() {
+    let peer = SessionKey::with_profile_topic("tenant-a", "api", "tab-1", "peer-slugz");
+    let goal_session = SessionKey::with_profile("tenant-a", "api", "master");
+    let master_open: std::collections::HashSet<SessionKey> =
+        [goal_session.clone()].into_iter().collect();
+    let peer_open: std::collections::HashSet<SessionKey> = [peer.clone()].into_iter().collect();
+
+    // Master hasn't opened the peer → must NOT run the peer's turn.
+    assert!(!peer_target_deliverable_on_connection(&peer, &master_open));
+    // The peer's own connection → runs it (live output reaches the peer).
+    assert!(peer_target_deliverable_on_connection(&peer, &peer_open));
+    // Non-peer targets (goal/loop) — any connection may drain, as before.
+    assert!(peer_target_deliverable_on_connection(
+        &goal_session,
+        &master_open
+    ));
+    assert!(peer_target_deliverable_on_connection(
+        &goal_session,
+        &std::collections::HashSet::new()
+    ));
+}
+
+/// #436 P1 #3 — a durable-persist failure must surface as an ERROR, never a
+/// false success ack; a queued/duplicate injection is a success.
+#[test]
+fn peer_send_input_persist_failure_maps_to_error_not_success() {
+    use crate::api::agent_orchestrator::PeerSendInputEnqueueOutcome;
+    let err = PeerSendInputEnqueueOutcome::PersistFailed
+        .into_callback_result("slugz")
+        .expect_err("persist failure must be an error, not a success ack");
+    assert!(
+        err.contains("slugz") && err.contains("not delivered"),
+        "reason: {err}"
+    );
+    assert!(
+        PeerSendInputEnqueueOutcome::Queued
+            .into_callback_result("slugz")
+            .is_ok()
+    );
+    assert!(
+        PeerSendInputEnqueueOutcome::Duplicate
+            .into_callback_result("slugz")
+            .is_ok()
+    );
+}
+
+/// #436 P1 #1 — on reconnect the peer opens under a NEW client-chosen wire key;
+/// a queued injection must be RE-HOMED to the new session, not stranded on the
+/// closed one.
+#[tokio::test]
+async fn peer_send_input_rehomes_to_reopened_peer_wire_on_reconnect() {
+    use crate::api::agent_orchestrator::PeerSendInputEnqueueOutcome;
+    let orchestrator = default_agent_orchestrator();
+    let profile_id = "test-peer-reconnect-rehome";
+    let slug = "reconnect-peer";
+    let s1 = SessionKey::with_profile_topic(profile_id, "api", "conn-1", &format!("peer-{slug}"));
+    let s2 = SessionKey::with_profile_topic(profile_id, "api", "conn-2", &format!("peer-{slug}"));
+
+    // Peer opens as S1; an injection is queued against S1.
+    register_peer_wire_session(&s1);
+    let outcome = orchestrator.enqueue_peer_send_input_continuation(
+        &s1,
+        profile_id,
+        slug,
+        "call-x",
+        "resume work",
+    );
+    assert_eq!(outcome, PeerSendInputEnqueueOutcome::Queued);
+    assert_eq!(
+        orchestrator.pending_continuation_count_for_session_for_test(&s1, profile_id),
+        1
+    );
+
+    // Peer reopens as a NEW wire key S2 → the stranded injection is re-homed.
+    register_peer_wire_session(&s2);
+    assert_eq!(
+        orchestrator.pending_continuation_count_for_session_for_test(&s1, profile_id),
+        0,
+        "the injection must not remain stranded on the closed S1",
+    );
+    assert_eq!(
+        orchestrator.pending_continuation_count_for_session_for_test(&s2, profile_id),
+        1,
+        "the injection must be re-homed to the reopened S2",
+    );
+    assert_eq!(
+        peer_wire_registry().resolve(&peer_wire_key(profile_id, slug)),
+        Some(s2.clone()),
+        "registry reflects latest-wins wire",
+    );
+    // The re-homed continuation still renders the original text verbatim.
+    let drained = orchestrator.drain_ready_continuations_for_session(
+        &s2,
+        profile_id,
+        crate::api::master_continuation_scheduler::MasterContinuationRuntimeState::idle(),
+        8,
+    );
+    assert_eq!(drained.len(), 1);
+    assert_eq!(master_continuation_prompt(&drained[0]), "resume work");
+}
+
+/// #436 P1 #5 — a closing peer is evicted from the wire registry so it is no
+/// longer a stale injection target; a stale close must not clobber a session
+/// that already reopened.
+#[test]
+fn peer_wire_registry_evicts_on_close_conditionally() {
+    let profile_id = "test-peer-evict-close";
+    let slug = "evict-peer";
+    let s1 = SessionKey::with_profile_topic(profile_id, "api", "c1", &format!("peer-{slug}"));
+    register_peer_wire_session(&s1);
+    assert_eq!(
+        peer_wire_registry().resolve(&peer_wire_key(profile_id, slug)),
+        Some(s1.clone())
+    );
+
+    // Close S1 → evicted.
+    evict_peer_wire_session(&s1);
+    assert_eq!(
+        peer_wire_registry().resolve(&peer_wire_key(profile_id, slug)),
+        None,
+        "a closed peer must not remain a resolvable target",
+    );
+
+    // Race: peer reopened as S2 before S1's close lands — the stale close of S1
+    // must NOT evict the fresh S2 mapping.
+    let s2 = SessionKey::with_profile_topic(profile_id, "api", "c2", &format!("peer-{slug}"));
+    register_peer_wire_session(&s2);
+    evict_peer_wire_session(&s1);
+    assert_eq!(
+        peer_wire_registry().resolve(&peer_wire_key(profile_id, slug)),
+        Some(s2),
+        "a stale close must not evict the reopened session",
     );
 }
 
@@ -21947,6 +22134,9 @@ async fn appui_due_fixed_loop_tick_drains_internal_continuation_turn() {
         &active_turns,
         &connection_turns,
         Some(MAIN_PROFILE_ID),
+        // A loop continuation (non-peer) is unaffected by the peer open-session
+        // filter, so an empty set is fine here.
+        &std::collections::HashSet::new(),
         features,
     )
     .await;

@@ -1986,6 +1986,9 @@ struct PeerWireRegistry {
 const PEER_WIRE_REGISTRY_MAX: usize = 8192;
 
 impl PeerWireRegistry {
+    /// Register (or UPDATE) the slug→wire mapping. Latest open wins (#436 P1
+    /// #1): a reconnect under a fresh client-chosen wire key overwrites the
+    /// prior mapping so resolution always targets the CURRENT session.
     fn register(&self, key: String, session_id: SessionKey) {
         let mut map = self
             .by_key
@@ -2009,6 +2012,24 @@ impl PeerWireRegistry {
             .get(key)
             .cloned()
     }
+
+    /// Evict the mapping for `key` ONLY when it still points at `session_id`
+    /// (#436 P1 #5). The conditional guard is race-safe: if the peer already
+    /// reopened under a newer wire key (register overwrote the value), a late
+    /// close of the OLD session must not clobber the fresh mapping. Returns
+    /// whether an entry was removed. Also frees a slot against the cap.
+    fn evict_if_value(&self, key: &str, session_id: &SessionKey) -> bool {
+        let mut map = self
+            .by_key
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if map.get(key) == Some(session_id) {
+            map.remove(key);
+            true
+        } else {
+            false
+        }
+    }
 }
 
 fn peer_wire_registry() -> &'static PeerWireRegistry {
@@ -2022,20 +2043,77 @@ fn peer_wire_key(profile_id: &str, slug: &str) -> String {
     format!("{profile_id}:peer:{slug}")
 }
 
-/// Register a `peer-<slug>` session's wire key so `peer_send_input` can
-/// resolve it. No-op for non-peer or unprofiled sessions.
-fn register_peer_wire_session(session_id: &SessionKey) {
-    let Some(slug) = session_id
+/// Split a `peer-<slug>` session key into `(profile_id, slug)`, or `None` for
+/// a non-peer or unprofiled session.
+fn peer_slug_and_profile(session_id: &SessionKey) -> Option<(&str, &str)> {
+    let slug = session_id
         .topic()
         .and_then(|topic| topic.strip_prefix("peer-"))
-        .filter(|slug| !slug.is_empty())
-    else {
-        return;
-    };
-    let Some(profile_id) = session_id.profile_id() else {
+        .filter(|slug| !slug.is_empty())?;
+    let profile_id = session_id.profile_id()?;
+    Some((profile_id, slug))
+}
+
+/// Register a `peer-<slug>` session's wire key so `peer_send_input` can resolve
+/// it, and re-home any injections queued against the peer's PREVIOUS wire key
+/// onto this one (#436 P1 #1 reconnect). No-op for non-peer / unprofiled
+/// sessions.
+fn register_peer_wire_session(session_id: &SessionKey) {
+    let Some((profile_id, slug)) = peer_slug_and_profile(session_id) else {
         return;
     };
     peer_wire_registry().register(peer_wire_key(profile_id, slug), session_id.clone());
+    // Reconnect: migrate any pending injection stranded on the peer's old wire
+    // key to this newly-opened session so it is delivered, not lost.
+    let rehomed = default_agent_orchestrator()
+        .retarget_peer_send_input_continuations(profile_id, slug, session_id);
+    if rehomed > 0 {
+        tracing::debug!(
+            slug,
+            rehomed,
+            session = %session_id,
+            "re-homed pending peer_send_input injections to reopened peer session"
+        );
+    }
+}
+
+/// Evict a `peer-<slug>` session's wire mapping on session/connection close so
+/// a closed peer is not a stale injection target (#436 P1 #5). Conditional on
+/// the mapping still pointing at THIS session, so a concurrent reopen wins.
+fn evict_peer_wire_session(session_id: &SessionKey) {
+    let Some((profile_id, slug)) = peer_slug_and_profile(session_id) else {
+        return;
+    };
+    peer_wire_registry().evict_if_value(&peer_wire_key(profile_id, slug), session_id);
+}
+
+/// #436 P1 #6 — authorize a `peer_send_input` injection: ONLY the peer's
+/// recorded ORIGINATOR — the session that staged it via `peer_handoff` /
+/// `peer_prepare`, written to `peers/<slug>/originator` — may inject into it.
+/// Previously any non-peer session in the same profile could inject into any
+/// open staged peer.
+///
+/// Authorizing by the STABLE originator identity (not the ephemeral wire key)
+/// composes with the reconnect wire-resolution fix: the caller is the master
+/// session, and the target peer's wire may change across reconnects without
+/// affecting this check. Fail-closed: a missing originator record (e.g. a
+/// profile-scoped `peer_prepare` that recorded no originator) is unauthorized.
+fn peer_send_input_authorized(
+    peers_root: &Path,
+    slug: &str,
+    caller_session: &str,
+) -> Result<(), String> {
+    let originator_path = peers_root.join(slug).join("originator");
+    match std::fs::read_to_string(&originator_path) {
+        Ok(recorded) if recorded.trim() == caller_session => Ok(()),
+        Ok(_) => Err(format!(
+            "not the owner of peer session '{slug}' — only the session that \
+             staged this peer may send it input"
+        )),
+        Err(_) => Err(format!(
+            "peer session '{slug}' has no recorded owner; cannot authorize input"
+        )),
+    }
 }
 
 fn session_permission_profiles() -> Arc<SessionPermissionProfileStore> {
@@ -4711,6 +4789,8 @@ async fn ui_protocol_connection(
                 let profile_filter = connection_profile_id
                     .or(routed_profile_id)
                     .or(session_open_profile_id.as_deref());
+                let open_sessions: std::collections::HashSet<SessionKey> =
+                    live_forwarders.lock().await.keys().cloned().collect();
                 drain_appui_due_master_continuations(
                     &ws,
                     &state,
@@ -4719,6 +4799,7 @@ async fn ui_protocol_connection(
                     &active_turns,
                     &connection_turns,
                     profile_filter,
+                    &open_sessions,
                     features,
                 ).await;
                 emit_session_orchestration_updates(
@@ -5463,6 +5544,8 @@ where
                 break;
             }
             _ = appui_continuation_tick.tick() => {
+                let open_sessions: std::collections::HashSet<SessionKey> =
+                    live_forwarders.lock().await.keys().cloned().collect();
                 drain_appui_due_master_continuations(
                     &ws,
                     &state,
@@ -5471,6 +5554,7 @@ where
                     &active_turns,
                     &connection_turns,
                     connection_profile_id_owned.as_deref(),
+                    &open_sessions,
                     features,
                 ).await;
                 emit_session_orchestration_updates(
@@ -6241,6 +6325,10 @@ async fn abort_live_forwarders(forwarders: &SharedLiveForwarders, ledger: &UiPro
     }
     for session_id in drained_sessions {
         ledger.prune_subscriber_if_idle(&session_id);
+        // #436 P1 #5 — a closing peer session must stop being an injection
+        // target so `peer_send_input` fails cleanly (or re-homes on reopen)
+        // rather than queuing into a dead session; also frees a registry slot.
+        evict_peer_wire_session(&session_id);
     }
 }
 
@@ -14869,6 +14957,26 @@ async fn maybe_spawn_appui_master_continuation_runner(
     true
 }
 
+/// #436 P1 #2 — decide whether THIS connection's per-connection continuation
+/// drain may run a due target. A peer session's turn streams live deltas
+/// EPHEMERALLY to the running connection's socket, so a non-owning same-profile
+/// connection (e.g. the master) draining a peer continuation would render the
+/// peer's turn on the WRONG client. Restrict a peer target to the connection
+/// that has the peer session open; a peer whose client is elsewhere or
+/// disconnected is left for its OWN connection or the connection-independent
+/// global drain (detached socket → delivered via the peer's durable session
+/// forwarder). Non-peer targets (goal/loop/child) are unchanged — any
+/// same-profile connection may drain them, as before.
+fn peer_target_deliverable_on_connection(
+    wire_key: &SessionKey,
+    open_sessions: &std::collections::HashSet<SessionKey>,
+) -> bool {
+    let is_peer = wire_key
+        .topic()
+        .is_some_and(|topic| topic.starts_with("peer-"));
+    !is_peer || open_sessions.contains(wire_key)
+}
+
 async fn drain_appui_due_master_continuations(
     ws: &WsConnection,
     state: &Arc<AppState>,
@@ -14877,6 +14985,10 @@ async fn drain_appui_due_master_continuations(
     active_turns: &SharedActiveTurns,
     connection_turns: &SharedConnectionTurns,
     profile_filter: Option<&str>,
+    // #436 P1 #2 — the sessions THIS connection has open (live_forwarders
+    // snapshot); a peer continuation is only drained here when its session is
+    // in this set, so its live output reaches the peer's own client.
+    open_sessions: &std::collections::HashSet<SessionKey>,
     features: ConnectionUiFeatures,
 ) {
     let orchestrator = default_agent_orchestrator();
@@ -14891,6 +15003,10 @@ async fn drain_appui_due_master_continuations(
             continue;
         }
         let wire_key = wire_key_from_goal_key(&storage_key);
+        // #436 P1 #2 — never run another client's peer turn on this connection.
+        if !peer_target_deliverable_on_connection(&wire_key, open_sessions) {
+            continue;
+        }
         let _ = maybe_spawn_appui_master_continuation_runner(
             ws,
             state,
@@ -24183,8 +24299,15 @@ async fn run_standalone_turn(
         if peer_handoff_allowed_for_session(&session_id) {
             let send_profile_id = session_runtime.profile.profile_id.clone();
             let send_peers_root = session_runtime.profile.data_dir.join("peers");
+            // #436 P1 #6 — the ORIGINATOR identity of THIS calling session,
+            // captured at wire time. Only the session that staged the peer may
+            // inject into it.
+            let send_origin_session = session_id.to_string();
             let send_input: octos_agent::PeerSendInputCallback =
                 Arc::new(move |req: octos_agent::PeerSendInputRequest| {
+                    // #436 P1 #6 — authorize before any delivery path: only the
+                    // peer's recorded originator may inject.
+                    peer_send_input_authorized(&send_peers_root, &req.slug, &send_origin_session)?;
                     let key = peer_wire_key(&send_profile_id, &req.slug);
 
                     // Path 1: gateway in-process inbox (fast, direct).
@@ -24236,15 +24359,19 @@ async fn run_standalone_turn(
                             slug = req.slug
                         ));
                     }
-                    // Duplicate == already queued for delivery: treat as success
-                    // so an identical re-injection is a no-op, not a spurious
-                    // error (dedupe collapses it onto the pending continuation).
-                    let _ = default_agent_orchestrator().enqueue_peer_send_input_continuation(
-                        &target,
-                        &send_profile_id,
-                        &req.message,
-                    );
-                    Ok(())
+                    // #436 P1 #3/#4 — enqueue keyed on the unique occurrence id
+                    // (distinct calls never collapse) and map the REAL delivery
+                    // status to the result: a durable-persist failure is an
+                    // error, not a false success ack; Queued/Duplicate are ok.
+                    default_agent_orchestrator()
+                        .enqueue_peer_send_input_continuation(
+                            &target,
+                            &send_profile_id,
+                            &req.slug,
+                            &req.occurrence_id,
+                            &req.message,
+                        )
+                        .into_callback_result(&req.slug)
                 });
             tool_registry.register(octos_agent::PeerSendInputTool::new(send_input));
         }

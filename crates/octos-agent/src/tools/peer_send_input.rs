@@ -1,18 +1,22 @@
-//! `peer_send_input` — master→peer cross-session TurnStart injection (#436).
+//! `peer_send_input` — master→peer cross-session input injection (#436).
 //!
 //! When the master's LLM needs to give a follow-up instruction to a RUNNING
-//! peer session, this tool pushes an InboundMessage into the peer's
-//! session-actor inbox via a server-side channel. No TUI round-trip required.
-//!
-//! The host callback (wired during turn construction in the serve/WS path)
-//! holds a reference to the global peer inbox registry; the tool itself
-//! carries no IPC knowledge beyond calling that callback.
+//! peer session, this tool hands the message to a host callback (wired during
+//! turn construction in the serve/WS path). The tool carries no IPC knowledge;
+//! the callback picks the delivery path: the gateway in-process actor inbox
+//! when present, else the serve master-continuation queue (which delivers the
+//! injection as the peer's next turn on its own connection).
 //!
 //! Guard rails:
 //! - Depth-1: the tool is never registered on peer sessions themselves (same
 //!   guard as `peer_handoff`).
+//! - Authorization: only the peer's recorded originator may inject (enforced
+//!   host-side by the callback).
 //! - Max message size: PEER_SEND_INPUT_MAX_BYTES (64 KB).
-//! - Returns a clear error when the peer session is not running.
+//! - Each call carries a unique occurrence id so two distinct sends never
+//!   collapse while a true retry dedups.
+//! - Returns a clear error when the peer session is not open / not authorized /
+//!   could not be durably queued.
 
 use std::sync::Arc;
 
@@ -34,7 +38,20 @@ pub struct PeerSendInputRequest {
     pub slug: String,
     /// The message to inject as a new turn into the peer session.
     pub message: String,
+    /// #436 P1 — a UNIQUE-per-tool-call occurrence id (the LLM `tool_call_id`
+    /// when available, else a process-unique fallback). The continuation-queue
+    /// producer embeds this in its dedupe key so two DISTINCT injections
+    /// (separate tool calls, even with identical text) do NOT collapse, while a
+    /// genuine retry of the SAME call (same id) still dedups — the invariant
+    /// the scheduler requires of every `External` producer.
+    pub occurrence_id: String,
 }
+
+/// Monotonic fallback for the occurrence id when no `tool_call_id` is present
+/// (`ToolContext::zero()` — tests / non-context callers). Process-unique, which
+/// is all the in-memory dedupe needs.
+static PEER_SEND_INPUT_OCCURRENCE_SEQ: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 
 /// Host callback that delivers a message to a running peer session's inbox.
 pub type PeerSendInputCallback =
@@ -102,6 +119,18 @@ impl Tool for PeerSendInputTool {
     }
 
     async fn execute(&self, args: &Value) -> Result<ToolResult> {
+        // Migration pattern: the real logic lives in `execute_with_context` so
+        // it can read the `tool_call_id`; the context-free entry delegates with
+        // a zero context (which yields the process-unique fallback occurrence).
+        self.execute_with_context(&super::ToolContext::zero(), args)
+            .await
+    }
+
+    async fn execute_with_context(
+        &self,
+        ctx: &super::ToolContext,
+        args: &Value,
+    ) -> Result<ToolResult> {
         let input: Input = match serde_json::from_value(args.clone()) {
             Ok(i) => i,
             Err(e) => {
@@ -146,9 +175,23 @@ impl Tool for PeerSendInputTool {
             });
         }
 
+        // #436 P1 (#4) — the occurrence id makes THIS tool call unique so two
+        // distinct sends don't collapse. Prefer the LLM `tool_call_id` (stable
+        // across a framework retry of the same call → a true retry dedups);
+        // fall back to a process-unique counter when absent.
+        let occurrence_id = if ctx.tool_id.trim().is_empty() {
+            format!(
+                "seq-{}",
+                PEER_SEND_INPUT_OCCURRENCE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            )
+        } else {
+            ctx.tool_id.clone()
+        };
+
         let request = PeerSendInputRequest {
             slug: slug.to_string(),
             message: message.to_string(),
+            occurrence_id,
         };
 
         match (self.send_input)(request) {

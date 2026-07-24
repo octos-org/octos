@@ -12,8 +12,9 @@ use super::goal_loop_runtime::{
     resolve_maintenance_prompt,
 };
 use super::master_continuation_scheduler::{
-    MasterContinuationEnqueueOutcome, MasterContinuationReason, MasterContinuationRequest,
-    MasterContinuationRuntimeState, MasterContinuationScheduler, QueuedMasterContinuation,
+    MasterContinuationDedupeKey, MasterContinuationEnqueueOutcome, MasterContinuationReason,
+    MasterContinuationRequest, MasterContinuationRuntimeState, MasterContinuationScheduler,
+    QueuedMasterContinuation,
 };
 use super::supervisor_store::{
     ArtifactRecord as SupervisorArtifactRecord, ChildAgentRecord, ChildStatus, ContinuationStatus,
@@ -139,8 +140,51 @@ pub(crate) const PEER_SEND_INPUT_EXTERNAL_KIND: &str = "peer_send_input";
 /// Metadata key carrying the verbatim injected message; the prompt renderer
 /// emits it as the peer turn's user prompt.
 pub(crate) const PEER_SEND_INPUT_META_MESSAGE: &str = "peer_send_input_message";
+/// Metadata key carrying the peer slug, so a pending injection can be
+/// re-homed to the peer's new wire key on reconnect (#436 P1 #1/#5).
+pub(crate) const PEER_SEND_INPUT_META_SLUG: &str = "peer_send_input_slug";
+/// Metadata key carrying the unique occurrence id, so a re-home preserves the
+/// dedupe identity (a genuine retry still collapses after re-target).
+pub(crate) const PEER_SEND_INPUT_META_OCCURRENCE: &str = "peer_send_input_occurrence";
 /// Group id stamped onto peer_send_input continuations (queue triage filter).
 const PEER_SEND_INPUT_GROUP: &str = "peer-send-input";
+
+/// #436 P1 (#3) — real delivery status for a `peer_send_input` injection so the
+/// tool never acks success on a durable-persist failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PeerSendInputEnqueueOutcome {
+    /// Newly queued (durably persisted, or in-memory-only when no store).
+    Queued,
+    /// Collapsed onto an already-queued injection with the SAME occurrence id
+    /// (a genuine retry) — already queued for delivery.
+    Duplicate,
+    /// Enqueued in-memory but the durable store write failed; the enqueue was
+    /// rolled back so it is NOT queued. The caller MUST surface an error.
+    PersistFailed,
+}
+
+impl PeerSendInputEnqueueOutcome {
+    /// The tool callback maps a real delivery status to its `Result`: a
+    /// persist failure is an ERROR (do not ack success), everything else is a
+    /// queued-for-delivery success.
+    pub(crate) fn into_callback_result(self, slug: &str) -> Result<(), String> {
+        match self {
+            Self::Queued | Self::Duplicate => Ok(()),
+            Self::PersistFailed => Err(format!(
+                "failed to durably queue input for peer '{slug}' (storage write \
+                 error) — the injection was not delivered; try again"
+            )),
+        }
+    }
+}
+
+/// The dedupe key for a `peer_send_input` continuation. Keyed on the peer's
+/// wire session AND the unique per-call occurrence id, so distinct calls never
+/// collapse while a same-call retry (or a re-home under the same occurrence)
+/// dedups.
+fn peer_send_input_dedupe_key(session: &SessionKey, occurrence_id: &str) -> String {
+    format!("external/{PEER_SEND_INPUT_EXTERNAL_KIND}/{session}/{occurrence_id}")
+}
 
 #[derive(Debug, Clone)]
 pub(crate) struct AgentListRequest {
@@ -2323,21 +2367,20 @@ impl InProcessAgentOrchestrator {
     /// (or the connection-independent global drain) and rendered verbatim as
     /// the peer's next user turn by `master_continuation_prompt`.
     ///
-    /// Dedupe is content-hashed: an identical re-injection to the same peer
-    /// collapses onto the pending (or just-claimed) continuation so the same
-    /// message is never delivered twice, while a DIFFERENT message enqueues a
-    /// fresh turn. Returns [`MasterContinuationEnqueueOutcome::Duplicate`]
-    /// for a collapsed re-injection (the caller treats that as success — the
-    /// input is already queued for delivery).
+    /// Dedupe keys on the UNIQUE per-call `occurrence_id` (#436 P1 #4), so two
+    /// DISTINCT injections (separate tool calls, even identical text) each get
+    /// a fresh turn, while a genuine retry of the SAME call collapses. Returns
+    /// a real delivery status (#436 P1 #3): a durable-store write failure rolls
+    /// the enqueue back and reports [`PeerSendInputEnqueueOutcome::PersistFailed`]
+    /// so the tool surfaces an error rather than acking a false success.
     pub(crate) fn enqueue_peer_send_input_continuation(
         &self,
         target_session: &SessionKey,
         profile_id: &str,
+        slug: &str,
+        occurrence_id: &str,
         message: &str,
-    ) -> MasterContinuationEnqueueOutcome {
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        std::hash::Hash::hash(message, &mut hasher);
-        let message_hash = std::hash::Hasher::finish(&hasher);
+    ) -> PeerSendInputEnqueueOutcome {
         let request = MasterContinuationRequest::new(
             PEER_SEND_INPUT_GROUP,
             target_session.to_string(),
@@ -2346,14 +2389,97 @@ impl InProcessAgentOrchestrator {
             SystemTime::now(),
         )
         .with_metadata(PEER_SEND_INPUT_META_MESSAGE, message.to_owned())
-        .with_dedupe_key(format!(
-            "external/{kind}/{session}/{len}-{message_hash:016x}",
-            kind = PEER_SEND_INPUT_EXTERNAL_KIND,
-            session = target_session,
-            len = message.len(),
-        ));
+        .with_metadata(PEER_SEND_INPUT_META_SLUG, slug.to_owned())
+        .with_metadata(PEER_SEND_INPUT_META_OCCURRENCE, occurrence_id.to_owned())
+        .with_dedupe_key(peer_send_input_dedupe_key(target_session, occurrence_id));
         let mut state = self.state();
-        enqueue_and_persist_continuation(&mut state, request)
+        match state.continuations.enqueue(request) {
+            MasterContinuationEnqueueOutcome::Duplicate { .. } => {
+                PeerSendInputEnqueueOutcome::Duplicate
+            }
+            MasterContinuationEnqueueOutcome::Queued(continuation) => {
+                if let Err(err) = persist_continuation_queued_checked(&state, &continuation) {
+                    tracing::error!(
+                        ?err,
+                        slug,
+                        "peer_send_input durable persist failed; rolling back enqueue"
+                    );
+                    state.continuations.cancel(&continuation.dedupe_key);
+                    PeerSendInputEnqueueOutcome::PersistFailed
+                } else {
+                    PeerSendInputEnqueueOutcome::Queued
+                }
+            }
+        }
+    }
+
+    /// #436 P1 (#1/#5) — re-home any PENDING `peer_send_input` injections for
+    /// `slug` onto the peer's CURRENT wire key when the peer reopens as a fresh
+    /// client-chosen session. Without this, a queued injection stays bound to
+    /// the closed session and is lost. Called from `session/open`. Returns the
+    /// number of injections re-homed. The occurrence id is preserved so a true
+    /// retry still dedups after the re-home.
+    pub(crate) fn retarget_peer_send_input_continuations(
+        &self,
+        profile_id: &str,
+        slug: &str,
+        new_session: &SessionKey,
+    ) -> usize {
+        let new_session_str = new_session.to_string();
+        let mut state = self.state();
+        // Snapshot stranded items (immutable borrow) before mutating the queue.
+        let stranded: Vec<(MasterContinuationDedupeKey, String, String)> = state
+            .continuations
+            .pending_items()
+            .filter(|item| {
+                matches!(&item.reason, MasterContinuationReason::External(kind)
+                    if kind == PEER_SEND_INPUT_EXTERNAL_KIND)
+                    && item.profile_id.as_str() == profile_id
+                    && item
+                        .metadata
+                        .get(PEER_SEND_INPUT_META_SLUG)
+                        .map(String::as_str)
+                        == Some(slug)
+                    && item.session_id.as_str() != new_session_str
+            })
+            .map(|item| {
+                (
+                    item.dedupe_key.clone(),
+                    item.metadata
+                        .get(PEER_SEND_INPUT_META_OCCURRENCE)
+                        .cloned()
+                        .unwrap_or_default(),
+                    item.metadata
+                        .get(PEER_SEND_INPUT_META_MESSAGE)
+                        .cloned()
+                        .unwrap_or_default(),
+                )
+            })
+            .collect();
+        let mut rehomed = 0;
+        for (old_key, occurrence_id, message) in stranded {
+            state.continuations.cancel(&old_key);
+            let request = MasterContinuationRequest::new(
+                PEER_SEND_INPUT_GROUP,
+                new_session_str.clone(),
+                profile_id.to_owned(),
+                MasterContinuationReason::External(PEER_SEND_INPUT_EXTERNAL_KIND.to_owned()),
+                SystemTime::now(),
+            )
+            .with_metadata(PEER_SEND_INPUT_META_MESSAGE, message)
+            .with_metadata(PEER_SEND_INPUT_META_SLUG, slug.to_owned())
+            .with_metadata(PEER_SEND_INPUT_META_OCCURRENCE, occurrence_id.clone())
+            .with_dedupe_key(peer_send_input_dedupe_key(new_session, &occurrence_id));
+            if let MasterContinuationEnqueueOutcome::Queued(cont) =
+                state.continuations.enqueue(request)
+            {
+                // Already persisted once under the old key; a re-home persist
+                // failure only affects restart replay, not in-process delivery.
+                let _ = persist_continuation_queued_checked(&state, &cont);
+                rehomed += 1;
+            }
+        }
+        rehomed
     }
 
     /// #979 / M15-C2 — flip the goal to `complete` when the model
@@ -5157,8 +5283,21 @@ fn persist_continuation_queued(
     state: &AutonomyRuntimeState,
     continuation: &QueuedMasterContinuation,
 ) {
+    // Existing callers keep the fire-and-forget shape; the peer_send_input
+    // path uses the checked variant so a durable-store failure is surfaced
+    // (#436 P1 #3) instead of leaving the tool to ack a false success.
+    let _ = persist_continuation_queued_checked(state, continuation);
+}
+
+/// Durably persist a queued continuation, RETURNING the store error instead of
+/// discarding it. `Ok(())` when there is no supervisor store (pure in-memory
+/// serve — delivery still works in-process) or the write succeeds.
+fn persist_continuation_queued_checked(
+    state: &AutonomyRuntimeState,
+    continuation: &QueuedMasterContinuation,
+) -> std::io::Result<()> {
     let Some(store) = state.supervisor_store.as_ref() else {
-        return;
+        return Ok(());
     };
     let mut metadata = SupervisorMetadata::new();
     metadata.insert("session_id".into(), json!(continuation.session_id.as_str()));
@@ -5194,7 +5333,7 @@ fn persist_continuation_queued(
         attempt: 1,
         metadata,
     };
-    let _ = store.record_continuation_queued(record);
+    store.record_continuation_queued(record).map(|_| ())
 }
 
 fn master_continuation_request_from_persisted(
