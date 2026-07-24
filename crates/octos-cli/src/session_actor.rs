@@ -2699,10 +2699,28 @@ impl ActorRegistry {
         for key in keys_to_remove {
             if let Some(handle) = self.actors.remove(&key) {
                 debug!(session = %key, "removing session actor on delete");
-                drop(handle.tx); // actor's recv() returns None → run loop exits
+                // #436/#437 — drop the peer inbox registry's strong `Sender`
+                // clone for THIS actor's channel BEFORE dropping `handle.tx`.
+                // `dispatch` inserted a `tx.clone()` for peer sessions, so the
+                // registry itself holds a live sender: `is_closed()` can never
+                // fire while that clone is alive, which is why the trailing
+                // `retain(!is_closed)` below cannot evict the entry here. A
+                // stale entry keeps the deleted peer injectable (breaking
+                // `peer_close`) AND keeps the actor's `recv()` from ever
+                // returning `None`, leaking the actor past deletion until its
+                // idle timeout. Purge by `same_channel` so exactly this
+                // actor's entry is removed regardless of its registry key;
+                // dropping `handle.tx` next leaves no senders, so the run loop
+                // exits promptly.
+                peer_inbox_registry()
+                    .lock()
+                    .unwrap()
+                    .retain(|_, reg_tx| !reg_tx.same_channel(&handle.tx));
+                drop(handle.tx); // no senders remain → recv() returns None → run loop exits
             }
         }
-        // #436 — purge closed senders from the peer inbox registry
+        // Defensive sweep: evict any registry entry whose receiver has already
+        // been dropped (an actor that exited on its own before this delete).
         peer_inbox_registry()
             .lock()
             .unwrap()
