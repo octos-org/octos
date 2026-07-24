@@ -38,9 +38,8 @@ fn model_dir() -> PathBuf {
         return PathBuf::from(p);
     }
     let home = std::env::var("HOME").expect("HOME");
-    let snaps = Path::new(&home).join(
-        ".cache/huggingface/hub/models--mlx-community--embeddinggemma-300m-8bit/snapshots",
-    );
+    let snaps = Path::new(&home)
+        .join(".cache/huggingface/hub/models--mlx-community--embeddinggemma-300m-8bit/snapshots");
     let entry = fs::read_dir(&snaps)
         .unwrap_or_else(|e| panic!("model not cached at {snaps:?}: {e}; set OCTOS_EMBED_MODEL_DIR"))
         .filter_map(|e| e.ok())
@@ -92,7 +91,13 @@ fn token_ids(m: &serde_json::Value, i: usize) -> Vec<i32> {
 }
 
 fn cosine(a: &[f32], b: &[f32]) -> f32 {
-    assert_eq!(a.len(), b.len(), "length mismatch {} vs {}", a.len(), b.len());
+    assert_eq!(
+        a.len(),
+        b.len(),
+        "length mismatch {} vs {}",
+        a.len(),
+        b.len()
+    );
     let dot: f32 = a.iter().zip(b).map(|(x, y)| x * y).sum();
     let na: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
     let nb: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
@@ -101,7 +106,12 @@ fn cosine(a: &[f32], b: &[f32]) -> f32 {
 
 /// Relative L2: ‖a-b‖ / ‖b‖.
 fn rel_l2(a: &[f32], b: &[f32]) -> f32 {
-    let num: f32 = a.iter().zip(b).map(|(x, y)| (x - y).powi(2)).sum::<f32>().sqrt();
+    let num: f32 = a
+        .iter()
+        .zip(b)
+        .map(|(x, y)| (x - y).powi(2))
+        .sum::<f32>()
+        .sqrt();
     let den: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-12);
     num / den
 }
@@ -124,9 +134,15 @@ fn should_match_tokenizer_ids_when_encoding_prompts() {
             tok.encode_document(text).unwrap()
         };
         let want = token_ids(&m, i);
-        assert_eq!(got, want, "token ids differ for eval[{i}] ({role}): {text:?}");
+        assert_eq!(
+            got, want,
+            "token ids differ for eval[{i}] ({role}): {text:?}"
+        );
     }
-    println!("tokenizer: all {} eval prompts match Python ids", eval.len());
+    println!(
+        "tokenizer: all {} eval prompts match Python ids",
+        eval.len()
+    );
 }
 
 #[test]
@@ -152,14 +168,24 @@ fn should_match_per_stage_activations_when_probe() {
         "dense1",
         "normalized",
     ];
-    println!("\nper-stage parity (probe idx {probe}, {} tokens):", ids.len());
+    println!(
+        "\nper-stage parity (probe idx {probe}, {} tokens):",
+        ids.len()
+    );
     let mut worst_cos = 1.0f32;
     for stage in stages {
-        let got = taps.get(stage).unwrap_or_else(|| panic!("missing tap {stage}"));
-        let want = golden.get(stage).unwrap_or_else(|| panic!("missing golden {stage}"));
+        let got = taps
+            .get(stage)
+            .unwrap_or_else(|| panic!("missing tap {stage}"));
+        let want = golden
+            .get(stage)
+            .unwrap_or_else(|| panic!("missing golden {stage}"));
         let cos = cosine(got, want);
         let rl2 = rel_l2(got, want);
-        println!("  {stage:<13} cos={cos:.6}  relL2={rl2:.2e}  (n={})", got.len());
+        println!(
+            "  {stage:<13} cos={cos:.6}  relL2={rl2:.2e}  (n={})",
+            got.len()
+        );
         worst_cos = worst_cos.min(cos);
         assert!(cos >= 0.999, "stage {stage}: cosine {cos} < 0.999");
         assert!(rl2 < 5e-3, "stage {stage}: relL2 {rl2} >= 5e-3");
@@ -181,7 +207,11 @@ fn diag_per_block_drift() {
     for i in 0..24 {
         let k = format!("block_{i}");
         if let (Some(g), Some(w)) = (taps.get(&k), golden.get(&k)) {
-            println!("  block_{i:<2} cos={:.6} relL2={:.2e}", cosine(g, w), rel_l2(g, w));
+            println!(
+                "  block_{i:<2} cos={:.6} relL2={:.2e}",
+                cosine(g, w),
+                rel_l2(g, w)
+            );
         }
     }
 }
