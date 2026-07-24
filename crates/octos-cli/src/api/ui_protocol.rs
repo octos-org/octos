@@ -10061,14 +10061,79 @@ fn write_peer_result_if_peer_session(
         TurnTerminalOutcome::Interrupted => "interrupted",
         TurnTerminalOutcome::RateLimited => "rate_limited",
     };
+
+    // #435: versioned result files prevent silent overwrite when a persistent
+    // peer runs multiple turns. Count existing result-*.md files to determine
+    // the turn number so the caller doesn't need to track state.
+    let turn_count = count_peer_result_versions(&peer_dir) + 1;
+
     let text = format!(
-        "---\nslug: {slug}\noutcome: {outcome_str}\nupdated_unix: {updated_unix}\n---\n\n{body}{truncated}\n"
+        "---\nslug: {slug}\noutcome: {outcome_str}\nupdated_unix: {updated_unix}\nturn: {turn_count}\n---\n\n{body}{truncated}\n"
     );
+
+    // Backward-compatible latest copy — peer_gather reads this path.
     if let Err(err) =
         crate::memory_consolidate::apply::atomic_write(&peer_dir.join("result.md"), &text)
     {
         tracing::warn!(?err, slug, "failed to write peer result");
     }
+
+    // Versioned copy — historical record for multi-turn persistent peers.
+    let versioned_path = peer_dir.join(format!("result-{turn_count}.md"));
+    if let Err(err) =
+        crate::memory_consolidate::apply::atomic_write(&versioned_path, &text)
+    {
+        tracing::warn!(?err, slug, turn_count, "failed to write versioned peer result");
+    }
+
+    // Append to the turn index so peer_list and dashboard can discover
+    // historical results without globbing.
+    let turns_path = peer_dir.join("turns.txt");
+    let index_line = format!("{turn_count} {outcome_str} {updated_unix}\n");
+    if let Err(err) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&turns_path)
+        .and_then(|mut f| std::io::Write::write_all(&mut f, index_line.as_bytes()))
+    {
+        tracing::warn!(?err, slug, turn_count, "failed to append to turns.txt");
+    }
+}
+
+/// Count how many `result-*.md` files already exist in the peer directory.
+fn count_peer_result_versions(peer_dir: &std::path::Path) -> u32 {
+    let Ok(read_dir) = std::fs::read_dir(peer_dir) else {
+        return 0;
+    };
+    read_dir
+        .flatten()
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("result-")
+        })
+        .count() as u32
+}
+
+/// Parse `turns.txt` into `[(turn_count, outcome, updated_unix)]`.
+/// Returns `None` when the file doesn't exist.
+fn parse_peer_turns_index(peer_dir: &std::path::Path) -> Option<Vec<(u32, String, u64)>> {
+    let text = std::fs::read_to_string(peer_dir.join("turns.txt")).ok()?;
+    if text.trim().is_empty() {
+        return Some(Vec::new());
+    }
+    let entries: Vec<_> = text
+        .lines()
+        .filter_map(|line| {
+            let mut parts = line.split_whitespace();
+            let count: u32 = parts.next()?.parse().ok()?;
+            let outcome = parts.next()?.to_string();
+            let ts: u64 = parts.next()?.parse().ok()?;
+            Some((count, outcome, ts))
+        })
+        .collect();
+    Some(entries)
 }
 
 /// Cap a string at `cap` bytes on a char boundary; returns (text, truncated).
@@ -10113,6 +10178,9 @@ struct PeerBlackboardRow {
     result_truncated: bool,
     result_updated_unix: Option<u64>,
     has_worktree: bool,
+    /// #435: parsed `turns.txt` entries: `[(turn_count, outcome, updated_unix)]`.
+    /// `None` when the file doesn't exist (single-turn-or-less peer).
+    turn_history: Option<Vec<(u32, String, u64)>>,
 }
 
 /// #1801: row-reading core of the peer blackboard — every staged peer dir
@@ -10165,6 +10233,7 @@ fn read_peer_blackboard(peers_root: &Path, slugs: Option<&[String]>) -> Vec<Peer
                 result_truncated,
                 result_updated_unix,
                 has_worktree: dir.join("wt").is_dir(),
+                turn_history: parse_peer_turns_index(&dir),
             });
         }
     }
@@ -10202,6 +10271,15 @@ fn raw_peer_gather(
                 "result_truncated": row.result_truncated,
                 "result_updated_unix": row.result_updated_unix,
                 "has_worktree": row.has_worktree,
+                "turn_history": row.turn_history.as_ref().map(|history| {
+                    history.iter().map(|(count, outcome, ts)| {
+                        json!({
+                            "turn": count,
+                            "outcome": outcome,
+                            "updated_unix": ts,
+                        })
+                    }).collect::<Vec<_>>()
+                }),
             })
         })
         .collect();
