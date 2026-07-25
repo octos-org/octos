@@ -48,8 +48,10 @@ impl Block {
         })
     }
 
-    pub fn forward(&self, x: &Array) -> Result<Array> {
-        let r = self.attn.forward(&self.input_layernorm.forward(x)?)?;
+    /// `mask` is the optional additive attention mask (padded batches only);
+    /// see [`Attention::forward`].
+    pub fn forward(&self, x: &Array, mask: Option<&Array>) -> Result<Array> {
+        let r = self.attn.forward(&self.input_layernorm.forward(x)?, mask)?;
         let h = clip_residual(x, &self.post_attention_layernorm.forward(&r)?)?;
         let r = self
             .mlp

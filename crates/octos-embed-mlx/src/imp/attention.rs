@@ -9,15 +9,17 @@
 //! o = o.T(0,2,1,3).reshape(B,L,H*hd);  o_proj(o)
 //! ```
 //! q_norm/k_norm are per-head RMSNorm over `head_dim`, applied BEFORE RoPE.
-//! The RoPE base is per layer (sliding=10000, global=1e6). For the batch=1,
-//! unpadded encoder path the attention mask is all-visible, so we pass `None`
-//! (bidirectional full attention) — validated against the golden oracle.
+//! The RoPE base is per layer (sliding=10000, global=1e6). For an unpadded
+//! sequence the attention mask is all-visible, so `mask` is `None`
+//! (bidirectional full attention) — validated against the golden oracle. Only
+//! the padded-batch path supplies an additive mask, which keeps the verified
+//! single-sequence numerics bit-identical.
 
 use std::collections::HashMap;
 
 use eyre::Result;
 use mlx_rs::Array;
-use mlx_rs::fast::{rope, scaled_dot_product_attention};
+use mlx_rs::fast::{ScaledDotProductAttentionMask, rope, scaled_dot_product_attention};
 
 use super::config::GemmaConfig;
 use super::norm::RmsNorm;
@@ -68,7 +70,10 @@ impl Attention {
     }
 
     /// `x`: `[B, L, hidden]` → `[B, L, hidden]`.
-    pub fn forward(&self, x: &Array) -> Result<Array> {
+    ///
+    /// `mask` is an optional additive attention mask broadcastable to
+    /// `[B, n_heads, L, L]` (in practice `[B, 1, 1, L]` — key-side padding).
+    pub fn forward(&self, x: &Array, mask: Option<&Array>) -> Result<Array> {
         let shape = x.shape();
         let (b, l) = (shape[0], shape[1]);
 
@@ -94,7 +99,13 @@ impl Attention {
             .reshape(&[b, l, self.n_kv_heads, self.head_dim])?
             .transpose_axes(&[0, 2, 1, 3])?;
 
-        let o = scaled_dot_product_attention(&q, &k, &v, self.scale, None)?;
+        let o = scaled_dot_product_attention(
+            &q,
+            &k,
+            &v,
+            self.scale,
+            mask.map(ScaledDotProductAttentionMask::Array),
+        )?;
         let o = o.transpose_axes(&[0, 2, 1, 3])?.reshape(&[b, l, -1])?;
         self.o_proj.forward(&o)
     }

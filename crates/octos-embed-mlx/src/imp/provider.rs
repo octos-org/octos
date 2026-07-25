@@ -7,14 +7,25 @@ use async_trait::async_trait;
 use eyre::Result;
 use octos_llm::EmbeddingProvider;
 
+use crate::plan::{batch_plan, mrl_truncate};
+
 use super::model::GemmaModel;
 use super::tokenizer::GemmaTokenizer;
+
+/// Sequences per forward pass. Batching amortizes MLX's per-op dispatch cost
+/// (24 blocks × ~15 ops each), which dominates the runtime at these sequence
+/// lengths — the marginal cost of a second sequence is far below a second
+/// forward pass. Capped so a batch of long episodes cannot balloon the
+/// intermediate `[B, L, 4*hidden]` activations.
+const DEFAULT_MAX_BATCH: usize = 16;
 
 /// In-process EmbeddingGemma-300M embedder on Apple MLX (Metal).
 ///
 /// `mlx-rs` `Array` is `Send` but not `Sync`, and MLX evaluation is best kept
-/// single-threaded, so the model lives behind a `Mutex` — embed calls serialize
-/// (each is ~5 ms). The tokenizer is `Sync` and stays outside the lock.
+/// single-threaded, so the model lives behind a `Mutex` — forward passes
+/// serialize (~21 ms each for a short sequence on Metal, measured warm at
+/// batch=1). Tokenization is `Sync` and happens outside the lock, and a batched
+/// call takes ONE lock for the whole batch rather than one per text.
 pub struct MlxEmbedder {
     model: Mutex<GemmaModel>,
     tokenizer: GemmaTokenizer,
@@ -24,6 +35,8 @@ pub struct MlxEmbedder {
     /// When true, [`EmbeddingProvider::embed`] applies the QUERY prompt; by
     /// default it applies the DOCUMENT prompt (the common indexing case).
     default_query: bool,
+    /// Max sequences per forward pass.
+    max_batch: usize,
 }
 
 impl MlxEmbedder {
@@ -42,7 +55,14 @@ impl MlxEmbedder {
             native_dim,
             output_dim: native_dim,
             default_query: false,
+            max_batch: DEFAULT_MAX_BATCH,
         })
+    }
+
+    /// Override the number of sequences per forward pass (clamped to >= 1).
+    pub fn with_max_batch(mut self, max_batch: usize) -> Self {
+        self.max_batch = max_batch.max(1);
+        self
     }
 
     /// Make [`EmbeddingProvider::embed`] treat inputs as queries (default: docs).
@@ -68,35 +88,44 @@ impl MlxEmbedder {
     }
 
     /// Embed a batch with an explicit role (`is_query`), returning MRL-truncated
-    /// (and renormalized) vectors of length [`Self::dimension`].
+    /// (and renormalized) vectors of length [`Self::dimension`], in input order.
+    ///
+    /// Texts are tokenized outside the model lock, grouped into length-sorted
+    /// batches of at most `max_batch`, and run one forward pass per batch.
+    /// Padding is masked out of both attention and mean-pooling, so a text's
+    /// embedding does not depend on what it was batched with.
     pub fn embed_texts(&self, texts: &[&str], is_query: bool) -> Result<Vec<Vec<f32>>> {
+        if texts.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Tokenize first: it needs no lock, and the lengths drive the batching.
+        let ids: Vec<Vec<i32>> = texts
+            .iter()
+            .map(|&t| {
+                if is_query {
+                    self.tokenizer.encode_query(t)
+                } else {
+                    self.tokenizer.encode_document(t)
+                }
+            })
+            .collect::<Result<_>>()?;
+        let lens: Vec<usize> = ids.iter().map(Vec::len).collect();
+
+        let mut out: Vec<Vec<f32>> = vec![Vec::new(); texts.len()];
         let model = self
             .model
             .lock()
             .map_err(|_| eyre::eyre!("embedder mutex poisoned"))?;
-        let mut out = Vec::with_capacity(texts.len());
-        for &t in texts {
-            let ids = if is_query {
-                self.tokenizer.encode_query(t)?
-            } else {
-                self.tokenizer.encode_document(t)?
-            };
-            let full = model.embed_ids(&ids)?;
-            out.push(mrl_truncate(full, self.output_dim));
+        for group in batch_plan(&lens, self.max_batch) {
+            let batch: Vec<Vec<i32>> = group.iter().map(|&i| ids[i].clone()).collect();
+            let embedded = model.embed_batch(&batch)?;
+            for (&i, v) in group.iter().zip(embedded) {
+                out[i] = mrl_truncate(v, self.output_dim);
+            }
         }
         Ok(out)
     }
-}
-
-/// Truncate to `out` dims and renormalize (matches the Python MRL path:
-/// `l2(full[:, :d])`). A no-op when `out >= len`.
-fn mrl_truncate(v: Vec<f32>, out: usize) -> Vec<f32> {
-    if out >= v.len() {
-        return v;
-    }
-    let head = &v[..out];
-    let norm = head.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-9);
-    head.iter().map(|x| x / norm).collect()
 }
 
 #[async_trait]

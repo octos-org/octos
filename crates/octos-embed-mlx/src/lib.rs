@@ -20,6 +20,10 @@
 #[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "embed-mlx"))]
 mod imp;
 
+// Pure (MLX-free) helpers, intentionally NOT gated so `cargo test` covers them
+// everywhere — the parity/bench suites cannot run off Apple Silicon.
+mod plan;
+
 #[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "embed-mlx"))]
 pub use imp::MlxEmbedder;
 
