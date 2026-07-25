@@ -4839,6 +4839,7 @@ dependencies = [
  "eyre",
  "mlx-rs",
  "octos-llm",
+ "octos-memory",
  "serde",
  "serde_json",
  "tokenizers",

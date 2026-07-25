@@ -18,6 +18,15 @@ workspace = true
 # target-gated below.
 embed-mlx = ["dep:mlx-rs", "dep:tokenizers", "dep:serde", "dep:serde_json"]
 
+# Live end-to-end demo against octos-memory's HybridIndex — needs the MLX stack.
+[[example]]
+name = "memory_search"
+required-features = ["embed-mlx"]
+
+[[example]]
+name = "retrieval_compare"
+required-features = ["embed-mlx"]
+
 [dependencies]
 eyre = { workspace = true }
 async-trait = { workspace = true }
@@ -32,4 +41,5 @@ serde = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
 
 [dev-dependencies]
+octos-memory.workspace = true
 serde_json.workspace = true
