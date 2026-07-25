@@ -7546,8 +7546,10 @@ async fn peer_send_input_injects_continuation_for_peer_session() {
 
     // `session/open` glue: registering the peer makes its slug resolvable to
     // the wire key the master's `peer_send_input` (which cannot know the
-    // client-chosen wire id) must enqueue under.
-    register_peer_wire_session(&peer_key);
+    // client-chosen wire id) must enqueue under. An empty state has no profile
+    // runtime, so the close-marker retarget skip is a no-op here.
+    let state = Arc::new(AppState::empty_for_tests());
+    register_peer_wire_session(&state, &peer_key);
     let resolved = peer_wire_registry()
         .resolve(&peer_wire_key(profile_id, slug))
         .expect("an opened peer session's slug resolves to its wire key");
@@ -7556,7 +7558,7 @@ async fn peer_send_input_injects_continuation_for_peer_session() {
         "resolved wire key must match the opened peer session",
     );
     // A non-peer session is a no-op (never registered).
-    register_peer_wire_session(&SessionKey::with_profile("other", "web", "plain"));
+    register_peer_wire_session(&state, &SessionKey::with_profile("other", "web", "plain"));
 
     use crate::api::agent_orchestrator::PeerSendInputEnqueueOutcome;
     let orchestrator = default_agent_orchestrator();
@@ -7647,6 +7649,7 @@ fn peer_send_input_authorized_only_for_recorded_originator() {
     let peers_root = tmp.path();
     let slug = "auth-peer";
     std::fs::create_dir_all(peers_root.join(slug)).unwrap();
+    std::fs::write(peers_root.join(slug).join("brief.md"), "brief").unwrap();
     let owner = "tenant-a:api:master-1";
     std::fs::write(peers_root.join(slug).join("originator"), owner).unwrap();
 
@@ -7664,10 +7667,18 @@ fn peer_send_input_authorized_only_for_recorded_originator() {
         .expect_err("a non-originator session must be rejected");
     assert!(err.contains("not the owner"), "reason: {err}");
 
-    // A peer with NO recorded originator is fail-closed.
-    let err2 = peer_send_input_authorized(peers_root, "unstaged", owner)
+    // A STAGED peer (brief present) with NO recorded originator is fail-closed.
+    let no_owner = "no-owner-peer";
+    std::fs::create_dir_all(peers_root.join(no_owner)).unwrap();
+    std::fs::write(peers_root.join(no_owner).join("brief.md"), "brief").unwrap();
+    let err2 = peer_send_input_authorized(peers_root, no_owner, owner)
         .expect_err("missing originator must be unauthorized");
     assert!(err2.contains("no recorded owner"), "reason: {err2}");
+
+    // A non-staged slug (no dir / no brief.md) is refused before any read.
+    let err3 = peer_send_input_authorized(peers_root, "unstaged", owner)
+        .expect_err("a non-staged peer must be unauthorized");
+    assert!(err3.contains("not a staged peer"), "reason: {err3}");
 }
 
 /// #436 P1 #2 — a peer continuation is only drained by the connection that has
@@ -7731,9 +7742,12 @@ async fn peer_send_input_rehomes_to_reopened_peer_wire_on_reconnect() {
     let slug = "reconnect-peer";
     let s1 = SessionKey::with_profile_topic(profile_id, "api", "conn-1", &format!("peer-{slug}"));
     let s2 = SessionKey::with_profile_topic(profile_id, "api", "conn-2", &format!("peer-{slug}"));
+    // An empty state has no registered profile runtime, so the close-marker
+    // skip is a no-op here — retarget behaves exactly as before this fix.
+    let state = Arc::new(AppState::empty_for_tests());
 
     // Peer opens as S1; an injection is queued against S1.
-    register_peer_wire_session(&s1);
+    register_peer_wire_session(&state, &s1);
     let outcome = orchestrator.enqueue_peer_send_input_continuation(
         &s1,
         profile_id,
@@ -7748,7 +7762,7 @@ async fn peer_send_input_rehomes_to_reopened_peer_wire_on_reconnect() {
     );
 
     // Peer reopens as a NEW wire key S2 → the stranded injection is re-homed.
-    register_peer_wire_session(&s2);
+    register_peer_wire_session(&state, &s2);
     assert_eq!(
         orchestrator.pending_continuation_count_for_session_for_test(&s1, profile_id),
         0,
@@ -7783,7 +7797,8 @@ fn peer_wire_registry_evicts_on_close_conditionally() {
     let profile_id = "test-peer-evict-close";
     let slug = "evict-peer";
     let s1 = SessionKey::with_profile_topic(profile_id, "api", "c1", &format!("peer-{slug}"));
-    register_peer_wire_session(&s1);
+    let state = Arc::new(AppState::empty_for_tests());
+    register_peer_wire_session(&state, &s1);
     assert_eq!(
         peer_wire_registry().resolve(&peer_wire_key(profile_id, slug)),
         Some(s1.clone())
@@ -7800,7 +7815,7 @@ fn peer_wire_registry_evicts_on_close_conditionally() {
     // Race: peer reopened as S2 before S1's close lands — the stale close of S1
     // must NOT evict the fresh S2 mapping.
     let s2 = SessionKey::with_profile_topic(profile_id, "api", "c2", &format!("peer-{slug}"));
-    register_peer_wire_session(&s2);
+    register_peer_wire_session(&state, &s2);
     evict_peer_wire_session(&s1);
     assert_eq!(
         peer_wire_registry().resolve(&peer_wire_key(profile_id, slug)),
@@ -7837,12 +7852,13 @@ fn global_drain_skips_obsolete_or_closed_peer_wire() {
     let slug = "freshness-peer";
     let s1 = SessionKey::with_profile_topic(profile_id, "api", "c1", &format!("peer-{slug}"));
     let s2 = SessionKey::with_profile_topic(profile_id, "api", "c2", &format!("peer-{slug}"));
+    let state = Arc::new(AppState::empty_for_tests());
 
-    register_peer_wire_session(&s1);
+    register_peer_wire_session(&state, &s1);
     assert!(peer_target_is_current_wire(&s1), "current wire is runnable");
 
     // Reopen as S2 → S1 is now obsolete.
-    register_peer_wire_session(&s2);
+    register_peer_wire_session(&state, &s2);
     assert!(
         !peer_target_is_current_wire(&s1),
         "an obsolete wire must be skipped by the global drain",
@@ -24724,10 +24740,12 @@ fn stage_peer_reserves_slug_writes_brief_and_releases_on_failure() {
 
     // Plain staging: reserved dir + topic + brief on disk, cwd echoes the
     // workspace root, no fence branch.
+    // `name: None` exercises the LEGACY (title-seeded, auto-suffix) path.
     let staged = stage_peer(
         &peers,
         &plain,
         "CI Fix",
+        None,
         "Investigate the flaky test.",
         false,
     )
@@ -24743,12 +24761,12 @@ fn stage_peer_reserves_slug_writes_brief_and_releases_on_failure() {
     );
 
     // Same seed again: the reserve claim suffixes, same as peer/prepare.
-    let second = stage_peer(&peers, &plain, "CI Fix", "Second lane.", false).unwrap();
+    let second = stage_peer(&peers, &plain, "CI Fix", None, "Second lane.", false).unwrap();
     assert_eq!(second.slug, "ci-fix-2");
 
     // Worktree against a NON-git workspace fails AND releases the slug —
     // the member cleans its own dir so a retry re-claims the same name.
-    let err = stage_peer(&peers, &plain, "No Repo", "Doomed.", true)
+    let err = stage_peer(&peers, &plain, "No Repo", None, "Doomed.", true)
         .expect_err("worktree without a git repo must fail");
     assert!(
         err.message.contains("git repo"),
@@ -24759,7 +24777,7 @@ fn stage_peer_reserves_slug_writes_brief_and_releases_on_failure() {
         !peers.join("no-repo").exists(),
         "failed member removed its dir"
     );
-    let retry = stage_peer(&peers, &plain, "No Repo", "Fenceless retry.", false)
+    let retry = stage_peer(&peers, &plain, "No Repo", None, "Fenceless retry.", false)
         .expect("failed staging must not burn the slug");
     assert_eq!(retry.slug, "no-repo");
 
@@ -24793,8 +24811,8 @@ fn stage_peer_reserves_slug_writes_brief_and_releases_on_failure() {
             "init",
         ],
     );
-    let fenced =
-        stage_peer(&peers, &repo, "Fenced Lane", "Own worktree.", true).expect("worktree staging");
+    let fenced = stage_peer(&peers, &repo, "Fenced Lane", None, "Own worktree.", true)
+        .expect("worktree staging");
     assert_eq!(fenced.worktree_branch.as_deref(), Some("peer/fenced-lane"));
     assert!(fenced.cwd.ends_with("peers/fenced-lane/wt"));
     assert!(
@@ -24847,7 +24865,8 @@ fn peer_handoff_callback_caps_at_four_and_emits_staged_events() {
     for n in 1..=PEER_HANDOFFS_PER_TURN_MAX {
         let staged = callback(octos_agent::PeerHandoffRequest {
             brief: format!("Lane {n}: fix the flaky bus test."),
-            title: Some("Lane".to_owned()),
+            // Unique per iteration — named peers reject duplicates.
+            name: format!("Lane {n}"),
             worktree: false,
         })
         .unwrap_or_else(|err| panic!("handoff {n} within the cap must stage: {err}"));
@@ -24861,7 +24880,7 @@ fn peer_handoff_callback_caps_at_four_and_emits_staged_events() {
 
     let err = callback(octos_agent::PeerHandoffRequest {
         brief: "One too many.".to_owned(),
-        title: None,
+        name: "One too many".to_owned(),
         worktree: false,
     })
     .expect_err("5th handoff must be rejected");
@@ -24874,7 +24893,8 @@ fn peer_handoff_callback_caps_at_four_and_emits_staged_events() {
     let emitted = emitted.lock().unwrap();
     assert_eq!(emitted.len(), 4, "one peer/staged event per success");
     let slugs: Vec<&str> = emitted.iter().map(|e| e.slug.as_str()).collect();
-    assert_eq!(slugs, vec!["lane", "lane-2", "lane-3", "lane-4"]);
+    // Named peers derive a unique slug per name ("Lane 1" -> "lane-1").
+    assert_eq!(slugs, vec!["lane-1", "lane-2", "lane-3", "lane-4"]);
     for (i, event) in emitted.iter().enumerate() {
         assert_eq!(
             event.session_id, originating,
@@ -24936,6 +24956,13 @@ fn peer_gather_callback_composes_done_and_running_rows() {
     let beta = peers_root.join("beta");
     std::fs::create_dir_all(&beta).unwrap();
     std::fs::write(beta.join("brief.md"), "Check CI.").unwrap();
+    // A CLOSED peer (retired via peer_close): the durable `closed` marker wins
+    // over a result file, so it labels `(closed)`, not `(done)`.
+    let gamma = peers_root.join("gamma");
+    std::fs::create_dir_all(&gamma).unwrap();
+    std::fs::write(gamma.join("brief.md"), "Retired work.").unwrap();
+    std::fs::write(gamma.join("result.md"), "partial result before close\n").unwrap();
+    std::fs::write(gamma.join("closed"), "tenant-a:api:master\n1700000000\n").unwrap();
 
     let callback = build_peer_gather_callback(peers_root.clone());
     let text = callback(None).expect("gather composes");
@@ -24947,6 +24974,10 @@ fn peer_gather_callback_composes_done_and_running_rows() {
     assert!(text.contains("## peer beta (still running)"), "{text}");
     assert!(text.contains("(still running — no result yet)"));
     assert!(text.contains("Brief: Check CI."));
+    assert!(
+        text.contains("## peer gamma (closed)"),
+        "closed status wins over done: {text}"
+    );
     let brief_line = text
         .lines()
         .find(|line| line.starts_with("Brief: Review the auth diff."))
@@ -24977,6 +25008,454 @@ fn peer_gather_callback_reports_empty_blackboard() {
     std::fs::create_dir_all(&empty_root).unwrap();
     let empty = build_peer_gather_callback(empty_root);
     assert_eq!(empty(None).unwrap(), "No peers staged for this profile.");
+}
+
+/// #436 hardening — a peer slug is a single path component; reject anything
+/// that could escape `peers/`, mis-key the wire registry, or alias on Windows.
+#[test]
+fn peer_slug_is_safe_rejects_traversal_and_separators() {
+    // Legitimate slugs (as `reserve_peer_dir` / `name_to_slug` emit) pass.
+    for ok in [
+        "alpha",
+        "ci-fix",
+        "lens-review-2",
+        "peer",
+        "a_b-3",
+        "%E4%B8%AD",
+    ] {
+        assert!(peer_slug_is_safe(ok), "{ok:?} should be accepted");
+    }
+    // Traversal / separators / empty / NUL, plus the tightened rejects: a
+    // drive/ADS colon, control chars, a trailing dot or space, and over-length.
+    let too_long = "x".repeat(PEER_SLUG_MAX_BYTES + 1);
+    for bad in [
+        "",
+        ".",
+        "..",
+        "ymote/.",
+        "a/b",
+        "a\\b",
+        "/abs",
+        "..\\x",
+        "a\0b",
+        "C:",
+        "a:b",
+        "abc.",
+        "abc ",
+        "a\tb",
+        "a\nb",
+        "a\x7fb",
+        too_long.as_str(),
+    ] {
+        assert!(!peer_slug_is_safe(bad), "{bad:?} should be rejected");
+    }
+    // Exactly at the cap is still accepted.
+    assert!(peer_slug_is_safe(&"x".repeat(PEER_SLUG_MAX_BYTES)));
+}
+
+/// #436 — `name_to_slug`: lowercase, collapse non-`[a-z0-9]` runs to a single
+/// dash, trim edges, cap length; a pure-unicode / all-punctuation name falls
+/// back to a stable `peer-<hash>` ASCII slug; only a blank name yields no slug.
+#[test]
+fn name_to_slug_normalizes_ascii_and_hashes_unicode() {
+    assert_eq!(name_to_slug("Edison").as_deref(), Some("edison"));
+    assert_eq!(name_to_slug("  CI Fix  ").as_deref(), Some("ci-fix"));
+    assert_eq!(name_to_slug("Team A/B").as_deref(), Some("team-a-b"));
+    assert_eq!(name_to_slug("a---b__c").as_deref(), Some("a-b-c"));
+    assert_eq!(name_to_slug("!!!Edison!!!").as_deref(), Some("edison"));
+    // ASCII alnum wins even when mixed with unicode.
+    assert_eq!(name_to_slug("Edison爱迪生").as_deref(), Some("edison"));
+
+    // Pure unicode / all-punctuation → a stable `peer-<hash>` ASCII slug
+    // (accepted, not rejected): deterministic, safe, and distinct per name.
+    for name in ["爱迪生", "🔬", "!!!"] {
+        let slug = name_to_slug(name).expect("a unicode name gets a hash slug");
+        assert!(slug.starts_with("peer-"), "hash slug: {slug}");
+        assert!(peer_slug_is_safe(&slug));
+        assert_eq!(name_to_slug(name).as_deref(), Some(slug.as_str()), "stable");
+    }
+    assert_ne!(
+        name_to_slug("爱迪生"),
+        name_to_slug("特斯拉"),
+        "distinct unicode names get distinct slugs"
+    );
+
+    // Only a blank / whitespace-only name has no peer.
+    assert_eq!(name_to_slug("   "), None);
+    assert_eq!(name_to_slug(""), None);
+
+    // Derived slug is always safe and within the cap.
+    let long = name_to_slug(&"Name ".repeat(40)).unwrap();
+    assert!(long.len() <= PEER_SLUG_MAX_BYTES);
+    assert!(peer_slug_is_safe(&long));
+}
+
+/// #436 hardening — closing a peer writes the durable `closed` marker (so a
+/// later gather/list and `peer_is_closed` report it), only the recorded owner
+/// may close, and an unauthorized / missing-dir / unsafe-slug close writes NO
+/// marker (leaving the peer open — never partially closed).
+#[test]
+fn peer_close_callback_writes_marker_for_owner_only() {
+    let tmp = tempfile::tempdir().unwrap();
+    let peers_root = tmp.path().join("peers");
+    let slug = "close-me";
+    std::fs::create_dir_all(peers_root.join(slug)).unwrap();
+    std::fs::write(peers_root.join(slug).join("brief.md"), "work").unwrap();
+    let owner = "tenant-a:api:master";
+    std::fs::write(peers_root.join(slug).join("originator"), owner).unwrap();
+
+    assert!(!peer_is_closed(&peers_root, slug), "not closed initially");
+
+    // A NON-owner cannot close — and writes no marker.
+    let intruder = build_peer_close_callback(
+        peers_root.clone(),
+        "tenant-a:api:intruder".to_owned(),
+        "tenant-a".to_owned(),
+    );
+    let err = intruder(slug.to_owned()).expect_err("non-owner must be rejected");
+    assert!(err.contains("not the owner"), "reason: {err}");
+    assert!(
+        !peer_is_closed(&peers_root, slug),
+        "a rejected close must not leave a marker"
+    );
+
+    // The owner closes → durable marker written, body carries the closer id.
+    let close =
+        build_peer_close_callback(peers_root.clone(), owner.to_owned(), "tenant-a".to_owned());
+    let msg = close(slug.to_owned()).expect("owner closes");
+    assert!(msg.contains("closed"), "confirmation: {msg}");
+    assert!(peer_is_closed(&peers_root, slug), "marker is durable");
+    let body = std::fs::read_to_string(peers_root.join(slug).join("closed")).unwrap();
+    assert!(
+        body.contains(owner),
+        "marker body records the closer: {body:?}"
+    );
+
+    // A never-staged peer does not resolve (no name match, no staged dir) and
+    // leaves no marker — a close cannot resurrect / create a peer.
+    let err = close("no-such-peer".to_owned()).expect_err("unstaged peer rejected");
+    assert!(err.contains("no peer named"), "reason: {err}");
+    assert!(
+        !peer_is_closed(&peers_root, "no-such-peer"),
+        "a rejected close writes no marker"
+    );
+
+    // A traversal identifier is rejected at resolve (never joined as a path).
+    let bad = close("../escape".to_owned()).expect_err("unsafe identifier rejected");
+    assert!(bad.contains("no peer named"), "reason: {bad}");
+}
+
+/// PART C — a NAMED peer reserves the exact name-derived slug, stores the
+/// display name, and REJECTS a duplicate name (case-insensitive) or a name
+/// that derives an already-taken slug (no auto-suffix).
+#[test]
+fn stage_peer_named_rejects_duplicate_name_case_insensitive() {
+    let tmp = tempfile::tempdir().unwrap();
+    let peers = tmp.path().join("peers");
+    let ws = tmp.path().join("ws");
+    std::fs::create_dir_all(&ws).unwrap();
+
+    let first =
+        stage_peer(&peers, &ws, "seed", Some("Edison"), "Brief.", false).expect("first named peer");
+    assert_eq!(first.slug, "edison");
+    assert_eq!(
+        std::fs::read_to_string(peers.join("edison").join("name")).unwrap(),
+        "Edison",
+        "the display name is stored verbatim"
+    );
+
+    // Same name (different case) → rejected, NOT auto-suffixed.
+    let dup = stage_peer(&peers, &ws, "seed", Some("EDISON"), "Brief.", false)
+        .expect_err("duplicate name rejected");
+    assert!(
+        dup.message.contains("already exists"),
+        "reason: {}",
+        dup.message
+    );
+    // A different name that derives the SAME slug is also rejected.
+    let dup2 = stage_peer(&peers, &ws, "seed", Some("edison"), "Brief.", false)
+        .expect_err("duplicate slug rejected");
+    assert!(
+        dup2.message.contains("already exists"),
+        "reason: {}",
+        dup2.message
+    );
+
+    // A DISTINCT name stages fine.
+    let second =
+        stage_peer(&peers, &ws, "seed", Some("Tesla"), "Brief.", false).expect("distinct name");
+    assert_eq!(second.slug, "tesla");
+}
+
+/// PART C — `resolve_peer_name_to_slug` maps a display NAME (case-insensitive)
+/// or a slug to the slug; unknown / unsafe idents do not resolve; a legacy
+/// peer with no `name` file resolves by its slug.
+#[test]
+fn resolve_peer_name_to_slug_matches_name_and_slug() {
+    let tmp = tempfile::tempdir().unwrap();
+    let peers = tmp.path().join("peers");
+    let ws = tmp.path().join("ws");
+    std::fs::create_dir_all(&ws).unwrap();
+    stage_peer(&peers, &ws, "seed", Some("Edison"), "Brief.", false).unwrap();
+
+    for ident in ["Edison", "edison", "EDISON", "  Edison  "] {
+        assert_eq!(
+            resolve_peer_name_to_slug(&peers, ident).as_deref(),
+            Some("edison"),
+            "identifier {ident:?} resolves to the slug"
+        );
+    }
+    assert_eq!(resolve_peer_name_to_slug(&peers, "Tesla"), None);
+    assert_eq!(resolve_peer_name_to_slug(&peers, "../escape"), None);
+
+    // A legacy peer (brief but no `name` file) resolves by its slug.
+    std::fs::create_dir_all(peers.join("legacy")).unwrap();
+    std::fs::write(peers.join("legacy").join("brief.md"), "b").unwrap();
+    assert_eq!(
+        resolve_peer_name_to_slug(&peers, "legacy").as_deref(),
+        Some("legacy")
+    );
+}
+
+/// PART C — peer_list and peer_gather surface the display NAME (with the slug
+/// annotated), and gather resolves a name/slug in its identifier filter.
+#[test]
+fn peer_list_and_gather_surface_display_name() {
+    let tmp = tempfile::tempdir().unwrap();
+    let peers = tmp.path().join("peers");
+    let ws = tmp.path().join("ws");
+    std::fs::create_dir_all(&ws).unwrap();
+    stage_peer(&peers, &ws, "seed", Some("Edison"), "Wire the lab.", false).unwrap();
+
+    let list_cb = build_peer_list_callback(peers.clone());
+    let list = list_cb().unwrap();
+    assert!(
+        list.contains("Edison"),
+        "list shows the display name: {list}"
+    );
+    assert!(list.contains("(edison)"), "list annotates the slug: {list}");
+
+    let gather_cb = build_peer_gather_callback(peers.clone());
+    let gather = gather_cb(None).unwrap();
+    assert!(
+        gather.contains("## peer Edison [edison]"),
+        "gather header shows name + slug: {gather}"
+    );
+    // Gather narrows by a DISPLAY NAME in the identifier filter.
+    let by_name = gather_cb(Some(vec!["Edison".to_owned()])).unwrap();
+    assert!(
+        by_name.contains("## peer Edison"),
+        "gather resolves a display name: {by_name}"
+    );
+}
+
+/// PART A + PART C — closing a peer BY NAME reaches the right peer, cancels its
+/// PENDING `peer_send_input` injection (no durable leak), and leaves siblings
+/// untouched.
+#[test]
+fn peer_close_by_name_cancels_pending_injection_for_right_peer() {
+    use crate::api::agent_orchestrator::PeerSendInputEnqueueOutcome;
+    let orchestrator = default_agent_orchestrator();
+    let profile_id = "test-peer-close-by-name";
+    let owner = "test-peer-close-by-name:api:master";
+    let tmp = tempfile::tempdir().unwrap();
+    let peers = tmp.path().join("peers");
+    let ws = tmp.path().join("ws");
+    std::fs::create_dir_all(&ws).unwrap();
+
+    let edison = stage_peer(&peers, &ws, "s", Some("Edison"), "b", false).unwrap();
+    let tesla = stage_peer(&peers, &ws, "s", Some("Tesla"), "b", false).unwrap();
+    assert_eq!(edison.slug, "edison");
+    assert_eq!(tesla.slug, "tesla");
+    std::fs::write(peers.join("edison").join("originator"), owner).unwrap();
+    std::fs::write(peers.join("tesla").join("originator"), owner).unwrap();
+
+    // Queue an injection to Edison — the pre-close leak scenario.
+    let wire = SessionKey::with_profile_topic(profile_id, "api", "c1", "peer-edison");
+    assert_eq!(
+        orchestrator
+            .enqueue_peer_send_input_continuation(&wire, profile_id, "edison", "occ-1", "resume"),
+        PeerSendInputEnqueueOutcome::Queued
+    );
+    assert_eq!(
+        orchestrator.pending_continuation_count_for_session_for_test(&wire, profile_id),
+        1
+    );
+
+    // Close BY DISPLAY NAME (case-insensitive) → the RIGHT peer closes, its
+    // pending injection is cancelled, and the sibling is untouched.
+    let close = build_peer_close_callback(peers.clone(), owner.to_owned(), profile_id.to_owned());
+    let msg = close("EDISON".to_owned()).expect("close by name");
+    assert!(msg.contains("edison"), "confirmation names the slug: {msg}");
+    assert!(peer_is_closed(&peers, "edison"), "the named peer is closed");
+    assert!(!peer_is_closed(&peers, "tesla"), "the sibling is untouched");
+    assert_eq!(
+        orchestrator.pending_continuation_count_for_session_for_test(&wire, profile_id),
+        0,
+        "peer_close cancels the peer's pending injection (no durable leak)"
+    );
+}
+
+/// FIX 1 (security) — a SYMLINKED `peers/<slug>` entry is never resolved, read,
+/// closed, or written through: `staged_peer_dir` inspects the link (not its
+/// target), so I/O can't escape `peers/`.
+#[cfg(unix)]
+#[test]
+fn symlinked_peer_entry_is_not_resolved_or_written() {
+    let tmp = tempfile::tempdir().unwrap();
+    let peers = tmp.path().join("peers");
+    std::fs::create_dir_all(&peers).unwrap();
+    // A hostile target OUTSIDE peers/, complete with brief/name/closed so it
+    // WOULD resolve if the symlink were followed.
+    let outside = tmp.path().join("outside");
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::write(outside.join("brief.md"), "b").unwrap();
+    std::fs::write(outside.join("name"), "Edison").unwrap();
+    std::fs::write(outside.join("closed"), "x").unwrap();
+    std::os::unix::fs::symlink(&outside, peers.join("edison")).unwrap();
+
+    // Every access refuses the symlink.
+    assert!(staged_peer_dir(&peers, "edison").is_none());
+    assert_eq!(resolve_peer_name_to_slug(&peers, "Edison"), None);
+    assert_eq!(resolve_peer_name_to_slug(&peers, "edison"), None);
+    assert!(
+        !peer_is_closed(&peers, "edison"),
+        "a symlinked entry's `closed` is not followed"
+    );
+    assert!(
+        read_peer_blackboard(&peers, None).is_empty(),
+        "a symlinked entry is not a blackboard row"
+    );
+    // peer_close cannot resolve (hence cannot write a marker) through the link.
+    let close = build_peer_close_callback(peers.clone(), "owner".to_owned(), "prof".to_owned());
+    let err = close("Edison".to_owned()).expect_err("symlinked peer must not resolve/close");
+    assert!(err.contains("no peer named"), "reason: {err}");
+
+    // A REAL staged peer beside the symlink is handled normally.
+    let real = peers.join("tesla");
+    std::fs::create_dir_all(&real).unwrap();
+    std::fs::write(real.join("brief.md"), "b").unwrap();
+    assert!(staged_peer_dir(&peers, "tesla").is_some());
+    assert_eq!(
+        resolve_peer_name_to_slug(&peers, "tesla").as_deref(),
+        Some("tesla")
+    );
+}
+
+/// FIX 2 (security) — an unsafe topic-derived slug (`peer-/tmp/x`, `peer-../x`,
+/// a separator/NUL topic) is treated as a NON-peer session, so it never feeds
+/// `Path::join` or the wire registry.
+#[test]
+fn unsafe_peer_topic_slug_is_treated_as_non_peer() {
+    for topic in [
+        "peer-/tmp/x",
+        "peer-../x",
+        "peer-a/b",
+        "peer-a\0b",
+        "peer-.",
+    ] {
+        let s = SessionKey::with_profile_topic("dev", "api", "tab", topic);
+        assert!(
+            peer_slug_and_profile(&s).is_none(),
+            "{topic:?} must not parse as a peer session"
+        );
+        assert!(
+            peer_target_is_current_wire(&s),
+            "{topic:?} is a non-peer target (never gated)"
+        );
+    }
+    // A safe peer topic still parses.
+    let ok = SessionKey::with_profile_topic("dev", "api", "tab", "peer-edison");
+    assert_eq!(peer_slug_and_profile(&ok), Some(("dev", "edison")));
+
+    // register_peer_wire_session must NOT register a wire for an unsafe topic.
+    let state = Arc::new(AppState::empty_for_tests());
+    let bad = SessionKey::with_profile_topic("dev", "api", "tab", "peer-/tmp/x");
+    register_peer_wire_session(&state, &bad);
+    assert_eq!(
+        peer_wire_registry().resolve(&peer_wire_key("dev", "/tmp/x")),
+        None,
+        "an unsafe peer topic must not register a wire key"
+    );
+}
+
+/// FIX 5 — a pending injection to a CLOSED peer is RETIRED (cancelled +
+/// tombstoned) by the drain-gate retire path, not left pending/stranded. This
+/// exercises the exact decision (`peer_is_closed`) + action
+/// (`cancel_peer_send_input_continuations_for_peer`) the global-drain gate wires.
+#[test]
+fn drain_retires_continuation_for_closed_peer_not_pending() {
+    use crate::api::agent_orchestrator::PeerSendInputEnqueueOutcome;
+    let orchestrator = default_agent_orchestrator();
+    let profile_id = "test-drain-retire-closed";
+    let slug = "retire-peer";
+    let tmp = tempfile::tempdir().unwrap();
+    let peers = tmp.path().join("peers");
+    std::fs::create_dir_all(peers.join(slug)).unwrap();
+    std::fs::write(peers.join(slug).join("brief.md"), "b").unwrap();
+
+    let wire = SessionKey::with_profile_topic(profile_id, "api", "c1", &format!("peer-{slug}"));
+    assert_eq!(
+        orchestrator.enqueue_peer_send_input_continuation(&wire, profile_id, slug, "occ-1", "go"),
+        PeerSendInputEnqueueOutcome::Queued
+    );
+    assert_eq!(
+        orchestrator.pending_continuation_count_for_session_for_test(&wire, profile_id),
+        1
+    );
+
+    // The peer is closed → the gate detects it via `peer_is_closed` and RETIRES
+    // the pending set instead of skipping (which would strand it).
+    std::fs::write(peers.join(slug).join("closed"), "owner\n0\n").unwrap();
+    assert!(peer_is_closed(&peers, slug), "closed marker detected");
+    orchestrator.cancel_peer_send_input_continuations_for_peer(profile_id, slug);
+    assert_eq!(
+        orchestrator.pending_continuation_count_for_session_for_test(&wire, profile_id),
+        0,
+        "a closed peer's continuation is retired, not left pending"
+    );
+}
+
+/// #436 hardening — the peer_list index caps inline rows and folds the
+/// overflow into a trailing "… and N more" line.
+#[test]
+fn peer_list_caps_rows_and_summarizes_overflow() {
+    fn row(slug: &str) -> PeerBlackboardRow {
+        PeerBlackboardRow {
+            slug: slug.to_owned(),
+            name: slug.to_owned(),
+            brief: String::new(),
+            brief_truncated: false,
+            result: None,
+            result_truncated: false,
+            result_updated_unix: None,
+            has_worktree: false,
+            closed: false,
+            turn_history: None,
+        }
+    }
+    let over = PEER_LIST_MAX_ROWS + 5;
+    let rows: Vec<_> = (0..over).map(|i| row(&format!("p{i:04}"))).collect();
+    let text = compose_peer_list_text(&rows);
+    assert!(
+        text.starts_with(&format!("peers ({over}):")),
+        "header reports the true count: {:?}",
+        text.lines().next()
+    );
+    let listed = text.lines().filter(|l| l.starts_with("- p")).count();
+    assert_eq!(listed, PEER_LIST_MAX_ROWS, "inline rows are capped");
+    assert!(
+        text.contains("… and 5 more"),
+        "overflow summarized: {text:?}"
+    );
+
+    // Under the cap: every row inline, no summary line.
+    let few = compose_peer_list_text(&[row("only")]);
+    assert!(few.contains("- only"), "{few}");
+    assert!(
+        !few.contains("more"),
+        "no overflow line under the cap: {few}"
+    );
 }
 
 /// #1801 v3 fan-in: the composed tool output is capped at 48KiB total,
@@ -25033,7 +25512,7 @@ fn peer_originator_recorded_by_handoff_callback() {
     );
     let staged = callback(octos_agent::PeerHandoffRequest {
         brief: "Fix the flaky bus test.".to_owned(),
-        title: Some("CI Fix".to_owned()),
+        name: "CI Fix".to_owned(),
         worktree: false,
     })
     .expect("stage");
@@ -25156,6 +25635,7 @@ fn peer_results_ready_note_fires_once_per_new_result() {
     let peers_root = tmp.path().join("peers");
     let dir = peers_root.join("alpha");
     std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("brief.md"), "brief").unwrap();
     let originating = octos_core::SessionKey::with_profile_topic("dev", "local", "tui", "coding");
     std::fs::write(dir.join("originator"), originating.to_string()).unwrap();
     std::fs::write(dir.join("result.md"), "first result").unwrap();
@@ -25202,6 +25682,7 @@ fn peer_results_ready_note_scopes_to_the_originating_session() {
     let peers_root = tmp.path().join("peers");
     let dir = peers_root.join("alpha");
     std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("brief.md"), "brief").unwrap();
     let originating = octos_core::SessionKey::with_profile_topic("dev", "local", "tui", "coding");
     std::fs::write(dir.join("originator"), originating.to_string()).unwrap();
     std::fs::write(dir.join("result.md"), "done").unwrap();
@@ -25212,6 +25693,7 @@ fn peer_results_ready_note_scopes_to_the_originating_session() {
         octos_core::SessionKey::with_profile_topic("dev", "local", "tui", "peer-beta");
     let peer_owned = peers_root.join("beta-child");
     std::fs::create_dir_all(&peer_owned).unwrap();
+    std::fs::write(peer_owned.join("brief.md"), "brief").unwrap();
     std::fs::write(peer_owned.join("originator"), peer_session.to_string()).unwrap();
     std::fs::write(peer_owned.join("result.md"), "done").unwrap();
     assert_eq!(peer_results_ready_note(&peers_root, &peer_session), None);
@@ -25244,6 +25726,7 @@ fn peer_results_ready_note_caps_named_slugs() {
     for i in 1..=6 {
         let dir = peers_root.join(format!("lane-{i}"));
         std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("brief.md"), "brief").unwrap();
         std::fs::write(dir.join("originator"), originating.to_string()).unwrap();
         std::fs::write(dir.join("result.md"), "done").unwrap();
     }

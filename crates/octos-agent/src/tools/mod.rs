@@ -718,8 +718,10 @@ pub mod manage_skills;
 pub mod mcp_agent;
 pub mod memory_note;
 pub mod message;
+pub mod peer_close;
 pub mod peer_gather;
 pub mod peer_handoff;
+pub mod peer_list;
 pub mod peer_send_input;
 pub mod read_file;
 pub mod read_task_output;
@@ -782,10 +784,12 @@ pub use mcp_agent::{
 };
 pub use memory_note::MemoryNoteTool;
 pub use message::MessageTool;
+pub use peer_close::{PeerCloseCallback, PeerCloseTool};
 pub use peer_gather::{PeerGatherCallback, PeerGatherTool};
 pub use peer_handoff::{
     PeerHandoffCallback, PeerHandoffRequest, PeerHandoffStaged, PeerHandoffTool,
 };
+pub use peer_list::{PeerListCallback, PeerListTool};
 pub use peer_send_input::{PeerSendInputCallback, PeerSendInputRequest, PeerSendInputTool};
 pub use read_file::ReadFileTool;
 pub use read_task_output::ReadTaskOutputTool;

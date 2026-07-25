@@ -44,7 +44,8 @@ pub const PEER_SEND_INPUT_MAX_BYTES: usize = 64 * 1024;
 /// Facts the host callback needs to locate the peer session.
 #[derive(Debug, Clone)]
 pub struct PeerSendInputRequest {
-    /// The peer directory slug (as reported by peer_handoff / peer_list).
+    /// The peer IDENTIFIER — its display name or slug (as reported by
+    /// peer_handoff / peer_list). The host resolves it to the directory slug.
     pub slug: String,
     /// The message to inject as a new turn into the peer session.
     pub message: String,
@@ -91,11 +92,11 @@ impl Tool for PeerSendInputTool {
     }
 
     fn description(&self) -> &str {
-        "Send a follow-up message to a RUNNING peer session identified by slug \
-         (as reported by peer_handoff). The peer receives it as its next turn. \
-         Use when a deployed peer needs steering, additional context, or a \
-         correction — but only when the peer was staged earlier in THIS \
-         conversation or the user confirms the slug. The peer MUST be running \
+        "Send a follow-up message to a RUNNING peer identified by its NAME (or \
+         slug), as reported by peer_handoff / peer_list. The peer receives it as \
+         its next turn. Use when a deployed peer needs steering, additional \
+         context, or a correction — but only when the peer was staged earlier in \
+         THIS conversation or the user confirms the name. The peer MUST be running \
          (the user opened the staged session); if it has completed or is idle \
          this will fail with an error."
     }
@@ -116,7 +117,7 @@ impl Tool for PeerSendInputTool {
                 "slug": {
                     "type": "string",
                     "minLength": 1,
-                    "description": "Slug of the peer session to send to (as reported by peer_handoff or peer_list)."
+                    "description": "Peer NAME (or slug) to send to, as reported by peer_handoff or peer_list."
                 },
                 "message": {
                     "type": "string",

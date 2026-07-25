@@ -2050,19 +2050,181 @@ fn peer_slug_and_profile(session_id: &SessionKey) -> Option<(&str, &str)> {
         .topic()
         .and_then(|topic| topic.strip_prefix("peer-"))
         .filter(|slug| !slug.is_empty())?;
+    // #436 security — the topic-derived slug feeds `Path::join` (closed marker,
+    // peers dir) and the wire-key registry. Reject an unsafe one (e.g. a
+    // `peer-/tmp/x` or `peer-../x` topic) HERE so EVERY caller treats it as a
+    // NON-peer session rather than a path that escapes `peers/`.
+    if !peer_slug_is_safe(slug) {
+        return None;
+    }
     let profile_id = session_id.profile_id()?;
     Some((profile_id, slug))
+}
+
+/// Upper bound (bytes) on a peer slug — a slug is a short handle, not a
+/// payload. Aligns with [`name_to_slug`]'s cap so a derived slug always
+/// satisfies [`peer_slug_is_safe`].
+const PEER_SLUG_MAX_BYTES: usize = 64;
+
+/// Reject a peer slug that could escape `peers/` or mis-key the wire registry:
+/// empty, over-long, a `.`/`..` component, any path separator / NUL, a drive /
+/// alternate-data-stream `:`, a control char (`< 0x20`), or a trailing `.`/
+/// space (which some filesystems strip → a DIFFERENT real path). A slug is a
+/// single path component (a dir name under `peers/`) — real slugs from
+/// `reserve_peer_dir` / [`name_to_slug`] are lowercase `[a-z0-9-]` / `%`-escaped
+/// `[A-Za-z0-9_%-]`, so any of the above is illegitimate. Called at the TOP of
+/// the `peer_close` / `peer_send_input` callbacks (after resolving a name to a
+/// slug) before any path join or wire-key op. Mirrors
+/// `octos_core::session_scope::is_safe_session_id`, hardened for cross-platform.
+fn peer_slug_is_safe(slug: &str) -> bool {
+    if slug.is_empty() || slug.len() > PEER_SLUG_MAX_BYTES {
+        return false;
+    }
+    if slug == "." || slug == ".." {
+        return false;
+    }
+    // A trailing dot or space aliases to a different real path on Windows.
+    if slug.ends_with('.') || slug.ends_with(' ') {
+        return false;
+    }
+    // Path separators, NUL/control chars (incl. 0x7f DEL), and the drive/ADS colon.
+    !slug
+        .bytes()
+        .any(|b| matches!(b, b'/' | b'\\' | b':') || b < 0x20 || b == 0x7f)
+}
+
+/// Derive a filesystem/URL-safe ASCII slug from a peer's display NAME:
+/// lowercase, each run of non-`[a-z0-9]` collapses to a single `-`, trim
+/// leading/trailing `-`, cap at [`PEER_SLUG_MAX_BYTES`] bytes. A name with NO
+/// ASCII alphanumerics (a CJK / emoji display name — `爱迪生`, `🔬`) has no
+/// readable slug, so it falls back to a stable FNV-1a hash of the trimmed,
+/// lowercased name: `peer-<16 hex>`. The DISPLAY name (unicode, stored in
+/// `peers/<slug>/name`) is what users see and address; the slug is only the
+/// directory handle and resolution is by the name file, so the same name always
+/// yields the same slug — a duplicate is rejected, never suffixed. Returns
+/// `None` ONLY for a blank / whitespace-only name (which has no peer at all).
+fn name_to_slug(name: &str) -> Option<String> {
+    let mut slug = String::new();
+    let mut prev_dash = false;
+    for ch in name.chars() {
+        if ch.is_ascii_alphanumeric() {
+            slug.push(ch.to_ascii_lowercase());
+            prev_dash = false;
+        } else if !slug.is_empty() && !prev_dash {
+            slug.push('-');
+            prev_dash = true;
+        }
+    }
+    let mut slug = slug.trim_matches('-').to_owned();
+    // All retained bytes are ASCII, so a byte cut is a char boundary; re-trim a
+    // dash the cut may have exposed.
+    if slug.len() > PEER_SLUG_MAX_BYTES {
+        slug.truncate(PEER_SLUG_MAX_BYTES);
+        slug = slug.trim_end_matches('-').to_owned();
+    }
+    if slug.is_empty() {
+        // No ASCII handle (pure CJK / emoji / punctuation): hash the normalized
+        // unicode name into a stable ASCII slug so the peer is still addressable
+        // (by its display name, via the `name` file).
+        let key = name.trim().to_lowercase();
+        if key.is_empty() {
+            return None; // blank / whitespace-only — not a name at all
+        }
+        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+        for b in key.bytes() {
+            hash ^= u64::from(b);
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        slug = format!("peer-{hash:016x}");
+    }
+    peer_slug_is_safe(&slug).then_some(slug)
+}
+
+/// The REAL, staged peer directory for `slug` under `peers_root`, or `None`
+/// when it is not safe to touch. EVERY peer-dir access — reads AND the
+/// close-marker write — routes through this so a hostile or stray
+/// `peers/<slug>` SYMLINK can never redirect I/O outside `peers_root`. Returns
+/// `Some(dir)` ONLY when: [`peer_slug_is_safe`], `peers_root.join(slug)` is a
+/// REAL directory that is NOT a symlink (`symlink_metadata` inspects the LINK,
+/// not its target), and it carries the `brief.md` staging contract.
+fn staged_peer_dir(peers_root: &Path, slug: &str) -> Option<PathBuf> {
+    if !peer_slug_is_safe(slug) {
+        return None;
+    }
+    let dir = peers_root.join(slug);
+    let meta = std::fs::symlink_metadata(&dir).ok()?;
+    if meta.file_type().is_symlink() || !meta.is_dir() {
+        return None;
+    }
+    if !dir.join("brief.md").is_file() {
+        return None;
+    }
+    Some(dir)
+}
+
+/// `true` when `peers/<slug>/closed` exists — the durable marker written by
+/// `peer_close` retiring a peer. Shared by the continuation-drain freshness
+/// gates and the reconnect-retarget skip so a closed peer is never a live
+/// injection target, even for an injection queued just before the close.
+/// Routes through [`staged_peer_dir`] so a symlinked / unsafe slug is never
+/// followed.
+fn peer_is_closed(peers_root: &Path, slug: &str) -> bool {
+    staged_peer_dir(peers_root, slug).is_some_and(|dir| dir.join("closed").is_file())
+}
+
+/// Resolve a peer IDENTIFIER (its display NAME or its slug) to the slug. A name
+/// match is case-insensitive against each REAL staged `peers/<slug>/name`; if
+/// none matches, an `ident` that is itself a safe, staged dir is returned as-is
+/// (slug addressing, and legacy peers that have no `name` file). Both branches
+/// route through [`staged_peer_dir`], so a SYMLINKED entry is skipped and never
+/// resolved. Returns `None` when nothing matches. Names are the primary
+/// address, so callbacks resolve through this BEFORE any auth / path / wire op.
+fn resolve_peer_name_to_slug(peers_root: &Path, ident: &str) -> Option<String> {
+    let target = ident.trim();
+    if target.is_empty() {
+        return None;
+    }
+    let lowered = target.to_lowercase();
+    if let Ok(read_dir) = std::fs::read_dir(peers_root) {
+        for entry in read_dir.flatten() {
+            let slug = entry.file_name().to_string_lossy().into_owned();
+            // Only a REAL, staged (non-symlink) peer dir may claim a name.
+            let Some(dir) = staged_peer_dir(peers_root, &slug) else {
+                continue;
+            };
+            if let Ok(name) = std::fs::read_to_string(dir.join("name")) {
+                if name.trim().to_lowercase() == lowered {
+                    return Some(slug);
+                }
+            }
+        }
+    }
+    // Fall back to slug addressing: an ident that is a safe, staged, non-symlink
+    // dir name.
+    staged_peer_dir(peers_root, target).map(|_| target.to_owned())
 }
 
 /// Register a `peer-<slug>` session's wire key so `peer_send_input` can resolve
 /// it, and re-home any injections queued against the peer's PREVIOUS wire key
 /// onto this one (#436 P1 #1 reconnect). No-op for non-peer / unprofiled
 /// sessions.
-fn register_peer_wire_session(session_id: &SessionKey) {
+fn register_peer_wire_session(state: &Arc<AppState>, session_id: &SessionKey) {
     let Some((profile_id, slug)) = peer_slug_and_profile(session_id) else {
         return;
     };
     peer_wire_registry().register(peer_wire_key(profile_id, slug), session_id.clone());
+    // #436 — a peer retired via peer_close must not resurrect: if the durable
+    // close marker exists, skip re-homing so an injection queued just before the
+    // close is never migrated onto the reopened wire. Belt-and-suspenders — the
+    // continuation-drain freshness gates also refuse a closed target — but this
+    // stops the re-home at the source.
+    if state
+        .profiles
+        .get(profile_id)
+        .is_some_and(|runtime| peer_is_closed(&runtime.data_dir.join("peers"), slug))
+    {
+        return;
+    }
     // Reconnect: migrate any pending injection stranded on the peer's old wire
     // key to this newly-opened session so it is delivered, not lost.
     let rehomed = default_agent_orchestrator()
@@ -2129,8 +2291,16 @@ fn peer_send_input_authorized(
     slug: &str,
     caller_session: &str,
 ) -> Result<(), String> {
-    let originator_path = peers_root.join(slug).join("originator");
-    match std::fs::read_to_string(&originator_path) {
+    // Route through `staged_peer_dir`: the originator read must target a REAL,
+    // non-symlink staged peer under `peers/`, never a symlinked/unsafe slug that
+    // could redirect the read outside the root. Defense-in-depth — callers
+    // already resolve the slug, but auth is the boundary and stays self-safe.
+    let Some(dir) = staged_peer_dir(peers_root, slug) else {
+        return Err(format!(
+            "peer session '{slug}' is not a staged peer; cannot authorize input"
+        ));
+    };
+    match std::fs::read_to_string(dir.join("originator")) {
         Ok(recorded) if recorded.trim() == caller_session => Ok(()),
         Ok(_) => Err(format!(
             "not the owner of peer session '{slug}' — only the session that \
@@ -9761,8 +9931,16 @@ struct RawPeerPrepareParams {
     #[serde(default)]
     n: Option<u32>,
     /// Optional human title — seeds the slug (else the brief's first words).
+    /// Legacy (unnamed) fleet path only; ignored when `names` is given.
     #[serde(default)]
     title: Option<String>,
+    /// Required-when-present peer NAMES: one per fleet member (`len == n`).
+    /// Each is the peer's primary address — non-empty, unique within the list
+    /// AND against existing peers (case-insensitive), and must derive a usable
+    /// slug. When omitted the legacy unnamed (title-seeded, auto-suffixed) path
+    /// is used.
+    #[serde(default)]
+    names: Option<Vec<String>>,
     /// Create a git worktree (branch `peer/<slug>`) under the profile data
     /// dir and return it as the peer's cwd — the blast-radius fence.
     #[serde(default)]
@@ -9827,6 +10005,65 @@ fn reserve_peer_dir(peers_root: &Path, seed: &str) -> Result<(String, PathBuf), 
     Err(RpcError::invalid_params(
         "too many peers with this title — pick a distinct title",
     ))
+}
+
+/// True when a staged peer already claims this NAME (case-insensitive, reading
+/// each `peers/<slug>/name`) or already occupies the derived SLUG. Guards the
+/// NAMED staging path: names are the primary address, so they must be unique.
+fn existing_peer_name_conflict(peers_root: &Path, name: &str, slug: &str) -> bool {
+    let target = name.trim().to_lowercase();
+    let Ok(read_dir) = std::fs::read_dir(peers_root) else {
+        return false;
+    };
+    for entry in read_dir.flatten() {
+        let entry_slug = entry.file_name().to_string_lossy().into_owned();
+        // Any entry occupying the derived slug path — even a symlink or an
+        // unstaged dir — blocks the reservation (`create_dir` fails on it too).
+        if entry_slug == slug {
+            return true;
+        }
+        // A NAME collision only counts against a REAL staged peer: route the
+        // `name` read through `staged_peer_dir` so a symlinked entry is never
+        // followed and never falsely registers as a conflict.
+        if let Some(dir) = staged_peer_dir(peers_root, &entry_slug) {
+            if let Ok(existing) = std::fs::read_to_string(dir.join("name")) {
+                if existing.trim().to_lowercase() == target {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Reserve the EXACT slug derived from a peer NAME (no numeric suffix): a named
+/// peer must be addressable by its name, so a collision is an ERROR, not an
+/// auto-rename. Rejects a name with no usable slug, a duplicate name
+/// (case-insensitive), or a slug already taken. `create_dir` is the atomic
+/// claim that also closes the check→reserve race.
+fn reserve_named_peer_dir(peers_root: &Path, name: &str) -> Result<(String, PathBuf), RpcError> {
+    let Some(slug) = name_to_slug(name) else {
+        return Err(RpcError::invalid_params(
+            "peer name cannot be blank".to_string(),
+        ));
+    };
+    std::fs::create_dir_all(peers_root)
+        .map_err(|err| RpcError::internal_error(format!("failed to create peers dir: {err}")))?;
+    if existing_peer_name_conflict(peers_root, name, &slug) {
+        return Err(RpcError::invalid_params(format!(
+            "a peer named '{name}' already exists"
+        )));
+    }
+    let dir = peers_root.join(&slug);
+    match std::fs::create_dir(&dir) {
+        Ok(()) => Ok((slug, dir)),
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => Err(
+            RpcError::invalid_params(format!("a peer named '{name}' already exists")),
+        ),
+        Err(err) => Err(RpcError::internal_error(format!(
+            "failed to reserve peer dir: {err}"
+        ))),
+    }
 }
 
 /// `peer/prepare` (#1800): stage a peer-agent spin-off. Writes the durable
@@ -9910,6 +10147,49 @@ async fn raw_peer_prepare(
         return Err(RpcError::invalid_params("n must be between 1 and 8"));
     }
 
+    // Peer NAMES (when supplied): exactly one per fleet member, each non-empty,
+    // slug-derivable, and unique within the list (case-insensitive). Uniqueness
+    // AGAINST existing peers is enforced per-member inside `stage_peer`
+    // (`reserve_named_peer_dir`). Trimmed here so the stored name is canonical.
+    let names: Option<Vec<String>> = match params.names.as_ref() {
+        Some(names) => {
+            if names.len() != n as usize {
+                return Err(RpcError::invalid_params(format!(
+                    "names must have exactly {n} entries (one per peer)"
+                )));
+            }
+            // Same per-name bound as the `peer_handoff` tool: a name is a short
+            // handle, not a payload.
+            const PEER_PREPARE_NAME_MAX_CHARS: usize = 64;
+            let mut trimmed = Vec::with_capacity(names.len());
+            let mut seen = std::collections::HashSet::new();
+            for name in names {
+                let name = name.trim();
+                if name.is_empty() {
+                    return Err(RpcError::invalid_params("each peer name must be non-empty"));
+                }
+                if name.chars().count() > PEER_PREPARE_NAME_MAX_CHARS {
+                    return Err(RpcError::invalid_params(format!(
+                        "peer name '{name}' exceeds {PEER_PREPARE_NAME_MAX_CHARS} characters"
+                    )));
+                }
+                if name_to_slug(name).is_none() {
+                    return Err(RpcError::invalid_params(
+                        "peer name cannot be blank".to_string(),
+                    ));
+                }
+                if !seen.insert(name.to_lowercase()) {
+                    return Err(RpcError::invalid_params(format!(
+                        "duplicate peer name '{name}' in names"
+                    )));
+                }
+                trimmed.push(name.to_owned());
+            }
+            Some(trimmed)
+        }
+        None => None,
+    };
+
     // Fleet staging is ALL-OR-NOTHING: each member goes through `stage_peer`
     // (reserve → optional worktree fence → atomic brief write; the failing
     // member rolls ITSELF back inside the helper), and any member failure
@@ -9918,10 +10198,11 @@ async fn raw_peer_prepare(
     // fleet. Git work is blocking; keep each member off the reactor.
     let mut staged: Vec<(String, PathBuf)> = Vec::new();
     let mut entries: Vec<Value> = Vec::new();
-    for _ in 0..n {
+    for i in 0..n as usize {
         let member_peers_root = peers_root.clone();
         let member_workspace_root = workspace_root.clone();
         let member_seed = seed.clone();
+        let member_name = names.as_ref().map(|names| names[i].clone());
         let member_brief = brief.to_owned();
         let member_worktree = params.worktree;
         let member = tokio::task::spawn_blocking(move || {
@@ -9929,6 +10210,7 @@ async fn raw_peer_prepare(
                 &member_peers_root,
                 &member_workspace_root,
                 &member_seed,
+                member_name.as_deref(),
                 &member_brief,
                 member_worktree,
             )
@@ -10038,10 +10320,18 @@ fn stage_peer(
     peers_root: &Path,
     workspace_root: &Path,
     seed: &str,
+    name: Option<&str>,
     brief: &str,
     worktree: bool,
 ) -> Result<StagedPeer, RpcError> {
-    let (slug, peer_dir) = reserve_peer_dir(peers_root, seed)?;
+    // A NAMED peer reserves its EXACT (name-derived) slug and rejects
+    // collisions — a name is the primary address, so it must be unique and
+    // stable. An unnamed (legacy `peer/prepare`) peer keeps the auto-suffix
+    // seed path.
+    let (slug, peer_dir) = match name {
+        Some(name) => reserve_named_peer_dir(peers_root, name)?,
+        None => reserve_peer_dir(peers_root, seed)?,
+    };
     // The fence: a worktree on branch `peer/<slug>` under the peer dir.
     let cwd = if worktree {
         let worktree_path = peer_dir.join("wt");
@@ -10084,6 +10374,19 @@ fn stage_peer(
         return Err(RpcError::internal_error(format!(
             "failed to write brief: {err}"
         )));
+    }
+
+    // Store the display NAME so the peer is addressable by it and readers
+    // (`read_peer_blackboard` / `resolve_peer_name_to_slug`) can surface it.
+    if let Some(name) = name {
+        if let Err(err) =
+            crate::memory_consolidate::apply::atomic_write(&peer_dir.join("name"), name)
+        {
+            cleanup_staged_peer(workspace_root, &slug, &peer_dir);
+            return Err(RpcError::internal_error(format!(
+                "failed to write peer name: {err}"
+            )));
+        }
     }
 
     Ok(StagedPeer {
@@ -10149,20 +10452,14 @@ fn build_peer_handoff_callback(
                 "peer handoff limit reached for this turn ({PEER_HANDOFFS_PER_TURN_MAX})"
             ));
         }
-        // Same seed derivation as `raw_peer_prepare`: trimmed title, else
-        // the brief's leading words. The tool already validated/trimmed.
-        let seed = request.title.clone().unwrap_or_else(|| {
-            request
-                .brief
-                .split_whitespace()
-                .take(6)
-                .collect::<Vec<_>>()
-                .join(" ")
-        });
+        // Peers are named: the slug is derived from the (required, validated)
+        // name and must be unique — `stage_peer` rejects a duplicate rather
+        // than auto-suffixing. `seed` is unused on the named path.
         let staged = stage_peer(
             &peers_root,
             &workspace_root,
-            &seed,
+            &request.name,
+            Some(&request.name),
             &request.brief,
             request.worktree,
         )
@@ -10230,7 +10527,12 @@ fn write_peer_result_if_peer_session(
     let Some(runtime) = state.profiles.get(profile_id) else {
         return;
     };
-    let peer_dir = runtime.data_dir.join("peers").join(slug);
+    // Only write under a REAL staged (non-symlink, safe-slug, brief.md) dir so
+    // a hostile `peer-<slug>` topic / symlinked entry cannot redirect the
+    // result-file writes outside `peers/`.
+    let Some(peer_dir) = staged_peer_dir(&runtime.data_dir.join("peers"), slug) else {
+        return;
+    };
     if !peer_dir.is_dir() {
         return;
     }
@@ -10361,6 +10663,9 @@ const PEER_GATHER_RESULT_CAP: usize = 48 * 1024;
 /// the `peer_gather` tool callback — both are views over the SAME read.
 struct PeerBlackboardRow {
     slug: String,
+    /// Display NAME from `peers/<slug>/name` (the peer's primary address),
+    /// falling back to the slug for legacy peers that have no `name` file.
+    name: String,
     /// `brief.md`, capped at [`PEER_GATHER_BRIEF_CAP`].
     brief: String,
     brief_truncated: bool,
@@ -10370,6 +10675,10 @@ struct PeerBlackboardRow {
     result_truncated: bool,
     result_updated_unix: Option<u64>,
     has_worktree: bool,
+    /// `true` when `peers/<slug>/closed` exists — the durable marker written
+    /// by `peer_close` retiring the peer. A closed peer receives no further
+    /// input; its result files stay readable.
+    closed: bool,
     /// #435: parsed `turns.txt` entries: `[(turn_count, outcome, updated_unix)]`.
     /// `None` when the file doesn't exist (single-turn-or-less peer).
     turn_history: Option<Vec<(u32, String, u64)>>,
@@ -10384,10 +10693,9 @@ struct PeerBlackboardRow {
 fn read_peer_blackboard(peers_root: &Path, slugs: Option<&[String]>) -> Vec<PeerBlackboardRow> {
     let mut rows: Vec<PeerBlackboardRow> = Vec::new();
     if let Ok(read_dir) = std::fs::read_dir(peers_root) {
-        let mut dirs: Vec<_> = read_dir
-            .flatten()
-            .filter(|entry| entry.path().is_dir())
-            .collect();
+        // No `is_dir()` pre-filter — it follows symlinks. `staged_peer_dir`
+        // below is the sole gate (safe slug + real non-symlink dir + brief.md).
+        let mut dirs: Vec<_> = read_dir.flatten().collect();
         dirs.sort_by_key(|entry| entry.file_name());
         for entry in dirs {
             let slug = entry.file_name().to_string_lossy().into_owned();
@@ -10396,9 +10704,12 @@ fn read_peer_blackboard(peers_root: &Path, slugs: Option<&[String]>) -> Vec<Peer
                     continue;
                 }
             }
-            let dir = entry.path();
-            // Only staged peers (a brief is the staging contract) — stray
-            // dirs under peers/ are not part of the blackboard.
+            // Only REAL, staged (non-symlink) peer dirs — a symlinked entry
+            // could redirect reads outside `peers/`; `staged_peer_dir` also
+            // enforces the `brief.md` staging contract.
+            let Some(dir) = staged_peer_dir(peers_root, &slug) else {
+                continue;
+            };
             let Ok(brief) = std::fs::read_to_string(dir.join("brief.md")) else {
                 continue;
             };
@@ -10417,14 +10728,23 @@ fn read_peer_blackboard(peers_root: &Path, slugs: Option<&[String]>) -> Vec<Peer
                 }
                 None => (None, false),
             };
+            // Display name: `peers/<slug>/name`, trimmed; legacy peers with no
+            // `name` file fall back to the slug so the row always has an address.
+            let name = std::fs::read_to_string(dir.join("name"))
+                .ok()
+                .map(|n| n.trim().to_owned())
+                .filter(|n| !n.is_empty())
+                .unwrap_or_else(|| slug.clone());
             rows.push(PeerBlackboardRow {
                 slug,
+                name,
                 brief,
                 brief_truncated,
                 result,
                 result_truncated,
                 result_updated_unix,
                 has_worktree: dir.join("wt").is_dir(),
+                closed: dir.join("closed").is_file(),
                 turn_history: parse_peer_turns_index(&dir),
             });
         }
@@ -10456,6 +10776,7 @@ fn raw_peer_gather(
         .map(|row| {
             json!({
                 "slug": row.slug,
+                "name": row.name,
                 "topic": format!("peer-{}", row.slug),
                 "brief": row.brief,
                 "brief_truncated": row.brief_truncated,
@@ -10463,6 +10784,7 @@ fn raw_peer_gather(
                 "result_truncated": row.result_truncated,
                 "result_updated_unix": row.result_updated_unix,
                 "has_worktree": row.has_worktree,
+                "closed": row.closed,
                 "turn_history": row.turn_history.as_ref().map(|history| {
                     history.iter().map(|(count, outcome, ts)| {
                         json!({
@@ -10500,7 +10822,9 @@ fn compose_peer_gather_text(rows: &[PeerBlackboardRow]) -> String {
     let mut sections: Vec<String> = rows
         .iter()
         .map(|row| {
-            let status = if row.result.is_some() {
+            let status = if row.closed {
+                "closed"
+            } else if row.result.is_some() {
                 "done"
             } else {
                 "still running"
@@ -10514,10 +10838,14 @@ fn compose_peer_gather_text(rows: &[PeerBlackboardRow]) -> String {
                 .result
                 .as_deref()
                 .unwrap_or("(still running — no result yet)");
-            format!(
-                "## peer {slug} ({status})\nBrief: {brief_preview}\n\n{body}\n",
-                slug = row.slug
-            )
+            // Address by NAME; annotate the slug when it differs so the model
+            // can still pass slugs to a targeted peer_gather.
+            let header = if row.name == row.slug {
+                format!("## peer {} ({status})", row.slug)
+            } else {
+                format!("## peer {} [{}] ({status})", row.name, row.slug)
+            };
+            format!("{header}\nBrief: {brief_preview}\n\n{body}\n")
         })
         .collect();
     let joined_len =
@@ -10563,11 +10891,167 @@ fn peer_gather_allowed_for_session(_session_id: &SessionKey) -> bool {
 /// the blackboard through the SAME row reader the `peer/gather` RPC uses
 /// ([`read_peer_blackboard`]) and composes plain text for the model.
 fn build_peer_gather_callback(peers_root: PathBuf) -> octos_agent::PeerGatherCallback {
-    Arc::new(move |slugs: Option<Vec<String>>| {
+    Arc::new(move |idents: Option<Vec<String>>| {
+        // The model may pass peer NAMES or slugs; resolve each to a slug for
+        // the blackboard filter (an unresolved identifier matches nothing).
+        let slugs = idents.map(|idents| {
+            idents
+                .iter()
+                .filter_map(|ident| resolve_peer_name_to_slug(&peers_root, ident))
+                .collect::<Vec<_>>()
+        });
         Ok(compose_peer_gather_text(&read_peer_blackboard(
             &peers_root,
             slugs.as_deref(),
         )))
+    })
+}
+
+/// Compose the compact one-line-per-peer INDEX the `peer_list` tool returns:
+/// slug, status (`closed` if retired via `peer_close`, else `done` when a
+/// result file exists, else `running`), last-updated unix (or "—"), turn
+/// count, and `worktree` when the peer has its own fence. Deliberate contrast
+/// with [`compose_peer_gather_text`], which reads each peer's full brief +
+/// result — this is the index, that is the payload.
+/// Cap on peer rows the `peer_list` index emits inline — a runaway fleet
+/// cannot flood the model's context; the overflow folds into a trailing
+/// "… and N more" line (read specific peers with peer_gather slugs).
+const PEER_LIST_MAX_ROWS: usize = 200;
+
+fn compose_peer_list_text(rows: &[PeerBlackboardRow]) -> String {
+    if rows.is_empty() {
+        return "(no peers staged)".to_owned();
+    }
+    let mut lines: Vec<String> = Vec::with_capacity(rows.len().min(PEER_LIST_MAX_ROWS) + 2);
+    lines.push(format!("peers ({}):", rows.len()));
+    for row in rows.iter().take(PEER_LIST_MAX_ROWS) {
+        let status = if row.closed {
+            "closed"
+        } else if row.result.is_some() {
+            "done"
+        } else {
+            "running"
+        };
+        let updated = row
+            .result_updated_unix
+            .map_or_else(|| "—".to_owned(), |ts| ts.to_string());
+        let turns = row.turn_history.as_ref().map_or(0, Vec::len);
+        let worktree = if row.has_worktree { "  worktree" } else { "" };
+        // Address by NAME; show the slug in parens when it differs.
+        let addr = if row.name == row.slug {
+            row.slug.clone()
+        } else {
+            format!("{} ({})", row.name, row.slug)
+        };
+        lines.push(format!(
+            "- {addr}  {status}  updated {updated}  turns {turns}{worktree}"
+        ));
+    }
+    if rows.len() > PEER_LIST_MAX_ROWS {
+        lines.push(format!("… and {} more", rows.len() - PEER_LIST_MAX_ROWS));
+    }
+    lines.join("\n")
+}
+
+/// `peer_list` is read-only like `peer_gather` — registered for EVERY serve
+/// session (INCLUDING `peer-` topics). Mirrors
+/// [`peer_gather_allowed_for_session`]: a read-only index has no recursion
+/// hazard for a depth guard to contain, so the predicate is `true`, kept
+/// explicit at the wiring seam.
+fn peer_list_allowed_for_session(_session_id: &SessionKey) -> bool {
+    true
+}
+
+/// Build the `peer_list` read callback for ONE turn of the serve/WS path.
+/// Mirrors [`build_peer_gather_callback`] but composes the compact status
+/// index ([`compose_peer_list_text`]) over the SAME row reader
+/// ([`read_peer_blackboard`]); it takes no slugs — it always lists every peer.
+fn build_peer_list_callback(peers_root: PathBuf) -> octos_agent::PeerListCallback {
+    Arc::new(move || {
+        Ok(compose_peer_list_text(&read_peer_blackboard(
+            &peers_root,
+            None,
+        )))
+    })
+}
+
+/// Build the `peer_close` callback for ONE turn of the serve/WS path. Closing
+/// RETIRES a peer the caller created: authorize (originator-only, the SAME
+/// check `peer_send_input` uses), evict the live wire if the peer is open,
+/// and write the durable `closed` marker so `peer_list` / `peer_gather`
+/// report it closed and `peer_send_input` refuses it. Graceful — an in-flight
+/// peer turn still completes; result files stay readable.
+fn build_peer_close_callback(
+    peers_root: PathBuf,
+    origin_session: String,
+    profile_id: String,
+) -> octos_agent::PeerCloseCallback {
+    Arc::new(move |ident: String| {
+        // Resolve the identifier (peer NAME or slug) to the actual slug BEFORE
+        // any auth / path / wire op — names are the primary address.
+        let slug = resolve_peer_name_to_slug(&peers_root, &ident).ok_or_else(|| {
+            format!("no peer named '{ident}' — check the name (or slug) with peer_list")
+        })?;
+        // The resolved slug is a real staged dir name; keep the guard as
+        // defense-in-depth (an unsafe slug could escape peers/ or mis-key the
+        // live wire, leaving it un-evicted).
+        if !peer_slug_is_safe(&slug) {
+            return Err(format!("invalid peer slug '{slug}'"));
+        }
+        // #436 P1 #6 — originator-only, fail-closed. Reuses the exact check
+        // that gates `peer_send_input`, so only the session that staged the
+        // peer may retire it.
+        peer_send_input_authorized(&peers_root, &slug, &origin_session)?;
+        // Resolve the REAL staged dir (safe slug, NOT a symlink, has brief.md)
+        // and write ONLY under it — a deleted or symlinked peer cannot be
+        // closed, so the marker can never land outside `peers/`.
+        let Some(peer_dir) = staged_peer_dir(&peers_root, &slug) else {
+            return Err(format!(
+                "peer '{slug}' no longer exists (its staged directory was removed)"
+            ));
+        };
+        // Durable close marker FIRST, written atomically (same helper as the
+        // brief / originator / result files). The body records the closing
+        // session id and a unix timestamp for post-mortems; its mere existence
+        // is the signal that `read_peer_blackboard` reads back as `closed`.
+        // Writing the marker before evicting the wire means a marker-write
+        // failure leaves the peer fully OPEN — never partially closed (wire
+        // gone but no marker, which would silently drop input).
+        let now_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_secs())
+            .unwrap_or(0);
+        let body = format!("{origin_session}\n{now_unix}\n");
+        if let Err(err) =
+            crate::memory_consolidate::apply::atomic_write(&peer_dir.join("closed"), &body)
+        {
+            return Err(format!(
+                "failed to write close marker for peer '{slug}': {err}"
+            ));
+        }
+        // #436 leak fix — the marker now refuses NEW sends; actively CANCEL +
+        // tombstone any injection queued for this peer BEFORE the close so
+        // nothing stays stranded in the durable queue (the drain gates skip a
+        // closed target without ever popping/capping/tombstoning it).
+        let cancelled = default_agent_orchestrator()
+            .cancel_peer_send_input_continuations_for_peer(&profile_id, &slug);
+        if cancelled > 0 {
+            tracing::debug!(
+                slug = %slug,
+                cancelled,
+                "cancelled pending peer_send_input injections on peer close"
+            );
+        }
+        // Marker durable + queue cleared; now evict the live wire if the peer
+        // is open so a still-connected peer stops being an injection target
+        // immediately (the marker already covers the offline / reconnect case).
+        let key = peer_wire_key(&profile_id, &slug);
+        if let Some(wire) = peer_wire_registry().resolve(&key) {
+            evict_peer_wire_session(&wire);
+        }
+        Ok(format!(
+            "peer '{slug}' closed — it will receive no further input"
+        ))
     })
 }
 
@@ -10599,16 +11083,19 @@ fn peer_results_ready_note(peers_root: &Path, session_id: &SessionKey) -> Option
         return None;
     }
     let read_dir = std::fs::read_dir(peers_root).ok()?;
-    let mut dirs: Vec<_> = read_dir
-        .flatten()
-        .filter(|entry| entry.path().is_dir())
-        .collect();
+    // No `is_dir()` pre-filter — it follows symlinks. `staged_peer_dir` gates
+    // each entry so a symlinked peer can't redirect the `.notified` write or
+    // the result/originator reads outside `peers/`.
+    let mut dirs: Vec<_> = read_dir.flatten().collect();
     dirs.sort_by_key(|entry| entry.file_name());
     let session = session_id.to_string();
     // (slug, stamp path, result mtime) per ready peer.
     let mut ready: Vec<(String, PathBuf, u64)> = Vec::new();
     for entry in dirs {
-        let dir = entry.path();
+        let slug = entry.file_name().to_string_lossy().into_owned();
+        let Some(dir) = staged_peer_dir(peers_root, &slug) else {
+            continue;
+        };
         // Stat-first: no result file means nothing to announce, skip
         // before touching any other file.
         let Some(result_mtime) = std::fs::metadata(dir.join("result.md"))
@@ -10632,11 +11119,7 @@ fn peer_results_ready_note(peers_root: &Path, session_id: &SessionKey) -> Option
         if originator.trim() != session {
             continue;
         }
-        ready.push((
-            entry.file_name().to_string_lossy().into_owned(),
-            stamp_path,
-            result_mtime,
-        ));
+        ready.push((slug, stamp_path, result_mtime));
     }
     if ready.is_empty() {
         return None;
@@ -12890,7 +13373,7 @@ async fn open_session_result(
     // (wired on the master's turn, which cannot know the peer's client-chosen
     // wire id) can resolve the slug to the continuation-queue key it enqueues
     // an injected turn under. No-op for non-peer / unprofiled sessions.
-    register_peer_wire_session(&params.session_id);
+    register_peer_wire_session(state, &params.session_id);
     let (mut replay, replay_baseline_seq) =
         ledger.replay_after_with_head(&params.session_id, params.after.as_ref())?;
     replay.retain(|event| ledger_event_matches_topic_scope(&event.event, topic_scope.as_deref()));
@@ -14801,12 +15284,22 @@ async fn maybe_spawn_appui_master_continuation_runner(
         return false;
     };
 
+    // #436 FIX 5 — a peer retired via peer_close (durable `closed` marker) has
+    // its continuation RETIRED, not reinserted: it was already popped by the
+    // drain above, so tombstone it (record completed) so a restart never
+    // replays it and it does not strand. A reopened closed peer IS the current
+    // wire, so only the marker check catches an injection queued around the
+    // close. No-op for non-peer targets (never "closed").
+    if peer_target_is_closed(state, &session_id) {
+        default_agent_orchestrator()
+            .mark_continuation_completed(&continuation, Some("retired_peer_closed".to_owned()));
+        return false;
+    }
     // #436 P1 #4 — re-check peer freshness AFTER the pop (the pre-pop gate in
     // the global drain is stale under a concurrent reopen). If this peer wire
     // is no longer the slug's CURRENT registered wire, do NOT dispatch under
-    // the obsolete/closed wire: re-insert the injection so a reopen's retarget
-    // re-homes it (or the next tick redrains it once it is current again).
-    // No-op for non-peer (goal/loop) targets, which are always "current".
+    // the obsolete wire: RE-INSERT the injection so a reopen's retarget re-homes
+    // it (or the next tick redrains it once it is current again).
     if !peer_target_is_current_wire(&session_id) {
         default_agent_orchestrator().reinsert_peer_continuation(continuation);
         return false;
@@ -15078,6 +15571,23 @@ fn peer_target_is_current_wire(wire_key: &SessionKey) -> bool {
         .resolve(&peer_wire_key(profile_id, slug))
         .as_ref()
         == Some(wire_key)
+}
+
+/// #436 — a peer retired via `peer_close` must never be dispatched, even for an
+/// injection queued just before the close and re-homed onto the reopened wire:
+/// `peer_target_is_current_wire` sees only the registry (a reopened peer IS
+/// current), not the durable `closed` marker. This checks the marker so a
+/// closed peer's continuation is RETIRED by the drain gates (FIX 5 — popped +
+/// tombstoned, never reinserted), so it cannot strand. Non-peer (goal/loop)
+/// targets and unresolvable profiles are never "closed".
+fn peer_target_is_closed(state: &Arc<AppState>, wire_key: &SessionKey) -> bool {
+    let Some((profile_id, slug)) = peer_slug_and_profile(wire_key) else {
+        return false;
+    };
+    state
+        .profiles
+        .get(profile_id)
+        .is_some_and(|runtime| peer_is_closed(&runtime.data_dir.join("peers"), slug))
 }
 
 /// #436 P1 #2 — decide whether a drained continuation may be marked completed.
@@ -15395,9 +15905,23 @@ pub(crate) fn spawn_global_master_continuation_drain(state: Arc<AppState>) {
                     continue;
                 }
                 let wire_key = wire_key_from_goal_key(&storage_key);
-                // #436 P1 #3 — never run a peer injection under a closed or
-                // obsolete wire; it is delivered when the peer reopens (which
-                // re-homes it to the current wire).
+                // #436 FIX 5 — a peer retired via peer_close has its pending
+                // injections RETIRED (cancelled + tombstoned) here rather than
+                // skipped: a bare skip never pops them, so they would strand in
+                // the durable queue. Pop + tombstone the whole set for the
+                // closed peer, then move on.
+                if peer_target_is_closed(&state, &wire_key) {
+                    if let Some((closed_profile, closed_slug)) = peer_slug_and_profile(&wire_key) {
+                        orchestrator.cancel_peer_send_input_continuations_for_peer(
+                            closed_profile,
+                            closed_slug,
+                        );
+                    }
+                    continue;
+                }
+                // #436 P1 #3 — never run a peer injection under an obsolete
+                // wire (superseded by a reopen); it is delivered when the peer
+                // reopens (which re-homes it to the current wire).
                 if !peer_target_is_current_wire(&wire_key) {
                     continue;
                 }
@@ -24414,6 +24938,16 @@ async fn run_standalone_turn(
             tool_registry.register(octos_agent::PeerGatherTool::new(gather));
         }
 
+        // `peer_list` — the compact status INDEX companion to `peer_gather`:
+        // one line per peer (slug, running/done/closed, last-updated, turn
+        // count, worktree?). Read-only, so registered with the SAME policy as
+        // gather (ALL serve sessions, including peer- topics). Use peer_list
+        // to see what exists / what's finished; peer_gather to read output.
+        if peer_list_allowed_for_session(&session_id) {
+            let list = build_peer_list_callback(session_runtime.profile.data_dir.join("peers"));
+            tool_registry.register(octos_agent::PeerListTool::new(list));
+        }
+
         // #436 — `peer_send_input`: cross-session input injection into a
         // RUNNING peer session. Same depth-1 guard as peer_handoff: peer
         // sessions cannot send input to other peers (or themselves).
@@ -24438,10 +24972,32 @@ async fn run_standalone_turn(
             let send_origin_session = session_id.to_string();
             let send_input: octos_agent::PeerSendInputCallback =
                 Arc::new(move |req: octos_agent::PeerSendInputRequest| {
+                    // Resolve the identifier (peer NAME or slug) to the actual
+                    // slug BEFORE any auth / path / wire op — names are the
+                    // primary address. Unknown identifier → a clear error.
+                    let slug = resolve_peer_name_to_slug(&send_peers_root, &req.slug).ok_or_else(
+                        || {
+                            format!(
+                                "no peer named '{ident}' — check the name (or slug) with peer_list",
+                                ident = req.slug
+                            )
+                        },
+                    )?;
+                    // The resolved slug is a real staged dir name; keep the
+                    // guard as defense-in-depth (guards BOTH delivery paths).
+                    if !peer_slug_is_safe(&slug) {
+                        return Err(format!("invalid peer slug '{slug}'"));
+                    }
                     // #436 P1 #6 — authorize before any delivery path: only the
                     // peer's recorded originator may inject.
-                    peer_send_input_authorized(&send_peers_root, &req.slug, &send_origin_session)?;
-                    let key = peer_wire_key(&send_profile_id, &req.slug);
+                    peer_send_input_authorized(&send_peers_root, &slug, &send_origin_session)?;
+                    // A closed peer (retired via peer_close) refuses input on
+                    // BOTH delivery paths — check here, before the Path 1
+                    // fast-path inbox send, not just the continuation queue.
+                    if peer_is_closed(&send_peers_root, &slug) {
+                        return Err(format!("peer '{slug}' is closed and cannot receive input"));
+                    }
+                    let key = peer_wire_key(&send_profile_id, &slug);
 
                     // Path 1: gateway in-process inbox (fast, direct).
                     let inbox_tx = crate::session_actor::peer_inbox_registry()
@@ -24468,10 +25024,7 @@ async fn run_standalone_turn(
                             attachment_prompt: None,
                         };
                         return tx.try_send(actor_msg).map_err(|e| {
-                            format!(
-                                "peer session '{slug}' inbox is full or closed: {e}",
-                                slug = req.slug
-                            )
+                            format!("peer session '{slug}' inbox is full or closed: {e}")
                         });
                     }
 
@@ -24479,17 +25032,14 @@ async fn run_standalone_turn(
                     let Some(target) = peer_wire_registry().resolve(&key) else {
                         return Err(format!(
                             "peer session '{slug}' is not open — the user must open \
-                             the staged peer session before it can receive input",
-                            slug = req.slug
+                             the staged peer session before it can receive input"
                         ));
                     };
                     // A deleted peer must not silently swallow injections into a
                     // queue nothing will drain: require the staged dir to exist.
-                    if !send_peers_root.join(&req.slug).is_dir() {
+                    if !send_peers_root.join(&slug).is_dir() {
                         return Err(format!(
-                            "peer '{slug}' no longer exists (its staged directory \
-                             was removed)",
-                            slug = req.slug
+                            "peer '{slug}' no longer exists (its staged directory was removed)"
                         ));
                     }
                     // #436 P1 #3/#4 — enqueue keyed on the unique occurrence id
@@ -24500,13 +25050,25 @@ async fn run_standalone_turn(
                         .enqueue_peer_send_input_continuation(
                             &target,
                             &send_profile_id,
-                            &req.slug,
+                            &slug,
                             &req.occurrence_id,
                             &req.message,
                         )
-                        .into_callback_result(&req.slug)
+                        .into_callback_result(&slug)
                 });
             tool_registry.register(octos_agent::PeerSendInputTool::new(send_input));
+
+            // `peer_close` — gracefully retire a running peer the caller
+            // created. Same depth-1 guard as peer_send_input (originator-
+            // authorized, never on peer sessions). Captures the same
+            // peers-root / origin-session / profile-id the send_input callback
+            // does (fresh values — those bindings moved into the closure above).
+            let close = build_peer_close_callback(
+                session_runtime.profile.data_dir.join("peers"),
+                session_id.to_string(),
+                session_runtime.profile.profile_id.clone(),
+            );
+            tool_registry.register(octos_agent::PeerCloseTool::new(close));
         }
 
         // Wire the PARENT `send_file` for the legacy non-contract

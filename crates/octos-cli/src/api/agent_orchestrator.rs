@@ -2482,7 +2482,11 @@ impl InProcessAgentOrchestrator {
                 // Already re-homed (e.g. a prior retarget for the same reopen);
                 // fall through to retire the stale old record.
                 MasterContinuationEnqueueOutcome::Duplicate { .. } => {
-                    retire_old_peer_injection(&mut state, &old_key);
+                    retire_old_peer_injection(
+                        &mut state,
+                        &old_key,
+                        "retargeted_to_reopened_peer_wire",
+                    );
                     rehomed += 1;
                     continue;
                 }
@@ -2501,10 +2505,46 @@ impl InProcessAgentOrchestrator {
                 continue;
             }
             // New is durable — NOW retire the old (cancel in-mem + tombstone).
-            retire_old_peer_injection(&mut state, &old_key);
+            retire_old_peer_injection(&mut state, &old_key, "retargeted_to_reopened_peer_wire");
             rehomed += 1;
         }
         rehomed
+    }
+
+    /// #436 leak fix — CANCEL + tombstone every PENDING `peer_send_input`
+    /// injection targeting `slug` (any wire session) under `profile_id`. Called
+    /// by `peer_close`: without it, an injection queued just before the close
+    /// is skipped by the closed-target drain gate before it is ever popped, so
+    /// it is never reinserted/capped/tombstoned and lingers in the durable queue
+    /// forever. Mirrors [`retarget_peer_send_input_continuations`]'s pending-item
+    /// scan, but retires each match instead of re-homing it. Returns the count.
+    pub(crate) fn cancel_peer_send_input_continuations_for_peer(
+        &self,
+        profile_id: &str,
+        slug: &str,
+    ) -> usize {
+        let mut state = self.state();
+        // Snapshot matching keys (immutable borrow) before mutating the queue.
+        let keys: Vec<MasterContinuationDedupeKey> = state
+            .continuations
+            .pending_items()
+            .filter(|item| {
+                matches!(&item.reason, MasterContinuationReason::External(kind)
+                    if kind == PEER_SEND_INPUT_EXTERNAL_KIND)
+                    && item.profile_id.as_str() == profile_id
+                    && item
+                        .metadata
+                        .get(PEER_SEND_INPUT_META_SLUG)
+                        .map(String::as_str)
+                        == Some(slug)
+            })
+            .map(|item| item.dedupe_key.clone())
+            .collect();
+        let cancelled = keys.len();
+        for key in &keys {
+            retire_old_peer_injection(&mut state, key, "retired_peer_closed");
+        }
+        cancelled
     }
 
     /// #436 P1 #2/#4 — re-insert a popped-but-UNDELIVERED peer injection so it
@@ -5418,6 +5458,7 @@ fn persist_continuation_queued_checked(
 fn retire_old_peer_injection(
     state: &mut AutonomyRuntimeState,
     old_key: &MasterContinuationDedupeKey,
+    reason: &str,
 ) {
     state.continuations.cancel(old_key);
     if let Some(store) = state.supervisor_store.as_ref() {
@@ -5425,7 +5466,7 @@ fn retire_old_peer_injection(
             PEER_SEND_INPUT_GROUP,
             old_key.as_str(),
             now_ms_u64(),
-            Some("retargeted_to_reopened_peer_wire".to_owned()),
+            Some(reason.to_owned()),
         ) {
             tracing::error!(
                 ?err,
