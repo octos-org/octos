@@ -578,9 +578,25 @@ impl ProfileRuntime {
         // EpisodeStore; gateway falls back to a degraded handle when
         // serve already owns the redb lock so it doesn't crashloop on
         // every startup. Tracked by issue #899.
+        //
+        // The embedder is resolved FIRST because the episodic HNSW index is
+        // built at one fixed width and silently drops any vector of a
+        // different length. Sizing it from the configured provider is what
+        // makes a non-1536-d embedder (e.g. in-process EmbeddingGemma at 768)
+        // actually reach the vector lane instead of degrading to BM25-only.
+        let embedder =
+            chat::create_embedder(&config).map(|e| e as Arc<dyn octos_llm::EmbeddingProvider>);
+        let index_dimension = embedder
+            .as_ref()
+            .map_or(octos_memory::EPISODIC_INDEX_DIMENSION, |e| e.dimension());
+
         let memory_open_result = match role {
-            BootstrapRole::Serve => EpisodeStore::open(data_dir).await,
-            BootstrapRole::Gateway => EpisodeStore::open_or_degraded(data_dir).await,
+            BootstrapRole::Serve => {
+                EpisodeStore::open_with_dimension(data_dir, index_dimension).await
+            }
+            BootstrapRole::Gateway => {
+                EpisodeStore::open_or_degraded_with_dimension(data_dir, index_dimension).await
+            }
         };
         let memory = Arc::new(memory_open_result.wrap_err_with(|| {
             format!("failed to open episode store for profile '{}'", profile.id)
@@ -841,12 +857,11 @@ impl ProfileRuntime {
         // when adaptive is configured, so per-node calls still
         // fan out through the adaptive layer.
         //
-        // Resolve the profile's embedding provider ONCE. The same handle
-        // feeds the pipeline factory below AND rides on the returned
-        // ProfileRuntime so the serve spawn/delegate wiring hands every
-        // worker the exact same embed-on-save + hybrid-recall behaviour.
-        let embedder =
-            chat::create_embedder(&config).map(|e| e as Arc<dyn octos_llm::EmbeddingProvider>);
+        // The profile's embedding provider was resolved ONCE back in Step 4
+        // (the episodic index has to be sized from it). The same handle feeds
+        // the pipeline factory below AND rides on the returned ProfileRuntime
+        // so the serve spawn/delegate wiring hands every worker the exact same
+        // embed-on-save + hybrid-recall behaviour.
 
         // NEW-07: hoist the per-instance `RunPipelineTool` builder
         // into a [`crate::session_actor::PipelineToolFactory`] impl
