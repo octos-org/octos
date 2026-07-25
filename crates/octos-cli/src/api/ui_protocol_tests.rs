@@ -7681,149 +7681,102 @@ fn peer_send_input_authorized_only_for_recorded_originator() {
     assert!(err3.contains("not a staged peer"), "reason: {err3}");
 }
 
-/// Peer-fleet auto-synthesis fire policy (v1), exercised on the pure decision:
-/// FIRES once when every owned peer is done + the master is idle (value = the
-/// composite `(newest_mtime, total_turns)` stamp/key basis); HOLDS while any
-/// peer is mid-turn (or has queued input), while the master is busy, when a peer
-/// has no result yet, and for a master with zero peers; DEDUPS a wave already
-/// covered by the `.synthesized` stamp; RE-ARMS for a strictly newer result AND
-/// (codex #3) for a same-second wave whose total turn count advanced.
+/// Peer-fleet auto-synthesis fire policy — EXACTLY ONCE per fleet, on the pure
+/// decision. FIRES when every owned peer is done + the master is idle + no
+/// marker yet; HOLDS while any peer is mid-turn (or has queued input), while the
+/// master is busy, when a peer has no result, and — crucially — when the marker
+/// ALREADY EXISTS (no re-fire while any owned peer lives, even if all are done).
+/// A cleared fleet (zero owned peers) yields ClearStamp when a marker exists (so
+/// a fresh fleet can fire), else Hold.
 #[test]
-fn evaluate_peer_fleet_synthesis_fire_policy_matrix() {
-    let peer = |mtime: Option<u64>, turns: u64, mid_turn: bool| OwnedPeerState {
-        result_mtime: mtime,
-        turn_count: turns,
+fn evaluate_peer_fleet_synthesis_fires_once_and_resets_on_clear() {
+    use FleetSynthesisDecision::{ClearStamp, Fire, Hold};
+    let peer = |has_result: bool, mid_turn: bool| OwnedPeerState {
+        has_result,
         mid_turn,
     };
-    let stamp = |mtime: u64, turns: u64| FleetSynthesisStamp {
-        newest_mtime: mtime,
-        total_turns: turns,
-    };
-    let done_a = peer(Some(100), 1, false);
-    let done_b = peer(Some(120), 2, false);
+    let done_a = peer(true, false);
+    let done_b = peer(true, false);
 
-    // Fires when all peers done + master idle + no prior stamp → (newest mtime,
-    // total turns) = (120, 3).
+    // FIRES: >=1 peer, idle, all settled + done, marker absent.
     assert_eq!(
-        evaluate_peer_fleet_synthesis(&[done_a.clone(), done_b.clone()], None, true),
-        Some(stamp(120, 3)),
+        evaluate_peer_fleet_synthesis(&[done_a, done_b], false, true),
+        Fire,
     );
 
-    // Does NOT fire while an owned peer is still running (mid_turn).
+    // HOLDS while an owned peer is still running / has queued input (mid_turn).
     assert_eq!(
-        evaluate_peer_fleet_synthesis(&[done_a.clone(), peer(Some(120), 2, true)], None, true),
-        None,
+        evaluate_peer_fleet_synthesis(&[done_a, peer(true, true)], false, true),
+        Hold,
     );
 
-    // Does NOT fire while the master is busy (even though the fleet is done).
+    // HOLDS while the master is busy (even though the fleet is done).
     assert_eq!(
-        evaluate_peer_fleet_synthesis(&[done_a.clone(), done_b.clone()], None, false),
-        None,
+        evaluate_peer_fleet_synthesis(&[done_a, done_b], false, false),
+        Hold
     );
 
-    // Does NOT fire when an owned peer has produced no result yet.
+    // HOLDS when an owned peer has produced no result yet.
     assert_eq!(
-        evaluate_peer_fleet_synthesis(&[done_a.clone(), peer(None, 0, false)], None, true),
-        None,
+        evaluate_peer_fleet_synthesis(&[done_a, peer(false, false)], false, true),
+        Hold,
     );
 
-    // Does NOT fire for a master with zero owned peers.
-    assert_eq!(evaluate_peer_fleet_synthesis(&[], None, true), None);
-
-    // DEDUP: a wave fully covered by the stamp does not re-fire.
+    // EXACTLY ONCE: the marker already exists → NEVER re-fire while any owned
+    // peer remains, even with MORE peers all done (added-and-completed peers and
+    // newer results do NOT re-synthesize).
     assert_eq!(
-        evaluate_peer_fleet_synthesis(&[done_a.clone(), done_b.clone()], Some(stamp(120, 3)), true,),
-        None,
+        evaluate_peer_fleet_synthesis(&[done_a, done_b, peer(true, false)], true, true),
+        Hold,
     );
 
-    // RE-ARM (newer mtime): stamp (120,3), peer b advances to mtime 150 (turns
-    // 1 + 2 = 3) → fires (150, 3), then holds again at (150, 3).
-    let newer_b = peer(Some(150), 2, false);
-    assert_eq!(
-        evaluate_peer_fleet_synthesis(
-            &[done_a.clone(), newer_b.clone()],
-            Some(stamp(120, 3)),
-            true,
-        ),
-        Some(stamp(150, 3)),
-    );
-    assert_eq!(
-        evaluate_peer_fleet_synthesis(&[done_a.clone(), newer_b], Some(stamp(150, 3)), true),
-        None,
-    );
+    // Zero owned peers + no marker → nothing to do.
+    assert_eq!(evaluate_peer_fleet_synthesis(&[], false, true), Hold);
 
-    // RE-ARM (codex #3 tiebreak): SAME second (mtime unchanged at 120) but one
-    // more fleet turn (total 4 > stamp 3) → re-fires despite the equal mtime.
-    let done_b_more_turns = peer(Some(120), 3, false);
-    assert_eq!(
-        evaluate_peer_fleet_synthesis(
-            &[done_a.clone(), done_b_more_turns],
-            Some(stamp(120, 3)),
-            true,
-        ),
-        Some(stamp(120, 4)),
-    );
+    // RESET: zero owned peers + marker exists → ClearStamp (remove it) so a
+    // genuinely fresh fleet can fire once later. Independent of idle.
+    assert_eq!(evaluate_peer_fleet_synthesis(&[], true, true), ClearStamp);
+    assert_eq!(evaluate_peer_fleet_synthesis(&[], true, false), ClearStamp);
 
-    // codex #1 — a peer with a queued follow-up is modeled as mid_turn=true and
-    // blocks the fire even though its result is on disk.
-    assert_eq!(
-        evaluate_peer_fleet_synthesis(&[done_a, peer(Some(120), 2, true)], None, true),
-        None,
-    );
+    // After the reset (marker absent again) a fresh, complete fleet fires once.
+    assert_eq!(evaluate_peer_fleet_synthesis(&[done_a], false, true), Fire);
 }
 
-/// codex #2 residual — the interrupt terminal path now evaluates the fleet too
-/// (the same pure decision the Completed/errored arms make). An INTERRUPTED
-/// peer writes no fresh result.md, so the two behaviors the path must exhibit:
-/// (a) HOLDS when the interrupted peer has no result yet (fleet not done), and
-/// (b) FIRES once when the interrupted peer already has a prior result on the
-/// blackboard (persistent peer), then dedups.
+/// Peer-fleet auto-synthesis — the interrupt terminal path now evaluates the
+/// fleet too. An INTERRUPTED peer writes no fresh result.md, so: (a) HOLD when
+/// it has no result yet (fleet not done), and (b) FIRE once when it already has
+/// a prior result on the blackboard (persistent peer) and no marker exists yet.
 #[test]
 fn evaluate_holds_for_resultless_interrupt_and_fires_with_prior_result() {
-    let peer = |mtime: Option<u64>, turns: u64| OwnedPeerState {
-        result_mtime: mtime,
-        turn_count: turns,
+    use FleetSynthesisDecision::{Fire, Hold};
+    let peer = |has_result: bool| OwnedPeerState {
+        has_result,
         mid_turn: false,
     };
-    let sibling_done = peer(Some(100), 1);
+    let sibling_done = peer(true);
 
     // (a) Interrupted peer has NO result → fleet is not done → HOLD.
-    let interrupted_no_result = peer(None, 0);
     assert_eq!(
-        evaluate_peer_fleet_synthesis(&[sibling_done.clone(), interrupted_no_result], None, true,),
-        None,
+        evaluate_peer_fleet_synthesis(&[sibling_done, peer(false)], false, true),
+        Hold,
         "an interrupted peer with no result.md must not complete the fleet",
     );
 
-    // (b) Interrupted peer already has a PRIOR result (persistent peer) → the
-    // fleet is done → FIRES once, then dedups on the same stamp.
-    let interrupted_prior_result = peer(Some(90), 1);
-    let fired = evaluate_peer_fleet_synthesis(
-        &[sibling_done.clone(), interrupted_prior_result.clone()],
-        None,
-        true,
-    );
+    // (b) Interrupted peer already has a PRIOR result (persistent peer) + no
+    // marker → the fleet is done → FIRE once.
     assert_eq!(
-        fired,
-        Some(FleetSynthesisStamp {
-            newest_mtime: 100,
-            total_turns: 2,
-        }),
+        evaluate_peer_fleet_synthesis(&[sibling_done, peer(true)], false, true),
+        Fire,
         "an interrupted peer with a prior result still lets the fleet synthesize",
-    );
-    assert_eq!(
-        evaluate_peer_fleet_synthesis(&[sibling_done, interrupted_prior_result], fired, true,),
-        None,
-        "the same wave dedups — no duplicate synthesis on the interrupt path",
     );
 }
 
 /// Peer-fleet auto-synthesis — `collect_owned_peer_results` returns exactly the
-/// REAL staged peers whose `originator` matches the master, each with its
-/// `result.md` mtime and terminal-turn count; a peer with no result yields
-/// `None` (still in the fleet, blocks synthesis), an ERRORED peer's result
-/// still counts as present (codex #2), a CLOSED peer is excluded, and a peer
-/// owned by a DIFFERENT master is excluded.
+/// REAL staged peers whose `originator` matches the master, each paired with
+/// whether it has a `result.md`; a peer with no result is present-but-`false`
+/// (still in the fleet, blocks synthesis), an ERRORED peer's result still counts
+/// as present, a CLOSED peer is excluded, and a peer owned by a DIFFERENT master
+/// is excluded.
 #[test]
 fn collect_owned_peer_results_filters_by_originator_and_excludes_closed() {
     let tmp = tempfile::tempdir().unwrap();
@@ -7839,16 +7792,12 @@ fn collect_owned_peer_results_filters_by_originator_and_excludes_closed() {
         dir
     };
 
-    // Owned + has a result (two terminal turns on disk → turn_count 2).
+    // Owned + has a result.
     let done = stage("done-peer", master);
     std::fs::write(done.join("result.md"), "res").unwrap();
-    std::fs::write(done.join("result-1.md"), "res").unwrap();
-    std::fs::write(done.join("result-2.md"), "res").unwrap();
-    // Owned, ERRORED terminal — result.md present (outcome unparsed here), so it
-    // counts as done for readiness (codex #2).
+    // Owned, ERRORED terminal — result.md present, so it counts as done.
     let errored = stage("errored-peer", master);
     std::fs::write(errored.join("result.md"), "err body").unwrap();
-    std::fs::write(errored.join("result-1.md"), "err body").unwrap();
     // Owned but NO result yet (blocks synthesis; still part of the fleet).
     stage("pending-peer", master);
     // Owned but CLOSED — excluded (retired peer).
@@ -7861,79 +7810,99 @@ fn collect_owned_peer_results_filters_by_originator_and_excludes_closed() {
 
     let mut owned = collect_owned_peer_results(peers_root, master);
     owned.sort();
-    let slugs: Vec<&str> = owned.iter().map(|(slug, _, _)| slug.as_str()).collect();
+    let slugs: Vec<&str> = owned.iter().map(|(slug, _)| slug.as_str()).collect();
     assert_eq!(
         slugs,
         vec!["done-peer", "errored-peer", "pending-peer"],
         "only this master's non-closed peers are owned"
     );
-    let done_entry = owned.iter().find(|(s, _, _)| s == "done-peer").unwrap();
-    assert!(done_entry.1.is_some(), "a written result has an mtime");
-    assert_eq!(done_entry.2, 2, "two result-*.md versions → turn_count 2");
-    let errored_entry = owned.iter().find(|(s, _, _)| s == "errored-peer").unwrap();
     assert!(
-        errored_entry.1.is_some(),
-        "an errored peer's result.md still counts as present (codex #2)"
+        owned.iter().find(|(s, _)| s == "done-peer").unwrap().1,
+        "a written result → has_result true"
     );
-    let pending_entry = owned.iter().find(|(s, _, _)| s == "pending-peer").unwrap();
-    assert_eq!(
-        pending_entry.1, None,
-        "a peer with no result.md yields None"
+    assert!(
+        owned.iter().find(|(s, _)| s == "errored-peer").unwrap().1,
+        "an errored peer's result.md still counts as present"
     );
-    assert_eq!(pending_entry.2, 0, "no result versions → turn_count 0");
+    assert!(
+        !owned.iter().find(|(s, _)| s == "pending-peer").unwrap().1,
+        "a peer with no result.md → has_result false"
+    );
 }
 
-/// Peer-fleet auto-synthesis — the per-master `.synthesized` stamp round-trips
-/// through `safe_filename` (distinct masters never collide), reads back the
-/// composite `(mtime, turns)`, tolerates a legacy single-number stamp (turns
-/// default 0), and is never mistaken for a staged peer by the fleet scan.
+/// Peer-fleet auto-synthesis — the per-master `.synthesized` stamp is an
+/// EXISTENCE marker: create/exists/remove round-trips, distinct masters are
+/// independent (`safe_filename`), removing an absent marker is a no-op, and the
+/// colocated marker file is never mistaken for a staged peer.
 #[test]
-fn peer_fleet_synthesized_stamp_round_trips_per_master() {
+fn peer_fleet_synthesized_stamp_is_an_existence_marker() {
     let tmp = tempfile::tempdir().unwrap();
     let peers_root = tmp.path();
     let master_a = "tenant-a:api:master-1";
     let master_b = "tenant-a:api:master-2";
 
-    assert_eq!(
-        read_peer_fleet_synthesized_stamp(peers_root, master_a),
-        None
-    );
+    assert!(!peer_fleet_synthesized_stamp_exists(peers_root, master_a));
 
-    let written = FleetSynthesisStamp {
-        newest_mtime: 1234,
-        total_turns: 7,
-    };
+    // Create (content is a debug timestamp; only existence gates).
     crate::memory_consolidate::apply::atomic_write(
         &peer_fleet_synthesized_stamp_path(peers_root, master_a),
-        &written.to_stamp_string(),
+        "1721900000",
     )
     .unwrap();
-    assert_eq!(
-        read_peer_fleet_synthesized_stamp(peers_root, master_a),
-        Some(written)
-    );
-    // A different master has an independent stamp (no cross-talk).
-    assert_eq!(
-        read_peer_fleet_synthesized_stamp(peers_root, master_b),
-        None
-    );
+    assert!(peer_fleet_synthesized_stamp_exists(peers_root, master_a));
+    // A different master is independent.
+    assert!(!peer_fleet_synthesized_stamp_exists(peers_root, master_b));
 
-    // Legacy single-number stamp parses with turns = 0 (upgrade re-arms once).
+    // Remove clears it; removing an absent marker is a no-op (no panic).
+    remove_peer_fleet_synthesized_stamp(peers_root, master_a);
+    assert!(!peer_fleet_synthesized_stamp_exists(peers_root, master_a));
+    remove_peer_fleet_synthesized_stamp(peers_root, master_b);
+
+    // The colocated marker file is NOT mistaken for a staged peer.
     crate::memory_consolidate::apply::atomic_write(
-        &peer_fleet_synthesized_stamp_path(peers_root, master_b),
-        "999",
+        &peer_fleet_synthesized_stamp_path(peers_root, master_a),
+        "x",
     )
     .unwrap();
-    assert_eq!(
-        read_peer_fleet_synthesized_stamp(peers_root, master_b),
-        Some(FleetSynthesisStamp {
-            newest_mtime: 999,
-            total_turns: 0,
-        })
+    assert!(collect_owned_peer_results(peers_root, master_a).is_empty());
+}
+
+/// Peer-fleet auto-synthesis RESET — `reset_peer_fleet_synthesis_if_cleared`
+/// removes the marker ONLY when the master's owned fleet is fully cleared. While
+/// any owned (non-closed) peer remains the marker persists; once the last peer
+/// is closed the marker is dropped so a fresh fleet fires once later.
+#[test]
+fn reset_removes_marker_only_when_fleet_fully_cleared() {
+    let tmp = tempfile::tempdir().unwrap();
+    let peers_root = tmp.path();
+    let master = "tenant-a:api:master-1";
+
+    // One owned, completed peer + the synthesized marker.
+    let dir = peers_root.join("worker");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("brief.md"), "brief").unwrap();
+    std::fs::write(dir.join("originator"), master).unwrap();
+    std::fs::write(dir.join("result.md"), "res").unwrap();
+    crate::memory_consolidate::apply::atomic_write(
+        &peer_fleet_synthesized_stamp_path(peers_root, master),
+        "1721900000",
+    )
+    .unwrap();
+
+    // Reset while an owned peer remains → marker PERSISTS.
+    reset_peer_fleet_synthesis_if_cleared(peers_root, master);
+    assert!(
+        peer_fleet_synthesized_stamp_exists(peers_root, master),
+        "marker persists while any owned peer remains"
     );
 
-    // The stamp file colocated in `peers/` is NOT mistaken for a staged peer.
-    assert!(collect_owned_peer_results(peers_root, master_a).is_empty());
+    // Close the peer (exclude it from the owned scan) → fleet cleared.
+    std::fs::write(dir.join("closed"), "").unwrap();
+    reset_peer_fleet_synthesis_if_cleared(peers_root, master);
+    assert!(
+        !peer_fleet_synthesized_stamp_exists(peers_root, master),
+        "marker removed once the fleet is fully cleared (a fresh fleet re-fires)"
+    );
 }
 
 /// codex #6 — `stage_peer` records the ORIGINATOR (when supplied) so the
@@ -7987,7 +7956,7 @@ fn stage_peer_records_originator_for_ownership_scan() {
     // The ownership scan attributes ONLY the owned peer to the master.
     let owned_slugs: Vec<String> = collect_owned_peer_results(&peers_root, master)
         .into_iter()
-        .map(|(slug, _, _)| slug)
+        .map(|(slug, _)| slug)
         .collect();
     assert_eq!(
         owned_slugs,

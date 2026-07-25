@@ -11056,6 +11056,13 @@ fn build_peer_close_callback(
                 "cancelled pending peer_send_input injections on peer close"
             );
         }
+        // Peer-fleet auto-synthesis RESET — the close marker now excludes this
+        // peer from the master's owned fleet. If it was the LAST owned peer, the
+        // fleet is fully retired: drop the `.synthesized` marker so a genuinely
+        // fresh fleet (spawned later under the same master) synthesizes once.
+        // No-op while any owned peer remains. `origin_session` is the master
+        // (the authorized originator).
+        reset_peer_fleet_synthesis_if_cleared(&peers_root, &origin_session);
         // Marker durable + queue cleared; now evict the live wire if the peer
         // is open so a still-connected peer stops being an injection target
         // immediately (the marker already covers the offline / reconnect case).
@@ -11165,111 +11172,82 @@ fn peer_results_ready_note(peers_root: &Path, session_id: &SessionKey) -> Option
 
 /// Peer-fleet auto-synthesis — one owned peer's readiness inputs for the
 /// [`evaluate_peer_fleet_synthesis`] decision.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct OwnedPeerState {
-    /// `result.md` mtime (secs since epoch), or `None` when the peer has not
-    /// produced any result yet — which BLOCKS synthesis (the fleet isn't done).
-    result_mtime: Option<u64>,
-    /// Number of terminal turns this peer has produced (its `result-*.md`
-    /// versions). Summed into the fleet's total-turn tiebreaker so a
-    /// same-second new turn still advances the dedup basis (codex #3).
-    turn_count: u64,
+    /// True when this peer has a `result.md` on the blackboard. A peer with no
+    /// result yet is NOT done, so it BLOCKS synthesis (the fleet isn't complete).
+    has_result: bool,
     /// True when this peer is NOT settled: it has a live (non-terminal) turn in
-    /// flight OR a queued `peer_send_input` follow-up (codex #1) that has not
-    /// run yet. Either BLOCKS synthesis so a stale earlier result isn't
-    /// synthesized while a fresher one is (about to be) produced.
+    /// flight OR a queued/just-claimed `peer_send_input` follow-up that has not
+    /// run yet. Either BLOCKS synthesis so a stale result isn't synthesized
+    /// while a fresher one is (about to be) produced.
     mid_turn: bool,
 }
 
-/// Peer-fleet auto-synthesis — the composite dedup basis for one fire: the
-/// newest owned `result.md` mtime paired with the fleet's total turn count.
-/// mtime is 1s-granular, so a same-second-but-newer result would be invisible
-/// to an mtime-only gate; pairing it with the monotonic total turn count
-/// (codex #3) lets such a result still re-arm — a re-fire happens when EITHER
-/// component advances past the stored stamp.
+/// Peer-fleet auto-synthesis — the decision for one evaluation of a master's
+/// fleet.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct FleetSynthesisStamp {
-    newest_mtime: u64,
-    total_turns: u64,
+enum FleetSynthesisDecision {
+    /// Fire ONE synthesis turn and CREATE the per-master `.synthesized`
+    /// existence marker so the fleet never synthesizes again while it lives.
+    Fire,
+    /// Do nothing.
+    Hold,
+    /// The master's owned fleet is fully CLEARED (zero owned peers): remove the
+    /// `.synthesized` marker (if present) so a later, freshly-spawned fleet can
+    /// fire once. Never a synthesis.
+    ClearStamp,
 }
 
-impl FleetSynthesisStamp {
-    /// Serialize as `"<mtime> <turns>"` (same space format as `turns.txt`).
-    fn to_stamp_string(self) -> String {
-        format!("{} {}", self.newest_mtime, self.total_turns)
-    }
-
-    /// Parse `"<mtime> [turns]"`; a legacy single-number stamp reads turns = 0
-    /// (so an upgrade re-arms at most once).
-    fn parse(text: &str) -> Option<Self> {
-        let mut parts = text.split_whitespace();
-        let newest_mtime = parts.next()?.parse::<u64>().ok()?;
-        let total_turns = parts
-            .next()
-            .and_then(|t| t.parse::<u64>().ok())
-            .unwrap_or(0);
-        Some(Self {
-            newest_mtime,
-            total_turns,
-        })
-    }
-}
-
-/// Peer-fleet auto-synthesis — decide whether a master's peer fleet is ready
-/// for an AUTONOMOUS synthesis turn, and (when so) the [`FleetSynthesisStamp`]
-/// to stamp + key the fire on.
+/// Peer-fleet auto-synthesis — decide whether a master's peer fleet warrants an
+/// AUTONOMOUS synthesis turn. The `.synthesized` stamp is an EXISTENCE marker:
+/// a fleet fires EXACTLY ONCE and never re-fires while any owned peer lives (a
+/// newer result or an added-and-completed peer must NOT re-synthesize). The
+/// stamp is cleared only when the fleet is fully retired (zero owned peers), so
+/// a genuinely fresh fleet later fires once.
 ///
-/// Fire policy (v1): fire IFF the master owns AT LEAST ONE peer, the master is
-/// idle, EVERY owned peer has produced a `result.md` AND none is mid-turn (nor
-/// has queued input), AND the candidate `(newest_mtime, total_turns)` advances
-/// past the `.synthesized` stamp the last synthesis covered. That makes a
-/// completion wave fire exactly once and re-fire only when a peer later
-/// produces a genuinely newer result (or, at the same second, one more turn).
+/// Decision:
+/// - zero owned peers → [`ClearStamp`](FleetSynthesisDecision::ClearStamp) when
+///   the marker exists (reset for a future fresh fleet), else `Hold`.
+/// - marker already exists (this fleet was synthesized) → `Hold` — never
+///   re-fire while any owned peer remains.
+/// - master busy, or any owned peer not settled / not done → `Hold`.
+/// - otherwise (≥1 owned peer, idle, all settled + done, no marker) → `Fire`.
 ///
-/// Pure + input-driven so the whole fire/dedup/idle/mid-turn matrix is
+/// Pure + input-driven so the whole fire/reset/idle/settled matrix is
 /// unit-testable without the filesystem, the wire registry, or a live turn.
 fn evaluate_peer_fleet_synthesis(
     peers: &[OwnedPeerState],
-    synthesized_stamp: Option<FleetSynthesisStamp>,
+    stamp_exists: bool,
     master_idle: bool,
-) -> Option<FleetSynthesisStamp> {
-    // Zero owned peers → nothing to synthesize (a master that never handed off,
-    // or whose peers are all closed/retired).
+) -> FleetSynthesisDecision {
+    // Fleet fully cleared → drop the marker so a fresh fleet can fire once.
+    // Checked FIRST and independent of idle: a retired fleet resets regardless.
     if peers.is_empty() {
-        return None;
+        return if stamp_exists {
+            FleetSynthesisDecision::ClearStamp
+        } else {
+            FleetSynthesisDecision::Hold
+        };
+    }
+    // Already synthesized this fleet → EXACTLY ONCE: never re-fire while any
+    // owned peer exists (added peers / newer results do not re-arm).
+    if stamp_exists {
+        return FleetSynthesisDecision::Hold;
     }
     // Never fire onto a busy master. The continuation drain re-checks
-    // idle-eligibility before firing, but gating the DECISION here keeps it
-    // self-contained and avoids advancing the `.synthesized` stamp for a wave
-    // the master did not actually synthesize.
+    // idle-eligibility before firing; gating here keeps the decision
+    // self-contained and avoids creating the marker for an unfired wave.
     if !master_idle {
-        return None;
+        return FleetSynthesisDecision::Hold;
     }
     // Every owned peer must be DONE (has a result) and SETTLED (not mid-turn).
-    let mut newest_mtime = 0u64;
-    let mut total_turns = 0u64;
     for peer in peers {
-        if peer.mid_turn {
-            return None;
+        if peer.mid_turn || !peer.has_result {
+            return FleetSynthesisDecision::Hold;
         }
-        let mtime = peer.result_mtime?;
-        newest_mtime = newest_mtime.max(mtime);
-        total_turns = total_turns.saturating_add(peer.turn_count);
     }
-    let candidate = FleetSynthesisStamp {
-        newest_mtime,
-        total_turns,
-    };
-    // Dedup / re-arm gate: hold only when the candidate is fully covered by the
-    // stamp (mirrors the `.notified` `>=` gate in `peer_results_ready_note`).
-    // Re-arm when EITHER the newest mtime OR the total turn count advances, so a
-    // same-second new result is not suppressed by 1s mtime granularity.
-    if synthesized_stamp.is_some_and(|stamp| {
-        candidate.newest_mtime <= stamp.newest_mtime && candidate.total_turns <= stamp.total_turns
-    }) {
-        return None;
-    }
-    Some(candidate)
+    FleetSynthesisDecision::Fire
 }
 
 /// Per-master `.synthesized` stamp path under `peers/`. Keyed by a
@@ -11285,26 +11263,47 @@ fn peer_fleet_synthesized_stamp_path(peers_root: &Path, master: &str) -> PathBuf
     ))
 }
 
-/// Read the per-master `.synthesized` stamp (the [`FleetSynthesisStamp`] the
-/// last synthesis covered), or `None` when unstamped / unparseable.
-fn read_peer_fleet_synthesized_stamp(
-    peers_root: &Path,
-    master: &str,
-) -> Option<FleetSynthesisStamp> {
-    std::fs::read_to_string(peer_fleet_synthesized_stamp_path(peers_root, master))
-        .ok()
-        .as_deref()
-        .and_then(FleetSynthesisStamp::parse)
+/// True when the per-master `.synthesized` EXISTENCE marker is present. Only
+/// existence gates synthesis; the file's content (a debug timestamp) is never
+/// read.
+fn peer_fleet_synthesized_stamp_exists(peers_root: &Path, master: &str) -> bool {
+    peer_fleet_synthesized_stamp_path(peers_root, master).exists()
 }
 
-/// Enumerate every peer OWNED by `master` under `peers_root` with its
-/// `result.md` mtime (secs, or `None` when absent) and terminal-turn count.
-/// "Owned" = a REAL staged peer (non-symlink dir carrying `brief.md`, via
-/// [`staged_peer_dir`]) whose `originator` file equals `master`. CLOSED peers
-/// (retired via `peer_close`) are EXCLUDED — a retired peer neither blocks nor
-/// contributes to the fleet. Symlink-safe throughout; filesystem-only +
-/// wire-registry-free, so it is unit-testable with a tempdir.
-fn collect_owned_peer_results(peers_root: &Path, master: &str) -> Vec<(String, Option<u64>, u64)> {
+/// Remove the per-master `.synthesized` marker (best-effort). Absent is not an
+/// error. Used to RESET a fully-cleared fleet so a fresh one can fire once.
+fn remove_peer_fleet_synthesized_stamp(peers_root: &Path, master: &str) {
+    match std::fs::remove_file(peer_fleet_synthesized_stamp_path(peers_root, master)) {
+        Ok(()) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => {
+            tracing::warn!(?err, "failed to remove peer fleet .synthesized stamp");
+        }
+    }
+}
+
+/// Peer-fleet auto-synthesis RESET — remove the per-master `.synthesized` marker
+/// when the master's owned fleet has been fully CLEARED (every peer closed /
+/// removed), so a genuinely fresh fleet fires once later. Called from
+/// `peer_close` after the close marker lands (the just-closed peer is now
+/// excluded from the owned scan). No-op while any owned peer remains — the
+/// marker persists for the life of the fleet.
+fn reset_peer_fleet_synthesis_if_cleared(peers_root: &Path, master: &str) {
+    if master.is_empty() {
+        return;
+    }
+    if collect_owned_peer_results(peers_root, master).is_empty() {
+        remove_peer_fleet_synthesized_stamp(peers_root, master);
+    }
+}
+
+/// Enumerate every peer OWNED by `master` under `peers_root`, each paired with
+/// whether it has a `result.md`. "Owned" = a REAL staged peer (non-symlink dir
+/// carrying `brief.md`, via [`staged_peer_dir`]) whose `originator` file equals
+/// `master`. CLOSED peers (retired via `peer_close`) are EXCLUDED — a retired
+/// peer neither blocks nor keeps the fleet alive. Symlink-safe throughout;
+/// filesystem-only + wire-registry-free, so it is unit-testable with a tempdir.
+fn collect_owned_peer_results(peers_root: &Path, master: &str) -> Vec<(String, bool)> {
     let Ok(read_dir) = std::fs::read_dir(peers_root) else {
         return Vec::new();
     };
@@ -11316,27 +11315,21 @@ fn collect_owned_peer_results(peers_root: &Path, master: &str) -> Vec<(String, O
         let Some(dir) = staged_peer_dir(peers_root, &slug) else {
             continue;
         };
-        // Retired peer: neither blocks nor contributes to the fleet.
+        // Retired peer: neither blocks nor keeps the fleet alive.
         if dir.join("closed").is_file() {
             continue;
         }
-        // Originator gate — only peers THIS master staged. codex #6: after the
-        // atomic owner-before-brief write in `stage_peer`, a visible (brief.md)
-        // member always has a readable originator, so a member of THIS master is
-        // never silently dropped from the ownership scan.
+        // Originator gate — only peers THIS master staged. After the atomic
+        // owner-before-brief write in `stage_peer`, a visible (brief.md) member
+        // always has a readable originator, so a member of THIS master is never
+        // silently dropped from the ownership scan.
         let Ok(originator) = std::fs::read_to_string(dir.join("originator")) else {
             continue;
         };
         if originator.trim() != master {
             continue;
         }
-        let result_mtime = std::fs::metadata(dir.join("result.md"))
-            .ok()
-            .and_then(|meta| meta.modified().ok())
-            .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|elapsed| elapsed.as_secs());
-        let turn_count = u64::from(count_peer_result_versions(&dir));
-        owned.push((slug, result_mtime, turn_count));
+        owned.push((slug, dir.join("result.md").is_file()));
     }
     owned
 }
@@ -11344,30 +11337,29 @@ fn collect_owned_peer_results(peers_root: &Path, master: &str) -> Vec<(String, O
 /// Peer-fleet auto-synthesis hook. Called at a PEER session's turn terminal
 /// (right after its `result.md` is written): resolve the owning master from
 /// this peer's `originator`, and — when the master's WHOLE fleet is complete,
-/// settled, and the master is idle — enqueue ONE autonomous synthesis
-/// continuation on the master session. The continuation drain (per-connection
-/// tick + connection-independent global drain) turns it into a fired master
-/// turn; `due_loop_targets`' pending-continuation sweep surfaces the master
-/// even though it has no active goal/loop.
+/// settled, the master is idle, and the fleet has not already been synthesized
+/// — enqueue ONE autonomous synthesis continuation on the master session. The
+/// continuation drain (per-connection tick + connection-independent global
+/// drain) turns it into a fired master turn; `due_loop_targets`'
+/// pending-continuation sweep surfaces the master even without an active
+/// goal/loop.
 ///
-/// DEDUP (codex #5, stamp-first): `evaluate_peer_fleet_synthesis` fires only
-/// when the candidate `(newest_mtime, total_turns)` advances past the
-/// per-master `.synthesized` stamp. The stamp is written FIRST (atomically),
-/// and the continuation is enqueued ONLY if that write succeeds — so no
-/// synthesis turn ever fires without a durable stamp, and a lost enqueue can
-/// never leave a wave un-stamped and re-fire once the 30s claim guard expires.
-/// The dedupe key embeds the same `(mtime, turns)`, so a genuine re-fire inside
-/// the claim window is not wrongly dropped.
+/// EXACTLY ONCE: the per-master `.synthesized` marker is an existence gate. On
+/// fire the marker is CREATED FIRST (atomically); the continuation is enqueued
+/// ONLY if that write succeeds, so no synthesis fires without a durable marker.
+/// While the marker exists the fleet never re-fires — a newer result or an
+/// added peer does NOT re-synthesize. The marker is cleared only when the fleet
+/// is fully retired (see [`reset_peer_fleet_synthesis_if_cleared`], called from
+/// `peer_close`), letting a later fresh fleet fire once.
 ///
 /// LOOP SAFETY: this fires ONLY on a `peer-<slug>` session's terminal. The
 /// synthesis turn runs on the MASTER session (not a peer), and `peer_gather`
 /// only READS `result.md` files — it never writes one — so the synthesis turn
-/// cannot produce a peer terminal and cannot re-trigger itself. A re-fire
-/// requires a peer to produce a strictly newer `result.md`, which requires real,
-/// bounded peer work; there is no self-sustaining loop.
+/// cannot produce a peer terminal and cannot re-trigger itself.
 ///
 /// No-op for a non-peer session, an unstaged peer, a peer with no recorded
-/// originator, a busy master, or a fleet that is not yet complete.
+/// originator, a busy master, an already-synthesized fleet, or an incomplete
+/// fleet.
 async fn maybe_enqueue_peer_fleet_synthesis(state: &Arc<AppState>, peer_session: &SessionKey) {
     let Some((profile_id, finished_slug)) = peer_slug_and_profile(peer_session) else {
         return;
@@ -11405,77 +11397,79 @@ async fn maybe_enqueue_peer_fleet_synthesis(state: &Arc<AppState>, peer_session:
             .pending_for_session(&master_key)
             .is_empty();
 
-    // Build the fleet's readiness inputs + the OWNED slug list (codex #4, used
-    // to scope the synthesis gather). A peer is NOT settled if it has a live
-    // turn OR a queued `peer_send_input` follow-up (codex #1).
+    // Build the fleet's readiness inputs + the OWNED slug list (used to scope
+    // the synthesis gather). A peer is NOT settled if it has a live turn OR a
+    // queued/just-claimed `peer_send_input` follow-up.
     let orchestrator = default_agent_orchestrator();
     let owned = collect_owned_peer_results(&peers_root, &master);
     let mut owned_slugs: Vec<String> = Vec::with_capacity(owned.len());
     let peers: Vec<OwnedPeerState> = owned
         .into_iter()
-        .map(|(slug, result_mtime, turn_count)| {
+        .map(|(slug, has_result)| {
             // Resolve the wire session ONCE; reuse it for both the active-turn
             // check and the in-flight-injection check.
             let wire_session = peer_wire_registry().resolve(&peer_wire_key(profile_id, &slug));
             let active_mid_turn = wire_session
                 .as_ref()
                 .is_some_and(|session| running.contains(session));
-            // codex #1 residual — a peer is NOT settled if it has a
-            // `peer_send_input` that is QUEUED or was just CLAIMED (popped by
-            // the drain, turn not yet active). The active-turn snapshot above
-            // and the pending queue are separate reads; the recent-claim check
-            // closes the pop-vs-snapshot window so an in-flight injection can't
-            // slip through and let a premature (then re-armed, duplicate)
-            // synthesis fire.
+            // A peer is NOT settled if it has a `peer_send_input` that is QUEUED
+            // or was just CLAIMED (popped by the drain, turn not yet active).
+            // The active-turn snapshot above and the pending queue are separate
+            // reads; the recent-claim check closes the pop-vs-snapshot window.
             let inflight_injection =
                 orchestrator.peer_has_inflight_send_input(profile_id, &slug, wire_session.as_ref());
             owned_slugs.push(slug);
             OwnedPeerState {
-                result_mtime,
-                turn_count,
+                has_result,
                 mid_turn: active_mid_turn || inflight_injection,
             }
         })
         .collect();
 
-    let stamp = read_peer_fleet_synthesized_stamp(&peers_root, &master);
-    let Some(candidate) = evaluate_peer_fleet_synthesis(&peers, stamp, master_idle) else {
-        return;
-    };
-
-    // codex #5 — write the `.synthesized` stamp FIRST (durably, atomically). If
-    // it fails, do NOT enqueue: no fire without a persisted stamp, so a lost
-    // enqueue can never leave a wave un-stamped and re-fire. The value is
-    // idempotent for a given wave, so a concurrent terminal writing the same
-    // stamp is safe; the scheduler's key dedup collapses the paired enqueue.
-    if let Err(err) = crate::memory_consolidate::apply::atomic_write(
-        &peer_fleet_synthesized_stamp_path(&peers_root, &master),
-        &candidate.to_stamp_string(),
-    ) {
-        tracing::warn!(
-            ?err,
-            "peer fleet synthesis: .synthesized stamp write failed; not enqueuing"
-        );
-        return;
-    }
-
-    let outcome = orchestrator.enqueue_peer_fleet_synthesis_continuation(
-        &master_key,
-        profile_id,
-        candidate.newest_mtime,
-        candidate.total_turns,
-        &owned_slugs,
-        peers.len(),
-    );
-    if outcome.queued().is_some() {
-        tracing::debug!(
-            master = %master_key,
-            profile = profile_id,
-            peers = peers.len(),
-            newest_mtime = candidate.newest_mtime,
-            total_turns = candidate.total_turns,
-            "peer fleet complete — enqueued autonomous synthesis turn on master"
-        );
+    let stamp_exists = peer_fleet_synthesized_stamp_exists(&peers_root, &master);
+    match evaluate_peer_fleet_synthesis(&peers, stamp_exists, master_idle) {
+        FleetSynthesisDecision::Hold => {}
+        // Defensive: a peer-terminal eval always includes the just-terminated
+        // peer, so the owned set is non-empty here; the real reset runs on
+        // `peer_close`. Handle it anyway so the decision contract is honored.
+        FleetSynthesisDecision::ClearStamp => {
+            remove_peer_fleet_synthesized_stamp(&peers_root, &master);
+        }
+        FleetSynthesisDecision::Fire => {
+            // Write the `.synthesized` marker FIRST (durably, atomically). If it
+            // fails, do NOT enqueue: no fire without a persisted marker. The
+            // content is a debug timestamp; only existence gates. Concurrent
+            // terminals writing the same marker are safe (idempotent), and the
+            // per-master dedupe key collapses the paired enqueue.
+            let now_unix = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|elapsed| elapsed.as_secs())
+                .unwrap_or(0);
+            if let Err(err) = crate::memory_consolidate::apply::atomic_write(
+                &peer_fleet_synthesized_stamp_path(&peers_root, &master),
+                &now_unix.to_string(),
+            ) {
+                tracing::warn!(
+                    ?err,
+                    "peer fleet synthesis: .synthesized marker write failed; not enqueuing"
+                );
+                return;
+            }
+            let outcome = orchestrator.enqueue_peer_fleet_synthesis_continuation(
+                &master_key,
+                profile_id,
+                &owned_slugs,
+                peers.len(),
+            );
+            if outcome.queued().is_some() {
+                tracing::debug!(
+                    master = %master_key,
+                    profile = profile_id,
+                    peers = peers.len(),
+                    "peer fleet complete — enqueued ONE autonomous synthesis turn on master"
+                );
+            }
+        }
     }
 }
 

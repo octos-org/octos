@@ -206,28 +206,16 @@ fn peer_send_input_dedupe_key(session: &SessionKey, occurrence_id: &str) -> Stri
     format!("external/{PEER_SEND_INPUT_EXTERNAL_KIND}/{session}/{occurrence_id}")
 }
 
-/// The dedupe key for a peer-fleet-synthesis continuation. Keyed on the master
-/// (originator) wire session AND the newest owned `result.md` mtime that the
-/// enqueue was decided on. Embedding the mtime as the occurrence id is REQUIRED
-/// by the scheduler's `RECENT_CLAIM_GUARD_WINDOW` invariant: a stable key would
-/// be rejected as a duplicate for 30s after a synthesis turn is claimed, which
-/// would wrongly drop a legitimate re-fire when a peer produces a genuinely
-/// newer result inside that window. Because a re-fire only happens when the
-/// newest mtime STRICTLY advances past the per-master `.synthesized` stamp, the
-/// mtime is a monotonic occurrence id: the same completion wave always maps to
-/// the same key (deduped), a genuinely newer wave maps to a fresh key (fires).
-///
-/// The 1s-granular mtime is paired with the fleet's total turn count (codex #3):
-/// a same-second-but-newer result advances `total_turns` even when the mtime is
-/// unchanged, so the key still differs and the re-fire is not collapsed.
-fn peer_fleet_synthesis_dedupe_key(
-    master_session: &SessionKey,
-    newest_result_mtime: u64,
-    total_turns: u64,
-) -> String {
-    format!(
-        "external/{PEER_FLEET_SYNTHESIS_EXTERNAL_KIND}/{master_session}/{newest_result_mtime}-{total_turns}"
-    )
+/// The dedupe key for a peer-fleet-synthesis continuation — PER-MASTER only.
+/// A master's fleet synthesizes EXACTLY ONCE (the `.synthesized` existence
+/// marker gates the enqueue, and the marker persists for the life of the
+/// fleet), so a stable per-master key is exactly right: a second enqueue for the
+/// same master collapses onto the first. No mtime/turns occurrence id — there is
+/// no re-arm to distinguish, and the `RECENT_CLAIM_GUARD_WINDOW` can only ever
+/// see a benign duplicate here (a genuine re-fire requires the fleet to be fully
+/// cleared and a fresh one completed, far beyond the 30s window).
+fn peer_fleet_synthesis_dedupe_key(master_session: &SessionKey) -> String {
+    format!("external/{PEER_FLEET_SYNTHESIS_EXTERNAL_KIND}/{master_session}")
 }
 
 #[derive(Debug, Clone)]
@@ -2459,26 +2447,23 @@ impl InProcessAgentOrchestrator {
 
     /// Peer-fleet auto-synthesis — enqueue ONE autonomous synthesis turn on the
     /// master (originator) session when its whole peer fleet has completed. The
-    /// fire/dedup decision (every owned peer has a fresh `result.md`, none is
-    /// mid-turn, the master is idle, and at least one result is newer than the
-    /// per-master `.synthesized` stamp) is made by the caller in
-    /// `ui_protocol.rs`; this method only performs the enqueue.
+    /// fire decision (every owned peer has a `result.md`, none is mid-turn, the
+    /// master is idle, and the fleet has not already been synthesized) is made
+    /// by the caller in `ui_protocol.rs`; this method only performs the enqueue.
+    ///
+    /// The dedupe key is PER-MASTER, so a second enqueue for the same master
+    /// (concurrent terminals, or any stray re-evaluation) collapses onto the
+    /// first — one synthesis per fleet. `owned_slugs` scopes the prompt's
+    /// `peer_gather` to this master's fleet only.
     ///
     /// In-memory enqueue (no durable persist): losing a synthesis TRIGGER across
     /// a restart is benign — the master's next real turn still picks up the
     /// passive `peer_results_ready_note` nudge — so, unlike a user's
-    /// `peer_send_input` message, it need not survive a crash. Skipping the
-    /// durable write also avoids a restart replaying a synthesis turn the
-    /// `.synthesized` stamp already covered.
-    ///
-    /// Returns the raw enqueue outcome so the caller can advance the
-    /// `.synthesized` stamp exactly when a continuation is newly queued.
+    /// `peer_send_input` message, it need not survive a crash.
     pub(crate) fn enqueue_peer_fleet_synthesis_continuation(
         &self,
         master_session: &SessionKey,
         profile_id: &str,
-        newest_result_mtime: u64,
-        total_turns: u64,
         owned_slugs: &[String],
         peer_count: usize,
     ) -> MasterContinuationEnqueueOutcome {
@@ -2490,15 +2475,11 @@ impl InProcessAgentOrchestrator {
             SystemTime::now(),
         )
         .with_metadata(PEER_FLEET_SYNTHESIS_META_PEER_COUNT, peer_count.to_string())
-        // codex #4 — carry the OWNED slugs so the prompt scopes `peer_gather` to
-        // this master's fleet only. The explicit `with_dedupe_key` below is
+        // Carry the OWNED slugs so the prompt scopes `peer_gather` to this
+        // master's fleet only. The explicit `with_dedupe_key` below is
         // authoritative, so this metadata never widens the key.
         .with_metadata(PEER_FLEET_SYNTHESIS_META_SLUGS, owned_slugs.join(","))
-        .with_dedupe_key(peer_fleet_synthesis_dedupe_key(
-            master_session,
-            newest_result_mtime,
-            total_turns,
-        ));
+        .with_dedupe_key(peer_fleet_synthesis_dedupe_key(master_session));
         let mut state = self.state();
         state.continuations.enqueue(request)
     }
@@ -8965,47 +8946,40 @@ mod tests {
         );
     }
 
-    /// Peer-fleet auto-synthesis — the synthesis continuation dedupes on the
-    /// master session + (newest mtime, total turns): re-enqueuing the SAME wave
-    /// collapses to one queued turn, a strictly NEWER mtime re-arms, AND (codex
-    /// #3) a SAME-second wave whose total turn count advanced also re-arms.
+    /// Peer-fleet auto-synthesis — the synthesis continuation dedupes PER-MASTER:
+    /// a second enqueue for the same master collapses to the one queued turn,
+    /// even with a different (larger) owned-slug set or peer count. There is no
+    /// re-arm — one synthesis per fleet.
     #[test]
-    fn peer_fleet_synthesis_continuation_dedupes_on_master_and_newest_mtime() {
+    fn peer_fleet_synthesis_continuation_dedupes_per_master() {
         let orchestrator = default_agent_orchestrator();
         let master = SessionKey::with_profile("tenant-fleet-synth", "api", "master-dedupe");
         let profile = "tenant-fleet-synth";
-        let slugs = vec!["alpha".to_owned(), "beta".to_owned()];
 
-        let first = orchestrator
-            .enqueue_peer_fleet_synthesis_continuation(&master, profile, 1000, 5, &slugs, 3);
-        assert!(first.queued().is_some(), "first synthesis wave must queue");
+        let first = orchestrator.enqueue_peer_fleet_synthesis_continuation(
+            &master,
+            profile,
+            &["alpha".to_owned(), "beta".to_owned()],
+            2,
+        );
+        assert!(first.queued().is_some(), "first synthesis must queue");
 
-        let dup = orchestrator
-            .enqueue_peer_fleet_synthesis_continuation(&master, profile, 1000, 5, &slugs, 3);
+        // A later evaluation — MORE peers, different slug set — must NOT stack a
+        // second synthesis: the per-master key collapses onto the first.
+        let dup = orchestrator.enqueue_peer_fleet_synthesis_continuation(
+            &master,
+            profile,
+            &["alpha".to_owned(), "beta".to_owned(), "gamma".to_owned()],
+            3,
+        );
         assert!(
             dup.is_duplicate(),
-            "same (mtime, turns) re-enqueue must dedupe"
+            "a per-master key: a second synthesis for the same master must dedupe"
         );
         assert_eq!(
             orchestrator.pending_continuation_count_for_session_for_test(&master, profile),
             1,
-            "same completion wave must not stack a second synthesis continuation",
-        );
-
-        // Same second (mtime unchanged) but a new fleet turn → fresh key.
-        let same_second_newer = orchestrator
-            .enqueue_peer_fleet_synthesis_continuation(&master, profile, 1000, 6, &slugs, 3);
-        assert!(
-            same_second_newer.queued().is_some(),
-            "a same-second wave with more total turns must re-arm (codex #3)",
-        );
-
-        // Strictly newer mtime → fresh key.
-        let rearm = orchestrator
-            .enqueue_peer_fleet_synthesis_continuation(&master, profile, 1500, 6, &slugs, 3);
-        assert!(
-            rearm.queued().is_some(),
-            "a strictly newer result must re-arm synthesis with a fresh continuation",
+            "a fleet synthesizes exactly once — never two queued continuations",
         );
     }
 
@@ -9018,8 +8992,7 @@ mod tests {
         let master = SessionKey::with_profile("tenant-fleet-prompt", "api", "master-prompt");
         let profile = "tenant-fleet-prompt";
         let slugs = vec!["edison".to_owned(), "tesla".to_owned()];
-        orchestrator
-            .enqueue_peer_fleet_synthesis_continuation(&master, profile, 2000, 2, &slugs, 2);
+        orchestrator.enqueue_peer_fleet_synthesis_continuation(&master, profile, &slugs, 2);
         let drained = orchestrator.drain_ready_continuations_for_session(
             &master,
             profile,
