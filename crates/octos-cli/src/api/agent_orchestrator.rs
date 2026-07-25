@@ -2484,6 +2484,17 @@ impl InProcessAgentOrchestrator {
         state.continuations.enqueue(request)
     }
 
+    /// Peer-fleet auto-synthesis RESET — clear the scheduler's recent-claim
+    /// guard entry for a master's (stable, per-master) synthesis dedupe key, so
+    /// a fresh fleet completing within `RECENT_CLAIM_GUARD_WINDOW` after a reset
+    /// is not wrongly deduped against the just-claimed prior synthesis. Called
+    /// when the fleet RESET removes the `.synthesized` marker.
+    pub(crate) fn clear_peer_fleet_synthesis_claim(&self, master_session: &SessionKey) {
+        let key =
+            MasterContinuationDedupeKey::from(peer_fleet_synthesis_dedupe_key(master_session));
+        self.state().continuations.clear_recent_external_claim(&key);
+    }
+
     /// codex #1 — true when peer `slug` (under `profile_id`) has a
     /// `peer_send_input` injection still QUEUED (a follow-up turn that has not
     /// run yet). Such a peer is NOT settled: the fleet-synthesis gate must not
@@ -8980,6 +8991,63 @@ mod tests {
             orchestrator.pending_continuation_count_for_session_for_test(&master, profile),
             1,
             "a fleet synthesizes exactly once — never two queued continuations",
+        );
+    }
+
+    /// Bug 1 (reset edge) — after a fleet RESET clears the recent-claim guard, a
+    /// FRESH fleet completing within `RECENT_CLAIM_GUARD_WINDOW` still fires: its
+    /// per-master enqueue is no longer collapsed against the just-claimed prior
+    /// synthesis. Without the reset's `clear_peer_fleet_synthesis_claim`, the
+    /// stable key would stay guarded and the fresh continuation would be dropped
+    /// (marked-but-unsynthesized).
+    #[test]
+    fn fresh_fleet_after_reset_fires_within_claim_window() {
+        let orchestrator = default_agent_orchestrator();
+        let master = SessionKey::with_profile("tenant-fleet-reset", "api", "master-reset");
+        let profile = "tenant-fleet-reset";
+        let slugs = vec!["alpha".to_owned()];
+
+        // Fleet A fires and is DRAINED (claimed) → recorded in the recent-claim
+        // guard for the stable per-master key.
+        assert!(
+            orchestrator
+                .enqueue_peer_fleet_synthesis_continuation(&master, profile, &slugs, 1)
+                .queued()
+                .is_some()
+        );
+        let drained = orchestrator.drain_ready_continuations_for_session(
+            &master,
+            profile,
+            MasterContinuationRuntimeState::idle(),
+            4,
+        );
+        assert!(
+            drained.iter().any(
+                |c| matches!(&c.reason, MasterContinuationReason::External(k)
+                if k == PEER_FLEET_SYNTHESIS_EXTERNAL_KIND)
+            ),
+            "the first synthesis must drain (recording the claim)",
+        );
+
+        // WITHOUT a reset, a re-enqueue within the window is deduped by the guard
+        // (the item already left `pending_by_key` when drained).
+        assert!(
+            orchestrator
+                .enqueue_peer_fleet_synthesis_continuation(&master, profile, &slugs, 1)
+                .is_duplicate(),
+            "the recent-claim guard still holds the just-claimed key",
+        );
+
+        // RESET clears the guard entry for this master's key.
+        orchestrator.clear_peer_fleet_synthesis_claim(&master);
+
+        // A fresh fleet within the SAME window now fires — not suppressed.
+        assert!(
+            orchestrator
+                .enqueue_peer_fleet_synthesis_continuation(&master, profile, &slugs, 1)
+                .queued()
+                .is_some(),
+            "a fresh fleet after reset must fire, not be dropped by the stale guard",
         );
     }
 

@@ -810,6 +810,25 @@ impl MasterContinuationScheduler {
                 key.as_str().starts_with(key_prefix) && within_recent_claim_window(*claimed_at, now)
             })
     }
+
+    /// Drop a SPECIFIC External key from the recent-claim guard so a subsequent
+    /// enqueue of that exact key is NOT collapsed as a recent duplicate. Returns
+    /// whether an entry was removed.
+    ///
+    /// Used by the peer-fleet-synthesis RESET: that key is STABLE per master, so
+    /// after a fleet is cleared a fresh fleet completing within
+    /// [`RECENT_CLAIM_GUARD_WINDOW`] would otherwise have its enqueue rejected as
+    /// a duplicate of the just-claimed PRIOR synthesis — dropping the fresh
+    /// continuation and leaving the fresh fleet marked-but-unsynthesized. Clearing
+    /// the entry on reset re-opens the key for the next legitimate fire. Distinct
+    /// from [`reinsert`](Self::reinsert)'s guard-clear (an undelivered restore);
+    /// this is a deliberate reset of a delivered, now-obsolete claim.
+    pub(crate) fn clear_recent_external_claim(
+        &mut self,
+        dedupe_key: &MasterContinuationDedupeKey,
+    ) -> bool {
+        self.recently_claimed_external.remove(dedupe_key).is_some()
+    }
 }
 
 /// True when `candidate` falls within [`RECENT_CLAIM_GUARD_WINDOW`] after

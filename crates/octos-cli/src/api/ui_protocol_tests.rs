@@ -7808,7 +7808,7 @@ fn collect_owned_peer_results_filters_by_originator_and_excludes_closed() {
     let foreign = stage("foreign-peer", other);
     std::fs::write(foreign.join("result.md"), "res").unwrap();
 
-    let mut owned = collect_owned_peer_results(peers_root, master);
+    let mut owned = collect_owned_peer_results(peers_root, master).expect("peers dir readable");
     owned.sort();
     let slugs: Vec<&str> = owned.iter().map(|(slug, _)| slug.as_str()).collect();
     assert_eq!(
@@ -7864,7 +7864,11 @@ fn peer_fleet_synthesized_stamp_is_an_existence_marker() {
         "x",
     )
     .unwrap();
-    assert!(collect_owned_peer_results(peers_root, master_a).is_empty());
+    assert!(
+        collect_owned_peer_results(peers_root, master_a)
+            .expect("peers dir readable")
+            .is_empty()
+    );
 }
 
 /// Peer-fleet auto-synthesis RESET — `reset_peer_fleet_synthesis_if_cleared`
@@ -7902,6 +7906,79 @@ fn reset_removes_marker_only_when_fleet_fully_cleared() {
     assert!(
         !peer_fleet_synthesized_stamp_exists(peers_root, master),
         "marker removed once the fleet is fully cleared (a fresh fleet re-fires)"
+    );
+}
+
+/// Bug 2 (reset edge) — `collect_owned_peer_results` distinguishes a
+/// genuinely-EMPTY readable directory (`Some(vec![])`) from a `peers/` scan
+/// FAILURE (`None`), so a transient read error is never mistaken for a cleared
+/// fleet.
+#[test]
+fn collect_owned_peer_results_distinguishes_empty_from_scan_failure() {
+    let tmp = tempfile::tempdir().unwrap();
+    let master = "tenant-a:api:master-scan";
+
+    // Genuinely-empty (readable) dir → Some(empty).
+    let empty = tmp.path().join("empty-peers");
+    std::fs::create_dir_all(&empty).unwrap();
+    assert_eq!(
+        collect_owned_peer_results(&empty, master),
+        Some(Vec::new()),
+        "an empty readable dir is Some(empty), not a failure"
+    );
+
+    // Non-existent dir → read_dir fails → None (distinct from Some(empty)).
+    let missing = tmp.path().join("missing-peers");
+    assert_eq!(
+        collect_owned_peer_results(&missing, master),
+        None,
+        "a read_dir failure must be None (fail-closed), not Some(empty)"
+    );
+}
+
+/// Bug 2 (reset edge) — a `peers/` scan FAILURE must fail closed: the reset does
+/// NOT remove an existing marker (which would let an already-synthesized fleet
+/// re-fire). Exercised on Unix by denying READ (keeping EXECUTE) on `peers/` so
+/// `read_dir` fails while the marker stat still succeeds. Skipped when perms are
+/// not enforced (e.g. running as root).
+#[cfg(unix)]
+#[test]
+fn scan_failure_does_not_reset_marker() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = tempfile::tempdir().unwrap();
+    let peers_root = tmp.path().join("peers");
+    std::fs::create_dir_all(&peers_root).unwrap();
+    let master = "tenant-a:api:master-scan";
+
+    // Marker present (written while the dir is readable).
+    crate::memory_consolidate::apply::atomic_write(
+        &peer_fleet_synthesized_stamp_path(&peers_root, master),
+        "1721900000",
+    )
+    .unwrap();
+
+    // Deny READ but keep EXECUTE: read_dir fails, stat(marker) still works.
+    std::fs::set_permissions(&peers_root, std::fs::Permissions::from_mode(0o111)).unwrap();
+    if std::fs::read_dir(&peers_root).is_ok() {
+        // Permissions not enforced (root); can't exercise the failure path.
+        std::fs::set_permissions(&peers_root, std::fs::Permissions::from_mode(0o755)).unwrap();
+        return;
+    }
+
+    // Exercise the fail-closed path while read is denied.
+    let collect_result = collect_owned_peer_results(&peers_root, master);
+    reset_peer_fleet_synthesis_if_cleared(&peers_root, master);
+
+    // Restore read for the marker check + tempdir cleanup, THEN assert (so a
+    // panic can't leave the dir unreadable).
+    std::fs::set_permissions(&peers_root, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert_eq!(
+        collect_result, None,
+        "a read_dir failure yields None (fail-closed)"
+    );
+    assert!(
+        peer_fleet_synthesized_stamp_exists(&peers_root, master),
+        "a scan failure must NOT reset the marker (fail-closed)"
     );
 }
 
@@ -7955,6 +8032,7 @@ fn stage_peer_records_originator_for_ownership_scan() {
 
     // The ownership scan attributes ONLY the owned peer to the master.
     let owned_slugs: Vec<String> = collect_owned_peer_results(&peers_root, master)
+        .expect("peers dir readable")
         .into_iter()
         .map(|(slug, _)| slug)
         .collect();

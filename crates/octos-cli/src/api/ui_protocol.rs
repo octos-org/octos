@@ -11288,13 +11288,28 @@ fn remove_peer_fleet_synthesized_stamp(peers_root: &Path, master: &str) {
 /// `peer_close` after the close marker lands (the just-closed peer is now
 /// excluded from the owned scan). No-op while any owned peer remains — the
 /// marker persists for the life of the fleet.
+///
+/// FAIL-CLOSED: a `peers/` scan failure (`None`) can't prove the fleet is empty,
+/// so it does NOT reset — a spurious reset would let an already-synthesized
+/// fleet re-fire. A failed marker REMOVAL is only logged: a stale marker lingers
+/// until the NEXT successful reset (not permanently).
 fn reset_peer_fleet_synthesis_if_cleared(peers_root: &Path, master: &str) {
     if master.is_empty() {
         return;
     }
-    if collect_owned_peer_results(peers_root, master).is_empty() {
-        remove_peer_fleet_synthesized_stamp(peers_root, master);
+    // Only a genuinely-read EMPTY owned set resets. `None` (scan error) or any
+    // remaining owned peer leaves the marker in place.
+    if collect_owned_peer_results(peers_root, master).is_none_or(|owned| !owned.is_empty()) {
+        return;
     }
+    remove_peer_fleet_synthesized_stamp(peers_root, master);
+    // Bug 1 — also drop the scheduler's recent-claim guard entry for this
+    // master's STABLE per-master synthesis key. Without this, a fresh fleet
+    // completing within `RECENT_CLAIM_GUARD_WINDOW` would have its Fire enqueue
+    // rejected as a duplicate of the just-claimed prior synthesis, leaving the
+    // fresh fleet marked-but-unsynthesized. The disk marker and the in-memory
+    // guard are cleared together so the next legitimate fire is not suppressed.
+    default_agent_orchestrator().clear_peer_fleet_synthesis_claim(&SessionKey(master.to_owned()));
 }
 
 /// Enumerate every peer OWNED by `master` under `peers_root`, each paired with
@@ -11303,10 +11318,14 @@ fn reset_peer_fleet_synthesis_if_cleared(peers_root: &Path, master: &str) {
 /// `master`. CLOSED peers (retired via `peer_close`) are EXCLUDED — a retired
 /// peer neither blocks nor keeps the fleet alive. Symlink-safe throughout;
 /// filesystem-only + wire-registry-free, so it is unit-testable with a tempdir.
-fn collect_owned_peer_results(peers_root: &Path, master: &str) -> Vec<(String, bool)> {
-    let Ok(read_dir) = std::fs::read_dir(peers_root) else {
-        return Vec::new();
-    };
+///
+/// Returns `None` when the `peers/` directory cannot be READ (missing /
+/// permission) — distinct from `Some(vec![])` for a genuinely-empty directory.
+/// The caller MUST treat `None` as "can't determine this pass" and fail closed
+/// (never reset the marker, never fire), so a transient scan error is never
+/// mistaken for a cleared fleet.
+fn collect_owned_peer_results(peers_root: &Path, master: &str) -> Option<Vec<(String, bool)>> {
+    let read_dir = std::fs::read_dir(peers_root).ok()?;
     let mut owned = Vec::new();
     for entry in read_dir.flatten() {
         let slug = entry.file_name().to_string_lossy().into_owned();
@@ -11331,7 +11350,7 @@ fn collect_owned_peer_results(peers_root: &Path, master: &str) -> Vec<(String, b
         }
         owned.push((slug, dir.join("result.md").is_file()));
     }
-    owned
+    Some(owned)
 }
 
 /// Peer-fleet auto-synthesis hook. Called at a PEER session's turn terminal
@@ -11400,8 +11419,14 @@ async fn maybe_enqueue_peer_fleet_synthesis(state: &Arc<AppState>, peer_session:
     // Build the fleet's readiness inputs + the OWNED slug list (used to scope
     // the synthesis gather). A peer is NOT settled if it has a live turn OR a
     // queued/just-claimed `peer_send_input` follow-up.
+    //
+    // FAIL-CLOSED (Bug 2): a `peers/` scan failure returns `None`; do nothing
+    // this pass (no fire, no reset) rather than mistake an unreadable dir for a
+    // cleared fleet.
     let orchestrator = default_agent_orchestrator();
-    let owned = collect_owned_peer_results(&peers_root, &master);
+    let Some(owned) = collect_owned_peer_results(&peers_root, &master) else {
+        return;
+    };
     let mut owned_slugs: Vec<String> = Vec::with_capacity(owned.len());
     let peers: Vec<OwnedPeerState> = owned
         .into_iter()
@@ -11431,9 +11456,11 @@ async fn maybe_enqueue_peer_fleet_synthesis(state: &Arc<AppState>, peer_session:
         FleetSynthesisDecision::Hold => {}
         // Defensive: a peer-terminal eval always includes the just-terminated
         // peer, so the owned set is non-empty here; the real reset runs on
-        // `peer_close`. Handle it anyway so the decision contract is honored.
+        // `peer_close`. Handle it anyway so the decision contract is honored —
+        // drop the disk marker AND the recent-claim guard together (Bug 1).
         FleetSynthesisDecision::ClearStamp => {
             remove_peer_fleet_synthesized_stamp(&peers_root, &master);
+            orchestrator.clear_peer_fleet_synthesis_claim(&master_key);
         }
         FleetSynthesisDecision::Fire => {
             // Write the `.synthesized` marker FIRST (durably, atomically). If it
