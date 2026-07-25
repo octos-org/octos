@@ -7683,34 +7683,35 @@ fn peer_send_input_authorized_only_for_recorded_originator() {
 
 /// Peer-fleet auto-synthesis fire policy (v1), exercised on the pure decision:
 /// FIRES once when every owned peer is done + the master is idle (value = the
-/// NEWEST owned result, the stamp/key basis); HOLDS while any peer is mid-turn,
-/// while the master is busy, when a peer has no result yet, and for a master
-/// with zero peers; DEDUPS a wave already covered by the `.synthesized` stamp;
-/// RE-ARMS once for a strictly newer result.
+/// composite `(newest_mtime, total_turns)` stamp/key basis); HOLDS while any
+/// peer is mid-turn (or has queued input), while the master is busy, when a peer
+/// has no result yet, and for a master with zero peers; DEDUPS a wave already
+/// covered by the `.synthesized` stamp; RE-ARMS for a strictly newer result AND
+/// (codex #3) for a same-second wave whose total turn count advanced.
 #[test]
 fn evaluate_peer_fleet_synthesis_fire_policy_matrix() {
-    let done_a = OwnedPeerState {
-        result_mtime: Some(100),
-        mid_turn: false,
+    let peer = |mtime: Option<u64>, turns: u64, mid_turn: bool| OwnedPeerState {
+        result_mtime: mtime,
+        turn_count: turns,
+        mid_turn,
     };
-    let done_b = OwnedPeerState {
-        result_mtime: Some(120),
-        mid_turn: false,
+    let stamp = |mtime: u64, turns: u64| FleetSynthesisStamp {
+        newest_mtime: mtime,
+        total_turns: turns,
     };
+    let done_a = peer(Some(100), 1, false);
+    let done_b = peer(Some(120), 2, false);
 
-    // Fires when all peers done + master idle + no prior stamp → newest mtime.
+    // Fires when all peers done + master idle + no prior stamp → (newest mtime,
+    // total turns) = (120, 3).
     assert_eq!(
         evaluate_peer_fleet_synthesis(&[done_a.clone(), done_b.clone()], None, true),
-        Some(120),
+        Some(stamp(120, 3)),
     );
 
-    // Does NOT fire while an owned peer is still running.
-    let running_b = OwnedPeerState {
-        result_mtime: Some(120),
-        mid_turn: true,
-    };
+    // Does NOT fire while an owned peer is still running (mid_turn).
     assert_eq!(
-        evaluate_peer_fleet_synthesis(&[done_a.clone(), running_b], None, true),
+        evaluate_peer_fleet_synthesis(&[done_a.clone(), peer(Some(120), 2, true)], None, true),
         None,
     );
 
@@ -7721,50 +7722,62 @@ fn evaluate_peer_fleet_synthesis_fire_policy_matrix() {
     );
 
     // Does NOT fire when an owned peer has produced no result yet.
-    let pending_b = OwnedPeerState {
-        result_mtime: None,
-        mid_turn: false,
-    };
     assert_eq!(
-        evaluate_peer_fleet_synthesis(&[done_a.clone(), pending_b], None, true),
+        evaluate_peer_fleet_synthesis(&[done_a.clone(), peer(None, 0, false)], None, true),
         None,
     );
 
     // Does NOT fire for a master with zero owned peers.
     assert_eq!(evaluate_peer_fleet_synthesis(&[], None, true), None);
 
-    // DEDUP: a second evaluation whose newest is already covered by the stamp
-    // does not re-fire (`>=` gate, mirroring `.notified`).
+    // DEDUP: a wave fully covered by the stamp does not re-fire.
     assert_eq!(
-        evaluate_peer_fleet_synthesis(&[done_a.clone(), done_b.clone()], Some(120), true),
-        None,
-    );
-    assert_eq!(
-        evaluate_peer_fleet_synthesis(&[done_a.clone()], Some(100), true),
+        evaluate_peer_fleet_synthesis(&[done_a.clone(), done_b.clone()], Some(stamp(120, 3)), true,),
         None,
     );
 
-    // RE-ARM: after synthesis (stamp = 120) a peer produces a strictly newer
-    // result (150) → fires once with the new newest, then holds again at 150.
-    let newer_b = OwnedPeerState {
-        result_mtime: Some(150),
-        mid_turn: false,
-    };
+    // RE-ARM (newer mtime): stamp (120,3), peer b advances to mtime 150 (turns
+    // 1 + 2 = 3) → fires (150, 3), then holds again at (150, 3).
+    let newer_b = peer(Some(150), 2, false);
     assert_eq!(
-        evaluate_peer_fleet_synthesis(&[done_a.clone(), newer_b.clone()], Some(120), true),
-        Some(150),
+        evaluate_peer_fleet_synthesis(
+            &[done_a.clone(), newer_b.clone()],
+            Some(stamp(120, 3)),
+            true,
+        ),
+        Some(stamp(150, 3)),
     );
     assert_eq!(
-        evaluate_peer_fleet_synthesis(&[done_a, newer_b], Some(150), true),
+        evaluate_peer_fleet_synthesis(&[done_a.clone(), newer_b], Some(stamp(150, 3)), true),
+        None,
+    );
+
+    // RE-ARM (codex #3 tiebreak): SAME second (mtime unchanged at 120) but one
+    // more fleet turn (total 4 > stamp 3) → re-fires despite the equal mtime.
+    let done_b_more_turns = peer(Some(120), 3, false);
+    assert_eq!(
+        evaluate_peer_fleet_synthesis(
+            &[done_a.clone(), done_b_more_turns],
+            Some(stamp(120, 3)),
+            true,
+        ),
+        Some(stamp(120, 4)),
+    );
+
+    // codex #1 — a peer with a queued follow-up is modeled as mid_turn=true and
+    // blocks the fire even though its result is on disk.
+    assert_eq!(
+        evaluate_peer_fleet_synthesis(&[done_a, peer(Some(120), 2, true)], None, true),
         None,
     );
 }
 
 /// Peer-fleet auto-synthesis — `collect_owned_peer_results` returns exactly the
 /// REAL staged peers whose `originator` matches the master, each with its
-/// `result.md` mtime; a peer with no result yields `None` (still in the fleet,
-/// blocks synthesis), a CLOSED peer is excluded, and a peer owned by a DIFFERENT
-/// master is excluded.
+/// `result.md` mtime and terminal-turn count; a peer with no result yields
+/// `None` (still in the fleet, blocks synthesis), an ERRORED peer's result
+/// still counts as present (codex #2), a CLOSED peer is excluded, and a peer
+/// owned by a DIFFERENT master is excluded.
 #[test]
 fn collect_owned_peer_results_filters_by_originator_and_excludes_closed() {
     let tmp = tempfile::tempdir().unwrap();
@@ -7780,9 +7793,16 @@ fn collect_owned_peer_results_filters_by_originator_and_excludes_closed() {
         dir
     };
 
-    // Owned + has a result.
+    // Owned + has a result (two terminal turns on disk → turn_count 2).
     let done = stage("done-peer", master);
     std::fs::write(done.join("result.md"), "res").unwrap();
+    std::fs::write(done.join("result-1.md"), "res").unwrap();
+    std::fs::write(done.join("result-2.md"), "res").unwrap();
+    // Owned, ERRORED terminal — result.md present (outcome unparsed here), so it
+    // counts as done for readiness (codex #2).
+    let errored = stage("errored-peer", master);
+    std::fs::write(errored.join("result.md"), "err body").unwrap();
+    std::fs::write(errored.join("result-1.md"), "err body").unwrap();
     // Owned but NO result yet (blocks synthesis; still part of the fleet).
     stage("pending-peer", master);
     // Owned but CLOSED — excluded (retired peer).
@@ -7795,24 +7815,32 @@ fn collect_owned_peer_results_filters_by_originator_and_excludes_closed() {
 
     let mut owned = collect_owned_peer_results(peers_root, master);
     owned.sort();
-    let slugs: Vec<&str> = owned.iter().map(|(slug, _)| slug.as_str()).collect();
+    let slugs: Vec<&str> = owned.iter().map(|(slug, _, _)| slug.as_str()).collect();
     assert_eq!(
         slugs,
-        vec!["done-peer", "pending-peer"],
+        vec!["done-peer", "errored-peer", "pending-peer"],
         "only this master's non-closed peers are owned"
     );
-    let done_entry = owned.iter().find(|(s, _)| s == "done-peer").unwrap();
+    let done_entry = owned.iter().find(|(s, _, _)| s == "done-peer").unwrap();
     assert!(done_entry.1.is_some(), "a written result has an mtime");
-    let pending_entry = owned.iter().find(|(s, _)| s == "pending-peer").unwrap();
+    assert_eq!(done_entry.2, 2, "two result-*.md versions → turn_count 2");
+    let errored_entry = owned.iter().find(|(s, _, _)| s == "errored-peer").unwrap();
+    assert!(
+        errored_entry.1.is_some(),
+        "an errored peer's result.md still counts as present (codex #2)"
+    );
+    let pending_entry = owned.iter().find(|(s, _, _)| s == "pending-peer").unwrap();
     assert_eq!(
         pending_entry.1, None,
         "a peer with no result.md yields None"
     );
+    assert_eq!(pending_entry.2, 0, "no result versions → turn_count 0");
 }
 
 /// Peer-fleet auto-synthesis — the per-master `.synthesized` stamp round-trips
 /// through `safe_filename` (distinct masters never collide), reads back the
-/// stored mtime, and is never mistaken for a staged peer by the fleet scan.
+/// composite `(mtime, turns)`, tolerates a legacy single-number stamp (turns
+/// default 0), and is never mistaken for a staged peer by the fleet scan.
 #[test]
 fn peer_fleet_synthesized_stamp_round_trips_per_master() {
     let tmp = tempfile::tempdir().unwrap();
@@ -7825,22 +7853,101 @@ fn peer_fleet_synthesized_stamp_round_trips_per_master() {
         None
     );
 
+    let written = FleetSynthesisStamp {
+        newest_mtime: 1234,
+        total_turns: 7,
+    };
     crate::memory_consolidate::apply::atomic_write(
         &peer_fleet_synthesized_stamp_path(peers_root, master_a),
-        "1234",
+        &written.to_stamp_string(),
     )
     .unwrap();
     assert_eq!(
         read_peer_fleet_synthesized_stamp(peers_root, master_a),
-        Some(1234)
+        Some(written)
     );
     // A different master has an independent stamp (no cross-talk).
     assert_eq!(
         read_peer_fleet_synthesized_stamp(peers_root, master_b),
         None
     );
+
+    // Legacy single-number stamp parses with turns = 0 (upgrade re-arms once).
+    crate::memory_consolidate::apply::atomic_write(
+        &peer_fleet_synthesized_stamp_path(peers_root, master_b),
+        "999",
+    )
+    .unwrap();
+    assert_eq!(
+        read_peer_fleet_synthesized_stamp(peers_root, master_b),
+        Some(FleetSynthesisStamp {
+            newest_mtime: 999,
+            total_turns: 0,
+        })
+    );
+
     // The stamp file colocated in `peers/` is NOT mistaken for a staged peer.
     assert!(collect_owned_peer_results(peers_root, master_a).is_empty());
+}
+
+/// codex #6 — `stage_peer` records the ORIGINATOR (when supplied) so the
+/// fleet-ownership scan reliably attributes the peer to its master, and does so
+/// alongside `brief.md` (both present after a successful stage). A `None`
+/// originator (profile-scoped prepare) leaves no owner file and is unowned.
+#[test]
+fn stage_peer_records_originator_for_ownership_scan() {
+    let tmp = tempfile::tempdir().unwrap();
+    let peers_root = tmp.path().join("peers");
+    std::fs::create_dir_all(&peers_root).unwrap();
+    let ws = tmp.path().join("ws");
+    std::fs::create_dir_all(&ws).unwrap();
+    let master = "tenant-a:api:master-1";
+
+    // Owned peer: originator threaded in → recorded beside brief.md.
+    let owned = stage_peer(
+        &peers_root,
+        &ws,
+        "seed",
+        Some("Curie"),
+        Some(master),
+        "Brief.",
+        false,
+    )
+    .expect("owned staging");
+    let owned_dir = peers_root.join(&owned.slug);
+    assert!(owned_dir.join("brief.md").is_file(), "brief.md written");
+    assert_eq!(
+        std::fs::read_to_string(owned_dir.join("originator")).unwrap(),
+        master,
+        "originator recorded for the owning master"
+    );
+
+    // Unowned peer: no originator supplied → no owner file.
+    let unowned = stage_peer(
+        &peers_root,
+        &ws,
+        "seed",
+        Some("Bohr"),
+        None,
+        "Brief.",
+        false,
+    )
+    .expect("unowned staging");
+    assert!(
+        !peers_root.join(&unowned.slug).join("originator").exists(),
+        "a None originator leaves no owner file"
+    );
+
+    // The ownership scan attributes ONLY the owned peer to the master.
+    let owned_slugs: Vec<String> = collect_owned_peer_results(&peers_root, master)
+        .into_iter()
+        .map(|(slug, _, _)| slug)
+        .collect();
+    assert_eq!(
+        owned_slugs,
+        vec![owned.slug],
+        "only the owned peer is in the fleet"
+    );
 }
 
 /// #436 P1 #2 — a peer continuation is only drained by the connection that has
@@ -24908,6 +25015,7 @@ fn stage_peer_reserves_slug_writes_brief_and_releases_on_failure() {
         &plain,
         "CI Fix",
         None,
+        None,
         "Investigate the flaky test.",
         false,
     )
@@ -24923,12 +25031,12 @@ fn stage_peer_reserves_slug_writes_brief_and_releases_on_failure() {
     );
 
     // Same seed again: the reserve claim suffixes, same as peer/prepare.
-    let second = stage_peer(&peers, &plain, "CI Fix", None, "Second lane.", false).unwrap();
+    let second = stage_peer(&peers, &plain, "CI Fix", None, None, "Second lane.", false).unwrap();
     assert_eq!(second.slug, "ci-fix-2");
 
     // Worktree against a NON-git workspace fails AND releases the slug —
     // the member cleans its own dir so a retry re-claims the same name.
-    let err = stage_peer(&peers, &plain, "No Repo", None, "Doomed.", true)
+    let err = stage_peer(&peers, &plain, "No Repo", None, None, "Doomed.", true)
         .expect_err("worktree without a git repo must fail");
     assert!(
         err.message.contains("git repo"),
@@ -24939,8 +25047,16 @@ fn stage_peer_reserves_slug_writes_brief_and_releases_on_failure() {
         !peers.join("no-repo").exists(),
         "failed member removed its dir"
     );
-    let retry = stage_peer(&peers, &plain, "No Repo", None, "Fenceless retry.", false)
-        .expect("failed staging must not burn the slug");
+    let retry = stage_peer(
+        &peers,
+        &plain,
+        "No Repo",
+        None,
+        None,
+        "Fenceless retry.",
+        false,
+    )
+    .expect("failed staging must not burn the slug");
     assert_eq!(retry.slug, "no-repo");
 
     // Worktree against a real repo: fenced cwd + branch.
@@ -24973,8 +25089,16 @@ fn stage_peer_reserves_slug_writes_brief_and_releases_on_failure() {
             "init",
         ],
     );
-    let fenced = stage_peer(&peers, &repo, "Fenced Lane", None, "Own worktree.", true)
-        .expect("worktree staging");
+    let fenced = stage_peer(
+        &peers,
+        &repo,
+        "Fenced Lane",
+        None,
+        None,
+        "Own worktree.",
+        true,
+    )
+    .expect("worktree staging");
     assert_eq!(fenced.worktree_branch.as_deref(), Some("peer/fenced-lane"));
     assert!(fenced.cwd.ends_with("peers/fenced-lane/wt"));
     assert!(
@@ -25317,8 +25441,8 @@ fn stage_peer_named_rejects_duplicate_name_case_insensitive() {
     let ws = tmp.path().join("ws");
     std::fs::create_dir_all(&ws).unwrap();
 
-    let first =
-        stage_peer(&peers, &ws, "seed", Some("Edison"), "Brief.", false).expect("first named peer");
+    let first = stage_peer(&peers, &ws, "seed", Some("Edison"), None, "Brief.", false)
+        .expect("first named peer");
     assert_eq!(first.slug, "edison");
     assert_eq!(
         std::fs::read_to_string(peers.join("edison").join("name")).unwrap(),
@@ -25327,7 +25451,7 @@ fn stage_peer_named_rejects_duplicate_name_case_insensitive() {
     );
 
     // Same name (different case) → rejected, NOT auto-suffixed.
-    let dup = stage_peer(&peers, &ws, "seed", Some("EDISON"), "Brief.", false)
+    let dup = stage_peer(&peers, &ws, "seed", Some("EDISON"), None, "Brief.", false)
         .expect_err("duplicate name rejected");
     assert!(
         dup.message.contains("already exists"),
@@ -25335,7 +25459,7 @@ fn stage_peer_named_rejects_duplicate_name_case_insensitive() {
         dup.message
     );
     // A different name that derives the SAME slug is also rejected.
-    let dup2 = stage_peer(&peers, &ws, "seed", Some("edison"), "Brief.", false)
+    let dup2 = stage_peer(&peers, &ws, "seed", Some("edison"), None, "Brief.", false)
         .expect_err("duplicate slug rejected");
     assert!(
         dup2.message.contains("already exists"),
@@ -25344,8 +25468,8 @@ fn stage_peer_named_rejects_duplicate_name_case_insensitive() {
     );
 
     // A DISTINCT name stages fine.
-    let second =
-        stage_peer(&peers, &ws, "seed", Some("Tesla"), "Brief.", false).expect("distinct name");
+    let second = stage_peer(&peers, &ws, "seed", Some("Tesla"), None, "Brief.", false)
+        .expect("distinct name");
     assert_eq!(second.slug, "tesla");
 }
 
@@ -25358,7 +25482,7 @@ fn resolve_peer_name_to_slug_matches_name_and_slug() {
     let peers = tmp.path().join("peers");
     let ws = tmp.path().join("ws");
     std::fs::create_dir_all(&ws).unwrap();
-    stage_peer(&peers, &ws, "seed", Some("Edison"), "Brief.", false).unwrap();
+    stage_peer(&peers, &ws, "seed", Some("Edison"), None, "Brief.", false).unwrap();
 
     for ident in ["Edison", "edison", "EDISON", "  Edison  "] {
         assert_eq!(
@@ -25387,7 +25511,16 @@ fn peer_list_and_gather_surface_display_name() {
     let peers = tmp.path().join("peers");
     let ws = tmp.path().join("ws");
     std::fs::create_dir_all(&ws).unwrap();
-    stage_peer(&peers, &ws, "seed", Some("Edison"), "Wire the lab.", false).unwrap();
+    stage_peer(
+        &peers,
+        &ws,
+        "seed",
+        Some("Edison"),
+        None,
+        "Wire the lab.",
+        false,
+    )
+    .unwrap();
 
     let list_cb = build_peer_list_callback(peers.clone());
     let list = list_cb().unwrap();
@@ -25425,8 +25558,8 @@ fn peer_close_by_name_cancels_pending_injection_for_right_peer() {
     let ws = tmp.path().join("ws");
     std::fs::create_dir_all(&ws).unwrap();
 
-    let edison = stage_peer(&peers, &ws, "s", Some("Edison"), "b", false).unwrap();
-    let tesla = stage_peer(&peers, &ws, "s", Some("Tesla"), "b", false).unwrap();
+    let edison = stage_peer(&peers, &ws, "s", Some("Edison"), None, "b", false).unwrap();
+    let tesla = stage_peer(&peers, &ws, "s", Some("Tesla"), None, "b", false).unwrap();
     assert_eq!(edison.slug, "edison");
     assert_eq!(tesla.slug, "tesla");
     std::fs::write(peers.join("edison").join("originator"), owner).unwrap();

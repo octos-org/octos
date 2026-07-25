@@ -160,6 +160,12 @@ pub(crate) const PEER_FLEET_SYNTHESIS_EXTERNAL_KIND: &str = "peer_fleet_synthesi
 /// Metadata key carrying the number of completed peers in the fleet (prompt
 /// context only; the synthesis turn gathers results by reading the blackboard).
 pub(crate) const PEER_FLEET_SYNTHESIS_META_PEER_COUNT: &str = "peer_fleet_peer_count";
+/// Metadata key carrying the comma-separated OWNED peer slugs (this master's
+/// fleet). The synthesis prompt directs `peer_gather` at ONLY these slugs, so
+/// it reads this master's fleet and never another master's peers that share the
+/// same profile `peers/` root (codex #4). Slugs are `peer_slug_is_safe`
+/// (`[a-z0-9-]` / `%`-escaped), so a comma join is unambiguous.
+pub(crate) const PEER_FLEET_SYNTHESIS_META_SLUGS: &str = "peer_fleet_slugs";
 /// Group id stamped onto peer-fleet-synthesis continuations (queue triage).
 const PEER_FLEET_SYNTHESIS_GROUP: &str = "peer-fleet-synthesis";
 
@@ -210,11 +216,18 @@ fn peer_send_input_dedupe_key(session: &SessionKey, occurrence_id: &str) -> Stri
 /// newest mtime STRICTLY advances past the per-master `.synthesized` stamp, the
 /// mtime is a monotonic occurrence id: the same completion wave always maps to
 /// the same key (deduped), a genuinely newer wave maps to a fresh key (fires).
+///
+/// The 1s-granular mtime is paired with the fleet's total turn count (codex #3):
+/// a same-second-but-newer result advances `total_turns` even when the mtime is
+/// unchanged, so the key still differs and the re-fire is not collapsed.
 fn peer_fleet_synthesis_dedupe_key(
     master_session: &SessionKey,
     newest_result_mtime: u64,
+    total_turns: u64,
 ) -> String {
-    format!("external/{PEER_FLEET_SYNTHESIS_EXTERNAL_KIND}/{master_session}/{newest_result_mtime}")
+    format!(
+        "external/{PEER_FLEET_SYNTHESIS_EXTERNAL_KIND}/{master_session}/{newest_result_mtime}-{total_turns}"
+    )
 }
 
 #[derive(Debug, Clone)]
@@ -2465,6 +2478,8 @@ impl InProcessAgentOrchestrator {
         master_session: &SessionKey,
         profile_id: &str,
         newest_result_mtime: u64,
+        total_turns: u64,
+        owned_slugs: &[String],
         peer_count: usize,
     ) -> MasterContinuationEnqueueOutcome {
         let request = MasterContinuationRequest::new(
@@ -2475,12 +2490,40 @@ impl InProcessAgentOrchestrator {
             SystemTime::now(),
         )
         .with_metadata(PEER_FLEET_SYNTHESIS_META_PEER_COUNT, peer_count.to_string())
+        // codex #4 — carry the OWNED slugs so the prompt scopes `peer_gather` to
+        // this master's fleet only. The explicit `with_dedupe_key` below is
+        // authoritative, so this metadata never widens the key.
+        .with_metadata(PEER_FLEET_SYNTHESIS_META_SLUGS, owned_slugs.join(","))
         .with_dedupe_key(peer_fleet_synthesis_dedupe_key(
             master_session,
             newest_result_mtime,
+            total_turns,
         ));
         let mut state = self.state();
         state.continuations.enqueue(request)
+    }
+
+    /// codex #1 — true when peer `slug` (under `profile_id`) has a
+    /// `peer_send_input` injection still QUEUED (a follow-up turn that has not
+    /// run yet). Such a peer is NOT settled: the fleet-synthesis gate must not
+    /// count it as done, or it would synthesize a stale result before the
+    /// queued turn produces a fresher one. Mirrors the pending-item scan in
+    /// [`Self::cancel_peer_send_input_continuations_for_peer`].
+    pub(crate) fn has_pending_peer_send_input_for_peer(
+        &self,
+        profile_id: &str,
+        slug: &str,
+    ) -> bool {
+        self.state().continuations.pending_items().any(|item| {
+            matches!(&item.reason, MasterContinuationReason::External(kind)
+                if kind == PEER_SEND_INPUT_EXTERNAL_KIND)
+                && item.profile_id.as_str() == profile_id
+                && item
+                    .metadata
+                    .get(PEER_SEND_INPUT_META_SLUG)
+                    .map(String::as_str)
+                    == Some(slug)
+        })
     }
 
     /// #436 P1 (#1/#5) — re-home any PENDING `peer_send_input` injections for
@@ -6235,8 +6278,25 @@ pub(crate) fn master_continuation_prompt(continuation: &QueuedMasterContinuation
         // verbatim user turn: it instructs the master to act, it is not itself
         // the user's words.
         MasterContinuationReason::External(kind) if kind == PEER_FLEET_SYNTHESIS_EXTERNAL_KIND => {
+            // codex #4 — scope the gather to THIS master's fleet. `peer_gather`
+            // accepts a `slugs` filter; without one it reads EVERY staged peer
+            // in the profile, including other masters' peers. Name the owned
+            // slugs explicitly so the synthesis reads only this fleet.
+            let gather_line = match continuation
+                .metadata
+                .get(PEER_FLEET_SYNTHESIS_META_SLUGS)
+                .map(String::as_str)
+                .filter(|slugs| !slugs.is_empty())
+            {
+                Some(slugs) => format!(
+                    "Use the `peer_gather` tool with its `slugs` filter set to EXACTLY your fleet — [{slugs}] — to collect their results now. Do NOT gather peers outside this list; they belong to other work."
+                ),
+                None => {
+                    "Use the `peer_gather` tool to collect your fleet's results now.".to_owned()
+                }
+            };
             format!(
-                "[system-internal]\nAll peer agents you handed off have completed their work.\n\nGroup: {group}\nMetadata:\n{metadata}\n\nUse the `peer_gather` tool to collect their results now and synthesize one consolidated report for the user. Attribute key findings to the peer that produced them, call out any failures, gaps, or disagreements between peers, and end with the single concrete next step if one is needed. Do NOT start new peer work in this turn — only gather and synthesize what the fleet has already produced.",
+                "[system-internal]\nAll peer agents you handed off have completed their work.\n\nGroup: {group}\nMetadata:\n{metadata}\n\n{gather_line} Then synthesize one consolidated report for the user. Attribute key findings to the peer that produced them, call out any failures, gaps, or disagreements between peers, and end with the single concrete next step if one is needed. Do NOT start new peer work in this turn — only gather and synthesize what the fleet has already produced.",
                 group = continuation.group_id.as_str(),
             )
         }
@@ -8871,32 +8931,43 @@ mod tests {
     }
 
     /// Peer-fleet auto-synthesis — the synthesis continuation dedupes on the
-    /// master session + newest-result mtime: enqueuing the SAME wave (same
-    /// mtime) collapses to one queued turn, while a genuinely NEWER result
-    /// (higher mtime) enqueues a fresh one. This is what makes the fleet fire
-    /// once per completion wave and re-arm exactly once when a peer later
-    /// produces a newer result — and embedding the mtime in the key keeps a
-    /// legit re-fire from being dropped by the `External` recent-claim guard.
+    /// master session + (newest mtime, total turns): re-enqueuing the SAME wave
+    /// collapses to one queued turn, a strictly NEWER mtime re-arms, AND (codex
+    /// #3) a SAME-second wave whose total turn count advanced also re-arms.
     #[test]
     fn peer_fleet_synthesis_continuation_dedupes_on_master_and_newest_mtime() {
         let orchestrator = default_agent_orchestrator();
         let master = SessionKey::with_profile("tenant-fleet-synth", "api", "master-dedupe");
         let profile = "tenant-fleet-synth";
+        let slugs = vec!["alpha".to_owned(), "beta".to_owned()];
 
-        let first =
-            orchestrator.enqueue_peer_fleet_synthesis_continuation(&master, profile, 1000, 3);
+        let first = orchestrator
+            .enqueue_peer_fleet_synthesis_continuation(&master, profile, 1000, 5, &slugs, 3);
         assert!(first.queued().is_some(), "first synthesis wave must queue");
 
-        let dup = orchestrator.enqueue_peer_fleet_synthesis_continuation(&master, profile, 1000, 3);
-        assert!(dup.is_duplicate(), "same-mtime re-enqueue must dedupe");
+        let dup = orchestrator
+            .enqueue_peer_fleet_synthesis_continuation(&master, profile, 1000, 5, &slugs, 3);
+        assert!(
+            dup.is_duplicate(),
+            "same (mtime, turns) re-enqueue must dedupe"
+        );
         assert_eq!(
             orchestrator.pending_continuation_count_for_session_for_test(&master, profile),
             1,
             "same completion wave must not stack a second synthesis continuation",
         );
 
-        let rearm =
-            orchestrator.enqueue_peer_fleet_synthesis_continuation(&master, profile, 1500, 3);
+        // Same second (mtime unchanged) but a new fleet turn → fresh key.
+        let same_second_newer = orchestrator
+            .enqueue_peer_fleet_synthesis_continuation(&master, profile, 1000, 6, &slugs, 3);
+        assert!(
+            same_second_newer.queued().is_some(),
+            "a same-second wave with more total turns must re-arm (codex #3)",
+        );
+
+        // Strictly newer mtime → fresh key.
+        let rearm = orchestrator
+            .enqueue_peer_fleet_synthesis_continuation(&master, profile, 1500, 6, &slugs, 3);
         assert!(
             rearm.queued().is_some(),
             "a strictly newer result must re-arm synthesis with a fresh continuation",
@@ -8904,15 +8975,16 @@ mod tests {
     }
 
     /// Peer-fleet auto-synthesis — the master continuation renders the
-    /// gather-and-consolidate directive (naming `peer_gather`) so the
-    /// autonomous turn synthesizes the fleet's results, not the generic
-    /// external body.
+    /// gather-and-consolidate directive scoped to THIS master's OWNED slugs
+    /// (codex #4), so the autonomous turn reads only its own fleet.
     #[test]
-    fn peer_fleet_synthesis_prompt_directs_gather_and_synthesize() {
+    fn peer_fleet_synthesis_prompt_directs_fleet_scoped_gather() {
         let orchestrator = default_agent_orchestrator();
         let master = SessionKey::with_profile("tenant-fleet-prompt", "api", "master-prompt");
         let profile = "tenant-fleet-prompt";
-        orchestrator.enqueue_peer_fleet_synthesis_continuation(&master, profile, 2000, 2);
+        let slugs = vec!["edison".to_owned(), "tesla".to_owned()];
+        orchestrator
+            .enqueue_peer_fleet_synthesis_continuation(&master, profile, 2000, 2, &slugs, 2);
         let drained = orchestrator.drain_ready_continuations_for_session(
             &master,
             profile,
@@ -8935,9 +9007,48 @@ mod tests {
             prompt.contains("completed their work"),
             "prompt must state the fleet completed: {prompt}"
         );
+        // Fleet-scoped: the OWNED slugs are named as the gather filter.
         assert!(
-            prompt.contains("peer_fleet_peer_count: 2"),
-            "prompt metadata must carry the peer count: {prompt}"
+            prompt.contains("edison,tesla"),
+            "prompt must scope peer_gather to the owned slugs: {prompt}"
+        );
+        assert!(
+            prompt.contains("slugs` filter"),
+            "prompt must instruct the slugs filter: {prompt}"
+        );
+    }
+
+    /// codex #1 — a peer with a QUEUED (not-yet-run) `peer_send_input` follow-up
+    /// is reported as having pending input, per (profile, slug); an unrelated
+    /// slug / profile is not.
+    #[test]
+    fn has_pending_peer_send_input_detects_queued_follow_up() {
+        let orchestrator = default_agent_orchestrator();
+        let profile = "tenant-fleet-queued";
+        let peer_wire = SessionKey::with_profile_topic(profile, "api", "peer-wire", "peer-worker");
+        assert!(
+            !orchestrator.has_pending_peer_send_input_for_peer(profile, "worker"),
+            "no queued input before any injection",
+        );
+        let outcome = orchestrator.enqueue_peer_send_input_continuation(
+            &peer_wire,
+            profile,
+            "worker",
+            "occ-1",
+            "follow up please",
+        );
+        assert_eq!(outcome, PeerSendInputEnqueueOutcome::Queued);
+        assert!(
+            orchestrator.has_pending_peer_send_input_for_peer(profile, "worker"),
+            "a queued peer_send_input must be detected for its slug",
+        );
+        assert!(
+            !orchestrator.has_pending_peer_send_input_for_peer(profile, "other-worker"),
+            "a different slug must not report pending input",
+        );
+        assert!(
+            !orchestrator.has_pending_peer_send_input_for_peer("tenant-other", "worker"),
+            "a different profile must not report pending input",
         );
     }
 
