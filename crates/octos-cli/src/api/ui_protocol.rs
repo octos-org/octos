@@ -11149,6 +11149,240 @@ fn peer_results_ready_note(peers_root: &Path, session_id: &SessionKey) -> Option
     ))
 }
 
+/// Peer-fleet auto-synthesis — one owned peer's readiness inputs for the
+/// [`evaluate_peer_fleet_synthesis`] decision.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OwnedPeerState {
+    /// `result.md` mtime (secs since epoch), or `None` when the peer has not
+    /// produced any result yet — which BLOCKS synthesis (the fleet isn't done).
+    result_mtime: Option<u64>,
+    /// True while this peer has a live (non-terminal) turn in flight — a peer
+    /// mid-turn BLOCKS synthesis so a stale earlier result isn't synthesized
+    /// while a fresher one is being produced.
+    mid_turn: bool,
+}
+
+/// Peer-fleet auto-synthesis — decide whether a master's peer fleet is ready
+/// for an AUTONOMOUS synthesis turn, and (when so) the newest owned `result.md`
+/// mtime to stamp + key the fire on.
+///
+/// Fire policy (v1): fire IFF the master owns AT LEAST ONE peer, the master is
+/// idle, EVERY owned peer has produced a `result.md` AND none is mid-turn, AND
+/// the newest owned result is strictly newer than the `.synthesized` stamp the
+/// last synthesis covered. That makes a completion wave fire exactly once and
+/// re-fire only when a peer later produces a genuinely newer result. Returns
+/// `Some(newest_mtime)` to fire (the value to write as the new stamp and embed
+/// in the dedupe key), or `None` to hold.
+///
+/// Pure + input-driven so the whole fire/dedup/idle/mid-turn matrix is
+/// unit-testable without the filesystem, the wire registry, or a live turn.
+fn evaluate_peer_fleet_synthesis(
+    peers: &[OwnedPeerState],
+    synthesized_stamp: Option<u64>,
+    master_idle: bool,
+) -> Option<u64> {
+    // Zero owned peers → nothing to synthesize (a master that never handed off,
+    // or whose peers are all closed/retired).
+    if peers.is_empty() {
+        return None;
+    }
+    // Never fire onto a busy master. The continuation drain re-checks
+    // idle-eligibility before firing, but gating the DECISION here keeps it
+    // self-contained and avoids advancing the `.synthesized` stamp for a wave
+    // the master did not actually synthesize.
+    if !master_idle {
+        return None;
+    }
+    // Every owned peer must be DONE (has a result) and SETTLED (not mid-turn).
+    let mut newest = 0u64;
+    for peer in peers {
+        if peer.mid_turn {
+            return None;
+        }
+        let mtime = peer.result_mtime?;
+        newest = newest.max(mtime);
+    }
+    // Dedup / re-arm gate: only fire when a result is newer than the stamp the
+    // last synthesis covered. Seconds-granular mtimes, mirroring the `.notified`
+    // gate in `peer_results_ready_note` (`covered >= mtime` skips).
+    if synthesized_stamp.is_some_and(|stamp| stamp >= newest) {
+        return None;
+    }
+    Some(newest)
+}
+
+/// Per-master `.synthesized` stamp path under `peers/`. Keyed by a
+/// `safe_filename` of the master's originator session string (which may carry
+/// `:`/`#`/path chars) so it is one safe, injective filename. Colocated with
+/// the per-slug peer dirs but never mistaken for one: it is a hidden FILE, and
+/// the fleet scan only accepts real dirs carrying `brief.md` (via
+/// [`staged_peer_dir`]), so it is skipped.
+fn peer_fleet_synthesized_stamp_path(peers_root: &Path, master: &str) -> PathBuf {
+    peers_root.join(format!(
+        ".synthesized-{}",
+        octos_core::safe_filename(master)
+    ))
+}
+
+/// Read the per-master `.synthesized` stamp (secs since epoch of the newest
+/// owned result the last synthesis covered), or `None` when unstamped.
+fn read_peer_fleet_synthesized_stamp(peers_root: &Path, master: &str) -> Option<u64> {
+    std::fs::read_to_string(peer_fleet_synthesized_stamp_path(peers_root, master))
+        .ok()
+        .and_then(|stamp| stamp.trim().parse::<u64>().ok())
+}
+
+/// Enumerate every peer OWNED by `master` under `peers_root` with its
+/// `result.md` mtime (secs, or `None` when absent). "Owned" = a REAL staged
+/// peer (non-symlink dir carrying `brief.md`, via [`staged_peer_dir`]) whose
+/// `originator` file equals `master`. CLOSED peers (retired via `peer_close`)
+/// are EXCLUDED — a retired peer neither blocks nor contributes to the fleet.
+/// Symlink-safe throughout; filesystem-only + wire-registry-free, so it is
+/// unit-testable with a tempdir.
+fn collect_owned_peer_results(peers_root: &Path, master: &str) -> Vec<(String, Option<u64>)> {
+    let Ok(read_dir) = std::fs::read_dir(peers_root) else {
+        return Vec::new();
+    };
+    let mut owned = Vec::new();
+    for entry in read_dir.flatten() {
+        let slug = entry.file_name().to_string_lossy().into_owned();
+        // Route through `staged_peer_dir`: a symlinked / unsafe slug is never
+        // followed, and the `.synthesized-*` stamp files (not dirs) are skipped.
+        let Some(dir) = staged_peer_dir(peers_root, &slug) else {
+            continue;
+        };
+        // Retired peer: neither blocks nor contributes to the fleet.
+        if dir.join("closed").is_file() {
+            continue;
+        }
+        // Originator gate — only peers THIS master staged.
+        let Ok(originator) = std::fs::read_to_string(dir.join("originator")) else {
+            continue;
+        };
+        if originator.trim() != master {
+            continue;
+        }
+        let result_mtime = std::fs::metadata(dir.join("result.md"))
+            .ok()
+            .and_then(|meta| meta.modified().ok())
+            .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|elapsed| elapsed.as_secs());
+        owned.push((slug, result_mtime));
+    }
+    owned
+}
+
+/// Peer-fleet auto-synthesis hook. Called at a PEER session's turn terminal
+/// (right after its `result.md` is written): resolve the owning master from
+/// this peer's `originator`, and — when the master's WHOLE fleet is complete,
+/// settled, and the master is idle — enqueue ONE autonomous synthesis
+/// continuation on the master session. The continuation drain (per-connection
+/// tick + connection-independent global drain) turns it into a fired master
+/// turn; `due_loop_targets`' pending-continuation sweep surfaces the master
+/// even though it has no active goal/loop.
+///
+/// DEDUP: `evaluate_peer_fleet_synthesis` fires only when the newest owned
+/// result is newer than the per-master `.synthesized` stamp; on a newly-queued
+/// continuation the stamp is advanced to that mtime, so a completion wave fires
+/// ONCE and re-fires only for a genuinely newer result. The dedupe key embeds
+/// the same mtime, so a re-fire inside the scheduler's 30s claim-guard window is
+/// not wrongly dropped.
+///
+/// LOOP SAFETY: this fires ONLY on a `peer-<slug>` session's terminal. The
+/// synthesis turn runs on the MASTER session (not a peer), and `peer_gather`
+/// only READS `result.md` files — it never writes one — so the synthesis turn
+/// cannot produce a peer terminal and cannot re-trigger itself. A re-fire
+/// requires a peer to produce a strictly newer `result.md`, which requires real,
+/// bounded peer work; there is no self-sustaining loop.
+///
+/// No-op for a non-peer session, an unstaged peer, a peer with no recorded
+/// originator, a busy master, or a fleet that is not yet complete.
+async fn maybe_enqueue_peer_fleet_synthesis(state: &Arc<AppState>, peer_session: &SessionKey) {
+    let Some((profile_id, finished_slug)) = peer_slug_and_profile(peer_session) else {
+        return;
+    };
+    let Some(runtime) = state.profiles.get(profile_id) else {
+        return;
+    };
+    let peers_root = runtime.data_dir.join("peers");
+    // Resolve the owning master from THIS peer's originator (symlink-safe).
+    let Some(finished_dir) = staged_peer_dir(&peers_root, finished_slug) else {
+        return;
+    };
+    let Ok(master) = std::fs::read_to_string(finished_dir.join("originator")) else {
+        return;
+    };
+    let master = master.trim().to_owned();
+    if master.is_empty() {
+        return;
+    }
+    let master_key = SessionKey(master.clone());
+
+    // One lock: sessions with a live (non-terminal) turn. Exclude THIS peer —
+    // its turn is still marked Active at this hook (the terminal transition
+    // runs just after), yet its result is already on the blackboard, so it
+    // counts as DONE, not mid-turn.
+    let active_turns = active_turns_registry();
+    let mut running = active_turn_sessions(&active_turns).await;
+    running.remove(peer_session);
+
+    // Master idle-eligibility, mirroring the drain's gate inputs: no in-flight
+    // turn AND no pending approval. (The drain re-checks this before firing.)
+    let master_idle = !running.contains(&master_key)
+        && contract_stores()
+            .approvals
+            .pending_for_session(&master_key)
+            .is_empty();
+
+    // Build the fleet's readiness inputs: each owned peer's result mtime + a
+    // mid-turn flag (its current wire session has a live turn).
+    let peers: Vec<OwnedPeerState> = collect_owned_peer_results(&peers_root, &master)
+        .into_iter()
+        .map(|(slug, result_mtime)| {
+            let mid_turn = peer_wire_registry()
+                .resolve(&peer_wire_key(profile_id, &slug))
+                .is_some_and(|session| running.contains(&session));
+            OwnedPeerState {
+                result_mtime,
+                mid_turn,
+            }
+        })
+        .collect();
+
+    let stamp = read_peer_fleet_synthesized_stamp(&peers_root, &master);
+    let Some(newest) = evaluate_peer_fleet_synthesis(&peers, stamp, master_idle) else {
+        return;
+    };
+
+    let outcome = default_agent_orchestrator().enqueue_peer_fleet_synthesis_continuation(
+        &master_key,
+        profile_id,
+        newest,
+        peers.len(),
+    );
+    // Advance the per-master `.synthesized` stamp to the wave we just fired so a
+    // later evaluation with no newer result does not re-enqueue. Written only on
+    // a NEWLY-queued continuation: a `Duplicate` means another concurrent
+    // terminal already queued this exact wave (same key) and stamped it. A
+    // failed stamp write is safe — the embedded-mtime dedupe key still collapses
+    // a re-enqueue of the same wave.
+    if outcome.queued().is_some() {
+        let stamp_path = peer_fleet_synthesized_stamp_path(&peers_root, &master);
+        if let Err(err) =
+            crate::memory_consolidate::apply::atomic_write(&stamp_path, &newest.to_string())
+        {
+            tracing::warn!(?err, "failed to write peer fleet .synthesized stamp");
+        }
+        tracing::debug!(
+            master = %master_key,
+            profile = profile_id,
+            peers = peers.len(),
+            newest,
+            "peer fleet complete — enqueued autonomous synthesis turn on master"
+        );
+    }
+}
+
 /// Serializes profile `sub_providers` read-modify-write across concurrent
 /// upsert/remove RPCs so two clients adding different lanes don't clobber each
 /// other (a bare get→mutate→save is last-writer-wins because `save_with_merge`
@@ -26678,6 +26912,15 @@ async fn run_standalone_turn(
                     TurnTerminalOutcome::Completed,
                     event.get("content").and_then(Value::as_str).unwrap_or(""),
                 );
+                // Peer-fleet auto-synthesis: a peer COMPLETING may be the last
+                // of its master's fleet — evaluate the fleet and, when every
+                // owned peer is done and the master is idle, fire ONE autonomous
+                // synthesis turn on the master (no user prompt). No-op for
+                // non-peer sessions and incomplete fleets. Only the Completed
+                // arm triggers the evaluation; an errored/interrupted peer's
+                // result still counts toward readiness (it does not block) but
+                // does not itself kick off a synthesis.
+                maybe_enqueue_peer_fleet_synthesis(&state, &session_id).await;
                 // FIX-04: flush any accumulated drops before the lifecycle
                 // terminal so the client knows the cursor is incomplete.
                 flush_replay_lossy(&ws, &ledger, &session_id, &progress_dropped);

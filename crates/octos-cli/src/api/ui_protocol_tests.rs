@@ -7681,6 +7681,168 @@ fn peer_send_input_authorized_only_for_recorded_originator() {
     assert!(err3.contains("not a staged peer"), "reason: {err3}");
 }
 
+/// Peer-fleet auto-synthesis fire policy (v1), exercised on the pure decision:
+/// FIRES once when every owned peer is done + the master is idle (value = the
+/// NEWEST owned result, the stamp/key basis); HOLDS while any peer is mid-turn,
+/// while the master is busy, when a peer has no result yet, and for a master
+/// with zero peers; DEDUPS a wave already covered by the `.synthesized` stamp;
+/// RE-ARMS once for a strictly newer result.
+#[test]
+fn evaluate_peer_fleet_synthesis_fire_policy_matrix() {
+    let done_a = OwnedPeerState {
+        result_mtime: Some(100),
+        mid_turn: false,
+    };
+    let done_b = OwnedPeerState {
+        result_mtime: Some(120),
+        mid_turn: false,
+    };
+
+    // Fires when all peers done + master idle + no prior stamp → newest mtime.
+    assert_eq!(
+        evaluate_peer_fleet_synthesis(&[done_a.clone(), done_b.clone()], None, true),
+        Some(120),
+    );
+
+    // Does NOT fire while an owned peer is still running.
+    let running_b = OwnedPeerState {
+        result_mtime: Some(120),
+        mid_turn: true,
+    };
+    assert_eq!(
+        evaluate_peer_fleet_synthesis(&[done_a.clone(), running_b], None, true),
+        None,
+    );
+
+    // Does NOT fire while the master is busy (even though the fleet is done).
+    assert_eq!(
+        evaluate_peer_fleet_synthesis(&[done_a.clone(), done_b.clone()], None, false),
+        None,
+    );
+
+    // Does NOT fire when an owned peer has produced no result yet.
+    let pending_b = OwnedPeerState {
+        result_mtime: None,
+        mid_turn: false,
+    };
+    assert_eq!(
+        evaluate_peer_fleet_synthesis(&[done_a.clone(), pending_b], None, true),
+        None,
+    );
+
+    // Does NOT fire for a master with zero owned peers.
+    assert_eq!(evaluate_peer_fleet_synthesis(&[], None, true), None);
+
+    // DEDUP: a second evaluation whose newest is already covered by the stamp
+    // does not re-fire (`>=` gate, mirroring `.notified`).
+    assert_eq!(
+        evaluate_peer_fleet_synthesis(&[done_a.clone(), done_b.clone()], Some(120), true),
+        None,
+    );
+    assert_eq!(
+        evaluate_peer_fleet_synthesis(&[done_a.clone()], Some(100), true),
+        None,
+    );
+
+    // RE-ARM: after synthesis (stamp = 120) a peer produces a strictly newer
+    // result (150) → fires once with the new newest, then holds again at 150.
+    let newer_b = OwnedPeerState {
+        result_mtime: Some(150),
+        mid_turn: false,
+    };
+    assert_eq!(
+        evaluate_peer_fleet_synthesis(&[done_a.clone(), newer_b.clone()], Some(120), true),
+        Some(150),
+    );
+    assert_eq!(
+        evaluate_peer_fleet_synthesis(&[done_a, newer_b], Some(150), true),
+        None,
+    );
+}
+
+/// Peer-fleet auto-synthesis — `collect_owned_peer_results` returns exactly the
+/// REAL staged peers whose `originator` matches the master, each with its
+/// `result.md` mtime; a peer with no result yields `None` (still in the fleet,
+/// blocks synthesis), a CLOSED peer is excluded, and a peer owned by a DIFFERENT
+/// master is excluded.
+#[test]
+fn collect_owned_peer_results_filters_by_originator_and_excludes_closed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let peers_root = tmp.path();
+    let master = "tenant-a:api:master-1";
+    let other = "tenant-a:api:master-2";
+
+    let stage = |slug: &str, originator: &str| {
+        let dir = peers_root.join(slug);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("brief.md"), "brief").unwrap();
+        std::fs::write(dir.join("originator"), originator).unwrap();
+        dir
+    };
+
+    // Owned + has a result.
+    let done = stage("done-peer", master);
+    std::fs::write(done.join("result.md"), "res").unwrap();
+    // Owned but NO result yet (blocks synthesis; still part of the fleet).
+    stage("pending-peer", master);
+    // Owned but CLOSED — excluded (retired peer).
+    let closed = stage("closed-peer", master);
+    std::fs::write(closed.join("result.md"), "res").unwrap();
+    std::fs::write(closed.join("closed"), "").unwrap();
+    // Owned by a DIFFERENT master — excluded.
+    let foreign = stage("foreign-peer", other);
+    std::fs::write(foreign.join("result.md"), "res").unwrap();
+
+    let mut owned = collect_owned_peer_results(peers_root, master);
+    owned.sort();
+    let slugs: Vec<&str> = owned.iter().map(|(slug, _)| slug.as_str()).collect();
+    assert_eq!(
+        slugs,
+        vec!["done-peer", "pending-peer"],
+        "only this master's non-closed peers are owned"
+    );
+    let done_entry = owned.iter().find(|(s, _)| s == "done-peer").unwrap();
+    assert!(done_entry.1.is_some(), "a written result has an mtime");
+    let pending_entry = owned.iter().find(|(s, _)| s == "pending-peer").unwrap();
+    assert_eq!(
+        pending_entry.1, None,
+        "a peer with no result.md yields None"
+    );
+}
+
+/// Peer-fleet auto-synthesis — the per-master `.synthesized` stamp round-trips
+/// through `safe_filename` (distinct masters never collide), reads back the
+/// stored mtime, and is never mistaken for a staged peer by the fleet scan.
+#[test]
+fn peer_fleet_synthesized_stamp_round_trips_per_master() {
+    let tmp = tempfile::tempdir().unwrap();
+    let peers_root = tmp.path();
+    let master_a = "tenant-a:api:master-1";
+    let master_b = "tenant-a:api:master-2";
+
+    assert_eq!(
+        read_peer_fleet_synthesized_stamp(peers_root, master_a),
+        None
+    );
+
+    crate::memory_consolidate::apply::atomic_write(
+        &peer_fleet_synthesized_stamp_path(peers_root, master_a),
+        "1234",
+    )
+    .unwrap();
+    assert_eq!(
+        read_peer_fleet_synthesized_stamp(peers_root, master_a),
+        Some(1234)
+    );
+    // A different master has an independent stamp (no cross-talk).
+    assert_eq!(
+        read_peer_fleet_synthesized_stamp(peers_root, master_b),
+        None
+    );
+    // The stamp file colocated in `peers/` is NOT mistaken for a staged peer.
+    assert!(collect_owned_peer_results(peers_root, master_a).is_empty());
+}
+
 /// #436 P1 #2 — a peer continuation is only drained by the connection that has
 /// the peer session open, so its live (ephemeral) turn output never renders on
 /// another same-profile client. Non-peer targets are unaffected.

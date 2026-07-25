@@ -149,6 +149,20 @@ pub(crate) const PEER_SEND_INPUT_META_OCCURRENCE: &str = "peer_send_input_occurr
 /// Group id stamped onto peer_send_input continuations (queue triage filter).
 const PEER_SEND_INPUT_GROUP: &str = "peer-send-input";
 
+/// Peer-fleet auto-synthesis — kind label for the `External(_)` master
+/// continuation that fires an AUTONOMOUS synthesis turn on the ORIGINATOR
+/// (master) session the moment every peer it handed off has completed. Unlike
+/// the passive `peer_results_ready_note` (a mailbox nudge injected only when
+/// the user next prompts the master), this actively enqueues a master turn so
+/// the fleet's consolidated report is produced with no user prompt. Flows
+/// through the same hardened `External` drain path as `peer_send_input`.
+pub(crate) const PEER_FLEET_SYNTHESIS_EXTERNAL_KIND: &str = "peer_fleet_synthesis";
+/// Metadata key carrying the number of completed peers in the fleet (prompt
+/// context only; the synthesis turn gathers results by reading the blackboard).
+pub(crate) const PEER_FLEET_SYNTHESIS_META_PEER_COUNT: &str = "peer_fleet_peer_count";
+/// Group id stamped onto peer-fleet-synthesis continuations (queue triage).
+const PEER_FLEET_SYNTHESIS_GROUP: &str = "peer-fleet-synthesis";
+
 /// #436 P1 (#3) — real delivery status for a `peer_send_input` injection so the
 /// tool never acks success on a durable-persist failure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -184,6 +198,23 @@ impl PeerSendInputEnqueueOutcome {
 /// dedups.
 fn peer_send_input_dedupe_key(session: &SessionKey, occurrence_id: &str) -> String {
     format!("external/{PEER_SEND_INPUT_EXTERNAL_KIND}/{session}/{occurrence_id}")
+}
+
+/// The dedupe key for a peer-fleet-synthesis continuation. Keyed on the master
+/// (originator) wire session AND the newest owned `result.md` mtime that the
+/// enqueue was decided on. Embedding the mtime as the occurrence id is REQUIRED
+/// by the scheduler's `RECENT_CLAIM_GUARD_WINDOW` invariant: a stable key would
+/// be rejected as a duplicate for 30s after a synthesis turn is claimed, which
+/// would wrongly drop a legitimate re-fire when a peer produces a genuinely
+/// newer result inside that window. Because a re-fire only happens when the
+/// newest mtime STRICTLY advances past the per-master `.synthesized` stamp, the
+/// mtime is a monotonic occurrence id: the same completion wave always maps to
+/// the same key (deduped), a genuinely newer wave maps to a fresh key (fires).
+fn peer_fleet_synthesis_dedupe_key(
+    master_session: &SessionKey,
+    newest_result_mtime: u64,
+) -> String {
+    format!("external/{PEER_FLEET_SYNTHESIS_EXTERNAL_KIND}/{master_session}/{newest_result_mtime}")
 }
 
 #[derive(Debug, Clone)]
@@ -2411,6 +2442,45 @@ impl InProcessAgentOrchestrator {
                 }
             }
         }
+    }
+
+    /// Peer-fleet auto-synthesis — enqueue ONE autonomous synthesis turn on the
+    /// master (originator) session when its whole peer fleet has completed. The
+    /// fire/dedup decision (every owned peer has a fresh `result.md`, none is
+    /// mid-turn, the master is idle, and at least one result is newer than the
+    /// per-master `.synthesized` stamp) is made by the caller in
+    /// `ui_protocol.rs`; this method only performs the enqueue.
+    ///
+    /// In-memory enqueue (no durable persist): losing a synthesis TRIGGER across
+    /// a restart is benign — the master's next real turn still picks up the
+    /// passive `peer_results_ready_note` nudge — so, unlike a user's
+    /// `peer_send_input` message, it need not survive a crash. Skipping the
+    /// durable write also avoids a restart replaying a synthesis turn the
+    /// `.synthesized` stamp already covered.
+    ///
+    /// Returns the raw enqueue outcome so the caller can advance the
+    /// `.synthesized` stamp exactly when a continuation is newly queued.
+    pub(crate) fn enqueue_peer_fleet_synthesis_continuation(
+        &self,
+        master_session: &SessionKey,
+        profile_id: &str,
+        newest_result_mtime: u64,
+        peer_count: usize,
+    ) -> MasterContinuationEnqueueOutcome {
+        let request = MasterContinuationRequest::new(
+            PEER_FLEET_SYNTHESIS_GROUP,
+            master_session.to_string(),
+            profile_id.to_owned(),
+            MasterContinuationReason::External(PEER_FLEET_SYNTHESIS_EXTERNAL_KIND.to_owned()),
+            SystemTime::now(),
+        )
+        .with_metadata(PEER_FLEET_SYNTHESIS_META_PEER_COUNT, peer_count.to_string())
+        .with_dedupe_key(peer_fleet_synthesis_dedupe_key(
+            master_session,
+            newest_result_mtime,
+        ));
+        let mut state = self.state();
+        state.continuations.enqueue(request)
     }
 
     /// #436 P1 (#1/#5) — re-home any PENDING `peer_send_input` injections for
@@ -6159,6 +6229,17 @@ pub(crate) fn master_continuation_prompt(continuation: &QueuedMasterContinuation
                 .cloned()
                 .unwrap_or_default()
         }
+        // Peer-fleet auto-synthesis — every peer this master handed off has
+        // completed. Direct an autonomous gather + consolidate turn. This is a
+        // `[system-internal]` envelope (like the child/scatter join arms), NOT a
+        // verbatim user turn: it instructs the master to act, it is not itself
+        // the user's words.
+        MasterContinuationReason::External(kind) if kind == PEER_FLEET_SYNTHESIS_EXTERNAL_KIND => {
+            format!(
+                "[system-internal]\nAll peer agents you handed off have completed their work.\n\nGroup: {group}\nMetadata:\n{metadata}\n\nUse the `peer_gather` tool to collect their results now and synthesize one consolidated report for the user. Attribute key findings to the peer that produced them, call out any failures, gaps, or disagreements between peers, and end with the single concrete next step if one is needed. Do NOT start new peer work in this turn — only gather and synthesize what the fleet has already produced.",
+                group = continuation.group_id.as_str(),
+            )
+        }
         MasterContinuationReason::External(kind) => format!(
             "[system-internal]\nAn external master continuation was requested.\n\nKind: {kind}\nGroup: {group}\nMetadata:\n{metadata}\n\nHandle the continuation conservatively and summarize the visible state for the user.",
             group = continuation.group_id.as_str(),
@@ -8786,6 +8867,77 @@ mod tests {
                 .pending_continuation_count_for_session_for_test(&session_queue, "tenant-queue"),
             1,
             "Queue failure routing must enqueue exactly one recovery continuation",
+        );
+    }
+
+    /// Peer-fleet auto-synthesis — the synthesis continuation dedupes on the
+    /// master session + newest-result mtime: enqueuing the SAME wave (same
+    /// mtime) collapses to one queued turn, while a genuinely NEWER result
+    /// (higher mtime) enqueues a fresh one. This is what makes the fleet fire
+    /// once per completion wave and re-arm exactly once when a peer later
+    /// produces a newer result — and embedding the mtime in the key keeps a
+    /// legit re-fire from being dropped by the `External` recent-claim guard.
+    #[test]
+    fn peer_fleet_synthesis_continuation_dedupes_on_master_and_newest_mtime() {
+        let orchestrator = default_agent_orchestrator();
+        let master = SessionKey::with_profile("tenant-fleet-synth", "api", "master-dedupe");
+        let profile = "tenant-fleet-synth";
+
+        let first =
+            orchestrator.enqueue_peer_fleet_synthesis_continuation(&master, profile, 1000, 3);
+        assert!(first.queued().is_some(), "first synthesis wave must queue");
+
+        let dup = orchestrator.enqueue_peer_fleet_synthesis_continuation(&master, profile, 1000, 3);
+        assert!(dup.is_duplicate(), "same-mtime re-enqueue must dedupe");
+        assert_eq!(
+            orchestrator.pending_continuation_count_for_session_for_test(&master, profile),
+            1,
+            "same completion wave must not stack a second synthesis continuation",
+        );
+
+        let rearm =
+            orchestrator.enqueue_peer_fleet_synthesis_continuation(&master, profile, 1500, 3);
+        assert!(
+            rearm.queued().is_some(),
+            "a strictly newer result must re-arm synthesis with a fresh continuation",
+        );
+    }
+
+    /// Peer-fleet auto-synthesis — the master continuation renders the
+    /// gather-and-consolidate directive (naming `peer_gather`) so the
+    /// autonomous turn synthesizes the fleet's results, not the generic
+    /// external body.
+    #[test]
+    fn peer_fleet_synthesis_prompt_directs_gather_and_synthesize() {
+        let orchestrator = default_agent_orchestrator();
+        let master = SessionKey::with_profile("tenant-fleet-prompt", "api", "master-prompt");
+        let profile = "tenant-fleet-prompt";
+        orchestrator.enqueue_peer_fleet_synthesis_continuation(&master, profile, 2000, 2);
+        let drained = orchestrator.drain_ready_continuations_for_session(
+            &master,
+            profile,
+            MasterContinuationRuntimeState::idle(),
+            4,
+        );
+        let synthesis = drained
+            .iter()
+            .find(|c| {
+                matches!(&c.reason, MasterContinuationReason::External(kind)
+                    if kind == PEER_FLEET_SYNTHESIS_EXTERNAL_KIND)
+            })
+            .expect("synthesis continuation must drain when the master is idle");
+        let prompt = master_continuation_prompt(synthesis);
+        assert!(
+            prompt.contains("peer_gather"),
+            "prompt must direct peer_gather: {prompt}"
+        );
+        assert!(
+            prompt.contains("completed their work"),
+            "prompt must state the fleet completed: {prompt}"
+        );
+        assert!(
+            prompt.contains("peer_fleet_peer_count: 2"),
+            "prompt metadata must carry the peer count: {prompt}"
         );
     }
 
