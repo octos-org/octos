@@ -11414,15 +11414,26 @@ async fn maybe_enqueue_peer_fleet_synthesis(state: &Arc<AppState>, peer_session:
     let peers: Vec<OwnedPeerState> = owned
         .into_iter()
         .map(|(slug, result_mtime, turn_count)| {
-            let active_mid_turn = peer_wire_registry()
-                .resolve(&peer_wire_key(profile_id, &slug))
-                .is_some_and(|session| running.contains(&session));
-            let queued_input = orchestrator.has_pending_peer_send_input_for_peer(profile_id, &slug);
+            // Resolve the wire session ONCE; reuse it for both the active-turn
+            // check and the in-flight-injection check.
+            let wire_session = peer_wire_registry().resolve(&peer_wire_key(profile_id, &slug));
+            let active_mid_turn = wire_session
+                .as_ref()
+                .is_some_and(|session| running.contains(session));
+            // codex #1 residual — a peer is NOT settled if it has a
+            // `peer_send_input` that is QUEUED or was just CLAIMED (popped by
+            // the drain, turn not yet active). The active-turn snapshot above
+            // and the pending queue are separate reads; the recent-claim check
+            // closes the pop-vs-snapshot window so an in-flight injection can't
+            // slip through and let a premature (then re-armed, duplicate)
+            // synthesis fire.
+            let inflight_injection =
+                orchestrator.peer_has_inflight_send_input(profile_id, &slug, wire_session.as_ref());
             owned_slugs.push(slug);
             OwnedPeerState {
                 result_mtime,
                 turn_count,
-                mid_turn: active_mid_turn || queued_input,
+                mid_turn: active_mid_turn || inflight_injection,
             }
         })
         .collect();
@@ -27391,6 +27402,15 @@ async fn run_standalone_turn(
             None,
         )
         .await;
+        // codex #2 residual — a client-interrupted peer takes THIS branch, not
+        // the Completed/errored arms, so its fleet was never evaluated: a last
+        // interrupted peer could leave the fleet unsynthesized. Evaluate here
+        // too. An interrupt writes no fresh result.md, so if this was the peer's
+        // only turn the fleet-done check correctly HOLDS (it's not done); a
+        // persistent peer with a prior result is synthesized against that. The
+        // point is to not SKIP evaluation on the interrupt path. No-op for
+        // non-peer sessions.
+        maybe_enqueue_peer_fleet_synthesis(&state, &session_id).await;
     }
 
     let _ = agent_task.await;

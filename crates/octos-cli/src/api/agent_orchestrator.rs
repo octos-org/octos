@@ -2526,6 +2526,41 @@ impl InProcessAgentOrchestrator {
         })
     }
 
+    /// codex #1 (residual, TOCTOU) — true when peer `slug` has a
+    /// `peer_send_input` injection that is either QUEUED or was just CLAIMED
+    /// (popped by the drain for its wire session `target_session`, turn not yet
+    /// active) within the scheduler's recent-claim window. Blocks the
+    /// fleet-synthesis gate so a peer whose injection is IN-FLIGHT — pending OR
+    /// popped-but-not-yet-active — is never treated as settled.
+    ///
+    /// Race-free by ORDER, not by a single lock: `pop_ready` removes the item
+    /// from `pending_by_key` AND records its claim in `recently_claimed_external`
+    /// in ONE critical section. So if the pending check (taken FIRST) finds
+    /// nothing, the pop must already have completed and recorded its claim,
+    /// which the second check then observes. A concurrent drain can therefore
+    /// never leave the injection invisible to BOTH checks.
+    pub(crate) fn peer_has_inflight_send_input(
+        &self,
+        profile_id: &str,
+        slug: &str,
+        target_session: Option<&SessionKey>,
+    ) -> bool {
+        // Check pending FIRST: a still-queued injection short-circuits, and a
+        // `false` here means any concurrent pop already recorded its claim.
+        if self.has_pending_peer_send_input_for_peer(profile_id, slug) {
+            return true;
+        }
+        let Some(session) = target_session else {
+            return false;
+        };
+        // The just-claimed (popped, dispatch in-flight) case: match the
+        // per-session key stem `peer_send_input_dedupe_key` builds.
+        let prefix = format!("external/{PEER_SEND_INPUT_EXTERNAL_KIND}/{session}/");
+        self.state()
+            .continuations
+            .has_recent_external_claim_with_prefix(&prefix, SystemTime::now())
+    }
+
     /// #436 P1 (#1/#5) — re-home any PENDING `peer_send_input` injections for
     /// `slug` onto the peer's CURRENT wire key when the peer reopens as a fresh
     /// client-chosen session. Without this, a queued injection stays bound to
@@ -9050,6 +9085,69 @@ mod tests {
             !orchestrator.has_pending_peer_send_input_for_peer("tenant-other", "worker"),
             "a different profile must not report pending input",
         );
+    }
+
+    /// codex #1 (residual TOCTOU) — `peer_has_inflight_send_input` blocks the
+    /// fleet-synthesis gate for BOTH a queued injection AND one that was just
+    /// CLAIMED (popped by the drain, turn not yet active). Draining the queued
+    /// item removes it from `pending_by_key` yet records it in
+    /// `recently_claimed_external`, so a peer whose injection is mid-dispatch is
+    /// never seen as settled — closing the premature/re-armed double synthesis.
+    #[test]
+    fn peer_has_inflight_send_input_covers_queued_and_just_claimed() {
+        let orchestrator = default_agent_orchestrator();
+        let profile = "tenant-fleet-claim";
+        let peer_wire =
+            SessionKey::with_profile_topic(profile, "api", "peer-wire-claim", "peer-worker");
+
+        // Nothing yet.
+        assert!(!orchestrator.peer_has_inflight_send_input(profile, "worker", Some(&peer_wire)));
+
+        // Queued injection → the pending case blocks.
+        let outcome = orchestrator.enqueue_peer_send_input_continuation(
+            &peer_wire,
+            profile,
+            "worker",
+            "occ-claim",
+            "hi",
+        );
+        assert_eq!(outcome, PeerSendInputEnqueueOutcome::Queued);
+        assert!(orchestrator.peer_has_inflight_send_input(profile, "worker", Some(&peer_wire)));
+
+        // Drain it: popped → recorded as recently-claimed, no longer pending.
+        let drained = orchestrator.drain_ready_continuations_for_session(
+            &peer_wire,
+            profile,
+            MasterContinuationRuntimeState::idle(),
+            4,
+        );
+        assert!(
+            drained.iter().any(
+                |c| matches!(&c.reason, MasterContinuationReason::External(k)
+                if k == PEER_SEND_INPUT_EXTERNAL_KIND)
+            ),
+            "the injection must drain",
+        );
+        assert!(
+            !orchestrator.has_pending_peer_send_input_for_peer(profile, "worker"),
+            "a popped injection is no longer pending",
+        );
+
+        // ...but the combined check STILL blocks via the recent-claim record —
+        // this is the closed TOCTOU window.
+        assert!(
+            orchestrator.peer_has_inflight_send_input(profile, "worker", Some(&peer_wire)),
+            "a just-claimed (popped, not-yet-active) injection must still block",
+        );
+
+        // A DIFFERENT peer session's key stem must not match the claim.
+        let other_wire = SessionKey::with_profile_topic(profile, "api", "peer-other", "peer-other");
+        assert!(
+            !orchestrator.peer_has_inflight_send_input(profile, "other", Some(&other_wire)),
+            "a different peer session must not see this claim",
+        );
+        // With no target session, only the pending case is consulted (none now).
+        assert!(!orchestrator.peer_has_inflight_send_input(profile, "worker", None));
     }
 
     /// codex DO-NOT-SHIP TOCTOU: on the WS path BOTH the legacy `on_failure`

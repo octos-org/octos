@@ -7772,6 +7772,52 @@ fn evaluate_peer_fleet_synthesis_fire_policy_matrix() {
     );
 }
 
+/// codex #2 residual — the interrupt terminal path now evaluates the fleet too
+/// (the same pure decision the Completed/errored arms make). An INTERRUPTED
+/// peer writes no fresh result.md, so the two behaviors the path must exhibit:
+/// (a) HOLDS when the interrupted peer has no result yet (fleet not done), and
+/// (b) FIRES once when the interrupted peer already has a prior result on the
+/// blackboard (persistent peer), then dedups.
+#[test]
+fn evaluate_holds_for_resultless_interrupt_and_fires_with_prior_result() {
+    let peer = |mtime: Option<u64>, turns: u64| OwnedPeerState {
+        result_mtime: mtime,
+        turn_count: turns,
+        mid_turn: false,
+    };
+    let sibling_done = peer(Some(100), 1);
+
+    // (a) Interrupted peer has NO result → fleet is not done → HOLD.
+    let interrupted_no_result = peer(None, 0);
+    assert_eq!(
+        evaluate_peer_fleet_synthesis(&[sibling_done.clone(), interrupted_no_result], None, true,),
+        None,
+        "an interrupted peer with no result.md must not complete the fleet",
+    );
+
+    // (b) Interrupted peer already has a PRIOR result (persistent peer) → the
+    // fleet is done → FIRES once, then dedups on the same stamp.
+    let interrupted_prior_result = peer(Some(90), 1);
+    let fired = evaluate_peer_fleet_synthesis(
+        &[sibling_done.clone(), interrupted_prior_result.clone()],
+        None,
+        true,
+    );
+    assert_eq!(
+        fired,
+        Some(FleetSynthesisStamp {
+            newest_mtime: 100,
+            total_turns: 2,
+        }),
+        "an interrupted peer with a prior result still lets the fleet synthesize",
+    );
+    assert_eq!(
+        evaluate_peer_fleet_synthesis(&[sibling_done, interrupted_prior_result], fired, true,),
+        None,
+        "the same wave dedups — no duplicate synthesis on the interrupt path",
+    );
+}
+
 /// Peer-fleet auto-synthesis — `collect_owned_peer_results` returns exactly the
 /// REAL staged peers whose `originator` matches the master, each with its
 /// `result.md` mtime and terminal-turn count; a peer with no result yields

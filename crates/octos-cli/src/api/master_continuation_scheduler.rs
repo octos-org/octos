@@ -785,6 +785,31 @@ impl MasterContinuationScheduler {
         self.recently_claimed_external
             .retain(|_, claimed_at| within_recent_claim_window(*claimed_at, now));
     }
+
+    /// True when an `External` continuation whose dedupe key STARTS WITH
+    /// `key_prefix` was CLAIMED (popped by a drain) within
+    /// [`RECENT_CLAIM_GUARD_WINDOW`] of `now`. Reads the same
+    /// `recently_claimed_external` map the double-enqueue guard maintains.
+    ///
+    /// The fleet-synthesis gate uses this to treat a peer whose `peer_send_input`
+    /// was just popped by the drain — but whose turn has not yet registered in
+    /// the active-turn map — as still busy, closing the pop-vs-active-snapshot
+    /// TOCTOU: the pop removes the item from `pending_by_key` AND records the
+    /// claim here in ONE critical section, so a caller that finds no pending
+    /// item is guaranteed to find the claim instead. `key_prefix` is the
+    /// per-session key stem (e.g. `external/peer_send_input/<session>/`) so a
+    /// distinct peer's claim never matches.
+    pub(crate) fn has_recent_external_claim_with_prefix(
+        &self,
+        key_prefix: &str,
+        now: SystemTime,
+    ) -> bool {
+        self.recently_claimed_external
+            .iter()
+            .any(|(key, claimed_at)| {
+                key.as_str().starts_with(key_prefix) && within_recent_claim_window(*claimed_at, now)
+            })
+    }
 }
 
 /// True when `candidate` falls within [`RECENT_CLAIM_GUARD_WINDOW`] after
