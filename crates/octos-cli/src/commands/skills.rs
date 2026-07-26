@@ -226,7 +226,7 @@ impl Executable for SkillsCommand {
         // Resolve skills directory: per-profile or global
         let skills_dir = if let Some(ref profile_id) = self.profile {
             let data_dir = super::resolve_data_dir(None)?;
-            let store = crate::profiles::ProfileStore::open(&data_dir)?;
+            let store = crate::profiles::ProfileStore::open_unified(&data_dir)?;
             resolve_profile_skills_dir(&store, profile_id)?
         } else {
             cwd.join(".octos").join("skills")

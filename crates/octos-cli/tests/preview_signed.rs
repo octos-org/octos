@@ -76,7 +76,7 @@ async fn build_fixture_with_ttl(ttl: std::time::Duration) -> Fixture {
     let tempdir = TempDir::new().expect("tempdir");
     let octos_home = tempdir.path().to_path_buf();
 
-    let profile_store = Arc::new(ProfileStore::open(&octos_home).expect("profile store"));
+    let profile_store = Arc::new(ProfileStore::open_unified(&octos_home).expect("profile store"));
 
     let profile_a = UserProfile {
         id: "tenant-a".into(),

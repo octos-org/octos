@@ -334,9 +334,31 @@ impl GatewayRuntime {
         // resolves --data-dir > $OCTOS_HOME > ~/.octos).
         let effective_octos_home = cmd.octos_home.clone().unwrap_or_else(|| data_dir.clone());
         let profile_store: Option<Arc<crate::profiles::ProfileStore>> =
-            crate::profiles::ProfileStore::open(&effective_octos_home)
+            crate::profiles::ProfileStore::open_unified(&effective_octos_home)
                 .ok()
                 .map(Arc::new);
+
+        // FIX 2 (single shared runtime-profile resolver): in profile-mode,
+        // resolve the profile ONCE up front — parent/sub-account inheritance
+        // AND the store's global `profile-defaults.json` base — and thread the
+        // resolved config into the flattened `Config` so EVERY downstream read
+        // of profile config (sandbox ~L699, hooks ~L1253, plugin signing
+        // ~L1387, memory, approvals) sees the inherited base. This runs
+        // regardless of `cli_llm_override`, so the CLI-override path (which
+        // skips the `ProfileRuntime` bootstrap below) still applies
+        // inheritance. Absent store / parent / defaults ⇒ no change.
+        if let (Some(store), Some(profile)) = (profile_store.as_ref(), resolved_profile.as_mut()) {
+            let resolved = store.resolve_runtime_profile(profile);
+            config.sandbox = resolved.config.sandbox.clone();
+            config.hooks = resolved.config.hooks.clone();
+            config.memory = resolved.config.memory.clone();
+            config.approval_policy = resolved.config.approval_policy.clone();
+            // OR-merge signing so neither the env-forced host policy (already
+            // merged into `config.plugins` above) nor a defaults signing floor
+            // is dropped.
+            config.plugins.require_signed |= resolved.config.plugins.require_signed;
+            *profile = resolved;
+        }
 
         #[allow(unused_variables)] // used by feature-gated channel registration
         let media_dir = data_dir.join("media");
@@ -382,8 +404,15 @@ impl GatewayRuntime {
             // for the `--config` path. We forward `config.plugins` here
             // and `bootstrap_with_host_plugins` then OR-merges it onto
             // the profile-derived config, closing the loop.
+            //
+            // `profile` (from `resolved_profile`) already carries the resolved
+            // runtime config — parent/sub-account inheritance + the store's
+            // global `profile-defaults.json` base were applied ONCE up front
+            // (see the `resolve_runtime_profile` block above), matching
+            // `octos serve`. No per-bootstrap re-resolution needed.
+            let effective_profile = profile.clone();
             match ProfileRuntime::bootstrap_with_host_plugins(
-                profile,
+                &effective_profile,
                 &data_dir,
                 Some(&effective_octos_home),
                 crate::runtime::BootstrapRole::Gateway,
@@ -593,7 +622,14 @@ impl GatewayRuntime {
         // is profile-driven by design.
 
         // Customer-installed skills are strictly account-scoped.
-        let skills_loader = crate::skills_scope::build_account_skills_loader(&data_dir);
+        // Skill layering v1: inherit the resolved profile's skill selection.
+        // `None` ⇒ no skills layer ⇒ every discovered skill loads (as before).
+        let skill_filter = resolved_profile
+            .as_ref()
+            .and_then(|p| p.config.skills.as_ref())
+            .map(|s| s.to_agent_filter());
+        let skills_loader = crate::skills_scope::build_account_skills_loader(&data_dir)
+            .with_skill_filter(skill_filter.clone());
 
         // Create message bus (before publisher is consumed by channel manager)
         let (agent_handle, publisher) = create_bus();
@@ -809,7 +845,7 @@ impl GatewayRuntime {
                 plugin_result = octos_agent::PluginLoadResult::default();
                 if !plugin_dirs.is_empty() {
                     let synthesis_config = build_synthesis_config(&config, &provider_name);
-                    match octos_agent::PluginLoader::load_into_with_options(
+                    match octos_agent::PluginLoader::load_into_with_options_and_filter(
                         &mut tools,
                         &plugin_dirs,
                         &plugin_env,
@@ -823,6 +859,7 @@ impl GatewayRuntime {
                             require_signed: config.plugins.require_signed,
                             verified_cache_dir: None,
                         },
+                        skill_filter.as_ref(),
                     ) {
                         Ok(result) => plugin_result = result,
                         Err(e) => warn!("plugin loading failed: {e}"),
@@ -1230,6 +1267,8 @@ impl GatewayRuntime {
                 .approval_policy
                 .as_ref()
                 .map(|policy| policy.to_runtime_rules()),
+            // #1774: opt-in post-edit formatting (rustfmt/prettier/black/gofmt).
+            format_after_edit: config.format_after_edit,
             ..Default::default()
         };
 
@@ -1450,7 +1489,15 @@ impl GatewayRuntime {
             paths
         };
         let (config_tx, config_rx) = tokio::sync::watch::channel(None);
-        let _watcher_handle = ConfigWatcher::new(watch_paths, config.clone(), config_tx).spawn();
+        let mut watcher = ConfigWatcher::new(watch_paths, config.clone(), config_tx);
+        // FIX 3: in profile-mode also watch the store's global
+        // `profile-defaults.json` so an edit to the shared base layer triggers
+        // the same reload path as a profile edit.
+        if cmd.profile.is_some() {
+            watcher =
+                watcher.with_profile_defaults(effective_octos_home.join("profile-defaults.json"));
+        }
+        let _watcher_handle = watcher.spawn();
 
         // Create channel manager and register channels.
         // If --api-port is passed but no Api channel is configured (serve mode

@@ -3,7 +3,7 @@
 use std::path::PathBuf;
 
 use async_trait::async_trait;
-use eyre::{Result, WrapErr};
+use eyre::Result;
 use serde::Deserialize;
 
 use super::{Tool, ToolContext, ToolResult};
@@ -35,12 +35,48 @@ impl ReadFileTool {
 }
 
 #[derive(Debug, Deserialize)]
+// #1770: unknown keys are usually a typo of a real parameter; rejecting
+// them (with a did-you-mean via `args::parse_tool_args`) lets the model
+// self-correct instead of silently dropping its intent.
+#[serde(deny_unknown_fields)]
 struct ReadFileInput {
+    /// #1767: `filePath` is the industry-convention alias.
+    #[serde(alias = "filePath")]
     path: String,
-    #[serde(default)]
+    /// `offset` is a 1:1 alias — both mean "first line to read, 1-indexed".
+    #[serde(default, alias = "offset")]
     start_line: Option<usize>,
     #[serde(default)]
     end_line: Option<usize>,
+    /// #1767: distinct field, NOT an alias of `end_line` — `limit` is a
+    /// *count* of lines to read starting at `start_line`, from which the
+    /// effective `end_line` is computed. A bare alias would misread
+    /// `limit: 100` as "stop at line 100".
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+/// Resolve the effective `(start_line, end_line)` pair from the three
+/// accepted range parameters. `limit` computes `end_line = start_line +
+/// limit - 1`; supplying both `end_line` and `limit` is ambiguous and
+/// rejected.
+fn resolve_line_range(
+    start_line: Option<usize>,
+    end_line: Option<usize>,
+    limit: Option<usize>,
+) -> Result<(Option<usize>, Option<usize>), String> {
+    match (end_line, limit) {
+        (Some(_), Some(_)) => Err("Provide either 'end_line' or 'limit', not both.".to_string()),
+        (None, Some(0)) => Err("'limit' must be at least 1.".to_string()),
+        (None, Some(count)) => {
+            let start = start_line.unwrap_or(1);
+            Ok((
+                start_line,
+                Some(start.saturating_add(count).saturating_sub(1)),
+            ))
+        }
+        (end, None) => Ok((start_line, end)),
+    }
 }
 
 #[async_trait]
@@ -63,15 +99,19 @@ impl Tool for ReadFileTool {
             "properties": {
                 "path": {
                     "type": "string",
-                    "description": "Path to the file to read (relative to working directory)"
+                    "description": "Path to the file to read (relative to working directory; alias: filePath)"
                 },
                 "start_line": {
                     "type": "integer",
-                    "description": "Optional starting line number (1-indexed)"
+                    "description": "Optional starting line number (1-indexed; alias: offset)"
                 },
                 "end_line": {
                     "type": "integer",
                     "description": "Optional ending line number (1-indexed, inclusive)"
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Optional maximum number of lines to read, starting at start_line (alternative to end_line — do not provide both)"
                 }
             },
             "required": ["path"]
@@ -91,7 +131,7 @@ impl Tool for ReadFileTool {
         args: &serde_json::Value,
     ) -> Result<ToolResult> {
         let input: ReadFileInput =
-            serde_json::from_value(args.clone()).wrap_err("invalid read_file tool input")?;
+            super::args::parse_tool_args(self.name(), &self.input_schema(), args)?;
 
         // M8.1 permission gate (stub): consult the typed permissions record
         // so the hook is in place before M8.3 wires real allow lists. Today
@@ -103,6 +143,21 @@ impl Tool for ReadFileTool {
                 ..Default::default()
             });
         }
+
+        // #1767: fold `limit` into an effective end_line up front so every
+        // consumer below (range slicing AND the file-state cache key) sees
+        // one canonical range.
+        let (start_line, end_line) =
+            match resolve_line_range(input.start_line, input.end_line, input.limit) {
+                Ok(range) => range,
+                Err(message) => {
+                    return Ok(ToolResult {
+                        output: message,
+                        success: false,
+                        ..Default::default()
+                    });
+                }
+            };
 
         // Phase 2-C of the SessionScope migration: when the host has
         // threaded a scope through `ToolContext`, use it as the single
@@ -165,7 +220,7 @@ impl Tool for ReadFileTool {
         // file body. This reduces token cost by 30-60 % in long sessions.
         // We store the user-supplied range verbatim so the comparison here is
         // exact (without needing to know the file's total line count).
-        let requested_range = user_range(input.start_line, input.end_line);
+        let requested_range = user_range(start_line, end_line);
         if let (Some(cache), Some(mtime)) = (ctx.file_state_cache.as_ref(), current_mtime) {
             if let Some(entry) = cache.get(&path, mtime) {
                 if cache_matches_request(&entry, requested_range) {
@@ -188,8 +243,8 @@ impl Tool for ReadFileTool {
         let total_lines = lines.len();
 
         // Apply line range
-        let start = input.start_line.unwrap_or(1).saturating_sub(1);
-        let end = input.end_line.unwrap_or(total_lines).min(total_lines);
+        let start = start_line.unwrap_or(1).saturating_sub(1);
+        let end = end_line.unwrap_or(total_lines).min(total_lines);
 
         if start >= total_lines {
             return Ok(ToolResult {
@@ -255,7 +310,7 @@ impl Tool for ReadFileTool {
             let can_cache = !FileStateCache::has_binary_extension(&path)
                 && FileStateCache::is_text_cacheable(content.as_bytes());
             if can_cache {
-                let view_range = user_range(input.start_line, input.end_line);
+                let view_range = user_range(start_line, end_line);
                 cache.put(CacheEntry::new(
                     path.clone(),
                     mtime,
@@ -320,6 +375,94 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let tool = ReadFileTool::new(dir.path());
         assert_eq!(tool.concurrency_class(), ConcurrencyClass::Safe);
+    }
+
+    #[tokio::test]
+    async fn invalid_args_error_names_each_problem_with_did_you_mean() {
+        // #1770: a misspelled parameter must produce a model-facing
+        // message that (a) names the missing required parameter, (b)
+        // names the unknown parameter, and (c) suggests the correction —
+        // so the LLM can self-correct on the next iteration instead of
+        // retrying blind.
+        let dir = tempfile::tempdir().unwrap();
+        let tool = ReadFileTool::new(dir.path());
+        let err = match tool
+            .execute(&serde_json::json!({"file_path": "a.txt"}))
+            .await
+        {
+            Err(e) => e,
+            Ok(_) => panic!("misspelled parameter must fail"),
+        };
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("Invalid arguments for tool 'read_file'"),
+            "names the tool: {msg}"
+        );
+        assert!(
+            msg.contains("path") && msg.contains("missing required parameter"),
+            "names the missing parameter: {msg}"
+        );
+        assert!(
+            msg.contains("file_path") && msg.contains("unknown parameter"),
+            "names the unknown parameter: {msg}"
+        );
+        assert!(
+            msg.contains("did you mean 'path'?"),
+            "suggests the correction: {msg}"
+        );
+        // #1690 contract: argument errors are ToolInputError so a
+        // malformed call never cascade-cancels well-formed siblings.
+        assert!(
+            err.chain()
+                .any(|src| src.is::<crate::tools::ToolInputError>()),
+            "argument errors must carry the ToolInputError marker"
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_args_error_reports_type_mismatch() {
+        // #1770: wrong-typed values are reported per-parameter with the
+        // expected and actual JSON types.
+        let dir = tempfile::tempdir().unwrap();
+        let tool = ReadFileTool::new(dir.path());
+        let err = match tool
+            .execute(&serde_json::json!({"path": "a.txt", "start_line": "abc"}))
+            .await
+        {
+            Err(e) => e,
+            Ok(_) => panic!("wrong-typed parameter must fail"),
+        };
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("start_line") && msg.contains("expected integer, got string"),
+            "reports the type mismatch: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_extra_parameter_is_rejected_with_suggestion() {
+        // #1770: `deny_unknown_fields` — a stray parameter alongside an
+        // otherwise valid call is rejected (it is usually a typo of a
+        // real parameter, and silently ignoring it hides model bugs).
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("ok.txt"), b"ok").unwrap();
+        let tool = ReadFileTool::new(dir.path());
+        let err = match tool
+            .execute(&serde_json::json!({"path": "ok.txt", "startline": 1}))
+            .await
+        {
+            Err(e) => e,
+            Ok(_) => panic!("unknown parameter must fail"),
+        };
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("startline") && msg.contains("unknown parameter"),
+            "names the unknown parameter: {msg}"
+        );
+        assert!(
+            msg.contains("did you mean 'start_line'?"),
+            "suggests the near-miss known parameter: {msg}"
+        );
     }
 
     #[tokio::test]
@@ -760,6 +903,199 @@ mod tests {
             .unwrap();
         assert!(!bad.success);
         assert!(bad.output.contains("outside working directory"));
+    }
+
+    // -----------------------------------------------------------------------
+    // #1767: industry-convention parameter aliases.
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn should_accept_file_path_alias_for_path() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("hello.txt"), "aliased content\n").unwrap();
+
+        let tool = ReadFileTool::new(dir.path());
+        let result = tool
+            .execute(&serde_json::json!({"filePath": "hello.txt"}))
+            .await
+            .unwrap();
+
+        assert!(
+            result.success,
+            "filePath alias must work: {}",
+            result.output
+        );
+        assert!(result.output.contains("aliased content"));
+    }
+
+    fn ten_lines_file(dir: &tempfile::TempDir) {
+        let content = (1..=10)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(dir.path().join("lines.txt"), &content).unwrap();
+    }
+
+    #[tokio::test]
+    async fn should_accept_offset_alias_for_start_line() {
+        let dir = tempfile::tempdir().unwrap();
+        ten_lines_file(&dir);
+
+        let tool = ReadFileTool::new(dir.path());
+        let result = tool
+            .execute(&serde_json::json!({"path": "lines.txt", "offset": 3, "end_line": 5}))
+            .await
+            .unwrap();
+
+        assert!(result.success, "{}", result.output);
+        assert!(result.output.contains("showing lines 3-5 of 10"));
+    }
+
+    #[tokio::test]
+    async fn should_compute_end_line_from_limit() {
+        // limit is a COUNT of lines, not a line number: offset 3 + limit 3
+        // reads lines 3..=5 (end_line = start + limit - 1).
+        let dir = tempfile::tempdir().unwrap();
+        ten_lines_file(&dir);
+
+        let tool = ReadFileTool::new(dir.path());
+        let result = tool
+            .execute(&serde_json::json!({"path": "lines.txt", "offset": 3, "limit": 3}))
+            .await
+            .unwrap();
+
+        assert!(result.success, "{}", result.output);
+        assert!(
+            result.output.contains("showing lines 3-5 of 10"),
+            "limit must be a line count: {}",
+            result.output
+        );
+        assert!(result.output.contains("line 3"));
+        assert!(result.output.contains("line 5"));
+        assert!(!result.output.contains("line 6"));
+    }
+
+    #[tokio::test]
+    async fn should_default_start_to_one_when_only_limit_given() {
+        let dir = tempfile::tempdir().unwrap();
+        ten_lines_file(&dir);
+
+        let tool = ReadFileTool::new(dir.path());
+        let result = tool
+            .execute(&serde_json::json!({"path": "lines.txt", "limit": 2}))
+            .await
+            .unwrap();
+
+        assert!(result.success, "{}", result.output);
+        assert!(result.output.contains("showing lines 1-2 of 10"));
+    }
+
+    #[tokio::test]
+    async fn should_reject_when_both_end_line_and_limit_supplied() {
+        let dir = tempfile::tempdir().unwrap();
+        ten_lines_file(&dir);
+
+        let tool = ReadFileTool::new(dir.path());
+        let result = tool
+            .execute(
+                &serde_json::json!({"path": "lines.txt", "start_line": 2, "end_line": 5, "limit": 2}),
+            )
+            .await
+            .unwrap();
+
+        assert!(!result.success, "must reject ambiguous range");
+        assert!(
+            result.output.contains("not both"),
+            "expected both-supplied rejection, got: {}",
+            result.output
+        );
+    }
+
+    #[tokio::test]
+    async fn should_reject_zero_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        ten_lines_file(&dir);
+
+        let tool = ReadFileTool::new(dir.path());
+        let result = tool
+            .execute(&serde_json::json!({"path": "lines.txt", "limit": 0}))
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        assert!(result.output.contains("at least 1"));
+    }
+
+    #[test]
+    fn resolve_line_range_math() {
+        // Pure math checks, including saturation on absurd inputs.
+        assert_eq!(resolve_line_range(None, None, None), Ok((None, None)));
+        assert_eq!(
+            resolve_line_range(Some(3), None, Some(3)),
+            Ok((Some(3), Some(5)))
+        );
+        assert_eq!(resolve_line_range(None, None, Some(2)), Ok((None, Some(2))));
+        assert_eq!(
+            resolve_line_range(Some(4), Some(9), None),
+            Ok((Some(4), Some(9)))
+        );
+        assert_eq!(
+            resolve_line_range(Some(usize::MAX), None, Some(usize::MAX)),
+            Ok((Some(usize::MAX), Some(usize::MAX - 1))),
+            "absurd inputs saturate instead of overflowing"
+        );
+        assert!(resolve_line_range(Some(1), Some(2), Some(2)).is_err());
+        assert!(resolve_line_range(None, None, Some(0)).is_err());
+    }
+
+    #[test]
+    fn schema_advertises_canonical_names_only() {
+        let tool = ReadFileTool::new("/tmp");
+        let schema = tool.input_schema();
+        let props = schema["properties"].as_object().unwrap();
+        assert!(props.contains_key("path"));
+        assert!(props.contains_key("start_line"));
+        assert!(props.contains_key("end_line"));
+        assert!(props.contains_key("limit"));
+        assert!(!props.contains_key("filePath"));
+        assert!(!props.contains_key("offset"));
+    }
+
+    #[tokio::test]
+    async fn should_hit_cache_when_limit_expresses_same_range_as_end_line() {
+        // limit folds into the canonical (start, end) range BEFORE the
+        // file-state cache is consulted, so an offset+limit request and a
+        // start_line+end_line request for the same lines share one entry.
+        let dir = tempfile::tempdir().unwrap();
+        ten_lines_file(&dir);
+
+        let tool = ReadFileTool::new(dir.path());
+        let cache = Arc::new(FileStateCache::new());
+        let ctx = ctx_with_cache(cache.clone());
+
+        let first = tool
+            .execute_with_context(
+                &ctx,
+                &serde_json::json!({"path": "lines.txt", "offset": 2, "limit": 3}),
+            )
+            .await
+            .unwrap();
+        assert!(first.success);
+        assert!(!first.output.contains("[FILE_UNCHANGED]"));
+
+        let second = tool
+            .execute_with_context(
+                &ctx,
+                &serde_json::json!({"path": "lines.txt", "start_line": 2, "end_line": 4}),
+            )
+            .await
+            .unwrap();
+        assert!(second.success);
+        assert!(
+            second.output.contains("[FILE_UNCHANGED]"),
+            "same canonical range must hit the cache: {}",
+            second.output
+        );
     }
 
     #[tokio::test]

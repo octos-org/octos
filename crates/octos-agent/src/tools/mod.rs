@@ -314,6 +314,13 @@ pub struct ToolContext {
     /// [`SessionScope::workspace`]. See `octos_core::session_scope`
     /// for the contract and migration notes.
     pub session_scope: Option<Arc<SessionScope>>,
+    /// Post-edit formatting (issue #1774): when true, a successful
+    /// `edit_file` / `write_file` / `diff_edit` runs the language formatter
+    /// for the file (rustfmt / prettier / black / gofmt — see
+    /// [`crate::format`]) and echoes the formatted content back in the tool
+    /// result. OFF by default; threaded from
+    /// [`crate::AgentConfig::format_after_edit`].
+    pub format_after_edit: bool,
 }
 
 impl ToolContext {
@@ -340,6 +347,7 @@ impl ToolContext {
             parent_session_key: None,
             spawn_depth: 0,
             session_scope: None,
+            format_after_edit: false,
         }
     }
 }
@@ -468,11 +476,15 @@ pub enum ToolProgress {
 ///
 /// Admission policy (implemented in `agent::execution`):
 /// - If every call in the batch is [`ConcurrencyClass::Safe`], the batch
-///   dispatches in parallel (today's behaviour).
-/// - If *any* call is [`ConcurrencyClass::Exclusive`], the entire batch runs
+///   dispatches in parallel.
+/// - If every call is [`ConcurrencyClass::Exclusive`], the batch runs
 ///   serially in call order. A single error from an exclusive call cancels
 ///   the remaining peers so the LLM sees the cascade instead of continuing
 ///   to mutate state on a doomed path.
+/// - Mixed batches (#1766) run the Safe calls in parallel first, then the
+///   Exclusive calls serially in call order; results are reassembled in the
+///   original call order. See the `agent::execution` module doc for the
+///   pinned visibility and cascade semantics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ConcurrencyClass {
@@ -686,7 +698,11 @@ pub use robot_groups::{RobotToolRegistry, install_registry as install_robot_regi
 // Shared SSRF protection
 pub mod ssrf;
 
+// #1770: structured, model-facing tool-argument validation.
+pub mod args;
+
 // Built-in tools
+pub mod apply_patch;
 pub mod ask_user_question;
 pub mod coding_tools;
 pub mod deep_search;
@@ -702,10 +718,16 @@ pub mod manage_skills;
 pub mod mcp_agent;
 pub mod memory_note;
 pub mod message;
+pub mod peer_close;
+pub mod peer_gather;
+pub mod peer_handoff;
+pub mod peer_list;
+pub mod peer_send_input;
 pub mod read_file;
 pub mod read_task_output;
 pub mod recall_memory;
 pub mod record_memory_use;
+pub(crate) mod replacer;
 pub mod research_utils;
 pub mod save_memory;
 pub mod send_app_card;
@@ -721,6 +743,7 @@ pub mod write_file;
 
 pub mod admin;
 pub mod browser;
+pub mod check;
 pub mod check_background_tasks;
 pub mod check_workspace_contract;
 pub mod mofa_make;
@@ -733,12 +756,12 @@ pub mod git;
 #[cfg(feature = "ast")]
 pub mod code_structure;
 
+pub use apply_patch::ApplyPatchTool;
 pub use ask_user_question::AskUserQuestionTool;
 pub use coding_tools::{
-    ApplyPatchTool, BashTool, CloseAgentTool, DelegateAliasTool, ExecCommandTool,
-    ImageGenerationTool, RequestUserInputTool, ResumeAgentTool, SendInputTool, SpawnAgentTool,
-    ToolCatalogEntry, ToolSearchTool, ToolSuggestTool, UpdatePlanTool, ViewImageTool,
-    WaitAgentTool, WriteStdinTool,
+    BashTool, CloseAgentTool, DelegateAliasTool, ExecCommandTool, ImageGenerationTool,
+    RequestUserInputTool, ResumeAgentTool, SendInputTool, SpawnAgentTool, ToolCatalogEntry,
+    ToolSearchTool, ToolSuggestTool, UpdatePlanTool, ViewImageTool, WaitAgentTool, WriteStdinTool,
 };
 pub use deep_search::DeepSearchTool;
 pub use delegate::{
@@ -761,6 +784,13 @@ pub use mcp_agent::{
 };
 pub use memory_note::MemoryNoteTool;
 pub use message::MessageTool;
+pub use peer_close::{PeerCloseCallback, PeerCloseTool};
+pub use peer_gather::{PeerGatherCallback, PeerGatherTool};
+pub use peer_handoff::{
+    PeerHandoffCallback, PeerHandoffRequest, PeerHandoffStaged, PeerHandoffTool,
+};
+pub use peer_list::{PeerListCallback, PeerListTool};
+pub use peer_send_input::{PeerSendInputCallback, PeerSendInputRequest, PeerSendInputTool};
 pub use read_file::ReadFileTool;
 pub use read_task_output::ReadTaskOutputTool;
 pub use recall_memory::RecallMemoryTool;
@@ -776,6 +806,7 @@ pub use web_search::WebSearchTool;
 pub use write_file::WriteFileTool;
 
 pub use browser::BrowserTool;
+pub use check::CheckTool;
 pub use check_background_tasks::CheckBackgroundTasksTool;
 pub use check_workspace_contract::CheckWorkspaceContractTool;
 pub use mofa_make::{

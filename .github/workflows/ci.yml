@@ -8,6 +8,14 @@ on:
   schedule:
     - cron: "0 10 * * *"
 
+# Cancel a PR's in-flight run when it is superseded by a new push. Without this
+# every amend queues another full matrix behind the old one, and the
+# self-hosted/large runners (ARM, RISC-V) are the ones that back up. Never
+# cancels `main`: those runs gate the release artifacts.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
   CARGO_TERM_COLOR: always
@@ -431,6 +439,11 @@ jobs:
         run: cargo check -p octos-cli --no-default-features --features api,telegram,discord,dingtalk,slack,whatsapp,feishu,email,matrix,audio_mp3
 
   check-arm:
+    # Deliberately NOT on PRs, unlike check-windows: the workspace has ZERO
+    # `cfg(target_arch)` sites, so there is no arch-specific code for this to
+    # catch that the x86 jobs do not already compile — and it costs ~67 min.
+    # It stays on `main` (and the nightly schedule) to catch toolchain- or
+    # dependency-level ARM breakage, which is the real risk here.
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-24.04-arm
     env:
@@ -489,6 +502,10 @@ jobs:
         run: cargo test --workspace --doc
 
   check-riscv:
+    # Push-only for the same reason as check-arm, plus a live problem: this job
+    # has not COMPLETED in recent history — it runs to the 24 h ceiling and is
+    # cancelled (see runs 30087155881, 30025529065). Until that is diagnosed it
+    # must not gate anything; putting it on PRs would wedge every PR for a day.
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-24.04-riscv
     env:
@@ -547,7 +564,27 @@ jobs:
         run: cargo test --workspace --doc
 
   check-windows:
-    if: github.event_name != 'pull_request'
+    # Runs on PRs, unlike its ARM/RISC-V siblings below. The workspace has 42
+    # `cfg(windows)` sites that NEVER compile on the Linux runners every other
+    # PR job uses, so a Windows-only break was invisible until after merge. At
+    # ~15 min it is the cheapest job in the matrix covering code no other PR
+    # check can even see.
+    #
+    # NON-BLOCKING for now, because it is currently RED for a pre-existing
+    # reason: `octos-core` `session_scope` has 2 Windows-only test failures
+    # (5-for-5 on recent `main` runs, long before this job moved to PRs).
+    # Making it blocking today would wedge every PR on a bug it did not
+    # introduce. It still surfaces on the PR, which is the point — a NEW
+    # Windows break is now visible at review time instead of after merge.
+    #
+    # Non-blocking ONLY on PRs. On push to `main` it stays hard-failing, so
+    # `build-windows` (which `needs:` this job) still refuses to ship a Windows
+    # artifact from a red suite — a blanket `continue-on-error: true` would have
+    # silently re-enabled those releases.
+    #
+    # Drop this line entirely once the two tests are fixed; see the tracking
+    # note in `crates/octos-core/src/session_scope.rs`.
+    continue-on-error: ${{ github.event_name == 'pull_request' }}
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v6

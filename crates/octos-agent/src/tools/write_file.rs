@@ -44,7 +44,13 @@ impl WriteFileTool {
 }
 
 #[derive(Debug, Deserialize)]
+// #1770: unknown keys are usually a typo of a real parameter; rejecting
+// them (with a did-you-mean via `args::parse_tool_args`) lets the model
+// self-correct instead of silently dropping its intent.
+#[serde(deny_unknown_fields)]
 struct WriteFileInput {
+    /// #1767: `filePath` is the industry-convention alias.
+    #[serde(alias = "filePath")]
     path: String,
     content: String,
 }
@@ -76,7 +82,7 @@ impl Tool for WriteFileTool {
             "properties": {
                 "path": {
                     "type": "string",
-                    "description": "Path to the file to write"
+                    "description": "Path to the file to write (alias: filePath)"
                 },
                 "content": {
                     "type": "string",
@@ -100,7 +106,7 @@ impl Tool for WriteFileTool {
         args: &serde_json::Value,
     ) -> Result<ToolResult> {
         let input: WriteFileInput =
-            serde_json::from_value(args.clone()).wrap_err("invalid write_file tool input")?;
+            super::args::parse_tool_args(self.name(), &self.input_schema(), args)?;
 
         if !self.file_access.allows_write() {
             return Ok(ToolResult {
@@ -160,6 +166,15 @@ impl Tool for WriteFileTool {
             return Ok(super::file_io_error(e, &input.path));
         }
 
+        // #1774: opt-in post-edit formatting. Runs BEFORE cache invalidation
+        // and the git snapshot so both observe the final on-disk content.
+        // Best-effort by contract — a formatter failure never fails the write.
+        let format_note = if ctx.format_after_edit {
+            crate::format::post_edit_format_note(&path, &input.content).await
+        } else {
+            None
+        };
+
         // M8.4: invalidate any stale cache entry for this path — the file's
         // contents (and mtime) just changed, so previous reads must not serve
         // a [FILE_UNCHANGED] stub on the next read.
@@ -179,7 +194,12 @@ impl Tool for WriteFileTool {
 
         let line_count = input.content.lines().count();
         Ok(ToolResult {
-            output: format!("Successfully wrote {} lines to {}", line_count, input.path),
+            output: format!(
+                "Successfully wrote {} lines to {}{}",
+                line_count,
+                input.path,
+                format_note.unwrap_or_default()
+            ),
             success: true,
             file_modified: Some(path),
             ..Default::default()
@@ -214,6 +234,36 @@ mod tests {
         assert!(result.output.contains("Successfully wrote"));
         let content = std::fs::read_to_string(dir.path().join("new.txt")).unwrap();
         assert_eq!(content, "hello world\n");
+    }
+
+    #[tokio::test]
+    async fn should_accept_file_path_alias_for_path() {
+        // #1767: `filePath` is the industry-convention alias for `path`.
+        let dir = tempfile::tempdir().unwrap();
+        let tool = WriteFileTool::new(dir.path());
+
+        let result = tool
+            .execute(&serde_json::json!({"filePath": "aliased.txt", "content": "via alias\n"}))
+            .await
+            .unwrap();
+
+        assert!(
+            result.success,
+            "filePath alias must work: {}",
+            result.output
+        );
+        let content = std::fs::read_to_string(dir.path().join("aliased.txt")).unwrap();
+        assert_eq!(content, "via alias\n");
+    }
+
+    #[test]
+    fn schema_advertises_canonical_names_only() {
+        let tool = WriteFileTool::new("/tmp");
+        let schema = tool.input_schema();
+        let props = schema["properties"].as_object().unwrap();
+        assert!(props.contains_key("path"));
+        assert!(props.contains_key("content"));
+        assert!(!props.contains_key("filePath"));
     }
 
     #[tokio::test]
@@ -489,6 +539,75 @@ mod tests {
             .unwrap();
         assert!(!bad.success);
         assert!(bad.output.contains("outside working directory"));
+    }
+
+    // -----------------------------------------------------------------------
+    // #1774: post-edit formatting integration.
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn should_not_append_note_for_non_code_file_when_formatting_enabled() {
+        // Deterministic (no formatter binary involved): a .txt file has no
+        // mapped formatter, so even with the flag ON the output carries no
+        // note and the bytes are exactly as written.
+        let dir = tempfile::tempdir().unwrap();
+        let tool = WriteFileTool::new(dir.path());
+        let mut ctx = ToolContext::zero();
+        ctx.format_after_edit = true;
+
+        let result = tool
+            .execute_with_context(
+                &ctx,
+                &serde_json::json!({"path": "notes.txt", "content": "plain  text\n"}),
+            )
+            .await
+            .unwrap();
+        assert!(result.success);
+        assert!(!result.output.contains("reformatted"));
+        assert!(!result.output.contains("Note:"));
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("notes.txt")).unwrap(),
+            "plain  text\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn should_format_written_file_when_format_after_edit_enabled() {
+        if !crate::format::binary_on_path("rustfmt") {
+            eprintln!("skipping: rustfmt not on PATH");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let tool = WriteFileTool::new(dir.path());
+        let mut ctx = ToolContext::zero();
+        ctx.format_after_edit = true;
+
+        let result = tool
+            .execute_with_context(
+                &ctx,
+                &serde_json::json!({
+                    "path": "gen.rs",
+                    "content": "fn main(){let x=1;println!(\"{}\",x);}\n",
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(result.success, "write must succeed: {}", result.output);
+        assert!(
+            result.output.contains("reformatted"),
+            "output must state the file was reformatted: {}",
+            result.output
+        );
+        assert!(
+            result.output.contains("fn main() {"),
+            "output must echo the formatted content: {}",
+            result.output
+        );
+        let on_disk = std::fs::read_to_string(dir.path().join("gen.rs")).unwrap();
+        assert!(
+            on_disk.contains("fn main() {"),
+            "file must be rustfmt-formatted on disk: {on_disk}"
+        );
     }
 
     #[tokio::test]

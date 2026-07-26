@@ -41,6 +41,12 @@ pub(super) struct StreamTimeouts {
     pub overall_max_secs: u64,
 }
 
+/// #1507: shown in place of suppressed repetitive output. The content must
+/// never become `None` here — the `EndTurn` consumer renders
+/// `content.unwrap_or_default()`, so `None` surfaced as a completely blank
+/// assistant bubble with no hint that anything was suppressed.
+pub(super) const REPETITIVE_OUTPUT_MESSAGE: &str = "The model got stuck repeating itself, so the repetitive output was suppressed. Please try again or rephrase the request.";
+
 impl Agent {
     /// Wait until the shutdown flag is set. Used with `tokio::select!`
     /// to cancel long-running operations on Ctrl+C.
@@ -501,14 +507,16 @@ impl Agent {
         }
 
         // Detect repetitive/looping output -- model got stuck repeating itself.
-        // Replace with a short message so the user sees something useful.
+        // Replace with a short message so the user sees something useful
+        // (#1507: this used to set `None`, which the EndTurn consumer rendered
+        // as a completely blank assistant reply).
         let content = if let Some(ref text) = content {
             if Self::is_repetitive_output(text) {
                 tracing::warn!(
                     content_len = text.len(),
                     "detected repetitive LLM output, replacing with error message"
                 );
-                None
+                Some(REPETITIVE_OUTPUT_MESSAGE.to_string())
             } else {
                 content
             }
@@ -945,6 +953,34 @@ mod tests {
         assert!(streamed);
         assert_eq!(response.content.as_deref(), Some("Hello, fast world!"));
         assert_eq!(response.stop_reason, StopReason::EndTurn);
+    }
+
+    #[tokio::test]
+    async fn repetitive_output_is_replaced_with_message_not_none() {
+        // #1507: suppressed repetitive output used to become `content: None`,
+        // which the EndTurn consumer rendered as a completely blank assistant
+        // bubble. The user must see a short explanatory message instead.
+        let (agent, _dir) = build_test_agent().await;
+
+        // A >=20-char phrase repeated enough that the last 500 chars are pure
+        // repeats — trips `is_repetitive_output` (pattern seen 4+ times).
+        let phrase = "I will now check the file once more. ";
+        let repetitive: String = phrase.repeat(20);
+        let stream = into_chat_stream(vec![
+            StreamEvent::TextDelta(repetitive),
+            StreamEvent::Done(StopReason::EndTurn),
+        ]);
+
+        let (response, _streamed) = agent
+            .consume_stream_for_test(stream, 1, 0, test_thresholds(1))
+            .await
+            .expect("repetitive stream still completes");
+        assert_eq!(response.stop_reason, StopReason::EndTurn);
+        assert_eq!(
+            response.content.as_deref(),
+            Some(super::REPETITIVE_OUTPUT_MESSAGE),
+            "suppression must yield the explanatory message, never None/blank"
+        );
     }
 
     #[tokio::test]

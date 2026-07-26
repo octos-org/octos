@@ -1455,7 +1455,7 @@ mod tests {
     /// Create a temporary ProfileStore backed by a real temp directory.
     fn temp_profile_store() -> (tempfile::TempDir, Arc<ProfileStore>) {
         let dir = tempfile::tempdir().expect("failed to create temp dir");
-        let store = ProfileStore::open(dir.path()).expect("failed to open profile store");
+        let store = ProfileStore::open_unified(dir.path()).expect("failed to open profile store");
         (dir, Arc::new(store))
     }
 

@@ -130,6 +130,8 @@ pub enum AgentMessage {           // tagged: "type", snake_case
 }
 ```
 
+This tagged enum is the **sub-agent** coordination channel. **Peers** coordinate differently — through sovereign sessions and a file blackboard rather than in-band messages; see [Sub-Agents & Peers](#sub-agents--peers).
+
 ### Error System
 
 ```rust
@@ -1435,7 +1437,11 @@ LLM response: [web_search, read_file, send_email]
                     Next LLM call
 ```
 
-### Sub-Agent Modes (spawn tool)
+### Sub-Agents & Peers
+
+octos supports two multi-agent shapes with opposite ownership models.
+
+**Sub-agents** (`spawn` tool) are children of the current turn:
 
 | Aspect | Sync | Background |
 |--------|------|------------|
@@ -1445,6 +1451,8 @@ LLM response: [web_search, read_file, send_email]
 | Use case | Sequential pipelines | Fire-and-forget long tasks |
 
 Sub-agents cannot spawn further sub-agents (spawn tool is always denied in sub-agent policy).
+
+**Peers** (`peer_handoff` / `peer_send_input` / `peer_gather` / `peer_list` / `peer_close` tools) are *sovereign sessions*, not children: a peer has its own durable brief, workspace, `session/open` + `turn/start` lifecycle, and `peers/<slug>/result.md` output, and it survives the originating turn (closing only on client disconnect). Peers are staged on disk (`peer/prepare` stages a 1–8 fleet), tracked live in a process-global peer wire registry (`{profile}:peer:{slug}` → session), and coordinate only through the file blackboard read by `peer_gather` — they never share context in-band. `peer_send_input` reaches a running peer through the gateway actor inbox (gateway) or a durable, persisted **continuation queue** drained ~2 s per-connection / 5 s globally (serve); delivery is **best-effort, single-user**, guarded by an originator check (fail-closed), a depth-1 rail (peers cannot hand off or inject), a 4-handoff-per-turn cap, and a redelivery cap (5 attempts, sequence-advanced so a stuck injection cannot starve newer work). See [Multi-Agent Orchestration](./multi-agent.md) for the full model, delivery path, and known limitations.
 
 ### Multi-Tenant Dashboard
 

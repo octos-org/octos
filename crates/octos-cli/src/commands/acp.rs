@@ -329,6 +329,8 @@ impl AcpSharedStores {
             save_episodes: true,
             chat_max_tokens: config.gateway.as_ref().and_then(|g| g.max_output_tokens),
             reasoning_effort: config.gateway.as_ref().and_then(|g| g.reasoning_effort),
+            // #1774: opt-in post-edit formatting (rustfmt/prettier/black/gofmt).
+            format_after_edit: config.format_after_edit,
             ..Default::default()
         };
 

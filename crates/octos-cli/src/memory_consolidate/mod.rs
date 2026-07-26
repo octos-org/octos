@@ -924,7 +924,7 @@ pub async fn run_consolidation(
         }
     }
 
-    // Confirmed pendings: restore every unconfirmed interim candidate
+    // Confirmed pending entries: restore every unconfirmed interim candidate
     // byte-identically and schedule the note files for deletion.
     for (entry_id, block) in &restores {
         if working.iter().any(|e| e.id == *entry_id) {

@@ -145,7 +145,7 @@ impl Updater {
     /// Download and install a release. Returns the update result on success.
     pub async fn update(&self, release: &ReleaseInfo) -> Result<UpdateResult> {
         let old_version = env!("CARGO_PKG_VERSION").to_string();
-        let tmp_dir = std::env::temp_dir().join(format!("octos-update-{}", &release.tag));
+        let tmp_dir = std::env::temp_dir().join(format!("octos-update-{}", release.tag));
 
         // Clean up any previous attempt
         if tmp_dir.exists() {
