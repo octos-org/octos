@@ -614,6 +614,13 @@ pub struct EmbeddingConfig {
     /// output differs or its vectors are dropped to BM25-only.
     #[serde(default)]
     pub dimensions: Option<u32>,
+
+    /// Path to the local `.gguf` file for the in-process `llamacpp` provider
+    /// (feature `embed-llama`; add `embed-llama-metal` / `embed-llama-cuda` to
+    /// offload). Any GGUF embedding model works, e.g.
+    /// `ggml-org/embeddinggemma-300M-GGUF`. Ignored by remote providers.
+    #[serde(default)]
+    pub model_path: Option<String>,
 }
 
 fn default_embedding_provider() -> String {

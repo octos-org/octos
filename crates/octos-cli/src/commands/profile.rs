@@ -331,6 +331,7 @@ mod tests {
             base_url: Some("https://dashscope.aliyuncs.com/compatible-mode/v1".into()),
             model: Some("text-embedding-v4".into()),
             dimensions: None,
+            model_path: None,
         });
         config
             .env_vars

@@ -31,6 +31,7 @@ members = [
     "crates/octos-plugin",
     "crates/octos-sandbox",
     "crates/octos-swarm",
+    "crates/octos-embed-llama",
 ]
 
 [workspace.package]
@@ -59,6 +60,7 @@ octos-services = { path = "crates/octos-services" }
 octos-pipeline = { path = "crates/octos-pipeline" }
 octos-plugin = { path = "crates/octos-plugin" }
 octos-swarm = { path = "crates/octos-swarm" }
+octos-embed-llama = { path = "crates/octos-embed-llama" }
 
 # codex-rs crates (reused)
 codex-execpolicy = { git = "https://github.com/openai/codex", path = "codex-rs/execpolicy" }
