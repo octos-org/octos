@@ -142,8 +142,11 @@ mod tests {
 
     use super::*;
 
-    fn tool_with_recorder() -> (PeerGatherTool, Arc<Mutex<Vec<Option<Vec<String>>>>>) {
-        let seen: Arc<Mutex<Vec<Option<Vec<String>>>>> = Arc::new(Mutex::new(Vec::new()));
+    /// Every `slugs` argument the tool was invoked with, in call order.
+    type SeenSlugs = Arc<Mutex<Vec<Option<Vec<String>>>>>;
+
+    fn tool_with_recorder() -> (PeerGatherTool, SeenSlugs) {
+        let seen: SeenSlugs = Arc::new(Mutex::new(Vec::new()));
         let seen_cb = seen.clone();
         let tool = PeerGatherTool::new(Arc::new(move |slugs: Option<Vec<String>>| {
             seen_cb.lock().unwrap().push(slugs.clone());

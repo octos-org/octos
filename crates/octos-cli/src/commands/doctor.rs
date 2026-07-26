@@ -332,9 +332,9 @@ fn build_report(cmd: &DoctorCommand, with_network: bool) -> Result<Report> {
     Ok(report)
 }
 
-/// Network category (Stage 2, `github` feature): GitHub API reachability + a
-/// best-effort newer-release check. Both are advisory — a network/API failure
-/// produces a `[!]` WARN, never a `[✗]` FAIL, so `doctor` never blocks offline.
+// Network category (Stage 2, `github` feature): GitHub API reachability + a
+// best-effort newer-release check. Both are advisory — a network/API failure
+// produces a `[!]` WARN, never a `[✗]` FAIL, so `doctor` never blocks offline.
 // ---------------------------------------------------------------------------
 // Installations — every octos + octos-tui on the machine, with versions
 // ---------------------------------------------------------------------------
