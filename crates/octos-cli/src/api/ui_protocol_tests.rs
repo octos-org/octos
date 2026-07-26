@@ -25490,6 +25490,7 @@ fn peer_close_callback_writes_marker_for_owner_only() {
         peers_root.clone(),
         "tenant-a:api:intruder".to_owned(),
         "tenant-a".to_owned(),
+        Arc::new(|_event: PeerClosedEvent| {}),
     );
     let err = intruder(slug.to_owned()).expect_err("non-owner must be rejected");
     assert!(err.contains("not the owner"), "reason: {err}");
@@ -25499,8 +25500,12 @@ fn peer_close_callback_writes_marker_for_owner_only() {
     );
 
     // The owner closes → durable marker written, body carries the closer id.
-    let close =
-        build_peer_close_callback(peers_root.clone(), owner.to_owned(), "tenant-a".to_owned());
+    let close = build_peer_close_callback(
+        peers_root.clone(),
+        owner.to_owned(),
+        "tenant-a".to_owned(),
+        Arc::new(|_event: PeerClosedEvent| {}),
+    );
     let msg = close(slug.to_owned()).expect("owner closes");
     assert!(msg.contains("closed"), "confirmation: {msg}");
     assert!(peer_is_closed(&peers_root, slug), "marker is durable");
@@ -25522,6 +25527,51 @@ fn peer_close_callback_writes_marker_for_owner_only() {
     // A traversal identifier is rejected at resolve (never joined as a path).
     let bad = close("../escape".to_owned()).expect_err("unsafe identifier rejected");
     assert!(bad.contains("no peer named"), "reason: {bad}");
+}
+
+/// A SUCCESSFUL `peer_close` emits exactly one durable `peer/closed` event
+/// stamped with the ORIGINATING (owner) session, the closed peer's topic
+/// (`peer-<slug>`), its slug, and the profile — mirroring the `peer/staged`
+/// emit. A REJECTED close (unstaged / unauthorized) emits nothing.
+#[test]
+fn peer_close_callback_emits_closed_event_on_success_only() {
+    let tmp = tempfile::tempdir().unwrap();
+    let peers_root = tmp.path().join("peers");
+    let slug = "wrap-up";
+    std::fs::create_dir_all(peers_root.join(slug)).unwrap();
+    std::fs::write(peers_root.join(slug).join("brief.md"), "work").unwrap();
+    let owner = "tenant-a:api:master";
+    std::fs::write(peers_root.join(slug).join("originator"), owner).unwrap();
+
+    let emitted: Arc<StdMutex<Vec<PeerClosedEvent>>> = Arc::new(StdMutex::new(Vec::new()));
+    let sink = emitted.clone();
+    let close = build_peer_close_callback(
+        peers_root.clone(),
+        owner.to_owned(),
+        "tenant-a".to_owned(),
+        Arc::new(move |event| sink.lock().unwrap().push(event)),
+    );
+
+    // A rejected close (peer was never staged) emits nothing.
+    close("no-such-peer".to_owned()).expect_err("unstaged peer rejected");
+    assert!(
+        emitted.lock().unwrap().is_empty(),
+        "a rejected close emits no peer/closed event"
+    );
+
+    // The owner closes → exactly one durable peer/closed event.
+    close(slug.to_owned()).expect("owner closes");
+    let events = emitted.lock().unwrap();
+    assert_eq!(events.len(), 1, "one peer/closed per successful close");
+    let event = &events[0];
+    assert_eq!(
+        event.session_id,
+        octos_core::SessionKey(owner.to_owned()),
+        "event routes to the ORIGINATING (owner) session"
+    );
+    assert_eq!(event.topic, format!("peer-{slug}"), "closed peer's topic");
+    assert_eq!(event.slug, slug);
+    assert_eq!(event.profile_id, "tenant-a");
 }
 
 /// PART C — a NAMED peer reserves the exact name-derived slug, stores the
@@ -25672,7 +25722,12 @@ fn peer_close_by_name_cancels_pending_injection_for_right_peer() {
 
     // Close BY DISPLAY NAME (case-insensitive) → the RIGHT peer closes, its
     // pending injection is cancelled, and the sibling is untouched.
-    let close = build_peer_close_callback(peers.clone(), owner.to_owned(), profile_id.to_owned());
+    let close = build_peer_close_callback(
+        peers.clone(),
+        owner.to_owned(),
+        profile_id.to_owned(),
+        Arc::new(|_event: PeerClosedEvent| {}),
+    );
     let msg = close("EDISON".to_owned()).expect("close by name");
     assert!(msg.contains("edison"), "confirmation names the slug: {msg}");
     assert!(peer_is_closed(&peers, "edison"), "the named peer is closed");
@@ -25715,7 +25770,12 @@ fn symlinked_peer_entry_is_not_resolved_or_written() {
         "a symlinked entry is not a blackboard row"
     );
     // peer_close cannot resolve (hence cannot write a marker) through the link.
-    let close = build_peer_close_callback(peers.clone(), "owner".to_owned(), "prof".to_owned());
+    let close = build_peer_close_callback(
+        peers.clone(),
+        "owner".to_owned(),
+        "prof".to_owned(),
+        Arc::new(|_event: PeerClosedEvent| {}),
+    );
     let err = close("Edison".to_owned()).expect_err("symlinked peer must not resolve/close");
     assert!(err.contains("no peer named"), "reason: {err}");
 

@@ -1221,6 +1221,11 @@ pub mod methods {
     /// the background. `session_id` is the ORIGINATING session; replayed on
     /// reconnect, so clients dedup by existing session.
     pub const PEER_STAGED: &str = "peer/staged";
+    /// `peer/closed` — the model's `peer_close` tool tore down a staged peer
+    /// session (durable brief + optional fenced worktree evicted). Mirrors
+    /// [`PEER_STAGED`]: `session_id` is the ORIGINATING session; durable so
+    /// reconnect replay redelivers it, and clients dedup by the closed peer.
+    pub const PEER_CLOSED: &str = "peer/closed";
 }
 
 /// Reason codes for `approval/cancelled` notifications. The registry is
@@ -1339,6 +1344,7 @@ pub const UI_PROTOCOL_NOTIFICATION_METHODS: &[&str] = &[
     methods::CONTEXT_COMPACTION_STARTED,
     methods::CONTEXT_NORMALIZATION_REPORTED,
     methods::PEER_STAGED,
+    methods::PEER_CLOSED,
 ];
 
 /// Request methods currently handled by the first server/runtime slice.
@@ -6156,6 +6162,26 @@ pub struct PeerStagedEvent {
     pub profile_id: String,
 }
 
+/// `peer/closed` — the model's `peer_close` tool tore down a staged peer
+/// session: the durable brief (and optional fenced worktree) were evicted
+/// server-side, so the user's client should close the peer pane it opened
+/// for `topic`. Mirrors [`PeerStagedEvent`]: routing keys off `session_id`
+/// (the ORIGINATING session), and `topic` (`peer-<slug>`) is the closed
+/// peer's session topic carried as a payload field.
+///
+/// Durable (ledger-appended): reconnect replay redelivers the event.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PeerClosedEvent {
+    /// The ORIGINATING session (the conversation whose turn closed the peer).
+    pub session_id: SessionKey,
+    /// Topic of the closed peer session the client tears down (`peer-<slug>`).
+    pub topic: String,
+    /// Directory slug that was reserved under the profile's `peers/` root.
+    pub slug: String,
+    /// Profile the peer session ran under.
+    pub profile_id: String,
+}
+
 /// Draft notification payloads for UI protocol v1.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[allow(clippy::large_enum_variant)]
@@ -6246,6 +6272,9 @@ pub enum UiNotification {
     /// session (durable brief + optional fenced worktree); the client opens
     /// the staged session in the background. See [`PeerStagedEvent`].
     PeerStaged(PeerStagedEvent),
+    /// The model's `peer_close` tool tore down a staged peer session; the
+    /// client closes the peer pane it opened. See [`PeerClosedEvent`].
+    PeerClosed(PeerClosedEvent),
     /// UPCR-2026-014 (M9-γ) canonical projection envelope (`projection/envelope`).
     /// Spec § 14. Capability-gated on `projection.envelope.v1`; the
     /// per-connection live filter keeps legacy and envelope deliveries
@@ -6319,6 +6348,7 @@ impl UiNotification {
             Self::ContextNormalizationReported(_) => methods::CONTEXT_NORMALIZATION_REPORTED,
             Self::SessionOrchestration(_) => methods::SESSION_ORCHESTRATION,
             Self::PeerStaged(_) => methods::PEER_STAGED,
+            Self::PeerClosed(_) => methods::PEER_CLOSED,
             Self::Envelope(_) => methods::PROJECTION_ENVELOPE,
             Self::EnvelopeV2(_) => methods::PROJECTION_ENVELOPE,
         }
@@ -6370,6 +6400,7 @@ impl UiNotification {
             Self::ContextNormalizationReported(event) => &event.session_id,
             Self::SessionOrchestration(event) => &event.session_id,
             Self::PeerStaged(event) => &event.session_id,
+            Self::PeerClosed(event) => &event.session_id,
             Self::Envelope(event) => &event.session_id,
             Self::EnvelopeV2(event) => &event.session_id,
         }
@@ -6530,6 +6561,7 @@ impl UiNotification {
             // `stamp_topic_from_session` catch-all above leaves it alone,
             // and routing keys off `session_id` (the originating session).
             Self::PeerStaged(params) => serde_json::to_value(params),
+            Self::PeerClosed(params) => serde_json::to_value(params),
             // UPCR-2026-014 (M9-γ) + feat(envelope-wire-routing): the wire
             // shape per spec § 14.1 is the bare `Envelope` fields FLATTENED
             // with the routing keys `session_id` (the bare base key) +
@@ -6674,6 +6706,7 @@ impl UiNotification {
                 Ok(Self::SessionOrchestration(decode_params(method, params)?))
             }
             methods::PEER_STAGED => Ok(Self::PeerStaged(decode_params(method, params)?)),
+            methods::PEER_CLOSED => Ok(Self::PeerClosed(decode_params(method, params)?)),
             // UPCR-2026-014 (M9-γ) + feat(envelope-wire-routing): decode
             // the FLATTENED wire frame — bare Envelope keys plus the
             // routing keys `session_id` + `topic`. Backward-compatible:

@@ -2882,6 +2882,7 @@ fn notification_session_id(notification: &UiNotification) -> &SessionKey {
         UiNotification::ContextNormalizationReported(event) => &event.session_id,
         UiNotification::SessionOrchestration(event) => &event.session_id,
         UiNotification::PeerStaged(event) => &event.session_id,
+        UiNotification::PeerClosed(event) => &event.session_id,
         UiNotification::UserQuestionRequested(event) => &event.session_id,
         UiNotification::Envelope(event) => &event.session_id,
         UiNotification::EnvelopeV2(event) => &event.session_id,

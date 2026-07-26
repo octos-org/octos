@@ -33,17 +33,18 @@ use octos_core::ui_protocol::{
     ContextNormalizationReportedEvent, CronListParams, CronToggleParams, EnvelopeTokenUsage,
     EnvelopeV2, EnvelopeV2Notification, FileRef, HydratedMessage, HydratedTurn, InputItem,
     MemoryEntityParams, MemoryOverviewParams, MessageDeltaEvent, MessageMeta, OutputCursor,
-    Payload, PayloadV2, PeerStagedEvent, ReplayLossyEvent, RpcError, RpcErrorResponse, RpcRequest,
-    RpcResponse, SESSION_HYDRATE_INCLUDE_MAX, SESSION_MESSAGES_PAGE_DEFAULT_LIMIT,
-    SESSION_MESSAGES_PAGE_MAX_LIMIT, SESSION_MESSAGES_PAGE_MAX_OFFSET, SESSION_TITLE_SET_MAX_CHARS,
-    SessionBtwParams, SessionDeleteParams, SessionFilesListParams, SessionHydrateParams,
-    SessionHydrateResult, SessionListParams, SessionMessagesPageParams, SessionOpenParams,
-    SessionOpenResult, SessionOpened, SessionOrchestrationEvent, SessionRollbackParams,
-    SessionRollbackResult, SessionSnapshotParams, SessionStatusGetParams, SessionTasksListParams,
-    SessionTitleSetParams, SessionWorkspaceGetParams, SystemStatusGetParams,
-    TaskArtifactListParams, TaskArtifactListResult, TaskArtifactReadParams, TaskArtifactReadResult,
-    TaskArtifactRecord, TaskCancelParams, TaskCancelResult, TaskListEntry, TaskListParams,
-    TaskListResult, TaskOutputDeltaEvent, TaskRestartFromNodeParams, TaskRestartFromNodeResult,
+    Payload, PayloadV2, PeerClosedEvent, PeerStagedEvent, ReplayLossyEvent, RpcError,
+    RpcErrorResponse, RpcRequest, RpcResponse, SESSION_HYDRATE_INCLUDE_MAX,
+    SESSION_MESSAGES_PAGE_DEFAULT_LIMIT, SESSION_MESSAGES_PAGE_MAX_LIMIT,
+    SESSION_MESSAGES_PAGE_MAX_OFFSET, SESSION_TITLE_SET_MAX_CHARS, SessionBtwParams,
+    SessionDeleteParams, SessionFilesListParams, SessionHydrateParams, SessionHydrateResult,
+    SessionListParams, SessionMessagesPageParams, SessionOpenParams, SessionOpenResult,
+    SessionOpened, SessionOrchestrationEvent, SessionRollbackParams, SessionRollbackResult,
+    SessionSnapshotParams, SessionStatusGetParams, SessionTasksListParams, SessionTitleSetParams,
+    SessionWorkspaceGetParams, SystemStatusGetParams, TaskArtifactListParams,
+    TaskArtifactListResult, TaskArtifactReadParams, TaskArtifactReadResult, TaskArtifactRecord,
+    TaskCancelParams, TaskCancelResult, TaskListEntry, TaskListParams, TaskListResult,
+    TaskOutputDeltaEvent, TaskRestartFromNodeParams, TaskRestartFromNodeResult,
     TaskRuntimeState as UiTaskRuntimeState, TaskUpdatedEvent, ThreadGraphEntry,
     ThreadGraphGetParams, ThreadGraphGetResult, ToolCompletedEvent, ToolProgressEvent,
     ToolStartedEvent, TurnCompletedEvent, TurnErrorEvent, TurnId, TurnInterruptParams,
@@ -10999,6 +11000,7 @@ fn build_peer_close_callback(
     peers_root: PathBuf,
     origin_session: String,
     profile_id: String,
+    emit_closed: Arc<dyn Fn(PeerClosedEvent) + Send + Sync>,
 ) -> octos_agent::PeerCloseCallback {
     Arc::new(move |ident: String| {
         // Resolve the identifier (peer NAME or slug) to the actual slug BEFORE
@@ -11070,6 +11072,16 @@ fn build_peer_close_callback(
         if let Some(wire) = peer_wire_registry().resolve(&key) {
             evict_peer_wire_session(&wire);
         }
+        // Close succeeded (marker durable, queue cleared, wire evicted). Emit
+        // the durable `peer/closed` so the client tears down the peer pane it
+        // opened. Mirrors the `peer/staged` emit — routing keys off the
+        // ORIGINATING session; `topic` (`peer-<slug>`) is the closed peer's.
+        emit_closed(PeerClosedEvent {
+            session_id: SessionKey(origin_session.clone()),
+            topic: format!("peer-{slug}"),
+            slug: slug.clone(),
+            profile_id: profile_id.clone(),
+        });
         Ok(format!(
             "peer '{slug}' closed — it will receive no further input"
         ))
@@ -25414,10 +25426,23 @@ async fn run_standalone_turn(
             // authorized, never on peer sessions). Captures the same
             // peers-root / origin-session / profile-id the send_input callback
             // does (fresh values — those bindings moved into the closure above).
+            let close_ws = ws.clone();
+            let close_ledger = ledger.clone();
+            // Durable `peer/closed` — mirrors the `peer/staged` emit so a
+            // briefly-disconnected client still tears down the peer on replay.
+            let emit_closed: Arc<dyn Fn(PeerClosedEvent) + Send + Sync> =
+                Arc::new(move |event: PeerClosedEvent| {
+                    let _ = send_notification_durable(
+                        &close_ws,
+                        &close_ledger,
+                        UiNotification::PeerClosed(event),
+                    );
+                });
             let close = build_peer_close_callback(
                 session_runtime.profile.data_dir.join("peers"),
                 session_id.to_string(),
                 session_runtime.profile.profile_id.clone(),
+                emit_closed,
             );
             tool_registry.register(octos_agent::PeerCloseTool::new(close));
         }
@@ -31199,6 +31224,9 @@ fn ledger_event_cursor(event: &UiProtocolLedgerEvent) -> Option<UiCursor> {
             // cwd / branch), not a replay cursor; the durable ledger cursor
             // on the surrounding LedgeredUiProtocolEvent is authoritative.
             | UiNotification::PeerStaged(_)
+            // peer/closed likewise carries only teardown facts (slug / topic),
+            // not a replay cursor — same authoritative-ledger-cursor rule.
+            | UiNotification::PeerClosed(_)
             // UPCR-2026-014 M9-γ: envelopes carry their OWN per-thread
             // `seq` allocated by `ThreadSeqAllocator`, not the per-session
             // `UiCursor` the legacy ledger replay uses. The durable
