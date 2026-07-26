@@ -33,17 +33,18 @@ use octos_core::ui_protocol::{
     ContextNormalizationReportedEvent, CronListParams, CronToggleParams, EnvelopeTokenUsage,
     EnvelopeV2, EnvelopeV2Notification, FileRef, HydratedMessage, HydratedTurn, InputItem,
     MemoryEntityParams, MemoryOverviewParams, MessageDeltaEvent, MessageMeta, OutputCursor,
-    Payload, PayloadV2, PeerStagedEvent, ReplayLossyEvent, RpcError, RpcErrorResponse, RpcRequest,
-    RpcResponse, SESSION_HYDRATE_INCLUDE_MAX, SESSION_MESSAGES_PAGE_DEFAULT_LIMIT,
-    SESSION_MESSAGES_PAGE_MAX_LIMIT, SESSION_MESSAGES_PAGE_MAX_OFFSET, SESSION_TITLE_SET_MAX_CHARS,
-    SessionBtwParams, SessionDeleteParams, SessionFilesListParams, SessionHydrateParams,
-    SessionHydrateResult, SessionListParams, SessionMessagesPageParams, SessionOpenParams,
-    SessionOpenResult, SessionOpened, SessionOrchestrationEvent, SessionRollbackParams,
-    SessionRollbackResult, SessionSnapshotParams, SessionStatusGetParams, SessionTasksListParams,
-    SessionTitleSetParams, SessionWorkspaceGetParams, SystemStatusGetParams,
-    TaskArtifactListParams, TaskArtifactListResult, TaskArtifactReadParams, TaskArtifactReadResult,
-    TaskArtifactRecord, TaskCancelParams, TaskCancelResult, TaskListEntry, TaskListParams,
-    TaskListResult, TaskOutputDeltaEvent, TaskRestartFromNodeParams, TaskRestartFromNodeResult,
+    Payload, PayloadV2, PeerClosedEvent, PeerStagedEvent, ReplayLossyEvent, RpcError,
+    RpcErrorResponse, RpcRequest, RpcResponse, SESSION_HYDRATE_INCLUDE_MAX,
+    SESSION_MESSAGES_PAGE_DEFAULT_LIMIT, SESSION_MESSAGES_PAGE_MAX_LIMIT,
+    SESSION_MESSAGES_PAGE_MAX_OFFSET, SESSION_TITLE_SET_MAX_CHARS, SessionBtwParams,
+    SessionDeleteParams, SessionFilesListParams, SessionHydrateParams, SessionHydrateResult,
+    SessionListParams, SessionMessagesPageParams, SessionOpenParams, SessionOpenResult,
+    SessionOpened, SessionOrchestrationEvent, SessionRollbackParams, SessionRollbackResult,
+    SessionSnapshotParams, SessionStatusGetParams, SessionTasksListParams, SessionTitleSetParams,
+    SessionWorkspaceGetParams, SystemStatusGetParams, TaskArtifactListParams,
+    TaskArtifactListResult, TaskArtifactReadParams, TaskArtifactReadResult, TaskArtifactRecord,
+    TaskCancelParams, TaskCancelResult, TaskListEntry, TaskListParams, TaskListResult,
+    TaskOutputDeltaEvent, TaskRestartFromNodeParams, TaskRestartFromNodeResult,
     TaskRuntimeState as UiTaskRuntimeState, TaskUpdatedEvent, ThreadGraphEntry,
     ThreadGraphGetParams, ThreadGraphGetResult, ToolCompletedEvent, ToolProgressEvent,
     ToolStartedEvent, TurnCompletedEvent, TurnErrorEvent, TurnId, TurnInterruptParams,
@@ -70,7 +71,8 @@ use octos_core::ui_protocol::{
     progress_kinds, thread_status,
 };
 use octos_core::{
-    AgentId, InboundMessage, MAIN_PROFILE_ID, Message, MessageRole, SessionKey, TaskId,
+    AgentId, InboundMessage, MAIN_PROFILE_ID, Message, MessageOrigin, MessageRole, SessionKey,
+    TaskId,
 };
 use octos_llm::pricing::model_pricing;
 use serde::{Deserialize, Serialize};
@@ -1963,6 +1965,352 @@ fn session_workspaces() -> Arc<SessionWorkspaceStore> {
     SESSION_WORKSPACES
         .get_or_init(|| Arc::new(SessionWorkspaceStore::default()))
         .clone()
+}
+
+/// #436 — serve-side registry mapping `"{profile}:peer:{slug}"` → the peer
+/// session's wire `SessionKey`, populated on `session/open` for `peer-<slug>`
+/// sessions. `peer_send_input` reads this to resolve a slug to the
+/// continuation-queue key it enqueues an injected turn under: the serve
+/// process has no gateway `ActorRegistry` to populate the inbox registry, so
+/// the tool delivers via the master continuation queue instead. A stale entry
+/// (a peer that has since closed) is harmless — the enqueued continuation is
+/// durable and drains when the peer next reconnects — so entries are not
+/// evicted on disconnect; a bounded cap prevents unbounded growth on a
+/// long-lived serve that opens many distinct peers.
+#[derive(Default)]
+struct PeerWireRegistry {
+    by_key: std::sync::Mutex<HashMap<String, SessionKey>>,
+}
+
+/// Soft cap on the peer-wire registry. A new key past the cap is dropped (that
+/// peer is not injectable until re-opened); existing keys still refresh.
+const PEER_WIRE_REGISTRY_MAX: usize = 8192;
+
+impl PeerWireRegistry {
+    /// Register (or UPDATE) the slug→wire mapping. Latest open wins (#436 P1
+    /// #1): a reconnect under a fresh client-chosen wire key overwrites the
+    /// prior mapping so resolution always targets the CURRENT session.
+    fn register(&self, key: String, session_id: SessionKey) {
+        let mut map = self
+            .by_key
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if map.len() >= PEER_WIRE_REGISTRY_MAX && !map.contains_key(&key) {
+            tracing::warn!(
+                key = %key,
+                cap = PEER_WIRE_REGISTRY_MAX,
+                "peer wire registry at capacity; skipping new peer registration"
+            );
+            return;
+        }
+        map.insert(key, session_id);
+    }
+
+    fn resolve(&self, key: &str) -> Option<SessionKey> {
+        self.by_key
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .get(key)
+            .cloned()
+    }
+
+    /// Evict the mapping for `key` ONLY when it still points at `session_id`
+    /// (#436 P1 #5). The conditional guard is race-safe: if the peer already
+    /// reopened under a newer wire key (register overwrote the value), a late
+    /// close of the OLD session must not clobber the fresh mapping. Returns
+    /// whether an entry was removed. Also frees a slot against the cap.
+    fn evict_if_value(&self, key: &str, session_id: &SessionKey) -> bool {
+        let mut map = self
+            .by_key
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if map.get(key) == Some(session_id) {
+            map.remove(key);
+            true
+        } else {
+            false
+        }
+    }
+}
+
+fn peer_wire_registry() -> &'static PeerWireRegistry {
+    static PEER_WIRE_REGISTRY: OnceLock<PeerWireRegistry> = OnceLock::new();
+    PEER_WIRE_REGISTRY.get_or_init(PeerWireRegistry::default)
+}
+
+/// Registry key for a peer session: `"{profile}:peer:{slug}"` (mirrors the
+/// gateway inbox registry's key construction in `session_actor`).
+fn peer_wire_key(profile_id: &str, slug: &str) -> String {
+    format!("{profile_id}:peer:{slug}")
+}
+
+/// Split a `peer-<slug>` session key into `(profile_id, slug)`, or `None` for
+/// a non-peer or unprofiled session.
+fn peer_slug_and_profile(session_id: &SessionKey) -> Option<(&str, &str)> {
+    let slug = session_id
+        .topic()
+        .and_then(|topic| topic.strip_prefix("peer-"))
+        .filter(|slug| !slug.is_empty())?;
+    // #436 security — the topic-derived slug feeds `Path::join` (closed marker,
+    // peers dir) and the wire-key registry. Reject an unsafe one (e.g. a
+    // `peer-/tmp/x` or `peer-../x` topic) HERE so EVERY caller treats it as a
+    // NON-peer session rather than a path that escapes `peers/`.
+    if !peer_slug_is_safe(slug) {
+        return None;
+    }
+    let profile_id = session_id.profile_id()?;
+    Some((profile_id, slug))
+}
+
+/// Upper bound (bytes) on a peer slug — a slug is a short handle, not a
+/// payload. Aligns with [`name_to_slug`]'s cap so a derived slug always
+/// satisfies [`peer_slug_is_safe`].
+const PEER_SLUG_MAX_BYTES: usize = 64;
+
+/// Reject a peer slug that could escape `peers/` or mis-key the wire registry:
+/// empty, over-long, a `.`/`..` component, any path separator / NUL, a drive /
+/// alternate-data-stream `:`, a control char (`< 0x20`), or a trailing `.`/
+/// space (which some filesystems strip → a DIFFERENT real path). A slug is a
+/// single path component (a dir name under `peers/`) — real slugs from
+/// `reserve_peer_dir` / [`name_to_slug`] are lowercase `[a-z0-9-]` / `%`-escaped
+/// `[A-Za-z0-9_%-]`, so any of the above is illegitimate. Called at the TOP of
+/// the `peer_close` / `peer_send_input` callbacks (after resolving a name to a
+/// slug) before any path join or wire-key op. Mirrors
+/// `octos_core::session_scope::is_safe_session_id`, hardened for cross-platform.
+fn peer_slug_is_safe(slug: &str) -> bool {
+    if slug.is_empty() || slug.len() > PEER_SLUG_MAX_BYTES {
+        return false;
+    }
+    if slug == "." || slug == ".." {
+        return false;
+    }
+    // A trailing dot or space aliases to a different real path on Windows.
+    if slug.ends_with('.') || slug.ends_with(' ') {
+        return false;
+    }
+    // Path separators, NUL/control chars (incl. 0x7f DEL), and the drive/ADS colon.
+    !slug
+        .bytes()
+        .any(|b| matches!(b, b'/' | b'\\' | b':') || b < 0x20 || b == 0x7f)
+}
+
+/// Derive a filesystem/URL-safe ASCII slug from a peer's display NAME:
+/// lowercase, each run of non-`[a-z0-9]` collapses to a single `-`, trim
+/// leading/trailing `-`, cap at [`PEER_SLUG_MAX_BYTES`] bytes. A name with NO
+/// ASCII alphanumerics (a CJK / emoji display name — `爱迪生`, `🔬`) has no
+/// readable slug, so it falls back to a stable FNV-1a hash of the trimmed,
+/// lowercased name: `peer-<16 hex>`. The DISPLAY name (unicode, stored in
+/// `peers/<slug>/name`) is what users see and address; the slug is only the
+/// directory handle and resolution is by the name file, so the same name always
+/// yields the same slug — a duplicate is rejected, never suffixed. Returns
+/// `None` ONLY for a blank / whitespace-only name (which has no peer at all).
+fn name_to_slug(name: &str) -> Option<String> {
+    let mut slug = String::new();
+    let mut prev_dash = false;
+    for ch in name.chars() {
+        if ch.is_ascii_alphanumeric() {
+            slug.push(ch.to_ascii_lowercase());
+            prev_dash = false;
+        } else if !slug.is_empty() && !prev_dash {
+            slug.push('-');
+            prev_dash = true;
+        }
+    }
+    let mut slug = slug.trim_matches('-').to_owned();
+    // All retained bytes are ASCII, so a byte cut is a char boundary; re-trim a
+    // dash the cut may have exposed.
+    if slug.len() > PEER_SLUG_MAX_BYTES {
+        slug.truncate(PEER_SLUG_MAX_BYTES);
+        slug = slug.trim_end_matches('-').to_owned();
+    }
+    if slug.is_empty() {
+        // No ASCII handle (pure CJK / emoji / punctuation): hash the normalized
+        // unicode name into a stable ASCII slug so the peer is still addressable
+        // (by its display name, via the `name` file).
+        let key = name.trim().to_lowercase();
+        if key.is_empty() {
+            return None; // blank / whitespace-only — not a name at all
+        }
+        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+        for b in key.bytes() {
+            hash ^= u64::from(b);
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        slug = format!("peer-{hash:016x}");
+    }
+    peer_slug_is_safe(&slug).then_some(slug)
+}
+
+/// The REAL, staged peer directory for `slug` under `peers_root`, or `None`
+/// when it is not safe to touch. EVERY peer-dir access — reads AND the
+/// close-marker write — routes through this so a hostile or stray
+/// `peers/<slug>` SYMLINK can never redirect I/O outside `peers_root`. Returns
+/// `Some(dir)` ONLY when: [`peer_slug_is_safe`], `peers_root.join(slug)` is a
+/// REAL directory that is NOT a symlink (`symlink_metadata` inspects the LINK,
+/// not its target), and it carries the `brief.md` staging contract.
+fn staged_peer_dir(peers_root: &Path, slug: &str) -> Option<PathBuf> {
+    if !peer_slug_is_safe(slug) {
+        return None;
+    }
+    let dir = peers_root.join(slug);
+    let meta = std::fs::symlink_metadata(&dir).ok()?;
+    if meta.file_type().is_symlink() || !meta.is_dir() {
+        return None;
+    }
+    if !dir.join("brief.md").is_file() {
+        return None;
+    }
+    Some(dir)
+}
+
+/// `true` when `peers/<slug>/closed` exists — the durable marker written by
+/// `peer_close` retiring a peer. Shared by the continuation-drain freshness
+/// gates and the reconnect-retarget skip so a closed peer is never a live
+/// injection target, even for an injection queued just before the close.
+/// Routes through [`staged_peer_dir`] so a symlinked / unsafe slug is never
+/// followed.
+fn peer_is_closed(peers_root: &Path, slug: &str) -> bool {
+    staged_peer_dir(peers_root, slug).is_some_and(|dir| dir.join("closed").is_file())
+}
+
+/// Resolve a peer IDENTIFIER (its display NAME or its slug) to the slug. A name
+/// match is case-insensitive against each REAL staged `peers/<slug>/name`; if
+/// none matches, an `ident` that is itself a safe, staged dir is returned as-is
+/// (slug addressing, and legacy peers that have no `name` file). Both branches
+/// route through [`staged_peer_dir`], so a SYMLINKED entry is skipped and never
+/// resolved. Returns `None` when nothing matches. Names are the primary
+/// address, so callbacks resolve through this BEFORE any auth / path / wire op.
+fn resolve_peer_name_to_slug(peers_root: &Path, ident: &str) -> Option<String> {
+    let target = ident.trim();
+    if target.is_empty() {
+        return None;
+    }
+    let lowered = target.to_lowercase();
+    if let Ok(read_dir) = std::fs::read_dir(peers_root) {
+        for entry in read_dir.flatten() {
+            let slug = entry.file_name().to_string_lossy().into_owned();
+            // Only a REAL, staged (non-symlink) peer dir may claim a name.
+            let Some(dir) = staged_peer_dir(peers_root, &slug) else {
+                continue;
+            };
+            if let Ok(name) = std::fs::read_to_string(dir.join("name")) {
+                if name.trim().to_lowercase() == lowered {
+                    return Some(slug);
+                }
+            }
+        }
+    }
+    // Fall back to slug addressing: an ident that is a safe, staged, non-symlink
+    // dir name.
+    staged_peer_dir(peers_root, target).map(|_| target.to_owned())
+}
+
+/// Register a `peer-<slug>` session's wire key so `peer_send_input` can resolve
+/// it, and re-home any injections queued against the peer's PREVIOUS wire key
+/// onto this one (#436 P1 #1 reconnect). No-op for non-peer / unprofiled
+/// sessions.
+fn register_peer_wire_session(state: &Arc<AppState>, session_id: &SessionKey) {
+    let Some((profile_id, slug)) = peer_slug_and_profile(session_id) else {
+        return;
+    };
+    peer_wire_registry().register(peer_wire_key(profile_id, slug), session_id.clone());
+    // #436 — a peer retired via peer_close must not resurrect: if the durable
+    // close marker exists, skip re-homing so an injection queued just before the
+    // close is never migrated onto the reopened wire. Belt-and-suspenders — the
+    // continuation-drain freshness gates also refuse a closed target — but this
+    // stops the re-home at the source.
+    if state
+        .profiles
+        .get(profile_id)
+        .is_some_and(|runtime| peer_is_closed(&runtime.data_dir.join("peers"), slug))
+    {
+        return;
+    }
+    // Reconnect: migrate any pending injection stranded on the peer's old wire
+    // key to this newly-opened session so it is delivered, not lost.
+    let rehomed = default_agent_orchestrator()
+        .retarget_peer_send_input_continuations(profile_id, slug, session_id);
+    if rehomed > 0 {
+        tracing::debug!(
+            slug,
+            rehomed,
+            session = %session_id,
+            "re-homed pending peer_send_input injections to reopened peer session"
+        );
+    }
+}
+
+/// Evict a `peer-<slug>` session's wire mapping on session/connection close so
+/// a closed peer is not a stale injection target (#436 P1 #5). Conditional on
+/// the mapping still pointing at THIS session, so a concurrent reopen wins.
+fn evict_peer_wire_session(session_id: &SessionKey) {
+    let Some((profile_id, slug)) = peer_slug_and_profile(session_id) else {
+        return;
+    };
+    peer_wire_registry().evict_if_value(&peer_wire_key(profile_id, slug), session_id);
+}
+
+/// #436 P1 #6 — authorize a `peer_send_input` injection: ONLY the peer's
+/// recorded ORIGINATOR — the session that staged it via `peer_handoff` /
+/// `peer_prepare`, written to `peers/<slug>/originator` — may inject into it.
+/// Previously any non-peer session in the same profile could inject into any
+/// open staged peer.
+///
+/// Authorizing by the STABLE originator identity (not the ephemeral wire key)
+/// composes with the reconnect wire-resolution fix: the caller is the master
+/// session, and the target peer's wire may change across reconnects without
+/// affecting this check. Fail-closed: a missing originator record (e.g. a
+/// profile-scoped `peer_prepare` that recorded no originator) is unauthorized.
+///
+/// # Security model (#436 #5 — single-user-per-profile / Option C)
+///
+/// Authorization is SESSION-scoped WITHIN a single user's own trust domain. In
+/// serve, the authenticated identity IS the profile: `authenticated_profile_id`
+/// returns the `AuthIdentity::User { id }` id *as* the profile, so a profile is
+/// exactly one user's own trust domain.
+///
+/// - **Cross-USER injection is blocked by profile scoping.** A connection can
+///   only open / run turns in sessions under its own profile
+///   (`validate_authenticated_session_scope`), so a different user cannot reach
+///   another user's peer at all — the strong isolation boundary.
+/// - **An LLM cannot cross-session-inject.** `caller_session` is the
+///   SERVER-CAPTURED session of the running turn (never a client-supplied
+///   argument), and the LLM cannot call `session/open` — so an LLM in a
+///   non-owner session sees its own session key ≠ the recorded originator and
+///   is rejected. This check blocks LLM-level cross-session injection, the
+///   meaningful in-band threat.
+/// - **The residual same-user, cross-session "spoof" is by design.** A CLIENT
+///   that deliberately `session/open`s the owner session and drives a turn
+///   there satisfies the originator check — but that is the USER exercising
+///   their own authority within their own profile, not a cross-trust breach.
+///   Making it non-spoofable would require a capability / session-access-control
+///   model (a per-peer owner token held outside any session-replayable channel;
+///   Option A), which is OUT OF SCOPE for the single-user serve model. If
+///   serve ever gains sub-user identities or multi-user profiles, revisit here.
+fn peer_send_input_authorized(
+    peers_root: &Path,
+    slug: &str,
+    caller_session: &str,
+) -> Result<(), String> {
+    // Route through `staged_peer_dir`: the originator read must target a REAL,
+    // non-symlink staged peer under `peers/`, never a symlinked/unsafe slug that
+    // could redirect the read outside the root. Defense-in-depth — callers
+    // already resolve the slug, but auth is the boundary and stays self-safe.
+    let Some(dir) = staged_peer_dir(peers_root, slug) else {
+        return Err(format!(
+            "peer session '{slug}' is not a staged peer; cannot authorize input"
+        ));
+    };
+    match std::fs::read_to_string(dir.join("originator")) {
+        Ok(recorded) if recorded.trim() == caller_session => Ok(()),
+        Ok(_) => Err(format!(
+            "not the owner of peer session '{slug}' — only the session that \
+             staged this peer may send it input"
+        )),
+        Err(_) => Err(format!(
+            "peer session '{slug}' has no recorded owner; cannot authorize input"
+        )),
+    }
 }
 
 fn session_permission_profiles() -> Arc<SessionPermissionProfileStore> {
@@ -4638,6 +4986,8 @@ async fn ui_protocol_connection(
                 let profile_filter = connection_profile_id
                     .or(routed_profile_id)
                     .or(session_open_profile_id.as_deref());
+                let open_sessions: std::collections::HashSet<SessionKey> =
+                    live_forwarders.lock().await.keys().cloned().collect();
                 drain_appui_due_master_continuations(
                     &ws,
                     &state,
@@ -4646,6 +4996,7 @@ async fn ui_protocol_connection(
                     &active_turns,
                     &connection_turns,
                     profile_filter,
+                    &open_sessions,
                     features,
                 ).await;
                 emit_session_orchestration_updates(
@@ -5390,6 +5741,8 @@ where
                 break;
             }
             _ = appui_continuation_tick.tick() => {
+                let open_sessions: std::collections::HashSet<SessionKey> =
+                    live_forwarders.lock().await.keys().cloned().collect();
                 drain_appui_due_master_continuations(
                     &ws,
                     &state,
@@ -5398,6 +5751,7 @@ where
                     &active_turns,
                     &connection_turns,
                     connection_profile_id_owned.as_deref(),
+                    &open_sessions,
                     features,
                 ).await;
                 emit_session_orchestration_updates(
@@ -6168,6 +6522,10 @@ async fn abort_live_forwarders(forwarders: &SharedLiveForwarders, ledger: &UiPro
     }
     for session_id in drained_sessions {
         ledger.prune_subscriber_if_idle(&session_id);
+        // #436 P1 #5 — a closing peer session must stop being an injection
+        // target so `peer_send_input` fails cleanly (or re-homes on reopen)
+        // rather than queuing into a dead session; also frees a registry slot.
+        evict_peer_wire_session(&session_id);
     }
 }
 
@@ -9574,8 +9932,16 @@ struct RawPeerPrepareParams {
     #[serde(default)]
     n: Option<u32>,
     /// Optional human title — seeds the slug (else the brief's first words).
+    /// Legacy (unnamed) fleet path only; ignored when `names` is given.
     #[serde(default)]
     title: Option<String>,
+    /// Required-when-present peer NAMES: one per fleet member (`len == n`).
+    /// Each is the peer's primary address — non-empty, unique within the list
+    /// AND against existing peers (case-insensitive), and must derive a usable
+    /// slug. When omitted the legacy unnamed (title-seeded, auto-suffixed) path
+    /// is used.
+    #[serde(default)]
+    names: Option<Vec<String>>,
     /// Create a git worktree (branch `peer/<slug>`) under the profile data
     /// dir and return it as the peer's cwd — the blast-radius fence.
     #[serde(default)]
@@ -9640,6 +10006,65 @@ fn reserve_peer_dir(peers_root: &Path, seed: &str) -> Result<(String, PathBuf), 
     Err(RpcError::invalid_params(
         "too many peers with this title — pick a distinct title",
     ))
+}
+
+/// True when a staged peer already claims this NAME (case-insensitive, reading
+/// each `peers/<slug>/name`) or already occupies the derived SLUG. Guards the
+/// NAMED staging path: names are the primary address, so they must be unique.
+fn existing_peer_name_conflict(peers_root: &Path, name: &str, slug: &str) -> bool {
+    let target = name.trim().to_lowercase();
+    let Ok(read_dir) = std::fs::read_dir(peers_root) else {
+        return false;
+    };
+    for entry in read_dir.flatten() {
+        let entry_slug = entry.file_name().to_string_lossy().into_owned();
+        // Any entry occupying the derived slug path — even a symlink or an
+        // unstaged dir — blocks the reservation (`create_dir` fails on it too).
+        if entry_slug == slug {
+            return true;
+        }
+        // A NAME collision only counts against a REAL staged peer: route the
+        // `name` read through `staged_peer_dir` so a symlinked entry is never
+        // followed and never falsely registers as a conflict.
+        if let Some(dir) = staged_peer_dir(peers_root, &entry_slug) {
+            if let Ok(existing) = std::fs::read_to_string(dir.join("name")) {
+                if existing.trim().to_lowercase() == target {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Reserve the EXACT slug derived from a peer NAME (no numeric suffix): a named
+/// peer must be addressable by its name, so a collision is an ERROR, not an
+/// auto-rename. Rejects a name with no usable slug, a duplicate name
+/// (case-insensitive), or a slug already taken. `create_dir` is the atomic
+/// claim that also closes the check→reserve race.
+fn reserve_named_peer_dir(peers_root: &Path, name: &str) -> Result<(String, PathBuf), RpcError> {
+    let Some(slug) = name_to_slug(name) else {
+        return Err(RpcError::invalid_params(
+            "peer name cannot be blank".to_string(),
+        ));
+    };
+    std::fs::create_dir_all(peers_root)
+        .map_err(|err| RpcError::internal_error(format!("failed to create peers dir: {err}")))?;
+    if existing_peer_name_conflict(peers_root, name, &slug) {
+        return Err(RpcError::invalid_params(format!(
+            "a peer named '{name}' already exists"
+        )));
+    }
+    let dir = peers_root.join(&slug);
+    match std::fs::create_dir(&dir) {
+        Ok(()) => Ok((slug, dir)),
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => Err(
+            RpcError::invalid_params(format!("a peer named '{name}' already exists")),
+        ),
+        Err(err) => Err(RpcError::internal_error(format!(
+            "failed to reserve peer dir: {err}"
+        ))),
+    }
 }
 
 /// `peer/prepare` (#1800): stage a peer-agent spin-off. Writes the durable
@@ -9723,6 +10148,49 @@ async fn raw_peer_prepare(
         return Err(RpcError::invalid_params("n must be between 1 and 8"));
     }
 
+    // Peer NAMES (when supplied): exactly one per fleet member, each non-empty,
+    // slug-derivable, and unique within the list (case-insensitive). Uniqueness
+    // AGAINST existing peers is enforced per-member inside `stage_peer`
+    // (`reserve_named_peer_dir`). Trimmed here so the stored name is canonical.
+    let names: Option<Vec<String>> = match params.names.as_ref() {
+        Some(names) => {
+            if names.len() != n as usize {
+                return Err(RpcError::invalid_params(format!(
+                    "names must have exactly {n} entries (one per peer)"
+                )));
+            }
+            // Same per-name bound as the `peer_handoff` tool: a name is a short
+            // handle, not a payload.
+            const PEER_PREPARE_NAME_MAX_CHARS: usize = 64;
+            let mut trimmed = Vec::with_capacity(names.len());
+            let mut seen = std::collections::HashSet::new();
+            for name in names {
+                let name = name.trim();
+                if name.is_empty() {
+                    return Err(RpcError::invalid_params("each peer name must be non-empty"));
+                }
+                if name.chars().count() > PEER_PREPARE_NAME_MAX_CHARS {
+                    return Err(RpcError::invalid_params(format!(
+                        "peer name '{name}' exceeds {PEER_PREPARE_NAME_MAX_CHARS} characters"
+                    )));
+                }
+                if name_to_slug(name).is_none() {
+                    return Err(RpcError::invalid_params(
+                        "peer name cannot be blank".to_string(),
+                    ));
+                }
+                if !seen.insert(name.to_lowercase()) {
+                    return Err(RpcError::invalid_params(format!(
+                        "duplicate peer name '{name}' in names"
+                    )));
+                }
+                trimmed.push(name.to_owned());
+            }
+            Some(trimmed)
+        }
+        None => None,
+    };
+
     // Fleet staging is ALL-OR-NOTHING: each member goes through `stage_peer`
     // (reserve → optional worktree fence → atomic brief write; the failing
     // member rolls ITSELF back inside the helper), and any member failure
@@ -9731,17 +10199,27 @@ async fn raw_peer_prepare(
     // fleet. Git work is blocking; keep each member off the reactor.
     let mut staged: Vec<(String, PathBuf)> = Vec::new();
     let mut entries: Vec<Value> = Vec::new();
-    for _ in 0..n {
+    for i in 0..n as usize {
         let member_peers_root = peers_root.clone();
         let member_workspace_root = workspace_root.clone();
         let member_seed = seed.clone();
+        let member_name = names.as_ref().map(|names| names[i].clone());
         let member_brief = brief.to_owned();
         let member_worktree = params.worktree;
+        // codex #6 — the originating session owns this member; `stage_peer`
+        // records it atomically BEFORE brief.md and rolls staging back on
+        // failure. Absent session_id (profile-scoped prepare) = no owner.
+        let member_originator = params
+            .session_id
+            .as_ref()
+            .map(|session| session.to_string());
         let member = tokio::task::spawn_blocking(move || {
             stage_peer(
                 &member_peers_root,
                 &member_workspace_root,
                 &member_seed,
+                member_name.as_deref(),
+                member_originator.as_deref(),
                 &member_brief,
                 member_worktree,
             )
@@ -9755,20 +10233,6 @@ async fn raw_peer_prepare(
                 return Err(err);
             }
         };
-
-        // Mailbox nudge (#1801 v3 fan-in): when the preparing client names
-        // the session the handoff came from, record it so that session's
-        // later turns can carry a ready-note once this member's result
-        // lands (`peer_results_ready_note`). Best-effort; absent
-        // session_id (profile-scoped prepare) = no originator, no nudge.
-        if let Some(originator) = params.session_id.as_ref() {
-            if let Err(err) = crate::memory_consolidate::apply::atomic_write(
-                &peers_root.join(&member.slug).join("originator"),
-                &originator.to_string(),
-            ) {
-                tracing::warn!(?err, slug = %member.slug, "failed to record peer originator");
-            }
-        }
 
         // Track the member for the fleet-level rollback: the reserved dir is
         // the brief's parent (`peers/<slug>`), same claim `stage_peer` made.
@@ -9851,10 +10315,26 @@ fn stage_peer(
     peers_root: &Path,
     workspace_root: &Path,
     seed: &str,
+    name: Option<&str>,
+    // codex #6 — the ORIGINATING (master) session that owns this peer, recorded
+    // atomically BEFORE `brief.md`. `staged_peer_dir` gates peer visibility on
+    // `brief.md`, so writing the owner first guarantees any fleet-ownership scan
+    // that can see this peer can also read its owner — no window where a member
+    // is visible-but-ownerless (which would let a sibling's completion fire
+    // synthesis while this peer is silently omitted). `None` for a
+    // profile-scoped `peer/prepare` with no originating session.
+    originator: Option<&str>,
     brief: &str,
     worktree: bool,
 ) -> Result<StagedPeer, RpcError> {
-    let (slug, peer_dir) = reserve_peer_dir(peers_root, seed)?;
+    // A NAMED peer reserves its EXACT (name-derived) slug and rejects
+    // collisions — a name is the primary address, so it must be unique and
+    // stable. An unnamed (legacy `peer/prepare`) peer keeps the auto-suffix
+    // seed path.
+    let (slug, peer_dir) = match name {
+        Some(name) => reserve_named_peer_dir(peers_root, name)?,
+        None => reserve_peer_dir(peers_root, seed)?,
+    };
     // The fence: a worktree on branch `peer/<slug>` under the peer dir.
     let cwd = if worktree {
         let worktree_path = peer_dir.join("wt");
@@ -9891,12 +10371,40 @@ fn stage_peer(
         workspace_root.to_path_buf()
     };
 
+    // codex #6 — record the owner BEFORE brief.md (the visibility gate), atomic
+    // + surfaced. A failed owner-write rolls the whole staging back instead of
+    // leaving a silently unowned member that a sibling's completion could omit
+    // from the fleet and fire synthesis prematurely.
+    if let Some(originator) = originator {
+        if let Err(err) =
+            crate::memory_consolidate::apply::atomic_write(&peer_dir.join("originator"), originator)
+        {
+            cleanup_staged_peer(workspace_root, &slug, &peer_dir);
+            return Err(RpcError::internal_error(format!(
+                "failed to record peer originator: {err}"
+            )));
+        }
+    }
+
     let brief_path = peer_dir.join("brief.md");
     if let Err(err) = crate::memory_consolidate::apply::atomic_write(&brief_path, brief) {
         cleanup_staged_peer(workspace_root, &slug, &peer_dir);
         return Err(RpcError::internal_error(format!(
             "failed to write brief: {err}"
         )));
+    }
+
+    // Store the display NAME so the peer is addressable by it and readers
+    // (`read_peer_blackboard` / `resolve_peer_name_to_slug`) can surface it.
+    if let Some(name) = name {
+        if let Err(err) =
+            crate::memory_consolidate::apply::atomic_write(&peer_dir.join("name"), name)
+        {
+            cleanup_staged_peer(workspace_root, &slug, &peer_dir);
+            return Err(RpcError::internal_error(format!(
+                "failed to write peer name: {err}"
+            )));
+        }
     }
 
     Ok(StagedPeer {
@@ -9962,34 +10470,25 @@ fn build_peer_handoff_callback(
                 "peer handoff limit reached for this turn ({PEER_HANDOFFS_PER_TURN_MAX})"
             ));
         }
-        // Same seed derivation as `raw_peer_prepare`: trimmed title, else
-        // the brief's leading words. The tool already validated/trimmed.
-        let seed = request.title.clone().unwrap_or_else(|| {
-            request
-                .brief
-                .split_whitespace()
-                .take(6)
-                .collect::<Vec<_>>()
-                .join(" ")
-        });
+        // Peers are named: the slug is derived from the (required, validated)
+        // name and must be unique — `stage_peer` rejects a duplicate rather
+        // than auto-suffixing. `seed` is unused on the named path.
+        //
+        // codex #6 — record WHO handed off (the originating master session) so
+        // the fleet-ownership scan + `peer_results_ready_note` are reliable.
+        // `stage_peer` writes it atomically BEFORE brief.md and rolls the
+        // staging back on failure, so a peer is never visible-but-ownerless.
+        let originator = originating_session.to_string();
         let staged = stage_peer(
             &peers_root,
             &workspace_root,
-            &seed,
+            &request.name,
+            Some(&request.name),
+            Some(originator.as_str()),
             &request.brief,
             request.worktree,
         )
         .map_err(|err| err.message)?;
-        // Mailbox nudge (#1801 v3 fan-in): record WHO handed off, so the
-        // originating session's later turns can carry a ready-note once
-        // this peer's result lands (`peer_results_ready_note`). Best-effort
-        // — a missing originator file just means no nudge.
-        if let Err(err) = crate::memory_consolidate::apply::atomic_write(
-            &peers_root.join(&staged.slug).join("originator"),
-            &originating_session.to_string(),
-        ) {
-            tracing::warn!(?err, slug = %staged.slug, "failed to record peer originator");
-        }
         // Durable so reconnect replay still delivers the open request; the
         // client dedups by an already-open session for the topic.
         emit_staged(PeerStagedEvent {
@@ -10018,10 +10517,17 @@ fn build_peer_handoff_callback(
 /// post-mortems all survive client crashes, reconnects, and limit outages.
 /// Only a session whose topic is `peer-<slug>` AND whose staged dir exists
 /// gets a write — an unstaged `peer-` topic must not create directories.
+///
+/// #438 persistent peer sessions: peer sessions are persistent by design —
+/// they survive turn completion and only close on WebSocket disconnect
+/// (FIX-06 `evict_session` at connection-close hook, line 27850). There is
+/// no per-turn auto-close. The TUI keeps the session alive across multiple
+/// turns; this function is called at every turn terminal to update the
+/// blackboard with the latest result (and a versioned historical copy).
 fn write_peer_result_if_peer_session(
     state: &Arc<AppState>,
     session_id: &SessionKey,
-    status: &str,
+    outcome: TurnTerminalOutcome,
     content: &str,
 ) {
     let Some(slug) = session_id
@@ -10036,7 +10542,12 @@ fn write_peer_result_if_peer_session(
     let Some(runtime) = state.profiles.get(profile_id) else {
         return;
     };
-    let peer_dir = runtime.data_dir.join("peers").join(slug);
+    // Only write under a REAL staged (non-symlink, safe-slug, brief.md) dir so
+    // a hostile `peer-<slug>` topic / symlinked entry cannot redirect the
+    // result-file writes outside `peers/`.
+    let Some(peer_dir) = staged_peer_dir(&runtime.data_dir.join("peers"), slug) else {
+        return;
+    };
     if !peer_dir.is_dir() {
         return;
     }
@@ -10055,14 +10566,83 @@ fn write_peer_result_if_peer_session(
         .duration_since(std::time::UNIX_EPOCH)
         .map(|elapsed| elapsed.as_secs())
         .unwrap_or(0);
+    let outcome_str = match outcome {
+        TurnTerminalOutcome::Completed => "completed",
+        TurnTerminalOutcome::Errored => "errored",
+        TurnTerminalOutcome::Interrupted => "interrupted",
+        TurnTerminalOutcome::RateLimited => "rate_limited",
+    };
+
+    // #435: versioned result files prevent silent overwrite when a persistent
+    // peer runs multiple turns. Count existing result-*.md files to determine
+    // the turn number so the caller doesn't need to track state.
+    let turn_count = count_peer_result_versions(&peer_dir) + 1;
+
     let text = format!(
-        "---\nslug: {slug}\nstatus: {status}\nupdated_unix: {updated_unix}\n---\n\n{body}{truncated}\n"
+        "---\nslug: {slug}\noutcome: {outcome_str}\nupdated_unix: {updated_unix}\nturn: {turn_count}\n---\n\n{body}{truncated}\n"
     );
+
+    // Backward-compatible latest copy — peer_gather reads this path.
     if let Err(err) =
         crate::memory_consolidate::apply::atomic_write(&peer_dir.join("result.md"), &text)
     {
         tracing::warn!(?err, slug, "failed to write peer result");
     }
+
+    // Versioned copy — historical record for multi-turn persistent peers.
+    let versioned_path = peer_dir.join(format!("result-{turn_count}.md"));
+    if let Err(err) = crate::memory_consolidate::apply::atomic_write(&versioned_path, &text) {
+        tracing::warn!(
+            ?err,
+            slug,
+            turn_count,
+            "failed to write versioned peer result"
+        );
+    }
+
+    // Append to the turn index so peer_list and dashboard can discover
+    // historical results without globbing.
+    let turns_path = peer_dir.join("turns.txt");
+    let index_line = format!("{turn_count} {outcome_str} {updated_unix}\n");
+    if let Err(err) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&turns_path)
+        .and_then(|mut f| std::io::Write::write_all(&mut f, index_line.as_bytes()))
+    {
+        tracing::warn!(?err, slug, turn_count, "failed to append to turns.txt");
+    }
+}
+
+/// Count how many `result-*.md` files already exist in the peer directory.
+fn count_peer_result_versions(peer_dir: &std::path::Path) -> u32 {
+    let Ok(read_dir) = std::fs::read_dir(peer_dir) else {
+        return 0;
+    };
+    read_dir
+        .flatten()
+        .filter(|entry| entry.file_name().to_string_lossy().starts_with("result-"))
+        .count() as u32
+}
+
+/// Parse `turns.txt` into `[(turn_count, outcome, updated_unix)]`.
+/// Returns `None` when the file doesn't exist.
+fn parse_peer_turns_index(peer_dir: &std::path::Path) -> Option<Vec<(u32, String, u64)>> {
+    let text = std::fs::read_to_string(peer_dir.join("turns.txt")).ok()?;
+    if text.trim().is_empty() {
+        return Some(Vec::new());
+    }
+    let entries: Vec<_> = text
+        .lines()
+        .filter_map(|line| {
+            let mut parts = line.split_whitespace();
+            let count: u32 = parts.next()?.parse().ok()?;
+            let outcome = parts.next()?.to_string();
+            let ts: u64 = parts.next()?.parse().ok()?;
+            Some((count, outcome, ts))
+        })
+        .collect();
+    Some(entries)
 }
 
 /// Cap a string at `cap` bytes on a char boundary; returns (text, truncated).
@@ -10098,6 +10678,9 @@ const PEER_GATHER_RESULT_CAP: usize = 48 * 1024;
 /// the `peer_gather` tool callback — both are views over the SAME read.
 struct PeerBlackboardRow {
     slug: String,
+    /// Display NAME from `peers/<slug>/name` (the peer's primary address),
+    /// falling back to the slug for legacy peers that have no `name` file.
+    name: String,
     /// `brief.md`, capped at [`PEER_GATHER_BRIEF_CAP`].
     brief: String,
     brief_truncated: bool,
@@ -10107,6 +10690,13 @@ struct PeerBlackboardRow {
     result_truncated: bool,
     result_updated_unix: Option<u64>,
     has_worktree: bool,
+    /// `true` when `peers/<slug>/closed` exists — the durable marker written
+    /// by `peer_close` retiring the peer. A closed peer receives no further
+    /// input; its result files stay readable.
+    closed: bool,
+    /// #435: parsed `turns.txt` entries: `[(turn_count, outcome, updated_unix)]`.
+    /// `None` when the file doesn't exist (single-turn-or-less peer).
+    turn_history: Option<Vec<(u32, String, u64)>>,
 }
 
 /// #1801: row-reading core of the peer blackboard — every staged peer dir
@@ -10118,10 +10708,9 @@ struct PeerBlackboardRow {
 fn read_peer_blackboard(peers_root: &Path, slugs: Option<&[String]>) -> Vec<PeerBlackboardRow> {
     let mut rows: Vec<PeerBlackboardRow> = Vec::new();
     if let Ok(read_dir) = std::fs::read_dir(peers_root) {
-        let mut dirs: Vec<_> = read_dir
-            .flatten()
-            .filter(|entry| entry.path().is_dir())
-            .collect();
+        // No `is_dir()` pre-filter — it follows symlinks. `staged_peer_dir`
+        // below is the sole gate (safe slug + real non-symlink dir + brief.md).
+        let mut dirs: Vec<_> = read_dir.flatten().collect();
         dirs.sort_by_key(|entry| entry.file_name());
         for entry in dirs {
             let slug = entry.file_name().to_string_lossy().into_owned();
@@ -10130,9 +10719,12 @@ fn read_peer_blackboard(peers_root: &Path, slugs: Option<&[String]>) -> Vec<Peer
                     continue;
                 }
             }
-            let dir = entry.path();
-            // Only staged peers (a brief is the staging contract) — stray
-            // dirs under peers/ are not part of the blackboard.
+            // Only REAL, staged (non-symlink) peer dirs — a symlinked entry
+            // could redirect reads outside `peers/`; `staged_peer_dir` also
+            // enforces the `brief.md` staging contract.
+            let Some(dir) = staged_peer_dir(peers_root, &slug) else {
+                continue;
+            };
             let Ok(brief) = std::fs::read_to_string(dir.join("brief.md")) else {
                 continue;
             };
@@ -10151,14 +10743,24 @@ fn read_peer_blackboard(peers_root: &Path, slugs: Option<&[String]>) -> Vec<Peer
                 }
                 None => (None, false),
             };
+            // Display name: `peers/<slug>/name`, trimmed; legacy peers with no
+            // `name` file fall back to the slug so the row always has an address.
+            let name = std::fs::read_to_string(dir.join("name"))
+                .ok()
+                .map(|n| n.trim().to_owned())
+                .filter(|n| !n.is_empty())
+                .unwrap_or_else(|| slug.clone());
             rows.push(PeerBlackboardRow {
                 slug,
+                name,
                 brief,
                 brief_truncated,
                 result,
                 result_truncated,
                 result_updated_unix,
                 has_worktree: dir.join("wt").is_dir(),
+                closed: dir.join("closed").is_file(),
+                turn_history: parse_peer_turns_index(&dir),
             });
         }
     }
@@ -10189,6 +10791,7 @@ fn raw_peer_gather(
         .map(|row| {
             json!({
                 "slug": row.slug,
+                "name": row.name,
                 "topic": format!("peer-{}", row.slug),
                 "brief": row.brief,
                 "brief_truncated": row.brief_truncated,
@@ -10196,6 +10799,16 @@ fn raw_peer_gather(
                 "result_truncated": row.result_truncated,
                 "result_updated_unix": row.result_updated_unix,
                 "has_worktree": row.has_worktree,
+                "closed": row.closed,
+                "turn_history": row.turn_history.as_ref().map(|history| {
+                    history.iter().map(|(count, outcome, ts)| {
+                        json!({
+                            "turn": count,
+                            "outcome": outcome,
+                            "updated_unix": ts,
+                        })
+                    }).collect::<Vec<_>>()
+                }),
             })
         })
         .collect();
@@ -10224,7 +10837,9 @@ fn compose_peer_gather_text(rows: &[PeerBlackboardRow]) -> String {
     let mut sections: Vec<String> = rows
         .iter()
         .map(|row| {
-            let status = if row.result.is_some() {
+            let status = if row.closed {
+                "closed"
+            } else if row.result.is_some() {
                 "done"
             } else {
                 "still running"
@@ -10238,10 +10853,14 @@ fn compose_peer_gather_text(rows: &[PeerBlackboardRow]) -> String {
                 .result
                 .as_deref()
                 .unwrap_or("(still running — no result yet)");
-            format!(
-                "## peer {slug} ({status})\nBrief: {brief_preview}\n\n{body}\n",
-                slug = row.slug
-            )
+            // Address by NAME; annotate the slug when it differs so the model
+            // can still pass slugs to a targeted peer_gather.
+            let header = if row.name == row.slug {
+                format!("## peer {} ({status})", row.slug)
+            } else {
+                format!("## peer {} [{}] ({status})", row.name, row.slug)
+            };
+            format!("{header}\nBrief: {brief_preview}\n\n{body}\n")
         })
         .collect();
     let joined_len =
@@ -10287,11 +10906,185 @@ fn peer_gather_allowed_for_session(_session_id: &SessionKey) -> bool {
 /// the blackboard through the SAME row reader the `peer/gather` RPC uses
 /// ([`read_peer_blackboard`]) and composes plain text for the model.
 fn build_peer_gather_callback(peers_root: PathBuf) -> octos_agent::PeerGatherCallback {
-    Arc::new(move |slugs: Option<Vec<String>>| {
+    Arc::new(move |idents: Option<Vec<String>>| {
+        // The model may pass peer NAMES or slugs; resolve each to a slug for
+        // the blackboard filter (an unresolved identifier matches nothing).
+        let slugs = idents.map(|idents| {
+            idents
+                .iter()
+                .filter_map(|ident| resolve_peer_name_to_slug(&peers_root, ident))
+                .collect::<Vec<_>>()
+        });
         Ok(compose_peer_gather_text(&read_peer_blackboard(
             &peers_root,
             slugs.as_deref(),
         )))
+    })
+}
+
+/// Compose the compact one-line-per-peer INDEX the `peer_list` tool returns:
+/// slug, status (`closed` if retired via `peer_close`, else `done` when a
+/// result file exists, else `running`), last-updated unix (or "—"), turn
+/// count, and `worktree` when the peer has its own fence. Deliberate contrast
+/// with [`compose_peer_gather_text`], which reads each peer's full brief +
+/// result — this is the index, that is the payload.
+/// Cap on peer rows the `peer_list` index emits inline — a runaway fleet
+/// cannot flood the model's context; the overflow folds into a trailing
+/// "… and N more" line (read specific peers with peer_gather slugs).
+const PEER_LIST_MAX_ROWS: usize = 200;
+
+fn compose_peer_list_text(rows: &[PeerBlackboardRow]) -> String {
+    if rows.is_empty() {
+        return "(no peers staged)".to_owned();
+    }
+    let mut lines: Vec<String> = Vec::with_capacity(rows.len().min(PEER_LIST_MAX_ROWS) + 2);
+    lines.push(format!("peers ({}):", rows.len()));
+    for row in rows.iter().take(PEER_LIST_MAX_ROWS) {
+        let status = if row.closed {
+            "closed"
+        } else if row.result.is_some() {
+            "done"
+        } else {
+            "running"
+        };
+        let updated = row
+            .result_updated_unix
+            .map_or_else(|| "—".to_owned(), |ts| ts.to_string());
+        let turns = row.turn_history.as_ref().map_or(0, Vec::len);
+        let worktree = if row.has_worktree { "  worktree" } else { "" };
+        // Address by NAME; show the slug in parens when it differs.
+        let addr = if row.name == row.slug {
+            row.slug.clone()
+        } else {
+            format!("{} ({})", row.name, row.slug)
+        };
+        lines.push(format!(
+            "- {addr}  {status}  updated {updated}  turns {turns}{worktree}"
+        ));
+    }
+    if rows.len() > PEER_LIST_MAX_ROWS {
+        lines.push(format!("… and {} more", rows.len() - PEER_LIST_MAX_ROWS));
+    }
+    lines.join("\n")
+}
+
+/// `peer_list` is read-only like `peer_gather` — registered for EVERY serve
+/// session (INCLUDING `peer-` topics). Mirrors
+/// [`peer_gather_allowed_for_session`]: a read-only index has no recursion
+/// hazard for a depth guard to contain, so the predicate is `true`, kept
+/// explicit at the wiring seam.
+fn peer_list_allowed_for_session(_session_id: &SessionKey) -> bool {
+    true
+}
+
+/// Build the `peer_list` read callback for ONE turn of the serve/WS path.
+/// Mirrors [`build_peer_gather_callback`] but composes the compact status
+/// index ([`compose_peer_list_text`]) over the SAME row reader
+/// ([`read_peer_blackboard`]); it takes no slugs — it always lists every peer.
+fn build_peer_list_callback(peers_root: PathBuf) -> octos_agent::PeerListCallback {
+    Arc::new(move || {
+        Ok(compose_peer_list_text(&read_peer_blackboard(
+            &peers_root,
+            None,
+        )))
+    })
+}
+
+/// Build the `peer_close` callback for ONE turn of the serve/WS path. Closing
+/// RETIRES a peer the caller created: authorize (originator-only, the SAME
+/// check `peer_send_input` uses), evict the live wire if the peer is open,
+/// and write the durable `closed` marker so `peer_list` / `peer_gather`
+/// report it closed and `peer_send_input` refuses it. Graceful — an in-flight
+/// peer turn still completes; result files stay readable.
+fn build_peer_close_callback(
+    peers_root: PathBuf,
+    origin_session: String,
+    profile_id: String,
+    emit_closed: Arc<dyn Fn(PeerClosedEvent) + Send + Sync>,
+) -> octos_agent::PeerCloseCallback {
+    Arc::new(move |ident: String| {
+        // Resolve the identifier (peer NAME or slug) to the actual slug BEFORE
+        // any auth / path / wire op — names are the primary address.
+        let slug = resolve_peer_name_to_slug(&peers_root, &ident).ok_or_else(|| {
+            format!("no peer named '{ident}' — check the name (or slug) with peer_list")
+        })?;
+        // The resolved slug is a real staged dir name; keep the guard as
+        // defense-in-depth (an unsafe slug could escape peers/ or mis-key the
+        // live wire, leaving it un-evicted).
+        if !peer_slug_is_safe(&slug) {
+            return Err(format!("invalid peer slug '{slug}'"));
+        }
+        // #436 P1 #6 — originator-only, fail-closed. Reuses the exact check
+        // that gates `peer_send_input`, so only the session that staged the
+        // peer may retire it.
+        peer_send_input_authorized(&peers_root, &slug, &origin_session)?;
+        // Resolve the REAL staged dir (safe slug, NOT a symlink, has brief.md)
+        // and write ONLY under it — a deleted or symlinked peer cannot be
+        // closed, so the marker can never land outside `peers/`.
+        let Some(peer_dir) = staged_peer_dir(&peers_root, &slug) else {
+            return Err(format!(
+                "peer '{slug}' no longer exists (its staged directory was removed)"
+            ));
+        };
+        // Durable close marker FIRST, written atomically (same helper as the
+        // brief / originator / result files). The body records the closing
+        // session id and a unix timestamp for post-mortems; its mere existence
+        // is the signal that `read_peer_blackboard` reads back as `closed`.
+        // Writing the marker before evicting the wire means a marker-write
+        // failure leaves the peer fully OPEN — never partially closed (wire
+        // gone but no marker, which would silently drop input).
+        let now_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_secs())
+            .unwrap_or(0);
+        let body = format!("{origin_session}\n{now_unix}\n");
+        if let Err(err) =
+            crate::memory_consolidate::apply::atomic_write(&peer_dir.join("closed"), &body)
+        {
+            return Err(format!(
+                "failed to write close marker for peer '{slug}': {err}"
+            ));
+        }
+        // #436 leak fix — the marker now refuses NEW sends; actively CANCEL +
+        // tombstone any injection queued for this peer BEFORE the close so
+        // nothing stays stranded in the durable queue (the drain gates skip a
+        // closed target without ever popping/capping/tombstoning it).
+        let cancelled = default_agent_orchestrator()
+            .cancel_peer_send_input_continuations_for_peer(&profile_id, &slug);
+        if cancelled > 0 {
+            tracing::debug!(
+                slug = %slug,
+                cancelled,
+                "cancelled pending peer_send_input injections on peer close"
+            );
+        }
+        // Peer-fleet auto-synthesis RESET — the close marker now excludes this
+        // peer from the master's owned fleet. If it was the LAST owned peer, the
+        // fleet is fully retired: drop the `.synthesized` marker so a genuinely
+        // fresh fleet (spawned later under the same master) synthesizes once.
+        // No-op while any owned peer remains. `origin_session` is the master
+        // (the authorized originator).
+        reset_peer_fleet_synthesis_if_cleared(&peers_root, &origin_session);
+        // Marker durable + queue cleared; now evict the live wire if the peer
+        // is open so a still-connected peer stops being an injection target
+        // immediately (the marker already covers the offline / reconnect case).
+        let key = peer_wire_key(&profile_id, &slug);
+        if let Some(wire) = peer_wire_registry().resolve(&key) {
+            evict_peer_wire_session(&wire);
+        }
+        // Close succeeded (marker durable, queue cleared, wire evicted). Emit
+        // the durable `peer/closed` so the client tears down the peer pane it
+        // opened. Mirrors the `peer/staged` emit — routing keys off the
+        // ORIGINATING session; `topic` (`peer-<slug>`) is the closed peer's.
+        emit_closed(PeerClosedEvent {
+            session_id: SessionKey(origin_session.clone()),
+            topic: format!("peer-{slug}"),
+            slug: slug.clone(),
+            profile_id: profile_id.clone(),
+        });
+        Ok(format!(
+            "peer '{slug}' closed — it will receive no further input"
+        ))
     })
 }
 
@@ -10323,16 +11116,19 @@ fn peer_results_ready_note(peers_root: &Path, session_id: &SessionKey) -> Option
         return None;
     }
     let read_dir = std::fs::read_dir(peers_root).ok()?;
-    let mut dirs: Vec<_> = read_dir
-        .flatten()
-        .filter(|entry| entry.path().is_dir())
-        .collect();
+    // No `is_dir()` pre-filter — it follows symlinks. `staged_peer_dir` gates
+    // each entry so a symlinked peer can't redirect the `.notified` write or
+    // the result/originator reads outside `peers/`.
+    let mut dirs: Vec<_> = read_dir.flatten().collect();
     dirs.sort_by_key(|entry| entry.file_name());
     let session = session_id.to_string();
     // (slug, stamp path, result mtime) per ready peer.
     let mut ready: Vec<(String, PathBuf, u64)> = Vec::new();
     for entry in dirs {
-        let dir = entry.path();
+        let slug = entry.file_name().to_string_lossy().into_owned();
+        let Some(dir) = staged_peer_dir(peers_root, &slug) else {
+            continue;
+        };
         // Stat-first: no result file means nothing to announce, skip
         // before touching any other file.
         let Some(result_mtime) = std::fs::metadata(dir.join("result.md"))
@@ -10356,11 +11152,7 @@ fn peer_results_ready_note(peers_root: &Path, session_id: &SessionKey) -> Option
         if originator.trim() != session {
             continue;
         }
-        ready.push((
-            entry.file_name().to_string_lossy().into_owned(),
-            stamp_path,
-            result_mtime,
-        ));
+        ready.push((slug, stamp_path, result_mtime));
     }
     if ready.is_empty() {
         return None;
@@ -10388,6 +11180,336 @@ fn peer_results_ready_note(peers_root: &Path, session_id: &SessionKey) -> Option
     Some(format!(
         "[peer results ready: {list} — use peer_gather to read them when relevant]"
     ))
+}
+
+/// Peer-fleet auto-synthesis — one owned peer's readiness inputs for the
+/// [`evaluate_peer_fleet_synthesis`] decision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct OwnedPeerState {
+    /// True when this peer has a `result.md` on the blackboard. A peer with no
+    /// result yet is NOT done, so it BLOCKS synthesis (the fleet isn't complete).
+    has_result: bool,
+    /// True when this peer is NOT settled: it has a live (non-terminal) turn in
+    /// flight OR a queued/just-claimed `peer_send_input` follow-up that has not
+    /// run yet. Either BLOCKS synthesis so a stale result isn't synthesized
+    /// while a fresher one is (about to be) produced.
+    mid_turn: bool,
+}
+
+/// Peer-fleet auto-synthesis — the decision for one evaluation of a master's
+/// fleet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FleetSynthesisDecision {
+    /// Fire ONE synthesis turn and CREATE the per-master `.synthesized`
+    /// existence marker so the fleet never synthesizes again while it lives.
+    Fire,
+    /// Do nothing.
+    Hold,
+    /// The master's owned fleet is fully CLEARED (zero owned peers): remove the
+    /// `.synthesized` marker (if present) so a later, freshly-spawned fleet can
+    /// fire once. Never a synthesis.
+    ClearStamp,
+}
+
+/// Peer-fleet auto-synthesis — decide whether a master's peer fleet warrants an
+/// AUTONOMOUS synthesis turn. The `.synthesized` stamp is an EXISTENCE marker:
+/// a fleet fires EXACTLY ONCE and never re-fires while any owned peer lives (a
+/// newer result or an added-and-completed peer must NOT re-synthesize). The
+/// stamp is cleared only when the fleet is fully retired (zero owned peers), so
+/// a genuinely fresh fleet later fires once.
+///
+/// Decision:
+/// - zero owned peers → [`ClearStamp`](FleetSynthesisDecision::ClearStamp) when
+///   the marker exists (reset for a future fresh fleet), else `Hold`.
+/// - marker already exists (this fleet was synthesized) → `Hold` — never
+///   re-fire while any owned peer remains.
+/// - master busy, or any owned peer not settled / not done → `Hold`.
+/// - otherwise (≥1 owned peer, idle, all settled + done, no marker) → `Fire`.
+///
+/// Pure + input-driven so the whole fire/reset/idle/settled matrix is
+/// unit-testable without the filesystem, the wire registry, or a live turn.
+fn evaluate_peer_fleet_synthesis(
+    peers: &[OwnedPeerState],
+    stamp_exists: bool,
+    master_idle: bool,
+) -> FleetSynthesisDecision {
+    // Fleet fully cleared → drop the marker so a fresh fleet can fire once.
+    // Checked FIRST and independent of idle: a retired fleet resets regardless.
+    if peers.is_empty() {
+        return if stamp_exists {
+            FleetSynthesisDecision::ClearStamp
+        } else {
+            FleetSynthesisDecision::Hold
+        };
+    }
+    // Already synthesized this fleet → EXACTLY ONCE: never re-fire while any
+    // owned peer exists (added peers / newer results do not re-arm).
+    if stamp_exists {
+        return FleetSynthesisDecision::Hold;
+    }
+    // Never fire onto a busy master. The continuation drain re-checks
+    // idle-eligibility before firing; gating here keeps the decision
+    // self-contained and avoids creating the marker for an unfired wave.
+    if !master_idle {
+        return FleetSynthesisDecision::Hold;
+    }
+    // Every owned peer must be DONE (has a result) and SETTLED (not mid-turn).
+    for peer in peers {
+        if peer.mid_turn || !peer.has_result {
+            return FleetSynthesisDecision::Hold;
+        }
+    }
+    FleetSynthesisDecision::Fire
+}
+
+/// Per-master `.synthesized` stamp path under `peers/`. Keyed by a
+/// `safe_filename` of the master's originator session string (which may carry
+/// `:`/`#`/path chars) so it is one safe, injective filename. Colocated with
+/// the per-slug peer dirs but never mistaken for one: it is a hidden FILE, and
+/// the fleet scan only accepts real dirs carrying `brief.md` (via
+/// [`staged_peer_dir`]), so it is skipped.
+fn peer_fleet_synthesized_stamp_path(peers_root: &Path, master: &str) -> PathBuf {
+    peers_root.join(format!(
+        ".synthesized-{}",
+        octos_core::safe_filename(master)
+    ))
+}
+
+/// True when the per-master `.synthesized` EXISTENCE marker is present. Only
+/// existence gates synthesis; the file's content (a debug timestamp) is never
+/// read.
+fn peer_fleet_synthesized_stamp_exists(peers_root: &Path, master: &str) -> bool {
+    peer_fleet_synthesized_stamp_path(peers_root, master).exists()
+}
+
+/// Remove the per-master `.synthesized` marker (best-effort). Absent is not an
+/// error. Used to RESET a fully-cleared fleet so a fresh one can fire once.
+fn remove_peer_fleet_synthesized_stamp(peers_root: &Path, master: &str) {
+    match std::fs::remove_file(peer_fleet_synthesized_stamp_path(peers_root, master)) {
+        Ok(()) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => {
+            tracing::warn!(?err, "failed to remove peer fleet .synthesized stamp");
+        }
+    }
+}
+
+/// Peer-fleet auto-synthesis RESET — remove the per-master `.synthesized` marker
+/// when the master's owned fleet has been fully CLEARED (every peer closed /
+/// removed), so a genuinely fresh fleet fires once later. Called from
+/// `peer_close` after the close marker lands (the just-closed peer is now
+/// excluded from the owned scan). No-op while any owned peer remains — the
+/// marker persists for the life of the fleet.
+///
+/// FAIL-CLOSED: a `peers/` scan failure (`None`) can't prove the fleet is empty,
+/// so it does NOT reset — a spurious reset would let an already-synthesized
+/// fleet re-fire. A failed marker REMOVAL is only logged: a stale marker lingers
+/// until the NEXT successful reset (not permanently).
+fn reset_peer_fleet_synthesis_if_cleared(peers_root: &Path, master: &str) {
+    if master.is_empty() {
+        return;
+    }
+    // Only a genuinely-read EMPTY owned set resets. `None` (scan error) or any
+    // remaining owned peer leaves the marker in place.
+    if collect_owned_peer_results(peers_root, master).is_none_or(|owned| !owned.is_empty()) {
+        return;
+    }
+    remove_peer_fleet_synthesized_stamp(peers_root, master);
+    // Bug 1 — also drop the scheduler's recent-claim guard entry for this
+    // master's STABLE per-master synthesis key. Without this, a fresh fleet
+    // completing within `RECENT_CLAIM_GUARD_WINDOW` would have its Fire enqueue
+    // rejected as a duplicate of the just-claimed prior synthesis, leaving the
+    // fresh fleet marked-but-unsynthesized. The disk marker and the in-memory
+    // guard are cleared together so the next legitimate fire is not suppressed.
+    default_agent_orchestrator().clear_peer_fleet_synthesis_claim(&SessionKey(master.to_owned()));
+}
+
+/// Enumerate every peer OWNED by `master` under `peers_root`, each paired with
+/// whether it has a `result.md`. "Owned" = a REAL staged peer (non-symlink dir
+/// carrying `brief.md`, via [`staged_peer_dir`]) whose `originator` file equals
+/// `master`. CLOSED peers (retired via `peer_close`) are EXCLUDED — a retired
+/// peer neither blocks nor keeps the fleet alive. Symlink-safe throughout;
+/// filesystem-only + wire-registry-free, so it is unit-testable with a tempdir.
+///
+/// Returns `None` when the `peers/` directory cannot be READ (missing /
+/// permission) — distinct from `Some(vec![])` for a genuinely-empty directory.
+/// The caller MUST treat `None` as "can't determine this pass" and fail closed
+/// (never reset the marker, never fire), so a transient scan error is never
+/// mistaken for a cleared fleet.
+fn collect_owned_peer_results(peers_root: &Path, master: &str) -> Option<Vec<(String, bool)>> {
+    let read_dir = std::fs::read_dir(peers_root).ok()?;
+    let mut owned = Vec::new();
+    for entry in read_dir.flatten() {
+        let slug = entry.file_name().to_string_lossy().into_owned();
+        // Route through `staged_peer_dir`: a symlinked / unsafe slug is never
+        // followed, and the `.synthesized-*` stamp files (not dirs) are skipped.
+        let Some(dir) = staged_peer_dir(peers_root, &slug) else {
+            continue;
+        };
+        // Retired peer: neither blocks nor keeps the fleet alive.
+        if dir.join("closed").is_file() {
+            continue;
+        }
+        // Originator gate — only peers THIS master staged. After the atomic
+        // owner-before-brief write in `stage_peer`, a visible (brief.md) member
+        // always has a readable originator, so a member of THIS master is never
+        // silently dropped from the ownership scan.
+        let Ok(originator) = std::fs::read_to_string(dir.join("originator")) else {
+            continue;
+        };
+        if originator.trim() != master {
+            continue;
+        }
+        owned.push((slug, dir.join("result.md").is_file()));
+    }
+    Some(owned)
+}
+
+/// Peer-fleet auto-synthesis hook. Called at a PEER session's turn terminal
+/// (right after its `result.md` is written): resolve the owning master from
+/// this peer's `originator`, and — when the master's WHOLE fleet is complete,
+/// settled, the master is idle, and the fleet has not already been synthesized
+/// — enqueue ONE autonomous synthesis continuation on the master session. The
+/// continuation drain (per-connection tick + connection-independent global
+/// drain) turns it into a fired master turn; `due_loop_targets`'
+/// pending-continuation sweep surfaces the master even without an active
+/// goal/loop.
+///
+/// EXACTLY ONCE: the per-master `.synthesized` marker is an existence gate. On
+/// fire the marker is CREATED FIRST (atomically); the continuation is enqueued
+/// ONLY if that write succeeds, so no synthesis fires without a durable marker.
+/// While the marker exists the fleet never re-fires — a newer result or an
+/// added peer does NOT re-synthesize. The marker is cleared only when the fleet
+/// is fully retired (see [`reset_peer_fleet_synthesis_if_cleared`], called from
+/// `peer_close`), letting a later fresh fleet fire once.
+///
+/// LOOP SAFETY: this fires ONLY on a `peer-<slug>` session's terminal. The
+/// synthesis turn runs on the MASTER session (not a peer), and `peer_gather`
+/// only READS `result.md` files — it never writes one — so the synthesis turn
+/// cannot produce a peer terminal and cannot re-trigger itself.
+///
+/// No-op for a non-peer session, an unstaged peer, a peer with no recorded
+/// originator, a busy master, an already-synthesized fleet, or an incomplete
+/// fleet.
+async fn maybe_enqueue_peer_fleet_synthesis(state: &Arc<AppState>, peer_session: &SessionKey) {
+    let Some((profile_id, finished_slug)) = peer_slug_and_profile(peer_session) else {
+        return;
+    };
+    let Some(runtime) = state.profiles.get(profile_id) else {
+        return;
+    };
+    let peers_root = runtime.data_dir.join("peers");
+    // Resolve the owning master from THIS peer's originator (symlink-safe).
+    let Some(finished_dir) = staged_peer_dir(&peers_root, finished_slug) else {
+        return;
+    };
+    let Ok(master) = std::fs::read_to_string(finished_dir.join("originator")) else {
+        return;
+    };
+    let master = master.trim().to_owned();
+    if master.is_empty() {
+        return;
+    }
+    let master_key = SessionKey(master.clone());
+
+    // One lock: sessions with a live (non-terminal) turn. Exclude THIS peer —
+    // its turn is still marked Active at this hook (the terminal transition
+    // runs just after), yet its result is already on the blackboard, so it
+    // counts as DONE, not mid-turn.
+    let active_turns = active_turns_registry();
+    let mut running = active_turn_sessions(&active_turns).await;
+    running.remove(peer_session);
+
+    // Master idle-eligibility, mirroring the drain's gate inputs: no in-flight
+    // turn AND no pending approval. (The drain re-checks this before firing.)
+    let master_idle = !running.contains(&master_key)
+        && contract_stores()
+            .approvals
+            .pending_for_session(&master_key)
+            .is_empty();
+
+    // Build the fleet's readiness inputs + the OWNED slug list (used to scope
+    // the synthesis gather). A peer is NOT settled if it has a live turn OR a
+    // queued/just-claimed `peer_send_input` follow-up.
+    //
+    // FAIL-CLOSED (Bug 2): a `peers/` scan failure returns `None`; do nothing
+    // this pass (no fire, no reset) rather than mistake an unreadable dir for a
+    // cleared fleet.
+    let orchestrator = default_agent_orchestrator();
+    let Some(owned) = collect_owned_peer_results(&peers_root, &master) else {
+        return;
+    };
+    let mut owned_slugs: Vec<String> = Vec::with_capacity(owned.len());
+    let peers: Vec<OwnedPeerState> = owned
+        .into_iter()
+        .map(|(slug, has_result)| {
+            // Resolve the wire session ONCE; reuse it for both the active-turn
+            // check and the in-flight-injection check.
+            let wire_session = peer_wire_registry().resolve(&peer_wire_key(profile_id, &slug));
+            let active_mid_turn = wire_session
+                .as_ref()
+                .is_some_and(|session| running.contains(session));
+            // A peer is NOT settled if it has a `peer_send_input` that is QUEUED
+            // or was just CLAIMED (popped by the drain, turn not yet active).
+            // The active-turn snapshot above and the pending queue are separate
+            // reads; the recent-claim check closes the pop-vs-snapshot window.
+            let inflight_injection =
+                orchestrator.peer_has_inflight_send_input(profile_id, &slug, wire_session.as_ref());
+            owned_slugs.push(slug);
+            OwnedPeerState {
+                has_result,
+                mid_turn: active_mid_turn || inflight_injection,
+            }
+        })
+        .collect();
+
+    let stamp_exists = peer_fleet_synthesized_stamp_exists(&peers_root, &master);
+    match evaluate_peer_fleet_synthesis(&peers, stamp_exists, master_idle) {
+        FleetSynthesisDecision::Hold => {}
+        // Defensive: a peer-terminal eval always includes the just-terminated
+        // peer, so the owned set is non-empty here; the real reset runs on
+        // `peer_close`. Handle it anyway so the decision contract is honored —
+        // drop the disk marker AND the recent-claim guard together (Bug 1).
+        FleetSynthesisDecision::ClearStamp => {
+            remove_peer_fleet_synthesized_stamp(&peers_root, &master);
+            orchestrator.clear_peer_fleet_synthesis_claim(&master_key);
+        }
+        FleetSynthesisDecision::Fire => {
+            // Write the `.synthesized` marker FIRST (durably, atomically). If it
+            // fails, do NOT enqueue: no fire without a persisted marker. The
+            // content is a debug timestamp; only existence gates. Concurrent
+            // terminals writing the same marker are safe (idempotent), and the
+            // per-master dedupe key collapses the paired enqueue.
+            let now_unix = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|elapsed| elapsed.as_secs())
+                .unwrap_or(0);
+            if let Err(err) = crate::memory_consolidate::apply::atomic_write(
+                &peer_fleet_synthesized_stamp_path(&peers_root, &master),
+                &now_unix.to_string(),
+            ) {
+                tracing::warn!(
+                    ?err,
+                    "peer fleet synthesis: .synthesized marker write failed; not enqueuing"
+                );
+                return;
+            }
+            let outcome = orchestrator.enqueue_peer_fleet_synthesis_continuation(
+                &master_key,
+                profile_id,
+                &owned_slugs,
+                peers.len(),
+            );
+            if outcome.queued().is_some() {
+                tracing::debug!(
+                    master = %master_key,
+                    profile = profile_id,
+                    peers = peers.len(),
+                    "peer fleet complete — enqueued ONE autonomous synthesis turn on master"
+                );
+            }
+        }
+    }
 }
 
 /// Serializes profile `sub_providers` read-modify-write across concurrent
@@ -12610,6 +13732,11 @@ async fn open_session_result(
     if let Some(root) = effective_workspace_root.as_ref() {
         session_workspaces().set(params.session_id.clone(), root.clone());
     }
+    // #436 — record a `peer-<slug>` session's wire key so `peer_send_input`
+    // (wired on the master's turn, which cannot know the peer's client-chosen
+    // wire id) can resolve the slug to the continuation-queue key it enqueues
+    // an injected turn under. No-op for non-peer / unprofiled sessions.
+    register_peer_wire_session(state, &params.session_id);
     let (mut replay, replay_baseline_seq) =
         ledger.replay_after_with_head(&params.session_id, params.after.as_ref())?;
     replay.retain(|event| ledger_event_matches_topic_scope(&event.event, topic_scope.as_deref()));
@@ -14233,6 +15360,11 @@ async fn handle_turn_start_with_accept(
                 None,
                 // #1650 — interactive goal binding snapshotted above.
                 interactive_goal_binding,
+                // #436 — regular user turns already persist their prompt
+                // (they are not internal continuations); no override needed.
+                false,
+                // #436 P1 #2 — regular turns don't gate completion on dispatch.
+                None,
             )
             .await;
         }
@@ -14515,6 +15647,49 @@ async fn maybe_spawn_appui_master_continuation_runner(
         return false;
     };
 
+    // #436 FIX 5 — a peer retired via peer_close (durable `closed` marker) has
+    // its continuation RETIRED, not reinserted: it was already popped by the
+    // drain above, so tombstone it (record completed) so a restart never
+    // replays it and it does not strand. A reopened closed peer IS the current
+    // wire, so only the marker check catches an injection queued around the
+    // close. No-op for non-peer targets (never "closed").
+    if peer_target_is_closed(state, &session_id) {
+        default_agent_orchestrator()
+            .mark_continuation_completed(&continuation, Some("retired_peer_closed".to_owned()));
+        return false;
+    }
+    // #436 P1 #4 — re-check peer freshness AFTER the pop (the pre-pop gate in
+    // the global drain is stale under a concurrent reopen). If this peer wire
+    // is no longer the slug's CURRENT registered wire, do NOT dispatch under
+    // the obsolete wire: RE-INSERT the injection so a reopen's retarget re-homes
+    // it (or the next tick redrains it once it is current again).
+    if !peer_target_is_current_wire(&session_id) {
+        default_agent_orchestrator().reinsert_peer_continuation(continuation);
+        return false;
+    }
+
+    // KNOWN LIMITATION (#436, accepted — best-effort single-user delivery).
+    // The freshness re-check above is NOT atomic with the dispatch below. A peer
+    // close+reopen that lands in the window between that check and the turn
+    // start can leave us dispatching under a wire that just went obsolete:
+    // the injection is delivered to the closing session (lost to the freshly
+    // reopened peer) or, if the process crashes mid-window before the turn's
+    // durable record completes, replayed on restart (duplicated). Closing this
+    // fully would require an atomic claim-and-dispatch spanning the wire
+    // registry, the continuation scheduler, and the turn spawn — disproportionate
+    // for a best-effort, single-user channel. An occasional lost/dup peer message
+    // under a concurrent close-reopen race is within the delivery semantics
+    // documented on `peer_send_input_authorized`. The window is small but NOT
+    // instantaneous: after this check the dispatch below builds the turn params,
+    // spawns the turn task (which awaits `start_rx`), briefly locks
+    // `connection_turns` to register the turn, then sends on `start_tx` to release
+    // it — a reopen interleaving anywhere in there is the race. It is narrow in
+    // practice (a peer close+reopen must land against a ~2s drain cadence and a
+    // multi-second human close+reopen) but nothing enforces a minimum gap, so it
+    // is a real accepted edge, not an impossibility. (The dup-on-restart case
+    // additionally requires a durable supervisor store; in pure in-memory serve
+    // the same race can only drop, never dup.)
+
     // M15-F5 (#44), Codex P2: a scheduled loop fire (self-paced / fixed /
     // maintenance) or goal continuation reaches the runtime here, NOT through
     // the manual `loop/fire_now` RPC. Emit the `loop/fired` /
@@ -14597,6 +15772,14 @@ async fn maybe_spawn_appui_master_continuation_runner(
         }
         _ => None,
     };
+    // #436 — a `peer_send_input` continuation's prompt is a real user turn:
+    // persist it as a `UserMessage` (transcript + durable history) rather than
+    // skipping it like a system-internal continuation.
+    let persist_peer_input_prompt = matches!(
+        &continuation.reason,
+        MasterContinuationReason::External(kind)
+            if kind == crate::api::agent_orchestrator::PEER_SEND_INPUT_EXTERNAL_KIND
+    );
     let handle = tokio::spawn(async move {
         if start_rx.await.is_err() {
             return;
@@ -14640,6 +15823,12 @@ async fn maybe_spawn_appui_master_continuation_runner(
         } else {
             None
         };
+        // #436 P1 #2 — for a peer_send_input injection, track whether the turn
+        // actually dispatched the agent, so an UNDELIVERED injection (e.g. a
+        // failed `TurnStarted`) is NOT marked completed and stays durable for
+        // retry/replay. `None` for every other continuation kind (unchanged).
+        let turn_dispatched = persist_peer_input_prompt
+            .then(|| std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)));
         run_standalone_turn(
             ws_for_turn,
             state_for_turn,
@@ -14659,12 +15848,34 @@ async fn maybe_spawn_appui_master_continuation_runner(
             // `goal_context` (a `GoalContinue` charges through
             // `record_goal_turn`); the interactive binding is never used.
             None,
+            // #436 — persist a peer_send_input injection as a UserMessage.
+            persist_peer_input_prompt,
+            turn_dispatched.clone(),
         )
         .await;
-        default_agent_orchestrator().mark_continuation_completed(
-            &continuation,
-            Some("processed_by_appui_turn_runtime".to_owned()),
-        );
+        // #436 P1 #2 — keep an undelivered peer injection durable; every other
+        // continuation keeps its unconditional completion. `None` (non-peer)
+        // counts as dispatched so the rule is a no-op there.
+        let agent_dispatched = turn_dispatched
+            .as_ref()
+            .is_none_or(|flag| flag.load(std::sync::atomic::Ordering::Acquire));
+        if continuation_may_complete(persist_peer_input_prompt, agent_dispatched) {
+            default_agent_orchestrator().mark_continuation_completed(
+                &continuation,
+                Some("processed_by_appui_turn_runtime".to_owned()),
+            );
+        } else {
+            // #436 P1 #2 — the injection never reached the agent (e.g. a failed
+            // `TurnStarted`). Keep the durable record AND re-insert it so it is
+            // retried LIVE on the next tick (and re-homed by a reopen's
+            // retarget) — not stranded until a server restart's durable replay.
+            tracing::warn!(
+                continuation_id = continuation.id.as_u64(),
+                "peer_send_input turn did not dispatch the agent; re-queuing the \
+                 injection for live retry"
+            );
+            default_agent_orchestrator().reinsert_peer_continuation(continuation);
+        }
     });
 
     btw_live_draft_clear(&session_id, &turn_id);
@@ -14689,6 +15900,68 @@ async fn maybe_spawn_appui_master_continuation_runner(
     true
 }
 
+/// #436 P1 #2 — decide whether THIS connection's per-connection continuation
+/// drain may run a due target. A peer session's turn streams live deltas
+/// EPHEMERALLY to the running connection's socket, so a non-owning same-profile
+/// connection (e.g. the master) draining a peer continuation would render the
+/// peer's turn on the WRONG client. Restrict a peer target to the connection
+/// that has the peer session open; a peer whose client is elsewhere or
+/// disconnected is left for its OWN connection or the connection-independent
+/// global drain (detached socket → delivered via the peer's durable session
+/// forwarder). Non-peer targets (goal/loop/child) are unchanged — any
+/// same-profile connection may drain them, as before.
+fn peer_target_deliverable_on_connection(
+    wire_key: &SessionKey,
+    open_sessions: &std::collections::HashSet<SessionKey>,
+) -> bool {
+    let is_peer = wire_key
+        .topic()
+        .is_some_and(|topic| topic.starts_with("peer-"));
+    !is_peer || open_sessions.contains(wire_key)
+}
+
+/// #436 P1 #3 — a peer continuation is only run by the connection-independent
+/// global drain when its target session is the slug's CURRENT registered wire.
+/// A closed peer (evicted from the registry) or an obsolete wire (superseded by
+/// a reopen the global drain raced) is skipped, so the injection is never run
+/// under a dead/obsolete session — it is re-homed and delivered when the peer
+/// reopens. Non-peer targets always pass.
+fn peer_target_is_current_wire(wire_key: &SessionKey) -> bool {
+    let Some((profile_id, slug)) = peer_slug_and_profile(wire_key) else {
+        return true;
+    };
+    peer_wire_registry()
+        .resolve(&peer_wire_key(profile_id, slug))
+        .as_ref()
+        == Some(wire_key)
+}
+
+/// #436 — a peer retired via `peer_close` must never be dispatched, even for an
+/// injection queued just before the close and re-homed onto the reopened wire:
+/// `peer_target_is_current_wire` sees only the registry (a reopened peer IS
+/// current), not the durable `closed` marker. This checks the marker so a
+/// closed peer's continuation is RETIRED by the drain gates (FIX 5 — popped +
+/// tombstoned, never reinserted), so it cannot strand. Non-peer (goal/loop)
+/// targets and unresolvable profiles are never "closed".
+fn peer_target_is_closed(state: &Arc<AppState>, wire_key: &SessionKey) -> bool {
+    let Some((profile_id, slug)) = peer_slug_and_profile(wire_key) else {
+        return false;
+    };
+    state
+        .profiles
+        .get(profile_id)
+        .is_some_and(|runtime| peer_is_closed(&runtime.data_dir.join("peers"), slug))
+}
+
+/// #436 P1 #2 — decide whether a drained continuation may be marked completed.
+/// A `peer_send_input` injection that did NOT dispatch the agent (its turn
+/// aborted before processing — e.g. a failed `TurnStarted` delivery) must stay
+/// durable for retry/replay, so it is NOT completed. Every other continuation
+/// (and a peer injection that DID dispatch) completes normally.
+fn continuation_may_complete(is_peer_injection: bool, agent_dispatched: bool) -> bool {
+    !is_peer_injection || agent_dispatched
+}
+
 async fn drain_appui_due_master_continuations(
     ws: &WsConnection,
     state: &Arc<AppState>,
@@ -14697,6 +15970,10 @@ async fn drain_appui_due_master_continuations(
     active_turns: &SharedActiveTurns,
     connection_turns: &SharedConnectionTurns,
     profile_filter: Option<&str>,
+    // #436 P1 #2 — the sessions THIS connection has open (live_forwarders
+    // snapshot); a peer continuation is only drained here when its session is
+    // in this set, so its live output reaches the peer's own client.
+    open_sessions: &std::collections::HashSet<SessionKey>,
     features: ConnectionUiFeatures,
 ) {
     let orchestrator = default_agent_orchestrator();
@@ -14711,6 +15988,10 @@ async fn drain_appui_due_master_continuations(
             continue;
         }
         let wire_key = wire_key_from_goal_key(&storage_key);
+        // #436 P1 #2 — never run another client's peer turn on this connection.
+        if !peer_target_deliverable_on_connection(&wire_key, open_sessions) {
+            continue;
+        }
         let _ = maybe_spawn_appui_master_continuation_runner(
             ws,
             state,
@@ -14987,6 +16268,26 @@ pub(crate) fn spawn_global_master_continuation_drain(state: Arc<AppState>) {
                     continue;
                 }
                 let wire_key = wire_key_from_goal_key(&storage_key);
+                // #436 FIX 5 — a peer retired via peer_close has its pending
+                // injections RETIRED (cancelled + tombstoned) here rather than
+                // skipped: a bare skip never pops them, so they would strand in
+                // the durable queue. Pop + tombstone the whole set for the
+                // closed peer, then move on.
+                if peer_target_is_closed(&state, &wire_key) {
+                    if let Some((closed_profile, closed_slug)) = peer_slug_and_profile(&wire_key) {
+                        orchestrator.cancel_peer_send_input_continuations_for_peer(
+                            closed_profile,
+                            closed_slug,
+                        );
+                    }
+                    continue;
+                }
+                // #436 P1 #3 — never run a peer injection under an obsolete
+                // wire (superseded by a reopen); it is delivered when the peer
+                // reopens (which re-homes it to the current wire).
+                if !peer_target_is_current_wire(&wire_key) {
+                    continue;
+                }
                 if maybe_spawn_appui_master_continuation_runner(
                     &ws,
                     &state,
@@ -22807,6 +24108,19 @@ async fn run_standalone_turn(
     // `None` for master continuations (`goal_context` carries their
     // accounting instead).
     interactive_goal_binding: Option<(String, String)>,
+    // #436 — when a master continuation's prompt IS a user turn that must land
+    // in the transcript + durable history (a `peer_send_input` injection),
+    // persist the internal user message instead of skipping it. `false` for
+    // system-internal continuations (goal/loop/child/recovery), whose
+    // `[system-internal]` prompt is intentionally not shown as a user row.
+    persist_continuation_prompt_as_user: bool,
+    // #436 P1 #2 — set to `true` right before the agent is dispatched, so the
+    // caller can tell whether the turn ACTUALLY processed the prompt. A turn
+    // that aborts before dispatch (e.g. a failed `TurnStarted` delivery) leaves
+    // it `false`, and the continuation runner then keeps a peer_send_input
+    // injection durable for retry/replay instead of marking it completed.
+    // `None` for the regular `turn/start` path, which doesn't need the signal.
+    turn_dispatched: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 ) {
     let session_id = params.session_id.clone();
     let turn_id = params.turn_id.clone();
@@ -23229,6 +24543,14 @@ async fn run_standalone_turn(
         workspace_root: Some(session_runtime.workspace_root.clone()),
     };
     if let Some(reply) = ws_slash::try_dispatch_slash_command(&prompt, &slash_ctx).await {
+        // #436 P1 #3 — a `/`-prefixed injected message is CONSUMED here (the
+        // command runs + is persisted) and returns before the agent-dispatch
+        // flag point below. Mark it dispatched so the continuation runner
+        // COMPLETES it rather than keeping it durable — otherwise a slash-shaped
+        // peer_send_input injection would be re-delivered after a restart.
+        if let Some(flag) = turn_dispatched.as_ref() {
+            flag.store(true, std::sync::atomic::Ordering::Release);
+        }
         let user_turn_id = turn_id.0.to_string();
         let user_message = pre_stamp_turn_thread_id(Message::user(prompt.clone()), &user_turn_id);
         let assistant_message = pre_stamp_turn_thread_id(Message::assistant(reply), &user_turn_id);
@@ -23979,6 +25301,152 @@ async fn run_standalone_turn(
             tool_registry.register(octos_agent::PeerGatherTool::new(gather));
         }
 
+        // `peer_list` — the compact status INDEX companion to `peer_gather`:
+        // one line per peer (slug, running/done/closed, last-updated, turn
+        // count, worktree?). Read-only, so registered with the SAME policy as
+        // gather (ALL serve sessions, including peer- topics). Use peer_list
+        // to see what exists / what's finished; peer_gather to read output.
+        if peer_list_allowed_for_session(&session_id) {
+            let list = build_peer_list_callback(session_runtime.profile.data_dir.join("peers"));
+            tool_registry.register(octos_agent::PeerListTool::new(list));
+        }
+
+        // #436 — `peer_send_input`: cross-session input injection into a
+        // RUNNING peer session. Same depth-1 guard as peer_handoff: peer
+        // sessions cannot send input to other peers (or themselves).
+        //
+        // Two delivery paths, tried in order:
+        //  1. Gateway fast-path — the process-global inbox registry populated
+        //     by `ActorRegistry::dispatch`. Delivers directly to a live
+        //     session actor's inbox. Always EMPTY in the serve process (serve
+        //     spawns `octos gateway` as a separate child and constructs no
+        //     `ActorRegistry`), so it normally falls through.
+        //  2. Serve continuation-queue path — resolve the peer's wire
+        //     `SessionKey` (recorded on `session/open`) and enqueue the
+        //     injection as a master continuation the peer drains on its next
+        //     `appui_continuation_tick` (or the connection-independent global
+        //     drain), rendered verbatim as the peer's next user turn.
+        if peer_handoff_allowed_for_session(&session_id) {
+            let send_profile_id = session_runtime.profile.profile_id.clone();
+            let send_peers_root = session_runtime.profile.data_dir.join("peers");
+            // #436 P1 #6 — the ORIGINATOR identity of THIS calling session,
+            // captured at wire time. Only the session that staged the peer may
+            // inject into it.
+            let send_origin_session = session_id.to_string();
+            let send_input: octos_agent::PeerSendInputCallback =
+                Arc::new(move |req: octos_agent::PeerSendInputRequest| {
+                    // Resolve the identifier (peer NAME or slug) to the actual
+                    // slug BEFORE any auth / path / wire op — names are the
+                    // primary address. Unknown identifier → a clear error.
+                    let slug = resolve_peer_name_to_slug(&send_peers_root, &req.slug).ok_or_else(
+                        || {
+                            format!(
+                                "no peer named '{ident}' — check the name (or slug) with peer_list",
+                                ident = req.slug
+                            )
+                        },
+                    )?;
+                    // The resolved slug is a real staged dir name; keep the
+                    // guard as defense-in-depth (guards BOTH delivery paths).
+                    if !peer_slug_is_safe(&slug) {
+                        return Err(format!("invalid peer slug '{slug}'"));
+                    }
+                    // #436 P1 #6 — authorize before any delivery path: only the
+                    // peer's recorded originator may inject.
+                    peer_send_input_authorized(&send_peers_root, &slug, &send_origin_session)?;
+                    // A closed peer (retired via peer_close) refuses input on
+                    // BOTH delivery paths — check here, before the Path 1
+                    // fast-path inbox send, not just the continuation queue.
+                    if peer_is_closed(&send_peers_root, &slug) {
+                        return Err(format!("peer '{slug}' is closed and cannot receive input"));
+                    }
+                    let key = peer_wire_key(&send_profile_id, &slug);
+
+                    // Path 1: gateway in-process inbox (fast, direct).
+                    let inbox_tx = crate::session_actor::peer_inbox_registry()
+                        .lock()
+                        .unwrap()
+                        .get(&key)
+                        .cloned();
+                    if let Some(tx) = inbox_tx {
+                        let inbound = InboundMessage {
+                            channel: String::new(),
+                            sender_id: String::new(),
+                            chat_id: String::new(),
+                            content: req.message,
+                            timestamp: chrono::Utc::now(),
+                            media: vec![],
+                            metadata: serde_json::json!({"origin": "peer_send_input"}),
+                            message_id: None,
+                            origin: MessageOrigin::Synthetic,
+                        };
+                        let actor_msg = crate::session_actor::ActorMessage::Inbound {
+                            message: inbound,
+                            image_media: vec![],
+                            attachment_media: vec![],
+                            attachment_prompt: None,
+                        };
+                        return tx.try_send(actor_msg).map_err(|e| {
+                            format!("peer session '{slug}' inbox is full or closed: {e}")
+                        });
+                    }
+
+                    // Path 2: serve continuation queue.
+                    let Some(target) = peer_wire_registry().resolve(&key) else {
+                        return Err(format!(
+                            "peer session '{slug}' is not open — the user must open \
+                             the staged peer session before it can receive input"
+                        ));
+                    };
+                    // A deleted peer must not silently swallow injections into a
+                    // queue nothing will drain: require the staged dir to exist.
+                    if !send_peers_root.join(&slug).is_dir() {
+                        return Err(format!(
+                            "peer '{slug}' no longer exists (its staged directory was removed)"
+                        ));
+                    }
+                    // #436 P1 #3/#4 — enqueue keyed on the unique occurrence id
+                    // (distinct calls never collapse) and map the REAL delivery
+                    // status to the result: a durable-persist failure is an
+                    // error, not a false success ack; Queued/Duplicate are ok.
+                    default_agent_orchestrator()
+                        .enqueue_peer_send_input_continuation(
+                            &target,
+                            &send_profile_id,
+                            &slug,
+                            &req.occurrence_id,
+                            &req.message,
+                        )
+                        .into_callback_result(&slug)
+                });
+            tool_registry.register(octos_agent::PeerSendInputTool::new(send_input));
+
+            // `peer_close` — gracefully retire a running peer the caller
+            // created. Same depth-1 guard as peer_send_input (originator-
+            // authorized, never on peer sessions). Captures the same
+            // peers-root / origin-session / profile-id the send_input callback
+            // does (fresh values — those bindings moved into the closure above).
+            let close_ws = ws.clone();
+            let close_ledger = ledger.clone();
+            // Durable `peer/closed` — mirrors the `peer/staged` emit so a
+            // briefly-disconnected client still tears down the peer on replay.
+            let emit_closed: Arc<dyn Fn(PeerClosedEvent) + Send + Sync> =
+                Arc::new(move |event: PeerClosedEvent| {
+                    let _ = send_notification_durable(
+                        &close_ws,
+                        &close_ledger,
+                        UiNotification::PeerClosed(event),
+                    );
+                });
+            let close = build_peer_close_callback(
+                session_runtime.profile.data_dir.join("peers"),
+                session_id.to_string(),
+                session_runtime.profile.profile_id.clone(),
+                emit_closed,
+            );
+            tool_registry.register(octos_agent::PeerCloseTool::new(close));
+        }
+
         // Wire the PARENT `send_file` for the legacy non-contract
         // `files_to_send` path and any explicit agent calls. The
         // spawn_only auto-background branch falls back to `send_file`
@@ -24624,7 +26092,11 @@ async fn run_standalone_turn(
     // since FA-11.
     let auto_escalation_router = session_runtime.profile.adaptive_router.clone();
     let auto_escalation_session_id = session_id.0.clone();
-    let skip_internal_user_persist = internal_master_continuation;
+    // #436 — a `peer_send_input` continuation carries a real user turn: keep
+    // its prompt (persist it as a `UserMessage`) so it reaches the peer's
+    // transcript + durable history via the canonical `MessageCommitObserver`.
+    let skip_internal_user_persist =
+        internal_master_continuation && !persist_continuation_prompt_as_user;
     // #1128 codex P1 re-review #2 — clone the session manager Arc
     // before the agent_task spawn moves the original. We need the
     // clone alive in this outer scope for the post-turn self-paced
@@ -24656,6 +26128,13 @@ async fn run_standalone_turn(
     // client returns home after the farewell audio. `false` for text turns or
     // replies without the marker.
     let (exit_directive_tx, exit_directive_rx) = tokio::sync::oneshot::channel::<bool>();
+    // #436 P1 #2 — we are past every pre-dispatch early-return (failed
+    // `TurnStarted`, runtime-unavailable, etc.); the agent is about to process
+    // the prompt. Record that so the continuation runner knows the injection
+    // was actually consumed and may be marked completed.
+    if let Some(flag) = turn_dispatched.as_ref() {
+        flag.store(true, std::sync::atomic::Ordering::Release);
+    }
     let agent_task = tokio::spawn(async move {
         let start = std::time::Instant::now();
         // RFC-3 (#1292): wrap the agent.process_message future in the
@@ -25565,15 +27044,25 @@ async fn run_standalone_turn(
                     tokens_in: Some(u32::try_from(tokens_in).unwrap_or(u32::MAX)),
                     tokens_out: Some(u32::try_from(tokens_out).unwrap_or(u32::MAX)),
                     session_result,
+                    outcome: Some(TurnTerminalOutcome::Completed),
                 };
                 // #1801 v2: a peer session's terminal leaves its result on
                 // the blackboard (result.md beside the brief).
                 write_peer_result_if_peer_session(
                     &state,
                     &session_id,
-                    "completed",
+                    TurnTerminalOutcome::Completed,
                     event.get("content").and_then(Value::as_str).unwrap_or(""),
                 );
+                // Peer-fleet auto-synthesis: a peer COMPLETING may be the last
+                // of its master's fleet — evaluate the fleet and, when every
+                // owned peer is done and the master is idle, fire ONE autonomous
+                // synthesis turn on the master (no user prompt). No-op for
+                // non-peer sessions and incomplete fleets. Only the Completed
+                // arm triggers the evaluation; an errored/interrupted peer's
+                // result still counts toward readiness (it does not block) but
+                // does not itself kick off a synthesis.
+                maybe_enqueue_peer_fleet_synthesis(&state, &session_id).await;
                 // FIX-04: flush any accumulated drops before the lifecycle
                 // terminal so the client knows the cursor is incomplete.
                 flush_replay_lossy(&ws, &ledger, &session_id, &progress_dropped);
@@ -25627,7 +27116,24 @@ async fn run_standalone_turn(
                     }
                     None => ("runtime_error", message),
                 };
-                write_peer_result_if_peer_session(&state, &session_id, "error", &wire_msg);
+                let turn_outcome = if code.contains("rate_limit")
+                    || code.contains("rate_limited")
+                    || wire_msg.contains("rate_limit")
+                    || wire_msg.contains("rate_limited")
+                    || code.contains("429")
+                    || wire_msg.contains("429")
+                {
+                    TurnTerminalOutcome::RateLimited
+                } else {
+                    TurnTerminalOutcome::Errored
+                };
+                write_peer_result_if_peer_session(&state, &session_id, turn_outcome, &wire_msg);
+                // codex #2 — an ERRORED/interrupted/rate-limited peer still
+                // wrote a result.md; evaluate the fleet here too so a fleet
+                // whose LAST peer errors still triggers synthesis (the error
+                // body is part of what the master consolidates). Same fleet
+                // gate as the completed arm; no-op for non-peer sessions.
+                maybe_enqueue_peer_fleet_synthesis(&state, &session_id).await;
                 flush_replay_lossy(&ws, &ledger, &session_id, &progress_dropped);
                 try_emit_terminal(
                     &turn_state,
@@ -25942,6 +27448,15 @@ async fn run_standalone_turn(
             None,
         )
         .await;
+        // codex #2 residual — a client-interrupted peer takes THIS branch, not
+        // the Completed/errored arms, so its fleet was never evaluated: a last
+        // interrupted peer could leave the fleet unsynthesized. Evaluate here
+        // too. An interrupt writes no fresh result.md, so if this was the peer's
+        // only turn the fleet-done check correctly HOLDS (it's not done); a
+        // persistent peer with a prior result is synthesized against that. The
+        // point is to not SKIP evaluation on the interrupt path. No-op for
+        // non-peer sessions.
+        maybe_enqueue_peer_fleet_synthesis(&state, &session_id).await;
     }
 
     let _ = agent_task.await;
@@ -26734,6 +28249,7 @@ struct TurnCompletionDetails {
     tokens_in: Option<u32>,
     tokens_out: Option<u32>,
     session_result: Option<TurnSessionResult>,
+    outcome: Option<TurnTerminalOutcome>,
 }
 
 /// Atomically transition state and emit exactly one terminal event. No-op if
@@ -29708,6 +31224,9 @@ fn ledger_event_cursor(event: &UiProtocolLedgerEvent) -> Option<UiCursor> {
             // cwd / branch), not a replay cursor; the durable ledger cursor
             // on the surrounding LedgeredUiProtocolEvent is authoritative.
             | UiNotification::PeerStaged(_)
+            // peer/closed likewise carries only teardown facts (slug / topic),
+            // not a replay cursor — same authoritative-ledger-cursor rule.
+            | UiNotification::PeerClosed(_)
             // UPCR-2026-014 M9-γ: envelopes carry their OWN per-thread
             // `seq` allocated by `ThreadSeqAllocator`, not the per-session
             // `UiCursor` the legacy ledger replay uses. The durable

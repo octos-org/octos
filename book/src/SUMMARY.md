@@ -10,6 +10,7 @@
 - [LLM Providers & Routing](./providers.md)
 - [Gateway & Channels](./channels.md)
 - [Memory & Skills](./memory-skills.md)
+- [Multi-Agent Orchestration](./multi-agent.md)
 - [Advanced Features](./advanced.md)
 
 # Operations

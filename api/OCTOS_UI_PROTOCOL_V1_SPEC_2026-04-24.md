@@ -581,6 +581,12 @@ Peer staging (#1801 v3, ungated):
   `worktree_branch?`, and `profile_id` — the same facts a `peer/prepare`
   result entry carries. Durable: reconnect replay redelivers it, so clients
   dedup by existing session for the topic.
+- `peer/closed` — agent-initiated peer teardown: the model's `peer_close`
+  tool retired a staged peer (durable brief and optional fenced worktree
+  evicted), so the client tears down the peer pane it opened (topic
+  `peer-<slug>`). `params` carry the ORIGINATING `session_id` plus `topic`,
+  `slug`, and `profile_id`. Durable: reconnect replay redelivers it, so
+  clients dedup by the already-closed peer for the topic.
 
 ## 7. Command Semantics
 

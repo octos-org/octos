@@ -26,15 +26,21 @@ use super::{Tool, ToolResult};
 /// `peer/prepare` cap — a brief is a task contract, not blob storage.
 pub const PEER_HANDOFF_BRIEF_MAX_BYTES: usize = 64 * 1024;
 
+/// Upper bound (chars) on a peer NAME — a short, human-readable handle, not a
+/// payload. The host derives the directory slug from it (capped separately).
+pub const PEER_HANDOFF_NAME_MAX_CHARS: usize = 64;
+
 /// Parsed, validated handoff arguments delivered to the host callback.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PeerHandoffRequest {
     /// The complete task contract for the peer (trimmed, non-empty,
     /// `<=` [`PEER_HANDOFF_BRIEF_MAX_BYTES`]).
     pub brief: String,
-    /// Optional short title seeding the peer's slug (trimmed; `None` when
-    /// omitted or blank — the host derives a seed from the brief instead).
-    pub title: Option<String>,
+    /// Required human-readable NAME — the peer's primary address ("let Edison
+    /// do X"). Trimmed, non-empty, `<=` [`PEER_HANDOFF_NAME_MAX_CHARS`] chars.
+    /// The host derives the directory slug from it and REJECTS a duplicate
+    /// (case-insensitive) rather than auto-suffixing.
+    pub name: String,
     /// Whether the host should fence the peer in its own git worktree.
     pub worktree: bool,
 }
@@ -77,8 +83,7 @@ impl PeerHandoffTool {
 #[derive(Debug, Deserialize)]
 struct Input {
     brief: String,
-    #[serde(default)]
-    title: Option<String>,
+    name: String,
     #[serde(default)]
     worktree: bool,
 }
@@ -99,13 +104,15 @@ impl Tool for PeerHandoffTool {
 
     fn description(&self) -> &str {
         "Promote work OUT of this conversation into a sovereign peer session with \
-         its own durable brief, workspace, and lifecycle. Use when the work outlives \
-         this turn, needs its own workspace or safety envelope, or the user may steer \
-         it separately. You will NOT receive the result in this turn — the peer \
-         reports to the user's session strip and the shared blackboard. For work \
-         whose result THIS turn needs to continue reasoning, use spawn instead. The \
-         brief is a complete task contract: include all context the peer needs (it \
-         cannot see this conversation)."
+         its own durable brief, workspace, and lifecycle. Give the peer a short, \
+         unique NAME — it is the peer's primary address (\"let Edison do X\"); you \
+         reach it later by name with peer_send_input / peer_close / peer_gather. \
+         Use when the work outlives this turn, needs its own workspace or safety \
+         envelope, or the user may steer it separately. You will NOT receive the \
+         result in this turn — the peer reports to the user's session strip and the \
+         shared blackboard. For work whose result THIS turn needs to continue \
+         reasoning, use spawn instead. The brief is a complete task contract: \
+         include all context the peer needs (it cannot see this conversation)."
     }
 
     fn tags(&self) -> &[&str] {
@@ -123,17 +130,19 @@ impl Tool for PeerHandoffTool {
     fn input_schema(&self) -> Value {
         json!({
             "type": "object",
-            "required": ["brief"],
+            "required": ["name", "brief"],
             "properties": {
+                "name": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": PEER_HANDOFF_NAME_MAX_CHARS,
+                    "description": "Short, unique, human-readable name for the peer — its primary address (e.g. \"Edison\"). You reach the peer later by this name. Must be unique among your peers."
+                },
                 "brief": {
                     "type": "string",
                     "minLength": 1,
                     "maxLength": PEER_HANDOFF_BRIEF_MAX_BYTES,
                     "description": "Complete task contract for the peer. It cannot see this conversation: include the goal, all needed context/paths, constraints, and what a finished result looks like."
-                },
-                "title": {
-                    "type": "string",
-                    "description": "Optional short title; seeds the peer's slug and session name."
                 },
                 "worktree": {
                     "type": "boolean",
@@ -148,11 +157,23 @@ impl Tool for PeerHandoffTool {
             Ok(input) => input,
             Err(err) => {
                 return Ok(failure(format!(
-                    "invalid peer_handoff arguments: {err}. Required: {{\"brief\": string}}; \
-                     optional: \"title\" (string), \"worktree\" (boolean)."
+                    "invalid peer_handoff arguments: {err}. Required: \
+                     {{\"name\": string, \"brief\": string}}; optional: \"worktree\" (boolean)."
                 )));
             }
         };
+        let name = input.name.trim();
+        if name.is_empty() {
+            return Ok(failure(
+                "name is required — a short, unique, human-readable handle for the peer \
+                 (e.g. \"Edison\"); it is how you address the peer later.",
+            ));
+        }
+        if name.chars().count() > PEER_HANDOFF_NAME_MAX_CHARS {
+            return Ok(failure(format!(
+                "name exceeds {PEER_HANDOFF_NAME_MAX_CHARS} characters — keep it a short handle."
+            )));
+        }
         let brief = input.brief.trim();
         if brief.is_empty() {
             return Ok(failure(
@@ -168,18 +189,14 @@ impl Tool for PeerHandoffTool {
         }
         let request = PeerHandoffRequest {
             brief: brief.to_owned(),
-            title: input
-                .title
-                .as_deref()
-                .map(str::trim)
-                .filter(|title| !title.is_empty())
-                .map(ToOwned::to_owned),
+            name: name.to_owned(),
             worktree: input.worktree,
         };
         match (self.stage)(request) {
             Ok(staged) => Ok(ToolResult {
                 output: format!(
-                    "Staged peer '{slug}' (brief at {brief_path}, cwd {cwd}). The user's \
+                    "Staged peer '{name}' (slug {slug}, brief at {brief_path}, cwd {cwd}). \
+                     Address it later by name with peer_send_input / peer_close. The user's \
                      client opens it in the background; its result lands on the blackboard \
                      at peers/{slug}/result.md. Do not wait for it.",
                     slug = staged.slug,
@@ -227,7 +244,7 @@ mod tests {
         }));
 
         let result = tool
-            .execute(&json!({ "title": "No brief" }))
+            .execute(&json!({ "name": "Edison" }))
             .await
             .expect("validation failure is a tool result, not an Err");
         assert!(!result.success);
@@ -248,7 +265,10 @@ mod tests {
             Err("must not run".to_owned())
         }));
 
-        let result = tool.execute(&json!({ "brief": "   \n\t " })).await.unwrap();
+        let result = tool
+            .execute(&json!({ "brief": "   \n\t ", "name": "Edison" }))
+            .await
+            .unwrap();
         assert!(!result.success);
         assert!(result.output.contains("brief is required"));
         assert_eq!(calls.load(Ordering::SeqCst), 0, "callback must not fire");
@@ -264,12 +284,80 @@ mod tests {
         }));
 
         let oversized = "x".repeat(PEER_HANDOFF_BRIEF_MAX_BYTES + 1);
-        let result = tool.execute(&json!({ "brief": oversized })).await.unwrap();
+        let result = tool
+            .execute(&json!({ "brief": oversized, "name": "Edison" }))
+            .await
+            .unwrap();
         assert!(!result.success);
         assert!(
             result
                 .output
                 .contains(&PEER_HANDOFF_BRIEF_MAX_BYTES.to_string()),
+            "cap named in the error: {}",
+            result.output
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "callback must not fire");
+    }
+
+    #[tokio::test]
+    async fn should_reject_and_skip_callback_when_name_missing() {
+        let calls = Arc::new(AtomicU32::new(0));
+        let calls_cb = calls.clone();
+        let tool = PeerHandoffTool::new(Arc::new(move |_request| {
+            calls_cb.fetch_add(1, Ordering::SeqCst);
+            Err("must not run".to_owned())
+        }));
+
+        let result = tool
+            .execute(&json!({ "brief": "Has a brief but no name." }))
+            .await
+            .expect("validation failure is a tool result, not an Err");
+        assert!(!result.success);
+        assert!(
+            result.output.contains("name"),
+            "schema hint names the missing field: {}",
+            result.output
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "callback must not fire");
+    }
+
+    #[tokio::test]
+    async fn should_reject_and_skip_callback_when_name_blank() {
+        let calls = Arc::new(AtomicU32::new(0));
+        let calls_cb = calls.clone();
+        let tool = PeerHandoffTool::new(Arc::new(move |_request| {
+            calls_cb.fetch_add(1, Ordering::SeqCst);
+            Err("must not run".to_owned())
+        }));
+
+        let result = tool
+            .execute(&json!({ "brief": "A real brief.", "name": "   " }))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(result.output.contains("name is required"));
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "callback must not fire");
+    }
+
+    #[tokio::test]
+    async fn should_reject_and_skip_callback_when_name_oversized() {
+        let calls = Arc::new(AtomicU32::new(0));
+        let calls_cb = calls.clone();
+        let tool = PeerHandoffTool::new(Arc::new(move |_request| {
+            calls_cb.fetch_add(1, Ordering::SeqCst);
+            Err("must not run".to_owned())
+        }));
+
+        let oversized = "n".repeat(PEER_HANDOFF_NAME_MAX_CHARS + 1);
+        let result = tool
+            .execute(&json!({ "brief": "A real brief.", "name": oversized }))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(
+            result
+                .output
+                .contains(&PEER_HANDOFF_NAME_MAX_CHARS.to_string()),
             "cap named in the error: {}",
             result.output
         );
@@ -283,7 +371,7 @@ mod tests {
         let result = tool
             .execute(&json!({
                 "brief": "  Fix the flaky bus test; repro in crates/octos-bus.  ",
-                "title": "  CI Fix  ",
+                "name": "  CI Fix  ",
                 "worktree": true,
             }))
             .await
@@ -296,14 +384,16 @@ mod tests {
             seen[0],
             PeerHandoffRequest {
                 brief: "Fix the flaky bus test; repro in crates/octos-bus.".to_owned(),
-                title: Some("CI Fix".to_owned()),
+                name: "CI Fix".to_owned(),
                 worktree: true,
             },
-            "brief/title are trimmed, worktree passes through"
+            "brief/name are trimmed, worktree passes through"
         );
 
-        // The result teaches the model the fire-and-forget contract.
-        assert!(result.output.contains("Staged peer 'ci-fix'"));
+        // The result addresses the peer by NAME and teaches the fire-and-forget
+        // contract (the recorder maps it to slug `ci-fix`).
+        assert!(result.output.contains("Staged peer 'CI Fix'"));
+        assert!(result.output.contains("slug ci-fix"));
         assert!(result.output.contains("/data/peers/ci-fix/brief.md"));
         assert!(result.output.contains("cwd /work/peers/ci-fix/wt"));
         assert!(result.output.contains("peers/ci-fix/result.md"));
@@ -311,11 +401,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn should_default_optional_args_when_omitted() {
+    async fn should_default_worktree_when_omitted() {
         let (tool, seen) = tool_with_recorder();
 
         let result = tool
-            .execute(&json!({ "brief": "Just the brief." }))
+            .execute(&json!({ "brief": "Just the brief.", "name": "Solo" }))
             .await
             .unwrap();
         assert!(result.success);
@@ -325,7 +415,7 @@ mod tests {
             seen[0],
             PeerHandoffRequest {
                 brief: "Just the brief.".to_owned(),
-                title: None,
+                name: "Solo".to_owned(),
                 worktree: false,
             }
         );
@@ -334,17 +424,14 @@ mod tests {
     #[tokio::test]
     async fn should_surface_callback_error_as_tool_failure() {
         let tool = PeerHandoffTool::new(Arc::new(|_request| {
-            Err("peer handoff limit reached for this turn (4)".to_owned())
+            Err("a peer named 'Edison' already exists".to_owned())
         }));
 
         let result = tool
-            .execute(&json!({ "brief": "Over budget." }))
+            .execute(&json!({ "brief": "Over budget.", "name": "Edison" }))
             .await
             .unwrap();
         assert!(!result.success);
-        assert_eq!(
-            result.output,
-            "peer handoff limit reached for this turn (4)"
-        );
+        assert_eq!(result.output, "a peer named 'Edison' already exists");
     }
 }

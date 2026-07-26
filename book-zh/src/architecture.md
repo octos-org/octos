@@ -130,6 +130,8 @@ pub enum AgentMessage {           // tagged: "type", snake_case
 }
 ```
 
+该带标签枚举是**子 Agent** 的协调通道。**对等 Agent** 的协调方式不同 —— 通过自治会话与文件黑板，而非带内消息；参见[多 Agent 编排](./multi-agent.md)。
+
 ### 错误系统
 
 ```rust
@@ -1441,7 +1443,11 @@ LLM 响应：[web_search, read_file, send_email]
                     下一次 LLM 调用
 ```
 
-### 子 Agent 模式（spawn 工具）
+### 子 Agent 与对等 Agent
+
+octos 支持两种归属模型相反的多 Agent 形态。
+
+**子 Agent**（`spawn` 工具）是当前轮次的子代：
 
 | 方面 | 同步 | 后台 |
 |--------|------|------------|
@@ -1451,6 +1457,8 @@ LLM 响应：[web_search, read_file, send_email]
 | 使用场景 | 顺序流水线 | 触发后不管的长任务 |
 
 子 Agent 不能再生成子 Agent（spawn 工具在子 Agent 策略中始终被拒绝）。
+
+**对等 Agent**（`peer_handoff` / `peer_send_input` / `peer_gather` / `peer_list` / `peer_close` 工具）是*自治的会话*，而非子代：一个对等 Agent 拥有自己持久化的简报、工作区、`session/open` + `turn/start` 生命周期，以及 `peers/<slug>/result.md` 产出，并在发起它的那一轮结束后继续存活（仅在客户端断连时关闭）。对等 Agent 在磁盘上暂存（`peer/prepare` 暂存 1–8 个编队），在一个进程级全局的对等连线注册表（`{profile}:peer:{slug}` → 会话）中被实时追踪，并且仅通过 `peer_gather` 读取的文件黑板协调 —— 它们绝不在带内共享上下文。`peer_send_input` 通过网关 actor 收件箱（网关）或一个持久化的**延续队列**（serve，约 2 秒逐连接 / 5 秒全局抽取）触达运行中的对等 Agent；投递是**尽力而为、单用户**的，由 originator 检查（fail-closed）、深度-1 护栏（对等 Agent 不能 handoff 或注入）、每轮 4 次 handoff 上限，以及重投上限（5 次尝试，序列前移使卡住的注入不会饿死新工作）共同守护。完整模型、投递路径与已知限制参见[多 Agent 编排](./multi-agent.md)。
 
 ### 多租户仪表板
 
