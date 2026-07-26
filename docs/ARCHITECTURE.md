@@ -10,7 +10,7 @@ For the next hardening/generalization round after the runtime refactor, see [OCT
 **Workspace members**:
 - **10 octos-* crates**: octos-core, octos-memory, octos-llm, octos-agent, octos-bus, octos-cli, octos-pipeline, octos-plugin, **octos-sandbox** (Windows AppContainer helper binary), **octos-swarm** (PM/swarm dispatcher, ledger, topology)
 - **14 app-skill workspace crates**, of which **9 are auto-bootstrapped at gateway startup** (the contents of `BUNDLED_APP_SKILLS` in `crates/octos-agent/src/bundled_app_skills.rs`):
-  - **Bundled (9)**: news, deep-search, deep-crawl, send-email, account-manager, time (binary `clock`), weather, pipeline-guard, skill-evolve
+  - **Bundled (9)**: news, deep-search, deep-crawl, send-email, account-manager, time (binary `clock`), weather, smart-home, skill-evolve
   - **Not bundled (5) — workspace example/utility crates only**: `harness-starter-{audio, coding, generic, report}` (templates for new skill authors), `wechat-bridge` (transport helper, not a tool-providing skill)
 - **1 platform-skill crate**: voice (auto-bootstrapped)
 
@@ -602,7 +602,7 @@ Triggered when estimated tokens exceed 80% of context window / 1.2 safety margin
 | `account-manager` | `account_manager` | Sub-account ops |
 | `time` | `clock` | Time/timezone |
 | `weather` | `weather` | Weather API |
-| `pipeline-guard` | `pipeline-guard` | DOT pipeline before-hook validator |
+| `smart-home` | `smart_home` | List/control smart-home devices via profile bridge |
 | `skill-evolve` | `skill-evolve` | Patch-management for skill SKILL.md drift |
 
 `PLATFORM_SKILLS` adds one more entry — `voice` — bootstrapped once by `octos serve` at admin-bot startup, shared across all gateway profiles, only installed when its OminiX-API backend is reachable. Voice cloning is **not** part of the platform voice skill — it is handled by the separate `mofa-fm` skill (`fm_tts`).
@@ -1562,7 +1562,7 @@ crates/
 ├── app-skills/    (14 workspace crates; only 9 are auto-bootstrapped via
 │                    BUNDLED_APP_SKILLS:
 │                      news, deep-search, deep-crawl, send-email,
-│                      account-manager, time, weather, pipeline-guard,
+│                      account-manager, time, weather, smart-home,
 │                      skill-evolve.
 │                    Workspace-only (not bundled):
 │                      harness-starter-{audio, coding, generic, report},

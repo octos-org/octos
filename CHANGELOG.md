@@ -3,6 +3,10 @@
 All notable changes to octos will be documented in this file.
 ## [Unreleased]
 
+### Features
+
+- Smart Home control — list and control smart-home devices (lights, thermostats, curtains, etc.) via a per-profile bridge (e.g. Home Assistant), through both the UI Protocol (`smart_home/*` WS methods, backing octos-web's Smart Home panel) and a new bundled `smart-home` agent skill (`smart_home_list_devices`, `smart_home_control_device`). Camera video streaming stays a human-facing, WebSocket-only feature and is not exposed to the agent.
+
 ### Changed
 
 - Per-tenant frps tunnel authentication via `metadatas.token`. Each tenant now has its own `tunnel_token` (UUID generated at registration) validated by the octos frps server plugin; the previous shared FRPS auth token is no longer needed and `auth.token` is set to `""` on both frps and frpc. `scripts/install.sh` and `scripts/install.ps1` recover the per-tenant token from an existing `/etc/frp/frpc.toml` on rerun and have updated prompt wording to reflect the per-tenant model.

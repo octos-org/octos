@@ -29,6 +29,8 @@ pub mod preview_tokens;
 pub mod purge;
 mod router;
 pub(crate) mod session_ingress;
+mod smart_home_bridge;
+mod smart_home_panel;
 pub(crate) mod solo_auth;
 pub(crate) mod specialist_runner;
 mod static_files;

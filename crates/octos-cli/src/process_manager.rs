@@ -511,6 +511,16 @@ impl ProcessManager {
             }
         }
 
+        // Inject smart-home bridge config as env vars for the smart-home
+        // plugin skill, same gap-bridging as the email block above.
+        if let Some(ref smart_home) = profile.config.smart_home {
+            for (key, value) in smart_home.to_env_vars(&profile.config.env_vars) {
+                if !profile.config.env_vars.contains_key(&key) {
+                    cmd.env(&key, &value);
+                }
+            }
+        }
+
         // Pass env vars from profile config, resolving keychain markers and
         // filtering out dangerous ones.
         tracing::debug!(profile = %profile.id, "start: resolving env vars");

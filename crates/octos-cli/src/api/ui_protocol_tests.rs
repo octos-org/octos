@@ -14036,6 +14036,11 @@ fn session_ingress_callable_method_matches_the_deny_surfaces() {
         octos_core::ui_protocol::methods::CRON_LIST,
         octos_core::ui_protocol::methods::CRON_TOGGLE,
         octos_core::ui_protocol::methods::SESSION_FORK,
+        octos_core::ui_protocol::methods::SMART_HOME_STATUS_GET,
+        octos_core::ui_protocol::methods::SMART_HOME_DEVICE_LIST,
+        octos_core::ui_protocol::methods::SMART_HOME_DEVICE_COMMAND,
+        octos_core::ui_protocol::methods::SMART_HOME_CAMERA_STREAM_START,
+        octos_core::ui_protocol::methods::SMART_HOME_CAMERA_STREAM_STOP,
     ] {
         assert!(
             !session_ingress_callable_method(m),
