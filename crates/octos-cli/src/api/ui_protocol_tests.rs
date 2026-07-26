@@ -25669,7 +25669,7 @@ fn peer_list_and_gather_surface_display_name() {
     )
     .unwrap();
 
-    let list_cb = build_peer_list_callback(peers.clone());
+    let list_cb = build_peer_list_callback(peers.clone(), Vec::new());
     let list = list_cb().unwrap();
     assert!(
         list.contains("Edison"),
@@ -25889,7 +25889,7 @@ fn peer_list_caps_rows_and_summarizes_overflow() {
     }
     let over = PEER_LIST_MAX_ROWS + 5;
     let rows: Vec<_> = (0..over).map(|i| row(&format!("p{i:04}"))).collect();
-    let text = compose_peer_list_text(&rows);
+    let text = compose_peer_list_text(&rows, &[]);
     assert!(
         text.starts_with(&format!("peers ({over}):")),
         "header reports the true count: {:?}",
@@ -25903,7 +25903,7 @@ fn peer_list_caps_rows_and_summarizes_overflow() {
     );
 
     // Under the cap: every row inline, no summary line.
-    let few = compose_peer_list_text(&[row("only")]);
+    let few = compose_peer_list_text(&[row("only")], &[]);
     assert!(few.contains("- only"), "{few}");
     assert!(
         !few.contains("more"),
@@ -26209,18 +26209,29 @@ fn peer_lane_resolution_skips_non_peer_session() {
     assert_eq!(peer_slug_and_profile(&peer), Some(("dev", "synth")));
 }
 
-/// #peer-model (part 4): `peer_list` annotates a peer running on a model lane
-/// and leaves a primary-model peer unannotated.
+/// #peer-model (part 4a): `peer_list` annotates a peer on a CURRENTLY-configured
+/// lane, flags a peer whose recorded lane no longer resolves as
+/// `unavailable→primary`, and leaves a primary-model peer unannotated.
 #[test]
-fn compose_peer_list_text_annotates_model_lane() {
+fn compose_peer_list_text_annotates_and_flags_stale_model_lane() {
     let rows = vec![
         peer_list_row("synth", Some("strong")),
+        peer_list_row("stale", Some("gone")),
         peer_list_row("grunt", None),
     ];
-    let text = compose_peer_list_text(&rows);
+    // Only "strong" is currently configured.
+    let text = compose_peer_list_text(&rows, &["strong".to_owned()]);
     assert!(
         text.contains("- synth  running  updated —  turns 0  · model=strong"),
-        "a lane peer is annotated with its lane: {text:?}"
+        "a live lane peer is annotated with its lane: {text:?}"
+    );
+    let stale_line = text
+        .lines()
+        .find(|line| line.starts_with("- stale"))
+        .expect("stale row present");
+    assert!(
+        stale_line.contains("· model=gone (unavailable→primary)"),
+        "a lane that no longer resolves is flagged, matching what the turn does: {stale_line:?}"
     );
     let grunt_line = text
         .lines()
@@ -26229,6 +26240,144 @@ fn compose_peer_list_text_annotates_model_lane() {
     assert!(
         !grunt_line.contains("model="),
         "a primary-model peer has no lane annotation: {grunt_line:?}"
+    );
+}
+
+/// #peer-model (codex-1): a lane that OMITS its own `api_key_env` must CLEAR the
+/// primary's (never inherit the primary provider's credential); a lane WITH one
+/// uses it.
+#[test]
+fn lane_provider_config_clears_primary_api_key_env_when_lane_omits_it() {
+    let mut primary = crate::config::Config::default();
+    primary.api_key_env = Some("PRIMARY_PROVIDER_KEY".to_owned());
+
+    // A lane on a DIFFERENT provider with NO api_key_env of its own.
+    let lane = crate::config::SubProviderConfig {
+        key: "strong".to_owned(),
+        provider: "anthropic".to_owned(),
+        model: Some("claude-x".to_owned()),
+        api_key_env: None,
+        base_url: None,
+        description: None,
+        default_context_window: None,
+        max_output_tokens: None,
+        api_type: None,
+    };
+    assert_eq!(
+        lane_provider_config(&primary, &lane).api_key_env,
+        None,
+        "a lane without its own api_key_env CLEARS the primary's (falls back to the lane provider's default env), not inherits it"
+    );
+
+    // A lane WITH its own api_key_env uses that.
+    let lane_keyed = crate::config::SubProviderConfig {
+        api_key_env: Some("LANE_KEY".to_owned()),
+        ..lane.clone()
+    };
+    assert_eq!(
+        lane_provider_config(&primary, &lane_keyed)
+            .api_key_env
+            .as_deref(),
+        Some("LANE_KEY"),
+        "a lane with its own api_key_env uses it"
+    );
+}
+
+/// #peer-model (codex-3): duplicate lane keys resolve to the LAST match,
+/// mirroring `ProviderRouter`'s last-wins registration.
+#[test]
+fn select_peer_lane_prefers_last_duplicate_key() {
+    let mut config = crate::config::Config::default();
+    let base = crate::config::SubProviderConfig {
+        key: "strong".to_owned(),
+        provider: "openai".to_owned(),
+        model: Some("first".to_owned()),
+        api_key_env: None,
+        base_url: None,
+        description: None,
+        default_context_window: None,
+        max_output_tokens: None,
+        api_type: None,
+    };
+    config.sub_providers = vec![
+        base.clone(),
+        crate::config::SubProviderConfig {
+            provider: "anthropic".to_owned(),
+            model: Some("second".to_owned()),
+            ..base.clone()
+        },
+    ];
+    let sp = select_peer_lane(&config, "strong").expect("lane found");
+    assert_eq!(
+        sp.model.as_deref(),
+        Some("second"),
+        "the LAST duplicate wins (matches ProviderRouter register-last-wins)"
+    );
+    assert_eq!(sp.provider, "anthropic");
+    assert!(select_peer_lane(&config, "cheap").is_none());
+}
+
+/// #peer-model (codex-2): a symlinked `model` leaf is refused by BOTH the
+/// turn-path read and peer_list's independent read — never followed.
+#[cfg(unix)]
+#[test]
+fn read_peer_model_lane_refuses_symlinked_model_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    let peers_root = tmp.path().join("peers");
+    let dir = stage_peer_dir_with(&peers_root, "synth");
+    // Point `model` at an external file via a symlink.
+    let secret = tmp.path().join("elsewhere");
+    std::fs::write(&secret, "strong").unwrap();
+    std::os::unix::fs::symlink(&secret, dir.join("model")).unwrap();
+
+    assert_eq!(
+        read_peer_model_lane(&peers_root, "synth"),
+        None,
+        "the turn-path read refuses a symlinked model file"
+    );
+    let row = read_peer_blackboard(&peers_root, None)
+        .into_iter()
+        .find(|r| r.slug == "synth")
+        .expect("row present");
+    assert_eq!(
+        row.model_lane, None,
+        "peer_list's independent read also refuses the symlinked model file"
+    );
+}
+
+/// #peer-model (codex-4b): when the lane record WRITE fails, the tool note must
+/// say the peer fell back to the primary model — not report success.
+#[test]
+fn record_peer_model_lane_reports_fallback_when_write_fails() {
+    let tmp = tempfile::tempdir().unwrap();
+    let peers_root = tmp.path().join("peers");
+    let dir = stage_peer_dir_with(&peers_root, "synth");
+    // Force the atomic write to fail: `model` already exists as a DIRECTORY, so
+    // the temp+rename cannot replace it with a file.
+    std::fs::create_dir(dir.join("model")).unwrap();
+
+    let note = record_peer_model_lane(&peers_root, "synth", Some("strong"), &["strong".to_owned()])
+        .expect("a failed record yields a note");
+    assert!(
+        note.contains("primary model"),
+        "a failed record is truthful about the fallback: {note}"
+    );
+    // A clean record (no pre-existing obstruction) yields no note.
+    let clean = stage_peer_dir_with(&peers_root, "synth2");
+    assert_eq!(
+        record_peer_model_lane(
+            &peers_root,
+            "synth2",
+            Some("strong"),
+            &["strong".to_owned()]
+        ),
+        None,
+        "a clean record produces no warning note"
+    );
+    assert_eq!(
+        std::fs::read_to_string(clean.join("model")).unwrap(),
+        "strong",
+        "the lane is recorded on a clean write"
     );
 }
 
