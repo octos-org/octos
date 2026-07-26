@@ -23,9 +23,19 @@ const DEFAULT_MAX_BATCH: usize = 16;
 ///
 /// `mlx-rs` `Array` is `Send` but not `Sync`, and MLX evaluation is best kept
 /// single-threaded, so the model lives behind a `Mutex` — forward passes
-/// serialize (~21 ms each for a short sequence on Metal, measured warm at
-/// batch=1). Tokenization is `Sync` and happens outside the lock, and a batched
-/// call takes ONE lock for the whole batch rather than one per text.
+/// serialize. Tokenization is `Sync` and happens outside the lock, and a
+/// batched call takes ONE lock for the whole batch rather than one per text.
+///
+/// Cost of a short sequence on Metal, warm, `--release` (a debug build is ~3x
+/// slower — do not quote dev-profile timings):
+///
+/// * batch=1  — ~7 ms per embedding
+/// * batch=16 — ~1.2 ms per embedding
+///
+/// That 6x gap is the point: at batch=1 most of the wall clock is per-op
+/// dispatch for ~360 kernel launches (24 blocks x ~15 ops), not arithmetic.
+/// The model is small enough that a single sequence never fills the GPU, so
+/// batching is what turns latency-bound work into throughput-bound work.
 pub struct MlxEmbedder {
     model: Mutex<GemmaModel>,
     tokenizer: GemmaTokenizer,
