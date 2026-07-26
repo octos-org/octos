@@ -66,6 +66,26 @@ impl Block {
 /// f16 range (±65504). A plain f16 add overflows to `inf`; mlx clips instead:
 /// for f16 inputs it adds in f32, clamps to ±f16::MAX, then casts back to f16.
 /// Skipping this diverged hard at the last two blocks (cos 0.98 → 1.0000).
+///
+/// NEGATIVE RESULT — do not re-try this. As written this is six mlx-rs calls
+/// (two casts, add, two clamps, cast back), running twice per block over 24
+/// blocks, which looks like ~288 kernel launches on a model that is
+/// dispatch-bound at batch=1. Replacing it with one hand-written fused Metal
+/// kernel via `mlx_fast_metal_kernel` was implemented and measured: numerically
+/// EXACT (golden parity unchanged to the digit) and **flat on speed** —
+/// batch=1 6.85 ms fused vs 6.88 ms graph, batch=16 17.7 ms vs 18.2 ms, both
+/// inside run-to-run spread over 3 A/B pairs.
+///
+/// A follow-up probe found why, and bounds any future attempt: replacing this
+/// whole chain with a bare `x.add(y)` — 1 op instead of 6, numerically wrong but
+/// timing-valid — measured 6.60/6.87/6.65 ms against a 6.86/6.95/6.83 ms
+/// baseline. **Deleting five sixths of the chain is worth ~3%, at the edge of
+/// noise.** No fusion of it could ever have won more than that.
+///
+/// So the mistake was picking the target by counting ops rather than measuring
+/// where time goes: mlx-rs calls build a lazy GRAPH, and op-count at the binding
+/// layer is not GPU launch-count. The batch=1 cost lives in the quantized
+/// matmuls and SDPA. Optimize there, or raise the batch size.
 fn clip_residual(x: &Array, y: &Array) -> Result<Array> {
     if x.dtype() != Dtype::Float16 {
         return Ok(x.add(y)?);
