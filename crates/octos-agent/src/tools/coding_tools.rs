@@ -375,7 +375,11 @@ impl ExecCommandTool {
         // timeout arm needs it to kill the process tree (dropping the wait
         // future does NOT kill a tokio child).
         let child_pid = child.id();
+        // Armed for the whole wait: a dropped future (user interrupt ->
+        // `agent_task.abort()`) reaches neither arm below. See `ChildGroupGuard`.
+        let mut group_guard = ChildGroupGuard::new(child_pid);
         let result = timeout(Duration::from_secs(timeout_secs), child.wait_with_output()).await;
+        group_guard.disarm();
         match result {
             Ok(Ok(output)) => {
                 let mut text = String::new();
@@ -1797,7 +1801,12 @@ impl Tool for BashTool {
         // SIGTERM -> brief grace -> SIGKILL (Unix) or `taskkill /F /T`
         // (Windows). Mirrors `ShellTool`'s kill-on-timeout path.
         let child_pid = child.id();
-        match timeout(Duration::from_secs(timeout_secs), child.wait_with_output()).await {
+        // Armed for the whole wait: a dropped future (user interrupt ->
+        // `agent_task.abort()`) reaches neither arm below. See `ChildGroupGuard`.
+        let mut group_guard = ChildGroupGuard::new(child_pid);
+        let waited = timeout(Duration::from_secs(timeout_secs), child.wait_with_output()).await;
+        group_guard.disarm();
+        match waited {
             Ok(Ok(output)) => {
                 let mut text = String::new();
                 text.push_str(&String::from_utf8_lossy(&output.stdout));
@@ -1835,6 +1844,67 @@ impl Tool for BashTool {
                     success: false,
                     ..Default::default()
                 })
+            }
+        }
+    }
+}
+
+/// Kills a child's process group if dropped while still armed.
+///
+/// [`kill_timed_out_child`] only runs on the TIMEOUT arm of the `match` below.
+/// When the whole future is dropped instead, neither that arm nor tokio's own
+/// cleanup fires — `tokio::process::Child` does not kill on drop — and the
+/// child's entire process group survives.
+///
+/// That is not a hypothetical path: it is exactly what a user interrupt does.
+/// Esc on the serve path calls `agent_task.abort()`, which drops this future,
+/// so `bash("npm run dev")` kept running after the UI said the turn had
+/// stopped — holding its ports and still able to write to the workspace. The
+/// guard closes that by making cleanup a property of the scope rather than of
+/// one match arm.
+///
+/// Disarm on every path that has already reaped or killed the child.
+struct ChildGroupGuard(Option<u32>);
+
+impl ChildGroupGuard {
+    fn new(child_pid: Option<u32>) -> Self {
+        Self(child_pid)
+    }
+
+    /// The normal paths (clean exit, spawn error, timeout ladder) have already
+    /// dealt with the child; leave it alone.
+    fn disarm(&mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for ChildGroupGuard {
+    fn drop(&mut self) {
+        let Some(pid) = self.0 else {
+            return;
+        };
+        // `Drop` cannot await, but the graceful ladder needs a grace period
+        // between SIGTERM and SIGKILL. Hand it to a detached task when a
+        // runtime is still available — cancellation drops this guard while the
+        // runtime is very much alive, so that is the normal case. Only if there
+        // is no runtime (shutdown) fall back to a synchronous hard kill, which
+        // is a better end state than leaking the group.
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                handle.spawn(kill_timed_out_child(Some(pid)));
+            }
+            Err(_) => {
+                #[cfg(unix)]
+                {
+                    signal_process_group(pid, "-9");
+                    signal_process(pid, "-9");
+                }
+                #[cfg(windows)]
+                {
+                    let _ = std::process::Command::new("taskkill")
+                        .args(["/F", "/T", "/PID", &pid.to_string()])
+                        .status();
+                }
             }
         }
     }
