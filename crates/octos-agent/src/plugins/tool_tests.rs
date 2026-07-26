@@ -2245,16 +2245,21 @@ async fn strict_env_allowlist_retains_path() {
 
 // ---- risk approval gate ----
 
+#[cfg(unix)]
 use async_trait::async_trait;
+#[cfg(unix)]
 use std::sync::Mutex;
 
+#[cfg(unix)]
 use crate::tools::ToolApprovalRequester;
 
+#[cfg(unix)]
 struct RecordingRequester {
     decision: ToolApprovalDecision,
     last: Arc<Mutex<Option<ToolApprovalRequest>>>,
 }
 
+#[cfg(unix)]
 impl RecordingRequester {
     fn new(decision: ToolApprovalDecision) -> (Arc<Self>, Arc<Mutex<Option<ToolApprovalRequest>>>) {
         let last = Arc::new(Mutex::new(None));
@@ -2266,6 +2271,7 @@ impl RecordingRequester {
     }
 }
 
+#[cfg(unix)]
 #[async_trait]
 impl ToolApprovalRequester for RecordingRequester {
     async fn request_approval(&self, request: ToolApprovalRequest) -> ToolApprovalDecision {
@@ -2532,7 +2538,11 @@ fn should_thread_session_approval_context_into_plugin_tools_on_rebind() {
 
     let dir = tempfile::tempdir().expect("create temp dir");
     let script_path = dir.path().join("script.sh");
-    write_test_script(&script_path, "#!/bin/sh\necho '{}'\n");
+    // Never executed — this test only checks approval-context threading
+    // through the registry rebind, so the placeholder just needs to exist
+    // on disk. `write_test_script` (real shebang + chmod +x) is Unix-only;
+    // an empty file keeps this test running on Windows too.
+    std::fs::write(&script_path, "").unwrap();
     let mut def = make_tool_def("risky", "risky");
     def.risk = Some("high".into());
 
@@ -2893,6 +2903,7 @@ fn multi_tenant_scope_at(
     .expect("build multi-tenant scope")
 }
 
+#[cfg(unix)]
 fn ctx_with_scope(scope: SessionScope) -> ToolContext {
     let mut ctx = ToolContext::zero();
     ctx.session_scope = Some(Arc::new(scope));

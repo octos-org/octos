@@ -1,5 +1,6 @@
 use super::*;
 use async_trait::async_trait;
+#[cfg(unix)]
 use octos_agent::{HookConfig, HookEvent};
 use octos_llm::{AdaptiveConfig, ChatConfig, ChatResponse, StopReason, TokenUsage, ToolSpec};
 use std::sync::atomic::AtomicUsize;

@@ -123,9 +123,9 @@ fn default_data_dir() -> PathBuf {
 fn xdg_config_home() -> PathBuf {
     #[cfg(windows)]
     {
-        return dirs::config_dir()
+        dirs::config_dir()
             .map(|d| d.join("octos"))
-            .unwrap_or_else(default_data_dir);
+            .unwrap_or_else(default_data_dir)
     }
     #[cfg(not(windows))]
     {

@@ -1,4 +1,5 @@
 use super::*;
+#[cfg(unix)]
 use crate::{HookConfig, HookEvent};
 
 #[test]
