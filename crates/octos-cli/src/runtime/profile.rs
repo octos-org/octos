@@ -171,6 +171,16 @@ pub struct ProfileRuntime {
     /// session-scope bootstrap code don't have to re-derive it.
     pub data_dir: PathBuf,
 
+    /// The profile's resolved [`crate::config::Config`] (as produced by
+    /// `config_from_profile` at bootstrap, with host memory/plugins merged).
+    /// Most runtime state is pre-extracted into the typed fields below; this
+    /// is retained for the few paths that must resolve a lane provider
+    /// LAZILY from `config.sub_providers` (with the profile's credential /
+    /// timeout config), e.g. a peer session that runs its turns on a named
+    /// `sub_provider` model lane (`peers/<slug>/model`). Kept whole rather
+    /// than re-deriving a `Config` off disk on the hot path.
+    pub config: crate::config::Config,
+
     /// The fully-wrapped LLM provider chain for this profile.
     /// Includes retry, provider failover, and (if `adaptive_router`
     /// is `Some`) adaptive routing. Every session for this profile
@@ -1133,6 +1143,10 @@ impl ProfileRuntime {
         Ok(Arc::new(Self {
             profile_id: profile.id.clone(),
             data_dir: data_dir.to_path_buf(),
+            // Retained whole for lazy per-lane provider resolution (e.g. a
+            // peer running on a named `sub_provider` model lane); the typed
+            // fields below carry the pre-extracted hot-path state.
+            config: config.clone(),
             llm,
             adaptive_router,
             runtime_qos_catalog,

@@ -10461,6 +10461,12 @@ fn build_peer_handoff_callback(
     workspace_root: PathBuf,
     originating_session: SessionKey,
     profile_id: String,
+    // #peer-model — the KEYS of the profile's configured `sub_providers`
+    // (model lanes). A `peer_handoff` naming a matching lane records it beside
+    // the brief so the peer runs its turns on that provider; an unknown lane
+    // is surfaced as a warning note (the peer falls back to the primary
+    // model), never a failure.
+    available_lanes: Vec<String>,
     handoffs_this_turn: Arc<AtomicU32>,
     emit_staged: Arc<dyn Fn(PeerStagedEvent) + Send + Sync>,
 ) -> octos_agent::PeerHandoffCallback {
@@ -10489,6 +10495,16 @@ fn build_peer_handoff_callback(
             request.worktree,
         )
         .map_err(|err| err.message)?;
+        // #peer-model — optional model lane. Record a VALID lane symlink-safely
+        // under the re-validated staged dir; an unknown lane (or a failed
+        // record) is a truthful warning (the peer runs on the primary model),
+        // never a staging failure.
+        let model_note = record_peer_model_lane(
+            &peers_root,
+            &staged.slug,
+            request.model.as_deref(),
+            &available_lanes,
+        );
         // Durable so reconnect replay still delivers the open request; the
         // client dedups by an already-open session for the topic.
         emit_staged(PeerStagedEvent {
@@ -10507,8 +10523,192 @@ fn build_peer_handoff_callback(
             brief_path: staged.brief_path.to_string_lossy().into_owned(),
             cwd: staged.cwd.to_string_lossy().into_owned(),
             worktree_branch: staged.worktree_branch,
+            model_note,
         })
     })
+}
+
+/// #peer-model — read a small text file through an `O_NOFOLLOW` open (Unix) so
+/// a symlink leaf swapped into a validated peer dir cannot redirect the read to
+/// an off-tenant target (mirrors `read_file_no_follow` for the sync peer-file
+/// layer). On non-Unix, re-checks `symlink_metadata` first. `None` on any error
+/// (missing, symlink, unreadable).
+fn read_text_no_follow(path: &Path) -> Option<String> {
+    use std::io::Read;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.custom_flags(libc::O_NOFOLLOW);
+    }
+    #[cfg(not(unix))]
+    {
+        if path.symlink_metadata().is_ok_and(|meta| meta.is_symlink()) {
+            return None;
+        }
+    }
+    let mut file = opts.open(path).ok()?;
+    let mut content = String::new();
+    file.read_to_string(&mut content).ok()?;
+    Some(content)
+}
+
+/// #peer-model — read a peer's optional model LANE key from
+/// `peers/<slug>/model` (written by the `peer_handoff` staging callback when
+/// the master named a VALID `sub_provider` lane). Routed through
+/// [`staged_peer_dir`] (real, non-symlink dir with `brief.md`) AND an
+/// `O_NOFOLLOW` read of the leaf so neither a symlinked dir nor a symlinked
+/// `model` file is ever followed. Returns the trimmed lane key, or `None` when
+/// the dir is not a real staged peer, the file is absent/symlinked, or empty.
+fn read_peer_model_lane(peers_root: &Path, slug: &str) -> Option<String> {
+    let dir = staged_peer_dir(peers_root, slug)?;
+    let lane = read_text_no_follow(&dir.join("model"))?;
+    let lane = lane.trim();
+    (!lane.is_empty()).then(|| lane.to_owned())
+}
+
+/// #peer-model — record a requested model lane for a freshly-staged peer,
+/// returning the tool-visible note (`None` = recorded cleanly, or no lane was
+/// requested). Validates the (trimmed) lane against the CURRENT
+/// `available_lanes`; a match is written symlink-safely under the RE-VALIDATED
+/// [`staged_peer_dir`] (never `brief_path.parent()`, which races a parent
+/// swap) via the atomic temp+rename write (no-follow at the target). Both an
+/// unknown lane and a failed record are TRUTHFUL: they say the peer will run on
+/// the primary model, matching what the turn actually does.
+fn record_peer_model_lane(
+    peers_root: &Path,
+    slug: &str,
+    requested: Option<&str>,
+    available_lanes: &[String],
+) -> Option<String> {
+    let lane = requested.map(str::trim).filter(|lane| !lane.is_empty())?;
+    if !available_lanes.iter().any(|key| key == lane) {
+        let available = if available_lanes.is_empty() {
+            "none configured".to_owned()
+        } else {
+            available_lanes.join(", ")
+        };
+        return Some(format!(
+            "model lane '{lane}' not found (available: {available}) — \
+             this peer will use the primary model."
+        ));
+    }
+    let recorded = match staged_peer_dir(peers_root, slug) {
+        Some(dir) => crate::memory_consolidate::apply::atomic_write(&dir.join("model"), lane),
+        None => Err(eyre::eyre!("staged peer dir not found for slug {slug}")),
+    };
+    if let Err(err) = recorded {
+        tracing::warn!(
+            ?err,
+            slug,
+            lane,
+            "failed to record peer model lane; peer will use the primary model"
+        );
+        return Some(format!(
+            "could not record model lane '{lane}' — this peer will use the primary model."
+        ));
+    }
+    None
+}
+
+/// #peer-model — select the `sub_provider` for a lane KEY. LAST match wins,
+/// mirroring `ProviderRouter::register_with_full_meta` (last-registered wins),
+/// so a profile with duplicate lane keys runs a peer on the SAME model a
+/// pipeline sub-provider lane would resolve to.
+fn select_peer_lane<'a>(
+    config: &'a crate::config::Config,
+    lane: &str,
+) -> Option<&'a crate::config::SubProviderConfig> {
+    config.sub_providers.iter().rev().find(|sp| sp.key == lane)
+}
+
+/// #peer-model — derive the per-lane [`crate::config::Config`] for building a
+/// lane provider. The lane's `api_key_env` is applied UNCONDITIONALLY (even
+/// when `None`): a lane that omits its own key must CLEAR the primary's
+/// `api_key_env` and fall back to its OWN provider's default env var (e.g.
+/// `ANTHROPIC_API_KEY`), never borrow the primary provider's credential.
+fn lane_provider_config(
+    config: &crate::config::Config,
+    sp: &crate::config::SubProviderConfig,
+) -> crate::config::Config {
+    let mut c = config.clone();
+    c.api_key_env = sp.api_key_env.clone();
+    c
+}
+
+/// #peer-model — build the LLM provider for a named model LANE from the
+/// profile config, mirroring `build_sub_provider_router`'s per-lane
+/// construction: select the lane's `sub_provider` (last-wins), build via
+/// `create_provider_with_api_type` with the lane's own credential, and wrap in
+/// `RetryProvider`. Returns `None` (caller falls back to the primary model)
+/// when no lane matches or the provider fails to build.
+fn build_peer_lane_provider(
+    config: &crate::config::Config,
+    lane: &str,
+) -> Option<Arc<dyn octos_llm::LlmProvider>> {
+    let Some(sp) = select_peer_lane(config, lane) else {
+        tracing::warn!(
+            lane,
+            "peer model lane not found among the profile's sub_providers — using the primary model"
+        );
+        return None;
+    };
+    let sp_config = lane_provider_config(config, sp);
+    match crate::commands::chat::create_provider_with_api_type(
+        &sp.provider,
+        &sp_config,
+        sp.model.clone(),
+        sp.base_url.clone(),
+        sp.api_type.as_deref(),
+    ) {
+        Ok(p) => {
+            let provider: Arc<dyn octos_llm::LlmProvider> =
+                Arc::new(octos_llm::RetryProvider::new(p));
+            Some(provider)
+        }
+        Err(err) => {
+            tracing::warn!(
+                lane,
+                provider = %sp.provider,
+                error = %err,
+                "failed to build peer model lane provider — using the primary model"
+            );
+            None
+        }
+    }
+}
+
+/// #peer-model — resolve the model-lane provider for `slug` under `peers_root`
+/// using `config`: read the recorded lane key, then build its provider. `None`
+/// at any missing step so the caller falls back to the primary model. Split
+/// out of [`peer_lane_provider_for`] so the lane read + selection + build is
+/// unit-testable without a full `SessionRuntime`.
+fn resolve_peer_lane_provider(
+    peers_root: &Path,
+    slug: &str,
+    config: &crate::config::Config,
+) -> Option<Arc<dyn octos_llm::LlmProvider>> {
+    let lane = read_peer_model_lane(peers_root, slug)?;
+    build_peer_lane_provider(config, &lane)
+}
+
+/// #peer-model — the per-peer model LANE resolver used by the WS turn path.
+/// When THIS session is a peer whose staging recorded a `peers/<slug>/model`
+/// lane matching a configured `sub_provider`, run the peer's turns on THAT
+/// provider instead of the profile's primary. Returns `None` — so the caller
+/// falls back to the primary model — for a non-peer session, a peer with no
+/// recorded lane, an unmatched lane key, or a lane whose provider fails to
+/// build. The peer STAYS on the master's profile (blackboard, ownership,
+/// `peer_gather`, synthesis all keyed to the master's profile unchanged); only
+/// the model-within-the-profile differs.
+fn peer_lane_provider_for(
+    session_id: &SessionKey,
+    session_runtime: &crate::runtime::SessionRuntime,
+) -> Option<Arc<dyn octos_llm::LlmProvider>> {
+    let (_profile_id, slug) = peer_slug_and_profile(session_id)?;
+    let peers_root = session_runtime.profile.data_dir.join("peers");
+    resolve_peer_lane_provider(&peers_root, slug, &session_runtime.profile.config)
 }
 
 /// #1801 v2: peer sessions leave a durable result on the blackboard — a
@@ -10697,6 +10897,10 @@ struct PeerBlackboardRow {
     /// #435: parsed `turns.txt` entries: `[(turn_count, outcome, updated_unix)]`.
     /// `None` when the file doesn't exist (single-turn-or-less peer).
     turn_history: Option<Vec<(u32, String, u64)>>,
+    /// #peer-model — the model LANE key from `peers/<slug>/model` (a configured
+    /// `sub_provider` this peer runs its turns on), trimmed; `None` for a peer
+    /// on the profile's primary model.
+    model_lane: Option<String>,
 }
 
 /// #1801: row-reading core of the peer blackboard — every staged peer dir
@@ -10761,6 +10965,12 @@ fn read_peer_blackboard(peers_root: &Path, slugs: Option<&[String]>) -> Vec<Peer
                 has_worktree: dir.join("wt").is_dir(),
                 closed: dir.join("closed").is_file(),
                 turn_history: parse_peer_turns_index(&dir),
+                // #peer-model — the recorded model lane, if any (O_NOFOLLOW
+                // read so a symlinked `model` leaf is refused; trimmed, empty
+                // treated as absent).
+                model_lane: read_text_no_follow(&dir.join("model"))
+                    .map(|lane| lane.trim().to_owned())
+                    .filter(|lane| !lane.is_empty()),
             });
         }
     }
@@ -10933,7 +11143,7 @@ fn build_peer_gather_callback(peers_root: PathBuf) -> octos_agent::PeerGatherCal
 /// "… and N more" line (read specific peers with peer_gather slugs).
 const PEER_LIST_MAX_ROWS: usize = 200;
 
-fn compose_peer_list_text(rows: &[PeerBlackboardRow]) -> String {
+fn compose_peer_list_text(rows: &[PeerBlackboardRow], available_lanes: &[String]) -> String {
     if rows.is_empty() {
         return "(no peers staged)".to_owned();
     }
@@ -10952,6 +11162,17 @@ fn compose_peer_list_text(rows: &[PeerBlackboardRow]) -> String {
             .map_or_else(|| "—".to_owned(), |ts| ts.to_string());
         let turns = row.turn_history.as_ref().map_or(0, Vec::len);
         let worktree = if row.has_worktree { "  worktree" } else { "" };
+        // #peer-model — annotate the peer's model lane, resolved against the
+        // CURRENT `sub_providers` so the index matches what the turn actually
+        // does: a lane whose key no longer exists is flagged as falling back to
+        // the primary model, not printed as if it were live.
+        let model = match row.model_lane.as_deref() {
+            Some(lane) if available_lanes.iter().any(|key| key == lane) => {
+                format!("  · model={lane}")
+            }
+            Some(lane) => format!("  · model={lane} (unavailable→primary)"),
+            None => String::new(),
+        };
         // Address by NAME; show the slug in parens when it differs.
         let addr = if row.name == row.slug {
             row.slug.clone()
@@ -10959,7 +11180,7 @@ fn compose_peer_list_text(rows: &[PeerBlackboardRow]) -> String {
             format!("{} ({})", row.name, row.slug)
         };
         lines.push(format!(
-            "- {addr}  {status}  updated {updated}  turns {turns}{worktree}"
+            "- {addr}  {status}  updated {updated}  turns {turns}{worktree}{model}"
         ));
     }
     if rows.len() > PEER_LIST_MAX_ROWS {
@@ -10981,12 +11202,17 @@ fn peer_list_allowed_for_session(_session_id: &SessionKey) -> bool {
 /// Mirrors [`build_peer_gather_callback`] but composes the compact status
 /// index ([`compose_peer_list_text`]) over the SAME row reader
 /// ([`read_peer_blackboard`]); it takes no slugs — it always lists every peer.
-fn build_peer_list_callback(peers_root: PathBuf) -> octos_agent::PeerListCallback {
+/// `available_lanes` (the profile's CURRENT `sub_provider` keys) lets the index
+/// flag a peer whose recorded model lane no longer resolves (#peer-model).
+fn build_peer_list_callback(
+    peers_root: PathBuf,
+    available_lanes: Vec<String>,
+) -> octos_agent::PeerListCallback {
     Arc::new(move || {
-        Ok(compose_peer_list_text(&read_peer_blackboard(
-            &peers_root,
-            None,
-        )))
+        Ok(compose_peer_list_text(
+            &read_peer_blackboard(&peers_root, None),
+            &available_lanes,
+        ))
     })
 }
 
@@ -24453,7 +24679,13 @@ async fn run_standalone_turn(
     }
 
     let workspace_root: Option<PathBuf> = Some(session_runtime.workspace_root.clone());
-    let llm_provider: Arc<dyn octos_llm::LlmProvider> = session_runtime.profile.llm.clone();
+    // #peer-model — a peer session whose staging recorded a valid model LANE
+    // (`peers/<slug>/model`) runs its turns on that `sub_provider` instead of
+    // the profile's primary; every other session (and any missing/unmatched/
+    // unbuildable lane) falls back to the profile's primary provider.
+    let llm_provider: Arc<dyn octos_llm::LlmProvider> =
+        peer_lane_provider_for(&session_id, &session_runtime)
+            .unwrap_or_else(|| session_runtime.profile.llm.clone());
     let memory_store: Arc<octos_memory::EpisodeStore> = session_runtime.profile.memory.clone();
     let mut agent_config = session_runtime.agent.agent_config();
     // Per-session reasoning/thinking effort (TUI `/thinking`), persisted
@@ -25283,6 +25515,15 @@ async fn run_standalone_turn(
                 session_runtime.workspace_root.clone(),
                 session_id.clone(),
                 session_runtime.profile.profile_id.clone(),
+                // #peer-model — the configured `sub_provider` lane keys a
+                // `peer_handoff` may name; validated in the callback.
+                session_runtime
+                    .profile
+                    .config
+                    .sub_providers
+                    .iter()
+                    .map(|sp| sp.key.clone())
+                    .collect(),
                 Arc::new(AtomicU32::new(0)),
                 emit_staged,
             );
@@ -25307,7 +25548,18 @@ async fn run_standalone_turn(
         // gather (ALL serve sessions, including peer- topics). Use peer_list
         // to see what exists / what's finished; peer_gather to read output.
         if peer_list_allowed_for_session(&session_id) {
-            let list = build_peer_list_callback(session_runtime.profile.data_dir.join("peers"));
+            // #peer-model — the CURRENT lane keys so the index flags a peer
+            // whose recorded lane no longer resolves (unavailable→primary).
+            let list = build_peer_list_callback(
+                session_runtime.profile.data_dir.join("peers"),
+                session_runtime
+                    .profile
+                    .config
+                    .sub_providers
+                    .iter()
+                    .map(|sp| sp.key.clone())
+                    .collect(),
+            );
             tool_registry.register(octos_agent::PeerListTool::new(list));
         }
 

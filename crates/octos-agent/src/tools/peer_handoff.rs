@@ -43,6 +43,14 @@ pub struct PeerHandoffRequest {
     pub name: String,
     /// Whether the host should fence the peer in its own git worktree.
     pub worktree: bool,
+    /// Optional model LANE for this peer: the KEY of a `sub_provider`
+    /// configured in the master's profile (e.g. `"cheap"`, `"strong"`).
+    /// `None` (or an empty/whitespace value, normalized to `None` by
+    /// [`PeerHandoffTool::execute`]) keeps the peer on the profile's primary
+    /// model. The host validates the key against the profile's configured
+    /// lanes and, on a match, records it beside the brief so the peer's turns
+    /// resolve that provider; an unknown key is a warning, not a failure.
+    pub model: Option<String>,
 }
 
 /// Staged-peer facts the host callback returns on success.
@@ -58,6 +66,12 @@ pub struct PeerHandoffStaged {
     pub cwd: String,
     /// Fence branch (`peer/<slug>`) when a worktree was created.
     pub worktree_branch: Option<String>,
+    /// Optional model-lane note the host surfaces back to the model in the
+    /// tool's success output — e.g. a warning that the requested `model` lane
+    /// was not found among the profile's configured `sub_providers` (so the
+    /// peer falls back to the primary model). `None` when no lane was
+    /// requested or the requested lane resolved cleanly.
+    pub model_note: Option<String>,
 }
 
 /// Host staging callback. Synchronous by design: the tool needs the staged
@@ -86,6 +100,8 @@ struct Input {
     name: String,
     #[serde(default)]
     worktree: bool,
+    #[serde(default)]
+    model: Option<String>,
 }
 
 fn failure(output: impl Into<String>) -> ToolResult {
@@ -147,6 +163,10 @@ impl Tool for PeerHandoffTool {
                 "worktree": {
                     "type": "boolean",
                     "description": "Fence the peer in its own git worktree on branch peer/<slug> (default false). Use for code changes that must not collide with this session's working tree."
+                },
+                "model": {
+                    "type": "string",
+                    "description": "Optional model lane for this peer — the KEY of a sub_provider configured in your profile (e.g. \"cheap\", \"strong\"). Omit to use the profile's primary model."
                 }
             }
         })
@@ -187,14 +207,23 @@ impl Tool for PeerHandoffTool {
                  contract; keep the payload in the workspace and reference it by path."
             )));
         }
+        // Normalize the optional model lane: trim and drop an empty/whitespace
+        // value to `None` so the host only ever sees a real lane key.
+        let model = input
+            .model
+            .as_deref()
+            .map(str::trim)
+            .filter(|lane| !lane.is_empty())
+            .map(str::to_owned);
         let request = PeerHandoffRequest {
             brief: brief.to_owned(),
             name: name.to_owned(),
             worktree: input.worktree,
+            model,
         };
         match (self.stage)(request) {
-            Ok(staged) => Ok(ToolResult {
-                output: format!(
+            Ok(staged) => {
+                let mut output = format!(
                     "Staged peer '{name}' (slug {slug}, brief at {brief_path}, cwd {cwd}). \
                      Address it later by name with peer_send_input / peer_close. The user's \
                      client opens it in the background; its result lands on the blackboard \
@@ -202,10 +231,19 @@ impl Tool for PeerHandoffTool {
                     slug = staged.slug,
                     brief_path = staged.brief_path,
                     cwd = staged.cwd,
-                ),
-                success: true,
-                ..Default::default()
-            }),
+                );
+                // Surface any model-lane note (e.g. an unknown lane fell back to
+                // the primary model) back to the model in the same result.
+                if let Some(note) = &staged.model_note {
+                    output.push(' ');
+                    output.push_str(note);
+                }
+                Ok(ToolResult {
+                    output,
+                    success: true,
+                    ..Default::default()
+                })
+            }
             Err(err) => Ok(failure(err)),
         }
     }
@@ -229,6 +267,7 @@ mod tests {
                 brief_path: "/data/peers/ci-fix/brief.md".to_owned(),
                 cwd: "/work/peers/ci-fix/wt".to_owned(),
                 worktree_branch: request.worktree.then(|| "peer/ci-fix".to_owned()),
+                model_note: None,
             })
         }));
         (tool, seen)
@@ -386,6 +425,7 @@ mod tests {
                 brief: "Fix the flaky bus test; repro in crates/octos-bus.".to_owned(),
                 name: "CI Fix".to_owned(),
                 worktree: true,
+                model: None,
             },
             "brief/name are trimmed, worktree passes through"
         );
@@ -417,7 +457,93 @@ mod tests {
                 brief: "Just the brief.".to_owned(),
                 name: "Solo".to_owned(),
                 worktree: false,
+                model: None,
             }
+        );
+    }
+
+    #[tokio::test]
+    async fn should_thread_model_lane_through_to_callback_trimmed() {
+        let (tool, seen) = tool_with_recorder();
+
+        let result = tool
+            .execute(&json!({
+                "brief": "Grunt work.",
+                "name": "Grunt",
+                "model": "  strong  ",
+            }))
+            .await
+            .unwrap();
+        assert!(result.success, "unexpected failure: {}", result.output);
+
+        let seen = seen.lock().unwrap();
+        assert_eq!(
+            seen[0].model.as_deref(),
+            Some("strong"),
+            "model lane is trimmed and threaded into the staging request"
+        );
+    }
+
+    #[tokio::test]
+    async fn should_normalize_blank_model_lane_to_none() {
+        let (tool, seen) = tool_with_recorder();
+
+        let result = tool
+            .execute(&json!({
+                "brief": "Grunt work.",
+                "name": "Grunt",
+                "model": "   \n\t ",
+            }))
+            .await
+            .unwrap();
+        assert!(result.success);
+
+        let seen = seen.lock().unwrap();
+        assert_eq!(
+            seen[0].model, None,
+            "a blank/whitespace model lane normalizes to None (use the primary model)"
+        );
+    }
+
+    #[tokio::test]
+    async fn should_append_model_note_from_host_to_success_output() {
+        // The host may report that the requested lane was unknown; the note is
+        // appended to the (still successful) staging result verbatim.
+        let tool = PeerHandoffTool::new(Arc::new(|request: PeerHandoffRequest| {
+            let note = request
+                .model
+                .as_ref()
+                .map(|lane| format!("model lane '{lane}' not found — using the primary model."));
+            Ok(PeerHandoffStaged {
+                slug: "grunt".to_owned(),
+                topic: "peer-grunt".to_owned(),
+                brief_path: "/data/peers/grunt/brief.md".to_owned(),
+                cwd: "/work".to_owned(),
+                worktree_branch: None,
+                model_note: note,
+            })
+        }));
+
+        let result = tool
+            .execute(&json!({
+                "brief": "Grunt work.",
+                "name": "Grunt",
+                "model": "bogus",
+            }))
+            .await
+            .unwrap();
+        assert!(result.success, "an unknown lane warns, it does not fail");
+        assert!(
+            result.output.contains("Staged peer 'Grunt'"),
+            "the staged confirmation is still present: {}",
+            result.output
+        );
+        assert!(
+            result
+                .output
+                .contains("model lane 'bogus' not found — using the primary model."),
+            "the host's model-lane note is appended to the output: {}",
+            result.output
         );
     }
 

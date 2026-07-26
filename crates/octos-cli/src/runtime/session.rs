@@ -1133,6 +1133,7 @@ mod tests {
         Arc::new(ProfileRuntime {
             profile_id: "_main".to_string(),
             data_dir,
+            config: crate::config::Config::default(),
             llm: Arc::new(StubLlm),
             adaptive_router: None,
             runtime_qos_catalog: None,
@@ -1807,6 +1808,7 @@ mod tests {
         Arc::new(ProfileRuntime {
             profile_id: "_main".to_string(),
             data_dir,
+            config: crate::config::Config::default(),
             llm: Arc::new(StubLlm),
             adaptive_router: None,
             runtime_qos_catalog: None,
