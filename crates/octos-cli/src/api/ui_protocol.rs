@@ -2163,6 +2163,466 @@ fn staged_peer_dir(peers_root: &Path, slug: &str) -> Option<PathBuf> {
     Some(dir)
 }
 
+/// fd-anchored, symlink/FIFO/DoS-safe I/O for the per-session peer files under
+/// `peers/<slug>/` (octos#1824). [`staged_peer_dir`] validates the `<slug>`
+/// directory by PATH; a subsequent path-based `std::fs` read/write then races a
+/// parent swap — an attacker who can write under `peers/` replaces `<slug>` (or
+/// a leaf) with a symlink between the check and the I/O, and the plain read/
+/// `atomic_write` follows the swap. It also accepts a FIFO/device leaf, so a
+/// hostile `model`/`brief.md` FIFO parks a turn on an unbounded blocking read.
+///
+/// Every op here re-opens the peer DIR fd `O_NOFOLLOW|O_DIRECTORY` (so a
+/// symlinked `<slug>` is refused, not followed) and resolves the LEAF relative
+/// to that pinned inode with `openat`/`renameat`/`unlinkat` — no path is ever
+/// re-walked after the anchor, closing the parent-swap race. Reads open
+/// `O_NOFOLLOW|O_NONBLOCK`, `fstat` the opened handle, require a regular file
+/// (`S_ISREG` — a FIFO/device/dir/symlink is refused before any `read`), and
+/// bound the read to a cap. This mirrors the anchored pattern already used by
+/// `api::memory_panel` for the memory-panel reads.
+mod peer_io {
+    use std::path::Path;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// Read cap for the large peer files (`brief.md`, `result.md`). Over-cap
+    /// content reads as absent (`None`) rather than a truncated prefix, matching
+    /// `memory_panel`'s over-cap posture. 1 MiB is far above any legitimate
+    /// brief/result (the write side caps `result.md` at 256 KiB and the gather
+    /// display re-caps to tens of KiB).
+    pub(super) const PEER_FILE_READ_CAP_LARGE: usize = 1024 * 1024;
+
+    /// Read cap for the small control files (`model`, `originator`, `name`,
+    /// `turns.txt`, `closed`). These hold a lane key, a session id, a display
+    /// name, or a compact line index — all KB-scale.
+    pub(super) const PEER_FILE_READ_CAP_SMALL: usize = 64 * 1024;
+
+    /// Process-unique suffix source for temp filenames, so concurrent
+    /// atomic writes to the same leaf never collide on the `O_EXCL` create.
+    static TMP_UNIQ: AtomicU64 = AtomicU64::new(0);
+
+    /// A `.<leaf>.tmp-<pid>-<uniq>` sibling name for the atomic temp file. The
+    /// leading `.` keeps it out of `result-*` globs (e.g.
+    /// `count_peer_result_versions`), which a bare `<leaf>.tmp` would otherwise
+    /// pollute for `result-<n>.md`.
+    fn tmp_name(leaf: &str) -> String {
+        let uniq = TMP_UNIQ.fetch_add(1, Ordering::Relaxed);
+        let pid = std::process::id();
+        format!(".{leaf}.tmp-{pid}-{uniq}")
+    }
+
+    /// Read a peer leaf file, anchored on the peer dir fd. Returns the content
+    /// when the leaf is a REGULAR file no larger than `cap` bytes; `None` for a
+    /// symlinked dir/leaf, a FIFO/device/dir leaf, an over-cap file, invalid
+    /// UTF-8, or any I/O error.
+    pub(super) fn read_peer_file(peer_dir: &Path, leaf: &str, cap: usize) -> Option<String> {
+        imp::read_peer_file(peer_dir, leaf, cap)
+    }
+
+    /// Atomically replace a peer leaf file (temp + fsync + rename), every step
+    /// relative to the peer dir fd. A symlinked dir/leaf is refused (never
+    /// followed); on any write/rename error the temp file is best-effort
+    /// removed.
+    pub(super) fn write_peer_file_atomic(
+        peer_dir: &Path,
+        leaf: &str,
+        content: &str,
+    ) -> std::io::Result<()> {
+        imp::write_peer_file_atomic(peer_dir, leaf, content)
+    }
+
+    /// Append `line` to a peer leaf file (the `turns.txt` index), anchored on
+    /// the peer dir fd. Creates the file if absent; refuses a symlinked dir/
+    /// leaf and a non-regular (FIFO/device) leaf. Opened `O_NONBLOCK` so a
+    /// planted FIFO fails fast instead of parking the writer on the missing
+    /// reader.
+    pub(super) fn append_peer_line(peer_dir: &Path, leaf: &str, line: &str) -> std::io::Result<()> {
+        imp::append_peer_line(peer_dir, leaf, line)
+    }
+
+    #[cfg(unix)]
+    mod imp {
+        use std::io::{Read, Write};
+        use std::os::fd::OwnedFd;
+        use std::os::unix::fs::OpenOptionsExt;
+        use std::path::Path;
+
+        use rustix::fs::{AtFlags, Mode, OFlags, openat, renameat, unlinkat};
+
+        /// Open the peer dir as an `O_NOFOLLOW|O_DIRECTORY` fd: a symlinked
+        /// `<slug>` is refused here (belt-and-braces over `staged_peer_dir`'s
+        /// path check, and the anchor that makes the leaf ops race-free).
+        fn open_peer_dir(peer_dir: &Path) -> std::io::Result<OwnedFd> {
+            std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(
+                    libc::O_NOFOLLOW | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NONBLOCK,
+                )
+                .open(peer_dir)
+                .map(OwnedFd::from)
+        }
+
+        pub(super) fn read_peer_file(peer_dir: &Path, leaf: &str, cap: usize) -> Option<String> {
+            let dir = open_peer_dir(peer_dir).ok()?;
+            // NONBLOCK: a FIFO opened plain `O_RDONLY` blocks until a writer
+            // appears — a planted FIFO must never park the caller (#1824).
+            let fd = openat(
+                &dir,
+                leaf,
+                OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK,
+                Mode::empty(),
+            )
+            .ok()?;
+            let file = std::fs::File::from(fd);
+            // fstat the OPENED handle (no stat-by-path race). Regular files
+            // only: a FIFO/device/dir/socket is refused before any `read`.
+            let meta = file.metadata().ok()?;
+            if !meta.is_file() {
+                return None;
+            }
+            let cap = cap as u64;
+            // Bound the ACTUAL read, not just the fstat snapshot: `take(cap+1)`
+            // detects an over-cap file (a full cap+1 bytes) and rejects it
+            // rather than serving a truncated prefix. Invalid UTF-8 → `None`
+            // (matching the prior `read_to_string`).
+            let mut content = String::new();
+            let read = Read::take(file, cap + 1)
+                .read_to_string(&mut content)
+                .ok()?;
+            if read as u64 > cap {
+                return None;
+            }
+            Some(content)
+        }
+
+        pub(super) fn write_peer_file_atomic(
+            peer_dir: &Path,
+            leaf: &str,
+            content: &str,
+        ) -> std::io::Result<()> {
+            let dir = open_peer_dir(peer_dir)?;
+            let tmp = super::tmp_name(leaf);
+            // O_EXCL|O_NOFOLLOW: create a fresh regular temp beside the leaf,
+            // never following/clobbering a pre-existing name.
+            let fd = openat(
+                &dir,
+                tmp.as_str(),
+                OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Mode::RUSR | Mode::WUSR,
+            )
+            .map_err(std::io::Error::from)?;
+            let mut file = std::fs::File::from(fd);
+            let written = file
+                .write_all(content.as_bytes())
+                .and_then(|()| file.sync_all());
+            if let Err(err) = written {
+                let _ = unlinkat(&dir, tmp.as_str(), AtFlags::empty());
+                return Err(err);
+            }
+            // renameat relative to the SAME dir fd — atomic in-dir replace that
+            // a parent swap cannot redirect.
+            if let Err(err) = renameat(&dir, tmp.as_str(), &dir, leaf) {
+                let _ = unlinkat(&dir, tmp.as_str(), AtFlags::empty());
+                return Err(err.into());
+            }
+            Ok(())
+        }
+
+        pub(super) fn append_peer_line(
+            peer_dir: &Path,
+            leaf: &str,
+            line: &str,
+        ) -> std::io::Result<()> {
+            let dir = open_peer_dir(peer_dir)?;
+            // O_APPEND create; O_NOFOLLOW refuses a symlinked leaf; O_NONBLOCK
+            // makes a planted FIFO fail fast (ENXIO, no reader) instead of
+            // parking the writer.
+            let fd = openat(
+                &dir,
+                leaf,
+                OFlags::WRONLY
+                    | OFlags::CREATE
+                    | OFlags::APPEND
+                    | OFlags::NOFOLLOW
+                    | OFlags::CLOEXEC
+                    | OFlags::NONBLOCK,
+                Mode::RUSR | Mode::WUSR,
+            )
+            .map_err(std::io::Error::from)?;
+            let mut file = std::fs::File::from(fd);
+            // Regular files only: refuse a device/FIFO leaf that slipped past
+            // the open (e.g. a FIFO with a live reader).
+            if !file.metadata()?.is_file() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "peer leaf is not a regular file",
+                ));
+            }
+            file.write_all(line.as_bytes())
+        }
+    }
+
+    #[cfg(not(unix))]
+    mod imp {
+        use std::io::{Read, Write};
+        use std::path::Path;
+
+        /// Refuse a symlinked peer dir; require a real directory. Non-unix
+        /// serve is dev-only (matching the `symlink_metadata` fallback
+        /// `memory_panel` uses for the same reads), so a path-anchored check
+        /// with a documented multi-syscall TOCTOU window is acceptable here.
+        fn peer_dir_ok(peer_dir: &Path) -> bool {
+            std::fs::symlink_metadata(peer_dir)
+                .map(|m| !m.file_type().is_symlink() && m.is_dir())
+                .unwrap_or(false)
+        }
+
+        pub(super) fn read_peer_file(peer_dir: &Path, leaf: &str, cap: usize) -> Option<String> {
+            if !peer_dir_ok(peer_dir) {
+                return None;
+            }
+            let path = peer_dir.join(leaf);
+            let meta = std::fs::symlink_metadata(&path).ok()?;
+            if meta.file_type().is_symlink() || !meta.is_file() {
+                return None;
+            }
+            let cap = cap as u64;
+            let file = std::fs::File::open(&path).ok()?;
+            let mut content = String::new();
+            let read = Read::take(file, cap + 1)
+                .read_to_string(&mut content)
+                .ok()?;
+            if read as u64 > cap {
+                return None;
+            }
+            Some(content)
+        }
+
+        pub(super) fn write_peer_file_atomic(
+            peer_dir: &Path,
+            leaf: &str,
+            content: &str,
+        ) -> std::io::Result<()> {
+            if !peer_dir_ok(peer_dir) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "peer dir is not a real directory",
+                ));
+            }
+            let path = peer_dir.join(leaf);
+            if std::fs::symlink_metadata(&path).is_ok_and(|m| m.file_type().is_symlink()) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "refusing to follow a symlinked peer leaf",
+                ));
+            }
+            let tmp = peer_dir.join(super::tmp_name(leaf));
+            {
+                let mut file = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&tmp)?;
+                if let Err(err) = file
+                    .write_all(content.as_bytes())
+                    .and_then(|()| file.sync_all())
+                {
+                    let _ = std::fs::remove_file(&tmp);
+                    return Err(err);
+                }
+            }
+            if let Err(err) = std::fs::rename(&tmp, &path) {
+                let _ = std::fs::remove_file(&tmp);
+                return Err(err);
+            }
+            Ok(())
+        }
+
+        pub(super) fn append_peer_line(
+            peer_dir: &Path,
+            leaf: &str,
+            line: &str,
+        ) -> std::io::Result<()> {
+            if !peer_dir_ok(peer_dir) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "peer dir is not a real directory",
+                ));
+            }
+            let path = peer_dir.join(leaf);
+            if let Ok(meta) = std::fs::symlink_metadata(&path) {
+                if meta.file_type().is_symlink() || !meta.is_file() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "peer leaf is not a regular file",
+                    ));
+                }
+            }
+            let mut file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)?;
+            file.write_all(line.as_bytes())
+        }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod peer_io_tests {
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    use super::peer_io::{
+        PEER_FILE_READ_CAP_LARGE, PEER_FILE_READ_CAP_SMALL, append_peer_line, read_peer_file,
+        write_peer_file_atomic,
+    };
+
+    // octos#1824: a symlinked leaf must NOT be followed — the anchored openat
+    // is O_NOFOLLOW, so a `model`/`brief.md` symlink pointing at a real file
+    // reads as absent instead of leaking the target's content.
+    #[test]
+    fn symlinked_leaf_is_refused_not_followed() {
+        let dir = tempfile::tempdir().unwrap();
+        let peer = dir.path();
+        std::fs::write(peer.join("secret"), "SENSITIVE").unwrap();
+        for leaf in ["model", "brief.md"] {
+            std::os::unix::fs::symlink("secret", peer.join(leaf)).unwrap();
+            assert_eq!(
+                read_peer_file(peer, leaf, PEER_FILE_READ_CAP_LARGE),
+                None,
+                "a symlinked `{leaf}` leaf must not be followed"
+            );
+        }
+    }
+
+    // octos#1824: a FIFO leaf must be rejected PROMPTLY (NONBLOCK open +
+    // regular-file reject) — never block the caller on the missing writer.
+    #[test]
+    fn fifo_leaf_reads_none_without_hanging() {
+        let dir = tempfile::tempdir().unwrap();
+        let peer = dir.path().to_path_buf();
+        let status = std::process::Command::new("mkfifo")
+            .arg(peer.join("model"))
+            .status()
+            .expect("mkfifo");
+        assert!(status.success());
+
+        // Run the read on a worker thread and require it to return quickly: a
+        // blocking open (no NONBLOCK) would never send, tripping the timeout.
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let out = read_peer_file(&peer, "model", PEER_FILE_READ_CAP_SMALL);
+            let _ = tx.send(out);
+        });
+        let result = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("read must not block on a FIFO leaf");
+        assert_eq!(result, None, "FIFO content must not be served");
+    }
+
+    // A real regular file round-trips through the atomic writer + anchored
+    // reader, landing at the intended leaf.
+    #[test]
+    fn regular_file_round_trips_to_the_named_leaf() {
+        let dir = tempfile::tempdir().unwrap();
+        let peer = dir.path();
+        write_peer_file_atomic(peer, "result.md", "hello peer").unwrap();
+        write_peer_file_atomic(peer, "name", "Kestrel").unwrap();
+        assert_eq!(
+            read_peer_file(peer, "result.md", PEER_FILE_READ_CAP_LARGE).as_deref(),
+            Some("hello peer")
+        );
+        assert_eq!(
+            read_peer_file(peer, "name", PEER_FILE_READ_CAP_SMALL).as_deref(),
+            Some("Kestrel"),
+            "each leaf must read back its OWN content"
+        );
+        // The atomic temp must not linger under the peer dir.
+        let leftover = std::fs::read_dir(peer)
+            .unwrap()
+            .filter_map(Result::ok)
+            .any(|e| e.file_name().to_string_lossy().contains(".tmp-"));
+        assert!(
+            !leftover,
+            "atomic temp file must be renamed away, not left behind"
+        );
+    }
+
+    // An over-cap file reads as absent, and the read is BOUNDED: a tiny cap on
+    // a much larger file must not slurp the whole thing.
+    #[test]
+    fn oversized_file_is_refused_and_read_is_bounded() {
+        let dir = tempfile::tempdir().unwrap();
+        let peer = dir.path();
+        let cap = 16usize;
+        // Exactly at cap → served.
+        write_peer_file_atomic(peer, "at_cap", &"a".repeat(cap)).unwrap();
+        assert_eq!(
+            read_peer_file(peer, "at_cap", cap).map(|s| s.len()),
+            Some(cap),
+            "a file exactly at the cap must be served whole"
+        );
+        // One over cap → refused (not a truncated prefix).
+        write_peer_file_atomic(peer, "over_cap", &"a".repeat(cap + 1)).unwrap();
+        assert_eq!(
+            read_peer_file(peer, "over_cap", cap),
+            None,
+            "an over-cap file must read as absent"
+        );
+        // Far over cap → still bounded (proves take(cap+1), not a full read).
+        std::fs::write(peer.join("huge"), "b".repeat(cap * 4096)).unwrap();
+        assert_eq!(read_peer_file(peer, "huge", cap), None);
+    }
+
+    // A peer_dir that is itself a symlink fails BOTH ops safely — the
+    // O_NOFOLLOW|O_DIRECTORY anchor refuses to open a symlinked `<slug>`.
+    #[test]
+    fn symlinked_peer_dir_fails_both_ops_safely() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        std::fs::write(real.join("name"), "present").unwrap();
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        assert_eq!(
+            read_peer_file(&link, "name", PEER_FILE_READ_CAP_SMALL),
+            None,
+            "reads through a symlinked peer dir must be refused"
+        );
+        assert!(
+            write_peer_file_atomic(&link, "name", "evil").is_err(),
+            "writes through a symlinked peer dir must be refused"
+        );
+        // The refused write must not have touched the real file.
+        assert_eq!(
+            std::fs::read_to_string(real.join("name")).unwrap(),
+            "present",
+            "a refused write must not reach the symlink target"
+        );
+    }
+
+    // The `turns.txt` append is anchored too: it round-trips for a real file
+    // and refuses a symlinked leaf.
+    #[test]
+    fn append_round_trips_and_refuses_symlinked_leaf() {
+        let dir = tempfile::tempdir().unwrap();
+        let peer = dir.path();
+        append_peer_line(peer, "turns.txt", "1 completed 100\n").unwrap();
+        append_peer_line(peer, "turns.txt", "2 completed 200\n").unwrap();
+        assert_eq!(
+            read_peer_file(peer, "turns.txt", PEER_FILE_READ_CAP_SMALL).as_deref(),
+            Some("1 completed 100\n2 completed 200\n")
+        );
+
+        let other = dir.path().join("elsewhere");
+        std::fs::write(&other, "untouched").unwrap();
+        std::os::unix::fs::symlink(&other, peer.join("evil.txt")).unwrap();
+        assert!(
+            append_peer_line(peer, "evil.txt", "x\n").is_err(),
+            "append must refuse a symlinked leaf"
+        );
+        assert_eq!(std::fs::read_to_string(&other).unwrap(), "untouched");
+    }
+}
+
 /// `true` when `peers/<slug>/closed` exists — the durable marker written by
 /// `peer_close` retiring a peer. Shared by the continuation-drain freshness
 /// gates and the reconnect-retarget skip so a closed peer is never a live
@@ -2193,7 +2653,9 @@ fn resolve_peer_name_to_slug(peers_root: &Path, ident: &str) -> Option<String> {
             let Some(dir) = staged_peer_dir(peers_root, &slug) else {
                 continue;
             };
-            if let Ok(name) = std::fs::read_to_string(dir.join("name")) {
+            if let Some(name) =
+                peer_io::read_peer_file(&dir, "name", peer_io::PEER_FILE_READ_CAP_SMALL)
+            {
                 if name.trim().to_lowercase() == lowered {
                     return Some(slug);
                 }
@@ -2301,13 +2763,13 @@ fn peer_send_input_authorized(
             "peer session '{slug}' is not a staged peer; cannot authorize input"
         ));
     };
-    match std::fs::read_to_string(dir.join("originator")) {
-        Ok(recorded) if recorded.trim() == caller_session => Ok(()),
-        Ok(_) => Err(format!(
+    match peer_io::read_peer_file(&dir, "originator", peer_io::PEER_FILE_READ_CAP_SMALL) {
+        Some(recorded) if recorded.trim() == caller_session => Ok(()),
+        Some(_) => Err(format!(
             "not the owner of peer session '{slug}' — only the session that \
              staged this peer may send it input"
         )),
-        Err(_) => Err(format!(
+        None => Err(format!(
             "peer session '{slug}' has no recorded owner; cannot authorize input"
         )),
     }
@@ -10027,7 +10489,9 @@ fn existing_peer_name_conflict(peers_root: &Path, name: &str, slug: &str) -> boo
         // `name` read through `staged_peer_dir` so a symlinked entry is never
         // followed and never falsely registers as a conflict.
         if let Some(dir) = staged_peer_dir(peers_root, &entry_slug) {
-            if let Ok(existing) = std::fs::read_to_string(dir.join("name")) {
+            if let Some(existing) =
+                peer_io::read_peer_file(&dir, "name", peer_io::PEER_FILE_READ_CAP_SMALL)
+            {
                 if existing.trim().to_lowercase() == target {
                     return true;
                 }
@@ -10376,9 +10840,7 @@ fn stage_peer(
     // leaving a silently unowned member that a sibling's completion could omit
     // from the fleet and fire synthesis prematurely.
     if let Some(originator) = originator {
-        if let Err(err) =
-            crate::memory_consolidate::apply::atomic_write(&peer_dir.join("originator"), originator)
-        {
+        if let Err(err) = peer_io::write_peer_file_atomic(&peer_dir, "originator", originator) {
             cleanup_staged_peer(workspace_root, &slug, &peer_dir);
             return Err(RpcError::internal_error(format!(
                 "failed to record peer originator: {err}"
@@ -10387,7 +10849,7 @@ fn stage_peer(
     }
 
     let brief_path = peer_dir.join("brief.md");
-    if let Err(err) = crate::memory_consolidate::apply::atomic_write(&brief_path, brief) {
+    if let Err(err) = peer_io::write_peer_file_atomic(&peer_dir, "brief.md", brief) {
         cleanup_staged_peer(workspace_root, &slug, &peer_dir);
         return Err(RpcError::internal_error(format!(
             "failed to write brief: {err}"
@@ -10397,9 +10859,7 @@ fn stage_peer(
     // Store the display NAME so the peer is addressable by it and readers
     // (`read_peer_blackboard` / `resolve_peer_name_to_slug`) can surface it.
     if let Some(name) = name {
-        if let Err(err) =
-            crate::memory_consolidate::apply::atomic_write(&peer_dir.join("name"), name)
-        {
+        if let Err(err) = peer_io::write_peer_file_atomic(&peer_dir, "name", name) {
             cleanup_staged_peer(workspace_root, &slug, &peer_dir);
             return Err(RpcError::internal_error(format!(
                 "failed to write peer name: {err}"
@@ -10533,37 +10993,17 @@ fn build_peer_handoff_callback(
 /// an off-tenant target (mirrors `read_file_no_follow` for the sync peer-file
 /// layer). On non-Unix, re-checks `symlink_metadata` first. `None` on any error
 /// (missing, symlink, unreadable).
-fn read_text_no_follow(path: &Path) -> Option<String> {
-    use std::io::Read;
-    let mut opts = std::fs::OpenOptions::new();
-    opts.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.custom_flags(libc::O_NOFOLLOW);
-    }
-    #[cfg(not(unix))]
-    {
-        if path.symlink_metadata().is_ok_and(|meta| meta.is_symlink()) {
-            return None;
-        }
-    }
-    let mut file = opts.open(path).ok()?;
-    let mut content = String::new();
-    file.read_to_string(&mut content).ok()?;
-    Some(content)
-}
-
 /// #peer-model — read a peer's optional model LANE key from
 /// `peers/<slug>/model` (written by the `peer_handoff` staging callback when
 /// the master named a VALID `sub_provider` lane). Routed through
-/// [`staged_peer_dir`] (real, non-symlink dir with `brief.md`) AND an
-/// `O_NOFOLLOW` read of the leaf so neither a symlinked dir nor a symlinked
-/// `model` file is ever followed. Returns the trimmed lane key, or `None` when
+/// [`staged_peer_dir`] (real, non-symlink dir with `brief.md`) AND the
+/// fd-anchored [`peer_io::read_peer_file`] (openat `O_NOFOLLOW` under the pinned
+/// dir fd, regular-file only) so neither a symlinked dir nor a symlinked/FIFO
+/// `model` leaf is ever followed. Returns the trimmed lane key, or `None` when
 /// the dir is not a real staged peer, the file is absent/symlinked, or empty.
 fn read_peer_model_lane(peers_root: &Path, slug: &str) -> Option<String> {
     let dir = staged_peer_dir(peers_root, slug)?;
-    let lane = read_text_no_follow(&dir.join("model"))?;
+    let lane = peer_io::read_peer_file(&dir, "model", peer_io::PEER_FILE_READ_CAP_SMALL)?;
     let lane = lane.trim();
     (!lane.is_empty()).then(|| lane.to_owned())
 }
@@ -10573,9 +11013,10 @@ fn read_peer_model_lane(peers_root: &Path, slug: &str) -> Option<String> {
 /// requested). Validates the (trimmed) lane against the CURRENT
 /// `available_lanes`; a match is written symlink-safely under the RE-VALIDATED
 /// [`staged_peer_dir`] (never `brief_path.parent()`, which races a parent
-/// swap) via the atomic temp+rename write (no-follow at the target). Both an
-/// unknown lane and a failed record are TRUTHFUL: they say the peer will run on
-/// the primary model, matching what the turn actually does.
+/// swap) via the fd-anchored atomic writer ([`peer_io::write_peer_file_atomic`],
+/// no-follow openat + renameat under the pinned dir fd). Both an unknown lane
+/// and a failed record are TRUTHFUL: they say the peer will run on the primary
+/// model, matching what the turn actually does.
 fn record_peer_model_lane(
     peers_root: &Path,
     slug: &str,
@@ -10595,7 +11036,8 @@ fn record_peer_model_lane(
         ));
     }
     let recorded = match staged_peer_dir(peers_root, slug) {
-        Some(dir) => crate::memory_consolidate::apply::atomic_write(&dir.join("model"), lane),
+        Some(dir) => peer_io::write_peer_file_atomic(&dir, "model", lane)
+            .map_err(|err| eyre::eyre!("failed to write peer model lane: {err}")),
         None => Err(eyre::eyre!("staged peer dir not found for slug {slug}")),
     };
     if let Err(err) = recorded {
@@ -10782,16 +11224,16 @@ fn write_peer_result_if_peer_session(
         "---\nslug: {slug}\noutcome: {outcome_str}\nupdated_unix: {updated_unix}\nturn: {turn_count}\n---\n\n{body}{truncated}\n"
     );
 
-    // Backward-compatible latest copy — peer_gather reads this path.
-    if let Err(err) =
-        crate::memory_consolidate::apply::atomic_write(&peer_dir.join("result.md"), &text)
-    {
+    // Backward-compatible latest copy — peer_gather reads this path. Written
+    // through the fd-anchored atomic writer (openat/renameat under the pinned
+    // peer dir fd) so a parent swap cannot redirect it (#1824).
+    if let Err(err) = peer_io::write_peer_file_atomic(&peer_dir, "result.md", &text) {
         tracing::warn!(?err, slug, "failed to write peer result");
     }
 
     // Versioned copy — historical record for multi-turn persistent peers.
-    let versioned_path = peer_dir.join(format!("result-{turn_count}.md"));
-    if let Err(err) = crate::memory_consolidate::apply::atomic_write(&versioned_path, &text) {
+    let versioned_leaf = format!("result-{turn_count}.md");
+    if let Err(err) = peer_io::write_peer_file_atomic(&peer_dir, &versioned_leaf, &text) {
         tracing::warn!(
             ?err,
             slug,
@@ -10801,15 +11243,10 @@ fn write_peer_result_if_peer_session(
     }
 
     // Append to the turn index so peer_list and dashboard can discover
-    // historical results without globbing.
-    let turns_path = peer_dir.join("turns.txt");
+    // historical results without globbing. fd-anchored append (O_NOFOLLOW +
+    // regular-file only) so a symlinked/FIFO `turns.txt` is refused (#1824).
     let index_line = format!("{turn_count} {outcome_str} {updated_unix}\n");
-    if let Err(err) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&turns_path)
-        .and_then(|mut f| std::io::Write::write_all(&mut f, index_line.as_bytes()))
-    {
+    if let Err(err) = peer_io::append_peer_line(&peer_dir, "turns.txt", &index_line) {
         tracing::warn!(?err, slug, turn_count, "failed to append to turns.txt");
     }
 }
@@ -10828,7 +11265,7 @@ fn count_peer_result_versions(peer_dir: &std::path::Path) -> u32 {
 /// Parse `turns.txt` into `[(turn_count, outcome, updated_unix)]`.
 /// Returns `None` when the file doesn't exist.
 fn parse_peer_turns_index(peer_dir: &std::path::Path) -> Option<Vec<(u32, String, u64)>> {
-    let text = std::fs::read_to_string(peer_dir.join("turns.txt")).ok()?;
+    let text = peer_io::read_peer_file(peer_dir, "turns.txt", peer_io::PEER_FILE_READ_CAP_SMALL)?;
     if text.trim().is_empty() {
         return Some(Vec::new());
     }
@@ -10929,11 +11366,14 @@ fn read_peer_blackboard(peers_root: &Path, slugs: Option<&[String]>) -> Vec<Peer
             let Some(dir) = staged_peer_dir(peers_root, &slug) else {
                 continue;
             };
-            let Ok(brief) = std::fs::read_to_string(dir.join("brief.md")) else {
+            let Some(brief) =
+                peer_io::read_peer_file(&dir, "brief.md", peer_io::PEER_FILE_READ_CAP_LARGE)
+            else {
                 continue;
             };
             let result_path = dir.join("result.md");
-            let result = std::fs::read_to_string(&result_path).ok();
+            let result =
+                peer_io::read_peer_file(&dir, "result.md", peer_io::PEER_FILE_READ_CAP_LARGE);
             let result_updated_unix = std::fs::metadata(&result_path)
                 .ok()
                 .and_then(|meta| meta.modified().ok())
@@ -10949,8 +11389,7 @@ fn read_peer_blackboard(peers_root: &Path, slugs: Option<&[String]>) -> Vec<Peer
             };
             // Display name: `peers/<slug>/name`, trimmed; legacy peers with no
             // `name` file fall back to the slug so the row always has an address.
-            let name = std::fs::read_to_string(dir.join("name"))
-                .ok()
+            let name = peer_io::read_peer_file(&dir, "name", peer_io::PEER_FILE_READ_CAP_SMALL)
                 .map(|n| n.trim().to_owned())
                 .filter(|n| !n.is_empty())
                 .unwrap_or_else(|| slug.clone());
@@ -10965,12 +11404,16 @@ fn read_peer_blackboard(peers_root: &Path, slugs: Option<&[String]>) -> Vec<Peer
                 has_worktree: dir.join("wt").is_dir(),
                 closed: dir.join("closed").is_file(),
                 turn_history: parse_peer_turns_index(&dir),
-                // #peer-model — the recorded model lane, if any (O_NOFOLLOW
-                // read so a symlinked `model` leaf is refused; trimmed, empty
-                // treated as absent).
-                model_lane: read_text_no_follow(&dir.join("model"))
-                    .map(|lane| lane.trim().to_owned())
-                    .filter(|lane| !lane.is_empty()),
+                // #peer-model — the recorded model lane, if any (fd-anchored
+                // no-follow read so a symlinked/FIFO `model` leaf is refused;
+                // trimmed, empty treated as absent).
+                model_lane: peer_io::read_peer_file(
+                    &dir,
+                    "model",
+                    peer_io::PEER_FILE_READ_CAP_SMALL,
+                )
+                .map(|lane| lane.trim().to_owned())
+                .filter(|lane| !lane.is_empty()),
             });
         }
     }
@@ -11264,9 +11707,7 @@ fn build_peer_close_callback(
             .map(|elapsed| elapsed.as_secs())
             .unwrap_or(0);
         let body = format!("{origin_session}\n{now_unix}\n");
-        if let Err(err) =
-            crate::memory_consolidate::apply::atomic_write(&peer_dir.join("closed"), &body)
-        {
+        if let Err(err) = peer_io::write_peer_file_atomic(&peer_dir, "closed", &body) {
             return Err(format!(
                 "failed to write close marker for peer '{slug}': {err}"
             ));
@@ -11372,7 +11813,9 @@ fn peer_results_ready_note(peers_root: &Path, session_id: &SessionKey) -> Option
         if covered.is_some_and(|covered| covered >= result_mtime) {
             continue;
         }
-        let Ok(originator) = std::fs::read_to_string(dir.join("originator")) else {
+        let Some(originator) =
+            peer_io::read_peer_file(&dir, "originator", peer_io::PEER_FILE_READ_CAP_SMALL)
+        else {
             continue;
         };
         if originator.trim() != session {
@@ -11580,7 +12023,9 @@ fn collect_owned_peer_results(peers_root: &Path, master: &str) -> Option<Vec<(St
         // owner-before-brief write in `stage_peer`, a visible (brief.md) member
         // always has a readable originator, so a member of THIS master is never
         // silently dropped from the ownership scan.
-        let Ok(originator) = std::fs::read_to_string(dir.join("originator")) else {
+        let Some(originator) =
+            peer_io::read_peer_file(&dir, "originator", peer_io::PEER_FILE_READ_CAP_SMALL)
+        else {
             continue;
         };
         if originator.trim() != master {
@@ -11629,7 +12074,11 @@ async fn maybe_enqueue_peer_fleet_synthesis(state: &Arc<AppState>, peer_session:
     let Some(finished_dir) = staged_peer_dir(&peers_root, finished_slug) else {
         return;
     };
-    let Ok(master) = std::fs::read_to_string(finished_dir.join("originator")) else {
+    let Some(master) = peer_io::read_peer_file(
+        &finished_dir,
+        "originator",
+        peer_io::PEER_FILE_READ_CAP_SMALL,
+    ) else {
         return;
     };
     let master = master.trim().to_owned();
