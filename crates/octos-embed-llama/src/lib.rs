@@ -14,6 +14,19 @@
 //! edge once batched. What llama.cpp adds is every platform that is not an
 //! Apple laptop, plus any GGUF instead of one hand-written architecture.
 //!
+//! # Switching backends invalidates a populated index
+//!
+//! `tests/cross_backend.rs` pins this provider against the MLX port, which is
+//! verified against a Python oracle. They agree on semantics — same pooling,
+//! prefixes and normalization — and their retrieval rankings match. But the
+//! vectors themselves only agree to 0.962–0.991 cosine, because the two run
+//! different 8-bit quantizations through different kernels.
+//!
+//! That drift is the same order as the gap between genuinely related documents,
+//! so embeddings from the two backends MUST NOT share an index. Changing
+//! `embedding.provider` between `"mlx"` and `"llamacpp"` requires re-embedding
+//! stored episodes, exactly as changing the model would.
+//!
 //! # Gating
 //!
 //! Compiled only under the `embed-llama` feature, which pulls a CMake build of

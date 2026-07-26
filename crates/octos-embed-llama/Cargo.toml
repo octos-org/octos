@@ -25,6 +25,14 @@ embed-llama = ["dep:llama-cpp-2", "dep:self_cell"]
 metal = ["llama-cpp-2/metal"]
 cuda = ["llama-cpp-2/cuda"]
 
+# Verification only. Pulls in the MLX backend so `tests/cross_backend.rs` can
+# check this provider against it. That port is numerically verified against a
+# Python oracle (golden per-stage activations, end-to-end cosine >= 0.999997),
+# so agreeing with it transfers that evidence here without re-deriving it.
+# Apple Silicon only, because that is where MLX runs; never enabled in a
+# shipping build.
+cross-backend = ["embed-llama", "metal", "dep:octos-embed-mlx", "octos-embed-mlx/embed-mlx"]
+
 [dependencies]
 eyre = { workspace = true }
 async-trait = { workspace = true }
@@ -37,6 +45,10 @@ llama-cpp-2 = { version = "0.1", optional = true, default-features = false }
 # `unsafe_code`, and recreating the context per call would re-allocate the KV
 # cache on every embed.
 self_cell = { version = "1", optional = true }
+
+# Verification-only peer backend; see the `cross-backend` feature.
+[target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.dependencies]
+octos-embed-mlx = { workspace = true, optional = true }
 
 [dev-dependencies]
 octos-memory.workspace = true
