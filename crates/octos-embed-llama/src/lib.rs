@@ -1,18 +1,26 @@
 //! In-process GGUF embedding provider backed by llama.cpp.
 //!
-//! The cross-platform counterpart to `octos-embed-mlx`. That crate hand-ports a
-//! single model (EmbeddingGemma-300M) onto Apple MLX and is therefore
-//! macOS+aarch64 only; this one runs any GGUF embedding model on any platform
-//! llama.cpp supports, with the CPU backend as a genuinely usable default.
+//! The only embedding backend. It replaced `octos-embed-mlx`, a hand-written
+//! port of one model (EmbeddingGemma-300M) onto Apple MLX, which was
+//! macOS+aarch64 only — so `provider = "mlx"` gave a Linux deployment nothing.
+//! This runs any GGUF embedding model anywhere llama.cpp builds, with a CPU
+//! backend that is a real implementation rather than a fallback.
 //!
-//! # Why both exist
+//! # Why it replaced the MLX port
 //!
-//! Benchmarked head-to-head on an M3 Max, same model, same 8-bit quantization:
-//! a single short text costs ~6.5 ms through llama.cpp/Metal against ~6.85 ms
-//! through the MLX port — a tie, because at that size both are dominated by
-//! fixed per-forward-pass overhead rather than arithmetic. MLX keeps a modest
-//! edge once batched. What llama.cpp adds is every platform that is not an
-//! Apple laptop, plus any GGUF instead of one hand-written architecture.
+//! Benchmarked in-process on an M3 Max, same weights, same 8-bit class:
+//!
+//! | | single | batched |
+//! |---|---|---|
+//! | llama.cpp | 5.68 ms | 0.98 ms |
+//! | MLX port  | 6.85 ms | 1.10 ms |
+//!
+//! So portability cost nothing — this is at parity or slightly ahead. At these
+//! sizes both are dominated by fixed per-forward-pass overhead rather than
+//! arithmetic, which is why batching (5.8x) is the only lever that has ever
+//! moved the number. It also drops a hand-derived forward pass that needed
+//! golden tests against a Python oracle to stay honest, and generalizes to any
+//! GGUF instead of one architecture.
 //!
 //! # Switching backends invalidates a populated index
 //!

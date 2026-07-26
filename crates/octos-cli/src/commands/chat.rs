@@ -1869,41 +1869,20 @@ pub(crate) fn create_embedder(config: &Config) -> Option<Arc<dyn EmbeddingProvid
         }
     }
 
-    // In-process MLX EmbeddingGemma provider (Apple Silicon, feature `embed-mlx`).
-    // `provider = "mlx"` + `model_path = "<dir>"` builds an `MlxEmbedder`; the
-    // optional `dimensions` truncates the output via Matryoshka (MRL).
+    // `provider = "mlx"` was the Apple-Silicon-only in-process backend. It has
+    // been replaced by `"llamacpp"` above, which is cross-platform and measured
+    // at parity or better. Fail LOUDLY rather than falling through to the
+    // remote-provider path below, where "mlx" would be treated as an API
+    // provider name and produce a baffling credential error.
     if cfg.provider.eq_ignore_ascii_case("mlx") {
-        #[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "embed-mlx"))]
-        {
-            let path = cfg.model_path.as_deref().or(cfg.model.as_deref());
-            let Some(path) = path else {
-                tracing::error!(
-                    "embedding.provider=\"mlx\" requires `model_path` (the local model dir)"
-                );
-                return None;
-            };
-            match octos_embed_mlx::MlxEmbedder::from_model_dir(path) {
-                Ok(mut e) => {
-                    if let Some(d) = cfg.dimensions {
-                        e = e.with_output_dim(d as usize);
-                    }
-                    tracing::info!(model_path = %path, "loaded in-process MLX embedder");
-                    return Some(Arc::new(e));
-                }
-                Err(err) => {
-                    tracing::error!(%err, model_path = %path, "failed to load MLX embedder");
-                    return None;
-                }
-            }
-        }
-        #[cfg(not(all(target_os = "macos", target_arch = "aarch64", feature = "embed-mlx")))]
-        {
-            tracing::warn!(
-                "embedding.provider=\"mlx\" needs an Apple-Silicon build with \
-                 `--features embed-mlx`; ignoring and disabling embeddings"
-            );
-            return None;
-        }
+        tracing::error!(
+            "embedding.provider=\"mlx\" has been removed — use \"llamacpp\" with a \
+             .gguf `model_path`. NOTE: the two backends' vectors are not \
+             interchangeable (~0.96-0.99 cosine), so stored episode embeddings \
+             must be regenerated after switching; until then recall degrades to \
+             BM25-only for those episodes."
+        );
+        return None;
     }
 
     // `api_key_env` was declared on EmbeddingConfig but never honored —

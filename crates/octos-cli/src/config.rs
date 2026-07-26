@@ -615,10 +615,10 @@ pub struct EmbeddingConfig {
     #[serde(default)]
     pub dimensions: Option<u32>,
 
-    /// Local model directory for the in-process `mlx` provider (feature
-    /// `embed-mlx`, Apple Silicon only). Must contain `config.json`,
-    /// `model.safetensors` and `tokenizer.json` (e.g. a HuggingFace snapshot of
-    /// `mlx-community/embeddinggemma-300m-8bit`). Ignored by other providers.
+    /// Path to the local `.gguf` file for the in-process `llamacpp` provider
+    /// (feature `embed-llama`; add `embed-llama-metal` / `embed-llama-cuda` to
+    /// offload). Any GGUF embedding model works, e.g.
+    /// `ggml-org/embeddinggemma-300M-GGUF`. Ignored by remote providers.
     #[serde(default)]
     pub model_path: Option<String>,
 }

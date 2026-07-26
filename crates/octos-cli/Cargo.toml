@@ -129,21 +129,12 @@ rustix = { version = "1.1", features = ["fs"] }
 [target.'cfg(target_os = "macos")'.dependencies]
 keyring = { workspace = true, features = ["apple-native"] }
 
-# In-process MLX EmbeddingGemma provider — Apple-Silicon only, and only pulled
-# in when the `embed-mlx` feature is enabled (it drags in mlx-sys/Metal FFI).
-# Target-gated so non-Apple `--workspace` builds never see it.
-[target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.dependencies]
-octos-embed-mlx = { workspace = true, optional = true }
 
 [target.'cfg(windows)'.dependencies]
 keyring = { workspace = true, features = ["windows-native"] }
 
 [features]
 default = []
-# In-process MLX EmbeddingGemma embedding provider (Apple Silicon only). Wires
-# `embedding.provider = "mlx"` in create_embedder. The `octos-embed-mlx` dep is
-# target-gated to macOS/aarch64, so this feature is a no-op elsewhere.
-embed-mlx = ["dep:octos-embed-mlx", "octos-embed-mlx/embed-mlx"]
 # In-process llama.cpp GGUF embedding provider. Wires
 # `embedding.provider = "llamacpp"` in create_embedder. Cross-platform — no
 # target gate — and defaults to the CPU backend; add an accelerator explicitly.
