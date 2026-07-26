@@ -12144,6 +12144,41 @@ async fn ensure_session_profile_runtime(
     Ok(Some(runtime))
 }
 
+/// Explain why `ensure_session_profile_runtime`/`resolve_session_profile_runtime`
+/// returned `None` for `profile_id`, re-deriving the same checks in the same
+/// order. The 4 call sites used to collapse every cause (no profile store, no
+/// such profile, disabled, sub-account, no LLM selected) into one "Set up the
+/// profile with an API key" message — accurate only for the last cause and
+/// actively misleading for the other four, e.g. telling a disabled profile's
+/// owner to add an API key it may already have.
+fn profile_runtime_unavailable_message(state: &AppState, profile_id: &str) -> String {
+    let Some(store) = state.profile_store.as_ref() else {
+        return format!(
+            "No profile store is configured, so profile '{profile_id}' cannot be resolved."
+        );
+    };
+    let profile = match store.get(profile_id) {
+        Ok(Some(profile)) => profile,
+        Ok(None) => return format!("Profile '{profile_id}' does not exist."),
+        Err(error) => return format!("Failed to read profile '{profile_id}': {error}"),
+    };
+    if !profile.enabled {
+        return format!("Profile '{profile_id}' is disabled.");
+    }
+    if profile.parent_id.is_some() {
+        return format!(
+            "Profile '{profile_id}' is a sub-account and does not have its own runtime."
+        );
+    }
+    if !profile.config.has_llm_selection() {
+        return format!(
+            "No ProfileRuntime registered for profile '{profile_id}'. \
+             Set up the profile with an API key in the dashboard."
+        );
+    }
+    format!("Profile '{profile_id}' runtime is unavailable.")
+}
+
 /// Resolve the canonical `SessionManager` handle for read operations
 /// (hydrate, state, etc.). Closes #919.1: turn persistence writes to
 /// the profile's `SessionRuntime.sessions`, so reads under profile
@@ -12665,9 +12700,8 @@ async fn handle_review_start(
                 let _ = send_rpc_error(
                     ws,
                     Some(id),
-                    runtime_unavailable_error(format!(
-                        "No ProfileRuntime registered for profile '{}'. \
-                     Set up the profile with an API key in the dashboard.",
+                    runtime_unavailable_error(profile_runtime_unavailable_message(
+                        state,
                         active_profile_id.as_deref().unwrap_or("<unset>"),
                     )),
                 );
@@ -12881,9 +12915,8 @@ async fn handle_turn_start(
             let _ = send_rpc_error(
                 ws,
                 Some(id),
-                runtime_unavailable_error(format!(
-                    "No ProfileRuntime registered for profile '{}'. \
-                     Set up the profile with an API key in the dashboard.",
+                runtime_unavailable_error(profile_runtime_unavailable_message(
+                    state,
                     active_profile_id.as_deref().unwrap_or("<unset>"),
                 )),
             );
@@ -19664,8 +19697,8 @@ async fn run_native_code_review_turn(
     {
         Ok(Some(runtime)) => runtime,
         Ok(None) => {
-            let message = format!(
-                "No ProfileRuntime registered for profile '{}'. Set up the profile with an API key in the dashboard.",
+            let message = profile_runtime_unavailable_message(
+                &state,
                 active_profile_id.as_deref().unwrap_or("<unset>"),
             );
             try_emit_terminal(
@@ -21317,9 +21350,8 @@ async fn run_standalone_turn(
     let Some(profile_runtime) =
         resolve_session_profile_runtime(&state, active_profile_id.as_deref())
     else {
-        let error = format!(
-            "No ProfileRuntime registered for profile '{}'. \
-             Set up the profile with an API key in the dashboard.",
+        let error = profile_runtime_unavailable_message(
+            &state,
             active_profile_id.as_deref().unwrap_or("<unset>"),
         );
         try_emit_terminal(
@@ -28434,6 +28466,118 @@ mod tests {
             solo_login_enabled: true,
             ..AppState::empty_for_tests()
         }
+    }
+
+    fn profile_for_runtime_message(id: &str) -> crate::profiles::UserProfile {
+        let now = Utc::now();
+        crate::profiles::UserProfile {
+            id: id.to_string(),
+            name: id.to_string(),
+            public_subdomain: None,
+            enabled: true,
+            data_dir: None,
+            parent_id: None,
+            config: crate::profiles::ProfileConfig::default(),
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    // Regression coverage for the "No ProfileRuntime registered... Set up the
+    // profile with an API key in the dashboard" message, which used to fire
+    // verbatim for every Ok(None) from `ensure_session_profile_runtime` —
+    // including a merely-disabled profile, a sub-account, or an unknown id,
+    // none of which an API key would fix.
+    #[test]
+    fn should_report_no_profile_store_when_profile_runtime_unavailable_and_store_missing() {
+        let state = AppState {
+            profile_store: None,
+            ..AppState::empty_for_tests()
+        };
+        let message = profile_runtime_unavailable_message(&state, "ghost");
+        assert!(
+            message.contains("no profile store") || message.contains("No profile store"),
+            "expected a no-store explanation, got: {message}"
+        );
+        assert!(
+            !message.contains("API key"),
+            "must not blame a missing API key: {message}"
+        );
+    }
+
+    #[test]
+    fn should_report_unknown_profile_when_profile_runtime_unavailable_and_profile_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = local_profile_state(dir.path());
+        let message = profile_runtime_unavailable_message(&state, "ghost");
+        assert!(
+            message.contains("does not exist"),
+            "expected a not-found explanation, got: {message}"
+        );
+        assert!(
+            !message.contains("API key"),
+            "must not blame a missing API key: {message}"
+        );
+    }
+
+    #[test]
+    fn should_report_disabled_when_profile_runtime_unavailable_and_profile_disabled() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = local_profile_state(dir.path());
+        let mut profile = profile_for_runtime_message("disabled-one");
+        profile.enabled = false;
+        // Fully configured (a real key) — the only thing wrong is `enabled`.
+        profile.config.llm = Some(crate::profiles::LlmProfileConfig {
+            primary: Some(crate::profiles::LlmModelSelectionConfig {
+                family_id: Some("zai".to_string()),
+                ..Default::default()
+            }),
+            fallbacks: Vec::new(),
+        });
+        state.profile_store.as_ref().unwrap().save(&profile).unwrap();
+
+        let message = profile_runtime_unavailable_message(&state, "disabled-one");
+        assert!(
+            message.contains("disabled"),
+            "expected a disabled-profile explanation, got: {message}"
+        );
+        assert!(
+            !message.contains("API key"),
+            "a disabled-but-configured profile must not be told to add an API key: {message}"
+        );
+    }
+
+    #[test]
+    fn should_report_sub_account_when_profile_runtime_unavailable_and_profile_has_parent() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = local_profile_state(dir.path());
+        let mut profile = profile_for_runtime_message("child-one");
+        profile.parent_id = Some("parent-one".to_string());
+        state.profile_store.as_ref().unwrap().save(&profile).unwrap();
+
+        let message = profile_runtime_unavailable_message(&state, "child-one");
+        assert!(
+            message.contains("sub-account") || message.contains("sub-profile"),
+            "expected a sub-account explanation, got: {message}"
+        );
+        assert!(
+            !message.contains("API key"),
+            "a sub-account must not be told to add an API key: {message}"
+        );
+    }
+
+    #[test]
+    fn should_report_missing_api_key_when_profile_runtime_unavailable_and_no_llm_selected() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = local_profile_state(dir.path());
+        let profile = profile_for_runtime_message("no-llm-one");
+        state.profile_store.as_ref().unwrap().save(&profile).unwrap();
+
+        let message = profile_runtime_unavailable_message(&state, "no-llm-one");
+        assert!(
+            message.contains("API key"),
+            "a genuinely unconfigured profile should keep the API-key guidance, got: {message}"
+        );
     }
 
     #[test]
