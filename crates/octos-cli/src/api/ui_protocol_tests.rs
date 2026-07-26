@@ -22421,6 +22421,7 @@ async fn make_m11e_profile_with_llm_and_sandbox(
     Arc::new(crate::runtime::ProfileRuntime {
         profile_id: profile_id.to_string(),
         data_dir: data_dir.to_path_buf(),
+        config: crate::config::Config::default(),
         llm,
         adaptive_router: None,
         runtime_qos_catalog: None,
@@ -25237,6 +25238,7 @@ fn peer_handoff_callback_caps_at_four_and_emits_staged_events() {
         workspace.clone(),
         originating.clone(),
         "dev".to_owned(),
+        Vec::new(),
         Arc::new(AtomicU32::new(0)),
         Arc::new(move |event| emitted_sink.lock().unwrap().push(event)),
     );
@@ -25247,6 +25249,7 @@ fn peer_handoff_callback_caps_at_four_and_emits_staged_events() {
             // Unique per iteration — named peers reject duplicates.
             name: format!("Lane {n}"),
             worktree: false,
+            model: None,
         })
         .unwrap_or_else(|err| panic!("handoff {n} within the cap must stage: {err}"));
         assert_eq!(staged.topic, format!("peer-{}", staged.slug));
@@ -25261,6 +25264,7 @@ fn peer_handoff_callback_caps_at_four_and_emits_staged_events() {
         brief: "One too many.".to_owned(),
         name: "One too many".to_owned(),
         worktree: false,
+        model: None,
     })
     .expect_err("5th handoff must be rejected");
     assert_eq!(err, "peer handoff limit reached for this turn (4)");
@@ -25880,6 +25884,7 @@ fn peer_list_caps_rows_and_summarizes_overflow() {
             has_worktree: false,
             closed: false,
             turn_history: None,
+            model_lane: None,
         }
     }
     let over = PEER_LIST_MAX_ROWS + 5;
@@ -25955,6 +25960,7 @@ fn peer_originator_recorded_by_handoff_callback() {
         workspace,
         originating.clone(),
         "dev".to_owned(),
+        Vec::new(),
         Arc::new(AtomicU32::new(0)),
         Arc::new(|_event| {}),
     );
@@ -25962,11 +25968,268 @@ fn peer_originator_recorded_by_handoff_callback() {
         brief: "Fix the flaky bus test.".to_owned(),
         name: "CI Fix".to_owned(),
         worktree: false,
+        model: None,
     })
     .expect("stage");
     let originator =
         std::fs::read_to_string(peers_root.join(&staged.slug).join("originator")).unwrap();
     assert_eq!(originator, originating.to_string());
+}
+
+// ----------------------------------------------------------------------------
+// #peer-model — per-peer model lane (a peer runs its turns on a named
+// `sub_provider` lane configured in the master's profile).
+// ----------------------------------------------------------------------------
+
+/// A staged peer dir the lane readers accept: a real dir carrying the
+/// `brief.md` staging contract, plus the caller's extra files.
+fn stage_peer_dir_with(peers_root: &std::path::Path, slug: &str) -> std::path::PathBuf {
+    let dir = peers_root.join(slug);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("brief.md"), "brief").unwrap();
+    dir
+}
+
+/// A minimal profile config carrying ONE model lane (`key`) whose credential
+/// resolves offline through `env_vars` — enough to exercise lane selection +
+/// provider construction without a network call.
+fn config_with_lane(key: &str) -> crate::config::Config {
+    let mut config = crate::config::Config::default();
+    config.env_vars.insert(
+        "PEER_LANE_TEST_KEY".to_owned(),
+        "sk-peer-lane-test".to_owned(),
+    );
+    config.sub_providers = vec![crate::config::SubProviderConfig {
+        key: key.to_owned(),
+        provider: "openai".to_owned(),
+        model: Some("gpt-4o-mini".to_owned()),
+        api_key_env: Some("PEER_LANE_TEST_KEY".to_owned()),
+        base_url: None,
+        description: None,
+        default_context_window: None,
+        max_output_tokens: None,
+        api_type: None,
+    }];
+    config
+}
+
+fn peer_list_row(slug: &str, model_lane: Option<&str>) -> PeerBlackboardRow {
+    PeerBlackboardRow {
+        slug: slug.to_owned(),
+        name: slug.to_owned(),
+        brief: String::new(),
+        brief_truncated: false,
+        result: None,
+        result_truncated: false,
+        result_updated_unix: None,
+        has_worktree: false,
+        closed: false,
+        turn_history: None,
+        model_lane: model_lane.map(str::to_owned),
+    }
+}
+
+/// #peer-model (part 2): a `peer_handoff` naming a CONFIGURED lane records it
+/// beside the brief (`peers/<slug>/model`) and produces no warning note.
+#[test]
+fn peer_handoff_callback_records_valid_model_lane() {
+    let tmp = tempfile::tempdir().unwrap();
+    let peers_root = tmp.path().join("data").join("peers");
+    let workspace = tmp.path().join("work");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let originating = octos_core::SessionKey::with_profile_topic("dev", "local", "tui", "coding");
+    let callback = build_peer_handoff_callback(
+        peers_root.clone(),
+        workspace,
+        originating,
+        "dev".to_owned(),
+        vec!["cheap".to_owned(), "strong".to_owned()],
+        Arc::new(AtomicU32::new(0)),
+        Arc::new(|_event| {}),
+    );
+
+    let staged = callback(octos_agent::PeerHandoffRequest {
+        brief: "Synthesize the peers' findings.".to_owned(),
+        name: "Synth".to_owned(),
+        worktree: false,
+        model: Some("strong".to_owned()),
+    })
+    .expect("a valid lane still stages the peer");
+
+    let recorded = std::fs::read_to_string(peers_root.join(&staged.slug).join("model")).unwrap();
+    assert_eq!(
+        recorded, "strong",
+        "the valid lane is recorded beside the brief"
+    );
+    assert!(
+        staged.model_note.is_none(),
+        "a valid lane produces no warning note: {:?}",
+        staged.model_note
+    );
+}
+
+/// #peer-model (part 2): a `peer_handoff` naming an UNKNOWN lane still stages
+/// the peer, records NO model file (so it uses the primary model), and returns
+/// a note naming the bad lane, the available lanes, and the fallback.
+#[test]
+fn peer_handoff_callback_notes_unknown_model_lane_but_still_stages() {
+    let tmp = tempfile::tempdir().unwrap();
+    let peers_root = tmp.path().join("data").join("peers");
+    let workspace = tmp.path().join("work");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let originating = octos_core::SessionKey::with_profile_topic("dev", "local", "tui", "coding");
+    let callback = build_peer_handoff_callback(
+        peers_root.clone(),
+        workspace,
+        originating,
+        "dev".to_owned(),
+        vec!["cheap".to_owned(), "strong".to_owned()],
+        Arc::new(AtomicU32::new(0)),
+        Arc::new(|_event| {}),
+    );
+
+    let staged = callback(octos_agent::PeerHandoffRequest {
+        brief: "Grind the grunt work.".to_owned(),
+        name: "Grunt".to_owned(),
+        worktree: false,
+        model: Some("gpt-mega".to_owned()),
+    })
+    .expect("an unknown lane warns, it does not fail staging");
+
+    assert!(
+        std::path::Path::new(&staged.brief_path).is_file(),
+        "the peer is still staged despite the unknown lane"
+    );
+    assert!(
+        !peers_root.join(&staged.slug).join("model").exists(),
+        "an unknown lane is not recorded on disk"
+    );
+    let note = staged.model_note.expect("an unknown lane yields a note");
+    assert!(note.contains("gpt-mega"), "note names the bad lane: {note}");
+    assert!(
+        note.contains("cheap, strong"),
+        "note lists the available lanes: {note}"
+    );
+    assert!(
+        note.contains("primary model"),
+        "note explains the fallback: {note}"
+    );
+}
+
+/// #peer-model (part 3): the lane read trims the file and treats a missing or
+/// empty `model` file as "no lane" (primary model).
+#[test]
+fn read_peer_model_lane_trims_and_treats_empty_as_absent() {
+    let tmp = tempfile::tempdir().unwrap();
+    let peers_root = tmp.path().join("peers");
+
+    let padded = stage_peer_dir_with(&peers_root, "synth");
+    std::fs::write(padded.join("model"), "  strong \n").unwrap();
+    assert_eq!(
+        read_peer_model_lane(&peers_root, "synth").as_deref(),
+        Some("strong"),
+        "the recorded lane is trimmed"
+    );
+
+    stage_peer_dir_with(&peers_root, "bare");
+    assert_eq!(
+        read_peer_model_lane(&peers_root, "bare"),
+        None,
+        "no model file → no lane"
+    );
+
+    let blank = stage_peer_dir_with(&peers_root, "blank");
+    std::fs::write(blank.join("model"), "   \n").unwrap();
+    assert_eq!(
+        read_peer_model_lane(&peers_root, "blank"),
+        None,
+        "a whitespace-only model file → no lane"
+    );
+}
+
+/// #peer-model (part 3): a peer naming a CONFIGURED lane resolves that lane's
+/// provider (selection + build succeed offline via `env_vars`).
+#[test]
+fn resolve_peer_lane_provider_selects_configured_lane() {
+    let tmp = tempfile::tempdir().unwrap();
+    let peers_root = tmp.path().join("peers");
+    let dir = stage_peer_dir_with(&peers_root, "synth");
+    std::fs::write(dir.join("model"), "strong").unwrap();
+
+    let config = config_with_lane("strong");
+    assert!(
+        resolve_peer_lane_provider(&peers_root, "synth", &config).is_some(),
+        "a peer naming a configured lane resolves that lane's provider"
+    );
+}
+
+/// #peer-model (part 3): an UNMATCHED lane key falls back to the primary model
+/// (None) — the pure selection-miss branch.
+#[test]
+fn resolve_peer_lane_provider_none_for_unmatched_lane() {
+    let tmp = tempfile::tempdir().unwrap();
+    let peers_root = tmp.path().join("peers");
+    let dir = stage_peer_dir_with(&peers_root, "synth");
+    std::fs::write(dir.join("model"), "nonesuch").unwrap();
+
+    // Only "strong" is configured; the recorded "nonesuch" matches nothing.
+    let config = config_with_lane("strong");
+    assert!(
+        resolve_peer_lane_provider(&peers_root, "synth", &config).is_none(),
+        "an unmatched lane falls back to the primary model (None)"
+    );
+}
+
+/// #peer-model (part 3): a peer with NO recorded lane falls back to the
+/// primary model (None) even when lanes are configured.
+#[test]
+fn resolve_peer_lane_provider_none_without_model_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    let peers_root = tmp.path().join("peers");
+    stage_peer_dir_with(&peers_root, "synth");
+
+    let config = config_with_lane("strong");
+    assert!(
+        resolve_peer_lane_provider(&peers_root, "synth", &config).is_none(),
+        "no model file → primary model (None)"
+    );
+}
+
+/// #peer-model (part 3): the wrapper returns None for a NON-peer session — it
+/// relies on `peer_slug_and_profile`, which rejects a plain coding session and
+/// accepts a `peer-<slug>` topic.
+#[test]
+fn peer_lane_resolution_skips_non_peer_session() {
+    let plain = octos_core::SessionKey::with_profile_topic("dev", "local", "tui", "coding");
+    assert!(
+        peer_slug_and_profile(&plain).is_none(),
+        "a non-peer session is never a lane target"
+    );
+    let peer = octos_core::SessionKey::with_profile_topic("dev", "local", "tui", "peer-synth");
+    assert_eq!(peer_slug_and_profile(&peer), Some(("dev", "synth")));
+}
+
+/// #peer-model (part 4): `peer_list` annotates a peer running on a model lane
+/// and leaves a primary-model peer unannotated.
+#[test]
+fn compose_peer_list_text_annotates_model_lane() {
+    let rows = vec![
+        peer_list_row("synth", Some("strong")),
+        peer_list_row("grunt", None),
+    ];
+    let text = compose_peer_list_text(&rows);
+    assert!(
+        text.contains("- synth  running  updated —  turns 0  · model=strong"),
+        "a lane peer is annotated with its lane: {text:?}"
+    );
+    let grunt_line = text
+        .lines()
+        .find(|line| line.starts_with("- grunt"))
+        .expect("grunt row present");
+    assert!(
+        !grunt_line.contains("model="),
+        "a primary-model peer has no lane annotation: {grunt_line:?}"
+    );
 }
 
 /// Mailbox nudge (#1801 v3): `peer/prepare` records the originator for every
