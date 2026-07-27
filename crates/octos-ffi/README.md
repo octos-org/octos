@@ -81,8 +81,11 @@ Task result: `{"output": "...", "iterations": N, "tokens": {"input", "output", .
   terminator corrupts the allocator).
 - **Panics never cross the boundary.** Every export runs inside a panic
   firewall; a panic becomes a null/error return, never an unwind into C.
-- **Errors are redacted.** `octos_last_error` strings are scrubbed of
-  credential-shaped tokens and length-capped before being exposed.
+- **Errors are redacted (best-effort).** `octos_last_error` strings are
+  length-capped and scrubbed before being exposed: the caller's OWN configured
+  key is removed by reliable **exact match** (any length, any source), while
+  credential-*shaped* UNKNOWN tokens are removed by a heuristic that — being a
+  heuristic — is best-effort and cannot be perfect.
 
 ### Credentials
 
@@ -92,6 +95,15 @@ Resolution reuses octos's `Config`. An **explicitly-passed `api_key` (or
 in cannot silently shadow the caller's key. If you supply neither, resolution
 falls back to the conventional `{PROVIDER}_API_KEY` process env var and the
 AuthStore, in that order.
+
+### Security: provider error logging
+
+`octos_last_error` is redacted, but octos and its LLM providers may also log
+provider error bodies at **debug/trace** level via `tracing`. A misbehaving
+"OpenAI-compatible" endpoint that echoes your request credential in a 4xx body
+would then land in those logs (not in `octos_last_error`, which is redacted).
+The `tracing` subscriber is the **host's** responsibility: **do not enable
+debug/trace logging with untrusted providers** when embedding octos.
 
 ## Python (ctypes) example
 

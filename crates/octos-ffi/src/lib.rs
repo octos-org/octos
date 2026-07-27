@@ -77,6 +77,12 @@ fn set_last_error(msg: impl Into<String>) {
     // Redact credential-shaped tokens and cap length BEFORE storing: provider
     // error bodies can echo an auth value, and this string is handed back
     // verbatim by `octos_last_error`.
+    //
+    // NOTE: this redacts only what the FFI EXPOSES here. It does NOT reach
+    // octos/provider `tracing` — a debug/trace subscriber may still log a
+    // provider error body verbatim (a hostile endpoint could stuff the request
+    // credential into it). That subscriber is the host's responsibility; see the
+    // SECURITY note in README.md.
     let sanitized = sanitize_error_text(&msg.into());
     // CString rejects interior NUL; scrub so the message always stores.
     let scrubbed = sanitized.replace('\0', " ");
@@ -88,11 +94,15 @@ fn clear_last_error() {
     LAST_ERROR.with(|slot| *slot.borrow_mut() = None);
 }
 
-/// Replace an exact known secret value with a placeholder. Used at sites where
-/// the FFI still holds the caller's plaintext key — the most reliable scrub.
+/// Replace the caller's EXACT known secret with a placeholder — the reliable
+/// scrub. Applied to error text wherever the FFI holds the key the provider was
+/// configured with, at ANY length and from ANY source (env_vars-injected
+/// `api_key`, `api_key_env` process var, default env var, or auth store; see
+/// [`OctosRuntime`]'s `secret`). Only an empty key is skipped — an empty pattern
+/// would otherwise splice the placeholder between every byte.
 fn scrub_secret(mut s: String, secret: Option<&str>) -> String {
     if let Some(sec) = secret {
-        if sec.len() >= 4 && s.contains(sec) {
+        if !sec.is_empty() && s.contains(sec) {
             s = s.replace(sec, "<redacted>");
         }
     }
@@ -216,9 +226,12 @@ pub struct OctosRuntime {
     embedding_configured: bool,
     #[cfg(feature = "embed-llama")]
     embedder: Option<Arc<octos_embed_llama::LlamaEmbedder>>,
-    /// The caller's plaintext key when supplied via `api_key`, retained ONLY to
-    /// scrub it out of provider error text before it reaches `octos_last_error`.
-    /// (It already lives inside `llm`, so this is not new exposure.)
+    /// The RESOLVED plaintext key the provider was built with — from whatever
+    /// source (env_vars-injected `api_key`, `api_key_env` process var, default
+    /// env var, or auth store; see `runtime_new_impl`). Retained ONLY to
+    /// exact-scrub it out of provider/agent/embed error text before it reaches
+    /// `octos_last_error`. (It already lives inside `llm`, so this is not new
+    /// exposure.)
     secret: Option<String>,
     /// Scratch dir backing the episodic memory store; removed on free.
     mem_dir: PathBuf,
@@ -372,6 +385,14 @@ fn runtime_new_impl(config_json: *const c_char) -> Result<*mut OctosRuntime, Str
         cli_cfg.bypass_auth_store = true;
     }
 
+    // Resolve the ACTUAL key value that will be used, from whatever source
+    // (env_vars-injected api_key, api_key_env process var, default env var, or —
+    // when not bypassed — the auth store), so it can be exact-scrubbed out of
+    // any error text regardless of how it was supplied. `.ok()` because a
+    // key-less provider (or a genuinely missing key) is not itself a redaction
+    // concern; a missing REQUIRED key still fails at `create_provider` below.
+    let resolved_secret = cli_cfg.get_api_key(&cfg.provider).ok();
+
     let llm = create_provider_with_api_type(
         &cfg.provider,
         &cli_cfg,
@@ -382,7 +403,7 @@ fn runtime_new_impl(config_json: *const c_char) -> Result<*mut OctosRuntime, Str
     .map_err(|e| {
         scrub_secret(
             format!("failed to build provider '{}': {e}", cfg.provider),
-            cfg.api_key.as_deref(),
+            resolved_secret.as_deref(),
         )
     })?;
 
@@ -430,7 +451,7 @@ fn runtime_new_impl(config_json: *const c_char) -> Result<*mut OctosRuntime, Str
         embedding_configured,
         #[cfg(feature = "embed-llama")]
         embedder,
-        secret: cfg.api_key.clone(),
+        secret: resolved_secret,
         mem_dir,
     };
     Ok(Box::into_raw(Box::new(runtime)))
@@ -692,5 +713,45 @@ mod tests {
         let e = scrub_secret(format!("provider rejected {key} verbatim"), Some(key));
         assert!(e.contains("<redacted>"));
         assert!(!e.contains(key));
+    }
+
+    #[test]
+    fn scrub_secret_redacts_short_exact_key() {
+        // The exact-match scrub must fire regardless of key length — a 3-char
+        // key is unusual but must still be removed (the length guard is only for
+        // the UNKNOWN-token heuristic, not the exact scrub).
+        let e = scrub_secret("401 unauthorized for abc here".to_string(), Some("abc"));
+        assert!(e.contains("<redacted>"), "got: {e}");
+        assert!(!e.contains("abc"));
+    }
+
+    #[test]
+    fn secret_captured_from_api_key_env_and_scrubbed() {
+        // A short key sourced via `api_key_env` (process env) must be captured
+        // into `OctosRuntime.secret` and exact-scrubbed — not just a directly
+        // passed `api_key`. Follows the codebase convention of `unsafe set_var`
+        // in tests; the var name is unique to avoid cross-test collisions.
+        let var = "OCTOS_FFI_TEST_APIKEYENV_SHORT";
+        // SAFETY: test-only process env mutation with a unique var name.
+        unsafe { std::env::set_var(var, "abc") };
+
+        let cfg_json =
+            format!(r#"{{"provider":"openai","model":"gpt-4o-mini","api_key_env":"{var}"}}"#);
+        let cfg = CString::new(cfg_json).unwrap();
+        let raw = runtime_new_impl(cfg.as_ptr()).expect("runtime built");
+        // SAFETY: non-null handle just built by `runtime_new_impl`.
+        let rt = unsafe { &*raw };
+        // The api_key_env-sourced key is captured for scrubbing, even at 3 chars.
+        assert_eq!(rt.secret.as_deref(), Some("abc"));
+        let scrubbed = scrub_secret(
+            "provider 401: bad key abc".to_string(),
+            rt.secret.as_deref(),
+        );
+        assert!(scrubbed.contains("<redacted>"));
+        assert!(!scrubbed.contains("abc"));
+
+        octos_runtime_free(raw);
+        // SAFETY: test cleanup of the unique var.
+        unsafe { std::env::remove_var(var) };
     }
 }
