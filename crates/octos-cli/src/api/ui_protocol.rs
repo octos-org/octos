@@ -2439,24 +2439,24 @@ mod peer_io {
             };
             // fdopendir on the anchored fd — entries come from THIS inode, never
             // a re-walked path, so a swapped `<slug>` can't redirect the scan.
-            let Ok(dir) = Dir::read_from(&dirfd) else {
+            let Ok(mut dir) = Dir::read_from(&dirfd) else {
                 return 0;
             };
             let prefix = prefix.as_bytes();
             let mut count = 0usize;
             let mut scanned = 0usize;
-            for entry in dir {
-                // A read error ends the scan (don't spin); the count so far is a
-                // safe lower bound.
-                let Ok(entry) = entry else {
+            // Fetch AT MOST `cap` entries: the budget is checked BEFORE each
+            // read, so the cap+1'th entry is never even fetched.
+            while scanned < cap {
+                let Some(next) = dir.next() else {
                     break;
                 };
-                // Bound the RAW scan before any filtering so a hostile flood of
-                // entries can't stall the turn.
+                // A mid-scan read error is a FAILURE, not a short scan: return 0
+                // (the documented contract), never a partial count.
+                let Ok(entry) = next else {
+                    return 0;
+                };
                 scanned += 1;
-                if scanned > cap {
-                    break;
-                }
                 if !entry.file_name().to_bytes().starts_with(prefix) {
                     continue;
                 }
@@ -2612,19 +2612,21 @@ mod peer_io {
             if !peer_dir_ok(peer_dir) {
                 return 0;
             }
-            let Ok(read_dir) = std::fs::read_dir(peer_dir) else {
+            let Ok(mut read_dir) = std::fs::read_dir(peer_dir) else {
                 return 0;
             };
             let mut count = 0usize;
             let mut scanned = 0usize;
-            for entry in read_dir {
-                let Ok(entry) = entry else {
+            // Fetch AT MOST `cap` entries (budget checked before each read); a
+            // mid-scan read error returns 0, never a partial count.
+            while scanned < cap {
+                let Some(next) = read_dir.next() else {
                     break;
                 };
+                let Ok(entry) = next else {
+                    return 0;
+                };
                 scanned += 1;
-                if scanned > cap {
-                    break;
-                }
                 if !entry.file_name().to_string_lossy().starts_with(prefix) {
                     continue;
                 }
@@ -2916,6 +2918,25 @@ mod peer_io_tests {
             peer_dir_count_prefixed(&link, "result-", PEER_DIR_SCAN_CAP),
             0,
             "a symlinked peer dir must not be followed for enumeration"
+        );
+        // Any open/read failure returns 0 (the documented contract), never a
+        // partial count — here an absent dir; a mid-scan readdir error takes the
+        // same `return 0` path.
+        assert_eq!(
+            peer_dir_count_prefixed(&dir.path().join("absent"), "result-", PEER_DIR_SCAN_CAP),
+            0,
+            "a missing peer dir must count 0"
+        );
+        // The budget is checked BEFORE each read: cap 0 fetches nothing (→ 0),
+        // and cap 1 fetches at most one entry so the count never exceeds the cap.
+        assert_eq!(
+            peer_dir_count_prefixed(peer, "result-", 0),
+            0,
+            "cap 0 must fetch no entries"
+        );
+        assert!(
+            peer_dir_count_prefixed(peer, "result-", 1) <= 1,
+            "the raw scan must stop at exactly the cap"
         );
     }
 }
@@ -11101,6 +11122,21 @@ fn stage_peer(
     let cwd = if worktree {
         let worktree_path = peer_dir.join("wt");
         let branch = format!("peer/{slug}");
+        // Best-effort re-validation immediately before handing the path to git:
+        // narrows (to near-zero) the window in which `<slug>` could be swapped
+        // to a symlink after reservation, which would redirect git's worktree
+        // creation outside `peers_root`. NOTE: this does NOT fully close it —
+        // git re-resolves `peers/<slug>/wt` by path itself, so a residual
+        // path-resolution TOCTOU is inherent to handing a path to a subprocess
+        // (tracked as a follow-up; #1824). Accurate scope: all peer-FILE
+        // read/write/enumeration I/O is fd-anchored; only this git-worktree
+        // creation path is best-effort re-validated.
+        if !peer_io::peer_dir_exists(&peer_dir) {
+            cleanup_staged_peer(workspace_root, &slug, &peer_dir);
+            return Err(RpcError::invalid_params(format!(
+                "peer '{slug}' staging directory is no longer a real directory"
+            )));
+        }
         let output = std::process::Command::new("git")
             .arg("-C")
             .arg(workspace_root)
