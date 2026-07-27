@@ -112,7 +112,14 @@ fn scrub_secret(mut s: String, secret: Option<&str>) -> String {
 /// Best-effort redaction of credential-shaped substrings plus a length cap.
 /// Applied to every stored error as a backstop for the env-var / auth-store key
 /// paths where the plaintext isn't available for an exact scrub.
-fn sanitize_error_text(input: &str) -> String {
+///
+/// `pub` so a non-C facade (e.g. `octos-uniffi`) can apply the SAME heuristic
+/// backstop + cap that the C-ABI's `set_last_error` applies. It must be invoked
+/// ONLY at the outer facade boundary, never inside the core ([`OctosRuntime::
+/// from_config`]/[`OctosRuntime::run_task`]/[`CoreError`] construction) — doing
+/// so would double-apply on the C path and perturb `octos_last_error`'s
+/// byte-for-byte output.
+pub fn sanitize_error_text(input: &str) -> String {
     let mut out = String::with_capacity(input.len().min(MAX_ERROR_LEN + 16));
     for (i, word) in input.split_whitespace().enumerate() {
         if i > 0 {
@@ -219,45 +226,139 @@ fn pin_resolved_key(cli_cfg: &mut Config, resolved: Option<&str>) {
     }
 }
 
-/// The FFI-facing config accepted by [`octos_runtime_new`] as JSON.
-#[derive(Debug, Deserialize)]
-struct FfiConfig {
-    provider: String,
-    model: String,
+/// Native runtime configuration — the single source of truth consumed by
+/// [`OctosRuntime::from_config`].
+///
+/// The C-ABI ([`octos_runtime_new`]) parses its JSON into this, and the
+/// `octos-uniffi` wrapper maps its idiomatic `Config` into it. Retains
+/// `Deserialize` so the C JSON parse is byte-for-byte unchanged. Fields are
+/// `pub` so the native core can be built directly (e.g. from uniffi) without
+/// going through JSON.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct RuntimeConfig {
+    pub provider: String,
+    pub model: String,
     /// Raw API key. Injected into the reused octos `Config` key resolution.
     #[serde(default)]
-    api_key: Option<String>,
+    pub api_key: Option<String>,
     /// Name of a process env var holding the API key (alternative to `api_key`).
     #[serde(default)]
-    api_key_env: Option<String>,
+    pub api_key_env: Option<String>,
     #[serde(default)]
-    base_url: Option<String>,
+    pub base_url: Option<String>,
     /// API protocol override: `"anthropic"` / `"responses"` (see the reused
-    /// `create_provider_with_api_type`). Usually omitted.
+    /// `create_provider_with_api_type`). Usually omitted. Retained for exact
+    /// C-ABI parity; the uniffi surface leaves it `None`.
     #[serde(default)]
-    api_type: Option<String>,
+    pub api_type: Option<String>,
     /// Working directory the FS tools are confined to. Defaults to the process
     /// cwd.
     #[serde(default)]
-    cwd: Option<String>,
+    pub cwd: Option<String>,
     /// Register the `shell` tool. Off by default — an embedded library should
     /// not run shell unless the host asks.
     #[serde(default)]
-    allow_shell: bool,
+    pub allow_shell: bool,
     #[serde(default)]
-    max_iterations: Option<u32>,
-    /// Path to a GGUF embedding model. Enables [`octos_embed`] (requires the
-    /// `embed-llama` build feature).
+    pub max_iterations: Option<u32>,
+    /// Path to a GGUF embedding model. Enables [`OctosRuntime::embed`] (requires
+    /// the `embed-llama` build feature).
     #[serde(default)]
-    embedding_model_path: Option<String>,
+    pub embedding_model_path: Option<String>,
 }
 
-/// The per-task brief accepted by [`octos_run_task`] as JSON.
-#[derive(Debug, Deserialize)]
-struct Brief {
-    prompt: String,
+/// The per-task brief consumed by [`OctosRuntime::run_task`]. The C-ABI
+/// ([`octos_run_task`]) parses its JSON into this; retains `Deserialize` so the
+/// C JSON parse is unchanged.
+#[derive(Debug, Clone, Deserialize)]
+pub struct TaskBrief {
+    pub prompt: String,
     #[serde(default)]
-    max_iterations: Option<u32>,
+    pub max_iterations: Option<u32>,
+}
+
+/// Token accounting for a completed [`OctosRuntime::run_task`].
+#[derive(Debug, Clone, Default)]
+pub struct TokenUsage {
+    pub input: u64,
+    pub output: u64,
+    pub reasoning: u64,
+    pub cache_read: u64,
+    pub cache_write: u64,
+}
+
+/// The native result of [`OctosRuntime::run_task`].
+#[derive(Debug, Clone)]
+pub struct TaskResult {
+    pub output: String,
+    pub iterations: u32,
+    pub tokens: TokenUsage,
+}
+
+/// Native error for the core surface ([`OctosRuntime::from_config`],
+/// [`OctosRuntime::run_task`], [`OctosRuntime::embed`]).
+///
+/// Every `String` payload is ALREADY credential-scrubbed via [`scrub_secret`]
+/// at the point it is constructed, so `Display` renders it verbatim. The C-ABI
+/// then applies its own [`sanitize_error_text`] length-cap/heuristic backstop
+/// (unchanged) before exposing it via [`octos_last_error`].
+#[derive(Debug)]
+pub enum CoreError {
+    /// Configuration / runtime-construction failure (bad config, tokio/runtime
+    /// or memory-store setup).
+    Config(String),
+    /// Provider construction failure.
+    Provider(String),
+    /// Task-execution failure.
+    Run(String),
+    /// Embedding failure (model load, embed call, or empty result).
+    Embed(String),
+    /// No embedder is available: either no `embedding_model_path` was configured
+    /// or the crate was built without the `embed-llama` feature.
+    NoEmbedder,
+}
+
+impl std::fmt::Display for CoreError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CoreError::Config(m)
+            | CoreError::Provider(m)
+            | CoreError::Run(m)
+            | CoreError::Embed(m) => f.write_str(m),
+            CoreError::NoEmbedder => f.write_str("no embedder configured"),
+        }
+    }
+}
+
+impl std::error::Error for CoreError {}
+
+/// RAII owner of the ephemeral episodic-memory scratch dir that THIS crate
+/// created under the OS temp dir. Its `Drop` best-effort removes the dir
+/// (errors ignored).
+///
+/// It only ever owns a `mkdtemp`-style path this crate itself minted — NEVER a
+/// user-supplied `cwd`/path — so dropping it can never delete caller data. It
+/// is declared as the LAST field of [`OctosRuntime`] so declaration-order field
+/// drop runs it AFTER the `Arc<EpisodeStore>`: the redb file lock releases
+/// first, then the dir is removed. That is exactly the ordering the old manual
+/// `octos_runtime_free` cleanup guaranteed by hand (a Drop that removed first
+/// would fail on Windows / lock-sensitive platforms). Holding it locally in
+/// `from_config` before it is moved into the struct also cleans up if
+/// construction errors out after the dir exists.
+struct ScratchDir(Option<PathBuf>);
+
+impl ScratchDir {
+    fn new(path: PathBuf) -> Self {
+        ScratchDir(Some(path))
+    }
+}
+
+impl Drop for ScratchDir {
+    fn drop(&mut self) {
+        if let Some(dir) = self.0.take() {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
 }
 
 /// Opaque runtime handle.
@@ -294,11 +395,202 @@ pub struct OctosRuntime {
     /// `octos_last_error`. (It already lives inside `llm`, so this is not new
     /// exposure.)
     secret: Option<String>,
-    /// Scratch dir backing the episodic memory store; removed on free.
-    mem_dir: PathBuf,
+    /// RAII owner of the episodic-memory scratch dir. MUST be the LAST field so
+    /// it drops AFTER `memory` (releasing the redb lock) on both the C free path
+    /// and a native drop. See [`ScratchDir`]. `allow(dead_code)`: it exists only
+    /// for its `Drop` side effect (removing the dir) and its declaration
+    /// position — outside `#[cfg(test)]` nothing reads it explicitly.
+    #[allow(dead_code)]
+    scratch: ScratchDir,
 }
 
 impl OctosRuntime {
+    /// Build a runtime from a native [`RuntimeConfig`].
+    ///
+    /// This is the SINGLE home of the hardened credential path — the C-ABI
+    /// (`octos_runtime_new`) and the `octos-uniffi` wrapper both construct the
+    /// runtime through here, so the credential logic lives in exactly one place:
+    /// canonical provider-name resolution, one-shot `get_api_key` resolution,
+    /// pinning that value back so the factory can never do a second
+    /// (possibly-rotated) read, provider construction, tool + agent + tokio +
+    /// memory setup, and retention of the resolved secret purely to scrub it out
+    /// of later error text.
+    pub fn from_config(cfg: RuntimeConfig) -> Result<OctosRuntime, CoreError> {
+        // Reuse octos-cli's Config + provider factory (key resolution, timeout
+        // overrides, api_type bypasses).
+        let mut cli_cfg: Config = serde_json::from_str("{}")
+            .map_err(|e| CoreError::Config(format!("internal default config: {e}")))?;
+        let key_env = cfg
+            .api_key_env
+            .clone()
+            .unwrap_or_else(|| format!("{}_API_KEY", cfg.provider.to_uppercase()));
+        if let Some(key) = &cfg.api_key {
+            // Inject the raw key so Config::get_api_key resolves it from env_vars,
+            // and make it authoritative over any host `octos auth login` credential.
+            cli_cfg.api_key_env = Some(key_env.clone());
+            cli_cfg.env_vars.insert(key_env, key.clone());
+            cli_cfg.bypass_auth_store = true;
+        } else if cfg.api_key_env.is_some() {
+            // Host explicitly named the process env var; let it win over auth store.
+            cli_cfg.api_key_env = cfg.api_key_env.clone();
+            cli_cfg.bypass_auth_store = true;
+        }
+
+        // SINGLE credential resolution. Resolve the effective key EXACTLY ONCE,
+        // from whatever source (env_vars-injected api_key, api_key_env process
+        // var, default env var, or — when not bypassed — the auth store), under
+        // the CANONICAL provider name the factory uses (so an auth-store key
+        // keyed by the canonical name is not missed when the caller used an
+        // alias/case variant).
+        let canonical = canonical_provider_name(&cfg.provider);
+        let resolved_secret = cli_cfg.get_api_key(&canonical).ok();
+
+        // Pin that single resolution back into the config so the factory's OWN
+        // `get_api_key` returns this exact value from `env_vars` — never doing a
+        // second AuthStore/process-env read that a mid-flight credential rotation
+        // could make disagree. After this, `resolved_secret` == the key the
+        // provider is built with, by construction, so `secret` mirrors it
+        // deterministically. `.ok()` above (not `?`) because a genuinely missing
+        // REQUIRED key is not a redaction concern and still fails at
+        // `create_provider` below.
+        pin_resolved_key(&mut cli_cfg, resolved_secret.as_deref());
+
+        let llm = create_provider_with_api_type(
+            &cfg.provider,
+            &cli_cfg,
+            Some(cfg.model.clone()),
+            cfg.base_url.clone(),
+            cfg.api_type.as_deref(),
+        )
+        .map_err(|e| {
+            CoreError::Provider(scrub_secret(
+                format!("failed to build provider '{}': {e}", cfg.provider),
+                resolved_secret.as_deref(),
+            ))
+        })?;
+
+        let tokio = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| CoreError::Config(format!("failed to build tokio runtime: {e}")))?;
+
+        // Build the embedder BEFORE creating the memory scratch dir so that no
+        // fallible step follows dir creation (issue: a later failure would leak
+        // the dir). See the cleanup on the memory-open error path below.
+        #[cfg(feature = "embed-llama")]
+        let embedder =
+            build_embedder(cfg.embedding_model_path.as_deref()).map_err(CoreError::Embed)?;
+
+        let cwd = match &cfg.cwd {
+            Some(c) => PathBuf::from(c),
+            None => std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+        };
+        let default_max_iterations = cfg
+            .max_iterations
+            .unwrap_or_else(|| AgentConfig::default().max_iterations);
+        let embedding_configured = cfg.embedding_model_path.is_some();
+
+        // Minimal episodic memory store in a unique scratch dir. Take RAII
+        // ownership of the dir the moment we commit to its path, so that if the
+        // store fails to open (or any later step errors) the local `scratch`
+        // drops and best-effort removes the dir — no mid-init leak. On success
+        // it moves into the struct's LAST field and is removed only after the
+        // store's redb lock releases on teardown. (`EpisodeStore::open` creates
+        // the dir before it can fail, and does not hold the lock on failure.)
+        let seq = MEM_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let mem_dir =
+            std::env::temp_dir().join(format!("octos-ffi-mem-{}-{}", std::process::id(), seq));
+        let scratch = ScratchDir::new(mem_dir.clone());
+        let memory = match tokio.block_on(EpisodeStore::open(&mem_dir)) {
+            Ok(store) => Arc::new(store),
+            Err(e) => {
+                // `scratch` drops on this early return, removing the dir.
+                return Err(CoreError::Config(format!(
+                    "failed to open memory store: {e}"
+                )));
+            }
+        };
+
+        Ok(OctosRuntime {
+            tokio,
+            llm,
+            memory,
+            cwd,
+            allow_shell: cfg.allow_shell,
+            default_max_iterations,
+            embedding_configured,
+            #[cfg(feature = "embed-llama")]
+            embedder,
+            secret: resolved_secret,
+            scratch,
+        })
+    }
+
+    /// Run a one-shot task, returning its native [`TaskResult`]. Builds a fresh
+    /// agent (honoring a per-task `max_iterations`), blocks on the agent loop,
+    /// derives the iteration count from the assistant-message count, and folds
+    /// up token usage. Error text is credential-scrubbed.
+    pub fn run_task(&self, brief: &TaskBrief) -> Result<TaskResult, CoreError> {
+        if brief.prompt.trim().is_empty() {
+            return Err(CoreError::Run("prompt is empty".to_string()));
+        }
+        let max_iter = brief.max_iterations.unwrap_or(self.default_max_iterations);
+        let agent = self.build_agent(max_iter);
+        let response = self
+            .tokio
+            .block_on(agent.process_message(&brief.prompt, &[], Vec::new()))
+            .map_err(|e| {
+                CoreError::Run(scrub_secret(
+                    format!("agent run failed: {e}"),
+                    self.secret.as_deref(),
+                ))
+            })?;
+
+        // `ConversationResponse` carries no explicit loop-iteration count, so
+        // derive one: each LLM round contributes exactly one assistant message.
+        let iterations = response
+            .messages
+            .iter()
+            .filter(|m| m.role == MessageRole::Assistant)
+            .count();
+        Ok(TaskResult {
+            output: response.content,
+            iterations: u32::try_from(iterations).unwrap_or(u32::MAX),
+            tokens: TokenUsage {
+                input: u64::from(response.token_usage.input_tokens),
+                output: u64::from(response.token_usage.output_tokens),
+                reasoning: u64::from(response.token_usage.reasoning_tokens),
+                cache_read: u64::from(response.token_usage.cache_read_tokens),
+                cache_write: u64::from(response.token_usage.cache_write_tokens),
+            },
+        })
+    }
+
+    /// Embed `text`, returning the raw vector. Requires the `embed-llama`
+    /// feature and a configured `embedding_model_path`; otherwise
+    /// [`CoreError::NoEmbedder`]. Error text is credential-scrubbed.
+    #[cfg(feature = "embed-llama")]
+    pub fn embed(&self, text: &str) -> Result<Vec<f32>, CoreError> {
+        let embedder = self.embedder.as_ref().ok_or(CoreError::NoEmbedder)?;
+        let mut vectors = self.tokio.block_on(embedder.embed(&[text])).map_err(|e| {
+            CoreError::Embed(scrub_secret(
+                format!("embed failed: {e}"),
+                self.secret.as_deref(),
+            ))
+        })?;
+        if vectors.is_empty() {
+            return Err(CoreError::Embed("embedder returned no vectors".to_string()));
+        }
+        Ok(vectors.swap_remove(0))
+    }
+
+    /// Embed stub when the crate is built without the `embed-llama` feature —
+    /// always [`CoreError::NoEmbedder`].
+    #[cfg(not(feature = "embed-llama"))]
+    pub fn embed(&self, _text: &str) -> Result<Vec<f32>, CoreError> {
+        Err(CoreError::NoEmbedder)
+    }
+
     /// Build a fresh agent with a cwd-scoped FS toolset.
     fn build_agent(&self, max_iterations: u32) -> Agent {
         let tools = build_tools(&self.cwd, self.allow_shell);
@@ -423,107 +715,14 @@ pub extern "C" fn octos_runtime_new(config_json: *const c_char) -> *mut OctosRun
 fn runtime_new_impl(config_json: *const c_char) -> Result<*mut OctosRuntime, String> {
     // SAFETY: `cstr_to_str` NULL-checks and UTF-8-validates.
     let raw = unsafe { cstr_to_str(config_json) }.map_err(|e| format!("config_json: {e}"))?;
-    let cfg: FfiConfig =
+    let cfg: RuntimeConfig =
         serde_json::from_str(raw).map_err(|e| format!("invalid config_json: {e}"))?;
 
-    // Reuse octos-cli's Config + provider factory (key resolution, timeout
-    // overrides, api_type bypasses).
-    let mut cli_cfg: Config =
-        serde_json::from_str("{}").map_err(|e| format!("internal default config: {e}"))?;
-    let key_env = cfg
-        .api_key_env
-        .clone()
-        .unwrap_or_else(|| format!("{}_API_KEY", cfg.provider.to_uppercase()));
-    if let Some(key) = &cfg.api_key {
-        // Inject the raw key so Config::get_api_key resolves it from env_vars,
-        // and make it authoritative over any host `octos auth login` credential.
-        cli_cfg.api_key_env = Some(key_env.clone());
-        cli_cfg.env_vars.insert(key_env, key.clone());
-        cli_cfg.bypass_auth_store = true;
-    } else if cfg.api_key_env.is_some() {
-        // Host explicitly named the process env var; let it win over auth store.
-        cli_cfg.api_key_env = cfg.api_key_env.clone();
-        cli_cfg.bypass_auth_store = true;
-    }
-
-    // SINGLE credential resolution. Resolve the effective key EXACTLY ONCE, from
-    // whatever source (env_vars-injected api_key, api_key_env process var,
-    // default env var, or — when not bypassed — the auth store), under the
-    // CANONICAL provider name the factory uses (so an auth-store key keyed by the
-    // canonical name is not missed when the caller used an alias/case variant).
-    let canonical = canonical_provider_name(&cfg.provider);
-    let resolved_secret = cli_cfg.get_api_key(&canonical).ok();
-
-    // Pin that single resolution back into the config so the factory's OWN
-    // `get_api_key` returns this exact value from `env_vars` — never doing a
-    // second AuthStore/process-env read that a mid-flight credential rotation
-    // could make disagree. After this, `resolved_secret` == the key the provider
-    // is built with, by construction, so `secret` mirrors it deterministically.
-    // `.ok()` above (not `?`) because a genuinely missing REQUIRED key is not a
-    // redaction concern and still fails at `create_provider` below.
-    pin_resolved_key(&mut cli_cfg, resolved_secret.as_deref());
-
-    let llm = create_provider_with_api_type(
-        &cfg.provider,
-        &cli_cfg,
-        Some(cfg.model.clone()),
-        cfg.base_url.clone(),
-        cfg.api_type.as_deref(),
-    )
-    .map_err(|e| {
-        scrub_secret(
-            format!("failed to build provider '{}': {e}", cfg.provider),
-            resolved_secret.as_deref(),
-        )
-    })?;
-
-    let tokio = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .map_err(|e| format!("failed to build tokio runtime: {e}"))?;
-
-    // Build the embedder BEFORE creating the memory scratch dir so that no
-    // fallible step follows dir creation (issue: a later failure would leak the
-    // dir). See the cleanup on the memory-open error path below.
-    #[cfg(feature = "embed-llama")]
-    let embedder = build_embedder(cfg.embedding_model_path.as_deref())?;
-
-    let cwd = match &cfg.cwd {
-        Some(c) => PathBuf::from(c),
-        None => std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
-    };
-    let default_max_iterations = cfg
-        .max_iterations
-        .unwrap_or_else(|| AgentConfig::default().max_iterations);
-    let embedding_configured = cfg.embedding_model_path.is_some();
-
-    // Minimal episodic memory store in a unique scratch dir. `EpisodeStore::open`
-    // creates the dir before it can fail, so remove it on the error path (the
-    // store is not constructed there, so nothing holds the redb lock).
-    let seq = MEM_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let mem_dir =
-        std::env::temp_dir().join(format!("octos-ffi-mem-{}-{}", std::process::id(), seq));
-    let memory = match tokio.block_on(EpisodeStore::open(&mem_dir)) {
-        Ok(store) => Arc::new(store),
-        Err(e) => {
-            let _ = std::fs::remove_dir_all(&mem_dir);
-            return Err(format!("failed to open memory store: {e}"));
-        }
-    };
-
-    let runtime = OctosRuntime {
-        tokio,
-        llm,
-        memory,
-        cwd,
-        allow_shell: cfg.allow_shell,
-        default_max_iterations,
-        embedding_configured,
-        #[cfg(feature = "embed-llama")]
-        embedder,
-        secret: resolved_secret,
-        mem_dir,
-    };
+    // All construction (incl. the hardened credential path) lives in the native
+    // core; the C-ABI only marshals JSON in and a boxed handle out. `Display` on
+    // `CoreError` renders the already-scrubbed message verbatim, so the stored
+    // last-error is unchanged.
+    let runtime = OctosRuntime::from_config(cfg).map_err(|e| e.to_string())?;
     Ok(Box::into_raw(Box::new(runtime)))
 }
 
@@ -540,16 +739,17 @@ pub extern "C" fn octos_runtime_free(runtime: *mut OctosRuntime) {
         // SAFETY: `runtime` came from `Box::into_raw` in `octos_runtime_new`
         // and is reconstructed exactly once (caller must not double-free).
         let boxed = unsafe { Box::from_raw(runtime) };
-        let mem_dir = boxed.mem_dir.clone();
+        // Dropping the box drops OctosRuntime's fields in declaration order: the
+        // `Arc<EpisodeStore>` (releasing the redb file lock) BEFORE the trailing
+        // `ScratchDir`, whose Drop removes the temp dir — the same order the old
+        // manual cleanup guaranteed by hand, now enforced by field order + RAII.
+        //
         // NOTE: dropping the held tokio runtime here PANICS if the host calls
         // this from inside its own async/tokio context ("Cannot drop a runtime
         // in a context where blocking is not allowed"). That panic is contained
         // by `guard` (no UB), but the drop is then incomplete and the scratch
         // dir may leak — hosts must free from a plain, non-async thread.
-        //
-        // Drop first so the redb store releases its file lock before cleanup.
         drop(boxed);
-        let _ = std::fs::remove_dir_all(&mem_dir);
     });
 }
 
@@ -581,34 +781,26 @@ fn run_task_impl(
     let rt = unsafe { runtime.as_ref() }.ok_or_else(|| "runtime pointer is null".to_string())?;
     // SAFETY: `cstr_to_str` NULL-checks and UTF-8-validates.
     let raw = unsafe { cstr_to_str(brief_json) }?;
-    let brief: Brief = serde_json::from_str(raw).map_err(|e| format!("invalid brief_json: {e}"))?;
+    let brief: TaskBrief =
+        serde_json::from_str(raw).map_err(|e| format!("invalid brief_json: {e}"))?;
+    // Preserve the exact C-ABI message for an empty prompt (the native
+    // `run_task` also guards this, with its own message, for the uniffi path).
     if brief.prompt.trim().is_empty() {
         return Err("brief_json.prompt is empty".to_string());
     }
-    let max_iter = brief.max_iterations.unwrap_or(rt.default_max_iterations);
 
-    let agent = rt.build_agent(max_iter);
-    let response = rt
-        .tokio
-        .block_on(agent.process_message(&brief.prompt, &[], Vec::new()))
-        .map_err(|e| scrub_secret(format!("agent run failed: {e}"), rt.secret.as_deref()))?;
-
-    // `ConversationResponse` carries no explicit loop-iteration count, so
-    // derive one: each LLM round contributes exactly one assistant message.
-    let iterations = response
-        .messages
-        .iter()
-        .filter(|m| m.role == MessageRole::Assistant)
-        .count();
+    // Run through the native core, then serialize its `TaskResult` into the
+    // exact JSON shape/order the C-ABI has always emitted.
+    let result = rt.run_task(&brief).map_err(|e| e.to_string())?;
     let out = json!({
-        "output": response.content,
-        "iterations": iterations,
+        "output": result.output,
+        "iterations": result.iterations,
         "tokens": {
-            "input": response.token_usage.input_tokens,
-            "output": response.token_usage.output_tokens,
-            "reasoning": response.token_usage.reasoning_tokens,
-            "cache_read": response.token_usage.cache_read_tokens,
-            "cache_write": response.token_usage.cache_write_tokens,
+            "input": result.tokens.input,
+            "output": result.tokens.output,
+            "reasoning": result.tokens.reasoning,
+            "cache_read": result.tokens.cache_read,
+            "cache_write": result.tokens.cache_write,
         }
     });
     let serialized = serde_json::to_string(&out).map_err(|e| format!("serialize output: {e}"))?;
@@ -638,34 +830,28 @@ fn embed_entry(runtime: *mut OctosRuntime, text: *const c_char) -> Result<*mut c
     let rt = unsafe { runtime.as_ref() }.ok_or_else(|| "runtime pointer is null".to_string())?;
     // SAFETY: `cstr_to_str` NULL-checks and UTF-8-validates.
     let text = unsafe { cstr_to_str(text) }?;
+    // Preserve the exact C-ABI distinction: "no embedder configured" when the
+    // config named no model path, vs "embedding support not compiled in…" when a
+    // model was named but the feature is off (the latter is decided in
+    // `embed_serialize`, whose feature split predates the native core).
     if !rt.embedding_configured {
         return Err("no embedder configured".to_string());
     }
-    embed_impl(rt, text)
+    embed_serialize(rt, text)
 }
 
+/// Serialize an embedding produced by the native [`OctosRuntime::embed`] core.
+/// Split by feature so the "not compiled in" C-ABI message is preserved exactly.
 #[cfg(feature = "embed-llama")]
-fn embed_impl(rt: &OctosRuntime, text: &str) -> Result<*mut c_char, String> {
-    let embedder = rt
-        .embedder
-        .as_ref()
-        .ok_or_else(|| "no embedder configured".to_string())?;
-    let mut vectors = rt
-        .tokio
-        .block_on(embedder.embed(&[text]))
-        .map_err(|e| scrub_secret(format!("embed failed: {e}"), rt.secret.as_deref()))?;
-    let first = if vectors.is_empty() {
-        return Err("embedder returned no vectors".to_string());
-    } else {
-        vectors.swap_remove(0)
-    };
-    let serialized = serde_json::to_string(&json!({ "embedding": first }))
+fn embed_serialize(rt: &OctosRuntime, text: &str) -> Result<*mut c_char, String> {
+    let vector = rt.embed(text).map_err(|e| e.to_string())?;
+    let serialized = serde_json::to_string(&json!({ "embedding": vector }))
         .map_err(|e| format!("serialize embedding: {e}"))?;
     to_owned_ptr(serialized)
 }
 
 #[cfg(not(feature = "embed-llama"))]
-fn embed_impl(_rt: &OctosRuntime, _text: &str) -> Result<*mut c_char, String> {
+fn embed_serialize(_rt: &OctosRuntime, _text: &str) -> Result<*mut c_char, String> {
     Err(
         "embedding support not compiled in (rebuild octos-ffi with --features embed-llama)"
             .to_string(),
@@ -710,6 +896,18 @@ pub extern "C" fn octos_version() -> *const c_char {
         const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "\0");
         VERSION.as_ptr() as *const c_char
     })
+}
+
+#[cfg(test)]
+impl OctosRuntime {
+    /// Test-only view of the RAII-owned scratch dir path (the field is private
+    /// and has no runtime accessor).
+    fn scratch_dir_for_test(&self) -> PathBuf {
+        self.scratch
+            .0
+            .clone()
+            .expect("scratch dir present while runtime is alive")
+    }
 }
 
 #[cfg(test)]
@@ -924,6 +1122,51 @@ mod tests {
         let rt = unsafe { &*raw };
         assert_eq!(rt.secret.as_deref(), Some("pinme-key-123"));
         octos_runtime_free(raw);
+    }
+
+    #[test]
+    fn native_drop_removes_scratch_dir() {
+        // A native `OctosRuntime` (the uniffi path) must clean up its scratch dir
+        // when dropped — RAII via the trailing `ScratchDir` field.
+        let rt = OctosRuntime::from_config(RuntimeConfig {
+            provider: "openai".to_string(),
+            model: "gpt-4o-mini".to_string(),
+            api_key: Some("dummy-key".to_string()),
+            ..RuntimeConfig::default()
+        })
+        .expect("runtime built");
+        let dir = rt.scratch_dir_for_test();
+        assert!(
+            dir.exists(),
+            "scratch dir should exist while alive: {dir:?}"
+        );
+        drop(rt);
+        assert!(
+            !dir.exists(),
+            "scratch dir must be removed after native drop: {dir:?}"
+        );
+    }
+
+    #[test]
+    fn c_free_removes_scratch_dir() {
+        // The C free path must still remove the scratch dir now that the manual
+        // `remove_dir_all` is gone (drop order: store lock releases, then
+        // `ScratchDir` removes the dir).
+        let cfg =
+            CString::new(r#"{"provider":"openai","model":"gpt-4o-mini","api_key":"dummy-key"}"#)
+                .unwrap();
+        let raw = runtime_new_impl(cfg.as_ptr()).expect("runtime built");
+        // SAFETY: non-null handle just built by `runtime_new_impl`.
+        let dir = unsafe { &*raw }.scratch_dir_for_test();
+        assert!(
+            dir.exists(),
+            "scratch dir should exist while alive: {dir:?}"
+        );
+        octos_runtime_free(raw);
+        assert!(
+            !dir.exists(),
+            "scratch dir must be removed after octos_runtime_free: {dir:?}"
+        );
     }
 
     #[test]
