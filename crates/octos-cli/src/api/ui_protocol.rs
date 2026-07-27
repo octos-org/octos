@@ -2195,6 +2195,11 @@ mod peer_io {
     /// name, or a compact line index — all KB-scale.
     pub(super) const PEER_FILE_READ_CAP_SMALL: usize = 64 * 1024;
 
+    /// Raw directory-scan budget for [`peer_dir_count_prefixed`]. A legitimate
+    /// peer has a handful of `result-<n>.md` files; this only bounds a hostile
+    /// flood so a directory stuffed with entries can't stall a turn.
+    pub(super) const PEER_DIR_SCAN_CAP: usize = 100_000;
+
     /// Process-unique suffix source for temp filenames, so concurrent
     /// atomic writes to the same leaf never collide on the `O_EXCL` create.
     static TMP_UNIQ: AtomicU64 = AtomicU64::new(0);
@@ -2257,14 +2262,34 @@ mod peer_io {
         imp::peer_file_mtime(peer_dir, leaf)
     }
 
+    /// Count REGULAR-file entries whose name starts with `prefix`, enumerating
+    /// the peer dir through its own `O_NOFOLLOW|O_DIRECTORY` fd (`fdopendir`) —
+    /// never a path `read_dir`, so swapping `<slug>` to a symlink after
+    /// [`staged_peer_dir`] cannot redirect the scan into an attacker's tree
+    /// (#1824). A symlinked/dir/FIFO entry matching the prefix is NOT counted
+    /// (so it can't inflate a version number), and the raw scan stops after
+    /// `cap` entries so a hostile flood can't stall the turn. Any failure
+    /// (symlinked peer dir, open/read error) → 0.
+    pub(super) fn peer_dir_count_prefixed(peer_dir: &Path, prefix: &str, cap: usize) -> usize {
+        imp::peer_dir_count_prefixed(peer_dir, prefix, cap)
+    }
+
+    /// `true` when `peer_dir` exists as a REAL (non-symlink) directory, opened
+    /// `O_NOFOLLOW|O_DIRECTORY` — a symlinked `<slug>` is refused. Anchored
+    /// replacement for a path-following `is_dir()` gate on a per-slug peer dir.
+    pub(super) fn peer_dir_exists(peer_dir: &Path) -> bool {
+        imp::peer_dir_exists(peer_dir)
+    }
+
     #[cfg(unix)]
     mod imp {
+        use std::ffi::CStr;
         use std::io::{Read, Write};
         use std::os::fd::OwnedFd;
         use std::os::unix::fs::OpenOptionsExt;
         use std::path::Path;
 
-        use rustix::fs::{AtFlags, Mode, OFlags, fsync, openat, renameat, unlinkat};
+        use rustix::fs::{AtFlags, Dir, FileType, Mode, OFlags, fsync, openat, renameat, unlinkat};
 
         /// Open the peer dir as an `O_NOFOLLOW|O_DIRECTORY` fd: a symlinked
         /// `<slug>` is refused here (belt-and-braces over `staged_peer_dir`'s
@@ -2402,6 +2427,65 @@ mod peer_io {
             }
             meta.modified().ok()
         }
+
+        pub(super) fn peer_dir_exists(peer_dir: &Path) -> bool {
+            // O_NOFOLLOW|O_DIRECTORY succeeds only for a REAL non-symlink dir.
+            open_peer_dir(peer_dir).is_ok()
+        }
+
+        pub(super) fn peer_dir_count_prefixed(peer_dir: &Path, prefix: &str, cap: usize) -> usize {
+            let Ok(dirfd) = open_peer_dir(peer_dir) else {
+                return 0;
+            };
+            // fdopendir on the anchored fd — entries come from THIS inode, never
+            // a re-walked path, so a swapped `<slug>` can't redirect the scan.
+            let Ok(dir) = Dir::read_from(&dirfd) else {
+                return 0;
+            };
+            let prefix = prefix.as_bytes();
+            let mut count = 0usize;
+            let mut scanned = 0usize;
+            for entry in dir {
+                // A read error ends the scan (don't spin); the count so far is a
+                // safe lower bound.
+                let Ok(entry) = entry else {
+                    break;
+                };
+                // Bound the RAW scan before any filtering so a hostile flood of
+                // entries can't stall the turn.
+                scanned += 1;
+                if scanned > cap {
+                    break;
+                }
+                if !entry.file_name().to_bytes().starts_with(prefix) {
+                    continue;
+                }
+                // Regular files only — a symlinked/dir/FIFO `result-*` entry
+                // must not inflate the version count.
+                match entry.file_type() {
+                    FileType::RegularFile => count += 1,
+                    // d_type unavailable on this FS → classify with a no-follow
+                    // stat before counting.
+                    FileType::Unknown if entry_is_regular(&dirfd, entry.file_name()) => count += 1,
+                    _ => {}
+                }
+            }
+            count
+        }
+
+        /// No-follow `S_ISREG` check of `name` relative to the peer dir fd, for
+        /// the rare filesystem that returns `DT_UNKNOWN` from `readdir`.
+        fn entry_is_regular(dirfd: &OwnedFd, name: &CStr) -> bool {
+            openat(
+                dirfd,
+                name,
+                OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK,
+                Mode::empty(),
+            )
+            .ok()
+            .and_then(|fd| std::fs::File::from(fd).metadata().ok())
+            .is_some_and(|meta| meta.is_file())
+        }
     }
 
     #[cfg(not(unix))]
@@ -2519,6 +2603,39 @@ mod peer_io {
             }
             meta.modified().ok()
         }
+
+        pub(super) fn peer_dir_exists(peer_dir: &Path) -> bool {
+            peer_dir_ok(peer_dir)
+        }
+
+        pub(super) fn peer_dir_count_prefixed(peer_dir: &Path, prefix: &str, cap: usize) -> usize {
+            if !peer_dir_ok(peer_dir) {
+                return 0;
+            }
+            let Ok(read_dir) = std::fs::read_dir(peer_dir) else {
+                return 0;
+            };
+            let mut count = 0usize;
+            let mut scanned = 0usize;
+            for entry in read_dir {
+                let Ok(entry) = entry else {
+                    break;
+                };
+                scanned += 1;
+                if scanned > cap {
+                    break;
+                }
+                if !entry.file_name().to_string_lossy().starts_with(prefix) {
+                    continue;
+                }
+                if std::fs::symlink_metadata(entry.path())
+                    .is_ok_and(|m| !m.file_type().is_symlink() && m.is_file())
+                {
+                    count += 1;
+                }
+            }
+            count
+        }
     }
 }
 
@@ -2528,8 +2645,9 @@ mod peer_io_tests {
     use std::time::Duration;
 
     use super::peer_io::{
-        PEER_FILE_READ_CAP_LARGE, PEER_FILE_READ_CAP_SMALL, append_peer_line, peer_file_mtime,
-        peer_regular_file_exists, read_peer_file, write_peer_file_atomic,
+        PEER_DIR_SCAN_CAP, PEER_FILE_READ_CAP_LARGE, PEER_FILE_READ_CAP_SMALL, append_peer_line,
+        peer_dir_count_prefixed, peer_dir_exists, peer_file_mtime, peer_regular_file_exists,
+        read_peer_file, write_peer_file_atomic,
     };
 
     // octos#1824: a symlinked leaf must NOT be followed — the anchored openat
@@ -2761,6 +2879,43 @@ mod peer_io_tests {
                 .file_type()
                 .is_symlink(),
             "the symlink must have been replaced by a regular file"
+        );
+    }
+
+    // octos#1824: `result-*` version enumeration is fd-anchored and counts only
+    // REGULAR prefixed files — a symlinked or non-prefixed entry can't inflate
+    // the count, and a symlinked peer dir yields 0 (no follow).
+    #[test]
+    fn peer_dir_count_prefixed_counts_only_regular_prefixed_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let peer = dir.path();
+        std::fs::write(peer.join("result-1.md"), "a").unwrap();
+        std::fs::write(peer.join("result-2.md"), "b").unwrap();
+        std::fs::write(peer.join("result.md"), "latest").unwrap(); // no `result-` prefix
+        std::fs::write(peer.join("brief.md"), "brief").unwrap(); // other prefix
+        std::fs::create_dir(peer.join("result-dir")).unwrap(); // dir, not a file
+        // A symlinked `result-*` entry must NOT be counted (not followed).
+        std::fs::write(dir.path().join("outside"), "x").unwrap();
+        std::os::unix::fs::symlink(dir.path().join("outside"), peer.join("result-9.md")).unwrap();
+
+        assert_eq!(
+            peer_dir_count_prefixed(peer, "result-", PEER_DIR_SCAN_CAP),
+            2,
+            "only the two REGULAR `result-<n>.md` files may count"
+        );
+
+        // A real peer dir exists; a symlinked one is refused and enumerates to 0.
+        assert!(peer_dir_exists(peer));
+        let link = dir.path().join("peerlink");
+        std::os::unix::fs::symlink(peer, &link).unwrap();
+        assert!(
+            !peer_dir_exists(&link),
+            "a symlinked peer dir must be refused"
+        );
+        assert_eq!(
+            peer_dir_count_prefixed(&link, "result-", PEER_DIR_SCAN_CAP),
+            0,
+            "a symlinked peer dir must not be followed for enumeration"
         );
     }
 }
@@ -11333,9 +11488,8 @@ fn write_peer_result_if_peer_session(
     let Some(peer_dir) = staged_peer_dir(&runtime.data_dir.join("peers"), slug) else {
         return;
     };
-    if !peer_dir.is_dir() {
-        return;
-    }
+    // No redundant `peer_dir.is_dir()` here — `staged_peer_dir` already proved a
+    // real non-symlink dir, and every write below re-anchors on the dir fd.
     const PEER_RESULT_MAX_BYTES: usize = 256 * 1024;
     let mut body = content;
     let mut truncated = "";
@@ -11394,15 +11548,12 @@ fn write_peer_result_if_peer_session(
     }
 }
 
-/// Count how many `result-*.md` files already exist in the peer directory.
+/// Count how many `result-<n>.md` version files exist in the peer directory,
+/// via the fd-anchored, regular-file-only, scan-capped enumerator so swapping
+/// `<slug>` to a symlink can neither redirect the scan into another tree nor
+/// inflate the derived version number (#1824).
 fn count_peer_result_versions(peer_dir: &std::path::Path) -> u32 {
-    let Ok(read_dir) = std::fs::read_dir(peer_dir) else {
-        return 0;
-    };
-    read_dir
-        .flatten()
-        .filter(|entry| entry.file_name().to_string_lossy().starts_with("result-"))
-        .count() as u32
+    peer_io::peer_dir_count_prefixed(peer_dir, "result-", peer_io::PEER_DIR_SCAN_CAP) as u32
 }
 
 /// Parse `turns.txt` into `[(turn_count, outcome, updated_unix)]`.
@@ -26240,8 +26391,10 @@ async fn run_standalone_turn(
                         ));
                     };
                     // A deleted peer must not silently swallow injections into a
-                    // queue nothing will drain: require the staged dir to exist.
-                    if !send_peers_root.join(&slug).is_dir() {
+                    // queue nothing will drain: require the staged dir to exist,
+                    // anchored (O_NOFOLLOW|O_DIRECTORY) so a symlink swapped in
+                    // for the removed `<slug>` can't spoof the gate (#1824).
+                    if !peer_io::peer_dir_exists(&send_peers_root.join(&slug)) {
                         return Err(format!(
                             "peer '{slug}' no longer exists (its staged directory was removed)"
                         ));
