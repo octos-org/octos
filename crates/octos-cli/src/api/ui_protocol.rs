@@ -337,6 +337,11 @@ const APPUI_STDIO_AUTH_BOUND_UNAVAILABLE_METHODS: &[&str] = &[
     octos_core::ui_protocol::methods::MEMORY_ENTITY,
     octos_core::ui_protocol::methods::CRON_LIST,
     octos_core::ui_protocol::methods::CRON_TOGGLE,
+    octos_core::ui_protocol::methods::SMART_HOME_STATUS_GET,
+    octos_core::ui_protocol::methods::SMART_HOME_DEVICE_LIST,
+    octos_core::ui_protocol::methods::SMART_HOME_DEVICE_COMMAND,
+    octos_core::ui_protocol::methods::SMART_HOME_CAMERA_STREAM_START,
+    octos_core::ui_protocol::methods::SMART_HOME_CAMERA_STREAM_STOP,
 ];
 type WsSink = futures::stream::SplitSink<WebSocket, WsMessage>;
 type SharedActiveTurns = Arc<tokio::sync::Mutex<HashMap<SessionKey, ActiveTurn>>>;
@@ -6381,6 +6386,66 @@ async fn ui_protocol_connection(
                 )
                 .await;
             }
+            UiCommand::SmartHomeStatusGet(params) => {
+                handle_smart_home_status_get(
+                    &ws,
+                    &state,
+                    &connection_headers,
+                    connection_identity.as_ref(),
+                    true,
+                    id,
+                    params,
+                )
+                .await;
+            }
+            UiCommand::SmartHomeDeviceList(params) => {
+                handle_smart_home_device_list(
+                    &ws,
+                    &state,
+                    &connection_headers,
+                    connection_identity.as_ref(),
+                    true,
+                    id,
+                    params,
+                )
+                .await;
+            }
+            UiCommand::SmartHomeDeviceCommand(params) => {
+                handle_smart_home_device_command(
+                    &ws,
+                    &state,
+                    &connection_headers,
+                    connection_identity.as_ref(),
+                    true,
+                    id,
+                    params,
+                )
+                .await;
+            }
+            UiCommand::SmartHomeCameraStreamStart(params) => {
+                handle_smart_home_camera_stream_start(
+                    &ws,
+                    &state,
+                    &connection_headers,
+                    connection_identity.as_ref(),
+                    true,
+                    id,
+                    params,
+                )
+                .await;
+            }
+            UiCommand::SmartHomeCameraStreamStop(params) => {
+                handle_smart_home_camera_stream_stop(
+                    &ws,
+                    &state,
+                    &connection_headers,
+                    connection_identity.as_ref(),
+                    true,
+                    id,
+                    params,
+                )
+                .await;
+            }
         }
     }
 
@@ -7020,6 +7085,66 @@ where
                     &state,
                     None,
                     connection_profile_id_owned.as_deref(),
+                    id,
+                    params,
+                )
+                .await;
+            }
+            UiCommand::SmartHomeStatusGet(params) => {
+                handle_smart_home_status_get(
+                    &ws,
+                    &state,
+                    &connection_headers,
+                    None,
+                    false,
+                    id,
+                    params,
+                )
+                .await;
+            }
+            UiCommand::SmartHomeDeviceList(params) => {
+                handle_smart_home_device_list(
+                    &ws,
+                    &state,
+                    &connection_headers,
+                    None,
+                    false,
+                    id,
+                    params,
+                )
+                .await;
+            }
+            UiCommand::SmartHomeDeviceCommand(params) => {
+                handle_smart_home_device_command(
+                    &ws,
+                    &state,
+                    &connection_headers,
+                    None,
+                    false,
+                    id,
+                    params,
+                )
+                .await;
+            }
+            UiCommand::SmartHomeCameraStreamStart(params) => {
+                handle_smart_home_camera_stream_start(
+                    &ws,
+                    &state,
+                    &connection_headers,
+                    None,
+                    false,
+                    id,
+                    params,
+                )
+                .await;
+            }
+            UiCommand::SmartHomeCameraStreamStop(params) => {
+                handle_smart_home_camera_stream_stop(
+                    &ws,
+                    &state,
+                    &connection_headers,
+                    None,
+                    false,
                     id,
                     params,
                 )
@@ -13588,6 +13713,11 @@ fn session_ingress_callable_method(method: &str) -> bool {
             | octos_core::ui_protocol::methods::CRON_LIST
             | octos_core::ui_protocol::methods::CRON_TOGGLE
             | octos_core::ui_protocol::methods::SESSION_FORK
+            | octos_core::ui_protocol::methods::SMART_HOME_STATUS_GET
+            | octos_core::ui_protocol::methods::SMART_HOME_DEVICE_LIST
+            | octos_core::ui_protocol::methods::SMART_HOME_DEVICE_COMMAND
+            | octos_core::ui_protocol::methods::SMART_HOME_CAMERA_STREAM_START
+            | octos_core::ui_protocol::methods::SMART_HOME_CAMERA_STREAM_STOP
     )
 }
 
@@ -13616,7 +13746,12 @@ fn validate_session_ingress_command_scope(
         | UiCommand::MemoryEntity(_)
         | UiCommand::CronList(_)
         | UiCommand::CronToggle(_)
-        | UiCommand::SessionFork(_) => {
+        | UiCommand::SessionFork(_)
+        | UiCommand::SmartHomeStatusGet(_)
+        | UiCommand::SmartHomeDeviceList(_)
+        | UiCommand::SmartHomeDeviceCommand(_)
+        | UiCommand::SmartHomeCameraStreamStart(_)
+        | UiCommand::SmartHomeCameraStreamStop(_) => {
             return Err(RpcError::invalid_request(
                 "session ingress credentials may only call session-scoped methods",
             ));
@@ -22217,6 +22352,223 @@ async fn handle_router_get_metrics(
         }
     };
     let _ = send_rpc_result(ws, id, value);
+}
+
+/// Thin WS wrapper over `smart_home_panel::my_smart_home_status`, mirroring
+/// `handle_memory_overview`/`handle_cron_list`.
+async fn handle_smart_home_status_get(
+    ws: &WsConnection,
+    state: &Arc<AppState>,
+    headers: &HeaderMap,
+    identity: Option<&AuthIdentity>,
+    close_on_auth_unavailable: bool,
+    id: String,
+    _params: octos_core::ui_protocol::SmartHomeStatusGetParams,
+) {
+    let method = octos_core::ui_protocol::methods::SMART_HOME_STATUS_GET;
+    let Some(identity) = identity.cloned() else {
+        if close_on_auth_unavailable {
+            let _ = close_ws_with_code(ws, 1008, "auth_expired");
+        }
+        let _ = send_rpc_error(ws, Some(id), auth_unavailable_error(method));
+        return;
+    };
+    let result = super::smart_home_panel::my_smart_home_status(
+        State(state.clone()),
+        headers.clone(),
+        Extension(identity),
+    )
+    .await;
+    match result {
+        Ok(axum::Json(body)) => send_aux_rpc_result(ws, id, method, body),
+        Err((status, axum::Json(body))) => {
+            let detail = body
+                .get("reason")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            let context = RestResourceContext::resource("smart_home", "");
+            let _ = send_rpc_error(
+                ws,
+                Some(id),
+                rest_status_to_rpc_error(method, status, detail, &context),
+            );
+        }
+    }
+}
+
+async fn handle_smart_home_device_list(
+    ws: &WsConnection,
+    state: &Arc<AppState>,
+    headers: &HeaderMap,
+    identity: Option<&AuthIdentity>,
+    close_on_auth_unavailable: bool,
+    id: String,
+    _params: octos_core::ui_protocol::SmartHomeDeviceListParams,
+) {
+    let method = octos_core::ui_protocol::methods::SMART_HOME_DEVICE_LIST;
+    let Some(identity) = identity.cloned() else {
+        if close_on_auth_unavailable {
+            let _ = close_ws_with_code(ws, 1008, "auth_expired");
+        }
+        let _ = send_rpc_error(ws, Some(id), auth_unavailable_error(method));
+        return;
+    };
+    let result = super::smart_home_panel::my_smart_home_devices(
+        State(state.clone()),
+        headers.clone(),
+        Extension(identity),
+    )
+    .await;
+    match result {
+        Ok(axum::Json(devices)) => {
+            send_aux_rpc_result(ws, id, method, json!({ "devices": devices }))
+        }
+        Err((status, axum::Json(body))) => {
+            let detail = body
+                .get("reason")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            let context = RestResourceContext::resource("smart_home_device", "");
+            let _ = send_rpc_error(
+                ws,
+                Some(id),
+                rest_status_to_rpc_error(method, status, detail, &context),
+            );
+        }
+    }
+}
+
+async fn handle_smart_home_device_command(
+    ws: &WsConnection,
+    state: &Arc<AppState>,
+    headers: &HeaderMap,
+    identity: Option<&AuthIdentity>,
+    close_on_auth_unavailable: bool,
+    id: String,
+    params: octos_core::ui_protocol::SmartHomeDeviceCommandParams,
+) {
+    let method = octos_core::ui_protocol::methods::SMART_HOME_DEVICE_COMMAND;
+    let Some(identity) = identity.cloned() else {
+        if close_on_auth_unavailable {
+            let _ = close_ws_with_code(ws, 1008, "auth_expired");
+        }
+        let _ = send_rpc_error(ws, Some(id), auth_unavailable_error(method));
+        return;
+    };
+    let Some(command_params) = params.params.as_object().cloned() else {
+        let _ = send_rpc_error(
+            ws,
+            Some(id),
+            RpcError::invalid_params(format!("{method}: params must be a JSON object")),
+        );
+        return;
+    };
+    let result = super::smart_home_panel::my_smart_home_device_command(
+        State(state.clone()),
+        headers.clone(),
+        Extension(identity),
+        params.device_id.clone(),
+        command_params,
+    )
+    .await;
+    match result {
+        Ok(_) => send_aux_rpc_result(ws, id, method, json!({})),
+        Err((status, axum::Json(body))) => {
+            let detail = body
+                .get("reason")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            let context = RestResourceContext::resource("smart_home_device", params.device_id);
+            let _ = send_rpc_error(
+                ws,
+                Some(id),
+                rest_status_to_rpc_error(method, status, detail, &context),
+            );
+        }
+    }
+}
+
+async fn handle_smart_home_camera_stream_start(
+    ws: &WsConnection,
+    state: &Arc<AppState>,
+    headers: &HeaderMap,
+    identity: Option<&AuthIdentity>,
+    close_on_auth_unavailable: bool,
+    id: String,
+    params: octos_core::ui_protocol::SmartHomeCameraStreamStartParams,
+) {
+    let method = octos_core::ui_protocol::methods::SMART_HOME_CAMERA_STREAM_START;
+    let Some(identity) = identity.cloned() else {
+        if close_on_auth_unavailable {
+            let _ = close_ws_with_code(ws, 1008, "auth_expired");
+        }
+        let _ = send_rpc_error(ws, Some(id), auth_unavailable_error(method));
+        return;
+    };
+    let result = super::smart_home_panel::my_smart_home_camera_stream_start(
+        State(state.clone()),
+        headers.clone(),
+        Extension(identity),
+        params.device_id.clone(),
+        params.quality,
+    )
+    .await;
+    match result {
+        Ok(axum::Json(stream)) => send_aux_rpc_result(ws, id, method, json!({ "stream": stream })),
+        Err((status, axum::Json(body))) => {
+            let detail = body
+                .get("reason")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            let context = RestResourceContext::resource("smart_home_camera", params.device_id);
+            let _ = send_rpc_error(
+                ws,
+                Some(id),
+                rest_status_to_rpc_error(method, status, detail, &context),
+            );
+        }
+    }
+}
+
+async fn handle_smart_home_camera_stream_stop(
+    ws: &WsConnection,
+    state: &Arc<AppState>,
+    headers: &HeaderMap,
+    identity: Option<&AuthIdentity>,
+    close_on_auth_unavailable: bool,
+    id: String,
+    params: octos_core::ui_protocol::SmartHomeCameraStreamStopParams,
+) {
+    let method = octos_core::ui_protocol::methods::SMART_HOME_CAMERA_STREAM_STOP;
+    let Some(identity) = identity.cloned() else {
+        if close_on_auth_unavailable {
+            let _ = close_ws_with_code(ws, 1008, "auth_expired");
+        }
+        let _ = send_rpc_error(ws, Some(id), auth_unavailable_error(method));
+        return;
+    };
+    let result = super::smart_home_panel::my_smart_home_camera_stream_stop(
+        State(state.clone()),
+        headers.clone(),
+        Extension(identity),
+        params.device_id.clone(),
+    )
+    .await;
+    match result {
+        Ok(_) => send_aux_rpc_result(ws, id, method, json!({})),
+        Err((status, axum::Json(body))) => {
+            let detail = body
+                .get("reason")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            let context = RestResourceContext::resource("smart_home_camera", params.device_id);
+            let _ = send_rpc_error(
+                ws,
+                Some(id),
+                rest_status_to_rpc_error(method, status, detail, &context),
+            );
+        }
+    }
 }
 
 fn task_relaunch_rpc_error(task_id: &TaskId, error: octos_agent::TaskRelaunchError) -> RpcError {

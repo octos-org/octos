@@ -442,6 +442,14 @@ Launch (per-project session UX, gated `session.workspace_cwd.v1`):
 
 - `launch/resolve`
 
+Smart-home bridge integration (gated `smart_home.v1`; auth-bound — omitted
+from the stdio capability set and reported unsupported per § stdio policy,
+same as `memory/overview` / `cron/list` above):
+
+- `smart_home/status.get`, `smart_home/device.list`,
+  `smart_home/device.command`, `smart_home/camera.stream_start`,
+  `smart_home/camera.stream_stop`
+
 Runtime, auth, profile, and onboarding inspection (server-handled
 `APPUI_EXTRA_METHODS`):
 

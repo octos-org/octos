@@ -1,0 +1,42 @@
+{
+  "name": "smart-home",
+  "version": "1.0.0",
+  "author": "octos",
+  "description": "List and control smart-home devices via the profile's configured bridge (e.g. Home Assistant)",
+  "timeout_secs": 10,
+  "requires_network": true,
+  "tools": [
+    {
+      "name": "smart_home_list_devices",
+      "description": "List smart-home devices known to the configured bridge, with their current state (on/off, brightness, temperature, etc.). Use this before controlling a device to find its exact device_id.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "room": {
+            "type": "string",
+            "description": "Optional room name to filter devices by (case-insensitive, e.g. 'Living Room'). Omit to list all devices."
+          }
+        }
+      }
+    },
+    {
+      "name": "smart_home_control_device",
+      "description": "Send a command to a smart-home device by ID. Use smart_home_list_devices first to find the device_id. Common params: {\"on\": true|false} to turn on/off, {\"brightness\": 0-100} for lights, {\"temperature\": <number>} for thermostats, {\"volume\": 0-100} for speakers/TVs, {\"position\": 0-100} for covers/blinds, {\"color\": \"#rrggbb\"} for color lights, {\"mode\": \"...\"} for multi-mode appliances. Exact supported params depend on the device kind — check the device's current fields from smart_home_list_devices as a guide to what it supports.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "device_id": {
+            "type": "string",
+            "description": "Exact device ID as returned by smart_home_list_devices."
+          },
+          "params": {
+            "type": "object",
+            "description": "Command parameters to send, e.g. {\"on\": true} or {\"brightness\": 50}.",
+            "additionalProperties": true
+          }
+        },
+        "required": ["device_id", "params"]
+      }
+    }
+  ]
+}

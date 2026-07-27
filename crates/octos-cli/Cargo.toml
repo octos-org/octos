@@ -187,6 +187,7 @@ octos-llm = { workspace = true, features = ["test-utils"] }
 octos-store = { workspace = true, features = ["test-util"] }
 octos-services = { workspace = true, features = ["test-util"] }
 tokio-tungstenite.workspace = true
+wiremock = { workspace = true }
 
 [[test]]
 name = "build_output_dir_validation"

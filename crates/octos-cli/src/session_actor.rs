@@ -143,17 +143,20 @@ const FAILOVER_PUSH_DEBOUNCE: Duration = Duration::from_secs(5);
 
 // ── Peer inbox registry (#436) ─────────────────────────────────────────────
 
+/// Inbox sender map keyed by `"{profile_id}:peer:{slug}"`, shared behind
+/// an `Arc<StdMutex<_>>` so [`peer_inbox_registry`] callers can clone the
+/// `Arc` and lock independently.
+type PeerInboxMap = Arc<StdMutex<HashMap<String, mpsc::Sender<ActorMessage>>>>;
+
 /// Global registry mapping `"{profile_id}:peer:{slug}"` → inbox sender for
 /// running peer sessions. Populated by [`ActorRegistry::dispatch`] when a
 /// peer session actor spawns; removed on session death / deletion. The
 /// [`PeerSendInputTool`] callback reads this to deliver cross-session
 /// messages without a TUI round-trip.
-static PEER_INBOX_REGISTRY: OnceLock<Arc<StdMutex<HashMap<String, mpsc::Sender<ActorMessage>>>>> =
-    OnceLock::new();
+static PEER_INBOX_REGISTRY: OnceLock<PeerInboxMap> = OnceLock::new();
 
 /// Get (or init) the global peer inbox registry.
-pub fn peer_inbox_registry() -> &'static Arc<StdMutex<HashMap<String, mpsc::Sender<ActorMessage>>>>
-{
+pub fn peer_inbox_registry() -> &'static PeerInboxMap {
     PEER_INBOX_REGISTRY.get_or_init(|| Arc::new(StdMutex::new(HashMap::new())))
 }
 
