@@ -32,6 +32,7 @@ members = [
     "crates/octos-sandbox",
     "crates/octos-swarm",
     "crates/octos-embed-llama",
+    "crates/octos-ffi",
 ]
 
 [workspace.package]

@@ -4570,6 +4570,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "octos-ffi"
+version = "2.0.2"
+dependencies = [
+ "libc",
+ "octos-agent",
+ "octos-cli",
+ "octos-core",
+ "octos-embed-llama",
+ "octos-llm",
+ "octos-memory",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "octos-llm"
 version = "2.0.2"
 dependencies = [
