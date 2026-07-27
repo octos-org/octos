@@ -174,6 +174,11 @@ const APPROVAL_CANCELLED_REASON_WAITER_DROPPED: &str = "waiter_dropped";
 /// reasons. The wire value stays `"waiter_dropped"` (used by both stores'
 /// drop-guards conceptually, but each store records it under its own const).
 const USER_QUESTION_CANCELLED_REASON_WAITER_DROPPED: &str = "waiter_dropped";
+/// Reason recorded when a pending approval/question is cancelled because its
+/// PEER was retired via `peer_close` while parked on it (#P1-2). The dropped
+/// oneshot sender releases the peer's in-flight turn fail-closed (Deny /
+/// Cancelled) instead of wedging it forever awaiting an answer no one will give.
+const APPROVAL_CANCELLED_REASON_PEER_CLOSED: &str = "peer_closed";
 const APPUI_METHOD_CONFIG_CAPABILITIES_LIST: &str =
     octos_core::ui_protocol::methods::CONFIG_CAPABILITIES_LIST;
 const APPUI_METHOD_CLIENT_HELLO: &str = "client_hello";
@@ -5026,6 +5031,13 @@ impl octos_agent::ToolApprovalRequester for UiProtocolApprovalRequester {
             self.turn_id.clone(),
         );
 
+        // #peer-respond — a peer parking on an approval is surfaced as
+        // `awaiting_input` and answered via `peer_respond` PURELY through the
+        // process-global pending store: `request_runtime` above already
+        // registered this `(approval_id, session)` entry, which peer_list /
+        // peer_respond read authoritatively. Nothing is written to the peer's
+        // filesystem here, so a peer can never park invisibly on an fs failure.
+
         // Approvals are durable: if the WS drop strands the request, the
         // ledger still records it and the client can rehydrate.
         if let Err(err) = send_notification_durable(
@@ -5298,6 +5310,14 @@ impl octos_agent::UserQuestionRequester for SessionUserQuestionRequester {
             self.session_id.clone(),
             question_id.clone(),
         );
+
+        // #peer-respond — a peer parking on a question is surfaced as
+        // `awaiting_input` and answered via `peer_respond` PURELY through the
+        // process-global pending store: `request_runtime` above registered this
+        // `(question_id, session)` entry (with its full per-question options),
+        // which peer_list / peer_respond read authoritatively. No peer-filesystem
+        // write happens here, so an OPEN peer can never park invisibly. (A closed
+        // peer that re-parks is the documented close-while-parked exception.)
 
         // The event is durable: if the WS drop strands the request, the ledger
         // still records it and a reconnecting client can rehydrate. We cancel
@@ -11487,6 +11507,300 @@ fn peer_lane_provider_for(
     resolve_peer_lane_provider(&peers_root, slug, &session_runtime.profile.config)
 }
 
+/// Cap on the human-readable prompt summary shown for a parked prompt.
+const PEER_PENDING_PROMPT_CAP: usize = 2048;
+
+/// Kind of interactive prompt a peer session is parked on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PeerPendingKind {
+    Approval,
+    Question,
+}
+
+impl PeerPendingKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Approval => "approval",
+            Self::Question => "question",
+        }
+    }
+}
+
+/// One interactive prompt a PEER session is currently parked on, PROJECTED from
+/// the process-global pending store (`contract_stores()`), which is the single
+/// AUTHORITY for "awaiting input" — not the filesystem. Because that store is
+/// in-memory, internally consistent, and shared by peer_list / peer_respond /
+/// peer_close (all in the serve process), there is no torn on-disk index, no
+/// stale-delete that could hide a still-parked entry, and no marker a peer could
+/// park without: the store entry exists the instant `request_runtime` registers
+/// the oneshot, so a parked peer is visible and answerable for as long as it
+/// remains OPEN. (A closed peer that re-parks after the close sweep is the
+/// documented close-while-parked exception — see `peer_respond`'s module doc.)
+#[derive(Debug, Clone)]
+struct PeerPendingSummary {
+    kind: PeerPendingKind,
+    /// The `ApprovalId`/`QuestionId` as a string — the master targets a specific
+    /// prompt by this (`peer_list` lists each id).
+    id: String,
+    /// Compact prompt summary for display.
+    prompt: String,
+    /// For a QUESTION: the offered option labels across its questions (a display
+    /// hint; real answers are validated by the store against the stored request).
+    /// Empty for an approval.
+    options: Vec<String>,
+}
+
+/// Compact, capped summary of an interactive prompt (title/body) for display.
+fn peer_pending_prompt_summary(title: &str, body: &str) -> String {
+    let title = title.trim();
+    let body = body.trim();
+    let combined = if title.is_empty() {
+        body.to_owned()
+    } else if body.is_empty() || body == title {
+        title.to_owned()
+    } else {
+        format!("{title} — {body}")
+    };
+    capped_utf8(combined, PEER_PENDING_PROMPT_CAP).0
+}
+
+/// Every prompt `session` is currently parked on, read from the AUTHORITATIVE
+/// process-global stores. Approvals first, then questions, each group ordered by
+/// id — a deterministic order for display and single-default selection.
+fn peer_pending_summaries(
+    contracts: &UiProtocolContractStores,
+    session: &SessionKey,
+) -> Vec<PeerPendingSummary> {
+    let mut approvals: Vec<PeerPendingSummary> = contracts
+        .approvals
+        .pending_for_session(session)
+        .into_iter()
+        .map(|event| PeerPendingSummary {
+            kind: PeerPendingKind::Approval,
+            id: event.approval_id.0.to_string(),
+            prompt: peer_pending_prompt_summary(&event.title, &event.body),
+            options: Vec::new(),
+        })
+        .collect();
+    approvals.sort_by(|a, b| a.id.cmp(&b.id));
+    let mut questions: Vec<PeerPendingSummary> = contracts
+        .user_questions
+        .pending_for_session(session)
+        .into_iter()
+        .map(|event| PeerPendingSummary {
+            kind: PeerPendingKind::Question,
+            id: event.question_id.0.to_string(),
+            prompt: peer_pending_prompt_summary(&event.title, &event.body),
+            options: event
+                .questions
+                .iter()
+                .flat_map(|question| question.options.iter().map(|option| option.label.clone()))
+                .collect(),
+        })
+        .collect();
+    questions.sort_by(|a, b| a.id.cmp(&b.id));
+    approvals.append(&mut questions);
+    approvals
+}
+
+/// The peer's TRUSTED session key (#P1-1): the wire it runs its turns under,
+/// recorded server-side at `session/open`. `None` when the peer is not currently
+/// open — it then has no live oneshot to answer or cancel. This is the ONLY
+/// slug→session mapping any peer-control path trusts; it never comes from a
+/// client argument or an on-disk file.
+fn peer_trusted_session(profile_id: &str, slug: &str) -> Option<SessionKey> {
+    peer_wire_registry().resolve(&peer_wire_key(profile_id, slug))
+}
+
+/// Map the tool's answer entries onto the store's `UserQuestionAnswer[]`,
+/// matching each entry to ITS question's options (#new-P2-#2): a bare string
+/// answer to a CHOICE question becomes a real label selection for THAT question
+/// (so a 2–4-question choice prompt is answerable), while free text passes
+/// through where the question allows it. One answer per stored question, in
+/// order; a mismatched count/label surfaces the store's typed error rather than
+/// resolving incorrectly.
+fn peer_respond_build_answers(
+    req_answers: &[octos_agent::PeerRespondAnswer],
+    questions: &[octos_core::ui_protocol::UserQuestion],
+) -> Vec<octos_core::ui_protocol::UserQuestionAnswer> {
+    req_answers
+        .iter()
+        .enumerate()
+        .map(|(index, answer)| {
+            if answer.selected_labels.is_empty() {
+                if let Some(text) = &answer.free_text {
+                    if let Some(option) = questions.get(index).and_then(|question| {
+                        question
+                            .options
+                            .iter()
+                            .find(|option| option.label.eq_ignore_ascii_case(text))
+                    }) {
+                        return octos_core::ui_protocol::UserQuestionAnswer {
+                            selected_labels: vec![option.label.clone()],
+                            free_text: None,
+                        };
+                    }
+                }
+            }
+            octos_core::ui_protocol::UserQuestionAnswer {
+                selected_labels: answer.selected_labels.clone(),
+                free_text: answer.free_text.clone(),
+            }
+        })
+        .collect()
+}
+
+/// The cross-session resolution `peer_respond`'s host callback performs — a
+/// named fn (rather than an inline closure) so tests exercise the EXACT
+/// production path. Authorizes the caller as the peer's recorded originator,
+/// derives the peer's TRUSTED session key from the wire registry (#P1-1),
+/// selects the targeted parked prompt from the AUTHORITATIVE store (by `id`, or
+/// the sole one), and resolves that oneshot via the SAME store the client
+/// `approval/respond` / `user_question/respond` RPCs use. For an approval it
+/// also emits `approval/decided` + audit via `on_approval_decided` (#P1-5),
+/// attributing the MASTER. No filesystem marker is read or written — the store
+/// is the source of truth. Every error is a model-visible string.
+fn peer_respond_resolve(
+    peers_root: &Path,
+    origin_session: &str,
+    profile_id: &str,
+    contracts: &UiProtocolContractStores,
+    on_approval_decided: &dyn Fn(&ApprovalDecidedEvent, Option<&str>),
+    req: octos_agent::PeerRespondRequest,
+) -> Result<(), String> {
+    // Resolve NAME/slug → real slug (names are the primary address).
+    let slug = resolve_peer_name_to_slug(peers_root, &req.slug).ok_or_else(|| {
+        format!(
+            "no peer named '{ident}' — check the name (or slug) with peer_list",
+            ident = req.slug
+        )
+    })?;
+    if !peer_slug_is_safe(&slug) {
+        return Err(format!("invalid peer slug '{slug}'"));
+    }
+    // Only the peer's recorded originator may respond (the same fail-closed
+    // check peer_send_input uses; the originator lives in `peers/<slug>/`).
+    peer_send_input_authorized(peers_root, &slug, origin_session)?;
+    // A retired peer is not awaiting input.
+    if peer_is_closed(peers_root, &slug) {
+        return Err(format!("peer '{slug}' is closed"));
+    }
+
+    // #P1-1 SECURITY — the peer's TRUSTED session key comes ONLY from the wire
+    // registry (server-captured at `session/open`), so a resolution can reach
+    // exactly THIS peer's oneshots and no other's.
+    let Some(peer_session) = peer_trusted_session(profile_id, &slug) else {
+        return Err(format!(
+            "peer '{slug}' is not open — the user must open the staged peer session before it can be answered"
+        ));
+    };
+
+    // The AUTHORITATIVE parked set for this peer, straight from the store.
+    let pendings = peer_pending_summaries(contracts, &peer_session);
+    if pendings.is_empty() {
+        return Err(format!(
+            "peer '{slug}' is not awaiting input — nothing to respond to \
+             (peer_list shows a peer as `awaiting_input` when it is)"
+        ));
+    }
+    let target = match req.id.as_deref() {
+        Some(id) => pendings.iter().find(|p| p.id == id).ok_or_else(|| {
+            format!(
+                "peer '{slug}' has no pending prompt with id '{id}' — check the ids with peer_list"
+            )
+        })?,
+        None if pendings.len() == 1 => &pendings[0],
+        None => {
+            let ids = pendings
+                .iter()
+                .map(|p| format!("{} ({})", p.id, p.kind.as_str()))
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(format!(
+                "peer '{slug}' has {n} pending prompts — pass the specific id (one of: {ids})",
+                n = pendings.len()
+            ));
+        }
+    };
+
+    match target.kind {
+        PeerPendingKind::Approval => {
+            let Some(decision) = req.decision.as_deref() else {
+                return Err(format!(
+                    "peer '{slug}' pending '{id}' is an APPROVAL — pass \
+                     decision=\"approve\"/\"deny\" (not answer)",
+                    id = target.id
+                ));
+            };
+            let approval_id: ApprovalId =
+                serde_json::from_value(serde_json::Value::String(target.id.clone()))
+                    .map_err(|_| format!("peer '{slug}' pending id is malformed"))?;
+            let params = octos_core::ui_protocol::ApprovalRespondParams {
+                session_id: peer_session,
+                approval_id,
+                decision: ApprovalDecision::from(decision.to_owned()),
+                approval_scope: None,
+                client_note: Some(format!(
+                    "answered by master via peer_respond ({origin_session})"
+                )),
+            };
+            let outcome = contracts
+                .approvals
+                .respond_with_context(params.clone())
+                .map_err(|err| {
+                    format!("could not resolve peer '{slug}' approval: {}", err.message)
+                })?;
+            // #P1-5 — publish the canonical `approval/decided` + audit,
+            // attributing the master, via the shared sink (same builder the RPC
+            // handler uses).
+            let tool_name = outcome.context.as_ref().map(|ctx| ctx.tool_name.clone());
+            let event = super::ui_protocol_approvals::build_decided_event(
+                &params,
+                &outcome,
+                origin_session,
+                Utc::now(),
+            );
+            on_approval_decided(&event, tool_name.as_deref());
+        }
+        PeerPendingKind::Question => {
+            let Some(req_answers) = req.answers.as_deref() else {
+                return Err(format!(
+                    "peer '{slug}' pending '{id}' is a QUESTION — pass answer/answers (not decision)",
+                    id = target.id
+                ));
+            };
+            let question_id: octos_core::ui_protocol::QuestionId =
+                serde_json::from_value(serde_json::Value::String(target.id.clone()))
+                    .map_err(|_| format!("peer '{slug}' pending id is malformed"))?;
+            // #new-P2-#2 — map each answer against the STORED request's questions
+            // (per-question options), re-read from the authoritative store.
+            let questions = contracts
+                .user_questions
+                .pending_for_session(&peer_session)
+                .into_iter()
+                .find(|event| event.question_id == question_id)
+                .map(|event| event.questions)
+                .unwrap_or_default();
+            let answers = peer_respond_build_answers(req_answers, &questions);
+            let params = UserQuestionRespondParams {
+                session_id: peer_session,
+                question_id,
+                answers,
+                client_note: Some(format!(
+                    "answered by master via peer_respond ({origin_session})"
+                )),
+            };
+            contracts
+                .user_questions
+                .respond_with_context(&params)
+                .map_err(|err| {
+                    format!("could not resolve peer '{slug}' question: {}", err.message)
+                })?;
+        }
+    }
+    Ok(())
+}
+
 /// #1801 v2: peer sessions leave a durable result on the blackboard — a
 /// `result.md` beside the brief, overwritten on every turn terminal (latest
 /// state). Files, not connection state: `/gather`, the future mailbox, and
@@ -11913,19 +12227,75 @@ fn build_peer_gather_callback(peers_root: PathBuf) -> octos_agent::PeerGatherCal
 /// "… and N more" line (read specific peers with peer_gather slugs).
 const PEER_LIST_MAX_ROWS: usize = 200;
 
-fn compose_peer_list_text(rows: &[PeerBlackboardRow], available_lanes: &[String]) -> String {
+/// `awaiting_by_slug`: the AUTHORITATIVE parked-prompt set per peer slug,
+/// projected from the process-global store by the caller (`build_peer_list_callback`).
+/// A slug absent from the map (or closed) is not awaiting input.
+fn compose_peer_list_text(
+    rows: &[PeerBlackboardRow],
+    available_lanes: &[String],
+    awaiting_by_slug: &std::collections::HashMap<String, Vec<PeerPendingSummary>>,
+) -> String {
     if rows.is_empty() {
         return "(no peers staged)".to_owned();
     }
     let mut lines: Vec<String> = Vec::with_capacity(rows.len().min(PEER_LIST_MAX_ROWS) + 2);
     lines.push(format!("peers ({}):", rows.len()));
     for row in rows.iter().take(PEER_LIST_MAX_ROWS) {
+        // Precedence: a retired peer is `closed`; else a peer PARKED on one or
+        // more interactive prompts is `awaiting_input` (the master can answer
+        // each via peer_respond) — this beats `done` so a persistent peer that
+        // finished an earlier turn and is now blocked mid-turn still surfaces as
+        // blocked; else `done` when a result exists; else `running`.
+        let awaiting: &[PeerPendingSummary] = if row.closed {
+            &[]
+        } else {
+            awaiting_by_slug
+                .get(&row.slug)
+                .map_or(&[][..], Vec::as_slice)
+        };
         let status = if row.closed {
             "closed"
+        } else if !awaiting.is_empty() {
+            "awaiting_input"
         } else if row.result.is_some() {
             "done"
         } else {
             "running"
+        };
+        // List each parked prompt (id + kind + short prompt + any offered
+        // options) so the master sees WHAT the peer waits on and which `id` to
+        // pass to peer_respond — without a peer_gather. Capped so a peer with a
+        // flood of prompts can't dominate the index.
+        const PEER_LIST_MAX_PENDING: usize = 8;
+        let awaiting_note = if awaiting.is_empty() {
+            String::new()
+        } else {
+            let mut items = awaiting
+                .iter()
+                .take(PEER_LIST_MAX_PENDING)
+                .map(|pending| {
+                    let (prompt, truncated) = capped_utf8(pending.prompt.trim().to_owned(), 80);
+                    let ellipsis = if truncated { "…" } else { "" };
+                    let opts = if pending.options.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" options=[{}]", pending.options.join(", "))
+                    };
+                    format!(
+                        "[id={id} {kind}: {prompt}{ellipsis}{opts}]",
+                        id = pending.id,
+                        kind = pending.kind.as_str()
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(" ");
+            if awaiting.len() > PEER_LIST_MAX_PENDING {
+                items.push_str(&format!(
+                    " (+{} more)",
+                    awaiting.len() - PEER_LIST_MAX_PENDING
+                ));
+            }
+            format!("  · awaiting: {items}")
         };
         let updated = row
             .result_updated_unix
@@ -11950,7 +12320,7 @@ fn compose_peer_list_text(rows: &[PeerBlackboardRow], available_lanes: &[String]
             format!("{} ({})", row.name, row.slug)
         };
         lines.push(format!(
-            "- {addr}  {status}  updated {updated}  turns {turns}{worktree}{model}"
+            "- {addr}  {status}  updated {updated}  turns {turns}{worktree}{model}{awaiting_note}"
         ));
     }
     if rows.len() > PEER_LIST_MAX_ROWS {
@@ -11977,26 +12347,97 @@ fn peer_list_allowed_for_session(_session_id: &SessionKey) -> bool {
 fn build_peer_list_callback(
     peers_root: PathBuf,
     available_lanes: Vec<String>,
+    contracts: Arc<UiProtocolContractStores>,
+    profile_id: String,
 ) -> octos_agent::PeerListCallback {
     Arc::new(move || {
+        let rows = read_peer_blackboard(&peers_root, None);
+        // #peer-respond — the AUTHORITATIVE awaiting-input set comes from the
+        // process-global store, joined to each open peer by its TRUSTED wire
+        // session (never a filesystem marker). A peer with no wire (not open) or
+        // no store entries simply isn't awaiting.
+        let awaiting_by_slug: std::collections::HashMap<String, Vec<PeerPendingSummary>> = rows
+            .iter()
+            .filter(|row| !row.closed)
+            .filter_map(|row| {
+                let session = peer_trusted_session(&profile_id, &row.slug)?;
+                let pending = peer_pending_summaries(&contracts, &session);
+                (!pending.is_empty()).then(|| (row.slug.clone(), pending))
+            })
+            .collect();
         Ok(compose_peer_list_text(
-            &read_peer_blackboard(&peers_root, None),
+            &rows,
             &available_lanes,
+            &awaiting_by_slug,
         ))
     })
 }
 
+/// #P1-2 — on peer close, CANCEL every pending approval/question the peer is
+/// parked on, so a peer retired while `awaiting_input` does not wedge its
+/// in-flight turn forever. It reads the AUTHORITATIVE store (not any filesystem
+/// scan), so a missing/corrupt marker can never let a live entry escape
+/// cancellation. Cancelling drops the store entry's oneshot sender, so the peer
+/// requester's `await` errs → fail-closed (Deny / Cancelled). Uses the peer's
+/// TRUSTED session key from the wire registry (#P1-1); when the peer is not open
+/// (no wire) there is no live oneshot, so this is a no-op. Emits
+/// `approval/cancelled` per cancelled approval (questions have no equivalent
+/// wire event in the RPC path, matching that path). Best-effort.
+///
+/// Residual (documented, accepted): a park landing in the narrow window between
+/// this cancel and the caller evicting the wire could survive close. The window
+/// is tiny (both run synchronously in the close callback before the callback
+/// returns), and the client tears the peer down on `peer/closed`; a fully
+/// race-free guarantee would need a per-peer lifecycle latch that refuses new
+/// parks once closing — out of scope for this fix.
+fn cancel_peer_pending_on_close(
+    contracts: &UiProtocolContractStores,
+    profile_id: &str,
+    slug: &str,
+    emit_cancelled: &dyn Fn(ApprovalCancelledEvent),
+) {
+    let Some(session) = peer_trusted_session(profile_id, slug) else {
+        return;
+    };
+    for event in contracts.approvals.pending_for_session(&session) {
+        if let Some(cancelled) = contracts.approvals.cancel_pending_approval(
+            &session,
+            &event.approval_id,
+            &event.turn_id,
+            APPROVAL_CANCELLED_REASON_PEER_CLOSED,
+        ) {
+            emit_cancelled(ApprovalCancelledEvent {
+                session_id: session.clone(),
+                topic: session.topic().map(ToOwned::to_owned),
+                approval_id: cancelled.approval_id,
+                turn_id: cancelled.turn_id,
+                reason: APPROVAL_CANCELLED_REASON_PEER_CLOSED.to_owned(),
+            });
+        }
+    }
+    for event in contracts.user_questions.pending_for_session(&session) {
+        let _ = contracts.user_questions.cancel_pending_question(
+            &session,
+            &event.question_id,
+            APPROVAL_CANCELLED_REASON_PEER_CLOSED,
+        );
+    }
+}
+
 /// Build the `peer_close` callback for ONE turn of the serve/WS path. Closing
 /// RETIRES a peer the caller created: authorize (originator-only, the SAME
-/// check `peer_send_input` uses), evict the live wire if the peer is open,
-/// and write the durable `closed` marker so `peer_list` / `peer_gather`
-/// report it closed and `peer_send_input` refuses it. Graceful — an in-flight
-/// peer turn still completes; result files stay readable.
+/// check `peer_send_input` uses), cancel any pending approval/question it is
+/// parked on (#P1-2), evict the live wire if the peer is open, and write the
+/// durable `closed` marker so `peer_list` / `peer_gather` report it closed and
+/// `peer_send_input` refuses it. Graceful — an in-flight peer turn still
+/// completes; result files stay readable.
 fn build_peer_close_callback(
     peers_root: PathBuf,
     origin_session: String,
     profile_id: String,
+    contracts: Arc<UiProtocolContractStores>,
     emit_closed: Arc<dyn Fn(PeerClosedEvent) + Send + Sync>,
+    emit_cancelled: Arc<dyn Fn(ApprovalCancelledEvent) + Send + Sync>,
 ) -> octos_agent::PeerCloseCallback {
     Arc::new(move |ident: String| {
         // Resolve the identifier (peer NAME or slug) to the actual slug BEFORE
@@ -12052,6 +12493,13 @@ fn build_peer_close_callback(
                 "cancelled pending peer_send_input injections on peer close"
             );
         }
+        // #P1-2 — cancel any pending approval/question this peer is parked on
+        // (from the authoritative store) so its in-flight turn is released
+        // fail-closed. BEFORE the wire eviction below, which removes the
+        // slug→session mapping the cancel derives its trusted session key from.
+        cancel_peer_pending_on_close(&contracts, &profile_id, &slug, &|event| {
+            emit_cancelled(event)
+        });
         // Peer-fleet auto-synthesis RESET — the close marker now excludes this
         // peer from the master's owned fleet. If it was the LAST owned peer, the
         // fleet is fully retired: drop the `.synthesized` marker so a genuinely
@@ -17496,6 +17944,43 @@ fn unknown_turn_error(turn_id: &TurnId) -> RpcError {
         .with_data(json!({ "turn_id": turn_id_str, "kind": "unknown_turn" }))
 }
 
+/// Publish the canonical `approval/decided` durable notification + decision
+/// trace. SHARED by the `approval/respond` RPC handler and `peer_respond` (#P1-5)
+/// so a master-driven decision is recorded on the wire identically to a
+/// client-driven one. Sync (no await) so the RPC path can call it BEFORE the
+/// data_dir lock — the decided event must append to the ledger before the woken
+/// turn can publish `turn/completed`.
+fn emit_approval_decided(
+    ws: &WsConnection,
+    ledger: &UiProtocolLedger,
+    event: &ApprovalDecidedEvent,
+    tool_name: Option<&str>,
+) {
+    log_decision_tracing(event, tool_name);
+    let _ = send_notification_durable(ws, ledger, UiNotification::ApprovalDecided(event.clone()));
+}
+
+/// Append the approval decision to the durable audit log. SHARED by the
+/// `approval/respond` RPC handler and `peer_respond` (#P1-5). Sync given a
+/// pre-resolved `data_dir` (the RPC path resolves it via the sessions lock; the
+/// peer path captures it at wiring time).
+fn audit_approval_decided(
+    contracts: &UiProtocolContractStores,
+    data_dir: &Path,
+    event: &ApprovalDecidedEvent,
+    tool_name: Option<&str>,
+) {
+    let audit = contracts.audit_log(data_dir);
+    if let Err(error) = audit.record(event, tool_name) {
+        tracing::warn!(
+            target: "octos.approvals.decision",
+            approval_id = %event.approval_id.0,
+            error = %error,
+            "failed to append approval audit log entry"
+        );
+    }
+}
+
 async fn handle_approval_respond(
     ws: &WsConnection,
     state: &Arc<AppState>,
@@ -17537,8 +18022,7 @@ async fn handle_approval_respond(
         connection_profile_id.unwrap_or(""),
         Utc::now(),
     );
-    log_decision_tracing(&event, tool_name.as_deref());
-    let _ = send_notification_durable(ws, ledger, UiNotification::ApprovalDecided(event.clone()));
+    emit_approval_decided(ws, ledger, &event, tool_name.as_deref());
 
     // FIX-06: if the user picked a recordable scope and we have the original
     // request context, register the policy entry. Open-registry rule:
@@ -17573,15 +18057,7 @@ async fn handle_approval_respond(
 
     if let Some(sessions) = state.sessions.as_ref() {
         let data_dir = sessions.lock().await.data_dir();
-        let audit = contracts.audit_log(&data_dir);
-        if let Err(error) = audit.record(&event, tool_name.as_deref()) {
-            tracing::warn!(
-                target: "octos.approvals.decision",
-                approval_id = %event.approval_id.0,
-                error = %error,
-                "failed to append approval audit log entry"
-            );
-        }
+        audit_approval_decided(contracts, &data_dir, &event, tool_name.as_deref());
     }
 }
 
@@ -26366,6 +26842,9 @@ async fn run_standalone_turn(
                     .iter()
                     .map(|sp| sp.key.clone())
                     .collect(),
+                // #peer-respond — the store authority + profile for the wire join.
+                contracts.clone(),
+                session_runtime.profile.profile_id.clone(),
             );
             tool_registry.register(octos_agent::PeerListTool::new(list));
         }
@@ -26499,13 +26978,74 @@ async fn run_standalone_turn(
                         UiNotification::PeerClosed(event),
                     );
                 });
+            // #P1-2 — durable `approval/cancelled` for each pending approval a
+            // just-closed peer was parked on (same emit shape as the RPC path).
+            let cancelled_ws = ws.clone();
+            let cancelled_ledger = ledger.clone();
+            let emit_cancelled: Arc<dyn Fn(ApprovalCancelledEvent) + Send + Sync> =
+                Arc::new(move |event: ApprovalCancelledEvent| {
+                    let _ = send_notification_durable(
+                        &cancelled_ws,
+                        &cancelled_ledger,
+                        UiNotification::ApprovalCancelled(event),
+                    );
+                });
             let close = build_peer_close_callback(
                 session_runtime.profile.data_dir.join("peers"),
                 session_id.to_string(),
                 session_runtime.profile.profile_id.clone(),
+                contracts.clone(),
                 emit_closed,
+                emit_cancelled,
             );
             tool_registry.register(octos_agent::PeerCloseTool::new(close));
+
+            // #peer-respond — answer a peer BLOCKED on an interactive prompt
+            // (tool-approval or clarifying question) so the master acts as its
+            // human-in-the-loop. Same depth-1 + originator-auth guards as
+            // peer_send_input/peer_close (this whole block is gated on
+            // `peer_handoff_allowed_for_session`, so it is NEVER registered on a
+            // peer session). The callback resolves the peer's parked oneshot
+            // through the SAME process-global contract store the client
+            // `approval/respond` / `user_question/respond` RPCs use — the peer's
+            // OWN requester registered its pending entry there (contract_stores()
+            // is a process-global OnceLock), which is the AUTHORITY for awaiting
+            // input (no filesystem marker is involved).
+            let respond_peers_root = session_runtime.profile.data_dir.join("peers");
+            let respond_origin_session = session_id.to_string();
+            let respond_profile_id = session_runtime.profile.profile_id.clone();
+            let respond_contracts = contracts.clone();
+            let respond_ws = ws.clone();
+            let respond_ledger = ledger.clone();
+            // #P1-5 — pre-resolve the audit data_dir ONCE (the sink is sync and
+            // cannot take the async sessions lock per call), so a master approval
+            // records to the SAME durable audit log the RPC handler writes.
+            let respond_audit_data_dir = match state.sessions.as_ref() {
+                Some(sessions) => Some(sessions.lock().await.data_dir()),
+                None => None,
+            };
+            let respond: octos_agent::PeerRespondCallback =
+                Arc::new(move |req: octos_agent::PeerRespondRequest| {
+                    // #P1-5 — emit `approval/decided` + audit for a master
+                    // approval via the SAME helpers the RPC handler uses,
+                    // attributing the master session.
+                    let on_approval_decided =
+                        |event: &ApprovalDecidedEvent, tool_name: Option<&str>| {
+                            emit_approval_decided(&respond_ws, &respond_ledger, event, tool_name);
+                            if let Some(dir) = &respond_audit_data_dir {
+                                audit_approval_decided(&respond_contracts, dir, event, tool_name);
+                            }
+                        };
+                    peer_respond_resolve(
+                        &respond_peers_root,
+                        &respond_origin_session,
+                        &respond_profile_id,
+                        &respond_contracts,
+                        &on_approval_decided,
+                        req,
+                    )
+                });
+            tool_registry.register(octos_agent::PeerRespondTool::new(respond));
         }
 
         // Wire the PARENT `send_file` for the legacy non-contract

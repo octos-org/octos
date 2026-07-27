@@ -25621,7 +25621,9 @@ fn peer_close_callback_writes_marker_for_owner_only() {
         peers_root.clone(),
         "tenant-a:api:intruder".to_owned(),
         "tenant-a".to_owned(),
+        Arc::new(UiProtocolContractStores::default()),
         Arc::new(|_event: PeerClosedEvent| {}),
+        Arc::new(|_event: ApprovalCancelledEvent| {}),
     );
     let err = intruder(slug.to_owned()).expect_err("non-owner must be rejected");
     assert!(err.contains("not the owner"), "reason: {err}");
@@ -25635,7 +25637,9 @@ fn peer_close_callback_writes_marker_for_owner_only() {
         peers_root.clone(),
         owner.to_owned(),
         "tenant-a".to_owned(),
+        Arc::new(UiProtocolContractStores::default()),
         Arc::new(|_event: PeerClosedEvent| {}),
+        Arc::new(|_event: ApprovalCancelledEvent| {}),
     );
     let msg = close(slug.to_owned()).expect("owner closes");
     assert!(msg.contains("closed"), "confirmation: {msg}");
@@ -25680,7 +25684,9 @@ fn peer_close_callback_emits_closed_event_on_success_only() {
         peers_root.clone(),
         owner.to_owned(),
         "tenant-a".to_owned(),
+        Arc::new(UiProtocolContractStores::default()),
         Arc::new(move |event| sink.lock().unwrap().push(event)),
+        Arc::new(|_event: ApprovalCancelledEvent| {}),
     );
 
     // A rejected close (peer was never staged) emits nothing.
@@ -25796,7 +25802,12 @@ fn peer_list_and_gather_surface_display_name() {
     )
     .unwrap();
 
-    let list_cb = build_peer_list_callback(peers.clone(), Vec::new());
+    let list_cb = build_peer_list_callback(
+        peers.clone(),
+        Vec::new(),
+        Arc::new(UiProtocolContractStores::default()),
+        "seed".to_owned(),
+    );
     let list = list_cb().unwrap();
     assert!(
         list.contains("Edison"),
@@ -25857,7 +25868,9 @@ fn peer_close_by_name_cancels_pending_injection_for_right_peer() {
         peers.clone(),
         owner.to_owned(),
         profile_id.to_owned(),
+        Arc::new(UiProtocolContractStores::default()),
         Arc::new(|_event: PeerClosedEvent| {}),
+        Arc::new(|_event: ApprovalCancelledEvent| {}),
     );
     let msg = close("EDISON".to_owned()).expect("close by name");
     assert!(msg.contains("edison"), "confirmation names the slug: {msg}");
@@ -25905,7 +25918,9 @@ fn symlinked_peer_entry_is_not_resolved_or_written() {
         peers.clone(),
         "owner".to_owned(),
         "prof".to_owned(),
+        Arc::new(UiProtocolContractStores::default()),
         Arc::new(|_event: PeerClosedEvent| {}),
+        Arc::new(|_event: ApprovalCancelledEvent| {}),
     );
     let err = close("Edison".to_owned()).expect_err("symlinked peer must not resolve/close");
     assert!(err.contains("no peer named"), "reason: {err}");
@@ -26016,7 +26031,7 @@ fn peer_list_caps_rows_and_summarizes_overflow() {
     }
     let over = PEER_LIST_MAX_ROWS + 5;
     let rows: Vec<_> = (0..over).map(|i| row(&format!("p{i:04}"))).collect();
-    let text = compose_peer_list_text(&rows, &[]);
+    let text = compose_peer_list_text(&rows, &[], &Default::default());
     assert!(
         text.starts_with(&format!("peers ({over}):")),
         "header reports the true count: {:?}",
@@ -26030,7 +26045,7 @@ fn peer_list_caps_rows_and_summarizes_overflow() {
     );
 
     // Under the cap: every row inline, no summary line.
-    let few = compose_peer_list_text(&[row("only")], &[]);
+    let few = compose_peer_list_text(&[row("only")], &[], &Default::default());
     assert!(few.contains("- only"), "{few}");
     assert!(
         !few.contains("more"),
@@ -26154,6 +26169,684 @@ fn peer_list_row(slug: &str, model_lane: Option<&str>) -> PeerBlackboardRow {
         turn_history: None,
         model_lane: model_lane.map(str::to_owned),
     }
+}
+
+// ---------------------------------------------------------------------------
+// #peer-respond — master answers a BLOCKED peer (human-in-the-loop).
+// The process-global pending STORE is the authority for "awaiting input" — not
+// the filesystem — so these drive the store + `peer_respond_resolve` /
+// `cancel_peer_pending_on_close` / `build_peer_list_callback` directly, WITHOUT
+// a live LLM. Each test uses a UNIQUE peer slug so the process-global peer-wire
+// registry never collides across parallel tests.
+// ---------------------------------------------------------------------------
+
+/// Stage a real peer dir (`brief.md` + `name` + `originator`) via the production
+/// staging callback (needed for the originator auth + name resolution), and
+/// register its TRUSTED wire session in the process-global registry (so
+/// peer_list / peer_respond can join slug → session → store). Returns
+/// `(slug, peer_session_key)`.
+fn stage_and_open_peer(
+    peers_root: &std::path::Path,
+    profile_id: &str,
+    name: &str,
+    originator: &octos_core::SessionKey,
+) -> (String, octos_core::SessionKey) {
+    std::fs::create_dir_all(peers_root).unwrap();
+    let workspace = peers_root.parent().unwrap().join("work");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let callback = build_peer_handoff_callback(
+        peers_root.to_path_buf(),
+        workspace,
+        originator.clone(),
+        profile_id.to_owned(),
+        Vec::new(),
+        Arc::new(AtomicU32::new(0)),
+        Arc::new(|_event| {}),
+    );
+    let slug = callback(octos_agent::PeerHandoffRequest {
+        brief: "do the work".to_owned(),
+        name: name.to_owned(),
+        worktree: false,
+        model: None,
+    })
+    .expect("stage peer")
+    .slug;
+    let peer_key = octos_core::SessionKey::with_profile_topic(
+        profile_id,
+        "api",
+        "tab",
+        &format!("peer-{slug}"),
+    );
+    peer_wire_registry().register(peer_wire_key(profile_id, &slug), peer_key.clone());
+    (slug, peer_key)
+}
+
+fn approval_event(session: &octos_core::SessionKey, id: &ApprovalId) -> ApprovalRequestedEvent {
+    ApprovalRequestedEvent::generic(
+        session.clone(),
+        id.clone(),
+        TurnId::new(),
+        "shell".to_owned(),
+        "Run rm -rf build?".to_owned(),
+        "rm -rf build".to_owned(),
+    )
+}
+
+fn question_event(
+    session: &octos_core::SessionKey,
+    id: &QuestionId,
+    questions: Vec<octos_core::ui_protocol::UserQuestion>,
+) -> UserQuestionRequestedEvent {
+    UserQuestionRequestedEvent {
+        session_id: session.clone(),
+        topic: session.topic().map(ToOwned::to_owned),
+        question_id: id.clone(),
+        turn_id: TurnId::new(),
+        title: "Pick".to_owned(),
+        body: "Pick a store".to_owned(),
+        questions,
+    }
+}
+
+fn one_free_text_question() -> Vec<octos_core::ui_protocol::UserQuestion> {
+    vec![octos_core::ui_protocol::UserQuestion {
+        header: "DB".to_owned(),
+        question: "Which database?".to_owned(),
+        options: Vec::new(),
+        multi_select: false,
+        allow_free_text: true,
+    }]
+}
+
+/// A strict CHOICE question (options, NO free text) — a string answer MUST map
+/// to a label or the store rejects it (`free_text_not_allowed`).
+fn choice_question(question: &str, options: &[&str]) -> octos_core::ui_protocol::UserQuestion {
+    octos_core::ui_protocol::UserQuestion {
+        header: question.to_owned(),
+        question: question.to_owned(),
+        options: options
+            .iter()
+            .map(|l| octos_core::ui_protocol::UserQuestionOption {
+                label: (*l).to_owned(),
+                description: String::new(),
+            })
+            .collect(),
+        multi_select: false,
+        allow_free_text: false,
+    }
+}
+
+fn approve_req(slug: &str, id: Option<&str>) -> octos_agent::PeerRespondRequest {
+    octos_agent::PeerRespondRequest {
+        slug: slug.to_owned(),
+        id: id.map(ToOwned::to_owned),
+        decision: Some("approve".to_owned()),
+        answers: None,
+    }
+}
+
+fn answer_req(slug: &str, texts: &[&str]) -> octos_agent::PeerRespondRequest {
+    octos_agent::PeerRespondRequest {
+        slug: slug.to_owned(),
+        id: None,
+        decision: None,
+        answers: Some(
+            texts
+                .iter()
+                .map(|t| octos_agent::PeerRespondAnswer {
+                    selected_labels: Vec::new(),
+                    free_text: Some((*t).to_owned()),
+                })
+                .collect(),
+        ),
+    }
+}
+
+fn no_decided_sink() -> impl Fn(&ApprovalDecidedEvent, Option<&str>) {
+    |_event: &ApprovalDecidedEvent, _tool: Option<&str>| {}
+}
+
+/// (P2-6 / overarching) A parked peer is VISIBLE via the store with NO
+/// filesystem write at all — request_runtime alone makes peer_list report
+/// `awaiting_input`, so a peer can never park invisibly.
+#[test]
+fn peer_parks_visible_via_store_without_any_filesystem_marker() {
+    let tmp = tempfile::tempdir().unwrap();
+    let peers_root = tmp.path().join("data").join("peers");
+    let master = octos_core::SessionKey::with_profile_topic("dev", "local", "tui", "coding");
+    let (slug, peer_key) = stage_and_open_peer(&peers_root, "prof-vis", "vis", &master);
+
+    let contracts = Arc::new(UiProtocolContractStores::default());
+    let approval_id = ApprovalId::new();
+    let _rx = contracts
+        .approvals
+        .request_runtime(approval_event(&peer_key, &approval_id));
+
+    // No pending-* file was written; the store alone drives peer_list.
+    let list = build_peer_list_callback(
+        peers_root.clone(),
+        Vec::new(),
+        contracts.clone(),
+        "prof-vis".to_owned(),
+    );
+    let text = list().unwrap();
+    assert!(
+        text.contains("awaiting_input"),
+        "store makes it visible: {text}"
+    );
+    assert!(
+        text.contains(&approval_id.0.to_string()),
+        "lists the id: {text}"
+    );
+    let _ = slug;
+}
+
+/// (B) peer_list lists EACH pending id (approval + question) from the store.
+#[test]
+fn peer_list_lists_each_pending_id_from_store() {
+    let tmp = tempfile::tempdir().unwrap();
+    let peers_root = tmp.path().join("data").join("peers");
+    let master = octos_core::SessionKey::with_profile_topic("dev", "local", "tui", "coding");
+    let (_slug, peer_key) = stage_and_open_peer(&peers_root, "prof-list", "listy", &master);
+
+    let contracts = Arc::new(UiProtocolContractStores::default());
+    let aid = ApprovalId::new();
+    let qid = QuestionId::new();
+    let _r1 = contracts
+        .approvals
+        .request_runtime(approval_event(&peer_key, &aid));
+    let _r2 = contracts.user_questions.request_runtime(question_event(
+        &peer_key,
+        &qid,
+        one_free_text_question(),
+    ));
+
+    let list = build_peer_list_callback(
+        peers_root.clone(),
+        Vec::new(),
+        contracts.clone(),
+        "prof-list".to_owned(),
+    );
+    let text = list().unwrap();
+    assert!(text.contains("awaiting_input"), "status: {text}");
+    assert!(text.contains(&aid.0.to_string()), "approval id: {text}");
+    assert!(text.contains(&qid.0.to_string()), "question id: {text}");
+}
+
+/// (C) peer_respond resolves a pending APPROVAL (approve) via the store, and
+/// emits `approval/decided` attributing the MASTER (#P1-5).
+#[test]
+fn peer_respond_resolves_pending_approval_approve() {
+    let tmp = tempfile::tempdir().unwrap();
+    let peers_root = tmp.path().join("data").join("peers");
+    let master = octos_core::SessionKey::with_profile_topic("dev", "local", "tui", "coding");
+    let (slug, peer_key) = stage_and_open_peer(&peers_root, "prof-approve", "approve", &master);
+
+    let contracts = UiProtocolContractStores::default();
+    let approval_id = ApprovalId::new();
+    let mut rx = contracts
+        .approvals
+        .request_runtime(approval_event(&peer_key, &approval_id));
+
+    let decided = std::cell::RefCell::new(Vec::<ApprovalDecidedEvent>::new());
+    let sink = |event: &ApprovalDecidedEvent, _tool: Option<&str>| {
+        decided.borrow_mut().push(event.clone());
+    };
+
+    peer_respond_resolve(
+        &peers_root,
+        &master.0,
+        "prof-approve",
+        &contracts,
+        &sink,
+        approve_req(&slug, None),
+    )
+    .expect("approve resolves the pending approval");
+
+    assert_eq!(
+        rx.try_recv().expect("oneshot resolved"),
+        ApprovalDecision::Approve
+    );
+    let events = decided.borrow();
+    assert_eq!(events.len(), 1, "approval/decided emitted once");
+    assert_eq!(
+        events[0].decided_by, master.0,
+        "master is the decision source"
+    );
+}
+
+/// (C) peer_respond resolves a pending APPROVAL (deny).
+#[test]
+fn peer_respond_resolves_pending_approval_deny() {
+    let tmp = tempfile::tempdir().unwrap();
+    let peers_root = tmp.path().join("data").join("peers");
+    let master = octos_core::SessionKey::with_profile_topic("dev", "local", "tui", "coding");
+    let (slug, peer_key) = stage_and_open_peer(&peers_root, "prof-deny", "deny", &master);
+
+    let contracts = UiProtocolContractStores::default();
+    let approval_id = ApprovalId::new();
+    let mut rx = contracts
+        .approvals
+        .request_runtime(approval_event(&peer_key, &approval_id));
+
+    peer_respond_resolve(
+        &peers_root,
+        &master.0,
+        "prof-deny",
+        &contracts,
+        &no_decided_sink(),
+        octos_agent::PeerRespondRequest {
+            slug: slug.clone(),
+            id: None,
+            decision: Some("deny".to_owned()),
+            answers: None,
+        },
+    )
+    .expect("deny resolves");
+    assert_eq!(rx.try_recv().unwrap(), ApprovalDecision::Deny);
+}
+
+/// (C) peer_respond resolves a single-question prompt with a free-text answer.
+#[test]
+fn peer_respond_resolves_pending_question_answer() {
+    let tmp = tempfile::tempdir().unwrap();
+    let peers_root = tmp.path().join("data").join("peers");
+    let master = octos_core::SessionKey::with_profile_topic("dev", "local", "tui", "coding");
+    let (slug, peer_key) = stage_and_open_peer(&peers_root, "prof-q", "q", &master);
+
+    let contracts = UiProtocolContractStores::default();
+    let qid = QuestionId::new();
+    let mut rx = contracts.user_questions.request_runtime(question_event(
+        &peer_key,
+        &qid,
+        one_free_text_question(),
+    ));
+
+    peer_respond_resolve(
+        &peers_root,
+        &master.0,
+        "prof-q",
+        &contracts,
+        &no_decided_sink(),
+        answer_req(&slug, &["use postgres"]),
+    )
+    .expect("answer resolves");
+    let answers = rx.try_recv().expect("question oneshot resolved");
+    assert_eq!(answers.len(), 1);
+    assert_eq!(answers[0].free_text.as_deref(), Some("use postgres"));
+}
+
+/// (new-P2-#2) A 2-question strict CHOICE prompt is answerable with STRING
+/// answers — each maps to ITS question's option label (not free text, which
+/// these questions forbid). This is the exact case that was broken before.
+#[test]
+fn peer_respond_multi_question_choice_maps_string_answers_to_labels() {
+    let tmp = tempfile::tempdir().unwrap();
+    let peers_root = tmp.path().join("data").join("peers");
+    let master = octos_core::SessionKey::with_profile_topic("dev", "local", "tui", "coding");
+    let (slug, peer_key) = stage_and_open_peer(&peers_root, "prof-multi", "multi", &master);
+
+    let contracts = UiProtocolContractStores::default();
+    let qid = QuestionId::new();
+    let questions = vec![
+        choice_question("Enable SSL?", &["Yes", "No"]),
+        choice_question("Which store?", &["postgres", "sqlite"]),
+    ];
+    let mut rx = contracts
+        .user_questions
+        .request_runtime(question_event(&peer_key, &qid, questions));
+
+    // Bare strings, one per question — must become label selections.
+    peer_respond_resolve(
+        &peers_root,
+        &master.0,
+        "prof-multi",
+        &contracts,
+        &no_decided_sink(),
+        answer_req(&slug, &["Yes", "postgres"]),
+    )
+    .expect("a 2-question choice prompt is answerable with string answers");
+
+    let answers = rx.try_recv().expect("multi-question oneshot resolved");
+    assert_eq!(answers.len(), 2);
+    assert_eq!(answers[0].selected_labels, vec!["Yes".to_string()]);
+    assert!(answers[0].free_text.is_none());
+    assert_eq!(answers[1].selected_labels, vec!["postgres".to_string()]);
+}
+
+/// (P1-3) With MULTIPLE pending prompts, an id is REQUIRED; answering one leaves
+/// the other pending (its oneshot untouched).
+#[test]
+fn peer_respond_requires_id_when_multiple_pending() {
+    let tmp = tempfile::tempdir().unwrap();
+    let peers_root = tmp.path().join("data").join("peers");
+    let master = octos_core::SessionKey::with_profile_topic("dev", "local", "tui", "coding");
+    let (slug, peer_key) = stage_and_open_peer(&peers_root, "prof-many", "many", &master);
+
+    let contracts = UiProtocolContractStores::default();
+    let id1 = ApprovalId::new();
+    let id2 = ApprovalId::new();
+    let mut rx1 = contracts
+        .approvals
+        .request_runtime(approval_event(&peer_key, &id1));
+    let mut rx2 = contracts
+        .approvals
+        .request_runtime(approval_event(&peer_key, &id2));
+
+    let err = peer_respond_resolve(
+        &peers_root,
+        &master.0,
+        "prof-many",
+        &contracts,
+        &no_decided_sink(),
+        approve_req(&slug, None),
+    )
+    .expect_err(">1 pending without an id is rejected");
+    assert!(err.contains("pending prompts"), "clear error: {err}");
+    assert!(rx1.try_recv().is_err() && rx2.try_recv().is_err());
+
+    peer_respond_resolve(
+        &peers_root,
+        &master.0,
+        "prof-many",
+        &contracts,
+        &no_decided_sink(),
+        approve_req(&slug, Some(&id1.0.to_string())),
+    )
+    .expect("targeting id1 resolves it");
+    assert_eq!(rx1.try_recv().unwrap(), ApprovalDecision::Approve);
+    assert!(rx2.try_recv().is_err(), "the other prompt is untouched");
+    // id2 still pending in the store.
+    let still = peer_pending_summaries(&contracts, &peer_key);
+    assert_eq!(still.len(), 1);
+    assert_eq!(still[0].id, id2.0.to_string());
+}
+
+/// (P1-1 SECURITY) peer_respond can only ever reach THIS peer's oneshots: the
+/// session key is derived from the wire registry, and the target is chosen from
+/// the store's entries for THAT session — so a victim peer's id is simply not in
+/// the attacker peer's pending set.
+#[test]
+fn peer_respond_cannot_target_another_peers_pending() {
+    let tmp = tempfile::tempdir().unwrap();
+    let peers_root = tmp.path().join("data").join("peers");
+    let master = octos_core::SessionKey::with_profile_topic("dev", "local", "tui", "coding");
+    let (slug, _attacker_key) = stage_and_open_peer(&peers_root, "prof-atk", "attacker", &master);
+
+    let contracts = UiProtocolContractStores::default();
+    // A DIFFERENT victim peer with a live pending approval under ITS own key.
+    let victim_key =
+        octos_core::SessionKey::with_profile_topic("prof-atk", "api", "tab", "peer-victim");
+    let victim_id = ApprovalId::new();
+    let mut victim_rx = contracts
+        .approvals
+        .request_runtime(approval_event(&victim_key, &victim_id));
+
+    let err = peer_respond_resolve(
+        &peers_root,
+        &master.0,
+        "prof-atk",
+        &contracts,
+        &no_decided_sink(),
+        approve_req(&slug, Some(&victim_id.0.to_string())),
+    )
+    .expect_err("cannot target another peer's pending id");
+    // The attacker's OWN pending set (from its derived session) is empty, so the
+    // victim's id is unreachable — rejected as not-awaiting / no-such-id.
+    assert!(
+        err.contains("not awaiting input") || err.contains("no pending prompt"),
+        "rejected: {err}"
+    );
+    assert!(
+        victim_rx.try_recv().is_err(),
+        "victim oneshot stays unresolved"
+    );
+}
+
+/// (P1-1 targeted) An UNKNOWN/bogus id does NOT disturb a still-parked entry —
+/// the store is authoritative and the bogus id never reaches respond.
+#[test]
+fn peer_respond_unknown_id_leaves_other_pending_intact() {
+    let tmp = tempfile::tempdir().unwrap();
+    let peers_root = tmp.path().join("data").join("peers");
+    let master = octos_core::SessionKey::with_profile_topic("dev", "local", "tui", "coding");
+    let (slug, peer_key) = stage_and_open_peer(&peers_root, "prof-unk", "unk", &master);
+
+    let contracts = UiProtocolContractStores::default();
+    let s1 = ApprovalId::new();
+    let mut rx1 = contracts
+        .approvals
+        .request_runtime(approval_event(&peer_key, &s1));
+
+    let bogus = ApprovalId::new();
+    let err = peer_respond_resolve(
+        &peers_root,
+        &master.0,
+        "prof-unk",
+        &contracts,
+        &no_decided_sink(),
+        approve_req(&slug, Some(&bogus.0.to_string())),
+    )
+    .expect_err("an unknown id errors");
+    assert!(err.contains("no pending prompt"), "rejected: {err}");
+    assert!(rx1.try_recv().is_err(), "S1 stays parked");
+    assert_eq!(
+        peer_pending_summaries(&contracts, &peer_key).len(),
+        1,
+        "S1 still pending"
+    );
+}
+
+/// Authorization: a non-originator is rejected; the oneshot stays unresolved.
+#[test]
+fn peer_respond_rejects_non_originator() {
+    let tmp = tempfile::tempdir().unwrap();
+    let peers_root = tmp.path().join("data").join("peers");
+    let master = octos_core::SessionKey::with_profile_topic("dev", "local", "tui", "coding");
+    let (slug, peer_key) = stage_and_open_peer(&peers_root, "prof-auth", "auth", &master);
+
+    let contracts = UiProtocolContractStores::default();
+    let approval_id = ApprovalId::new();
+    let mut rx = contracts
+        .approvals
+        .request_runtime(approval_event(&peer_key, &approval_id));
+
+    let err = peer_respond_resolve(
+        &peers_root,
+        "some-other-session",
+        "prof-auth",
+        &contracts,
+        &no_decided_sink(),
+        approve_req(&slug, None),
+    )
+    .expect_err("non-originator rejected");
+    assert!(err.contains("owner"), "ownership error: {err}");
+    assert!(rx.try_recv().is_err(), "oneshot untouched");
+}
+
+/// Error when the peer is open but has NO pending entry.
+#[test]
+fn peer_respond_errors_when_not_awaiting_input() {
+    let tmp = tempfile::tempdir().unwrap();
+    let peers_root = tmp.path().join("data").join("peers");
+    let master = octos_core::SessionKey::with_profile_topic("dev", "local", "tui", "coding");
+    let (slug, _key) = stage_and_open_peer(&peers_root, "prof-idle", "idle", &master);
+
+    let contracts = UiProtocolContractStores::default();
+    let err = peer_respond_resolve(
+        &peers_root,
+        &master.0,
+        "prof-idle",
+        &contracts,
+        &no_decided_sink(),
+        approve_req(&slug, None),
+    )
+    .expect_err("no pending → error");
+    assert!(err.contains("not awaiting input"), "clear error: {err}");
+}
+
+/// Kind mismatch: answering an APPROVAL with `answers` errors, oneshot untouched.
+#[test]
+fn peer_respond_rejects_wrong_response_kind() {
+    let tmp = tempfile::tempdir().unwrap();
+    let peers_root = tmp.path().join("data").join("peers");
+    let master = octos_core::SessionKey::with_profile_topic("dev", "local", "tui", "coding");
+    let (slug, peer_key) = stage_and_open_peer(&peers_root, "prof-kind", "kind", &master);
+
+    let contracts = UiProtocolContractStores::default();
+    let approval_id = ApprovalId::new();
+    let mut rx = contracts
+        .approvals
+        .request_runtime(approval_event(&peer_key, &approval_id));
+
+    let err = peer_respond_resolve(
+        &peers_root,
+        &master.0,
+        "prof-kind",
+        &contracts,
+        &no_decided_sink(),
+        answer_req(&slug, &["sure"]),
+    )
+    .expect_err("answering an approval is a kind mismatch");
+    assert!(err.contains("APPROVAL"), "names the kind: {err}");
+    assert!(rx.try_recv().is_err(), "oneshot untouched");
+}
+
+/// Peer not open (no wire) → clear error even with a store entry.
+#[test]
+fn peer_respond_errors_when_peer_not_open() {
+    let tmp = tempfile::tempdir().unwrap();
+    let peers_root = tmp.path().join("data").join("peers");
+    let master = octos_core::SessionKey::with_profile_topic("dev", "local", "tui", "coding");
+    // Stage but do NOT open (no wire registration): craft the slug manually.
+    std::fs::create_dir_all(&peers_root).unwrap();
+    let workspace = peers_root.parent().unwrap().join("work");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let cb = build_peer_handoff_callback(
+        peers_root.clone(),
+        workspace,
+        master.clone(),
+        "prof-closed".to_owned(),
+        Vec::new(),
+        Arc::new(AtomicU32::new(0)),
+        Arc::new(|_e| {}),
+    );
+    let slug = cb(octos_agent::PeerHandoffRequest {
+        brief: "x".to_owned(),
+        name: "notopen".to_owned(),
+        worktree: false,
+        model: None,
+    })
+    .unwrap()
+    .slug;
+
+    let contracts = UiProtocolContractStores::default();
+    let err = peer_respond_resolve(
+        &peers_root,
+        &master.0,
+        "prof-noopen",
+        &contracts,
+        &no_decided_sink(),
+        approve_req(&slug, None),
+    )
+    .expect_err("no wire → not open");
+    assert!(err.contains("not open"), "clear error: {err}");
+}
+
+/// (P1-2) `peer_close` cancels a pending approval from the AUTHORITATIVE store
+/// (fail-closed) — no filesystem marker involved — releasing the parked turn.
+#[test]
+fn peer_close_cancels_pending_from_store() {
+    let tmp = tempfile::tempdir().unwrap();
+    let peers_root = tmp.path().join("data").join("peers");
+    let master = octos_core::SessionKey::with_profile_topic("dev", "local", "tui", "coding");
+    let (slug, peer_key) = stage_and_open_peer(&peers_root, "prof-close", "closing", &master);
+
+    let contracts = UiProtocolContractStores::default();
+    let approval_id = ApprovalId::new();
+    let mut rx = contracts
+        .approvals
+        .request_runtime(approval_event(&peer_key, &approval_id));
+
+    let cancelled = std::cell::RefCell::new(Vec::<ApprovalCancelledEvent>::new());
+    cancel_peer_pending_on_close(&contracts, "prof-close", &slug, &|event| {
+        cancelled.borrow_mut().push(event);
+    });
+
+    assert!(
+        rx.try_recv().is_err(),
+        "closing a parked peer releases its oneshot"
+    );
+    assert!(
+        peer_pending_summaries(&contracts, &peer_key).is_empty(),
+        "no longer pending"
+    );
+    assert_eq!(cancelled.borrow().len(), 1, "approval/cancelled emitted");
+    assert_eq!(cancelled.borrow()[0].reason, "peer_closed");
+}
+
+/// (P1-5) The shared `audit_approval_decided` helper writes a durable audit
+/// entry (the peer_respond production sink calls this alongside the emit).
+#[test]
+fn audit_approval_decided_writes_durable_entry() {
+    use octos_core::ui_protocol::ApprovalRequestedEvent;
+    let temp = tempfile::tempdir().unwrap();
+    let contracts = UiProtocolContractStores::default();
+    let session_id = SessionKey("dev:peer-audit".into());
+    let approval_id = ApprovalId::new();
+    contracts.approvals.request(ApprovalRequestedEvent::generic(
+        session_id.clone(),
+        approval_id.clone(),
+        TurnId::new(),
+        "shell",
+        "Run",
+        "body",
+    ));
+    let params = ApprovalRespondParams::new(
+        session_id.clone(),
+        approval_id.clone(),
+        ApprovalDecision::Approve,
+    );
+    let outcome = contracts
+        .approvals
+        .respond_with_context(params.clone())
+        .unwrap();
+    let event = crate::api::ui_protocol_approvals::build_decided_event(
+        &params,
+        &outcome,
+        "master:session",
+        chrono::Utc::now(),
+    );
+
+    audit_approval_decided(&contracts, temp.path(), &event, Some("shell"));
+
+    let active = std::fs::read_dir(temp.path().join("audit"))
+        .expect("audit dir")
+        .filter_map(Result::ok)
+        .next()
+        .expect("active log")
+        .path();
+    let lines = crate::api::ui_protocol_audit::read_audit_lines(&active);
+    assert_eq!(lines.len(), 1, "one audit entry per master decision");
+    assert_eq!(lines[0]["approval_id"], json!(approval_id.0.to_string()));
+    assert_eq!(lines[0]["decided_by"], json!("master:session"));
+    assert_eq!(lines[0]["decision"], json!("approve"));
+}
+
+/// Depth-1: `peer_respond` is gated on the SAME predicate as peer_send_input /
+/// peer_close — never registered on a peer session.
+#[test]
+fn peer_respond_depth_guard_excludes_peer_sessions() {
+    let peer = octos_core::SessionKey::with_profile_topic("dev", "local", "tui", "peer-alpha");
+    let master = octos_core::SessionKey::with_profile_topic("dev", "local", "tui", "coding");
+    assert!(
+        !peer_handoff_allowed_for_session(&peer),
+        "peer_respond (gated on this predicate) must NOT be registered on a peer session"
+    );
+    assert!(
+        peer_handoff_allowed_for_session(&master),
+        "a normal master session CAN register peer_respond"
+    );
 }
 
 /// #peer-model (part 2): a `peer_handoff` naming a CONFIGURED lane records it
@@ -26347,7 +27040,7 @@ fn compose_peer_list_text_annotates_and_flags_stale_model_lane() {
         peer_list_row("grunt", None),
     ];
     // Only "strong" is currently configured.
-    let text = compose_peer_list_text(&rows, &["strong".to_owned()]);
+    let text = compose_peer_list_text(&rows, &["strong".to_owned()], &Default::default());
     assert!(
         text.contains("- synth  running  updated —  turns 0  · model=strong"),
         "a live lane peer is annotated with its lane: {text:?}"
