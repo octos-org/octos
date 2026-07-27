@@ -1,0 +1,51 @@
+[package]
+name = "octos-ffi"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "C-ABI bindings for embedding octos in non-Rust apps (Python/Node/Go/C)."
+
+[lib]
+# cdylib   -> the shared library non-Rust hosts dlopen/link against.
+# staticlib -> a `.a` for static linking into C/Go binaries.
+# rlib      -> lets this crate's own Rust integration tests call the
+#              `extern "C"` symbols directly (see tests/ffi.rs).
+crate-type = ["cdylib", "staticlib", "rlib"]
+
+[dependencies]
+octos-core = { workspace = true }
+octos-agent = { workspace = true }
+octos-llm = { workspace = true }
+octos-memory = { workspace = true }
+# Path dep (octos-cli is a workspace member, not a `workspace.dependencies`
+# entry). default-features = false keeps out the heavy `api`/channel features —
+# only the ungated `config` + `commands::chat` modules are needed to reuse
+# `Config` + `create_provider_with_api_type`.
+octos-cli = { path = "../octos-cli", default-features = false }
+# Optional: the in-process GGUF embedder. Pulled only under `embed-llama`
+# (a CMake build of llama.cpp), so the default `cargo build --workspace`
+# stays pure Rust.
+octos-embed-llama = { workspace = true, optional = true }
+tokio = { version = "1", default-features = false, features = ["rt-multi-thread"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+libc = { workspace = true }
+
+[features]
+default = []
+# Compile the GGUF embedding backend into `octos_embed`. Without it,
+# `octos_embed` reports "embedding support not compiled in".
+embed-llama = ["dep:octos-embed-llama", "octos-embed-llama/embed-llama"]
+embed-llama-metal = ["embed-llama", "octos-embed-llama/metal"]
+embed-llama-cuda = ["embed-llama", "octos-embed-llama/cuda"]
+
+# NOTE: this crate deliberately does NOT set `[lints] workspace = true` at the
+# table level the same way as leaf crates — it still inherits the workspace
+# `deny(unsafe_code)`, but overrides it at the crate root with
+# `#![allow(unsafe_code)]` because an FFI boundary is unsafe by nature. See the
+# SAFETY rationale at the top of src/lib.rs.
+[lints]
+workspace = true

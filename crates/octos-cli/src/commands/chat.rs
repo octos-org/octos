@@ -3038,7 +3038,12 @@ pub(crate) fn create_provider(
 ///
 /// Does NOT print to stdout — callers that want a log line should print
 /// after calling this function.
-pub(crate) fn create_provider_with_api_type(
+///
+/// Exposed as `pub` (was `pub(crate)`) so the `octos-ffi` C-ABI crate can
+/// reuse the exact provider-construction path (auth store → env_vars → env
+/// key resolution, timeout overrides, anthropic/responses api_type bypasses)
+/// instead of re-implementing a drift-prone parallel factory.
+pub fn create_provider_with_api_type(
     name: &str,
     config: &Config,
     model: Option<String>,

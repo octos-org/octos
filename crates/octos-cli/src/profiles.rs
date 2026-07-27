@@ -2500,6 +2500,9 @@ pub(crate) fn config_from_profile(
                 .and_then(|route| route.api_key_env.clone())
         }),
         env_vars: profile.config.env_vars.clone(),
+        // Internal-only flag (octos-ffi opt-out); profiles always use the
+        // default auth-store resolution order.
+        bypass_auth_store: false,
         api_type: primary.and_then(|selection| {
             selection
                 .route
