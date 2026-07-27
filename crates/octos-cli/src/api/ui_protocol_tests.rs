@@ -22649,6 +22649,234 @@ async fn state_with_profile_llm_and_sandbox(
     (state, profile_runtime)
 }
 
+// ---- #peer-awaiting-wake — real requester integration ----
+//
+// Drive the REAL `UiProtocolApprovalRequester::request_approval` /
+// `SessionUserQuestionRequester::request_user_question` from a PEER session and
+// assert the peer's park wakes its originator (master) via the process-global
+// master-continuation scheduler — the exact seam `peer_fleet_synthesis` uses.
+// No live LLM: the requester parks on its oneshot and we cancel it to unwind.
+
+/// Stage `<peers_root>/<slug>/` with `brief.md` + `originator` so
+/// `staged_peer_dir` accepts it and the wake can resolve the master.
+fn stage_wake_peer(peers_root: &std::path::Path, slug: &str, originator: &str) {
+    let dir = peers_root.join(slug);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("brief.md"), "do the thing").unwrap();
+    std::fs::write(dir.join("originator"), originator).unwrap();
+}
+
+/// Poll the global orchestrator until `master` has >= `expected` pending
+/// continuations (or time out ~1s). The wake enqueue is synchronous inside the
+/// requester (before it awaits its oneshot), so this settles in a few yields.
+async fn wait_for_pending_count(master: &SessionKey, profile: &str, expected: usize) -> usize {
+    let orchestrator = default_agent_orchestrator();
+    for _ in 0..200 {
+        let n = orchestrator.pending_continuation_count_for_session_for_test(master, profile);
+        if n >= expected {
+            return n;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    orchestrator.pending_continuation_count_for_session_for_test(master, profile)
+}
+
+#[tokio::test]
+async fn real_peer_approval_park_wakes_originator() {
+    use octos_agent::ToolApprovalRequester as _;
+    let temp = tempfile::tempdir().unwrap();
+    let profile = "tenant-wake-rt-appr";
+    let (state, runtime) = state_with_profile(temp.path(), profile).await;
+    let peers_root = runtime.data_dir.join("peers");
+    let master = format!("{profile}:api:master");
+    stage_wake_peer(&peers_root, "edison", &master);
+
+    let (ws_tx, _ws_rx) = mpsc::channel(64);
+    let ws = WsConnection::new(ws_tx);
+    let ledger = Arc::new(UiProtocolLedger::new(64));
+    let contracts = Arc::new(UiProtocolContractStores::default());
+    let session_id = SessionKey::with_profile_topic(profile, "api", "edison-wire", "peer-edison");
+    let turn_id = TurnId::new();
+
+    let requester = UiProtocolApprovalRequester {
+        ws,
+        ledger,
+        contracts: contracts.clone(),
+        state: state.clone(),
+        session_id: session_id.clone(),
+        turn_id: turn_id.clone(),
+        features: ConnectionUiFeatures::default(),
+    };
+    let request = octos_agent::ToolApprovalRequest {
+        tool_id: "call-1".to_owned(),
+        tool_name: "shell".to_owned(),
+        title: "Run a shell command".to_owned(),
+        body: "rm -rf ./build-cache".to_owned(),
+        command: Some("rm -rf ./build-cache".to_owned()),
+        cwd: None,
+    };
+    let handle = tokio::spawn(async move { requester.request_approval(request).await });
+
+    let master_key = SessionKey(master.clone());
+    let n = wait_for_pending_count(&master_key, profile, 1).await;
+    assert_eq!(
+        n, 1,
+        "the real approval park must wake its originator exactly once"
+    );
+
+    // Inspect the queued wake: right reason kind + parked slug.
+    let drained = default_agent_orchestrator().drain_ready_continuations_for_session(
+        &master_key,
+        profile,
+        MasterContinuationRuntimeState::idle(),
+        4,
+    );
+    let wake = drained
+        .iter()
+        .find(|c| {
+            matches!(&c.reason, MasterContinuationReason::External(k)
+                if k == crate::api::agent_orchestrator::PEER_AWAITING_INPUT_EXTERNAL_KIND)
+        })
+        .expect("a peer_awaiting_input wake must be queued on the master");
+    assert!(
+        master_continuation_prompt(wake).contains("edison"),
+        "the wake prompt names the parked peer",
+    );
+
+    // Unblock the parked requester so the spawned task can finish.
+    contracts
+        .approvals
+        .cancel_pending_for_turn(&session_id, &turn_id, "test-teardown");
+    let decision = handle.await.unwrap();
+    assert_eq!(decision, octos_agent::ToolApprovalDecision::Deny);
+}
+
+#[tokio::test]
+async fn real_auto_resolved_approval_does_not_wake() {
+    use octos_agent::ToolApprovalRequester as _;
+    let temp = tempfile::tempdir().unwrap();
+    let profile = "tenant-wake-rt-auto";
+    let (state, runtime) = state_with_profile(temp.path(), profile).await;
+    let peers_root = runtime.data_dir.join("peers");
+    let master = format!("{profile}:api:master");
+    // Stage a VALID peer+originator, so the ONLY reason no wake fires is the
+    // auto-resolve short-circuit (not a missing originator).
+    stage_wake_peer(&peers_root, "edison", &master);
+
+    let (ws_tx, _ws_rx) = mpsc::channel(64);
+    let ws = WsConnection::new(ws_tx);
+    let ledger = Arc::new(UiProtocolLedger::new(64));
+    let contracts = Arc::new(UiProtocolContractStores::default());
+    let session_id = SessionKey::with_profile_topic(profile, "api", "edison-wire", "peer-edison");
+    let turn_id = TurnId::new();
+
+    // Pre-record a session-wide auto-approve for `shell`, so this approval is
+    // resolved by policy and NEVER parks (never reaches request_runtime).
+    contracts.scopes.record(
+        &session_id,
+        ApprovalScopeKind::ApproveForTool,
+        match_key_for(ApprovalScopeKind::ApproveForTool, "shell", &turn_id),
+        ApprovalDecision::Approve,
+    );
+
+    let requester = UiProtocolApprovalRequester {
+        ws,
+        ledger,
+        contracts: contracts.clone(),
+        state: state.clone(),
+        session_id: session_id.clone(),
+        turn_id: turn_id.clone(),
+        features: ConnectionUiFeatures::default(),
+    };
+    let request = octos_agent::ToolApprovalRequest {
+        tool_id: "call-1".to_owned(),
+        tool_name: "shell".to_owned(),
+        title: "Run a shell command".to_owned(),
+        body: "echo hi".to_owned(),
+        command: Some("echo hi".to_owned()),
+        cwd: None,
+    };
+    // Auto-resolve returns immediately (no oneshot to await), so call directly.
+    let decision = requester.request_approval(request).await;
+    assert_eq!(
+        decision,
+        octos_agent::ToolApprovalDecision::Approve,
+        "the scope policy must auto-approve",
+    );
+
+    let master_key = SessionKey(master.clone());
+    assert_eq!(
+        default_agent_orchestrator()
+            .pending_continuation_count_for_session_for_test(&master_key, profile),
+        0,
+        "an AUTO-RESOLVED approval never parks, so it must NOT wake the master",
+    );
+}
+
+#[tokio::test]
+async fn real_peer_question_park_wakes_originator() {
+    use octos_agent::UserQuestionRequester as _;
+    let temp = tempfile::tempdir().unwrap();
+    let profile = "tenant-wake-rt-q";
+    let (state, runtime) = state_with_profile(temp.path(), profile).await;
+    let peers_root = runtime.data_dir.join("peers");
+    let master = format!("{profile}:api:master");
+    stage_wake_peer(&peers_root, "tesla", &master);
+
+    let (ws_tx, _ws_rx) = mpsc::channel(64);
+    let ws = WsConnection::new(ws_tx);
+    let ledger = Arc::new(UiProtocolLedger::new(64));
+    let contracts = Arc::new(UiProtocolContractStores::default());
+    let session_id = SessionKey::with_profile_topic(profile, "api", "tesla-wire", "peer-tesla");
+    let turn_id = TurnId::new();
+
+    let requester = SessionUserQuestionRequester {
+        ws,
+        ledger,
+        contracts: contracts.clone(),
+        state: state.clone(),
+        session_id: session_id.clone(),
+        turn_id: turn_id.clone(),
+    };
+    let request = octos_agent::UserQuestionRequest {
+        questions: Vec::new(),
+        title: "Pick a datastore".to_owned(),
+        body: "Postgres or SQLite?".to_owned(),
+    };
+    let handle = tokio::spawn(async move { requester.request_user_question(request).await });
+
+    let master_key = SessionKey(master.clone());
+    let n = wait_for_pending_count(&master_key, profile, 1).await;
+    assert_eq!(
+        n, 1,
+        "the real question park must wake its originator exactly once"
+    );
+
+    let drained = default_agent_orchestrator().drain_ready_continuations_for_session(
+        &master_key,
+        profile,
+        MasterContinuationRuntimeState::idle(),
+        4,
+    );
+    let wake = drained
+        .iter()
+        .find(|c| {
+            matches!(&c.reason, MasterContinuationReason::External(k)
+                if k == crate::api::agent_orchestrator::PEER_AWAITING_INPUT_EXTERNAL_KIND)
+        })
+        .expect("a peer_awaiting_input wake must be queued on the master");
+    assert!(
+        master_continuation_prompt(wake).contains("question"),
+        "the wake prompt states the question kind",
+    );
+
+    contracts
+        .user_questions
+        .cancel_pending_for_turn(&session_id, &turn_id, "test-teardown");
+    let outcome = handle.await.unwrap();
+    assert_eq!(outcome, octos_agent::UserQuestionOutcome::Cancelled);
+}
+
 struct AppuiContinuationLlm {
     response: String,
     call_count: std::sync::atomic::AtomicUsize,
