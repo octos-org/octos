@@ -296,6 +296,133 @@ fn local_profile_state(dir: &Path) -> AppState {
     }
 }
 
+fn profile_for_runtime_message(id: &str) -> crate::profiles::UserProfile {
+    let now = Utc::now();
+    crate::profiles::UserProfile {
+        id: id.to_string(),
+        name: id.to_string(),
+        public_subdomain: None,
+        enabled: true,
+        data_dir: None,
+        parent_id: None,
+        config: crate::profiles::ProfileConfig::default(),
+        created_at: now,
+        updated_at: now,
+    }
+}
+
+// Regression coverage for the "No ProfileRuntime registered... Set up the
+// profile with an API key in the dashboard" message, which used to fire
+// verbatim for every Ok(None) from `ensure_session_profile_runtime` —
+// including a merely-disabled profile, a sub-account, or an unknown id,
+// none of which an API key would fix.
+#[test]
+fn should_report_no_profile_store_when_profile_runtime_unavailable_and_store_missing() {
+    let state = AppState {
+        profile_store: None,
+        ..AppState::empty_for_tests()
+    };
+    let message = profile_runtime_unavailable_message(&state, "ghost");
+    assert!(
+        message.contains("no profile store") || message.contains("No profile store"),
+        "expected a no-store explanation, got: {message}"
+    );
+    assert!(
+        !message.contains("API key"),
+        "must not blame a missing API key: {message}"
+    );
+}
+
+#[test]
+fn should_report_unknown_profile_when_profile_runtime_unavailable_and_profile_missing() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = local_profile_state(dir.path());
+    let message = profile_runtime_unavailable_message(&state, "ghost");
+    assert!(
+        message.contains("does not exist"),
+        "expected a not-found explanation, got: {message}"
+    );
+    assert!(
+        !message.contains("API key"),
+        "must not blame a missing API key: {message}"
+    );
+}
+
+#[test]
+fn should_report_disabled_when_profile_runtime_unavailable_and_profile_disabled() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = local_profile_state(dir.path());
+    let mut profile = profile_for_runtime_message("disabled-one");
+    profile.enabled = false;
+    // Fully configured (a real key) — the only thing wrong is `enabled`.
+    profile.config.llm = Some(crate::profiles::LlmProfileConfig {
+        primary: Some(crate::profiles::LlmModelSelectionConfig {
+            family_id: Some("zai".to_string()),
+            ..Default::default()
+        }),
+        fallbacks: Vec::new(),
+    });
+    state
+        .profile_store
+        .as_ref()
+        .unwrap()
+        .save(&profile)
+        .unwrap();
+
+    let message = profile_runtime_unavailable_message(&state, "disabled-one");
+    assert!(
+        message.contains("disabled"),
+        "expected a disabled-profile explanation, got: {message}"
+    );
+    assert!(
+        !message.contains("API key"),
+        "a disabled-but-configured profile must not be told to add an API key: {message}"
+    );
+}
+
+#[test]
+fn should_report_sub_account_when_profile_runtime_unavailable_and_profile_has_parent() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = local_profile_state(dir.path());
+    let mut profile = profile_for_runtime_message("child-one");
+    profile.parent_id = Some("parent-one".to_string());
+    state
+        .profile_store
+        .as_ref()
+        .unwrap()
+        .save(&profile)
+        .unwrap();
+
+    let message = profile_runtime_unavailable_message(&state, "child-one");
+    assert!(
+        message.contains("sub-account") || message.contains("sub-profile"),
+        "expected a sub-account explanation, got: {message}"
+    );
+    assert!(
+        !message.contains("API key"),
+        "a sub-account must not be told to add an API key: {message}"
+    );
+}
+
+#[test]
+fn should_report_missing_api_key_when_profile_runtime_unavailable_and_no_llm_selected() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = local_profile_state(dir.path());
+    let profile = profile_for_runtime_message("no-llm-one");
+    state
+        .profile_store
+        .as_ref()
+        .unwrap()
+        .save(&profile)
+        .unwrap();
+
+    let message = profile_runtime_unavailable_message(&state, "no-llm-one");
+    assert!(
+        message.contains("API key"),
+        "a genuinely unconfigured profile should keep the API-key guidance, got: {message}"
+    );
+}
+
 #[test]
 fn profile_local_create_make_default_persists_pointer() {
     let dir = tempfile::tempdir().unwrap();

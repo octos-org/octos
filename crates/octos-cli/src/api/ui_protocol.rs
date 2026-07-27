@@ -15469,6 +15469,41 @@ async fn ensure_session_profile_runtime(
     Ok(Some(runtime))
 }
 
+/// Explain why `ensure_session_profile_runtime`/`resolve_session_profile_runtime`
+/// returned `None` for `profile_id`, re-deriving the same checks in the same
+/// order. The 4 call sites used to collapse every cause (no profile store, no
+/// such profile, disabled, sub-account, no LLM selected) into one "Set up the
+/// profile with an API key" message — accurate only for the last cause and
+/// actively misleading for the other four, e.g. telling a disabled profile's
+/// owner to add an API key it may already have.
+fn profile_runtime_unavailable_message(state: &AppState, profile_id: &str) -> String {
+    let Some(store) = state.profile_store.as_ref() else {
+        return format!(
+            "No profile store is configured, so profile '{profile_id}' cannot be resolved."
+        );
+    };
+    let profile = match store.get(profile_id) {
+        Ok(Some(profile)) => profile,
+        Ok(None) => return format!("Profile '{profile_id}' does not exist."),
+        Err(error) => return format!("Failed to read profile '{profile_id}': {error}"),
+    };
+    if !profile.enabled {
+        return format!("Profile '{profile_id}' is disabled.");
+    }
+    if profile.parent_id.is_some() {
+        return format!(
+            "Profile '{profile_id}' is a sub-account and does not have its own runtime."
+        );
+    }
+    if !profile.config.has_llm_selection() {
+        return format!(
+            "No ProfileRuntime registered for profile '{profile_id}'. \
+             Set up the profile with an API key in the dashboard."
+        );
+    }
+    format!("Profile '{profile_id}' runtime is unavailable.")
+}
+
 /// Resolve the canonical `SessionManager` handle for read operations
 /// (hydrate, state, etc.). Closes #919.1: turn persistence writes to
 /// the profile's `SessionRuntime.sessions`, so reads under profile
@@ -15990,9 +16025,8 @@ async fn handle_review_start(
                 let _ = send_rpc_error(
                     ws,
                     Some(id),
-                    runtime_unavailable_error(format!(
-                        "No ProfileRuntime registered for profile '{}'. \
-                     Set up the profile with an API key in the dashboard.",
+                    runtime_unavailable_error(profile_runtime_unavailable_message(
+                        state,
                         active_profile_id.as_deref().unwrap_or("<unset>"),
                     )),
                 );
@@ -16250,9 +16284,8 @@ async fn handle_turn_start_with_accept(
             let _ = send_rpc_error(
                 ws,
                 Some(id),
-                runtime_unavailable_error(format!(
-                    "No ProfileRuntime registered for profile '{}'. \
-                     Set up the profile with an API key in the dashboard.",
+                runtime_unavailable_error(profile_runtime_unavailable_message(
+                    state,
                     active_profile_id.as_deref().unwrap_or("<unset>"),
                 )),
             );
@@ -23411,46 +23444,45 @@ async fn run_native_code_review_turn(
         .profile_id()
         .map(ToOwned::to_owned)
         .or(routed_profile_id.clone());
-    let profile_runtime = match ensure_session_profile_runtime(&state, active_profile_id.as_deref())
-        .await
-    {
-        Ok(Some(runtime)) => runtime,
-        Ok(None) => {
-            let message = format!(
-                "No ProfileRuntime registered for profile '{}'. Set up the profile with an API key in the dashboard.",
-                active_profile_id.as_deref().unwrap_or("<unset>"),
-            );
-            try_emit_terminal(
-                &turn_state,
-                TerminalReason::Errored,
-                &ws,
-                &ledger,
-                &session_id,
-                &turn_id,
-                Some(("runtime_unavailable", message.as_str())),
-                None,
-            )
-            .await;
-            contracts.scopes.evict_turn(&session_id, &turn_id);
-            return;
-        }
-        Err(error) => {
-            let message = error.message.clone();
-            try_emit_terminal(
-                &turn_state,
-                TerminalReason::Errored,
-                &ws,
-                &ledger,
-                &session_id,
-                &turn_id,
-                Some(("runtime_unavailable", message.as_str())),
-                None,
-            )
-            .await;
-            contracts.scopes.evict_turn(&session_id, &turn_id);
-            return;
-        }
-    };
+    let profile_runtime =
+        match ensure_session_profile_runtime(&state, active_profile_id.as_deref()).await {
+            Ok(Some(runtime)) => runtime,
+            Ok(None) => {
+                let message = profile_runtime_unavailable_message(
+                    &state,
+                    active_profile_id.as_deref().unwrap_or("<unset>"),
+                );
+                try_emit_terminal(
+                    &turn_state,
+                    TerminalReason::Errored,
+                    &ws,
+                    &ledger,
+                    &session_id,
+                    &turn_id,
+                    Some(("runtime_unavailable", message.as_str())),
+                    None,
+                )
+                .await;
+                contracts.scopes.evict_turn(&session_id, &turn_id);
+                return;
+            }
+            Err(error) => {
+                let message = error.message.clone();
+                try_emit_terminal(
+                    &turn_state,
+                    TerminalReason::Errored,
+                    &ws,
+                    &ledger,
+                    &session_id,
+                    &turn_id,
+                    Some(("runtime_unavailable", message.as_str())),
+                    None,
+                )
+                .await;
+                contracts.scopes.evict_turn(&session_id, &turn_id);
+                return;
+            }
+        };
     let hint = session_workspaces().get(&session_id);
     let permissions_epoch = state.session_cache.session_generation(&session_id);
     let permissions = match effective_permissions_for_session(&state, &session_id) {
@@ -25192,9 +25224,8 @@ async fn run_standalone_turn(
     let Some(profile_runtime) =
         resolve_session_profile_runtime(&state, active_profile_id.as_deref())
     else {
-        let error = format!(
-            "No ProfileRuntime registered for profile '{}'. \
-             Set up the profile with an API key in the dashboard.",
+        let error = profile_runtime_unavailable_message(
+            &state,
             active_profile_id.as_deref().unwrap_or("<unset>"),
         );
         try_emit_terminal(
