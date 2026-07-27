@@ -2157,7 +2157,7 @@ fn staged_peer_dir(peers_root: &Path, slug: &str) -> Option<PathBuf> {
     if meta.file_type().is_symlink() || !meta.is_dir() {
         return None;
     }
-    if !dir.join("brief.md").is_file() {
+    if !peer_io::peer_regular_file_exists(&dir, "brief.md") {
         return None;
     }
     Some(dir)
@@ -2238,6 +2238,25 @@ mod peer_io {
         imp::append_peer_line(peer_dir, leaf, line)
     }
 
+    /// `true` when the peer leaf exists as a REGULAR file, resolved under the
+    /// peer dir fd with a no-follow stat (`S_ISREG` required). A symlinked/FIFO/
+    /// dir/device leaf — or a symlinked peer dir — reads as absent. Replaces the
+    /// path-following `dir.join(leaf).is_file()` status probes so an existence
+    /// gate (e.g. the `closed` close-marker) can't be redirected by a parent- or
+    /// leaf-swap (#1824).
+    pub(super) fn peer_regular_file_exists(peer_dir: &Path, leaf: &str) -> bool {
+        imp::peer_file_mtime(peer_dir, leaf).is_some()
+    }
+
+    /// The mtime of a peer leaf REGULAR file, resolved under the peer dir fd
+    /// with the same no-follow `S_ISREG` gate as [`peer_regular_file_exists`].
+    /// `None` for a symlinked/FIFO/dir leaf, a symlinked peer dir, or a stat
+    /// error. Used where the mtime AFFECTS behavior (the ready-note freshness
+    /// gate), so a swapped leaf can neither park nor mislead it.
+    pub(super) fn peer_file_mtime(peer_dir: &Path, leaf: &str) -> Option<std::time::SystemTime> {
+        imp::peer_file_mtime(peer_dir, leaf)
+    }
+
     #[cfg(unix)]
     mod imp {
         use std::io::{Read, Write};
@@ -2245,7 +2264,7 @@ mod peer_io {
         use std::os::unix::fs::OpenOptionsExt;
         use std::path::Path;
 
-        use rustix::fs::{AtFlags, Mode, OFlags, openat, renameat, unlinkat};
+        use rustix::fs::{AtFlags, Mode, OFlags, fsync, openat, renameat, unlinkat};
 
         /// Open the peer dir as an `O_NOFOLLOW|O_DIRECTORY` fd: a symlinked
         /// `<slug>` is refused here (belt-and-braces over `staged_peer_dir`'s
@@ -2323,6 +2342,9 @@ mod peer_io {
                 let _ = unlinkat(&dir, tmp.as_str(), AtFlags::empty());
                 return Err(err.into());
             }
+            // Best-effort dir fsync so the rename entry itself is crash-durable
+            // (the tmp file's data was already fsync'd above).
+            let _ = fsync(&dir);
             Ok(())
         }
 
@@ -2357,6 +2379,28 @@ mod peer_io {
                 ));
             }
             file.write_all(line.as_bytes())
+        }
+
+        pub(super) fn peer_file_mtime(
+            peer_dir: &Path,
+            leaf: &str,
+        ) -> Option<std::time::SystemTime> {
+            let dir = open_peer_dir(peer_dir).ok()?;
+            // Anchored no-follow open + fstat (NONBLOCK so a planted FIFO can't
+            // park the probe); regular files only, then read the mtime off the
+            // opened handle. No content is read.
+            let fd = openat(
+                &dir,
+                leaf,
+                OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK,
+                Mode::empty(),
+            )
+            .ok()?;
+            let meta = std::fs::File::from(fd).metadata().ok()?;
+            if !meta.is_file() {
+                return None;
+            }
+            meta.modified().ok()
         }
     }
 
@@ -2461,6 +2505,20 @@ mod peer_io {
                 .open(&path)?;
             file.write_all(line.as_bytes())
         }
+
+        pub(super) fn peer_file_mtime(
+            peer_dir: &Path,
+            leaf: &str,
+        ) -> Option<std::time::SystemTime> {
+            if !peer_dir_ok(peer_dir) {
+                return None;
+            }
+            let meta = std::fs::symlink_metadata(peer_dir.join(leaf)).ok()?;
+            if meta.file_type().is_symlink() || !meta.is_file() {
+                return None;
+            }
+            meta.modified().ok()
+        }
     }
 }
 
@@ -2470,8 +2528,8 @@ mod peer_io_tests {
     use std::time::Duration;
 
     use super::peer_io::{
-        PEER_FILE_READ_CAP_LARGE, PEER_FILE_READ_CAP_SMALL, append_peer_line, read_peer_file,
-        write_peer_file_atomic,
+        PEER_FILE_READ_CAP_LARGE, PEER_FILE_READ_CAP_SMALL, append_peer_line, peer_file_mtime,
+        peer_regular_file_exists, read_peer_file, write_peer_file_atomic,
     };
 
     // octos#1824: a symlinked leaf must NOT be followed — the anchored openat
@@ -2621,6 +2679,90 @@ mod peer_io_tests {
         );
         assert_eq!(std::fs::read_to_string(&other).unwrap(), "untouched");
     }
+
+    // octos#1824 status probes: the anchored existence/mtime gate counts only
+    // REGULAR files — a symlinked or FIFO leaf (or absent) is not "present".
+    #[test]
+    fn peer_regular_file_exists_gates_on_regular_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let peer = dir.path();
+        // Regular file → present, with a readable mtime.
+        std::fs::write(peer.join("closed"), "x").unwrap();
+        assert!(peer_regular_file_exists(peer, "closed"));
+        assert!(peer_file_mtime(peer, "closed").is_some());
+        // Absent → not present.
+        assert!(!peer_regular_file_exists(peer, "result.md"));
+        assert!(peer_file_mtime(peer, "result.md").is_none());
+        // Symlinked leaf → not present (not followed), even to a real file.
+        std::fs::write(peer.join("target"), "y").unwrap();
+        std::os::unix::fs::symlink("target", peer.join("result.md")).unwrap();
+        assert!(!peer_regular_file_exists(peer, "result.md"));
+        assert!(peer_file_mtime(peer, "result.md").is_none());
+        // FIFO leaf → not present, PROMPTLY (NONBLOCK open + regular-file
+        // reject); a blocking probe would trip the timeout.
+        let status = std::process::Command::new("mkfifo")
+            .arg(peer.join("fifo"))
+            .status()
+            .expect("mkfifo");
+        assert!(status.success());
+        let peer_buf = peer.to_path_buf();
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(peer_regular_file_exists(&peer_buf, "fifo"));
+        });
+        let got = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("existence probe must not block on a FIFO leaf");
+        assert!(!got, "a FIFO leaf must not count as a regular file");
+    }
+
+    // octos#1824 `.notified` freshness stamp: round-trips through the anchored
+    // helpers, and neither read nor write follows a symlinked leaf.
+    #[test]
+    fn notified_stamp_round_trips_and_refuses_symlinked_leaf() {
+        let dir = tempfile::tempdir().unwrap();
+        let peer = dir.path();
+        write_peer_file_atomic(peer, ".notified", "1700000000").unwrap();
+        assert_eq!(
+            read_peer_file(peer, ".notified", PEER_FILE_READ_CAP_SMALL).as_deref(),
+            Some("1700000000")
+        );
+
+        // Plant a symlinked `.notified` pointing OUTSIDE the peer dir.
+        let outside = dir.path().join("outside");
+        std::fs::write(&outside, "original").unwrap();
+        std::fs::remove_file(peer.join(".notified")).unwrap();
+        std::os::unix::fs::symlink(&outside, peer.join(".notified")).unwrap();
+
+        // Read refuses to follow it.
+        assert_eq!(
+            read_peer_file(peer, ".notified", PEER_FILE_READ_CAP_SMALL),
+            None,
+            "a symlinked `.notified` must not be followed on read"
+        );
+        // Write does not follow it either: renameat REPLACES the symlink with a
+        // fresh regular file, so the target outside the peer dir is untouched.
+        write_peer_file_atomic(peer, ".notified", "9999").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&outside).unwrap(),
+            "original",
+            "the stamp write must not reach the symlink target"
+        );
+        assert_eq!(
+            read_peer_file(peer, ".notified", PEER_FILE_READ_CAP_SMALL).as_deref(),
+            Some("9999"),
+            "after replacing the symlink the stamp reads back its new value"
+        );
+        assert!(
+            !peer
+                .join(".notified")
+                .symlink_metadata()
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the symlink must have been replaced by a regular file"
+        );
+    }
 }
 
 /// `true` when `peers/<slug>/closed` exists — the durable marker written by
@@ -2630,7 +2772,8 @@ mod peer_io_tests {
 /// Routes through [`staged_peer_dir`] so a symlinked / unsafe slug is never
 /// followed.
 fn peer_is_closed(peers_root: &Path, slug: &str) -> bool {
-    staged_peer_dir(peers_root, slug).is_some_and(|dir| dir.join("closed").is_file())
+    staged_peer_dir(peers_root, slug)
+        .is_some_and(|dir| peer_io::peer_regular_file_exists(&dir, "closed"))
 }
 
 /// Resolve a peer IDENTIFIER (its display NAME or its slug) to the slug. A name
@@ -11371,12 +11514,9 @@ fn read_peer_blackboard(peers_root: &Path, slugs: Option<&[String]>) -> Vec<Peer
             else {
                 continue;
             };
-            let result_path = dir.join("result.md");
             let result =
                 peer_io::read_peer_file(&dir, "result.md", peer_io::PEER_FILE_READ_CAP_LARGE);
-            let result_updated_unix = std::fs::metadata(&result_path)
-                .ok()
-                .and_then(|meta| meta.modified().ok())
+            let result_updated_unix = peer_io::peer_file_mtime(&dir, "result.md")
                 .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
                 .map(|elapsed| elapsed.as_secs());
             let (brief, brief_truncated) = capped_utf8(brief, PEER_GATHER_BRIEF_CAP);
@@ -11402,7 +11542,7 @@ fn read_peer_blackboard(peers_root: &Path, slugs: Option<&[String]>) -> Vec<Peer
                 result_truncated,
                 result_updated_unix,
                 has_worktree: dir.join("wt").is_dir(),
-                closed: dir.join("closed").is_file(),
+                closed: peer_io::peer_regular_file_exists(&dir, "closed"),
                 turn_history: parse_peer_turns_index(&dir),
                 // #peer-model — the recorded model lane, if any (fd-anchored
                 // no-follow read so a symlinked/FIFO `model` leaf is refused;
@@ -11789,26 +11929,26 @@ fn peer_results_ready_note(peers_root: &Path, session_id: &SessionKey) -> Option
     let mut dirs: Vec<_> = read_dir.flatten().collect();
     dirs.sort_by_key(|entry| entry.file_name());
     let session = session_id.to_string();
-    // (slug, stamp path, result mtime) per ready peer.
+    // (slug, peer dir, result mtime) per ready peer. The peer dir is carried so
+    // the `.notified` stamp write below anchors on it (never a bare path).
     let mut ready: Vec<(String, PathBuf, u64)> = Vec::new();
     for entry in dirs {
         let slug = entry.file_name().to_string_lossy().into_owned();
         let Some(dir) = staged_peer_dir(peers_root, &slug) else {
             continue;
         };
-        // Stat-first: no result file means nothing to announce, skip
-        // before touching any other file.
-        let Some(result_mtime) = std::fs::metadata(dir.join("result.md"))
-            .ok()
-            .and_then(|meta| meta.modified().ok())
+        // Stat-first (anchored mtime): no result file means nothing to
+        // announce, skip before touching any other file.
+        let Some(result_mtime) = peer_io::peer_file_mtime(&dir, "result.md")
             .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
             .map(|elapsed| elapsed.as_secs())
         else {
             continue;
         };
-        let stamp_path = dir.join(".notified");
-        let covered = std::fs::read_to_string(&stamp_path)
-            .ok()
+        // The `.notified` freshness stamp is per-slug — a FIFO here would park
+        // this ready-note path, and a leaf swap could feed a bogus cursor; read
+        // it through the anchored no-follow/regular-file helper (#1824).
+        let covered = peer_io::read_peer_file(&dir, ".notified", peer_io::PEER_FILE_READ_CAP_SMALL)
             .and_then(|stamp| stamp.trim().parse::<u64>().ok());
         if covered.is_some_and(|covered| covered >= result_mtime) {
             continue;
@@ -11821,7 +11961,7 @@ fn peer_results_ready_note(peers_root: &Path, session_id: &SessionKey) -> Option
         if originator.trim() != session {
             continue;
         }
-        ready.push((slug, stamp_path, result_mtime));
+        ready.push((slug, dir, result_mtime));
     }
     if ready.is_empty() {
         return None;
@@ -11829,9 +11969,9 @@ fn peer_results_ready_note(peers_root: &Path, session_id: &SessionKey) -> Option
     // Stamp EVERY peer the note covers — the "+N more" ones included: the
     // note tells the model results are ready and `peer_gather` reads them
     // all. Best-effort; a failed stamp only risks one repeat nudge.
-    for (_, stamp_path, result_mtime) in &ready {
+    for (_, dir, result_mtime) in &ready {
         if let Err(err) =
-            crate::memory_consolidate::apply::atomic_write(stamp_path, &result_mtime.to_string())
+            peer_io::write_peer_file_atomic(dir, ".notified", &result_mtime.to_string())
         {
             tracing::warn!(?err, "failed to write peer .notified stamp");
         }
@@ -12016,7 +12156,7 @@ fn collect_owned_peer_results(peers_root: &Path, master: &str) -> Option<Vec<(St
             continue;
         };
         // Retired peer: neither blocks nor keeps the fleet alive.
-        if dir.join("closed").is_file() {
+        if peer_io::peer_regular_file_exists(&dir, "closed") {
             continue;
         }
         // Originator gate — only peers THIS master staged. After the atomic
@@ -12031,7 +12171,7 @@ fn collect_owned_peer_results(peers_root: &Path, master: &str) -> Option<Vec<(St
         if originator.trim() != master {
             continue;
         }
-        owned.push((slug, dir.join("result.md").is_file()));
+        owned.push((slug, peer_io::peer_regular_file_exists(&dir, "result.md")));
     }
     Some(owned)
 }
