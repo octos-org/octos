@@ -34,6 +34,7 @@ members = [
     "crates/octos-embed-llama",
     "crates/octos-ffi",
     "crates/octos-uniffi",
+    "crates/octos-wasm",
 ]
 
 [workspace.package]

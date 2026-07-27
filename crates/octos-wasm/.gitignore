@@ -1,0 +1,4 @@
+# wasm-pack build output — never commit generated artifacts.
+/pkg/
+/target/
+*.wasm
