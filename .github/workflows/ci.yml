@@ -570,21 +570,9 @@ jobs:
     # ~15 min it is the cheapest job in the matrix covering code no other PR
     # check can even see.
     #
-    # NON-BLOCKING for now, because it is currently RED for a pre-existing
-    # reason: `octos-core` `session_scope` has 2 Windows-only test failures
-    # (5-for-5 on recent `main` runs, long before this job moved to PRs).
-    # Making it blocking today would wedge every PR on a bug it did not
-    # introduce. It still surfaces on the PR, which is the point — a NEW
-    # Windows break is now visible at review time instead of after merge.
-    #
-    # Non-blocking ONLY on PRs. On push to `main` it stays hard-failing, so
-    # `build-windows` (which `needs:` this job) still refuses to ship a Windows
-    # artifact from a red suite — a blanket `continue-on-error: true` would have
-    # silently re-enabled those releases.
-    #
-    # Drop this line entirely once the two tests are fixed; see the tracking
-    # note in `crates/octos-core/src/session_scope.rs`.
-    continue-on-error: ${{ github.event_name == 'pull_request' }}
+    # This is blocking on PRs now that the pre-existing `session_scope`
+    # canonical-path failures are fixed. Keep it blocking so Windows-only
+    # regressions cannot merge unseen.
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v6
