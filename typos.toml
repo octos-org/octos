@@ -55,6 +55,8 @@ strng = "strng"
 # Basic Regular Expression — referenced in slides validator spec comments
 # explaining the regex escape behavior for find -name patterns.
 BRE = "BRE"
+# POSIX open(2) flag (O_WRONLY), not a misspelling of "wrongly"
+WRONLY = "WRONLY"
 
 [files]
 extend-exclude = ["**/*.js", "**/*.css", "**/*.html", "examples/*/static/**/*.*"]
