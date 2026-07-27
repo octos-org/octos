@@ -66,6 +66,7 @@ use octos_llm::{
 };
 use octos_memory::EpisodeStore;
 
+#[cfg(unix)]
 use crate::plugins::PluginTool;
 use crate::{AgentConfig, AgentVerifierConfig};
 
@@ -499,11 +500,14 @@ impl LlmProvider for GateVerifier {
         "mock-verifier"
     }
 }
+#[cfg(unix)]
 use crate::plugins::manifest::PluginToolDef;
 use crate::prompt_context::{
     PromptContextManager, PromptContextPhase, PromptContextReport, PromptContextRequest,
 };
-use crate::tools::{Tool, ToolRegistry, ToolResult, TurnAttachmentContext};
+#[cfg(unix)]
+use crate::tools::TurnAttachmentContext;
+use crate::tools::{Tool, ToolRegistry, ToolResult};
 
 struct FilesToSendOnlyTool {
     file_path: PathBuf,
@@ -942,10 +946,12 @@ impl LlmProvider for PodcastGenerateTwiceProvider {
     }
 }
 
+#[cfg(unix)]
 struct ConsecutiveVoiceSaveProvider {
     calls: AtomicUsize,
 }
 
+#[cfg(unix)]
 #[async_trait]
 impl LlmProvider for ConsecutiveVoiceSaveProvider {
     async fn chat(
@@ -5375,11 +5381,13 @@ async fn should_not_emit_turn_failure_when_hook_denies_llm_call_under_failfast()
 /// Records the message contents of every LLM call and returns EndTurn
 /// immediately. Used to assert what the model actually saw and that it was
 /// (or was not) called at all.
+#[cfg(unix)]
 struct RecordingEndProvider {
     chat_calls: Arc<AtomicUsize>,
     observed: Arc<StdMutex<Vec<Vec<String>>>>,
 }
 
+#[cfg(unix)]
 #[async_trait]
 impl LlmProvider for RecordingEndProvider {
     async fn chat(

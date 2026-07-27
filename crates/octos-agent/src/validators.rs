@@ -50,6 +50,7 @@ const DEFAULT_COMMAND_TIMEOUT_MS: u64 = 30_000;
 /// stalling the whole contract gate.
 const DEFAULT_HTTP_PROBE_TIMEOUT_MS: u64 = 5_000;
 const MAX_EVIDENCE_BYTES: usize = 512 * 1024;
+#[cfg(unix)]
 const KILL_GRACE_PERIOD: Duration = Duration::from_millis(300);
 
 /// Default ominix-api URL when the `OMINIX_API_URL` env override is absent.

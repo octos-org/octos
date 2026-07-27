@@ -1239,9 +1239,11 @@ mod tests {
     use crate::profiles::{
         GatewaySettings, LlmModelSelectionConfig, LlmProfileConfig, LlmRouteConfig, ProfileConfig,
     };
+    #[cfg(unix)]
     use crate::runtime::SessionRuntime;
     use chrono::Utc;
     use octos_agent::SandboxConfig;
+    #[cfg(unix)]
     use octos_core::SessionKey;
     use std::collections::HashMap;
 

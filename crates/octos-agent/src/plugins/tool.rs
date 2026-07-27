@@ -229,7 +229,10 @@ impl PluginTool {
 
     /// The plugin's own execution timeout (seconds-resolution `Duration`).
     /// Exposed for the loader tests to assert the manifest-timeout clamp.
-    #[cfg(test)]
+    /// Its only callers are `#[cfg(unix)]` loader tests (they chmod +x a
+    /// real shell script), so this accessor must match their gating or it's
+    /// dead code on Windows.
+    #[cfg(all(test, unix))]
     pub(crate) fn timeout(&self) -> Duration {
         self.timeout
     }
