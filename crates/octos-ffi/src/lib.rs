@@ -183,20 +183,39 @@ fn canonical_provider_name(provider: &str) -> String {
 /// process var of the same name — `env_vars` is checked before process env).
 const PINNED_KEY_ENV: &str = "OCTOS_FFI_RESOLVED_KEY";
 
-/// Pin a once-resolved effective key into `cli_cfg` so the provider factory's
-/// own `get_api_key` returns THIS exact value deterministically — from
-/// `env_vars`, with the auth store bypassed — instead of performing a SECOND
+/// Pin the once-resolved effective key into `cli_cfg` so the provider factory's
+/// own `get_api_key` is FULLY determined here — never a SECOND
 /// AuthStore/process-env resolution that a mid-flight credential rotation could
-/// make disagree with the value we captured for `secret`. No-op when nothing
-/// resolved (the factory then fails on a genuinely missing required key, as
-/// before).
+/// make disagree with the value we captured for `secret`.
+///
+/// Both cases are pinned deterministically: `api_key_env` always points at the
+/// synthetic [`PINNED_KEY_ENV`] and the auth store is always bypassed.
+/// * `Some(key)` — served from `env_vars`, so the factory builds with exactly
+///   this value.
+/// * `None` — the pinned var is left ABSENT, so the factory also resolves to
+///   `None` (no key at init ⇒ the factory sees no key, consistently). A key
+///   added to the auth store / a real provider env var BETWEEN the single
+///   resolution and provider construction is thus never picked up while
+///   `secret` stays `None`; `runtime_new` fails cleanly if a key was required.
+///
+/// NOTE: the key is served through octos's normal `env_vars` value resolution,
+/// so a literal value beginning with `keychain:` is interpreted as a keychain
+/// reference (octos's secret-indirection convention), not used verbatim — see
+/// the credentials note in README.md. Don't pass a raw key starting with
+/// `keychain:`.
 fn pin_resolved_key(cli_cfg: &mut Config, resolved: Option<&str>) {
-    if let Some(key) = resolved {
-        cli_cfg.api_key_env = Some(PINNED_KEY_ENV.to_string());
-        cli_cfg
-            .env_vars
-            .insert(PINNED_KEY_ENV.to_string(), key.to_string());
-        cli_cfg.bypass_auth_store = true;
+    cli_cfg.api_key_env = Some(PINNED_KEY_ENV.to_string());
+    cli_cfg.bypass_auth_store = true;
+    match resolved {
+        Some(key) => {
+            cli_cfg
+                .env_vars
+                .insert(PINNED_KEY_ENV.to_string(), key.to_string());
+        }
+        None => {
+            // Leave the pinned var absent so the factory's lookup yields None.
+            cli_cfg.env_vars.remove(PINNED_KEY_ENV);
+        }
     }
 }
 
@@ -905,5 +924,23 @@ mod tests {
         let rt = unsafe { &*raw };
         assert_eq!(rt.secret.as_deref(), Some("pinme-key-123"));
         octos_runtime_free(raw);
+    }
+
+    #[test]
+    fn pin_none_makes_factory_resolution_none_deterministically() {
+        // resolved == None must be pinned too: the factory's get_api_key resolves
+        // to None as well, and a key added AFTER the single resolution (simulated
+        // by a real provider key already sitting in env_vars) is NOT picked up —
+        // no mid-init race where the factory sees a key while rt.secret is None.
+        let mut cli_cfg: Config = serde_json::from_str("{}").unwrap();
+        cli_cfg
+            .env_vars
+            .insert("OPENAI_API_KEY".to_string(), "late-added-key".to_string());
+
+        pin_resolved_key(&mut cli_cfg, None);
+
+        // api_key_env now points at the (absent) pinned var and the auth store is
+        // bypassed, so the natural OPENAI_API_KEY entry is ignored -> None.
+        assert!(cli_cfg.get_api_key("openai").is_err());
     }
 }

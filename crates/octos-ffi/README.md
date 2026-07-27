@@ -94,7 +94,14 @@ Resolution reuses octos's `Config`. An **explicitly-passed `api_key` (or
 `octos auth login` AuthStore for that call, so a host that happens to be logged
 in cannot silently shadow the caller's key. If you supply neither, resolution
 falls back to the conventional `{PROVIDER}_API_KEY` process env var and the
-AuthStore, in that order.
+AuthStore, in that order. The key is resolved exactly once and pinned so the
+provider is built with that same value (no second, possibly-rotated read).
+
+> **Do not supply a raw API key that begins with `keychain:`.** The resolved key
+> is pinned into the config's `env_vars`, which octos then passes through its
+> normal value resolution — so a value beginning with `keychain:` is interpreted
+> as a keychain *reference* (octos's standard secret-indirection convention),
+> not used verbatim. This is inherent to octos's config model, not FFI-specific.
 
 ### Security: provider error logging
 
