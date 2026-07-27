@@ -5043,6 +5043,25 @@ impl octos_agent::ToolApprovalRequester for UiProtocolApprovalRequester {
         // peer_respond read authoritatively. Nothing is written to the peer's
         // filesystem here, so a peer can never park invisibly on an fs failure.
 
+        // #peer-awaiting-wake — the peer is now GENUINELY parked (its pending
+        // oneshot is registered by `request_runtime` above). WAKE its originator
+        // (master) with an autonomous continuation so an IDLE master is notified
+        // to answer it via peer_list → peer_respond, instead of only discovering
+        // the block if it happens to be taking turns. This runs ONLY on the real
+        // park path: the scope-policy AUTO-RESOLVE short-circuit returned far
+        // above (before `request_runtime`), so an auto-approved request never
+        // reaches here and never wakes the master. No-op for a non-peer session
+        // or an unresolvable originator. The enqueue is a quick scheduler push —
+        // it does NOT block; we await `response_rx` below exactly as before, and
+        // the woken master resolves that oneshot from a different task.
+        wake_master_on_peer_awaiting_input(
+            self.state.as_ref(),
+            &self.session_id,
+            &approval_id.0.to_string(),
+            PeerPendingKind::Approval,
+            &peer_pending_prompt_summary(&event.title, &event.body),
+        );
+
         // Approvals are durable: if the WS drop strands the request, the
         // ledger still records it and the client can rehydrate.
         if let Err(err) = send_notification_durable(
@@ -5219,6 +5238,10 @@ struct SessionUserQuestionRequester {
     ws: WsConnection,
     ledger: Arc<UiProtocolLedger>,
     contracts: Arc<UiProtocolContractStores>,
+    /// #peer-awaiting-wake — held so a peer parking on a question can resolve
+    /// its `peers/<slug>/originator` (via `state.profiles`) and WAKE the master.
+    /// (The approval requester already holds `state`; this mirrors it.)
+    state: Arc<AppState>,
     session_id: SessionKey,
     turn_id: TurnId,
 }
@@ -5323,6 +5346,23 @@ impl octos_agent::UserQuestionRequester for SessionUserQuestionRequester {
         // which peer_list / peer_respond read authoritatively. No peer-filesystem
         // write happens here, so an OPEN peer can never park invisibly. (A closed
         // peer that re-parks is the documented close-while-parked exception.)
+
+        // #peer-awaiting-wake — the peer is now GENUINELY parked (its pending
+        // oneshot is registered by `request_runtime` above). WAKE its originator
+        // (master) so an IDLE master is notified to answer via peer_list →
+        // peer_respond. Unlike the approval requester there is no auto-resolve
+        // short-circuit for questions — every question genuinely parks — so the
+        // wake fires for each. No-op for a non-peer session or an unresolvable
+        // originator. The enqueue does NOT block; we await `response_rx` below
+        // exactly as before, and the woken master resolves it from a different
+        // task.
+        wake_master_on_peer_awaiting_input(
+            self.state.as_ref(),
+            &self.session_id,
+            &question_id.0.to_string(),
+            PeerPendingKind::Question,
+            &peer_pending_prompt_summary(&event.title, &event.body),
+        );
 
         // The event is durable: if the WS drop strands the request, the ledger
         // still records it and a reconnecting client can rehydrate. We cancel
@@ -11726,6 +11766,469 @@ fn peer_pending_summaries(
     questions.sort_by(|a, b| a.id.cmp(&b.id));
     approvals.append(&mut questions);
     approvals
+}
+
+/// Outcome of a peer awaiting-input WAKE attempt — a test-visible summary of
+/// whether (and why) the master was notified. `Woke`/`AlreadyQueued` mean a peer
+/// genuinely parked; the rest are the fail-closed no-wake reasons.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PeerAwaitingWakeOutcome {
+    /// A wake continuation was newly enqueued on the master (originator).
+    Woke,
+    /// The wake collapsed onto an already-queued wake for the SAME park (same
+    /// pending id) — the master is already scheduled to handle it.
+    AlreadyQueued,
+    /// The parking session is not a peer session (topic is not `peer-<slug>`),
+    /// so there is no master to notify — a non-peer park never wakes anyone.
+    NotPeer,
+    /// The peer is not staged / not resolvable under `peers/` — no wake.
+    NoStagedPeer,
+    /// The peer has no recorded `originator` (master). Fail-closed: no wake.
+    NoOriginator,
+    /// The recorded `originator` is present but not a LEGITIMATE master session
+    /// — wrong/absent profile, or itself a peer session (a peer can never answer
+    /// via `peer_respond` under the depth-1 guard). Fail-closed: no wake, so a
+    /// malformed/hostile originator can never strand a continuation on the wrong
+    /// or an unanswerable session.
+    InvalidOriginator,
+}
+
+/// Short, single-line summary of what a peer is blocked on, for the wake nudge.
+/// Collapses all whitespace and caps length — the master reads the AUTHORITATIVE
+/// parked set via `peer_list`, so this is only a hint (and peer-supplied
+/// title/body is untrusted display text that must not blow up the prompt).
+fn peer_awaiting_wake_prompt_summary(prompt: &str) -> String {
+    const WAKE_PROMPT_SUMMARY_CAP: usize = 160;
+    let one_line = prompt.split_whitespace().collect::<Vec<_>>().join(" ");
+    capped_utf8(one_line, WAKE_PROMPT_SUMMARY_CAP).0
+}
+
+/// #peer-awaiting-wake CORE — enqueue an AUTONOMOUS master continuation that
+/// WAKES the peer's originator (master) the moment the peer PARKS on an
+/// approval/question (becomes genuinely `awaiting_input`). Resolves the peer's
+/// slug/profile from `peer_session`, reads the recorded `originator` from
+/// `peers/<slug>/originator` (the SAME source `peer_send_input`/`peer_respond`
+/// authorize against — symlink-safe via [`staged_peer_dir`]), VALIDATES it is a
+/// legitimate master session (right profile, not itself a peer), and pushes ONE
+/// [`PEER_AWAITING_INPUT_EXTERNAL_KIND`] continuation onto that master through
+/// the SAME scheduler `peer_fleet_synthesis` uses. Filesystem-only +
+/// `AppState`-free, so it is unit-testable with a tempdir.
+///
+/// The enqueue is a quick, non-blocking scheduler push: the caller (a park-point
+/// requester) awaits its own oneshot as normal, and the woken master resolves it
+/// from a DIFFERENT task via `peer_respond`. The scheduler's `is_idle_eligible`
+/// gate (checked at drain) means the wake never fires while the MASTER itself is
+/// mid-turn or blocked on its own input/approval.
+fn enqueue_peer_awaiting_input_wake(
+    peers_root: &Path,
+    peer_session: &SessionKey,
+    pending_id: &str,
+    park_kind: PeerPendingKind,
+    prompt: &str,
+) -> PeerAwaitingWakeOutcome {
+    // ONLY a peer session parks a peer. A non-peer (e.g. the master's OWN)
+    // session parking must never wake anyone.
+    let Some((profile_id, slug)) = peer_slug_and_profile(peer_session) else {
+        return PeerAwaitingWakeOutcome::NotPeer;
+    };
+    // Route the originator read through `staged_peer_dir` so a hostile/stray
+    // `peers/<slug>` symlink can never redirect the read outside `peers_root`.
+    let Some(peer_dir) = staged_peer_dir(peers_root, slug) else {
+        return PeerAwaitingWakeOutcome::NoStagedPeer;
+    };
+    let Some(master) =
+        peer_io::read_peer_file(&peer_dir, "originator", peer_io::PEER_FILE_READ_CAP_SMALL)
+    else {
+        return PeerAwaitingWakeOutcome::NoOriginator;
+    };
+    let master = master.trim();
+    if master.is_empty() {
+        return PeerAwaitingWakeOutcome::NoOriginator;
+    }
+    let master_key = SessionKey(master.to_owned());
+    // VALIDATE the recorded originator is a legitimate MASTER session before
+    // targeting a wake at it — never trust the string blindly. `peer/prepare`
+    // writes its supplied `session_id` verbatim as the `originator`, so it can be
+    // malformed, wrong-profile, or itself a PEER session. Treat it as an
+    // authorization locator (exactly as `peer_respond`/`peer_send_input` do), not
+    // a blind target: require a profile that EQUALS the peer's (peers run under
+    // their master's profile) AND a topic that is NOT a peer topic — a peer can
+    // NEVER answer via `peer_respond` (depth-1 guard), so a wake aimed at one
+    // would strand the blocked peer, and a wrong-profile/garbage value would
+    // strand a continuation on the wrong or a nonexistent session. Any failure →
+    // skip silently, exactly like a missing originator (the peer just emits no
+    // wake). The `peer-` prefix is checked on the RAW topic (not
+    // `peer_slug_and_profile`, which also gates slug safety) so even a malformed
+    // `peer-<unsafe>` originator topic is rejected.
+    if master_key.profile_id() != Some(profile_id)
+        || master_key
+            .topic()
+            .is_some_and(|topic| topic.starts_with("peer-"))
+    {
+        return PeerAwaitingWakeOutcome::InvalidOriginator;
+    }
+    let summary = peer_awaiting_wake_prompt_summary(prompt);
+    let outcome = default_agent_orchestrator().enqueue_peer_awaiting_input_continuation(
+        &master_key,
+        profile_id,
+        slug,
+        pending_id,
+        park_kind.as_str(),
+        &summary,
+    );
+    if outcome.is_duplicate() {
+        PeerAwaitingWakeOutcome::AlreadyQueued
+    } else {
+        tracing::debug!(
+            master = %master_key,
+            profile = profile_id,
+            slug,
+            kind = park_kind.as_str(),
+            "peer parked on input — enqueued autonomous wake on master",
+        );
+        PeerAwaitingWakeOutcome::Woke
+    }
+}
+
+/// Resolve the peer's `peers_root` from `state.profiles` and enqueue the
+/// awaiting-input wake on its originator. The thin `AppState` seam over
+/// [`enqueue_peer_awaiting_input_wake`] that the park-point requesters call.
+/// No-op for a non-peer session or an unregistered profile.
+fn wake_master_on_peer_awaiting_input(
+    state: &AppState,
+    peer_session: &SessionKey,
+    pending_id: &str,
+    park_kind: PeerPendingKind,
+    prompt: &str,
+) {
+    let Some((profile_id, _slug)) = peer_slug_and_profile(peer_session) else {
+        return;
+    };
+    let Some(runtime) = state.profiles.get(profile_id) else {
+        return;
+    };
+    let peers_root = runtime.data_dir.join("peers");
+    let _ =
+        enqueue_peer_awaiting_input_wake(&peers_root, peer_session, pending_id, park_kind, prompt);
+}
+
+#[cfg(test)]
+mod peer_awaiting_wake_tests {
+    use super::*;
+    use crate::api::agent_orchestrator::PEER_AWAITING_INPUT_EXTERNAL_KIND;
+
+    /// Stage a peer dir (`<peers_root>/<slug>/` with `brief.md`) and optionally
+    /// record its `originator`. Mirrors the `stage_peer` staging contract that
+    /// `staged_peer_dir` validates.
+    fn stage_peer_with_originator(peers_root: &Path, slug: &str, originator: Option<&str>) {
+        let dir = peers_root.join(slug);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("brief.md"), "do the thing").unwrap();
+        if let Some(originator) = originator {
+            std::fs::write(dir.join("originator"), originator).unwrap();
+        }
+    }
+
+    fn peer_session(profile: &str, chat: &str, slug: &str) -> SessionKey {
+        SessionKey::with_profile_topic(profile, "api", chat, &format!("peer-{slug}"))
+    }
+
+    /// A peer parking on an APPROVAL wakes its originator (master) with a
+    /// continuation carrying the peer slug + `approval` kind.
+    #[test]
+    fn peer_approval_park_wakes_master_on_originator() {
+        let tmp = tempfile::tempdir().unwrap();
+        let peers_root = tmp.path();
+        let profile = "tenant-wake-core-appr";
+        let master = "tenant-wake-core-appr:api:master";
+        stage_peer_with_originator(peers_root, "edison", Some(master));
+
+        let session = peer_session(profile, "edison-wire", "edison");
+        let outcome = enqueue_peer_awaiting_input_wake(
+            peers_root,
+            &session,
+            "approval-1",
+            PeerPendingKind::Approval,
+            "shell: delete build cache",
+        );
+        assert_eq!(outcome, PeerAwaitingWakeOutcome::Woke);
+
+        let orchestrator = default_agent_orchestrator();
+        let master_key = SessionKey(master.to_owned());
+        assert_eq!(
+            orchestrator.pending_continuation_count_for_session_for_test(&master_key, profile),
+            1,
+            "a peer approval park enqueues exactly one wake on its originator",
+        );
+        let drained = orchestrator.drain_ready_continuations_for_session(
+            &master_key,
+            profile,
+            MasterContinuationRuntimeState::idle(),
+            4,
+        );
+        let wake = drained
+            .iter()
+            .find(|c| {
+                matches!(&c.reason, MasterContinuationReason::External(k)
+                    if k == PEER_AWAITING_INPUT_EXTERNAL_KIND)
+            })
+            .expect("the approval wake must be queued on the master");
+        let prompt = master_continuation_prompt(wake);
+        assert!(prompt.contains("edison"), "prompt names the slug: {prompt}");
+        assert!(
+            prompt.contains("approval"),
+            "prompt states the approval kind: {prompt}"
+        );
+        assert!(
+            prompt.contains("peer_list") && prompt.contains("peer_respond"),
+            "prompt directs peer_list/peer_respond: {prompt}"
+        );
+    }
+
+    /// A peer parking on a QUESTION wakes its originator with a `question`-kind
+    /// continuation.
+    #[test]
+    fn peer_question_park_wakes_master_on_originator() {
+        let tmp = tempfile::tempdir().unwrap();
+        let peers_root = tmp.path();
+        let profile = "tenant-wake-core-q";
+        let master = "tenant-wake-core-q:api:master";
+        stage_peer_with_originator(peers_root, "tesla", Some(master));
+
+        let session = peer_session(profile, "tesla-wire", "tesla");
+        let outcome = enqueue_peer_awaiting_input_wake(
+            peers_root,
+            &session,
+            "question-1",
+            PeerPendingKind::Question,
+            "Which region should I deploy to?",
+        );
+        assert_eq!(outcome, PeerAwaitingWakeOutcome::Woke);
+
+        let orchestrator = default_agent_orchestrator();
+        let master_key = SessionKey(master.to_owned());
+        let drained = orchestrator.drain_ready_continuations_for_session(
+            &master_key,
+            profile,
+            MasterContinuationRuntimeState::idle(),
+            4,
+        );
+        let wake = drained
+            .iter()
+            .find(|c| {
+                matches!(&c.reason, MasterContinuationReason::External(k)
+                    if k == PEER_AWAITING_INPUT_EXTERNAL_KIND)
+            })
+            .expect("the question wake must be queued on the master");
+        assert!(
+            master_continuation_prompt(wake).contains("question"),
+            "prompt states the question kind",
+        );
+    }
+
+    /// A NON-peer session parking (topic is not `peer-<slug>`) must NOT wake
+    /// anyone — there is no master behind an ordinary session.
+    #[test]
+    fn non_peer_session_park_does_not_wake() {
+        let tmp = tempfile::tempdir().unwrap();
+        let peers_root = tmp.path();
+        // An ordinary (non-peer) session: a master's OWN turn parking.
+        let session = SessionKey::with_profile("tenant-wake-core-nonpeer", "api", "master");
+        let outcome = enqueue_peer_awaiting_input_wake(
+            peers_root,
+            &session,
+            "approval-x",
+            PeerPendingKind::Approval,
+            "anything",
+        );
+        assert_eq!(
+            outcome,
+            PeerAwaitingWakeOutcome::NotPeer,
+            "a non-peer session must never wake a master",
+        );
+    }
+
+    /// A peer with NO recorded originator fails closed: no wake (nothing to
+    /// notify).
+    #[test]
+    fn peer_without_originator_does_not_wake() {
+        let tmp = tempfile::tempdir().unwrap();
+        let peers_root = tmp.path();
+        let profile = "tenant-wake-core-noorig";
+        stage_peer_with_originator(peers_root, "ghost", None);
+
+        let session = peer_session(profile, "ghost-wire", "ghost");
+        let outcome = enqueue_peer_awaiting_input_wake(
+            peers_root,
+            &session,
+            "approval-y",
+            PeerPendingKind::Approval,
+            "anything",
+        );
+        assert_eq!(outcome, PeerAwaitingWakeOutcome::NoOriginator);
+    }
+
+    /// A recorded originator that is itself a PEER session (topic `peer-...`)
+    /// must NOT wake: a peer can never answer via `peer_respond` (depth-1 guard),
+    /// so a wake aimed at one would strand the blocked peer. `peer/prepare`
+    /// writes its supplied session_id verbatim, so this is a real input.
+    #[test]
+    fn peer_session_originator_does_not_wake() {
+        let tmp = tempfile::tempdir().unwrap();
+        let peers_root = tmp.path();
+        let profile = "tenant-wake-core-peerorig";
+        // The originator string is ANOTHER peer session under the same profile.
+        let peer_originator = format!("{profile}:api:other-wire#peer-other");
+        stage_peer_with_originator(peers_root, "edison", Some(&peer_originator));
+
+        let session = peer_session(profile, "edison-wire", "edison");
+        let outcome = enqueue_peer_awaiting_input_wake(
+            peers_root,
+            &session,
+            "approval-z",
+            PeerPendingKind::Approval,
+            "anything",
+        );
+        assert_eq!(
+            outcome,
+            PeerAwaitingWakeOutcome::InvalidOriginator,
+            "a peer-session originator can never answer — no wake",
+        );
+        // And nothing was enqueued anywhere for that peer-session key.
+        let orchestrator = default_agent_orchestrator();
+        assert_eq!(
+            orchestrator.pending_continuation_count_for_session_for_test(
+                &SessionKey(peer_originator),
+                profile,
+            ),
+            0,
+            "no continuation may land on a peer-session originator",
+        );
+    }
+
+    /// A recorded originator under a DIFFERENT profile than the peer's must NOT
+    /// wake — peers run under their master's profile, so a profile mismatch is a
+    /// malformed/hostile originator that would strand a continuation on the wrong
+    /// (or a nonexistent) session.
+    #[test]
+    fn wrong_profile_originator_does_not_wake() {
+        let tmp = tempfile::tempdir().unwrap();
+        let peers_root = tmp.path();
+        let profile = "tenant-wake-core-wrongprof";
+        // A well-formed MASTER session, but under a DIFFERENT profile.
+        let foreign_master = "some-other-tenant:api:master";
+        stage_peer_with_originator(peers_root, "edison", Some(foreign_master));
+
+        let session = peer_session(profile, "edison-wire", "edison");
+        let outcome = enqueue_peer_awaiting_input_wake(
+            peers_root,
+            &session,
+            "approval-w",
+            PeerPendingKind::Approval,
+            "anything",
+        );
+        assert_eq!(
+            outcome,
+            PeerAwaitingWakeOutcome::InvalidOriginator,
+            "a wrong-profile originator must not wake",
+        );
+        let orchestrator = default_agent_orchestrator();
+        assert_eq!(
+            orchestrator.pending_continuation_count_for_session_for_test(
+                &SessionKey(foreign_master.to_owned()),
+                profile,
+            ),
+            0,
+            "no continuation may land on a wrong-profile originator",
+        );
+        // Belt-and-suspenders: nor under the foreign profile either.
+        assert_eq!(
+            orchestrator.pending_continuation_count_for_session_for_test(
+                &SessionKey(foreign_master.to_owned()),
+                "some-other-tenant",
+            ),
+            0,
+        );
+    }
+
+    /// A profile-LESS originator (a bare `channel:chat`, no `{profile}:` prefix)
+    /// must NOT wake — it has no profile to match the peer's.
+    #[test]
+    fn profileless_originator_does_not_wake() {
+        let tmp = tempfile::tempdir().unwrap();
+        let peers_root = tmp.path();
+        let profile = "tenant-wake-core-noprof";
+        stage_peer_with_originator(peers_root, "edison", Some("garbage-no-profile"));
+
+        let session = peer_session(profile, "edison-wire", "edison");
+        let outcome = enqueue_peer_awaiting_input_wake(
+            peers_root,
+            &session,
+            "approval-v",
+            PeerPendingKind::Approval,
+            "anything",
+        );
+        assert_eq!(outcome, PeerAwaitingWakeOutcome::InvalidOriginator);
+    }
+
+    /// Two DISTINCT parks (distinct pending ids) wake the master twice; a RETRY
+    /// of the SAME park dedupes.
+    #[test]
+    fn distinct_parks_wake_twice_same_park_dedupes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let peers_root = tmp.path();
+        let profile = "tenant-wake-core-dedupe";
+        let master = "tenant-wake-core-dedupe:api:master";
+        stage_peer_with_originator(peers_root, "edison", Some(master));
+        stage_peer_with_originator(peers_root, "tesla", Some(master));
+
+        let orchestrator = default_agent_orchestrator();
+        let master_key = SessionKey(master.to_owned());
+
+        // Two distinct parks (different peers, different pending ids).
+        assert_eq!(
+            enqueue_peer_awaiting_input_wake(
+                peers_root,
+                &peer_session(profile, "edison-wire", "edison"),
+                "pending-A",
+                PeerPendingKind::Approval,
+                "first",
+            ),
+            PeerAwaitingWakeOutcome::Woke,
+        );
+        assert_eq!(
+            enqueue_peer_awaiting_input_wake(
+                peers_root,
+                &peer_session(profile, "tesla-wire", "tesla"),
+                "pending-B",
+                PeerPendingKind::Question,
+                "second",
+            ),
+            PeerAwaitingWakeOutcome::Woke,
+        );
+        assert_eq!(
+            orchestrator.pending_continuation_count_for_session_for_test(&master_key, profile),
+            2,
+            "two distinct parks → two wakes",
+        );
+
+        // A RETRY of the FIRST park (same pending id) dedupes — no third wake.
+        assert_eq!(
+            enqueue_peer_awaiting_input_wake(
+                peers_root,
+                &peer_session(profile, "edison-wire", "edison"),
+                "pending-A",
+                PeerPendingKind::Approval,
+                "retry",
+            ),
+            PeerAwaitingWakeOutcome::AlreadyQueued,
+        );
+        assert_eq!(
+            orchestrator.pending_continuation_count_for_session_for_test(&master_key, profile),
+            2,
+            "a retried park never stacks a redundant wake",
+        );
+    }
 }
 
 /// The peer's TRUSTED session key (#P1-1): the wire it runs its turns under,
@@ -27747,6 +28250,7 @@ async fn run_standalone_turn(
                 ws: ws.clone(),
                 ledger: ledger.clone(),
                 contracts: contracts.clone(),
+                state: state.clone(),
                 session_id: session_id.clone(),
                 turn_id: turn_id.clone(),
             }) as Arc<dyn octos_agent::UserQuestionRequester>

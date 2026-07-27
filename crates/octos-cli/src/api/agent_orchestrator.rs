@@ -169,6 +169,27 @@ pub(crate) const PEER_FLEET_SYNTHESIS_META_SLUGS: &str = "peer_fleet_slugs";
 /// Group id stamped onto peer-fleet-synthesis continuations (queue triage).
 const PEER_FLEET_SYNTHESIS_GROUP: &str = "peer-fleet-synthesis";
 
+/// Peer awaiting-input WAKE — kind label for the `External(_)` master
+/// continuation that WAKES an idle master when one of its staged peers PARKS on
+/// an approval/question (i.e. becomes genuinely `awaiting_input`). This closes
+/// the "master is the human-in-the-loop" gap: today a peer's block is visible
+/// via `peer_list awaiting_input`, but nothing NOTIFIES the master — it has to
+/// already be taking turns and choose to check. The wake enqueues an autonomous
+/// master turn (drained ONLY when the master is idle-eligible) that directs the
+/// master to `peer_list` → `peer_respond`. Sibling of the fleet-synthesis wake;
+/// flows through the same hardened `External` drain path.
+pub(crate) const PEER_AWAITING_INPUT_EXTERNAL_KIND: &str = "peer_awaiting_input";
+/// Metadata key carrying the parked peer's slug (names the peer in the nudge).
+pub(crate) const PEER_AWAITING_INPUT_META_SLUG: &str = "peer_awaiting_input_slug";
+/// Metadata key carrying the park kind — `"approval"` or `"question"`.
+pub(crate) const PEER_AWAITING_INPUT_META_KIND: &str = "peer_awaiting_input_kind";
+/// Metadata key carrying a short one-line summary of what the peer is blocked
+/// on (prompt context only; the master reads the authoritative parked set via
+/// `peer_list`).
+pub(crate) const PEER_AWAITING_INPUT_META_PROMPT: &str = "peer_awaiting_input_prompt";
+/// Group id stamped onto peer-awaiting-input wakes (queue triage).
+const PEER_AWAITING_INPUT_GROUP: &str = "peer-awaiting-input";
+
 /// #436 P1 (#3) — real delivery status for a `peer_send_input` injection so the
 /// tool never acks success on a durable-persist failure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -216,6 +237,28 @@ fn peer_send_input_dedupe_key(session: &SessionKey, occurrence_id: &str) -> Stri
 /// cleared and a fresh one completed, far beyond the 30s window).
 fn peer_fleet_synthesis_dedupe_key(master_session: &SessionKey) -> String {
     format!("external/{PEER_FLEET_SYNTHESIS_EXTERNAL_KIND}/{master_session}")
+}
+
+/// The dedupe key for a peer awaiting-input WAKE — keyed on the master
+/// (originator) session AND the park's unique pending id (the `ApprovalId` /
+/// `QuestionId`, a fresh UUID minted per park). PER-PENDING-ID by design:
+///
+/// * Two DISTINCT parks carry two distinct pending ids → two distinct keys →
+///   two wakes, so each block wakes the master at least once while it is still
+///   pending.
+/// * A retry of the SAME park re-uses its pending id → the second enqueue
+///   collapses onto the first (either as a live pending duplicate, or via the
+///   `RECENT_CLAIM_GUARD_WINDOW` once the wake has been drained).
+///
+/// The pending id is the unique per-occurrence id the `External`-producer
+/// invariant requires (a park's id never re-fires under a different park), so
+/// there is NO re-arm hazard: the recent-claim guard can only ever suppress the
+/// SAME park's key, never a different peer's fresh park. The tradeoff is that N
+/// simultaneous parks under one master enqueue N wakes; the first woken turn
+/// handles the whole `peer_list` batch and any surplus wakes are harmless
+/// no-ops (the master calls `peer_list`, finds nothing pending, ends).
+fn peer_awaiting_input_dedupe_key(master_session: &SessionKey, pending_id: &str) -> String {
+    format!("external/{PEER_AWAITING_INPUT_EXTERNAL_KIND}/{master_session}/{pending_id}")
 }
 
 #[derive(Debug, Clone)]
@@ -2493,6 +2536,51 @@ impl InProcessAgentOrchestrator {
         let key =
             MasterContinuationDedupeKey::from(peer_fleet_synthesis_dedupe_key(master_session));
         self.state().continuations.clear_recent_external_claim(&key);
+    }
+
+    /// Peer awaiting-input WAKE — enqueue ONE autonomous continuation on the
+    /// master (originator) session so an IDLE master is notified to answer a
+    /// peer that just PARKED on an approval/question. The park decision (a REAL
+    /// park past the auto-resolve short-circuit, a peer session, an originator
+    /// that resolves) is made by the caller in `ui_protocol.rs`; this method
+    /// only performs the enqueue.
+    ///
+    /// The dedupe key is PER-PENDING-ID ([`peer_awaiting_input_dedupe_key`]), so
+    /// distinct parks each wake the master while the SAME park dedupes; the
+    /// unique pending id satisfies the `External`-producer occurrence invariant,
+    /// so there is no re-arm hazard.
+    ///
+    /// In-memory enqueue (no durable persist): losing a wake TRIGGER across a
+    /// restart is benign — the peer re-parks on its next turn and the master can
+    /// always `peer_list` — so, like fleet-synthesis and unlike a user's
+    /// `peer_send_input` message, it need not survive a crash. The scheduler's
+    /// `is_idle_eligible` gate (checked at drain) means the wake never fires
+    /// while the MASTER itself is mid-turn or blocked on its own input/approval.
+    pub(crate) fn enqueue_peer_awaiting_input_continuation(
+        &self,
+        master_session: &SessionKey,
+        profile_id: &str,
+        slug: &str,
+        pending_id: &str,
+        park_kind: &str,
+        prompt_summary: &str,
+    ) -> MasterContinuationEnqueueOutcome {
+        let request = MasterContinuationRequest::new(
+            PEER_AWAITING_INPUT_GROUP,
+            master_session.to_string(),
+            profile_id.to_owned(),
+            MasterContinuationReason::External(PEER_AWAITING_INPUT_EXTERNAL_KIND.to_owned()),
+            SystemTime::now(),
+        )
+        .with_metadata(PEER_AWAITING_INPUT_META_SLUG, slug.to_owned())
+        .with_metadata(PEER_AWAITING_INPUT_META_KIND, park_kind.to_owned())
+        .with_metadata(PEER_AWAITING_INPUT_META_PROMPT, prompt_summary.to_owned())
+        // The explicit per-pending-id key below is authoritative; the metadata
+        // above never widens it (a same-park retry with a re-summarized prompt
+        // still dedupes on the pending id).
+        .with_dedupe_key(peer_awaiting_input_dedupe_key(master_session, pending_id));
+        let mut state = self.state();
+        state.continuations.enqueue(request)
     }
 
     /// codex #1 — true when peer `slug` (under `profile_id`) has a
@@ -6327,6 +6415,34 @@ pub(crate) fn master_continuation_prompt(continuation: &QueuedMasterContinuation
                 group = continuation.group_id.as_str(),
             )
         }
+        // Peer awaiting-input WAKE — one of this master's staged peers PARKED on
+        // an approval/question and is now `awaiting_input`. Nudge the master to
+        // answer it. This is a `[system-internal]` envelope (like the
+        // fleet-synthesis arm) — the master acts as the human-in-the-loop; it
+        // reads the AUTHORITATIVE parked set via `peer_list` and answers via
+        // `peer_respond`, so the metadata below is only a hint (a spurious wake
+        // after the peer already resolved is a harmless no-op: `peer_list` shows
+        // nothing awaiting and the turn ends).
+        MasterContinuationReason::External(kind) if kind == PEER_AWAITING_INPUT_EXTERNAL_KIND => {
+            let slug = continuation
+                .metadata
+                .get(PEER_AWAITING_INPUT_META_SLUG)
+                .map(String::as_str)
+                .unwrap_or("unknown");
+            let park_kind = continuation
+                .metadata
+                .get(PEER_AWAITING_INPUT_META_KIND)
+                .map(String::as_str)
+                .unwrap_or("input");
+            let prompt = continuation
+                .metadata
+                .get(PEER_AWAITING_INPUT_META_PROMPT)
+                .map(String::as_str)
+                .unwrap_or("");
+            format!(
+                "[system-internal]\nA peer you staged is awaiting your input — peer \"{slug}\" ({park_kind}): \"{prompt}\". Call the `peer_list` tool to see EVERY peer awaiting input, then use `peer_respond` to answer them. Answer only what is genuinely blocked; if `peer_list` shows nothing awaiting input, that block was already handled — just end the turn."
+            )
+        }
         MasterContinuationReason::External(kind) => format!(
             "[system-internal]\nAn external master continuation was requested.\n\nKind: {kind}\nGroup: {group}\nMetadata:\n{metadata}\n\nHandle the continuation conservatively and summarize the visible state for the user.",
             group = continuation.group_id.as_str(),
@@ -9091,6 +9207,195 @@ mod tests {
         assert!(
             prompt.contains("slugs` filter"),
             "prompt must instruct the slugs filter: {prompt}"
+        );
+    }
+
+    /// Peer awaiting-input WAKE — a peer parking enqueues ONE autonomous
+    /// continuation on the ORIGINATOR (master), carrying the peer slug + kind,
+    /// and it drains when the master is idle.
+    #[test]
+    fn peer_awaiting_input_wake_enqueues_on_originator() {
+        let orchestrator = default_agent_orchestrator();
+        let master = SessionKey::with_profile("tenant-wake-enq", "api", "master-wake");
+        let profile = "tenant-wake-enq";
+
+        let outcome = orchestrator.enqueue_peer_awaiting_input_continuation(
+            &master,
+            profile,
+            "edison",
+            "approval-id-1",
+            "approval",
+            "shell: rm build cache",
+        );
+        assert!(
+            outcome.queued().is_some(),
+            "a peer park must enqueue a wake on the originator",
+        );
+        assert_eq!(
+            orchestrator.pending_continuation_count_for_session_for_test(&master, profile),
+            1,
+            "exactly one wake queued for the master",
+        );
+
+        let drained = orchestrator.drain_ready_continuations_for_session(
+            &master,
+            profile,
+            MasterContinuationRuntimeState::idle(),
+            4,
+        );
+        let wake = drained
+            .iter()
+            .find(|c| {
+                matches!(&c.reason, MasterContinuationReason::External(kind)
+                    if kind == PEER_AWAITING_INPUT_EXTERNAL_KIND)
+            })
+            .expect("the wake must drain when the master is idle");
+        assert_eq!(
+            wake.metadata
+                .get(PEER_AWAITING_INPUT_META_SLUG)
+                .map(String::as_str),
+            Some("edison"),
+            "the wake carries the parked peer's slug",
+        );
+        assert_eq!(
+            wake.metadata
+                .get(PEER_AWAITING_INPUT_META_KIND)
+                .map(String::as_str),
+            Some("approval"),
+            "the wake carries the park kind",
+        );
+    }
+
+    /// Peer awaiting-input WAKE — two DISTINCT parks (distinct pending ids)
+    /// enqueue TWO wakes: the per-pending-id key never collapses distinct
+    /// blocks, so each is surfaced to the master at least once.
+    #[test]
+    fn peer_awaiting_input_two_distinct_parks_enqueue_two_wakes() {
+        let orchestrator = default_agent_orchestrator();
+        let master = SessionKey::with_profile("tenant-wake-two", "api", "master-two");
+        let profile = "tenant-wake-two";
+
+        assert!(
+            orchestrator
+                .enqueue_peer_awaiting_input_continuation(
+                    &master,
+                    profile,
+                    "edison",
+                    "pending-A",
+                    "approval",
+                    "one",
+                )
+                .queued()
+                .is_some(),
+            "first park queues",
+        );
+        assert!(
+            orchestrator
+                .enqueue_peer_awaiting_input_continuation(
+                    &master,
+                    profile,
+                    "tesla",
+                    "pending-B",
+                    "question",
+                    "two",
+                )
+                .queued()
+                .is_some(),
+            "a DISTINCT park (different pending id) queues a SECOND wake",
+        );
+        assert_eq!(
+            orchestrator.pending_continuation_count_for_session_for_test(&master, profile),
+            2,
+            "two distinct parks → two wakes",
+        );
+    }
+
+    /// Peer awaiting-input WAKE — a RETRY of the same park (same pending id)
+    /// dedupes onto the already-queued wake: no continuation spam.
+    #[test]
+    fn peer_awaiting_input_same_park_retried_dedupes() {
+        let orchestrator = default_agent_orchestrator();
+        let master = SessionKey::with_profile("tenant-wake-dup", "api", "master-dup");
+        let profile = "tenant-wake-dup";
+
+        assert!(
+            orchestrator
+                .enqueue_peer_awaiting_input_continuation(
+                    &master,
+                    profile,
+                    "edison",
+                    "pending-same",
+                    "approval",
+                    "first",
+                )
+                .queued()
+                .is_some(),
+            "first enqueue of a park queues",
+        );
+        assert!(
+            orchestrator
+                .enqueue_peer_awaiting_input_continuation(
+                    &master,
+                    profile,
+                    "edison",
+                    "pending-same",
+                    "approval",
+                    "retry",
+                )
+                .is_duplicate(),
+            "the SAME park (same pending id) dedupes — even with a different summary",
+        );
+        assert_eq!(
+            orchestrator.pending_continuation_count_for_session_for_test(&master, profile),
+            1,
+            "a retried park never stacks a second wake",
+        );
+    }
+
+    /// Peer awaiting-input WAKE — the rendered master turn names the parked peer
+    /// slug + kind and directs the master at `peer_list` / `peer_respond`.
+    #[test]
+    fn peer_awaiting_input_prompt_names_slug_and_directs_peer_list() {
+        let orchestrator = default_agent_orchestrator();
+        let master = SessionKey::with_profile("tenant-wake-prompt", "api", "master-wprompt");
+        let profile = "tenant-wake-prompt";
+        orchestrator.enqueue_peer_awaiting_input_continuation(
+            &master,
+            profile,
+            "edison",
+            "approval-id-9",
+            "question",
+            "Which datastore should I migrate to?",
+        );
+        let drained = orchestrator.drain_ready_continuations_for_session(
+            &master,
+            profile,
+            MasterContinuationRuntimeState::idle(),
+            4,
+        );
+        let wake = drained
+            .iter()
+            .find(|c| {
+                matches!(&c.reason, MasterContinuationReason::External(kind)
+                    if kind == PEER_AWAITING_INPUT_EXTERNAL_KIND)
+            })
+            .expect("wake continuation must drain when the master is idle");
+        let prompt = master_continuation_prompt(wake);
+        assert!(
+            prompt.contains("edison"),
+            "prompt must name the parked peer's slug: {prompt}"
+        );
+        assert!(
+            prompt.contains("question"),
+            "prompt must state the park kind: {prompt}"
+        );
+        assert!(
+            prompt.contains("peer_list"),
+            "prompt must direct the master to peer_list: {prompt}"
+        );
+        assert!(
+            prompt.contains("peer_respond"),
+            "prompt must direct the master to peer_respond: {prompt}"
         );
     }
 
