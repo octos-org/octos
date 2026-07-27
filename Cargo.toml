@@ -35,6 +35,7 @@ members = [
     "crates/octos-ffi",
     "crates/octos-uniffi",
     "crates/octos-wasm",
+    "crates/octos-pyo3",
 ]
 
 [workspace.package]

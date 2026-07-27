@@ -1,0 +1,27 @@
+[build-system]
+requires = ["maturin>=1.5"]
+build-backend = "maturin"
+
+[project]
+name = "octos"
+description = "Native Python bindings for embedding octos (Rust agentic OS) — the recommended Python binding, built with pyo3 over the octos-ffi native core."
+requires-python = ">=3.9"
+license = { text = "Apache-2.0" }
+readme = "README.md"
+# Version is inherited from Cargo.toml (workspace version) by maturin.
+dynamic = ["version"]
+classifiers = [
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: Implementation :: CPython",
+    "Operating System :: MacOS",
+    "Operating System :: POSIX :: Linux",
+]
+
+[tool.maturin]
+# The import name: `import octos`. Matches `[lib] name` and `#[pymodule] fn octos`.
+module-name = "octos"
+# Turn ON pyo3's `extension-module` ONLY for the wheel build. With it on, the
+# compiled extension does NOT link libpython (symbols resolve from the host
+# interpreter at import time). It stays OFF for `cargo build`/`cargo test`, which
+# instead link libpython so the Rust test harness can start an interpreter.
+features = ["octos-pyo3/extension-module"]

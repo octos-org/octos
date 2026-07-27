@@ -1,0 +1,61 @@
+[package]
+name = "octos-pyo3"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Native pyo3 Python extension for embedding octos, over the octos-ffi native core. The recommended Python binding (vs the octos-uniffi reference Python)."
+
+[lib]
+# cdylib -> the Python extension module maturin packages into the wheel.
+# rlib   -> lets this crate's own Rust tests link and exercise the wrapped
+#           surface (`cargo test -p octos-pyo3 --features python`).
+name = "octos"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# The native octos core. Path dep (octos-ffi is a workspace member, not a
+# `workspace.dependencies` entry). This crate wraps its `OctosRuntime` core;
+# the hardened credential path (single resolution + pinning + exact
+# secret-scrub) lives entirely in octos-ffi and is NOT duplicated here.
+octos-ffi = { path = "../octos-ffi" }
+# pyo3 is OPTIONAL and OFF by default so the plain `cargo build --workspace`
+# (run on octos CI's linux-x64, linux-arm64 AND windows self-hosted runners)
+# pulls ZERO libpython — a Python-less lane must not break. It is turned on by
+# the `python` feature. `abi3-py39` => ONE wheel serves CPython >= 3.9.
+# `extension-module` is a SEPARATE feature (see below): with it OFF, `cargo
+# build`/`cargo test --features python` link libpython so the Rust tests can
+# start an interpreter; maturin turns it ON so the wheel resolves Python symbols
+# from the host interpreter instead of linking libpython.
+pyo3 = { version = "0.23", features = ["abi3-py39"], optional = true }
+
+# NOTE: build.rs deliberately has NO build-dependencies. It would have used
+# `pyo3-build-config` to read pyo3's resolved interpreter, but that crate's
+# `resolve-config` feature (required for its `get()`) probes for an interpreter
+# AT COMPILE TIME and `exit(1)`s when none is found — which would break the
+# default `cargo build --workspace` on a Python-less CI lane, the very thing the
+# `python` feature-gate prevents. build.rs instead replicates pyo3's own
+# interpreter resolution order at runtime, guarded by CARGO_FEATURE_PYTHON.
+
+[features]
+default = []
+# Compile the pyo3 surface (pulls libpython). Everything Python-facing is gated
+# behind this; with it off the crate is an (essentially empty) library.
+python = ["dep:pyo3"]
+# Wheel builds turn this on (via pyproject `features`). Implies `python` and
+# tells pyo3 NOT to link libpython (host-interpreter symbol resolution).
+extension-module = ["python", "pyo3/extension-module"]
+# Re-export octos-ffi's optional in-process GGUF embedder so `Runtime.embed`
+# returns real vectors instead of raising NoEmbedder. Off by default so the
+# plain `cargo build`/`cargo build --workspace` stays pure Rust.
+embed-llama = ["octos-ffi/embed-llama"]
+
+# Inherits the workspace `deny(unsafe_code)` and KEEPS it: pyo3 0.23's
+# proc-macros annotate the `unsafe` FFI scaffolding they generate so it does not
+# trip the crate's lint, so this binding compiles cleanly under `deny` (verified)
+# and needs NO `#![allow(unsafe_code)]`. This crate writes no hand-unsafe code.
+# See the Safety note atop src/lib.rs.
+[lints]
+workspace = true
