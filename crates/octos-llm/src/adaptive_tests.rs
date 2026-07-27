@@ -18,7 +18,12 @@ impl LlmProvider for MockProvider {
         _tools: &[ToolSpec],
         _config: &ChatConfig,
     ) -> Result<ChatResponse> {
-        tokio::time::sleep(std::time::Duration::from_millis(self.latency_ms)).await;
+        // A zero-latency mock must be immediately ready. `sleep(0)` still
+        // yields to the runtime, making hedge ordering depend on scheduler and
+        // timer granularity (notably on Windows).
+        if self.latency_ms > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(self.latency_ms)).await;
+        }
         if self.fail {
             eyre::bail!("{} API error: 429 - rate limited", self.error_msg);
         }
