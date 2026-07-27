@@ -323,7 +323,7 @@ mod tests {
     fn splitter_handles_tag_split_across_deltas() {
         // The MiniMax live-leak case: tags arrive fragmented across chunks.
         let (content, reasoning) =
-            split_parts(&["Hello <th", "ink>hidden ", "chain</thin", "k> world"]);
+            split_parts(&["Hello <th", "ink>hidden ", "chain</thi", "nk> world"]);
         assert_eq!(content, "Hello  world");
         assert_eq!(reasoning, "hidden chain");
     }

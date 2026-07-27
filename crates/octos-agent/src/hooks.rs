@@ -1699,6 +1699,7 @@ mod tests {
 
     /// Convenience constructor for path-filter tests so the cases that follow
     /// stay focused on the filtering behaviour itself.
+    #[cfg(unix)]
     fn hook_with_path_filter(event: HookEvent, patterns: Vec<&str>) -> HookConfig {
         HookConfig {
             event,
@@ -1942,6 +1943,7 @@ mod tests {
     // ----- UserPromptSubmit hook tests -----
 
     /// Convenience constructor for the UserPromptSubmit tests below.
+    #[cfg(unix)]
     fn user_prompt_hook(command: Vec<&str>, timeout_ms: u64) -> HookConfig {
         HookConfig {
             event: HookEvent::UserPromptSubmit,

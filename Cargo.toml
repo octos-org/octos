@@ -19,6 +19,7 @@ members = [
     "crates/app-skills/account-manager",
     "crates/app-skills/time",
     "crates/app-skills/weather",
+    "crates/app-skills/smart-home",
     "crates/app-skills/wechat-bridge",
     "crates/app-skills/skill-evolve",
     "crates/app-skills/harness-starter-generic",
@@ -31,10 +32,15 @@ members = [
     "crates/octos-plugin",
     "crates/octos-sandbox",
     "crates/octos-swarm",
+    "crates/octos-embed-llama",
+    "crates/octos-ffi",
+    "crates/octos-uniffi",
+    "crates/octos-wasm",
+    "crates/octos-pyo3",
 ]
 
 [workspace.package]
-version = "2.0.2-rc.12"
+version = "2.0.2"
 edition = "2024"
 rust-version = "1.85.0"
 authors = ["octos team"]
@@ -59,6 +65,7 @@ octos-services = { path = "crates/octos-services" }
 octos-pipeline = { path = "crates/octos-pipeline" }
 octos-plugin = { path = "crates/octos-plugin" }
 octos-swarm = { path = "crates/octos-swarm" }
+octos-embed-llama = { path = "crates/octos-embed-llama" }
 
 # codex-rs crates (reused)
 codex-execpolicy = { git = "https://github.com/openai/codex", path = "codex-rs/execpolicy" }

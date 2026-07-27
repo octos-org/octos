@@ -1458,6 +1458,7 @@ async fn should_not_burn_retry_budget_on_progress_rounds() {
 }
 
 #[tokio::test]
+#[cfg(unix)]
 async fn should_dispatch_through_cli_backend_with_retry_on_nonzero_exit() {
     // The CLI backend lane end-to-end through the real dispatcher: a
     // one-shot script that fails on its first invocation (non-zero

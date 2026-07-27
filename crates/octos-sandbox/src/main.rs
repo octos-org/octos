@@ -734,7 +734,7 @@ fn run_sandboxed(args: &Args) -> eyre::Result<u8> {
     // 1. Create or reuse the AppContainer profile
     let profile = AppContainerProfile::ensure(
         &args.profile,
-        &format!("octos-sandbox-{}", &args.profile),
+        &format!("octos-sandbox-{}", args.profile),
         Some("octos agent sandbox"),
     )
     .wrap_err("failed to create AppContainer profile")?;

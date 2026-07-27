@@ -11,6 +11,11 @@ name = "octos"
 path = "src/main.rs"
 
 [dependencies]
+# In-process llama.cpp GGUF embedding provider. Deliberately NOT target-gated:
+# unlike octos-embed-mlx this builds on macOS, Linux and Windows, ARM and x86,
+# which is the entire reason it exists. Optional, so it costs nothing until
+# `embed-llama` is enabled.
+octos-embed-llama = { workspace = true, optional = true }
 octos-core = { workspace = true }
 # `github` feature on for Stage 2: enables the shared GitHub Releases client so
 # `octos update --check` + `octos doctor`'s Network category can reach the public
@@ -124,11 +129,18 @@ rustix = { version = "1.1", features = ["fs"] }
 [target.'cfg(target_os = "macos")'.dependencies]
 keyring = { workspace = true, features = ["apple-native"] }
 
+
 [target.'cfg(windows)'.dependencies]
 keyring = { workspace = true, features = ["windows-native"] }
 
 [features]
 default = []
+# In-process llama.cpp GGUF embedding provider. Wires
+# `embedding.provider = "llamacpp"` in create_embedder. Cross-platform — no
+# target gate — and defaults to the CPU backend; add an accelerator explicitly.
+embed-llama = ["dep:octos-embed-llama", "octos-embed-llama/embed-llama"]
+embed-llama-metal = ["embed-llama", "octos-embed-llama/metal"]
+embed-llama-cuda = ["embed-llama", "octos-embed-llama/cuda"]
 # `matrix` is pulled in unconditionally: the `/api/my/profile/matrix/*`
 # handlers and the admin dashboard's Matrix invite UI reference matrix-only
 # types (e.g. `octos_bus::MatrixInviteStore`), so the API cannot compile
@@ -175,6 +187,7 @@ octos-llm = { workspace = true, features = ["test-utils"] }
 octos-store = { workspace = true, features = ["test-util"] }
 octos-services = { workspace = true, features = ["test-util"] }
 tokio-tungstenite.workspace = true
+wiremock = { workspace = true }
 
 [[test]]
 name = "build_output_dir_validation"

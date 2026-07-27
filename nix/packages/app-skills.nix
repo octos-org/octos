@@ -23,6 +23,7 @@ let
     "account-manager"
     "clock"
     "weather"
+    "smart-home"
   ];
   skillBins = [
     "news_fetch"
@@ -32,6 +33,7 @@ let
     "account_manager"
     "clock"
     "weather"
+    "smart_home"
   ];
 in
 

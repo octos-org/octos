@@ -27,12 +27,15 @@ pub fn seed_pricing_catalog(entries: &[(String, f64, f64)]) {
     // alias `kimi-k2.5`, mispricing direct requests (which look up the bare id).
     // Award the bare alias to the row with the FEWEST path segments (the most
     // canonical/native), so the result is deterministic and order-independent.
-    // On an EQUAL segment count the lexicographically-smaller lowercased full
-    // key wins — `minimax/MiniMax-M3` ($0.15/$1.5) and `r9s/minimax-m3`
-    // ($0.5/$2) both have one slash, so without a tie-breaker the bare
-    // `minimax-m3` rate would depend on which row the router exported first.
-    // (Tracking the owner's key rather than only its depth is what lets the
-    // tie-break compare keys.)
+    // On an EQUAL segment count the more-native HOST wins: compare the provider
+    // prefix (segment before the first `/`) FIRST, then the full lowercased key —
+    // `minimax/MiniMax-M3` ($0.15/$1.5) and `r9s/minimax-m3` ($0.5/$2) both have
+    // one slash, so without a tie-breaker the bare `minimax-m3` rate would depend
+    // on which row the router exported first. Comparing the provider prefix
+    // (rather than the raw key) keeps a native `zai/…` row ahead of a
+    // `zai-coding/…` re-host, whose `-` would otherwise sort before the native
+    // row's `/` (mirrors `context::build_catalog_map`). (Tracking the owner's key
+    // rather than only its depth is what lets the tie-break compare keys.)
     //
     // The bare alias is LOWERCASED (`catalog_pricing` lowercases the requested id
     // before lookup) so a case-variant native key like `minimax/MiniMax-M2.5` is
@@ -68,7 +71,14 @@ pub fn seed_pricing_catalog(entries: &[(String, f64, f64)]) {
                     None => true,
                     Some((owned_seg, owner_key)) => {
                         segments < *owned_seg
-                            || (segments == *owned_seg && key_lower.as_str() < owner_key.as_str())
+                            || (segments == *owned_seg
+                                && (
+                                    crate::context::provider_prefix(&key_lower),
+                                    key_lower.as_str(),
+                                ) < (
+                                    crate::context::provider_prefix(owner_key),
+                                    owner_key.as_str(),
+                                ))
                     }
                 };
                 if take {

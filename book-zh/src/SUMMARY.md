@@ -10,6 +10,7 @@
 - [LLM 服务商与路由](./providers.md)
 - [网关与频道](./channels.md)
 - [记忆与技能](./memory-skills.md)
+- [多 Agent 编排](./multi-agent.md)
 - [高级功能](./advanced.md)
 
 # 运维

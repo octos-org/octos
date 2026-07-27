@@ -205,309 +205,9 @@ async fn request_command_approval(
     }
 }
 
-#[derive(Debug, Deserialize)]
-struct ApplyPatchInput {
-    #[serde(default)]
-    patch: Option<String>,
-    #[serde(default)]
-    path: Option<String>,
-    #[serde(default)]
-    diff: Option<String>,
-}
-
-pub struct ApplyPatchTool {
-    base_dir: PathBuf,
-    filesystem_scope: FilesystemScope,
-    file_access: FileAccessMode,
-}
-
-impl ApplyPatchTool {
-    pub fn new(base_dir: impl Into<PathBuf>) -> Self {
-        Self {
-            base_dir: base_dir.into(),
-            filesystem_scope: FilesystemScope::Workspace,
-            file_access: FileAccessMode::ReadWrite,
-        }
-    }
-
-    pub fn with_filesystem_scope(mut self, filesystem_scope: FilesystemScope) -> Self {
-        self.filesystem_scope = filesystem_scope;
-        self
-    }
-
-    pub fn with_file_access(mut self, file_access: FileAccessMode) -> Self {
-        self.file_access = file_access;
-        self
-    }
-}
-
-#[async_trait]
-impl Tool for ApplyPatchTool {
-    fn name(&self) -> &str {
-        "apply_patch"
-    }
-
-    fn description(&self) -> &str {
-        "Apply a Codex-style patch. Supports Add File, Delete File, and exact-match Update File hunks; also accepts {path,diff} for unified diffs."
-    }
-
-    fn tags(&self) -> &[&str] {
-        &["fs", "code"]
-    }
-
-    fn concurrency_class(&self) -> ConcurrencyClass {
-        ConcurrencyClass::Exclusive
-    }
-
-    fn input_schema(&self) -> Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "patch": {
-                    "type": "string",
-                    "description": "Codex apply_patch envelope beginning with *** Begin Patch"
-                },
-                "path": {
-                    "type": "string",
-                    "description": "Single file path when applying a unified diff"
-                },
-                "diff": {
-                    "type": "string",
-                    "description": "Unified diff for path"
-                }
-            }
-        })
-    }
-
-    async fn execute(&self, args: &Value) -> Result<ToolResult> {
-        self.execute_with_context(&ToolContext::zero(), args).await
-    }
-
-    async fn execute_with_context(&self, ctx: &ToolContext, args: &Value) -> Result<ToolResult> {
-        let input: ApplyPatchInput =
-            serde_json::from_value(args.clone()).wrap_err("invalid apply_patch input")?;
-        if !self.file_access.allows_write() {
-            return Ok(ToolResult {
-                output: "apply_patch is not permitted by read-only filesystem access".to_string(),
-                success: false,
-                ..Default::default()
-            });
-        }
-        if let (Some(path), Some(diff)) = (input.path.as_deref(), input.diff.as_deref()) {
-            return self.apply_unified_diff(ctx, path, diff).await;
-        }
-        let Some(patch) = input.patch.as_deref() else {
-            return Ok(ToolResult {
-                output: "apply_patch requires either patch or {path,diff}".to_string(),
-                success: false,
-                ..Default::default()
-            });
-        };
-        self.apply_codex_patch(ctx, patch).await
-    }
-}
-
-impl ApplyPatchTool {
-    async fn apply_unified_diff(
-        &self,
-        ctx: &ToolContext,
-        path: &str,
-        diff: &str,
-    ) -> Result<ToolResult> {
-        let tool = super::DiffEditTool::new(&self.base_dir)
-            .with_filesystem_scope(self.filesystem_scope)
-            .with_file_access(self.file_access);
-        tool.execute_with_context(ctx, &json!({ "path": path, "diff": diff }))
-            .await
-    }
-
-    async fn apply_codex_patch(&self, ctx: &ToolContext, patch: &str) -> Result<ToolResult> {
-        let sections = parse_codex_patch(patch);
-        if sections.is_empty() {
-            return Ok(ToolResult {
-                output: "No apply_patch sections found".to_string(),
-                success: false,
-                ..Default::default()
-            });
-        }
-
-        let mut modified = Vec::new();
-        // #972 / M14-B — capture a per-section operation summary so the
-        // AppUI diff preview flow can render an "applied X to Y files"
-        // card without round-tripping back through `read_file` to figure
-        // out which paths changed. Each entry mirrors the parsed patch
-        // section: { op: add|update|delete, path }.
-        let mut diff_preview = Vec::new();
-        for section in sections {
-            let path = match super::resolve_path_with_scope(
-                &self.base_dir,
-                &section.path,
-                self.filesystem_scope,
-            ) {
-                Ok(path) => path,
-                Err(_) => {
-                    return Ok(ToolResult {
-                        output: format!("Path outside working directory: {}", section.path),
-                        success: false,
-                        ..Default::default()
-                    });
-                }
-            };
-            let op_label = match section.kind {
-                PatchSectionKind::Add => {
-                    let content = section
-                        .lines
-                        .iter()
-                        .filter_map(|line| line.strip_prefix('+'))
-                        .collect::<Vec<_>>()
-                        .join("\n");
-                    if let Some(parent) = path.parent() {
-                        tokio::fs::create_dir_all(parent).await?;
-                    }
-                    super::write_no_follow(&path, content.as_bytes()).await?;
-                    "add"
-                }
-                PatchSectionKind::Delete => {
-                    tokio::fs::remove_file(&path).await?;
-                    "delete"
-                }
-                PatchSectionKind::Update => {
-                    let content = super::read_no_follow(&path).await?;
-                    let updated = apply_exact_update_hunks(&content, &section.lines)?;
-                    super::write_no_follow(&path, updated.as_bytes()).await?;
-                    "update"
-                }
-            };
-            if let Some(cache) = ctx.file_state_cache.as_ref() {
-                cache.invalidate(&path);
-            }
-            diff_preview.push(json!({ "op": op_label, "path": section.path.clone() }));
-            modified.push(section.path);
-        }
-
-        Ok(ToolResult {
-            output: format!("Applied patch to {}", modified.join(", ")),
-            success: true,
-            file_modified: modified.first().map(|path| self.base_dir.join(path)),
-            // #972 / M14-B — structured diff preview event consumed by the
-            // AppUI diff flow. `codex_tool = "apply_patch"` matches the
-            // model-visible tool name so the client routing stays uniform
-            // with `update_plan` / `request_user_input`.
-            structured_metadata: Some(json!({
-                "codex_tool": "apply_patch",
-                "diff_preview": diff_preview,
-                "modified_paths": modified,
-            })),
-            ..Default::default()
-        })
-    }
-}
-
-#[derive(Clone, Copy)]
-enum PatchSectionKind {
-    Add,
-    Delete,
-    Update,
-}
-
-struct PatchSection {
-    kind: PatchSectionKind,
-    path: String,
-    lines: Vec<String>,
-}
-
-fn parse_codex_patch(patch: &str) -> Vec<PatchSection> {
-    let mut sections = Vec::new();
-    let mut current: Option<PatchSection> = None;
-    for raw in patch.lines() {
-        if let Some(path) = raw.strip_prefix("*** Add File: ") {
-            if let Some(section) = current.take() {
-                sections.push(section);
-            }
-            current = Some(PatchSection {
-                kind: PatchSectionKind::Add,
-                path: path.trim().to_string(),
-                lines: Vec::new(),
-            });
-        } else if let Some(path) = raw.strip_prefix("*** Delete File: ") {
-            if let Some(section) = current.take() {
-                sections.push(section);
-            }
-            current = Some(PatchSection {
-                kind: PatchSectionKind::Delete,
-                path: path.trim().to_string(),
-                lines: Vec::new(),
-            });
-        } else if let Some(path) = raw.strip_prefix("*** Update File: ") {
-            if let Some(section) = current.take() {
-                sections.push(section);
-            }
-            current = Some(PatchSection {
-                kind: PatchSectionKind::Update,
-                path: path.trim().to_string(),
-                lines: Vec::new(),
-            });
-        } else if raw.starts_with("*** End Patch") {
-            if let Some(section) = current.take() {
-                sections.push(section);
-            }
-        } else if let Some(section) = current.as_mut() {
-            section.lines.push(raw.to_string());
-        }
-    }
-    if let Some(section) = current {
-        sections.push(section);
-    }
-    sections
-}
-
-fn apply_exact_update_hunks(content: &str, patch_lines: &[String]) -> Result<String> {
-    let had_trailing_newline = content.ends_with('\n');
-    let mut file_lines: Vec<String> = content.lines().map(ToOwned::to_owned).collect();
-    let mut index = 0;
-    while index < patch_lines.len() {
-        while index < patch_lines.len()
-            && (patch_lines[index].starts_with("@@") || patch_lines[index].is_empty())
-        {
-            index += 1;
-        }
-        let mut old = Vec::new();
-        let mut new = Vec::new();
-        while index < patch_lines.len() && !patch_lines[index].starts_with("@@") {
-            let line = &patch_lines[index];
-            if let Some(rest) = line.strip_prefix('-') {
-                old.push(rest.to_string());
-            } else if let Some(rest) = line.strip_prefix('+') {
-                new.push(rest.to_string());
-            } else if let Some(rest) = line.strip_prefix(' ') {
-                old.push(rest.to_string());
-                new.push(rest.to_string());
-            }
-            index += 1;
-        }
-        if old.is_empty() && new.is_empty() {
-            continue;
-        }
-        let Some(pos) = find_line_block(&file_lines, &old) else {
-            eyre::bail!("apply_patch update hunk did not match file content");
-        };
-        file_lines.splice(pos..pos + old.len(), new);
-    }
-    let mut output = file_lines.join("\n");
-    if had_trailing_newline {
-        output.push('\n');
-    }
-    Ok(output)
-}
-
-fn find_line_block(haystack: &[String], needle: &[String]) -> Option<usize> {
-    if needle.is_empty() {
-        return Some(0);
-    }
-    haystack
-        .windows(needle.len())
-        .position(|window| window == needle)
-}
+// NOTE: `ApplyPatchTool` moved to `super::apply_patch` (#1773) — the full
+// Codex-envelope implementation with Move support and two-phase
+// validate-then-apply atomicity lives there now.
 
 #[derive(Debug, Deserialize)]
 struct ExecCommandInput {
@@ -675,7 +375,11 @@ impl ExecCommandTool {
         // timeout arm needs it to kill the process tree (dropping the wait
         // future does NOT kill a tokio child).
         let child_pid = child.id();
+        // Armed for the whole wait: a dropped future (user interrupt ->
+        // `agent_task.abort()`) reaches neither arm below. See `ChildGroupGuard`.
+        let mut group_guard = ChildGroupGuard::new(child_pid);
         let result = timeout(Duration::from_secs(timeout_secs), child.wait_with_output()).await;
+        group_guard.disarm();
         match result {
             Ok(Ok(output)) => {
                 let mut text = String::new();
@@ -2097,7 +1801,12 @@ impl Tool for BashTool {
         // SIGTERM -> brief grace -> SIGKILL (Unix) or `taskkill /F /T`
         // (Windows). Mirrors `ShellTool`'s kill-on-timeout path.
         let child_pid = child.id();
-        match timeout(Duration::from_secs(timeout_secs), child.wait_with_output()).await {
+        // Armed for the whole wait: a dropped future (user interrupt ->
+        // `agent_task.abort()`) reaches neither arm below. See `ChildGroupGuard`.
+        let mut group_guard = ChildGroupGuard::new(child_pid);
+        let waited = timeout(Duration::from_secs(timeout_secs), child.wait_with_output()).await;
+        group_guard.disarm();
+        match waited {
             Ok(Ok(output)) => {
                 let mut text = String::new();
                 text.push_str(&String::from_utf8_lossy(&output.stdout));
@@ -2135,6 +1844,67 @@ impl Tool for BashTool {
                     success: false,
                     ..Default::default()
                 })
+            }
+        }
+    }
+}
+
+/// Kills a child's process group if dropped while still armed.
+///
+/// [`kill_timed_out_child`] only runs on the TIMEOUT arm of the `match` below.
+/// When the whole future is dropped instead, neither that arm nor tokio's own
+/// cleanup fires — `tokio::process::Child` does not kill on drop — and the
+/// child's entire process group survives.
+///
+/// That is not a hypothetical path: it is exactly what a user interrupt does.
+/// Esc on the serve path calls `agent_task.abort()`, which drops this future,
+/// so `bash("npm run dev")` kept running after the UI said the turn had
+/// stopped — holding its ports and still able to write to the workspace. The
+/// guard closes that by making cleanup a property of the scope rather than of
+/// one match arm.
+///
+/// Disarm on every path that has already reaped or killed the child.
+struct ChildGroupGuard(Option<u32>);
+
+impl ChildGroupGuard {
+    fn new(child_pid: Option<u32>) -> Self {
+        Self(child_pid)
+    }
+
+    /// The normal paths (clean exit, spawn error, timeout ladder) have already
+    /// dealt with the child; leave it alone.
+    fn disarm(&mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for ChildGroupGuard {
+    fn drop(&mut self) {
+        let Some(pid) = self.0 else {
+            return;
+        };
+        // `Drop` cannot await, but the graceful ladder needs a grace period
+        // between SIGTERM and SIGKILL. Hand it to a detached task when a
+        // runtime is still available — cancellation drops this guard while the
+        // runtime is very much alive, so that is the normal case. Only if there
+        // is no runtime (shutdown) fall back to a synchronous hard kill, which
+        // is a better end state than leaking the group.
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                handle.spawn(kill_timed_out_child(Some(pid)));
+            }
+            Err(_) => {
+                #[cfg(unix)]
+                {
+                    signal_process_group(pid, "-9");
+                    signal_process(pid, "-9");
+                }
+                #[cfg(windows)]
+                {
+                    let _ = std::process::Command::new("taskkill")
+                        .args(["/F", "/T", "/PID", &pid.to_string()])
+                        .status();
+                }
             }
         }
     }

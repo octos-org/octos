@@ -28,6 +28,10 @@ impl GrepTool {
 }
 
 #[derive(Debug, Deserialize)]
+// #1770: unknown keys are usually a typo of a real parameter; rejecting
+// them (with a did-you-mean via `args::parse_tool_args`) lets the model
+// self-correct instead of silently dropping its intent.
+#[serde(deny_unknown_fields)]
 struct GrepInput {
     /// Regex pattern to search for.
     pattern: String,
@@ -114,7 +118,7 @@ impl Tool for GrepTool {
         args: &serde_json::Value,
     ) -> Result<ToolResult> {
         let input: GrepInput =
-            serde_json::from_value(args.clone()).wrap_err("invalid grep tool input")?;
+            super::args::parse_tool_args(self.name(), &self.input_schema(), args)?;
 
         // Reject file_pattern with absolute paths or traversal.
         if let Some(ref fp) = input.file_pattern {

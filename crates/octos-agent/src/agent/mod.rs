@@ -119,6 +119,13 @@ pub struct AgentConfig {
     /// under [`octos_llm::LlmCallPolicy::FailFast`] (voice turns). Default 30s;
     /// env override `OCTOS_VOICE_LLM_DEADLINE_SECS`.
     pub voice_overall_deadline: std::time::Duration,
+    /// Post-edit formatting (issue #1774): when true, a successful
+    /// `edit_file` / `write_file` / `diff_edit` runs the file's language
+    /// formatter (rustfmt / prettier / black / gofmt — see [`crate::format`])
+    /// and echoes the formatted content back in the tool result. Best-effort:
+    /// missing binaries, failures, and timeouts never fail the edit. OFF by
+    /// default — opt in via `format_after_edit: true` in config.json.
+    pub format_after_edit: bool,
 }
 
 /// Default time-to-first-token grace for streaming LLM calls (180s).
@@ -205,6 +212,7 @@ impl Default for AgentConfig {
                 "OCTOS_VOICE_LLM_DEADLINE_SECS",
                 DEFAULT_VOICE_LLM_DEADLINE_SECS,
             ),
+            format_after_edit: false,
         }
     }
 }
@@ -445,6 +453,28 @@ pub struct Agent {
     /// `None` keeps pre-Task-8 behaviour byte-for-byte — the original
     /// `eyre::Report` still flows out of the loop unchanged.
     pub(super) voice_failure_sink: Option<tokio::sync::mpsc::UnboundedSender<crate::TurnFailure>>,
+    /// Git-backed workspace snapshot store (#1768, opt-in). When present,
+    /// `execute_tools` records a snapshot of the workspace before any
+    /// batch containing a mutating tool so the user can restore
+    /// pre-mutation state later. `None` (the default) disables the
+    /// feature entirely — no git subprocess is ever spawned.
+    pub(super) snapshot_manager: Option<Arc<crate::snapshot::SnapshotManager>>,
+    /// Per-turn pending-input buffer for mid-turn prompt injection
+    /// ("steer") — codex `TurnState.pending_input` parity. The host pushes
+    /// while the turn runs; the conversation loop drains FIFO at the top of
+    /// each iteration (before the next LLM call) and appends each entry as
+    /// a plain `role: user` message with no wrapper text. A steer that
+    /// lands after the model's final answer forces one more round
+    /// (`needs_follow_up = model_wants_more || buffer_nonempty`). `None`
+    /// (the default) keeps the loop byte-identical to pre-steer behaviour.
+    pub(super) steer_buffer: Option<crate::steering::SharedSteerBuffer>,
+    /// Host callback observing each drained steer batch (codex
+    /// `record_user_prompt_and_emit_turn_item` parity): the host persists
+    /// the injected user message + emits its standard persisted
+    /// user-message event. Called inline at the drain point, before the
+    /// next LLM call. When set, drained steer rows stay OUT of the turn
+    /// output log so end-of-turn persistence cannot double-write them.
+    pub(super) steer_drained_callback: Option<crate::steering::SteerDrainedCallback>,
 }
 
 impl Agent {
@@ -519,6 +549,9 @@ impl Agent {
             session_scope: None,
             verifier_config: None,
             voice_failure_sink: None,
+            snapshot_manager: None,
+            steer_buffer: None,
+            steer_drained_callback: None,
         }
     }
 
@@ -594,6 +627,9 @@ impl Agent {
             session_scope: None,
             verifier_config: None,
             voice_failure_sink: None,
+            snapshot_manager: None,
+            steer_buffer: None,
+            steer_drained_callback: None,
         }
     }
 
@@ -765,6 +801,33 @@ impl Agent {
         self.voice_failure_sink = Some(tx);
     }
 
+    /// Attach the per-turn pending-input buffer for mid-turn prompt
+    /// injection ("steer"). The host keeps a clone and pushes inputs while
+    /// the turn runs; the conversation loop drains FIFO at the top of each
+    /// iteration, before the next LLM call, appending each entry as a plain
+    /// `role: user` message (codex `TurnState.pending_input` parity —
+    /// codex-rs `core/src/session/turn.rs:225-233`). Absent = pre-steer
+    /// behaviour, byte-identical.
+    pub fn with_steer_buffer(mut self, buffer: crate::steering::SharedSteerBuffer) -> Self {
+        self.steer_buffer = Some(buffer);
+        self
+    }
+
+    /// Register the host callback observing each drained steer batch.
+    /// Called inline from the drain point (after the drained texts joined
+    /// the prompt, before the next LLM call) so the host can persist the
+    /// injected user message and emit its standard persisted user-message
+    /// event. When set, the loop keeps drained steer rows OUT of
+    /// `ConversationResponse.messages` — the host owns their persistence,
+    /// and the end-of-turn persist pass must not write them again.
+    pub fn with_steer_drained_callback(
+        mut self,
+        callback: crate::steering::SteerDrainedCallback,
+    ) -> Self {
+        self.steer_drained_callback = Some(callback);
+        self
+    }
+
     /// Enable M8.4's [`FileStateCache`] for file tools.
     ///
     /// When set, file tools like `read_file`, `write_file`, `edit_file`, and
@@ -928,6 +991,24 @@ impl Agent {
     pub fn with_harness_event_sink(mut self, sink_path: impl Into<String>) -> Self {
         self.harness_event_sink = Some(sink_path.into());
         self
+    }
+
+    /// Attach a workspace [`crate::snapshot::SnapshotManager`] (#1768).
+    /// When present, `execute_tools` records a snapshot before any batch
+    /// containing a mutating tool (see
+    /// [`crate::snapshot::is_mutating_tool`]) so the user can later
+    /// restore pre-mutation state. `None` (the default) disables
+    /// snapshotting entirely — the feature is opt-in.
+    pub fn with_snapshot_manager(mut self, manager: Arc<crate::snapshot::SnapshotManager>) -> Self {
+        self.snapshot_manager = Some(manager);
+        self
+    }
+
+    /// Returns the attached snapshot manager, if any. Lets hosts (and the
+    /// follow-up UI/RPC surface) list/restore snapshots for this agent's
+    /// workspace.
+    pub fn snapshot_manager(&self) -> Option<Arc<crate::snapshot::SnapshotManager>> {
+        self.snapshot_manager.clone()
     }
 
     /// Set per-session runtime limits for tool execution.

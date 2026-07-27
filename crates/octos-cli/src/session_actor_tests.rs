@@ -1,5 +1,6 @@
 use super::*;
 use async_trait::async_trait;
+#[cfg(unix)]
 use octos_agent::{HookConfig, HookEvent};
 use octos_llm::{AdaptiveConfig, ChatConfig, ChatResponse, StopReason, TokenUsage, ToolSpec};
 use std::sync::atomic::AtomicUsize;
@@ -5822,6 +5823,100 @@ async fn test_dispatch_routes_to_default_profile() {
         keys[0].starts_with("_main:"),
         "dispatch key should start with _main when no profile_id, got: {}",
         keys[0]
+    );
+}
+
+/// #436/#437 — the peer inbox registry lifecycle: a `peer-<slug>` session
+/// registers its inbox sender on dispatch (so `peer_send_input` can find and
+/// deliver to it), and `remove_session` purges that entry (so a deleted peer
+/// leaves no stale, still-injectable sender behind). Regression guard: the
+/// registry holds a strong `Sender` clone, so the old `retain(!is_closed)`
+/// purge could never evict the entry on delete.
+#[tokio::test]
+async fn peer_inbox_registry_registers_on_dispatch_and_purges_on_remove() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let (mut registry, _rx) = setup_dispatch_registry(&dir).await;
+
+    // A peer session: topic `peer-<slug>` routed under profile `weather`.
+    let slug = "lifecycle-slug";
+    let sk = SessionKey::with_topic("api", "peerchat", &format!("peer-{slug}"));
+    let reg_key = peer_inbox_key("weather", slug);
+
+    let msg = InboundMessage {
+        channel: "api".to_string(),
+        sender_id: "user1".to_string(),
+        chat_id: "peerchat".to_string(),
+        content: "hello peer".to_string(),
+        timestamp: chrono::Utc::now(),
+        media: vec![],
+        metadata: serde_json::json!({}),
+        message_id: None,
+        origin: octos_core::MessageOrigin::ExternalUser,
+    };
+
+    registry
+        .dispatch(DispatchParams {
+            message: msg,
+            image_media: vec![],
+            attachment_media: vec![],
+            attachment_prompt: None,
+            session_key: sk.clone(),
+            reply_channel: "api",
+            reply_chat_id: "peerchat",
+            status_indicator: None,
+            profile_id: Some("weather"),
+            tenant_id: Some("weather"),
+            system_prompt_override: None,
+            sender_user_id: None,
+        })
+        .await;
+
+    // register: the peer inbox entry exists after dispatch.
+    assert!(
+        peer_inbox_registry().lock().unwrap().contains_key(&reg_key),
+        "peer inbox should be registered under {reg_key} after dispatch, keys: {:?}",
+        peer_inbox_registry()
+            .lock()
+            .unwrap()
+            .keys()
+            .collect::<Vec<_>>()
+    );
+
+    // deliver: the registered sender accepts a cross-session message — exactly
+    // what the `peer_send_input` callback does (build an `Inbound` + try_send).
+    {
+        let map = peer_inbox_registry().lock().unwrap();
+        let tx = map.get(&reg_key).expect("peer inbox sender registered");
+        let injected = InboundMessage {
+            channel: String::new(),
+            sender_id: String::new(),
+            chat_id: String::new(),
+            content: "steer the peer".to_string(),
+            timestamp: chrono::Utc::now(),
+            media: vec![],
+            metadata: serde_json::json!({"origin": "peer_send_input"}),
+            message_id: None,
+            origin: octos_core::MessageOrigin::Synthetic,
+        };
+        tx.try_send(ActorMessage::Inbound {
+            message: injected,
+            image_media: vec![],
+            attachment_media: vec![],
+            attachment_prompt: None,
+        })
+        .expect("delivery to a running peer inbox should succeed");
+    }
+
+    // remove: after the session is deleted, no stale entry may remain.
+    registry.remove_session(&sk.to_string());
+    assert!(
+        !peer_inbox_registry().lock().unwrap().contains_key(&reg_key),
+        "peer inbox entry must be purged after remove_session, keys: {:?}",
+        peer_inbox_registry()
+            .lock()
+            .unwrap()
+            .keys()
+            .collect::<Vec<_>>()
     );
 }
 

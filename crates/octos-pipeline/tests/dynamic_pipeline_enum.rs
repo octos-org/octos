@@ -321,10 +321,12 @@ async fn gateway_path_installed_wins_and_bundled_discovers() {
             dot.contains("digraph deep_research"),
             "bundled copy must resolve when no install exists"
         );
-        // The fixed tool name must be present (regression guard for Blocker 1).
+        // The fixed tool name must be present (regression guard for Blocker 1),
+        // now including the `write_file` grant so workers can write their
+        // `findings-{label}.md` deliverable.
         assert!(
-            dot.contains("tools=\"search,read_file\""),
-            "bundled deep_research must allow-list the registered `search` tool, not `deep_search`"
+            dot.contains("tools=\"search,read_file,write_file\""),
+            "bundled deep_research must allow-list the registered `search` tool (+ write_file for the findings deliverable), not `deep_search`; got: {dot}"
         );
     }
 

@@ -8,6 +8,8 @@
 //! E) uninstall (deactivate) runs shutdown phase
 //! F) HTTP discovery failure aborts install — no tools partially registered
 
+#![cfg(unix)]
+
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 

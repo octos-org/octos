@@ -6,6 +6,36 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
 #[test]
+fn sanitize_label_for_filename_yields_a_deterministic_fs_safe_token() {
+    // deep_research workers write `findings-{label}.md`; the substituted token
+    // must be stable + filesystem-safe so the analyze node reads it back by name.
+    assert_eq!(
+        sanitize_label_for_filename("Official Docs"),
+        "official_docs"
+    );
+    assert_eq!(
+        sanitize_label_for_filename("Alternatives / Comparisons"),
+        "alternatives_comparisons"
+    );
+    assert_eq!(
+        sanitize_label_for_filename("  Recent Trends!!!  "),
+        "recent_trends"
+    );
+    assert_eq!(sanitize_label_for_filename("Task 3"), "task_3");
+    // No usable characters → fallback, so a filename is never `findings-.md`.
+    assert_eq!(sanitize_label_for_filename("///"), "task");
+    // CJK (and other alphanumeric scripts) are preserved.
+    assert_eq!(sanitize_label_for_filename("技术架构"), "技术架构");
+    // Length is capped (by chars, UTF-8-safe) so a pathological label can't
+    // overflow the filename; per-worker uniqueness comes from the index suffix
+    // the caller appends, not from the full label.
+    let long = "a".repeat(200);
+    assert_eq!(sanitize_label_for_filename(&long).chars().count(), 48);
+    let long_cjk = "中".repeat(100);
+    assert_eq!(sanitize_label_for_filename(&long_cjk).chars().count(), 48);
+}
+
+#[test]
 fn fanout_worker_deadline_priority_and_clamp() {
     // No deadline/timeout → absolute ceiling (never `None`, so a worker can
     // never hang forever).

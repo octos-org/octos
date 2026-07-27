@@ -34,6 +34,35 @@ use crate::handler::{CodergenHandler, GateHandler, HandlerContext, HandlerRegist
 use crate::parser::parse_dot;
 use crate::validate;
 
+/// Sanitize a fan-out worker label into a filesystem-safe token for prompt
+/// substitution (e.g. the `findings-{label}.md` deliverable deep_research
+/// workers write): lowercased, every run of non-alphanumeric characters
+/// collapsed to a single `_`, and leading/trailing `_` trimmed. Alphanumeric
+/// scripts including CJK are preserved. Falls back to `task` when the label has
+/// no usable characters, so a substituted filename is never `findings-.md`.
+fn sanitize_label_for_filename(label: &str) -> String {
+    let mut out = String::with_capacity(label.len());
+    let mut prev_underscore = false;
+    for c in label.trim().chars() {
+        if c.is_alphanumeric() {
+            out.extend(c.to_lowercase());
+            prev_underscore = false;
+        } else if !prev_underscore {
+            out.push('_');
+            prev_underscore = true;
+        }
+    }
+    let trimmed = out.trim_matches('_');
+    if trimmed.is_empty() {
+        "task".to_string()
+    } else {
+        // Cap the length (by chars, UTF-8-safe) so a pathological label can't
+        // produce a filename-too-long error. Per-worker uniqueness is added by
+        // the caller (the fan-out index), so truncation can't collide two lanes.
+        trimmed.chars().take(48).collect()
+    }
+}
+
 /// Minimum projected USD per LLM-call node when no model-specific rate
 /// is available. Keeps the reservation path live for unknown models so
 /// budget-policy breaches surface on every dispatch rather than slipping
@@ -3219,11 +3248,28 @@ impl PipelineExecutor {
                 let mut synthetic_nodes: Vec<(String, PipelineNode)> = Vec::new();
                 for (i, task) in tasks.iter().enumerate() {
                     let task_id = format!("{}_task_{i}", node.id);
-                    let prompt = worker_prompt_template.replace("{task}", &task.task);
                     let label = task
                         .label
                         .clone()
                         .unwrap_or_else(|| format!("Task {}", i + 1));
+                    // Substitute BOTH {task} and {label}. {label} is sanitized to a
+                    // filesystem-safe token so a worker can be told to write a
+                    // deterministic `findings-{label}.md` deliverable the converge
+                    // node reads back by name (previously only {task} was
+                    // substituted, so `{label}` reached the model literally and the
+                    // file-pointer contract was unreliable).
+                    let prompt = worker_prompt_template
+                        .replace("{task}", &task.task)
+                        // Append the fan-out index so two labels that sanitize to
+                        // the same token (e.g. "Official Docs" / "official docs",
+                        // or duplicate CJK labels) don't both write the SAME
+                        // findings file and silently overwrite each other. The
+                        // analyze node reads `findings-*.md`, so uniqueness here
+                        // doesn't break its glob.
+                        .replace(
+                            "{label}",
+                            &format!("{}-{i}", sanitize_label_for_filename(&label)),
+                        );
 
                     // Round-robin model from pool
                     let worker_model = Some(model_pool[i % model_pool.len()].to_string());
