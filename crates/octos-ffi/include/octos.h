@@ -1,3 +1,19 @@
+/*
+ * octos-ffi C API.
+ *
+ * OWNERSHIP & SAFETY CONTRACT:
+ *  - An OctosRuntime* is NOT thread-safe. Serialize all calls on a handle.
+ *    Never use a handle after octos_runtime_free(); never free it twice or
+ *    concurrently with any other call on the same handle. Free it from a plain
+ *    (non-async) thread.
+ *  - Strings returned by octos_run_task()/octos_embed() are owned by YOU and
+ *    must be freed, UNMODIFIED, with octos_string_free() -- never free(3),
+ *    never twice, and do not alter the bytes or NUL terminator before freeing.
+ *  - const char* from octos_last_error()/octos_version() must NOT be freed.
+ *    octos_last_error() is thread-local and valid only until the next FFI call
+ *    on the same thread.
+ */
+
 #ifndef OCTOS_FFI_H
 #define OCTOS_FFI_H
 
@@ -10,10 +26,21 @@
 #include <stdint.h>
 #include <stdlib.h>
 
-// Opaque runtime handle. Holds the shared pieces (tokio runtime, provider,
-// memory) and rebuilds a fresh [`Agent`] per task so a per-task
-// `max_iterations` can be honored (the `Agent` config is otherwise fixed at
-// construction).
+// Opaque runtime handle.
+//
+// # Thread-safety & lifetime (C-ABI contract)
+//
+// An `OctosRuntime` handle is NOT thread-safe. Do not call any function on a
+// handle after [`octos_runtime_free`]. Do not call [`octos_runtime_free`]
+// concurrently with — or while any other call on the same handle is in flight.
+// Serialize all calls on a given handle (or guard it with your own mutex): a
+// concurrent run+free is a use-after-free and free+free is a double-free, and
+// the library cannot prevent either across a C ABI. Also free the handle from
+// a plain (non-async) thread — dropping the held tokio runtime from inside
+// another async/tokio context fails.
+//
+// (Internally: shared tokio runtime + provider + memory; a fresh [`Agent`] is
+// built per task so a per-task `max_iterations` can be honored.)
 typedef struct OctosRuntime OctosRuntime;
 
 #ifdef __cplusplus
@@ -26,20 +53,30 @@ extern "C" {
 OctosRuntime *octos_runtime_new(const char *config_json);
 
 // Free a runtime created by [`octos_runtime_new`]. NULL is a no-op.
+//
+// Call from a plain (non-async) thread and never concurrently with another
+// call on the same handle (see [`OctosRuntime`]).
 void octos_runtime_free(OctosRuntime *runtime);
 
 // Run a one-shot task. `brief_json` is `{"prompt": "...", "max_iterations"?:
-// N}`. Returns owned JSON `{"output", "iterations", "tokens"}` (free with
-// [`octos_string_free`]) or NULL on error.
+// N}`. Returns owned JSON `{"output", "iterations", "tokens"}` that the caller
+// must free, UNMODIFIED, with [`octos_string_free`] — or NULL on error.
 char *octos_run_task(OctosRuntime *runtime, const char *brief_json);
 
-// Embed `text`. Returns owned JSON `{"embedding": [f32, ...]}` (free with
-// [`octos_string_free`]) or NULL on error. Requires the `embed-llama` feature
-// and an `embedding_model_path` in the config.
+// Embed `text`. Returns owned JSON `{"embedding": [f32, ...]}` that the caller
+// must free, UNMODIFIED, with [`octos_string_free`] — or NULL on error.
+// Requires the `embed-llama` feature and an `embedding_model_path` in the
+// config.
 char *octos_embed(OctosRuntime *runtime, const char *text);
 
 // Free a string returned by [`octos_run_task`] / [`octos_embed`]. NULL is a
-// no-op. Never call `free(3)` on these; never double-free.
+// no-op.
+//
+// The string is owned by the caller and MUST be freed here, UNMODIFIED — do
+// not alter its bytes or NUL terminator before freeing. (This reclaims via
+// `CString::from_raw`, which rescans for the NUL; a mutated terminator
+// miscomputes the length and corrupts the allocator.) Never call `free(3)` on
+// these; never double-free.
 void octos_string_free(char *s);
 
 // Return the thread-local last-error string, or NULL if none. Do NOT free it;

@@ -48,6 +48,15 @@ pub struct Config {
     #[serde(default)]
     pub env_vars: std::collections::HashMap<String, String>,
 
+    /// When true, [`Config::get_api_key`] skips the global `AuthStore` lookup so
+    /// an explicitly-supplied key (e.g. the `env_vars`-injected key the
+    /// `octos-ffi` embedding API passes) is authoritative and cannot be silently
+    /// shadowed by a host's `octos auth login` credentials for the same
+    /// provider. Internal, not (de)serialized; default `false` preserves the
+    /// CLI / gateway resolution order.
+    #[serde(skip)]
+    pub bypass_auth_store: bool,
+
     /// Override auto-detected model behavior hints for the OpenAI provider.
     /// Useful for custom/unknown models behind OpenAI-compatible proxies.
     #[serde(default)]
@@ -1950,11 +1959,16 @@ impl Config {
         // independent of `--data-dir`, so per-profile gateways keep the host's
         // shared `octos auth login` credentials. We resolve the context with no
         // cli_data_dir because auth_home never depends on it.
-        let auth_home = crate::config_context::resolve_config_context(None).auth_home;
-        if let Ok(store) = crate::auth::AuthStore::at(&auth_home) {
-            if let Some(cred) = store.get(provider) {
-                if !cred.is_expired() {
-                    return Ok(cred.access_token.clone());
+        //
+        // `bypass_auth_store` opts out (used by octos-ffi): a caller that passed
+        // an explicit key must have it win over any ambient login credential.
+        if !self.bypass_auth_store {
+            let auth_home = crate::config_context::resolve_config_context(None).auth_home;
+            if let Ok(store) = crate::auth::AuthStore::at(&auth_home) {
+                if let Some(cred) = store.get(provider) {
+                    if !cred.is_expired() {
+                        return Ok(cred.access_token.clone());
+                    }
                 }
             }
         }

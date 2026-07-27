@@ -63,10 +63,35 @@ Task result: `{"output": "...", "iterations": N, "tokens": {"input", "output", .
 
 ### Safety contract
 
-- The runtime handle is opaque; free it exactly once with `octos_runtime_free`.
-- Strings from `octos_run_task`/`octos_embed` are owned by the caller and must
-  be freed with `octos_string_free` — never `free(3)`, never twice.
-- All pointer arguments are NULL-checked and panics never cross the boundary.
+- **Handle thread-safety & lifetime.** An `OctosRuntime*` is NOT thread-safe.
+  Do not call any function on a handle after `octos_runtime_free`. Do not call
+  `octos_runtime_free` concurrently with — or while any other call on the same
+  handle is in flight. Serialize all calls on a handle (or guard it with your
+  own mutex): a concurrent run+free is a use-after-free and free+free is a
+  double-free, and the library cannot prevent either across a C ABI.
+- **Free from a non-async thread.** `octos_runtime_free` drops a tokio runtime;
+  dropping it from inside a host's own async/tokio context fails. Call
+  `octos_run_task`/`octos_embed`/`octos_runtime_free` from a plain thread (they
+  block internally). The panic firewall contains such misuse (returns
+  null/no-op) but the runtime cannot then clean up fully.
+- **Returned strings are immutable + caller-owned.** Strings from
+  `octos_run_task`/`octos_embed` MUST be freed, UNMODIFIED, with
+  `octos_string_free` — never `free(3)`, never twice, and do not alter the bytes
+  or the NUL terminator before freeing (freeing rescans for the NUL; a mutated
+  terminator corrupts the allocator).
+- **Panics never cross the boundary.** Every export runs inside a panic
+  firewall; a panic becomes a null/error return, never an unwind into C.
+- **Errors are redacted.** `octos_last_error` strings are scrubbed of
+  credential-shaped tokens and length-capped before being exposed.
+
+### Credentials
+
+Resolution reuses octos's `Config`. An **explicitly-passed `api_key` (or
+`api_key_env`) wins**: the FFI marks the config to bypass the global
+`octos auth login` AuthStore for that call, so a host that happens to be logged
+in cannot silently shadow the caller's key. If you supply neither, resolution
+falls back to the conventional `{PROVIDER}_API_KEY` process env var and the
+AuthStore, in that order.
 
 ## Python (ctypes) example
 
