@@ -158,6 +158,25 @@ fn looks_secretish(word: &str) -> bool {
         && w.bytes().any(|b| b.is_ascii_digit())
 }
 
+/// The canonical provider name the factory resolves the credential under.
+///
+/// `create_provider_with_api_type` normalizes the caller's provider spelling to
+/// its canonical registry name (case-insensitive alias lookup — e.g.
+/// `qwen`→`dashscope`, `OpenAI`→`openai`) and calls `get_api_key(entry.name)`.
+/// The FFI MUST resolve `secret` under that SAME canonical name, or a key stored
+/// under the canonical name (notably an auth-store credential, which is keyed by
+/// the raw provider string) is missed and a later error goes unscrubbed. `custom`
+/// stays as-is (the factory resolves it under `"custom"`); an unknown name passes
+/// through (the factory then fails on it before any key is needed).
+fn canonical_provider_name(provider: &str) -> String {
+    if provider == "custom" {
+        return "custom".to_string();
+    }
+    octos_llm::registry::lookup(provider)
+        .map(|entry| entry.name.to_string())
+        .unwrap_or_else(|| provider.to_string())
+}
+
 /// The FFI-facing config accepted by [`octos_runtime_new`] as JSON.
 #[derive(Debug, Deserialize)]
 struct FfiConfig {
@@ -388,10 +407,15 @@ fn runtime_new_impl(config_json: *const c_char) -> Result<*mut OctosRuntime, Str
     // Resolve the ACTUAL key value that will be used, from whatever source
     // (env_vars-injected api_key, api_key_env process var, default env var, or —
     // when not bypassed — the auth store), so it can be exact-scrubbed out of
-    // any error text regardless of how it was supplied. `.ok()` because a
-    // key-less provider (or a genuinely missing key) is not itself a redaction
-    // concern; a missing REQUIRED key still fails at `create_provider` below.
-    let resolved_secret = cli_cfg.get_api_key(&cfg.provider).ok();
+    // any error text regardless of how it was supplied. Resolve under the
+    // CANONICAL provider name (matching the factory), so an auth-store key stored
+    // under the canonical name is not missed when the caller used an alias/case
+    // variant. `.ok()` because a key-less provider (or a genuinely missing key)
+    // is not itself a redaction concern; a missing REQUIRED key still fails at
+    // `create_provider` below.
+    let resolved_secret = cli_cfg
+        .get_api_key(&canonical_provider_name(&cfg.provider))
+        .ok();
 
     let llm = create_provider_with_api_type(
         &cfg.provider,
@@ -726,32 +750,68 @@ mod tests {
     }
 
     #[test]
-    fn secret_captured_from_api_key_env_and_scrubbed() {
-        // A short key sourced via `api_key_env` (process env) must be captured
-        // into `OctosRuntime.secret` and exact-scrubbed — not just a directly
-        // passed `api_key`. Follows the codebase convention of `unsafe set_var`
-        // in tests; the var name is unique to avoid cross-test collisions.
-        let var = "OCTOS_FFI_TEST_APIKEYENV_SHORT";
-        // SAFETY: test-only process env mutation with a unique var name.
-        unsafe { std::env::set_var(var, "abc") };
+    fn canonical_provider_name_matches_factory() {
+        // The factory resolves the credential under the canonical registry name;
+        // `secret` must resolve under the SAME name. Case + real alias + custom +
+        // unknown-passthrough.
+        assert_eq!(canonical_provider_name("qwen"), "dashscope"); // alias
+        assert_eq!(canonical_provider_name("OpenAI"), "openai"); // case
+        assert_eq!(canonical_provider_name("custom"), "custom"); // special-cased
+        assert_eq!(
+            canonical_provider_name("totally-unknown-xyz"),
+            "totally-unknown-xyz"
+        ); // passthrough
+    }
 
-        let cfg_json =
-            format!(r#"{{"provider":"openai","model":"gpt-4o-mini","api_key_env":"{var}"}}"#);
-        let cfg = CString::new(cfg_json).unwrap();
-        let raw = runtime_new_impl(cfg.as_ptr()).expect("runtime built");
-        // SAFETY: non-null handle just built by `runtime_new_impl`.
-        let rt = unsafe { &*raw };
-        // The api_key_env-sourced key is captured for scrubbing, even at 3 chars.
-        assert_eq!(rt.secret.as_deref(), Some("abc"));
+    #[test]
+    fn resolved_secret_uses_canonical_name_so_authstore_key_is_found_and_scrubbed() {
+        // Hermetic (temp auth store; no process-env mutation, no subprocess).
+        // A credential stored under the CANONICAL name `dashscope` must be found
+        // when the caller configures the ALIAS `qwen` — which is exactly what
+        // resolving under `canonical_provider_name(cfg.provider)` achieves — and
+        // the resolved token must then be exact-scrubbed out of an error string.
+        let dir = std::env::temp_dir().join(format!(
+            "octos-ffi-auth-{}-{}",
+            std::process::id(),
+            MEM_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let token = "canon-token-abc123XYZ";
+        {
+            let mut store = octos_cli::auth::AuthStore::at(&dir).unwrap();
+            store
+                .set(
+                    "dashscope",
+                    octos_cli::auth::AuthCredential {
+                        access_token: token.to_string(),
+                        refresh_token: None,
+                        expires_at: None,
+                        provider: "dashscope".to_string(),
+                        auth_method: "paste_token".to_string(),
+                    },
+                )
+                .unwrap();
+        }
+
+        let store = octos_cli::auth::AuthStore::at(&dir).unwrap();
+        // The alias spelling misses the canonically-keyed credential...
+        assert!(store.get("qwen").is_none());
+        // ...but the canonical name the FFI now resolves under hits it.
+        let canonical = canonical_provider_name("qwen");
+        let found = store
+            .get(&canonical)
+            .expect("credential under canonical name");
+        assert_eq!(found.access_token, token);
+
+        // And the resolved token is scrubbed from error text.
         let scrubbed = scrub_secret(
-            "provider 401: bad key abc".to_string(),
-            rt.secret.as_deref(),
+            format!("401 unauthorized: {token}"),
+            Some(&found.access_token),
         );
         assert!(scrubbed.contains("<redacted>"));
-        assert!(!scrubbed.contains("abc"));
+        assert!(!scrubbed.contains(token));
 
-        octos_runtime_free(raw);
-        // SAFETY: test cleanup of the unique var.
-        unsafe { std::env::remove_var(var) };
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
