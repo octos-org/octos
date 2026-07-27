@@ -177,6 +177,29 @@ fn canonical_provider_name(provider: &str) -> String {
         .unwrap_or_else(|| provider.to_string())
 }
 
+/// Synthetic `env_vars` key the once-resolved credential is pinned under. Since
+/// `Config::api_key_env` takes precedence in `get_api_key`'s lookup, pointing it
+/// at this name makes the factory read exactly the pinned value (not any real
+/// process var of the same name — `env_vars` is checked before process env).
+const PINNED_KEY_ENV: &str = "OCTOS_FFI_RESOLVED_KEY";
+
+/// Pin a once-resolved effective key into `cli_cfg` so the provider factory's
+/// own `get_api_key` returns THIS exact value deterministically — from
+/// `env_vars`, with the auth store bypassed — instead of performing a SECOND
+/// AuthStore/process-env resolution that a mid-flight credential rotation could
+/// make disagree with the value we captured for `secret`. No-op when nothing
+/// resolved (the factory then fails on a genuinely missing required key, as
+/// before).
+fn pin_resolved_key(cli_cfg: &mut Config, resolved: Option<&str>) {
+    if let Some(key) = resolved {
+        cli_cfg.api_key_env = Some(PINNED_KEY_ENV.to_string());
+        cli_cfg
+            .env_vars
+            .insert(PINNED_KEY_ENV.to_string(), key.to_string());
+        cli_cfg.bypass_auth_store = true;
+    }
+}
+
 /// The FFI-facing config accepted by [`octos_runtime_new`] as JSON.
 #[derive(Debug, Deserialize)]
 struct FfiConfig {
@@ -404,18 +427,22 @@ fn runtime_new_impl(config_json: *const c_char) -> Result<*mut OctosRuntime, Str
         cli_cfg.bypass_auth_store = true;
     }
 
-    // Resolve the ACTUAL key value that will be used, from whatever source
-    // (env_vars-injected api_key, api_key_env process var, default env var, or —
-    // when not bypassed — the auth store), so it can be exact-scrubbed out of
-    // any error text regardless of how it was supplied. Resolve under the
-    // CANONICAL provider name (matching the factory), so an auth-store key stored
-    // under the canonical name is not missed when the caller used an alias/case
-    // variant. `.ok()` because a key-less provider (or a genuinely missing key)
-    // is not itself a redaction concern; a missing REQUIRED key still fails at
-    // `create_provider` below.
-    let resolved_secret = cli_cfg
-        .get_api_key(&canonical_provider_name(&cfg.provider))
-        .ok();
+    // SINGLE credential resolution. Resolve the effective key EXACTLY ONCE, from
+    // whatever source (env_vars-injected api_key, api_key_env process var,
+    // default env var, or — when not bypassed — the auth store), under the
+    // CANONICAL provider name the factory uses (so an auth-store key keyed by the
+    // canonical name is not missed when the caller used an alias/case variant).
+    let canonical = canonical_provider_name(&cfg.provider);
+    let resolved_secret = cli_cfg.get_api_key(&canonical).ok();
+
+    // Pin that single resolution back into the config so the factory's OWN
+    // `get_api_key` returns this exact value from `env_vars` — never doing a
+    // second AuthStore/process-env read that a mid-flight credential rotation
+    // could make disagree. After this, `resolved_secret` == the key the provider
+    // is built with, by construction, so `secret` mirrors it deterministically.
+    // `.ok()` above (not `?`) because a genuinely missing REQUIRED key is not a
+    // redaction concern and still fails at `create_provider` below.
+    pin_resolved_key(&mut cli_cfg, resolved_secret.as_deref());
 
     let llm = create_provider_with_api_type(
         &cfg.provider,
@@ -670,6 +697,27 @@ pub extern "C" fn octos_version() -> *const c_char {
 mod tests {
     use super::*;
 
+    /// Unique temp dir for a hermetic auth store (no process-env, no subprocess).
+    fn tmp_auth_dir() -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "octos-ffi-auth-{}-{}",
+            std::process::id(),
+            MEM_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn cred(token: &str, provider: &str) -> octos_cli::auth::AuthCredential {
+        octos_cli::auth::AuthCredential {
+            access_token: token.to_string(),
+            refresh_token: None,
+            expires_at: None,
+            provider: provider.to_string(),
+            auth_method: "paste_token".to_string(),
+        }
+    }
+
     #[test]
     fn owned_string_round_trips_through_free() {
         let ptr = to_owned_ptr("hello ffi".to_string()).expect("no interior NUL");
@@ -770,28 +818,11 @@ mod tests {
         // when the caller configures the ALIAS `qwen` — which is exactly what
         // resolving under `canonical_provider_name(cfg.provider)` achieves — and
         // the resolved token must then be exact-scrubbed out of an error string.
-        let dir = std::env::temp_dir().join(format!(
-            "octos-ffi-auth-{}-{}",
-            std::process::id(),
-            MEM_COUNTER.fetch_add(1, Ordering::Relaxed)
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-
+        let dir = tmp_auth_dir();
         let token = "canon-token-abc123XYZ";
         {
             let mut store = octos_cli::auth::AuthStore::at(&dir).unwrap();
-            store
-                .set(
-                    "dashscope",
-                    octos_cli::auth::AuthCredential {
-                        access_token: token.to_string(),
-                        refresh_token: None,
-                        expires_at: None,
-                        provider: "dashscope".to_string(),
-                        auth_method: "paste_token".to_string(),
-                    },
-                )
-                .unwrap();
+            store.set("dashscope", cred(token, "dashscope")).unwrap();
         }
 
         let store = octos_cli::auth::AuthStore::at(&dir).unwrap();
@@ -813,5 +844,66 @@ mod tests {
         assert!(!scrubbed.contains(token));
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn factory_consumes_the_single_resolved_pinned_key() {
+        // The single-resolution invariant: a key resolved ONCE (here sourced
+        // from a temp auth store, keyed by the canonical `dashscope`) and pinned
+        // via `pin_resolved_key` is what the factory's OWN `get_api_key` returns
+        // and what it builds the provider with — no second AuthStore/env read.
+        let dir = tmp_auth_dir();
+        let token = "authstore-only-tok-42abc";
+        {
+            let mut store = octos_cli::auth::AuthStore::at(&dir).unwrap();
+            store.set("dashscope", cred(token, "dashscope")).unwrap();
+        }
+
+        // Resolve ONCE (simulating runtime_new_impl's single read).
+        let resolved = octos_cli::auth::AuthStore::at(&dir)
+            .unwrap()
+            .get(&canonical_provider_name("qwen"))
+            .map(|c| c.access_token.clone());
+        assert_eq!(resolved.as_deref(), Some(token));
+
+        // Pin it exactly as runtime_new_impl does, then the factory consumes it.
+        let mut cli_cfg: Config = serde_json::from_str("{}").unwrap();
+        pin_resolved_key(&mut cli_cfg, resolved.as_deref());
+
+        // The factory calls get_api_key(canonical); it must return the pinned
+        // value deterministically (from env_vars, auth store bypassed).
+        let canonical = canonical_provider_name("qwen"); // "dashscope"
+        assert_eq!(cli_cfg.get_api_key(&canonical).ok().as_deref(), Some(token));
+
+        // And a provider builds from that config (consumes the pinned key).
+        let provider = create_provider_with_api_type(
+            "qwen",
+            &cli_cfg,
+            Some("qwen-max".to_string()),
+            None,
+            None,
+        );
+        assert!(
+            provider.is_ok(),
+            "provider build failed: {:?}",
+            provider.err()
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn runtime_secret_mirrors_the_single_resolved_key() {
+        // End-to-end through runtime_new_impl: rt.secret equals the exact key the
+        // provider was built with (single resolution → pinned → mirrored).
+        let cfg = CString::new(
+            r#"{"provider":"openai","model":"gpt-4o-mini","api_key":"pinme-key-123"}"#,
+        )
+        .unwrap();
+        let raw = runtime_new_impl(cfg.as_ptr()).expect("runtime built");
+        // SAFETY: non-null handle just built by `runtime_new_impl`.
+        let rt = unsafe { &*raw };
+        assert_eq!(rt.secret.as_deref(), Some("pinme-key-123"));
+        octos_runtime_free(raw);
     }
 }
