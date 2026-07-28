@@ -896,7 +896,9 @@ jobs:
           else
             FILES=$(git diff --name-only ${{ github.event.pull_request.base.sha }} HEAD 2>/dev/null || echo "")
           fi
-          if echo "$FILES" | grep -qE '(sandbox|ssrf|security|tools/mod|session_actor|profiles)'; then
+          # `session_scope` is the path-containment boundary behind
+          # `classify_canonical_path`; it is NOT covered by `session_actor`.
+          if echo "$FILES" | grep -qE '(sandbox|ssrf|security|tools/mod|session_actor|session_scope|profiles)'; then
             echo "run=true" >> "$GITHUB_OUTPUT"
           else
             echo "run=false" >> "$GITHUB_OUTPUT"
