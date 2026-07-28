@@ -184,6 +184,63 @@ Use this when:
 
 Skip it when you just need the CLI — `cargo install --path crates/octos-cli --features "api,telegram,discord,dingtalk,whatsapp,feishu,twilio,wecom,wecom-bot"` is faster. Trim the feature list to only the channels you need (or just `api` for `octos chat` + `octos serve`); leaving `api` off is what causes `octos serve` to fail with `unrecognized subcommand 'serve'`.
 
+## Use octos as a library
+
+Everything above builds the **binary**. octos is also embeddable — as Rust crates, or through C/Python/Swift/Kotlin/JS bindings that wrap the same agent loop.
+
+### Rust
+
+The crates are **not published to crates.io** (`publish = false` in the workspace), so depend on them by git. Pin a tag; `main` moves fast:
+
+```toml
+[dependencies]
+octos-core  = { git = "https://github.com/octos-org/octos", tag = "v2.0.2" }
+octos-agent = { git = "https://github.com/octos-org/octos", tag = "v2.0.2" }
+```
+
+```rust
+use octos_agent::{HookConfig, HookEvent, HookExecutor};
+
+let executor = HookExecutor::new(vec![HookConfig {
+    event: HookEvent::BeforeSpawnVerify,
+    command: vec!["/usr/local/bin/verify-motion".into()],
+    timeout_ms: 5000,
+    tool_filter: vec![],
+    path_filter: vec![],
+    requires_bin: None,
+}]);
+```
+
+Take the smallest layer that does the job — each row pulls in the ones above it:
+
+| Crate | Use it for | Weight |
+| --- | --- | --- |
+| `octos-core` | protocol types, task model, IDs, codecs | leaf — pure deps, the only crate that compiles to `wasm32` |
+| `octos-llm` | provider abstraction, failover/routing | + HTTP/TLS |
+| `octos-memory` | episodic store, hybrid BM25 + vector recall | + `redb` (filesystem) |
+| `octos-agent` | the full loop: tools, sandbox, approvals, hooks | + `tokio` multi-thread, browser/CDP |
+
+Worked examples live in `crates/octos-agent/examples/` — `robot_domain_hook.rs` shows the domain-hook pattern integrators use to veto a dispatched sub-task from live telemetry, without adding domain-specific variants to the core.
+
+Feature flags worth knowing: `octos-agent` defaults to `browser` (CDP `web_search` fallback) and offers `git` and `ast`; in-process embeddings come from `octos-embed-llama` (`embed-llama`, plus `metal` / `cuda`), which is cross-platform and defaults to a CPU backend.
+
+### From other languages
+
+`octos-ffi` is the native core; `octos-pyo3` and `octos-uniffi` are built over it, so those three share behaviour and feature flags. `octos-wasm` is separate — it binds `octos-core` only (see below).
+
+| Binding | Target | Build |
+| --- | --- | --- |
+| **`octos-pyo3`** | Python — **the recommended Python path** | `maturin build --release` (from `crates/octos-pyo3/`) |
+| `octos-ffi` | C ABI — C, Go, Node, anything with FFI | `cargo build -p octos-ffi --release` → `.a` / `.dylib` / `.so` + generated header |
+| `octos-uniffi` | Python, Swift, Kotlin from one definition | `cargo build -p octos-uniffi`, then `cargo run -p octos-uniffi --bin uniffi-bindgen -- generate ...` |
+| `octos-wasm` | Browser / JS | `wasm-pack build --target web` |
+
+Add the in-process GGUF embedder to any of them with the same flag, e.g. `cargo build -p octos-ffi --release --features embed-llama` (or `embed-llama-metal` on Apple GPUs).
+
+**The browser is protocol-only.** `octos-wasm` binds `octos-core` — wire (de)serialization, message/task/ID modelling — and nothing more. The agent loop cannot run in a browser: `redb` needs a filesystem, `tokio`'s multi-thread runtime needs OS threads, and native TLS and llama.cpp do not target `wasm32-unknown-unknown`. Run the agent behind `octos serve` and talk to it over the network.
+
+Each binding has its own README with the full API and examples: [octos-ffi](crates/octos-ffi/README.md) · [octos-pyo3](crates/octos-pyo3/README.md) · [octos-uniffi](crates/octos-uniffi/README.md) · [octos-wasm](crates/octos-wasm/README.md).
+
 ## Clients and the UI Protocol
 
 Interactive clients talk to `octos serve` over **UI Protocol v1** — a JSON-RPC contract carried on WebSocket (`/api/ui-protocol/ws`) or stdio (`octos serve --stdio`). It covers session open with cursor replay, streamed turns, durable persistence events, tool activity, approvals, background tasks, and rollback. The protocol spec is the contract: server and clients release independently against it.
