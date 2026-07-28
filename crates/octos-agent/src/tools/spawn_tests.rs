@@ -1248,8 +1248,10 @@ fn write_mock_podcast_plugin(root: &std::path::Path, script_seen: &std::path::Pa
 }"#,
     )
     .unwrap();
-    let main = plugin_dir.join("main");
-    std::fs::write(
+    #[cfg(unix)]
+    {
+        let main = plugin_dir.join("main");
+        std::fs::write(
             &main,
             format!(
                 r#"#!/usr/bin/env bash
@@ -1278,10 +1280,50 @@ PY
             ),
         )
         .unwrap();
-    #[cfg(unix)]
-    {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&main, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    // On Windows the plugin resolver tries the bare names
+    // [manifest_name, dir_name, "main"] (no extension) and `is_executable` is
+    // just `path.exists()`, so a bare `main` would be selected and
+    // `Command::new(main)` would fail (CreateProcess can't run a shebang
+    // script). We therefore write NO bare `main`: `main.cmd` is picked by the
+    // resolver's directory-scan fallback and is run via cmd.exe by
+    // `std::process::Command` (Rust >= 1.77.2). The logic lives in the dotfile
+    // `.impl.ps1`, which the scan excludes (dotfiles are skipped), so
+    // `main.cmd` stays the only selectable executable. Windows PowerShell 5.1
+    // (`powershell.exe`) ships on windows-latest.
+    #[cfg(windows)]
+    {
+        const PS_IMPL: &str = r##"$ErrorActionPreference = 'Stop'
+# Read ALL of stdin as raw bytes and decode UTF-8 explicitly. Do NOT use
+# $input / [Console]::In: they apply the console OEM codepage and mojibake the
+# CJK script text the test asserts on.
+$in = [System.Console]::OpenStandardInput()
+$ms = New-Object System.IO.MemoryStream
+$in.CopyTo($ms)
+$raw = [System.Text.Encoding]::UTF8.GetString($ms.ToArray())
+$script = $raw
+try { $p = $raw | ConvertFrom-Json; if ($null -ne $p.script) { $script = [string]$p.script } } catch { }
+[System.IO.File]::WriteAllText('@@SCRIPT_SEEN@@', $script, (New-Object System.Text.UTF8Encoding($false)))
+$base = $env:OCTOS_WORK_DIR
+if ([string]::IsNullOrEmpty($base)) { $base = (Get-Location).Path }
+$dir = Join-Path (Join-Path $base 'skill-output') 'mofa-podcast'
+New-Item -ItemType Directory -Force -Path $dir > $null
+$mp3 = Join-Path $dir 'podcast_full_test.mp3'
+[System.IO.File]::WriteAllBytes($mp3, (New-Object 'byte[]' 8192))
+# Hand-build the JSON so files_to_send is ALWAYS an array (PS 5.1
+# ConvertTo-Json collapses single-element arrays) and the path is escaped.
+$e = $mp3.Replace('\','\\').Replace('"','\"')
+[System.Console]::Out.Write('{"output":"Podcast generated successfully: ' + $e + '","success":true,"files_to_send":["' + $e + '"]}')
+"##;
+        let ps_impl = PS_IMPL.replace("@@SCRIPT_SEEN@@", &script_seen.display().to_string());
+        std::fs::write(plugin_dir.join(".impl.ps1"), ps_impl).unwrap();
+        std::fs::write(
+            plugin_dir.join("main.cmd"),
+            "@echo off\r\npowershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"%~dp0.impl.ps1\"\r\n",
+        )
+        .unwrap();
     }
     plugin_root
 }

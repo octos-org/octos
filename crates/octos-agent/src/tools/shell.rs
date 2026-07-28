@@ -1046,10 +1046,16 @@ mod tests {
         std::fs::create_dir_all(&cwd).unwrap();
 
         let tool = ShellTool::new(&cwd);
+        // The product injects these env vars unconditionally (see
+        // `apply_frontend_tool_env`); this test only needs a shell command
+        // that echoes them one per line. `printf`/`$VAR` is POSIX-only, so
+        // use a `cmd`-native `echo %VAR%` form on Windows.
+        #[cfg(windows)]
+        let command = "echo %ASTRO_TELEMETRY_DISABLED%&echo %NPM_CONFIG_CACHE%";
+        #[cfg(not(windows))]
+        let command = "printf '%s\\n%s\\n' \"$ASTRO_TELEMETRY_DISABLED\" \"$NPM_CONFIG_CACHE\"";
         let result = tool
-            .execute(&serde_json::json!({
-                "command": "printf '%s\\n%s\\n' \"$ASTRO_TELEMETRY_DISABLED\" \"$NPM_CONFIG_CACHE\""
-            }))
+            .execute(&serde_json::json!({ "command": command }))
             .await
             .unwrap();
 
@@ -1158,6 +1164,14 @@ mod tests {
         ctx
     }
 
+    /// Render a canonicalized path the way a child shell's `cd`/`pwd` echoes
+    /// it. On Windows `std::fs::canonicalize` yields a `\\?\` verbatim prefix
+    /// that the shell never prints, so strip it via `dunce::simplified`
+    /// (a lexical no-op on Unix, so the assertions below are unchanged there).
+    fn shell_visible_path(p: &std::path::Path) -> String {
+        dunce::simplified(p).to_string_lossy().to_string()
+    }
+
     #[cfg(not(windows))]
     const PWD_COMMAND: &str = "pwd";
     #[cfg(windows)]
@@ -1193,7 +1207,7 @@ mod tests {
         assert!(
             result
                 .output
-                .contains(&canonical_workspace.to_string_lossy().to_string()),
+                .contains(&shell_visible_path(&canonical_workspace)),
             "expected scope workspace ({}) in shell output, got: {}",
             canonical_workspace.display(),
             result.output
@@ -1237,7 +1251,7 @@ mod tests {
         assert!(
             result
                 .output
-                .contains(&canonical_hinted.to_string_lossy().to_string()),
+                .contains(&shell_visible_path(&canonical_hinted)),
             "expected hinted workspace ({}) in shell output, got: {}",
             canonical_hinted.display(),
             result.output
@@ -1245,7 +1259,7 @@ mod tests {
         assert!(
             !result
                 .output
-                .contains(&canonical_default_scope.to_string_lossy().to_string()),
+                .contains(&shell_visible_path(&canonical_default_scope)),
             "default scope workspace ({}) leaked into shell output: {}",
             canonical_default_scope.display(),
             result.output
@@ -1274,7 +1288,7 @@ mod tests {
         assert!(
             result
                 .output
-                .contains(&canonical_legacy.to_string_lossy().to_string()),
+                .contains(&shell_visible_path(&canonical_legacy)),
             "expected legacy cwd ({}) in shell output, got: {}",
             canonical_legacy.display(),
             result.output

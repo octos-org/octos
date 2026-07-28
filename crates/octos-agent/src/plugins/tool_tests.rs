@@ -543,6 +543,13 @@ fn rewrite_workspace_file_args_rejects_raw_parent_dir_on_output_keys() {
         safe,
         skill_output.join("sub/dir/out.toml").to_string_lossy()
     );
+    // A platform-absolute path is passed through verbatim (the sandbox /
+    // scope check is the next gate). `/tmp/...` is not absolute on Windows
+    // (`Path::is_absolute` needs a drive or UNC root), so use a drive-absolute
+    // path there.
+    #[cfg(windows)]
+    let abs_in = "C:\\tmp\\explicit-out.toml";
+    #[cfg(not(windows))]
     let abs_in = "/tmp/explicit-out.toml";
     let abs_out = absolutize_path_in_work_dir(abs_in, &skill_output)
         .expect("absolute path must succeed (sandbox is the next gate)");
