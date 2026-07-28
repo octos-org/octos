@@ -33,6 +33,7 @@ members = [
     "crates/octos-sandbox",
     "crates/octos-swarm",
     "crates/octos-fleet",
+    "crates/octos-fleet-worker",
     "crates/octos-embed-llama",
     "crates/octos-ffi",
     "crates/octos-uniffi",
