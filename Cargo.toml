@@ -32,6 +32,7 @@ members = [
     "crates/octos-plugin",
     "crates/octos-sandbox",
     "crates/octos-swarm",
+    "crates/octos-fleet",
     "crates/octos-embed-llama",
     "crates/octos-ffi",
     "crates/octos-uniffi",
@@ -65,6 +66,7 @@ octos-services = { path = "crates/octos-services" }
 octos-pipeline = { path = "crates/octos-pipeline" }
 octos-plugin = { path = "crates/octos-plugin" }
 octos-swarm = { path = "crates/octos-swarm" }
+octos-fleet = { path = "crates/octos-fleet" }
 octos-embed-llama = { path = "crates/octos-embed-llama" }
 
 # codex-rs crates (reused)

@@ -4741,6 +4741,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "octos-fleet"
+version = "2.0.2"
+dependencies = [
+ "eyre",
+ "octos-core",
+ "redb",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "octos-llm"
 version = "2.0.2"
 dependencies = [
