@@ -596,6 +596,63 @@ impl EpisodeStore {
         }
     }
 
+    /// Episodes that carry no usable vector, as `(episode_id, summary)` ready
+    /// to re-embed.
+    ///
+    /// "Usable" means a persisted embedding whose width matches this store's
+    /// index. An episode qualifies when its vector is ABSENT (saved while no
+    /// embedder was configured, or the embed call failed) or MISMATCHED (the
+    /// embedding model changed — stored vectors cannot be converted to a
+    /// different width, only regenerated).
+    ///
+    /// This is the input to `octos memory reindex`. It reads persisted state
+    /// rather than the in-memory index, so it stays correct regardless of what
+    /// the index dropped at rebuild, and the summary it returns is the exact
+    /// text the save path embeds.
+    ///
+    /// A degraded (lock-contended) handle has no database and returns empty.
+    pub async fn episodes_needing_vectors(&self) -> Result<Vec<(String, String)>> {
+        let Some(db) = self.db.clone() else {
+            return Ok(Vec::new());
+        };
+        let expected = self
+            .index
+            .read()
+            .map(|idx| idx.vector_coverage().dimension)
+            .unwrap_or(DEFAULT_DIMENSION);
+
+        tokio::task::spawn_blocking(move || {
+            let read_txn = db.begin_read()?;
+            let episodes_table = read_txn.open_table(EPISODES_TABLE)?;
+            let embeddings_table = read_txn.open_table(EMBEDDINGS_TABLE)?;
+            let mut out = Vec::new();
+
+            for entry in episodes_table.iter()? {
+                let (key, value) = entry?;
+                let ep_id = key.value().to_string();
+                let Ok(episode) = serde_json::from_str::<Episode>(value.value()) else {
+                    continue;
+                };
+                // An episode with no summary has nothing to embed; skip it
+                // rather than sending empty text to a provider.
+                if episode.summary.trim().is_empty() {
+                    continue;
+                }
+                let width = embeddings_table
+                    .get(ep_id.as_str())
+                    .ok()
+                    .flatten()
+                    .and_then(|v| bincode::deserialize::<Vec<f32>>(v.value()).ok())
+                    .map(|v| v.len());
+                if width != Some(expected) {
+                    out.push((ep_id, episode.summary));
+                }
+            }
+            Ok::<_, eyre::Report>(out)
+        })
+        .await?
+    }
+
     pub async fn store_embedding(&self, episode_id: &str, embedding: Vec<f32>) -> Result<()> {
         // Degraded fallback: skip the disk write, update the in-memory
         // embedding entry only, return success.
@@ -1051,6 +1108,118 @@ mod tests {
             "the re-embedded episode rejoins the vector index"
         );
         assert!((c.ratio() - 1.0).abs() < 1e-9);
+    }
+
+    /// The reindex worklist must contain exactly the episodes that lack a
+    /// usable vector — absent AND wrong-width — and nothing else. A false
+    /// positive re-embeds (and re-bills) work that was already fine; a false
+    /// negative leaves an episode permanently BM25-only.
+    #[tokio::test]
+    async fn episodes_needing_vectors_lists_absent_and_mismatched_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = EpisodeStore::open_with_dimension(dir.path(), 4)
+            .await
+            .unwrap();
+
+        let good = make_episode("has a correct vector", "/proj");
+        let good_id = good.id.clone();
+        store.store(good).await.unwrap();
+        store
+            .store_embedding(&good_id, vec![0.5f32; 4])
+            .await
+            .unwrap();
+
+        let absent = make_episode("never embedded", "/proj");
+        let absent_id = absent.id.clone();
+        store.store(absent).await.unwrap();
+
+        let wrong = make_episode("embedded at the old width", "/proj");
+        let wrong_id = wrong.id.clone();
+        store.store(wrong).await.unwrap();
+        store
+            .store_embedding(&wrong_id, vec![0.5f32; 1536])
+            .await
+            .unwrap();
+
+        let pending = store.episodes_needing_vectors().await.unwrap();
+        let ids: Vec<&str> = pending.iter().map(|(id, _)| id.as_str()).collect();
+
+        assert!(
+            !ids.contains(&good_id.as_str()),
+            "a correctly-sized vector must NOT be re-embedded"
+        );
+        assert!(
+            ids.contains(&absent_id.as_str()),
+            "an episode with no vector needs one"
+        );
+        assert!(
+            ids.contains(&wrong_id.as_str()),
+            "a wrong-width vector must be regenerated"
+        );
+        assert_eq!(pending.len(), 2);
+
+        // The summary comes back so the caller can embed without a second read.
+        let (_, summary) = pending.iter().find(|(id, _)| id == &absent_id).unwrap();
+        assert_eq!(summary, "never embedded");
+    }
+
+    /// Full repair loop: the worklist drains to empty and coverage recovers.
+    /// This is what `octos memory reindex` does, minus the provider.
+    #[tokio::test]
+    async fn reindexing_the_worklist_restores_full_coverage() {
+        let dir = tempfile::tempdir().unwrap();
+        // Persist at the old width.
+        {
+            let store = EpisodeStore::open_with_dimension(dir.path(), 1536)
+                .await
+                .unwrap();
+            for i in 0..5 {
+                let ep = make_episode(&format!("episode {i}"), "/proj");
+                let id = ep.id.clone();
+                store.store(ep).await.unwrap();
+                store
+                    .store_embedding(&id, vec![0.1f32; 1536])
+                    .await
+                    .unwrap();
+            }
+        }
+        // Reopen at the new width: everything is now mismatched.
+        let store = EpisodeStore::open_with_dimension(dir.path(), 768)
+            .await
+            .unwrap();
+        assert_eq!(store.vector_coverage().vectorized, 0);
+
+        let pending = store.episodes_needing_vectors().await.unwrap();
+        assert_eq!(pending.len(), 5);
+        for (id, _summary) in &pending {
+            let mut v = vec![0.0f32; 768];
+            v[0] = 1.0;
+            store.store_embedding(id, v).await.unwrap();
+        }
+
+        let after = store.vector_coverage();
+        assert_eq!(
+            after.vectorized, 5,
+            "every episode rejoins the vector index"
+        );
+        assert!((after.ratio() - 1.0).abs() < 1e-9);
+        assert!(
+            store.episodes_needing_vectors().await.unwrap().is_empty(),
+            "the worklist must drain — a non-empty list here means reindex never converges"
+        );
+    }
+
+    /// An episode with an empty summary has nothing to embed. Including it
+    /// would send empty text to a paid provider and never clear the worklist.
+    #[tokio::test]
+    async fn episodes_needing_vectors_skips_empty_summaries() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = EpisodeStore::open_with_dimension(dir.path(), 4)
+            .await
+            .unwrap();
+        let ep = make_episode("   ", "/proj");
+        store.store(ep).await.unwrap();
+        assert!(store.episodes_needing_vectors().await.unwrap().is_empty());
     }
 
     #[test]
