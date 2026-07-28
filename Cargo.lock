@@ -4755,6 +4755,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "octos-fleet-worker"
+version = "2.0.2"
+dependencies = [
+ "async-trait",
+ "eyre",
+ "octos-agent",
+ "octos-core",
+ "octos-fleet",
+ "octos-llm",
+ "octos-memory",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "octos-llm"
 version = "2.0.2"
 dependencies = [

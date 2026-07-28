@@ -74,6 +74,19 @@ pub enum CompleteOutcome {
     Superseded,
 }
 
+/// Result of a `mark_running` CAS. `Superseded` means the identity/predicate
+/// fence failed — a genuine lost race (the attempt is stale/superseded or not
+/// the child's current attempt), so nothing changes; deliberately **not** an
+/// error, exactly like [`CompleteOutcome::Superseded`]. `Err` is reserved for a
+/// real infra failure (redb read/commit/join or a corrupt-row parse), which
+/// leaves it ambiguous whether the still-`Launching` attempt is ours — the
+/// caller must NOT treat that as "not ours".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MarkRunningOutcome {
+    Running,
+    Superseded,
+}
+
 /// Result of a revision-fenced plan operation (`replan` / `retitle_task`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PlanMutateOutcome {
@@ -745,42 +758,56 @@ impl FleetKernelStore {
     /// fleet.generation` — **before writing either row**, so any mismatch
     /// (including a pre-replan attempt whose generation is now stale) is
     /// rejected with zero mutation.
-    pub async fn mark_running(&self, child_id: &str, attempt_id: &str) -> Result<()> {
+    ///
+    /// Returns the typed [`MarkRunningOutcome`] (mirrors [`CompleteOutcome`]):
+    /// an identity/existence/predicate miss (a genuine lost race — the attempt
+    /// is superseded or not the child's current one) is
+    /// [`MarkRunningOutcome::Superseded`], **not** an `Err`. `Err` is reserved
+    /// for a real infra failure (redb read/commit/join, or a corrupt-row parse
+    /// surfaced by `?`) — which leaves the still-`Launching` attempt possibly
+    /// ours, so the caller must not disarm its cleanup on that path.
+    pub async fn mark_running(
+        &self,
+        child_id: &str,
+        attempt_id: &str,
+    ) -> Result<MarkRunningOutcome> {
         ensure_key_safe(&[child_id, attempt_id])?;
         let db = self.db.clone();
         let child_id = child_id.to_string();
         let attempt_id = attempt_id.to_string();
         let held = self.io_gate.clone().lock_owned().await;
-        tokio::task::spawn_blocking(move || -> Result<()> {
+        tokio::task::spawn_blocking(move || -> Result<MarkRunningOutcome> {
             let _held = held;
             let wtx = db.begin_write()?;
-            {
+            let outcome = {
                 let mut attempts = wtx.open_table(ATTEMPTS)?;
                 let mut children = wtx.open_table(FLEET_CHILDREN)?;
                 let fleets = wtx.open_table(FLEETS)?;
 
-                // Read the attempt (owned).
+                // Read the attempt (owned). A missing row / newer-schema row /
+                // identity mismatch is a superseded-or-foreign attempt, never an
+                // infra error — mirror `complete_child` (only `?` yields `Err`).
                 let akey = attempt_key(&child_id, &attempt_id);
                 let Some(aj) = attempts.get(akey.as_str())?.map(|g| g.value().to_string()) else {
-                    bail!("mark_running: unknown attempt {attempt_id} for child {child_id}");
+                    return Ok(MarkRunningOutcome::Superseded);
                 };
                 let Some(mut attempt) = decode_row::<Attempt>(&aj)? else {
-                    bail!("mark_running: attempt {attempt_id} is a newer schema");
+                    return Ok(MarkRunningOutcome::Superseded);
                 };
                 if attempt.child_id != child_id || attempt.attempt_id != attempt_id {
-                    bail!("mark_running: attempt/child identity mismatch");
+                    return Ok(MarkRunningOutcome::Superseded);
                 }
 
                 // Read the child derived from the attempt's fleet (P1-4).
                 let ckey = child_key(&attempt.fleet_id, &child_id);
                 let Some(cj) = children.get(ckey.as_str())?.map(|g| g.value().to_string()) else {
-                    bail!("mark_running: child {child_id} not found for attempt {attempt_id}");
+                    return Ok(MarkRunningOutcome::Superseded);
                 };
                 let Some(mut child) = decode_row::<FleetChildRecord>(&cj)? else {
-                    bail!("mark_running: child {child_id} is a newer schema");
+                    return Ok(MarkRunningOutcome::Superseded);
                 };
                 if child.fleet_id != attempt.fleet_id || child.child_id != child_id {
-                    bail!("mark_running: child identity mismatch");
+                    return Ok(MarkRunningOutcome::Superseded);
                 }
 
                 // Read the fleet for the generation fence.
@@ -788,37 +815,23 @@ impl FleetKernelStore {
                     .get(attempt.fleet_id.as_str())?
                     .map(|g| g.value().to_string())
                 else {
-                    bail!("mark_running: fleet {} not found", attempt.fleet_id);
+                    return Ok(MarkRunningOutcome::Superseded);
                 };
                 let Some(fleet) = decode_row::<FleetRecord>(&fj)? else {
-                    bail!("mark_running: fleet {} is a newer schema", attempt.fleet_id);
+                    return Ok(MarkRunningOutcome::Superseded);
                 };
                 if fleet.fleet_id != attempt.fleet_id {
-                    bail!("mark_running: fleet identity mismatch");
+                    return Ok(MarkRunningOutcome::Superseded);
                 }
 
-                // Validate EVERYTHING before writing either row (P2-6).
-                if child.current_attempt_id.as_deref() != Some(attempt_id.as_str()) {
-                    bail!("mark_running: {attempt_id} is not the child's current attempt");
-                }
-                if child.status != ChildStatus::Launching {
-                    bail!(
-                        "mark_running: child {child_id} is {:?}, not Launching",
-                        child.status
-                    );
-                }
-                if attempt.status != AttemptStatus::Leased {
-                    bail!(
-                        "mark_running: attempt {attempt_id} is {:?}, not Leased",
-                        attempt.status
-                    );
-                }
-                if attempt.generation != fleet.generation {
-                    bail!(
-                        "mark_running: attempt {attempt_id} generation {} != fleet {}",
-                        attempt.generation,
-                        fleet.generation
-                    );
+                // Validate EVERYTHING before writing either row (P2-6). Each is
+                // a CAS-predicate fence — a miss is a lost race (`Superseded`).
+                if child.current_attempt_id.as_deref() != Some(attempt_id.as_str())
+                    || child.status != ChildStatus::Launching
+                    || attempt.status != AttemptStatus::Leased
+                    || attempt.generation != fleet.generation
+                {
+                    return Ok(MarkRunningOutcome::Superseded);
                 }
 
                 // All checks passed — write both rows.
@@ -826,9 +839,15 @@ impl FleetKernelStore {
                 attempts.insert(akey.as_str(), serde_json::to_string(&attempt)?.as_str())?;
                 child.status = ChildStatus::Running;
                 children.insert(ckey.as_str(), serde_json::to_string(&child)?.as_str())?;
+
+                MarkRunningOutcome::Running
+            };
+            // Only a real state change commits; a `Superseded` returned above
+            // never reaches here (it exits the closure, dropping `wtx` unwritten).
+            if matches!(outcome, MarkRunningOutcome::Running) {
+                wtx.commit()?;
             }
-            wtx.commit()?;
-            Ok(())
+            Ok(outcome)
         })
         .await
         .wrap_err("join mark_running")?
@@ -2257,8 +2276,16 @@ mod tests {
             ChildStatus::Running
         );
 
-        assert!(store.mark_running("c1", &attempt_id).await.is_err());
-        assert!(store.mark_running("c1", "nope").await.is_err());
+        // A repeat (child now Running, not Launching) and an unknown attempt
+        // are BOTH lost-race misses now — `Superseded`, not an infra `Err`.
+        assert_eq!(
+            store.mark_running("c1", &attempt_id).await.unwrap(),
+            MarkRunningOutcome::Superseded,
+        );
+        assert_eq!(
+            store.mark_running("c1", "nope").await.unwrap(),
+            MarkRunningOutcome::Superseded,
+        );
     }
 
     #[tokio::test]
@@ -2958,7 +2985,11 @@ mod tests {
         child.current_attempt_id = Some("ghost".into());
         store.write_raw_child(&child).await.unwrap();
 
-        assert!(store.mark_running("c1", &att).await.is_err());
+        // Not the child's current attempt → a lost-race `Superseded`, not `Err`.
+        assert_eq!(
+            store.mark_running("c1", &att).await.unwrap(),
+            MarkRunningOutcome::Superseded,
+        );
         // Zero mutation: attempt still Leased, child pointer unchanged.
         assert_eq!(
             store.get_attempt("c1", &att).await.unwrap().unwrap().status,
@@ -2998,7 +3029,11 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(store.mark_running("c1", &att).await.is_err());
+        // Stale generation → a lost-race `Superseded`, not an infra `Err`.
+        assert_eq!(
+            store.mark_running("c1", &att).await.unwrap(),
+            MarkRunningOutcome::Superseded,
+        );
         assert_eq!(
             store.get_attempt("c1", &att).await.unwrap().unwrap().status,
             AttemptStatus::Leased,
