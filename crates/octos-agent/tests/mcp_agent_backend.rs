@@ -94,6 +94,14 @@ done
 read init
 printf '%s\n' '{{"jsonrpc":"2.0","id":1,"result":{{"serverInfo":{{}}}}}}'
 read call
+# Spec-compliant clients send notifications/initialized between the
+# initialize response and the first request. Skip notification frames
+# until the real tools/call arrives — otherwise this `read` consumes the
+# notification, the script answers and exits, and the client's still-
+# pending tools/call write hits a closed pipe (TransportError).
+while printf '%s' "$call" | grep -q '"method":"notifications/'; do
+  read call
+done
 printf '%s\n' '{{"jsonrpc":"2.0","id":2,"result":{{"content":[{{"type":"text","text":"probed"}}]}}}}'
 "#,
         log = log_path.display()
@@ -213,7 +221,9 @@ async fn should_dispatch_to_stdio_mcp_agent_and_return_contract_artifact() {
     let request = DispatchRequest::new("run_task", serde_json::json!({"task": "hello"}));
     let response = backend.dispatch(request).await;
 
-    assert_eq!(response.outcome, DispatchOutcome::Success);
+    // Carry the whole response: a bare `left: TransportError` says nothing
+    // about *why* the transport failed.
+    assert_eq!(response.outcome, DispatchOutcome::Success, "{response:?}");
     assert!(
         response.output.contains("fake-agent:run_task"),
         "unexpected output: {}",
@@ -252,7 +262,9 @@ async fn should_dispatch_to_remote_mcp_agent_and_return_contract_artifact() {
     let response = backend.dispatch(request).await;
     join.abort();
 
-    assert_eq!(response.outcome, DispatchOutcome::Success);
+    // Carry the whole response: a bare `left: TransportError` says nothing
+    // about *why* the transport failed.
+    assert_eq!(response.outcome, DispatchOutcome::Success, "{response:?}");
     assert_eq!(response.output, "remote-agent");
     assert_eq!(
         response.files_to_send,
@@ -390,7 +402,9 @@ async fn should_apply_blocked_env_vars_to_stdio_subprocess() {
     let response = backend
         .dispatch(DispatchRequest::new("run_task", serde_json::json!({})))
         .await;
-    assert_eq!(response.outcome, DispatchOutcome::Success);
+    // Carry the whole response: a bare `left: TransportError` says nothing
+    // about *why* the transport failed.
+    assert_eq!(response.outcome, DispatchOutcome::Success, "{response:?}");
 
     let log_contents = std::fs::read_to_string(&log).expect("read env probe log");
     // Empty value after the `=` proves the blocked name was scrubbed
@@ -518,6 +532,14 @@ set -eu
 read init
 printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"serverInfo":{}}}'
 read call
+# Spec-compliant clients send notifications/initialized between the
+# initialize response and the first request. Skip notification frames
+# until the real tools/call arrives — otherwise this `read` consumes the
+# notification, the script answers and exits, and the client's still-
+# pending tools/call write hits a closed pipe (TransportError).
+while printf '%s' "$call" | grep -q '"method":"notifications/'; do
+  read call
+done
 # Pretend the sub-agent ran several internal tools — but only the final
 # JSON-RPC frame is emitted on stdout. Everything else is logged on
 # stderr so even a leaky harness cannot accidentally surface it.
@@ -549,7 +571,9 @@ printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"content":[{"type":"text","text
         ))
         .await;
 
-    assert_eq!(response.outcome, DispatchOutcome::Success);
+    // Carry the whole response: a bare `left: TransportError` says nothing
+    // about *why* the transport failed.
+    assert_eq!(response.outcome, DispatchOutcome::Success, "{response:?}");
     assert_eq!(response.output, "final-artifact-only");
     // Internal chatter never appears in the DispatchResponse.
     assert!(
