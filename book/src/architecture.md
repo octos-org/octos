@@ -401,7 +401,13 @@ pub trait EmbeddingProvider: Send + Sync {
 }
 ```
 
-**OpenAIEmbedder**: Default model `text-embedding-3-small` (1536 dims). `text-embedding-3-large` = 3072 dims.
+Two implementations:
+
+**OpenAIEmbedder** — remote, OpenAI-compatible (`provider = "openai"`). Default model `text-embedding-3-small` (1536 dims); `text-embedding-3-large` = 3072 dims. The optional `dimensions` request field pins providers whose native size differs (e.g. DashScope `text-embedding-v4` at 1024).
+
+**LlamaEmbedder** (`octos-embed-llama`) — in-process, any GGUF embedding model over llama.cpp (`provider = "llamacpp"` + `model_path`). Cross-platform, CPU by default; `metal` / `cuda` features offload. Off unless built with `--features embed-llama`.
+
+**The index is sized from the embedder.** `EpisodeStore` builds its HNSW index at one fixed width and `HybridIndex::insert` DROPS any vector that does not match, degrading that episode to BM25-only — so the store is opened with `embedder.dimension()`, not a constant. Two consequences: Matryoshka truncation only goes *down* (a 768-d model can never fill a 1536-d index), and changing provider or model invalidates a populated index. Embeddings from different backends are not interchangeable — measured agreement between the two above is 0.96–0.99 cosine, the same order as the gap between genuinely related documents — so stored episodes must be re-embedded after a switch.
 
 ### Transcription
 

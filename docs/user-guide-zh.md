@@ -2003,12 +2003,24 @@ chmod +x .octos/skills/translator/main
   // 智能体设置
   "max_iterations": 50,
 
-  // 嵌入（用于记忆中的向量搜索）
+  // 嵌入（用于记忆中的向量搜索）。
+  // 远程，OpenAI 兼容：
   "embedding": {
     "provider": "openai",
     "api_key_env": "OPENAI_API_KEY",
-    "base_url": null
+    "base_url": null,
+    "model": null,       // 默认 text-embedding-3-small（1536 维）
+    "dimensions": null   // 模型原生维度不同时，用它固定输出维度
   },
+  // 或者进程内运行，不需要 API key，通过 llama.cpp 跑任意 GGUF 模型。
+  // 需要用 `--features embed-llama` 编译（加 embed-llama-metal / -cuda
+  // 可以走 GPU），否则用 CPU。换 provider 或换模型会改变向量维度，
+  // 已有索引会失效。切换后要重新生成已存 episode 的向量，否则它们的
+  // 召回会悄悄退化成只有 BM25。
+  // "embedding": {
+  //   "provider": "llamacpp",
+  //   "model_path": "/path/to/embeddinggemma-300M-Q8_0.gguf"
+  // },
 
   // 语音
   "voice": {

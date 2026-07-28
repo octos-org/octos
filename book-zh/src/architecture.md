@@ -401,7 +401,13 @@ pub trait EmbeddingProvider: Send + Sync {
 }
 ```
 
-**OpenAIEmbedder**：默认模型 `text-embedding-3-small`（1536 维）。`text-embedding-3-large` = 3072 维。
+两种实现：
+
+**OpenAIEmbedder**：远程，OpenAI 兼容（`provider = "openai"`）。默认模型 `text-embedding-3-small`（1536 维），`text-embedding-3-large` 为 3072 维。可选的 `dimensions` 字段用来固定原生维度不同的服务，例如 DashScope `text-embedding-v4` 默认 1024 维。
+
+**LlamaEmbedder**（`octos-embed-llama`）：进程内，通过 llama.cpp 跑任意 GGUF 嵌入模型（`provider = "llamacpp"`，配 `model_path`）。跨平台，默认用 CPU，`metal` / `cuda` feature 可以走 GPU。需要 `--features embed-llama` 才会编译进来。
+
+**索引宽度由 embedder 决定。** `EpisodeStore` 的 HNSW 索引只有一个固定宽度，`HybridIndex::insert` 会丢掉维度不匹配的向量，该 episode 退化成只有 BM25。所以打开 store 用的是 `embedder.dimension()`，不是常量。两个后果：Matryoshka 只能向下截断，768 维的模型填不满 1536 维的索引；换 provider 或换模型会让已有索引失效。不同后端的向量不能混用，上面两者实测余弦一致度是 0.96–0.99，和真正相关的文档之间的差距是同一量级。切换之后已存的 episode 必须重新生成向量。
 
 ### 语音转文字
 
