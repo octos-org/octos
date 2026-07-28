@@ -66,6 +66,7 @@ use octos_llm::{
 };
 use octos_memory::EpisodeStore;
 
+#[cfg(unix)]
 use crate::plugins::PluginTool;
 use crate::{AgentConfig, AgentVerifierConfig};
 
@@ -499,11 +500,14 @@ impl LlmProvider for GateVerifier {
         "mock-verifier"
     }
 }
+#[cfg(unix)]
 use crate::plugins::manifest::PluginToolDef;
 use crate::prompt_context::{
     PromptContextManager, PromptContextPhase, PromptContextReport, PromptContextRequest,
 };
-use crate::tools::{Tool, ToolRegistry, ToolResult, TurnAttachmentContext};
+#[cfg(unix)]
+use crate::tools::TurnAttachmentContext;
+use crate::tools::{Tool, ToolRegistry, ToolResult};
 
 struct FilesToSendOnlyTool {
     file_path: PathBuf,
@@ -942,10 +946,12 @@ impl LlmProvider for PodcastGenerateTwiceProvider {
     }
 }
 
+#[cfg(unix)]
 struct ConsecutiveVoiceSaveProvider {
     calls: AtomicUsize,
 }
 
+#[cfg(unix)]
 #[async_trait]
 impl LlmProvider for ConsecutiveVoiceSaveProvider {
     async fn chat(
@@ -3024,6 +3030,69 @@ async fn dedup_loop_warning_resets_after_reset() {
 }
 
 #[tokio::test]
+async fn shell_spiral_dispatch_marks_loop_detected_recently() {
+    // #1656: a firing shell spiral must mark the two-stage dedup flag, so a
+    // generic loop detection later in the SAME turn is treated as the second
+    // fire (terminal) instead of restarting the warn-then-terminate ladder.
+    let dir = tempfile::tempdir().unwrap();
+    let agent = build_agent_with_mock(dir.path()).await;
+
+    // Four consecutive failing shell exchanges inside the current user turn —
+    // the spiral detector's threshold.
+    let mut messages = vec![Message::user("fix the build")];
+    for i in 0..4 {
+        let call_id = format!("call_shell_{i}");
+        messages.push(Message {
+            role: MessageRole::Assistant,
+            content: String::new(),
+            media: vec![],
+            tool_calls: Some(vec![ToolCall {
+                id: call_id.clone(),
+                name: "shell".into(),
+                arguments: serde_json::json!({"command": "cargo build"}),
+                metadata: None,
+            }]),
+            tool_call_id: None,
+            reasoning_content: None,
+            client_message_id: None,
+            thread_id: None,
+            timestamp: chrono::Utc::now(),
+        });
+        messages.push(Message {
+            role: MessageRole::Tool,
+            content: "error[E0999]: broken\n\nExit code: 101".into(),
+            media: vec![],
+            tool_calls: None,
+            tool_call_id: Some(call_id),
+            reasoning_content: None,
+            client_message_id: None,
+            thread_id: None,
+            timestamp: chrono::Utc::now(),
+        });
+    }
+
+    assert!(!agent.is_loop_detected_recently());
+    let mut retry_state = LoopRetryState::new();
+    let outcome = agent.dispatch_shell_retry_recovery(&messages, &mut retry_state, 1);
+    assert!(
+        outcome.is_some(),
+        "the spiral must fire on 4 failing shells"
+    );
+    assert!(
+        agent.is_loop_detected_recently(),
+        "a firing spiral must mark the loop-detected flag (#1656)"
+    );
+
+    // The NEXT generic loop detection in this turn is the SECOND fire —
+    // terminal, not a fresh warning.
+    let second = agent.dedup_loop_warning("[LOOP DETECTED] generic".to_string());
+    assert!(
+        second.is_err(),
+        "generic detection after a spiral must be terminal, got {second:?}"
+    );
+}
+
+#[tokio::test]
 async fn process_message_resets_loop_detected_flag_at_start() {
     // Pre-set the flag, then run a process_message that does NOT trigger
     // the loop detector. The reset at the start of process_message_inner
@@ -3490,23 +3559,20 @@ impl LlmProvider for CountingAlwaysSameToolProvider {
 }
 
 #[tokio::test]
-async fn loop_detected_first_fire_continues_then_second_fire_terminates() {
-    // Exercises the full PR `fix/news-fetch-loop-and-detect-recovery`
-    // recovery contract end-to-end:
-    //   1. The looping LLM trips the detector on the 4th call (cycle-1).
-    //   2. First detection MUST NOT terminate — it injects a synthetic
-    //      tool result with the warning and calls the LLM again.
-    //   3. If the LLM repeats the same call, the SECOND detection
-    //      terminates with `loop_detected_terminal_message()`.
+async fn doom_loop_aborts_turn_when_third_identical_call_arrives() {
+    // #1765 doom-loop guard: when the LLM issues the SAME tool call
+    // (same name + identical arguments JSON) 3 times in a row, the
+    // conversation loop must abort the turn with a clear message
+    // instead of issuing the next LLM call.
     //
     // We assert via:
+    //   - The terminal `content` matches `doom_loop_terminal_message`
+    //     (proves the doom guard fired, not the older two-stage
+    //     warn-then-terminate cycle path).
+    //   - The mock LLM was called EXACTLY 3 times: calls 1 and 2
+    //     execute the tool; the 3rd identical call trips the guard and
+    //     no further LLM call is issued.
     //   - The flag (`is_loop_detected_recently`) is set after the run.
-    //   - The terminal `content` matches `loop_detected_terminal_message`
-    //     (proves the second-fire path ran, not the original first-fire
-    //     return-immediately path).
-    //   - The mock LLM was called AT LEAST 5 times (>=4 to trigger first
-    //     fire, +1 for the recovery iteration), confirming the loop
-    //     continued after the first fire.
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("loopy.txt"), b"x").unwrap();
     let provider = Arc::new(CountingAlwaysSameToolProvider {
@@ -3526,25 +3592,107 @@ async fn loop_detected_first_fire_continues_then_second_fire_terminates() {
     let result = agent
         .process_message("please loop", &[], vec![])
         .await
-        .expect("process_message should return Ok even when the loop terminates");
+        .expect("process_message should return Ok even when the doom guard aborts");
 
-    // The terminal message proves the second-fire branch ran. The
-    // pre-fix behaviour would have returned the FIRST-fire warning
-    // text and stopped before issuing another LLM call.
     assert_eq!(
         result.content,
-        loop_detected_terminal_message(),
-        "expected the terminal hard-stop message after the second \
-             loop detection; pre-fix code would have returned the warning \
-             text on the first fire"
+        doom_loop_terminal_message("read_file", 3),
+        "expected the doom-loop abort message when the 3rd identical \
+             call arrives"
     );
     assert!(agent.is_loop_detected_recently());
 
     let total_calls = provider.calls.load(AtomicOrdering::SeqCst);
+    assert_eq!(
+        total_calls, 3,
+        "expected exactly 3 LLM calls — the doom guard must stop the \
+             loop instead of issuing a 4th; got {total_calls}"
+    );
+}
+
+/// LLM mock that alternates between two different argument sets for the
+/// same tool. The doom guard (consecutive identical) must never fire;
+/// the cycle detector (`LoopDetector::record`) owns alternating
+/// patterns and still runs its two-stage warn-then-terminate recovery.
+struct CountingAlternatingArgsProvider {
+    calls: AtomicUsize,
+}
+
+#[async_trait]
+impl LlmProvider for CountingAlternatingArgsProvider {
+    async fn chat(
+        &self,
+        _messages: &[Message],
+        _tools: &[octos_llm::ToolSpec],
+        _config: &octos_llm::ChatConfig,
+    ) -> Result<ChatResponse> {
+        let n = self.calls.fetch_add(1, AtomicOrdering::SeqCst);
+        let path = if n % 2 == 0 { "a.txt" } else { "b.txt" };
+        Ok(ChatResponse {
+            content: None,
+            reasoning_content: None,
+            tool_calls: vec![ToolCall {
+                id: format!("call_alt_{n}"),
+                name: "read_file".to_string(),
+                arguments: serde_json::json!({ "path": path }),
+                metadata: None,
+            }],
+            stop_reason: StopReason::ToolUse,
+            usage: LlmTokenUsage::default(),
+            provider_index: None,
+        })
+    }
+
+    fn model_id(&self) -> &str {
+        "mock"
+    }
+
+    fn provider_name(&self) -> &str {
+        "mock"
+    }
+}
+
+#[tokio::test]
+async fn alternating_cycle_still_uses_two_stage_warning_not_doom_abort() {
+    // #1765: the doom guard counts CONSECUTIVE identical calls only —
+    // an A,B,A,B,… alternation resets the streak every call, so the
+    // existing cycle detector must keep owning that pattern with its
+    // two-stage recovery (first fire injects a warning + one more LLM
+    // iteration; second fire terminates with
+    // `loop_detected_terminal_message`).
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.txt"), b"a").unwrap();
+    std::fs::write(dir.path().join("b.txt"), b"b").unwrap();
+    let provider = Arc::new(CountingAlternatingArgsProvider {
+        calls: AtomicUsize::new(0),
+    });
+    let provider_arc: Arc<dyn LlmProvider> = provider.clone();
+    let tools = ToolRegistry::with_builtins(dir.path());
+    let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+    let agent = Agent::new(AgentId::new("recover"), provider_arc, tools, memory).with_config(
+        crate::AgentConfig {
+            max_iterations: 30,
+            save_episodes: false,
+            ..Default::default()
+        },
+    );
+
+    let result = agent
+        .process_message("please alternate", &[], vec![])
+        .await
+        .expect("process_message should return Ok when the cycle detector terminates");
+
+    assert_eq!(
+        result.content,
+        loop_detected_terminal_message(),
+        "alternating A,B cycles belong to the two-stage cycle detector, \
+             not the doom guard"
+    );
+    let total_calls = provider.calls.load(AtomicOrdering::SeqCst);
     assert!(
-        total_calls >= 5,
-        "expected at least 5 LLM calls (4 to trigger first detection + \
-             1 recovery iteration); got {total_calls}"
+        total_calls >= 7,
+        "expected >= 7 LLM calls (6 to reach a cycle-2 first fire + 1 \
+             recovery iteration before the terminating fire); got {total_calls}"
     );
 }
 
@@ -3589,22 +3737,16 @@ impl LlmProvider for CountingAlwaysNamedToolProvider {
 }
 
 #[tokio::test]
-async fn loop_detected_first_fire_does_not_execute_the_spiraling_tool() {
-    // Regression: the loop-detector `continue` after injecting synthetic
-    // results must re-enter the AGENT loop, not merely the inner
-    // `for tc in &response.tool_calls` loop. When it bound to the `for`,
-    // control fell through to `handle_tool_use` and the spiraling tool
-    // EXECUTED anyway (extra side effects + a duplicate tool_call_id row),
-    // defeating the detector's "inject a warning, do NOT call the tools"
-    // contract.
+async fn doom_loop_does_not_execute_the_tripping_call() {
+    // #1765: the doom guard runs BEFORE tool execution. When the 3rd
+    // identical call arrives it must abort the turn without executing
+    // the call again — re-running an identical call is pure waste (and
+    // possibly a duplicated side effect).
     //
-    // With the same-tool provider the detector trips on the 4th call, so:
-    //   - iterations 1..=3 execute the tool  (3 executions)
-    //   - iteration 4 (FIRST fire) injects synthetic results and re-enters
-    //     the loop WITHOUT executing
-    //   - iteration 5 (SECOND fire) terminates before executing
-    // ⇒ executions == total_llm_calls - 2. The buggy fall-through executed
-    // on the first-fire iteration too (executions == total_llm_calls - 1).
+    // With the same-call provider:
+    //   - iterations 1..=2 execute the tool  (2 executions)
+    //   - iteration 3 trips the doom guard pre-execution and terminates
+    // ⇒ executions == total_llm_calls - 1 == 2.
     let dir = tempfile::tempdir().unwrap();
     let exec_count = Arc::new(AtomicUsize::new(0));
     let provider = Arc::new(CountingAlwaysNamedToolProvider {
@@ -3630,18 +3772,32 @@ async fn loop_detected_first_fire_does_not_execute_the_spiraling_tool() {
     let result = agent
         .process_message("please loop", &[], vec![])
         .await
-        .expect("process_message should return Ok even when the loop terminates");
-    assert_eq!(result.content, loop_detected_terminal_message());
+        .expect("process_message should return Ok even when the doom guard aborts");
+    assert_eq!(result.content, doom_loop_terminal_message("loopy_tool", 3));
 
     let total_calls = provider.calls.load(AtomicOrdering::SeqCst);
     let executions = exec_count.load(AtomicOrdering::SeqCst);
+    assert_eq!(total_calls, 3, "doom aborts before a 4th LLM call");
     assert_eq!(
         executions,
-        total_calls - 2,
-        "the spiraling tool must NOT execute on the first-fire (synthetic-\
-             injection) iteration; got {executions} executions across \
-             {total_calls} LLM calls (buggy fall-through would be {})",
-        total_calls - 1
+        total_calls - 1,
+        "the tripping call must NOT execute; got {executions} executions \
+             across {total_calls} LLM calls"
+    );
+}
+
+#[test]
+fn doom_loop_terminal_message_is_model_and_user_facing() {
+    let msg = doom_loop_terminal_message("read_file", 3);
+    assert!(msg.contains("read_file"), "names the looping tool: {msg}");
+    assert!(msg.contains('3'), "states the streak length: {msg}");
+    assert!(
+        msg.contains("identical arguments"),
+        "explains WHY the turn stopped: {msg}"
+    );
+    assert!(
+        msg.contains("different approach") || msg.contains("rephrase"),
+        "guides the model/user toward a way forward: {msg}"
     );
 }
 
@@ -5225,11 +5381,13 @@ async fn should_not_emit_turn_failure_when_hook_denies_llm_call_under_failfast()
 /// Records the message contents of every LLM call and returns EndTurn
 /// immediately. Used to assert what the model actually saw and that it was
 /// (or was not) called at all.
+#[cfg(unix)]
 struct RecordingEndProvider {
     chat_calls: Arc<AtomicUsize>,
     observed: Arc<StdMutex<Vec<Vec<String>>>>,
 }
 
+#[cfg(unix)]
 #[async_trait]
 impl LlmProvider for RecordingEndProvider {
     async fn chat(
@@ -5368,5 +5526,334 @@ async fn user_prompt_submit_hook_deny_blocks_turn_before_llm() {
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .is_empty()
+    );
+}
+
+// --- Mid-turn steer injection (codex `TurnState.pending_input` parity) ---
+
+/// Per-request prompt capture: `(role, content)` per message, one vec per
+/// LLM call.
+type ObservedRolePrompts = Arc<StdMutex<Vec<Vec<(MessageRole, String)>>>>;
+
+/// Records every prompt as `(role, content)` pairs. Call 0 pushes the given
+/// steer inputs into the shared buffer MID-CALL (simulating a `turn/steer`
+/// racing in while the model streams), then returns a tool call; call 1
+/// returns EndTurn.
+struct SteerDuringToolRoundProvider {
+    calls: AtomicUsize,
+    observed: ObservedRolePrompts,
+    buffer: crate::steering::SharedSteerBuffer,
+    steers: Vec<String>,
+}
+
+#[async_trait]
+impl LlmProvider for SteerDuringToolRoundProvider {
+    async fn chat(
+        &self,
+        messages: &[Message],
+        _tools: &[octos_llm::ToolSpec],
+        _config: &octos_llm::ChatConfig,
+    ) -> Result<ChatResponse> {
+        self.observed
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .push(
+                messages
+                    .iter()
+                    .map(|message| (message.role, message.content.clone()))
+                    .collect(),
+            );
+        let call = self.calls.fetch_add(1, AtomicOrdering::SeqCst);
+        Ok(if call == 0 {
+            for steer in &self.steers {
+                self.buffer.push(steer.clone());
+            }
+            tool_use(
+                vec![ToolCall {
+                    id: "call_alpha".to_string(),
+                    name: "alpha".to_string(),
+                    arguments: serde_json::json!({}),
+                    metadata: None,
+                }],
+                1,
+                1,
+            )
+        } else {
+            end_turn("done", 1, 1)
+        })
+    }
+
+    fn model_id(&self) -> &str {
+        "mock"
+    }
+
+    fn provider_name(&self) -> &str {
+        "mock"
+    }
+}
+
+/// Call 0 pushes steer inputs mid-call and returns a FINAL answer
+/// (EndTurn). The pending steer must force one more round; call 1 returns
+/// the follow-up answer.
+struct SteerAfterFinalAnswerProvider {
+    calls: AtomicUsize,
+    observed: ObservedRolePrompts,
+    buffer: crate::steering::SharedSteerBuffer,
+    steers: Vec<String>,
+}
+
+#[async_trait]
+impl LlmProvider for SteerAfterFinalAnswerProvider {
+    async fn chat(
+        &self,
+        messages: &[Message],
+        _tools: &[octos_llm::ToolSpec],
+        _config: &octos_llm::ChatConfig,
+    ) -> Result<ChatResponse> {
+        self.observed
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .push(
+                messages
+                    .iter()
+                    .map(|message| (message.role, message.content.clone()))
+                    .collect(),
+            );
+        let call = self.calls.fetch_add(1, AtomicOrdering::SeqCst);
+        Ok(if call == 0 {
+            for steer in &self.steers {
+                self.buffer.push(steer.clone());
+            }
+            end_turn("first answer", 1, 1)
+        } else {
+            end_turn("second answer", 1, 1)
+        })
+    }
+
+    fn model_id(&self) -> &str {
+        "mock"
+    }
+
+    fn provider_name(&self) -> &str {
+        "mock"
+    }
+}
+
+/// Steer landing between tool rounds is drained at the top of the next
+/// iteration, BEFORE the next LLM call, as a plain `role: user` message
+/// appended after the previous round's tool output — no wrapper text.
+#[tokio::test]
+async fn should_fold_steer_into_next_llm_call_when_injected_between_rounds() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut tools = ToolRegistry::with_builtins(dir.path());
+    tools.register(NamedEchoTool {
+        name: "alpha",
+        output: "alpha ok",
+    });
+    let buffer: crate::steering::SharedSteerBuffer =
+        Arc::new(crate::steering::SteerBuffer::default());
+    let observed = Arc::new(StdMutex::new(Vec::new()));
+    let provider: Arc<dyn LlmProvider> = Arc::new(SteerDuringToolRoundProvider {
+        calls: AtomicUsize::new(0),
+        observed: Arc::clone(&observed),
+        buffer: Arc::clone(&buffer),
+        steers: vec!["also check the tests".to_string()],
+    });
+    let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+    let agent = Agent::new(AgentId::new("steer-agent"), provider, tools, memory)
+        .with_steer_buffer(Arc::clone(&buffer));
+
+    let result = agent.process_message("do work", &[], vec![]).await.unwrap();
+    assert_eq!(result.content, "done");
+
+    let observed = observed.lock().unwrap_or_else(|error| error.into_inner());
+    assert_eq!(observed.len(), 2, "tool round + follow-up round");
+    // First call: no steer yet (it lands mid-call).
+    assert!(
+        !observed[0]
+            .iter()
+            .any(|(_, content)| content.contains("also check the tests")),
+        "steer must not time-travel into the request that was already built"
+    );
+    // Second call: the steer is a plain user message with NO wrapper text,
+    // appended AFTER the previous round's tool output.
+    let steer_idx = observed[1]
+        .iter()
+        .position(|(role, content)| *role == MessageRole::User && content == "also check the tests")
+        .expect("second request must carry the steer as a plain role:user message");
+    let tool_idx = observed[1]
+        .iter()
+        .position(|(role, _)| *role == MessageRole::Tool)
+        .expect("second request must carry the tool result");
+    assert!(
+        steer_idx > tool_idx,
+        "steer must append after the prior round's tool output (append-only history)"
+    );
+    // Buffer fully drained.
+    assert!(buffer.is_empty());
+    // No callback registered → the steer row rides the turn output log so
+    // the host's end-of-turn persistence writes it exactly once.
+    assert!(
+        result
+            .messages
+            .iter()
+            .any(|m| m.role == MessageRole::User && m.content == "also check the tests"),
+        "without a drained-callback the steer row must land in the turn output log"
+    );
+}
+
+/// A steer that lands while the model produces its FINAL answer forces one
+/// more round (`needs_follow_up = model_wants_more || buffer_nonempty`),
+/// and the prior answer is recorded as a normal assistant row the model
+/// sees in the follow-up request.
+#[tokio::test]
+async fn should_run_extra_round_when_steer_lands_after_final_answer() {
+    let dir = tempfile::tempdir().unwrap();
+    let tools = ToolRegistry::with_builtins(dir.path());
+    let buffer: crate::steering::SharedSteerBuffer =
+        Arc::new(crate::steering::SteerBuffer::default());
+    let observed = Arc::new(StdMutex::new(Vec::new()));
+    let provider: Arc<dyn LlmProvider> = Arc::new(SteerAfterFinalAnswerProvider {
+        calls: AtomicUsize::new(0),
+        observed: Arc::clone(&observed),
+        buffer: Arc::clone(&buffer),
+        steers: vec!["one more thing".to_string()],
+    });
+    let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+    let agent = Agent::new(AgentId::new("steer-agent"), provider, tools, memory)
+        .with_steer_buffer(Arc::clone(&buffer));
+
+    let result = agent.process_message("do work", &[], vec![]).await.unwrap();
+
+    // The steer forced a second round and the turn ends on ITS answer.
+    assert_eq!(result.content, "second answer");
+    let observed = observed.lock().unwrap_or_else(|error| error.into_inner());
+    assert_eq!(
+        observed.len(),
+        2,
+        "steer after EndTurn must force another round"
+    );
+    let assistant_idx = observed[1]
+        .iter()
+        .position(|(role, content)| *role == MessageRole::Assistant && content == "first answer")
+        .expect("follow-up request must carry the recorded first answer");
+    let steer_idx = observed[1]
+        .iter()
+        .position(|(role, content)| *role == MessageRole::User && content == "one more thing")
+        .expect("follow-up request must carry the steer as a plain role:user message");
+    assert!(
+        steer_idx > assistant_idx,
+        "steer must follow the recorded final answer in history order"
+    );
+    // Both the intermediate answer and the steer row persist via the log.
+    assert!(
+        result
+            .messages
+            .iter()
+            .any(|m| m.role == MessageRole::Assistant && m.content == "first answer"),
+        "the pre-steer final answer must persist as a normal assistant row"
+    );
+    assert!(
+        result
+            .messages
+            .iter()
+            .any(|m| m.role == MessageRole::User && m.content == "one more thing")
+    );
+}
+
+/// Rapid steers drain together, in FIFO order, at the next boundary.
+#[tokio::test]
+async fn should_preserve_fifo_order_when_multiple_steers_accumulate() {
+    let dir = tempfile::tempdir().unwrap();
+    let tools = ToolRegistry::with_builtins(dir.path());
+    let buffer: crate::steering::SharedSteerBuffer =
+        Arc::new(crate::steering::SteerBuffer::default());
+    let observed = Arc::new(StdMutex::new(Vec::new()));
+    let provider: Arc<dyn LlmProvider> = Arc::new(SteerAfterFinalAnswerProvider {
+        calls: AtomicUsize::new(0),
+        observed: Arc::clone(&observed),
+        buffer: Arc::clone(&buffer),
+        steers: vec!["steer one".to_string(), "steer two".to_string()],
+    });
+    let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+    let agent = Agent::new(AgentId::new("steer-agent"), provider, tools, memory)
+        .with_steer_buffer(Arc::clone(&buffer));
+
+    let result = agent.process_message("do work", &[], vec![]).await.unwrap();
+    assert_eq!(result.content, "second answer");
+
+    let observed = observed.lock().unwrap_or_else(|error| error.into_inner());
+    assert_eq!(observed.len(), 2);
+    let first_idx = observed[1]
+        .iter()
+        .position(|(role, content)| *role == MessageRole::User && content == "steer one")
+        .expect("first steer present");
+    let second_idx = observed[1]
+        .iter()
+        .position(|(role, content)| *role == MessageRole::User && content == "steer two")
+        .expect("second steer present");
+    assert!(
+        first_idx < second_idx,
+        "steers must drain in FIFO (arrival) order"
+    );
+}
+
+/// With a drained-callback registered, the HOST owns steer-row persistence:
+/// the callback sees the drained batch (before the next LLM call) and the
+/// rows stay OUT of the turn output log so end-of-turn persistence cannot
+/// double-write them. The prompt still carries them.
+#[tokio::test]
+async fn should_hand_drained_steers_to_callback_and_skip_output_log() {
+    let dir = tempfile::tempdir().unwrap();
+    let tools = ToolRegistry::with_builtins(dir.path());
+    let buffer: crate::steering::SharedSteerBuffer =
+        Arc::new(crate::steering::SteerBuffer::default());
+    let observed = Arc::new(StdMutex::new(Vec::new()));
+    let provider: Arc<dyn LlmProvider> = Arc::new(SteerAfterFinalAnswerProvider {
+        calls: AtomicUsize::new(0),
+        observed: Arc::clone(&observed),
+        buffer: Arc::clone(&buffer),
+        steers: vec!["persist me host-side".to_string()],
+    });
+    let drained_batches: Arc<StdMutex<Vec<Vec<String>>>> = Arc::new(StdMutex::new(Vec::new()));
+    let drained_for_callback = Arc::clone(&drained_batches);
+    let callback: crate::steering::SteerDrainedCallback = Arc::new(move |batch: Vec<String>| {
+        let drained = Arc::clone(&drained_for_callback);
+        Box::pin(async move {
+            drained
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .push(batch);
+        })
+    });
+    let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+    let agent = Agent::new(AgentId::new("steer-agent"), provider, tools, memory)
+        .with_steer_buffer(Arc::clone(&buffer))
+        .with_steer_drained_callback(callback);
+
+    let result = agent.process_message("do work", &[], vec![]).await.unwrap();
+    assert_eq!(result.content, "second answer");
+
+    let batches = drained_batches
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    assert_eq!(
+        batches.as_slice(),
+        [vec!["persist me host-side".to_string()]]
+    );
+    // Host owns persistence → the row must NOT ride the output log.
+    assert!(
+        !result
+            .messages
+            .iter()
+            .any(|m| m.role == MessageRole::User && m.content == "persist me host-side"),
+        "steer rows must stay out of the turn output log when the host persists them"
+    );
+    // ...but the model did see it.
+    let observed = observed.lock().unwrap_or_else(|error| error.into_inner());
+    assert!(
+        observed[1]
+            .iter()
+            .any(|(role, content)| *role == MessageRole::User && content == "persist me host-side")
     );
 }

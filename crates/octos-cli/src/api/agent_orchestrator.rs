@@ -12,8 +12,9 @@ use super::goal_loop_runtime::{
     resolve_maintenance_prompt,
 };
 use super::master_continuation_scheduler::{
-    MasterContinuationEnqueueOutcome, MasterContinuationReason, MasterContinuationRequest,
-    MasterContinuationRuntimeState, MasterContinuationScheduler, QueuedMasterContinuation,
+    MAX_REDELIVERY_ATTEMPTS, MasterContinuationDedupeKey, MasterContinuationEnqueueOutcome,
+    MasterContinuationReason, MasterContinuationRequest, MasterContinuationRuntimeState,
+    MasterContinuationScheduler, QueuedMasterContinuation, ReinsertOutcome,
 };
 use super::supervisor_store::{
     ArtifactRecord as SupervisorArtifactRecord, ChildAgentRecord, ChildStatus, ContinuationStatus,
@@ -128,6 +129,94 @@ const SPAWN_ONLY_FAILURE_META_ORIGINATING_CMID: &str = "originating_client_messa
 /// Distinct from `coding-autonomy` (loops/goals) so operators can filter
 /// the persisted queue by group when triaging recovery turns.
 const SPAWN_ONLY_FAILURE_GROUP: &str = "spawn-only-failure-recovery";
+
+/// #436 — kind label for the `External(_)` master continuation reason that
+/// delivers a `peer_send_input` injection into a RUNNING serve peer session.
+/// The serve process has no gateway `ActorRegistry` to populate the inbox
+/// registry, so the tool re-plumbs onto the master continuation queue: the
+/// injected text is enqueued under the peer's wire session key and drained
+/// as the peer's next turn on its `appui_continuation_tick`.
+pub(crate) const PEER_SEND_INPUT_EXTERNAL_KIND: &str = "peer_send_input";
+/// Metadata key carrying the verbatim injected message; the prompt renderer
+/// emits it as the peer turn's user prompt.
+pub(crate) const PEER_SEND_INPUT_META_MESSAGE: &str = "peer_send_input_message";
+/// Metadata key carrying the peer slug, so a pending injection can be
+/// re-homed to the peer's new wire key on reconnect (#436 P1 #1/#5).
+pub(crate) const PEER_SEND_INPUT_META_SLUG: &str = "peer_send_input_slug";
+/// Metadata key carrying the unique occurrence id, so a re-home preserves the
+/// dedupe identity (a genuine retry still collapses after re-target).
+pub(crate) const PEER_SEND_INPUT_META_OCCURRENCE: &str = "peer_send_input_occurrence";
+/// Group id stamped onto peer_send_input continuations (queue triage filter).
+const PEER_SEND_INPUT_GROUP: &str = "peer-send-input";
+
+/// Peer-fleet auto-synthesis — kind label for the `External(_)` master
+/// continuation that fires an AUTONOMOUS synthesis turn on the ORIGINATOR
+/// (master) session the moment every peer it handed off has completed. Unlike
+/// the passive `peer_results_ready_note` (a mailbox nudge injected only when
+/// the user next prompts the master), this actively enqueues a master turn so
+/// the fleet's consolidated report is produced with no user prompt. Flows
+/// through the same hardened `External` drain path as `peer_send_input`.
+pub(crate) const PEER_FLEET_SYNTHESIS_EXTERNAL_KIND: &str = "peer_fleet_synthesis";
+/// Metadata key carrying the number of completed peers in the fleet (prompt
+/// context only; the synthesis turn gathers results by reading the blackboard).
+pub(crate) const PEER_FLEET_SYNTHESIS_META_PEER_COUNT: &str = "peer_fleet_peer_count";
+/// Metadata key carrying the comma-separated OWNED peer slugs (this master's
+/// fleet). The synthesis prompt directs `peer_gather` at ONLY these slugs, so
+/// it reads this master's fleet and never another master's peers that share the
+/// same profile `peers/` root (codex #4). Slugs are `peer_slug_is_safe`
+/// (`[a-z0-9-]` / `%`-escaped), so a comma join is unambiguous.
+pub(crate) const PEER_FLEET_SYNTHESIS_META_SLUGS: &str = "peer_fleet_slugs";
+/// Group id stamped onto peer-fleet-synthesis continuations (queue triage).
+const PEER_FLEET_SYNTHESIS_GROUP: &str = "peer-fleet-synthesis";
+
+/// #436 P1 (#3) — real delivery status for a `peer_send_input` injection so the
+/// tool never acks success on a durable-persist failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PeerSendInputEnqueueOutcome {
+    /// Newly queued (durably persisted, or in-memory-only when no store).
+    Queued,
+    /// Collapsed onto an already-queued injection with the SAME occurrence id
+    /// (a genuine retry) — already queued for delivery.
+    Duplicate,
+    /// Enqueued in-memory but the durable store write failed; the enqueue was
+    /// rolled back so it is NOT queued. The caller MUST surface an error.
+    PersistFailed,
+}
+
+impl PeerSendInputEnqueueOutcome {
+    /// The tool callback maps a real delivery status to its `Result`: a
+    /// persist failure is an ERROR (do not ack success), everything else is a
+    /// queued-for-delivery success.
+    pub(crate) fn into_callback_result(self, slug: &str) -> Result<(), String> {
+        match self {
+            Self::Queued | Self::Duplicate => Ok(()),
+            Self::PersistFailed => Err(format!(
+                "failed to durably queue input for peer '{slug}' (storage write \
+                 error) — the injection was not delivered; try again"
+            )),
+        }
+    }
+}
+
+/// The dedupe key for a `peer_send_input` continuation. Keyed on the peer's
+/// wire session AND the unique per-call occurrence id, so distinct calls never
+/// collapse while a same-call retry (or a re-home under the same occurrence)
+/// dedups.
+fn peer_send_input_dedupe_key(session: &SessionKey, occurrence_id: &str) -> String {
+    format!("external/{PEER_SEND_INPUT_EXTERNAL_KIND}/{session}/{occurrence_id}")
+}
+
+/// The dedupe key for a peer-fleet-synthesis continuation — PER-MASTER only.
+/// A master's fleet synthesizes EXACTLY ONCE (the `.synthesized` existence
+/// marker gates the enqueue, and the marker persists for the life of the
+/// fleet), so a stable per-master key is exactly right: a second enqueue for the
+/// same master collapses onto the first. No mtime/turns occurrence id — there is
+/// no re-arm to distinguish, and the `RECENT_CLAIM_GUARD_WINDOW` can only ever
+/// see a benign duplicate here (a genuine re-fire requires the fleet to be fully
+/// cleared and a fresh one completed, far beyond the 30s window).
+fn peer_fleet_synthesis_dedupe_key(master_session: &SessionKey) -> String {
+    format!("external/{PEER_FLEET_SYNTHESIS_EXTERNAL_KIND}/{master_session}")
+}
 
 #[derive(Debug, Clone)]
 pub(crate) struct AgentListRequest {
@@ -2301,6 +2390,335 @@ impl InProcessAgentOrchestrator {
         }
         let mut state = self.state();
         enqueue_and_persist_continuation(&mut state, request)
+    }
+
+    /// #436 — enqueue a `peer_send_input` injection as a master continuation
+    /// on the TARGET peer session's queue. The serve `peer_send_input` tool
+    /// calls this after resolving a slug to the peer's wire `SessionKey`; the
+    /// continuation is drained on the peer's next `appui_continuation_tick`
+    /// (or the connection-independent global drain) and rendered verbatim as
+    /// the peer's next user turn by `master_continuation_prompt`.
+    ///
+    /// Dedupe keys on the UNIQUE per-call `occurrence_id` (#436 P1 #4), so two
+    /// DISTINCT injections (separate tool calls, even identical text) each get
+    /// a fresh turn, while a genuine retry of the SAME call collapses. Returns
+    /// a real delivery status (#436 P1 #3): a durable-store write failure rolls
+    /// the enqueue back and reports [`PeerSendInputEnqueueOutcome::PersistFailed`]
+    /// so the tool surfaces an error rather than acking a false success.
+    pub(crate) fn enqueue_peer_send_input_continuation(
+        &self,
+        target_session: &SessionKey,
+        profile_id: &str,
+        slug: &str,
+        occurrence_id: &str,
+        message: &str,
+    ) -> PeerSendInputEnqueueOutcome {
+        let request = MasterContinuationRequest::new(
+            PEER_SEND_INPUT_GROUP,
+            target_session.to_string(),
+            profile_id.to_owned(),
+            MasterContinuationReason::External(PEER_SEND_INPUT_EXTERNAL_KIND.to_owned()),
+            SystemTime::now(),
+        )
+        .with_metadata(PEER_SEND_INPUT_META_MESSAGE, message.to_owned())
+        .with_metadata(PEER_SEND_INPUT_META_SLUG, slug.to_owned())
+        .with_metadata(PEER_SEND_INPUT_META_OCCURRENCE, occurrence_id.to_owned())
+        .with_dedupe_key(peer_send_input_dedupe_key(target_session, occurrence_id));
+        let mut state = self.state();
+        match state.continuations.enqueue(request) {
+            MasterContinuationEnqueueOutcome::Duplicate { .. } => {
+                PeerSendInputEnqueueOutcome::Duplicate
+            }
+            MasterContinuationEnqueueOutcome::Queued(continuation) => {
+                if let Err(err) = persist_continuation_queued_checked(&state, &continuation) {
+                    tracing::error!(
+                        ?err,
+                        slug,
+                        "peer_send_input durable persist failed; rolling back enqueue"
+                    );
+                    state.continuations.cancel(&continuation.dedupe_key);
+                    PeerSendInputEnqueueOutcome::PersistFailed
+                } else {
+                    PeerSendInputEnqueueOutcome::Queued
+                }
+            }
+        }
+    }
+
+    /// Peer-fleet auto-synthesis — enqueue ONE autonomous synthesis turn on the
+    /// master (originator) session when its whole peer fleet has completed. The
+    /// fire decision (every owned peer has a `result.md`, none is mid-turn, the
+    /// master is idle, and the fleet has not already been synthesized) is made
+    /// by the caller in `ui_protocol.rs`; this method only performs the enqueue.
+    ///
+    /// The dedupe key is PER-MASTER, so a second enqueue for the same master
+    /// (concurrent terminals, or any stray re-evaluation) collapses onto the
+    /// first — one synthesis per fleet. `owned_slugs` scopes the prompt's
+    /// `peer_gather` to this master's fleet only.
+    ///
+    /// In-memory enqueue (no durable persist): losing a synthesis TRIGGER across
+    /// a restart is benign — the master's next real turn still picks up the
+    /// passive `peer_results_ready_note` nudge — so, unlike a user's
+    /// `peer_send_input` message, it need not survive a crash.
+    pub(crate) fn enqueue_peer_fleet_synthesis_continuation(
+        &self,
+        master_session: &SessionKey,
+        profile_id: &str,
+        owned_slugs: &[String],
+        peer_count: usize,
+    ) -> MasterContinuationEnqueueOutcome {
+        let request = MasterContinuationRequest::new(
+            PEER_FLEET_SYNTHESIS_GROUP,
+            master_session.to_string(),
+            profile_id.to_owned(),
+            MasterContinuationReason::External(PEER_FLEET_SYNTHESIS_EXTERNAL_KIND.to_owned()),
+            SystemTime::now(),
+        )
+        .with_metadata(PEER_FLEET_SYNTHESIS_META_PEER_COUNT, peer_count.to_string())
+        // Carry the OWNED slugs so the prompt scopes `peer_gather` to this
+        // master's fleet only. The explicit `with_dedupe_key` below is
+        // authoritative, so this metadata never widens the key.
+        .with_metadata(PEER_FLEET_SYNTHESIS_META_SLUGS, owned_slugs.join(","))
+        .with_dedupe_key(peer_fleet_synthesis_dedupe_key(master_session));
+        let mut state = self.state();
+        state.continuations.enqueue(request)
+    }
+
+    /// Peer-fleet auto-synthesis RESET — clear the scheduler's recent-claim
+    /// guard entry for a master's (stable, per-master) synthesis dedupe key, so
+    /// a fresh fleet completing within `RECENT_CLAIM_GUARD_WINDOW` after a reset
+    /// is not wrongly deduped against the just-claimed prior synthesis. Called
+    /// when the fleet RESET removes the `.synthesized` marker.
+    pub(crate) fn clear_peer_fleet_synthesis_claim(&self, master_session: &SessionKey) {
+        let key =
+            MasterContinuationDedupeKey::from(peer_fleet_synthesis_dedupe_key(master_session));
+        self.state().continuations.clear_recent_external_claim(&key);
+    }
+
+    /// codex #1 — true when peer `slug` (under `profile_id`) has a
+    /// `peer_send_input` injection still QUEUED (a follow-up turn that has not
+    /// run yet). Such a peer is NOT settled: the fleet-synthesis gate must not
+    /// count it as done, or it would synthesize a stale result before the
+    /// queued turn produces a fresher one. Mirrors the pending-item scan in
+    /// [`Self::cancel_peer_send_input_continuations_for_peer`].
+    pub(crate) fn has_pending_peer_send_input_for_peer(
+        &self,
+        profile_id: &str,
+        slug: &str,
+    ) -> bool {
+        self.state().continuations.pending_items().any(|item| {
+            matches!(&item.reason, MasterContinuationReason::External(kind)
+                if kind == PEER_SEND_INPUT_EXTERNAL_KIND)
+                && item.profile_id.as_str() == profile_id
+                && item
+                    .metadata
+                    .get(PEER_SEND_INPUT_META_SLUG)
+                    .map(String::as_str)
+                    == Some(slug)
+        })
+    }
+
+    /// codex #1 (residual, TOCTOU) — true when peer `slug` has a
+    /// `peer_send_input` injection that is either QUEUED or was just CLAIMED
+    /// (popped by the drain for its wire session `target_session`, turn not yet
+    /// active) within the scheduler's recent-claim window. Blocks the
+    /// fleet-synthesis gate so a peer whose injection is IN-FLIGHT — pending OR
+    /// popped-but-not-yet-active — is never treated as settled.
+    ///
+    /// Race-free by ORDER, not by a single lock: `pop_ready` removes the item
+    /// from `pending_by_key` AND records its claim in `recently_claimed_external`
+    /// in ONE critical section. So if the pending check (taken FIRST) finds
+    /// nothing, the pop must already have completed and recorded its claim,
+    /// which the second check then observes. A concurrent drain can therefore
+    /// never leave the injection invisible to BOTH checks.
+    pub(crate) fn peer_has_inflight_send_input(
+        &self,
+        profile_id: &str,
+        slug: &str,
+        target_session: Option<&SessionKey>,
+    ) -> bool {
+        // Check pending FIRST: a still-queued injection short-circuits, and a
+        // `false` here means any concurrent pop already recorded its claim.
+        if self.has_pending_peer_send_input_for_peer(profile_id, slug) {
+            return true;
+        }
+        let Some(session) = target_session else {
+            return false;
+        };
+        // The just-claimed (popped, dispatch in-flight) case: match the
+        // per-session key stem `peer_send_input_dedupe_key` builds.
+        let prefix = format!("external/{PEER_SEND_INPUT_EXTERNAL_KIND}/{session}/");
+        self.state()
+            .continuations
+            .has_recent_external_claim_with_prefix(&prefix, SystemTime::now())
+    }
+
+    /// #436 P1 (#1/#5) — re-home any PENDING `peer_send_input` injections for
+    /// `slug` onto the peer's CURRENT wire key when the peer reopens as a fresh
+    /// client-chosen session. Without this, a queued injection stays bound to
+    /// the closed session and is lost. Called from `session/open`. Returns the
+    /// number of injections re-homed. The occurrence id is preserved so a true
+    /// retry still dedups after the re-home.
+    pub(crate) fn retarget_peer_send_input_continuations(
+        &self,
+        profile_id: &str,
+        slug: &str,
+        new_session: &SessionKey,
+    ) -> usize {
+        let new_session_str = new_session.to_string();
+        let mut state = self.state();
+        // Snapshot stranded items (immutable borrow) before mutating the queue.
+        let stranded: Vec<(MasterContinuationDedupeKey, String, String)> = state
+            .continuations
+            .pending_items()
+            .filter(|item| {
+                matches!(&item.reason, MasterContinuationReason::External(kind)
+                    if kind == PEER_SEND_INPUT_EXTERNAL_KIND)
+                    && item.profile_id.as_str() == profile_id
+                    && item
+                        .metadata
+                        .get(PEER_SEND_INPUT_META_SLUG)
+                        .map(String::as_str)
+                        == Some(slug)
+                    && item.session_id.as_str() != new_session_str
+            })
+            .map(|item| {
+                (
+                    item.dedupe_key.clone(),
+                    item.metadata
+                        .get(PEER_SEND_INPUT_META_OCCURRENCE)
+                        .cloned()
+                        .unwrap_or_default(),
+                    item.metadata
+                        .get(PEER_SEND_INPUT_META_MESSAGE)
+                        .cloned()
+                        .unwrap_or_default(),
+                )
+            })
+            .collect();
+        let mut rehomed = 0;
+        for (old_key, occurrence_id, message) in stranded {
+            // #436 P1 #1 — CRASH-ORDER SAFETY. The re-home is three writes
+            // (persist-new / tombstone-old-durable / cancel-old-in-mem) with no
+            // transaction. Order them so no crash window can lose the injection:
+            // persist the NEW record FIRST, and only AFTER it is durable retire
+            // the OLD one. A crash between the two leaves BOTH durable — never
+            // "neither" — and the redundant old is handled by the freshness gate
+            // (+ dedup) on the next drain. `restore`'s completed-only skip means
+            // the tombstone is what prevents a restart re-delivering the old.
+            let request = MasterContinuationRequest::new(
+                PEER_SEND_INPUT_GROUP,
+                new_session_str.clone(),
+                profile_id.to_owned(),
+                MasterContinuationReason::External(PEER_SEND_INPUT_EXTERNAL_KIND.to_owned()),
+                SystemTime::now(),
+            )
+            .with_metadata(PEER_SEND_INPUT_META_MESSAGE, message)
+            .with_metadata(PEER_SEND_INPUT_META_SLUG, slug.to_owned())
+            .with_metadata(PEER_SEND_INPUT_META_OCCURRENCE, occurrence_id.clone())
+            .with_dedupe_key(peer_send_input_dedupe_key(new_session, &occurrence_id));
+            let new_cont = match state.continuations.enqueue(request) {
+                MasterContinuationEnqueueOutcome::Queued(cont) => cont,
+                // Already re-homed (e.g. a prior retarget for the same reopen);
+                // fall through to retire the stale old record.
+                MasterContinuationEnqueueOutcome::Duplicate { .. } => {
+                    retire_old_peer_injection(
+                        &mut state,
+                        &old_key,
+                        "retargeted_to_reopened_peer_wire",
+                    );
+                    rehomed += 1;
+                    continue;
+                }
+            };
+            // Persist the NEW record before touching the old. On a durable-write
+            // failure, propagate it: roll back the in-mem new and LEAVE the old
+            // intact (still deliverable + durable) rather than risk losing both.
+            if let Err(err) = persist_continuation_queued_checked(&state, &new_cont) {
+                tracing::error!(
+                    ?err,
+                    slug,
+                    "peer_send_input re-home persist failed; leaving the old record \
+                     intact (not re-homed this pass)"
+                );
+                state.continuations.cancel(&new_cont.dedupe_key);
+                continue;
+            }
+            // New is durable — NOW retire the old (cancel in-mem + tombstone).
+            retire_old_peer_injection(&mut state, &old_key, "retargeted_to_reopened_peer_wire");
+            rehomed += 1;
+        }
+        rehomed
+    }
+
+    /// #436 leak fix — CANCEL + tombstone every PENDING `peer_send_input`
+    /// injection targeting `slug` (any wire session) under `profile_id`. Called
+    /// by `peer_close`: without it, an injection queued just before the close
+    /// is skipped by the closed-target drain gate before it is ever popped, so
+    /// it is never reinserted/capped/tombstoned and lingers in the durable queue
+    /// forever. Mirrors [`retarget_peer_send_input_continuations`]'s pending-item
+    /// scan, but retires each match instead of re-homing it. Returns the count.
+    pub(crate) fn cancel_peer_send_input_continuations_for_peer(
+        &self,
+        profile_id: &str,
+        slug: &str,
+    ) -> usize {
+        let mut state = self.state();
+        // Snapshot matching keys (immutable borrow) before mutating the queue.
+        let keys: Vec<MasterContinuationDedupeKey> = state
+            .continuations
+            .pending_items()
+            .filter(|item| {
+                matches!(&item.reason, MasterContinuationReason::External(kind)
+                    if kind == PEER_SEND_INPUT_EXTERNAL_KIND)
+                    && item.profile_id.as_str() == profile_id
+                    && item
+                        .metadata
+                        .get(PEER_SEND_INPUT_META_SLUG)
+                        .map(String::as_str)
+                        == Some(slug)
+            })
+            .map(|item| item.dedupe_key.clone())
+            .collect();
+        let cancelled = keys.len();
+        for key in &keys {
+            retire_old_peer_injection(&mut state, key, "retired_peer_closed");
+        }
+        cancelled
+    }
+
+    /// #436 P1 #2/#4 — re-insert a popped-but-UNDELIVERED peer injection so it
+    /// is retried live on the next tick (and re-homed by a reopen's retarget),
+    /// instead of waiting for a server restart's durable replay. The durable
+    /// record is still `Queued` (an undelivered turn is never tombstoned), so
+    /// this only restores the in-memory queue entry.
+    ///
+    /// #436 follow-up — re-delivery is bounded ([`MAX_REDELIVERY_ATTEMPTS`]) so
+    /// a permanently-undeliverable injection cannot starve newer work. When the
+    /// bound is hit the item is dropped from the live queue; log it so a dropped
+    /// peer message is never silent. In durable-store mode its record is still
+    /// `Queued` and replays on the next restart (a natural point to re-evaluate
+    /// whether the target is back); in pure in-memory serve there is no record,
+    /// so the capped drop is final — which is why the drop is logged.
+    pub(crate) fn reinsert_peer_continuation(&self, continuation: QueuedMasterContinuation) {
+        let slug = continuation
+            .metadata
+            .get(PEER_SEND_INPUT_META_SLUG)
+            .cloned()
+            .unwrap_or_default();
+        let session = continuation.session_id.as_str().to_owned();
+        let mut state = self.state();
+        if state.continuations.reinsert(continuation) == ReinsertOutcome::Dropped {
+            tracing::warn!(
+                slug = %slug,
+                session = %session,
+                max_attempts = MAX_REDELIVERY_ATTEMPTS,
+                "peer_send_input injection undeliverable after repeated live retries; \
+                 dropped from the in-memory queue (its durable record, if a supervisor \
+                 store is configured, replays on the next restart; in pure in-memory \
+                 serve the drop is final)"
+            );
+        }
     }
 
     /// #979 / M15-C2 — flip the goal to `complete` when the model
@@ -5104,8 +5522,21 @@ fn persist_continuation_queued(
     state: &AutonomyRuntimeState,
     continuation: &QueuedMasterContinuation,
 ) {
+    // Existing callers keep the fire-and-forget shape; the peer_send_input
+    // path uses the checked variant so a durable-store failure is surfaced
+    // (#436 P1 #3) instead of leaving the tool to ack a false success.
+    let _ = persist_continuation_queued_checked(state, continuation);
+}
+
+/// Durably persist a queued continuation, RETURNING the store error instead of
+/// discarding it. `Ok(())` when there is no supervisor store (pure in-memory
+/// serve — delivery still works in-process) or the write succeeds.
+fn persist_continuation_queued_checked(
+    state: &AutonomyRuntimeState,
+    continuation: &QueuedMasterContinuation,
+) -> std::io::Result<()> {
     let Some(store) = state.supervisor_store.as_ref() else {
-        return;
+        return Ok(());
     };
     let mut metadata = SupervisorMetadata::new();
     metadata.insert("session_id".into(), json!(continuation.session_id.as_str()));
@@ -5141,7 +5572,49 @@ fn persist_continuation_queued(
         attempt: 1,
         metadata,
     };
-    let _ = store.record_continuation_queued(record);
+    store.record_continuation_queued(record).map(|_| ())
+}
+
+/// #436 P1 #1 — retire a re-homed peer injection's OLD record: drop the
+/// in-memory entry and TOMBSTONE the durable record so a restart's `restore`
+/// (which re-enqueues every non-`Completed` record) does not resurrect + re-
+/// deliver it.
+///
+/// A tombstone-write failure is logged, not swallowed silently. In that case
+/// the old record stays `Queued` and IS re-enqueued on the next restart, but it
+/// targets the now-obsolete old wire: the post-restart wire registry is empty,
+/// so `peer_target_is_current_wire` is false, the freshness gate re-inserts it,
+/// and the redelivery cap ([`MAX_REDELIVERY_ATTEMPTS`]) drops it in-memory — it
+/// never dispatches, because only the CURRENT wire passes the gate. So a failed
+/// tombstone causes neither a lost injection nor, in the normal single-reopen
+/// case, a duplicate delivery: the live injection still lands via the current
+/// wire while the stale one is dropped. What it DOES leave is a small durable
+/// LEAK — the un-tombstoned old record lingers and is re-restored-then-dropped
+/// on every restart until the store is cleaned. (A genuine duplicate would need
+/// a convoluted multi-reopen sequence in which two different-session records
+/// each become current in turn; occurrence-id dedup does not span the differing
+/// session keys. Non-blocking — a proper fix would retry the tombstone write or
+/// tombstone superseded records on restore. Confirmed by codex + K3 review.)
+fn retire_old_peer_injection(
+    state: &mut AutonomyRuntimeState,
+    old_key: &MasterContinuationDedupeKey,
+    reason: &str,
+) {
+    state.continuations.cancel(old_key);
+    if let Some(store) = state.supervisor_store.as_ref() {
+        if let Err(err) = store.record_continuation_completed(
+            PEER_SEND_INPUT_GROUP,
+            old_key.as_str(),
+            now_ms_u64(),
+            Some(reason.to_owned()),
+        ) {
+            tracing::error!(
+                ?err,
+                key = old_key.as_str(),
+                "peer_send_input old-record tombstone write failed"
+            );
+        }
+    }
 }
 
 fn master_continuation_request_from_persisted(
@@ -5811,6 +6284,48 @@ pub(crate) fn master_continuation_prompt(continuation: &QueuedMasterContinuation
         }
         MasterContinuationReason::External(kind) if kind == SPAWN_ONLY_FAILURE_EXTERNAL_KIND => {
             render_spawn_only_failure_recovery_prompt(continuation)
+        }
+        // #436 — a `peer_send_input` injection IS the peer's next user turn:
+        // render the injected message verbatim (NOT wrapped in a
+        // `[system-internal]` envelope) so the peer's LLM processes it exactly
+        // as if the operator had typed it into the peer session. The turn
+        // dispatcher persists this prompt as a `UserMessage` (it does not skip
+        // internal-user-persist for this kind), so it lands in the peer's
+        // transcript + durable history.
+        MasterContinuationReason::External(kind) if kind == PEER_SEND_INPUT_EXTERNAL_KIND => {
+            continuation
+                .metadata
+                .get(PEER_SEND_INPUT_META_MESSAGE)
+                .cloned()
+                .unwrap_or_default()
+        }
+        // Peer-fleet auto-synthesis — every peer this master handed off has
+        // completed. Direct an autonomous gather + consolidate turn. This is a
+        // `[system-internal]` envelope (like the child/scatter join arms), NOT a
+        // verbatim user turn: it instructs the master to act, it is not itself
+        // the user's words.
+        MasterContinuationReason::External(kind) if kind == PEER_FLEET_SYNTHESIS_EXTERNAL_KIND => {
+            // codex #4 — scope the gather to THIS master's fleet. `peer_gather`
+            // accepts a `slugs` filter; without one it reads EVERY staged peer
+            // in the profile, including other masters' peers. Name the owned
+            // slugs explicitly so the synthesis reads only this fleet.
+            let gather_line = match continuation
+                .metadata
+                .get(PEER_FLEET_SYNTHESIS_META_SLUGS)
+                .map(String::as_str)
+                .filter(|slugs| !slugs.is_empty())
+            {
+                Some(slugs) => format!(
+                    "Use the `peer_gather` tool with its `slugs` filter set to EXACTLY your fleet — [{slugs}] — to collect their results now. Do NOT gather peers outside this list; they belong to other work."
+                ),
+                None => {
+                    "Use the `peer_gather` tool to collect your fleet's results now.".to_owned()
+                }
+            };
+            format!(
+                "[system-internal]\nAll peer agents you handed off have completed their work.\n\nGroup: {group}\nMetadata:\n{metadata}\n\n{gather_line} Then synthesize one consolidated report for the user. Attribute key findings to the peer that produced them, call out any failures, gaps, or disagreements between peers, and end with the single concrete next step if one is needed. Do NOT start new peer work in this turn — only gather and synthesize what the fleet has already produced.",
+                group = continuation.group_id.as_str(),
+            )
         }
         MasterContinuationReason::External(kind) => format!(
             "[system-internal]\nAn external master continuation was requested.\n\nKind: {kind}\nGroup: {group}\nMetadata:\n{metadata}\n\nHandle the continuation conservatively and summarize the visible state for the user.",
@@ -8440,6 +8955,240 @@ mod tests {
             1,
             "Queue failure routing must enqueue exactly one recovery continuation",
         );
+    }
+
+    /// Peer-fleet auto-synthesis — the synthesis continuation dedupes PER-MASTER:
+    /// a second enqueue for the same master collapses to the one queued turn,
+    /// even with a different (larger) owned-slug set or peer count. There is no
+    /// re-arm — one synthesis per fleet.
+    #[test]
+    fn peer_fleet_synthesis_continuation_dedupes_per_master() {
+        let orchestrator = default_agent_orchestrator();
+        let master = SessionKey::with_profile("tenant-fleet-synth", "api", "master-dedupe");
+        let profile = "tenant-fleet-synth";
+
+        let first = orchestrator.enqueue_peer_fleet_synthesis_continuation(
+            &master,
+            profile,
+            &["alpha".to_owned(), "beta".to_owned()],
+            2,
+        );
+        assert!(first.queued().is_some(), "first synthesis must queue");
+
+        // A later evaluation — MORE peers, different slug set — must NOT stack a
+        // second synthesis: the per-master key collapses onto the first.
+        let dup = orchestrator.enqueue_peer_fleet_synthesis_continuation(
+            &master,
+            profile,
+            &["alpha".to_owned(), "beta".to_owned(), "gamma".to_owned()],
+            3,
+        );
+        assert!(
+            dup.is_duplicate(),
+            "a per-master key: a second synthesis for the same master must dedupe"
+        );
+        assert_eq!(
+            orchestrator.pending_continuation_count_for_session_for_test(&master, profile),
+            1,
+            "a fleet synthesizes exactly once — never two queued continuations",
+        );
+    }
+
+    /// Bug 1 (reset edge) — after a fleet RESET clears the recent-claim guard, a
+    /// FRESH fleet completing within `RECENT_CLAIM_GUARD_WINDOW` still fires: its
+    /// per-master enqueue is no longer collapsed against the just-claimed prior
+    /// synthesis. Without the reset's `clear_peer_fleet_synthesis_claim`, the
+    /// stable key would stay guarded and the fresh continuation would be dropped
+    /// (marked-but-unsynthesized).
+    #[test]
+    fn fresh_fleet_after_reset_fires_within_claim_window() {
+        let orchestrator = default_agent_orchestrator();
+        let master = SessionKey::with_profile("tenant-fleet-reset", "api", "master-reset");
+        let profile = "tenant-fleet-reset";
+        let slugs = vec!["alpha".to_owned()];
+
+        // Fleet A fires and is DRAINED (claimed) → recorded in the recent-claim
+        // guard for the stable per-master key.
+        assert!(
+            orchestrator
+                .enqueue_peer_fleet_synthesis_continuation(&master, profile, &slugs, 1)
+                .queued()
+                .is_some()
+        );
+        let drained = orchestrator.drain_ready_continuations_for_session(
+            &master,
+            profile,
+            MasterContinuationRuntimeState::idle(),
+            4,
+        );
+        assert!(
+            drained.iter().any(
+                |c| matches!(&c.reason, MasterContinuationReason::External(k)
+                if k == PEER_FLEET_SYNTHESIS_EXTERNAL_KIND)
+            ),
+            "the first synthesis must drain (recording the claim)",
+        );
+
+        // WITHOUT a reset, a re-enqueue within the window is deduped by the guard
+        // (the item already left `pending_by_key` when drained).
+        assert!(
+            orchestrator
+                .enqueue_peer_fleet_synthesis_continuation(&master, profile, &slugs, 1)
+                .is_duplicate(),
+            "the recent-claim guard still holds the just-claimed key",
+        );
+
+        // RESET clears the guard entry for this master's key.
+        orchestrator.clear_peer_fleet_synthesis_claim(&master);
+
+        // A fresh fleet within the SAME window now fires — not suppressed.
+        assert!(
+            orchestrator
+                .enqueue_peer_fleet_synthesis_continuation(&master, profile, &slugs, 1)
+                .queued()
+                .is_some(),
+            "a fresh fleet after reset must fire, not be dropped by the stale guard",
+        );
+    }
+
+    /// Peer-fleet auto-synthesis — the master continuation renders the
+    /// gather-and-consolidate directive scoped to THIS master's OWNED slugs
+    /// (codex #4), so the autonomous turn reads only its own fleet.
+    #[test]
+    fn peer_fleet_synthesis_prompt_directs_fleet_scoped_gather() {
+        let orchestrator = default_agent_orchestrator();
+        let master = SessionKey::with_profile("tenant-fleet-prompt", "api", "master-prompt");
+        let profile = "tenant-fleet-prompt";
+        let slugs = vec!["edison".to_owned(), "tesla".to_owned()];
+        orchestrator.enqueue_peer_fleet_synthesis_continuation(&master, profile, &slugs, 2);
+        let drained = orchestrator.drain_ready_continuations_for_session(
+            &master,
+            profile,
+            MasterContinuationRuntimeState::idle(),
+            4,
+        );
+        let synthesis = drained
+            .iter()
+            .find(|c| {
+                matches!(&c.reason, MasterContinuationReason::External(kind)
+                    if kind == PEER_FLEET_SYNTHESIS_EXTERNAL_KIND)
+            })
+            .expect("synthesis continuation must drain when the master is idle");
+        let prompt = master_continuation_prompt(synthesis);
+        assert!(
+            prompt.contains("peer_gather"),
+            "prompt must direct peer_gather: {prompt}"
+        );
+        assert!(
+            prompt.contains("completed their work"),
+            "prompt must state the fleet completed: {prompt}"
+        );
+        // Fleet-scoped: the OWNED slugs are named as the gather filter.
+        assert!(
+            prompt.contains("edison,tesla"),
+            "prompt must scope peer_gather to the owned slugs: {prompt}"
+        );
+        assert!(
+            prompt.contains("slugs` filter"),
+            "prompt must instruct the slugs filter: {prompt}"
+        );
+    }
+
+    /// codex #1 — a peer with a QUEUED (not-yet-run) `peer_send_input` follow-up
+    /// is reported as having pending input, per (profile, slug); an unrelated
+    /// slug / profile is not.
+    #[test]
+    fn has_pending_peer_send_input_detects_queued_follow_up() {
+        let orchestrator = default_agent_orchestrator();
+        let profile = "tenant-fleet-queued";
+        let peer_wire = SessionKey::with_profile_topic(profile, "api", "peer-wire", "peer-worker");
+        assert!(
+            !orchestrator.has_pending_peer_send_input_for_peer(profile, "worker"),
+            "no queued input before any injection",
+        );
+        let outcome = orchestrator.enqueue_peer_send_input_continuation(
+            &peer_wire,
+            profile,
+            "worker",
+            "occ-1",
+            "follow up please",
+        );
+        assert_eq!(outcome, PeerSendInputEnqueueOutcome::Queued);
+        assert!(
+            orchestrator.has_pending_peer_send_input_for_peer(profile, "worker"),
+            "a queued peer_send_input must be detected for its slug",
+        );
+        assert!(
+            !orchestrator.has_pending_peer_send_input_for_peer(profile, "other-worker"),
+            "a different slug must not report pending input",
+        );
+        assert!(
+            !orchestrator.has_pending_peer_send_input_for_peer("tenant-other", "worker"),
+            "a different profile must not report pending input",
+        );
+    }
+
+    /// codex #1 (residual TOCTOU) — `peer_has_inflight_send_input` blocks the
+    /// fleet-synthesis gate for BOTH a queued injection AND one that was just
+    /// CLAIMED (popped by the drain, turn not yet active). Draining the queued
+    /// item removes it from `pending_by_key` yet records it in
+    /// `recently_claimed_external`, so a peer whose injection is mid-dispatch is
+    /// never seen as settled — closing the premature/re-armed double synthesis.
+    #[test]
+    fn peer_has_inflight_send_input_covers_queued_and_just_claimed() {
+        let orchestrator = default_agent_orchestrator();
+        let profile = "tenant-fleet-claim";
+        let peer_wire =
+            SessionKey::with_profile_topic(profile, "api", "peer-wire-claim", "peer-worker");
+
+        // Nothing yet.
+        assert!(!orchestrator.peer_has_inflight_send_input(profile, "worker", Some(&peer_wire)));
+
+        // Queued injection → the pending case blocks.
+        let outcome = orchestrator.enqueue_peer_send_input_continuation(
+            &peer_wire,
+            profile,
+            "worker",
+            "occ-claim",
+            "hi",
+        );
+        assert_eq!(outcome, PeerSendInputEnqueueOutcome::Queued);
+        assert!(orchestrator.peer_has_inflight_send_input(profile, "worker", Some(&peer_wire)));
+
+        // Drain it: popped → recorded as recently-claimed, no longer pending.
+        let drained = orchestrator.drain_ready_continuations_for_session(
+            &peer_wire,
+            profile,
+            MasterContinuationRuntimeState::idle(),
+            4,
+        );
+        assert!(
+            drained.iter().any(
+                |c| matches!(&c.reason, MasterContinuationReason::External(k)
+                if k == PEER_SEND_INPUT_EXTERNAL_KIND)
+            ),
+            "the injection must drain",
+        );
+        assert!(
+            !orchestrator.has_pending_peer_send_input_for_peer(profile, "worker"),
+            "a popped injection is no longer pending",
+        );
+
+        // ...but the combined check STILL blocks via the recent-claim record —
+        // this is the closed TOCTOU window.
+        assert!(
+            orchestrator.peer_has_inflight_send_input(profile, "worker", Some(&peer_wire)),
+            "a just-claimed (popped, not-yet-active) injection must still block",
+        );
+
+        // A DIFFERENT peer session's key stem must not match the claim.
+        let other_wire = SessionKey::with_profile_topic(profile, "api", "peer-other", "peer-other");
+        assert!(
+            !orchestrator.peer_has_inflight_send_input(profile, "other", Some(&other_wire)),
+            "a different peer session must not see this claim",
+        );
+        // With no target session, only the pending case is consulted (none now).
+        assert!(!orchestrator.peer_has_inflight_send_input(profile, "worker", None));
     }
 
     /// codex DO-NOT-SHIP TOCTOU: on the WS path BOTH the legacy `on_failure`

@@ -67,14 +67,15 @@ use octos_core::ui_protocol::{
     UiProtocolCapabilities,
 };
 use octos_diagnostics::{
-    Check, CheckStatus, InstallMethod, ProductSpec, Reachability, Report, UpdatePlan,
-    config_writability_check, data_writability_check, detect, locate, on_path_check,
+    Check, CheckStatus, InstallMethod, LocatedBinaries, ProductSpec, Reachability, Report,
+    UpdatePlan, config_writability_check, data_writability_check, detect, locate, on_path_check,
     protocol_skew_check, reachability, shadow_check, terminal_checks, update_check,
 };
 
 use super::Executable;
 
 const CAT_BINARY: &str = "Binary & version";
+const CAT_INSTALLS: &str = "Installations";
 const CAT_NETWORK: &str = "Network";
 const CAT_CONFIG: &str = "Config";
 const CAT_PROVIDER: &str = "Provider & auth";
@@ -241,6 +242,12 @@ fn build_report(cmd: &DoctorCommand, with_network: bool) -> Result<Report> {
     ));
     report.push(shadow_check(&located, &method, &spec));
 
+    // --- Installations (every octos + octos-tui copy, with versions) --------
+    // Parity with `octos-tui doctor`'s Installations section: enumerate BOTH
+    // binaries across PATH + the known install dirs so duplicate / mismatched
+    // installs are visible from either doctor.
+    report.extend(installations_checks(&spec));
+
     // --- Config / data-dir context ------------------------------------------
     // Resolve the REAL config_home (~/.config/octos by default) and data_dir
     // (~/.octos) via the canonical resolver so doctor reports what octos
@@ -325,9 +332,134 @@ fn build_report(cmd: &DoctorCommand, with_network: bool) -> Result<Report> {
     Ok(report)
 }
 
-/// Network category (Stage 2, `github` feature): GitHub API reachability + a
-/// best-effort newer-release check. Both are advisory — a network/API failure
-/// produces a `[!]` WARN, never a `[✗]` FAIL, so `doctor` never blocks offline.
+// ---------------------------------------------------------------------------
+// Installations — every octos + octos-tui on the machine, with versions
+// ---------------------------------------------------------------------------
+
+/// Parity with `octos-tui doctor`'s Installations section: enumerate every
+/// octos AND octos-tui copy (across `$PATH`, Homebrew, cargo, the shell
+/// installer's `~/.local/bin`, and octos-tui's `~/.octos/bin` auto-install dir),
+/// with each copy's `--version` + inferred install method — so duplicate /
+/// mismatched installs are visible from `octos doctor` too, not just the TUI's.
+fn installations_checks(octos: &ProductSpec) -> Vec<Check> {
+    vec![
+        installs_check("octos", &locate_with_octos_bin(octos)),
+        installs_check("octos-tui", &locate(&octos_tui_spec())),
+    ]
+}
+
+/// Minimal spec for LOCATING the octos-tui client binary — only `binary_name`
+/// matters for enumeration; the rest are placeholders.
+fn octos_tui_spec() -> ProductSpec {
+    ProductSpec::new(
+        "octos-tui",
+        "octos-tui",
+        "0.0.0",
+        "octos-org/octos-tui",
+        "octos-tui",
+    )
+}
+
+/// `locate()` scans PATH + Homebrew/cargo/`~/.local/bin`, but octos-tui's
+/// auto-installer drops `octos` into `~/.octos/bin`, off both — add it (deduped
+/// by canonical path).
+fn locate_with_octos_bin(spec: &ProductSpec) -> LocatedBinaries {
+    let mut located = locate(spec);
+    if let Some(home) = std::env::var_os("HOME") {
+        let candidate = Path::new(&home)
+            .join(".octos")
+            .join("bin")
+            .join(spec.binary_file_name());
+        if candidate.is_file() {
+            let canonical = std::fs::canonicalize(&candidate).unwrap_or_else(|_| candidate.clone());
+            let already = located
+                .all()
+                .iter()
+                .any(|p| std::fs::canonicalize(p).unwrap_or_else(|_| p.clone()) == canonical);
+            if !already {
+                located.off_path.push(candidate);
+            }
+        }
+    }
+    located
+}
+
+/// Best-effort install-method guess from a binary's on-disk path.
+fn install_method_for_path(path: &Path) -> &'static str {
+    let p = path.to_string_lossy();
+    if p.contains("/.cargo/bin/") {
+        "cargo"
+    } else if p.contains("node_modules") {
+        "npm"
+    } else if p.contains("/homebrew/") || p.contains("/Cellar/") || p.starts_with("/usr/local/") {
+        "brew"
+    } else if p.contains("/.octos/bin/") {
+        "octos-tui auto-install"
+    } else if p.contains("/.local/bin/") {
+        "shell installer"
+    } else if p.starts_with("/usr/bin/") || p.starts_with("/bin/") {
+        "system"
+    } else {
+        "unknown"
+    }
+}
+
+/// Run `<path> --version` and return its first non-empty line, or `None`.
+fn probe_version(path: &Path) -> Option<String> {
+    let output = std::process::Command::new(path)
+        .arg("--version")
+        .output()
+        .ok()?;
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .map(str::to_owned)
+}
+
+/// One display row per located binary: `<path> [<method>, on/off PATH] → <version>`.
+fn install_rows(located: &LocatedBinaries) -> Vec<String> {
+    located
+        .all()
+        .iter()
+        .map(|p| {
+            let method = install_method_for_path(p);
+            let on = if located.on_path.contains(p) {
+                "on PATH"
+            } else {
+                "off PATH"
+            };
+            let version = probe_version(p).unwrap_or_else(|| "no --version".to_string());
+            format!("{} [{method}, {on}] → {version}", p.display())
+        })
+        .collect()
+}
+
+/// PASS on exactly one install, WARN on duplicates (naming the extras to
+/// remove) or on none found.
+fn installs_check(name: &str, located: &LocatedBinaries) -> Check {
+    let rows = install_rows(located);
+    match rows.len() {
+        0 => Check::warn(
+            CAT_INSTALLS,
+            format!("{name} installs"),
+            "none found on $PATH or known install dirs",
+            format!("install {name}"),
+        ),
+        1 => Check::pass(CAT_INSTALLS, format!("{name} installs"), rows[0].clone()),
+        n => Check::warn(
+            CAT_INSTALLS,
+            format!("{name} installs"),
+            format!("{n} installs found — the first on $PATH wins; the rest can confuse updates"),
+            format!(
+                "remove the copies you don't want: {}",
+                rows[1..].join(" ; ")
+            ),
+        )
+        .with_value(rows.join(" | ")),
+    }
+}
+
 fn network_checks(spec: &ProductSpec, method: &InstallMethod) -> Vec<Check> {
     let mut checks = Vec::new();
 
@@ -1622,6 +1754,67 @@ mod tests {
             strict: false,
             data_dir: None,
         }
+    }
+
+    #[test]
+    fn install_method_for_path_infers_from_path() {
+        assert_eq!(
+            install_method_for_path(Path::new("/home/u/.cargo/bin/octos")),
+            "cargo"
+        );
+        assert_eq!(
+            install_method_for_path(Path::new("/opt/homebrew/bin/octos")),
+            "brew"
+        );
+        assert_eq!(
+            install_method_for_path(Path::new("/home/u/.local/bin/octos-tui")),
+            "shell installer"
+        );
+        assert_eq!(
+            install_method_for_path(Path::new("/home/u/.octos/bin/octos")),
+            "octos-tui auto-install"
+        );
+        assert_eq!(
+            install_method_for_path(Path::new("/usr/bin/octos")),
+            "system"
+        );
+        assert_eq!(
+            install_method_for_path(Path::new("/x/node_modules/.bin/octos-tui")),
+            "npm"
+        );
+    }
+
+    #[test]
+    fn installs_check_passes_on_one_and_warns_on_duplicates() {
+        let one = installs_check(
+            "octos",
+            &LocatedBinaries {
+                on_path: vec![PathBuf::from("/opt/homebrew/bin/octos")],
+                off_path: vec![],
+            },
+        );
+        assert_eq!(one.status, CheckStatus::Pass);
+
+        let dup = installs_check(
+            "octos",
+            &LocatedBinaries {
+                on_path: vec![PathBuf::from("/opt/homebrew/bin/octos")],
+                off_path: vec![PathBuf::from("/home/u/.cargo/bin/octos")],
+            },
+        );
+        assert_eq!(dup.status, CheckStatus::Warn);
+
+        assert_eq!(
+            installs_check("octos", &LocatedBinaries::default()).status,
+            CheckStatus::Warn
+        );
+    }
+
+    #[test]
+    fn installations_checks_cover_both_octos_and_octos_tui() {
+        let checks = installations_checks(&octos_server_spec());
+        assert!(checks.iter().any(|c| c.name == "octos installs"));
+        assert!(checks.iter().any(|c| c.name == "octos-tui installs"));
     }
 
     #[test]

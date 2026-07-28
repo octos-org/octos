@@ -2,12 +2,12 @@
 
 ## Overview
 
-octos is a 26-member Rust workspace (Edition 2024, rust-version 1.85.0) providing both a coding agent CLI and a multi-channel messaging gateway. Pure Rust TLS via rustls (no OpenSSL). Error handling via `eyre`/`color-eyre`.
+octos is a 27-member Rust workspace (Edition 2024, rust-version 1.85.0) providing both a coding agent CLI and a multi-channel messaging gateway. Pure Rust TLS via rustls (no OpenSSL). Error handling via `eyre`/`color-eyre`.
 
 **Workspace members** (from `Cargo.toml`):
 - **Layered core** (7): `octos-core` (shared types) → `octos-memory` + `octos-llm` → `octos-agent` (agent loop, tools, sandbox, MCP, compaction) → `octos-cli` (commands, config, serve/API), plus `octos-bus` (14 channels, sessions, coalescing, cron) and `octos-diagnostics` (powers `octos doctor`).
 - **Agent-adjacent** (5): `octos-pipeline` (DOT-graph workflows), `octos-plugin` (plugin/skill SDK), `octos-swarm` (multi-agent contract authoring), `octos-sandbox`, `octos-dora-mcp`.
-- **Bundled skill crates** (14): each app skill under `crates/app-skills/` is its own crate — `news`, `deep-search`, `deep-crawl`, `send-email`, `account-manager`, `time`, `weather`, `wechat-bridge`, `skill-evolve`, and the `harness-starter-{generic,report,audio,coding}` templates — plus `platform-skills/voice` (ASR/TTS).
+- **Bundled skill crates** (15): each app skill under `crates/app-skills/` is its own crate — `news`, `deep-search`, `deep-crawl`, `send-email`, `account-manager`, `time`, `weather`, `smart-home`, `wechat-bridge`, `skill-evolve`, and the `harness-starter-{generic,report,audio,coding}` templates — plus `platform-skills/voice` (ASR/TTS).
 
 (The web SPA and terminal client live in the separate `octos-web` and `octos-tui` repositories and talk to `octos serve` over the UI Protocol.)
 
@@ -129,6 +129,8 @@ pub enum AgentMessage {           // tagged: "type", snake_case
     ContextResponse { task_id: TaskId, context: Vec<Message> },
 }
 ```
+
+This tagged enum is the **sub-agent** coordination channel. **Peers** coordinate differently — through sovereign sessions and a file blackboard rather than in-band messages; see [Sub-Agents & Peers](#sub-agents--peers).
 
 ### Error System
 
@@ -1435,7 +1437,11 @@ LLM response: [web_search, read_file, send_email]
                     Next LLM call
 ```
 
-### Sub-Agent Modes (spawn tool)
+### Sub-Agents & Peers
+
+octos supports two multi-agent shapes with opposite ownership models.
+
+**Sub-agents** (`spawn` tool) are children of the current turn:
 
 | Aspect | Sync | Background |
 |--------|------|------------|
@@ -1445,6 +1451,8 @@ LLM response: [web_search, read_file, send_email]
 | Use case | Sequential pipelines | Fire-and-forget long tasks |
 
 Sub-agents cannot spawn further sub-agents (spawn tool is always denied in sub-agent policy).
+
+**Peers** (`peer_handoff` / `peer_send_input` / `peer_gather` / `peer_list` / `peer_close` tools) are *sovereign sessions*, not children: a peer has its own durable brief, workspace, `session/open` + `turn/start` lifecycle, and `peers/<slug>/result.md` output, and it survives the originating turn (closing only on client disconnect). Peers are staged on disk (`peer/prepare` stages a 1–8 fleet), tracked live in a process-global peer wire registry (`{profile}:peer:{slug}` → session), and coordinate only through the file blackboard read by `peer_gather` — they never share context in-band. `peer_send_input` reaches a running peer through the gateway actor inbox (gateway) or a durable, persisted **continuation queue** drained ~2 s per-connection / 5 s globally (serve); delivery is **best-effort, single-user**, guarded by an originator check (fail-closed), a depth-1 rail (peers cannot hand off or inject), a 4-handoff-per-turn cap, and a redelivery cap (5 attempts, sequence-advanced so a stuck injection cannot starve newer work). See [Multi-Agent Orchestration](./multi-agent.md) for the full model, delivery path, and known limitations.
 
 ### Multi-Tenant Dashboard
 

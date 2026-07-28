@@ -263,6 +263,12 @@ impl ConfigWatcher {
         if old.hooks != new.hooks {
             restart_fields.push("hooks".into());
         }
+        // #1774: post-edit formatting is baked into AgentConfig at startup
+        // (chat / gateway / serve all copy it into their agent configs), so
+        // a live toggle needs a restart to take effect.
+        if old.format_after_edit != new.format_after_edit {
+            restart_fields.push("format_after_edit".into());
+        }
         // Section B (codex review round-6 P2): plugin loader policy
         // (`plugins.require_signed`) is consumed only during plugin
         // load. A toggle in a running gateway must trigger a restart
@@ -456,6 +462,37 @@ mod tests {
                 "provider change should not require restart, got fields: {:?}",
                 fields
             );
+        }
+    }
+
+    #[test]
+    fn should_require_restart_when_format_after_edit_toggled() {
+        // #1774: `format_after_edit` is baked into AgentConfig at startup, so
+        // a live toggle must surface as restart-required (like `hooks`).
+        let dir = TempDir::new().unwrap();
+        let path = write_config(&dir, r#"{"provider": "anthropic"}"#);
+        let old_config = Config::from_file(&path).unwrap();
+
+        std::fs::write(
+            &path,
+            r#"{"provider": "anthropic", "format_after_edit": true}"#,
+        )
+        .unwrap();
+        let new_config = Config::from_file(&path).unwrap();
+
+        let (tx, rx) = watch::channel(None);
+        let watcher = ConfigWatcher::new(vec![path], old_config, tx);
+        watcher.diff_and_emit(&new_config);
+
+        let change = rx.borrow().clone();
+        match change {
+            Some(ConfigChange::RestartRequired(fields)) => {
+                assert!(
+                    fields.iter().any(|f| f == "format_after_edit"),
+                    "expected format_after_edit in restart fields, got: {fields:?}"
+                );
+            }
+            other => panic!("expected RestartRequired, got: {other:?}"),
         }
     }
 

@@ -24,6 +24,7 @@ pub mod dispatch_policy;
 pub mod event_bus;
 pub mod exec_env;
 pub mod file_state_cache;
+pub mod format;
 pub mod harness_errors;
 pub mod harness_events;
 pub mod hooks;
@@ -47,7 +48,9 @@ pub mod sandbox;
 mod sanitize;
 pub mod session;
 pub mod session_usage;
+mod shell_analysis;
 pub mod skills;
+pub mod snapshot;
 pub mod steering;
 pub mod subagent_output;
 pub mod subagent_summary;
@@ -160,7 +163,13 @@ pub use sandbox::{Sandbox, SandboxConfig, SandboxMode, create_sandbox};
 pub use session::{SessionLimits, SessionState, SessionStateHandle, SessionUsage};
 pub use session_usage::{SessionUsageHandle, SessionUsageSnapshot, SharedSessionUsage};
 pub use skills::{SkillFilter, SkillInfo, SkillsLoader};
-pub use steering::{SteeringMessage, SteeringReceiver, SteeringSender};
+pub use snapshot::{
+    DEFAULT_SNAPSHOT_KEEP_LAST, SnapshotConfig, SnapshotId, SnapshotInfo, SnapshotManager,
+};
+pub use steering::{
+    SharedSteerBuffer, SteerBuffer, SteerDrainedCallback, SteeringMessage, SteeringReceiver,
+    SteeringSender,
+};
 pub use subagent_output::{
     AppendResult, DEFAULT_GC_AGE, DEFAULT_MAX_BYTES_PER_TASK, DEFAULT_MAX_BYTES_TOTAL,
     DEFAULT_PREVIEW_BYTES, SubAgentOutputRouter,
@@ -188,9 +197,12 @@ pub use tools::{
     DispatchContextContract, DispatchOutcome, DispatchRequest, DispatchResponse, EditFileTool,
     GlobTool, GrepTool, HttpMcpAgent, ListDirTool, MAX_DEPTH, MakeTypeEntry, ManageSkillsTool,
     McpAgentBackend, McpAgentBackendConfig, MemoryNoteTool, MessageTool,
-    MofaDescribeContentTypeTool, MofaMakeTool, PolicyDecision, ReadFileTool, ReadTaskOutputTool,
-    RecallMemoryTool, RecordMemoryUseTool, RobotToolRegistry, SaveMemoryTool, SendAppCardTool,
-    SendFileTool, SharedBackend, ShellTool, SpawnTool, StdioMcpAgent, SynthesizeResearchTool, Tool,
+    MofaDescribeContentTypeTool, MofaMakeTool, PeerCloseCallback, PeerCloseTool,
+    PeerGatherCallback, PeerGatherTool, PeerHandoffCallback, PeerHandoffRequest, PeerHandoffStaged,
+    PeerHandoffTool, PeerListCallback, PeerListTool, PeerSendInputCallback, PeerSendInputRequest,
+    PeerSendInputTool, PolicyDecision, ReadFileTool, ReadTaskOutputTool, RecallMemoryTool,
+    RecordMemoryUseTool, RobotToolRegistry, SaveMemoryTool, SendAppCardTool, SendFileTool,
+    SharedBackend, ShellTool, SpawnTool, StdioMcpAgent, SynthesizeResearchTool, Tool,
     ToolApprovalDecision, ToolApprovalRequest, ToolApprovalRequester, ToolConfigStore, ToolPolicy,
     ToolRegistry, ToolResult, TurnAttachmentContext, UserQuestionOutcome, UserQuestionRequest,
     UserQuestionRequester, WebFetchTool, WebSearchTool, WriteFileTool,

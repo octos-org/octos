@@ -1,0 +1,46 @@
+[package]
+name = "octos-embed-llama"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Cross-platform in-process GGUF embedding provider backed by llama.cpp."
+
+[lints]
+workspace = true
+
+[features]
+# Off by default: enabling compiles llama.cpp from source (CMake + a C++
+# toolchain), which is slow. Unlike `octos-embed-mlx` this is NOT target-gated —
+# llama.cpp builds on macOS, Linux and Windows, on ARM and x86, which is the
+# whole reason this backend exists.
+embed-llama = ["dep:llama-cpp-2", "dep:self_cell"]
+
+# Hardware accelerators, opt-in ON TOP of `embed-llama`. With none of them the
+# CPU backend is used, which for a 300M embedding model is a legitimate choice —
+# measured within ~15% of Metal for a single short text (it only falls behind
+# once batches get large).
+metal = ["llama-cpp-2/metal"]
+cuda = ["llama-cpp-2/cuda"]
+
+
+[dependencies]
+eyre = { workspace = true }
+async-trait = { workspace = true }
+octos-llm = { workspace = true }
+tracing = { workspace = true }
+
+llama-cpp-2 = { version = "0.1", optional = true, default-features = false }
+# `LlamaContext` borrows `LlamaModel`, so holding both in one long-lived struct
+# is self-referential. `self_cell` expresses that safely — the workspace denies
+# `unsafe_code`, and recreating the context per call would re-allocate the KV
+# cache on every embed.
+self_cell = { version = "1", optional = true }
+
+
+[dev-dependencies]
+octos-memory.workspace = true
+# Parses tests/golden/golden_mlx.json, the frozen reference embeddings.
+serde_json.workspace = true

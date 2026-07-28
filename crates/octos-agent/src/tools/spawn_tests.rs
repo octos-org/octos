@@ -1,4 +1,5 @@
 use super::*;
+#[cfg(unix)]
 use crate::{HookConfig, HookEvent};
 
 #[test]
@@ -357,6 +358,7 @@ async fn test_spawn_returns_immediately() {
         cost_accountant: None,
         parent_file_state_cache: None,
         parent_subagent_output_router: None,
+        child_stream_callback: None,
         parent_subagent_summary_generator: None,
         child_prompt_context_manager_factory: None,
         dispatch_policy: None,
@@ -366,6 +368,8 @@ async fn test_spawn_returns_immediately() {
             mode: crate::sandbox::SandboxMode::None,
             ..SandboxConfig::default()
         },
+        deliverable_root: None,
+        workspace_write_access: true,
     };
 
     assert_eq!(tool.worker_count.load(Ordering::SeqCst), 0);
@@ -1368,11 +1372,23 @@ async fn child_spawn_clone_is_named_spawn_and_binds_spawn_agent_via_registry_swa
         Arc::new(create_test_store().await),
         PathBuf::from("/tmp"),
         in_tx,
-    );
+    )
+    .with_deliverable_root(PathBuf::from("/runtime/deliverables"))
+    .with_workspace_write_access(false);
 
-    let child_spawn = parent.child_spawn_clone(PathBuf::from("/work/child"));
+    let child_id = AgentId::new("child-0");
+    let child_spawn = parent.child_spawn_clone(PathBuf::from("/work/child"), &child_id);
     assert_eq!(child_spawn.name(), "spawn");
     assert_eq!(child_spawn.working_dir, PathBuf::from("/work/child"));
+    assert_eq!(
+        child_spawn.deliverable_root,
+        Some(
+            PathBuf::from("/runtime/deliverables")
+                .join("child-0")
+                .join("children")
+        )
+    );
+    assert!(!child_spawn.workspace_write_access);
 
     // A bare builtins registry (what every child registry starts from)
     // carries only the delegate-LESS builtin spawn_agent — the reason a
@@ -1438,7 +1454,8 @@ async fn nested_spawn_agent_resolves_a_real_agent_id_through_the_bound_delegate(
     );
 
     let mut tools = ToolRegistry::with_builtins(std::env::temp_dir());
-    let mut clone = parent.child_spawn_clone(std::env::temp_dir());
+    let child_id = AgentId::new("child-0");
+    let mut clone = parent.child_spawn_clone(std::env::temp_dir(), &child_id);
     clone.task_supervisor = Some(tools.supervisor());
     tools.register(clone);
 
@@ -2176,6 +2193,142 @@ async fn background_child_transcript_streams_to_router_and_final_output_is_recor
     );
 }
 
+/// PR #1799 fix pins, all through a REAL detached background child.
+///
+/// (a) the `child_stream_callback` receives live `(task_id, start_offset,
+///     text)` chunks with START-offset cursor semantics (offset of the
+///     window's first byte — the convention every sibling cursor producer
+///     uses), monotonically: offset[i+1] == offset[i] + len(text[i]).
+/// (b) duplication pin: each child message lands in the router file
+///     EXACTLY once. Before the fix the StreamChunk arm appended live
+///     text to the same `<task_id>.out` the Response arm appends full
+///     iteration text to, doubling every message (the exact duplication
+///     the original drop-comment warned about).
+#[tokio::test]
+async fn child_stream_callback_gets_start_offsets_and_router_file_has_no_duplicates() {
+    let (in_tx, _in_rx) = tokio::sync::mpsc::channel(16);
+    let temp = tempfile::tempdir().unwrap();
+    let ledger = temp.path().join("tasks.jsonl");
+    let workspace = temp.path().join("ws");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let supervisor = Arc::new(TaskSupervisor::new());
+    supervisor.enable_persistence(&ledger).unwrap();
+    let router = Arc::new(crate::subagent_output::SubAgentOutputRouter::new(
+        temp.path().join("router"),
+    ));
+    let chunks: Arc<std::sync::Mutex<Vec<(String, u64, String)>>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
+    let chunks_sink = Arc::clone(&chunks);
+    let tool = SpawnTool::new(
+        Arc::new(ContentThenToolProvider {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        }),
+        Arc::new(create_test_store().await),
+        workspace.clone(),
+        in_tx,
+    )
+    .with_task_supervisor(supervisor.clone(), "api:test-session", ledger.clone())
+    .with_parent_subagent_output_router(router.clone())
+    .with_child_stream_callback(move |task_id, offset, text| {
+        chunks_sink
+            .lock()
+            .unwrap()
+            .push((task_id.to_owned(), offset, text.to_owned()));
+    });
+
+    let result = tool
+        .execute(&serde_json::json!({
+            "task": "scan the workspace and report",
+            "label": "streamer",
+            "mode": "background",
+            "allowed_tools": ["list_dir"]
+        }))
+        .await
+        .unwrap();
+    assert!(result.success, "dispatch failed: {}", result.output);
+
+    let started = std::time::Instant::now();
+    let task = loop {
+        let tasks = supervisor.get_tasks_for_session("api:test-session");
+        if let Some(task) = tasks.first() {
+            if task.status == crate::task_supervisor::TaskStatus::Completed {
+                break task.clone();
+            }
+            if task.status == crate::task_supervisor::TaskStatus::Failed {
+                panic!("background child failed: {:?}", task.error);
+            }
+        }
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "background child did not complete in time"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    };
+
+    // (a) live chunks arrived, keyed by the spawned task id, with
+    // start-offset cursors: first window starts at 0, and each next
+    // window starts where the previous ended.
+    let chunks = chunks.lock().unwrap().clone();
+    assert!(
+        chunks.len() >= 2,
+        "expected a chunk per iteration (plan + final), got {chunks:?}"
+    );
+    for (task_id, _, _) in &chunks {
+        assert_eq!(task_id, &task.id, "chunks are keyed by the child task id");
+    }
+    assert_eq!(chunks[0].1, 0, "the FIRST window starts at offset 0");
+    let mut expected = 0u64;
+    for (_, offset, text) in &chunks {
+        assert_eq!(
+            *offset, expected,
+            "start-offset must be the cumulative streamed bytes BEFORE the chunk: {chunks:?}"
+        );
+        expected += text.len() as u64;
+    }
+
+    // (b) NO duplication in the router file: streamed live text goes only
+    // to the callback; the router transcript is the Response-based durable
+    // record, one copy per message.
+    let transcript = router
+        .preview(&task.id)
+        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+        .unwrap_or_default();
+    assert_eq!(
+        transcript.matches("FINAL: transcript test done").count(),
+        1,
+        "the final text must appear EXACTLY once (StreamChunk must not \
+         double the Response append): {transcript:?}"
+    );
+    assert_eq!(
+        transcript.matches("PLAN: scan the tree").count(),
+        1,
+        "iteration text must appear EXACTLY once: {transcript:?}"
+    );
+}
+
+/// PR #1799 fix pin (c): `child_spawn_clone` preserves the stream callback
+/// so grandchildren keep streaming to the dock (the #1679 lesson: child
+/// registries silently losing parent wiring).
+#[tokio::test]
+async fn child_spawn_clone_preserves_stream_callback() {
+    let (in_tx, _in_rx) = tokio::sync::mpsc::channel(16);
+    let temp = tempfile::tempdir().unwrap();
+    let workspace = temp.path().join("ws");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let tool = SpawnTool::new(
+        Arc::new(MockProvider),
+        Arc::new(create_test_store().await),
+        workspace.clone(),
+        in_tx,
+    )
+    .with_child_stream_callback(|_, _, _| {});
+    let clone = tool.child_spawn_clone(workspace, &AgentId::new("child-1"));
+    assert!(
+        clone.child_stream_callback.is_some(),
+        "the grandchild spawn path must inherit the stream callback"
+    );
+}
+
 /// Emits one `shell` call that writes a deliverable via a redirect —
 /// reporting no `file_modified`, exactly like the mini4 heredoc reviews —
 /// then ends the turn.
@@ -2299,6 +2452,142 @@ async fn background_deliverable_surfaces_shell_written_file_in_output_files() {
         );
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
+}
+
+#[tokio::test]
+async fn background_deliverable_uses_configured_root_without_touching_workspace_state() {
+    let (in_tx, _in_rx) = tokio::sync::mpsc::channel(16);
+    let temp = tempfile::tempdir().unwrap();
+    let ledger = temp.path().join("tasks.jsonl");
+    let workspace = temp.path().join("workspace");
+    let deliverable_root = temp.path().join("runtime").join("spawn-deliverables");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let supervisor = Arc::new(TaskSupervisor::new());
+    supervisor.enable_persistence(&ledger).unwrap();
+    let tool = SpawnTool::new(
+        Arc::new(ShellDeliverableProvider {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        }),
+        Arc::new(create_test_store().await),
+        workspace.clone(),
+        in_tx,
+    )
+    .with_task_supervisor(supervisor.clone(), "api:test-session", ledger)
+    .with_deliverable_root(deliverable_root.clone())
+    .with_workspace_write_access(false)
+    .with_sandbox(SandboxConfig {
+        mode: crate::sandbox::SandboxMode::None,
+        ..Default::default()
+    });
+
+    let result = tool
+        .execute(&serde_json::json!({
+            "task": "Review the repo, then write octos-review.md",
+            "label": "reviewer",
+            "mode": "background",
+            "allowed_tools": ["shell"],
+            "deliverable": "*.md"
+        }))
+        .await
+        .unwrap();
+    assert!(result.success, "spawn dispatch failed: {}", result.output);
+
+    let started = std::time::Instant::now();
+    loop {
+        let tasks = supervisor.get_tasks_for_session("api:test-session");
+        if let Some(task) = tasks.first() {
+            match task.status {
+                crate::task_supervisor::TaskStatus::Completed => {
+                    assert_eq!(task.output_files.len(), 1, "{:?}", task.output_files);
+                    assert!(
+                        std::path::Path::new(&task.output_files[0]).starts_with(&deliverable_root),
+                        "deliverable must be outside the workspace: {:?}",
+                        task.output_files
+                    );
+                    assert!(
+                        !workspace.join(".octos").exists(),
+                        "deliverable setup must not create workspace state"
+                    );
+                    break;
+                }
+                crate::task_supervisor::TaskStatus::Failed => {
+                    panic!("background deliverable spawn failed: {:?}", task.error);
+                }
+                _ => {}
+            }
+        }
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "background deliverable spawn did not complete in time"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}
+
+#[tokio::test]
+async fn read_only_spawn_refuses_deliverable_without_external_root() {
+    let (in_tx, _in_rx) = tokio::sync::mpsc::channel(1);
+    let temp = tempfile::tempdir().unwrap();
+    let workspace = temp.path().join("workspace");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let tool = SpawnTool::new(
+        Arc::new(MockProvider),
+        Arc::new(create_test_store().await),
+        workspace.clone(),
+        in_tx,
+    )
+    .with_workspace_write_access(false);
+
+    let result = tool
+        .execute(&serde_json::json!({
+            "task": "review the workspace",
+            "mode": "sync",
+            "deliverable": "*.md"
+        }))
+        .await
+        .unwrap();
+
+    assert!(!result.success);
+    assert!(
+        result.output.contains("external deliverable root"),
+        "{}",
+        result.output
+    );
+    assert!(
+        !workspace.join(".octos").exists(),
+        "read-only deliverable refusal must leave no workspace state"
+    );
+}
+
+#[tokio::test]
+async fn read_only_spawn_refuses_worktree_isolation_without_creating_workspace_state() {
+    let (in_tx, _in_rx) = tokio::sync::mpsc::channel(1);
+    let temp = tempfile::tempdir().unwrap();
+    let workspace = temp.path().join("workspace");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let tool = SpawnTool::new(
+        Arc::new(MockProvider),
+        Arc::new(create_test_store().await),
+        workspace.clone(),
+        in_tx,
+    )
+    .with_workspace_write_access(false);
+
+    let result = tool
+        .execute(&serde_json::json!({
+            "task": "review the workspace",
+            "mode": "sync",
+            "isolation": "worktree"
+        }))
+        .await
+        .unwrap();
+
+    assert!(!result.success);
+    assert!(result.output.contains("read-only"), "{}", result.output);
+    assert!(
+        !workspace.join(".octos").exists(),
+        "read-only worktree refusal must leave no workspace state"
+    );
 }
 
 #[tokio::test]
@@ -2427,6 +2716,32 @@ async fn spawn_spec_exposes_max_iterations() {
         "spawn schema must expose max_iterations so the model can raise the budget"
     );
     assert_eq!(props["max_iterations"]["type"], "integer");
+}
+
+#[tokio::test]
+async fn spawn_schema_warns_narrowed_allowed_tools_needs_write_file_or_deliverable() {
+    // Guards the guidance that stops the "worker shell-wrote to /tmp, deliverable
+    // lost" failure: if the orchestrator narrows allowed_tools, it must include
+    // write_file OR set a deliverable glob. Keyed loosely so rewording is fine.
+    let (in_tx, _in_rx) = tokio::sync::mpsc::channel(16);
+    let tool = SpawnTool::new(
+        Arc::new(MockProvider),
+        Arc::new(create_test_store().await),
+        PathBuf::from("/tmp"),
+        in_tx,
+    );
+    let desc = tool.input_schema()["properties"]["allowed_tools"]["description"]
+        .as_str()
+        .expect("allowed_tools description present")
+        .to_string();
+    assert!(
+        desc.contains("write_file"),
+        "allowed_tools guidance must mention write_file: {desc}"
+    );
+    assert!(
+        desc.contains("deliverable"),
+        "allowed_tools guidance must point at the deliverable glob: {desc}"
+    );
 }
 
 #[test]

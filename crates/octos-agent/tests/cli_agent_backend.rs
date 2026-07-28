@@ -2,6 +2,8 @@
 //! lane that invokes one-shot headless agents (`claude -p`,
 //! `codex exec`) and maps process results onto [`DispatchOutcome`].
 
+#![cfg(unix)]
+
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};

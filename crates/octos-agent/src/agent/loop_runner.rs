@@ -383,6 +383,11 @@ impl Agent {
             return None;
         }
         let recovery = recover_shell_retry(window, SHELL_RETRY_RECOVERY_THRESHOLD)?;
+        // #1656: a firing spiral IS a loop detection — mark the two-stage
+        // dedup flag so a generic loop detection later in the SAME turn is
+        // treated as the second fire (terminal) instead of restarting the
+        // warn-then-terminate ladder with no memory of this one.
+        self.mark_loop_detected_recently();
         let decision = retry_state.observe_shell_spiral();
         tracing::warn!(
             recovery_kind = ?recovery.kind,
@@ -709,6 +714,63 @@ impl Agent {
         Ok(warning)
     }
 
+    /// Drain the per-turn steer buffer (mid-turn injected user inputs) into
+    /// the live conversation.
+    ///
+    /// Codex parity: `run_turn` drains `TurnState.pending_input` at the TOP
+    /// of each loop iteration, before building the next model request
+    /// (codex-rs `core/src/session/turn.rs:225-233`), and records each item
+    /// as a plain `role: user` message with NO wrapper text
+    /// (`record_user_prompt_and_emit_turn_item`). FIFO order is the
+    /// buffer's append order (`split_off(0)` semantics).
+    ///
+    /// Persistence ownership: when a drained-callback is registered the
+    /// HOST persists each steer row (and emits its standard persisted
+    /// user-message event) at drain time, so the rows stay OUT of
+    /// `turn_output_log` — otherwise the end-of-turn persist pass would
+    /// write them a second time. Without a callback (chat/gateway paths)
+    /// the rows ride the normal end-of-turn persistence via the log.
+    ///
+    /// No-op without a configured buffer — pre-steer loops are
+    /// byte-identical.
+    async fn drain_pending_steer_input(
+        &self,
+        messages: &mut Vec<Message>,
+        turn_output_log: &mut Vec<Message>,
+    ) {
+        let Some(buffer) = self.steer_buffer.as_ref() else {
+            return;
+        };
+        let drained = buffer.drain();
+        if drained.is_empty() {
+            return;
+        }
+        tracing::info!(
+            count = drained.len(),
+            "draining mid-turn steer input into the conversation before the next LLM call"
+        );
+        for text in &drained {
+            let message = Message::user(text.clone());
+            messages.push(message.clone());
+            if self.steer_drained_callback.is_none() {
+                turn_output_log.push(message);
+            }
+        }
+        if let Some(callback) = self.steer_drained_callback.as_ref() {
+            callback(drained).await;
+        }
+    }
+
+    /// Whether a mid-turn steer input is pending (codex `has_pending_input`,
+    /// `turn.rs:304-318`). Read in the EndTurn arm so
+    /// `needs_follow_up = model_wants_more || buffer_nonempty` — a steer
+    /// landing after the model's final answer forces one more round.
+    fn steer_input_pending(&self) -> bool {
+        self.steer_buffer
+            .as_ref()
+            .is_some_and(|buffer| !buffer.is_empty())
+    }
+
     /// Process a single message in conversation mode (chat/gateway).
     /// Takes the user's message, conversation history, and optional media paths.
     pub async fn process_message(
@@ -1032,6 +1094,15 @@ impl Agent {
                 // loop — an unlabeled `continue` there fell through to
                 // `handle_tool_use` and executed the spiraling tools anyway.
                 'agent_loop: loop {
+                    // Codex-parity steer drain (turn.rs:225-233): fold any
+                    // mid-turn injected user inputs into the conversation at
+                    // the TOP of each iteration, BEFORE the next LLM call,
+                    // in FIFO order. Steering never interrupts an in-flight
+                    // round — inputs buffered while the model streams are
+                    // picked up here, after the previous round's tool
+                    // results are recorded.
+                    self.drain_pending_steer_input(&mut messages, &mut turn_output_log)
+                        .await;
                     if let Some(stop) = turn.check_budget(self, activity.as_ref()) {
                         let stop_iteration = turn.iteration();
                         if !self.try_budget_grace_call(
@@ -1301,6 +1372,30 @@ impl Agent {
                             {
                                 continue;
                             }
+                            // Codex-parity follow-up gate (turn.rs:304-318):
+                            // `needs_follow_up = model_needs_follow_up ||
+                            // has_pending_input`. The model produced its
+                            // final answer, but a steer landed during this
+                            // round — record that answer as a normal
+                            // assistant row (so the model sees its own
+                            // reply next round and the row persists), then
+                            // loop again; the top-of-loop drain folds the
+                            // steer in as a plain user message and the
+                            // steer gets a response inside the SAME turn.
+                            if self.steer_input_pending() {
+                                if !content.trim().is_empty() {
+                                    let mut assistant_row = Message::assistant(content.clone());
+                                    assistant_row.reasoning_content =
+                                        response.reasoning_content.clone();
+                                    messages.push(assistant_row.clone());
+                                    turn_output_log.push(assistant_row);
+                                }
+                                tracing::info!(
+                                    "steer input pending at EndTurn — running another round \
+                                     instead of terminating the turn"
+                                );
+                                continue 'agent_loop;
+                            }
                             self.emit_cost_update(&turn, &response, attributed_cost);
                             return Ok(ConversationResponse {
                                 content,
@@ -1322,9 +1417,43 @@ impl Agent {
                         StopReason::ToolUse => {
                             // Check for loop detection before executing
                             for tc in &response.tool_calls {
-                                if let Some(warning) = loop_detector.record(&tc.name, &tc.arguments)
+                                // #1765 doom-loop guard: 3+ CONSECUTIVE
+                                // identical tool calls (same name + identical
+                                // arguments JSON) abort the turn before the
+                                // next LLM call. Checked ahead of the cycle
+                                // detector so the tighter threshold owns pure
+                                // identical streaks; the cycle detector keeps
+                                // owning alternating (cycle 2/3) patterns,
+                                // which never build a doom streak. When the
+                                // guard fires, the shell-spiral recovery is
+                                // still consulted first — extracting real
+                                // shell output from a retry spiral is a
+                                // strictly better outcome than a doom abort.
+                                //
+                                // Verifier-configured agents are exempt: the
+                                // verifier lane classifies each repeated
+                                // failure into the turn ledger and injects a
+                                // `verdict: Repeating` note the planner acts
+                                // on at exactly this streak length — a
+                                // strictly richer recovery than an abort
+                                // (see `verifier_repeating_note_changes_
+                                // next_planner_action`). The cycle detector
+                                // below still terminates true thrash there.
+                                let doom_streak = if self.verifier_config.is_some() {
+                                    None
+                                } else {
+                                    loop_detector.record_doom(&tc.name, &tc.arguments)
+                                };
+                                let cycle_warning = if doom_streak.is_some() {
+                                    None
+                                } else {
+                                    loop_detector.record(&tc.name, &tc.arguments)
+                                };
+                                if doom_streak.is_none() && cycle_warning.is_none() {
+                                    continue;
+                                }
+                                warn!("loop detected — breaking agent loop");
                                 {
-                                    warn!("loop detected — breaking agent loop");
                                     let spiral_iteration = turn.iteration();
                                     if let Some(outcome) = self
                                         .dispatch_shell_retry_recovery(
@@ -1414,6 +1543,45 @@ impl Agent {
                                 pending_approval: None,
                                         });
                                     }
+                                    self.emit_cost_update(&turn, &response, attributed_cost);
+                                    // #1765 v1 escalation: the doom guard
+                                    // aborts the turn with a clear model-and-
+                                    // user-facing message — no further LLM
+                                    // call, no execution of the tripping
+                                    // call. (Interactive continue/edit
+                                    // options are follow-up work; v1
+                                    // deliberately avoids a new AppUI
+                                    // approval kind.)
+                                    if let Some(streak) = doom_streak {
+                                        self.mark_loop_detected_recently();
+                                        warn!(
+                                            tool = %tc.name,
+                                            streak,
+                                            "doom loop detected — aborting turn before the next LLM call (#1765)"
+                                        );
+                                        return Ok(ConversationResponse {
+                                            content: doom_loop_terminal_message(
+                                                &tc.name, streak,
+                                            ),
+                                            reasoning_content: None,
+                                            provider_metadata: None,
+                                            token_usage: turn.total_usage().clone(),
+                                            estimated_spend_usd: turn.priced_spend(),
+                                            files_modified,
+                                            files_to_send,
+                                            streamed,
+                                            messages: turn_output_log.clone(),
+                                            tool_results: tool_structured_metadata.clone(),
+                                            synthesized_from_spawn_only: false,
+                                            pending_approval: None,
+                                        });
+                                    }
+                                    let Some(warning) = cycle_warning else {
+                                        // Unreachable: doom returned above and
+                                        // the earlier gate skipped no-signal
+                                        // calls. Kept defensive.
+                                        continue;
+                                    };
                                     // Two-stage loop-detector recovery:
                                     //
                                     // 1. First fire in this turn — inject the
@@ -1443,7 +1611,6 @@ impl Agent {
                                     // returns on second fire is caught and
                                     // converted to a terminal Ok response
                                     // here so callers don't see an error.
-                                    self.emit_cost_update(&turn, &response, attributed_cost);
                                     match self.dedup_loop_warning(warning) {
                                         Ok(warning_content) => {
                                             inject_loop_detected_synthetic_results_with_log(
@@ -3263,6 +3430,22 @@ fn inject_loop_detected_synthetic_results_with_log(
     if let Some(log) = turn_output_log {
         log.extend(rows_for_log);
     }
+}
+
+/// #1765: terminal message returned when the doom-loop guard fires —
+/// the model issued the same tool call (same name + identical arguments
+/// JSON) [`crate::loop_detect::DOOM_LOOP_THRESHOLD`]+ times in a row.
+/// The text is both model-facing (it lands in session history, so the
+/// model can change course next turn) and user-facing (it is the
+/// assistant reply for the aborted turn).
+fn doom_loop_terminal_message(tool_name: &str, streak: usize) -> String {
+    format!(
+        "[DOOM LOOP DETECTED] The `{tool_name}` tool was called {streak} times in a row \
+         with identical arguments, so this turn was stopped before issuing another model \
+         call. Repeating the exact same call cannot produce a different result. Try a \
+         different approach — vary the arguments, use a different tool, or rephrase the \
+         request."
+    )
 }
 
 /// Terminal message returned when the LLM ignores the loop-detector

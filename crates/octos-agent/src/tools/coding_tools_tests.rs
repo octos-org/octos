@@ -115,51 +115,8 @@ fn builtins_expose_codex_p0_tool_names() {
     }
 }
 
-/// #972 / M14-B acceptance: `apply_patch` MUST produce a diff
-/// preview compatible with the AppUI diff flow. The contract is a
-/// `structured_metadata` envelope with `codex_tool = "apply_patch"`,
-/// a `diff_preview` array of `{ op, path }` entries (one per parsed
-/// patch section), and a flat `modified_paths` list the diff panel
-/// can render without re-parsing the patch envelope.
-#[tokio::test]
-async fn apply_patch_emits_diff_preview_structured_metadata() {
-    use std::path::PathBuf;
-    let temp = tempfile::tempdir().expect("tempdir");
-    let workspace: PathBuf = temp.path().to_path_buf();
-    let tool = ApplyPatchTool::new(workspace.clone());
-    // Add a fresh file via the Codex patch envelope.
-    let patch = concat!(
-        "*** Begin Patch\n",
-        "*** Add File: hello.txt\n",
-        "+hello\n",
-        "+world\n",
-        "*** End Patch\n",
-    );
-    let result = tool
-        .execute(&json!({ "patch": patch }))
-        .await
-        .expect("apply_patch ok");
-    assert!(result.success, "apply_patch must succeed on Add File");
-    let meta = result
-        .structured_metadata
-        .as_ref()
-        .expect("apply_patch must emit structured_metadata");
-    assert_eq!(meta["codex_tool"], json!("apply_patch"));
-    assert_eq!(meta["modified_paths"], json!(["hello.txt"]));
-    let preview = meta["diff_preview"]
-        .as_array()
-        .expect("diff_preview must be an array");
-    assert_eq!(preview.len(), 1);
-    assert_eq!(preview[0]["op"], json!("add"));
-    assert_eq!(preview[0]["path"], json!("hello.txt"));
-    // Sanity: the file we asked for actually exists with the
-    // intended content (this also guards against the metadata
-    // claim drifting from the underlying write).
-    let contents = std::fs::read_to_string(workspace.join("hello.txt"))
-        .expect("created file must be readable");
-    assert!(contents.contains("hello"));
-    assert!(contents.contains("world"));
-}
+// NOTE (#1773): `apply_patch_emits_diff_preview_structured_metadata` moved to
+// `crate::tools::apply_patch::tests` alongside the relocated tool.
 
 /// #972 / M14-B acceptance: `update_plan` MUST generate a structured
 /// UI event so the AppUI layer can render the plan card without
@@ -1429,38 +1386,8 @@ async fn codex_agent_aliases_operate_on_supervisor_state() {
     assert_eq!(closed_task.status, crate::TaskStatus::Cancelled);
 }
 
-#[tokio::test]
-async fn apply_patch_adds_and_updates_file() {
-    let temp = tempfile::tempdir().expect("tempdir");
-    let tool = ApplyPatchTool::new(temp.path());
-    let add = tool
-        .execute(&json!({
-            "patch": "*** Begin Patch\n*** Add File: demo.txt\n+hello\n+world\n*** End Patch\n"
-        }))
-        .await
-        .expect("apply add");
-    assert!(add.success, "{}", add.output);
-    assert_eq!(
-        tokio::fs::read_to_string(temp.path().join("demo.txt"))
-            .await
-            .expect("read added"),
-        "hello\nworld"
-    );
-
-    let update = tool
-            .execute(&json!({
-                "patch": "*** Begin Patch\n*** Update File: demo.txt\n@@\n hello\n-world\n+codex\n*** End Patch\n"
-            }))
-            .await
-            .expect("apply update");
-    assert!(update.success, "{}", update.output);
-    assert_eq!(
-        tokio::fs::read_to_string(temp.path().join("demo.txt"))
-            .await
-            .expect("read updated"),
-        "hello\ncodex"
-    );
-}
+// NOTE (#1773): `apply_patch_adds_and_updates_file` moved to
+// `crate::tools::apply_patch::tests` alongside the relocated tool.
 
 #[tokio::test]
 async fn exec_command_runs_to_completion() {
@@ -2557,4 +2484,144 @@ async fn image_generation_rejects_whitespace_only_prompt() {
     let meta = result.structured_metadata.expect("structured metadata");
     assert_eq!(meta["error_kind"], json!("coding_tool_denied"));
     assert_eq!(meta["reason"], json!("missing_prompt"));
+}
+
+// ---------------------------------------------------------------------------
+// Cancellation must not orphan a child's process group.
+//
+// The kill ladder only runs on the TIMEOUT arm. A user interrupt drops the
+// whole future instead (`agent_task.abort()`), and `tokio::process::Child` does
+// not kill on drop — so before `ChildGroupGuard` an Esc'd `bash("npm run dev")`
+// kept running, holding ports and able to write to the workspace.
+// ---------------------------------------------------------------------------
+
+#[cfg(unix)]
+mod cancellation_kills_child_group {
+    use super::*;
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+
+    /// Spawn a long-lived child in its OWN process group, exactly as the tools
+    /// do, and hand back its pid.
+    fn spawn_group_leader() -> (tokio::process::Child, u32) {
+        let mut cmd = tokio::process::Command::new("sh");
+        cmd.arg("-c")
+            .arg("sleep 300")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0);
+        let child = cmd.spawn().expect("spawn sleeper");
+        let pid = child.id().expect("child pid");
+        (child, pid)
+    }
+
+    /// `kill -0` the group until it disappears, or give up.
+    ///
+    /// Deliberately `async` with `tokio::time::sleep`: the guard hands its kill
+    /// ladder to a spawned task, and a blocking `std::thread::sleep` here would
+    /// starve the current-thread test runtime so that task never runs — the
+    /// test would fail against a working fix.
+    async fn wait_until_group_gone(pid: u32, within: Duration) -> bool {
+        let deadline = Instant::now() + within;
+        while Instant::now() < deadline {
+            if !process_group_exists(pid) {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        !process_group_exists(pid)
+    }
+
+    #[tokio::test]
+    async fn dropping_an_armed_guard_kills_the_process_group() {
+        let (child, pid) = spawn_group_leader();
+        assert!(process_group_exists(pid), "sleeper should be running");
+
+        {
+            let _guard = ChildGroupGuard::new(Some(pid));
+            drop(child); // tokio does NOT kill on drop — the guard must.
+        }
+
+        assert!(
+            wait_until_group_gone(pid, Duration::from_secs(5)).await,
+            "process group {pid} survived a dropped guard — an interrupted \
+             command would keep running and mutating the workspace"
+        );
+    }
+
+    #[tokio::test]
+    async fn disarmed_guard_leaves_the_process_alone() {
+        // The normal paths reap or kill the child themselves; the guard must
+        // not double-kill, and must not kill a pid that has been recycled.
+        let (mut child, pid) = spawn_group_leader();
+        {
+            let mut guard = ChildGroupGuard::new(Some(pid));
+            guard.disarm();
+        }
+        // Still alive after the disarmed guard dropped.
+        assert!(
+            process_group_exists(pid),
+            "a disarmed guard must not kill the child"
+        );
+        let _ = child.kill().await;
+        let _ = child.wait().await;
+        let _ = signal_process_group(pid, "-9");
+    }
+
+    /// End-to-end: abort the tool future the way the serve path does on Esc,
+    /// and assert the command it launched is actually gone.
+    ///
+    /// The command reports its OWN pid through a file rather than being found
+    /// by name: `sh -c "sleep 300 # marker"` **execs** `sleep`, so a marker in
+    /// the command string never reaches any argv and `pgrep -f` cannot see it.
+    /// Because two commands are chained here the shell does not exec, so `$$`
+    /// is the surviving shell — which is also the process-group leader, exactly
+    /// what the guard must kill.
+    #[tokio::test]
+    async fn aborting_the_bash_tool_kills_the_command_it_launched() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pidfile = dir.path().join("probe.pid");
+        // AllowAll: `ApprovalPolicy::Never` FAILS any command the policy would
+        // ask about, which would stop the probe before it ever ran.
+        let tool = BashTool::new(dir.path(), Arc::new(crate::sandbox::NoSandbox))
+            .with_policy(Arc::new(crate::policy::AllowAllPolicy));
+        let args = json!({
+            "cmd": format!("echo $$ > {}; sleep 300", pidfile.display()),
+        });
+
+        let handle = tokio::spawn(async move { tool.execute(&args).await });
+
+        // Wait for the probe to actually be running before aborting.
+        let mut probe_pid = None;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            if let Ok(text) = std::fs::read_to_string(&pidfile) {
+                if let Ok(pid) = text.trim().parse::<u32>() {
+                    if process_exists(pid) {
+                        probe_pid = Some(pid);
+                        break;
+                    }
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let probe_pid = probe_pid.expect("probe never started; test cannot conclude");
+
+        // This is what Esc does on the serve path.
+        handle.abort();
+        let _ = handle.await;
+
+        let gone = wait_until_group_gone(probe_pid, Duration::from_secs(10)).await;
+        // Clean up before asserting so a failure cannot leak a sleeper.
+        if !gone {
+            let _ = signal_process_group(probe_pid, "-9");
+            let _ = signal_process(probe_pid, "-9");
+        }
+        assert!(
+            gone,
+            "aborting the turn left process group {probe_pid} alive — an \
+             interrupted `npm run dev` would keep holding ports and writing \
+             to the workspace"
+        );
+    }
 }

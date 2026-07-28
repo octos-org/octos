@@ -3,7 +3,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use async_trait::async_trait;
 use eyre::{Result, WrapErr};
@@ -794,10 +794,48 @@ fn role_task_capability_warning(effective_tools: &[String], task: &str) -> Optio
 /// The `router_session_id` must mirror `read_task_output`'s lookup:
 /// `agent:{task.tool_call_id}` where the spawn registers with
 /// `tool_call_id = "spawn-{worker_id}"`.
+///
+/// When an `on_stream_chunk` callback is set, live `StreamChunk` events are
+/// forwarded there so the caller (the WS/serve layer) can emit
+/// `agent/output/delta` directly — bypassing the heavy `on_change` path
+/// (which persists a snapshot on every fire). This gives the TUI agent dock
+/// live streaming output for running background children without per-token
+/// persistence overhead (codex plan review: "the proposed per-token
+/// persistence/on_change fan-out is too heavy"). The WS layer emits via
+/// `send_notification_ephemeral(UiNotification::AgentOutputDelta(...))`.
+/// Live child-stream callback: `(agent_id, start_offset, text_delta)` —
+/// `start_offset` is the cumulative streamed-bytes offset BEFORE the delta
+/// (the window's first byte), `u64` end to end to match
+/// `OutputCursor::offset` on the wire.
+type ChildStreamCallback = Arc<dyn Fn(&str, u64, &str) + Send + Sync>;
+
 struct SpawnChildTranscriptReporter {
     router: Arc<SubAgentOutputRouter>,
     router_session_id: String,
     task_id: String,
+    /// Cumulative byte count of streamed text so far. Incremented per
+    /// `StreamChunk`; the callback receives the value from BEFORE the
+    /// increment, i.e. the START offset of the delta's window — the same
+    /// convention every other `cursor` producer uses
+    /// (`TaskOutputDeltaTracker`, the agent_orchestrator read RPCs all
+    /// report `cursor` = window start). Monotonic, so clients can detect
+    /// gaps / reorder if chunks ever arrive out of order (e.g. across
+    /// reconnects). Atomic because `report(&self)` is `&self` and the
+    /// reporter is shared across the child's tokio task(s). `u64` end to
+    /// end so no lossy narrowing hides between here and
+    /// `OutputCursor::offset` (`u64`) on the wire.
+    stream_offset: AtomicU64,
+    /// Optional callback for live `StreamChunk` forwarding. Called directly
+    /// from the reporter thread with `(agent_id, cursor_offset, text_delta)`
+    /// — the caller owns the emit path (e.g. emitting
+    /// `agent/output/delta` via `send_notification_ephemeral` with a
+    /// properly-formed `AgentOutputDeltaEvent` keyed on the child's
+    /// `agent_id`). The `agent_id` is the spawn's `task_id` (the same id
+    /// surfaced via `TurnSpawnCompleteEvent` / the agent dock).
+    /// `cursor_offset` is the cumulative byte offset BEFORE this chunk
+    /// (i.e. the start-offset of this delta's window) — matches the
+    /// start-offset convention of every sibling `OutputCursor` producer.
+    on_stream_chunk: Option<ChildStreamCallback>,
 }
 
 impl crate::progress::ProgressReporter for SpawnChildTranscriptReporter {
@@ -823,7 +861,51 @@ impl crate::progress::ProgressReporter for SpawnChildTranscriptReporter {
                 format!("[tool {status}] {name} — {first}\n")
             }
             ProgressEvent::FileModified { path } => format!("[file modified] {path}\n"),
-            // StreamChunk would duplicate the Response event's final content;
+            // StreamChunk: live text goes ONLY to the direct
+            // on_stream_chunk callback (if set) so the WS layer can emit
+            // agent/output/delta WITHOUT going through on_change (which
+            // persists a snapshot on every fire — too heavy per-token per
+            // codex review). Deliberately NO router append here: the
+            // Response arm below already appends each iteration's full
+            // text, so writing the same bytes per-chunk would land every
+            // child message TWICE in `<task_id>.out` (this exact
+            // duplication is what the original drop-comment on this arm
+            // warned about). The router file stays the Response-based
+            // durable record; `task/output/delta` is produced from
+            // supervisor progress events, not router appends, so no live
+            // consumer loses anything.
+            //
+            // Delivery note (codex review): a fast LLM child can fire
+            // this 100+ times/sec. There is no per-token coalescing here,
+            // and the ephemeral WS send is LOSSY: `try_enqueue` onto the
+            // bounded channel drops the frame on full (BackpressureDrop)
+            // rather than blocking the producer. Dropped deltas are
+            // acceptable for a live tail (the durable record is the
+            // Response append); if loss under N parallel children proves
+            // user-visible, add a ~16ms coalescing debounce at the
+            // callback site.
+            ProgressEvent::StreamChunk { text, .. } => {
+                if !text.is_empty() {
+                    // `fetch_add` returns the PREVIOUS value: the
+                    // cumulative streamed-bytes offset BEFORE this chunk,
+                    // i.e. the START offset of the delta's window —
+                    // matching every sibling `cursor` producer
+                    // (TaskOutputDeltaTracker, the agent_orchestrator
+                    // read RPCs). Monotonic, so clients can detect gaps /
+                    // reorder on reconnect.
+                    let start_offset = self
+                        .stream_offset
+                        .fetch_add(text.len() as u64, Ordering::Relaxed);
+                    if let Some(ref cb) = self.on_stream_chunk {
+                        // Pass `(task_id, cursor_offset, text)` so the WS
+                        // layer can construct a properly-keyed
+                        // `AgentOutputDeltaEvent` (the dock correlates live
+                        // output with the spawned agent by `task_id`).
+                        cb(self.task_id.as_str(), start_offset, text.as_str());
+                    }
+                }
+                return;
+            }
             // Thinking/LlmStatus/etc. are cadence noise for a transcript.
             _ => return,
         };
@@ -1017,6 +1099,11 @@ pub struct SpawnTool {
     /// the child Agent's spawn_only background tools route output
     /// through the same on-disk log the dashboard tails.
     parent_subagent_output_router: Option<Arc<SubAgentOutputRouter>>,
+    /// Optional callback for live stream-chunk forwarding. When set, the
+    /// spawn child's `ProgressEvent::StreamChunk` text is forwarded here so
+    /// the WS/serve layer can emit `agent/output/delta` directly (bypassing
+    /// the heavy `on_change` + per-token persistence path — per codex review).
+    child_stream_callback: Option<ChildStreamCallback>,
     /// M8 Runtime Parity W2.B1: parent session's M8.7 summary generator
     /// so the child can spawn periodic-summary watchers under the same
     /// LLM/budget contract.
@@ -1051,6 +1138,14 @@ pub struct SpawnTool {
     /// argv directly there — behaviour is unchanged on hosts without a real
     /// backend.
     sandbox: SandboxConfig,
+    /// Optional host-owned root for spawned-worker deliverables. When absent,
+    /// retain the legacy `<working_dir>/.octos/spawn-deliverables` location.
+    deliverable_root: Option<PathBuf>,
+    /// Whether Octos itself may create workspace-local state such as a git
+    /// worktree. Agent file access is enforced elsewhere; this covers the
+    /// host-side control plane so a read-only session cannot create
+    /// `.octos/work` before a tool sandbox applies.
+    workspace_write_access: bool,
 }
 
 impl SpawnTool {
@@ -1088,10 +1183,13 @@ impl SpawnTool {
             cost_accountant: None,
             parent_file_state_cache: None,
             parent_subagent_output_router: None,
+            child_stream_callback: None,
             parent_subagent_summary_generator: None,
             child_prompt_context_manager_factory: None,
             dispatch_policy: None,
             sandbox: SandboxConfig::default(),
+            deliverable_root: None,
+            workspace_write_access: true,
         }
     }
 
@@ -1132,10 +1230,13 @@ impl SpawnTool {
             cost_accountant: None,
             parent_file_state_cache: None,
             parent_subagent_output_router: None,
+            child_stream_callback: None,
             parent_subagent_summary_generator: None,
             child_prompt_context_manager_factory: None,
             dispatch_policy: None,
             sandbox: SandboxConfig::default(),
+            deliverable_root: None,
+            workspace_write_access: true,
         }
     }
 
@@ -1156,7 +1257,7 @@ impl SpawnTool {
     /// works identically at each level; `worker_count` restarts at 0 because
     /// each instance numbers only its own direct children, and `origin` is
     /// snapshotted from the parent's current value.
-    fn child_spawn_clone(&self, working_dir: PathBuf) -> SpawnTool {
+    fn child_spawn_clone(&self, working_dir: PathBuf, child_id: &AgentId) -> SpawnTool {
         SpawnTool {
             llm: self.llm.clone(),
             memory: self.memory.clone(),
@@ -1190,6 +1291,7 @@ impl SpawnTool {
             cost_accountant: self.cost_accountant.clone(),
             parent_file_state_cache: self.parent_file_state_cache.clone(),
             parent_subagent_output_router: self.parent_subagent_output_router.clone(),
+            child_stream_callback: self.child_stream_callback.clone(),
             parent_subagent_summary_generator: self.parent_subagent_summary_generator.clone(),
             // Depth-1-only wiring, deliberately DROPPED for grandchildren: the
             // AppUI context-fork factory captures the ORIGINAL parent session's
@@ -1208,6 +1310,13 @@ impl SpawnTool {
             // `ctx.task_supervisor` a nested `spawn_agent` reads. See the two
             // registration sites in `execute_with_context`.
             sandbox: self.sandbox.clone(),
+            // A child starts its direct worker numbering at `subagent-0`, so
+            // give nested spawns a distinct descendant root.
+            deliverable_root: self
+                .deliverable_root
+                .as_ref()
+                .map(|root| root.join(child_id.to_string()).join("children")),
+            workspace_write_access: self.workspace_write_access,
         }
     }
 
@@ -1253,6 +1362,41 @@ impl SpawnTool {
     pub fn with_sandbox(mut self, sandbox: SandboxConfig) -> Self {
         self.sandbox = sandbox;
         self
+    }
+
+    /// Direct host-created deliverables outside the agent workspace. This is
+    /// used by read-only chat sessions so Octos bookkeeping cannot create a
+    /// `.octos` directory in the reviewed repository.
+    pub fn with_deliverable_root(mut self, root: PathBuf) -> Self {
+        self.deliverable_root = Some(root);
+        self
+    }
+
+    /// Control host-side workspace state such as git worktree allocation.
+    /// This must track the parent session's file-write capability; it is
+    /// separate from the child tool sandbox because allocation happens before
+    /// the child registry exists. When disabled, a spawn that requests a
+    /// deliverable must also use [`Self::with_deliverable_root`].
+    pub fn with_workspace_write_access(mut self, allowed: bool) -> Self {
+        self.workspace_write_access = allowed;
+        self
+    }
+
+    fn deliverable_output_dir(
+        &self,
+        worker_id: &AgentId,
+    ) -> std::result::Result<PathBuf, &'static str> {
+        if let Some(root) = &self.deliverable_root {
+            return Ok(root.join(worker_id.to_string()));
+        }
+        if !self.workspace_write_access {
+            return Err("read-only spawn requires an external deliverable root");
+        }
+        Ok(self
+            .working_dir
+            .join(".octos")
+            .join("spawn-deliverables")
+            .join(worker_id.to_string()))
     }
 
     /// Set a provider router for multi-model sub-agent support.
@@ -1400,6 +1544,29 @@ impl SpawnTool {
     /// through the same on-disk log the parent dashboard tails.
     pub fn with_parent_subagent_output_router(mut self, router: Arc<SubAgentOutputRouter>) -> Self {
         self.parent_subagent_output_router = Some(router);
+        self
+    }
+
+    /// Set a callback that receives live `StreamChunk` text deltas from a
+    /// spawned background child. The WS/serve layer uses this to emit
+    /// `agent/output/delta` directly — bypassing the per-token `on_change`
+    /// persistence path (codex plan review: "per-token persistence/on_change
+    /// fan-out is too heavy"). The callback receives
+    /// `(agent_id, cursor_offset, text)`:
+    /// - `agent_id` is the spawn's `task_id` (the same id surfaced via
+    ///   `TurnSpawnCompleteEvent` and the agent dock).
+    /// - `cursor_offset` is the cumulative byte offset BEFORE this chunk —
+    ///   the START of the delta's window, matching every sibling
+    ///   `OutputCursor` producer (`TaskOutputDeltaTracker`, the
+    ///   agent_orchestrator read RPCs). Monotonic; lets clients detect
+    ///   gaps/reorder on reconnect. `u64` end to end so no lossy cast
+    ///   hides between here and `OutputCursor::offset` on the wire.
+    /// - `text` is the delta text.
+    pub fn with_child_stream_callback(
+        mut self,
+        cb: impl Fn(&str, u64, &str) + Send + Sync + 'static,
+    ) -> Self {
+        self.child_stream_callback = Some(Arc::new(cb));
         self
     }
 
@@ -1654,7 +1821,10 @@ struct Input {
     /// worktree gives the child a dedicated git worktree under `.octos/work`.
     #[serde(default)]
     isolation: WorkerIsolation,
-    /// Tool names the subagent is allowed to use. Empty = all builtins.
+    /// Tool names the subagent is allowed to use. Empty = all builtins. A
+    /// narrowed list that omits `write_file` leaves the child unable to write a
+    /// deliverable except via a shell redirect (which is only captured when a
+    /// `deliverable` glob is set) — see the JSON-schema `description`.
     #[serde(default)]
     allowed_tools: Vec<String>,
     /// Extra context injected as a system-level prefix.
@@ -2808,7 +2978,7 @@ impl Tool for SpawnTool {
                 "allowed_tools": {
                     "type": "array",
                     "items": { "type": "string" },
-                    "description": "Tool names the subagent may use. Empty = all builtins."
+                    "description": "Tool names the subagent may use. Empty = all builtins (the recommended default). CAUTION: if you narrow this list AND the subagent must PRODUCE A FILE (a report, review, generated code, any deliverable), you MUST include `write_file` (and usually `edit_file`) here — OR set the top-level `deliverable` glob. A subagent given `shell` but not `write_file` and no `deliverable` can only write via a shell redirect, and any file it writes outside the working tree (e.g. under /tmp) is LOST (never collected as output_files). When in doubt, leave this empty."
                 },
                 "role": {
                     "type": "string",
@@ -3521,6 +3691,13 @@ impl Tool for SpawnTool {
         let (mut worker_worktree_guard, child_session_scope) = match input.isolation {
             WorkerIsolation::Shared => (None, ctx.session_scope.clone()),
             WorkerIsolation::Worktree => {
+                if !self.workspace_write_access {
+                    return Ok(ToolResult {
+                        output: "Status: FAILED\nworktree isolation is unavailable in a read-only workspace; use shared isolation for a review-only worker".to_string(),
+                        success: false,
+                        ..Default::default()
+                    });
+                }
                 match allocate_worker_worktree(
                     &self.working_dir,
                     &worker_id,
@@ -3558,11 +3735,16 @@ impl Tool for SpawnTool {
         }
         let child_working_dir = match deliverable_glob.as_deref() {
             Some(glob) => {
-                let out = self
-                    .working_dir
-                    .join(".octos")
-                    .join("spawn-deliverables")
-                    .join(worker_id.to_string());
+                let out = match self.deliverable_output_dir(&worker_id) {
+                    Ok(out) => out,
+                    Err(error) => {
+                        return Ok(ToolResult {
+                            output: format!("Status: FAILED\n{error}"),
+                            success: false,
+                            ..Default::default()
+                        });
+                    }
+                };
                 // worker_id ("subagent-N") can repeat across turns, so start
                 // from a clean directory — otherwise a stale deliverable from a
                 // prior run would be surfaced (the output dir has no mtime
@@ -3679,7 +3861,7 @@ impl Tool for SpawnTool {
             // fan-out cap is per-subtree, not global. The grandchild's RESULT
             // still flows back via the inherited result sender / inline
             // output; only its task-tracking row stays subtree-local.
-            let mut child_spawn = self.child_spawn_clone(child_working_dir.clone());
+            let mut child_spawn = self.child_spawn_clone(child_working_dir.clone(), &worker_id);
             child_spawn.task_supervisor = Some(tools.supervisor());
             tools.register(child_spawn);
             // In subagent context, spawn_only tools should be regular tools —
@@ -4016,6 +4198,7 @@ impl Tool for SpawnTool {
             // `read_task_output` derives (`agent:{tool_call_id}` with
             // `tool_call_id = "spawn-{worker_id}"` from the register above).
             let parent_output_router = self.parent_subagent_output_router.clone();
+            let child_stream_callback = self.child_stream_callback.clone();
             let child_router_session_id = format!("agent:spawn-{worker_id}");
             // PR #1250 finding 1: the fanout-cap refusal above was the last
             // refusal point on the background path — the detached worker is
@@ -4052,7 +4235,8 @@ impl Tool for SpawnTool {
             // delegate-less builtin. Kept concrete (not `Arc<dyn Tool>`) so the
             // closure can align its supervisor with the child registry before
             // registering (see the sync-path rationale).
-            let child_spawn_template = self.child_spawn_clone(child_working_dir.clone());
+            let child_spawn_template =
+                self.child_spawn_clone(child_working_dir.clone(), &worker_id);
             let task_supervisor = self.task_supervisor.clone();
             let worker_config = self.worker_config.clone();
             let worker_embedder = self.embedder.clone();
@@ -4331,6 +4515,8 @@ impl Tool for SpawnTool {
                                 router: router.clone(),
                                 router_session_id: child_router_session_id.clone(),
                                 task_id: task_id.clone(),
+                                stream_offset: AtomicU64::new(0),
+                                on_stream_chunk: child_stream_callback.clone(),
                             }))
                         }
                         _ => None,

@@ -34,6 +34,11 @@ pn = "pn"
 unparseable = "unparseable"
 # Base64 placeholder token
 iz = "iz"
+# Deliberate mid-token chunk split of "</think>" in the stream-splitter test
+# (octos-llm types.rs) — the split point IS the test.
+thi = "thi"
+# "borderline" label abbreviation in the deepseek routing probe test
+bord = "bord"
 # One-Time Passwords (OTPs)
 ot = "ot"
 # Rust TUI library name
@@ -50,6 +55,8 @@ strng = "strng"
 # Basic Regular Expression — referenced in slides validator spec comments
 # explaining the regex escape behavior for find -name patterns.
 BRE = "BRE"
+# POSIX open(2) flag (O_WRONLY), not a misspelling of "wrongly"
+WRONLY = "WRONLY"
 
 [files]
 extend-exclude = ["**/*.js", "**/*.css", "**/*.html", "examples/*/static/**/*.*"]

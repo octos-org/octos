@@ -912,6 +912,31 @@ impl SessionScope {
 ///
 /// The input must already be lexically normalised (no `..`) so the
 /// re-attached suffix names a real would-be on-disk location.
+/// KNOWN WINDOWS DEFECT — this function and [`canonical_root_lossy`] disagree
+/// about how far to canonicalise, and on Windows that difference is visible.
+///
+/// For a path whose root does NOT exist on disk:
+/// * this walks up to the first existing ancestor. On Windows that is `C:\`,
+///   which always exists, and `std::fs::canonicalize` returns it in VERBATIM
+///   form (`\\?\C:\`), so the result is `\\?\C:\...`.
+/// * `canonical_root_lossy` gives up and returns its input unchanged, e.g.
+///   `C:/octos/repos/some-repo`.
+///
+/// `starts_with` between a verbatim and a non-verbatim path is always false, so
+/// [`SessionScope::classify_canonical_path`] returns `OutOfScope` for a path
+/// that is plainly inside the workspace. On Unix the same walk ends at `/`,
+/// where canonicalisation is a no-op, so the asymmetry never shows.
+///
+/// This is why `session_scope`'s `multi_tenant_at_workspace_*` tests fail on
+/// Windows (5-for-5 on recent `main` runs), which in turn is why `check-windows`
+/// is non-blocking on PRs in `.github/workflows/ci.yml`.
+///
+/// NOT fixed here deliberately: `classify_canonical_path` is a sandbox-escape
+/// boundary, and the fix (normalising the verbatim prefix on both sides) needs
+/// to be validated ON Windows, not reasoned about from a Unix host. In
+/// production the workspace root normally exists, so both sides canonicalise to
+/// verbatim consistently and the misclassification does not fire — it is
+/// reachable when the root is missing.
 pub fn canonicalize_lossy(path: &Path) -> PathBuf {
     if let Ok(canon) = std::fs::canonicalize(path) {
         return canon;

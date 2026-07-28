@@ -125,10 +125,30 @@ impl ModelHints {
         // families can reject `reasoning_effort`.
         let reasoning_style = if m.contains("deepseek-v4") || m.contains("deepseek-reasoner") {
             ReasoningStyle::EffortAndThinkingToggle
-        } else if m.contains("kimi-k3") || m == "k3" {
-            // K3, incl. the coding plan's bare `k3` id — thinking is always on
-            // and effort maps to `max` (the K2.x `thinking` object is rejected).
-            ReasoningStyle::EffortMaxOnly
+        } else if m.contains("kimi-k3") || m == "k3" || m.starts_with("kimi-for-coding") {
+            // K3, incl. the coding plan's bare `k3` and `kimi-for-coding*` ids
+            // (same K3 model, different ids that don't contain `kimi-k3`): per
+            // its quickstart docs `reasoning_effort` accepts low|high|max
+            // (default max); thinking is always on and the K2.x `thinking`
+            // object is rejected. Graded effort IS honored — do NOT collapse
+            // everything to "max". (These ids already pin temperature above;
+            // they must get the graded style too or `/thinking` is a no-op.)
+            ReasoningStyle::EffortLowHighMax
+        } else if m.contains("glm-4.5")
+            || m.contains("glm-4.6")
+            || m.contains("glm-5")
+            || m.contains("glm-z")
+        {
+            // GLM-4.5+/4.6/5.x + the z-reasoning line (Zhipu / Z.ai, e.g.
+            // `glm-5.2`): thinking is a binary `thinking:{"type":"enabled"}`
+            // toggle, no graded effort. Any set effort level enables thinking.
+            // Narrowed from a bare `contains("glm")`: legacy `glm-4`/`glm-4-plus`/
+            // `glm-3` REJECT the thinking object (400), so they must not match.
+            // NOTE: the SHIPPED `glm-5.2` route runs through AnthropicProvider
+            // (Z.ai's Anthropic-compatible endpoint), which maps `/thinking` via
+            // `build_anthropic_thinking`; this arm only governs a GLM added
+            // through an OpenAI-compatible endpoint.
+            ReasoningStyle::ThinkingToggle
         } else if m.starts_with("grok-4") || is_o_series || m.starts_with("gpt-5") {
             ReasoningStyle::Effort
         } else {
@@ -161,12 +181,22 @@ pub enum ReasoningStyle {
     Effort,
     /// `reasoning_effort` plus `thinking: {"type": "enabled"}` — DeepSeek V4.
     EffortAndThinkingToggle,
-    /// Top-level `reasoning_effort` whose only accepted value is `"max"` —
-    /// Kimi K3, where thinking is always on and per K3's docs the K2.x
-    /// `thinking` object must NOT be sent. Every configured effort level maps
-    /// to `"max"`; when no effort is configured nothing is emitted (the model
-    /// still thinks — that is its server-side default).
+    /// Top-level `reasoning_effort` whose only accepted value is `"max"`. Legacy
+    /// / manual-override only — retained for configs that pin it; Kimi K3 now uses
+    /// [`ReasoningStyle::EffortLowHighMax`] since K3's docs list `low|high|max`.
     EffortMaxOnly,
+    /// Top-level `reasoning_effort: "low"|"high"|"max"` (default `"max"`) — Kimi
+    /// K3. Per K3's quickstart docs it accepts exactly those three values, thinking
+    /// is ALWAYS on, and the K2.x `thinking` object must NOT be sent. octos has no
+    /// K3-native "medium" tier, so `Medium` clamps up to `"high"`; `Max` maps to
+    /// `"max"` (NOT clamped to "high" like the Effort style). No effort configured
+    /// ⇒ nothing emitted (K3 still thinks — its server-side `max` default).
+    EffortLowHighMax,
+    /// Binary `thinking: {"type": "enabled"}` toggle with NO `reasoning_effort` —
+    /// GLM-4.5+/5.x (Zhipu / Z.ai), which control thinking via enable/disable and
+    /// do not accept graded effort. Any configured effort level ENABLES thinking;
+    /// no effort configured ⇒ nothing emitted (the model's server-side default).
+    ThinkingToggle,
 }
 
 /// Serialize tool-call arguments for the request wire as a JSON **object**
@@ -480,28 +510,48 @@ impl OpenAIProvider {
         // request fields the model's ReasoningStyle expects. Emitted only when
         // an effort is configured AND the model declares a non-None style, so
         // it stays a no-op for models/endpoints that don't accept it.
-        let (reasoning_effort, thinking) =
+        let (reasoning_effort, thinking): (Option<&str>, Option<serde_json::Value>) =
             match (config.reasoning_effort, self.hints.reasoning_style) {
                 (Some(effort), style) if style != ReasoningStyle::None => {
                     use crate::config::ReasoningEffort as RE;
-                    let effort_str = match (effort, style) {
-                        // Kimi K3 accepts exactly one value ("max"): thinking
-                        // is always on, so every configured level clamps to it.
-                        (_, ReasoningStyle::EffortMaxOnly) => "max",
-                        (RE::Low, _) => "low",
-                        (RE::Medium, _) => "medium",
-                        (RE::High, _) => "high",
-                        // DeepSeek V4 accepts "max"; Effort-style providers
-                        // (OpenAI/Grok) have no max tier, so clamp to "high".
-                        (RE::Max, ReasoningStyle::EffortAndThinkingToggle) => "max",
-                        (RE::Max, _) => "high",
-                    };
-                    let thinking = if style == ReasoningStyle::EffortAndThinkingToggle {
-                        Some(serde_json::json!({ "type": "enabled" }))
-                    } else {
-                        None
-                    };
-                    (Some(effort_str), thinking)
+                    let enabled = || serde_json::json!({ "type": "enabled" });
+                    match style {
+                        // GLM-4.5+/5.x: binary thinking toggle, NO reasoning_effort.
+                        ReasoningStyle::ThinkingToggle => (None, Some(enabled())),
+                        // Kimi K3: low|high|max (no medium tier → clamp up to high;
+                        // Max stays "max", NOT clamped to "high"). Thinking always on.
+                        ReasoningStyle::EffortLowHighMax => {
+                            let e = match effort {
+                                RE::Low => "low",
+                                RE::Medium | RE::High => "high",
+                                RE::Max => "max",
+                            };
+                            (Some(e), None)
+                        }
+                        // Legacy manual-override: everything → "max".
+                        ReasoningStyle::EffortMaxOnly => (Some("max"), None),
+                        // DeepSeek V4: reasoning_effort + `thinking` toggle.
+                        ReasoningStyle::EffortAndThinkingToggle => {
+                            let e = match effort {
+                                RE::Low => "low",
+                                RE::Medium => "medium",
+                                RE::High => "high",
+                                RE::Max => "max",
+                            };
+                            (Some(e), Some(enabled()))
+                        }
+                        // OpenAI/Grok: low|medium|high, no max tier → clamp to high.
+                        ReasoningStyle::Effort => {
+                            let e = match effort {
+                                RE::Low => "low",
+                                RE::Medium => "medium",
+                                RE::High => "high",
+                                RE::Max => "high",
+                            };
+                            (Some(e), None)
+                        }
+                        ReasoningStyle::None => (None, None),
+                    }
                 }
                 _ => (None, None),
             };
@@ -1383,15 +1433,34 @@ mod tests {
             ModelHints::detect("gpt-5.3-codex").reasoning_style,
             ReasoningStyle::Effort
         );
-        // Kimi K3 (incl. provider-prefixed) -> max-only reasoning_effort.
+        // Kimi K3 (incl. provider-prefixed) -> low|high|max reasoning_effort.
         assert_eq!(
             ModelHints::detect("kimi-k3").reasoning_style,
-            ReasoningStyle::EffortMaxOnly
+            ReasoningStyle::EffortLowHighMax
         );
         assert_eq!(
             ModelHints::detect("moonshotai/kimi-k3").reasoning_style,
-            ReasoningStyle::EffortMaxOnly
+            ReasoningStyle::EffortLowHighMax
         );
+        // GLM-4.5+/5.x (Zhipu / Z.ai) -> binary thinking toggle.
+        assert_eq!(
+            ModelHints::detect("glm-5.2").reasoning_style,
+            ReasoningStyle::ThinkingToggle
+        );
+        assert_eq!(
+            ModelHints::detect("zai-org/glm-4.6").reasoning_style,
+            ReasoningStyle::ThinkingToggle
+        );
+        // Legacy GLM (pre-4.5) REJECTS the `thinking` object — it must NOT get
+        // the toggle style (a bare `contains("glm")` used to misfire here and
+        // send an unsupported field → 400).
+        for legacy in ["glm-4", "glm-4-plus", "zhipu/glm-4-air", "glm-3-turbo"] {
+            assert_eq!(
+                ModelHints::detect(legacy).reasoning_style,
+                ReasoningStyle::None,
+                "{legacy} predates the thinking toggle and must emit no reasoning control"
+            );
+        }
         // Non-thinking / unknown-control models emit nothing. grok-3 is
         // excluded (only grok-4.x is known to accept reasoning_effort).
         for m in [
@@ -1612,7 +1681,7 @@ mod tests {
         let p = OpenAIProvider::new("k", "kimi-k3")
             .with_provider_label("moonshot")
             .with_base_url("https://api.moonshot.ai/v1");
-        assert_eq!(p.hints.reasoning_style, ReasoningStyle::EffortMaxOnly);
+        assert_eq!(p.hints.reasoning_style, ReasoningStyle::EffortLowHighMax);
         // Explicit config override still wins (with_hints runs after
         // with_base_url), e.g. for a proxy that rejects reasoning_effort.
         let overridden = OpenAIProvider::new("k", "kimi-k3")
@@ -1637,21 +1706,79 @@ mod tests {
                 h.fixed_temperature,
                 "{id} must pin temperature (K3 rejects any temperature != 1)"
             );
+            // These ids ARE the K3 model, so they must also get K3's graded
+            // low|high|max reasoning — otherwise `/thinking` is silently a
+            // no-op for the coding-plan aliases even though temperature is pinned.
+            assert_eq!(
+                h.reasoning_style,
+                ReasoningStyle::EffortLowHighMax,
+                "{id} is the K3 model and must get K3's graded low|high|max reasoning"
+            );
         }
-        // Bare `k3` also gets K3's max-only reasoning.
-        assert_eq!(
-            ModelHints::detect("k3").reasoning_style,
-            ReasoningStyle::EffortMaxOnly
-        );
         // Guard: an unrelated model containing "k3" as a substring is NOT the
         // coding plan (exact match only), so it is unaffected.
         assert!(!ModelHints::detect("mock-k3000").fixed_temperature);
     }
 
     #[test]
-    fn build_request_maps_every_effort_to_max_for_kimi_k3() {
-        // K3's only accepted reasoning_effort value is "max" (thinking is
-        // always on), and the K2.x thinking object must NOT be sent.
+    fn reasoning_emission_for_k3_is_graded_and_for_glm_is_a_toggle() {
+        use crate::config::ReasoningEffort as RE;
+        let build = |model: &str, effort: Option<RE>| {
+            let p = OpenAIProvider::new("key", model);
+            let cfg = ChatConfig {
+                reasoning_effort: effort,
+                ..ChatConfig::default()
+            };
+            serde_json::to_value(p.build_request(&[msg("hi")], &[], &cfg, false)).unwrap()
+        };
+
+        // Kimi K3: graded low|high|max (no medium tier → clamps up to high; Max
+        // stays "max"). No `thinking` object (K3 rejects it).
+        for (effort, want) in [
+            (RE::Low, "low"),
+            (RE::Medium, "high"),
+            (RE::High, "high"),
+            (RE::Max, "max"),
+        ] {
+            let v = build("k3", Some(effort));
+            assert_eq!(
+                v["reasoning_effort"].as_str(),
+                Some(want),
+                "k3 {effort:?} must map to {want}, not collapse to max"
+            );
+            assert!(
+                v.get("thinking").is_none_or(|t| t.is_null()),
+                "k3 must NOT send a thinking object"
+            );
+        }
+        // No effort configured → nothing emitted (K3 thinks by its server default).
+        let v = build("k3", None);
+        assert!(v.get("reasoning_effort").is_none_or(|r| r.is_null()));
+
+        // GLM-5.2: any effort level ENABLES thinking via the binary toggle; it
+        // must NOT send reasoning_effort (previously it emitted nothing at all).
+        for effort in [RE::Low, RE::Medium, RE::High, RE::Max] {
+            let v = build("glm-5.2", Some(effort));
+            assert_eq!(
+                v["thinking"],
+                serde_json::json!({ "type": "enabled" }),
+                "glm {effort:?} must enable thinking"
+            );
+            assert!(
+                v.get("reasoning_effort").is_none_or(|r| r.is_null()),
+                "glm must NOT send reasoning_effort"
+            );
+        }
+        // No effort → nothing (server default).
+        let v = build("glm-5.2", None);
+        assert!(v.get("thinking").is_none_or(|t| t.is_null()));
+    }
+
+    #[test]
+    fn kimi_k3_pins_temperature_and_never_sends_the_thinking_object() {
+        // K3 always thinks and rejects the K2.x `thinking` object; it also pins
+        // temperature server-side. (Graded low|high|max emission is covered by
+        // `reasoning_emission_for_k3_is_graded_and_for_glm_is_a_toggle`.)
         let p = OpenAIProvider::new("key", "kimi-k3");
         let msgs = [msg("hi")];
         use crate::config::ReasoningEffort as RE;
@@ -1661,7 +1788,6 @@ mod tests {
                 ..Default::default()
             };
             let v = serde_json::to_value(p.build_request(&msgs, &[], &cfg, false)).unwrap();
-            assert_eq!(v["reasoning_effort"], "max", "{effort:?} must clamp to max");
             assert!(
                 v.get("thinking").is_none(),
                 "kimi-k3 must not emit the K2.x thinking object"
@@ -1671,11 +1797,6 @@ mod tests {
                 "kimi-k3 pins temperature server-side"
             );
         }
-        // No configured effort -> nothing emitted (K3 thinks by default).
-        let v = serde_json::to_value(p.build_request(&msgs, &[], &ChatConfig::default(), false))
-            .unwrap();
-        assert!(v.get("reasoning_effort").is_none());
-        assert!(v.get("thinking").is_none());
     }
 
     #[test]

@@ -135,6 +135,16 @@ pub struct ProfileConfig {
     /// First-class structured LLM selection contract.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub llm: Option<LlmProfileConfig>,
+    /// Named provider lanes for per-node pipeline routing (e.g. the
+    /// `deep_research` pipeline's `cheap`/`strong` nodes) and sub-agent model
+    /// selection. These are ISOLATED from the primary coding provider: the serve
+    /// path builds a `ProviderRouter` from these entries ONLY (never the coding
+    /// primary/fallbacks), so a research-lane failover trips its own circuit
+    /// breakers and can never disturb the coding conversation's provider or its
+    /// KV/prompt cache. Empty by default (pipeline nodes then use the shared
+    /// coding provider, unchanged behavior).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sub_providers: Vec<crate::config::SubProviderConfig>,
     /// Per-tenant reply-voice (TTS timbre) choice. Voice route/ASR settings stay
     /// platform-level on the serve config; only the chosen timbre is per-user.
     /// Applied at profile bootstrap over the shared `VoiceConfig.default_voice`
@@ -194,6 +204,9 @@ pub struct ProfileConfig {
     /// Email sending configuration (SMTP or Feishu/Lark).
     #[serde(default)]
     pub email: Option<EmailSettings>,
+    /// Smart-home bridge integration (self-hosted/LAN-reachable bridge only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub smart_home: Option<SmartHomeConfig>,
     /// API protocol type: "openai" or "anthropic". Overrides provider default.
     #[serde(default)]
     pub api_type: Option<String>,
@@ -213,6 +226,14 @@ pub struct ProfileConfig {
     /// (no shell, file, web, browser tools). Used for the admin bot profile.
     #[serde(default)]
     pub admin_mode: bool,
+    /// #1774: opt-in post-edit formatting (rustfmt/prettier/black/gofmt)
+    /// after successful edit_file/write_file/diff_edit. Default OFF.
+    #[serde(default)]
+    pub format_after_edit: bool,
+    /// #1768: opt-in git-backed workspace snapshots before mutating tools
+    /// (`snapshots.enabled` + `keep_last`). Default OFF.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshots: Option<octos_agent::SnapshotConfig>,
     /// Sandbox configuration for tool isolation.
     #[serde(default)]
     pub sandbox: octos_agent::SandboxConfig,
@@ -666,6 +687,8 @@ pub struct ProfileConfigPatch {
     #[serde(default)]
     pub email: PatchField<EmailSettings>,
     #[serde(default)]
+    pub smart_home: PatchField<SmartHomeConfig>,
+    #[serde(default)]
     pub env_vars: Option<HashMap<String, String>>,
     #[serde(default)]
     pub hooks: Option<Vec<octos_agent::HookConfig>>,
@@ -849,6 +872,45 @@ impl EmailSettings {
     }
 }
 
+/// Smart-home bridge integration for a profile.
+///
+/// Scope: self-hosted / same-LAN bridges only (e.g. a Home Assistant bridge
+/// reachable at `http://192.168.x.x:8787`). Cloud-tenant deployments where the
+/// backend isn't on the user's home network are out of scope for now.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct SmartHomeConfig {
+    /// Base URL of the smart-home bridge (e.g. `http://192.168.1.50:8787`).
+    /// Not a secret — left in the clear by `mask_secrets`.
+    #[serde(default)]
+    pub bridge_url: Option<String>,
+    /// Bridge auth token (literal value, preferred over token_env).
+    #[serde(default)]
+    pub token: Option<String>,
+    /// Env var name holding the bridge auth token (legacy/reference pattern).
+    #[serde(default)]
+    pub token_env: Option<String>,
+}
+
+impl SmartHomeConfig {
+    /// Return env var pairs that the `smart-home` plugin skill and the
+    /// backend's own bridge client expect.
+    /// `env_vars` is the profile's env_vars map used to resolve `token_env`.
+    pub fn to_env_vars(&self, env_vars: &HashMap<String, String>) -> Vec<(String, String)> {
+        let mut out = Vec::new();
+        if let Some(ref url) = self.bridge_url {
+            out.push(("SMART_HOME_BRIDGE_URL".into(), url.clone()));
+        }
+        if let Some(ref token) = self.token {
+            out.push(("SMART_HOME_BRIDGE_TOKEN".into(), token.clone()));
+        } else if let Some(ref token_env) = self.token_env {
+            if let Some(token_val) = env_vars.get(token_env) {
+                out.push(("SMART_HOME_BRIDGE_TOKEN".into(), token_val.clone()));
+            }
+        }
+        out
+    }
+}
+
 impl ProfileConfig {
     pub fn primary_llm(&self) -> Option<&LlmModelSelectionConfig> {
         self.llm.as_ref().and_then(|llm| llm.primary.as_ref())
@@ -910,6 +972,11 @@ impl ProfileConfig {
             PatchField::Absent => {}
             PatchField::Clear => self.email = None,
             PatchField::Value(email) => self.email = Some(email),
+        }
+        match patch.smart_home {
+            PatchField::Absent => {}
+            PatchField::Clear => self.smart_home = None,
+            PatchField::Value(smart_home) => self.smart_home = Some(smart_home),
         }
         if let Some(env_vars) = patch.env_vars {
             self.env_vars = env_vars;
@@ -2132,15 +2199,50 @@ fn merge_sandbox_defaults(
     eff
 }
 
+/// Lexically normalize an absolute `/`-rooted path, collapsing `.`/`..`
+/// segments WITHOUT touching the filesystem (the read roots may not exist yet).
+/// Returns `None` for a non-absolute path or one whose `..` segments climb above
+/// the root — such a path can never be a valid subset of an operator root, so
+/// the clamp drops it. This is what closes the `..` traversal that a bare
+/// `strip_prefix` check would wave through (e.g. `/srv/data/../../etc` → `/etc`).
+fn normalize_abs_lexical(path: &str) -> Option<String> {
+    if !path.starts_with('/') {
+        return None;
+    }
+    let mut out: Vec<&str> = Vec::new();
+    for seg in path.split('/') {
+        match seg {
+            "" | "." => {}
+            ".." => {
+                // Escapes above the root — reject the whole path.
+                out.pop()?;
+            }
+            seg => out.push(seg),
+        }
+    }
+    Some(format!("/{}", out.join("/")))
+}
+
 /// True when `path` is exactly one of `roots` or nested beneath one of them.
 /// Enforces the `read_allow_paths` floor: a profile may only keep read roots
-/// that fall within an operator-approved root.
+/// that fall within an operator-approved root. Both sides are lexically
+/// normalized first so a profile CANNOT use `..` (or a non-absolute path) to
+/// escape an operator root and still pass the subset check.
 fn sandbox_path_within_any(path: &str, roots: &[String]) -> bool {
+    let Some(path) = normalize_abs_lexical(path) else {
+        return false;
+    };
     roots.iter().any(|root| {
-        let root = root.trim_end_matches('/');
-        path == root
+        let Some(root) = normalize_abs_lexical(root) else {
+            return false;
+        };
+        // A `/` root allows all absolute paths; otherwise require an exact
+        // match or a `<root>/…` descendant (not a mere string prefix, so
+        // `/srv/database` is NOT within `/srv/data`).
+        root == "/"
+            || path == root
             || path
-                .strip_prefix(root)
+                .strip_prefix(&root)
                 .is_some_and(|rest| rest.starts_with('/'))
     })
 }
@@ -2227,8 +2329,22 @@ pub fn mask_secrets(profile: &UserProfile) -> UserProfile {
     if let Some(email) = &mut masked.config.email {
         mask_email_secrets(email);
     }
+    if let Some(smart_home) = &mut masked.config.smart_home {
+        mask_smart_home_secrets(smart_home);
+    }
     masked.config.normalize_llm_contract();
     masked
+}
+
+/// Mask the literal secret in `config.smart_home`.
+///
+/// `token` holds a real credential; `bridge_url` is not a secret (just a LAN
+/// address the user needs to see/edit), and `token_env` holds only an env var
+/// NAME, so both stay in the clear.
+fn mask_smart_home_secrets(smart_home: &mut SmartHomeConfig) {
+    if let Some(token) = &mut smart_home.token {
+        *token = mask_value(token);
+    }
 }
 
 /// Mask the literal secrets in `config.email`.
@@ -2536,6 +2652,9 @@ pub(crate) fn config_from_profile(
                 .and_then(|route| route.api_key_env.clone())
         }),
         env_vars: profile.config.env_vars.clone(),
+        // Internal-only flag (octos-ffi opt-out); profiles always use the
+        // default auth-store resolution order.
+        bypass_auth_store: false,
         api_type: primary.and_then(|selection| {
             selection
                 .route
@@ -2558,6 +2677,10 @@ pub(crate) fn config_from_profile(
         model_hints: primary.and_then(|selection| selection.model_hints.clone()),
         mcp_servers: vec![],
         sandbox: profile.config.sandbox.clone(),
+        // (serve-side wiring lands with the UI/RPC follow-up).
+        // #1768: thread the profile's snapshot opt-in so serve sessions
+        // honor it (parity with format_after_edit).
+        snapshots: profile.config.snapshots.clone(),
         tool_policy: None,
         tool_policy_by_provider: Default::default(),
         embedding: None,
@@ -2565,7 +2688,7 @@ pub(crate) fn config_from_profile(
         hooks: profile.config.hooks.clone(),
         approval_policy: profile.config.approval_policy.clone(),
         context_filter: vec![],
-        sub_providers: vec![],
+        sub_providers: profile.config.sub_providers.clone(),
         email: profile
             .config
             .email
@@ -2603,6 +2726,10 @@ pub(crate) fn config_from_profile(
         // `profile.config` directly when needed.
         credential_pool: None,
         content_routing: profile.config.content_routing.clone(),
+        // #1774: thread the profile's formatting opt-in so `octos serve`
+        // sessions honor it (review: hardcoding false here left serve
+        // permanently OFF while chat/gateway/acp worked).
+        format_after_edit: profile.config.format_after_edit,
         appui: Default::default(),
         // Carry the profile-declared plugin loader policy through to the
         // flattened `Config` so callers reading
@@ -3041,6 +3168,121 @@ pub fn api_channel_port(profile: &UserProfile) -> Option<u16> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn should_include_bridge_url_in_env_vars_when_set() {
+        let config = SmartHomeConfig {
+            bridge_url: Some("http://localhost:8787".into()),
+            ..Default::default()
+        };
+        let env_vars = HashMap::new();
+        let out = config.to_env_vars(&env_vars);
+        assert!(
+            out.contains(&(
+                "SMART_HOME_BRIDGE_URL".to_string(),
+                "http://localhost:8787".to_string()
+            )),
+            "expected SMART_HOME_BRIDGE_URL in {out:?}"
+        );
+    }
+
+    #[test]
+    fn should_resolve_token_env_when_literal_token_absent() {
+        let config = SmartHomeConfig {
+            bridge_url: None,
+            token: None,
+            token_env: Some("SH_TOKEN".into()),
+        };
+        let mut env_vars = HashMap::new();
+        env_vars.insert("SH_TOKEN".to_string(), "secret123".to_string());
+        let out = config.to_env_vars(&env_vars);
+        assert!(
+            out.contains(&(
+                "SMART_HOME_BRIDGE_TOKEN".to_string(),
+                "secret123".to_string()
+            )),
+            "expected resolved token in {out:?}"
+        );
+    }
+
+    #[test]
+    fn should_prefer_literal_token_over_token_env() {
+        let config = SmartHomeConfig {
+            bridge_url: None,
+            token: Some("literal-token".into()),
+            token_env: Some("SH_TOKEN".into()),
+        };
+        let mut env_vars = HashMap::new();
+        env_vars.insert("SH_TOKEN".to_string(), "should-not-be-used".to_string());
+        let out = config.to_env_vars(&env_vars);
+        assert!(
+            out.contains(&(
+                "SMART_HOME_BRIDGE_TOKEN".to_string(),
+                "literal-token".to_string()
+            )),
+            "expected literal token to win in {out:?}"
+        );
+    }
+
+    #[test]
+    fn should_mask_smart_home_token_but_not_url_when_masking_profile() {
+        let profile = UserProfile {
+            id: "test".into(),
+            name: "Test".into(),
+            public_subdomain: None,
+            enabled: true,
+            data_dir: None,
+            parent_id: None,
+            config: ProfileConfig {
+                smart_home: Some(SmartHomeConfig {
+                    bridge_url: Some("http://192.168.1.50:8787".into()),
+                    token: Some("supersecret-token-value".into()),
+                    token_env: None,
+                }),
+                ..Default::default()
+            },
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        let profile = mask_secrets(&profile);
+        let smart_home = profile.config.smart_home.expect("smart_home present");
+        assert_eq!(
+            smart_home.bridge_url.as_deref(),
+            Some("http://192.168.1.50:8787"),
+            "bridge_url is not a secret and must not be masked"
+        );
+        let masked_token = smart_home.token.expect("token present");
+        assert_ne!(masked_token, "supersecret-token-value");
+        assert_eq!(masked_token, "supe***lue");
+    }
+
+    #[test]
+    fn should_apply_smart_home_patch_value_and_clear() {
+        let mut config = ProfileConfig::default();
+        let patch = ProfileConfigPatch {
+            smart_home: PatchField::Value(SmartHomeConfig {
+                bridge_url: Some("http://localhost:8787".into()),
+                token: None,
+                token_env: None,
+            }),
+            ..Default::default()
+        };
+        config.apply_patch(patch);
+        assert_eq!(
+            config
+                .smart_home
+                .as_ref()
+                .and_then(|s| s.bridge_url.clone()),
+            Some("http://localhost:8787".to_string())
+        );
+
+        let clear_patch = ProfileConfigPatch {
+            smart_home: PatchField::Clear,
+            ..Default::default()
+        };
+        config.apply_patch(clear_patch);
+        assert!(config.smart_home.is_none());
+    }
+
     fn llm_selection(
         family_id: &str,
         model_id: &str,
@@ -3315,6 +3557,87 @@ mod tests {
         assert_eq!(saved["username"], serde_json::json!("ada"));
         assert_eq!(saved["email"], serde_json::json!("ada@example.com"));
         assert_eq!(saved["name"], serde_json::json!("Ada Byron"));
+    }
+
+    #[test]
+    fn config_from_profile_maps_sub_providers_for_isolated_pipeline_lanes() {
+        // The `deep_research` pipeline's `cheap`/`strong` nodes resolve through
+        // the profile's `sub_providers`; `config_from_profile` must carry them
+        // into the runtime `Config`. It used to hard-zero them (`vec![]`), so
+        // serve-mode pipelines could never reach an isolated research lane.
+        let sp = |key: &str, provider: &str, model: &str| crate::config::SubProviderConfig {
+            key: key.into(),
+            provider: provider.into(),
+            model: Some(model.into()),
+            api_key_env: None,
+            base_url: None,
+            description: None,
+            default_context_window: None,
+            max_output_tokens: None,
+            api_type: None,
+        };
+        let profile = UserProfile {
+            id: "research-lane".into(),
+            name: "Research Lane".into(),
+            enabled: false,
+            data_dir: None,
+            parent_id: None,
+            public_subdomain: None,
+            config: ProfileConfig {
+                sub_providers: vec![
+                    sp("cheap", "gemini", "gemini-2.5-flash"),
+                    sp("strong", "openai", "gpt-5-mini"),
+                ],
+                ..Default::default()
+            },
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+
+        let config = config_from_profile(&profile, None, None);
+        assert_eq!(
+            config.sub_providers.len(),
+            2,
+            "profile sub_providers must reach the runtime config (was hard-zeroed)"
+        );
+        assert_eq!(config.sub_providers[0].key, "cheap");
+        assert_eq!(
+            config.sub_providers[0].model.as_deref(),
+            Some("gemini-2.5-flash")
+        );
+        assert_eq!(config.sub_providers[1].key, "strong");
+    }
+
+    #[test]
+    fn config_from_profile_threads_format_after_edit() {
+        // #1774 review: `octos serve` builds session configs through
+        // config_from_profile — hardcoding `format_after_edit: false` here
+        // left serve permanently OFF while chat/gateway/acp honored the
+        // opt-in. The profile's flag must reach the runtime Config.
+        let profile = UserProfile {
+            id: "fmt-opt-in".into(),
+            name: "Fmt Opt-In".into(),
+            enabled: false,
+            data_dir: None,
+            parent_id: None,
+            public_subdomain: None,
+            config: ProfileConfig {
+                format_after_edit: true,
+                ..Default::default()
+            },
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        assert!(
+            config_from_profile(&profile, None, None).format_after_edit,
+            "profile opt-in must reach the runtime config (serve path)"
+        );
+        // And the default stays OFF.
+        let off = UserProfile {
+            config: ProfileConfig::default(),
+            ..profile
+        };
+        assert!(!config_from_profile(&off, None, None).format_after_edit);
     }
 
     #[test]
@@ -5968,6 +6291,35 @@ mod tests {
             eff.sandbox.read_allow_paths,
             vec!["/srv/data".to_string()],
             "an entirely out-of-floor profile list is clamped to the operator's roots"
+        );
+
+        // A profile using `..` to climb out of the operator root must NOT slip
+        // through the subset check: `/srv/data/../../etc` resolves to `/etc`,
+        // outside the floor, so it is dropped and the list clamps to defaults.
+        let mut traverse = inheritance_profile("mallory");
+        traverse.config.sandbox = octos_agent::SandboxConfig {
+            read_allow_paths: vec!["/srv/data/../../etc".into()],
+            ..Default::default()
+        };
+        let eff = store.effective_config(&traverse);
+        assert_eq!(
+            eff.sandbox.read_allow_paths,
+            vec!["/srv/data".to_string()],
+            "a `..` traversal escaping the operator root must be clamped, not honored"
+        );
+
+        // Sibling-prefix guard: `/srv/database` must not count as within
+        // `/srv/data` (string prefix ≠ path containment).
+        let mut sibling = inheritance_profile("neil");
+        sibling.config.sandbox = octos_agent::SandboxConfig {
+            read_allow_paths: vec!["/srv/database".into()],
+            ..Default::default()
+        };
+        let eff = store.effective_config(&sibling);
+        assert_eq!(
+            eff.sandbox.read_allow_paths,
+            vec!["/srv/data".to_string()],
+            "a sibling dir sharing a string prefix must not pass the containment check"
         );
     }
 

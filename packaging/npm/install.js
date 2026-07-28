@@ -2,7 +2,7 @@
 // postinstall: download the prebuilt octos release bundle for this platform,
 // extract every binary into vendor/, and assert the full skill set is present.
 //
-// The bundle ships `octos` alongside its 8 skill binaries. At `octos serve`
+// The bundle ships `octos` alongside its 9 skill binaries. At `octos serve`
 // startup, bootstrap discovers those skills as SIBLINGS of the resolved
 // `octos` executable, so they must all land in the same dir (vendor/).
 //
@@ -35,6 +35,7 @@ const EXPECTED_BINS = [
   "voice",
   "clock",
   "weather",
+  "smart_home",
 ];
 
 function fail(msg) {
