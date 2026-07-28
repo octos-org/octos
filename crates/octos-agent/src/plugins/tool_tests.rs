@@ -1760,28 +1760,45 @@ async fn dropped_execute_future_kills_child_no_orphan() {
     // branch that saves us — only dropping the future can kill the child.
     let tool = PluginTool::new("p".into(), def, script_path).with_timeout(Duration::from_secs(600));
 
-    // Simulate the registry dispatch boundary: wrap the tool future in a
-    // short timeout. On elapse the future is dropped (its `Child` with it).
-    // Use a 3s window (generous even under heavy parallel test load) so the
-    // child reliably runs `echo $$ > pidfile` and reaches `sleep` BEFORE
-    // the timeout drops the future — otherwise we could not observe the
-    // pid to assert on. The cancellation-safety property is unaffected by
-    // the window length.
+    // Simulate the registry dispatch boundary: the pending tool future is
+    // dropped, taking its `Child` with it. We must not drop until the child
+    // has actually run `echo $$ > pidfile`, or there is no pid to assert on.
+    //
+    // Drive the future in slices and wait on the *pidfile* rather than on a
+    // fixed window. A fixed window cannot be both cheap and safe here: this
+    // future never completes, so the entire window is always consumed, which
+    // means buying reliability with a longer one directly lengthens every
+    // run. The previous 3s window — commented "generous even under heavy
+    // parallel test load" — still lost the race ~2 runs in 20 on an *idle*
+    // machine, panicking with "child should have recorded its pid before
+    // sleeping". Waiting on the observable event removes the race outright
+    // and finishes in tens of milliseconds instead of a fixed 3s.
     let args = json!({});
-    let fut = tool.execute(&args);
-    let res = tokio::time::timeout(Duration::from_secs(3), fut).await;
-    assert!(
-        res.is_err(),
-        "expected the short registry-style timeout to elapse (future dropped)"
-    );
-    // `res` (the dropped future) is gone here — the `Child` was owned by it.
-
-    // The child should have written its pid before sleeping. It had the
-    // full 3s window above to do so.
-    let pid: u32 = std::fs::read_to_string(&pidfile)
-        .ok()
-        .and_then(|s| s.trim().parse::<u32>().ok())
-        .expect("child should have recorded its pid before sleeping");
+    let mut fut = Box::pin(tool.execute(&args));
+    let pid: u32 = {
+        let started = std::time::Instant::now();
+        loop {
+            // Let the future make progress. It is supposed to hang.
+            if tokio::time::timeout(Duration::from_millis(20), &mut fut)
+                .await
+                .is_ok()
+            {
+                panic!("plugin future completed; it must stay pending");
+            }
+            if let Some(p) = std::fs::read_to_string(&pidfile)
+                .ok()
+                .and_then(|s| s.trim().parse::<u32>().ok())
+            {
+                break p;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(60),
+                "child never recorded its pid"
+            );
+        }
+    };
+    // THE EVENT UNDER TEST: dropping the pending future must kill the child.
+    drop(fut);
 
     // Poll: the drop-kill + tokio reaper should make the child dead. Allow
     // a brief window for SIGKILL delivery + reap.
@@ -1860,29 +1877,35 @@ async fn dropped_execute_future_kills_child_and_grandchild_no_orphan() {
     // kill branch.
     let tool = PluginTool::new("p".into(), def, script_path).with_timeout(Duration::from_secs(600));
 
-    // Simulate the registry dispatch boundary: a short timeout drops the
-    // future (and its `Child`) on elapse. 3s window so the script reliably
-    // records both pids before the drop.
+    // Same deterministic hand-off as the single-child case above: drive the
+    // pending future in slices until BOTH pids are on disk, then drop. The
+    // old shape polled the pidfile *after* the drop, which cannot help — a
+    // dropped future has already killed the tree, so a script that had not
+    // written yet never will. Hence the "got: \"\"" flake.
     let args = json!({});
-    let fut = tool.execute(&args);
-    let res = tokio::time::timeout(Duration::from_secs(3), fut).await;
-    assert!(
-        res.is_err(),
-        "expected the short registry-style timeout to elapse (future dropped)"
-    );
-
+    let mut fut = Box::pin(tool.execute(&args));
     // Read BOTH recorded pids (grandchild first, then direct child).
     let contents = {
-        let mut last = String::new();
-        for _ in 0..100 {
-            last = std::fs::read_to_string(&pidfile).unwrap_or_default();
-            if last.lines().filter(|l| !l.trim().is_empty()).count() >= 2 {
-                break;
+        let started = std::time::Instant::now();
+        loop {
+            if tokio::time::timeout(Duration::from_millis(20), &mut fut)
+                .await
+                .is_ok()
+            {
+                panic!("plugin future completed; it must stay pending");
             }
-            tokio::time::sleep(Duration::from_millis(20)).await;
+            let last = std::fs::read_to_string(&pidfile).unwrap_or_default();
+            if last.lines().filter(|l| !l.trim().is_empty()).count() >= 2 {
+                break last;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(60),
+                "plugin never recorded both pids, got: {last:?}"
+            );
         }
-        last
     };
+    // THE EVENT UNDER TEST: dropping the pending future must reap the tree.
+    drop(fut);
     let pids: Vec<u32> = contents
         .lines()
         .filter_map(|l| l.trim().parse::<u32>().ok())
