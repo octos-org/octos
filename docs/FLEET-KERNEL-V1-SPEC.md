@@ -170,13 +170,15 @@ non-`Cancelled` fleets:
 
 ```rust
 struct DurablePlan { schema_version, fleet_id, revision: u64, objective: String, tasks: Vec<PlanTask> }
-struct PlanTask {
+struct PlanTask {                               // the SPEC only — live state derives from the child
   task_id: String, title: String, detail: String,
-  deps: Vec<String>,                            // task_ids that must be Accepted first
-  state: TaskState,                             // Pending|Ready|Assigned|Running|Blocked{reason}|Accepted|Rejected{reason}|Cancelled
+  deps: Vec<String>,                            // task_ids that must be Succeeded first (child.deps is the store's re-synced copy)
   acceptance: Vec<AcceptanceCriterion>,
-  evidence: Vec<EvidenceRef>,
 }
+// PR-2 reconciliation: PlanTask.state and PlanTask.evidence were removed — one source of truth per fact.
+// Live state = FleetChildRecord.status (+ current_attempt_id); outcome + evidence live with
+// FleetChildRecord.outcome (an AcceptanceVerdict). Because child_id == task_id there is no assigned_child.
+// The ergonomic Fleet::view() (PR 2) JOINs the spec back with the child's state for rendering.
 struct AcceptanceCriterion { id: String, description: String,
   verifier: Manual | FileExists{path} | CommandExit{cmd, code} | ValidatorRef{id} }  // data + a verifier — "done" is checkable
 struct EvidenceRef { kind, locator: String, sha256: String, captured_at_ms: u64 }
