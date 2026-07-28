@@ -1137,6 +1137,48 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn canonical_root_and_candidate_match_for_missing_root_behind_symlink() {
+        // Unix companion to the test above. That one roots at `/`, where the
+        // ancestor walk stops immediately and canonicalisation is a no-op, so
+        // it only ever constrains Windows. Put the missing root behind a
+        // SYMLINK and the same asymmetry appears on Unix — which is the shape
+        // macOS ships by default, where `/tmp` and `/var` resolve into
+        // `/private`. Without this case a regression here is invisible to
+        // every non-Windows run.
+        use std::os::unix::fs::symlink;
+
+        let real = tempfile::tempdir().expect("real dir");
+        let link_dir = tempfile::tempdir().expect("link parent");
+        let link = link_dir.path().join("workspace-link");
+        symlink(real.path(), &link).expect("symlink");
+
+        // Guard the premise: if the link resolved to itself the assertion
+        // below would hold for the wrong reason.
+        assert_ne!(
+            std::fs::canonicalize(&link).expect("canonicalise link"),
+            link,
+            "symlink must resolve elsewhere for this test to bite"
+        );
+
+        let missing_root = link.join("not-created-yet");
+        assert!(
+            !missing_root.exists(),
+            "test root must not exist: {}",
+            missing_root.display()
+        );
+
+        let canonical_root = canonical_root_lossy(&missing_root);
+        let canonical_child = canonicalize_lossy(&missing_root.join("src/main.rs"));
+        assert!(
+            canonical_child.starts_with(&canonical_root),
+            "candidate {} must retain root representation {}",
+            canonical_child.display(),
+            canonical_root.display()
+        );
+    }
+
     #[test]
     fn multi_tenant_at_workspace_rejects_workspace_escaping_root() {
         // A workspace that is neither under nor equal to root is a
