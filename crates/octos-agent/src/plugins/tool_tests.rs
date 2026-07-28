@@ -3,6 +3,18 @@ use crate::SilentReporter;
 use serde_json::json;
 use std::sync::Arc;
 
+/// Plugin timeout for tests whose script finishes in milliseconds and which
+/// are NOT exercising the timeout path. It is headroom, not an assertion —
+/// nothing here is supposed to reach it.
+///
+/// It used to be 5s, which a loaded host can exceed just by scheduling the
+/// subprocess: five `plugins::tool::tests` cases went red together with
+/// `PluginTimeout` from `tool.rs:2966` during a repeat run on a busy machine,
+/// none of them related to timeouts. The one test that genuinely wants the
+/// timeout to fire (`execute_timeout_returns_error`) keeps its own 1s value
+/// against a script that sleeps 60s, so this constant does not weaken it.
+const TEST_PLUGIN_TIMEOUT: Duration = Duration::from_secs(120);
+
 fn make_tool_def(name: &str, desc: &str) -> PluginToolDef {
     PluginToolDef {
         name: name.to_string(),
@@ -1367,7 +1379,7 @@ async fn execute_spawns_subprocess_and_captures_output() {
 
     let def = make_tool_def("echo_tool", "echoes input");
     let tool = PluginTool::new("test-plugin".into(), def, script_path)
-        .with_timeout(Duration::from_secs(5));
+        .with_timeout(TEST_PLUGIN_TIMEOUT);
 
     let args = json!({"msg": "hello"});
     let result = tool.execute(&args).await.expect("execute should succeed");
@@ -1399,7 +1411,7 @@ async fn execute_structured_progress_event_updates_task_supervisor() {
 
     let def = make_tool_def("structured_tool", "writes harness events");
     let tool = PluginTool::new("test-plugin".into(), def, script_path)
-        .with_timeout(Duration::from_secs(5));
+        .with_timeout(TEST_PLUGIN_TIMEOUT);
 
     let sink = crate::harness_events::HarnessEventSink::new(
         supervisor.clone(),
@@ -1468,7 +1480,7 @@ async fn execute_does_not_expose_secret_extra_env_without_tool_allowlist() {
             "OPENAI_API_KEY".into(),
             "sk-octos-plugin-regression".into(),
         )])
-        .with_timeout(Duration::from_secs(5));
+        .with_timeout(TEST_PLUGIN_TIMEOUT);
 
     let result = tool.execute(&json!({})).await.expect("should succeed");
 
@@ -1494,7 +1506,7 @@ async fn execute_exposes_secret_extra_env_with_tool_allowlist() {
             "OPENAI_API_KEY".into(),
             "sk-octos-plugin-allowed".into(),
         )])
-        .with_timeout(Duration::from_secs(5));
+        .with_timeout(TEST_PLUGIN_TIMEOUT);
 
     let result = tool.execute(&json!({})).await.expect("should succeed");
 
@@ -1511,7 +1523,7 @@ async fn execute_fallback_on_non_json_stdout() {
     write_test_script(&script_path, "#!/bin/sh\necho 'plain text output'\n");
 
     let def = make_tool_def("plain_tool", "plain output");
-    let tool = PluginTool::new("p".into(), def, script_path).with_timeout(Duration::from_secs(5));
+    let tool = PluginTool::new("p".into(), def, script_path).with_timeout(TEST_PLUGIN_TIMEOUT);
 
     let result = tool.execute(&json!({})).await.expect("should succeed");
 
@@ -1551,7 +1563,7 @@ async fn execute_fallback_detects_generated_pptx_as_file_to_send() {
     };
     let tool = PluginTool::new("p".into(), def, script_path)
         .with_work_dir(dir.path().to_path_buf())
-        .with_timeout(Duration::from_secs(5));
+        .with_timeout(TEST_PLUGIN_TIMEOUT);
 
     let result = tool
         .execute(&json!({"out": output_rel}))
@@ -1593,7 +1605,7 @@ async fn execute_fallback_waits_briefly_for_generated_pptx_to_appear() {
     };
     let tool = PluginTool::new("p".into(), def, script_path)
         .with_work_dir(dir.path().to_path_buf())
-        .with_timeout(Duration::from_secs(5));
+        .with_timeout(TEST_PLUGIN_TIMEOUT);
 
     let result = tool
         .execute(&json!({"out": output_rel}))
@@ -1638,7 +1650,7 @@ async fn execute_fallback_skips_missing_generated_pptx() {
     };
     let tool = PluginTool::new("p".into(), def, script_path)
         .with_work_dir(dir.path().to_path_buf())
-        .with_timeout(Duration::from_secs(5));
+        .with_timeout(TEST_PLUGIN_TIMEOUT);
 
     let result = tool
         .execute(&json!({"out": output_rel}))
@@ -2167,7 +2179,7 @@ async fn strict_env_allowlist_drops_non_listed_extra_env() {
             ("FOO_ALLOWED_PLUGIN".into(), "yes".into()),
             ("FOO_BLOCKED_PLUGIN".into(), "should_be_stripped".into()),
         ])
-        .with_timeout(Duration::from_secs(5));
+        .with_timeout(TEST_PLUGIN_TIMEOUT);
 
     let result = tool.execute(&json!({})).await.expect("should succeed");
 
@@ -2204,7 +2216,7 @@ async fn empty_env_allowlist_keeps_legacy_extra_env_passthrough() {
     // No `env` allowlist declared → empty list → legacy gate.
     let tool = PluginTool::new("p".into(), def, script_path)
         .with_extra_env(vec![("MY_BASE_URL".into(), "passes_through".into())])
-        .with_timeout(Duration::from_secs(5));
+        .with_timeout(TEST_PLUGIN_TIMEOUT);
 
     let result = tool.execute(&json!({})).await.expect("should succeed");
 
@@ -2232,7 +2244,7 @@ async fn strict_env_allowlist_retains_path() {
 
     let mut def = make_tool_def("path_tool", "prints PATH");
     def.env.push("FOO_ALLOWED_PLUGIN".into());
-    let tool = PluginTool::new("p".into(), def, script_path).with_timeout(Duration::from_secs(5));
+    let tool = PluginTool::new("p".into(), def, script_path).with_timeout(TEST_PLUGIN_TIMEOUT);
 
     let result = tool.execute(&json!({})).await.expect("should succeed");
     assert!(result.success);
@@ -2292,7 +2304,7 @@ async fn high_risk_plugin_tool_requests_approval() {
 
     let mut def = make_tool_def("danger_tool", "danger");
     def.risk = Some("high".into());
-    let tool = PluginTool::new("p".into(), def, script_path).with_timeout(Duration::from_secs(5));
+    let tool = PluginTool::new("p".into(), def, script_path).with_timeout(TEST_PLUGIN_TIMEOUT);
 
     let (requester, last) = RecordingRequester::new(ToolApprovalDecision::Approve);
     let requester_arc: Arc<dyn ToolApprovalRequester> = requester;
@@ -2325,7 +2337,7 @@ async fn high_risk_plugin_tool_denied_returns_deny_message() {
 
     let mut def = make_tool_def("danger_tool_deny", "danger");
     def.risk = Some("critical".into());
-    let tool = PluginTool::new("p".into(), def, script_path).with_timeout(Duration::from_secs(5));
+    let tool = PluginTool::new("p".into(), def, script_path).with_timeout(TEST_PLUGIN_TIMEOUT);
 
     let (requester, _last) = RecordingRequester::new(ToolApprovalDecision::Deny);
     let requester_arc: Arc<dyn ToolApprovalRequester> = requester;
@@ -2356,7 +2368,7 @@ async fn low_risk_plugin_tool_does_not_request_approval() {
 
     let mut def = make_tool_def("safe_tool", "safe");
     def.risk = Some("low".into());
-    let tool = PluginTool::new("p".into(), def, script_path).with_timeout(Duration::from_secs(5));
+    let tool = PluginTool::new("p".into(), def, script_path).with_timeout(TEST_PLUGIN_TIMEOUT);
 
     let (requester, last) = RecordingRequester::new(ToolApprovalDecision::Deny);
     let requester_arc: Arc<dyn ToolApprovalRequester> = requester;
@@ -2387,7 +2399,7 @@ async fn unspecified_risk_plugin_tool_does_not_request_approval() {
     );
 
     let def = make_tool_def("plain_tool", "plain");
-    let tool = PluginTool::new("p".into(), def, script_path).with_timeout(Duration::from_secs(5));
+    let tool = PluginTool::new("p".into(), def, script_path).with_timeout(TEST_PLUGIN_TIMEOUT);
 
     let (requester, last) = RecordingRequester::new(ToolApprovalDecision::Deny);
     let requester_arc: Arc<dyn ToolApprovalRequester> = requester;
@@ -2425,7 +2437,7 @@ async fn should_deny_high_risk_plugin_without_prompt_when_approval_policy_never(
     let mut def = make_tool_def("danger_never", "danger");
     def.risk = Some("high".into());
     let tool = PluginTool::new("p".into(), def, script_path)
-        .with_timeout(Duration::from_secs(5))
+        .with_timeout(TEST_PLUGIN_TIMEOUT)
         .with_approval_policy(ApprovalPolicy::Never);
 
     let (requester, last) = RecordingRequester::new(ToolApprovalDecision::Approve);
@@ -2468,7 +2480,7 @@ async fn should_auto_allow_high_risk_plugin_without_prompt_when_danger_full_acce
     let mut def = make_tool_def("danger_yolo", "danger");
     def.risk = Some("critical".into());
     let tool = PluginTool::new("p".into(), def, script_path)
-        .with_timeout(Duration::from_secs(5))
+        .with_timeout(TEST_PLUGIN_TIMEOUT)
         .with_approval_policy(ApprovalPolicy::Never)
         .with_auto_approve_high_risk(true);
 
@@ -2508,7 +2520,7 @@ async fn should_request_approval_for_high_risk_plugin_when_approval_policy_ask()
     let mut def = make_tool_def("danger_ask", "danger");
     def.risk = Some("high".into());
     let tool = PluginTool::new("p".into(), def, script_path)
-        .with_timeout(Duration::from_secs(5))
+        .with_timeout(TEST_PLUGIN_TIMEOUT)
         .with_approval_policy(ApprovalPolicy::Ask);
 
     let (requester, last) = RecordingRequester::new(ToolApprovalDecision::Approve);
@@ -2601,7 +2613,7 @@ async fn high_risk_without_approval_bridge_denies_safely() {
 
     let mut def = make_tool_def("danger_tool_no_bridge", "danger");
     def.risk = Some("HIGH".into());
-    let tool = PluginTool::new("p".into(), def, script_path).with_timeout(Duration::from_secs(5));
+    let tool = PluginTool::new("p".into(), def, script_path).with_timeout(TEST_PLUGIN_TIMEOUT);
 
     // No TOOL_APPROVAL_CTX scoped → try_with returns Err → deny.
     let result = tool
@@ -2666,7 +2678,7 @@ async fn unknown_risk_literal_does_not_force_approval() {
 
     let mut def = make_tool_def("medium_tool", "medium");
     def.risk = Some("medium".into());
-    let tool = PluginTool::new("p".into(), def, script_path).with_timeout(Duration::from_secs(5));
+    let tool = PluginTool::new("p".into(), def, script_path).with_timeout(TEST_PLUGIN_TIMEOUT);
 
     let (requester, last) = RecordingRequester::new(ToolApprovalDecision::Deny);
     let requester_arc: Arc<dyn ToolApprovalRequester> = requester;
@@ -2797,7 +2809,7 @@ async fn execute_with_named_outputs_threads_field_into_tool_result() {
     );
 
     let def = make_tool_def("publish_tool", "publish");
-    let tool = PluginTool::new("p".into(), def, script_path).with_timeout(Duration::from_secs(5));
+    let tool = PluginTool::new("p".into(), def, script_path).with_timeout(TEST_PLUGIN_TIMEOUT);
 
     let result = tool.execute(&json!({})).await.expect("execute should ok");
     assert!(result.success);
@@ -2822,7 +2834,7 @@ async fn execute_with_malformed_named_outputs_returns_failure() {
     );
 
     let def = make_tool_def("bad_tool", "emits bad named outputs");
-    let tool = PluginTool::new("p".into(), def, script_path).with_timeout(Duration::from_secs(5));
+    let tool = PluginTool::new("p".into(), def, script_path).with_timeout(TEST_PLUGIN_TIMEOUT);
 
     let result = tool.execute(&json!({})).await.expect("execute should ok");
     assert!(!result.success);
@@ -2846,7 +2858,7 @@ async fn execute_without_named_outputs_leaves_tool_result_none() {
     );
 
     let def = make_tool_def("legacy_tool", "legacy");
-    let tool = PluginTool::new("p".into(), def, script_path).with_timeout(Duration::from_secs(5));
+    let tool = PluginTool::new("p".into(), def, script_path).with_timeout(TEST_PLUGIN_TIMEOUT);
 
     let result = tool.execute(&json!({})).await.expect("execute should ok");
     assert!(result.success);
@@ -2952,7 +2964,7 @@ async fn plugin_uses_scope_workspace_when_present() {
     // Crucially: NO `.with_work_dir(...)`. The scope is the only
     // source of truth.
     let tool =
-        PluginTool::new("plug".into(), def, script_path).with_timeout(Duration::from_secs(5));
+        PluginTool::new("plug".into(), def, script_path).with_timeout(TEST_PLUGIN_TIMEOUT);
 
     let ctx = ctx_with_scope(scope);
     let result = crate::tools::TOOL_CTX
@@ -3003,7 +3015,7 @@ async fn high_risk_plugin_approval_cwd_reflects_scope_workspace() {
 
     let mut def = make_tool_def("approval_cwd_tool", "danger");
     def.risk = Some("high".into());
-    let tool = PluginTool::new("p".into(), def, script_path).with_timeout(Duration::from_secs(5));
+    let tool = PluginTool::new("p".into(), def, script_path).with_timeout(TEST_PLUGIN_TIMEOUT);
 
     let (requester, last) = RecordingRequester::new(ToolApprovalDecision::Approve);
     let requester_arc: Arc<dyn ToolApprovalRequester> = requester;
@@ -3065,7 +3077,7 @@ async fn plugin_rescues_workspace_root_under_hinted_skill_output_rebind() {
     );
     let tool = PluginTool::new("plug".into(), input_path_def("script_path"), bin_path)
         .with_work_dir(skill_output.clone())
-        .with_timeout(Duration::from_secs(5));
+        .with_timeout(TEST_PLUGIN_TIMEOUT);
 
     let ctx = ctx_with_scope(scope);
     let result = crate::tools::TOOL_CTX
@@ -3118,7 +3130,7 @@ async fn plugin_refuses_absolute_escape_in_hinted_session() {
     );
     let tool = PluginTool::new("plug".into(), input_path_def("audio_path"), script.clone())
         .with_work_dir(hinted_work_dir.path().to_path_buf())
-        .with_timeout(Duration::from_secs(5));
+        .with_timeout(TEST_PLUGIN_TIMEOUT);
 
     let ctx = ctx_with_scope(scope);
     let bait_abs = bait_path.to_string_lossy().to_string();
@@ -3175,7 +3187,7 @@ async fn plugin_prefers_registry_rebound_work_dir_over_scope() {
     let def = make_tool_def("hint_cwd", "echo CWD");
     let tool = PluginTool::new("plug".into(), def, script_path)
         .with_work_dir(hinted_work_dir.path().to_path_buf())
-        .with_timeout(Duration::from_secs(5));
+        .with_timeout(TEST_PLUGIN_TIMEOUT);
 
     let ctx = ctx_with_scope(scope);
     let result = crate::tools::TOOL_CTX
@@ -3215,7 +3227,7 @@ async fn plugin_falls_back_to_self_work_dir_when_no_scope() {
     let def = make_tool_def("legacy_cwd", "echo CWD");
     let tool = PluginTool::new("plug".into(), def, script_path)
         .with_work_dir(dir.path().to_path_buf())
-        .with_timeout(Duration::from_secs(5));
+        .with_timeout(TEST_PLUGIN_TIMEOUT);
 
     // No scope threaded — execute via the default `TOOL_CTX::zero`
     // shape (the global TOOL_CTX::try_with returns Err so the
