@@ -3,7 +3,7 @@
 Status: Proposed
 Date: 2026-07-27
 Author: ymote
-Related: `peer_respond` (#1843), awaiting-input wake (#1844); supersedes the informal "peers-as-substrate" sketch.
+Related: `docs/FLEET-KERNEL-FOUNDATION-SPEC.md` (the grounded design this decision drives); `peer_respond` (#1843), awaiting-input wake (#1844); supersedes the informal "peers-as-substrate" sketch.
 
 ## Context
 
@@ -135,15 +135,25 @@ scheduler.
 
 ## Roadmap
 
-1. **Kernel design (next).** The durable child-state ledger (modeled on
-   `DispatchRecord`), budget, status/retry, gate, validators — convergence-ready
-   by construction. Design-first, #1842-grade rigor, before code.
-2. **Goal on the fleet.** The headless session runner + the durable-interactive
-   session worker-kind + the durable plan + the dynamic topology + goal-as-app.
-   The goal win, and it validates the kernel.
-3. **Converge swarm + pipeline.** Lift their ledgers onto the kernel; keep their
-   topologies as planners. The "3 → fewer silos" payoff — a phased follow-on,
-   **not** a prerequisite for goal.
+Refined by `docs/FLEET-KERNEL-FOUNDATION-SPEC.md`, which — after two adversarial
+design passes — establishes that the kernel is a **durable-execution /
+restartable-workflow runtime** (recovery *interrupts and restarts* attempts; it
+does not resume a live turn), and splits the goal win from the hard part:
+
+1. **Kernel v1.** One transactional store + the attempt-based state machine
+   (launch leases, generation fencing, idempotent outbox) + the durable plan
+   schema. Design-first, #1842-grade rigor, before code.
+2. **Goal on *stateless* workers — the goal win.** A goal keeper + durable plan
+   dispatching bounded sub-tasks to the already-durable stateless worker. Progress
+   lives in the plan + ledger, not context — the goal-drift fix, using workers
+   that already recover correctly. **Ships without the interactive-session-worker
+   durability problem.**
+3. **Durable interactive session-worker.** Durable prompts + attempt-based
+   park/answer + the headless launcher — for sub-tasks that are themselves long
+   interactive work.
+4. **Converge swarm + pipeline** onto the kernel; keep their topologies as
+   planners. The "3 → fewer silos" payoff — a phased follow-on, **not** a
+   prerequisite for the goal win.
 
 ## Open questions
 
