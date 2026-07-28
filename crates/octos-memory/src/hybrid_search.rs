@@ -26,6 +26,58 @@ pub struct HybridIndex {
     vector_weight: f32,
     /// Weight for BM25 text relevance in hybrid scoring (0.0-1.0).
     bm25_weight: f32,
+    /// Vectors rejected because their width did not match [`Self::dimension`].
+    ///
+    /// Counted rather than logged per occurrence: the store's open path
+    /// re-inserts EVERY persisted episode, so after an embedding-model change a
+    /// per-episode warning meant one line per episode at boot. Thousands of
+    /// identical warnings are easier to miss than one, and log truncation can
+    /// eat the lot. [`Self::insert`] warns once, then counts.
+    dimension_mismatches: usize,
+    /// Whether the first mismatch has already been logged.
+    mismatch_logged: bool,
+}
+
+/// How much of the index is actually reachable by vector search.
+///
+/// The failure this exists to surface is invisible at query time: a vector
+/// whose width does not match the index is dropped and that episode silently
+/// falls back to BM25-only recall. Nothing about the search result says so — it
+/// is just quietly worse. This makes the state queryable so a health check can
+/// report it instead of leaving it to be inferred from log archaeology.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VectorCoverage {
+    /// Documents in the index (including BM25-only ones).
+    pub total: usize,
+    /// Documents that made it into the HNSW vector index.
+    pub vectorized: usize,
+    /// Vectors rejected for a width mismatch since this index was built.
+    pub dimension_mismatches: usize,
+    /// The width this index accepts.
+    pub dimension: usize,
+}
+
+impl VectorCoverage {
+    /// Documents searchable by BM25 only.
+    pub fn bm25_only(&self) -> usize {
+        self.total.saturating_sub(self.vectorized)
+    }
+
+    /// Fraction of documents reachable by vector search, `0.0..=1.0`.
+    /// An empty index reports `1.0` — nothing is missing.
+    pub fn ratio(&self) -> f64 {
+        if self.total == 0 {
+            return 1.0;
+        }
+        self.vectorized as f64 / self.total as f64
+    }
+
+    /// True when at least one vector was rejected for a width mismatch, i.e.
+    /// the configured embedding model disagrees with the index this store was
+    /// built at. Re-embedding is the only fix; the vectors cannot be converted.
+    pub fn has_dimension_mismatch(&self) -> bool {
+        self.dimension_mismatches > 0
+    }
 }
 
 const BM25_K1: f64 = 1.2;
@@ -146,6 +198,8 @@ impl HybridIndex {
             dimension,
             vector_weight: DEFAULT_VECTOR_WEIGHT,
             bm25_weight: DEFAULT_BM25_WEIGHT,
+            dimension_mismatches: 0,
+            mismatch_logged: false,
         }
     }
 
@@ -164,6 +218,25 @@ impl HybridIndex {
     /// degrades to BM25-only insertion), the BM25 inverted index can
     /// outgrow the HNSW graph; callers MUST NOT assume the corpus
     /// size is capped at `HNSW_CAPACITY`.
+    /// Snapshot of how much of this index is reachable by vector search.
+    ///
+    /// `len()` counts DOCUMENTS; this counts how many of them actually carry a
+    /// vector, which is the number that degrades silently when the embedding
+    /// model and the index disagree.
+    pub fn vector_coverage(&self) -> VectorCoverage {
+        VectorCoverage {
+            total: self.ids.iter().filter(|id| !id.is_empty()).count(),
+            vectorized: self
+                .has_embedding
+                .iter()
+                .zip(&self.ids)
+                .filter(|(has, id)| **has && !id.is_empty())
+                .count(),
+            dimension_mismatches: self.dimension_mismatches,
+            dimension: self.dimension,
+        }
+    }
+
     pub fn len(&self) -> usize {
         self.ids.len()
     }
@@ -236,11 +309,21 @@ impl HybridIndex {
         }
 
         // Insert embedding into HNSW if provided, dimension matches, and not at capacity
-        if let Some(e) = embedding {
-            if e.len() != self.dimension {
+        if let Some(e) = embedding
+            && e.len() != self.dimension
+        {
+            // Warn on the FIRST mismatch only, then count. The store's open
+            // path re-inserts every persisted episode, so warning per
+            // occurrence produced one line per episode after a model change.
+            // `vector_coverage()` reports the total; the store logs a summary
+            // once its rebuild finishes.
+            self.dimension_mismatches += 1;
+            if !self.mismatch_logged {
+                self.mismatch_logged = true;
                 tracing::warn!(
                     "embedding dimension mismatch for {episode_id}: got {}, index expects {} — \
-                     vector dropped, episode indexed BM25-only (check embedding model vs index dimension)",
+                     vector dropped, episode indexed BM25-only (check embedding model vs index \
+                     dimension). Further mismatches are counted, not logged; see vector_coverage()",
                     e.len(),
                     self.dimension
                 );
@@ -604,6 +687,91 @@ fn l2_normalize(v: &[f32]) -> Option<Vec<f32>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The counter must survive the exact scenario it exists for: a model
+    /// change, where the store re-inserts every persisted episode and each one
+    /// carries a now-wrong width.
+    #[test]
+    fn vector_coverage_counts_every_dimension_mismatch() {
+        let mut index = HybridIndex::new(4);
+        // Three good, two the wrong width (as if the model changed under us).
+        index.insert("ok1", "alpha beta", Some(&[1.0, 0.0, 0.0, 0.0]));
+        index.insert("bad1", "gamma delta", Some(&[1.0, 0.0]));
+        index.insert("ok2", "epsilon zeta", Some(&[0.0, 1.0, 0.0, 0.0]));
+        index.insert("bad2", "eta theta", Some(&[1.0, 0.0, 0.0, 0.0, 0.0, 0.0]));
+        index.insert("ok3", "iota kappa", Some(&[0.0, 0.0, 1.0, 0.0]));
+
+        let c = index.vector_coverage();
+        assert_eq!(c.total, 5);
+        assert_eq!(c.vectorized, 3, "only the correctly-sized vectors index");
+        assert_eq!(
+            c.dimension_mismatches, 2,
+            "both mismatches counted, not just the logged one"
+        );
+        assert_eq!(c.bm25_only(), 2);
+        assert_eq!(c.dimension, 4);
+        assert!(c.has_dimension_mismatch());
+        assert!((c.ratio() - 0.6).abs() < 1e-9);
+    }
+
+    /// A healthy index must not look degraded — the signal is useless if it
+    /// fires when nothing is wrong.
+    #[test]
+    fn vector_coverage_is_clean_when_dimensions_agree() {
+        let mut index = HybridIndex::new(2);
+        index.insert("a", "alpha", Some(&[1.0, 0.0]));
+        index.insert("b", "beta", Some(&[0.0, 1.0]));
+
+        let c = index.vector_coverage();
+        assert_eq!((c.total, c.vectorized, c.dimension_mismatches), (2, 2, 0));
+        assert!(!c.has_dimension_mismatch());
+        assert!((c.ratio() - 1.0).abs() < 1e-9);
+        assert_eq!(c.bm25_only(), 0);
+    }
+
+    /// An episode saved with no embedding at all is BM25-only but is NOT a
+    /// mismatch — conflating the two would make the health signal cry wolf on
+    /// every text-only episode.
+    #[test]
+    fn vector_coverage_separates_absent_vectors_from_mismatched_ones() {
+        let mut index = HybridIndex::new(2);
+        index.insert("has_vec", "alpha", Some(&[1.0, 0.0]));
+        index.insert("no_vec", "beta", None);
+
+        let c = index.vector_coverage();
+        assert_eq!(c.total, 2);
+        assert_eq!(c.vectorized, 1);
+        assert_eq!(
+            c.bm25_only(),
+            1,
+            "the vector-less episode still counts as BM25-only"
+        );
+        assert_eq!(c.dimension_mismatches, 0, "absent != mismatched");
+        assert!(!c.has_dimension_mismatch());
+    }
+
+    /// Empty index reports full coverage rather than 0/0 = NaN.
+    #[test]
+    fn vector_coverage_ratio_is_one_when_empty() {
+        let c = HybridIndex::new(4).vector_coverage();
+        assert_eq!((c.total, c.vectorized), (0, 0));
+        assert!((c.ratio() - 1.0).abs() < 1e-9);
+        assert!(c.ratio().is_finite());
+    }
+
+    /// Tombstoned entries must leave both sides of the ratio, or removing an
+    /// episode would make coverage look worse than it is.
+    #[test]
+    fn vector_coverage_excludes_removed_episodes() {
+        let mut index = HybridIndex::new(2);
+        index.insert("a", "alpha", Some(&[1.0, 0.0]));
+        index.insert("b", "beta", Some(&[0.0, 1.0]));
+        assert!(index.remove("a"));
+
+        let c = index.vector_coverage();
+        assert_eq!((c.total, c.vectorized), (1, 1));
+        assert!((c.ratio() - 1.0).abs() < 1e-9);
+    }
 
     #[test]
     fn test_tokenize() {

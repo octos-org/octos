@@ -235,7 +235,29 @@ impl EpisodeStore {
                     }
                 }
 
-                debug!(path = %data_dir.display(), "opened episode store");
+                // One summary instead of one line per episode. `insert` warns on
+                // the first mismatch and counts the rest, so without this a
+                // model change was either a single warning buried in the boot
+                // log or (before) thousands of identical ones.
+                let coverage = index.vector_coverage();
+                if coverage.has_dimension_mismatch() {
+                    warn!(
+                        path = %data_dir.display(),
+                        expected_dimension = coverage.dimension,
+                        mismatched = coverage.dimension_mismatches,
+                        vectorized = coverage.vectorized,
+                        total = coverage.total,
+                        "episode store rebuilt with dimension-mismatched embeddings dropped — \
+                         those episodes are BM25-only until re-embedded. This happens when the \
+                         configured embedding model changed; stored vectors cannot be converted."
+                    );
+                }
+                debug!(
+                    path = %data_dir.display(),
+                    vectorized = coverage.vectorized,
+                    total = coverage.total,
+                    "opened episode store"
+                );
                 Ok(Some((db, index)))
             })
             .await?;
@@ -549,6 +571,31 @@ impl EpisodeStore {
     /// empty for the same reason as [`Self::store`] — they need
     /// disk-backed bodies. Follows the same "writes accepted, reads
     /// empty" contract.
+    /// How much of the episodic index is reachable by vector search.
+    ///
+    /// Surfaces the one failure mode that is invisible at query time: when the
+    /// configured embedding model's width disagrees with the index, those
+    /// vectors are dropped and the episodes fall back to BM25-only recall.
+    /// Search does not report this — it just gets worse — so a health check
+    /// should read it. `dimension_mismatches > 0` means re-embedding is needed;
+    /// stored vectors cannot be converted to a different width.
+    ///
+    /// A degraded (lock-contended) handle reports an empty index.
+    pub fn vector_coverage(&self) -> crate::VectorCoverage {
+        match self.index.read() {
+            Ok(index) => index.vector_coverage(),
+            Err(e) => {
+                warn!("index read lock poisoned, reporting empty coverage: {e}");
+                crate::VectorCoverage {
+                    total: 0,
+                    vectorized: 0,
+                    dimension_mismatches: 0,
+                    dimension: 0,
+                }
+            }
+        }
+    }
+
     pub async fn store_embedding(&self, episode_id: &str, embedding: Vec<f32>) -> Result<()> {
         // Degraded fallback: skip the disk write, update the in-memory
         // embedding entry only, return success.
@@ -918,6 +965,92 @@ mod tests {
             0.0,
             "mismatched vector must not enter the index"
         );
+    }
+
+    /// The scenario this whole signal exists for: someone switches embedding
+    /// model, restarts, and every persisted vector is now the wrong width.
+    /// Before, that was a wall of per-episode warnings and no way to ask how
+    /// bad it was. Reopening at a different width must report it precisely.
+    #[tokio::test]
+    async fn reopening_at_a_different_dimension_reports_the_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Session 1: a 1536-d model (the OpenAI default).
+        {
+            let store = EpisodeStore::open_with_dimension(dir.path(), 1536)
+                .await
+                .unwrap();
+            for i in 0..3 {
+                let ep = make_episode(&format!("episode {i}"), "/proj");
+                let id = ep.id.clone();
+                store.store(ep).await.unwrap();
+                store
+                    .store_embedding(&id, vec![0.1f32; 1536])
+                    .await
+                    .unwrap();
+            }
+            let c = store.vector_coverage();
+            assert_eq!((c.total, c.vectorized), (3, 3), "all three vectorized");
+            assert!(!c.has_dimension_mismatch());
+        }
+
+        // Session 2: switched to a 768-d model. The persisted 1536-d vectors
+        // cannot be converted, so they are dropped on rebuild.
+        {
+            let store = EpisodeStore::open_with_dimension(dir.path(), 768)
+                .await
+                .unwrap();
+            let c = store.vector_coverage();
+            assert_eq!(c.dimension, 768);
+            assert_eq!(c.total, 3, "the episodes themselves survive");
+            assert_eq!(c.vectorized, 0, "none of the old vectors fit the new index");
+            assert_eq!(
+                c.dimension_mismatches, 3,
+                "every dropped vector is counted, not just the first (which is the only one logged)"
+            );
+            assert_eq!(c.bm25_only(), 3);
+            assert!(
+                c.has_dimension_mismatch(),
+                "a health check must be able to see this"
+            );
+            assert!((c.ratio() - 0.0).abs() < 1e-9);
+        }
+    }
+
+    /// Re-embedding at the new width is the documented remedy — it has to
+    /// actually clear the signal, or the advice is wrong.
+    #[tokio::test]
+    async fn re_embedding_restores_vector_coverage() {
+        let dir = tempfile::tempdir().unwrap();
+        let ep = make_episode("needs re-embedding", "/proj");
+        let ep_id = ep.id.clone();
+        {
+            let store = EpisodeStore::open_with_dimension(dir.path(), 1536)
+                .await
+                .unwrap();
+            store.store(ep).await.unwrap();
+            store
+                .store_embedding(&ep_id, vec![0.1f32; 1536])
+                .await
+                .unwrap();
+        }
+
+        let store = EpisodeStore::open_with_dimension(dir.path(), 768)
+            .await
+            .unwrap();
+        assert!(store.vector_coverage().has_dimension_mismatch());
+
+        // Re-embed at the width the index actually wants.
+        let mut v = vec![0.0f32; 768];
+        v[0] = 1.0;
+        store.store_embedding(&ep_id, v).await.unwrap();
+
+        let c = store.vector_coverage();
+        assert_eq!(
+            c.vectorized, 1,
+            "the re-embedded episode rejoins the vector index"
+        );
+        assert!((c.ratio() - 1.0).abs() < 1e-9);
     }
 
     #[test]
