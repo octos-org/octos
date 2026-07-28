@@ -317,12 +317,14 @@ fn row_9_parent_traversal_rejected() {
 #[test]
 fn row_10_absolute_outside_all_allowed_roots_rejected() {
     let rig = Rig::new("row10");
-    // /etc/passwd is a stable target outside every test root. We
-    // don't read the file — only require that the resolver refuses.
+    // A named file directly under the system temp directory is a
+    // sibling of the workspace/profile tempdirs and `octos-uploads`,
+    // so it is a portable absolute target outside every allowed root.
+    let outside = tempfile::NamedTempFile::new().expect("outside temp file");
     let err = expect_err(resolve_tool_path(
         rig.workspace_root(),
         Some(rig.profile_root()),
-        "/etc/passwd",
+        &outside.path().to_string_lossy(),
     ));
     assert_eq!(err, ToolPathError::OutsideAllowedRoots);
 }
