@@ -41,6 +41,38 @@ impl LlmProvider for MockProvider {
     }
 }
 
+/// Failure provider that is ready on its first poll.
+///
+/// This is intentionally separate from [`MockProvider`]: a zero-duration
+/// Tokio sleep still yields, while hedge-ordering tests need an immediate
+/// failure without changing the scheduling semantics of every zero-latency
+/// mock in this module.
+struct ImmediateFailureProvider {
+    name: &'static str,
+    model: &'static str,
+    error_msg: &'static str,
+}
+
+#[async_trait]
+impl LlmProvider for ImmediateFailureProvider {
+    async fn chat(
+        &self,
+        _messages: &[Message],
+        _tools: &[ToolSpec],
+        _config: &ChatConfig,
+    ) -> Result<ChatResponse> {
+        eyre::bail!("{} API error: 429 - rate limited", self.error_msg);
+    }
+
+    fn model_id(&self) -> &str {
+        self.model
+    }
+
+    fn provider_name(&self) -> &str {
+        self.name
+    }
+}
+
 #[tokio::test]
 async fn test_selects_primary_on_cold_start() {
     let router = AdaptiveRouter::new(
@@ -1197,11 +1229,9 @@ async fn should_drift_qos_score_in_response_to_live_traffic() {
                 fail: false,
                 error_msg: "",
             }),
-            Arc::new(MockProvider {
+            Arc::new(ImmediateFailureProvider {
                 name: "fast-fails",
                 model: "m2",
-                latency_ms: 0,
-                fail: true,
                 error_msg: "rate-limited",
             }),
         ],
