@@ -13,7 +13,12 @@ use serde::{Deserialize, Serialize};
 /// Schema version stamped on every persisted record. Bumping this
 /// invalidates prior rows the same way the swarm dispatch ledger does:
 /// a load that sees a *higher* version returns `Ok(None)`.
-pub const SCHEMA_VERSION: u32 = 1;
+///
+/// Bumped 1 → 2 in PR 2: [`DurablePlan`]/[`PlanTask`] dropped the `state`
+/// and `evidence` fields (the plan/child duality reconciliation). Stamping
+/// v2 means a PR-1 binary drops a v2 row via the higher-version guard rather
+/// than failing to deserialize the now-absent fields.
+pub const SCHEMA_VERSION: u32 = 2;
 
 // ---------------------------------------------------------------------------
 // Status enums
@@ -63,20 +68,6 @@ pub enum AttemptStatus {
     Running,
     Done,
     Interrupted,
-}
-
-/// Plan-task state (the durable plan's view; distinct from the child's
-/// runtime [`ChildStatus`]).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum TaskState {
-    Pending,
-    Ready,
-    Assigned,
-    Running,
-    Blocked { reason: String },
-    Accepted,
-    Rejected { reason: String },
-    Cancelled,
 }
 
 /// The worker kind backing a child. v1 ships only the stateless,
@@ -240,16 +231,26 @@ pub struct DurablePlan {
     pub tasks: Vec<PlanTask>,
 }
 
+/// One task in the durable plan — the **spec** (author intent),
+/// deliberately free of any execution state. There is exactly one home
+/// per fact (PR-2 reconciliation): a task's *live state* is its child's
+/// ([`FleetChildRecord::status`] + `current_attempt_id`), and its
+/// *outcome + evidence* live with the child's
+/// [`FleetChildRecord::outcome`] (an [`AcceptanceVerdict`], whose
+/// `Accepted` variant carries the `EvidenceRef`s). Because
+/// `child_id == task_id` there is no separate `assigned_child` pointer.
+/// So `PlanTask` says *what* to do; `FleetChildRecord` says *how it is
+/// going*.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PlanTask {
     pub task_id: String,
     pub title: String,
     pub detail: String,
-    /// task_ids that must be `Accepted`/`Succeeded` first.
+    /// task_ids that must be `Succeeded` first. This is the author's
+    /// declared spec; the store keeps a denormalized resolution copy on
+    /// [`FleetChildRecord::deps`], re-synced by `replan`.
     pub deps: Vec<String>,
-    pub state: TaskState,
     pub acceptance: Vec<AcceptanceCriterion>,
-    pub evidence: Vec<EvidenceRef>,
 }
 
 /// An acceptance criterion: a description plus a checkable [`Verifier`].

@@ -74,11 +74,23 @@ pub enum CompleteOutcome {
     Superseded,
 }
 
-/// Result of a revision-fenced plan operation (`replan`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Result of a revision-fenced plan operation (`replan` / `retitle_task`).
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PlanMutateOutcome {
-    Mutated { revision: u64 },
-    RevisionMismatch { actual: u64 },
+    Mutated {
+        revision: u64,
+    },
+    RevisionMismatch {
+        actual: u64,
+    },
+    /// A `RetargetDeps`-style edit tried to change the dependency set of a
+    /// task that is terminal (`Succeeded`/`Failed`) — detected **inside**
+    /// the `replan` write-txn, so a task that completes between a caller's
+    /// out-of-txn pre-check and the CAS cannot slip a dep-change past the
+    /// freeze (round-2 P1). No mutation.
+    RejectedTerminalDepChange {
+        task_id: String,
+    },
 }
 
 /// Result of an outbox `ack`. `StaleClaim` means the presented
@@ -102,6 +114,19 @@ pub struct InterruptedAttempt {
     pub fleet_id: String,
     pub child_id: String,
     pub attempt_id: String,
+}
+
+/// A point-in-time, internally-consistent read of one fleet: its
+/// [`FleetRecord`], its [`DurablePlan`] (if any), and all its children —
+/// captured under a **single** read transaction (one `io_gate`
+/// acquisition), so a concurrent `replan` interleaving between the
+/// component reads can never produce an old-plan + new-children mix (P1-c).
+/// `children` is sorted by `child_id`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FleetSnapshot {
+    pub fleet: FleetRecord,
+    pub plan: Option<DurablePlan>,
+    pub children: Vec<FleetChildRecord>,
 }
 
 // ---------------------------------------------------------------------------
@@ -244,6 +269,107 @@ impl FleetKernelStore {
         .wrap_err("join create_plan")?
     }
 
+    /// Atomically create a fleet, its durable plan, and one child per plan
+    /// task, in a **single** write transaction (P2-a). Either every row is
+    /// written or none is — there is no half-created fleet-without-plan on a
+    /// mid-sequence failure (unlike composing separate `create_fleet`,
+    /// `add_child`, and `create_plan` calls). Rejects a duplicate fleet or
+    /// plan. A dep-free task starts `Ready`, a dep-gated one `Planned`
+    /// (nothing is `Succeeded` at genesis). Callers should validate the task
+    /// graph (unique ids, no dangling / self / cyclic deps) **before**
+    /// calling this; the store only enforces key-safety and duplicate
+    /// rejection.
+    pub async fn create_fleet_with_plan(
+        &self,
+        controller_session_key: SessionKey,
+        profile_id: &str,
+        token_budget: u64,
+        hard: bool,
+        plan: DurablePlan,
+        now_ms: u64,
+    ) -> Result<()> {
+        let fleet_id = plan.fleet_id.clone();
+        ensure_key_safe(&[fleet_id.as_str()])?;
+        for t in &plan.tasks {
+            ensure_key_safe(&[t.task_id.as_str()])?;
+            for d in &t.deps {
+                ensure_key_safe(&[d.as_str()])?;
+            }
+        }
+        let db = self.db.clone();
+        let profile_id = profile_id.to_string();
+        let held = self.io_gate.clone().lock_owned().await;
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let _held = held;
+            let mut plan = plan;
+            plan.schema_version = SCHEMA_VERSION;
+            let wtx = db.begin_write()?;
+            {
+                let mut fleets = wtx.open_table(FLEETS)?;
+                let mut plans = wtx.open_table(PLANS)?;
+                let mut children = wtx.open_table(FLEET_CHILDREN)?;
+
+                if fleets.get(fleet_id.as_str())?.is_some() {
+                    bail!("fleet {fleet_id} already exists");
+                }
+                if plans.get(fleet_id.as_str())?.is_some() {
+                    bail!("plan for fleet {fleet_id} already exists");
+                }
+
+                let fleet = FleetRecord {
+                    schema_version: SCHEMA_VERSION,
+                    fleet_id: fleet_id.clone(),
+                    controller_session_key,
+                    profile_id,
+                    budget: FleetBudget {
+                        token_budget,
+                        tokens_reserved: 0,
+                        tokens_committed: 0,
+                        hard,
+                    },
+                    status: FleetStatus::Active,
+                    generation: 0,
+                    created_at_ms: now_ms,
+                    updated_at_ms: now_ms,
+                };
+                fleets.insert(fleet_id.as_str(), serde_json::to_string(&fleet)?.as_str())?;
+
+                for t in &plan.tasks {
+                    let ckey = child_key(&fleet_id, &t.task_id);
+                    if children.get(ckey.as_str())?.is_some() {
+                        bail!("duplicate child {} in fleet {fleet_id}", t.task_id);
+                    }
+                    let status = if t.deps.is_empty() {
+                        ChildStatus::Ready
+                    } else {
+                        ChildStatus::Planned
+                    };
+                    let record = FleetChildRecord {
+                        schema_version: SCHEMA_VERSION,
+                        fleet_id: fleet_id.clone(),
+                        child_id: t.task_id.clone(),
+                        worker_kind: WorkerKind::StatelessTask,
+                        status,
+                        current_attempt_id: None,
+                        attempts_used: 0,
+                        outcome: None,
+                        tokens_committed: 0,
+                        deps: t.deps.clone(),
+                        generation: 0,
+                        updated_at_ms: now_ms,
+                    };
+                    children.insert(ckey.as_str(), serde_json::to_string(&record)?.as_str())?;
+                }
+
+                plans.insert(fleet_id.as_str(), serde_json::to_string(&plan)?.as_str())?;
+            }
+            wtx.commit()?;
+            Ok(())
+        })
+        .await
+        .wrap_err("join create_fleet_with_plan")?
+    }
+
     /// Add a child (== plan task) to a fleet. `deps` are the task-ids
     /// that must be `Succeeded` first; an empty `deps` makes the child
     /// `Ready` immediately, otherwise it starts `Planned` and is
@@ -383,6 +509,82 @@ impl FleetKernelStore {
         })
         .await
         .wrap_err("join mark_ready")?
+    }
+
+    /// Atomically resolve readiness and collect the launchable set, in
+    /// **one** write-txn (round-2 P1). Inside a single `begin_write`: read
+    /// every child of the fleet, promote each `Planned` child whose deps are
+    /// **all** `Succeeded` to `Ready`, then collect every `Ready` child with
+    /// no live attempt; commit; return the collected ids (sorted).
+    ///
+    /// Doing the promote-decision and the collect in the same transaction is
+    /// what makes readiness self-healing without a TOCTOU: a `snapshot →
+    /// mark_ready → re-snapshot` sequence could tear (a completion landing
+    /// between the two reads leaves a successor neither promoted nor
+    /// collected). Here they cannot. Only all-`Succeeded` deps promote; a
+    /// `Failed`/`Cancelled` dep keeps a child `Planned`.
+    pub async fn resolve_and_collect_ready(
+        &self,
+        fleet_id: &str,
+        now_ms: u64,
+    ) -> Result<Vec<String>> {
+        ensure_key_safe(&[fleet_id])?;
+        let db = self.db.clone();
+        let fleet_id = fleet_id.to_string();
+        let held = self.io_gate.clone().lock_owned().await;
+        tokio::task::spawn_blocking(move || -> Result<Vec<String>> {
+            let _held = held;
+            let wtx = db.begin_write()?;
+            let mut ready = Vec::new();
+            {
+                let mut children = wtx.open_table(FLEET_CHILDREN)?;
+
+                // Collect this fleet's children (owned, identity-checked) so
+                // the iterator's borrow is released before we mutate.
+                let recs: Vec<FleetChildRecord> = {
+                    let mut out = Vec::new();
+                    for item in children.iter()? {
+                        let (k, v) = item?;
+                        if let Some(rec) = decode_row::<FleetChildRecord>(v.value())? {
+                            if rec.fleet_id == fleet_id
+                                && child_key(&rec.fleet_id, &rec.child_id) == k.value()
+                            {
+                                out.push(rec);
+                            }
+                        }
+                    }
+                    out
+                };
+
+                // Succeeded set from this single consistent read (promotion
+                // to `Ready` never adds to it, so one pass suffices).
+                let succeeded: HashSet<String> = recs
+                    .iter()
+                    .filter(|c| c.status == ChildStatus::Succeeded)
+                    .map(|c| c.child_id.clone())
+                    .collect();
+
+                for mut c in recs {
+                    if c.status == ChildStatus::Planned
+                        && c.current_attempt_id.is_none()
+                        && c.deps.iter().all(|d| succeeded.contains(d))
+                    {
+                        c.status = ChildStatus::Ready;
+                        c.updated_at_ms = now_ms;
+                        let ckey = child_key(&fleet_id, &c.child_id);
+                        children.insert(ckey.as_str(), serde_json::to_string(&c)?.as_str())?;
+                    }
+                    if c.status == ChildStatus::Ready && c.current_attempt_id.is_none() {
+                        ready.push(c.child_id.clone());
+                    }
+                }
+            }
+            wtx.commit()?;
+            ready.sort();
+            Ok(ready)
+        })
+        .await
+        .wrap_err("join resolve_and_collect_ready")?
     }
 
     // ---- CAS state transitions -------------------------------------------
@@ -906,6 +1108,28 @@ impl FleetKernelStore {
                     .map(|c| c.child_id.clone())
                     .collect();
 
+                // --- terminal-dep-change guard (round-2 P1), IN-TXN --------
+                // A surviving task whose new deps differ from its durable
+                // child deps is a `RetargetDeps`-style change. If that child
+                // is terminal (`Succeeded`/`Failed`) its spec is frozen —
+                // reject with ZERO mutation. Checking this INSIDE the same
+                // txn as the revision-CAS closes the race where the caller's
+                // out-of-txn pre-check saw the task non-terminal and it then
+                // completed before this write. (`Cancelled` is excluded: a
+                // removed→re-added task is intentionally resurrected with a
+                // fresh spec, so its deps may legitimately change.)
+                for task in &new_plan.tasks {
+                    if let Some(child) = existing.iter().find(|c| c.child_id == task.task_id) {
+                        if child.deps != task.deps
+                            && matches!(child.status, ChildStatus::Succeeded | ChildStatus::Failed)
+                        {
+                            return Ok(PlanMutateOutcome::RejectedTerminalDepChange {
+                                task_id: task.task_id.clone(),
+                            });
+                        }
+                    }
+                }
+
                 // --- interrupt-and-restart every existing child ----------
                 for mut child in existing {
                     let ckey = child_key(&fleet_id, &child.child_id);
@@ -1050,6 +1274,72 @@ impl FleetKernelStore {
         .wrap_err("join replan")?
     }
 
+    /// Spec-only plan edit: revision-fenced update of one task's `title` +
+    /// `detail`, in one write-txn, that **does not** bump `fleet.generation`
+    /// or touch any child (P2-c). Title/detail have no execution impact, so
+    /// unlike [`FleetKernelStore::replan`] this must **not** interrupt live
+    /// attempts or reset children. CAS on `expected_revision` (bumps the
+    /// plan's `revision` only); a stale revision yields
+    /// [`PlanMutateOutcome::RevisionMismatch`]. Errors if the task is not in
+    /// the plan.
+    pub async fn retitle_task(
+        &self,
+        fleet_id: &str,
+        expected_revision: u64,
+        task_id: &str,
+        title: &str,
+        detail: &str,
+        now_ms: u64,
+    ) -> Result<PlanMutateOutcome> {
+        ensure_key_safe(&[fleet_id, task_id])?;
+        let db = self.db.clone();
+        let fleet_id = fleet_id.to_string();
+        let task_id = task_id.to_string();
+        let title = title.to_string();
+        let detail = detail.to_string();
+        let _ = now_ms; // spec-only: no timestamped row is written here
+        let held = self.io_gate.clone().lock_owned().await;
+        tokio::task::spawn_blocking(move || -> Result<PlanMutateOutcome> {
+            let _held = held;
+            let wtx = db.begin_write()?;
+            let outcome = {
+                let mut plans = wtx.open_table(PLANS)?;
+                let Some(pj) = plans.get(fleet_id.as_str())?.map(|g| g.value().to_string()) else {
+                    bail!("retitle_task: no plan for fleet {fleet_id}");
+                };
+                let Some(mut plan) = decode_row::<DurablePlan>(&pj)? else {
+                    bail!("retitle_task: plan for {fleet_id} is a newer schema");
+                };
+                if plan.fleet_id != fleet_id {
+                    bail!("retitle_task: plan identity mismatch for {fleet_id}");
+                }
+                if plan.revision != expected_revision {
+                    return Ok(PlanMutateOutcome::RevisionMismatch {
+                        actual: plan.revision,
+                    });
+                }
+                let Some(task) = plan.tasks.iter_mut().find(|t| t.task_id == task_id) else {
+                    bail!("retitle_task: task {task_id} not in fleet {fleet_id}'s plan");
+                };
+                task.title = title;
+                task.detail = detail;
+                let new_rev = expected_revision
+                    .checked_add(1)
+                    .ok_or_else(|| eyre::eyre!("revision overflow retitling {fleet_id}"))?;
+                plan.revision = new_rev;
+                plan.schema_version = SCHEMA_VERSION;
+                plans.insert(fleet_id.as_str(), serde_json::to_string(&plan)?.as_str())?;
+                PlanMutateOutcome::Mutated { revision: new_rev }
+            };
+            if matches!(outcome, PlanMutateOutcome::Mutated { .. }) {
+                wtx.commit()?;
+            }
+            Ok(outcome)
+        })
+        .await
+        .wrap_err("join retitle_task")?
+    }
+
     /// Boot recovery: scan children, and for each `Launching`/`Running`
     /// child whose live attempt's lease is stale (foreign `owner_epoch`
     /// **or** expired at `now_ms`), atomically mark the attempt
@@ -1188,6 +1478,71 @@ impl FleetKernelStore {
     }
 
     // ---- gated reads ------------------------------------------------------
+
+    /// Read a fleet + its plan + all its children as one internally
+    /// consistent [`FleetSnapshot`], under a **single** `begin_read`
+    /// transaction (one `io_gate` acquisition) — so the plan, fleet, and
+    /// children are all from the same instant and a concurrent `replan`
+    /// cannot tear the read into an old-plan + new-children mix (P1-c).
+    /// Returns `None` if the fleet does not exist (or is a higher schema).
+    pub async fn load_snapshot(&self, fleet_id: &str) -> Result<Option<FleetSnapshot>> {
+        ensure_key_safe(&[fleet_id])?;
+        let db = self.db.clone();
+        let fleet_id = fleet_id.to_string();
+        let held = self.io_gate.clone().lock_owned().await;
+        tokio::task::spawn_blocking(move || -> Result<Option<FleetSnapshot>> {
+            let _held = held;
+            let rtx = db.begin_read()?;
+
+            // Fleet — the anchor. Absent → no snapshot.
+            let fj = {
+                let fleets = rtx.open_table(FLEETS)?;
+                fleets
+                    .get(fleet_id.as_str())?
+                    .map(|g| g.value().to_string())
+            };
+            let Some(fj) = fj else {
+                return Ok(None);
+            };
+            let Some(fleet) = decode_row::<FleetRecord>(&fj)?.filter(|r| r.fleet_id == fleet_id)
+            else {
+                return Ok(None);
+            };
+
+            // Plan (optional) — same read txn.
+            let pj = {
+                let plans = rtx.open_table(PLANS)?;
+                plans.get(fleet_id.as_str())?.map(|g| g.value().to_string())
+            };
+            let plan = match pj {
+                Some(pj) => decode_row::<DurablePlan>(&pj)?.filter(|p| p.fleet_id == fleet_id),
+                None => None,
+            };
+
+            // Children — same read txn.
+            let mut children = Vec::new();
+            {
+                let table = rtx.open_table(FLEET_CHILDREN)?;
+                for item in table.iter()? {
+                    let (_, v) = item?;
+                    if let Some(rec) = decode_row::<FleetChildRecord>(v.value())? {
+                        if rec.fleet_id == fleet_id {
+                            children.push(rec);
+                        }
+                    }
+                }
+            }
+            children.sort_by(|a, b| a.child_id.cmp(&b.child_id));
+
+            Ok(Some(FleetSnapshot {
+                fleet,
+                plan,
+                children,
+            }))
+        })
+        .await
+        .wrap_err("join load_snapshot")?
+    }
 
     /// Fetch a fleet (dropping a higher-schema row as `Ok(None)`).
     pub async fn get_fleet(&self, fleet_id: &str) -> Result<Option<FleetRecord>> {
@@ -1666,9 +2021,7 @@ mod tests {
             title: id.into(),
             detail: String::new(),
             deps: deps.iter().map(|s| s.to_string()).collect(),
-            state: TaskState::Pending,
             acceptance: vec![],
-            evidence: vec![],
         }
     }
 
@@ -2896,7 +3249,7 @@ mod tests {
             .create_fleet("f1", controller(), "default", 100, false, 0)
             .await
             .unwrap();
-        let raw = r#"{"schema_version":2,"fleet_id":"f1","controller_session_key":"fleet:controller-1","profile_id":"default","budget":{"token_budget":100,"tokens_reserved":0,"tokens_committed":0,"hard":false},"status":"Active","generation":0,"created_at_ms":0,"updated_at_ms":0}"#;
+        let raw = r#"{"schema_version":3,"fleet_id":"f1","controller_session_key":"fleet:controller-1","profile_id":"default","budget":{"token_budget":100,"tokens_reserved":0,"tokens_committed":0,"hard":false},"status":"Active","generation":0,"created_at_ms":0,"updated_at_ms":0}"#;
         store.write_raw_fleet("f1", raw).await.unwrap();
         assert!(store.get_fleet("f1").await.unwrap().is_none());
     }
