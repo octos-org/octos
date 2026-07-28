@@ -121,12 +121,24 @@ The complete configuration structure with all available fields:
   // Agent settings
   "max_iterations": 50,
 
-  // Embedding (for vector search in memory)
+  // Embedding (for vector search in memory).
+  // Remote, OpenAI-compatible:
   "embedding": {
     "provider": "openai",
     "api_key_env": "OPENAI_API_KEY",
-    "base_url": null
+    "base_url": null,
+    "model": null,       // default text-embedding-3-small (1536 dims)
+    "dimensions": null   // pin the output size when the model's native size differs
   },
+  // ...or in-process, no API key, any GGUF model over llama.cpp. Needs a
+  // build with `--features embed-llama` (add embed-llama-metal / -cuda to
+  // offload); CPU otherwise. Changing provider or model changes the vector
+  // DIMENSION, which invalidates a populated index — re-embed stored
+  // episodes after switching, or their recall silently degrades to BM25.
+  // "embedding": {
+  //   "provider": "llamacpp",
+  //   "model_path": "/path/to/embeddinggemma-300M-Q8_0.gguf"
+  // },
 
   // Voice
   "voice": {
