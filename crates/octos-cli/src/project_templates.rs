@@ -893,6 +893,33 @@ fn write_site_support_files(
     Ok(())
 }
 
+/// Resolve a real `bash` interpreter for the site-bootstrap scripts.
+///
+/// The scripts are bash (they use `[[ ]]` and `set -euo pipefail`), so `sh`
+/// — dash on many Linux images — is not a safe substitute. On Windows a bare
+/// `bash` resolves to `C:\Windows\System32\bash.exe`, the WSL launcher, which
+/// exits 1 with "Windows Subsystem for Linux has no installed distributions"
+/// on machines without a WSL distro (windows-latest CI included). Prefer a real
+/// Git Bash from the standard install roots; fall back to `bash` on PATH (which
+/// is correct on Unix and on Windows boxes where a non-stub bash leads).
+fn bootstrap_bash() -> std::path::PathBuf {
+    #[cfg(windows)]
+    {
+        use std::path::PathBuf;
+        for var in ["ProgramFiles", "ProgramW6432", "ProgramFiles(x86)"] {
+            if let Ok(root) = std::env::var(var) {
+                for sub in ["Git\\bin\\bash.exe", "Git\\usr\\bin\\bash.exe"] {
+                    let candidate = PathBuf::from(&root).join(sub);
+                    if candidate.exists() {
+                        return candidate;
+                    }
+                }
+            }
+        }
+    }
+    std::path::PathBuf::from("bash")
+}
+
 fn run_site_bootstrap(
     skill_dir: &Path,
     project_dir: &Path,
@@ -902,19 +929,20 @@ fn run_site_bootstrap(
     std::fs::create_dir_all(project_dir)
         .map_err(|e| format!("create site project dir failed: {e}"))?;
 
-    // Windows CI runs these bootstrap scripts through Git Bash (MSYS2),
-    // whose coreutils treat `\` as a literal character rather than a path
-    // separator. A backslash-spelled `--out-dir "C:\...\out"` makes the
-    // script's `mkdir -p` fail ("Invalid argument"), and `set -euo pipefail`
-    // then aborts with exit code 1 — the failure surfaced on windows-latest.
-    // Forward-slash spellings are understood by every bash flavour (MSYS2,
-    // Cygwin, real Unix), so hand the script forward-slash paths. `replace`
-    // is a lexical no-op on Unix, where paths carry no backslashes.
+    // On Windows a bare `bash` resolves to the System32 WSL launcher, which
+    // fails on runners without a WSL distro; resolve a real Git Bash instead.
+    let bash = bootstrap_bash();
+
+    // A real Git Bash on Windows is MSYS2, whose coreutils treat `\` as an
+    // escape rather than a path separator, so a backslash-spelled `C:\...\out`
+    // would break the script's `mkdir -p`. Hand it forward-slash paths, which
+    // MSYS2, Cygwin and real Unix all accept. `replace` is a lexical no-op on
+    // Unix, where paths carry no backslashes.
     let to_bash = |p: PathBuf| p.to_string_lossy().replace('\\', "/");
     let out_dir_arg = to_bash(project_dir.to_path_buf());
 
     let output = if metadata.template == "quarto-lesson" {
-        Command::new("bash")
+        Command::new(&bash)
             .arg(to_bash(scripts_dir.join("bootstrap_quarto_lesson.sh")))
             .arg("--out-dir")
             .arg(&out_dir_arg)
@@ -925,7 +953,7 @@ fn run_site_bootstrap(
             .output()
             .map_err(|e| format!("spawn Quarto bootstrap failed: {e}"))?
     } else {
-        Command::new("bash")
+        Command::new(&bash)
             .arg(to_bash(scripts_dir.join("bootstrap_template.sh")))
             .arg("--template")
             .arg(&metadata.template)
