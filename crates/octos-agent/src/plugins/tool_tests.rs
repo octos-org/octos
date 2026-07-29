@@ -1378,8 +1378,8 @@ async fn execute_spawns_subprocess_and_captures_output() {
     );
 
     let def = make_tool_def("echo_tool", "echoes input");
-    let tool = PluginTool::new("test-plugin".into(), def, script_path)
-        .with_timeout(TEST_PLUGIN_TIMEOUT);
+    let tool =
+        PluginTool::new("test-plugin".into(), def, script_path).with_timeout(TEST_PLUGIN_TIMEOUT);
 
     let args = json!({"msg": "hello"});
     let result = tool.execute(&args).await.expect("execute should succeed");
@@ -1410,8 +1410,8 @@ async fn execute_structured_progress_event_updates_task_supervisor() {
     );
 
     let def = make_tool_def("structured_tool", "writes harness events");
-    let tool = PluginTool::new("test-plugin".into(), def, script_path)
-        .with_timeout(TEST_PLUGIN_TIMEOUT);
+    let tool =
+        PluginTool::new("test-plugin".into(), def, script_path).with_timeout(TEST_PLUGIN_TIMEOUT);
 
     let sink = crate::harness_events::HarnessEventSink::new(
         supervisor.clone(),
@@ -2986,8 +2986,7 @@ async fn plugin_uses_scope_workspace_when_present() {
     let def = make_tool_def("scope_cwd", "echo CWD");
     // Crucially: NO `.with_work_dir(...)`. The scope is the only
     // source of truth.
-    let tool =
-        PluginTool::new("plug".into(), def, script_path).with_timeout(TEST_PLUGIN_TIMEOUT);
+    let tool = PluginTool::new("plug".into(), def, script_path).with_timeout(TEST_PLUGIN_TIMEOUT);
 
     let ctx = ctx_with_scope(scope);
     let result = crate::tools::TOOL_CTX
