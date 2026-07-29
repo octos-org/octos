@@ -913,7 +913,7 @@ fn run_site_bootstrap(
     let to_bash = |p: PathBuf| p.to_string_lossy().replace('\\', "/");
     let out_dir_arg = to_bash(project_dir.to_path_buf());
 
-    let status = if metadata.template == "quarto-lesson" {
+    let output = if metadata.template == "quarto-lesson" {
         Command::new("bash")
             .arg(to_bash(scripts_dir.join("bootstrap_quarto_lesson.sh")))
             .arg("--out-dir")
@@ -922,7 +922,7 @@ fn run_site_bootstrap(
             .arg(&metadata.site_name)
             .arg("--description")
             .arg(&metadata.description)
-            .status()
+            .output()
             .map_err(|e| format!("spawn Quarto bootstrap failed: {e}"))?
     } else {
         Command::new("bash")
@@ -941,14 +941,23 @@ fn run_site_bootstrap(
             .arg("en")
             .arg("--base-path")
             .arg(site_bootstrap_base_path(metadata))
-            .status()
+            .output()
             .map_err(|e| format!("spawn site bootstrap failed: {e}"))?
     };
 
-    if !status.success() {
+    if !output.status.success() {
+        // Surface the script's own stdout/stderr. A bare "exit code: 1" is
+        // undebuggable — especially on windows-latest, where these scripts
+        // run under Git Bash (MSYS2) and can fail for path/tooling reasons
+        // the caller never sees. Echo the resolved out-dir too, so path
+        // normalisation problems are visible at the failure site.
         return Err(format!(
-            "site bootstrap failed for {} with status {}",
-            metadata.template, status
+            "site bootstrap failed for {} with status {} \
+             (out-dir={out_dir_arg:?}) stdout={:?} stderr={:?}",
+            metadata.template,
+            output.status,
+            String::from_utf8_lossy(&output.stdout).trim(),
+            String::from_utf8_lossy(&output.stderr).trim(),
         ));
     }
 
