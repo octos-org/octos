@@ -489,8 +489,15 @@ async fn test_background_spawn_tracks_supervisor_lifecycle() {
                 break;
             }
         }
+        // A loaded windows-latest runner can push a background spawn past a
+        // tight completion budget (this guard flaked at 5s while passing on
+        // prior runs). 15s is generous headroom — the loop still breaks the
+        // instant the task completes — and matches the 15s guard already used
+        // elsewhere in this file. This is an anti-hang ceiling, not a latency
+        // assertion; the real checks (artifact produced, in-workspace, phase
+        // ledger) are unchanged.
         assert!(
-            started.elapsed() < std::time::Duration::from_secs(5),
+            started.elapsed() < std::time::Duration::from_secs(15),
             "background spawn task did not complete in time"
         );
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -639,8 +646,15 @@ async fn test_background_spawn_uses_contract_selected_slides_artifact_for_persis
                 break;
             }
         }
+        // A loaded windows-latest runner can push a background spawn past a
+        // tight completion budget (this guard flaked at 5s while passing on
+        // prior runs). 15s is generous headroom — the loop still breaks the
+        // instant the task completes — and matches the 15s guard already used
+        // elsewhere in this file. This is an anti-hang ceiling, not a latency
+        // assertion; the real checks (artifact produced, in-workspace, phase
+        // ledger) are unchanged.
         assert!(
-            started.elapsed() < std::time::Duration::from_secs(5),
+            started.elapsed() < std::time::Duration::from_secs(15),
             "background spawn task did not complete in time"
         );
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -1699,8 +1713,15 @@ async fn test_background_spawn_persists_workflow_phase_transitions() {
                 break;
             }
         }
+        // A loaded windows-latest runner can push a background spawn past a
+        // tight completion budget (this guard flaked at 5s while passing on
+        // prior runs). 15s is generous headroom — the loop still breaks the
+        // instant the task completes — and matches the 15s guard already used
+        // elsewhere in this file. This is an anti-hang ceiling, not a latency
+        // assertion; the real checks (artifact produced, in-workspace, phase
+        // ledger) are unchanged.
         assert!(
-            started.elapsed() < std::time::Duration::from_secs(5),
+            started.elapsed() < std::time::Duration::from_secs(15),
             "background spawn task did not complete in time"
         );
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
