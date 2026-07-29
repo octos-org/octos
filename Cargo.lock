@@ -4632,6 +4632,7 @@ dependencies = [
  "octos-core",
  "octos-diagnostics",
  "octos-embed-llama",
+ "octos-fleet",
  "octos-llm",
  "octos-memory",
  "octos-pipeline",

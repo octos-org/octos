@@ -148,7 +148,11 @@ pub struct FleetSnapshot {
 
 /// Redb-backed fleet kernel store. Cheaply cloneable (`Arc` internals);
 /// the `io_gate` serialises all DB access for cancellation-safety.
-#[derive(Clone)]
+///
+/// `Debug` is derived so the store can be embedded in `Debug`-deriving
+/// runtime-state structs (e.g. the server's `AutonomyRuntimeState`); redb's
+/// `Database` prints an opaque summary, exposing no row contents.
+#[derive(Clone, Debug)]
 pub struct FleetKernelStore {
     db: Arc<Database>,
     path: Arc<PathBuf>,

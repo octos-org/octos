@@ -109,6 +109,7 @@ rand = { workspace = true, optional = true }
 teloxide = { workspace = true, optional = true }
 sysinfo = { version = "0.34", optional = true }
 redb.workspace = true
+octos-fleet.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 # O_NOFOLLOW for the symlink-safe preview file serve in

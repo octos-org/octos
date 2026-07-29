@@ -2659,6 +2659,44 @@ fn session_actor_continuation_prompt_matches_canonical_renderer() {
         .ok();
 }
 
+/// #1857 PR 4a — the SessionActor continuation renderer (a delegator to
+/// `agent_orchestrator::master_continuation_prompt`) must route a fleet-keeper
+/// wake to the fleet-keeper arm, not the generic external fallback. This is the
+/// gateway-path half of the "both renderers" guard (its orchestrator-path twin
+/// lives in `api::fleet_wake`); it also proves the objective is XML-escaped
+/// across the delegation.
+#[cfg(feature = "api")]
+#[test]
+fn session_actor_renders_fleet_keeper_prompt() {
+    use crate::api::fleet_wake::{FleetKeeperSnapshot, fleet_keeper_continuation_request};
+    use crate::api::master_continuation_scheduler::MasterContinuationScheduler;
+
+    let snap = FleetKeeperSnapshot {
+        objective: "keeper via <gateway>".to_owned(),
+        task_lines: "- t1: Task t1 [Ready]".to_owned(),
+        ready: "t1".to_owned(),
+    };
+    let controller = SessionKey::new("api", "keeper-actor");
+    let req = fleet_keeper_continuation_request(&controller, "tenant-c", "fleet-actor", 7, &snap);
+    let mut scheduler = MasterContinuationScheduler::new();
+    let item = scheduler.enqueue(req).queued().expect("queued").clone();
+
+    // Render via the SessionActor path (the function under test).
+    let prompt = master_continuation_prompt(&item);
+    assert!(
+        prompt.starts_with("[system-internal]"),
+        "fleet-keeper prompt: {prompt}"
+    );
+    assert!(
+        prompt.contains("keeper via &lt;gateway&gt;"),
+        "objective must be XML-escaped across the delegation: {prompt}"
+    );
+    assert!(
+        !prompt.contains("An external master continuation was requested"),
+        "must not fall through to the generic external fallback: {prompt}"
+    );
+}
+
 #[tokio::test]
 #[cfg(unix)]
 async fn test_session_actor_emits_resume_and_turn_end_hooks() {
