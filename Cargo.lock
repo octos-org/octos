@@ -4633,6 +4633,8 @@ dependencies = [
  "octos-core",
  "octos-diagnostics",
  "octos-embed-llama",
+ "octos-fleet",
+ "octos-fleet-worker",
  "octos-llm",
  "octos-memory",
  "octos-pipeline",
@@ -4753,6 +4755,23 @@ dependencies = [
  "tempfile",
  "tokio",
  "uuid",
+]
+
+[[package]]
+name = "octos-fleet-worker"
+version = "2.0.2"
+dependencies = [
+ "async-trait",
+ "eyre",
+ "octos-agent",
+ "octos-core",
+ "octos-fleet",
+ "octos-llm",
+ "octos-memory",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

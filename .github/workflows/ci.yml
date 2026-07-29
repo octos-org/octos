@@ -502,11 +502,31 @@ jobs:
         run: cargo test --workspace --doc
 
   check-riscv:
-    # Push-only for the same reason as check-arm, plus a live problem: this job
-    # has not COMPLETED in recent history — it runs to the 24 h ceiling and is
-    # cancelled (see runs 30087155881, 30025529065). Until that is diagnosed it
-    # must not gate anything; putting it on PRs would wedge every PR for a day.
-    if: github.event_name != 'pull_request'
+    # MANUAL ONLY — this job is the reason `main` has had no CI signal for weeks.
+    #
+    # There is no runner for the `ubuntu-24.04-riscv` label. Every dispatch sits
+    # in `queued` with `runner_id: 0`, `runner_name: ""` and `steps: []` until
+    # GitHub's fixed 24 h *queue* ceiling kills it. Job 89914973597 in run
+    # 30244166464: 2026-07-27T07:33:57Z → 2026-07-28T07:33:58Z, zero steps, no
+    # runner ever assigned. All 22 such jobs in the last 50 `main` runs died at
+    # exactly 24:00:00–01. Not one has ever executed a step.
+    #
+    # Note this is a QUEUE limit, so `timeout-minutes` does NOT bound it —
+    # that only starts counting once a runner picks the job up.
+    #
+    # While queued it holds the whole run in-progress, and `cancel-in-progress`
+    # is false for `push` and `schedule`, so that one run owns the
+    # `ci-CI-refs/heads/main` concurrency slot for a full day. Every push behind
+    # it is cancelled while still pending — 22 of the last 50 `main` runs were
+    # cancelled having dispatched zero jobs.
+    #
+    # `schedule` is deliberately excluded too: the nightly cron runs on `main`
+    # and lands in the SAME concurrency group, so a schedule-only riscv job
+    # would re-wedge the slot for 24 h once a day.
+    #
+    # Restore `github.event_name != 'pull_request'` once a riscv64 runner is
+    # actually registered for this repo.
+    if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-24.04-riscv
     env:
       CARGO_BUILD_JOBS: "2"

@@ -50,6 +50,20 @@ pub struct ShellTool {
     /// Task-ledger path recorded as lineage on registered background tasks so
     /// they can be restored across a restart, mirroring the spawn tool.
     task_ledger_path: Option<PathBuf>,
+    /// When `false`, a background/detached command — an explicit
+    /// `background: true` arg OR a trailing `&` — is refused outright instead
+    /// of being spawned detached. A detached child outlives the agent turn and
+    /// dodges any per-attempt deadline, so a closed, non-interactive worker
+    /// (e.g. the fleet task-worker) sets this `false` to stay replay-safe.
+    /// Defaults to `true` — unchanged behaviour for every existing caller.
+    background_allowed: bool,
+    /// Optional hard CEILING on a single command's effective timeout. When set,
+    /// the per-command timeout is `min(requested-or-default, max_timeout)` — an
+    /// upper bound that overrides a LARGER LLM-provided `timeout_secs`, so a
+    /// closed worker can guarantee no foreground command outlives its attempt
+    /// deadline. `None` = no extra cap (only the outer `[1, 600]s` clamp
+    /// applies) — unchanged behaviour for every existing caller.
+    max_timeout: Option<Duration>,
 }
 
 impl ShellTool {
@@ -64,7 +78,34 @@ impl ShellTool {
             task_supervisor: None,
             session_key: None,
             task_ledger_path: None,
+            background_allowed: true,
+            max_timeout: None,
         }
+    }
+
+    /// Cap the effective per-command timeout at `cap_secs` (a hard CEILING).
+    ///
+    /// The effective timeout becomes `min(requested-or-default, cap_secs)`, so
+    /// this overrides a LARGER LLM-provided `timeout_secs` (which the agent
+    /// loop can otherwise raise up to the outer 600s clamp). A closed worker
+    /// sets this to its attempt deadline so — together with
+    /// `with_background_allowed(false)` — no single foreground command can
+    /// outlive the deadline. `cap_secs` is floored to 1. Default: no extra cap.
+    pub fn with_max_timeout_secs(mut self, cap_secs: u64) -> Self {
+        self.max_timeout = Some(Duration::from_secs(cap_secs.max(1)));
+        self
+    }
+
+    /// Allow or forbid background/detached execution (default: allowed).
+    ///
+    /// With `allowed = false`, any background request — an explicit
+    /// `background: true` arg or a trailing `&` — is refused with a failed
+    /// [`ToolResult`] rather than spawned detached. A closed worker that must
+    /// not outlive its per-attempt deadline (the fleet task-worker) sets this
+    /// so a `sh -c "cmd &"` cannot orphan work past the attempt.
+    pub fn with_background_allowed(mut self, allowed: bool) -> Self {
+        self.background_allowed = allowed;
+        self
     }
 
     /// Set the timeout for commands.
@@ -730,6 +771,29 @@ impl Tool for ShellTool {
             Decision::Allow => {}
         }
 
+        // A closed worker (`background_allowed == false`) refuses the two
+        // string-detectable ways to detach: the explicit `background: true`
+        // arg and a trailing `&` (checked before the background branch below,
+        // so neither falls through to a foreground run that self-detaches).
+        // This is best-effort defense-in-depth, NOT a boundary: arbitrary
+        // shell-internal backgrounding (`sleep 600 & true`, `sh -c "cmd &"`)
+        // cannot be caught by string inspection — the SANDBOX's process-group
+        // teardown is what actually bounds a detached child.
+        if is_background_command(&input.command, input.background) && !self.background_allowed {
+            tracing::warn!(
+                command = %input.command,
+                "background/detached shell execution is disabled for this worker",
+            );
+            return Ok(ToolResult {
+                output: format!(
+                    "background/detached execution is disabled for this worker: {}",
+                    input.command
+                ),
+                success: false,
+                ..Default::default()
+            });
+        }
+
         // Background execution: a trailing `&` or an explicit `background: true`
         // arg asks the command to run detached. Register it as a tracked
         // supervisor task (so it surfaces in `/ps` and the sub-agent dock),
@@ -744,10 +808,17 @@ impl Tool for ShellTool {
         // Clamp timeout to [1, 600] seconds to prevent abuse
         const MIN_TIMEOUT: u64 = 1;
         const MAX_TIMEOUT: u64 = 600;
-        let timeout_duration = input
+        let mut timeout_duration = input
             .timeout_secs
             .map(|s| Duration::from_secs(s.clamp(MIN_TIMEOUT, MAX_TIMEOUT)))
             .unwrap_or(self.timeout);
+        // Apply the hard per-command ceiling (if configured): the effective
+        // timeout can only be LOWERED by it, never raised. This is what keeps a
+        // closed worker's foreground command bounded by its attempt deadline
+        // even when the LLM requests a larger `timeout_secs`.
+        if let Some(cap) = self.max_timeout {
+            timeout_duration = timeout_duration.min(cap);
+        }
 
         // Execute command (through sandbox).
         // Spawn the child, grab its PID, then timeout on wait_with_output().
@@ -887,6 +958,13 @@ impl Tool for ShellTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Runaway guard for the "poll until the background task reaches state X"
+    /// loops below. NOT a latency assertion: each loop breaks the instant the
+    /// supervisor reports a terminal status, so a generous ceiling costs a passing
+    /// run nothing, and a genuinely broken run still fails — just later.
+    /// Mirrors `spawn_tests::BACKGROUND_DEADLINE`.
+    const BACKGROUND_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
 
     #[test]
     fn shell_tool_is_exclusive() {
@@ -1411,7 +1489,7 @@ mod tests {
                     panic!("background task failed: {:?}", t.error);
                 }
             }
-            if started.elapsed() > std::time::Duration::from_secs(15) {
+            if started.elapsed() > BACKGROUND_DEADLINE {
                 let statuses: Vec<_> = supervisor
                     .get_tasks_for_session("api:test-session")
                     .iter()
@@ -1457,6 +1535,74 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn background_disabled_refuses_explicit_and_trailing_ampersand() {
+        // A worker that forbids background execution must refuse BOTH an
+        // explicit `background: true` arg and a trailing `&`, returning a
+        // failed result WITHOUT spawning a detached child (a `sh -c "cmd &"`
+        // must not fall through to a foreground run that self-detaches).
+        let tool = ShellTool::new(std::env::temp_dir()).with_background_allowed(false);
+
+        let explicit = tool
+            .execute(&serde_json::json!({"command": "sleep 30", "background": true}))
+            .await
+            .unwrap();
+        assert!(!explicit.success, "explicit background must be refused");
+        assert!(
+            explicit.output.contains("disabled"),
+            "unexpected output: {}",
+            explicit.output
+        );
+
+        let ampersand = tool
+            .execute(&serde_json::json!({"command": "sleep 30 &"}))
+            .await
+            .unwrap();
+        assert!(!ampersand.success, "trailing-& background must be refused");
+        assert!(
+            ampersand.output.contains("disabled"),
+            "unexpected output: {}",
+            ampersand.output
+        );
+
+        // The default (background allowed) is unchanged: a foreground command
+        // still runs to completion.
+        let allowed = ShellTool::new(std::env::temp_dir());
+        let fg = allowed
+            .execute(&serde_json::json!({"command": "echo ok"}))
+            .await
+            .unwrap();
+        assert!(
+            fg.success,
+            "foreground command must still run: {}",
+            fg.output
+        );
+    }
+
+    #[tokio::test]
+    async fn max_timeout_secs_caps_a_larger_requested_timeout() {
+        // A hard 1s ceiling must override a larger requested `timeout_secs`:
+        // `sleep 30` with `timeout_secs: 30` under `with_max_timeout_secs(1)`
+        // is killed at ~1s, so a closed worker's foreground command cannot
+        // outlive its deadline even when the LLM asks for a big timeout.
+        let tool = ShellTool::new(std::env::temp_dir()).with_max_timeout_secs(1);
+        let started = std::time::Instant::now();
+        let result = tool
+            .execute(&serde_json::json!({"command": "sleep 30", "timeout_secs": 30}))
+            .await
+            .unwrap();
+        assert!(!result.success, "a capped, timed-out command must fail");
+        assert!(
+            result.output.contains("timed out after 1 seconds"),
+            "expected a 1s timeout (cap applied), got: {}",
+            result.output
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "the 1s cap must bound the wait well under the requested 30s",
+        );
+    }
+
+    #[tokio::test]
     async fn background_command_failure_flips_task_failed() {
         use crate::task_supervisor::{TaskStatus, TaskSupervisor};
 
@@ -1494,7 +1640,7 @@ mod tests {
                     panic!("expected failure, task completed");
                 }
             }
-            if started.elapsed() > std::time::Duration::from_secs(15) {
+            if started.elapsed() > BACKGROUND_DEADLINE {
                 panic!("background failure not observed in 15s");
             }
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;

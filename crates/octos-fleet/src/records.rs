@@ -119,6 +119,27 @@ pub struct FleetRecord {
     pub fleet_id: String,
     /// Server-resolved; how a `FleetEvent` finds the keeper (later PRs).
     pub controller_session_key: SessionKey,
+    /// The controller session's workspace root at fleet-create time. Persisted
+    /// so a HEADLESS keeper (no live client) can be rehydrated across a serve
+    /// restart: the outbox consumer carries it in the keeper-wake metadata and
+    /// the global master-continuation drain re-seeds `session_workspaces()`
+    /// from it before the workspace-known gate (PR 4b). `None` for a keeper
+    /// whose workspace was never persisted (simply not headlessly
+    /// rehydratable). `#[serde(default)]` is deliberate forward-compat, **NOT**
+    /// a `SCHEMA_VERSION` bump: an older row missing the field deserializes to
+    /// `None`, while a bump would make an older binary DROP the row (`decode_row`
+    /// drops only `schema_version > SCHEMA_VERSION`). Mirrors the crate's
+    /// existing discipline (`Attempt.fleet_id`, `OutboxEvent.payload`).
+    ///
+    /// Rolling-downgrade caveat: the field survives an older binary that only
+    /// READS a row, but an older binary that REWRITES the record (it does not
+    /// know this field) re-serializes it WITHOUT the root, erasing it — the
+    /// keeper then loses headless rehydration. This is acceptable for v1: a
+    /// single serve process is active at a time, so a live downgrade that
+    /// rewrites records mid-flight is not an operational path. PR 5 must set a
+    /// server-resolved root at fleet-create for this to carry a value at all.
+    #[serde(default)]
+    pub controller_workspace_root: Option<String>,
     pub profile_id: String,
     pub budget: FleetBudget,
     pub status: FleetStatus,
@@ -426,5 +447,49 @@ mod tests {
         assert!(ChildStatus::Cancelled.is_terminal());
         assert!(!ChildStatus::Ready.is_terminal());
         assert!(!ChildStatus::Running.is_terminal());
+    }
+
+    #[test]
+    fn fleet_record_without_workspace_root_deserializes_to_none() {
+        // PR 4b schema back-compat: an OLD row written before
+        // `controller_workspace_root` existed (no such key) must still decode —
+        // `#[serde(default)]` fills `None` rather than erroring. This is why the
+        // field is NOT a `SCHEMA_VERSION` bump: `decode_row` keeps the row
+        // (version unchanged at 2) and serde defaults the missing field.
+        let old_json = r#"{
+            "schema_version": 2,
+            "fleet_id": "f1",
+            "controller_session_key": "api:keeper-1",
+            "profile_id": "default",
+            "budget": {
+                "token_budget": 1000,
+                "tokens_reserved": 0,
+                "tokens_committed": 0,
+                "hard": false
+            },
+            "status": "Active",
+            "generation": 0,
+            "created_at_ms": 5,
+            "updated_at_ms": 5
+        }"#;
+        let rec: FleetRecord = decode_row(old_json)
+            .expect("decode old row")
+            .expect("row kept, not dropped");
+        assert_eq!(
+            rec.controller_workspace_root, None,
+            "a missing field defaults to None"
+        );
+
+        // And a NEW row with the field round-trips it verbatim.
+        let with_root = FleetRecord {
+            controller_workspace_root: Some("/repos/app".to_owned()),
+            ..rec
+        };
+        let json = serde_json::to_string(&with_root).unwrap();
+        let back: FleetRecord = decode_row(&json).unwrap().unwrap();
+        assert_eq!(
+            back.controller_workspace_root,
+            Some("/repos/app".to_owned())
+        );
     }
 }

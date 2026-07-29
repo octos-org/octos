@@ -74,6 +74,19 @@ pub enum CompleteOutcome {
     Superseded,
 }
 
+/// Result of a `mark_running` CAS. `Superseded` means the identity/predicate
+/// fence failed — a genuine lost race (the attempt is stale/superseded or not
+/// the child's current attempt), so nothing changes; deliberately **not** an
+/// error, exactly like [`CompleteOutcome::Superseded`]. `Err` is reserved for a
+/// real infra failure (redb read/commit/join or a corrupt-row parse), which
+/// leaves it ambiguous whether the still-`Launching` attempt is ours — the
+/// caller must NOT treat that as "not ours".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MarkRunningOutcome {
+    Running,
+    Superseded,
+}
+
 /// Result of a revision-fenced plan operation (`replan` / `retitle_task`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PlanMutateOutcome {
@@ -135,7 +148,11 @@ pub struct FleetSnapshot {
 
 /// Redb-backed fleet kernel store. Cheaply cloneable (`Arc` internals);
 /// the `io_gate` serialises all DB access for cancellation-safety.
-#[derive(Clone)]
+///
+/// `Debug` is derived so the store can be embedded in `Debug`-deriving
+/// runtime-state structs (e.g. the server's `AutonomyRuntimeState`); redb's
+/// `Database` prints an opaque summary, exposing no row contents.
+#[derive(Clone, Debug)]
 pub struct FleetKernelStore {
     db: Arc<Database>,
     path: Arc<PathBuf>,
@@ -184,10 +201,12 @@ impl FleetKernelStore {
 
     /// Create a fresh fleet (generation 0, `Active`, soft/hard budget).
     /// Rejects a duplicate `fleet_id` rather than clobbering live state.
+    #[allow(clippy::too_many_arguments)] // fleet identity + controller + budget columns are irreducible here
     pub async fn create_fleet(
         &self,
         fleet_id: &str,
         controller_session_key: SessionKey,
+        controller_workspace_root: Option<String>,
         profile_id: &str,
         token_budget: u64,
         hard: bool,
@@ -210,6 +229,7 @@ impl FleetKernelStore {
                     schema_version: SCHEMA_VERSION,
                     fleet_id: fleet_id.clone(),
                     controller_session_key,
+                    controller_workspace_root,
                     profile_id,
                     budget: FleetBudget {
                         token_budget,
@@ -279,9 +299,11 @@ impl FleetKernelStore {
     /// graph (unique ids, no dangling / self / cyclic deps) **before**
     /// calling this; the store only enforces key-safety and duplicate
     /// rejection.
+    #[allow(clippy::too_many_arguments)] // fleet identity + controller + budget + plan inputs are irreducible here
     pub async fn create_fleet_with_plan(
         &self,
         controller_session_key: SessionKey,
+        controller_workspace_root: Option<String>,
         profile_id: &str,
         token_budget: u64,
         hard: bool,
@@ -320,6 +342,7 @@ impl FleetKernelStore {
                     schema_version: SCHEMA_VERSION,
                     fleet_id: fleet_id.clone(),
                     controller_session_key,
+                    controller_workspace_root,
                     profile_id,
                     budget: FleetBudget {
                         token_budget,
@@ -745,42 +768,56 @@ impl FleetKernelStore {
     /// fleet.generation` — **before writing either row**, so any mismatch
     /// (including a pre-replan attempt whose generation is now stale) is
     /// rejected with zero mutation.
-    pub async fn mark_running(&self, child_id: &str, attempt_id: &str) -> Result<()> {
+    ///
+    /// Returns the typed [`MarkRunningOutcome`] (mirrors [`CompleteOutcome`]):
+    /// an identity/existence/predicate miss (a genuine lost race — the attempt
+    /// is superseded or not the child's current one) is
+    /// [`MarkRunningOutcome::Superseded`], **not** an `Err`. `Err` is reserved
+    /// for a real infra failure (redb read/commit/join, or a corrupt-row parse
+    /// surfaced by `?`) — which leaves the still-`Launching` attempt possibly
+    /// ours, so the caller must not disarm its cleanup on that path.
+    pub async fn mark_running(
+        &self,
+        child_id: &str,
+        attempt_id: &str,
+    ) -> Result<MarkRunningOutcome> {
         ensure_key_safe(&[child_id, attempt_id])?;
         let db = self.db.clone();
         let child_id = child_id.to_string();
         let attempt_id = attempt_id.to_string();
         let held = self.io_gate.clone().lock_owned().await;
-        tokio::task::spawn_blocking(move || -> Result<()> {
+        tokio::task::spawn_blocking(move || -> Result<MarkRunningOutcome> {
             let _held = held;
             let wtx = db.begin_write()?;
-            {
+            let outcome = {
                 let mut attempts = wtx.open_table(ATTEMPTS)?;
                 let mut children = wtx.open_table(FLEET_CHILDREN)?;
                 let fleets = wtx.open_table(FLEETS)?;
 
-                // Read the attempt (owned).
+                // Read the attempt (owned). A missing row / newer-schema row /
+                // identity mismatch is a superseded-or-foreign attempt, never an
+                // infra error — mirror `complete_child` (only `?` yields `Err`).
                 let akey = attempt_key(&child_id, &attempt_id);
                 let Some(aj) = attempts.get(akey.as_str())?.map(|g| g.value().to_string()) else {
-                    bail!("mark_running: unknown attempt {attempt_id} for child {child_id}");
+                    return Ok(MarkRunningOutcome::Superseded);
                 };
                 let Some(mut attempt) = decode_row::<Attempt>(&aj)? else {
-                    bail!("mark_running: attempt {attempt_id} is a newer schema");
+                    return Ok(MarkRunningOutcome::Superseded);
                 };
                 if attempt.child_id != child_id || attempt.attempt_id != attempt_id {
-                    bail!("mark_running: attempt/child identity mismatch");
+                    return Ok(MarkRunningOutcome::Superseded);
                 }
 
                 // Read the child derived from the attempt's fleet (P1-4).
                 let ckey = child_key(&attempt.fleet_id, &child_id);
                 let Some(cj) = children.get(ckey.as_str())?.map(|g| g.value().to_string()) else {
-                    bail!("mark_running: child {child_id} not found for attempt {attempt_id}");
+                    return Ok(MarkRunningOutcome::Superseded);
                 };
                 let Some(mut child) = decode_row::<FleetChildRecord>(&cj)? else {
-                    bail!("mark_running: child {child_id} is a newer schema");
+                    return Ok(MarkRunningOutcome::Superseded);
                 };
                 if child.fleet_id != attempt.fleet_id || child.child_id != child_id {
-                    bail!("mark_running: child identity mismatch");
+                    return Ok(MarkRunningOutcome::Superseded);
                 }
 
                 // Read the fleet for the generation fence.
@@ -788,37 +825,23 @@ impl FleetKernelStore {
                     .get(attempt.fleet_id.as_str())?
                     .map(|g| g.value().to_string())
                 else {
-                    bail!("mark_running: fleet {} not found", attempt.fleet_id);
+                    return Ok(MarkRunningOutcome::Superseded);
                 };
                 let Some(fleet) = decode_row::<FleetRecord>(&fj)? else {
-                    bail!("mark_running: fleet {} is a newer schema", attempt.fleet_id);
+                    return Ok(MarkRunningOutcome::Superseded);
                 };
                 if fleet.fleet_id != attempt.fleet_id {
-                    bail!("mark_running: fleet identity mismatch");
+                    return Ok(MarkRunningOutcome::Superseded);
                 }
 
-                // Validate EVERYTHING before writing either row (P2-6).
-                if child.current_attempt_id.as_deref() != Some(attempt_id.as_str()) {
-                    bail!("mark_running: {attempt_id} is not the child's current attempt");
-                }
-                if child.status != ChildStatus::Launching {
-                    bail!(
-                        "mark_running: child {child_id} is {:?}, not Launching",
-                        child.status
-                    );
-                }
-                if attempt.status != AttemptStatus::Leased {
-                    bail!(
-                        "mark_running: attempt {attempt_id} is {:?}, not Leased",
-                        attempt.status
-                    );
-                }
-                if attempt.generation != fleet.generation {
-                    bail!(
-                        "mark_running: attempt {attempt_id} generation {} != fleet {}",
-                        attempt.generation,
-                        fleet.generation
-                    );
+                // Validate EVERYTHING before writing either row (P2-6). Each is
+                // a CAS-predicate fence — a miss is a lost race (`Superseded`).
+                if child.current_attempt_id.as_deref() != Some(attempt_id.as_str())
+                    || child.status != ChildStatus::Launching
+                    || attempt.status != AttemptStatus::Leased
+                    || attempt.generation != fleet.generation
+                {
+                    return Ok(MarkRunningOutcome::Superseded);
                 }
 
                 // All checks passed — write both rows.
@@ -826,9 +849,15 @@ impl FleetKernelStore {
                 attempts.insert(akey.as_str(), serde_json::to_string(&attempt)?.as_str())?;
                 child.status = ChildStatus::Running;
                 children.insert(ckey.as_str(), serde_json::to_string(&child)?.as_str())?;
+
+                MarkRunningOutcome::Running
+            };
+            // Only a real state change commits; a `Superseded` returned above
+            // never reaches here (it exits the closure, dropping `wtx` unwritten).
+            if matches!(outcome, MarkRunningOutcome::Running) {
+                wtx.commit()?;
             }
-            wtx.commit()?;
-            Ok(())
+            Ok(outcome)
         })
         .await
         .wrap_err("join mark_running")?
@@ -1982,7 +2011,7 @@ mod tests {
     /// A fleet with one dep-free (immediately `Ready`) child.
     async fn fleet_with_ready_child(store: &FleetKernelStore, budget: u64) {
         store
-            .create_fleet("f1", controller(), "default", budget, false, 0)
+            .create_fleet("f1", controller(), None, "default", budget, false, 0)
             .await
             .unwrap();
         store.add_child("f1", "c1", vec![], 0).await.unwrap();
@@ -2055,7 +2084,7 @@ mod tests {
         {
             let store = FleetKernelStore::open(dir.path()).await.unwrap();
             store
-                .create_fleet("f1", controller(), "default", 500, false, 1)
+                .create_fleet("f1", controller(), None, "default", 500, false, 1)
                 .await
                 .unwrap();
             assert!(store.path().ends_with("fleet-kernel.redb"));
@@ -2071,12 +2100,12 @@ mod tests {
     async fn create_fleet_rejects_duplicate() {
         let (_d, store) = fresh().await;
         store
-            .create_fleet("f1", controller(), "default", 100, false, 0)
+            .create_fleet("f1", controller(), None, "default", 100, false, 0)
             .await
             .unwrap();
         assert!(
             store
-                .create_fleet("f1", controller(), "default", 100, false, 0)
+                .create_fleet("f1", controller(), None, "default", 100, false, 0)
                 .await
                 .is_err()
         );
@@ -2086,7 +2115,7 @@ mod tests {
     async fn create_plan_is_insert_only() {
         let (_d, store) = fresh().await;
         store
-            .create_fleet("f1", controller(), "default", 100, false, 0)
+            .create_fleet("f1", controller(), None, "default", 100, false, 0)
             .await
             .unwrap();
         store.create_plan(plan("f1", 0, vec![])).await.unwrap();
@@ -2174,7 +2203,7 @@ mod tests {
     async fn launch_rejected_when_child_not_ready() {
         let (_d, store) = fresh().await;
         store
-            .create_fleet("f1", controller(), "default", 1_000, false, 0)
+            .create_fleet("f1", controller(), None, "default", 1_000, false, 0)
             .await
             .unwrap();
         store
@@ -2257,8 +2286,16 @@ mod tests {
             ChildStatus::Running
         );
 
-        assert!(store.mark_running("c1", &attempt_id).await.is_err());
-        assert!(store.mark_running("c1", "nope").await.is_err());
+        // A repeat (child now Running, not Launching) and an unknown attempt
+        // are BOTH lost-race misses now — `Superseded`, not an infra `Err`.
+        assert_eq!(
+            store.mark_running("c1", &attempt_id).await.unwrap(),
+            MarkRunningOutcome::Superseded,
+        );
+        assert_eq!(
+            store.mark_running("c1", "nope").await.unwrap(),
+            MarkRunningOutcome::Superseded,
+        );
     }
 
     #[tokio::test]
@@ -2600,7 +2637,7 @@ mod tests {
     async fn replan_interrupts_surviving_running_attempt_and_frees_reservation() {
         let (_d, store) = fresh().await;
         store
-            .create_fleet("f1", controller(), "default", 100, false, 0)
+            .create_fleet("f1", controller(), None, "default", 100, false, 0)
             .await
             .unwrap();
         store
@@ -2718,7 +2755,7 @@ mod tests {
     async fn replan_survivor_with_new_unmet_dep_becomes_planned() {
         let (_d, store) = fresh().await;
         store
-            .create_fleet("f1", controller(), "default", 1_000, false, 0)
+            .create_fleet("f1", controller(), None, "default", 1_000, false, 0)
             .await
             .unwrap();
         store
@@ -2763,7 +2800,7 @@ mod tests {
     async fn replan_removed_live_child_releases_reservation() {
         let (_d, store) = fresh().await;
         store
-            .create_fleet("f1", controller(), "default", 100, false, 0)
+            .create_fleet("f1", controller(), None, "default", 100, false, 0)
             .await
             .unwrap();
         store
@@ -2817,7 +2854,7 @@ mod tests {
     async fn replan_readds_removed_task_as_fresh_child() {
         let (_d, store) = fresh().await;
         store
-            .create_fleet("f1", controller(), "default", 100, false, 0)
+            .create_fleet("f1", controller(), None, "default", 100, false, 0)
             .await
             .unwrap();
         store
@@ -2958,7 +2995,11 @@ mod tests {
         child.current_attempt_id = Some("ghost".into());
         store.write_raw_child(&child).await.unwrap();
 
-        assert!(store.mark_running("c1", &att).await.is_err());
+        // Not the child's current attempt → a lost-race `Superseded`, not `Err`.
+        assert_eq!(
+            store.mark_running("c1", &att).await.unwrap(),
+            MarkRunningOutcome::Superseded,
+        );
         // Zero mutation: attempt still Leased, child pointer unchanged.
         assert_eq!(
             store.get_attempt("c1", &att).await.unwrap().unwrap().status,
@@ -2998,7 +3039,11 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(store.mark_running("c1", &att).await.is_err());
+        // Stale generation → a lost-race `Superseded`, not an infra `Err`.
+        assert_eq!(
+            store.mark_running("c1", &att).await.unwrap(),
+            MarkRunningOutcome::Superseded,
+        );
         assert_eq!(
             store.get_attempt("c1", &att).await.unwrap().unwrap().status,
             AttemptStatus::Leased,
@@ -3049,7 +3094,7 @@ mod tests {
     async fn replan_is_revision_fenced() {
         let (_d, store) = fresh().await;
         store
-            .create_fleet("f1", controller(), "default", 100, false, 0)
+            .create_fleet("f1", controller(), None, "default", 100, false, 0)
             .await
             .unwrap();
         store.create_plan(plan("f1", 0, vec![])).await.unwrap();
@@ -3077,7 +3122,7 @@ mod tests {
     async fn add_child_and_mark_ready_resolve_dependencies() {
         let (_d, store) = fresh().await;
         store
-            .create_fleet("f1", controller(), "default", 1_000, false, 0)
+            .create_fleet("f1", controller(), None, "default", 1_000, false, 0)
             .await
             .unwrap();
         store.add_child("f1", "a", vec![], 0).await.unwrap();
@@ -3123,11 +3168,11 @@ mod tests {
     async fn list_children_scopes_to_fleet_and_sorts() {
         let (_d, store) = fresh().await;
         store
-            .create_fleet("f1", controller(), "default", 100, false, 0)
+            .create_fleet("f1", controller(), None, "default", 100, false, 0)
             .await
             .unwrap();
         store
-            .create_fleet("f2", controller(), "default", 100, false, 0)
+            .create_fleet("f2", controller(), None, "default", 100, false, 0)
             .await
             .unwrap();
         store.add_child("f1", "b", vec![], 0).await.unwrap();
@@ -3246,7 +3291,7 @@ mod tests {
     async fn load_drops_row_with_higher_schema_version() {
         let (_d, store) = fresh().await;
         store
-            .create_fleet("f1", controller(), "default", 100, false, 0)
+            .create_fleet("f1", controller(), None, "default", 100, false, 0)
             .await
             .unwrap();
         let raw = r#"{"schema_version":3,"fleet_id":"f1","controller_session_key":"fleet:controller-1","profile_id":"default","budget":{"token_budget":100,"tokens_reserved":0,"tokens_committed":0,"hard":false},"status":"Active","generation":0,"created_at_ms":0,"updated_at_ms":0}"#;
@@ -3260,7 +3305,7 @@ mod tests {
     async fn key_components_reject_control_chars_preventing_collision() {
         let (_d, store) = fresh().await;
         store
-            .create_fleet("f", controller(), "default", 100, false, 0)
+            .create_fleet("f", controller(), None, "default", 100, false, 0)
             .await
             .unwrap();
 
@@ -3269,7 +3314,7 @@ mod tests {
         assert!(store.add_child("f", "x\0c", vec![], 0).await.is_err());
         assert!(
             store
-                .create_fleet("f\0x", controller(), "default", 100, false, 0)
+                .create_fleet("f\0x", controller(), None, "default", 100, false, 0)
                 .await
                 .is_err()
         );

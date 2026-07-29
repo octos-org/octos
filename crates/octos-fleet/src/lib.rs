@@ -54,5 +54,5 @@ pub use records::{
 };
 pub use store::{
     AckOutcome, CompleteOutcome, FleetKernelStore, FleetSnapshot, InterruptedAttempt,
-    LaunchOutcome, PlanMutateOutcome, ReconcileReport,
+    LaunchOutcome, MarkRunningOutcome, PlanMutateOutcome, ReconcileReport,
 };
