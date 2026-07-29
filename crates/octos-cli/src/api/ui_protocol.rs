@@ -85,15 +85,15 @@ use tracing::{debug, info, warn};
 use super::AppState;
 use super::agent_orchestrator::{
     AgentArtifactReadRequest, AgentListRequest, AgentOrchestrator, AgentOutputRequest,
-    AgentRequest, AgentUpsert, GoalSessionRequest, GoalSetRequest, LoopControlKind,
-    LoopControlRequest, LoopCreateRequest, LoopListRequest, NativeSpecialistAppUiEvent,
-    NativeSpecialistLaunchRequest, default_agent_orchestrator, master_continuation_prompt,
-    master_continuation_reason_name, upsert_background_task_agent, wire_key_from_goal_key,
+    AgentRequest, AgentUpsert, FleetKeeperSeed, GoalSessionRequest, GoalSetRequest,
+    InProcessAgentOrchestrator, LoopControlKind, LoopControlRequest, LoopCreateRequest,
+    LoopListRequest, NativeSpecialistAppUiEvent, NativeSpecialistLaunchRequest,
+    default_agent_orchestrator, master_continuation_prompt, master_continuation_reason_name,
+    upsert_background_task_agent, wire_key_from_goal_key,
 };
 #[cfg(test)]
 use super::agent_orchestrator::{
-    AgentArtifactRecord as AgentRuntimeArtifactRecord, InProcessAgentOrchestrator,
-    clear_default_agent_orchestrator_for_test,
+    AgentArtifactRecord as AgentRuntimeArtifactRecord, clear_default_agent_orchestrator_for_test,
 };
 use super::master_continuation_scheduler::{
     MasterContinuationReason, MasterContinuationRuntimeState,
@@ -883,6 +883,388 @@ impl SessionWorkspaceStore {
             .unwrap_or_else(|error| error.into_inner())
             .get(session_id)
             .cloned()
+    }
+
+    /// Insert `root` under `session_id` ONLY when no entry exists yet, holding
+    /// the lock across the check + insert. Returns whether this call inserted
+    /// (`true`) or found an established entry it left untouched (`false`). PR 4b
+    /// Fix 2: the fleet-keeper re-seed's never-overwrite guard was a separate
+    /// `get()` then `set()` (two lock acquisitions) that a concurrent
+    /// `session/open` `set` (the authoritative live-client cwd) could race
+    /// between, letting a headless seed clobber the real workspace. `set_if_absent`
+    /// collapses that to one atomic step so the seed can only ever fill a gap.
+    fn set_if_absent(&self, session_id: SessionKey, root: PathBuf) -> bool {
+        use std::collections::hash_map::Entry;
+        match self
+            .roots
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .entry(session_id)
+        {
+            Entry::Occupied(_) => false,
+            Entry::Vacant(slot) => {
+                slot.insert(root);
+                true
+            }
+        }
+    }
+}
+
+/// PR 4b — re-seed the in-memory maps a HEADLESS fleet-keeper (no live client)
+/// never got from a `session/open` after a serve restart, from ONE bounded,
+/// validated, PAIRED [`FleetKeeperSeed`] per wire (codex round 2). The global
+/// master-continuation drain runs this pre-pass BEFORE its two gates.
+///
+/// For each seed the workspace root AND the cwd scope come from the SAME pending
+/// continuation ([`InProcessAgentOrchestrator::pending_fleet_keeper_seeds`] pairs
+/// and validates them), so:
+/// - `set_if_absent(wire, root)` clears Gate A (workspace-known). The seed key is
+///   the `wire_key_from_goal_key` strip — byte-identical to the gate probe (THE
+///   landmine); a mismatch would strand the keeper silently.
+/// - `set_goal_scope_if_absent(wire, scope)` (only for a scoped key) clears Gate
+///   D (`goal_target_is_dispatchable`, which for a cwd-scoped target requires
+///   `goal_scopes[wire] == scope` — empty after a headless restart, so a scoped
+///   keeper would otherwise be surfaced yet `continue`d SILENTLY).
+///
+/// Pairing them in the accessor is only half the fix: the APPLICATION must be
+/// all-or-nothing too, or a wire whose workspace already exists but whose scope
+/// is absent gets a MIXED pair (codex round 3). Concrete, no race needed: a live
+/// UNscoped session leaves `session_workspaces[wire] = /live` with `goal_scopes`
+/// absent; a scoped seed `(wire, A, /A)` would `set_if_absent` the workspace
+/// (no-op, `/live` present) yet `set_goal_scope_if_absent` scope A — Gate A then
+/// passes on `/live` and Gate D on A, so the keeper runs in `/live`, not `/A`.
+///
+/// So gate the WHOLE seed on the target slots being absent (seed only a FRESH
+/// wire, never a half/mixed pair):
+/// - Scoped (`scope = Some`): seed BOTH only when the workspace AND the goal
+///   scope are both absent. If either is already present (a live session, or a
+///   prior seed), skip both — never inject a scope into a wire whose workspace
+///   belongs to someone else. `wire` is the `wire_key_from_goal_key` strip so the
+///   workspace key is byte-identical to the drain gate probe.
+/// - Plain (`scope = None`): only a workspace to seed (Gate D is always true for
+///   an unscoped target); fill the workspace gap.
+///
+/// Both stores stay atomically never-overwrite via `set_if_absent`, so a live
+/// entry is authoritative and the seed only ever fills a genuine GAP. The
+/// accessor already did the `is_dir` validation, dedupe, and cap.
+///
+/// v1 residual (bounded, documented — deliberately NOT hardened): the two maps
+/// have independent locks, so a concurrent `session/open` that publishes its
+/// scope before its workspace (see `session/open`) could, in a sub-tick
+/// interleave between this gate's check and its set, still leave a one-turn
+/// mismatch on that precise keeper wire. It is bounded to one turn, needs a
+/// concurrent open on the exact wire, and the module is dormant until PR 5 (which
+/// sets the controller key server-side). A fully cross-map-atomic establish is a
+/// follow-up.
+fn reseed_fleet_keeper_candidates(
+    workspaces: &SessionWorkspaceStore,
+    orchestrator: &InProcessAgentOrchestrator,
+    seeds: Vec<FleetKeeperSeed>,
+) {
+    for seed in seeds {
+        match seed.scope {
+            Some(scope) => {
+                // Seed the pair only into a FRESH wire — never a mixed pair.
+                if workspaces.get(&seed.wire).is_none()
+                    && orchestrator.goal_scope(&seed.wire).is_none()
+                {
+                    workspaces.set_if_absent(seed.wire.clone(), PathBuf::from(&seed.root));
+                    orchestrator.set_goal_scope_if_absent(&seed.wire, &scope);
+                }
+            }
+            None => {
+                workspaces.set_if_absent(seed.wire, PathBuf::from(&seed.root));
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod fleet_keeper_reseed_tests {
+    use super::*;
+    use crate::api::agent_orchestrator::{
+        FLEET_KEEPER_EXTERNAL_KIND, FLEET_KEEPER_GROUP, FLEET_KEEPER_META_FLEET_ID,
+        FLEET_KEEPER_META_WORKSPACE_ROOT,
+    };
+    use crate::api::master_continuation_scheduler::MasterContinuationRequest;
+
+    #[test]
+    fn set_if_absent_is_atomic_and_never_overwrites() {
+        // PR 4b Fix 2 — the workspace re-seed's never-overwrite check was a
+        // get()-then-set() across two lock acquisitions, racy against a
+        // concurrent `session/open` `set`. `set_if_absent` collapses check+insert
+        // under a single lock: it inserts (returns true) only on a vacant slot and
+        // leaves an established entry untouched (returns false).
+        let store = SessionWorkspaceStore::default();
+        let key = SessionKey("prof:api:chat#s".to_owned());
+        assert!(
+            store.set_if_absent(key.clone(), PathBuf::from("/first")),
+            "first insert into a vacant slot returns true"
+        );
+        assert!(
+            !store.set_if_absent(key.clone(), PathBuf::from("/second")),
+            "a second insert finds an established entry and returns false"
+        );
+        assert_eq!(
+            store.get(&key),
+            Some(PathBuf::from("/first")),
+            "the established entry is never overwritten"
+        );
+    }
+
+    /// Enqueue a fleet-keeper wake, optionally rooted (real dir), on `controller`.
+    fn enqueue_keeper(
+        orchestrator: &InProcessAgentOrchestrator,
+        controller: &str,
+        fleet_id: &str,
+        root: Option<&str>,
+    ) {
+        let mut req = MasterContinuationRequest::new(
+            FLEET_KEEPER_GROUP,
+            controller,
+            "prof",
+            MasterContinuationReason::External(FLEET_KEEPER_EXTERNAL_KIND.to_owned()),
+            std::time::SystemTime::now(),
+        )
+        .with_metadata(FLEET_KEEPER_META_FLEET_ID, fleet_id);
+        if let Some(root) = root {
+            req = req.with_metadata(FLEET_KEEPER_META_WORKSPACE_ROOT, root);
+        }
+        orchestrator.enqueue_continuation_for_test(req);
+    }
+
+    #[test]
+    fn admission_reseeds_both_workspace_and_goal_scope_for_a_scoped_keeper() {
+        // PR 4b Gate A + Gate D end-to-end. A SCOPED headless keeper must clear
+        // BOTH the workspace-known gate (Gate A) and `goal_target_is_dispatchable`
+        // (Gate D, which for a cwd-scoped storage key demands
+        // `goal_scopes[wire] == scope`). `goal_scopes` is empty after a headless
+        // restart, so without the goal-scope half the keeper is surfaced yet
+        // `continue`d SILENTLY. The paired pre-pass fills BOTH maps of the FRESH
+        // wire from the SAME seed, so both gates pass and the wire's workspace and
+        // scope provably match. (The RED that the scope half is load-bearing is
+        // pinned by `scoped_seed_skipped_when_wire_has_a_live_workspace`.)
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let workspaces = SessionWorkspaceStore::default();
+
+        // The persisted controller workspace MUST be a real directory — the
+        // accessor's is_dir validation refuses a moved/deleted root.
+        let root = tempfile::tempdir().expect("tempdir");
+        let root_str = root.path().to_str().expect("utf8 root").to_owned();
+
+        let scoped_controller = "prof:api:chat#topic\u{0}~cwd-abcd1234";
+        let scoped_key = SessionKey(scoped_controller.to_owned());
+        let wire = SessionKey("prof:api:chat#topic".to_owned());
+        enqueue_keeper(&orchestrator, scoped_controller, "f-a", Some(&root_str));
+
+        // The drain's connection-independent sweep surfaces a pending
+        // continuation only when its wire key has a known workspace.
+        let is_surfaced = |ws: &SessionWorkspaceStore| -> bool {
+            let runnable =
+                |session: &SessionKey| ws.get(&wire_key_from_goal_key(session)).is_some();
+            orchestrator
+                .due_loop_targets_with_filter(None, 8, Some(&runnable))
+                .into_iter()
+                .any(|(key, _)| key == scoped_key)
+        };
+
+        // Cold restart: empty workspaces + empty goal_scopes → neither gate passes.
+        assert!(
+            !is_surfaced(&workspaces),
+            "a workspace-unknown keeper is not surfaced (Gate A)"
+        );
+        assert!(
+            !orchestrator.goal_target_is_dispatchable(&scoped_key),
+            "a scoped keeper is not dispatchable with an empty goal_scopes (Gate D)"
+        );
+
+        let seeds = orchestrator.pending_fleet_keeper_seeds();
+        assert_eq!(seeds.len(), 1, "exactly one paired candidate");
+        assert_eq!(seeds[0].scope.as_deref(), Some("abcd1234"));
+
+        // The paired pre-pass seeds BOTH maps of the fresh wire from one seed.
+        reseed_fleet_keeper_candidates(&workspaces, &orchestrator, seeds);
+        assert_eq!(
+            workspaces.get(&wire),
+            Some(root.path().to_path_buf()),
+            "Gate A: the wire's workspace is the seed root"
+        );
+        assert_eq!(
+            orchestrator.goal_scope(&wire).as_deref(),
+            Some("abcd1234"),
+            "Gate D: the wire's goal scope is the SAME seed's scope (paired)"
+        );
+        assert!(
+            orchestrator.goal_target_is_dispatchable(&scoped_key),
+            "after the paired re-seed Gate D passes — scoped identity end to end"
+        );
+        assert!(
+            is_surfaced(&workspaces),
+            "surfaced after the paired re-seed (Gate A)"
+        );
+    }
+
+    #[test]
+    fn unpaired_scope_and_root_for_one_wire_cannot_bypass_gate_d() {
+        // codex round 2 P1 regression. Two pending keepers on the SAME wire:
+        // scope A is ROOTLESS (not rehydratable) and scope B is ROOTED (`/B`).
+        // Two independently-filtered accessors would seed workspace `wire → /B`
+        // (root filter) but scope `wire → A` (no root filter), admitting the A
+        // continuation and running it in `/B` — the isolation bypass Gate D
+        // exists to prevent. The unified paired accessor DROPS the rootless A
+        // entirely, so only B is seeded and only B is dispatchable.
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let workspaces = SessionWorkspaceStore::default();
+        let root_b = tempfile::tempdir().expect("tempdir");
+        let root_b_str = root_b.path().to_str().expect("utf8 root").to_owned();
+
+        let wire = "prof:api:chat#topic";
+        let scoped_a = SessionKey(format!("{wire}\u{0}~cwd-aaaa"));
+        let scoped_b = SessionKey(format!("{wire}\u{0}~cwd-bbbb"));
+        enqueue_keeper(&orchestrator, scoped_a.0.as_str(), "f-a", None);
+        enqueue_keeper(&orchestrator, scoped_b.0.as_str(), "f-b", Some(&root_b_str));
+
+        reseed_fleet_keeper_candidates(
+            &workspaces,
+            &orchestrator,
+            orchestrator.pending_fleet_keeper_seeds(),
+        );
+
+        // The rooted B is admitted: the wire's workspace is B's root (paired) and
+        // B is dispatchable.
+        assert_eq!(
+            workspaces.get(&SessionKey(wire.to_owned())),
+            Some(PathBuf::from(&root_b_str)),
+            "the wire's workspace is B's root (root and scope paired from one continuation)"
+        );
+        assert!(
+            orchestrator.goal_target_is_dispatchable(&scoped_b),
+            "the rooted B continuation is dispatchable in its own workspace"
+        );
+        // The rootless A can NOT bypass Gate D onto B's workspace: goal_scopes[wire]
+        // is B, so scoped_goal_key(wire) != A.
+        assert!(
+            !orchestrator.goal_target_is_dispatchable(&scoped_a),
+            "the rootless A continuation cannot be admitted to run in B's workspace"
+        );
+    }
+
+    #[test]
+    fn reseed_never_overwrites_a_live_session_workspace_or_scope() {
+        // Both never-overwrite disciplines through the unified paired pre-pass: a
+        // live `session/open` established an authoritative workspace AND cwd scope
+        // for the wire; a headless seed carrying a DIFFERENT root/scope must fill
+        // only a GAP and never clobber the live client (`set_if_absent` /
+        // `set_goal_scope_if_absent` are atomic no-overwrite).
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let workspaces = SessionWorkspaceStore::default();
+        let live = tempfile::tempdir().expect("tempdir");
+        let seed_root = tempfile::tempdir().expect("tempdir");
+        let seed_root_str = seed_root.path().to_str().expect("utf8").to_owned();
+
+        let wire = SessionKey("prof:api:chat#topic".to_owned());
+        // Live client: workspace + goal scope already established for this wire.
+        workspaces.set(wire.clone(), live.path().to_path_buf());
+        orchestrator.set_goal_scope(&wire, Some("live-b".to_owned()));
+
+        reseed_fleet_keeper_candidates(
+            &workspaces,
+            &orchestrator,
+            vec![FleetKeeperSeed {
+                wire: wire.clone(),
+                scope: Some("seed-a".to_owned()),
+                root: seed_root_str,
+            }],
+        );
+
+        assert_eq!(
+            workspaces.get(&wire),
+            Some(live.path().to_path_buf()),
+            "a live workspace is never overwritten by a headless seed"
+        );
+        assert_eq!(
+            orchestrator.scoped_goal_key(&wire),
+            SessionKey("prof:api:chat#topic\u{0}~cwd-live-b".to_owned()),
+            "a live session/open scope is never overwritten by a headless seed"
+        );
+    }
+
+    #[test]
+    fn scoped_seed_skipped_when_wire_has_a_live_workspace() {
+        // codex round 3 (RED against 6ff0aa22e). The application must be
+        // all-or-nothing across the two maps. A live UNscoped session left
+        // `session_workspaces[wire] = /live` with NO goal scope. A scoped seed
+        // `(wire, aaaa, /A)` must NOT insert scope `aaaa` into that wire —
+        // otherwise Gate A passes on `/live` and Gate D passes for `aaaa`, so the
+        // keeper runs in `/live`, not `/A` (cross-folder execution via
+        // pre-existing, non-concurrent state). The whole seed is skipped because
+        // the workspace slot is already occupied.
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let workspaces = SessionWorkspaceStore::default();
+        let live = tempfile::tempdir().expect("tempdir");
+        let seed_root = tempfile::tempdir().expect("tempdir");
+        let seed_root_str = seed_root.path().to_str().expect("utf8").to_owned();
+        let wire = SessionKey("prof:api:chat#topic".to_owned());
+        // A live UNscoped session established a workspace but no goal scope.
+        workspaces.set(wire.clone(), live.path().to_path_buf());
+
+        reseed_fleet_keeper_candidates(
+            &workspaces,
+            &orchestrator,
+            vec![FleetKeeperSeed {
+                wire: wire.clone(),
+                scope: Some("aaaa".to_owned()),
+                root: seed_root_str,
+            }],
+        );
+
+        assert_eq!(
+            orchestrator.goal_scope(&wire),
+            None,
+            "a scoped seed must NOT insert a scope into a wire whose workspace is already live"
+        );
+        assert!(
+            !orchestrator.goal_target_is_dispatchable(&SessionKey(
+                "prof:api:chat#topic\u{0}~cwd-aaaa".to_owned()
+            )),
+            "the scoped keeper cannot be admitted to run in the live session's workspace"
+        );
+        assert_eq!(
+            workspaces.get(&wire),
+            Some(live.path().to_path_buf()),
+            "the live workspace is never overwritten"
+        );
+    }
+
+    #[test]
+    fn plain_seed_fills_only_the_workspace_gap() {
+        // An UNscoped keeper (scope = None) has Gate D always true, so it seeds
+        // only the workspace and never touches goal_scopes.
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let workspaces = SessionWorkspaceStore::default();
+        let root = tempfile::tempdir().expect("tempdir");
+        let wire = SessionKey("prof:api:chat#plain".to_owned());
+
+        reseed_fleet_keeper_candidates(
+            &workspaces,
+            &orchestrator,
+            vec![FleetKeeperSeed {
+                wire: wire.clone(),
+                scope: None,
+                root: root.path().to_str().expect("utf8").to_owned(),
+            }],
+        );
+
+        assert_eq!(
+            workspaces.get(&wire),
+            Some(root.path().to_path_buf()),
+            "a plain seed fills the workspace gap"
+        );
+        assert_eq!(
+            orchestrator.goal_scope(&wire),
+            None,
+            "a plain seed never registers a goal scope"
+        );
     }
 }
 
@@ -18363,6 +18745,30 @@ pub(crate) fn spawn_global_master_continuation_drain(state: Arc<AppState>) {
             // sessions is not operationally reachable on a single serve.
             const DRAIN_SPAWN_CAP: usize = 8;
             const DRAIN_CANDIDATE_WINDOW: usize = 64;
+            // PR 4b — rehydration pre-pass: BEFORE the two workspace/scope gates,
+            // re-seed the in-memory maps a HEADLESS keeper (fleet outbox → keeper
+            // continuation, no live client) never got from a `session/open` after
+            // a serve restart. Each candidate PAIRS the workspace root and the cwd
+            // scope from the SAME pending continuation (codex round 2) so a wire's
+            // Gate A workspace and Gate D scope can never come from two different
+            // continuations (which would admit one folder's continuation and run
+            // it in another's). Both seeds key under the `wire_key_from_goal_key`
+            // form the gates probe and never overwrite an established entry.
+            //   (1) `session_workspaces()` clears the workspace-known gate below;
+            //       `run_standalone_turn` later reads the same entry as its
+            //       `workspace_hint`.
+            //   (2) `goal_scopes` (scoped keepers only) clears the SECOND gate
+            //       (`goal_target_is_dispatchable`, Gate D), which would otherwise
+            //       surface a scoped keeper yet `continue` it SILENTLY.
+            // Rolling-downgrade note: an old v2 binary that REWRITES the fleet
+            // record erases the unknown `controller_workspace_root` (the keeper
+            // then loses headless rehydration) — acceptable for v1's
+            // single-active-serve model; not a concern within one binary version.
+            reseed_fleet_keeper_candidates(
+                &session_workspaces(),
+                default_agent_orchestrator(),
+                default_agent_orchestrator().pending_fleet_keeper_seeds(),
+            );
             // #1666 residue — a goal target is cwd-scoped (`<wire>\u{0}~cwd-…`)
             // while `session_workspaces()` is keyed by the plain wire id, so
             // the workspace-known gate must strip the scope before probing.

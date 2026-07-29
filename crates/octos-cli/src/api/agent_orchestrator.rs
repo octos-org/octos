@@ -187,6 +187,46 @@ pub(crate) const FLEET_KEEPER_META_OBJECTIVE: &str = "objective";
 pub(crate) const FLEET_KEEPER_META_TASK_LINES: &str = "task_lines";
 /// Metadata key carrying the comma-separated ids of tasks ready to dispatch.
 pub(crate) const FLEET_KEEPER_META_READY: &str = "ready";
+/// Metadata key carrying the controller session's persisted workspace root
+/// (`FleetRecord.controller_workspace_root`), so a HEADLESS keeper (no live
+/// client) can be rehydrated across a serve restart: the global
+/// master-continuation drain re-seeds `session_workspaces()` from this before
+/// its workspace-known gate (PR 4b). Omitted when the fleet has no persisted
+/// root (that keeper is simply not headlessly rehydratable).
+pub(crate) const FLEET_KEEPER_META_WORKSPACE_ROOT: &str = "workspace_root";
+
+/// PR 4b — upper bound on the VALID (rehydratable) fleet-keeper candidates
+/// [`InProcessAgentOrchestrator::pending_fleet_keeper_seeds`] produces per drain
+/// tick. It caps the per-tick clone/allocation so a pathological backlog of
+/// stranded headless keepers cannot make the drain's pre-pass unbounded. The cap
+/// counts ONLY rooted, existing-directory, deduped candidates — rootless or
+/// invalid-root keepers are dropped BEFORE the cap, so noise (a non-rehydratable
+/// keeper) can never consume a slot and re-strand a valid keeper behind it.
+pub(crate) const FLEET_KEEPER_SEED_CAP: usize = 256;
+
+/// PR 4b — one bounded, validated, PAIRED fleet-keeper rehydration candidate
+/// (codex round 2). The workspace root AND the (optional) cwd scope for a wire
+/// come from the SAME pending continuation, so the drain's Gate A (workspace
+/// known) and Gate D (`goal_target_is_dispatchable`) can never admit a
+/// continuation for one folder and execute it in another — the isolation bypass
+/// that two independently-selected re-seeds allowed.
+///
+/// PR 5 MUST bind + validate `controller_session_key` server-side: a
+/// corrupt/untrusted scoped controller key could otherwise seed another wire's
+/// scope. 4b's require-root + `is_dir` + dedupe validation bounds the damage
+/// while the fleet module is dormant (no production create caller yet).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FleetKeeperSeed {
+    /// The plain wire session id (cwd scope stripped) — byte-identical to what
+    /// the drain's workspace-known gate probes.
+    pub(crate) wire: SessionKey,
+    /// The cwd scope hash recovered from a scoped controller key, else `None`
+    /// for a plain (unscoped) controller — a plain key needs no Gate-D seed.
+    pub(crate) scope: Option<String>,
+    /// The persisted controller workspace root, validated to be an existing
+    /// directory at selection time.
+    pub(crate) root: String,
+}
 
 /// Peer awaiting-input WAKE — kind label for the `External(_)` master
 /// continuation that WAKES an idle master when one of its staged peers PARKS on
@@ -839,6 +879,42 @@ impl InProcessAgentOrchestrator {
                 scopes.remove(session_id.0.as_str());
             }
         }
+    }
+
+    /// PR 4b — register `scope` for `session_id` ONLY when no scope is registered
+    /// yet, holding the `goal_scopes` lock across the check + insert. Returns
+    /// whether this call registered the scope (`true`) or found an established one
+    /// it left untouched (`false`). The goal-scope twin of
+    /// `SessionWorkspaceStore::set_if_absent`: the fleet-keeper Gate-D re-seed uses
+    /// it so a headless seed can only ever fill a gap and never clobber a live
+    /// `session/open` cwd scope (a check via `scoped_goal_key` then a separate
+    /// `set_goal_scope` would race that authoritative live write).
+    pub(crate) fn set_goal_scope_if_absent(&self, session_id: &SessionKey, scope: &str) -> bool {
+        use std::collections::hash_map::Entry;
+        match self
+            .goal_scopes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .entry(session_id.0.clone())
+        {
+            Entry::Occupied(_) => false,
+            Entry::Vacant(slot) => {
+                slot.insert(scope.to_owned());
+                true
+            }
+        }
+    }
+
+    /// The cwd scope currently registered for a wire session id, or `None` if
+    /// none is. The read accessor to [`Self::set_goal_scope`]; PR 4b's
+    /// fleet-keeper re-seed uses it to gate a scoped seed on the wire's goal
+    /// scope being absent (so a pair is only ever seeded into a FRESH wire).
+    pub(crate) fn goal_scope(&self, session_id: &SessionKey) -> Option<String> {
+        self.goal_scopes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(session_id.0.as_str())
+            .cloned()
     }
 
     /// #1666 residue — the STORAGE identity for a wire session id in the goal
@@ -3246,6 +3322,110 @@ impl InProcessAgentOrchestrator {
             )));
         }
         sessions
+    }
+
+    /// Pending fleet-keeper (PR 4a) rehydration candidates for the global drain's
+    /// pre-pass (PR 4b), as ONE bounded, validated, PAIRED [`FleetKeeperSeed`]
+    /// per wire (codex round 2). The workspace root and the cwd scope for a wire
+    /// come from the SAME continuation, closing the Gate-D isolation bypass that
+    /// two independently-filtered accessors allowed (a scope from a rootless
+    /// `wire\0~cwd-A` paired with a root from a rooted `wire\0~cwd-B` would admit
+    /// A and run it in `/B`).
+    ///
+    /// Selection rules:
+    /// - Only `External(fleet_keeper_wake)` continuations.
+    /// - REQUIRE a `workspace_root`: a rootless keeper cannot pass Gate A, so it
+    ///   is DROPPED entirely (never contributes a scope, never consumes the cap
+    ///   — otherwise unordered rootless noise could exhaust the cap and re-strand
+    ///   a valid keeper behind it every tick).
+    /// - `wire` is the `wire_key_from_goal_key` strip (byte-identical to what the
+    ///   drain gate probes — a raw scoped key would miss the lookup and strand
+    ///   the keeper silently); `scope` is the cwd hash if the key is scoped.
+    /// - Validate `is_dir` (a moved/deleted root that `validate_workspace_hint`
+    ///   would recreate EMPTY is dropped + warned, BEFORE dedupe so an invalid
+    ///   candidate cannot occupy a wire's slot).
+    /// - Dedupe by `wire` (first-wins + warn on a genuine conflict), then cap the
+    ///   VALID set at [`FLEET_KEEPER_SEED_CAP`].
+    ///
+    /// The `is_dir` stat and the dedupe/cap run OUTSIDE the state lock: the lock
+    /// is held only for the raw snapshot (phase 1), never across filesystem I/O.
+    pub(crate) fn pending_fleet_keeper_seeds(&self) -> Vec<FleetKeeperSeed> {
+        // Phase 1 (under the state lock): snapshot the raw rooted candidates.
+        // Rootless keepers are dropped here so they never reach dedupe/cap. No
+        // filesystem I/O runs while the lock is held.
+        let raw: Vec<(SessionKey, Option<String>, String)> = {
+            let state = self.state();
+            state
+                .continuations
+                .pending_items()
+                .filter(|it| {
+                    matches!(
+                        &it.reason,
+                        MasterContinuationReason::External(kind) if kind == FLEET_KEEPER_EXTERNAL_KIND
+                    )
+                })
+                .filter_map(|it| {
+                    let root = it.metadata.get(FLEET_KEEPER_META_WORKSPACE_ROOT)?.clone();
+                    let (wire, scope) = match it.session_id.as_str().split_once("\u{0}~cwd-") {
+                        Some((wire, scope)) => {
+                            (SessionKey(wire.to_owned()), Some(scope.to_owned()))
+                        }
+                        None => (SessionKey(it.session_id.as_str().to_owned()), None),
+                    };
+                    Some((wire, scope, root))
+                })
+                .collect()
+        };
+
+        // Phase 2 (no lock): is_dir validation → dedupe by wire → cap.
+        let mut out: Vec<FleetKeeperSeed> = Vec::new();
+        for (wire, scope, root) in raw {
+            if !std::path::Path::new(&root).is_dir() {
+                tracing::warn!(
+                    target = "octos::fleet",
+                    wire_key = %wire.0,
+                    root = %root,
+                    "fleet-keeper seed: root is not an existing directory; dropping candidate"
+                );
+                continue;
+            }
+            if let Some(existing) = out.iter().find(|s| s.wire == wire) {
+                if existing.root != root || existing.scope != scope {
+                    tracing::warn!(
+                        target = "octos::fleet",
+                        wire_key = %wire.0,
+                        first_root = %existing.root,
+                        first_scope = ?existing.scope,
+                        conflicting_root = %root,
+                        conflicting_scope = ?scope,
+                        "fleet-keeper seed: two candidates for one wire key; keeping the first"
+                    );
+                }
+                continue;
+            }
+            out.push(FleetKeeperSeed { wire, scope, root });
+            if out.len() >= FLEET_KEEPER_SEED_CAP {
+                // P2 (codex round 3): >CAP distinct valid wires this tick. The
+                // rest are deferred to a later tick (they stay pending) — log it
+                // so the silent-defer is observable rather than mysterious.
+                tracing::warn!(
+                    target = "octos::fleet",
+                    cap = FLEET_KEEPER_SEED_CAP,
+                    "fleet-keeper seeds hit the per-tick cap; remaining valid keepers deferred to a later drain tick"
+                );
+                break;
+            }
+        }
+        out
+    }
+
+    /// Test-only: enqueue a master continuation directly. `state()` is
+    /// module-private, so a cross-module test (e.g. the PR 4b end-to-end
+    /// rehydration admission test in `ui_protocol`) that must stage a pending
+    /// fleet-keeper continuation goes through this seam.
+    #[cfg(test)]
+    pub(crate) fn enqueue_continuation_for_test(&self, request: MasterContinuationRequest) {
+        self.state().continuations.enqueue(request);
     }
 
     #[cfg(test)]
@@ -7786,6 +7966,147 @@ mod tests {
             })
             .expect("artifact list response");
         assert_eq!(artifacts["artifacts"][0]["id"], json!("report"));
+    }
+
+    #[test]
+    fn pending_seeds_pair_root_and_scope_filter_to_fleet_keeper_and_strip_cwd_scope() {
+        // THE landmine + codex round 2 pairing. Each candidate PAIRS the wire's
+        // workspace root and cwd scope from the SAME continuation. The `wire` MUST
+        // be the `wire_key_from_goal_key` strip (byte-identical to the drain's
+        // gate probe — a raw scoped key would miss the lookup and strand the
+        // keeper silently). Only rooted, existing-directory fleet-keeper wakes
+        // qualify: a rootless keeper, a non-fleet-keeper External, and an
+        // is_dir-invalid root are all dropped so they can neither be paired nor
+        // influence selection.
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let root = tempfile::tempdir().expect("tempdir");
+        let root_str = root.path().to_str().expect("utf8 root").to_owned();
+
+        // (A) fleet-keeper wake WITH a real-dir root, on a CWD-SCOPED controller.
+        let scoped_controller = "prof:api:chat#topic\u{0}~cwd-abcd1234";
+        let keeper_with_root = MasterContinuationRequest::new(
+            FLEET_KEEPER_GROUP,
+            scoped_controller,
+            "prof",
+            MasterContinuationReason::External(FLEET_KEEPER_EXTERNAL_KIND.to_owned()),
+            SystemTime::now(),
+        )
+        .with_metadata(FLEET_KEEPER_META_FLEET_ID, "f-a")
+        .with_metadata(FLEET_KEEPER_META_WORKSPACE_ROOT, root_str.as_str());
+
+        // (B) fleet-keeper wake WITHOUT a root → dropped (not rehydratable).
+        let keeper_no_root = MasterContinuationRequest::new(
+            FLEET_KEEPER_GROUP,
+            "prof:api:chat#no-root",
+            "prof",
+            MasterContinuationReason::External(FLEET_KEEPER_EXTERNAL_KIND.to_owned()),
+            SystemTime::now(),
+        )
+        .with_metadata(FLEET_KEEPER_META_FLEET_ID, "f-b");
+
+        // (C) a DIFFERENT External kind that ALSO carries a workspace_root →
+        // dropped by reason (kind-discrimination, not merely "is External").
+        let other_external = MasterContinuationRequest::new(
+            "peer-fleet-synthesis",
+            "prof:api:chat#other",
+            "prof",
+            MasterContinuationReason::External("some_other_wake".to_owned()),
+            SystemTime::now(),
+        )
+        .with_metadata(FLEET_KEEPER_META_WORKSPACE_ROOT, root_str.as_str());
+
+        // (D) fleet-keeper wake with a root that is NOT an existing directory →
+        // dropped by the is_dir validation (before dedupe/cap, so it can't
+        // occupy a wire slot).
+        let keeper_bad_dir = MasterContinuationRequest::new(
+            FLEET_KEEPER_GROUP,
+            "prof:api:chat#gone",
+            "prof",
+            MasterContinuationReason::External(FLEET_KEEPER_EXTERNAL_KIND.to_owned()),
+            SystemTime::now(),
+        )
+        .with_metadata(FLEET_KEEPER_META_WORKSPACE_ROOT, "/no/such/dir/pr4b");
+
+        for req in [
+            keeper_with_root,
+            keeper_no_root,
+            other_external,
+            keeper_bad_dir,
+        ] {
+            orchestrator.enqueue_continuation_for_test(req);
+        }
+
+        let seeds = orchestrator.pending_fleet_keeper_seeds();
+        assert_eq!(
+            seeds.len(),
+            1,
+            "only the rooted, existing-dir fleet-keeper wake is a candidate"
+        );
+        let seed = &seeds[0];
+        assert_eq!(seed.root, root_str, "the seed carries the paired root");
+        assert_eq!(
+            seed.scope.as_deref(),
+            Some("abcd1234"),
+            "the cwd scope is paired with the SAME continuation's root"
+        );
+        // The landmine assertion: `wire` == what the gate probes (the strip).
+        assert_eq!(
+            seed.wire,
+            wire_key_from_goal_key(&SessionKey(scoped_controller.to_owned())),
+            "seed wire MUST equal the gate-probe wire key (else silent stranding)"
+        );
+        assert_eq!(
+            seed.wire.0, "prof:api:chat#topic",
+            "the cwd scope suffix is stripped from the seed wire"
+        );
+    }
+
+    #[test]
+    fn cap_does_not_strand_a_valid_keeper_behind_rootless_ones() {
+        // codex round 2 P1: `pending_items()` is unordered, and rootless keepers
+        // are not rehydratable and stay pending forever. If they counted toward
+        // FLEET_KEEPER_SEED_CAP, a full cap of rootless noise ahead of a valid
+        // keeper would re-strand it EVERY tick. Rooted-required drops rootless
+        // BEFORE the cap, so the valid keeper is always selected.
+        let orchestrator = InProcessAgentOrchestrator::default();
+        for i in 0..FLEET_KEEPER_SEED_CAP {
+            orchestrator.enqueue_continuation_for_test(
+                MasterContinuationRequest::new(
+                    FLEET_KEEPER_GROUP,
+                    format!("prof:api:chat#rootless-{i}\u{0}~cwd-scope{i}"),
+                    "prof",
+                    MasterContinuationReason::External(FLEET_KEEPER_EXTERNAL_KIND.to_owned()),
+                    SystemTime::now(),
+                )
+                .with_metadata(FLEET_KEEPER_META_FLEET_ID, format!("f-{i}")),
+            );
+        }
+        let root = tempfile::tempdir().expect("tempdir");
+        let root_str = root.path().to_str().expect("utf8 root").to_owned();
+        orchestrator.enqueue_continuation_for_test(
+            MasterContinuationRequest::new(
+                FLEET_KEEPER_GROUP,
+                "prof:api:chat#valid\u{0}~cwd-validscope",
+                "prof",
+                MasterContinuationReason::External(FLEET_KEEPER_EXTERNAL_KIND.to_owned()),
+                SystemTime::now(),
+            )
+            .with_metadata(FLEET_KEEPER_META_FLEET_ID, "f-valid")
+            .with_metadata(FLEET_KEEPER_META_WORKSPACE_ROOT, root_str.as_str()),
+        );
+
+        let seeds = orchestrator.pending_fleet_keeper_seeds();
+        assert_eq!(
+            seeds.len(),
+            1,
+            "the {FLEET_KEEPER_SEED_CAP} rootless keepers are dropped, not capped-in"
+        );
+        assert_eq!(
+            seeds[0].wire.0, "prof:api:chat#valid",
+            "the one valid rooted keeper is selected regardless of iteration order"
+        );
+        assert_eq!(seeds[0].scope.as_deref(), Some("validscope"));
+        assert_eq!(seeds[0].root, root_str);
     }
 
     #[test]

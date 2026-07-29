@@ -182,6 +182,7 @@ impl Fleet {
         store: Arc<FleetKernelStore>,
         fleet_id: impl Into<String>,
         controller_session_key: SessionKey,
+        controller_workspace_root: Option<String>,
         profile_id: impl Into<String>,
         budget: FleetBudget,
         objective: impl Into<String>,
@@ -209,6 +210,7 @@ impl Fleet {
         store
             .create_fleet_with_plan(
                 controller_session_key,
+                controller_workspace_root,
                 &profile_id,
                 budget.token_budget,
                 budget.hard,
@@ -970,12 +972,68 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn create_persists_controller_workspace_root() {
+        // PR 4b: the controller's workspace root, known at fleet-create time,
+        // is persisted on the `FleetRecord` so a headless keeper can be
+        // rehydrated across a serve restart. `Some(root)` round-trips; `None`
+        // stays `None` (a keeper simply not headlessly rehydratable).
+        let (_d, store) = fresh().await;
+        Fleet::create(
+            store.clone(),
+            "f-with-root",
+            controller(),
+            Some("/repos/app".to_owned()),
+            "default",
+            budget(1_000),
+            "obj",
+            vec![spec("a", &[])],
+            0,
+        )
+        .await
+        .unwrap();
+        let rec = store
+            .get_fleet("f-with-root")
+            .await
+            .unwrap()
+            .expect("fleet exists");
+        assert_eq!(
+            rec.controller_workspace_root,
+            Some("/repos/app".to_owned()),
+            "the create-time workspace root is persisted"
+        );
+
+        Fleet::create(
+            store.clone(),
+            "f-no-root",
+            controller(),
+            None,
+            "default",
+            budget(1_000),
+            "obj",
+            vec![spec("a", &[])],
+            0,
+        )
+        .await
+        .unwrap();
+        let rec = store
+            .get_fleet("f-no-root")
+            .await
+            .unwrap()
+            .expect("fleet exists");
+        assert_eq!(
+            rec.controller_workspace_root, None,
+            "no root persists as None"
+        );
+    }
+
+    #[tokio::test]
     async fn create_sets_initial_ready_and_planned_from_deps() {
         let (_d, store) = fresh().await;
         let fleet = Fleet::create(
             store.clone(),
             "f1",
             controller(),
+            None,
             "default",
             budget(1_000),
             "obj",
@@ -1008,6 +1066,7 @@ mod tests {
             store.clone(),
             "f1",
             controller(),
+            None,
             "default",
             budget(1_000),
             "obj",
@@ -1026,6 +1085,7 @@ mod tests {
             store.clone(),
             "f1",
             controller(),
+            None,
             "default",
             budget(1_000),
             "obj",
@@ -1057,6 +1117,7 @@ mod tests {
             store.clone(),
             "f1",
             controller(),
+            None,
             "default",
             budget(10_000),
             "obj",
@@ -1091,6 +1152,7 @@ mod tests {
             store.clone(),
             "f1",
             controller(),
+            None,
             "default",
             budget(1_000),
             "obj",
@@ -1124,6 +1186,7 @@ mod tests {
             store.clone(),
             "f1",
             controller(),
+            None,
             "default",
             budget(1_000),
             "obj",
@@ -1169,6 +1232,7 @@ mod tests {
             store.clone(),
             "f1",
             controller(),
+            None,
             "default",
             budget(10_000),
             "obj",
@@ -1191,6 +1255,7 @@ mod tests {
             store.clone(),
             "f1",
             controller(),
+            None,
             "default",
             budget(1_000),
             "obj",
@@ -1227,6 +1292,7 @@ mod tests {
             store.clone(),
             "f1",
             controller(),
+            None,
             "default",
             budget(100),
             "obj",
@@ -1294,6 +1360,7 @@ mod tests {
             store.clone(),
             "f1",
             controller(),
+            None,
             "default",
             budget(1_000),
             "obj",
@@ -1342,6 +1409,7 @@ mod tests {
             store.clone(),
             "f1",
             controller(),
+            None,
             "default",
             budget(1_000),
             "obj",
@@ -1403,6 +1471,7 @@ mod tests {
             store.clone(),
             "f1",
             controller(),
+            None,
             "default",
             budget(1_000),
             "obj",
@@ -1440,6 +1509,7 @@ mod tests {
             store.clone(),
             "f1",
             controller(),
+            None,
             "default",
             budget(1_000),
             "obj",
@@ -1535,6 +1605,7 @@ mod tests {
             store.clone(),
             "f1",
             controller(),
+            None,
             "default",
             budget(1_000),
             "ship it",
@@ -1581,6 +1652,7 @@ mod tests {
             store.clone(),
             "f1",
             controller(),
+            None,
             "default",
             budget(10_000),
             "obj",
@@ -1611,6 +1683,7 @@ mod tests {
             store.clone(),
             "f1",
             controller(),
+            None,
             "default",
             budget(1_000),
             "obj",
@@ -1633,6 +1706,7 @@ mod tests {
             store.clone(),
             "f1",
             controller(),
+            None,
             "default",
             budget(1_000),
             "obj",
@@ -1666,6 +1740,7 @@ mod tests {
             store.clone(),
             "f1",
             controller(),
+            None,
             "default",
             budget(1_000),
             "obj",
@@ -1699,6 +1774,7 @@ mod tests {
             store.clone(),
             "f1",
             controller(),
+            None,
             "default",
             budget(1_000),
             "obj",
@@ -1736,6 +1812,7 @@ mod tests {
             store.clone(),
             "f1",
             controller(),
+            None,
             "default",
             budget(1_000),
             "obj",
@@ -1777,6 +1854,7 @@ mod tests {
             store.clone(),
             "f1",
             controller(),
+            None,
             "default",
             budget(1_000),
             "obj",
@@ -1864,6 +1942,7 @@ mod tests {
             store.clone(),
             "f1",
             controller(),
+            None,
             "default",
             budget(10_000),
             "obj",
@@ -1932,6 +2011,7 @@ mod tests {
             store.clone(),
             "f1",
             controller(),
+            None,
             "default",
             budget(1_000_000),
             "obj",
@@ -1990,6 +2070,7 @@ mod tests {
             store.clone(),
             "f1",
             controller(),
+            None,
             "default",
             budget(1_000),
             "obj",
@@ -2015,6 +2096,7 @@ mod tests {
             store.clone(),
             "f1",
             controller(),
+            None,
             "default",
             budget(1_000),
             "obj",
@@ -2035,6 +2117,7 @@ mod tests {
             store.clone(),
             "f1",
             controller(),
+            None,
             "default",
             budget(1_000),
             "obj",
@@ -2070,6 +2153,7 @@ mod tests {
             store.clone(),
             "f1",
             controller(),
+            None,
             "default",
             budget(1_000),
             "obj",
@@ -2150,6 +2234,7 @@ mod tests {
             store.clone(),
             "f1",
             controller(),
+            None,
             "default",
             budget(10_000),
             "obj",
@@ -2213,6 +2298,7 @@ mod tests {
             store.clone(),
             "f1",
             controller(),
+            None,
             "default",
             budget(1_000_000),
             "obj",
@@ -2296,6 +2382,7 @@ mod tests {
             store.clone(),
             "f1",
             controller(),
+            None,
             "default",
             budget(10_000),
             "obj",
@@ -2364,6 +2451,7 @@ mod tests {
                 store.clone(),
                 fid.clone(),
                 controller(),
+                None,
                 "default",
                 budget(1_000_000),
                 "obj",

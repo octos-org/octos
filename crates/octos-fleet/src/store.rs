@@ -201,10 +201,12 @@ impl FleetKernelStore {
 
     /// Create a fresh fleet (generation 0, `Active`, soft/hard budget).
     /// Rejects a duplicate `fleet_id` rather than clobbering live state.
+    #[allow(clippy::too_many_arguments)] // fleet identity + controller + budget columns are irreducible here
     pub async fn create_fleet(
         &self,
         fleet_id: &str,
         controller_session_key: SessionKey,
+        controller_workspace_root: Option<String>,
         profile_id: &str,
         token_budget: u64,
         hard: bool,
@@ -227,6 +229,7 @@ impl FleetKernelStore {
                     schema_version: SCHEMA_VERSION,
                     fleet_id: fleet_id.clone(),
                     controller_session_key,
+                    controller_workspace_root,
                     profile_id,
                     budget: FleetBudget {
                         token_budget,
@@ -296,9 +299,11 @@ impl FleetKernelStore {
     /// graph (unique ids, no dangling / self / cyclic deps) **before**
     /// calling this; the store only enforces key-safety and duplicate
     /// rejection.
+    #[allow(clippy::too_many_arguments)] // fleet identity + controller + budget + plan inputs are irreducible here
     pub async fn create_fleet_with_plan(
         &self,
         controller_session_key: SessionKey,
+        controller_workspace_root: Option<String>,
         profile_id: &str,
         token_budget: u64,
         hard: bool,
@@ -337,6 +342,7 @@ impl FleetKernelStore {
                     schema_version: SCHEMA_VERSION,
                     fleet_id: fleet_id.clone(),
                     controller_session_key,
+                    controller_workspace_root,
                     profile_id,
                     budget: FleetBudget {
                         token_budget,
@@ -2005,7 +2011,7 @@ mod tests {
     /// A fleet with one dep-free (immediately `Ready`) child.
     async fn fleet_with_ready_child(store: &FleetKernelStore, budget: u64) {
         store
-            .create_fleet("f1", controller(), "default", budget, false, 0)
+            .create_fleet("f1", controller(), None, "default", budget, false, 0)
             .await
             .unwrap();
         store.add_child("f1", "c1", vec![], 0).await.unwrap();
@@ -2078,7 +2084,7 @@ mod tests {
         {
             let store = FleetKernelStore::open(dir.path()).await.unwrap();
             store
-                .create_fleet("f1", controller(), "default", 500, false, 1)
+                .create_fleet("f1", controller(), None, "default", 500, false, 1)
                 .await
                 .unwrap();
             assert!(store.path().ends_with("fleet-kernel.redb"));
@@ -2094,12 +2100,12 @@ mod tests {
     async fn create_fleet_rejects_duplicate() {
         let (_d, store) = fresh().await;
         store
-            .create_fleet("f1", controller(), "default", 100, false, 0)
+            .create_fleet("f1", controller(), None, "default", 100, false, 0)
             .await
             .unwrap();
         assert!(
             store
-                .create_fleet("f1", controller(), "default", 100, false, 0)
+                .create_fleet("f1", controller(), None, "default", 100, false, 0)
                 .await
                 .is_err()
         );
@@ -2109,7 +2115,7 @@ mod tests {
     async fn create_plan_is_insert_only() {
         let (_d, store) = fresh().await;
         store
-            .create_fleet("f1", controller(), "default", 100, false, 0)
+            .create_fleet("f1", controller(), None, "default", 100, false, 0)
             .await
             .unwrap();
         store.create_plan(plan("f1", 0, vec![])).await.unwrap();
@@ -2197,7 +2203,7 @@ mod tests {
     async fn launch_rejected_when_child_not_ready() {
         let (_d, store) = fresh().await;
         store
-            .create_fleet("f1", controller(), "default", 1_000, false, 0)
+            .create_fleet("f1", controller(), None, "default", 1_000, false, 0)
             .await
             .unwrap();
         store
@@ -2631,7 +2637,7 @@ mod tests {
     async fn replan_interrupts_surviving_running_attempt_and_frees_reservation() {
         let (_d, store) = fresh().await;
         store
-            .create_fleet("f1", controller(), "default", 100, false, 0)
+            .create_fleet("f1", controller(), None, "default", 100, false, 0)
             .await
             .unwrap();
         store
@@ -2749,7 +2755,7 @@ mod tests {
     async fn replan_survivor_with_new_unmet_dep_becomes_planned() {
         let (_d, store) = fresh().await;
         store
-            .create_fleet("f1", controller(), "default", 1_000, false, 0)
+            .create_fleet("f1", controller(), None, "default", 1_000, false, 0)
             .await
             .unwrap();
         store
@@ -2794,7 +2800,7 @@ mod tests {
     async fn replan_removed_live_child_releases_reservation() {
         let (_d, store) = fresh().await;
         store
-            .create_fleet("f1", controller(), "default", 100, false, 0)
+            .create_fleet("f1", controller(), None, "default", 100, false, 0)
             .await
             .unwrap();
         store
@@ -2848,7 +2854,7 @@ mod tests {
     async fn replan_readds_removed_task_as_fresh_child() {
         let (_d, store) = fresh().await;
         store
-            .create_fleet("f1", controller(), "default", 100, false, 0)
+            .create_fleet("f1", controller(), None, "default", 100, false, 0)
             .await
             .unwrap();
         store
@@ -3088,7 +3094,7 @@ mod tests {
     async fn replan_is_revision_fenced() {
         let (_d, store) = fresh().await;
         store
-            .create_fleet("f1", controller(), "default", 100, false, 0)
+            .create_fleet("f1", controller(), None, "default", 100, false, 0)
             .await
             .unwrap();
         store.create_plan(plan("f1", 0, vec![])).await.unwrap();
@@ -3116,7 +3122,7 @@ mod tests {
     async fn add_child_and_mark_ready_resolve_dependencies() {
         let (_d, store) = fresh().await;
         store
-            .create_fleet("f1", controller(), "default", 1_000, false, 0)
+            .create_fleet("f1", controller(), None, "default", 1_000, false, 0)
             .await
             .unwrap();
         store.add_child("f1", "a", vec![], 0).await.unwrap();
@@ -3162,11 +3168,11 @@ mod tests {
     async fn list_children_scopes_to_fleet_and_sorts() {
         let (_d, store) = fresh().await;
         store
-            .create_fleet("f1", controller(), "default", 100, false, 0)
+            .create_fleet("f1", controller(), None, "default", 100, false, 0)
             .await
             .unwrap();
         store
-            .create_fleet("f2", controller(), "default", 100, false, 0)
+            .create_fleet("f2", controller(), None, "default", 100, false, 0)
             .await
             .unwrap();
         store.add_child("f1", "b", vec![], 0).await.unwrap();
@@ -3285,7 +3291,7 @@ mod tests {
     async fn load_drops_row_with_higher_schema_version() {
         let (_d, store) = fresh().await;
         store
-            .create_fleet("f1", controller(), "default", 100, false, 0)
+            .create_fleet("f1", controller(), None, "default", 100, false, 0)
             .await
             .unwrap();
         let raw = r#"{"schema_version":3,"fleet_id":"f1","controller_session_key":"fleet:controller-1","profile_id":"default","budget":{"token_budget":100,"tokens_reserved":0,"tokens_committed":0,"hard":false},"status":"Active","generation":0,"created_at_ms":0,"updated_at_ms":0}"#;
@@ -3299,7 +3305,7 @@ mod tests {
     async fn key_components_reject_control_chars_preventing_collision() {
         let (_d, store) = fresh().await;
         store
-            .create_fleet("f", controller(), "default", 100, false, 0)
+            .create_fleet("f", controller(), None, "default", 100, false, 0)
             .await
             .unwrap();
 
@@ -3308,7 +3314,7 @@ mod tests {
         assert!(store.add_child("f", "x\0c", vec![], 0).await.is_err());
         assert!(
             store
-                .create_fleet("f\0x", controller(), "default", 100, false, 0)
+                .create_fleet("f\0x", controller(), None, "default", 100, false, 0)
                 .await
                 .is_err()
         );
