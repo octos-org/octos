@@ -104,6 +104,7 @@ pub async fn create_fleet(
         store,
         fleet_id,
         controller(),
+        None,
         "default",
         budget(1_000_000),
         "objective",
