@@ -888,6 +888,13 @@ impl Tool for ShellTool {
 mod tests {
     use super::*;
 
+    /// Runaway guard for the "poll until the background task reaches state X"
+    /// loops below. NOT a latency assertion: each loop breaks the instant the
+    /// supervisor reports a terminal status, so a generous ceiling costs a passing
+    /// run nothing, and a genuinely broken run still fails — just later.
+    /// Mirrors `spawn_tests::BACKGROUND_DEADLINE`.
+    const BACKGROUND_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
+
     #[test]
     fn shell_tool_is_exclusive() {
         // Shell must serialize relative to peers (M8.8) — a mutating command
@@ -1385,7 +1392,7 @@ mod tests {
                     panic!("background task failed: {:?}", t.error);
                 }
             }
-            if started.elapsed() > std::time::Duration::from_secs(15) {
+            if started.elapsed() > BACKGROUND_DEADLINE {
                 let statuses: Vec<_> = supervisor
                     .get_tasks_for_session("api:test-session")
                     .iter()
@@ -1468,7 +1475,7 @@ mod tests {
                     panic!("expected failure, task completed");
                 }
             }
-            if started.elapsed() > std::time::Duration::from_secs(15) {
+            if started.elapsed() > BACKGROUND_DEADLINE {
                 panic!("background failure not observed in 15s");
             }
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;

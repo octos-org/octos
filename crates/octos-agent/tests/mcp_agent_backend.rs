@@ -27,6 +27,20 @@ use octos_agent::tools::mcp_agent::{
     StdioMcpAgent, build_backend_from_config, build_dispatch_event_payload, dispatch_with_metrics,
 };
 
+/// Headroom for spawn + MCP handshake + reply in the stdio dispatch tests that
+/// are NOT about timing. It is not an assertion — nothing here should reach it.
+///
+/// `StdioMcpAgent::dispatch_inner` wraps the *whole* run in this budget, so 5s
+/// had to cover `/bin/sh` startup, the initialize round-trip, the
+/// notification-skip loop (which forks `printf | grep` per iteration), a
+/// `printf | sed` fork, and the tools/call reply — all on a CI runner that may
+/// be running the rest of the suite at full parallelism.
+///
+/// The two tests that genuinely exercise the timeout path set their own budget
+/// via `with_dispatch_timeout` (300ms / 150ms) and pass
+/// `dispatch_timeout_secs: None`, so this constant cannot weaken them.
+const STDIO_DISPATCH_TIMEOUT_SECS: u64 = 120;
+
 // ── Helpers ────────────────────────────────────────────────────────────────
 
 /// Build a throwaway shell-script MCP server that answers two requests:
@@ -214,7 +228,7 @@ async fn should_dispatch_to_stdio_mcp_agent_and_return_contract_artifact() {
         cmd: script.display().to_string(),
         args: vec![],
         env: HashMap::new(),
-        dispatch_timeout_secs: Some(5),
+        dispatch_timeout_secs: Some(STDIO_DISPATCH_TIMEOUT_SECS),
     };
     let backend =
         build_backend_from_config(&config, Some(dir.path())).expect("build stdio backend");
@@ -393,7 +407,7 @@ async fn should_apply_blocked_env_vars_to_stdio_subprocess() {
         cmd: script.display().to_string(),
         args: vec![],
         env: extra,
-        dispatch_timeout_secs: Some(5),
+        dispatch_timeout_secs: Some(STDIO_DISPATCH_TIMEOUT_SECS),
     };
     let backend = StdioMcpAgent::from_config(&config)
         .unwrap()
@@ -473,7 +487,7 @@ async fn should_emit_sub_agent_dispatch_event_on_typed_payload() {
         cmd: script.display().to_string(),
         args: vec![],
         env: HashMap::new(),
-        dispatch_timeout_secs: Some(5),
+        dispatch_timeout_secs: Some(STDIO_DISPATCH_TIMEOUT_SECS),
     };
     let backend =
         build_backend_from_config(&config, Some(dir.path())).expect("build stdio backend");
@@ -558,7 +572,7 @@ printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"content":[{"type":"text","text
         cmd: script_path.display().to_string(),
         args: vec![],
         env: HashMap::new(),
-        dispatch_timeout_secs: Some(5),
+        dispatch_timeout_secs: Some(STDIO_DISPATCH_TIMEOUT_SECS),
     };
     let backend = StdioMcpAgent::from_config(&config)
         .unwrap()
