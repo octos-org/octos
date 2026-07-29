@@ -424,12 +424,22 @@ fn allocate_worker_worktree(
                 path.display()
             )
         })?;
+        // `git worktree add` (and the later `git worktree remove` in
+        // `prune_worker_worktree`) cannot parse a Windows verbatim path:
+        // `canonicalize` yields `\\?\C:\…`, which git turns into `//?/C:/…`
+        // and rejects ("could not create leading directories"). Strip the
+        // prefix for git and for the stored path (reused by prune, status
+        // writes, and the worker's own working directory). `dunce::simplified`
+        // is a no-op on Unix and on already-simple paths; the exists- and
+        // session-scope checks above already ran against the un-simplified
+        // path, so containment guarantees are unaffected.
+        let git_path = dunce::simplified(&path).to_path_buf();
         let output = Command::new("git")
             .arg("-C")
             .arg(&repo_root)
             .args(["worktree", "add", "-b"])
             .arg(&branch)
-            .arg(&path)
+            .arg(&git_path)
             .arg("HEAD")
             .output()
             .wrap_err("failed to run git worktree add")?;
@@ -439,7 +449,11 @@ fn allocate_worker_worktree(
                 String::from_utf8_lossy(&output.stderr).trim()
             ));
         }
-        let allocation = WorkerWorktree { slug, branch, path };
+        let allocation = WorkerWorktree {
+            slug,
+            branch,
+            path: git_path,
+        };
         allocation.mark_status("spawned");
         return Ok((WorkerWorktreeGuard::new(repo_root, allocation), child_scope));
     }

@@ -1,0 +1,7 @@
+# The harness compat-gate fixture skill is a POSIX `sh` script. It is executed
+# via its `#!/usr/bin/env sh` shebang on Unix and via `sh <path>` on Windows
+# (windows-latest has no shebang support). It MUST keep LF line endings on every
+# platform: CRLF breaks the shebang on Unix, and CRLF handling in `sh` varies by
+# Git-for-Windows version. Pinning `eol=lf` makes checkout deterministic and
+# overrides a Windows checkout's `core.autocrlf=true`.
+e2e/fixtures/compat-test-skill/main text eol=lf

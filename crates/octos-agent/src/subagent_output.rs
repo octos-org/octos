@@ -146,8 +146,22 @@ impl SubAgentOutputRouter {
     }
 
     /// Resolve the per-task output file path.
+    ///
+    /// `session_id` (e.g. `agent:<tool_call_id>`) and `task_id` are attacker-
+    /// or caller-controlled and may contain characters that are illegal in a
+    /// path component on some platforms — most importantly `:`, which is a
+    /// reserved drive / NTFS alternate-data-stream separator on Windows and
+    /// makes `create_dir_all` fail with `NotADirectory` (os error 267). Both
+    /// components are therefore percent-encoded through
+    /// [`octos_core::safe_filename`] — the same filename-safety scheme used
+    /// for session files elsewhere in the workspace — before they touch the
+    /// filesystem. This is the single source of truth for the on-disk path;
+    /// `ensure_handle` derives its directory from here, so writes and reads
+    /// always resolve to the same file on every platform.
     pub fn path_for(&self, session_id: &str, task_id: &str) -> PathBuf {
-        self.root.join(session_id).join(format!("{task_id}.out"))
+        self.root
+            .join(octos_core::safe_filename(session_id))
+            .join(format!("{}.out", octos_core::safe_filename(task_id)))
     }
 
     /// Append raw bytes to the output file for `task_id`, honoring both
@@ -359,9 +373,13 @@ impl SubAgentOutputRouter {
         task_id: &str,
     ) -> std::io::Result<()> {
         if !handles.contains_key(task_id) {
-            let parent = self.root.join(session_id);
-            std::fs::create_dir_all(&parent)?;
-            let path = parent.join(format!("{task_id}.out"));
+            // `path_for` is the single source of truth for the encoded on-disk
+            // path; derive the session directory from it so a write and a
+            // later read can never disagree on how a component was encoded.
+            let path = self.path_for(session_id, task_id);
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
 
             // Reject symlink targets up front — create() with O_NOFOLLOW will
             // error on Unix, but we also pre-check on all platforms so the
@@ -443,6 +461,43 @@ mod tests {
         assert_ne!(p1, p2);
         assert_eq!(std::fs::read_to_string(&p1).unwrap(), "alpha");
         assert_eq!(std::fs::read_to_string(&p2).unwrap(), "beta");
+    }
+
+    #[test]
+    fn should_encode_illegal_path_chars_in_session_and_task_ids() {
+        // Regression (Windows): spawn_only sub-agents key the router on a
+        // session id of `agent:<tool_call_id>`. `:` is a reserved drive /
+        // NTFS ADS separator on Windows, so joining it as a raw path
+        // component made `create_dir_all` fail with `NotADirectory`
+        // (os error 267), taking out every read_task_output and
+        // spawn-streaming test. The component must be filename-encoded
+        // before it touches the filesystem — and identically on read and
+        // write so the file round-trips.
+        let dir = tempfile::TempDir::new().unwrap();
+        let router = make_router(dir.path());
+
+        let session_id = "agent:019fa9db-1234-7abc";
+        assert_eq!(
+            router.append(session_id, "task-1", b"payload").unwrap(),
+            AppendResult::Ok
+        );
+
+        let path = router.path_for(session_id, "task-1");
+        // No raw `:` may survive into any component *under* the router root
+        // (the root itself may legitimately contain a drive-letter colon).
+        let relative = path.strip_prefix(dir.path()).unwrap();
+        assert!(
+            !relative.to_string_lossy().contains(':'),
+            "encoded path must not contain a raw ':': {}",
+            relative.display()
+        );
+        // The exact path the writer used must be readable back.
+        assert!(
+            path.exists(),
+            "router file should exist at {}",
+            path.display()
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "payload");
     }
 
     #[test]

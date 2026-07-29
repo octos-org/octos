@@ -375,10 +375,13 @@ mod tests {
             map.get("OCTOS_PROFILE_ID").map(String::as_str),
             Some("dspfac")
         );
-        assert_eq!(
-            map.get("OCTOS_VOICE_DIR").map(String::as_str),
-            Some("/tmp/profile-data/voice_profiles")
-        );
+        // Derive the expectation the way the product does (`Path::join`), so
+        // the separator matches on Windows (`\`) as well as Unix (`/`).
+        let expected_voice = data_dir
+            .join("voice_profiles")
+            .to_string_lossy()
+            .to_string();
+        assert_eq!(map.get("OCTOS_VOICE_DIR"), Some(&expected_voice));
         assert_eq!(
             map.get("OMINIX_API_URL").map(String::as_str),
             Some("http://127.0.0.1:8765")

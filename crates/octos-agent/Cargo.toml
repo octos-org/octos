@@ -30,6 +30,10 @@ globset = { workspace = true }
 # sandbox (so `sh -c` reconstructs the exact argv rather than word-splitting).
 shlex = "1"
 which = { workspace = true }
+# Strip Windows `\\?\` verbatim path prefixes (from `fs::canonicalize`) before
+# handing paths to external programs like git, which mangle `\\?\C:\…` into
+# `//?/C:/…` and fail. No-op on Unix and on already-simple paths.
+dunce = "1"
 regex = { workspace = true }
 ignore = { workspace = true }
 futures = { workspace = true }

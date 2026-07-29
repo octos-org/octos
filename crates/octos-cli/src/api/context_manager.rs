@@ -454,7 +454,14 @@ fn context_ledger_artifact_path(data_dir: &Path, artifact_ref: &str) -> Result<P
     let mut path = root.clone();
     for component in Path::new(artifact_ref).components() {
         match component {
-            Component::Normal(part) => path.push(part),
+            Component::Normal(part) => {
+                // Percent-encode reserved bytes (notably `:` from the
+                // `sha256:<hex>` content address) so the sidecar filename is
+                // valid on Windows, where `:` is the drive/ADS separator.
+                // Writer and readers both route through this function, so the
+                // on-disk name stays consistent across platforms.
+                path.push(octos_core::safe_filename(&part.to_string_lossy()));
+            }
             _ => {
                 return Err(format!(
                     "invalid context artifact reference contains non-normal component: {artifact_ref}"

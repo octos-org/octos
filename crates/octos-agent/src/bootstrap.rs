@@ -311,7 +311,16 @@ pub fn bootstrap_single_skill(octos_home: &Path, name: &str) -> bool {
         Some(d) => d,
         None => return false,
     };
+    bootstrap_single_skill_in(&exe_dir, octos_home, name)
+}
 
+/// Testable seam for [`bootstrap_single_skill`] (the public caller resolves
+/// `exe_dir` via `current_exe`). Bootstraps the single named skill from a
+/// sibling binary found in `exe_dir`; returns `true` on success. Mirrors the
+/// [`bootstrap_entries`] / [`bootstrap_entries_in`] split so tests can pass a
+/// controlled `exe_dir` rather than depending on whatever sits beside the test
+/// runner (on Windows cargo leaves bare-named skill `.exe`s in `deps/`).
+fn bootstrap_single_skill_in(exe_dir: &Path, octos_home: &Path, name: &str) -> bool {
     // Determine which list this skill belongs to and its target directory
     let (entry, subdir) =
         if let Some(e) = BUNDLED_APP_SKILLS.iter().find(|&&(d, _, _, _)| d == name) {
@@ -327,7 +336,7 @@ pub fn bootstrap_single_skill(octos_home: &Path, name: &str) -> bool {
     let skill_dir = octos_home.join(subdir).join(dir_name);
     let main_path = skill_dir.join("main");
 
-    let src_binary = match resolve_sibling_binary(&exe_dir, binary_name) {
+    let src_binary = match resolve_sibling_binary(exe_dir, binary_name) {
         Some(p) => p,
         None => return false,
     };
@@ -466,10 +475,18 @@ mod tests {
     #[test]
     fn bootstrap_bundled_skills_with_empty_dir_returns_zero() {
         let tmp = tempfile::tempdir().unwrap();
+        // Point the bootstrap seam at a controlled, EMPTY exe_dir. Unit tests
+        // run from `target/debug/deps/`, and on Windows cargo drops bare-named
+        // skill binaries (`weather.exe`, `news_fetch.exe`, …) right there next
+        // to the test runner — so probing beside the real runner finds sibling
+        // binaries and bootstraps them (this test used to see 7 on Windows).
+        // An empty exe_dir exercises the "no sibling binaries → nothing
+        // bootstrapped" invariant deterministically on every platform.
+        let exe_dir = tmp.path().join("exe");
         let skills_dir = tmp.path().join("skills");
+        std::fs::create_dir_all(&exe_dir).unwrap();
         std::fs::create_dir_all(&skills_dir).unwrap();
-        // No sibling binaries exist next to the test runner, so nothing gets bootstrapped.
-        let count = bootstrap_bundled_skills(&skills_dir);
+        let count = bootstrap_entries_in(&exe_dir, &skills_dir, BUNDLED_APP_SKILLS);
         assert_eq!(count, 0);
     }
 
@@ -484,10 +501,16 @@ mod tests {
     #[test]
     fn bootstrap_single_skill_valid_name_no_binary_returns_false() {
         let tmp = tempfile::tempdir().unwrap();
+        // Controlled empty exe_dir (see the empty-dir test above): on Windows
+        // the real test runner has sibling skill `.exe`s in `deps/`, so probe
+        // an empty dir to exercise the "known name, missing binary" path.
+        let exe_dir = tmp.path().join("exe");
         let skills_dir = tmp.path().join("skills");
+        std::fs::create_dir_all(&exe_dir).unwrap();
         std::fs::create_dir_all(&skills_dir).unwrap();
-        // "news" is a real bundled skill name, but the binary won't exist next to the test runner.
-        assert!(!bootstrap_single_skill(&skills_dir, "news"));
+        // "news" is a real bundled skill name, but no sibling binary exists in
+        // the empty exe_dir, so bootstrap must fail.
+        assert!(!bootstrap_single_skill_in(&exe_dir, &skills_dir, "news"));
     }
 
     #[test]

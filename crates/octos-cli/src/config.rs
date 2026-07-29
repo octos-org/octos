@@ -1713,7 +1713,16 @@ impl Config {
         //    legacy path differs from config_home (so we don't double-check the
         //    same file). Explicit/tenant contexts never reach here.
         if is_default {
-            if let Some(home) = dirs::home_dir() {
+            // Prefer an explicit `HOME` before the OS profile dir so the legacy
+            // `~/.octos` lookup is testable and user-overridable on Windows,
+            // where `dirs::home_dir()` reads FOLDERID_Profile and ignores
+            // `HOME`/`USERPROFILE`. On Unix `dirs::home_dir()` already consults
+            // `HOME`, so this is behaviour-preserving there.
+            let legacy_home = std::env::var_os("HOME")
+                .filter(|value| !value.is_empty())
+                .map(PathBuf::from)
+                .or_else(dirs::home_dir);
+            if let Some(home) = legacy_home {
                 let legacy_config = home.join(".octos").join("config.json");
                 if legacy_config != home_config && legacy_config.exists() {
                     tracing::info!(

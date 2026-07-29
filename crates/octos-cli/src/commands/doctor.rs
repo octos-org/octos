@@ -2357,10 +2357,18 @@ mod tests {
         let data_dir = temp.path().to_path_buf();
         write_session(&data_dir.join("sessions"), "s.jsonl", &[r#"{"a":1}"#]);
         let now = chrono::Utc::now().to_rfc3339();
-        let profile: crate::profiles::UserProfile = serde_json::from_str(&format!(
-            r#"{{"id":"alias","name":"alias","enabled":true,"config":{{}},"data_dir":"{}","created_at":"{now}","updated_at":"{now}"}}"#,
-            data_dir.display()
-        ))
+        // Build via `json!` so a Windows `data_dir` (backslashes) is escaped
+        // correctly. Interpolating it into a raw JSON string produced invalid
+        // escapes (`\U`, `\A`, ...) that made `from_str` panic on Windows.
+        let profile: crate::profiles::UserProfile = serde_json::from_value(serde_json::json!({
+            "id": "alias",
+            "name": "alias",
+            "enabled": true,
+            "config": {},
+            "data_dir": data_dir.to_string_lossy(),
+            "created_at": now.clone(),
+            "updated_at": now,
+        }))
         .unwrap();
         let profiles: Vec<DiscoveredProfile> = vec![("alias".into(), Ok(profile))];
 

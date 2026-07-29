@@ -28,7 +28,9 @@ fn octos_binary() -> PathBuf {
     let mut path = std::env::current_exe().expect("current_exe");
     path.pop(); // test binary name
     path.pop(); // deps
-    path.push("octos");
+    // Cargo emits the binary as `octos.exe` on Windows and `octos` elsewhere;
+    // `std::env::consts::EXE_SUFFIX` is "" on Unix, so this is a no-op there.
+    path.push(format!("octos{}", std::env::consts::EXE_SUFFIX));
     path
 }
 
@@ -74,7 +76,18 @@ fn run_skill_main(
         "installed skill missing binary at {}",
         main_path.display()
     );
-    let mut cmd = Command::new(&main_path);
+    // The fixture `main` is a `#!/usr/bin/env sh` script. On Unix the kernel
+    // honours the shebang so it runs directly; Windows has no shebang support
+    // and launching the script as an image fails with ERROR_BAD_EXE_FORMAT
+    // (os error 193), so route it through the Git-Bash `sh` present on
+    // windows-latest. Forward-slash the path since `\` is an escape in `sh`.
+    let mut cmd = if cfg!(windows) {
+        let mut c = Command::new("sh");
+        c.arg(main_path.to_string_lossy().replace('\\', "/"));
+        c
+    } else {
+        Command::new(&main_path)
+    };
     cmd.arg(tool);
     cmd.stdin(std::process::Stdio::piped());
     cmd.stdout(std::process::Stdio::piped());

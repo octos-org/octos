@@ -902,24 +902,35 @@ fn run_site_bootstrap(
     std::fs::create_dir_all(project_dir)
         .map_err(|e| format!("create site project dir failed: {e}"))?;
 
-    let status = if metadata.template == "quarto-lesson" {
+    // Windows CI runs these bootstrap scripts through Git Bash (MSYS2),
+    // whose coreutils treat `\` as a literal character rather than a path
+    // separator. A backslash-spelled `--out-dir "C:\...\out"` makes the
+    // script's `mkdir -p` fail ("Invalid argument"), and `set -euo pipefail`
+    // then aborts with exit code 1 — the failure surfaced on windows-latest.
+    // Forward-slash spellings are understood by every bash flavour (MSYS2,
+    // Cygwin, real Unix), so hand the script forward-slash paths. `replace`
+    // is a lexical no-op on Unix, where paths carry no backslashes.
+    let to_bash = |p: PathBuf| p.to_string_lossy().replace('\\', "/");
+    let out_dir_arg = to_bash(project_dir.to_path_buf());
+
+    let output = if metadata.template == "quarto-lesson" {
         Command::new("bash")
-            .arg(scripts_dir.join("bootstrap_quarto_lesson.sh"))
+            .arg(to_bash(scripts_dir.join("bootstrap_quarto_lesson.sh")))
             .arg("--out-dir")
-            .arg(project_dir)
+            .arg(&out_dir_arg)
             .arg("--title")
             .arg(&metadata.site_name)
             .arg("--description")
             .arg(&metadata.description)
-            .status()
+            .output()
             .map_err(|e| format!("spawn Quarto bootstrap failed: {e}"))?
     } else {
         Command::new("bash")
-            .arg(scripts_dir.join("bootstrap_template.sh"))
+            .arg(to_bash(scripts_dir.join("bootstrap_template.sh")))
             .arg("--template")
             .arg(&metadata.template)
             .arg("--out-dir")
-            .arg(project_dir)
+            .arg(&out_dir_arg)
             .arg("--site-name")
             .arg(&metadata.site_name)
             .arg("--description")
@@ -930,14 +941,23 @@ fn run_site_bootstrap(
             .arg("en")
             .arg("--base-path")
             .arg(site_bootstrap_base_path(metadata))
-            .status()
+            .output()
             .map_err(|e| format!("spawn site bootstrap failed: {e}"))?
     };
 
-    if !status.success() {
+    if !output.status.success() {
+        // Surface the script's own stdout/stderr. A bare "exit code: 1" is
+        // undebuggable — especially on windows-latest, where these scripts
+        // run under Git Bash (MSYS2) and can fail for path/tooling reasons
+        // the caller never sees. Echo the resolved out-dir too, so path
+        // normalisation problems are visible at the failure site.
         return Err(format!(
-            "site bootstrap failed for {} with status {}",
-            metadata.template, status
+            "site bootstrap failed for {} with status {} \
+             (out-dir={out_dir_arg:?}) stdout={:?} stderr={:?}",
+            metadata.template,
+            output.status,
+            String::from_utf8_lossy(&output.stdout).trim(),
+            String::from_utf8_lossy(&output.stderr).trim(),
         ));
     }
 

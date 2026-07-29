@@ -106,6 +106,7 @@ fn tool_produces_primary_artifact_matching_policy_glob() {
     assert!(
         out.artifact_path
             .to_string_lossy()
+            .replace('\\', "/")
             .starts_with("output/artifact-")
     );
     assert!(out.artifact_path.extension().and_then(|e| e.to_str()) == Some("txt"));
@@ -158,7 +159,11 @@ fn lifecycle_state_transitions_queued_running_verifying_ready() {
 /// policies (suffix + single `*` body segment). It is NOT a general glob
 /// engine — the runtime uses the `glob` crate with gitignore semantics.
 fn path_matches_glob(path: &Path, pattern: &str) -> bool {
-    let path_str = path.to_string_lossy();
+    // Normalize `\` -> `/` so the `/`-based policy globs match on Windows,
+    // where `to_string_lossy()` renders backslash separators. The real runtime
+    // globs the filesystem via the `glob` crate (separator-agnostic); this
+    // helper only mirrors that at the string level for the smoke assertion.
+    let path_str = path.to_string_lossy().replace('\\', "/");
     let (prefix, rest) = match pattern.split_once('*') {
         Some(pair) => pair,
         None => return path_str == pattern,
