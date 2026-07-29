@@ -1427,21 +1427,16 @@ pub async fn session_workspace_contract(
     // `sess.data_dir()` BEFORE checking the host-routed profile, so a
     // cross-tenant header on a TRUSTED hop exposed the victim
     // profile's workspace-contract statuses. The Layer-2 gate runs
-    // up-front; `state.sessions.data_dir()` only resolves when the
-    // routed profile is authorized (admin / owner / self).
+    // up-front, and data-directory selection below must remain identical
+    // to the companion `session_files` surface.
     if let Err(response) = authorized_routed_profile_id_from_headers(&state, &headers, identity_ref)
     {
         return response;
     }
 
-    let data_dir = if let Some(sessions) = &state.sessions {
-        let sess = sessions.lock().await;
-        sess.data_dir()
-    } else {
-        match resolve_profile_data_dir(&state, &headers, identity_ref).await {
-            Ok(data_dir) => data_dir,
-            Err(response) => return response,
-        }
+    let data_dir = match resolve_file_access_data_dir(&state, &headers, identity_ref).await {
+        Ok(data_dir) => data_dir,
+        Err(response) => return response,
     };
 
     let mut statuses = Vec::new();
@@ -4959,8 +4954,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn should_read_profile_workspace_files_when_authenticated_user_and_global_store_coexist()
-    {
+    async fn profile_workspace_surfaces_ignore_global_session_store() {
         use crate::profiles::{ProfileStore, UserProfile};
         use crate::user_store::UserRole;
 
@@ -4997,7 +4991,7 @@ mod tests {
         });
 
         let response = session_files(
-            State(state),
+            State(state.clone()),
             HeaderMap::new(),
             Some(Extension(AuthIdentity::User {
                 id: "learner".into(),
@@ -5014,6 +5008,37 @@ mod tests {
         let files: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
         assert_eq!(files.len(), 1, "profile artifact must be listed: {files:?}");
         assert_eq!(files[0]["filename"], "artifact.json");
+
+        let profile_repo =
+            profile_data_dir.join("users/web-profile-scope/workspace/slides/profile-deck");
+        std::fs::create_dir_all(&profile_repo).unwrap();
+        let global_repo = global_data_dir
+            .path()
+            .join("users/web-profile-scope/workspace/slides/global-deck");
+        std::fs::create_dir_all(&global_repo).unwrap();
+
+        let response = session_workspace_contract(
+            State(state),
+            HeaderMap::new(),
+            Some(Extension(AuthIdentity::User {
+                id: "learner".into(),
+                role: UserRole::User,
+            })),
+            axum::extract::Path("web-profile-scope".into()),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let contracts: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            contracts.len(),
+            1,
+            "only the profile workspace contract must be listed: {contracts:?}"
+        );
+        assert_eq!(contracts[0]["repo_label"], "slides/profile-deck");
     }
 
     #[tokio::test]
