@@ -95,6 +95,10 @@ pub(crate) fn browser_origin_allowlist(
 /// `Url::origin()`'s ASCII serialization makes equivalent spellings (scheme
 /// or host case, default ports, IDNs) compare exactly after startup.
 fn normalize_appui_origin(raw: &str) -> eyre::Result<String> {
+    eyre::ensure!(
+        !raw.chars().any(char::is_control),
+        "control characters are not valid in an exact browser origin"
+    );
     let candidate = raw.trim();
     eyre::ensure!(!candidate.is_empty(), "origin is empty");
     eyre::ensure!(
@@ -154,9 +158,9 @@ fn normalize_appui_origin(raw: &str) -> eyre::Result<String> {
 ///
 /// A non-empty `OCTOS_APPUI_ALLOWED_ORIGINS` value replaces the config list;
 /// an absent or whitespace-only value leaves config authoritative. The
-/// running HTTP port's three loopback spellings are appended automatically.
-/// Port `0` is intentionally skipped because its eventual ephemeral port is
-/// unknown at this stage and must be configured explicitly if needed.
+/// bound HTTP port's three loopback spellings are appended automatically.
+/// HTTP serve resolves an ephemeral `--port 0` before calling this helper;
+/// a literal `0` is only meaningful to non-HTTP callers and adds no origin.
 pub(crate) fn resolve_appui_allowed_origins(
     configured: &[String],
     env_value: Option<&str>,
@@ -1793,6 +1797,9 @@ mod tests {
             "https://example.com/.",
             "https://example.com/foo/..",
             "https://example.com\\.",
+            "h\tttps://example.com",
+            "https://exa\nmple.com",
+            "https://exa\rmple.com",
             "https://example.com/?query=1",
             "https://example.com/#fragment",
             "ws://example.com",
@@ -1859,6 +1866,37 @@ mod tests {
                 .get(axum::http::header::ACCESS_CONTROL_ALLOW_CREDENTIALS)
                 .is_none(),
             "origin configuration must not opt CORS into ambient credentials"
+        );
+
+        let preflight = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(axum::http::Method::OPTIONS)
+                    .uri("/api/auth/status")
+                    .header(axum::http::header::ORIGIN, "http://localhost:50081")
+                    .header(axum::http::header::ACCESS_CONTROL_REQUEST_METHOD, "POST")
+                    .header(
+                        axum::http::header::ACCESS_CONTROL_REQUEST_HEADERS,
+                        "authorization",
+                    )
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            preflight
+                .headers()
+                .get(axum::http::header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                .and_then(|value| value.to_str().ok()),
+            Some("http://localhost:50081")
+        );
+        assert!(
+            preflight
+                .headers()
+                .get(axum::http::header::ACCESS_CONTROL_ALLOW_CREDENTIALS)
+                .is_none()
         );
 
         let wrong_port = app

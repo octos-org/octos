@@ -195,8 +195,8 @@ The complete configuration structure with all available fields:
 ## Browser AppUI Origins
 
 `octos serve` retains the existing OminiX/base-domain and development origins,
-and automatically allows loopback origins on the configured non-zero
-`--port`. Add every other browser origin explicitly—including a LAN address
+and automatically allows loopback origins on the actual bound port (including
+an OS-selected `--port 0`). Add every other browser origin explicitly—including a LAN address
 or custom hostname used to reach the embedded assets:
 
 ```json

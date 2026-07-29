@@ -183,7 +183,8 @@
 ## 浏览器 AppUI Origin
 
 `octos serve` 会保留既有 OminiX/base-domain 与开发 Origin，并自动允许
-配置的非零 `--port` 上的 loopback Origin。其他浏览器 Origin 都必须逐个
+实际绑定端口（包括系统为 `--port 0` 选定的端口）上的 loopback Origin。
+其他浏览器 Origin 都必须逐个
 显式配置——包括用 LAN 地址或自定义主机名访问同一份内嵌资源的情况：
 
 ```json
