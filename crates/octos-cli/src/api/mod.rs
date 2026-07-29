@@ -17,6 +17,7 @@ pub(crate) mod coding_tool_contract;
 mod cron_panel;
 mod events;
 mod events_harness;
+pub(crate) mod fleet_wake;
 mod frps_plugin;
 pub(crate) mod goal_loop_runtime;
 mod handlers;

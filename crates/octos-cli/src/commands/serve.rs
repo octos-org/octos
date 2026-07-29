@@ -529,6 +529,28 @@ impl ServeCommand {
             }
         }
 
+        // Fleet-kernel outbox consumer (#1857 PR 4a): open the durable fleet
+        // store beside the supervisor store — guarded by the same serve
+        // single-writer lock, and redb is single-process, so the sibling
+        // `fleet-kernel.redb` is safe — install it on the orchestrator and
+        // spawn the background consumer that turns `ChildDone` / `FleetDrained`
+        // events into keeper wake-ups. Dormant until a fleet writes events (a
+        // later PR); a failure to open is non-fatal (fleet features stay inert).
+        match octos_fleet::FleetKernelStore::open(data_dir.join("fleet-kernel")).await {
+            Ok(fleet_store) => {
+                crate::api::agent_orchestrator::default_agent_orchestrator()
+                    .set_fleet_store(fleet_store.clone());
+                crate::api::fleet_wake::spawn_fleet_outbox_consumer(fleet_store);
+                tracing::info!("fleet-kernel outbox consumer started");
+            }
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    "failed to open fleet-kernel store; fleet wake consumer not started"
+                );
+            }
+        }
+
         let broadcaster = Arc::new(EventBroadcaster::new(256));
 
         // M11-F: per-profile LLM, credentials, tool registry, plugins,
