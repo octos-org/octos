@@ -26986,6 +26986,23 @@ async fn run_standalone_turn(
     // use that as the `workspace_hint`. Otherwise the bootstrap default
     // Tier-3 (`<profile_data_dir>/users/.../workspace`) wins.
     let hint = session_workspaces().get(&session_id);
+    // #1857 PR 5a — THE LOAD-BEARING SEAM: on a goal turn, stash the resolved
+    // controller workspace root on the goal record (keyed by the SCOPED
+    // `goal_session_key`) BEFORE the keeper's `goal_plan` can run mid-turn. It
+    // MUST equal the same `hint` the turn runs under, so `Fleet::create` stamps
+    // the EXACT root a later `ChildDone` wake rehydrates a headless keeper with
+    // (PR 4b) — a fabricated root would silently execute against the wrong repo
+    // after a restart. Only a live-client turn has a `session_workspaces()`
+    // entry; a headless pre-fleet `GoalContinue` passes `None`, which leaves any
+    // previously-captured root intact (same client-dependence as the existing
+    // goal feature).
+    if let Some(goal_ctx) = goal_context.as_ref() {
+        default_agent_orchestrator().set_goal_workspace_root(
+            &goal_ctx.goal_session_key,
+            hint.as_ref()
+                .map(|path| path.to_string_lossy().into_owned()),
+        );
+    }
     let permissions_epoch = state.session_cache.session_generation(&session_id);
     let permissions = match effective_permissions_for_session(&state, &session_id) {
         Ok(permissions) => permissions,

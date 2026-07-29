@@ -160,50 +160,68 @@ pub async fn run_attempt(
     // validators a weaker (e.g. no-op) sandbox.
     let sandbox = factory.sandbox_for(working_dir);
 
-    // 3. Fresh, closed-registry agent (cannot park, cannot fan out) under the
-    //    shared sandbox. Its per-tool timeouts AND per-command shell ceiling
-    //    are clamped to `deadline` (P1-2).
-    let agent = factory.build_agent(working_dir, sandbox.clone(), deadline);
+    // #1857 PR 5a fix (H1, codex round 2) — ATTEMPT-TIME fail-closed. The serve
+    // boot probe checks ONE sandbox instance, but the factory reconstructs the
+    // sandbox PER attempt and `SandboxMode::Auto` can fall through to `NoSandbox`
+    // if the backend (e.g. bwrap) became unavailable AFTER boot. The closed tool
+    // set is a denylist, not a boundary — the shell's network/host reach is
+    // bounded ONLY by the sandbox — so a no-op sandbox here means running a fleet
+    // worker unsandboxed. REFUSE: settle the attempt `Terminated` (via the normal
+    // `complete_child` path below, so the child ends terminal, not silently
+    // unsandboxed) WITHOUT ever building or running the agent.
+    let computed = if sandbox.is_noop() {
+        tracing::error!(
+            %fleet_id, %task_id, %attempt_id,
+            "fleet worker: no isolating sandbox available at attempt time; terminating the \
+             attempt instead of running the agent unsandboxed",
+        );
+        Computed::terminated("no isolating sandbox available at attempt time".to_string())
+    } else {
+        // 3. Fresh, closed-registry agent (cannot park, cannot fan out) under the
+        //    shared sandbox. Its per-tool timeouts AND per-command shell ceiling
+        //    are clamped to `deadline` (P1-2).
+        let agent = factory.build_agent(working_dir, sandbox.clone(), deadline);
 
-    // 4. Run under a HARD deadline — `run_task` is cancel-safe to drop and
-    //    has NO internal wall-clock cap, so the timeout wrapper is mandatory.
-    let start = Instant::now();
-    let run = tokio::time::timeout(deadline, agent.run_task(&task)).await;
-    let elapsed = start.elapsed();
+        // 4. Run under a HARD deadline — `run_task` is cancel-safe to drop and
+        //    has NO internal wall-clock cap, so the timeout wrapper is mandatory.
+        let start = Instant::now();
+        let run = tokio::time::timeout(deadline, agent.run_task(&task)).await;
+        let elapsed = start.elapsed();
 
-    // 5-6. Map the result to a verdict + snapshot inputs.
-    let computed = match run {
-        Err(_elapsed) => {
-            Computed::terminated(format!("deadline exceeded after {}s", deadline.as_secs()))
-        }
-        Ok(Err(report)) => Computed::terminated(format!("run failed: {report}")),
-        Ok(Ok(result)) if !result.success => {
-            let reason = if result.output.trim().is_empty() {
-                "run did not succeed".to_string()
-            } else {
-                result.output.clone()
-            };
-            Computed::rejected(reason, &result)
-        }
-        Ok(Ok(result)) => {
-            // P1-5b: bound the acceptance phase by the REMAINING deadline so a
-            // slow `CommandExit` validator can't hold both permits past the
-            // fleet deadline. A small floor keeps a right-at-the-edge run from
-            // getting a 0ms acceptance budget.
-            let remaining = deadline
-                .checked_sub(elapsed)
-                .unwrap_or(Duration::ZERO)
-                .max(ACCEPTANCE_MIN_BUDGET);
-            let (verdict, error) = run_acceptance(
-                task_view,
-                working_dir,
-                factory,
-                sandbox,
-                deadline.as_secs().max(1),
-                remaining,
-            )
-            .await;
-            Computed::from_verdict(verdict, error, &result)
+        // 5-6. Map the result to a verdict + snapshot inputs.
+        match run {
+            Err(_elapsed) => {
+                Computed::terminated(format!("deadline exceeded after {}s", deadline.as_secs()))
+            }
+            Ok(Err(report)) => Computed::terminated(format!("run failed: {report}")),
+            Ok(Ok(result)) if !result.success => {
+                let reason = if result.output.trim().is_empty() {
+                    "run did not succeed".to_string()
+                } else {
+                    result.output.clone()
+                };
+                Computed::rejected(reason, &result)
+            }
+            Ok(Ok(result)) => {
+                // P1-5b: bound the acceptance phase by the REMAINING deadline so a
+                // slow `CommandExit` validator can't hold both permits past the
+                // fleet deadline. A small floor keeps a right-at-the-edge run from
+                // getting a 0ms acceptance budget.
+                let remaining = deadline
+                    .checked_sub(elapsed)
+                    .unwrap_or(Duration::ZERO)
+                    .max(ACCEPTANCE_MIN_BUDGET);
+                let (verdict, error) = run_acceptance(
+                    task_view,
+                    working_dir,
+                    factory,
+                    sandbox,
+                    deadline.as_secs().max(1),
+                    remaining,
+                )
+                .await;
+                Computed::from_verdict(verdict, error, &result)
+            }
         }
     };
 
@@ -793,9 +811,12 @@ mod tests {
         let factory = AgentFactory::new(
             Arc::new(SuccessProvider),
             memory,
+            // MarkerSandbox (isolating test double) so the attempt-time
+            // fail-closed guard (H1) lets the agent run; still counts factory
+            // invocations to prove the single-shared-instance contract.
             Arc::new(move |_| {
                 seen.fetch_add(1, Ordering::SeqCst);
-                Arc::new(NoSandbox) as Arc<dyn Sandbox>
+                Arc::new(MarkerSandbox) as Arc<dyn Sandbox>
             }),
         );
         let task_view = view_of(&fleet, "a").await;
@@ -827,6 +848,70 @@ mod tests {
             1,
             "the sandbox factory must be invoked exactly once per attempt (shared instance)",
         );
+    }
+
+    /// #1857 PR 5a fix (H1, codex round 2) — ATTEMPT-TIME fail-closed: the boot
+    /// probe checks ONE sandbox, but the factory rebuilds the sandbox per attempt
+    /// and `Auto` can fall through to `NoSandbox` if the backend vanished AFTER
+    /// boot. A no-op sandbox at attempt time must TERMINATE the attempt WITHOUT
+    /// building or running the agent — never run a fleet worker unsandboxed.
+    #[tokio::test]
+    async fn run_attempt_terminates_when_sandbox_is_not_isolating() {
+        let (_sd, store) = fresh_store().await;
+        let fleet = create_fleet(
+            store.clone(),
+            "f1",
+            vec![task_spec("a", &[], file_exists("out.txt"))],
+        )
+        .await;
+        let attempt = launch(&store, "f1", "a").await;
+
+        let work = TempDir::new().unwrap();
+        let (_md, memory) = fresh_memory().await;
+        // A genuine no-op sandbox + a provider that MUST NOT be called: proving
+        // the attempt aborts BEFORE the agent (and thus any LLM call) is built.
+        let calls = Arc::new(AtomicUsize::new(0));
+        let factory = AgentFactory::new(
+            Arc::new(CountingProvider {
+                calls: calls.clone(),
+            }),
+            memory,
+            Arc::new(|_| Arc::new(NoSandbox) as Arc<dyn Sandbox>),
+        );
+        let task_view = view_of(&fleet, "a").await;
+
+        let outcome = run_attempt(
+            store.clone(),
+            "f1",
+            "a",
+            &attempt,
+            &task_view,
+            &factory,
+            work.path(),
+            Duration::from_secs(30),
+            EPOCH,
+            || NOW,
+        )
+        .await;
+
+        assert!(
+            matches!(
+                outcome,
+                AttemptOutcome::Completed {
+                    verdict: AcceptanceVerdict::Terminated { .. }
+                }
+            ),
+            "a no-op sandbox must Terminate the attempt, got {outcome:?}",
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "the agent/LLM must NEVER run under a no-op sandbox",
+        );
+        // Recorded via the normal completion path: the child ends terminal
+        // (Failed), not silently left running unsandboxed.
+        let child = store.get_child("f1", "a").await.unwrap().unwrap();
+        assert_eq!(child.status, ChildStatus::Failed);
     }
 
     #[tokio::test]

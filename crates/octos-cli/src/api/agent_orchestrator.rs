@@ -28,7 +28,10 @@ use octos_core::ui_protocol::{
     OutputCursor, RpcError, autonomy_error_kinds as kinds, methods, rpc_error_codes,
 };
 use octos_core::{AgentId, MAIN_PROFILE_ID, SessionKey, TaskId};
-use octos_fleet::FleetKernelStore;
+use octos_fleet::{
+    AcceptanceVerdict, Fleet, FleetBudget, FleetKernelStore, LaunchOutcome, TaskSpec,
+};
+use octos_fleet_worker::FleetWorkerPool;
 use octos_llm::LlmProvider;
 use octos_memory::EpisodeStore;
 use serde_json::{Value, json};
@@ -985,9 +988,26 @@ impl InProcessAgentOrchestrator {
     /// `supervisor_store` pair); the drain loop owns its own store clone, so the
     /// first live reader is PR 4b headless rehydration (re-seed the controller's
     /// workspace from the installed store) — hence `allow(dead_code)` in 4a.
-    #[allow(dead_code)]
     pub(crate) fn fleet_store(&self) -> Option<FleetKernelStore> {
         self.state().fleet_store.clone()
+    }
+
+    /// #1857 PR 5a — install the live fleet worker pool (built at serve boot
+    /// from the keeper profile's `ProfileRuntime`). The goal keeper's
+    /// `goal_dispatch` tool reaches it through [`Self::fleet_pool`] to launch
+    /// ready tasks. Mirrors [`Self::set_fleet_store`]; `None` on the
+    /// chat/gateway boot paths (no fleet kernel) and in unit tests that don't
+    /// dispatch.
+    pub(crate) fn set_fleet_pool(&self, pool: Arc<FleetWorkerPool>) {
+        let mut state = self.state();
+        state.fleet_pool = Some(pool);
+    }
+
+    /// The installed fleet worker pool (`Arc` clone out of the lock). `None`
+    /// until [`Self::set_fleet_pool`] runs at serve boot — the symmetric read
+    /// accessor `model_dispatch_fleet` uses to launch a goal's ready tasks.
+    pub(crate) fn fleet_pool(&self) -> Option<Arc<FleetWorkerPool>> {
+        self.state().fleet_pool.clone()
     }
 
     /// #1857 PR 4a — drain the fleet outbox once against this orchestrator's
@@ -3122,6 +3142,458 @@ impl InProcessAgentOrchestrator {
         Ok(autonomy_goal_json(&snapshot))
     }
 
+    /// #1857 PR 5a — stash the controller workspace root on the goal record at
+    /// goal-turn start. THE LOAD-BEARING SEAM: `run_standalone_turn` resolves
+    /// `session_workspaces().get(wire)` server-side and calls this with the
+    /// already-SCOPED `goal_session_key`, so by the time the keeper's
+    /// `goal_plan` runs mid-turn the root is on the record and `Fleet::create`
+    /// can stamp it onto the `FleetRecord` — a `ChildDone` wake then rehydrates
+    /// a headless keeper across a serve restart (PR 4b). Keyed by the scoped
+    /// goal key DIRECTLY (family-2, like `record_goal_turn`), never re-scoped.
+    /// A `None` root (a headless turn with no live-client workspace) leaves any
+    /// previously-captured root intact rather than stripping the seam. Returns
+    /// whether a matching goal record was updated.
+    pub(crate) fn set_goal_workspace_root(
+        &self,
+        goal_session_key: &SessionKey,
+        root: Option<String>,
+    ) -> bool {
+        let Some(root) = root else {
+            return false;
+        };
+        let mut state = self.state();
+        let Some(goal) = state.goals.get_mut(goal_session_key) else {
+            return false;
+        };
+        if goal.controller_workspace_root.as_deref() == Some(root.as_str()) {
+            // Already current — skip the persist churn.
+            return true;
+        }
+        goal.controller_workspace_root = Some(root);
+        goal.updated_at_ms = now_ms();
+        let snapshot = goal.clone();
+        persist_goal_state(&state, goal_session_key, &snapshot, false);
+        true
+    }
+
+    /// #1857 PR 5a fix (H3, codex round 2) — confirm a fleet record genuinely
+    /// belongs to THIS goal before binding it (for re-attach or dispatch): its
+    /// `controller_session_key` must equal the goal's SCOPED key and its
+    /// `profile_id` the goal's profile. Guards against binding an UNRELATED fleet
+    /// — e.g. a legacy deterministic `goal_NN` id reused after clear+restart, or
+    /// any stale/corrupted `goal.fleet_id` — whose tasks would dispatch under,
+    /// and whose completion would wake, the WRONG controller. Ok(()) on match;
+    /// Err(reason) on mismatch or a missing/unreadable record.
+    async fn fleet_belongs_to_goal(
+        store: &FleetKernelStore,
+        fleet_id: &str,
+        expected_controller: &SessionKey,
+        expected_profile: &str,
+    ) -> Result<(), String> {
+        match store.get_fleet(fleet_id).await {
+            Ok(Some(rec)) => {
+                if &rec.controller_session_key == expected_controller
+                    && rec.profile_id == expected_profile
+                {
+                    Ok(())
+                } else {
+                    Err(format!(
+                        "fleet `{fleet_id}` does not belong to this goal (controller/profile \
+                         mismatch); refusing to bind an unrelated fleet"
+                    ))
+                }
+            }
+            Ok(None) => Err(format!("fleet `{fleet_id}` not found; refusing to bind")),
+            Err(e) => Err(format!(
+                "failed to load fleet `{fleet_id}` for validation: {e}"
+            )),
+        }
+    }
+
+    /// #1857 PR 5a fix (H3, codex round 3) — the ONE gate for binding a goal's
+    /// fleet: validate `fleet_id` belongs to this goal
+    /// ([`Self::fleet_belongs_to_goal`]: controller == the SCOPED goal key AND
+    /// profile == the goal's profile) and ONLY THEN [`Fleet::bind`] it. Every
+    /// path that acts on `goal.fleet_id` (goal_plan's already-planned fast path,
+    /// goal_dispatch, goal_get's snapshot) routes through here, so no path can
+    /// ever bind — or read/mutate/complete-from — a fleet that isn't the goal's.
+    async fn resolve_owned_fleet(
+        store: Arc<FleetKernelStore>,
+        fleet_id: &str,
+        expected_controller: &SessionKey,
+        expected_profile: &str,
+    ) -> Result<Fleet, String> {
+        Self::fleet_belongs_to_goal(&store, fleet_id, expected_controller, expected_profile)
+            .await?;
+        Ok(Fleet::bind(store, fleet_id))
+    }
+
+    /// #1857 PR 5a — `goal_plan` tool: lazily create the durable fleet this goal
+    /// drives and decompose the objective onto `tasks`. Idempotent — a goal that
+    /// already has a `fleet_id` returns "already planned" rather than recreating
+    /// the fleet. Binds the fleet's `controller_session_key` to the SCOPED goal
+    /// key (MANDATORY for the `ChildDone` wake round-trip: the wake targets
+    /// `controller.to_string()`) and stamps the controller workspace root
+    /// captured at turn start — refusing to create a fleet without it, which
+    /// would be un-rehydratable after a restart.
+    pub(crate) async fn model_create_fleet_plan(
+        &self,
+        session_id: &SessionKey,
+        profile_id: &str,
+        tasks: Vec<TaskSpec>,
+        now_ms: u64,
+    ) -> Result<Value, String> {
+        if tasks.is_empty() {
+            return Err("goal_plan requires at least one task".to_owned());
+        }
+        // The tool passes the PLAIN wire key; re-scope to THIS folder's goal
+        // (mirrors `model_transition_goal`).
+        let key = self.scoped_goal_key(session_id);
+        // #1857 PR 5a fix (HIGH 4) — the pool binds ONE keeper profile; a goal
+        // on a different profile must NOT run its tasks on this pool's
+        // model/sandbox (its completion wake would return to the OTHER profile).
+        // Captured before the state lock (`fleet_pool` takes its own lock); also
+        // carries the per-task token projection for the MEDIUM warning below.
+        let pool = self.fleet_pool();
+        let (existing_fleet, root, objective, token_budget, goal_id) = {
+            let state = self.state();
+            let Some(goal) = state.goals.get(&key) else {
+                return Err("no goal is set for this session".to_owned());
+            };
+            if goal.profile_id != profile_id {
+                return Err("goal is outside this profile's scope".to_owned());
+            }
+            if let Some(pool) = &pool {
+                if goal.profile_id != pool.keeper_profile_id() {
+                    return Err(format!(
+                        "fleet dispatch is only available for the keeper profile `{}` in v1 \
+                         (this goal is on profile `{}`)",
+                        pool.keeper_profile_id(),
+                        goal.profile_id,
+                    ));
+                }
+            }
+            (
+                goal.fleet_id.clone(),
+                goal.controller_workspace_root.clone(),
+                goal.objective.clone(),
+                goal.token_budget,
+                goal.goal_id.clone(),
+            )
+        };
+        if let Some(fleet_id) = existing_fleet {
+            // #1857 PR 5a fix (H3, codex round 3) — validate the existing binding
+            // belongs to this goal before returning it: never surface a foreign
+            // fleet id from a stale/corrupt `goal.fleet_id`.
+            let Some(store) = self.fleet_store() else {
+                return Err(
+                    "fleet kernel store is not available (serve boot did not open it)".to_owned(),
+                );
+            };
+            Self::resolve_owned_fleet(Arc::new(store), &fleet_id, &key, profile_id).await?;
+            return Ok(json!({
+                "status": "already_planned",
+                "fleet_id": fleet_id,
+            }));
+        }
+        let Some(root) = root else {
+            return Err(
+                "workspace root not resolved for this goal — create the plan on a live session. \
+                 The controller root is captured at goal-turn start and is required so a \
+                 fleet-completion wake can rehydrate the keeper after a restart."
+                    .to_owned(),
+            );
+        };
+        let Some(store) = self.fleet_store() else {
+            return Err(
+                "fleet kernel store is not available (serve boot did not open it)".to_owned(),
+            );
+        };
+        let store = Arc::new(store);
+        // #1857 PR 5a fix (H3, codex round 2) — GLOBALLY-UNIQUE fleet id. The
+        // goal id is a REUSED sequence (`goal_NN`): after `goal_clear` + restart,
+        // `next_goal_seq` is rebuilt only from SURVIVING goals, so a new goal can
+        // take the same `goal_NN` a cleared goal once held. A deterministic
+        // `fleet_id == goal_id` would then collide with the cleared goal's
+        // orphaned fleet and re-attach an UNRELATED fleet (wrong controller /
+        // profile / root) — dispatching its tasks and waking the WRONG keeper. A
+        // uuid suffix makes the id globally unique, so a re-plan across the crash
+        // window at worst orphans a never-dispatched fleet (benign) and NEVER
+        // rebinds a foreign one. Idempotency for THIS goal is preserved by the
+        // `goal.fleet_id.is_some()` early return above (already planned → bind).
+        let fleet_id = format!("{goal_id}-{}", uuid::Uuid::now_v7());
+        let budget = FleetBudget {
+            token_budget,
+            tokens_reserved: 0,
+            tokens_committed: 0,
+            hard: false,
+        };
+        let task_count = tasks.len();
+        let reattached = match Fleet::create(
+            store.clone(),
+            fleet_id.clone(),
+            // The SCOPED controller session key — the wake round-trip target.
+            key.clone(),
+            Some(root),
+            profile_id,
+            budget,
+            objective,
+            tasks,
+            now_ms,
+        )
+        .await
+        {
+            Ok(_) => false,
+            // Defense-in-depth (unreachable under unique ids, but the create+bind
+            // window is still not one transaction): if a create ever reports a
+            // duplicate, VALIDATE the existing fleet is genuinely this goal's
+            // before binding it — a mismatch means an unrelated fleet, so refuse.
+            Err(e) if e.to_string().contains("already exists") => {
+                Self::fleet_belongs_to_goal(&store, &fleet_id, &key, profile_id).await?;
+                tracing::warn!(
+                    fleet_id = %fleet_id,
+                    "goal_plan: fleet already exists AND validated as this goal's; re-attaching",
+                );
+                true
+            }
+            Err(e) => return Err(format!("failed to create fleet plan: {e}")),
+        };
+        // Stash the binding on the goal record (single-lock RMW; persist).
+        {
+            let mut state = self.state();
+            if let Some(goal) = state.goals.get_mut(&key) {
+                goal.fleet_id = Some(fleet_id.clone());
+                goal.updated_at_ms = now_ms as i64;
+                let snapshot = goal.clone();
+                persist_goal_state(&state, &key, &snapshot, false);
+            }
+        }
+        tracing::info!(
+            session = %session_id,
+            fleet_id = %fleet_id,
+            tasks = task_count,
+            reattached,
+            "goal keeper created a fleet plan via goal_plan tool"
+        );
+        let mut result = json!({
+            "status": if reattached { "reattached" } else { "planned" },
+            "fleet_id": fleet_id,
+            "tasks": task_count,
+        });
+        // #1857 PR 5a fix (MEDIUM) — warn when the goal's WHOLE token budget
+        // can't fund even one task: every launch would be RejectedBudgetExceeded,
+        // so goal_dispatch would otherwise report a silent no-op. Surface it at
+        // plan time so the keeper (or user) raises the budget first.
+        if let Some(pool) = &pool {
+            let projected = pool.projected_tokens();
+            if token_budget < projected {
+                result["budget_warning"] = json!(format!(
+                    "goal token budget {token_budget} is below the per-task projection \
+                     {projected}; tasks will be rejected for budget until the budget is raised"
+                ));
+            }
+        }
+        Ok(result)
+    }
+
+    /// #1857 PR 5a — `goal_dispatch` tool: launch every ready task of this
+    /// goal's fleet onto the live worker pool. Each `pool.dispatch` auto-appends
+    /// the `ChildDone` wake on completion (no extra wiring). Errors when the goal
+    /// has no fleet yet (`goal_plan` first) or the pool/store is unset.
+    pub(crate) async fn model_dispatch_fleet(
+        &self,
+        session_id: &SessionKey,
+        profile_id: &str,
+        now_ms: u64,
+    ) -> Result<Value, String> {
+        let key = self.scoped_goal_key(session_id);
+        // #1857 PR 5a fix (HIGH 4) — fetch the pool BEFORE the state lock so its
+        // bound keeper profile can fence a cross-profile goal (mirrors
+        // `model_create_fleet_plan`), then reuse the same handle to dispatch.
+        let pool = self.fleet_pool();
+        let fleet_id = {
+            let state = self.state();
+            let Some(goal) = state.goals.get(&key) else {
+                return Err("no goal is set for this session".to_owned());
+            };
+            if goal.profile_id != profile_id {
+                return Err("goal is outside this profile's scope".to_owned());
+            }
+            if let Some(pool) = &pool {
+                if goal.profile_id != pool.keeper_profile_id() {
+                    return Err(format!(
+                        "fleet dispatch is only available for the keeper profile `{}` in v1 \
+                         (this goal is on profile `{}`)",
+                        pool.keeper_profile_id(),
+                        goal.profile_id,
+                    ));
+                }
+            }
+            goal.fleet_id.clone().ok_or_else(|| {
+                "this goal has no fleet plan yet — call goal_plan first".to_owned()
+            })?
+        };
+        let Some(pool) = pool else {
+            return Err(
+                "fleet worker pool is not available (serve boot did not build it)".to_owned(),
+            );
+        };
+        let Some(store) = self.fleet_store() else {
+            return Err("fleet kernel store is not available".to_owned());
+        };
+        // #1857 PR 5a fix (H3) — validate + bind through the ONE ownership gate:
+        // a stale/foreign binding must never dispatch someone else's tasks or
+        // wake the wrong controller.
+        let fleet = Self::resolve_owned_fleet(Arc::new(store), &fleet_id, &key, profile_id).await?;
+        let ready = fleet
+            .ready_tasks(now_ms)
+            .await
+            .map_err(|e| format!("failed to resolve ready tasks: {e}"))?;
+        let mut dispatched = Vec::new();
+        let mut rejected = Vec::new();
+        for task_id in ready {
+            match pool.dispatch(&fleet_id, &task_id).await {
+                // Production DROPS the JoinHandle (launch-and-return): the
+                // detached background run drives the attempt + appends the wake.
+                Ok(d) => match d.launch {
+                    LaunchOutcome::Launched { attempt_id } => dispatched.push(json!({
+                        "task_id": task_id,
+                        "attempt_id": attempt_id,
+                    })),
+                    other => rejected.push(json!({
+                        "task_id": task_id,
+                        "reason": format!("{other:?}"),
+                    })),
+                },
+                Err(e) => rejected.push(json!({
+                    "task_id": task_id,
+                    "error": e.to_string(),
+                })),
+            }
+        }
+        // #1857 PR 5a fix (MEDIUM) — surface the dispatch outcome so a
+        // budget-starved fleet is NOT reported as a silent success: the keeper
+        // sees explicit counts and, when launches were rejected for budget, a
+        // clear `budget_exhausted` flag + summary telling it to raise the budget.
+        let dispatched_count = dispatched.len();
+        let rejected_count = rejected.len();
+        let budget_label = format!("{:?}", LaunchOutcome::RejectedBudgetExceeded);
+        let budget_rejected = rejected
+            .iter()
+            .filter(|r| r.get("reason").and_then(|v| v.as_str()) == Some(budget_label.as_str()))
+            .count();
+        let mut result = json!({
+            "fleet_id": fleet_id,
+            "dispatched": dispatched,
+            "rejected": rejected,
+            "dispatched_count": dispatched_count,
+            "rejected_count": rejected_count,
+        });
+        if budget_rejected > 0 {
+            result["budget_exhausted"] = json!(true);
+            result["summary"] = json!(format!(
+                "{dispatched_count} task(s) launched, {budget_rejected} rejected: fleet token \
+                 budget exhausted — raise the goal budget to launch the remaining task(s)"
+            ));
+        }
+        Ok(result)
+    }
+
+    /// #1857 PR 5a — the fleet plan view for the `goal_get` tool: objective,
+    /// per-task title/status/verdict, the ready set, and status counts.
+    /// `Ok(None)` when this goal drives no fleet (so `goal_get` renders just the
+    /// budget snapshot), when no goal matches this profile, or when the kernel
+    /// store is unavailable. ALSO the completion self-detection point:
+    /// `FleetDrained` is not emitted in production, so when `Fleet::is_complete`
+    /// holds (every task `Succeeded`/`Accepted`) it transitions the goal to
+    /// `complete` here (idempotent — a re-call is a no-op).
+    ///
+    /// #1857 PR 5a fix (H3, codex round 3) — `Err` when `goal.fleet_id` does NOT
+    /// belong to this goal: a stale/foreign binding must NOT expose or mutate
+    /// (`ready_tasks` promotes) another controller's fleet, and must NEVER mark
+    /// THIS goal complete from a foreign fleet. Ownership is validated through
+    /// [`Self::resolve_owned_fleet`] before any read.
+    pub(crate) async fn model_fleet_snapshot(
+        &self,
+        session_id: &SessionKey,
+        profile_id: &str,
+    ) -> Result<Option<Value>, String> {
+        let key = self.scoped_goal_key(session_id);
+        let fleet_id = {
+            let state = self.state();
+            let Some(goal) = state
+                .goals
+                .get(&key)
+                .filter(|goal| goal.profile_id == profile_id)
+            else {
+                return Ok(None);
+            };
+            match goal.fleet_id.clone() {
+                Some(id) => id,
+                None => return Ok(None),
+            }
+        };
+        let Some(store) = self.fleet_store() else {
+            return Ok(None);
+        };
+        // Validate ownership BEFORE any read: a foreign binding errors here and
+        // never reaches view/ready_tasks/is_complete (nor the completion
+        // transition below).
+        let fleet = Self::resolve_owned_fleet(Arc::new(store), &fleet_id, &key, profile_id).await?;
+        let Ok(view) = fleet.view().await else {
+            return Ok(None);
+        };
+        let summary = fleet.summary().await.ok();
+        let ready = fleet.ready_tasks(now_ms_u64()).await.unwrap_or_default();
+        let complete = fleet.is_complete().await.unwrap_or(false);
+        // Completion self-detection: no `FleetDrained` in production, so the
+        // keeper marks its OWN goal complete once every task is accepted. The
+        // transition is idempotent (a second call errors and is ignored).
+        if complete {
+            let _ = self.model_transition_goal(
+                session_id,
+                profile_id,
+                "complete",
+                "all fleet tasks accepted",
+            );
+        }
+        let tasks: Vec<Value> = view
+            .tasks
+            .iter()
+            .map(|t| {
+                let verdict = match &t.verdict {
+                    Some(AcceptanceVerdict::Accepted { .. }) => "accepted",
+                    Some(AcceptanceVerdict::Rejected { .. }) => "rejected",
+                    Some(AcceptanceVerdict::Terminated { .. }) => "terminated",
+                    None => "",
+                };
+                json!({
+                    "task_id": t.task_id,
+                    "title": t.title,
+                    "status": format!("{:?}", t.status),
+                    "verdict": verdict,
+                })
+            })
+            .collect();
+        Ok(Some(json!({
+            "fleet_id": fleet_id,
+            "objective": view.objective,
+            "status": format!("{:?}", view.status),
+            "complete": complete,
+            "ready": ready,
+            "tasks": tasks,
+            "counts": summary.map(|s| json!({
+                "total": s.total,
+                "planned": s.planned,
+                "ready": s.ready,
+                "running": s.running,
+                "succeeded": s.succeeded,
+                "failed": s.failed,
+                "cancelled": s.cancelled,
+            })),
+        })))
+    }
+
     /// `create_goal` tool (codex parity): the MODEL starts a new goal when the
     /// user or system/developer instructions explicitly ask for one. Rejects if
     /// this session already has an UNFINISHED goal; a `complete` goal MAY be
@@ -3222,6 +3694,50 @@ impl InProcessAgentOrchestrator {
             .goals
             .get(session_id)
             .map(|goal| goal.goal_id.clone())
+    }
+
+    /// PR 5a — the goal's bound `fleet_id` (re-scoped, so tests can pass the
+    /// plain wire key even with a cwd scope registered).
+    #[cfg(test)]
+    pub(crate) fn goal_fleet_id_for_test(&self, session_id: &SessionKey) -> Option<String> {
+        let key = self.scoped_goal_key(session_id);
+        self.state()
+            .goals
+            .get(&key)
+            .and_then(|goal| goal.fleet_id.clone())
+    }
+
+    /// PR 5a fix (HIGH 3) — clear the goal's bound `fleet_id` to simulate the
+    /// create-then-persist crash window: the fleet is durably created but the
+    /// goal binding was never persisted, so a re-plan onto the same `fleet_id`
+    /// must RE-ATTACH rather than duplicate-error forever.
+    #[cfg(test)]
+    pub(crate) fn clear_goal_fleet_id_for_test(&self, session_id: &SessionKey) {
+        let key = self.scoped_goal_key(session_id);
+        if let Some(goal) = self.state().goals.get_mut(&key) {
+            goal.fleet_id = None;
+        }
+    }
+
+    /// PR 5a fix (H3) — force the goal's bound `fleet_id` to simulate a
+    /// stale/foreign binding (a corrupted or migrated record pointing at another
+    /// controller's fleet), so a dispatch must refuse it.
+    #[cfg(test)]
+    pub(crate) fn set_goal_fleet_id_for_test(&self, session_id: &SessionKey, fleet_id: &str) {
+        let key = self.scoped_goal_key(session_id);
+        if let Some(goal) = self.state().goals.get_mut(&key) {
+            goal.fleet_id = Some(fleet_id.to_owned());
+        }
+    }
+
+    /// PR 5a — the goal's stashed controller workspace root (re-scoped).
+    #[cfg(test)]
+    pub(crate) fn goal_workspace_root_for_test(&self, session_id: &SessionKey) -> Option<String> {
+        let key = self.scoped_goal_key(session_id);
+        self.state()
+            .goals
+            .get(&key)
+            .and_then(|goal| goal.controller_workspace_root.clone())
     }
 
     /// #1650 — `time_used_seconds` accessor for the elapsed-only charge test.
@@ -4076,6 +4592,10 @@ impl AgentOrchestrator for InProcessAgentOrchestrator {
                 rate_window_count: 0,
                 wrap_up_emitted: false,
                 consecutive_failed_turns: 0,
+                // PR 5a — no fleet/root until a live goal turn stashes the root
+                // and the keeper's `goal_plan` decomposes onto a fleet.
+                fleet_id: None,
+                controller_workspace_root: None,
             };
             state.goals.insert(key.clone(), goal.clone());
             goal
@@ -4514,6 +5034,11 @@ struct AutonomyRuntimeState {
     /// it against `continuations`. `None` until `set_fleet_store` (never wired
     /// on the chat/gateway boot paths, which have no fleet kernel).
     fleet_store: Option<FleetKernelStore>,
+    /// #1857 PR 5a — live fleet worker pool the goal keeper dispatches ready
+    /// tasks onto (`model_dispatch_fleet`). Installed at serve boot from the
+    /// keeper profile's `ProfileRuntime` (`set_fleet_pool`); `None` on the
+    /// chat/gateway boot paths and in unit tests that don't dispatch.
+    fleet_pool: Option<Arc<FleetWorkerPool>>,
     next_goal_seq: u64,
     next_loop_seq: u64,
     /// #991 / M15-B — per-agent cancellation handles registered by
@@ -4611,6 +5136,20 @@ struct AutonomyGoalRecord {
     /// `blocked` (user-resumable). Reset by any token-consuming turn
     /// and by user re-activation.
     consecutive_failed_turns: u32,
+    /// #1857 PR 5a — the durable fleet this goal drives, once `goal_plan`
+    /// has created it (`<goal_id>`). `None` before the keeper decomposes the
+    /// objective onto a fleet; set once and treated as idempotent (a second
+    /// `goal_plan` returns "already planned" rather than recreating). Rides
+    /// the `SupervisedGroupRecord.metadata` open bag — no schema bump.
+    fleet_id: Option<String>,
+    /// #1857 PR 5a — the controller workspace root captured at goal-turn start
+    /// from `session_workspaces().get(wire)` (the LOAD-BEARING seam:
+    /// `Fleet::create` stamps this onto the `FleetRecord` so a `ChildDone` wake
+    /// can rehydrate a headless keeper across a serve restart — PR 4b). `None`
+    /// until a live-client goal turn stashes it; `goal_plan` refuses to create a
+    /// fleet without it (an un-rehydratable fleet). Persisted in the metadata
+    /// bag alongside `fleet_id`.
+    controller_workspace_root: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -6109,6 +6648,15 @@ fn restore_goal_from_group(state: &mut AutonomyRuntimeState, group: &SupervisedG
         )
         .unwrap_or(0)
         .min(u32::MAX as u64) as u32,
+        // PR 5a — read the fleet binding + controller root back out of the
+        // metadata open bag (missing → None, so pre-5a snapshots restore
+        // unchanged).
+        fleet_id: supervisor_metadata_str(&group.metadata, "fleet_id").map(str::to_owned),
+        controller_workspace_root: supervisor_metadata_str(
+            &group.metadata,
+            "controller_workspace_root",
+        )
+        .map(str::to_owned),
     };
     state.next_goal_seq = state.next_goal_seq.max(sequence_suffix(&goal.goal_id));
     state.goals.insert(session_id, goal);
@@ -6340,6 +6888,9 @@ fn persist_goal_cleared(state: &AutonomyRuntimeState, session_id: &SessionKey, p
         rate_window_count: 0,
         wrap_up_emitted: false,
         consecutive_failed_turns: 0,
+        // PR 5a — a cleared goal drives no fleet.
+        fleet_id: None,
+        controller_workspace_root: None,
     };
     persist_goal_state(state, session_id, &goal, true);
 }
@@ -6417,6 +6968,16 @@ fn persist_goal_state_with_store(
     group.metadata.insert(
         "consecutive_failed_turns".into(),
         json!(goal.consecutive_failed_turns),
+    );
+    // PR 5a — ride the fleet binding + controller root through the open
+    // metadata bag (no schema bump). Both `None` for a pre-fleet or cleared
+    // goal; a serialized `null` restores as `None` via `supervisor_metadata_str`.
+    group
+        .metadata
+        .insert("fleet_id".into(), json!(goal.fleet_id));
+    group.metadata.insert(
+        "controller_workspace_root".into(),
+        json!(goal.controller_workspace_root),
     );
     let event_id = format!(
         "autonomy_goal_state:{}:{}",
@@ -7660,6 +8221,800 @@ mod tests {
         fn provider_name(&self) -> &str {
             "test"
         }
+    }
+
+    // ---- PR 5a: goal keeper drives a fleet (dispatch backbone) -------------
+
+    /// A non-no-op sandbox test double: runs commands directly (like NoSandbox)
+    /// but reports `is_noop() == false`, so the worker's attempt-time fail-closed
+    /// guard (fix H1) lets the mock agent actually run. (octos-fleet-worker's
+    /// testutil holds the twin used by its own tests.)
+    struct MarkerSandbox;
+    impl octos_agent::sandbox::Sandbox for MarkerSandbox {
+        fn wrap_command(
+            &self,
+            shell_command: &str,
+            cwd: &std::path::Path,
+        ) -> tokio::process::Command {
+            octos_agent::sandbox::Sandbox::wrap_command(
+                &octos_agent::sandbox::NoSandbox,
+                shell_command,
+                cwd,
+            )
+        }
+    }
+
+    /// A fresh kernel store in its own tempdir (guard held for its lifetime).
+    async fn fleet_test_store() -> (tempfile::TempDir, FleetKernelStore) {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let store = FleetKernelStore::open(dir.path().join("fleet-kernel"))
+            .await
+            .expect("open fleet store");
+        (dir, store)
+    }
+
+    /// A mock-provider worker pool over `store` (an isolating [`MarkerSandbox`]
+    /// test double + an EndTurn LLM), so `pool.dispatch → run_attempt` runs a
+    /// real attempt to completion without a live model or network — and clears
+    /// the attempt-time fail-closed guard (fix H1). The returned tempdir guards
+    /// the pool's episodic store.
+    /// `keeper_profile_id` is fixed to `tenant-a` — the profile every fleet
+    /// test seeds its goal under — so the keeper fence passes by default; a
+    /// non-keeper-profile test seeds its goal under a DIFFERENT profile.
+    /// `projected_tokens` is caller-chosen so a test can force budget rejection
+    /// (a projection larger than the goal's whole budget).
+    async fn mock_fleet_pool(
+        store: FleetKernelStore,
+        work: &std::path::Path,
+        projected_tokens: u64,
+    ) -> (tempfile::TempDir, Arc<FleetWorkerPool>) {
+        let mem_dir = tempfile::TempDir::new().expect("mem tempdir");
+        let memory = Arc::new(
+            octos_memory::EpisodeStore::open(mem_dir.path())
+                .await
+                .expect("open episode store"),
+        );
+        let sandbox_factory: octos_fleet_worker::SandboxFactory =
+            Arc::new(|_cwd| Arc::new(MarkerSandbox) as Arc<dyn octos_agent::sandbox::Sandbox>);
+        let factory = Arc::new(octos_fleet_worker::AgentFactory::new(
+            Arc::new(NativeMockProvider {
+                content: Ok("done".to_owned()),
+            }),
+            memory,
+            sandbox_factory,
+        ));
+        let cfg = octos_fleet_worker::PoolConfig {
+            global_concurrency: 2,
+            per_fleet_concurrency: 2,
+            deadline: std::time::Duration::from_secs(30),
+            owner_epoch: 1,
+            lease_ttl_ms: 60_000,
+            projected_tokens,
+            workspace_root: work.to_path_buf(),
+            keeper_profile_id: "tenant-a".to_owned(),
+        };
+        let pool = FleetWorkerPool::new(
+            Arc::new(store),
+            factory,
+            cfg,
+            Arc::new(|| chrono::Utc::now().timestamp_millis().max(0) as u64),
+        );
+        (mem_dir, Arc::new(pool))
+    }
+
+    /// Seed an active goal for `session` under `profile`.
+    fn seed_goal(orchestrator: &InProcessAgentOrchestrator, session: &SessionKey, profile: &str) {
+        orchestrator
+            .set_goal(GoalSetRequest {
+                session_id: session.clone(),
+                profile_id: profile.to_owned(),
+                objective: "ship the thing".to_owned(),
+                status: Some("active".to_owned()),
+                token_budget: Some(1_000_000),
+                transition_actor: None,
+            })
+            .expect("set goal");
+    }
+
+    /// One dependency-free task with no acceptance criteria (so the attempt is
+    /// vacuously accepted → the child ends `Succeeded`).
+    fn plan_tasks() -> Vec<TaskSpec> {
+        vec![TaskSpec {
+            task_id: "t1".to_owned(),
+            title: "first task".to_owned(),
+            detail: "do the thing".to_owned(),
+            deps: Vec::new(),
+            acceptance: Vec::new(),
+        }]
+    }
+
+    /// THE load-bearing seam: `goal_plan` must create a fleet whose
+    /// `controller_session_key` is the SCOPED goal key (the wake round-trip
+    /// target) and whose `controller_workspace_root` is the stashed root (the
+    /// 4b rehydration prerequisite); `goal.fleet_id` is set; idempotent.
+    #[tokio::test]
+    async fn goal_plan_creates_a_fleet_bound_to_the_scoped_keeper() {
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let (_sd, store) = fleet_test_store().await;
+        orchestrator.set_fleet_store(store.clone());
+
+        let wire = SessionKey::new("api", "keeper-plan");
+        // Register a cwd scope so the SCOPED goal key DIFFERS from the wire key —
+        // this is what proves the fleet binds to the scoped key (mandatory for
+        // the wake), not the plain wire id.
+        orchestrator.set_goal_scope(&wire, Some("aaaa111122223333".into()));
+        let scoped = orchestrator.scoped_goal_key(&wire);
+        assert_ne!(
+            scoped, wire,
+            "the scope must make the goal key differ from wire"
+        );
+        seed_goal(&orchestrator, &wire, "tenant-a");
+
+        // Stash the controller workspace root under the SCOPED key (the seam
+        // `run_standalone_turn` fills at goal-turn start).
+        let root = "/repos/app".to_owned();
+        assert!(orchestrator.set_goal_workspace_root(&scoped, Some(root.clone())));
+
+        // goal_plan — the tool passes the PLAIN wire key; the method re-scopes.
+        let outcome = orchestrator
+            .model_create_fleet_plan(&wire, "tenant-a", plan_tasks(), 1_000)
+            .await
+            .expect("plan");
+        assert_eq!(outcome["status"], json!("planned"));
+        let fleet_id = outcome["fleet_id"].as_str().expect("fleet_id").to_owned();
+
+        assert_eq!(
+            orchestrator.goal_fleet_id_for_test(&wire).as_deref(),
+            Some(fleet_id.as_str()),
+            "goal.fleet_id is bound",
+        );
+
+        let rec = store
+            .get_fleet(&fleet_id)
+            .await
+            .expect("get_fleet")
+            .expect("fleet exists");
+        assert_eq!(
+            rec.controller_session_key, scoped,
+            "the fleet MUST bind the SCOPED controller key (the wake target)",
+        );
+        assert_eq!(
+            rec.controller_workspace_root.as_deref(),
+            Some(root.as_str()),
+            "the fleet MUST carry the stashed workspace root (4b rehydration)",
+        );
+
+        // Idempotent: a second plan returns already_planned with the same id.
+        let again = orchestrator
+            .model_create_fleet_plan(&wire, "tenant-a", plan_tasks(), 2_000)
+            .await
+            .expect("plan again");
+        assert_eq!(again["status"], json!("already_planned"));
+        assert_eq!(again["fleet_id"].as_str(), Some(fleet_id.as_str()));
+    }
+
+    /// `goal_plan` refuses to create an un-rehydratable fleet: no stashed
+    /// controller workspace root → a clear error, no fleet.
+    #[tokio::test]
+    async fn goal_plan_errors_without_a_resolved_workspace_root() {
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let (_sd, store) = fleet_test_store().await;
+        orchestrator.set_fleet_store(store);
+        let wire = SessionKey::new("api", "keeper-noroot");
+        seed_goal(&orchestrator, &wire, "tenant-a");
+        // No `set_goal_workspace_root` → controller_workspace_root is None.
+        let err = orchestrator
+            .model_create_fleet_plan(&wire, "tenant-a", plan_tasks(), 1_000)
+            .await
+            .expect_err("must error without a resolved workspace root");
+        assert!(err.contains("workspace root"), "unexpected error: {err}");
+        assert_eq!(
+            orchestrator.goal_fleet_id_for_test(&wire),
+            None,
+            "no fleet must be created"
+        );
+    }
+
+    /// `goal_dispatch` launches the ready task onto the live (mock) pool; the
+    /// detached attempt ends the child `Succeeded` and appends a `ChildDone`
+    /// outbox event — the wake source that drives the keeper loop.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn goal_dispatch_launches_ready_tasks_and_records_child_done() {
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let (_sd, store) = fleet_test_store().await;
+        orchestrator.set_fleet_store(store.clone());
+        let work = tempfile::TempDir::new().unwrap();
+        let (_md, pool) = mock_fleet_pool(store.clone(), work.path(), 100).await;
+        orchestrator.set_fleet_pool(pool);
+
+        let wire = SessionKey::new("api", "keeper-dispatch");
+        seed_goal(&orchestrator, &wire, "tenant-a");
+        let scoped = orchestrator.scoped_goal_key(&wire);
+        orchestrator
+            .set_goal_workspace_root(&scoped, Some(work.path().to_string_lossy().into_owned()));
+        let plan = orchestrator
+            .model_create_fleet_plan(&wire, "tenant-a", plan_tasks(), 1_000)
+            .await
+            .expect("plan");
+        let fleet_id = plan["fleet_id"].as_str().unwrap().to_owned();
+
+        let dispatch = orchestrator
+            .model_dispatch_fleet(&wire, "tenant-a", 2_000)
+            .await
+            .expect("dispatch");
+        let dispatched = dispatch["dispatched"].as_array().expect("dispatched array");
+        assert_eq!(
+            dispatched.len(),
+            1,
+            "the ready task must launch: {dispatch}"
+        );
+        assert_eq!(dispatched[0]["task_id"], json!("t1"));
+
+        // Wait for the detached attempt to drive the child terminal.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let status = store
+                .get_child(&fleet_id, "t1")
+                .await
+                .unwrap()
+                .unwrap()
+                .status;
+            if status == octos_fleet::ChildStatus::Succeeded {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "child t1 did not Succeed within 10s (last: {status:?})",
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+
+        // A `ChildDone` outbox event was appended (the keeper-wake source).
+        let mut found_child_done = false;
+        for _ in 0..8 {
+            let Some(ev) = store
+                .claim_next("test-consumer", now_ms_u64(), 30_000)
+                .await
+                .unwrap()
+            else {
+                break;
+            };
+            if ev.kind == octos_fleet::FleetEventKind::ChildDone && ev.fleet_id == fleet_id {
+                found_child_done = true;
+                break;
+            }
+        }
+        assert!(
+            found_child_done,
+            "a ChildDone outbox event must be appended (the wake source)",
+        );
+    }
+
+    /// `goal_dispatch` before `goal_plan` is a clear error (must plan first).
+    #[tokio::test]
+    async fn goal_dispatch_before_plan_errors() {
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let (_sd, store) = fleet_test_store().await;
+        orchestrator.set_fleet_store(store.clone());
+        let work = tempfile::TempDir::new().unwrap();
+        let (_md, pool) = mock_fleet_pool(store, work.path(), 100).await;
+        orchestrator.set_fleet_pool(pool);
+        let wire = SessionKey::new("api", "keeper-noplan");
+        seed_goal(&orchestrator, &wire, "tenant-a");
+        let err = orchestrator
+            .model_dispatch_fleet(&wire, "tenant-a", 1_000)
+            .await
+            .expect_err("dispatch before plan must error");
+        assert!(err.contains("goal_plan"), "unexpected error: {err}");
+    }
+
+    /// Completion self-detection: a fleet whose only task is accepted →
+    /// `goal_get`'s fleet snapshot transitions the goal to `complete` (since
+    /// `FleetDrained` is not emitted in production, the keeper self-detects).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn completion_detected_marks_goal_complete() {
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let (_sd, store) = fleet_test_store().await;
+        orchestrator.set_fleet_store(store.clone());
+        let work = tempfile::TempDir::new().unwrap();
+        let (_md, pool) = mock_fleet_pool(store, work.path(), 100).await;
+
+        let wire = SessionKey::new("api", "keeper-complete");
+        seed_goal(&orchestrator, &wire, "tenant-a");
+        orchestrator.set_goal_workspace_root(
+            &orchestrator.scoped_goal_key(&wire),
+            Some(work.path().to_string_lossy().into_owned()),
+        );
+        let plan = orchestrator
+            .model_create_fleet_plan(&wire, "tenant-a", plan_tasks(), 1_000)
+            .await
+            .expect("plan");
+        let fleet_id = plan["fleet_id"].as_str().unwrap().to_owned();
+
+        // Dispatch the single empty-acceptance task directly and AWAIT it so the
+        // child ends `Succeeded` deterministically (no polling).
+        let d = pool.dispatch(&fleet_id, "t1").await.expect("dispatch");
+        assert!(matches!(d.launch, LaunchOutcome::Launched { .. }));
+        let outcome = d.handle.expect("handle").await.expect("join");
+        assert!(
+            matches!(
+                outcome,
+                octos_fleet_worker::AttemptOutcome::Completed { .. }
+            ),
+            "the mock attempt must complete accepted, got {outcome:?}",
+        );
+
+        // Still active until goal_get's snapshot self-detects completion.
+        assert_eq!(
+            orchestrator.goal_status_for_test(&wire).as_deref(),
+            Some("active"),
+        );
+        let snap = orchestrator
+            .model_fleet_snapshot(&wire, "tenant-a")
+            .await
+            .expect("snapshot must not error for an owned fleet")
+            .expect("fleet snapshot present");
+        assert_eq!(snap["complete"], json!(true), "all tasks accepted: {snap}");
+        assert_eq!(
+            orchestrator.goal_status_for_test(&wire).as_deref(),
+            Some("complete"),
+            "completion self-detection must mark the goal complete",
+        );
+    }
+
+    /// The boot-recovery contract (store-level; mirrors serve boot's call): a
+    /// fresh boot's `reconcile(now, new_epoch)` interrupts an attempt a PRIOR
+    /// boot launched under a different epoch and returns its child to `Ready`.
+    #[tokio::test]
+    async fn owner_epoch_and_reconcile_returns_stale_attempt_to_ready() {
+        let (_sd, store) = fleet_test_store().await;
+        let store = Arc::new(store);
+        Fleet::create(
+            store.clone(),
+            "frecon",
+            SessionKey::new("api", "keeper-recon"),
+            Some("/repos/app".to_owned()),
+            "tenant-a",
+            FleetBudget {
+                token_budget: 1_000_000,
+                tokens_reserved: 0,
+                tokens_committed: 0,
+                hard: false,
+            },
+            "obj",
+            plan_tasks(),
+            1,
+        )
+        .await
+        .expect("create fleet");
+
+        // A prior boot (epoch 100) launches + starts the attempt.
+        let prior_epoch = 100u64;
+        let attempt = match store
+            .launch_child("frecon", "t1", 100, 1, prior_epoch, 60_000)
+            .await
+            .unwrap()
+        {
+            LaunchOutcome::Launched { attempt_id } => attempt_id,
+            other => panic!("expected Launched, got {other:?}"),
+        };
+        store.mark_running("t1", &attempt).await.unwrap();
+
+        // A new boot (epoch 101) reconciles → the stale-epoch attempt is
+        // interrupted and its child returns to Ready for relaunch.
+        let report = store
+            .reconcile(2, prior_epoch + 1)
+            .await
+            .expect("reconcile");
+        assert_eq!(
+            report.interrupted.len(),
+            1,
+            "the stale-epoch attempt must be interrupted",
+        );
+        let child = store.get_child("frecon", "t1").await.unwrap().unwrap();
+        assert_eq!(
+            child.status,
+            octos_fleet::ChildStatus::Ready,
+            "the child must return to Ready for this boot to relaunch",
+        );
+    }
+
+    /// `set_goal_workspace_root` RMW round-trips through the metadata bag: a
+    /// fresh orchestrator loading the SAME supervisor store restores the stashed
+    /// root. Also: a `None` root leaves a prior root intact (never strips it).
+    #[test]
+    fn workspace_root_stash_persists_on_the_goal_record() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let wire = SessionKey::new("api", "keeper-stash");
+
+        let orchestrator = InProcessAgentOrchestrator::default();
+        orchestrator
+            .configure_supervisor_store(dir.path())
+            .expect("configure store");
+        seed_goal(&orchestrator, &wire, "tenant-a");
+        let scoped = orchestrator.scoped_goal_key(&wire);
+        assert_eq!(orchestrator.goal_workspace_root_for_test(&wire), None);
+
+        assert!(orchestrator.set_goal_workspace_root(&scoped, Some("/repos/app".to_owned())));
+        assert_eq!(
+            orchestrator.goal_workspace_root_for_test(&wire).as_deref(),
+            Some("/repos/app"),
+        );
+        // A None root (headless turn) must NOT strip a captured root.
+        assert!(!orchestrator.set_goal_workspace_root(&scoped, None));
+        assert_eq!(
+            orchestrator.goal_workspace_root_for_test(&wire).as_deref(),
+            Some("/repos/app"),
+        );
+
+        // Round-trip: a fresh orchestrator loading the same store restores it.
+        let restored = InProcessAgentOrchestrator::default();
+        restored
+            .configure_supervisor_store(dir.path())
+            .expect("reload store");
+        assert_eq!(
+            restored.goal_workspace_root_for_test(&wire).as_deref(),
+            Some("/repos/app"),
+            "the root round-trips through the metadata bag",
+        );
+    }
+
+    /// #1857 PR 5a fix (H3, codex round 2) — the create-then-persist crash
+    /// window is recovered by GLOBALLY-UNIQUE fleet ids, not by re-attaching to a
+    /// deterministic id (which could collide with an unrelated fleet). If the
+    /// goal binding is lost after create, a re-plan mints a FRESH unique fleet
+    /// (status `planned`, a NEW id) and simply orphans the first — never
+    /// duplicate-errors, never rebinds a possibly-foreign fleet.
+    #[tokio::test]
+    async fn goal_plan_after_lost_binding_creates_a_fresh_unique_fleet() {
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let (_sd, store) = fleet_test_store().await;
+        orchestrator.set_fleet_store(store);
+        let wire = SessionKey::new("api", "keeper-reattach");
+        seed_goal(&orchestrator, &wire, "tenant-a");
+        let scoped = orchestrator.scoped_goal_key(&wire);
+        orchestrator.set_goal_workspace_root(&scoped, Some("/repos/app".to_owned()));
+
+        let first = orchestrator
+            .model_create_fleet_plan(&wire, "tenant-a", plan_tasks(), 1_000)
+            .await
+            .expect("plan");
+        assert_eq!(first["status"], json!("planned"));
+        let first_fleet = first["fleet_id"].as_str().unwrap().to_owned();
+        // The fleet id is globally unique (goal_id + uuid), NOT the reused
+        // sequence goal_id.
+        let goal_id = orchestrator.goal_id_for_test(&wire).expect("goal id");
+        assert_ne!(
+            first_fleet, goal_id,
+            "fleet id must not be the bare goal id"
+        );
+        assert!(
+            first_fleet.starts_with(&format!("{goal_id}-")),
+            "fleet id should carry the goal id prefix for debuggability: {first_fleet}",
+        );
+
+        // Simulate the crash window: the fleet is durable, but the goal binding
+        // was lost (never persisted).
+        orchestrator.clear_goal_fleet_id_for_test(&wire);
+        assert_eq!(orchestrator.goal_fleet_id_for_test(&wire), None);
+
+        // Re-running goal_plan recovers by creating a FRESH unique fleet (never
+        // errors), leaving the first orphaned.
+        let again = orchestrator
+            .model_create_fleet_plan(&wire, "tenant-a", plan_tasks(), 2_000)
+            .await
+            .expect("re-plan must recover, not error");
+        assert_eq!(again["status"], json!("planned"), "creates anew: {again}");
+        let second_fleet = again["fleet_id"].as_str().unwrap().to_owned();
+        assert_ne!(
+            second_fleet, first_fleet,
+            "the re-plan must mint a NEW unique fleet id, not reuse/collide",
+        );
+        assert_eq!(
+            orchestrator.goal_fleet_id_for_test(&wire).as_deref(),
+            Some(second_fleet.as_str()),
+            "the goal is bound to the fresh fleet",
+        );
+    }
+
+    /// #1857 PR 5a fix (HIGH 4) — the pool binds ONE keeper profile; a goal on a
+    /// DIFFERENT profile must be fenced (its tasks would otherwise run on the
+    /// keeper's model/sandbox while its completion wake returns to the other
+    /// profile). Both `goal_plan` and `goal_dispatch` reject a non-keeper goal.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn goal_plan_and_dispatch_fence_a_non_keeper_profile_goal() {
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let (_sd, store) = fleet_test_store().await;
+        orchestrator.set_fleet_store(store.clone());
+        let work = tempfile::TempDir::new().unwrap();
+        // `mock_fleet_pool` binds the keeper profile to `tenant-a`.
+        let (_md, pool) = mock_fleet_pool(store, work.path(), 100).await;
+        orchestrator.set_fleet_pool(pool);
+
+        // The goal is on `tenant-b` — a DIFFERENT profile than the pool's keeper.
+        let wire = SessionKey::new("api", "keeper-crossprofile");
+        seed_goal(&orchestrator, &wire, "tenant-b");
+        let scoped = orchestrator.scoped_goal_key(&wire);
+        orchestrator.set_goal_workspace_root(&scoped, Some("/repos/app".to_owned()));
+
+        let plan_err = orchestrator
+            .model_create_fleet_plan(&wire, "tenant-b", plan_tasks(), 1_000)
+            .await
+            .expect_err("goal_plan must fence a non-keeper profile");
+        assert!(
+            plan_err.contains("keeper profile"),
+            "unexpected plan error: {plan_err}",
+        );
+        // The fence fires BEFORE any create: no fleet is bound.
+        assert_eq!(orchestrator.goal_fleet_id_for_test(&wire), None);
+
+        let dispatch_err = orchestrator
+            .model_dispatch_fleet(&wire, "tenant-b", 2_000)
+            .await
+            .expect_err("goal_dispatch must fence a non-keeper profile");
+        assert!(
+            dispatch_err.contains("keeper profile"),
+            "unexpected dispatch error: {dispatch_err}",
+        );
+    }
+
+    /// #1857 PR 5a fix (MEDIUM) — a goal whose whole token budget can't fund even
+    /// one task must NOT be reported as a silent dispatch success: `goal_plan`
+    /// warns, and `goal_dispatch` surfaces the budget rejection with explicit
+    /// counts + a `budget_exhausted` flag.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dispatch_surfaces_budget_rejection_not_silent_success() {
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let (_sd, store) = fleet_test_store().await;
+        orchestrator.set_fleet_store(store.clone());
+        let work = tempfile::TempDir::new().unwrap();
+        // Per-task projection (2M) far exceeds the goal's whole budget (1M from
+        // `seed_goal`) → every launch is RejectedBudgetExceeded.
+        let (_md, pool) = mock_fleet_pool(store, work.path(), 2_000_000).await;
+        orchestrator.set_fleet_pool(pool);
+
+        let wire = SessionKey::new("api", "keeper-budget");
+        seed_goal(&orchestrator, &wire, "tenant-a");
+        let scoped = orchestrator.scoped_goal_key(&wire);
+        orchestrator
+            .set_goal_workspace_root(&scoped, Some(work.path().to_string_lossy().into_owned()));
+
+        // goal_plan warns that the budget can't fund a task.
+        let plan = orchestrator
+            .model_create_fleet_plan(&wire, "tenant-a", plan_tasks(), 1_000)
+            .await
+            .expect("plan");
+        assert!(
+            plan.get("budget_warning").is_some(),
+            "goal_plan must warn the budget can't fund a task: {plan}",
+        );
+
+        // goal_dispatch must SURFACE the rejection, not report a silent success.
+        let dispatch = orchestrator
+            .model_dispatch_fleet(&wire, "tenant-a", 2_000)
+            .await
+            .expect("dispatch");
+        assert_eq!(
+            dispatch["dispatched_count"],
+            json!(0),
+            "nothing launched: {dispatch}",
+        );
+        assert_eq!(
+            dispatch["rejected_count"],
+            json!(1),
+            "the task is rejected: {dispatch}",
+        );
+        assert_eq!(
+            dispatch["budget_exhausted"],
+            json!(true),
+            "the budget exhaustion must be flagged: {dispatch}",
+        );
+        assert!(
+            dispatch["summary"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("budget"),
+            "the summary must name the budget: {dispatch}",
+        );
+    }
+
+    /// #1857 PR 5a fix (H3, codex round 2) — the cleared-goal-seq-reuse
+    /// collision: a pre-existing fleet under a DIFFERENT controller sits at the
+    /// id the OLD scheme (`fleet_id == goal_id`) would pick. A new goal reusing
+    /// that sequence id must NOT bind it — the globally-unique fleet id makes the
+    /// new goal create its OWN fleet, leaving the foreign one untouched.
+    #[tokio::test]
+    async fn goal_plan_does_not_bind_a_foreign_fleet_at_a_reused_goal_id() {
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let (_sd, store) = fleet_test_store().await;
+        orchestrator.set_fleet_store(store.clone());
+        let store = Arc::new(store);
+
+        let wire = SessionKey::new("api", "keeper-collision");
+        seed_goal(&orchestrator, &wire, "tenant-a");
+        let scoped = orchestrator.scoped_goal_key(&wire);
+        orchestrator.set_goal_workspace_root(&scoped, Some("/repos/app".to_owned()));
+
+        // Pre-create an UNRELATED fleet at the goal's sequence id (the id the OLD
+        // buggy scheme would mint), owned by a DIFFERENT controller + profile —
+        // a prior goal's orphan whose sequence a new goal reused after restart.
+        let goal_id = orchestrator.goal_id_for_test(&wire).expect("goal id");
+        let foreign_controller = SessionKey::new("api", "some-other-controller");
+        Fleet::create(
+            store.clone(),
+            goal_id.clone(),
+            foreign_controller.clone(),
+            Some("/repos/other".to_owned()),
+            "tenant-z",
+            FleetBudget {
+                token_budget: 1_000_000,
+                tokens_reserved: 0,
+                tokens_committed: 0,
+                hard: false,
+            },
+            "someone else's objective",
+            plan_tasks(),
+            1,
+        )
+        .await
+        .expect("pre-create the foreign fleet");
+
+        // goal_plan for the new goal must create its OWN fleet, NOT bind goal_id.
+        let out = orchestrator
+            .model_create_fleet_plan(&wire, "tenant-a", plan_tasks(), 1_000)
+            .await
+            .expect("plan");
+        assert_eq!(out["status"], json!("planned"), "must create anew: {out}");
+        let bound = orchestrator.goal_fleet_id_for_test(&wire).expect("bound");
+        assert_ne!(
+            bound, goal_id,
+            "the new goal must NOT bind the foreign fleet at the reused sequence id",
+        );
+
+        // The new fleet is owned by THIS goal's controller; the foreign fleet is
+        // untouched (never rebound, never dispatched).
+        let mine = store.get_fleet(&bound).await.unwrap().unwrap();
+        assert_eq!(mine.controller_session_key, scoped);
+        assert_eq!(mine.profile_id, "tenant-a");
+        let foreign = store.get_fleet(&goal_id).await.unwrap().unwrap();
+        assert_eq!(
+            foreign.controller_session_key, foreign_controller,
+            "the foreign fleet's controller must be untouched",
+        );
+        assert_eq!(foreign.profile_id, "tenant-z");
+    }
+
+    /// #1857 PR 5a fix (H3, codex round 2) — even if `goal.fleet_id` somehow
+    /// points at a fleet owned by a DIFFERENT controller (a stale/corrupted
+    /// binding), `goal_dispatch` must REFUSE it — validate controller + profile
+    /// before launching, never dispatch someone else's tasks.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dispatch_refuses_a_foreign_fleet_binding() {
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let (_sd, store) = fleet_test_store().await;
+        orchestrator.set_fleet_store(store.clone());
+        let work = tempfile::TempDir::new().unwrap();
+        let (_md, pool) = mock_fleet_pool(store.clone(), work.path(), 100).await;
+        orchestrator.set_fleet_pool(pool);
+        let store = Arc::new(store);
+
+        let wire = SessionKey::new("api", "keeper-foreignbind");
+        seed_goal(&orchestrator, &wire, "tenant-a");
+
+        // A fleet owned by a DIFFERENT controller, that `goal.fleet_id` is then
+        // (corruptly) pointed at.
+        Fleet::create(
+            store.clone(),
+            "foreign-fleet",
+            SessionKey::new("api", "other-controller"),
+            Some("/repos/other".to_owned()),
+            "tenant-a",
+            FleetBudget {
+                token_budget: 1_000_000,
+                tokens_reserved: 0,
+                tokens_committed: 0,
+                hard: false,
+            },
+            "not this goal's work",
+            plan_tasks(),
+            1,
+        )
+        .await
+        .expect("create foreign fleet");
+        orchestrator.set_goal_fleet_id_for_test(&wire, "foreign-fleet");
+
+        let err = orchestrator
+            .model_dispatch_fleet(&wire, "tenant-a", 2_000)
+            .await
+            .expect_err("dispatch must refuse a foreign fleet binding");
+        assert!(
+            err.contains("does not belong to this goal"),
+            "unexpected error: {err}",
+        );
+        // The foreign fleet's task was never launched.
+        let child = store
+            .get_child("foreign-fleet", "t1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            child.status,
+            octos_fleet::ChildStatus::Ready,
+            "the foreign fleet's task must NOT have been dispatched",
+        );
+    }
+
+    /// #1857 PR 5a fix (H3, codex round 3) — goal_get's snapshot must ALSO
+    /// refuse a foreign binding: a stale/corrupt `goal.fleet_id` pointing at
+    /// another controller's (even COMPLETE) fleet must error, never read/mutate
+    /// it, and never mark THIS goal complete from it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn goal_get_refuses_a_foreign_fleet_binding() {
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let (_sd, store) = fleet_test_store().await;
+        orchestrator.set_fleet_store(store.clone());
+        let work = tempfile::TempDir::new().unwrap();
+        let (_md, pool) = mock_fleet_pool(store.clone(), work.path(), 100).await;
+        let store = Arc::new(store);
+
+        let wire = SessionKey::new("api", "keeper-getforeign");
+        seed_goal(&orchestrator, &wire, "tenant-a");
+
+        // A COMPLETE fleet owned by a DIFFERENT controller (its only task is
+        // accepted): if the snapshot read it, it would WRONGLY mark this goal
+        // complete.
+        Fleet::create(
+            store.clone(),
+            "foreign-get",
+            SessionKey::new("api", "other-controller"),
+            Some("/repos/other".to_owned()),
+            "tenant-a",
+            FleetBudget {
+                token_budget: 1_000_000,
+                tokens_reserved: 0,
+                tokens_committed: 0,
+                hard: false,
+            },
+            "not this goal's work",
+            plan_tasks(),
+            1,
+        )
+        .await
+        .expect("create foreign fleet");
+        let d = pool.dispatch("foreign-get", "t1").await.expect("dispatch");
+        d.handle.expect("handle").await.expect("join");
+        assert!(
+            Fleet::bind(store.clone(), "foreign-get")
+                .is_complete()
+                .await
+                .unwrap(),
+            "the foreign fleet must be complete for this test to be meaningful",
+        );
+
+        // Corrupt/stale binding: point goal.fleet_id at the foreign fleet.
+        orchestrator.set_goal_fleet_id_for_test(&wire, "foreign-get");
+
+        let err = orchestrator
+            .model_fleet_snapshot(&wire, "tenant-a")
+            .await
+            .expect_err("goal_get must refuse a foreign fleet binding");
+        assert!(
+            err.contains("does not belong to this goal"),
+            "unexpected error: {err}",
+        );
+
+        // The local goal is NOT completed from the foreign fleet.
+        assert_eq!(
+            orchestrator.goal_status_for_test(&wire).as_deref(),
+            Some("active"),
+            "goal must NOT be marked complete from a foreign fleet",
+        );
+        // The foreign fleet is untouched (still owned by the other controller).
+        let foreign = store.get_fleet("foreign-get").await.unwrap().unwrap();
+        assert_eq!(
+            foreign.controller_session_key,
+            SessionKey::new("api", "other-controller"),
+        );
     }
 
     fn sample_agent(agent_id: &str, profile_id: &str) -> AutonomyAgentRecord {

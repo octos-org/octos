@@ -110,6 +110,10 @@ teloxide = { workspace = true, optional = true }
 sysinfo = { version = "0.34", optional = true }
 redb.workspace = true
 octos-fleet.workspace = true
+# PR 5a — the live fleet worker pool the goal keeper dispatches onto. Used only
+# under `feature = "api"` (serve boot + the goal orchestrator), mirroring how
+# `octos-fleet` is a plain dep consumed only on the api paths.
+octos-fleet-worker.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 # O_NOFOLLOW for the symlink-safe preview file serve in
