@@ -1775,7 +1775,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn port_zero_resolves_before_origin_and_gateway_configuration() {
+    async fn port_zero_resolves_before_origin_configuration() {
         let (listener, effective_port) = bind_http_listener(false, "127.0.0.1", 0)
             .await
             .expect("bind an ephemeral loopback listener");

@@ -229,7 +229,11 @@ pub fn build_router(state: Arc<AppState>) -> Router {
                 },
             ))
             .allow_methods(tower_http::cors::Any)
-            .allow_headers(tower_http::cors::Any)
+            // `Authorization` is a Fetch non-wildcard request header, so
+            // `Access-Control-Allow-Headers: *` does not authorize the bearer
+            // preflight used by AppUI. Mirror the browser's requested header
+            // names after the exact Origin predicate has accepted the request.
+            .allow_headers(tower_http::cors::AllowHeaders::mirror_request())
     };
 
     // Public auth endpoints (no auth required)
@@ -1891,6 +1895,14 @@ mod tests {
                 .get(axum::http::header::ACCESS_CONTROL_ALLOW_ORIGIN)
                 .and_then(|value| value.to_str().ok()),
             Some("http://localhost:50081")
+        );
+        assert_eq!(
+            preflight
+                .headers()
+                .get(axum::http::header::ACCESS_CONTROL_ALLOW_HEADERS)
+                .and_then(|value| value.to_str().ok()),
+            Some("authorization"),
+            "authenticated AppUI requests require Authorization to survive preflight"
         );
         assert!(
             preflight
