@@ -866,23 +866,51 @@ impl UiProtocolContractStores {
 
 #[derive(Default)]
 struct SessionWorkspaceStore {
-    roots: std::sync::Mutex<HashMap<SessionKey, PathBuf>>,
+    entries: std::sync::Mutex<HashMap<SessionKey, SessionWorkspaceBinding>>,
+}
+
+struct SessionWorkspaceBinding {
+    /// Effective workspace used by tools, panes, goals, and the UI.
+    root: PathBuf,
+    /// Only a genuine Tier-1/Tier-2 cwd belongs here. `None` means `root` was
+    /// the derived Tier-3 workspace and must not relocate transcript storage.
+    runtime_hint: Option<PathBuf>,
 }
 
 impl SessionWorkspaceStore {
+    /// Establish an explicit workspace binding. Fleet-keeper recovery and the
+    /// legacy call sites using this method carry an authoritative workspace,
+    /// so it is also a runtime cwd hint.
+    #[cfg(test)]
     fn set(&self, session_id: SessionKey, root: PathBuf) {
-        self.roots
+        self.set_resolved(session_id, root.clone(), Some(root));
+    }
+
+    /// Publish the resolved tool/UI workspace while retaining whether it came
+    /// from an explicit cwd. Keeping the provenance separate prevents a
+    /// derived Tier-3 workspace from being fed back into SessionRuntimeCache as
+    /// a Tier-1/Tier-2 hint on the next request.
+    fn set_resolved(&self, session_id: SessionKey, root: PathBuf, runtime_hint: Option<PathBuf>) {
+        self.entries
             .lock()
             .unwrap_or_else(|error| error.into_inner())
-            .insert(session_id, root);
+            .insert(session_id, SessionWorkspaceBinding { root, runtime_hint });
     }
 
     fn get(&self, session_id: &SessionKey) -> Option<PathBuf> {
-        self.roots
+        self.entries
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .get(session_id)
-            .cloned()
+            .map(|binding| binding.root.clone())
+    }
+
+    fn runtime_hint(&self, session_id: &SessionKey) -> Option<PathBuf> {
+        self.entries
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .get(session_id)
+            .and_then(|binding| binding.runtime_hint.clone())
     }
 
     /// Insert `root` under `session_id` ONLY when no entry exists yet, holding
@@ -896,14 +924,17 @@ impl SessionWorkspaceStore {
     fn set_if_absent(&self, session_id: SessionKey, root: PathBuf) -> bool {
         use std::collections::hash_map::Entry;
         match self
-            .roots
+            .entries
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .entry(session_id)
         {
             Entry::Occupied(_) => false,
             Entry::Vacant(slot) => {
-                slot.insert(root);
+                slot.insert(SessionWorkspaceBinding {
+                    root: root.clone(),
+                    runtime_hint: Some(root),
+                });
                 true
             }
         }
@@ -1009,6 +1040,11 @@ mod fleet_keeper_reseed_tests {
             store.get(&key),
             Some(PathBuf::from("/first")),
             "the established entry is never overwritten"
+        );
+        assert_eq!(
+            store.runtime_hint(&key),
+            Some(PathBuf::from("/first")),
+            "a recovered fleet workspace remains an authoritative runtime hint"
         );
     }
 
@@ -4043,7 +4079,7 @@ async fn handle_session_compact(
     // session this is a cache hit that returns the existing runtime.
     let permissions_epoch = state.session_cache.session_generation(&session_id);
     let permissions = effective_permissions_for_session(state, &session_id)?;
-    let workspace_hint = session_workspaces().get(&session_id);
+    let workspace_hint = session_workspaces().runtime_hint(&session_id);
     let session_runtime = state
         .session_cache
         .get_or_init_with_permissions(
@@ -9647,7 +9683,7 @@ async fn tool_status_list_result(
         // preempted caller (codex P1 round 4 on #1639).
         let permissions_epoch = state.session_cache.session_generation(session_id);
         let permissions = effective_permissions_for_session(state, session_id)?;
-        let workspace_hint = session_workspaces().get(session_id);
+        let workspace_hint = session_workspaces().runtime_hint(session_id);
         Some(
             state
                 .session_cache
@@ -16106,13 +16142,14 @@ async fn open_session_result(
     // workspace the next turn will use — closing the cache/wire
     // divergence codex flagged on PR #884 follow-up.
     //
-    // The `session_workspaces()` map is kept as a thin read-through
-    // view for the legacy WS dispatcher fallback (no profile registered
-    // — setup wizard / single-agent serve) and for pane snapshots that
-    // need a sync read of the workspace root. We always write the
-    // *effective* workspace root (the runtime's, when present) so the
-    // map cannot drift out of sync with the cache.
+    // The `session_workspaces()` map is kept as a thin read-through view for
+    // the legacy WS dispatcher fallback (no profile registered — setup wizard
+    // / single-agent serve) and for pane snapshots that need a sync read of
+    // the workspace root. It stores both the effective root and the provenance
+    // of the runtime hint: a derived Tier-3 root remains available to tools and
+    // UI without being mistaken for an explicit cwd on a later cache lookup.
     let mut effective_workspace_root: Option<PathBuf> = None;
+    let mut effective_runtime_hint: Option<PathBuf> = None;
     if let Some(profile_runtime) =
         resolve_session_profile_runtime(state, active_profile_id.as_deref())
     {
@@ -16148,6 +16185,9 @@ async fn open_session_result(
                 // storage identity. No-op when the store wasn't relocated.
                 register_session_ledger_scope(ledger, &runtime);
                 effective_workspace_root = Some(runtime.workspace_root.clone());
+                effective_runtime_hint = effective_workspace_hint
+                    .as_ref()
+                    .map(|_| runtime.workspace_root.clone());
                 // Sticky marker: record this profile as the folder's active one
                 // so a later bare launch resumes it deterministically (beats the
                 // store-mtime recency fallback in `derive_sticky_profile`). Gated
@@ -16198,9 +16238,14 @@ async fn open_session_result(
         // effective hint in the read-through map so the legacy
         // dispatcher's pane-snapshot path can pick it up.
         effective_workspace_root = Some(workspace_root.clone());
+        effective_runtime_hint = Some(workspace_root.clone());
     }
     if let Some(root) = effective_workspace_root.as_ref() {
-        session_workspaces().set(params.session_id.clone(), root.clone());
+        session_workspaces().set_resolved(
+            params.session_id.clone(),
+            root.clone(),
+            effective_runtime_hint,
+        );
     }
     // #436 — record a `peer-<slug>` session's wire key so `peer_send_input`
     // (wired on the master's turn, which cannot know the peer's client-chosen
@@ -17004,7 +17049,7 @@ pub(crate) async fn resolve_sessions_for_lookup(
         .or(connection_profile_id)
         .or(routed_profile_id);
     if let Some(profile_runtime) = resolve_session_profile_runtime(state, active_profile_id) {
-        let hint = session_workspaces().get(session_id);
+        let hint = session_workspaces().runtime_hint(session_id);
         let permissions_epoch = state.session_cache.session_generation(session_id);
         let permissions = effective_permissions_for_session(state, session_id).ok()?;
         if let Ok(runtime) = state
@@ -25220,7 +25265,7 @@ async fn run_native_code_review_turn(
                 return;
             }
         };
-    let hint = session_workspaces().get(&session_id);
+    let hint = session_workspaces().runtime_hint(&session_id);
     let permissions_epoch = state.session_cache.session_generation(&session_id);
     let permissions = match effective_permissions_for_session(&state, &session_id) {
         Ok(permissions) => permissions,
@@ -26980,26 +27025,26 @@ async fn run_standalone_turn(
         return;
     };
 
-    // Read-through view: when `session.open` previously stashed an
-    // effective cwd in `session_workspaces()` (Tier-1 client cwd or
-    // Tier-2 operator default, resolved at `open_session_result` time),
-    // use that as the `workspace_hint`. Otherwise the bootstrap default
-    // Tier-3 (`<profile_data_dir>/users/.../workspace`) wins.
-    let hint = session_workspaces().get(&session_id);
+    // Keep two meanings separate: every opened session has an effective
+    // workspace root for tools/goals/UI, but only a Tier-1 client cwd or Tier-2
+    // operator default is a runtime hint that may relocate transcript storage.
+    // A derived Tier-3 workspace therefore yields `hint == None`.
+    let workspace_root = session_workspaces().get(&session_id);
+    let hint = session_workspaces().runtime_hint(&session_id);
     // #1857 PR 5a — THE LOAD-BEARING SEAM: on a goal turn, stash the resolved
     // controller workspace root on the goal record (keyed by the SCOPED
     // `goal_session_key`) BEFORE the keeper's `goal_plan` can run mid-turn. It
-    // MUST equal the same `hint` the turn runs under, so `Fleet::create` stamps
-    // the EXACT root a later `ChildDone` wake rehydrates a headless keeper with
-    // (PR 4b) — a fabricated root would silently execute against the wrong repo
-    // after a restart. Only a live-client turn has a `session_workspaces()`
-    // entry; a headless pre-fleet `GoalContinue` passes `None`, which leaves any
-    // previously-captured root intact (same client-dependence as the existing
-    // goal feature).
+    // MUST equal the effective tool workspace (including the derived Tier-3
+    // root), so `Fleet::create` stamps the EXACT root a later `ChildDone` wake
+    // rehydrates a headless keeper with (PR 4b) — a fabricated root would
+    // silently execute against the wrong repo after a restart. A headless
+    // pre-fleet `GoalContinue` with no established binding still passes `None`,
+    // which leaves any previously captured root intact.
     if let Some(goal_ctx) = goal_context.as_ref() {
         default_agent_orchestrator().set_goal_workspace_root(
             &goal_ctx.goal_session_key,
-            hint.as_ref()
+            workspace_root
+                .as_ref()
                 .map(|path| path.to_string_lossy().into_owned()),
         );
     }
