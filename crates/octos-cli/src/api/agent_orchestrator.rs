@@ -12444,6 +12444,82 @@ mod tests {
         assert_eq!(resumed["goal"]["token_budget"].as_u64(), Some(5_000));
     }
 
+    /// Goal-budget re-arm: after a `budget_limited` goal is legitimately
+    /// reactivated by RAISING its budget above `tokens_used`, the
+    /// budget-exhaustion flip must RE-ARM. A subsequent interactive charge
+    /// that crosses the NEW budget flips the goal straight back to
+    /// `budget_limited` instead of accruing unbounded past budget (the
+    /// `10925K/2000K` runaway). Reactivation resets `wrap_up_emitted`
+    /// (`set_goal`), so `charge_active_goal_tokens`'s gate
+    /// (`used >= budget && !wrap_up_emitted`) fires again in the new window.
+    #[test]
+    fn charge_re_arms_budget_flip_after_raised_budget_reactivation() {
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let session_id = SessionKey::with_profile("tenant-a", "api", "goal-rearm");
+        // Active goal with a small budget.
+        orchestrator
+            .set_goal(GoalSetRequest {
+                session_id: session_id.clone(),
+                profile_id: "tenant-a".into(),
+                objective: "sprawling world cup site".into(),
+                status: Some("active".into()),
+                token_budget: Some(2_000),
+                transition_actor: None,
+            })
+            .expect("set active goal");
+        let goal_id = orchestrator
+            .active_goal_id(&session_id, "tenant-a")
+            .expect("active goal id");
+
+        // First exhaustion: an interactive charge crosses the 2k budget and
+        // flips the goal to budget_limited (also sets wrap_up_emitted = true).
+        orchestrator.charge_active_goal_tokens(&session_id, "tenant-a", &goal_id, 2_000, 1);
+        assert_eq!(
+            orchestrator.goal_status_for_test(&session_id).as_deref(),
+            Some("budget_limited"),
+            "crossing the budget flips the goal to budget_limited",
+        );
+
+        // Legitimate resume: raise the budget above tokens_used and reactivate.
+        let resumed = orchestrator
+            .set_goal(GoalSetRequest {
+                session_id: session_id.clone(),
+                profile_id: "tenant-a".into(),
+                objective: "sprawling world cup site".into(),
+                status: Some("active".into()),
+                token_budget: Some(4_000),
+                transition_actor: Some("user".into()),
+            })
+            .expect("raising the budget above tokens_used resumes the goal");
+        assert_eq!(resumed["goal"]["status"], json!("active"));
+        // The record is reused in place — the goal_id is stable across resume.
+        assert_eq!(
+            orchestrator
+                .active_goal_id(&session_id, "tenant-a")
+                .as_deref(),
+            Some(goal_id.as_str()),
+            "reactivation reuses the same goal record",
+        );
+
+        // Re-arm proof: a second interactive charge crosses the NEW 4k budget
+        // (tokens_used 2k → 4k). The flip MUST fire again — the goal must not
+        // stay `active` and accrue unbounded past the (new) budget.
+        orchestrator.charge_active_goal_tokens(&session_id, "tenant-a", &goal_id, 2_000, 1);
+        assert_eq!(
+            orchestrator.goal_status_for_test(&session_id).as_deref(),
+            Some("budget_limited"),
+            "re-arm: crossing the raised budget must flip the resumed goal back \
+             to budget_limited, not accrue unbounded",
+        );
+        let (tokens_used, _, _) = orchestrator
+            .goal_counters_for_test(&session_id)
+            .expect("goal exists");
+        assert_eq!(
+            tokens_used, 4_000,
+            "tokens_used lands exactly at the raised budget when the flip re-arms",
+        );
+    }
+
     /// Fix A (codex HIGH): the reactivation guard only covers non-active →
     /// active. An ALREADY-active goal whose budget is lowered below the tokens
     /// already used (status "active" or omitted) must NOT stay active — it
