@@ -1285,10 +1285,22 @@ mod tests {
 
         let canonical_legacy =
             std::fs::canonicalize(legacy_dir.path()).expect("canonicalise legacy dir");
-        assert!(
-            result
-                .output
-                .contains(&shell_visible_path(&canonical_legacy)),
+        // The child prints its CWD as the FIRST line of the tool output (the
+        // tool appends `\nExit code: N` after it, so the whole string is not a
+        // path). Compare by canonical identity rather than a substring match:
+        // on windows-latest the runner's TEMP is an 8.3 short name
+        // (`C:\Users\RUNNER~1\...`, because the account `runneradmin` exceeds 8
+        // chars) while `canonicalize` resolves it to the long name plus a
+        // `\\?\` prefix, so a raw-string match spuriously fails (unreproducible
+        // where the account name is already short). `canonicalize` collapses
+        // short/long spelling and the verbatim prefix to one form and is an
+        // idempotent no-op on Unix.
+        let printed_cwd = result.output.lines().next().unwrap_or_default().trim();
+        let printed_canonical =
+            std::fs::canonicalize(printed_cwd).expect("canonicalise shell-printed cwd");
+        assert_eq!(
+            printed_canonical,
+            canonical_legacy,
             "expected legacy cwd ({}) in shell output, got: {}",
             canonical_legacy.display(),
             result.output
