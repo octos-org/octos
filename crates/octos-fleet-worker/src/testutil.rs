@@ -1,12 +1,14 @@
 //! Shared test helpers: in-memory-ish store/fleet builders and scripted
 //! mock LLM providers. Compiled only under `#[cfg(test)]`.
 
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
 use eyre::Result;
+use octos_agent::sandbox::{NoSandbox, Sandbox};
 use octos_core::{Message, SessionKey};
 use octos_fleet::{
     AcceptanceCriterion, Fleet, FleetBudget, FleetKernelStore, LaunchOutcome, TaskSpec, Verifier,
@@ -14,6 +16,7 @@ use octos_fleet::{
 use octos_llm::{ChatConfig, ChatResponse, LlmProvider, StopReason, ToolSpec};
 use octos_memory::EpisodeStore;
 use tempfile::TempDir;
+use tokio::process::Command;
 
 use crate::AgentFactory;
 
@@ -127,12 +130,52 @@ pub async fn launch(store: &FleetKernelStore, fleet_id: &str, task_id: &str) -> 
     }
 }
 
-/// An [`AgentFactory`] over `provider` and a throwaway episodic store, built
-/// via the test-only [`AgentFactory::for_testing`] (no-op sandbox). The
-/// returned [`TempDir`] must be held for the store's lifetime.
+/// A test double for a REAL isolating sandbox backend: it runs commands
+/// directly (like [`NoSandbox`]) but reports `is_noop() == false`. The
+/// attempt-time fail-closed guard in `run_attempt` (H1) refuses to run the agent
+/// under a no-op sandbox, so run_attempt tests thread THIS to exercise the agent
+/// path; a test that wants the fail-closed path passes a genuine [`NoSandbox`].
+pub struct MarkerSandbox;
+
+impl Sandbox for MarkerSandbox {
+    fn wrap_command(&self, shell_command: &str, cwd: &Path) -> Command {
+        NoSandbox.wrap_command(shell_command, cwd)
+    }
+}
+
+/// Records how many times `chat` was invoked (shared with the caller). Used to
+/// prove `run_attempt` did NOT build or run the agent — e.g. the H1 fail-closed
+/// path terminates the attempt BEFORE any LLM call.
+pub struct CountingProvider {
+    pub calls: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl LlmProvider for CountingProvider {
+    async fn chat(&self, _m: &[Message], _t: &[ToolSpec], _c: &ChatConfig) -> Result<ChatResponse> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok(end_turn("counted"))
+    }
+    fn model_id(&self) -> &str {
+        "mock"
+    }
+    fn provider_name(&self) -> &str {
+        "mock"
+    }
+}
+
+/// An [`AgentFactory`] over `provider` and a throwaway episodic store. Threads a
+/// [`MarkerSandbox`] (a real-isolating test double), NOT a no-op sandbox, so the
+/// attempt-time fail-closed guard (H1) lets the agent run. The returned
+/// [`TempDir`] must be held for the store's lifetime.
 pub async fn factory_for(provider: Arc<dyn LlmProvider>) -> (TempDir, AgentFactory) {
     let (dir, memory) = fresh_memory().await;
-    (dir, AgentFactory::for_testing(provider, memory))
+    let factory = AgentFactory::new(
+        provider,
+        memory,
+        Arc::new(|_| Arc::new(MarkerSandbox) as Arc<dyn Sandbox>),
+    );
+    (dir, factory)
 }
 
 fn usage() -> octos_llm::TokenUsage {

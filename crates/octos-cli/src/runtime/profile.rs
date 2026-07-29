@@ -1007,6 +1007,12 @@ impl ProfileRuntime {
             tools.register(crate::goal_tool::GoalGetTool::new(profile.id.clone()));
             tools.register(crate::goal_tool::GoalCreateTool::new(profile.id.clone()));
             tools.register(crate::goal_tool::GoalUpdateTool::new(profile.id.clone()));
+            // #1857 PR 5a — the goal keeper's fleet controls: decompose the
+            // objective onto a durable fleet (`goal_plan`) and launch its ready
+            // tasks onto the live worker pool (`goal_dispatch`). `goal_get`
+            // (above) folds in the fleet plan view + self-detects completion.
+            tools.register(crate::goal_tool::GoalPlanTool::new(profile.id.clone()));
+            tools.register(crate::goal_tool::GoalDispatchTool::new(profile.id.clone()));
         }
 
         // Step 17: re-apply tool policy AFTER plugin / memory-bank

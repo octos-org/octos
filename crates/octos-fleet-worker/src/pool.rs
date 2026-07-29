@@ -67,6 +67,12 @@ pub struct PoolConfig {
     /// (`<workspace_root>/<fleet>/<task>`), used as the tool cwd + the
     /// acceptance-gate root.
     pub workspace_root: PathBuf,
+    /// #1857 PR 5a — the profile this pool is bound to (its `llm` / `memory` /
+    /// sandbox come from that profile's runtime). The goal keeper fences
+    /// dispatch on it: a goal set on a DIFFERENT profile must not run its tasks
+    /// on this profile's model/sandbox while its wake returns to the other
+    /// profile. Read back via [`FleetWorkerPool::keeper_profile_id`].
+    pub keeper_profile_id: String,
 }
 
 /// The result of a [`FleetWorkerPool::dispatch`]: the typed launch decision
@@ -89,6 +95,17 @@ pub struct FleetWorkerPool {
     /// (P1-4a). `Arc` so the spawned `'static` future can hold it.
     per_fleet: Arc<Mutex<HashMap<String, Arc<Semaphore>>>>,
     clock: Arc<dyn Fn() -> u64 + Send + Sync>,
+}
+
+// Manual `Debug` (the `factory` and `clock` fields are not `Debug`): render the
+// static [`PoolConfig`] so an owning type — e.g. a keeper orchestrator holding
+// an `Option<Arc<FleetWorkerPool>>` — can still `derive(Debug)`.
+impl std::fmt::Debug for FleetWorkerPool {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FleetWorkerPool")
+            .field("cfg", &self.cfg)
+            .finish_non_exhaustive()
+    }
 }
 
 impl FleetWorkerPool {
@@ -119,6 +136,21 @@ impl FleetWorkerPool {
             per_fleet: Arc::new(Mutex::new(HashMap::new())),
             clock,
         }
+    }
+
+    /// #1857 PR 5a — the profile this pool is bound to (from [`PoolConfig`]).
+    /// The goal keeper compares a goal's profile against this to fence
+    /// cross-profile dispatch (a profile-B goal must not run on a profile-A
+    /// pool). See [`PoolConfig::keeper_profile_id`].
+    pub fn keeper_profile_id(&self) -> &str {
+        &self.cfg.keeper_profile_id
+    }
+
+    /// #1857 PR 5a — tokens reserved on the fleet budget per launch (soft
+    /// admission). The keeper reads it to warn when a goal's whole token budget
+    /// can't fund even one task (every launch would be `RejectedBudgetExceeded`).
+    pub fn projected_tokens(&self) -> u64 {
+        self.cfg.projected_tokens
     }
 
     /// Get-or-create a fleet's permit semaphore in `map` (clamped ≥1, P2-1).
@@ -412,6 +444,7 @@ mod tests {
             lease_ttl_ms: TTL,
             projected_tokens: PROJECTED,
             workspace_root: work.path().to_path_buf(),
+            keeper_profile_id: "test-keeper".to_owned(),
         }
     }
 
@@ -551,6 +584,7 @@ mod tests {
             lease_ttl_ms: TTL,
             projected_tokens: PROJECTED,
             workspace_root: file_root,
+            keeper_profile_id: "test-keeper".to_owned(),
         };
         let (_md, factory) = factory_for(Arc::new(SuccessProvider)).await;
         let pool = FleetWorkerPool::new(store.clone(), Arc::new(factory), cfg, fixed_clock());
