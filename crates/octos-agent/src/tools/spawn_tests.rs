@@ -2,6 +2,19 @@ use super::*;
 #[cfg(unix)]
 use crate::{HookConfig, HookEvent};
 
+/// Runaway guard for the "poll until the background task reaches state X"
+/// loops below. It is NOT a latency assertion: on a passing run the loop
+/// returns as soon as the state arrives, so a generous ceiling costs nothing,
+/// and on a genuinely broken run the test still fails — just later.
+///
+/// It used to be 5s, which sits under the noise floor of a loaded CI runner:
+/// `test_background_spawn_fails_when_contract_owned_workflow_is_not_ready`
+/// failed with "did not fail in time" on ubuntu-latest in run 30387949499
+/// while the only change under test was one line of `.github/workflows/ci.yml`.
+/// These loops spawn real subprocesses, so their wall-clock cost tracks host
+/// load rather than anything the test controls.
+const BACKGROUND_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
+
 #[test]
 fn frame_subagent_task_leads_with_identity_and_directive() {
     let out = frame_subagent_task("review-octos-web", "Clone and review the repo.");
@@ -168,10 +181,10 @@ async fn background_deliverable_auto_materializes_inline_final_output() {
                 panic!("spawn failed: {:?}", t.error);
             }
         }
-        if started.elapsed() >= std::time::Duration::from_secs(15) {
+        if started.elapsed() >= BACKGROUND_DEADLINE {
             let tasks = supervisor.get_tasks_for_session("api:test-session");
             panic!(
-                "did not complete in 15s; tasks = {:?}",
+                "did not complete in {BACKGROUND_DEADLINE:?}; tasks = {:?}",
                 tasks
                     .iter()
                     .map(|t| (t.status.as_str(), t.error.clone()))
@@ -490,7 +503,7 @@ async fn test_background_spawn_tracks_supervisor_lifecycle() {
             }
         }
         assert!(
-            started.elapsed() < std::time::Duration::from_secs(5),
+            started.elapsed() < BACKGROUND_DEADLINE,
             "background spawn task did not complete in time"
         );
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -640,7 +653,7 @@ async fn test_background_spawn_uses_contract_selected_slides_artifact_for_persis
             }
         }
         assert!(
-            started.elapsed() < std::time::Duration::from_secs(5),
+            started.elapsed() < BACKGROUND_DEADLINE,
             "background spawn task did not complete in time"
         );
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -758,7 +771,7 @@ async fn test_background_spawn_fails_when_contract_owned_workflow_is_not_ready()
             }
         }
         assert!(
-            started.elapsed() < std::time::Duration::from_secs(5),
+            started.elapsed() < BACKGROUND_DEADLINE,
             "background spawn task did not fail in time"
         );
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -839,7 +852,7 @@ async fn test_background_spawn_emits_failure_hook_for_contract_failure() {
             }
         }
         assert!(
-            started.elapsed() < std::time::Duration::from_secs(5),
+            started.elapsed() < BACKGROUND_DEADLINE,
             "background spawn failure hook did not arrive in time"
         );
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -1658,7 +1671,7 @@ async fn test_background_spawn_persists_workflow_phase_transitions() {
             }
         }
         assert!(
-            started.elapsed() < std::time::Duration::from_secs(5),
+            started.elapsed() < BACKGROUND_DEADLINE,
             "background spawn task did not complete in time"
         );
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -1821,7 +1834,7 @@ async fn test_background_spawn_emits_child_session_lifecycle_events() {
         }
 
         assert!(
-            started.elapsed() < std::time::Duration::from_secs(5),
+            started.elapsed() < BACKGROUND_DEADLINE,
             "child-session lifecycle events did not arrive in time"
         );
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -1899,7 +1912,7 @@ async fn test_background_spawn_emits_verify_and_complete_hooks() {
         }
 
         assert!(
-            started.elapsed() < std::time::Duration::from_secs(5),
+            started.elapsed() < BACKGROUND_DEADLINE,
             "spawn lifecycle hooks did not arrive in time"
         );
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -2157,7 +2170,7 @@ async fn background_child_transcript_streams_to_router_and_final_output_is_recor
             }
         }
         assert!(
-            started.elapsed() < std::time::Duration::from_secs(5),
+            started.elapsed() < BACKGROUND_DEADLINE,
             "background child did not complete in time"
         );
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -2259,7 +2272,7 @@ async fn child_stream_callback_gets_start_offsets_and_router_file_has_no_duplica
             }
         }
         assert!(
-            started.elapsed() < std::time::Duration::from_secs(5),
+            started.elapsed() < BACKGROUND_DEADLINE,
             "background child did not complete in time"
         );
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -2447,7 +2460,7 @@ async fn background_deliverable_surfaces_shell_written_file_in_output_files() {
             }
         }
         assert!(
-            started.elapsed() < std::time::Duration::from_secs(5),
+            started.elapsed() < BACKGROUND_DEADLINE,
             "background deliverable spawn did not complete in time"
         );
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -2517,7 +2530,7 @@ async fn background_deliverable_uses_configured_root_without_touching_workspace_
             }
         }
         assert!(
-            started.elapsed() < std::time::Duration::from_secs(5),
+            started.elapsed() < BACKGROUND_DEADLINE,
             "background deliverable spawn did not complete in time"
         );
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -2649,7 +2662,7 @@ async fn background_without_deliverable_does_not_surface_shell_write() {
             }
         }
         assert!(
-            started.elapsed() < std::time::Duration::from_secs(5),
+            started.elapsed() < BACKGROUND_DEADLINE,
             "background spawn did not complete in time"
         );
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
