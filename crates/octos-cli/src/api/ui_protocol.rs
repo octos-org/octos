@@ -5895,6 +5895,7 @@ enum WsOriginDecision {
 fn decide_ws_origin_gate(
     headers: &HeaderMap,
     base_domain: Option<&str>,
+    appui_allowed_origins: &[String],
     is_authenticated: bool,
 ) -> WsOriginDecision {
     let Some(origin) = headers.get(axum::http::header::ORIGIN) else {
@@ -5903,7 +5904,8 @@ fn decide_ws_origin_gate(
     match origin.to_str() {
         Ok(origin_str) if origin_str.trim().is_empty() => WsOriginDecision::Allow,
         Ok(origin_str) => {
-            let allowed = super::router::cors_allowlist_for_base_domain(base_domain);
+            let allowed =
+                super::router::browser_origin_allowlist(base_domain, appui_allowed_origins);
             if allowed.iter().any(|s| s == origin_str) {
                 return WsOriginDecision::Allow;
             }
@@ -5947,6 +5949,33 @@ fn decide_ws_origin_gate(
     }
 }
 
+fn decide_ui_ws_origin_gate(
+    headers: &HeaderMap,
+    state: &AppState,
+    is_authenticated: bool,
+) -> WsOriginDecision {
+    decide_ws_origin_gate(
+        headers,
+        state.base_domain.as_deref(),
+        &state.appui_allowed_origins,
+        is_authenticated,
+    )
+}
+
+fn decide_session_ingress_ws_origin_gate(
+    headers: &HeaderMap,
+    state: &AppState,
+) -> WsOriginDecision {
+    // The work secret authenticates and scopes the session independently.
+    // It does not replace the browser Origin gate.
+    decide_ws_origin_gate(
+        headers,
+        state.base_domain.as_deref(),
+        &state.appui_allowed_origins,
+        true,
+    )
+}
+
 /// GET /api/ui-protocol/ws — JSON-RPC over WebSocket for UI Protocol v1.
 pub async fn ws_handler(
     State(state): State<Arc<AppState>>,
@@ -5966,7 +5995,7 @@ pub async fn ws_handler(
     // deployments (`has_auth == false` in `router.rs`) `identity` is
     // `None` and the gate falls back to the strict tenant-subdomain rule.
     let is_authenticated = identity.is_some();
-    match decide_ws_origin_gate(&headers, state.base_domain.as_deref(), is_authenticated) {
+    match decide_ui_ws_origin_gate(&headers, &state, is_authenticated) {
         WsOriginDecision::Allow => {}
         WsOriginDecision::RejectDisallowed { origin } => {
             tracing::warn!(
@@ -6058,7 +6087,7 @@ pub(crate) async fn ws_handler_for_session_ingress(
     uri: Uri,
     ws: Result<WebSocketUpgrade, axum::extract::ws::rejection::WebSocketUpgradeRejection>,
 ) -> Response {
-    match decide_ws_origin_gate(&headers, state.base_domain.as_deref(), true) {
+    match decide_session_ingress_ws_origin_gate(&headers, &state) {
         WsOriginDecision::Allow => {}
         WsOriginDecision::RejectDisallowed { origin } => {
             tracing::warn!(

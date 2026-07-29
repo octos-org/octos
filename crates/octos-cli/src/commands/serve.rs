@@ -10,7 +10,9 @@ use eyre::{Result, WrapErr};
 use octos_bus::SessionManager;
 
 use super::Executable;
-use crate::api::{AppState, EventBroadcaster, build_router, init_metrics};
+use crate::api::{
+    AppState, EventBroadcaster, build_router, init_metrics, resolve_appui_allowed_origins,
+};
 use crate::config::Config;
 
 // #1857 PR 5a — fleet worker pool defaults (serve boot). Conservative single-
@@ -1153,6 +1155,24 @@ impl ServeCommand {
                 config.mode
             );
         }
+        // Resolve browser origins once, before any HTTP route is exposed.
+        // A malformed explicit origin aborts startup instead of silently
+        // weakening CORS/WS behavior. Empty env means "use config"; a
+        // non-empty env value replaces the config list for deployments.
+        let appui_allowed_origins_env = match std::env::var("OCTOS_APPUI_ALLOWED_ORIGINS") {
+            Ok(value) => Some(value),
+            Err(std::env::VarError::NotPresent) => None,
+            Err(std::env::VarError::NotUnicode(_)) => {
+                eyre::bail!("OCTOS_APPUI_ALLOWED_ORIGINS must be valid Unicode")
+            }
+        };
+        let appui_allowed_origins = resolve_appui_allowed_origins(
+            &config.appui.allowed_origins,
+            appui_allowed_origins_env.as_deref(),
+            self.port,
+        )
+        .wrap_err("invalid AppUI browser-origin configuration")?;
+
         let state = Arc::new(AppState {
             profiles: profile_runtimes,
             session_cache,
@@ -1195,6 +1215,7 @@ impl ServeCommand {
                 .ok()
                 .filter(|s| !s.trim().is_empty())
                 .or_else(|| config.base_domain.clone().filter(|s| !s.trim().is_empty())),
+            appui_allowed_origins,
             frps_server: config
                 .frps_server
                 .clone()

@@ -293,7 +293,8 @@ pub struct PluginsConfig {
 
 /// AppUi session defaults applied by `octos serve`'s API agent.
 ///
-/// Both fields are optional. `default_session_cwd` defaults to `None` (no
+/// All fields have backward-compatible defaults. `allowed_origins` defaults
+/// to empty, `default_session_cwd` defaults to `None` (no
 /// server-side default cwd; sessions fall through Tier-3 of the
 /// `session_tool_registry` chain unchanged), but `sessions_in_cwd` defaults
 /// to `true` — see its field doc for the coexistence trade-off — so an
@@ -302,6 +303,16 @@ pub struct PluginsConfig {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AppUiConfig {
+    /// Additional browser origins allowed to call the REST API and open
+    /// either UI Protocol WebSocket endpoint.
+    ///
+    /// Every entry must be an exact `http://` or `https://` origin (scheme,
+    /// host, and optional port only). `octos serve` validates and normalizes
+    /// the list at startup. `OCTOS_APPUI_ALLOWED_ORIGINS`, when non-empty,
+    /// replaces this list with a comma-separated deployment override.
+    #[serde(default)]
+    pub allowed_origins: Vec<String>,
+
     /// Optional default workspace cwd for AppUi sessions. When set, every
     /// `session/open` call against this server falls back to this cwd
     /// (Tier-2 of `session_tool_registry`'s fallback chain) when the
@@ -354,6 +365,7 @@ fn default_sessions_in_cwd() -> bool {
 impl Default for AppUiConfig {
     fn default() -> Self {
         Self {
+            allowed_origins: Vec::new(),
             default_session_cwd: None,
             sessions_in_cwd: default_sessions_in_cwd(),
         }
@@ -2309,6 +2321,7 @@ mod tests {
             absent.appui.sessions_in_cwd,
             "an absent [appui] section must default sessions_in_cwd on",
         );
+        assert!(absent.appui.allowed_origins.is_empty());
 
         // Present `[appui]` missing the key → the field-level
         // `#[serde(default = \"default_sessions_in_cwd\")]` path → ON.
@@ -2331,6 +2344,26 @@ mod tests {
 
         // The programmatic Default agrees with both serde paths.
         assert!(AppUiConfig::default().sessions_in_cwd);
+        assert!(AppUiConfig::default().allowed_origins.is_empty());
+    }
+
+    #[test]
+    fn appui_allowed_origins_deserialize_without_prevalidating_deployment_values() {
+        let config: Config = serde_json::from_str(
+            r#"{
+                "appui": {
+                    "allowed_origins": [
+                        "https://octos.example",
+                        "http://localhost:50081"
+                    ]
+                }
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(
+            config.appui.allowed_origins,
+            vec!["https://octos.example", "http://localhost:50081"]
+        );
     }
 
     #[test]

@@ -177,6 +177,11 @@ The complete configuration structure with all available fields:
     }
   },
 
+  // Browser AppUI access (serve mode only)
+  "appui": {
+    "allowed_origins": ["https://octos.example.com"]
+  },
+
   // Dashboard auth (serve mode only)
   "dashboard_auth": null,
 
@@ -186,6 +191,36 @@ The complete configuration structure with all available fields:
 ```
 
 > The `memory.refresh` pipeline is **on by default**. See [Memory & Skills → Automatic Memory Refresh](./memory-skills.md) for the full field list and the `octos memory` command. Opt out with `"enabled": false` or `OCTOS_MEMORY_REFRESH_ENABLED=0`.
+
+## Browser AppUI Origins
+
+`octos serve` retains the existing OminiX/base-domain and development origins,
+and automatically allows loopback origins on the configured non-zero
+`--port`. Add every other browser origin explicitly—including a LAN address
+or custom hostname used to reach the embedded assets:
+
+```json
+{
+  "appui": {
+    "allowed_origins": [
+      "https://octos.example.com",
+      "https://octos.lan.example:50081"
+    ]
+  }
+}
+```
+
+Only `http://` and `https://` scheme + host + optional port are accepted.
+Userinfo, paths, queries, fragments, wildcards, `null`, and other schemes make
+startup fail. A non-empty comma-separated `OCTOS_APPUI_ALLOWED_ORIGINS`
+replaces the config list; an empty value does not.
+
+Reverse proxies must configure their public origin explicitly. Octos never
+derives trust from `Host` or `X-Forwarded-*`, and it does not guess LAN
+addresses. Use HTTPS for every non-loopback/production origin. Browser auth
+tokens are stored per origin, so open the public origin and log in there after
+changing the URL; logging in on localhost does not authenticate a different
+public origin.
 
 ## Runtime Tool Profiles
 
@@ -344,6 +379,7 @@ like Robrix render native Approve/Deny buttons, others show a text fallback):
 |----------|-------------|
 | `RUST_LOG` | Log level (error/warn/info/debug/trace) |
 | `OCTOS_LOG_JSON` | Enable JSON-formatted logs (set to any value) |
+| `OCTOS_APPUI_ALLOWED_ORIGINS` | Non-empty comma-separated exact browser origins; replaces `appui.allowed_origins` |
 
 ## File Layout
 

@@ -67,6 +67,7 @@ pub use preview_tokens::{
     DEFAULT_PREVIEW_SWEEP_INTERVAL, IssueError as PreviewTokenIssueError, PreviewSweeperHandle,
     PreviewTokens, SharedPreviewTokens, SignedPreviewResponse,
 };
+pub(crate) use router::resolve_appui_allowed_origins;
 pub use router::{DEFAULT_BASE_DOMAIN, build_router, cors_allowlist_for_base_domain};
 
 /// Test-only re-exports for the build_output_dir validation suite.
@@ -255,6 +256,11 @@ pub struct AppState {
     /// compatibility. See `crate::config::Config::base_domain` for the
     /// config / env-var wiring.
     pub base_domain: Option<String>,
+    /// Startup-normalized exact origins from `appui.allowed_origins` (or its
+    /// non-empty environment override), plus loopback origins for the active
+    /// serve port. CORS and both browser WebSocket gates consume this same
+    /// list; authentication and work-secret validation remain separate.
+    pub appui_allowed_origins: Vec<String>,
     /// frps server address for tunnel config generation.
     pub frps_server: Option<String>,
     /// frps control port.
@@ -413,6 +419,7 @@ impl AppState {
             run_id_cache: Arc::new(RunIdCache::new()),
             tunnel_domain: None,
             base_domain: None,
+            appui_allowed_origins: Vec::new(),
             frps_server: None,
             frps_port: None,
             deployment_mode: crate::config::DeploymentMode::Local,

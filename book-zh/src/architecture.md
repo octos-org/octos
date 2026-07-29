@@ -1192,7 +1192,7 @@ JSON 持久化位于 `.octos/cron.json`。
 
 许多方法由一个**协商的能力标志**（约 22 个 `*.v1` token，如 `coding.goal_runtime.v1`、`harness.task_control.v1`、`auxiliary.rest_to_ws.v1`）门控，客户端在连接时声明——WebSocket 通过 `ui_feature`/`X-Octos-Ui-Features`，`serve --stdio` 通过 `client_hello` 的 `supported_features`。核心的聊天/轮次/会话方法始终可用；自主运行、任务产物与辅助方法组位于标志之后。**「声明」与「可调用」**的确切规则较为微妙：某个方法可能出现在默认能力列表中，却仍需其标志才能被*调用*（如 `auxiliary.rest_to_ws.v1` 方法与 `user_question/respond`），因此客户端应以协商后的能力列表为准，并稳妥处理 `method_not_supported`，而非仅凭「已声明」就假定可调用。
 
-**认证**：可选的 bearer token，常量时间比较（仅 API 路由；`/metrics` 和静态文件为公开）。**CORS**：localhost 开发源加已配置的 base domain。**最大消息**：1MB。
+**认证**：可选的 bearer token，常量时间比较（仅 API 路由；`/metrics` 和静态文件为公开）。浏览器 Origin 策略在 serve 启动时一次性解析进 `AppState`：既有 OminiX/base-domain 与开发 Origin、规范化后的精确 `appui.allowed_origins`，以及实际 serve 端口的 loopback Origin。router 的 CORS predicate、`/api/ui-protocol/ws` 与 `/v1/session_ingress/ws/*` 两条升级 gate 共用这份列表；认证/work-secret 校验保持独立，CORS 不启用 credentials。托管环境的单层 tenant 子域仍由额外 WS 兼容规则处理。反向代理和 LAN Origin 不会从请求的 `Host`/转发头推导。**最大消息**：1MB。
 
 **Web UI**：通过 `rust-embed` 嵌入的 SPA，作为回退处理器提供服务。会话侧边栏、聊天界面、UI Protocol WebSocket 流式传输以及 dashboard/admin 页面共用同一个 `octos serve` 进程。
 

@@ -1,5 +1,6 @@
 //! API router construction.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use axum::Router;
@@ -9,6 +10,7 @@ use axum::middleware::{self, Next};
 use axum::routing::{delete, get, post, put};
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
+use url::Url;
 
 use super::AppState;
 use super::admin;
@@ -68,18 +70,151 @@ pub fn cors_allowlist_for_base_domain(base: Option<&str>) -> Vec<String> {
     ]
 }
 
+/// Compose the exact browser-origin allowlist shared by CORS and both
+/// UI Protocol WebSocket upgrade gates.
+///
+/// Legacy OminiX/base-domain and Vite development entries remain first for
+/// backward compatibility. Operator-provided, startup-normalized origins are
+/// appended in declaration order, with the first occurrence winning.
+pub(crate) fn browser_origin_allowlist(
+    base: Option<&str>,
+    appui_allowed_origins: &[String],
+) -> Vec<String> {
+    let mut seen = HashSet::new();
+    cors_allowlist_for_base_domain(base)
+        .into_iter()
+        .chain(appui_allowed_origins.iter().cloned())
+        .filter(|origin| seen.insert(origin.clone()))
+        .collect()
+}
+
+/// Validate and normalize one exact browser origin.
+///
+/// Paths other than `/`, queries, fragments, credentials, opaque origins,
+/// wildcards, and non-HTTP(S) schemes are deliberately rejected. Returning
+/// `Url::origin()`'s ASCII serialization makes equivalent spellings (scheme
+/// or host case, default ports, IDNs) compare exactly after startup.
+fn normalize_appui_origin(raw: &str) -> eyre::Result<String> {
+    let candidate = raw.trim();
+    eyre::ensure!(!candidate.is_empty(), "origin is empty");
+    eyre::ensure!(
+        !candidate.eq_ignore_ascii_case("null"),
+        "`null` is not a trusted browser origin"
+    );
+    eyre::ensure!(
+        !candidate.contains('*'),
+        "wildcards are not allowed; configure each exact origin"
+    );
+    eyre::ensure!(
+        !candidate.contains('\\'),
+        "backslashes are not valid in an exact browser origin"
+    );
+
+    let parsed =
+        Url::parse(candidate).map_err(|error| eyre::eyre!("invalid origin URL: {error}"))?;
+    eyre::ensure!(
+        matches!(parsed.scheme(), "http" | "https"),
+        "scheme must be http or https"
+    );
+    eyre::ensure!(parsed.host().is_some(), "origin must include a host");
+
+    // `Url::username()` cannot distinguish no userinfo from an explicitly
+    // empty username (`https://@host`), so also inspect the raw authority.
+    let authority_and_suffix = candidate
+        .find("://")
+        .map(|scheme_end| &candidate[scheme_end + 3..])
+        .ok_or_else(|| eyre::eyre!("origin must use `scheme://host` syntax"))?;
+    let authority_end = authority_and_suffix
+        .find(['/', '?', '#'])
+        .unwrap_or(authority_and_suffix.len());
+    let authority = &authority_and_suffix[..authority_end];
+    let raw_suffix = &authority_and_suffix[authority_end..];
+    eyre::ensure!(
+        !authority.contains('@') && parsed.username().is_empty() && parsed.password().is_none(),
+        "userinfo is not allowed in an origin"
+    );
+    eyre::ensure!(
+        parsed.path() == "/",
+        "origin must not include a non-root path"
+    );
+    eyre::ensure!(parsed.query().is_none(), "origin must not include a query");
+    eyre::ensure!(
+        parsed.fragment().is_none(),
+        "origin must not include a fragment"
+    );
+    eyre::ensure!(
+        raw_suffix.is_empty() || raw_suffix == "/",
+        "origin must contain only scheme, authority, and an optional root slash"
+    );
+
+    Ok(parsed.origin().ascii_serialization())
+}
+
+/// Resolve the effective operator/loopback origin list at serve startup.
+///
+/// A non-empty `OCTOS_APPUI_ALLOWED_ORIGINS` value replaces the config list;
+/// an absent or whitespace-only value leaves config authoritative. The
+/// running HTTP port's three loopback spellings are appended automatically.
+/// Port `0` is intentionally skipped because its eventual ephemeral port is
+/// unknown at this stage and must be configured explicitly if needed.
+pub(crate) fn resolve_appui_allowed_origins(
+    configured: &[String],
+    env_value: Option<&str>,
+    serve_port: u16,
+) -> eyre::Result<Vec<String>> {
+    let env_override = env_value.filter(|value| !value.trim().is_empty());
+    let selected: Vec<&str> = match env_override {
+        Some(value) => value.split(',').collect(),
+        None => configured.iter().map(String::as_str).collect(),
+    };
+
+    let source = if env_override.is_some() {
+        "OCTOS_APPUI_ALLOWED_ORIGINS"
+    } else {
+        "appui.allowed_origins"
+    };
+    let mut normalized = Vec::new();
+    let mut seen = HashSet::new();
+    for (index, raw) in selected.into_iter().enumerate() {
+        let origin = normalize_appui_origin(raw)
+            .map_err(|error| eyre::eyre!("{source}[{index}] is invalid: {error}"))?;
+        if seen.insert(origin.clone()) {
+            normalized.push(origin);
+        }
+    }
+
+    if serve_port != 0 {
+        for raw in [
+            format!("http://127.0.0.1:{serve_port}"),
+            format!("http://localhost:{serve_port}"),
+            format!("http://[::1]:{serve_port}"),
+        ] {
+            let origin = normalize_appui_origin(&raw)
+                .expect("generated loopback origins are valid exact HTTP origins");
+            if seen.insert(origin.clone()) {
+                normalized.push(origin);
+            }
+        }
+    }
+
+    Ok(normalized)
+}
+
 /// Build the axum router with all API routes.
 pub fn build_router(state: Arc<AppState>) -> Router {
     // Restrict CORS to an explicit allowlist of known origins.
     // Do NOT use suffix matching (e.g. ends_with(".ominix.io")) — a hijacked
     // subdomain would pass the check and enable cross-origin requests.
     //
-    // The allowlist is composed from `state.base_domain` at startup so each
-    // mini accepts its own public subdomain variants (`crew.`, `bot.`,
-    // `octos.`, `ocean.`) without redeploys. `None` preserves the legacy
-    // `crew.ominix.io` triple.
-    let allowed_origins: Arc<Vec<String>> =
-        Arc::new(cors_allowlist_for_base_domain(state.base_domain.as_deref()));
+    // The allowlist combines `state.base_domain` compatibility entries with
+    // the startup-normalized AppUI deployment/loopback origins. The same
+    // composition is used by both WebSocket gates. CORS intentionally does
+    // not call `allow_credentials`: bearer/work-secret auth is an independent
+    // layer and must not become ambient browser authority.
+    let allowed_origins: Arc<Vec<String>> = Arc::new(browser_origin_allowlist(
+        state.base_domain.as_deref(),
+        &state.appui_allowed_origins,
+    ));
     let cors = {
         let allowed = allowed_origins.clone();
         CorsLayer::new()
@@ -1204,6 +1339,7 @@ mod tests {
     use axum::http::Request;
     use chrono::Utc;
     use std::sync::Arc;
+    use tower::ServiceExt as _;
 
     #[test]
     fn test_constant_time_eq_equal() {
@@ -1604,6 +1740,143 @@ mod tests {
         let list = cors_allowlist_for_base_domain(Some("bot.ominix.io"));
         assert!(!list.iter().any(|s| s.contains("evil.example.com")));
         assert!(!list.iter().any(|s| s.contains("ocean.ominix.io")));
+    }
+
+    #[test]
+    fn appui_origins_are_normalized_deduplicated_and_get_actual_loopbacks() {
+        let configured = vec![
+            " HTTPS://Example.COM:443/ ".to_string(),
+            "https://example.com".to_string(),
+            "http://localhost:50081".to_string(),
+        ];
+        let origins = resolve_appui_allowed_origins(&configured, None, 50081).unwrap();
+
+        assert_eq!(
+            origins,
+            vec![
+                "https://example.com",
+                "http://localhost:50081",
+                "http://127.0.0.1:50081",
+                "http://[::1]:50081",
+            ]
+        );
+        assert!(!origins.contains(&"http://localhost:50080".to_string()));
+    }
+
+    #[test]
+    fn non_empty_appui_origins_env_replaces_config_but_empty_env_does_not() {
+        let configured = vec!["https://from-config.example".to_string()];
+        let overridden = resolve_appui_allowed_origins(
+            &configured,
+            Some(" https://one.example,HTTPS://TWO.EXAMPLE:443/ "),
+            0,
+        )
+        .unwrap();
+        assert_eq!(
+            overridden,
+            vec!["https://one.example", "https://two.example"]
+        );
+
+        let config_wins = resolve_appui_allowed_origins(&configured, Some("  "), 0).unwrap();
+        assert_eq!(config_wins, vec!["https://from-config.example"]);
+    }
+
+    #[test]
+    fn appui_origin_validation_rejects_non_origins_and_unsafe_schemes() {
+        for invalid in [
+            "",
+            "null",
+            "https://*.example.com",
+            "https://user@example.com",
+            "https://@example.com",
+            "https://example.com/path",
+            "https://example.com/.",
+            "https://example.com/foo/..",
+            "https://example.com\\.",
+            "https://example.com/?query=1",
+            "https://example.com/#fragment",
+            "ws://example.com",
+            "wss://example.com",
+            "file:///tmp/index.html",
+        ] {
+            let error =
+                resolve_appui_allowed_origins(&[invalid.to_string()], None, 0).expect_err(invalid);
+            assert!(
+                error.to_string().contains("invalid"),
+                "{invalid:?} returned an unhelpful error: {error}"
+            );
+        }
+
+        let empty_env_item =
+            resolve_appui_allowed_origins(&[], Some("https://ok.example,"), 0).unwrap_err();
+        assert!(empty_env_item.to_string().contains("[1]"));
+    }
+
+    #[test]
+    fn browser_origin_allowlist_preserves_legacy_and_adds_exact_custom_origin() {
+        let custom =
+            resolve_appui_allowed_origins(&["https://public.example".to_string()], None, 50081)
+                .unwrap();
+        let list = browser_origin_allowlist(Some("bot.ominix.io"), &custom);
+
+        assert!(list.contains(&"https://app.ominix.io".to_string()));
+        assert!(list.contains(&"https://app.bot.ominix.io".to_string()));
+        assert!(list.contains(&"http://localhost:5174".to_string()));
+        assert!(list.contains(&"https://public.example".to_string()));
+        assert!(list.contains(&"http://127.0.0.1:50081".to_string()));
+        assert!(!list.contains(&"http://127.0.0.1:50080".to_string()));
+    }
+
+    #[tokio::test]
+    async fn cors_uses_exact_effective_appui_origins_without_credentials() {
+        let state = Arc::new(AppState {
+            appui_allowed_origins: resolve_appui_allowed_origins(&[], None, 50081).unwrap(),
+            ..AppState::empty_for_tests()
+        });
+        let app = build_router(state);
+
+        let allowed = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/auth/status")
+                    .header(axum::http::header::ORIGIN, "http://localhost:50081")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            allowed
+                .headers()
+                .get(axum::http::header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                .and_then(|value| value.to_str().ok()),
+            Some("http://localhost:50081")
+        );
+        assert!(
+            allowed
+                .headers()
+                .get(axum::http::header::ACCESS_CONTROL_ALLOW_CREDENTIALS)
+                .is_none(),
+            "origin configuration must not opt CORS into ambient credentials"
+        );
+
+        let wrong_port = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/auth/status")
+                    .header(axum::http::header::ORIGIN, "http://localhost:50080")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            wrong_port
+                .headers()
+                .get(axum::http::header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                .is_none()
+        );
     }
 
     // ── #995 — `is_trusted_proxy_addr` + CIDR parser ───────────────────

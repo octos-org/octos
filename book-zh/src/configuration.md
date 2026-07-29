@@ -165,6 +165,11 @@
     }
   },
 
+  // 浏览器 AppUI 访问（仅 serve 模式）
+  "appui": {
+    "allowed_origins": ["https://octos.example.com"]
+  },
+
   // 仪表板认证（仅 serve 模式）
   "dashboard_auth": null,
 
@@ -174,6 +179,34 @@
 ```
 
 > `memory.refresh` 流水线**默认开启**。完整字段列表与 `octos memory` 命令见[记忆与技能 → 自动记忆刷新](./memory-skills.md)。通过 `"enabled": false` 或 `OCTOS_MEMORY_REFRESH_ENABLED=0` 退出。
+
+## 浏览器 AppUI Origin
+
+`octos serve` 会保留既有 OminiX/base-domain 与开发 Origin，并自动允许
+配置的非零 `--port` 上的 loopback Origin。其他浏览器 Origin 都必须逐个
+显式配置——包括用 LAN 地址或自定义主机名访问同一份内嵌资源的情况：
+
+```json
+{
+  "appui": {
+    "allowed_origins": [
+      "https://octos.example.com",
+      "https://octos.lan.example:50081"
+    ]
+  }
+}
+```
+
+每项只能包含 `http://` 或 `https://`、主机以及可选端口。userinfo、路径、
+query、fragment、通配符、`null` 或其他 scheme 会让启动直接失败。非空的
+`OCTOS_APPUI_ALLOWED_ORIGINS` 使用逗号分隔，并整体覆盖配置文件列表；
+空值不覆盖配置。
+
+反向代理必须显式填写浏览器实际访问的公开 Origin。Octos 不会从 `Host`
+或 `X-Forwarded-*` 推导信任，也不会猜测 LAN 地址。非 loopback/生产
+Origin 应使用 HTTPS。浏览器认证 token 按 Origin 存储；URL 变化后请
+打开公开 Origin 并在该页面重新登录，在 localhost 登录不会自动认证
+另一个公开 Origin。
 
 ## 人工审批规则
 
@@ -269,6 +302,7 @@
 |------|------|
 | `RUST_LOG` | 日志级别（error/warn/info/debug/trace） |
 | `OCTOS_LOG_JSON` | 启用 JSON 格式日志（设置为任意值即可） |
+| `OCTOS_APPUI_ALLOWED_ORIGINS` | 非空、逗号分隔的精确浏览器 Origin；覆盖 `appui.allowed_origins` |
 
 ## 文件目录结构
 

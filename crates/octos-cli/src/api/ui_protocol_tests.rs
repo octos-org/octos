@@ -16512,7 +16512,7 @@ fn ws_origin_gate_allows_absent_or_empty_origin() {
     // No Origin header at all → allow (TUI / gateway / scripts).
     let headers = HeaderMap::new();
     assert_eq!(
-        decide_ws_origin_gate(&headers, None, false),
+        decide_ws_origin_gate(&headers, None, &[], false),
         WsOriginDecision::Allow,
     );
 
@@ -16520,14 +16520,14 @@ fn ws_origin_gate_allows_absent_or_empty_origin() {
     let mut headers = HeaderMap::new();
     headers.insert(axum::http::header::ORIGIN, "".parse().unwrap());
     assert_eq!(
-        decide_ws_origin_gate(&headers, None, false),
+        decide_ws_origin_gate(&headers, None, &[], false),
         WsOriginDecision::Allow,
     );
 
     let mut headers = HeaderMap::new();
     headers.insert(axum::http::header::ORIGIN, "   ".parse().unwrap());
     assert_eq!(
-        decide_ws_origin_gate(&headers, None, false),
+        decide_ws_origin_gate(&headers, None, &[], false),
         WsOriginDecision::Allow,
     );
 }
@@ -16542,7 +16542,7 @@ fn ws_origin_gate_rejects_present_non_allowlisted_origin() {
     // Even authenticated, an unrelated cross-origin must still be
     // rejected — the auth gate is a separate layer, the Origin
     // gate is what stops a hijacked browser tab on another origin.
-    let decision = decide_ws_origin_gate(&headers, Some("bot.ominix.io"), true);
+    let decision = decide_ws_origin_gate(&headers, Some("bot.ominix.io"), &[], true);
     assert!(matches!(
         decision,
         WsOriginDecision::RejectDisallowed { ref origin }
@@ -16563,7 +16563,7 @@ fn ws_origin_gate_allows_single_label_subdomain_of_base() {
         "https://dspfac.ocean.ominix.io".parse().unwrap(),
     );
     assert_eq!(
-        decide_ws_origin_gate(&headers, Some("ocean.ominix.io"), false),
+        decide_ws_origin_gate(&headers, Some("ocean.ominix.io"), &[], false),
         WsOriginDecision::Allow,
     );
 }
@@ -16583,7 +16583,7 @@ fn ws_origin_gate_allows_bare_base_domain_when_authenticated() {
         "https://ocean.ominix.io".parse().unwrap(),
     );
     assert_eq!(
-        decide_ws_origin_gate(&headers, Some("ocean.ominix.io"), true),
+        decide_ws_origin_gate(&headers, Some("ocean.ominix.io"), &[], true),
         WsOriginDecision::Allow,
     );
 }
@@ -16600,7 +16600,7 @@ fn ws_origin_gate_rejects_bare_base_domain_without_auth() {
         axum::http::header::ORIGIN,
         "https://ocean.ominix.io".parse().unwrap(),
     );
-    let decision = decide_ws_origin_gate(&headers, Some("ocean.ominix.io"), false);
+    let decision = decide_ws_origin_gate(&headers, Some("ocean.ominix.io"), &[], false);
     assert!(matches!(
         decision,
         WsOriginDecision::RejectDisallowed { ref origin }
@@ -16618,7 +16618,7 @@ fn ws_origin_gate_rejects_bare_base_domain_with_port_even_when_authenticated() {
         axum::http::header::ORIGIN,
         "https://ocean.ominix.io:8443".parse().unwrap(),
     );
-    let decision = decide_ws_origin_gate(&headers, Some("ocean.ominix.io"), true);
+    let decision = decide_ws_origin_gate(&headers, Some("ocean.ominix.io"), &[], true);
     assert!(matches!(
         decision,
         WsOriginDecision::RejectDisallowed { .. }
@@ -16637,7 +16637,7 @@ fn ws_origin_gate_rejects_cross_origin_even_when_authenticated() {
         axum::http::header::ORIGIN,
         "https://attacker.example.com".parse().unwrap(),
     );
-    let decision = decide_ws_origin_gate(&headers, Some("ocean.ominix.io"), true);
+    let decision = decide_ws_origin_gate(&headers, Some("ocean.ominix.io"), &[], true);
     assert!(matches!(
         decision,
         WsOriginDecision::RejectDisallowed { .. }
@@ -16654,7 +16654,7 @@ fn ws_origin_gate_rejects_multi_label_subdomain_of_base() {
         axum::http::header::ORIGIN,
         "https://attacker.dspfac.ocean.ominix.io".parse().unwrap(),
     );
-    let decision = decide_ws_origin_gate(&headers, Some("ocean.ominix.io"), true);
+    let decision = decide_ws_origin_gate(&headers, Some("ocean.ominix.io"), &[], true);
     assert!(matches!(
         decision,
         WsOriginDecision::RejectDisallowed { .. }
@@ -16670,7 +16670,7 @@ fn ws_origin_gate_rejects_tenant_with_port() {
         axum::http::header::ORIGIN,
         "https://dspfac.ocean.ominix.io:8443".parse().unwrap(),
     );
-    let decision = decide_ws_origin_gate(&headers, Some("ocean.ominix.io"), false);
+    let decision = decide_ws_origin_gate(&headers, Some("ocean.ominix.io"), &[], false);
     assert!(matches!(
         decision,
         WsOriginDecision::RejectDisallowed { .. }
@@ -16691,9 +16691,47 @@ fn ws_origin_gate_rejects_non_ascii_origin() {
         .expect("HeaderValue accepts arbitrary visible bytes");
     headers.insert(axum::http::header::ORIGIN, val);
     assert_eq!(
-        decide_ws_origin_gate(&headers, None, false),
+        decide_ws_origin_gate(&headers, None, &[], false),
         WsOriginDecision::RejectMalformed,
     );
+}
+
+#[test]
+fn both_ws_gates_share_exact_effective_appui_origins() {
+    let state = AppState {
+        appui_allowed_origins: vec!["http://localhost:50081".to_string()],
+        ..AppState::empty_for_tests()
+    };
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        axum::http::header::ORIGIN,
+        "http://localhost:50081".parse().unwrap(),
+    );
+
+    // Main UI auth and session-ingress work-secret validation remain
+    // independent layers; both browser upgrades first consume this same
+    // exact startup policy.
+    assert_eq!(
+        decide_ui_ws_origin_gate(&headers, &state, false),
+        WsOriginDecision::Allow
+    );
+    assert_eq!(
+        decide_session_ingress_ws_origin_gate(&headers, &state),
+        WsOriginDecision::Allow
+    );
+
+    headers.insert(
+        axum::http::header::ORIGIN,
+        "http://localhost:50080".parse().unwrap(),
+    );
+    assert!(matches!(
+        decide_ui_ws_origin_gate(&headers, &state, true),
+        WsOriginDecision::RejectDisallowed { .. }
+    ));
+    assert!(matches!(
+        decide_session_ingress_ws_origin_gate(&headers, &state),
+        WsOriginDecision::RejectDisallowed { .. }
+    ));
 }
 
 #[tokio::test]
