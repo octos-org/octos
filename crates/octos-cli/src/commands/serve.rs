@@ -979,7 +979,13 @@ impl ServeCommand {
                 )
                 .with_host_memory_refresh_enabled(crate::config::MemoryConfig::refresh_enabled(
                     config.memory.as_ref(),
-                )),
+                ))
+                .with_host_asr_language(
+                    config
+                        .voice
+                        .as_ref()
+                        .and_then(|voice| voice.asr_language.clone()),
+                ),
         );
         process_manager.set_self_ref();
 
