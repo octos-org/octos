@@ -10,6 +10,8 @@
 use octos_core::SessionKey;
 use serde::{Deserialize, Serialize};
 
+use crate::grant::WorkerGrant;
+
 /// Schema version stamped on every persisted record. Bumping this
 /// invalidates prior rows the same way the swarm dispatch ledger does:
 /// a load that sees a *higher* version returns `Ok(None)`.
@@ -272,6 +274,15 @@ pub struct PlanTask {
     /// [`FleetChildRecord::deps`], re-synced by `replan`.
     pub deps: Vec<String>,
     pub acceptance: Vec<AcceptanceCriterion>,
+    /// PR A — the operator-supplied capability grant the host builds this
+    /// task's worker from (network / tools / filesystem). `#[serde(default)]`
+    /// is deliberate forward-compat, **NOT** a `SCHEMA_VERSION` bump: an old
+    /// row written before grants existed (no `grant` key) deserializes to
+    /// [`WorkerGrant::minimal`] — byte-for-byte today's closed worker — rather
+    /// than dropping the row. Least-privilege by default; the master expands it
+    /// explicitly per task.
+    #[serde(default)]
+    pub grant: WorkerGrant,
 }
 
 /// An acceptance criterion: a description plus a checkable [`Verifier`].
@@ -447,6 +458,52 @@ mod tests {
         assert!(ChildStatus::Cancelled.is_terminal());
         assert!(!ChildStatus::Ready.is_terminal());
         assert!(!ChildStatus::Running.is_terminal());
+    }
+
+    #[test]
+    fn plan_task_grant_persists_and_restores() {
+        use crate::grant::{FsGrant, NetworkGrant, WorkerGrant};
+
+        // A granted task round-trips its grant verbatim through JSON (the shape
+        // the FleetKernelStore persists).
+        let task = PlanTask {
+            task_id: "t1".into(),
+            title: "fetch".into(),
+            detail: "grab the report".into(),
+            deps: vec![],
+            acceptance: vec![],
+            grant: WorkerGrant {
+                network: NetworkGrant::Hosts(vec!["example.com".into()]),
+                tools: vec!["read_file".into(), "write_file".into(), "web_fetch".into()],
+                fs: FsGrant::Host,
+            },
+        };
+        // PlanTask is nested inside DurablePlan (which carries schema_version);
+        // it has no version field of its own, so it round-trips via plain serde.
+        let json = serde_json::to_string(&task).unwrap();
+        let back: PlanTask = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            back.grant, task.grant,
+            "grant round-trips through the store"
+        );
+
+        // An OLD row written before grants existed (no `grant` key) must still
+        // decode — `#[serde(default)]` fills `WorkerGrant::minimal()` (today's
+        // closed worker), NOT fail. This is why grant is not a SCHEMA_VERSION
+        // bump.
+        let old_json = r#"{
+            "task_id": "t0",
+            "title": "legacy",
+            "detail": "",
+            "deps": [],
+            "acceptance": []
+        }"#;
+        let legacy: PlanTask = serde_json::from_str(old_json).expect("decode old row");
+        assert_eq!(
+            legacy.grant,
+            WorkerGrant::minimal(),
+            "a task with no grant loads as the least-privilege closed worker",
+        );
     }
 
     #[test]

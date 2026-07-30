@@ -2051,6 +2051,7 @@ mod tests {
             detail: String::new(),
             deps: deps.iter().map(|s| s.to_string()).collect(),
             acceptance: vec![],
+            grant: crate::grant::WorkerGrant::minimal(),
         }
     }
 

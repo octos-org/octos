@@ -322,6 +322,7 @@ mod tests {
             detail: format!("detail {id}"),
             deps: deps.iter().map(|s| (*s).to_owned()).collect(),
             acceptance: Vec::new(),
+            grant: octos_fleet::WorkerGrant::minimal(),
         }
     }
 

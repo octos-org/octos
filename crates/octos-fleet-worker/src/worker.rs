@@ -154,11 +154,18 @@ pub async fn run_attempt(
         },
     );
 
+    // PR A: the sandbox's raw network egress comes from THIS task's grant, not
+    // a hardcoded `false`. `None`/`Hosts` → no raw egress (the shell cannot
+    // `curl`; `Hosts` is enforced by the granted web tools); `Full` → raw egress
+    // (git/npm/etc.). The isolating backend is unchanged — only the network flag
+    // is per-attempt.
+    let allow_network = task_view.grant.network.allows_raw_egress();
+
     // P1-3-fix: ONE sandbox instance for the whole attempt, shared by the
-    // agent's closed registry AND the acceptance validators — so a
+    // agent's granted registry AND the acceptance validators — so a
     // non-idempotent factory can never sandbox the agent while handing the
     // validators a weaker (e.g. no-op) sandbox.
-    let sandbox = factory.sandbox_for(working_dir);
+    let sandbox = factory.sandbox_for(working_dir, allow_network);
 
     // #1857 PR 5a fix (H1, codex round 2) — ATTEMPT-TIME fail-closed. The serve
     // boot probe checks ONE sandbox instance, but the factory reconstructs the
@@ -177,50 +184,64 @@ pub async fn run_attempt(
         );
         Computed::terminated("no isolating sandbox available at attempt time".to_string())
     } else {
-        // 3. Fresh, closed-registry agent (cannot park, cannot fan out) under the
-        //    shared sandbox. Its per-tool timeouts AND per-command shell ceiling
-        //    are clamped to `deadline` (P1-2).
-        let agent = factory.build_agent(working_dir, sandbox.clone(), deadline);
-
-        // 4. Run under a HARD deadline — `run_task` is cancel-safe to drop and
-        //    has NO internal wall-clock cap, so the timeout wrapper is mandatory.
-        let start = Instant::now();
-        let run = tokio::time::timeout(deadline, agent.run_task(&task)).await;
-        let elapsed = start.elapsed();
-
-        // 5-6. Map the result to a verdict + snapshot inputs.
-        match run {
-            Err(_elapsed) => {
-                Computed::terminated(format!("deadline exceeded after {}s", deadline.as_secs()))
+        // 3. Fresh, granted-registry agent (cannot park, cannot fan out; holds
+        //    EXACTLY the operator-granted tools) under the shared sandbox. Its
+        //    per-tool timeouts AND per-command shell ceiling are clamped to
+        //    `deadline` (P1-2). An incoherent grant (rejected at parse) fails
+        //    closed here too: terminate the attempt without running.
+        match factory.build_agent(working_dir, sandbox.clone(), deadline, &task_view.grant) {
+            Err(err) => {
+                tracing::error!(
+                    %fleet_id, %task_id, %attempt_id, error = %err,
+                    "fleet worker: invalid worker grant; terminating the attempt",
+                );
+                Computed::terminated(format!("invalid worker grant: {err}"))
             }
-            Ok(Err(report)) => Computed::terminated(format!("run failed: {report}")),
-            Ok(Ok(result)) if !result.success => {
-                let reason = if result.output.trim().is_empty() {
-                    "run did not succeed".to_string()
-                } else {
-                    result.output.clone()
-                };
-                Computed::rejected(reason, &result)
-            }
-            Ok(Ok(result)) => {
-                // P1-5b: bound the acceptance phase by the REMAINING deadline so a
-                // slow `CommandExit` validator can't hold both permits past the
-                // fleet deadline. A small floor keeps a right-at-the-edge run from
-                // getting a 0ms acceptance budget.
-                let remaining = deadline
-                    .checked_sub(elapsed)
-                    .unwrap_or(Duration::ZERO)
-                    .max(ACCEPTANCE_MIN_BUDGET);
-                let (verdict, error) = run_acceptance(
-                    task_view,
-                    working_dir,
-                    factory,
-                    sandbox,
-                    deadline.as_secs().max(1),
-                    remaining,
-                )
-                .await;
-                Computed::from_verdict(verdict, error, &result)
+            Ok(agent) => {
+                // 4. Run under a HARD deadline — `run_task` is cancel-safe to
+                //    drop and has NO internal wall-clock cap, so the timeout
+                //    wrapper is mandatory.
+                let start = Instant::now();
+                let run = tokio::time::timeout(deadline, agent.run_task(&task)).await;
+                let elapsed = start.elapsed();
+
+                // 5-6. Map the result to a verdict + snapshot inputs.
+                match run {
+                    Err(_elapsed) => Computed::terminated(format!(
+                        "deadline exceeded after {}s",
+                        deadline.as_secs()
+                    )),
+                    Ok(Err(report)) => Computed::terminated(format!("run failed: {report}")),
+                    Ok(Ok(result)) if !result.success => {
+                        let reason = if result.output.trim().is_empty() {
+                            "run did not succeed".to_string()
+                        } else {
+                            result.output.clone()
+                        };
+                        Computed::rejected(reason, &result)
+                    }
+                    Ok(Ok(result)) => {
+                        // P1-5b: bound the acceptance phase by the REMAINING
+                        // deadline so a slow `CommandExit` validator can't hold
+                        // both permits past the fleet deadline. A small floor
+                        // keeps a right-at-the-edge run from getting a 0ms
+                        // acceptance budget.
+                        let remaining = deadline
+                            .checked_sub(elapsed)
+                            .unwrap_or(Duration::ZERO)
+                            .max(ACCEPTANCE_MIN_BUDGET);
+                        let (verdict, error) = run_acceptance(
+                            task_view,
+                            working_dir,
+                            factory,
+                            sandbox,
+                            deadline.as_secs().max(1),
+                            remaining,
+                        )
+                        .await;
+                        Computed::from_verdict(verdict, error, &result)
+                    }
+                }
             }
         }
     };
@@ -476,15 +497,29 @@ async fn run_acceptance(
     // it alone would leak a `sleep`ing subprocess past the recorded terminal
     // state. Subtracting each run's elapsed keeps the TOTAL phase bounded by
     // the initial `remaining`.
-    let runner = ValidatorRunner::new(
-        Arc::new(factory.build_registry_with(
-            workspace_root,
-            sandbox.clone(),
-            max_shell_timeout_secs,
-        )),
-        workspace_root.to_path_buf(),
-    )
-    .with_sandbox(sandbox);
+    // The acceptance gate runs `CommandExit` validators through the SAME granted
+    // registry the agent held (so the shell is configured identically). An
+    // incoherent grant would already have failed the agent build above; handle
+    // the Result defensively.
+    let registry = match factory.build_registry_with(
+        workspace_root,
+        sandbox.clone(),
+        max_shell_timeout_secs,
+        &task_view.grant,
+    ) {
+        Ok(registry) => registry,
+        Err(err) => {
+            let reason = format!("invalid worker grant for acceptance: {err}");
+            return (
+                AcceptanceVerdict::Terminated {
+                    reason: reason.clone(),
+                },
+                Some(reason),
+            );
+        }
+    };
+    let runner = ValidatorRunner::new(Arc::new(registry), workspace_root.to_path_buf())
+        .with_sandbox(sandbox);
     let invocation = ValidatorInvocation::new(
         ValidatorPhase::Completion,
         workspace_root.to_path_buf(),
@@ -728,6 +763,77 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn grant_network_threads_allow_network_into_sandbox() {
+        // PR A: `run_attempt` derives the sandbox's `allow_network` from the
+        // task's grant — a `Full` grant threads `true`, a minimal grant `false`.
+        // A recording sandbox factory captures the flag it is handed.
+        use std::sync::Mutex;
+        let seen: Arc<Mutex<Vec<bool>>> = Arc::new(Mutex::new(Vec::new()));
+
+        async fn run_with_grant(
+            seen: Arc<std::sync::Mutex<Vec<bool>>>,
+            grant: octos_fleet::WorkerGrant,
+        ) {
+            let (_sd, store) = fresh_store().await;
+            let fleet = create_fleet(
+                store.clone(),
+                "f1",
+                vec![task_spec_granted("a", &[], vec![], grant)],
+            )
+            .await;
+            let attempt = launch(&store, "f1", "a").await;
+
+            let (_md, memory) = fresh_memory().await;
+            let rec = seen.clone();
+            let factory = AgentFactory::new(
+                Arc::new(SuccessProvider),
+                memory,
+                Arc::new(move |_cwd, allow_network| {
+                    rec.lock().unwrap().push(allow_network);
+                    Arc::new(MarkerSandbox) as Arc<dyn Sandbox>
+                }),
+            );
+            let task_view = view_of(&fleet, "a").await;
+            let work = TempDir::new().unwrap();
+            let _ = run_attempt(
+                store.clone(),
+                "f1",
+                "a",
+                &attempt,
+                &task_view,
+                &factory,
+                work.path(),
+                Duration::from_secs(30),
+                EPOCH,
+                || NOW,
+            )
+            .await;
+        }
+
+        // Minimal grant → no raw egress.
+        run_with_grant(seen.clone(), octos_fleet::WorkerGrant::minimal()).await;
+        // Full grant → raw egress.
+        run_with_grant(
+            seen.clone(),
+            octos_fleet::WorkerGrant {
+                network: octos_fleet::NetworkGrant::Full,
+                ..octos_fleet::WorkerGrant::minimal()
+            },
+        )
+        .await;
+
+        let flags = seen.lock().unwrap().clone();
+        assert!(
+            flags.contains(&false),
+            "a minimal grant must build the sandbox with allow_network=false: {flags:?}",
+        );
+        assert!(
+            flags.contains(&true),
+            "a Full grant must build the sandbox with allow_network=true: {flags:?}",
+        );
+    }
+
+    #[tokio::test]
     async fn run_attempt_happy_path() {
         let (_sd, store) = fresh_store().await;
         let fleet = create_fleet(
@@ -814,7 +920,7 @@ mod tests {
             // MarkerSandbox (isolating test double) so the attempt-time
             // fail-closed guard (H1) lets the agent run; still counts factory
             // invocations to prove the single-shared-instance contract.
-            Arc::new(move |_| {
+            Arc::new(move |_, _| {
                 seen.fetch_add(1, Ordering::SeqCst);
                 Arc::new(MarkerSandbox) as Arc<dyn Sandbox>
             }),
@@ -876,7 +982,7 @@ mod tests {
                 calls: calls.clone(),
             }),
             memory,
-            Arc::new(|_| Arc::new(NoSandbox) as Arc<dyn Sandbox>),
+            Arc::new(|_, _| Arc::new(NoSandbox) as Arc<dyn Sandbox>),
         );
         let task_view = view_of(&fleet, "a").await;
 
