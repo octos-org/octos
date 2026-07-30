@@ -10,6 +10,7 @@ pub fn paste_token_flow(provider: &str) -> Result<AuthCredential> {
         "anthropic" => "ANTHROPIC_API_KEY",
         "gemini" | "google" => "GEMINI_API_KEY",
         "deepseek" => "DEEPSEEK_API_KEY",
+        "atlascloud" | "atlas-cloud" => "ATLASCLOUD_API_KEY",
         _ => "API_KEY",
     };
 

@@ -90,6 +90,14 @@ const PROVIDERS: &[ProviderInfo] = &[
         api_types: &[],
     },
     ProviderInfo {
+        name: "atlascloud",
+        display: "Atlas Cloud",
+        api_key_env: "ATLASCLOUD_API_KEY",
+        base_url: Some("https://api.atlascloud.ai/v1"),
+        api_type: None,
+        api_types: &[],
+    },
+    ProviderInfo {
         name: "moonshot",
         display: "Moonshot (Kimi)",
         api_key_env: "KIMI_API_KEY",
@@ -692,6 +700,7 @@ fn default_model_for(provider: &str, catalog: &BTreeMap<String, Vec<String>>) ->
     match provider {
         "openai" => return Ok("gpt-4.1-mini".to_string()),
         "anthropic" => return Ok("claude-sonnet-4-20250514".to_string()),
+        "atlascloud" => return Ok("deepseek-ai/deepseek-v4-pro".to_string()),
         _ => {}
     }
     if let Some(first) = catalog.get(provider).and_then(|m| m.first()) {
@@ -1154,6 +1163,10 @@ mod tests {
         let catalog = embedded_catalog_models();
         assert!(default_model_for("anthropic", &catalog).is_ok());
         assert!(default_model_for("deepseek", &catalog).is_ok());
+        assert_eq!(
+            default_model_for("atlascloud", &catalog).unwrap(),
+            "deepseek-ai/deepseek-v4-pro"
+        );
         let err = default_model_for("no-such-provider", &BTreeMap::new()).unwrap_err();
         assert!(err.to_string().contains("model"), "guidance in {err}");
     }

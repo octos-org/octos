@@ -13,6 +13,7 @@ use crate::provider::LlmProvider;
 // ── Provider sub-modules ────────────────────────────────────────────────────
 
 mod anthropic;
+mod atlascloud;
 mod dashscope;
 mod deepseek;
 mod gemini;
@@ -121,6 +122,7 @@ static ALL: &[ProviderEntry] = &[
     vertex::ENTRY,
     r9s::ENTRY,
     openrouter::ENTRY,
+    atlascloud::ENTRY,
     deepseek::ENTRY,
     groq::ENTRY,
     // Coding-plan families FIRST so an explicit `moonshot-coding` / `zai-coding`
@@ -191,6 +193,7 @@ mod tests {
     #[test]
     fn lookup_by_name() {
         assert!(lookup("anthropic").is_some());
+        assert!(lookup("atlascloud").is_some());
         assert!(lookup("deepseek").is_some());
         assert!(lookup("vllm").is_some());
     }
@@ -220,6 +223,9 @@ mod tests {
 
         let e = lookup("r9s.ai").unwrap();
         assert_eq!(e.name, "r9s");
+
+        let e = lookup("atlas-cloud").unwrap();
+        assert_eq!(e.name, "atlascloud");
     }
 
     #[test]
@@ -236,7 +242,16 @@ mod tests {
 
     #[test]
     fn all_entries_count() {
-        assert_eq!(all_entries().len(), 18);
+        assert_eq!(all_entries().len(), 19);
+    }
+
+    #[test]
+    fn atlascloud_entry_uses_openai_compatible_defaults() {
+        let e = lookup("atlascloud").expect("atlascloud provider should be registered");
+        assert_eq!(e.default_model, Some("deepseek-ai/deepseek-v4-pro"));
+        assert_eq!(e.api_key_env, Some("ATLASCLOUD_API_KEY"));
+        assert_eq!(e.default_base_url, Some("https://api.atlascloud.ai/v1"));
+        assert!(e.requires_api_key);
     }
 
     /// The coding-plan families resolve to their coding endpoints + default
