@@ -7,6 +7,7 @@ license.workspace = true
 description = "Closed, non-interactive fleet task worker: audited replay-safe tool registry + bounded pool over the fleet kernel store"
 
 [dependencies]
+async-trait.workspace = true
 eyre.workspace = true
 octos-agent.workspace = true
 octos-core.workspace = true
@@ -18,7 +19,6 @@ tokio.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
-async-trait.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
 

@@ -32,6 +32,8 @@ use octos_agent::tools::{
 };
 use octos_fleet::WorkerGrant;
 
+use crate::escalate::{EscalateTool, EscalationSlot};
+
 /// The base tool set a *minimal* (least-privilege) worker holds — today's
 /// closed seven. Kept as a named constant for docs / discriminator tests;
 /// equals [`octos_fleet::BASE_TOOLS`] and `WorkerGrant::minimal().tools`. The
@@ -91,6 +93,7 @@ pub fn build_fleet_worker_registry(
     sandbox: Arc<dyn Sandbox>,
     max_shell_timeout_secs: u64,
     grant: &WorkerGrant,
+    escalation: EscalationSlot,
 ) -> Result<ToolRegistry> {
     // Reject an incoherent grant up front (unknown tool / web tool with no
     // network) — validated at parse time too, so this is defense-in-depth: an
@@ -184,14 +187,25 @@ pub fn build_fleet_worker_registry(
         }
     }
 
-    // Belt-and-suspenders: hard-remove anything not in the granted allow-set.
-    // A no-op today (we registered exactly the grant and nothing auto-swaps),
-    // but it locks the invariant so a future edit that registers an extra tool
-    // cannot silently widen the worker's reach — `apply_policy` -> `retain` is a
-    // real removal. `ToolPolicy.allow` empty = allow-all, which only happens for
-    // an (unusual) empty grant that registered nothing, so it is still bounded.
+    // PR B — the always-on `escalate` safety valve. Registered UNCONDITIONALLY,
+    // AFTER the grant loop, and NOT grant-gated: even a minimal-grant worker must
+    // be able to ASK for more capability when a task hits the edge of its grant.
+    // It only RECORDS a request (into the shared slot) and returns — it never
+    // parks (`blocks_on_human_input == false`) and never self-widens the grant
+    // (only the keeper's `goal_grant` mutates `PlanTask.grant`).
+    r.register(EscalateTool::new(escalation));
+
+    // Belt-and-suspenders: hard-remove anything not in the granted allow-set
+    // PLUS the always-on `escalate` valve. A no-op today (we registered exactly
+    // the grant + escalate and nothing auto-swaps), but it locks the invariant so
+    // a future edit that registers an extra tool cannot silently widen the
+    // worker's reach — `apply_policy` -> `retain` is a real removal. The allow
+    // list is never empty here (it always contains `escalate`), so it can never
+    // collapse into the empty=allow-all case.
+    let mut allow = grant.tools.clone();
+    allow.push("escalate".to_string());
     r.apply_policy(&ToolPolicy {
-        allow: grant.tools.clone(),
+        allow,
         ..Default::default()
     });
     Ok(r)
@@ -204,7 +218,22 @@ mod tests {
     use octos_fleet::{FsGrant, NetworkGrant};
     use std::collections::HashSet;
     use std::path::Path;
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
+
+    /// A fresh, empty escalation slot for a test build.
+    fn slot() -> EscalationSlot {
+        Arc::new(Mutex::new(None))
+    }
+
+    /// The audit key for a worker registry: the granted tools PLUS the always-on
+    /// `escalate` valve, deduped + sorted.
+    fn sorted_with_escalate(grant: &WorkerGrant) -> Vec<String> {
+        let mut names = grant.sorted_tools();
+        names.push("escalate".to_string());
+        names.sort();
+        names.dedup();
+        names
+    }
 
     /// Tools that must NEVER appear in a closed worker registry. This is a
     /// supplementary explicit denylist; the exhaustive `tool_names() ==
@@ -279,23 +308,34 @@ mod tests {
             Arc::new(NoSandbox),
             30,
             &grant,
+            slot(),
         )
         .expect("minimal grant builds");
 
-        // EXHAUSTIVE: the registry contains EXACTLY the granted tools.
+        // EXHAUSTIVE: the registry contains EXACTLY the granted tools PLUS the
+        // always-on `escalate` valve (PR B) — nothing more.
         let mut names = reg.tool_names();
         names.sort();
         assert_eq!(
             names,
-            grant.sorted_tools(),
-            "a minimal-grant worker holds exactly the base replay-safe tools",
+            sorted_with_escalate(&grant),
+            "a minimal-grant worker holds exactly the base replay-safe tools + escalate",
         );
-        // And that set is the old closed seven.
+        // And the GRANTED subset is the old closed seven (escalate is separate).
         assert_eq!(grant.sorted_tools(), {
             let mut v: Vec<String> = ALLOWED.iter().map(|s| s.to_string()).collect();
             v.sort();
             v
         });
+        // The escalate valve is present, LLM-visible, and never parks.
+        assert!(
+            reg.get("escalate").is_some(),
+            "escalate is always available"
+        );
+        assert!(
+            !reg.blocks_on_human_input("escalate"),
+            "escalate must NOT block on human input — it records and returns",
+        );
 
         let spec_names: HashSet<String> = reg.specs().into_iter().map(|s| s.name).collect();
 
@@ -336,6 +376,41 @@ mod tests {
     }
 
     #[test]
+    fn escalate_tool_is_always_available_even_at_minimal_grant() {
+        // PR B — the safety valve is NOT grant-gated: even the least-privilege
+        // worker holds `escalate`, and the audit key is `sorted_tools() +
+        // escalate`. A grant that names NO extra tools still gets the valve.
+        for grant in [
+            WorkerGrant::minimal(),
+            WorkerGrant {
+                tools: vec!["read_file".into()],
+                ..WorkerGrant::minimal()
+            },
+        ] {
+            let reg = build_fleet_worker_registry(
+                Path::new("/tmp/fleet-escalate-valve"),
+                Arc::new(NoSandbox),
+                30,
+                &grant,
+                slot(),
+            )
+            .expect("grant builds");
+            assert!(
+                reg.get("escalate").is_some(),
+                "escalate must exist for grant {:?}",
+                grant.tools,
+            );
+            let mut names = reg.tool_names();
+            names.sort();
+            assert_eq!(
+                names,
+                sorted_with_escalate(&grant),
+                "audit = granted tools + escalate",
+            );
+        }
+    }
+
+    #[test]
     fn grant_expands_tools_and_scopes() {
         // A master grants +web_fetch (under a Hosts network) and Host fs → the
         // registry gains web_fetch and the native file tools' EffectivePermissions
@@ -353,13 +428,17 @@ mod tests {
             },
             fs: FsGrant::Host,
         };
-        let reg = build_fleet_worker_registry(cwd, Arc::new(NoSandbox), 30, &grant)
+        let reg = build_fleet_worker_registry(cwd, Arc::new(NoSandbox), 30, &grant, slot())
             .expect("expanded grant builds");
 
         assert!(reg.get("web_fetch").is_some(), "granted web_fetch present");
         let mut names = reg.tool_names();
         names.sort();
-        assert_eq!(names, grant.sorted_tools(), "exactly the granted set");
+        assert_eq!(
+            names,
+            sorted_with_escalate(&grant),
+            "exactly the granted set + escalate",
+        );
 
         // The Host fs grant widens native tools to Host scope.
         assert_eq!(
@@ -390,6 +469,7 @@ mod tests {
             Arc::new(NoSandbox),
             30,
             &grant,
+            slot(),
         )
         .expect("hosts grant builds");
         assert!(reg.get("web_fetch").is_some());
@@ -418,6 +498,7 @@ mod tests {
             Arc::new(NoSandbox),
             30,
             &grant,
+            slot(),
         )
         .expect("full grant builds");
         assert!(reg.get("web_fetch").is_some());
@@ -444,6 +525,7 @@ mod tests {
             Arc::new(NoSandbox),
             30,
             &grant,
+            slot(),
         );
         let err = result
             .err()
@@ -466,6 +548,7 @@ mod tests {
             Arc::new(NoSandbox),
             30,
             &WorkerGrant::minimal(),
+            slot(),
         )
         .expect("minimal grant builds");
         let shell = reg.get("shell").expect("shell tool present");

@@ -273,6 +273,127 @@ impl LlmProvider for WriteFileProvider {
     }
 }
 
+/// Calls the always-on `escalate` tool on the first turn (requesting a wider
+/// grant), then ends. Proves an escalation mid-turn yields the attempt
+/// NON-terminally. `then_sleep` optionally holds AFTER escalating so a test can
+/// drive the turn to the DEADLINE and prove the escalation still wins
+/// (determinism), rather than ending cleanly with EndTurn.
+pub struct EscalateProvider {
+    pub reason: String,
+    pub then_sleep: Option<Duration>,
+    calls: AtomicUsize,
+}
+
+impl EscalateProvider {
+    pub fn new(reason: &str) -> Self {
+        Self {
+            reason: reason.to_string(),
+            then_sleep: None,
+            calls: AtomicUsize::new(0),
+        }
+    }
+
+    /// After escalating, sleep `hold` so the attempt hits the deadline while the
+    /// slot is already set — the escalation must still win.
+    pub fn then_sleeping(reason: &str, hold: Duration) -> Self {
+        Self {
+            reason: reason.to_string(),
+            then_sleep: Some(hold),
+            calls: AtomicUsize::new(0),
+        }
+    }
+}
+
+#[async_trait]
+impl LlmProvider for EscalateProvider {
+    async fn chat(&self, _m: &[Message], _t: &[ToolSpec], _c: &ChatConfig) -> Result<ChatResponse> {
+        if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+            return Ok(ChatResponse {
+                content: None,
+                reasoning_content: None,
+                tool_calls: vec![octos_core::ToolCall {
+                    id: "call_escalate".to_string(),
+                    name: "escalate".to_string(),
+                    arguments: serde_json::json!({
+                        "reason": self.reason,
+                        "requested_grant": {
+                            "network": { "mode": "hosts", "hosts": ["example.com"] },
+                            "tools": ["read_file", "write_file", "shell", "web_fetch"],
+                        },
+                    }),
+                    metadata: None,
+                }],
+                stop_reason: StopReason::ToolUse,
+                usage: usage(),
+                provider_index: None,
+            });
+        }
+        if let Some(hold) = self.then_sleep {
+            tokio::time::sleep(hold).await;
+        }
+        Ok(end_turn("escalated; awaiting the operator"))
+    }
+    fn model_id(&self) -> &str {
+        "mock"
+    }
+    fn provider_name(&self) -> &str {
+        "mock"
+    }
+}
+
+/// Writes `path` via `write_file`, then ends — but only when a specific grant
+/// tool is available. Used to prove a fresh attempt after a grant widen rebuilds
+/// with the NEW capabilities: it records which tool NAMES it was offered.
+pub struct RecordingWriteProvider {
+    pub path: String,
+    pub seen_tools: Arc<std::sync::Mutex<Vec<String>>>,
+    calls: AtomicUsize,
+}
+
+impl RecordingWriteProvider {
+    pub fn new(path: &str, seen_tools: Arc<std::sync::Mutex<Vec<String>>>) -> Self {
+        Self {
+            path: path.to_string(),
+            seen_tools,
+            calls: AtomicUsize::new(0),
+        }
+    }
+}
+
+#[async_trait]
+impl LlmProvider for RecordingWriteProvider {
+    async fn chat(&self, _m: &[Message], t: &[ToolSpec], _c: &ChatConfig) -> Result<ChatResponse> {
+        if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+            // Record the tool names the fresh attempt was offered — the audit
+            // point for "rebuilt from the widened grant".
+            *self.seen_tools.lock().unwrap() = t.iter().map(|s| s.name.clone()).collect();
+            return Ok(ChatResponse {
+                content: None,
+                reasoning_content: None,
+                tool_calls: vec![octos_core::ToolCall {
+                    id: "call_write".to_string(),
+                    name: "write_file".to_string(),
+                    arguments: serde_json::json!({
+                        "path": self.path,
+                        "content": "post-grant artifact\n",
+                    }),
+                    metadata: None,
+                }],
+                stop_reason: StopReason::ToolUse,
+                usage: usage(),
+                provider_index: None,
+            });
+        }
+        Ok(end_turn("wrote the artifact after the grant widen"))
+    }
+    fn model_id(&self) -> &str {
+        "mock"
+    }
+    fn provider_name(&self) -> &str {
+        "mock"
+    }
+}
+
 /// Sleeps past the attempt deadline on the first `chat`, so the `timeout`
 /// wrapper in `run_attempt` fires.
 pub struct SleepProvider {
