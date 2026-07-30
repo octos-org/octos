@@ -30,6 +30,7 @@ use std::sync::Arc;
 use eyre::Result;
 use octos_core::SessionKey;
 
+use crate::grant::WorkerGrant;
 use crate::records::{
     AcceptanceCriterion, AcceptanceVerdict, ChildResultSnapshot, ChildStatus, DecisionKind,
     DurablePlan, EvidenceRef, FleetBudget, FleetChildRecord, FleetStatus, PlanTask, SCHEMA_VERSION,
@@ -52,6 +53,10 @@ pub struct TaskSpec {
     /// task_ids that must be `Succeeded` before this task is launchable.
     pub deps: Vec<String>,
     pub acceptance: Vec<AcceptanceCriterion>,
+    /// PR A — the operator grant the master provisions this task's worker with
+    /// (network / tools / filesystem). Defaults to [`WorkerGrant::minimal`]
+    /// (today's closed worker) when the master specifies nothing.
+    pub grant: WorkerGrant,
 }
 
 impl From<TaskSpec> for PlanTask {
@@ -62,6 +67,7 @@ impl From<TaskSpec> for PlanTask {
             detail: s.detail,
             deps: s.deps,
             acceptance: s.acceptance,
+            grant: s.grant,
         }
     }
 }
@@ -123,6 +129,11 @@ pub struct TaskView {
     pub detail: String,
     pub deps: Vec<String>,
     pub acceptance: Vec<AcceptanceCriterion>,
+    /// PR A — the operator grant the worker for this task is built from,
+    /// projected from the plan's [`PlanTask::grant`]. The executor
+    /// (`octos-fleet-worker`) reads it to build the worker's registry, sandbox
+    /// network, and filesystem scope. Defaults to [`WorkerGrant::minimal`].
+    pub grant: WorkerGrant,
     // ---- state (from the child) ----
     pub status: ChildStatus,
     pub verdict: Option<AcceptanceVerdict>,
@@ -275,6 +286,7 @@ impl Fleet {
                     detail: t.detail.clone(),
                     deps: t.deps.clone(),
                     acceptance: t.acceptance.clone(),
+                    grant: t.grant.clone(),
                     status: child.map(|c| c.status).unwrap_or(ChildStatus::Planned),
                     evidence: verdict_evidence(verdict.as_ref()),
                     verdict,
@@ -927,6 +939,7 @@ mod tests {
             detail: "do the thing".into(),
             deps: deps.iter().map(|s| s.to_string()).collect(),
             acceptance: Vec::new(),
+            grant: WorkerGrant::minimal(),
         }
     }
 
@@ -1594,12 +1607,18 @@ mod tests {
                 path: "out.txt".into(),
             },
         }];
+        let granted = WorkerGrant {
+            network: crate::grant::NetworkGrant::Hosts(vec!["example.com".into()]),
+            tools: vec!["read_file".into(), "write_file".into(), "web_fetch".into()],
+            fs: crate::grant::FsGrant::default(),
+        };
         let task = TaskSpec {
             task_id: "a".into(),
             title: "Build".into(),
             detail: "make out.txt".into(),
             deps: vec![],
             acceptance: acceptance.clone(),
+            grant: granted.clone(),
         };
         let fleet = Fleet::create(
             store.clone(),
@@ -1622,6 +1641,10 @@ mod tests {
         assert_eq!(tv.title, "Build");
         assert_eq!(tv.detail, "make out.txt");
         assert_eq!(tv.acceptance.len(), 1);
+        assert_eq!(
+            tv.grant, granted,
+            "the operator grant is projected from the plan into the view (PR A)"
+        );
         assert_eq!(tv.status, ChildStatus::Ready);
         assert!(tv.verdict.is_none());
         assert!(tv.evidence.is_empty());

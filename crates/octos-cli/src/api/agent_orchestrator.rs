@@ -8275,7 +8275,9 @@ mod tests {
                 .expect("open episode store"),
         );
         let sandbox_factory: octos_fleet_worker::SandboxFactory =
-            Arc::new(|_cwd| Arc::new(MarkerSandbox) as Arc<dyn octos_agent::sandbox::Sandbox>);
+            Arc::new(|_cwd, _allow_network| {
+                Arc::new(MarkerSandbox) as Arc<dyn octos_agent::sandbox::Sandbox>
+            });
         let factory = Arc::new(octos_fleet_worker::AgentFactory::new(
             Arc::new(NativeMockProvider {
                 content: Ok("done".to_owned()),
@@ -8325,6 +8327,7 @@ mod tests {
             detail: "do the thing".to_owned(),
             deps: Vec::new(),
             acceptance: Vec::new(),
+            grant: octos_fleet::WorkerGrant::minimal(),
         }]
     }
 

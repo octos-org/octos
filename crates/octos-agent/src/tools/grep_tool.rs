@@ -11,11 +11,16 @@ use regex::RegexBuilder;
 use serde::Deserialize;
 
 use super::{Tool, ToolContext, ToolResult};
+use crate::policy::FilesystemScope;
 
 /// Tool for searching file contents with regex.
 pub struct GrepTool {
     /// Base directory for searches.
     base_dir: PathBuf,
+    /// Effective filesystem reach for the legacy (no-`SessionScope`) path. When
+    /// `Host`, an explicit `path` arg may point OUTSIDE `base_dir` (mirrors
+    /// read_file/glob/list_dir); `Workspace` (default) confines to `base_dir`.
+    filesystem_scope: FilesystemScope,
 }
 
 impl GrepTool {
@@ -23,7 +28,16 @@ impl GrepTool {
     pub fn new(base_dir: impl Into<PathBuf>) -> Self {
         Self {
             base_dir: base_dir.into(),
+            filesystem_scope: FilesystemScope::Workspace,
         }
+    }
+
+    /// Set the effective filesystem scope. `Host` lets an explicit `path` arg
+    /// escape `base_dir`, consistent with the other cwd-bound read tools (so a
+    /// worker granted host FS can grep outside its cwd, not just read/glob).
+    pub fn with_filesystem_scope(mut self, filesystem_scope: FilesystemScope) -> Self {
+        self.filesystem_scope = filesystem_scope;
+        self
     }
 }
 
@@ -154,16 +168,21 @@ impl Tool for GrepTool {
                 None => scope.workspace().to_path_buf(),
             },
             None => match input.path.as_deref() {
-                Some(p) => match super::resolve_path(&self.base_dir, p) {
-                    Ok(root) => root,
-                    Err(_) => {
-                        return Ok(ToolResult {
-                            output: format!("Path outside working directory: {p}"),
-                            success: false,
-                            ..Default::default()
-                        });
+                // Honor the filesystem scope: `Host` lets an explicit path leave
+                // base_dir (consistent with read_file/glob/list_dir under a host
+                // FS grant); `Workspace` confines to base_dir.
+                Some(p) => {
+                    match super::resolve_path_with_scope(&self.base_dir, p, self.filesystem_scope) {
+                        Ok(root) => root,
+                        Err(_) => {
+                            return Ok(ToolResult {
+                                output: format!("Path outside working directory: {p}"),
+                                success: false,
+                                ..Default::default()
+                            });
+                        }
                     }
-                },
+                }
                 None => self.base_dir.clone(),
             },
         };
@@ -504,6 +523,47 @@ mod tests {
         assert!(result.success);
         assert!(result.output.contains("5 match"));
         assert!(result.output.contains("limited to 5"));
+    }
+
+    #[tokio::test]
+    async fn grep_host_scope_reads_outside_base_dir() {
+        // PR A fix #3: with FilesystemScope::Host (a host FS grant) an explicit
+        // `path` outside base_dir is searched — consistent with read/glob/list.
+        // The default (Workspace) still refuses it.
+        let base = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("data.txt"), "NEEDLE lives here\n").unwrap();
+
+        // Workspace scope (default): the out-of-cwd path is refused.
+        let confined = GrepTool::new(base.path());
+        let refused = confined
+            .execute(&serde_json::json!({
+                "pattern": "NEEDLE",
+                "path": outside.path().to_string_lossy(),
+            }))
+            .await
+            .unwrap();
+        assert!(
+            !refused.success,
+            "workspace scope must refuse an outside path"
+        );
+        assert!(refused.output.contains("outside working directory"));
+
+        // Host scope: the same path is searched and the match is found.
+        let host = GrepTool::new(base.path()).with_filesystem_scope(FilesystemScope::Host);
+        let found = host
+            .execute(&serde_json::json!({
+                "pattern": "NEEDLE",
+                "path": outside.path().to_string_lossy(),
+            }))
+            .await
+            .unwrap();
+        assert!(
+            found.success,
+            "host scope must search the path, got: {}",
+            found.output
+        );
+        assert!(found.output.contains("NEEDLE"), "got: {}", found.output);
     }
 
     #[tokio::test]

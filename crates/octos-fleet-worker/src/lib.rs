@@ -53,9 +53,11 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
+use eyre::Result;
 use octos_agent::sandbox::Sandbox;
 use octos_agent::{Agent, AgentConfig, ToolRegistry};
 use octos_core::AgentId;
+use octos_fleet::WorkerGrant;
 use octos_llm::LlmProvider;
 use octos_memory::EpisodeStore;
 
@@ -63,9 +65,16 @@ pub use closed_registry::{ALLOWED, build_fleet_worker_registry};
 pub use pool::{Dispatched, FleetWorkerPool, PoolConfig};
 pub use worker::{AttemptOutcome, run_attempt};
 
-/// A per-cwd sandbox factory: given a working directory, produce the
-/// [`Sandbox`] that backs the shell tool for an attempt rooted there.
-pub type SandboxFactory = Arc<dyn Fn(&Path) -> Arc<dyn Sandbox> + Send + Sync>;
+/// A per-cwd sandbox factory: given a working directory AND whether the grant
+/// permits raw network egress (`allow_network`), produce the [`Sandbox`] that
+/// backs the shell tool for an attempt rooted there.
+///
+/// PR A threads `allow_network` from the task's [`WorkerGrant`]: `None`/`Hosts`
+/// grants pass `false` (the shell has no raw egress — `Hosts` is enforced by
+/// the web tools), a `Full` grant passes `true` (raw egress for git/npm/etc.).
+/// The factory owns the isolating BACKEND (bwrap/macos/docker); only the
+/// network flag is per-attempt.
+pub type SandboxFactory = Arc<dyn Fn(&Path, bool) -> Arc<dyn Sandbox> + Send + Sync>;
 
 /// Default agent-loop iteration ceiling for a fleet task-worker.
 pub const DEFAULT_MAX_ITERATIONS: u32 = 50;
@@ -123,7 +132,7 @@ impl AgentFactory {
         Self::new(
             llm,
             memory,
-            Arc::new(|_| Arc::new(NoSandbox) as Arc<dyn Sandbox>),
+            Arc::new(|_, _| Arc::new(NoSandbox) as Arc<dyn Sandbox>),
         )
     }
 
@@ -145,22 +154,26 @@ impl AgentFactory {
     /// [`AgentFactory::build_agent`] / [`AgentFactory::build_registry_with`]),
     /// so a non-idempotent factory can never sandbox the agent while handing
     /// the validators a different (weaker) sandbox.
-    pub fn sandbox_for(&self, cwd: &Path) -> Arc<dyn Sandbox> {
-        (self.sandbox_factory)(cwd)
+    pub fn sandbox_for(&self, cwd: &Path, allow_network: bool) -> Arc<dyn Sandbox> {
+        (self.sandbox_factory)(cwd, allow_network)
     }
 
-    /// Build the closed replay-safe tool registry for `cwd` with an EXPLICIT,
-    /// caller-owned `sandbox` instance and a per-command shell timeout ceiling
-    /// of `max_shell_timeout_secs`. Threading the instance (rather than
-    /// re-invoking the factory) is what lets the agent and the acceptance-gate
-    /// [`octos_agent::ValidatorRunner`] share one sandbox.
+    /// Build the granted replay-safe tool registry for `cwd` FROM `grant`, with
+    /// an EXPLICIT, caller-owned `sandbox` instance and a per-command shell
+    /// timeout ceiling of `max_shell_timeout_secs`. Threading the instance
+    /// (rather than re-invoking the factory) is what lets the agent and the
+    /// acceptance-gate [`octos_agent::ValidatorRunner`] share one sandbox.
+    ///
+    /// Returns `Err` for an incoherent grant (unknown tool / web tool without a
+    /// network grant) — validated at parse too, so this is defense-in-depth.
     pub fn build_registry_with(
         &self,
         cwd: &Path,
         sandbox: Arc<dyn Sandbox>,
         max_shell_timeout_secs: u64,
-    ) -> ToolRegistry {
-        build_fleet_worker_registry(cwd, sandbox, max_shell_timeout_secs)
+        grant: &WorkerGrant,
+    ) -> Result<ToolRegistry> {
+        build_fleet_worker_registry(cwd, sandbox, max_shell_timeout_secs, grant)
     }
 
     /// The [`AgentConfig`] for an attempt bounded by `deadline`. The per-tool
@@ -183,18 +196,26 @@ impl AgentFactory {
         }
     }
 
-    /// Build a fresh, closed-registry [`Agent`] rooted at `cwd` under the
-    /// shared `sandbox`, bounded by `deadline` (which clamps the agent's
-    /// per-tool timeouts AND caps every shell command at the deadline).
-    pub fn build_agent(&self, cwd: &Path, sandbox: Arc<dyn Sandbox>, deadline: Duration) -> Agent {
+    /// Build a fresh, granted-registry [`Agent`] rooted at `cwd` under the
+    /// shared `sandbox`, from `grant`, bounded by `deadline` (which clamps the
+    /// agent's per-tool timeouts AND caps every shell command at the deadline).
+    ///
+    /// Returns `Err` for an incoherent grant (see [`AgentFactory::build_registry_with`]).
+    pub fn build_agent(
+        &self,
+        cwd: &Path,
+        sandbox: Arc<dyn Sandbox>,
+        deadline: Duration,
+        grant: &WorkerGrant,
+    ) -> Result<Agent> {
         let deadline_secs = deadline.as_secs().max(1);
-        Agent::new(
+        Ok(Agent::new(
             AgentId::new("fleet-worker"),
             self.llm.clone(),
-            self.build_registry_with(cwd, sandbox, deadline_secs),
+            self.build_registry_with(cwd, sandbox, deadline_secs, grant)?,
             self.memory.clone(),
         )
-        .with_config(self.agent_config(deadline))
+        .with_config(self.agent_config(deadline)))
     }
 }
 
@@ -227,13 +248,13 @@ mod tests {
         let factory = AgentFactory::new(
             Arc::new(SuccessProvider),
             memory,
-            Arc::new(move |_| {
+            Arc::new(move |_, _| {
                 seen.fetch_add(1, Ordering::SeqCst);
                 Arc::new(MarkerSandbox) as Arc<dyn Sandbox>
             }),
         );
 
-        let sb = factory.sandbox_for(Path::new("/tmp/fleet-x"));
+        let sb = factory.sandbox_for(Path::new("/tmp/fleet-x"), false);
         assert!(
             !sb.is_noop(),
             "the injected sandbox must reach the shell, not a NoSandbox default",
@@ -246,7 +267,14 @@ mod tests {
 
         // build_registry_with threads the caller-owned instance WITHOUT
         // re-invoking the factory — the shared-instance contract (P1-3-fix).
-        let _reg = factory.build_registry_with(Path::new("/tmp/fleet-x"), sb.clone(), 30);
+        let _reg = factory
+            .build_registry_with(
+                Path::new("/tmp/fleet-x"),
+                sb.clone(),
+                30,
+                &WorkerGrant::minimal(),
+            )
+            .unwrap();
         assert_eq!(
             calls.load(Ordering::SeqCst),
             1,
@@ -257,7 +285,7 @@ mod tests {
         let test_factory = AgentFactory::for_testing(Arc::new(SuccessProvider), memory2);
         assert!(
             test_factory
-                .sandbox_for(Path::new("/tmp/fleet-x"))
+                .sandbox_for(Path::new("/tmp/fleet-x"), false)
                 .is_noop(),
             "for_testing must be the NoSandbox path",
         );

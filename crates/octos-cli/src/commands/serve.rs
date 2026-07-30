@@ -877,20 +877,24 @@ impl ServeCommand {
                 });
             match keeper {
                 Some(rt) => {
-                    // PR-3 requires a network-isolated sandbox: the closed worker
-                    // tool set is a denylist, not a boundary, so the shell's
-                    // reach is bounded only by the sandbox. Force
-                    // `allow_network = false` regardless of the profile default.
+                    // PR-3 requires a network-isolated sandbox: the worker tool
+                    // set is a denylist, not a boundary, so the shell's reach is
+                    // bounded only by the sandbox. Base the sandbox on the profile
+                    // default with network OFF; PR A re-enables raw egress
+                    // PER-ATTEMPT only for a `Full` network grant (see the factory
+                    // closure below). `None`/`Hosts` keep it off (`Hosts` is
+                    // enforced by the granted web tools, not raw egress).
                     let mut sandbox_cfg = rt.default_sandbox.clone();
                     sandbox_cfg.allow_network = false;
                     // #1857 PR 5a fix (HIGH 1) — FAIL CLOSED: install the pool
-                    // ONLY when the forced-no-network sandbox is a REAL isolating
-                    // backend. A disabled sandbox (or `Auto` with no backend on
-                    // this host) yields `NoSandbox` = unbounded shell reach
-                    // (curl / git push / host access), breaking PR-3's
-                    // replay-safe boundary. Leave the pool unset so goal_dispatch
-                    // cleanly reports "unavailable" instead of running a fleet
-                    // worker unsandboxed with network.
+                    // ONLY when the sandbox is a REAL isolating backend. A
+                    // disabled sandbox (or `Auto` with no backend on this host)
+                    // yields `NoSandbox` = unbounded shell reach (curl / git push
+                    // / host access), breaking PR-3's replay-safe boundary. The
+                    // isolation of the BACKEND is independent of the network flag,
+                    // so probing with network off is sufficient. Leave the pool
+                    // unset so goal_dispatch cleanly reports "unavailable" instead
+                    // of running a fleet worker unsandboxed.
                     if !fleet_sandbox_is_isolating(&sandbox_cfg) {
                         tracing::error!(
                             keeper_profile = %rt.profile_id,
@@ -900,10 +904,15 @@ impl ServeCommand {
                              will report the pool unavailable."
                         );
                     } else {
+                        // PR A — the SandboxFactory takes the per-attempt
+                        // `allow_network` derived from the task's grant: `Full` →
+                        // true (raw egress for git/npm), `None`/`Hosts` → false.
                         let sandbox_factory: octos_fleet_worker::SandboxFactory =
-                            Arc::new(move |_cwd: &std::path::Path| {
+                            Arc::new(move |_cwd: &std::path::Path, allow_network: bool| {
+                                let mut cfg = sandbox_cfg.clone();
+                                cfg.allow_network = allow_network;
                                 Arc::<dyn octos_agent::sandbox::Sandbox>::from(
-                                    octos_agent::sandbox::create_sandbox(&sandbox_cfg),
+                                    octos_agent::sandbox::create_sandbox(&cfg),
                                 )
                             });
                         let factory = Arc::new(octos_fleet_worker::AgentFactory::new(
@@ -1786,6 +1795,7 @@ mod tests {
                 detail: "d".to_owned(),
                 deps: Vec::new(),
                 acceptance: Vec::new(),
+                grant: octos_fleet::WorkerGrant::minimal(),
             }],
             1,
         )

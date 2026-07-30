@@ -12,6 +12,7 @@ use octos_agent::sandbox::{NoSandbox, Sandbox};
 use octos_core::{Message, SessionKey};
 use octos_fleet::{
     AcceptanceCriterion, Fleet, FleetBudget, FleetKernelStore, LaunchOutcome, TaskSpec, Verifier,
+    WorkerGrant,
 };
 use octos_llm::{ChatConfig, ChatResponse, LlmProvider, StopReason, ToolSpec};
 use octos_memory::EpisodeStore;
@@ -52,14 +53,26 @@ pub async fn fresh_memory() -> (TempDir, Arc<EpisodeStore>) {
     (dir, Arc::new(memory))
 }
 
-/// A `TaskSpec` with the given deps + acceptance.
+/// A `TaskSpec` with the given deps + acceptance and the minimal (least-privilege)
+/// worker grant — today's closed worker.
 pub fn task_spec(id: &str, deps: &[&str], acceptance: Vec<AcceptanceCriterion>) -> TaskSpec {
+    task_spec_granted(id, deps, acceptance, WorkerGrant::minimal())
+}
+
+/// A `TaskSpec` carrying an explicit [`WorkerGrant`] (for grant-driven tests).
+pub fn task_spec_granted(
+    id: &str,
+    deps: &[&str],
+    acceptance: Vec<AcceptanceCriterion>,
+    grant: WorkerGrant,
+) -> TaskSpec {
     TaskSpec {
         task_id: id.to_string(),
         title: format!("Task {id}"),
         detail: "do the thing".to_string(),
         deps: deps.iter().map(|s| s.to_string()).collect(),
         acceptance,
+        grant,
     }
 }
 
@@ -173,7 +186,7 @@ pub async fn factory_for(provider: Arc<dyn LlmProvider>) -> (TempDir, AgentFacto
     let factory = AgentFactory::new(
         provider,
         memory,
-        Arc::new(|_| Arc::new(MarkerSandbox) as Arc<dyn Sandbox>),
+        Arc::new(|_, _| Arc::new(MarkerSandbox) as Arc<dyn Sandbox>),
     );
     (dir, factory)
 }

@@ -16,15 +16,35 @@ const MAX_REDIRECTS: usize = 10;
 
 pub struct WebFetchTool {
     config: Option<Arc<super::tool_config::ToolConfigStore>>,
+    /// PR A — a per-host network allowlist (fleet worker grant). The
+    /// None/Some distinction is SECURITY-LOAD-BEARING: `None` = unrestricted
+    /// (the default for every non-fleet caller); `Some(list)` = RESTRICTED to
+    /// `list` (and their subdomains), enforced on the initial URL AND every
+    /// redirect hop, on top of the private-IP block. `Some([])` denies
+    /// everything (fail closed) — it is never read as "unrestricted".
+    host_allowlist: Option<Vec<String>>,
 }
 
 impl WebFetchTool {
     pub fn new() -> Self {
-        Self { config: None }
+        Self {
+            config: None,
+            host_allowlist: None,
+        }
     }
 
     pub fn with_config(mut self, config: Arc<super::tool_config::ToolConfigStore>) -> Self {
         self.config = Some(config);
+        self
+    }
+
+    /// PR A — restrict this tool to a fleet-worker grant's host allowlist. A
+    /// fetch (or redirect hop) to any host not in `hosts` (nor a subdomain of
+    /// one) is refused before a socket is opened. Passing an empty `hosts`
+    /// denies EVERYTHING (fail closed), never "unrestricted" — to leave the
+    /// tool unrestricted, simply do not call this.
+    pub fn with_host_allowlist(mut self, hosts: Vec<String>) -> Self {
+        self.host_allowlist = Some(hosts);
         self
     }
 }
@@ -106,8 +126,9 @@ impl Tool for WebFetchTool {
         }
 
         // SSRF-safe fetch: validate initial URL, disable auto-redirects,
-        // and re-validate each redirect hop against SSRF rules.
-        let response = match ssrf_safe_fetch(&input.url).await {
+        // and re-validate each redirect hop against SSRF rules PLUS the fleet
+        // grant's host allowlist (PR A).
+        let response = match ssrf_safe_fetch(&input.url, self.host_allowlist.as_deref()).await {
             Ok(r) => r,
             Err(msg) => {
                 return Ok(ToolResult {
@@ -194,18 +215,27 @@ impl Tool for WebFetchTool {
 /// Validate a URL against SSRF rules, build a pinned client, and fetch.
 /// Redirects are followed manually with SSRF validation on each hop.
 /// DNS failures are treated as blocked (fail-closed).
-async fn ssrf_safe_fetch(initial_url: &str) -> Result<reqwest::Response, String> {
+async fn ssrf_safe_fetch(
+    initial_url: &str,
+    host_allowlist: Option<&[String]>,
+) -> Result<reqwest::Response, String> {
     let mut current_url = initial_url.to_string();
 
     for _ in 0..MAX_REDIRECTS {
-        // Validate the URL and resolve DNS (fail-closed on DNS error).
-        let check = super::ssrf::check_ssrf_with_addrs(&current_url).await?;
-
         let parsed = reqwest::Url::parse(&current_url).map_err(|_| "Invalid URL".to_string())?;
         let host = parsed
             .host_str()
             .ok_or_else(|| "URL has no host".to_string())?
             .to_string();
+
+        // PR A — enforce the fleet grant's host allowlist BEFORE any DNS or
+        // socket, so a refused host never touches the network (and the
+        // deterministic "not in the granted network allowlist" error is
+        // returned, not a DNS/connection error). Empty allowlist = unrestricted.
+        super::ssrf::check_host_allowlist(&host, host_allowlist)?;
+
+        // Validate the URL and resolve DNS (fail-closed on DNS error).
+        let check = super::ssrf::check_ssrf_with_addrs(&current_url).await?;
 
         // Build a per-request client with redirects disabled and DNS pinned.
         let mut builder = Client::builder()
@@ -344,7 +374,7 @@ mod tests {
     async fn test_ssrf_redirect_to_private_ip_blocked() {
         // A redirect to a private IP must be blocked.
         // We test the ssrf_safe_fetch function directly with localhost.
-        let result = ssrf_safe_fetch("http://127.0.0.1/secret").await;
+        let result = ssrf_safe_fetch("http://127.0.0.1/secret", None).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("private"));
     }
@@ -352,8 +382,11 @@ mod tests {
     #[tokio::test]
     async fn test_ssrf_dns_failure_blocks_request() {
         // DNS failure must fail closed, not fall through to an unpinned client.
-        let result =
-            ssrf_safe_fetch("https://this-domain-does-not-exist-ssrf-test.invalid/foo").await;
+        let result = ssrf_safe_fetch(
+            "https://this-domain-does-not-exist-ssrf-test.invalid/foo",
+            None,
+        )
+        .await;
         assert!(result.is_err(), "DNS failure should block request");
         let err = result.unwrap_err();
         assert!(
@@ -364,8 +397,77 @@ mod tests {
 
     #[tokio::test]
     async fn test_ssrf_metadata_endpoint_blocked() {
-        let result = ssrf_safe_fetch("http://169.254.169.254/latest/meta-data/").await;
+        let result = ssrf_safe_fetch("http://169.254.169.254/latest/meta-data/", None).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("private"));
+    }
+
+    #[tokio::test]
+    async fn web_fetch_enforces_host_allowlist() {
+        // PR A — a fleet worker granted `Hosts([allowed.invalid])`:
+        // - a fetch to a NON-allowlisted host is refused by the allowlist
+        //   BEFORE any network (deterministic "allowlist" error, offline), and
+        // - a fetch to an ALLOWLISTED host passes the allowlist gate and only
+        //   then hits the normal SSRF/DNS path (here it fails DNS on `.invalid`,
+        //   proving it got PAST the allowlist rather than being blocked by it).
+        let tool = WebFetchTool::new().with_host_allowlist(vec!["allowed.invalid".to_string()]);
+
+        let blocked = tool
+            .execute(&serde_json::json!({"url": "https://blocked.invalid/x"}))
+            .await
+            .unwrap();
+        assert!(!blocked.success, "non-allowlisted host must be refused");
+        assert!(
+            blocked.output.contains("allowlist"),
+            "refusal must name the allowlist (no network hit): {}",
+            blocked.output,
+        );
+
+        let allowed = tool
+            .execute(&serde_json::json!({"url": "https://allowed.invalid/x"}))
+            .await
+            .unwrap();
+        assert!(!allowed.success, "allowed.invalid still fails DNS");
+        assert!(
+            !allowed.output.contains("allowlist"),
+            "an allowlisted host must pass the allowlist gate (fail later, not on allowlist): {}",
+            allowed.output,
+        );
+    }
+
+    #[tokio::test]
+    async fn web_fetch_no_allowlist_is_unrestricted() {
+        // The default (no grant → no `with_host_allowlist` call → None) imposes
+        // no host restriction — byte-for-byte the pre-PR-A tool. A private host
+        // is still blocked by the SSRF layer, not the allowlist.
+        let tool = WebFetchTool::new();
+        let result = tool
+            .execute(&serde_json::json!({"url": "http://127.0.0.1/secret"}))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(
+            result.output.contains("private"),
+            "no allowlist defers to SSRF private-IP block: {}",
+            result.output,
+        );
+    }
+
+    #[tokio::test]
+    async fn web_fetch_empty_host_allowlist_denies_everything() {
+        // PR A fail-closed: `with_host_allowlist(vec![])` = "restricted to
+        // nothing" must reach NOTHING (never "unrestricted"). Even a public host
+        // is refused by the allowlist BEFORE any network.
+        let tool = WebFetchTool::new().with_host_allowlist(vec![]);
+        let result = tool
+            .execute(&serde_json::json!({"url": "https://example.com/"}))
+            .await
+            .unwrap();
+        assert!(!result.success, "an empty allowlist must deny all");
+        assert!(
+            result.output.contains("allowlist"),
+            "refusal must be the allowlist (no network hit): {}",
+            result.output,
+        );
     }
 }
