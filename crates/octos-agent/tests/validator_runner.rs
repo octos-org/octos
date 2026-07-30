@@ -495,7 +495,18 @@ async fn should_strip_blocked_env_vars_from_command_validator_child() {
                 "-c".into(),
                 format!(
                     "printf '%s' \"${{LD_PRELOAD:-__unset__}}\" > {}",
-                    probe_path.display()
+                    // `sh` treats `\` as an escape, so a Windows path
+                    // (`C:\…\probe.txt`) embedded in this `sh -c` redirect
+                    // target is mangled — the probe file is never written at
+                    // the expected path and the read-back yields "", masking
+                    // the real env-strip assertion. Forward slashes are
+                    // accepted by the Git-Bash `sh` present on windows-latest
+                    // (the sibling timeout test also relies on `sh`) and are a
+                    // no-op on Unix paths. This keeps the same shell/command on
+                    // both platforms so the product's BLOCKED_ENV_VARS stripping
+                    // is still exercised (an unstripped LD_PRELOAD would print
+                    // its value here, not `__unset__`).
+                    probe_path.to_string_lossy().replace('\\', "/")
                 ),
             ],
         },

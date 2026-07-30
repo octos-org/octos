@@ -116,7 +116,11 @@ fn lifecycle_state_transitions_queued_running_verifying_ready() {
 }
 
 fn path_matches_glob(path: &Path, pattern: &str) -> bool {
-    let path_str = path.to_string_lossy();
+    // Normalize `\` -> `/` so the `/`-based policy globs match on Windows,
+    // where `to_string_lossy()` renders backslash separators. The real runtime
+    // globs the filesystem via the `glob` crate (separator-agnostic); this
+    // helper only mirrors that at the string level for the smoke assertion.
+    let path_str = path.to_string_lossy().replace('\\', "/");
     let (prefix, rest) = match pattern.split_once('*') {
         Some(pair) => pair,
         None => return path_str == pattern,

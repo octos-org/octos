@@ -85,15 +85,15 @@ use tracing::{debug, info, warn};
 use super::AppState;
 use super::agent_orchestrator::{
     AgentArtifactReadRequest, AgentListRequest, AgentOrchestrator, AgentOutputRequest,
-    AgentRequest, AgentUpsert, GoalSessionRequest, GoalSetRequest, LoopControlKind,
-    LoopControlRequest, LoopCreateRequest, LoopListRequest, NativeSpecialistAppUiEvent,
-    NativeSpecialistLaunchRequest, default_agent_orchestrator, master_continuation_prompt,
-    master_continuation_reason_name, upsert_background_task_agent, wire_key_from_goal_key,
+    AgentRequest, AgentUpsert, FleetKeeperSeed, GoalSessionRequest, GoalSetRequest,
+    InProcessAgentOrchestrator, LoopControlKind, LoopControlRequest, LoopCreateRequest,
+    LoopListRequest, NativeSpecialistAppUiEvent, NativeSpecialistLaunchRequest,
+    default_agent_orchestrator, master_continuation_prompt, master_continuation_reason_name,
+    upsert_background_task_agent, wire_key_from_goal_key,
 };
 #[cfg(test)]
 use super::agent_orchestrator::{
-    AgentArtifactRecord as AgentRuntimeArtifactRecord, InProcessAgentOrchestrator,
-    clear_default_agent_orchestrator_for_test,
+    AgentArtifactRecord as AgentRuntimeArtifactRecord, clear_default_agent_orchestrator_for_test,
 };
 use super::master_continuation_scheduler::{
     MasterContinuationReason, MasterContinuationRuntimeState,
@@ -174,6 +174,11 @@ const APPROVAL_CANCELLED_REASON_WAITER_DROPPED: &str = "waiter_dropped";
 /// reasons. The wire value stays `"waiter_dropped"` (used by both stores'
 /// drop-guards conceptually, but each store records it under its own const).
 const USER_QUESTION_CANCELLED_REASON_WAITER_DROPPED: &str = "waiter_dropped";
+/// Reason recorded when a pending approval/question is cancelled because its
+/// PEER was retired via `peer_close` while parked on it (#P1-2). The dropped
+/// oneshot sender releases the peer's in-flight turn fail-closed (Deny /
+/// Cancelled) instead of wedging it forever awaiting an answer no one will give.
+const APPROVAL_CANCELLED_REASON_PEER_CLOSED: &str = "peer_closed";
 const APPUI_METHOD_CONFIG_CAPABILITIES_LIST: &str =
     octos_core::ui_protocol::methods::CONFIG_CAPABILITIES_LIST;
 const APPUI_METHOD_CLIENT_HELLO: &str = "client_hello";
@@ -878,6 +883,388 @@ impl SessionWorkspaceStore {
             .unwrap_or_else(|error| error.into_inner())
             .get(session_id)
             .cloned()
+    }
+
+    /// Insert `root` under `session_id` ONLY when no entry exists yet, holding
+    /// the lock across the check + insert. Returns whether this call inserted
+    /// (`true`) or found an established entry it left untouched (`false`). PR 4b
+    /// Fix 2: the fleet-keeper re-seed's never-overwrite guard was a separate
+    /// `get()` then `set()` (two lock acquisitions) that a concurrent
+    /// `session/open` `set` (the authoritative live-client cwd) could race
+    /// between, letting a headless seed clobber the real workspace. `set_if_absent`
+    /// collapses that to one atomic step so the seed can only ever fill a gap.
+    fn set_if_absent(&self, session_id: SessionKey, root: PathBuf) -> bool {
+        use std::collections::hash_map::Entry;
+        match self
+            .roots
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .entry(session_id)
+        {
+            Entry::Occupied(_) => false,
+            Entry::Vacant(slot) => {
+                slot.insert(root);
+                true
+            }
+        }
+    }
+}
+
+/// PR 4b — re-seed the in-memory maps a HEADLESS fleet-keeper (no live client)
+/// never got from a `session/open` after a serve restart, from ONE bounded,
+/// validated, PAIRED [`FleetKeeperSeed`] per wire (codex round 2). The global
+/// master-continuation drain runs this pre-pass BEFORE its two gates.
+///
+/// For each seed the workspace root AND the cwd scope come from the SAME pending
+/// continuation ([`InProcessAgentOrchestrator::pending_fleet_keeper_seeds`] pairs
+/// and validates them), so:
+/// - `set_if_absent(wire, root)` clears Gate A (workspace-known). The seed key is
+///   the `wire_key_from_goal_key` strip — byte-identical to the gate probe (THE
+///   landmine); a mismatch would strand the keeper silently.
+/// - `set_goal_scope_if_absent(wire, scope)` (only for a scoped key) clears Gate
+///   D (`goal_target_is_dispatchable`, which for a cwd-scoped target requires
+///   `goal_scopes[wire] == scope` — empty after a headless restart, so a scoped
+///   keeper would otherwise be surfaced yet `continue`d SILENTLY).
+///
+/// Pairing them in the accessor is only half the fix: the APPLICATION must be
+/// all-or-nothing too, or a wire whose workspace already exists but whose scope
+/// is absent gets a MIXED pair (codex round 3). Concrete, no race needed: a live
+/// UNscoped session leaves `session_workspaces[wire] = /live` with `goal_scopes`
+/// absent; a scoped seed `(wire, A, /A)` would `set_if_absent` the workspace
+/// (no-op, `/live` present) yet `set_goal_scope_if_absent` scope A — Gate A then
+/// passes on `/live` and Gate D on A, so the keeper runs in `/live`, not `/A`.
+///
+/// So gate the WHOLE seed on the target slots being absent (seed only a FRESH
+/// wire, never a half/mixed pair):
+/// - Scoped (`scope = Some`): seed BOTH only when the workspace AND the goal
+///   scope are both absent. If either is already present (a live session, or a
+///   prior seed), skip both — never inject a scope into a wire whose workspace
+///   belongs to someone else. `wire` is the `wire_key_from_goal_key` strip so the
+///   workspace key is byte-identical to the drain gate probe.
+/// - Plain (`scope = None`): only a workspace to seed (Gate D is always true for
+///   an unscoped target); fill the workspace gap.
+///
+/// Both stores stay atomically never-overwrite via `set_if_absent`, so a live
+/// entry is authoritative and the seed only ever fills a genuine GAP. The
+/// accessor already did the `is_dir` validation, dedupe, and cap.
+///
+/// v1 residual (bounded, documented — deliberately NOT hardened): the two maps
+/// have independent locks, so a concurrent `session/open` that publishes its
+/// scope before its workspace (see `session/open`) could, in a sub-tick
+/// interleave between this gate's check and its set, still leave a one-turn
+/// mismatch on that precise keeper wire. It is bounded to one turn, needs a
+/// concurrent open on the exact wire, and the module is dormant until PR 5 (which
+/// sets the controller key server-side). A fully cross-map-atomic establish is a
+/// follow-up.
+fn reseed_fleet_keeper_candidates(
+    workspaces: &SessionWorkspaceStore,
+    orchestrator: &InProcessAgentOrchestrator,
+    seeds: Vec<FleetKeeperSeed>,
+) {
+    for seed in seeds {
+        match seed.scope {
+            Some(scope) => {
+                // Seed the pair only into a FRESH wire — never a mixed pair.
+                if workspaces.get(&seed.wire).is_none()
+                    && orchestrator.goal_scope(&seed.wire).is_none()
+                {
+                    workspaces.set_if_absent(seed.wire.clone(), PathBuf::from(&seed.root));
+                    orchestrator.set_goal_scope_if_absent(&seed.wire, &scope);
+                }
+            }
+            None => {
+                workspaces.set_if_absent(seed.wire, PathBuf::from(&seed.root));
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod fleet_keeper_reseed_tests {
+    use super::*;
+    use crate::api::agent_orchestrator::{
+        FLEET_KEEPER_EXTERNAL_KIND, FLEET_KEEPER_GROUP, FLEET_KEEPER_META_FLEET_ID,
+        FLEET_KEEPER_META_WORKSPACE_ROOT,
+    };
+    use crate::api::master_continuation_scheduler::MasterContinuationRequest;
+
+    #[test]
+    fn set_if_absent_is_atomic_and_never_overwrites() {
+        // PR 4b Fix 2 — the workspace re-seed's never-overwrite check was a
+        // get()-then-set() across two lock acquisitions, racy against a
+        // concurrent `session/open` `set`. `set_if_absent` collapses check+insert
+        // under a single lock: it inserts (returns true) only on a vacant slot and
+        // leaves an established entry untouched (returns false).
+        let store = SessionWorkspaceStore::default();
+        let key = SessionKey("prof:api:chat#s".to_owned());
+        assert!(
+            store.set_if_absent(key.clone(), PathBuf::from("/first")),
+            "first insert into a vacant slot returns true"
+        );
+        assert!(
+            !store.set_if_absent(key.clone(), PathBuf::from("/second")),
+            "a second insert finds an established entry and returns false"
+        );
+        assert_eq!(
+            store.get(&key),
+            Some(PathBuf::from("/first")),
+            "the established entry is never overwritten"
+        );
+    }
+
+    /// Enqueue a fleet-keeper wake, optionally rooted (real dir), on `controller`.
+    fn enqueue_keeper(
+        orchestrator: &InProcessAgentOrchestrator,
+        controller: &str,
+        fleet_id: &str,
+        root: Option<&str>,
+    ) {
+        let mut req = MasterContinuationRequest::new(
+            FLEET_KEEPER_GROUP,
+            controller,
+            "prof",
+            MasterContinuationReason::External(FLEET_KEEPER_EXTERNAL_KIND.to_owned()),
+            std::time::SystemTime::now(),
+        )
+        .with_metadata(FLEET_KEEPER_META_FLEET_ID, fleet_id);
+        if let Some(root) = root {
+            req = req.with_metadata(FLEET_KEEPER_META_WORKSPACE_ROOT, root);
+        }
+        orchestrator.enqueue_continuation_for_test(req);
+    }
+
+    #[test]
+    fn admission_reseeds_both_workspace_and_goal_scope_for_a_scoped_keeper() {
+        // PR 4b Gate A + Gate D end-to-end. A SCOPED headless keeper must clear
+        // BOTH the workspace-known gate (Gate A) and `goal_target_is_dispatchable`
+        // (Gate D, which for a cwd-scoped storage key demands
+        // `goal_scopes[wire] == scope`). `goal_scopes` is empty after a headless
+        // restart, so without the goal-scope half the keeper is surfaced yet
+        // `continue`d SILENTLY. The paired pre-pass fills BOTH maps of the FRESH
+        // wire from the SAME seed, so both gates pass and the wire's workspace and
+        // scope provably match. (The RED that the scope half is load-bearing is
+        // pinned by `scoped_seed_skipped_when_wire_has_a_live_workspace`.)
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let workspaces = SessionWorkspaceStore::default();
+
+        // The persisted controller workspace MUST be a real directory — the
+        // accessor's is_dir validation refuses a moved/deleted root.
+        let root = tempfile::tempdir().expect("tempdir");
+        let root_str = root.path().to_str().expect("utf8 root").to_owned();
+
+        let scoped_controller = "prof:api:chat#topic\u{0}~cwd-abcd1234";
+        let scoped_key = SessionKey(scoped_controller.to_owned());
+        let wire = SessionKey("prof:api:chat#topic".to_owned());
+        enqueue_keeper(&orchestrator, scoped_controller, "f-a", Some(&root_str));
+
+        // The drain's connection-independent sweep surfaces a pending
+        // continuation only when its wire key has a known workspace.
+        let is_surfaced = |ws: &SessionWorkspaceStore| -> bool {
+            let runnable =
+                |session: &SessionKey| ws.get(&wire_key_from_goal_key(session)).is_some();
+            orchestrator
+                .due_loop_targets_with_filter(None, 8, Some(&runnable))
+                .into_iter()
+                .any(|(key, _)| key == scoped_key)
+        };
+
+        // Cold restart: empty workspaces + empty goal_scopes → neither gate passes.
+        assert!(
+            !is_surfaced(&workspaces),
+            "a workspace-unknown keeper is not surfaced (Gate A)"
+        );
+        assert!(
+            !orchestrator.goal_target_is_dispatchable(&scoped_key),
+            "a scoped keeper is not dispatchable with an empty goal_scopes (Gate D)"
+        );
+
+        let seeds = orchestrator.pending_fleet_keeper_seeds();
+        assert_eq!(seeds.len(), 1, "exactly one paired candidate");
+        assert_eq!(seeds[0].scope.as_deref(), Some("abcd1234"));
+
+        // The paired pre-pass seeds BOTH maps of the fresh wire from one seed.
+        reseed_fleet_keeper_candidates(&workspaces, &orchestrator, seeds);
+        assert_eq!(
+            workspaces.get(&wire),
+            Some(root.path().to_path_buf()),
+            "Gate A: the wire's workspace is the seed root"
+        );
+        assert_eq!(
+            orchestrator.goal_scope(&wire).as_deref(),
+            Some("abcd1234"),
+            "Gate D: the wire's goal scope is the SAME seed's scope (paired)"
+        );
+        assert!(
+            orchestrator.goal_target_is_dispatchable(&scoped_key),
+            "after the paired re-seed Gate D passes — scoped identity end to end"
+        );
+        assert!(
+            is_surfaced(&workspaces),
+            "surfaced after the paired re-seed (Gate A)"
+        );
+    }
+
+    #[test]
+    fn unpaired_scope_and_root_for_one_wire_cannot_bypass_gate_d() {
+        // codex round 2 P1 regression. Two pending keepers on the SAME wire:
+        // scope A is ROOTLESS (not rehydratable) and scope B is ROOTED (`/B`).
+        // Two independently-filtered accessors would seed workspace `wire → /B`
+        // (root filter) but scope `wire → A` (no root filter), admitting the A
+        // continuation and running it in `/B` — the isolation bypass Gate D
+        // exists to prevent. The unified paired accessor DROPS the rootless A
+        // entirely, so only B is seeded and only B is dispatchable.
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let workspaces = SessionWorkspaceStore::default();
+        let root_b = tempfile::tempdir().expect("tempdir");
+        let root_b_str = root_b.path().to_str().expect("utf8 root").to_owned();
+
+        let wire = "prof:api:chat#topic";
+        let scoped_a = SessionKey(format!("{wire}\u{0}~cwd-aaaa"));
+        let scoped_b = SessionKey(format!("{wire}\u{0}~cwd-bbbb"));
+        enqueue_keeper(&orchestrator, scoped_a.0.as_str(), "f-a", None);
+        enqueue_keeper(&orchestrator, scoped_b.0.as_str(), "f-b", Some(&root_b_str));
+
+        reseed_fleet_keeper_candidates(
+            &workspaces,
+            &orchestrator,
+            orchestrator.pending_fleet_keeper_seeds(),
+        );
+
+        // The rooted B is admitted: the wire's workspace is B's root (paired) and
+        // B is dispatchable.
+        assert_eq!(
+            workspaces.get(&SessionKey(wire.to_owned())),
+            Some(PathBuf::from(&root_b_str)),
+            "the wire's workspace is B's root (root and scope paired from one continuation)"
+        );
+        assert!(
+            orchestrator.goal_target_is_dispatchable(&scoped_b),
+            "the rooted B continuation is dispatchable in its own workspace"
+        );
+        // The rootless A can NOT bypass Gate D onto B's workspace: goal_scopes[wire]
+        // is B, so scoped_goal_key(wire) != A.
+        assert!(
+            !orchestrator.goal_target_is_dispatchable(&scoped_a),
+            "the rootless A continuation cannot be admitted to run in B's workspace"
+        );
+    }
+
+    #[test]
+    fn reseed_never_overwrites_a_live_session_workspace_or_scope() {
+        // Both never-overwrite disciplines through the unified paired pre-pass: a
+        // live `session/open` established an authoritative workspace AND cwd scope
+        // for the wire; a headless seed carrying a DIFFERENT root/scope must fill
+        // only a GAP and never clobber the live client (`set_if_absent` /
+        // `set_goal_scope_if_absent` are atomic no-overwrite).
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let workspaces = SessionWorkspaceStore::default();
+        let live = tempfile::tempdir().expect("tempdir");
+        let seed_root = tempfile::tempdir().expect("tempdir");
+        let seed_root_str = seed_root.path().to_str().expect("utf8").to_owned();
+
+        let wire = SessionKey("prof:api:chat#topic".to_owned());
+        // Live client: workspace + goal scope already established for this wire.
+        workspaces.set(wire.clone(), live.path().to_path_buf());
+        orchestrator.set_goal_scope(&wire, Some("live-b".to_owned()));
+
+        reseed_fleet_keeper_candidates(
+            &workspaces,
+            &orchestrator,
+            vec![FleetKeeperSeed {
+                wire: wire.clone(),
+                scope: Some("seed-a".to_owned()),
+                root: seed_root_str,
+            }],
+        );
+
+        assert_eq!(
+            workspaces.get(&wire),
+            Some(live.path().to_path_buf()),
+            "a live workspace is never overwritten by a headless seed"
+        );
+        assert_eq!(
+            orchestrator.scoped_goal_key(&wire),
+            SessionKey("prof:api:chat#topic\u{0}~cwd-live-b".to_owned()),
+            "a live session/open scope is never overwritten by a headless seed"
+        );
+    }
+
+    #[test]
+    fn scoped_seed_skipped_when_wire_has_a_live_workspace() {
+        // codex round 3 (RED against 6ff0aa22e). The application must be
+        // all-or-nothing across the two maps. A live UNscoped session left
+        // `session_workspaces[wire] = /live` with NO goal scope. A scoped seed
+        // `(wire, aaaa, /A)` must NOT insert scope `aaaa` into that wire —
+        // otherwise Gate A passes on `/live` and Gate D passes for `aaaa`, so the
+        // keeper runs in `/live`, not `/A` (cross-folder execution via
+        // pre-existing, non-concurrent state). The whole seed is skipped because
+        // the workspace slot is already occupied.
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let workspaces = SessionWorkspaceStore::default();
+        let live = tempfile::tempdir().expect("tempdir");
+        let seed_root = tempfile::tempdir().expect("tempdir");
+        let seed_root_str = seed_root.path().to_str().expect("utf8").to_owned();
+        let wire = SessionKey("prof:api:chat#topic".to_owned());
+        // A live UNscoped session established a workspace but no goal scope.
+        workspaces.set(wire.clone(), live.path().to_path_buf());
+
+        reseed_fleet_keeper_candidates(
+            &workspaces,
+            &orchestrator,
+            vec![FleetKeeperSeed {
+                wire: wire.clone(),
+                scope: Some("aaaa".to_owned()),
+                root: seed_root_str,
+            }],
+        );
+
+        assert_eq!(
+            orchestrator.goal_scope(&wire),
+            None,
+            "a scoped seed must NOT insert a scope into a wire whose workspace is already live"
+        );
+        assert!(
+            !orchestrator.goal_target_is_dispatchable(&SessionKey(
+                "prof:api:chat#topic\u{0}~cwd-aaaa".to_owned()
+            )),
+            "the scoped keeper cannot be admitted to run in the live session's workspace"
+        );
+        assert_eq!(
+            workspaces.get(&wire),
+            Some(live.path().to_path_buf()),
+            "the live workspace is never overwritten"
+        );
+    }
+
+    #[test]
+    fn plain_seed_fills_only_the_workspace_gap() {
+        // An UNscoped keeper (scope = None) has Gate D always true, so it seeds
+        // only the workspace and never touches goal_scopes.
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let workspaces = SessionWorkspaceStore::default();
+        let root = tempfile::tempdir().expect("tempdir");
+        let wire = SessionKey("prof:api:chat#plain".to_owned());
+
+        reseed_fleet_keeper_candidates(
+            &workspaces,
+            &orchestrator,
+            vec![FleetKeeperSeed {
+                wire: wire.clone(),
+                scope: None,
+                root: root.path().to_str().expect("utf8").to_owned(),
+            }],
+        );
+
+        assert_eq!(
+            workspaces.get(&wire),
+            Some(root.path().to_path_buf()),
+            "a plain seed fills the workspace gap"
+        );
+        assert_eq!(
+            orchestrator.goal_scope(&wire),
+            None,
+            "a plain seed never registers a goal scope"
+        );
     }
 }
 
@@ -5031,6 +5418,32 @@ impl octos_agent::ToolApprovalRequester for UiProtocolApprovalRequester {
             self.turn_id.clone(),
         );
 
+        // #peer-respond — a peer parking on an approval is surfaced as
+        // `awaiting_input` and answered via `peer_respond` PURELY through the
+        // process-global pending store: `request_runtime` above already
+        // registered this `(approval_id, session)` entry, which peer_list /
+        // peer_respond read authoritatively. Nothing is written to the peer's
+        // filesystem here, so a peer can never park invisibly on an fs failure.
+
+        // #peer-awaiting-wake — the peer is now GENUINELY parked (its pending
+        // oneshot is registered by `request_runtime` above). WAKE its originator
+        // (master) with an autonomous continuation so an IDLE master is notified
+        // to answer it via peer_list → peer_respond, instead of only discovering
+        // the block if it happens to be taking turns. This runs ONLY on the real
+        // park path: the scope-policy AUTO-RESOLVE short-circuit returned far
+        // above (before `request_runtime`), so an auto-approved request never
+        // reaches here and never wakes the master. No-op for a non-peer session
+        // or an unresolvable originator. The enqueue is a quick scheduler push —
+        // it does NOT block; we await `response_rx` below exactly as before, and
+        // the woken master resolves that oneshot from a different task.
+        wake_master_on_peer_awaiting_input(
+            self.state.as_ref(),
+            &self.session_id,
+            &approval_id.0.to_string(),
+            PeerPendingKind::Approval,
+            &peer_pending_prompt_summary(&event.title, &event.body),
+        );
+
         // Approvals are durable: if the WS drop strands the request, the
         // ledger still records it and the client can rehydrate.
         if let Err(err) = send_notification_durable(
@@ -5207,6 +5620,10 @@ struct SessionUserQuestionRequester {
     ws: WsConnection,
     ledger: Arc<UiProtocolLedger>,
     contracts: Arc<UiProtocolContractStores>,
+    /// #peer-awaiting-wake — held so a peer parking on a question can resolve
+    /// its `peers/<slug>/originator` (via `state.profiles`) and WAKE the master.
+    /// (The approval requester already holds `state`; this mirrors it.)
+    state: Arc<AppState>,
     session_id: SessionKey,
     turn_id: TurnId,
 }
@@ -5302,6 +5719,31 @@ impl octos_agent::UserQuestionRequester for SessionUserQuestionRequester {
             self.contracts.clone(),
             self.session_id.clone(),
             question_id.clone(),
+        );
+
+        // #peer-respond — a peer parking on a question is surfaced as
+        // `awaiting_input` and answered via `peer_respond` PURELY through the
+        // process-global pending store: `request_runtime` above registered this
+        // `(question_id, session)` entry (with its full per-question options),
+        // which peer_list / peer_respond read authoritatively. No peer-filesystem
+        // write happens here, so an OPEN peer can never park invisibly. (A closed
+        // peer that re-parks is the documented close-while-parked exception.)
+
+        // #peer-awaiting-wake — the peer is now GENUINELY parked (its pending
+        // oneshot is registered by `request_runtime` above). WAKE its originator
+        // (master) so an IDLE master is notified to answer via peer_list →
+        // peer_respond. Unlike the approval requester there is no auto-resolve
+        // short-circuit for questions — every question genuinely parks — so the
+        // wake fires for each. No-op for a non-peer session or an unresolvable
+        // originator. The enqueue does NOT block; we await `response_rx` below
+        // exactly as before, and the woken master resolves it from a different
+        // task.
+        wake_master_on_peer_awaiting_input(
+            self.state.as_ref(),
+            &self.session_id,
+            &question_id.0.to_string(),
+            PeerPendingKind::Question,
+            &peer_pending_prompt_summary(&event.title, &event.body),
         );
 
         // The event is durable: if the WS drop strands the request, the ledger
@@ -11612,6 +12054,763 @@ fn peer_lane_provider_for(
     resolve_peer_lane_provider(&peers_root, slug, &session_runtime.profile.config)
 }
 
+/// Cap on the human-readable prompt summary shown for a parked prompt.
+const PEER_PENDING_PROMPT_CAP: usize = 2048;
+
+/// Kind of interactive prompt a peer session is parked on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PeerPendingKind {
+    Approval,
+    Question,
+}
+
+impl PeerPendingKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Approval => "approval",
+            Self::Question => "question",
+        }
+    }
+}
+
+/// One interactive prompt a PEER session is currently parked on, PROJECTED from
+/// the process-global pending store (`contract_stores()`), which is the single
+/// AUTHORITY for "awaiting input" — not the filesystem. Because that store is
+/// in-memory, internally consistent, and shared by peer_list / peer_respond /
+/// peer_close (all in the serve process), there is no torn on-disk index, no
+/// stale-delete that could hide a still-parked entry, and no marker a peer could
+/// park without: the store entry exists the instant `request_runtime` registers
+/// the oneshot, so a parked peer is visible and answerable for as long as it
+/// remains OPEN. (A closed peer that re-parks after the close sweep is the
+/// documented close-while-parked exception — see `peer_respond`'s module doc.)
+#[derive(Debug, Clone)]
+struct PeerPendingSummary {
+    kind: PeerPendingKind,
+    /// The `ApprovalId`/`QuestionId` as a string — the master targets a specific
+    /// prompt by this (`peer_list` lists each id).
+    id: String,
+    /// Compact prompt summary for display.
+    prompt: String,
+    /// For a QUESTION: the offered option labels across its questions (a display
+    /// hint; real answers are validated by the store against the stored request).
+    /// Empty for an approval.
+    options: Vec<String>,
+}
+
+/// Compact, capped summary of an interactive prompt (title/body) for display.
+fn peer_pending_prompt_summary(title: &str, body: &str) -> String {
+    let title = title.trim();
+    let body = body.trim();
+    let combined = if title.is_empty() {
+        body.to_owned()
+    } else if body.is_empty() || body == title {
+        title.to_owned()
+    } else {
+        format!("{title} — {body}")
+    };
+    capped_utf8(combined, PEER_PENDING_PROMPT_CAP).0
+}
+
+/// Every prompt `session` is currently parked on, read from the AUTHORITATIVE
+/// process-global stores. Approvals first, then questions, each group ordered by
+/// id — a deterministic order for display and single-default selection.
+fn peer_pending_summaries(
+    contracts: &UiProtocolContractStores,
+    session: &SessionKey,
+) -> Vec<PeerPendingSummary> {
+    let mut approvals: Vec<PeerPendingSummary> = contracts
+        .approvals
+        .pending_for_session(session)
+        .into_iter()
+        .map(|event| PeerPendingSummary {
+            kind: PeerPendingKind::Approval,
+            id: event.approval_id.0.to_string(),
+            prompt: peer_pending_prompt_summary(&event.title, &event.body),
+            options: Vec::new(),
+        })
+        .collect();
+    approvals.sort_by(|a, b| a.id.cmp(&b.id));
+    let mut questions: Vec<PeerPendingSummary> = contracts
+        .user_questions
+        .pending_for_session(session)
+        .into_iter()
+        .map(|event| PeerPendingSummary {
+            kind: PeerPendingKind::Question,
+            id: event.question_id.0.to_string(),
+            prompt: peer_pending_prompt_summary(&event.title, &event.body),
+            options: event
+                .questions
+                .iter()
+                .flat_map(|question| question.options.iter().map(|option| option.label.clone()))
+                .collect(),
+        })
+        .collect();
+    questions.sort_by(|a, b| a.id.cmp(&b.id));
+    approvals.append(&mut questions);
+    approvals
+}
+
+/// Outcome of a peer awaiting-input WAKE attempt — a test-visible summary of
+/// whether (and why) the master was notified. `Woke`/`AlreadyQueued` mean a peer
+/// genuinely parked; the rest are the fail-closed no-wake reasons.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PeerAwaitingWakeOutcome {
+    /// A wake continuation was newly enqueued on the master (originator).
+    Woke,
+    /// The wake collapsed onto an already-queued wake for the SAME park (same
+    /// pending id) — the master is already scheduled to handle it.
+    AlreadyQueued,
+    /// The parking session is not a peer session (topic is not `peer-<slug>`),
+    /// so there is no master to notify — a non-peer park never wakes anyone.
+    NotPeer,
+    /// The peer is not staged / not resolvable under `peers/` — no wake.
+    NoStagedPeer,
+    /// The peer has no recorded `originator` (master). Fail-closed: no wake.
+    NoOriginator,
+    /// The recorded `originator` is present but not a LEGITIMATE master session
+    /// — wrong/absent profile, or itself a peer session (a peer can never answer
+    /// via `peer_respond` under the depth-1 guard). Fail-closed: no wake, so a
+    /// malformed/hostile originator can never strand a continuation on the wrong
+    /// or an unanswerable session.
+    InvalidOriginator,
+}
+
+/// Short, single-line summary of what a peer is blocked on, for the wake nudge.
+/// Collapses all whitespace and caps length — the master reads the AUTHORITATIVE
+/// parked set via `peer_list`, so this is only a hint (and peer-supplied
+/// title/body is untrusted display text that must not blow up the prompt).
+fn peer_awaiting_wake_prompt_summary(prompt: &str) -> String {
+    const WAKE_PROMPT_SUMMARY_CAP: usize = 160;
+    let one_line = prompt.split_whitespace().collect::<Vec<_>>().join(" ");
+    capped_utf8(one_line, WAKE_PROMPT_SUMMARY_CAP).0
+}
+
+/// #peer-awaiting-wake CORE — enqueue an AUTONOMOUS master continuation that
+/// WAKES the peer's originator (master) the moment the peer PARKS on an
+/// approval/question (becomes genuinely `awaiting_input`). Resolves the peer's
+/// slug/profile from `peer_session`, reads the recorded `originator` from
+/// `peers/<slug>/originator` (the SAME source `peer_send_input`/`peer_respond`
+/// authorize against — symlink-safe via [`staged_peer_dir`]), VALIDATES it is a
+/// legitimate master session (right profile, not itself a peer), and pushes ONE
+/// [`PEER_AWAITING_INPUT_EXTERNAL_KIND`] continuation onto that master through
+/// the SAME scheduler `peer_fleet_synthesis` uses. Filesystem-only +
+/// `AppState`-free, so it is unit-testable with a tempdir.
+///
+/// The enqueue is a quick, non-blocking scheduler push: the caller (a park-point
+/// requester) awaits its own oneshot as normal, and the woken master resolves it
+/// from a DIFFERENT task via `peer_respond`. The scheduler's `is_idle_eligible`
+/// gate (checked at drain) means the wake never fires while the MASTER itself is
+/// mid-turn or blocked on its own input/approval.
+fn enqueue_peer_awaiting_input_wake(
+    peers_root: &Path,
+    peer_session: &SessionKey,
+    pending_id: &str,
+    park_kind: PeerPendingKind,
+    prompt: &str,
+) -> PeerAwaitingWakeOutcome {
+    // ONLY a peer session parks a peer. A non-peer (e.g. the master's OWN)
+    // session parking must never wake anyone.
+    let Some((profile_id, slug)) = peer_slug_and_profile(peer_session) else {
+        return PeerAwaitingWakeOutcome::NotPeer;
+    };
+    // Route the originator read through `staged_peer_dir` so a hostile/stray
+    // `peers/<slug>` symlink can never redirect the read outside `peers_root`.
+    let Some(peer_dir) = staged_peer_dir(peers_root, slug) else {
+        return PeerAwaitingWakeOutcome::NoStagedPeer;
+    };
+    let Some(master) =
+        peer_io::read_peer_file(&peer_dir, "originator", peer_io::PEER_FILE_READ_CAP_SMALL)
+    else {
+        return PeerAwaitingWakeOutcome::NoOriginator;
+    };
+    let master = master.trim();
+    if master.is_empty() {
+        return PeerAwaitingWakeOutcome::NoOriginator;
+    }
+    let master_key = SessionKey(master.to_owned());
+    // VALIDATE the recorded originator is a legitimate MASTER session before
+    // targeting a wake at it — never trust the string blindly. `peer/prepare`
+    // writes its supplied `session_id` verbatim as the `originator`, so it can be
+    // malformed, wrong-profile, or itself a PEER session. Treat it as an
+    // authorization locator (exactly as `peer_respond`/`peer_send_input` do), not
+    // a blind target: require a profile that EQUALS the peer's (peers run under
+    // their master's profile) AND a topic that is NOT a peer topic — a peer can
+    // NEVER answer via `peer_respond` (depth-1 guard), so a wake aimed at one
+    // would strand the blocked peer, and a wrong-profile/garbage value would
+    // strand a continuation on the wrong or a nonexistent session. Any failure →
+    // skip silently, exactly like a missing originator (the peer just emits no
+    // wake). The `peer-` prefix is checked on the RAW topic (not
+    // `peer_slug_and_profile`, which also gates slug safety) so even a malformed
+    // `peer-<unsafe>` originator topic is rejected.
+    if master_key.profile_id() != Some(profile_id)
+        || master_key
+            .topic()
+            .is_some_and(|topic| topic.starts_with("peer-"))
+    {
+        return PeerAwaitingWakeOutcome::InvalidOriginator;
+    }
+    let summary = peer_awaiting_wake_prompt_summary(prompt);
+    let outcome = default_agent_orchestrator().enqueue_peer_awaiting_input_continuation(
+        &master_key,
+        profile_id,
+        slug,
+        pending_id,
+        park_kind.as_str(),
+        &summary,
+    );
+    if outcome.is_duplicate() {
+        PeerAwaitingWakeOutcome::AlreadyQueued
+    } else {
+        tracing::debug!(
+            master = %master_key,
+            profile = profile_id,
+            slug,
+            kind = park_kind.as_str(),
+            "peer parked on input — enqueued autonomous wake on master",
+        );
+        PeerAwaitingWakeOutcome::Woke
+    }
+}
+
+/// Resolve the peer's `peers_root` from `state.profiles` and enqueue the
+/// awaiting-input wake on its originator. The thin `AppState` seam over
+/// [`enqueue_peer_awaiting_input_wake`] that the park-point requesters call.
+/// No-op for a non-peer session or an unregistered profile.
+fn wake_master_on_peer_awaiting_input(
+    state: &AppState,
+    peer_session: &SessionKey,
+    pending_id: &str,
+    park_kind: PeerPendingKind,
+    prompt: &str,
+) {
+    let Some((profile_id, _slug)) = peer_slug_and_profile(peer_session) else {
+        return;
+    };
+    let Some(runtime) = state.profiles.get(profile_id) else {
+        return;
+    };
+    let peers_root = runtime.data_dir.join("peers");
+    let _ =
+        enqueue_peer_awaiting_input_wake(&peers_root, peer_session, pending_id, park_kind, prompt);
+}
+
+#[cfg(test)]
+mod peer_awaiting_wake_tests {
+    use super::*;
+    use crate::api::agent_orchestrator::PEER_AWAITING_INPUT_EXTERNAL_KIND;
+
+    /// Stage a peer dir (`<peers_root>/<slug>/` with `brief.md`) and optionally
+    /// record its `originator`. Mirrors the `stage_peer` staging contract that
+    /// `staged_peer_dir` validates.
+    fn stage_peer_with_originator(peers_root: &Path, slug: &str, originator: Option<&str>) {
+        let dir = peers_root.join(slug);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("brief.md"), "do the thing").unwrap();
+        if let Some(originator) = originator {
+            std::fs::write(dir.join("originator"), originator).unwrap();
+        }
+    }
+
+    fn peer_session(profile: &str, chat: &str, slug: &str) -> SessionKey {
+        SessionKey::with_profile_topic(profile, "api", chat, &format!("peer-{slug}"))
+    }
+
+    /// A peer parking on an APPROVAL wakes its originator (master) with a
+    /// continuation carrying the peer slug + `approval` kind.
+    #[test]
+    fn peer_approval_park_wakes_master_on_originator() {
+        let tmp = tempfile::tempdir().unwrap();
+        let peers_root = tmp.path();
+        let profile = "tenant-wake-core-appr";
+        let master = "tenant-wake-core-appr:api:master";
+        stage_peer_with_originator(peers_root, "edison", Some(master));
+
+        let session = peer_session(profile, "edison-wire", "edison");
+        let outcome = enqueue_peer_awaiting_input_wake(
+            peers_root,
+            &session,
+            "approval-1",
+            PeerPendingKind::Approval,
+            "shell: delete build cache",
+        );
+        assert_eq!(outcome, PeerAwaitingWakeOutcome::Woke);
+
+        let orchestrator = default_agent_orchestrator();
+        let master_key = SessionKey(master.to_owned());
+        assert_eq!(
+            orchestrator.pending_continuation_count_for_session_for_test(&master_key, profile),
+            1,
+            "a peer approval park enqueues exactly one wake on its originator",
+        );
+        let drained = orchestrator.drain_ready_continuations_for_session(
+            &master_key,
+            profile,
+            MasterContinuationRuntimeState::idle(),
+            4,
+        );
+        let wake = drained
+            .iter()
+            .find(|c| {
+                matches!(&c.reason, MasterContinuationReason::External(k)
+                    if k == PEER_AWAITING_INPUT_EXTERNAL_KIND)
+            })
+            .expect("the approval wake must be queued on the master");
+        let prompt = master_continuation_prompt(wake);
+        assert!(prompt.contains("edison"), "prompt names the slug: {prompt}");
+        assert!(
+            prompt.contains("approval"),
+            "prompt states the approval kind: {prompt}"
+        );
+        assert!(
+            prompt.contains("peer_list") && prompt.contains("peer_respond"),
+            "prompt directs peer_list/peer_respond: {prompt}"
+        );
+    }
+
+    /// A peer parking on a QUESTION wakes its originator with a `question`-kind
+    /// continuation.
+    #[test]
+    fn peer_question_park_wakes_master_on_originator() {
+        let tmp = tempfile::tempdir().unwrap();
+        let peers_root = tmp.path();
+        let profile = "tenant-wake-core-q";
+        let master = "tenant-wake-core-q:api:master";
+        stage_peer_with_originator(peers_root, "tesla", Some(master));
+
+        let session = peer_session(profile, "tesla-wire", "tesla");
+        let outcome = enqueue_peer_awaiting_input_wake(
+            peers_root,
+            &session,
+            "question-1",
+            PeerPendingKind::Question,
+            "Which region should I deploy to?",
+        );
+        assert_eq!(outcome, PeerAwaitingWakeOutcome::Woke);
+
+        let orchestrator = default_agent_orchestrator();
+        let master_key = SessionKey(master.to_owned());
+        let drained = orchestrator.drain_ready_continuations_for_session(
+            &master_key,
+            profile,
+            MasterContinuationRuntimeState::idle(),
+            4,
+        );
+        let wake = drained
+            .iter()
+            .find(|c| {
+                matches!(&c.reason, MasterContinuationReason::External(k)
+                    if k == PEER_AWAITING_INPUT_EXTERNAL_KIND)
+            })
+            .expect("the question wake must be queued on the master");
+        assert!(
+            master_continuation_prompt(wake).contains("question"),
+            "prompt states the question kind",
+        );
+    }
+
+    /// A NON-peer session parking (topic is not `peer-<slug>`) must NOT wake
+    /// anyone — there is no master behind an ordinary session.
+    #[test]
+    fn non_peer_session_park_does_not_wake() {
+        let tmp = tempfile::tempdir().unwrap();
+        let peers_root = tmp.path();
+        // An ordinary (non-peer) session: a master's OWN turn parking.
+        let session = SessionKey::with_profile("tenant-wake-core-nonpeer", "api", "master");
+        let outcome = enqueue_peer_awaiting_input_wake(
+            peers_root,
+            &session,
+            "approval-x",
+            PeerPendingKind::Approval,
+            "anything",
+        );
+        assert_eq!(
+            outcome,
+            PeerAwaitingWakeOutcome::NotPeer,
+            "a non-peer session must never wake a master",
+        );
+    }
+
+    /// A peer with NO recorded originator fails closed: no wake (nothing to
+    /// notify).
+    #[test]
+    fn peer_without_originator_does_not_wake() {
+        let tmp = tempfile::tempdir().unwrap();
+        let peers_root = tmp.path();
+        let profile = "tenant-wake-core-noorig";
+        stage_peer_with_originator(peers_root, "ghost", None);
+
+        let session = peer_session(profile, "ghost-wire", "ghost");
+        let outcome = enqueue_peer_awaiting_input_wake(
+            peers_root,
+            &session,
+            "approval-y",
+            PeerPendingKind::Approval,
+            "anything",
+        );
+        assert_eq!(outcome, PeerAwaitingWakeOutcome::NoOriginator);
+    }
+
+    /// A recorded originator that is itself a PEER session (topic `peer-...`)
+    /// must NOT wake: a peer can never answer via `peer_respond` (depth-1 guard),
+    /// so a wake aimed at one would strand the blocked peer. `peer/prepare`
+    /// writes its supplied session_id verbatim, so this is a real input.
+    #[test]
+    fn peer_session_originator_does_not_wake() {
+        let tmp = tempfile::tempdir().unwrap();
+        let peers_root = tmp.path();
+        let profile = "tenant-wake-core-peerorig";
+        // The originator string is ANOTHER peer session under the same profile.
+        let peer_originator = format!("{profile}:api:other-wire#peer-other");
+        stage_peer_with_originator(peers_root, "edison", Some(&peer_originator));
+
+        let session = peer_session(profile, "edison-wire", "edison");
+        let outcome = enqueue_peer_awaiting_input_wake(
+            peers_root,
+            &session,
+            "approval-z",
+            PeerPendingKind::Approval,
+            "anything",
+        );
+        assert_eq!(
+            outcome,
+            PeerAwaitingWakeOutcome::InvalidOriginator,
+            "a peer-session originator can never answer — no wake",
+        );
+        // And nothing was enqueued anywhere for that peer-session key.
+        let orchestrator = default_agent_orchestrator();
+        assert_eq!(
+            orchestrator.pending_continuation_count_for_session_for_test(
+                &SessionKey(peer_originator),
+                profile,
+            ),
+            0,
+            "no continuation may land on a peer-session originator",
+        );
+    }
+
+    /// A recorded originator under a DIFFERENT profile than the peer's must NOT
+    /// wake — peers run under their master's profile, so a profile mismatch is a
+    /// malformed/hostile originator that would strand a continuation on the wrong
+    /// (or a nonexistent) session.
+    #[test]
+    fn wrong_profile_originator_does_not_wake() {
+        let tmp = tempfile::tempdir().unwrap();
+        let peers_root = tmp.path();
+        let profile = "tenant-wake-core-wrongprof";
+        // A well-formed MASTER session, but under a DIFFERENT profile.
+        let foreign_master = "some-other-tenant:api:master";
+        stage_peer_with_originator(peers_root, "edison", Some(foreign_master));
+
+        let session = peer_session(profile, "edison-wire", "edison");
+        let outcome = enqueue_peer_awaiting_input_wake(
+            peers_root,
+            &session,
+            "approval-w",
+            PeerPendingKind::Approval,
+            "anything",
+        );
+        assert_eq!(
+            outcome,
+            PeerAwaitingWakeOutcome::InvalidOriginator,
+            "a wrong-profile originator must not wake",
+        );
+        let orchestrator = default_agent_orchestrator();
+        assert_eq!(
+            orchestrator.pending_continuation_count_for_session_for_test(
+                &SessionKey(foreign_master.to_owned()),
+                profile,
+            ),
+            0,
+            "no continuation may land on a wrong-profile originator",
+        );
+        // Belt-and-suspenders: nor under the foreign profile either.
+        assert_eq!(
+            orchestrator.pending_continuation_count_for_session_for_test(
+                &SessionKey(foreign_master.to_owned()),
+                "some-other-tenant",
+            ),
+            0,
+        );
+    }
+
+    /// A profile-LESS originator (a bare `channel:chat`, no `{profile}:` prefix)
+    /// must NOT wake — it has no profile to match the peer's.
+    #[test]
+    fn profileless_originator_does_not_wake() {
+        let tmp = tempfile::tempdir().unwrap();
+        let peers_root = tmp.path();
+        let profile = "tenant-wake-core-noprof";
+        stage_peer_with_originator(peers_root, "edison", Some("garbage-no-profile"));
+
+        let session = peer_session(profile, "edison-wire", "edison");
+        let outcome = enqueue_peer_awaiting_input_wake(
+            peers_root,
+            &session,
+            "approval-v",
+            PeerPendingKind::Approval,
+            "anything",
+        );
+        assert_eq!(outcome, PeerAwaitingWakeOutcome::InvalidOriginator);
+    }
+
+    /// Two DISTINCT parks (distinct pending ids) wake the master twice; a RETRY
+    /// of the SAME park dedupes.
+    #[test]
+    fn distinct_parks_wake_twice_same_park_dedupes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let peers_root = tmp.path();
+        let profile = "tenant-wake-core-dedupe";
+        let master = "tenant-wake-core-dedupe:api:master";
+        stage_peer_with_originator(peers_root, "edison", Some(master));
+        stage_peer_with_originator(peers_root, "tesla", Some(master));
+
+        let orchestrator = default_agent_orchestrator();
+        let master_key = SessionKey(master.to_owned());
+
+        // Two distinct parks (different peers, different pending ids).
+        assert_eq!(
+            enqueue_peer_awaiting_input_wake(
+                peers_root,
+                &peer_session(profile, "edison-wire", "edison"),
+                "pending-A",
+                PeerPendingKind::Approval,
+                "first",
+            ),
+            PeerAwaitingWakeOutcome::Woke,
+        );
+        assert_eq!(
+            enqueue_peer_awaiting_input_wake(
+                peers_root,
+                &peer_session(profile, "tesla-wire", "tesla"),
+                "pending-B",
+                PeerPendingKind::Question,
+                "second",
+            ),
+            PeerAwaitingWakeOutcome::Woke,
+        );
+        assert_eq!(
+            orchestrator.pending_continuation_count_for_session_for_test(&master_key, profile),
+            2,
+            "two distinct parks → two wakes",
+        );
+
+        // A RETRY of the FIRST park (same pending id) dedupes — no third wake.
+        assert_eq!(
+            enqueue_peer_awaiting_input_wake(
+                peers_root,
+                &peer_session(profile, "edison-wire", "edison"),
+                "pending-A",
+                PeerPendingKind::Approval,
+                "retry",
+            ),
+            PeerAwaitingWakeOutcome::AlreadyQueued,
+        );
+        assert_eq!(
+            orchestrator.pending_continuation_count_for_session_for_test(&master_key, profile),
+            2,
+            "a retried park never stacks a redundant wake",
+        );
+    }
+}
+
+/// The peer's TRUSTED session key (#P1-1): the wire it runs its turns under,
+/// recorded server-side at `session/open`. `None` when the peer is not currently
+/// open — it then has no live oneshot to answer or cancel. This is the ONLY
+/// slug→session mapping any peer-control path trusts; it never comes from a
+/// client argument or an on-disk file.
+fn peer_trusted_session(profile_id: &str, slug: &str) -> Option<SessionKey> {
+    peer_wire_registry().resolve(&peer_wire_key(profile_id, slug))
+}
+
+/// Map the tool's answer entries onto the store's `UserQuestionAnswer[]`,
+/// matching each entry to ITS question's options (#new-P2-#2): a bare string
+/// answer to a CHOICE question becomes a real label selection for THAT question
+/// (so a 2–4-question choice prompt is answerable), while free text passes
+/// through where the question allows it. One answer per stored question, in
+/// order; a mismatched count/label surfaces the store's typed error rather than
+/// resolving incorrectly.
+fn peer_respond_build_answers(
+    req_answers: &[octos_agent::PeerRespondAnswer],
+    questions: &[octos_core::ui_protocol::UserQuestion],
+) -> Vec<octos_core::ui_protocol::UserQuestionAnswer> {
+    req_answers
+        .iter()
+        .enumerate()
+        .map(|(index, answer)| {
+            if answer.selected_labels.is_empty() {
+                if let Some(text) = &answer.free_text {
+                    if let Some(option) = questions.get(index).and_then(|question| {
+                        question
+                            .options
+                            .iter()
+                            .find(|option| option.label.eq_ignore_ascii_case(text))
+                    }) {
+                        return octos_core::ui_protocol::UserQuestionAnswer {
+                            selected_labels: vec![option.label.clone()],
+                            free_text: None,
+                        };
+                    }
+                }
+            }
+            octos_core::ui_protocol::UserQuestionAnswer {
+                selected_labels: answer.selected_labels.clone(),
+                free_text: answer.free_text.clone(),
+            }
+        })
+        .collect()
+}
+
+/// The cross-session resolution `peer_respond`'s host callback performs — a
+/// named fn (rather than an inline closure) so tests exercise the EXACT
+/// production path. Authorizes the caller as the peer's recorded originator,
+/// derives the peer's TRUSTED session key from the wire registry (#P1-1),
+/// selects the targeted parked prompt from the AUTHORITATIVE store (by `id`, or
+/// the sole one), and resolves that oneshot via the SAME store the client
+/// `approval/respond` / `user_question/respond` RPCs use. For an approval it
+/// also emits `approval/decided` + audit via `on_approval_decided` (#P1-5),
+/// attributing the MASTER. No filesystem marker is read or written — the store
+/// is the source of truth. Every error is a model-visible string.
+fn peer_respond_resolve(
+    peers_root: &Path,
+    origin_session: &str,
+    profile_id: &str,
+    contracts: &UiProtocolContractStores,
+    on_approval_decided: &dyn Fn(&ApprovalDecidedEvent, Option<&str>),
+    req: octos_agent::PeerRespondRequest,
+) -> Result<(), String> {
+    // Resolve NAME/slug → real slug (names are the primary address).
+    let slug = resolve_peer_name_to_slug(peers_root, &req.slug).ok_or_else(|| {
+        format!(
+            "no peer named '{ident}' — check the name (or slug) with peer_list",
+            ident = req.slug
+        )
+    })?;
+    if !peer_slug_is_safe(&slug) {
+        return Err(format!("invalid peer slug '{slug}'"));
+    }
+    // Only the peer's recorded originator may respond (the same fail-closed
+    // check peer_send_input uses; the originator lives in `peers/<slug>/`).
+    peer_send_input_authorized(peers_root, &slug, origin_session)?;
+    // A retired peer is not awaiting input.
+    if peer_is_closed(peers_root, &slug) {
+        return Err(format!("peer '{slug}' is closed"));
+    }
+
+    // #P1-1 SECURITY — the peer's TRUSTED session key comes ONLY from the wire
+    // registry (server-captured at `session/open`), so a resolution can reach
+    // exactly THIS peer's oneshots and no other's.
+    let Some(peer_session) = peer_trusted_session(profile_id, &slug) else {
+        return Err(format!(
+            "peer '{slug}' is not open — the user must open the staged peer session before it can be answered"
+        ));
+    };
+
+    // The AUTHORITATIVE parked set for this peer, straight from the store.
+    let pendings = peer_pending_summaries(contracts, &peer_session);
+    if pendings.is_empty() {
+        return Err(format!(
+            "peer '{slug}' is not awaiting input — nothing to respond to \
+             (peer_list shows a peer as `awaiting_input` when it is)"
+        ));
+    }
+    let target = match req.id.as_deref() {
+        Some(id) => pendings.iter().find(|p| p.id == id).ok_or_else(|| {
+            format!(
+                "peer '{slug}' has no pending prompt with id '{id}' — check the ids with peer_list"
+            )
+        })?,
+        None if pendings.len() == 1 => &pendings[0],
+        None => {
+            let ids = pendings
+                .iter()
+                .map(|p| format!("{} ({})", p.id, p.kind.as_str()))
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(format!(
+                "peer '{slug}' has {n} pending prompts — pass the specific id (one of: {ids})",
+                n = pendings.len()
+            ));
+        }
+    };
+
+    match target.kind {
+        PeerPendingKind::Approval => {
+            let Some(decision) = req.decision.as_deref() else {
+                return Err(format!(
+                    "peer '{slug}' pending '{id}' is an APPROVAL — pass \
+                     decision=\"approve\"/\"deny\" (not answer)",
+                    id = target.id
+                ));
+            };
+            let approval_id: ApprovalId =
+                serde_json::from_value(serde_json::Value::String(target.id.clone()))
+                    .map_err(|_| format!("peer '{slug}' pending id is malformed"))?;
+            let params = octos_core::ui_protocol::ApprovalRespondParams {
+                session_id: peer_session,
+                approval_id,
+                decision: ApprovalDecision::from(decision.to_owned()),
+                approval_scope: None,
+                client_note: Some(format!(
+                    "answered by master via peer_respond ({origin_session})"
+                )),
+            };
+            let outcome = contracts
+                .approvals
+                .respond_with_context(params.clone())
+                .map_err(|err| {
+                    format!("could not resolve peer '{slug}' approval: {}", err.message)
+                })?;
+            // #P1-5 — publish the canonical `approval/decided` + audit,
+            // attributing the master, via the shared sink (same builder the RPC
+            // handler uses).
+            let tool_name = outcome.context.as_ref().map(|ctx| ctx.tool_name.clone());
+            let event = super::ui_protocol_approvals::build_decided_event(
+                &params,
+                &outcome,
+                origin_session,
+                Utc::now(),
+            );
+            on_approval_decided(&event, tool_name.as_deref());
+        }
+        PeerPendingKind::Question => {
+            let Some(req_answers) = req.answers.as_deref() else {
+                return Err(format!(
+                    "peer '{slug}' pending '{id}' is a QUESTION — pass answer/answers (not decision)",
+                    id = target.id
+                ));
+            };
+            let question_id: octos_core::ui_protocol::QuestionId =
+                serde_json::from_value(serde_json::Value::String(target.id.clone()))
+                    .map_err(|_| format!("peer '{slug}' pending id is malformed"))?;
+            // #new-P2-#2 — map each answer against the STORED request's questions
+            // (per-question options), re-read from the authoritative store.
+            let questions = contracts
+                .user_questions
+                .pending_for_session(&peer_session)
+                .into_iter()
+                .find(|event| event.question_id == question_id)
+                .map(|event| event.questions)
+                .unwrap_or_default();
+            let answers = peer_respond_build_answers(req_answers, &questions);
+            let params = UserQuestionRespondParams {
+                session_id: peer_session,
+                question_id,
+                answers,
+                client_note: Some(format!(
+                    "answered by master via peer_respond ({origin_session})"
+                )),
+            };
+            contracts
+                .user_questions
+                .respond_with_context(&params)
+                .map_err(|err| {
+                    format!("could not resolve peer '{slug}' question: {}", err.message)
+                })?;
+        }
+    }
+    Ok(())
+}
+
 /// #1801 v2: peer sessions leave a durable result on the blackboard — a
 /// `result.md` beside the brief, overwritten on every turn terminal (latest
 /// state). Files, not connection state: `/gather`, the future mailbox, and
@@ -12038,19 +13237,75 @@ fn build_peer_gather_callback(peers_root: PathBuf) -> octos_agent::PeerGatherCal
 /// "… and N more" line (read specific peers with peer_gather slugs).
 const PEER_LIST_MAX_ROWS: usize = 200;
 
-fn compose_peer_list_text(rows: &[PeerBlackboardRow], available_lanes: &[String]) -> String {
+/// `awaiting_by_slug`: the AUTHORITATIVE parked-prompt set per peer slug,
+/// projected from the process-global store by the caller (`build_peer_list_callback`).
+/// A slug absent from the map (or closed) is not awaiting input.
+fn compose_peer_list_text(
+    rows: &[PeerBlackboardRow],
+    available_lanes: &[String],
+    awaiting_by_slug: &std::collections::HashMap<String, Vec<PeerPendingSummary>>,
+) -> String {
     if rows.is_empty() {
         return "(no peers staged)".to_owned();
     }
     let mut lines: Vec<String> = Vec::with_capacity(rows.len().min(PEER_LIST_MAX_ROWS) + 2);
     lines.push(format!("peers ({}):", rows.len()));
     for row in rows.iter().take(PEER_LIST_MAX_ROWS) {
+        // Precedence: a retired peer is `closed`; else a peer PARKED on one or
+        // more interactive prompts is `awaiting_input` (the master can answer
+        // each via peer_respond) — this beats `done` so a persistent peer that
+        // finished an earlier turn and is now blocked mid-turn still surfaces as
+        // blocked; else `done` when a result exists; else `running`.
+        let awaiting: &[PeerPendingSummary] = if row.closed {
+            &[]
+        } else {
+            awaiting_by_slug
+                .get(&row.slug)
+                .map_or(&[][..], Vec::as_slice)
+        };
         let status = if row.closed {
             "closed"
+        } else if !awaiting.is_empty() {
+            "awaiting_input"
         } else if row.result.is_some() {
             "done"
         } else {
             "running"
+        };
+        // List each parked prompt (id + kind + short prompt + any offered
+        // options) so the master sees WHAT the peer waits on and which `id` to
+        // pass to peer_respond — without a peer_gather. Capped so a peer with a
+        // flood of prompts can't dominate the index.
+        const PEER_LIST_MAX_PENDING: usize = 8;
+        let awaiting_note = if awaiting.is_empty() {
+            String::new()
+        } else {
+            let mut items = awaiting
+                .iter()
+                .take(PEER_LIST_MAX_PENDING)
+                .map(|pending| {
+                    let (prompt, truncated) = capped_utf8(pending.prompt.trim().to_owned(), 80);
+                    let ellipsis = if truncated { "…" } else { "" };
+                    let opts = if pending.options.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" options=[{}]", pending.options.join(", "))
+                    };
+                    format!(
+                        "[id={id} {kind}: {prompt}{ellipsis}{opts}]",
+                        id = pending.id,
+                        kind = pending.kind.as_str()
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(" ");
+            if awaiting.len() > PEER_LIST_MAX_PENDING {
+                items.push_str(&format!(
+                    " (+{} more)",
+                    awaiting.len() - PEER_LIST_MAX_PENDING
+                ));
+            }
+            format!("  · awaiting: {items}")
         };
         let updated = row
             .result_updated_unix
@@ -12075,7 +13330,7 @@ fn compose_peer_list_text(rows: &[PeerBlackboardRow], available_lanes: &[String]
             format!("{} ({})", row.name, row.slug)
         };
         lines.push(format!(
-            "- {addr}  {status}  updated {updated}  turns {turns}{worktree}{model}"
+            "- {addr}  {status}  updated {updated}  turns {turns}{worktree}{model}{awaiting_note}"
         ));
     }
     if rows.len() > PEER_LIST_MAX_ROWS {
@@ -12102,26 +13357,97 @@ fn peer_list_allowed_for_session(_session_id: &SessionKey) -> bool {
 fn build_peer_list_callback(
     peers_root: PathBuf,
     available_lanes: Vec<String>,
+    contracts: Arc<UiProtocolContractStores>,
+    profile_id: String,
 ) -> octos_agent::PeerListCallback {
     Arc::new(move || {
+        let rows = read_peer_blackboard(&peers_root, None);
+        // #peer-respond — the AUTHORITATIVE awaiting-input set comes from the
+        // process-global store, joined to each open peer by its TRUSTED wire
+        // session (never a filesystem marker). A peer with no wire (not open) or
+        // no store entries simply isn't awaiting.
+        let awaiting_by_slug: std::collections::HashMap<String, Vec<PeerPendingSummary>> = rows
+            .iter()
+            .filter(|row| !row.closed)
+            .filter_map(|row| {
+                let session = peer_trusted_session(&profile_id, &row.slug)?;
+                let pending = peer_pending_summaries(&contracts, &session);
+                (!pending.is_empty()).then(|| (row.slug.clone(), pending))
+            })
+            .collect();
         Ok(compose_peer_list_text(
-            &read_peer_blackboard(&peers_root, None),
+            &rows,
             &available_lanes,
+            &awaiting_by_slug,
         ))
     })
 }
 
+/// #P1-2 — on peer close, CANCEL every pending approval/question the peer is
+/// parked on, so a peer retired while `awaiting_input` does not wedge its
+/// in-flight turn forever. It reads the AUTHORITATIVE store (not any filesystem
+/// scan), so a missing/corrupt marker can never let a live entry escape
+/// cancellation. Cancelling drops the store entry's oneshot sender, so the peer
+/// requester's `await` errs → fail-closed (Deny / Cancelled). Uses the peer's
+/// TRUSTED session key from the wire registry (#P1-1); when the peer is not open
+/// (no wire) there is no live oneshot, so this is a no-op. Emits
+/// `approval/cancelled` per cancelled approval (questions have no equivalent
+/// wire event in the RPC path, matching that path). Best-effort.
+///
+/// Residual (documented, accepted): a park landing in the narrow window between
+/// this cancel and the caller evicting the wire could survive close. The window
+/// is tiny (both run synchronously in the close callback before the callback
+/// returns), and the client tears the peer down on `peer/closed`; a fully
+/// race-free guarantee would need a per-peer lifecycle latch that refuses new
+/// parks once closing — out of scope for this fix.
+fn cancel_peer_pending_on_close(
+    contracts: &UiProtocolContractStores,
+    profile_id: &str,
+    slug: &str,
+    emit_cancelled: &dyn Fn(ApprovalCancelledEvent),
+) {
+    let Some(session) = peer_trusted_session(profile_id, slug) else {
+        return;
+    };
+    for event in contracts.approvals.pending_for_session(&session) {
+        if let Some(cancelled) = contracts.approvals.cancel_pending_approval(
+            &session,
+            &event.approval_id,
+            &event.turn_id,
+            APPROVAL_CANCELLED_REASON_PEER_CLOSED,
+        ) {
+            emit_cancelled(ApprovalCancelledEvent {
+                session_id: session.clone(),
+                topic: session.topic().map(ToOwned::to_owned),
+                approval_id: cancelled.approval_id,
+                turn_id: cancelled.turn_id,
+                reason: APPROVAL_CANCELLED_REASON_PEER_CLOSED.to_owned(),
+            });
+        }
+    }
+    for event in contracts.user_questions.pending_for_session(&session) {
+        let _ = contracts.user_questions.cancel_pending_question(
+            &session,
+            &event.question_id,
+            APPROVAL_CANCELLED_REASON_PEER_CLOSED,
+        );
+    }
+}
+
 /// Build the `peer_close` callback for ONE turn of the serve/WS path. Closing
 /// RETIRES a peer the caller created: authorize (originator-only, the SAME
-/// check `peer_send_input` uses), evict the live wire if the peer is open,
-/// and write the durable `closed` marker so `peer_list` / `peer_gather`
-/// report it closed and `peer_send_input` refuses it. Graceful — an in-flight
-/// peer turn still completes; result files stay readable.
+/// check `peer_send_input` uses), cancel any pending approval/question it is
+/// parked on (#P1-2), evict the live wire if the peer is open, and write the
+/// durable `closed` marker so `peer_list` / `peer_gather` report it closed and
+/// `peer_send_input` refuses it. Graceful — an in-flight peer turn still
+/// completes; result files stay readable.
 fn build_peer_close_callback(
     peers_root: PathBuf,
     origin_session: String,
     profile_id: String,
+    contracts: Arc<UiProtocolContractStores>,
     emit_closed: Arc<dyn Fn(PeerClosedEvent) + Send + Sync>,
+    emit_cancelled: Arc<dyn Fn(ApprovalCancelledEvent) + Send + Sync>,
 ) -> octos_agent::PeerCloseCallback {
     Arc::new(move |ident: String| {
         // Resolve the identifier (peer NAME or slug) to the actual slug BEFORE
@@ -12177,6 +13503,13 @@ fn build_peer_close_callback(
                 "cancelled pending peer_send_input injections on peer close"
             );
         }
+        // #P1-2 — cancel any pending approval/question this peer is parked on
+        // (from the authoritative store) so its in-flight turn is released
+        // fail-closed. BEFORE the wire eviction below, which removes the
+        // slug→session mapping the cancel derives its trusted session key from.
+        cancel_peer_pending_on_close(&contracts, &profile_id, &slug, &|event| {
+            emit_cancelled(event)
+        });
         // Peer-fleet auto-synthesis RESET — the close marker now excludes this
         // peer from the master's owned fleet. If it was the LAST owned peer, the
         // fleet is fully retired: drop the `.synthesized` marker so a genuinely
@@ -17412,6 +18745,30 @@ pub(crate) fn spawn_global_master_continuation_drain(state: Arc<AppState>) {
             // sessions is not operationally reachable on a single serve.
             const DRAIN_SPAWN_CAP: usize = 8;
             const DRAIN_CANDIDATE_WINDOW: usize = 64;
+            // PR 4b — rehydration pre-pass: BEFORE the two workspace/scope gates,
+            // re-seed the in-memory maps a HEADLESS keeper (fleet outbox → keeper
+            // continuation, no live client) never got from a `session/open` after
+            // a serve restart. Each candidate PAIRS the workspace root and the cwd
+            // scope from the SAME pending continuation (codex round 2) so a wire's
+            // Gate A workspace and Gate D scope can never come from two different
+            // continuations (which would admit one folder's continuation and run
+            // it in another's). Both seeds key under the `wire_key_from_goal_key`
+            // form the gates probe and never overwrite an established entry.
+            //   (1) `session_workspaces()` clears the workspace-known gate below;
+            //       `run_standalone_turn` later reads the same entry as its
+            //       `workspace_hint`.
+            //   (2) `goal_scopes` (scoped keepers only) clears the SECOND gate
+            //       (`goal_target_is_dispatchable`, Gate D), which would otherwise
+            //       surface a scoped keeper yet `continue` it SILENTLY.
+            // Rolling-downgrade note: an old v2 binary that REWRITES the fleet
+            // record erases the unknown `controller_workspace_root` (the keeper
+            // then loses headless rehydration) — acceptable for v1's
+            // single-active-serve model; not a concern within one binary version.
+            reseed_fleet_keeper_candidates(
+                &session_workspaces(),
+                default_agent_orchestrator(),
+                default_agent_orchestrator().pending_fleet_keeper_seeds(),
+            );
             // #1666 residue — a goal target is cwd-scoped (`<wire>\u{0}~cwd-…`)
             // while `session_workspaces()` is keyed by the plain wire id, so
             // the workspace-known gate must strip the scope before probing.
@@ -17631,6 +18988,43 @@ fn unknown_turn_error(turn_id: &TurnId) -> RpcError {
         .with_data(json!({ "turn_id": turn_id_str, "kind": "unknown_turn" }))
 }
 
+/// Publish the canonical `approval/decided` durable notification + decision
+/// trace. SHARED by the `approval/respond` RPC handler and `peer_respond` (#P1-5)
+/// so a master-driven decision is recorded on the wire identically to a
+/// client-driven one. Sync (no await) so the RPC path can call it BEFORE the
+/// data_dir lock — the decided event must append to the ledger before the woken
+/// turn can publish `turn/completed`.
+fn emit_approval_decided(
+    ws: &WsConnection,
+    ledger: &UiProtocolLedger,
+    event: &ApprovalDecidedEvent,
+    tool_name: Option<&str>,
+) {
+    log_decision_tracing(event, tool_name);
+    let _ = send_notification_durable(ws, ledger, UiNotification::ApprovalDecided(event.clone()));
+}
+
+/// Append the approval decision to the durable audit log. SHARED by the
+/// `approval/respond` RPC handler and `peer_respond` (#P1-5). Sync given a
+/// pre-resolved `data_dir` (the RPC path resolves it via the sessions lock; the
+/// peer path captures it at wiring time).
+fn audit_approval_decided(
+    contracts: &UiProtocolContractStores,
+    data_dir: &Path,
+    event: &ApprovalDecidedEvent,
+    tool_name: Option<&str>,
+) {
+    let audit = contracts.audit_log(data_dir);
+    if let Err(error) = audit.record(event, tool_name) {
+        tracing::warn!(
+            target: "octos.approvals.decision",
+            approval_id = %event.approval_id.0,
+            error = %error,
+            "failed to append approval audit log entry"
+        );
+    }
+}
+
 async fn handle_approval_respond(
     ws: &WsConnection,
     state: &Arc<AppState>,
@@ -17672,8 +19066,7 @@ async fn handle_approval_respond(
         connection_profile_id.unwrap_or(""),
         Utc::now(),
     );
-    log_decision_tracing(&event, tool_name.as_deref());
-    let _ = send_notification_durable(ws, ledger, UiNotification::ApprovalDecided(event.clone()));
+    emit_approval_decided(ws, ledger, &event, tool_name.as_deref());
 
     // FIX-06: if the user picked a recordable scope and we have the original
     // request context, register the policy entry. Open-registry rule:
@@ -17708,15 +19101,7 @@ async fn handle_approval_respond(
 
     if let Some(sessions) = state.sessions.as_ref() {
         let data_dir = sessions.lock().await.data_dir();
-        let audit = contracts.audit_log(&data_dir);
-        if let Err(error) = audit.record(&event, tool_name.as_deref()) {
-            tracing::warn!(
-                target: "octos.approvals.decision",
-                approval_id = %event.approval_id.0,
-                error = %error,
-                "failed to append approval audit log entry"
-            );
-        }
+        audit_approval_decided(contracts, &data_dir, &event, tool_name.as_deref());
     }
 }
 
@@ -25601,6 +26986,23 @@ async fn run_standalone_turn(
     // use that as the `workspace_hint`. Otherwise the bootstrap default
     // Tier-3 (`<profile_data_dir>/users/.../workspace`) wins.
     let hint = session_workspaces().get(&session_id);
+    // #1857 PR 5a — THE LOAD-BEARING SEAM: on a goal turn, stash the resolved
+    // controller workspace root on the goal record (keyed by the SCOPED
+    // `goal_session_key`) BEFORE the keeper's `goal_plan` can run mid-turn. It
+    // MUST equal the same `hint` the turn runs under, so `Fleet::create` stamps
+    // the EXACT root a later `ChildDone` wake rehydrates a headless keeper with
+    // (PR 4b) — a fabricated root would silently execute against the wrong repo
+    // after a restart. Only a live-client turn has a `session_workspaces()`
+    // entry; a headless pre-fleet `GoalContinue` passes `None`, which leaves any
+    // previously-captured root intact (same client-dependence as the existing
+    // goal feature).
+    if let Some(goal_ctx) = goal_context.as_ref() {
+        default_agent_orchestrator().set_goal_workspace_root(
+            &goal_ctx.goal_session_key,
+            hint.as_ref()
+                .map(|path| path.to_string_lossy().into_owned()),
+        );
+    }
     let permissions_epoch = state.session_cache.session_generation(&session_id);
     let permissions = match effective_permissions_for_session(&state, &session_id) {
         Ok(permissions) => permissions,
@@ -26718,6 +28120,9 @@ async fn run_standalone_turn(
                     .iter()
                     .map(|sp| sp.key.clone())
                     .collect(),
+                // #peer-respond — the store authority + profile for the wire join.
+                contracts.clone(),
+                session_runtime.profile.profile_id.clone(),
             );
             tool_registry.register(octos_agent::PeerListTool::new(list));
         }
@@ -26851,13 +28256,74 @@ async fn run_standalone_turn(
                         UiNotification::PeerClosed(event),
                     );
                 });
+            // #P1-2 — durable `approval/cancelled` for each pending approval a
+            // just-closed peer was parked on (same emit shape as the RPC path).
+            let cancelled_ws = ws.clone();
+            let cancelled_ledger = ledger.clone();
+            let emit_cancelled: Arc<dyn Fn(ApprovalCancelledEvent) + Send + Sync> =
+                Arc::new(move |event: ApprovalCancelledEvent| {
+                    let _ = send_notification_durable(
+                        &cancelled_ws,
+                        &cancelled_ledger,
+                        UiNotification::ApprovalCancelled(event),
+                    );
+                });
             let close = build_peer_close_callback(
                 session_runtime.profile.data_dir.join("peers"),
                 session_id.to_string(),
                 session_runtime.profile.profile_id.clone(),
+                contracts.clone(),
                 emit_closed,
+                emit_cancelled,
             );
             tool_registry.register(octos_agent::PeerCloseTool::new(close));
+
+            // #peer-respond — answer a peer BLOCKED on an interactive prompt
+            // (tool-approval or clarifying question) so the master acts as its
+            // human-in-the-loop. Same depth-1 + originator-auth guards as
+            // peer_send_input/peer_close (this whole block is gated on
+            // `peer_handoff_allowed_for_session`, so it is NEVER registered on a
+            // peer session). The callback resolves the peer's parked oneshot
+            // through the SAME process-global contract store the client
+            // `approval/respond` / `user_question/respond` RPCs use — the peer's
+            // OWN requester registered its pending entry there (contract_stores()
+            // is a process-global OnceLock), which is the AUTHORITY for awaiting
+            // input (no filesystem marker is involved).
+            let respond_peers_root = session_runtime.profile.data_dir.join("peers");
+            let respond_origin_session = session_id.to_string();
+            let respond_profile_id = session_runtime.profile.profile_id.clone();
+            let respond_contracts = contracts.clone();
+            let respond_ws = ws.clone();
+            let respond_ledger = ledger.clone();
+            // #P1-5 — pre-resolve the audit data_dir ONCE (the sink is sync and
+            // cannot take the async sessions lock per call), so a master approval
+            // records to the SAME durable audit log the RPC handler writes.
+            let respond_audit_data_dir = match state.sessions.as_ref() {
+                Some(sessions) => Some(sessions.lock().await.data_dir()),
+                None => None,
+            };
+            let respond: octos_agent::PeerRespondCallback =
+                Arc::new(move |req: octos_agent::PeerRespondRequest| {
+                    // #P1-5 — emit `approval/decided` + audit for a master
+                    // approval via the SAME helpers the RPC handler uses,
+                    // attributing the master session.
+                    let on_approval_decided =
+                        |event: &ApprovalDecidedEvent, tool_name: Option<&str>| {
+                            emit_approval_decided(&respond_ws, &respond_ledger, event, tool_name);
+                            if let Some(dir) = &respond_audit_data_dir {
+                                audit_approval_decided(&respond_contracts, dir, event, tool_name);
+                            }
+                        };
+                    peer_respond_resolve(
+                        &respond_peers_root,
+                        &respond_origin_session,
+                        &respond_profile_id,
+                        &respond_contracts,
+                        &on_approval_decided,
+                        req,
+                    )
+                });
+            tool_registry.register(octos_agent::PeerRespondTool::new(respond));
         }
 
         // Wire the PARENT `send_file` for the legacy non-contract
@@ -27207,6 +28673,7 @@ async fn run_standalone_turn(
                 ws: ws.clone(),
                 ledger: ledger.clone(),
                 contracts: contracts.clone(),
+                state: state.clone(),
                 session_id: session_id.clone(),
                 turn_id: turn_id.clone(),
             }) as Arc<dyn octos_agent::UserQuestionRequester>

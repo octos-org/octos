@@ -502,11 +502,31 @@ jobs:
         run: cargo test --workspace --doc
 
   check-riscv:
-    # Push-only for the same reason as check-arm, plus a live problem: this job
-    # has not COMPLETED in recent history — it runs to the 24 h ceiling and is
-    # cancelled (see runs 30087155881, 30025529065). Until that is diagnosed it
-    # must not gate anything; putting it on PRs would wedge every PR for a day.
-    if: github.event_name != 'pull_request'
+    # MANUAL ONLY — this job is the reason `main` has had no CI signal for weeks.
+    #
+    # There is no runner for the `ubuntu-24.04-riscv` label. Every dispatch sits
+    # in `queued` with `runner_id: 0`, `runner_name: ""` and `steps: []` until
+    # GitHub's fixed 24 h *queue* ceiling kills it. Job 89914973597 in run
+    # 30244166464: 2026-07-27T07:33:57Z → 2026-07-28T07:33:58Z, zero steps, no
+    # runner ever assigned. All 22 such jobs in the last 50 `main` runs died at
+    # exactly 24:00:00–01. Not one has ever executed a step.
+    #
+    # Note this is a QUEUE limit, so `timeout-minutes` does NOT bound it —
+    # that only starts counting once a runner picks the job up.
+    #
+    # While queued it holds the whole run in-progress, and `cancel-in-progress`
+    # is false for `push` and `schedule`, so that one run owns the
+    # `ci-CI-refs/heads/main` concurrency slot for a full day. Every push behind
+    # it is cancelled while still pending — 22 of the last 50 `main` runs were
+    # cancelled having dispatched zero jobs.
+    #
+    # `schedule` is deliberately excluded too: the nightly cron runs on `main`
+    # and lands in the SAME concurrency group, so a schedule-only riscv job
+    # would re-wedge the slot for 24 h once a day.
+    #
+    # Restore `github.event_name != 'pull_request'` once a riscv64 runner is
+    # actually registered for this repo.
+    if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-24.04-riscv
     env:
       CARGO_BUILD_JOBS: "2"
@@ -571,19 +591,23 @@ jobs:
     # check can even see.
     #
     # NON-BLOCKING for now, because it is currently RED for a pre-existing
-    # reason: `octos-core` `session_scope` has 2 Windows-only test failures
-    # (5-for-5 on recent `main` runs, long before this job moved to PRs).
-    # Making it blocking today would wedge every PR on a bug it did not
+    # reason. Making it blocking today would wedge every PR on a bug it did not
     # introduce. It still surfaces on the PR, which is the point — a NEW
     # Windows break is now visible at review time instead of after merge.
+    #
+    # The original reason recorded here — 2 `octos-core` `session_scope`
+    # failures — was fixed by #1838; `Test octos-core` is green on `main`. As of
+    # run 30423603951 the job stops at `Test octos-plugin`
+    # (`lifecycle::tests::run_phase_injects_octos_skill_dir_env`), which #1860
+    # addresses. Keep this note pinned to the CURRENT blocker: a stale one reads
+    # as "known, tracked, someone's on it" long after nobody is.
     #
     # Non-blocking ONLY on PRs. On push to `main` it stays hard-failing, so
     # `build-windows` (which `needs:` this job) still refuses to ship a Windows
     # artifact from a red suite — a blanket `continue-on-error: true` would have
     # silently re-enabled those releases.
     #
-    # Drop this line entirely once the two tests are fixed; see the tracking
-    # note in `crates/octos-core/src/session_scope.rs`.
+    # Drop this line entirely once the job is green on `main`.
     continue-on-error: ${{ github.event_name == 'pull_request' }}
     runs-on: windows-latest
     steps:
@@ -595,45 +619,87 @@ jobs:
         with:
           shared-key: windows
 
-      - name: Build (workspace + all features)
-        run: |
-          cargo build --workspace
-          cargo build -p octos-cli --features ${{ env.FEATURES }}
+      # One command per step, on purpose. Windows steps run under pwsh, which
+      # does NOT abort on a failing native command — GitHub appends only
+      # `exit $LASTEXITCODE`, so a multi-line `run:` block reports the exit
+      # code of its LAST line and silently swallows every failure before it.
+      # The Linux jobs above are safe (bash runs with `-eo pipefail`); these
+      # two blocks were the only multi-command steps in this job.
+      - name: Build (workspace)
+        run: cargo build --workspace
+
+      - name: Build (octos-cli + all features)
+        run: cargo build -p octos-cli --features ${{ env.FEATURES }}
 
       # Sharded per-crate tests — same rationale as the `check` job.
+      #
+      # Every test step runs even after an earlier one fails. GitHub aborts a
+      # job at the first failing step, so a single red crate hid every crate
+      # after it — PR #1860 fixed ~48 Windows failures and the job STILL only
+      # reported one, with steps 18-20 never executing. That turned Windows
+      # into a one-failure-per-40-minute-run guessing game.
+      #
+      # `!cancelled()` keeps the step running on failure but NOT after a manual
+      # cancel or job timeout. The job's own conclusion is unchanged: any red
+      # step still fails the job, so this weakens no gate — it only makes one
+      # run report the whole truth.
       - name: Test octos-core
+        if: ${{ !cancelled() }}
         run: cargo test -p octos-core
       - name: Test octos-memory
+        if: ${{ !cancelled() }}
         run: cargo test -p octos-memory
       - name: Test octos-llm (lib)
+        if: ${{ !cancelled() }}
         run: cargo test -p octos-llm --lib
       - name: Test octos-llm (integration)
+        if: ${{ !cancelled() }}
         run: cargo test -p octos-llm --tests
       - name: Test octos-bus
+        if: ${{ !cancelled() }}
         run: cargo test -p octos-bus
       - name: Test octos-pipeline
+        if: ${{ !cancelled() }}
         run: cargo test -p octos-pipeline
       - name: Test octos-plugin
+        if: ${{ !cancelled() }}
         run: cargo test -p octos-plugin
       - name: Test octos-sandbox
+        if: ${{ !cancelled() }}
         run: cargo test -p octos-sandbox
       - name: Test octos-swarm
+        if: ${{ !cancelled() }}
         run: cargo test -p octos-swarm
       - name: Test octos-agent (lib)
+        if: ${{ !cancelled() }}
         run: cargo test -p octos-agent --lib
       - name: Test octos-agent (integration)
+        if: ${{ !cancelled() }}
         run: cargo test -p octos-agent --tests
       - name: Test octos-cli (lib)
+        if: ${{ !cancelled() }}
         run: cargo test -p octos-cli --lib
       - name: Test octos-cli (integration)
+        if: ${{ !cancelled() }}
         run: cargo test -p octos-cli --tests
-      - name: Test harness starter skills
-        run: |
-          cargo test -p harness-starter-generic
-          cargo test -p harness-starter-report
-          cargo test -p harness-starter-audio
-          cargo test -p harness-starter-coding
+      - name: Test harness starter generic
+        if: ${{ !cancelled() }}
+        run: cargo test -p harness-starter-generic
+
+      - name: Test harness starter report
+        if: ${{ !cancelled() }}
+        run: cargo test -p harness-starter-report
+
+      - name: Test harness starter audio
+        if: ${{ !cancelled() }}
+        run: cargo test -p harness-starter-audio
+
+      - name: Test harness starter coding
+        if: ${{ !cancelled() }}
+        run: cargo test -p harness-starter-coding
+
       - name: Doc tests
+        if: ${{ !cancelled() }}
         run: cargo test --workspace --doc
 
   # ── Release artifact builds (main only) ──────────────────────────
@@ -896,7 +962,9 @@ jobs:
           else
             FILES=$(git diff --name-only ${{ github.event.pull_request.base.sha }} HEAD 2>/dev/null || echo "")
           fi
-          if echo "$FILES" | grep -qE '(sandbox|ssrf|security|tools/mod|session_actor|profiles)'; then
+          # `session_scope` is the path-containment boundary behind
+          # `classify_canonical_path`; it is NOT covered by `session_actor`.
+          if echo "$FILES" | grep -qE '(sandbox|ssrf|security|tools/mod|session_actor|session_scope|profiles)'; then
             echo "run=true" >> "$GITHUB_OUTPUT"
           else
             echo "run=false" >> "$GITHUB_OUTPUT"

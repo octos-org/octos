@@ -722,6 +722,7 @@ pub mod peer_close;
 pub mod peer_gather;
 pub mod peer_handoff;
 pub mod peer_list;
+pub mod peer_respond;
 pub mod peer_send_input;
 pub mod read_file;
 pub mod read_task_output;
@@ -790,6 +791,9 @@ pub use peer_handoff::{
     PeerHandoffCallback, PeerHandoffRequest, PeerHandoffStaged, PeerHandoffTool,
 };
 pub use peer_list::{PeerListCallback, PeerListTool};
+pub use peer_respond::{
+    PeerRespondAnswer, PeerRespondCallback, PeerRespondRequest, PeerRespondTool,
+};
 pub use peer_send_input::{PeerSendInputCallback, PeerSendInputRequest, PeerSendInputTool};
 pub use read_file::ReadFileTool;
 pub use read_task_output::ReadTaskOutputTool;

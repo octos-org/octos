@@ -1,5 +1,12 @@
 use super::*;
 use async_trait::async_trait;
+
+/// Runaway guard for the "poll until the hook subprocess has appended its
+/// JSONL line" loop. NOT a latency assertion: the loop breaks on content the
+/// instant the line appears, so a generous ceiling costs a passing run
+/// nothing, and a broken run (hook never fires) still fails — just later.
+/// Mirrors `octos_agent`'s `spawn_tests::BACKGROUND_DEADLINE`.
+const HOOK_DEADLINE: Duration = Duration::from_secs(60);
 #[cfg(unix)]
 use octos_agent::{HookConfig, HookEvent};
 use octos_llm::{AdaptiveConfig, ChatConfig, ChatResponse, StopReason, TokenUsage, ToolSpec};
@@ -745,7 +752,11 @@ fn capture_hook(event: HookEvent, log_path: &std::path::Path) -> HookConfig {
             "sh".into(),
             log_path.to_string_lossy().into_owned(),
         ],
-        timeout_ms: 5000,
+        // Headroom only — neither hook test asserts that a hook times out, and
+        // on expiry `hooks.rs` kills the child, so the JSONL line never lands
+        // and the poll loop below cannot recover no matter how long it waits.
+        // This must stay in step with `HOOK_DEADLINE`.
+        timeout_ms: 60_000,
         tool_filter: vec![],
         path_filter: Vec::new(),
         requires_bin: None,
@@ -2659,6 +2670,45 @@ fn session_actor_continuation_prompt_matches_canonical_renderer() {
         .ok();
 }
 
+/// #1857 PR 4a — the SessionActor continuation renderer (a delegator to
+/// `agent_orchestrator::master_continuation_prompt`) must route a fleet-keeper
+/// wake to the fleet-keeper arm, not the generic external fallback. This is the
+/// gateway-path half of the "both renderers" guard (its orchestrator-path twin
+/// lives in `api::fleet_wake`); it also proves the objective is XML-escaped
+/// across the delegation.
+#[cfg(feature = "api")]
+#[test]
+fn session_actor_renders_fleet_keeper_prompt() {
+    use crate::api::fleet_wake::{FleetKeeperSnapshot, fleet_keeper_continuation_request};
+    use crate::api::master_continuation_scheduler::MasterContinuationScheduler;
+
+    let snap = FleetKeeperSnapshot {
+        objective: "keeper via <gateway>".to_owned(),
+        task_lines: "- t1: Task t1 [Ready]".to_owned(),
+        ready: "t1".to_owned(),
+    };
+    let controller = SessionKey::new("api", "keeper-actor");
+    let req =
+        fleet_keeper_continuation_request(&controller, "tenant-c", "fleet-actor", 7, &snap, None);
+    let mut scheduler = MasterContinuationScheduler::new();
+    let item = scheduler.enqueue(req).queued().expect("queued").clone();
+
+    // Render via the SessionActor path (the function under test).
+    let prompt = master_continuation_prompt(&item);
+    assert!(
+        prompt.starts_with("[system-internal]"),
+        "fleet-keeper prompt: {prompt}"
+    );
+    assert!(
+        prompt.contains("keeper via &lt;gateway&gt;"),
+        "objective must be XML-escaped across the delegation: {prompt}"
+    );
+    assert!(
+        !prompt.contains("An external master continuation was requested"),
+        "must not fall through to the generic external fallback: {prompt}"
+    );
+}
+
 #[tokio::test]
 #[cfg(unix)]
 async fn test_session_actor_emits_resume_and_turn_end_hooks() {
@@ -2907,7 +2957,7 @@ async fn test_forced_background_turn_emits_turn_end_hook() {
         }
 
         assert!(
-            started.elapsed() < Duration::from_secs(5),
+            started.elapsed() < HOOK_DEADLINE,
             "forced-background turn-end hook did not arrive in time"
         );
         tokio::time::sleep(Duration::from_millis(50)).await;

@@ -26,10 +26,67 @@ pub struct HybridIndex {
     vector_weight: f32,
     /// Weight for BM25 text relevance in hybrid scoring (0.0-1.0).
     bm25_weight: f32,
+    /// Vectors rejected because their width did not match [`Self::dimension`].
+    ///
+    /// Counted rather than logged per occurrence: the store's open path
+    /// re-inserts EVERY persisted episode, so after an embedding-model change a
+    /// per-episode warning meant one line per episode at boot. Thousands of
+    /// identical warnings are easier to miss than one, and log truncation can
+    /// eat the lot. [`Self::insert`] warns once, then counts.
+    dimension_mismatches: usize,
+    /// Whether the first mismatch has already been logged.
+    mismatch_logged: bool,
+}
+
+/// How much of the index is actually reachable by vector search.
+///
+/// The failure this exists to surface is invisible at query time: a vector
+/// whose width does not match the index is dropped and that episode silently
+/// falls back to BM25-only recall. Nothing about the search result says so — it
+/// is just quietly worse. This makes the state queryable so a health check can
+/// report it instead of leaving it to be inferred from log archaeology.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VectorCoverage {
+    /// Documents in the index (including BM25-only ones).
+    pub total: usize,
+    /// Documents that made it into the HNSW vector index.
+    pub vectorized: usize,
+    /// Vectors rejected for a width mismatch since this index was built.
+    pub dimension_mismatches: usize,
+    /// The width this index accepts.
+    pub dimension: usize,
+}
+
+impl VectorCoverage {
+    /// Documents searchable by BM25 only.
+    pub fn bm25_only(&self) -> usize {
+        self.total.saturating_sub(self.vectorized)
+    }
+
+    /// Fraction of documents reachable by vector search, `0.0..=1.0`.
+    /// An empty index reports `1.0` — nothing is missing.
+    pub fn ratio(&self) -> f64 {
+        if self.total == 0 {
+            return 1.0;
+        }
+        self.vectorized as f64 / self.total as f64
+    }
+
+    /// True when at least one vector was rejected for a width mismatch, i.e.
+    /// the configured embedding model disagrees with the index this store was
+    /// built at. Re-embedding is the only fix; the vectors cannot be converted.
+    pub fn has_dimension_mismatch(&self) -> bool {
+        self.dimension_mismatches > 0
+    }
 }
 
 const BM25_K1: f64 = 1.2;
 const BM25_B: f64 = 0.75;
+
+/// Switch [`HybridIndex::bm25_score`] to a dense score accumulator once a query
+/// walks at least `corpus_size / DENSE_ACCUM_DIVISOR` postings. Below that the
+/// dense buffer's O(n) clear costs more than the hashing it saves.
+const DENSE_ACCUM_DIVISOR: usize = 8;
 
 /// Default weight for vector similarity in hybrid scoring.
 const DEFAULT_VECTOR_WEIGHT: f32 = 0.7;
@@ -146,6 +203,8 @@ impl HybridIndex {
             dimension,
             vector_weight: DEFAULT_VECTOR_WEIGHT,
             bm25_weight: DEFAULT_BM25_WEIGHT,
+            dimension_mismatches: 0,
+            mismatch_logged: false,
         }
     }
 
@@ -164,6 +223,25 @@ impl HybridIndex {
     /// degrades to BM25-only insertion), the BM25 inverted index can
     /// outgrow the HNSW graph; callers MUST NOT assume the corpus
     /// size is capped at `HNSW_CAPACITY`.
+    /// Snapshot of how much of this index is reachable by vector search.
+    ///
+    /// `len()` counts DOCUMENTS; this counts how many of them actually carry a
+    /// vector, which is the number that degrades silently when the embedding
+    /// model and the index disagree.
+    pub fn vector_coverage(&self) -> VectorCoverage {
+        VectorCoverage {
+            total: self.ids.iter().filter(|id| !id.is_empty()).count(),
+            vectorized: self
+                .has_embedding
+                .iter()
+                .zip(&self.ids)
+                .filter(|(has, id)| **has && !id.is_empty())
+                .count(),
+            dimension_mismatches: self.dimension_mismatches,
+            dimension: self.dimension,
+        }
+    }
+
     pub fn len(&self) -> usize {
         self.ids.len()
     }
@@ -236,11 +314,21 @@ impl HybridIndex {
         }
 
         // Insert embedding into HNSW if provided, dimension matches, and not at capacity
-        if let Some(e) = embedding {
-            if e.len() != self.dimension {
+        if let Some(e) = embedding
+            && e.len() != self.dimension
+        {
+            // Warn on the FIRST mismatch only, then count. The store's open
+            // path re-inserts every persisted episode, so warning per
+            // occurrence produced one line per episode after a model change.
+            // `vector_coverage()` reports the total; the store logs a summary
+            // once its rebuild finishes.
+            self.dimension_mismatches += 1;
+            if !self.mismatch_logged {
+                self.mismatch_logged = true;
                 tracing::warn!(
                     "embedding dimension mismatch for {episode_id}: got {}, index expects {} — \
-                     vector dropped, episode indexed BM25-only (check embedding model vs index dimension)",
+                     vector dropped, episode indexed BM25-only (check embedding model vs index \
+                     dimension). Further mismatches are counted, not logged; see vector_coverage()",
                     e.len(),
                     self.dimension
                 );
@@ -546,40 +634,97 @@ impl HybridIndex {
 
     /// Compute BM25 scores for a query, returning top candidates.
     fn bm25_score(&self, query: &str, limit: usize) -> HashMap<usize, f32> {
+        if limit == 0 {
+            return HashMap::new();
+        }
         let query_tokens = tokenize(query);
         let n = self.ids.len() as f64;
-        let mut scores: HashMap<usize, f64> = HashMap::new();
 
-        for token in &query_tokens {
-            if let Some(postings) = self.inverted.get(token.as_str()) {
-                let df = postings.len() as f64;
-                let idf = ((n - df + 0.5) / (df + 0.5) + 1.0).ln();
+        // How many postings this query will walk. Drives both the accumulator
+        // strategy below and its pre-sizing.
+        let matched_postings: usize = query_tokens
+            .iter()
+            .filter_map(|t| self.inverted.get(t.as_str()))
+            .map(Vec::len)
+            .sum();
+        let n_docs = self.doc_lengths.len();
 
-                for &(doc_idx, raw_tf) in postings {
-                    let dl = self.doc_lengths[doc_idx] as f64;
-                    let tf_d = raw_tf as f64;
-                    let numerator = tf_d * (BM25_K1 + 1.0);
-                    let denominator = tf_d + BM25_K1 * (1.0 - BM25_B + BM25_B * dl / self.avg_dl);
-                    *scores.entry(doc_idx).or_default() += idf * numerator / denominator;
+        // Per-posting BM25 term contribution. Always strictly positive: the idf
+        // log argument exceeds 1 for every df <= n, and tf >= 1. The dense path
+        // relies on that to detect first touch.
+        let contribution = |doc_idx: usize, raw_tf: u32, idf: f64| -> f64 {
+            let dl = self.doc_lengths[doc_idx] as f64;
+            let tf_d = raw_tf as f64;
+            let numerator = tf_d * (BM25_K1 + 1.0);
+            let denominator = tf_d + BM25_K1 * (1.0 - BM25_B + BM25_B * dl / self.avg_dl);
+            idf * numerator / denominator
+        };
+
+        // Choose the accumulator by how much of the corpus the query touches.
+        //
+        // Hashing every posting dominates once a query hits a large share of the
+        // corpus — which this tokenizer makes routine, since it strips no
+        // stopwords and so `the` carries df ~= n. A dense buffer removes hashing
+        // entirely at the cost of one O(n) clear. For a selective query that
+        // clear would be pure overhead (it can exceed the whole search), so
+        // sparse queries stay on the map.
+        let mut result: Vec<(usize, f64)> = if matched_postings >= n_docs / DENSE_ACCUM_DIVISOR {
+            let mut acc = vec![0.0f64; n_docs];
+            let mut touched: Vec<usize> = Vec::with_capacity(matched_postings.min(n_docs));
+            for token in &query_tokens {
+                if let Some(postings) = self.inverted.get(token.as_str()) {
+                    let df = postings.len() as f64;
+                    let idf = ((n - df + 0.5) / (df + 0.5) + 1.0).ln();
+                    for &(doc_idx, raw_tf) in postings {
+                        if acc[doc_idx] == 0.0 {
+                            touched.push(doc_idx);
+                        }
+                        acc[doc_idx] += contribution(doc_idx, raw_tf, idf);
+                    }
                 }
             }
-        }
+            touched.into_iter().map(|idx| (idx, acc[idx])).collect()
+        } else {
+            let mut scores: HashMap<usize, f64> =
+                HashMap::with_capacity(matched_postings.min(n_docs));
+            for token in &query_tokens {
+                if let Some(postings) = self.inverted.get(token.as_str()) {
+                    let df = postings.len() as f64;
+                    let idf = ((n - df + 0.5) / (df + 0.5) + 1.0).ln();
+                    for &(doc_idx, raw_tf) in postings {
+                        *scores.entry(doc_idx).or_default() += contribution(doc_idx, raw_tf, idf);
+                    }
+                }
+            }
+            scores.into_iter().collect()
+        };
 
         // Normalize to [0, 1]. Use epsilon to avoid amplifying noise from near-zero scores.
-        let max_score = scores.values().copied().fold(0.0f64, f64::max);
+        let max_score = result.iter().map(|&(_, s)| s).fold(0.0f64, f64::max);
         if max_score < 1e-10 {
             return HashMap::new();
         }
 
-        let mut result: Vec<(usize, f64)> = scores.into_iter().collect();
-        result.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        result.truncate(limit);
+        // Partition the top `limit` in O(matches) instead of sorting every matched
+        // document. A single high-df term can match the whole corpus, which made
+        // the old full sort the dominant cost of a lexical query. The return type
+        // is a `HashMap`, so ordering within the retained set is not part of the
+        // contract — only *which* candidates survive — and no sort is needed.
+        if result.len() > limit {
+            result.select_nth_unstable_by(limit - 1, by_score_desc);
+            result.truncate(limit);
+        }
 
         result
             .into_iter()
             .map(|(idx, score)| (idx, (score / max_score) as f32))
             .collect()
     }
+}
+
+/// Descending order by BM25 score, with NaN treated as equal.
+fn by_score_desc(a: &(usize, f64), b: &(usize, f64)) -> std::cmp::Ordering {
+    b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
 }
 
 /// Tokenize text: lowercase, split on non-alphanumeric, filter tokens < 2 chars.
@@ -604,6 +749,91 @@ fn l2_normalize(v: &[f32]) -> Option<Vec<f32>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The counter must survive the exact scenario it exists for: a model
+    /// change, where the store re-inserts every persisted episode and each one
+    /// carries a now-wrong width.
+    #[test]
+    fn vector_coverage_counts_every_dimension_mismatch() {
+        let mut index = HybridIndex::new(4);
+        // Three good, two the wrong width (as if the model changed under us).
+        index.insert("ok1", "alpha beta", Some(&[1.0, 0.0, 0.0, 0.0]));
+        index.insert("bad1", "gamma delta", Some(&[1.0, 0.0]));
+        index.insert("ok2", "epsilon zeta", Some(&[0.0, 1.0, 0.0, 0.0]));
+        index.insert("bad2", "eta theta", Some(&[1.0, 0.0, 0.0, 0.0, 0.0, 0.0]));
+        index.insert("ok3", "iota kappa", Some(&[0.0, 0.0, 1.0, 0.0]));
+
+        let c = index.vector_coverage();
+        assert_eq!(c.total, 5);
+        assert_eq!(c.vectorized, 3, "only the correctly-sized vectors index");
+        assert_eq!(
+            c.dimension_mismatches, 2,
+            "both mismatches counted, not just the logged one"
+        );
+        assert_eq!(c.bm25_only(), 2);
+        assert_eq!(c.dimension, 4);
+        assert!(c.has_dimension_mismatch());
+        assert!((c.ratio() - 0.6).abs() < 1e-9);
+    }
+
+    /// A healthy index must not look degraded — the signal is useless if it
+    /// fires when nothing is wrong.
+    #[test]
+    fn vector_coverage_is_clean_when_dimensions_agree() {
+        let mut index = HybridIndex::new(2);
+        index.insert("a", "alpha", Some(&[1.0, 0.0]));
+        index.insert("b", "beta", Some(&[0.0, 1.0]));
+
+        let c = index.vector_coverage();
+        assert_eq!((c.total, c.vectorized, c.dimension_mismatches), (2, 2, 0));
+        assert!(!c.has_dimension_mismatch());
+        assert!((c.ratio() - 1.0).abs() < 1e-9);
+        assert_eq!(c.bm25_only(), 0);
+    }
+
+    /// An episode saved with no embedding at all is BM25-only but is NOT a
+    /// mismatch — conflating the two would make the health signal cry wolf on
+    /// every text-only episode.
+    #[test]
+    fn vector_coverage_separates_absent_vectors_from_mismatched_ones() {
+        let mut index = HybridIndex::new(2);
+        index.insert("has_vec", "alpha", Some(&[1.0, 0.0]));
+        index.insert("no_vec", "beta", None);
+
+        let c = index.vector_coverage();
+        assert_eq!(c.total, 2);
+        assert_eq!(c.vectorized, 1);
+        assert_eq!(
+            c.bm25_only(),
+            1,
+            "the vector-less episode still counts as BM25-only"
+        );
+        assert_eq!(c.dimension_mismatches, 0, "absent != mismatched");
+        assert!(!c.has_dimension_mismatch());
+    }
+
+    /// Empty index reports full coverage rather than 0/0 = NaN.
+    #[test]
+    fn vector_coverage_ratio_is_one_when_empty() {
+        let c = HybridIndex::new(4).vector_coverage();
+        assert_eq!((c.total, c.vectorized), (0, 0));
+        assert!((c.ratio() - 1.0).abs() < 1e-9);
+        assert!(c.ratio().is_finite());
+    }
+
+    /// Tombstoned entries must leave both sides of the ratio, or removing an
+    /// episode would make coverage look worse than it is.
+    #[test]
+    fn vector_coverage_excludes_removed_episodes() {
+        let mut index = HybridIndex::new(2);
+        index.insert("a", "alpha", Some(&[1.0, 0.0]));
+        index.insert("b", "beta", Some(&[0.0, 1.0]));
+        assert!(index.remove("a"));
+
+        let c = index.vector_coverage();
+        assert_eq!((c.total, c.vectorized), (1, 1));
+        assert!((c.ratio() - 1.0).abs() < 1e-9);
+    }
 
     #[test]
     fn test_tokenize() {
@@ -1158,5 +1388,140 @@ mod tests {
         index.insert("ep1", "some text", None);
         assert!(!index.add_embedding("ep1", &[1.0, 0.0, 0.0]));
         assert!(index.add_embedding("ep1", &[1.0, 0.0, 0.0, 0.0]));
+    }
+
+    /// Reference BM25: score every matching document with the same formula and
+    /// no selection shortcut, then take the top `limit` scores descending.
+    ///
+    /// `bm25_score` partitions instead of fully sorting, so this is the oracle
+    /// proving the partition still yields the *true* top-k.
+    fn reference_top_k(index: &HybridIndex, query: &str, limit: usize) -> Vec<f64> {
+        let n = index.ids.len() as f64;
+        let mut scores: std::collections::BTreeMap<usize, f64> = Default::default();
+        for token in tokenize(query) {
+            if let Some(postings) = index.inverted.get(token.as_str()) {
+                let df = postings.len() as f64;
+                let idf = ((n - df + 0.5) / (df + 0.5) + 1.0).ln();
+                for &(doc_idx, raw_tf) in postings {
+                    let dl = index.doc_lengths[doc_idx] as f64;
+                    let tf_d = raw_tf as f64;
+                    let numerator = tf_d * (BM25_K1 + 1.0);
+                    let denominator = tf_d + BM25_K1 * (1.0 - BM25_B + BM25_B * dl / index.avg_dl);
+                    *scores.entry(doc_idx).or_default() += idf * numerator / denominator;
+                }
+            }
+        }
+        let mut all: Vec<f64> = scores.into_values().collect();
+        all.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+        all.truncate(limit);
+        all
+    }
+
+    /// 400 docs all sharing one term, with varied repetition and length so the
+    /// BM25 scores spread out — a single-term query therefore matches the whole
+    /// corpus and forces the top-k partition to do real work.
+    fn wide_index() -> HybridIndex {
+        let mut index = HybridIndex::new(4);
+        for i in 0..400usize {
+            let reps = (i % 7) + 1;
+            let filler = "common ".repeat(reps);
+            let pad = "pad ".repeat(i % 11);
+            index.insert(
+                &format!("d{i}"),
+                &format!("{filler}{pad}unique{i} topic{}", i % 13),
+                None,
+            );
+        }
+        index
+    }
+
+    #[test]
+    fn should_select_true_top_k_when_matches_exceed_limit() {
+        let index = wide_index();
+        let limit = 10;
+
+        let got = index.bm25_score("common", limit);
+        assert_eq!(got.len(), limit, "should return exactly `limit` candidates");
+
+        let want = reference_top_k(&index, "common", limit);
+        let max = want[0];
+        let mut got_scores: Vec<f64> = got.values().map(|&s| s as f64).collect();
+        got_scores.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+
+        for (i, (g, w)) in got_scores.iter().zip(want.iter()).enumerate() {
+            let want_norm = w / max;
+            assert!(
+                (g - want_norm).abs() < 1e-6,
+                "rank {i}: got {g}, want {want_norm}"
+            );
+        }
+    }
+
+    #[test]
+    fn should_select_true_top_k_when_query_has_multiple_terms() {
+        let index = wide_index();
+        let limit = 7;
+
+        let got = index.bm25_score("common pad topic3", limit);
+        let want = reference_top_k(&index, "common pad topic3", limit);
+        assert_eq!(got.len(), want.len());
+
+        let max = want[0];
+        let mut got_scores: Vec<f64> = got.values().map(|&s| s as f64).collect();
+        got_scores.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+        for (i, (g, w)) in got_scores.iter().zip(want.iter()).enumerate() {
+            assert!(
+                (g - w / max).abs() < 1e-6,
+                "rank {i}: got {g}, want {}",
+                w / max
+            );
+        }
+    }
+
+    #[test]
+    fn should_select_true_top_k_when_query_is_selective() {
+        // `wide_index`'s common-term queries walk enough postings to take the
+        // dense accumulator; two df=1 terms keep this one on the sparse hash-map
+        // path, so both branches are checked against the same oracle.
+        let index = wide_index();
+        let query = "unique7 unique19";
+        let limit = 10;
+
+        let got = index.bm25_score(query, limit);
+        let want = reference_top_k(&index, query, limit);
+        assert_eq!(got.len(), want.len(), "sparse path returned wrong count");
+        assert_eq!(got.len(), 2, "only two documents carry these terms");
+
+        let max = want[0];
+        let mut got_scores: Vec<f64> = got.values().map(|&s| s as f64).collect();
+        got_scores.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+        for (i, (g, w)) in got_scores.iter().zip(want.iter()).enumerate() {
+            assert!(
+                (g - w / max).abs() < 1e-6,
+                "rank {i}: got {g}, want {}",
+                w / max
+            );
+        }
+    }
+
+    #[test]
+    fn should_rank_descending_and_respect_limit_when_searching() {
+        let index = wide_index();
+        let results = index.search("common", None, 5);
+        assert_eq!(results.len(), 5);
+        for pair in results.windows(2) {
+            assert!(
+                pair[0].1 >= pair[1].1,
+                "results must be descending: {:?} then {:?}",
+                pair[0],
+                pair[1]
+            );
+        }
+    }
+
+    #[test]
+    fn should_return_empty_when_limit_is_zero() {
+        let index = wide_index();
+        assert!(index.bm25_score("common", 0).is_empty());
     }
 }

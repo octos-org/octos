@@ -2,6 +2,19 @@ use super::*;
 #[cfg(unix)]
 use crate::{HookConfig, HookEvent};
 
+/// Runaway guard for the "poll until the background task reaches state X"
+/// loops below. It is NOT a latency assertion: on a passing run the loop
+/// returns as soon as the state arrives, so a generous ceiling costs nothing,
+/// and on a genuinely broken run the test still fails — just later.
+///
+/// It used to be 5s, which sits under the noise floor of a loaded CI runner:
+/// `test_background_spawn_fails_when_contract_owned_workflow_is_not_ready`
+/// failed with "did not fail in time" on ubuntu-latest in run 30387949499
+/// while the only change under test was one line of `.github/workflows/ci.yml`.
+/// These loops spawn real subprocesses, so their wall-clock cost tracks host
+/// load rather than anything the test controls.
+const BACKGROUND_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
+
 #[test]
 fn frame_subagent_task_leads_with_identity_and_directive() {
     let out = frame_subagent_task("review-octos-web", "Clone and review the repo.");
@@ -168,10 +181,10 @@ async fn background_deliverable_auto_materializes_inline_final_output() {
                 panic!("spawn failed: {:?}", t.error);
             }
         }
-        if started.elapsed() >= std::time::Duration::from_secs(15) {
+        if started.elapsed() >= BACKGROUND_DEADLINE {
             let tasks = supervisor.get_tasks_for_session("api:test-session");
             panic!(
-                "did not complete in 15s; tasks = {:?}",
+                "did not complete in {BACKGROUND_DEADLINE:?}; tasks = {:?}",
                 tasks
                     .iter()
                     .map(|t| (t.status.as_str(), t.error.clone()))
@@ -490,7 +503,7 @@ async fn test_background_spawn_tracks_supervisor_lifecycle() {
             }
         }
         assert!(
-            started.elapsed() < std::time::Duration::from_secs(5),
+            started.elapsed() < BACKGROUND_DEADLINE,
             "background spawn task did not complete in time"
         );
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -640,7 +653,7 @@ async fn test_background_spawn_uses_contract_selected_slides_artifact_for_persis
             }
         }
         assert!(
-            started.elapsed() < std::time::Duration::from_secs(5),
+            started.elapsed() < BACKGROUND_DEADLINE,
             "background spawn task did not complete in time"
         );
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -758,7 +771,7 @@ async fn test_background_spawn_fails_when_contract_owned_workflow_is_not_ready()
             }
         }
         assert!(
-            started.elapsed() < std::time::Duration::from_secs(5),
+            started.elapsed() < BACKGROUND_DEADLINE,
             "background spawn task did not fail in time"
         );
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -839,7 +852,7 @@ async fn test_background_spawn_emits_failure_hook_for_contract_failure() {
             }
         }
         assert!(
-            started.elapsed() < std::time::Duration::from_secs(5),
+            started.elapsed() < BACKGROUND_DEADLINE,
             "background spawn failure hook did not arrive in time"
         );
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -1248,8 +1261,10 @@ fn write_mock_podcast_plugin(root: &std::path::Path, script_seen: &std::path::Pa
 }"#,
     )
     .unwrap();
-    let main = plugin_dir.join("main");
-    std::fs::write(
+    #[cfg(unix)]
+    {
+        let main = plugin_dir.join("main");
+        std::fs::write(
             &main,
             format!(
                 r#"#!/usr/bin/env bash
@@ -1278,10 +1293,50 @@ PY
             ),
         )
         .unwrap();
-    #[cfg(unix)]
-    {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&main, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    // On Windows the plugin resolver tries the bare names
+    // [manifest_name, dir_name, "main"] (no extension) and `is_executable` is
+    // just `path.exists()`, so a bare `main` would be selected and
+    // `Command::new(main)` would fail (CreateProcess can't run a shebang
+    // script). We therefore write NO bare `main`: `main.cmd` is picked by the
+    // resolver's directory-scan fallback and is run via cmd.exe by
+    // `std::process::Command` (Rust >= 1.77.2). The logic lives in the dotfile
+    // `.impl.ps1`, which the scan excludes (dotfiles are skipped), so
+    // `main.cmd` stays the only selectable executable. Windows PowerShell 5.1
+    // (`powershell.exe`) ships on windows-latest.
+    #[cfg(windows)]
+    {
+        const PS_IMPL: &str = r##"$ErrorActionPreference = 'Stop'
+# Read ALL of stdin as raw bytes and decode UTF-8 explicitly. Do NOT use
+# $input / [Console]::In: they apply the console OEM codepage and mojibake the
+# CJK script text the test asserts on.
+$in = [System.Console]::OpenStandardInput()
+$ms = New-Object System.IO.MemoryStream
+$in.CopyTo($ms)
+$raw = [System.Text.Encoding]::UTF8.GetString($ms.ToArray())
+$script = $raw
+try { $p = $raw | ConvertFrom-Json; if ($null -ne $p.script) { $script = [string]$p.script } } catch { }
+[System.IO.File]::WriteAllText('@@SCRIPT_SEEN@@', $script, (New-Object System.Text.UTF8Encoding($false)))
+$base = $env:OCTOS_WORK_DIR
+if ([string]::IsNullOrEmpty($base)) { $base = (Get-Location).Path }
+$dir = Join-Path (Join-Path $base 'skill-output') 'mofa-podcast'
+New-Item -ItemType Directory -Force -Path $dir > $null
+$mp3 = Join-Path $dir 'podcast_full_test.mp3'
+[System.IO.File]::WriteAllBytes($mp3, (New-Object 'byte[]' 8192))
+# Hand-build the JSON so files_to_send is ALWAYS an array (PS 5.1
+# ConvertTo-Json collapses single-element arrays) and the path is escaped.
+$e = $mp3.Replace('\','\\').Replace('"','\"')
+[System.Console]::Out.Write('{"output":"Podcast generated successfully: ' + $e + '","success":true,"files_to_send":["' + $e + '"]}')
+"##;
+        let ps_impl = PS_IMPL.replace("@@SCRIPT_SEEN@@", &script_seen.display().to_string());
+        std::fs::write(plugin_dir.join(".impl.ps1"), ps_impl).unwrap();
+        std::fs::write(
+            plugin_dir.join("main.cmd"),
+            "@echo off\r\npowershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"%~dp0.impl.ps1\"\r\n",
+        )
+        .unwrap();
     }
     plugin_root
 }
@@ -1658,7 +1713,7 @@ async fn test_background_spawn_persists_workflow_phase_transitions() {
             }
         }
         assert!(
-            started.elapsed() < std::time::Duration::from_secs(5),
+            started.elapsed() < BACKGROUND_DEADLINE,
             "background spawn task did not complete in time"
         );
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -1821,7 +1876,7 @@ async fn test_background_spawn_emits_child_session_lifecycle_events() {
         }
 
         assert!(
-            started.elapsed() < std::time::Duration::from_secs(5),
+            started.elapsed() < BACKGROUND_DEADLINE,
             "child-session lifecycle events did not arrive in time"
         );
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -1899,7 +1954,7 @@ async fn test_background_spawn_emits_verify_and_complete_hooks() {
         }
 
         assert!(
-            started.elapsed() < std::time::Duration::from_secs(5),
+            started.elapsed() < BACKGROUND_DEADLINE,
             "spawn lifecycle hooks did not arrive in time"
         );
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -2157,7 +2212,7 @@ async fn background_child_transcript_streams_to_router_and_final_output_is_recor
             }
         }
         assert!(
-            started.elapsed() < std::time::Duration::from_secs(5),
+            started.elapsed() < BACKGROUND_DEADLINE,
             "background child did not complete in time"
         );
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -2259,7 +2314,7 @@ async fn child_stream_callback_gets_start_offsets_and_router_file_has_no_duplica
             }
         }
         assert!(
-            started.elapsed() < std::time::Duration::from_secs(5),
+            started.elapsed() < BACKGROUND_DEADLINE,
             "background child did not complete in time"
         );
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -2447,7 +2502,7 @@ async fn background_deliverable_surfaces_shell_written_file_in_output_files() {
             }
         }
         assert!(
-            started.elapsed() < std::time::Duration::from_secs(5),
+            started.elapsed() < BACKGROUND_DEADLINE,
             "background deliverable spawn did not complete in time"
         );
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -2517,7 +2572,7 @@ async fn background_deliverable_uses_configured_root_without_touching_workspace_
             }
         }
         assert!(
-            started.elapsed() < std::time::Duration::from_secs(5),
+            started.elapsed() < BACKGROUND_DEADLINE,
             "background deliverable spawn did not complete in time"
         );
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -2649,7 +2704,7 @@ async fn background_without_deliverable_does_not_surface_shell_write() {
             }
         }
         assert!(
-            started.elapsed() < std::time::Duration::from_secs(5),
+            started.elapsed() < BACKGROUND_DEADLINE,
             "background spawn did not complete in time"
         );
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
