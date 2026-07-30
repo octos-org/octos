@@ -1013,6 +1013,12 @@ impl ProfileRuntime {
             // (above) folds in the fleet plan view + self-detects completion.
             tools.register(crate::goal_tool::GoalPlanTool::new(profile.id.clone()));
             tools.register(crate::goal_tool::GoalDispatchTool::new(profile.id.clone()));
+            // PR B — the keeper's escalation controls: approve a worker's
+            // mid-task grant-widen request (`goal_grant`, resumes the task) or
+            // refuse it (`goal_deny`, fails the task). A Blocked task surfaced by
+            // goal_get needs exactly one of these.
+            tools.register(crate::goal_tool::GoalGrantTool::new(profile.id.clone()));
+            tools.register(crate::goal_tool::GoalDenyTool::new(profile.id.clone()));
         }
 
         // Step 17: re-apply tool policy AFTER plugin / memory-bank

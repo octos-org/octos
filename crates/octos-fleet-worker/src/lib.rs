@@ -43,6 +43,7 @@
 #![deny(unsafe_code)]
 
 mod closed_registry;
+mod escalate;
 mod pool;
 mod worker;
 
@@ -62,6 +63,7 @@ use octos_llm::LlmProvider;
 use octos_memory::EpisodeStore;
 
 pub use closed_registry::{ALLOWED, build_fleet_worker_registry};
+pub use escalate::{EscalateTool, EscalationSlot};
 pub use pool::{Dispatched, FleetWorkerPool, PoolConfig};
 pub use worker::{AttemptOutcome, run_attempt};
 
@@ -166,14 +168,20 @@ impl AgentFactory {
     ///
     /// Returns `Err` for an incoherent grant (unknown tool / web tool without a
     /// network grant) — validated at parse too, so this is defense-in-depth.
+    ///
+    /// `escalation` is the shared slot the always-on `escalate` valve writes
+    /// into; the agent path threads the attempt's real slot (which
+    /// [`run_attempt`] reads after the turn), while the acceptance-validator
+    /// path passes a throwaway (validators never call tools).
     pub fn build_registry_with(
         &self,
         cwd: &Path,
         sandbox: Arc<dyn Sandbox>,
         max_shell_timeout_secs: u64,
         grant: &WorkerGrant,
+        escalation: EscalationSlot,
     ) -> Result<ToolRegistry> {
-        build_fleet_worker_registry(cwd, sandbox, max_shell_timeout_secs, grant)
+        build_fleet_worker_registry(cwd, sandbox, max_shell_timeout_secs, grant, escalation)
     }
 
     /// The [`AgentConfig`] for an attempt bounded by `deadline`. The per-tool
@@ -207,12 +215,13 @@ impl AgentFactory {
         sandbox: Arc<dyn Sandbox>,
         deadline: Duration,
         grant: &WorkerGrant,
+        escalation: EscalationSlot,
     ) -> Result<Agent> {
         let deadline_secs = deadline.as_secs().max(1);
         Ok(Agent::new(
             AgentId::new("fleet-worker"),
             self.llm.clone(),
-            self.build_registry_with(cwd, sandbox, deadline_secs, grant)?,
+            self.build_registry_with(cwd, sandbox, deadline_secs, grant, escalation)?,
             self.memory.clone(),
         )
         .with_config(self.agent_config(deadline)))
@@ -273,6 +282,7 @@ mod tests {
                 sb.clone(),
                 30,
                 &WorkerGrant::minimal(),
+                Arc::new(std::sync::Mutex::new(None)),
             )
             .unwrap();
         assert_eq!(
