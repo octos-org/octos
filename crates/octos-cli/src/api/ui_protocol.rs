@@ -869,6 +869,7 @@ struct SessionWorkspaceStore {
     entries: std::sync::Mutex<HashMap<SessionKey, SessionWorkspaceBinding>>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct SessionWorkspaceBinding {
     /// Effective workspace used by tools, panes, goals, and the UI.
     root: PathBuf,
@@ -898,19 +899,23 @@ impl SessionWorkspaceStore {
     }
 
     fn get(&self, session_id: &SessionKey) -> Option<PathBuf> {
+        self.snapshot(session_id).map(|binding| binding.root)
+    }
+
+    /// Clone the complete binding under one mutex acquisition. Consumers that
+    /// need both root and provenance must use this snapshot so a concurrent
+    /// `session/open` cannot pair one binding's root with another's hint.
+    fn snapshot(&self, session_id: &SessionKey) -> Option<SessionWorkspaceBinding> {
         self.entries
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .get(session_id)
-            .map(|binding| binding.root.clone())
+            .cloned()
     }
 
     fn runtime_hint(&self, session_id: &SessionKey) -> Option<PathBuf> {
-        self.entries
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .get(session_id)
-            .and_then(|binding| binding.runtime_hint.clone())
+        self.snapshot(session_id)
+            .and_then(|binding| binding.runtime_hint)
     }
 
     /// Insert `root` under `session_id` ONLY when no entry exists yet, holding
@@ -921,7 +926,12 @@ impl SessionWorkspaceStore {
     /// `session/open` `set` (the authoritative live-client cwd) could race
     /// between, letting a headless seed clobber the real workspace. `set_if_absent`
     /// collapses that to one atomic step so the seed can only ever fill a gap.
-    fn set_if_absent(&self, session_id: SessionKey, root: PathBuf) -> bool {
+    fn set_if_absent(
+        &self,
+        session_id: SessionKey,
+        root: PathBuf,
+        runtime_hint: Option<PathBuf>,
+    ) -> bool {
         use std::collections::hash_map::Entry;
         match self
             .entries
@@ -931,10 +941,7 @@ impl SessionWorkspaceStore {
         {
             Entry::Occupied(_) => false,
             Entry::Vacant(slot) => {
-                slot.insert(SessionWorkspaceBinding {
-                    root: root.clone(),
-                    runtime_hint: Some(root),
-                });
+                slot.insert(SessionWorkspaceBinding { root, runtime_hint });
                 true
             }
         }
@@ -949,9 +956,12 @@ impl SessionWorkspaceStore {
 /// For each seed the workspace root AND the cwd scope come from the SAME pending
 /// continuation ([`InProcessAgentOrchestrator::pending_fleet_keeper_seeds`] pairs
 /// and validates them), so:
-/// - `set_if_absent(wire, root)` clears Gate A (workspace-known). The seed key is
-///   the `wire_key_from_goal_key` strip — byte-identical to the gate probe (THE
-///   landmine); a mismatch would strand the keeper silently.
+/// - `set_if_absent(wire, root, runtime_hint)` clears Gate A (workspace-known)
+///   while restoring transcript-relocation provenance. Only an explicit
+///   `workspace_has_runtime_hint=true` reconstructs a hint; derived and legacy
+///   roots remain tool/UI workspaces without moving transcript storage. The
+///   seed key is the `wire_key_from_goal_key` strip — byte-identical to the gate
+///   probe (THE landmine); a mismatch would strand the keeper silently.
 /// - `set_goal_scope_if_absent(wire, scope)` (only for a scoped key) clears Gate
 ///   D (`goal_target_is_dispatchable`, which for a cwd-scoped target requires
 ///   `goal_scopes[wire] == scope` — empty after a headless restart, so a scoped
@@ -999,12 +1009,18 @@ fn reseed_fleet_keeper_candidates(
                 if workspaces.get(&seed.wire).is_none()
                     && orchestrator.goal_scope(&seed.wire).is_none()
                 {
-                    workspaces.set_if_absent(seed.wire.clone(), PathBuf::from(&seed.root));
+                    let root = PathBuf::from(&seed.root);
+                    let runtime_hint =
+                        (seed.workspace_has_runtime_hint == Some(true)).then(|| root.clone());
+                    workspaces.set_if_absent(seed.wire.clone(), root, runtime_hint);
                     orchestrator.set_goal_scope_if_absent(&seed.wire, &scope);
                 }
             }
             None => {
-                workspaces.set_if_absent(seed.wire, PathBuf::from(&seed.root));
+                let root = PathBuf::from(&seed.root);
+                let runtime_hint =
+                    (seed.workspace_has_runtime_hint == Some(true)).then(|| root.clone());
+                workspaces.set_if_absent(seed.wire, root, runtime_hint);
             }
         }
     }
@@ -1015,7 +1031,7 @@ mod fleet_keeper_reseed_tests {
     use super::*;
     use crate::api::agent_orchestrator::{
         FLEET_KEEPER_EXTERNAL_KIND, FLEET_KEEPER_GROUP, FLEET_KEEPER_META_FLEET_ID,
-        FLEET_KEEPER_META_WORKSPACE_ROOT,
+        FLEET_KEEPER_META_WORKSPACE_HAS_RUNTIME_HINT, FLEET_KEEPER_META_WORKSPACE_ROOT,
     };
     use crate::api::master_continuation_scheduler::MasterContinuationRequest;
 
@@ -1029,11 +1045,19 @@ mod fleet_keeper_reseed_tests {
         let store = SessionWorkspaceStore::default();
         let key = SessionKey("prof:api:chat#s".to_owned());
         assert!(
-            store.set_if_absent(key.clone(), PathBuf::from("/first")),
+            store.set_if_absent(
+                key.clone(),
+                PathBuf::from("/first"),
+                Some(PathBuf::from("/first")),
+            ),
             "first insert into a vacant slot returns true"
         );
         assert!(
-            !store.set_if_absent(key.clone(), PathBuf::from("/second")),
+            !store.set_if_absent(
+                key.clone(),
+                PathBuf::from("/second"),
+                Some(PathBuf::from("/second")),
+            ),
             "a second insert finds an established entry and returns false"
         );
         assert_eq!(
@@ -1045,6 +1069,97 @@ mod fleet_keeper_reseed_tests {
             store.runtime_hint(&key),
             Some(PathBuf::from("/first")),
             "a recovered fleet workspace remains an authoritative runtime hint"
+        );
+    }
+
+    #[test]
+    fn should_preserve_derived_workspace_provenance_when_reseeding_after_restart() {
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let workspaces = SessionWorkspaceStore::default();
+        let root = tempfile::tempdir().expect("tempdir");
+        let root_str = root.path().to_str().expect("utf8 root").to_owned();
+        let wire = SessionKey("prof:api:chat#derived".to_owned());
+        let request = MasterContinuationRequest::new(
+            FLEET_KEEPER_GROUP,
+            wire.0.clone(),
+            "prof",
+            MasterContinuationReason::External(FLEET_KEEPER_EXTERNAL_KIND.to_owned()),
+            std::time::SystemTime::now(),
+        )
+        .with_metadata(FLEET_KEEPER_META_FLEET_ID, "f-derived")
+        .with_metadata(FLEET_KEEPER_META_WORKSPACE_ROOT, root_str)
+        .with_metadata(FLEET_KEEPER_META_WORKSPACE_HAS_RUNTIME_HINT, "false");
+        orchestrator.enqueue_continuation_for_test(request);
+
+        let seeds = orchestrator.pending_fleet_keeper_seeds();
+        assert_eq!(seeds[0].workspace_has_runtime_hint, Some(false));
+        reseed_fleet_keeper_candidates(&workspaces, &orchestrator, seeds);
+
+        let binding = workspaces.snapshot(&wire).expect("reseeded binding");
+        assert_eq!(binding.root, root.path());
+        assert_eq!(
+            binding.runtime_hint, None,
+            "a persisted Tier-3 workspace must remain a non-relocating binding"
+        );
+    }
+
+    #[test]
+    fn should_preserve_explicit_cwd_provenance_when_reseeding_after_restart() {
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let workspaces = SessionWorkspaceStore::default();
+        let root = tempfile::tempdir().expect("tempdir");
+        let root_str = root.path().to_str().expect("utf8 root").to_owned();
+        let wire = SessionKey("prof:api:chat#explicit".to_owned());
+        let request = MasterContinuationRequest::new(
+            FLEET_KEEPER_GROUP,
+            wire.0.clone(),
+            "prof",
+            MasterContinuationReason::External(FLEET_KEEPER_EXTERNAL_KIND.to_owned()),
+            std::time::SystemTime::now(),
+        )
+        .with_metadata(FLEET_KEEPER_META_FLEET_ID, "f-explicit")
+        .with_metadata(FLEET_KEEPER_META_WORKSPACE_ROOT, root_str)
+        .with_metadata(FLEET_KEEPER_META_WORKSPACE_HAS_RUNTIME_HINT, "true");
+        orchestrator.enqueue_continuation_for_test(request);
+
+        let seeds = orchestrator.pending_fleet_keeper_seeds();
+        assert_eq!(seeds[0].workspace_has_runtime_hint, Some(true));
+        reseed_fleet_keeper_candidates(&workspaces, &orchestrator, seeds);
+
+        let binding = workspaces.snapshot(&wire).expect("reseeded binding");
+        assert_eq!(binding.root, root.path());
+        assert_eq!(binding.runtime_hint.as_deref(), Some(root.path()));
+    }
+
+    #[test]
+    fn should_not_relocate_transcripts_when_legacy_seed_has_unknown_provenance() {
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let workspaces = SessionWorkspaceStore::default();
+        let root = tempfile::tempdir().expect("tempdir");
+        let root_str = root.path().to_str().expect("utf8 root").to_owned();
+        let wire = SessionKey("prof:api:chat#legacy".to_owned());
+        let request = MasterContinuationRequest::new(
+            FLEET_KEEPER_GROUP,
+            wire.0.clone(),
+            "prof",
+            MasterContinuationReason::External(FLEET_KEEPER_EXTERNAL_KIND.to_owned()),
+            std::time::SystemTime::now(),
+        )
+        .with_metadata(FLEET_KEEPER_META_FLEET_ID, "f-legacy")
+        .with_metadata(FLEET_KEEPER_META_WORKSPACE_ROOT, root_str);
+        orchestrator.enqueue_continuation_for_test(request);
+
+        let seeds = orchestrator.pending_fleet_keeper_seeds();
+        assert_eq!(seeds[0].workspace_has_runtime_hint, None);
+        reseed_fleet_keeper_candidates(&workspaces, &orchestrator, seeds);
+
+        assert_eq!(
+            workspaces
+                .snapshot(&wire)
+                .expect("reseeded legacy binding")
+                .runtime_hint,
+            None,
+            "unknown legacy provenance must fail safe instead of becoming a cwd hint"
         );
     }
 
@@ -1210,6 +1325,7 @@ mod fleet_keeper_reseed_tests {
                 wire: wire.clone(),
                 scope: Some("seed-a".to_owned()),
                 root: seed_root_str,
+                workspace_has_runtime_hint: None,
             }],
         );
 
@@ -1251,6 +1367,7 @@ mod fleet_keeper_reseed_tests {
                 wire: wire.clone(),
                 scope: Some("aaaa".to_owned()),
                 root: seed_root_str,
+                workspace_has_runtime_hint: None,
             }],
         );
 
@@ -1288,6 +1405,7 @@ mod fleet_keeper_reseed_tests {
                 wire: wire.clone(),
                 scope: None,
                 root: root.path().to_str().expect("utf8").to_owned(),
+                workspace_has_runtime_hint: None,
             }],
         );
 
@@ -27029,8 +27147,10 @@ async fn run_standalone_turn(
     // workspace root for tools/goals/UI, but only a Tier-1 client cwd or Tier-2
     // operator default is a runtime hint that may relocate transcript storage.
     // A derived Tier-3 workspace therefore yields `hint == None`.
-    let workspace_root = session_workspaces().get(&session_id);
-    let hint = session_workspaces().runtime_hint(&session_id);
+    let workspace_binding = session_workspaces().snapshot(&session_id);
+    let hint = workspace_binding
+        .as_ref()
+        .and_then(|binding| binding.runtime_hint.clone());
     // #1857 PR 5a — THE LOAD-BEARING SEAM: on a goal turn, stash the resolved
     // controller workspace root on the goal record (keyed by the SCOPED
     // `goal_session_key`) BEFORE the keeper's `goal_plan` can run mid-turn. It
@@ -27041,11 +27161,14 @@ async fn run_standalone_turn(
     // pre-fleet `GoalContinue` with no established binding still passes `None`,
     // which leaves any previously captured root intact.
     if let Some(goal_ctx) = goal_context.as_ref() {
-        default_agent_orchestrator().set_goal_workspace_root(
+        default_agent_orchestrator().set_goal_workspace_binding(
             &goal_ctx.goal_session_key,
-            workspace_root
-                .as_ref()
-                .map(|path| path.to_string_lossy().into_owned()),
+            workspace_binding.as_ref().map(|binding| {
+                (
+                    binding.root.to_string_lossy().into_owned(),
+                    binding.runtime_hint.is_some(),
+                )
+            }),
         );
     }
     let permissions_epoch = state.session_cache.session_generation(&session_id);

@@ -24096,6 +24096,81 @@ async fn appui_explicit_cwd_remains_a_transcript_store_hint() {
     );
 }
 
+#[tokio::test]
+async fn should_keep_profile_transcript_store_with_fresh_cache_after_no_cwd_reseed() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let profile_id = "restart-no-cwd";
+    let (_state, profile_runtime) = state_with_profile(temp.path(), profile_id).await;
+    let workspace = temp.path().join("derived-workspace");
+    std::fs::create_dir_all(&workspace).expect("create derived workspace");
+    let workspace = std::fs::canonicalize(workspace).expect("canonicalize workspace");
+    let wire = SessionKey::with_profile(profile_id, "api", "restart-derived");
+    let workspaces = SessionWorkspaceStore::default();
+    let orchestrator = InProcessAgentOrchestrator::default();
+
+    reseed_fleet_keeper_candidates(
+        &workspaces,
+        &orchestrator,
+        vec![FleetKeeperSeed {
+            wire: wire.clone(),
+            scope: None,
+            root: workspace.to_string_lossy().into_owned(),
+            workspace_has_runtime_hint: Some(false),
+        }],
+    );
+    let binding = workspaces.snapshot(&wire).expect("reseeded binding");
+    let fresh_cache =
+        crate::runtime::SessionRuntimeCache::new(8, std::time::Duration::from_secs(60))
+            .with_sessions_in_cwd(true);
+    let runtime = fresh_cache
+        .get_or_init(&profile_runtime, wire, binding.runtime_hint)
+        .await
+        .expect("fresh runtime");
+
+    assert_eq!(
+        runtime.sessions_root, profile_runtime.data_dir,
+        "a no-cwd keeper must remain in the profile-global transcript store after restart"
+    );
+}
+
+#[tokio::test]
+async fn should_keep_project_transcript_store_with_fresh_cache_after_explicit_cwd_reseed() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let profile_id = "restart-explicit-cwd";
+    let (_state, profile_runtime) = state_with_profile(temp.path(), profile_id).await;
+    let workspace = temp.path().join("explicit-workspace");
+    std::fs::create_dir_all(&workspace).expect("create explicit workspace");
+    let workspace = std::fs::canonicalize(workspace).expect("canonicalize workspace");
+    let wire = SessionKey::with_profile(profile_id, "api", "restart-explicit");
+    let workspaces = SessionWorkspaceStore::default();
+    let orchestrator = InProcessAgentOrchestrator::default();
+
+    reseed_fleet_keeper_candidates(
+        &workspaces,
+        &orchestrator,
+        vec![FleetKeeperSeed {
+            wire: wire.clone(),
+            scope: None,
+            root: workspace.to_string_lossy().into_owned(),
+            workspace_has_runtime_hint: Some(true),
+        }],
+    );
+    let binding = workspaces.snapshot(&wire).expect("reseeded binding");
+    let fresh_cache =
+        crate::runtime::SessionRuntimeCache::new(8, std::time::Duration::from_secs(60))
+            .with_sessions_in_cwd(true);
+    let runtime = fresh_cache
+        .get_or_init(&profile_runtime, wire, binding.runtime_hint)
+        .await
+        .expect("fresh runtime");
+
+    assert_eq!(
+        runtime.sessions_root,
+        crate::runtime::session::project_sessions_root(&workspace, profile_id),
+        "an explicit cwd keeper must remain in the project transcript store after restart"
+    );
+}
+
 #[test]
 fn review_join_preserves_explicit_final_marker() {
     let summary = ensure_requested_final_marker(
