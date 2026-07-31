@@ -19,9 +19,14 @@ const CWD_INDEX_TABLE: TableDefinition<&str, &str> = TableDefinition::new("cwd_i
 /// Table for episode embeddings: key = episode_id, value = bincode-serialized Vec<f32>
 const EMBEDDINGS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("embeddings");
 
-/// Default embedding dimension (OpenAI text-embedding-3-small). Public:
-/// embedder configuration pins non-1536 models to this value so their
-/// vectors are not dropped by the fixed-dimension episodic index.
+/// Default embedding dimension (OpenAI text-embedding-3-small), used when the
+/// caller opens the store without declaring a width.
+///
+/// Public because remote OpenAI-compatible providers whose native size differs
+/// (e.g. DashScope `text-embedding-v4` at 1024) can be pinned to this value via
+/// the `dimensions` request field. Providers that CANNOT reach it — notably
+/// in-process EmbeddingGemma at 768, since Matryoshka only truncates downward —
+/// must instead size the index itself via [`EpisodeStore::open_with_dimension`].
 pub const DEFAULT_DIMENSION: usize = 1536;
 
 /// Parse a cwd-index JSON array of episode IDs. On corrupt JSON, salvage any
@@ -125,7 +130,25 @@ impl EpisodeStore {
     /// when the canonical store is owned elsewhere), use
     /// [`Self::open_or_degraded`].
     pub async fn open(data_dir: impl AsRef<Path>) -> Result<Self> {
-        Self::open_inner(data_dir.as_ref(), false).await
+        Self::open_inner(data_dir.as_ref(), false, DEFAULT_DIMENSION).await
+    }
+
+    /// Like [`Self::open`] but sizes the vector index to `dimension` instead of
+    /// [`DEFAULT_DIMENSION`].
+    ///
+    /// The HNSW index is built at ONE fixed width and
+    /// [`HybridIndex::insert`] drops any vector that does not match it,
+    /// degrading that episode to BM25-only. So the index must be sized from the
+    /// embedding provider actually in use — 1536 for `text-embedding-3-small`,
+    /// but 768 for in-process EmbeddingGemma, which can never reach 1536
+    /// (Matryoshka only truncates downward). Callers that have an embedder
+    /// should pass `embedder.dimension()`.
+    ///
+    /// Changing the dimension invalidates previously persisted embeddings:
+    /// they stay in redb but are skipped on rebuild (with a warning) until
+    /// the episodes are re-embedded.
+    pub async fn open_with_dimension(data_dir: impl AsRef<Path>, dimension: usize) -> Result<Self> {
+        Self::open_inner(data_dir.as_ref(), false, dimension).await
     }
 
     /// Open or create an episode store at the given path, falling
@@ -145,10 +168,19 @@ impl EpisodeStore {
     /// degraded fallback; corruption / I/O / permission errors are
     /// returned as `Err`.
     pub async fn open_or_degraded(data_dir: impl AsRef<Path>) -> Result<Self> {
-        Self::open_inner(data_dir.as_ref(), true).await
+        Self::open_inner(data_dir.as_ref(), true, DEFAULT_DIMENSION).await
     }
 
-    async fn open_inner(data_dir: &Path, allow_degraded: bool) -> Result<Self> {
+    /// [`Self::open_or_degraded`] with an explicit vector-index width.
+    /// See [`Self::open_with_dimension`] for why this must track the embedder.
+    pub async fn open_or_degraded_with_dimension(
+        data_dir: impl AsRef<Path>,
+        dimension: usize,
+    ) -> Result<Self> {
+        Self::open_inner(data_dir.as_ref(), true, dimension).await
+    }
+
+    async fn open_inner(data_dir: &Path, allow_degraded: bool, dimension: usize) -> Result<Self> {
         let data_dir = data_dir.to_path_buf();
         tokio::fs::create_dir_all(&data_dir)
             .await
@@ -183,7 +215,7 @@ impl EpisodeStore {
                 write_txn.commit()?;
 
                 // Rebuild in-memory hybrid index from stored data
-                let mut index = HybridIndex::new(DEFAULT_DIMENSION);
+                let mut index = HybridIndex::new(dimension);
                 {
                     let read_txn = db.begin_read()?;
                     let episodes_table = read_txn.open_table(EPISODES_TABLE)?;
@@ -203,7 +235,29 @@ impl EpisodeStore {
                     }
                 }
 
-                debug!(path = %data_dir.display(), "opened episode store");
+                // One summary instead of one line per episode. `insert` warns on
+                // the first mismatch and counts the rest, so without this a
+                // model change was either a single warning buried in the boot
+                // log or (before) thousands of identical ones.
+                let coverage = index.vector_coverage();
+                if coverage.has_dimension_mismatch() {
+                    warn!(
+                        path = %data_dir.display(),
+                        expected_dimension = coverage.dimension,
+                        mismatched = coverage.dimension_mismatches,
+                        vectorized = coverage.vectorized,
+                        total = coverage.total,
+                        "episode store rebuilt with dimension-mismatched embeddings dropped — \
+                         those episodes are BM25-only until re-embedded. This happens when the \
+                         configured embedding model changed; stored vectors cannot be converted."
+                    );
+                }
+                debug!(
+                    path = %data_dir.display(),
+                    vectorized = coverage.vectorized,
+                    total = coverage.total,
+                    "opened episode store"
+                );
                 Ok(Some((db, index)))
             })
             .await?;
@@ -224,7 +278,7 @@ impl EpisodeStore {
                 );
                 Ok(Self {
                     db: None,
-                    index: RwLock::new(HybridIndex::new(DEFAULT_DIMENSION)),
+                    index: RwLock::new(HybridIndex::new(dimension)),
                 })
             }
             None => Err(eyre::eyre!(
@@ -517,6 +571,88 @@ impl EpisodeStore {
     /// empty for the same reason as [`Self::store`] — they need
     /// disk-backed bodies. Follows the same "writes accepted, reads
     /// empty" contract.
+    /// How much of the episodic index is reachable by vector search.
+    ///
+    /// Surfaces the one failure mode that is invisible at query time: when the
+    /// configured embedding model's width disagrees with the index, those
+    /// vectors are dropped and the episodes fall back to BM25-only recall.
+    /// Search does not report this — it just gets worse — so a health check
+    /// should read it. `dimension_mismatches > 0` means re-embedding is needed;
+    /// stored vectors cannot be converted to a different width.
+    ///
+    /// A degraded (lock-contended) handle reports an empty index.
+    pub fn vector_coverage(&self) -> crate::VectorCoverage {
+        match self.index.read() {
+            Ok(index) => index.vector_coverage(),
+            Err(e) => {
+                warn!("index read lock poisoned, reporting empty coverage: {e}");
+                crate::VectorCoverage {
+                    total: 0,
+                    vectorized: 0,
+                    dimension_mismatches: 0,
+                    dimension: 0,
+                }
+            }
+        }
+    }
+
+    /// Episodes that carry no usable vector, as `(episode_id, summary)` ready
+    /// to re-embed.
+    ///
+    /// "Usable" means a persisted embedding whose width matches this store's
+    /// index. An episode qualifies when its vector is ABSENT (saved while no
+    /// embedder was configured, or the embed call failed) or MISMATCHED (the
+    /// embedding model changed — stored vectors cannot be converted to a
+    /// different width, only regenerated).
+    ///
+    /// This is the input to `octos memory reindex`. It reads persisted state
+    /// rather than the in-memory index, so it stays correct regardless of what
+    /// the index dropped at rebuild, and the summary it returns is the exact
+    /// text the save path embeds.
+    ///
+    /// A degraded (lock-contended) handle has no database and returns empty.
+    pub async fn episodes_needing_vectors(&self) -> Result<Vec<(String, String)>> {
+        let Some(db) = self.db.clone() else {
+            return Ok(Vec::new());
+        };
+        let expected = self
+            .index
+            .read()
+            .map(|idx| idx.vector_coverage().dimension)
+            .unwrap_or(DEFAULT_DIMENSION);
+
+        tokio::task::spawn_blocking(move || {
+            let read_txn = db.begin_read()?;
+            let episodes_table = read_txn.open_table(EPISODES_TABLE)?;
+            let embeddings_table = read_txn.open_table(EMBEDDINGS_TABLE)?;
+            let mut out = Vec::new();
+
+            for entry in episodes_table.iter()? {
+                let (key, value) = entry?;
+                let ep_id = key.value().to_string();
+                let Ok(episode) = serde_json::from_str::<Episode>(value.value()) else {
+                    continue;
+                };
+                // An episode with no summary has nothing to embed; skip it
+                // rather than sending empty text to a provider.
+                if episode.summary.trim().is_empty() {
+                    continue;
+                }
+                let width = embeddings_table
+                    .get(ep_id.as_str())
+                    .ok()
+                    .flatten()
+                    .and_then(|v| bincode::deserialize::<Vec<f32>>(v.value()).ok())
+                    .map(|v| v.len());
+                if width != Some(expected) {
+                    out.push((ep_id, episode.summary));
+                }
+            }
+            Ok::<_, eyre::Report>(out)
+        })
+        .await?
+    }
+
     pub async fn store_embedding(&self, episode_id: &str, embedding: Vec<f32>) -> Result<()> {
         // Degraded fallback: skip the disk write, update the in-memory
         // embedding entry only, return success.
@@ -812,6 +948,278 @@ mod tests {
             summary.into(),
             EpisodeOutcome::Success,
         )
+    }
+
+    /// A 768-d embedder (in-process EmbeddingGemma) must actually reach the
+    /// vector lane. Before the index width was made configurable this store
+    /// was hardcoded to 1536, so every 768-d vector was dropped on insert and
+    /// hybrid search silently degraded to BM25-only.
+    #[tokio::test]
+    async fn open_with_dimension_indexes_vectors_at_a_non_default_width() {
+        const DIM: usize = 768;
+        let dir = tempfile::tempdir().unwrap();
+        let store = EpisodeStore::open_with_dimension(dir.path(), DIM)
+            .await
+            .unwrap();
+
+        let ep = make_episode("deployed the metal shader cache", "/proj");
+        let ep_id = ep.id.clone();
+        store.store(ep).await.unwrap();
+
+        // Unit vector pointing at dim 0; the query points the same way.
+        let mut embedding = vec![0.0f32; DIM];
+        embedding[0] = 1.0;
+        store
+            .store_embedding(&ep_id, embedding.clone())
+            .await
+            .unwrap();
+
+        // Query text deliberately shares NO tokens with the summary, so any
+        // non-zero score has to come from the vector lane.
+        let scored = store
+            .find_relevant_hybrid_scored("zzzz", Some(embedding), 10)
+            .await
+            .unwrap();
+
+        let hit = scored
+            .iter()
+            .find(|(ep, _)| ep.id == ep_id)
+            .expect("768-d vector was dropped — index width did not follow the embedder");
+        assert!(
+            hit.1.vector > 0.9,
+            "expected near-1.0 cosine on an identical unit vector, got {}",
+            hit.1.vector
+        );
+    }
+
+    /// The mismatch guard still has to bite: a vector of the wrong width is
+    /// dropped rather than corrupting the index.
+    #[tokio::test]
+    async fn open_with_dimension_still_drops_mismatched_vectors() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = EpisodeStore::open_with_dimension(dir.path(), 768)
+            .await
+            .unwrap();
+
+        let ep = make_episode("wrong width embedding", "/proj");
+        let ep_id = ep.id.clone();
+        store.store(ep).await.unwrap();
+        // 1536-d vector into a 768-d index.
+        store
+            .store_embedding(&ep_id, vec![0.1f32; 1536])
+            .await
+            .unwrap();
+
+        let scored = store
+            .find_relevant_hybrid_scored("wrong width", None, 10)
+            .await
+            .unwrap();
+        let hit = scored.iter().find(|(ep, _)| ep.id == ep_id);
+        // Still findable by BM25, but with no vector contribution.
+        assert!(hit.is_some(), "episode should remain BM25-searchable");
+        assert_eq!(
+            hit.unwrap().1.vector,
+            0.0,
+            "mismatched vector must not enter the index"
+        );
+    }
+
+    /// The scenario this whole signal exists for: someone switches embedding
+    /// model, restarts, and every persisted vector is now the wrong width.
+    /// Before, that was a wall of per-episode warnings and no way to ask how
+    /// bad it was. Reopening at a different width must report it precisely.
+    #[tokio::test]
+    async fn reopening_at_a_different_dimension_reports_the_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Session 1: a 1536-d model (the OpenAI default).
+        {
+            let store = EpisodeStore::open_with_dimension(dir.path(), 1536)
+                .await
+                .unwrap();
+            for i in 0..3 {
+                let ep = make_episode(&format!("episode {i}"), "/proj");
+                let id = ep.id.clone();
+                store.store(ep).await.unwrap();
+                store
+                    .store_embedding(&id, vec![0.1f32; 1536])
+                    .await
+                    .unwrap();
+            }
+            let c = store.vector_coverage();
+            assert_eq!((c.total, c.vectorized), (3, 3), "all three vectorized");
+            assert!(!c.has_dimension_mismatch());
+        }
+
+        // Session 2: switched to a 768-d model. The persisted 1536-d vectors
+        // cannot be converted, so they are dropped on rebuild.
+        {
+            let store = EpisodeStore::open_with_dimension(dir.path(), 768)
+                .await
+                .unwrap();
+            let c = store.vector_coverage();
+            assert_eq!(c.dimension, 768);
+            assert_eq!(c.total, 3, "the episodes themselves survive");
+            assert_eq!(c.vectorized, 0, "none of the old vectors fit the new index");
+            assert_eq!(
+                c.dimension_mismatches, 3,
+                "every dropped vector is counted, not just the first (which is the only one logged)"
+            );
+            assert_eq!(c.bm25_only(), 3);
+            assert!(
+                c.has_dimension_mismatch(),
+                "a health check must be able to see this"
+            );
+            assert!((c.ratio() - 0.0).abs() < 1e-9);
+        }
+    }
+
+    /// Re-embedding at the new width is the documented remedy — it has to
+    /// actually clear the signal, or the advice is wrong.
+    #[tokio::test]
+    async fn re_embedding_restores_vector_coverage() {
+        let dir = tempfile::tempdir().unwrap();
+        let ep = make_episode("needs re-embedding", "/proj");
+        let ep_id = ep.id.clone();
+        {
+            let store = EpisodeStore::open_with_dimension(dir.path(), 1536)
+                .await
+                .unwrap();
+            store.store(ep).await.unwrap();
+            store
+                .store_embedding(&ep_id, vec![0.1f32; 1536])
+                .await
+                .unwrap();
+        }
+
+        let store = EpisodeStore::open_with_dimension(dir.path(), 768)
+            .await
+            .unwrap();
+        assert!(store.vector_coverage().has_dimension_mismatch());
+
+        // Re-embed at the width the index actually wants.
+        let mut v = vec![0.0f32; 768];
+        v[0] = 1.0;
+        store.store_embedding(&ep_id, v).await.unwrap();
+
+        let c = store.vector_coverage();
+        assert_eq!(
+            c.vectorized, 1,
+            "the re-embedded episode rejoins the vector index"
+        );
+        assert!((c.ratio() - 1.0).abs() < 1e-9);
+    }
+
+    /// The reindex worklist must contain exactly the episodes that lack a
+    /// usable vector — absent AND wrong-width — and nothing else. A false
+    /// positive re-embeds (and re-bills) work that was already fine; a false
+    /// negative leaves an episode permanently BM25-only.
+    #[tokio::test]
+    async fn episodes_needing_vectors_lists_absent_and_mismatched_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = EpisodeStore::open_with_dimension(dir.path(), 4)
+            .await
+            .unwrap();
+
+        let good = make_episode("has a correct vector", "/proj");
+        let good_id = good.id.clone();
+        store.store(good).await.unwrap();
+        store
+            .store_embedding(&good_id, vec![0.5f32; 4])
+            .await
+            .unwrap();
+
+        let absent = make_episode("never embedded", "/proj");
+        let absent_id = absent.id.clone();
+        store.store(absent).await.unwrap();
+
+        let wrong = make_episode("embedded at the old width", "/proj");
+        let wrong_id = wrong.id.clone();
+        store.store(wrong).await.unwrap();
+        store
+            .store_embedding(&wrong_id, vec![0.5f32; 1536])
+            .await
+            .unwrap();
+
+        let pending = store.episodes_needing_vectors().await.unwrap();
+        let ids: Vec<&str> = pending.iter().map(|(id, _)| id.as_str()).collect();
+
+        assert!(
+            !ids.contains(&good_id.as_str()),
+            "a correctly-sized vector must NOT be re-embedded"
+        );
+        assert!(
+            ids.contains(&absent_id.as_str()),
+            "an episode with no vector needs one"
+        );
+        assert!(
+            ids.contains(&wrong_id.as_str()),
+            "a wrong-width vector must be regenerated"
+        );
+        assert_eq!(pending.len(), 2);
+
+        // The summary comes back so the caller can embed without a second read.
+        let (_, summary) = pending.iter().find(|(id, _)| id == &absent_id).unwrap();
+        assert_eq!(summary, "never embedded");
+    }
+
+    /// Full repair loop: the worklist drains to empty and coverage recovers.
+    /// This is what `octos memory reindex` does, minus the provider.
+    #[tokio::test]
+    async fn reindexing_the_worklist_restores_full_coverage() {
+        let dir = tempfile::tempdir().unwrap();
+        // Persist at the old width.
+        {
+            let store = EpisodeStore::open_with_dimension(dir.path(), 1536)
+                .await
+                .unwrap();
+            for i in 0..5 {
+                let ep = make_episode(&format!("episode {i}"), "/proj");
+                let id = ep.id.clone();
+                store.store(ep).await.unwrap();
+                store
+                    .store_embedding(&id, vec![0.1f32; 1536])
+                    .await
+                    .unwrap();
+            }
+        }
+        // Reopen at the new width: everything is now mismatched.
+        let store = EpisodeStore::open_with_dimension(dir.path(), 768)
+            .await
+            .unwrap();
+        assert_eq!(store.vector_coverage().vectorized, 0);
+
+        let pending = store.episodes_needing_vectors().await.unwrap();
+        assert_eq!(pending.len(), 5);
+        for (id, _summary) in &pending {
+            let mut v = vec![0.0f32; 768];
+            v[0] = 1.0;
+            store.store_embedding(id, v).await.unwrap();
+        }
+
+        let after = store.vector_coverage();
+        assert_eq!(
+            after.vectorized, 5,
+            "every episode rejoins the vector index"
+        );
+        assert!((after.ratio() - 1.0).abs() < 1e-9);
+        assert!(
+            store.episodes_needing_vectors().await.unwrap().is_empty(),
+            "the worklist must drain — a non-empty list here means reindex never converges"
+        );
+    }
+
+    /// An episode with an empty summary has nothing to embed. Including it
+    /// would send empty text to a paid provider and never clear the worklist.
+    #[tokio::test]
+    async fn episodes_needing_vectors_skips_empty_summaries() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = EpisodeStore::open_with_dimension(dir.path(), 4)
+            .await
+            .unwrap();
+        let ep = make_episode("   ", "/proj");
+        store.store(ep).await.unwrap();
+        assert!(store.episodes_needing_vectors().await.unwrap().is_empty());
     }
 
     #[test]

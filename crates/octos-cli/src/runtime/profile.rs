@@ -171,6 +171,16 @@ pub struct ProfileRuntime {
     /// session-scope bootstrap code don't have to re-derive it.
     pub data_dir: PathBuf,
 
+    /// The profile's resolved [`crate::config::Config`] (as produced by
+    /// `config_from_profile` at bootstrap, with host memory/plugins merged).
+    /// Most runtime state is pre-extracted into the typed fields below; this
+    /// is retained for the few paths that must resolve a lane provider
+    /// LAZILY from `config.sub_providers` (with the profile's credential /
+    /// timeout config), e.g. a peer session that runs its turns on a named
+    /// `sub_provider` model lane (`peers/<slug>/model`). Kept whole rather
+    /// than re-deriving a `Config` off disk on the hot path.
+    pub config: crate::config::Config,
+
     /// The fully-wrapped LLM provider chain for this profile.
     /// Includes retry, provider failover, and (if `adaptive_router`
     /// is `Some`) adaptive routing. Every session for this profile
@@ -578,9 +588,25 @@ impl ProfileRuntime {
         // EpisodeStore; gateway falls back to a degraded handle when
         // serve already owns the redb lock so it doesn't crashloop on
         // every startup. Tracked by issue #899.
+        //
+        // The embedder is resolved FIRST because the episodic HNSW index is
+        // built at one fixed width and silently drops any vector of a
+        // different length. Sizing it from the configured provider is what
+        // makes a non-1536-d embedder (e.g. in-process EmbeddingGemma at 768)
+        // actually reach the vector lane instead of degrading to BM25-only.
+        let embedder =
+            chat::create_embedder(&config).map(|e| e as Arc<dyn octos_llm::EmbeddingProvider>);
+        let index_dimension = embedder
+            .as_ref()
+            .map_or(octos_memory::EPISODIC_INDEX_DIMENSION, |e| e.dimension());
+
         let memory_open_result = match role {
-            BootstrapRole::Serve => EpisodeStore::open(data_dir).await,
-            BootstrapRole::Gateway => EpisodeStore::open_or_degraded(data_dir).await,
+            BootstrapRole::Serve => {
+                EpisodeStore::open_with_dimension(data_dir, index_dimension).await
+            }
+            BootstrapRole::Gateway => {
+                EpisodeStore::open_or_degraded_with_dimension(data_dir, index_dimension).await
+            }
         };
         let memory = Arc::new(memory_open_result.wrap_err_with(|| {
             format!("failed to open episode store for profile '{}'", profile.id)
@@ -841,12 +867,11 @@ impl ProfileRuntime {
         // when adaptive is configured, so per-node calls still
         // fan out through the adaptive layer.
         //
-        // Resolve the profile's embedding provider ONCE. The same handle
-        // feeds the pipeline factory below AND rides on the returned
-        // ProfileRuntime so the serve spawn/delegate wiring hands every
-        // worker the exact same embed-on-save + hybrid-recall behaviour.
-        let embedder =
-            chat::create_embedder(&config).map(|e| e as Arc<dyn octos_llm::EmbeddingProvider>);
+        // The profile's embedding provider was resolved ONCE back in Step 4
+        // (the episodic index has to be sized from it). The same handle feeds
+        // the pipeline factory below AND rides on the returned ProfileRuntime
+        // so the serve spawn/delegate wiring hands every worker the exact same
+        // embed-on-save + hybrid-recall behaviour.
 
         // NEW-07: hoist the per-instance `RunPipelineTool` builder
         // into a [`crate::session_actor::PipelineToolFactory`] impl
@@ -982,6 +1007,18 @@ impl ProfileRuntime {
             tools.register(crate::goal_tool::GoalGetTool::new(profile.id.clone()));
             tools.register(crate::goal_tool::GoalCreateTool::new(profile.id.clone()));
             tools.register(crate::goal_tool::GoalUpdateTool::new(profile.id.clone()));
+            // #1857 PR 5a — the goal keeper's fleet controls: decompose the
+            // objective onto a durable fleet (`goal_plan`) and launch its ready
+            // tasks onto the live worker pool (`goal_dispatch`). `goal_get`
+            // (above) folds in the fleet plan view + self-detects completion.
+            tools.register(crate::goal_tool::GoalPlanTool::new(profile.id.clone()));
+            tools.register(crate::goal_tool::GoalDispatchTool::new(profile.id.clone()));
+            // PR B — the keeper's escalation controls: approve a worker's
+            // mid-task grant-widen request (`goal_grant`, resumes the task) or
+            // refuse it (`goal_deny`, fails the task). A Blocked task surfaced by
+            // goal_get needs exactly one of these.
+            tools.register(crate::goal_tool::GoalGrantTool::new(profile.id.clone()));
+            tools.register(crate::goal_tool::GoalDenyTool::new(profile.id.clone()));
         }
 
         // Step 17: re-apply tool policy AFTER plugin / memory-bank
@@ -1118,6 +1155,10 @@ impl ProfileRuntime {
         Ok(Arc::new(Self {
             profile_id: profile.id.clone(),
             data_dir: data_dir.to_path_buf(),
+            // Retained whole for lazy per-lane provider resolution (e.g. a
+            // peer running on a named `sub_provider` model lane); the typed
+            // fields below carry the pre-extracted hot-path state.
+            config: config.clone(),
             llm,
             adaptive_router,
             runtime_qos_catalog,
@@ -1210,9 +1251,11 @@ mod tests {
     use crate::profiles::{
         GatewaySettings, LlmModelSelectionConfig, LlmProfileConfig, LlmRouteConfig, ProfileConfig,
     };
+    #[cfg(unix)]
     use crate::runtime::SessionRuntime;
     use chrono::Utc;
     use octos_agent::SandboxConfig;
+    #[cfg(unix)]
     use octos_core::SessionKey;
     use std::collections::HashMap;
 

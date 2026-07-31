@@ -296,6 +296,133 @@ fn local_profile_state(dir: &Path) -> AppState {
     }
 }
 
+fn profile_for_runtime_message(id: &str) -> crate::profiles::UserProfile {
+    let now = Utc::now();
+    crate::profiles::UserProfile {
+        id: id.to_string(),
+        name: id.to_string(),
+        public_subdomain: None,
+        enabled: true,
+        data_dir: None,
+        parent_id: None,
+        config: crate::profiles::ProfileConfig::default(),
+        created_at: now,
+        updated_at: now,
+    }
+}
+
+// Regression coverage for the "No ProfileRuntime registered... Set up the
+// profile with an API key in the dashboard" message, which used to fire
+// verbatim for every Ok(None) from `ensure_session_profile_runtime` —
+// including a merely-disabled profile, a sub-account, or an unknown id,
+// none of which an API key would fix.
+#[test]
+fn should_report_no_profile_store_when_profile_runtime_unavailable_and_store_missing() {
+    let state = AppState {
+        profile_store: None,
+        ..AppState::empty_for_tests()
+    };
+    let message = profile_runtime_unavailable_message(&state, "ghost");
+    assert!(
+        message.contains("no profile store") || message.contains("No profile store"),
+        "expected a no-store explanation, got: {message}"
+    );
+    assert!(
+        !message.contains("API key"),
+        "must not blame a missing API key: {message}"
+    );
+}
+
+#[test]
+fn should_report_unknown_profile_when_profile_runtime_unavailable_and_profile_missing() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = local_profile_state(dir.path());
+    let message = profile_runtime_unavailable_message(&state, "ghost");
+    assert!(
+        message.contains("does not exist"),
+        "expected a not-found explanation, got: {message}"
+    );
+    assert!(
+        !message.contains("API key"),
+        "must not blame a missing API key: {message}"
+    );
+}
+
+#[test]
+fn should_report_disabled_when_profile_runtime_unavailable_and_profile_disabled() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = local_profile_state(dir.path());
+    let mut profile = profile_for_runtime_message("disabled-one");
+    profile.enabled = false;
+    // Fully configured (a real key) — the only thing wrong is `enabled`.
+    profile.config.llm = Some(crate::profiles::LlmProfileConfig {
+        primary: Some(crate::profiles::LlmModelSelectionConfig {
+            family_id: Some("zai".to_string()),
+            ..Default::default()
+        }),
+        fallbacks: Vec::new(),
+    });
+    state
+        .profile_store
+        .as_ref()
+        .unwrap()
+        .save(&profile)
+        .unwrap();
+
+    let message = profile_runtime_unavailable_message(&state, "disabled-one");
+    assert!(
+        message.contains("disabled"),
+        "expected a disabled-profile explanation, got: {message}"
+    );
+    assert!(
+        !message.contains("API key"),
+        "a disabled-but-configured profile must not be told to add an API key: {message}"
+    );
+}
+
+#[test]
+fn should_report_sub_account_when_profile_runtime_unavailable_and_profile_has_parent() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = local_profile_state(dir.path());
+    let mut profile = profile_for_runtime_message("child-one");
+    profile.parent_id = Some("parent-one".to_string());
+    state
+        .profile_store
+        .as_ref()
+        .unwrap()
+        .save(&profile)
+        .unwrap();
+
+    let message = profile_runtime_unavailable_message(&state, "child-one");
+    assert!(
+        message.contains("sub-account") || message.contains("sub-profile"),
+        "expected a sub-account explanation, got: {message}"
+    );
+    assert!(
+        !message.contains("API key"),
+        "a sub-account must not be told to add an API key: {message}"
+    );
+}
+
+#[test]
+fn should_report_missing_api_key_when_profile_runtime_unavailable_and_no_llm_selected() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = local_profile_state(dir.path());
+    let profile = profile_for_runtime_message("no-llm-one");
+    state
+        .profile_store
+        .as_ref()
+        .unwrap()
+        .save(&profile)
+        .unwrap();
+
+    let message = profile_runtime_unavailable_message(&state, "no-llm-one");
+    assert!(
+        message.contains("API key"),
+        "a genuinely unconfigured profile should keep the API-key guidance, got: {message}"
+    );
+}
+
 #[test]
 fn profile_local_create_make_default_persists_pointer() {
     let dir = tempfile::tempdir().unwrap();
@@ -6834,6 +6961,7 @@ async fn try_emit_terminal_populates_turn_completed_tokens_and_session_result() 
             message_id: format!("{}:{}:{}", session_id.0, cursor.seq, 99_999),
             client_message_id: Some("cmid-user-1".into()),
         }),
+        outcome: None,
     };
 
     try_emit_terminal(
@@ -7523,6 +7651,861 @@ async fn ws_turn_supervisor_routes_spawn_only_failure_to_master_continuation_que
     // at end — that would wipe queue entries created by sibling
     // tests running in parallel under the shared static.
     drop(tool_registry);
+}
+
+/// #436 — serve `peer_send_input` round-trip through the master continuation
+/// queue. A `peer-<slug>` session records its wire key on `session/open`; the
+/// tool resolves the slug to that key and enqueues the injected text as an
+/// `External(peer_send_input)` continuation which drains FOR the peer session
+/// and renders VERBATIM as the peer's next user turn (no `[system-internal]`
+/// envelope). Dedupe collapses an identical re-injection so the same input is
+/// never delivered twice; a distinct message enqueues a fresh turn.
+#[tokio::test]
+async fn peer_send_input_injects_continuation_for_peer_session() {
+    // Unique profile/session so the shared process-global orchestrator + peer
+    // wire registry never collide with sibling tests running in parallel.
+    let profile_id = "test-peer-send-input-roundtrip";
+    let slug = "harbor-otter";
+    // The peer's WIRE key: profiled, topic `peer-<slug>` — exactly what
+    // `session/open` records and what the queue / tick / drain key on.
+    let peer_key =
+        SessionKey::with_profile_topic(profile_id, "api", "tab-9", &format!("peer-{slug}"));
+
+    // `session/open` glue: registering the peer makes its slug resolvable to
+    // the wire key the master's `peer_send_input` (which cannot know the
+    // client-chosen wire id) must enqueue under. An empty state has no profile
+    // runtime, so the close-marker retarget skip is a no-op here.
+    let state = Arc::new(AppState::empty_for_tests());
+    register_peer_wire_session(&state, &peer_key);
+    let resolved = peer_wire_registry()
+        .resolve(&peer_wire_key(profile_id, slug))
+        .expect("an opened peer session's slug resolves to its wire key");
+    assert_eq!(
+        resolved, peer_key,
+        "resolved wire key must match the opened peer session",
+    );
+    // A non-peer session is a no-op (never registered).
+    register_peer_wire_session(&state, &SessionKey::with_profile("other", "web", "plain"));
+
+    use crate::api::agent_orchestrator::PeerSendInputEnqueueOutcome;
+    let orchestrator = default_agent_orchestrator();
+    let message = "focus on the auth module next; skip the CSS pass";
+    // `call-1` stands in for the LLM `tool_call_id` of the first tool call.
+    let outcome = orchestrator
+        .enqueue_peer_send_input_continuation(&resolved, profile_id, slug, "call-1", message);
+    assert_eq!(
+        outcome,
+        PeerSendInputEnqueueOutcome::Queued,
+        "first injection must enqueue"
+    );
+    assert_eq!(
+        orchestrator.pending_continuation_count_for_session_for_test(&peer_key, profile_id),
+        1,
+        "the injection is queued for the peer session",
+    );
+
+    // #436 P1 #4 — dedupe keys on the occurrence id, NOT the text: a genuine
+    // retry of the SAME call (same occurrence) collapses...
+    let dup = orchestrator
+        .enqueue_peer_send_input_continuation(&resolved, profile_id, slug, "call-1", message);
+    assert_eq!(
+        dup,
+        PeerSendInputEnqueueOutcome::Duplicate,
+        "same-call retry must dedupe"
+    );
+    assert_eq!(
+        orchestrator.pending_continuation_count_for_session_for_test(&peer_key, profile_id),
+        1,
+        "a retry must not grow the queue",
+    );
+    // ...while a DISTINCT call (new occurrence) with IDENTICAL text is a
+    // separate injection and enqueues a second turn.
+    let distinct = orchestrator
+        .enqueue_peer_send_input_continuation(&resolved, profile_id, slug, "call-2", message);
+    assert_eq!(
+        distinct,
+        PeerSendInputEnqueueOutcome::Queued,
+        "a distinct tool call with identical text must NOT collapse"
+    );
+    assert_eq!(
+        orchestrator.pending_continuation_count_for_session_for_test(&peer_key, profile_id),
+        2,
+        "two distinct injections must yield two turns",
+    );
+
+    // Drain (what the peer's tick does) + render (what `run_standalone_turn`
+    // feeds the agent): the prompt IS the injected text, verbatim, so the peer
+    // processes it as a user turn.
+    let drained = orchestrator.drain_ready_continuations_for_session(
+        &peer_key,
+        profile_id,
+        crate::api::master_continuation_scheduler::MasterContinuationRuntimeState::idle(),
+        1,
+    );
+    assert_eq!(
+        drained.len(),
+        1,
+        "the peer session drains its injected continuation",
+    );
+    let prompt = master_continuation_prompt(&drained[0]);
+    assert_eq!(
+        prompt, message,
+        "the injected text is delivered verbatim as the peer's user turn",
+    );
+    assert!(
+        !prompt.contains("[system-internal]"),
+        "a user injection must not be wrapped as a system-internal continuation",
+    );
+
+    // Housekeeping: drain the residual so the shared static is left clean for
+    // sibling tests (never `clear_default_agent_orchestrator_for_test` — that
+    // would wipe parallel tests' queues).
+    let _ = orchestrator.drain_ready_continuations_for_session(
+        &peer_key,
+        profile_id,
+        crate::api::master_continuation_scheduler::MasterContinuationRuntimeState::idle(),
+        8,
+    );
+}
+
+/// #436 P1 #6 — only the peer's recorded ORIGINATOR may inject. A different
+/// same-profile session (or a peer with no recorded owner) is rejected.
+#[test]
+fn peer_send_input_authorized_only_for_recorded_originator() {
+    let tmp = tempfile::tempdir().unwrap();
+    let peers_root = tmp.path();
+    let slug = "auth-peer";
+    std::fs::create_dir_all(peers_root.join(slug)).unwrap();
+    std::fs::write(peers_root.join(slug).join("brief.md"), "brief").unwrap();
+    let owner = "tenant-a:api:master-1";
+    std::fs::write(peers_root.join(slug).join("originator"), owner).unwrap();
+
+    // The recorded originator is authorized (trailing newline tolerated).
+    assert!(peer_send_input_authorized(peers_root, slug, owner).is_ok());
+    std::fs::write(
+        peers_root.join(slug).join("originator"),
+        format!("{owner}\n"),
+    )
+    .unwrap();
+    assert!(peer_send_input_authorized(peers_root, slug, owner).is_ok());
+
+    // A DIFFERENT same-profile session is rejected with the ownership error.
+    let err = peer_send_input_authorized(peers_root, slug, "tenant-a:api:intruder-2")
+        .expect_err("a non-originator session must be rejected");
+    assert!(err.contains("not the owner"), "reason: {err}");
+
+    // A STAGED peer (brief present) with NO recorded originator is fail-closed.
+    let no_owner = "no-owner-peer";
+    std::fs::create_dir_all(peers_root.join(no_owner)).unwrap();
+    std::fs::write(peers_root.join(no_owner).join("brief.md"), "brief").unwrap();
+    let err2 = peer_send_input_authorized(peers_root, no_owner, owner)
+        .expect_err("missing originator must be unauthorized");
+    assert!(err2.contains("no recorded owner"), "reason: {err2}");
+
+    // A non-staged slug (no dir / no brief.md) is refused before any read.
+    let err3 = peer_send_input_authorized(peers_root, "unstaged", owner)
+        .expect_err("a non-staged peer must be unauthorized");
+    assert!(err3.contains("not a staged peer"), "reason: {err3}");
+}
+
+/// Peer-fleet auto-synthesis fire policy — EXACTLY ONCE per fleet, on the pure
+/// decision. FIRES when every owned peer is done + the master is idle + no
+/// marker yet; HOLDS while any peer is mid-turn (or has queued input), while the
+/// master is busy, when a peer has no result, and — crucially — when the marker
+/// ALREADY EXISTS (no re-fire while any owned peer lives, even if all are done).
+/// A cleared fleet (zero owned peers) yields ClearStamp when a marker exists (so
+/// a fresh fleet can fire), else Hold.
+#[test]
+fn evaluate_peer_fleet_synthesis_fires_once_and_resets_on_clear() {
+    use FleetSynthesisDecision::{ClearStamp, Fire, Hold};
+    let peer = |has_result: bool, mid_turn: bool| OwnedPeerState {
+        has_result,
+        mid_turn,
+    };
+    let done_a = peer(true, false);
+    let done_b = peer(true, false);
+
+    // FIRES: >=1 peer, idle, all settled + done, marker absent.
+    assert_eq!(
+        evaluate_peer_fleet_synthesis(&[done_a, done_b], false, true),
+        Fire,
+    );
+
+    // HOLDS while an owned peer is still running / has queued input (mid_turn).
+    assert_eq!(
+        evaluate_peer_fleet_synthesis(&[done_a, peer(true, true)], false, true),
+        Hold,
+    );
+
+    // HOLDS while the master is busy (even though the fleet is done).
+    assert_eq!(
+        evaluate_peer_fleet_synthesis(&[done_a, done_b], false, false),
+        Hold
+    );
+
+    // HOLDS when an owned peer has produced no result yet.
+    assert_eq!(
+        evaluate_peer_fleet_synthesis(&[done_a, peer(false, false)], false, true),
+        Hold,
+    );
+
+    // EXACTLY ONCE: the marker already exists → NEVER re-fire while any owned
+    // peer remains, even with MORE peers all done (added-and-completed peers and
+    // newer results do NOT re-synthesize).
+    assert_eq!(
+        evaluate_peer_fleet_synthesis(&[done_a, done_b, peer(true, false)], true, true),
+        Hold,
+    );
+
+    // Zero owned peers + no marker → nothing to do.
+    assert_eq!(evaluate_peer_fleet_synthesis(&[], false, true), Hold);
+
+    // RESET: zero owned peers + marker exists → ClearStamp (remove it) so a
+    // genuinely fresh fleet can fire once later. Independent of idle.
+    assert_eq!(evaluate_peer_fleet_synthesis(&[], true, true), ClearStamp);
+    assert_eq!(evaluate_peer_fleet_synthesis(&[], true, false), ClearStamp);
+
+    // After the reset (marker absent again) a fresh, complete fleet fires once.
+    assert_eq!(evaluate_peer_fleet_synthesis(&[done_a], false, true), Fire);
+}
+
+/// Peer-fleet auto-synthesis — the interrupt terminal path now evaluates the
+/// fleet too. An INTERRUPTED peer writes no fresh result.md, so: (a) HOLD when
+/// it has no result yet (fleet not done), and (b) FIRE once when it already has
+/// a prior result on the blackboard (persistent peer) and no marker exists yet.
+#[test]
+fn evaluate_holds_for_resultless_interrupt_and_fires_with_prior_result() {
+    use FleetSynthesisDecision::{Fire, Hold};
+    let peer = |has_result: bool| OwnedPeerState {
+        has_result,
+        mid_turn: false,
+    };
+    let sibling_done = peer(true);
+
+    // (a) Interrupted peer has NO result → fleet is not done → HOLD.
+    assert_eq!(
+        evaluate_peer_fleet_synthesis(&[sibling_done, peer(false)], false, true),
+        Hold,
+        "an interrupted peer with no result.md must not complete the fleet",
+    );
+
+    // (b) Interrupted peer already has a PRIOR result (persistent peer) + no
+    // marker → the fleet is done → FIRE once.
+    assert_eq!(
+        evaluate_peer_fleet_synthesis(&[sibling_done, peer(true)], false, true),
+        Fire,
+        "an interrupted peer with a prior result still lets the fleet synthesize",
+    );
+}
+
+/// Peer-fleet auto-synthesis — `collect_owned_peer_results` returns exactly the
+/// REAL staged peers whose `originator` matches the master, each paired with
+/// whether it has a `result.md`; a peer with no result is present-but-`false`
+/// (still in the fleet, blocks synthesis), an ERRORED peer's result still counts
+/// as present, a CLOSED peer is excluded, and a peer owned by a DIFFERENT master
+/// is excluded.
+#[test]
+fn collect_owned_peer_results_filters_by_originator_and_excludes_closed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let peers_root = tmp.path();
+    let master = "tenant-a:api:master-1";
+    let other = "tenant-a:api:master-2";
+
+    let stage = |slug: &str, originator: &str| {
+        let dir = peers_root.join(slug);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("brief.md"), "brief").unwrap();
+        std::fs::write(dir.join("originator"), originator).unwrap();
+        dir
+    };
+
+    // Owned + has a result.
+    let done = stage("done-peer", master);
+    std::fs::write(done.join("result.md"), "res").unwrap();
+    // Owned, ERRORED terminal — result.md present, so it counts as done.
+    let errored = stage("errored-peer", master);
+    std::fs::write(errored.join("result.md"), "err body").unwrap();
+    // Owned but NO result yet (blocks synthesis; still part of the fleet).
+    stage("pending-peer", master);
+    // Owned but CLOSED — excluded (retired peer).
+    let closed = stage("closed-peer", master);
+    std::fs::write(closed.join("result.md"), "res").unwrap();
+    std::fs::write(closed.join("closed"), "").unwrap();
+    // Owned by a DIFFERENT master — excluded.
+    let foreign = stage("foreign-peer", other);
+    std::fs::write(foreign.join("result.md"), "res").unwrap();
+
+    let mut owned = collect_owned_peer_results(peers_root, master).expect("peers dir readable");
+    owned.sort();
+    let slugs: Vec<&str> = owned.iter().map(|(slug, _)| slug.as_str()).collect();
+    assert_eq!(
+        slugs,
+        vec!["done-peer", "errored-peer", "pending-peer"],
+        "only this master's non-closed peers are owned"
+    );
+    assert!(
+        owned.iter().find(|(s, _)| s == "done-peer").unwrap().1,
+        "a written result → has_result true"
+    );
+    assert!(
+        owned.iter().find(|(s, _)| s == "errored-peer").unwrap().1,
+        "an errored peer's result.md still counts as present"
+    );
+    assert!(
+        !owned.iter().find(|(s, _)| s == "pending-peer").unwrap().1,
+        "a peer with no result.md → has_result false"
+    );
+}
+
+/// Peer-fleet auto-synthesis — the per-master `.synthesized` stamp is an
+/// EXISTENCE marker: create/exists/remove round-trips, distinct masters are
+/// independent (`safe_filename`), removing an absent marker is a no-op, and the
+/// colocated marker file is never mistaken for a staged peer.
+#[test]
+fn peer_fleet_synthesized_stamp_is_an_existence_marker() {
+    let tmp = tempfile::tempdir().unwrap();
+    let peers_root = tmp.path();
+    let master_a = "tenant-a:api:master-1";
+    let master_b = "tenant-a:api:master-2";
+
+    assert!(!peer_fleet_synthesized_stamp_exists(peers_root, master_a));
+
+    // Create (content is a debug timestamp; only existence gates).
+    crate::memory_consolidate::apply::atomic_write(
+        &peer_fleet_synthesized_stamp_path(peers_root, master_a),
+        "1721900000",
+    )
+    .unwrap();
+    assert!(peer_fleet_synthesized_stamp_exists(peers_root, master_a));
+    // A different master is independent.
+    assert!(!peer_fleet_synthesized_stamp_exists(peers_root, master_b));
+
+    // Remove clears it; removing an absent marker is a no-op (no panic).
+    remove_peer_fleet_synthesized_stamp(peers_root, master_a);
+    assert!(!peer_fleet_synthesized_stamp_exists(peers_root, master_a));
+    remove_peer_fleet_synthesized_stamp(peers_root, master_b);
+
+    // The colocated marker file is NOT mistaken for a staged peer.
+    crate::memory_consolidate::apply::atomic_write(
+        &peer_fleet_synthesized_stamp_path(peers_root, master_a),
+        "x",
+    )
+    .unwrap();
+    assert!(
+        collect_owned_peer_results(peers_root, master_a)
+            .expect("peers dir readable")
+            .is_empty()
+    );
+}
+
+/// Peer-fleet auto-synthesis RESET — `reset_peer_fleet_synthesis_if_cleared`
+/// removes the marker ONLY when the master's owned fleet is fully cleared. While
+/// any owned (non-closed) peer remains the marker persists; once the last peer
+/// is closed the marker is dropped so a fresh fleet fires once later.
+#[test]
+fn reset_removes_marker_only_when_fleet_fully_cleared() {
+    let tmp = tempfile::tempdir().unwrap();
+    let peers_root = tmp.path();
+    let master = "tenant-a:api:master-1";
+
+    // One owned, completed peer + the synthesized marker.
+    let dir = peers_root.join("worker");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("brief.md"), "brief").unwrap();
+    std::fs::write(dir.join("originator"), master).unwrap();
+    std::fs::write(dir.join("result.md"), "res").unwrap();
+    crate::memory_consolidate::apply::atomic_write(
+        &peer_fleet_synthesized_stamp_path(peers_root, master),
+        "1721900000",
+    )
+    .unwrap();
+
+    // Reset while an owned peer remains → marker PERSISTS.
+    reset_peer_fleet_synthesis_if_cleared(peers_root, master);
+    assert!(
+        peer_fleet_synthesized_stamp_exists(peers_root, master),
+        "marker persists while any owned peer remains"
+    );
+
+    // Close the peer (exclude it from the owned scan) → fleet cleared.
+    std::fs::write(dir.join("closed"), "").unwrap();
+    reset_peer_fleet_synthesis_if_cleared(peers_root, master);
+    assert!(
+        !peer_fleet_synthesized_stamp_exists(peers_root, master),
+        "marker removed once the fleet is fully cleared (a fresh fleet re-fires)"
+    );
+}
+
+/// Bug 2 (reset edge) — `collect_owned_peer_results` distinguishes a
+/// genuinely-EMPTY readable directory (`Some(vec![])`) from a `peers/` scan
+/// FAILURE (`None`), so a transient read error is never mistaken for a cleared
+/// fleet.
+#[test]
+fn collect_owned_peer_results_distinguishes_empty_from_scan_failure() {
+    let tmp = tempfile::tempdir().unwrap();
+    let master = "tenant-a:api:master-scan";
+
+    // Genuinely-empty (readable) dir → Some(empty).
+    let empty = tmp.path().join("empty-peers");
+    std::fs::create_dir_all(&empty).unwrap();
+    assert_eq!(
+        collect_owned_peer_results(&empty, master),
+        Some(Vec::new()),
+        "an empty readable dir is Some(empty), not a failure"
+    );
+
+    // Non-existent dir → read_dir fails → None (distinct from Some(empty)).
+    let missing = tmp.path().join("missing-peers");
+    assert_eq!(
+        collect_owned_peer_results(&missing, master),
+        None,
+        "a read_dir failure must be None (fail-closed), not Some(empty)"
+    );
+}
+
+/// Bug 2 (reset edge) — a `peers/` scan FAILURE must fail closed: the reset does
+/// NOT remove an existing marker (which would let an already-synthesized fleet
+/// re-fire). Exercised on Unix by denying READ (keeping EXECUTE) on `peers/` so
+/// `read_dir` fails while the marker stat still succeeds. Skipped when perms are
+/// not enforced (e.g. running as root).
+#[cfg(unix)]
+#[test]
+fn scan_failure_does_not_reset_marker() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = tempfile::tempdir().unwrap();
+    let peers_root = tmp.path().join("peers");
+    std::fs::create_dir_all(&peers_root).unwrap();
+    let master = "tenant-a:api:master-scan";
+
+    // Marker present (written while the dir is readable).
+    crate::memory_consolidate::apply::atomic_write(
+        &peer_fleet_synthesized_stamp_path(&peers_root, master),
+        "1721900000",
+    )
+    .unwrap();
+
+    // Deny READ but keep EXECUTE: read_dir fails, stat(marker) still works.
+    std::fs::set_permissions(&peers_root, std::fs::Permissions::from_mode(0o111)).unwrap();
+    if std::fs::read_dir(&peers_root).is_ok() {
+        // Permissions not enforced (root); can't exercise the failure path.
+        std::fs::set_permissions(&peers_root, std::fs::Permissions::from_mode(0o755)).unwrap();
+        return;
+    }
+
+    // Exercise the fail-closed path while read is denied.
+    let collect_result = collect_owned_peer_results(&peers_root, master);
+    reset_peer_fleet_synthesis_if_cleared(&peers_root, master);
+
+    // Restore read for the marker check + tempdir cleanup, THEN assert (so a
+    // panic can't leave the dir unreadable).
+    std::fs::set_permissions(&peers_root, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert_eq!(
+        collect_result, None,
+        "a read_dir failure yields None (fail-closed)"
+    );
+    assert!(
+        peer_fleet_synthesized_stamp_exists(&peers_root, master),
+        "a scan failure must NOT reset the marker (fail-closed)"
+    );
+}
+
+/// codex #6 — `stage_peer` records the ORIGINATOR (when supplied) so the
+/// fleet-ownership scan reliably attributes the peer to its master, and does so
+/// alongside `brief.md` (both present after a successful stage). A `None`
+/// originator (profile-scoped prepare) leaves no owner file and is unowned.
+#[test]
+fn stage_peer_records_originator_for_ownership_scan() {
+    let tmp = tempfile::tempdir().unwrap();
+    let peers_root = tmp.path().join("peers");
+    std::fs::create_dir_all(&peers_root).unwrap();
+    let ws = tmp.path().join("ws");
+    std::fs::create_dir_all(&ws).unwrap();
+    let master = "tenant-a:api:master-1";
+
+    // Owned peer: originator threaded in → recorded beside brief.md.
+    let owned = stage_peer(
+        &peers_root,
+        &ws,
+        "seed",
+        Some("Curie"),
+        Some(master),
+        "Brief.",
+        false,
+    )
+    .expect("owned staging");
+    let owned_dir = peers_root.join(&owned.slug);
+    assert!(owned_dir.join("brief.md").is_file(), "brief.md written");
+    assert_eq!(
+        std::fs::read_to_string(owned_dir.join("originator")).unwrap(),
+        master,
+        "originator recorded for the owning master"
+    );
+
+    // Unowned peer: no originator supplied → no owner file.
+    let unowned = stage_peer(
+        &peers_root,
+        &ws,
+        "seed",
+        Some("Bohr"),
+        None,
+        "Brief.",
+        false,
+    )
+    .expect("unowned staging");
+    assert!(
+        !peers_root.join(&unowned.slug).join("originator").exists(),
+        "a None originator leaves no owner file"
+    );
+
+    // The ownership scan attributes ONLY the owned peer to the master.
+    let owned_slugs: Vec<String> = collect_owned_peer_results(&peers_root, master)
+        .expect("peers dir readable")
+        .into_iter()
+        .map(|(slug, _)| slug)
+        .collect();
+    assert_eq!(
+        owned_slugs,
+        vec![owned.slug],
+        "only the owned peer is in the fleet"
+    );
+}
+
+/// #436 P1 #2 — a peer continuation is only drained by the connection that has
+/// the peer session open, so its live (ephemeral) turn output never renders on
+/// another same-profile client. Non-peer targets are unaffected.
+#[test]
+fn peer_continuation_only_drained_by_owning_connection() {
+    let peer = SessionKey::with_profile_topic("tenant-a", "api", "tab-1", "peer-slugz");
+    let goal_session = SessionKey::with_profile("tenant-a", "api", "master");
+    let master_open: std::collections::HashSet<SessionKey> =
+        [goal_session.clone()].into_iter().collect();
+    let peer_open: std::collections::HashSet<SessionKey> = [peer.clone()].into_iter().collect();
+
+    // Master hasn't opened the peer → must NOT run the peer's turn.
+    assert!(!peer_target_deliverable_on_connection(&peer, &master_open));
+    // The peer's own connection → runs it (live output reaches the peer).
+    assert!(peer_target_deliverable_on_connection(&peer, &peer_open));
+    // Non-peer targets (goal/loop) — any connection may drain, as before.
+    assert!(peer_target_deliverable_on_connection(
+        &goal_session,
+        &master_open
+    ));
+    assert!(peer_target_deliverable_on_connection(
+        &goal_session,
+        &std::collections::HashSet::new()
+    ));
+}
+
+/// #436 P1 #3 — a durable-persist failure must surface as an ERROR, never a
+/// false success ack; a queued/duplicate injection is a success.
+#[test]
+fn peer_send_input_persist_failure_maps_to_error_not_success() {
+    use crate::api::agent_orchestrator::PeerSendInputEnqueueOutcome;
+    let err = PeerSendInputEnqueueOutcome::PersistFailed
+        .into_callback_result("slugz")
+        .expect_err("persist failure must be an error, not a success ack");
+    assert!(
+        err.contains("slugz") && err.contains("not delivered"),
+        "reason: {err}"
+    );
+    assert!(
+        PeerSendInputEnqueueOutcome::Queued
+            .into_callback_result("slugz")
+            .is_ok()
+    );
+    assert!(
+        PeerSendInputEnqueueOutcome::Duplicate
+            .into_callback_result("slugz")
+            .is_ok()
+    );
+}
+
+/// #436 P1 #1 — on reconnect the peer opens under a NEW client-chosen wire key;
+/// a queued injection must be RE-HOMED to the new session, not stranded on the
+/// closed one.
+#[tokio::test]
+async fn peer_send_input_rehomes_to_reopened_peer_wire_on_reconnect() {
+    use crate::api::agent_orchestrator::PeerSendInputEnqueueOutcome;
+    let orchestrator = default_agent_orchestrator();
+    let profile_id = "test-peer-reconnect-rehome";
+    let slug = "reconnect-peer";
+    let s1 = SessionKey::with_profile_topic(profile_id, "api", "conn-1", &format!("peer-{slug}"));
+    let s2 = SessionKey::with_profile_topic(profile_id, "api", "conn-2", &format!("peer-{slug}"));
+    // An empty state has no registered profile runtime, so the close-marker
+    // skip is a no-op here — retarget behaves exactly as before this fix.
+    let state = Arc::new(AppState::empty_for_tests());
+
+    // Peer opens as S1; an injection is queued against S1.
+    register_peer_wire_session(&state, &s1);
+    let outcome = orchestrator.enqueue_peer_send_input_continuation(
+        &s1,
+        profile_id,
+        slug,
+        "call-x",
+        "resume work",
+    );
+    assert_eq!(outcome, PeerSendInputEnqueueOutcome::Queued);
+    assert_eq!(
+        orchestrator.pending_continuation_count_for_session_for_test(&s1, profile_id),
+        1
+    );
+
+    // Peer reopens as a NEW wire key S2 → the stranded injection is re-homed.
+    register_peer_wire_session(&state, &s2);
+    assert_eq!(
+        orchestrator.pending_continuation_count_for_session_for_test(&s1, profile_id),
+        0,
+        "the injection must not remain stranded on the closed S1",
+    );
+    assert_eq!(
+        orchestrator.pending_continuation_count_for_session_for_test(&s2, profile_id),
+        1,
+        "the injection must be re-homed to the reopened S2",
+    );
+    assert_eq!(
+        peer_wire_registry().resolve(&peer_wire_key(profile_id, slug)),
+        Some(s2.clone()),
+        "registry reflects latest-wins wire",
+    );
+    // The re-homed continuation still renders the original text verbatim.
+    let drained = orchestrator.drain_ready_continuations_for_session(
+        &s2,
+        profile_id,
+        crate::api::master_continuation_scheduler::MasterContinuationRuntimeState::idle(),
+        8,
+    );
+    assert_eq!(drained.len(), 1);
+    assert_eq!(master_continuation_prompt(&drained[0]), "resume work");
+}
+
+/// #436 P1 #5 — a closing peer is evicted from the wire registry so it is no
+/// longer a stale injection target; a stale close must not clobber a session
+/// that already reopened.
+#[test]
+fn peer_wire_registry_evicts_on_close_conditionally() {
+    let profile_id = "test-peer-evict-close";
+    let slug = "evict-peer";
+    let s1 = SessionKey::with_profile_topic(profile_id, "api", "c1", &format!("peer-{slug}"));
+    let state = Arc::new(AppState::empty_for_tests());
+    register_peer_wire_session(&state, &s1);
+    assert_eq!(
+        peer_wire_registry().resolve(&peer_wire_key(profile_id, slug)),
+        Some(s1.clone())
+    );
+
+    // Close S1 → evicted.
+    evict_peer_wire_session(&s1);
+    assert_eq!(
+        peer_wire_registry().resolve(&peer_wire_key(profile_id, slug)),
+        None,
+        "a closed peer must not remain a resolvable target",
+    );
+
+    // Race: peer reopened as S2 before S1's close lands — the stale close of S1
+    // must NOT evict the fresh S2 mapping.
+    let s2 = SessionKey::with_profile_topic(profile_id, "api", "c2", &format!("peer-{slug}"));
+    register_peer_wire_session(&state, &s2);
+    evict_peer_wire_session(&s1);
+    assert_eq!(
+        peer_wire_registry().resolve(&peer_wire_key(profile_id, slug)),
+        Some(s2),
+        "a stale close must not evict the reopened session",
+    );
+}
+
+/// #436 P1 #2 — a peer_send_input injection is completed only if its turn
+/// dispatched the agent; an undispatched one (e.g. failed `TurnStarted`) stays
+/// durable for retry/replay. Non-peer continuations always complete.
+#[test]
+fn peer_injection_completes_only_when_dispatched() {
+    assert!(
+        continuation_may_complete(true, true),
+        "a dispatched peer injection completes",
+    );
+    assert!(
+        !continuation_may_complete(true, false),
+        "an undispatched peer injection stays durable (not completed)",
+    );
+    // Non-peer continuations are unaffected — completed regardless.
+    assert!(continuation_may_complete(false, true));
+    assert!(continuation_may_complete(false, false));
+}
+
+/// #436 P1 #3 — the connection-independent global drain runs a peer injection
+/// only under the slug's CURRENT registered wire: an obsolete (superseded) or
+/// closed (evicted) wire is skipped and delivered on reopen. Non-peer targets
+/// always pass.
+#[test]
+fn global_drain_skips_obsolete_or_closed_peer_wire() {
+    let profile_id = "test-peer-freshness-gate";
+    let slug = "freshness-peer";
+    let s1 = SessionKey::with_profile_topic(profile_id, "api", "c1", &format!("peer-{slug}"));
+    let s2 = SessionKey::with_profile_topic(profile_id, "api", "c2", &format!("peer-{slug}"));
+    let state = Arc::new(AppState::empty_for_tests());
+
+    register_peer_wire_session(&state, &s1);
+    assert!(peer_target_is_current_wire(&s1), "current wire is runnable");
+
+    // Reopen as S2 → S1 is now obsolete.
+    register_peer_wire_session(&state, &s2);
+    assert!(
+        !peer_target_is_current_wire(&s1),
+        "an obsolete wire must be skipped by the global drain",
+    );
+    assert!(peer_target_is_current_wire(&s2), "the new wire is runnable");
+
+    // Close S2 → no current wire; skipped (delivered on reopen).
+    evict_peer_wire_session(&s2);
+    assert!(
+        !peer_target_is_current_wire(&s2),
+        "a closed peer wire must be skipped",
+    );
+
+    // Non-peer targets are never gated.
+    assert!(peer_target_is_current_wire(&SessionKey::with_profile(
+        profile_id, "api", "master"
+    )));
+}
+
+/// #436 P1 #3 — retarget TOMBSTONES the old durable record, so a restart does
+/// NOT resurrect + re-deliver the obsolete-wire injection. Simulated with two
+/// isolated orchestrators sharing one supervisor store: after retarget, a
+/// fresh orchestrator restoring the store re-enqueues exactly one injection,
+/// under the NEW wire (not the old).
+#[test]
+fn retarget_tombstones_old_durable_record_no_restart_dup() {
+    use crate::api::agent_orchestrator::{InProcessAgentOrchestrator, PeerSendInputEnqueueOutcome};
+    let dir = tempfile::tempdir().unwrap();
+    let profile_id = "tenant-a";
+    let slug = "restart-dup-peer";
+    let s1 = SessionKey::with_profile_topic(profile_id, "api", "c1", &format!("peer-{slug}"));
+    let s2 = SessionKey::with_profile_topic(profile_id, "api", "c2", &format!("peer-{slug}"));
+
+    // Pre-restart orchestrator, durably backed.
+    let orch1 = InProcessAgentOrchestrator::default();
+    orch1.configure_supervisor_store(dir.path()).unwrap();
+    let outcome =
+        orch1.enqueue_peer_send_input_continuation(&s1, profile_id, slug, "call-1", "resume");
+    assert_eq!(outcome, PeerSendInputEnqueueOutcome::Queued);
+    // Peer reopened as S2 → re-home (tombstones the old S1 durable record).
+    assert_eq!(
+        orch1.retarget_peer_send_input_continuations(profile_id, slug, &s2),
+        1,
+        "the stranded S1 injection is re-homed to S2",
+    );
+
+    // Simulate a restart: a fresh orchestrator restores from the SAME store.
+    let orch2 = InProcessAgentOrchestrator::default();
+    orch2.configure_supervisor_store(dir.path()).unwrap();
+    assert_eq!(
+        orch2.pending_continuation_count_for_session_for_test(&s1, profile_id),
+        0,
+        "the tombstoned old record must NOT be resurrected on restart",
+    );
+    assert_eq!(
+        orch2.pending_continuation_count_for_session_for_test(&s2, profile_id),
+        1,
+        "exactly one injection is restored, under the current wire",
+    );
+}
+
+/// #436 P1 #1 — retarget must persist the NEW durable record BEFORE tombstoning
+/// the OLD one, so a crash between the two writes can never lose the injection
+/// (worst case both survive, never "neither"). Asserted on the durable event
+/// log: the new record's queue event precedes the old record's completed
+/// (tombstone) event.
+#[test]
+fn retarget_persists_new_before_tombstoning_old_crash_safe() {
+    use crate::api::agent_orchestrator::{InProcessAgentOrchestrator, PeerSendInputEnqueueOutcome};
+    let dir = tempfile::tempdir().unwrap();
+    let orch = InProcessAgentOrchestrator::default();
+    orch.configure_supervisor_store(dir.path()).unwrap();
+    let profile_id = "tenant-a";
+    let slug = "crash-order-peer";
+    let s1 = SessionKey::with_profile_topic(profile_id, "api", "c1", &format!("peer-{slug}"));
+    let s2 = SessionKey::with_profile_topic(profile_id, "api", "c2", &format!("peer-{slug}"));
+    assert_eq!(
+        orch.enqueue_peer_send_input_continuation(&s1, profile_id, slug, "call-1", "work"),
+        PeerSendInputEnqueueOutcome::Queued
+    );
+    assert_eq!(
+        orch.retarget_peer_send_input_continuations(profile_id, slug, &s2),
+        1
+    );
+
+    let events = std::fs::read_to_string(
+        crate::api::supervisor_store::SupervisorStore::new(dir.path()).events_path(),
+    )
+    .unwrap();
+    let lines: Vec<&str> = events.lines().collect();
+    // The NEW record's queue event is the only one mentioning the S2 wire.
+    let new_queued_idx = lines
+        .iter()
+        .position(|l| l.contains("c2#peer-crash-order-peer"))
+        .expect("new record queue event present");
+    // The OLD record's tombstone is the (only) `continuation_completed` event.
+    let old_completed_idx = lines
+        .iter()
+        .position(|l| l.contains("continuation_completed"))
+        .expect("old record tombstone present");
+    assert!(
+        new_queued_idx < old_completed_idx,
+        "the new record must be persisted BEFORE the old is tombstoned \
+         (new_queued={new_queued_idx}, old_completed={old_completed_idx})",
+    );
+}
+
+/// #436 P1 #2/#4 — an injection that was popped (claimed) but NOT delivered
+/// (failed dispatch, or an obsolete wire) is RE-INSERTED so it is retryable
+/// live on the next tick — the recently-claimed guard must not block the
+/// redraw. Without this it would only ever re-deliver at a server restart.
+#[test]
+fn reinsert_makes_popped_injection_drainable_again() {
+    use crate::api::agent_orchestrator::{InProcessAgentOrchestrator, PeerSendInputEnqueueOutcome};
+    use crate::api::master_continuation_scheduler::MasterContinuationRuntimeState;
+    let orch = InProcessAgentOrchestrator::default();
+    let profile_id = "test-peer-reinsert";
+    let slug = "reinsert-peer";
+    let s = SessionKey::with_profile_topic(profile_id, "api", "c1", &format!("peer-{slug}"));
+    assert_eq!(
+        orch.enqueue_peer_send_input_continuation(&s, profile_id, slug, "call-1", "retry me"),
+        PeerSendInputEnqueueOutcome::Queued
+    );
+
+    // Drain (pop) — removes it from pending and records the recently-claimed
+    // guard entry.
+    let drained = orch.drain_ready_continuations_for_session(
+        &s,
+        profile_id,
+        MasterContinuationRuntimeState::idle(),
+        1,
+    );
+    assert_eq!(drained.len(), 1);
+    assert_eq!(
+        orch.pending_continuation_count_for_session_for_test(&s, profile_id),
+        0
+    );
+
+    // Undelivered → re-insert. It must be pending AND drainable again (the
+    // recently-claimed guard is cleared for a not-delivered restore).
+    orch.reinsert_peer_continuation(drained.into_iter().next().unwrap());
+    assert_eq!(
+        orch.pending_continuation_count_for_session_for_test(&s, profile_id),
+        1,
+        "the undelivered injection is re-queued for live retry",
+    );
+    let redrained = orch.drain_ready_continuations_for_session(
+        &s,
+        profile_id,
+        MasterContinuationRuntimeState::idle(),
+        1,
+    );
+    assert_eq!(
+        redrained.len(),
+        1,
+        "the re-inserted injection is retryable on the next tick",
+    );
+    assert_eq!(master_continuation_prompt(&redrained[0]), "retry me");
 }
 
 /// Regression: a `mark_failed` driven by the orphan-task sweep
@@ -12112,6 +13095,53 @@ fn m15_raw_autonomy_rpc_dispatches_every_method_to_orchestrator() {
     assert_eq!(calls, expected);
 }
 
+#[test]
+fn agent_output_read_preserves_recoverable_cursor_error_shape() {
+    let features = ConnectionUiFeatures::stdio_defaults();
+    let session_id = SessionKey::new("tenant-a", "cursor-error");
+    let orchestrator = RecordingOrchestrator::default();
+
+    for malformed_cursor in [
+        json!({}),
+        json!({ "offset": "not-a-number" }),
+        json!({ "offset": -1 }),
+    ] {
+        let request = RpcRequest::new(
+            "read-output",
+            methods::AGENT_OUTPUT_READ,
+            json!({
+                "agent_id": "agent-1",
+                "session_id": session_id.clone(),
+                "profile_id": "tenant-a",
+                "cursor": malformed_cursor,
+            }),
+        );
+        let error = raw_autonomy_rpc_with_orchestrator(&request, features, None, &orchestrator)
+            .expect_err("malformed cursor must retain the domain error");
+        let data = error.data.expect("cursor error data");
+
+        assert_eq!(error.code, rpc_error_codes::INVALID_PARAMS);
+        assert_eq!(
+            error.message,
+            "agent output cursor must be an object with numeric offset"
+        );
+        assert_eq!(data["kind"], "agent_output_cursor_invalid");
+        assert_eq!(data["policy_id"], "coding-autonomy-v1");
+        assert_eq!(data["profile_id"], "tenant-a");
+        assert_eq!(data["session_id"], json!(session_id));
+        assert_eq!(data["recoverable"], true);
+    }
+
+    assert!(
+        orchestrator
+            .calls
+            .lock()
+            .expect("recorded calls")
+            .is_empty(),
+        "invalid cursors must fail before orchestrator dispatch"
+    );
+}
+
 /// Codex P1 follow-up to #1094: `task/artifact/list` and
 /// `task/artifact/read` are the UPCR-2026-019 / M13 canonical names.
 /// Spec-conforming clients reach them via `task/list`, which exposes
@@ -13053,6 +14083,11 @@ fn session_ingress_callable_method_matches_the_deny_surfaces() {
         octos_core::ui_protocol::methods::CRON_LIST,
         octos_core::ui_protocol::methods::CRON_TOGGLE,
         octos_core::ui_protocol::methods::SESSION_FORK,
+        octos_core::ui_protocol::methods::SMART_HOME_STATUS_GET,
+        octos_core::ui_protocol::methods::SMART_HOME_DEVICE_LIST,
+        octos_core::ui_protocol::methods::SMART_HOME_DEVICE_COMMAND,
+        octos_core::ui_protocol::methods::SMART_HOME_CAMERA_STREAM_START,
+        octos_core::ui_protocol::methods::SMART_HOME_CAMERA_STREAM_STOP,
     ] {
         assert!(
             !session_ingress_callable_method(m),
@@ -21565,6 +22600,7 @@ async fn make_m11e_profile_with_llm_and_sandbox(
     Arc::new(crate::runtime::ProfileRuntime {
         profile_id: profile_id.to_string(),
         data_dir: data_dir.to_path_buf(),
+        config: crate::config::Config::default(),
         llm,
         adaptive_router: None,
         runtime_qos_catalog: None,
@@ -21658,6 +22694,234 @@ async fn state_with_profile_llm_and_sandbox(
     });
 
     (state, profile_runtime)
+}
+
+// ---- #peer-awaiting-wake — real requester integration ----
+//
+// Drive the REAL `UiProtocolApprovalRequester::request_approval` /
+// `SessionUserQuestionRequester::request_user_question` from a PEER session and
+// assert the peer's park wakes its originator (master) via the process-global
+// master-continuation scheduler — the exact seam `peer_fleet_synthesis` uses.
+// No live LLM: the requester parks on its oneshot and we cancel it to unwind.
+
+/// Stage `<peers_root>/<slug>/` with `brief.md` + `originator` so
+/// `staged_peer_dir` accepts it and the wake can resolve the master.
+fn stage_wake_peer(peers_root: &std::path::Path, slug: &str, originator: &str) {
+    let dir = peers_root.join(slug);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("brief.md"), "do the thing").unwrap();
+    std::fs::write(dir.join("originator"), originator).unwrap();
+}
+
+/// Poll the global orchestrator until `master` has >= `expected` pending
+/// continuations (or time out ~1s). The wake enqueue is synchronous inside the
+/// requester (before it awaits its oneshot), so this settles in a few yields.
+async fn wait_for_pending_count(master: &SessionKey, profile: &str, expected: usize) -> usize {
+    let orchestrator = default_agent_orchestrator();
+    for _ in 0..200 {
+        let n = orchestrator.pending_continuation_count_for_session_for_test(master, profile);
+        if n >= expected {
+            return n;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    orchestrator.pending_continuation_count_for_session_for_test(master, profile)
+}
+
+#[tokio::test]
+async fn real_peer_approval_park_wakes_originator() {
+    use octos_agent::ToolApprovalRequester as _;
+    let temp = tempfile::tempdir().unwrap();
+    let profile = "tenant-wake-rt-appr";
+    let (state, runtime) = state_with_profile(temp.path(), profile).await;
+    let peers_root = runtime.data_dir.join("peers");
+    let master = format!("{profile}:api:master");
+    stage_wake_peer(&peers_root, "edison", &master);
+
+    let (ws_tx, _ws_rx) = mpsc::channel(64);
+    let ws = WsConnection::new(ws_tx);
+    let ledger = Arc::new(UiProtocolLedger::new(64));
+    let contracts = Arc::new(UiProtocolContractStores::default());
+    let session_id = SessionKey::with_profile_topic(profile, "api", "edison-wire", "peer-edison");
+    let turn_id = TurnId::new();
+
+    let requester = UiProtocolApprovalRequester {
+        ws,
+        ledger,
+        contracts: contracts.clone(),
+        state: state.clone(),
+        session_id: session_id.clone(),
+        turn_id: turn_id.clone(),
+        features: ConnectionUiFeatures::default(),
+    };
+    let request = octos_agent::ToolApprovalRequest {
+        tool_id: "call-1".to_owned(),
+        tool_name: "shell".to_owned(),
+        title: "Run a shell command".to_owned(),
+        body: "rm -rf ./build-cache".to_owned(),
+        command: Some("rm -rf ./build-cache".to_owned()),
+        cwd: None,
+    };
+    let handle = tokio::spawn(async move { requester.request_approval(request).await });
+
+    let master_key = SessionKey(master.clone());
+    let n = wait_for_pending_count(&master_key, profile, 1).await;
+    assert_eq!(
+        n, 1,
+        "the real approval park must wake its originator exactly once"
+    );
+
+    // Inspect the queued wake: right reason kind + parked slug.
+    let drained = default_agent_orchestrator().drain_ready_continuations_for_session(
+        &master_key,
+        profile,
+        MasterContinuationRuntimeState::idle(),
+        4,
+    );
+    let wake = drained
+        .iter()
+        .find(|c| {
+            matches!(&c.reason, MasterContinuationReason::External(k)
+                if k == crate::api::agent_orchestrator::PEER_AWAITING_INPUT_EXTERNAL_KIND)
+        })
+        .expect("a peer_awaiting_input wake must be queued on the master");
+    assert!(
+        master_continuation_prompt(wake).contains("edison"),
+        "the wake prompt names the parked peer",
+    );
+
+    // Unblock the parked requester so the spawned task can finish.
+    contracts
+        .approvals
+        .cancel_pending_for_turn(&session_id, &turn_id, "test-teardown");
+    let decision = handle.await.unwrap();
+    assert_eq!(decision, octos_agent::ToolApprovalDecision::Deny);
+}
+
+#[tokio::test]
+async fn real_auto_resolved_approval_does_not_wake() {
+    use octos_agent::ToolApprovalRequester as _;
+    let temp = tempfile::tempdir().unwrap();
+    let profile = "tenant-wake-rt-auto";
+    let (state, runtime) = state_with_profile(temp.path(), profile).await;
+    let peers_root = runtime.data_dir.join("peers");
+    let master = format!("{profile}:api:master");
+    // Stage a VALID peer+originator, so the ONLY reason no wake fires is the
+    // auto-resolve short-circuit (not a missing originator).
+    stage_wake_peer(&peers_root, "edison", &master);
+
+    let (ws_tx, _ws_rx) = mpsc::channel(64);
+    let ws = WsConnection::new(ws_tx);
+    let ledger = Arc::new(UiProtocolLedger::new(64));
+    let contracts = Arc::new(UiProtocolContractStores::default());
+    let session_id = SessionKey::with_profile_topic(profile, "api", "edison-wire", "peer-edison");
+    let turn_id = TurnId::new();
+
+    // Pre-record a session-wide auto-approve for `shell`, so this approval is
+    // resolved by policy and NEVER parks (never reaches request_runtime).
+    contracts.scopes.record(
+        &session_id,
+        ApprovalScopeKind::ApproveForTool,
+        match_key_for(ApprovalScopeKind::ApproveForTool, "shell", &turn_id),
+        ApprovalDecision::Approve,
+    );
+
+    let requester = UiProtocolApprovalRequester {
+        ws,
+        ledger,
+        contracts: contracts.clone(),
+        state: state.clone(),
+        session_id: session_id.clone(),
+        turn_id: turn_id.clone(),
+        features: ConnectionUiFeatures::default(),
+    };
+    let request = octos_agent::ToolApprovalRequest {
+        tool_id: "call-1".to_owned(),
+        tool_name: "shell".to_owned(),
+        title: "Run a shell command".to_owned(),
+        body: "echo hi".to_owned(),
+        command: Some("echo hi".to_owned()),
+        cwd: None,
+    };
+    // Auto-resolve returns immediately (no oneshot to await), so call directly.
+    let decision = requester.request_approval(request).await;
+    assert_eq!(
+        decision,
+        octos_agent::ToolApprovalDecision::Approve,
+        "the scope policy must auto-approve",
+    );
+
+    let master_key = SessionKey(master.clone());
+    assert_eq!(
+        default_agent_orchestrator()
+            .pending_continuation_count_for_session_for_test(&master_key, profile),
+        0,
+        "an AUTO-RESOLVED approval never parks, so it must NOT wake the master",
+    );
+}
+
+#[tokio::test]
+async fn real_peer_question_park_wakes_originator() {
+    use octos_agent::UserQuestionRequester as _;
+    let temp = tempfile::tempdir().unwrap();
+    let profile = "tenant-wake-rt-q";
+    let (state, runtime) = state_with_profile(temp.path(), profile).await;
+    let peers_root = runtime.data_dir.join("peers");
+    let master = format!("{profile}:api:master");
+    stage_wake_peer(&peers_root, "tesla", &master);
+
+    let (ws_tx, _ws_rx) = mpsc::channel(64);
+    let ws = WsConnection::new(ws_tx);
+    let ledger = Arc::new(UiProtocolLedger::new(64));
+    let contracts = Arc::new(UiProtocolContractStores::default());
+    let session_id = SessionKey::with_profile_topic(profile, "api", "tesla-wire", "peer-tesla");
+    let turn_id = TurnId::new();
+
+    let requester = SessionUserQuestionRequester {
+        ws,
+        ledger,
+        contracts: contracts.clone(),
+        state: state.clone(),
+        session_id: session_id.clone(),
+        turn_id: turn_id.clone(),
+    };
+    let request = octos_agent::UserQuestionRequest {
+        questions: Vec::new(),
+        title: "Pick a datastore".to_owned(),
+        body: "Postgres or SQLite?".to_owned(),
+    };
+    let handle = tokio::spawn(async move { requester.request_user_question(request).await });
+
+    let master_key = SessionKey(master.clone());
+    let n = wait_for_pending_count(&master_key, profile, 1).await;
+    assert_eq!(
+        n, 1,
+        "the real question park must wake its originator exactly once"
+    );
+
+    let drained = default_agent_orchestrator().drain_ready_continuations_for_session(
+        &master_key,
+        profile,
+        MasterContinuationRuntimeState::idle(),
+        4,
+    );
+    let wake = drained
+        .iter()
+        .find(|c| {
+            matches!(&c.reason, MasterContinuationReason::External(k)
+                if k == crate::api::agent_orchestrator::PEER_AWAITING_INPUT_EXTERNAL_KIND)
+        })
+        .expect("a peer_awaiting_input wake must be queued on the master");
+    assert!(
+        master_continuation_prompt(wake).contains("question"),
+        "the wake prompt states the question kind",
+    );
+
+    contracts
+        .user_questions
+        .cancel_pending_for_turn(&session_id, &turn_id, "test-teardown");
+    let outcome = handle.await.unwrap();
+    assert_eq!(outcome, octos_agent::UserQuestionOutcome::Cancelled);
 }
 
 struct AppuiContinuationLlm {
@@ -21850,6 +23114,9 @@ async fn appui_due_fixed_loop_tick_drains_internal_continuation_turn() {
         &active_turns,
         &connection_turns,
         Some(MAIN_PROFILE_ID),
+        // A loop continuation (non-peer) is unaffected by the peer open-session
+        // filter, so an empty set is fine here.
+        &std::collections::HashSet::new(),
         features,
     )
     .await;
@@ -24243,10 +25510,13 @@ fn stage_peer_reserves_slug_writes_brief_and_releases_on_failure() {
 
     // Plain staging: reserved dir + topic + brief on disk, cwd echoes the
     // workspace root, no fence branch.
+    // `name: None` exercises the LEGACY (title-seeded, auto-suffix) path.
     let staged = stage_peer(
         &peers,
         &plain,
         "CI Fix",
+        None,
+        None,
         "Investigate the flaky test.",
         false,
     )
@@ -24262,12 +25532,12 @@ fn stage_peer_reserves_slug_writes_brief_and_releases_on_failure() {
     );
 
     // Same seed again: the reserve claim suffixes, same as peer/prepare.
-    let second = stage_peer(&peers, &plain, "CI Fix", "Second lane.", false).unwrap();
+    let second = stage_peer(&peers, &plain, "CI Fix", None, None, "Second lane.", false).unwrap();
     assert_eq!(second.slug, "ci-fix-2");
 
     // Worktree against a NON-git workspace fails AND releases the slug —
     // the member cleans its own dir so a retry re-claims the same name.
-    let err = stage_peer(&peers, &plain, "No Repo", "Doomed.", true)
+    let err = stage_peer(&peers, &plain, "No Repo", None, None, "Doomed.", true)
         .expect_err("worktree without a git repo must fail");
     assert!(
         err.message.contains("git repo"),
@@ -24278,8 +25548,16 @@ fn stage_peer_reserves_slug_writes_brief_and_releases_on_failure() {
         !peers.join("no-repo").exists(),
         "failed member removed its dir"
     );
-    let retry = stage_peer(&peers, &plain, "No Repo", "Fenceless retry.", false)
-        .expect("failed staging must not burn the slug");
+    let retry = stage_peer(
+        &peers,
+        &plain,
+        "No Repo",
+        None,
+        None,
+        "Fenceless retry.",
+        false,
+    )
+    .expect("failed staging must not burn the slug");
     assert_eq!(retry.slug, "no-repo");
 
     // Worktree against a real repo: fenced cwd + branch.
@@ -24312,8 +25590,16 @@ fn stage_peer_reserves_slug_writes_brief_and_releases_on_failure() {
             "init",
         ],
     );
-    let fenced =
-        stage_peer(&peers, &repo, "Fenced Lane", "Own worktree.", true).expect("worktree staging");
+    let fenced = stage_peer(
+        &peers,
+        &repo,
+        "Fenced Lane",
+        None,
+        None,
+        "Own worktree.",
+        true,
+    )
+    .expect("worktree staging");
     assert_eq!(fenced.worktree_branch.as_deref(), Some("peer/fenced-lane"));
     assert!(fenced.cwd.ends_with("peers/fenced-lane/wt"));
     assert!(
@@ -24359,6 +25645,7 @@ fn peer_handoff_callback_caps_at_four_and_emits_staged_events() {
         workspace.clone(),
         originating.clone(),
         "dev".to_owned(),
+        Vec::new(),
         Arc::new(AtomicU32::new(0)),
         Arc::new(move |event| emitted_sink.lock().unwrap().push(event)),
     );
@@ -24366,8 +25653,10 @@ fn peer_handoff_callback_caps_at_four_and_emits_staged_events() {
     for n in 1..=PEER_HANDOFFS_PER_TURN_MAX {
         let staged = callback(octos_agent::PeerHandoffRequest {
             brief: format!("Lane {n}: fix the flaky bus test."),
-            title: Some("Lane".to_owned()),
+            // Unique per iteration — named peers reject duplicates.
+            name: format!("Lane {n}"),
             worktree: false,
+            model: None,
         })
         .unwrap_or_else(|err| panic!("handoff {n} within the cap must stage: {err}"));
         assert_eq!(staged.topic, format!("peer-{}", staged.slug));
@@ -24380,8 +25669,9 @@ fn peer_handoff_callback_caps_at_four_and_emits_staged_events() {
 
     let err = callback(octos_agent::PeerHandoffRequest {
         brief: "One too many.".to_owned(),
-        title: None,
+        name: "One too many".to_owned(),
         worktree: false,
+        model: None,
     })
     .expect_err("5th handoff must be rejected");
     assert_eq!(err, "peer handoff limit reached for this turn (4)");
@@ -24393,7 +25683,8 @@ fn peer_handoff_callback_caps_at_four_and_emits_staged_events() {
     let emitted = emitted.lock().unwrap();
     assert_eq!(emitted.len(), 4, "one peer/staged event per success");
     let slugs: Vec<&str> = emitted.iter().map(|e| e.slug.as_str()).collect();
-    assert_eq!(slugs, vec!["lane", "lane-2", "lane-3", "lane-4"]);
+    // Named peers derive a unique slug per name ("Lane 1" -> "lane-1").
+    assert_eq!(slugs, vec!["lane-1", "lane-2", "lane-3", "lane-4"]);
     for (i, event) in emitted.iter().enumerate() {
         assert_eq!(
             event.session_id, originating,
@@ -24455,6 +25746,13 @@ fn peer_gather_callback_composes_done_and_running_rows() {
     let beta = peers_root.join("beta");
     std::fs::create_dir_all(&beta).unwrap();
     std::fs::write(beta.join("brief.md"), "Check CI.").unwrap();
+    // A CLOSED peer (retired via peer_close): the durable `closed` marker wins
+    // over a result file, so it labels `(closed)`, not `(done)`.
+    let gamma = peers_root.join("gamma");
+    std::fs::create_dir_all(&gamma).unwrap();
+    std::fs::write(gamma.join("brief.md"), "Retired work.").unwrap();
+    std::fs::write(gamma.join("result.md"), "partial result before close\n").unwrap();
+    std::fs::write(gamma.join("closed"), "tenant-a:api:master\n1700000000\n").unwrap();
 
     let callback = build_peer_gather_callback(peers_root.clone());
     let text = callback(None).expect("gather composes");
@@ -24466,6 +25764,10 @@ fn peer_gather_callback_composes_done_and_running_rows() {
     assert!(text.contains("## peer beta (still running)"), "{text}");
     assert!(text.contains("(still running — no result yet)"));
     assert!(text.contains("Brief: Check CI."));
+    assert!(
+        text.contains("## peer gamma (closed)"),
+        "closed status wins over done: {text}"
+    );
     let brief_line = text
         .lines()
         .find(|line| line.starts_with("Brief: Review the auth diff."))
@@ -24496,6 +25798,539 @@ fn peer_gather_callback_reports_empty_blackboard() {
     std::fs::create_dir_all(&empty_root).unwrap();
     let empty = build_peer_gather_callback(empty_root);
     assert_eq!(empty(None).unwrap(), "No peers staged for this profile.");
+}
+
+/// #436 hardening — a peer slug is a single path component; reject anything
+/// that could escape `peers/`, mis-key the wire registry, or alias on Windows.
+#[test]
+fn peer_slug_is_safe_rejects_traversal_and_separators() {
+    // Legitimate slugs (as `reserve_peer_dir` / `name_to_slug` emit) pass.
+    for ok in [
+        "alpha",
+        "ci-fix",
+        "lens-review-2",
+        "peer",
+        "a_b-3",
+        "%E4%B8%AD",
+    ] {
+        assert!(peer_slug_is_safe(ok), "{ok:?} should be accepted");
+    }
+    // Traversal / separators / empty / NUL, plus the tightened rejects: a
+    // drive/ADS colon, control chars, a trailing dot or space, and over-length.
+    let too_long = "x".repeat(PEER_SLUG_MAX_BYTES + 1);
+    for bad in [
+        "",
+        ".",
+        "..",
+        "ymote/.",
+        "a/b",
+        "a\\b",
+        "/abs",
+        "..\\x",
+        "a\0b",
+        "C:",
+        "a:b",
+        "abc.",
+        "abc ",
+        "a\tb",
+        "a\nb",
+        "a\x7fb",
+        too_long.as_str(),
+    ] {
+        assert!(!peer_slug_is_safe(bad), "{bad:?} should be rejected");
+    }
+    // Exactly at the cap is still accepted.
+    assert!(peer_slug_is_safe(&"x".repeat(PEER_SLUG_MAX_BYTES)));
+}
+
+/// #436 — `name_to_slug`: lowercase, collapse non-`[a-z0-9]` runs to a single
+/// dash, trim edges, cap length; a pure-unicode / all-punctuation name falls
+/// back to a stable `peer-<hash>` ASCII slug; only a blank name yields no slug.
+#[test]
+fn name_to_slug_normalizes_ascii_and_hashes_unicode() {
+    assert_eq!(name_to_slug("Edison").as_deref(), Some("edison"));
+    assert_eq!(name_to_slug("  CI Fix  ").as_deref(), Some("ci-fix"));
+    assert_eq!(name_to_slug("Team A/B").as_deref(), Some("team-a-b"));
+    assert_eq!(name_to_slug("a---b__c").as_deref(), Some("a-b-c"));
+    assert_eq!(name_to_slug("!!!Edison!!!").as_deref(), Some("edison"));
+    // ASCII alnum wins even when mixed with unicode.
+    assert_eq!(name_to_slug("Edison爱迪生").as_deref(), Some("edison"));
+
+    // Pure unicode / all-punctuation → a stable `peer-<hash>` ASCII slug
+    // (accepted, not rejected): deterministic, safe, and distinct per name.
+    for name in ["爱迪生", "🔬", "!!!"] {
+        let slug = name_to_slug(name).expect("a unicode name gets a hash slug");
+        assert!(slug.starts_with("peer-"), "hash slug: {slug}");
+        assert!(peer_slug_is_safe(&slug));
+        assert_eq!(name_to_slug(name).as_deref(), Some(slug.as_str()), "stable");
+    }
+    assert_ne!(
+        name_to_slug("爱迪生"),
+        name_to_slug("特斯拉"),
+        "distinct unicode names get distinct slugs"
+    );
+
+    // Only a blank / whitespace-only name has no peer.
+    assert_eq!(name_to_slug("   "), None);
+    assert_eq!(name_to_slug(""), None);
+
+    // Derived slug is always safe and within the cap.
+    let long = name_to_slug(&"Name ".repeat(40)).unwrap();
+    assert!(long.len() <= PEER_SLUG_MAX_BYTES);
+    assert!(peer_slug_is_safe(&long));
+}
+
+/// #436 hardening — closing a peer writes the durable `closed` marker (so a
+/// later gather/list and `peer_is_closed` report it), only the recorded owner
+/// may close, and an unauthorized / missing-dir / unsafe-slug close writes NO
+/// marker (leaving the peer open — never partially closed).
+#[test]
+fn peer_close_callback_writes_marker_for_owner_only() {
+    let tmp = tempfile::tempdir().unwrap();
+    let peers_root = tmp.path().join("peers");
+    let slug = "close-me";
+    std::fs::create_dir_all(peers_root.join(slug)).unwrap();
+    std::fs::write(peers_root.join(slug).join("brief.md"), "work").unwrap();
+    let owner = "tenant-a:api:master";
+    std::fs::write(peers_root.join(slug).join("originator"), owner).unwrap();
+
+    assert!(!peer_is_closed(&peers_root, slug), "not closed initially");
+
+    // A NON-owner cannot close — and writes no marker.
+    let intruder = build_peer_close_callback(
+        peers_root.clone(),
+        "tenant-a:api:intruder".to_owned(),
+        "tenant-a".to_owned(),
+        Arc::new(UiProtocolContractStores::default()),
+        Arc::new(|_event: PeerClosedEvent| {}),
+        Arc::new(|_event: ApprovalCancelledEvent| {}),
+    );
+    let err = intruder(slug.to_owned()).expect_err("non-owner must be rejected");
+    assert!(err.contains("not the owner"), "reason: {err}");
+    assert!(
+        !peer_is_closed(&peers_root, slug),
+        "a rejected close must not leave a marker"
+    );
+
+    // The owner closes → durable marker written, body carries the closer id.
+    let close = build_peer_close_callback(
+        peers_root.clone(),
+        owner.to_owned(),
+        "tenant-a".to_owned(),
+        Arc::new(UiProtocolContractStores::default()),
+        Arc::new(|_event: PeerClosedEvent| {}),
+        Arc::new(|_event: ApprovalCancelledEvent| {}),
+    );
+    let msg = close(slug.to_owned()).expect("owner closes");
+    assert!(msg.contains("closed"), "confirmation: {msg}");
+    assert!(peer_is_closed(&peers_root, slug), "marker is durable");
+    let body = std::fs::read_to_string(peers_root.join(slug).join("closed")).unwrap();
+    assert!(
+        body.contains(owner),
+        "marker body records the closer: {body:?}"
+    );
+
+    // A never-staged peer does not resolve (no name match, no staged dir) and
+    // leaves no marker — a close cannot resurrect / create a peer.
+    let err = close("no-such-peer".to_owned()).expect_err("unstaged peer rejected");
+    assert!(err.contains("no peer named"), "reason: {err}");
+    assert!(
+        !peer_is_closed(&peers_root, "no-such-peer"),
+        "a rejected close writes no marker"
+    );
+
+    // A traversal identifier is rejected at resolve (never joined as a path).
+    let bad = close("../escape".to_owned()).expect_err("unsafe identifier rejected");
+    assert!(bad.contains("no peer named"), "reason: {bad}");
+}
+
+/// A SUCCESSFUL `peer_close` emits exactly one durable `peer/closed` event
+/// stamped with the ORIGINATING (owner) session, the closed peer's topic
+/// (`peer-<slug>`), its slug, and the profile — mirroring the `peer/staged`
+/// emit. A REJECTED close (unstaged / unauthorized) emits nothing.
+#[test]
+fn peer_close_callback_emits_closed_event_on_success_only() {
+    let tmp = tempfile::tempdir().unwrap();
+    let peers_root = tmp.path().join("peers");
+    let slug = "wrap-up";
+    std::fs::create_dir_all(peers_root.join(slug)).unwrap();
+    std::fs::write(peers_root.join(slug).join("brief.md"), "work").unwrap();
+    let owner = "tenant-a:api:master";
+    std::fs::write(peers_root.join(slug).join("originator"), owner).unwrap();
+
+    let emitted: Arc<StdMutex<Vec<PeerClosedEvent>>> = Arc::new(StdMutex::new(Vec::new()));
+    let sink = emitted.clone();
+    let close = build_peer_close_callback(
+        peers_root.clone(),
+        owner.to_owned(),
+        "tenant-a".to_owned(),
+        Arc::new(UiProtocolContractStores::default()),
+        Arc::new(move |event| sink.lock().unwrap().push(event)),
+        Arc::new(|_event: ApprovalCancelledEvent| {}),
+    );
+
+    // A rejected close (peer was never staged) emits nothing.
+    close("no-such-peer".to_owned()).expect_err("unstaged peer rejected");
+    assert!(
+        emitted.lock().unwrap().is_empty(),
+        "a rejected close emits no peer/closed event"
+    );
+
+    // The owner closes → exactly one durable peer/closed event.
+    close(slug.to_owned()).expect("owner closes");
+    let events = emitted.lock().unwrap();
+    assert_eq!(events.len(), 1, "one peer/closed per successful close");
+    let event = &events[0];
+    assert_eq!(
+        event.session_id,
+        octos_core::SessionKey(owner.to_owned()),
+        "event routes to the ORIGINATING (owner) session"
+    );
+    assert_eq!(event.topic, format!("peer-{slug}"), "closed peer's topic");
+    assert_eq!(event.slug, slug);
+    assert_eq!(event.profile_id, "tenant-a");
+}
+
+/// PART C — a NAMED peer reserves the exact name-derived slug, stores the
+/// display name, and REJECTS a duplicate name (case-insensitive) or a name
+/// that derives an already-taken slug (no auto-suffix).
+#[test]
+fn stage_peer_named_rejects_duplicate_name_case_insensitive() {
+    let tmp = tempfile::tempdir().unwrap();
+    let peers = tmp.path().join("peers");
+    let ws = tmp.path().join("ws");
+    std::fs::create_dir_all(&ws).unwrap();
+
+    let first = stage_peer(&peers, &ws, "seed", Some("Edison"), None, "Brief.", false)
+        .expect("first named peer");
+    assert_eq!(first.slug, "edison");
+    assert_eq!(
+        std::fs::read_to_string(peers.join("edison").join("name")).unwrap(),
+        "Edison",
+        "the display name is stored verbatim"
+    );
+
+    // Same name (different case) → rejected, NOT auto-suffixed.
+    let dup = stage_peer(&peers, &ws, "seed", Some("EDISON"), None, "Brief.", false)
+        .expect_err("duplicate name rejected");
+    assert!(
+        dup.message.contains("already exists"),
+        "reason: {}",
+        dup.message
+    );
+    // A different name that derives the SAME slug is also rejected.
+    let dup2 = stage_peer(&peers, &ws, "seed", Some("edison"), None, "Brief.", false)
+        .expect_err("duplicate slug rejected");
+    assert!(
+        dup2.message.contains("already exists"),
+        "reason: {}",
+        dup2.message
+    );
+
+    // A DISTINCT name stages fine.
+    let second = stage_peer(&peers, &ws, "seed", Some("Tesla"), None, "Brief.", false)
+        .expect("distinct name");
+    assert_eq!(second.slug, "tesla");
+}
+
+/// PART C — `resolve_peer_name_to_slug` maps a display NAME (case-insensitive)
+/// or a slug to the slug; unknown / unsafe idents do not resolve; a legacy
+/// peer with no `name` file resolves by its slug.
+#[test]
+fn resolve_peer_name_to_slug_matches_name_and_slug() {
+    let tmp = tempfile::tempdir().unwrap();
+    let peers = tmp.path().join("peers");
+    let ws = tmp.path().join("ws");
+    std::fs::create_dir_all(&ws).unwrap();
+    stage_peer(&peers, &ws, "seed", Some("Edison"), None, "Brief.", false).unwrap();
+
+    for ident in ["Edison", "edison", "EDISON", "  Edison  "] {
+        assert_eq!(
+            resolve_peer_name_to_slug(&peers, ident).as_deref(),
+            Some("edison"),
+            "identifier {ident:?} resolves to the slug"
+        );
+    }
+    assert_eq!(resolve_peer_name_to_slug(&peers, "Tesla"), None);
+    assert_eq!(resolve_peer_name_to_slug(&peers, "../escape"), None);
+
+    // A legacy peer (brief but no `name` file) resolves by its slug.
+    std::fs::create_dir_all(peers.join("legacy")).unwrap();
+    std::fs::write(peers.join("legacy").join("brief.md"), "b").unwrap();
+    assert_eq!(
+        resolve_peer_name_to_slug(&peers, "legacy").as_deref(),
+        Some("legacy")
+    );
+}
+
+/// PART C — peer_list and peer_gather surface the display NAME (with the slug
+/// annotated), and gather resolves a name/slug in its identifier filter.
+#[test]
+fn peer_list_and_gather_surface_display_name() {
+    let tmp = tempfile::tempdir().unwrap();
+    let peers = tmp.path().join("peers");
+    let ws = tmp.path().join("ws");
+    std::fs::create_dir_all(&ws).unwrap();
+    stage_peer(
+        &peers,
+        &ws,
+        "seed",
+        Some("Edison"),
+        None,
+        "Wire the lab.",
+        false,
+    )
+    .unwrap();
+
+    let list_cb = build_peer_list_callback(
+        peers.clone(),
+        Vec::new(),
+        Arc::new(UiProtocolContractStores::default()),
+        "seed".to_owned(),
+    );
+    let list = list_cb().unwrap();
+    assert!(
+        list.contains("Edison"),
+        "list shows the display name: {list}"
+    );
+    assert!(list.contains("(edison)"), "list annotates the slug: {list}");
+
+    let gather_cb = build_peer_gather_callback(peers.clone());
+    let gather = gather_cb(None).unwrap();
+    assert!(
+        gather.contains("## peer Edison [edison]"),
+        "gather header shows name + slug: {gather}"
+    );
+    // Gather narrows by a DISPLAY NAME in the identifier filter.
+    let by_name = gather_cb(Some(vec!["Edison".to_owned()])).unwrap();
+    assert!(
+        by_name.contains("## peer Edison"),
+        "gather resolves a display name: {by_name}"
+    );
+}
+
+/// PART A + PART C — closing a peer BY NAME reaches the right peer, cancels its
+/// PENDING `peer_send_input` injection (no durable leak), and leaves siblings
+/// untouched.
+#[test]
+fn peer_close_by_name_cancels_pending_injection_for_right_peer() {
+    use crate::api::agent_orchestrator::PeerSendInputEnqueueOutcome;
+    let orchestrator = default_agent_orchestrator();
+    let profile_id = "test-peer-close-by-name";
+    let owner = "test-peer-close-by-name:api:master";
+    let tmp = tempfile::tempdir().unwrap();
+    let peers = tmp.path().join("peers");
+    let ws = tmp.path().join("ws");
+    std::fs::create_dir_all(&ws).unwrap();
+
+    let edison = stage_peer(&peers, &ws, "s", Some("Edison"), None, "b", false).unwrap();
+    let tesla = stage_peer(&peers, &ws, "s", Some("Tesla"), None, "b", false).unwrap();
+    assert_eq!(edison.slug, "edison");
+    assert_eq!(tesla.slug, "tesla");
+    std::fs::write(peers.join("edison").join("originator"), owner).unwrap();
+    std::fs::write(peers.join("tesla").join("originator"), owner).unwrap();
+
+    // Queue an injection to Edison — the pre-close leak scenario.
+    let wire = SessionKey::with_profile_topic(profile_id, "api", "c1", "peer-edison");
+    assert_eq!(
+        orchestrator
+            .enqueue_peer_send_input_continuation(&wire, profile_id, "edison", "occ-1", "resume"),
+        PeerSendInputEnqueueOutcome::Queued
+    );
+    assert_eq!(
+        orchestrator.pending_continuation_count_for_session_for_test(&wire, profile_id),
+        1
+    );
+
+    // Close BY DISPLAY NAME (case-insensitive) → the RIGHT peer closes, its
+    // pending injection is cancelled, and the sibling is untouched.
+    let close = build_peer_close_callback(
+        peers.clone(),
+        owner.to_owned(),
+        profile_id.to_owned(),
+        Arc::new(UiProtocolContractStores::default()),
+        Arc::new(|_event: PeerClosedEvent| {}),
+        Arc::new(|_event: ApprovalCancelledEvent| {}),
+    );
+    let msg = close("EDISON".to_owned()).expect("close by name");
+    assert!(msg.contains("edison"), "confirmation names the slug: {msg}");
+    assert!(peer_is_closed(&peers, "edison"), "the named peer is closed");
+    assert!(!peer_is_closed(&peers, "tesla"), "the sibling is untouched");
+    assert_eq!(
+        orchestrator.pending_continuation_count_for_session_for_test(&wire, profile_id),
+        0,
+        "peer_close cancels the peer's pending injection (no durable leak)"
+    );
+}
+
+/// FIX 1 (security) — a SYMLINKED `peers/<slug>` entry is never resolved, read,
+/// closed, or written through: `staged_peer_dir` inspects the link (not its
+/// target), so I/O can't escape `peers/`.
+#[cfg(unix)]
+#[test]
+fn symlinked_peer_entry_is_not_resolved_or_written() {
+    let tmp = tempfile::tempdir().unwrap();
+    let peers = tmp.path().join("peers");
+    std::fs::create_dir_all(&peers).unwrap();
+    // A hostile target OUTSIDE peers/, complete with brief/name/closed so it
+    // WOULD resolve if the symlink were followed.
+    let outside = tmp.path().join("outside");
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::write(outside.join("brief.md"), "b").unwrap();
+    std::fs::write(outside.join("name"), "Edison").unwrap();
+    std::fs::write(outside.join("closed"), "x").unwrap();
+    std::os::unix::fs::symlink(&outside, peers.join("edison")).unwrap();
+
+    // Every access refuses the symlink.
+    assert!(staged_peer_dir(&peers, "edison").is_none());
+    assert_eq!(resolve_peer_name_to_slug(&peers, "Edison"), None);
+    assert_eq!(resolve_peer_name_to_slug(&peers, "edison"), None);
+    assert!(
+        !peer_is_closed(&peers, "edison"),
+        "a symlinked entry's `closed` is not followed"
+    );
+    assert!(
+        read_peer_blackboard(&peers, None).is_empty(),
+        "a symlinked entry is not a blackboard row"
+    );
+    // peer_close cannot resolve (hence cannot write a marker) through the link.
+    let close = build_peer_close_callback(
+        peers.clone(),
+        "owner".to_owned(),
+        "prof".to_owned(),
+        Arc::new(UiProtocolContractStores::default()),
+        Arc::new(|_event: PeerClosedEvent| {}),
+        Arc::new(|_event: ApprovalCancelledEvent| {}),
+    );
+    let err = close("Edison".to_owned()).expect_err("symlinked peer must not resolve/close");
+    assert!(err.contains("no peer named"), "reason: {err}");
+
+    // A REAL staged peer beside the symlink is handled normally.
+    let real = peers.join("tesla");
+    std::fs::create_dir_all(&real).unwrap();
+    std::fs::write(real.join("brief.md"), "b").unwrap();
+    assert!(staged_peer_dir(&peers, "tesla").is_some());
+    assert_eq!(
+        resolve_peer_name_to_slug(&peers, "tesla").as_deref(),
+        Some("tesla")
+    );
+}
+
+/// FIX 2 (security) — an unsafe topic-derived slug (`peer-/tmp/x`, `peer-../x`,
+/// a separator/NUL topic) is treated as a NON-peer session, so it never feeds
+/// `Path::join` or the wire registry.
+#[test]
+fn unsafe_peer_topic_slug_is_treated_as_non_peer() {
+    for topic in [
+        "peer-/tmp/x",
+        "peer-../x",
+        "peer-a/b",
+        "peer-a\0b",
+        "peer-.",
+    ] {
+        let s = SessionKey::with_profile_topic("dev", "api", "tab", topic);
+        assert!(
+            peer_slug_and_profile(&s).is_none(),
+            "{topic:?} must not parse as a peer session"
+        );
+        assert!(
+            peer_target_is_current_wire(&s),
+            "{topic:?} is a non-peer target (never gated)"
+        );
+    }
+    // A safe peer topic still parses.
+    let ok = SessionKey::with_profile_topic("dev", "api", "tab", "peer-edison");
+    assert_eq!(peer_slug_and_profile(&ok), Some(("dev", "edison")));
+
+    // register_peer_wire_session must NOT register a wire for an unsafe topic.
+    let state = Arc::new(AppState::empty_for_tests());
+    let bad = SessionKey::with_profile_topic("dev", "api", "tab", "peer-/tmp/x");
+    register_peer_wire_session(&state, &bad);
+    assert_eq!(
+        peer_wire_registry().resolve(&peer_wire_key("dev", "/tmp/x")),
+        None,
+        "an unsafe peer topic must not register a wire key"
+    );
+}
+
+/// FIX 5 — a pending injection to a CLOSED peer is RETIRED (cancelled +
+/// tombstoned) by the drain-gate retire path, not left pending/stranded. This
+/// exercises the exact decision (`peer_is_closed`) + action
+/// (`cancel_peer_send_input_continuations_for_peer`) the global-drain gate wires.
+#[test]
+fn drain_retires_continuation_for_closed_peer_not_pending() {
+    use crate::api::agent_orchestrator::PeerSendInputEnqueueOutcome;
+    let orchestrator = default_agent_orchestrator();
+    let profile_id = "test-drain-retire-closed";
+    let slug = "retire-peer";
+    let tmp = tempfile::tempdir().unwrap();
+    let peers = tmp.path().join("peers");
+    std::fs::create_dir_all(peers.join(slug)).unwrap();
+    std::fs::write(peers.join(slug).join("brief.md"), "b").unwrap();
+
+    let wire = SessionKey::with_profile_topic(profile_id, "api", "c1", &format!("peer-{slug}"));
+    assert_eq!(
+        orchestrator.enqueue_peer_send_input_continuation(&wire, profile_id, slug, "occ-1", "go"),
+        PeerSendInputEnqueueOutcome::Queued
+    );
+    assert_eq!(
+        orchestrator.pending_continuation_count_for_session_for_test(&wire, profile_id),
+        1
+    );
+
+    // The peer is closed → the gate detects it via `peer_is_closed` and RETIRES
+    // the pending set instead of skipping (which would strand it).
+    std::fs::write(peers.join(slug).join("closed"), "owner\n0\n").unwrap();
+    assert!(peer_is_closed(&peers, slug), "closed marker detected");
+    orchestrator.cancel_peer_send_input_continuations_for_peer(profile_id, slug);
+    assert_eq!(
+        orchestrator.pending_continuation_count_for_session_for_test(&wire, profile_id),
+        0,
+        "a closed peer's continuation is retired, not left pending"
+    );
+}
+
+/// #436 hardening — the peer_list index caps inline rows and folds the
+/// overflow into a trailing "… and N more" line.
+#[test]
+fn peer_list_caps_rows_and_summarizes_overflow() {
+    fn row(slug: &str) -> PeerBlackboardRow {
+        PeerBlackboardRow {
+            slug: slug.to_owned(),
+            name: slug.to_owned(),
+            brief: String::new(),
+            brief_truncated: false,
+            result: None,
+            result_truncated: false,
+            result_updated_unix: None,
+            has_worktree: false,
+            closed: false,
+            turn_history: None,
+            model_lane: None,
+        }
+    }
+    let over = PEER_LIST_MAX_ROWS + 5;
+    let rows: Vec<_> = (0..over).map(|i| row(&format!("p{i:04}"))).collect();
+    let text = compose_peer_list_text(&rows, &[], &Default::default());
+    assert!(
+        text.starts_with(&format!("peers ({over}):")),
+        "header reports the true count: {:?}",
+        text.lines().next()
+    );
+    let listed = text.lines().filter(|l| l.starts_with("- p")).count();
+    assert_eq!(listed, PEER_LIST_MAX_ROWS, "inline rows are capped");
+    assert!(
+        text.contains("… and 5 more"),
+        "overflow summarized: {text:?}"
+    );
+
+    // Under the cap: every row inline, no summary line.
+    let few = compose_peer_list_text(&[row("only")], &[], &Default::default());
+    assert!(few.contains("- only"), "{few}");
+    assert!(
+        !few.contains("more"),
+        "no overflow line under the cap: {few}"
+    );
 }
 
 /// #1801 v3 fan-in: the composed tool output is capped at 48KiB total,
@@ -24547,18 +26382,1103 @@ fn peer_originator_recorded_by_handoff_callback() {
         workspace,
         originating.clone(),
         "dev".to_owned(),
+        Vec::new(),
         Arc::new(AtomicU32::new(0)),
         Arc::new(|_event| {}),
     );
     let staged = callback(octos_agent::PeerHandoffRequest {
         brief: "Fix the flaky bus test.".to_owned(),
-        title: Some("CI Fix".to_owned()),
+        name: "CI Fix".to_owned(),
         worktree: false,
+        model: None,
     })
     .expect("stage");
     let originator =
         std::fs::read_to_string(peers_root.join(&staged.slug).join("originator")).unwrap();
     assert_eq!(originator, originating.to_string());
+}
+
+// ----------------------------------------------------------------------------
+// #peer-model — per-peer model lane (a peer runs its turns on a named
+// `sub_provider` lane configured in the master's profile).
+// ----------------------------------------------------------------------------
+
+/// A staged peer dir the lane readers accept: a real dir carrying the
+/// `brief.md` staging contract, plus the caller's extra files.
+fn stage_peer_dir_with(peers_root: &std::path::Path, slug: &str) -> std::path::PathBuf {
+    let dir = peers_root.join(slug);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("brief.md"), "brief").unwrap();
+    dir
+}
+
+/// A minimal profile config carrying ONE model lane (`key`) whose credential
+/// resolves offline through `env_vars` — enough to exercise lane selection +
+/// provider construction without a network call.
+fn config_with_lane(key: &str) -> crate::config::Config {
+    let mut config = crate::config::Config::default();
+    config.env_vars.insert(
+        "PEER_LANE_TEST_KEY".to_owned(),
+        "sk-peer-lane-test".to_owned(),
+    );
+    config.sub_providers = vec![crate::config::SubProviderConfig {
+        key: key.to_owned(),
+        provider: "openai".to_owned(),
+        model: Some("gpt-4o-mini".to_owned()),
+        api_key_env: Some("PEER_LANE_TEST_KEY".to_owned()),
+        base_url: None,
+        description: None,
+        default_context_window: None,
+        max_output_tokens: None,
+        api_type: None,
+    }];
+    config
+}
+
+fn peer_list_row(slug: &str, model_lane: Option<&str>) -> PeerBlackboardRow {
+    PeerBlackboardRow {
+        slug: slug.to_owned(),
+        name: slug.to_owned(),
+        brief: String::new(),
+        brief_truncated: false,
+        result: None,
+        result_truncated: false,
+        result_updated_unix: None,
+        has_worktree: false,
+        closed: false,
+        turn_history: None,
+        model_lane: model_lane.map(str::to_owned),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// #peer-respond — master answers a BLOCKED peer (human-in-the-loop).
+// The process-global pending STORE is the authority for "awaiting input" — not
+// the filesystem — so these drive the store + `peer_respond_resolve` /
+// `cancel_peer_pending_on_close` / `build_peer_list_callback` directly, WITHOUT
+// a live LLM. Each test uses a UNIQUE peer slug so the process-global peer-wire
+// registry never collides across parallel tests.
+// ---------------------------------------------------------------------------
+
+/// Stage a real peer dir (`brief.md` + `name` + `originator`) via the production
+/// staging callback (needed for the originator auth + name resolution), and
+/// register its TRUSTED wire session in the process-global registry (so
+/// peer_list / peer_respond can join slug → session → store). Returns
+/// `(slug, peer_session_key)`.
+fn stage_and_open_peer(
+    peers_root: &std::path::Path,
+    profile_id: &str,
+    name: &str,
+    originator: &octos_core::SessionKey,
+) -> (String, octos_core::SessionKey) {
+    std::fs::create_dir_all(peers_root).unwrap();
+    let workspace = peers_root.parent().unwrap().join("work");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let callback = build_peer_handoff_callback(
+        peers_root.to_path_buf(),
+        workspace,
+        originator.clone(),
+        profile_id.to_owned(),
+        Vec::new(),
+        Arc::new(AtomicU32::new(0)),
+        Arc::new(|_event| {}),
+    );
+    let slug = callback(octos_agent::PeerHandoffRequest {
+        brief: "do the work".to_owned(),
+        name: name.to_owned(),
+        worktree: false,
+        model: None,
+    })
+    .expect("stage peer")
+    .slug;
+    let peer_key = octos_core::SessionKey::with_profile_topic(
+        profile_id,
+        "api",
+        "tab",
+        &format!("peer-{slug}"),
+    );
+    peer_wire_registry().register(peer_wire_key(profile_id, &slug), peer_key.clone());
+    (slug, peer_key)
+}
+
+fn approval_event(session: &octos_core::SessionKey, id: &ApprovalId) -> ApprovalRequestedEvent {
+    ApprovalRequestedEvent::generic(
+        session.clone(),
+        id.clone(),
+        TurnId::new(),
+        "shell".to_owned(),
+        "Run rm -rf build?".to_owned(),
+        "rm -rf build".to_owned(),
+    )
+}
+
+fn question_event(
+    session: &octos_core::SessionKey,
+    id: &QuestionId,
+    questions: Vec<octos_core::ui_protocol::UserQuestion>,
+) -> UserQuestionRequestedEvent {
+    UserQuestionRequestedEvent {
+        session_id: session.clone(),
+        topic: session.topic().map(ToOwned::to_owned),
+        question_id: id.clone(),
+        turn_id: TurnId::new(),
+        title: "Pick".to_owned(),
+        body: "Pick a store".to_owned(),
+        questions,
+    }
+}
+
+fn one_free_text_question() -> Vec<octos_core::ui_protocol::UserQuestion> {
+    vec![octos_core::ui_protocol::UserQuestion {
+        header: "DB".to_owned(),
+        question: "Which database?".to_owned(),
+        options: Vec::new(),
+        multi_select: false,
+        allow_free_text: true,
+    }]
+}
+
+/// A strict CHOICE question (options, NO free text) — a string answer MUST map
+/// to a label or the store rejects it (`free_text_not_allowed`).
+fn choice_question(question: &str, options: &[&str]) -> octos_core::ui_protocol::UserQuestion {
+    octos_core::ui_protocol::UserQuestion {
+        header: question.to_owned(),
+        question: question.to_owned(),
+        options: options
+            .iter()
+            .map(|l| octos_core::ui_protocol::UserQuestionOption {
+                label: (*l).to_owned(),
+                description: String::new(),
+            })
+            .collect(),
+        multi_select: false,
+        allow_free_text: false,
+    }
+}
+
+fn approve_req(slug: &str, id: Option<&str>) -> octos_agent::PeerRespondRequest {
+    octos_agent::PeerRespondRequest {
+        slug: slug.to_owned(),
+        id: id.map(ToOwned::to_owned),
+        decision: Some("approve".to_owned()),
+        answers: None,
+    }
+}
+
+fn answer_req(slug: &str, texts: &[&str]) -> octos_agent::PeerRespondRequest {
+    octos_agent::PeerRespondRequest {
+        slug: slug.to_owned(),
+        id: None,
+        decision: None,
+        answers: Some(
+            texts
+                .iter()
+                .map(|t| octos_agent::PeerRespondAnswer {
+                    selected_labels: Vec::new(),
+                    free_text: Some((*t).to_owned()),
+                })
+                .collect(),
+        ),
+    }
+}
+
+fn no_decided_sink() -> impl Fn(&ApprovalDecidedEvent, Option<&str>) {
+    |_event: &ApprovalDecidedEvent, _tool: Option<&str>| {}
+}
+
+/// (P2-6 / overarching) A parked peer is VISIBLE via the store with NO
+/// filesystem write at all — request_runtime alone makes peer_list report
+/// `awaiting_input`, so a peer can never park invisibly.
+#[test]
+fn peer_parks_visible_via_store_without_any_filesystem_marker() {
+    let tmp = tempfile::tempdir().unwrap();
+    let peers_root = tmp.path().join("data").join("peers");
+    let master = octos_core::SessionKey::with_profile_topic("dev", "local", "tui", "coding");
+    let (slug, peer_key) = stage_and_open_peer(&peers_root, "prof-vis", "vis", &master);
+
+    let contracts = Arc::new(UiProtocolContractStores::default());
+    let approval_id = ApprovalId::new();
+    let _rx = contracts
+        .approvals
+        .request_runtime(approval_event(&peer_key, &approval_id));
+
+    // No pending-* file was written; the store alone drives peer_list.
+    let list = build_peer_list_callback(
+        peers_root.clone(),
+        Vec::new(),
+        contracts.clone(),
+        "prof-vis".to_owned(),
+    );
+    let text = list().unwrap();
+    assert!(
+        text.contains("awaiting_input"),
+        "store makes it visible: {text}"
+    );
+    assert!(
+        text.contains(&approval_id.0.to_string()),
+        "lists the id: {text}"
+    );
+    let _ = slug;
+}
+
+/// (B) peer_list lists EACH pending id (approval + question) from the store.
+#[test]
+fn peer_list_lists_each_pending_id_from_store() {
+    let tmp = tempfile::tempdir().unwrap();
+    let peers_root = tmp.path().join("data").join("peers");
+    let master = octos_core::SessionKey::with_profile_topic("dev", "local", "tui", "coding");
+    let (_slug, peer_key) = stage_and_open_peer(&peers_root, "prof-list", "listy", &master);
+
+    let contracts = Arc::new(UiProtocolContractStores::default());
+    let aid = ApprovalId::new();
+    let qid = QuestionId::new();
+    let _r1 = contracts
+        .approvals
+        .request_runtime(approval_event(&peer_key, &aid));
+    let _r2 = contracts.user_questions.request_runtime(question_event(
+        &peer_key,
+        &qid,
+        one_free_text_question(),
+    ));
+
+    let list = build_peer_list_callback(
+        peers_root.clone(),
+        Vec::new(),
+        contracts.clone(),
+        "prof-list".to_owned(),
+    );
+    let text = list().unwrap();
+    assert!(text.contains("awaiting_input"), "status: {text}");
+    assert!(text.contains(&aid.0.to_string()), "approval id: {text}");
+    assert!(text.contains(&qid.0.to_string()), "question id: {text}");
+}
+
+/// (C) peer_respond resolves a pending APPROVAL (approve) via the store, and
+/// emits `approval/decided` attributing the MASTER (#P1-5).
+#[test]
+fn peer_respond_resolves_pending_approval_approve() {
+    let tmp = tempfile::tempdir().unwrap();
+    let peers_root = tmp.path().join("data").join("peers");
+    let master = octos_core::SessionKey::with_profile_topic("dev", "local", "tui", "coding");
+    let (slug, peer_key) = stage_and_open_peer(&peers_root, "prof-approve", "approve", &master);
+
+    let contracts = UiProtocolContractStores::default();
+    let approval_id = ApprovalId::new();
+    let mut rx = contracts
+        .approvals
+        .request_runtime(approval_event(&peer_key, &approval_id));
+
+    let decided = std::cell::RefCell::new(Vec::<ApprovalDecidedEvent>::new());
+    let sink = |event: &ApprovalDecidedEvent, _tool: Option<&str>| {
+        decided.borrow_mut().push(event.clone());
+    };
+
+    peer_respond_resolve(
+        &peers_root,
+        &master.0,
+        "prof-approve",
+        &contracts,
+        &sink,
+        approve_req(&slug, None),
+    )
+    .expect("approve resolves the pending approval");
+
+    assert_eq!(
+        rx.try_recv().expect("oneshot resolved"),
+        ApprovalDecision::Approve
+    );
+    let events = decided.borrow();
+    assert_eq!(events.len(), 1, "approval/decided emitted once");
+    assert_eq!(
+        events[0].decided_by, master.0,
+        "master is the decision source"
+    );
+}
+
+/// (C) peer_respond resolves a pending APPROVAL (deny).
+#[test]
+fn peer_respond_resolves_pending_approval_deny() {
+    let tmp = tempfile::tempdir().unwrap();
+    let peers_root = tmp.path().join("data").join("peers");
+    let master = octos_core::SessionKey::with_profile_topic("dev", "local", "tui", "coding");
+    let (slug, peer_key) = stage_and_open_peer(&peers_root, "prof-deny", "deny", &master);
+
+    let contracts = UiProtocolContractStores::default();
+    let approval_id = ApprovalId::new();
+    let mut rx = contracts
+        .approvals
+        .request_runtime(approval_event(&peer_key, &approval_id));
+
+    peer_respond_resolve(
+        &peers_root,
+        &master.0,
+        "prof-deny",
+        &contracts,
+        &no_decided_sink(),
+        octos_agent::PeerRespondRequest {
+            slug: slug.clone(),
+            id: None,
+            decision: Some("deny".to_owned()),
+            answers: None,
+        },
+    )
+    .expect("deny resolves");
+    assert_eq!(rx.try_recv().unwrap(), ApprovalDecision::Deny);
+}
+
+/// (C) peer_respond resolves a single-question prompt with a free-text answer.
+#[test]
+fn peer_respond_resolves_pending_question_answer() {
+    let tmp = tempfile::tempdir().unwrap();
+    let peers_root = tmp.path().join("data").join("peers");
+    let master = octos_core::SessionKey::with_profile_topic("dev", "local", "tui", "coding");
+    let (slug, peer_key) = stage_and_open_peer(&peers_root, "prof-q", "q", &master);
+
+    let contracts = UiProtocolContractStores::default();
+    let qid = QuestionId::new();
+    let mut rx = contracts.user_questions.request_runtime(question_event(
+        &peer_key,
+        &qid,
+        one_free_text_question(),
+    ));
+
+    peer_respond_resolve(
+        &peers_root,
+        &master.0,
+        "prof-q",
+        &contracts,
+        &no_decided_sink(),
+        answer_req(&slug, &["use postgres"]),
+    )
+    .expect("answer resolves");
+    let answers = rx.try_recv().expect("question oneshot resolved");
+    assert_eq!(answers.len(), 1);
+    assert_eq!(answers[0].free_text.as_deref(), Some("use postgres"));
+}
+
+/// (new-P2-#2) A 2-question strict CHOICE prompt is answerable with STRING
+/// answers — each maps to ITS question's option label (not free text, which
+/// these questions forbid). This is the exact case that was broken before.
+#[test]
+fn peer_respond_multi_question_choice_maps_string_answers_to_labels() {
+    let tmp = tempfile::tempdir().unwrap();
+    let peers_root = tmp.path().join("data").join("peers");
+    let master = octos_core::SessionKey::with_profile_topic("dev", "local", "tui", "coding");
+    let (slug, peer_key) = stage_and_open_peer(&peers_root, "prof-multi", "multi", &master);
+
+    let contracts = UiProtocolContractStores::default();
+    let qid = QuestionId::new();
+    let questions = vec![
+        choice_question("Enable SSL?", &["Yes", "No"]),
+        choice_question("Which store?", &["postgres", "sqlite"]),
+    ];
+    let mut rx = contracts
+        .user_questions
+        .request_runtime(question_event(&peer_key, &qid, questions));
+
+    // Bare strings, one per question — must become label selections.
+    peer_respond_resolve(
+        &peers_root,
+        &master.0,
+        "prof-multi",
+        &contracts,
+        &no_decided_sink(),
+        answer_req(&slug, &["Yes", "postgres"]),
+    )
+    .expect("a 2-question choice prompt is answerable with string answers");
+
+    let answers = rx.try_recv().expect("multi-question oneshot resolved");
+    assert_eq!(answers.len(), 2);
+    assert_eq!(answers[0].selected_labels, vec!["Yes".to_string()]);
+    assert!(answers[0].free_text.is_none());
+    assert_eq!(answers[1].selected_labels, vec!["postgres".to_string()]);
+}
+
+/// (P1-3) With MULTIPLE pending prompts, an id is REQUIRED; answering one leaves
+/// the other pending (its oneshot untouched).
+#[test]
+fn peer_respond_requires_id_when_multiple_pending() {
+    let tmp = tempfile::tempdir().unwrap();
+    let peers_root = tmp.path().join("data").join("peers");
+    let master = octos_core::SessionKey::with_profile_topic("dev", "local", "tui", "coding");
+    let (slug, peer_key) = stage_and_open_peer(&peers_root, "prof-many", "many", &master);
+
+    let contracts = UiProtocolContractStores::default();
+    let id1 = ApprovalId::new();
+    let id2 = ApprovalId::new();
+    let mut rx1 = contracts
+        .approvals
+        .request_runtime(approval_event(&peer_key, &id1));
+    let mut rx2 = contracts
+        .approvals
+        .request_runtime(approval_event(&peer_key, &id2));
+
+    let err = peer_respond_resolve(
+        &peers_root,
+        &master.0,
+        "prof-many",
+        &contracts,
+        &no_decided_sink(),
+        approve_req(&slug, None),
+    )
+    .expect_err(">1 pending without an id is rejected");
+    assert!(err.contains("pending prompts"), "clear error: {err}");
+    assert!(rx1.try_recv().is_err() && rx2.try_recv().is_err());
+
+    peer_respond_resolve(
+        &peers_root,
+        &master.0,
+        "prof-many",
+        &contracts,
+        &no_decided_sink(),
+        approve_req(&slug, Some(&id1.0.to_string())),
+    )
+    .expect("targeting id1 resolves it");
+    assert_eq!(rx1.try_recv().unwrap(), ApprovalDecision::Approve);
+    assert!(rx2.try_recv().is_err(), "the other prompt is untouched");
+    // id2 still pending in the store.
+    let still = peer_pending_summaries(&contracts, &peer_key);
+    assert_eq!(still.len(), 1);
+    assert_eq!(still[0].id, id2.0.to_string());
+}
+
+/// (P1-1 SECURITY) peer_respond can only ever reach THIS peer's oneshots: the
+/// session key is derived from the wire registry, and the target is chosen from
+/// the store's entries for THAT session — so a victim peer's id is simply not in
+/// the attacker peer's pending set.
+#[test]
+fn peer_respond_cannot_target_another_peers_pending() {
+    let tmp = tempfile::tempdir().unwrap();
+    let peers_root = tmp.path().join("data").join("peers");
+    let master = octos_core::SessionKey::with_profile_topic("dev", "local", "tui", "coding");
+    let (slug, _attacker_key) = stage_and_open_peer(&peers_root, "prof-atk", "attacker", &master);
+
+    let contracts = UiProtocolContractStores::default();
+    // A DIFFERENT victim peer with a live pending approval under ITS own key.
+    let victim_key =
+        octos_core::SessionKey::with_profile_topic("prof-atk", "api", "tab", "peer-victim");
+    let victim_id = ApprovalId::new();
+    let mut victim_rx = contracts
+        .approvals
+        .request_runtime(approval_event(&victim_key, &victim_id));
+
+    let err = peer_respond_resolve(
+        &peers_root,
+        &master.0,
+        "prof-atk",
+        &contracts,
+        &no_decided_sink(),
+        approve_req(&slug, Some(&victim_id.0.to_string())),
+    )
+    .expect_err("cannot target another peer's pending id");
+    // The attacker's OWN pending set (from its derived session) is empty, so the
+    // victim's id is unreachable — rejected as not-awaiting / no-such-id.
+    assert!(
+        err.contains("not awaiting input") || err.contains("no pending prompt"),
+        "rejected: {err}"
+    );
+    assert!(
+        victim_rx.try_recv().is_err(),
+        "victim oneshot stays unresolved"
+    );
+}
+
+/// (P1-1 targeted) An UNKNOWN/bogus id does NOT disturb a still-parked entry —
+/// the store is authoritative and the bogus id never reaches respond.
+#[test]
+fn peer_respond_unknown_id_leaves_other_pending_intact() {
+    let tmp = tempfile::tempdir().unwrap();
+    let peers_root = tmp.path().join("data").join("peers");
+    let master = octos_core::SessionKey::with_profile_topic("dev", "local", "tui", "coding");
+    let (slug, peer_key) = stage_and_open_peer(&peers_root, "prof-unk", "unk", &master);
+
+    let contracts = UiProtocolContractStores::default();
+    let s1 = ApprovalId::new();
+    let mut rx1 = contracts
+        .approvals
+        .request_runtime(approval_event(&peer_key, &s1));
+
+    let bogus = ApprovalId::new();
+    let err = peer_respond_resolve(
+        &peers_root,
+        &master.0,
+        "prof-unk",
+        &contracts,
+        &no_decided_sink(),
+        approve_req(&slug, Some(&bogus.0.to_string())),
+    )
+    .expect_err("an unknown id errors");
+    assert!(err.contains("no pending prompt"), "rejected: {err}");
+    assert!(rx1.try_recv().is_err(), "S1 stays parked");
+    assert_eq!(
+        peer_pending_summaries(&contracts, &peer_key).len(),
+        1,
+        "S1 still pending"
+    );
+}
+
+/// Authorization: a non-originator is rejected; the oneshot stays unresolved.
+#[test]
+fn peer_respond_rejects_non_originator() {
+    let tmp = tempfile::tempdir().unwrap();
+    let peers_root = tmp.path().join("data").join("peers");
+    let master = octos_core::SessionKey::with_profile_topic("dev", "local", "tui", "coding");
+    let (slug, peer_key) = stage_and_open_peer(&peers_root, "prof-auth", "auth", &master);
+
+    let contracts = UiProtocolContractStores::default();
+    let approval_id = ApprovalId::new();
+    let mut rx = contracts
+        .approvals
+        .request_runtime(approval_event(&peer_key, &approval_id));
+
+    let err = peer_respond_resolve(
+        &peers_root,
+        "some-other-session",
+        "prof-auth",
+        &contracts,
+        &no_decided_sink(),
+        approve_req(&slug, None),
+    )
+    .expect_err("non-originator rejected");
+    assert!(err.contains("owner"), "ownership error: {err}");
+    assert!(rx.try_recv().is_err(), "oneshot untouched");
+}
+
+/// Error when the peer is open but has NO pending entry.
+#[test]
+fn peer_respond_errors_when_not_awaiting_input() {
+    let tmp = tempfile::tempdir().unwrap();
+    let peers_root = tmp.path().join("data").join("peers");
+    let master = octos_core::SessionKey::with_profile_topic("dev", "local", "tui", "coding");
+    let (slug, _key) = stage_and_open_peer(&peers_root, "prof-idle", "idle", &master);
+
+    let contracts = UiProtocolContractStores::default();
+    let err = peer_respond_resolve(
+        &peers_root,
+        &master.0,
+        "prof-idle",
+        &contracts,
+        &no_decided_sink(),
+        approve_req(&slug, None),
+    )
+    .expect_err("no pending → error");
+    assert!(err.contains("not awaiting input"), "clear error: {err}");
+}
+
+/// Kind mismatch: answering an APPROVAL with `answers` errors, oneshot untouched.
+#[test]
+fn peer_respond_rejects_wrong_response_kind() {
+    let tmp = tempfile::tempdir().unwrap();
+    let peers_root = tmp.path().join("data").join("peers");
+    let master = octos_core::SessionKey::with_profile_topic("dev", "local", "tui", "coding");
+    let (slug, peer_key) = stage_and_open_peer(&peers_root, "prof-kind", "kind", &master);
+
+    let contracts = UiProtocolContractStores::default();
+    let approval_id = ApprovalId::new();
+    let mut rx = contracts
+        .approvals
+        .request_runtime(approval_event(&peer_key, &approval_id));
+
+    let err = peer_respond_resolve(
+        &peers_root,
+        &master.0,
+        "prof-kind",
+        &contracts,
+        &no_decided_sink(),
+        answer_req(&slug, &["sure"]),
+    )
+    .expect_err("answering an approval is a kind mismatch");
+    assert!(err.contains("APPROVAL"), "names the kind: {err}");
+    assert!(rx.try_recv().is_err(), "oneshot untouched");
+}
+
+/// Peer not open (no wire) → clear error even with a store entry.
+#[test]
+fn peer_respond_errors_when_peer_not_open() {
+    let tmp = tempfile::tempdir().unwrap();
+    let peers_root = tmp.path().join("data").join("peers");
+    let master = octos_core::SessionKey::with_profile_topic("dev", "local", "tui", "coding");
+    // Stage but do NOT open (no wire registration): craft the slug manually.
+    std::fs::create_dir_all(&peers_root).unwrap();
+    let workspace = peers_root.parent().unwrap().join("work");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let cb = build_peer_handoff_callback(
+        peers_root.clone(),
+        workspace,
+        master.clone(),
+        "prof-closed".to_owned(),
+        Vec::new(),
+        Arc::new(AtomicU32::new(0)),
+        Arc::new(|_e| {}),
+    );
+    let slug = cb(octos_agent::PeerHandoffRequest {
+        brief: "x".to_owned(),
+        name: "notopen".to_owned(),
+        worktree: false,
+        model: None,
+    })
+    .unwrap()
+    .slug;
+
+    let contracts = UiProtocolContractStores::default();
+    let err = peer_respond_resolve(
+        &peers_root,
+        &master.0,
+        "prof-noopen",
+        &contracts,
+        &no_decided_sink(),
+        approve_req(&slug, None),
+    )
+    .expect_err("no wire → not open");
+    assert!(err.contains("not open"), "clear error: {err}");
+}
+
+/// (P1-2) `peer_close` cancels a pending approval from the AUTHORITATIVE store
+/// (fail-closed) — no filesystem marker involved — releasing the parked turn.
+#[test]
+fn peer_close_cancels_pending_from_store() {
+    let tmp = tempfile::tempdir().unwrap();
+    let peers_root = tmp.path().join("data").join("peers");
+    let master = octos_core::SessionKey::with_profile_topic("dev", "local", "tui", "coding");
+    let (slug, peer_key) = stage_and_open_peer(&peers_root, "prof-close", "closing", &master);
+
+    let contracts = UiProtocolContractStores::default();
+    let approval_id = ApprovalId::new();
+    let mut rx = contracts
+        .approvals
+        .request_runtime(approval_event(&peer_key, &approval_id));
+
+    let cancelled = std::cell::RefCell::new(Vec::<ApprovalCancelledEvent>::new());
+    cancel_peer_pending_on_close(&contracts, "prof-close", &slug, &|event| {
+        cancelled.borrow_mut().push(event);
+    });
+
+    assert!(
+        rx.try_recv().is_err(),
+        "closing a parked peer releases its oneshot"
+    );
+    assert!(
+        peer_pending_summaries(&contracts, &peer_key).is_empty(),
+        "no longer pending"
+    );
+    assert_eq!(cancelled.borrow().len(), 1, "approval/cancelled emitted");
+    assert_eq!(cancelled.borrow()[0].reason, "peer_closed");
+}
+
+/// (P1-5) The shared `audit_approval_decided` helper writes a durable audit
+/// entry (the peer_respond production sink calls this alongside the emit).
+#[test]
+fn audit_approval_decided_writes_durable_entry() {
+    use octos_core::ui_protocol::ApprovalRequestedEvent;
+    let temp = tempfile::tempdir().unwrap();
+    let contracts = UiProtocolContractStores::default();
+    let session_id = SessionKey("dev:peer-audit".into());
+    let approval_id = ApprovalId::new();
+    contracts.approvals.request(ApprovalRequestedEvent::generic(
+        session_id.clone(),
+        approval_id.clone(),
+        TurnId::new(),
+        "shell",
+        "Run",
+        "body",
+    ));
+    let params = ApprovalRespondParams::new(
+        session_id.clone(),
+        approval_id.clone(),
+        ApprovalDecision::Approve,
+    );
+    let outcome = contracts
+        .approvals
+        .respond_with_context(params.clone())
+        .unwrap();
+    let event = crate::api::ui_protocol_approvals::build_decided_event(
+        &params,
+        &outcome,
+        "master:session",
+        chrono::Utc::now(),
+    );
+
+    audit_approval_decided(&contracts, temp.path(), &event, Some("shell"));
+
+    let active = std::fs::read_dir(temp.path().join("audit"))
+        .expect("audit dir")
+        .filter_map(Result::ok)
+        .next()
+        .expect("active log")
+        .path();
+    let lines = crate::api::ui_protocol_audit::read_audit_lines(&active);
+    assert_eq!(lines.len(), 1, "one audit entry per master decision");
+    assert_eq!(lines[0]["approval_id"], json!(approval_id.0.to_string()));
+    assert_eq!(lines[0]["decided_by"], json!("master:session"));
+    assert_eq!(lines[0]["decision"], json!("approve"));
+}
+
+/// Depth-1: `peer_respond` is gated on the SAME predicate as peer_send_input /
+/// peer_close — never registered on a peer session.
+#[test]
+fn peer_respond_depth_guard_excludes_peer_sessions() {
+    let peer = octos_core::SessionKey::with_profile_topic("dev", "local", "tui", "peer-alpha");
+    let master = octos_core::SessionKey::with_profile_topic("dev", "local", "tui", "coding");
+    assert!(
+        !peer_handoff_allowed_for_session(&peer),
+        "peer_respond (gated on this predicate) must NOT be registered on a peer session"
+    );
+    assert!(
+        peer_handoff_allowed_for_session(&master),
+        "a normal master session CAN register peer_respond"
+    );
+}
+
+/// #peer-model (part 2): a `peer_handoff` naming a CONFIGURED lane records it
+/// beside the brief (`peers/<slug>/model`) and produces no warning note.
+#[test]
+fn peer_handoff_callback_records_valid_model_lane() {
+    let tmp = tempfile::tempdir().unwrap();
+    let peers_root = tmp.path().join("data").join("peers");
+    let workspace = tmp.path().join("work");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let originating = octos_core::SessionKey::with_profile_topic("dev", "local", "tui", "coding");
+    let callback = build_peer_handoff_callback(
+        peers_root.clone(),
+        workspace,
+        originating,
+        "dev".to_owned(),
+        vec!["cheap".to_owned(), "strong".to_owned()],
+        Arc::new(AtomicU32::new(0)),
+        Arc::new(|_event| {}),
+    );
+
+    let staged = callback(octos_agent::PeerHandoffRequest {
+        brief: "Synthesize the peers' findings.".to_owned(),
+        name: "Synth".to_owned(),
+        worktree: false,
+        model: Some("strong".to_owned()),
+    })
+    .expect("a valid lane still stages the peer");
+
+    let recorded = std::fs::read_to_string(peers_root.join(&staged.slug).join("model")).unwrap();
+    assert_eq!(
+        recorded, "strong",
+        "the valid lane is recorded beside the brief"
+    );
+    assert!(
+        staged.model_note.is_none(),
+        "a valid lane produces no warning note: {:?}",
+        staged.model_note
+    );
+}
+
+/// #peer-model (part 2): a `peer_handoff` naming an UNKNOWN lane still stages
+/// the peer, records NO model file (so it uses the primary model), and returns
+/// a note naming the bad lane, the available lanes, and the fallback.
+#[test]
+fn peer_handoff_callback_notes_unknown_model_lane_but_still_stages() {
+    let tmp = tempfile::tempdir().unwrap();
+    let peers_root = tmp.path().join("data").join("peers");
+    let workspace = tmp.path().join("work");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let originating = octos_core::SessionKey::with_profile_topic("dev", "local", "tui", "coding");
+    let callback = build_peer_handoff_callback(
+        peers_root.clone(),
+        workspace,
+        originating,
+        "dev".to_owned(),
+        vec!["cheap".to_owned(), "strong".to_owned()],
+        Arc::new(AtomicU32::new(0)),
+        Arc::new(|_event| {}),
+    );
+
+    let staged = callback(octos_agent::PeerHandoffRequest {
+        brief: "Grind the grunt work.".to_owned(),
+        name: "Grunt".to_owned(),
+        worktree: false,
+        model: Some("gpt-mega".to_owned()),
+    })
+    .expect("an unknown lane warns, it does not fail staging");
+
+    assert!(
+        std::path::Path::new(&staged.brief_path).is_file(),
+        "the peer is still staged despite the unknown lane"
+    );
+    assert!(
+        !peers_root.join(&staged.slug).join("model").exists(),
+        "an unknown lane is not recorded on disk"
+    );
+    let note = staged.model_note.expect("an unknown lane yields a note");
+    assert!(note.contains("gpt-mega"), "note names the bad lane: {note}");
+    assert!(
+        note.contains("cheap, strong"),
+        "note lists the available lanes: {note}"
+    );
+    assert!(
+        note.contains("primary model"),
+        "note explains the fallback: {note}"
+    );
+}
+
+/// #peer-model (part 3): the lane read trims the file and treats a missing or
+/// empty `model` file as "no lane" (primary model).
+#[test]
+fn read_peer_model_lane_trims_and_treats_empty_as_absent() {
+    let tmp = tempfile::tempdir().unwrap();
+    let peers_root = tmp.path().join("peers");
+
+    let padded = stage_peer_dir_with(&peers_root, "synth");
+    std::fs::write(padded.join("model"), "  strong \n").unwrap();
+    assert_eq!(
+        read_peer_model_lane(&peers_root, "synth").as_deref(),
+        Some("strong"),
+        "the recorded lane is trimmed"
+    );
+
+    stage_peer_dir_with(&peers_root, "bare");
+    assert_eq!(
+        read_peer_model_lane(&peers_root, "bare"),
+        None,
+        "no model file → no lane"
+    );
+
+    let blank = stage_peer_dir_with(&peers_root, "blank");
+    std::fs::write(blank.join("model"), "   \n").unwrap();
+    assert_eq!(
+        read_peer_model_lane(&peers_root, "blank"),
+        None,
+        "a whitespace-only model file → no lane"
+    );
+}
+
+/// #peer-model (part 3): a peer naming a CONFIGURED lane resolves that lane's
+/// provider (selection + build succeed offline via `env_vars`).
+#[test]
+fn resolve_peer_lane_provider_selects_configured_lane() {
+    let tmp = tempfile::tempdir().unwrap();
+    let peers_root = tmp.path().join("peers");
+    let dir = stage_peer_dir_with(&peers_root, "synth");
+    std::fs::write(dir.join("model"), "strong").unwrap();
+
+    let config = config_with_lane("strong");
+    assert!(
+        resolve_peer_lane_provider(&peers_root, "synth", &config).is_some(),
+        "a peer naming a configured lane resolves that lane's provider"
+    );
+}
+
+/// #peer-model (part 3): an UNMATCHED lane key falls back to the primary model
+/// (None) — the pure selection-miss branch.
+#[test]
+fn resolve_peer_lane_provider_none_for_unmatched_lane() {
+    let tmp = tempfile::tempdir().unwrap();
+    let peers_root = tmp.path().join("peers");
+    let dir = stage_peer_dir_with(&peers_root, "synth");
+    std::fs::write(dir.join("model"), "nonesuch").unwrap();
+
+    // Only "strong" is configured; the recorded "nonesuch" matches nothing.
+    let config = config_with_lane("strong");
+    assert!(
+        resolve_peer_lane_provider(&peers_root, "synth", &config).is_none(),
+        "an unmatched lane falls back to the primary model (None)"
+    );
+}
+
+/// #peer-model (part 3): a peer with NO recorded lane falls back to the
+/// primary model (None) even when lanes are configured.
+#[test]
+fn resolve_peer_lane_provider_none_without_model_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    let peers_root = tmp.path().join("peers");
+    stage_peer_dir_with(&peers_root, "synth");
+
+    let config = config_with_lane("strong");
+    assert!(
+        resolve_peer_lane_provider(&peers_root, "synth", &config).is_none(),
+        "no model file → primary model (None)"
+    );
+}
+
+/// #peer-model (part 3): the wrapper returns None for a NON-peer session — it
+/// relies on `peer_slug_and_profile`, which rejects a plain coding session and
+/// accepts a `peer-<slug>` topic.
+#[test]
+fn peer_lane_resolution_skips_non_peer_session() {
+    let plain = octos_core::SessionKey::with_profile_topic("dev", "local", "tui", "coding");
+    assert!(
+        peer_slug_and_profile(&plain).is_none(),
+        "a non-peer session is never a lane target"
+    );
+    let peer = octos_core::SessionKey::with_profile_topic("dev", "local", "tui", "peer-synth");
+    assert_eq!(peer_slug_and_profile(&peer), Some(("dev", "synth")));
+}
+
+/// #peer-model (part 4a): `peer_list` annotates a peer on a CURRENTLY-configured
+/// lane, flags a peer whose recorded lane no longer resolves as
+/// `unavailable→primary`, and leaves a primary-model peer unannotated.
+#[test]
+fn compose_peer_list_text_annotates_and_flags_stale_model_lane() {
+    let rows = vec![
+        peer_list_row("synth", Some("strong")),
+        peer_list_row("stale", Some("gone")),
+        peer_list_row("grunt", None),
+    ];
+    // Only "strong" is currently configured.
+    let text = compose_peer_list_text(&rows, &["strong".to_owned()], &Default::default());
+    assert!(
+        text.contains("- synth  running  updated —  turns 0  · model=strong"),
+        "a live lane peer is annotated with its lane: {text:?}"
+    );
+    let stale_line = text
+        .lines()
+        .find(|line| line.starts_with("- stale"))
+        .expect("stale row present");
+    assert!(
+        stale_line.contains("· model=gone (unavailable→primary)"),
+        "a lane that no longer resolves is flagged, matching what the turn does: {stale_line:?}"
+    );
+    let grunt_line = text
+        .lines()
+        .find(|line| line.starts_with("- grunt"))
+        .expect("grunt row present");
+    assert!(
+        !grunt_line.contains("model="),
+        "a primary-model peer has no lane annotation: {grunt_line:?}"
+    );
+}
+
+/// #peer-model (codex-1): a lane that OMITS its own `api_key_env` must CLEAR the
+/// primary's (never inherit the primary provider's credential); a lane WITH one
+/// uses it.
+#[test]
+fn lane_provider_config_clears_primary_api_key_env_when_lane_omits_it() {
+    let mut primary = crate::config::Config::default();
+    primary.api_key_env = Some("PRIMARY_PROVIDER_KEY".to_owned());
+
+    // A lane on a DIFFERENT provider with NO api_key_env of its own.
+    let lane = crate::config::SubProviderConfig {
+        key: "strong".to_owned(),
+        provider: "anthropic".to_owned(),
+        model: Some("claude-x".to_owned()),
+        api_key_env: None,
+        base_url: None,
+        description: None,
+        default_context_window: None,
+        max_output_tokens: None,
+        api_type: None,
+    };
+    assert_eq!(
+        lane_provider_config(&primary, &lane).api_key_env,
+        None,
+        "a lane without its own api_key_env CLEARS the primary's (falls back to the lane provider's default env), not inherits it"
+    );
+
+    // A lane WITH its own api_key_env uses that.
+    let lane_keyed = crate::config::SubProviderConfig {
+        api_key_env: Some("LANE_KEY".to_owned()),
+        ..lane.clone()
+    };
+    assert_eq!(
+        lane_provider_config(&primary, &lane_keyed)
+            .api_key_env
+            .as_deref(),
+        Some("LANE_KEY"),
+        "a lane with its own api_key_env uses it"
+    );
+}
+
+/// #peer-model (codex-3): duplicate lane keys resolve to the LAST match,
+/// mirroring `ProviderRouter`'s last-wins registration.
+#[test]
+fn select_peer_lane_prefers_last_duplicate_key() {
+    let mut config = crate::config::Config::default();
+    let base = crate::config::SubProviderConfig {
+        key: "strong".to_owned(),
+        provider: "openai".to_owned(),
+        model: Some("first".to_owned()),
+        api_key_env: None,
+        base_url: None,
+        description: None,
+        default_context_window: None,
+        max_output_tokens: None,
+        api_type: None,
+    };
+    config.sub_providers = vec![
+        base.clone(),
+        crate::config::SubProviderConfig {
+            provider: "anthropic".to_owned(),
+            model: Some("second".to_owned()),
+            ..base.clone()
+        },
+    ];
+    let sp = select_peer_lane(&config, "strong").expect("lane found");
+    assert_eq!(
+        sp.model.as_deref(),
+        Some("second"),
+        "the LAST duplicate wins (matches ProviderRouter register-last-wins)"
+    );
+    assert_eq!(sp.provider, "anthropic");
+    assert!(select_peer_lane(&config, "cheap").is_none());
+}
+
+/// #peer-model (codex-2): a symlinked `model` leaf is refused by BOTH the
+/// turn-path read and peer_list's independent read — never followed.
+#[cfg(unix)]
+#[test]
+fn read_peer_model_lane_refuses_symlinked_model_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    let peers_root = tmp.path().join("peers");
+    let dir = stage_peer_dir_with(&peers_root, "synth");
+    // Point `model` at an external file via a symlink.
+    let secret = tmp.path().join("elsewhere");
+    std::fs::write(&secret, "strong").unwrap();
+    std::os::unix::fs::symlink(&secret, dir.join("model")).unwrap();
+
+    assert_eq!(
+        read_peer_model_lane(&peers_root, "synth"),
+        None,
+        "the turn-path read refuses a symlinked model file"
+    );
+    let row = read_peer_blackboard(&peers_root, None)
+        .into_iter()
+        .find(|r| r.slug == "synth")
+        .expect("row present");
+    assert_eq!(
+        row.model_lane, None,
+        "peer_list's independent read also refuses the symlinked model file"
+    );
+}
+
+/// #peer-model (codex-4b): when the lane record WRITE fails, the tool note must
+/// say the peer fell back to the primary model — not report success.
+#[test]
+fn record_peer_model_lane_reports_fallback_when_write_fails() {
+    let tmp = tempfile::tempdir().unwrap();
+    let peers_root = tmp.path().join("peers");
+    let dir = stage_peer_dir_with(&peers_root, "synth");
+    // Force the atomic write to fail: `model` already exists as a DIRECTORY, so
+    // the temp+rename cannot replace it with a file.
+    std::fs::create_dir(dir.join("model")).unwrap();
+
+    let note = record_peer_model_lane(&peers_root, "synth", Some("strong"), &["strong".to_owned()])
+        .expect("a failed record yields a note");
+    assert!(
+        note.contains("primary model"),
+        "a failed record is truthful about the fallback: {note}"
+    );
+    // A clean record (no pre-existing obstruction) yields no note.
+    let clean = stage_peer_dir_with(&peers_root, "synth2");
+    assert_eq!(
+        record_peer_model_lane(
+            &peers_root,
+            "synth2",
+            Some("strong"),
+            &["strong".to_owned()]
+        ),
+        None,
+        "a clean record produces no warning note"
+    );
+    assert_eq!(
+        std::fs::read_to_string(clean.join("model")).unwrap(),
+        "strong",
+        "the lane is recorded on a clean write"
+    );
 }
 
 /// Mailbox nudge (#1801 v3): `peer/prepare` records the originator for every
@@ -24675,6 +27595,7 @@ fn peer_results_ready_note_fires_once_per_new_result() {
     let peers_root = tmp.path().join("peers");
     let dir = peers_root.join("alpha");
     std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("brief.md"), "brief").unwrap();
     let originating = octos_core::SessionKey::with_profile_topic("dev", "local", "tui", "coding");
     std::fs::write(dir.join("originator"), originating.to_string()).unwrap();
     std::fs::write(dir.join("result.md"), "first result").unwrap();
@@ -24721,6 +27642,7 @@ fn peer_results_ready_note_scopes_to_the_originating_session() {
     let peers_root = tmp.path().join("peers");
     let dir = peers_root.join("alpha");
     std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("brief.md"), "brief").unwrap();
     let originating = octos_core::SessionKey::with_profile_topic("dev", "local", "tui", "coding");
     std::fs::write(dir.join("originator"), originating.to_string()).unwrap();
     std::fs::write(dir.join("result.md"), "done").unwrap();
@@ -24731,6 +27653,7 @@ fn peer_results_ready_note_scopes_to_the_originating_session() {
         octos_core::SessionKey::with_profile_topic("dev", "local", "tui", "peer-beta");
     let peer_owned = peers_root.join("beta-child");
     std::fs::create_dir_all(&peer_owned).unwrap();
+    std::fs::write(peer_owned.join("brief.md"), "brief").unwrap();
     std::fs::write(peer_owned.join("originator"), peer_session.to_string()).unwrap();
     std::fs::write(peer_owned.join("result.md"), "done").unwrap();
     assert_eq!(peer_results_ready_note(&peers_root, &peer_session), None);
@@ -24763,6 +27686,7 @@ fn peer_results_ready_note_caps_named_slugs() {
     for i in 1..=6 {
         let dir = peers_root.join(format!("lane-{i}"));
         std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("brief.md"), "brief").unwrap();
         std::fs::write(dir.join("originator"), originating.to_string()).unwrap();
         std::fs::write(dir.join("result.md"), "done").unwrap();
     }
@@ -25211,28 +28135,83 @@ async fn peer_fleet_result_writer_and_gather_roundtrip() {
     // an unstaged peer topic writes nothing (no dir creation).
     let peer_key =
         octos_core::SessionKey::with_profile_topic("dev", "local", "tui", "peer-lens-review-2");
-    write_peer_result_if_peer_session(&state, &peer_key, "completed", "All three lenses agree.");
+    write_peer_result_if_peer_session(
+        &state,
+        &peer_key,
+        TurnTerminalOutcome::Completed,
+        "All three lenses agree.",
+    );
     let written =
         std::fs::read_to_string(peers_root.join("lens-review-2").join("result.md")).unwrap();
-    assert!(written.contains("status: completed"));
+    assert!(
+        written.contains("outcome: completed"),
+        "result.md should contain outcome: completed"
+    );
+    assert!(written.contains("turn: 1"), "first turn should be turn 1");
     assert!(written.contains("All three lenses agree."));
+    // #435: versioned result file for historical record.
+    let versioned =
+        std::fs::read_to_string(peers_root.join("lens-review-2").join("result-1.md")).unwrap();
+    assert!(versioned.contains("outcome: completed"));
+    // #435: turns.txt index file.
+    let turns =
+        std::fs::read_to_string(peers_root.join("lens-review-2").join("turns.txt")).unwrap();
+    assert!(
+        turns.contains("1 completed"),
+        "turns.txt first line should be '1 completed'"
+    );
     let ghost_key =
         octos_core::SessionKey::with_profile_topic("dev", "local", "tui", "peer-never-staged");
-    write_peer_result_if_peer_session(&state, &ghost_key, "completed", "ghost");
+    write_peer_result_if_peer_session(&state, &ghost_key, TurnTerminalOutcome::Completed, "ghost");
     assert!(
         !peers_root.join("never-staged").exists(),
         "an unstaged peer topic must not create directories"
     );
     // A non-peer topic is a no-op.
     let coding_key = octos_core::SessionKey::with_profile_topic("dev", "local", "tui", "coding");
-    write_peer_result_if_peer_session(&state, &coding_key, "completed", "not a peer");
+    write_peer_result_if_peer_session(
+        &state,
+        &coding_key,
+        TurnTerminalOutcome::Completed,
+        "not a peer",
+    );
 
-    // Overwrite = latest state.
-    write_peer_result_if_peer_session(&state, &peer_key, "error", "second turn failed");
+    // Overwrite = latest state on result.md, versioned file for turn 2.
+    write_peer_result_if_peer_session(
+        &state,
+        &peer_key,
+        TurnTerminalOutcome::Errored,
+        "second turn failed",
+    );
     let rewritten =
         std::fs::read_to_string(peers_root.join("lens-review-2").join("result.md")).unwrap();
-    assert!(rewritten.contains("status: error"));
+    assert!(rewritten.contains("outcome: error"));
+    assert!(
+        rewritten.contains("turn: 2"),
+        "second turn should be turn 2"
+    );
     assert!(!rewritten.contains("All three lenses agree."));
+    // #435: historical copy preserved.
+    let turn1 =
+        std::fs::read_to_string(peers_root.join("lens-review-2").join("result-1.md")).unwrap();
+    assert!(
+        turn1.contains("All three lenses agree."),
+        "result-1.md must preserve turn 1"
+    );
+    let turn2 =
+        std::fs::read_to_string(peers_root.join("lens-review-2").join("result-2.md")).unwrap();
+    assert!(
+        turn2.contains("second turn failed"),
+        "result-2.md must have turn 2 result"
+    );
+    // #435: turns.txt has both entries.
+    let turns =
+        std::fs::read_to_string(peers_root.join("lens-review-2").join("turns.txt")).unwrap();
+    assert!(
+        turns.contains("1 completed"),
+        "turns.txt must contain turn 1"
+    );
+    assert!(turns.contains("2 error"), "turns.txt must contain turn 2");
 
     // Gather: all peers, brief always present, result only where written,
     // slugs filter narrows.

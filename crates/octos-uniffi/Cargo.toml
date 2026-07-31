@@ -1,0 +1,46 @@
+[package]
+name = "octos-uniffi"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "uniffi bindings (idiomatic Python/Swift/Kotlin from one Rust definition) for embedding octos, over the octos-ffi native core."
+
+[lib]
+# cdylib   -> the shared library the generated Python/Swift/Kotlin load.
+# staticlib -> a `.a` for hosts that static-link (e.g. iOS).
+# rlib      -> lets this crate's own Rust tests exercise the wrapped surface.
+crate-type = ["cdylib", "staticlib", "rlib"]
+name = "octos_uniffi"
+
+# uniffi-bindgen CLI: generates the foreign-language bindings from the built
+# library metadata (no UDL — everything is proc-macro). Invoke as, e.g.:
+#   cargo run -p octos-uniffi --bin uniffi-bindgen -- generate \
+#       --library target/debug/liboctos_uniffi.dylib \
+#       --language python --out-dir crates/octos-uniffi/bindings/python
+[[bin]]
+name = "uniffi-bindgen"
+path = "src/bin/uniffi-bindgen.rs"
+
+[dependencies]
+# The native octos core. Path dep (octos-ffi is a workspace member, not a
+# `workspace.dependencies` entry). This crate wraps its `OctosRuntime` core;
+# the hardened credential path lives entirely in octos-ffi.
+octos-ffi = { path = "../octos-ffi" }
+# `cli` pulls in the in-library `uniffi_bindgen_main` (used by the bin above),
+# plus the proc-macros for the idiomatic surface (Record/Object/Error/export).
+uniffi = { version = "0.29", features = ["cli"] }
+
+[features]
+default = []
+# Re-export octos-ffi's optional in-process GGUF embedder so `Runtime::embed`
+# returns real vectors instead of `NoEmbedder`. Off by default, so the plain
+# `cargo build --workspace` stays pure Rust.
+embed-llama = ["octos-ffi/embed-llama"]
+
+# Inherits the workspace `deny(unsafe_code)`. uniffi's own macros generate the
+# FFI scaffolding (and annotate it), so this crate writes NO hand-unsafe code.
+[lints]
+workspace = true

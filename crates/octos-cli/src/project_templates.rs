@@ -901,25 +901,37 @@ fn run_site_bootstrap(
     let scripts_dir = skill_dir.join("scripts");
     std::fs::create_dir_all(project_dir)
         .map_err(|e| format!("create site project dir failed: {e}"))?;
+    let bash = resolve_site_bootstrap_bash()?;
 
-    let status = if metadata.template == "quarto-lesson" {
-        Command::new("bash")
-            .arg(scripts_dir.join("bootstrap_quarto_lesson.sh"))
+    // Windows CI runs these bootstrap scripts through Git Bash (MSYS2),
+    // whose coreutils treat `\` as a literal character rather than a path
+    // separator. A backslash-spelled `--out-dir "C:\...\out"` makes the
+    // script's `mkdir -p` fail ("Invalid argument"), and `set -euo pipefail`
+    // then aborts with exit code 1 — the failure surfaced on windows-latest.
+    // Forward-slash spellings are understood by every bash flavour (MSYS2,
+    // Cygwin, real Unix), so hand the script forward-slash paths. `replace`
+    // is a lexical no-op on Unix, where paths carry no backslashes.
+    let to_bash = |p: PathBuf| p.to_string_lossy().replace('\\', "/");
+    let out_dir_arg = to_bash(project_dir.to_path_buf());
+
+    let output = if metadata.template == "quarto-lesson" {
+        Command::new(&bash)
+            .arg(to_bash(scripts_dir.join("bootstrap_quarto_lesson.sh")))
             .arg("--out-dir")
-            .arg(project_dir)
+            .arg(&out_dir_arg)
             .arg("--title")
             .arg(&metadata.site_name)
             .arg("--description")
             .arg(&metadata.description)
-            .status()
+            .output()
             .map_err(|e| format!("spawn Quarto bootstrap failed: {e}"))?
     } else {
-        Command::new("bash")
-            .arg(scripts_dir.join("bootstrap_template.sh"))
+        Command::new(&bash)
+            .arg(to_bash(scripts_dir.join("bootstrap_template.sh")))
             .arg("--template")
             .arg(&metadata.template)
             .arg("--out-dir")
-            .arg(project_dir)
+            .arg(&out_dir_arg)
             .arg("--site-name")
             .arg(&metadata.site_name)
             .arg("--description")
@@ -930,18 +942,82 @@ fn run_site_bootstrap(
             .arg("en")
             .arg("--base-path")
             .arg(site_bootstrap_base_path(metadata))
-            .status()
+            .output()
             .map_err(|e| format!("spawn site bootstrap failed: {e}"))?
     };
 
-    if !status.success() {
+    if !output.status.success() {
+        // Surface the script's own stdout/stderr. A bare "exit code: 1" is
+        // undebuggable — especially on windows-latest, where these scripts
+        // run under Git Bash (MSYS2) and can fail for path/tooling reasons
+        // the caller never sees. Echo the resolved out-dir too, so path
+        // normalisation problems are visible at the failure site.
         return Err(format!(
-            "site bootstrap failed for {} with status {}",
-            metadata.template, status
+            "site bootstrap failed for {} with status {} \
+             (out-dir={out_dir_arg:?}) stdout={:?} stderr={:?}",
+            metadata.template,
+            output.status,
+            String::from_utf8_lossy(&output.stdout).trim(),
+            String::from_utf8_lossy(&output.stderr).trim(),
         ));
     }
 
     Ok(())
+}
+
+/// Resolve the shell used by the site bootstrap scripts.
+///
+/// Windows ships `System32\bash.exe` as the WSL launcher. On hosts without
+/// a WSL distribution, resolving a bare `bash` from `PATH` starts that
+/// launcher and the script never runs. Git for Windows is already required
+/// by site workspace initialization, so derive its MSYS2 Bash from Git's own
+/// exec path instead of relying on ambiguous process search order.
+fn resolve_site_bootstrap_bash() -> Result<PathBuf, String> {
+    #[cfg(not(windows))]
+    {
+        Ok(PathBuf::from("bash"))
+    }
+
+    #[cfg(windows)]
+    {
+        let output = Command::new("git")
+            .arg("--exec-path")
+            .output()
+            .map_err(|e| format!("resolve Git Bash failed: spawn `git --exec-path`: {e}"))?;
+        if !output.status.success() {
+            return Err(format!(
+                "resolve Git Bash failed: `git --exec-path` exited with {} \
+                 stdout={:?} stderr={:?}",
+                output.status,
+                String::from_utf8_lossy(&output.stdout).trim(),
+                String::from_utf8_lossy(&output.stderr).trim(),
+            ));
+        }
+
+        let raw_exec_path = String::from_utf8_lossy(&output.stdout);
+        let exec_path = PathBuf::from(raw_exec_path.trim());
+        if exec_path.as_os_str().is_empty() {
+            return Err("resolve Git Bash failed: `git --exec-path` returned an empty path".into());
+        }
+
+        // Standard 64-bit, 32-bit, and PortableGit layouts report an exec
+        // path below `<git-root>/mingw{32,64}/libexec/git-core`. Walk upward
+        // so the same lookup also covers installations with a custom prefix.
+        for ancestor in exec_path.ancestors() {
+            for relative in ["bin/bash.exe", "usr/bin/bash.exe"] {
+                let candidate = ancestor.join(relative);
+                if candidate.is_file() {
+                    return Ok(candidate);
+                }
+            }
+        }
+
+        Err(format!(
+            "resolve Git Bash failed: no `bin/bash.exe` or `usr/bin/bash.exe` \
+             found above Git exec path {}; install or repair Git for Windows",
+            exec_path.display(),
+        ))
+    }
 }
 
 fn site_bootstrap_base_path(metadata: &SiteProjectMetadata) -> &str {
@@ -1238,6 +1314,32 @@ printf '%s' "$BASE_PATH" >"$OUT_DIR/base_path.txt"
             std::fs::read_to_string(project_dir.join("base_path.txt")).unwrap(),
             "./",
             "React/Vite build assets must be relative so signed preview URLs load JS/CSS through /api/preview-signed/<token>/..."
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn should_resolve_git_bash_instead_of_the_wsl_launcher_on_windows() {
+        let bash = resolve_site_bootstrap_bash().expect("Git Bash resolves");
+        let output = Command::new(&bash)
+            .args(["--noprofile", "--norc", "-c", "uname -s"])
+            .output()
+            .expect("resolved Bash runs");
+
+        assert!(
+            output.status.success(),
+            "resolved Bash failed: path={} status={} stdout={:?} stderr={:?}",
+            bash.display(),
+            output.status,
+            String::from_utf8_lossy(&output.stdout).trim(),
+            String::from_utf8_lossy(&output.stderr).trim(),
+        );
+        let uname = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            uname.trim().starts_with("MINGW") || uname.trim().starts_with("MSYS"),
+            "site bootstrap must use Git Bash/MSYS, not WSL: path={} uname={:?}",
+            bash.display(),
+            uname.trim(),
         );
     }
 

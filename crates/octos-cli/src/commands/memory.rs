@@ -33,6 +33,22 @@ enum MemoryAction {
         #[arg(long)]
         data_dir: Option<PathBuf>,
     },
+    /// Regenerate missing or wrong-width episode embeddings.
+    ///
+    /// Changing the embedding model changes the vector WIDTH, and stored
+    /// vectors cannot be converted — only regenerated. Until they are, those
+    /// episodes fall back to BM25-only recall, which is invisible at query
+    /// time (search is just quietly worse). This is the repair.
+    ///
+    /// Requires the profile's store lock: stop `octos serve` first.
+    Reindex {
+        /// Report what would be re-embedded, then exit without writing.
+        #[arg(long)]
+        dry_run: bool,
+        /// Data directory (defaults to the resolved profile data dir).
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+    },
     /// Record a host-authored remember request (full consolidation
     /// authority — no model in the loop).
     Remember {
@@ -76,6 +92,7 @@ impl MemoryCommand {
         match self.action {
             MemoryAction::Refresh { data_dir } => run_refresh(data_dir).await,
             MemoryAction::Status { data_dir } => run_status(data_dir).await,
+            MemoryAction::Reindex { dry_run, data_dir } => run_reindex(dry_run, data_dir).await,
             MemoryAction::Remember { text, data_dir } => {
                 write_host_note(data_dir, octos_memory::NoteKind::UserRequest, text, false).await
             }
@@ -120,6 +137,132 @@ impl MemoryCommand {
             }
         }
     }
+}
+
+/// Episodes embedded per provider call. The in-process llama.cpp backend
+/// amortises its fixed per-forward-pass cost across a batch (~6x at 16), and
+/// remote providers accept batched input too, so this is the difference between
+/// a reindex taking seconds and taking minutes.
+const REINDEX_BATCH: usize = 16;
+
+async fn run_reindex(dry_run: bool, data_dir: Option<PathBuf>) -> Result<()> {
+    let (data_dir, config) = resolve(data_dir).await?;
+
+    // Resolve the embedder FIRST: it decides the index width, and without one
+    // there is nothing to regenerate. Failing here costs nothing.
+    let Some(embedder) = crate::commands::chat::create_embedder(&config) else {
+        eyre::bail!(
+            "no embedding provider configured — set `embedding` in your config.\n\
+             Without one, episodes are BM25-only by design and there is nothing to reindex."
+        );
+    };
+    let dimension = embedder.dimension();
+
+    // Strict open: this needs the writer lock. `octos serve` holds it in the
+    // normal fleet, so say that plainly instead of surfacing redb's
+    // "Database already open" — the operator's next action is to stop serve.
+    let store = octos_memory::EpisodeStore::open_with_dimension(&data_dir, dimension)
+        .await
+        .wrap_err_with(|| {
+            format!(
+                "failed to open the episode store at {} — if `octos serve` (or a gateway) is \
+                 running it holds the writer lock; stop it and retry",
+                data_dir.display()
+            )
+        })?;
+
+    let before = store.vector_coverage();
+    let pending = store.episodes_needing_vectors().await?;
+
+    println!("{}", "Episode vector coverage".bold());
+    println!("  data dir      {}", data_dir.display());
+    println!("  index width   {dimension}");
+    println!(
+        "  vectorized    {} / {} ({:.0}%)",
+        before.vectorized,
+        before.total,
+        before.ratio() * 100.0
+    );
+    if before.has_dimension_mismatch() {
+        println!(
+            "  {}  {} stored vector(s) have the wrong width for this model",
+            "mismatch".yellow(),
+            before.dimension_mismatches
+        );
+    }
+
+    if pending.is_empty() {
+        println!("\n{} nothing to reindex.", "✓".green());
+        return Ok(());
+    }
+    println!("\n  {} episode(s) need embedding", pending.len());
+
+    if dry_run {
+        for (id, summary) in pending.iter().take(10) {
+            let head: String = summary.chars().take(72).collect();
+            println!("    {id}  {head}");
+        }
+        if pending.len() > 10 {
+            println!("    … and {} more", pending.len() - 10);
+        }
+        println!("\n{} dry run — nothing written.", "•".dimmed());
+        return Ok(());
+    }
+
+    let mut embedded = 0usize;
+    let mut failed = 0usize;
+    for chunk in pending.chunks(REINDEX_BATCH) {
+        let texts: Vec<&str> = chunk.iter().map(|(_, summary)| summary.as_str()).collect();
+        // One failed batch must not abandon the rest: a provider hiccup or a
+        // single pathological summary would otherwise leave the store half
+        // repaired with no indication of where it stopped.
+        let vectors = match embedder.embed(&texts).await {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("  {} batch failed: {e}", "!".yellow());
+                failed += chunk.len();
+                continue;
+            }
+        };
+        if vectors.len() != chunk.len() {
+            eprintln!(
+                "  {} provider returned {} vector(s) for {} input(s); skipping batch",
+                "!".yellow(),
+                vectors.len(),
+                chunk.len()
+            );
+            failed += chunk.len();
+            continue;
+        }
+        for ((ep_id, _), vector) in chunk.iter().zip(vectors) {
+            match store.store_embedding(ep_id, vector).await {
+                Ok(()) => embedded += 1,
+                Err(e) => {
+                    eprintln!("  {} {ep_id}: {e}", "!".yellow());
+                    failed += 1;
+                }
+            }
+        }
+        println!("  {} / {} embedded", embedded, pending.len());
+    }
+
+    let after = store.vector_coverage();
+    println!(
+        "\n{} {embedded} embedded, {failed} failed. Coverage {:.0}% → {:.0}% ({} / {}).",
+        if failed == 0 {
+            "✓".green()
+        } else {
+            "partial".yellow()
+        },
+        before.ratio() * 100.0,
+        after.ratio() * 100.0,
+        after.vectorized,
+        after.total
+    );
+    if failed > 0 {
+        println!("  Re-run to retry the {failed} that failed.");
+    }
+    Ok(())
 }
 
 async fn write_host_note(

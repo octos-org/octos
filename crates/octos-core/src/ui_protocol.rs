@@ -256,6 +256,15 @@ pub const UI_PROTOCOL_FEATURE_VOICE_AUDIO_V1: &str = "event.voice_audio.v1";
 /// on the legacy `tool/completed` `structured_metadata` path.
 pub const UI_PROTOCOL_FEATURE_PLAN_TODOS_V1: &str = "plan.todos.v1";
 
+/// Smart-home bridge control (self-hosted/LAN bridge only). Gates
+/// `smart_home/status.get`, `smart_home/device.list`,
+/// `smart_home/device.command`, `smart_home/camera.stream_start`, and
+/// `smart_home/camera.stream_stop`. Device control/state moved server-side
+/// so the profile's bridge credentials never reach the browser; camera video
+/// itself still streams directly browser-to-bridge (these methods only
+/// return the playback URL).
+pub const UI_PROTOCOL_FEATURE_SMART_HOME_V1: &str = "smart_home.v1";
+
 /// Server-known feature registry. Used by
 /// [`UiProtocolCapabilities::for_negotiated_features`] (UPCR-2026-007) to
 /// intersect a client's `X-Octos-Ui-Features` request with the names the
@@ -286,6 +295,7 @@ pub const UI_PROTOCOL_KNOWN_FEATURES: &[&str] = &[
     UI_PROTOCOL_FEATURE_USER_QUESTION_V1,
     UI_PROTOCOL_FEATURE_VOICE_AUDIO_V1,
     UI_PROTOCOL_FEATURE_PLAN_TODOS_V1,
+    UI_PROTOCOL_FEATURE_SMART_HOME_V1,
 ];
 
 /// Returns the feature flag that gates `method` per spec § 7 capability
@@ -345,6 +355,11 @@ fn method_capability_gate(method: &str) -> Option<&'static str> {
         | methods::LOOP_FIRE_NOW => Some(UI_PROTOCOL_FEATURE_CODING_LOOP_RUNTIME_V1),
         methods::REVIEW_START => Some(UI_PROTOCOL_FEATURE_REVIEW_START_V1),
         methods::USER_QUESTION_RESPOND => Some(UI_PROTOCOL_FEATURE_USER_QUESTION_V1),
+        methods::SMART_HOME_STATUS_GET
+        | methods::SMART_HOME_DEVICE_LIST
+        | methods::SMART_HOME_DEVICE_COMMAND
+        | methods::SMART_HOME_CAMERA_STREAM_START
+        | methods::SMART_HOME_CAMERA_STREAM_STOP => Some(UI_PROTOCOL_FEATURE_SMART_HOME_V1),
         _ => None,
     }
 }
@@ -1221,6 +1236,29 @@ pub mod methods {
     /// the background. `session_id` is the ORIGINATING session; replayed on
     /// reconnect, so clients dedup by existing session.
     pub const PEER_STAGED: &str = "peer/staged";
+    /// `peer/closed` — the model's `peer_close` tool tore down a staged peer
+    /// session (durable brief + optional fenced worktree evicted). Mirrors
+    /// [`PEER_STAGED`]: `session_id` is the ORIGINATING session; durable so
+    /// reconnect replay redelivers it, and clients dedup by the closed peer.
+    pub const PEER_CLOSED: &str = "peer/closed";
+
+    // ---- Smart-home bridge integration ----
+    // Device control/state moved server-side from octos-web's client-only
+    // widget so bridge credentials never reach the browser. Camera video
+    // stays a direct browser-to-bridge stream; these methods only return
+    // the playback URL. All five are capability-gated on
+    // `UI_PROTOCOL_FEATURE_SMART_HOME_V1`.
+
+    /// Bridge configuration/reachability status for the current profile.
+    pub const SMART_HOME_STATUS_GET: &str = "smart_home/status.get";
+    /// Device list + state, proxied from the configured bridge.
+    pub const SMART_HOME_DEVICE_LIST: &str = "smart_home/device.list";
+    /// Send a device command (on/off, temperature, mode, action, ...).
+    pub const SMART_HOME_DEVICE_COMMAND: &str = "smart_home/device.command";
+    /// Start a camera stream; returns the bridge's playback URL.
+    pub const SMART_HOME_CAMERA_STREAM_START: &str = "smart_home/camera.stream_start";
+    /// Stop a camera stream.
+    pub const SMART_HOME_CAMERA_STREAM_STOP: &str = "smart_home/camera.stream_stop";
 }
 
 /// Reason codes for `approval/cancelled` notifications. The registry is
@@ -1291,6 +1329,11 @@ pub const UI_PROTOCOL_COMMAND_METHODS: &[&str] = &[
     methods::ROUTER_SET_MODE,
     methods::ROUTER_GET_METRICS,
     methods::LAUNCH_RESOLVE,
+    methods::SMART_HOME_STATUS_GET,
+    methods::SMART_HOME_DEVICE_LIST,
+    methods::SMART_HOME_DEVICE_COMMAND,
+    methods::SMART_HOME_CAMERA_STREAM_START,
+    methods::SMART_HOME_CAMERA_STREAM_STOP,
 ];
 
 /// Notification methods defined by the v1alpha1 protocol model.
@@ -1339,6 +1382,7 @@ pub const UI_PROTOCOL_NOTIFICATION_METHODS: &[&str] = &[
     methods::CONTEXT_COMPACTION_STARTED,
     methods::CONTEXT_NORMALIZATION_REPORTED,
     methods::PEER_STAGED,
+    methods::PEER_CLOSED,
 ];
 
 /// Request methods currently handled by the first server/runtime slice.
@@ -1401,6 +1445,11 @@ pub const UI_PROTOCOL_FIRST_SERVER_METHODS: &[&str] = &[
     methods::ROUTER_SET_MODE,
     methods::ROUTER_GET_METRICS,
     methods::LAUNCH_RESOLVE,
+    methods::SMART_HOME_STATUS_GET,
+    methods::SMART_HOME_DEVICE_LIST,
+    methods::SMART_HOME_DEVICE_COMMAND,
+    methods::SMART_HOME_CAMERA_STREAM_START,
+    methods::SMART_HOME_CAMERA_STREAM_STOP,
 ];
 
 /// Protocol methods known but not implemented by the first server/runtime slice.
@@ -1480,6 +1529,7 @@ impl UiProtocolCapabilities {
             UI_PROTOCOL_FEATURE_CONTEXT_LIFECYCLE_V1,
             UI_PROTOCOL_FEATURE_USER_QUESTION_V1,
             UI_PROTOCOL_FEATURE_PLAN_TODOS_V1,
+            UI_PROTOCOL_FEATURE_SMART_HOME_V1,
         ])
     }
 
@@ -2994,6 +3044,78 @@ pub struct SessionListResult {
     pub sessions: Value,
 }
 
+// ----- Smart-home bridge integration -----
+//
+// Mirrors the REST-facing bridge client in
+// `crates/octos-cli/src/api/smart_home_bridge.rs`. Result payloads that
+// carry bridge data are typed as opaque [`Value`] containers — same
+// rationale as the M12 Phase D-1 frames above: octos-core cannot depend on
+// octos-cli (`SmartHomeDevice`, `DeviceListResponse`, `CameraStreamInfo` live
+// there), so the bridge's JSON contract stays the single source of truth in
+// octos-cli and this crate stays a schema-agnostic envelope layer. Gated on
+// [`UI_PROTOCOL_FEATURE_SMART_HOME_V1`].
+
+/// Params for `smart_home/status.get`. Empty request — reports whether this
+/// profile has a bridge configured without exposing its URL/token.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SmartHomeStatusGetParams {}
+
+/// Result for `smart_home/status.get`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SmartHomeStatusGetResult {
+    pub configured: bool,
+}
+
+/// Params for `smart_home/device.list`. Empty request.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SmartHomeDeviceListParams {}
+
+/// Result for `smart_home/device.list`. `devices` is the bridge's
+/// `DeviceListResponse` JSON body, forwarded byte-for-byte.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SmartHomeDeviceListResult {
+    pub devices: Value,
+}
+
+/// Params for `smart_home/device.command`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SmartHomeDeviceCommandParams {
+    pub device_id: String,
+    /// Command payload, forwarded to the bridge as a form-encoded POST body
+    /// (see `send_device_command`), e.g. `{"on": true}`.
+    pub params: Value,
+}
+
+/// Result for `smart_home/device.command`. Empty on success — bridge/request
+/// failures surface as a JSON-RPC error response instead.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SmartHomeDeviceCommandResult {}
+
+/// Params for `smart_home/camera.stream_start`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SmartHomeCameraStreamStartParams {
+    pub device_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quality: Option<u32>,
+}
+
+/// Result for `smart_home/camera.stream_start`. `stream` is the bridge's
+/// `CameraStreamInfo` JSON body, forwarded byte-for-byte.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SmartHomeCameraStreamStartResult {
+    pub stream: Value,
+}
+
+/// Params for `smart_home/camera.stream_stop`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SmartHomeCameraStreamStopParams {
+    pub device_id: String,
+}
+
+/// Result for `smart_home/camera.stream_stop`. Empty on success.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SmartHomeCameraStreamStopResult {}
+
 /// Params for `launch/resolve` — the pre-session launch probe. Given the
 /// project `cwd` and the optionally requested profile, the server decides
 /// whether to resume the folder's conversation, activate a new one, or surface
@@ -3800,6 +3922,7 @@ pub enum TurnTerminalOutcome {
     Completed,
     Errored,
     Interrupted,
+    RateLimited,
 }
 
 /// Structured error carried by an errored or interrupted v2 terminal.
@@ -4017,6 +4140,12 @@ pub enum UiCommand {
     RouterGetMetrics(RouterGetMetricsParams),
     // ---- launch/resolve: pre-session launch probe ----
     LaunchResolve(LaunchResolveParams),
+    // ---- Smart-home bridge integration ----
+    SmartHomeStatusGet(SmartHomeStatusGetParams),
+    SmartHomeDeviceList(SmartHomeDeviceListParams),
+    SmartHomeDeviceCommand(SmartHomeDeviceCommandParams),
+    SmartHomeCameraStreamStart(SmartHomeCameraStreamStartParams),
+    SmartHomeCameraStreamStop(SmartHomeCameraStreamStopParams),
 }
 
 impl UiCommand {
@@ -4064,6 +4193,11 @@ impl UiCommand {
             Self::RouterSetMode(_) => methods::ROUTER_SET_MODE,
             Self::RouterGetMetrics(_) => methods::ROUTER_GET_METRICS,
             Self::LaunchResolve(_) => methods::LAUNCH_RESOLVE,
+            Self::SmartHomeStatusGet(_) => methods::SMART_HOME_STATUS_GET,
+            Self::SmartHomeDeviceList(_) => methods::SMART_HOME_DEVICE_LIST,
+            Self::SmartHomeDeviceCommand(_) => methods::SMART_HOME_DEVICE_COMMAND,
+            Self::SmartHomeCameraStreamStart(_) => methods::SMART_HOME_CAMERA_STREAM_START,
+            Self::SmartHomeCameraStreamStop(_) => methods::SMART_HOME_CAMERA_STREAM_STOP,
         }
     }
 
@@ -4115,6 +4249,11 @@ impl UiCommand {
             Self::RouterSetMode(params) => serde_json::to_value(params),
             Self::RouterGetMetrics(params) => serde_json::to_value(params),
             Self::LaunchResolve(params) => serde_json::to_value(params),
+            Self::SmartHomeStatusGet(params) => serde_json::to_value(params),
+            Self::SmartHomeDeviceList(params) => serde_json::to_value(params),
+            Self::SmartHomeDeviceCommand(params) => serde_json::to_value(params),
+            Self::SmartHomeCameraStreamStart(params) => serde_json::to_value(params),
+            Self::SmartHomeCameraStreamStop(params) => serde_json::to_value(params),
         }?;
 
         Ok(RpcRequest::new(id, method, params))
@@ -4210,6 +4349,21 @@ impl UiCommand {
             methods::ROUTER_GET_METRICS => {
                 Ok(Self::RouterGetMetrics(decode_params(method, params)?))
             }
+            methods::SMART_HOME_STATUS_GET => Ok(Self::SmartHomeStatusGet(decode_optional_params(
+                method, params,
+            )?)),
+            methods::SMART_HOME_DEVICE_LIST => Ok(Self::SmartHomeDeviceList(
+                decode_optional_params(method, params)?,
+            )),
+            methods::SMART_HOME_DEVICE_COMMAND => {
+                Ok(Self::SmartHomeDeviceCommand(decode_params(method, params)?))
+            }
+            methods::SMART_HOME_CAMERA_STREAM_START => Ok(Self::SmartHomeCameraStreamStart(
+                decode_params(method, params)?,
+            )),
+            methods::SMART_HOME_CAMERA_STREAM_STOP => Ok(Self::SmartHomeCameraStreamStop(
+                decode_params(method, params)?,
+            )),
             _ => Err(RpcError::method_not_found(method)),
         }
     }
@@ -6155,6 +6309,26 @@ pub struct PeerStagedEvent {
     pub profile_id: String,
 }
 
+/// `peer/closed` — the model's `peer_close` tool tore down a staged peer
+/// session: the durable brief (and optional fenced worktree) were evicted
+/// server-side, so the user's client should close the peer pane it opened
+/// for `topic`. Mirrors [`PeerStagedEvent`]: routing keys off `session_id`
+/// (the ORIGINATING session), and `topic` (`peer-<slug>`) is the closed
+/// peer's session topic carried as a payload field.
+///
+/// Durable (ledger-appended): reconnect replay redelivers the event.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PeerClosedEvent {
+    /// The ORIGINATING session (the conversation whose turn closed the peer).
+    pub session_id: SessionKey,
+    /// Topic of the closed peer session the client tears down (`peer-<slug>`).
+    pub topic: String,
+    /// Directory slug that was reserved under the profile's `peers/` root.
+    pub slug: String,
+    /// Profile the peer session ran under.
+    pub profile_id: String,
+}
+
 /// Draft notification payloads for UI protocol v1.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[allow(clippy::large_enum_variant)]
@@ -6245,6 +6419,9 @@ pub enum UiNotification {
     /// session (durable brief + optional fenced worktree); the client opens
     /// the staged session in the background. See [`PeerStagedEvent`].
     PeerStaged(PeerStagedEvent),
+    /// The model's `peer_close` tool tore down a staged peer session; the
+    /// client closes the peer pane it opened. See [`PeerClosedEvent`].
+    PeerClosed(PeerClosedEvent),
     /// UPCR-2026-014 (M9-γ) canonical projection envelope (`projection/envelope`).
     /// Spec § 14. Capability-gated on `projection.envelope.v1`; the
     /// per-connection live filter keeps legacy and envelope deliveries
@@ -6318,6 +6495,7 @@ impl UiNotification {
             Self::ContextNormalizationReported(_) => methods::CONTEXT_NORMALIZATION_REPORTED,
             Self::SessionOrchestration(_) => methods::SESSION_ORCHESTRATION,
             Self::PeerStaged(_) => methods::PEER_STAGED,
+            Self::PeerClosed(_) => methods::PEER_CLOSED,
             Self::Envelope(_) => methods::PROJECTION_ENVELOPE,
             Self::EnvelopeV2(_) => methods::PROJECTION_ENVELOPE,
         }
@@ -6369,6 +6547,7 @@ impl UiNotification {
             Self::ContextNormalizationReported(event) => &event.session_id,
             Self::SessionOrchestration(event) => &event.session_id,
             Self::PeerStaged(event) => &event.session_id,
+            Self::PeerClosed(event) => &event.session_id,
             Self::Envelope(event) => &event.session_id,
             Self::EnvelopeV2(event) => &event.session_id,
         }
@@ -6529,6 +6708,7 @@ impl UiNotification {
             // `stamp_topic_from_session` catch-all above leaves it alone,
             // and routing keys off `session_id` (the originating session).
             Self::PeerStaged(params) => serde_json::to_value(params),
+            Self::PeerClosed(params) => serde_json::to_value(params),
             // UPCR-2026-014 (M9-γ) + feat(envelope-wire-routing): the wire
             // shape per spec § 14.1 is the bare `Envelope` fields FLATTENED
             // with the routing keys `session_id` (the bare base key) +
@@ -6673,6 +6853,7 @@ impl UiNotification {
                 Ok(Self::SessionOrchestration(decode_params(method, params)?))
             }
             methods::PEER_STAGED => Ok(Self::PeerStaged(decode_params(method, params)?)),
+            methods::PEER_CLOSED => Ok(Self::PeerClosed(decode_params(method, params)?)),
             // UPCR-2026-014 (M9-γ) + feat(envelope-wire-routing): decode
             // the FLATTENED wire frame — bare Envelope keys plus the
             // routing keys `session_id` + `topic`. Backward-compatible:

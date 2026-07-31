@@ -26,7 +26,7 @@ A comprehensive guide for deploying, configuring, and using the Octos AI agent p
     - [Clock](#126-clock)
     - [Weather](#127-weather)
     - [WeChat Bridge](#128-wechat-bridge)
-    - [Pipeline Guard](#129-pipeline-guard)
+    - [Smart Home](#129-smart-home)
     - [Skill Evolve](#1210-skill-evolve)
     - [Harness Starters](#1211-harness-starters)
 13. [Platform Skills (ASR/TTS)](#13-platform-skills-asrtts)
@@ -1155,7 +1155,7 @@ Check for new issues in the GitHub repo and summarize any urgent ones.
 
 Bundled app skills ship as compiled binaries alongside the `octos` binary. On gateway startup they are written into `<octos_home>/bundled-app-skills/<name>/`, while operator or user customizations are installed into the active profile's `~/.octos/profiles/<profile>/data/skills/` directory so a re-deploy never overwrites them. The full list lives in `BUNDLED_APP_SKILLS` (`crates/octos-agent/src/bundled_app_skills.rs`):
 
-> **Bundled (auto-installed):** news, deep-search, deep-crawl, send-email, account-manager, time (binary `clock`), weather, pipeline-guard, skill-evolve. Plus the platform-skill `voice`.
+> **Bundled (auto-installed):** news, deep-search, deep-crawl, send-email, account-manager, time (binary `clock`), weather, smart-home, skill-evolve. Plus the platform-skill `voice`.
 
 Sections 12.8 (WeChat Bridge) and 12.11 (Harness Starters) below describe **workspace example crates** under `crates/app-skills/` that are *not* in `BUNDLED_APP_SKILLS` — they ship in the source tree as templates / transport helpers, not as auto-installed runtime skills.
 
@@ -1538,12 +1538,44 @@ Bot: [uses get_forecast with city="New York, US", days=5]
 
 WebSocket bridge for WeChat personal accounts. Connects to the WeChat client via WebSocket and forwards messages to the gateway.
 
-### 12.9 Pipeline Guard
+### 12.9 Smart Home
 
-**Type:** Hook (not a tool)
-**Event:** `before_tool_call` (filter: `run_pipeline`)
+**Tools:** `smart_home_list_devices`, `smart_home_control_device`
+**Timeout:** 10 seconds
+**Requires:** A bridge configured for the profile first (Settings → Smart Home)
+**Context-triggered:** Activated when conversation mentions "smart home", "device", "light", "thermostat", "智能家居", "开灯", "关灯", "空调", "窗帘"
 
-Validates DOT graphs and injects optimal model assignments before `run_pipeline` executes. Runs as a before-hook with 10s timeout — can deny malformed pipeline submissions.
+Lists and controls smart-home devices (lights, thermostats, curtains, speakers, etc.) through the bridge configured for the active profile (e.g. Home Assistant). Reads the bridge URL and token directly from the profile — does not proxy through the running gateway. Camera video streaming stays a human-facing, WebSocket-only feature in octos-web and is not exposed to the agent.
+
+#### smart_home_list_devices Parameters
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `room` | string | *(none)* | Optional room name filter (case-insensitive) |
+
+#### smart_home_control_device Parameters
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `device_id` | string | *(required)* | Target device ID, as returned by `smart_home_list_devices` |
+| `params` | object | *(required)* | Command fields, e.g. `{"on": true}`, `{"brightness": 80}`, `{"temperature": 22}` |
+
+#### Sample Chat Usage
+
+```
+User: What smart home devices do I have in the living room?
+
+Bot: [uses smart_home_list_devices with room="living room"]
+     Living Room Lamp (id: lamp_1, light) — on | brightness: 80
+     Living Room AC (id: ac_1, thermostat) — on | temperature: 24
+```
+
+```
+User: 把客厅的灯调暗一点
+
+Bot: [uses smart_home_control_device with device_id="lamp_1", params={"brightness": 30}]
+     Sent to lamp_1: brightness=30
+```
 
 ### 12.10 Skill Evolve
 
@@ -2051,12 +2083,24 @@ Bot: [uses translate tool with text="Hello world", target_lang="JA"]
   // Agent settings
   "max_iterations": 50,
 
-  // Embedding (for vector search in memory)
+  // Embedding (for vector search in memory).
+  // Remote, OpenAI-compatible:
   "embedding": {
     "provider": "openai",
     "api_key_env": "OPENAI_API_KEY",
-    "base_url": null
+    "base_url": null,
+    "model": null,       // default text-embedding-3-small (1536 dims)
+    "dimensions": null   // pin the output size when the model's native size differs
   },
+  // ...or in-process, no API key, any GGUF model over llama.cpp. Needs a
+  // build with `--features embed-llama` (add embed-llama-metal / -cuda to
+  // offload); CPU otherwise. Changing provider or model changes the vector
+  // DIMENSION, which invalidates a populated index — re-embed stored
+  // episodes after switching, or their recall silently degrades to BM25.
+  // "embedding": {
+  //   "provider": "llamacpp",
+  //   "model_path": "/path/to/embeddinggemma-300M-Q8_0.gguf"
+  // },
 
   // Voice
   "voice": {
@@ -2191,7 +2235,7 @@ Bot: [uses translate tool with text="Hello world", target_lang="JA"]
 │   ├── account-manager/        # sub-account ops
 │   ├── time/                   # time / timezone (binary "clock")
 │   ├── weather/                # Open-Meteo weather
-│   ├── pipeline-guard/         # DOT-pipeline before-hook validator
+│   ├── smart-home/             # List/control devices via profile bridge
 │   └── skill-evolve/           # SKILL.md patch queue (foreground)
 ├── skills/                     # User-installed custom skills (precedence:
 │   │                           #  project > profile > global; not overwritten

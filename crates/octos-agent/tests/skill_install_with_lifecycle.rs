@@ -8,6 +8,8 @@
 //! E) uninstall (deactivate) runs shutdown phase
 //! F) HTTP discovery failure aborts install — no tools partially registered
 
+#![cfg(unix)]
+
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
@@ -53,19 +55,37 @@ async fn install_runs_preflight_init_ready_check_in_order_with_skill_dir_env() {
     let env_file = skill_dir.join("skill_dir.txt");
     let env_str = env_file.to_string_lossy().to_string();
 
+    // The lifecycle runs each step through the platform shell (`sh -c` on
+    // Unix, `cmd /C` on Windows), so the commands must be shell-appropriate:
+    // cmd has no `printf`, expands `%VAR%` not `$VAR`, chains with `&` (not
+    // `;`), and treats `'` literally. Tempdir paths have no spaces, so we pass
+    // them unquoted (which also avoids `cmd` mangling Rust's quoted argv). The
+    // Windows `echo <var> >file` yields a trailing space + CRLF, trimmed below.
+    #[cfg(windows)]
+    let (pre_cmd, init_cmd, ready_cmd) = (
+        format!("echo preflight>>{log_str}"),
+        format!("echo init>>{log_str} & echo %OCTOS_SKILL_DIR% >{env_str}"),
+        format!("echo ready_check>>{log_str}"),
+    );
+    #[cfg(not(windows))]
+    let (pre_cmd, init_cmd, ready_cmd) = (
+        format!("echo preflight >> '{log_str}'"),
+        format!("echo init >> '{log_str}'; printf '%s' \"$OCTOS_SKILL_DIR\" > '{env_str}'"),
+        format!("echo ready_check >> '{log_str}'"),
+    );
     let manifest = json!({
         "name": "hw-skill",
         "version": "0.1.0",
         "tools": [],
         "hardware_lifecycle": {
             "preflight": [
-                {"label": "pre", "command": format!("echo preflight >> '{log_str}'")}
+                {"label": "pre", "command": pre_cmd}
             ],
             "init": [
-                {"label": "init-env", "command": format!("echo init >> '{log_str}'; printf '%s' \"$OCTOS_SKILL_DIR\" > '{env_str}'")}
+                {"label": "init-env", "command": init_cmd}
             ],
             "ready_check": [
-                {"label": "ready", "command": format!("echo ready_check >> '{log_str}'")}
+                {"label": "ready", "command": ready_cmd}
             ]
         }
     });
@@ -87,8 +107,8 @@ async fn install_runs_preflight_init_ready_check_in_order_with_skill_dir_env() {
     // Verify OCTOS_SKILL_DIR was injected.
     let captured_dir = std::fs::read_to_string(&env_file).expect("skill_dir.txt should exist");
     assert_eq!(
-        captured_dir,
-        skill_dir.to_string_lossy().as_ref(),
+        captured_dir.trim(),
+        skill_dir.to_string_lossy().trim(),
         "OCTOS_SKILL_DIR mismatch"
     );
 
@@ -371,13 +391,19 @@ async fn uninstall_runs_shutdown_phase() {
     let sentinel = skill_dir.join("shutdown_ran.txt");
     let sentinel_str = sentinel.to_string_lossy().to_string();
 
+    // cmd has no `touch`; create the empty sentinel with `type nul >file`
+    // (unquoted — tempdir paths have no spaces).
+    #[cfg(windows)]
+    let shutdown_cmd = format!("type nul >{sentinel_str}");
+    #[cfg(not(windows))]
+    let shutdown_cmd = format!("touch '{sentinel_str}'");
     let manifest = json!({
         "name": "shutdown-skill",
         "version": "0.1.0",
         "tools": [],
         "hardware_lifecycle": {
             "shutdown": [
-                {"label": "write-sentinel", "command": format!("touch '{sentinel_str}'")}
+                {"label": "write-sentinel", "command": shutdown_cmd}
             ]
         }
     });

@@ -1813,6 +1813,78 @@ pub(crate) fn resolve_provider_policy(
 /// Create an embedding provider from config, if configured.
 pub(crate) fn create_embedder(config: &Config) -> Option<Arc<dyn EmbeddingProvider>> {
     let cfg = config.embedding.as_ref()?;
+
+    // In-process llama.cpp GGUF provider (every platform, feature `embed-llama`).
+    // `provider = "llamacpp"` + `model_path = "<file.gguf>"`; `dimensions`
+    // truncates the output via Matryoshka (MRL). Unlike the MLX provider below
+    // this is NOT Apple-only, and it runs any GGUF embedding model rather than
+    // one hand-ported architecture — with a CPU backend that is a legitimate
+    // choice, not a fallback.
+    if cfg.provider.eq_ignore_ascii_case("llamacpp") || cfg.provider.eq_ignore_ascii_case("llama") {
+        #[cfg(feature = "embed-llama")]
+        {
+            let path = cfg.model_path.as_deref().or(cfg.model.as_deref());
+            let Some(path) = path else {
+                tracing::error!(
+                    "embedding.provider=\"llamacpp\" requires `model_path` (the .gguf file)"
+                );
+                return None;
+            };
+            // Offload everything when built with an accelerator; the CPU build
+            // ignores this.
+            let n_gpu_layers = if cfg!(any(
+                feature = "embed-llama-metal",
+                feature = "embed-llama-cuda"
+            )) {
+                99
+            } else {
+                0
+            };
+            match octos_embed_llama::LlamaEmbedder::from_model_file(path, n_gpu_layers) {
+                Ok(mut e) => {
+                    if let Some(d) = cfg.dimensions {
+                        e = e.with_output_dim(d as usize);
+                    }
+                    tracing::info!(
+                        model_path = %path,
+                        dimension = e.dimension(),
+                        n_gpu_layers,
+                        "loaded in-process llama.cpp embedder"
+                    );
+                    return Some(Arc::new(e));
+                }
+                Err(err) => {
+                    tracing::error!(%err, model_path = %path, "failed to load llama.cpp embedder");
+                    return None;
+                }
+            }
+        }
+        #[cfg(not(feature = "embed-llama"))]
+        {
+            tracing::warn!(
+                "embedding.provider=\"llamacpp\" needs a build with `--features embed-llama`; \
+                 ignoring and disabling embeddings"
+            );
+            return None;
+        }
+    }
+
+    // `provider = "mlx"` was the Apple-Silicon-only in-process backend. It has
+    // been replaced by `"llamacpp"` above, which is cross-platform and measured
+    // at parity or better. Fail LOUDLY rather than falling through to the
+    // remote-provider path below, where "mlx" would be treated as an API
+    // provider name and produce a baffling credential error.
+    if cfg.provider.eq_ignore_ascii_case("mlx") {
+        tracing::error!(
+            "embedding.provider=\"mlx\" has been removed — use \"llamacpp\" with a \
+             .gguf `model_path`. NOTE: the two backends' vectors are not \
+             interchangeable (~0.96-0.99 cosine), so stored episode embeddings \
+             must be regenerated after switching; until then recall degrades to \
+             BM25-only for those episodes."
+        );
+        return None;
+    }
+
     // `api_key_env` was declared on EmbeddingConfig but never honored —
     // it wins over the provider-default var name, resolving through the
     // SAME credential chain as every other key (auth store, env_vars +
@@ -2966,7 +3038,12 @@ pub(crate) fn create_provider(
 ///
 /// Does NOT print to stdout — callers that want a log line should print
 /// after calling this function.
-pub(crate) fn create_provider_with_api_type(
+///
+/// Exposed as `pub` (was `pub(crate)`) so the `octos-ffi` C-ABI crate can
+/// reuse the exact provider-construction path (auth store → env_vars → env
+/// key resolution, timeout overrides, anthropic/responses api_type bypasses)
+/// instead of re-implementing a drift-prone parallel factory.
+pub fn create_provider_with_api_type(
     name: &str,
     config: &Config,
     model: Option<String>,

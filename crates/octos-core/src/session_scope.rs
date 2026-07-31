@@ -912,6 +912,13 @@ impl SessionScope {
 ///
 /// The input must already be lexically normalised (no `..`) so the
 /// re-attached suffix names a real would-be on-disk location.
+///
+/// Scope roots must be resolved with [`canonical_root_lossy`], which deliberately
+/// uses this same ancestor walk. Besides applying the same symlink treatment to
+/// both sides of a containment check, that keeps Windows paths in the same
+/// representation: `std::fs::canonicalize` adds the verbatim `\\?\` prefix, so
+/// comparing an ancestor-walked candidate with an uncanonicalised missing root
+/// would incorrectly deny a path inside the root.
 pub fn canonicalize_lossy(path: &Path) -> PathBuf {
     if let Ok(canon) = std::fs::canonicalize(path) {
         return canon;
@@ -935,11 +942,15 @@ pub fn canonicalize_lossy(path: &Path) -> PathBuf {
     path.to_path_buf()
 }
 
-/// Canonicalise a zone root, falling back to the input when the root
-/// doesn't exist (rare for `scope.workspace()` but possible in tests
-/// that pass a not-yet-created directory).
+/// Canonicalise a zone root, walking existing ancestors when the root does not
+/// exist yet.
+///
+/// This must stay symmetric with [`canonicalize_lossy`], which resolves the
+/// candidate side of scope containment checks. In particular, using a raw-path
+/// fallback here would compare non-verbatim and verbatim paths on Windows and
+/// misclassify children of a missing root as out of scope.
 pub fn canonical_root_lossy(root: &Path) -> PathBuf {
-    std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf())
+    canonicalize_lossy(root)
 }
 
 /// Canonicalise a list of skill plugin directories, dropping (with a
@@ -1094,6 +1105,78 @@ mod tests {
             scope.classify_canonical_path(&repo.join("src/main.rs")),
             PathClassification::InWorkspace
         ));
+    }
+
+    #[test]
+    fn canonical_root_and_candidate_match_for_missing_root() {
+        // The nonce keeps the entire root absent even on developer machines.
+        // On Windows, walking from the candidate reaches `C:\` and yields a
+        // verbatim (`\\?\C:\...`) path. The root must use the same walk or a
+        // containment comparison between the two representations fails.
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock is after Unix epoch")
+            .as_nanos();
+        let missing_root = abs(&format!(
+            "/octos/session-scope-missing-{}-{nonce}",
+            std::process::id()
+        ));
+        assert!(
+            !missing_root.exists(),
+            "test root must not exist: {}",
+            missing_root.display()
+        );
+
+        let canonical_root = canonical_root_lossy(&missing_root);
+        let canonical_child = canonicalize_lossy(&missing_root.join("src/main.rs"));
+        assert!(
+            canonical_child.starts_with(&canonical_root),
+            "candidate {} must retain root representation {}",
+            canonical_child.display(),
+            canonical_root.display()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn canonical_root_and_candidate_match_for_missing_root_behind_symlink() {
+        // Unix companion to the test above. That one roots at `/`, where the
+        // ancestor walk stops immediately and canonicalisation is a no-op, so
+        // it only ever constrains Windows. Put the missing root behind a
+        // SYMLINK and the same asymmetry appears on Unix — which is the shape
+        // macOS ships by default, where `/tmp` and `/var` resolve into
+        // `/private`. Without this case a regression here is invisible to
+        // every non-Windows run.
+        use std::os::unix::fs::symlink;
+
+        let real = tempfile::tempdir().expect("real dir");
+        let link_dir = tempfile::tempdir().expect("link parent");
+        let link = link_dir.path().join("workspace-link");
+        symlink(real.path(), &link).expect("symlink");
+
+        // Guard the premise: if the link resolved to itself the assertion
+        // below would hold for the wrong reason.
+        assert_ne!(
+            std::fs::canonicalize(&link).expect("canonicalise link"),
+            link,
+            "symlink must resolve elsewhere for this test to bite"
+        );
+
+        let missing_root = link.join("not-created-yet");
+        assert!(
+            !missing_root.exists(),
+            "test root must not exist: {}",
+            missing_root.display()
+        );
+
+        let canonical_root = canonical_root_lossy(&missing_root);
+        let canonical_child = canonicalize_lossy(&missing_root.join("src/main.rs"));
+        assert!(
+            canonical_child.starts_with(&canonical_root),
+            "candidate {} must retain root representation {}",
+            canonical_child.display(),
+            canonical_root.display()
+        );
     }
 
     #[test]

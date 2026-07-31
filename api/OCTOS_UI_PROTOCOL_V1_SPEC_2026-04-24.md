@@ -442,6 +442,14 @@ Launch (per-project session UX, gated `session.workspace_cwd.v1`):
 
 - `launch/resolve`
 
+Smart-home bridge integration (gated `smart_home.v1`; auth-bound — omitted
+from the stdio capability set and reported unsupported per § stdio policy,
+same as `memory/overview` / `cron/list` above):
+
+- `smart_home/status.get`, `smart_home/device.list`,
+  `smart_home/device.command`, `smart_home/camera.stream_start`,
+  `smart_home/camera.stream_stop`
+
 Runtime, auth, profile, and onboarding inspection (server-handled
 `APPUI_EXTRA_METHODS`):
 
@@ -581,6 +589,12 @@ Peer staging (#1801 v3, ungated):
   `worktree_branch?`, and `profile_id` — the same facts a `peer/prepare`
   result entry carries. Durable: reconnect replay redelivers it, so clients
   dedup by existing session for the topic.
+- `peer/closed` — agent-initiated peer teardown: the model's `peer_close`
+  tool retired a staged peer (durable brief and optional fenced worktree
+  evicted), so the client tears down the peer pane it opened (topic
+  `peer-<slug>`). `params` carry the ORIGINATING `session_id` plus `topic`,
+  `slug`, and `profile_id`. Durable: reconnect replay redelivers it, so
+  clients dedup by the already-closed peer for the topic.
 
 ## 7. Command Semantics
 

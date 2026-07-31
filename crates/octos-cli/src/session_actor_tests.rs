@@ -1,5 +1,13 @@
 use super::*;
 use async_trait::async_trait;
+
+/// Runaway guard for the "poll until the hook subprocess has appended its
+/// JSONL line" loop. NOT a latency assertion: the loop breaks on content the
+/// instant the line appears, so a generous ceiling costs a passing run
+/// nothing, and a broken run (hook never fires) still fails — just later.
+/// Mirrors `octos_agent`'s `spawn_tests::BACKGROUND_DEADLINE`.
+const HOOK_DEADLINE: Duration = Duration::from_secs(60);
+#[cfg(unix)]
 use octos_agent::{HookConfig, HookEvent};
 use octos_llm::{AdaptiveConfig, ChatConfig, ChatResponse, StopReason, TokenUsage, ToolSpec};
 use std::sync::atomic::AtomicUsize;
@@ -744,7 +752,11 @@ fn capture_hook(event: HookEvent, log_path: &std::path::Path) -> HookConfig {
             "sh".into(),
             log_path.to_string_lossy().into_owned(),
         ],
-        timeout_ms: 5000,
+        // Headroom only — neither hook test asserts that a hook times out, and
+        // on expiry `hooks.rs` kills the child, so the JSONL line never lands
+        // and the poll loop below cannot recover no matter how long it waits.
+        // This must stay in step with `HOOK_DEADLINE`.
+        timeout_ms: 60_000,
         tool_filter: vec![],
         path_filter: Vec::new(),
         requires_bin: None,
@@ -2658,6 +2670,45 @@ fn session_actor_continuation_prompt_matches_canonical_renderer() {
         .ok();
 }
 
+/// #1857 PR 4a — the SessionActor continuation renderer (a delegator to
+/// `agent_orchestrator::master_continuation_prompt`) must route a fleet-keeper
+/// wake to the fleet-keeper arm, not the generic external fallback. This is the
+/// gateway-path half of the "both renderers" guard (its orchestrator-path twin
+/// lives in `api::fleet_wake`); it also proves the objective is XML-escaped
+/// across the delegation.
+#[cfg(feature = "api")]
+#[test]
+fn session_actor_renders_fleet_keeper_prompt() {
+    use crate::api::fleet_wake::{FleetKeeperSnapshot, fleet_keeper_continuation_request};
+    use crate::api::master_continuation_scheduler::MasterContinuationScheduler;
+
+    let snap = FleetKeeperSnapshot {
+        objective: "keeper via <gateway>".to_owned(),
+        task_lines: "- t1: Task t1 [Ready]".to_owned(),
+        ready: "t1".to_owned(),
+    };
+    let controller = SessionKey::new("api", "keeper-actor");
+    let req =
+        fleet_keeper_continuation_request(&controller, "tenant-c", "fleet-actor", 7, &snap, None);
+    let mut scheduler = MasterContinuationScheduler::new();
+    let item = scheduler.enqueue(req).queued().expect("queued").clone();
+
+    // Render via the SessionActor path (the function under test).
+    let prompt = master_continuation_prompt(&item);
+    assert!(
+        prompt.starts_with("[system-internal]"),
+        "fleet-keeper prompt: {prompt}"
+    );
+    assert!(
+        prompt.contains("keeper via &lt;gateway&gt;"),
+        "objective must be XML-escaped across the delegation: {prompt}"
+    );
+    assert!(
+        !prompt.contains("An external master continuation was requested"),
+        "must not fall through to the generic external fallback: {prompt}"
+    );
+}
+
 #[tokio::test]
 #[cfg(unix)]
 async fn test_session_actor_emits_resume_and_turn_end_hooks() {
@@ -2906,7 +2957,7 @@ async fn test_forced_background_turn_emits_turn_end_hook() {
         }
 
         assert!(
-            started.elapsed() < Duration::from_secs(5),
+            started.elapsed() < HOOK_DEADLINE,
             "forced-background turn-end hook did not arrive in time"
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -5822,6 +5873,100 @@ async fn test_dispatch_routes_to_default_profile() {
         keys[0].starts_with("_main:"),
         "dispatch key should start with _main when no profile_id, got: {}",
         keys[0]
+    );
+}
+
+/// #436/#437 — the peer inbox registry lifecycle: a `peer-<slug>` session
+/// registers its inbox sender on dispatch (so `peer_send_input` can find and
+/// deliver to it), and `remove_session` purges that entry (so a deleted peer
+/// leaves no stale, still-injectable sender behind). Regression guard: the
+/// registry holds a strong `Sender` clone, so the old `retain(!is_closed)`
+/// purge could never evict the entry on delete.
+#[tokio::test]
+async fn peer_inbox_registry_registers_on_dispatch_and_purges_on_remove() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let (mut registry, _rx) = setup_dispatch_registry(&dir).await;
+
+    // A peer session: topic `peer-<slug>` routed under profile `weather`.
+    let slug = "lifecycle-slug";
+    let sk = SessionKey::with_topic("api", "peerchat", &format!("peer-{slug}"));
+    let reg_key = peer_inbox_key("weather", slug);
+
+    let msg = InboundMessage {
+        channel: "api".to_string(),
+        sender_id: "user1".to_string(),
+        chat_id: "peerchat".to_string(),
+        content: "hello peer".to_string(),
+        timestamp: chrono::Utc::now(),
+        media: vec![],
+        metadata: serde_json::json!({}),
+        message_id: None,
+        origin: octos_core::MessageOrigin::ExternalUser,
+    };
+
+    registry
+        .dispatch(DispatchParams {
+            message: msg,
+            image_media: vec![],
+            attachment_media: vec![],
+            attachment_prompt: None,
+            session_key: sk.clone(),
+            reply_channel: "api",
+            reply_chat_id: "peerchat",
+            status_indicator: None,
+            profile_id: Some("weather"),
+            tenant_id: Some("weather"),
+            system_prompt_override: None,
+            sender_user_id: None,
+        })
+        .await;
+
+    // register: the peer inbox entry exists after dispatch.
+    assert!(
+        peer_inbox_registry().lock().unwrap().contains_key(&reg_key),
+        "peer inbox should be registered under {reg_key} after dispatch, keys: {:?}",
+        peer_inbox_registry()
+            .lock()
+            .unwrap()
+            .keys()
+            .collect::<Vec<_>>()
+    );
+
+    // deliver: the registered sender accepts a cross-session message — exactly
+    // what the `peer_send_input` callback does (build an `Inbound` + try_send).
+    {
+        let map = peer_inbox_registry().lock().unwrap();
+        let tx = map.get(&reg_key).expect("peer inbox sender registered");
+        let injected = InboundMessage {
+            channel: String::new(),
+            sender_id: String::new(),
+            chat_id: String::new(),
+            content: "steer the peer".to_string(),
+            timestamp: chrono::Utc::now(),
+            media: vec![],
+            metadata: serde_json::json!({"origin": "peer_send_input"}),
+            message_id: None,
+            origin: octos_core::MessageOrigin::Synthetic,
+        };
+        tx.try_send(ActorMessage::Inbound {
+            message: injected,
+            image_media: vec![],
+            attachment_media: vec![],
+            attachment_prompt: None,
+        })
+        .expect("delivery to a running peer inbox should succeed");
+    }
+
+    // remove: after the session is deleted, no stale entry may remain.
+    registry.remove_session(&sk.to_string());
+    assert!(
+        !peer_inbox_registry().lock().unwrap().contains_key(&reg_key),
+        "peer inbox entry must be purged after remove_session, keys: {:?}",
+        peer_inbox_registry()
+            .lock()
+            .unwrap()
+            .keys()
+            .collect::<Vec<_>>()
     );
 }
 

@@ -34,7 +34,33 @@ if [ ! -d node_modules ]; then
 fi
 
 echo "Building octos-web (BASE_URL=$BASE_PATH) → $OUT_DIR"
-BASE_URL="$BASE_PATH" npm run build
+# Git for Windows runs native npm/node through MSYS2. Without an exclusion,
+# MSYS2 treats the POSIX-looking BASE_URL as a filesystem path and rewrites
+# `/app/` to e.g. `C:/Program Files/Git/app/`, which Vite then bakes into every
+# asset URL and the React Router basename.
+msys2_env_conv_excl="${MSYS2_ENV_CONV_EXCL:-}"
+if [ -n "$msys2_env_conv_excl" ]; then
+    msys2_env_conv_excl="${msys2_env_conv_excl};BASE_URL"
+else
+    msys2_env_conv_excl="BASE_URL"
+fi
+MSYS2_ENV_CONV_EXCL="$msys2_env_conv_excl" BASE_URL="$BASE_PATH" npm run build
+
+# Fail the release build before rust-embed can package a shell whose primary
+# Vite assets point outside `/app/`. This is intentionally an output check,
+# not just an environment check, so CI guards the artifact users receive.
+INDEX_FILE="$WEB_DIR/dist/index.html"
+if [ ! -f "$INDEX_FILE" ]; then
+    echo "error: octos-web build did not produce $INDEX_FILE" >&2
+    exit 1
+fi
+if ! grep -Fq "src=\"${BASE_PATH}assets/" "$INDEX_FILE" \
+    || ! grep -Fq "href=\"${BASE_PATH}assets/" "$INDEX_FILE"; then
+    echo "error: octos-web assets are not rooted at $BASE_PATH" >&2
+    echo "  generated index references:" >&2
+    grep -Eo '(src|href)="[^"]+"' "$INDEX_FILE" >&2 || true
+    exit 1
+fi
 
 # Replace the embed dir atomically-ish: clear then copy the fresh dist.
 rm -rf "$OUT_DIR"

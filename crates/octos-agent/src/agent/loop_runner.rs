@@ -2056,6 +2056,29 @@ impl Agent {
     }
     /// Run a task to completion (used by spawn tool).
     pub async fn run_task(&self, task: &Task) -> Result<TaskResult> {
+        self.run_task_inner(task, None).await
+    }
+
+    /// Like [`Agent::run_task`], but stores the turn-cumulative token counts
+    /// into `tracker` after every LLM response. A caller that runs the task
+    /// under an external wall-clock timeout — which DROPS the future and
+    /// discards the returned [`TaskResult`] — can then still read the REAL
+    /// tokens the run spent. The fleet worker uses this to settle a mid-task
+    /// escalation's budget honestly even on the timeout / run-error path (never
+    /// `0`), mirroring the conversation loop's real-time tracker.
+    pub async fn run_task_with_tracker(
+        &self,
+        task: &Task,
+        tracker: &TokenTracker,
+    ) -> Result<TaskResult> {
+        self.run_task_inner(task, Some(tracker)).await
+    }
+
+    async fn run_task_inner(
+        &self,
+        task: &Task,
+        tracker: Option<&TokenTracker>,
+    ) -> Result<TaskResult> {
         let task_start = Instant::now();
         let span = info_span!(
             "task",
@@ -2182,7 +2205,7 @@ impl Agent {
                     response.usage.output_tokens,
                     response.usage.cache_read_tokens,
                     response.usage.cache_write_tokens,
-                    None,
+                    tracker,
                     // Attributed per attempt inside `call_llm_with_hooks`
                     // (cross-provider retries priced at their own slot).
                     attributed_cost,

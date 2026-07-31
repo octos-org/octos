@@ -48,6 +48,15 @@ pub struct Config {
     #[serde(default)]
     pub env_vars: std::collections::HashMap<String, String>,
 
+    /// When true, [`Config::get_api_key`] skips the global `AuthStore` lookup so
+    /// an explicitly-supplied key (e.g. the `env_vars`-injected key the
+    /// `octos-ffi` embedding API passes) is authoritative and cannot be silently
+    /// shadowed by a host's `octos auth login` credentials for the same
+    /// provider. Internal, not (de)serialized; default `false` preserves the
+    /// CLI / gateway resolution order.
+    #[serde(skip)]
+    pub bypass_auth_store: bool,
+
     /// Override auto-detected model behavior hints for the OpenAI provider.
     /// Useful for custom/unknown models behind OpenAI-compatible proxies.
     #[serde(default)]
@@ -614,6 +623,13 @@ pub struct EmbeddingConfig {
     /// output differs or its vectors are dropped to BM25-only.
     #[serde(default)]
     pub dimensions: Option<u32>,
+
+    /// Path to the local `.gguf` file for the in-process `llamacpp` provider
+    /// (feature `embed-llama`; add `embed-llama-metal` / `embed-llama-cuda` to
+    /// offload). Any GGUF embedding model works, e.g.
+    /// `ggml-org/embeddinggemma-300M-GGUF`. Ignored by remote providers.
+    #[serde(default)]
+    pub model_path: Option<String>,
 }
 
 fn default_embedding_provider() -> String {
@@ -1697,7 +1713,16 @@ impl Config {
         //    legacy path differs from config_home (so we don't double-check the
         //    same file). Explicit/tenant contexts never reach here.
         if is_default {
-            if let Some(home) = dirs::home_dir() {
+            // Prefer an explicit `HOME` before the OS profile dir so the legacy
+            // `~/.octos` lookup is testable and user-overridable on Windows,
+            // where `dirs::home_dir()` reads FOLDERID_Profile and ignores
+            // `HOME`/`USERPROFILE`. On Unix `dirs::home_dir()` already consults
+            // `HOME`, so this is behaviour-preserving there.
+            let legacy_home = std::env::var_os("HOME")
+                .filter(|value| !value.is_empty())
+                .map(PathBuf::from)
+                .or_else(dirs::home_dir);
+            if let Some(home) = legacy_home {
                 let legacy_config = home.join(".octos").join("config.json");
                 if legacy_config != home_config && legacy_config.exists() {
                     tracing::info!(
@@ -1943,11 +1968,16 @@ impl Config {
         // independent of `--data-dir`, so per-profile gateways keep the host's
         // shared `octos auth login` credentials. We resolve the context with no
         // cli_data_dir because auth_home never depends on it.
-        let auth_home = crate::config_context::resolve_config_context(None).auth_home;
-        if let Ok(store) = crate::auth::AuthStore::at(&auth_home) {
-            if let Some(cred) = store.get(provider) {
-                if !cred.is_expired() {
-                    return Ok(cred.access_token.clone());
+        //
+        // `bypass_auth_store` opts out (used by octos-ffi): a caller that passed
+        // an explicit key must have it win over any ambient login credential.
+        if !self.bypass_auth_store {
+            let auth_home = crate::config_context::resolve_config_context(None).auth_home;
+            if let Ok(store) = crate::auth::AuthStore::at(&auth_home) {
+                if let Some(cred) = store.get(provider) {
+                    if !cred.is_expired() {
+                        return Ok(cred.access_token.clone());
+                    }
                 }
             }
         }

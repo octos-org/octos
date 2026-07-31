@@ -772,6 +772,11 @@ fn ui_protocol_v1_wire_contract_is_golden() {
             "router/set_mode",
             "router/get_metrics",
             "launch/resolve",
+            "smart_home/status.get",
+            "smart_home/device.list",
+            "smart_home/device.command",
+            "smart_home/camera.stream_start",
+            "smart_home/camera.stream_stop",
         ]
     );
     assert_eq!(
@@ -821,6 +826,7 @@ fn ui_protocol_v1_wire_contract_is_golden() {
             "context/compaction_started",
             "context/normalization_reported",
             "peer/staged",
+            "peer/closed",
         ]
     );
     assert_eq!(
@@ -884,6 +890,11 @@ fn ui_protocol_v1_wire_contract_is_golden() {
             "router/set_mode",
             "router/get_metrics",
             "launch/resolve",
+            "smart_home/status.get",
+            "smart_home/device.list",
+            "smart_home/device.command",
+            "smart_home/camera.stream_start",
+            "smart_home/camera.stream_stop",
         ]
     );
     assert_eq!(UI_PROTOCOL_FIRST_SERVER_UNSUPPORTED_METHODS.len(), 0);
@@ -964,7 +975,12 @@ fn ui_protocol_v1_representative_wire_payloads_are_golden() {
                 "cron/toggle",
                 "router/set_mode",
                 "router/get_metrics",
-                "launch/resolve"
+                "launch/resolve",
+                "smart_home/status.get",
+                "smart_home/device.list",
+                "smart_home/device.command",
+                "smart_home/camera.stream_start",
+                "smart_home/camera.stream_stop"
             ],
             "supported_notifications": [
                 "session/open",
@@ -1010,7 +1026,8 @@ fn ui_protocol_v1_representative_wire_payloads_are_golden() {
                 "context/compaction_completed",
                 "context/compaction_started",
                 "context/normalization_reported",
-                "peer/staged"
+                "peer/staged",
+                "peer/closed"
             ],
             "supported_features": [
                 "approval.typed.v1",
@@ -1035,7 +1052,8 @@ fn ui_protocol_v1_representative_wire_payloads_are_golden() {
                 "harness.task_artifacts.v1",
                 "user_question.v1",
                 "event.voice_audio.v1",
-                "plan.todos.v1"
+                "plan.todos.v1",
+                "smart_home.v1"
             ]
         })
     );
@@ -2954,6 +2972,37 @@ fn peer_staged_notification_roundtrips_and_keeps_peer_topic() {
     .into_rpc_notification()
     .expect("serialize plain peer/staged");
     assert!(plain.params.get("worktree_branch").is_none());
+}
+
+/// `peer/closed` round-trips through the wire boundary with the originating
+/// session as the routing key and the closed peer's topic kept as an
+/// untouched payload field (the topic-stamping pass must NOT overwrite it
+/// with the originating session's own topic). Mirrors the `peer/staged` case.
+#[test]
+fn peer_closed_notification_roundtrips_and_keeps_peer_topic() {
+    let session_id = SessionKey("dev:local:tui#coding".into());
+    let event = PeerClosedEvent {
+        session_id: session_id.clone(),
+        topic: "peer-ci-fix".into(),
+        slug: "ci-fix".into(),
+        profile_id: "dev".into(),
+    };
+    let notification = UiNotification::PeerClosed(event.clone());
+
+    assert_eq!(notification.method(), methods::PEER_CLOSED);
+    assert!(UI_PROTOCOL_NOTIFICATION_METHODS.contains(&methods::PEER_CLOSED));
+    assert_eq!(notification.session_id(), &session_id);
+    // Routing topic comes from the ORIGINATING session key, not the payload.
+    assert_eq!(notification.topic(), Some("coding"));
+
+    let rpc = notification
+        .clone()
+        .into_rpc_notification()
+        .expect("serialize peer/closed");
+    assert_eq!(rpc.method, methods::PEER_CLOSED);
+    assert_eq!(rpc.params["topic"], "peer-ci-fix", "peer topic untouched");
+    let decoded = UiNotification::from_rpc_notification(rpc).expect("decode peer/closed");
+    assert_eq!(decoded, notification);
 }
 
 #[test]
@@ -6734,5 +6783,173 @@ fn tool_started_topic_field_round_trips_on_the_wire() {
     assert!(
         wire["params"].get("topic").is_none(),
         "absent topic field must stay omitted on the wire (no v0 breakage)"
+    );
+}
+
+/// Smart-home bridge integration: `smart_home/status.get` and
+/// `smart_home/device.list` both accept an omitted (`{}`/null) params
+/// object, matching the `session/list`-style empty-request convention.
+#[test]
+fn smart_home_status_get_and_device_list_accept_omitted_params() {
+    assert_eq!(
+        UiCommand::from_method_and_params(methods::SMART_HOME_STATUS_GET, Value::Null)
+            .expect("decode smart_home/status.get with omitted params"),
+        UiCommand::SmartHomeStatusGet(SmartHomeStatusGetParams {})
+    );
+    assert_eq!(
+        UiCommand::from_method_and_params(methods::SMART_HOME_DEVICE_LIST, json!({}))
+            .expect("decode smart_home/device.list with empty object params"),
+        UiCommand::SmartHomeDeviceList(SmartHomeDeviceListParams {})
+    );
+}
+
+/// `smart_home/status.get` result round-trips its `configured` flag.
+#[test]
+fn smart_home_status_get_result_round_trips() {
+    let result = SmartHomeStatusGetResult { configured: true };
+    let json = serde_json::to_string(&result).expect("serialize result");
+    let parsed: SmartHomeStatusGetResult = serde_json::from_str(&json).expect("deserialize result");
+    assert_eq!(parsed, result);
+}
+
+/// `smart_home/device.list` command round-trips through the RPC envelope,
+/// and its result forwards the bridge's device-list JSON byte-for-byte
+/// (opaque `Value`, same pattern as `SessionListResult`).
+#[test]
+fn smart_home_device_list_command_and_result_round_trip() {
+    let command = UiCommand::SmartHomeDeviceList(SmartHomeDeviceListParams {});
+    assert_eq!(command.method(), methods::SMART_HOME_DEVICE_LIST);
+
+    let rpc = command
+        .clone()
+        .into_rpc_request("req-device-list")
+        .expect("serialize smart_home/device.list");
+    let json = serde_json::to_string(&rpc).expect("to_string");
+    let parsed_rpc: RpcRequest<Value> = serde_json::from_str(&json).expect("from_str");
+    let decoded = UiCommand::from_rpc_request(parsed_rpc).expect("decode smart_home/device.list");
+    assert_eq!(decoded, command);
+
+    let result = SmartHomeDeviceListResult {
+        devices: json!({
+            "source": "home_assistant",
+            "ok": true,
+            "devices": [{"id": "tv1", "name": "Living Room TV", "kind": "tv", "on": true}]
+        }),
+    };
+    let json = serde_json::to_string(&result).expect("serialize result");
+    let parsed: SmartHomeDeviceListResult =
+        serde_json::from_str(&json).expect("deserialize result");
+    assert_eq!(parsed, result);
+}
+
+/// `smart_home/device.command` requires `device_id` + `params` and
+/// round-trips through the RPC envelope.
+#[test]
+fn smart_home_device_command_round_trips() {
+    let mut params = serde_json::Map::new();
+    params.insert("on".into(), json!(true));
+    let command = UiCommand::SmartHomeDeviceCommand(SmartHomeDeviceCommandParams {
+        device_id: "tv1".into(),
+        params: Value::Object(params),
+    });
+    assert_eq!(command.method(), methods::SMART_HOME_DEVICE_COMMAND);
+
+    let rpc = command
+        .clone()
+        .into_rpc_request("req-device-command")
+        .expect("serialize smart_home/device.command");
+    assert_eq!(rpc.params["device_id"], json!("tv1"));
+    assert_eq!(rpc.params["params"]["on"], json!(true));
+
+    let json = serde_json::to_string(&rpc).expect("to_string");
+    let parsed_rpc: RpcRequest<Value> = serde_json::from_str(&json).expect("from_str");
+    let decoded =
+        UiCommand::from_rpc_request(parsed_rpc).expect("decode smart_home/device.command");
+    assert_eq!(decoded, command);
+}
+
+/// `smart_home/camera.stream_start` round-trips its optional `quality`
+/// field and its result forwards the bridge's `CameraStreamInfo` JSON.
+#[test]
+fn smart_home_camera_stream_start_command_and_result_round_trip() {
+    let command = UiCommand::SmartHomeCameraStreamStart(SmartHomeCameraStreamStartParams {
+        device_id: "cam1".into(),
+        quality: Some(2),
+    });
+    assert_eq!(command.method(), methods::SMART_HOME_CAMERA_STREAM_START);
+
+    let rpc = command
+        .clone()
+        .into_rpc_request("req-stream-start")
+        .expect("serialize smart_home/camera.stream_start");
+    assert_eq!(rpc.params["quality"], json!(2));
+
+    let json = serde_json::to_string(&rpc).expect("to_string");
+    let parsed_rpc: RpcRequest<Value> = serde_json::from_str(&json).expect("from_str");
+    let decoded =
+        UiCommand::from_rpc_request(parsed_rpc).expect("decode smart_home/camera.stream_start");
+    assert_eq!(decoded, command);
+
+    // Omitted quality stays omitted on the wire (server picks a default).
+    let bare = UiCommand::SmartHomeCameraStreamStart(SmartHomeCameraStreamStartParams {
+        device_id: "cam1".into(),
+        quality: None,
+    });
+    let rpc = bare
+        .into_rpc_request("req-stream-start-bare")
+        .expect("serialize bare");
+    assert!(rpc.params.get("quality").is_none());
+
+    let result = SmartHomeCameraStreamStartResult {
+        stream: json!({"ok": true, "protocol": "hls", "playback_url": "http://bridge/hls/cam1.m3u8"}),
+    };
+    let json = serde_json::to_string(&result).expect("serialize result");
+    let parsed: SmartHomeCameraStreamStartResult =
+        serde_json::from_str(&json).expect("deserialize result");
+    assert_eq!(parsed, result);
+}
+
+/// `smart_home/camera.stream_stop` round-trips through the RPC envelope.
+#[test]
+fn smart_home_camera_stream_stop_command_round_trips() {
+    let command = UiCommand::SmartHomeCameraStreamStop(SmartHomeCameraStreamStopParams {
+        device_id: "cam1".into(),
+    });
+    assert_eq!(command.method(), methods::SMART_HOME_CAMERA_STREAM_STOP);
+
+    let rpc = command
+        .clone()
+        .into_rpc_request("req-stream-stop")
+        .expect("serialize smart_home/camera.stream_stop");
+    let json = serde_json::to_string(&rpc).expect("to_string");
+    let parsed_rpc: RpcRequest<Value> = serde_json::from_str(&json).expect("from_str");
+    let decoded =
+        UiCommand::from_rpc_request(parsed_rpc).expect("decode smart_home/camera.stream_stop");
+    assert_eq!(decoded, command);
+}
+
+/// The `smart_home.v1` feature gates all 5 smart-home methods, and is
+/// advertised in `full_protocol()` but withheld from a server that hasn't
+/// negotiated it — same pattern as `user_question_methods_and_feature_are_registered`.
+#[test]
+fn smart_home_methods_are_gated_on_smart_home_v1() {
+    for method in [
+        methods::SMART_HOME_STATUS_GET,
+        methods::SMART_HOME_DEVICE_LIST,
+        methods::SMART_HOME_DEVICE_COMMAND,
+        methods::SMART_HOME_CAMERA_STREAM_START,
+        methods::SMART_HOME_CAMERA_STREAM_STOP,
+    ] {
+        assert_eq!(
+            method_capability_gate(method),
+            Some(UI_PROTOCOL_FEATURE_SMART_HOME_V1),
+            "{method} must be gated on smart_home.v1"
+        );
+    }
+
+    let full = UiProtocolCapabilities::full_protocol();
+    assert!(
+        full.supported_features
+            .contains(&UI_PROTOCOL_FEATURE_SMART_HOME_V1.to_string())
     );
 }

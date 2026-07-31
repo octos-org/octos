@@ -331,6 +331,7 @@ impl Updater {
                     "voice",
                     "clock",
                     "weather",
+                    "smart-home",
                 ];
                 for skill in &skills {
                     let dir = skills_dir.join(skill);

@@ -14,7 +14,6 @@
 
 use std::path::Path;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
 use octos_plugin::{
     HardwareLifecycle, LifecycleExecutor, LifecyclePhase, LifecycleStep, NoSandbox, Sandbox,
@@ -161,7 +160,7 @@ async fn should_apply_blocked_env_vars_to_lifecycle_steps() {
 #[cfg(unix)]
 #[tokio::test]
 async fn should_kill_child_when_step_timeout_exceeded() {
-    use std::time::Instant;
+    use std::time::{Duration, Instant};
 
     let tmp = tempfile::tempdir().unwrap();
     let pid_path = tmp.path().join("marker.pid");

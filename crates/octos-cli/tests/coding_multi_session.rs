@@ -195,6 +195,7 @@ async fn make_m11g_profile(profile_id: &str, data_dir: &std::path::Path) -> Arc<
     Arc::new(ProfileRuntime {
         profile_id: profile_id.to_string(),
         data_dir: data_dir.to_path_buf(),
+        config: octos_cli::config::Config::default(),
         snapshots: None,
         llm: Arc::new(ReadFileStubLlm),
         adaptive_router: None,
