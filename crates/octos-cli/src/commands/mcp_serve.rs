@@ -42,12 +42,13 @@ use async_trait::async_trait;
 use clap::{Args, ValueEnum};
 use eyre::{Result, WrapErr};
 use octos_agent::mcp_server::{
-    McpServer, McpServerError, McpSessionDispatch, McpSessionOutcome, OCTOS_MCP_SERVER_TOKEN_ENV,
-    SessionLifecycleObserver,
+    McpServer, McpServerError, McpSessionCost, McpSessionDispatch, McpSessionOutcome,
+    OCTOS_MCP_SERVER_TOKEN_ENV, SessionLifecycleObserver,
 };
 use octos_agent::task_supervisor::{TaskLifecycleState, TaskSupervisor};
 use octos_agent::validators::{
-    ValidatorInvocation, ValidatorPhase, ValidatorRunner, run_workspace_validators,
+    ValidatorInvocation, ValidatorOutcome, ValidatorPhase, ValidatorRunner,
+    run_workspace_validators,
 };
 use octos_agent::{
     Agent, AgentConfig, ApprovalPolicy, EffectivePermissions, HarnessEvent, SandboxConfig,
@@ -56,7 +57,7 @@ use octos_agent::{
 use octos_core::{AgentId, Task, TaskContext, TaskKind};
 use octos_llm::LlmProvider;
 use octos_memory::EpisodeStore;
-use serde_json::{Value, json};
+use serde_json::Value;
 
 use super::Executable;
 use crate::config::Config;
@@ -633,7 +634,7 @@ impl McpSessionDispatch for RealSessionDispatch {
                     artifact_path: None,
                     artifact_content: None,
                     validator_results: Vec::new(),
-                    cost: token_usage_to_value(&octos_core::TokenUsage::default()),
+                    cost: McpSessionCost::default(),
                     error: Some(format!("llm_error: {err}")),
                 });
             }
@@ -664,21 +665,13 @@ impl McpSessionDispatch for RealSessionDispatch {
             &task_result.files_to_send,
         );
 
-        let cost = token_usage_to_value(&task_result.token_usage);
+        let cost = McpSessionCost::from(&task_result.token_usage);
 
         // Any required validator failure blocks terminal success — mirrors
         // the local `enforce_spawn_task_contract` path.
-        let required_validator_failed = validator_results.iter().any(|value| {
-            let required = value
-                .get("required")
-                .and_then(Value::as_bool)
-                .unwrap_or(false);
-            let status = value
-                .get("status")
-                .and_then(Value::as_str)
-                .unwrap_or("pass");
-            required && status != "pass"
-        });
+        let required_validator_failed = validator_results
+            .iter()
+            .any(|outcome| !outcome.required_gate_passed());
         if required_validator_failed {
             observer.mark_state(TaskLifecycleState::Failed);
             return Ok(McpSessionOutcome {
@@ -746,18 +739,8 @@ impl McpSessionDispatch for RealSessionDispatch {
     }
 }
 
-fn token_usage_to_value(usage: &octos_core::TokenUsage) -> Value {
-    json!({
-        "input_tokens": usage.input_tokens,
-        "output_tokens": usage.output_tokens,
-        "reasoning_tokens": usage.reasoning_tokens,
-        "cache_read_tokens": usage.cache_read_tokens,
-        "cache_write_tokens": usage.cache_write_tokens,
-    })
-}
-
-/// Run completion-phase workspace validators and return their typed outcomes
-/// as JSON. No policy or no completion validators → empty vec. Failures
+/// Run completion-phase workspace validators and return their typed outcomes.
+/// No policy or no completion validators returns an empty vector. Failures
 /// during individual validators show up as `status != pass` entries in the
 /// returned array — the dispatch blocks terminal success on required misses.
 async fn run_completion_validators(
@@ -765,7 +748,7 @@ async fn run_completion_validators(
     contract: &str,
     tools: &Arc<ToolRegistry>,
     sandbox: &SandboxConfig,
-) -> Vec<Value> {
+) -> Vec<ValidatorOutcome> {
     let Ok(Some(policy)) = octos_agent::read_workspace_policy(workspace_root) else {
         return Vec::new();
     };
@@ -786,21 +769,13 @@ async fn run_completion_validators(
         tool_output: None,
         spawn_only_files: Vec::new(),
     };
-    let outcomes = run_workspace_validators(
+    run_workspace_validators(
         &runner,
         &invocation,
         &policy.validation.validators,
         Some(ValidatorPhase::Completion),
     )
-    .await;
-    outcomes
-        .into_iter()
-        .map(|outcome| {
-            serde_json::to_value(outcome).unwrap_or_else(
-                |_| serde_json::json!({"status": "error", "reason": "serialize failed"}),
-            )
-        })
-        .collect()
+    .await
 }
 
 fn resolve_artifact_path(
@@ -922,7 +897,7 @@ mod tests {
     }
 
     #[test]
-    fn token_usage_to_value_includes_all_counters() {
+    fn mcp_session_cost_includes_all_counters() {
         let usage = octos_core::TokenUsage {
             input_tokens: 12,
             output_tokens: 7,
@@ -930,12 +905,12 @@ mod tests {
             cache_read_tokens: 2,
             cache_write_tokens: 1,
         };
-        let value = token_usage_to_value(&usage);
-        assert_eq!(value["input_tokens"], 12);
-        assert_eq!(value["output_tokens"], 7);
-        assert_eq!(value["reasoning_tokens"], 3);
-        assert_eq!(value["cache_read_tokens"], 2);
-        assert_eq!(value["cache_write_tokens"], 1);
+        let cost = McpSessionCost::from(&usage);
+        assert_eq!(cost.input_tokens, 12);
+        assert_eq!(cost.output_tokens, 7);
+        assert_eq!(cost.reasoning_tokens, 3);
+        assert_eq!(cost.cache_read_tokens, 2);
+        assert_eq!(cost.cache_write_tokens, 1);
     }
 
     #[test]
@@ -963,7 +938,8 @@ mod http_transport_tests {
 
     use async_trait::async_trait;
     use octos_agent::mcp_server::{
-        McpServer, McpServerError, McpSessionDispatch, McpSessionOutcome, SessionLifecycleObserver,
+        McpServer, McpServerError, McpSessionCost, McpSessionDispatch, McpSessionOutcome,
+        SessionLifecycleObserver,
     };
     use octos_agent::task_supervisor::{TaskLifecycleState, TaskSupervisor};
     use serde_json::Value;
@@ -986,7 +962,7 @@ mod http_transport_tests {
                 artifact_path: None,
                 artifact_content: None,
                 validator_results: vec![],
-                cost: serde_json::json!({}),
+                cost: McpSessionCost::default(),
                 error: None,
             })
         }

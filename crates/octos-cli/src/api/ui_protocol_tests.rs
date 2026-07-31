@@ -13095,6 +13095,53 @@ fn m15_raw_autonomy_rpc_dispatches_every_method_to_orchestrator() {
     assert_eq!(calls, expected);
 }
 
+#[test]
+fn agent_output_read_preserves_recoverable_cursor_error_shape() {
+    let features = ConnectionUiFeatures::stdio_defaults();
+    let session_id = SessionKey::new("tenant-a", "cursor-error");
+    let orchestrator = RecordingOrchestrator::default();
+
+    for malformed_cursor in [
+        json!({}),
+        json!({ "offset": "not-a-number" }),
+        json!({ "offset": -1 }),
+    ] {
+        let request = RpcRequest::new(
+            "read-output",
+            methods::AGENT_OUTPUT_READ,
+            json!({
+                "agent_id": "agent-1",
+                "session_id": session_id.clone(),
+                "profile_id": "tenant-a",
+                "cursor": malformed_cursor,
+            }),
+        );
+        let error = raw_autonomy_rpc_with_orchestrator(&request, features, None, &orchestrator)
+            .expect_err("malformed cursor must retain the domain error");
+        let data = error.data.expect("cursor error data");
+
+        assert_eq!(error.code, rpc_error_codes::INVALID_PARAMS);
+        assert_eq!(
+            error.message,
+            "agent output cursor must be an object with numeric offset"
+        );
+        assert_eq!(data["kind"], "agent_output_cursor_invalid");
+        assert_eq!(data["policy_id"], "coding-autonomy-v1");
+        assert_eq!(data["profile_id"], "tenant-a");
+        assert_eq!(data["session_id"], json!(session_id));
+        assert_eq!(data["recoverable"], true);
+    }
+
+    assert!(
+        orchestrator
+            .calls
+            .lock()
+            .expect("recorded calls")
+            .is_empty(),
+        "invalid cursors must fail before orchestrator dispatch"
+    );
+}
+
 /// Codex P1 follow-up to #1094: `task/artifact/list` and
 /// `task/artifact/read` are the UPCR-2026-019 / M13 canonical names.
 /// Spec-conforming clients reach them via `task/list`, which exposes

@@ -17,11 +17,12 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use octos_agent::harness_events::HarnessEventPayload;
 use octos_agent::mcp_server::{
-    McpServer, McpServerError, McpSessionDispatch, McpSessionOutcome, SessionLifecycleObserver,
-    build_initialize_response, build_tools_list_response, constant_time_eq,
-    dispatch_run_octos_session, parse_bearer_token, render_mcp_error,
+    McpServer, McpServerError, McpSessionCost, McpSessionDispatch, McpSessionOutcome,
+    SessionLifecycleObserver, build_initialize_response, build_tools_list_response,
+    constant_time_eq, dispatch_run_octos_session, parse_bearer_token, render_mcp_error,
 };
 use octos_agent::task_supervisor::{TaskLifecycleState, TaskSupervisor};
+use octos_agent::validators::{ValidatorOutcome, ValidatorPhase, ValidatorStatus};
 use octos_agent::{HarnessEvent, TASK_RESULT_SCHEMA_VERSION};
 use serde_json::{Value, json};
 use tokio::sync::Mutex;
@@ -65,10 +66,12 @@ fn sample_ready_outcome() -> McpSessionOutcome {
         final_state: TaskLifecycleState::Ready,
         artifact_path: Some("pf/deck.pptx".to_string()),
         artifact_content: Some("MOCK-PPTX-BYTES".to_string()),
-        validator_results: vec![
-            json!({"validator": "slides-sanity", "passed": true, "message": "ok"}),
-        ],
-        cost: json!({"input_tokens": 100, "output_tokens": 42}),
+        validator_results: vec![sample_validator_outcome(ValidatorStatus::Pass, "ok")],
+        cost: McpSessionCost {
+            input_tokens: 100,
+            output_tokens: 42,
+            ..Default::default()
+        },
         error: None,
     }
 }
@@ -78,11 +81,34 @@ fn sample_failed_outcome() -> McpSessionOutcome {
         final_state: TaskLifecycleState::Failed,
         artifact_path: None,
         artifact_content: None,
-        validator_results: vec![
-            json!({"validator": "slides-sanity", "passed": false, "message": "slide count too low"}),
-        ],
-        cost: json!({"input_tokens": 40, "output_tokens": 12}),
+        validator_results: vec![sample_validator_outcome(
+            ValidatorStatus::Fail,
+            "slide count too low",
+        )],
+        cost: McpSessionCost {
+            input_tokens: 40,
+            output_tokens: 12,
+            ..Default::default()
+        },
         error: Some("contract gate failed: slides-sanity".to_string()),
+    }
+}
+
+fn sample_validator_outcome(status: ValidatorStatus, reason: &str) -> ValidatorOutcome {
+    ValidatorOutcome {
+        schema_version: 1,
+        validator_id: "slides-sanity".into(),
+        phase: ValidatorPhase::Completion,
+        kind: "command".into(),
+        repo_label: "mcp-serve/slides_delivery".into(),
+        required: true,
+        required_tier: "hard".into(),
+        status,
+        reason: reason.into(),
+        duration_ms: 1,
+        evidence_path: None,
+        stderr: None,
+        started_at: chrono::Utc::now(),
     }
 }
 
@@ -163,8 +189,13 @@ async fn should_return_contract_artifact_on_session_ready() {
     assert_eq!(parsed["schema_version"], TASK_RESULT_SCHEMA_VERSION);
     let validators = parsed["validator_results"].as_array().unwrap();
     assert_eq!(validators.len(), 1);
-    assert_eq!(validators[0]["passed"], true);
-    assert!(parsed.get("cost").is_some());
+    assert_eq!(validators[0]["validator_id"], "slides-sanity");
+    assert_eq!(validators[0]["status"], "pass");
+    assert_eq!(parsed["cost"]["input_tokens"], 100);
+    assert_eq!(parsed["cost"]["output_tokens"], 42);
+    assert_eq!(parsed["cost"]["reasoning_tokens"], 0);
+    assert_eq!(parsed["cost"]["cache_read_tokens"], 0);
+    assert_eq!(parsed["cost"]["cache_write_tokens"], 0);
 }
 
 #[tokio::test]
@@ -202,7 +233,8 @@ async fn should_return_typed_error_on_session_failed() {
     // Validator list still shipped so the outer orchestrator sees WHY it failed.
     let validators = parsed["validator_results"].as_array().unwrap();
     assert_eq!(validators.len(), 1);
-    assert_eq!(validators[0]["passed"], false);
+    assert_eq!(validators[0]["validator_id"], "slides-sanity");
+    assert_eq!(validators[0]["status"], "fail");
 }
 
 #[tokio::test]
