@@ -54,6 +54,15 @@ use super::matrix_integration::*;
 const PROFILE_PROMPT_CACHE_CAP: usize = 128;
 const CLI_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
 
+fn gateway_serve_asr_language(
+    voice_config: Option<&crate::config::VoiceConfig>,
+    forwarded_host_default: Option<&str>,
+) -> Option<String> {
+    voice_config
+        .and_then(|voice| voice.asr_language.clone())
+        .or_else(|| forwarded_host_default.map(ToOwned::to_owned))
+}
+
 // `large_enum_variant`: the `Inbound` variant carries an
 // `octos_core::InboundMessage`, which holds `serde_json::Value` fields. When a
 // workspace crate enables serde_json's `preserve_order` feature (the `octos acp`
@@ -593,7 +602,12 @@ impl GatewayRuntime {
             } else {
                 None
             };
-        let asr_language = voice_config.as_ref().and_then(|vc| vc.asr_language.clone());
+        let forwarded_host_asr_language =
+            std::env::var(crate::profiles::HOST_ASR_LANGUAGE_ENV).ok();
+        let asr_language = gateway_serve_asr_language(
+            voice_config.as_ref(),
+            forwarded_host_asr_language.as_deref(),
+        );
 
         // M11-F gateway consolidation note:
         //
@@ -1907,10 +1921,31 @@ impl GatewayRuntime {
             }
 
             // Transcribe audio, separate images, and tag voice metadata.
+            // Resolve the routed profile's ASR override for every message so a
+            // Settings save applies to the next channel utterance just as it
+            // does in AppUI. Store read/parse failures are fatal instead of
+            // silently changing the request to auto-detect or a host default.
+            let has_audio_media = self.asr_binary.is_some()
+                && inbound
+                    .media
+                    .iter()
+                    .any(|path| octos_bus::media::is_audio(path));
+            let effective_asr_language = if has_audio_media {
+                let asr_profile_id = dispatch_profile_id
+                    .as_deref()
+                    .or(self.profile_id.as_deref());
+                crate::profiles::effective_profile_asr_language(
+                    self.profile_store.as_deref(),
+                    asr_profile_id,
+                    self.asr_language.as_deref(),
+                )?
+            } else {
+                None
+            };
             let media_result = message_preprocessing::process_media(
                 &mut inbound,
                 self.asr_binary.as_deref(),
-                self.asr_language.as_deref(),
+                effective_asr_language.as_deref(),
                 &self.channel_mgr,
             )
             .await;
@@ -2218,6 +2253,23 @@ impl GatewayRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn should_resolve_forwarded_host_asr_default_for_profile_gateway() {
+        assert_eq!(
+            gateway_serve_asr_language(None, Some("English")),
+            Some("English".to_string())
+        );
+        let voice = crate::config::VoiceConfig {
+            asr_language: Some("French".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            gateway_serve_asr_language(Some(&voice), Some("English")),
+            Some("French".to_string())
+        );
+        assert_eq!(gateway_serve_asr_language(None, None), None);
+    }
     use chrono::Utc;
     use tokio::sync::mpsc;
 
