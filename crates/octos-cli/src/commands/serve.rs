@@ -51,6 +51,22 @@ fn fleet_sandbox_is_isolating(sandbox_cfg: &octos_agent::sandbox::SandboxConfig)
     !octos_agent::sandbox::create_sandbox(sandbox_cfg).is_noop()
 }
 
+/// Whether the resolved sandbox backend can grant a `FsGrant::Host` worker FULL
+/// daemon-user FS write together with the reads git needs — the third gate
+/// condition for the fleet WORKTREE flow (§5). Computed at serve boot (mirrors
+/// [`fleet_sandbox_is_isolating`]) from the base sandbox's
+/// `supports_repo_git_write()`: `true` for bwrap and unrestricted-read macOS,
+/// `false` for docker, restricted-read macOS, Landlock, AppContainer, and no
+/// sandbox. When `false`, the pool falls back to a scratch workspace for every
+/// task (a worktree worker whose `git commit` can't reach `<repo>/.git` would
+/// lose its deliverable when the checkout is removed). Threaded into
+/// `PoolConfig.repo_git_write_supported`.
+fn fleet_sandbox_supports_repo_git_write(
+    sandbox_cfg: &octos_agent::sandbox::SandboxConfig,
+) -> bool {
+    octos_agent::sandbox::create_sandbox(sandbox_cfg).supports_repo_git_write()
+}
+
 /// #1857 PR 5a fix (HIGH 2) — reconcile the fleet store at boot with a bounded
 /// retry. `reconcile` is the ONLY production recovery of a prior boot's stale
 /// leases: a stale `Launching`/`Running` child never re-readies on its own
@@ -904,17 +920,31 @@ impl ServeCommand {
                              will report the pool unavailable."
                         );
                     } else {
-                        // PR A — the SandboxFactory takes the per-attempt
-                        // `allow_network` derived from the task's grant: `Full` →
-                        // true (raw egress for git/npm), `None`/`Hosts` → false.
-                        let sandbox_factory: octos_fleet_worker::SandboxFactory =
-                            Arc::new(move |_cwd: &std::path::Path, allow_network: bool| {
+                        // §5 gate condition 3: compute the repo-`.git`-write
+                        // capability BEFORE the factory closure moves `sandbox_cfg`
+                        // in (the closure needs the whole config; the pool only
+                        // needs the bool).
+                        let repo_git_write_supported =
+                            fleet_sandbox_supports_repo_git_write(&sandbox_cfg);
+                        // The SandboxFactory folds the per-attempt SandboxGrant
+                        // (derived from the task's WorkerGrant) onto the base
+                        // network-isolated sandbox: `allow_network` from the
+                        // network lane (`Full` → true, `None`/`Hosts` → false) and
+                        // `repo_git_write` from the FS lane (`FsGrant::Host` worktree
+                        // worker → `Some(<repo>/.git)`, a TARGETED rw-bind so its
+                        // `git commit` can reach `<repo>/.git` outside its cwd
+                        // WITHOUT exposing host sockets via `--bind / /`).
+                        let sandbox_factory: octos_fleet_worker::SandboxFactory = Arc::new(
+                            move |_cwd: &std::path::Path,
+                                  grant: octos_fleet_worker::SandboxGrant| {
                                 let mut cfg = sandbox_cfg.clone();
-                                cfg.allow_network = allow_network;
+                                cfg.allow_network = grant.allow_network;
+                                cfg.repo_git_write = grant.repo_git_dir;
                                 Arc::<dyn octos_agent::sandbox::Sandbox>::from(
                                     octos_agent::sandbox::create_sandbox(&cfg),
                                 )
-                            });
+                            },
+                        );
                         let factory = Arc::new(octos_fleet_worker::AgentFactory::new(
                             rt.llm.clone(),
                             rt.memory.clone(),
@@ -934,6 +964,12 @@ impl ServeCommand {
                             // Fix (HIGH 4): the pool's bound keeper profile — the
                             // keeper fences a cross-profile goal against it.
                             keeper_profile_id: rt.profile_id.clone(),
+                            // §5 gate condition 3: only take the worktree flow when
+                            // the resolved backend supports full-FS write (bwrap /
+                            // full-read macOS). Otherwise every task falls back to a
+                            // scratch workspace so a non-supporting backend never
+                            // loses a deliverable.
+                            repo_git_write_supported,
                         };
                         let pool = octos_fleet_worker::FleetWorkerPool::new(
                             Arc::new(fleet_store),

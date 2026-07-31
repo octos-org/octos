@@ -5,52 +5,19 @@
 //! inherit those raw secrets unless the tool explicitly allowlists them.
 
 use std::collections::HashSet;
-use std::sync::{LazyLock, RwLock};
 
 use tokio::process::Command;
 
+// The provider-secret machinery (the injection denylist, the heuristic, AND the
+// runtime-registered-secret registry) lives in `octos_core::env_hygiene` (the
+// bottom crate), so it is the SINGLE source consulted by BOTH this subprocess
+// sanitiser AND octos-core's controller-side git sanitiser. A name registered
+// via `register_secret_env_names` (re-exported unchanged at
+// `octos_agent::register_secret_env_names`) is therefore stripped from EVERY
+// spawned subprocess — sandboxed worker git ops AND controller-side git ops.
 use crate::sandbox::BLOCKED_ENV_VARS;
-
-/// Exact env-var names known to hold a configured LLM provider API key.
-/// Populated at provider build time via [`register_secret_env_names`].
-///
-/// These are treated exactly like heuristic secrets ([`is_secret_env_name`]):
-/// stripped from the default subprocess environment, but still forwardable to a
-/// tool that explicitly allowlists them — the sanctioned path for skills that
-/// call LLMs (see `build_plugin_env`). The registry closes the gap where the
-/// NAME heuristic misses a custom `api_key_env` that doesn't look secret (e.g.
-/// `ANTHROPIC_CREDS`), so it can't be `echo`'d from the empty-allowlist shell
-/// tool / hooks / validators.
-static REGISTERED_SECRET_ENV: LazyLock<RwLock<HashSet<String>>> =
-    LazyLock::new(|| RwLock::new(HashSet::new()));
-
-/// Register env-var names (e.g. the resolved LLM `api_key_env`) that must
-/// always be stripped from subprocess environments. Idempotent; names are
-/// normalized (ASCII-uppercased). Safe to call repeatedly from provider
-/// construction.
-pub fn register_secret_env_names<I, S>(names: I)
-where
-    I: IntoIterator<Item = S>,
-    S: AsRef<str>,
-{
-    let mut set = REGISTERED_SECRET_ENV
-        .write()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    for name in names {
-        let normalized = normalize_env_name(name.as_ref());
-        if !normalized.is_empty() {
-            set.insert(normalized);
-        }
-    }
-}
-
-fn is_registered_secret_env_name(name: &str) -> bool {
-    let normalized = normalize_env_name(name);
-    REGISTERED_SECRET_ENV
-        .read()
-        .map(|set| set.contains(&normalized))
-        .unwrap_or(false)
-}
+pub use octos_core::register_secret_env_names;
+use octos_core::{is_registered_secret_env_name, is_secret_env_name};
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct EnvAllowlist {
@@ -183,45 +150,6 @@ fn normalize_env_name(name: &str) -> String {
     name.to_ascii_uppercase()
 }
 
-fn env_name_tokens(upper_name: &str) -> impl Iterator<Item = &str> {
-    upper_name
-        .split(|ch: char| !ch.is_ascii_alphanumeric())
-        .filter(|token| !token.is_empty())
-}
-
-pub(crate) fn is_secret_env_name(name: &str) -> bool {
-    let upper = normalize_env_name(name);
-    let tokens: Vec<&str> = env_name_tokens(&upper).collect();
-
-    if tokens.iter().any(|token| {
-        matches!(
-            *token,
-            "TOKEN"
-                | "SECRET"
-                | "PASSWORD"
-                | "PASSCODE"
-                | "PASSPHRASE"
-                | "CREDENTIAL"
-                | "CREDENTIALS"
-                | "PAT"
-                | "BEARER"
-                | "AUTHORIZATION"
-                | "COOKIE"
-        )
-    }) {
-        return true;
-    }
-
-    upper.contains("APIKEY")
-        || upper.contains("API_KEY")
-        || upper.contains("ACCESSKEY")
-        || upper.contains("SECRETKEY")
-        || upper.contains("PRIVATEKEY")
-        || upper == "KEY"
-        || upper.ends_with("_KEY")
-        || upper.contains("_KEY_")
-}
-
 pub(crate) fn is_injection_env_name(name: &str) -> bool {
     BLOCKED_ENV_VARS
         .iter()
@@ -236,6 +164,18 @@ pub(crate) fn should_forward_env_name(name: &str, allowlist: &EnvAllowlist) -> b
     // by default, but still allowlistable (skills that call LLMs declare them).
     let is_secret = is_secret_env_name(name) || is_registered_secret_env_name(name);
     !is_secret || allowlist.contains(name)
+}
+
+/// Strip provider/API-key and process-injection env vars from `cmd` using the
+/// DEFAULT (empty-allowlist) policy — the exact sanitisation the shell tool
+/// applies before every command ([`sanitize_command_env`] with
+/// [`EnvAllowlist::empty`]). Public so an out-of-crate subprocess spawner that
+/// runs at a LOWER trust level than the harness (e.g. the fleet worker's
+/// sandboxed git ops, whose `.git` `filter.*`/hooks are worker-controlled) can
+/// match the shell's secret hygiene and never hand controller credentials to
+/// worker-planted code.
+pub fn sanitize_default_subprocess_env(cmd: &mut Command) {
+    sanitize_command_env(cmd, &EnvAllowlist::empty());
 }
 
 pub(crate) fn sanitize_command_env(cmd: &mut Command, allowlist: &EnvAllowlist) {
@@ -258,6 +198,29 @@ pub(crate) fn sanitize_command_env(cmd: &mut Command, allowlist: &EnvAllowlist) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_subprocess_env_strips_injection_vars() {
+        // The public wrapper the fleet worker's sandboxed git ops use must strip
+        // every process-injection var (defense the child inherits nothing
+        // dangerous), matching the shell tool's empty-allowlist sanitisation.
+        let mut cmd = Command::new("true");
+        sanitize_default_subprocess_env(&mut cmd);
+        let removed: Vec<String> = cmd
+            .as_std()
+            .get_envs()
+            .filter_map(|(k, v)| {
+                if v.is_none() {
+                    Some(k.to_string_lossy().to_string())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        for var in BLOCKED_ENV_VARS {
+            assert!(removed.iter().any(|r| r == *var), "must strip {var}");
+        }
+    }
 
     #[test]
     fn detects_common_secret_env_names() {

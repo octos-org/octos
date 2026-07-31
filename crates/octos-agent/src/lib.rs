@@ -55,7 +55,7 @@ pub mod steering;
 pub mod subagent_output;
 pub mod subagent_summary;
 mod subprocess_env;
-pub use subprocess_env::register_secret_env_names;
+pub use subprocess_env::{register_secret_env_names, sanitize_default_subprocess_env};
 pub mod summarizer;
 pub mod swarm;
 pub mod task_supervisor;
@@ -215,7 +215,7 @@ pub use tools::{
 pub use turn::{Turn, TurnKind, turns_to_messages};
 pub use validators::{
     VALIDATOR_RESULT_SCHEMA_VERSION, ValidatorInvocation, ValidatorLedger, ValidatorOutcome,
-    ValidatorPhase, ValidatorRunner, ValidatorStatus, run_workspace_validators,
+    ValidatorPhase, ValidatorRunner, ValidatorStatus, kill_child_process, run_workspace_validators,
 };
 pub use workspace_git::{
     WorkspaceArtifactStatus, WorkspaceCheckStatus, WorkspaceContractStatus, WorkspaceProjectKind,

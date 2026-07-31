@@ -2564,8 +2564,20 @@ fn record_counter(outcome: &ValidatorOutcome, kind_label: &'static str) {
 }
 
 /// Kill a child process (and process group on Unix) cleanly. Used by the
-/// command validator timeout handler.
-async fn kill_child_process(pid: u32) {
+/// command validator timeout handler AND by the fleet worktree worker's
+/// bounded sandboxed git ops (populate/commit) so a hung clean/smudge filter or
+/// `post-commit` hook is reaped rather than retaining pool permits. Sends
+/// SIGTERM to the process group + descendants, waits a grace period, then
+/// SIGKILL any survivor. `pid` should be the leader of its own process group
+/// (spawn the command with `process_group(0)` on Unix).
+///
+/// `kill`/`ps` are invoked by ABSOLUTE path ([`KILL_BIN`]/[`PS_BIN`]), never via
+/// `$PATH`, so a full-FS worker that planted a fake `kill`/`ps` cannot get the
+/// controller to run it on a git-op timeout. Best-effort against an escapee that
+/// `setsid`/double-forks into a NEW process group AND reparents away from `pid`
+/// (no longer a descendant): the sandbox's own process/network confinement is
+/// the real containment there; this reaps the common tree.
+pub async fn kill_child_process(pid: u32) {
     debug!(pid, "killing validator child on timeout");
 
     #[cfg(unix)]
@@ -2607,12 +2619,40 @@ async fn kill_child_process(pid: u32) {
     }
 }
 
+/// Absolute path to the `kill` binary, resolved ONCE from a fixed set of system
+/// locations — NEVER via `$PATH`. `kill_child_process` runs on a git-op TIMEOUT
+/// as the CONTROLLER (unsandboxed), so resolving `kill` by bare name would let a
+/// full-FS worker that planted a fake `kill` earlier in `$PATH` (a
+/// daemon-writable dir) get the controller to execute it. Pinning to an absolute
+/// path defeats that; the fallback stays ABSOLUTE so there is no `$PATH` lookup
+/// even on an exotic layout where the probes miss.
+#[cfg(unix)]
+static KILL_BIN: std::sync::LazyLock<PathBuf> = std::sync::LazyLock::new(|| {
+    resolve_system_binary(&["/bin/kill", "/usr/bin/kill"], "/bin/kill")
+});
+
+/// Absolute path to the `ps` binary (same rationale as [`KILL_BIN`]).
+#[cfg(unix)]
+static PS_BIN: std::sync::LazyLock<PathBuf> =
+    std::sync::LazyLock::new(|| resolve_system_binary(&["/bin/ps", "/usr/bin/ps"], "/bin/ps"));
+
+/// Pick the first EXISTING absolute candidate, else the (absolute) `fallback`.
+/// Never returns a bare name, so the caller never triggers a `$PATH` lookup.
+#[cfg(unix)]
+fn resolve_system_binary(candidates: &[&str], fallback: &str) -> PathBuf {
+    candidates
+        .iter()
+        .map(PathBuf::from)
+        .find(|p| p.exists())
+        .unwrap_or_else(|| PathBuf::from(fallback))
+}
+
 #[cfg(unix)]
 fn signal_process_group(pid: u32, signal: &str) -> bool {
     use std::process::Command as StdCommand;
 
     let group = format!("-{pid}");
-    StdCommand::new("kill")
+    StdCommand::new(&*KILL_BIN)
         .args([signal, "--", &group])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -2624,7 +2664,7 @@ fn signal_process_group(pid: u32, signal: &str) -> bool {
 fn signal_process(pid: u32, signal: &str) -> bool {
     use std::process::Command as StdCommand;
 
-    StdCommand::new("kill")
+    StdCommand::new(&*KILL_BIN)
         .args([signal, &pid.to_string()])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -2653,7 +2693,7 @@ fn process_exists(pid: u32) -> bool {
 fn process_group_id(pid: u32) -> Option<u32> {
     use std::process::Command as StdCommand;
 
-    let output = StdCommand::new("ps")
+    let output = StdCommand::new(&*PS_BIN)
         .args(["-o", "pgid=", "-p", &pid.to_string()])
         .output()
         .ok()?;
@@ -2670,7 +2710,10 @@ fn process_group_id(pid: u32) -> Option<u32> {
 fn collect_descendant_pids(root_pid: u32) -> Vec<u32> {
     use std::process::Command as StdCommand;
 
-    let output = match StdCommand::new("ps").args(["-eo", "pid=,ppid="]).output() {
+    let output = match StdCommand::new(&*PS_BIN)
+        .args(["-eo", "pid=,ppid="])
+        .output()
+    {
         Ok(output) if output.status.success() => output,
         _ => return Vec::new(),
     };

@@ -9,8 +9,10 @@
 pub mod abort;
 pub mod app_ui;
 pub mod app_ui_codec;
+pub mod env_hygiene;
 mod error;
 pub mod gateway;
+pub mod git_worktree;
 mod message;
 pub mod session_scope;
 mod task;
@@ -19,8 +21,17 @@ pub mod ui_protocol;
 mod utils;
 
 pub use abort::{abort_response, is_abort_trigger};
+pub use env_hygiene::{
+    BLOCKED_ENV_VARS, is_registered_secret_env_name, is_secret_env_name, register_secret_env_names,
+    sanitize_git_command_env,
+};
 pub use error::{Error, ErrorKind, Result};
 pub use gateway::{InboundMessage, METADATA_SENDER_USER_ID, MessageOrigin, OutboundMessage};
+pub use git_worktree::{
+    PreparedWorktree, branch_advanced_past, deliverable_commit_command, git_ref_exists,
+    is_git_repo, prepare_fleet_worktree, probe_git_repo, remove_checkout_keep_branch,
+    worktree_populate_command,
+};
 pub use message::AgentMessage;
 pub use session_scope::{
     DEFAULT_MULTI_TENANT_SHARED_ZONE_NAMES, MULTI_TENANT_USERS_DIR_NAME,
