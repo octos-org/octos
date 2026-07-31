@@ -8750,10 +8750,9 @@ mod tests {
                 .await
                 .expect("open episode store"),
         );
-        let sandbox_factory: octos_fleet_worker::SandboxFactory =
-            Arc::new(|_cwd, _allow_network| {
-                Arc::new(MarkerSandbox) as Arc<dyn octos_agent::sandbox::Sandbox>
-            });
+        let sandbox_factory: octos_fleet_worker::SandboxFactory = Arc::new(|_cwd, _grant| {
+            Arc::new(MarkerSandbox) as Arc<dyn octos_agent::sandbox::Sandbox>
+        });
         let factory = Arc::new(octos_fleet_worker::AgentFactory::new(
             Arc::new(NativeMockProvider {
                 content: Ok("done".to_owned()),
@@ -8770,6 +8769,10 @@ mod tests {
             projected_tokens,
             workspace_root: work.to_path_buf(),
             keeper_profile_id: "tenant-a".to_owned(),
+            // This test's MarkerSandbox is a real-isolating double; the worktree
+            // flow is irrelevant here (no git controller root), so either value
+            // works — mirror production's "supported" default.
+            repo_git_write_supported: true,
         };
         let pool = FleetWorkerPool::new(
             Arc::new(store),

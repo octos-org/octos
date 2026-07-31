@@ -56,8 +56,28 @@ use octos_fleet::{
     FleetKernelStore, MarkRunningOutcome, TaskView, Verifier,
 };
 
-use crate::AgentFactory;
 use crate::escalate::EscalationSlot;
+use crate::{AgentFactory, SandboxGrant};
+
+/// The controller-repo context for a WORKTREE attempt, threaded into
+/// [`run_attempt`] so it can land the deliverable on the task branch before
+/// completion and refuse to record a phantom success on an EMPTY branch. `None`
+/// for the scratch fallback (no worktree, no branch).
+#[derive(Debug, Clone)]
+pub struct WorktreeContext {
+    /// Canonical controller repository root.
+    pub repo_root: PathBuf,
+    /// The task-stable `fleet/<fleet>/<task>` branch the checkout is on.
+    pub branch: String,
+    /// The branch head captured at prepare — the base the deliverable must
+    /// advance past for the attempt to count as having produced work.
+    pub base_commit: String,
+    /// The repository's `.git` common dir (objects/refs/worktree-admin), OUTSIDE
+    /// the checkout cwd. Threaded into the sandbox grant (`repo_git_dir`) so the
+    /// worker's `git commit` can rw the ONLY path beyond its cwd it needs — a
+    /// TARGETED bind, not full-`/`.
+    pub git_dir: PathBuf,
+}
 
 /// Settle an escalation NON-terminally via the store's four-part fence, mapping
 /// the store outcome to an [`AttemptOutcome`]. Shared by `run_attempt` (the
@@ -153,7 +173,7 @@ pub enum AttemptOutcome {
 /// docs for the sequence. `actual_now_ms` is the wall clock threaded into
 /// the store's `complete_child` (settlement timestamp) and the follow-on
 /// readiness promotion.
-#[allow(clippy::too_many_arguments)] // store + ids + view + factory + deadline + epoch + clock + escalation slot are irreducible
+#[allow(clippy::too_many_arguments)] // store + ids + view + factory + cwd + worktree + deadline + epoch + clock + escalation slot are irreducible
 pub async fn run_attempt(
     store: Arc<FleetKernelStore>,
     fleet_id: &str,
@@ -162,6 +182,11 @@ pub async fn run_attempt(
     task_view: &TaskView,
     factory: &AgentFactory,
     working_dir: &Path,
+    // Some(ctx) when this attempt runs in a git worktree (the pool allocated one
+    // for a `FsGrant::Host` task on a git controller root under a supporting
+    // backend); None for the scratch-cwd fallback. Drives the deliverable
+    // auto-commit + empty-branch reject.
+    worktree: Option<&WorktreeContext>,
     deadline: Duration,
     owner_epoch: u64,
     // PR B — the shared escalation slot the always-on `escalate` valve writes
@@ -210,7 +235,18 @@ pub async fn run_attempt(
         }
     }
 
-    // 2. Build the Task from the rendered brief + acceptance criteria.
+    // 2. Build the Task from the rendered brief + acceptance criteria. For a
+    //    worktree attempt, add the deliverable hint (belt-and-suspenders on the
+    //    auto-commit): the worker's deliverable is a COMMIT on its branch.
+    let mut brief = render_brief(task_view);
+    if worktree.is_some() {
+        brief.push_str(
+            "\n## Deliverable\nYou are working inside a `git worktree` on your own branch. Your \
+             deliverable is a COMMIT on that branch: make your changes here, then `git add -A` and \
+             `git commit`. (Any changes you leave uncommitted are auto-committed on completion, but \
+             an empty branch with no changes counts as NO deliverable.)\n",
+        );
+    }
     let task = Task::new(
         TaskKind::Custom {
             name: "fleet_task".to_string(),
@@ -222,23 +258,34 @@ pub async fn run_attempt(
         },
         TaskContext {
             working_dir: working_dir.to_path_buf(),
-            working_memory: vec![Message::user(render_brief(task_view))],
+            working_memory: vec![Message::user(brief)],
             ..Default::default()
         },
     );
 
-    // PR A: the sandbox's raw network egress comes from THIS task's grant, not
-    // a hardcoded `false`. `None`/`Hosts` → no raw egress (the shell cannot
-    // `curl`; `Hosts` is enforced by the granted web tools); `Full` → raw egress
-    // (git/npm/etc.). The isolating backend is unchanged — only the network flag
-    // is per-attempt.
-    let allow_network = task_view.grant.network.allows_raw_egress();
+    // The sandbox scope comes from THIS task's grant (projected fresh per
+    // attempt), not a hardcode:
+    // - `allow_network` (PR A): `None`/`Hosts` → no raw egress (the shell cannot
+    //   `curl`; `Hosts` is enforced by the granted web tools); `Full` → raw
+    //   egress (git/npm/etc.).
+    // - `repo_git_dir` (PR C, codex fix #2a): set ONLY for an actual WORKTREE
+    //   worker (to the prepared checkout's `<repo>/.git`), NOT from `fs.is_host()`
+    //   alone. The pool allocates a worktree only when the FULL gate holds —
+    //   `FsGrant::Host` AND `NetworkGrant::Full` (a coherent full-trust grant) AND
+    //   a git repo AND a supporting backend — so a SCRATCH-fallback worker
+    //   (restricted grant, non-git, or unsupported backend) stays cwd-confined and
+    //   never gets the extra `.git` write. It is a TARGETED bind, never full-`/`,
+    //   so no host AF_UNIX socket is exposed above the worker's grant.
+    let grant = SandboxGrant {
+        allow_network: task_view.grant.network.allows_raw_egress(),
+        repo_git_dir: worktree.map(|w| w.git_dir.clone()),
+    };
 
     // P1-3-fix: ONE sandbox instance for the whole attempt, shared by the
     // agent's granted registry AND the acceptance validators — so a
     // non-idempotent factory can never sandbox the agent while handing the
     // validators a weaker (e.g. no-op) sandbox.
-    let sandbox = factory.sandbox_for(working_dir, allow_network);
+    let sandbox = factory.sandbox_for(working_dir, grant);
 
     // PR B — the agent folds each response's cumulative spend into `tracker` (via
     // `run_task_with_tracker`), so an escalation that ends on the TIMEOUT /
@@ -258,6 +305,16 @@ pub async fn run_attempt(
     // worker unsandboxed. REFUSE: settle the attempt `Terminated` (via the normal
     // `complete_child` path below, so the child ends terminal, not silently
     // unsandboxed) WITHOUT ever building or running the agent.
+    // codex fix #2b — per-attempt full-FS-write verification for a worktree
+    // worker: BOOT guarantees ≠ RUNTIME guarantees. `SandboxMode::Auto`
+    // re-resolves the backend per factory call, so the pool's boot-time
+    // `repo_git_write_supported` probe can be stale (the backend degraded, e.g.
+    // bwrap became unavailable and Auto fell to a backend that can't grant the
+    // `.git` write). A worktree worker under such a sandbox would fail its git
+    // ops and lose the deliverable. Verify the RESOLVED sandbox actually supports
+    // it (mirrors the PR 5a per-attempt network check) and fail closed otherwise.
+    let worktree_backend_ok = worktree.is_none() || sandbox.supports_repo_git_write();
+
     let computed = if sandbox.is_noop() {
         tracing::error!(
             %fleet_id, %task_id, %attempt_id,
@@ -265,6 +322,22 @@ pub async fn run_attempt(
              attempt instead of running the agent unsandboxed",
         );
         Computed::terminated("no isolating sandbox available at attempt time".to_string())
+    } else if !worktree_backend_ok {
+        tracing::error!(
+            %fleet_id, %task_id, %attempt_id,
+            "fleet worker: worktree attempt but the resolved sandbox no longer supports full-FS \
+             write (backend degraded since boot); terminating rather than losing the deliverable",
+        );
+        Computed::terminated(
+            "worktree attempt: resolved sandbox no longer supports full-FS write".to_string(),
+        )
+    } else if let Some(reason) = populate_worktree(worktree, &sandbox, working_dir, deadline).await
+    {
+        tracing::error!(
+            %fleet_id, %task_id, %attempt_id, %reason,
+            "fleet worker: worktree populate failed; terminating the attempt",
+        );
+        Computed::terminated(reason)
     } else {
         // 3. Fresh, granted-registry agent (cannot park, cannot fan out; holds
         //    EXACTLY the operator-granted tools) under the shared sandbox. Its
@@ -367,9 +440,26 @@ pub async fn run_attempt(
                             task_view,
                             working_dir,
                             factory,
-                            sandbox,
+                            sandbox.clone(),
                             deadline.as_secs().max(1),
                             remaining,
+                        )
+                        .await;
+                        // For a worktree attempt that PASSED acceptance, land the
+                        // deliverable on the branch (auto-commit any uncommitted
+                        // checkout changes INSIDE the worker's sandbox — §4b) and
+                        // REQUIRE the branch to have advanced; an accepted run
+                        // that left an EMPTY branch produced no deliverable and
+                        // must not be recorded a success. The scratch fallback
+                        // (no worktree) passes through unchanged.
+                        let (verdict, error) = settle_worktree_deliverable(
+                            verdict,
+                            error,
+                            worktree,
+                            &sandbox,
+                            working_dir,
+                            task_id,
+                            deadline,
                         )
                         .await;
                         Computed::from_verdict(verdict, error, &result)
@@ -787,6 +877,198 @@ async fn run_acceptance(
     }
 }
 
+/// Cap for an in-sandbox worktree git op (populate/commit). Bounded so a hung
+/// clean/smudge filter or `post-commit` hook can't retain pool permits; the
+/// effective deadline is `min(this, attempt deadline)` (git ops are fast, so
+/// this is a generous ceiling that only binds a pathological hang).
+const WORKTREE_GIT_OP_DEADLINE: Duration = Duration::from_secs(120);
+
+/// Build the sandboxed git-op command: wrap it in the worker's sandbox, put it in
+/// its own process group (so the timeout can group-kill a detached filter/hook
+/// child), and STRIP controller secrets from its environment.
+fn sandboxed_git_command(
+    sandbox: &Arc<dyn Sandbox>,
+    cwd: &Path,
+    shell_cmd: &str,
+) -> tokio::process::Command {
+    let mut command = sandbox.wrap_command(shell_cmd, cwd);
+    #[cfg(unix)]
+    {
+        // Own process group so the timeout can SIGTERM→SIGKILL the whole tree
+        // (a planted filter/hook may detach a child).
+        command.process_group(0);
+    }
+    // HIGH (controller-hijack, fix 1): strip provider/API keys + injection vars
+    // exactly as the shell tool does, so a worker-planted `.git` `filter.*`/hook
+    // that dumps `env` during the populate/commit never sees controller secrets
+    // (a Full-network worker would otherwise exfiltrate them).
+    octos_agent::sanitize_default_subprocess_env(&mut command);
+    command
+}
+
+/// Run a git shell command INSIDE the worker's sandbox, BOUNDED by
+/// `min(deadline, WORKTREE_GIT_OP_DEADLINE)` with a cancellation-safe
+/// process-group kill on timeout (codex fix #4; mirrors the command-validator
+/// timeout). The child is spawned in its own process group so a detached
+/// filter/hook child is reaped too.
+///
+/// `require_success` decides how a CLEAN (non-timeout) exit is judged:
+/// - `true` (the POPULATE, `git reset --hard`): a NON-ZERO exit is a FAILURE
+///   (`Err`) — an unpopulated tree means the agent would run in a partial/empty
+///   checkout, so the attempt must fail rather than proceed (fix 4).
+/// - `false` (the deliverable COMMIT): the exit code is NOT gated on — a clean
+///   tree is a deliberate no-op (exit 0) and a worker's own broken `filter.*`
+///   (contained) must not read as infra failure; the authoritative check is
+///   whether the branch advanced, read host-side.
+///
+/// `Err` also on a spawn failure or a DEADLINE (the child + its group are
+/// SIGTERM→SIGKILL'd).
+async fn run_sandboxed_git(
+    sandbox: &Arc<dyn Sandbox>,
+    cwd: &Path,
+    shell_cmd: &str,
+    deadline: Duration,
+    require_success: bool,
+) -> Result<(), String> {
+    let bounded = deadline
+        .min(WORKTREE_GIT_OP_DEADLINE)
+        .max(Duration::from_secs(1));
+    let mut command = sandboxed_git_command(sandbox, cwd, shell_cmd);
+    let mut child = command
+        .spawn()
+        .map_err(|e| format!("failed to spawn sandboxed git op: {e}"))?;
+    let pid = child.id();
+    match tokio::time::timeout(bounded, child.wait()).await {
+        Ok(Ok(status)) => {
+            if require_success && !status.success() {
+                Err(format!("sandboxed git op exited with {status}"))
+            } else {
+                Ok(())
+            }
+        }
+        Ok(Err(e)) => Err(format!("sandboxed git op wait failed: {e}")),
+        Err(_elapsed) => {
+            if let Some(pid) = pid {
+                octos_agent::kill_child_process(pid).await;
+            }
+            Err(format!(
+                "sandboxed git op timed out after {}s (killed)",
+                bounded.as_secs()
+            ))
+        }
+    }
+}
+
+/// codex fix #5 — POPULATE a `--no-checkout` worktree's working tree INSIDE the
+/// worker's sandbox (via `git reset --hard`), so a worker-planted local smudge
+/// filter runs at the WORKER's grant (contained), never host-side as the daemon
+/// during the controller's `git worktree add`. Returns `None` on success (or the
+/// scratch fallback, `worktree = None`); `Some(reason)` on failure/timeout, so
+/// the caller terminates the attempt rather than run the agent in an empty tree.
+async fn populate_worktree(
+    worktree: Option<&WorktreeContext>,
+    sandbox: &Arc<dyn Sandbox>,
+    checkout: &Path,
+    deadline: Duration,
+) -> Option<String> {
+    worktree?;
+    let cmd = octos_core::worktree_populate_command();
+    // require_success = true (fix 4): a non-zero `git reset --hard` left the tree
+    // unpopulated — FAIL the attempt rather than run the agent in an empty tree.
+    match run_sandboxed_git(sandbox, checkout, &cmd, deadline, true).await {
+        Ok(()) => None,
+        Err(err) => Some(format!("worktree populate failed: {err}")),
+    }
+}
+
+/// Land + verify a WORKTREE attempt's deliverable. For an `Accepted` verdict
+/// with a worktree context: run the auto-commit fallback (`git add -A &&
+/// git commit`) INSIDE the worker's sandbox — so a worker-planted local-config
+/// `filter.*`/commit hook triggered by it runs at the WORKER's network grant
+/// (contained), NOT host-side with the controller's network (§4b, mixed-grant
+/// escape dissolution) — then REQUIRE the branch to have advanced past its base:
+///
+/// - branch advanced → keep `Accepted` (the deliverable is durable on the
+///   branch, which survives the later checkout removal);
+/// - branch UNCHANGED (empty) → downgrade to `Rejected` — an accepted run that
+///   produced no commit is not a real deliverable and must not be recorded a
+///   success on an empty `fleet/*` branch;
+/// - branch-read ERROR (infra) → `Terminated`.
+///
+/// The commit command's own exit code is NOT gated on: a clean tree is a
+/// deliberate no-op (exit 0), and a worker's own broken filter (contained) must
+/// not be an infra error — the authoritative check is whether the branch
+/// advanced, read host-side (hooks-disabled). A non-`Accepted` verdict, or the
+/// scratch fallback (`worktree = None`), passes through unchanged.
+async fn settle_worktree_deliverable(
+    verdict: AcceptanceVerdict,
+    error: Option<String>,
+    worktree: Option<&WorktreeContext>,
+    sandbox: &Arc<dyn Sandbox>,
+    checkout: &Path,
+    task_id: &str,
+    deadline: Duration,
+) -> (AcceptanceVerdict, Option<String>) {
+    let Some(ctx) = worktree else {
+        return (verdict, error);
+    };
+    if !matches!(verdict, AcceptanceVerdict::Accepted { .. }) {
+        return (verdict, error);
+    }
+
+    // (b) Auto-commit any uncommitted deliverable INSIDE the worker's sandbox,
+    // BOUNDED by a deadline with a cancellation-safe process-group kill (codex
+    // fix #4): a worker-planted clean/process filter or `post-commit` hook fired
+    // here must not HANG forever (retaining pool permits + leaving the child
+    // Running). A clean tree is a no-op. A spawn failure or a DEADLINE is infra
+    // → Terminated; a non-zero EXIT is not gated on (the branch-advance check
+    // below is authoritative).
+    let message = format!("fleet {task_id} deliverable");
+    let commit_cmd = octos_core::deliverable_commit_command(&message);
+    // require_success = false: the commit's exit code is NOT authoritative (a
+    // clean tree no-ops at exit 0; a worker's own broken filter is contained, not
+    // infra). The branch-advance check below is the authority.
+    if let Err(err) = run_sandboxed_git(sandbox, checkout, &commit_cmd, deadline, false).await {
+        let reason = format!("worktree deliverable auto-commit failed: {err}");
+        tracing::error!(%reason, "fleet worker: deliverable auto-commit error");
+        return (
+            AcceptanceVerdict::Terminated {
+                reason: reason.clone(),
+            },
+            Some(reason),
+        );
+    }
+
+    // Authoritative: did the branch advance past its base? (Read host-side,
+    // hooks-disabled — a read-only `rev-parse`, no code-exec surface.)
+    match octos_core::branch_advanced_past(&ctx.repo_root, &ctx.branch, &ctx.base_commit) {
+        Ok(true) => (verdict, error),
+        Ok(false) => {
+            let reason = format!(
+                "accepted run left an EMPTY fleet branch — no commit / no changes to commit \
+                 for task {task_id}; refusing to record a phantom deliverable"
+            );
+            tracing::warn!(%reason, "fleet worker: empty worktree deliverable");
+            (
+                AcceptanceVerdict::Rejected {
+                    reason: reason.clone(),
+                },
+                Some(reason),
+            )
+        }
+        Err(err) => {
+            let reason = format!("worktree deliverable branch check failed: {err}");
+            tracing::error!(%reason, "fleet worker: deliverable branch check error");
+            (
+                AcceptanceVerdict::Terminated {
+                    reason: reason.clone(),
+                },
+                Some(reason),
+            )
+        }
+    }
+}
+
 /// Evaluate a `FileExists` criterion IN THE WORKER, resistant to symlink
 /// escape (P1-5a). Confines `path` lexically (via [`confined_relative`]), then
 /// resolves it under `workspace_root` following symlinks (`canonicalize`) and
@@ -897,6 +1179,104 @@ mod tests {
     }
 
     #[test]
+    fn sandboxed_git_env_is_sanitized_of_secrets() {
+        // HIGH (controller-hijack): a worker's sandboxed git op (populate/commit)
+        // can trigger a planted `.git` `filter.*`/hook that dumps `env`. That op
+        // must NOT inherit the CONTROLLER's provider/API keys — else a
+        // Full-network worker exfiltrates them. Re-exec THIS test binary with a
+        // provider key in its env (mirroring the daemon that holds one) and
+        // assert the child, running through `sandboxed_git_command`, can't see it.
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("worker::tests::child_sandboxed_git_env_has_no_secret")
+            .arg("--exact")
+            .arg("--ignored")
+            .env("OPENAI_API_KEY", "sk-fleet-controller-secret")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "child regression failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn child_sandboxed_git_env_has_no_secret() {
+        // Runs in a re-exec'd process that HAS `OPENAI_API_KEY` in its env. The
+        // sandboxed git command dumps `env` (a stand-in for a worker-planted
+        // `filter.*.clean` doing the same); the controller secret must be gone.
+        let sandbox: Arc<dyn Sandbox> = Arc::new(NoSandbox);
+        let cwd = std::env::temp_dir();
+        let mut cmd = sandboxed_git_command(&sandbox, &cwd, "env");
+        let out = cmd.output().await.expect("run env dump");
+        let text = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            !text.contains("sk-fleet-controller-secret"),
+            "sandboxed git op leaked the controller API key to a planted filter:\n{text}"
+        );
+        // Sanity: the dump ran and produced SOME environment, so the negative
+        // assertion above is not vacuously true because `env` failed to run.
+        assert!(!text.is_empty(), "env dump produced no output");
+    }
+
+    #[tokio::test]
+    async fn run_sandboxed_git_gates_exit_status_when_required() {
+        // fix 4: a non-zero exit FAILS only when `require_success` (the populate);
+        // the commit path (false) treats a clean non-zero exit as Ok (its exit
+        // code is not authoritative — the branch-advance check is).
+        let sandbox: Arc<dyn Sandbox> = Arc::new(NoSandbox);
+        let cwd = std::env::temp_dir();
+        let d = Duration::from_secs(30);
+
+        let gated = run_sandboxed_git(&sandbox, &cwd, "exit 7", d, true).await;
+        assert!(
+            gated.is_err(),
+            "a non-zero populate must be Err, got {gated:?}"
+        );
+
+        let ungated = run_sandboxed_git(&sandbox, &cwd, "exit 7", d, false).await;
+        assert!(
+            ungated.is_ok(),
+            "the commit path must NOT gate on exit code, got {ungated:?}"
+        );
+
+        // A clean success is Ok under either flag.
+        assert!(
+            run_sandboxed_git(&sandbox, &cwd, "true", d, true)
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_populate_fails_the_attempt() {
+        // fix 4 (regression): populating a `--no-checkout` worktree runs
+        // `git reset --hard`. In a NON-repo dir that exits non-zero; the populate
+        // must report failure (Some) so `run_attempt` TERMINATES rather than run
+        // the agent in an empty/partial tree.
+        let sandbox: Arc<dyn Sandbox> = Arc::new(NoSandbox);
+        let dir = TempDir::new().unwrap(); // deliberately NOT a git repo
+        let ctx = WorktreeContext {
+            repo_root: dir.path().to_path_buf(),
+            branch: "fleet/f/t".to_string(),
+            base_commit: "0".repeat(40),
+            git_dir: dir.path().join(".git"),
+        };
+        let reason =
+            populate_worktree(Some(&ctx), &sandbox, dir.path(), Duration::from_secs(30)).await;
+        assert!(
+            reason.is_some(),
+            "a failed populate must fail the attempt (Some(reason)), got None"
+        );
+        assert!(
+            reason.as_deref().unwrap().contains("populate failed"),
+            "unexpected reason: {reason:?}"
+        );
+    }
+
+    #[test]
     fn file_exists_confined_rejects_symlink_escape() {
         // P1-5a: a real in-workspace file passes; an absent file is
         // fail-closed "not found"; an in-workspace symlink pointing OUTSIDE
@@ -949,16 +1329,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn grant_network_threads_allow_network_into_sandbox() {
-        // PR A: `run_attempt` derives the sandbox's `allow_network` from the
-        // task's grant — a `Full` grant threads `true`, a minimal grant `false`.
-        // A recording sandbox factory captures the flag it is handed.
+    async fn grant_threads_network_and_repo_git_dir_into_sandbox() {
+        // `run_attempt` derives the sandbox scope PER ATTEMPT: `allow_network`
+        // from the task's network lane (PR A), and `repo_git_dir` from whether
+        // this is an actual WORKTREE attempt (`worktree.is_some()`, codex fix
+        // #2a) — NOT from `fs.is_host()` alone, so a scratch worker is never
+        // handed the extra `.git` write. A recording factory captures the
+        // `SandboxGrant`.
         use std::sync::Mutex;
-        let seen: Arc<Mutex<Vec<bool>>> = Arc::new(Mutex::new(Vec::new()));
+        let seen: Arc<Mutex<Vec<SandboxGrant>>> = Arc::new(Mutex::new(Vec::new()));
 
-        async fn run_with_grant(
-            seen: Arc<std::sync::Mutex<Vec<bool>>>,
+        async fn run_with(
+            seen: Arc<std::sync::Mutex<Vec<SandboxGrant>>>,
             grant: octos_fleet::WorkerGrant,
+            worktree: Option<WorktreeContext>,
         ) {
             let (_sd, store) = fresh_store().await;
             let fleet = create_fleet(
@@ -974,13 +1358,16 @@ mod tests {
             let factory = AgentFactory::new(
                 Arc::new(SuccessProvider),
                 memory,
-                Arc::new(move |_cwd, allow_network| {
-                    rec.lock().unwrap().push(allow_network);
+                Arc::new(move |_cwd, grant: SandboxGrant| {
+                    rec.lock().unwrap().push(grant);
                     Arc::new(MarkerSandbox) as Arc<dyn Sandbox>
                 }),
             );
             let task_view = view_of(&fleet, "a").await;
             let work = TempDir::new().unwrap();
+            // The factory records the grant BEFORE any populate/agent step, so a
+            // dummy worktree ctx (populate will no-op/fail on this non-repo tmp
+            // dir) still captures the intended `repo_git_dir`.
             let _ = run_attempt(
                 store.clone(),
                 "f1",
@@ -989,6 +1376,7 @@ mod tests {
                 &task_view,
                 &factory,
                 work.path(),
+                worktree.as_ref(),
                 Duration::from_secs(30),
                 EPOCH,
                 slot(),
@@ -999,26 +1387,58 @@ mod tests {
             .await;
         }
 
-        // Minimal grant → no raw egress.
-        run_with_grant(seen.clone(), octos_fleet::WorkerGrant::minimal()).await;
-        // Full grant → raw egress.
-        run_with_grant(
+        let dummy_worktree = || WorktreeContext {
+            repo_root: std::path::PathBuf::from("/nonexistent-repo"),
+            branch: "fleet/f1/a".to_string(),
+            base_commit: "0000000".to_string(),
+            git_dir: std::path::PathBuf::from("/nonexistent-repo/.git"),
+        };
+
+        // Minimal grant, scratch (no worktree) → no raw egress, cwd-only.
+        run_with(seen.clone(), octos_fleet::WorkerGrant::minimal(), None).await;
+        // Full network grant, scratch → raw egress, but STILL cwd-only (no worktree).
+        run_with(
             seen.clone(),
             octos_fleet::WorkerGrant {
                 network: octos_fleet::NetworkGrant::Full,
                 ..octos_fleet::WorkerGrant::minimal()
             },
+            None,
+        )
+        .await;
+        // A worktree attempt → repo_git_dir set to the checkout's `<repo>/.git`.
+        run_with(
+            seen.clone(),
+            octos_fleet::WorkerGrant {
+                network: octos_fleet::NetworkGrant::Full,
+                fs: octos_fleet::FsGrant::Host,
+                ..octos_fleet::WorkerGrant::minimal()
+            },
+            Some(dummy_worktree()),
         )
         .await;
 
-        let flags = seen.lock().unwrap().clone();
+        let grants = seen.lock().unwrap().clone();
         assert!(
-            flags.contains(&false),
-            "a minimal grant must build the sandbox with allow_network=false: {flags:?}",
+            grants.contains(&SandboxGrant {
+                allow_network: false,
+                repo_git_dir: None,
+            }),
+            "a minimal scratch worker gets the base sandbox (no network, cwd-only): {grants:?}",
         );
         assert!(
-            flags.contains(&true),
-            "a Full grant must build the sandbox with allow_network=true: {flags:?}",
+            grants.contains(&SandboxGrant {
+                allow_network: true,
+                repo_git_dir: None,
+            }),
+            "a Full-network SCRATCH worker gets network but NOT the .git write: {grants:?}",
+        );
+        assert!(
+            grants.contains(&SandboxGrant {
+                allow_network: true,
+                repo_git_dir: Some(std::path::PathBuf::from("/nonexistent-repo/.git")),
+            }),
+            "a WORKTREE attempt gets repo_git_dir = <repo>/.git: {grants:?}",
         );
     }
 
@@ -1045,6 +1465,7 @@ mod tests {
             &task_view,
             &factory,
             work.path(),
+            None,
             Duration::from_secs(30),
             EPOCH,
             slot(),
@@ -1127,6 +1548,7 @@ mod tests {
             &task_view,
             &factory,
             work.path(),
+            None,
             Duration::from_secs(30),
             EPOCH,
             slot(),
@@ -1189,6 +1611,7 @@ mod tests {
             &task_view,
             &factory,
             work.path(),
+            None,
             Duration::from_secs(30),
             EPOCH,
             slot(),
@@ -1246,6 +1669,7 @@ mod tests {
             &task_view,
             &factory,
             work.path(),
+            None,
             Duration::from_secs(2),
             EPOCH,
             slot(),
@@ -1319,6 +1743,7 @@ mod tests {
             &task_view,
             &factory,
             work.path(),
+            None,
             Duration::from_secs(2),
             EPOCH,
             slot(),
@@ -1372,6 +1797,7 @@ mod tests {
             &task_view,
             &factory,
             work.path(),
+            None,
             Duration::from_secs(30),
             EPOCH,
             slot(),
@@ -1424,6 +1850,7 @@ mod tests {
             &task_view,
             &factory,
             work.path(),
+            None,
             Duration::from_secs(30),
             EPOCH,
             slot(),
@@ -1472,6 +1899,7 @@ mod tests {
             &task_view,
             &factory,
             work.path(),
+            None,
             Duration::from_secs(30),
             EPOCH,
             slot(),
@@ -1516,6 +1944,7 @@ mod tests {
             &task_view,
             &factory,
             work.path(),
+            None,
             Duration::from_millis(200),
             EPOCH,
             slot(),
@@ -1566,6 +1995,7 @@ mod tests {
             &task_view,
             &factory,
             work.path(),
+            None,
             Duration::from_secs(30),
             EPOCH,
             slot(),
@@ -1619,6 +2049,7 @@ mod tests {
             &task_view,
             &factory,
             work.path(),
+            None,
             Duration::from_secs(30),
             EPOCH,
             slot(),
@@ -1674,6 +2105,7 @@ mod tests {
             &task_view,
             &factory,
             work.path(),
+            None,
             Duration::from_secs(30),
             EPOCH,
             slot(),
@@ -1780,6 +2212,7 @@ mod tests {
             &task_view,
             &factory,
             work.path(),
+            None,
             Duration::from_secs(30),
             EPOCH,
             slot(),
@@ -1832,6 +2265,7 @@ mod tests {
             &task_view,
             &factory,
             work.path(),
+            None,
             Duration::from_secs(2),
             EPOCH,
             slot(),
@@ -1902,6 +2336,7 @@ mod tests {
             &task_view,
             &factory,
             work.path(),
+            None,
             Duration::from_secs(30),
             EPOCH,
             slot(),
@@ -1955,6 +2390,7 @@ mod tests {
             &view1,
             &esc_factory,
             work.path(),
+            None,
             Duration::from_secs(30),
             EPOCH,
             slot(),
@@ -2018,6 +2454,7 @@ mod tests {
             &view2,
             &write_factory,
             work2.path(),
+            None,
             Duration::from_secs(30),
             EPOCH,
             slot(),
