@@ -2184,3 +2184,34 @@ async fn map_tool_dispatcher_excludes_provider_policy_denied_tools() {
     // A non-denied built-in is still present.
     assert!(dispatcher.tools.contains_key("read_file"));
 }
+
+#[cfg(unix)]
+#[test]
+fn kill_child_process_uses_absolute_paths() {
+    // HIGH (controller-hijack): `kill_child_process` runs on a git-op TIMEOUT as
+    // the CONTROLLER (unsandboxed). If it invoked `kill`/`ps` by BARE name a
+    // full-FS worker could plant a fake `kill`/`ps` earlier in `$PATH` (a
+    // daemon-writable dir) and get the controller to run it. Both must resolve to
+    // an ABSOLUTE path so `$PATH` is never consulted.
+    assert!(
+        KILL_BIN.is_absolute(),
+        "the timeout-kill must invoke `kill` by ABSOLUTE path (no $PATH lookup), got {:?}",
+        &*KILL_BIN
+    );
+    assert!(
+        PS_BIN.is_absolute(),
+        "process enumeration must invoke `ps` by ABSOLUTE path (no $PATH lookup), got {:?}",
+        &*PS_BIN
+    );
+
+    // The resolver never falls back to a bare (PATH-looked-up) name: even when no
+    // candidate exists, the fallback is itself absolute.
+    let missed = resolve_system_binary(&["/no/such/dir/kill"], "/bin/kill");
+    assert_eq!(missed, PathBuf::from("/bin/kill"));
+    assert!(missed.is_absolute());
+
+    // A candidate that DOES exist is preferred over the fallback (and is absolute).
+    let hit = resolve_system_binary(&["/nope/ps", "/bin/sh"], "/unused/fallback");
+    assert_eq!(hit, PathBuf::from("/bin/sh"));
+    assert!(hit.is_absolute());
+}
