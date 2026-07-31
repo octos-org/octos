@@ -1387,14 +1387,9 @@ pub async fn session_files(
         return response;
     }
 
-    let data_dir = if let Some(sessions) = &state.sessions {
-        let sess = sessions.lock().await;
-        sess.data_dir()
-    } else {
-        match resolve_profile_data_dir(&state, &headers, identity_ref).await {
-            Ok(data_dir) => data_dir,
-            Err(response) => return response,
-        }
+    let data_dir = match resolve_file_access_data_dir(&state, &headers, identity_ref).await {
+        Ok(data_dir) => data_dir,
+        Err(response) => return response,
     };
 
     let mut files = Vec::new();
@@ -1432,21 +1427,16 @@ pub async fn session_workspace_contract(
     // `sess.data_dir()` BEFORE checking the host-routed profile, so a
     // cross-tenant header on a TRUSTED hop exposed the victim
     // profile's workspace-contract statuses. The Layer-2 gate runs
-    // up-front; `state.sessions.data_dir()` only resolves when the
-    // routed profile is authorized (admin / owner / self).
+    // up-front, and data-directory selection below must remain identical
+    // to the companion `session_files` surface.
     if let Err(response) = authorized_routed_profile_id_from_headers(&state, &headers, identity_ref)
     {
         return response;
     }
 
-    let data_dir = if let Some(sessions) = &state.sessions {
-        let sess = sessions.lock().await;
-        sess.data_dir()
-    } else {
-        match resolve_profile_data_dir(&state, &headers, identity_ref).await {
-            Ok(data_dir) => data_dir,
-            Err(response) => return response,
-        }
+    let data_dir = match resolve_file_access_data_dir(&state, &headers, identity_ref).await {
+        Ok(data_dir) => data_dir,
+        Err(response) => return response,
     };
 
     let mut statuses = Vec::new();
@@ -1470,6 +1460,19 @@ async fn resolve_file_access_data_dir(
     headers: &HeaderMap,
     identity: Option<&AuthIdentity>,
 ) -> Result<std::path::PathBuf, Response> {
+    // A localhost client remains profile-scoped even when this process is not
+    // the multi-profile gateway. In that topology there is no profile API port,
+    // so `resolve_profile_data_dir` returns 503. Falling back to the process-wide
+    // SessionManager root would make session metadata visible while file APIs
+    // silently scan a different directory.
+    if let Some(AuthIdentity::User { id, .. }) = identity
+        && state.profile_store.is_some()
+    {
+        let profile_id = authorized_routed_profile_id_from_headers(state, headers, identity)?
+            .unwrap_or_else(|| id.clone());
+        return resolve_profile_data_dir_by_id(state, &profile_id);
+    }
+
     if should_resolve_file_access_from_profile(headers, identity) {
         match resolve_profile_data_dir(state, headers, identity).await {
             Ok(data_dir) => return Ok(data_dir),
@@ -4946,6 +4949,117 @@ mod tests {
         let resolved = resolve_file_access_data_dir(&state, &headers, None)
             .await
             .expect("fallback data dir");
+
+        assert_eq!(resolved, data_dir.path());
+    }
+
+    #[tokio::test]
+    async fn profile_workspace_surfaces_ignore_global_session_store() {
+        use crate::profiles::{ProfileStore, UserProfile};
+        use crate::user_store::UserRole;
+
+        let home = tempfile::tempdir().unwrap();
+        let profile_data_dir = home.path().join("profile-data");
+        let store = ProfileStore::open_unified(home.path()).unwrap();
+        store
+            .save(&UserProfile {
+                id: "learner".into(),
+                name: "Learner".into(),
+                enabled: true,
+                data_dir: Some(profile_data_dir.to_string_lossy().into_owned()),
+                parent_id: None,
+                public_subdomain: None,
+                config: Default::default(),
+                created_at: chrono::Utc::now(),
+                updated_at: chrono::Utc::now(),
+            })
+            .unwrap();
+
+        let artifact = profile_data_dir
+            .join("users/web-profile-scope/workspace/skill-output")
+            .join("artifact.json");
+        std::fs::create_dir_all(artifact.parent().unwrap()).unwrap();
+        std::fs::write(&artifact, br#"{"status":"ready"}"#).unwrap();
+
+        let global_data_dir = tempfile::tempdir().unwrap();
+        let state = Arc::new(AppState {
+            profile_store: Some(Arc::new(store)),
+            sessions: Some(Arc::new(tokio::sync::Mutex::new(
+                octos_bus::SessionManager::open(global_data_dir.path()).unwrap(),
+            ))),
+            ..AppState::empty_for_tests()
+        });
+
+        let response = session_files(
+            State(state.clone()),
+            HeaderMap::new(),
+            Some(Extension(AuthIdentity::User {
+                id: "learner".into(),
+                role: UserRole::User,
+            })),
+            axum::extract::Path("web-profile-scope".into()),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let files: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+        assert_eq!(files.len(), 1, "profile artifact must be listed: {files:?}");
+        assert_eq!(files[0]["filename"], "artifact.json");
+
+        let profile_repo =
+            profile_data_dir.join("users/web-profile-scope/workspace/slides/profile-deck");
+        std::fs::create_dir_all(&profile_repo).unwrap();
+        let global_repo = global_data_dir
+            .path()
+            .join("users/web-profile-scope/workspace/slides/global-deck");
+        std::fs::create_dir_all(&global_repo).unwrap();
+
+        let response = session_workspace_contract(
+            State(state),
+            HeaderMap::new(),
+            Some(Extension(AuthIdentity::User {
+                id: "learner".into(),
+                role: UserRole::User,
+            })),
+            axum::extract::Path("web-profile-scope".into()),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let contracts: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            contracts.len(),
+            1,
+            "only the profile workspace contract must be listed: {contracts:?}"
+        );
+        assert_eq!(contracts[0]["repo_label"], "slides/profile-deck");
+    }
+
+    #[tokio::test]
+    async fn should_fall_back_to_session_store_when_authenticated_user_has_no_profile_store() {
+        use crate::user_store::UserRole;
+
+        let data_dir = tempfile::tempdir().unwrap();
+        let state = AppState {
+            sessions: Some(Arc::new(tokio::sync::Mutex::new(
+                octos_bus::SessionManager::open(data_dir.path()).unwrap(),
+            ))),
+            ..AppState::empty_for_tests()
+        };
+        let identity = AuthIdentity::User {
+            id: "standalone-user".into(),
+            role: UserRole::User,
+        };
+
+        let resolved = resolve_file_access_data_dir(&state, &HeaderMap::new(), Some(&identity))
+            .await
+            .expect("session store fallback");
 
         assert_eq!(resolved, data_dir.path());
     }
