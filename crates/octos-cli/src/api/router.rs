@@ -217,6 +217,11 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/my/voice", put(auth_handlers::set_my_voice))
         // Per-tenant voice-assistant pre-flight: ASR + LLM + (route-aware) TTS.
         .route("/api/voice/readiness", get(auth_handlers::voice_readiness))
+        // Generic profile-scoped text-to-speech synthesis.
+        .route(
+            "/api/voice/synthesize",
+            post(auth_handlers::synthesize_speech),
+        )
         // Memory + Cron panel REST routes retired in favor of the UI Protocol
         // methods (`memory/overview`, `memory/entity`, `cron/list`,
         // `cron/toggle`, gated by `auxiliary.rest_to_ws.v1`), which wrap the

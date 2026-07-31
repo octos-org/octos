@@ -5,8 +5,10 @@ use std::sync::Arc;
 use std::sync::{LazyLock, Mutex};
 
 use axum::Json;
+use axum::body::Body;
 use axum::extract::{Path, Query, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
+use axum::response::Response;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
@@ -1512,6 +1514,99 @@ pub struct VoiceReadiness {
     pub asr: VoiceLeg,
     pub llm: VoiceLeg,
     pub tts: VoiceTtsLeg,
+}
+
+const MAX_SPEECH_SYNTHESIS_CHARS: usize = 4_000;
+
+#[derive(Deserialize)]
+pub(crate) struct SpeechSynthesisRequest {
+    pub text: String,
+}
+
+fn validate_synthesis_text(text: &str) -> Result<&str, (StatusCode, String)> {
+    let text = text.trim();
+    if text.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "text must not be empty".into()));
+    }
+    if text.chars().count() > MAX_SPEECH_SYNTHESIS_CHARS {
+        return Err((
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!("text exceeds {MAX_SPEECH_SYNTHESIS_CHARS} characters"),
+        ));
+    }
+    Ok(text)
+}
+
+fn speech_audio_content_type(path: &std::path::Path) -> &'static str {
+    match path.extension().and_then(|extension| extension.to_str()) {
+        Some("mp3") => "audio/mpeg",
+        Some("ogg") | Some("opus") => "audio/ogg",
+        Some("pcm") => "audio/pcm",
+        _ => "audio/wav",
+    }
+}
+
+/// POST /api/voice/synthesize — synthesize text with the caller's voice profile.
+///
+/// The caller's effective profile runtime supplies the provider, credentials,
+/// and selected voice. The endpoint is intentionally independent of any
+/// product-specific playback or content model.
+pub(crate) async fn synthesize_speech(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    axum::Extension(identity): axum::Extension<AuthIdentity>,
+    Json(request): Json<SpeechSynthesisRequest>,
+) -> Result<Response, (StatusCode, String)> {
+    let text = validate_synthesis_text(&request.text)?;
+    let profile_store = state.profile_store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "profile store unavailable".into(),
+    ))?;
+    let profile_id = resolve_my_profile_id(&identity, profile_store, &state, &headers)
+        .map_err(|status| (status, "profile unavailable".into()))?;
+    let runtime =
+        crate::api::ui_protocol::resolve_session_profile_runtime(&state, Some(&profile_id)).ok_or(
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "profile runtime unavailable".into(),
+            ),
+        )?;
+    let voice = crate::api::voices::resolve_reply_voice(&profile_id, &runtime.voice.default_voice);
+    let output_dir = tempfile::tempdir().map_err(|error| {
+        tracing::error!(%error, "failed to create speech synthesis temp directory");
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "failed to prepare speech synthesis".into(),
+        )
+    })?;
+    let audio_path = crate::api::voice_turn::synthesize_reply(
+        text,
+        &voice,
+        &runtime.voice.tts_provider,
+        runtime.voice.cloud.as_ref(),
+        output_dir.path(),
+    )
+    .await
+    .ok_or((
+        StatusCode::BAD_GATEWAY,
+        "configured TTS provider failed to synthesize speech".into(),
+    ))?;
+    let content_type = speech_audio_content_type(&audio_path);
+    let audio = tokio::fs::read(&audio_path).await.map_err(|error| {
+        tracing::error!(%error, path = %audio_path.display(), "failed to read synthesized speech");
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "failed to read synthesized speech".into(),
+        )
+    })?;
+    let mut response = Response::new(Body::from(audio));
+    response
+        .headers_mut()
+        .insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    Ok(response)
 }
 
 /// GET /api/voice/readiness — per-tenant pre-flight for the voice assistant.
@@ -3821,6 +3916,35 @@ fn build_portal_state(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn speech_synthesis_rejects_blank_and_oversized_text() {
+        assert_eq!(
+            validate_synthesis_text("  ").unwrap_err().0,
+            StatusCode::BAD_REQUEST
+        );
+        let oversized = "旁".repeat(MAX_SPEECH_SYNTHESIS_CHARS + 1);
+        assert_eq!(
+            validate_synthesis_text(&oversized).unwrap_err().0,
+            StatusCode::PAYLOAD_TOO_LARGE
+        );
+    }
+
+    #[test]
+    fn speech_synthesis_trims_valid_text_and_maps_audio_mime() {
+        assert_eq!(
+            validate_synthesis_text("  先看这个圆。 \n").unwrap(),
+            "先看这个圆。"
+        );
+        assert_eq!(
+            speech_audio_content_type(std::path::Path::new("speech.mp3")),
+            "audio/mpeg"
+        );
+        assert_eq!(
+            speech_audio_content_type(std::path::Path::new("speech.wav")),
+            "audio/wav"
+        );
+    }
     use crate::login_allowlist::{AllowedLogin, LoginAllowlistStore};
     use crate::otp::AuthManager;
     use crate::profiles::ProfileStore;
