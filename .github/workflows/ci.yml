@@ -196,6 +196,19 @@ jobs:
             throw 'uninstall dry run did not include purge behavior'
           }
 
+  web-app-base-url-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+
+      - name: Test embedded web base URL
+        shell: bash
+        run: '"$BASH" scripts/tests/test-build-web-app-base-url.sh'
+
   check:
     runs-on: ubuntu-latest
     env:
