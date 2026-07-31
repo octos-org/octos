@@ -640,6 +640,70 @@ impl FleetKernelStore {
         .wrap_err("join resolve_and_collect_ready")?
     }
 
+    /// Every **live** fleet (`Active`/`Draining`) that currently has at least
+    /// one launchable child. This is the boot-resume driver: a fleet
+    /// interrupted by a restart has its in-flight children reset to `Ready` by
+    /// [`Self::reconcile`], but reconcile emits NO outbox event, so the outbox
+    /// consumer never wakes the keeper and nothing re-dispatches. This query
+    /// finds exactly the fleets whose keeper must be re-woken at boot.
+    ///
+    /// Two-phase to respect the non-reentrant `io_gate`: phase 1 takes the gate
+    /// ONCE to snapshot the live fleet records from the `FLEETS` table
+    /// (mirroring [`Self::list_children`]'s iterator) and then RELEASES it;
+    /// phase 2 calls [`Self::resolve_and_collect_ready`] per candidate — each
+    /// re-acquires the gate for its own one-write-txn, so it MUST run outside
+    /// phase 1's guard. Reusing `resolve_and_collect_ready` rather than a naive
+    /// `status == Ready` scan is deliberate: it heals a missed `Planned → Ready`
+    /// promotion in-txn (a dep that `Succeeded` pre-crash whose dependent never
+    /// promoted), so a fleet stranded in exactly that state is still detected.
+    /// A candidate whose ready set comes back empty (all children terminal or
+    /// in-flight) is dropped; terminal fleets (`Complete`/`Failed`/`Cancelled`)
+    /// are excluded up front by the status filter.
+    pub async fn fleets_with_ready_children(&self, now_ms: u64) -> Result<Vec<FleetRecord>> {
+        // Phase 1 (one io_gate acquisition): snapshot the live fleet records.
+        let candidates: Vec<FleetRecord> = {
+            let db = self.db.clone();
+            let held = self.io_gate.clone().lock_owned().await;
+            tokio::task::spawn_blocking(move || -> Result<Vec<FleetRecord>> {
+                let _held = held;
+                let rtx = db.begin_read()?;
+                let table = rtx.open_table(FLEETS)?;
+                let mut out = Vec::new();
+                for item in table.iter()? {
+                    let (k, v) = item?;
+                    if let Some(rec) = decode_row::<FleetRecord>(v.value())? {
+                        // Identity check (defense in depth, mirrors get_fleet):
+                        // the row must own the key it lives under. Filter to the
+                        // two live states — terminal fleets never re-dispatch.
+                        if rec.fleet_id == k.value()
+                            && matches!(rec.status, FleetStatus::Active | FleetStatus::Draining)
+                        {
+                            out.push(rec);
+                        }
+                    }
+                }
+                Ok(out)
+            })
+            .await
+            .wrap_err("join fleets_with_ready_children")??
+        };
+
+        // Phase 2 (gate released): resolve+collect each candidate's ready set.
+        // Each call re-acquires the io_gate for its own write-txn, so it runs
+        // OUTSIDE phase 1's guard (the Mutex is non-reentrant). Non-empty ⇒ the
+        // fleet has launchable work and its keeper needs a wake.
+        let mut out = Vec::new();
+        for rec in candidates {
+            let ready = self
+                .resolve_and_collect_ready(&rec.fleet_id, now_ms)
+                .await?;
+            if !ready.is_empty() {
+                out.push(rec);
+            }
+        }
+        Ok(out)
+    }
+
     // ---- CAS state transitions -------------------------------------------
 
     /// Launch a `Ready` child: one write-txn that checks the predicate
@@ -3985,6 +4049,141 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(out, LaunchOutcome::RejectedBudgetExceeded);
+    }
+
+    #[tokio::test]
+    async fn fleets_with_ready_children_finds_active_fleets_with_ready_tasks() {
+        let (_d, store) = fresh().await;
+
+        // Helper: plant a fleet then force its status (the public API mints
+        // only `Active`; terminal transitions arrive in later PRs, so a test
+        // reaches for the raw writer to exercise the boot-resume status filter).
+        async fn force_status(store: &FleetKernelStore, fleet_id: &str, status: FleetStatus) {
+            let mut f = store.get_fleet(fleet_id).await.unwrap().unwrap();
+            f.status = status;
+            store
+                .write_raw_fleet(fleet_id, &serde_json::to_string(&f).unwrap())
+                .await
+                .unwrap();
+        }
+        // Helper: force a child terminal (Succeeded) without the full lifecycle.
+        async fn force_succeeded(store: &FleetKernelStore, fleet_id: &str, child_id: &str) {
+            let mut c = store.get_child(fleet_id, child_id).await.unwrap().unwrap();
+            c.status = ChildStatus::Succeeded;
+            c.current_attempt_id = None;
+            store.write_raw_child(&c).await.unwrap();
+        }
+
+        // f-ready: an Active fleet with a dep-free (immediately Ready) child.
+        store
+            .create_fleet("f-ready", controller(), None, "default", 1_000, false, 0)
+            .await
+            .unwrap();
+        store.add_child("f-ready", "c1", vec![], 0).await.unwrap();
+
+        // f-draining: a live (Draining) fleet with a Ready child — also woken.
+        store
+            .create_fleet("f-draining", controller(), None, "default", 1_000, false, 0)
+            .await
+            .unwrap();
+        store
+            .add_child("f-draining", "c1", vec![], 0)
+            .await
+            .unwrap();
+        force_status(&store, "f-draining", FleetStatus::Draining).await;
+
+        // f-complete: a terminal fleet, even WITH a Ready child, is excluded by
+        // the status filter (the fleet is done; it must not re-dispatch).
+        store
+            .create_fleet("f-complete", controller(), None, "default", 1_000, false, 0)
+            .await
+            .unwrap();
+        store
+            .add_child("f-complete", "c1", vec![], 0)
+            .await
+            .unwrap();
+        force_status(&store, "f-complete", FleetStatus::Complete).await;
+
+        // f-cancelled: likewise excluded by the status filter.
+        store
+            .create_fleet(
+                "f-cancelled",
+                controller(),
+                None,
+                "default",
+                1_000,
+                false,
+                0,
+            )
+            .await
+            .unwrap();
+        store
+            .add_child("f-cancelled", "c1", vec![], 0)
+            .await
+            .unwrap();
+        force_status(&store, "f-cancelled", FleetStatus::Cancelled).await;
+
+        // f-done: Active but every child terminal → empty ready set → excluded.
+        store
+            .create_fleet("f-done", controller(), None, "default", 1_000, false, 0)
+            .await
+            .unwrap();
+        store.add_child("f-done", "c1", vec![], 0).await.unwrap();
+        force_succeeded(&store, "f-done", "c1").await;
+
+        // f-heal: the healed-promotion edge — c1 Succeeded (pre-crash) but its
+        // dependent c2 never promoted (still Planned). `resolve_and_collect_ready`
+        // promotes c2 in-txn, so the fleet IS detected as needing a wake.
+        store
+            .create_fleet("f-heal", controller(), None, "default", 1_000, false, 0)
+            .await
+            .unwrap();
+        store.add_child("f-heal", "c1", vec![], 0).await.unwrap();
+        store
+            .add_child("f-heal", "c2", vec!["c1".into()], 0)
+            .await
+            .unwrap();
+        force_succeeded(&store, "f-heal", "c1").await;
+        assert_eq!(
+            store
+                .get_child("f-heal", "c2")
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            ChildStatus::Planned,
+            "precondition: the dependent is still Planned (a missed promotion)"
+        );
+
+        let mut ids: Vec<String> = store
+            .fleets_with_ready_children(9_999)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|r| r.fleet_id)
+            .collect();
+        ids.sort();
+        assert_eq!(
+            ids,
+            vec![
+                "f-draining".to_string(),
+                "f-heal".to_string(),
+                "f-ready".to_string()
+            ],
+            "only live (Active|Draining) fleets with a ready/heal-promotable child are returned"
+        );
+
+        // The heal was applied in-txn: the missed dependent is now Ready.
+        assert_eq!(
+            store
+                .get_child("f-heal", "c2")
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            ChildStatus::Ready,
+            "resolve_and_collect_ready promoted the missed dependent in-txn"
+        );
     }
 
     // ---- test-only raw writer ---------------------------------------------
