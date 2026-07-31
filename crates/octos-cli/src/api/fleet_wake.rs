@@ -45,7 +45,7 @@ use tokio::time::MissedTickBehavior;
 use super::agent_orchestrator::{
     FLEET_KEEPER_EXTERNAL_KIND, FLEET_KEEPER_GROUP, FLEET_KEEPER_META_FLEET_ID,
     FLEET_KEEPER_META_OBJECTIVE, FLEET_KEEPER_META_READY, FLEET_KEEPER_META_TASK_LINES,
-    FLEET_KEEPER_META_WORKSPACE_ROOT, default_agent_orchestrator,
+    FLEET_KEEPER_META_WORKSPACE_ROOT, InProcessAgentOrchestrator, default_agent_orchestrator,
 };
 use super::master_continuation_scheduler::{MasterContinuationReason, MasterContinuationRequest};
 
@@ -288,6 +288,137 @@ pub(crate) fn spawn_fleet_outbox_consumer(store: FleetKernelStore) {
             }
         }
     });
+}
+
+/// The stable, boot-namespaced dedupe key for a fleet's boot-resume keeper wake.
+///
+/// Deliberately NOT the outbox consumer's sequence-based
+/// [`fleet_keeper_dedupe_key`]: the literal `boot-resume` terminal can never
+/// numerically collide a real outbox `sequence` (the consumer's key ends in a
+/// `u64`), and the key is stable per fleet across boots — so a boot wake that
+/// was persisted on a prior boot but not yet drained collapses with the fresh
+/// one instead of double-queuing.
+///
+/// The `fleet_id` is IN the key (not just the controller): controller↔fleet is
+/// NOT 1:1 — `goal_clear` removes a goal WITHOUT terminalizing its fleet, so a
+/// cleared-then-replanned controller can transiently own two `Active` fleets
+/// with `Ready` children. A controller-only key would make their two boot
+/// wakes collide and silently discard one; keying on `fleet_id` keeps distinct
+/// fleets distinct (belt-and-suspenders alongside the orphan guard in
+/// [`enqueue_fleet_boot_resume_wakes`], which normally wakes only the bound
+/// fleet).
+fn fleet_boot_resume_dedupe_key(controller: &SessionKey, fleet_id: &str) -> String {
+    format!("external/{FLEET_KEEPER_EXTERNAL_KIND}/{controller}/boot-resume/{fleet_id}")
+}
+
+/// Boot-resume — "a fleet survives an octos restart". After the boot reconcile
+/// flips a restart-interrupted fleet's in-flight children back to `Ready`,
+/// NOTHING re-dispatches them: reconcile emits no outbox event, so the outbox
+/// consumer (the only other keeper-wake driver) never fires and the fleet stalls
+/// forever. This closes that gap — for every live fleet with a launchable child
+/// ([`FleetKernelStore::fleets_with_ready_children`]) it enqueues ONE keeper
+/// wake, reusing the SAME continuation + PR-4b workspace seed the outbox
+/// consumer builds, under a stable boot-namespaced dedupe key. The global
+/// master-continuation drain (already running, ~5s poll) picks the wakes up on
+/// its next tick → PR-4b reseed pre-pass → `run_standalone_turn` → the keeper's
+/// `goal_dispatch` re-launches the ready set.
+///
+/// - **Orphan guard** — only a fleet STILL bound to its controller's current
+///   goal is woken. `goal_clear` removes a goal without terminalizing its
+///   fleet, and a re-plan rebinds the controller to a new fleet; in both cases
+///   the keeper's `goal_dispatch` resolves ONLY the current goal's fleet, so a
+///   superseded fleet has no keeper to drive it — waking it is useless and
+///   would surface stale metadata. Such fleets are skipped + logged.
+/// - **Double-wake** (a fleet the outbox consumer also wakes) is harmless: the
+///   `launch_child` CAS + `resolve_and_collect_ready` + the per-session
+///   active-turn guard admit at most one no-op keeper turn, never a
+///   double-dispatch.
+/// - **Not solo-gated** (matches the outbox consumer, which wakes on
+///   `ChildDone` regardless of `--solo`): this recovers already-committed
+///   in-flight work, not a fresh autonomous goal.
+/// - **Rootless fleet** (`controller_workspace_root == None`): the wake carries
+///   no workspace root, so the seed pre-pass drops it
+///   ([`InProcessAgentOrchestrator::pending_fleet_keeper_seeds`]) — the same
+///   not-headlessly-rehydratable limitation as the consumer path, not a
+///   regression.
+///
+/// Returns the number of fleets for which a wake was DURABLY (or, with no
+/// supervisor store, at least in-memory) enqueued — a persistence failure that
+/// rolls the wake back is NOT counted (see below).
+pub(crate) async fn enqueue_fleet_boot_resume_wakes(
+    store: &FleetKernelStore,
+    orchestrator: &InProcessAgentOrchestrator,
+    now_ms: u64,
+) -> eyre::Result<usize> {
+    let fleets = store.fleets_with_ready_children(now_ms).await?;
+    // With a supervisor store, a `NotDurable` commit can ONLY be a persistence
+    // rollback (a failed persist cancels the in-memory enqueue); without one it
+    // is the benign in-memory-only path. Captured once — it does not change
+    // mid-pass.
+    let has_store = orchestrator.has_supervisor_store();
+    let mut enqueued = 0usize;
+    for rec in fleets {
+        // Orphan guard: skip a fleet no longer bound to its controller's current
+        // goal (cleared or re-planned). No keeper will resolve it, so a wake is
+        // wasted and carries stale metadata.
+        let bound = orchestrator.goal_bound_fleet_id(&rec.controller_session_key);
+        if bound.as_deref() != Some(rec.fleet_id.as_str()) {
+            tracing::warn!(
+                fleet_id = %rec.fleet_id,
+                controller = %rec.controller_session_key,
+                bound = ?bound,
+                "fleet boot-resume: skipping an orphaned fleet not bound to its controller's \
+                 current goal (goal cleared or re-planned); no keeper will drive it"
+            );
+            continue;
+        }
+
+        let snap = render_fleet_snapshot(store, &rec.fleet_id, now_ms).await;
+        // Reuse the consumer's request builder — it writes the PR-4b workspace
+        // seed when a root is present — then OVERRIDE its sequence-based dedupe
+        // key with the stable, fleet-scoped boot key. `sequence` is unused here
+        // (the key it would produce is replaced below), so pass 0.
+        let req = fleet_keeper_continuation_request(
+            &rec.controller_session_key,
+            &rec.profile_id,
+            &rec.fleet_id,
+            0,
+            &snap,
+            rec.controller_workspace_root.as_deref(),
+        )
+        .with_dedupe_key(fleet_boot_resume_dedupe_key(
+            &rec.controller_session_key,
+            &rec.fleet_id,
+        ));
+        match orchestrator.commit_fleet_keeper_wake(req) {
+            // Persisted to the durable store — survives a further restart.
+            WakeCommit::Durable => enqueued += 1,
+            // No supervisor store → the wake is in-memory only: it still drives
+            // THIS boot's drain (all boot-resume needs), it just won't survive
+            // another restart. Benign — count it.
+            WakeCommit::NotDurable if !has_store => enqueued += 1,
+            // A supervisor store IS configured yet the commit is NotDurable —
+            // the ONLY cause is a persistence error that ROLLED BACK the
+            // in-memory enqueue. There is now NO wake and NO retry, and
+            // reconcile emitted no outbox event either, so this fleet will NOT
+            // auto-resume this boot. Surface it honestly; do NOT count it as a
+            // success (never report false progress that masks a stall).
+            WakeCommit::NotDurable => tracing::warn!(
+                fleet_id = %rec.fleet_id,
+                controller = %rec.controller_session_key,
+                "fleet boot-resume wake FAILED to persist and was rolled back; this fleet will \
+                 NOT auto-resume this boot — it stays Ready with no keeper wake until the next \
+                 fleet event or a restart"
+            ),
+        }
+    }
+    if enqueued > 0 {
+        tracing::info!(
+            fleets = enqueued,
+            "fleet boot-resume: enqueued keeper wakes for restart-stranded fleets"
+        );
+    }
+    Ok(enqueued)
 }
 
 #[cfg(test)]
@@ -1023,6 +1154,315 @@ mod tests {
         assert!(
             !prompt.contains("An external master continuation was requested"),
             "must not hit the generic external fallback: {prompt}"
+        );
+    }
+
+    // ---- boot-resume (a fleet survives an octos restart) ------------------
+
+    use crate::api::agent_orchestrator::InProcessAgentOrchestrator;
+
+    /// Bind `controller`'s current goal to `fleet_id` (a PLAIN, unscoped key, so
+    /// the goal key equals the fleet's `controller_session_key`). The boot-resume
+    /// orphan guard only wakes a fleet still bound to its controller's goal, so a
+    /// test expecting a wake must bind first.
+    fn bind_goal(orch: &InProcessAgentOrchestrator, controller: &SessionKey, fleet_id: &str) {
+        orch.bind_goal_fleet_for_test(controller, "profile-x", fleet_id);
+    }
+
+    #[tokio::test]
+    async fn boot_resume_enqueues_a_keeper_wake_for_a_stalled_fleet() {
+        // After boot reconcile leaves a live fleet's children `Ready` (but emits
+        // no outbox event), the boot-resume pass enqueues ONE keeper wake on the
+        // fleet's controller, carrying the workspace_root seed, so the global
+        // drain re-drives it.
+        let (dir, store) = test_store().await;
+        let controller = SessionKey::new("api", "keeper-boot");
+        // The controller workspace root must be a REAL directory so the PR-4b
+        // seed pre-pass (`pending_fleet_keeper_seeds`, is_dir-validated) accepts
+        // it — proving the boot wake reaches the headless-rehydration path.
+        let root = dir.path().to_string_lossy().into_owned();
+        make_fleet_with_root(&store, "fleet-boot", &controller, "ship it", Some(&root)).await;
+
+        let orch = InProcessAgentOrchestrator::default();
+        orch.configure_supervisor_store(dir.path().join("supervisor"))
+            .expect("configure supervisor store");
+        bind_goal(&orch, &controller, "fleet-boot");
+
+        let enqueued = enqueue_fleet_boot_resume_wakes(&store, &orch, 1_000)
+            .await
+            .expect("boot resume");
+        assert_eq!(
+            enqueued, 1,
+            "one live, bound fleet with a ready child → one wake"
+        );
+
+        assert_eq!(
+            orch.pending_continuation_count_for_session_for_test(&controller, "profile-x"),
+            1,
+            "exactly one keeper continuation on the fleet's controller session"
+        );
+
+        // The wake carries the workspace_root seed → it reaches the PR-4b drain
+        // pre-pass, which yields exactly one rooted seed for this controller.
+        let seeds = orch.pending_fleet_keeper_seeds();
+        assert_eq!(seeds.len(), 1, "one rooted keeper seed");
+        assert_eq!(
+            seeds[0].wire, controller,
+            "seed is for the fleet's controller"
+        );
+        assert_eq!(
+            seeds[0].root, root,
+            "seed carries the persisted workspace root"
+        );
+    }
+
+    #[tokio::test]
+    async fn boot_resume_skips_complete_and_cancelled_fleets() {
+        // The helper wakes EXACTLY the fleets the query returns. `fleet-live`
+        // has a ready child → woken; `fleet-idle`'s only ready task is already
+        // in flight (no launchable child) → skipped by the query. (The literal
+        // Complete / Cancelled status exclusion is covered authoritatively by
+        // the store test `fleets_with_ready_children_finds_active_fleets_with_ready_tasks`,
+        // where terminal-status fleets are mintable via `write_raw_fleet`;
+        // terminal fleet status has no public transition at this layer.)
+        let (dir, store) = test_store().await;
+        let root = dir.path().to_string_lossy().into_owned();
+
+        let live = SessionKey::new("api", "keeper-live");
+        make_fleet_with_root(&store, "fleet-live", &live, "obj", Some(&root)).await;
+
+        let idle = SessionKey::new("api", "keeper-idle");
+        make_fleet_with_root(&store, "fleet-idle", &idle, "obj", Some(&root)).await;
+        // Launch t1 so it is in-flight (Launching, live attempt); t2 stays
+        // Planned (dep unmet) — the fleet now has NO launchable child.
+        let outcome = store
+            .launch_child("fleet-idle", "t1", 100, 0, 1, 1_000)
+            .await
+            .expect("launch");
+        assert!(
+            matches!(outcome, octos_fleet::LaunchOutcome::Launched { .. }),
+            "t1 should launch: {outcome:?}"
+        );
+
+        let orch = InProcessAgentOrchestrator::default();
+        orch.configure_supervisor_store(dir.path().join("supervisor"))
+            .expect("configure supervisor store");
+        // Both fleets are bound to their controllers, so only the query decides.
+        bind_goal(&orch, &live, "fleet-live");
+        bind_goal(&orch, &idle, "fleet-idle");
+
+        let enqueued = enqueue_fleet_boot_resume_wakes(&store, &orch, 1_000)
+            .await
+            .expect("boot resume");
+        assert_eq!(
+            enqueued, 1,
+            "only the live fleet with a ready child is woken"
+        );
+        assert_eq!(
+            orch.pending_continuation_count_for_session_for_test(&live, "profile-x"),
+            1,
+            "the live fleet's keeper is woken"
+        );
+        assert_eq!(
+            orch.pending_continuation_count_for_session_for_test(&idle, "profile-x"),
+            0,
+            "a fleet with no launchable child is NOT woken"
+        );
+    }
+
+    #[tokio::test]
+    async fn boot_resume_wake_dedupes_across_two_boots() {
+        // The boot dedupe key is stable per (controller, fleet), so a boot-resume
+        // pass run twice against the same continuation state (a restart re-running
+        // the pass before the first wake drained, then restoring the persisted
+        // wake) collapses to ONE continuation rather than double-queuing.
+        let (dir, store) = test_store().await;
+        let controller = SessionKey::new("api", "keeper-twoboot");
+        let root = dir.path().to_string_lossy().into_owned();
+        make_fleet_with_root(&store, "fleet-tb", &controller, "obj", Some(&root)).await;
+
+        let orch = InProcessAgentOrchestrator::default();
+        orch.configure_supervisor_store(dir.path().join("supervisor"))
+            .expect("configure supervisor store");
+        bind_goal(&orch, &controller, "fleet-tb");
+
+        enqueue_fleet_boot_resume_wakes(&store, &orch, 1_000)
+            .await
+            .expect("boot 1");
+        enqueue_fleet_boot_resume_wakes(&store, &orch, 2_000)
+            .await
+            .expect("boot 2");
+
+        assert_eq!(
+            orch.pending_continuation_count_for_session_for_test(&controller, "profile-x"),
+            1,
+            "the stable per-fleet boot key collapses two boot passes to one continuation"
+        );
+    }
+
+    #[tokio::test]
+    async fn boot_resume_key_differs_from_consumer_sequence_key() {
+        // The boot key is namespaced apart from the consumer's sequence-based
+        // key (`.../{sequence}`), so a boot wake and a real ChildDone wake for
+        // the SAME (controller, fleet) never false-collapse onto each other.
+        let (dir, store) = test_store().await;
+        let controller = SessionKey::new("api", "keeper-key");
+        let root = dir.path().to_string_lossy().into_owned();
+        make_fleet_with_root(&store, "fleet-key", &controller, "obj", Some(&root)).await;
+
+        let orch = InProcessAgentOrchestrator::default();
+        orch.configure_supervisor_store(dir.path().join("supervisor"))
+            .expect("configure supervisor store");
+        bind_goal(&orch, &controller, "fleet-key");
+
+        enqueue_fleet_boot_resume_wakes(&store, &orch, 1_000)
+            .await
+            .expect("boot resume");
+        // A consumer-style wake for the same controller+fleet with a real sequence.
+        let snap = render_fleet_snapshot(&store, "fleet-key", 1_000).await;
+        let seq_req = fleet_keeper_continuation_request(
+            &controller,
+            "profile-x",
+            "fleet-key",
+            7,
+            &snap,
+            Some(&root),
+        );
+        orch.commit_fleet_keeper_wake(seq_req);
+
+        assert_eq!(
+            orch.pending_continuation_count_for_session_for_test(&controller, "profile-x"),
+            2,
+            "boot key and sequence key are distinct → two continuations, no false collapse"
+        );
+    }
+
+    #[test]
+    fn boot_resume_dedupe_key_disambiguates_two_fleets_on_one_controller() {
+        // HIGH fix (a): controller↔fleet is NOT 1:1 (`goal_clear` leaves a fleet
+        // Active), so a cleared-then-replanned controller can transiently own two
+        // Active fleets. Their boot keys must be DISTINCT (else one wake is
+        // silently discarded), while staying stable per fleet across boots.
+        let c = SessionKey::new("api", "keeper-collide");
+        assert_ne!(
+            fleet_boot_resume_dedupe_key(&c, "fleet-A"),
+            fleet_boot_resume_dedupe_key(&c, "fleet-B"),
+            "distinct fleets on one controller must not share a boot dedupe key"
+        );
+        assert_eq!(
+            fleet_boot_resume_dedupe_key(&c, "fleet-A"),
+            fleet_boot_resume_dedupe_key(&c, "fleet-A"),
+            "the key is stable per fleet across boots"
+        );
+    }
+
+    #[tokio::test]
+    async fn boot_resume_skips_an_orphaned_fleet_not_bound_to_the_current_goal() {
+        // HIGH fix (b) + the collision scenario: a controller whose goal G1 was
+        // cleared and re-planned as G2 transiently owns TWO Active fleets with
+        // Ready children (F1 orphaned, F2 current). Only F2 (bound to the current
+        // goal) is woken — F1 is skipped (no keeper would ever resolve it). The
+        // fleet-scoped key (fix a) also guarantees the two never collide.
+        let (dir, store) = test_store().await;
+        let controller = SessionKey::new("api", "keeper-orphan");
+        let root = dir.path().to_string_lossy().into_owned();
+        make_fleet_with_root(&store, "fleet-old", &controller, "obj-old", Some(&root)).await;
+        make_fleet_with_root(&store, "fleet-new", &controller, "obj-new", Some(&root)).await;
+
+        let orch = InProcessAgentOrchestrator::default();
+        orch.configure_supervisor_store(dir.path().join("supervisor"))
+            .expect("configure supervisor store");
+        // The controller's CURRENT goal is bound to fleet-new; fleet-old is the
+        // orphaned remnant of a cleared goal (still Active in the store).
+        bind_goal(&orch, &controller, "fleet-new");
+
+        let enqueued = enqueue_fleet_boot_resume_wakes(&store, &orch, 1_000)
+            .await
+            .expect("boot resume");
+        assert_eq!(enqueued, 1, "only the currently-bound fleet is woken");
+
+        let wakes = orch.pending_fleet_keeper_wakes_for_test();
+        assert_eq!(
+            wakes.len(),
+            1,
+            "exactly one boot wake (the orphan is skipped)"
+        );
+        assert_eq!(
+            wakes[0].2.as_deref(),
+            Some("fleet-new"),
+            "the wake targets the bound (current-goal) fleet, not the orphan"
+        );
+    }
+
+    #[tokio::test]
+    async fn boot_resume_wakes_each_bound_fleet_with_a_distinct_key() {
+        // Two controllers, each with its own bound Active fleet → BOTH get wakes,
+        // under distinct dedupe keys (no collision, no discard).
+        let (dir, store) = test_store().await;
+        let root = dir.path().to_string_lossy().into_owned();
+        let c1 = SessionKey::new("api", "keeper-m1");
+        let c2 = SessionKey::new("api", "keeper-m2");
+        make_fleet_with_root(&store, "fleet-m1", &c1, "obj1", Some(&root)).await;
+        make_fleet_with_root(&store, "fleet-m2", &c2, "obj2", Some(&root)).await;
+
+        let orch = InProcessAgentOrchestrator::default();
+        orch.configure_supervisor_store(dir.path().join("supervisor"))
+            .expect("configure supervisor store");
+        bind_goal(&orch, &c1, "fleet-m1");
+        bind_goal(&orch, &c2, "fleet-m2");
+
+        let enqueued = enqueue_fleet_boot_resume_wakes(&store, &orch, 1_000)
+            .await
+            .expect("boot resume");
+        assert_eq!(enqueued, 2, "both bound fleets are woken");
+
+        let mut keys: Vec<String> = orch
+            .pending_fleet_keeper_wakes_for_test()
+            .into_iter()
+            .map(|(_, dedupe_key, _)| dedupe_key)
+            .collect();
+        keys.sort();
+        keys.dedup();
+        assert_eq!(keys.len(), 2, "two distinct boot dedupe keys");
+    }
+
+    #[tokio::test]
+    async fn boot_resume_does_not_report_success_on_persistence_failure() {
+        // HIGH fix 2: with a supervisor store, a durable-persist FAILURE makes
+        // `commit_fleet_keeper_wake` ROLL BACK the in-memory enqueue → no wake,
+        // no retry. The pass must NOT count that as enqueued (never mask a stall
+        // with false success).
+        let (dir, store) = test_store().await;
+        let controller = SessionKey::new("api", "keeper-persistfail");
+        let root = dir.path().to_string_lossy().into_owned();
+        make_fleet_with_root(&store, "fleet-pf", &controller, "obj", Some(&root)).await;
+
+        let orch = InProcessAgentOrchestrator::default();
+        let sup = dir.path().join("supervisor");
+        orch.configure_supervisor_store(&sup)
+            .expect("configure supervisor store");
+        bind_goal(&orch, &controller, "fleet-pf");
+
+        // Sabotage the durable write: plant a DIRECTORY where the event-ledger
+        // FILE must be, so `record_continuation_queued` fails → the commit rolls
+        // back (a persistence error, NOT the benign no-store in-memory path).
+        std::fs::create_dir_all(&sup).expect("sup dir");
+        let events = sup.join("supervisor-events.jsonl");
+        let _ = std::fs::remove_file(&events);
+        std::fs::create_dir_all(&events).expect("plant ledger-path directory");
+
+        let enqueued = enqueue_fleet_boot_resume_wakes(&store, &orch, 1_000)
+            .await
+            .expect("boot resume returns Ok even when a wake fails to persist");
+
+        assert_eq!(
+            enqueued, 0,
+            "a rolled-back (failed-persist) wake must NOT be reported as enqueued"
+        );
+        assert_eq!(
+            orch.pending_continuation_count_for_session_for_test(&controller, "profile-x"),
+            0,
+            "the failed wake was rolled back → no pending continuation lingers"
         );
     }
 }

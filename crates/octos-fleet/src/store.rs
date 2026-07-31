@@ -40,6 +40,7 @@ use octos_core::SessionKey;
 use redb::{Database, ReadableTable, TableDefinition};
 use uuid::Uuid;
 
+use crate::grant::WorkerGrant;
 use crate::records::*;
 
 const FLEETS: TableDefinition<&str, &str> = TableDefinition::new("fleets");
@@ -74,6 +75,24 @@ pub enum CompleteOutcome {
     Superseded,
 }
 
+/// Result of [`FleetKernelStore::deny_escalation`]. Carries the settle outcome
+/// AND — computed IN THE SAME write-txn, over the durable post-deny child states
+/// — whether the fleet can no longer auto-complete. PR B (codex round-4, defect
+/// 2): the keeper drives the goal terminal from `fleet_un_completable` DIRECTLY,
+/// so the resolution can never be skipped by a separate fallible read after the
+/// durable deny.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DenyEscalationOutcome {
+    /// `Completed` when the `Blocked → Failed` transition committed; `Superseded`
+    /// when the child was not `Blocked` (an inert no-op deny).
+    pub settled: CompleteOutcome,
+    /// Whether the fleet is now un-completable — no task can drive it to
+    /// all-`Succeeded` because a `Failed` task strands it (mirrors the goal
+    /// snapshot's `!complete && any-failed` rule, computed on the durable state).
+    /// `false` on a `Superseded` no-op (nothing changed).
+    pub fleet_un_completable: bool,
+}
+
 /// Result of a `mark_running` CAS. `Superseded` means the identity/predicate
 /// fence failed — a genuine lost race (the attempt is stale/superseded or not
 /// the child's current attempt), so nothing changes; deliberately **not** an
@@ -102,6 +121,15 @@ pub enum PlanMutateOutcome {
     /// out-of-txn pre-check and the CAS cannot slip a dep-change past the
     /// freeze (round-2 P1). No mutation.
     RejectedTerminalDepChange {
+        task_id: String,
+    },
+    /// PR B — a `SetGrant` (grant-widen + resume) targeted a child that is NOT
+    /// `Blocked` — detected **inside** the `set_task_grant` write-txn, so a
+    /// child that a concurrent `deny_escalation` moved `Blocked → Failed` (or
+    /// that a prior grant already resumed) between the caller's out-of-txn read
+    /// and the CAS cannot have the denied/stale grant applied. No mutation: the
+    /// grant is REFUSED (grant and deny are mutually exclusive).
+    RejectedNotBlocked {
         task_id: String,
     },
 }
@@ -378,6 +406,7 @@ impl FleetKernelStore {
                         outcome: None,
                         tokens_committed: 0,
                         deps: t.deps.clone(),
+                        pending_escalation: None,
                         generation: 0,
                         updated_at_ms: now_ms,
                     };
@@ -451,6 +480,7 @@ impl FleetKernelStore {
                     outcome: None,
                     tokens_committed: 0,
                     deps,
+                    pending_escalation: None,
                     generation: fleet.generation,
                     updated_at_ms: now_ms,
                 };
@@ -608,6 +638,70 @@ impl FleetKernelStore {
         })
         .await
         .wrap_err("join resolve_and_collect_ready")?
+    }
+
+    /// Every **live** fleet (`Active`/`Draining`) that currently has at least
+    /// one launchable child. This is the boot-resume driver: a fleet
+    /// interrupted by a restart has its in-flight children reset to `Ready` by
+    /// [`Self::reconcile`], but reconcile emits NO outbox event, so the outbox
+    /// consumer never wakes the keeper and nothing re-dispatches. This query
+    /// finds exactly the fleets whose keeper must be re-woken at boot.
+    ///
+    /// Two-phase to respect the non-reentrant `io_gate`: phase 1 takes the gate
+    /// ONCE to snapshot the live fleet records from the `FLEETS` table
+    /// (mirroring [`Self::list_children`]'s iterator) and then RELEASES it;
+    /// phase 2 calls [`Self::resolve_and_collect_ready`] per candidate — each
+    /// re-acquires the gate for its own one-write-txn, so it MUST run outside
+    /// phase 1's guard. Reusing `resolve_and_collect_ready` rather than a naive
+    /// `status == Ready` scan is deliberate: it heals a missed `Planned → Ready`
+    /// promotion in-txn (a dep that `Succeeded` pre-crash whose dependent never
+    /// promoted), so a fleet stranded in exactly that state is still detected.
+    /// A candidate whose ready set comes back empty (all children terminal or
+    /// in-flight) is dropped; terminal fleets (`Complete`/`Failed`/`Cancelled`)
+    /// are excluded up front by the status filter.
+    pub async fn fleets_with_ready_children(&self, now_ms: u64) -> Result<Vec<FleetRecord>> {
+        // Phase 1 (one io_gate acquisition): snapshot the live fleet records.
+        let candidates: Vec<FleetRecord> = {
+            let db = self.db.clone();
+            let held = self.io_gate.clone().lock_owned().await;
+            tokio::task::spawn_blocking(move || -> Result<Vec<FleetRecord>> {
+                let _held = held;
+                let rtx = db.begin_read()?;
+                let table = rtx.open_table(FLEETS)?;
+                let mut out = Vec::new();
+                for item in table.iter()? {
+                    let (k, v) = item?;
+                    if let Some(rec) = decode_row::<FleetRecord>(v.value())? {
+                        // Identity check (defense in depth, mirrors get_fleet):
+                        // the row must own the key it lives under. Filter to the
+                        // two live states — terminal fleets never re-dispatch.
+                        if rec.fleet_id == k.value()
+                            && matches!(rec.status, FleetStatus::Active | FleetStatus::Draining)
+                        {
+                            out.push(rec);
+                        }
+                    }
+                }
+                Ok(out)
+            })
+            .await
+            .wrap_err("join fleets_with_ready_children")??
+        };
+
+        // Phase 2 (gate released): resolve+collect each candidate's ready set.
+        // Each call re-acquires the io_gate for its own write-txn, so it runs
+        // OUTSIDE phase 1's guard (the Mutex is non-reentrant). Non-empty ⇒ the
+        // fleet has launchable work and its keeper needs a wake.
+        let mut out = Vec::new();
+        for rec in candidates {
+            let ready = self
+                .resolve_and_collect_ready(&rec.fleet_id, now_ms)
+                .await?;
+            if !ready.is_empty() {
+                out.push(rec);
+            }
+        }
+        Ok(out)
     }
 
     // ---- CAS state transitions -------------------------------------------
@@ -1016,6 +1110,181 @@ impl FleetKernelStore {
         .wrap_err("join complete_child")?
     }
 
+    /// PR B — record a mid-task ESCALATION: settle a running attempt into a
+    /// NON-terminal [`ChildStatus::Blocked`] with a [`EscalationRequest`], so
+    /// the keeper can widen the grant (`goal_grant` → `Ready`) or deny it
+    /// (`goal_deny` → `Failed`).
+    ///
+    /// It reuses `complete_child`'s EXACT four-part fence (the child's
+    /// `current_attempt_id` is this attempt, the attempt is `Running`, its
+    /// `generation` equals the fleet's, and its lease `owner_epoch` matches) —
+    /// so a stale / superseded / cross-fleet attempt is a no-op
+    /// ([`CompleteOutcome::Superseded`]). It differs from `complete_child` only
+    /// in the effect: on success it
+    ///
+    /// - settles the **REAL** tokens the yielded attempt used (`committed +=
+    ///   actual_tokens`, `reserved -= reserved_tokens`) — NOT `0`. Budget
+    ///   honesty matters here precisely because the child is NON-terminal: a
+    ///   FRESH attempt runs after the grant widen, so the budget it is admitted
+    ///   against must already reflect the tokens the yielded attempt spent (a
+    ///   `0`-commit would let a worker spend the whole budget, escalate, and
+    ///   spend it again);
+    /// - marks the attempt `Interrupted` (it yielded, it did not complete) and
+    ///   **clears** `current_attempt_id`, so the Blocked→Ready transition can
+    ///   launch a clean fresh attempt;
+    /// - sets the child `Blocked` + `pending_escalation` (its `outcome` stays
+    ///   `None` — Blocked is not terminal, so there is no verdict yet);
+    /// - appends the SAME [`FleetEventKind::ChildDone`] the completion path
+    ///   does, so the EXISTING keeper wake fires with no new machinery.
+    #[allow(clippy::too_many_arguments)] // 4-part predicate + escalation payload + settlement inputs are irreducible here
+    pub async fn record_escalation(
+        &self,
+        fleet_id: &str,
+        child_id: &str,
+        attempt_id: &str,
+        request: EscalationRequest,
+        actual_tokens: u64,
+        owner_epoch: u64,
+        now_ms: u64,
+    ) -> Result<CompleteOutcome> {
+        ensure_key_safe(&[fleet_id, child_id, attempt_id])?;
+        let db = self.db.clone();
+        let fleet_id = fleet_id.to_string();
+        let child_id = child_id.to_string();
+        let attempt_id = attempt_id.to_string();
+        let held = self.io_gate.clone().lock_owned().await;
+        tokio::task::spawn_blocking(move || -> Result<CompleteOutcome> {
+            let _held = held;
+            let wtx = db.begin_write()?;
+            let outcome = {
+                let mut fleets = wtx.open_table(FLEETS)?;
+                let mut children = wtx.open_table(FLEET_CHILDREN)?;
+                let mut attempts = wtx.open_table(ATTEMPTS)?;
+                let mut outbox = wtx.open_table(OUTBOX)?;
+
+                let ckey = child_key(&fleet_id, &child_id);
+                let akey = attempt_key(&child_id, &attempt_id);
+
+                let Some(cj) = children.get(ckey.as_str())?.map(|g| g.value().to_string()) else {
+                    return Ok(CompleteOutcome::Superseded);
+                };
+                let Some(mut child) = decode_row::<FleetChildRecord>(&cj)? else {
+                    return Ok(CompleteOutcome::Superseded);
+                };
+                let Some(aj) = attempts.get(akey.as_str())?.map(|g| g.value().to_string()) else {
+                    return Ok(CompleteOutcome::Superseded);
+                };
+                let Some(mut attempt) = decode_row::<Attempt>(&aj)? else {
+                    return Ok(CompleteOutcome::Superseded);
+                };
+                let Some(fj) = fleets
+                    .get(fleet_id.as_str())?
+                    .map(|g| g.value().to_string())
+                else {
+                    return Ok(CompleteOutcome::Superseded);
+                };
+                let Some(mut fleet) = decode_row::<FleetRecord>(&fj)? else {
+                    return Ok(CompleteOutcome::Superseded);
+                };
+
+                // Identity: every decoded row must own the addressed ids (P1-4).
+                if child.fleet_id != fleet_id
+                    || child.child_id != child_id
+                    || attempt.fleet_id != fleet_id
+                    || attempt.child_id != child_id
+                    || attempt.attempt_id != attempt_id
+                    || fleet.fleet_id != fleet_id
+                {
+                    return Ok(CompleteOutcome::Superseded);
+                }
+
+                // Same four-part predicate as `complete_child` — a stale / late
+                // / superseded attempt cannot escalate.
+                let is_current = child.current_attempt_id.as_deref() == Some(attempt_id.as_str());
+                let is_running = attempt.status == AttemptStatus::Running;
+                let gen_ok = attempt.generation == fleet.generation;
+                let lease_ok = attempt.lease.owner_epoch == owner_epoch;
+                if !(is_current && is_running && gen_ok && lease_ok) {
+                    return Ok(CompleteOutcome::Superseded);
+                }
+
+                // ---- passes: settle REAL tokens + Blocked (non-terminal) ----
+                let reserved = attempt.reserved_tokens;
+                let new_committed = fleet
+                    .budget
+                    .tokens_committed
+                    .checked_add(actual_tokens)
+                    .ok_or_else(|| eyre::eyre!("committed-token overflow escalating {child_id}"))?;
+                let new_reserved = fleet
+                    .budget
+                    .tokens_reserved
+                    .checked_sub(reserved)
+                    .ok_or_else(|| {
+                        eyre::eyre!(
+                            "reservation underflow escalating {child_id}: reserved {reserved} > \
+                             fleet.tokens_reserved {}",
+                            fleet.budget.tokens_reserved
+                        )
+                    })?;
+
+                // Blocked is NON-terminal: no verdict, but the yielded attempt's
+                // real token spend IS committed so the fresh attempt's budget is
+                // honest. Clear `current_attempt_id` so Blocked→Ready launches
+                // clean.
+                child.status = ChildStatus::Blocked;
+                // PR B (codex round-3, defect 3) — RE-STAMP the row to the current
+                // schema. `Blocked` is a v3-only enum variant, so a row carrying it
+                // MUST say v3: a legacy v2 child (written before the upgrade, still
+                // stamped `schema_version: 2`) that escalates would otherwise persist
+                // `{schema_version: 2, status: "Blocked"}` — and a rolled-back v2
+                // binary, seeing `2 <= 2`, attempts a full decode and ERRORS on the
+                // unknown `Blocked` variant instead of dropping the row as newer.
+                // Stamping v3 makes `decode_row` on the old binary drop it (`3 > 2`).
+                // This is THE write that introduces `Blocked`, so it is the one that
+                // must guarantee the invariant "any persisted `Blocked` row is v3".
+                child.schema_version = SCHEMA_VERSION;
+                child.pending_escalation = Some(request);
+                child.current_attempt_id = None;
+                child.tokens_committed = child
+                    .tokens_committed
+                    .checked_add(actual_tokens)
+                    .ok_or_else(|| eyre::eyre!("child committed-token overflow for {child_id}"))?;
+                child.updated_at_ms = now_ms;
+                children.insert(ckey.as_str(), serde_json::to_string(&child)?.as_str())?;
+
+                // The attempt yielded — Interrupted, not Done (no result).
+                attempt.status = AttemptStatus::Interrupted;
+                attempt.ended_at_ms = Some(now_ms);
+                attempts.insert(akey.as_str(), serde_json::to_string(&attempt)?.as_str())?;
+
+                fleet.budget.tokens_committed = new_committed;
+                fleet.budget.tokens_reserved = new_reserved;
+                fleet.updated_at_ms = now_ms;
+                fleets.insert(fleet_id.as_str(), serde_json::to_string(&fleet)?.as_str())?;
+
+                // The SAME wake the completion path fires — the keeper reads the
+                // pending escalation off the fleet view on its next turn.
+                append_outbox(
+                    &mut outbox,
+                    outbox_event(
+                        FleetEventKind::ChildDone,
+                        &fleet_id,
+                        Some(&child_id),
+                        Some(&attempt_id),
+                    ),
+                )?;
+
+                CompleteOutcome::Completed
+            };
+            if matches!(outcome, CompleteOutcome::Completed) {
+                wtx.commit()?;
+            }
+            Ok(outcome)
+        })
+        .await
+        .wrap_err("join record_escalation")?
+    }
+
     /// Re-plan a fleet (P1-2): revision-fenced full replacement of the
     /// durable plan with clean **interrupt-and-restart** semantics, all in
     /// one write-txn. It CAS-checks `expected_revision`, increments
@@ -1233,6 +1502,13 @@ impl FleetKernelStore {
                             // as a double-launch (P1).
                             child.current_attempt_id = None;
                             child.outcome = None;
+                            // PR B — a replan that resets a `Blocked` survivor must
+                            // CLEAR its `pending_escalation`: the child is being
+                            // freshly re-readied against the new plan, so a stale
+                            // request (whose advisory grant may name capabilities
+                            // the operator never approved) must not linger onto the
+                            // fresh attempt or a later grant/deny decision.
+                            child.pending_escalation = None;
                             child.status = if child.deps.iter().all(|d| succeeded_ids.contains(d)) {
                                 ChildStatus::Ready
                             } else {
@@ -1245,6 +1521,7 @@ impl FleetKernelStore {
                             reason: "removed by replan".into(),
                         });
                         child.current_attempt_id = None;
+                        child.pending_escalation = None;
                     }
                     children.insert(ckey.as_str(), serde_json::to_string(&child)?.as_str())?;
                 }
@@ -1273,6 +1550,7 @@ impl FleetKernelStore {
                         outcome: None,
                         tokens_committed: 0,
                         deps: task.deps.clone(),
+                        pending_escalation: None,
                         generation: new_gen,
                         updated_at_ms: now_ms,
                     };
@@ -1367,6 +1645,276 @@ impl FleetKernelStore {
         })
         .await
         .wrap_err("join retitle_task")?
+    }
+
+    /// PR B — apply an operator grant WIDEN to one task and resume its blocked
+    /// child, in one revision-fenced write-txn. This is the `goal_grant` store
+    /// op: the keeper approved a worker's mid-task escalation, so the task's
+    /// [`PlanTask::grant`] is replaced with the keeper-chosen grant and the
+    /// yielded child is transitioned `Blocked → Ready` (its
+    /// `pending_escalation` cleared) — a fresh attempt then rebuilds its
+    /// registry + sandbox from the NEW, wider grant.
+    ///
+    /// It is DELIBERATELY targeted, NOT a [`FleetKernelStore::replan`]: it bumps
+    /// only the plan `revision` (never `fleet.generation`) and touches only THIS
+    /// task's row — no blast radius across other children, no re-ready of every
+    /// non-`Succeeded` child. A generation bump is unnecessary because the
+    /// yielded attempt is ALREADY settled (`record_escalation` interrupted it
+    /// and cleared `current_attempt_id` before this edit): there is no live
+    /// attempt to fence off.
+    ///
+    /// CAS on `expected_revision` (stale → [`PlanMutateOutcome::RevisionMismatch`],
+    /// nothing changes). Errors if the task is absent from the plan. The child
+    /// transition is applied only when the child is `Blocked` (the escalation
+    /// case); a non-`Blocked` child keeps its status (the grant still updates),
+    /// so a grant edit is inert on execution state outside the escalation flow.
+    pub async fn set_task_grant(
+        &self,
+        fleet_id: &str,
+        expected_revision: u64,
+        task_id: &str,
+        grant: WorkerGrant,
+        now_ms: u64,
+    ) -> Result<PlanMutateOutcome> {
+        ensure_key_safe(&[fleet_id, task_id])?;
+        let db = self.db.clone();
+        let fleet_id = fleet_id.to_string();
+        let task_id = task_id.to_string();
+        let held = self.io_gate.clone().lock_owned().await;
+        tokio::task::spawn_blocking(move || -> Result<PlanMutateOutcome> {
+            let _held = held;
+            let wtx = db.begin_write()?;
+            let outcome = {
+                let mut plans = wtx.open_table(PLANS)?;
+                let mut children = wtx.open_table(FLEET_CHILDREN)?;
+
+                let Some(pj) = plans.get(fleet_id.as_str())?.map(|g| g.value().to_string()) else {
+                    bail!("set_task_grant: no plan for fleet {fleet_id}");
+                };
+                let Some(mut plan) = decode_row::<DurablePlan>(&pj)? else {
+                    bail!("set_task_grant: plan for {fleet_id} is a newer schema");
+                };
+                if plan.fleet_id != fleet_id {
+                    bail!("set_task_grant: plan identity mismatch for {fleet_id}");
+                }
+                if plan.revision != expected_revision {
+                    return Ok(PlanMutateOutcome::RevisionMismatch {
+                        actual: plan.revision,
+                    });
+                }
+                let Some(task_idx) = plan.tasks.iter().position(|t| t.task_id == task_id) else {
+                    bail!("set_task_grant: task {task_id} not in fleet {fleet_id}'s plan");
+                };
+
+                // PR B (codex round-2) — CAS on the child being `Blocked` INSIDE
+                // the txn, BEFORE mutating the plan. The grant+resume applies ONLY
+                // to a child still awaiting the operator: if a concurrent
+                // `deny_escalation` moved it `Blocked → Failed` (and bumped the
+                // revision), or a prior grant already resumed it, this child is no
+                // longer `Blocked` and the (possibly stale/denied) grant is
+                // REFUSED with ZERO mutation. Grant and deny are mutually
+                // exclusive. Materialize the read into an owned String first so no
+                // access guard borrows `children` across the later `insert`.
+                let ckey = child_key(&fleet_id, &task_id);
+                let cj = children.get(ckey.as_str())?.map(|g| g.value().to_string());
+                let refused = PlanMutateOutcome::RejectedNotBlocked {
+                    task_id: task_id.clone(),
+                };
+                let Some(cj) = cj else {
+                    return Ok(refused);
+                };
+                let Some(mut child) = decode_row::<FleetChildRecord>(&cj)? else {
+                    return Ok(refused);
+                };
+                if child.fleet_id != fleet_id
+                    || child.child_id != task_id
+                    || child.status != ChildStatus::Blocked
+                {
+                    return Ok(refused);
+                }
+
+                // Blocked confirmed — apply the grant to the plan, bump the
+                // revision, and resume the child (Blocked → Ready, request
+                // cleared). A Ready child MUST have no live attempt or
+                // launch_child rejects the relaunch as a double-launch.
+                let new_rev = expected_revision
+                    .checked_add(1)
+                    .ok_or_else(|| eyre::eyre!("revision overflow granting {fleet_id}"))?;
+                plan.tasks[task_idx].grant = grant;
+                plan.revision = new_rev;
+                plan.schema_version = SCHEMA_VERSION;
+                plans.insert(fleet_id.as_str(), serde_json::to_string(&plan)?.as_str())?;
+
+                child.status = ChildStatus::Ready;
+                child.pending_escalation = None;
+                child.current_attempt_id = None;
+                child.updated_at_ms = now_ms;
+                children.insert(ckey.as_str(), serde_json::to_string(&child)?.as_str())?;
+
+                PlanMutateOutcome::Mutated { revision: new_rev }
+            };
+            if matches!(outcome, PlanMutateOutcome::Mutated { .. }) {
+                wtx.commit()?;
+            }
+            Ok(outcome)
+        })
+        .await
+        .wrap_err("join set_task_grant")?
+    }
+
+    /// PR B — deny a worker's mid-task escalation, moving its blocked child
+    /// `Blocked → Failed` (TERMINAL), in one write-txn. This is the `goal_deny`
+    /// store op: the keeper refused the requested grant widen, so the task
+    /// cannot proceed. Terminality is load-bearing — a `Blocked` child is
+    /// non-terminal and holds `is_complete` open forever, so a denial that left
+    /// it `Blocked` would WEDGE the fleet. The child is stamped a
+    /// [`AcceptanceVerdict::Rejected`] with the keeper's reason and its
+    /// `pending_escalation` cleared.
+    ///
+    /// A no-op ([`CompleteOutcome::Superseded`]) if the child is not `Blocked`
+    /// (nothing to deny) — so a double-deny, or a deny racing a grant, cannot
+    /// clobber a child that already resumed.
+    ///
+    /// PR B (codex round-4, defect 2) — it also computes, IN THE SAME write-txn,
+    /// whether the fleet is now un-completable (a `Failed` task strands it) and
+    /// returns it on the [`DenyEscalationOutcome`]. The keeper drives the goal
+    /// terminal DIRECTLY from that returned value, so the goal-terminal resolution
+    /// can never be skipped by a separate fallible read after the durable deny.
+    pub async fn deny_escalation(
+        &self,
+        fleet_id: &str,
+        child_id: &str,
+        reason: &str,
+        now_ms: u64,
+    ) -> Result<DenyEscalationOutcome> {
+        ensure_key_safe(&[fleet_id, child_id])?;
+        let db = self.db.clone();
+        let fleet_id = fleet_id.to_string();
+        let child_id = child_id.to_string();
+        let reason = reason.to_string();
+        let held = self.io_gate.clone().lock_owned().await;
+        tokio::task::spawn_blocking(move || -> Result<DenyEscalationOutcome> {
+            let _held = held;
+            // A no-op deny changed nothing, so the fleet's completability is
+            // untouched (`false`).
+            let superseded = DenyEscalationOutcome {
+                settled: CompleteOutcome::Superseded,
+                fleet_un_completable: false,
+            };
+            let wtx = db.begin_write()?;
+            let outcome = {
+                let mut children = wtx.open_table(FLEET_CHILDREN)?;
+                let mut plans = wtx.open_table(PLANS)?;
+                let mut outbox = wtx.open_table(OUTBOX)?;
+                let ckey = child_key(&fleet_id, &child_id);
+                let Some(cj) = children.get(ckey.as_str())?.map(|g| g.value().to_string()) else {
+                    return Ok(superseded);
+                };
+                let Some(mut child) = decode_row::<FleetChildRecord>(&cj)? else {
+                    return Ok(superseded);
+                };
+                // Only a Blocked child can be denied (identity-checked, P1-4).
+                if child.fleet_id != fleet_id
+                    || child.child_id != child_id
+                    || child.status != ChildStatus::Blocked
+                {
+                    return Ok(superseded);
+                }
+                child.status = ChildStatus::Failed;
+                child.outcome = Some(AcceptanceVerdict::Rejected {
+                    reason: format!("escalation denied: {reason}"),
+                });
+                child.pending_escalation = None;
+                child.current_attempt_id = None;
+                child.updated_at_ms = now_ms;
+                children.insert(ckey.as_str(), serde_json::to_string(&child)?.as_str())?;
+
+                // PR B (codex round-2) — BUMP the plan revision so a concurrent
+                // `set_task_grant` that read this child `Blocked` at revision N
+                // fails its revision CAS: the grant and the deny cannot both
+                // commit, so a denied capability can never be applied. (The
+                // grant's in-txn `Blocked` CAS is the belt; this bump is the
+                // suspenders — whichever commits first, the other is refused.)
+                // A missing plan row is a corruption we do not silently create.
+                // Materialize the read into an owned String FIRST so no access
+                // guard borrows `plans` across the later `insert`.
+                //
+                // PR B (codex round-4, defect 2) — the SAME plan drives the
+                // completability computation below (its task list is the ground
+                // truth for "can this fleet still reach all-Succeeded?").
+                let pj = plans.get(fleet_id.as_str())?.map(|g| g.value().to_string());
+                let mut fleet_un_completable = false;
+                if let Some(pj) = pj {
+                    if let Some(mut plan) = decode_row::<DurablePlan>(&pj)? {
+                        if plan.fleet_id == fleet_id {
+                            plan.revision = plan.revision.checked_add(1).ok_or_else(|| {
+                                eyre::eyre!("revision overflow denying escalation for {fleet_id}")
+                            })?;
+                            plan.schema_version = SCHEMA_VERSION;
+                            plans.insert(
+                                fleet_id.as_str(),
+                                serde_json::to_string(&plan)?.as_str(),
+                            )?;
+
+                            // Completability, computed on the durable POST-deny
+                            // child states — mirrors the goal snapshot's rule
+                            // (`!all-Succeeded && any-Failed`). The just-denied
+                            // child is `Failed` (already written), so this is
+                            // always `true` here; computing it over the real plan
+                            // (rather than assuming) keeps it faithful if the plan
+                            // shape changes. The denied child is read from the
+                            // local `child` (avoids a redundant re-decode); the
+                            // rest are read back (owned String first, so no access
+                            // guard borrows `children` across iterations).
+                            let mut all_succeeded = true;
+                            let mut any_failed = false;
+                            for task in &plan.tasks {
+                                let status = if task.task_id == child_id {
+                                    child.status
+                                } else {
+                                    let tkey = child_key(&fleet_id, &task.task_id);
+                                    match children
+                                        .get(tkey.as_str())?
+                                        .map(|g| g.value().to_string())
+                                    {
+                                        Some(j) => decode_row::<FleetChildRecord>(&j)?
+                                            .map(|c| c.status)
+                                            .unwrap_or(ChildStatus::Planned),
+                                        None => ChildStatus::Planned,
+                                    }
+                                };
+                                if status != ChildStatus::Succeeded {
+                                    all_succeeded = false;
+                                }
+                                if status == ChildStatus::Failed {
+                                    any_failed = true;
+                                }
+                            }
+                            fleet_un_completable = !all_succeeded && any_failed;
+                        }
+                    }
+                }
+
+                // PR B (codex round-2) — EMIT the same ChildDone wake the
+                // completion/escalation paths do, so the keeper is woken to
+                // re-evaluate a denied task (its goal reaches a terminal state
+                // instead of staying perpetually active on the now-Failed child).
+                append_outbox(
+                    &mut outbox,
+                    outbox_event(FleetEventKind::ChildDone, &fleet_id, Some(&child_id), None),
+                )?;
+                DenyEscalationOutcome {
+                    settled: CompleteOutcome::Completed,
+                    fleet_un_completable,
+                }
+            };
+            if matches!(outcome.settled, CompleteOutcome::Completed) {
+                wtx.commit()?;
+            }
+            Ok(outcome)
+        })
+        .await
+        .wrap_err("join deny_escalation")?
     }
 
     /// Boot recovery: scan children, and for each `Launching`/`Running`
@@ -2345,6 +2893,159 @@ mod tests {
         assert_eq!(e2.sequence, 2);
     }
 
+    fn escalation_request() -> EscalationRequest {
+        EscalationRequest {
+            requested_grant: crate::grant::WorkerGrant {
+                network: crate::grant::NetworkGrant::Hosts(vec!["example.com".into()]),
+                tools: vec!["read_file".into(), "web_fetch".into()],
+                ..crate::grant::WorkerGrant::minimal()
+            },
+            reason: "needs example.com to fetch the report".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn record_escalation_blocks_child_non_terminally_and_emits_childdone() {
+        let (_d, store) = fresh().await;
+        fleet_with_ready_child(&store, 1_000).await;
+        let attempt_id = launch_running(&store).await;
+
+        // The yielded attempt used 80 REAL tokens — they must be committed
+        // (NOT 0), so a fresh attempt after the grant widen has an honest budget.
+        let out = store
+            .record_escalation("f1", "c1", &attempt_id, escalation_request(), 80, EPOCH, 20)
+            .await
+            .unwrap();
+        assert_eq!(out, CompleteOutcome::Completed);
+
+        // Child is Blocked (NON-terminal) with the pending request; no verdict.
+        let child = store.get_child("f1", "c1").await.unwrap().unwrap();
+        assert_eq!(child.status, ChildStatus::Blocked);
+        assert!(!child.status.is_terminal(), "Blocked must be non-terminal");
+        assert!(
+            child.outcome.is_none(),
+            "a Blocked child has no verdict yet"
+        );
+        assert_eq!(
+            child.pending_escalation.as_ref().map(|e| e.reason.as_str()),
+            Some("needs example.com to fetch the report"),
+        );
+        assert_eq!(
+            child.current_attempt_id, None,
+            "the yielded attempt is cleared so Blocked→Ready can relaunch clean",
+        );
+        assert_eq!(child.tokens_committed, 80);
+
+        // The attempt is Interrupted (it yielded, did not complete).
+        let attempt = store.get_attempt("c1", &attempt_id).await.unwrap().unwrap();
+        assert_eq!(attempt.status, AttemptStatus::Interrupted);
+        assert_eq!(attempt.ended_at_ms, Some(20));
+
+        // Budget: REAL tokens committed (not 0), reservation released.
+        let fleet = store.get_fleet("f1").await.unwrap().unwrap();
+        assert_eq!(
+            fleet.budget.tokens_committed, 80,
+            "record_escalation must settle the REAL tokens used, never 0",
+        );
+        assert_eq!(fleet.budget.tokens_reserved, 0, "reservation released");
+
+        // Outbox: ChildLaunching (seq 1) then the SAME ChildDone wake (seq 2).
+        let e1 = store.claim_next("k", 0, 100).await.unwrap().unwrap();
+        assert_eq!(e1.kind, FleetEventKind::ChildLaunching);
+        let e2 = store.claim_next("k", 0, 100).await.unwrap().unwrap();
+        assert_eq!(
+            e2.kind,
+            FleetEventKind::ChildDone,
+            "escalation fires the EXISTING ChildDone wake — no new machinery",
+        );
+    }
+
+    #[tokio::test]
+    async fn record_escalation_is_a_no_op_for_a_stale_attempt() {
+        let (_d, store) = fresh().await;
+        fleet_with_ready_child(&store, 1_000).await;
+        let attempt_id = launch_running(&store).await;
+
+        // Wrong attempt id → the four-part fence rejects it (no state change).
+        let bogus = store
+            .record_escalation(
+                "f1",
+                "c1",
+                "not-the-attempt",
+                escalation_request(),
+                80,
+                EPOCH,
+                5,
+            )
+            .await
+            .unwrap();
+        assert_eq!(bogus, CompleteOutcome::Superseded);
+        // A foreign owner_epoch (a superseded lease) is likewise a no-op.
+        let stale_lease = store
+            .record_escalation(
+                "f1",
+                "c1",
+                &attempt_id,
+                escalation_request(),
+                80,
+                EPOCH + 1,
+                5,
+            )
+            .await
+            .unwrap();
+        assert_eq!(stale_lease, CompleteOutcome::Superseded);
+
+        // The child is untouched (still Running, no escalation, no commit).
+        let child = store.get_child("f1", "c1").await.unwrap().unwrap();
+        assert_eq!(child.status, ChildStatus::Running);
+        assert!(child.pending_escalation.is_none());
+        assert_eq!(child.tokens_committed, 0);
+        let fleet = store.get_fleet("f1").await.unwrap().unwrap();
+        assert_eq!(fleet.budget.tokens_committed, 0);
+    }
+
+    #[tokio::test]
+    async fn escalating_a_legacy_v2_child_restamps_to_v3() {
+        // codex round-3 (defect 3): a LEGACY v2 child row (written before the v3
+        // upgrade) that escalates must be RE-STAMPED to the current schema on
+        // write. `Blocked` is a v3-only enum variant; without the re-stamp the row
+        // would persist `{schema_version: 2, status: "Blocked"}`, and a rolled-back
+        // v2 binary (seeing `2 <= 2`) would attempt a full decode and ERROR on the
+        // unknown `Blocked` variant instead of dropping it as newer. `decode_row`
+        // only drops rows whose version EXCEEDS the binary's — so a `Blocked` row
+        // must be v3 for an older binary to drop it cleanly.
+        let (_d, store) = fresh().await;
+        fleet_with_ready_child(&store, 1_000).await;
+        let attempt_id = launch_running(&store).await;
+
+        // Plant the child row at the LEGACY v2 schema (as the pre-upgrade binary
+        // would have written it), preserving its live Running state + attempt so
+        // the four-part escalation fence still passes.
+        let mut legacy = store.get_child("f1", "c1").await.unwrap().unwrap();
+        assert_eq!(
+            legacy.schema_version, SCHEMA_VERSION,
+            "sanity: a freshly launched child is stamped at the current schema",
+        );
+        legacy.schema_version = 2;
+        store.write_raw_child(&legacy).await.unwrap();
+
+        // Escalate — the write MUST re-stamp the row to the current schema.
+        let out = store
+            .record_escalation("f1", "c1", &attempt_id, escalation_request(), 80, EPOCH, 20)
+            .await
+            .unwrap();
+        assert_eq!(out, CompleteOutcome::Completed);
+
+        let child = store.get_child("f1", "c1").await.unwrap().unwrap();
+        assert_eq!(child.status, ChildStatus::Blocked);
+        assert_eq!(
+            child.schema_version, SCHEMA_VERSION,
+            "a legacy v2 row carrying the new `Blocked` variant must be re-stamped \
+             v3 — so an older binary drops it as newer rather than erroring on the \
+             unknown variant",
+        );
+    }
+
     #[tokio::test]
     async fn complete_rejected_for_wrong_attempt_id_no_state_change() {
         let (_d, store) = fresh().await;
@@ -3295,7 +3996,7 @@ mod tests {
             .create_fleet("f1", controller(), None, "default", 100, false, 0)
             .await
             .unwrap();
-        let raw = r#"{"schema_version":3,"fleet_id":"f1","controller_session_key":"fleet:controller-1","profile_id":"default","budget":{"token_budget":100,"tokens_reserved":0,"tokens_committed":0,"hard":false},"status":"Active","generation":0,"created_at_ms":0,"updated_at_ms":0}"#;
+        let raw = r#"{"schema_version":4,"fleet_id":"f1","controller_session_key":"fleet:controller-1","profile_id":"default","budget":{"token_budget":100,"tokens_reserved":0,"tokens_committed":0,"hard":false},"status":"Active","generation":0,"created_at_ms":0,"updated_at_ms":0}"#;
         store.write_raw_fleet("f1", raw).await.unwrap();
         assert!(store.get_fleet("f1").await.unwrap().is_none());
     }
@@ -3348,6 +4049,141 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(out, LaunchOutcome::RejectedBudgetExceeded);
+    }
+
+    #[tokio::test]
+    async fn fleets_with_ready_children_finds_active_fleets_with_ready_tasks() {
+        let (_d, store) = fresh().await;
+
+        // Helper: plant a fleet then force its status (the public API mints
+        // only `Active`; terminal transitions arrive in later PRs, so a test
+        // reaches for the raw writer to exercise the boot-resume status filter).
+        async fn force_status(store: &FleetKernelStore, fleet_id: &str, status: FleetStatus) {
+            let mut f = store.get_fleet(fleet_id).await.unwrap().unwrap();
+            f.status = status;
+            store
+                .write_raw_fleet(fleet_id, &serde_json::to_string(&f).unwrap())
+                .await
+                .unwrap();
+        }
+        // Helper: force a child terminal (Succeeded) without the full lifecycle.
+        async fn force_succeeded(store: &FleetKernelStore, fleet_id: &str, child_id: &str) {
+            let mut c = store.get_child(fleet_id, child_id).await.unwrap().unwrap();
+            c.status = ChildStatus::Succeeded;
+            c.current_attempt_id = None;
+            store.write_raw_child(&c).await.unwrap();
+        }
+
+        // f-ready: an Active fleet with a dep-free (immediately Ready) child.
+        store
+            .create_fleet("f-ready", controller(), None, "default", 1_000, false, 0)
+            .await
+            .unwrap();
+        store.add_child("f-ready", "c1", vec![], 0).await.unwrap();
+
+        // f-draining: a live (Draining) fleet with a Ready child — also woken.
+        store
+            .create_fleet("f-draining", controller(), None, "default", 1_000, false, 0)
+            .await
+            .unwrap();
+        store
+            .add_child("f-draining", "c1", vec![], 0)
+            .await
+            .unwrap();
+        force_status(&store, "f-draining", FleetStatus::Draining).await;
+
+        // f-complete: a terminal fleet, even WITH a Ready child, is excluded by
+        // the status filter (the fleet is done; it must not re-dispatch).
+        store
+            .create_fleet("f-complete", controller(), None, "default", 1_000, false, 0)
+            .await
+            .unwrap();
+        store
+            .add_child("f-complete", "c1", vec![], 0)
+            .await
+            .unwrap();
+        force_status(&store, "f-complete", FleetStatus::Complete).await;
+
+        // f-cancelled: likewise excluded by the status filter.
+        store
+            .create_fleet(
+                "f-cancelled",
+                controller(),
+                None,
+                "default",
+                1_000,
+                false,
+                0,
+            )
+            .await
+            .unwrap();
+        store
+            .add_child("f-cancelled", "c1", vec![], 0)
+            .await
+            .unwrap();
+        force_status(&store, "f-cancelled", FleetStatus::Cancelled).await;
+
+        // f-done: Active but every child terminal → empty ready set → excluded.
+        store
+            .create_fleet("f-done", controller(), None, "default", 1_000, false, 0)
+            .await
+            .unwrap();
+        store.add_child("f-done", "c1", vec![], 0).await.unwrap();
+        force_succeeded(&store, "f-done", "c1").await;
+
+        // f-heal: the healed-promotion edge — c1 Succeeded (pre-crash) but its
+        // dependent c2 never promoted (still Planned). `resolve_and_collect_ready`
+        // promotes c2 in-txn, so the fleet IS detected as needing a wake.
+        store
+            .create_fleet("f-heal", controller(), None, "default", 1_000, false, 0)
+            .await
+            .unwrap();
+        store.add_child("f-heal", "c1", vec![], 0).await.unwrap();
+        store
+            .add_child("f-heal", "c2", vec!["c1".into()], 0)
+            .await
+            .unwrap();
+        force_succeeded(&store, "f-heal", "c1").await;
+        assert_eq!(
+            store
+                .get_child("f-heal", "c2")
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            ChildStatus::Planned,
+            "precondition: the dependent is still Planned (a missed promotion)"
+        );
+
+        let mut ids: Vec<String> = store
+            .fleets_with_ready_children(9_999)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|r| r.fleet_id)
+            .collect();
+        ids.sort();
+        assert_eq!(
+            ids,
+            vec![
+                "f-draining".to_string(),
+                "f-heal".to_string(),
+                "f-ready".to_string()
+            ],
+            "only live (Active|Draining) fleets with a ready/heal-promotable child are returned"
+        );
+
+        // The heal was applied in-txn: the missed dependent is now Ready.
+        assert_eq!(
+            store
+                .get_child("f-heal", "c2")
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            ChildStatus::Ready,
+            "resolve_and_collect_ready promoted the missed dependent in-txn"
+        );
     }
 
     // ---- test-only raw writer ---------------------------------------------

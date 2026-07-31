@@ -128,7 +128,10 @@ fn parse_task_specs(args: &Value) -> Result<Vec<TaskSpec>, String> {
 /// Wire shape:
 /// `{ "network": { "mode": "none"|"hosts"|"full", "hosts": ["example.com"] },
 ///    "tools": ["read_file", ..., "web_fetch"],
-///    "fs": { "read": ["/data/in"], "write": ["/data/out"] } }`
+///    "fs": "workspace"|"host" }`
+///
+/// `fs` is the coarse binary scope (v1 has no per-path allowlist — see
+/// [`parse_fs`]), NOT a `{read, write}` path object.
 fn parse_grant(value: Option<&Value>, task_id: &str) -> Result<WorkerGrant, String> {
     let value = match value {
         None | Some(Value::Null) => return Ok(WorkerGrant::minimal()),
@@ -269,7 +272,10 @@ impl Tool for GoalGetTool {
          goal_plan), also returns a `fleet` object with the objective, per-task \
          title/status/verdict, the ready set, and status counts — call this after a \
          fleet-completion wake to see progress and, when every task is accepted, the goal \
-         auto-transitions to complete. Returns status=none when no goal is set."
+         auto-transitions to complete. A task with status `Blocked` and a `pending_escalation` \
+         (a worker's `reason` + advisory `requested_grant`) is waiting on YOUR operator decision: \
+         call goal_grant (widen its grant + resume it) or goal_deny (fail it). Returns status=none \
+         when no goal is set."
     }
 
     fn input_schema(&self) -> Value {
@@ -513,7 +519,9 @@ impl Tool for GoalDispatchTool {
          Each launched task runs to completion in the background and wakes this goal when it \
          finishes, so the loop is: goal_dispatch → (workers run) → wake → goal_get to see \
          progress → goal_dispatch again for the newly-ready tasks, until goal_get reports all \
-         tasks accepted. Safe to call repeatedly — already-running tasks are not relaunched."
+         tasks accepted. Safe to call repeatedly — already-running tasks are not relaunched. If a \
+         woken task is `Blocked` on a `pending_escalation`, resolve it with goal_grant or goal_deny \
+         (not goal_dispatch) before it can run again."
     }
 
     fn input_schema(&self) -> Value {
@@ -550,6 +558,237 @@ impl Tool for GoalDispatchTool {
             }),
             Err(message) => Ok(ToolResult {
                 output: format!("goal_dispatch: {message}"),
+                success: false,
+                ..Default::default()
+            }),
+        }
+    }
+}
+
+/// PR B — `goal_grant`: APPROVE a worker's mid-task escalation, widen the task's
+/// grant, and resume it.
+pub struct GoalGrantTool {
+    profile_id: String,
+}
+
+impl GoalGrantTool {
+    pub fn new(profile_id: impl Into<String>) -> Self {
+        Self {
+            profile_id: profile_id.into(),
+        }
+    }
+}
+
+#[async_trait]
+impl Tool for GoalGrantTool {
+    fn name(&self) -> &str {
+        "goal_grant"
+    }
+
+    fn description(&self) -> &str {
+        "APPROVE a fleet worker's mid-task escalation: widen the blocked task's operator grant \
+         and resume it (a fresh attempt re-runs with the new capability; its scratch dir \
+         persists). Use when goal_get shows a task with status `Blocked` and a `pending_escalation` \
+         — read the worker's `reason` and its advisory `requested_grant`, then decide. Pass the \
+         `task_id`. Omit `grant` to approve the worker's requested grant as-is, OR pass a `grant` \
+         (same shape as goal_plan's task grant) to grant LESS — you are the operator and may narrow \
+         what it asked for (e.g. a tighter host allowlist). The grant is validated exactly as at \
+         plan time. To refuse instead, use goal_deny."
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "task_id": {
+                    "type": "string",
+                    "description": "The Blocked task whose escalation you are approving."
+                },
+                "grant": {
+                    "type": "object",
+                    "description": "Optional operator grant to apply (same shape as goal_plan's task grant: network/tools/fs). Omit to approve the worker's requested grant as-is; provide to grant LESS.",
+                    "properties": {
+                        "network": {
+                            "type": "object",
+                            "properties": {
+                                "mode": { "type": "string", "enum": ["none", "hosts", "full"] },
+                                "hosts": { "type": "array", "items": { "type": "string" } }
+                            },
+                            "additionalProperties": false
+                        },
+                        "tools": { "type": "array", "items": { "type": "string" } },
+                        "fs": { "type": "string", "enum": ["workspace", "host"] }
+                    },
+                    "additionalProperties": false
+                }
+            },
+            "required": ["task_id"],
+            "additionalProperties": false
+        })
+    }
+
+    async fn execute(&self, args: &Value) -> Result<ToolResult> {
+        self.execute_with_context(&ToolContext::zero(), args).await
+    }
+
+    async fn execute_with_context(&self, ctx: &ToolContext, args: &Value) -> Result<ToolResult> {
+        let Some(session_id) = session_from_ctx(ctx) else {
+            return Ok(ToolResult {
+                output: "goal_grant: no session context for this turn".into(),
+                success: false,
+                ..Default::default()
+            });
+        };
+        let Some(task_id) = args
+            .get("task_id")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        else {
+            return Ok(ToolResult {
+                output: "goal_grant: `task_id` is required".into(),
+                success: false,
+                ..Default::default()
+            });
+        };
+        // Absent/null grant → approve as-requested (None); a supplied grant is
+        // parsed + validated exactly like a plan-time grant.
+        let grant = match args.get("grant") {
+            None | Some(Value::Null) => None,
+            Some(value) => match parse_grant(Some(value), task_id) {
+                Ok(grant) => Some(grant),
+                Err(message) => {
+                    return Ok(ToolResult {
+                        output: format!("goal_grant: {message}"),
+                        success: false,
+                        ..Default::default()
+                    });
+                }
+            },
+        };
+        match default_agent_orchestrator()
+            .model_grant_escalation(
+                &session_id,
+                &self.profile_id,
+                task_id,
+                grant,
+                fleet_now_ms(),
+            )
+            .await
+        {
+            Ok(outcome) => Ok(ToolResult {
+                output: format!(
+                    "goal_grant:\n{}",
+                    serde_json::to_string_pretty(&outcome).unwrap_or_else(|_| outcome.to_string())
+                ),
+                success: true,
+                ..Default::default()
+            }),
+            Err(message) => Ok(ToolResult {
+                output: format!("goal_grant: {message}"),
+                success: false,
+                ..Default::default()
+            }),
+        }
+    }
+}
+
+/// PR B — `goal_deny`: REFUSE a worker's mid-task escalation, failing the task.
+pub struct GoalDenyTool {
+    profile_id: String,
+}
+
+impl GoalDenyTool {
+    pub fn new(profile_id: impl Into<String>) -> Self {
+        Self {
+            profile_id: profile_id.into(),
+        }
+    }
+}
+
+#[async_trait]
+impl Tool for GoalDenyTool {
+    fn name(&self) -> &str {
+        "goal_deny"
+    }
+
+    fn description(&self) -> &str {
+        "REFUSE a fleet worker's mid-task escalation: the blocked task cannot proceed without a \
+         capability you are not willing to grant, so FAIL it (terminal). Use when goal_get shows a \
+         Blocked task with a `pending_escalation` you decide not to approve. Pass the `task_id` and \
+         a short `reason`. This is terminal — the task will not re-run; the fleet then completes \
+         around it (a Blocked task left undecided would wedge the goal forever, so decide every \
+         escalation with either goal_grant or goal_deny). To approve instead, use goal_grant."
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "task_id": {
+                    "type": "string",
+                    "description": "The Blocked task whose escalation you are refusing."
+                },
+                "reason": {
+                    "type": "string",
+                    "description": "One-line reason for refusing (recorded on the failed task)."
+                }
+            },
+            "required": ["task_id"],
+            "additionalProperties": false
+        })
+    }
+
+    async fn execute(&self, args: &Value) -> Result<ToolResult> {
+        self.execute_with_context(&ToolContext::zero(), args).await
+    }
+
+    async fn execute_with_context(&self, ctx: &ToolContext, args: &Value) -> Result<ToolResult> {
+        let Some(session_id) = session_from_ctx(ctx) else {
+            return Ok(ToolResult {
+                output: "goal_deny: no session context for this turn".into(),
+                success: false,
+                ..Default::default()
+            });
+        };
+        let Some(task_id) = args
+            .get("task_id")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        else {
+            return Ok(ToolResult {
+                output: "goal_deny: `task_id` is required".into(),
+                success: false,
+                ..Default::default()
+            });
+        };
+        let reason = args
+            .get("reason")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("escalation refused by the operator");
+        match default_agent_orchestrator()
+            .model_deny_escalation(
+                &session_id,
+                &self.profile_id,
+                task_id,
+                reason,
+                fleet_now_ms(),
+            )
+            .await
+        {
+            Ok(outcome) => Ok(ToolResult {
+                output: format!(
+                    "goal_deny:\n{}",
+                    serde_json::to_string_pretty(&outcome).unwrap_or_else(|_| outcome.to_string())
+                ),
+                success: true,
+                ..Default::default()
+            }),
+            Err(message) => Ok(ToolResult {
+                output: format!("goal_deny: {message}"),
                 success: false,
                 ..Default::default()
             }),
