@@ -204,25 +204,7 @@ impl LlmProvider for GeminiProvider {
     ) -> Result<ChatResponse> {
         let (contents, system_instruction) = build_gemini_contents(messages);
 
-        // Build tools array
-        let gemini_tools: Option<Vec<GeminiTool>> = if tools.is_empty() {
-            None
-        } else {
-            Some(vec![GeminiTool {
-                function_declarations: tools
-                    .iter()
-                    .map(|t| {
-                        let mut params = t.input_schema.clone();
-                        sanitize_schema_for_gemini(&mut params);
-                        GeminiFunctionDeclaration {
-                            name: t.name.clone(),
-                            description: t.description.clone(),
-                            parameters: params,
-                        }
-                    })
-                    .collect(),
-            }])
-        };
+        let gemini_tools = build_gemini_tools(tools);
 
         let request = GeminiRequest {
             contents,
@@ -284,24 +266,7 @@ impl LlmProvider for GeminiProvider {
     ) -> Result<ChatStream> {
         let (contents, system_instruction) = build_gemini_contents(messages);
 
-        let gemini_tools: Option<Vec<GeminiTool>> = if tools.is_empty() {
-            None
-        } else {
-            Some(vec![GeminiTool {
-                function_declarations: tools
-                    .iter()
-                    .map(|t| {
-                        let mut params = t.input_schema.clone();
-                        sanitize_schema_for_gemini(&mut params);
-                        GeminiFunctionDeclaration {
-                            name: t.name.clone(),
-                            description: t.description.clone(),
-                            parameters: params,
-                        }
-                    })
-                    .collect(),
-            }])
-        };
+        let gemini_tools = build_gemini_tools(tools);
 
         let request = GeminiRequest {
             contents,
@@ -661,12 +626,65 @@ struct GeminiFunctionDeclaration {
 /// Maximum recursion depth for schema sanitization (matches MCP limit).
 const MAX_SCHEMA_DEPTH: usize = 64;
 
+/// Build Gemini tool declarations while isolating schemas whose array element
+/// contract is unknowable. Guessing an element type here can make model output
+/// pass server-side validation while violating the tool's real client contract.
+fn build_gemini_tools(tools: &[ToolSpec]) -> Option<Vec<GeminiTool>> {
+    let function_declarations: Vec<_> = tools
+        .iter()
+        .filter_map(|tool| {
+            let mut parameters = tool.input_schema.clone();
+            sanitize_schema_for_gemini(&mut parameters);
+            if contains_underspecified_array(&parameters, 0) {
+                tracing::warn!(
+                    tool = %tool.name,
+                    "excluding Gemini tool declaration with missing or empty array items schema"
+                );
+                return None;
+            }
+            Some(GeminiFunctionDeclaration {
+                name: tool.name.clone(),
+                description: tool.description.clone(),
+                parameters,
+            })
+        })
+        .collect();
+
+    (!function_declarations.is_empty()).then_some(vec![GeminiTool {
+        function_declarations,
+    }])
+}
+
+fn contains_underspecified_array(value: &serde_json::Value, depth: usize) -> bool {
+    if depth > MAX_SCHEMA_DEPTH {
+        return false;
+    }
+
+    match value {
+        serde_json::Value::Object(object) => {
+            let is_underspecified_array = object.get("type").and_then(serde_json::Value::as_str)
+                == Some("array")
+                && match object.get("items") {
+                    None => true,
+                    Some(items) => items.as_object().is_some_and(serde_json::Map::is_empty),
+                };
+            is_underspecified_array
+                || object
+                    .values()
+                    .any(|nested| contains_underspecified_array(nested, depth + 1))
+        }
+        serde_json::Value::Array(items) => items
+            .iter()
+            .any(|nested| contains_underspecified_array(nested, depth + 1)),
+        _ => false,
+    }
+}
+
 /// Sanitize a JSON Schema for Gemini's restricted schema support.
 ///
 /// Gemini only supports a subset of JSON Schema. This recursively removes
 /// unsupported fields that cause 400 errors or silent empty responses:
 /// - `additionalProperties`
-/// - Missing or empty array `items` schemas
 /// - `$schema`, `$ref`, `$id`
 fn sanitize_schema_for_gemini(value: &mut serde_json::Value) {
     sanitize_schema_recursive(value, 0);
@@ -690,18 +708,6 @@ fn sanitize_schema_recursive(value: &mut serde_json::Value, depth: usize) {
         // `x-octos-host-config-keys` on the deep-search manifest) doesn't
         // crash plan_and_search workers when routing lands on Gemini.
         obj.retain(|k, _| !k.starts_with("x-"));
-
-        // Gemini rejects array schemas without an element schema before the
-        // request reaches the model. Repair both a missing `items` field and
-        // the equivalent empty-object form emitted by some tool providers.
-        let needs_default_items = obj.get("type").and_then(|value| value.as_str()) == Some("array")
-            && match obj.get("items") {
-                None => true,
-                Some(items) => items.as_object().is_some_and(|items| items.is_empty()),
-            };
-        if needs_default_items {
-            obj.insert("items".to_string(), serde_json::json!({"type": "string"}));
-        }
 
         // Recurse into nested objects
         let keys: Vec<String> = obj.keys().cloned().collect();
@@ -1033,17 +1039,17 @@ mod tests {
     }
 
     #[test]
-    fn test_sanitize_replaces_empty_items() {
+    fn should_not_guess_items_when_array_items_are_empty() {
         let mut schema = serde_json::json!({
             "type": "array",
             "items": {}
         });
         sanitize_schema_for_gemini(&mut schema);
-        assert_eq!(schema["items"]["type"], "string");
+        assert_eq!(schema["items"], serde_json::json!({}));
     }
 
     #[test]
-    fn should_add_default_items_when_array_schema_omits_items() {
+    fn should_not_guess_items_when_array_schema_omits_items() {
         let mut schema = serde_json::json!({
             "type": "object",
             "properties": {
@@ -1053,7 +1059,10 @@ mod tests {
 
         sanitize_schema_for_gemini(&mut schema);
 
-        assert_eq!(schema["properties"]["items"]["items"]["type"], "string");
+        assert!(
+            schema["properties"]["items"].get("items").is_none(),
+            "the provider must not invent an element contract"
+        );
     }
 
     #[test]
@@ -1064,6 +1073,71 @@ mod tests {
         });
         sanitize_schema_for_gemini(&mut schema);
         assert_eq!(schema["items"]["type"], "integer");
+    }
+
+    #[test]
+    fn should_preserve_object_array_contract_when_sanitizing() {
+        let mut schema = serde_json::json!({
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "id": {"type": "string"},
+                    "label": {"type": "string"},
+                    "style": {"type": "string"}
+                },
+                "required": ["id", "label"]
+            }
+        });
+        let expected = schema["items"].clone();
+
+        sanitize_schema_for_gemini(&mut schema);
+
+        assert_eq!(schema["items"], expected);
+    }
+
+    #[test]
+    fn should_isolate_tool_when_array_element_contract_is_unknown() {
+        let tools = vec![
+            ToolSpec {
+                name: "unknown_array".into(),
+                description: "Malformed external tool schema".into(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "values": {"type": "array"}
+                    }
+                }),
+            },
+            ToolSpec {
+                name: "object_array".into(),
+                description: "Valid object-array contract".into(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "values": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "id": {"type": "string"}
+                                }
+                            }
+                        }
+                    }
+                }),
+            },
+        ];
+
+        let gemini_tools = build_gemini_tools(&tools).expect("one valid tool remains");
+        let declarations = &gemini_tools[0].function_declarations;
+
+        assert_eq!(declarations.len(), 1);
+        assert_eq!(declarations[0].name, "object_array");
+        assert_eq!(
+            declarations[0].parameters["properties"]["values"]["items"]["type"],
+            "object"
+        );
     }
 
     #[test]
@@ -1090,8 +1164,8 @@ mod tests {
                 .is_none()
         );
         assert_eq!(
-            schema["properties"]["nested"]["properties"]["list"]["items"]["type"],
-            "string"
+            schema["properties"]["nested"]["properties"]["list"]["items"],
+            serde_json::json!({})
         );
     }
 
