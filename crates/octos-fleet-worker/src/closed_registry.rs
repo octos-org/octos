@@ -1,81 +1,124 @@
-//! Module 1 — the closed, replay-safe worker tool registry (**the crux**).
+//! Module 1 — the operator-granted, replay-safe worker tool registry (**the
+//! crux**).
 //!
-//! A fleet task-worker is *provably* non-interactive: it may hold only the
-//! seven native tools that are safe to run and re-run headless (read/write/
-//! edit files, glob/grep search, list dirs, and a fail-closed shell). It
-//! must NOT be able to park (`ask_user_question`/`request_user_input`), fan
-//! out (`spawn*`/`delegate*`/`peer_*`), reach the network
-//! (`web_*`/`http`/`browser`/deep-crawl), message a channel (`message`/
-//! `send_*`), or mutate durable memory (`recall_memory`/`save_memory`/…).
+//! PR A: a fleet task-worker no longer holds a HARDCODED closed set. The master
+//! provisions each worker's capabilities explicitly at dispatch as a
+//! [`WorkerGrant`] — network, tools, filesystem — and the host builds the
+//! worker FROM that grant. The DEFAULT is least privilege:
+//! [`WorkerGrant::minimal`] is byte-for-byte the old closed worker (no network,
+//! the base seven file tools, workspace-write), so every pre-grant dispatch
+//! path is unchanged.
 //!
-//! [`build_fleet_worker_registry`] starts from an EMPTY [`ToolRegistry`]
-//! (never [`ToolRegistry::with_builtins`], which registers ~35 tools
-//! including the parking + fan-out set), registers exactly the allow-set,
-//! and then hard-removes anything else with [`ToolRegistry::apply_policy`]
-//! as a belt-and-suspenders lock on the invariant. The exhaustive audit
-//! test asserts `tool_names() == ALLOWED`, so any future dynamic tool
-//! (MCP/plugin/skill) sneaking in fails the build.
+//! A worker is still *provably* bounded to exactly what it was granted:
+//! [`build_fleet_worker_registry`] starts from an EMPTY [`ToolRegistry`] (never
+//! [`ToolRegistry::with_builtins`], which registers ~35 tools including the
+//! parking + fan-out set), registers exactly the granted tools from a KNOWN
+//! CATALOG, and then hard-removes anything else with
+//! [`ToolRegistry::apply_policy`]. The exhaustive audit test asserts
+//! `tool_names() == grant.sorted_tools()`, so the closed-worker guarantee now
+//! reads "exactly what the operator granted, nothing more" — any future dynamic
+//! (MCP/plugin/skill) tool sneaking in fails the build.
 
 use std::path::Path;
 use std::sync::Arc;
 
-use octos_agent::policy::{ApprovalPolicy, EffectivePermissions};
+use eyre::{Result, eyre};
+use octos_agent::policy::{ApprovalPolicy, EffectivePermissions, FilesystemScope};
 use octos_agent::sandbox::Sandbox;
 use octos_agent::tools::policy::ToolPolicy;
 use octos_agent::tools::{
     EditFileTool, GlobTool, GrepTool, ListDirTool, ReadFileTool, ShellTool, ToolRegistry,
-    WriteFileTool,
+    WebFetchTool, WebSearchTool, WriteFileTool,
 };
+use octos_fleet::WorkerGrant;
 
-/// The EXACT set of native tool names a closed fleet task-worker may hold.
-/// Every one is replay-safe (idempotent-enough to re-run after a crash) and
-/// none blocks on human input. The audit test asserts the built registry's
-/// `tool_names()` equals this set — no more, no less.
-pub const ALLOWED: &[&str] = &[
-    "read_file",
-    "write_file",
-    "edit_file",
-    "glob",
-    "grep",
-    "list_dir",
-    "shell",
-];
+use crate::escalate::{EscalateTool, EscalationSlot};
 
-/// Build the closed, replay-safe tool registry for a fleet task-worker
-/// rooted at `cwd`, with `sandbox` backing the shell tool and each shell
-/// command's effective timeout CAPPED at `max_shell_timeout_secs` (the attempt
-/// deadline, in whole seconds) so no single foreground command outlives it.
+/// The base tool set a *minimal* (least-privilege) worker holds — today's
+/// closed seven. Kept as a named constant for docs / discriminator tests;
+/// equals [`octos_fleet::BASE_TOOLS`] and `WorkerGrant::minimal().tools`. The
+/// audit no longer compares against this fixed set — it compares against the
+/// per-worker `grant.sorted_tools()`.
+pub const ALLOWED: &[&str] = octos_fleet::BASE_TOOLS;
+
+/// Map a [`WorkerGrant`]'s filesystem grant onto [`EffectivePermissions`].
 ///
-/// The closed tool set is a DENYLIST (it removes parking/fan-out/network
-/// *tools*), NOT a network or process boundary. The surviving `shell` can
-/// still reach the network and can still detach a child via arbitrary
-/// shell-internal backgrounding that string inspection cannot catch (e.g.
-/// `sleep 600 & true`). Both are bounded by the **sandbox**: production MUST
-/// supply a network-isolated sandbox whose process-group/container teardown
-/// reaps detached children. Passing a no-op sandbox here is an operator error
-/// (flagged with a `tracing::warn!`), analogous to `--danger-full-access`.
+/// [`FsGrant::Workspace`] (the minimal default) maps to
+/// `FilesystemScope::Workspace` with `ReadWrite`, reproducing today's
+/// `workspace_write()` closed worker exactly (cwd-only). [`FsGrant::Host`] maps
+/// to `FilesystemScope::Host` (full daemon-user read+write) — an explicit,
+/// broad operator grant.
+///
+/// **v1 limitation (coarse fs scope, honestly binary).** The native file tools'
+/// scope IS binary (`Workspace | Host`) with no per-path allowlist, so the grant
+/// is binary too — there is no silent "some paths" middle ground that would
+/// promise narrow access but deliver host-wide. A narrow per-path FS grant is a
+/// FOLLOW-UP (it needs a native-tool path-allowlist model), exactly like
+/// per-host filtering of raw network needs an egress proxy.
+///
+/// [`FsGrant::Workspace`]: octos_fleet::FsGrant::Workspace
+/// [`FsGrant::Host`]: octos_fleet::FsGrant::Host
+fn perms_from_grant(grant: &WorkerGrant) -> EffectivePermissions {
+    let mut perms =
+        EffectivePermissions::workspace_write().with_approval_policy(ApprovalPolicy::Never);
+    if grant.fs.is_host() {
+        perms.filesystem_scope = FilesystemScope::Host;
+    }
+    perms
+}
+
+/// Build the replay-safe tool registry for a fleet task-worker rooted at `cwd`,
+/// FROM the operator's [`WorkerGrant`], with `sandbox` backing the shell tool
+/// and each shell command's effective timeout CAPPED at `max_shell_timeout_secs`
+/// (the attempt deadline, in whole seconds) so no foreground command outlives
+/// it.
+///
+/// The registry holds EXACTLY the granted tools — the base file tools (scoped
+/// by `grant.fs`) plus, if granted, the network content tools (`web_fetch` /
+/// `web_search`). A tool outside the grantable catalog, or a web tool with no
+/// network grant, is a hard error (`grant.validate()`), so an incoherent grant
+/// can never produce a live worker.
+///
+/// The granted tool set is a DENYLIST at the tool boundary (it omits
+/// parking/fan-out/etc.), NOT a network or process boundary. Under a `None` /
+/// `Hosts` grant the surviving `shell` has NO network (the sandbox blocks raw
+/// egress; the ONLY network path is the granted web tools, restricted to the
+/// allowlist). Under a `Full` grant the shell reaches the network and can
+/// detach children via shell-internal backgrounding that string inspection
+/// cannot catch — both bounded by the **sandbox**. Passing a no-op sandbox here
+/// is an operator error (flagged with a `tracing::warn!`), analogous to
+/// `--danger-full-access`.
 pub fn build_fleet_worker_registry(
     cwd: &Path,
     sandbox: Arc<dyn Sandbox>,
     max_shell_timeout_secs: u64,
-) -> ToolRegistry {
+    grant: &WorkerGrant,
+    escalation: EscalationSlot,
+) -> Result<ToolRegistry> {
+    // Reject an incoherent grant up front (unknown tool / web tool with no
+    // network) — validated at parse time too, so this is defense-in-depth: an
+    // unknown tool can never reach a live worker.
+    grant
+        .validate()
+        .map_err(|e| eyre!("fleet worker: invalid grant: {e}"))?;
+
     // P1-3-enforce (document, don't type-enforce): the API cannot police
     // sandbox quality, but a no-op sandbox leaves the shell's network reach and
     // detached children unbounded — surface it so it can't pass silently.
     if sandbox.is_noop() {
         tracing::warn!(
-            "fleet worker: building a closed registry with a NO-OP sandbox — the \
+            "fleet worker: building a granted registry with a NO-OP sandbox — the \
              shell's network reach and detached children are UNBOUNDED; production \
              must supply a network-isolated sandbox",
         );
     }
 
-    // Workspace read/write, but approvals FAIL CLOSED at the tool boundary:
-    // a shell command that the SafePolicy would ask about is denied outright
-    // (a closed worker has no human to ask). `SafePolicy` is preserved — we
-    // do NOT widen to AllowAll — so dangerous commands stay blocked.
-    let perms = EffectivePermissions::workspace_write().with_approval_policy(ApprovalPolicy::Never);
-    let scope = perms.filesystem_scope; // Workspace
+    // Filesystem reach from the grant. Approvals FAIL CLOSED at the tool
+    // boundary: a shell command the SafePolicy would ask about is denied
+    // outright (a closed worker has no human to ask). `SafePolicy` is preserved
+    // — we do NOT widen to AllowAll — so dangerous commands stay blocked.
+    let perms = perms_from_grant(grant);
+    let scope = perms.filesystem_scope; // Workspace (minimal) or Host (fs=Host)
     let access = perms.file_access; // ReadWrite
 
     let mut r = ToolRegistry::new();
@@ -83,59 +126,119 @@ pub fn build_fleet_worker_registry(
     // session-scope fallback and any project-root machinery resolve against
     // the same cwd the tools are bound to.
     r.set_workspace_root(cwd.to_path_buf());
-    r.register(
-        ShellTool::new(cwd)
-            .with_shared_sandbox(sandbox)
-            .with_policy(perms.shell_command_policy())
-            .with_approval_policy(ApprovalPolicy::Never)
-            // Refuse the string-detectable detach vectors (`background: true`
-            // and a trailing `&`) as defense-in-depth — the sandbox is the real
-            // boundary for detached children (see the fn doc).
-            .with_background_allowed(false)
-            // Hard per-command CEILING at the attempt deadline: combined with
-            // `background_allowed(false)`, no single foreground command outlives
-            // the deadline even if the LLM requests a larger `timeout_secs`.
-            .with_max_timeout_secs(max_shell_timeout_secs),
-    );
-    r.register(ReadFileTool::new(cwd).with_filesystem_scope(scope));
-    r.register(
-        WriteFileTool::new(cwd)
-            .with_filesystem_scope(scope)
-            .with_file_access(access),
-    );
-    r.register(
-        EditFileTool::new(cwd)
-            .with_filesystem_scope(scope)
-            .with_file_access(access),
-    );
-    r.register(GlobTool::new(cwd).with_filesystem_scope(scope));
-    r.register(GrepTool::new(cwd));
-    r.register(ListDirTool::new(cwd).with_filesystem_scope(scope));
 
-    // Belt-and-suspenders: hard-remove anything not in the allow-set. A no-op
-    // today (we registered exactly the allow-set and nothing auto-swaps,
-    // because no tool is named "spawn"), but it locks the invariant so a
-    // future edit that registers an extra tool cannot silently widen the
-    // worker's reach — `apply_policy` -> `retain` is a real removal.
+    // Build each granted tool from the KNOWN CATALOG. An unknown name is
+    // unreachable after `validate()` above, but the arm returns a hard error
+    // defensively rather than silently dropping a tool.
+    for name in &grant.tools {
+        match name.as_str() {
+            "shell" => r.register(
+                ShellTool::new(cwd)
+                    .with_shared_sandbox(sandbox.clone())
+                    .with_policy(perms.shell_command_policy())
+                    .with_approval_policy(ApprovalPolicy::Never)
+                    // Refuse the string-detectable detach vectors (`background:
+                    // true` and a trailing `&`) as defense-in-depth — the
+                    // sandbox is the real boundary for detached children.
+                    .with_background_allowed(false)
+                    // Hard per-command CEILING at the attempt deadline: combined
+                    // with `background_allowed(false)`, no single foreground
+                    // command outlives the deadline even if the LLM requests a
+                    // larger `timeout_secs`.
+                    .with_max_timeout_secs(max_shell_timeout_secs),
+            ),
+            "read_file" => r.register(ReadFileTool::new(cwd).with_filesystem_scope(scope)),
+            "write_file" => r.register(
+                WriteFileTool::new(cwd)
+                    .with_filesystem_scope(scope)
+                    .with_file_access(access),
+            ),
+            "edit_file" => r.register(
+                EditFileTool::new(cwd)
+                    .with_filesystem_scope(scope)
+                    .with_file_access(access),
+            ),
+            "glob" => r.register(GlobTool::new(cwd).with_filesystem_scope(scope)),
+            "grep" => r.register(GrepTool::new(cwd).with_filesystem_scope(scope)),
+            "list_dir" => r.register(ListDirTool::new(cwd).with_filesystem_scope(scope)),
+            // The network content tools — buildable ONLY under a network grant
+            // (`validate()` rejects them under `None`). `web_fetch` ENFORCES the
+            // per-host allowlist (`Hosts` → the list; `Full` → unrestricted, the
+            // private-IP block still applies). This is the ONLY network path
+            // under `Hosts` (the shell has no raw egress there).
+            "web_fetch" => {
+                let tool = match grant.network.web_allowlist() {
+                    Some(hosts) => WebFetchTool::new().with_host_allowlist(hosts.to_vec()),
+                    None => WebFetchTool::new(),
+                };
+                r.register(tool);
+            }
+            // `web_search` targets fixed search-PROVIDER endpoints (not arbitrary
+            // content hosts), so it is catalog-gated (buildable only when
+            // granted) but not itself host-allowlist-filtered in v1 — content
+            // retrieval remains allowlist-bound via `web_fetch` (documented v1
+            // limitation).
+            "web_search" => r.register(WebSearchTool::new()),
+            other => {
+                return Err(eyre!(
+                    "fleet worker: tool `{other}` is not in the grantable catalog"
+                ));
+            }
+        }
+    }
+
+    // PR B — the always-on `escalate` safety valve. Registered UNCONDITIONALLY,
+    // AFTER the grant loop, and NOT grant-gated: even a minimal-grant worker must
+    // be able to ASK for more capability when a task hits the edge of its grant.
+    // It only RECORDS a request (into the shared slot) and returns — it never
+    // parks (`blocks_on_human_input == false`) and never self-widens the grant
+    // (only the keeper's `goal_grant` mutates `PlanTask.grant`).
+    r.register(EscalateTool::new(escalation));
+
+    // Belt-and-suspenders: hard-remove anything not in the granted allow-set
+    // PLUS the always-on `escalate` valve. A no-op today (we registered exactly
+    // the grant + escalate and nothing auto-swaps), but it locks the invariant so
+    // a future edit that registers an extra tool cannot silently widen the
+    // worker's reach — `apply_policy` -> `retain` is a real removal. The allow
+    // list is never empty here (it always contains `escalate`), so it can never
+    // collapse into the empty=allow-all case.
+    let mut allow = grant.tools.clone();
+    allow.push("escalate".to_string());
     r.apply_policy(&ToolPolicy {
-        allow: ALLOWED.iter().map(|s| s.to_string()).collect(),
+        allow,
         ..Default::default()
     });
-    r
+    Ok(r)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use octos_agent::sandbox::NoSandbox;
+    use octos_fleet::{FsGrant, NetworkGrant};
     use std::collections::HashSet;
     use std::path::Path;
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
+
+    /// A fresh, empty escalation slot for a test build.
+    fn slot() -> EscalationSlot {
+        Arc::new(Mutex::new(None))
+    }
+
+    /// The audit key for a worker registry: the granted tools PLUS the always-on
+    /// `escalate` valve, deduped + sorted.
+    fn sorted_with_escalate(grant: &WorkerGrant) -> Vec<String> {
+        let mut names = grant.sorted_tools();
+        names.push("escalate".to_string());
+        names.sort();
+        names.dedup();
+        names
+    }
 
     /// Tools that must NEVER appear in a closed worker registry. This is a
     /// supplementary explicit denylist; the exhaustive `tool_names() ==
-    /// ALLOWED` assertion below is the real guard (it also catches names not
-    /// listed here). Covers the parking, fan-out, peer, channel, network,
+    /// grant.sorted_tools()` assertion below is the real guard (it also catches
+    /// names not listed here). Covers the parking, fan-out, peer, channel,
     /// memory, skill, and dispatch families.
     const FORBIDDEN: &[&str] = &[
         // parking / plan / human input
@@ -166,10 +269,8 @@ mod tests {
         "message",
         "send_file",
         "send_app_card",
-        // network / external
+        // network / external (NOT granted in a minimal worker)
         "browser",
-        "web_search",
-        "web_fetch",
         "search",
         "deep_crawl",
         "http",
@@ -196,34 +297,49 @@ mod tests {
         "diff_edit",
     ];
 
-    fn allowed_sorted() -> Vec<String> {
-        let mut v: Vec<String> = ALLOWED.iter().map(|s| s.to_string()).collect();
-        v.sort();
-        v
-    }
-
     #[test]
-    fn closed_worker_registry_has_only_replay_safe_tools() {
+    fn grant_minimal_reproduces_todays_closed_worker() {
+        // PR A: the minimal grant is byte-for-byte the old closed worker — the
+        // base seven, workspace-write, no network tools. The audit compares
+        // against `grant.sorted_tools()` (== the old `ALLOWED` for minimal).
+        let grant = WorkerGrant::minimal();
         let reg = build_fleet_worker_registry(
             Path::new("/tmp/fleet-worker-audit"),
             Arc::new(NoSandbox),
             30,
-        );
+            &grant,
+            slot(),
+        )
+        .expect("minimal grant builds");
 
-        // (2) EXHAUSTIVE: the registry contains EXACTLY the allow-set — no
-        // more, no less. This is the boundary that catches any future
-        // dynamic (MCP/plugin/skill) tool sneaking in.
+        // EXHAUSTIVE: the registry contains EXACTLY the granted tools PLUS the
+        // always-on `escalate` valve (PR B) — nothing more.
         let mut names = reg.tool_names();
         names.sort();
         assert_eq!(
             names,
-            allowed_sorted(),
-            "closed worker registry must contain EXACTLY the replay-safe tools",
+            sorted_with_escalate(&grant),
+            "a minimal-grant worker holds exactly the base replay-safe tools + escalate",
+        );
+        // And the GRANTED subset is the old closed seven (escalate is separate).
+        assert_eq!(grant.sorted_tools(), {
+            let mut v: Vec<String> = ALLOWED.iter().map(|s| s.to_string()).collect();
+            v.sort();
+            v
+        });
+        // The escalate valve is present, LLM-visible, and never parks.
+        assert!(
+            reg.get("escalate").is_some(),
+            "escalate is always available"
+        );
+        assert!(
+            !reg.blocks_on_human_input("escalate"),
+            "escalate must NOT block on human input — it records and returns",
         );
 
         let spec_names: HashSet<String> = reg.specs().into_iter().map(|s| s.name).collect();
 
-        // (1) every FORBIDDEN name is un-gettable AND absent from specs().
+        // Every FORBIDDEN name is un-gettable AND absent from specs().
         for name in FORBIDDEN {
             assert!(
                 reg.get(name).is_none(),
@@ -235,7 +351,7 @@ mod tests {
             );
         }
 
-        // (3) NOTHING in the registry blocks on human input.
+        // NOTHING in the registry blocks on human input.
         for name in reg.tool_names() {
             assert!(
                 !reg.blocks_on_human_input(&name),
@@ -243,17 +359,182 @@ mod tests {
             );
         }
 
-        // Sanity: every allowed tool is actually present + LLM-visible.
-        for name in ALLOWED {
+        // Sanity: every granted tool is present + LLM-visible.
+        for name in &grant.tools {
             assert!(
                 reg.get(name).is_some(),
-                "allowed tool {name} missing from closed registry",
+                "granted tool {name} missing from registry",
             );
             assert!(
-                spec_names.contains(*name),
-                "allowed tool {name} not exposed in specs()",
+                spec_names.contains(name),
+                "granted tool {name} not exposed in specs()",
             );
         }
+        // A minimal worker has NO web tools.
+        assert!(reg.get("web_fetch").is_none());
+        assert!(reg.get("web_search").is_none());
+    }
+
+    #[test]
+    fn escalate_tool_is_always_available_even_at_minimal_grant() {
+        // PR B — the safety valve is NOT grant-gated: even the least-privilege
+        // worker holds `escalate`, and the audit key is `sorted_tools() +
+        // escalate`. A grant that names NO extra tools still gets the valve.
+        for grant in [
+            WorkerGrant::minimal(),
+            WorkerGrant {
+                tools: vec!["read_file".into()],
+                ..WorkerGrant::minimal()
+            },
+        ] {
+            let reg = build_fleet_worker_registry(
+                Path::new("/tmp/fleet-escalate-valve"),
+                Arc::new(NoSandbox),
+                30,
+                &grant,
+                slot(),
+            )
+            .expect("grant builds");
+            assert!(
+                reg.get("escalate").is_some(),
+                "escalate must exist for grant {:?}",
+                grant.tools,
+            );
+            let mut names = reg.tool_names();
+            names.sort();
+            assert_eq!(
+                names,
+                sorted_with_escalate(&grant),
+                "audit = granted tools + escalate",
+            );
+        }
+    }
+
+    #[test]
+    fn grant_expands_tools_and_scopes() {
+        // A master grants +web_fetch (under a Hosts network) and Host fs → the
+        // registry gains web_fetch and the native file tools' EffectivePermissions
+        // widen to Host scope.
+        let cwd = Path::new("/tmp/fleet-expand");
+        let grant = WorkerGrant {
+            network: NetworkGrant::Hosts(vec!["example.com".into()]),
+            tools: {
+                let mut t: Vec<String> = octos_fleet::BASE_TOOLS
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect();
+                t.push("web_fetch".into());
+                t
+            },
+            fs: FsGrant::Host,
+        };
+        let reg = build_fleet_worker_registry(cwd, Arc::new(NoSandbox), 30, &grant, slot())
+            .expect("expanded grant builds");
+
+        assert!(reg.get("web_fetch").is_some(), "granted web_fetch present");
+        let mut names = reg.tool_names();
+        names.sort();
+        assert_eq!(
+            names,
+            sorted_with_escalate(&grant),
+            "exactly the granted set + escalate",
+        );
+
+        // The Host fs grant widens native tools to Host scope.
+        assert_eq!(
+            perms_from_grant(&grant).filesystem_scope,
+            FilesystemScope::Host,
+            "an fs=Host grant opens Host scope for native tools",
+        );
+        // The minimal (Workspace) grant stays Workspace-scoped (cwd-only).
+        assert_eq!(
+            perms_from_grant(&WorkerGrant::minimal()).filesystem_scope,
+            FilesystemScope::Workspace,
+            "minimal fs stays workspace-scoped",
+        );
+    }
+
+    #[test]
+    fn grant_hosts_allowlist_enforced_on_web_tool() {
+        // A Hosts grant builds the web tool and keeps raw egress OFF — the
+        // allowlist is enforced by the web tool (tested in octos-agent), and
+        // the sandbox never gets raw network under Hosts.
+        let grant = WorkerGrant {
+            network: NetworkGrant::Hosts(vec!["example.com".into()]),
+            tools: vec!["read_file".into(), "web_fetch".into()],
+            ..WorkerGrant::minimal()
+        };
+        let reg = build_fleet_worker_registry(
+            Path::new("/tmp/fleet-hosts"),
+            Arc::new(NoSandbox),
+            30,
+            &grant,
+            slot(),
+        )
+        .expect("hosts grant builds");
+        assert!(reg.get("web_fetch").is_some());
+        assert!(
+            !grant.network.allows_raw_egress(),
+            "Hosts must NOT grant raw sandbox egress — the shell cannot curl",
+        );
+        assert_eq!(
+            grant.network.web_allowlist(),
+            Some(&["example.com".to_string()][..]),
+            "the allowlist is threaded to the web tool",
+        );
+    }
+
+    #[test]
+    fn grant_full_enables_raw_network() {
+        // A Full grant turns on raw sandbox egress (git/npm) and builds web
+        // tools unrestricted (private-IP block still applies).
+        let grant = WorkerGrant {
+            network: NetworkGrant::Full,
+            tools: vec!["shell".into(), "web_fetch".into()],
+            ..WorkerGrant::minimal()
+        };
+        let reg = build_fleet_worker_registry(
+            Path::new("/tmp/fleet-full"),
+            Arc::new(NoSandbox),
+            30,
+            &grant,
+            slot(),
+        )
+        .expect("full grant builds");
+        assert!(reg.get("web_fetch").is_some());
+        assert!(
+            grant.network.allows_raw_egress(),
+            "Full grants raw sandbox egress",
+        );
+        assert!(
+            grant.network.web_allowlist().is_none(),
+            "Full leaves web tools unrestricted (no host allowlist)",
+        );
+    }
+
+    #[test]
+    fn grant_unknown_tool_is_rejected_at_build() {
+        // Defense-in-depth: even if an unknown tool slips past parse validation,
+        // the build refuses it rather than dropping it silently.
+        let grant = WorkerGrant {
+            tools: vec!["read_file".into(), "definitely_not_a_tool".into()],
+            ..WorkerGrant::minimal()
+        };
+        let result = build_fleet_worker_registry(
+            Path::new("/tmp/fleet-bad"),
+            Arc::new(NoSandbox),
+            30,
+            &grant,
+            slot(),
+        );
+        let err = result
+            .err()
+            .expect("unknown tool must be rejected")
+            .to_string();
+        assert!(
+            err.contains("definitely_not_a_tool"),
+            "error names the bad tool: {err}",
+        );
     }
 
     /// P1-1: the closed worker's shell refuses BOTH an explicit
@@ -262,7 +543,14 @@ mod tests {
     /// (before any child is spawned).
     #[tokio::test]
     async fn closed_worker_shell_refuses_background() {
-        let reg = build_fleet_worker_registry(&std::env::temp_dir(), Arc::new(NoSandbox), 30);
+        let reg = build_fleet_worker_registry(
+            &std::env::temp_dir(),
+            Arc::new(NoSandbox),
+            30,
+            &WorkerGrant::minimal(),
+            slot(),
+        )
+        .expect("minimal grant builds");
         let shell = reg.get("shell").expect("shell tool present");
 
         let explicit = shell

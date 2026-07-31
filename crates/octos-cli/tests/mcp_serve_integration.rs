@@ -25,6 +25,7 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use octos_agent::mcp_server::{McpSessionDispatch, SessionLifecycleObserver};
 use octos_agent::task_supervisor::TaskLifecycleState;
+use octos_agent::validators::ValidatorStatus;
 use octos_agent::{SandboxConfig, SandboxMode};
 use octos_cli::commands::mcp_serve::{AgentLlmFactory, RealSessionDispatch, SessionDispatchConfig};
 use octos_core::{Message, ToolCall};
@@ -227,8 +228,8 @@ async fn should_execute_real_agent_session_via_mcp_dispatch_and_return_artifact(
     );
     assert!(outcome.error.is_none());
     // cost must be a real token bundle, never a placeholder zero struct.
-    assert_eq!(outcome.cost["input_tokens"], 42);
-    assert_eq!(outcome.cost["output_tokens"], 17);
+    assert_eq!(outcome.cost.input_tokens, 42);
+    assert_eq!(outcome.cost.output_tokens, 17);
 }
 
 #[tokio::test]
@@ -523,8 +524,8 @@ async fn should_populate_validator_results_when_workspace_policy_declares_valida
         outcome.validator_results,
     );
     let entry = &outcome.validator_results[0];
-    assert_eq!(entry["validator_id"], "deck-exists");
-    assert_eq!(entry["status"], "pass");
+    assert_eq!(entry.validator_id, "deck-exists");
+    assert_eq!(entry.status, ValidatorStatus::Pass);
 }
 
 /// Security regression for the M7.2 session-dispatch RCE: the per-session tool

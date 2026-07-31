@@ -42,17 +42,21 @@
 #![deny(unsafe_code)]
 
 mod fleet;
+mod grant;
 mod records;
 mod store;
 
 pub use fleet::{Fleet, FleetSummary, FleetView, PlanEdit, PlanGraphError, TaskSpec, TaskView};
+pub use grant::{
+    BASE_TOOLS, FsGrant, GRANTABLE_TOOLS, GrantError, NetworkGrant, WEB_TOOLS, WorkerGrant,
+};
 pub use records::{
     AcceptanceCriterion, AcceptanceVerdict, Attempt, AttemptStatus, ChildResultSnapshot,
-    ChildStatus, DecisionEntry, DecisionKind, DurablePlan, EvidenceRef, FleetBudget,
-    FleetChildRecord, FleetEventKind, FleetRecord, FleetStatus, Lease, OutboxEvent, PlanTask,
-    SCHEMA_VERSION, Verifier, WorkerKind,
+    ChildStatus, DecisionEntry, DecisionKind, DurablePlan, EscalationRequest, EvidenceRef,
+    FleetBudget, FleetChildRecord, FleetEventKind, FleetRecord, FleetStatus, Lease, OutboxEvent,
+    PlanTask, SCHEMA_VERSION, Verifier, WorkerKind,
 };
 pub use store::{
-    AckOutcome, CompleteOutcome, FleetKernelStore, FleetSnapshot, InterruptedAttempt,
-    LaunchOutcome, MarkRunningOutcome, PlanMutateOutcome, ReconcileReport,
+    AckOutcome, CompleteOutcome, DenyEscalationOutcome, FleetKernelStore, FleetSnapshot,
+    InterruptedAttempt, LaunchOutcome, MarkRunningOutcome, PlanMutateOutcome, ReconcileReport,
 };

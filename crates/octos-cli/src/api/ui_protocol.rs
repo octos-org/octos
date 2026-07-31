@@ -89,7 +89,7 @@ use super::agent_orchestrator::{
     InProcessAgentOrchestrator, LoopControlKind, LoopControlRequest, LoopCreateRequest,
     LoopListRequest, NativeSpecialistAppUiEvent, NativeSpecialistLaunchRequest,
     default_agent_orchestrator, master_continuation_prompt, master_continuation_reason_name,
-    upsert_background_task_agent, wire_key_from_goal_key,
+    parse_agent_output_cursor, upsert_background_task_agent, wire_key_from_goal_key,
 };
 #[cfg(test)]
 use super::agent_orchestrator::{
@@ -14447,11 +14447,13 @@ fn raw_autonomy_rpc_with_orchestrator(
                 params.profile_id.as_deref(),
                 connection_profile_id,
             )?;
+            let cursor =
+                parse_agent_output_cursor(params.cursor, params.session_id.as_ref(), &profile_id)?;
             orchestrator.read_agent_output(AgentOutputRequest {
                 agent_id: params.agent_id,
                 session_id: params.session_id,
                 profile_id,
-                cursor: params.cursor,
+                cursor,
                 limit: params.limit,
             })
         }
