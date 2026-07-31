@@ -28962,9 +28962,6 @@ async fn run_standalone_turn(
     // ── 语音轮 STT（serve 路径）────────────────────────────────────
     // 若 turn 媒体含音频，转写并并入 prompt；并记录"本轮含音频输入"，
     // 供下方决定是否合成语音回复。
-    // ASR language hint from the profile's resolved voice config (captured at
-    // bootstrap from the host config.json `voice` block). `None` → auto-detect.
-    let asr_language: Option<String> = session_runtime.profile.voice.asr_language.clone();
     // `materialize_turn_uploads` returns workspace-RELATIVE paths
     // ("uploads/<name>"). That works for the agent's own tools (cwd =
     // workspace_root), but ominix-api is a SEPARATE process that reads
@@ -28985,6 +28982,42 @@ async fn run_standalone_turn(
             }
         })
         .collect();
+    let had_audio_media = asr_media.iter().any(|p| octos_bus::media::is_audio(p));
+    // Read the profile override for every voice turn instead of freezing it in
+    // the cached SessionRuntime. A Settings save therefore affects the very
+    // next utterance without restarting `octos serve`. Do not touch the store
+    // for text-only turns; a malformed voice setting must not break chat.
+    let asr_language = if had_audio_media {
+        match crate::profiles::effective_profile_asr_language(
+            state.profile_store.as_deref(),
+            Some(&session_runtime.profile.profile_id),
+            session_runtime.profile.voice.asr_language.as_deref(),
+        ) {
+            Ok(language) => language,
+            Err(error) => {
+                tracing::error!(
+                    profile_id = %session_runtime.profile.profile_id,
+                    %error,
+                    "voice_turn: failed to resolve profile ASR language"
+                );
+                try_emit_terminal(
+                    &turn_state,
+                    TerminalReason::Errored,
+                    &ws,
+                    &ledger,
+                    &session_id,
+                    &turn_id,
+                    Some(("profile_config_unavailable", &error.to_string())),
+                    None,
+                )
+                .await;
+                contracts.scopes.evict_turn(&session_id, &turn_id);
+                return;
+            }
+        }
+    } else {
+        None
+    };
     tracing::debug!(media = ?asr_media, "voice_turn: STT input media");
     let voice_transcripts =
         crate::api::voice_turn::transcribe_audio_media(&asr_media, asr_language.as_deref()).await;
@@ -28999,7 +29032,6 @@ async fn run_standalone_turn(
     // silently completed any non-audio-media turn (e.g. text+image) without
     // running the agent. Short-circuit only genuinely empty voice turns:
     // audio present, no transcript, no typed prompt, no other media.
-    let had_audio_media = asr_media.iter().any(|p| octos_bus::media::is_audio(p));
     let had_non_audio_media = asr_media.iter().any(|p| !octos_bus::media::is_audio(p));
     if should_short_circuit_no_speech(
         had_audio_media,
