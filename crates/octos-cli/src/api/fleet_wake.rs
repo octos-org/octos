@@ -1407,6 +1407,7 @@ mod tests {
             7,
             &snap,
             Some(&root),
+            None,
         );
         orch.commit_fleet_keeper_wake(seq_req);
 

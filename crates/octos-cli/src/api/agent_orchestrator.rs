@@ -4126,6 +4126,7 @@ impl InProcessAgentOrchestrator {
                 consecutive_failed_turns: 0,
                 fleet_id: Some(fleet_id.to_owned()),
                 controller_workspace_root: None,
+                controller_workspace_has_runtime_hint: None,
             },
         );
     }
