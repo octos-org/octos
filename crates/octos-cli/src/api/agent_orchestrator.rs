@@ -1081,6 +1081,19 @@ impl InProcessAgentOrchestrator {
         }
     }
 
+    /// Whether a durable supervisor store is configured. The fleet boot-resume
+    /// pass uses this to make a [`Self::commit_fleet_keeper_wake`] result
+    /// unambiguous: WITH a store, a `NotDurable` result can ONLY be a
+    /// persistence rollback (a `Queued` continuation whose persist errored is
+    /// cancelled — see the `Err` arm above), whereas WITHOUT a store
+    /// `NotDurable` is the benign in-memory-only wake. So the pass counts a
+    /// no-store `NotDurable` as a (this-boot-only) success but must NOT count a
+    /// with-store `NotDurable`, which means the wake was rolled back and the
+    /// fleet will not auto-resume.
+    pub(crate) fn has_supervisor_store(&self) -> bool {
+        self.state().supervisor_store.is_some()
+    }
+
     /// Solo-boot loop safety. Loops restored from a PRIOR process's
     /// supervisor store resume firing REAL model turns with nobody having
     /// asked this process for them — a forgotten test loop can burn a turn
@@ -3229,6 +3242,25 @@ impl InProcessAgentOrchestrator {
         Ok(Fleet::bind(store, fleet_id))
     }
 
+    /// The `fleet_id` currently BOUND to `controller`'s goal, or `None` if no
+    /// goal is set for that key. `controller` is the fleet's
+    /// `controller_session_key`, which `goal_plan` binds to the SCOPED goal key
+    /// — the same key the goals map is keyed by — so this is a direct lookup
+    /// (never re-scope an already-scoped key).
+    ///
+    /// The fleet boot-resume pass uses this to skip an ORPHANED fleet: a
+    /// `goal_clear` removes a goal WITHOUT terminalizing its fleet, and a
+    /// re-plan rebinds the controller to a fresh fleet — in both cases the
+    /// keeper's `goal_dispatch` resolves ONLY the current goal's fleet (see
+    /// [`Self::resolve_owned_fleet`]), so a superseded fleet has no keeper to
+    /// drive it and waking it is useless (and would surface stale metadata).
+    pub(crate) fn goal_bound_fleet_id(&self, controller: &SessionKey) -> Option<String> {
+        self.state()
+            .goals
+            .get(controller)
+            .and_then(|goal| goal.fleet_id.clone())
+    }
+
     /// #1857 PR 5a — `goal_plan` tool: lazily create the durable fleet this goal
     /// drives and decompose the objective onto `tasks`. Idempotent — a goal that
     /// already has a `fleet_id` returns "already planned" rather than recreating
@@ -4038,6 +4070,44 @@ impl InProcessAgentOrchestrator {
         }
     }
 
+    /// Test-only: bind `controller`'s goal to `fleet_id` by inserting a minimal
+    /// active goal record — NO persistence, NO goal-continuation enqueue — so a
+    /// fleet boot-resume test can exercise the orphan guard
+    /// ([`Self::goal_bound_fleet_id`]) without the live goal-turn machinery (a
+    /// real `set_goal(active)` would also enqueue a `GoalContinue`). Overwrites
+    /// any existing goal at the (scoped) key.
+    #[cfg(test)]
+    pub(crate) fn bind_goal_fleet_for_test(
+        &self,
+        controller: &SessionKey,
+        profile_id: &str,
+        fleet_id: &str,
+    ) {
+        let key = self.scoped_goal_key(controller);
+        self.state().goals.insert(
+            key,
+            AutonomyGoalRecord {
+                profile_id: profile_id.to_owned(),
+                goal_id: "goal_test".to_owned(),
+                objective: "obj".to_owned(),
+                status: "active".to_owned(),
+                token_budget: 1_000_000,
+                tokens_used: 0,
+                time_used_seconds: 0,
+                created_at_ms: 0,
+                updated_at_ms: 0,
+                continuations_used: 0,
+                last_continued_at_ms: 0,
+                rate_window_start_ms: 0,
+                rate_window_count: 0,
+                wrap_up_emitted: false,
+                consecutive_failed_turns: 0,
+                fleet_id: Some(fleet_id.to_owned()),
+                controller_workspace_root: None,
+            },
+        );
+    }
+
     /// PR 5a — the goal's stashed controller workspace root (re-scoped).
     #[cfg(test)]
     pub(crate) fn goal_workspace_root_for_test(&self, session_id: &SessionKey) -> Option<String> {
@@ -4261,6 +4331,34 @@ impl InProcessAgentOrchestrator {
         self.state()
             .continuations
             .pending_count_for_session(&session_id.to_string(), profile_id)
+    }
+
+    /// Test-only: snapshot the pending fleet-keeper (`External(fleet_keeper_wake)`)
+    /// continuations as `(session_id, dedupe_key, fleet_id metadata)`. Filters
+    /// out unrelated continuations (e.g. a goal's `GoalContinue`) so a
+    /// boot-resume test can assert exactly which fleets were woken and that
+    /// their dedupe keys are distinct.
+    #[cfg(test)]
+    pub(crate) fn pending_fleet_keeper_wakes_for_test(
+        &self,
+    ) -> Vec<(String, String, Option<String>)> {
+        self.state()
+            .continuations
+            .pending_items()
+            .filter(|it| {
+                matches!(
+                    &it.reason,
+                    MasterContinuationReason::External(kind) if kind == FLEET_KEEPER_EXTERNAL_KIND
+                )
+            })
+            .map(|it| {
+                (
+                    it.session_id.as_str().to_owned(),
+                    it.dedupe_key.as_str().to_owned(),
+                    it.metadata.get(FLEET_KEEPER_META_FLEET_ID).cloned(),
+                )
+            })
+            .collect()
     }
 
     #[cfg(test)]

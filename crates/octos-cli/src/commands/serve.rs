@@ -956,6 +956,43 @@ impl ServeCommand {
             }
         }
 
+        // Boot-resume — "a fleet survives an octos restart". The boot reconcile
+        // above flipped any restart-interrupted fleet's in-flight children back
+        // to `Ready`, but emitted NO outbox event — so the outbox consumer never
+        // wakes the keeper and an in-progress fleet would STALL forever after a
+        // restart (nothing re-dispatches its ready tasks). Now that the worker
+        // pool is installed, enqueue a keeper wake for every live fleet with a
+        // launchable child; the global master-continuation drain (started below,
+        // ~5s poll) picks them up on its next tick → PR-4b reseed pre-pass →
+        // `run_standalone_turn` → the keeper's `goal_dispatch` re-launches the
+        // ready set. Gated on a reconciled store AND an installed pool (no pool ⇒
+        // nothing to dispatch onto). Re-fetch the store here: the local binding
+        // was moved into the outbox consumer / worker pool above.
+        let boot_resume_orchestrator = crate::api::agent_orchestrator::default_agent_orchestrator();
+        let boot_resume_store =
+            if fleet_reconciled && boot_resume_orchestrator.fleet_pool().is_some() {
+                boot_resume_orchestrator.fleet_store()
+            } else {
+                None
+            };
+        if let Some(store) = boot_resume_store {
+            let now_ms = chrono::Utc::now().timestamp_millis().max(0) as u64;
+            match crate::api::fleet_wake::enqueue_fleet_boot_resume_wakes(
+                &store,
+                boot_resume_orchestrator,
+                now_ms,
+            )
+            .await
+            {
+                Ok(n) if n > 0 => tracing::info!(
+                    fleets = n,
+                    "fleet boot-resume: re-woke keepers for restart-stranded fleets"
+                ),
+                Ok(_) => {}
+                Err(error) => tracing::warn!(%error, "fleet boot-resume wake pass failed"),
+            }
+        }
+
         let session_cache = Arc::new(
             crate::runtime::SessionRuntimeCache::new(64, std::time::Duration::from_secs(1800))
                 // Per-project session storage (opt-in, default off). When set,
