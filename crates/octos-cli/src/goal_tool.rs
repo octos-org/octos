@@ -22,7 +22,9 @@ use async_trait::async_trait;
 use eyre::Result;
 use octos_agent::tools::{Tool, ToolContext, ToolResult};
 use octos_core::SessionKey;
-use octos_fleet::{AcceptanceCriterion, TaskSpec, Verifier};
+use octos_fleet::{
+    AcceptanceCriterion, BASE_TOOLS, FsGrant, NetworkGrant, TaskSpec, Verifier, WorkerGrant,
+};
 use serde_json::{Value, json};
 
 use crate::api::agent_orchestrator::default_agent_orchestrator;
@@ -102,15 +104,135 @@ fn parse_task_specs(args: &Value) -> Result<Vec<TaskSpec>, String> {
                     .collect()
             })
             .unwrap_or_default();
+        let grant = parse_grant(task.get("grant"), &task_id)?;
         out.push(TaskSpec {
             task_id,
             title,
             detail,
             deps,
             acceptance,
+            grant,
         });
     }
     Ok(out)
+}
+
+/// PR A — parse a task's optional operator `grant` object into a
+/// [`WorkerGrant`]. The master PROVISIONS each worker like an operator: it
+/// grants exactly the network hosts / tools / paths a task needs, default-deny.
+/// An absent (or null) grant is [`WorkerGrant::minimal`] — today's closed
+/// worker (least privilege). Validated against the grantable catalog before it
+/// can reach the store, so an unknown tool (or a web tool with no network) is
+/// rejected at plan time.
+///
+/// Wire shape:
+/// `{ "network": { "mode": "none"|"hosts"|"full", "hosts": ["example.com"] },
+///    "tools": ["read_file", ..., "web_fetch"],
+///    "fs": "workspace"|"host" }`
+///
+/// `fs` is the coarse binary scope (v1 has no per-path allowlist — see
+/// [`parse_fs`]), NOT a `{read, write}` path object.
+fn parse_grant(value: Option<&Value>, task_id: &str) -> Result<WorkerGrant, String> {
+    let value = match value {
+        None | Some(Value::Null) => return Ok(WorkerGrant::minimal()),
+        Some(value) => value,
+    };
+    let obj = value
+        .as_object()
+        .ok_or_else(|| format!("task `{task_id}`: `grant` must be an object"))?;
+
+    let network = match obj.get("network") {
+        None | Some(Value::Null) => NetworkGrant::None,
+        Some(network) => parse_network(network, task_id)?,
+    };
+
+    let tools = match obj.get("tools") {
+        None | Some(Value::Null) => BASE_TOOLS.iter().map(|s| (*s).to_string()).collect(),
+        Some(Value::Array(items)) => {
+            let mut tools = Vec::with_capacity(items.len());
+            for item in items {
+                let name = item
+                    .as_str()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .ok_or_else(|| {
+                        format!("task `{task_id}`: each `grant.tools` entry must be a tool name")
+                    })?;
+                tools.push(name.to_owned());
+            }
+            tools
+        }
+        Some(_) => return Err(format!("task `{task_id}`: `grant.tools` must be an array")),
+    };
+
+    let fs = match obj.get("fs") {
+        None | Some(Value::Null) => FsGrant::Workspace,
+        Some(fs) => parse_fs(fs, task_id)?,
+    };
+
+    let grant = WorkerGrant { network, tools, fs };
+    grant
+        .validate()
+        .map_err(|e| format!("task `{task_id}`: {e}"))?;
+    Ok(grant)
+}
+
+/// Parse `{ "mode": "none"|"hosts"|"full", "hosts": [...] }` into a
+/// [`NetworkGrant`]. `hosts` mode requires a non-empty allowlist.
+fn parse_network(value: &Value, task_id: &str) -> Result<NetworkGrant, String> {
+    let obj = value
+        .as_object()
+        .ok_or_else(|| format!("task `{task_id}`: `grant.network` must be an object"))?;
+    let mode = obj
+        .get("mode")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or("none");
+    match mode {
+        "none" => Ok(NetworkGrant::None),
+        "full" => Ok(NetworkGrant::Full),
+        "hosts" => {
+            let hosts: Vec<String> = obj
+                .get("hosts")
+                .and_then(Value::as_array)
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_owned)
+                        .collect()
+                })
+                .unwrap_or_default();
+            if hosts.is_empty() {
+                return Err(format!(
+                    "task `{task_id}`: network mode `hosts` requires a non-empty `hosts` allowlist"
+                ));
+            }
+            Ok(NetworkGrant::Hosts(hosts))
+        }
+        other => Err(format!(
+            "task `{task_id}`: unknown network mode `{other}` (use `none`, `hosts`, or `full`)"
+        )),
+    }
+}
+
+/// Parse the coarse `fs` scope — the string `"workspace"` (cwd-only, the
+/// default) or `"host"` (full daemon-user read+write). v1 is deliberately
+/// binary: the native tools have no per-path allowlist, so a narrow-paths grant
+/// is not offered here (it would falsely promise narrow but deliver host-wide).
+fn parse_fs(value: &Value, task_id: &str) -> Result<FsGrant, String> {
+    let mode = value.as_str().map(str::trim).ok_or_else(|| {
+        format!("task `{task_id}`: `grant.fs` must be the string \"workspace\" or \"host\"")
+    })?;
+    match mode.to_ascii_lowercase().as_str() {
+        "workspace" => Ok(FsGrant::Workspace),
+        "host" => Ok(FsGrant::Host),
+        other => Err(format!(
+            "task `{task_id}`: unknown fs scope `{other}` (use \"workspace\" or \"host\")"
+        )),
+    }
 }
 
 /// Statuses the MODEL may set via `goal_update`. Everything else is
@@ -150,7 +272,10 @@ impl Tool for GoalGetTool {
          goal_plan), also returns a `fleet` object with the objective, per-task \
          title/status/verdict, the ready set, and status counts — call this after a \
          fleet-completion wake to see progress and, when every task is accepted, the goal \
-         auto-transitions to complete. Returns status=none when no goal is set."
+         auto-transitions to complete. A task with status `Blocked` and a `pending_escalation` \
+         (a worker's `reason` + advisory `requested_grant`) is waiting on YOUR operator decision: \
+         call goal_grant (widen its grant + resume it) or goal_deny (fail it). Returns status=none \
+         when no goal is set."
     }
 
     fn input_schema(&self) -> Value {
@@ -235,7 +360,17 @@ impl Tool for GoalPlanTool {
          to launch ready tasks. Requires a live session (the workspace root is captured then). \
          Each task runs in its OWN isolated scratch directory (replay-safe), NOT your repo \
          checkout: v1 fleet tasks do self-contained local work, not in-repo edits to the \
-         controller's files — in-repo/remote-mutating goals are out of v1 scope."
+         controller's files — in-repo/remote-mutating goals are out of v1 scope. \
+         \
+         YOU are the operator: provision each worker's capabilities with an optional per-task \
+         `grant` — least privilege by default. Omit `grant` and the worker gets exactly today's \
+         closed set (no network, the base file tools read/write/edit/glob/grep/list_dir/shell, \
+         its own scratch dir). Grant MORE only where a task needs it: `network.mode`=`hosts` \
+         with a `hosts` allowlist lets its web_fetch reach ONLY those hosts (the shell still has \
+         no raw network); `network.mode`=`full` gives raw egress (git/npm); add `web_fetch`/\
+         `web_search` to `tools` (they require a network grant); set `fs`=`host` ONLY when a task \
+         needs the full host filesystem (it is broad — the default scratch-dir scope covers most \
+         work). Grant each task the minimum it needs."
     }
 
     fn input_schema(&self) -> Value {
@@ -270,6 +405,40 @@ impl Tool for GoalPlanTool {
                                 "type": "array",
                                 "items": { "type": "string" },
                                 "description": "Shell commands (split argv, no shell) that must each exit 0 for the task to be accepted. Omit for a task with no mechanical check."
+                            },
+                            "grant": {
+                                "type": "object",
+                                "description": "Optional operator capability grant for THIS task's worker. Omit for least privilege (today's closed worker: no network, base file tools, own scratch dir). Grant more only where needed.",
+                                "properties": {
+                                    "network": {
+                                        "type": "object",
+                                        "description": "Network egress for the worker. Omit = none.",
+                                        "properties": {
+                                            "mode": {
+                                                "type": "string",
+                                                "enum": ["none", "hosts", "full"],
+                                                "description": "none = no network; hosts = only the listed hosts, via web_fetch only (the shell still has no raw network); full = raw egress (git/npm)."
+                                            },
+                                            "hosts": {
+                                                "type": "array",
+                                                "items": { "type": "string" },
+                                                "description": "Allowlisted hosts (required, non-empty, when mode=hosts). web_fetch may reach only these hosts and their subdomains."
+                                            }
+                                        },
+                                        "additionalProperties": false
+                                    },
+                                    "tools": {
+                                        "type": "array",
+                                        "items": { "type": "string" },
+                                        "description": "The tools the worker may hold. Omit = the base file tools (read_file/write_file/edit_file/glob/grep/list_dir/shell). Add web_fetch/web_search (each REQUIRES a network grant)."
+                                    },
+                                    "fs": {
+                                        "type": "string",
+                                        "enum": ["workspace", "host"],
+                                        "description": "Filesystem reach. Omit = workspace (the worker's own scratch dir only, read+write). host = FULL daemon-user filesystem read+write (broad — grant only when a task genuinely needs host access). v1 is binary: narrow per-path grants are not yet supported."
+                                    }
+                                },
+                                "additionalProperties": false
                             }
                         },
                         "required": ["task_id", "title"],
@@ -350,7 +519,9 @@ impl Tool for GoalDispatchTool {
          Each launched task runs to completion in the background and wakes this goal when it \
          finishes, so the loop is: goal_dispatch → (workers run) → wake → goal_get to see \
          progress → goal_dispatch again for the newly-ready tasks, until goal_get reports all \
-         tasks accepted. Safe to call repeatedly — already-running tasks are not relaunched."
+         tasks accepted. Safe to call repeatedly — already-running tasks are not relaunched. If a \
+         woken task is `Blocked` on a `pending_escalation`, resolve it with goal_grant or goal_deny \
+         (not goal_dispatch) before it can run again."
     }
 
     fn input_schema(&self) -> Value {
@@ -387,6 +558,237 @@ impl Tool for GoalDispatchTool {
             }),
             Err(message) => Ok(ToolResult {
                 output: format!("goal_dispatch: {message}"),
+                success: false,
+                ..Default::default()
+            }),
+        }
+    }
+}
+
+/// PR B — `goal_grant`: APPROVE a worker's mid-task escalation, widen the task's
+/// grant, and resume it.
+pub struct GoalGrantTool {
+    profile_id: String,
+}
+
+impl GoalGrantTool {
+    pub fn new(profile_id: impl Into<String>) -> Self {
+        Self {
+            profile_id: profile_id.into(),
+        }
+    }
+}
+
+#[async_trait]
+impl Tool for GoalGrantTool {
+    fn name(&self) -> &str {
+        "goal_grant"
+    }
+
+    fn description(&self) -> &str {
+        "APPROVE a fleet worker's mid-task escalation: widen the blocked task's operator grant \
+         and resume it (a fresh attempt re-runs with the new capability; its scratch dir \
+         persists). Use when goal_get shows a task with status `Blocked` and a `pending_escalation` \
+         — read the worker's `reason` and its advisory `requested_grant`, then decide. Pass the \
+         `task_id`. Omit `grant` to approve the worker's requested grant as-is, OR pass a `grant` \
+         (same shape as goal_plan's task grant) to grant LESS — you are the operator and may narrow \
+         what it asked for (e.g. a tighter host allowlist). The grant is validated exactly as at \
+         plan time. To refuse instead, use goal_deny."
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "task_id": {
+                    "type": "string",
+                    "description": "The Blocked task whose escalation you are approving."
+                },
+                "grant": {
+                    "type": "object",
+                    "description": "Optional operator grant to apply (same shape as goal_plan's task grant: network/tools/fs). Omit to approve the worker's requested grant as-is; provide to grant LESS.",
+                    "properties": {
+                        "network": {
+                            "type": "object",
+                            "properties": {
+                                "mode": { "type": "string", "enum": ["none", "hosts", "full"] },
+                                "hosts": { "type": "array", "items": { "type": "string" } }
+                            },
+                            "additionalProperties": false
+                        },
+                        "tools": { "type": "array", "items": { "type": "string" } },
+                        "fs": { "type": "string", "enum": ["workspace", "host"] }
+                    },
+                    "additionalProperties": false
+                }
+            },
+            "required": ["task_id"],
+            "additionalProperties": false
+        })
+    }
+
+    async fn execute(&self, args: &Value) -> Result<ToolResult> {
+        self.execute_with_context(&ToolContext::zero(), args).await
+    }
+
+    async fn execute_with_context(&self, ctx: &ToolContext, args: &Value) -> Result<ToolResult> {
+        let Some(session_id) = session_from_ctx(ctx) else {
+            return Ok(ToolResult {
+                output: "goal_grant: no session context for this turn".into(),
+                success: false,
+                ..Default::default()
+            });
+        };
+        let Some(task_id) = args
+            .get("task_id")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        else {
+            return Ok(ToolResult {
+                output: "goal_grant: `task_id` is required".into(),
+                success: false,
+                ..Default::default()
+            });
+        };
+        // Absent/null grant → approve as-requested (None); a supplied grant is
+        // parsed + validated exactly like a plan-time grant.
+        let grant = match args.get("grant") {
+            None | Some(Value::Null) => None,
+            Some(value) => match parse_grant(Some(value), task_id) {
+                Ok(grant) => Some(grant),
+                Err(message) => {
+                    return Ok(ToolResult {
+                        output: format!("goal_grant: {message}"),
+                        success: false,
+                        ..Default::default()
+                    });
+                }
+            },
+        };
+        match default_agent_orchestrator()
+            .model_grant_escalation(
+                &session_id,
+                &self.profile_id,
+                task_id,
+                grant,
+                fleet_now_ms(),
+            )
+            .await
+        {
+            Ok(outcome) => Ok(ToolResult {
+                output: format!(
+                    "goal_grant:\n{}",
+                    serde_json::to_string_pretty(&outcome).unwrap_or_else(|_| outcome.to_string())
+                ),
+                success: true,
+                ..Default::default()
+            }),
+            Err(message) => Ok(ToolResult {
+                output: format!("goal_grant: {message}"),
+                success: false,
+                ..Default::default()
+            }),
+        }
+    }
+}
+
+/// PR B — `goal_deny`: REFUSE a worker's mid-task escalation, failing the task.
+pub struct GoalDenyTool {
+    profile_id: String,
+}
+
+impl GoalDenyTool {
+    pub fn new(profile_id: impl Into<String>) -> Self {
+        Self {
+            profile_id: profile_id.into(),
+        }
+    }
+}
+
+#[async_trait]
+impl Tool for GoalDenyTool {
+    fn name(&self) -> &str {
+        "goal_deny"
+    }
+
+    fn description(&self) -> &str {
+        "REFUSE a fleet worker's mid-task escalation: the blocked task cannot proceed without a \
+         capability you are not willing to grant, so FAIL it (terminal). Use when goal_get shows a \
+         Blocked task with a `pending_escalation` you decide not to approve. Pass the `task_id` and \
+         a short `reason`. This is terminal — the task will not re-run; the fleet then completes \
+         around it (a Blocked task left undecided would wedge the goal forever, so decide every \
+         escalation with either goal_grant or goal_deny). To approve instead, use goal_grant."
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "task_id": {
+                    "type": "string",
+                    "description": "The Blocked task whose escalation you are refusing."
+                },
+                "reason": {
+                    "type": "string",
+                    "description": "One-line reason for refusing (recorded on the failed task)."
+                }
+            },
+            "required": ["task_id"],
+            "additionalProperties": false
+        })
+    }
+
+    async fn execute(&self, args: &Value) -> Result<ToolResult> {
+        self.execute_with_context(&ToolContext::zero(), args).await
+    }
+
+    async fn execute_with_context(&self, ctx: &ToolContext, args: &Value) -> Result<ToolResult> {
+        let Some(session_id) = session_from_ctx(ctx) else {
+            return Ok(ToolResult {
+                output: "goal_deny: no session context for this turn".into(),
+                success: false,
+                ..Default::default()
+            });
+        };
+        let Some(task_id) = args
+            .get("task_id")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        else {
+            return Ok(ToolResult {
+                output: "goal_deny: `task_id` is required".into(),
+                success: false,
+                ..Default::default()
+            });
+        };
+        let reason = args
+            .get("reason")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("escalation refused by the operator");
+        match default_agent_orchestrator()
+            .model_deny_escalation(
+                &session_id,
+                &self.profile_id,
+                task_id,
+                reason,
+                fleet_now_ms(),
+            )
+            .await
+        {
+            Ok(outcome) => Ok(ToolResult {
+                output: format!(
+                    "goal_deny:\n{}",
+                    serde_json::to_string_pretty(&outcome).unwrap_or_else(|_| outcome.to_string())
+                ),
+                success: true,
+                ..Default::default()
+            }),
+            Err(message) => Ok(ToolResult {
+                output: format!("goal_deny: {message}"),
                 success: false,
                 ..Default::default()
             }),
@@ -600,5 +1002,122 @@ impl Tool for GoalCreateTool {
                 ..Default::default()
             }),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn goal_plan_absent_grant_is_minimal() {
+        // A task with no `grant` is today's closed worker (least privilege).
+        let args = json!({
+            "tasks": [ { "task_id": "t1", "title": "do it" } ]
+        });
+        let specs = parse_task_specs(&args).expect("parses");
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].grant, WorkerGrant::minimal());
+    }
+
+    #[test]
+    fn goal_plan_parses_per_task_grant() {
+        // The master provisions a worker: hosts-restricted network + web_fetch +
+        // host filesystem. The parsed grant matches exactly.
+        let args = json!({
+            "tasks": [ {
+                "task_id": "fetch",
+                "title": "grab the report",
+                "grant": {
+                    "network": { "mode": "hosts", "hosts": ["example.com", "docs.example.com"] },
+                    "tools": ["read_file", "write_file", "web_fetch"],
+                    "fs": "host"
+                }
+            } ]
+        });
+        let specs = parse_task_specs(&args).expect("parses");
+        let grant = &specs[0].grant;
+        assert_eq!(
+            grant.network,
+            NetworkGrant::Hosts(vec!["example.com".into(), "docs.example.com".into()]),
+        );
+        assert_eq!(grant.tools, vec!["read_file", "write_file", "web_fetch"]);
+        assert_eq!(grant.fs, FsGrant::Host);
+        // A `full` grant parses to raw egress; omitted fs = Workspace.
+        let full = json!({
+            "tasks": [ {
+                "task_id": "build",
+                "title": "npm install",
+                "grant": { "network": { "mode": "full" }, "tools": ["shell", "web_fetch"] }
+            } ]
+        });
+        let specs = parse_task_specs(&full).expect("parses");
+        assert_eq!(specs[0].grant.network, NetworkGrant::Full);
+        assert_eq!(specs[0].grant.fs, FsGrant::Workspace);
+    }
+
+    #[test]
+    fn goal_plan_rejects_empty_hosts_allowlist() {
+        // Fail-closed: `hosts` with no hosts is rejected at parse (the operator
+        // meant `none`; an empty allowlist must never read as "unrestricted").
+        let args = json!({
+            "tasks": [ {
+                "task_id": "t1",
+                "title": "do it",
+                "grant": { "network": { "mode": "hosts", "hosts": [] }, "tools": ["web_fetch"] }
+            } ]
+        });
+        let err = parse_task_specs(&args).expect_err("empty hosts rejected");
+        assert!(
+            err.contains("hosts"),
+            "error names the empty allowlist: {err}"
+        );
+    }
+
+    #[test]
+    fn goal_plan_rejects_unknown_granted_tool() {
+        let args = json!({
+            "tasks": [ {
+                "task_id": "t1",
+                "title": "do it",
+                "grant": { "tools": ["read_file", "not_a_real_tool"] }
+            } ]
+        });
+        let err = parse_task_specs(&args).expect_err("unknown tool rejected");
+        assert!(
+            err.contains("not_a_real_tool"),
+            "error names the tool: {err}"
+        );
+    }
+
+    #[test]
+    fn goal_plan_rejects_web_tool_without_network() {
+        // web_fetch under the default (none) network is incoherent.
+        let args = json!({
+            "tasks": [ {
+                "task_id": "t1",
+                "title": "do it",
+                "grant": { "tools": ["read_file", "web_fetch"] }
+            } ]
+        });
+        let err = parse_task_specs(&args).expect_err("web tool without network rejected");
+        assert!(err.contains("web_fetch"), "error names the tool: {err}");
+        assert!(err.contains("network"), "error explains the fix: {err}");
+    }
+
+    #[test]
+    fn goal_plan_rejects_hosts_mode_without_hosts() {
+        let args = json!({
+            "tasks": [ {
+                "task_id": "t1",
+                "title": "do it",
+                "grant": { "network": { "mode": "hosts" }, "tools": ["read_file", "web_fetch"] }
+            } ]
+        });
+        let err = parse_task_specs(&args).expect_err("empty hosts rejected");
+        assert!(
+            err.contains("hosts"),
+            "error names the missing allowlist: {err}"
+        );
     }
 }

@@ -877,20 +877,24 @@ impl ServeCommand {
                 });
             match keeper {
                 Some(rt) => {
-                    // PR-3 requires a network-isolated sandbox: the closed worker
-                    // tool set is a denylist, not a boundary, so the shell's
-                    // reach is bounded only by the sandbox. Force
-                    // `allow_network = false` regardless of the profile default.
+                    // PR-3 requires a network-isolated sandbox: the worker tool
+                    // set is a denylist, not a boundary, so the shell's reach is
+                    // bounded only by the sandbox. Base the sandbox on the profile
+                    // default with network OFF; PR A re-enables raw egress
+                    // PER-ATTEMPT only for a `Full` network grant (see the factory
+                    // closure below). `None`/`Hosts` keep it off (`Hosts` is
+                    // enforced by the granted web tools, not raw egress).
                     let mut sandbox_cfg = rt.default_sandbox.clone();
                     sandbox_cfg.allow_network = false;
                     // #1857 PR 5a fix (HIGH 1) — FAIL CLOSED: install the pool
-                    // ONLY when the forced-no-network sandbox is a REAL isolating
-                    // backend. A disabled sandbox (or `Auto` with no backend on
-                    // this host) yields `NoSandbox` = unbounded shell reach
-                    // (curl / git push / host access), breaking PR-3's
-                    // replay-safe boundary. Leave the pool unset so goal_dispatch
-                    // cleanly reports "unavailable" instead of running a fleet
-                    // worker unsandboxed with network.
+                    // ONLY when the sandbox is a REAL isolating backend. A
+                    // disabled sandbox (or `Auto` with no backend on this host)
+                    // yields `NoSandbox` = unbounded shell reach (curl / git push
+                    // / host access), breaking PR-3's replay-safe boundary. The
+                    // isolation of the BACKEND is independent of the network flag,
+                    // so probing with network off is sufficient. Leave the pool
+                    // unset so goal_dispatch cleanly reports "unavailable" instead
+                    // of running a fleet worker unsandboxed.
                     if !fleet_sandbox_is_isolating(&sandbox_cfg) {
                         tracing::error!(
                             keeper_profile = %rt.profile_id,
@@ -900,10 +904,15 @@ impl ServeCommand {
                              will report the pool unavailable."
                         );
                     } else {
+                        // PR A — the SandboxFactory takes the per-attempt
+                        // `allow_network` derived from the task's grant: `Full` →
+                        // true (raw egress for git/npm), `None`/`Hosts` → false.
                         let sandbox_factory: octos_fleet_worker::SandboxFactory =
-                            Arc::new(move |_cwd: &std::path::Path| {
+                            Arc::new(move |_cwd: &std::path::Path, allow_network: bool| {
+                                let mut cfg = sandbox_cfg.clone();
+                                cfg.allow_network = allow_network;
                                 Arc::<dyn octos_agent::sandbox::Sandbox>::from(
-                                    octos_agent::sandbox::create_sandbox(&sandbox_cfg),
+                                    octos_agent::sandbox::create_sandbox(&cfg),
                                 )
                             });
                         let factory = Arc::new(octos_fleet_worker::AgentFactory::new(
@@ -944,6 +953,43 @@ impl ServeCommand {
                     "no bootstrapped profile runtime; fleet worker pool not built \
                      (goal_dispatch will report the pool unavailable)"
                 ),
+            }
+        }
+
+        // Boot-resume — "a fleet survives an octos restart". The boot reconcile
+        // above flipped any restart-interrupted fleet's in-flight children back
+        // to `Ready`, but emitted NO outbox event — so the outbox consumer never
+        // wakes the keeper and an in-progress fleet would STALL forever after a
+        // restart (nothing re-dispatches its ready tasks). Now that the worker
+        // pool is installed, enqueue a keeper wake for every live fleet with a
+        // launchable child; the global master-continuation drain (started below,
+        // ~5s poll) picks them up on its next tick → PR-4b reseed pre-pass →
+        // `run_standalone_turn` → the keeper's `goal_dispatch` re-launches the
+        // ready set. Gated on a reconciled store AND an installed pool (no pool ⇒
+        // nothing to dispatch onto). Re-fetch the store here: the local binding
+        // was moved into the outbox consumer / worker pool above.
+        let boot_resume_orchestrator = crate::api::agent_orchestrator::default_agent_orchestrator();
+        let boot_resume_store =
+            if fleet_reconciled && boot_resume_orchestrator.fleet_pool().is_some() {
+                boot_resume_orchestrator.fleet_store()
+            } else {
+                None
+            };
+        if let Some(store) = boot_resume_store {
+            let now_ms = chrono::Utc::now().timestamp_millis().max(0) as u64;
+            match crate::api::fleet_wake::enqueue_fleet_boot_resume_wakes(
+                &store,
+                boot_resume_orchestrator,
+                now_ms,
+            )
+            .await
+            {
+                Ok(n) if n > 0 => tracing::info!(
+                    fleets = n,
+                    "fleet boot-resume: re-woke keepers for restart-stranded fleets"
+                ),
+                Ok(_) => {}
+                Err(error) => tracing::warn!(%error, "fleet boot-resume wake pass failed"),
             }
         }
 
@@ -1786,6 +1832,7 @@ mod tests {
                 detail: "d".to_owned(),
                 deps: Vec::new(),
                 acceptance: Vec::new(),
+                grant: octos_fleet::WorkerGrant::minimal(),
             }],
             1,
         )

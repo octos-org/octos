@@ -4506,6 +4506,7 @@ dependencies = [
  "chromiumoxide",
  "chrono",
  "dirs",
+ "dunce",
  "eyre",
  "flate2",
  "futures",

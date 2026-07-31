@@ -12,6 +12,7 @@ use octos_agent::sandbox::{NoSandbox, Sandbox};
 use octos_core::{Message, SessionKey};
 use octos_fleet::{
     AcceptanceCriterion, Fleet, FleetBudget, FleetKernelStore, LaunchOutcome, TaskSpec, Verifier,
+    WorkerGrant,
 };
 use octos_llm::{ChatConfig, ChatResponse, LlmProvider, StopReason, ToolSpec};
 use octos_memory::EpisodeStore;
@@ -52,14 +53,26 @@ pub async fn fresh_memory() -> (TempDir, Arc<EpisodeStore>) {
     (dir, Arc::new(memory))
 }
 
-/// A `TaskSpec` with the given deps + acceptance.
+/// A `TaskSpec` with the given deps + acceptance and the minimal (least-privilege)
+/// worker grant — today's closed worker.
 pub fn task_spec(id: &str, deps: &[&str], acceptance: Vec<AcceptanceCriterion>) -> TaskSpec {
+    task_spec_granted(id, deps, acceptance, WorkerGrant::minimal())
+}
+
+/// A `TaskSpec` carrying an explicit [`WorkerGrant`] (for grant-driven tests).
+pub fn task_spec_granted(
+    id: &str,
+    deps: &[&str],
+    acceptance: Vec<AcceptanceCriterion>,
+    grant: WorkerGrant,
+) -> TaskSpec {
     TaskSpec {
         task_id: id.to_string(),
         title: format!("Task {id}"),
         detail: "do the thing".to_string(),
         deps: deps.iter().map(|s| s.to_string()).collect(),
         acceptance,
+        grant,
     }
 }
 
@@ -173,7 +186,7 @@ pub async fn factory_for(provider: Arc<dyn LlmProvider>) -> (TempDir, AgentFacto
     let factory = AgentFactory::new(
         provider,
         memory,
-        Arc::new(|_| Arc::new(MarkerSandbox) as Arc<dyn Sandbox>),
+        Arc::new(|_, _| Arc::new(MarkerSandbox) as Arc<dyn Sandbox>),
     );
     (dir, factory)
 }
@@ -251,6 +264,127 @@ impl LlmProvider for WriteFileProvider {
             });
         }
         Ok(end_turn("wrote the artifact"))
+    }
+    fn model_id(&self) -> &str {
+        "mock"
+    }
+    fn provider_name(&self) -> &str {
+        "mock"
+    }
+}
+
+/// Calls the always-on `escalate` tool on the first turn (requesting a wider
+/// grant), then ends. Proves an escalation mid-turn yields the attempt
+/// NON-terminally. `then_sleep` optionally holds AFTER escalating so a test can
+/// drive the turn to the DEADLINE and prove the escalation still wins
+/// (determinism), rather than ending cleanly with EndTurn.
+pub struct EscalateProvider {
+    pub reason: String,
+    pub then_sleep: Option<Duration>,
+    calls: AtomicUsize,
+}
+
+impl EscalateProvider {
+    pub fn new(reason: &str) -> Self {
+        Self {
+            reason: reason.to_string(),
+            then_sleep: None,
+            calls: AtomicUsize::new(0),
+        }
+    }
+
+    /// After escalating, sleep `hold` so the attempt hits the deadline while the
+    /// slot is already set — the escalation must still win.
+    pub fn then_sleeping(reason: &str, hold: Duration) -> Self {
+        Self {
+            reason: reason.to_string(),
+            then_sleep: Some(hold),
+            calls: AtomicUsize::new(0),
+        }
+    }
+}
+
+#[async_trait]
+impl LlmProvider for EscalateProvider {
+    async fn chat(&self, _m: &[Message], _t: &[ToolSpec], _c: &ChatConfig) -> Result<ChatResponse> {
+        if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+            return Ok(ChatResponse {
+                content: None,
+                reasoning_content: None,
+                tool_calls: vec![octos_core::ToolCall {
+                    id: "call_escalate".to_string(),
+                    name: "escalate".to_string(),
+                    arguments: serde_json::json!({
+                        "reason": self.reason,
+                        "requested_grant": {
+                            "network": { "mode": "hosts", "hosts": ["example.com"] },
+                            "tools": ["read_file", "write_file", "shell", "web_fetch"],
+                        },
+                    }),
+                    metadata: None,
+                }],
+                stop_reason: StopReason::ToolUse,
+                usage: usage(),
+                provider_index: None,
+            });
+        }
+        if let Some(hold) = self.then_sleep {
+            tokio::time::sleep(hold).await;
+        }
+        Ok(end_turn("escalated; awaiting the operator"))
+    }
+    fn model_id(&self) -> &str {
+        "mock"
+    }
+    fn provider_name(&self) -> &str {
+        "mock"
+    }
+}
+
+/// Writes `path` via `write_file`, then ends — but only when a specific grant
+/// tool is available. Used to prove a fresh attempt after a grant widen rebuilds
+/// with the NEW capabilities: it records which tool NAMES it was offered.
+pub struct RecordingWriteProvider {
+    pub path: String,
+    pub seen_tools: Arc<std::sync::Mutex<Vec<String>>>,
+    calls: AtomicUsize,
+}
+
+impl RecordingWriteProvider {
+    pub fn new(path: &str, seen_tools: Arc<std::sync::Mutex<Vec<String>>>) -> Self {
+        Self {
+            path: path.to_string(),
+            seen_tools,
+            calls: AtomicUsize::new(0),
+        }
+    }
+}
+
+#[async_trait]
+impl LlmProvider for RecordingWriteProvider {
+    async fn chat(&self, _m: &[Message], t: &[ToolSpec], _c: &ChatConfig) -> Result<ChatResponse> {
+        if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+            // Record the tool names the fresh attempt was offered — the audit
+            // point for "rebuilt from the widened grant".
+            *self.seen_tools.lock().unwrap() = t.iter().map(|s| s.name.clone()).collect();
+            return Ok(ChatResponse {
+                content: None,
+                reasoning_content: None,
+                tool_calls: vec![octos_core::ToolCall {
+                    id: "call_write".to_string(),
+                    name: "write_file".to_string(),
+                    arguments: serde_json::json!({
+                        "path": self.path,
+                        "content": "post-grant artifact\n",
+                    }),
+                    metadata: None,
+                }],
+                stop_reason: StopReason::ToolUse,
+                usage: usage(),
+                provider_index: None,
+            });
+        }
+        Ok(end_turn("wrote the artifact after the grant widen"))
     }
     fn model_id(&self) -> &str {
         "mock"

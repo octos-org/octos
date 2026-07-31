@@ -39,9 +39,12 @@ use eyre::{Result, eyre};
 use tokio::sync::{Mutex, Semaphore};
 use tokio::task::JoinHandle;
 
+use octos_agent::TokenTracker;
 use octos_core::safe_filename;
 use octos_fleet::{AcceptanceVerdict, ChildResultSnapshot, Fleet, FleetKernelStore, LaunchOutcome};
 
+use crate::escalate::EscalationSlot;
+use crate::worker::{escalation_tokens_with_floor, tracked_tokens};
 use crate::{AgentFactory, AttemptOutcome, run_attempt};
 
 /// Static configuration for a [`FleetWorkerPool`].
@@ -232,17 +235,40 @@ impl FleetWorkerPool {
         let per_fleet_concurrency = self.cfg.per_fleet_concurrency;
         let deadline = self.cfg.deadline;
         let owner_epoch = self.cfg.owner_epoch;
+        // PR B (codex round-4, defect 1) — the exact reservation `launch_child`
+        // just placed (== the attempt's `reserved_tokens`), threaded into both
+        // `run_attempt` and the LaunchGuard as the RELIABLE never-zero escalation
+        // floor (no fallible store re-fetch at settle time).
+        let reserved_tokens = self.cfg.projected_tokens;
         let fleet_id = fleet_id.to_string();
         let task_id = task_id.to_string();
+
+        // PR B — the escalation slot, created SYNCHRONOUSLY here (before the
+        // guard, no await) and shared into BOTH `run_attempt` (→ the agent's
+        // `escalate` valve) AND the LaunchGuard. So if this run is cancelled
+        // AFTER the agent recorded an escalation but BEFORE `run_attempt` settled
+        // it, the guard settles ESCALATED (child Blocked), not `Terminated` —
+        // a cancel/timeout can never DROP a recorded escalation.
+        let escalation_slot: EscalationSlot = Arc::new(std::sync::Mutex::new(None));
+
+        // PR B (codex round-3, defect 1) — the shared token tracker, created here
+        // (before the guard, no await) alongside the escalation slot and shared
+        // into BOTH `run_attempt` (→ the agent's `run_task_with_tracker`, which
+        // folds each response's cumulative spend into it) AND the LaunchGuard. So a
+        // cancel that drops this run AFTER the agent recorded an escalation but
+        // BEFORE `run_attempt` settled it lets the guard settle the REAL tokens the
+        // agent spent (never 0) — a 0-commit would let the fresh post-grant attempt
+        // double-spend the budget.
+        let tracker: Arc<TokenTracker> = Arc::new(TokenTracker::new());
 
         // P1-4a: arm the drop-guard SYNCHRONOUSLY here — there is NO `.await`
         // between `launch_child` returning `Launched` and this line — then MOVE
         // it into the spawned future. So even a future that is dropped before
         // its first poll (e.g. current-thread runtime: `dispatch().await` then
         // `handle.abort()`) still drops its captured guard → `Drop` fires the
-        // `Terminated` cleanup. The whole `[launch → complete]` window is
-        // guarded with no gap. The store's four-part CAS makes the cleanup a
-        // no-op if the attempt was already settled/superseded.
+        // `Terminated` (or `Escalated`) cleanup. The whole `[launch → complete]`
+        // window is guarded with no gap. The store's four-part CAS makes the
+        // cleanup a no-op if the attempt was already settled/superseded.
         let guard = LaunchGuard {
             store: store.clone(),
             fleet_id: fleet_id.clone(),
@@ -250,6 +276,9 @@ impl FleetWorkerPool {
             attempt_id: attempt_id.clone(),
             owner_epoch,
             clock: clock.clone(),
+            escalation: escalation_slot.clone(),
+            tracker: tracker.clone(),
+            reserved_tokens,
             armed: true,
         };
 
@@ -286,6 +315,9 @@ impl FleetWorkerPool {
                 &working_dir,
                 deadline,
                 owner_epoch,
+                escalation_slot,
+                tracker,
+                reserved_tokens,
                 move || (run_clock)(),
             )
             .await;
@@ -314,18 +346,23 @@ impl FleetWorkerPool {
 /// - `Completed` / `Superseded` — the attempt reached a durable terminal state.
 /// - `Aborted` — `mark_running` returned `Superseded`, a genuine lost race, so
 ///   the attempt belongs to someone else.
+/// - `Escalated` (PR B) — `record_escalation` settled the attempt
+///   NON-terminally (child `Blocked`); it is SETTLED (its lease released, its
+///   tokens committed), so the guard must DISARM — a `Drop` `Terminated`
+///   completion would double-settle (and would clobber the Blocked child).
 ///
 /// A [`AttemptOutcome::RecordError`] — our own store CAS
-/// (`mark_running`/`complete_child`) hit an infra error, so the attempt may
-/// still be live AND ours — must KEEP the guard armed (returns `false`) so its
-/// `Drop` best-effort completes it and can't wedge the child in `Launching`
-/// (round-4 P1).
+/// (`mark_running`/`complete_child`/`record_escalation`) hit an infra error, so
+/// the attempt may still be live AND ours — must KEEP the guard armed (returns
+/// `false`) so its `Drop` best-effort completes it and can't wedge the child in
+/// `Launching` (round-4 P1).
 fn should_disarm(outcome: &AttemptOutcome) -> bool {
     matches!(
         outcome,
         AttemptOutcome::Completed { .. }
             | AttemptOutcome::Superseded
             | AttemptOutcome::Aborted { .. }
+            | AttemptOutcome::Escalated { .. }
     )
 }
 
@@ -354,6 +391,18 @@ struct LaunchGuard {
     attempt_id: String,
     owner_epoch: u64,
     clock: Arc<dyn Fn() -> u64 + Send + Sync>,
+    /// PR B — the shared escalation slot. On a cancel-drop, if the agent already
+    /// recorded an escalation here, the guard settles ESCALATED (child Blocked),
+    /// not `Terminated` — so a cancel/timeout can never drop a recorded request.
+    escalation: EscalationSlot,
+    /// PR B (codex round-3, defect 1) — the SAME token tracker `run_attempt`
+    /// handed the agent, so a cancel-drop escalation settle commits the REAL
+    /// spend (with the attempt's reserved tokens as a never-zero floor), not 0.
+    tracker: Arc<TokenTracker>,
+    /// PR B (codex round-4, defect 1) — the attempt's reservation
+    /// (`PoolConfig::projected_tokens`), the RELIABLE never-zero escalation floor
+    /// on a cancel-drop settle (no fallible store re-fetch).
+    reserved_tokens: u64,
     armed: bool,
 }
 
@@ -381,21 +430,65 @@ impl Drop for LaunchGuard {
             return;
         };
         let store = self.store.clone();
+        let tracker = self.tracker.clone();
+        let reserved_tokens = self.reserved_tokens;
         let fleet_id = std::mem::take(&mut self.fleet_id);
         let task_id = std::mem::take(&mut self.task_id);
         let attempt_id = std::mem::take(&mut self.attempt_id);
         let owner_epoch = self.owner_epoch;
         let now = (self.clock)();
+        // PR B — if the agent recorded an escalation before this run was
+        // cancelled, PRECEDENCE goes to the escalation: settle NON-terminally
+        // (child Blocked), never `Terminated`. Take it out of the slot so the
+        // decision is made synchronously here (no await between the check and
+        // the spawn). `record_escalation`'s own four-part CAS no-ops if
+        // `run_attempt` already committed it.
+        let pending = self
+            .escalation
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
         const INTERRUPTED: &str = "attempt interrupted before completion";
         runtime.spawn(async move {
-            // `complete_child` requires the attempt to be `Running`. A pre-poll
-            // abort leaves it `Launching` (its `mark_running` never ran), so
-            // best-effort advance it first. `mark_running` is a CAS (needs
-            // Launching + current attempt): it succeeds for a still-Launching
-            // attempt, and harmlessly errors for one already Running (the
-            // normal interrupted case) or superseded — either way
-            // `complete_child`'s own four-part CAS then settles or no-ops.
+            // `complete_child`/`record_escalation` both require the attempt to be
+            // `Running`. A pre-poll abort leaves it `Launching` (its
+            // `mark_running` never ran), so best-effort advance it first.
+            // `mark_running` is a CAS (needs Launching + current attempt): it
+            // succeeds for a still-Launching attempt, and harmlessly errors for
+            // one already Running (the normal interrupted case) or superseded —
+            // either way the settle op's own four-part CAS then settles or no-ops.
             let _ = store.mark_running(&task_id, &attempt_id).await;
+            if let Some(request) = pending {
+                // Cancelled AFTER an escalation was recorded. Settle the REAL
+                // tokens the agent spent — read live from the SAME shared tracker
+                // `run_attempt` handed the agent (an atomic, always reliable) —
+                // with the attempt's RESERVED tokens (threaded in reliably from the
+                // pool config, NOT re-fetched) as a never-zero floor, exactly like
+                // the normal `run_attempt` escalation path. It is impossible to
+                // settle 0 while real tokens were used: a 0-commit here would
+                // release the reservation while committing nothing, letting the
+                // fresh post-grant attempt double-spend the budget.
+                let tracked = tracked_tokens(&tracker);
+                let tokens = escalation_tokens_with_floor(tracked, reserved_tokens);
+                if let Err(err) = store
+                    .record_escalation(
+                        &fleet_id,
+                        &task_id,
+                        &attempt_id,
+                        request,
+                        tokens,
+                        owner_epoch,
+                        now,
+                    )
+                    .await
+                {
+                    tracing::warn!(
+                        %fleet_id, %task_id, %attempt_id, error = %err,
+                        "fleet worker: drop-guard escalation settle failed (advisory; recovery reconciles)",
+                    );
+                }
+                return;
+            }
             let snapshot = ChildResultSnapshot {
                 output: String::new(),
                 success: false,
@@ -642,6 +735,134 @@ mod tests {
             final_status,
             ChildStatus::Failed,
             "an interrupted attempt must end Failed via the drop-guard",
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn escalation_survives_a_cancel_via_the_guard() {
+        // codex round-2 (defect 1): if the run is CANCELLED after the agent
+        // recorded an escalation but before `run_attempt` settled it, the
+        // LaunchGuard must settle ESCALATED (child Blocked), NOT `Terminated` —
+        // a cancel/timeout can never DROP a recorded escalation.
+        let (_sd, store) = fresh_store().await;
+        create_fleet(store.clone(), "f1", vec![task_spec("a", &[], vec![])]).await;
+
+        let work = TempDir::new().unwrap();
+        // Escalate on turn 1, then sleep 30s (turn 2) so the slot is SET and the
+        // run is still alive when we abort it.
+        let (_md, factory) = factory_for(Arc::new(EscalateProvider::then_sleeping(
+            "blocked past the cancel",
+            Duration::from_secs(30),
+        )))
+        .await;
+        let pool = FleetWorkerPool::new(
+            store.clone(),
+            Arc::new(factory),
+            pool_config(&work, 4, 4),
+            fixed_clock(),
+        );
+
+        let d = pool.dispatch("f1", "a").await.unwrap();
+        assert!(matches!(d.launch, LaunchOutcome::Launched { .. }));
+        let handle = d.handle.unwrap();
+
+        // Wait until the child is Running (the agent turn started), then give
+        // turn 1 + the escalate tool time to SET the slot.
+        wait_for_status(&store, "f1", "a", ChildStatus::Running).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        // Cancel mid-run: the guard fires and must settle ESCALATED.
+        handle.abort();
+
+        // The child must reach Blocked (via the guard's escalation settle), and
+        // must NEVER be dropped to Failed (a Terminated completion).
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let status = store.get_child("f1", "a").await.unwrap().unwrap().status;
+            assert_ne!(
+                status,
+                ChildStatus::Failed,
+                "a cancel dropped the escalation to a Terminated/Failed completion",
+            );
+            if status == ChildStatus::Blocked {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "child never reached Blocked (last: {status:?})",
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let child = store.get_child("f1", "a").await.unwrap().unwrap();
+        assert!(
+            child.pending_escalation.is_some(),
+            "the recorded escalation request is preserved through the cancel",
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn escalation_cancel_drop_commits_real_tokens_not_zero() {
+        // codex round-3 (defect 1): the LaunchGuard's cancel-drop escalation
+        // settle must commit the REAL tokens the yielded attempt spent — read from
+        // the SAME shared tracker the agent updated, with the reserved tokens as a
+        // never-zero floor — NOT 0. A 0-commit would release the reservation while
+        // committing nothing, so after the keeper grants a wider grant the FRESH
+        // attempt could re-reserve and spend the same budget twice (double-spend).
+        let (_sd, store) = fresh_store().await;
+        create_fleet(store.clone(), "f1", vec![task_spec("a", &[], vec![])]).await;
+
+        let work = TempDir::new().unwrap();
+        // Escalate on turn 1 (so the tracker records that turn's real tokens),
+        // then sleep 30s so the slot is SET and the run is still alive when we
+        // abort it INSIDE the guarded region.
+        let (_md, factory) = factory_for(Arc::new(EscalateProvider::then_sleeping(
+            "blocked past the cancel",
+            Duration::from_secs(30),
+        )))
+        .await;
+        let pool = FleetWorkerPool::new(
+            store.clone(),
+            Arc::new(factory),
+            pool_config(&work, 4, 4),
+            fixed_clock(),
+        );
+
+        let d = pool.dispatch("f1", "a").await.unwrap();
+        assert!(matches!(d.launch, LaunchOutcome::Launched { .. }));
+        let handle = d.handle.unwrap();
+
+        // Wait until Running, then give turn 1 + the escalate tool time to SET the
+        // slot AND fold that turn's tokens into the shared tracker.
+        wait_for_status(&store, "f1", "a", ChildStatus::Running).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        // Cancel mid-run: the guard fires and must settle ESCALATED with REAL
+        // tokens (not 0).
+        handle.abort();
+
+        // Wait for the guard's escalation settle to land (child Blocked).
+        wait_for_status(&store, "f1", "a", ChildStatus::Blocked).await;
+
+        // Budget honesty: the cancel-drop settle committed the REAL tokens the
+        // yielded attempt spent (> 0), and released its reservation — so the
+        // fleet's committed budget already reflects the spend before any re-run.
+        let fleet_rec = store.get_fleet("f1").await.unwrap().unwrap();
+        assert!(
+            fleet_rec.budget.tokens_committed > 0,
+            "the cancel-drop escalation settle must commit REAL tokens, never 0 \
+             (committed={})",
+            fleet_rec.budget.tokens_committed,
+        );
+        assert_eq!(
+            fleet_rec.budget.tokens_reserved, 0,
+            "the yielded attempt's reservation is released on the cancel-drop settle",
+        );
+        // The child carries the pending request (it truly escalated, not Terminated).
+        let child = store.get_child("f1", "a").await.unwrap().unwrap();
+        assert!(child.pending_escalation.is_some());
+        assert_eq!(
+            child.tokens_committed, fleet_rec.budget.tokens_committed,
+            "the child's committed tokens mirror the fleet settle",
         );
     }
 

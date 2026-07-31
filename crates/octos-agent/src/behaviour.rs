@@ -261,12 +261,17 @@ fn action_file_size_min(
         let meta =
             std::fs::metadata(path).map_err(|e| eyre!("cannot stat {}: {e}", path.display()))?;
         if meta.len() < min_bytes {
+            // Report the spec-relative path with `/` separators so the reason
+            // is deterministic across platforms (and does not leak the
+            // absolute workspace path). On Windows `path.display()` would use
+            // `\`, breaking downstream `contains("dir/file")` checks.
+            let display = path
+                .strip_prefix(workspace_root)
+                .unwrap_or(path.as_path())
+                .to_string_lossy()
+                .replace('\\', "/");
             return Ok(ActionResult::Fail {
-                reason: format!(
-                    "{} is {} bytes, minimum is {min_bytes}",
-                    path.display(),
-                    meta.len()
-                ),
+                reason: format!("{display} is {} bytes, minimum is {min_bytes}", meta.len()),
             });
         }
     }

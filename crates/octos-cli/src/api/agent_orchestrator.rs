@@ -29,7 +29,8 @@ use octos_core::ui_protocol::{
 };
 use octos_core::{AgentId, MAIN_PROFILE_ID, SessionKey, TaskId};
 use octos_fleet::{
-    AcceptanceVerdict, Fleet, FleetBudget, FleetKernelStore, LaunchOutcome, TaskSpec,
+    AcceptanceVerdict, CompleteOutcome, DenyEscalationOutcome, Fleet, FleetBudget,
+    FleetKernelStore, LaunchOutcome, PlanEdit, PlanMutateOutcome, TaskSpec, WorkerGrant,
 };
 use octos_fleet_worker::FleetWorkerPool;
 use octos_llm::LlmProvider;
@@ -342,7 +343,7 @@ pub(crate) struct AgentOutputRequest {
     pub(crate) agent_id: String,
     pub(crate) session_id: Option<SessionKey>,
     pub(crate) profile_id: String,
-    pub(crate) cursor: Option<Value>,
+    pub(crate) cursor: Option<OutputCursor>,
     pub(crate) limit: Option<usize>,
 }
 
@@ -1078,6 +1079,19 @@ impl InProcessAgentOrchestrator {
                 }
             }
         }
+    }
+
+    /// Whether a durable supervisor store is configured. The fleet boot-resume
+    /// pass uses this to make a [`Self::commit_fleet_keeper_wake`] result
+    /// unambiguous: WITH a store, a `NotDurable` result can ONLY be a
+    /// persistence rollback (a `Queued` continuation whose persist errored is
+    /// cancelled — see the `Err` arm above), whereas WITHOUT a store
+    /// `NotDurable` is the benign in-memory-only wake. So the pass counts a
+    /// no-store `NotDurable` as a (this-boot-only) success but must NOT count a
+    /// with-store `NotDurable`, which means the wake was rolled back and the
+    /// fleet will not auto-resume.
+    pub(crate) fn has_supervisor_store(&self) -> bool {
+        self.state().supervisor_store.is_some()
     }
 
     /// Solo-boot loop safety. Loops restored from a PRIOR process's
@@ -3228,6 +3242,25 @@ impl InProcessAgentOrchestrator {
         Ok(Fleet::bind(store, fleet_id))
     }
 
+    /// The `fleet_id` currently BOUND to `controller`'s goal, or `None` if no
+    /// goal is set for that key. `controller` is the fleet's
+    /// `controller_session_key`, which `goal_plan` binds to the SCOPED goal key
+    /// — the same key the goals map is keyed by — so this is a direct lookup
+    /// (never re-scope an already-scoped key).
+    ///
+    /// The fleet boot-resume pass uses this to skip an ORPHANED fleet: a
+    /// `goal_clear` removes a goal WITHOUT terminalizing its fleet, and a
+    /// re-plan rebinds the controller to a fresh fleet — in both cases the
+    /// keeper's `goal_dispatch` resolves ONLY the current goal's fleet (see
+    /// [`Self::resolve_owned_fleet`]), so a superseded fleet has no keeper to
+    /// drive it and waking it is useless (and would surface stale metadata).
+    pub(crate) fn goal_bound_fleet_id(&self, controller: &SessionKey) -> Option<String> {
+        self.state()
+            .goals
+            .get(controller)
+            .and_then(|goal| goal.fleet_id.clone())
+    }
+
     /// #1857 PR 5a — `goal_plan` tool: lazily create the durable fleet this goal
     /// drives and decompose the objective onto `tasks`. Idempotent — a goal that
     /// already has a `fleet_id` returns "already planned" rather than recreating
@@ -3499,6 +3532,279 @@ impl InProcessAgentOrchestrator {
         Ok(result)
     }
 
+    /// PR B — `goal_grant` tool: APPROVE a worker's mid-task escalation. The
+    /// keeper widens the blocked task's [`WorkerGrant`] to the KEEPER-chosen
+    /// grant (the worker's request is advisory) and resumes it, then re-dispatches
+    /// the now-ready task so a fresh attempt rebuilds from the wider grant.
+    ///
+    /// Security: the ownership gate ([`Self::resolve_owned_fleet`]) runs BEFORE
+    /// any edit — a stale/foreign binding can never have its grant widened. The
+    /// keeper-chosen grant is re-`validate()`d here (unknown tool / web-without-
+    /// network / empty-hosts rejected exactly as at plan time), so an escalation
+    /// can never inject a grant the host cannot honor. Only THIS path mutates
+    /// `PlanTask.grant`; the worker itself never can.
+    pub(crate) async fn model_grant_escalation(
+        &self,
+        session_id: &SessionKey,
+        profile_id: &str,
+        task_id: &str,
+        grant: Option<WorkerGrant>,
+        now_ms: u64,
+    ) -> Result<Value, String> {
+        let key = self.scoped_goal_key(session_id);
+        // Fetch the pool BEFORE the state lock so its bound keeper profile can
+        // fence a cross-profile goal (mirrors `model_dispatch_fleet`).
+        let pool = self.fleet_pool();
+        let fleet_id = {
+            let state = self.state();
+            let Some(goal) = state.goals.get(&key) else {
+                return Err("no goal is set for this session".to_owned());
+            };
+            if goal.profile_id != profile_id {
+                return Err("goal is outside this profile's scope".to_owned());
+            }
+            if let Some(pool) = &pool {
+                if goal.profile_id != pool.keeper_profile_id() {
+                    return Err(format!(
+                        "fleet grants are only available for the keeper profile `{}` in v1 \
+                         (this goal is on profile `{}`)",
+                        pool.keeper_profile_id(),
+                        goal.profile_id,
+                    ));
+                }
+            }
+            goal.fleet_id
+                .clone()
+                .ok_or_else(|| "this goal has no fleet plan yet — nothing to grant".to_owned())?
+        };
+        let Some(store) = self.fleet_store() else {
+            return Err("fleet kernel store is not available".to_owned());
+        };
+        // THE ownership gate — before any edit, mirrors dispatch/snapshot.
+        let fleet = Self::resolve_owned_fleet(Arc::new(store), &fleet_id, &key, profile_id).await?;
+
+        // The task must be Blocked on a pending escalation — reject a grant on a
+        // task that isn't actually waiting (a stale/duplicate approval).
+        let view = fleet
+            .view()
+            .await
+            .map_err(|e| format!("failed to read fleet: {e}"))?;
+        let Some(task) = view.tasks.iter().find(|t| t.task_id == task_id) else {
+            return Err(format!("task `{task_id}` is not in this goal's fleet"));
+        };
+        // Verify the child is actually `Blocked` (not merely that a request field
+        // exists): a task the operator already resolved is not grantable. This is
+        // the out-of-txn early-out; `set_task_grant` re-checks `Blocked` INSIDE
+        // the write-txn (the authoritative CAS against a racing deny).
+        if task.status != octos_fleet::ChildStatus::Blocked {
+            return Err(format!(
+                "task `{task_id}` is not Blocked on an escalation (status {:?}) — nothing to grant",
+                task.status
+            ));
+        }
+        let Some(requested) = task.pending_escalation.as_ref().map(|e| &e.requested_grant) else {
+            return Err(format!(
+                "task `{task_id}` has no pending escalation to grant (status {:?})",
+                task.status
+            ));
+        };
+        // The keeper picks the actual grant. If it supplied none, approve the
+        // worker's requested grant AS-IS (advisory → chosen). Either way it is
+        // re-`validate()`d — an incoherent grant never reaches the plan/worker,
+        // and the keeper can always grant LESS than requested.
+        let chosen = grant.unwrap_or_else(|| requested.clone());
+        chosen
+            .validate()
+            .map_err(|e| format!("invalid grant: {e}"))?;
+
+        // Apply the targeted grant-widen + Blocked→Ready resume (revision-fenced;
+        // NOT a replan). Then re-dispatch the newly-ready task.
+        match fleet
+            .apply_edit(
+                PlanEdit::SetGrant {
+                    task_id: task_id.to_owned(),
+                    grant: chosen,
+                },
+                view.revision,
+                now_ms,
+            )
+            .await
+        {
+            Ok(PlanMutateOutcome::Mutated { revision }) => {
+                let dispatch = self
+                    .model_dispatch_fleet(session_id, profile_id, now_ms)
+                    .await?;
+                Ok(json!({
+                    "status": "granted",
+                    "fleet_id": fleet_id,
+                    "task_id": task_id,
+                    "revision": revision,
+                    "dispatch": dispatch,
+                }))
+            }
+            Ok(PlanMutateOutcome::RevisionMismatch { actual }) => Err(format!(
+                "the fleet plan changed under this grant (expected revision {}, found {actual}); \
+                 re-read with goal_get and retry",
+                view.revision
+            )),
+            // The in-txn `Blocked` CAS refused: a concurrent `goal_deny` (or a
+            // prior grant) resolved this task first, so the grant is REJECTED with
+            // no mutation — grant and deny are mutually exclusive.
+            Ok(PlanMutateOutcome::RejectedNotBlocked { .. }) => Err(format!(
+                "task `{task_id}` is no longer Blocked (a deny or another grant won the race); \
+                 the grant was NOT applied — re-read with goal_get"
+            )),
+            Ok(other) => Err(format!("unexpected grant outcome: {other:?}")),
+            Err(e) => {
+                // A structural error (e.g. UnknownTask) surfaces as a plain message.
+                Err(format!("failed to apply grant: {e}"))
+            }
+        }
+    }
+
+    /// PR B — `goal_deny` tool: REFUSE a worker's mid-task escalation. Moves the
+    /// blocked task's child `Blocked → Failed` (TERMINAL) with the keeper's
+    /// reason. Terminality is load-bearing: a `Blocked` child is non-terminal
+    /// and holds `is_complete` open, so a denial that left it `Blocked` would
+    /// WEDGE the fleet — the goal could never complete.
+    ///
+    /// Security: the same [`Self::resolve_owned_fleet`] ownership gate as
+    /// `goal_grant`/`goal_dispatch` runs before the store op — a foreign binding
+    /// can never have its child failed.
+    pub(crate) async fn model_deny_escalation(
+        &self,
+        session_id: &SessionKey,
+        profile_id: &str,
+        task_id: &str,
+        reason: &str,
+        now_ms: u64,
+    ) -> Result<Value, String> {
+        let key = self.scoped_goal_key(session_id);
+        let pool = self.fleet_pool();
+        let fleet_id = {
+            let state = self.state();
+            let Some(goal) = state.goals.get(&key) else {
+                return Err("no goal is set for this session".to_owned());
+            };
+            if goal.profile_id != profile_id {
+                return Err("goal is outside this profile's scope".to_owned());
+            }
+            if let Some(pool) = &pool {
+                if goal.profile_id != pool.keeper_profile_id() {
+                    return Err(format!(
+                        "fleet denials are only available for the keeper profile `{}` in v1 \
+                         (this goal is on profile `{}`)",
+                        pool.keeper_profile_id(),
+                        goal.profile_id,
+                    ));
+                }
+            }
+            goal.fleet_id
+                .clone()
+                .ok_or_else(|| "this goal has no fleet plan yet — nothing to deny".to_owned())?
+        };
+        let Some(store) = self.fleet_store() else {
+            return Err("fleet kernel store is not available".to_owned());
+        };
+        // THE ownership gate — before the terminal deny.
+        let fleet = Self::resolve_owned_fleet(Arc::new(store), &fleet_id, &key, profile_id).await?;
+        match fleet
+            .store()
+            .deny_escalation(&fleet_id, task_id, reason, now_ms)
+            .await
+        {
+            Ok(DenyEscalationOutcome {
+                settled: CompleteOutcome::Completed,
+                fleet_un_completable,
+            }) => {
+                // PR B (codex round-4, defect 2) — drive the goal terminal from the
+                // DURABLE deny's OWN returned completability, computed in the same
+                // write-txn — NOT a separate `fleet.view()` after the deny. The
+                // denied task is now terminally `Failed`, so it strands any
+                // dependents `Planned` and the fleet can never auto-complete; a
+                // post-hoc view/read that got cancelled or errored would have left
+                // the goal `active` forever. Because the transition depends only on
+                // the value the durable op returned, a denied task ALWAYS resolves
+                // the goal even if a later read would fail. (The `goal_get` snapshot
+                // stays as a backstop for the non-deny paths.)
+                if fleet_un_completable {
+                    let _ = self.model_transition_goal(
+                        session_id,
+                        profile_id,
+                        "blocked",
+                        &format!(
+                            "fleet cannot complete — task `{task_id}` was denied and will not \
+                             re-run without a replan",
+                        ),
+                    );
+                }
+                Ok(json!({
+                    "status": "denied",
+                    "fleet_id": fleet_id,
+                    "task_id": task_id,
+                    "task_status": "Failed",
+                }))
+            }
+            // The child wasn't Blocked (already resumed/failed/never escalated) —
+            // an inert no-op, surfaced clearly rather than pretending to fail it.
+            Ok(DenyEscalationOutcome {
+                settled: CompleteOutcome::Superseded,
+                ..
+            }) => Err(format!(
+                "task `{task_id}` has no pending escalation to deny (it is not Blocked)"
+            )),
+            Err(e) => Err(format!("failed to deny escalation: {e}")),
+        }
+    }
+
+    /// PR B (codex round-3, defect 2) — resolve the goal to its terminal status
+    /// from the CURRENT fleet completion state. Shared by `model_fleet_snapshot`
+    /// (the lazy `goal_get` backstop) and `model_deny_escalation` (the eager deny
+    /// path), so the un-completable rule lives in ONE place and a denied/failed
+    /// task drives the goal terminal identically whether or not the keeper reads
+    /// `goal_get`.
+    ///
+    /// - `complete` (every task `Succeeded`/`Accepted`) → transition the goal
+    ///   `complete`;
+    /// - else any `failed_tasks` (a terminally-`Failed` task can never become
+    ///   `Succeeded`, so `is_complete` is false forever and any dependents wedge
+    ///   `Planned`) → transition the goal `blocked`.
+    ///
+    /// Returns whether the fleet is un-completable (a failed task strands it) so a
+    /// caller (the snapshot) can surface it. Idempotent: `model_transition_goal`
+    /// no-ops once the goal is already `complete`, and a `blocked → blocked`
+    /// re-transition is harmless — so the eager deny path and the snapshot backstop
+    /// can both run without conflict.
+    fn drive_goal_terminal_transition(
+        &self,
+        session_id: &SessionKey,
+        profile_id: &str,
+        complete: bool,
+        failed_tasks: &[&str],
+    ) -> bool {
+        let un_completable = !complete && !failed_tasks.is_empty();
+        if complete {
+            let _ = self.model_transition_goal(
+                session_id,
+                profile_id,
+                "complete",
+                "all fleet tasks accepted",
+            );
+        } else if un_completable {
+            let _ = self.model_transition_goal(
+                session_id,
+                profile_id,
+                "blocked",
+                &format!(
+                    "fleet cannot complete — task(s) failed and will not re-run without a \
+                     replan: {}",
+                    failed_tasks.join(", ")
+                ),
+            );
+        }
+        un_completable
+    }
+
     /// #1857 PR 5a — the fleet plan view for the `goal_get` tool: objective,
     /// per-task title/status/verdict, the ready set, and status counts.
     /// `Ok(None)` when this goal drives no fleet (so `goal_get` renders just the
@@ -3549,14 +3855,30 @@ impl InProcessAgentOrchestrator {
         // Completion self-detection: no `FleetDrained` in production, so the
         // keeper marks its OWN goal complete once every task is accepted. The
         // transition is idempotent (a second call errors and is ignored).
-        if complete {
-            let _ = self.model_transition_goal(
-                session_id,
-                profile_id,
-                "complete",
-                "all fleet tasks accepted",
-            );
-        }
+        //
+        // PR B (codex round-2) — un-completable self-detection. A terminally
+        // `Failed` task (a normal acceptance failure OR a `goal_deny`ed
+        // escalation) can NEVER become `Succeeded`, so `is_complete` — which
+        // requires ALL `Succeeded` — is false FOREVER, and any dependents wedge
+        // `Planned`. Without this the goal would stay perpetually `active`. Mirror
+        // the completion self-detection: mark the goal `blocked` (a terminal,
+        // model-allowed status) so it reaches a terminal state. The keeper is
+        // woken by the same `ChildDone` the deny/complete paths emit and may still
+        // replan to recover (`goal_plan`/`goal_dispatch` work on a blocked goal;
+        // a subsequent all-`Succeeded` fleet re-transitions it to `complete`).
+        let failed_tasks: Vec<&str> = view
+            .tasks
+            .iter()
+            .filter(|t| t.status == octos_fleet::ChildStatus::Failed)
+            .map(|t| t.task_id.as_str())
+            .collect();
+        // Shared with the eager deny path (`model_deny_escalation`): the SAME
+        // un-completable rule + goal-terminal transition. Here it is the BACKSTOP
+        // (a normally-`Failed` task reached via the keeper's goal_get wake still
+        // resolves the goal); the deny path drives it eagerly so a keeper that
+        // never reads goal_get is also covered.
+        let un_completable =
+            self.drive_goal_terminal_transition(session_id, profile_id, complete, &failed_tasks);
         let tasks: Vec<Value> = view
             .tasks
             .iter()
@@ -3567,12 +3889,24 @@ impl InProcessAgentOrchestrator {
                     Some(AcceptanceVerdict::Terminated { .. }) => "terminated",
                     None => "",
                 };
-                json!({
+                let mut task = json!({
                     "task_id": t.task_id,
                     "title": t.title,
                     "status": format!("{:?}", t.status),
                     "verdict": verdict,
-                })
+                });
+                // PR B — surface a pending escalation so the keeper NOTICES it on
+                // its next goal_get and decides (goal_grant / goal_deny). A
+                // Blocked task carries the worker's advisory requested grant +
+                // reason; this is how the request reaches the operator.
+                if let Some(esc) = &t.pending_escalation {
+                    task["pending_escalation"] = json!({
+                        "reason": esc.reason,
+                        "requested_grant": grant_to_json(&esc.requested_grant),
+                        "decision_needed": "call goal_grant (widen + resume) or goal_deny (fail the task)",
+                    });
+                }
+                task
             })
             .collect();
         Ok(Some(json!({
@@ -3580,6 +3914,11 @@ impl InProcessAgentOrchestrator {
             "objective": view.objective,
             "status": format!("{:?}", view.status),
             "complete": complete,
+            // PR B — the fleet has a terminally-failed task and can never
+            // auto-complete; the goal was transitioned `blocked`. The keeper may
+            // replan (drop/adjust the failed task) to recover.
+            "un_completable": un_completable,
+            "failed_tasks": failed_tasks,
             "ready": ready,
             "tasks": tasks,
             "counts": summary.map(|s| json!({
@@ -3587,6 +3926,7 @@ impl InProcessAgentOrchestrator {
                 "planned": s.planned,
                 "ready": s.ready,
                 "running": s.running,
+                "blocked": s.blocked,
                 "succeeded": s.succeeded,
                 "failed": s.failed,
                 "cancelled": s.cancelled,
@@ -3728,6 +4068,44 @@ impl InProcessAgentOrchestrator {
         if let Some(goal) = self.state().goals.get_mut(&key) {
             goal.fleet_id = Some(fleet_id.to_owned());
         }
+    }
+
+    /// Test-only: bind `controller`'s goal to `fleet_id` by inserting a minimal
+    /// active goal record — NO persistence, NO goal-continuation enqueue — so a
+    /// fleet boot-resume test can exercise the orphan guard
+    /// ([`Self::goal_bound_fleet_id`]) without the live goal-turn machinery (a
+    /// real `set_goal(active)` would also enqueue a `GoalContinue`). Overwrites
+    /// any existing goal at the (scoped) key.
+    #[cfg(test)]
+    pub(crate) fn bind_goal_fleet_for_test(
+        &self,
+        controller: &SessionKey,
+        profile_id: &str,
+        fleet_id: &str,
+    ) {
+        let key = self.scoped_goal_key(controller);
+        self.state().goals.insert(
+            key,
+            AutonomyGoalRecord {
+                profile_id: profile_id.to_owned(),
+                goal_id: "goal_test".to_owned(),
+                objective: "obj".to_owned(),
+                status: "active".to_owned(),
+                token_budget: 1_000_000,
+                tokens_used: 0,
+                time_used_seconds: 0,
+                created_at_ms: 0,
+                updated_at_ms: 0,
+                continuations_used: 0,
+                last_continued_at_ms: 0,
+                rate_window_start_ms: 0,
+                rate_window_count: 0,
+                wrap_up_emitted: false,
+                consecutive_failed_turns: 0,
+                fleet_id: Some(fleet_id.to_owned()),
+                controller_workspace_root: None,
+            },
+        );
     }
 
     /// PR 5a — the goal's stashed controller workspace root (re-scoped).
@@ -3955,6 +4333,34 @@ impl InProcessAgentOrchestrator {
             .pending_count_for_session(&session_id.to_string(), profile_id)
     }
 
+    /// Test-only: snapshot the pending fleet-keeper (`External(fleet_keeper_wake)`)
+    /// continuations as `(session_id, dedupe_key, fleet_id metadata)`. Filters
+    /// out unrelated continuations (e.g. a goal's `GoalContinue`) so a
+    /// boot-resume test can assert exactly which fleets were woken and that
+    /// their dedupe keys are distinct.
+    #[cfg(test)]
+    pub(crate) fn pending_fleet_keeper_wakes_for_test(
+        &self,
+    ) -> Vec<(String, String, Option<String>)> {
+        self.state()
+            .continuations
+            .pending_items()
+            .filter(|it| {
+                matches!(
+                    &it.reason,
+                    MasterContinuationReason::External(kind) if kind == FLEET_KEEPER_EXTERNAL_KIND
+                )
+            })
+            .map(|it| {
+                (
+                    it.session_id.as_str().to_owned(),
+                    it.dedupe_key.as_str().to_owned(),
+                    it.metadata.get(FLEET_KEEPER_META_FLEET_ID).cloned(),
+                )
+            })
+            .collect()
+    }
+
     #[cfg(test)]
     pub(crate) fn force_loop_due_for_test(&self, loop_id: &str) {
         let mut state = self.state();
@@ -4080,7 +4486,7 @@ impl AgentOrchestrator for InProcessAgentOrchestrator {
     fn read_agent_output(&self, request: AgentOutputRequest) -> Result<Value, RpcError> {
         let state = self.state();
         let profile_id = request.profile_id.clone();
-        let cursor = request.cursor.clone();
+        let cursor = request.cursor;
         let limit = request.limit;
         let agent = get_agent(
             &state,
@@ -4090,13 +4496,7 @@ impl AgentOrchestrator for InProcessAgentOrchestrator {
                 profile_id,
             },
         )?;
-        let window = agent_output_window(
-            &agent.output,
-            cursor.as_ref(),
-            limit,
-            &agent.session_id,
-            &agent.profile_id,
-        )?;
+        let window = agent_output_window(&agent.output, cursor.as_ref(), limit);
         Ok(json!({
             "agent_id": agent.agent_id,
             "session_id": agent.session_id,
@@ -5491,6 +5891,28 @@ fn now_ms_u64() -> u64 {
     now_ms().try_into().unwrap_or(0)
 }
 
+/// PR B — render a [`WorkerGrant`] to the wire JSON shape the goal tools speak
+/// (`{ network: {mode, hosts}, tools: [...], fs: "workspace"|"host" }`), so a
+/// surfaced escalation's advisory requested grant reads back the same way the
+/// keeper would specify it in `goal_grant`.
+fn grant_to_json(grant: &WorkerGrant) -> Value {
+    use octos_fleet::{FsGrant, NetworkGrant};
+    let network = match &grant.network {
+        NetworkGrant::None => json!({ "mode": "none" }),
+        NetworkGrant::Full => json!({ "mode": "full" }),
+        NetworkGrant::Hosts(hosts) => json!({ "mode": "hosts", "hosts": hosts }),
+    };
+    let fs = match grant.fs {
+        FsGrant::Workspace => "workspace",
+        FsGrant::Host => "host",
+    };
+    json!({
+        "network": network,
+        "tools": grant.tools,
+        "fs": fs,
+    })
+}
+
 fn autonomy_error_code(kind: &str) -> i64 {
     match kind {
         kinds::AGENT_CONTROL_FORBIDDEN
@@ -5557,6 +5979,26 @@ fn agent_invalid_params_error(
         data.insert(key.into(), json!(value));
     }
     RpcError::invalid_params(message).with_data(Value::Object(data))
+}
+
+pub(crate) fn parse_agent_output_cursor(
+    cursor: Option<Value>,
+    session_id: Option<&SessionKey>,
+    profile_id: &str,
+) -> Result<Option<OutputCursor>, RpcError> {
+    let Some(cursor) = cursor else {
+        return Ok(None);
+    };
+    let Some(offset) = cursor.get("offset").and_then(Value::as_u64) else {
+        return Err(agent_invalid_params_error(
+            AGENT_OUTPUT_CURSOR_INVALID,
+            "agent output cursor must be an object with numeric offset",
+            session_id,
+            Some(profile_id),
+            None,
+        ));
+    };
+    Ok(Some(OutputCursor { offset }))
 }
 
 fn session_controls_target(requested: &SessionKey, target: &SessionKey) -> bool {
@@ -7441,50 +7883,34 @@ struct AgentOutputWindow {
 
 fn agent_output_window(
     text: &str,
-    cursor: Option<&Value>,
+    cursor: Option<&OutputCursor>,
     limit: Option<usize>,
-    session_id: &SessionKey,
-    profile_id: &str,
-) -> Result<AgentOutputWindow, RpcError> {
-    let start_offset = agent_output_cursor_offset(cursor, text, session_id, profile_id)?;
+) -> AgentOutputWindow {
+    let start_offset = agent_output_cursor_offset(cursor, text);
     let limit = limit.unwrap_or(usize::MAX);
     let mut end_offset = start_offset.saturating_add(limit).min(text.len());
     while end_offset > start_offset && !text.is_char_boundary(end_offset) {
         end_offset -= 1;
     }
 
-    Ok(AgentOutputWindow {
+    AgentOutputWindow {
         start_offset,
         end_offset,
         text: text[start_offset..end_offset].to_owned(),
-    })
+    }
 }
 
-fn agent_output_cursor_offset(
-    cursor: Option<&Value>,
-    text: &str,
-    session_id: &SessionKey,
-    profile_id: &str,
-) -> Result<usize, RpcError> {
+fn agent_output_cursor_offset(cursor: Option<&OutputCursor>, text: &str) -> usize {
     let Some(cursor) = cursor else {
-        return Ok(0);
+        return 0;
     };
-    let Some(offset) = cursor.get("offset").and_then(Value::as_u64) else {
-        return Err(agent_invalid_params_error(
-            AGENT_OUTPUT_CURSOR_INVALID,
-            "agent output cursor must be an object with numeric offset",
-            Some(session_id),
-            Some(profile_id),
-            None,
-        ));
-    };
-    let mut offset = usize::try_from(offset)
+    let mut offset = usize::try_from(cursor.offset)
         .unwrap_or(usize::MAX)
         .min(text.len());
     while offset < text.len() && !text.is_char_boundary(offset) {
         offset += 1;
     }
-    Ok(offset)
+    offset
 }
 
 fn ensure_loop_scope(
@@ -8275,7 +8701,9 @@ mod tests {
                 .expect("open episode store"),
         );
         let sandbox_factory: octos_fleet_worker::SandboxFactory =
-            Arc::new(|_cwd| Arc::new(MarkerSandbox) as Arc<dyn octos_agent::sandbox::Sandbox>);
+            Arc::new(|_cwd, _allow_network| {
+                Arc::new(MarkerSandbox) as Arc<dyn octos_agent::sandbox::Sandbox>
+            });
         let factory = Arc::new(octos_fleet_worker::AgentFactory::new(
             Arc::new(NativeMockProvider {
                 content: Ok("done".to_owned()),
@@ -8325,6 +8753,7 @@ mod tests {
             detail: "do the thing".to_owned(),
             deps: Vec::new(),
             acceptance: Vec::new(),
+            grant: octos_fleet::WorkerGrant::minimal(),
         }]
     }
 
@@ -9017,6 +9446,553 @@ mod tests {
         );
     }
 
+    // ---- PR B: escalate-to-master mid-task (goal_grant / goal_deny) --------
+
+    /// Drive `task_id` into `Blocked` on a pending escalation by launching +
+    /// mark_running + `record_escalation` directly on the store (epoch 1, the
+    /// mock pool's owner epoch, so a later grant re-dispatch is consistent).
+    async fn block_task_on_escalation(
+        store: &FleetKernelStore,
+        fleet_id: &str,
+        task_id: &str,
+    ) -> octos_fleet::EscalationRequest {
+        let attempt = match store
+            .launch_child(fleet_id, task_id, 100, now_ms_u64(), 1, 60_000)
+            .await
+            .unwrap()
+        {
+            LaunchOutcome::Launched { attempt_id } => attempt_id,
+            other => panic!("launch {task_id}: {other:?}"),
+        };
+        store.mark_running(task_id, &attempt).await.unwrap();
+        let request = octos_fleet::EscalationRequest {
+            requested_grant: octos_fleet::WorkerGrant {
+                network: octos_fleet::NetworkGrant::Hosts(vec!["example.com".into()]),
+                tools: vec!["read_file".into(), "web_fetch".into()],
+                ..octos_fleet::WorkerGrant::minimal()
+            },
+            reason: "needs example.com".into(),
+        };
+        let out = store
+            .record_escalation(
+                fleet_id,
+                task_id,
+                &attempt,
+                request.clone(),
+                80,
+                1,
+                now_ms_u64(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(out, CompleteOutcome::Completed);
+        request
+    }
+
+    /// Plan a one-task fleet under a live goal and return its fleet_id. Shared
+    /// setup for the escalation tests.
+    async fn seed_planned_goal(
+        orchestrator: &InProcessAgentOrchestrator,
+        wire: &SessionKey,
+        work: &std::path::Path,
+    ) -> String {
+        seed_goal(orchestrator, wire, "tenant-a");
+        let scoped = orchestrator.scoped_goal_key(wire);
+        orchestrator.set_goal_workspace_root(&scoped, Some(work.to_string_lossy().into_owned()));
+        let plan = orchestrator
+            .model_create_fleet_plan(wire, "tenant-a", plan_tasks(), 1_000)
+            .await
+            .expect("plan");
+        plan["fleet_id"].as_str().unwrap().to_owned()
+    }
+
+    /// `goal_grant` widens a blocked task's grant (through the ownership gate)
+    /// and re-dispatches it: the plan carries the wider grant and the child
+    /// leaves `Blocked`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn goal_grant_widens_and_redispatches() {
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let (_sd, store) = fleet_test_store().await;
+        orchestrator.set_fleet_store(store.clone());
+        let work = tempfile::TempDir::new().unwrap();
+        let (_md, pool) = mock_fleet_pool(store.clone(), work.path(), 100).await;
+        orchestrator.set_fleet_pool(pool);
+
+        let wire = SessionKey::new("api", "keeper-grant");
+        let fleet_id = seed_planned_goal(&orchestrator, &wire, work.path()).await;
+        block_task_on_escalation(&store, &fleet_id, "t1").await;
+        assert_eq!(
+            store
+                .get_child(&fleet_id, "t1")
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            octos_fleet::ChildStatus::Blocked,
+        );
+
+        // The keeper approves a WIDER grant (adds web_fetch under a Hosts list).
+        let grant = octos_fleet::WorkerGrant {
+            network: octos_fleet::NetworkGrant::Hosts(vec!["example.com".into()]),
+            tools: vec![
+                "read_file".into(),
+                "write_file".into(),
+                "shell".into(),
+                "web_fetch".into(),
+            ],
+            ..octos_fleet::WorkerGrant::minimal()
+        };
+        let out = orchestrator
+            .model_grant_escalation(&wire, "tenant-a", "t1", Some(grant.clone()), now_ms_u64())
+            .await
+            .expect("grant");
+        assert_eq!(out["status"], json!("granted"), "grant applied: {out}");
+        let dispatched = out["dispatch"]["dispatched"]
+            .as_array()
+            .expect("dispatched array");
+        assert!(
+            dispatched.iter().any(|d| d["task_id"] == json!("t1")),
+            "the resumed task must be re-dispatched: {out}",
+        );
+
+        // The plan now carries the widened grant; the child left Blocked with no
+        // pending escalation.
+        let plan = store.get_plan(&fleet_id).await.unwrap().unwrap();
+        let t1 = plan.tasks.iter().find(|t| t.task_id == "t1").unwrap();
+        assert_eq!(
+            t1.grant, grant,
+            "the widened grant is persisted on the plan"
+        );
+        let child = store.get_child(&fleet_id, "t1").await.unwrap().unwrap();
+        assert!(child.pending_escalation.is_none(), "escalation cleared");
+        assert_ne!(
+            child.status,
+            octos_fleet::ChildStatus::Blocked,
+            "the child resumed out of Blocked",
+        );
+    }
+
+    /// `goal_grant` re-validates the keeper-chosen grant: an incoherent grant
+    /// (unknown tool) is rejected and the task stays Blocked (nothing applied).
+    #[tokio::test]
+    async fn goal_grant_rejects_invalid_grant() {
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let (_sd, store) = fleet_test_store().await;
+        orchestrator.set_fleet_store(store.clone());
+        let work = tempfile::TempDir::new().unwrap();
+
+        let wire = SessionKey::new("api", "keeper-badgrant");
+        let fleet_id = seed_planned_goal(&orchestrator, &wire, work.path()).await;
+        block_task_on_escalation(&store, &fleet_id, "t1").await;
+
+        let bad = octos_fleet::WorkerGrant {
+            tools: vec!["read_file".into(), "definitely_not_a_tool".into()],
+            ..octos_fleet::WorkerGrant::minimal()
+        };
+        let err = orchestrator
+            .model_grant_escalation(&wire, "tenant-a", "t1", Some(bad), now_ms_u64())
+            .await
+            .expect_err("an invalid grant must be rejected");
+        assert!(err.contains("invalid grant"), "unexpected error: {err}");
+        // Nothing applied — the task is STILL Blocked with its request intact.
+        let child = store.get_child(&fleet_id, "t1").await.unwrap().unwrap();
+        assert_eq!(child.status, octos_fleet::ChildStatus::Blocked);
+        assert!(child.pending_escalation.is_some());
+    }
+
+    /// `goal_deny` moves the blocked task `Blocked → Failed` (terminal), so the
+    /// fleet no longer wedges on it.
+    #[tokio::test]
+    async fn goal_deny_fails_the_task() {
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let (_sd, store) = fleet_test_store().await;
+        orchestrator.set_fleet_store(store.clone());
+        let work = tempfile::TempDir::new().unwrap();
+
+        let wire = SessionKey::new("api", "keeper-deny");
+        let fleet_id = seed_planned_goal(&orchestrator, &wire, work.path()).await;
+        block_task_on_escalation(&store, &fleet_id, "t1").await;
+
+        let out = orchestrator
+            .model_deny_escalation(
+                &wire,
+                "tenant-a",
+                "t1",
+                "no budget for that host",
+                now_ms_u64(),
+            )
+            .await
+            .expect("deny");
+        assert_eq!(out["status"], json!("denied"), "denied: {out}");
+        let child = store.get_child(&fleet_id, "t1").await.unwrap().unwrap();
+        assert_eq!(
+            child.status,
+            octos_fleet::ChildStatus::Failed,
+            "denial is terminal — the fleet cannot wedge on a Blocked child",
+        );
+        assert!(child.pending_escalation.is_none());
+        assert!(child.status.is_terminal());
+
+        // codex round-3 (defect 2): the goal must reach a TERMINAL state, not stay
+        // perpetually `active`. The deny path now drives this EAGERLY — the goal is
+        // `blocked` IMMEDIATELY after the deny, with NO goal_get needed.
+        assert_eq!(
+            orchestrator.goal_status_for_test(&wire).as_deref(),
+            Some("blocked"),
+            "the deny path drives the goal terminal eagerly (no goal_get needed)",
+        );
+        // The goal_get snapshot remains a correct BACKSTOP: it re-detects the
+        // un-completable fleet (idempotent) and still surfaces the failed task.
+        let snap = orchestrator
+            .model_fleet_snapshot(&wire, "tenant-a")
+            .await
+            .expect("snapshot")
+            .expect("present");
+        assert_eq!(
+            snap["un_completable"],
+            json!(true),
+            "snapshot flags the un-completable fleet: {snap}",
+        );
+        assert_eq!(snap["complete"], json!(false));
+        assert_eq!(
+            snap["failed_tasks"],
+            json!(["t1"]),
+            "the failed task is surfaced",
+        );
+        assert_eq!(
+            orchestrator.goal_status_for_test(&wire).as_deref(),
+            Some("blocked"),
+            "a denied task must drive the goal to a terminal state, never perpetual active",
+        );
+    }
+
+    /// codex round-3 (defect 2): a `goal_deny` must drive the goal to a TERMINAL
+    /// state IMMEDIATELY — the deny path itself detects the now-un-completable
+    /// fleet and transitions the goal `blocked`, with NO `goal_get` call. Without
+    /// this, a keeper that ends its wake without reading `goal_get` leaves the
+    /// goal perpetually `active` and the failed prerequisite strands its
+    /// dependents `Planned` forever.
+    #[tokio::test]
+    async fn deny_drives_goal_terminal_without_goal_get() {
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let (_sd, store) = fleet_test_store().await;
+        orchestrator.set_fleet_store(store.clone());
+        let work = tempfile::TempDir::new().unwrap();
+
+        let wire = SessionKey::new("api", "keeper-deny-eager");
+        let fleet_id = seed_planned_goal(&orchestrator, &wire, work.path()).await;
+        block_task_on_escalation(&store, &fleet_id, "t1").await;
+        assert_eq!(
+            orchestrator.goal_status_for_test(&wire).as_deref(),
+            Some("active"),
+            "the goal is active while its task is Blocked on an escalation",
+        );
+
+        orchestrator
+            .model_deny_escalation(
+                &wire,
+                "tenant-a",
+                "t1",
+                "no budget for that host",
+                now_ms_u64(),
+            )
+            .await
+            .expect("deny");
+
+        // The goal is ALREADY terminal — WITHOUT any goal_get / model_fleet_snapshot
+        // call. The deny path drove it eagerly.
+        assert_eq!(
+            orchestrator.goal_status_for_test(&wire).as_deref(),
+            Some("blocked"),
+            "deny must drive the goal terminal eagerly — no goal_get needed to resolve it",
+        );
+    }
+
+    /// codex round-4 (defect 2): the goal-terminal transition is driven by the
+    /// DURABLE deny's OWN returned completability (computed inside the deny
+    /// write-txn), NOT a separate `fleet.view()`/`is_complete` after the deny. So
+    /// a denied task ALWAYS resolves the goal — a post-deny read that got
+    /// cancelled or errored can no longer skip the transition. A two-task plan (a
+    /// dependent stranded by the failure) exercises the real completability path
+    /// end-to-end; the goal is `blocked` from the deny alone, no follow-up read.
+    #[tokio::test]
+    async fn deny_resolves_goal_even_if_view_would_fail() {
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let (_sd, store) = fleet_test_store().await;
+        orchestrator.set_fleet_store(store.clone());
+        let work = tempfile::TempDir::new().unwrap();
+
+        let wire = SessionKey::new("api", "keeper-deny-durable");
+        // Plan a two-task fleet: `b` depends on `a`. `a` escalates then is denied,
+        // stranding `b` — so the fleet is un-completable and the deny txn's scan
+        // over BOTH children returns that.
+        seed_goal(&orchestrator, &wire, "tenant-a");
+        let scoped = orchestrator.scoped_goal_key(&wire);
+        orchestrator
+            .set_goal_workspace_root(&scoped, Some(work.path().to_string_lossy().into_owned()));
+        let tasks = vec![
+            TaskSpec {
+                task_id: "a".into(),
+                title: "first".into(),
+                detail: String::new(),
+                deps: vec![],
+                acceptance: vec![],
+                grant: octos_fleet::WorkerGrant::minimal(),
+            },
+            TaskSpec {
+                task_id: "b".into(),
+                title: "second".into(),
+                detail: String::new(),
+                deps: vec!["a".into()],
+                acceptance: vec![],
+                grant: octos_fleet::WorkerGrant::minimal(),
+            },
+        ];
+        let plan = orchestrator
+            .model_create_fleet_plan(&wire, "tenant-a", tasks, 1_000)
+            .await
+            .expect("plan");
+        let fleet_id = plan["fleet_id"].as_str().unwrap().to_owned();
+
+        block_task_on_escalation(&store, &fleet_id, "a").await;
+        assert_eq!(
+            orchestrator.goal_status_for_test(&wire).as_deref(),
+            Some("active"),
+        );
+
+        // Deny `a`. The goal must resolve to `blocked` from the deny's returned
+        // completability alone — the deny path calls NO fleet.view(), so no
+        // fallible post-deny read stands between the durable failure and the
+        // goal-terminal transition.
+        orchestrator
+            .model_deny_escalation(&wire, "tenant-a", "a", "no budget", now_ms_u64())
+            .await
+            .expect("deny");
+
+        assert_eq!(
+            orchestrator.goal_status_for_test(&wire).as_deref(),
+            Some("blocked"),
+            "deny resolves the goal from the durable returned completability, not a post-hoc view",
+        );
+    }
+
+    /// Fix 2 backstop: a task that failed NORMALLY (acceptance rejected via
+    /// `complete_child`, not a deny) and is reached via the keeper's `goal_get`
+    /// snapshot ALSO resolves the goal. The shared un-completable rule keys off
+    /// `status == Failed` regardless of HOW the task failed — so the refactor that
+    /// extracted the eager deny driver did not break the snapshot backstop.
+    #[tokio::test]
+    async fn normally_failed_task_resolves_goal_via_snapshot_backstop() {
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let (_sd, store) = fleet_test_store().await;
+        orchestrator.set_fleet_store(store.clone());
+        let work = tempfile::TempDir::new().unwrap();
+
+        let wire = SessionKey::new("api", "keeper-normalfail");
+        let fleet_id = seed_planned_goal(&orchestrator, &wire, work.path()).await;
+
+        // Fail t1 the NORMAL way: launch → run → complete with a Rejected verdict
+        // (an acceptance failure), so the child ends terminally `Failed` WITHOUT
+        // any escalation/deny.
+        let attempt = match store
+            .launch_child(&fleet_id, "t1", 100, now_ms_u64(), 1, 60_000)
+            .await
+            .unwrap()
+        {
+            LaunchOutcome::Launched { attempt_id } => attempt_id,
+            other => panic!("launch t1: {other:?}"),
+        };
+        store.mark_running("t1", &attempt).await.unwrap();
+        let settled = store
+            .complete_child(
+                &fleet_id,
+                "t1",
+                &attempt,
+                AcceptanceVerdict::Rejected {
+                    reason: "acceptance failed".into(),
+                },
+                octos_fleet::ChildResultSnapshot::default(),
+                50,
+                1,
+                now_ms_u64(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(settled, CompleteOutcome::Completed);
+        assert_eq!(
+            store
+                .get_child(&fleet_id, "t1")
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            octos_fleet::ChildStatus::Failed,
+        );
+
+        // The goal is still `active` (a normal completion emits a ChildDone wake
+        // but does not itself touch the goal). The keeper's goal_get snapshot is
+        // the BACKSTOP that resolves it.
+        assert_eq!(
+            orchestrator.goal_status_for_test(&wire).as_deref(),
+            Some("active"),
+        );
+        let snap = orchestrator
+            .model_fleet_snapshot(&wire, "tenant-a")
+            .await
+            .expect("snapshot")
+            .expect("present");
+        assert_eq!(snap["un_completable"], json!(true), "snapshot: {snap}");
+        assert_eq!(snap["failed_tasks"], json!(["t1"]));
+        assert_eq!(
+            orchestrator.goal_status_for_test(&wire).as_deref(),
+            Some("blocked"),
+            "a normally-failed task must resolve the goal via the snapshot backstop",
+        );
+    }
+
+    /// codex round-2 (defect 4) — grant and deny are MUTUALLY EXCLUSIVE at the
+    /// orchestrator: once a task is denied (Failed), a grant is refused (the
+    /// out-of-txn `Blocked` check AND the in-txn CAS both reject it).
+    #[tokio::test]
+    async fn grant_after_deny_is_rejected() {
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let (_sd, store) = fleet_test_store().await;
+        orchestrator.set_fleet_store(store.clone());
+        let work = tempfile::TempDir::new().unwrap();
+
+        let wire = SessionKey::new("api", "keeper-grantdeny");
+        let fleet_id = seed_planned_goal(&orchestrator, &wire, work.path()).await;
+        block_task_on_escalation(&store, &fleet_id, "t1").await;
+
+        // Deny wins.
+        orchestrator
+            .model_deny_escalation(&wire, "tenant-a", "t1", "no", now_ms_u64())
+            .await
+            .expect("deny");
+
+        // A grant afterwards must be refused — the task is no longer Blocked.
+        let err = orchestrator
+            .model_grant_escalation(&wire, "tenant-a", "t1", None, now_ms_u64())
+            .await
+            .expect_err("grant after deny must be rejected");
+        assert!(
+            err.contains("not Blocked"),
+            "unexpected grant-after-deny error: {err}",
+        );
+        // The denied task keeps its minimal grant (the request was never applied).
+        let plan = store.get_plan(&fleet_id).await.unwrap().unwrap();
+        let t1 = plan.tasks.iter().find(|t| t.task_id == "t1").unwrap();
+        assert_eq!(t1.grant, octos_fleet::WorkerGrant::minimal());
+    }
+
+    /// The ownership gate covers BOTH new tools: a stale/foreign `goal.fleet_id`
+    /// binding is refused by grant AND deny before any mutation.
+    #[tokio::test]
+    async fn grant_escalation_requires_ownership() {
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let (_sd, store) = fleet_test_store().await;
+        orchestrator.set_fleet_store(store.clone());
+        let store = Arc::new(store);
+
+        let wire = SessionKey::new("api", "keeper-ownership");
+        seed_goal(&orchestrator, &wire, "tenant-a");
+
+        // A fleet owned by a DIFFERENT controller, that goal.fleet_id is then
+        // (corruptly) pointed at.
+        Fleet::create(
+            store.clone(),
+            "foreign-escalate",
+            SessionKey::new("api", "other-controller"),
+            Some("/repos/other".to_owned()),
+            "tenant-a",
+            FleetBudget {
+                token_budget: 1_000_000,
+                tokens_reserved: 0,
+                tokens_committed: 0,
+                hard: false,
+            },
+            "not this goal's work",
+            plan_tasks(),
+            1,
+        )
+        .await
+        .expect("create foreign fleet");
+        orchestrator.set_goal_fleet_id_for_test(&wire, "foreign-escalate");
+
+        // grant must refuse before touching the plan.
+        let grant_err = orchestrator
+            .model_grant_escalation(&wire, "tenant-a", "t1", None, now_ms_u64())
+            .await
+            .expect_err("grant must refuse a foreign fleet binding");
+        assert!(
+            grant_err.contains("does not belong to this goal"),
+            "unexpected grant error: {grant_err}",
+        );
+        // deny must refuse too.
+        let deny_err = orchestrator
+            .model_deny_escalation(&wire, "tenant-a", "t1", "x", now_ms_u64())
+            .await
+            .expect_err("deny must refuse a foreign fleet binding");
+        assert!(
+            deny_err.contains("does not belong to this goal"),
+            "unexpected deny error: {deny_err}",
+        );
+        // The foreign fleet's task is untouched (never failed, never granted).
+        let child = store
+            .get_child("foreign-escalate", "t1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(child.status, octos_fleet::ChildStatus::Ready);
+    }
+
+    /// `goal_get`'s fleet snapshot surfaces a pending escalation (Blocked status
+    /// + reason + advisory requested grant) so the keeper notices and decides.
+    #[tokio::test]
+    async fn goal_get_surfaces_pending_escalation() {
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let (_sd, store) = fleet_test_store().await;
+        orchestrator.set_fleet_store(store.clone());
+        let work = tempfile::TempDir::new().unwrap();
+
+        let wire = SessionKey::new("api", "keeper-surface");
+        let fleet_id = seed_planned_goal(&orchestrator, &wire, work.path()).await;
+        block_task_on_escalation(&store, &fleet_id, "t1").await;
+
+        let snap = orchestrator
+            .model_fleet_snapshot(&wire, "tenant-a")
+            .await
+            .expect("snapshot must not error for an owned fleet")
+            .expect("fleet snapshot present");
+        // Not complete while blocked; the counts show the blocked child.
+        assert_eq!(snap["complete"], json!(false));
+        assert_eq!(
+            snap["counts"]["blocked"],
+            json!(1),
+            "counts show blocked: {snap}"
+        );
+
+        let t1 = snap["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["task_id"] == json!("t1"))
+            .expect("t1 in snapshot");
+        assert_eq!(t1["status"], json!("Blocked"));
+        let esc = &t1["pending_escalation"];
+        assert_eq!(esc["reason"], json!("needs example.com"), "surfaced: {t1}");
+        assert_eq!(esc["requested_grant"]["network"]["mode"], json!("hosts"));
+        assert!(
+            esc["decision_needed"].is_string(),
+            "the keeper is told which decision to make: {esc}",
+        );
+        // The goal stays active while the task is blocked on the operator.
+        assert_eq!(
+            orchestrator.goal_status_for_test(&wire).as_deref(),
+            Some("active"),
+        );
+    }
+
     fn sample_agent(agent_id: &str, profile_id: &str) -> AutonomyAgentRecord {
         AutonomyAgentRecord {
             agent_id: agent_id.to_owned(),
@@ -9499,7 +10475,7 @@ mod tests {
                 agent_id: "agent-output".into(),
                 session_id: Some(session_id.clone()),
                 profile_id: "tenant-a".into(),
-                cursor: Some(json!({ "offset": 6 })),
+                cursor: Some(OutputCursor { offset: 6 }),
                 limit: Some(5),
             })
             .expect("windowed output");

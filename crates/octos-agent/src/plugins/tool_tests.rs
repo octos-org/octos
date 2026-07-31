@@ -3,6 +3,18 @@ use crate::SilentReporter;
 use serde_json::json;
 use std::sync::Arc;
 
+/// Plugin timeout for tests whose script finishes in milliseconds and which
+/// are NOT exercising the timeout path. It is headroom, not an assertion —
+/// nothing here is supposed to reach it.
+///
+/// It used to be 5s, which a loaded host can exceed just by scheduling the
+/// subprocess: five `plugins::tool::tests` cases went red together with
+/// `PluginTimeout` from `tool.rs:2966` during a repeat run on a busy machine,
+/// none of them related to timeouts. The one test that genuinely wants the
+/// timeout to fire (`execute_timeout_returns_error`) keeps its own 1s value
+/// against a script that sleeps 60s, so this constant does not weaken it.
+const TEST_PLUGIN_TIMEOUT: Duration = Duration::from_secs(120);
+
 fn make_tool_def(name: &str, desc: &str) -> PluginToolDef {
     PluginToolDef {
         name: name.to_string(),
@@ -543,6 +555,13 @@ fn rewrite_workspace_file_args_rejects_raw_parent_dir_on_output_keys() {
         safe,
         skill_output.join("sub/dir/out.toml").to_string_lossy()
     );
+    // A platform-absolute path is passed through verbatim (the sandbox /
+    // scope check is the next gate). `/tmp/...` is not absolute on Windows
+    // (`Path::is_absolute` needs a drive or UNC root), so use a drive-absolute
+    // path there.
+    #[cfg(windows)]
+    let abs_in = "C:\\tmp\\explicit-out.toml";
+    #[cfg(not(windows))]
     let abs_in = "/tmp/explicit-out.toml";
     let abs_out = absolutize_path_in_work_dir(abs_in, &skill_output)
         .expect("absolute path must succeed (sandbox is the next gate)");
@@ -1366,8 +1385,8 @@ async fn execute_spawns_subprocess_and_captures_output() {
     );
 
     let def = make_tool_def("echo_tool", "echoes input");
-    let tool = PluginTool::new("test-plugin".into(), def, script_path)
-        .with_timeout(Duration::from_secs(5));
+    let tool =
+        PluginTool::new("test-plugin".into(), def, script_path).with_timeout(TEST_PLUGIN_TIMEOUT);
 
     let args = json!({"msg": "hello"});
     let result = tool.execute(&args).await.expect("execute should succeed");
@@ -1398,8 +1417,8 @@ async fn execute_structured_progress_event_updates_task_supervisor() {
     );
 
     let def = make_tool_def("structured_tool", "writes harness events");
-    let tool = PluginTool::new("test-plugin".into(), def, script_path)
-        .with_timeout(Duration::from_secs(5));
+    let tool =
+        PluginTool::new("test-plugin".into(), def, script_path).with_timeout(TEST_PLUGIN_TIMEOUT);
 
     let sink = crate::harness_events::HarnessEventSink::new(
         supervisor.clone(),
@@ -1468,7 +1487,7 @@ async fn execute_does_not_expose_secret_extra_env_without_tool_allowlist() {
             "OPENAI_API_KEY".into(),
             "sk-octos-plugin-regression".into(),
         )])
-        .with_timeout(Duration::from_secs(5));
+        .with_timeout(TEST_PLUGIN_TIMEOUT);
 
     let result = tool.execute(&json!({})).await.expect("should succeed");
 
@@ -1494,7 +1513,7 @@ async fn execute_exposes_secret_extra_env_with_tool_allowlist() {
             "OPENAI_API_KEY".into(),
             "sk-octos-plugin-allowed".into(),
         )])
-        .with_timeout(Duration::from_secs(5));
+        .with_timeout(TEST_PLUGIN_TIMEOUT);
 
     let result = tool.execute(&json!({})).await.expect("should succeed");
 
@@ -1511,7 +1530,7 @@ async fn execute_fallback_on_non_json_stdout() {
     write_test_script(&script_path, "#!/bin/sh\necho 'plain text output'\n");
 
     let def = make_tool_def("plain_tool", "plain output");
-    let tool = PluginTool::new("p".into(), def, script_path).with_timeout(Duration::from_secs(5));
+    let tool = PluginTool::new("p".into(), def, script_path).with_timeout(TEST_PLUGIN_TIMEOUT);
 
     let result = tool.execute(&json!({})).await.expect("should succeed");
 
@@ -1551,7 +1570,7 @@ async fn execute_fallback_detects_generated_pptx_as_file_to_send() {
     };
     let tool = PluginTool::new("p".into(), def, script_path)
         .with_work_dir(dir.path().to_path_buf())
-        .with_timeout(Duration::from_secs(5));
+        .with_timeout(TEST_PLUGIN_TIMEOUT);
 
     let result = tool
         .execute(&json!({"out": output_rel}))
@@ -1593,7 +1612,7 @@ async fn execute_fallback_waits_briefly_for_generated_pptx_to_appear() {
     };
     let tool = PluginTool::new("p".into(), def, script_path)
         .with_work_dir(dir.path().to_path_buf())
-        .with_timeout(Duration::from_secs(5));
+        .with_timeout(TEST_PLUGIN_TIMEOUT);
 
     let result = tool
         .execute(&json!({"out": output_rel}))
@@ -1638,7 +1657,7 @@ async fn execute_fallback_skips_missing_generated_pptx() {
     };
     let tool = PluginTool::new("p".into(), def, script_path)
         .with_work_dir(dir.path().to_path_buf())
-        .with_timeout(Duration::from_secs(5));
+        .with_timeout(TEST_PLUGIN_TIMEOUT);
 
     let result = tool
         .execute(&json!({"out": output_rel}))
@@ -1748,28 +1767,45 @@ async fn dropped_execute_future_kills_child_no_orphan() {
     // branch that saves us — only dropping the future can kill the child.
     let tool = PluginTool::new("p".into(), def, script_path).with_timeout(Duration::from_secs(600));
 
-    // Simulate the registry dispatch boundary: wrap the tool future in a
-    // short timeout. On elapse the future is dropped (its `Child` with it).
-    // Use a 3s window (generous even under heavy parallel test load) so the
-    // child reliably runs `echo $$ > pidfile` and reaches `sleep` BEFORE
-    // the timeout drops the future — otherwise we could not observe the
-    // pid to assert on. The cancellation-safety property is unaffected by
-    // the window length.
+    // Simulate the registry dispatch boundary: the pending tool future is
+    // dropped, taking its `Child` with it. We must not drop until the child
+    // has actually run `echo $$ > pidfile`, or there is no pid to assert on.
+    //
+    // Drive the future in slices and wait on the *pidfile* rather than on a
+    // fixed window. A fixed window cannot be both cheap and safe here: this
+    // future never completes, so the entire window is always consumed, which
+    // means buying reliability with a longer one directly lengthens every
+    // run. The previous 3s window — commented "generous even under heavy
+    // parallel test load" — still lost the race ~2 runs in 20 on an *idle*
+    // machine, panicking with "child should have recorded its pid before
+    // sleeping". Waiting on the observable event removes the race outright
+    // and finishes in tens of milliseconds instead of a fixed 3s.
     let args = json!({});
-    let fut = tool.execute(&args);
-    let res = tokio::time::timeout(Duration::from_secs(3), fut).await;
-    assert!(
-        res.is_err(),
-        "expected the short registry-style timeout to elapse (future dropped)"
-    );
-    // `res` (the dropped future) is gone here — the `Child` was owned by it.
-
-    // The child should have written its pid before sleeping. It had the
-    // full 3s window above to do so.
-    let pid: u32 = std::fs::read_to_string(&pidfile)
-        .ok()
-        .and_then(|s| s.trim().parse::<u32>().ok())
-        .expect("child should have recorded its pid before sleeping");
+    let mut fut = Box::pin(tool.execute(&args));
+    let pid: u32 = {
+        let started = std::time::Instant::now();
+        loop {
+            // Let the future make progress. It is supposed to hang.
+            if tokio::time::timeout(Duration::from_millis(20), &mut fut)
+                .await
+                .is_ok()
+            {
+                panic!("plugin future completed; it must stay pending");
+            }
+            if let Some(p) = std::fs::read_to_string(&pidfile)
+                .ok()
+                .and_then(|s| s.trim().parse::<u32>().ok())
+            {
+                break p;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(60),
+                "child never recorded its pid"
+            );
+        }
+    };
+    // THE EVENT UNDER TEST: dropping the pending future must kill the child.
+    drop(fut);
 
     // Poll: the drop-kill + tokio reaper should make the child dead. Allow
     // a brief window for SIGKILL delivery + reap.
@@ -1848,29 +1884,35 @@ async fn dropped_execute_future_kills_child_and_grandchild_no_orphan() {
     // kill branch.
     let tool = PluginTool::new("p".into(), def, script_path).with_timeout(Duration::from_secs(600));
 
-    // Simulate the registry dispatch boundary: a short timeout drops the
-    // future (and its `Child`) on elapse. 3s window so the script reliably
-    // records both pids before the drop.
+    // Same deterministic hand-off as the single-child case above: drive the
+    // pending future in slices until BOTH pids are on disk, then drop. The
+    // old shape polled the pidfile *after* the drop, which cannot help — a
+    // dropped future has already killed the tree, so a script that had not
+    // written yet never will. Hence the "got: \"\"" flake.
     let args = json!({});
-    let fut = tool.execute(&args);
-    let res = tokio::time::timeout(Duration::from_secs(3), fut).await;
-    assert!(
-        res.is_err(),
-        "expected the short registry-style timeout to elapse (future dropped)"
-    );
-
+    let mut fut = Box::pin(tool.execute(&args));
     // Read BOTH recorded pids (grandchild first, then direct child).
     let contents = {
-        let mut last = String::new();
-        for _ in 0..100 {
-            last = std::fs::read_to_string(&pidfile).unwrap_or_default();
-            if last.lines().filter(|l| !l.trim().is_empty()).count() >= 2 {
-                break;
+        let started = std::time::Instant::now();
+        loop {
+            if tokio::time::timeout(Duration::from_millis(20), &mut fut)
+                .await
+                .is_ok()
+            {
+                panic!("plugin future completed; it must stay pending");
             }
-            tokio::time::sleep(Duration::from_millis(20)).await;
+            let last = std::fs::read_to_string(&pidfile).unwrap_or_default();
+            if last.lines().filter(|l| !l.trim().is_empty()).count() >= 2 {
+                break last;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(60),
+                "plugin never recorded both pids, got: {last:?}"
+            );
         }
-        last
     };
+    // THE EVENT UNDER TEST: dropping the pending future must reap the tree.
+    drop(fut);
     let pids: Vec<u32> = contents
         .lines()
         .filter_map(|l| l.trim().parse::<u32>().ok())
@@ -2167,7 +2209,7 @@ async fn strict_env_allowlist_drops_non_listed_extra_env() {
             ("FOO_ALLOWED_PLUGIN".into(), "yes".into()),
             ("FOO_BLOCKED_PLUGIN".into(), "should_be_stripped".into()),
         ])
-        .with_timeout(Duration::from_secs(5));
+        .with_timeout(TEST_PLUGIN_TIMEOUT);
 
     let result = tool.execute(&json!({})).await.expect("should succeed");
 
@@ -2204,7 +2246,7 @@ async fn empty_env_allowlist_keeps_legacy_extra_env_passthrough() {
     // No `env` allowlist declared → empty list → legacy gate.
     let tool = PluginTool::new("p".into(), def, script_path)
         .with_extra_env(vec![("MY_BASE_URL".into(), "passes_through".into())])
-        .with_timeout(Duration::from_secs(5));
+        .with_timeout(TEST_PLUGIN_TIMEOUT);
 
     let result = tool.execute(&json!({})).await.expect("should succeed");
 
@@ -2232,7 +2274,7 @@ async fn strict_env_allowlist_retains_path() {
 
     let mut def = make_tool_def("path_tool", "prints PATH");
     def.env.push("FOO_ALLOWED_PLUGIN".into());
-    let tool = PluginTool::new("p".into(), def, script_path).with_timeout(Duration::from_secs(5));
+    let tool = PluginTool::new("p".into(), def, script_path).with_timeout(TEST_PLUGIN_TIMEOUT);
 
     let result = tool.execute(&json!({})).await.expect("should succeed");
     assert!(result.success);
@@ -2292,7 +2334,7 @@ async fn high_risk_plugin_tool_requests_approval() {
 
     let mut def = make_tool_def("danger_tool", "danger");
     def.risk = Some("high".into());
-    let tool = PluginTool::new("p".into(), def, script_path).with_timeout(Duration::from_secs(5));
+    let tool = PluginTool::new("p".into(), def, script_path).with_timeout(TEST_PLUGIN_TIMEOUT);
 
     let (requester, last) = RecordingRequester::new(ToolApprovalDecision::Approve);
     let requester_arc: Arc<dyn ToolApprovalRequester> = requester;
@@ -2325,7 +2367,7 @@ async fn high_risk_plugin_tool_denied_returns_deny_message() {
 
     let mut def = make_tool_def("danger_tool_deny", "danger");
     def.risk = Some("critical".into());
-    let tool = PluginTool::new("p".into(), def, script_path).with_timeout(Duration::from_secs(5));
+    let tool = PluginTool::new("p".into(), def, script_path).with_timeout(TEST_PLUGIN_TIMEOUT);
 
     let (requester, _last) = RecordingRequester::new(ToolApprovalDecision::Deny);
     let requester_arc: Arc<dyn ToolApprovalRequester> = requester;
@@ -2356,7 +2398,7 @@ async fn low_risk_plugin_tool_does_not_request_approval() {
 
     let mut def = make_tool_def("safe_tool", "safe");
     def.risk = Some("low".into());
-    let tool = PluginTool::new("p".into(), def, script_path).with_timeout(Duration::from_secs(5));
+    let tool = PluginTool::new("p".into(), def, script_path).with_timeout(TEST_PLUGIN_TIMEOUT);
 
     let (requester, last) = RecordingRequester::new(ToolApprovalDecision::Deny);
     let requester_arc: Arc<dyn ToolApprovalRequester> = requester;
@@ -2387,7 +2429,7 @@ async fn unspecified_risk_plugin_tool_does_not_request_approval() {
     );
 
     let def = make_tool_def("plain_tool", "plain");
-    let tool = PluginTool::new("p".into(), def, script_path).with_timeout(Duration::from_secs(5));
+    let tool = PluginTool::new("p".into(), def, script_path).with_timeout(TEST_PLUGIN_TIMEOUT);
 
     let (requester, last) = RecordingRequester::new(ToolApprovalDecision::Deny);
     let requester_arc: Arc<dyn ToolApprovalRequester> = requester;
@@ -2425,7 +2467,7 @@ async fn should_deny_high_risk_plugin_without_prompt_when_approval_policy_never(
     let mut def = make_tool_def("danger_never", "danger");
     def.risk = Some("high".into());
     let tool = PluginTool::new("p".into(), def, script_path)
-        .with_timeout(Duration::from_secs(5))
+        .with_timeout(TEST_PLUGIN_TIMEOUT)
         .with_approval_policy(ApprovalPolicy::Never);
 
     let (requester, last) = RecordingRequester::new(ToolApprovalDecision::Approve);
@@ -2468,7 +2510,7 @@ async fn should_auto_allow_high_risk_plugin_without_prompt_when_danger_full_acce
     let mut def = make_tool_def("danger_yolo", "danger");
     def.risk = Some("critical".into());
     let tool = PluginTool::new("p".into(), def, script_path)
-        .with_timeout(Duration::from_secs(5))
+        .with_timeout(TEST_PLUGIN_TIMEOUT)
         .with_approval_policy(ApprovalPolicy::Never)
         .with_auto_approve_high_risk(true);
 
@@ -2508,7 +2550,7 @@ async fn should_request_approval_for_high_risk_plugin_when_approval_policy_ask()
     let mut def = make_tool_def("danger_ask", "danger");
     def.risk = Some("high".into());
     let tool = PluginTool::new("p".into(), def, script_path)
-        .with_timeout(Duration::from_secs(5))
+        .with_timeout(TEST_PLUGIN_TIMEOUT)
         .with_approval_policy(ApprovalPolicy::Ask);
 
     let (requester, last) = RecordingRequester::new(ToolApprovalDecision::Approve);
@@ -2601,7 +2643,7 @@ async fn high_risk_without_approval_bridge_denies_safely() {
 
     let mut def = make_tool_def("danger_tool_no_bridge", "danger");
     def.risk = Some("HIGH".into());
-    let tool = PluginTool::new("p".into(), def, script_path).with_timeout(Duration::from_secs(5));
+    let tool = PluginTool::new("p".into(), def, script_path).with_timeout(TEST_PLUGIN_TIMEOUT);
 
     // No TOOL_APPROVAL_CTX scoped → try_with returns Err → deny.
     let result = tool
@@ -2666,7 +2708,7 @@ async fn unknown_risk_literal_does_not_force_approval() {
 
     let mut def = make_tool_def("medium_tool", "medium");
     def.risk = Some("medium".into());
-    let tool = PluginTool::new("p".into(), def, script_path).with_timeout(Duration::from_secs(5));
+    let tool = PluginTool::new("p".into(), def, script_path).with_timeout(TEST_PLUGIN_TIMEOUT);
 
     let (requester, last) = RecordingRequester::new(ToolApprovalDecision::Deny);
     let requester_arc: Arc<dyn ToolApprovalRequester> = requester;
@@ -2797,7 +2839,7 @@ async fn execute_with_named_outputs_threads_field_into_tool_result() {
     );
 
     let def = make_tool_def("publish_tool", "publish");
-    let tool = PluginTool::new("p".into(), def, script_path).with_timeout(Duration::from_secs(5));
+    let tool = PluginTool::new("p".into(), def, script_path).with_timeout(TEST_PLUGIN_TIMEOUT);
 
     let result = tool.execute(&json!({})).await.expect("execute should ok");
     assert!(result.success);
@@ -2822,7 +2864,7 @@ async fn execute_with_malformed_named_outputs_returns_failure() {
     );
 
     let def = make_tool_def("bad_tool", "emits bad named outputs");
-    let tool = PluginTool::new("p".into(), def, script_path).with_timeout(Duration::from_secs(5));
+    let tool = PluginTool::new("p".into(), def, script_path).with_timeout(TEST_PLUGIN_TIMEOUT);
 
     let result = tool.execute(&json!({})).await.expect("execute should ok");
     assert!(!result.success);
@@ -2846,7 +2888,7 @@ async fn execute_without_named_outputs_leaves_tool_result_none() {
     );
 
     let def = make_tool_def("legacy_tool", "legacy");
-    let tool = PluginTool::new("p".into(), def, script_path).with_timeout(Duration::from_secs(5));
+    let tool = PluginTool::new("p".into(), def, script_path).with_timeout(TEST_PLUGIN_TIMEOUT);
 
     let result = tool.execute(&json!({})).await.expect("execute should ok");
     assert!(result.success);
@@ -2951,8 +2993,7 @@ async fn plugin_uses_scope_workspace_when_present() {
     let def = make_tool_def("scope_cwd", "echo CWD");
     // Crucially: NO `.with_work_dir(...)`. The scope is the only
     // source of truth.
-    let tool =
-        PluginTool::new("plug".into(), def, script_path).with_timeout(Duration::from_secs(5));
+    let tool = PluginTool::new("plug".into(), def, script_path).with_timeout(TEST_PLUGIN_TIMEOUT);
 
     let ctx = ctx_with_scope(scope);
     let result = crate::tools::TOOL_CTX
@@ -3003,7 +3044,7 @@ async fn high_risk_plugin_approval_cwd_reflects_scope_workspace() {
 
     let mut def = make_tool_def("approval_cwd_tool", "danger");
     def.risk = Some("high".into());
-    let tool = PluginTool::new("p".into(), def, script_path).with_timeout(Duration::from_secs(5));
+    let tool = PluginTool::new("p".into(), def, script_path).with_timeout(TEST_PLUGIN_TIMEOUT);
 
     let (requester, last) = RecordingRequester::new(ToolApprovalDecision::Approve);
     let requester_arc: Arc<dyn ToolApprovalRequester> = requester;
@@ -3065,7 +3106,7 @@ async fn plugin_rescues_workspace_root_under_hinted_skill_output_rebind() {
     );
     let tool = PluginTool::new("plug".into(), input_path_def("script_path"), bin_path)
         .with_work_dir(skill_output.clone())
-        .with_timeout(Duration::from_secs(5));
+        .with_timeout(TEST_PLUGIN_TIMEOUT);
 
     let ctx = ctx_with_scope(scope);
     let result = crate::tools::TOOL_CTX
@@ -3118,7 +3159,7 @@ async fn plugin_refuses_absolute_escape_in_hinted_session() {
     );
     let tool = PluginTool::new("plug".into(), input_path_def("audio_path"), script.clone())
         .with_work_dir(hinted_work_dir.path().to_path_buf())
-        .with_timeout(Duration::from_secs(5));
+        .with_timeout(TEST_PLUGIN_TIMEOUT);
 
     let ctx = ctx_with_scope(scope);
     let bait_abs = bait_path.to_string_lossy().to_string();
@@ -3175,7 +3216,7 @@ async fn plugin_prefers_registry_rebound_work_dir_over_scope() {
     let def = make_tool_def("hint_cwd", "echo CWD");
     let tool = PluginTool::new("plug".into(), def, script_path)
         .with_work_dir(hinted_work_dir.path().to_path_buf())
-        .with_timeout(Duration::from_secs(5));
+        .with_timeout(TEST_PLUGIN_TIMEOUT);
 
     let ctx = ctx_with_scope(scope);
     let result = crate::tools::TOOL_CTX
@@ -3215,7 +3256,7 @@ async fn plugin_falls_back_to_self_work_dir_when_no_scope() {
     let def = make_tool_def("legacy_cwd", "echo CWD");
     let tool = PluginTool::new("plug".into(), def, script_path)
         .with_work_dir(dir.path().to_path_buf())
-        .with_timeout(Duration::from_secs(5));
+        .with_timeout(TEST_PLUGIN_TIMEOUT);
 
     // No scope threaded — execute via the default `TOOL_CTX::zero`
     // shape (the global TOOL_CTX::try_with returns Err so the

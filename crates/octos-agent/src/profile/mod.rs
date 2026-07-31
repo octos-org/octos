@@ -437,7 +437,16 @@ impl ProfileDefinition {
 }
 
 fn looks_like_path(arg: &str) -> bool {
-    arg.starts_with('/') || arg.starts_with("./") || arg.starts_with("~/") || arg.starts_with("../")
+    arg.starts_with('/')
+        || arg.starts_with("./")
+        || arg.starts_with("~/")
+        || arg.starts_with("../")
+        // Windows absolute paths (`C:\…`, `C:/…`, verbatim `\\?\…`, UNC
+        // `\\server\share`) match none of the Unix-style prefixes above, so a
+        // real profile file passed by absolute path was misclassified as a
+        // profile *name* and rejected as "unknown profile". `is_absolute()` is
+        // platform-aware and a no-op on Unix (there it ⇔ a leading `/`).
+        || Path::new(arg).is_absolute()
 }
 
 fn expand_tilde(arg: &str, home: Option<&Path>) -> PathBuf {
@@ -920,6 +929,19 @@ mod tests {
         assert!(looks_like_path("../shared.json"));
         assert!(!looks_like_path("coding"));
         assert!(!looks_like_path("swarm"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn looks_like_path_recognizes_windows_absolute_paths() {
+        // Regression: a profile passed by absolute Windows path (drive-letter,
+        // forward- or back-slashed, or verbatim) must be classified as a path
+        // and routed to `from_file`, not treated as a profile name.
+        assert!(looks_like_path(r"C:\Users\me\custom.json"));
+        assert!(looks_like_path("C:/Users/me/custom.json"));
+        assert!(looks_like_path(r"\\?\C:\Users\me\custom.json"));
+        // Plain names still route to name lookup.
+        assert!(!looks_like_path("coding"));
     }
 
     #[test]
