@@ -24023,6 +24023,201 @@ async fn appui_session_without_client_cwd_respects_operator_default_session_cwd(
     );
 }
 
+/// A no-cwd AppUI session still gets a derived Tier-3 workspace for tools, but
+/// that derived path is not a caller-supplied cwd and must never relocate the
+/// transcript store when `appui.sessions_in_cwd` is enabled.
+///
+/// Regression: `session/open` used to write the derived workspace root into
+/// `session_workspaces()`. A later lookup then fed that root back into the
+/// runtime cache as a cwd hint, creating a second runtime under
+/// `<derived-workspace>/.octos/<profile>` and making the session disappear
+/// from the profile-global session list.
+#[tokio::test]
+async fn appui_no_cwd_workspace_does_not_become_a_transcript_store_hint() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let profile_id = "no-cwd-store-stability";
+    let (state, profile_runtime) = state_with_profile(temp.path(), profile_id).await;
+    let mut state_inner = Arc::try_unwrap(state)
+        .map_err(|_| "state Arc must be unique for test setup")
+        .expect("unique Arc");
+    state_inner.session_cache = Arc::new(
+        crate::runtime::SessionRuntimeCache::new(8, std::time::Duration::from_secs(60))
+            .with_sessions_in_cwd(true),
+    );
+    let state = Arc::new(state_inner);
+
+    let session_id = SessionKey::with_profile(profile_id, "api", "learn-no-cwd");
+    let outcome = open_session_result(
+        &state,
+        &UiProtocolLedger::new(16),
+        &PendingApprovalStore::default(),
+        &PendingQuestionStore::default(),
+        ConnectionId::next(),
+        Some(profile_id),
+        ConnectionUiFeatures {
+            session_workspace_cwd: false,
+            header_present: true,
+            ..ConnectionUiFeatures::default()
+        },
+        SessionOpenParams {
+            session_id: session_id.clone(),
+            topic: None,
+            profile_id: Some(profile_id.into()),
+            cwd: None,
+            sandbox: None,
+            after: None,
+        },
+    )
+    .await
+    .expect("no-cwd session/open must succeed");
+
+    let workspace_root = outcome
+        .result
+        .opened
+        .workspace_root
+        .expect("Tier-3 workspace root is still exposed for tools and UI");
+    assert_ne!(workspace_root, profile_runtime.data_dir);
+
+    let sessions = resolve_sessions_for_lookup(&state, None, Some(profile_id), &session_id)
+        .await
+        .expect("session manager resolves after open");
+    assert_eq!(
+        sessions.lock().await.data_dir(),
+        profile_runtime.data_dir,
+        "derived Tier-3 workspace must not be replayed as a cwd hint",
+    );
+}
+
+/// The provenance split must not weaken real per-project sessions: an
+/// explicitly supplied cwd remains the runtime hint used by later lookup
+/// paths, so transcript storage stays under that project's `.octos` root.
+#[tokio::test]
+async fn appui_explicit_cwd_remains_a_transcript_store_hint() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let profile_id = "explicit-cwd-store-stability";
+    let (state, _profile_runtime) = state_with_profile(temp.path(), profile_id).await;
+    let mut state_inner = Arc::try_unwrap(state)
+        .map_err(|_| "state Arc must be unique for test setup")
+        .expect("unique Arc");
+    state_inner.session_cache = Arc::new(
+        crate::runtime::SessionRuntimeCache::new(8, std::time::Duration::from_secs(60))
+            .with_sessions_in_cwd(true),
+    );
+    let state = Arc::new(state_inner);
+
+    let workspace = temp.path().join("project");
+    std::fs::create_dir_all(&workspace).expect("create explicit workspace");
+    let workspace = std::fs::canonicalize(workspace).expect("canonicalize explicit workspace");
+    let session_id = SessionKey::with_profile(profile_id, "api", "coding-with-cwd");
+    open_session_result(
+        &state,
+        &UiProtocolLedger::new(16),
+        &PendingApprovalStore::default(),
+        &PendingQuestionStore::default(),
+        ConnectionId::next(),
+        Some(profile_id),
+        ConnectionUiFeatures {
+            session_workspace_cwd: true,
+            header_present: true,
+            ..ConnectionUiFeatures::default()
+        },
+        SessionOpenParams {
+            session_id: session_id.clone(),
+            topic: None,
+            profile_id: Some(profile_id.into()),
+            cwd: Some(workspace.to_string_lossy().into_owned()),
+            sandbox: None,
+            after: None,
+        },
+    )
+    .await
+    .expect("explicit-cwd session/open must succeed");
+
+    let sessions = resolve_sessions_for_lookup(&state, None, Some(profile_id), &session_id)
+        .await
+        .expect("explicit-cwd session manager resolves after open");
+    assert_eq!(
+        sessions.lock().await.data_dir(),
+        crate::runtime::session::project_sessions_root(&workspace, profile_id),
+        "explicit cwd must remain the transcript-store hint",
+    );
+}
+
+#[tokio::test]
+async fn should_keep_profile_transcript_store_with_fresh_cache_after_no_cwd_reseed() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let profile_id = "restart-no-cwd";
+    let (_state, profile_runtime) = state_with_profile(temp.path(), profile_id).await;
+    let workspace = temp.path().join("derived-workspace");
+    std::fs::create_dir_all(&workspace).expect("create derived workspace");
+    let workspace = std::fs::canonicalize(workspace).expect("canonicalize workspace");
+    let wire = SessionKey::with_profile(profile_id, "api", "restart-derived");
+    let workspaces = SessionWorkspaceStore::default();
+    let orchestrator = InProcessAgentOrchestrator::default();
+
+    reseed_fleet_keeper_candidates(
+        &workspaces,
+        &orchestrator,
+        vec![FleetKeeperSeed {
+            wire: wire.clone(),
+            scope: None,
+            root: workspace.to_string_lossy().into_owned(),
+            workspace_has_runtime_hint: Some(false),
+        }],
+    );
+    let binding = workspaces.snapshot(&wire).expect("reseeded binding");
+    let fresh_cache =
+        crate::runtime::SessionRuntimeCache::new(8, std::time::Duration::from_secs(60))
+            .with_sessions_in_cwd(true);
+    let runtime = fresh_cache
+        .get_or_init(&profile_runtime, wire, binding.runtime_hint)
+        .await
+        .expect("fresh runtime");
+
+    assert_eq!(
+        runtime.sessions_root, profile_runtime.data_dir,
+        "a no-cwd keeper must remain in the profile-global transcript store after restart"
+    );
+}
+
+#[tokio::test]
+async fn should_keep_project_transcript_store_with_fresh_cache_after_explicit_cwd_reseed() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let profile_id = "restart-explicit-cwd";
+    let (_state, profile_runtime) = state_with_profile(temp.path(), profile_id).await;
+    let workspace = temp.path().join("explicit-workspace");
+    std::fs::create_dir_all(&workspace).expect("create explicit workspace");
+    let workspace = std::fs::canonicalize(workspace).expect("canonicalize workspace");
+    let wire = SessionKey::with_profile(profile_id, "api", "restart-explicit");
+    let workspaces = SessionWorkspaceStore::default();
+    let orchestrator = InProcessAgentOrchestrator::default();
+
+    reseed_fleet_keeper_candidates(
+        &workspaces,
+        &orchestrator,
+        vec![FleetKeeperSeed {
+            wire: wire.clone(),
+            scope: None,
+            root: workspace.to_string_lossy().into_owned(),
+            workspace_has_runtime_hint: Some(true),
+        }],
+    );
+    let binding = workspaces.snapshot(&wire).expect("reseeded binding");
+    let fresh_cache =
+        crate::runtime::SessionRuntimeCache::new(8, std::time::Duration::from_secs(60))
+            .with_sessions_in_cwd(true);
+    let runtime = fresh_cache
+        .get_or_init(&profile_runtime, wire, binding.runtime_hint)
+        .await
+        .expect("fresh runtime");
+
+    assert_eq!(
+        runtime.sessions_root,
+        crate::runtime::session::project_sessions_root(&workspace, profile_id),
+        "an explicit cwd keeper must remain in the project transcript store after restart"
+    );
+}
+
 #[test]
 fn review_join_preserves_explicit_final_marker() {
     let summary = ensure_requested_final_marker(

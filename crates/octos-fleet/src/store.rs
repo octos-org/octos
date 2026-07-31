@@ -258,6 +258,7 @@ impl FleetKernelStore {
                     fleet_id: fleet_id.clone(),
                     controller_session_key,
                     controller_workspace_root,
+                    controller_workspace_has_runtime_hint: None,
                     profile_id,
                     budget: FleetBudget {
                         token_budget,
@@ -338,6 +339,34 @@ impl FleetKernelStore {
         plan: DurablePlan,
         now_ms: u64,
     ) -> Result<()> {
+        self.create_fleet_with_plan_and_workspace_provenance(
+            controller_session_key,
+            controller_workspace_root,
+            None,
+            profile_id,
+            token_budget,
+            hard,
+            plan,
+            now_ms,
+        )
+        .await
+    }
+
+    /// Like [`Self::create_fleet_with_plan`], while also persisting whether the
+    /// controller root is a genuine runtime cwd hint. New callers should pass
+    /// `Some(true|false)`; `None` is reserved for legacy/unknown provenance.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn create_fleet_with_plan_and_workspace_provenance(
+        &self,
+        controller_session_key: SessionKey,
+        controller_workspace_root: Option<String>,
+        controller_workspace_has_runtime_hint: Option<bool>,
+        profile_id: &str,
+        token_budget: u64,
+        hard: bool,
+        plan: DurablePlan,
+        now_ms: u64,
+    ) -> Result<()> {
         let fleet_id = plan.fleet_id.clone();
         ensure_key_safe(&[fleet_id.as_str()])?;
         for t in &plan.tasks {
@@ -371,6 +400,7 @@ impl FleetKernelStore {
                     fleet_id: fleet_id.clone(),
                     controller_session_key,
                     controller_workspace_root,
+                    controller_workspace_has_runtime_hint,
                     profile_id,
                     budget: FleetBudget {
                         token_budget,

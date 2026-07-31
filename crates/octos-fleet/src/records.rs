@@ -167,6 +167,13 @@ pub struct FleetRecord {
     /// server-resolved root at fleet-create for this to carry a value at all.
     #[serde(default)]
     pub controller_workspace_root: Option<String>,
+    /// Whether `controller_workspace_root` originated from a genuine runtime
+    /// cwd hint. `Some(true)` means a restarted keeper may reuse the root as a
+    /// transcript-relocation hint; `Some(false)` means it is the derived
+    /// workspace used only by tools/UI. `None` is the legacy/unknown case and
+    /// must be handled like `false` by readers (fail safe: never relocate).
+    #[serde(default)]
+    pub controller_workspace_has_runtime_hint: Option<bool>,
     pub profile_id: String,
     pub budget: FleetBudget,
     pub status: FleetStatus,
@@ -653,10 +660,15 @@ mod tests {
             rec.controller_workspace_root, None,
             "a missing field defaults to None"
         );
+        assert_eq!(
+            rec.controller_workspace_has_runtime_hint, None,
+            "legacy rows have unknown workspace provenance and must fail safe"
+        );
 
         // And a NEW row with the field round-trips it verbatim.
         let with_root = FleetRecord {
             controller_workspace_root: Some("/repos/app".to_owned()),
+            controller_workspace_has_runtime_hint: Some(false),
             ..rec
         };
         let json = serde_json::to_string(&with_root).unwrap();
@@ -664,6 +676,11 @@ mod tests {
         assert_eq!(
             back.controller_workspace_root,
             Some("/repos/app".to_owned())
+        );
+        assert_eq!(
+            back.controller_workspace_has_runtime_hint,
+            Some(false),
+            "derived-workspace provenance round-trips with the root"
         );
     }
 }

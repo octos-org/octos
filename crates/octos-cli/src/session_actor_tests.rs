@@ -2688,8 +2688,15 @@ fn session_actor_renders_fleet_keeper_prompt() {
         ready: "t1".to_owned(),
     };
     let controller = SessionKey::new("api", "keeper-actor");
-    let req =
-        fleet_keeper_continuation_request(&controller, "tenant-c", "fleet-actor", 7, &snap, None);
+    let req = fleet_keeper_continuation_request(
+        &controller,
+        "tenant-c",
+        "fleet-actor",
+        7,
+        &snap,
+        None,
+        None,
+    );
     let mut scheduler = MasterContinuationScheduler::new();
     let item = scheduler.enqueue(req).queued().expect("queued").clone();
 
