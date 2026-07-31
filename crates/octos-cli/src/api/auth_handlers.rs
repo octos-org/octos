@@ -1,8 +1,7 @@
 //! Authentication and user self-service API handlers.
 
 use std::collections::HashMap;
-use std::sync::Arc;
-use std::sync::{LazyLock, Mutex};
+use std::sync::{Arc, LazyLock, Mutex, Weak};
 
 use axum::Json;
 use axum::body::Body;
@@ -1517,6 +1516,10 @@ pub struct VoiceReadiness {
 }
 
 const MAX_SPEECH_SYNTHESIS_CHARS: usize = 4_000;
+const MAX_CONCURRENT_SPEECH_SYNTHESIS_PER_PROFILE: usize = 1;
+
+static SPEECH_SYNTHESIS_LIMITS: LazyLock<Mutex<HashMap<String, Weak<tokio::sync::Semaphore>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 #[derive(Deserialize)]
 pub(crate) struct SpeechSynthesisRequest {
@@ -1535,6 +1538,33 @@ fn validate_synthesis_text(text: &str) -> Result<&str, (StatusCode, String)> {
         ));
     }
     Ok(text)
+}
+
+fn acquire_speech_synthesis_permit(
+    profile_id: &str,
+) -> Result<tokio::sync::OwnedSemaphorePermit, (StatusCode, String)> {
+    let semaphore = {
+        let mut limits = SPEECH_SYNTHESIS_LIMITS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        limits.retain(|_, limit| limit.strong_count() > 0);
+        if let Some(limit) = limits.get(profile_id).and_then(Weak::upgrade) {
+            limit
+        } else {
+            let limit = Arc::new(tokio::sync::Semaphore::new(
+                MAX_CONCURRENT_SPEECH_SYNTHESIS_PER_PROFILE,
+            ));
+            limits.insert(profile_id.to_owned(), Arc::downgrade(&limit));
+            limit
+        }
+    };
+
+    semaphore.try_acquire_owned().map_err(|_| {
+        (
+            StatusCode::TOO_MANY_REQUESTS,
+            "speech synthesis already in progress for this profile".into(),
+        )
+    })
 }
 
 fn speech_audio_content_type(path: &std::path::Path) -> &'static str {
@@ -1564,6 +1594,7 @@ pub(crate) async fn synthesize_speech(
     ))?;
     let profile_id = resolve_my_profile_id(&identity, profile_store, &state, &headers)
         .map_err(|status| (status, "profile unavailable".into()))?;
+    let _synthesis_permit = acquire_speech_synthesis_permit(&profile_id)?;
     let runtime =
         crate::api::ui_protocol::resolve_session_profile_runtime(&state, Some(&profile_id)).ok_or(
             (
@@ -3944,6 +3975,33 @@ mod tests {
             speech_audio_content_type(std::path::Path::new("speech.wav")),
             "audio/wav"
         );
+        assert_eq!(
+            speech_audio_content_type(std::path::Path::new("speech.pcm")),
+            "audio/pcm"
+        );
+        assert_eq!(
+            speech_audio_content_type(std::path::Path::new("speech.ogg")),
+            "audio/ogg"
+        );
+    }
+
+    #[tokio::test]
+    async fn speech_synthesis_limits_concurrency_per_profile() {
+        let profile = format!("speech-limit-{}", uuid::Uuid::now_v7());
+        let other_profile = format!("speech-limit-{}", uuid::Uuid::now_v7());
+
+        let first = acquire_speech_synthesis_permit(&profile).expect("first call is admitted");
+        assert_eq!(
+            acquire_speech_synthesis_permit(&profile).unwrap_err().0,
+            StatusCode::TOO_MANY_REQUESTS
+        );
+        let other = acquire_speech_synthesis_permit(&other_profile).expect("profiles are isolated");
+
+        drop(first);
+        let resumed =
+            acquire_speech_synthesis_permit(&profile).expect("permit is reusable after completion");
+        drop(resumed);
+        drop(other);
     }
     use crate::login_allowlist::{AllowedLogin, LoginAllowlistStore};
     use crate::otp::AuthManager;

@@ -807,6 +807,24 @@ struct VolcanoTts {
     endpoint: String,
 }
 
+pub(crate) fn cloud_audio_file_extension(encoding: &str) -> &'static str {
+    match encoding {
+        "wav" => "wav",
+        "pcm" => "pcm",
+        "ogg_opus" => "ogg",
+        _ => "mp3",
+    }
+}
+
+pub(crate) fn cloud_audio_content_type(encoding: &str) -> &'static str {
+    match encoding {
+        "wav" => "audio/wav",
+        "pcm" => "audio/pcm",
+        "ogg_opus" => "audio/ogg",
+        _ => "audio/mpeg",
+    }
+}
+
 /// Whether the route wants the cloud path. Legacy `volcano` aliases `cloud`.
 fn wants_cloud(provider: &str) -> bool {
     matches!(provider, "auto" | "cloud" | "volcano")
@@ -1005,7 +1023,7 @@ async fn synthesize_volcano(cfg: &VolcanoTts, text: &str, out_dir: &Path) -> Opt
         return None;
     }
 
-    let ext = if cfg.encoding == "wav" { "wav" } else { "mp3" };
+    let ext = cloud_audio_file_extension(&cfg.encoding);
     let out_path = out_dir.join(format!("reply-{reqid}.{ext}"));
     tokio::fs::write(&out_path, &bytes)
         .await
@@ -1047,12 +1065,7 @@ pub(crate) async fn synthesize_reply_streaming(
         return None;
     }
     let cfg = resolve_volcano(cloud)?;
-    let mime = match cfg.encoding.as_str() {
-        "wav" => "audio/wav",
-        "pcm" => "audio/pcm",
-        "ogg_opus" => "audio/ogg",
-        _ => "audio/mpeg",
-    };
+    let mime = cloud_audio_content_type(&cfg.encoding);
     crate::api::volcano_ws::synthesize_ws_stream(
         &cfg.appid,
         &cfg.token,
@@ -1315,6 +1328,19 @@ mod tests {
         assert_eq!(v.cluster, "clu");
         assert_eq!(v.encoding, "wav");
         assert_eq!(v.endpoint, "https://openspeech.bytedance.com/api/v1/tts");
+    }
+
+    #[test]
+    fn should_map_supported_cloud_audio_encodings_to_extension_and_mime() {
+        for (encoding, extension, mime) in [
+            ("mp3", "mp3", "audio/mpeg"),
+            ("wav", "wav", "audio/wav"),
+            ("pcm", "pcm", "audio/pcm"),
+            ("ogg_opus", "ogg", "audio/ogg"),
+        ] {
+            assert_eq!(cloud_audio_file_extension(encoding), extension);
+            assert_eq!(cloud_audio_content_type(encoding), mime);
+        }
     }
 
     #[test]
