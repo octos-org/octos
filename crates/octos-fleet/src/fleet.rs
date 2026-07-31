@@ -218,6 +218,37 @@ impl Fleet {
         tasks: Vec<TaskSpec>,
         now_ms: u64,
     ) -> Result<Fleet> {
+        Self::create_with_workspace_provenance(
+            store,
+            fleet_id,
+            controller_session_key,
+            controller_workspace_root,
+            None,
+            profile_id,
+            budget,
+            objective,
+            tasks,
+            now_ms,
+        )
+        .await
+    }
+
+    /// Create a fleet while preserving the provenance of its controller
+    /// workspace across durable wake/restart boundaries. `None` provenance is
+    /// the legacy/unknown case and must never be treated as a cwd hint.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_with_workspace_provenance(
+        store: Arc<FleetKernelStore>,
+        fleet_id: impl Into<String>,
+        controller_session_key: SessionKey,
+        controller_workspace_root: Option<String>,
+        controller_workspace_has_runtime_hint: Option<bool>,
+        profile_id: impl Into<String>,
+        budget: FleetBudget,
+        objective: impl Into<String>,
+        tasks: Vec<TaskSpec>,
+        now_ms: u64,
+    ) -> Result<Fleet> {
         let fleet_id = fleet_id.into();
         let profile_id = profile_id.into();
         let tasks: Vec<PlanTask> = tasks.into_iter().map(PlanTask::from).collect();
@@ -237,9 +268,10 @@ impl Fleet {
 
         // P2-a: fleet + plan + children in ONE transaction (all-or-nothing).
         store
-            .create_fleet_with_plan(
+            .create_fleet_with_plan_and_workspace_provenance(
                 controller_session_key,
                 controller_workspace_root,
+                controller_workspace_has_runtime_hint,
                 &profile_id,
                 budget.token_budget,
                 budget.hard,

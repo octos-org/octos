@@ -198,6 +198,10 @@ pub(crate) const FLEET_KEEPER_META_READY: &str = "ready";
 /// its workspace-known gate (PR 4b). Omitted when the fleet has no persisted
 /// root (that keeper is simply not headlessly rehydratable).
 pub(crate) const FLEET_KEEPER_META_WORKSPACE_ROOT: &str = "workspace_root";
+/// Metadata key preserving whether `workspace_root` originated from an
+/// explicit runtime cwd hint. Missing/invalid means legacy unknown and is
+/// handled as `false` so a restart never relocates transcripts unsafely.
+pub(crate) const FLEET_KEEPER_META_WORKSPACE_HAS_RUNTIME_HINT: &str = "workspace_has_runtime_hint";
 
 /// PR 4b — upper bound on the VALID (rehydratable) fleet-keeper candidates
 /// [`InProcessAgentOrchestrator::pending_fleet_keeper_seeds`] produces per drain
@@ -230,6 +234,9 @@ pub(crate) struct FleetKeeperSeed {
     /// The persisted controller workspace root, validated to be an existing
     /// directory at selection time.
     pub(crate) root: String,
+    /// `Some(true|false)` for new durable records; `None` for legacy/unknown
+    /// provenance. Only `Some(true)` may reconstruct a runtime cwd hint.
+    pub(crate) workspace_has_runtime_hint: Option<bool>,
 }
 
 /// Peer awaiting-input WAKE — kind label for the `External(_)` master
@@ -343,7 +350,7 @@ pub(crate) struct AgentOutputRequest {
     pub(crate) agent_id: String,
     pub(crate) session_id: Option<SessionKey>,
     pub(crate) profile_id: String,
-    pub(crate) cursor: Option<Value>,
+    pub(crate) cursor: Option<OutputCursor>,
     pub(crate) limit: Option<usize>,
 }
 
@@ -3156,38 +3163,51 @@ impl InProcessAgentOrchestrator {
         Ok(autonomy_goal_json(&snapshot))
     }
 
-    /// #1857 PR 5a — stash the controller workspace root on the goal record at
-    /// goal-turn start. THE LOAD-BEARING SEAM: `run_standalone_turn` resolves
-    /// `session_workspaces().get(wire)` server-side and calls this with the
-    /// already-SCOPED `goal_session_key`, so by the time the keeper's
-    /// `goal_plan` runs mid-turn the root is on the record and `Fleet::create`
-    /// can stamp it onto the `FleetRecord` — a `ChildDone` wake then rehydrates
-    /// a headless keeper across a serve restart (PR 4b). Keyed by the scoped
-    /// goal key DIRECTLY (family-2, like `record_goal_turn`), never re-scoped.
-    /// A `None` root (a headless turn with no live-client workspace) leaves any
-    /// previously-captured root intact rather than stripping the seam. Returns
+    /// #1857 PR 5a — stash the controller workspace binding on the goal record
+    /// at goal-turn start. THE LOAD-BEARING SEAM: `run_standalone_turn` resolves
+    /// one atomic `session_workspaces().snapshot(wire)` and calls this with the
+    /// already-SCOPED `goal_session_key`, so by the time `goal_plan` runs the
+    /// root and its runtime-hint provenance are paired on the durable goal.
+    /// `Fleet::create_with_workspace_provenance` then stamps both onto the fleet
+    /// and its later wake. Keyed by the scoped goal key DIRECTLY (family-2, like
+    /// `record_goal_turn`), never re-scoped. A `None` binding (a headless turn
+    /// with no established workspace) leaves a prior binding intact. Returns
     /// whether a matching goal record was updated.
-    pub(crate) fn set_goal_workspace_root(
+    pub(crate) fn set_goal_workspace_binding(
         &self,
         goal_session_key: &SessionKey,
-        root: Option<String>,
+        binding: Option<(String, bool)>,
     ) -> bool {
-        let Some(root) = root else {
+        let Some((root, has_runtime_hint)) = binding else {
             return false;
         };
         let mut state = self.state();
         let Some(goal) = state.goals.get_mut(goal_session_key) else {
             return false;
         };
-        if goal.controller_workspace_root.as_deref() == Some(root.as_str()) {
+        if goal.controller_workspace_root.as_deref() == Some(root.as_str())
+            && goal.controller_workspace_has_runtime_hint == Some(has_runtime_hint)
+        {
             // Already current — skip the persist churn.
             return true;
         }
         goal.controller_workspace_root = Some(root);
+        goal.controller_workspace_has_runtime_hint = Some(has_runtime_hint);
         goal.updated_at_ms = now_ms();
         let snapshot = goal.clone();
         persist_goal_state(&state, goal_session_key, &snapshot, false);
         true
+    }
+
+    /// Compatibility helper for tests and older in-module call sites that
+    /// establish an authoritative cwd-root binding.
+    #[cfg(test)]
+    pub(crate) fn set_goal_workspace_root(
+        &self,
+        goal_session_key: &SessionKey,
+        root: Option<String>,
+    ) -> bool {
+        self.set_goal_workspace_binding(goal_session_key, root.map(|root| (root, true)))
     }
 
     /// #1857 PR 5a fix (H3, codex round 2) — confirm a fleet record genuinely
@@ -3288,7 +3308,7 @@ impl InProcessAgentOrchestrator {
         // Captured before the state lock (`fleet_pool` takes its own lock); also
         // carries the per-task token projection for the MEDIUM warning below.
         let pool = self.fleet_pool();
-        let (existing_fleet, root, objective, token_budget, goal_id) = {
+        let (existing_fleet, root, workspace_has_runtime_hint, objective, token_budget, goal_id) = {
             let state = self.state();
             let Some(goal) = state.goals.get(&key) else {
                 return Err("no goal is set for this session".to_owned());
@@ -3309,6 +3329,7 @@ impl InProcessAgentOrchestrator {
             (
                 goal.fleet_id.clone(),
                 goal.controller_workspace_root.clone(),
+                goal.controller_workspace_has_runtime_hint,
                 goal.objective.clone(),
                 goal.token_budget,
                 goal.goal_id.clone(),
@@ -3362,12 +3383,13 @@ impl InProcessAgentOrchestrator {
             hard: false,
         };
         let task_count = tasks.len();
-        let reattached = match Fleet::create(
+        let reattached = match Fleet::create_with_workspace_provenance(
             store.clone(),
             fleet_id.clone(),
             // The SCOPED controller session key — the wake round-trip target.
             key.clone(),
             Some(root),
+            workspace_has_runtime_hint,
             profile_id,
             budget,
             objective,
@@ -4104,6 +4126,7 @@ impl InProcessAgentOrchestrator {
                 consecutive_failed_turns: 0,
                 fleet_id: Some(fleet_id.to_owned()),
                 controller_workspace_root: None,
+                controller_workspace_has_runtime_hint: None,
             },
         );
     }
@@ -4247,7 +4270,7 @@ impl InProcessAgentOrchestrator {
         // Phase 1 (under the state lock): snapshot the raw rooted candidates.
         // Rootless keepers are dropped here so they never reach dedupe/cap. No
         // filesystem I/O runs while the lock is held.
-        let raw: Vec<(SessionKey, Option<String>, String)> = {
+        let raw: Vec<(SessionKey, Option<String>, String, Option<bool>)> = {
             let state = self.state();
             state
                 .continuations
@@ -4260,20 +4283,24 @@ impl InProcessAgentOrchestrator {
                 })
                 .filter_map(|it| {
                     let root = it.metadata.get(FLEET_KEEPER_META_WORKSPACE_ROOT)?.clone();
+                    let has_runtime_hint = it
+                        .metadata
+                        .get(FLEET_KEEPER_META_WORKSPACE_HAS_RUNTIME_HINT)
+                        .and_then(|value| value.parse::<bool>().ok());
                     let (wire, scope) = match it.session_id.as_str().split_once("\u{0}~cwd-") {
                         Some((wire, scope)) => {
                             (SessionKey(wire.to_owned()), Some(scope.to_owned()))
                         }
                         None => (SessionKey(it.session_id.as_str().to_owned()), None),
                     };
-                    Some((wire, scope, root))
+                    Some((wire, scope, root, has_runtime_hint))
                 })
                 .collect()
         };
 
         // Phase 2 (no lock): is_dir validation → dedupe by wire → cap.
         let mut out: Vec<FleetKeeperSeed> = Vec::new();
-        for (wire, scope, root) in raw {
+        for (wire, scope, root, workspace_has_runtime_hint) in raw {
             if !std::path::Path::new(&root).is_dir() {
                 tracing::warn!(
                     target = "octos::fleet",
@@ -4284,7 +4311,10 @@ impl InProcessAgentOrchestrator {
                 continue;
             }
             if let Some(existing) = out.iter().find(|s| s.wire == wire) {
-                if existing.root != root || existing.scope != scope {
+                if existing.root != root
+                    || existing.scope != scope
+                    || existing.workspace_has_runtime_hint != workspace_has_runtime_hint
+                {
                     tracing::warn!(
                         target = "octos::fleet",
                         wire_key = %wire.0,
@@ -4292,12 +4322,19 @@ impl InProcessAgentOrchestrator {
                         first_scope = ?existing.scope,
                         conflicting_root = %root,
                         conflicting_scope = ?scope,
+                        first_has_runtime_hint = ?existing.workspace_has_runtime_hint,
+                        conflicting_has_runtime_hint = ?workspace_has_runtime_hint,
                         "fleet-keeper seed: two candidates for one wire key; keeping the first"
                     );
                 }
                 continue;
             }
-            out.push(FleetKeeperSeed { wire, scope, root });
+            out.push(FleetKeeperSeed {
+                wire,
+                scope,
+                root,
+                workspace_has_runtime_hint,
+            });
             if out.len() >= FLEET_KEEPER_SEED_CAP {
                 // P2 (codex round 3): >CAP distinct valid wires this tick. The
                 // rest are deferred to a later tick (they stay pending) — log it
@@ -4486,7 +4523,7 @@ impl AgentOrchestrator for InProcessAgentOrchestrator {
     fn read_agent_output(&self, request: AgentOutputRequest) -> Result<Value, RpcError> {
         let state = self.state();
         let profile_id = request.profile_id.clone();
-        let cursor = request.cursor.clone();
+        let cursor = request.cursor;
         let limit = request.limit;
         let agent = get_agent(
             &state,
@@ -4496,13 +4533,7 @@ impl AgentOrchestrator for InProcessAgentOrchestrator {
                 profile_id,
             },
         )?;
-        let window = agent_output_window(
-            &agent.output,
-            cursor.as_ref(),
-            limit,
-            &agent.session_id,
-            &agent.profile_id,
-        )?;
+        let window = agent_output_window(&agent.output, cursor.as_ref(), limit);
         Ok(json!({
             "agent_id": agent.agent_id,
             "session_id": agent.session_id,
@@ -5002,6 +5033,7 @@ impl AgentOrchestrator for InProcessAgentOrchestrator {
                 // and the keeper's `goal_plan` decomposes onto a fleet.
                 fleet_id: None,
                 controller_workspace_root: None,
+                controller_workspace_has_runtime_hint: None,
             };
             state.goals.insert(key.clone(), goal.clone());
             goal
@@ -5549,13 +5581,16 @@ struct AutonomyGoalRecord {
     /// the `SupervisedGroupRecord.metadata` open bag — no schema bump.
     fleet_id: Option<String>,
     /// #1857 PR 5a — the controller workspace root captured at goal-turn start
-    /// from `session_workspaces().get(wire)` (the LOAD-BEARING seam:
-    /// `Fleet::create` stamps this onto the `FleetRecord` so a `ChildDone` wake
-    /// can rehydrate a headless keeper across a serve restart — PR 4b). `None`
+    /// from one `session_workspaces().snapshot(wire)` (the LOAD-BEARING seam:
+    /// fleet create stamps it and the paired provenance onto `FleetRecord` so a
+    /// `ChildDone` wake can rehydrate a headless keeper across restart). `None`
     /// until a live-client goal turn stashes it; `goal_plan` refuses to create a
-    /// fleet without it (an un-rehydratable fleet). Persisted in the metadata
-    /// bag alongside `fleet_id`.
+    /// fleet without it. Persisted in the metadata bag alongside `fleet_id`.
     controller_workspace_root: Option<String>,
+    /// Provenance paired with `controller_workspace_root`: `Some(true)` for an
+    /// explicit cwd, `Some(false)` for a derived Tier-3 root, `None` for legacy
+    /// records whose provenance is unknown (and therefore unsafe as a hint).
+    controller_workspace_has_runtime_hint: Option<bool>,
 }
 
 #[derive(Debug, Clone)]
@@ -5985,6 +6020,26 @@ fn agent_invalid_params_error(
         data.insert(key.into(), json!(value));
     }
     RpcError::invalid_params(message).with_data(Value::Object(data))
+}
+
+pub(crate) fn parse_agent_output_cursor(
+    cursor: Option<Value>,
+    session_id: Option<&SessionKey>,
+    profile_id: &str,
+) -> Result<Option<OutputCursor>, RpcError> {
+    let Some(cursor) = cursor else {
+        return Ok(None);
+    };
+    let Some(offset) = cursor.get("offset").and_then(Value::as_u64) else {
+        return Err(agent_invalid_params_error(
+            AGENT_OUTPUT_CURSOR_INVALID,
+            "agent output cursor must be an object with numeric offset",
+            session_id,
+            Some(profile_id),
+            None,
+        ));
+    };
+    Ok(Some(OutputCursor { offset }))
 }
 
 fn session_controls_target(requested: &SessionKey, target: &SessionKey) -> bool {
@@ -7085,6 +7140,10 @@ fn restore_goal_from_group(state: &mut AutonomyRuntimeState, group: &SupervisedG
             "controller_workspace_root",
         )
         .map(str::to_owned),
+        controller_workspace_has_runtime_hint: supervisor_metadata_bool(
+            &group.metadata,
+            "controller_workspace_has_runtime_hint",
+        ),
     };
     state.next_goal_seq = state.next_goal_seq.max(sequence_suffix(&goal.goal_id));
     state.goals.insert(session_id, goal);
@@ -7319,6 +7378,7 @@ fn persist_goal_cleared(state: &AutonomyRuntimeState, session_id: &SessionKey, p
         // PR 5a — a cleared goal drives no fleet.
         fleet_id: None,
         controller_workspace_root: None,
+        controller_workspace_has_runtime_hint: None,
     };
     persist_goal_state(state, session_id, &goal, true);
 }
@@ -7406,6 +7466,10 @@ fn persist_goal_state_with_store(
     group.metadata.insert(
         "controller_workspace_root".into(),
         json!(goal.controller_workspace_root),
+    );
+    group.metadata.insert(
+        "controller_workspace_has_runtime_hint".into(),
+        json!(goal.controller_workspace_has_runtime_hint),
     );
     let event_id = format!(
         "autonomy_goal_state:{}:{}",
@@ -7869,50 +7933,34 @@ struct AgentOutputWindow {
 
 fn agent_output_window(
     text: &str,
-    cursor: Option<&Value>,
+    cursor: Option<&OutputCursor>,
     limit: Option<usize>,
-    session_id: &SessionKey,
-    profile_id: &str,
-) -> Result<AgentOutputWindow, RpcError> {
-    let start_offset = agent_output_cursor_offset(cursor, text, session_id, profile_id)?;
+) -> AgentOutputWindow {
+    let start_offset = agent_output_cursor_offset(cursor, text);
     let limit = limit.unwrap_or(usize::MAX);
     let mut end_offset = start_offset.saturating_add(limit).min(text.len());
     while end_offset > start_offset && !text.is_char_boundary(end_offset) {
         end_offset -= 1;
     }
 
-    Ok(AgentOutputWindow {
+    AgentOutputWindow {
         start_offset,
         end_offset,
         text: text[start_offset..end_offset].to_owned(),
-    })
+    }
 }
 
-fn agent_output_cursor_offset(
-    cursor: Option<&Value>,
-    text: &str,
-    session_id: &SessionKey,
-    profile_id: &str,
-) -> Result<usize, RpcError> {
+fn agent_output_cursor_offset(cursor: Option<&OutputCursor>, text: &str) -> usize {
     let Some(cursor) = cursor else {
-        return Ok(0);
+        return 0;
     };
-    let Some(offset) = cursor.get("offset").and_then(Value::as_u64) else {
-        return Err(agent_invalid_params_error(
-            AGENT_OUTPUT_CURSOR_INVALID,
-            "agent output cursor must be an object with numeric offset",
-            Some(session_id),
-            Some(profile_id),
-            None,
-        ));
-    };
-    let mut offset = usize::try_from(offset)
+    let mut offset = usize::try_from(cursor.offset)
         .unwrap_or(usize::MAX)
         .min(text.len());
     while offset < text.len() && !text.is_char_boundary(offset) {
         offset += 1;
     }
-    Ok(offset)
+    offset
 }
 
 fn ensure_loop_scope(
@@ -8784,7 +8832,7 @@ mod tests {
         // Stash the controller workspace root under the SCOPED key (the seam
         // `run_standalone_turn` fills at goal-turn start).
         let root = "/repos/app".to_owned();
-        assert!(orchestrator.set_goal_workspace_root(&scoped, Some(root.clone())));
+        assert!(orchestrator.set_goal_workspace_binding(&scoped, Some((root.clone(), true))));
 
         // goal_plan — the tool passes the PLAIN wire key; the method re-scopes.
         let outcome = orchestrator
@@ -8814,6 +8862,11 @@ mod tests {
             Some(root.as_str()),
             "the fleet MUST carry the stashed workspace root (4b rehydration)",
         );
+        assert_eq!(
+            rec.controller_workspace_has_runtime_hint,
+            Some(true),
+            "the fleet MUST preserve that the root came from an explicit cwd",
+        );
 
         // Idempotent: a second plan returns already_planned with the same id.
         let again = orchestrator
@@ -8822,6 +8875,39 @@ mod tests {
             .expect("plan again");
         assert_eq!(again["status"], json!("already_planned"));
         assert_eq!(again["fleet_id"].as_str(), Some(fleet_id.as_str()));
+    }
+
+    #[tokio::test]
+    async fn should_persist_derived_workspace_provenance_when_goal_creates_fleet() {
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let (_sd, store) = fleet_test_store().await;
+        orchestrator.set_fleet_store(store.clone());
+        let wire = SessionKey::new("api", "keeper-derived-workspace");
+        seed_goal(&orchestrator, &wire, "tenant-a");
+        let scoped = orchestrator.scoped_goal_key(&wire);
+        let root = "/profile/users/u/workspace".to_owned();
+
+        assert!(orchestrator.set_goal_workspace_binding(&scoped, Some((root.clone(), false)),));
+        let outcome = orchestrator
+            .model_create_fleet_plan(&wire, "tenant-a", plan_tasks(), 1_000)
+            .await
+            .expect("plan");
+        let fleet_id = outcome["fleet_id"].as_str().expect("fleet id");
+        let rec = store
+            .get_fleet(fleet_id)
+            .await
+            .expect("get fleet")
+            .expect("fleet exists");
+
+        assert_eq!(
+            rec.controller_workspace_root.as_deref(),
+            Some(root.as_str())
+        );
+        assert_eq!(
+            rec.controller_workspace_has_runtime_hint,
+            Some(false),
+            "a Tier-3 root must not become a cwd hint after persistence"
+        );
     }
 
     /// `goal_plan` refuses to create an un-rehydratable fleet: no stashed
@@ -9050,9 +9136,9 @@ mod tests {
         );
     }
 
-    /// `set_goal_workspace_root` RMW round-trips through the metadata bag: a
-    /// fresh orchestrator loading the SAME supervisor store restores the stashed
-    /// root. Also: a `None` root leaves a prior root intact (never strips it).
+    /// Workspace binding RMW round-trips root + provenance through the metadata
+    /// bag. A fresh orchestrator loading the SAME supervisor store restores both;
+    /// a `None` binding leaves a prior binding intact (never strips it).
     #[test]
     fn workspace_root_stash_persists_on_the_goal_record() {
         let dir = tempfile::TempDir::new().unwrap();
@@ -9066,13 +9152,16 @@ mod tests {
         let scoped = orchestrator.scoped_goal_key(&wire);
         assert_eq!(orchestrator.goal_workspace_root_for_test(&wire), None);
 
-        assert!(orchestrator.set_goal_workspace_root(&scoped, Some("/repos/app".to_owned())));
+        assert!(
+            orchestrator
+                .set_goal_workspace_binding(&scoped, Some(("/repos/app".to_owned(), false)),)
+        );
         assert_eq!(
             orchestrator.goal_workspace_root_for_test(&wire).as_deref(),
             Some("/repos/app"),
         );
         // A None root (headless turn) must NOT strip a captured root.
-        assert!(!orchestrator.set_goal_workspace_root(&scoped, None));
+        assert!(!orchestrator.set_goal_workspace_binding(&scoped, None));
         assert_eq!(
             orchestrator.goal_workspace_root_for_test(&wire).as_deref(),
             Some("/repos/app"),
@@ -9087,6 +9176,16 @@ mod tests {
             restored.goal_workspace_root_for_test(&wire).as_deref(),
             Some("/repos/app"),
             "the root round-trips through the metadata bag",
+        );
+        let restored_key = restored.scoped_goal_key(&wire);
+        assert_eq!(
+            restored
+                .state()
+                .goals
+                .get(&restored_key)
+                .and_then(|goal| goal.controller_workspace_has_runtime_hint),
+            Some(false),
+            "derived-workspace provenance round-trips with the root",
         );
     }
 
@@ -10477,7 +10576,7 @@ mod tests {
                 agent_id: "agent-output".into(),
                 session_id: Some(session_id.clone()),
                 profile_id: "tenant-a".into(),
-                cursor: Some(json!({ "offset": 6 })),
+                cursor: Some(OutputCursor { offset: 6 }),
                 limit: Some(5),
             })
             .expect("windowed output");
@@ -13420,6 +13519,82 @@ mod tests {
             .expect("raising the budget above tokens_used resumes the goal");
         assert_eq!(resumed["goal"]["status"], json!("active"));
         assert_eq!(resumed["goal"]["token_budget"].as_u64(), Some(5_000));
+    }
+
+    /// Goal-budget re-arm: after a `budget_limited` goal is legitimately
+    /// reactivated by RAISING its budget above `tokens_used`, the
+    /// budget-exhaustion flip must RE-ARM. A subsequent interactive charge
+    /// that crosses the NEW budget flips the goal straight back to
+    /// `budget_limited` instead of accruing unbounded past budget (the
+    /// `10925K/2000K` runaway). Reactivation resets `wrap_up_emitted`
+    /// (`set_goal`), so `charge_active_goal_tokens`'s gate
+    /// (`used >= budget && !wrap_up_emitted`) fires again in the new window.
+    #[test]
+    fn charge_re_arms_budget_flip_after_raised_budget_reactivation() {
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let session_id = SessionKey::with_profile("tenant-a", "api", "goal-rearm");
+        // Active goal with a small budget.
+        orchestrator
+            .set_goal(GoalSetRequest {
+                session_id: session_id.clone(),
+                profile_id: "tenant-a".into(),
+                objective: "sprawling world cup site".into(),
+                status: Some("active".into()),
+                token_budget: Some(2_000),
+                transition_actor: None,
+            })
+            .expect("set active goal");
+        let goal_id = orchestrator
+            .active_goal_id(&session_id, "tenant-a")
+            .expect("active goal id");
+
+        // First exhaustion: an interactive charge crosses the 2k budget and
+        // flips the goal to budget_limited (also sets wrap_up_emitted = true).
+        orchestrator.charge_active_goal_tokens(&session_id, "tenant-a", &goal_id, 2_000, 1);
+        assert_eq!(
+            orchestrator.goal_status_for_test(&session_id).as_deref(),
+            Some("budget_limited"),
+            "crossing the budget flips the goal to budget_limited",
+        );
+
+        // Legitimate resume: raise the budget above tokens_used and reactivate.
+        let resumed = orchestrator
+            .set_goal(GoalSetRequest {
+                session_id: session_id.clone(),
+                profile_id: "tenant-a".into(),
+                objective: "sprawling world cup site".into(),
+                status: Some("active".into()),
+                token_budget: Some(4_000),
+                transition_actor: Some("user".into()),
+            })
+            .expect("raising the budget above tokens_used resumes the goal");
+        assert_eq!(resumed["goal"]["status"], json!("active"));
+        // The record is reused in place — the goal_id is stable across resume.
+        assert_eq!(
+            orchestrator
+                .active_goal_id(&session_id, "tenant-a")
+                .as_deref(),
+            Some(goal_id.as_str()),
+            "reactivation reuses the same goal record",
+        );
+
+        // Re-arm proof: a second interactive charge crosses the NEW 4k budget
+        // (tokens_used 2k → 4k). The flip MUST fire again — the goal must not
+        // stay `active` and accrue unbounded past the (new) budget.
+        orchestrator.charge_active_goal_tokens(&session_id, "tenant-a", &goal_id, 2_000, 1);
+        assert_eq!(
+            orchestrator.goal_status_for_test(&session_id).as_deref(),
+            Some("budget_limited"),
+            "re-arm: crossing the raised budget must flip the resumed goal back \
+             to budget_limited, not accrue unbounded",
+        );
+        let (tokens_used, _, _) = orchestrator
+            .goal_counters_for_test(&session_id)
+            .expect("goal exists");
+        assert_eq!(
+            tokens_used, 4_000,
+            "tokens_used lands exactly at the raised budget when the flip re-arms",
+        );
     }
 
     /// Fix A (codex HIGH): the reactivation guard only covers non-active →
