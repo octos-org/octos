@@ -7,8 +7,8 @@ use axum::Json;
 use axum::body::Body;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
-use axum::response::Response;
 use axum::response::sse::{Event, KeepAlive, Sse};
+use axum::response::{IntoResponse, Response};
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -1517,22 +1517,111 @@ pub struct VoiceReadiness {
 
 const MAX_SPEECH_SYNTHESIS_CHARS: usize = 4_000;
 const MAX_CONCURRENT_SPEECH_SYNTHESIS_PER_PROFILE: usize = 1;
+const MAX_SPEECH_SYNTHESIS_REQUESTS_PER_WINDOW: u32 = 20;
+const MAX_SPEECH_SYNTHESIS_CHARS_PER_WINDOW: usize = 20_000;
+const SPEECH_SYNTHESIS_QUOTA_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
 
 static SPEECH_SYNTHESIS_LIMITS: LazyLock<Mutex<HashMap<String, Weak<tokio::sync::Semaphore>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
+static SPEECH_SYNTHESIS_QUOTAS: LazyLock<Mutex<HashMap<String, SpeechSynthesisQuota>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+#[derive(Debug)]
+pub(crate) struct SpeechSynthesisError {
+    status: StatusCode,
+    message: String,
+    retry_after_seconds: Option<u64>,
+}
+
+impl SpeechSynthesisError {
+    fn new(status: StatusCode, message: impl Into<String>) -> Self {
+        Self {
+            status,
+            message: message.into(),
+            retry_after_seconds: None,
+        }
+    }
+
+    fn rate_limited(message: impl Into<String>, retry_after_seconds: u64) -> Self {
+        Self {
+            status: StatusCode::TOO_MANY_REQUESTS,
+            message: message.into(),
+            retry_after_seconds: Some(retry_after_seconds.max(1)),
+        }
+    }
+}
+
+impl IntoResponse for SpeechSynthesisError {
+    fn into_response(self) -> Response {
+        let mut response = (self.status, self.message).into_response();
+        if let Some(seconds) = self.retry_after_seconds
+            && let Ok(value) = HeaderValue::from_str(&seconds.to_string())
+        {
+            response.headers_mut().insert(header::RETRY_AFTER, value);
+        }
+        response
+    }
+}
+
+#[derive(Debug)]
+struct SpeechSynthesisQuota {
+    started_at: std::time::Instant,
+    requests: u32,
+    characters: usize,
+}
+
+impl SpeechSynthesisQuota {
+    fn new(started_at: std::time::Instant) -> Self {
+        Self {
+            started_at,
+            requests: 0,
+            characters: 0,
+        }
+    }
+
+    fn consume(
+        &mut self,
+        characters: usize,
+        now: std::time::Instant,
+    ) -> Result<(), SpeechSynthesisError> {
+        let elapsed = now.saturating_duration_since(self.started_at);
+        if elapsed >= SPEECH_SYNTHESIS_QUOTA_WINDOW {
+            *self = Self::new(now);
+        }
+        if self.requests >= MAX_SPEECH_SYNTHESIS_REQUESTS_PER_WINDOW
+            || self.characters.saturating_add(characters) > MAX_SPEECH_SYNTHESIS_CHARS_PER_WINDOW
+        {
+            let remaining = SPEECH_SYNTHESIS_QUOTA_WINDOW
+                .saturating_sub(now.saturating_duration_since(self.started_at));
+            let retry_after_seconds = remaining.as_secs() + u64::from(remaining.subsec_nanos() > 0);
+            return Err(SpeechSynthesisError::rate_limited(
+                format!(
+                    "speech synthesis quota exceeded; limit is {MAX_SPEECH_SYNTHESIS_REQUESTS_PER_WINDOW} requests or {MAX_SPEECH_SYNTHESIS_CHARS_PER_WINDOW} characters per minute"
+                ),
+                retry_after_seconds,
+            ));
+        }
+        self.requests += 1;
+        self.characters += characters;
+        Ok(())
+    }
+}
 
 #[derive(Deserialize)]
 pub(crate) struct SpeechSynthesisRequest {
     pub text: String,
 }
 
-fn validate_synthesis_text(text: &str) -> Result<&str, (StatusCode, String)> {
+fn validate_synthesis_text(text: &str) -> Result<&str, SpeechSynthesisError> {
     let text = text.trim();
     if text.is_empty() {
-        return Err((StatusCode::BAD_REQUEST, "text must not be empty".into()));
+        return Err(SpeechSynthesisError::new(
+            StatusCode::BAD_REQUEST,
+            "text must not be empty",
+        ));
     }
     if text.chars().count() > MAX_SPEECH_SYNTHESIS_CHARS {
-        return Err((
+        return Err(SpeechSynthesisError::new(
             StatusCode::PAYLOAD_TOO_LARGE,
             format!("text exceeds {MAX_SPEECH_SYNTHESIS_CHARS} characters"),
         ));
@@ -1542,7 +1631,7 @@ fn validate_synthesis_text(text: &str) -> Result<&str, (StatusCode, String)> {
 
 fn acquire_speech_synthesis_permit(
     profile_id: &str,
-) -> Result<tokio::sync::OwnedSemaphorePermit, (StatusCode, String)> {
+) -> Result<tokio::sync::OwnedSemaphorePermit, SpeechSynthesisError> {
     let semaphore = {
         let mut limits = SPEECH_SYNTHESIS_LIMITS
             .lock()
@@ -1560,11 +1649,28 @@ fn acquire_speech_synthesis_permit(
     };
 
     semaphore.try_acquire_owned().map_err(|_| {
-        (
-            StatusCode::TOO_MANY_REQUESTS,
-            "speech synthesis already in progress for this profile".into(),
+        SpeechSynthesisError::rate_limited(
+            "speech synthesis already in progress for this profile",
+            1,
         )
     })
+}
+
+fn consume_speech_synthesis_quota(
+    profile_id: &str,
+    characters: usize,
+) -> Result<(), SpeechSynthesisError> {
+    let now = std::time::Instant::now();
+    let mut quotas = SPEECH_SYNTHESIS_QUOTAS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    quotas.retain(|_, quota| {
+        now.saturating_duration_since(quota.started_at) < SPEECH_SYNTHESIS_QUOTA_WINDOW
+    });
+    quotas
+        .entry(profile_id.to_owned())
+        .or_insert_with(|| SpeechSynthesisQuota::new(now))
+        .consume(characters, now)
 }
 
 fn speech_audio_content_type(path: &std::path::Path) -> &'static str {
@@ -1586,28 +1692,29 @@ pub(crate) async fn synthesize_speech(
     headers: HeaderMap,
     axum::Extension(identity): axum::Extension<AuthIdentity>,
     Json(request): Json<SpeechSynthesisRequest>,
-) -> Result<Response, (StatusCode, String)> {
+) -> Result<Response, SpeechSynthesisError> {
     let text = validate_synthesis_text(&request.text)?;
-    let profile_store = state.profile_store.as_ref().ok_or((
-        StatusCode::SERVICE_UNAVAILABLE,
-        "profile store unavailable".into(),
-    ))?;
+    let profile_store = state.profile_store.as_ref().ok_or_else(|| {
+        SpeechSynthesisError::new(StatusCode::SERVICE_UNAVAILABLE, "profile store unavailable")
+    })?;
     let profile_id = resolve_my_profile_id(&identity, profile_store, &state, &headers)
-        .map_err(|status| (status, "profile unavailable".into()))?;
+        .map_err(|status| SpeechSynthesisError::new(status, "profile unavailable"))?;
     let _synthesis_permit = acquire_speech_synthesis_permit(&profile_id)?;
+    consume_speech_synthesis_quota(&profile_id, text.chars().count())?;
     let runtime =
-        crate::api::ui_protocol::resolve_session_profile_runtime(&state, Some(&profile_id)).ok_or(
-            (
-                StatusCode::SERVICE_UNAVAILABLE,
-                "profile runtime unavailable".into(),
-            ),
-        )?;
+        crate::api::ui_protocol::resolve_session_profile_runtime(&state, Some(&profile_id))
+            .ok_or_else(|| {
+                SpeechSynthesisError::new(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "profile runtime unavailable",
+                )
+            })?;
     let voice = crate::api::voices::resolve_reply_voice(&profile_id, &runtime.voice.default_voice);
     let output_dir = tempfile::tempdir().map_err(|error| {
         tracing::error!(%error, "failed to create speech synthesis temp directory");
-        (
+        SpeechSynthesisError::new(
             StatusCode::INTERNAL_SERVER_ERROR,
-            "failed to prepare speech synthesis".into(),
+            "failed to prepare speech synthesis",
         )
     })?;
     let audio_path = crate::api::voice_turn::synthesize_reply(
@@ -1618,16 +1725,18 @@ pub(crate) async fn synthesize_speech(
         output_dir.path(),
     )
     .await
-    .ok_or((
-        StatusCode::BAD_GATEWAY,
-        "configured TTS provider failed to synthesize speech".into(),
-    ))?;
+    .ok_or_else(|| {
+        SpeechSynthesisError::new(
+            StatusCode::BAD_GATEWAY,
+            "configured TTS provider failed to synthesize speech",
+        )
+    })?;
     let content_type = speech_audio_content_type(&audio_path);
     let audio = tokio::fs::read(&audio_path).await.map_err(|error| {
         tracing::error!(%error, path = %audio_path.display(), "failed to read synthesized speech");
-        (
+        SpeechSynthesisError::new(
             StatusCode::INTERNAL_SERVER_ERROR,
-            "failed to read synthesized speech".into(),
+            "failed to read synthesized speech",
         )
     })?;
     let mut response = Response::new(Body::from(audio));
@@ -3951,12 +4060,12 @@ mod tests {
     #[test]
     fn speech_synthesis_rejects_blank_and_oversized_text() {
         assert_eq!(
-            validate_synthesis_text("  ").unwrap_err().0,
+            validate_synthesis_text("  ").unwrap_err().status,
             StatusCode::BAD_REQUEST
         );
         let oversized = "旁".repeat(MAX_SPEECH_SYNTHESIS_CHARS + 1);
         assert_eq!(
-            validate_synthesis_text(&oversized).unwrap_err().0,
+            validate_synthesis_text(&oversized).unwrap_err().status,
             StatusCode::PAYLOAD_TOO_LARGE
         );
     }
@@ -3992,7 +4101,9 @@ mod tests {
 
         let first = acquire_speech_synthesis_permit(&profile).expect("first call is admitted");
         assert_eq!(
-            acquire_speech_synthesis_permit(&profile).unwrap_err().0,
+            acquire_speech_synthesis_permit(&profile)
+                .unwrap_err()
+                .status,
             StatusCode::TOO_MANY_REQUESTS
         );
         let other = acquire_speech_synthesis_permit(&other_profile).expect("profiles are isolated");
@@ -4002,6 +4113,39 @@ mod tests {
             acquire_speech_synthesis_permit(&profile).expect("permit is reusable after completion");
         drop(resumed);
         drop(other);
+    }
+
+    #[test]
+    fn speech_synthesis_quota_bounds_requests_and_characters_per_window() {
+        let started_at = std::time::Instant::now();
+        let mut request_quota = SpeechSynthesisQuota::new(started_at);
+        for _ in 0..MAX_SPEECH_SYNTHESIS_REQUESTS_PER_WINDOW {
+            request_quota.consume(1, started_at).unwrap();
+        }
+        let request_error = request_quota.consume(1, started_at).unwrap_err();
+        assert_eq!(request_error.status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(request_error.retry_after_seconds, Some(60));
+
+        let mut character_quota = SpeechSynthesisQuota::new(started_at);
+        character_quota
+            .consume(MAX_SPEECH_SYNTHESIS_CHARS_PER_WINDOW, started_at)
+            .unwrap();
+        assert_eq!(
+            character_quota.consume(1, started_at).unwrap_err().status,
+            StatusCode::TOO_MANY_REQUESTS
+        );
+
+        request_quota
+            .consume(1, started_at + SPEECH_SYNTHESIS_QUOTA_WINDOW)
+            .expect("a new window restores the profile budget");
+    }
+
+    #[test]
+    fn speech_synthesis_rate_limit_response_sets_retry_after() {
+        let response = SpeechSynthesisError::rate_limited("speech synthesis quota exceeded", 17)
+            .into_response();
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(response.headers().get(header::RETRY_AFTER).unwrap(), "17");
     }
     use crate::login_allowlist::{AllowedLogin, LoginAllowlistStore};
     use crate::otp::AuthManager;
