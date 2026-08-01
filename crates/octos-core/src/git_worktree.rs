@@ -74,17 +74,30 @@ const NO_FSMONITOR: &str = "core.fsmonitor=";
 /// full-FS (`FilesystemScope::Host`) write, so a bare `git` (PATH-resolved) would
 /// let it plant a fake `git` earlier in the controller's `$PATH` (or in a
 /// user-writable dir like `/opt/homebrew/bin`) and have the CONTROLLER, running
-/// UNSANDBOXED, execute it. Pin to `/usr/bin/git` / `/bin/git` (root-owned /
-/// SIP-protected — not worker-writable); the fallback stays ABSOLUTE so there is
-/// never a `$PATH` lookup. Mirrors the timeout-kill's `KILL_BIN`/`PS_BIN`.
+/// UNSANDBOXED, execute it. Pin to `/usr/bin/git` / `/bin/git` on Unix or the
+/// administrator-protected Git for Windows installation under `Program Files`;
+/// the fallback stays ABSOLUTE so there is never a `$PATH` lookup. Mirrors the
+/// timeout-kill's `KILL_BIN`/`PS_BIN`.
 /// (Homebrew/`/usr/local` are deliberately NOT candidates — they are
 /// user/daemon-writable, which is exactly the plant vector.)
+#[cfg(unix)]
+const SYSTEM_GIT_CANDIDATES: &[&str] = &["/usr/bin/git", "/bin/git"];
+
+#[cfg(windows)]
+const SYSTEM_GIT_CANDIDATES: &[&str] = &[
+    r"C:\Program Files\Git\cmd\git.exe",
+    r"C:\Program Files\Git\bin\git.exe",
+];
+
+#[cfg(not(any(unix, windows)))]
+const SYSTEM_GIT_CANDIDATES: &[&str] = &["/usr/bin/git"];
+
 static GIT_BIN: std::sync::LazyLock<PathBuf> = std::sync::LazyLock::new(|| {
-    ["/usr/bin/git", "/bin/git"]
-        .into_iter()
+    SYSTEM_GIT_CANDIDATES
+        .iter()
         .map(PathBuf::from)
         .find(|p| p.exists())
-        .unwrap_or_else(|| PathBuf::from("/usr/bin/git"))
+        .unwrap_or_else(|| PathBuf::from(SYSTEM_GIT_CANDIDATES[0]))
 });
 
 /// Build the base `git -C <repo> …` command with the controller-side code-exec
