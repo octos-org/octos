@@ -35,10 +35,12 @@
 //!   worker-planted `git` in a controller-`$PATH` dir is never run), (2) STRIPS
 //!   provider/API-key + injection env vars ([`crate::env_hygiene`] — so no
 //!   controller secret is inherited), and (3) sets hooks
-//!   (`core.hooksPath=/dev/null`), fsmonitor (`core.fsmonitor=`), and
-//!   global/system config (`GIT_CONFIG_GLOBAL`/`GIT_CONFIG_SYSTEM=/dev/null`) to
-//!   empty, so no hook/fsmonitor fires and no global/system-config `filter.*`
-//!   runs on a controller op.
+//!   (`core.hooksPath=<null device>`), fsmonitor (`core.fsmonitor=`), and
+//!   global/system config
+//!   (`GIT_CONFIG_GLOBAL`/`GIT_CONFIG_SYSTEM=<null device>`) to empty, so no
+//!   hook/fsmonitor fires and no global/system-config `filter.*` runs on a
+//!   controller op. The null device is [`NULL_DEVICE`] — `/dev/null`, or `NUL`
+//!   on Windows.
 //! - **(b) no host-side checkout + in-sandbox populate/commit:** every controller
 //!   `git worktree add` uses `--no-checkout`, so a worker-planted LOCAL
 //!   `.git/config` `filter.*.smudge` never runs host-side as the daemon. The
@@ -58,33 +60,71 @@ use std::process::Command;
 
 use eyre::{Result, WrapErr, eyre};
 
-/// `-c core.hooksPath=/dev/null`: disables ALL git hooks for a controller-side
-/// invocation (`/dev/null` can never be a hooks directory, so no hook is ever
-/// found). One part of the code-exec fence — see the module note and
-/// [`git_command`].
+/// The platform's null device: a path that can never be a directory and never
+/// holds config. `/dev/null` on Unix, `NUL` on Windows — a reserved device name,
+/// so it is the exact analogue.
+///
+/// On Windows the old hardcoded `/dev/null` did still mask config and hooks, but
+/// only by ACCIDENT: it is not the null device there, merely a path that happens
+/// not to exist. That is a property of the filesystem, not a guarantee — create
+/// `C:\dev\null` and the fence silently opens. `NUL` cannot be a directory or a
+/// readable config no matter what is on disk.
+#[cfg(not(windows))]
+const NULL_DEVICE: &str = "/dev/null";
+#[cfg(windows)]
+const NULL_DEVICE: &str = "NUL";
+
+/// `-c core.hooksPath=<null device>`: disables ALL git hooks for a
+/// controller-side invocation (the null device can never be a hooks directory,
+/// so no hook is ever found). One part of the code-exec fence — see the module
+/// note and [`git_command`].
+#[cfg(not(windows))]
 const NO_HOOKS: &str = "core.hooksPath=/dev/null";
+#[cfg(windows)]
+const NO_HOOKS: &str = "core.hooksPath=NUL";
 
 /// `-c core.fsmonitor=`: override any worker-set local `core.fsmonitor` to EMPTY
 /// so no fsmonitor hook program can run on a controller-side git op (defensive
 /// belt — these ops don't scan the index, but override unconditionally).
 const NO_FSMONITOR: &str = "core.fsmonitor=";
 
+/// Candidate absolute `git` paths, most-preferred first. Every entry MUST be a
+/// location a fleet worker cannot write to (see [`GIT_BIN`]).
+///
+/// On Windows the analogue of `/usr/bin` is `%ProgramFiles%\Git`, which requires
+/// Administrator to write. `%LOCALAPPDATA%\Programs\Git` — where Git for Windows
+/// installs in per-user mode — is deliberately EXCLUDED for exactly the reason
+/// Homebrew is on Unix: it is user-writable, which is the plant vector. A host
+/// with only a per-user git therefore fails closed (git not found) rather than
+/// running a binary the worker could have replaced.
+#[cfg(not(windows))]
+const GIT_CANDIDATES: &[&str] = &["/usr/bin/git", "/bin/git"];
+#[cfg(windows)]
+const GIT_CANDIDATES: &[&str] = &[
+    r"C:\Program Files\Git\cmd\git.exe",
+    r"C:\Program Files\Git\bin\git.exe",
+    r"C:\Program Files (x86)\Git\cmd\git.exe",
+    r"C:\Program Files (x86)\Git\bin\git.exe",
+];
+
 /// Absolute path to the `git` binary, resolved ONCE from NON-worker-writable
 /// system locations — NEVER via `$PATH`. A fleet worker's NATIVE tools have
 /// full-FS (`FilesystemScope::Host`) write, so a bare `git` (PATH-resolved) would
 /// let it plant a fake `git` earlier in the controller's `$PATH` (or in a
 /// user-writable dir like `/opt/homebrew/bin`) and have the CONTROLLER, running
-/// UNSANDBOXED, execute it. Pin to `/usr/bin/git` / `/bin/git` (root-owned /
-/// SIP-protected — not worker-writable); the fallback stays ABSOLUTE so there is
-/// never a `$PATH` lookup. Mirrors the timeout-kill's `KILL_BIN`/`PS_BIN`.
-/// (Homebrew/`/usr/local` are deliberately NOT candidates — they are
-/// user/daemon-writable, which is exactly the plant vector.)
+/// UNSANDBOXED, execute it. Pin to [`GIT_CANDIDATES`] (root-owned / SIP-protected
+/// on Unix, Administrator-only on Windows — not worker-writable); the fallback
+/// stays ABSOLUTE so there is never a `$PATH` lookup. Mirrors the timeout-kill's
+/// `KILL_BIN`/`PS_BIN`. (Homebrew/`/usr/local` are deliberately NOT candidates —
+/// they are user/daemon-writable, which is exactly the plant vector.)
 static GIT_BIN: std::sync::LazyLock<PathBuf> = std::sync::LazyLock::new(|| {
-    ["/usr/bin/git", "/bin/git"]
-        .into_iter()
+    GIT_CANDIDATES
+        .iter()
         .map(PathBuf::from)
         .find(|p| p.exists())
-        .unwrap_or_else(|| PathBuf::from("/usr/bin/git"))
+        // Keep the fallback ABSOLUTE: a missing git must fail as "cannot spawn
+        // this exact path", never degrade into a `$PATH` lookup.
+        .unwrap_or_else(|| PathBuf::from(GIT_CANDIDATES[0]))
 });
 
 /// Build the base `git -C <repo> …` command with the controller-side code-exec
@@ -122,8 +162,8 @@ fn git_command(repo: &Path) -> Command {
     // SAME set the worker-sandboxed git ops strip. Done BEFORE re-applying the
     // git-specific env below, so those overrides can never be stripped.
     crate::env_hygiene::sanitize_git_command_env(&mut cmd);
-    cmd.env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_CONFIG_SYSTEM", "/dev/null");
+    cmd.env("GIT_CONFIG_GLOBAL", NULL_DEVICE)
+        .env("GIT_CONFIG_SYSTEM", NULL_DEVICE);
     cmd
 }
 
@@ -376,6 +416,14 @@ fn worktree_admin_dir(checkout: &Path) -> Option<PathBuf> {
 /// code (a clean tree, or a worker's own broken filter, exits non-zero without
 /// being an infra error) — the authoritative "did a deliverable land?" check is
 /// [`branch_advanced_past`], read host-side.
+///
+/// PLATFORM: the returned string is POSIX `sh` (`&&`, `if ! …; then …; fi`,
+/// single-quote escaping) and is only valid where the worker sandbox runs a
+/// POSIX shell. `cmd /C` — the Windows shell fallback — cannot execute it, so
+/// fleet worktree WORKERS are Unix-only. The controller-side helpers in this
+/// module (which spawn git directly, no shell) are cross-platform, and their
+/// tests run everywhere; the tests that exercise THIS contract by shelling out
+/// to `sh` are `#[cfg(unix)]`.
 pub fn deliverable_commit_command(message: &str) -> String {
     let msg = sh_single_quote(message);
     // `-c core.hooksPath=/dev/null` on BOTH ops (belt): disables ALL git hooks so
@@ -728,11 +776,31 @@ mod tests {
     /// uses `--no-checkout`, so the working tree starts EMPTY and the worker must
     /// restore it (`git reset --hard`) before working. Every test that inspects
     /// or commits files in the checkout runs this first, as the real worker does.
+    /// Unix: run the REAL command string through `sh`, exactly as the worker's
+    /// sandbox does — the fidelity is the point.
+    #[cfg(unix)]
     fn populate(checkout: &Path) -> bool {
         Command::new("sh")
             .arg("-c")
             .arg(worktree_populate_command())
             .current_dir(checkout)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+
+    /// Windows: `worktree_populate_command()` is POSIX `sh` and there is no
+    /// shell to run it in, so perform the SAME git op natively. This is a test
+    /// fixture (restore the `--no-checkout` working tree so `commit_in` has
+    /// something to commit), not a claim that worktree workers run on Windows —
+    /// it exists so the CONTROLLER-side tests, which are cross-platform, are not
+    /// gated out by an incidental `sh` dependency.
+    #[cfg(windows)]
+    fn populate(checkout: &Path) -> bool {
+        Command::new("git")
+            .arg("-C")
+            .arg(checkout)
+            .args(["-c", NO_HOOKS, "reset", "-q", "--hard"])
             .status()
             .map(|s| s.success())
             .unwrap_or(false)
@@ -845,6 +913,9 @@ mod tests {
         );
     }
 
+    // POSIX-sh contract: drives the worker's `sh -c` command strings
+    // (`populate`/`run_deliverable_command`), which `cmd /C` cannot run.
+    #[cfg(unix)]
     #[test]
     fn prepare_reconciles_existing_branch_and_checkout_resuming_from_branch() {
         let repo = tempfile::tempdir().unwrap();
@@ -887,6 +958,9 @@ mod tests {
         );
     }
 
+    // POSIX-sh contract: drives the worker's `sh -c` command strings
+    // (`populate`/`run_deliverable_command`), which `cmd /C` cannot run.
+    #[cfg(unix)]
     #[test]
     fn prepare_reclaims_a_locked_leftover_worktree() {
         // HIGH #5: a dead attempt left a LOCKED worktree. A single
@@ -928,6 +1002,7 @@ mod tests {
 
     /// Run [`deliverable_commit_command`] in `checkout` via `sh -c` (simulating
     /// the worker's sandbox running it). Returns whether it exited 0.
+    #[cfg(unix)]
     fn run_deliverable_command(checkout: &Path, message: &str) -> bool {
         Command::new("sh")
             .arg("-c")
@@ -938,6 +1013,9 @@ mod tests {
             .unwrap_or(false)
     }
 
+    // POSIX-sh contract: drives the worker's `sh -c` command strings
+    // (`populate`/`run_deliverable_command`), which `cmd /C` cannot run.
+    #[cfg(unix)]
     #[test]
     fn deliverable_commit_command_lands_uncommitted_changes() {
         // §4b: a worker wrote a file but did NOT commit. The auto-commit command
@@ -981,6 +1059,9 @@ mod tests {
         );
     }
 
+    // POSIX-sh contract: drives the worker's `sh -c` command strings
+    // (`populate`/`run_deliverable_command`), which `cmd /C` cannot run.
+    #[cfg(unix)]
     #[test]
     fn deliverable_command_noop_and_branch_empty_when_nothing_produced() {
         // §4b: a worker that produced nothing leaves the branch at base — the
@@ -1014,6 +1095,9 @@ mod tests {
         assert_eq!(head, prepared.base_commit, "branch stays at base");
     }
 
+    // POSIX-sh contract: drives the worker's `sh -c` command strings
+    // (`populate`/`run_deliverable_command`), which `cmd /C` cannot run.
+    #[cfg(unix)]
     #[test]
     fn deliverable_commit_command_escapes_the_message() {
         // The commit MESSAGE is single-quote-escaped, so a message containing a
@@ -1137,8 +1221,7 @@ mod tests {
             .map(|a| a.to_string_lossy().into_owned())
             .collect();
         assert!(
-            args.windows(2)
-                .any(|w| w[0] == "-c" && w[1] == "core.hooksPath=/dev/null"),
+            args.windows(2).any(|w| w[0] == "-c" && w[1] == NO_HOOKS),
             "must disable hooks, args: {args:?}",
         );
         assert!(
@@ -1157,13 +1240,13 @@ mod tests {
             .collect();
         assert_eq!(
             envs.get("GIT_CONFIG_GLOBAL"),
-            Some(&Some("/dev/null".to_string())),
-            "must mask GLOBAL config to /dev/null",
+            Some(&Some(NULL_DEVICE.to_string())),
+            "must mask GLOBAL config to the null device",
         );
         assert_eq!(
             envs.get("GIT_CONFIG_SYSTEM"),
-            Some(&Some("/dev/null".to_string())),
-            "must mask SYSTEM config to /dev/null",
+            Some(&Some(NULL_DEVICE.to_string())),
+            "must mask SYSTEM config to the null device",
         );
     }
 
@@ -1181,7 +1264,7 @@ mod tests {
         assert!(
             GIT_BIN.is_absolute(),
             "GIT_BIN must be absolute, got {:?}",
-            &*GIT_BIN
+            *GIT_BIN
         );
     }
 
@@ -1253,16 +1336,19 @@ mod tests {
         // The git-specific overrides REMAIN (config masking intact).
         assert!(
             envs.iter()
-                .any(|(k, v)| k == "GIT_CONFIG_GLOBAL" && v.as_deref() == Some("/dev/null")),
+                .any(|(k, v)| k == "GIT_CONFIG_GLOBAL" && v.as_deref() == Some(NULL_DEVICE)),
             "GIT_CONFIG_GLOBAL override must remain: {envs:?}",
         );
         assert!(
             envs.iter()
-                .any(|(k, v)| k == "GIT_CONFIG_SYSTEM" && v.as_deref() == Some("/dev/null")),
+                .any(|(k, v)| k == "GIT_CONFIG_SYSTEM" && v.as_deref() == Some(NULL_DEVICE)),
             "GIT_CONFIG_SYSTEM override must remain: {envs:?}",
         );
     }
 
+    // POSIX-sh contract: drives the worker's `sh -c` command strings
+    // (`populate`/`run_deliverable_command`), which `cmd /C` cannot run.
+    #[cfg(unix)]
     #[test]
     fn global_filter_is_neutralized_on_controller_ops() {
         // CRITICAL (codex re-review, fix 3): a `filter.*.clean` defined in GLOBAL
@@ -1340,6 +1426,9 @@ mod tests {
         );
     }
 
+    // Whole body is unix-only (needs `symlink`), like its sibling below —
+    // gating the test itself keeps the Windows build warning-free.
+    #[cfg(unix)]
     #[test]
     fn prepare_rejects_symlinked_checkout() {
         let repo = tempfile::tempdir().unwrap();
@@ -1350,14 +1439,11 @@ mod tests {
         let parent = work.path().join("f1");
         std::fs::create_dir_all(&parent).unwrap();
         let checkout = parent.join("a");
-        #[cfg(unix)]
-        {
-            std::os::unix::fs::symlink(work.path(), &checkout).unwrap();
-            assert!(
-                prepare_fleet_worktree(repo.path(), work.path(), "fleet/f1/a", &checkout).is_err(),
-                "a symlinked checkout path must be refused",
-            );
-        }
+        std::os::unix::fs::symlink(work.path(), &checkout).unwrap();
+        assert!(
+            prepare_fleet_worktree(repo.path(), work.path(), "fleet/f1/a", &checkout).is_err(),
+            "a symlinked checkout path must be refused",
+        );
     }
 
     #[cfg(unix)]
