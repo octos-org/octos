@@ -428,6 +428,14 @@ jobs:
       - name: gateway_runtime regression (octos-cli)
         run: cargo test -p octos-cli gateway_runtime::tests --features api -- --nocapture
 
+      # Peer staging/fencing lives in the `api`-gated ui_protocol module, so the
+      # unfeatured runs above never compile it — same reason as the §6 guard.
+      # These cover slug reservation, worktree fencing, and the rollback
+      # isolation guard (one peer's cleanup must not delete a SIBLING's
+      # worktree, which a repo-global `git worktree prune` used to do).
+      - name: Peer staging + worktree fencing (octos-cli)
+        run: cargo test -p octos-cli --features api peer
+
   # Lightweight check that exercises the `matrix` feature gate. The default
   # `FEATURES` env above intentionally omits `matrix` to keep the main `check`
   # job lean, but the Dockerfile and several release configurations enable it.
@@ -609,11 +617,17 @@ jobs:
     # Windows break is now visible at review time instead of after merge.
     #
     # The original reason recorded here — 2 `octos-core` `session_scope`
-    # failures — was fixed by #1838; `Test octos-core` is green on `main`. As of
-    # run 30423603951 the job stops at `Test octos-plugin`
-    # (`lifecycle::tests::run_phase_injects_octos_skill_dir_env`), which #1860
-    # addresses. Keep this note pinned to the CURRENT blocker: a stale one reads
-    # as "known, tracked, someone's on it" long after nobody is.
+    # failures — was fixed by #1838, and the `octos-plugin` blocker noted next
+    # (`run_phase_injects_octos_skill_dir_env`) by #1860. As of run 30695951586
+    # the two remaining failures were: 12 `octos-core` `git_worktree::tests::*`
+    # (`GIT_BIN` resolved only `/usr/bin/git` | `/bin/git`, so EVERY controller
+    # git spawn failed on Windows and `is_git_repo` reported "not a repository"),
+    # and `octos-plugin`'s `blocked_env_vars_match_agent_sandbox` (it scraped
+    # `BLOCKED_ENV_VARS` out of a file the constant had moved away from). Both
+    # are fixed; this job is EXPECTED green. If it stays green, delete the
+    # `continue-on-error` below and this note. Keep the note pinned to the
+    # CURRENT blocker: a stale one reads as "known, tracked, someone's on it"
+    # long after nobody is.
     #
     # Non-blocking ONLY on PRs. On push to `main` it stays hard-failing, so
     # `build-windows` (which `needs:` this job) still refuses to ship a Windows
