@@ -1293,13 +1293,13 @@ mod tests {
         prepare_fleet_worktree(repo.path(), work.path(), "fleet/f1/a", &checkout).expect("prepare");
 
         let evil = work.path().join("evil-gitconfig");
-        let marker = work.path().join("FILTER_RAN");
+        // Keep the filter command platform-neutral. Embedding an absolute
+        // Windows path directly in git-config makes its backslashes parse as
+        // config escapes before the shell ever runs.
+        let marker = checkout.join("FILTER_RAN");
         std::fs::write(
             &evil,
-            format!(
-                "[filter \"pwn\"]\n\tclean = sh -c 'touch {}'\n",
-                marker.display()
-            ),
+            "[filter \"pwn\"]\n\tclean = sh -c 'touch FILTER_RAN'\n",
         )
         .unwrap();
         std::fs::write(checkout.join(".gitattributes"), b"out.txt filter=pwn\n").unwrap();
