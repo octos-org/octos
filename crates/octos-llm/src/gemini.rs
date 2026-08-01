@@ -215,7 +215,10 @@ impl LlmProvider for GeminiProvider {
                 }],
             }),
             tools: gemini_tools,
-            generation_config: Some(build_gemini_generation_config(config)),
+            generation_config: Some(build_gemini_generation_config(
+                config,
+                &format!("gemini/{}", self.model),
+            )?),
             cached_content: None,
         };
 
@@ -277,7 +280,10 @@ impl LlmProvider for GeminiProvider {
                 }],
             }),
             tools: gemini_tools,
-            generation_config: Some(build_gemini_generation_config(config)),
+            generation_config: Some(build_gemini_generation_config(
+                config,
+                &format!("gemini/{}", self.model),
+            )?),
             cached_content: None,
         };
 
@@ -414,7 +420,10 @@ struct GeminiInlineData {
 }
 
 /// Build the Gemini generation config from ChatConfig.
-fn build_gemini_generation_config(config: &ChatConfig) -> GeminiGenerationConfig {
+fn build_gemini_generation_config(
+    config: &ChatConfig,
+    provider_label: &str,
+) -> Result<GeminiGenerationConfig> {
     use crate::config::{ReasoningEffort, ResponseFormat};
 
     let thinking_config = config.reasoning_effort.map(|effort| {
@@ -434,18 +443,29 @@ fn build_gemini_generation_config(config: &ChatConfig) -> GeminiGenerationConfig
         Some(ResponseFormat::JsonSchema { schema, .. }) => {
             let mut s = schema.clone();
             sanitize_schema_for_gemini(&mut s);
+            if contains_underspecified_array(&s, 0) {
+                let message = "Gemini structured response schema contains an array with missing or empty `items`; define an element schema for every array";
+                return Err(crate::error::LlmError::new(
+                    crate::error::LlmErrorKind::InvalidRequest {
+                        detail: message.to_string(),
+                    },
+                    message,
+                )
+                .with_provider(provider_label)
+                .into());
+            }
             (Some("application/json".into()), Some(s))
         }
         _ => (None, None),
     };
 
-    GeminiGenerationConfig {
+    Ok(GeminiGenerationConfig {
         max_output_tokens: config.max_tokens,
         temperature: config.temperature,
         thinking_config,
         response_mime_type,
         response_schema,
-    }
+    })
 }
 
 /// Build the Gemini `contents` array and optional system instruction from messages.
@@ -723,7 +743,7 @@ fn sanitize_schema_recursive(value: &mut serde_json::Value, depth: usize) {
     }
 }
 
-#[derive(Serialize)]
+#[derive(Debug, Serialize)]
 struct GeminiGenerationConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     max_output_tokens: Option<u32>,
@@ -737,7 +757,7 @@ struct GeminiGenerationConfig {
     response_schema: Option<serde_json::Value>,
 }
 
-#[derive(Serialize)]
+#[derive(Debug, Serialize)]
 struct GeminiThinkingConfig {
     #[serde(rename = "thinkingBudget", skip_serializing_if = "Option::is_none")]
     thinking_budget: Option<u32>,
@@ -1543,7 +1563,7 @@ mod tests {
             reasoning_effort: Some(ReasoningEffort::Low),
             ..Default::default()
         };
-        let gen_config = build_gemini_generation_config(&config);
+        let gen_config = build_gemini_generation_config(&config, "gemini/test").unwrap();
         let tc = gen_config.thinking_config.unwrap();
         assert_eq!(tc.thinking_budget, Some(1024));
     }
@@ -1555,7 +1575,7 @@ mod tests {
             reasoning_effort: Some(ReasoningEffort::High),
             ..Default::default()
         };
-        let gen_config = build_gemini_generation_config(&config);
+        let gen_config = build_gemini_generation_config(&config, "gemini/test").unwrap();
         let tc = gen_config.thinking_config.unwrap();
         assert!(tc.thinking_budget.is_none());
     }
@@ -1563,7 +1583,7 @@ mod tests {
     #[test]
     fn test_no_thinking_config_by_default() {
         let config = ChatConfig::default();
-        let gen_config = build_gemini_generation_config(&config);
+        let gen_config = build_gemini_generation_config(&config, "gemini/test").unwrap();
         assert!(gen_config.thinking_config.is_none());
     }
 
@@ -1574,7 +1594,7 @@ mod tests {
             response_format: Some(ResponseFormat::JsonObject),
             ..Default::default()
         };
-        let gen_config = build_gemini_generation_config(&config);
+        let gen_config = build_gemini_generation_config(&config, "gemini/test").unwrap();
         assert_eq!(
             gen_config.response_mime_type.as_deref(),
             Some("application/json")
@@ -1593,7 +1613,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        let gen_config = build_gemini_generation_config(&config);
+        let gen_config = build_gemini_generation_config(&config, "gemini/test").unwrap();
         assert_eq!(
             gen_config.response_mime_type.as_deref(),
             Some("application/json")
@@ -1601,6 +1621,62 @@ mod tests {
         // additionalProperties should be sanitized away
         let schema = gen_config.response_schema.unwrap();
         assert!(schema.get("additionalProperties").is_none());
+    }
+
+    #[test]
+    fn should_reject_response_schema_when_array_items_are_missing() {
+        use crate::config::ResponseFormat;
+        let config = ChatConfig {
+            response_format: Some(ResponseFormat::JsonSchema {
+                name: "test".into(),
+                schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "values": {"type": "array"}
+                    }
+                }),
+                strict: true,
+            }),
+            ..Default::default()
+        };
+
+        let error = build_gemini_generation_config(&config, "gemini/test")
+            .expect_err("missing array items must fail before the provider request");
+        let llm_error = error
+            .downcast_ref::<crate::error::LlmError>()
+            .expect("failure should remain a classified LLM error");
+        assert!(matches!(
+            llm_error.kind,
+            crate::error::LlmErrorKind::InvalidRequest { .. }
+        ));
+        assert!(llm_error.message.contains("missing or empty `items`"));
+        assert_eq!(llm_error.provider, "gemini/test");
+    }
+
+    #[test]
+    fn should_reject_response_schema_when_array_items_are_empty() {
+        use crate::config::ResponseFormat;
+        let config = ChatConfig {
+            response_format: Some(ResponseFormat::JsonSchema {
+                name: "test".into(),
+                schema: serde_json::json!({
+                    "type": "array",
+                    "items": {}
+                }),
+                strict: true,
+            }),
+            ..Default::default()
+        };
+
+        let error = build_gemini_generation_config(&config, "gemini/test")
+            .expect_err("empty array items must fail before the provider request");
+        let llm_error = error
+            .downcast_ref::<crate::error::LlmError>()
+            .expect("failure should remain a classified LLM error");
+        assert!(matches!(
+            llm_error.kind,
+            crate::error::LlmErrorKind::InvalidRequest { .. }
+        ));
     }
 
     #[test]
