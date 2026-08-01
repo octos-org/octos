@@ -39,12 +39,19 @@ pub(crate) async fn transcribe_audio_media(
     media: &[String],
     language: Option<&str>,
 ) -> Vec<String> {
+    transcribe_audio_media_with_base_url(media, language, &ominix_base_url()).await
+}
+
+async fn transcribe_audio_media_with_base_url(
+    media: &[String],
+    language: Option<&str>,
+    base_url: &str,
+) -> Vec<String> {
     let audios = audio_paths(media);
     if audios.is_empty() {
         return Vec::new();
     }
-    let client =
-        OminixClient::new(&ominix_base_url()).with_language(language.map(|s| s.to_string()));
+    let client = OminixClient::new(base_url).with_language(language.map(|s| s.to_string()));
     let asr_t = std::time::Instant::now();
     let mut out = Vec::new();
     for path in audios {
@@ -490,7 +497,7 @@ pub(crate) fn remove_all_visual_markers(s: &str) -> String {
 
 /// Lift the trailing `[[VISUAL:...]]` directive out of the turn's authoritative
 /// reply surfaces and strip it in place, so the internal control protocol never
-/// reaches the WIRE (`message/delta` from `done`, `message/persisted`) or
+/// reaches the WIRE (`message/delta` from `done`, `projection/envelope`) or
 /// STORAGE (session JSONL). Strips both `content` (the final `response.content`)
 /// and every Assistant carrier in `messages` that ends with the same trailing
 /// marker. Returns the parsed directive for background dispatch, or `None` (and
@@ -515,7 +522,7 @@ pub(crate) fn strip_visual_directive(
 
 /// Lift the trailing `[[EXIT]]` control marker out of the turn's authoritative
 /// reply surfaces and strip it in place, so the internal control protocol never
-/// reaches the WIRE (`message/delta`, `message/persisted`) or STORAGE (session
+/// reaches the WIRE (`message/delta`, `projection/envelope`) or STORAGE (session
 /// JSONL). Strips both `content` (the final `response.content`) and every
 /// Assistant carrier in `messages` whose trailing marker matches. Returns `true`
 /// when a real trailing marker was found and removed (the caller then emits the
@@ -544,7 +551,7 @@ pub(crate) fn strip_exit_directive(content: &mut String, messages: &mut [Message
 ///
 /// A reply may end with both markers (e.g. `…[[VISUAL:…]][[EXIT]]`): stripping
 /// only the outermost would leave the inner one trailing on the wire
-/// (`message/delta`, `message/persisted`) and in storage (session JSONL), and —
+/// (`message/delta`, `projection/envelope`) and in storage (session JSONL), and —
 /// for the visual case — never dispatch it. So this loops, peeling whichever
 /// marker is currently trailing, until neither is. Reuses (and supersedes on the
 /// turn path) the per-marker [`strip_visual_directive`] / [`strip_exit_directive`].
@@ -1396,6 +1403,94 @@ mod tests {
             307,
             "redirects must NOT be followed (token would leak to the target)"
         );
+    }
+
+    #[tokio::test]
+    async fn should_send_reloaded_profile_asr_language_to_ominix_request() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (request_tx, request_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let body_start = loop {
+                let mut chunk = [0u8; 1024];
+                let read = socket.read(&mut chunk).await.unwrap();
+                assert!(read > 0, "client closed before sending HTTP headers");
+                request.extend_from_slice(&chunk[..read]);
+                if let Some(index) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                    break index + 4;
+                }
+            };
+            let headers = String::from_utf8_lossy(&request[..body_start]);
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    line.strip_prefix("content-length: ")
+                        .or_else(|| line.strip_prefix("Content-Length: "))
+                })
+                .unwrap()
+                .trim()
+                .parse::<usize>()
+                .unwrap();
+            while request.len() < body_start + content_length {
+                let mut chunk = [0u8; 1024];
+                let read = socket.read(&mut chunk).await.unwrap();
+                assert!(read > 0, "client closed before sending HTTP body");
+                request.extend_from_slice(&chunk[..read]);
+            }
+            let body: serde_json::Value =
+                serde_json::from_slice(&request[body_start..body_start + content_length]).unwrap();
+            request_tx.send(body).unwrap();
+            let response_body = r#"{"text":"bonjour"}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                response_body.len(),
+                response_body
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::profiles::ProfileStore::open_unified(dir.path()).unwrap();
+        let now = chrono::Utc::now();
+        let mut profile = crate::profiles::UserProfile {
+            id: "alpha".into(),
+            name: "Alpha".into(),
+            enabled: true,
+            data_dir: None,
+            parent_id: None,
+            public_subdomain: None,
+            config: crate::profiles::ProfileConfig {
+                asr_language: Some("English".into()),
+                ..Default::default()
+            },
+            created_at: now,
+            updated_at: now,
+        };
+        store.save(&profile).unwrap();
+        let patch: crate::profiles::ProfileConfigPatch =
+            serde_json::from_str(r#"{"asr_language":"french"}"#).unwrap();
+        profile.config.apply_patch(patch);
+        store.save_with_merge(&mut profile).unwrap();
+
+        let language =
+            crate::profiles::effective_profile_asr_language(Some(&store), Some("alpha"), None)
+                .unwrap();
+        let audio_path = dir.path().join("utterance.wav");
+        std::fs::write(&audio_path, b"RIFF-test-audio").unwrap();
+        let transcripts = transcribe_audio_media_with_base_url(
+            &[audio_path.to_string_lossy().into_owned()],
+            language.as_deref(),
+            &format!("http://{addr}"),
+        )
+        .await;
+
+        assert_eq!(transcripts, vec!["bonjour"]);
+        let request = request_rx.await.unwrap();
+        assert_eq!(request["language"], "French");
     }
 
     #[test]

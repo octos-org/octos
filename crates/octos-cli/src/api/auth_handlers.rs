@@ -939,11 +939,14 @@ pub async fn my_profile(
         crate::process_manager::ProcessStatus::stopped()
     };
 
-    Ok(Json(ProfileResponse {
-        email: None,
-        profile: mask_secrets(&profile),
-        status,
-    }))
+    // `with_email_lookup` is the only thing that reads the address out of the
+    // user store. Building the literal with `email: None` instead left the
+    // settings page's "Email (for OTP login)" field blank for everyone — on GET,
+    // and again right after a save on PUT.
+    Ok(Json(
+        ProfileResponse::from(mask_secrets(&profile), status)
+            .with_email_lookup(state.user_store.as_deref()),
+    ))
 }
 
 #[derive(Deserialize, Default)]
@@ -1326,11 +1329,14 @@ pub async fn update_my_profile(
         crate::process_manager::ProcessStatus::stopped()
     };
 
-    Ok(Json(ProfileResponse {
-        email: None,
-        profile: mask_secrets(&profile),
-        status,
-    }))
+    // `with_email_lookup` is the only thing that reads the address out of the
+    // user store. Building the literal with `email: None` instead left the
+    // settings page's "Email (for OTP login)" field blank for everyone — on GET,
+    // and again right after a save on PUT.
+    Ok(Json(
+        ProfileResponse::from(mask_secrets(&profile), status)
+            .with_email_lookup(state.user_store.as_deref()),
+    ))
 }
 
 // ── Voice selection endpoints ────────────────────────────────────────
@@ -4156,7 +4162,7 @@ mod tests {
 
     fn temp_profile_store() -> (tempfile::TempDir, ProfileStore) {
         let dir = tempfile::tempdir().unwrap();
-        let ps = ProfileStore::open(dir.path()).unwrap();
+        let ps = ProfileStore::open_unified(dir.path()).unwrap();
         (dir, ps)
     }
 
@@ -4182,7 +4188,7 @@ mod tests {
     ) {
         let dir = tempfile::tempdir().unwrap();
         let user_store = Arc::new(UserStore::open(dir.path()).unwrap());
-        let profile_store = Arc::new(ProfileStore::open(dir.path()).unwrap());
+        let profile_store = Arc::new(ProfileStore::open_unified(dir.path()).unwrap());
         let allowlist_store = Arc::new(LoginAllowlistStore::open(dir.path()).unwrap());
         // Tests that exercise per-email send_code/verify branches expect the
         // SMTP precheck to pass; populate a synthetic config so the common
@@ -5062,6 +5068,61 @@ mod tests {
         assert!(
             stored.config.env_vars.is_empty(),
             "an explicit empty env_vars map must clear all entries"
+        );
+    }
+
+    // Task #15: smart-home bridge config needs no dedicated REST route — it
+    // rides the same generic `config` JSON-merge-patch every other
+    // `ProfileConfig` section uses (see `my_profile_config_patch_preserves_existing_sections`
+    // above). This proves the wire round trip end to end: the response masks
+    // the token (never the URL), while the persisted profile keeps the real
+    // token so the bridge client (`smart_home_bridge.rs`) can still use it.
+    #[tokio::test]
+    async fn my_profile_config_patch_applies_and_masks_smart_home_section() {
+        let (_dir, state, _user_store, profile_store) = temp_app_state();
+        profile_store
+            .save(&make_user_profile("tenant", "Tenant Owner"))
+            .unwrap();
+        let state = Arc::new(state);
+
+        let Json(resp) = update_my_profile(
+            State(state.clone()),
+            HeaderMap::new(),
+            axum::Extension(AuthIdentity::User {
+                id: "tenant".into(),
+                role: UserRole::User,
+            }),
+            serde_json::json!({
+                "config": {
+                    "smart_home": {
+                        "bridge_url": "http://192.168.1.50:8787",
+                        "token": "supersecret-token-value"
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .await
+        .unwrap();
+
+        let smart_home = resp.profile.config.smart_home.expect("smart_home present");
+        assert_eq!(
+            smart_home.bridge_url.as_deref(),
+            Some("http://192.168.1.50:8787"),
+            "bridge_url is not a secret and must round-trip in the clear"
+        );
+        let masked_token = smart_home.token.expect("token present in response");
+        assert_ne!(
+            masked_token, "supersecret-token-value",
+            "the response must mask the token"
+        );
+
+        let stored = profile_store.get("tenant").unwrap().expect("profile");
+        let stored_smart_home = stored.config.smart_home.expect("smart_home persisted");
+        assert_eq!(
+            stored_smart_home.token.as_deref(),
+            Some("supersecret-token-value"),
+            "the persisted profile must keep the real token, not the masked display value"
         );
     }
 

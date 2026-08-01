@@ -27,12 +27,15 @@ pub fn seed_pricing_catalog(entries: &[(String, f64, f64)]) {
     // alias `kimi-k2.5`, mispricing direct requests (which look up the bare id).
     // Award the bare alias to the row with the FEWEST path segments (the most
     // canonical/native), so the result is deterministic and order-independent.
-    // On an EQUAL segment count the lexicographically-smaller lowercased full
-    // key wins — `minimax/MiniMax-M3` ($0.15/$1.5) and `r9s/minimax-m3`
-    // ($0.5/$2) both have one slash, so without a tie-breaker the bare
-    // `minimax-m3` rate would depend on which row the router exported first.
-    // (Tracking the owner's key rather than only its depth is what lets the
-    // tie-break compare keys.)
+    // On an EQUAL segment count the more-native HOST wins: compare the provider
+    // prefix (segment before the first `/`) FIRST, then the full lowercased key —
+    // `minimax/MiniMax-M3` ($0.15/$1.5) and `r9s/minimax-m3` ($0.5/$2) both have
+    // one slash, so without a tie-breaker the bare `minimax-m3` rate would depend
+    // on which row the router exported first. Comparing the provider prefix
+    // (rather than the raw key) keeps a native `zai/…` row ahead of a
+    // `zai-coding/…` re-host, whose `-` would otherwise sort before the native
+    // row's `/` (mirrors `context::build_catalog_map`). (Tracking the owner's key
+    // rather than only its depth is what lets the tie-break compare keys.)
     //
     // The bare alias is LOWERCASED (`catalog_pricing` lowercases the requested id
     // before lookup) so a case-variant native key like `minimax/MiniMax-M2.5` is
@@ -68,7 +71,14 @@ pub fn seed_pricing_catalog(entries: &[(String, f64, f64)]) {
                     None => true,
                     Some((owned_seg, owner_key)) => {
                         segments < *owned_seg
-                            || (segments == *owned_seg && key_lower.as_str() < owner_key.as_str())
+                            || (segments == *owned_seg
+                                && (
+                                    crate::context::provider_prefix(&key_lower),
+                                    key_lower.as_str(),
+                                ) < (
+                                    crate::context::provider_prefix(owner_key),
+                                    owner_key.as_str(),
+                                ))
                     }
                 };
                 if take {
@@ -285,7 +295,16 @@ pub fn model_pricing(model_id: &str) -> Option<ModelPricing> {
         });
     }
 
-    // Kimi / Moonshot
+    // Kimi / Moonshot — NOTE: kimi-k3 MUST be checked before the generic
+    // kimi-k2/moonshot branch: the full provider key ("moonshot/kimi-k3")
+    // contains both substrings. K3 official rates: $3.00/M input (cache
+    // miss) / $15.00/M output.
+    if m.contains("kimi-k3") {
+        return Some(ModelPricing {
+            input_per_million: 3.00,
+            output_per_million: 15.0,
+        });
+    }
     if m.contains("kimi-k2") || m.contains("moonshot") {
         return Some(ModelPricing {
             input_per_million: 0.60,
@@ -395,6 +414,22 @@ mod tests {
     fn test_unknown_model_returns_none() {
         assert!(model_pricing("my-local-model").is_none());
         assert!(model_pricing("ollama/phi-custom").is_none());
+    }
+
+    #[test]
+    fn should_price_kimi_k3_before_generic_moonshot_branch() {
+        // kimi-k3 ($3.00/M in, $15.00/M out) must match before the generic
+        // kimi-k2/moonshot branch — the full provider key contains BOTH
+        // "kimi-k3" and "moonshot", and last-writer semantics would misprice
+        // it at the k2 rates ($0.60/$2.40).
+        for id in ["kimi-k3", "moonshot/kimi-k3"] {
+            let p = model_pricing(id).unwrap();
+            assert!((p.input_per_million - 3.0).abs() < f64::EPSILON, "{id}");
+            assert!((p.output_per_million - 15.0).abs() < f64::EPSILON, "{id}");
+        }
+        // The k2 family keeps its own rates.
+        let k2 = model_pricing("kimi-k2.6").unwrap();
+        assert!((k2.input_per_million - 0.60).abs() < f64::EPSILON);
     }
 
     #[test]

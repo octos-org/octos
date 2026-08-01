@@ -19,6 +19,7 @@ mod gemini;
 mod groq;
 mod minimax;
 mod moonshot;
+mod moonshot_coding;
 mod nvidia;
 mod ollama;
 mod openai;
@@ -27,6 +28,7 @@ mod r9s;
 mod vertex;
 mod vllm;
 mod zai;
+mod zai_coding;
 mod zhipu;
 
 // ── Public types ────────────────────────────────────────────────────────────
@@ -121,9 +123,13 @@ static ALL: &[ProviderEntry] = &[
     openrouter::ENTRY,
     deepseek::ENTRY,
     groq::ENTRY,
+    // Coding-plan families FIRST so an explicit `moonshot-coding` / `zai-coding`
+    // resolves to the coding endpoint before the base family's name/aliases.
+    moonshot_coding::ENTRY,
     moonshot::ENTRY,
     dashscope::ENTRY,
     minimax::ENTRY,
+    zai_coding::ENTRY,
     zhipu::ENTRY,
     zai::ENTRY,
     nvidia::ENTRY,
@@ -230,7 +236,32 @@ mod tests {
 
     #[test]
     fn all_entries_count() {
-        assert_eq!(all_entries().len(), 16);
+        assert_eq!(all_entries().len(), 18);
+    }
+
+    /// The coding-plan families resolve to their coding endpoints + default
+    /// models, distinct from the regular families, and their name/alias lookups
+    /// don't shadow the base families.
+    #[test]
+    fn coding_plan_families_resolve_to_coding_endpoints() {
+        // Kimi coding plan: OpenAI-compat, api.kimi.com/coding/v1, default k3.
+        let mc = lookup("moonshot-coding").expect("moonshot-coding registered");
+        assert_eq!(mc.default_model, Some("k3"));
+        assert_eq!(mc.default_base_url, Some("https://api.kimi.com/coding/v1"));
+        assert!(mc.is_known_key_env("KIMI_API_KEY"));
+        assert_eq!(
+            lookup("kimi-coding").map(|e| e.name),
+            Some("moonshot-coding")
+        );
+
+        // Z.AI GLM coding plan: Anthropic-compat coding endpoint.
+        let zc = lookup("zai-coding").expect("zai-coding registered");
+        assert_eq!(zc.default_base_url, Some("https://api.z.ai/api/anthropic"));
+        assert_eq!(lookup("z.ai-coding").map(|e| e.name), Some("zai-coding"));
+
+        // The base families are unshadowed by the coding families.
+        assert_eq!(lookup("kimi").map(|e| e.name), Some("moonshot"));
+        assert_eq!(lookup("z.ai").map(|e| e.name), Some("zai"));
     }
 
     #[test]

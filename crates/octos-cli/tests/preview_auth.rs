@@ -85,7 +85,7 @@ async fn build_fixture() -> Fixture {
     //    back up to recover the profile id, so we MUST leave
     //    `data_dir = None` (an override breaks that lookup and the
     //    session-workspace search misses the pre-seeded files).
-    let profile_store = Arc::new(ProfileStore::open(&octos_home).expect("profile store"));
+    let profile_store = Arc::new(ProfileStore::open_unified(&octos_home).expect("profile store"));
 
     let profile_a = UserProfile {
         id: "tenant-a".into(),

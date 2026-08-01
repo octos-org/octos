@@ -31,6 +31,18 @@ pub enum GroupStatus {
     Completed,
     Failed,
     Cancelled,
+    // Precise non-running goal states (codex MED). Mapping a paused goal to
+    // `Cancelled` or a blocked goal to `Failed` misleads a roster that renders
+    // GroupStatus — a paused goal is not cancelled and a budget-capped goal is
+    // not a hard failure. These variants keep the roster honest. They are only
+    // ever produced by `group_status_for_goal`; no exhaustive `match` on
+    // `GroupStatus` exists, and GroupStatus never crosses the wire protocol
+    // (the roster's "orchestrating" indicator derives from live orchestration
+    // counts, and the goal's precise status string is also carried in the
+    // group metadata), so adding them is contained to this crate.
+    Paused,
+    Blocked,
+    BudgetLimited,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -725,6 +737,23 @@ impl SupervisorStore {
         Ok(row)
     }
 
+    /// Append one row to the event ledger. The write reaches the OS directly:
+    /// `std::fs::File` is unbuffered, so `write_all` issues the write syscall
+    /// and the trailing `flush()` is a no-op (there is no user-space buffer to
+    /// drain).
+    ///
+    /// DURABILITY (KNOWN LIMITATION, accepted): the append is handed to the OS
+    /// but is NOT `fsync`-ed, so the OS page cache may briefly hold the last
+    /// appended row(s) before the disk physically commits. An ordinary process
+    /// crash (panic / kill / OOM) is safe — the OS still flushes its cache — but
+    /// a HARD power loss or kernel panic in that window can lose the most recent
+    /// append. This is a STORE-WIDE property: every
+    /// group / terminal / continuation record rides this path, not just peer
+    /// continuations, so an `fsync` here would be a store-wide latency cost.
+    /// Under the best-effort peer-delivery model (see `peer_send_input_authorized`)
+    /// a peer injection lost only to a simultaneous power cut is within the
+    /// documented semantics; revisit with a batched/periodic `fsync` if any
+    /// caller ever needs power-loss durability.
     pub fn append_ledger_row(&self, row: &SupervisorEventLedgerRow) -> io::Result<()> {
         self.ensure_root_dir()?;
         let mut file = OpenOptions::new()

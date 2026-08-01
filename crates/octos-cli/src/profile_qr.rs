@@ -320,6 +320,68 @@ pub fn generate_pin() -> String {
 mod tests {
     use super::*;
 
+    const HISTORICAL_V1_FIXTURE: &str = r#"{
+        "v": 1,
+        "kind": "octos-profile",
+        "id": "legacy-profile",
+        "name": "Legacy Profile",
+        "endpoint": "https://octos.example.test",
+        "llm": {
+            "primary": {
+                "family_id": "deepseek",
+                "model_id": "deepseek-chat",
+                "route": {
+                    "api_key_env": "DEEPSEEK_API_KEY"
+                }
+            },
+            "fallbacks": []
+        },
+        "memory": {
+            "max_inject_tokens": 2500
+        },
+        "embedding": {
+            "provider": "openai",
+            "model": "text-embedding-3-small"
+        },
+        "voice_default": "alloy"
+    }"#;
+
+    const EXTENSION_BEARING_V1_FIXTURE: &str = r#"{
+        "v": 1,
+        "kind": "octos-profile",
+        "id": "extended-profile",
+        "llm": {
+            "primary": {
+                "family_id": "proxy",
+                "model_id": "future-model",
+                "route": {
+                    "api_key_env": "PROXY_API_KEY",
+                    "custom_headers": {
+                        "x-route-preview": "enabled"
+                    }
+                },
+                "vendor_capabilities": ["reasoning", "tools-v2"]
+            },
+            "fallbacks": [],
+            "routing_extension": {
+                "strategy": "latency-aware"
+            }
+        },
+        "memory": {
+            "max_inject_tokens": 4096,
+            "retention_extension": {
+                "strategy": "semantic"
+            }
+        },
+        "embedding": {
+            "provider": "future-provider",
+            "model": "future-embedding",
+            "batch_extension": {
+                "size": 128
+            }
+        }
+    }"#;
+
     fn sample(with_secrets: bool) -> ProfileQrPayload {
         let mut p = ProfileQrPayload::new("dspfac");
         p.name = Some("DSP Factory".into());
@@ -335,6 +397,31 @@ mod tests {
                 .insert("DEEPSEEK_API_KEY".into(), format!("sk-{}", "0".repeat(32)));
         }
         p
+    }
+
+    fn assert_v1_fixture_round_trips_verbatim(fixture: &str) {
+        let expected: serde_json::Value =
+            serde_json::from_str(fixture).expect("literal v1 fixture");
+        let payload: ProfileQrPayload =
+            serde_json::from_str(fixture).expect("decode literal v1 fixture");
+        assert_eq!(payload.v, 1);
+
+        let encoded = encode_plain(&payload, false).expect("encode literal v1 fixture");
+        let decoded = decode(&encoded, None).expect("decode encoded v1 fixture");
+        assert_eq!(
+            serde_json::to_value(decoded).expect("serialize decoded v1 fixture"),
+            expected
+        );
+    }
+
+    #[test]
+    fn historical_v1_payload_remains_decodable_and_lossless() {
+        assert_v1_fixture_round_trips_verbatim(HISTORICAL_V1_FIXTURE);
+    }
+
+    #[test]
+    fn extension_bearing_v1_blocks_round_trip_without_field_loss() {
+        assert_v1_fixture_round_trips_verbatim(EXTENSION_BEARING_V1_FIXTURE);
     }
 
     #[test]

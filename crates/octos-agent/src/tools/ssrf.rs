@@ -160,6 +160,45 @@ where
     Err(format!("Too many redirects (max {max_redirects})"))
 }
 
+/// Enforce a per-host allowlist (PR A fleet worker grant).
+///
+/// The allowlist is an `Option`, and the None/Some distinction is
+/// SECURITY-LOAD-BEARING (fail closed, not open):
+/// - `None` — no per-host restriction (unrestricted; the backward-compatible
+///   default for every non-fleet caller, and the `Full` network grant).
+/// - `Some(list)` — RESTRICTED to `list`. A NON-EMPTY list admits `host` only
+///   when it exactly matches (case-insensitively) a listed host or is a
+///   subdomain of one (`docs.example.com` ⊂ `example.com`). An EMPTY (or
+///   all-blank) list denies EVERYTHING — "restricted to nothing" reaches
+///   nothing, never "unrestricted". So a `Hosts([])` grant that somehow bypassed
+///   [`WorkerGrant::validate`] still fails closed here.
+///
+/// This is layered ON TOP of the private-IP block in [`check_ssrf_with_addrs`],
+/// so a fleet worker granted `Hosts([example.com])` can reach only those hosts
+/// over HTTP(S) via the web tools and nothing else.
+///
+/// Subdomain matching uses the label boundary (`.`) so `example.com` does NOT
+/// admit `notexample.com` or `example.com.evil.tld`.
+///
+/// [`WorkerGrant::validate`]: octos_fleet::WorkerGrant::validate
+pub(crate) fn check_host_allowlist(host: &str, allowlist: Option<&[String]>) -> Result<(), String> {
+    let Some(allowlist) = allowlist else {
+        return Ok(()); // unrestricted
+    };
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    let admitted = allowlist.iter().any(|allowed| {
+        let allowed = allowed.trim().trim_end_matches('.').to_ascii_lowercase();
+        !allowed.is_empty() && (host == allowed || host.ends_with(&format!(".{allowed}")))
+    });
+    if admitted {
+        Ok(())
+    } else {
+        Err(format!(
+            "host `{host}` is not in the granted network allowlist"
+        ))
+    }
+}
+
 /// Check if a hostname is private/internal (string check + IP parse).
 pub fn is_private_host(host: &str) -> bool {
     let lower = host.to_ascii_lowercase();
@@ -347,6 +386,68 @@ mod tests {
         assert!(is_private_host("224.0.0.1"));
         // Mapped/compat forms of CGNAT must be blocked too (defense in depth).
         assert!(is_private_host("::ffff:100.64.0.1"), "mapped CGNAT");
+    }
+
+    // --- check_host_allowlist tests (PR A fleet worker grant) ---
+
+    #[test]
+    fn test_host_allowlist_none_admits_everything() {
+        // `None` = no restriction — the backward-compatible default for every
+        // non-fleet caller (and the `Full` network grant).
+        assert!(check_host_allowlist("anything.example.com", None).is_ok());
+    }
+
+    #[test]
+    fn test_host_allowlist_some_empty_denies_everything() {
+        // FAIL CLOSED: `Some([])` (restricted to nothing) reaches NOTHING —
+        // never "unrestricted". Defense-in-depth for a `Hosts([])` grant that
+        // bypassed validation (e.g. an old serde row).
+        assert!(check_host_allowlist("example.com", Some(&[])).is_err());
+        let blank = ["   ".to_string()];
+        assert!(
+            check_host_allowlist("example.com", Some(&blank)).is_err(),
+            "an all-blank list is empty → deny all"
+        );
+    }
+
+    #[test]
+    fn test_host_allowlist_exact_and_subdomain() {
+        let list = vec!["example.com".to_string()];
+        assert!(
+            check_host_allowlist("example.com", Some(&list)).is_ok(),
+            "exact"
+        );
+        assert!(
+            check_host_allowlist("docs.example.com", Some(&list)).is_ok(),
+            "subdomain admitted"
+        );
+        assert!(
+            check_host_allowlist("EXAMPLE.COM", Some(&list)).is_ok(),
+            "case-insensitive"
+        );
+        assert!(
+            check_host_allowlist("example.com.", Some(&list)).is_ok(),
+            "trailing dot normalized"
+        );
+    }
+
+    #[test]
+    fn test_host_allowlist_refuses_others_and_lookalikes() {
+        let list = vec!["example.com".to_string()];
+        assert!(check_host_allowlist("other.com", Some(&list)).is_err());
+        assert!(
+            check_host_allowlist("notexample.com", Some(&list)).is_err(),
+            "label boundary: notexample.com is NOT a subdomain of example.com"
+        );
+        assert!(
+            check_host_allowlist("example.com.evil.tld", Some(&list)).is_err(),
+            "suffix attack rejected"
+        );
+        let err = check_host_allowlist("other.com", Some(&list)).unwrap_err();
+        assert!(
+            err.contains("allowlist"),
+            "error names the allowlist: {err}"
+        );
     }
 
     #[test]

@@ -21,7 +21,7 @@ permissions:
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
   FEATURES: "api,telegram,discord,whatsapp,feishu,twilio,wecom,wecom-bot,audio_mp3"
-  SKILL_CRATES: "-p news_fetch -p deep-search -p deep-crawl -p send-email -p account-manager -p voice -p clock -p weather"
+  SKILL_CRATES: "-p news_fetch -p deep-search -p deep-crawl -p send-email -p account-manager -p voice -p clock -p weather -p smart-home"
 
 jobs:
   build-macos-arm:
@@ -48,6 +48,7 @@ jobs:
           cd ..
           git submodule update --init octos-web
           bash scripts/build-web-app.sh
+          bash scripts/build-swarm-app.sh
 
       - name: Build
         run: |
@@ -58,7 +59,7 @@ jobs:
       - name: Bundle
         run: |
           mkdir dist
-          for b in octos octos-sandbox news_fetch deep-search deep_crawl send_email account_manager voice clock weather; do
+          for b in octos octos-sandbox news_fetch deep-search deep_crawl send_email account_manager voice clock weather smart_home; do
             cp "target/release/$b" dist/ 2>/dev/null || true
           done
           cd dist && tar czf ../octos-bundle-aarch64-apple-darwin.tar.gz *
@@ -92,6 +93,7 @@ jobs:
           cd ..
           git submodule update --init octos-web
           bash scripts/build-web-app.sh
+          bash scripts/build-swarm-app.sh
 
       - name: Build
         run: |
@@ -102,7 +104,7 @@ jobs:
       - name: Bundle
         run: |
           mkdir dist
-          for b in octos octos-sandbox news_fetch deep-search deep_crawl send_email account_manager voice clock weather; do
+          for b in octos octos-sandbox news_fetch deep-search deep_crawl send_email account_manager voice clock weather smart_home; do
             cp "target/release/$b" dist/ 2>/dev/null || true
           done
           cd dist && tar czf ../octos-bundle-x86_64-unknown-linux-gnu.tar.gz *
@@ -138,6 +140,7 @@ jobs:
           cd ..
           git submodule update --init octos-web
           bash scripts/build-web-app.sh
+          bash scripts/build-swarm-app.sh
 
       - name: Build
         run: |
@@ -148,7 +151,7 @@ jobs:
       - name: Bundle
         run: |
           mkdir dist
-          for b in octos octos-sandbox news_fetch deep-search deep_crawl send_email account_manager voice clock weather; do
+          for b in octos octos-sandbox news_fetch deep-search deep_crawl send_email account_manager voice clock weather smart_home; do
             cp "target/release/$b" dist/ 2>/dev/null || true
           done
           cd dist && tar czf ../octos-bundle-aarch64-unknown-linux-gnu.tar.gz *
@@ -186,6 +189,7 @@ jobs:
           cd ..
           git submodule update --init octos-web
           bash scripts/build-web-app.sh
+          bash scripts/build-swarm-app.sh
 
       - name: Build
         run: |
@@ -197,7 +201,7 @@ jobs:
         shell: bash
         run: |
           mkdir dist
-          for b in octos octos-sandbox news_fetch deep-search deep_crawl send_email account_manager voice clock weather; do
+          for b in octos octos-sandbox news_fetch deep-search deep_crawl send_email account_manager voice clock weather smart_home; do
             cp "target/release/${b}.exe" dist/ 2>/dev/null || true
           done
           cd dist && 7z a ../octos-bundle-x86_64-pc-windows-msvc.zip *

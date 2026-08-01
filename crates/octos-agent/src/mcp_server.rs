@@ -36,7 +36,8 @@ use std::time::Duration;
 use async_trait::async_trait;
 use eyre::Result;
 use metrics::counter;
-use octos_core::{TASK_RESULT_SCHEMA_VERSION, TaskId};
+use octos_core::{TASK_RESULT_SCHEMA_VERSION, TaskId, TokenUsage};
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tokio::sync::{Mutex, RwLock};
@@ -53,6 +54,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::harness_events::HarnessEvent;
 use crate::task_supervisor::{TaskLifecycleState, TaskSupervisor};
+use crate::validators::ValidatorOutcome;
 
 /// MCP protocol version negotiated by `octos mcp-serve`. Stays in sync with
 /// the client implementation in [`crate::mcp`].
@@ -104,9 +106,34 @@ pub struct McpSessionOutcome {
     pub final_state: TaskLifecycleState,
     pub artifact_path: Option<String>,
     pub artifact_content: Option<String>,
-    pub validator_results: Vec<Value>,
-    pub cost: Value,
+    pub validator_results: Vec<ValidatorOutcome>,
+    pub cost: McpSessionCost,
     pub error: Option<String>,
+}
+
+/// Stable token-cost projection returned by `run_octos_session`.
+///
+/// Unlike the internal token accounting type, every counter remains present
+/// on the wire, including zero values, to preserve the existing MCP contract.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct McpSessionCost {
+    pub input_tokens: u32,
+    pub output_tokens: u32,
+    pub reasoning_tokens: u32,
+    pub cache_read_tokens: u32,
+    pub cache_write_tokens: u32,
+}
+
+impl From<&TokenUsage> for McpSessionCost {
+    fn from(usage: &TokenUsage) -> Self {
+        Self {
+            input_tokens: usage.input_tokens,
+            output_tokens: usage.output_tokens,
+            reasoning_tokens: usage.reasoning_tokens,
+            cache_read_tokens: usage.cache_read_tokens,
+            cache_write_tokens: usage.cache_write_tokens,
+        }
+    }
 }
 
 /// Observer used by the session dispatch to record lifecycle transitions
@@ -645,9 +672,13 @@ fn build_run_session_result(contract: &str, outcome: &McpSessionOutcome) -> Valu
     }
     body.insert(
         "validator_results".into(),
-        Value::Array(outcome.validator_results.clone()),
+        serde_json::to_value(&outcome.validator_results)
+            .expect("validator outcomes are JSON-serializable"),
     );
-    body.insert("cost".into(), outcome.cost.clone());
+    body.insert(
+        "cost".into(),
+        serde_json::to_value(&outcome.cost).expect("MCP session cost is JSON-serializable"),
+    );
     if let Some(error) = &outcome.error {
         body.insert("error".into(), Value::String(error.clone()));
     }
@@ -837,7 +868,11 @@ mod tests {
                 artifact_path: Some("out/deck.pptx".to_string()),
                 artifact_content: Some("BYTES".to_string()),
                 validator_results: vec![],
-                cost: json!({"input_tokens": 1, "output_tokens": 1}),
+                cost: McpSessionCost {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                    ..Default::default()
+                },
                 error: None,
             })
         }
@@ -942,7 +977,7 @@ mod tests {
             artifact_path: None,
             artifact_content: None,
             validator_results: Vec::new(),
-            cost: json!({}),
+            cost: McpSessionCost::default(),
             error: Some("boom".into()),
         };
         let result = build_run_session_result("c", &outcome);
@@ -960,8 +995,11 @@ mod tests {
             final_state: TaskLifecycleState::Ready,
             artifact_path: Some("out/deck.pptx".into()),
             artifact_content: Some("binary".into()),
-            validator_results: vec![json!({"passed": true})],
-            cost: json!({"input_tokens": 10}),
+            validator_results: Vec::new(),
+            cost: McpSessionCost {
+                input_tokens: 10,
+                ..Default::default()
+            },
             error: None,
         };
         let result = build_run_session_result("slides_delivery", &outcome);

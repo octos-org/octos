@@ -78,8 +78,19 @@ impl ModelHints {
         let uses_completion_tokens =
             is_o_series || m.starts_with("gpt-5") || m.starts_with("gpt-4.1");
 
-        let fixed_temperature =
-            is_o_series || m.starts_with("gpt-5") || m.contains("kimi-k2") || m == "gpt-4.1-nano";
+        // kimi-k3 pins its sampling params server-side (temperature=1.0,
+        // top_p=0.95, …) and rejects overrides, so never send temperature. The
+        // Kimi *coding plan* (family `moonshot-coding`) exposes the SAME K3
+        // model under the bare ids `k3` / `kimi-for-coding*`, which don't
+        // contain `kimi-k3` — match them too, or the endpoint 400s with
+        // "invalid temperature: only 1 is allowed for this model".
+        let fixed_temperature = is_o_series
+            || m.starts_with("gpt-5")
+            || m.contains("kimi-k2")
+            || m.contains("kimi-k3")
+            || m == "k3"
+            || m.starts_with("kimi-for-coding")
+            || m == "gpt-4.1-nano";
 
         // Vision capability is NO LONGER inferred from the model name. The old
         // allow/deny list wrongly stripped images from vision-capable models —
@@ -102,7 +113,10 @@ impl ModelHints {
         // Reasoning-control style on the chat/completions path. DeepSeek V4
         // (incl. `deepseek-reasoner`, a V4-Flash thinking alias) wants
         // `reasoning_effort` + a `thinking` toggle; OpenAI reasoning models and
-        // grok-4.x take a plain `reasoning_effort`. Everything else emits nothing.
+        // grok-4.x take a plain `reasoning_effort`; Kimi K3 takes a top-level
+        // `reasoning_effort` whose only accepted value is `"max"` (thinking is
+        // always on and K3 rejects the K2.x `thinking` object). Everything else
+        // emits nothing.
         // Effort/thinking is only EMITTED when an operator sets `reasoning_effort`
         // (opt-in), and the style is config-overridable per route — important
         // because the same `deepseek-v4` name fronts endpoints that differ
@@ -111,6 +125,30 @@ impl ModelHints {
         // families can reject `reasoning_effort`.
         let reasoning_style = if m.contains("deepseek-v4") || m.contains("deepseek-reasoner") {
             ReasoningStyle::EffortAndThinkingToggle
+        } else if m.contains("kimi-k3") || m == "k3" || m.starts_with("kimi-for-coding") {
+            // K3, incl. the coding plan's bare `k3` and `kimi-for-coding*` ids
+            // (same K3 model, different ids that don't contain `kimi-k3`): per
+            // its quickstart docs `reasoning_effort` accepts low|high|max
+            // (default max); thinking is always on and the K2.x `thinking`
+            // object is rejected. Graded effort IS honored — do NOT collapse
+            // everything to "max". (These ids already pin temperature above;
+            // they must get the graded style too or `/thinking` is a no-op.)
+            ReasoningStyle::EffortLowHighMax
+        } else if m.contains("glm-4.5")
+            || m.contains("glm-4.6")
+            || m.contains("glm-5")
+            || m.contains("glm-z")
+        {
+            // GLM-4.5+/4.6/5.x + the z-reasoning line (Zhipu / Z.ai, e.g.
+            // `glm-5.2`): thinking is a binary `thinking:{"type":"enabled"}`
+            // toggle, no graded effort. Any set effort level enables thinking.
+            // Narrowed from a bare `contains("glm")`: legacy `glm-4`/`glm-4-plus`/
+            // `glm-3` REJECT the thinking object (400), so they must not match.
+            // NOTE: the SHIPPED `glm-5.2` route runs through AnthropicProvider
+            // (Z.ai's Anthropic-compatible endpoint), which maps `/thinking` via
+            // `build_anthropic_thinking`; this arm only governs a GLM added
+            // through an OpenAI-compatible endpoint.
+            ReasoningStyle::ThinkingToggle
         } else if m.starts_with("grok-4") || is_o_series || m.starts_with("gpt-5") {
             ReasoningStyle::Effort
         } else {
@@ -143,6 +181,48 @@ pub enum ReasoningStyle {
     Effort,
     /// `reasoning_effort` plus `thinking: {"type": "enabled"}` — DeepSeek V4.
     EffortAndThinkingToggle,
+    /// Top-level `reasoning_effort` whose only accepted value is `"max"`. Legacy
+    /// / manual-override only — retained for configs that pin it; Kimi K3 now uses
+    /// [`ReasoningStyle::EffortLowHighMax`] since K3's docs list `low|high|max`.
+    EffortMaxOnly,
+    /// Top-level `reasoning_effort: "low"|"high"|"max"` (default `"max"`) — Kimi
+    /// K3. Per K3's quickstart docs it accepts exactly those three values, thinking
+    /// is ALWAYS on, and the K2.x `thinking` object must NOT be sent. octos has no
+    /// K3-native "medium" tier, so `Medium` clamps up to `"high"`; `Max` maps to
+    /// `"max"` (NOT clamped to "high" like the Effort style). No effort configured
+    /// ⇒ nothing emitted (K3 still thinks — its server-side `max` default).
+    EffortLowHighMax,
+    /// Binary `thinking: {"type": "enabled"}` toggle with NO `reasoning_effort` —
+    /// GLM-4.5+/5.x (Zhipu / Z.ai), which control thinking via enable/disable and
+    /// do not accept graded effort. Any configured effort level ENABLES thinking;
+    /// no effort configured ⇒ nothing emitted (the model's server-side default).
+    ThinkingToggle,
+}
+
+/// Serialize tool-call arguments for the request wire as a JSON **object**
+/// string. Chat/completions providers validate `function.arguments` and reject
+/// the ENTIRE request with a non-retryable HTTP 400 when it does not decode to
+/// an object — which a tool call recovered from inline/malformed model output
+/// can be (a bare string, or a truncated fragment). Coercing a non-object to
+/// `{}` keeps the request valid; the model then sees an ordinary empty-arg call
+/// and can retry, instead of the whole turn/task dying. Objects pass through
+/// byte-identically, so this is a no-op on the normal path. See #1711.
+fn tool_call_arguments_to_wire(arguments: &serde_json::Value) -> String {
+    if arguments.is_object() {
+        return arguments.to_string();
+    }
+    // Recover a stringified object (e.g. `"{\"command\":\"ls\"}"`).
+    if let serde_json::Value::String(inner) = arguments
+        && let Ok(parsed) = serde_json::from_str::<serde_json::Value>(inner)
+        && parsed.is_object()
+    {
+        return parsed.to_string();
+    }
+    tracing::warn!(
+        target: "octos::toolcall_repair",
+        "coerced non-object tool-call arguments to empty object at request boundary (#1711)"
+    );
+    "{}".to_string()
 }
 
 /// OpenAI GPT provider.
@@ -325,7 +405,7 @@ impl OpenAIProvider {
                             call_type: "function".to_string(),
                             function: FunctionCall {
                                 name: tc.name.clone(),
-                                arguments: tc.arguments.to_string(),
+                                arguments: tool_call_arguments_to_wire(&tc.arguments),
                             },
                         })
                         .collect()
@@ -336,19 +416,24 @@ impl OpenAIProvider {
                 // pure context bloat (and grows unboundedly across a tool loop) —
                 // OpenAI's own API and codex both drop it.
                 //
-                // kimi-k2 is the exception. With thinking enabled it (a) returns 400
-                // "reasoning_content is missing in assistant tool call message" if the
-                // field is absent, AND (b) per kimi's docs preserves historical
-                // assistant reasoning for multi-step tool-use continuity. So for
-                // kimi-k2 we keep the REAL reasoning when present, and fall back to a
-                // minimal "." stub only to satisfy the presence check when it's absent.
+                // kimi-k2/k3 are the exception. With thinking enabled kimi-k2 (a)
+                // returns 400 "reasoning_content is missing in assistant tool call
+                // message" if the field is absent, AND (b) per kimi's docs preserves
+                // historical assistant reasoning for multi-step tool-use continuity
+                // (K3's quickstart likewise mandates "add the complete assistant
+                // message returned by the API to the next request. Do not keep only
+                // `content`"). So for kimi-k2/k3 we keep the REAL reasoning when
+                // present, and fall back to a minimal "." stub only to satisfy the
+                // presence check when it's absent.
                 //
-                // kimi-k2 is detected via fixed_temperature + model name containing
-                // "kimi-k2". Other models (e.g. deepseek-v4, verified live to return
-                // 200 without the field, and non-official nvidia/vllm endpoints that
-                // don't expect it) get no reasoning_content at all.
-                let needs_reasoning_stub =
-                    self.hints.fixed_temperature && self.model.to_lowercase().contains("kimi-k2");
+                // kimi-k2/k3 are detected via fixed_temperature + model name
+                // containing "kimi-k2"/"kimi-k3". Other models (e.g. deepseek-v4,
+                // verified live to return 200 without the field, and non-official
+                // nvidia/vllm endpoints that don't expect it) get no
+                // reasoning_content at all.
+                let model_lower = self.model.to_lowercase();
+                let needs_reasoning_stub = self.hints.fixed_temperature
+                    && (model_lower.contains("kimi-k2") || model_lower.contains("kimi-k3"));
                 let reasoning = if role == "assistant" && needs_reasoning_stub {
                     match m.reasoning_content.as_deref() {
                         Some(r) if !r.is_empty() => Some(r),
@@ -425,25 +510,48 @@ impl OpenAIProvider {
         // request fields the model's ReasoningStyle expects. Emitted only when
         // an effort is configured AND the model declares a non-None style, so
         // it stays a no-op for models/endpoints that don't accept it.
-        let (reasoning_effort, thinking) =
+        let (reasoning_effort, thinking): (Option<&str>, Option<serde_json::Value>) =
             match (config.reasoning_effort, self.hints.reasoning_style) {
                 (Some(effort), style) if style != ReasoningStyle::None => {
                     use crate::config::ReasoningEffort as RE;
-                    let effort_str = match (effort, style) {
-                        (RE::Low, _) => "low",
-                        (RE::Medium, _) => "medium",
-                        (RE::High, _) => "high",
-                        // DeepSeek V4 accepts "max"; Effort-style providers
-                        // (OpenAI/Grok) have no max tier, so clamp to "high".
-                        (RE::Max, ReasoningStyle::EffortAndThinkingToggle) => "max",
-                        (RE::Max, _) => "high",
-                    };
-                    let thinking = if style == ReasoningStyle::EffortAndThinkingToggle {
-                        Some(serde_json::json!({ "type": "enabled" }))
-                    } else {
-                        None
-                    };
-                    (Some(effort_str), thinking)
+                    let enabled = || serde_json::json!({ "type": "enabled" });
+                    match style {
+                        // GLM-4.5+/5.x: binary thinking toggle, NO reasoning_effort.
+                        ReasoningStyle::ThinkingToggle => (None, Some(enabled())),
+                        // Kimi K3: low|high|max (no medium tier → clamp up to high;
+                        // Max stays "max", NOT clamped to "high"). Thinking always on.
+                        ReasoningStyle::EffortLowHighMax => {
+                            let e = match effort {
+                                RE::Low => "low",
+                                RE::Medium | RE::High => "high",
+                                RE::Max => "max",
+                            };
+                            (Some(e), None)
+                        }
+                        // Legacy manual-override: everything → "max".
+                        ReasoningStyle::EffortMaxOnly => (Some("max"), None),
+                        // DeepSeek V4: reasoning_effort + `thinking` toggle.
+                        ReasoningStyle::EffortAndThinkingToggle => {
+                            let e = match effort {
+                                RE::Low => "low",
+                                RE::Medium => "medium",
+                                RE::High => "high",
+                                RE::Max => "max",
+                            };
+                            (Some(e), Some(enabled()))
+                        }
+                        // OpenAI/Grok: low|medium|high, no max tier → clamp to high.
+                        ReasoningStyle::Effort => {
+                            let e = match effort {
+                                RE::Low => "low",
+                                RE::Medium => "medium",
+                                RE::High => "high",
+                                RE::Max => "high",
+                            };
+                            (Some(e), None)
+                        }
+                        ReasoningStyle::None => (None, None),
+                    }
                 }
                 _ => (None, None),
             };
@@ -1077,6 +1185,40 @@ mod tests {
     use crate::provider::LlmProvider;
     use octos_core::{Message, MessageRole};
 
+    #[test]
+    fn tool_call_arguments_wire_passes_objects_through() {
+        let obj = serde_json::json!({"command": "ls -la"});
+        let wire = tool_call_arguments_to_wire(&obj);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&wire).unwrap(),
+            obj
+        );
+    }
+
+    #[test]
+    fn tool_call_arguments_wire_coerces_non_object_to_empty_object() {
+        // A bare string is what the old inline fallback produced; serialized
+        // verbatim it caused the provider HTTP 400. It must become `{}`.
+        let bare = serde_json::Value::String("git clone https://x".to_string());
+        assert_eq!(tool_call_arguments_to_wire(&bare), "{}");
+        // Arrays/numbers/null are also not valid arguments objects.
+        assert_eq!(
+            tool_call_arguments_to_wire(&serde_json::json!([1, 2])),
+            "{}"
+        );
+        assert_eq!(tool_call_arguments_to_wire(&serde_json::Value::Null), "{}");
+    }
+
+    #[test]
+    fn tool_call_arguments_wire_recovers_a_stringified_object() {
+        let stringified = serde_json::Value::String(r#"{"command":"ls"}"#.to_string());
+        let wire = tool_call_arguments_to_wire(&stringified);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&wire).unwrap(),
+            serde_json::json!({"command": "ls"})
+        );
+    }
+
     fn msg(content: &str) -> Message {
         Message {
             role: MessageRole::User,
@@ -1291,6 +1433,34 @@ mod tests {
             ModelHints::detect("gpt-5.3-codex").reasoning_style,
             ReasoningStyle::Effort
         );
+        // Kimi K3 (incl. provider-prefixed) -> low|high|max reasoning_effort.
+        assert_eq!(
+            ModelHints::detect("kimi-k3").reasoning_style,
+            ReasoningStyle::EffortLowHighMax
+        );
+        assert_eq!(
+            ModelHints::detect("moonshotai/kimi-k3").reasoning_style,
+            ReasoningStyle::EffortLowHighMax
+        );
+        // GLM-4.5+/5.x (Zhipu / Z.ai) -> binary thinking toggle.
+        assert_eq!(
+            ModelHints::detect("glm-5.2").reasoning_style,
+            ReasoningStyle::ThinkingToggle
+        );
+        assert_eq!(
+            ModelHints::detect("zai-org/glm-4.6").reasoning_style,
+            ReasoningStyle::ThinkingToggle
+        );
+        // Legacy GLM (pre-4.5) REJECTS the `thinking` object — it must NOT get
+        // the toggle style (a bare `contains("glm")` used to misfire here and
+        // send an unsupported field → 400).
+        for legacy in ["glm-4", "glm-4-plus", "zhipu/glm-4-air", "glm-3-turbo"] {
+            assert_eq!(
+                ModelHints::detect(legacy).reasoning_style,
+                ReasoningStyle::None,
+                "{legacy} predates the thinking toggle and must emit no reasoning control"
+            );
+        }
         // Non-thinking / unknown-control models emit nothing. grok-3 is
         // excluded (only grok-4.x is known to accept reasoning_effort).
         for m in [
@@ -1498,6 +1668,178 @@ mod tests {
             a2.get("reasoning_content").and_then(|r| r.as_str()),
             Some("."),
             "kimi-k2 must get the \".\" stub when reasoning_content is absent"
+        );
+    }
+
+    #[test]
+    fn kimi_k3_hints_survive_official_endpoint_and_pin_temperature() {
+        // K3 pins sampling params server-side -> never send temperature.
+        assert!(ModelHints::detect("kimi-k3").fixed_temperature);
+        // Unlike the DeepSeek-specific thinking toggle, K3's max-only
+        // reasoning_effort is a plain top-level field, so with_base_url must
+        // not downgrade it on the official moonshot endpoint.
+        let p = OpenAIProvider::new("k", "kimi-k3")
+            .with_provider_label("moonshot")
+            .with_base_url("https://api.moonshot.ai/v1");
+        assert_eq!(p.hints.reasoning_style, ReasoningStyle::EffortLowHighMax);
+        // Explicit config override still wins (with_hints runs after
+        // with_base_url), e.g. for a proxy that rejects reasoning_effort.
+        let overridden = OpenAIProvider::new("k", "kimi-k3")
+            .with_base_url("https://api.moonshot.ai/v1")
+            .with_hints(ModelHints {
+                reasoning_style: ReasoningStyle::None,
+                fixed_temperature: true,
+                ..Default::default()
+            });
+        assert_eq!(overridden.hints.reasoning_style, ReasoningStyle::None);
+    }
+
+    /// The Kimi coding plan (family `moonshot-coding`) exposes K3 under the bare
+    /// ids `k3` / `kimi-for-coding*`, which don't contain `kimi-k3`. They MUST
+    /// still pin temperature (else the endpoint 400s "only 1 is allowed") and
+    /// get K3's max-only reasoning.
+    #[test]
+    fn coding_plan_k3_ids_pin_temperature_and_max_reasoning() {
+        for id in ["k3", "kimi-for-coding", "kimi-for-coding-highspeed"] {
+            let h = ModelHints::detect(id);
+            assert!(
+                h.fixed_temperature,
+                "{id} must pin temperature (K3 rejects any temperature != 1)"
+            );
+            // These ids ARE the K3 model, so they must also get K3's graded
+            // low|high|max reasoning — otherwise `/thinking` is silently a
+            // no-op for the coding-plan aliases even though temperature is pinned.
+            assert_eq!(
+                h.reasoning_style,
+                ReasoningStyle::EffortLowHighMax,
+                "{id} is the K3 model and must get K3's graded low|high|max reasoning"
+            );
+        }
+        // Guard: an unrelated model containing "k3" as a substring is NOT the
+        // coding plan (exact match only), so it is unaffected.
+        assert!(!ModelHints::detect("mock-k3000").fixed_temperature);
+    }
+
+    #[test]
+    fn reasoning_emission_for_k3_is_graded_and_for_glm_is_a_toggle() {
+        use crate::config::ReasoningEffort as RE;
+        let build = |model: &str, effort: Option<RE>| {
+            let p = OpenAIProvider::new("key", model);
+            let cfg = ChatConfig {
+                reasoning_effort: effort,
+                ..ChatConfig::default()
+            };
+            serde_json::to_value(p.build_request(&[msg("hi")], &[], &cfg, false)).unwrap()
+        };
+
+        // Kimi K3: graded low|high|max (no medium tier → clamps up to high; Max
+        // stays "max"). No `thinking` object (K3 rejects it).
+        for (effort, want) in [
+            (RE::Low, "low"),
+            (RE::Medium, "high"),
+            (RE::High, "high"),
+            (RE::Max, "max"),
+        ] {
+            let v = build("k3", Some(effort));
+            assert_eq!(
+                v["reasoning_effort"].as_str(),
+                Some(want),
+                "k3 {effort:?} must map to {want}, not collapse to max"
+            );
+            assert!(
+                v.get("thinking").is_none_or(|t| t.is_null()),
+                "k3 must NOT send a thinking object"
+            );
+        }
+        // No effort configured → nothing emitted (K3 thinks by its server default).
+        let v = build("k3", None);
+        assert!(v.get("reasoning_effort").is_none_or(|r| r.is_null()));
+
+        // GLM-5.2: any effort level ENABLES thinking via the binary toggle; it
+        // must NOT send reasoning_effort (previously it emitted nothing at all).
+        for effort in [RE::Low, RE::Medium, RE::High, RE::Max] {
+            let v = build("glm-5.2", Some(effort));
+            assert_eq!(
+                v["thinking"],
+                serde_json::json!({ "type": "enabled" }),
+                "glm {effort:?} must enable thinking"
+            );
+            assert!(
+                v.get("reasoning_effort").is_none_or(|r| r.is_null()),
+                "glm must NOT send reasoning_effort"
+            );
+        }
+        // No effort → nothing (server default).
+        let v = build("glm-5.2", None);
+        assert!(v.get("thinking").is_none_or(|t| t.is_null()));
+    }
+
+    #[test]
+    fn kimi_k3_pins_temperature_and_never_sends_the_thinking_object() {
+        // K3 always thinks and rejects the K2.x `thinking` object; it also pins
+        // temperature server-side. (Graded low|high|max emission is covered by
+        // `reasoning_emission_for_k3_is_graded_and_for_glm_is_a_toggle`.)
+        let p = OpenAIProvider::new("key", "kimi-k3");
+        let msgs = [msg("hi")];
+        use crate::config::ReasoningEffort as RE;
+        for effort in [RE::Low, RE::Medium, RE::High, RE::Max] {
+            let cfg = ChatConfig {
+                reasoning_effort: Some(effort),
+                ..Default::default()
+            };
+            let v = serde_json::to_value(p.build_request(&msgs, &[], &cfg, false)).unwrap();
+            assert!(
+                v.get("thinking").is_none(),
+                "kimi-k3 must not emit the K2.x thinking object"
+            );
+            assert!(
+                v.get("temperature").is_none(),
+                "kimi-k3 pins temperature server-side"
+            );
+        }
+    }
+
+    #[test]
+    fn build_request_preserves_reasoning_for_kimi_k3() {
+        // K3's quickstart mandates the same round-trip contract as kimi-k2:
+        // "add the complete assistant message returned by the API to the next
+        // request. Do not keep only `content`". Auto-detected hints (no
+        // with_hints) must be enough to get it.
+        let p = OpenAIProvider::new("key", "kimi-k3");
+        let mut assistant = msg("the answer");
+        assistant.role = MessageRole::Assistant;
+        assistant.reasoning_content = Some("prior k3 reasoning".to_string());
+        let msgs = [assistant];
+        let v = serde_json::to_value(p.build_request(&msgs, &[], &ChatConfig::default(), false))
+            .unwrap();
+        let a = v["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["role"] == "assistant")
+            .expect("assistant message present");
+        assert_eq!(
+            a.get("reasoning_content").and_then(|r| r.as_str()),
+            Some("prior k3 reasoning"),
+            "kimi-k3 must round-trip prior assistant reasoning_content"
+        );
+        // Absent reasoning -> "." stub (same presence contract as kimi-k2).
+        let mut assistant2 = msg("the answer");
+        assistant2.role = MessageRole::Assistant;
+        assistant2.reasoning_content = None;
+        let msgs2 = [assistant2];
+        let v2 = serde_json::to_value(p.build_request(&msgs2, &[], &ChatConfig::default(), false))
+            .unwrap();
+        let a2 = v2["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["role"] == "assistant")
+            .expect("assistant message present");
+        assert_eq!(
+            a2.get("reasoning_content").and_then(|r| r.as_str()),
+            Some("."),
+            "kimi-k3 must get the \".\" stub when reasoning_content is absent"
         );
     }
 

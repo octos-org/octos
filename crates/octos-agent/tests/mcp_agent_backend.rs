@@ -27,6 +27,20 @@ use octos_agent::tools::mcp_agent::{
     StdioMcpAgent, build_backend_from_config, build_dispatch_event_payload, dispatch_with_metrics,
 };
 
+/// Headroom for spawn + MCP handshake + reply in the stdio dispatch tests that
+/// are NOT about timing. It is not an assertion — nothing here should reach it.
+///
+/// `StdioMcpAgent::dispatch_inner` wraps the *whole* run in this budget, so 5s
+/// had to cover `/bin/sh` startup, the initialize round-trip, the
+/// notification-skip loop (which forks `printf | grep` per iteration), a
+/// `printf | sed` fork, and the tools/call reply — all on a CI runner that may
+/// be running the rest of the suite at full parallelism.
+///
+/// The two tests that genuinely exercise the timeout path set their own budget
+/// via `with_dispatch_timeout` (300ms / 150ms) and pass
+/// `dispatch_timeout_secs: None`, so this constant cannot weaken them.
+const STDIO_DISPATCH_TIMEOUT_SECS: u64 = 120;
+
 // ── Helpers ────────────────────────────────────────────────────────────────
 
 /// Build a throwaway shell-script MCP server that answers two requests:
@@ -41,6 +55,12 @@ read init
 # Respond to initialize
 printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"serverInfo":{"name":"fake"}}}'
 read call
+# Spec-compliant clients send notifications/initialized between the
+# initialize response and the first request; skip notification frames
+# (no "id") until the actual tools/call arrives.
+while printf '%s' "$call" | grep -q '"method":"notifications/'; do
+  read call
+done
 # Extract the tool name out of the call for assertion.
 tool=$(printf '%s' "$call" | sed -n 's/.*"name":"\([^"]*\)".*/\1/p')
 printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"fake-agent:$tool\"}],\"files_to_send\":[\"/tmp/artifact.md\"]}}"
@@ -88,6 +108,14 @@ done
 read init
 printf '%s\n' '{{"jsonrpc":"2.0","id":1,"result":{{"serverInfo":{{}}}}}}'
 read call
+# Spec-compliant clients send notifications/initialized between the
+# initialize response and the first request. Skip notification frames
+# until the real tools/call arrives — otherwise this `read` consumes the
+# notification, the script answers and exits, and the client's still-
+# pending tools/call write hits a closed pipe (TransportError).
+while printf '%s' "$call" | grep -q '"method":"notifications/'; do
+  read call
+done
 printf '%s\n' '{{"jsonrpc":"2.0","id":2,"result":{{"content":[{{"type":"text","text":"probed"}}]}}}}'
 "#,
         log = log_path.display()
@@ -200,14 +228,16 @@ async fn should_dispatch_to_stdio_mcp_agent_and_return_contract_artifact() {
         cmd: script.display().to_string(),
         args: vec![],
         env: HashMap::new(),
-        dispatch_timeout_secs: Some(5),
+        dispatch_timeout_secs: Some(STDIO_DISPATCH_TIMEOUT_SECS),
     };
     let backend =
         build_backend_from_config(&config, Some(dir.path())).expect("build stdio backend");
     let request = DispatchRequest::new("run_task", serde_json::json!({"task": "hello"}));
     let response = backend.dispatch(request).await;
 
-    assert_eq!(response.outcome, DispatchOutcome::Success);
+    // Carry the whole response: a bare `left: TransportError` says nothing
+    // about *why* the transport failed.
+    assert_eq!(response.outcome, DispatchOutcome::Success, "{response:?}");
     assert!(
         response.output.contains("fake-agent:run_task"),
         "unexpected output: {}",
@@ -246,7 +276,9 @@ async fn should_dispatch_to_remote_mcp_agent_and_return_contract_artifact() {
     let response = backend.dispatch(request).await;
     join.abort();
 
-    assert_eq!(response.outcome, DispatchOutcome::Success);
+    // Carry the whole response: a bare `left: TransportError` says nothing
+    // about *why* the transport failed.
+    assert_eq!(response.outcome, DispatchOutcome::Success, "{response:?}");
     assert_eq!(response.output, "remote-agent");
     assert_eq!(
         response.files_to_send,
@@ -375,7 +407,7 @@ async fn should_apply_blocked_env_vars_to_stdio_subprocess() {
         cmd: script.display().to_string(),
         args: vec![],
         env: extra,
-        dispatch_timeout_secs: Some(5),
+        dispatch_timeout_secs: Some(STDIO_DISPATCH_TIMEOUT_SECS),
     };
     let backend = StdioMcpAgent::from_config(&config)
         .unwrap()
@@ -384,7 +416,9 @@ async fn should_apply_blocked_env_vars_to_stdio_subprocess() {
     let response = backend
         .dispatch(DispatchRequest::new("run_task", serde_json::json!({})))
         .await;
-    assert_eq!(response.outcome, DispatchOutcome::Success);
+    // Carry the whole response: a bare `left: TransportError` says nothing
+    // about *why* the transport failed.
+    assert_eq!(response.outcome, DispatchOutcome::Success, "{response:?}");
 
     let log_contents = std::fs::read_to_string(&log).expect("read env probe log");
     // Empty value after the `=` proves the blocked name was scrubbed
@@ -453,7 +487,7 @@ async fn should_emit_sub_agent_dispatch_event_on_typed_payload() {
         cmd: script.display().to_string(),
         args: vec![],
         env: HashMap::new(),
-        dispatch_timeout_secs: Some(5),
+        dispatch_timeout_secs: Some(STDIO_DISPATCH_TIMEOUT_SECS),
     };
     let backend =
         build_backend_from_config(&config, Some(dir.path())).expect("build stdio backend");
@@ -512,6 +546,14 @@ set -eu
 read init
 printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"serverInfo":{}}}'
 read call
+# Spec-compliant clients send notifications/initialized between the
+# initialize response and the first request. Skip notification frames
+# until the real tools/call arrives — otherwise this `read` consumes the
+# notification, the script answers and exits, and the client's still-
+# pending tools/call write hits a closed pipe (TransportError).
+while printf '%s' "$call" | grep -q '"method":"notifications/'; do
+  read call
+done
 # Pretend the sub-agent ran several internal tools — but only the final
 # JSON-RPC frame is emitted on stdout. Everything else is logged on
 # stderr so even a leaky harness cannot accidentally surface it.
@@ -530,7 +572,7 @@ printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"content":[{"type":"text","text
         cmd: script_path.display().to_string(),
         args: vec![],
         env: HashMap::new(),
-        dispatch_timeout_secs: Some(5),
+        dispatch_timeout_secs: Some(STDIO_DISPATCH_TIMEOUT_SECS),
     };
     let backend = StdioMcpAgent::from_config(&config)
         .unwrap()
@@ -543,7 +585,9 @@ printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"content":[{"type":"text","text
         ))
         .await;
 
-    assert_eq!(response.outcome, DispatchOutcome::Success);
+    // Carry the whole response: a bare `left: TransportError` says nothing
+    // about *why* the transport failed.
+    assert_eq!(response.outcome, DispatchOutcome::Success, "{response:?}");
     assert_eq!(response.output, "final-artifact-only");
     // Internal chatter never appears in the DispatchResponse.
     assert!(

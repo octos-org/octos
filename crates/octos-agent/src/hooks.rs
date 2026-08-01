@@ -29,6 +29,13 @@ pub struct HookContext {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HookEvent {
+    /// Fires once when a real user-submitted prompt enters a turn, BEFORE the
+    /// agent/LLM processes it (mirrors Claude Code's `UserPromptSubmit`). A
+    /// before-hook can DENY the prompt (exit 1) to block the turn, or inject
+    /// additional per-turn context (exit 0 with stdout) that is prepended to
+    /// the model's input for that turn. Distinct from [`Self::BeforeLlmCall`],
+    /// which fires on every LLM iteration within a turn.
+    UserPromptSubmit,
     BeforeToolCall,
     AfterToolCall,
     BeforeLlmCall,
@@ -39,6 +46,29 @@ pub enum HookEvent {
     OnSpawnVerify,
     OnSpawnComplete,
     OnSpawnFailure,
+}
+
+impl HookEvent {
+    /// The config-string form of this event, matching the `snake_case` serde
+    /// rename used in `config.json`'s `hooks[].event` field. Kept as an
+    /// explicit match (rather than re-deriving from serde) so the enum ⇄
+    /// string mapping is auditable in one place and usable in log/error
+    /// messages without a `serde_json` round-trip.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            HookEvent::UserPromptSubmit => "user_prompt_submit",
+            HookEvent::BeforeToolCall => "before_tool_call",
+            HookEvent::AfterToolCall => "after_tool_call",
+            HookEvent::BeforeLlmCall => "before_llm_call",
+            HookEvent::AfterLlmCall => "after_llm_call",
+            HookEvent::OnResume => "on_resume",
+            HookEvent::OnTurnEnd => "on_turn_end",
+            HookEvent::BeforeSpawnVerify => "before_spawn_verify",
+            HookEvent::OnSpawnVerify => "on_spawn_verify",
+            HookEvent::OnSpawnComplete => "on_spawn_complete",
+            HookEvent::OnSpawnFailure => "on_spawn_failure",
+        }
+    }
 }
 
 /// Configuration for a single hook.
@@ -96,6 +126,14 @@ pub struct HookPayload {
     #[serde(default = "default_hook_payload_schema_version")]
     pub schema_version: u32,
     pub event: HookEvent,
+    /// The user's submitted prompt text (`user_prompt_submit` event only).
+    /// Truncated to [`MAX_PAYLOAD_FIELD_BYTES`] like other free-text fields.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt: Option<String>,
+    /// Working directory the turn runs in (`user_prompt_submit` event).
+    /// Lets prompt hooks emit cwd-scoped context (git state, policy, etc).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -257,6 +295,31 @@ impl HookPayload {
         let mut p = Self {
             turn_summary: Some(turn_summary),
             ..Self::empty(HookEvent::OnTurnEnd)
+        };
+        p.apply_context(ctx);
+        p
+    }
+
+    /// Payload for a `user_prompt_submit` hook.
+    ///
+    /// Fires once when a real user prompt enters a turn, before the first LLM
+    /// call. Carries the prompt text plus the turn's `model` and `cwd`, and
+    /// the session/profile context (via `ctx`) — mirroring the request codex's
+    /// UserPromptSubmit handler receives. The prompt is truncated to
+    /// [`MAX_PAYLOAD_FIELD_BYTES`] to keep the hook stdin bounded, matching the
+    /// other free-text payload fields.
+    pub fn user_prompt_submit(
+        prompt: &str,
+        model: &str,
+        cwd: Option<&str>,
+        ctx: Option<&HookContext>,
+    ) -> Self {
+        let mut p = Self {
+            event: HookEvent::UserPromptSubmit,
+            prompt: Some(truncate_string(prompt, MAX_PAYLOAD_FIELD_BYTES)),
+            model: Some(model.to_string()),
+            cwd: cwd.map(str::to_string),
+            ..Self::empty(HookEvent::UserPromptSubmit)
         };
         p.apply_context(ctx);
         p
@@ -522,6 +585,8 @@ impl HookPayload {
         Self {
             schema_version: HOOK_PAYLOAD_SCHEMA_VERSION,
             event,
+            prompt: None,
+            cwd: None,
             tool_name: None,
             arguments: None,
             tool_id: None,
@@ -590,6 +655,11 @@ pub enum HookResult {
     /// A before-hook modified the pending input for the event (exit code 2,
     /// stdout = replacement JSON payload).
     Modified(serde_json::Value),
+    /// One or more `user_prompt_submit` hooks allowed the prompt and emitted
+    /// additional context on stdout (exit code 0) to inject into the turn
+    /// before the first LLM call. Holds one entry per context-emitting hook,
+    /// in configuration order. Only produced for `HookEvent::UserPromptSubmit`.
+    Context(Vec<String>),
     /// A hook encountered an error (does not block).
     Error(String),
 }
@@ -671,6 +741,11 @@ impl HookExecutor {
         };
 
         let mut last_error = None;
+        // Additional context emitted by exit-0 `user_prompt_submit` hooks
+        // (one entry per hook that printed to stdout). Collected across all
+        // matching hooks and returned as `HookResult::Context` at the end so
+        // the caller can inject it into the turn before the first LLM call.
+        let mut injected_contexts: Vec<String> = Vec::new();
 
         for (i, hook) in self.hooks.iter().enumerate() {
             if hook.event != event {
@@ -746,13 +821,20 @@ impl HookExecutor {
             }
 
             match self.execute_hook(hook, &payload_json).await {
-                Ok((0, _stdout)) => {
+                Ok((0, stdout)) => {
                     self.failures[i].store(0, Ordering::Relaxed);
+                    // Context injection (user_prompt_submit): a hook that exits
+                    // 0 and prints to stdout contributes that text as extra
+                    // per-turn context. Other events ignore exit-0 stdout.
+                    if event == HookEvent::UserPromptSubmit && !stdout.is_empty() {
+                        injected_contexts.push(stdout);
+                    }
                 }
                 Ok((1, stdout)) => {
                     if matches!(
                         event,
-                        HookEvent::BeforeToolCall
+                        HookEvent::UserPromptSubmit
+                            | HookEvent::BeforeToolCall
                             | HookEvent::BeforeLlmCall
                             | HookEvent::BeforeSpawnVerify
                     ) {
@@ -828,6 +910,8 @@ impl HookExecutor {
 
         if let Some(err) = last_error {
             HookResult::Error(err)
+        } else if !injected_contexts.is_empty() {
+            HookResult::Context(injected_contexts)
         } else {
             HookResult::Allow
         }
@@ -909,9 +993,15 @@ impl HookExecutor {
             }
             Ok(Err(e)) => Err(e.into()),
             Err(_) => {
-                // Timeout: kill the child process to prevent orphans
+                // Timeout: kill the child process to prevent orphans. The
+                // message names the event and points at the fix so operators
+                // can act on it directly (mirrors Claude Code's guidance).
                 let _ = child.kill().await;
-                Err(eyre::eyre!("hook timed out after {}ms", hook.timeout_ms))
+                Err(eyre::eyre!(
+                    "{} hook timed out after {}ms — raise the hook's timeout_ms to allow more time",
+                    hook.event.as_str(),
+                    hook.timeout_ms
+                ))
             }
         }
     }
@@ -1286,6 +1376,8 @@ mod tests {
         let payload = HookPayload {
             schema_version: HOOK_PAYLOAD_SCHEMA_VERSION,
             event: HookEvent::AfterToolCall,
+            prompt: None,
+            cwd: None,
             tool_name: Some("test".into()),
             arguments: None,
             tool_id: None,
@@ -1607,6 +1699,7 @@ mod tests {
 
     /// Convenience constructor for path-filter tests so the cases that follow
     /// stay focused on the filtering behaviour itself.
+    #[cfg(unix)]
     fn hook_with_path_filter(event: HookEvent, patterns: Vec<&str>) -> HookConfig {
         HookConfig {
             event,
@@ -1845,5 +1938,230 @@ mod tests {
         // Non-object
         let args = serde_json::json!([]);
         assert!(extract_tool_path(&args).is_none());
+    }
+
+    // ----- UserPromptSubmit hook tests -----
+
+    /// Convenience constructor for the UserPromptSubmit tests below.
+    #[cfg(unix)]
+    fn user_prompt_hook(command: Vec<&str>, timeout_ms: u64) -> HookConfig {
+        HookConfig {
+            event: HookEvent::UserPromptSubmit,
+            command: command.into_iter().map(String::from).collect(),
+            timeout_ms,
+            tool_filter: vec![],
+            path_filter: vec![],
+            requires_bin: None,
+        }
+    }
+
+    #[test]
+    fn should_map_user_prompt_submit_event_to_snake_case_string() {
+        assert_eq!(HookEvent::UserPromptSubmit.as_str(), "user_prompt_submit");
+        // serde rename matches as_str()
+        let json = serde_json::to_string(&HookEvent::UserPromptSubmit).unwrap();
+        assert_eq!(json, "\"user_prompt_submit\"");
+        // round-trips from the config-string form
+        let parsed: HookEvent = serde_json::from_str("\"user_prompt_submit\"").unwrap();
+        assert_eq!(parsed, HookEvent::UserPromptSubmit);
+        // as_str() agrees with serde for every variant
+        for ev in [
+            HookEvent::UserPromptSubmit,
+            HookEvent::BeforeToolCall,
+            HookEvent::AfterToolCall,
+            HookEvent::BeforeLlmCall,
+            HookEvent::AfterLlmCall,
+            HookEvent::OnResume,
+            HookEvent::OnTurnEnd,
+            HookEvent::BeforeSpawnVerify,
+            HookEvent::OnSpawnVerify,
+            HookEvent::OnSpawnComplete,
+            HookEvent::OnSpawnFailure,
+        ] {
+            let via_serde = serde_json::to_string(&ev).unwrap();
+            assert_eq!(via_serde, format!("\"{}\"", ev.as_str()));
+        }
+    }
+
+    #[test]
+    fn should_deserialize_user_prompt_submit_hook_config() {
+        let cfg: HookConfig =
+            serde_json::from_str(r#"{"event":"user_prompt_submit","command":["true"]}"#).unwrap();
+        assert_eq!(cfg.event, HookEvent::UserPromptSubmit);
+        assert_eq!(cfg.timeout_ms, 5000);
+    }
+
+    #[test]
+    fn should_build_user_prompt_submit_payload_with_prompt_cwd_and_model() {
+        let ctx = HookContext {
+            session_id: Some("sess-9".into()),
+            profile_id: Some("prof-9".into()),
+        };
+        let payload =
+            HookPayload::user_prompt_submit("hello world", "gpt-4", Some("/tmp/wd"), Some(&ctx));
+        assert_eq!(payload.event, HookEvent::UserPromptSubmit);
+        assert_eq!(payload.prompt.as_deref(), Some("hello world"));
+        assert_eq!(payload.model.as_deref(), Some("gpt-4"));
+        assert_eq!(payload.cwd.as_deref(), Some("/tmp/wd"));
+        assert_eq!(payload.session_id.as_deref(), Some("sess-9"));
+        assert_eq!(payload.schema_version, HOOK_PAYLOAD_SCHEMA_VERSION);
+
+        let json = serde_json::to_string(&payload).unwrap();
+        assert!(json.contains("\"event\":\"user_prompt_submit\""));
+        assert!(json.contains("\"prompt\":\"hello world\""));
+        assert!(json.contains("\"cwd\":\"/tmp/wd\""));
+        assert!(json.contains("\"model\":\"gpt-4\""));
+    }
+
+    #[test]
+    fn should_truncate_long_user_prompt_in_payload() {
+        let long = "z".repeat(MAX_PAYLOAD_FIELD_BYTES * 2);
+        let payload = HookPayload::user_prompt_submit(&long, "m", None, None);
+        assert!(
+            payload
+                .prompt
+                .as_deref()
+                .is_some_and(|p| p.ends_with("... (truncated)"))
+        );
+        // cwd omitted when None
+        let json = serde_json::to_string(&payload).unwrap();
+        assert!(!json.contains("\"cwd\""));
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn should_deny_prompt_when_user_prompt_submit_hook_exits_1() {
+        // A UserPromptSubmit hook is a BEFORE hook: exit 1 denies the prompt.
+        // The hook's stdout is surfaced as the deny reason (same convention as
+        // a denied tool call).
+        let executor = HookExecutor::new(vec![user_prompt_hook(
+            vec!["sh", "-c", "echo 'blocked: policy violation'; exit 1"],
+            5000,
+        )]);
+        let payload = HookPayload::user_prompt_submit("do the risky thing", "m", None, None);
+        let result = executor.run(HookEvent::UserPromptSubmit, &payload).await;
+        match result {
+            HookResult::Deny(reason) => assert_eq!(reason, "blocked: policy violation"),
+            other => panic!("expected Deny, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn should_inject_context_when_user_prompt_submit_hook_exits_0_with_stdout() {
+        let executor = HookExecutor::new(vec![user_prompt_hook(
+            vec!["sh", "-c", "echo 'git branch: main, 3 files staged'"],
+            5000,
+        )]);
+        let payload = HookPayload::user_prompt_submit("what changed?", "m", None, None);
+        let result = executor.run(HookEvent::UserPromptSubmit, &payload).await;
+        match result {
+            HookResult::Context(contexts) => {
+                assert_eq!(
+                    contexts,
+                    vec!["git branch: main, 3 files staged".to_string()]
+                );
+            }
+            other => panic!("expected Context, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn should_allow_when_user_prompt_submit_hook_exits_0_without_stdout() {
+        let executor = HookExecutor::new(vec![user_prompt_hook(vec!["true"], 5000)]);
+        let payload = HookPayload::user_prompt_submit("hi", "m", None, None);
+        let result = executor.run(HookEvent::UserPromptSubmit, &payload).await;
+        assert_eq!(result, HookResult::Allow);
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn should_collect_context_from_multiple_hooks_in_config_order() {
+        let executor = HookExecutor::new(vec![
+            user_prompt_hook(vec!["sh", "-c", "echo first"], 5000),
+            user_prompt_hook(vec!["sh", "-c", "echo second"], 5000),
+        ]);
+        let payload = HookPayload::user_prompt_submit("hi", "m", None, None);
+        let result = executor.run(HookEvent::UserPromptSubmit, &payload).await;
+        match result {
+            HookResult::Context(contexts) => {
+                assert_eq!(contexts, vec!["first".to_string(), "second".to_string()]);
+            }
+            other => panic!("expected Context, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn should_deny_when_any_user_prompt_submit_hook_exits_1_even_after_context() {
+        // First hook injects context, second denies. Deny short-circuits.
+        let executor = HookExecutor::new(vec![
+            user_prompt_hook(vec!["sh", "-c", "echo context-note"], 5000),
+            user_prompt_hook(vec!["sh", "-c", "echo 'denied by second'; exit 1"], 5000),
+        ]);
+        let payload = HookPayload::user_prompt_submit("hi", "m", None, None);
+        let result = executor.run(HookEvent::UserPromptSubmit, &payload).await;
+        match result {
+            HookResult::Deny(reason) => assert_eq!(reason, "denied by second"),
+            other => panic!("expected Deny, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn should_report_actionable_message_when_user_prompt_submit_hook_times_out() {
+        // Timeout is fail-open (returns Error, not Deny) but the surfaced
+        // message must be actionable and name the event.
+        let executor = HookExecutor::new(vec![user_prompt_hook(vec!["sh", "-c", "sleep 5"], 50)]);
+        let payload = HookPayload::user_prompt_submit("hi", "m", None, None);
+        let result = executor.run(HookEvent::UserPromptSubmit, &payload).await;
+        match result {
+            HookResult::Error(msg) => {
+                assert!(
+                    msg.contains("user_prompt_submit hook timed out after 50ms"),
+                    "message should name the event and timeout: {msg}"
+                );
+                assert!(
+                    msg.contains("raise the hook's timeout_ms"),
+                    "message should be actionable: {msg}"
+                );
+            }
+            other => panic!("expected Error(timeout), got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn should_apply_circuit_breaker_to_user_prompt_submit_hook() {
+        // Generic error exit (code 3) counts as a failure; after the threshold
+        // the hook is disabled and the executor returns Allow (fail-open).
+        let executor = HookExecutor::with_threshold(
+            vec![user_prompt_hook(vec!["sh", "-c", "exit 3"], 1000)],
+            3,
+        );
+        let payload = HookPayload::user_prompt_submit("hi", "m", None, None);
+        for _ in 0..3 {
+            executor.run(HookEvent::UserPromptSubmit, &payload).await;
+        }
+        let result = executor.run(HookEvent::UserPromptSubmit, &payload).await;
+        assert_eq!(result, HookResult::Allow);
+    }
+
+    #[tokio::test]
+    async fn should_be_noop_when_no_user_prompt_submit_hook_configured() {
+        // Backwards-compat: an executor with only other events never fires for
+        // UserPromptSubmit.
+        let executor = HookExecutor::new(vec![HookConfig {
+            event: HookEvent::AfterToolCall,
+            command: vec!["false".into()],
+            timeout_ms: 5000,
+            tool_filter: vec![],
+            path_filter: vec![],
+            requires_bin: None,
+        }]);
+        let payload = HookPayload::user_prompt_submit("hi", "m", None, None);
+        let result = executor.run(HookEvent::UserPromptSubmit, &payload).await;
+        assert_eq!(result, HookResult::Allow);
     }
 }

@@ -221,6 +221,7 @@ fn resolve_hook(def: &SkillHookDef, skill_dir: &Path) -> Option<HookConfig> {
     use crate::hooks::HookEvent;
 
     let event = match def.event.as_str() {
+        "user_prompt_submit" => HookEvent::UserPromptSubmit,
         "before_tool_call" => HookEvent::BeforeToolCall,
         "after_tool_call" => HookEvent::AfterToolCall,
         "before_llm_call" => HookEvent::BeforeLlmCall,

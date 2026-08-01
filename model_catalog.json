@@ -596,6 +596,19 @@
       "max_output": 98304
     },
     {
+      "provider": "moonshot/kimi-k3",
+      "type": "strong",
+      "stability": 1.0,
+      "tool_avg_ms": 0,
+      "p95_ms": 0,
+      "score": 0.0,
+      "ds_output": 0,
+      "cost_in": 3.0,
+      "cost_out": 15.0,
+      "context_window": 1048576,
+      "max_output": 131072
+    },
+    {
       "provider": "nvidia/deepseek-ai/deepseek-v3.2",
       "type": "fast",
       "cost_in": 0.0,
@@ -1972,6 +1985,69 @@
       "cost_out": 2.0,
       "context_window": 200000,
       "max_output": 131072
+    },
+    {
+      "provider": "moonshot-coding/k3",
+      "type": "strong",
+      "stability": 1.0,
+      "tool_avg_ms": 0,
+      "p95_ms": 0,
+      "score": 0.0,
+      "ds_output": 0,
+      "cost_in": 0.0,
+      "cost_out": 0.0,
+      "context_window": 1048576,
+      "max_output": 131072,
+      "endpoints": [
+        {
+          "id": "moonshot-coding",
+          "label": "Kimi Coding Plan",
+          "base_url": "https://api.kimi.com/coding/v1",
+          "api_key_env": "KIMI_API_KEY"
+        }
+      ]
+    },
+    {
+      "provider": "moonshot-coding/kimi-for-coding-highspeed",
+      "type": "fast",
+      "stability": 1.0,
+      "tool_avg_ms": 0,
+      "p95_ms": 0,
+      "score": 0.0,
+      "ds_output": 0,
+      "cost_in": 0.0,
+      "cost_out": 0.0,
+      "context_window": 262144,
+      "max_output": 131072,
+      "endpoints": [
+        {
+          "id": "moonshot-coding",
+          "label": "Kimi Coding Plan",
+          "base_url": "https://api.kimi.com/coding/v1",
+          "api_key_env": "KIMI_API_KEY"
+        }
+      ]
+    },
+    {
+      "provider": "zai-coding/glm-5.2",
+      "type": "strong",
+      "stability": 1.0,
+      "tool_avg_ms": 0,
+      "p95_ms": 0,
+      "score": 0.0,
+      "ds_output": 0,
+      "cost_in": 0.0,
+      "cost_out": 0.0,
+      "context_window": 200000,
+      "max_output": 131072,
+      "endpoints": [
+        {
+          "id": "zai-coding",
+          "label": "GLM Coding Plan",
+          "base_url": "https://api.z.ai/api/anthropic",
+          "api_key_env": "ZAI_API_KEY"
+        }
+      ]
     }
   ]
 }

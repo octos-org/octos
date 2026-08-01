@@ -767,6 +767,7 @@ mod tests {
         Arc::new(ProfileRuntime {
             profile_id: "_main".to_string(),
             data_dir,
+            config: crate::config::Config::default(),
             llm: Arc::new(StubLlm),
             adaptive_router: None,
             runtime_qos_catalog: None,
@@ -778,6 +779,8 @@ mod tests {
             tool_policy: None,
             default_sandbox: sandbox,
             max_iterations: None,
+            format_after_edit: false,
+            snapshots: None,
             tool_specs: Arc::new(base_tools),
             plugin_tool_names: Vec::new(),
             skill_actions: Vec::new(),

@@ -87,6 +87,6 @@ pub use stream_accumulator::StreamAccumulator;
 pub use swappable::SwappableProvider;
 pub use throttle::SemaphoreThrottledProvider;
 pub use types::{
-    ChatResponse, ChatStream, ProviderMetadata, StopReason, StreamEvent, TokenUsage, ToolSpec,
-    strip_think_tags,
+    ChatResponse, ChatStream, ProviderMetadata, StopReason, StreamEvent, ThinkTagStreamSplitter,
+    TokenUsage, ToolSpec, strip_think_tags,
 };

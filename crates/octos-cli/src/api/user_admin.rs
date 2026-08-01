@@ -522,7 +522,7 @@ mod tests {
     async fn delete_user_cascades_sub_account_profiles_and_data_dirs() {
         let dir = tempfile::tempdir().unwrap();
         let user_store = Arc::new(UserStore::open(dir.path()).unwrap());
-        let profile_store = Arc::new(ProfileStore::open(dir.path()).unwrap());
+        let profile_store = Arc::new(ProfileStore::open_unified(dir.path()).unwrap());
         let parent = test_profile("alice", None);
         let sub_account = test_profile("alice--bot", Some("alice"));
         let parent_data_dir = profile_store.resolve_data_dir(&parent);
@@ -570,7 +570,7 @@ mod tests {
     async fn delete_user_missing_user_does_not_delete_matching_profile() {
         let dir = tempfile::tempdir().unwrap();
         let user_store = Arc::new(UserStore::open(dir.path()).unwrap());
-        let profile_store = Arc::new(ProfileStore::open(dir.path()).unwrap());
+        let profile_store = Arc::new(ProfileStore::open_unified(dir.path()).unwrap());
         let profile = test_profile("alice", None);
         let data_dir = profile_store.resolve_data_dir(&profile);
         profile_store.save(&profile).unwrap();

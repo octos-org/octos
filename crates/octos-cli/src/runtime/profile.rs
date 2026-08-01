@@ -48,6 +48,7 @@ pub struct ProfilePluginReloadConfig {
     context_filter: Vec<String>,
     host_hooks: Vec<octos_agent::HookConfig>,
     gateway_system_prompt: Option<String>,
+    skill_filter: Option<octos_agent::SkillFilter>,
 }
 
 /// Shared owner for profile services whose shutdown cannot be tied to one
@@ -62,6 +63,64 @@ impl Drop for ProfileRuntimeLifecycle {
             cron.shutdown_signal();
         }
     }
+}
+
+/// Build an ISOLATED per-node pipeline provider router from the profile's
+/// `sub_providers` (e.g. the `deep_research` pipeline's `cheap`/`strong`
+/// nodes, resolved via `RunPipelineTool`'s provider router).
+///
+/// Registers ONLY the declared sub-providers — never the coding primary or its
+/// fallbacks — so a research-lane failover (`FallbackProvider` +
+/// `compatible_fallbacks`) trips its OWN circuit breakers and can never disturb
+/// the coding conversation's provider or its KV/prompt cache. Returns `None`
+/// when no sub-providers are configured, in which case pipeline nodes fall back
+/// to the shared coding provider (`self.llm` in `resolve_provider`) exactly as
+/// before. Mirrors the gateway's sub-provider registration
+/// (`gateway_runtime.rs`) but deliberately omits the primary/fallback
+/// auto-registration to keep the research lane isolated.
+fn build_sub_provider_router(config: &Config) -> Option<Arc<octos_llm::ProviderRouter>> {
+    if config.sub_providers.is_empty() {
+        return None;
+    }
+    let router = Arc::new(octos_llm::ProviderRouter::new());
+    let mut registered = 0usize;
+    for sp in &config.sub_providers {
+        // Per-sub-provider key override, matching the gateway path: an explicit
+        // `api_key_env` selects a distinct credential; otherwise inherit the
+        // profile's default for the provider.
+        let sp_config = if sp.api_key_env.is_some() {
+            let mut c = config.clone();
+            c.api_key_env = sp.api_key_env.clone();
+            c
+        } else {
+            config.clone()
+        };
+        match chat::create_provider_with_api_type(
+            &sp.provider,
+            &sp_config,
+            sp.model.clone(),
+            sp.base_url.clone(),
+            sp.api_type.as_deref(),
+        ) {
+            Ok(p) => {
+                router.register_with_full_meta(
+                    &sp.key,
+                    Arc::new(octos_llm::RetryProvider::new(p)),
+                    sp.description.clone(),
+                    sp.default_context_window,
+                    sp.max_output_tokens,
+                );
+                registered += 1;
+            }
+            Err(e) => warn!(
+                key = %sp.key,
+                provider = %sp.provider,
+                error = %e,
+                "skipping isolated pipeline sub-provider (research lane)"
+            ),
+        }
+    }
+    if registered > 0 { Some(router) } else { None }
 }
 
 /// All long-lived state that belongs to a single profile within the
@@ -145,6 +204,16 @@ pub struct ProfileRuntime {
     /// session-scope bootstrap code don't have to re-derive it.
     pub data_dir: PathBuf,
 
+    /// The profile's resolved [`crate::config::Config`] (as produced by
+    /// `config_from_profile` at bootstrap, with host memory/plugins merged).
+    /// Most runtime state is pre-extracted into the typed fields below; this
+    /// is retained for the few paths that must resolve a lane provider
+    /// LAZILY from `config.sub_providers` (with the profile's credential /
+    /// timeout config), e.g. a peer session that runs its turns on a named
+    /// `sub_provider` model lane (`peers/<slug>/model`). Kept whole rather
+    /// than re-deriving a `Config` off disk on the hot path.
+    pub config: crate::config::Config,
+
     /// The fully-wrapped LLM provider chain for this profile.
     /// Includes retry, provider failover, and (if `adaptive_router`
     /// is `Some`) adaptive routing. Every session for this profile
@@ -212,6 +281,17 @@ pub struct ProfileRuntime {
     /// honors the configured value instead of a hardcoded cap (which silently
     /// starved spawned sub-agents doing multi-step work).
     pub max_iterations: Option<u32>,
+
+    /// Post-edit formatting opt-in (`config.format_after_edit`, issue
+    /// #1774) that per-session agents inherit. When true, successful
+    /// `edit_file` / `write_file` / `diff_edit` calls run the file's
+    /// language formatter and echo the formatted content in the tool
+    /// result. Default: false.
+    pub format_after_edit: bool,
+
+    /// #1768: opt-in workspace-snapshot config per-session agents use to
+    /// build their `SnapshotManager` (None/disabled = no snapshots).
+    pub snapshots: Option<octos_agent::SnapshotConfig>,
 
     /// The base [`ToolRegistry`] template — builtins + plugins +
     /// MCP agents + the LRU pin set — but **NOT** workspace-bound.
@@ -437,7 +517,7 @@ async fn build_profile_plugin_layer(
     let mut tools = reload.base_tools.snapshot_excluding(&[]);
     let mut plugin_result = PluginLoadResult::default();
     if !reload.plugin_dirs.is_empty() {
-        let load_result = PluginLoader::load_into_with_options(
+        let load_result = PluginLoader::load_into_with_options_and_filter(
             &mut tools,
             &reload.plugin_dirs,
             &reload.plugin_env,
@@ -447,6 +527,7 @@ async fn build_profile_plugin_layer(
                 require_signed: reload.require_signed,
                 verified_cache_dir: Some(reload.verified_cache_dir.clone()),
             },
+            reload.skill_filter.as_ref(),
         );
         match load_result {
             Ok(result) if fail_on_loader_error && !result.plugin_errors.is_empty() => {
@@ -534,7 +615,8 @@ impl ProfileRuntime {
             tools.apply_policy(policy);
         }
 
-        let skills_loader = build_account_skills_loader(&self.data_dir);
+        let skills_loader = build_account_skills_loader(&self.data_dir)
+            .with_skill_filter(reload.skill_filter.clone());
         let mut prompt_parts = build_system_prompt(
             reload.gateway_system_prompt.as_deref(),
             &self.data_dir,
@@ -561,6 +643,7 @@ impl ProfileRuntime {
         Ok(Arc::new(Self {
             profile_id: self.profile_id.clone(),
             data_dir: self.data_dir.clone(),
+            config: self.config.clone(),
             llm: self.llm.clone(),
             adaptive_router: self.adaptive_router.clone(),
             runtime_qos_catalog: self.runtime_qos_catalog.clone(),
@@ -574,6 +657,8 @@ impl ProfileRuntime {
             tool_policy: self.tool_policy.clone(),
             default_sandbox: self.default_sandbox.clone(),
             max_iterations: self.max_iterations,
+            format_after_edit: self.format_after_edit,
+            snapshots: self.snapshots.clone(),
             tool_specs: Arc::new(tools),
             plugin_tool_names: plugin_result.tool_names.clone(),
             skill_actions: plugin_result.loaded_actions.clone(),
@@ -722,9 +807,25 @@ impl ProfileRuntime {
         // EpisodeStore; gateway falls back to a degraded handle when
         // serve already owns the redb lock so it doesn't crashloop on
         // every startup. Tracked by issue #899.
+        //
+        // The embedder is resolved FIRST because the episodic HNSW index is
+        // built at one fixed width and silently drops any vector of a
+        // different length. Sizing it from the configured provider is what
+        // makes a non-1536-d embedder (e.g. in-process EmbeddingGemma at 768)
+        // actually reach the vector lane instead of degrading to BM25-only.
+        let embedder =
+            chat::create_embedder(&config).map(|e| e as Arc<dyn octos_llm::EmbeddingProvider>);
+        let index_dimension = embedder
+            .as_ref()
+            .map_or(octos_memory::EPISODIC_INDEX_DIMENSION, |e| e.dimension());
+
         let memory_open_result = match role {
-            BootstrapRole::Serve => EpisodeStore::open(data_dir).await,
-            BootstrapRole::Gateway => EpisodeStore::open_or_degraded(data_dir).await,
+            BootstrapRole::Serve => {
+                EpisodeStore::open_with_dimension(data_dir, index_dimension).await
+            }
+            BootstrapRole::Gateway => {
+                EpisodeStore::open_or_degraded_with_dimension(data_dir, index_dimension).await
+            }
         };
         let memory = Arc::new(memory_open_result.wrap_err_with(|| {
             format!("failed to open episode store for profile '{}'", profile.id)
@@ -850,6 +951,30 @@ impl ProfileRuntime {
         if !plugin_dirs.contains(&profile_skills_dir) {
             plugin_dirs.push(profile_skills_dir);
         }
+        // --- Skill layering v1 ---
+        // Resolve the profile's inherited skill-selection layer (parent +
+        // global defaults already merged by `resolve_runtime_profile`) into a
+        // crate-agnostic filter handed to BOTH the plugin loader (tool specs)
+        // and the SkillsLoader (prompt / content injection) below. `None` ⇒ no
+        // skills layer ⇒ every discovered skill loads, exactly as before.
+        let skill_filter = profile.config.skills.as_ref().map(|s| s.to_agent_filter());
+        if profile.config.skills.is_some() {
+            let discovered_skill_ids: Vec<String> = build_account_skills_loader(data_dir)
+                .list_skills()
+                .await
+                .map(|skills| skills.into_iter().map(|s| s.name).collect())
+                .unwrap_or_default();
+            let catalog =
+                crate::skills_scope::resolve_profile_skills(profile, &discovered_skill_ids);
+            if catalog.has_disabled() {
+                info!(
+                    profile_id = %profile.id,
+                    mode = ?catalog.mode,
+                    disabled = ?catalog.disabled,
+                    "skill layering: installed skills disabled by profile config"
+                );
+            }
+        }
         let plugin_reload = Arc::new(ProfilePluginReloadConfig {
             base_tools: plugin_base_tools,
             plugin_dirs: plugin_dirs.clone(),
@@ -862,6 +987,7 @@ impl ProfileRuntime {
             context_filter: config.context_filter.clone(),
             host_hooks: config.hooks.clone(),
             gateway_system_prompt: profile.config.gateway.system_prompt.clone(),
+            skill_filter: skill_filter.clone(),
         });
         let (rebuilt_tools, plugin_result) =
             build_profile_plugin_layer(&profile.id, &plugin_reload, false).await?;
@@ -921,12 +1047,11 @@ impl ProfileRuntime {
         // when adaptive is configured, so per-node calls still
         // fan out through the adaptive layer.
         //
-        // Resolve the profile's embedding provider ONCE. The same handle
-        // feeds the pipeline factory below AND rides on the returned
-        // ProfileRuntime so the serve spawn/delegate wiring hands every
-        // worker the exact same embed-on-save + hybrid-recall behaviour.
-        let embedder =
-            chat::create_embedder(&config).map(|e| e as Arc<dyn octos_llm::EmbeddingProvider>);
+        // The profile's embedding provider was resolved ONCE back in Step 4
+        // (the episodic index has to be sized from it). The same handle feeds
+        // the pipeline factory below AND rides on the returned ProfileRuntime
+        // so the serve spawn/delegate wiring hands every worker the exact same
+        // embed-on-save + hybrid-recall behaviour.
 
         // NEW-07: hoist the per-instance `RunPipelineTool` builder
         // into a [`crate::session_actor::PipelineToolFactory`] impl
@@ -956,6 +1081,12 @@ impl ProfileRuntime {
                 /// agents inherit the contamination-safe hybrid scored
                 /// + filtered memory recall path.
                 embedder: Option<Arc<dyn octos_llm::EmbeddingProvider>>,
+                /// Isolated per-node model router built from the profile's
+                /// `sub_providers` (e.g. `deep_research`'s `cheap`/`strong`
+                /// nodes). Registers ONLY sub-providers, so per-node failover
+                /// trips its own breakers and never disturbs the coding
+                /// provider/cache. `None` ⇒ nodes use the shared coding `llm`.
+                provider_router: Option<Arc<octos_llm::ProviderRouter>>,
             }
 
             impl crate::session_actor::PipelineToolFactory for AppUiPipelineToolFactory {
@@ -980,6 +1111,9 @@ impl ProfileRuntime {
                     if let Some(ref embedder) = self.embedder {
                         pt = pt.with_embedder(embedder.clone());
                     }
+                    if let Some(ref router) = self.provider_router {
+                        pt = pt.with_provider_router(router.clone());
+                    }
                     Arc::new(pt)
                 }
             }
@@ -994,6 +1128,7 @@ impl ProfileRuntime {
                     octos_home: effective_octos_home.clone(),
                     plugin_require_signed: config.plugins.require_signed,
                     embedder: embedder.clone(),
+                    provider_router: build_sub_provider_router(&config),
                 });
 
             // Register the parent `run_pipeline` via the same factory so the
@@ -1044,6 +1179,30 @@ impl ProfileRuntime {
         let runtime_lifecycle = Some(Arc::new(ProfileRuntimeLifecycle {
             cron_service: Some(cron_service.clone()),
         }));
+        // #1696 — structured goal tools: goal_get (objective + remaining
+        // budget) and goal_update (model-owned complete|blocked ONLY,
+        // executor-enforced). Session resolved per-call from
+        // ToolContext::parent_session_key; profile scope pinned here.
+        // Goals live in the AppUI orchestrator, so the tools exist only
+        // with the `api` feature (like the orchestrator itself).
+        #[cfg(feature = "api")]
+        {
+            tools.register(crate::goal_tool::GoalGetTool::new(profile.id.clone()));
+            tools.register(crate::goal_tool::GoalCreateTool::new(profile.id.clone()));
+            tools.register(crate::goal_tool::GoalUpdateTool::new(profile.id.clone()));
+            // #1857 PR 5a — the goal keeper's fleet controls: decompose the
+            // objective onto a durable fleet (`goal_plan`) and launch its ready
+            // tasks onto the live worker pool (`goal_dispatch`). `goal_get`
+            // (above) folds in the fleet plan view + self-detects completion.
+            tools.register(crate::goal_tool::GoalPlanTool::new(profile.id.clone()));
+            tools.register(crate::goal_tool::GoalDispatchTool::new(profile.id.clone()));
+            // PR B — the keeper's escalation controls: approve a worker's
+            // mid-task grant-widen request (`goal_grant`, resumes the task) or
+            // refuse it (`goal_deny`, fails the task). A Blocked task surfaced by
+            // goal_get needs exactly one of these.
+            tools.register(crate::goal_tool::GoalGrantTool::new(profile.id.clone()));
+            tools.register(crate::goal_tool::GoalDenyTool::new(profile.id.clone()));
+        }
 
         // Step 17: re-apply tool policy AFTER plugin / memory-bank
         // registration so deny entries can target plugin-declared
@@ -1082,7 +1241,7 @@ impl ProfileRuntime {
         // can hand to the helper. Operators who want per-profile
         // bootstrap files drop them in `<data_dir>/`, which matches the
         // pre-M11-F serve-mode behavior.
-        let skills_loader = build_account_skills_loader(data_dir);
+        let skills_loader = build_account_skills_loader(data_dir).with_skill_filter(skill_filter);
         let max_inject_tokens =
             crate::config::MemoryConfig::effective_max_inject_tokens(config.memory.as_ref());
         let memory_refresh_enabled =
@@ -1180,6 +1339,10 @@ impl ProfileRuntime {
         Ok(Arc::new(Self {
             profile_id: profile.id.clone(),
             data_dir: data_dir.to_path_buf(),
+            // Retained whole for lazy per-lane provider resolution (e.g. a
+            // peer running on a named `sub_provider` model lane); the typed
+            // fields below carry the pre-extracted hot-path state.
+            config: config.clone(),
             llm,
             adaptive_router,
             runtime_qos_catalog,
@@ -1191,6 +1354,8 @@ impl ProfileRuntime {
             tool_policy: config.tool_policy.clone(),
             default_sandbox,
             max_iterations: config.max_iterations,
+            format_after_edit: config.format_after_edit,
+            snapshots: config.snapshots.clone(),
             tool_specs: Arc::new(tools),
             plugin_tool_names: plugin_result.tool_names.clone(),
             skill_actions: plugin_result.loaded_actions.clone(),
@@ -1265,9 +1430,11 @@ mod tests {
     use crate::profiles::{
         GatewaySettings, LlmModelSelectionConfig, LlmProfileConfig, LlmRouteConfig, ProfileConfig,
     };
+    #[cfg(unix)]
     use crate::runtime::SessionRuntime;
     use chrono::Utc;
     use octos_agent::SandboxConfig;
+    #[cfg(unix)]
     use octos_core::SessionKey;
     use std::collections::HashMap;
 

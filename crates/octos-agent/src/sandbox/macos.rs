@@ -1,6 +1,6 @@
 //! macOS sandbox using sandbox-exec.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use tokio::process::Command;
 
@@ -104,9 +104,29 @@ pub struct MacosSandbox {
     /// shell redirections and git still work. Default constructions use
     /// `true` to preserve the historical writable-workspace behaviour.
     pub(crate) workspace_write: bool,
+    /// TARGETED write to a repo's `.git` common dir (from a fleet worker's
+    /// `FsGrant::Host`). `Some(<repo>/.git)` emits `(allow file-write* (subpath
+    /// "<repo>/.git"))` ALONGSIDE the cwd grant — NOT a global `(allow
+    /// file-write*)` (which would let a full-FS worker rewrite ANY host file,
+    /// e.g. a LaunchAgent, ABOVE its grant) — so a Host-granted worktree worker's
+    /// `git commit` can reach `<repo>/.git` (outside its cwd). Viable ONLY under
+    /// an unrestricted-read profile (empty `read_allow_paths` → global
+    /// `(allow file-read*)`), since git must also READ `<repo>/.git`; the pool
+    /// gate (`supports_repo_git_write`) enforces that. Default `None` = today's
+    /// cwd-only writable behaviour. The operator's explicit grant, NOT a fence.
+    pub(crate) repo_git_write: Option<PathBuf>,
 }
 
 impl Sandbox for MacosSandbox {
+    fn supports_repo_git_write(&self) -> bool {
+        // A `(subpath "<repo>/.git")` rule grants the `.git` WRITE, but
+        // `git commit` must also READ `<repo>/.git`. That read only holds under an
+        // UNRESTRICTED-read profile (empty `read_allow_paths` → global
+        // `(allow file-read*)`); a restricted-read profile would grant the write
+        // but deny the read, so the worktree flow must fall back to scratch.
+        self.read_allow_paths.is_empty()
+    }
+
     fn wrap_command(&self, shell_command: &str, cwd: &Path) -> Command {
         let cwd_str = cwd.to_string_lossy();
 
@@ -190,13 +210,39 @@ impl Sandbox for MacosSandbox {
             rules.join("\n")
         };
 
-        // Workspace write rule. When `workspace_write` is false (read-only
-        // permission profile), OMIT the cwd `file-write*` grant so shell
-        // commands cannot mutate the workspace — `(deny default)` then denies
-        // the write. `/dev/null` stays writable regardless so shell
-        // redirections and git internals still function.
-        let workspace_write_rule = if self.workspace_write {
-            format!("(allow file-write* (subpath \"{cwd}\"))\n", cwd = real_cwd)
+        // Workspace write rule. Three cases:
+        // - `repo_git_write` (a fleet worktree worker granted `FsGrant::Host`):
+        //   grant `file-write*` to the cwd checkout AND a `(subpath "<repo>/.git")`
+        //   so `git commit` can reach objects/refs/worktree-admin OUTSIDE the cwd.
+        //   This is TARGETED, NOT a global `(allow file-write*)` — a full-FS
+        //   worker must not be able to rewrite arbitrary host files (e.g. plant a
+        //   LaunchAgent) ABOVE its grant. Only reached under unrestricted reads
+        //   (see `supports_repo_git_write`), which the pool gate enforces. The
+        //   `.git` path is validated for SBPL metacharacters; on failure it falls
+        //   back to cwd-only write (fail closed — the commit fails, caught by the
+        //   worker's branch-advance check, rather than injecting a rule).
+        // - `workspace_write` (default): grant `file-write*` to the cwd subpath.
+        // - neither (read-only profile): OMIT the grant so `(deny default)`
+        //   denies the write. `/dev/null` stays writable regardless so shell
+        //   redirections and git internals still function.
+        let cwd_write_rule = format!("(allow file-write* (subpath \"{cwd}\"))\n", cwd = real_cwd);
+        let workspace_write_rule = if let Some(git_dir) = &self.repo_git_write {
+            let real_git = std::fs::canonicalize(git_dir)
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_else(|_| git_dir.to_string_lossy().to_string());
+            if real_git
+                .bytes()
+                .any(|b| b < 0x20 || b == 0x7F || b == b'(' || b == b')' || b == b'\\' || b == b'"')
+            {
+                tracing::error!(
+                    "repo_git_write path contains SBPL metacharacters, granting cwd-only write"
+                );
+                cwd_write_rule
+            } else {
+                format!("{cwd_write_rule}(allow file-write* (subpath \"{real_git}\"))\n")
+            }
+        } else if self.workspace_write {
+            cwd_write_rule
         } else {
             String::new()
         };
@@ -314,6 +360,7 @@ mod tests {
             allow_network: true,
             read_allow_paths: Vec::new(),
             workspace_write: true,
+            repo_git_write: None,
         };
         let cmd = sb.wrap_command("echo hi", Path::new("/tmp/test"));
         let prog = cmd.as_std().get_program().to_string_lossy().to_string();
@@ -344,6 +391,95 @@ mod tests {
         );
     }
 
+    #[test]
+    fn repo_git_write_emits_git_subpath_not_global() {
+        // HIGH (controller-hijack, fix 2): a fleet worktree worker granted
+        // `FsGrant::Host` gets `repo_git_write = Some(<repo>/.git)`. The SBPL
+        // profile must grant `file-write*` to the cwd checkout AND a `(subpath
+        // "<repo>/.git")` — but NEVER a GLOBAL `(allow file-write*)` (which would
+        // let a full-FS worker rewrite arbitrary host files, e.g. a LaunchAgent,
+        // above its grant). Only reached under unrestricted reads, which
+        // `supports_repo_git_write` gates.
+        let sb = MacosSandbox {
+            allow_network: false,
+            read_allow_paths: Vec::new(),
+            workspace_write: true,
+            repo_git_write: Some(PathBuf::from("/tmp/controller-repo/.git")),
+        };
+        let cmd = sb.wrap_command("git commit -am wip", Path::new("/tmp/ws"));
+        let args: Vec<_> = cmd
+            .as_std()
+            .get_args()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect();
+        let profile = args
+            .iter()
+            .find(|a| a.contains("deny default"))
+            .expect("should have SBPL profile");
+        // The `.git` common dir is granted as a SUBPATH (a non-existent test path
+        // is not canonicalized, so it appears verbatim)...
+        assert!(
+            profile.contains("(allow file-write* (subpath \"/tmp/controller-repo/.git\"))"),
+            "repo_git_write must grant a `.git` subpath write, profile: {profile}",
+        );
+        // ...ALONGSIDE the cwd checkout: exactly TWO `file-write*` subpath rules
+        // (cwd + `.git`), asserted by count so the cwd's canonicalized form
+        // (`/tmp` → `/private/tmp` on macOS) does not make this platform-sensitive.
+        let subpath_writes = profile.matches("(allow file-write* (subpath \"").count();
+        assert_eq!(
+            subpath_writes, 2,
+            "expected exactly cwd + .git subpath write rules, profile: {profile}",
+        );
+        // ...but NEVER a global `(allow file-write*)` (close-paren right after `*`).
+        assert!(
+            !profile.contains("(allow file-write*)"),
+            "repo_git_write must NOT emit a GLOBAL file-write* grant, profile: {profile}",
+        );
+        assert!(
+            sb.supports_repo_git_write(),
+            "macOS with unrestricted reads supports repo .git write",
+        );
+
+        // Default (no repo_git_write): only the cwd subpath is writable, no global.
+        let plain = MacosSandbox {
+            allow_network: false,
+            read_allow_paths: Vec::new(),
+            workspace_write: true,
+            repo_git_write: None,
+        };
+        let cmd = plain.wrap_command("echo hi", Path::new("/tmp/ws"));
+        let args: Vec<_> = cmd
+            .as_std()
+            .get_args()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect();
+        let profile = args
+            .iter()
+            .find(|a| a.contains("deny default"))
+            .expect("should have SBPL profile");
+        assert!(
+            !profile.contains("(allow file-write*)"),
+            "default profile must NOT emit a global file-write* grant, profile: {profile}",
+        );
+    }
+
+    #[test]
+    fn restricted_reads_do_not_support_repo_git_write() {
+        // A restricted-read profile grants the `.git` WRITE but denies the
+        // `.git` READ `git commit` needs, so it must NOT be reported as
+        // supporting the worktree flow (the pool gate falls back to scratch).
+        let sb = MacosSandbox {
+            allow_network: false,
+            read_allow_paths: vec!["/opt/custom".to_string()],
+            workspace_write: true,
+            repo_git_write: None,
+        };
+        assert!(
+            !sb.supports_repo_git_write(),
+            "a restricted-read macOS profile must not support repo .git write",
+        );
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn test_macos_sandbox_rejects_control_chars() {
@@ -351,6 +487,7 @@ mod tests {
             allow_network: false,
             read_allow_paths: Vec::new(),
             workspace_write: true,
+            repo_git_write: None,
         };
         let cmd = sb.wrap_command("ls", Path::new("/tmp/\x01bad"));
         let prog = cmd.as_std().get_program().to_string_lossy().to_string();
@@ -372,6 +509,7 @@ mod tests {
             allow_network: false,
             read_allow_paths: Vec::new(),
             workspace_write: true,
+            repo_git_write: None,
         };
         // Parentheses, backslash, and quote should all be rejected
         for path in &[
@@ -401,6 +539,7 @@ mod tests {
             allow_network: false,
             read_allow_paths: Vec::new(),
             workspace_write: true,
+            repo_git_write: None,
         };
         let cmd = sb.wrap_command("echo hi", Path::new("/tmp/test"));
         let args: Vec<_> = cmd
@@ -421,6 +560,7 @@ mod tests {
             allow_network: false,
             read_allow_paths: Vec::new(),
             workspace_write: true,
+            repo_git_write: None,
         };
         let cmd = sb.wrap_command("echo ok", Path::new("/Users/test/project"));
         let prog = cmd.as_std().get_program().to_string_lossy().to_string();
@@ -434,6 +574,7 @@ mod tests {
             allow_network: false,
             read_allow_paths: Vec::new(),
             workspace_write: true,
+            repo_git_write: None,
         };
         let cmd = sb.wrap_command("ls", Path::new("/tmp/evil\x7Fpath"));
         let prog = cmd.as_std().get_program().to_string_lossy().to_string();
@@ -449,6 +590,7 @@ mod tests {
             allow_network: false,
             read_allow_paths: Vec::new(),
             workspace_write: true,
+            repo_git_write: None,
         };
         let cmd = sb.wrap_command("echo hi", Path::new("/tmp/test"));
         let args: Vec<_> = cmd
@@ -477,6 +619,7 @@ mod tests {
             allow_network: false,
             read_allow_paths: vec!["/custom/path".to_string()],
             workspace_write: true,
+            repo_git_write: None,
         };
         let cmd = sb.wrap_command("echo hi", cwd);
         let args: Vec<_> = cmd
@@ -504,6 +647,14 @@ mod tests {
             profile.contains(r#"(allow file-read* (subpath "/custom/path"))"#),
             "should allow reading custom path"
         );
+        // `/private/etc` must reach the restricted profile by its CANONICAL path
+        // (macOS `/etc` symlink) so system curl/LibreSSL can read
+        // `/private/etc/ssl/openssl.cnf` + `cert.pem` under the network-on
+        // default — otherwise TLS clients fast-fail "Operation not permitted".
+        assert!(
+            profile.contains(r#"(allow file-read* (subpath "/private/etc"))"#),
+            "should allow reading /private/etc (canonical of /etc) for TLS config, profile:\n{profile}"
+        );
     }
 
     #[cfg(target_os = "macos")]
@@ -517,6 +668,7 @@ mod tests {
                 "/another/safe".to_string(),
             ],
             workspace_write: true,
+            repo_git_write: None,
         };
         let cmd = sb.wrap_command("echo hi", Path::new("/tmp/test"));
         let args: Vec<_> = cmd
@@ -553,6 +705,7 @@ mod tests {
             allow_network: false,
             read_allow_paths: vec!["/path/with(parens)".to_string()],
             workspace_write: true,
+            repo_git_write: None,
         };
         let cmd = sb.wrap_command("echo hi", Path::new("/tmp/test"));
         let args: Vec<_> = cmd
@@ -581,6 +734,7 @@ mod tests {
                 "/valid/path".to_string(),
             ],
             workspace_write: true,
+            repo_git_write: None,
         };
         let cmd = sb.wrap_command("echo hi", Path::new("/tmp/test"));
         let args: Vec<_> = cmd
@@ -618,6 +772,7 @@ mod tests {
             allow_network: false,
             read_allow_paths: vec![],
             workspace_write: true,
+            repo_git_write: None,
         };
         let mut cmd = sb.wrap_command(
             "touch /tmp/sandbox_escape_test_file 2>&1; echo exit=$?",
@@ -643,6 +798,7 @@ mod tests {
             allow_network: false,
             read_allow_paths: vec![],
             workspace_write: true,
+            repo_git_write: None,
         };
         let mut cmd = sb.wrap_command("touch test_file && echo ok", cwd);
         let output = cmd.output().await.expect("sandbox-exec should run");
@@ -675,6 +831,7 @@ mod tests {
             allow_network: false,
             read_allow_paths: Vec::new(),
             workspace_write: false,
+            repo_git_write: None,
         };
         let cmd = sb.wrap_command("touch newfile", cwd);
         let args: Vec<_> = cmd
@@ -711,6 +868,7 @@ mod tests {
             allow_network: false,
             read_allow_paths: Vec::new(),
             workspace_write: true,
+            repo_git_write: None,
         };
         let cmd = sb.wrap_command("touch newfile", cwd);
         let args: Vec<_> = cmd
@@ -742,6 +900,7 @@ mod tests {
             allow_network: false,
             read_allow_paths: Vec::new(),
             workspace_write: false,
+            repo_git_write: None,
         };
         let cmd = sb.wrap_command("echo hi", cwd);
 
@@ -785,6 +944,7 @@ mod tests {
             allow_network: false,
             read_allow_paths: Vec::new(),
             workspace_write: false,
+            repo_git_write: None,
         };
         let cmd = sb.wrap_command("echo hi", cwd);
         let args: Vec<_> = cmd
@@ -958,6 +1118,7 @@ mod tests {
             allow_network: false,
             read_allow_paths: Vec::new(),
             workspace_write: false,
+            repo_git_write: None,
         };
         let cmd = sb.wrap_command("echo hi", cwd);
 
@@ -1003,6 +1164,7 @@ mod tests {
             allow_network: false,
             read_allow_paths: vec![],
             workspace_write: false,
+            repo_git_write: None,
         };
         let mut cmd = sb.wrap_command("echo hello; :", cwd);
         let output = cmd.output().await.expect("sandbox-exec should run");
@@ -1027,6 +1189,7 @@ mod tests {
             allow_network: false,
             read_allow_paths: vec![],
             workspace_write: false,
+            repo_git_write: None,
         };
         let mut cmd = sb.wrap_command("touch newfile 2>&1; echo exit=$?", cwd);
         let output = cmd.output().await.expect("sandbox-exec should run");
@@ -1054,6 +1217,7 @@ mod tests {
             allow_network: false,
             read_allow_paths: vec!["/nonexistent/path".to_string()],
             workspace_write: true,
+            repo_git_write: None,
         };
         let real_secret =
             std::fs::canonicalize(&secret_file).unwrap_or_else(|_| secret_file.clone());

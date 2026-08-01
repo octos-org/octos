@@ -189,9 +189,174 @@ pub fn strip_think_tags(text: &str) -> (String, Option<String>) {
     (cleaned, thinking)
 }
 
+const THINK_OPEN: &str = "<think>";
+const THINK_CLOSE: &str = "</think>";
+
+/// Incremental version of [`strip_think_tags`] for STREAMING deltas.
+///
+/// Models that embed chain-of-thought inline (MiniMax, Qwen, some DeepSeek
+/// routes) stream `<think>…</think>` inside ordinary content deltas — the
+/// structured reasoning lane never sees it, so a client's thinking-display
+/// toggle cannot hide it and raw tags render in live transcripts. The
+/// non-streaming parse and the post-stream accumulator both strip after the
+/// fact; this splitter routes the spans AS THEY ARRIVE.
+///
+/// Feed each content delta; get back `(content_part, reasoning_part)`.
+/// A suffix that could be the start of a tag split across deltas
+/// (`"…<th"` + `"ink>…"`) is held back until it can be classified. Call
+/// [`ThinkTagStreamSplitter::finish`] at stream end to flush the holdback;
+/// text inside an unclosed `<think>` is treated as reasoning, matching
+/// [`strip_think_tags`].
+#[derive(Debug, Default)]
+pub struct ThinkTagStreamSplitter {
+    inside_think: bool,
+    /// Holdback: bytes that might be a partial tag prefix split across
+    /// deltas. Always shorter than the tag itself.
+    pending: String,
+}
+
+impl ThinkTagStreamSplitter {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Feed one streamed content delta. Returns the text to route to the
+    /// CONTENT lane and the text to route to the REASONING lane.
+    pub fn feed(&mut self, delta: &str) -> (String, String) {
+        let mut buf = std::mem::take(&mut self.pending);
+        buf.push_str(delta);
+        let mut content = String::new();
+        let mut reasoning = String::new();
+        loop {
+            let tag = if self.inside_think {
+                THINK_CLOSE
+            } else {
+                THINK_OPEN
+            };
+            match buf.find(tag) {
+                Some(idx) => {
+                    if self.inside_think {
+                        reasoning.push_str(&buf[..idx]);
+                    } else {
+                        content.push_str(&buf[..idx]);
+                    }
+                    buf.drain(..idx + tag.len());
+                    self.inside_think = !self.inside_think;
+                }
+                None => {
+                    // Emit everything except a trailing run that could be
+                    // the start of the tag we are looking for.
+                    let keep = partial_tag_suffix_len(&buf, tag);
+                    let tail = buf.split_off(buf.len() - keep);
+                    if self.inside_think {
+                        reasoning.push_str(&buf);
+                    } else {
+                        content.push_str(&buf);
+                    }
+                    self.pending = tail;
+                    break;
+                }
+            }
+        }
+        (content, reasoning)
+    }
+
+    /// Flush the holdback at stream end. A pending partial tag was literal
+    /// text after all; route it to whichever lane the splitter is in.
+    pub fn finish(&mut self) -> (String, String) {
+        let tail = std::mem::take(&mut self.pending);
+        if tail.is_empty() {
+            (String::new(), String::new())
+        } else if self.inside_think {
+            (String::new(), tail)
+        } else {
+            (tail, String::new())
+        }
+    }
+}
+
+/// Length of the longest buffer SUFFIX that is a proper prefix of `tag`
+/// (e.g. buffer `"hello <th"` vs `"<think>"` → 3). Tags are ASCII, so any
+/// matching suffix is ASCII and the boundary check keeps multi-byte input
+/// safe.
+fn partial_tag_suffix_len(buf: &str, tag: &str) -> usize {
+    let max = (tag.len() - 1).min(buf.len());
+    for len in (1..=max).rev() {
+        let start = buf.len() - len;
+        if buf.is_char_boundary(start) && tag.starts_with(&buf[start..]) {
+            return len;
+        }
+    }
+    0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Drive the splitter with an arbitrary chunking of `parts` and collect
+    /// both lanes.
+    fn split_parts(parts: &[&str]) -> (String, String) {
+        let mut splitter = ThinkTagStreamSplitter::new();
+        let mut content = String::new();
+        let mut reasoning = String::new();
+        for part in parts {
+            let (c, r) = splitter.feed(part);
+            content.push_str(&c);
+            reasoning.push_str(&r);
+        }
+        let (c, r) = splitter.finish();
+        content.push_str(&c);
+        reasoning.push_str(&r);
+        (content, reasoning)
+    }
+
+    #[test]
+    fn splitter_routes_think_span_to_reasoning_lane() {
+        let (content, reasoning) =
+            split_parts(&["<think>plan the review</think>", "The answer is 42."]);
+        assert_eq!(content, "The answer is 42.");
+        assert_eq!(reasoning, "plan the review");
+    }
+
+    #[test]
+    fn splitter_handles_tag_split_across_deltas() {
+        // The MiniMax live-leak case: tags arrive fragmented across chunks.
+        let (content, reasoning) =
+            split_parts(&["Hello <th", "ink>hidden ", "chain</thi", "nk> world"]);
+        assert_eq!(content, "Hello  world");
+        assert_eq!(reasoning, "hidden chain");
+    }
+
+    #[test]
+    fn splitter_passes_plain_text_through() {
+        let (content, reasoning) = split_parts(&["No tags ", "here at all."]);
+        assert_eq!(content, "No tags here at all.");
+        assert_eq!(reasoning, "");
+    }
+
+    #[test]
+    fn splitter_treats_unclosed_think_as_reasoning() {
+        let (content, reasoning) = split_parts(&["Before <think>never closed"]);
+        assert_eq!(content, "Before ");
+        assert_eq!(reasoning, "never closed");
+    }
+
+    #[test]
+    fn splitter_flushes_false_partial_tag_as_content() {
+        // "<th" at end of stream that never became "<think>" is literal text.
+        let (content, reasoning) = split_parts(&["a < b and <th"]);
+        assert_eq!(content, "a < b and <th");
+        assert_eq!(reasoning, "");
+    }
+
+    #[test]
+    fn splitter_handles_multiple_think_blocks() {
+        let (content, reasoning) =
+            split_parts(&["<think>one</think>First. <think>two</think>Second."]);
+        assert_eq!(content, "First. Second.");
+        assert_eq!(reasoning, "onetwo");
+    }
 
     #[test]
     fn test_strip_think_tags_basic() {

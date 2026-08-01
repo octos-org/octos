@@ -135,6 +135,17 @@
       { "id": "qwen/qwen3-32b", "input": 0.29, "output": 0.39, "max_output": 8192 }
     ]
   },
+  "moonshot-coding": {
+    "env": "KIMI_CODING_API_KEY",
+    "models": [
+      { "id": "k3", "input": 0.0, "output": 0.0, "max_output": 131072, "endpoints": [
+        { "id": "moonshot-coding", "label": "Kimi Coding Plan", "base_url": "https://api.kimi.com/coding/v1", "api_key_env": "KIMI_API_KEY" }
+      ] },
+      { "id": "kimi-for-coding-highspeed", "input": 0.0, "output": 0.0, "max_output": 131072, "endpoints": [
+        { "id": "moonshot-coding", "label": "Kimi Coding Plan", "base_url": "https://api.kimi.com/coding/v1", "api_key_env": "KIMI_API_KEY" }
+      ] }
+    ]
+  },
   "moonshot": {
     "env": "MOONSHOT_API_KEY",
     "models": [
@@ -142,7 +153,8 @@
         { "id": "moonshot", "label": "Official API" },
         { "id": "autodl", "label": "AutoDL", "base_url": "https://www.autodl.art/api/v1", "api_key_env": "AUTODL_API_KEY" }
       ] },
-      { "id": "kimi-k2.6", "input": 0.6, "output": 2.4, "max_output": 65535 }
+      { "id": "kimi-k2.6", "input": 0.6, "output": 2.4, "max_output": 65535 },
+      { "id": "kimi-k3", "input": 3.0, "output": 15.0, "max_output": 131072 }
     ]
   },
   "dashscope": {
@@ -172,6 +184,14 @@
       { "id": "MiniMax-M2.1", "input": 0.5, "output": 2.0, "max_output": 16384 },
       { "id": "MiniMax-M2.1-highspeed", "input": 0.5, "output": 2.0, "max_output": 16384 },
       { "id": "MiniMax-M2", "input": 0.2, "output": 1.1, "max_output": 16384 }
+    ]
+  },
+  "zai-coding": {
+    "env": "ZAI_CODING_API_KEY",
+    "models": [
+      { "id": "glm-5.2", "input": 0.0, "output": 0.0, "max_output": 131072, "endpoints": [
+        { "id": "zai-coding", "label": "GLM Coding Plan", "base_url": "https://api.z.ai/api/anthropic", "api_key_env": "ZAI_API_KEY" }
+      ] }
     ]
   },
   "zhipu": {

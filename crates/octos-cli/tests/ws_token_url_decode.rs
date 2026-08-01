@@ -50,7 +50,7 @@ use tower::util::ServiceExt;
 /// pass in `Authorization: Bearer …`. The WS path must arrive at this
 /// same byte sequence after percent-decoding the `?token=` value.
 fn build_state_with_admin_token(_dir: &TempDir, token: &str) -> Arc<AppState> {
-    let store = Arc::new(octos_cli::profiles::ProfileStore::open(_dir.path()).unwrap());
+    let store = Arc::new(octos_cli::profiles::ProfileStore::open_unified(_dir.path()).unwrap());
     Arc::new(AppState {
         profile_store: Some(store),
         auth_token: Some(token.into()),

@@ -7,6 +7,10 @@ members = [
     "crates/octos-llm",
     "crates/octos-agent",
     "crates/octos-bus",
+    "crates/octos-workflows",
+    "crates/octos-server",
+    "crates/octos-store",
+    "crates/octos-services",
     "crates/octos-cli",
     "crates/app-skills/news",
     "crates/app-skills/deep-search",
@@ -15,6 +19,7 @@ members = [
     "crates/app-skills/account-manager",
     "crates/app-skills/time",
     "crates/app-skills/weather",
+    "crates/app-skills/smart-home",
     "crates/app-skills/wechat-bridge",
     "crates/app-skills/skill-evolve",
     "crates/app-skills/harness-starter-generic",
@@ -27,10 +32,17 @@ members = [
     "crates/octos-plugin",
     "crates/octos-sandbox",
     "crates/octos-swarm",
+    "crates/octos-fleet",
+    "crates/octos-fleet-worker",
+    "crates/octos-embed-llama",
+    "crates/octos-ffi",
+    "crates/octos-uniffi",
+    "crates/octos-wasm",
+    "crates/octos-pyo3",
 ]
 
 [workspace.package]
-version = "2.0.2-rc.3"
+version = "2.0.2"
 edition = "2024"
 rust-version = "1.85.0"
 authors = ["octos team"]
@@ -48,9 +60,16 @@ octos-memory = { path = "crates/octos-memory" }
 octos-llm = { path = "crates/octos-llm" }
 octos-agent = { path = "crates/octos-agent" }
 octos-bus = { path = "crates/octos-bus" }
+octos-workflows = { path = "crates/octos-workflows" }
+octos-server = { path = "crates/octos-server" }
+octos-store = { path = "crates/octos-store" }
+octos-services = { path = "crates/octos-services" }
 octos-pipeline = { path = "crates/octos-pipeline" }
 octos-plugin = { path = "crates/octos-plugin" }
 octos-swarm = { path = "crates/octos-swarm" }
+octos-fleet = { path = "crates/octos-fleet" }
+octos-fleet-worker = { path = "crates/octos-fleet-worker" }
+octos-embed-llama = { path = "crates/octos-embed-llama" }
 
 # codex-rs crates (reused)
 codex-execpolicy = { git = "https://github.com/openai/codex", path = "codex-rs/execpolicy" }

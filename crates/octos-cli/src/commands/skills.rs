@@ -226,7 +226,7 @@ impl Executable for SkillsCommand {
         // Resolve skills directory: per-profile or global
         let skills_dir = if let Some(ref profile_id) = self.profile {
             let data_dir = super::resolve_data_dir(None)?;
-            let store = crate::profiles::ProfileStore::open(&data_dir)?;
+            let store = crate::profiles::ProfileStore::open_unified(&data_dir)?;
             resolve_profile_skills_dir(&store, profile_id)?
         } else {
             cwd.join(".octos").join("skills")
@@ -620,6 +620,20 @@ fn looks_like_local_path(input: &str) -> bool {
         || input == "."
         || input == ".."
         || input.starts_with('~')
+        // Windows: backslash-relative, UNC/verbatim, and drive-absolute paths.
+        // `octos skills install C:\path\to\skill` must resolve as Local, not a
+        // git-repo shorthand. None of these tokens match a real POSIX path, so
+        // no `cfg(windows)` gate is needed; `canonicalize` still validates it.
+        || input.starts_with(".\\")
+        || input.starts_with("..\\")
+        || input.starts_with("\\\\")
+        || has_windows_drive_prefix(input)
+}
+
+/// True for a Windows drive-absolute prefix like `C:\` or `C:/`.
+fn has_windows_drive_prefix(input: &str) -> bool {
+    let b = input.as_bytes();
+    b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && (b[2] == b'\\' || b[2] == b'/')
 }
 
 fn looks_like_git_url(input: &str) -> bool {

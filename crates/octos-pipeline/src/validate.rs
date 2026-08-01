@@ -1274,6 +1274,11 @@ fn default_runtime_variables() -> BTreeSet<String> {
         "user_input",
         "topic",
         "task",
+        // `{label}` is bound alongside `{task}` when a fan-out plan is expanded
+        // into per-task workers (executor `sanitize_label_for_filename`), so a
+        // worker_prompt referencing it (e.g. a `findings-{label}.md` deliverable)
+        // is NOT an unbound template variable.
+        "label",
         "context",
         "previous",
         "workspace",

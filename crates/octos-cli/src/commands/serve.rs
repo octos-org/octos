@@ -13,6 +13,104 @@ use super::Executable;
 use crate::api::{AppState, EventBroadcaster, build_router, init_metrics};
 use crate::config::Config;
 
+// #1857 PR 5a — fleet worker pool defaults (serve boot). Conservative single-
+// host values; not yet operator-configurable (5a is the dispatch backbone, not
+// the tuning surface).
+/// Max fleet attempts running across ALL fleets at once.
+const FLEET_POOL_GLOBAL_CONCURRENCY: usize = 4;
+/// Max fleet attempts running per single fleet at once.
+const FLEET_POOL_PER_FLEET_CONCURRENCY: usize = 2;
+/// Hard wall-clock ceiling for one attempt's agent run.
+const FLEET_POOL_ATTEMPT_DEADLINE_SECS: u64 = 600;
+/// Lease TTL stamped at launch. Chosen > the attempt deadline so boot
+/// reconciliation reclaims only genuinely-abandoned (crashed-owner) leases, not
+/// a healthy in-flight attempt.
+const FLEET_POOL_LEASE_TTL_MS: u64 = 900_000;
+/// Tokens reserved on the fleet budget at launch (soft admission). #1857 PR 5a
+/// fix (MEDIUM): reduced from 50k — that is a whole small goal's budget, so a
+/// modestly-budgeted goal would have EVERY task rejected. This is a per-attempt
+/// admission estimate, not a hard cap (the attempt's real usage is committed on
+/// completion), so a conservative 12k admits many more tasks per budget while
+/// still bounding fan-out.
+const FLEET_POOL_PROJECTED_TOKENS: u64 = 12_000;
+/// #1857 PR 5a fix (HIGH 2): bounded boot-reconcile retries before the pool is
+/// left uninstalled for this boot (a store that can't reconcile must not accept
+/// new dispatch). Kept small — reconcile touches only prior-boot leases.
+const FLEET_BOOT_RECONCILE_MAX_ATTEMPTS: u32 = 3;
+
+/// #1857 PR 5a fix (HIGH 1) — a fleet worker's shell reach is bounded ONLY by
+/// the sandbox (the closed worker tool set is a denylist, not a boundary). Fail
+/// closed: the pool must be installed ONLY when the configured sandbox
+/// constructs a REAL isolating backend — never [`NoSandbox`], which a disabled
+/// sandbox (or `Auto` finding no backend on this host) yields and which would
+/// give the worker unbounded network/host reach. Returns whether `sandbox_cfg`
+/// yields real isolation.
+///
+/// [`NoSandbox`]: octos_agent::sandbox::NoSandbox
+fn fleet_sandbox_is_isolating(sandbox_cfg: &octos_agent::sandbox::SandboxConfig) -> bool {
+    !octos_agent::sandbox::create_sandbox(sandbox_cfg).is_noop()
+}
+
+/// Whether the resolved sandbox backend can grant a `FsGrant::Host` worker FULL
+/// daemon-user FS write together with the reads git needs — the third gate
+/// condition for the fleet WORKTREE flow (§5). Computed at serve boot (mirrors
+/// [`fleet_sandbox_is_isolating`]) from the base sandbox's
+/// `supports_repo_git_write()`: `true` for bwrap and unrestricted-read macOS,
+/// `false` for docker, restricted-read macOS, Landlock, AppContainer, and no
+/// sandbox. When `false`, the pool falls back to a scratch workspace for every
+/// task (a worktree worker whose `git commit` can't reach `<repo>/.git` would
+/// lose its deliverable when the checkout is removed). Threaded into
+/// `PoolConfig.repo_git_write_supported`.
+fn fleet_sandbox_supports_repo_git_write(
+    sandbox_cfg: &octos_agent::sandbox::SandboxConfig,
+) -> bool {
+    octos_agent::sandbox::create_sandbox(sandbox_cfg).supports_repo_git_write()
+}
+
+/// #1857 PR 5a fix (HIGH 2) — reconcile the fleet store at boot with a bounded
+/// retry. `reconcile` is the ONLY production recovery of a prior boot's stale
+/// leases: a stale `Launching`/`Running` child never re-readies on its own
+/// (lease expiry promotes only `Planned`), so a transient reconcile failure
+/// would silently wedge those children until a LATER clean boot. Retry up to
+/// `max_attempts` (small linear backoff); return whether reconcile ultimately
+/// SUCCEEDED. On persistent failure the caller must NOT install the pool, but
+/// serve boot itself is never aborted (advisory, like `FleetKernelStore::open`).
+async fn fleet_boot_reconcile(
+    store: &octos_fleet::FleetKernelStore,
+    now_ms: u64,
+    owner_epoch: u64,
+    max_attempts: u32,
+) -> bool {
+    for attempt in 1..=max_attempts.max(1) {
+        match store.reconcile(now_ms, owner_epoch).await {
+            Ok(report) => {
+                tracing::info!(
+                    interrupted = report.interrupted.len(),
+                    owner_epoch,
+                    attempt,
+                    "fleet-kernel boot reconcile complete"
+                );
+                return true;
+            }
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    attempt,
+                    max_attempts,
+                    "fleet-kernel boot reconcile failed; retrying"
+                );
+                if attempt < max_attempts {
+                    tokio::time::sleep(std::time::Duration::from_millis(
+                        50u64.saturating_mul(u64::from(attempt)),
+                    ))
+                    .await;
+                }
+            }
+        }
+    }
+    false
+}
+
 fn smtp_email_is_usable(email: &crate::profiles::EmailSettings) -> bool {
     if !email.provider.eq_ignore_ascii_case("smtp") {
         return false;
@@ -234,6 +332,19 @@ pub struct ServeCommand {
     #[arg(long)]
     pub data_dir: Option<PathBuf>,
 
+    /// Per-instance runtime data dir (redb stores, sessions, goals, serve lock,
+    /// per-profile data). When set, the profile REGISTRY + model catalog still
+    /// resolve from the shared state home (the normal
+    /// `--data-dir`/`OCTOS_HOME`/`~/.octos`), so many stdio instances share one
+    /// config/profile while each owns private runtime state. Unset ⇒ identical
+    /// to today (runtime == state home).
+    ///
+    /// Also settable via `OCTOS_INSTANCE_DATA_DIR` (the flag wins; an empty env
+    /// value is treated as unset). Env is resolved in `run_async` because the
+    /// workspace `clap` build does not enable the `env` feature.
+    #[arg(long)]
+    pub instance_data_dir: Option<PathBuf>,
+
     /// Path to config file.
     #[arg(long)]
     pub config: Option<PathBuf>,
@@ -269,6 +380,15 @@ pub struct ServeCommand {
     #[arg(long)]
     pub danger_full_access: bool,
 
+    /// Opt OUT of the network-on default. By default a fresh Local session with
+    /// no explicit `/permissions` choice runs Workspace-Write with network
+    /// ALLOWED (filesystem still sandboxed) so `npm install` / git / fetch work
+    /// out of the box. Pass `--no-network` (or `OCTOS_NO_NETWORK=1`) to revert
+    /// the default to network DENIED. Cloud/tenant deployments always default to
+    /// network-denied regardless. An explicit `/permissions` choice still wins.
+    #[arg(long)]
+    pub no_network: bool,
+
     /// Use LLM-summarization for AppUI context compaction: when a session's
     /// context fills, ask the model for a high-quality handoff summary (a real
     /// model call — slower, a few seconds) instead of the instant deterministic
@@ -282,18 +402,26 @@ pub struct ServeCommand {
     pub no_retry: bool,
 
     /// ── swarm ── (M7.6 contract-authoring dashboard)
-    /// Backend transport for the swarm MCP agent. When unset the
+    /// Backend transport for the swarm agent. When unset the
     /// `/api/swarm/*` endpoints return 503 (legacy opt-out behaviour).
-    /// `stdio` pairs with `--swarm-backend-cmd`; `http` pairs with
-    /// `--swarm-backend-url`.
-    #[arg(long, value_name = "stdio|http")]
+    /// `stdio` (MCP subprocess) and `cli` (one-shot headless CLI, e.g.
+    /// `claude -p` / `codex exec`) pair with `--swarm-backend-cmd`;
+    /// `http` pairs with `--swarm-backend-url`.
+    #[arg(long, value_name = "stdio|http|cli")]
     pub swarm_backend: Option<String>,
 
-    /// Stdio MCP agent executable (e.g. `claude`). Required when
-    /// `--swarm-backend stdio` is set. Forwarded to
-    /// [`octos_agent::tools::mcp_agent::StdioMcpAgent`].
+    /// Agent executable (e.g. `claude`). Required when
+    /// `--swarm-backend stdio` or `cli` is set. Forwarded to
+    /// [`octos_agent::tools::mcp_agent::StdioMcpAgent`] /
+    /// [`octos_agent::tools::mcp_agent::CliAgentBackend`].
     #[arg(long, value_name = "CMD")]
     pub swarm_backend_cmd: Option<String>,
+
+    /// Arguments passed to the backend executable before the prompt
+    /// (comma-separated, e.g. `-p` or `exec,--json`). Applies to the
+    /// `stdio` and `cli` backends.
+    #[arg(long, value_name = "ARGS", value_delimiter = ',')]
+    pub swarm_backend_args: Vec<String>,
 
     /// HTTPS URL for a remote MCP agent. Required when
     /// `--swarm-backend http` is set. Forwarded to
@@ -395,6 +523,39 @@ impl ServeCommand {
         let ctx = super::resolve_command_context(self.data_dir.clone())?;
         let data_dir = ctx.data_dir.clone();
 
+        // Multi-instance stdio split. `state_home` is the SHARED, config-like
+        // root that holds the profile REGISTRY and the model catalog — always
+        // the normal resolution (`--data-dir`/`OCTOS_HOME`/`~/.octos`), never
+        // the per-instance dir. The `data_dir` used from here on is the
+        // per-instance RUNTIME root (redb stores, sessions, goals, serve lock,
+        // per-profile data): the private per-instance dir when set, else the
+        // state home (byte-identical to today for default installs and for
+        // gateways, which never set a per-instance dir).
+        //
+        // The per-instance dir comes from `--instance-data-dir` (flag wins) or
+        // `OCTOS_INSTANCE_DATA_DIR` (empty ⇒ unset). Env is read here because
+        // the workspace `clap` build omits the `env` feature.
+        let state_home = data_dir.clone();
+        let instance_data_dir = self.instance_data_dir.clone().or_else(|| {
+            std::env::var("OCTOS_INSTANCE_DATA_DIR")
+                .ok()
+                .filter(|v| !v.trim().is_empty())
+                .map(PathBuf::from)
+        });
+        let data_dir = instance_data_dir
+            .clone()
+            .unwrap_or_else(|| state_home.clone());
+        if instance_data_dir.is_some() {
+            // A fresh per-instance dir must exist before the serve lock and
+            // redb stores open under it.
+            std::fs::create_dir_all(&data_dir).wrap_err_with(|| {
+                format!(
+                    "failed to create per-instance data dir: {}",
+                    data_dir.display()
+                )
+            })?;
+        }
+
         let (config, resolved_config_path) = if let Some(config_path) = &self.config {
             tracing::info!(path = %config_path.display(), "loading config (--config)");
             (Config::from_file(config_path)?, Some(config_path.clone()))
@@ -446,6 +607,80 @@ impl ServeCommand {
                     loop_id = %loop_id,
                     session_id = %session_id.0,
                     "solo boot: restored loop parked as paused (resume with /loop resume)"
+                );
+            }
+            // Same safety for GOALS (#1694): a goal restored `active`
+            // resumes autonomous model turns nobody asked this process
+            // for. Park paused; `/goal resume` re-arms,
+            // OCTOS_SOLO_RESUME_GOALS=1 opts out.
+            if std::env::var("OCTOS_SOLO_RESUME_GOALS").ok().as_deref() != Some("1") {
+                for (goal_id, session_id) in
+                    crate::api::agent_orchestrator::default_agent_orchestrator()
+                        .pause_restored_goals_for_solo_boot()
+                {
+                    tracing::info!(
+                        goal_id = %goal_id,
+                        session_id = %session_id.0,
+                        "solo boot: restored goal parked as paused (resume with /goal resume)"
+                    );
+                }
+            }
+        }
+
+        // Fleet-kernel outbox consumer (#1857 PR 4a): open the durable fleet
+        // store beside the supervisor store — guarded by the same serve
+        // single-writer lock, and redb is single-process, so the sibling
+        // `fleet-kernel.redb` is safe — install it on the orchestrator and
+        // spawn the background consumer that turns `ChildDone` / `FleetDrained`
+        // events into keeper wake-ups. Dormant until a fleet writes events (a
+        // later PR); a failure to open is non-fatal (fleet features stay inert).
+        // #1857 PR 5a — mint ONE boot lease owner epoch, shared by the boot
+        // reconcile (below) and the worker pool (built after the ProfileRuntime
+        // loop). It fences stale completions from a PRIOR boot: reconcile
+        // interrupts leases stamped with a different epoch, and the pool stamps
+        // THIS epoch on every launch. Wall-clock ms is monotone across restarts
+        // (unlike a random id), so a later boot always out-ranks an earlier one.
+        let fleet_owner_epoch = chrono::Utc::now().timestamp_millis().max(0) as u64;
+        // #1857 PR 5a fix (HIGH 2) — gates the worker-pool build below: the pool
+        // is installed ONLY if the boot reconcile succeeded (a store that can't
+        // reconcile a prior boot's stale leases must not accept new dispatch).
+        let mut fleet_reconciled = false;
+        match octos_fleet::FleetKernelStore::open(data_dir.join("fleet-kernel")).await {
+            Ok(fleet_store) => {
+                crate::api::agent_orchestrator::default_agent_orchestrator()
+                    .set_fleet_store(fleet_store.clone());
+                // #1857 PR 5a — BOOT RECOVERY: interrupt any attempt still
+                // holding a stale (prior-epoch) lease, release its budget
+                // reservation, and return its child to `Ready` so this boot can
+                // relaunch it. Fix (HIGH 2): retry a bounded number of times —
+                // reconcile is the ONLY production recovery of a prior boot's
+                // stale `Launching`/`Running` children — and on PERSISTENT
+                // failure leave the pool uninstalled (loud ERROR) rather than
+                // accept new dispatch onto an unreconciled store. Never abort
+                // serve boot (advisory, like `open`).
+                let reconcile_now = chrono::Utc::now().timestamp_millis().max(0) as u64;
+                fleet_reconciled = fleet_boot_reconcile(
+                    &fleet_store,
+                    reconcile_now,
+                    fleet_owner_epoch,
+                    FLEET_BOOT_RECONCILE_MAX_ATTEMPTS,
+                )
+                .await;
+                if !fleet_reconciled {
+                    tracing::error!(
+                        owner_epoch = fleet_owner_epoch,
+                        "fleet-kernel boot reconcile failed after retries; fleet dispatch \
+                         DISABLED this boot (a store that can't reconcile must not accept new \
+                         dispatch). Stale leases still expire on their TTL."
+                    );
+                }
+                crate::api::fleet_wake::spawn_fleet_outbox_consumer(fleet_store);
+                tracing::info!("fleet-kernel outbox consumer started");
+            }
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    "failed to open fleet-kernel store; fleet wake consumer not started"
                 );
             }
         }
@@ -511,10 +746,14 @@ impl ServeCommand {
             None
         };
 
-        // Initialize profile store and process manager for admin dashboard
+        // Initialize profile store and process manager for admin dashboard.
+        // Registry (`<id>.json`) resolves from the SHARED `state_home`; the
+        // per-profile `<id>/data` runtime tree roots under the per-instance
+        // `data_dir`. With no `--instance-data-dir`, `state_home == data_dir`,
+        // so this is byte-identical to `open_unified(&data_dir)`.
         tracing::info!("initializing profile store and process manager");
         let profile_store = Arc::new(
-            crate::profiles::ProfileStore::open(&data_dir)
+            crate::profiles::ProfileStore::open(&state_home, &data_dir)
                 .wrap_err("failed to open profile store")?,
         );
 
@@ -592,6 +831,14 @@ impl ServeCommand {
                 );
                 continue;
             }
+            // Resolve the full runtime profile through the single shared
+            // resolver: parent/sub-account inheritance THEN the store's global
+            // `profile-defaults.json` base, so inherited hooks / plugins /
+            // sandbox / memory settings reach the per-profile bootstrap. Absent
+            // parent + defaults ⇒ effective config == `profile.config` (no
+            // behavior change).
+            let profile = profile_store.resolve_runtime_profile(profile);
+            let profile = &profile;
             // Section B (codex review round-3): thread the host's
             // strict-signing policy so the per-profile plugin load honors
             // `plugins.require_signed = true` from the top-level config
@@ -626,6 +873,174 @@ impl ServeCommand {
                 }
             }
         }
+
+        // #1857 PR 5a — build the LIVE fleet worker pool the goal keeper
+        // dispatches ready tasks onto, then install it on the orchestrator
+        // singleton (`goal_dispatch` reaches it through `fleet_pool()`). It
+        // needs a bootstrapped `ProfileRuntime` (LLM + episodic memory +
+        // sandbox), so it is built HERE — after the profile loop — whereas the
+        // `reconcile` above ran at store-open time (it needs only store+epoch).
+        //
+        // v1 limitation (documented): the pool binds ONE keeper profile —
+        // preferring the synthetic main profile (`MAIN_PROFILE_ID`), else the
+        // lexicographically-first bootstrapped profile. All fleet workers run on
+        // that profile's model/memory/sandbox regardless of which profile a goal
+        // is set on. A goal on a DIFFERENT profile is fenced at dispatch time
+        // against the pool's bound `keeper_profile_id` (see model_dispatch_fleet).
+        //
+        // Fix (HIGH 2): gated on `fleet_reconciled` — a store that failed its
+        // boot reconcile must not accept new dispatch, so no pool is installed.
+        if let Some(fleet_store) = crate::api::agent_orchestrator::default_agent_orchestrator()
+            .fleet_store()
+            .filter(|_| fleet_reconciled)
+        {
+            let keeper = profile_runtimes
+                .get(octos_core::MAIN_PROFILE_ID)
+                .cloned()
+                .or_else(|| {
+                    profile_runtimes
+                        .iter()
+                        .min_by(|left, right| left.0.cmp(right.0))
+                        .map(|(_, rt)| rt.clone())
+                });
+            match keeper {
+                Some(rt) => {
+                    // PR-3 requires a network-isolated sandbox: the worker tool
+                    // set is a denylist, not a boundary, so the shell's reach is
+                    // bounded only by the sandbox. Base the sandbox on the profile
+                    // default with network OFF; PR A re-enables raw egress
+                    // PER-ATTEMPT only for a `Full` network grant (see the factory
+                    // closure below). `None`/`Hosts` keep it off (`Hosts` is
+                    // enforced by the granted web tools, not raw egress).
+                    let mut sandbox_cfg = rt.default_sandbox.clone();
+                    sandbox_cfg.allow_network = false;
+                    // #1857 PR 5a fix (HIGH 1) — FAIL CLOSED: install the pool
+                    // ONLY when the sandbox is a REAL isolating backend. A
+                    // disabled sandbox (or `Auto` with no backend on this host)
+                    // yields `NoSandbox` = unbounded shell reach (curl / git push
+                    // / host access), breaking PR-3's replay-safe boundary. The
+                    // isolation of the BACKEND is independent of the network flag,
+                    // so probing with network off is sufficient. Leave the pool
+                    // unset so goal_dispatch cleanly reports "unavailable" instead
+                    // of running a fleet worker unsandboxed.
+                    if !fleet_sandbox_is_isolating(&sandbox_cfg) {
+                        tracing::error!(
+                            keeper_profile = %rt.profile_id,
+                            sandbox_mode = ?sandbox_cfg.mode,
+                            "fleet dispatch disabled: no network-isolating sandbox available \
+                             (requires a real backend: bwrap / macos / docker). goal_dispatch \
+                             will report the pool unavailable."
+                        );
+                    } else {
+                        // §5 gate condition 3: compute the repo-`.git`-write
+                        // capability BEFORE the factory closure moves `sandbox_cfg`
+                        // in (the closure needs the whole config; the pool only
+                        // needs the bool).
+                        let repo_git_write_supported =
+                            fleet_sandbox_supports_repo_git_write(&sandbox_cfg);
+                        // The SandboxFactory folds the per-attempt SandboxGrant
+                        // (derived from the task's WorkerGrant) onto the base
+                        // network-isolated sandbox: `allow_network` from the
+                        // network lane (`Full` → true, `None`/`Hosts` → false) and
+                        // `repo_git_write` from the FS lane (`FsGrant::Host` worktree
+                        // worker → `Some(<repo>/.git)`, a TARGETED rw-bind so its
+                        // `git commit` can reach `<repo>/.git` outside its cwd
+                        // WITHOUT exposing host sockets via `--bind / /`).
+                        let sandbox_factory: octos_fleet_worker::SandboxFactory = Arc::new(
+                            move |_cwd: &std::path::Path,
+                                  grant: octos_fleet_worker::SandboxGrant| {
+                                let mut cfg = sandbox_cfg.clone();
+                                cfg.allow_network = grant.allow_network;
+                                cfg.repo_git_write = grant.repo_git_dir;
+                                Arc::<dyn octos_agent::sandbox::Sandbox>::from(
+                                    octos_agent::sandbox::create_sandbox(&cfg),
+                                )
+                            },
+                        );
+                        let factory = Arc::new(octos_fleet_worker::AgentFactory::new(
+                            rt.llm.clone(),
+                            rt.memory.clone(),
+                            sandbox_factory,
+                        ));
+                        let cfg = octos_fleet_worker::PoolConfig {
+                            global_concurrency: FLEET_POOL_GLOBAL_CONCURRENCY,
+                            per_fleet_concurrency: FLEET_POOL_PER_FLEET_CONCURRENCY,
+                            deadline: std::time::Duration::from_secs(
+                                FLEET_POOL_ATTEMPT_DEADLINE_SECS,
+                            ),
+                            owner_epoch: fleet_owner_epoch,
+                            lease_ttl_ms: FLEET_POOL_LEASE_TTL_MS,
+                            projected_tokens: FLEET_POOL_PROJECTED_TOKENS,
+                            // Each attempt gets its own `<root>/<fleet>/<task>` cwd.
+                            workspace_root: data_dir.join("fleet-work"),
+                            // Fix (HIGH 4): the pool's bound keeper profile — the
+                            // keeper fences a cross-profile goal against it.
+                            keeper_profile_id: rt.profile_id.clone(),
+                            // §5 gate condition 3: only take the worktree flow when
+                            // the resolved backend supports full-FS write (bwrap /
+                            // full-read macOS). Otherwise every task falls back to a
+                            // scratch workspace so a non-supporting backend never
+                            // loses a deliverable.
+                            repo_git_write_supported,
+                        };
+                        let pool = octos_fleet_worker::FleetWorkerPool::new(
+                            Arc::new(fleet_store),
+                            factory,
+                            cfg,
+                            Arc::new(|| chrono::Utc::now().timestamp_millis().max(0) as u64),
+                        );
+                        crate::api::agent_orchestrator::default_agent_orchestrator()
+                            .set_fleet_pool(Arc::new(pool));
+                        tracing::info!(
+                            keeper_profile = %rt.profile_id,
+                            "fleet worker pool installed (goal keeper dispatch enabled)"
+                        );
+                    }
+                }
+                None => tracing::warn!(
+                    "no bootstrapped profile runtime; fleet worker pool not built \
+                     (goal_dispatch will report the pool unavailable)"
+                ),
+            }
+        }
+
+        // Boot-resume — "a fleet survives an octos restart". The boot reconcile
+        // above flipped any restart-interrupted fleet's in-flight children back
+        // to `Ready`, but emitted NO outbox event — so the outbox consumer never
+        // wakes the keeper and an in-progress fleet would STALL forever after a
+        // restart (nothing re-dispatches its ready tasks). Now that the worker
+        // pool is installed, enqueue a keeper wake for every live fleet with a
+        // launchable child; the global master-continuation drain (started below,
+        // ~5s poll) picks them up on its next tick → PR-4b reseed pre-pass →
+        // `run_standalone_turn` → the keeper's `goal_dispatch` re-launches the
+        // ready set. Gated on a reconciled store AND an installed pool (no pool ⇒
+        // nothing to dispatch onto). Re-fetch the store here: the local binding
+        // was moved into the outbox consumer / worker pool above.
+        let boot_resume_orchestrator = crate::api::agent_orchestrator::default_agent_orchestrator();
+        let boot_resume_store =
+            if fleet_reconciled && boot_resume_orchestrator.fleet_pool().is_some() {
+                boot_resume_orchestrator.fleet_store()
+            } else {
+                None
+            };
+        if let Some(store) = boot_resume_store {
+            let now_ms = chrono::Utc::now().timestamp_millis().max(0) as u64;
+            match crate::api::fleet_wake::enqueue_fleet_boot_resume_wakes(
+                &store,
+                boot_resume_orchestrator,
+                now_ms,
+            )
+            .await
+            {
+                Ok(n) if n > 0 => tracing::info!(
+                    fleets = n,
+                    "fleet boot-resume: re-woke keepers for restart-stranded fleets"
+                ),
+                Ok(_) => {}
+                Err(error) => tracing::warn!(%error, "fleet boot-resume wake pass failed"),
+            }
+        }
+
         let session_cache = Arc::new(
             crate::runtime::SessionRuntimeCache::new(64, std::time::Duration::from_secs(1800))
                 // Per-project session storage (opt-in, default off). When set,
@@ -649,7 +1064,13 @@ impl ServeCommand {
                 )
                 .with_host_memory_refresh_enabled(crate::config::MemoryConfig::refresh_enabled(
                     config.memory.as_ref(),
-                )),
+                ))
+                .with_host_asr_language(
+                    config
+                        .voice
+                        .as_ref()
+                        .and_then(|voice| voice.asr_language.clone()),
+                ),
         );
         process_manager.set_self_ref();
 
@@ -773,6 +1194,7 @@ impl ServeCommand {
         let swarm_state_init = Self::build_swarm_state_from_flags(
             self.swarm_backend.as_deref(),
             self.swarm_backend_cmd.as_deref(),
+            &self.swarm_backend_args,
             self.swarm_backend_url.as_deref(),
             &data_dir,
             broadcaster.clone(),
@@ -801,6 +1223,10 @@ impl ServeCommand {
                 .unwrap_or(false);
         let dangerous_default_permissions_flag = self.danger_full_access
             || std::env::var("OCTOS_DANGER_FULL_ACCESS")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false);
+        let default_network_denied_flag = self.no_network
+            || std::env::var("OCTOS_NO_NETWORK")
                 .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
                 .unwrap_or(false);
         // SECURITY KEYSTONE: the dangerous default rides the SAME solo
@@ -879,6 +1305,7 @@ impl ServeCommand {
             host_memory: config.memory.clone(),
             solo_login_enabled: solo_login_enabled_flag,
             dangerous_default_permissions: dangerous_default_permissions_flag,
+            default_network_denied: default_network_denied_flag,
             llm_compaction: self.llm_compaction,
             allow_admin_shell: config.allow_admin_shell,
             content_catalog_mgr: Some(Arc::new(
@@ -1254,6 +1681,7 @@ impl ServeCommand {
     async fn build_swarm_state_from_flags(
         swarm_backend: Option<&str>,
         swarm_backend_cmd: Option<&str>,
+        swarm_backend_args: &[String],
         swarm_backend_url: Option<&str>,
         data_dir: &std::path::Path,
         broadcaster: Arc<crate::api::EventBroadcaster>,
@@ -1262,7 +1690,7 @@ impl ServeCommand {
     ) -> Result<Option<Arc<crate::api::SwarmState>>> {
         use octos_agent::cost_ledger::PersistentCostLedger;
         use octos_agent::tools::mcp_agent::{
-            HttpMcpAgent, McpAgentBackend, McpAgentBackendConfig, StdioMcpAgent,
+            CliAgentBackend, HttpMcpAgent, McpAgentBackend, McpAgentBackendConfig, StdioMcpAgent,
         };
 
         let Some(kind) = swarm_backend else {
@@ -1277,11 +1705,26 @@ impl ServeCommand {
                     ))?;
                 let config = McpAgentBackendConfig::Local {
                     cmd,
-                    args: Vec::new(),
+                    args: swarm_backend_args.to_vec(),
                     env: Default::default(),
                     dispatch_timeout_secs: None,
                 };
                 Arc::new(StdioMcpAgent::from_config(&config)?)
+            }
+            "cli" => {
+                let cmd = swarm_backend_cmd
+                    .map(str::to_owned)
+                    .ok_or_else(|| eyre::eyre!(
+                        "`--swarm-backend cli` requires `--swarm-backend-cmd <path>` (path to a one-shot agent CLI, e.g. `claude`)"
+                    ))?;
+                let config = McpAgentBackendConfig::Cli {
+                    cmd,
+                    args: swarm_backend_args.to_vec(),
+                    env: Default::default(),
+                    dispatch_timeout_secs: None,
+                    prompt_via_stdin: false,
+                };
+                Arc::new(CliAgentBackend::from_config(&config)?)
             }
             "http" => {
                 let url = swarm_backend_url
@@ -1300,7 +1743,9 @@ impl ServeCommand {
                 Arc::new(HttpMcpAgent::from_config(&config)?)
             }
             other => {
-                eyre::bail!("unknown --swarm-backend value `{other}` (expected `stdio` or `http`)");
+                eyre::bail!(
+                    "unknown --swarm-backend value `{other}` (expected `stdio`, `http`, or `cli`)"
+                );
             }
         };
 
@@ -1374,6 +1819,111 @@ mod tests {
         assert!(
             stdio_task_query_store(false).is_none(),
             "gateway/http serve must leave task_query_store None"
+        );
+    }
+
+    /// #1857 PR 5a fix (HIGH 1) — the fleet worker pool installs ONLY behind a
+    /// REAL isolating sandbox. A disabled sandbox (or an explicit `None` mode)
+    /// yields `NoSandbox`, which the fail-closed predicate must reject so a fleet
+    /// worker never runs unsandboxed with network reach. (The real-backend side
+    /// is host-dependent — `Auto` may resolve to `NoSandbox` on a CI host with no
+    /// bwrap/docker — so only the fail-closed direction is asserted here.)
+    #[test]
+    fn fleet_pool_requires_a_real_isolating_sandbox() {
+        use octos_agent::sandbox::{SandboxConfig, SandboxMode};
+        let disabled = SandboxConfig {
+            enabled: false,
+            ..Default::default()
+        };
+        assert!(
+            !fleet_sandbox_is_isolating(&disabled),
+            "a disabled sandbox must NOT be treated as isolating",
+        );
+        let none_mode = SandboxConfig {
+            enabled: true,
+            mode: SandboxMode::None,
+            ..Default::default()
+        };
+        assert!(
+            !fleet_sandbox_is_isolating(&none_mode),
+            "SandboxMode::None must NOT be treated as isolating",
+        );
+    }
+
+    /// #1857 PR 5a fix (HIGH 2) — the bounded boot reconcile recovers a prior
+    /// boot's stale-lease attempt AND reports success on a healthy store (so the
+    /// pool is allowed to install). Drives the serve-boot helper through the
+    /// store-level recovery contract.
+    #[tokio::test]
+    async fn fleet_boot_reconcile_recovers_a_stale_attempt_on_a_healthy_store() {
+        use octos_core::SessionKey;
+        use octos_fleet::{
+            ChildStatus, Fleet, FleetBudget, FleetKernelStore, LaunchOutcome, TaskSpec,
+        };
+        use std::sync::Arc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            FleetKernelStore::open(dir.path().join("fleet-kernel"))
+                .await
+                .expect("open store"),
+        );
+        Fleet::create(
+            store.clone(),
+            "fboot",
+            SessionKey::new("api", "keeper-boot"),
+            Some("/repos/app".to_owned()),
+            "tenant-a",
+            FleetBudget {
+                token_budget: 1_000_000,
+                tokens_reserved: 0,
+                tokens_committed: 0,
+                hard: false,
+            },
+            "obj",
+            vec![TaskSpec {
+                task_id: "t1".to_owned(),
+                title: "t".to_owned(),
+                detail: "d".to_owned(),
+                deps: Vec::new(),
+                acceptance: Vec::new(),
+                grant: octos_fleet::WorkerGrant::minimal(),
+            }],
+            1,
+        )
+        .await
+        .expect("create fleet");
+
+        // A prior boot (epoch 100) launched + started the attempt.
+        let prior_epoch = 100u64;
+        match store
+            .launch_child("fboot", "t1", 100, 1, prior_epoch, 60_000)
+            .await
+            .unwrap()
+        {
+            LaunchOutcome::Launched { attempt_id } => {
+                store.mark_running("t1", &attempt_id).await.unwrap();
+            }
+            other => panic!("expected Launched, got {other:?}"),
+        }
+
+        // This boot (epoch 101) reconciles via the serve-boot helper.
+        let ok = fleet_boot_reconcile(
+            &store,
+            2,
+            prior_epoch + 1,
+            FLEET_BOOT_RECONCILE_MAX_ATTEMPTS,
+        )
+        .await;
+        assert!(
+            ok,
+            "reconcile must succeed on a healthy store (the pool may install)",
+        );
+        let child = store.get_child("fboot", "t1").await.unwrap().unwrap();
+        assert_eq!(
+            child.status,
+            ChildStatus::Ready,
+            "the stale attempt must return to Ready for this boot to relaunch",
         );
     }
 
@@ -1467,7 +2017,7 @@ mod tests {
     #[test]
     fn derives_dashboard_auth_from_admin_profile_email_tool() {
         let dir = tempfile::tempdir().unwrap();
-        let store = crate::profiles::ProfileStore::open(dir.path()).unwrap();
+        let store = crate::profiles::ProfileStore::open_unified(dir.path()).unwrap();
         store
             .save(&crate::profiles::UserProfile {
                 id: crate::api::auth_handlers::ADMIN_PROFILE_ID.into(),
@@ -1520,7 +2070,7 @@ mod tests {
         let _guard = dashboard_smtp_test_env_lock().lock().unwrap();
         let _env = EnvVarGuard::remove("OCTOS_TEST_DASHBOARD_AUTH_ADMIN_SMTP_PASSWORD");
         let dir = tempfile::tempdir().unwrap();
-        let store = crate::profiles::ProfileStore::open(dir.path()).unwrap();
+        let store = crate::profiles::ProfileStore::open_unified(dir.path()).unwrap();
         store
             .save(&crate::profiles::UserProfile {
                 id: crate::api::auth_handlers::ADMIN_PROFILE_ID.into(),
@@ -1571,7 +2121,7 @@ mod tests {
     #[test]
     fn derives_dashboard_auth_from_first_usable_non_admin_profile() {
         let dir = tempfile::tempdir().unwrap();
-        let store = crate::profiles::ProfileStore::open(dir.path()).unwrap();
+        let store = crate::profiles::ProfileStore::open_unified(dir.path()).unwrap();
         store
             .save(&crate::profiles::UserProfile {
                 id: crate::api::auth_handlers::ADMIN_PROFILE_ID.into(),
@@ -1644,7 +2194,7 @@ mod tests {
         let _guard = dashboard_smtp_test_env_lock().lock().unwrap();
         let _env = EnvVarGuard::remove("OCTOS_TEST_DASHBOARD_AUTH_PROFILE_SMTP_PASSWORD");
         let dir = tempfile::tempdir().unwrap();
-        let store = crate::profiles::ProfileStore::open(dir.path()).unwrap();
+        let store = crate::profiles::ProfileStore::open_unified(dir.path()).unwrap();
         store
             .save(&crate::profiles::UserProfile {
                 id: "dspfac".into(),
@@ -1659,7 +2209,10 @@ mod tests {
                         smtp_host: Some("smtp.gmail.com".into()),
                         smtp_port: Some(587),
                         username: Some("dspfac@gmail.com".into()),
-                        password_env: Some("eqepkfbyfymwfhnv".into()),
+                        // Env var NAME, not a password. This field previously
+                        // held a 16-lowercase-char literal — the exact shape of
+                        // a Gmail App Password — next to a real gmail username.
+                        password_env: Some("SMTP_PASSWORD".into()),
                         password: Some("app-password".into()),
                         from_address: Some("dspfac@gmail.com".into()),
                         feishu_app_id: None,
@@ -1705,6 +2258,7 @@ mod tests {
         let state = ServeCommand::build_swarm_state_from_flags(
             None,
             None,
+            &[],
             None,
             dir.path(),
             broadcaster,
@@ -1731,6 +2285,7 @@ mod tests {
         let state = ServeCommand::build_swarm_state_from_flags(
             Some("stdio"),
             Some("/bin/cat"),
+            &[],
             None,
             dir.path(),
             broadcaster,
@@ -1755,6 +2310,60 @@ mod tests {
         let result = ServeCommand::build_swarm_state_from_flags(
             Some("stdio"),
             None,
+            &[],
+            None,
+            dir.path(),
+            broadcaster,
+            None,
+            None,
+        )
+        .await;
+        let err = match result {
+            Ok(_) => panic!("missing cmd must be rejected, got Ok"),
+            Err(e) => e,
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("--swarm-backend-cmd"),
+            "error must point at the missing flag, got: {msg}"
+        );
+    }
+
+    /// CLI backend: `--swarm-backend cli --swarm-backend-cmd <bin>`
+    /// builds a SwarmState around [`CliAgentBackend`]; args are
+    /// forwarded so `claude` + `-p` compose.
+    #[tokio::test]
+    async fn should_populate_swarm_state_for_cli_backend() {
+        let dir = tempfile::tempdir().unwrap();
+        let broadcaster = Arc::new(EventBroadcaster::new(16));
+        let state = ServeCommand::build_swarm_state_from_flags(
+            Some("cli"),
+            Some("/bin/echo"),
+            &["-n".to_string()],
+            None,
+            dir.path(),
+            broadcaster,
+            None,
+            None,
+        )
+        .await
+        .expect("helper must succeed when cli backend is configured");
+        assert!(
+            state.is_some(),
+            "swarm state must be Some with --swarm-backend cli"
+        );
+    }
+
+    /// CLI backend without `--swarm-backend-cmd` fails at startup like
+    /// the stdio variant.
+    #[tokio::test]
+    async fn should_reject_cli_backend_without_cmd() {
+        let dir = tempfile::tempdir().unwrap();
+        let broadcaster = Arc::new(EventBroadcaster::new(16));
+        let result = ServeCommand::build_swarm_state_from_flags(
+            Some("cli"),
+            None,
+            &[],
             None,
             dir.path(),
             broadcaster,
@@ -1782,6 +2391,7 @@ mod tests {
         let result = ServeCommand::build_swarm_state_from_flags(
             Some("http"),
             None,
+            &[],
             None,
             dir.path(),
             broadcaster,
@@ -1809,6 +2419,7 @@ mod tests {
         let result = ServeCommand::build_swarm_state_from_flags(
             Some("ouija"),
             None,
+            &[],
             None,
             dir.path(),
             broadcaster,
@@ -1822,7 +2433,7 @@ mod tests {
         };
         let msg = err.to_string();
         assert!(
-            msg.contains("stdio") && msg.contains("http"),
+            msg.contains("stdio") && msg.contains("http") && msg.contains("cli"),
             "error must list accepted backends, got: {msg}"
         );
     }
@@ -1848,6 +2459,7 @@ mod tests {
         let state = ServeCommand::build_swarm_state_from_flags(
             Some("stdio"),
             Some("/bin/cat"),
+            &[],
             None,
             dir.path(),
             broadcaster,
@@ -1910,6 +2522,7 @@ mod tests {
         let state = ServeCommand::build_swarm_state_from_flags(
             Some("stdio"),
             Some("/bin/cat"),
+            &[],
             None,
             dir.path(),
             broadcaster,

@@ -19,38 +19,18 @@ pub use macos::MacosSandbox;
 #[cfg(windows)]
 pub use windows::AppContainerSandbox;
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use tokio::process::Command;
 
 /// Environment variables blocked inside sandboxes (code injection vectors).
 ///
-/// Shared between sandbox backends and MCP server spawning.
-pub const BLOCKED_ENV_VARS: &[&str] = &[
-    // Linux: shared library injection
-    "LD_PRELOAD",
-    "LD_LIBRARY_PATH",
-    "LD_AUDIT",
-    // macOS: dylib injection
-    "DYLD_INSERT_LIBRARIES",
-    "DYLD_LIBRARY_PATH",
-    "DYLD_FRAMEWORK_PATH",
-    "DYLD_FALLBACK_LIBRARY_PATH",
-    "DYLD_VERSIONED_LIBRARY_PATH",
-    // Runtime-specific code injection
-    "NODE_OPTIONS",
-    "PYTHONSTARTUP",
-    "PYTHONPATH",
-    "PERL5OPT",
-    "RUBYOPT",
-    "RUBYLIB",
-    "JAVA_TOOL_OPTIONS",
-    // Shell startup injection
-    "BASH_ENV",
-    "ENV",
-    "ZDOTDIR",
-];
+/// Shared between sandbox backends and MCP server spawning. The canonical list
+/// lives in [`octos_core::env_hygiene`] (the bottom crate) so octos-core's own
+/// controller-side git ops sanitize against the SAME set; re-exported here so
+/// every existing `octos_agent::sandbox::BLOCKED_ENV_VARS` reference is unchanged.
+pub use octos_core::env_hygiene::BLOCKED_ENV_VARS;
 
 /// Sandbox configuration.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -79,6 +59,23 @@ pub struct SandboxConfig {
     /// writable behaviour for configs that never set this field.
     #[serde(default = "default_enabled")]
     pub workspace_write: bool,
+
+    /// Additionally grant the shell WRITE to a repository's `.git` common dir,
+    /// beyond the cwd (default: `None`). `Some(<repo>/.git)` is set from a fleet
+    /// worker's `FsGrant::Host` — the OPERATOR's explicit trust decision: a
+    /// Host-granted worktree worker's `git commit` must reach `<repo>/.git`
+    /// (objects/refs/worktree-admin), which lives OUTSIDE its checkout cwd. It is
+    /// a TARGETED bind, NOT full-`/`: bwrap adds `--bind <repo>/.git <repo>/.git`
+    /// (rw) on top of the usual system-ro / tmpfs / cwd binds — so NO host
+    /// AF_UNIX socket (`SSH_AUTH_SOCK`, `/var/run/docker.sock`) is ever exposed —
+    /// and macOS emits `(allow file-write* (subpath "<repo>/.git"))` alongside the
+    /// cwd grant (viable only under an unrestricted-read profile, since git must
+    /// also READ `<repo>/.git`). Docker, Landlock, and AppContainer ignore it
+    /// (the fleet worktree flow is gated to bwrap / full-read macOS). The default
+    /// (`None`) preserves today's cwd-only-writable behaviour for every config
+    /// that never sets it.
+    #[serde(default)]
+    pub repo_git_write: Option<PathBuf>,
 
     /// Docker-specific settings (used when mode = "docker").
     #[serde(default)]
@@ -112,6 +109,13 @@ pub(crate) const DEFAULT_READ_ALLOW_PATHS: &[&str] = &[
     "/tmp",
     "/var/tmp",
     "/etc", // system config (needed for DNS resolution, etc.)
+    // macOS `/etc` is a symlink to `/private/etc`, and SBPL subpath rules match
+    // the CANONICAL path — so the `/etc` entry above never covers a real read of
+    // `/private/etc/...`. Without this, TLS clients that resolve via the symlink
+    // (system `curl`/LibreSSL reading `/etc/ssl/openssl.cnf` + `cert.pem`) fail at
+    // init with a confusing "Operation not permitted" — very visible now that
+    // network is allowed by default. Mirrors the `/tmp` + `/private/tmp` pairing.
+    "/private/etc",
     "/dev/null",
     "/dev/urandom",
     "/dev/random",
@@ -124,6 +128,7 @@ impl Default for SandboxConfig {
             mode: SandboxMode::Auto,
             allow_network: false,
             workspace_write: true,
+            repo_git_write: None,
             docker: DockerConfig::default(),
             read_allow_paths: Vec::new(),
             profile_name: None,
@@ -244,6 +249,21 @@ pub trait Sandbox: Send + Sync {
     fn is_docker(&self) -> bool {
         false
     }
+
+    /// Whether this backend can grant WRITE to a repo's `.git` common dir
+    /// ([`SandboxConfig::repo_git_write`]) TOGETHER WITH the reads git also needs
+    /// — the capability the fleet worktree flow probes at serve boot. bwrap can
+    /// (a targeted `--bind <repo>/.git <repo>/.git` plus its read binds); macOS
+    /// can ONLY under an unrestricted-read profile (a restricted-read profile
+    /// would grant the `<repo>/.git` write but deny the `<repo>/.git` READ
+    /// `git commit` needs); Docker, Landlock, AppContainer, and [`NoSandbox`]
+    /// cannot, so the pool falls back to a scratch workspace (no worktree, no
+    /// lost deliverable). The pool gate ANDs this with `FsGrant::Host` and a git
+    /// controller root. This is the surviving kernel of the parked
+    /// `honors_write_allow_paths`.
+    fn supports_repo_git_write(&self) -> bool {
+        false
+    }
 }
 
 /// No-op sandbox: executes commands directly.
@@ -282,6 +302,7 @@ pub fn create_sandbox(config: &SandboxConfig) -> Box<dyn Sandbox> {
         SandboxMode::Bwrap => Box::new(BwrapSandbox {
             allow_network: config.allow_network,
             workspace_write: config.workspace_write,
+            repo_git_write: config.repo_git_write.clone(),
         }),
         SandboxMode::Landlock => {
             #[cfg(target_os = "linux")]
@@ -305,6 +326,7 @@ pub fn create_sandbox(config: &SandboxConfig) -> Box<dyn Sandbox> {
             allow_network: config.allow_network,
             read_allow_paths: config.read_allow_paths.clone(),
             workspace_write: config.workspace_write,
+            repo_git_write: config.repo_git_write.clone(),
         }),
         SandboxMode::Docker => Box::new(DockerSandbox {
             config: config.docker.clone(),
@@ -377,6 +399,7 @@ fn create_auto_sandbox(config: &SandboxConfig) -> Box<dyn Sandbox> {
                 allow_network: config.allow_network,
                 read_allow_paths: config.read_allow_paths.clone(),
                 workspace_write: config.workspace_write,
+                repo_git_write: config.repo_git_write.clone(),
             });
         }
     }
@@ -387,6 +410,7 @@ fn create_auto_sandbox(config: &SandboxConfig) -> Box<dyn Sandbox> {
             return Box::new(BwrapSandbox {
                 allow_network: config.allow_network,
                 workspace_write: config.workspace_write,
+                repo_git_write: config.repo_git_write.clone(),
             });
         }
         if linux_container_sandbox_available() {
@@ -684,6 +708,7 @@ mod tests {
             mode: SandboxMode::None,
             allow_network: false,
             workspace_write: true,
+            repo_git_write: None,
             docker: DockerConfig::default(),
             read_allow_paths: Vec::new(),
             profile_name: None,

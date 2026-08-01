@@ -396,6 +396,22 @@ Session, turn, and approval core:
 - `session/compact/mode/set` (per-session LLM-vs-heuristic compaction mode; the `/context` menu)
 - `turn/start`
 - `turn/interrupt`
+- `turn/steer` (mid-turn prompt injection into the ACTIVE turn, codex
+  app-server parity. Params `{session_id, expected_turn_id?, input}`,
+  result `{turn_id, steered}`. With a live turn the text input items are
+  pushed into that turn's pending-input buffer under the active-turns
+  registry lock; the agent loop drains them FIFO at its next iteration
+  boundary — before the next LLM call — as plain `role: user` messages
+  with no wrapper text, persisting each through the canonical session
+  path so the standard v2 `UserMessage` envelope announces the fold-in;
+  a steer landing after the model's final answer forces one more round
+  in the SAME turn. Returns `steered: true` + the ACTIVE turn id. An
+  `expected_turn_id` naming a different turn → `invalid_params`; a live
+  non-steerable turn (review/fixture) → `invalid_request`. With no live
+  turn the call falls back to the ordinary `turn/start` admission and
+  returns `steered: false` + the NEW turn id. Raw server-handled method
+  — session-ingress credentials cannot call it, and steering is NOT an
+  interrupt: `turn/interrupt` stays the separate cancel op)
 - `turn/state/get` (gate `state.turn_state_get.v1`, accepted `UPCR-2026-011`)
 - `thread/graph/get` (gate `state.thread_graph.v1`, accepted `UPCR-2026-010`)
 - `approval/respond`
@@ -441,6 +457,14 @@ Launch (per-project session UX, gated `session.workspace_cwd.v1`):
 
 - `launch/resolve`
 
+Smart-home bridge integration (gated `smart_home.v1`; auth-bound — omitted
+from the stdio capability set and reported unsupported per § stdio policy,
+same as `memory/overview` / `cron/list` above):
+
+- `smart_home/status.get`, `smart_home/device.list`,
+  `smart_home/device.command`, `smart_home/camera.stream_start`,
+  `smart_home/camera.stream_stop`
+
 Runtime, auth, profile, and onboarding inspection (server-handled
 `APPUI_EXTRA_METHODS`):
 
@@ -454,6 +478,25 @@ Runtime, auth, profile, and onboarding inspection (server-handled
 - `profile/llm/catalog`, `profile/llm/list`, `profile/llm/upsert`,
   `profile/llm/select`, `profile/llm/delete`, `profile/llm/test`,
   `profile/llm/fetch_models` (accepted `UPCR-2026-017`)
+- `profile/sub_providers/list`, `profile/sub_providers/upsert`,
+  `profile/sub_providers/remove` (named provider lanes for per-node pipeline
+  routing — e.g. `deep_research`'s isolated `cheap`/`strong` lanes)
+- `snapshot/list`, `snapshot/restore` (#1768 workspace snapshot undo: list
+  the session workspace's pre-mutation undo points; restore rolls the
+  workspace back — refused while a turn is in flight, itself undoable via
+  the automatic pre-restore snapshot)
+- `peer/prepare` (#1800 peer-agent spin-off staging: writes the durable task
+  brief under the profile data dir (`peers/<slug>/brief.md`) and optionally
+  creates a fenced git worktree on branch `peer/<slug>`; returns
+  `{slug, topic, brief_path, cwd, worktree_branch?, profile_id}`. Pure
+  resource staging — the client then opens the peer session and starts the
+  kickoff turn through the ordinary `session/open` + `turn/start`; #1801 v2
+  adds `n` (1..=8) for fleet staging — N suffixed slugs from ONE brief, the
+  scalar result fields mirror the first peer and `peers: [...]` carries all)
+- `peer/gather` (#1801 v2 blackboard read: per staged peer its brief + the
+  latest `result.md` — written server-side on every peer-session turn
+  terminal — with per-field truncation flags and `result_updated_unix`;
+  optional `slugs` filter)
 - `profile/skills/list`, `profile/skills/registry/search`,
   `profile/skills/install`, `profile/skills/remove` (server-handled skills
   management)
@@ -559,6 +602,23 @@ M15 agent/goal/loop autonomy (accepted `UPCR-2026-021`):
 M16 context lifecycle (gate `context.lifecycle.v1`):
 
 - `context/compaction_completed`, `context/compaction_started`, `context/normalization_reported`
+
+Peer staging (#1801 v3, ungated):
+
+- `peer/staged` — agent-initiated peer staging: the model's `peer_handoff`
+  tool staged a sovereign peer session server-side (durable brief + optional
+  fenced worktree), and the client auto-opens the staged session (topic
+  `peer-<slug>`) in the background. `params` carry the ORIGINATING
+  `session_id` plus `topic`, `slug`, `brief`, `brief_path`, `cwd`,
+  `worktree_branch?`, and `profile_id` — the same facts a `peer/prepare`
+  result entry carries. Durable: reconnect replay redelivers it, so clients
+  dedup by existing session for the topic.
+- `peer/closed` — agent-initiated peer teardown: the model's `peer_close`
+  tool retired a staged peer (durable brief and optional fenced worktree
+  evicted), so the client tears down the peer pane it opened (topic
+  `peer-<slug>`). `params` carry the ORIGINATING `session_id` plus `topic`,
+  `slug`, and `profile_id`. Durable: reconnect replay redelivers it, so
+  clients dedup by the already-closed peer for the topic.
 
 ## 7. Command Semantics
 

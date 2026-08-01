@@ -48,6 +48,15 @@ pub struct Config {
     #[serde(default)]
     pub env_vars: std::collections::HashMap<String, String>,
 
+    /// When true, [`Config::get_api_key`] skips the global `AuthStore` lookup so
+    /// an explicitly-supplied key (e.g. the `env_vars`-injected key the
+    /// `octos-ffi` embedding API passes) is authoritative and cannot be silently
+    /// shadowed by a host's `octos auth login` credentials for the same
+    /// provider. Internal, not (de)serialized; default `false` preserves the
+    /// CLI / gateway resolution order.
+    #[serde(skip)]
+    pub bypass_auth_store: bool,
+
     /// Override auto-detected model behavior hints for the OpenAI provider.
     /// Useful for custom/unknown models behind OpenAI-compatible proxies.
     #[serde(default)]
@@ -76,6 +85,15 @@ pub struct Config {
     #[serde(default)]
     pub sandbox: octos_agent::SandboxConfig,
 
+    /// Workspace snapshot-undo configuration (#1768). Opt-in: when
+    /// `snapshots.enabled` is true, the agent records a git-backed
+    /// snapshot of the workspace (into a separate git dir under
+    /// `<data_dir>/snapshots/`, never the user's own `.git`) before each
+    /// mutating tool batch. Absent or `enabled: false` (the default) =
+    /// feature off.
+    #[serde(default)]
+    pub snapshots: Option<octos_agent::SnapshotConfig>,
+
     /// Tool access policy (allow/deny lists with group and wildcard support).
     #[serde(default)]
     pub tool_policy: Option<octos_agent::ToolPolicy>,
@@ -101,6 +119,15 @@ pub struct Config {
     /// Maximum agent iterations per message (overridden by --max-iterations).
     #[serde(default)]
     pub max_iterations: Option<u32>,
+
+    /// Post-edit formatting (issue #1774): when true, a successful
+    /// `edit_file` / `write_file` / `diff_edit` runs the file's language
+    /// formatter (rustfmt / prettier / black / gofmt) and returns the
+    /// formatted content in the tool result. Formatters run file-scoped with
+    /// a sanitized environment and a hard 5s timeout; a missing binary or a
+    /// formatter failure never fails the edit. Default: false (opt-in).
+    #[serde(default)]
+    pub format_after_edit: bool,
 
     /// Lifecycle hooks for agent events.
     #[serde(default)]
@@ -596,6 +623,13 @@ pub struct EmbeddingConfig {
     /// output differs or its vectors are dropped to BM25-only.
     #[serde(default)]
     pub dimensions: Option<u32>,
+
+    /// Path to the local `.gguf` file for the in-process `llamacpp` provider
+    /// (feature `embed-llama`; add `embed-llama-metal` / `embed-llama-cuda` to
+    /// offload). Any GGUF embedding model works, e.g.
+    /// `ggml-org/embeddinggemma-300M-GGUF`. Ignored by remote providers.
+    #[serde(default)]
+    pub model_path: Option<String>,
 }
 
 fn default_embedding_provider() -> String {
@@ -1679,7 +1713,16 @@ impl Config {
         //    legacy path differs from config_home (so we don't double-check the
         //    same file). Explicit/tenant contexts never reach here.
         if is_default {
-            if let Some(home) = dirs::home_dir() {
+            // Prefer an explicit `HOME` before the OS profile dir so the legacy
+            // `~/.octos` lookup is testable and user-overridable on Windows,
+            // where `dirs::home_dir()` reads FOLDERID_Profile and ignores
+            // `HOME`/`USERPROFILE`. On Unix `dirs::home_dir()` already consults
+            // `HOME`, so this is behaviour-preserving there.
+            let legacy_home = std::env::var_os("HOME")
+                .filter(|value| !value.is_empty())
+                .map(PathBuf::from)
+                .or_else(dirs::home_dir);
+            if let Some(home) = legacy_home {
                 let legacy_config = home.join(".octos").join("config.json");
                 if legacy_config != home_config && legacy_config.exists() {
                     tracing::info!(
@@ -1925,11 +1968,16 @@ impl Config {
         // independent of `--data-dir`, so per-profile gateways keep the host's
         // shared `octos auth login` credentials. We resolve the context with no
         // cli_data_dir because auth_home never depends on it.
-        let auth_home = crate::config_context::resolve_config_context(None).auth_home;
-        if let Ok(store) = crate::auth::AuthStore::at(&auth_home) {
-            if let Some(cred) = store.get(provider) {
-                if !cred.is_expired() {
-                    return Ok(cred.access_token.clone());
+        //
+        // `bypass_auth_store` opts out (used by octos-ffi): a caller that passed
+        // an explicit key must have it win over any ambient login credential.
+        if !self.bypass_auth_store {
+            let auth_home = crate::config_context::resolve_config_context(None).auth_home;
+            if let Ok(store) = crate::auth::AuthStore::at(&auth_home) {
+                if let Some(cred) = store.get(provider) {
+                    if !cred.is_expired() {
+                        return Ok(cred.access_token.clone());
+                    }
                 }
             }
         }
@@ -2101,6 +2149,26 @@ mod tests {
     /// SAME mutex — per-module locks would let env-mutating tests race across
     /// modules (a flaky-failure source).
     use crate::config_context::TEST_ENV_LOCK as HOME_ENV_LOCK;
+
+    #[test]
+    fn should_parse_snapshots_config_and_default_to_off_when_absent() {
+        // Absent → None (feature off, #1768 opt-in contract).
+        let config: Config = serde_json::from_str("{}").unwrap();
+        assert!(config.snapshots.is_none());
+
+        let config: Config =
+            serde_json::from_str(r#"{"snapshots": {"enabled": true, "keep_last": 7}}"#).unwrap();
+        let snapshots = config.snapshots.expect("snapshots block parsed");
+        assert!(snapshots.enabled);
+        assert_eq!(snapshots.keep_last, 7);
+
+        // Partial block keeps the documented defaults.
+        let config: Config = serde_json::from_str(r#"{"snapshots": {"enabled": true}}"#).unwrap();
+        assert_eq!(
+            config.snapshots.unwrap().keep_last,
+            octos_agent::DEFAULT_SNAPSHOT_KEEP_LAST
+        );
+    }
 
     #[test]
     fn write_mutation_creates_file_with_pretty_json() {
@@ -2810,6 +2878,21 @@ mod tests {
         let json = r#"{"provider": "anthropic"}"#;
         let config: Config = serde_json::from_str(json).unwrap();
         assert!(config.tool_policy_by_provider.is_empty());
+    }
+
+    #[test]
+    fn should_default_format_after_edit_to_false_when_absent() {
+        // #1774: post-edit formatting is strictly opt-in.
+        let json = r#"{"provider": "anthropic"}"#;
+        let config: Config = serde_json::from_str(json).unwrap();
+        assert!(!config.format_after_edit);
+    }
+
+    #[test]
+    fn should_deserialize_format_after_edit_opt_in() {
+        let json = r#"{"provider": "anthropic", "format_after_edit": true}"#;
+        let config: Config = serde_json::from_str(json).unwrap();
+        assert!(config.format_after_edit);
     }
 
     #[test]

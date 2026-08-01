@@ -12,6 +12,8 @@
 //! - A before-hook can read `domain_data.force_n` from stdin JSON and exit 1
 //!   to deny a `BeforeSpawnVerify` event.
 
+#![cfg(unix)]
+
 use std::io::Write as _;
 use std::os::unix::fs::PermissionsExt;
 use std::sync::Arc;

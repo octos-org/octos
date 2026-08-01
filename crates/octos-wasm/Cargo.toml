@@ -1,0 +1,76 @@
+[package]
+name = "octos-wasm"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Browser/JS (wasm-bindgen) client-side binding for octos's protocol + utility types (octos-core). The agent loop runs server-side via `octos serve`."
+
+[lib]
+# cdylib -> the `.wasm` module `wasm-pack` + JS bundlers load in the browser.
+# rlib   -> lets the pure-logic layer be exercised by plain host `cargo test`
+#           (so `cargo test --workspace` covers this crate on the host target).
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# The leaf protocol/utility crate. This is the ONLY octos crate that is
+# browser-safe: its deps are pure (serde/serde_json/chrono/uuid/eyre/tracing/
+# sha2). The heavier crates (octos-agent/octos-memory/octos-llm) pull redb,
+# tokio rt-multi-thread, native TLS and a C++ embedder and CANNOT target
+# `wasm32-unknown-unknown` — see README.md.
+octos-core = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+# wasm-bindgen 0.2 already resolves in the workspace lock (transitively via the
+# native uuid/chrono `js`/`wasmbind` paths); pin the same major here.
+wasm-bindgen = "0.2"
+# Ergonomic JS objects <-> serde types (returns/accepts plain JS objects, not
+# ES `Map`s, via the `json_compatible()` serializer).
+serde-wasm-bindgen = "0.6"
+# Reflection over incoming JS params (strict finite-JSON validation before
+# encoding). Compiles on the host target too (unused there); already resolved
+# transitively via serde-wasm-bindgen/chrono.
+js-sys = "0.3"
+
+# ---------------------------------------------------------------------------
+# wasm feature-gating (the required fix).
+#
+# A naive `cargo build --target wasm32-unknown-unknown -p octos-core` FAILS:
+#   uuid: "specify a source of randomness using one of the js, rng-getrandom,
+#          or rng-rand features"
+# because on `wasm32-unknown-unknown` uuid gates `getrandom` OFF and needs a
+# browser randomness/time source instead. Declaring these deps HERE (only for
+# the wasm target) makes Cargo's feature unification add `js`/`wasmbind` to the
+# SAME uuid/chrono packages octos-core already depends on:
+#   * uuid `js`     -> WebCrypto randomness + `Date.now()` for `Uuid::now_v7()`
+#                      (TaskId::new / ClientMessageId::generate). `js` alone is
+#                      sufficient on `wasm32-unknown-unknown` — uuid uses
+#                      wasm-bindgen directly, so no extra `getrandom/js` is
+#                      needed.
+#   * chrono `wasmbind` -> `Utc::now()` via JS `Date` (Message constructors,
+#                      gateway, ui_protocol all call `Utc::now()`). `wasmbind`
+#                      is already a chrono default feature, but pin it
+#                      explicitly so a future `default-features = false` in the
+#                      workspace cannot silently break the wasm build.
+# On the host target these lines are absent, so the native (getrandom/SystemTime)
+# code paths are used unchanged — the host build is unaffected.
+# ---------------------------------------------------------------------------
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+uuid = { version = "1", features = ["js"] }
+chrono = { version = "0.4", features = ["wasmbind"] }
+# Dev-friendly panics: routes Rust panics to `console.error` with a stack.
+# Installed by `start()`. wasm-only so the host build never pulls it.
+console_error_panic_hook = "0.1"
+
+[target.'cfg(target_arch = "wasm32")'.dev-dependencies]
+wasm-bindgen-test = "0.3"
+
+# Inherits the workspace `deny(unsafe_code)`. The `#[wasm_bindgen]` macro
+# expands to `unsafe` glue (exported shims + pointer marshalling across the JS
+# boundary), so the crate root opts out with `#![allow(unsafe_code)]` — the
+# same rationale as `octos-ffi`. This crate writes NO hand-unsafe code of its
+# own; see the SAFETY note at the top of src/lib.rs.
+[lints]
+workspace = true

@@ -1277,6 +1277,11 @@ impl ToolRegistry {
         registry.register(WorkspaceLogTool::new(cwd));
         registry.register(WorkspaceShowTool::new(cwd));
         registry.register(WorkspaceDiffTool::new(cwd));
+        // #1772 (lite): project static-check with compact diagnostics.
+        // Shares the session sandbox with shell/exec/bash — `cargo check`
+        // executes build.rs/proc-macros (project-controlled code), so it
+        // must be confined like any shell command (#1607).
+        registry.register(super::CheckTool::new(cwd).with_shared_sandbox(registry.sandbox.clone()));
         #[cfg(feature = "git")]
         registry.register(super::GitTool::new(cwd));
         #[cfg(feature = "ast")]
@@ -1388,6 +1393,10 @@ impl ToolRegistry {
         "workspace_log",
         "workspace_show",
         "workspace_diff",
+        // #1772 (lite): `check` detects the project (Cargo.toml / tsconfig /
+        // go.mod) at its bound workspace root and runs the checker there, so
+        // a re-scoped session must re-register it against the new root.
+        "check",
         // #972 / M14-B P1: `view_image` reads files from the workspace and
         // must follow `rebind_cwd` so a session targeting a new project root
         // does not leak previously bound paths.
@@ -1476,6 +1485,11 @@ impl ToolRegistry {
         registry.register(WorkspaceLogTool::new(cwd));
         registry.register(WorkspaceShowTool::new(cwd));
         registry.register(WorkspaceDiffTool::new(cwd));
+        // #1772 (lite): `check` detects the project type from the workspace
+        // root, so it must follow `rebind_cwd` like the other cwd-bound
+        // tools — and it re-binds to the NEW session sandbox stored just
+        // above, in lockstep with the shell/exec/bash re-registrations.
+        registry.register(super::CheckTool::new(cwd).with_shared_sandbox(registry.sandbox.clone()));
         #[cfg(feature = "git")]
         registry.register(super::GitTool::new(cwd));
         #[cfg(feature = "ast")]
@@ -1808,6 +1822,87 @@ mod cwd_isolation_tests {
         );
     }
 
+    #[tokio::test]
+    async fn should_register_check_tool_and_rebind_its_cwd() {
+        let initial_cwd = tempfile::tempdir().expect("create temp dir");
+        let registry =
+            ToolRegistry::with_builtins_and_sandbox(initial_cwd.path(), Box::new(NoSandbox));
+        assert!(
+            registry.get("check").is_some(),
+            "check must be a builtin tool"
+        );
+
+        // `check` is cwd-bound: after a rebind it must detect the project at
+        // the NEW workspace root (the empty new cwd → "no supported project"),
+        // not the old one.
+        let new_cwd = tempfile::tempdir().expect("create temp dir");
+        std::fs::write(initial_cwd.path().join("go.mod"), "module old").unwrap();
+        let rebound = registry.rebind_cwd(new_cwd.path(), Box::new(NoSandbox));
+        let tr = rebound
+            .execute("check", &serde_json::json!({}))
+            .await
+            .expect("check dispatch");
+        assert!(tr.success, "no-project answer is a success: {}", tr.output);
+        assert!(
+            tr.output.contains("no supported project detected"),
+            "rebound check must look at the NEW cwd: {}",
+            tr.output
+        );
+    }
+
+    /// Review #1772 (high): `check` spawns cargo/tsc/go, which execute
+    /// project-controlled code (build.rs / proc-macros), so BOTH registry
+    /// constructors must hand it the session sandbox — same lockstep as
+    /// shell/exec/bash. The marker sandbox replaces the wrapped command
+    /// with an echo, so the marker in the output proves the checker went
+    /// through `Sandbox::wrap_command` instead of a direct host spawn.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn should_confine_check_tool_to_session_sandbox_on_build_and_rebind() {
+        struct MarkerSandbox;
+        impl Sandbox for MarkerSandbox {
+            fn wrap_command(
+                &self,
+                command: &str,
+                cwd: &std::path::Path,
+            ) -> tokio::process::Command {
+                let mut cmd = tokio::process::Command::new("sh");
+                cmd.arg("-c")
+                    .arg(format!("echo \"SANDBOX-WRAPPED: {command}\"; exit 7"))
+                    .current_dir(cwd);
+                cmd
+            }
+        }
+
+        // `cargo` resolves from PATH — always present under `cargo test` —
+        // but the marker sandbox substitutes the command, so no real
+        // checker ever runs.
+        let cwd = tempfile::tempdir().expect("create temp dir");
+        std::fs::write(cwd.path().join("Cargo.toml"), b"[package]").unwrap();
+
+        let registry = ToolRegistry::with_builtins_and_sandbox(cwd.path(), Box::new(MarkerSandbox));
+        let tr = registry
+            .execute("check", &serde_json::json!({}))
+            .await
+            .expect("check dispatch");
+        assert!(
+            tr.output.contains("SANDBOX-WRAPPED"),
+            "with_builtins must confine check to the session sandbox: {}",
+            tr.output
+        );
+
+        let rebound = registry.rebind_cwd(cwd.path(), Box::new(MarkerSandbox));
+        let tr = rebound
+            .execute("check", &serde_json::json!({}))
+            .await
+            .expect("check dispatch");
+        assert!(
+            tr.output.contains("SANDBOX-WRAPPED"),
+            "rebind_cwd must re-hand the session sandbox to check: {}",
+            tr.output
+        );
+    }
+
     #[test]
     fn set_workspace_root_records_path_for_session_tool_registry_fallback() {
         let mut reg = ToolRegistry::new();
@@ -1826,16 +1921,15 @@ mod registry_dispatch_tests {
     use super::*;
     use std::path::PathBuf;
 
-    // RFC-0 (#1289): LRU lifecycle was removed. `make_registry` keeps its
-    // two-argument shape purely so the surviving dispatch/spawn_only/policy
-    // tests below compile unchanged; the arguments are ignored.
-    fn make_registry(_max_active: usize, _idle_threshold: u32) -> ToolRegistry {
+    // RFC-0 (#1289): LRU tool-lifecycle deferral was removed, so this helper no
+    // longer carries the old `(max_active, idle_threshold)` tuning knobs.
+    fn make_registry() -> ToolRegistry {
         ToolRegistry::with_builtins(PathBuf::from("/tmp"))
     }
 
     #[test]
     fn spawn_only_message_uses_runtime_output_dir_hint() {
-        let mut reg = make_registry(5, 3);
+        let mut reg = make_registry();
         reg.mark_spawn_only("mofa_slides", None);
         reg.set_output_dir_hint("/tmp/octos-profile/skill-output");
 
@@ -1846,7 +1940,7 @@ mod registry_dispatch_tests {
 
     #[test]
     fn spawn_only_handle_message_returns_task_handle_envelope() {
-        let mut reg = make_registry(5, 3);
+        let mut reg = make_registry();
         reg.mark_spawn_only("search", None);
         reg.set_output_dir_hint("/tmp/octos/skill-output");
 
@@ -1883,7 +1977,7 @@ mod registry_dispatch_tests {
         // Codex round 2 P2: visibility helper must mirror the same filters
         // `specs()` applies, so the spawn_only intercept does not advertise
         // a tool the provider policy hid from the LLM's tool list.
-        let mut reg = make_registry(5, 3);
+        let mut reg = make_registry();
         // After make_registry, "shell" exists.
         assert!(reg.is_tool_visible("shell"));
 
@@ -1901,7 +1995,7 @@ mod registry_dispatch_tests {
 
     #[tokio::test]
     async fn spawn_agent_execution_policy_is_equivalent_to_spawn_alias() {
-        let mut reg = make_registry(5, 3);
+        let mut reg = make_registry();
         reg.set_provider_policy(ToolPolicy {
             deny: vec!["spawn".to_owned()],
             ..Default::default()
@@ -1922,7 +2016,7 @@ mod registry_dispatch_tests {
         };
         assert!(denied.to_string().contains("denied by provider policy"));
 
-        let mut reg = make_registry(5, 3);
+        let mut reg = make_registry();
         reg.set_provider_policy(ToolPolicy {
             allow: vec!["spawn".to_owned()],
             ..Default::default()
@@ -1944,7 +2038,7 @@ mod registry_dispatch_tests {
 
     #[test]
     fn is_tool_visible_returns_false_for_unregistered_tools() {
-        let reg = make_registry(5, 3);
+        let reg = make_registry();
         assert!(!reg.is_tool_visible("nope_does_not_exist"));
     }
 
@@ -1954,7 +2048,7 @@ mod registry_dispatch_tests {
         // the getter the project-root validator path calls must return a no-op
         // sandbox — `ValidatorRunner` then runs command validators' argv
         // directly, keeping host behavior unchanged where no backend exists.
-        let reg = make_registry(5, 3);
+        let reg = make_registry();
         assert!(
             reg.sandbox().is_noop(),
             "registry built without a real sandbox must expose a no-op sandbox"
@@ -1996,7 +2090,7 @@ mod registry_dispatch_tests {
     fn should_permit_all_tools_when_no_provider_policy_is_set() {
         // #1607 (P2): with no provider policy the permit predicate is a no-op,
         // so `MapToolDispatcher::from_registry` snapshots every tool.
-        let reg = make_registry(5, 3);
+        let reg = make_registry();
         assert!(reg.provider_policy_permits("shell"));
         assert!(reg.provider_policy_permits("read_file"));
     }
@@ -2006,7 +2100,7 @@ mod registry_dispatch_tests {
         // #1607 (P2): the permit predicate must mirror the deny-wins semantics
         // (with alias equivalence) that `execute` enforces, so a project-root
         // ToolCall validator can't reach a denied tool via the snapshot.
-        let mut reg = make_registry(5, 3);
+        let mut reg = make_registry();
         reg.set_provider_policy(ToolPolicy {
             deny: vec!["spawn".to_string()],
             ..Default::default()
@@ -2024,7 +2118,7 @@ mod registry_dispatch_tests {
     fn should_permit_only_allowlisted_tools_when_allow_list_is_set() {
         // #1607 (P2): a non-empty allow list means only listed (or
         // alias-equivalent) tools are permitted.
-        let mut reg = make_registry(5, 3);
+        let mut reg = make_registry();
         reg.set_provider_policy(ToolPolicy {
             allow: vec!["read_file".to_string()],
             ..Default::default()
@@ -2040,7 +2134,7 @@ mod registry_dispatch_tests {
     fn spawn_only_handle_message_payload_stays_under_one_kb() {
         // Phase 4 acceptance criterion: spawn_only tool result in agent
         // context is < 1KB (was 50KB+).
-        let mut reg = make_registry(5, 3);
+        let mut reg = make_registry();
         reg.mark_spawn_only("search", None);
 
         let payload = reg.spawn_only_handle_message("search", "task_xyz", &[]);

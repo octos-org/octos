@@ -26,7 +26,7 @@
     - [时钟](#126-时钟)
     - [天气](#127-天气)
     - [微信桥接](#128-微信桥接wechat-bridge)
-    - [Pipeline Guard](#129-pipeline-guard)
+    - [智能家居](#129-智能家居)
     - [Skill Evolve](#1210-skill-evolve)
     - [Harness Starter](#1211-harness-starter启动模板)
 13. [平台技能 (ASR/TTS)](#13-平台技能-asrtts)
@@ -1084,7 +1084,7 @@ octos cron enable <job-id> --disable
 
 内置应用技能作为编译好的二进制文件随 `octos` 一起发布。Gateway 启动时会写入 `<octos_home>/bundled-app-skills/<name>/`，运维或用户自定义技能安装到当前 profile 的 `~/.octos/profiles/<profile>/data/skills/`，因此重新部署不会覆盖自定义内容。完整列表见 `BUNDLED_APP_SKILLS`（`crates/octos-agent/src/bundled_app_skills.rs`）：
 
-> **自动安装的内置技能：** news、deep-search、deep-crawl、send-email、account-manager、time（二进制名 `clock`）、weather、pipeline-guard、skill-evolve。加上平台技能 `voice`。
+> **自动安装的内置技能：** news、deep-search、deep-crawl、send-email、account-manager、time（二进制名 `clock`）、weather、smart-home、skill-evolve。加上平台技能 `voice`。
 
 下文的 12.8（微信桥接）和 12.11（启动模板）描述的是 `crates/app-skills/` 下**仅在 workspace 中作为示例的 crate**，并未列入 `BUNDLED_APP_SKILLS`。它们以源码形式随仓库分发，作为模板或传输助手，不会被 gateway 自动安装为运行时技能。
 
@@ -1459,12 +1459,44 @@ export LARK_FROM_ADDRESS="your-feishu-email@company.com"
 
 为微信个人号提供 WebSocket 桥接 —— 通过 WebSocket 与微信客户端通信并把消息转发给 gateway。
 
-### 12.9 Pipeline Guard
+### 12.9 智能家居
 
-**类型：** Hook（不是工具）
-**事件：** `before_tool_call`（过滤：`run_pipeline`）
+**工具名称：** `smart_home_list_devices`、`smart_home_control_device`
+**超时：** 10 秒
+**前置条件：** 需要先为该 profile 配置好桥接（设置 → 智能家居）
+**上下文触发：** 当对话提到"智能家居"、"设备"、"灯"、"空调"、"开灯"、"关灯"、"窗帘"等关键词时激活
 
-在 `run_pipeline` 执行前校验 DOT 图并注入最佳模型分配。作为 before-hook 运行（10s 超时），可以拒绝畸形的 pipeline 提交。
+通过当前 profile 配置的桥接（如 Home Assistant）列出并控制智能家居设备（灯具、空调、窗帘、音箱等）。直接从 profile 读取桥接 URL 和 token —— 不经过正在运行的 gateway 转发。摄像头视频串流仍然是 octos-web 中面向人类、仅通过 WebSocket 提供的功能，不对 agent 开放。
+
+#### smart_home_list_devices 参数
+
+| 参数 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| `room` | 字符串 | *（无）* | 可选的房间名过滤（不区分大小写） |
+
+#### smart_home_control_device 参数
+
+| 参数 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| `device_id` | 字符串 | *（必填）* | 目标设备 ID，来自 `smart_home_list_devices` 的返回结果 |
+| `params` | 对象 | *（必填）* | 命令字段，如 `{"on": true}`、`{"brightness": 80}`、`{"temperature": 22}` |
+
+#### 聊天使用示例
+
+```
+用户：客厅里有哪些智能设备？
+
+机器人：[使用 smart_home_list_devices，room="客厅"]
+       客厅台灯 (id: lamp_1, light) — on | brightness: 80
+       客厅空调 (id: ac_1, thermostat) — on | temperature: 24
+```
+
+```
+用户：把客厅的灯调暗一点
+
+机器人：[使用 smart_home_control_device，device_id="lamp_1"，params={"brightness": 30}]
+       Sent to lamp_1: brightness=30
+```
 
 ### 12.10 Skill Evolve
 
@@ -1971,12 +2003,24 @@ chmod +x .octos/skills/translator/main
   // 智能体设置
   "max_iterations": 50,
 
-  // 嵌入（用于记忆中的向量搜索）
+  // 嵌入（用于记忆中的向量搜索）。
+  // 远程，OpenAI 兼容：
   "embedding": {
     "provider": "openai",
     "api_key_env": "OPENAI_API_KEY",
-    "base_url": null
+    "base_url": null,
+    "model": null,       // 默认 text-embedding-3-small（1536 维）
+    "dimensions": null   // 模型原生维度不同时，用它固定输出维度
   },
+  // 或者进程内运行，不需要 API key，通过 llama.cpp 跑任意 GGUF 模型。
+  // 需要用 `--features embed-llama` 编译（加 embed-llama-metal / -cuda
+  // 可以走 GPU），否则用 CPU。换 provider 或换模型会改变向量维度，
+  // 已有索引会失效。切换后要重新生成已存 episode 的向量，否则它们的
+  // 召回会悄悄退化成只有 BM25。
+  // "embedding": {
+  //   "provider": "llamacpp",
+  //   "model_path": "/path/to/embeddinggemma-300M-Q8_0.gguf"
+  // },
 
   // 语音
   "voice": {
@@ -2101,7 +2145,7 @@ chmod +x .octos/skills/translator/main
 │   ├── account-manager/        # 子账户管理
 │   ├── time/                   # 时间 / 时区（二进制名 "clock"）
 │   ├── weather/                # Open-Meteo 天气
-│   ├── pipeline-guard/         # DOT pipeline 前置 hook 校验
+│   ├── smart-home/             # 通过 profile 桥接列出/控制设备
 │   └── skill-evolve/           # SKILL.md 补丁队列（前台）
 ├── skills/                     # 用户安装的自定义技能
 │   │                           #（优先级：项目 > 配置 > 全局；重新部署不覆盖）。
