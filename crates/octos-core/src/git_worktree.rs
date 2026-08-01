@@ -1194,7 +1194,7 @@ mod tests {
         assert!(
             GIT_BIN.is_absolute(),
             "GIT_BIN must be absolute, got {:?}",
-            &*GIT_BIN
+            *GIT_BIN
         );
     }
 
