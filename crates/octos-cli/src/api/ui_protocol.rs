@@ -11758,28 +11758,31 @@ async fn raw_peer_prepare(
     Ok(Value::Object(result))
 }
 
-/// Roll back a half-staged peer fleet: remove every reserved dir, then
-/// best-effort `git worktree prune` + `branch -D peer/<slug>` for each (a
-/// worktree that WAS created for an earlier fleet member must not leak when
-/// a later member fails; both are no-ops for members that never got one).
+/// Roll back a half-staged peer fleet: unregister and remove every reserved
+/// member, then best-effort `branch -D peer/<slug>` for each (a worktree that
+/// WAS created for an earlier fleet member must not leak when a later member
+/// fails; all are no-ops for members that never got one).
+///
+/// Each member is torn down through [`remove_peer_worktree`], which is scoped to
+/// that member's own path — NOT the repo-global `git worktree prune` this used
+/// to run, which also deleted the fence of any peer outside this fleet that
+/// happened to be mid-`worktree add`.
 async fn cleanup_staged_peers(workspace_root: &Path, staged: &[(String, PathBuf)]) {
-    for (_, dir) in staged {
-        let _ = std::fs::remove_dir_all(dir);
-    }
     if staged.is_empty() {
         return;
     }
     let root = workspace_root.to_path_buf();
+    let dirs: Vec<PathBuf> = staged.iter().map(|(_, dir)| dir.clone()).collect();
     let branches: Vec<String> = staged
         .iter()
         .map(|(slug, _)| format!("peer/{slug}"))
         .collect();
     let _ = tokio::task::spawn_blocking(move || {
-        let _ = std::process::Command::new("git")
-            .arg("-C")
-            .arg(&root)
-            .args(["worktree", "prune"])
-            .output();
+        for dir in &dirs {
+            // Unregister BEFORE deleting: `git worktree remove` resolves by path.
+            remove_peer_worktree(&root, dir);
+            let _ = std::fs::remove_dir_all(dir);
+        }
         for branch in &branches {
             let _ = std::process::Command::new("git")
                 .arg("-C")
@@ -11931,17 +11934,96 @@ fn stage_peer(
     })
 }
 
-/// Roll back ONE half-staged peer: remove its reserved dir, then
-/// best-effort `git worktree prune` + `branch -D peer/<slug>` (both no-ops
-/// for a member that never got a worktree). The single-member synchronous
-/// sibling of [`cleanup_staged_peers`], used inside [`stage_peer`].
-fn cleanup_staged_peer(workspace_root: &Path, slug: &str, dir: &Path) {
-    let _ = std::fs::remove_dir_all(dir);
-    let _ = std::process::Command::new("git")
+/// The `.git` COMMON dir of `workspace_root` — where per-worktree admin dirs
+/// live. Resolved via git (not `join(".git")`) because `.git` is a FILE when the
+/// workspace is itself a worktree, and the admin dirs then live in the parent
+/// repo. `None` when `workspace_root` is not a repo.
+fn git_common_dir(workspace_root: &Path) -> Option<PathBuf> {
+    let out = std::process::Command::new("git")
         .arg("-C")
         .arg(workspace_root)
-        .args(["worktree", "prune"])
-        .output();
+        .args(["rev-parse", "--git-common-dir"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let raw = String::from_utf8(out.stdout).ok()?;
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let path = PathBuf::from(raw);
+    // `--git-common-dir` may answer relatively (`.git`) — anchor it.
+    Some(if path.is_absolute() {
+        path
+    } else {
+        workspace_root.join(path)
+    })
+}
+
+/// Drop ONLY the worktree belonging to peer dir `dir`.
+///
+/// Deliberately NOT `git worktree prune`, which is what this used to do: prune
+/// is repo-GLOBAL and removes the admin entry of EVERY worktree whose checkout
+/// is currently missing. `git worktree add` registers the admin entry BEFORE the
+/// checkout is fully in place, so a sibling peer staged concurrently sits in
+/// exactly that window — one peer's rollback silently destroyed another peer's
+/// fence, leaving its branch checked out nowhere. Every peer checkout is named
+/// `wt` (`peers/<slug>/wt`), so git disambiguates the admin dirs as `wt`, `wt1`,
+/// … — which is why this showed up as "the SECOND peer lost its worktree".
+///
+/// Both steps here are scoped STRICTLY to paths under `dir`, so a sibling is
+/// never touched no matter what state it is in.
+fn remove_peer_worktree(workspace_root: &Path, dir: &Path) {
+    // Normal path: the checkout exists, so git can unregister it by PATH.
+    let checkout = dir.join("wt");
+    if checkout.is_dir() {
+        let _ = std::process::Command::new("git")
+            .arg("-C")
+            .arg(workspace_root)
+            .args(["worktree", "remove", "--force"])
+            .arg(&checkout)
+            .output();
+    }
+    // Fallback: a checkout that never finished (or a `remove` git refused)
+    // leaves an admin entry behind, and a lingering entry keeps `branch -D`
+    // from succeeding — which would burn the slug for any retry. Sweep it by
+    // hand, matching ONLY entries whose `gitdir` points inside `dir`.
+    let Some(common) = git_common_dir(workspace_root) else {
+        return;
+    };
+    let Ok(entries) = std::fs::read_dir(common.join("worktrees")) else {
+        return;
+    };
+    // Compare canonicalized too: on macOS a temp/staging path reaches git as
+    // `/private/var/…` while `dir` is the `/var/…` symlink (or vice versa), and
+    // a purely lexical match would silently sweep nothing.
+    let canonical = std::fs::canonicalize(dir).ok();
+    for entry in entries.flatten() {
+        let Ok(target) = std::fs::read_to_string(entry.path().join("gitdir")) else {
+            continue;
+        };
+        let target = Path::new(target.trim());
+        let mine = target.starts_with(dir)
+            || canonical
+                .as_deref()
+                .is_some_and(|canonical| target.starts_with(canonical));
+        if mine {
+            let _ = std::fs::remove_dir_all(entry.path());
+        }
+    }
+}
+
+/// Roll back ONE half-staged peer: unregister its OWN worktree, remove its
+/// reserved dir, then best-effort `branch -D peer/<slug>` (all no-ops for a
+/// member that never got a worktree). The single-member synchronous sibling of
+/// [`cleanup_staged_peers`], used inside [`stage_peer`].
+fn cleanup_staged_peer(workspace_root: &Path, slug: &str, dir: &Path) {
+    // BEFORE `remove_dir_all`: `git worktree remove` needs the checkout on disk
+    // to unregister it by path.
+    remove_peer_worktree(workspace_root, dir);
+    let _ = std::fs::remove_dir_all(dir);
     let branch = format!("peer/{slug}");
     let _ = std::process::Command::new("git")
         .arg("-C")

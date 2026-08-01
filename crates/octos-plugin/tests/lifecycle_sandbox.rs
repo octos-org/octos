@@ -400,18 +400,25 @@ async fn pick_and_place_lifecycle_example_runs_end_to_end() {
     }
 }
 
-/// Sync test: asserts the BLOCKED_ENV_VARS list in `octos-plugin` matches
-/// the canonical list in `octos-agent/src/sandbox/mod.rs`. Failing this
-/// means the two lists have drifted and need to be reconciled.
+/// Sync test: asserts the BLOCKED_ENV_VARS list in `octos-plugin` matches the
+/// canonical list. That list USED to live in `octos-agent/src/sandbox/mod.rs`;
+/// #1881 moved it down to `octos-core::env_hygiene` (so octos-core's own
+/// controller-side git ops sanitize against the same set) and left a `pub use`
+/// re-export behind. This test scrapes the SOURCE TEXT, so the re-export broke
+/// it — it panicked with "could not locate BLOCKED_ENV_VARS", meaning the
+/// cross-crate invariant silently stopped being checked. Read the canonical
+/// definition, and fail with a pointer if it moves again.
 #[test]
 fn blocked_env_vars_match_agent_sandbox() {
-    let agent_source = include_str!("../../octos-agent/src/sandbox/mod.rs");
+    let agent_source = include_str!("../../octos-core/src/env_hygiene.rs");
     // Extract the slice literal: `pub const BLOCKED_ENV_VARS: &[&str] = &[...];`
     let re = regex::Regex::new(r"(?s)pub const BLOCKED_ENV_VARS:\s*&\[&str\]\s*=\s*&\[(.*?)\];")
         .unwrap();
-    let caps = re
-        .captures(agent_source)
-        .expect("could not locate BLOCKED_ENV_VARS in agent sandbox source");
+    let caps = re.captures(agent_source).expect(
+        "could not locate the BLOCKED_ENV_VARS definition in octos-core/src/env_hygiene.rs — \
+         if the canonical list moved again, repoint this test's include_str! at its new home \
+         (a re-export will NOT match: this scrapes the literal definition)",
+    );
     let body = &caps[1];
     let item_re = regex::Regex::new(r#""([A-Z0-9_]+)""#).unwrap();
     let agent_vars: Vec<String> = item_re

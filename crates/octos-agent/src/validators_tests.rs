@@ -2196,12 +2196,12 @@ fn kill_child_process_uses_absolute_paths() {
     assert!(
         KILL_BIN.is_absolute(),
         "the timeout-kill must invoke `kill` by ABSOLUTE path (no $PATH lookup), got {:?}",
-        &*KILL_BIN
+        *KILL_BIN
     );
     assert!(
         PS_BIN.is_absolute(),
         "process enumeration must invoke `ps` by ABSOLUTE path (no $PATH lookup), got {:?}",
-        &*PS_BIN
+        *PS_BIN
     );
 
     // The resolver never falls back to a bare (PATH-looked-up) name: even when no

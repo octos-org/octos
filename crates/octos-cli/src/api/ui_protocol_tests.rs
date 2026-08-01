@@ -25803,6 +25803,119 @@ fn stage_peer_reserves_slug_writes_brief_and_releases_on_failure() {
     );
 }
 
+/// Rolling back ONE peer must never touch a SIBLING's worktree fence.
+///
+/// `cleanup_staged_peer` used to run a repo-GLOBAL `git worktree prune`, which
+/// deletes the admin entry of EVERY worktree whose checkout is missing — not
+/// just the one being rolled back. `git worktree add` creates the admin entry
+/// BEFORE the checkout is fully in place, so a sibling staged concurrently was
+/// visible to prune in exactly that window and lost its fence: its branch was
+/// left checked-out-nowhere and the peer ran in a broken worktree. Every peer
+/// checkout is named `wt` (`peers/<slug>/wt`), so git disambiguates the admin
+/// dirs as `wt`, `wt1`, … — which is why this surfaced as "the SECOND peer's
+/// worktree disappeared".
+///
+/// The window is a race, but its consequence is deterministic: a peer whose
+/// checkout is absent when a sibling cleans up must survive. That is what this
+/// asserts — hiding the checkout stands in for "mid-`worktree add`".
+#[test]
+fn cleanup_of_one_peer_must_not_destroy_a_sibling_worktree() {
+    fn git(dir: &std::path::Path, args: &[&str]) -> String {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let peers = tmp.path().join("peers");
+    let repo = tmp.path().join("project");
+    std::fs::create_dir_all(&repo).unwrap();
+    git(&repo, &["init", "-q"]);
+    git(
+        &repo,
+        &[
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "user.name=t",
+            "commit",
+            "--allow-empty",
+            "-m",
+            "init",
+        ],
+    );
+
+    // The SURVIVOR: a fully staged, fenced peer.
+    let keeper = stage_peer(&peers, &repo, "Keeper", None, None, "Stay.", true)
+        .expect("sibling staging must succeed");
+    assert!(keeper.cwd.join(".git").exists(), "sibling fence is real");
+
+    // A second peer, so the admin dirs actually collide on basename `wt`
+    // (`wt` and `wt1`) exactly as they do in production.
+    let doomed =
+        stage_peer(&peers, &repo, "Doomed", None, None, "Rolled back.", true).expect("staging");
+
+    // Stand in for "sibling is mid-`worktree add`": its admin entry exists but
+    // its checkout is not on disk yet.
+    let hidden = tmp.path().join("keeper-checkout-parked");
+    std::fs::rename(&keeper.cwd, &hidden).unwrap();
+
+    // Roll back ONLY the doomed peer.
+    cleanup_staged_peer(&repo, &doomed.slug, &peers.join(&doomed.slug));
+
+    std::fs::rename(&hidden, &keeper.cwd).unwrap();
+
+    // The rollback must have removed its OWN fence…
+    let listed = git(&repo, &["worktree", "list"]);
+    assert!(
+        !listed.contains("peers/doomed"),
+        "the rolled-back peer's worktree must be gone, got:\n{listed}"
+    );
+    assert!(
+        !peers.join("doomed").exists(),
+        "the rolled-back peer's dir must be gone"
+    );
+
+    // …and left the SIBLING's fence completely intact.
+    assert!(
+        listed.contains(&keeper.cwd.to_string_lossy().into_owned())
+            || listed.contains("peers/keeper"),
+        "a sibling's worktree must survive another peer's rollback, got:\n{listed}"
+    );
+    assert!(
+        keeper.cwd.join(".git").exists(),
+        "sibling checkout must still be a live worktree"
+    );
+    // The decisive check: git must still resolve the sibling's worktree. A
+    // pruned admin entry leaves the checkout on disk but orphaned, so this is
+    // what actually distinguishes "survived" from "looks like it survived".
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&keeper.cwd)
+        .args(["rev-parse", "--abbrev-ref", "HEAD"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "sibling worktree must still be usable by git: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "peer/keeper",
+        "sibling must still be on its own fence branch"
+    );
+}
+
 /// #1801 v3 depth-1 guard: `peer_handoff` wiring is skipped for sessions
 /// whose topic is `peer-<slug>` — a peer must never see the tool at all.
 #[test]
