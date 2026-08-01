@@ -52,11 +52,11 @@ pub use grant::{
 };
 pub use records::{
     AcceptanceCriterion, AcceptanceVerdict, Attempt, AttemptStatus, ChildResultSnapshot,
-    ChildStatus, DecisionEntry, DecisionKind, DurablePlan, EvidenceRef, FleetBudget,
-    FleetChildRecord, FleetEventKind, FleetRecord, FleetStatus, Lease, OutboxEvent, PlanTask,
-    SCHEMA_VERSION, Verifier, WorkerKind,
+    ChildStatus, DecisionEntry, DecisionKind, DurablePlan, EscalationRequest, EvidenceRef,
+    FleetBudget, FleetChildRecord, FleetEventKind, FleetRecord, FleetStatus, Lease, OutboxEvent,
+    PlanTask, SCHEMA_VERSION, Verifier, WorkerKind,
 };
 pub use store::{
-    AckOutcome, CompleteOutcome, FleetKernelStore, FleetSnapshot, InterruptedAttempt,
-    LaunchOutcome, MarkRunningOutcome, PlanMutateOutcome, ReconcileReport,
+    AckOutcome, CompleteOutcome, DenyEscalationOutcome, FleetKernelStore, FleetSnapshot,
+    InterruptedAttempt, LaunchOutcome, MarkRunningOutcome, PlanMutateOutcome, ReconcileReport,
 };
