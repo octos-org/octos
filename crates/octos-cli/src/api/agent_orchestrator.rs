@@ -3351,10 +3351,22 @@ impl InProcessAgentOrchestrator {
             }));
         }
         let Some(root) = root else {
+            // The old message said "create the plan on a live session", which
+            // sends the reader to check session liveness — never the cause. The
+            // binding is captured under `if let Some(goal_ctx) = goal_context`
+            // (ui_protocol, "THE LOAD-BEARING SEAM"), so ONLY a goal turn
+            // captures it. An interactive turn never does, which means calling
+            // `goal_plan` straight from chat fails here 100% of the time no
+            // matter how live the session is. Name the real precondition and the
+            // actual remedy.
             return Err(
-                "workspace root not resolved for this goal — create the plan on a live session. \
-                 The controller root is captured at goal-turn start and is required so a \
-                 fleet-completion wake can rehydrate the keeper after a restart."
+                "workspace root not resolved for this goal, so `goal_plan` cannot run here. \
+                 The controller root is captured at GOAL-TURN start (it is required so a \
+                 fleet-completion wake can rehydrate the keeper after a restart), and an \
+                 INTERACTIVE turn never captures it — so calling `goal_plan` directly from \
+                 chat always fails, however live the session is. Start the goal instead \
+                 (`session/goal/set`, or `/goal` in the TUI) and let the keeper call \
+                 `goal_plan` on its own turn."
                     .to_owned(),
             );
         };
