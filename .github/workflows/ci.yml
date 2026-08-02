@@ -611,31 +611,26 @@ jobs:
     # ~15 min it is the cheapest job in the matrix covering code no other PR
     # check can even see.
     #
-    # NON-BLOCKING for now, because it is currently RED for a pre-existing
-    # reason. Making it blocking today would wedge every PR on a bug it did not
-    # introduce. It still surfaces on the PR, which is the point — a NEW
-    # Windows break is now visible at review time instead of after merge.
+    # BLOCKING. This job carried `continue-on-error: ${{ github.event_name ==
+    # 'pull_request' }}` while it was red on `main` for pre-existing reasons
+    # (`session_scope` → #1838, `run_phase_injects_octos_skill_dir_env` → #1860,
+    # then `git_worktree`'s `GIT_BIN` + `octos-plugin`'s drift guard → #1884).
+    # Those are all fixed and the job is green on `main`, which is the condition
+    # that note set for removing the flag.
     #
-    # The original reason recorded here — 2 `octos-core` `session_scope`
-    # failures — was fixed by #1838, and the `octos-plugin` blocker noted next
-    # (`run_phase_injects_octos_skill_dir_env`) by #1860. As of run 30695951586
-    # the two remaining failures were: 12 `octos-core` `git_worktree::tests::*`
-    # (`GIT_BIN` resolved only `/usr/bin/git` | `/bin/git`, so EVERY controller
-    # git spawn failed on Windows and `is_git_repo` reported "not a repository"),
-    # and `octos-plugin`'s `blocked_env_vars_match_agent_sandbox` (it scraped
-    # `BLOCKED_ENV_VARS` out of a file the constant had moved away from). Both
-    # are fixed; this job is EXPECTED green. If it stays green, delete the
-    # `continue-on-error` below and this note. Keep the note pinned to the
-    # CURRENT blocker: a stale one reads as "known, tracked, someone's on it"
-    # long after nobody is.
+    # It is gone rather than merely stale, because `continue-on-error` at JOB
+    # level makes GitHub report the job's conclusion as `success` even when its
+    # steps fail — so the PR checklist read `check-windows  pass` on a suite
+    # that was actually RED. That is not a muted gate, it is a misleading one,
+    # and it burned real time: #1883's branch sat at `341 passed; 1 failed`
+    # (`global_filter_is_neutralized_on_controller_ops`) while reporting green,
+    # and #1884 reported green before anyone had confirmed the Windows fix
+    # worked. Both were only caught by opening the raw job log.
     #
-    # Non-blocking ONLY on PRs. On push to `main` it stays hard-failing, so
-    # `build-windows` (which `needs:` this job) still refuses to ship a Windows
-    # artifact from a red suite — a blanket `continue-on-error: true` would have
-    # silently re-enabled those releases.
-    #
-    # Drop this line entirely once the job is green on `main`.
-    continue-on-error: ${{ github.event_name == 'pull_request' }}
+    # Consequence to accept: a Windows break now blocks PRs. If `main` ever goes
+    # red on Windows again, prefer fixing it or narrowing the failing test to
+    # `#[cfg(unix)]` over re-muting the whole job — a check that cannot fail
+    # tells you nothing.
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v6
