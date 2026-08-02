@@ -35,11 +35,10 @@ use tokio::process::Command;
 
 /// Environment variables blocked inside lifecycle step execution.
 ///
-/// Mirrors `octos-agent/src/sandbox/mod.rs::BLOCKED_ENV_VARS`. The two lists
-/// MUST stay in sync — the `blocked_env_vars_match_agent_sandbox` test in
-/// `tests/lifecycle_sandbox.rs` compiles the agent source in and asserts
-/// the two lists are element-wise equal. If you add/remove a variable here,
-/// update the agent source too (and vice versa).
+/// Mirrors `octos_core::BLOCKED_ENV_VARS`. The two lists MUST stay in sync —
+/// the `blocked_env_vars_match_core_canonical_list` test in
+/// `tests/lifecycle_sandbox.rs` compares the exported constants directly. If
+/// you add or remove a variable here, update the canonical core list too.
 pub const BLOCKED_ENV_VARS: &[&str] = &[
     // Linux: shared library injection
     "LD_PRELOAD",

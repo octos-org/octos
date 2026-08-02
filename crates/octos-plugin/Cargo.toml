@@ -18,9 +18,9 @@ tokio = { workspace = true }
 metrics = { workspace = true }
 
 [dev-dependencies]
+octos-core = { workspace = true }
 tempfile = { workspace = true }
 tokio-test = { workspace = true }
-regex = { workspace = true }
 
 # RFC-2 CI entrypoint — used by scripts/validate-skill-manifests.sh.
 [[bin]]
