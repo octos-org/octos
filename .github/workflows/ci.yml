@@ -505,9 +505,32 @@ jobs:
         run: cargo test -p octos-sandbox
       - name: Test octos-swarm
         run: cargo test -p octos-swarm
+      # RUST_TEST_THREADS=1 on the octos-agent steps ONLY.
+      #
+      # These two steps repeatedly killed the ARM runner outright:
+      # "The hosted runner lost communication with the server ... starves it for
+      # CPU/Memory". Every failure died at `Test octos-agent (lib)` after steps
+      # 1-15 passed, at ~68 min, on runs 30733580733 and 30737982761 — and it
+      # passed on the runs in between, which is what an on-the-edge OOM looks
+      # like rather than a random flake.
+      #
+      # `test-octos-agent` (x86) already hit exactly this and documents the
+      # mechanism: the validator-timeout tests spawn `sh -c "... sleep 30"`
+      # children, and under thread-per-core parallelism enough pile up that
+      # GitHub terminates the runner for resource use. That job mitigates with
+      # CARGO_BUILD_JOBS=1 + RUST_TEST_THREADS=1 AND splits lib/integration onto
+      # separate runners so each gets a fresh 16GB. check-arm runs the SAME
+      # suites with none of that, in one job, on a 16GB ARM runner.
+      #
+      # Scoped to these steps, not the job env: steps 1-15 pass fine in parallel
+      # and serialising them would only make an already ~67 min job slower.
       - name: Test octos-agent (lib)
+        env:
+          RUST_TEST_THREADS: "1"
         run: cargo test -p octos-agent --lib
       - name: Test octos-agent (integration)
+        env:
+          RUST_TEST_THREADS: "1"
         run: cargo test -p octos-agent --tests
       - name: Test octos-cli (lib)
         run: cargo test -p octos-cli --lib
