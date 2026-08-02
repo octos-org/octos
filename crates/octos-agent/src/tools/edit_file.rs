@@ -1271,11 +1271,25 @@ mod tests {
             "formatter failure must NOT fail the edit: {}",
             result.output
         );
-        assert!(
-            result.output.contains("failed"),
-            "output must note the formatter failure: {}",
-            result.output
-        );
+
+        // This asserts rustfmt FAILED (non-zero on broken syntax), which needs
+        // rustfmt to actually run. Post-edit formatting is best-effort behind a
+        // hard 5s `format::FORMAT_TIMEOUT`, and a loaded runner can exceed that
+        // just spawning it — `check-windows` did on run 30763300877. A timeout
+        // is a legitimate outcome (`FormatOutcome::TimedOut`), and it reports
+        // "timed out" rather than "failed", so the note assertion is only
+        // meaningful when the formatter got to run and exit. The edit-preserved
+        // check below holds either way and still runs.
+        let formatter_ran = !result.output.contains("timed out");
+        if !formatter_ran {
+            eprintln!("skipping formatter-failure assertion: rustfmt exceeded FORMAT_TIMEOUT");
+        } else {
+            assert!(
+                result.output.contains("failed"),
+                "output must note the formatter failure: {}",
+                result.output
+            );
+        }
         assert_eq!(
             std::fs::read_to_string(dir.path().join("broken.rs")).unwrap(),
             "fn main( { let a=2 \n",
