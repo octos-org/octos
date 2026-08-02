@@ -325,7 +325,7 @@ pub fn prepare_fleet_worktree(
     // Reconcile a leftover checkout/branch from a prior (interrupted) attempt —
     // robust to a LOCKED leftover (HIGH #5).
     if checkout_exists || branch_exists {
-        force_free_checkout(&canonical_root, &git_dir, work_root, checkout);
+        force_free_checkout(&canonical_root, Some(&git_dir), work_root, checkout);
     }
 
     // Re-add. Keep the branch (resume from its last commit) if it exists;
@@ -498,32 +498,32 @@ pub fn branch_advanced_past(repo_root: &Path, branch: &str, base_commit: &str) -
 /// reviews and merges. Every git op runs hooks-disabled (module SECURITY note).
 pub fn remove_checkout_keep_branch(repo_root: &Path, work_root: &Path, checkout: &Path) {
     // Compute the git common dir best-effort so a stale (possibly locked) admin
-    // entry can be cleared. If it fails we still do the worktree remove/prune.
+    // entry can be cleared. If it fails, everything else still runs — only the
+    // admin-entry clearing is skipped (there is no safe repo-global substitute;
+    // see `force_free_checkout`).
     let git_dir = git_common_dir(repo_root).ok();
-    match &git_dir {
-        Some(gd) => force_free_checkout(repo_root, gd, work_root, checkout),
-        None => {
-            // No git_dir: still best-effort unlock + double-force remove + prune,
-            // and a CONTAINED dir cleanup, just without admin-entry clearing.
-            let checkout_str = checkout.to_string_lossy();
-            let _ = run_git(repo_root, &["worktree", "unlock", &checkout_str]);
-            let _ = run_git(
-                repo_root,
-                &["worktree", "remove", "--force", "--force", &checkout_str],
-            );
-            remove_contained_dir(work_root, checkout);
-            let _ = run_git(repo_root, &["worktree", "prune"]);
-        }
-    }
+    force_free_checkout(repo_root, git_dir.as_deref(), work_root, checkout);
 }
 
 /// Free a (possibly LOCKED) worktree checkout, KEEPING the branch (HIGH #5):
 /// `unlock` (locked worktrees refuse a single `--force`), then
 /// `remove --force --force`, then a CONTAINED (#2) dir cleanup for a leftover,
-/// then `prune`, then clear any stale admin entry `prune` left behind (a locked
-/// entry survives prune and would keep the branch recorded as checked-out,
-/// wedging every relaunch). All git ops run hooks-disabled.
-fn force_free_checkout(repo: &Path, git_dir: &Path, work_root: &Path, checkout: &Path) {
+/// then clear any stale admin entry left behind (a locked entry survives, and
+/// would keep the branch recorded as checked-out, wedging every relaunch).
+/// All git ops run hooks-disabled.
+///
+/// Every step is scoped to THIS `checkout`. There is deliberately no
+/// `git worktree prune`: prune is repo-GLOBAL and deletes the admin entry of
+/// every worktree whose checkout is momentarily missing, and `git worktree add`
+/// registers its entry BEFORE the checkout exists — so a prune here silently
+/// unregistered any worktree being created concurrently, leaving its branch
+/// checked out nowhere. That reaches across FEATURES (fleet checkouts and peer
+/// fences share one repo), and `clear_stale_admin_entry` already covers this
+/// checkout's own stale entry, which is all prune was wanted for.
+///
+/// `git_dir` is `None` only when the common dir could not be resolved; the
+/// admin-entry clearing is then skipped rather than widened to a global prune.
+fn force_free_checkout(repo: &Path, git_dir: Option<&Path>, work_root: &Path, checkout: &Path) {
     let checkout_str = checkout.to_string_lossy();
     // A locked worktree needs an explicit unlock (or `--force` TWICE). Both are
     // best-effort — errors ("not locked", "not a working tree") are expected.
@@ -534,10 +534,24 @@ fn force_free_checkout(repo: &Path, git_dir: &Path, work_root: &Path, checkout: 
     );
     // Clear a leftover checkout dir ONLY if provably contained in fleet-work.
     remove_contained_dir(work_root, checkout);
-    let _ = run_git(repo, &["worktree", "prune"]);
     // Clear a stale (possibly locked) admin entry still pointing at this
     // checkout, so a relaunch can reclaim the task-stable branch.
-    clear_stale_admin_entry(git_dir, checkout);
+    if let Some(git_dir) = git_dir {
+        clear_stale_admin_entry(git_dir, checkout);
+    }
+}
+
+/// Clear the worktree admin entry for `checkout` and NOTHING else.
+///
+/// The safe replacement for a repo-global `git worktree prune` on any cleanup
+/// path: prune also unregisters worktrees that merely have no checkout on disk
+/// yet, which is the normal state mid-`git worktree add`. See
+/// [`force_free_checkout`]. Best-effort — a repo whose common dir cannot be
+/// resolved is left untouched.
+pub fn clear_worktree_admin_entry(repo_root: &Path, checkout: &Path) {
+    if let Ok(git_dir) = git_common_dir(repo_root) {
+        clear_stale_admin_entry(&git_dir, checkout);
+    }
 }
 
 /// `remove_dir_all(checkout)` ONLY when it is proven contained in `fleet-work`
@@ -1401,6 +1415,69 @@ mod tests {
         assert!(
             control_ran,
             "sanity: the control (global visible) must run the filter, else the test is vacuous",
+        );
+    }
+
+    /// Freeing ONE checkout must not unregister a SIBLING worktree.
+    ///
+    /// `remove_checkout_keep_branch` used to run a repo-GLOBAL
+    /// `git worktree prune`, which deletes the admin entry of EVERY worktree
+    /// whose checkout is currently missing — not just the one being freed. And
+    /// `git worktree add` registers the admin entry BEFORE the checkout is
+    /// populated, so any worktree being created concurrently sits in exactly
+    /// that window. The victim is left with its branch checked out nowhere.
+    ///
+    /// This is cross-FEATURE, not just cross-task: fleet checkouts
+    /// (`work_root/<fleet>/<task>`) and peer fences (`peers/<slug>/wt`) live in
+    /// the SAME repo, so a fleet cleanup could unregister a peer's in-flight
+    /// worktree. The targeted `clear_stale_admin_entry` already handles this
+    /// checkout's own stale entry, so the global prune was pure blast radius.
+    ///
+    /// The race is a window, but its consequence is deterministic: a sibling
+    /// whose checkout is absent must survive. Hiding it stands in for
+    /// "mid-`worktree add`".
+    #[test]
+    fn removing_one_checkout_must_not_unregister_a_sibling_worktree() {
+        let repo = tempfile::tempdir().unwrap();
+        if !git_init_repo(repo.path()) {
+            return;
+        }
+        let work = tempfile::tempdir().unwrap();
+
+        // The SURVIVOR and the one being freed — distinct paths, same repo.
+        let sibling = work.path().join("f1").join("keeper");
+        prepare_fleet_worktree(repo.path(), work.path(), "fleet/f1/keeper", &sibling)
+            .expect("prepare sibling");
+        let doomed = work.path().join("f1").join("doomed");
+        prepare_fleet_worktree(repo.path(), work.path(), "fleet/f1/doomed", &doomed)
+            .expect("prepare doomed");
+
+        // Stand in for "the sibling is mid-`worktree add`": its admin entry
+        // exists, its checkout is not on disk yet.
+        let parked = work.path().join("keeper-parked");
+        std::fs::rename(&sibling, &parked).unwrap();
+
+        remove_checkout_keep_branch(repo.path(), work.path(), &doomed);
+
+        std::fs::rename(&parked, &sibling).unwrap();
+
+        // The freed checkout is gone…
+        let listed = run_git(repo.path(), &["worktree", "list"]).unwrap_or_default();
+        assert!(
+            !listed.contains("doomed"),
+            "the freed checkout must be unregistered, got:\n{listed}"
+        );
+
+        // …and the SIBLING is still a live worktree. Checking `git worktree
+        // list` alone is not enough: a pruned entry leaves the directory on
+        // disk, so resolve HEAD from INSIDE it, which only works while the
+        // admin entry survives.
+        let head = run_git(&sibling, &["rev-parse", "--abbrev-ref", "HEAD"]);
+        assert_eq!(
+            head.unwrap_or_default(),
+            "fleet/f1/keeper",
+            "a sibling worktree must survive another checkout being freed; \
+             worktree list was:\n{listed}"
         );
     }
 

@@ -28,9 +28,9 @@ pub use env_hygiene::{
 pub use error::{Error, ErrorKind, Result};
 pub use gateway::{InboundMessage, METADATA_SENDER_USER_ID, MessageOrigin, OutboundMessage};
 pub use git_worktree::{
-    PreparedWorktree, branch_advanced_past, deliverable_commit_command, git_ref_exists,
-    is_git_repo, prepare_fleet_worktree, probe_git_repo, remove_checkout_keep_branch,
-    worktree_populate_command,
+    PreparedWorktree, branch_advanced_past, clear_worktree_admin_entry, deliverable_commit_command,
+    git_ref_exists, is_git_repo, prepare_fleet_worktree, probe_git_repo,
+    remove_checkout_keep_branch, worktree_populate_command,
 };
 pub use message::AgentMessage;
 pub use session_scope::{

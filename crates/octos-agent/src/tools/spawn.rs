@@ -178,7 +178,7 @@ fn prune_worker_worktree(repo_root: &Path, worktree: &WorkerWorktree) {
                 path = %worktree.path.display(),
                 stderr = %String::from_utf8_lossy(&output.stderr).trim(),
                 "spawn: git worktree remove failed for refused spawn; \
-                 falling back to manual prune"
+                 falling back to manual cleanup"
             );
             if worktree.path.exists() {
                 if let Err(error) = std::fs::remove_dir_all(&worktree.path) {
@@ -189,11 +189,12 @@ fn prune_worker_worktree(repo_root: &Path, worktree: &WorkerWorktree) {
                     );
                 }
             }
-            let _ = Command::new("git")
-                .arg("-C")
-                .arg(repo_root)
-                .args(["worktree", "prune"])
-                .output();
+            // Clear THIS worktree's admin entry only. A repo-global
+            // `git worktree prune` (what this used to do) also unregisters any
+            // worktree whose checkout is not on disk yet — the normal state
+            // mid-`git worktree add` — so a refused spawn could destroy a
+            // concurrently-created fleet checkout or peer fence in the same repo.
+            octos_core::clear_worktree_admin_entry(repo_root, &worktree.path);
         }
         Err(error) => {
             warn!(
