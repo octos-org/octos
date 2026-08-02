@@ -2593,18 +2593,50 @@ fn peer_wire_key(profile_id: &str, slug: &str) -> String {
 /// Split a `peer-<slug>` session key into `(profile_id, slug)`, or `None` for
 /// a non-peer or unprofiled session.
 fn peer_slug_and_profile(session_id: &SessionKey) -> Option<(&str, &str)> {
+    // NOT a peer session. The overwhelmingly common case, and the only one where
+    // `None` is uninteresting — every caller correctly skips peer bookkeeping.
     let slug = session_id
         .topic()
-        .and_then(|topic| topic.strip_prefix("peer-"))
-        .filter(|slug| !slug.is_empty())?;
+        .and_then(|topic| topic.strip_prefix("peer-"))?;
+
+    // Past this point the topic SAYS `peer-…`, so something intended a peer
+    // session. Each rejection below still returns `None` (callers must treat it
+    // as a non-peer session — that is the #436 fence), but it is now LOUD.
+    //
+    // Why: all ~10 callers do `let Some(..) = .. else { return }`, which is
+    // right for "not a peer" and silently wrong for "malformed peer key". A peer
+    // whose key is rejected here keeps running and looks healthy while its wire
+    // registration, result recording, blackboard writes, awaiting-input wake and
+    // fleet synthesis ALL no-op. That failure is invisible at every layer — the
+    // peer produces work nobody records — so the only place it can be reported
+    // is here, where the reason is still known.
+
     // #436 security — the topic-derived slug feeds `Path::join` (closed marker,
     // peers dir) and the wire-key registry. Reject an unsafe one (e.g. a
     // `peer-/tmp/x` or `peer-../x` topic) HERE so EVERY caller treats it as a
     // NON-peer session rather than a path that escapes `peers/`.
-    if !peer_slug_is_safe(slug) {
+    if slug.is_empty() || !peer_slug_is_safe(slug) {
+        warn!(
+            session = %session_id,
+            "peer session key has an unusable slug; peer bookkeeping (results, \
+             blackboard, wake, synthesis) is DISABLED for this session"
+        );
         return None;
     }
-    let profile_id = session_id.profile_id()?;
+
+    // A peer key with no profile component. Nothing downstream can address the
+    // peer without one — `peers_root` is per-profile and the wire key is
+    // `{profile}:peer:{slug}` — so this silently disables the same bookkeeping.
+    let Some(profile_id) = session_id.profile_id() else {
+        warn!(
+            session = %session_id,
+            slug,
+            "peer session key has NO profile component; peer bookkeeping \
+             (results, blackboard, wake, synthesis) is DISABLED for this \
+             session. Peer keys must be `{{profile}}:{{channel}}:{{chat}}#peer-{{slug}}`"
+        );
+        return None;
+    };
     Some((profile_id, slug))
 }
 
