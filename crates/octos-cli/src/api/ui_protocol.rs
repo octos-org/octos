@@ -100,7 +100,12 @@ use super::master_continuation_scheduler::{
 };
 use super::metrics::MetricsReporter;
 use super::router::AuthIdentity;
-use super::skill_action_jobs::{SkillActionJobRecord, SkillActionJobStatus, SkillActionJobStore};
+#[cfg(test)]
+use super::skill_action_jobs::SkillActionJobStatus;
+use super::skill_action_jobs::{
+    SkillActionJobRecord, SkillActionProjectionMetadata, load_skill_action_jobs,
+    project_skill_action_job, project_skill_action_jobs, with_skill_action_result,
+};
 use super::specialist_runner::{
     AppUiSupervisorEventSink, SpecialistArtifactSpec, SupervisedCliSpecialist,
     SupervisedMcpSpecialist, SupervisedSpecialistSpec, run_supervised_cli_specialist,
@@ -10892,13 +10897,13 @@ struct PreparedSkillActionInvocation {
     calls: Vec<PreparedSkillActionCall>,
 }
 
-#[derive(Clone)]
 struct QueuedSkillActionJob {
     tool: String,
     args: Value,
     workspace_root: PathBuf,
     execution_context: SkillActionExecutionContext,
-    job: SkillActionJobRecord,
+    task_id: String,
+    _terminal_guard: octos_agent::TaskTerminalGuard,
 }
 
 #[derive(Clone)]
@@ -11260,27 +11265,41 @@ async fn invoke_skill_action_tool_binding(
     Ok(Value::Object(response))
 }
 
-fn append_skill_action_job_snapshot(
-    store: &SkillActionJobStore,
-    ledger: Option<&Arc<UiProtocolLedger>>,
-    job: &SkillActionJobRecord,
-) -> Result<(), RpcError> {
-    store.append(job).map_err(|error| {
-        RpcError::internal_error(format!("failed to persist skill action job: {error}"))
-    })?;
-    if let Some(ledger) = ledger {
-        let job_value = skill_action_job_record_to_value(job.clone())?;
+fn install_skill_action_job_projection_listener(
+    supervisor: &octos_agent::TaskSupervisor,
+    profile_id: &str,
+    session_id: &SessionKey,
+    ledger: &Arc<UiProtocolLedger>,
+) {
+    let listener_key = format!("skill-action-job:{profile_id}:{session_id}");
+    let ledger = Arc::clone(ledger);
+    let expected_profile = profile_id.to_owned();
+    let expected_session = session_id.clone();
+    supervisor.set_on_change_listener(listener_key, move |task| {
+        let Some(job) = project_skill_action_job(task) else {
+            return;
+        };
+        if job.profile_id != expected_profile || job.session_id != expected_session {
+            return;
+        }
+        let Ok(job_value) = serde_json::to_value(&job) else {
+            return;
+        };
         let _ = ledger.append_notification(UiNotification::SkillActionJobUpdated(
             SkillActionJobUpdatedEvent {
-                profile_id: job.profile_id.clone(),
-                session_id: job.session_id.clone(),
+                profile_id: job.profile_id,
+                session_id: job.session_id,
                 job: job_value,
             },
         ));
-    }
-    Ok(())
+    });
 }
 
+// This adapter boundary keeps every trust and lifecycle scope explicit: the
+// manifest action, resolved tool registry, workspace/tenant scope, profile and
+// session identity, caller arguments, and execution context must not be
+// inferred from ambient state.
+#[allow(clippy::too_many_arguments)]
 fn enqueue_background_skill_action_jobs(
     action: &octos_agent::plugins::SkillActionDef,
     skill_id: &str,
@@ -11289,8 +11308,6 @@ fn enqueue_background_skill_action_jobs(
     tenant_id: Option<&str>,
     profile_id: &str,
     session_id: &SessionKey,
-    store: &SkillActionJobStore,
-    ledger: Option<&Arc<UiProtocolLedger>>,
     arguments: Value,
     execution_context: &SkillActionExecutionContext,
 ) -> Result<(Value, Vec<QueuedSkillActionJob>), RpcError> {
@@ -11302,35 +11319,59 @@ fn enqueue_background_skill_action_jobs(
         arguments,
     )?;
     let batch_id = format!("skillbatch_{}", uuid::Uuid::now_v7().simple());
-    let mut queued_jobs = Vec::with_capacity(prepared.calls.len());
+    let mut queued_jobs: Vec<QueuedSkillActionJob> = Vec::with_capacity(prepared.calls.len());
     let mut job_values = Vec::with_capacity(prepared.calls.len());
     for call in prepared.calls {
-        let now = Utc::now();
-        let job = SkillActionJobRecord {
-            job_id: format!("skilljob_{}", uuid::Uuid::now_v7().simple()),
-            batch_id: batch_id.clone(),
-            profile_id: profile_id.to_string(),
-            session_id: session_id.clone(),
-            action_id: action.id.clone(),
-            skill_id: skill_id.to_string(),
-            status: SkillActionJobStatus::Queued,
-            input_path: call.input_path,
-            filename: call.filename,
-            materialized_path: call.materialized_path,
-            output: None,
-            error: None,
-            result: None,
-            created_at: now,
-            updated_at: now,
+        let supervisor = registry.supervisor();
+        let tool_call_id = format!("skill-action:{batch_id}:{}", queued_jobs.len());
+        let task_id = match supervisor.try_register_with_input(
+            &prepared.tool,
+            &tool_call_id,
+            Some(&session_id.0),
+            Some(call.args.clone()),
+        ) {
+            Ok(task_id) => task_id,
+            Err(error) => {
+                for queued in &queued_jobs {
+                    supervisor.mark_failed(
+                        &queued.task_id,
+                        format!("skill action batch enqueue aborted: {error}"),
+                    );
+                }
+                return Err(RpcError::internal_error(format!(
+                    "failed to register skill action task: {error}"
+                )));
+            }
         };
-        append_skill_action_job_snapshot(store, ledger, &job)?;
-        job_values.push(skill_action_job_record_to_value(job.clone())?);
+        supervisor.set_projection_metadata(
+            &task_id,
+            SkillActionProjectionMetadata::new(
+                batch_id.clone(),
+                profile_id.to_owned(),
+                session_id.clone(),
+                action.id.clone(),
+                skill_id.to_owned(),
+                call.input_path,
+                call.filename,
+                call.materialized_path,
+            )
+            .into_value(),
+        );
+        let task = supervisor
+            .get_task(&task_id)
+            .expect("registered skill action task remains tracked");
+        let job = project_skill_action_job(&task)
+            .expect("registered skill action task has projection metadata");
+        job_values.push(skill_action_job_record_to_value(job)?);
+        let terminal_guard =
+            octos_agent::TaskTerminalGuard::new(Arc::clone(&supervisor), task_id.clone());
         queued_jobs.push(QueuedSkillActionJob {
             tool: prepared.tool.clone(),
             args: call.args,
             workspace_root: workspace_root.to_path_buf(),
             execution_context: execution_context.clone(),
-            job,
+            task_id,
+            _terminal_guard: terminal_guard,
         });
     }
 
@@ -11351,66 +11392,76 @@ fn enqueue_background_skill_action_jobs(
 async fn run_background_skill_action_job(
     registry: Arc<octos_agent::ToolRegistry>,
     queued: QueuedSkillActionJob,
-    store: SkillActionJobStore,
-    ledger: Option<Arc<UiProtocolLedger>>,
-) -> Result<(), RpcError> {
-    let mut running = queued.job.clone();
-    running.status = SkillActionJobStatus::Running;
-    running.updated_at = Utc::now();
-    append_skill_action_job_snapshot_with_retry(&store, ledger.as_ref(), &running).await?;
-
-    let result = execute_skill_action_tool_call(
-        &running.action_id,
+) {
+    let supervisor = registry.supervisor();
+    let task = match supervisor.get_task(&queued.task_id) {
+        Some(task) => task,
+        None => return,
+    };
+    let Some(metadata) = SkillActionProjectionMetadata::from_task(&task) else {
+        supervisor.mark_failed(
+            &queued.task_id,
+            "skill action task is missing projection metadata".to_owned(),
+        );
+        return;
+    };
+    let cancel_token = supervisor.cancel_token(&queued.task_id);
+    if cancel_token.is_cancelled() {
+        return;
+    }
+    supervisor.mark_running(&queued.task_id);
+    let execute = execute_skill_action_tool_call(
+        &metadata.action_id,
         &queued.tool,
         &registry,
         &queued.args,
         &queued.execution_context,
-    )
-    .await;
-    let mut completed = running;
-    completed.updated_at = Utc::now();
+    );
+    let result = tokio::select! {
+        biased;
+        _ = cancel_token.cancelled() => None,
+        result = execute => Some(result),
+    };
+    let Some(result) = result else {
+        // `TaskSupervisor::cancel` owns and has already persisted the distinct
+        // cancelled terminal state. The worker must not rewrite it as failed.
+        return;
+    };
     match result {
         Ok(tool_result) => {
             let success = tool_result.success;
             let output = tool_result.output.clone();
+            let output_files = tool_result
+                .files_to_send
+                .iter()
+                .map(|path| path.to_string_lossy().into_owned())
+                .collect::<Vec<_>>();
             let result_value = tool_result_to_action_value(tool_result, &queued.workspace_root);
-            if !output.is_empty() {
-                completed.output = Some(output.clone());
+            if let Some(task) = supervisor.get_task(&queued.task_id)
+                && let Some(metadata) = with_skill_action_result(&task, result_value)
+            {
+                supervisor.set_projection_metadata(&queued.task_id, metadata);
             }
-            completed.result = Some(result_value.clone());
+            if !output.is_empty() {
+                supervisor.record_final_output(&queued.task_id, &output);
+            }
             if success {
-                completed.status = SkillActionJobStatus::Succeeded;
+                supervisor.mark_completed(&queued.task_id, output_files);
             } else {
-                completed.status = SkillActionJobStatus::Failed;
-                completed.error = Some(if output.is_empty() {
-                    "skill action tool returned unsuccessful result".to_string()
-                } else {
-                    output
-                });
+                supervisor.mark_failed(
+                    &queued.task_id,
+                    if output.is_empty() {
+                        "skill action tool returned unsuccessful result".to_string()
+                    } else {
+                        output
+                    },
+                );
             }
         }
         Err(error) => {
-            completed.status = SkillActionJobStatus::Failed;
-            completed.error = Some(error.message);
+            supervisor.mark_failed(&queued.task_id, error.message);
         }
     }
-    append_skill_action_job_snapshot_with_retry(&store, ledger.as_ref(), &completed).await
-}
-
-async fn append_skill_action_job_snapshot_with_retry(
-    store: &SkillActionJobStore,
-    ledger: Option<&Arc<UiProtocolLedger>>,
-    job: &SkillActionJobRecord,
-) -> Result<(), RpcError> {
-    let mut last_error = None;
-    for attempt in 0..3 {
-        match append_skill_action_job_snapshot(store, ledger, job) {
-            Ok(()) => return Ok(()),
-            Err(error) => last_error = Some(error),
-        }
-        tokio::time::sleep(Duration::from_millis(25 * (1 << attempt))).await;
-    }
-    Err(last_error.expect("persistence retry loop always records an error"))
 }
 
 fn skill_action_batch_semaphore() -> Arc<tokio::sync::Semaphore> {
@@ -11439,8 +11490,6 @@ fn reserve_skill_action_batch() -> Result<tokio::sync::OwnedSemaphorePermit, Rpc
 async fn run_background_skill_action_batch(
     registry: Arc<octos_agent::ToolRegistry>,
     queued_jobs: Vec<QueuedSkillActionJob>,
-    store: SkillActionJobStore,
-    ledger: Arc<UiProtocolLedger>,
     concurrency_class: octos_agent::ConcurrencyClass,
     _batch_permit: tokio::sync::OwnedSemaphorePermit,
 ) {
@@ -11456,19 +11505,7 @@ async fn run_background_skill_action_batch(
     };
 
     for queued_job in queued_jobs {
-        if let Err(error) = run_background_skill_action_job(
-            Arc::clone(&registry),
-            queued_job,
-            store.clone(),
-            Some(Arc::clone(&ledger)),
-        )
-        .await
-        {
-            warn!(
-                error = %error.message,
-                "background skill action job failed to persist status"
-            );
-        }
+        run_background_skill_action_job(Arc::clone(&registry), queued_job).await;
     }
 }
 
@@ -11629,7 +11666,30 @@ async fn raw_skill_action_invoke(
         octos_agent::plugins::SkillActionExecution::Background => {
             let batch_permit = reserve_skill_action_batch()?;
             let profile_id = session_runtime.profile.profile_id.clone();
-            let store = SkillActionJobStore::open(session_runtime.profile.data_dir.as_path());
+            let supervisor = session_runtime.tools.supervisor();
+            install_skill_action_job_projection_listener(
+                &supervisor,
+                &profile_id,
+                &params.session_id,
+                ledger,
+            );
+            supervisor
+                .enable_persistence(ui_protocol_task_output::task_state_path(
+                    &session_runtime.sessions_root,
+                    &params.session_id,
+                ))
+                .map_err(|error| {
+                    RpcError::internal_error(format!(
+                        "failed to enable skill action task persistence: {error}"
+                    ))
+                })?;
+            if let Some(store) = state.task_query_store.as_ref() {
+                store.register(
+                    &params.session_id,
+                    &supervisor,
+                    &session_runtime.sessions_root,
+                );
+            }
             let (response, queued_jobs) = enqueue_background_skill_action_jobs(
                 &record.action,
                 &record.skill_id,
@@ -11638,8 +11698,6 @@ async fn raw_skill_action_invoke(
                 Some(profile_id.as_str()),
                 &profile_id,
                 &params.session_id,
-                &store,
-                Some(ledger),
                 params.arguments,
                 &execution_context,
             )?;
@@ -11648,12 +11706,9 @@ async fn raw_skill_action_invoke(
                 .first()
                 .map(|queued| registry.concurrency_class(&queued.tool))
                 .unwrap_or_default();
-            let ledger = Arc::clone(ledger);
             tokio::spawn(run_background_skill_action_batch(
                 registry,
                 queued_jobs,
-                store,
-                ledger,
                 concurrency_class,
                 batch_permit,
             ));
@@ -11662,35 +11717,72 @@ async fn raw_skill_action_invoke(
     }
 }
 
-fn skill_action_job_store_for_profile(
-    state: &AppState,
-    active_profile_id: Option<&str>,
-) -> Result<(String, SkillActionJobStore), RpcError> {
-    let profile_id = active_profile_id.unwrap_or(MAIN_PROFILE_ID).to_string();
-    if let Some(runtime) = state.profiles.get(&profile_id) {
-        return Ok((
-            profile_id,
-            SkillActionJobStore::open(runtime.data_dir.as_path()),
-        ));
-    }
-
-    let store = profile_store(state)?;
-    let profile = store
-        .get(&profile_id)
-        .map_err(|error| runtime_unavailable_error(format!("failed to read profile: {error}")))?
-        .ok_or_else(|| profile_unresolved_error(&profile_id))?;
-    let data_dir = store.resolve_data_dir(&profile);
-    Ok((profile_id, SkillActionJobStore::open(data_dir)))
-}
-
 fn skill_action_job_record_to_value(job: SkillActionJobRecord) -> Result<Value, RpcError> {
     serde_json::to_value(job).map_err(|error| {
         RpcError::internal_error(format!("failed to serialize skill action job: {error}"))
     })
 }
 
-fn raw_skill_action_job_list(
+fn skill_action_profile_data_dir(
+    state: &AppState,
+    active_profile_id: Option<&str>,
+) -> Result<(String, PathBuf), RpcError> {
+    let profile_id = active_profile_id.unwrap_or(MAIN_PROFILE_ID).to_owned();
+    if let Some(runtime) = state.profiles.get(&profile_id) {
+        return Ok((profile_id, runtime.data_dir.clone()));
+    }
+    let store = profile_store(state)?;
+    let profile = store
+        .get(&profile_id)
+        .map_err(|error| runtime_unavailable_error(format!("failed to read profile: {error}")))?
+        .ok_or_else(|| profile_unresolved_error(&profile_id))?;
+    Ok((profile_id, store.resolve_data_dir(&profile)))
+}
+
+async fn load_skill_action_job_view(
     state: &Arc<AppState>,
+    ledger: &Arc<UiProtocolLedger>,
+    session_id: &SessionKey,
+    active_profile_id: Option<&str>,
+) -> Result<(String, Vec<SkillActionJobRecord>), RpcError> {
+    match skill_action_session_runtime(state, session_id, active_profile_id).await {
+        Ok(runtime) => {
+            let profile_id = runtime.profile.profile_id.clone();
+            let supervisor = runtime.tools.supervisor();
+            install_skill_action_job_projection_listener(
+                &supervisor,
+                &profile_id,
+                session_id,
+                ledger,
+            );
+            supervisor
+                .enable_persistence(ui_protocol_task_output::task_state_path(
+                    &runtime.sessions_root,
+                    session_id,
+                ))
+                .map_err(|error| {
+                    RpcError::internal_error(format!(
+                        "failed to restore skill action tasks: {error}"
+                    ))
+                })?;
+            Ok((
+                profile_id,
+                project_skill_action_jobs(supervisor.get_tasks_for_session(&session_id.0)),
+            ))
+        }
+        Err(_) => {
+            let (profile_id, store_root) = skill_action_profile_data_dir(state, active_profile_id)?;
+            let jobs = load_skill_action_jobs(&store_root, session_id).map_err(|error| {
+                RpcError::internal_error(format!("failed to restore skill action tasks: {error}"))
+            })?;
+            Ok((profile_id, jobs))
+        }
+    }
+}
+
+async fn raw_skill_action_job_list(
+    state: &Arc<AppState>,
+    ledger: &Arc<UiProtocolLedger>,
     request: &RpcRequest<Value>,
     connection_profile_id: Option<&str>,
 ) -> Result<Value, RpcError> {
@@ -11703,11 +11795,9 @@ fn raw_skill_action_job_list(
         params.profile_id.as_deref(),
         connection_profile_id,
     )?;
-    let (profile_id, store) =
-        skill_action_job_store_for_profile(state, active_profile_id.as_deref())?;
-    let mut jobs = store.list(&session_id).map_err(|error| {
-        RpcError::internal_error(format!("failed to list skill action jobs: {error}"))
-    })?;
+    let (profile_id, mut jobs) =
+        load_skill_action_job_view(state, ledger, &session_id, active_profile_id.as_deref())
+            .await?;
     if let Some(batch_id) = params
         .batch_id
         .as_deref()
@@ -11736,8 +11826,9 @@ fn raw_skill_action_job_list(
     }))
 }
 
-fn raw_skill_action_job_read(
+async fn raw_skill_action_job_read(
     state: &Arc<AppState>,
+    ledger: &Arc<UiProtocolLedger>,
     request: &RpcRequest<Value>,
     connection_profile_id: Option<&str>,
 ) -> Result<Value, RpcError> {
@@ -11747,14 +11838,14 @@ fn raw_skill_action_job_read(
         params.profile_id.as_deref(),
         connection_profile_id,
     )?;
-    let (_profile_id, store) =
-        skill_action_job_store_for_profile(state, active_profile_id.as_deref())?;
-    let Some(job) = store
-        .read(&params.session_id, &params.job_id)
-        .map_err(|error| {
-            RpcError::internal_error(format!("failed to read skill action job: {error}"))
-        })?
-    else {
+    let (_profile_id, jobs) = load_skill_action_job_view(
+        state,
+        ledger,
+        &params.session_id,
+        active_profile_id.as_deref(),
+    )
+    .await?;
+    let Some(job) = jobs.into_iter().find(|job| job.job_id == params.job_id) else {
         return Err(RpcError::invalid_params(format!(
             "skill action job '{}' was not found",
             params.job_id
@@ -16237,10 +16328,10 @@ async fn handle_raw_appui_rpc(
             .await
         }
         APPUI_METHOD_SKILL_ACTION_JOB_LIST => {
-            raw_skill_action_job_list(state, request, connection_profile_id)
+            raw_skill_action_job_list(state, ledger, request, connection_profile_id).await
         }
         APPUI_METHOD_SKILL_ACTION_JOB_READ => {
-            raw_skill_action_job_read(state, request, connection_profile_id)
+            raw_skill_action_job_read(state, ledger, request, connection_profile_id).await
         }
         APPUI_METHOD_PROFILE_SKILLS_REGISTRY_SEARCH => {
             raw_profile_skills_registry_search(state, request, connection_profile_id).await

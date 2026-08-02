@@ -836,28 +836,32 @@ async fn llm_select_does_not_abandon_running_skill_action_jobs() {
         .get("job-owner")
         .expect("read profile")
         .expect("profile exists");
-    let job_store = SkillActionJobStore::open(profile_store.resolve_data_dir(&profile));
+    let profile_data_dir = profile_store.resolve_data_dir(&profile);
     let session_id = SessionKey("web-running-skill-action".into());
-    let now = Utc::now();
-    job_store
-        .append(&SkillActionJobRecord {
-            job_id: "running-job".into(),
-            batch_id: "batch-1".into(),
-            profile_id: "job-owner".into(),
-            session_id: session_id.clone(),
-            action_id: "source.import".into(),
-            skill_id: "mofa-notebook-source".into(),
-            status: SkillActionJobStatus::Running,
-            input_path: Some("uploads/report.pdf".into()),
-            filename: Some("report.pdf".into()),
-            materialized_path: Some("uploads/report.pdf".into()),
-            output: None,
-            error: None,
-            result: None,
-            created_at: now,
-            updated_at: now,
-        })
-        .expect("persist running job");
+    let supervisor = Arc::new(octos_agent::TaskSupervisor::new());
+    supervisor
+        .enable_persistence(ui_protocol_task_output::task_state_path(
+            &profile_data_dir,
+            &session_id,
+        ))
+        .unwrap();
+    let task_id = supervisor.register("source_import", "running-job", Some(&session_id.0));
+    supervisor.set_projection_metadata(
+        &task_id,
+        SkillActionProjectionMetadata::new(
+            "batch-1".into(),
+            "job-owner".into(),
+            session_id.clone(),
+            "source.import".into(),
+            "mofa-notebook-source".into(),
+            Some("uploads/report.pdf".into()),
+            Some("report.pdf".into()),
+            Some("uploads/report.pdf".into()),
+        )
+        .into_value(),
+    );
+    let _guard = octos_agent::TaskTerminalGuard::new(Arc::clone(&supervisor), task_id.clone());
+    supervisor.mark_running(&task_id);
 
     raw_profile_llm_select(
         &state,
@@ -877,9 +881,10 @@ async fn llm_select_does_not_abandon_running_skill_action_jobs() {
     .expect("switch dynamic profile runtime");
 
     assert_eq!(
-        job_store
-            .read(&session_id, "running-job")
-            .expect("read job")
+        load_skill_action_jobs(&profile_data_dir, &session_id)
+            .expect("read jobs")
+            .into_iter()
+            .find(|job| job.job_id == task_id)
             .expect("running job")
             .status,
         SkillActionJobStatus::Running,
@@ -6858,6 +6863,58 @@ impl octos_agent::Tool for ContextAwareActionTool {
     }
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn skill_action_contract_fixture_loads_invokes_and_returns_artifact_envelope() {
+    let fixture_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../e2e/fixtures/compat-test-skill");
+    let fixture_root = fixture_dir.parent().unwrap();
+    let mut registry = octos_agent::ToolRegistry::new();
+    let loaded =
+        octos_agent::PluginLoader::load_into(&mut registry, &[fixture_root.to_path_buf()], &[])
+            .expect("load reproducible skill action fixture");
+    let records = trusted_skill_action_records(&loaded.loaded_actions, &registry, None, &[]);
+    assert!(
+        records
+            .iter()
+            .any(|record| record.action.id == "source.import")
+    );
+    assert!(
+        records
+            .iter()
+            .any(|record| record.action.id == "reports.generate")
+    );
+
+    let workspace = tempfile::tempdir().unwrap();
+    let input = workspace.path().join("source.txt");
+    let output = workspace.path().join("summary.md");
+    std::fs::write(&input, "alpha\nbeta\n").unwrap();
+    let action = records
+        .iter()
+        .find(|record| record.action.id == "source.import")
+        .unwrap();
+    let result = invoke_skill_action_tool_binding(
+        &action.action,
+        &registry,
+        workspace.path(),
+        None,
+        json!({
+            "input_path": input,
+            "output_path": output,
+        }),
+        &SkillActionExecutionContext::zero(),
+    )
+    .await
+    .expect("invoke source.import fixture action");
+
+    assert_eq!(result["ok"], true);
+    assert_eq!(result["results"][0]["success"], true);
+    let artifact = &result["results"][0]["artifacts"][0];
+    assert!(artifact["handle"].as_str().unwrap().starts_with("ws/"));
+    assert_eq!(artifact["display_name"], "summary.md");
+    assert_eq!(artifact["media_type"], "text/markdown");
+}
+
 struct ApproveActionRequester;
 
 #[async_trait::async_trait]
@@ -7495,7 +7552,13 @@ async fn background_skill_action_file_each_returns_one_job_per_file() {
     registry.register(CaptureActionTool {
         calls: calls.clone(),
     });
-    let store = SkillActionJobStore::open(profile_data.path());
+    registry
+        .supervisor()
+        .enable_persistence(ui_protocol_task_output::task_state_path(
+            profile_data.path(),
+            &session_id,
+        ))
+        .unwrap();
     let execution_context = SkillActionExecutionContext::zero();
 
     let (response, queued) = enqueue_background_skill_action_jobs(
@@ -7506,8 +7569,6 @@ async fn background_skill_action_file_each_returns_one_job_per_file() {
         Some("tenant-a"),
         "tenant-a",
         &session_id,
-        &store,
-        None,
         json!({
             "paths": ["docs/a.pdf", "docs/b.jpg"],
             "title": "Notebook imports"
@@ -7527,7 +7588,12 @@ async fn background_skill_action_file_each_returns_one_job_per_file() {
         "background invocation must return before executing bound tools"
     );
 
-    let persisted = store.list(&session_id).unwrap();
+    let persisted = registry
+        .supervisor()
+        .get_tasks_for_session(&session_id.0)
+        .into_iter()
+        .filter_map(|task| project_skill_action_job(&task))
+        .collect::<Vec<_>>();
     assert_eq!(persisted.len(), 2);
     assert!(persisted.iter().all(|job| {
         job.status == SkillActionJobStatus::Queued
@@ -7599,8 +7665,20 @@ async fn background_skill_action_job_records_success_result() {
         calls: calls.clone(),
     });
     let registry = Arc::new(registry);
-    let store = SkillActionJobStore::open(profile_data.path());
     let ledger = Arc::new(UiProtocolLedger::new(8));
+    registry
+        .supervisor()
+        .enable_persistence(ui_protocol_task_output::task_state_path(
+            profile_data.path(),
+            &session_id,
+        ))
+        .unwrap();
+    install_skill_action_job_projection_listener(
+        &registry.supervisor(),
+        "tenant-a",
+        &session_id,
+        &ledger,
+    );
     let execution_context = SkillActionExecutionContext::zero();
     let (_response, mut queued) = enqueue_background_skill_action_jobs(
         &action,
@@ -7610,23 +7688,19 @@ async fn background_skill_action_job_records_success_result() {
         Some("tenant-a"),
         "tenant-a",
         &session_id,
-        &store,
-        Some(&ledger),
         json!({ "paths": ["uploads/report.pdf"] }),
         &execution_context,
     )
     .unwrap();
 
-    run_background_skill_action_job(
-        registry,
-        queued.remove(0),
-        store.clone(),
-        Some(ledger.clone()),
-    )
-    .await
-    .unwrap();
+    run_background_skill_action_job(Arc::clone(&registry), queued.remove(0)).await;
 
-    let persisted = store.list(&session_id).unwrap();
+    let persisted = registry
+        .supervisor()
+        .get_tasks_for_session(&session_id.0)
+        .into_iter()
+        .filter_map(|task| project_skill_action_job(&task))
+        .collect::<Vec<_>>();
     assert_eq!(persisted.len(), 1);
     let job = &persisted[0];
     assert_eq!(job.status, SkillActionJobStatus::Succeeded);
@@ -7642,19 +7716,6 @@ async fn background_skill_action_job_records_success_result() {
     assert!(wire_job.get("source_path").is_none());
     assert!(wire_job.get("metadata_path").is_none());
 
-    let snapshots = store.read_session_snapshots_for_test(&session_id).unwrap();
-    let statuses = snapshots
-        .iter()
-        .map(|job| job.status.clone())
-        .collect::<Vec<_>>();
-    assert_eq!(
-        statuses,
-        vec![
-            SkillActionJobStatus::Queued,
-            SkillActionJobStatus::Running,
-            SkillActionJobStatus::Succeeded
-        ]
-    );
     assert_eq!(
         calls.lock().unwrap()[0]["path"],
         json!("uploads/report.pdf")
@@ -7670,7 +7731,49 @@ async fn background_skill_action_job_records_success_result() {
             _ => None,
         })
         .collect::<Vec<_>>();
-    assert_eq!(update_statuses, vec!["queued", "running", "succeeded"]);
+    assert_eq!(update_statuses.first(), Some(&"queued"));
+    assert!(update_statuses.contains(&"running"));
+    assert_eq!(update_statuses.last(), Some(&"succeeded"));
+}
+
+#[tokio::test]
+async fn background_skill_action_cancelled_before_start_does_not_execute_tool() {
+    let workspace = tempfile::tempdir().unwrap();
+    let session_id = SessionKey("local:background-action-cancel".into());
+    let action: octos_agent::plugins::SkillActionDef = serde_json::from_value(json!({
+        "id": "report.generate",
+        "label": "Generate report",
+        "execution": "background",
+        "binding": { "type": "tool", "tool": "source_import" }
+    }))
+    .unwrap();
+    let calls = Arc::new(StdMutex::new(Vec::new()));
+    let mut registry = octos_agent::ToolRegistry::new();
+    registry.register(CaptureActionTool {
+        calls: Arc::clone(&calls),
+    });
+    let registry = Arc::new(registry);
+    let execution_context = SkillActionExecutionContext::zero();
+    let (_response, mut queued) = enqueue_background_skill_action_jobs(
+        &action,
+        "contract-fixture",
+        registry.as_ref(),
+        workspace.path(),
+        None,
+        "tenant-a",
+        &session_id,
+        json!({"prompt": "summary"}),
+        &execution_context,
+    )
+    .unwrap();
+    let task_id = queued[0].task_id.clone();
+    registry.supervisor().cancel(&task_id).unwrap();
+
+    run_background_skill_action_job(Arc::clone(&registry), queued.remove(0)).await;
+
+    assert!(calls.lock().unwrap().is_empty());
+    let job = project_skill_action_job(&registry.supervisor().get_task(&task_id).unwrap()).unwrap();
+    assert_eq!(job.status, SkillActionJobStatus::Cancelled);
 }
 
 #[test]
@@ -18532,6 +18635,7 @@ fn make_background_task(
         summary: None,
         artifact_count: None,
         runtime_policy_stamp: None,
+        projection_metadata: None,
     }
 }
 
@@ -18812,6 +18916,7 @@ async fn successful_spawn_only_completion_via_on_change_queues_autonomous_reentr
         summary: None,
         artifact_count: None,
         runtime_policy_stamp: None,
+        projection_metadata: None,
     };
 
     // The production `set_on_change` callback, threading the resolved
@@ -18924,6 +19029,7 @@ fn unified_terminal_test_task(
         summary: None,
         artifact_count: None,
         runtime_policy_stamp: None,
+        projection_metadata: None,
     }
 }
 
@@ -30668,8 +30774,8 @@ fn skill_action_job_updates_require_negotiated_job_feature() {
     ));
 }
 
-#[test]
-fn skill_action_job_list_requires_session_id() {
+#[tokio::test]
+async fn skill_action_job_list_requires_session_id() {
     let dir = tempfile::tempdir().unwrap();
     let state = Arc::new(local_profile_state(dir.path()));
     let request = RpcRequest::new(
@@ -30678,14 +30784,17 @@ fn skill_action_job_list_requires_session_id() {
         json!({ "profile_id": "alan0x" }),
     );
 
-    let error = raw_skill_action_job_list(&state, &request, None).unwrap_err();
+    let error =
+        raw_skill_action_job_list(&state, &Arc::new(UiProtocolLedger::new(8)), &request, None)
+            .await
+            .unwrap_err();
 
     assert_eq!(error.code, rpc_error_codes::INVALID_PARAMS);
     assert!(error.message.contains("session_id is required"));
 }
 
-#[test]
-fn skill_action_job_read_returns_unknown_job_error() {
+#[tokio::test]
+async fn skill_action_job_read_returns_unknown_job_error() {
     let dir = tempfile::tempdir().unwrap();
     let state = Arc::new(local_profile_state(dir.path()));
     state
@@ -30704,7 +30813,10 @@ fn skill_action_job_read_returns_unknown_job_error() {
         }),
     );
 
-    let error = raw_skill_action_job_read(&state, &request, None).unwrap_err();
+    let error =
+        raw_skill_action_job_read(&state, &Arc::new(UiProtocolLedger::new(8)), &request, None)
+            .await
+            .unwrap_err();
 
     assert_eq!(error.code, rpc_error_codes::INVALID_PARAMS);
     assert_eq!(

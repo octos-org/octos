@@ -283,7 +283,7 @@ pub struct SkillActionDef {
     /// Optional UI hints. The host treats this as opaque metadata.
     #[serde(default)]
     pub ui_schema: serde_json::Value,
-    /// Whether the action runs inline or as a persisted background job.
+    /// Whether the action runs inline or as a supervised background job.
     #[serde(default)]
     pub execution: SkillActionExecution,
     /// Backend binding. UI clients cannot override this at invocation time.
@@ -297,7 +297,7 @@ pub enum SkillActionExecution {
     /// Invoke the bound backend operation before returning the AppUI response.
     #[default]
     Sync,
-    /// Enqueue persisted job snapshots and execute out of band.
+    /// Register a persisted supervised task and execute out of band.
     Background,
 }
 
@@ -1641,6 +1641,36 @@ mod tests {
             SkillActionFileMaterialization::WorkspaceRelative
         );
         assert_eq!(action.execution, SkillActionExecution::Sync);
+    }
+
+    #[test]
+    fn contract_fixture_exports_source_and_background_generate_actions() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../e2e/fixtures/compat-test-skill/manifest.json");
+        let contents = std::fs::read_to_string(&path).expect("read skill action fixture");
+        let manifest: PluginManifest =
+            serde_json::from_str(&contents).expect("parse skill action fixture");
+
+        assert_eq!(manifest.canonical_id(), "compat-test-skill");
+        assert_eq!(manifest.version, "1.0.0");
+        let source = manifest
+            .actions
+            .iter()
+            .find(|action| action.id == "source.import")
+            .expect("source.import action");
+        let generate = manifest
+            .actions
+            .iter()
+            .find(|action| action.id == "reports.generate")
+            .expect("reports.generate action");
+        assert_eq!(source.execution, SkillActionExecution::Sync);
+        assert_eq!(generate.execution, SkillActionExecution::Background);
+        assert_eq!(source.binding.tool_name(), Some("summarize_text"));
+        assert_eq!(generate.binding.tool_name(), Some("summarize_text"));
+        manifest.validate_for_action_registration().unwrap();
+        for action in &manifest.actions {
+            action.validate_for_registration().unwrap();
+        }
     }
 
     #[test]

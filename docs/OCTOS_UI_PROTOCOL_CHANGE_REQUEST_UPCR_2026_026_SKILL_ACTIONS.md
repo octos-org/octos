@@ -124,6 +124,22 @@ workspace-relative paths must opt in with `workspace_relative`.
 
 ## Tests
 
+The reproducible contract registry is
+`e2e/fixtures/compat-test-skill/manifest.json`, skill id
+`compat-test-skill`, version `1.0.0`. It exports the concrete
+`source.import` and `reports.generate` actions against the fixture's executable
+`summarize_text` tool; downstream clients can use this fixture instead of
+depending on a developer-local skill installation.
+
+The production manifests are versioned in `mofa-org/mofa-skills` `main`
+(verified at commit `47a3778afa6072cd86d1ec87fe7a1d0b9a1c4a68`):
+`mofa-notebook-source@0.1.0` exports `source.import/list/rename/remove`,
+`mofa-notebook-study@0.1.0` exports `reports/quiz/flashcards.generate`,
+`mofa-notebook-data-table@0.2.0` exports `data_table.generate`, and the
+mind-map/video-overview packages export their respective `*.generate`
+actions. The in-repo fixture pins the host contract independently of network
+registry availability.
+
 - `crates/octos-agent/src/plugins/manifest.rs` parses manifest `actions[]`,
   tool bindings, `file_each`, and `file_materialization`.
 - `crates/octos-cli/src/api/ui_protocol.rs` covers discovery, capability

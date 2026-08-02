@@ -24,9 +24,10 @@ Do add an optional `execution` field to skill manifest actions:
 - `background`: `skill/action/invoke` enqueues one or more durable jobs and
   returns immediately
 
-Do model each background invocation as server-owned job snapshots. A `file_each`
-background action creates one job per materialized file and groups those jobs
-with a shared `batch_id`.
+Do model each background invocation as a supervised background task. A
+`file_each` action creates one task per materialized file and groups their job
+projections with a shared `batch_id`. `job_id` equals the canonical `task_id`;
+the job API does not own an independent lifecycle.
 
 Do support these statuses:
 
@@ -34,13 +35,16 @@ Do support these statuses:
 - `running`
 - `succeeded`
 - `failed`
+- `cancelled`
 - `abandoned`
 
-Do persist the latest job snapshots so clients can reconnect and query status.
-Queued or running jobs are not auto-resumed after process restart; startup
-recovery marks them `abandoned`.
+Do persist tasks through the standard per-session task ledger so clients can
+reconnect and query status. Queued or running tasks are not auto-resumed after
+process restart; the supervisor's orphan sweep projects them as `abandoned`.
 
-Do emit `skill/action/job/updated` after each appended job snapshot.
+Do derive `skill/action/job/updated` from the same task transition through a
+named `TaskSupervisor` listener. Named listeners fan out without replacing the
+runtime's primary `set_on_change` consumer.
 
 Do enforce the job snapshot's `profile_id` at both replay and live fan-out.
 A connection bound to another profile must not receive the notification even
@@ -182,15 +186,21 @@ notebook-specific fields.
 
 ## Persistence
 
-Job snapshots are append-only per session:
+The canonical task ledger is append-only per session:
 
 ```text
-<profile_data_dir>/skill-action-jobs/<encoded-session-id>.jsonl
+<session-store>/users/<encoded-base>/sessions/<encoded-topic>.tasks.jsonl
 ```
 
-The latest snapshot for a `job_id` wins. During `octos serve` startup, recovery
-scans persisted job files and appends `abandoned` snapshots for jobs whose
-latest status is `queued` or `running`.
+Skill fields (`batch_id`, action/skill identity, input paths, and result) live
+in opaque task projection metadata. Status, timestamps, output, errors,
+cancellation, and restart recovery come only from `TaskSupervisor`. Its orphan
+sweep marks stale active tasks failed with the restart-orphan reason; the job
+adapter maps that specific transition to `abandoned`. Explicit supervisor
+cancellation maps to `cancelled` and is never rewritten as failure.
+Because `job_id` equals `task_id`, the existing supervised task cancellation
+control is the only cancellation path; there is no second skill-job cancel
+state machine.
 
 ## Compatibility
 
@@ -204,11 +214,17 @@ before relying on job methods or notifications.
 ## Tests
 
 - Manifest parsing covers `execution: "background"` and default `sync`.
-- Job store tests cover latest-snapshot listing, reading, and restart recovery.
+- Task projection tests cover listing, reading, cancellation, and restart
+  recovery from the canonical task ledger.
 - AppUI route tests cover missing params, missing jobs, capability
   advertisement, and method dispatch.
 - Background invoke tests cover one job per `file_each` input and job snapshots
   progressing through queued/running/succeeded or failed.
+- The reproducible registry is
+  `e2e/fixtures/compat-test-skill/manifest.json`
+  (`compat-test-skill@1.0.0`), exporting concrete `source.import` and
+  background `reports.generate` actions. Production action packages and their
+  pinned registry commit are listed in UPCR-2026-026.
 
 ## References
 

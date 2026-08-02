@@ -11749,6 +11749,7 @@ mod tests {
             summary: None,
             artifact_count: None,
             runtime_policy_stamp: None,
+            projection_metadata: None,
         };
 
         let (_, agent) = upsert_background_task_agent(&task, None).expect("task should mirror");
@@ -11817,6 +11818,7 @@ mod tests {
             summary: None,
             artifact_count: None,
             runtime_policy_stamp: None,
+            projection_metadata: None,
         };
 
         let (mirrored_session, agent) =
@@ -11951,6 +11953,7 @@ mod tests {
                 summary: None,
                 artifact_count: None,
                 runtime_policy_stamp: None,
+                projection_metadata: None,
             };
             octos_agent::TerminalEvent {
                 task: task.clone(),
@@ -12463,6 +12466,7 @@ mod tests {
             summary: None,
             artifact_count: None,
             runtime_policy_stamp: None,
+            projection_metadata: None,
         };
         let signal = octos_agent::SpawnOnlyFailureSignal {
             task_id: task.id.clone(),
@@ -12564,6 +12568,7 @@ mod tests {
             summary: None,
             artifact_count: None,
             runtime_policy_stamp: None,
+            projection_metadata: None,
         };
         let signal = octos_agent::SpawnOnlyFailureSignal {
             task_id: task.id.clone(),
@@ -12681,6 +12686,7 @@ mod tests {
             summary: Some("deep code review".into()),
             artifact_count: None,
             runtime_policy_stamp: None,
+            projection_metadata: None,
         };
 
         // Reconcile under the profile the turn actually runs under ("coding"),

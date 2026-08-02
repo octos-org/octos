@@ -1,16 +1,16 @@
-use std::collections::{HashMap, HashSet};
-use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use chrono::{DateTime, Utc};
-use eyre::{Context, Result};
+use octos_agent::{BackgroundTask, TaskStatus, TaskSupervisor};
 use octos_core::SessionKey;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-const MAX_JOB_STORE_BYTES: u64 = 4 * 1024 * 1024;
+use super::ui_protocol_task_output::task_state_path;
+
+const SKILL_ACTION_PROJECTION_KIND: &str = "skill_action";
 const MAX_RETAINED_JOBS_PER_SESSION: usize = 256;
+const ORPHANED_ACROSS_RESTART: &str = "orphaned across restart";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -19,12 +19,72 @@ pub(crate) enum SkillActionJobStatus {
     Running,
     Succeeded,
     Failed,
+    Cancelled,
     Abandoned,
 }
 
 impl SkillActionJobStatus {
     fn is_active(&self) -> bool {
         matches!(self, Self::Queued | Self::Running)
+    }
+}
+
+/// Skill-owned fields persisted inside `BackgroundTask::projection_metadata`.
+/// The task supervisor remains generic and is the only lifecycle writer.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub(crate) struct SkillActionProjectionMetadata {
+    kind: String,
+    pub batch_id: String,
+    pub profile_id: String,
+    pub session_id: SessionKey,
+    pub action_id: String,
+    pub skill_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filename: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub materialized_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result: Option<Value>,
+}
+
+impl SkillActionProjectionMetadata {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        batch_id: String,
+        profile_id: String,
+        session_id: SessionKey,
+        action_id: String,
+        skill_id: String,
+        input_path: Option<String>,
+        filename: Option<String>,
+        materialized_path: Option<String>,
+    ) -> Self {
+        Self {
+            kind: SKILL_ACTION_PROJECTION_KIND.to_owned(),
+            batch_id,
+            profile_id,
+            session_id,
+            action_id,
+            skill_id,
+            input_path,
+            filename,
+            materialized_path,
+            result: None,
+        }
+    }
+
+    pub(crate) fn into_value(self) -> Value {
+        serde_json::to_value(self).expect("skill action projection metadata is serializable")
+    }
+
+    pub(crate) fn from_task(task: &BackgroundTask) -> Option<Self> {
+        let value = task.projection_metadata.as_ref()?;
+        if value.get("kind").and_then(Value::as_str) != Some(SKILL_ACTION_PROJECTION_KIND) {
+            return None;
+        }
+        serde_json::from_value(value.clone()).ok()
     }
 }
 
@@ -53,600 +113,184 @@ pub(crate) struct SkillActionJobRecord {
     pub updated_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone)]
-pub(crate) struct SkillActionJobStore {
-    profile_data_dir: PathBuf,
-    max_store_bytes: u64,
-    max_retained_jobs: usize,
-}
-
-impl SkillActionJobStore {
-    pub(crate) fn open(profile_data_dir: impl AsRef<Path>) -> Self {
-        Self {
-            profile_data_dir: profile_data_dir.as_ref().to_path_buf(),
-            max_store_bytes: MAX_JOB_STORE_BYTES,
-            max_retained_jobs: MAX_RETAINED_JOBS_PER_SESSION,
+fn projected_status(task: &BackgroundTask) -> SkillActionJobStatus {
+    match task.status {
+        TaskStatus::Spawned => SkillActionJobStatus::Queued,
+        TaskStatus::Running => SkillActionJobStatus::Running,
+        TaskStatus::Completed => SkillActionJobStatus::Succeeded,
+        TaskStatus::Cancelled => SkillActionJobStatus::Cancelled,
+        TaskStatus::Failed if task.error.as_deref() == Some(ORPHANED_ACROSS_RESTART) => {
+            SkillActionJobStatus::Abandoned
         }
-    }
-
-    #[cfg(test)]
-    fn open_with_limits(
-        profile_data_dir: impl AsRef<Path>,
-        max_store_bytes: u64,
-        max_retained_jobs: usize,
-    ) -> Self {
-        Self {
-            profile_data_dir: profile_data_dir.as_ref().to_path_buf(),
-            max_store_bytes,
-            max_retained_jobs,
-        }
-    }
-
-    pub(crate) fn append(&self, job: &SkillActionJobRecord) -> Result<()> {
-        let path = self.session_path(&job.session_id);
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)
-                .wrap_err_with(|| format!("failed to create job store dir {}", parent.display()))?;
-        }
-        let mut payload = serde_json::to_vec(job)
-            .wrap_err_with(|| format!("failed to serialize job {}", job.job_id))?;
-        payload.push(b'\n');
-        let mut file = OpenOptions::new()
-            .create(true)
-            .read(true)
-            .append(true)
-            .open(&path)
-            .wrap_err_with(|| format!("failed to open job store {}", path.display()))?;
-        fs2::FileExt::lock_exclusive(&file)
-            .wrap_err_with(|| format!("failed to lock job store {}", path.display()))?;
-        let write_result = (|| -> Result<()> {
-            file.write_all(&payload)
-                .wrap_err_with(|| format!("failed to append job {}", job.job_id))?;
-            if file
-                .metadata()
-                .wrap_err_with(|| format!("failed to stat job store {}", path.display()))?
-                .len()
-                > self.max_store_bytes
-            {
-                self.compact_locked_file(&mut file, &path)?;
-            }
-            Ok(())
-        })();
-        let unlock_result = fs2::FileExt::unlock(&file)
-            .wrap_err_with(|| format!("failed to unlock job store {}", path.display()));
-        write_result?;
-        unlock_result?;
-        Ok(())
-    }
-
-    pub(crate) fn list(&self, session_id: &SessionKey) -> Result<Vec<SkillActionJobRecord>> {
-        Ok(retain_recent_jobs(
-            latest_by_job_id(self.read_session_snapshots(session_id)?),
-            self.max_retained_jobs,
-        ))
-    }
-
-    pub(crate) fn read(
-        &self,
-        session_id: &SessionKey,
-        job_id: &str,
-    ) -> Result<Option<SkillActionJobRecord>> {
-        Ok(self
-            .list(session_id)?
-            .into_iter()
-            .find(|job| job.job_id == job_id))
-    }
-
-    pub(crate) fn mark_active_jobs_abandoned(&self) -> Result<usize> {
-        let jobs_dir = self.jobs_dir();
-        if !jobs_dir.exists() {
-            return Ok(0);
-        }
-
-        let mut count = 0;
-        for entry in fs::read_dir(&jobs_dir)
-            .wrap_err_with(|| format!("failed to read job store dir {}", jobs_dir.display()))?
-        {
-            let entry = entry.wrap_err("failed to read job store entry")?;
-            let path = entry.path();
-            if path.extension().and_then(|extension| extension.to_str()) != Some("jsonl") {
-                continue;
-            }
-            let snapshots = self.read_snapshots_from_path(&path)?;
-            for mut job in latest_by_job_id(snapshots) {
-                if !job.status.is_active() {
-                    continue;
-                }
-                job.status = SkillActionJobStatus::Abandoned;
-                job.error = Some("job abandoned after server restart".to_string());
-                job.updated_at = Utc::now();
-                self.append(&job)?;
-                count += 1;
-            }
-        }
-        Ok(count)
-    }
-
-    fn jobs_dir(&self) -> PathBuf {
-        self.profile_data_dir.join("skill-action-jobs")
-    }
-
-    fn session_path(&self, session_id: &SessionKey) -> PathBuf {
-        self.jobs_dir().join(format!(
-            "{}.jsonl",
-            octos_bus::session::encode_path_component(&session_id.0)
-        ))
-    }
-
-    fn read_session_snapshots(&self, session_id: &SessionKey) -> Result<Vec<SkillActionJobRecord>> {
-        self.read_snapshots_from_path(&self.session_path(session_id))
-    }
-
-    #[cfg(test)]
-    pub(crate) fn read_session_snapshots_for_test(
-        &self,
-        session_id: &SessionKey,
-    ) -> Result<Vec<SkillActionJobRecord>> {
-        self.read_session_snapshots(session_id)
-    }
-
-    fn read_snapshots_from_path(&self, path: &Path) -> Result<Vec<SkillActionJobRecord>> {
-        let mut file = match File::open(path) {
-            Ok(file) => file,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-            Err(error) => {
-                return Err(error)
-                    .wrap_err_with(|| format!("failed to open job store {}", path.display()));
-            }
-        };
-        fs2::FileExt::lock_shared(&file)
-            .wrap_err_with(|| format!("failed to lock job store {}", path.display()))?;
-        let mut contents = Vec::new();
-        let read_result = file
-            .read_to_end(&mut contents)
-            .wrap_err_with(|| format!("failed to read job store {}", path.display()));
-        let unlock_result = fs2::FileExt::unlock(&file)
-            .wrap_err_with(|| format!("failed to unlock job store {}", path.display()));
-        read_result?;
-        unlock_result?;
-
-        parse_snapshot_contents(path, &contents)
-    }
-
-    fn compact_locked_file(&self, file: &mut File, path: &Path) -> Result<()> {
-        file.flush()
-            .wrap_err_with(|| format!("failed to flush job store {}", path.display()))?;
-        file.seek(SeekFrom::Start(0))
-            .wrap_err_with(|| format!("failed to seek job store {}", path.display()))?;
-        let mut contents = Vec::new();
-        file.read_to_end(&mut contents)
-            .wrap_err_with(|| format!("failed to read job store {}", path.display()))?;
-
-        let retained = retain_recent_jobs(
-            latest_by_job_id(parse_snapshot_contents(path, &contents)?),
-            self.max_retained_jobs,
-        );
-        let mut compacted = Vec::new();
-        for job in retained {
-            serde_json::to_writer(&mut compacted, &job)
-                .wrap_err_with(|| format!("failed to compact job {}", job.job_id))?;
-            compacted.push(b'\n');
-        }
-
-        file.set_len(0)
-            .wrap_err_with(|| format!("failed to truncate job store {}", path.display()))?;
-        file.seek(SeekFrom::Start(0))
-            .wrap_err_with(|| format!("failed to rewind job store {}", path.display()))?;
-        file.write_all(&compacted)
-            .wrap_err_with(|| format!("failed to rewrite job store {}", path.display()))?;
-        file.flush()
-            .wrap_err_with(|| format!("failed to flush job store {}", path.display()))?;
-        Ok(())
+        TaskStatus::Failed => SkillActionJobStatus::Failed,
     }
 }
 
-fn parse_snapshot_contents(path: &Path, contents: &[u8]) -> Result<Vec<SkillActionJobRecord>> {
-    let lines = contents.split(|byte| *byte == b'\n').collect::<Vec<_>>();
-    let last_non_empty = lines
-        .iter()
-        .rposition(|line| !line.iter().all(u8::is_ascii_whitespace));
-    let mut records = Vec::new();
-    for (index, line) in lines.into_iter().enumerate() {
-        if line.iter().all(u8::is_ascii_whitespace) {
-            continue;
-        }
-        match serde_json::from_slice(line) {
-            Ok(record) => records.push(record),
-            Err(error) if Some(index) == last_non_empty => {
-                tracing::warn!(
-                    path = %path.display(),
-                    line = index + 1,
-                    %error,
-                    "ignoring malformed trailing skill action job snapshot"
-                );
-            }
-            Err(error) => {
-                return Err(error).wrap_err_with(|| {
-                    format!(
-                        "failed to parse job store line {} in {}",
-                        index + 1,
-                        path.display()
-                    )
-                });
-            }
-        }
-    }
-    Ok(records)
+pub(crate) fn project_skill_action_job(task: &BackgroundTask) -> Option<SkillActionJobRecord> {
+    let metadata = SkillActionProjectionMetadata::from_task(task)?;
+    Some(SkillActionJobRecord {
+        job_id: task.id.clone(),
+        batch_id: metadata.batch_id,
+        profile_id: metadata.profile_id,
+        session_id: metadata.session_id,
+        action_id: metadata.action_id,
+        skill_id: metadata.skill_id,
+        status: projected_status(task),
+        input_path: metadata.input_path,
+        filename: metadata.filename,
+        materialized_path: metadata.materialized_path,
+        output: task.final_output.clone(),
+        error: task.error.clone(),
+        result: metadata.result,
+        created_at: task.started_at,
+        updated_at: task.updated_at,
+    })
 }
 
-fn latest_by_job_id(snapshots: Vec<SkillActionJobRecord>) -> Vec<SkillActionJobRecord> {
-    let mut latest = HashMap::<String, SkillActionJobRecord>::new();
-    for snapshot in snapshots {
-        latest.insert(snapshot.job_id.clone(), snapshot);
-    }
-    latest.into_values().collect()
+pub(crate) fn with_skill_action_result(task: &BackgroundTask, result: Value) -> Option<Value> {
+    let mut metadata = SkillActionProjectionMetadata::from_task(task)?;
+    metadata.result = Some(result);
+    Some(metadata.into_value())
 }
 
-fn retain_recent_jobs(
-    mut jobs: Vec<SkillActionJobRecord>,
-    max_jobs: usize,
-) -> Vec<SkillActionJobRecord> {
+/// Restore jobs through the canonical task ledger. `enable_persistence`
+/// performs the supervisor's orphan sweep, so queued/running work from a
+/// prior process is projected as `abandoned` rather than being mutated by a
+/// second job-specific recovery store.
+pub(crate) fn load_skill_action_jobs(
+    data_dir: &Path,
+    session_id: &SessionKey,
+) -> std::io::Result<Vec<SkillActionJobRecord>> {
+    let supervisor = TaskSupervisor::new();
+    supervisor.enable_persistence(task_state_path(data_dir, session_id))?;
+    Ok(project_skill_action_jobs(
+        supervisor.get_tasks_for_session(&session_id.0),
+    ))
+}
+
+pub(crate) fn project_skill_action_jobs(tasks: Vec<BackgroundTask>) -> Vec<SkillActionJobRecord> {
+    let mut jobs = tasks
+        .into_iter()
+        .filter_map(|task| project_skill_action_job(&task))
+        .collect::<Vec<_>>();
     jobs.sort_by(|left, right| {
         left.updated_at
             .cmp(&right.updated_at)
             .then_with(|| left.job_id.cmp(&right.job_id))
     });
-    if jobs.len() <= max_jobs {
-        return jobs;
+    if jobs.len() > MAX_RETAINED_JOBS_PER_SESSION {
+        let active = jobs.iter().filter(|job| job.status.is_active()).count();
+        let terminal_budget = MAX_RETAINED_JOBS_PER_SESSION.saturating_sub(active);
+        let first_terminal_to_keep = jobs
+            .iter()
+            .rev()
+            .filter(|job| !job.status.is_active())
+            .nth(terminal_budget.saturating_sub(1))
+            .map(|job| job.updated_at);
+        if let Some(cutoff) = first_terminal_to_keep {
+            jobs.retain(|job| job.status.is_active() || job.updated_at >= cutoff);
+        } else if terminal_budget == 0 {
+            jobs.retain(|job| job.status.is_active());
+        }
     }
-
-    let active_count = jobs.iter().filter(|job| job.status.is_active()).count();
-    let terminal_budget = max_jobs.saturating_sub(active_count);
-    let retained_terminal_ids = jobs
-        .iter()
-        .rev()
-        .filter(|job| !job.status.is_active())
-        .take(terminal_budget)
-        .map(|job| job.job_id.clone())
-        .collect::<HashSet<_>>();
-    jobs.retain(|job| job.status.is_active() || retained_terminal_ids.contains(&job.job_id));
     jobs
-}
-
-pub(crate) fn recover_skill_action_jobs_for_profile_start(
-    profile_id: &str,
-    profile_data_dir: impl AsRef<Path>,
-) -> Result<usize> {
-    let store = SkillActionJobStore::open(profile_data_dir);
-    let abandoned = store.mark_active_jobs_abandoned()?;
-    if abandoned > 0 {
-        tracing::info!(
-            profile_id,
-            abandoned_jobs = abandoned,
-            "recovered active skill action jobs after profile start"
-        );
-    }
-    Ok(abandoned)
 }
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
-    use chrono::{Duration, Utc};
-    use octos_core::SessionKey;
     use serde_json::json;
 
     use super::*;
 
-    fn record(
-        session_id: &SessionKey,
-        job_id: &str,
-        status: SkillActionJobStatus,
-        updated_offset_secs: i64,
-    ) -> SkillActionJobRecord {
-        let now = Utc::now();
-        SkillActionJobRecord {
-            job_id: job_id.to_string(),
-            batch_id: "batch-a".to_string(),
-            profile_id: "alan0x".to_string(),
-            session_id: session_id.clone(),
-            action_id: "source.import".to_string(),
-            skill_id: "mofa-notebook-source".to_string(),
-            status,
-            input_path: Some("up://report.md".to_string()),
-            filename: Some("report.md".to_string()),
-            materialized_path: Some("uploads/report.md".to_string()),
-            output: None,
-            error: None,
-            result: None,
-            created_at: now,
-            updated_at: now + Duration::seconds(updated_offset_secs),
-        }
-    }
-
-    #[test]
-    fn should_list_latest_jobs_when_snapshots_are_appended() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = SkillActionJobStore::open(dir.path());
-        let session_id = SessionKey("local:test#topic/unsafe".to_string());
-
-        store
-            .append(&record(
-                &session_id,
-                "job-a",
-                SkillActionJobStatus::Queued,
-                1,
-            ))
-            .unwrap();
-        store
-            .append(&record(
-                &session_id,
-                "job-b",
-                SkillActionJobStatus::Failed,
-                2,
-            ))
-            .unwrap();
-        store
-            .append(&record(
-                &session_id,
-                "job-a",
-                SkillActionJobStatus::Running,
-                3,
-            ))
-            .unwrap();
-
-        let jobs = store.list(&session_id).unwrap();
-
-        assert_eq!(jobs.len(), 2);
-        assert_eq!(jobs[0].job_id, "job-b");
-        assert_eq!(jobs[0].status, SkillActionJobStatus::Failed);
-        assert_eq!(jobs[1].job_id, "job-a");
-        assert_eq!(jobs[1].status, SkillActionJobStatus::Running);
-        assert_eq!(
-            store.session_path(&session_id),
-            dir.path()
-                .join("skill-action-jobs")
-                .join("local%3Atest%23topic%2Funsafe.jsonl")
+    fn attach(supervisor: &TaskSupervisor, task_id: &str, session_id: &SessionKey) {
+        supervisor.set_projection_metadata(
+            task_id,
+            SkillActionProjectionMetadata::new(
+                "batch-a".into(),
+                "profile-a".into(),
+                session_id.clone(),
+                "source.import".into(),
+                "source-skill".into(),
+                Some("up://report.pdf".into()),
+                Some("report.pdf".into()),
+                Some("uploads/report.pdf".into()),
+            )
+            .into_value(),
         );
     }
 
     #[test]
-    fn should_read_latest_job_when_job_exists() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = SkillActionJobStore::open(dir.path());
-        let session_id = SessionKey("local:test".to_string());
-        let mut queued = record(&session_id, "job-a", SkillActionJobStatus::Queued, 1);
-        queued.output = Some("queued".to_string());
-        store.append(&queued).unwrap();
+    fn task_lifecycle_projects_to_skill_job_contract() {
+        let supervisor = TaskSupervisor::new();
+        let session_id = SessionKey("local:projection".into());
+        let task_id = supervisor.register("source_import", "call-a", Some(&session_id.0));
+        attach(&supervisor, &task_id, &session_id);
 
-        let mut succeeded = record(&session_id, "job-a", SkillActionJobStatus::Succeeded, 2);
-        succeeded.output = Some("done".to_string());
-        succeeded.result = Some(json!({"source": {"id": "src-1"}}));
-        store.append(&succeeded).unwrap();
+        let queued = project_skill_action_job(&supervisor.get_task(&task_id).unwrap()).unwrap();
+        assert_eq!(queued.job_id, task_id, "job id must equal task id");
+        assert_eq!(queued.status, SkillActionJobStatus::Queued);
 
-        let job = store.read(&session_id, "job-a").unwrap().unwrap();
+        supervisor.mark_running(&task_id);
+        assert_eq!(
+            project_skill_action_job(&supervisor.get_task(&task_id).unwrap())
+                .unwrap()
+                .status,
+            SkillActionJobStatus::Running
+        );
+        supervisor.mark_runtime_state(
+            &task_id,
+            octos_agent::TaskRuntimeState::VerifyingOutputs,
+            None,
+        );
+        assert_eq!(
+            project_skill_action_job(&supervisor.get_task(&task_id).unwrap())
+                .unwrap()
+                .status,
+            SkillActionJobStatus::Running,
+            "verifying remains the job contract's running state"
+        );
 
-        assert_eq!(job.status, SkillActionJobStatus::Succeeded);
-        assert_eq!(job.output.as_deref(), Some("done"));
-        assert_eq!(job.result.as_ref().unwrap()["source"]["id"], "src-1");
-        assert!(store.read(&session_id, "missing").unwrap().is_none());
+        let task = supervisor.get_task(&task_id).unwrap();
+        supervisor.set_projection_metadata(
+            &task_id,
+            with_skill_action_result(&task, json!({"success": true})).unwrap(),
+        );
+        supervisor.record_final_output(&task_id, "source imported");
+        supervisor.mark_completed(&task_id, vec![]);
+        let succeeded = project_skill_action_job(&supervisor.get_task(&task_id).unwrap()).unwrap();
+        assert_eq!(succeeded.status, SkillActionJobStatus::Succeeded);
+        assert_eq!(succeeded.output.as_deref(), Some("source imported"));
+        assert_eq!(succeeded.result, Some(json!({"success": true})));
     }
 
     #[test]
-    fn should_mark_active_jobs_abandoned_when_recovering_after_restart() {
+    fn cancelled_and_restart_orphans_have_distinct_statuses() {
         let dir = tempfile::tempdir().unwrap();
-        let store = SkillActionJobStore::open(dir.path());
-        let session_a = SessionKey("local:a".to_string());
-        let session_b = SessionKey("local:b".to_string());
+        let session_id = SessionKey("local:recovery".into());
+        let ledger = task_state_path(dir.path(), &session_id);
+        let supervisor = TaskSupervisor::new();
+        supervisor.enable_persistence(&ledger).unwrap();
 
-        store
-            .append(&record(
-                &session_a,
-                "queued",
-                SkillActionJobStatus::Queued,
-                1,
-            ))
-            .unwrap();
-        store
-            .append(&record(
-                &session_a,
-                "running",
-                SkillActionJobStatus::Running,
-                2,
-            ))
-            .unwrap();
-        store
-            .append(&record(
-                &session_a,
-                "succeeded",
-                SkillActionJobStatus::Succeeded,
-                3,
-            ))
-            .unwrap();
-        store
-            .append(&record(
-                &session_b,
-                "failed",
-                SkillActionJobStatus::Failed,
-                4,
-            ))
-            .unwrap();
+        let cancelled = supervisor.register("source_import", "cancel", Some(&session_id.0));
+        attach(&supervisor, &cancelled, &session_id);
+        supervisor.cancel(&cancelled).unwrap();
 
-        let abandoned = store.mark_active_jobs_abandoned().unwrap();
+        let orphan = supervisor.register("source_import", "orphan", Some(&session_id.0));
+        attach(&supervisor, &orphan, &session_id);
+        supervisor.mark_running(&orphan);
+        drop(supervisor);
 
-        assert_eq!(abandoned, 2);
-        assert_eq!(
-            store.read(&session_a, "queued").unwrap().unwrap().status,
-            SkillActionJobStatus::Abandoned
-        );
-        assert_eq!(
-            store.read(&session_a, "running").unwrap().unwrap().status,
-            SkillActionJobStatus::Abandoned
-        );
-        assert_eq!(
-            store.read(&session_a, "succeeded").unwrap().unwrap().status,
-            SkillActionJobStatus::Succeeded
-        );
-        assert_eq!(
-            store.read(&session_b, "failed").unwrap().unwrap().status,
-            SkillActionJobStatus::Failed
-        );
-    }
-
-    #[test]
-    fn should_recover_active_jobs_when_profile_starts() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = SkillActionJobStore::open(dir.path());
-        let session_id = SessionKey("local:profile-start".to_string());
-
-        store
-            .append(&record(
-                &session_id,
-                "job-queued",
-                SkillActionJobStatus::Queued,
-                1,
-            ))
-            .unwrap();
-        store
-            .append(&record(
-                &session_id,
-                "job-running",
-                SkillActionJobStatus::Running,
-                2,
-            ))
-            .unwrap();
-        store
-            .append(&record(
-                &session_id,
-                "job-finished",
-                SkillActionJobStatus::Succeeded,
-                3,
-            ))
-            .unwrap();
-
-        let recovered = recover_skill_action_jobs_for_profile_start("alan0x", dir.path()).unwrap();
-
-        assert_eq!(recovered, 2);
-        let jobs = store.list(&session_id).unwrap();
+        let jobs = load_skill_action_jobs(dir.path(), &session_id).unwrap();
         assert_eq!(
             jobs.iter()
-                .filter(|job| job.status == SkillActionJobStatus::Abandoned)
-                .count(),
-            2
+                .find(|job| job.job_id == cancelled)
+                .unwrap()
+                .status,
+            SkillActionJobStatus::Cancelled
         );
-        assert!(jobs.iter().any(|job| {
-            job.job_id == "job-finished" && job.status == SkillActionJobStatus::Succeeded
-        }));
-    }
-
-    #[test]
-    fn should_preserve_every_snapshot_when_appends_are_concurrent() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = Arc::new(SkillActionJobStore::open(dir.path()));
-        let session_id = SessionKey("local:concurrent".to_string());
-        let mut threads = Vec::new();
-
-        for index in 0..32 {
-            let store = Arc::clone(&store);
-            let session_id = session_id.clone();
-            threads.push(std::thread::spawn(move || {
-                store
-                    .append(&record(
-                        &session_id,
-                        &format!("job-{index}"),
-                        SkillActionJobStatus::Queued,
-                        index,
-                    ))
-                    .unwrap();
-            }));
-        }
-        for thread in threads {
-            thread.join().unwrap();
-        }
-
-        let snapshots = store.read_session_snapshots_for_test(&session_id).unwrap();
-        assert_eq!(snapshots.len(), 32);
-    }
-
-    #[test]
-    fn should_compact_history_without_dropping_active_jobs() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = SkillActionJobStore::open_with_limits(dir.path(), 1, 3);
-        let session_id = SessionKey("local:bounded".to_string());
-
-        store
-            .append(&record(
-                &session_id,
-                "job-active",
-                SkillActionJobStatus::Running,
-                0,
-            ))
-            .unwrap();
-        for index in 1..=4 {
-            store
-                .append(&record(
-                    &session_id,
-                    &format!("job-{index}"),
-                    SkillActionJobStatus::Succeeded,
-                    index,
-                ))
-                .unwrap();
-        }
-
-        let snapshots = store.read_session_snapshots_for_test(&session_id).unwrap();
-        let jobs = store.list(&session_id).unwrap();
-
-        assert_eq!(snapshots.len(), 3);
-        assert_eq!(jobs.len(), 3);
-        assert!(jobs.iter().any(|job| job.job_id == "job-active"));
-        assert!(jobs.iter().any(|job| job.job_id == "job-3"));
-        assert!(jobs.iter().any(|job| job.job_id == "job-4"));
-    }
-
-    #[test]
-    fn should_ignore_only_a_malformed_trailing_snapshot() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = SkillActionJobStore::open(dir.path());
-        let session_id = SessionKey("local:torn-tail".to_string());
-        let valid = serde_json::to_string(&record(
-            &session_id,
-            "job-valid",
-            SkillActionJobStatus::Succeeded,
-            1,
-        ))
-        .unwrap();
-        std::fs::create_dir_all(store.jobs_dir()).unwrap();
-        std::fs::write(
-            store.session_path(&session_id),
-            format!("{valid}\n{{\"job_id\":\"torn"),
-        )
-        .unwrap();
-
-        let jobs = store.list(&session_id).unwrap();
-        assert_eq!(jobs.len(), 1);
-        assert_eq!(jobs[0].job_id, "job-valid");
-    }
-
-    #[test]
-    fn should_reject_a_malformed_snapshot_before_the_trailing_record() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = SkillActionJobStore::open(dir.path());
-        let session_id = SessionKey("local:bad-middle".to_string());
-        let valid = serde_json::to_string(&record(
-            &session_id,
-            "job-valid",
-            SkillActionJobStatus::Succeeded,
-            1,
-        ))
-        .unwrap();
-        std::fs::create_dir_all(store.jobs_dir()).unwrap();
-        std::fs::write(
-            store.session_path(&session_id),
-            format!("{{broken\n{valid}\n"),
-        )
-        .unwrap();
-
-        assert!(store.list(&session_id).is_err());
+        assert_eq!(
+            jobs.iter().find(|job| job.job_id == orphan).unwrap().status,
+            SkillActionJobStatus::Abandoned
+        );
     }
 }

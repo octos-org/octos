@@ -808,19 +808,6 @@ impl ServeCommand {
             HashMap::new();
         let all_profiles = profile_store.list().unwrap_or_default();
         for profile in &all_profiles {
-            let profile_data_dir = profile_store.resolve_data_dir(profile);
-            if let Err(error) =
-                crate::api::skill_action_jobs::recover_skill_action_jobs_for_profile_start(
-                    &profile.id,
-                    &profile_data_dir,
-                )
-            {
-                tracing::warn!(
-                    profile_id = %profile.id,
-                    %error,
-                    "failed to recover active skill action jobs before profile bootstrap",
-                );
-            }
             if !profile.enabled || profile.parent_id.is_some() {
                 continue;
             }
@@ -831,6 +818,7 @@ impl ServeCommand {
                 );
                 continue;
             }
+            let profile_data_dir = profile_store.resolve_data_dir(profile);
             // Resolve the full runtime profile through the single shared
             // resolver: parent/sub-account inheritance THEN the store's global
             // `profile-defaults.json` base, so inherited hooks / plugins /

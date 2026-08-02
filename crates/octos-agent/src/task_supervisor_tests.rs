@@ -60,6 +60,48 @@ fn should_register_task_with_spawned_status() {
     assert!(tasks[0].updated_at >= tasks[0].started_at);
 }
 
+#[test]
+fn named_change_listeners_fan_out_without_replacing_primary_callback() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let supervisor = TaskSupervisor::new();
+    let primary = Arc::new(AtomicUsize::new(0));
+    let projection_a = Arc::new(AtomicUsize::new(0));
+    let projection_b = Arc::new(AtomicUsize::new(0));
+
+    let count = Arc::clone(&primary);
+    supervisor.set_on_change(move |_| {
+        count.fetch_add(1, Ordering::SeqCst);
+    });
+    let count = Arc::clone(&projection_a);
+    supervisor.set_on_change_listener("projection-a", move |_| {
+        count.fetch_add(1, Ordering::SeqCst);
+    });
+    let count = Arc::clone(&projection_b);
+    supervisor.set_on_change_listener("projection-b", move |_| {
+        count.fetch_add(1, Ordering::SeqCst);
+    });
+
+    let id = supervisor.register("source_import", "call-fanout", None);
+    supervisor.mark_running(&id);
+    assert_eq!(primary.load(Ordering::SeqCst), 1);
+    assert_eq!(projection_a.load(Ordering::SeqCst), 1);
+    assert_eq!(projection_b.load(Ordering::SeqCst), 1);
+
+    // Replacing a named listener is idempotent and leaves both the primary
+    // callback and other projections installed.
+    let replacement = Arc::new(AtomicUsize::new(0));
+    let count = Arc::clone(&replacement);
+    supervisor.set_on_change_listener("projection-a", move |_| {
+        count.fetch_add(1, Ordering::SeqCst);
+    });
+    supervisor.mark_completed(&id, vec![]);
+    assert_eq!(primary.load(Ordering::SeqCst), 2);
+    assert_eq!(projection_a.load(Ordering::SeqCst), 1);
+    assert_eq!(replacement.load(Ordering::SeqCst), 1);
+    assert_eq!(projection_b.load(Ordering::SeqCst), 2);
+}
+
 /// #966 / M13-B — the projection setter populates the new
 /// optional fields. Verifies that:
 /// - Newly-registered tasks start with all five fields None.

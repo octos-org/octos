@@ -314,8 +314,8 @@ Current M9 sandbox-parity decision:
   capability feature) is governed by accepted
   [UPCR-2026-027](../docs/OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_027_SKILL_ACTION_JOBS.md).
   It lets clients observe manifest-declared background actions through generic
-  persisted job snapshots. It does not introduce notebook-specific routes or a
-  generic client-selected tool-call primitive.
+  projections of persisted supervised tasks. It does not introduce
+  notebook-specific routes or a generic client-selected tool-call primitive.
 
 ## 5. Identity Model
 
@@ -1390,8 +1390,9 @@ Clients must use that method list to enable or disable slash commands.
 - files missing from or outside the session workspace are omitted from
   `artifacts[]`
 - when the manifest action declares `execution: "background"`, response shape
-  is `{ action_id, ok, batch_id, jobs }`; the server appends persisted job
-  snapshots and emits `skill/action/job/updated` for subsequent state changes
+  is `{ action_id, ok, batch_id, jobs }`; each `job_id` equals its supervised
+  `task_id`, and `skill/action/job/updated` is derived from that task's state
+  transitions
 - background actions require `skill.action_jobs.v1`; direct invocation without
   that negotiated capability fails with `method_not_supported`
 
@@ -1401,8 +1402,8 @@ Clients must use that method list to enable or disable slash commands.
   `action_id`
 - returns `{ profile_id, session_id, count, jobs }`
 - each job is the latest persisted snapshot for that `job_id`
-- job status is one of `queued`, `running`, `succeeded`, `failed`, or
-  `abandoned`
+- job status is one of `queued`, `running`, `succeeded`, `failed`,
+  `cancelled`, or `abandoned`
 - queued/running jobs from a previous server process are surfaced as
   `abandoned` after startup recovery; clients must not assume automatic resume
 - job list/read, replay, and live notification delivery are scoped by both
@@ -1417,7 +1418,8 @@ Clients must use that method list to enable or disable slash commands.
 
 `skill/action/job/updated`:
 
-- server notification emitted after every persisted background job snapshot
+- server notification derived from every supervised task transition carrying
+  skill-action projection metadata
 - payload is `{ profile_id, session_id, job }`
 - the `job` object uses the same wire shape returned by
   `skill/action/job/list` and `skill/action/job/read`
