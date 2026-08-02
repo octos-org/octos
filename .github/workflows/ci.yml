@@ -505,8 +505,36 @@ jobs:
         run: cargo test -p octos-sandbox
       - name: Test octos-swarm
         run: cargo test -p octos-swarm
-      # RUST_TEST_THREADS=1 on the octos-agent steps ONLY.
+      # RUST_TEST_THREADS=1 + timeout-minutes on the octos-agent steps ONLY.
       #
+      # STATUS: RUST_TEST_THREADS=1 (#1890) did NOT fix this — the job still
+      # died at `Test octos-agent (lib)` on run 30757917006. Step-duration data
+      # disproved the OOM-from-parallelism theory it was based on:
+      #
+      #   run 30733580733  no serialisation  steps 16-21 ALL done in ~16 min  PASS
+      #   run 30737982761  no serialisation  step 16 alone ran 46 min         KILLED
+      #   run 30757917006  serialised        step 16 alone ran 46.7 min       KILLED
+      #
+      # Serialising changed nothing (46 -> 46.7 min), so contention is not the
+      # cause. On the PASSING run step 16 finished in minutes; on failures it
+      # never finishes. Step 16 HANGS, and GitHub eventually kills the
+      # unresponsive runner.
+      #
+      # `timeout-minutes` is the diagnostic that unblocks this. A killed runner
+      # uploads NO logs (`gh run view --log` => "log not found" on every failed
+      # attempt), so each failure destroys its own evidence and we have learned
+      # nothing from three of them. A step timeout fails the step CLEANLY, the
+      # runner survives, and the logs are preserved. Under
+      # RUST_TEST_THREADS=1 libtest prints each test name BEFORE running it, so
+      # the last `test ... ` line with no result names the hanging test
+      # outright. Serialisation was not the fix, but it makes the hang legible.
+      #
+      # 35 min is chosen to sit BELOW the ~46 min at which the runner dies while
+      # staying well above the ~16 min a healthy run needs. If a serialised run
+      # genuinely needs longer, this trips early — and a clean timeout WITH logs
+      # is still strictly better than a dead runner with none.
+      #
+      # Original note (the theory that did not hold), kept for context:
       # These two steps repeatedly killed the ARM runner outright:
       # "The hosted runner lost communication with the server ... starves it for
       # CPU/Memory". Every failure died at `Test octos-agent (lib)` after steps
@@ -525,10 +553,12 @@ jobs:
       # Scoped to these steps, not the job env: steps 1-15 pass fine in parallel
       # and serialising them would only make an already ~67 min job slower.
       - name: Test octos-agent (lib)
+        timeout-minutes: 35
         env:
           RUST_TEST_THREADS: "1"
         run: cargo test -p octos-agent --lib
       - name: Test octos-agent (integration)
+        timeout-minutes: 35
         env:
           RUST_TEST_THREADS: "1"
         run: cargo test -p octos-agent --tests
