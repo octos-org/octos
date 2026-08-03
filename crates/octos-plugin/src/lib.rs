@@ -36,7 +36,10 @@ pub mod protocol_v2;
 pub mod types;
 
 // Re-export primary types for convenience.
-pub use discovery::{PluginSource, discover_plugins};
+pub use discovery::{
+    PluginDiscoveryError, PluginDiscoveryResult, PluginSource, discover_plugins,
+    discover_plugins_with_errors,
+};
 pub use gating::{GateCheck, GatingResult, check_requirements};
 pub use lifecycle::{
     BLOCKED_ENV_VARS, HardwareLifecycle, LifecycleExecutor, LifecyclePhase, LifecycleStep,

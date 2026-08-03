@@ -2,6 +2,11 @@ use super::*;
 use serde_json::json;
 
 #[test]
+fn skill_action_job_updated_notification_method_is_registered() {
+    assert!(UI_PROTOCOL_NOTIFICATION_METHODS.contains(&methods::SKILL_ACTION_JOB_UPDATED));
+}
+
+#[test]
 fn compare_protocol_compatible_for_full_protocol_with_known_features() {
     // The full-protocol capabilities advertise every known feature, so any
     // subset (here: the whole known registry) is satisfied.
@@ -107,6 +112,7 @@ fn reasoning_effort_level_wire_shape() {
         topic: None,
         rewrite_for: None,
         reasoning_effort: Some(ReasoningEffortLevel::Max),
+        tool_context: None,
         live_video: false,
     };
     let wire = serde_json::to_value(&params).unwrap();
@@ -145,10 +151,33 @@ fn turn_start_live_video_roundtrips_and_is_omitted_when_false() {
         topic: None,
         rewrite_for: None,
         reasoning_effort: None,
+        tool_context: None,
         live_video: false,
     };
     let wire = serde_json::to_value(&params).unwrap();
     assert!(wire.get("live_video").is_none());
+}
+
+#[test]
+fn should_roundtrip_optional_turn_tool_context() {
+    let notebook = json!({
+        "session_id": "local:demo",
+        "turn_id": "00000000-0000-0000-0000-000000000001",
+        "input": [],
+        "tool_context": "notebook"
+    });
+    let parsed: TurnStartParams = serde_json::from_value(notebook).unwrap();
+    assert_eq!(parsed.tool_context.as_deref(), Some("notebook"));
+    let wire = serde_json::to_value(parsed).unwrap();
+    assert_eq!(wire["tool_context"], json!("notebook"));
+
+    let ordinary: TurnStartParams = serde_json::from_value(json!({
+        "session_id": "local:demo",
+        "turn_id": "00000000-0000-0000-0000-000000000002",
+        "input": []
+    }))
+    .unwrap();
+    assert_eq!(ordinary.tool_context, None);
 }
 
 #[test]
@@ -808,6 +837,7 @@ fn ui_protocol_v1_wire_contract_is_golden() {
             "visual/succeeded",
             "visual/failed",
             "voice/exit",
+            "skill/action/job/updated",
             "voice/audio_chunk",
             "projection/envelope",
             "session/event",
@@ -1009,6 +1039,7 @@ fn ui_protocol_v1_representative_wire_payloads_are_golden() {
                 "visual/succeeded",
                 "visual/failed",
                 "voice/exit",
+                "skill/action/job/updated",
                 "voice/audio_chunk",
                 "projection/envelope",
                 "session/event",
@@ -1068,6 +1099,7 @@ fn ui_protocol_v1_representative_wire_payloads_are_golden() {
         topic: None,
         rewrite_for: None,
         reasoning_effort: None,
+        tool_context: None,
         live_video: false,
     })
     .into_rpc_request("req-turn-start")
@@ -1824,6 +1856,7 @@ fn ui_command_builds_and_parses_json_rpc_request() {
         topic: None,
         rewrite_for: None,
         reasoning_effort: None,
+        tool_context: None,
         live_video: false,
     });
 
@@ -1891,6 +1924,7 @@ fn turn_start_round_trips_with_media_field() {
         topic: None,
         rewrite_for: None,
         reasoning_effort: None,
+        tool_context: None,
         live_video: false,
     });
 
@@ -1932,6 +1966,7 @@ fn turn_start_round_trips_with_topic_field() {
         topic: Some("slides".into()),
         rewrite_for: None,
         reasoning_effort: None,
+        tool_context: None,
         live_video: false,
     });
 
@@ -1973,6 +2008,7 @@ fn turn_start_round_trips_with_rewrite_for_field() {
         topic: None,
         rewrite_for: Some("cmid-queued-original".into()),
         reasoning_effort: None,
+        tool_context: None,
         live_video: false,
     });
 
@@ -2019,6 +2055,7 @@ fn turn_start_round_trips_with_all_beta1_fields() {
         topic: Some("research".into()),
         rewrite_for: Some("cmid-original".into()),
         reasoning_effort: None,
+        tool_context: None,
         live_video: false,
     });
 

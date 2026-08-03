@@ -8,11 +8,14 @@ use serde::{Deserialize, Deserializer};
 /// A plugin manifest (manifest.json).
 #[derive(Debug, Deserialize)]
 pub struct PluginManifest {
-    /// Plugin name. Accepts `id` as an alias so manifests written against
-    /// upstream's renamed field (which uses `id` with `#[serde(alias = "name")]`)
-    /// still parse cleanly through the agent-side deserializer.
-    #[serde(alias = "id")]
+    /// Display and executable name. Legacy manifests use this as their
+    /// identity when they do not declare an explicit `id`.
+    #[serde(default)]
     pub name: String,
+    /// Canonical plugin identity. This matches `octos-plugin` discovery,
+    /// whose duplicate and root-precedence rules are keyed by manifest `id`.
+    #[serde(default)]
+    pub id: Option<String>,
     /// Plugin version.
     pub version: String,
     /// RFC-1 (issue #1290): the `content_type` discriminator this skill
@@ -54,6 +57,9 @@ pub struct PluginManifest {
     /// Tools provided by this plugin.
     #[serde(default)]
     pub tools: Vec<PluginToolDef>,
+    /// User-facing actions this skill allows UI clients to invoke directly.
+    #[serde(default)]
+    pub actions: Vec<SkillActionDef>,
     /// SHA-256 hash of the plugin executable for integrity verification.
     ///
     /// Empty-string values (`""`) are rejected at parse time: a manifest that
@@ -124,6 +130,42 @@ pub struct PluginManifest {
 }
 
 impl PluginManifest {
+    /// Canonical identity used for ownership, qualified action resolution,
+    /// and cache keys. Legacy manifests retain their `name` identity.
+    pub fn canonical_id(&self) -> &str {
+        self.id
+            .as_deref()
+            .filter(|id| !id.trim().is_empty())
+            .unwrap_or(&self.name)
+    }
+
+    /// Name used when resolving a plugin executable. Explicit names remain
+    /// compatible with older packages that do not name their binary by `id`.
+    pub fn executable_name(&self) -> &str {
+        if self.name.trim().is_empty() {
+            self.canonical_id()
+        } else {
+            &self.name
+        }
+    }
+
+    /// Validate the manifest name before using it as the skill half of a
+    /// qualified UI action identity. Existing plugins without actions are
+    /// intentionally outside this validation path.
+    pub fn validate_for_action_registration(&self) -> Result<(), ManifestValidationError> {
+        if self.actions.is_empty() {
+            return Ok(());
+        }
+        validate_action_text_field("id", self.canonical_id())?;
+        if self.canonical_id().contains('/') {
+            return Err(ManifestValidationError::InvalidActionField(
+                "id",
+                "must not contain '/'",
+            ));
+        }
+        Ok(())
+    }
+
     /// Whether this manifest declares any extras (MCP servers, hooks, prompts,
     /// or discovery).
     ///
@@ -219,6 +261,132 @@ pub struct SkillDiscovery {
     pub summary: Option<String>,
 }
 
+/// A UI-callable action declared by a skill manifest.
+#[derive(Debug, Clone, Deserialize, serde::Serialize)]
+pub struct SkillActionDef {
+    /// Stable action id within the skill, for example `source.import`.
+    pub id: String,
+    /// Human-readable label for menus and buttons.
+    pub label: String,
+    /// Optional short description for tooltips or secondary text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// Semantic tags clients can filter on without coupling to a specific app.
+    #[serde(default)]
+    pub tags: Vec<String>,
+    /// UI surfaces where this action is relevant, for example `studio.sources`.
+    #[serde(default)]
+    pub surfaces: Vec<String>,
+    /// JSON Schema for the action-level input.
+    #[serde(default = "default_schema")]
+    pub input_schema: serde_json::Value,
+    /// Optional UI hints. The host treats this as opaque metadata.
+    #[serde(default)]
+    pub ui_schema: serde_json::Value,
+    /// Whether the action runs inline or as a supervised background job.
+    #[serde(default)]
+    pub execution: SkillActionExecution,
+    /// Backend binding. UI clients cannot override this at invocation time.
+    pub binding: SkillActionBinding,
+}
+
+/// How a UI-callable skill action is executed by the host.
+#[derive(Debug, Clone, Copy, Deserialize, serde::Serialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SkillActionExecution {
+    /// Invoke the bound backend operation before returning the AppUI response.
+    #[default]
+    Sync,
+    /// Register a persisted supervised task and execute out of band.
+    Background,
+}
+
+/// Backend binding for a UI-callable skill action.
+#[derive(Debug, Clone, Deserialize, serde::Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum SkillActionBinding {
+    /// Invoke an existing registered tool.
+    Tool {
+        tool: String,
+        #[serde(default)]
+        input_mode: SkillActionInputMode,
+        #[serde(default)]
+        file_argument: Option<String>,
+        #[serde(default)]
+        file_materialization: SkillActionFileMaterialization,
+    },
+}
+
+impl SkillActionBinding {
+    pub fn tool_name(&self) -> Option<&str> {
+        match self {
+            Self::Tool { tool, .. } => Some(tool.as_str()),
+        }
+    }
+
+    pub fn input_mode(&self) -> SkillActionInputMode {
+        match self {
+            Self::Tool { input_mode, .. } => *input_mode,
+        }
+    }
+
+    pub fn file_argument(&self) -> Option<&str> {
+        match self {
+            Self::Tool { file_argument, .. } => file_argument.as_deref(),
+        }
+    }
+
+    pub fn file_materialization(&self) -> SkillActionFileMaterialization {
+        match self {
+            Self::Tool {
+                file_materialization,
+                ..
+            } => *file_materialization,
+        }
+    }
+}
+
+impl SkillActionDef {
+    /// Validate fields needed to register an action under a stable qualified ID.
+    pub fn validate_for_registration(&self) -> Result<(), ManifestValidationError> {
+        validate_action_text_field("id", &self.id)?;
+        if self.id.contains('/') {
+            return Err(ManifestValidationError::InvalidActionField(
+                "id",
+                "must not contain '/'",
+            ));
+        }
+        validate_action_text_field("label", &self.label)?;
+        let tool = self.binding.tool_name().unwrap_or_default();
+        validate_action_text_field("binding.tool", tool)?;
+        Ok(())
+    }
+}
+
+/// How action input is mapped to the bound tool call.
+#[derive(Debug, Clone, Copy, Deserialize, serde::Serialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SkillActionInputMode {
+    /// Forward the action arguments once.
+    #[default]
+    Single,
+    /// Materialize `arguments.paths[]` and call the tool once per file.
+    FileEach,
+}
+
+/// How `file_each` action paths are prepared before invoking the bound tool.
+#[derive(Debug, Clone, Copy, Deserialize, serde::Serialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SkillActionFileMaterialization {
+    /// Forward each string from `arguments.paths[]` unchanged.
+    #[default]
+    Raw,
+    /// Copy upload references into `<workspace>/uploads/` and pass workspace-relative paths.
+    WorkspaceRelative,
+    /// Use the same upload handling as chat turn media.
+    TurnMedia,
+}
+
 /// An MCP server declared by a skill manifest.
 #[derive(Debug, Clone, Deserialize)]
 pub struct SkillMcpServer {
@@ -276,6 +444,10 @@ pub struct PluginToolDef {
     /// JSON Schema for input parameters.
     #[serde(default = "default_schema")]
     pub input_schema: serde_json::Value,
+    /// Model contexts in which this tool may be advertised.
+    /// Empty means the tool remains available in every context.
+    #[serde(default)]
+    pub contexts: Vec<String>,
     /// If true, the tool runs in a background task automatically when called.
     /// The execution loop returns immediately with `spawn_only_message`.
     #[serde(default)]
@@ -358,6 +530,8 @@ pub enum ManifestValidationError {
     /// `env` allowlist contains a name that fails the syntactic check.
     /// First field: the offending name; second: human-readable reason.
     InvalidEnvName(String, &'static str),
+    /// An action field cannot be used to form a stable trusted registration.
+    InvalidActionField(&'static str, &'static str),
 }
 
 impl std::fmt::Display for ManifestValidationError {
@@ -367,6 +541,9 @@ impl std::fmt::Display for ManifestValidationError {
                 f,
                 "manifest env allowlist entry {name:?} is invalid: {reason}"
             ),
+            Self::InvalidActionField(field, reason) => {
+                write!(f, "manifest action field {field:?} is invalid: {reason}")
+            }
         }
     }
 }
@@ -481,6 +658,25 @@ fn validate_manifest_env_name(name: &str) -> Result<(), ManifestValidationError>
     Ok(())
 }
 
+fn validate_action_text_field(
+    field: &'static str,
+    value: &str,
+) -> Result<(), ManifestValidationError> {
+    if value.trim().is_empty() {
+        return Err(ManifestValidationError::InvalidActionField(
+            field,
+            "must not be empty",
+        ));
+    }
+    if value != value.trim() || value.chars().any(char::is_control) {
+        return Err(ManifestValidationError::InvalidActionField(
+            field,
+            "must not have surrounding whitespace or control characters",
+        ));
+    }
+    Ok(())
+}
+
 impl PluginToolDef {
     /// Whether this tool's input schema declares it accepts host-injected
     /// config under the named key (e.g. `"synthesis_config"`).
@@ -562,6 +758,22 @@ mod tests {
         );
         assert!(manifest.tools[0].env.is_empty());
         assert_eq!(manifest.tools[0].risk, None);
+        assert!(manifest.tools[0].contexts.is_empty());
+    }
+
+    #[test]
+    fn should_parse_tool_model_contexts() {
+        let json = r#"{
+            "name": "notebook-plugin",
+            "version": "1.0.0",
+            "tools": [{
+                "name": "source_search",
+                "description": "Search notebook sources",
+                "contexts": ["notebook"]
+            }]
+        }"#;
+        let manifest: PluginManifest = serde_json::from_str(json).unwrap();
+        assert_eq!(manifest.tools[0].contexts, vec!["notebook"]);
     }
 
     #[test]
@@ -716,13 +928,15 @@ mod tests {
     }
 
     #[test]
-    fn test_missing_name_fails() {
+    fn test_id_based_manifest_can_omit_legacy_name() {
         let json = r#"{
+            "id": "id-based-plugin",
             "version": "1.0.0",
             "tools": []
         }"#;
-        let result = serde_json::from_str::<PluginManifest>(json);
-        assert!(result.is_err());
+        let manifest = serde_json::from_str::<PluginManifest>(json).unwrap();
+        assert_eq!(manifest.canonical_id(), "id-based-plugin");
+        assert_eq!(manifest.executable_name(), "id-based-plugin");
     }
 
     #[test]
@@ -812,6 +1026,7 @@ mod tests {
             name: "t".to_string(),
             description: "d".to_string(),
             input_schema: default_schema(),
+            contexts: vec![],
             spawn_only: false,
             env: env.into_iter().map(str::to_string).collect(),
             risk: None,
@@ -881,6 +1096,30 @@ mod tests {
     }
 
     #[test]
+    fn action_registration_validates_qualified_plugin_identity_names() {
+        for name in [" bad-name ", "bad\nname", "bad/name"] {
+            let manifest: PluginManifest = serde_json::from_value(serde_json::json!({
+                "name": name,
+                "version": "1.0",
+                "actions": [{
+                    "id": "identity.check",
+                    "label": "Check identity",
+                    "binding": {"type": "tool", "tool": "identity_tool"}
+                }]
+            }))
+            .unwrap();
+            assert!(manifest.validate_for_action_registration().is_err());
+        }
+
+        let no_actions: PluginManifest = serde_json::from_value(serde_json::json!({
+            "name": " legacy/name ",
+            "version": "1.0"
+        }))
+        .unwrap();
+        assert!(no_actions.validate_for_action_registration().is_ok());
+    }
+
+    #[test]
     fn manifest_risk_gate_classifies_known_literals() {
         assert_eq!(
             ManifestRiskGate::classify(Some("low")),
@@ -940,6 +1179,7 @@ mod tests {
             name: "t".to_string(),
             description: "d".to_string(),
             input_schema: default_schema(),
+            contexts: vec![],
             spawn_only: false,
             env: vec![],
             risk: None,
@@ -984,11 +1224,13 @@ mod tests {
     fn manifest_with_tools(make_type: Option<&str>, tools: Vec<PluginToolDef>) -> PluginManifest {
         PluginManifest {
             name: "test-skill".into(),
+            id: None,
             version: "1.0".into(),
             make_type: make_type.map(str::to_string),
             content_type_description: None,
             make_target_tool: None,
             tools,
+            actions: vec![],
             sha256: None,
             binaries: HashMap::new(),
             requires_network: false,
@@ -1009,6 +1251,7 @@ mod tests {
             name: name.into(),
             description: "x".into(),
             input_schema: default_schema(),
+            contexts: vec![],
             spawn_only,
             env: vec![],
             risk: None,
@@ -1340,6 +1583,122 @@ mod tests {
         }"#;
         let manifest: PluginManifest = serde_json::from_str(json).unwrap();
         assert!(!manifest.has_extras());
+    }
+
+    #[test]
+    fn manifest_parses_ui_actions_bound_to_tools() {
+        let json = r#"{
+            "name": "mofa-notebook-source",
+            "version": "0.1.0",
+            "tools": [{"name": "source_import", "description": "Import source"}],
+            "actions": [{
+                "id": "source.import",
+                "label": "Add source",
+                "description": "Import uploaded files as reusable sources.",
+                "tags": ["source", "document"],
+                "surfaces": ["studio.sources"],
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "paths": {
+                            "type": "array",
+                            "items": { "type": "string" }
+                        }
+                    },
+                    "required": ["paths"]
+                },
+                "ui_schema": {
+                    "accept": [".md", ".txt", ".csv", ".json", ".html"]
+                },
+                "binding": {
+                    "type": "tool",
+                    "tool": "source_import",
+                    "input_mode": "file_each",
+                    "file_argument": "path",
+                    "file_materialization": "workspace_relative"
+                }
+            }]
+        }"#;
+
+        let manifest: PluginManifest = serde_json::from_str(json).unwrap();
+
+        assert_eq!(manifest.actions.len(), 1);
+        let action = &manifest.actions[0];
+        assert_eq!(action.id, "source.import");
+        assert_eq!(action.label, "Add source");
+        assert_eq!(action.tags, vec!["source", "document"]);
+        assert_eq!(action.surfaces, vec!["studio.sources"]);
+        assert_eq!(
+            action.input_schema["required"],
+            serde_json::json!(["paths"])
+        );
+        assert_eq!(action.ui_schema["accept"][0], ".md");
+        assert_eq!(action.binding.tool_name(), Some("source_import"));
+        assert_eq!(action.binding.input_mode(), SkillActionInputMode::FileEach);
+        assert_eq!(action.binding.file_argument(), Some("path"));
+        assert_eq!(
+            action.binding.file_materialization(),
+            SkillActionFileMaterialization::WorkspaceRelative
+        );
+        assert_eq!(action.execution, SkillActionExecution::Sync);
+    }
+
+    #[test]
+    fn contract_fixture_exports_source_and_background_generate_actions() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../e2e/fixtures/compat-test-skill/manifest.json");
+        let contents = std::fs::read_to_string(&path).expect("read skill action fixture");
+        let manifest: PluginManifest =
+            serde_json::from_str(&contents).expect("parse skill action fixture");
+
+        assert_eq!(manifest.canonical_id(), "compat-test-skill");
+        assert_eq!(manifest.version, "1.0.0");
+        let source = manifest
+            .actions
+            .iter()
+            .find(|action| action.id == "source.import")
+            .expect("source.import action");
+        let generate = manifest
+            .actions
+            .iter()
+            .find(|action| action.id == "reports.generate")
+            .expect("reports.generate action");
+        assert_eq!(source.execution, SkillActionExecution::Sync);
+        assert_eq!(generate.execution, SkillActionExecution::Background);
+        assert_eq!(source.binding.tool_name(), Some("summarize_text"));
+        assert_eq!(generate.binding.tool_name(), Some("summarize_text"));
+        manifest.validate_for_action_registration().unwrap();
+        for action in &manifest.actions {
+            action.validate_for_registration().unwrap();
+        }
+    }
+
+    #[test]
+    fn manifest_parses_background_skill_action_execution() {
+        let json = r#"{
+            "name": "mofa-notebook-source",
+            "version": "0.1.0",
+            "tools": [{"name": "source_import", "description": "Import source"}],
+            "actions": [{
+                "id": "source.import",
+                "label": "Add source",
+                "execution": "background",
+                "binding": {
+                    "type": "tool",
+                    "tool": "source_import",
+                    "input_mode": "file_each",
+                    "file_argument": "path",
+                    "file_materialization": "workspace_relative"
+                }
+            }]
+        }"#;
+
+        let manifest: PluginManifest = serde_json::from_str(json).unwrap();
+
+        assert_eq!(
+            manifest.actions[0].execution,
+            SkillActionExecution::Background
+        );
     }
 
     // ------------------------------------------------------------------

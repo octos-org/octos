@@ -20,6 +20,7 @@ fn make_tool_def(name: &str, desc: &str) -> PluginToolDef {
         name: name.to_string(),
         description: desc.to_string(),
         input_schema: json!({"type": "object", "properties": {"msg": {"type": "string"}}}),
+        contexts: vec![],
         spawn_only: false,
         env: vec![],
         risk: None,
@@ -37,6 +38,15 @@ fn new_sets_defaults() {
     assert_eq!(tool.timeout, PluginTool::DEFAULT_TIMEOUT);
     assert_eq!(tool.timeout, Duration::from_secs(600));
     assert!(tool.blocked_env.is_empty());
+}
+
+#[test]
+fn should_expose_manifest_contexts_through_tool_trait() {
+    let mut def = make_tool_def("source_search", "Search notebook sources");
+    def.contexts = vec!["notebook".to_string()];
+    let tool = PluginTool::new("notebook".into(), def, PathBuf::from("/bin/echo"));
+
+    assert_eq!(tool.contexts(), &["notebook".to_string()]);
 }
 
 #[test]
@@ -103,6 +113,7 @@ fn rewrite_workspace_file_args_updates_audio_and_file_paths() {
                 "file_path": {"type": "string"}
             }
         }),
+        contexts: vec![],
         spawn_only: false,
         env: vec![],
         risk: None,
@@ -150,6 +161,7 @@ fn rewrite_workspace_file_args_preserves_nested_workspace_paths() {
                 "slide_dir": {"type": "string"}
             }
         }),
+        contexts: vec![],
         spawn_only: false,
         env: vec![],
         risk: None,
@@ -210,6 +222,7 @@ fn rewrite_workspace_file_args_recovers_basename_when_workspace_relative_missing
             "type": "object",
             "properties": {"audio_path": {"type": "string"}}
         }),
+        contexts: vec![],
         spawn_only: false,
         env: vec![],
         risk: None,
@@ -258,6 +271,7 @@ fn rewrite_workspace_file_args_strips_redundant_skill_output_prefix_for_script_p
                 "script_path": {"type": "string"}
             }
         }),
+        contexts: vec![],
         spawn_only: true,
         env: vec![],
         risk: None,
@@ -304,6 +318,7 @@ fn rewrite_workspace_file_args_keeps_skill_output_prefix_when_work_dir_is_worksp
             "type": "object",
             "properties": {"script_path": {"type": "string"}}
         }),
+        contexts: vec![],
         spawn_only: true,
         env: vec![],
         risk: None,
@@ -435,6 +450,7 @@ fn resolve_plugin_input_path_returns_err_on_raw_parent_dir() {
             "type": "object",
             "properties": {"script_path": {"type": "string"}}
         }),
+        contexts: vec![],
         spawn_only: true,
         env: vec![],
         risk: None,
@@ -494,6 +510,7 @@ fn rewrite_workspace_file_args_rejects_raw_parent_dir_on_output_keys() {
                 "slide_dir": {"type": "string"}
             }
         }),
+        contexts: vec![],
         spawn_only: true,
         env: vec![],
         risk: None,
@@ -628,6 +645,7 @@ fn rewrite_workspace_file_args_recovers_workspace_root_script_for_podcast_genera
             "type": "object",
             "properties": {"script_path": {"type": "string"}}
         }),
+        contexts: vec![],
         spawn_only: true,
         env: vec![],
         risk: None,
@@ -893,6 +911,7 @@ fn rewrite_workspace_file_args_rewrites_video_path_and_text_path() {
                 "text_path": {"type": "string"}
             }
         }),
+        contexts: vec![],
         spawn_only: false,
         env: vec![],
         risk: None,
@@ -938,6 +957,7 @@ fn rewrite_workspace_file_args_keeps_mofa_style_as_name() {
                 "style": {"type": "string"}
             }
         }),
+        contexts: vec![],
         spawn_only: false,
         env: vec![],
         risk: None,
@@ -973,6 +993,7 @@ fn rewrite_workspace_file_args_strips_mofa_style_toml_paths_to_name() {
                 "style": {"type": "string"}
             }
         }),
+        contexts: vec![],
         spawn_only: false,
         env: vec![],
         risk: None,
@@ -1004,6 +1025,7 @@ fn rewrite_workspace_file_args_strips_repeated_mofa_style_toml_suffixes() {
                 "style": {"type": "string"}
             }
         }),
+        contexts: vec![],
         spawn_only: false,
         env: vec![],
         risk: None,
@@ -1034,6 +1056,7 @@ fn prepare_effective_args_injects_attachment_defaults() {
                 "file_path": {"type": "string"}
             }
         }),
+        contexts: vec![],
         spawn_only: false,
         env: vec![],
         risk: None,
@@ -1072,6 +1095,7 @@ fn deep_search_def_with_opt_in() -> PluginToolDef {
             },
             "x-octos-host-config-keys": ["synthesis_config"]
         }),
+        contexts: vec![],
         spawn_only: false,
         env: vec![],
         risk: None,
@@ -1092,6 +1116,7 @@ fn notebook_source_def_with_workspace_root_opt_in() -> PluginToolDef {
             },
             "x-octos-host-config-keys": ["workspace_root"]
         }),
+        contexts: vec![],
         spawn_only: false,
         env: vec![],
         risk: None,
@@ -1401,6 +1426,34 @@ async fn execute_spawns_subprocess_and_captures_output() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[cfg(unix)]
+async fn execute_preserves_plugin_structured_metadata() {
+    let dir = tempfile::tempdir().expect("create temp dir");
+    let script_path = dir.path().join("script.sh");
+    write_test_script(
+        &script_path,
+        "#!/bin/sh\ncat >/dev/null\nprintf '{\"success\":true,\"output\":\"ok\",\"structured_metadata\":{\"sources\":[{\"id\":\"report\"}]}}\\n'\n",
+    );
+
+    let tool = PluginTool::new(
+        "test-plugin".into(),
+        make_tool_def("metadata_tool", "returns structured metadata"),
+        script_path,
+    )
+    .with_timeout(Duration::from_secs(5));
+
+    let result = tool
+        .execute(&json!({}))
+        .await
+        .expect("execute should succeed");
+
+    assert_eq!(
+        result.structured_metadata,
+        Some(json!({"sources": [{"id": "report"}]}))
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[cfg(unix)]
 async fn execute_structured_progress_event_updates_task_supervisor() {
     use crate::task_supervisor::TaskSupervisor;
     use serde_json::json;
@@ -1562,6 +1615,7 @@ async fn execute_fallback_detects_generated_pptx_as_file_to_send() {
                 "out": {"type": "string"}
             }
         }),
+        contexts: vec![],
         spawn_only: false,
         env: vec![],
         risk: None,
@@ -1604,6 +1658,7 @@ async fn execute_fallback_waits_briefly_for_generated_pptx_to_appear() {
                 "out": {"type": "string"}
             }
         }),
+        contexts: vec![],
         spawn_only: false,
         env: vec![],
         risk: None,
@@ -1649,6 +1704,7 @@ async fn execute_fallback_skips_missing_generated_pptx() {
                 "out": {"type": "string"}
             }
         }),
+        contexts: vec![],
         spawn_only: false,
         env: vec![],
         risk: None,
@@ -2918,6 +2974,7 @@ fn input_path_def(key: &str) -> PluginToolDef {
             "type": "object",
             "properties": {key: {"type": "string"}}
         }),
+        contexts: vec![],
         spawn_only: false,
         env: vec![],
         risk: None,
@@ -3335,6 +3392,7 @@ fn plugin_refuses_out_of_scope_output_path() {
                 "slide_dir": {"type": "string"}
             }
         }),
+        contexts: vec![],
         spawn_only: false,
         env: vec![],
         risk: None,
@@ -3423,6 +3481,7 @@ fn plugin_refuses_write_to_shared_zone() {
             "type": "object",
             "properties": {"out": {"type": "string"}}
         }),
+        contexts: vec![],
         spawn_only: false,
         env: vec![],
         risk: None,
@@ -3549,6 +3608,7 @@ fn scope_still_validates_out_of_scope_when_self_work_dir_is_rebound() {
             "type": "object",
             "properties": {"out": {"type": "string"}}
         }),
+        contexts: vec![],
         spawn_only: false,
         env: vec![],
         risk: None,
@@ -3728,6 +3788,7 @@ fn legacy_workspace_root_rescue_still_works_when_no_scope() {
             "type": "object",
             "properties": {"script_path": {"type": "string"}}
         }),
+        contexts: vec![],
         spawn_only: true,
         env: vec![],
         risk: None,
@@ -3875,6 +3936,7 @@ async fn mofa_slides_preflight_only_fires_for_mofa_slides_tool() {
             "type": "object",
             "properties": {"style": {"type": "string"}}
         }),
+        contexts: vec![],
         spawn_only: true,
         env: vec![],
         risk: None,
@@ -3896,6 +3958,7 @@ async fn mofa_slides_preflight_only_fires_for_mofa_slides_tool() {
         name: "mofa_slides".to_string(),
         description: "Slides".to_string(),
         input_schema: json!({"type": "object", "properties": {"style": {"type": "string"}}}),
+        contexts: vec![],
         spawn_only: true,
         env: vec![],
         risk: None,
@@ -4121,6 +4184,7 @@ fn plugin_refuses_output_path_using_symlink_escape_inside_workspace() {
             "type": "object",
             "properties": {"out": {"type": "string"}}
         }),
+        contexts: vec![],
         spawn_only: false,
         env: vec![],
         risk: None,

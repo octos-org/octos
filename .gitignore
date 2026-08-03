@@ -20,6 +20,7 @@ Thumbs.db
 # git checkouts). They must never be tracked — committed as gitlinks they
 # break every git consumer of this repo (e.g. cargo git dependencies).
 .claude/worktrees/
+.worktrees/
 
 # Octos runtime state (keep config, ignore runtime data)
 .octos/*

@@ -275,6 +275,7 @@ mod tests {
             topic: None,
             rewrite_for: None,
             reasoning_effort: None,
+            tool_context: None,
             live_video: false,
         });
 

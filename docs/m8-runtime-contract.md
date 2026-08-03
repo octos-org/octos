@@ -127,7 +127,7 @@ front-end cost-breakdown panel renders these per-task rows.
 
 Invocation: `./plugin <tool_name>` with JSON args on stdin. Plugin writes:
 
-- **stdout**: a single JSON object — `{"output": "...", "success": true|false, "files_to_send": [...]}`
+- **stdout**: a single JSON object — `{"output": "...", "success": true|false, "files_to_send": [...], "structured_metadata": {...}}`. `structured_metadata` is optional JSON preserved on the host `ToolResult` for typed callers; it is not rendered as user-facing text.
 - **stderr**: free-form text, line by line. Each line becomes a
   `ToolProgress { name, tool_id, message: <line> }` event.
 

@@ -5,6 +5,42 @@
   "description": "Summarize a text file into a compact report artifact (third-party compatibility fixture)",
   "timeout_secs": 15,
   "requires_network": false,
+  "actions": [
+    {
+      "id": "source.import",
+      "label": "Import source",
+      "description": "Import a text source and create a grounded summary artifact.",
+      "tags": ["source", "import"],
+      "surfaces": ["studio.sources"],
+      "execution": "sync",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "input_path": { "type": "string" },
+          "output_path": { "type": "string" }
+        },
+        "required": ["input_path", "output_path"]
+      },
+      "binding": { "type": "tool", "tool": "summarize_text" }
+    },
+    {
+      "id": "reports.generate",
+      "label": "Generate report",
+      "description": "Generate a report artifact as a supervised background action.",
+      "tags": ["report", "generate"],
+      "surfaces": ["studio.reports"],
+      "execution": "background",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "input_path": { "type": "string" },
+          "output_path": { "type": "string" }
+        },
+        "required": ["input_path", "output_path"]
+      },
+      "binding": { "type": "tool", "tool": "summarize_text" }
+    }
+  ],
   "tools": [
     {
       "name": "summarize_text",

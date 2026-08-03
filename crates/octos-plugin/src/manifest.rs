@@ -110,8 +110,9 @@ pub struct InstallSpec {
 /// The parsed contents of a plugin's `manifest.json`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PluginManifest {
-    /// Plugin identifier (kebab-case). Falls back to `name` for legacy manifests.
-    #[serde(alias = "name")]
+    /// Plugin identifier (kebab-case). `from_json` fills this from legacy
+    /// `name` manifests before deserialization, so an explicit `id` can
+    /// coexist with a separate display or executable `name`.
     pub id: String,
 
     /// Semver version string.
@@ -201,8 +202,17 @@ impl PluginManifest {
     /// composite error: every violation is reported on its own line so
     /// authors can fix them all in a single round-trip.
     pub fn from_json(json: &str) -> Result<Self> {
-        let manifest: PluginManifest =
+        let mut value: serde_json::Value =
             serde_json::from_str(json).wrap_err("failed to parse manifest JSON")?;
+        if let Some(object) = value.as_object_mut() {
+            if !object.contains_key("id") {
+                if let Some(name) = object.get("name").cloned() {
+                    object.insert("id".to_string(), name);
+                }
+            }
+        }
+        let manifest: PluginManifest =
+            serde_json::from_value(value).wrap_err("failed to parse manifest JSON")?;
         manifest.validate()?;
         manifest.validate_schemas()?;
         Ok(manifest)

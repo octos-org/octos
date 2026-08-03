@@ -301,6 +301,21 @@ Current M9 sandbox-parity decision:
   pending questions; a client lacking the capability receives the agent tool's
   structured-metadata/generic-text fallback instead of a blocking question. See
   [docs/design/ask-user-question-2026-06-03.md](../docs/design/ask-user-question-2026-06-03.md).
+- The additive manifest-declared skill action surface
+  (`skill/action/list`, `skill/action/invoke`, and the `skill.actions.v1`
+  capability feature) is governed by accepted
+  [UPCR-2026-026](../docs/OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_026_SKILL_ACTIONS.md).
+  It lets clients render and invoke skill-owned UI actions without gaining a
+  generic AppUI tool-call primitive. Skill manifests own the action id, input
+  schema, UI hints, bound backend tool, and any file-materialization mode.
+- The additive skill action background-job surface
+  (`skill/action/job/list`, `skill/action/job/read`, the
+  `skill/action/job/updated` notification, and the `skill.action_jobs.v1`
+  capability feature) is governed by accepted
+  [UPCR-2026-027](../docs/OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_027_SKILL_ACTION_JOBS.md).
+  It lets clients observe manifest-declared background actions through generic
+  projections of persisted supervised tasks. It does not introduce
+  notebook-specific routes or a generic client-selected tool-call primitive.
 
 ## 5. Identity Model
 
@@ -485,6 +500,11 @@ Runtime, auth, profile, and onboarding inspection (server-handled
 - `profile/skills/list`, `profile/skills/registry/search`,
   `profile/skills/install`, `profile/skills/remove` (server-handled skills
   management)
+- `skill/action/list`, `skill/action/invoke` (gate `skill.actions.v1`,
+  accepted `UPCR-2026-026`; manifest-declared skill actions only)
+- `skill/action/job/list`, `skill/action/job/read` (gate
+  `skill.action_jobs.v1`, accepted `UPCR-2026-027`; persisted background skill
+  action jobs only)
 - `mcp/status/list`, `tool/status/list` (accepted `UPCR-2026-017`)
 - `onboarding/workspace_probe` (gate `onboarding.workspace_probe.v1`,
   local-solo only; #1057)
@@ -515,6 +535,10 @@ Structured user-question lifecycle (gate `user_question.v1`, proposed
 `UPCR-2026-023`):
 
 - `user_question/requested`
+
+Skill action jobs (gate `skill.action_jobs.v1`, accepted `UPCR-2026-027`):
+
+- `skill/action/job/updated`
 
 Task and progress:
 
@@ -1315,6 +1339,90 @@ Clients must use that method list to enable or disable slash commands.
   “profile saved”. Failed probes return `applied: false` plus optional
   `message` and `error` fields; clients must clear in-flight test state and
   keep the provider editable/retryable.
+
+`skill/action/list`:
+
+- requires `session_id`; accepts optional `profile_id`, `surface`, and `tags[]`
+- bootstraps the session's profile runtime and returns manifest actions loaded
+  for that runtime
+- returns `{ profile_id, session_id, count, actions }`
+- each action includes `id`, `skill_id`, `label`, `execution`, optional
+  `description`, `tags[]`, `surfaces[]`, `input_schema`,
+  `ui_schema`, and `available`
+- `skill_dir` is server-only and is never returned to AppUI clients
+- when `surface` is present, actions with an empty `surfaces[]` remain
+  eligible; actions with non-empty `surfaces[]` must include the requested
+  surface
+- every requested tag must be present in the action's `tags[]`
+- actions bound to tools that are unavailable in the session runtime are not
+  listed; clients must treat the list as server truth for the current session
+- when a negotiated connection lacks `skill.action_jobs.v1`, actions declared
+  with `execution: "background"` are omitted; synchronous actions remain
+  available through `skill.actions.v1`
+
+`skill/action/invoke`:
+
+- requires `session_id` and `action_id`; accepts optional `profile_id` and
+  `arguments`
+- `action_id` may be either the manifest action id (`source.import`) or the
+  skill-qualified id (`mofa-notebook-source/source.import`)
+- the server resolves the session runtime and invokes only its loaded manifest
+  binding; clients cannot override the
+  backend tool name, input mode, or file-materialization mode at call time
+- `single` input mode forwards the JSON object in `arguments` to the bound tool
+- `file_each` input mode requires `arguments.paths[]` and invokes the bound
+  tool once per materialized path, inserting each path into `file_argument`
+  (default `path`)
+- `file_materialization` is manifest-owned and defaults to `raw`:
+  `raw` forwards each string unchanged; `workspace_relative` copies owned upload
+  references into `<workspace>/uploads/` and passes workspace-relative paths
+  including images; `turn_media` uses the existing chat-turn media behavior
+  where non-images become workspace paths and images use the vision-readable
+  upload path
+- result shape is `{ action_id, ok, results }`; `file_each` also includes
+  `materialized_paths`
+- each `results[]` entry contains `success`, `output`, `file_modified`,
+  `artifacts[]`, and `structured_metadata`; `file_modified` is an opaque
+  session-workspace handle or `null`, and each artifact contains `handle`,
+  `display_name`, `media_type`, and `size`
+- `ws/...` artifact handles require the owning `session_id` when fetched;
+  clients must not interpret the handle payload or accept raw absolute paths
+- files missing from or outside the session workspace are omitted from
+  `artifacts[]`
+- when the manifest action declares `execution: "background"`, response shape
+  is `{ action_id, ok, batch_id, jobs }`; each `job_id` equals its supervised
+  `task_id`, and `skill/action/job/updated` is derived from that task's state
+  transitions
+- background actions require `skill.action_jobs.v1`; direct invocation without
+  that negotiated capability fails with `method_not_supported`
+
+`skill/action/job/list`:
+
+- requires `session_id`; accepts optional `profile_id`, `batch_id`, and
+  `action_id`
+- returns `{ profile_id, session_id, count, jobs }`
+- each job is the latest persisted snapshot for that `job_id`
+- job status is one of `queued`, `running`, `succeeded`, `failed`,
+  `cancelled`, or `abandoned`
+- queued/running jobs from a previous server process are surfaced as
+  `abandoned` after startup recovery; clients must not assume automatic resume
+- job list/read, replay, and live notification delivery are scoped by both
+  `profile_id` and `session_id`; equal bare session IDs in different profiles
+  must not expose each other's jobs
+
+`skill/action/job/read`:
+
+- requires `session_id` and `job_id`; accepts optional `profile_id`
+- returns `{ job }` with the latest persisted snapshot
+- missing jobs return a typed AppUI error rather than an empty success payload
+
+`skill/action/job/updated`:
+
+- server notification derived from every supervised task transition carrying
+  skill-action projection metadata
+- payload is `{ profile_id, session_id, job }`
+- the `job` object uses the same wire shape returned by
+  `skill/action/job/list` and `skill/action/job/read`
 
 `mcp/status/list` and `tool/status/list`:
 

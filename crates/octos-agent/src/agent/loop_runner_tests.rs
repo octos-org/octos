@@ -1287,6 +1287,7 @@ printf '{"output":"voice saved","success":true}\n'
             },
             "required": ["name", "audio_path"]
         }),
+        contexts: vec![],
         spawn_only: false,
         env: vec![],
         risk: None,

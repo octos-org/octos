@@ -384,23 +384,24 @@ impl SessionRuntimeCache {
         let key = (profile.profile_id.clone(), session_key.clone(), key_root);
 
         loop {
-            // Fast path: read lock + last_used bump on hit.
+            // Fast path: a matching profile allocation may reuse the cached
+            // session. The profile id alone is insufficient because runtime
+            // replacement intentionally keeps that stable.
             {
-                let guard = self.inner.read().await;
-                if let Some(entry) = guard.get(&key) {
-                    let runtime = Arc::clone(&entry.runtime);
-                    drop(guard);
-                    // Re-take the write lock just to bump the
-                    // timestamp. The read-then-write pattern is
-                    // acceptable here: the worst case is that two
-                    // concurrent hits race on the timestamp update,
-                    // which is benign (LRU bookkeeping is not
-                    // load-bearing for correctness).
-                    let mut guard = self.inner.write().await;
-                    if let Some(entry) = guard.get_mut(&key) {
+                let mut guard = self.inner.write().await;
+                // A replacement ProfileRuntime may also move the profile's
+                // data directory, which changes the sessions-root component
+                // of every cache key. Remove entries owned by the previous
+                // allocation across all roots before probing the new key.
+                guard.retain(|(profile_id, _, _), entry| {
+                    profile_id != &profile.profile_id
+                        || Arc::ptr_eq(&entry.runtime.profile, profile)
+                });
+                if let Some(entry) = guard.get_mut(&key) {
+                    if Arc::ptr_eq(&entry.runtime.profile, profile) {
                         entry.last_used = Instant::now();
+                        return Ok(Arc::clone(&entry.runtime));
                     }
-                    return Ok(runtime);
                 }
             }
 
@@ -554,14 +555,24 @@ impl SessionRuntimeCache {
             return runtime;
         }
 
+        // The profile allocation may have changed while this key was being
+        // bootstrapped. Its sessions root is part of the key, so evict stale
+        // allocations across every root rather than only the exact key below.
+        guard.retain(|(profile_id, _, _), entry| {
+            profile_id != &runtime.profile.profile_id
+                || Arc::ptr_eq(&entry.runtime.profile, &runtime.profile)
+        });
+
         // If a runtime is already present (e.g. another task
         // bootstrapped in a prior single-flight era and inserted
         // before our claim), bump its timestamp and return its
         // `Arc` — the caller will hand THAT Arc back, not the
         // redundant one we built.
         if let Some(entry) = guard.get_mut(&key) {
-            entry.last_used = Instant::now();
-            return Arc::clone(&entry.runtime);
+            if Arc::ptr_eq(&entry.runtime.profile, &runtime.profile) {
+                entry.last_used = Instant::now();
+                return Arc::clone(&entry.runtime);
+            }
         }
 
         // Soft-cap eviction: if we're at capacity, drop the LRU
@@ -772,6 +783,8 @@ mod tests {
             snapshots: None,
             tool_specs: Arc::new(base_tools),
             plugin_tool_names: Vec::new(),
+            skill_actions: Vec::new(),
+            plugin_reload: None,
             plugin_dirs: Vec::new(),
             plugin_prompt_fragments: Vec::new(),
             plugin_hooks: Vec::new(),
@@ -790,6 +803,7 @@ mod tests {
             memory_refresh: None,
             tool_config,
             cron_service: None,
+            runtime_lifecycle: None,
             pipeline_factory: None,
             hook_executor: None,
             lane_routing: None,
@@ -1006,6 +1020,33 @@ mod tests {
             Arc::ptr_eq(&first, &second),
             "second get_or_init must hit the cache and reuse the Arc"
         );
+        assert_eq!(cache.len().await, 1);
+    }
+
+    #[tokio::test]
+    async fn should_recreate_session_when_supplied_profile_runtime_is_replaced() {
+        let tmp = TempDir::new().unwrap();
+        let original_profile = make_profile(tmp.path().join("original-profile-data")).await;
+        let replacement_profile = make_profile(tmp.path().join("replacement-profile-data")).await;
+        assert_eq!(original_profile.profile_id, replacement_profile.profile_id);
+        assert!(!Arc::ptr_eq(&original_profile, &replacement_profile));
+
+        let cache = SessionRuntimeCache::new(8, Duration::from_secs(60));
+        let key = SessionKey::new("api", "profile-replacement");
+        let original_session = cache
+            .get_or_init(&original_profile, key.clone(), None)
+            .await
+            .unwrap();
+        let replacement_session = cache
+            .get_or_init(&replacement_profile, key, None)
+            .await
+            .unwrap();
+
+        assert!(!Arc::ptr_eq(&original_session, &replacement_session));
+        assert!(Arc::ptr_eq(
+            &replacement_session.profile,
+            &replacement_profile
+        ));
         assert_eq!(cache.len().await, 1);
     }
 

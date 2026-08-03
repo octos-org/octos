@@ -376,11 +376,13 @@ mod tests {
     fn test_resolve_extras_empty_manifest() {
         let manifest = PluginManifest {
             name: "test".into(),
+            id: None,
             version: "1.0".into(),
             make_type: None,
             content_type_description: None,
             make_target_tool: None,
             tools: vec![],
+            actions: vec![],
             sha256: None,
             binaries: HashMap::new(),
             requires_network: false,
@@ -410,11 +412,13 @@ mod tests {
 
         let manifest = PluginManifest {
             name: "test".into(),
+            id: None,
             version: "1.0".into(),
             make_type: None,
             content_type_description: None,
             make_target_tool: None,
             tools: vec![],
+            actions: vec![],
             sha256: None,
             binaries: HashMap::new(),
             requires_network: false,
@@ -454,6 +458,7 @@ mod tests {
         use crate::plugins::manifest::PluginToolDef;
         PluginManifest {
             name: name.into(),
+            id: None,
             version: "1.0.0".into(),
             make_type: None,
             content_type_description: None,
@@ -464,6 +469,7 @@ mod tests {
                     name: t.into(),
                     description: "desc".into(),
                     input_schema: serde_json::json!({"type": "object"}),
+                    contexts: vec![],
                     spawn_only: any_spawn_only,
                     env: vec![],
                     risk: None,
@@ -471,6 +477,7 @@ mod tests {
                     concurrency_class: None,
                 })
                 .collect(),
+            actions: vec![],
             sha256: None,
             binaries: HashMap::new(),
             requires_network: false,

@@ -338,6 +338,11 @@ pub struct BackgroundTask {
     /// AppUI `runtime_policy_stamp` schema.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime_policy_stamp: Option<Value>,
+    /// Opaque host projection metadata. The supervisor persists this value
+    /// without interpreting its schema, allowing API adapters to derive
+    /// domain-specific views from the canonical task lifecycle.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub projection_metadata: Option<Value>,
 }
 
 impl BackgroundTask {
@@ -364,7 +369,7 @@ impl BackgroundTask {
 }
 
 /// Callback invoked when a task's status changes.
-type OnChangeCallback = Box<dyn Fn(&BackgroundTask) + Send + Sync>;
+type OnChangeCallback = Arc<dyn Fn(&BackgroundTask) + Send + Sync>;
 
 /// Payload emitted when a `spawn_only` background task transitions to
 /// `Failed`. Consumers (e.g. the session actor) use this to schedule a
@@ -890,6 +895,8 @@ pub struct TaskSupervisor {
     /// loop cannot keep adding children.
     poisoned_parents: Arc<Mutex<HashSet<String>>>,
     on_change: Arc<Mutex<Option<OnChangeCallback>>>,
+    /// Named observers supplement (and never replace) the primary callback.
+    on_change_listeners: Arc<Mutex<HashMap<String, OnChangeCallback>>>,
     on_failure: Arc<Mutex<Option<OnFailureCallback>>>,
     /// Gap-1 unification: single terminal-transition sink. Fired from
     /// every terminal path alongside the legacy `on_change` / `on_failure`
@@ -1205,6 +1212,7 @@ impl TaskSupervisor {
             tasks: Arc::new(Mutex::new(HashMap::new())),
             poisoned_parents: Arc::new(Mutex::new(HashSet::new())),
             on_change: Arc::new(Mutex::new(None)),
+            on_change_listeners: Arc::new(Mutex::new(HashMap::new())),
             on_failure: Arc::new(Mutex::new(None)),
             on_terminal: Arc::new(Mutex::new(None)),
             on_relaunch: Arc::new(Mutex::new(None)),
@@ -1459,7 +1467,29 @@ impl TaskSupervisor {
     /// Set a callback that fires whenever a task's status changes.
     pub fn set_on_change(&self, cb: impl Fn(&BackgroundTask) + Send + Sync + 'static) {
         let mut guard = self.on_change.lock().unwrap_or_else(|e| e.into_inner());
-        *guard = Some(Box::new(cb));
+        *guard = Some(Arc::new(cb));
+    }
+
+    /// Add or replace a named observer without disturbing the primary
+    /// callback installed through [`Self::set_on_change`]. Stable keys make
+    /// repeated session wiring idempotent.
+    pub fn set_on_change_listener(
+        &self,
+        key: impl Into<String>,
+        cb: impl Fn(&BackgroundTask) + Send + Sync + 'static,
+    ) {
+        self.on_change_listeners
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(key.into(), Arc::new(cb));
+    }
+
+    /// Remove a named task-change observer.
+    pub fn remove_on_change_listener(&self, key: &str) {
+        self.on_change_listeners
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(key);
     }
 
     /// Set a callback that fires only when a `spawn_only` task transitions to
@@ -2157,6 +2187,7 @@ impl TaskSupervisor {
             summary: None,
             artifact_count: None,
             runtime_policy_stamp: None,
+            projection_metadata: None,
         };
         let mut tasks = self.tasks.lock().unwrap_or_else(|e| e.into_inner());
         // Codex P2 atomicity: when this is a child-task registration
@@ -2276,6 +2307,23 @@ impl TaskSupervisor {
         if let Some(task) = tasks.get_mut(task_id) {
             task.tool_input = Some(tool_input);
         }
+    }
+
+    /// Attach or replace opaque projection metadata for an existing task.
+    /// The update is persisted and emitted through the normal change stream,
+    /// so projections share the supervisor's ordering and durability.
+    pub fn set_projection_metadata(&self, task_id: &str, metadata: Value) {
+        let snapshot = {
+            let mut tasks = self.tasks.lock().unwrap_or_else(|e| e.into_inner());
+            let Some(task) = tasks.get_mut(task_id) else {
+                return;
+            };
+            task.projection_metadata = Some(metadata);
+            task.updated_at = Utc::now();
+            task.clone()
+        };
+        self.persist_snapshot(&snapshot);
+        self.notify_change(&snapshot);
     }
 
     /// Mark a task as running.
@@ -3231,10 +3279,26 @@ impl TaskSupervisor {
             .cloned())
     }
 
-    /// Fire the on_change callback (if set) with a task snapshot.
+    /// Fire the primary callback and every named observer. Clone callbacks
+    /// outside their mutexes before invocation so observers may safely update
+    /// their own registration.
     fn notify_change(&self, task: &BackgroundTask) {
-        let guard = self.on_change.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(ref cb) = *guard {
+        let primary = self
+            .on_change
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let listeners = self
+            .on_change_listeners
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        if let Some(cb) = primary {
+            cb(task);
+        }
+        for cb in listeners {
             cb(task);
         }
     }

@@ -159,6 +159,11 @@ impl PluginTool {
         }
     }
 
+    /// Name of the plugin that declared this tool.
+    pub fn plugin_name(&self) -> &str {
+        &self.plugin_name
+    }
+
     /// yolo GAP #2: set the runtime approval behavior for the manifest risk
     /// gate. Threaded from the session's
     /// [`EffectivePermissions::approval_policy`](crate::policy::EffectivePermissions),
@@ -2341,6 +2346,10 @@ impl Tool for PluginTool {
         &self.tool_def.description
     }
 
+    fn contexts(&self) -> &[String] {
+        &self.tool_def.contexts
+    }
+
     fn concurrency_class(&self) -> super::super::tools::ConcurrencyClass {
         // Item 6 of OCTOS_M8_FIX_FIRST_CHECKLIST_2026-04-24:
         // honour the plugin manifest's optional `concurrency_class`
@@ -2997,6 +3006,7 @@ impl Tool for PluginTool {
                 .get("success")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(exit_status.success());
+            let structured_metadata = parsed.get("structured_metadata").cloned();
             // Check if plugin reported a file path
             let file_modified = parsed
                 .get("file_modified")
@@ -3063,6 +3073,7 @@ impl Tool for PluginTool {
                 success,
                 file_modified,
                 files_to_send,
+                structured_metadata,
                 named_outputs,
                 ..Default::default()
             });

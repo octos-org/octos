@@ -1118,6 +1118,9 @@ pub mod methods {
     /// playing — it must NOT navigate before the reply audio drains. Ungated;
     /// emitted on the same ledger-backed live path as `file/attached`.
     pub const VOICE_EXIT: &str = "voice/exit";
+    /// UPCR-2026-027 `skill/action/job/updated` — latest persisted snapshot
+    /// for a manifest-declared background skill action job.
+    pub const SKILL_ACTION_JOB_UPDATED: &str = "skill/action/job/updated";
     /// Streamed voice-reply audio chunk (gated by `event.voice_audio.v1`).
     /// One per audio frame from cloud TTS; carries base64 audio plus a
     /// `segment_id`/`seq`/`last` so the client groups and plays chunks in order.
@@ -1364,6 +1367,7 @@ pub const UI_PROTOCOL_NOTIFICATION_METHODS: &[&str] = &[
     methods::VISUAL_SUCCEEDED,
     methods::VISUAL_FAILED,
     methods::VOICE_EXIT,
+    methods::SKILL_ACTION_JOB_UPDATED,
     methods::VOICE_AUDIO_CHUNK,
     methods::PROJECTION_ENVELOPE,
     methods::SESSION_EVENT,
@@ -1941,6 +1945,11 @@ pub struct TurnStartParams {
     /// overrides the turn's effort. No-op for models without a reasoning style.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<ReasoningEffortLevel>,
+    /// Optional per-turn model tool context. Context-scoped tools are only
+    /// advertised when this value exactly matches one of their manifest
+    /// contexts. Omitted for ordinary chat and voice turns.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_context: Option<String>,
     /// Explicit "this turn is a live video call" signal — the attached image
     /// (if any) is the user's current camera frame, not an uploaded file. Set
     /// by video-call surfaces (the voice screen with the camera on). The server
@@ -6274,6 +6283,17 @@ pub struct QueueStateEvent {
     pub head_client_message_id: Option<String>,
 }
 
+/// UPCR-2026-027 — latest background skill action job snapshot.
+///
+/// `job` is intentionally a generic JSON object at the core protocol layer so
+/// octos-core does not depend on a specific host-side job store type.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SkillActionJobUpdatedEvent {
+    pub profile_id: String,
+    pub session_id: SessionKey,
+    pub job: Value,
+}
+
 /// `peer/staged` (#1801 v3) — agent-initiated peer staging. Emitted by the
 /// serve/WS turn path when the model's `peer_handoff` tool staged a peer
 /// through the host callback: the durable brief (and optional fenced
@@ -6347,6 +6367,8 @@ pub enum UiNotification {
     /// UPCR-2026-025 voice exit intent: the voice turn detected an end /
     /// goodbye / mute intent; the client returns home after the farewell audio.
     VoiceExit(VoiceExitEvent),
+    /// UPCR-2026-027: latest background skill action job snapshot.
+    SkillActionJobUpdated(SkillActionJobUpdatedEvent),
     ToolStarted(ToolStartedEvent),
     ToolProgress(ToolProgressEvent),
     ToolCompleted(ToolCompletedEvent),
@@ -6459,6 +6481,7 @@ impl UiNotification {
             Self::VisualSucceeded(_) => methods::VISUAL_SUCCEEDED,
             Self::VisualFailed(_) => methods::VISUAL_FAILED,
             Self::VoiceExit(_) => methods::VOICE_EXIT,
+            Self::SkillActionJobUpdated(_) => methods::SKILL_ACTION_JOB_UPDATED,
             Self::ToolStarted(_) => methods::TOOL_STARTED,
             Self::ToolProgress(_) => methods::TOOL_PROGRESS,
             Self::ToolCompleted(_) => methods::TOOL_COMPLETED,
@@ -6511,6 +6534,7 @@ impl UiNotification {
             Self::VisualSucceeded(event) => &event.session_id,
             Self::VisualFailed(event) => &event.session_id,
             Self::VoiceExit(event) => &event.session_id,
+            Self::SkillActionJobUpdated(event) => &event.session_id,
             Self::ToolStarted(event) => &event.session_id,
             Self::ToolProgress(event) => &event.session_id,
             Self::ToolCompleted(event) => &event.session_id,
@@ -6668,6 +6692,7 @@ impl UiNotification {
             Self::VisualSucceeded(params) => serde_json::to_value(params),
             Self::VisualFailed(params) => serde_json::to_value(params),
             Self::VoiceExit(params) => serde_json::to_value(params),
+            Self::SkillActionJobUpdated(params) => serde_json::to_value(params),
             Self::ToolStarted(params) => serde_json::to_value(params),
             Self::ToolProgress(params) => serde_json::to_value(params),
             Self::ToolCompleted(params) => serde_json::to_value(params),
@@ -6791,6 +6816,9 @@ impl UiNotification {
             methods::VISUAL_SUCCEEDED => Ok(Self::VisualSucceeded(decode_params(method, params)?)),
             methods::VISUAL_FAILED => Ok(Self::VisualFailed(decode_params(method, params)?)),
             methods::VOICE_EXIT => Ok(Self::VoiceExit(decode_params(method, params)?)),
+            methods::SKILL_ACTION_JOB_UPDATED => {
+                Ok(Self::SkillActionJobUpdated(decode_params(method, params)?))
+            }
             methods::TOOL_STARTED => Ok(Self::ToolStarted(decode_params(method, params)?)),
             methods::TOOL_PROGRESS => Ok(Self::ToolProgress(decode_params(method, params)?)),
             methods::TOOL_COMPLETED => Ok(Self::ToolCompleted(decode_params(method, params)?)),

@@ -7253,6 +7253,7 @@ fn make_supervisor_task(
         summary: None,
         artifact_count: None,
         runtime_policy_stamp: None,
+        projection_metadata: None,
     }
 }
 

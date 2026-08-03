@@ -5,11 +5,13 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 
 const PROFILE_HANDLE_PREFIX: &str = "pf";
 const UPLOAD_HANDLE_PREFIX: &str = "up";
+const WORKSPACE_HANDLE_PREFIX: &str = "ws";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FileHandleScope {
     ProfileRelative(PathBuf),
     TempUpload(PathBuf),
+    WorkspaceRelative(PathBuf),
 }
 
 /// Scope of a resolved tool-argument path. Lets callers apply
@@ -99,6 +101,17 @@ pub fn encode_tmp_upload_handle(path: &Path, display_name: Option<&str>) -> Opti
     encode_scoped_handle(UPLOAD_HANDLE_PREFIX, relative, display_name)
 }
 
+pub fn encode_workspace_file_handle(workspace_root: &Path, path: &Path) -> Option<String> {
+    let canonical_root = std::fs::canonicalize(workspace_root).ok()?;
+    let canonical_path = std::fs::canonicalize(path).ok()?;
+    if !canonical_path.is_file() {
+        return None;
+    }
+    let relative = canonical_path.strip_prefix(canonical_root).ok()?;
+    let display_name = canonical_path.file_name()?.to_str()?;
+    encode_scoped_handle(WORKSPACE_HANDLE_PREFIX, relative, display_name)
+}
+
 pub fn decode_file_handle(handle: &str) -> Option<FileHandleScope> {
     let mut parts = handle.splitn(3, '/');
     let prefix = parts.next()?;
@@ -116,6 +129,7 @@ pub fn decode_file_handle(handle: &str) -> Option<FileHandleScope> {
     match prefix {
         PROFILE_HANDLE_PREFIX => Some(FileHandleScope::ProfileRelative(relative)),
         UPLOAD_HANDLE_PREFIX => Some(FileHandleScope::TempUpload(relative)),
+        WORKSPACE_HANDLE_PREFIX => Some(FileHandleScope::WorkspaceRelative(relative)),
         _ => None,
     }
 }
@@ -124,7 +138,15 @@ pub fn resolve_scoped_file_handle(base_dir: &Path, handle: &str) -> Option<PathB
     match decode_file_handle(handle)? {
         FileHandleScope::ProfileRelative(relative) => canonicalize_under(base_dir, &relative),
         FileHandleScope::TempUpload(relative) => canonicalize_under(&temp_upload_root(), &relative),
+        FileHandleScope::WorkspaceRelative(_) => None,
     }
+}
+
+pub fn resolve_workspace_file_handle(workspace_root: &Path, handle: &str) -> Option<PathBuf> {
+    let FileHandleScope::WorkspaceRelative(relative) = decode_file_handle(handle)? else {
+        return None;
+    };
+    canonicalize_under(workspace_root, &relative)
 }
 
 pub fn resolve_legacy_file_request(base_dir: &Path, raw: &str) -> Option<PathBuf> {
@@ -151,6 +173,7 @@ pub fn resolve_upload_reference(raw: &str) -> Option<PathBuf> {
             canonicalize_under(&temp_upload_root(), &relative)
         }
         Some(FileHandleScope::ProfileRelative(_)) => None,
+        Some(FileHandleScope::WorkspaceRelative(_)) => None,
         None => {
             let candidate = Path::new(raw);
             if candidate.is_absolute() {
@@ -228,6 +251,14 @@ pub fn resolve_tool_path(
                 .map(|absolute| ResolvedToolPath {
                     absolute,
                     scope: ToolPathScope::Profile,
+                })
+                .ok_or(ToolPathError::OutsideAllowedRoots);
+        }
+        Some(FileHandleScope::WorkspaceRelative(relative)) => {
+            return canonicalize_under(workspace_root, &relative)
+                .map(|absolute| ResolvedToolPath {
+                    absolute,
+                    scope: ToolPathScope::Workspace,
                 })
                 .ok_or(ToolPathError::OutsideAllowedRoots);
         }
@@ -489,11 +520,44 @@ pub fn materialize_turn_uploads(
     tenant_id: Option<&str>,
     media: &[String],
 ) -> Vec<String> {
+    materialize_uploads(
+        workspace_root,
+        tenant_id,
+        media,
+        ImageMaterializeMode::VisionPath,
+    )
+}
+
+/// Materialize upload references into `<workspace>/uploads/`.
+///
+/// Unlike turn media, this mode is for consumers that explicitly require
+/// workspace-relative file paths. That means images must be copied too: the
+/// vision encoder's absolute tmpdir path is useful for chat media, but tools
+/// that validate workspace paths reject absolute upload-tmpdir paths.
+pub fn materialize_uploads_as_workspace_relative(
+    workspace_root: &Path,
+    tenant_id: Option<&str>,
+    media: &[String],
+) -> Vec<String> {
+    materialize_uploads(
+        workspace_root,
+        tenant_id,
+        media,
+        ImageMaterializeMode::WorkspaceFile,
+    )
+}
+
+fn materialize_uploads(
+    workspace_root: &Path,
+    tenant_id: Option<&str>,
+    media: &[String],
+    image_mode: ImageMaterializeMode,
+) -> Vec<String> {
     let uploads_dir = workspace_root.join("uploads");
     media
         .iter()
         .filter_map(
-            |entry| match materialize_one(&uploads_dir, tenant_id, entry) {
+            |entry| match materialize_one(&uploads_dir, tenant_id, entry, image_mode) {
                 MaterializeOutcome::Rewritten(path) => Some(path),
                 MaterializeOutcome::Passthrough => Some(entry.clone()),
                 // Foreign / cross-tenant: DROP the entry entirely. Passing the
@@ -504,6 +568,14 @@ pub fn materialize_turn_uploads(
             },
         )
         .collect()
+}
+
+#[derive(Clone, Copy)]
+enum ImageMaterializeMode {
+    /// Keep images on an absolute upload-tmpdir path for the vision encoder.
+    VisionPath,
+    /// Copy images into `<workspace>/uploads/` like every other action input.
+    WorkspaceFile,
 }
 
 enum MaterializeOutcome {
@@ -562,7 +634,12 @@ pub fn upload_owned_by_tenant(resolved: &Path, tenant_id: Option<&str>) -> bool 
     first_is_tenant && comps.next().is_some()
 }
 
-fn materialize_one(uploads_dir: &Path, tenant_id: Option<&str>, entry: &str) -> MaterializeOutcome {
+fn materialize_one(
+    uploads_dir: &Path,
+    tenant_id: Option<&str>,
+    entry: &str,
+    image_mode: ImageMaterializeMode,
+) -> MaterializeOutcome {
     let Some(src) = resolve_upload_reference(entry) else {
         return MaterializeOutcome::Passthrough; // not a staged upload (workspace path / external / unknown)
     };
@@ -582,7 +659,7 @@ fn materialize_one(uploads_dir: &Path, tenant_id: Option<&str>, entry: &str) -> 
     // ABSOLUTE path so the encoder can read it (a bare `up/` handle isn't a real
     // file path). A non-tmpdir image (workspace/external) already returned
     // Passthrough above via `resolve_upload_reference` == None.
-    if crate::media::is_image(entry) {
+    if matches!(image_mode, ImageMaterializeMode::VisionPath) && crate::media::is_image(entry) {
         return match src.to_str() {
             Some(abs) => MaterializeOutcome::Rewritten(abs.to_string()),
             None => MaterializeOutcome::Passthrough,
@@ -810,6 +887,25 @@ mod tests {
     }
 
     #[test]
+    fn materialize_uploads_as_workspace_relative_copies_images_into_workspace_uploads() {
+        let ws = tempfile::tempdir().unwrap();
+        let (src, handle) = stage_upload("photo.png", b"\x89PNG\r\n");
+
+        let out = materialize_uploads_as_workspace_relative(
+            ws.path(),
+            None,
+            std::slice::from_ref(&handle),
+        );
+
+        assert_eq!(out[0], "uploads/photo.png");
+        assert_eq!(
+            std::fs::read(ws.path().join("uploads/photo.png")).unwrap(),
+            b"\x89PNG\r\n"
+        );
+        let _ = std::fs::remove_file(&src);
+    }
+
+    #[test]
     fn materialize_drops_foreign_image() {
         // codex round-7 P1: a raw image path under ANOTHER tenant's upload dir
         // must be DROPPED, not passed through to the vision encoder.
@@ -886,6 +982,24 @@ mod tests {
             FileHandleScope::ProfileRelative(PathBuf::from("slides/demo/output/deck.pptx"))
         );
         assert!(handle.ends_with("/deck.pptx"));
+    }
+
+    #[test]
+    fn workspace_handle_round_trips_only_within_its_workspace() {
+        let workspace = tempfile::tempdir().unwrap();
+        let artifact = workspace.path().join("outputs/quiz.md");
+        std::fs::create_dir_all(artifact.parent().unwrap()).unwrap();
+        std::fs::write(&artifact, b"quiz").unwrap();
+
+        let handle = encode_workspace_file_handle(workspace.path(), &artifact).expect("handle");
+
+        assert!(handle.starts_with("ws/"));
+        assert_eq!(
+            resolve_workspace_file_handle(workspace.path(), &handle),
+            std::fs::canonicalize(artifact).ok(),
+        );
+        let other_workspace = tempfile::tempdir().unwrap();
+        assert!(resolve_workspace_file_handle(other_workspace.path(), &handle).is_none());
     }
 
     #[test]
