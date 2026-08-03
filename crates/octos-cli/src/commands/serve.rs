@@ -10,7 +10,9 @@ use eyre::{Result, WrapErr};
 use octos_bus::SessionManager;
 
 use super::Executable;
-use crate::api::{AppState, EventBroadcaster, build_router, init_metrics};
+use crate::api::{
+    AppState, EventBroadcaster, build_router, init_metrics, resolve_appui_allowed_origins,
+};
 use crate::config::Config;
 
 // #1857 PR 5a — fleet worker pool defaults (serve boot). Conservative single-
@@ -444,6 +446,31 @@ pub struct ServeCommand {
 /// `handle_task_cancel` keeps proxying to the gateway via `resolve_api_port`.
 fn stdio_task_query_store(stdio: bool) -> Option<crate::session_actor::SessionTaskQueryStore> {
     stdio.then(crate::session_actor::SessionTaskQueryStore::default)
+}
+
+/// Bind the HTTP listener before constructing `AppState`.
+///
+/// Port `0` asks the OS for an ephemeral port. Resolving it here ensures every
+/// downstream consumer (gateway launch configuration, browser-Origin policy,
+/// and user-facing URLs) sees the real port instead of the sentinel `0`.
+/// Stdio mode does not bind HTTP and preserves the configured value.
+async fn bind_http_listener(
+    stdio: bool,
+    host: &str,
+    requested_port: u16,
+) -> Result<(Option<tokio::net::TcpListener>, u16)> {
+    if stdio {
+        return Ok((None, requested_port));
+    }
+
+    let listener = tokio::net::TcpListener::bind((host, requested_port))
+        .await
+        .wrap_err_with(|| format!("failed to bind octos API server to {host}:{requested_port}"))?;
+    let actual_port = listener
+        .local_addr()
+        .wrap_err("failed to inspect bound octos API listener")?
+        .port();
+    Ok((Some(listener), actual_port))
 }
 
 /// Stable, machine-greppable marker embedded in the "data directory is already
@@ -1037,11 +1064,14 @@ impl ServeCommand {
                 .with_sessions_in_cwd(config.appui.sessions_in_cwd),
         );
 
+        let (http_listener, effective_serve_port) =
+            bind_http_listener(self.stdio, &self.host, self.port).await?;
+
         let bridge_js_path = data_dir.join("whatsapp-bridge").join("bridge.js");
         let process_manager = Arc::new(
             crate::process_manager::ProcessManager::new(profile_store.clone())
                 .with_bridge_js(bridge_js_path)
-                .with_serve_config(self.port, auth_token.clone())
+                .with_serve_config(effective_serve_port, auth_token.clone())
                 // Section B (codex review round-5 P1.2): every spawned
                 // gateway inherits the host's strict-signing policy via
                 // an env var. `Config::from_file` OR-merges it onto the
@@ -1241,6 +1271,24 @@ impl ServeCommand {
                 config.mode
             );
         }
+        // Resolve browser origins once, before any HTTP route is exposed.
+        // A malformed explicit origin aborts startup instead of silently
+        // weakening CORS/WS behavior. Empty env means "use config"; a
+        // non-empty env value replaces the config list for deployments.
+        let appui_allowed_origins_env = match std::env::var("OCTOS_APPUI_ALLOWED_ORIGINS") {
+            Ok(value) => Some(value),
+            Err(std::env::VarError::NotPresent) => None,
+            Err(std::env::VarError::NotUnicode(_)) => {
+                eyre::bail!("OCTOS_APPUI_ALLOWED_ORIGINS must be valid Unicode")
+            }
+        };
+        let appui_allowed_origins = resolve_appui_allowed_origins(
+            &config.appui.allowed_origins,
+            appui_allowed_origins_env.as_deref(),
+            effective_serve_port,
+        )
+        .wrap_err("invalid AppUI browser-origin configuration")?;
+
         let state = Arc::new(AppState {
             profiles: profile_runtimes,
             session_cache,
@@ -1284,6 +1332,7 @@ impl ServeCommand {
                 .ok()
                 .filter(|s| !s.trim().is_empty())
                 .or_else(|| config.base_domain.clone().filter(|s| !s.trim().is_empty())),
+            appui_allowed_origins,
             frps_server: config
                 .frps_server
                 .clone()
@@ -1592,7 +1641,12 @@ impl ServeCommand {
         crate::api::ui_protocol::spawn_global_master_continuation_drain(state.clone());
 
         let app = build_router(state);
-        let addr = format!("{}:{}", self.host, self.port);
+        let listener =
+            http_listener.expect("non-stdio serve must bind its HTTP listener before AppState");
+        let addr = listener
+            .local_addr()
+            .wrap_err("failed to inspect bound octos API listener")?
+            .to_string();
 
         tracing::info!(address = %addr, "octos API server starting");
         tracing::info!(dashboard = %format!("http://{}/admin/", addr), "dashboard available");
@@ -1612,7 +1666,6 @@ impl ServeCommand {
         }
         println!();
 
-        let listener = tokio::net::TcpListener::bind(&addr).await?;
         axum::serve(
             listener,
             app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
@@ -1808,6 +1861,25 @@ mod tests {
             stdio_task_query_store(false).is_none(),
             "gateway/http serve must leave task_query_store None"
         );
+    }
+
+    #[tokio::test]
+    async fn port_zero_resolves_before_origin_configuration() {
+        let (listener, effective_port) = bind_http_listener(false, "127.0.0.1", 0)
+            .await
+            .expect("bind an ephemeral loopback listener");
+        let listener = listener.expect("HTTP serve returns a bound listener");
+
+        assert_ne!(effective_port, 0, "the OS-selected port must be concrete");
+        assert_eq!(
+            listener.local_addr().unwrap().port(),
+            effective_port,
+            "all downstream configuration must use the bound listener's port"
+        );
+        let origins = resolve_appui_allowed_origins(&[], None, effective_port).unwrap();
+        assert!(origins.contains(&format!("http://127.0.0.1:{effective_port}")));
+        assert!(origins.contains(&format!("http://localhost:{effective_port}")));
+        assert!(origins.contains(&format!("http://[::1]:{effective_port}")));
     }
 
     /// #1857 PR 5a fix (HIGH 1) — the fleet worker pool installs ONLY behind a

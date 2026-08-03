@@ -1270,7 +1270,7 @@ Polls every 5 seconds. SHA-256 hash comparison of file contents.
 | `/metrics` | GET | Prometheus text exposition format (unauthenticated) |
 | `/*` (fallback) | GET | Embedded web UI (static files via rust-embed) |
 
-**Auth**: Optional bearer token with constant-time comparison (API routes only; `/metrics` and static files are public). **CORS**: localhost development origins plus the configured base domain. **Max message**: 1MB.
+**Auth**: Optional bearer token with constant-time comparison (API routes only; `/metrics` and static files are public). Browser Origin policy is resolved once at serve startup into `AppState`: legacy OminiX/base-domain and development entries, exact normalized `appui.allowed_origins`, and the active serve port's loopback entries. The router CORS predicate and both `/api/ui-protocol/ws` and `/v1/session_ingress/ws/*` upgrade gates consume that same list; authentication/work-secret checks remain independent, and CORS does not enable credentials. Hosted single-label tenant compatibility remains an additional WS rule. Reverse-proxy and LAN origins are never inferred from request `Host`/forwarding headers. **Max message**: 1MB.
 
 **Web UI**: Embedded SPA via `rust-embed` served as the fallback handler. Session sidebar, chat interface, UI Protocol WebSocket streaming, and dashboard/admin surfaces share the same `octos serve` process.
 
