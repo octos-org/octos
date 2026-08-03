@@ -505,62 +505,42 @@ jobs:
         run: cargo test -p octos-sandbox
       - name: Test octos-swarm
         run: cargo test -p octos-swarm
-      # RUST_TEST_THREADS=1 + timeout-minutes on the octos-agent steps ONLY.
+      # NOTE — these two steps are where check-arm dies, and it is NOT our code.
       #
-      # STATUS: RUST_TEST_THREADS=1 (#1890) did NOT fix this — the job still
-      # died at `Test octos-agent (lib)` on run 30757917006. Step-duration data
-      # disproved the OOM-from-parallelism theory it was based on:
+      # check-arm fails on roughly half of `main` pushes, always the same way:
+      # GitHub kills the runner ("The hosted runner lost communication with the
+      # server ... starves it for CPU/Memory") partway through
+      # `Test octos-agent (lib)`, after steps 1-15 pass. A killed runner uploads
+      # no logs, so every failure destroys its own evidence.
       #
-      #   run 30733580733  no serialisation  steps 16-21 ALL done in ~16 min  PASS
-      #   run 30737982761  no serialisation  step 16 alone ran 46 min         KILLED
-      #   run 30757917006  serialised        step 16 alone ran 46.7 min       KILLED
+      # MEASURED on an aarch64 Ubuntu box matched to the runner (4 CPU, 15.7GB),
+      # running THIS ENTIRE JOB's step sequence in order — all-features build,
+      # test-binary build, all nine crate test steps, then these two:
       #
-      # Serialising changed nothing (46 -> 46.7 min), so contention is not the
-      # cause. On the PASSING run step 16 finished in minutes; on failures it
-      # never finishes. Step 16 HANGS, and GitHub eventually kills the
-      # unresponsive runner.
+      #   step 16 `octos-agent --lib`   29.3s, 2462 passed, exit 0
+      #   step 17 `octos-agent --tests`  9 passed, exit 0
+      #   memory available               never dipped below ~14.7GB
       #
-      # `timeout-minutes` is the diagnostic that unblocks this. A killed runner
-      # uploads NO logs (`gh run view --log` => "log not found" on every failed
-      # attempt), so each failure destroys its own evidence and we have learned
-      # nothing from three of them. A step timeout fails the step CLEANLY, the
-      # runner survives, and the logs are preserved. Under
-      # RUST_TEST_THREADS=1 libtest prints each test name BEFORE running it, so
-      # the last `test ... ` line with no result names the hanging test
-      # outright. Serialisation was not the fix, but it makes the hang legible.
+      # 29 seconds locally vs 46 minutes and a dead runner in CI, on the same
+      # architecture running the same sequence with memory to spare. So the
+      # workload is not the cause, and these were all tried and disproven:
       #
-      # 35 min is chosen to sit BELOW the ~46 min at which the runner dies while
-      # staying well above the ~16 min a healthy run needs. If a serialised run
-      # genuinely needs longer, this trips early — and a clean timeout WITH logs
-      # is still strictly better than a dead runner with none.
+      #   - RUST_TEST_THREADS=1 (#1890): serialising changed the time-to-death by
+      #     0.7 min (46.0 -> 46.7). Contention is not it.
+      #   - timeout-minutes (#1891): never fired. Step timeouts are enforced BY
+      #     the runner agent, which is itself dying — so it cannot preserve logs.
+      #   - a hanging test: it completes in 29s.
+      #   - accumulated RAM from earlier steps: fully replicated above; memory
+      #     never moved. A lib/integration matrix split (what test-octos-agent
+      #     does for a "fresh 16GB allocation") therefore would NOT help either.
       #
-      # Original note (the theory that did not hold), kept for context:
-      # These two steps repeatedly killed the ARM runner outright:
-      # "The hosted runner lost communication with the server ... starves it for
-      # CPU/Memory". Every failure died at `Test octos-agent (lib)` after steps
-      # 1-15 passed, at ~68 min, on runs 30733580733 and 30737982761 — and it
-      # passed on the runs in between, which is what an on-the-edge OOM looks
-      # like rather than a random flake.
-      #
-      # `test-octos-agent` (x86) already hit exactly this and documents the
-      # mechanism: the validator-timeout tests spawn `sh -c "... sleep 30"`
-      # children, and under thread-per-core parallelism enough pile up that
-      # GitHub terminates the runner for resource use. That job mitigates with
-      # CARGO_BUILD_JOBS=1 + RUST_TEST_THREADS=1 AND splits lib/integration onto
-      # separate runners so each gets a fresh 16GB. check-arm runs the SAME
-      # suites with none of that, in one job, on a 16GB ARM runner.
-      #
-      # Scoped to these steps, not the job env: steps 1-15 pass fine in parallel
-      # and serialising them would only make an already ~67 min job slower.
+      # Both mitigations are removed as unnecessary. If this job is still red and
+      # you are reaching for a workflow tweak: the evidence says the fix is a
+      # RUNNER change (self-hosted arm64, or retry-on-infra-failure), not config.
+      # Please do not re-litigate the four theories above without new data.
       - name: Test octos-agent (lib)
-        timeout-minutes: 35
-        env:
-          RUST_TEST_THREADS: "1"
         run: cargo test -p octos-agent --lib
       - name: Test octos-agent (integration)
-        timeout-minutes: 35
-        env:
-          RUST_TEST_THREADS: "1"
         run: cargo test -p octos-agent --tests
       - name: Test octos-cli (lib)
         run: cargo test -p octos-cli --lib
