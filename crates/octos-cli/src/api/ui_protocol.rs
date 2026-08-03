@@ -13281,6 +13281,21 @@ fn write_peer_result_if_peer_session(
     if let Err(err) = peer_io::append_peer_line(&peer_dir, "turns.txt", &index_line) {
         tracing::warn!(?err, slug, turn_count, "failed to append to turns.txt");
     }
+
+    // Publish this turn's commits to the workspace repo NOW, not only on close.
+    //
+    // A peer's fence branch lives in its own clone, so until it is fetched back
+    // the work is invisible from the workspace — `git branch` does not list it
+    // and it reads as though the peer produced nothing. Collecting only on close
+    // meant a peer that was never closed (the common case: peers usually just
+    // finish) kept its deliverable stranded in the clone. Live soak showed
+    // exactly that: the closed peer's branch landed, the un-closed peer's did
+    // not, despite both having committed.
+    //
+    // Here is the right moment — the peer has just finished a turn, so whatever
+    // it committed exists. Best-effort and idempotent: the fetch is a forced
+    // refspec, so re-running it per turn simply fast-forwards.
+    collect_peer_branch(&peer_dir, slug);
 }
 
 /// Count how many `result-<n>.md` version files exist in the peer directory,
