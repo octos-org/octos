@@ -133,13 +133,64 @@ impl ModelPools {
 /// touched (or `debug!` for the no-op cases) so operators can confirm
 /// the assignment fired without scraping per-node logs.
 pub fn assign_from_catalog_dir(graph: &mut PipelineGraph, data_dir: &Path) {
-    let Some(catalog) = load_catalog(data_dir) else {
+    assign_from_catalog_dir_filtered(graph, data_dir, None);
+}
+
+/// As [`assign_from_catalog_dir`], but only assigns models the provider router
+/// has actually REGISTERED (#1901).
+///
+/// Assignment rewrites DOT lane keys (`model="strong"`) to concrete catalog
+/// models, and a profile without a filtered `pipeline_models.json` falls back to
+/// the unfiltered `model_catalog.json` — 93 models, most of which the router
+/// never registered. It had no way to know that, because it was never given the
+/// router. So it happily rewrote a RESOLVABLE lane key into an UNRESOLVABLE
+/// model name, and the resolve failed downstream.
+///
+/// The key insight: when no registered concrete model exists, the right move is
+/// to leave the DOT alone. `strong` is itself a router key — that is what
+/// `available: ["cheap", "strong"]` in the old error was telling us. Rewriting
+/// it was the bug; not rewriting it resolves correctly.
+///
+/// `registered = None` keeps the old unfiltered behaviour for callers with no
+/// router (tests, legacy paths).
+pub fn assign_from_catalog_dir_filtered(
+    graph: &mut PipelineGraph,
+    data_dir: &Path,
+    registered: Option<&std::collections::HashSet<String>>,
+) {
+    let Some(mut catalog) = load_catalog(data_dir) else {
         tracing::debug!(
             data_dir = %data_dir.display(),
             "model_assignment: no catalog found, leaving DOT unchanged"
         );
         return;
     };
+
+    if let Some(registered) = registered {
+        let before = catalog.models.len();
+        catalog
+            .models
+            .retain(|m| registered.contains(m.model_key()) || registered.contains(&m.provider));
+        if catalog.models.is_empty() {
+            // Nothing in the catalog is registered, so any rewrite would produce
+            // an unresolvable model. Leaving the lane keys (`strong`/`cheap`) in
+            // place is CORRECT — the router registers those directly.
+            tracing::info!(
+                catalog_models = before,
+                registered = registered.len(),
+                "model_assignment: no catalog model is registered with the provider \
+                 router; leaving DOT lane keys unchanged so they resolve directly"
+            );
+            return;
+        }
+        if catalog.models.len() != before {
+            tracing::debug!(
+                kept = catalog.models.len(),
+                dropped = before - catalog.models.len(),
+                "model_assignment: restricted candidates to router-registered models"
+            );
+        }
+    }
 
     let Some(pools) = build_pools(&catalog) else {
         tracing::debug!("model_assignment: catalog had no healthy strong/fast models");
@@ -560,5 +611,78 @@ mod tests {
         // healthy-strong survives.
         assert_eq!(pools.strong, vec!["healthy-strong".to_string()]);
         assert_eq!(pools.fast, vec!["fast-a".to_string()]);
+    }
+}
+
+#[cfg(test)]
+mod registered_filter_tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    fn entry(provider: &str, model_type: &str) -> CatalogEntry {
+        CatalogEntry {
+            provider: provider.to_string(),
+            model_type: model_type.to_string(),
+            stability: 0.99,
+            score: 0.10,
+            cost_out: 0.0,
+        }
+    }
+
+    /// Assignment must never rewrite a lane key into a model the router cannot
+    /// resolve (#1901 layer 1 — the root cause).
+    ///
+    /// Assignment was given only the catalog, never the router, so it rewrote
+    /// `model="strong"` (which the router DOES register) into a concrete catalog
+    /// model it does not. Resolution then failed downstream. #1902 stopped that
+    /// failing the run, but the pipeline still silently executed on the default
+    /// provider instead of the requested lane — the bug this closes.
+    #[test]
+    fn unregistered_catalog_models_are_never_assigned() {
+        let catalog = ModelCatalog {
+            models: vec![
+                entry("openai/qwen3-max", "strong"),
+                entry("groq/llama-3.3-70b-versatile", "fast"),
+            ],
+        };
+        // The router registers only the LANES, exactly as the bug report showed:
+        // `available: ["cheap", "strong"]`.
+        let registered: HashSet<String> = ["cheap".to_string(), "strong".to_string()]
+            .into_iter()
+            .collect();
+
+        let survivors: Vec<&CatalogEntry> = catalog
+            .models
+            .iter()
+            .filter(|m| registered.contains(m.model_key()) || registered.contains(&m.provider))
+            .collect();
+
+        assert!(
+            survivors.is_empty(),
+            "no catalog model is registered, so none may be assigned; got {:?}",
+            survivors.iter().map(|m| &m.provider).collect::<Vec<_>>()
+        );
+    }
+
+    /// A registered catalog model IS still assignable — the filter must not
+    /// disable assignment wholesale.
+    #[test]
+    fn registered_catalog_models_survive_the_filter() {
+        let catalog = ModelCatalog {
+            models: vec![
+                entry("openai/qwen3-max", "strong"),
+                entry("deepseek/deepseek-v4-pro", "strong"),
+            ],
+        };
+        let registered: HashSet<String> = ["deepseek-v4-pro".to_string()].into_iter().collect();
+
+        let survivors: Vec<&CatalogEntry> = catalog
+            .models
+            .iter()
+            .filter(|m| registered.contains(m.model_key()) || registered.contains(&m.provider))
+            .collect();
+
+        assert_eq!(survivors.len(), 1, "only the registered model may survive");
+        assert_eq!(survivors[0].model_key(), "deepseek-v4-pro");
     }
 }

@@ -1795,7 +1795,19 @@ impl PipelineExecutor {
             .catalog_dir
             .as_deref()
             .unwrap_or(&self.config.working_dir);
-        crate::model_assignment::assign_from_catalog_dir(&mut graph, catalog_dir);
+        // Only assign models this profile's router actually registered (#1901).
+        // Without the router, assignment rewrote resolvable lane keys into
+        // catalog models that could not resolve — the crash #1902 papered over.
+        let registered: Option<std::collections::HashSet<String>> = self
+            .config
+            .provider_router
+            .as_ref()
+            .map(|r| r.keys().into_iter().collect());
+        crate::model_assignment::assign_from_catalog_dir_filtered(
+            &mut graph,
+            catalog_dir,
+            registered.as_ref(),
+        );
 
         // ── Pipeline start: log graph structure ──
         let node_summary: Vec<String> = graph
