@@ -1756,7 +1756,20 @@ impl SpawnTool {
         let (base, default_cw): (Arc<dyn LlmProvider>, Option<u32>) =
             match (model, &self.provider_router) {
                 (Some(model_key), Some(router)) => {
-                    let provider = router.resolve(model_key)?;
+                    // An unresolvable model key must degrade to the parent
+                    // provider, matching the pipeline handler's fallback —
+                    // model-assignment may name catalog models this profile's
+                    // router never registered, and that must not fail the spawn.
+                    let provider = match router.resolve(model_key) {
+                        Ok(p) => p,
+                        Err(_) => {
+                            warn!(
+                                model = model_key,
+                                "sub-agent model not in provider router; using parent provider"
+                            );
+                            self.llm.clone()
+                        }
+                    };
                     // Look up default_context_window from metadata
                     let key = model_key.split_once('/').map_or(model_key, |(k, _)| k);
                     let default_cw = router

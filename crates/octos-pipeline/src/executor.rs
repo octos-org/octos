@@ -1117,7 +1117,21 @@ fn resolve_provider(
     model_key: Option<&str>,
 ) -> Result<Arc<dyn LlmProvider>> {
     match (model_key, router) {
-        (Some(key), Some(r)) => r.resolve(key),
+        // A missing/unknown model key must degrade to the default provider,
+        // matching CodergenHandler::resolve_provider (handler.rs) — the
+        // model-assignment pass may rewrite lane keys (e.g. `strong`) to
+        // catalog models this profile's router never registered, and that
+        // must not fail the whole pipeline.
+        (Some(key), Some(r)) => match r.resolve(key) {
+            Ok(provider) => Ok(provider),
+            Err(_) => {
+                warn!(
+                    model = key,
+                    "pipeline model not in provider router; using default provider"
+                );
+                Ok(default.clone())
+            }
+        },
         (Some(key), None) => {
             warn!(
                 model = key,
