@@ -332,9 +332,14 @@ struct McpToolSpec {
 
 /// A running set of MCP server connections and the tools they expose.
 pub struct McpClient {
-    /// Kept alive so the underlying transports (and stdio child processes) stay
-    /// open for as long as any registered tool references them.
-    #[allow(dead_code)]
+    /// The live transports (and their stdio child processes).
+    ///
+    /// These are MOVED into the registry by [`McpClient::register_tools`], which
+    /// then owns them for its lifetime. That matters: `register_tools` consumes
+    /// `self`, so this field is dropped as soon as registration returns — it
+    /// never kept anything alive on its own, despite once claiming to. The
+    /// registered tools were the only owners, so any `retain()` that removed the
+    /// last MCP tool cancelled the transport and killed the child (#1886).
     services: Vec<(String, McpService)>,
     tools: Vec<McpToolSpec>,
 }
@@ -525,6 +530,13 @@ impl McpClient {
     /// names collide with built-in tool names are rejected so a remote server
     /// cannot silently replace core functionality.
     pub fn register_tools(self, registry: &mut ToolRegistry) {
+        // Hand the transports to the registry BEFORE the tools, so it owns them
+        // even if every tool below is later filtered out. Without this the tools
+        // are the sole owners and profile narrowing tears down the connection
+        // (#1886) — a visibility filter must not end a child process.
+        for (_server, service) in self.services {
+            registry.keep_mcp_service_alive(service as Arc<dyn std::any::Any + Send + Sync>);
+        }
         for spec in self.tools {
             if Self::PROTECTED_NAMES.contains(&spec.name.as_str()) {
                 warn!(
