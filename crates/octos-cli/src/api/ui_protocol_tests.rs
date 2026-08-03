@@ -28111,6 +28111,45 @@ fn unsafe_peer_topic_slug_is_treated_as_non_peer() {
     );
 }
 
+/// A peer key with NO profile component is not addressable, and must keep
+/// parsing as a non-peer session.
+///
+/// This is the shape of a real footgun: `peers_root` is per-profile and the wire
+/// key is `{profile}:peer:{slug}`, so without a profile there is nothing to
+/// address. `peer_slug_and_profile` therefore returns `None` — and all ~10
+/// callers do `let Some(..) = .. else { return }`, which is right for "not a
+/// peer" and silently wrong here. The peer runs, looks healthy, and its result
+/// recording, blackboard writes, awaiting-input wake and fleet synthesis ALL
+/// no-op, with nothing logged anywhere.
+///
+/// The RETURN value stays `None` (callers must keep treating it as a non-peer
+/// session — that is the #436 fence). What changed is that the two
+/// intended-a-peer rejections now `warn!`, because this is the only layer that
+/// still knows WHY. This test pins the contract so the fence is not accidentally
+/// relaxed into `Some` while making the diagnostics louder.
+#[test]
+fn peer_key_without_a_profile_is_not_addressable() {
+    let no_profile = SessionKey::with_topic("api", "tab", "peer-edison");
+    assert_eq!(
+        peer_slug_and_profile(&no_profile),
+        None,
+        "a profile-less peer key has nothing to address and must not parse"
+    );
+
+    // The SAME topic WITH a profile parses — so the profile component, not the
+    // topic, is what makes a peer addressable.
+    let with_profile = SessionKey::with_profile_topic("dev", "api", "tab", "peer-edison");
+    assert_eq!(
+        peer_slug_and_profile(&with_profile),
+        Some(("dev", "edison"))
+    );
+
+    // A genuinely non-peer topic is also None: the one case where silence is
+    // correct, and which stays indistinguishable in the RETURN value on purpose.
+    let not_a_peer = SessionKey::with_profile_topic("dev", "api", "tab", "coding");
+    assert_eq!(peer_slug_and_profile(&not_a_peer), None);
+}
+
 /// FIX 5 — a pending injection to a CLOSED peer is RETIRED (cancelled +
 /// tombstoned) by the drain-gate retire path, not left pending/stranded. This
 /// exercises the exact decision (`peer_is_closed`) + action
