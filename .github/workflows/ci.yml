@@ -196,6 +196,19 @@ jobs:
             throw 'uninstall dry run did not include purge behavior'
           }
 
+  web-app-base-url-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+
+      - name: Test embedded web base URL
+        shell: bash
+        run: '"$BASH" scripts/tests/test-build-web-app-base-url.sh'
+
   check:
     runs-on: ubuntu-latest
     env:
@@ -415,6 +428,14 @@ jobs:
       - name: gateway_runtime regression (octos-cli)
         run: cargo test -p octos-cli gateway_runtime::tests --features api -- --nocapture
 
+      # Peer staging/fencing lives in the `api`-gated ui_protocol module, so the
+      # unfeatured runs above never compile it — same reason as the §6 guard.
+      # These cover slug reservation, worktree fencing, and the rollback
+      # isolation guard (one peer's cleanup must not delete a SIBLING's
+      # worktree, which a repo-global `git worktree prune` used to do).
+      - name: Peer staging + worktree fencing (octos-cli)
+        run: cargo test -p octos-cli --features api peer
+
   # Lightweight check that exercises the `matrix` feature gate. The default
   # `FEATURES` env above intentionally omits `matrix` to keep the main `check`
   # job lean, but the Dockerfile and several release configurations enable it.
@@ -484,6 +505,39 @@ jobs:
         run: cargo test -p octos-sandbox
       - name: Test octos-swarm
         run: cargo test -p octos-swarm
+      # NOTE — these two steps are where check-arm dies, and it is NOT our code.
+      #
+      # check-arm fails on roughly half of `main` pushes, always the same way:
+      # GitHub kills the runner ("The hosted runner lost communication with the
+      # server ... starves it for CPU/Memory") partway through
+      # `Test octos-agent (lib)`, after steps 1-15 pass. A killed runner uploads
+      # no logs, so every failure destroys its own evidence.
+      #
+      # MEASURED on an aarch64 Ubuntu box matched to the runner (4 CPU, 15.7GB),
+      # running THIS ENTIRE JOB's step sequence in order — all-features build,
+      # test-binary build, all nine crate test steps, then these two:
+      #
+      #   step 16 `octos-agent --lib`   29.3s, 2462 passed, exit 0
+      #   step 17 `octos-agent --tests`  9 passed, exit 0
+      #   memory available               never dipped below ~14.7GB
+      #
+      # 29 seconds locally vs 46 minutes and a dead runner in CI, on the same
+      # architecture running the same sequence with memory to spare. So the
+      # workload is not the cause, and these were all tried and disproven:
+      #
+      #   - RUST_TEST_THREADS=1 (#1890): serialising changed the time-to-death by
+      #     0.7 min (46.0 -> 46.7). Contention is not it.
+      #   - timeout-minutes (#1891): never fired. Step timeouts are enforced BY
+      #     the runner agent, which is itself dying — so it cannot preserve logs.
+      #   - a hanging test: it completes in 29s.
+      #   - accumulated RAM from earlier steps: fully replicated above; memory
+      #     never moved. A lib/integration matrix split (what test-octos-agent
+      #     does for a "fresh 16GB allocation") therefore would NOT help either.
+      #
+      # Both mitigations are removed as unnecessary. If this job is still red and
+      # you are reaching for a workflow tweak: the evidence says the fix is a
+      # RUNNER change (self-hosted arm64, or retry-on-infra-failure), not config.
+      # Please do not re-litigate the four theories above without new data.
       - name: Test octos-agent (lib)
         run: cargo test -p octos-agent --lib
       - name: Test octos-agent (integration)
@@ -590,25 +644,26 @@ jobs:
     # ~15 min it is the cheapest job in the matrix covering code no other PR
     # check can even see.
     #
-    # NON-BLOCKING for now, because it is currently RED for a pre-existing
-    # reason. Making it blocking today would wedge every PR on a bug it did not
-    # introduce. It still surfaces on the PR, which is the point — a NEW
-    # Windows break is now visible at review time instead of after merge.
+    # BLOCKING. This job carried `continue-on-error: ${{ github.event_name ==
+    # 'pull_request' }}` while it was red on `main` for pre-existing reasons
+    # (`session_scope` → #1838, `run_phase_injects_octos_skill_dir_env` → #1860,
+    # then `git_worktree`'s `GIT_BIN` + `octos-plugin`'s drift guard → #1884).
+    # Those are all fixed and the job is green on `main`, which is the condition
+    # that note set for removing the flag.
     #
-    # The original reason recorded here — 2 `octos-core` `session_scope`
-    # failures — was fixed by #1838; `Test octos-core` is green on `main`. As of
-    # run 30423603951 the job stops at `Test octos-plugin`
-    # (`lifecycle::tests::run_phase_injects_octos_skill_dir_env`), which #1860
-    # addresses. Keep this note pinned to the CURRENT blocker: a stale one reads
-    # as "known, tracked, someone's on it" long after nobody is.
+    # It is gone rather than merely stale, because `continue-on-error` at JOB
+    # level makes GitHub report the job's conclusion as `success` even when its
+    # steps fail — so the PR checklist read `check-windows  pass` on a suite
+    # that was actually RED. That is not a muted gate, it is a misleading one,
+    # and it burned real time: #1883's branch sat at `341 passed; 1 failed`
+    # (`global_filter_is_neutralized_on_controller_ops`) while reporting green,
+    # and #1884 reported green before anyone had confirmed the Windows fix
+    # worked. Both were only caught by opening the raw job log.
     #
-    # Non-blocking ONLY on PRs. On push to `main` it stays hard-failing, so
-    # `build-windows` (which `needs:` this job) still refuses to ship a Windows
-    # artifact from a red suite — a blanket `continue-on-error: true` would have
-    # silently re-enabled those releases.
-    #
-    # Drop this line entirely once the job is green on `main`.
-    continue-on-error: ${{ github.event_name == 'pull_request' }}
+    # Consequence to accept: a Windows break now blocks PRs. If `main` ever goes
+    # red on Windows again, prefer fixing it or narrowing the failing test to
+    # `#[cfg(unix)]` over re-muting the whole job — a check that cannot fail
+    # tells you nothing.
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v6

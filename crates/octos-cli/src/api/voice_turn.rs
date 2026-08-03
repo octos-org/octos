@@ -39,12 +39,19 @@ pub(crate) async fn transcribe_audio_media(
     media: &[String],
     language: Option<&str>,
 ) -> Vec<String> {
+    transcribe_audio_media_with_base_url(media, language, &ominix_base_url()).await
+}
+
+async fn transcribe_audio_media_with_base_url(
+    media: &[String],
+    language: Option<&str>,
+    base_url: &str,
+) -> Vec<String> {
     let audios = audio_paths(media);
     if audios.is_empty() {
         return Vec::new();
     }
-    let client =
-        OminixClient::new(&ominix_base_url()).with_language(language.map(|s| s.to_string()));
+    let client = OminixClient::new(base_url).with_language(language.map(|s| s.to_string()));
     let asr_t = std::time::Instant::now();
     let mut out = Vec::new();
     for path in audios {
@@ -109,11 +116,60 @@ fn is_tts_safe(c: char) -> bool {
         )
 }
 
+fn prefers_chinese_speech(text: &str) -> bool {
+    text.chars().any(|c| {
+        matches!(
+            c,
+            '\u{3400}'..='\u{4DBF}'
+                | '\u{4E00}'..='\u{9FFF}'
+                | '\u{F900}'..='\u{FAFF}'
+                | '，'
+                | '。'
+                | '！'
+                | '？'
+                | '；'
+                | '：'
+                | '、'
+        )
+    })
+}
+
+fn push_spoken_operator(result: &mut String, spoken: &str) {
+    if result
+        .chars()
+        .next_back()
+        .is_some_and(|c| !c.is_whitespace())
+    {
+        result.push(' ');
+    }
+    result.push_str(spoken);
+    result.push(' ');
+}
+
+fn spoken_math_operator(c: char, speaks_chinese: bool) -> Option<&'static str> {
+    let (chinese, english) = match c {
+        '=' => ("等于", "equals"),
+        '+' => ("加", "plus"),
+        '−' => ("减", "minus"),
+        '×' => ("乘", "times"),
+        '÷' | '/' => ("除以", "divided by"),
+        '≈' => ("约等于", "approximately equals"),
+        '≠' => ("不等于", "does not equal"),
+        '≤' => ("小于等于", "is less than or equal to"),
+        '≥' => ("大于等于", "is greater than or equal to"),
+        '√' => ("根号", "square root of"),
+        _ => return None,
+    };
+    Some(if speaks_chinese { chinese } else { english })
+}
+
 /// Strip Markdown / formatting noise so the TTS speaks clean prose instead of
 /// "swallowing" or mispronouncing symbols. Removes fenced + inline code, link
 /// URLs (keeping the visible text), emphasis/heading/list/quote markers, emoji /
-/// pictographs / stray symbols, and collapses leftover whitespace.
+/// pictographs / stray symbols, verbalizes common math operators, and collapses
+/// leftover whitespace.
 pub(crate) fn clean_for_tts(text: &str) -> String {
+    let speaks_chinese = prefers_chinese_speech(text);
     let mut out = String::with_capacity(text.len());
     let mut in_fence = false;
     for line in text.lines() {
@@ -166,18 +222,23 @@ pub(crate) fn clean_for_tts(text: &str) -> String {
                 result.push_str(&label);
             }
             '*' | '_' | '`' | '~' | '#' => {} // drop emphasis / code markers
-            other if is_tts_safe(other) => result.push(other),
-            // Drop emoji / pictographs / stray symbols (😄🌙×🐙 …). Some on-device
-            // TTS engines (e.g. GPT-SoVITS) abort synthesis on unspeakable chars
-            // rather than skipping them, which fails the whole turn.
-            _ => {}
+            other => {
+                if let Some(spoken) = spoken_math_operator(other, speaks_chinese) {
+                    push_spoken_operator(&mut result, spoken);
+                } else if is_tts_safe(other) {
+                    result.push(other);
+                }
+                // Drop emoji / pictographs / stray symbols (😄🌙🐙 …). Some
+                // on-device TTS engines (e.g. GPT-SoVITS) abort synthesis on
+                // unspeakable chars rather than skipping them.
+            }
         }
     }
 
     // Collapse runs of blank lines / spaces.
     result
         .lines()
-        .map(str::trim_end)
+        .map(|line| line.split_whitespace().collect::<Vec<_>>().join(" "))
         .filter(|l| !l.trim().is_empty())
         .collect::<Vec<_>>()
         .join("\n")
@@ -807,6 +868,24 @@ struct VolcanoTts {
     endpoint: String,
 }
 
+pub(crate) fn cloud_audio_file_extension(encoding: &str) -> &'static str {
+    match encoding {
+        "wav" => "wav",
+        "pcm" => "pcm",
+        "ogg_opus" => "ogg",
+        _ => "mp3",
+    }
+}
+
+pub(crate) fn cloud_audio_content_type(encoding: &str) -> &'static str {
+    match encoding {
+        "wav" => "audio/wav",
+        "pcm" => "audio/pcm",
+        "ogg_opus" => "audio/ogg",
+        _ => "audio/mpeg",
+    }
+}
+
 /// Whether the route wants the cloud path. Legacy `volcano` aliases `cloud`.
 fn wants_cloud(provider: &str) -> bool {
     matches!(provider, "auto" | "cloud" | "volcano")
@@ -1005,7 +1084,7 @@ async fn synthesize_volcano(cfg: &VolcanoTts, text: &str, out_dir: &Path) -> Opt
         return None;
     }
 
-    let ext = if cfg.encoding == "wav" { "wav" } else { "mp3" };
+    let ext = cloud_audio_file_extension(&cfg.encoding);
     let out_path = out_dir.join(format!("reply-{reqid}.{ext}"));
     tokio::fs::write(&out_path, &bytes)
         .await
@@ -1047,12 +1126,7 @@ pub(crate) async fn synthesize_reply_streaming(
         return None;
     }
     let cfg = resolve_volcano(cloud)?;
-    let mime = match cfg.encoding.as_str() {
-        "wav" => "audio/wav",
-        "pcm" => "audio/pcm",
-        "ogg_opus" => "audio/ogg",
-        _ => "audio/mpeg",
-    };
+    let mime = cloud_audio_content_type(&cfg.encoding);
     crate::api::volcano_ws::synthesize_ws_stream(
         &cfg.appid,
         &cfg.token,
@@ -1063,6 +1137,16 @@ pub(crate) async fn synthesize_reply_streaming(
         |bytes, last| on_chunk(bytes, last, mime),
     )
     .await
+}
+
+fn local_tts_gate() -> &'static std::sync::Arc<tokio::sync::Semaphore> {
+    static GATE: std::sync::OnceLock<std::sync::Arc<tokio::sync::Semaphore>> =
+        std::sync::OnceLock::new();
+    GATE.get_or_init(|| std::sync::Arc::new(tokio::sync::Semaphore::new(1)))
+}
+
+async fn acquire_local_tts_permit() -> Option<tokio::sync::OwnedSemaphorePermit> {
+    local_tts_gate().clone().acquire_owned().await.ok()
 }
 
 pub(crate) async fn synthesize_reply(
@@ -1101,6 +1185,10 @@ pub(crate) async fn synthesize_reply(
     }
 
     // On-device route: always the default engine (no qwen3 UI split).
+    // OminiX owns one process-wide model/GPU. Every caller (voice turns and the
+    // generic REST endpoint alike) passes through this shared boundary so
+    // profiles cannot start overlapping local synthesis work.
+    let _local_tts_permit = acquire_local_tts_permit().await?;
     let engine = "sovits";
     let out_path = out_dir.join(format!("reply-{}.wav", uuid::Uuid::now_v7()));
     let client = OminixClient::new(&ominix_base_url());
@@ -1318,6 +1406,19 @@ mod tests {
     }
 
     #[test]
+    fn should_map_supported_cloud_audio_encodings_to_extension_and_mime() {
+        for (encoding, extension, mime) in [
+            ("mp3", "mp3", "audio/mpeg"),
+            ("wav", "wav", "audio/wav"),
+            ("pcm", "pcm", "audio/pcm"),
+            ("ogg_opus", "ogg", "audio/ogg"),
+        ] {
+            assert_eq!(cloud_audio_file_extension(encoding), extension);
+            assert_eq!(cloud_audio_content_type(encoding), mime);
+        }
+    }
+
+    #[test]
     fn should_return_none_when_no_appid_anywhere() {
         assert!(build_volcano(Some("tok".into()), None, None, None, None, None, None).is_none());
     }
@@ -1398,6 +1499,94 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn should_send_reloaded_profile_asr_language_to_ominix_request() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (request_tx, request_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let body_start = loop {
+                let mut chunk = [0u8; 1024];
+                let read = socket.read(&mut chunk).await.unwrap();
+                assert!(read > 0, "client closed before sending HTTP headers");
+                request.extend_from_slice(&chunk[..read]);
+                if let Some(index) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                    break index + 4;
+                }
+            };
+            let headers = String::from_utf8_lossy(&request[..body_start]);
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    line.strip_prefix("content-length: ")
+                        .or_else(|| line.strip_prefix("Content-Length: "))
+                })
+                .unwrap()
+                .trim()
+                .parse::<usize>()
+                .unwrap();
+            while request.len() < body_start + content_length {
+                let mut chunk = [0u8; 1024];
+                let read = socket.read(&mut chunk).await.unwrap();
+                assert!(read > 0, "client closed before sending HTTP body");
+                request.extend_from_slice(&chunk[..read]);
+            }
+            let body: serde_json::Value =
+                serde_json::from_slice(&request[body_start..body_start + content_length]).unwrap();
+            request_tx.send(body).unwrap();
+            let response_body = r#"{"text":"bonjour"}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                response_body.len(),
+                response_body
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::profiles::ProfileStore::open_unified(dir.path()).unwrap();
+        let now = chrono::Utc::now();
+        let mut profile = crate::profiles::UserProfile {
+            id: "alpha".into(),
+            name: "Alpha".into(),
+            enabled: true,
+            data_dir: None,
+            parent_id: None,
+            public_subdomain: None,
+            config: crate::profiles::ProfileConfig {
+                asr_language: Some("English".into()),
+                ..Default::default()
+            },
+            created_at: now,
+            updated_at: now,
+        };
+        store.save(&profile).unwrap();
+        let patch: crate::profiles::ProfileConfigPatch =
+            serde_json::from_str(r#"{"asr_language":"french"}"#).unwrap();
+        profile.config.apply_patch(patch);
+        store.save_with_merge(&mut profile).unwrap();
+
+        let language =
+            crate::profiles::effective_profile_asr_language(Some(&store), Some("alpha"), None)
+                .unwrap();
+        let audio_path = dir.path().join("utterance.wav");
+        std::fs::write(&audio_path, b"RIFF-test-audio").unwrap();
+        let transcripts = transcribe_audio_media_with_base_url(
+            &[audio_path.to_string_lossy().into_owned()],
+            language.as_deref(),
+            &format!("http://{addr}"),
+        )
+        .await;
+
+        assert_eq!(transcripts, vec!["bonjour"]);
+        let request = request_rx.await.unwrap();
+        assert_eq!(request["language"], "French");
+    }
+
     #[test]
     fn volcano_client_is_reused_across_calls() {
         // Per-sentence synthesis must not rebuild the HTTP client each time —
@@ -1416,6 +1605,19 @@ mod tests {
         let dir = std::env::temp_dir();
         let got = synthesize_reply("   ", "vivian", "auto", None, &dir).await;
         assert!(got.is_none());
+    }
+
+    #[tokio::test]
+    async fn should_bound_on_device_tts_with_one_process_wide_permit() {
+        let first = acquire_local_tts_permit()
+            .await
+            .expect("first local synthesis acquires the shared engine");
+        assert!(
+            local_tts_gate().clone().try_acquire_owned().is_err(),
+            "another local synthesis must not enter the shared engine"
+        );
+        drop(first);
+        assert!(local_tts_gate().clone().try_acquire_owned().is_ok());
     }
 
     #[test]
@@ -1473,6 +1675,19 @@ mod tests {
     }
 
     #[test]
+    fn should_verbalize_math_operators_without_merging_operands() {
+        assert_eq!(
+            clean_for_tts("当 n=365 时，2+3=5，x≈2.7。"),
+            "当 n 等于 365 时，2 加 3 等于 5，x 约等于 2.7。"
+        );
+        assert_eq!(clean_for_tts("n=365"), "n equals 365");
+        assert_eq!(
+            clean_for_tts("π=C/d，3/4≤x，x≠√2。"),
+            "π 等于 C 除以 d，3 除以 4 小于等于 x，x 不等于 根号 2。"
+        );
+    }
+
+    #[test]
     fn clean_for_tts_strips_emoji_and_symbols() {
         // GPT-SoVITS aborts synthesis on emoji/symbols; they must be dropped.
         let got = clean_for_tts("晚上好呀！😄🌙 今天第 N 次×2 打招呼 😂🐙");
@@ -1481,7 +1696,7 @@ mod tests {
         }
         // Speakable content + punctuation preserved.
         assert!(got.contains("晚上好呀！"));
-        assert!(got.contains("今天第 N 次"));
+        assert!(got.contains("今天第 N 次 乘 2"));
         assert!(got.contains("打招呼"));
     }
 

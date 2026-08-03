@@ -53,6 +53,22 @@ fn fleet_sandbox_is_isolating(sandbox_cfg: &octos_agent::sandbox::SandboxConfig)
     !octos_agent::sandbox::create_sandbox(sandbox_cfg).is_noop()
 }
 
+/// Whether the resolved sandbox backend can grant a `FsGrant::Host` worker FULL
+/// daemon-user FS write together with the reads git needs — the third gate
+/// condition for the fleet WORKTREE flow (§5). Computed at serve boot (mirrors
+/// [`fleet_sandbox_is_isolating`]) from the base sandbox's
+/// `supports_repo_git_write()`: `true` for bwrap and unrestricted-read macOS,
+/// `false` for docker, restricted-read macOS, Landlock, AppContainer, and no
+/// sandbox. When `false`, the pool falls back to a scratch workspace for every
+/// task (a worktree worker whose `git commit` can't reach `<repo>/.git` would
+/// lose its deliverable when the checkout is removed). Threaded into
+/// `PoolConfig.repo_git_write_supported`.
+fn fleet_sandbox_supports_repo_git_write(
+    sandbox_cfg: &octos_agent::sandbox::SandboxConfig,
+) -> bool {
+    octos_agent::sandbox::create_sandbox(sandbox_cfg).supports_repo_git_write()
+}
+
 /// #1857 PR 5a fix (HIGH 2) — reconcile the fleet store at boot with a bounded
 /// retry. `reconcile` is the ONLY production recovery of a prior boot's stale
 /// leases: a stale `Launching`/`Running` child never re-readies on its own
@@ -904,20 +920,24 @@ impl ServeCommand {
                 });
             match keeper {
                 Some(rt) => {
-                    // PR-3 requires a network-isolated sandbox: the closed worker
-                    // tool set is a denylist, not a boundary, so the shell's
-                    // reach is bounded only by the sandbox. Force
-                    // `allow_network = false` regardless of the profile default.
+                    // PR-3 requires a network-isolated sandbox: the worker tool
+                    // set is a denylist, not a boundary, so the shell's reach is
+                    // bounded only by the sandbox. Base the sandbox on the profile
+                    // default with network OFF; PR A re-enables raw egress
+                    // PER-ATTEMPT only for a `Full` network grant (see the factory
+                    // closure below). `None`/`Hosts` keep it off (`Hosts` is
+                    // enforced by the granted web tools, not raw egress).
                     let mut sandbox_cfg = rt.default_sandbox.clone();
                     sandbox_cfg.allow_network = false;
                     // #1857 PR 5a fix (HIGH 1) — FAIL CLOSED: install the pool
-                    // ONLY when the forced-no-network sandbox is a REAL isolating
-                    // backend. A disabled sandbox (or `Auto` with no backend on
-                    // this host) yields `NoSandbox` = unbounded shell reach
-                    // (curl / git push / host access), breaking PR-3's
-                    // replay-safe boundary. Leave the pool unset so goal_dispatch
-                    // cleanly reports "unavailable" instead of running a fleet
-                    // worker unsandboxed with network.
+                    // ONLY when the sandbox is a REAL isolating backend. A
+                    // disabled sandbox (or `Auto` with no backend on this host)
+                    // yields `NoSandbox` = unbounded shell reach (curl / git push
+                    // / host access), breaking PR-3's replay-safe boundary. The
+                    // isolation of the BACKEND is independent of the network flag,
+                    // so probing with network off is sufficient. Leave the pool
+                    // unset so goal_dispatch cleanly reports "unavailable" instead
+                    // of running a fleet worker unsandboxed.
                     if !fleet_sandbox_is_isolating(&sandbox_cfg) {
                         tracing::error!(
                             keeper_profile = %rt.profile_id,
@@ -927,12 +947,31 @@ impl ServeCommand {
                              will report the pool unavailable."
                         );
                     } else {
-                        let sandbox_factory: octos_fleet_worker::SandboxFactory =
-                            Arc::new(move |_cwd: &std::path::Path| {
+                        // §5 gate condition 3: compute the repo-`.git`-write
+                        // capability BEFORE the factory closure moves `sandbox_cfg`
+                        // in (the closure needs the whole config; the pool only
+                        // needs the bool).
+                        let repo_git_write_supported =
+                            fleet_sandbox_supports_repo_git_write(&sandbox_cfg);
+                        // The SandboxFactory folds the per-attempt SandboxGrant
+                        // (derived from the task's WorkerGrant) onto the base
+                        // network-isolated sandbox: `allow_network` from the
+                        // network lane (`Full` → true, `None`/`Hosts` → false) and
+                        // `repo_git_write` from the FS lane (`FsGrant::Host` worktree
+                        // worker → `Some(<repo>/.git)`, a TARGETED rw-bind so its
+                        // `git commit` can reach `<repo>/.git` outside its cwd
+                        // WITHOUT exposing host sockets via `--bind / /`).
+                        let sandbox_factory: octos_fleet_worker::SandboxFactory = Arc::new(
+                            move |_cwd: &std::path::Path,
+                                  grant: octos_fleet_worker::SandboxGrant| {
+                                let mut cfg = sandbox_cfg.clone();
+                                cfg.allow_network = grant.allow_network;
+                                cfg.repo_git_write = grant.repo_git_dir;
                                 Arc::<dyn octos_agent::sandbox::Sandbox>::from(
-                                    octos_agent::sandbox::create_sandbox(&sandbox_cfg),
+                                    octos_agent::sandbox::create_sandbox(&cfg),
                                 )
-                            });
+                            },
+                        );
                         let factory = Arc::new(octos_fleet_worker::AgentFactory::new(
                             rt.llm.clone(),
                             rt.memory.clone(),
@@ -952,6 +991,12 @@ impl ServeCommand {
                             // Fix (HIGH 4): the pool's bound keeper profile — the
                             // keeper fences a cross-profile goal against it.
                             keeper_profile_id: rt.profile_id.clone(),
+                            // §5 gate condition 3: only take the worktree flow when
+                            // the resolved backend supports full-FS write (bwrap /
+                            // full-read macOS). Otherwise every task falls back to a
+                            // scratch workspace so a non-supporting backend never
+                            // loses a deliverable.
+                            repo_git_write_supported,
                         };
                         let pool = octos_fleet_worker::FleetWorkerPool::new(
                             Arc::new(fleet_store),
@@ -971,6 +1016,43 @@ impl ServeCommand {
                     "no bootstrapped profile runtime; fleet worker pool not built \
                      (goal_dispatch will report the pool unavailable)"
                 ),
+            }
+        }
+
+        // Boot-resume — "a fleet survives an octos restart". The boot reconcile
+        // above flipped any restart-interrupted fleet's in-flight children back
+        // to `Ready`, but emitted NO outbox event — so the outbox consumer never
+        // wakes the keeper and an in-progress fleet would STALL forever after a
+        // restart (nothing re-dispatches its ready tasks). Now that the worker
+        // pool is installed, enqueue a keeper wake for every live fleet with a
+        // launchable child; the global master-continuation drain (started below,
+        // ~5s poll) picks them up on its next tick → PR-4b reseed pre-pass →
+        // `run_standalone_turn` → the keeper's `goal_dispatch` re-launches the
+        // ready set. Gated on a reconciled store AND an installed pool (no pool ⇒
+        // nothing to dispatch onto). Re-fetch the store here: the local binding
+        // was moved into the outbox consumer / worker pool above.
+        let boot_resume_orchestrator = crate::api::agent_orchestrator::default_agent_orchestrator();
+        let boot_resume_store =
+            if fleet_reconciled && boot_resume_orchestrator.fleet_pool().is_some() {
+                boot_resume_orchestrator.fleet_store()
+            } else {
+                None
+            };
+        if let Some(store) = boot_resume_store {
+            let now_ms = chrono::Utc::now().timestamp_millis().max(0) as u64;
+            match crate::api::fleet_wake::enqueue_fleet_boot_resume_wakes(
+                &store,
+                boot_resume_orchestrator,
+                now_ms,
+            )
+            .await
+            {
+                Ok(n) if n > 0 => tracing::info!(
+                    fleets = n,
+                    "fleet boot-resume: re-woke keepers for restart-stranded fleets"
+                ),
+                Ok(_) => {}
+                Err(error) => tracing::warn!(%error, "fleet boot-resume wake pass failed"),
             }
         }
 
@@ -1000,7 +1082,13 @@ impl ServeCommand {
                 )
                 .with_host_memory_refresh_enabled(crate::config::MemoryConfig::refresh_enabled(
                     config.memory.as_ref(),
-                )),
+                ))
+                .with_host_asr_language(
+                    config
+                        .voice
+                        .as_ref()
+                        .and_then(|voice| voice.asr_language.clone()),
+                ),
         );
         process_manager.set_self_ref();
 
@@ -1858,6 +1946,7 @@ mod tests {
                 detail: "d".to_owned(),
                 deps: Vec::new(),
                 acceptance: Vec::new(),
+                grant: octos_fleet::WorkerGrant::minimal(),
             }],
             1,
         )

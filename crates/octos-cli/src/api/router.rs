@@ -4,8 +4,8 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use axum::Router;
-use axum::extract::DefaultBodyLimit;
-use axum::http::{HeaderValue, StatusCode};
+use axum::extract::{DefaultBodyLimit, MatchedPath};
+use axum::http::{HeaderValue, Method, StatusCode};
 use axum::middleware::{self, Next};
 use axum::routing::{delete, get, post, put};
 use tower_http::cors::CorsLayer;
@@ -45,6 +45,35 @@ pub enum AuthIdentity {
 /// Backward-compatible default when the operator has not configured a
 /// base domain via `config.base_domain` or `OCTOS_BASE_DOMAIN`.
 pub const DEFAULT_BASE_DOMAIN: &str = "crew.ominix.io";
+
+/// Return the matched route template for logging, never the raw request path.
+///
+/// Besides query credentials, some public endpoints carry credentials in path
+/// parameters. A route template preserves useful request context while
+/// replacing those values with placeholders. Unmatched paths use a fixed
+/// marker rather than falling back to attacker-controlled input.
+fn request_log_path<B>(request: &axum::http::Request<B>) -> &str {
+    request
+        .extensions()
+        .get::<MatchedPath>()
+        .map(MatchedPath::as_str)
+        .unwrap_or("<unmatched>")
+}
+
+/// Build the HTTP request span without recording URI query parameters.
+///
+/// Some browser transports authenticate through query parameters (notably
+/// WebSocket `?token=...`). `TraceLayer::new_for_http()` records the complete
+/// URI by default, which would disclose those credentials whenever debug
+/// request tracing is enabled.
+fn make_http_trace_span(request: &axum::http::Request<axum::body::Body>) -> tracing::Span {
+    tracing::debug_span!(
+        "request",
+        method = %request.method(),
+        path = %request_log_path(request),
+        version = ?request.version(),
+    )
+}
 
 /// Compose the CORS allowlist for a given base domain.
 ///
@@ -360,6 +389,11 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/my/voice", put(auth_handlers::set_my_voice))
         // Per-tenant voice-assistant pre-flight: ASR + LLM + (route-aware) TTS.
         .route("/api/voice/readiness", get(auth_handlers::voice_readiness))
+        // Generic profile-scoped text-to-speech synthesis.
+        .route(
+            "/api/voice/synthesize",
+            post(auth_handlers::synthesize_speech),
+        )
         // Memory + Cron panel REST routes retired in favor of the UI Protocol
         // methods (`memory/overview`, `memory/entity`, `cron/list`,
         // `cron/toggle`, gated by `auxiliary.rest_to_ws.v1`), which wrap the
@@ -911,7 +945,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .merge(protected)
         .fallback(static_files::static_handler)
         .layer(middleware::from_fn(strip_untrusted_profile_id_middleware))
-        .layer(TraceLayer::new_for_http())
+        .layer(TraceLayer::new_for_http().make_span_with(make_http_trace_span))
         .layer(cors)
         .with_state(state)
 }
@@ -1075,7 +1109,7 @@ async fn strip_untrusted_profile_id_middleware(
             target: "octos::api::auth",
             remote_addr = ?remote_ip,
             stripped_value = %raw,
-            uri = %req.uri(),
+            path = %request_log_path(&req),
             "X-Profile-Id stripped: request not from a trusted proxy (#995 hardening)"
         );
     }
@@ -1211,6 +1245,28 @@ async fn resolve_identity(state: &AppState, token: &str) -> Option<AuthIdentity>
     None
 }
 
+/// Record a user-auth rejection without logging URI query parameters or token
+/// material. Browser WebSocket clients authenticate through `?token=...`, so
+/// logging the complete [`axum::http::Uri`] would disclose the credential.
+fn log_user_auth_rejection(method: &Method, path: &str, token: &str) {
+    tracing::warn!(
+        method = %method,
+        path = %path,
+        token_present = !token.is_empty(),
+        "user auth rejected"
+    );
+}
+
+/// Admin-level counterpart to [`log_user_auth_rejection`].
+fn log_admin_auth_rejection(method: &Method, path: &str, token: &str) {
+    tracing::warn!(
+        method = %method,
+        path = %path,
+        token_present = !token.is_empty(),
+        "admin auth rejected"
+    );
+}
+
 /// Auth middleware for user-level access (user session or admin token).
 ///
 /// Also accepts `X-Profile-Id` header as authentication for the chat API
@@ -1290,13 +1346,7 @@ async fn user_auth_middleware(
         );
     }
 
-    tracing::warn!(
-        method = %method,
-        uri = %uri,
-        token_len = token.len(),
-        token_prefix = %if token.len() > 8 { &token[..8] } else { &token },
-        "user auth rejected"
-    );
+    log_user_auth_rejection(&method, request_log_path(&req), &token);
     Err(StatusCode::UNAUTHORIZED)
 }
 
@@ -1308,7 +1358,6 @@ async fn admin_auth_middleware(
 ) -> Result<axum::response::Response, StatusCode> {
     let token = extract_token(&req);
     let method = req.method().clone();
-    let uri = req.uri().clone();
 
     match resolve_identity(&state, &token).await {
         Some(AuthIdentity::Admin) => {
@@ -1326,13 +1375,7 @@ async fn admin_auth_middleware(
             Ok(next.run(req).await)
         }
         _ => {
-            tracing::warn!(
-                method = %method,
-                uri = %uri,
-                token_len = token.len(),
-                token_prefix = %if token.len() > 8 { &token[..8] } else { &token },
-                "admin auth rejected"
-            );
+            log_admin_auth_rejection(&method, request_log_path(&req), &token);
             Err(StatusCode::UNAUTHORIZED)
         }
     }
@@ -1346,8 +1389,133 @@ mod tests {
     use crate::tenant::{TenantConfig, TenantStatus, TenantStore};
     use axum::http::Request;
     use chrono::Utc;
+    use std::io::Write;
     use std::sync::Arc;
-    use tower::ServiceExt as _;
+    use tower::ServiceExt;
+
+    #[derive(Clone, Default)]
+    struct CapturedLogs(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl Write for CapturedLogs {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl CapturedLogs {
+        fn as_string(&self) -> String {
+            String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
+        }
+    }
+
+    #[test]
+    fn rejected_auth_logs_omit_query_and_token_material() {
+        let captured = CapturedLogs::default();
+        let writer = captured.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_target(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        let query = "token=synthetic-sensitive-marker%21&feature=chat";
+        let token = "synthetic-sensitive-marker!";
+
+        tracing::subscriber::with_default(subscriber, || {
+            log_user_auth_rejection(&Method::GET, "/api/ui-protocol/ws", token);
+            log_admin_auth_rejection(&Method::GET, "/api/ui-protocol/ws", token);
+        });
+
+        let logs = captured.as_string();
+        assert_eq!(logs.matches("path=/api/ui-protocol/ws").count(), 2);
+        assert_eq!(logs.matches("token_present=true").count(), 2);
+        assert!(!logs.contains(query));
+        assert!(!logs.contains(token));
+        assert!(!logs.contains("synthetic-sensitive-marker"));
+        assert!(!logs.contains("token_prefix"));
+        assert!(!logs.contains("token_len"));
+    }
+
+    #[test]
+    fn http_trace_uses_route_templates_and_omits_credentials() {
+        let captured = CapturedLogs::default();
+        let writer = captured.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_target(false)
+            .with_max_level(tracing::Level::DEBUG)
+            .with_writer(move || writer.clone())
+            .finish();
+        let app = Router::new()
+            .route(
+                "/api/ui-protocol/ws",
+                get(|| async { StatusCode::NO_CONTENT }),
+            )
+            .route(
+                "/api/preview-signed/{token}/{*path}",
+                get(|| async { StatusCode::NO_CONTENT }),
+            )
+            .route(
+                "/api/register/setup-script/{id}/{auth_token}",
+                get(|| async { StatusCode::NO_CONTENT }),
+            )
+            .layer(TraceLayer::new_for_http().make_span_with(make_http_trace_span));
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        tracing::subscriber::with_default(subscriber, || {
+            runtime.block_on(async {
+                for uri in [
+                    "/api/ui-protocol/ws?token=synthetic-query-marker%21&feature=chat",
+                    "/api/preview-signed/synthetic-preview-marker/assets/index.html",
+                    "/api/register/setup-script/test-user/synthetic-setup-marker",
+                ] {
+                    let response = app
+                        .clone()
+                        .oneshot(
+                            Request::builder()
+                                .method(Method::GET)
+                                .uri(uri)
+                                .body(axum::body::Body::empty())
+                                .unwrap(),
+                        )
+                        .await
+                        .unwrap();
+                    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+                }
+
+                let response = app
+                    .oneshot(
+                        Request::builder()
+                            .method(Method::GET)
+                            .uri("/synthetic-unmatched-marker")
+                            .body(axum::body::Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::NOT_FOUND);
+            });
+        });
+
+        let logs = captured.as_string();
+        assert!(logs.contains("path=/api/ui-protocol/ws"));
+        assert!(logs.contains("/api/preview-signed/{token}/{*path}"));
+        assert!(logs.contains("/api/register/setup-script/{id}/{auth_token}"));
+        assert!(logs.contains("path=<unmatched>"));
+        assert!(!logs.contains("synthetic-query-marker"));
+        assert!(!logs.contains("synthetic-preview-marker"));
+        assert!(!logs.contains("synthetic-setup-marker"));
+        assert!(!logs.contains("synthetic-unmatched-marker"));
+    }
 
     #[test]
     fn test_constant_time_eq_equal() {

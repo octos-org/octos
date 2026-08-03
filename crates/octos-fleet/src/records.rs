@@ -10,6 +10,8 @@
 use octos_core::SessionKey;
 use serde::{Deserialize, Serialize};
 
+use crate::grant::WorkerGrant;
+
 /// Schema version stamped on every persisted record. Bumping this
 /// invalidates prior rows the same way the swarm dispatch ledger does:
 /// a load that sees a *higher* version returns `Ok(None)`.
@@ -18,7 +20,16 @@ use serde::{Deserialize, Serialize};
 /// and `evidence` fields (the plan/child duality reconciliation). Stamping
 /// v2 means a PR-1 binary drops a v2 row via the higher-version guard rather
 /// than failing to deserialize the now-absent fields.
-pub const SCHEMA_VERSION: u32 = 2;
+///
+/// Bumped 2 → 3 in PR B (escalate-to-master): [`ChildStatus`] gained the
+/// non-terminal `Blocked` variant. Unlike the `pending_escalation` /
+/// `controller_workspace_root` field additions (forward-compatible via
+/// `#[serde(default)]`, so NOT a bump), a NEW ENUM VARIANT is an *incompatible*
+/// change: a v2 binary decoding a row whose `status` is `"Blocked"` would fail
+/// with an unknown-variant error rather than gracefully dropping it. Stamping v3
+/// means such a row loads as `Ok(None)` (higher-version guard) on an older
+/// binary — dropped, never mis-parsed.
+pub const SCHEMA_VERSION: u32 = 3;
 
 // ---------------------------------------------------------------------------
 // Status enums
@@ -39,12 +50,25 @@ pub enum FleetStatus {
 /// `Ready` means every dependency child is `Succeeded`. `Launching` and
 /// `Running` are the two non-terminal in-flight states a live [`Attempt`]
 /// backs; recovery reconciliation returns a stranded one to `Ready`.
+///
+/// `Blocked` (PR B) is a NON-terminal state a worker's attempt yields into when
+/// it hits the edge of its [`crate::WorkerGrant`] and escalates: the yielded
+/// attempt is already settled (its tokens committed), the child records a
+/// [`FleetChildRecord::pending_escalation`], and it waits for the keeper's
+/// operator decision. A `goal_grant` widens the grant and moves it `Blocked →
+/// Ready` (a fresh attempt rebuilds from the wider grant); a `goal_deny` moves
+/// it `Blocked → Failed` (terminal — a Blocked child must never wedge the fleet,
+/// since `is_complete` never trips while one is non-terminal-but-unaccepted).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ChildStatus {
     Planned,
     Ready,
     Launching,
     Running,
+    /// Non-terminal: the attempt yielded to request an operator grant widen
+    /// ([`FleetChildRecord::pending_escalation`]); awaits `goal_grant` (→
+    /// `Ready`) or `goal_deny` (→ `Failed`).
+    Blocked,
     Succeeded,
     Failed,
     Cancelled,
@@ -52,7 +76,10 @@ pub enum ChildStatus {
 
 impl ChildStatus {
     /// A child in a terminal state cannot launch or transition further
-    /// (other than an explicit cancel, which is itself terminal).
+    /// (other than an explicit cancel, which is itself terminal). `Blocked`
+    /// is deliberately NOT terminal: it is a pause awaiting an operator
+    /// decision, so it holds `is_complete` open (the goal stays active) yet
+    /// can still transition to `Ready` (granted) or `Failed` (denied).
     pub fn is_terminal(self) -> bool {
         matches!(
             self,
@@ -140,6 +167,13 @@ pub struct FleetRecord {
     /// server-resolved root at fleet-create for this to carry a value at all.
     #[serde(default)]
     pub controller_workspace_root: Option<String>,
+    /// Whether `controller_workspace_root` originated from a genuine runtime
+    /// cwd hint. `Some(true)` means a restarted keeper may reuse the root as a
+    /// transcript-relocation hint; `Some(false)` means it is the derived
+    /// workspace used only by tools/UI. `None` is the legacy/unknown case and
+    /// must be handled like `false` by readers (fail safe: never relocate).
+    #[serde(default)]
+    pub controller_workspace_has_runtime_hint: Option<bool>,
     pub profile_id: String,
     pub budget: FleetBudget,
     pub status: FleetStatus,
@@ -172,8 +206,40 @@ pub struct FleetChildRecord {
     /// Denormalized from `PlanTask.deps` (child_id == task_id) so the
     /// store's dep-resolution helper is self-contained.
     pub deps: Vec<String>,
+    /// PR B — the pending mid-task escalation, set when a worker's attempt
+    /// yields via the `escalate` tool (status → [`ChildStatus::Blocked`]). It
+    /// is the worker's REQUEST for a wider grant; the keeper reads it (surfaced
+    /// through [`crate::TaskView::pending_escalation`]) and decides. `Some`
+    /// while a child is `Blocked`; cleared when the keeper's `goal_grant` (→
+    /// `Ready`) or `goal_deny` (→ `Failed`) resolves it — so a re-run child
+    /// never carries a stale request. `#[serde(default)]` is deliberate
+    /// forward-compat, **NOT** a `SCHEMA_VERSION` bump: an old row written
+    /// before escalation existed (no key) deserializes to `None` rather than
+    /// dropping the row (mirrors how `grant`/`controller_workspace_root` were
+    /// added).
+    #[serde(default)]
+    pub pending_escalation: Option<EscalationRequest>,
     pub generation: u64,
     pub updated_at_ms: u64,
+}
+
+/// A worker's mid-task request to WIDEN its [`crate::WorkerGrant`] (PR B). The
+/// worker records this via the always-on `escalate` tool when it hits the edge
+/// of its grant (a host/tool/fs it wasn't given) and yields its attempt; the
+/// keeper reads it and decides.
+///
+/// `requested_grant` is **ADVISORY** — it is what the worker asked for, not what
+/// it gets. The worker can NEVER self-widen: only the keeper's `goal_grant`
+/// mutates [`crate::PlanTask::grant`], and it re-runs `grant.validate()` on the
+/// grant IT chooses (which may be less than requested). This request only
+/// informs the operator's decision.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EscalationRequest {
+    /// The grant the worker asked for (advisory — the keeper may grant less).
+    pub requested_grant: WorkerGrant,
+    /// Why the worker needs it (the model's own justification), for the
+    /// operator's decision.
+    pub reason: String,
 }
 
 /// The daemon-boot lease guarding a live attempt. `owner_epoch` is this
@@ -272,6 +338,15 @@ pub struct PlanTask {
     /// [`FleetChildRecord::deps`], re-synced by `replan`.
     pub deps: Vec<String>,
     pub acceptance: Vec<AcceptanceCriterion>,
+    /// PR A — the operator-supplied capability grant the host builds this
+    /// task's worker from (network / tools / filesystem). `#[serde(default)]`
+    /// is deliberate forward-compat, **NOT** a `SCHEMA_VERSION` bump: an old
+    /// row written before grants existed (no `grant` key) deserializes to
+    /// [`WorkerGrant::minimal`] — byte-for-byte today's closed worker — rather
+    /// than dropping the row. Least-privilege by default; the master expands it
+    /// explicitly per task.
+    #[serde(default)]
+    pub grant: WorkerGrant,
 }
 
 /// An acceptance criterion: a description plus a checkable [`Verifier`].
@@ -447,6 +522,112 @@ mod tests {
         assert!(ChildStatus::Cancelled.is_terminal());
         assert!(!ChildStatus::Ready.is_terminal());
         assert!(!ChildStatus::Running.is_terminal());
+        // PR B: Blocked is a pause awaiting an operator decision — NOT terminal,
+        // so it holds `is_complete` open (the goal stays active).
+        assert!(!ChildStatus::Blocked.is_terminal());
+    }
+
+    #[test]
+    fn child_record_pending_escalation_round_trips_and_old_row_defaults_none() {
+        use crate::grant::{NetworkGrant, WorkerGrant};
+
+        // A blocked child carrying a pending escalation round-trips verbatim.
+        let rec = FleetChildRecord {
+            schema_version: SCHEMA_VERSION,
+            fleet_id: "f1".into(),
+            child_id: "t1".into(),
+            worker_kind: WorkerKind::StatelessTask,
+            status: ChildStatus::Blocked,
+            current_attempt_id: None,
+            attempts_used: 1,
+            outcome: None,
+            tokens_committed: 80,
+            deps: vec![],
+            pending_escalation: Some(EscalationRequest {
+                requested_grant: WorkerGrant {
+                    network: NetworkGrant::Hosts(vec!["example.com".into()]),
+                    tools: vec!["read_file".into(), "web_fetch".into()],
+                    ..WorkerGrant::minimal()
+                },
+                reason: "needs example.com to fetch the report".into(),
+            }),
+            generation: 0,
+            updated_at_ms: 5,
+        };
+        let json = serde_json::to_string(&rec).unwrap();
+        let back: FleetChildRecord = decode_row(&json).unwrap().unwrap();
+        assert_eq!(back, rec, "the pending escalation round-trips through JSON");
+
+        // An OLD row written before escalation existed (no `pending_escalation`
+        // key) must still decode — `#[serde(default)]` fills `None`, NOT fail.
+        // This is why the field is NOT a `SCHEMA_VERSION` bump.
+        let old_json = r#"{
+            "schema_version": 2,
+            "fleet_id": "f1",
+            "child_id": "t1",
+            "worker_kind": "StatelessTask",
+            "status": "Ready",
+            "current_attempt_id": null,
+            "attempts_used": 0,
+            "outcome": null,
+            "tokens_committed": 0,
+            "deps": [],
+            "generation": 0,
+            "updated_at_ms": 0
+        }"#;
+        let legacy: FleetChildRecord = decode_row(old_json)
+            .expect("decode old row")
+            .expect("row kept, not dropped");
+        assert_eq!(
+            legacy.pending_escalation, None,
+            "a child with no escalation field loads as None"
+        );
+    }
+
+    #[test]
+    fn plan_task_grant_persists_and_restores() {
+        use crate::grant::{FsGrant, NetworkGrant, WorkerGrant};
+
+        // A granted task round-trips its grant verbatim through JSON (the shape
+        // the FleetKernelStore persists).
+        let task = PlanTask {
+            task_id: "t1".into(),
+            title: "fetch".into(),
+            detail: "grab the report".into(),
+            deps: vec![],
+            acceptance: vec![],
+            grant: WorkerGrant {
+                network: NetworkGrant::Hosts(vec!["example.com".into()]),
+                tools: vec!["read_file".into(), "write_file".into(), "web_fetch".into()],
+                fs: FsGrant::Host,
+            },
+        };
+        // PlanTask is nested inside DurablePlan (which carries schema_version);
+        // it has no version field of its own, so it round-trips via plain serde.
+        let json = serde_json::to_string(&task).unwrap();
+        let back: PlanTask = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            back.grant, task.grant,
+            "grant round-trips through the store"
+        );
+
+        // An OLD row written before grants existed (no `grant` key) must still
+        // decode — `#[serde(default)]` fills `WorkerGrant::minimal()` (today's
+        // closed worker), NOT fail. This is why grant is not a SCHEMA_VERSION
+        // bump.
+        let old_json = r#"{
+            "task_id": "t0",
+            "title": "legacy",
+            "detail": "",
+            "deps": [],
+            "acceptance": []
+        }"#;
+        let legacy: PlanTask = serde_json::from_str(old_json).expect("decode old row");
+        assert_eq!(
+            legacy.grant,
+            WorkerGrant::minimal(),
+            "a task with no grant loads as the least-privilege closed worker",
+        );
     }
 
     #[test]
@@ -479,10 +660,15 @@ mod tests {
             rec.controller_workspace_root, None,
             "a missing field defaults to None"
         );
+        assert_eq!(
+            rec.controller_workspace_has_runtime_hint, None,
+            "legacy rows have unknown workspace provenance and must fail safe"
+        );
 
         // And a NEW row with the field round-trips it verbatim.
         let with_root = FleetRecord {
             controller_workspace_root: Some("/repos/app".to_owned()),
+            controller_workspace_has_runtime_hint: Some(false),
             ..rec
         };
         let json = serde_json::to_string(&with_root).unwrap();
@@ -490,6 +676,11 @@ mod tests {
         assert_eq!(
             back.controller_workspace_root,
             Some("/repos/app".to_owned())
+        );
+        assert_eq!(
+            back.controller_workspace_has_runtime_hint,
+            Some(false),
+            "derived-workspace provenance round-trips with the root"
         );
     }
 }

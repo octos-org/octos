@@ -89,7 +89,7 @@ use super::agent_orchestrator::{
     InProcessAgentOrchestrator, LoopControlKind, LoopControlRequest, LoopCreateRequest,
     LoopListRequest, NativeSpecialistAppUiEvent, NativeSpecialistLaunchRequest,
     default_agent_orchestrator, master_continuation_prompt, master_continuation_reason_name,
-    upsert_background_task_agent, wire_key_from_goal_key,
+    parse_agent_output_cursor, upsert_background_task_agent, wire_key_from_goal_key,
 };
 #[cfg(test)]
 use super::agent_orchestrator::{
@@ -866,23 +866,56 @@ impl UiProtocolContractStores {
 
 #[derive(Default)]
 struct SessionWorkspaceStore {
-    roots: std::sync::Mutex<HashMap<SessionKey, PathBuf>>,
+    entries: std::sync::Mutex<HashMap<SessionKey, SessionWorkspaceBinding>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SessionWorkspaceBinding {
+    /// Effective workspace used by tools, panes, goals, and the UI.
+    root: PathBuf,
+    /// Only a genuine Tier-1/Tier-2 cwd belongs here. `None` means `root` was
+    /// the derived Tier-3 workspace and must not relocate transcript storage.
+    runtime_hint: Option<PathBuf>,
 }
 
 impl SessionWorkspaceStore {
+    /// Establish an explicit workspace binding. Fleet-keeper recovery and the
+    /// legacy call sites using this method carry an authoritative workspace,
+    /// so it is also a runtime cwd hint.
+    #[cfg(test)]
     fn set(&self, session_id: SessionKey, root: PathBuf) {
-        self.roots
+        self.set_resolved(session_id, root.clone(), Some(root));
+    }
+
+    /// Publish the resolved tool/UI workspace while retaining whether it came
+    /// from an explicit cwd. Keeping the provenance separate prevents a
+    /// derived Tier-3 workspace from being fed back into SessionRuntimeCache as
+    /// a Tier-1/Tier-2 hint on the next request.
+    fn set_resolved(&self, session_id: SessionKey, root: PathBuf, runtime_hint: Option<PathBuf>) {
+        self.entries
             .lock()
             .unwrap_or_else(|error| error.into_inner())
-            .insert(session_id, root);
+            .insert(session_id, SessionWorkspaceBinding { root, runtime_hint });
     }
 
     fn get(&self, session_id: &SessionKey) -> Option<PathBuf> {
-        self.roots
+        self.snapshot(session_id).map(|binding| binding.root)
+    }
+
+    /// Clone the complete binding under one mutex acquisition. Consumers that
+    /// need both root and provenance must use this snapshot so a concurrent
+    /// `session/open` cannot pair one binding's root with another's hint.
+    fn snapshot(&self, session_id: &SessionKey) -> Option<SessionWorkspaceBinding> {
+        self.entries
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .get(session_id)
             .cloned()
+    }
+
+    fn runtime_hint(&self, session_id: &SessionKey) -> Option<PathBuf> {
+        self.snapshot(session_id)
+            .and_then(|binding| binding.runtime_hint)
     }
 
     /// Insert `root` under `session_id` ONLY when no entry exists yet, holding
@@ -893,17 +926,22 @@ impl SessionWorkspaceStore {
     /// `session/open` `set` (the authoritative live-client cwd) could race
     /// between, letting a headless seed clobber the real workspace. `set_if_absent`
     /// collapses that to one atomic step so the seed can only ever fill a gap.
-    fn set_if_absent(&self, session_id: SessionKey, root: PathBuf) -> bool {
+    fn set_if_absent(
+        &self,
+        session_id: SessionKey,
+        root: PathBuf,
+        runtime_hint: Option<PathBuf>,
+    ) -> bool {
         use std::collections::hash_map::Entry;
         match self
-            .roots
+            .entries
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .entry(session_id)
         {
             Entry::Occupied(_) => false,
             Entry::Vacant(slot) => {
-                slot.insert(root);
+                slot.insert(SessionWorkspaceBinding { root, runtime_hint });
                 true
             }
         }
@@ -918,9 +956,12 @@ impl SessionWorkspaceStore {
 /// For each seed the workspace root AND the cwd scope come from the SAME pending
 /// continuation ([`InProcessAgentOrchestrator::pending_fleet_keeper_seeds`] pairs
 /// and validates them), so:
-/// - `set_if_absent(wire, root)` clears Gate A (workspace-known). The seed key is
-///   the `wire_key_from_goal_key` strip — byte-identical to the gate probe (THE
-///   landmine); a mismatch would strand the keeper silently.
+/// - `set_if_absent(wire, root, runtime_hint)` clears Gate A (workspace-known)
+///   while restoring transcript-relocation provenance. Only an explicit
+///   `workspace_has_runtime_hint=true` reconstructs a hint; derived and legacy
+///   roots remain tool/UI workspaces without moving transcript storage. The
+///   seed key is the `wire_key_from_goal_key` strip — byte-identical to the gate
+///   probe (THE landmine); a mismatch would strand the keeper silently.
 /// - `set_goal_scope_if_absent(wire, scope)` (only for a scoped key) clears Gate
 ///   D (`goal_target_is_dispatchable`, which for a cwd-scoped target requires
 ///   `goal_scopes[wire] == scope` — empty after a headless restart, so a scoped
@@ -968,12 +1009,18 @@ fn reseed_fleet_keeper_candidates(
                 if workspaces.get(&seed.wire).is_none()
                     && orchestrator.goal_scope(&seed.wire).is_none()
                 {
-                    workspaces.set_if_absent(seed.wire.clone(), PathBuf::from(&seed.root));
+                    let root = PathBuf::from(&seed.root);
+                    let runtime_hint =
+                        (seed.workspace_has_runtime_hint == Some(true)).then(|| root.clone());
+                    workspaces.set_if_absent(seed.wire.clone(), root, runtime_hint);
                     orchestrator.set_goal_scope_if_absent(&seed.wire, &scope);
                 }
             }
             None => {
-                workspaces.set_if_absent(seed.wire, PathBuf::from(&seed.root));
+                let root = PathBuf::from(&seed.root);
+                let runtime_hint =
+                    (seed.workspace_has_runtime_hint == Some(true)).then(|| root.clone());
+                workspaces.set_if_absent(seed.wire, root, runtime_hint);
             }
         }
     }
@@ -984,7 +1031,7 @@ mod fleet_keeper_reseed_tests {
     use super::*;
     use crate::api::agent_orchestrator::{
         FLEET_KEEPER_EXTERNAL_KIND, FLEET_KEEPER_GROUP, FLEET_KEEPER_META_FLEET_ID,
-        FLEET_KEEPER_META_WORKSPACE_ROOT,
+        FLEET_KEEPER_META_WORKSPACE_HAS_RUNTIME_HINT, FLEET_KEEPER_META_WORKSPACE_ROOT,
     };
     use crate::api::master_continuation_scheduler::MasterContinuationRequest;
 
@@ -998,17 +1045,121 @@ mod fleet_keeper_reseed_tests {
         let store = SessionWorkspaceStore::default();
         let key = SessionKey("prof:api:chat#s".to_owned());
         assert!(
-            store.set_if_absent(key.clone(), PathBuf::from("/first")),
+            store.set_if_absent(
+                key.clone(),
+                PathBuf::from("/first"),
+                Some(PathBuf::from("/first")),
+            ),
             "first insert into a vacant slot returns true"
         );
         assert!(
-            !store.set_if_absent(key.clone(), PathBuf::from("/second")),
+            !store.set_if_absent(
+                key.clone(),
+                PathBuf::from("/second"),
+                Some(PathBuf::from("/second")),
+            ),
             "a second insert finds an established entry and returns false"
         );
         assert_eq!(
             store.get(&key),
             Some(PathBuf::from("/first")),
             "the established entry is never overwritten"
+        );
+        assert_eq!(
+            store.runtime_hint(&key),
+            Some(PathBuf::from("/first")),
+            "a recovered fleet workspace remains an authoritative runtime hint"
+        );
+    }
+
+    #[test]
+    fn should_preserve_derived_workspace_provenance_when_reseeding_after_restart() {
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let workspaces = SessionWorkspaceStore::default();
+        let root = tempfile::tempdir().expect("tempdir");
+        let root_str = root.path().to_str().expect("utf8 root").to_owned();
+        let wire = SessionKey("prof:api:chat#derived".to_owned());
+        let request = MasterContinuationRequest::new(
+            FLEET_KEEPER_GROUP,
+            wire.0.clone(),
+            "prof",
+            MasterContinuationReason::External(FLEET_KEEPER_EXTERNAL_KIND.to_owned()),
+            std::time::SystemTime::now(),
+        )
+        .with_metadata(FLEET_KEEPER_META_FLEET_ID, "f-derived")
+        .with_metadata(FLEET_KEEPER_META_WORKSPACE_ROOT, root_str)
+        .with_metadata(FLEET_KEEPER_META_WORKSPACE_HAS_RUNTIME_HINT, "false");
+        orchestrator.enqueue_continuation_for_test(request);
+
+        let seeds = orchestrator.pending_fleet_keeper_seeds();
+        assert_eq!(seeds[0].workspace_has_runtime_hint, Some(false));
+        reseed_fleet_keeper_candidates(&workspaces, &orchestrator, seeds);
+
+        let binding = workspaces.snapshot(&wire).expect("reseeded binding");
+        assert_eq!(binding.root, root.path());
+        assert_eq!(
+            binding.runtime_hint, None,
+            "a persisted Tier-3 workspace must remain a non-relocating binding"
+        );
+    }
+
+    #[test]
+    fn should_preserve_explicit_cwd_provenance_when_reseeding_after_restart() {
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let workspaces = SessionWorkspaceStore::default();
+        let root = tempfile::tempdir().expect("tempdir");
+        let root_str = root.path().to_str().expect("utf8 root").to_owned();
+        let wire = SessionKey("prof:api:chat#explicit".to_owned());
+        let request = MasterContinuationRequest::new(
+            FLEET_KEEPER_GROUP,
+            wire.0.clone(),
+            "prof",
+            MasterContinuationReason::External(FLEET_KEEPER_EXTERNAL_KIND.to_owned()),
+            std::time::SystemTime::now(),
+        )
+        .with_metadata(FLEET_KEEPER_META_FLEET_ID, "f-explicit")
+        .with_metadata(FLEET_KEEPER_META_WORKSPACE_ROOT, root_str)
+        .with_metadata(FLEET_KEEPER_META_WORKSPACE_HAS_RUNTIME_HINT, "true");
+        orchestrator.enqueue_continuation_for_test(request);
+
+        let seeds = orchestrator.pending_fleet_keeper_seeds();
+        assert_eq!(seeds[0].workspace_has_runtime_hint, Some(true));
+        reseed_fleet_keeper_candidates(&workspaces, &orchestrator, seeds);
+
+        let binding = workspaces.snapshot(&wire).expect("reseeded binding");
+        assert_eq!(binding.root, root.path());
+        assert_eq!(binding.runtime_hint.as_deref(), Some(root.path()));
+    }
+
+    #[test]
+    fn should_not_relocate_transcripts_when_legacy_seed_has_unknown_provenance() {
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let workspaces = SessionWorkspaceStore::default();
+        let root = tempfile::tempdir().expect("tempdir");
+        let root_str = root.path().to_str().expect("utf8 root").to_owned();
+        let wire = SessionKey("prof:api:chat#legacy".to_owned());
+        let request = MasterContinuationRequest::new(
+            FLEET_KEEPER_GROUP,
+            wire.0.clone(),
+            "prof",
+            MasterContinuationReason::External(FLEET_KEEPER_EXTERNAL_KIND.to_owned()),
+            std::time::SystemTime::now(),
+        )
+        .with_metadata(FLEET_KEEPER_META_FLEET_ID, "f-legacy")
+        .with_metadata(FLEET_KEEPER_META_WORKSPACE_ROOT, root_str);
+        orchestrator.enqueue_continuation_for_test(request);
+
+        let seeds = orchestrator.pending_fleet_keeper_seeds();
+        assert_eq!(seeds[0].workspace_has_runtime_hint, None);
+        reseed_fleet_keeper_candidates(&workspaces, &orchestrator, seeds);
+
+        assert_eq!(
+            workspaces
+                .snapshot(&wire)
+                .expect("reseeded legacy binding")
+                .runtime_hint,
+            None,
+            "unknown legacy provenance must fail safe instead of becoming a cwd hint"
         );
     }
 
@@ -1174,6 +1325,7 @@ mod fleet_keeper_reseed_tests {
                 wire: wire.clone(),
                 scope: Some("seed-a".to_owned()),
                 root: seed_root_str,
+                workspace_has_runtime_hint: None,
             }],
         );
 
@@ -1215,6 +1367,7 @@ mod fleet_keeper_reseed_tests {
                 wire: wire.clone(),
                 scope: Some("aaaa".to_owned()),
                 root: seed_root_str,
+                workspace_has_runtime_hint: None,
             }],
         );
 
@@ -1252,6 +1405,7 @@ mod fleet_keeper_reseed_tests {
                 wire: wire.clone(),
                 scope: None,
                 root: root.path().to_str().expect("utf8").to_owned(),
+                workspace_has_runtime_hint: None,
             }],
         );
 
@@ -2439,18 +2593,50 @@ fn peer_wire_key(profile_id: &str, slug: &str) -> String {
 /// Split a `peer-<slug>` session key into `(profile_id, slug)`, or `None` for
 /// a non-peer or unprofiled session.
 fn peer_slug_and_profile(session_id: &SessionKey) -> Option<(&str, &str)> {
+    // NOT a peer session. The overwhelmingly common case, and the only one where
+    // `None` is uninteresting — every caller correctly skips peer bookkeeping.
     let slug = session_id
         .topic()
-        .and_then(|topic| topic.strip_prefix("peer-"))
-        .filter(|slug| !slug.is_empty())?;
+        .and_then(|topic| topic.strip_prefix("peer-"))?;
+
+    // Past this point the topic SAYS `peer-…`, so something intended a peer
+    // session. Each rejection below still returns `None` (callers must treat it
+    // as a non-peer session — that is the #436 fence), but it is now LOUD.
+    //
+    // Why: all ~10 callers do `let Some(..) = .. else { return }`, which is
+    // right for "not a peer" and silently wrong for "malformed peer key". A peer
+    // whose key is rejected here keeps running and looks healthy while its wire
+    // registration, result recording, blackboard writes, awaiting-input wake and
+    // fleet synthesis ALL no-op. That failure is invisible at every layer — the
+    // peer produces work nobody records — so the only place it can be reported
+    // is here, where the reason is still known.
+
     // #436 security — the topic-derived slug feeds `Path::join` (closed marker,
     // peers dir) and the wire-key registry. Reject an unsafe one (e.g. a
     // `peer-/tmp/x` or `peer-../x` topic) HERE so EVERY caller treats it as a
     // NON-peer session rather than a path that escapes `peers/`.
-    if !peer_slug_is_safe(slug) {
+    if slug.is_empty() || !peer_slug_is_safe(slug) {
+        warn!(
+            session = %session_id,
+            "peer session key has an unusable slug; peer bookkeeping (results, \
+             blackboard, wake, synthesis) is DISABLED for this session"
+        );
         return None;
     }
-    let profile_id = session_id.profile_id()?;
+
+    // A peer key with no profile component. Nothing downstream can address the
+    // peer without one — `peers_root` is per-profile and the wire key is
+    // `{profile}:peer:{slug}` — so this silently disables the same bookkeeping.
+    let Some(profile_id) = session_id.profile_id() else {
+        warn!(
+            session = %session_id,
+            slug,
+            "peer session key has NO profile component; peer bookkeeping \
+             (results, blackboard, wake, synthesis) is DISABLED for this \
+             session. Peer keys must be `{{profile}}:{{channel}}:{{chat}}#peer-{{slug}}`"
+        );
+        return None;
+    };
     Some((profile_id, slug))
 }
 
@@ -4043,7 +4229,7 @@ async fn handle_session_compact(
     // session this is a cache hit that returns the existing runtime.
     let permissions_epoch = state.session_cache.session_generation(&session_id);
     let permissions = effective_permissions_for_session(state, &session_id)?;
-    let workspace_hint = session_workspaces().get(&session_id);
+    let workspace_hint = session_workspaces().runtime_hint(&session_id);
     let session_runtime = state
         .session_cache
         .get_or_init_with_permissions(
@@ -9676,7 +9862,7 @@ async fn tool_status_list_result(
         // preempted caller (codex P1 round 4 on #1639).
         let permissions_epoch = state.session_cache.session_generation(session_id);
         let permissions = effective_permissions_for_session(state, session_id)?;
-        let workspace_hint = session_workspaces().get(session_id);
+        let workspace_hint = session_workspaces().runtime_hint(session_id);
         Some(
             state
                 .session_cache
@@ -11633,28 +11819,31 @@ async fn raw_peer_prepare(
     Ok(Value::Object(result))
 }
 
-/// Roll back a half-staged peer fleet: remove every reserved dir, then
-/// best-effort `git worktree prune` + `branch -D peer/<slug>` for each (a
-/// worktree that WAS created for an earlier fleet member must not leak when
-/// a later member fails; both are no-ops for members that never got one).
+/// Roll back a half-staged peer fleet: unregister and remove every reserved
+/// member, then best-effort `branch -D peer/<slug>` for each (a worktree that
+/// WAS created for an earlier fleet member must not leak when a later member
+/// fails; all are no-ops for members that never got one).
+///
+/// Each member is torn down through [`remove_peer_worktree`], which is scoped to
+/// that member's own path — NOT the repo-global `git worktree prune` this used
+/// to run, which also deleted the fence of any peer outside this fleet that
+/// happened to be mid-`worktree add`.
 async fn cleanup_staged_peers(workspace_root: &Path, staged: &[(String, PathBuf)]) {
-    for (_, dir) in staged {
-        let _ = std::fs::remove_dir_all(dir);
-    }
     if staged.is_empty() {
         return;
     }
     let root = workspace_root.to_path_buf();
+    let dirs: Vec<PathBuf> = staged.iter().map(|(_, dir)| dir.clone()).collect();
     let branches: Vec<String> = staged
         .iter()
         .map(|(slug, _)| format!("peer/{slug}"))
         .collect();
     let _ = tokio::task::spawn_blocking(move || {
-        let _ = std::process::Command::new("git")
-            .arg("-C")
-            .arg(&root)
-            .args(["worktree", "prune"])
-            .output();
+        for dir in &dirs {
+            // Unregister BEFORE deleting: `git worktree remove` resolves by path.
+            remove_peer_worktree(&root, dir);
+            let _ = std::fs::remove_dir_all(dir);
+        }
         for branch in &branches {
             let _ = std::process::Command::new("git")
                 .arg("-C")
@@ -11733,32 +11922,82 @@ fn stage_peer(
                 "peer '{slug}' staging directory is no longer a real directory"
             )));
         }
-        let output = std::process::Command::new("git")
-            .arg("-C")
-            .arg(workspace_root)
-            .arg("worktree")
-            .arg("add")
-            .arg("-b")
-            .arg(&branch)
-            .arg(&worktree_path)
-            .output();
-        let output = match output {
-            Ok(output) => output,
-            Err(err) => {
-                cleanup_staged_peer(workspace_root, &slug, &peer_dir);
-                return Err(RpcError::invalid_params(format!(
-                    "failed to run git: {err}"
-                )));
+        // A CLONE, not `git worktree add`. A worktree's `.git` is a FILE
+        // pointing at `<repo>/.git/worktrees/<name>`, which lives OUTSIDE the
+        // peer's sandboxed workspace — so every git command inside a worktree
+        // peer failed with `fatal: not a git repository ... exit 128`, and the
+        // model "recovered" by running `git init`, destroying the fence. The
+        // branch then stayed at the seed commit and no deliverable ever landed.
+        // A clone puts the whole `.git` INSIDE `peers/<slug>/wt`, so git works
+        // with no sandbox widening, and one peer cannot reach another's refs.
+        //
+        // `--no-hardlinks` because isolation is the entire point here: the
+        // default local-clone optimisation shares object-file inodes with the
+        // parent, so a peer writing into its own `.git` could corrupt the
+        // source repo's objects. Costs a real object copy per peer; revisit
+        // with evidence if staging latency becomes the problem.
+        let run_git = |args: &[&std::ffi::OsStr]| -> Result<(), String> {
+            match std::process::Command::new("git").args(args).output() {
+                Err(err) => Err(format!("failed to run git: {err}")),
+                Ok(out) if out.status.success() => Ok(()),
+                Ok(out) => Err(String::from_utf8_lossy(&out.stderr).trim().to_owned()),
             }
         };
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+        let as_os = |s: &str| std::ffi::OsString::from(s);
+        let clone_args: Vec<std::ffi::OsString> = vec![
+            as_os("clone"),
+            as_os("--quiet"),
+            as_os("--no-hardlinks"),
+            workspace_root.as_os_str().to_os_string(),
+            worktree_path.as_os_str().to_os_string(),
+        ];
+        let clone_ref: Vec<&std::ffi::OsStr> = clone_args.iter().map(AsRef::as_ref).collect();
+        if let Err(detail) = run_git(&clone_ref) {
             cleanup_staged_peer(workspace_root, &slug, &peer_dir);
             return Err(RpcError::invalid_params(format!(
-                "git worktree add failed (is {} a git repo?): {}",
+                "git clone failed (is {} a git repo?): {}",
                 workspace_root.display(),
-                stderr
+                detail
             )));
+        }
+        // The fence branch now lives in the peer's OWN clone.
+        let branch_args: Vec<std::ffi::OsString> = vec![
+            as_os("-C"),
+            worktree_path.as_os_str().to_os_string(),
+            as_os("checkout"),
+            as_os("-q"),
+            as_os("-b"),
+            as_os(&branch),
+        ];
+        let branch_ref: Vec<&std::ffi::OsStr> = branch_args.iter().map(AsRef::as_ref).collect();
+        if let Err(detail) = run_git(&branch_ref) {
+            cleanup_staged_peer(workspace_root, &slug, &peer_dir);
+            return Err(RpcError::invalid_params(format!(
+                "git checkout -b {branch} failed in the peer clone: {detail}"
+            )));
+        }
+        // A clone does NOT inherit the source's LOCAL config, so a peer would
+        // have no commit identity and every `git commit` would fail. Carry the
+        // parent's over when it has one; otherwise git falls back to global.
+        for key in ["user.name", "user.email"] {
+            let read = std::process::Command::new("git")
+                .arg("-C")
+                .arg(workspace_root)
+                .args(["config", "--get", key])
+                .output();
+            let Ok(out) = read else { continue };
+            if !out.status.success() {
+                continue;
+            }
+            let value = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+            if value.is_empty() {
+                continue;
+            }
+            let _ = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&worktree_path)
+                .args(["config", key, &value])
+                .output();
         }
         worktree_path
     } else {
@@ -11806,17 +12045,153 @@ fn stage_peer(
     })
 }
 
-/// Roll back ONE half-staged peer: remove its reserved dir, then
-/// best-effort `git worktree prune` + `branch -D peer/<slug>` (both no-ops
-/// for a member that never got a worktree). The single-member synchronous
-/// sibling of [`cleanup_staged_peers`], used inside [`stage_peer`].
-fn cleanup_staged_peer(workspace_root: &Path, slug: &str, dir: &Path) {
-    let _ = std::fs::remove_dir_all(dir);
-    let _ = std::process::Command::new("git")
+/// The `.git` COMMON dir of `workspace_root` — where per-worktree admin dirs
+/// live. Resolved via git (not `join(".git")`) because `.git` is a FILE when the
+/// workspace is itself a worktree, and the admin dirs then live in the parent
+/// repo. `None` when `workspace_root` is not a repo.
+fn git_common_dir(workspace_root: &Path) -> Option<PathBuf> {
+    let out = std::process::Command::new("git")
         .arg("-C")
         .arg(workspace_root)
-        .args(["worktree", "prune"])
-        .output();
+        .args(["rev-parse", "--git-common-dir"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let raw = String::from_utf8(out.stdout).ok()?;
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let path = PathBuf::from(raw);
+    // `--git-common-dir` may answer relatively (`.git`) — anchor it.
+    Some(if path.is_absolute() {
+        path
+    } else {
+        workspace_root.join(path)
+    })
+}
+
+/// Drop ONLY the worktree belonging to peer dir `dir`.
+///
+/// Deliberately NOT `git worktree prune`, which is what this used to do: prune
+/// is repo-GLOBAL and removes the admin entry of EVERY worktree whose checkout
+/// is currently missing. `git worktree add` registers the admin entry BEFORE the
+/// checkout is fully in place, so a sibling peer staged concurrently sits in
+/// exactly that window — one peer's rollback silently destroyed another peer's
+/// fence, leaving its branch checked out nowhere. Every peer checkout is named
+/// `wt` (`peers/<slug>/wt`), so git disambiguates the admin dirs as `wt`, `wt1`,
+/// … — which is why this showed up as "the SECOND peer lost its worktree".
+///
+/// Both steps here are scoped STRICTLY to paths under `dir`, so a sibling is
+/// never touched no matter what state it is in.
+fn remove_peer_worktree(workspace_root: &Path, dir: &Path) {
+    // Normal path: the checkout exists, so git can unregister it by PATH.
+    let checkout = dir.join("wt");
+    if checkout.is_dir() {
+        let _ = std::process::Command::new("git")
+            .arg("-C")
+            .arg(workspace_root)
+            .args(["worktree", "remove", "--force"])
+            .arg(&checkout)
+            .output();
+    }
+    // Fallback: a checkout that never finished (or a `remove` git refused)
+    // leaves an admin entry behind, and a lingering entry keeps `branch -D`
+    // from succeeding — which would burn the slug for any retry. Sweep it by
+    // hand, matching ONLY entries whose `gitdir` points inside `dir`.
+    let Some(common) = git_common_dir(workspace_root) else {
+        return;
+    };
+    let Ok(entries) = std::fs::read_dir(common.join("worktrees")) else {
+        return;
+    };
+    // Compare canonicalized too: on macOS a temp/staging path reaches git as
+    // `/private/var/…` while `dir` is the `/var/…` symlink (or vice versa), and
+    // a purely lexical match would silently sweep nothing.
+    let canonical = std::fs::canonicalize(dir).ok();
+    for entry in entries.flatten() {
+        let Ok(target) = std::fs::read_to_string(entry.path().join("gitdir")) else {
+            continue;
+        };
+        let target = Path::new(target.trim());
+        let mine = target.starts_with(dir)
+            || canonical
+                .as_deref()
+                .is_some_and(|canonical| target.starts_with(canonical));
+        if mine {
+            let _ = std::fs::remove_dir_all(entry.path());
+        }
+    }
+}
+
+/// Fetch a peer's fence branch out of its own clone and into the workspace repo.
+///
+/// Peers are staged as CLONES (see `stage_peer`), so `peer/<slug>` exists only
+/// inside `peers/<slug>/wt`. Without this the work is invisible from the
+/// workspace — `git branch` would not list it and the deliverable would look
+/// like it never happened. Run on close, once the peer is done writing.
+///
+/// Best-effort by design: a peer that never committed, was staged without a
+/// worktree, or whose clone is gone simply has nothing to collect, and none of
+/// those should fail the close.
+fn collect_peer_branch(peer_dir: &Path, slug: &str) {
+    let clone = peer_dir.join("wt");
+    if !clone.join(".git").exists() {
+        return;
+    }
+    // The clone's `origin` IS the workspace repo it was cloned from, so the
+    // destination is self-describing — no need to thread a workspace root
+    // through the close callback, and it stays correct even if the session's
+    // workspace moved after staging.
+    let origin = match std::process::Command::new("git")
+        .arg("-C")
+        .arg(&clone)
+        .args(["config", "--get", "remote.origin.url"])
+        .output()
+    {
+        Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout).trim().to_owned(),
+        _ => return,
+    };
+    if origin.is_empty() {
+        return;
+    }
+    let workspace_root = PathBuf::from(origin);
+    let branch = format!("peer/{slug}");
+    // `+` forces the update: a re-opened peer that committed again must not be
+    // refused for a non-fast-forward.
+    let refspec = format!("+{branch}:{branch}");
+    match std::process::Command::new("git")
+        .arg("-C")
+        .arg(&workspace_root)
+        .args(["fetch", "--no-tags", "--quiet"])
+        .arg(&clone)
+        .arg(&refspec)
+        .output()
+    {
+        Ok(out) if out.status.success() => {
+            tracing::info!(slug, branch = %branch, "collected peer branch from its clone");
+        }
+        Ok(out) => tracing::warn!(
+            slug,
+            branch = %branch,
+            stderr = %String::from_utf8_lossy(&out.stderr).trim(),
+            "could not collect the peer branch (it may have committed nothing)"
+        ),
+        Err(error) => tracing::warn!(slug, %error, "failed to run git to collect the peer branch"),
+    }
+}
+
+/// Roll back ONE half-staged peer: unregister its OWN worktree, remove its
+/// reserved dir, then best-effort `branch -D peer/<slug>` (all no-ops for a
+/// member that never got a worktree). The single-member synchronous sibling of
+/// [`cleanup_staged_peers`], used inside [`stage_peer`].
+fn cleanup_staged_peer(workspace_root: &Path, slug: &str, dir: &Path) {
+    // BEFORE `remove_dir_all`: `git worktree remove` needs the checkout on disk
+    // to unregister it by path.
+    remove_peer_worktree(workspace_root, dir);
+    let _ = std::fs::remove_dir_all(dir);
     let branch = format!("peer/{slug}");
     let _ = std::process::Command::new("git")
         .arg("-C")
@@ -13519,6 +13894,12 @@ fn build_peer_close_callback(
                 "failed to write close marker for peer '{slug}': {err}"
             ));
         }
+        // The fence branch lives in the peer's own clone, so pull it into the
+        // workspace repo now that the peer is done — otherwise its work is
+        // invisible from the workspace and looks like it never happened.
+        // AFTER the marker: collection is best-effort and must never leave a
+        // peer un-closed.
+        collect_peer_branch(&peer_dir, &slug);
         // #436 leak fix — the marker now refuses NEW sends; actively CANCEL +
         // tombstone any injection queued for this peer BEFORE the close so
         // nothing stays stranded in the durable queue (the drain gates skip a
@@ -14322,11 +14703,13 @@ fn raw_autonomy_rpc_with_orchestrator(
                 params.profile_id.as_deref(),
                 connection_profile_id,
             )?;
+            let cursor =
+                parse_agent_output_cursor(params.cursor, params.session_id.as_ref(), &profile_id)?;
             orchestrator.read_agent_output(AgentOutputRequest {
                 agent_id: params.agent_id,
                 session_id: params.session_id,
                 profile_id,
-                cursor: params.cursor,
+                cursor,
                 limit: params.limit,
             })
         }
@@ -16135,13 +16518,14 @@ async fn open_session_result(
     // workspace the next turn will use — closing the cache/wire
     // divergence codex flagged on PR #884 follow-up.
     //
-    // The `session_workspaces()` map is kept as a thin read-through
-    // view for the legacy WS dispatcher fallback (no profile registered
-    // — setup wizard / single-agent serve) and for pane snapshots that
-    // need a sync read of the workspace root. We always write the
-    // *effective* workspace root (the runtime's, when present) so the
-    // map cannot drift out of sync with the cache.
+    // The `session_workspaces()` map is kept as a thin read-through view for
+    // the legacy WS dispatcher fallback (no profile registered — setup wizard
+    // / single-agent serve) and for pane snapshots that need a sync read of
+    // the workspace root. It stores both the effective root and the provenance
+    // of the runtime hint: a derived Tier-3 root remains available to tools and
+    // UI without being mistaken for an explicit cwd on a later cache lookup.
     let mut effective_workspace_root: Option<PathBuf> = None;
+    let mut effective_runtime_hint: Option<PathBuf> = None;
     if let Some(profile_runtime) =
         resolve_session_profile_runtime(state, active_profile_id.as_deref())
     {
@@ -16177,6 +16561,9 @@ async fn open_session_result(
                 // storage identity. No-op when the store wasn't relocated.
                 register_session_ledger_scope(ledger, &runtime);
                 effective_workspace_root = Some(runtime.workspace_root.clone());
+                effective_runtime_hint = effective_workspace_hint
+                    .as_ref()
+                    .map(|_| runtime.workspace_root.clone());
                 // Sticky marker: record this profile as the folder's active one
                 // so a later bare launch resumes it deterministically (beats the
                 // store-mtime recency fallback in `derive_sticky_profile`). Gated
@@ -16227,9 +16614,14 @@ async fn open_session_result(
         // effective hint in the read-through map so the legacy
         // dispatcher's pane-snapshot path can pick it up.
         effective_workspace_root = Some(workspace_root.clone());
+        effective_runtime_hint = Some(workspace_root.clone());
     }
     if let Some(root) = effective_workspace_root.as_ref() {
-        session_workspaces().set(params.session_id.clone(), root.clone());
+        session_workspaces().set_resolved(
+            params.session_id.clone(),
+            root.clone(),
+            effective_runtime_hint,
+        );
     }
     // #436 — record a `peer-<slug>` session's wire key so `peer_send_input`
     // (wired on the master's turn, which cannot know the peer's client-chosen
@@ -17033,7 +17425,7 @@ pub(crate) async fn resolve_sessions_for_lookup(
         .or(connection_profile_id)
         .or(routed_profile_id);
     if let Some(profile_runtime) = resolve_session_profile_runtime(state, active_profile_id) {
-        let hint = session_workspaces().get(session_id);
+        let hint = session_workspaces().runtime_hint(session_id);
         let permissions_epoch = state.session_cache.session_generation(session_id);
         let permissions = effective_permissions_for_session(state, session_id).ok()?;
         if let Ok(runtime) = state
@@ -25249,7 +25641,7 @@ async fn run_native_code_review_turn(
                 return;
             }
         };
-    let hint = session_workspaces().get(&session_id);
+    let hint = session_workspaces().runtime_hint(&session_id);
     let permissions_epoch = state.session_cache.session_generation(&session_id);
     let permissions = match effective_permissions_for_session(&state, &session_id) {
         Ok(permissions) => permissions,
@@ -27009,27 +27401,32 @@ async fn run_standalone_turn(
         return;
     };
 
-    // Read-through view: when `session.open` previously stashed an
-    // effective cwd in `session_workspaces()` (Tier-1 client cwd or
-    // Tier-2 operator default, resolved at `open_session_result` time),
-    // use that as the `workspace_hint`. Otherwise the bootstrap default
-    // Tier-3 (`<profile_data_dir>/users/.../workspace`) wins.
-    let hint = session_workspaces().get(&session_id);
+    // Keep two meanings separate: every opened session has an effective
+    // workspace root for tools/goals/UI, but only a Tier-1 client cwd or Tier-2
+    // operator default is a runtime hint that may relocate transcript storage.
+    // A derived Tier-3 workspace therefore yields `hint == None`.
+    let workspace_binding = session_workspaces().snapshot(&session_id);
+    let hint = workspace_binding
+        .as_ref()
+        .and_then(|binding| binding.runtime_hint.clone());
     // #1857 PR 5a — THE LOAD-BEARING SEAM: on a goal turn, stash the resolved
     // controller workspace root on the goal record (keyed by the SCOPED
     // `goal_session_key`) BEFORE the keeper's `goal_plan` can run mid-turn. It
-    // MUST equal the same `hint` the turn runs under, so `Fleet::create` stamps
-    // the EXACT root a later `ChildDone` wake rehydrates a headless keeper with
-    // (PR 4b) — a fabricated root would silently execute against the wrong repo
-    // after a restart. Only a live-client turn has a `session_workspaces()`
-    // entry; a headless pre-fleet `GoalContinue` passes `None`, which leaves any
-    // previously-captured root intact (same client-dependence as the existing
-    // goal feature).
+    // MUST equal the effective tool workspace (including the derived Tier-3
+    // root), so `Fleet::create` stamps the EXACT root a later `ChildDone` wake
+    // rehydrates a headless keeper with (PR 4b) — a fabricated root would
+    // silently execute against the wrong repo after a restart. A headless
+    // pre-fleet `GoalContinue` with no established binding still passes `None`,
+    // which leaves any previously captured root intact.
     if let Some(goal_ctx) = goal_context.as_ref() {
-        default_agent_orchestrator().set_goal_workspace_root(
+        default_agent_orchestrator().set_goal_workspace_binding(
             &goal_ctx.goal_session_key,
-            hint.as_ref()
-                .map(|path| path.to_string_lossy().into_owned()),
+            workspace_binding.as_ref().map(|binding| {
+                (
+                    binding.root.to_string_lossy().into_owned(),
+                    binding.runtime_hint.is_some(),
+                )
+            }),
         );
     }
     let permissions_epoch = state.session_cache.session_generation(&session_id);
@@ -28821,9 +29218,6 @@ async fn run_standalone_turn(
     // ── 语音轮 STT（serve 路径）────────────────────────────────────
     // 若 turn 媒体含音频，转写并并入 prompt；并记录"本轮含音频输入"，
     // 供下方决定是否合成语音回复。
-    // ASR language hint from the profile's resolved voice config (captured at
-    // bootstrap from the host config.json `voice` block). `None` → auto-detect.
-    let asr_language: Option<String> = session_runtime.profile.voice.asr_language.clone();
     // `materialize_turn_uploads` returns workspace-RELATIVE paths
     // ("uploads/<name>"). That works for the agent's own tools (cwd =
     // workspace_root), but ominix-api is a SEPARATE process that reads
@@ -28844,6 +29238,42 @@ async fn run_standalone_turn(
             }
         })
         .collect();
+    let had_audio_media = asr_media.iter().any(|p| octos_bus::media::is_audio(p));
+    // Read the profile override for every voice turn instead of freezing it in
+    // the cached SessionRuntime. A Settings save therefore affects the very
+    // next utterance without restarting `octos serve`. Do not touch the store
+    // for text-only turns; a malformed voice setting must not break chat.
+    let asr_language = if had_audio_media {
+        match crate::profiles::effective_profile_asr_language(
+            state.profile_store.as_deref(),
+            Some(&session_runtime.profile.profile_id),
+            session_runtime.profile.voice.asr_language.as_deref(),
+        ) {
+            Ok(language) => language,
+            Err(error) => {
+                tracing::error!(
+                    profile_id = %session_runtime.profile.profile_id,
+                    %error,
+                    "voice_turn: failed to resolve profile ASR language"
+                );
+                try_emit_terminal(
+                    &turn_state,
+                    TerminalReason::Errored,
+                    &ws,
+                    &ledger,
+                    &session_id,
+                    &turn_id,
+                    Some(("profile_config_unavailable", &error.to_string())),
+                    None,
+                )
+                .await;
+                contracts.scopes.evict_turn(&session_id, &turn_id);
+                return;
+            }
+        }
+    } else {
+        None
+    };
     tracing::debug!(media = ?asr_media, "voice_turn: STT input media");
     let voice_transcripts =
         crate::api::voice_turn::transcribe_audio_media(&asr_media, asr_language.as_deref()).await;
@@ -28858,7 +29288,6 @@ async fn run_standalone_turn(
     // silently completed any non-audio-media turn (e.g. text+image) without
     // running the agent. Short-circuit only genuinely empty voice turns:
     // audio present, no transcript, no typed prompt, no other media.
-    let had_audio_media = asr_media.iter().any(|p| octos_bus::media::is_audio(p));
     let had_non_audio_media = asr_media.iter().any(|p| !octos_bus::media::is_audio(p));
     if should_short_circuit_no_speech(
         had_audio_media,

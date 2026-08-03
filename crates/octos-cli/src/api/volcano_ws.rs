@@ -87,12 +87,7 @@ fn ws_endpoint() -> Option<String> {
 
 /// File extension for the requested audio encoding.
 fn audio_ext(encoding: &str) -> &'static str {
-    match encoding {
-        "wav" => "wav",
-        "pcm" => "pcm",
-        "ogg_opus" => "ogg",
-        _ => "mp3",
-    }
+    crate::api::voice_turn::cloud_audio_file_extension(encoding)
 }
 
 /// Streaming core: open the v1 ws_binary connection, send the `submit`

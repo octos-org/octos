@@ -13095,6 +13095,53 @@ fn m15_raw_autonomy_rpc_dispatches_every_method_to_orchestrator() {
     assert_eq!(calls, expected);
 }
 
+#[test]
+fn agent_output_read_preserves_recoverable_cursor_error_shape() {
+    let features = ConnectionUiFeatures::stdio_defaults();
+    let session_id = SessionKey::new("tenant-a", "cursor-error");
+    let orchestrator = RecordingOrchestrator::default();
+
+    for malformed_cursor in [
+        json!({}),
+        json!({ "offset": "not-a-number" }),
+        json!({ "offset": -1 }),
+    ] {
+        let request = RpcRequest::new(
+            "read-output",
+            methods::AGENT_OUTPUT_READ,
+            json!({
+                "agent_id": "agent-1",
+                "session_id": session_id.clone(),
+                "profile_id": "tenant-a",
+                "cursor": malformed_cursor,
+            }),
+        );
+        let error = raw_autonomy_rpc_with_orchestrator(&request, features, None, &orchestrator)
+            .expect_err("malformed cursor must retain the domain error");
+        let data = error.data.expect("cursor error data");
+
+        assert_eq!(error.code, rpc_error_codes::INVALID_PARAMS);
+        assert_eq!(
+            error.message,
+            "agent output cursor must be an object with numeric offset"
+        );
+        assert_eq!(data["kind"], "agent_output_cursor_invalid");
+        assert_eq!(data["policy_id"], "coding-autonomy-v1");
+        assert_eq!(data["profile_id"], "tenant-a");
+        assert_eq!(data["session_id"], json!(session_id));
+        assert_eq!(data["recoverable"], true);
+    }
+
+    assert!(
+        orchestrator
+            .calls
+            .lock()
+            .expect("recorded calls")
+            .is_empty(),
+        "invalid cursors must fail before orchestrator dispatch"
+    );
+}
+
 /// Codex P1 follow-up to #1094: `task/artifact/list` and
 /// `task/artifact/read` are the UPCR-2026-019 / M13 canonical names.
 /// Spec-conforming clients reach them via `task/list`, which exposes
@@ -24014,6 +24061,201 @@ async fn appui_session_without_client_cwd_respects_operator_default_session_cwd(
     );
 }
 
+/// A no-cwd AppUI session still gets a derived Tier-3 workspace for tools, but
+/// that derived path is not a caller-supplied cwd and must never relocate the
+/// transcript store when `appui.sessions_in_cwd` is enabled.
+///
+/// Regression: `session/open` used to write the derived workspace root into
+/// `session_workspaces()`. A later lookup then fed that root back into the
+/// runtime cache as a cwd hint, creating a second runtime under
+/// `<derived-workspace>/.octos/<profile>` and making the session disappear
+/// from the profile-global session list.
+#[tokio::test]
+async fn appui_no_cwd_workspace_does_not_become_a_transcript_store_hint() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let profile_id = "no-cwd-store-stability";
+    let (state, profile_runtime) = state_with_profile(temp.path(), profile_id).await;
+    let mut state_inner = Arc::try_unwrap(state)
+        .map_err(|_| "state Arc must be unique for test setup")
+        .expect("unique Arc");
+    state_inner.session_cache = Arc::new(
+        crate::runtime::SessionRuntimeCache::new(8, std::time::Duration::from_secs(60))
+            .with_sessions_in_cwd(true),
+    );
+    let state = Arc::new(state_inner);
+
+    let session_id = SessionKey::with_profile(profile_id, "api", "learn-no-cwd");
+    let outcome = open_session_result(
+        &state,
+        &UiProtocolLedger::new(16),
+        &PendingApprovalStore::default(),
+        &PendingQuestionStore::default(),
+        ConnectionId::next(),
+        Some(profile_id),
+        ConnectionUiFeatures {
+            session_workspace_cwd: false,
+            header_present: true,
+            ..ConnectionUiFeatures::default()
+        },
+        SessionOpenParams {
+            session_id: session_id.clone(),
+            topic: None,
+            profile_id: Some(profile_id.into()),
+            cwd: None,
+            sandbox: None,
+            after: None,
+        },
+    )
+    .await
+    .expect("no-cwd session/open must succeed");
+
+    let workspace_root = outcome
+        .result
+        .opened
+        .workspace_root
+        .expect("Tier-3 workspace root is still exposed for tools and UI");
+    assert_ne!(workspace_root, profile_runtime.data_dir);
+
+    let sessions = resolve_sessions_for_lookup(&state, None, Some(profile_id), &session_id)
+        .await
+        .expect("session manager resolves after open");
+    assert_eq!(
+        sessions.lock().await.data_dir(),
+        profile_runtime.data_dir,
+        "derived Tier-3 workspace must not be replayed as a cwd hint",
+    );
+}
+
+/// The provenance split must not weaken real per-project sessions: an
+/// explicitly supplied cwd remains the runtime hint used by later lookup
+/// paths, so transcript storage stays under that project's `.octos` root.
+#[tokio::test]
+async fn appui_explicit_cwd_remains_a_transcript_store_hint() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let profile_id = "explicit-cwd-store-stability";
+    let (state, _profile_runtime) = state_with_profile(temp.path(), profile_id).await;
+    let mut state_inner = Arc::try_unwrap(state)
+        .map_err(|_| "state Arc must be unique for test setup")
+        .expect("unique Arc");
+    state_inner.session_cache = Arc::new(
+        crate::runtime::SessionRuntimeCache::new(8, std::time::Duration::from_secs(60))
+            .with_sessions_in_cwd(true),
+    );
+    let state = Arc::new(state_inner);
+
+    let workspace = temp.path().join("project");
+    std::fs::create_dir_all(&workspace).expect("create explicit workspace");
+    let workspace = std::fs::canonicalize(workspace).expect("canonicalize explicit workspace");
+    let session_id = SessionKey::with_profile(profile_id, "api", "coding-with-cwd");
+    open_session_result(
+        &state,
+        &UiProtocolLedger::new(16),
+        &PendingApprovalStore::default(),
+        &PendingQuestionStore::default(),
+        ConnectionId::next(),
+        Some(profile_id),
+        ConnectionUiFeatures {
+            session_workspace_cwd: true,
+            header_present: true,
+            ..ConnectionUiFeatures::default()
+        },
+        SessionOpenParams {
+            session_id: session_id.clone(),
+            topic: None,
+            profile_id: Some(profile_id.into()),
+            cwd: Some(workspace.to_string_lossy().into_owned()),
+            sandbox: None,
+            after: None,
+        },
+    )
+    .await
+    .expect("explicit-cwd session/open must succeed");
+
+    let sessions = resolve_sessions_for_lookup(&state, None, Some(profile_id), &session_id)
+        .await
+        .expect("explicit-cwd session manager resolves after open");
+    assert_eq!(
+        sessions.lock().await.data_dir(),
+        crate::runtime::session::project_sessions_root(&workspace, profile_id),
+        "explicit cwd must remain the transcript-store hint",
+    );
+}
+
+#[tokio::test]
+async fn should_keep_profile_transcript_store_with_fresh_cache_after_no_cwd_reseed() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let profile_id = "restart-no-cwd";
+    let (_state, profile_runtime) = state_with_profile(temp.path(), profile_id).await;
+    let workspace = temp.path().join("derived-workspace");
+    std::fs::create_dir_all(&workspace).expect("create derived workspace");
+    let workspace = std::fs::canonicalize(workspace).expect("canonicalize workspace");
+    let wire = SessionKey::with_profile(profile_id, "api", "restart-derived");
+    let workspaces = SessionWorkspaceStore::default();
+    let orchestrator = InProcessAgentOrchestrator::default();
+
+    reseed_fleet_keeper_candidates(
+        &workspaces,
+        &orchestrator,
+        vec![FleetKeeperSeed {
+            wire: wire.clone(),
+            scope: None,
+            root: workspace.to_string_lossy().into_owned(),
+            workspace_has_runtime_hint: Some(false),
+        }],
+    );
+    let binding = workspaces.snapshot(&wire).expect("reseeded binding");
+    let fresh_cache =
+        crate::runtime::SessionRuntimeCache::new(8, std::time::Duration::from_secs(60))
+            .with_sessions_in_cwd(true);
+    let runtime = fresh_cache
+        .get_or_init(&profile_runtime, wire, binding.runtime_hint)
+        .await
+        .expect("fresh runtime");
+
+    assert_eq!(
+        runtime.sessions_root, profile_runtime.data_dir,
+        "a no-cwd keeper must remain in the profile-global transcript store after restart"
+    );
+}
+
+#[tokio::test]
+async fn should_keep_project_transcript_store_with_fresh_cache_after_explicit_cwd_reseed() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let profile_id = "restart-explicit-cwd";
+    let (_state, profile_runtime) = state_with_profile(temp.path(), profile_id).await;
+    let workspace = temp.path().join("explicit-workspace");
+    std::fs::create_dir_all(&workspace).expect("create explicit workspace");
+    let workspace = std::fs::canonicalize(workspace).expect("canonicalize workspace");
+    let wire = SessionKey::with_profile(profile_id, "api", "restart-explicit");
+    let workspaces = SessionWorkspaceStore::default();
+    let orchestrator = InProcessAgentOrchestrator::default();
+
+    reseed_fleet_keeper_candidates(
+        &workspaces,
+        &orchestrator,
+        vec![FleetKeeperSeed {
+            wire: wire.clone(),
+            scope: None,
+            root: workspace.to_string_lossy().into_owned(),
+            workspace_has_runtime_hint: Some(true),
+        }],
+    );
+    let binding = workspaces.snapshot(&wire).expect("reseeded binding");
+    let fresh_cache =
+        crate::runtime::SessionRuntimeCache::new(8, std::time::Duration::from_secs(60))
+            .with_sessions_in_cwd(true);
+    let runtime = fresh_cache
+        .get_or_init(&profile_runtime, wire, binding.runtime_hint)
+        .await
+        .expect("fresh runtime");
+
+    assert_eq!(
+        runtime.sessions_root,
+        crate::runtime::session::project_sessions_root(&workspace, profile_id),
+        "an explicit cwd keeper must remain in the project transcript store after restart"
+    );
+}
+
 #[test]
 fn review_join_preserves_explicit_final_marker() {
     let summary = ensure_requested_final_marker(
@@ -25599,6 +25841,85 @@ fn stage_peer_reserves_slug_writes_brief_and_releases_on_failure() {
     );
 }
 
+/// Rolling back ONE peer must never touch a SIBLING's fence.
+///
+/// HISTORY: `cleanup_staged_peer` used to run a repo-GLOBAL
+/// `git worktree prune`, which deletes the admin entry of EVERY worktree whose
+/// checkout is momentarily missing — and `git worktree add` registers that entry
+/// BEFORE the checkout exists, so a sibling staged concurrently sat in exactly
+/// that window and lost its fence. Every peer checkout was named `wt`, so git
+/// disambiguated the admin dirs as `wt`, `wt1`, … and it surfaced as "the SECOND
+/// peer's worktree disappeared".
+///
+/// Peers are now staged as CLONES, which removes the shared `.git` that bug
+/// lived in — so this can no longer assert on `git worktree list` (a clone is
+/// not registered in the parent at all). The INVARIANT is unchanged and still
+/// worth pinning: tearing down one peer must leave a sibling fully usable.
+#[test]
+fn cleanup_of_one_peer_must_not_destroy_a_sibling_fence() {
+    fn git(dir: &std::path::Path, args: &[&str]) -> std::process::Output {
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .output()
+            .unwrap()
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let peers = tmp.path().join("peers");
+    let repo = tmp.path().join("project");
+    std::fs::create_dir_all(&repo).unwrap();
+    assert!(git(&repo, &["init", "-q"]).status.success());
+    assert!(
+        git(&repo, &["config", "user.email", "t@t"])
+            .status
+            .success()
+    );
+    assert!(
+        git(&repo, &["config", "user.name", "ymote"])
+            .status
+            .success()
+    );
+    assert!(
+        git(&repo, &["commit", "--allow-empty", "-q", "-m", "init"])
+            .status
+            .success()
+    );
+
+    let keeper = stage_peer(&peers, &repo, "Keeper", None, None, "Stay.", true)
+        .expect("sibling staging must succeed");
+    let doomed =
+        stage_peer(&peers, &repo, "Doomed", None, None, "Rolled back.", true).expect("staging");
+
+    // Roll back ONLY the doomed peer.
+    cleanup_staged_peer(&repo, &doomed.slug, &peers.join(&doomed.slug));
+
+    assert!(
+        !peers.join(&doomed.slug).exists(),
+        "the rolled-back peer's dir must be gone"
+    );
+
+    // The sibling must still be a USABLE git repo on its own fence branch.
+    // Checking the directory still exists is not enough — a half-torn-down
+    // fence looks identical on disk until git is asked to resolve it.
+    assert!(
+        keeper.cwd.join(".git").is_dir(),
+        "the sibling's fence must survive intact"
+    );
+    let head = git(&keeper.cwd, &["rev-parse", "--abbrev-ref", "HEAD"]);
+    assert!(
+        head.status.success(),
+        "the sibling must still be usable by git: {}",
+        String::from_utf8_lossy(&head.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&head.stdout).trim(),
+        "peer/keeper",
+        "the sibling must still be on its own fence branch"
+    );
+}
+
 /// #1801 v3 depth-1 guard: `peer_handoff` wiring is skipped for sessions
 /// whose topic is `peer-<slug>` — a peer must never see the tool at all.
 #[test]
@@ -26242,6 +26563,166 @@ fn unsafe_peer_topic_slug_is_treated_as_non_peer() {
         None,
         "an unsafe peer topic must not register a wire key"
     );
+}
+
+/// A worktree peer's git state must live INSIDE its own workspace, so git
+/// actually works there.
+///
+/// Regression guard for the bug that made worktree peers useless. They were
+/// staged with `git worktree add`, whose `.git` is a FILE pointing at
+/// `<repo>/.git/worktrees/<name>` — OUTSIDE the peer's sandboxed workspace. The
+/// sandbox confines a peer to `peers/<slug>/wt`, so every git command failed:
+///
+/// ```text
+/// fatal: not a git repository: .../work/.git/worktrees/wt      Exit code: 128
+/// ```
+///
+/// The model then "recovered" by running `git init`, destroying the fence, and
+/// the branch stayed at the seed commit — a worktree peer produced a branch and
+/// never landed anything on it. Live-observed on BOTH peers of a two-peer run.
+///
+/// The old tests could not catch this: they asserted the fence was CREATED,
+/// never that a peer could USE it. So this asserts the property the sandbox
+/// actually needs — the RESOLVED git dir is contained in the peer's own
+/// workspace — plus a real commit and a collection round-trip.
+#[test]
+fn peer_fence_git_dir_is_inside_the_peer_workspace() {
+    fn git(dir: &std::path::Path, args: &[&str]) -> std::process::Output {
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .output()
+            .unwrap()
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let peers = tmp.path().join("peers");
+    let repo = tmp.path().join("project");
+    std::fs::create_dir_all(&repo).unwrap();
+    assert!(git(&repo, &["init", "-q"]).status.success());
+    assert!(
+        git(&repo, &["config", "user.email", "t@t"])
+            .status
+            .success()
+    );
+    assert!(
+        git(&repo, &["config", "user.name", "ymote"])
+            .status
+            .success()
+    );
+    std::fs::write(repo.join("seed.txt"), b"seed\n").unwrap();
+    assert!(git(&repo, &["add", "-A"]).status.success());
+    assert!(git(&repo, &["commit", "-q", "-m", "seed"]).status.success());
+
+    let staged =
+        stage_peer(&peers, &repo, "Fenced", None, None, "Own fence.", true).expect("staging");
+    let cwd = &staged.cwd;
+
+    // THE fix: `.git` is a real directory in the peer's workspace, not a file
+    // redirecting outside it.
+    assert!(
+        cwd.join(".git").is_dir(),
+        "the peer's .git must be a real directory inside its workspace, not a \
+         worktree pointer file to the parent repo"
+    );
+
+    // The property the sandbox needs: the RESOLVED git dir is contained in the
+    // peer's own workspace, so confining the peer to `cwd` cannot break git.
+    let out = git(cwd, &["rev-parse", "--absolute-git-dir"]);
+    assert!(out.status.success(), "git must work inside the peer fence");
+    let git_dir = std::path::PathBuf::from(String::from_utf8_lossy(&out.stdout).trim().to_owned());
+    let contained = std::fs::canonicalize(&git_dir)
+        .unwrap_or_else(|_| git_dir.clone())
+        .starts_with(std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.clone()));
+    assert!(
+        contained,
+        "the peer's git dir must resolve INSIDE its workspace, got {}",
+        git_dir.display()
+    );
+
+    // On its own fence branch...
+    let head = git(cwd, &["rev-parse", "--abbrev-ref", "HEAD"]);
+    assert_eq!(
+        String::from_utf8_lossy(&head.stdout).trim(),
+        "peer/fenced",
+        "the peer must start on its own fence branch"
+    );
+
+    // ...and able to actually commit. A clone does NOT inherit the source's
+    // LOCAL config, so this also covers the carried-over commit identity —
+    // without it every peer commit fails on "unable to auto-detect email".
+    std::fs::write(cwd.join("work.txt"), b"peer output\n").unwrap();
+    assert!(git(cwd, &["add", "-A"]).status.success());
+    let commit = git(cwd, &["commit", "-q", "-m", "peer deliverable"]);
+    assert!(
+        commit.status.success(),
+        "a peer must be able to commit inside its fence: {}",
+        String::from_utf8_lossy(&commit.stderr)
+    );
+
+    // The commit is NOT in the workspace repo yet — it lives in the peer's
+    // clone until collection.
+    assert!(
+        !git(&repo, &["rev-parse", "--verify", "-q", "peer/fenced"])
+            .status
+            .success(),
+        "the fence branch must not appear in the workspace before collection"
+    );
+
+    // Collection pulls it back, so the deliverable is visible from the workspace.
+    collect_peer_branch(&peers.join(&staged.slug), &staged.slug);
+    assert!(
+        git(&repo, &["rev-parse", "--verify", "-q", "peer/fenced"])
+            .status
+            .success(),
+        "collect_peer_branch must land the fence branch in the workspace repo"
+    );
+    let subject = git(&repo, &["log", "-1", "--format=%s", "peer/fenced"]);
+    assert_eq!(
+        String::from_utf8_lossy(&subject.stdout).trim(),
+        "peer deliverable",
+        "the collected branch must carry the peer's commit"
+    );
+}
+
+/// A peer key with NO profile component is not addressable, and must keep
+/// parsing as a non-peer session.
+///
+/// This is the shape of a real footgun: `peers_root` is per-profile and the wire
+/// key is `{profile}:peer:{slug}`, so without a profile there is nothing to
+/// address. `peer_slug_and_profile` therefore returns `None` — and all ~10
+/// callers do `let Some(..) = .. else { return }`, which is right for "not a
+/// peer" and silently wrong here. The peer runs, looks healthy, and its result
+/// recording, blackboard writes, awaiting-input wake and fleet synthesis ALL
+/// no-op, with nothing logged anywhere.
+///
+/// The RETURN value stays `None` (callers must keep treating it as a non-peer
+/// session — that is the #436 fence). What changed is that the two
+/// intended-a-peer rejections now `warn!`, because this is the only layer that
+/// still knows WHY. This test pins the contract so the fence is not accidentally
+/// relaxed into `Some` while making the diagnostics louder.
+#[test]
+fn peer_key_without_a_profile_is_not_addressable() {
+    let no_profile = SessionKey::with_topic("api", "tab", "peer-edison");
+    assert_eq!(
+        peer_slug_and_profile(&no_profile),
+        None,
+        "a profile-less peer key has nothing to address and must not parse"
+    );
+
+    // The SAME topic WITH a profile parses — so the profile component, not the
+    // topic, is what makes a peer addressable.
+    let with_profile = SessionKey::with_profile_topic("dev", "api", "tab", "peer-edison");
+    assert_eq!(
+        peer_slug_and_profile(&with_profile),
+        Some(("dev", "edison"))
+    );
+
+    // A genuinely non-peer topic is also None: the one case where silence is
+    // correct, and which stays indistinguishable in the RETURN value on purpose.
+    let not_a_peer = SessionKey::with_profile_topic("dev", "api", "tab", "coding");
+    assert_eq!(peer_slug_and_profile(&not_a_peer), None);
 }
 
 /// FIX 5 — a pending injection to a CLOSED peer is RETIRED (cancelled +

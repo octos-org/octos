@@ -30,9 +30,11 @@ use std::sync::Arc;
 use eyre::Result;
 use octos_core::SessionKey;
 
+use crate::grant::WorkerGrant;
 use crate::records::{
     AcceptanceCriterion, AcceptanceVerdict, ChildResultSnapshot, ChildStatus, DecisionKind,
-    DurablePlan, EvidenceRef, FleetBudget, FleetChildRecord, FleetStatus, PlanTask, SCHEMA_VERSION,
+    DurablePlan, EscalationRequest, EvidenceRef, FleetBudget, FleetChildRecord, FleetStatus,
+    PlanTask, SCHEMA_VERSION,
 };
 use crate::store::{CompleteOutcome, FleetKernelStore, PlanMutateOutcome};
 
@@ -52,6 +54,10 @@ pub struct TaskSpec {
     /// task_ids that must be `Succeeded` before this task is launchable.
     pub deps: Vec<String>,
     pub acceptance: Vec<AcceptanceCriterion>,
+    /// PR A — the operator grant the master provisions this task's worker with
+    /// (network / tools / filesystem). Defaults to [`WorkerGrant::minimal`]
+    /// (today's closed worker) when the master specifies nothing.
+    pub grant: WorkerGrant,
 }
 
 impl From<TaskSpec> for PlanTask {
@@ -62,6 +68,7 @@ impl From<TaskSpec> for PlanTask {
             detail: s.detail,
             deps: s.deps,
             acceptance: s.acceptance,
+            grant: s.grant,
         }
     }
 }
@@ -91,6 +98,13 @@ pub enum PlanEdit {
         task_id: String,
         into: Vec<TaskSpec>,
     },
+    /// PR B — WIDEN a task's operator [`WorkerGrant`] and resume its blocked
+    /// child (`Blocked → Ready`), clearing its `pending_escalation`. This is the
+    /// keeper's `goal_grant` after a worker escalated mid-task. Like `Retitle`
+    /// it is TARGETED — it bumps only the plan `revision` (never `generation`)
+    /// and touches only this task's row, NOT a `replan` blast: the yielded
+    /// attempt is already settled, so there is no live attempt to interrupt.
+    SetGrant { task_id: String, grant: WorkerGrant },
 }
 
 // ---------------------------------------------------------------------------
@@ -123,11 +137,22 @@ pub struct TaskView {
     pub detail: String,
     pub deps: Vec<String>,
     pub acceptance: Vec<AcceptanceCriterion>,
+    /// PR A — the operator grant the worker for this task is built from,
+    /// projected from the plan's [`PlanTask::grant`]. The executor
+    /// (`octos-fleet-worker`) reads it to build the worker's registry, sandbox
+    /// network, and filesystem scope. Defaults to [`WorkerGrant::minimal`].
+    pub grant: WorkerGrant,
     // ---- state (from the child) ----
     pub status: ChildStatus,
     pub verdict: Option<AcceptanceVerdict>,
     pub evidence: Vec<EvidenceRef>,
     pub current_attempt_id: Option<String>,
+    /// PR B — the pending mid-task escalation, projected from the child's
+    /// [`FleetChildRecord::pending_escalation`]. `Some` while `status ==
+    /// Blocked`: how the keeper NOTICES a worker's grant-widen request on its
+    /// next `goal_get` turn (the request's advisory grant + reason). Cleared
+    /// once the keeper's `goal_grant`/`goal_deny` resolves it.
+    pub pending_escalation: Option<EscalationRequest>,
 }
 
 /// Counts of the current plan's tasks by child state, for synthesis /
@@ -146,6 +171,10 @@ pub struct FleetSummary {
     pub ready: usize,
     pub launching: usize,
     pub running: usize,
+    /// PR B — children yielded on a pending escalation (non-terminal), awaiting
+    /// an operator `goal_grant`/`goal_deny`. Counted separately so a synthesis /
+    /// progress render distinguishes "waiting on the operator" from in-flight.
+    pub blocked: usize,
     pub succeeded: usize,
     pub failed: usize,
     pub cancelled: usize,
@@ -189,6 +218,37 @@ impl Fleet {
         tasks: Vec<TaskSpec>,
         now_ms: u64,
     ) -> Result<Fleet> {
+        Self::create_with_workspace_provenance(
+            store,
+            fleet_id,
+            controller_session_key,
+            controller_workspace_root,
+            None,
+            profile_id,
+            budget,
+            objective,
+            tasks,
+            now_ms,
+        )
+        .await
+    }
+
+    /// Create a fleet while preserving the provenance of its controller
+    /// workspace across durable wake/restart boundaries. `None` provenance is
+    /// the legacy/unknown case and must never be treated as a cwd hint.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_with_workspace_provenance(
+        store: Arc<FleetKernelStore>,
+        fleet_id: impl Into<String>,
+        controller_session_key: SessionKey,
+        controller_workspace_root: Option<String>,
+        controller_workspace_has_runtime_hint: Option<bool>,
+        profile_id: impl Into<String>,
+        budget: FleetBudget,
+        objective: impl Into<String>,
+        tasks: Vec<TaskSpec>,
+        now_ms: u64,
+    ) -> Result<Fleet> {
         let fleet_id = fleet_id.into();
         let profile_id = profile_id.into();
         let tasks: Vec<PlanTask> = tasks.into_iter().map(PlanTask::from).collect();
@@ -208,9 +268,10 @@ impl Fleet {
 
         // P2-a: fleet + plan + children in ONE transaction (all-or-nothing).
         store
-            .create_fleet_with_plan(
+            .create_fleet_with_plan_and_workspace_provenance(
                 controller_session_key,
                 controller_workspace_root,
+                controller_workspace_has_runtime_hint,
                 &profile_id,
                 budget.token_budget,
                 budget.hard,
@@ -275,10 +336,12 @@ impl Fleet {
                     detail: t.detail.clone(),
                     deps: t.deps.clone(),
                     acceptance: t.acceptance.clone(),
+                    grant: t.grant.clone(),
                     status: child.map(|c| c.status).unwrap_or(ChildStatus::Planned),
                     evidence: verdict_evidence(verdict.as_ref()),
                     verdict,
                     current_attempt_id: child.and_then(|c| c.current_attempt_id.clone()),
+                    pending_escalation: child.and_then(|c| c.pending_escalation.clone()),
                 }
             })
             .collect();
@@ -383,6 +446,34 @@ impl Fleet {
                 self.note(
                     DecisionKind::Note,
                     &format!("retitle task {task_id}"),
+                    now_ms,
+                )
+                .await;
+            }
+            return Ok(outcome);
+        }
+
+        // PR B — SetGrant: targeted grant-widen + Blocked→Ready resume. Like
+        // Retitle it must NOT interrupt other children or bump generation, so it
+        // routes to the dedicated `set_task_grant` store op, never `replan`.
+        if let PlanEdit::SetGrant { task_id, grant } = &edit {
+            if !plan.tasks.iter().any(|t| &t.task_id == task_id) {
+                return Err(PlanGraphError::UnknownTask(task_id.clone()).into());
+            }
+            let outcome = self
+                .store
+                .set_task_grant(
+                    &self.fleet_id,
+                    expected_revision,
+                    task_id,
+                    grant.clone(),
+                    now_ms,
+                )
+                .await?;
+            if matches!(outcome, PlanMutateOutcome::Mutated { .. }) {
+                self.note(
+                    DecisionKind::Note,
+                    &format!("grant widen + resume task {task_id}"),
                     now_ms,
                 )
                 .await;
@@ -514,6 +605,7 @@ impl Fleet {
             ready: 0,
             launching: 0,
             running: 0,
+            blocked: 0,
             succeeded: 0,
             failed: 0,
             cancelled: 0,
@@ -529,6 +621,7 @@ impl Fleet {
                 ChildStatus::Ready => s.ready += 1,
                 ChildStatus::Launching => s.launching += 1,
                 ChildStatus::Running => s.running += 1,
+                ChildStatus::Blocked => s.blocked += 1,
                 ChildStatus::Succeeded => s.succeeded += 1,
                 ChildStatus::Failed => s.failed += 1,
                 ChildStatus::Cancelled => s.cancelled += 1,
@@ -731,6 +824,17 @@ fn apply_edit_to_tasks(
             t.deps = deps;
             Ok(format!("retarget deps of task {task_id}"))
         }
+        // PR B: SetGrant is spec-only (like Retitle) and is early-returned by
+        // `apply_edit` to `set_task_grant`, so it never reaches this structural
+        // path. The arm exists for exhaustiveness and does the pure spec change.
+        PlanEdit::SetGrant { task_id, grant } => {
+            let t = tasks
+                .iter_mut()
+                .find(|t| t.task_id == task_id)
+                .ok_or_else(|| PlanGraphError::UnknownTask(task_id.clone()))?;
+            t.grant = grant;
+            Ok(format!("set grant of task {task_id}"))
+        }
         PlanEdit::SplitTask { task_id, into } => {
             if into.is_empty() {
                 return Err(PlanGraphError::EmptySplit(task_id));
@@ -927,6 +1031,7 @@ mod tests {
             detail: "do the thing".into(),
             deps: deps.iter().map(|s| s.to_string()).collect(),
             acceptance: Vec::new(),
+            grant: WorkerGrant::minimal(),
         }
     }
 
@@ -969,6 +1074,408 @@ mod tests {
             .record_outcome(task, &attempt, verdict, 80, EPOCH, now)
             .await
             .unwrap()
+    }
+
+    /// Drive a `Ready` task into `Blocked` via a recorded escalation: launch →
+    /// mark_running → `record_escalation` (80 real tokens). Returns the request
+    /// that was recorded, for assertions.
+    async fn escalate_child(fleet: &Fleet, task: &str, now: u64) -> crate::EscalationRequest {
+        let store = fleet.store();
+        let attempt = match store
+            .launch_child(fleet.fleet_id(), task, 100, now, EPOCH, TTL)
+            .await
+            .unwrap()
+        {
+            LaunchOutcome::Launched { attempt_id } => attempt_id,
+            other => panic!("launch {task}: {other:?}"),
+        };
+        store.mark_running(task, &attempt).await.unwrap();
+        let request = crate::EscalationRequest {
+            requested_grant: WorkerGrant {
+                network: crate::grant::NetworkGrant::Hosts(vec!["example.com".into()]),
+                tools: vec!["read_file".into(), "web_fetch".into()],
+                ..WorkerGrant::minimal()
+            },
+            reason: format!("{task} needs example.com"),
+        };
+        let out = store
+            .record_escalation(
+                fleet.fleet_id(),
+                task,
+                &attempt,
+                request.clone(),
+                80,
+                EPOCH,
+                now,
+            )
+            .await
+            .unwrap();
+        assert_eq!(out, CompleteOutcome::Completed);
+        request
+    }
+
+    #[tokio::test]
+    async fn set_grant_edit_widens_task_grant_and_readies_it() {
+        let (_d, store) = fresh().await;
+        let fleet = Fleet::create(
+            store.clone(),
+            "f1",
+            controller(),
+            None,
+            "default",
+            budget(10_000),
+            "obj",
+            vec![spec("a", &[]), spec("b", &[])],
+            0,
+        )
+        .await
+        .unwrap();
+        // Drive `a` to Blocked; `b` stays a fresh Ready, minimal-grant control.
+        escalate_child(&fleet, "a", 1).await;
+        let before = fleet.view().await.unwrap();
+        assert_eq!(before.revision, 0);
+        assert_eq!(before.generation, 0);
+        let a_before = before.tasks.iter().find(|t| t.task_id == "a").unwrap();
+        assert_eq!(a_before.status, ChildStatus::Blocked);
+        assert!(
+            a_before.pending_escalation.is_some(),
+            "a is blocked on a request"
+        );
+
+        // The keeper grants a WIDER grant (web_fetch under a Hosts allowlist).
+        let wider = WorkerGrant {
+            network: crate::grant::NetworkGrant::Hosts(vec!["example.com".into()]),
+            tools: vec!["read_file".into(), "write_file".into(), "web_fetch".into()],
+            ..WorkerGrant::minimal()
+        };
+        let out = fleet
+            .apply_edit(
+                PlanEdit::SetGrant {
+                    task_id: "a".into(),
+                    grant: wider.clone(),
+                },
+                0,
+                7,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            out,
+            PlanMutateOutcome::Mutated { revision: 1 },
+            "SetGrant bumps only the revision",
+        );
+
+        let after = fleet.view().await.unwrap();
+        assert_eq!(after.revision, 1, "revision bumped");
+        assert_eq!(
+            after.generation, 0,
+            "SetGrant must NOT bump the generation (no replan blast)",
+        );
+        let a = after.tasks.iter().find(|t| t.task_id == "a").unwrap();
+        assert_eq!(a.status, ChildStatus::Ready, "Blocked → Ready");
+        assert_eq!(a.grant, wider, "the widened grant is applied");
+        assert!(
+            a.pending_escalation.is_none(),
+            "the escalation is cleared on apply",
+        );
+        // `b` is untouched (no blast radius): still Ready, still minimal.
+        let b = after.tasks.iter().find(|t| t.task_id == "b").unwrap();
+        assert_eq!(b.status, ChildStatus::Ready);
+        assert_eq!(b.grant, WorkerGrant::minimal());
+        // The resumed task is launchable again.
+        assert!(
+            fleet
+                .ready_tasks(9)
+                .await
+                .unwrap()
+                .contains(&"a".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn blocked_child_keeps_goal_active() {
+        let (_d, store) = fresh().await;
+        let fleet = Fleet::create(
+            store.clone(),
+            "f1",
+            controller(),
+            None,
+            "default",
+            budget(10_000),
+            "obj",
+            vec![spec("a", &[])],
+            0,
+        )
+        .await
+        .unwrap();
+        escalate_child(&fleet, "a", 1).await;
+        // A Blocked (non-terminal, unaccepted) child holds completion open: the
+        // goal stays ACTIVE while it waits on the operator.
+        assert!(
+            !fleet.is_complete().await.unwrap(),
+            "a Blocked child must keep the fleet incomplete (goal stays active)",
+        );
+        let s = fleet.summary().await.unwrap();
+        assert_eq!(s.blocked, 1, "the summary counts the blocked child");
+        assert_eq!(s.succeeded, 0);
+    }
+
+    #[tokio::test]
+    async fn deny_moves_blocked_to_failed_terminal() {
+        let (_d, store) = fresh().await;
+        let fleet = Fleet::create(
+            store.clone(),
+            "f1",
+            controller(),
+            None,
+            "default",
+            budget(10_000),
+            "obj",
+            vec![spec("a", &[])],
+            0,
+        )
+        .await
+        .unwrap();
+        escalate_child(&fleet, "a", 1).await;
+
+        // Deny: the child must go Blocked → Failed (TERMINAL), else it wedges
+        // the fleet forever (is_complete never trips on a non-terminal child).
+        let out = store
+            .deny_escalation("f1", "a", "no budget for that host", 9)
+            .await
+            .unwrap();
+        assert_eq!(out.settled, CompleteOutcome::Completed);
+        // codex round-4 (defect 2): the deny txn ITSELF reports the fleet is now
+        // un-completable (a Failed task strands it) so the keeper resolves the
+        // goal without a separate read.
+        assert!(
+            out.fleet_un_completable,
+            "denying the only task makes the fleet un-completable",
+        );
+
+        let v = fleet.view().await.unwrap();
+        let a = v.tasks.iter().find(|t| t.task_id == "a").unwrap();
+        assert_eq!(a.status, ChildStatus::Failed, "denial is terminal");
+        assert!(a.status.is_terminal(), "a denied child is terminal");
+        assert!(matches!(
+            a.verdict,
+            Some(AcceptanceVerdict::Rejected { .. })
+        ));
+        assert!(a.pending_escalation.is_none(), "escalation cleared on deny");
+        // A denied child is not launchable — the fleet doesn't wedge on it.
+        assert!(fleet.ready_tasks(9).await.unwrap().is_empty());
+
+        // A second deny is an inert no-op (the child already resumed/failed) — and
+        // a no-op reports no completability change.
+        let again = store.deny_escalation("f1", "a", "again", 10).await.unwrap();
+        assert_eq!(again.settled, CompleteOutcome::Superseded);
+        assert!(
+            !again.fleet_un_completable,
+            "a no-op deny reports fleet_un_completable = false (nothing changed)",
+        );
+    }
+
+    #[tokio::test]
+    async fn deny_reports_un_completable_over_a_multi_task_plan() {
+        // codex round-4 (defect 2): the completability the deny txn RETURNS is
+        // computed by SCANNING the plan's children — not just the denied one. A
+        // two-task fleet (`b` depends on `a`): denying the escalated `a` makes the
+        // fleet un-completable (a Failed task PLUS a still-Planned task), and the
+        // scan reads BOTH children — `a` from the txn-local record it just wrote,
+        // `b` from the children table.
+        let (_d, store) = fresh().await;
+        let fleet = Fleet::create(
+            store.clone(),
+            "f1",
+            controller(),
+            None,
+            "default",
+            budget(10_000),
+            "obj",
+            vec![spec("a", &[]), spec("b", &["a"])],
+            0,
+        )
+        .await
+        .unwrap();
+        escalate_child(&fleet, "a", 1).await;
+
+        let out = store.deny_escalation("f1", "a", "no", 9).await.unwrap();
+        assert_eq!(out.settled, CompleteOutcome::Completed);
+        assert!(
+            out.fleet_un_completable,
+            "denying `a` strands dependent `b` — the scanned plan is un-completable",
+        );
+        // `b` never became Ready (its prerequisite failed), so the fleet is wedged
+        // absent a replan — exactly what the returned flag tells the keeper.
+        assert!(fleet.ready_tasks(9).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn deny_emits_a_childdone_wake_and_bumps_revision() {
+        // codex round-2 (defect 3+4): deny must EMIT a ChildDone wake (so the
+        // keeper re-evaluates instead of the goal wedging active) AND bump the
+        // plan revision (so a concurrent grant@N fails its CAS).
+        let (_d, store) = fresh().await;
+        let fleet = Fleet::create(
+            store.clone(),
+            "f1",
+            controller(),
+            None,
+            "default",
+            budget(10_000),
+            "obj",
+            vec![spec("a", &[])],
+            0,
+        )
+        .await
+        .unwrap();
+        escalate_child(&fleet, "a", 1).await;
+        let rev_before = fleet.view().await.unwrap().revision;
+
+        store.deny_escalation("f1", "a", "no", 9).await.unwrap();
+
+        // The plan revision advanced (mutual exclusion with a racing grant).
+        assert_eq!(
+            fleet.view().await.unwrap().revision,
+            rev_before + 1,
+            "deny bumps the plan revision",
+        );
+        // At least two ChildDone events exist (one from the escalation, one from
+        // the deny) — the deny wake is what re-drives the keeper.
+        let mut child_done = 0;
+        for _ in 0..8 {
+            match store.claim_next("k", 0, 100).await.unwrap() {
+                Some(ev) if ev.kind == crate::records::FleetEventKind::ChildDone => child_done += 1,
+                Some(_) => {}
+                None => break,
+            }
+        }
+        assert!(
+            child_done >= 2,
+            "deny must emit a ChildDone wake (saw {child_done} total)",
+        );
+    }
+
+    #[tokio::test]
+    async fn grant_after_deny_is_rejected_not_applied() {
+        // codex round-2 (defect 4): grant and deny are MUTUALLY EXCLUSIVE. Once
+        // deny fails the child, a grant (even one that read `Blocked`) must be
+        // REFUSED — the denied capability can never reach the plan.
+        let (_d, store) = fresh().await;
+        let fleet = Fleet::create(
+            store.clone(),
+            "f1",
+            controller(),
+            None,
+            "default",
+            budget(10_000),
+            "obj",
+            vec![spec("a", &[])],
+            0,
+        )
+        .await
+        .unwrap();
+        escalate_child(&fleet, "a", 1).await;
+        // Deny wins: Blocked → Failed + revision bump (0 → 1).
+        store.deny_escalation("f1", "a", "no", 2).await.unwrap();
+
+        let wider = WorkerGrant {
+            network: crate::grant::NetworkGrant::Hosts(vec!["example.com".into()]),
+            tools: vec!["read_file".into(), "web_fetch".into()],
+            ..WorkerGrant::minimal()
+        };
+        // A grant at the NEW revision (child now Failed, not Blocked) → the in-txn
+        // Blocked CAS refuses it (RejectedNotBlocked), no mutation.
+        let rev = fleet.view().await.unwrap().revision;
+        let refused = fleet
+            .apply_edit(
+                PlanEdit::SetGrant {
+                    task_id: "a".into(),
+                    grant: wider.clone(),
+                },
+                rev,
+                3,
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(refused, PlanMutateOutcome::RejectedNotBlocked { .. }),
+            "grant on a non-Blocked (denied) child must be refused: {refused:?}",
+        );
+        // A grant at the STALE (pre-deny) revision → RevisionMismatch (belt).
+        let stale = fleet
+            .apply_edit(
+                PlanEdit::SetGrant {
+                    task_id: "a".into(),
+                    grant: wider.clone(),
+                },
+                0,
+                4,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(stale, PlanMutateOutcome::RevisionMismatch { .. }));
+        // The denied capability was NEVER applied — the task keeps its minimal
+        // grant and stays terminally Failed.
+        let v = fleet.view().await.unwrap();
+        let a = v.tasks.iter().find(|t| t.task_id == "a").unwrap();
+        assert_eq!(a.status, ChildStatus::Failed);
+        assert_eq!(
+            a.grant,
+            WorkerGrant::minimal(),
+            "the denied grant must never be applied",
+        );
+    }
+
+    #[tokio::test]
+    async fn replan_clears_a_blocked_survivors_pending_escalation() {
+        // codex round-2 (defect 4): a replan that re-readies a Blocked survivor
+        // MUST clear its stale `pending_escalation` — the advisory grant may name
+        // capabilities the operator never approved.
+        let (_d, store) = fresh().await;
+        let fleet = Fleet::create(
+            store.clone(),
+            "f1",
+            controller(),
+            None,
+            "default",
+            budget(10_000),
+            "obj",
+            vec![spec("a", &[])],
+            0,
+        )
+        .await
+        .unwrap();
+        escalate_child(&fleet, "a", 1).await;
+        assert!(
+            fleet
+                .view()
+                .await
+                .unwrap()
+                .tasks
+                .iter()
+                .find(|t| t.task_id == "a")
+                .unwrap()
+                .pending_escalation
+                .is_some(),
+        );
+
+        // A structural replan (AddTask) resets the Blocked survivor.
+        fleet
+            .apply_edit(PlanEdit::AddTask(spec("b", &[])), 0, 5)
+            .await
+            .unwrap();
+        let v = fleet.view().await.unwrap();
+        let a = v.tasks.iter().find(|t| t.task_id == "a").unwrap();
+        assert!(
+            a.pending_escalation.is_none(),
+            "replan must clear the stale escalation on a re-readied Blocked child",
+        );
+        assert_eq!(
+            a.status,
+            ChildStatus::Ready,
+            "the Blocked survivor is re-readied by the replan",
+        );
     }
 
     #[tokio::test]
@@ -1594,12 +2101,18 @@ mod tests {
                 path: "out.txt".into(),
             },
         }];
+        let granted = WorkerGrant {
+            network: crate::grant::NetworkGrant::Hosts(vec!["example.com".into()]),
+            tools: vec!["read_file".into(), "write_file".into(), "web_fetch".into()],
+            fs: crate::grant::FsGrant::default(),
+        };
         let task = TaskSpec {
             task_id: "a".into(),
             title: "Build".into(),
             detail: "make out.txt".into(),
             deps: vec![],
             acceptance: acceptance.clone(),
+            grant: granted.clone(),
         };
         let fleet = Fleet::create(
             store.clone(),
@@ -1622,6 +2135,10 @@ mod tests {
         assert_eq!(tv.title, "Build");
         assert_eq!(tv.detail, "make out.txt");
         assert_eq!(tv.acceptance.len(), 1);
+        assert_eq!(
+            tv.grant, granted,
+            "the operator grant is projected from the plan into the view (PR A)"
+        );
         assert_eq!(tv.status, ChildStatus::Ready);
         assert!(tv.verdict.is_none());
         assert!(tv.evidence.is_empty());
@@ -2108,10 +2625,11 @@ mod tests {
         assert!(store.get_fleet("f1").await.unwrap().is_none());
     }
 
-    /// P2-b: records are stamped at schema_version 2 (so a PR-1 binary drops
-    /// them via the higher-version guard rather than mis-parsing).
+    /// P2-b: records are stamped at the CURRENT [`SCHEMA_VERSION`] (so an older
+    /// binary drops them via the higher-version guard rather than mis-parsing).
+    /// PR B bumped 2 → 3 for the `ChildStatus::Blocked` variant.
     #[tokio::test]
-    async fn records_are_written_at_schema_version_two() {
+    async fn records_are_written_at_current_schema_version() {
         let (_d, store) = fresh().await;
         Fleet::create(
             store.clone(),
@@ -2126,10 +2644,10 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(SCHEMA_VERSION, 2);
+        assert_eq!(SCHEMA_VERSION, 3);
         assert_eq!(
             store.get_plan("f1").await.unwrap().unwrap().schema_version,
-            2
+            SCHEMA_VERSION,
         );
         assert_eq!(
             store
@@ -2138,7 +2656,7 @@ mod tests {
                 .unwrap()
                 .unwrap()
                 .schema_version,
-            2
+            SCHEMA_VERSION,
         );
     }
 

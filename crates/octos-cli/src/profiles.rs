@@ -14,6 +14,134 @@ use serde::{Deserialize, Deserializer, Serialize};
 use crate::config::{ChannelEntry, CloudTtsConfig, Config, FallbackModel, GatewayConfig};
 
 pub const MAX_SUB_ACCOUNTS_PER_PARENT: usize = 10;
+pub(crate) const HOST_ASR_LANGUAGE_ENV: &str = "OCTOS_HOST_ASR_LANGUAGE";
+
+pub const SUPPORTED_ASR_LANGUAGES: &[&str] = &[
+    "Chinese",
+    "English",
+    "Cantonese",
+    "Arabic",
+    "German",
+    "French",
+    "Spanish",
+    "Portuguese",
+    "Indonesian",
+    "Italian",
+    "Korean",
+    "Russian",
+    "Thai",
+    "Vietnamese",
+    "Japanese",
+    "Turkish",
+    "Hindi",
+    "Malay",
+    "Dutch",
+    "Swedish",
+    "Danish",
+    "Finnish",
+    "Polish",
+    "Czech",
+    "Filipino",
+    "Persian",
+    "Greek",
+    "Romanian",
+    "Hungarian",
+    "Macedonian",
+];
+
+pub fn canonical_asr_language(language: &str) -> Option<&'static str> {
+    let requested = language.trim();
+    match requested.to_ascii_lowercase().as_str() {
+        "auto" => return Some("auto"),
+        "zh" | "zh-cn" | "zh-hans" => return Some("Chinese"),
+        "en" | "en-us" | "en-gb" => return Some("English"),
+        _ => {}
+    }
+    SUPPORTED_ASR_LANGUAGES
+        .iter()
+        .copied()
+        .find(|supported| supported.eq_ignore_ascii_case(requested))
+}
+
+/// Resolve the optional language hint sent to ASR. A per-profile setting wins
+/// over the serve-level default. `None` and `auto` preserve auto-detection;
+/// legacy ISO-style aliases are canonicalized. Unknown inherited values are
+/// passed through unchanged for backward compatibility with custom engines.
+pub fn effective_asr_language(
+    profile_override: Option<&str>,
+    serve_default: Option<&str>,
+) -> Option<String> {
+    let selected = profile_override.or(serve_default)?.trim();
+    if selected.eq_ignore_ascii_case("auto") {
+        return None;
+    }
+
+    Some(
+        canonical_asr_language(selected)
+            .unwrap_or(selected)
+            .to_string(),
+    )
+}
+
+/// Resolve the effective ASR language for a profile from durable storage.
+/// Reading the store on each call is intentional: a Settings save must affect
+/// the next AppUI or gateway utterance without restarting the process.
+pub fn effective_profile_asr_language(
+    profile_store: Option<&ProfileStore>,
+    profile_id: Option<&str>,
+    serve_default: Option<&str>,
+) -> Result<Option<String>> {
+    let profile_override = match (profile_store, profile_id) {
+        (Some(_), Some(profile_id)) if profile_id == octos_core::MAIN_PROFILE_ID => None,
+        (Some(store), Some(profile_id)) => {
+            let profile = store
+                .get(profile_id)?
+                .ok_or_else(|| eyre::eyre!("profile '{profile_id}' not found"))?;
+            let profile = store.resolve_runtime_profile(&profile);
+            profile.config.asr_language
+        }
+        _ => None,
+    };
+
+    Ok(effective_asr_language(
+        profile_override.as_deref(),
+        serve_default,
+    ))
+}
+
+fn deserialize_profile_asr_language<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Option::<String>::deserialize(deserializer)?;
+    value
+        .map(|language| {
+            canonical_asr_language(&language)
+                .map(ToOwned::to_owned)
+                .ok_or_else(|| {
+                    serde::de::Error::custom(format!("unsupported ASR language '{language}'"))
+                })
+        })
+        .transpose()
+}
+
+fn deserialize_profile_asr_language_patch<'de, D>(
+    deserializer: D,
+) -> std::result::Result<PatchField<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    match Option::<String>::deserialize(deserializer)? {
+        None => Ok(PatchField::Clear),
+        Some(language) => canonical_asr_language(&language)
+            .map(|canonical| PatchField::Value(canonical.to_string()))
+            .ok_or_else(|| {
+                serde::de::Error::custom(format!("unsupported ASR language '{language}'"))
+            }),
+    }
+}
 
 /// A user profile with all configuration needed to run a gateway.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -80,6 +208,15 @@ pub struct ProfileConfig {
     /// `env_vars["VOLC_TTS_TOKEN"]`. `None` → inherit serve / env defaults.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tts_cloud: Option<CloudTtsConfig>,
+    /// Per-profile ASR language override. `None` inherits the serve-level voice
+    /// setting, `"auto"` explicitly enables auto-detection, and named values
+    /// are canonical Qwen3-ASR language names.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_profile_asr_language"
+    )]
+    pub asr_language: Option<String>,
     /// Coding review specialist template. When omitted, `/review`
     /// uses the server's built-in default specialists. Operators may
     /// configure this per profile to change the native reviewer fanout
@@ -599,6 +736,8 @@ pub struct ProfileConfigPatch {
     pub email: PatchField<EmailSettings>,
     #[serde(default)]
     pub smart_home: PatchField<SmartHomeConfig>,
+    #[serde(default, deserialize_with = "deserialize_profile_asr_language_patch")]
+    pub asr_language: PatchField<String>,
     #[serde(default)]
     pub env_vars: Option<HashMap<String, String>>,
     #[serde(default)]
@@ -888,6 +1027,11 @@ impl ProfileConfig {
             PatchField::Absent => {}
             PatchField::Clear => self.smart_home = None,
             PatchField::Value(smart_home) => self.smart_home = Some(smart_home),
+        }
+        match patch.asr_language {
+            PatchField::Absent => {}
+            PatchField::Clear => self.asr_language = None,
+            PatchField::Value(asr_language) => self.asr_language = Some(asr_language),
         }
         if let Some(env_vars) = patch.env_vars {
             self.env_vars = env_vars;
@@ -6308,5 +6452,153 @@ mod tests {
             resolved.config.hooks[0].command,
             vec!["default-hook".to_string()]
         );
+    }
+
+    #[test]
+    fn should_roundtrip_canonical_asr_language_on_profile_config() {
+        let cfg: ProfileConfig = serde_json::from_str(r#"{ "asr_language": "chinese" }"#).unwrap();
+        assert_eq!(cfg.asr_language.as_deref(), Some("Chinese"));
+        assert_eq!(
+            serde_json::to_value(&cfg).unwrap()["asr_language"],
+            "Chinese"
+        );
+    }
+
+    #[test]
+    fn should_inherit_asr_language_when_absent_or_null() {
+        let absent: ProfileConfig = serde_json::from_str("{}").unwrap();
+        let null: ProfileConfig = serde_json::from_str(r#"{ "asr_language": null }"#).unwrap();
+        assert!(absent.asr_language.is_none());
+        assert!(null.asr_language.is_none());
+    }
+
+    #[test]
+    fn should_roundtrip_auto_as_profile_asr_language() {
+        let cfg: ProfileConfig = serde_json::from_str(r#"{ "asr_language": "AUTO" }"#).unwrap();
+        assert_eq!(cfg.asr_language.as_deref(), Some("auto"));
+        assert_eq!(serde_json::to_value(&cfg).unwrap()["asr_language"], "auto");
+    }
+
+    #[test]
+    fn should_patch_canonical_auto_and_clear_profile_asr_language() {
+        let mut config = ProfileConfig::default();
+        let patch: ProfileConfigPatch =
+            serde_json::from_str(r#"{ "asr_language": "french" }"#).unwrap();
+        config.apply_patch(patch);
+        assert_eq!(config.asr_language.as_deref(), Some("French"));
+
+        let patch: ProfileConfigPatch =
+            serde_json::from_str(r#"{ "asr_language": "AUTO" }"#).unwrap();
+        config.apply_patch(patch);
+        assert_eq!(config.asr_language.as_deref(), Some("auto"));
+
+        let patch: ProfileConfigPatch =
+            serde_json::from_str(r#"{ "asr_language": null }"#).unwrap();
+        config.apply_patch(patch);
+        assert!(config.asr_language.is_none());
+    }
+
+    #[test]
+    fn should_prefer_profile_asr_language_over_serve_default() {
+        assert_eq!(
+            effective_asr_language(Some("English"), Some("zh")),
+            Some("English".to_string())
+        );
+    }
+
+    #[test]
+    fn should_preserve_auto_none_and_unknown_inherited_asr_semantics() {
+        assert_eq!(
+            effective_asr_language(None, Some("zh")),
+            Some("Chinese".to_string())
+        );
+        assert_eq!(
+            effective_asr_language(None, Some("en-US")),
+            Some("English".to_string())
+        );
+        assert_eq!(effective_asr_language(None, Some("auto")), None);
+        assert_eq!(effective_asr_language(None, None), None);
+        assert_eq!(
+            effective_asr_language(None, Some("legacy-custom-language")),
+            Some("legacy-custom-language".to_string())
+        );
+        assert_eq!(effective_asr_language(Some("auto"), Some("Chinese")), None);
+    }
+
+    #[test]
+    fn should_reload_profile_asr_language_from_disk_and_isolate_profiles() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ProfileStore::open_unified(dir.path()).unwrap();
+        let now = chrono::Utc::now();
+        let mut alpha = UserProfile {
+            id: "alpha".into(),
+            name: "Alpha".into(),
+            enabled: true,
+            data_dir: None,
+            parent_id: None,
+            public_subdomain: None,
+            config: ProfileConfig {
+                asr_language: Some("English".into()),
+                ..Default::default()
+            },
+            created_at: now,
+            updated_at: now,
+        };
+        let beta = UserProfile {
+            id: "beta".into(),
+            name: "Beta".into(),
+            config: ProfileConfig {
+                asr_language: Some("Japanese".into()),
+                ..Default::default()
+            },
+            ..alpha.clone()
+        };
+        store.save(&alpha).unwrap();
+        store.save(&beta).unwrap();
+
+        assert_eq!(
+            effective_profile_asr_language(Some(&store), Some("alpha"), Some("Chinese")).unwrap(),
+            Some("English".to_string())
+        );
+        assert_eq!(
+            effective_profile_asr_language(Some(&store), Some("beta"), Some("Chinese")).unwrap(),
+            Some("Japanese".to_string())
+        );
+
+        alpha.config.asr_language = Some("French".into());
+        store.save(&alpha).unwrap();
+        assert_eq!(
+            effective_profile_asr_language(Some(&store), Some("alpha"), Some("Chinese")).unwrap(),
+            Some("French".to_string())
+        );
+        assert_eq!(
+            effective_profile_asr_language(Some(&store), Some("beta"), Some("Chinese")).unwrap(),
+            Some("Japanese".to_string())
+        );
+    }
+
+    #[test]
+    fn should_report_missing_and_malformed_profiles_when_resolving_asr_language() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ProfileStore::open_unified(dir.path()).unwrap();
+
+        assert_eq!(
+            effective_profile_asr_language(
+                Some(&store),
+                Some(octos_core::MAIN_PROFILE_ID),
+                Some("English"),
+            )
+            .unwrap(),
+            Some("English".to_string())
+        );
+
+        let missing =
+            effective_profile_asr_language(Some(&store), Some("missing"), None).unwrap_err();
+        assert!(missing.to_string().contains("not found"));
+
+        std::fs::write(store.profile_path("broken"), "{not json").unwrap();
+        let malformed =
+            effective_profile_asr_language(Some(&store), Some("broken"), None).unwrap_err();
+        assert!(malformed.to_string().contains("failed to parse profile"));
     }
 }
