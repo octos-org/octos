@@ -25803,116 +25803,82 @@ fn stage_peer_reserves_slug_writes_brief_and_releases_on_failure() {
     );
 }
 
-/// Rolling back ONE peer must never touch a SIBLING's worktree fence.
+/// Rolling back ONE peer must never touch a SIBLING's fence.
 ///
-/// `cleanup_staged_peer` used to run a repo-GLOBAL `git worktree prune`, which
-/// deletes the admin entry of EVERY worktree whose checkout is missing — not
-/// just the one being rolled back. `git worktree add` creates the admin entry
-/// BEFORE the checkout is fully in place, so a sibling staged concurrently was
-/// visible to prune in exactly that window and lost its fence: its branch was
-/// left checked-out-nowhere and the peer ran in a broken worktree. Every peer
-/// checkout is named `wt` (`peers/<slug>/wt`), so git disambiguates the admin
-/// dirs as `wt`, `wt1`, … — which is why this surfaced as "the SECOND peer's
-/// worktree disappeared".
+/// HISTORY: `cleanup_staged_peer` used to run a repo-GLOBAL
+/// `git worktree prune`, which deletes the admin entry of EVERY worktree whose
+/// checkout is momentarily missing — and `git worktree add` registers that entry
+/// BEFORE the checkout exists, so a sibling staged concurrently sat in exactly
+/// that window and lost its fence. Every peer checkout was named `wt`, so git
+/// disambiguated the admin dirs as `wt`, `wt1`, … and it surfaced as "the SECOND
+/// peer's worktree disappeared".
 ///
-/// The window is a race, but its consequence is deterministic: a peer whose
-/// checkout is absent when a sibling cleans up must survive. That is what this
-/// asserts — hiding the checkout stands in for "mid-`worktree add`".
+/// Peers are now staged as CLONES, which removes the shared `.git` that bug
+/// lived in — so this can no longer assert on `git worktree list` (a clone is
+/// not registered in the parent at all). The INVARIANT is unchanged and still
+/// worth pinning: tearing down one peer must leave a sibling fully usable.
 #[test]
-fn cleanup_of_one_peer_must_not_destroy_a_sibling_worktree() {
-    fn git(dir: &std::path::Path, args: &[&str]) -> String {
-        let out = std::process::Command::new("git")
+fn cleanup_of_one_peer_must_not_destroy_a_sibling_fence() {
+    fn git(dir: &std::path::Path, args: &[&str]) -> std::process::Output {
+        std::process::Command::new("git")
             .arg("-C")
             .arg(dir)
             .args(args)
             .output()
-            .unwrap();
-        assert!(
-            out.status.success(),
-            "git {args:?}: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-        String::from_utf8_lossy(&out.stdout).into_owned()
+            .unwrap()
     }
 
     let tmp = tempfile::tempdir().unwrap();
     let peers = tmp.path().join("peers");
     let repo = tmp.path().join("project");
     std::fs::create_dir_all(&repo).unwrap();
-    git(&repo, &["init", "-q"]);
-    git(
-        &repo,
-        &[
-            "-c",
-            "user.email=t@t",
-            "-c",
-            "user.name=t",
-            "commit",
-            "--allow-empty",
-            "-m",
-            "init",
-        ],
+    assert!(git(&repo, &["init", "-q"]).status.success());
+    assert!(
+        git(&repo, &["config", "user.email", "t@t"])
+            .status
+            .success()
+    );
+    assert!(
+        git(&repo, &["config", "user.name", "ymote"])
+            .status
+            .success()
+    );
+    assert!(
+        git(&repo, &["commit", "--allow-empty", "-q", "-m", "init"])
+            .status
+            .success()
     );
 
-    // The SURVIVOR: a fully staged, fenced peer.
     let keeper = stage_peer(&peers, &repo, "Keeper", None, None, "Stay.", true)
         .expect("sibling staging must succeed");
-    assert!(keeper.cwd.join(".git").exists(), "sibling fence is real");
-
-    // A second peer, so the admin dirs actually collide on basename `wt`
-    // (`wt` and `wt1`) exactly as they do in production.
     let doomed =
         stage_peer(&peers, &repo, "Doomed", None, None, "Rolled back.", true).expect("staging");
-
-    // Stand in for "sibling is mid-`worktree add`": its admin entry exists but
-    // its checkout is not on disk yet.
-    let hidden = tmp.path().join("keeper-checkout-parked");
-    std::fs::rename(&keeper.cwd, &hidden).unwrap();
 
     // Roll back ONLY the doomed peer.
     cleanup_staged_peer(&repo, &doomed.slug, &peers.join(&doomed.slug));
 
-    std::fs::rename(&hidden, &keeper.cwd).unwrap();
-
-    // The rollback must have removed its OWN fence…
-    let listed = git(&repo, &["worktree", "list"]);
     assert!(
-        !listed.contains("peers/doomed"),
-        "the rolled-back peer's worktree must be gone, got:\n{listed}"
-    );
-    assert!(
-        !peers.join("doomed").exists(),
+        !peers.join(&doomed.slug).exists(),
         "the rolled-back peer's dir must be gone"
     );
 
-    // …and left the SIBLING's fence completely intact.
+    // The sibling must still be a USABLE git repo on its own fence branch.
+    // Checking the directory still exists is not enough — a half-torn-down
+    // fence looks identical on disk until git is asked to resolve it.
     assert!(
-        listed.contains(&keeper.cwd.to_string_lossy().into_owned())
-            || listed.contains("peers/keeper"),
-        "a sibling's worktree must survive another peer's rollback, got:\n{listed}"
+        keeper.cwd.join(".git").is_dir(),
+        "the sibling's fence must survive intact"
     );
+    let head = git(&keeper.cwd, &["rev-parse", "--abbrev-ref", "HEAD"]);
     assert!(
-        keeper.cwd.join(".git").exists(),
-        "sibling checkout must still be a live worktree"
-    );
-    // The decisive check: git must still resolve the sibling's worktree. A
-    // pruned admin entry leaves the checkout on disk but orphaned, so this is
-    // what actually distinguishes "survived" from "looks like it survived".
-    let out = std::process::Command::new("git")
-        .arg("-C")
-        .arg(&keeper.cwd)
-        .args(["rev-parse", "--abbrev-ref", "HEAD"])
-        .output()
-        .unwrap();
-    assert!(
-        out.status.success(),
-        "sibling worktree must still be usable by git: {}",
-        String::from_utf8_lossy(&out.stderr)
+        head.status.success(),
+        "the sibling must still be usable by git: {}",
+        String::from_utf8_lossy(&head.stderr)
     );
     assert_eq!(
-        String::from_utf8_lossy(&out.stdout).trim(),
+        String::from_utf8_lossy(&head.stdout).trim(),
         "peer/keeper",
-        "sibling must still be on its own fence branch"
+        "the sibling must still be on its own fence branch"
     );
 }
 
@@ -26558,6 +26524,127 @@ fn unsafe_peer_topic_slug_is_treated_as_non_peer() {
         peer_wire_registry().resolve(&peer_wire_key("dev", "/tmp/x")),
         None,
         "an unsafe peer topic must not register a wire key"
+    );
+}
+
+/// A worktree peer's git state must live INSIDE its own workspace, so git
+/// actually works there.
+///
+/// Regression guard for the bug that made worktree peers useless. They were
+/// staged with `git worktree add`, whose `.git` is a FILE pointing at
+/// `<repo>/.git/worktrees/<name>` — OUTSIDE the peer's sandboxed workspace. The
+/// sandbox confines a peer to `peers/<slug>/wt`, so every git command failed:
+///
+/// ```text
+/// fatal: not a git repository: .../work/.git/worktrees/wt      Exit code: 128
+/// ```
+///
+/// The model then "recovered" by running `git init`, destroying the fence, and
+/// the branch stayed at the seed commit — a worktree peer produced a branch and
+/// never landed anything on it. Live-observed on BOTH peers of a two-peer run.
+///
+/// The old tests could not catch this: they asserted the fence was CREATED,
+/// never that a peer could USE it. So this asserts the property the sandbox
+/// actually needs — the RESOLVED git dir is contained in the peer's own
+/// workspace — plus a real commit and a collection round-trip.
+#[test]
+fn peer_fence_git_dir_is_inside_the_peer_workspace() {
+    fn git(dir: &std::path::Path, args: &[&str]) -> std::process::Output {
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .output()
+            .unwrap()
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let peers = tmp.path().join("peers");
+    let repo = tmp.path().join("project");
+    std::fs::create_dir_all(&repo).unwrap();
+    assert!(git(&repo, &["init", "-q"]).status.success());
+    assert!(
+        git(&repo, &["config", "user.email", "t@t"])
+            .status
+            .success()
+    );
+    assert!(
+        git(&repo, &["config", "user.name", "ymote"])
+            .status
+            .success()
+    );
+    std::fs::write(repo.join("seed.txt"), b"seed\n").unwrap();
+    assert!(git(&repo, &["add", "-A"]).status.success());
+    assert!(git(&repo, &["commit", "-q", "-m", "seed"]).status.success());
+
+    let staged =
+        stage_peer(&peers, &repo, "Fenced", None, None, "Own fence.", true).expect("staging");
+    let cwd = &staged.cwd;
+
+    // THE fix: `.git` is a real directory in the peer's workspace, not a file
+    // redirecting outside it.
+    assert!(
+        cwd.join(".git").is_dir(),
+        "the peer's .git must be a real directory inside its workspace, not a \
+         worktree pointer file to the parent repo"
+    );
+
+    // The property the sandbox needs: the RESOLVED git dir is contained in the
+    // peer's own workspace, so confining the peer to `cwd` cannot break git.
+    let out = git(cwd, &["rev-parse", "--absolute-git-dir"]);
+    assert!(out.status.success(), "git must work inside the peer fence");
+    let git_dir = std::path::PathBuf::from(String::from_utf8_lossy(&out.stdout).trim().to_owned());
+    let contained = std::fs::canonicalize(&git_dir)
+        .unwrap_or_else(|_| git_dir.clone())
+        .starts_with(std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.clone()));
+    assert!(
+        contained,
+        "the peer's git dir must resolve INSIDE its workspace, got {}",
+        git_dir.display()
+    );
+
+    // On its own fence branch...
+    let head = git(cwd, &["rev-parse", "--abbrev-ref", "HEAD"]);
+    assert_eq!(
+        String::from_utf8_lossy(&head.stdout).trim(),
+        "peer/fenced",
+        "the peer must start on its own fence branch"
+    );
+
+    // ...and able to actually commit. A clone does NOT inherit the source's
+    // LOCAL config, so this also covers the carried-over commit identity —
+    // without it every peer commit fails on "unable to auto-detect email".
+    std::fs::write(cwd.join("work.txt"), b"peer output\n").unwrap();
+    assert!(git(cwd, &["add", "-A"]).status.success());
+    let commit = git(cwd, &["commit", "-q", "-m", "peer deliverable"]);
+    assert!(
+        commit.status.success(),
+        "a peer must be able to commit inside its fence: {}",
+        String::from_utf8_lossy(&commit.stderr)
+    );
+
+    // The commit is NOT in the workspace repo yet — it lives in the peer's
+    // clone until collection.
+    assert!(
+        !git(&repo, &["rev-parse", "--verify", "-q", "peer/fenced"])
+            .status
+            .success(),
+        "the fence branch must not appear in the workspace before collection"
+    );
+
+    // Collection pulls it back, so the deliverable is visible from the workspace.
+    collect_peer_branch(&peers.join(&staged.slug), &staged.slug);
+    assert!(
+        git(&repo, &["rev-parse", "--verify", "-q", "peer/fenced"])
+            .status
+            .success(),
+        "collect_peer_branch must land the fence branch in the workspace repo"
+    );
+    let subject = git(&repo, &["log", "-1", "--format=%s", "peer/fenced"]);
+    assert_eq!(
+        String::from_utf8_lossy(&subject.stdout).trim(),
+        "peer deliverable",
+        "the collected branch must carry the peer's commit"
     );
 }
 
