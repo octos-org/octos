@@ -1341,7 +1341,27 @@ async fn run_prompt_turn(
                         .iter()
                         .find(|m| matches!(m.role, octos_core::MessageRole::User))
                         .and_then(|m| m.thread_id.clone().or_else(|| m.client_message_id.clone()))
-                        .unwrap_or_else(|| uuid::Uuid::now_v7().to_string());
+                        .unwrap_or_else(|| {
+                            // No user row to inherit from, so there is nothing to
+                            // stamp these rows onto. Minting an id keeps the write
+                            // fail-OPEN rather than dropping the turn, but it
+                            // creates exactly the orphan the store's fail-closed
+                            // check exists to prevent: assistant/tool rows in a
+                            // thread containing no user message. Expected to be
+                            // unreachable — say so out loud rather than silently
+                            // converting "we do not know the thread" into
+                            // "invent one", which is what made the original
+                            // thread-id bug so expensive to find.
+                            let minted = uuid::Uuid::now_v7().to_string();
+                            tracing::warn!(
+                                thread_id = %minted,
+                                rows = fresh.len(),
+                                "ACP turn produced no user row; persisting its \
+                                 messages under a MINTED thread id — they will \
+                                 load as a thread with no user message"
+                            );
+                            minted
+                        });
 
                     let mut guard = store.lock().await;
                     for mut message in fresh {
