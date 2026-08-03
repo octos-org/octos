@@ -26648,6 +26648,87 @@ fn peer_fence_git_dir_is_inside_the_peer_workspace() {
     );
 }
 
+/// Collecting a peer's fence must be idempotent and must not require a close.
+///
+/// `collect_peer_branch` originally ran ONLY on `peer_close`, so a peer that
+/// simply finished — the common case — kept its deliverable stranded in its own
+/// clone: committed, intact, and invisible from the workspace. A live soak showed
+/// exactly that split, with the closed peer's branch landing and the un-closed
+/// peer's not, despite both having committed. It now runs after every peer turn,
+/// which means it must survive being called repeatedly.
+#[test]
+fn collecting_a_peer_fence_is_repeatable_and_tracks_new_commits() {
+    fn git(dir: &std::path::Path, args: &[&str]) -> std::process::Output {
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .output()
+            .unwrap()
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let peers = tmp.path().join("peers");
+    let repo = tmp.path().join("project");
+    std::fs::create_dir_all(&repo).unwrap();
+    assert!(git(&repo, &["init", "-q"]).status.success());
+    assert!(
+        git(&repo, &["config", "user.email", "t@t"])
+            .status
+            .success()
+    );
+    assert!(
+        git(&repo, &["config", "user.name", "ymote"])
+            .status
+            .success()
+    );
+    assert!(
+        git(&repo, &["commit", "--allow-empty", "-q", "-m", "seed"])
+            .status
+            .success()
+    );
+
+    let staged =
+        stage_peer(&peers, &repo, "Turnwise", None, None, "Commit twice.", true).expect("staging");
+    let dir = peers.join(&staged.slug);
+
+    // Nothing committed yet: collecting must be a harmless no-op, not an error
+    // and not a spurious branch.
+    collect_peer_branch(&dir, &staged.slug);
+
+    // Turn 1.
+    std::fs::write(staged.cwd.join("a.txt"), b"one\n").unwrap();
+    assert!(git(&staged.cwd, &["add", "-A"]).status.success());
+    assert!(
+        git(&staged.cwd, &["commit", "-q", "-m", "turn one"])
+            .status
+            .success()
+    );
+    collect_peer_branch(&dir, &staged.slug);
+    let after_one = git(&repo, &["log", "-1", "--format=%s", "peer/turnwise"]);
+    assert_eq!(
+        String::from_utf8_lossy(&after_one.stdout).trim(),
+        "turn one",
+        "a peer's work must be visible in the workspace WITHOUT being closed"
+    );
+
+    // Turn 2 — the same collection must fast-forward, not fail on non-ff.
+    std::fs::write(staged.cwd.join("b.txt"), b"two\n").unwrap();
+    assert!(git(&staged.cwd, &["add", "-A"]).status.success());
+    assert!(
+        git(&staged.cwd, &["commit", "-q", "-m", "turn two"])
+            .status
+            .success()
+    );
+    collect_peer_branch(&dir, &staged.slug);
+    let after_two = git(&repo, &["log", "-1", "--format=%s", "peer/turnwise"]);
+    assert_eq!(
+        String::from_utf8_lossy(&after_two.stdout).trim(),
+        "turn two",
+        "repeat collection must advance the branch to the peer's latest commit"
+    );
+}
+
 /// A peer key with NO profile component is not addressable, and must keep
 /// parsing as a non-peer session.
 ///
