@@ -3,7 +3,7 @@
 //! The contract for the hardware lifecycle executor (issue #448) enumerates
 //! seven acceptance tests. This file implements all of them, plus a
 //! synchronization test that asserts `BLOCKED_ENV_VARS` in `octos-plugin`
-//! matches the canonical list in `octos-agent/src/sandbox/mod.rs`.
+//! matches the canonical list exported by `octos-core`.
 //!
 //! The hardest test is `should_kill_child_when_step_timeout_exceeded`: it
 //! runs a shell command that spawns a long-lived marker process (`sleep`
@@ -400,34 +400,16 @@ async fn pick_and_place_lifecycle_example_runs_end_to_end() {
     }
 }
 
-/// Sync test: asserts the BLOCKED_ENV_VARS list in `octos-plugin` matches
-/// the canonical list in `octos-agent/src/sandbox/mod.rs`. Failing this
-/// means the two lists have drifted and need to be reconciled.
+/// Sync test: asserts the BLOCKED_ENV_VARS list in `octos-plugin` matches the
+/// canonical list exported by `octos-core`. Comparing the constants directly
+/// keeps this test independent of where or how the canonical list is defined.
 #[test]
-fn blocked_env_vars_match_agent_sandbox() {
-    let agent_source = include_str!("../../octos-agent/src/sandbox/mod.rs");
-    // Extract the slice literal: `pub const BLOCKED_ENV_VARS: &[&str] = &[...];`
-    let re = regex::Regex::new(r"(?s)pub const BLOCKED_ENV_VARS:\s*&\[&str\]\s*=\s*&\[(.*?)\];")
-        .unwrap();
-    let caps = re
-        .captures(agent_source)
-        .expect("could not locate BLOCKED_ENV_VARS in agent sandbox source");
-    let body = &caps[1];
-    let item_re = regex::Regex::new(r#""([A-Z0-9_]+)""#).unwrap();
-    let agent_vars: Vec<String> = item_re
-        .captures_iter(body)
-        .map(|c| c[1].to_string())
-        .collect();
-
-    let plugin_vars: Vec<String> = octos_plugin::BLOCKED_ENV_VARS
-        .iter()
-        .map(|s| s.to_string())
-        .collect();
-
+fn blocked_env_vars_match_core_canonical_list() {
     assert_eq!(
-        plugin_vars, agent_vars,
-        "octos-plugin BLOCKED_ENV_VARS drifted from octos-agent::sandbox::BLOCKED_ENV_VARS. \
-         Update both lists together."
+        octos_plugin::BLOCKED_ENV_VARS,
+        octos_core::BLOCKED_ENV_VARS,
+        "octos-plugin BLOCKED_ENV_VARS drifted from octos-core's canonical list. \
+         Update both constants together."
     );
 }
 

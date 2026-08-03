@@ -2593,18 +2593,50 @@ fn peer_wire_key(profile_id: &str, slug: &str) -> String {
 /// Split a `peer-<slug>` session key into `(profile_id, slug)`, or `None` for
 /// a non-peer or unprofiled session.
 fn peer_slug_and_profile(session_id: &SessionKey) -> Option<(&str, &str)> {
+    // NOT a peer session. The overwhelmingly common case, and the only one where
+    // `None` is uninteresting — every caller correctly skips peer bookkeeping.
     let slug = session_id
         .topic()
-        .and_then(|topic| topic.strip_prefix("peer-"))
-        .filter(|slug| !slug.is_empty())?;
+        .and_then(|topic| topic.strip_prefix("peer-"))?;
+
+    // Past this point the topic SAYS `peer-…`, so something intended a peer
+    // session. Each rejection below still returns `None` (callers must treat it
+    // as a non-peer session — that is the #436 fence), but it is now LOUD.
+    //
+    // Why: all ~10 callers do `let Some(..) = .. else { return }`, which is
+    // right for "not a peer" and silently wrong for "malformed peer key". A peer
+    // whose key is rejected here keeps running and looks healthy while its wire
+    // registration, result recording, blackboard writes, awaiting-input wake and
+    // fleet synthesis ALL no-op. That failure is invisible at every layer — the
+    // peer produces work nobody records — so the only place it can be reported
+    // is here, where the reason is still known.
+
     // #436 security — the topic-derived slug feeds `Path::join` (closed marker,
     // peers dir) and the wire-key registry. Reject an unsafe one (e.g. a
     // `peer-/tmp/x` or `peer-../x` topic) HERE so EVERY caller treats it as a
     // NON-peer session rather than a path that escapes `peers/`.
-    if !peer_slug_is_safe(slug) {
+    if slug.is_empty() || !peer_slug_is_safe(slug) {
+        warn!(
+            session = %session_id,
+            "peer session key has an unusable slug; peer bookkeeping (results, \
+             blackboard, wake, synthesis) is DISABLED for this session"
+        );
         return None;
     }
-    let profile_id = session_id.profile_id()?;
+
+    // A peer key with no profile component. Nothing downstream can address the
+    // peer without one — `peers_root` is per-profile and the wire key is
+    // `{profile}:peer:{slug}` — so this silently disables the same bookkeeping.
+    let Some(profile_id) = session_id.profile_id() else {
+        warn!(
+            session = %session_id,
+            slug,
+            "peer session key has NO profile component; peer bookkeeping \
+             (results, blackboard, wake, synthesis) is DISABLED for this \
+             session. Peer keys must be `{{profile}}:{{channel}}:{{chat}}#peer-{{slug}}`"
+        );
+        return None;
+    };
     Some((profile_id, slug))
 }
 
@@ -11758,28 +11790,31 @@ async fn raw_peer_prepare(
     Ok(Value::Object(result))
 }
 
-/// Roll back a half-staged peer fleet: remove every reserved dir, then
-/// best-effort `git worktree prune` + `branch -D peer/<slug>` for each (a
-/// worktree that WAS created for an earlier fleet member must not leak when
-/// a later member fails; both are no-ops for members that never got one).
+/// Roll back a half-staged peer fleet: unregister and remove every reserved
+/// member, then best-effort `branch -D peer/<slug>` for each (a worktree that
+/// WAS created for an earlier fleet member must not leak when a later member
+/// fails; all are no-ops for members that never got one).
+///
+/// Each member is torn down through [`remove_peer_worktree`], which is scoped to
+/// that member's own path — NOT the repo-global `git worktree prune` this used
+/// to run, which also deleted the fence of any peer outside this fleet that
+/// happened to be mid-`worktree add`.
 async fn cleanup_staged_peers(workspace_root: &Path, staged: &[(String, PathBuf)]) {
-    for (_, dir) in staged {
-        let _ = std::fs::remove_dir_all(dir);
-    }
     if staged.is_empty() {
         return;
     }
     let root = workspace_root.to_path_buf();
+    let dirs: Vec<PathBuf> = staged.iter().map(|(_, dir)| dir.clone()).collect();
     let branches: Vec<String> = staged
         .iter()
         .map(|(slug, _)| format!("peer/{slug}"))
         .collect();
     let _ = tokio::task::spawn_blocking(move || {
-        let _ = std::process::Command::new("git")
-            .arg("-C")
-            .arg(&root)
-            .args(["worktree", "prune"])
-            .output();
+        for dir in &dirs {
+            // Unregister BEFORE deleting: `git worktree remove` resolves by path.
+            remove_peer_worktree(&root, dir);
+            let _ = std::fs::remove_dir_all(dir);
+        }
         for branch in &branches {
             let _ = std::process::Command::new("git")
                 .arg("-C")
@@ -11931,17 +11966,96 @@ fn stage_peer(
     })
 }
 
-/// Roll back ONE half-staged peer: remove its reserved dir, then
-/// best-effort `git worktree prune` + `branch -D peer/<slug>` (both no-ops
-/// for a member that never got a worktree). The single-member synchronous
-/// sibling of [`cleanup_staged_peers`], used inside [`stage_peer`].
-fn cleanup_staged_peer(workspace_root: &Path, slug: &str, dir: &Path) {
-    let _ = std::fs::remove_dir_all(dir);
-    let _ = std::process::Command::new("git")
+/// The `.git` COMMON dir of `workspace_root` — where per-worktree admin dirs
+/// live. Resolved via git (not `join(".git")`) because `.git` is a FILE when the
+/// workspace is itself a worktree, and the admin dirs then live in the parent
+/// repo. `None` when `workspace_root` is not a repo.
+fn git_common_dir(workspace_root: &Path) -> Option<PathBuf> {
+    let out = std::process::Command::new("git")
         .arg("-C")
         .arg(workspace_root)
-        .args(["worktree", "prune"])
-        .output();
+        .args(["rev-parse", "--git-common-dir"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let raw = String::from_utf8(out.stdout).ok()?;
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let path = PathBuf::from(raw);
+    // `--git-common-dir` may answer relatively (`.git`) — anchor it.
+    Some(if path.is_absolute() {
+        path
+    } else {
+        workspace_root.join(path)
+    })
+}
+
+/// Drop ONLY the worktree belonging to peer dir `dir`.
+///
+/// Deliberately NOT `git worktree prune`, which is what this used to do: prune
+/// is repo-GLOBAL and removes the admin entry of EVERY worktree whose checkout
+/// is currently missing. `git worktree add` registers the admin entry BEFORE the
+/// checkout is fully in place, so a sibling peer staged concurrently sits in
+/// exactly that window — one peer's rollback silently destroyed another peer's
+/// fence, leaving its branch checked out nowhere. Every peer checkout is named
+/// `wt` (`peers/<slug>/wt`), so git disambiguates the admin dirs as `wt`, `wt1`,
+/// … — which is why this showed up as "the SECOND peer lost its worktree".
+///
+/// Both steps here are scoped STRICTLY to paths under `dir`, so a sibling is
+/// never touched no matter what state it is in.
+fn remove_peer_worktree(workspace_root: &Path, dir: &Path) {
+    // Normal path: the checkout exists, so git can unregister it by PATH.
+    let checkout = dir.join("wt");
+    if checkout.is_dir() {
+        let _ = std::process::Command::new("git")
+            .arg("-C")
+            .arg(workspace_root)
+            .args(["worktree", "remove", "--force"])
+            .arg(&checkout)
+            .output();
+    }
+    // Fallback: a checkout that never finished (or a `remove` git refused)
+    // leaves an admin entry behind, and a lingering entry keeps `branch -D`
+    // from succeeding — which would burn the slug for any retry. Sweep it by
+    // hand, matching ONLY entries whose `gitdir` points inside `dir`.
+    let Some(common) = git_common_dir(workspace_root) else {
+        return;
+    };
+    let Ok(entries) = std::fs::read_dir(common.join("worktrees")) else {
+        return;
+    };
+    // Compare canonicalized too: on macOS a temp/staging path reaches git as
+    // `/private/var/…` while `dir` is the `/var/…` symlink (or vice versa), and
+    // a purely lexical match would silently sweep nothing.
+    let canonical = std::fs::canonicalize(dir).ok();
+    for entry in entries.flatten() {
+        let Ok(target) = std::fs::read_to_string(entry.path().join("gitdir")) else {
+            continue;
+        };
+        let target = Path::new(target.trim());
+        let mine = target.starts_with(dir)
+            || canonical
+                .as_deref()
+                .is_some_and(|canonical| target.starts_with(canonical));
+        if mine {
+            let _ = std::fs::remove_dir_all(entry.path());
+        }
+    }
+}
+
+/// Roll back ONE half-staged peer: unregister its OWN worktree, remove its
+/// reserved dir, then best-effort `branch -D peer/<slug>` (all no-ops for a
+/// member that never got a worktree). The single-member synchronous sibling of
+/// [`cleanup_staged_peers`], used inside [`stage_peer`].
+fn cleanup_staged_peer(workspace_root: &Path, slug: &str, dir: &Path) {
+    // BEFORE `remove_dir_all`: `git worktree remove` needs the checkout on disk
+    // to unregister it by path.
+    remove_peer_worktree(workspace_root, dir);
+    let _ = std::fs::remove_dir_all(dir);
     let branch = format!("peer/{slug}");
     let _ = std::process::Command::new("git")
         .arg("-C")
