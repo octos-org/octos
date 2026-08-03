@@ -2781,3 +2781,67 @@ async fn parallel_subnode_panic_emits_node_completed_via_guard_drop() {
         "the parallel worker must have started; got {events:?}"
     );
 }
+
+/// A pipeline node whose model key is NOT registered in the provider router
+/// must degrade to the default provider rather than kill the run (#1901).
+///
+/// `model_assignment` rewrites DOT lane keys (`model="strong"`) to concrete
+/// catalog models, and a profile without a filtered `pipeline_models.json`
+/// falls back to the UNFILTERED catalog — so it can name models the router
+/// never registered. `resolve_provider` propagated that with `?`, failing the
+/// whole pipeline, while `CodergenHandler::resolve_provider` (handler.rs) has
+/// always degraded in the same situation. The rotating model name in the error
+/// (`qwen3-max`, then `qwen-plus`, …) came from `ModelPools::nth_strong`
+/// round-robining the catalog, which is what made it look intermittent.
+///
+/// Mirrors handler.rs's `resolve_provider_falls_back_to_coding_llm_when_key_absent`
+/// so the two paths cannot drift apart again.
+#[tokio::test]
+async fn resolve_provider_falls_back_to_default_when_key_absent() {
+    struct NamedMock(&'static str);
+
+    #[async_trait::async_trait]
+    impl LlmProvider for NamedMock {
+        async fn chat(
+            &self,
+            _messages: &[octos_core::Message],
+            _tools: &[octos_llm::ToolSpec],
+            _config: &ChatConfig,
+        ) -> eyre::Result<octos_llm::ChatResponse> {
+            unreachable!("resolve_provider must not call chat()")
+        }
+        fn model_id(&self) -> &str {
+            self.0
+        }
+        fn provider_name(&self) -> &str {
+            self.0
+        }
+    }
+
+    let default: Arc<dyn LlmProvider> = Arc::new(NamedMock("pipeline-default"));
+    let router = Arc::new(ProviderRouter::new());
+    router.register("strong", Arc::new(NamedMock("research-strong")));
+
+    // The bug: an assigned-but-unregistered model must NOT fail the run.
+    let fallback = resolve_provider(&default, Some(&router), Some("qwen3-max"))
+        .expect("an unresolvable model key must not error the pipeline");
+    assert_eq!(
+        fallback.model_id(),
+        "pipeline-default",
+        "an unregistered model key must degrade to the default provider"
+    );
+
+    // A registered key still resolves to its own lane — the fallback must not
+    // swallow everything.
+    let resolved = resolve_provider(&default, Some(&router), Some("strong"))
+        .expect("a registered key must resolve");
+    assert_eq!(
+        resolved.model_id(),
+        "research-strong",
+        "a resolvable key must use its lane, not the default"
+    );
+
+    // No key at all: unchanged behaviour.
+    let none = resolve_provider(&default, Some(&router), None).expect("no key must resolve");
+    assert_eq!(none.model_id(), "pipeline-default");
+}

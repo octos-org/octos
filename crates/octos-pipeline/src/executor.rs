@@ -1124,9 +1124,14 @@ fn resolve_provider(
         // must not fail the whole pipeline.
         (Some(key), Some(r)) => match r.resolve(key) {
             Ok(provider) => Ok(provider),
-            Err(_) => {
+            // Keep the router's error: it names the keys that ARE registered
+            // (`available: [..]`), which is the one thing an operator needs to
+            // fix the gap. Dropping it leaves a warning that says what failed
+            // but not what would have worked.
+            Err(err) => {
                 warn!(
                     model = key,
+                    %err,
                     "pipeline model not in provider router; using default provider"
                 );
                 Ok(default.clone())

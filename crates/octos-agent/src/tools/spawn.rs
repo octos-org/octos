@@ -1762,9 +1762,12 @@ impl SpawnTool {
                     // router never registered, and that must not fail the spawn.
                     let provider = match router.resolve(model_key) {
                         Ok(p) => p,
-                        Err(_) => {
+                        // Keep the router's error — it lists the registered
+                        // keys, which is what makes the gap actionable.
+                        Err(err) => {
                             warn!(
                                 model = model_key,
+                                %err,
                                 "sub-agent model not in provider router; using parent provider"
                             );
                             self.llm.clone()
