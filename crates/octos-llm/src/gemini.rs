@@ -55,6 +55,12 @@ fn next_gemini_tool_call_id() -> String {
 /// Default AI Studio base URL (the `generativelanguage.googleapis.com` host).
 const STUDIO_BASE_URL: &str = "https://generativelanguage.googleapis.com/v1beta";
 
+/// Google documents this sentinel for manually reconstructed Gemini 3 tool
+/// history when the original response part did not carry a thought signature.
+/// Real signatures always win; this only prevents the next function-response
+/// request from failing before the model can consume the tool result.
+const SKIP_THOUGHT_SIGNATURE_VALIDATOR: &str = "skip_thought_signature_validator";
+
 /// How a [`GeminiProvider`] authenticates.
 ///
 /// `ApiKey` is AI Studio (`x-goog-api-key` against
@@ -202,7 +208,7 @@ impl LlmProvider for GeminiProvider {
         tools: &[ToolSpec],
         config: &ChatConfig,
     ) -> Result<ChatResponse> {
-        let (contents, system_instruction) = build_gemini_contents(messages);
+        let (contents, system_instruction) = build_gemini_contents_for_model(messages, &self.model);
 
         // Build tools array
         let gemini_tools: Option<Vec<GeminiTool>> = if tools.is_empty() {
@@ -282,7 +288,7 @@ impl LlmProvider for GeminiProvider {
         tools: &[ToolSpec],
         config: &ChatConfig,
     ) -> Result<ChatStream> {
-        let (contents, system_instruction) = build_gemini_contents(messages);
+        let (contents, system_instruction) = build_gemini_contents_for_model(messages, &self.model);
 
         let gemini_tools: Option<Vec<GeminiTool>> = if tools.is_empty() {
             None
@@ -489,15 +495,37 @@ fn build_gemini_generation_config(config: &ChatConfig) -> GeminiGenerationConfig
 /// - Assistant messages with tool calls → `model` role with `functionCall` parts
 /// - Tool result messages → `user` role with `functionResponse` parts
 /// - Consecutive same-role messages are merged (Gemini rejects adjacent same-role turns)
+#[cfg(test)]
 fn build_gemini_contents(messages: &[Message]) -> (Vec<GeminiContent>, Option<String>) {
+    build_gemini_contents_with_signature_fallback(messages, false)
+}
+
+fn build_gemini_contents_for_model(
+    messages: &[Message],
+    model: &str,
+) -> (Vec<GeminiContent>, Option<String>) {
+    build_gemini_contents_with_signature_fallback(messages, model.starts_with("gemini-3"))
+}
+
+fn build_gemini_contents_with_signature_fallback(
+    messages: &[Message],
+    synthesize_missing_thought_signature: bool,
+) -> (Vec<GeminiContent>, Option<String>) {
     let mut contents: Vec<GeminiContent> = Vec::new();
     let mut system_instruction: Option<String> = None;
+    // Gemini only validates function-call signatures in the current turn,
+    // which begins at the most recent real user message (tool responses do not
+    // start a new turn). Keep the documented escape hatch out of older turns
+    // because Google warns that it can reduce model performance.
+    let current_turn_start = messages
+        .iter()
+        .rposition(|message| message.role == octos_core::MessageRole::User);
 
     // Map tool_call_id → function name so tool results can reference the right name.
     let mut call_id_to_name: std::collections::HashMap<String, String> =
         std::collections::HashMap::new();
 
-    for msg in messages {
+    for (message_index, msg) in messages.iter().enumerate() {
         match msg.role {
             octos_core::MessageRole::System => match &mut system_instruction {
                 Some(existing) => {
@@ -523,7 +551,7 @@ fn build_gemini_contents(messages: &[Message]) -> (Vec<GeminiContent>, Option<St
                 }
                 // Include functionCall parts for any tool calls the model made.
                 if let Some(ref tcs) = msg.tool_calls {
-                    for tc in tcs {
+                    for (index, tc) in tcs.iter().enumerate() {
                         call_id_to_name.insert(tc.id.clone(), tc.name.clone());
                         // Restore thought_signature from metadata if present.
                         let thought_signature = tc
@@ -531,7 +559,17 @@ fn build_gemini_contents(messages: &[Message]) -> (Vec<GeminiContent>, Option<St
                             .as_ref()
                             .and_then(|m| m.get("thought_signature"))
                             .and_then(|v| v.as_str())
-                            .map(|s| s.to_string());
+                            .map(|s| s.to_string())
+                            .or_else(|| {
+                                // Gemini 3 validates the first function-call
+                                // part in each model step. Parallel siblings do
+                                // not carry signatures and must stay unsigned.
+                                (synthesize_missing_thought_signature
+                                    && current_turn_start
+                                        .is_some_and(|turn_start| message_index > turn_start)
+                                    && index == 0)
+                                    .then(|| SKIP_THOUGHT_SIGNATURE_VALIDATOR.to_string())
+                            });
                         parts.push(GeminiPart::FunctionCall {
                             function_call: GeminiFunctionCall {
                                 name: tc.name.clone(),
@@ -1141,6 +1179,150 @@ mod tests {
     }
 
     #[test]
+    fn gemini_3_supplies_documented_signature_fallback_only_to_first_parallel_call() {
+        let messages = vec![
+            msg(MessageRole::User, "run both"),
+            Message {
+                role: MessageRole::Assistant,
+                content: String::new(),
+                media: vec![],
+                tool_calls: Some(vec![
+                    ToolCall {
+                        id: "tc1".into(),
+                        name: "first".into(),
+                        arguments: serde_json::json!({}),
+                        metadata: None,
+                    },
+                    ToolCall {
+                        id: "tc2".into(),
+                        name: "second".into(),
+                        arguments: serde_json::json!({}),
+                        metadata: None,
+                    },
+                ]),
+                tool_call_id: None,
+                reasoning_content: None,
+                client_message_id: None,
+                thread_id: None,
+                timestamp: chrono::Utc::now(),
+            },
+        ];
+
+        let (contents, _) = build_gemini_contents_for_model(&messages, "gemini-3.6-flash");
+        let serialized = serde_json::to_value(&contents[1]).expect("serialize model content");
+
+        assert_eq!(
+            serialized["parts"][0]["thoughtSignature"],
+            SKIP_THOUGHT_SIGNATURE_VALIDATOR
+        );
+        assert!(serialized["parts"][1].get("thoughtSignature").is_none());
+    }
+
+    #[test]
+    fn gemini_3_preserves_real_thought_signature() {
+        let messages = vec![
+            msg(MessageRole::User, "run it"),
+            Message {
+                role: MessageRole::Assistant,
+                content: String::new(),
+                media: vec![],
+                tool_calls: Some(vec![ToolCall {
+                    id: "tc1".into(),
+                    name: "first".into(),
+                    arguments: serde_json::json!({}),
+                    metadata: Some(serde_json::json!({ "thought_signature": "real-signature" })),
+                }]),
+                tool_call_id: None,
+                reasoning_content: None,
+                client_message_id: None,
+                thread_id: None,
+                timestamp: chrono::Utc::now(),
+            },
+        ];
+
+        let (contents, _) = build_gemini_contents_for_model(&messages, "gemini-3.6-flash");
+        let serialized = serde_json::to_value(&contents[1]).expect("serialize model content");
+
+        assert_eq!(serialized["parts"][0]["thoughtSignature"], "real-signature");
+    }
+
+    #[test]
+    fn gemini_3_limits_signature_fallback_to_the_current_user_turn() {
+        let tool_call = |id: &str, name: &str| Message {
+            role: MessageRole::Assistant,
+            content: String::new(),
+            media: vec![],
+            tool_calls: Some(vec![ToolCall {
+                id: id.into(),
+                name: name.into(),
+                arguments: serde_json::json!({}),
+                metadata: None,
+            }]),
+            tool_call_id: None,
+            reasoning_content: None,
+            client_message_id: None,
+            thread_id: None,
+            timestamp: chrono::Utc::now(),
+        };
+        let messages = vec![
+            msg(MessageRole::User, "old turn"),
+            tool_call("tc1", "old_call"),
+            Message {
+                role: MessageRole::Tool,
+                content: "old result".into(),
+                media: vec![],
+                tool_calls: None,
+                tool_call_id: Some("tc1".into()),
+                reasoning_content: None,
+                client_message_id: None,
+                thread_id: None,
+                timestamp: chrono::Utc::now(),
+            },
+            msg(MessageRole::User, "current turn"),
+            tool_call("tc2", "current_call"),
+        ];
+
+        let (contents, _) = build_gemini_contents_for_model(&messages, "gemini-3.6-flash");
+        let old_step = serde_json::to_value(&contents[1]).expect("serialize old model step");
+        let current_step =
+            serde_json::to_value(&contents[4]).expect("serialize current model step");
+
+        assert!(old_step["parts"][0].get("thoughtSignature").is_none());
+        assert_eq!(
+            current_step["parts"][0]["thoughtSignature"],
+            SKIP_THOUGHT_SIGNATURE_VALIDATOR
+        );
+    }
+
+    #[test]
+    fn gemini_2_does_not_receive_gemini_3_signature_fallback() {
+        let messages = vec![
+            msg(MessageRole::User, "run it"),
+            Message {
+                role: MessageRole::Assistant,
+                content: String::new(),
+                media: vec![],
+                tool_calls: Some(vec![ToolCall {
+                    id: "tc1".into(),
+                    name: "first".into(),
+                    arguments: serde_json::json!({}),
+                    metadata: None,
+                }]),
+                tool_call_id: None,
+                reasoning_content: None,
+                client_message_id: None,
+                thread_id: None,
+                timestamp: chrono::Utc::now(),
+            },
+        ];
+
+        let (contents, _) = build_gemini_contents_for_model(&messages, "gemini-2.5-flash");
+        let serialized = serde_json::to_value(&contents[1]).expect("serialize model content");
+
+        assert!(serialized["parts"][0].get("thoughtSignature").is_none());
+    }
+
+    #[test]
     fn test_build_contents_merges_consecutive_same_role() {
         let messages = vec![
             msg(MessageRole::User, "first"),
@@ -1208,6 +1390,23 @@ mod tests {
         let events = map_gemini_sse(&mut state, &event);
         assert!(events.iter().any(|e| matches!(e, StreamEvent::ToolCallDelta { name, .. } if name.as_deref() == Some("shell"))));
         assert!(state.has_tool_calls);
+    }
+
+    #[test]
+    fn test_gemini_sse_function_call_captures_thought_signature() {
+        let mut state = GeminiStreamState::default();
+        let event = crate::sse::SseEvent {
+            event: None,
+            data: r#"{"candidates": [{"content": {"parts": [{"functionCall": {"name": "shell", "args": {"command": "ls"}}, "thoughtSignature": "signed"}]}}]}"#.into(),
+        };
+
+        let events = map_gemini_sse(&mut state, &event);
+
+        assert!(events.iter().any(|event| matches!(
+            event,
+            StreamEvent::ToolCallMetadata { index: 0, metadata }
+                if metadata["thought_signature"] == "signed"
+        )));
     }
 
     #[test]
