@@ -11893,32 +11893,82 @@ fn stage_peer(
                 "peer '{slug}' staging directory is no longer a real directory"
             )));
         }
-        let output = std::process::Command::new("git")
-            .arg("-C")
-            .arg(workspace_root)
-            .arg("worktree")
-            .arg("add")
-            .arg("-b")
-            .arg(&branch)
-            .arg(&worktree_path)
-            .output();
-        let output = match output {
-            Ok(output) => output,
-            Err(err) => {
-                cleanup_staged_peer(workspace_root, &slug, &peer_dir);
-                return Err(RpcError::invalid_params(format!(
-                    "failed to run git: {err}"
-                )));
+        // A CLONE, not `git worktree add`. A worktree's `.git` is a FILE
+        // pointing at `<repo>/.git/worktrees/<name>`, which lives OUTSIDE the
+        // peer's sandboxed workspace — so every git command inside a worktree
+        // peer failed with `fatal: not a git repository ... exit 128`, and the
+        // model "recovered" by running `git init`, destroying the fence. The
+        // branch then stayed at the seed commit and no deliverable ever landed.
+        // A clone puts the whole `.git` INSIDE `peers/<slug>/wt`, so git works
+        // with no sandbox widening, and one peer cannot reach another's refs.
+        //
+        // `--no-hardlinks` because isolation is the entire point here: the
+        // default local-clone optimisation shares object-file inodes with the
+        // parent, so a peer writing into its own `.git` could corrupt the
+        // source repo's objects. Costs a real object copy per peer; revisit
+        // with evidence if staging latency becomes the problem.
+        let run_git = |args: &[&std::ffi::OsStr]| -> Result<(), String> {
+            match std::process::Command::new("git").args(args).output() {
+                Err(err) => Err(format!("failed to run git: {err}")),
+                Ok(out) if out.status.success() => Ok(()),
+                Ok(out) => Err(String::from_utf8_lossy(&out.stderr).trim().to_owned()),
             }
         };
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+        let as_os = |s: &str| std::ffi::OsString::from(s);
+        let clone_args: Vec<std::ffi::OsString> = vec![
+            as_os("clone"),
+            as_os("--quiet"),
+            as_os("--no-hardlinks"),
+            workspace_root.as_os_str().to_os_string(),
+            worktree_path.as_os_str().to_os_string(),
+        ];
+        let clone_ref: Vec<&std::ffi::OsStr> = clone_args.iter().map(AsRef::as_ref).collect();
+        if let Err(detail) = run_git(&clone_ref) {
             cleanup_staged_peer(workspace_root, &slug, &peer_dir);
             return Err(RpcError::invalid_params(format!(
-                "git worktree add failed (is {} a git repo?): {}",
+                "git clone failed (is {} a git repo?): {}",
                 workspace_root.display(),
-                stderr
+                detail
             )));
+        }
+        // The fence branch now lives in the peer's OWN clone.
+        let branch_args: Vec<std::ffi::OsString> = vec![
+            as_os("-C"),
+            worktree_path.as_os_str().to_os_string(),
+            as_os("checkout"),
+            as_os("-q"),
+            as_os("-b"),
+            as_os(&branch),
+        ];
+        let branch_ref: Vec<&std::ffi::OsStr> = branch_args.iter().map(AsRef::as_ref).collect();
+        if let Err(detail) = run_git(&branch_ref) {
+            cleanup_staged_peer(workspace_root, &slug, &peer_dir);
+            return Err(RpcError::invalid_params(format!(
+                "git checkout -b {branch} failed in the peer clone: {detail}"
+            )));
+        }
+        // A clone does NOT inherit the source's LOCAL config, so a peer would
+        // have no commit identity and every `git commit` would fail. Carry the
+        // parent's over when it has one; otherwise git falls back to global.
+        for key in ["user.name", "user.email"] {
+            let read = std::process::Command::new("git")
+                .arg("-C")
+                .arg(workspace_root)
+                .args(["config", "--get", key])
+                .output();
+            let Ok(out) = read else { continue };
+            if !out.status.success() {
+                continue;
+            }
+            let value = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+            if value.is_empty() {
+                continue;
+            }
+            let _ = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&worktree_path)
+                .args(["config", key, &value])
+                .output();
         }
         worktree_path
     } else {
@@ -12044,6 +12094,63 @@ fn remove_peer_worktree(workspace_root: &Path, dir: &Path) {
         if mine {
             let _ = std::fs::remove_dir_all(entry.path());
         }
+    }
+}
+
+/// Fetch a peer's fence branch out of its own clone and into the workspace repo.
+///
+/// Peers are staged as CLONES (see `stage_peer`), so `peer/<slug>` exists only
+/// inside `peers/<slug>/wt`. Without this the work is invisible from the
+/// workspace — `git branch` would not list it and the deliverable would look
+/// like it never happened. Run on close, once the peer is done writing.
+///
+/// Best-effort by design: a peer that never committed, was staged without a
+/// worktree, or whose clone is gone simply has nothing to collect, and none of
+/// those should fail the close.
+fn collect_peer_branch(peer_dir: &Path, slug: &str) {
+    let clone = peer_dir.join("wt");
+    if !clone.join(".git").exists() {
+        return;
+    }
+    // The clone's `origin` IS the workspace repo it was cloned from, so the
+    // destination is self-describing — no need to thread a workspace root
+    // through the close callback, and it stays correct even if the session's
+    // workspace moved after staging.
+    let origin = match std::process::Command::new("git")
+        .arg("-C")
+        .arg(&clone)
+        .args(["config", "--get", "remote.origin.url"])
+        .output()
+    {
+        Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout).trim().to_owned(),
+        _ => return,
+    };
+    if origin.is_empty() {
+        return;
+    }
+    let workspace_root = PathBuf::from(origin);
+    let branch = format!("peer/{slug}");
+    // `+` forces the update: a re-opened peer that committed again must not be
+    // refused for a non-fast-forward.
+    let refspec = format!("+{branch}:{branch}");
+    match std::process::Command::new("git")
+        .arg("-C")
+        .arg(&workspace_root)
+        .args(["fetch", "--no-tags", "--quiet"])
+        .arg(&clone)
+        .arg(&refspec)
+        .output()
+    {
+        Ok(out) if out.status.success() => {
+            tracing::info!(slug, branch = %branch, "collected peer branch from its clone");
+        }
+        Ok(out) => tracing::warn!(
+            slug,
+            branch = %branch,
+            stderr = %String::from_utf8_lossy(&out.stderr).trim(),
+            "could not collect the peer branch (it may have committed nothing)"
+        ),
+        Err(error) => tracing::warn!(slug, %error, "failed to run git to collect the peer branch"),
     }
 }
 
@@ -13758,6 +13865,12 @@ fn build_peer_close_callback(
                 "failed to write close marker for peer '{slug}': {err}"
             ));
         }
+        // The fence branch lives in the peer's own clone, so pull it into the
+        // workspace repo now that the peer is done — otherwise its work is
+        // invisible from the workspace and looks like it never happened.
+        // AFTER the marker: collection is best-effort and must never leave a
+        // peer un-closed.
+        collect_peer_branch(&peer_dir, &slug);
         // #436 leak fix — the marker now refuses NEW sends; actively CANCEL +
         // tombstone any injection queued for this peer BEFORE the close so
         // nothing stays stranded in the durable queue (the drain gates skip a
