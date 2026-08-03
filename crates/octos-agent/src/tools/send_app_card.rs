@@ -225,7 +225,16 @@ impl Tool for SendAppCardTool {
                 "actions": {
                     "type": "array",
                     "description": "Optional shared OctOS action buttons. \
-                        Each item should include id, label, and optional style."
+                        Each item should include id, label, and optional style.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "id": {"type": "string"},
+                            "label": {"type": "string"},
+                            "style": {"type": "string"}
+                        },
+                        "required": ["id", "label"]
+                    }
                 },
                 "body": {
                     "type": "string",
@@ -379,6 +388,20 @@ mod tests {
             SendAppCardTool::with_context(tx, "matrix", "!room:example.org"),
             rx,
         )
+    }
+
+    #[test]
+    fn should_declare_action_items_as_objects() {
+        let (tool, _rx) = make_tool();
+        let schema = tool.input_schema();
+        let actions = &schema["properties"]["actions"];
+
+        assert_eq!(actions["type"], "array");
+        assert_eq!(actions["items"]["type"], "object");
+        assert_eq!(actions["items"]["properties"]["id"]["type"], "string");
+        assert_eq!(actions["items"]["properties"]["label"]["type"], "string");
+        assert_eq!(actions["items"]["properties"]["style"]["type"], "string");
+        assert_eq!(actions["items"]["required"], json!(["id", "label"]));
     }
 
     #[tokio::test]

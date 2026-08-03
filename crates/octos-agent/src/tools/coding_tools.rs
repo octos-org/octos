@@ -1074,7 +1074,19 @@ impl Tool for SpawnAgentTool {
             "type": "object",
             "properties": {
                 "message": {"type": "string"},
-                "items": {"type": "array"},
+                "items": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "type": {"type": "string"},
+                            "text": {"type": "string"},
+                            "name": {"type": "string"},
+                            "path": {"type": "string"},
+                            "image_url": {"type": "string"}
+                        }
+                    }
+                },
                 "agent_type": {"type": "string"},
                 "fork_context": {"type": "boolean"},
                 "model": {"type": "string"},

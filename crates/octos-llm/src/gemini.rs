@@ -204,25 +204,7 @@ impl LlmProvider for GeminiProvider {
     ) -> Result<ChatResponse> {
         let (contents, system_instruction) = build_gemini_contents(messages);
 
-        // Build tools array
-        let gemini_tools: Option<Vec<GeminiTool>> = if tools.is_empty() {
-            None
-        } else {
-            Some(vec![GeminiTool {
-                function_declarations: tools
-                    .iter()
-                    .map(|t| {
-                        let mut params = t.input_schema.clone();
-                        sanitize_schema_for_gemini(&mut params);
-                        GeminiFunctionDeclaration {
-                            name: t.name.clone(),
-                            description: t.description.clone(),
-                            parameters: params,
-                        }
-                    })
-                    .collect(),
-            }])
-        };
+        let gemini_tools = build_gemini_tools(tools);
 
         let request = GeminiRequest {
             contents,
@@ -233,7 +215,10 @@ impl LlmProvider for GeminiProvider {
                 }],
             }),
             tools: gemini_tools,
-            generation_config: Some(build_gemini_generation_config(config)),
+            generation_config: Some(build_gemini_generation_config(
+                config,
+                &format!("gemini/{}", self.model),
+            )?),
             cached_content: None,
         };
 
@@ -284,24 +269,7 @@ impl LlmProvider for GeminiProvider {
     ) -> Result<ChatStream> {
         let (contents, system_instruction) = build_gemini_contents(messages);
 
-        let gemini_tools: Option<Vec<GeminiTool>> = if tools.is_empty() {
-            None
-        } else {
-            Some(vec![GeminiTool {
-                function_declarations: tools
-                    .iter()
-                    .map(|t| {
-                        let mut params = t.input_schema.clone();
-                        sanitize_schema_for_gemini(&mut params);
-                        GeminiFunctionDeclaration {
-                            name: t.name.clone(),
-                            description: t.description.clone(),
-                            parameters: params,
-                        }
-                    })
-                    .collect(),
-            }])
-        };
+        let gemini_tools = build_gemini_tools(tools);
 
         let request = GeminiRequest {
             contents,
@@ -312,7 +280,10 @@ impl LlmProvider for GeminiProvider {
                 }],
             }),
             tools: gemini_tools,
-            generation_config: Some(build_gemini_generation_config(config)),
+            generation_config: Some(build_gemini_generation_config(
+                config,
+                &format!("gemini/{}", self.model),
+            )?),
             cached_content: None,
         };
 
@@ -449,7 +420,10 @@ struct GeminiInlineData {
 }
 
 /// Build the Gemini generation config from ChatConfig.
-fn build_gemini_generation_config(config: &ChatConfig) -> GeminiGenerationConfig {
+fn build_gemini_generation_config(
+    config: &ChatConfig,
+    provider_label: &str,
+) -> Result<GeminiGenerationConfig> {
     use crate::config::{ReasoningEffort, ResponseFormat};
 
     let thinking_config = config.reasoning_effort.map(|effort| {
@@ -469,18 +443,29 @@ fn build_gemini_generation_config(config: &ChatConfig) -> GeminiGenerationConfig
         Some(ResponseFormat::JsonSchema { schema, .. }) => {
             let mut s = schema.clone();
             sanitize_schema_for_gemini(&mut s);
+            if contains_underspecified_array(&s, 0) {
+                let message = "Gemini structured response schema contains an array with missing or empty `items`; define an element schema for every array";
+                return Err(crate::error::LlmError::new(
+                    crate::error::LlmErrorKind::InvalidRequest {
+                        detail: message.to_string(),
+                    },
+                    message,
+                )
+                .with_provider(provider_label)
+                .into());
+            }
             (Some("application/json".into()), Some(s))
         }
         _ => (None, None),
     };
 
-    GeminiGenerationConfig {
+    Ok(GeminiGenerationConfig {
         max_output_tokens: config.max_tokens,
         temperature: config.temperature,
         thinking_config,
         response_mime_type,
         response_schema,
-    }
+    })
 }
 
 /// Build the Gemini `contents` array and optional system instruction from messages.
@@ -661,12 +646,65 @@ struct GeminiFunctionDeclaration {
 /// Maximum recursion depth for schema sanitization (matches MCP limit).
 const MAX_SCHEMA_DEPTH: usize = 64;
 
+/// Build Gemini tool declarations while isolating schemas whose array element
+/// contract is unknowable. Guessing an element type here can make model output
+/// pass server-side validation while violating the tool's real client contract.
+fn build_gemini_tools(tools: &[ToolSpec]) -> Option<Vec<GeminiTool>> {
+    let function_declarations: Vec<_> = tools
+        .iter()
+        .filter_map(|tool| {
+            let mut parameters = tool.input_schema.clone();
+            sanitize_schema_for_gemini(&mut parameters);
+            if contains_underspecified_array(&parameters, 0) {
+                tracing::warn!(
+                    tool = %tool.name,
+                    "excluding Gemini tool declaration with missing or empty array items schema"
+                );
+                return None;
+            }
+            Some(GeminiFunctionDeclaration {
+                name: tool.name.clone(),
+                description: tool.description.clone(),
+                parameters,
+            })
+        })
+        .collect();
+
+    (!function_declarations.is_empty()).then_some(vec![GeminiTool {
+        function_declarations,
+    }])
+}
+
+fn contains_underspecified_array(value: &serde_json::Value, depth: usize) -> bool {
+    if depth > MAX_SCHEMA_DEPTH {
+        return false;
+    }
+
+    match value {
+        serde_json::Value::Object(object) => {
+            let is_underspecified_array = object.get("type").and_then(serde_json::Value::as_str)
+                == Some("array")
+                && match object.get("items") {
+                    None => true,
+                    Some(items) => items.as_object().is_some_and(serde_json::Map::is_empty),
+                };
+            is_underspecified_array
+                || object
+                    .values()
+                    .any(|nested| contains_underspecified_array(nested, depth + 1))
+        }
+        serde_json::Value::Array(items) => items
+            .iter()
+            .any(|nested| contains_underspecified_array(nested, depth + 1)),
+        _ => false,
+    }
+}
+
 /// Sanitize a JSON Schema for Gemini's restricted schema support.
 ///
 /// Gemini only supports a subset of JSON Schema. This recursively removes
 /// unsupported fields that cause 400 errors or silent empty responses:
 /// - `additionalProperties`
-/// - Empty `items` schemas (`"items": {}`)
 /// - `$schema`, `$ref`, `$id`
 fn sanitize_schema_for_gemini(value: &mut serde_json::Value) {
     sanitize_schema_recursive(value, 0);
@@ -691,14 +729,6 @@ fn sanitize_schema_recursive(value: &mut serde_json::Value, depth: usize) {
         // crash plan_and_search workers when routing lands on Gemini.
         obj.retain(|k, _| !k.starts_with("x-"));
 
-        // Gemini requires `items` to have a type when present.
-        // Replace empty `"items": {}` with `"items": {"type": "string"}`.
-        if let Some(items) = obj.get("items") {
-            if items.as_object().is_some_and(|o| o.is_empty()) {
-                obj.insert("items".to_string(), serde_json::json!({"type": "string"}));
-            }
-        }
-
         // Recurse into nested objects
         let keys: Vec<String> = obj.keys().cloned().collect();
         for key in keys {
@@ -713,7 +743,7 @@ fn sanitize_schema_recursive(value: &mut serde_json::Value, depth: usize) {
     }
 }
 
-#[derive(Serialize)]
+#[derive(Debug, Serialize)]
 struct GeminiGenerationConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     max_output_tokens: Option<u32>,
@@ -727,7 +757,7 @@ struct GeminiGenerationConfig {
     response_schema: Option<serde_json::Value>,
 }
 
-#[derive(Serialize)]
+#[derive(Debug, Serialize)]
 struct GeminiThinkingConfig {
     #[serde(rename = "thinkingBudget", skip_serializing_if = "Option::is_none")]
     thinking_budget: Option<u32>,
@@ -1029,13 +1059,30 @@ mod tests {
     }
 
     #[test]
-    fn test_sanitize_replaces_empty_items() {
+    fn should_not_guess_items_when_array_items_are_empty() {
         let mut schema = serde_json::json!({
             "type": "array",
             "items": {}
         });
         sanitize_schema_for_gemini(&mut schema);
-        assert_eq!(schema["items"]["type"], "string");
+        assert_eq!(schema["items"], serde_json::json!({}));
+    }
+
+    #[test]
+    fn should_not_guess_items_when_array_schema_omits_items() {
+        let mut schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "items": {"type": "array"}
+            }
+        });
+
+        sanitize_schema_for_gemini(&mut schema);
+
+        assert!(
+            schema["properties"]["items"].get("items").is_none(),
+            "the provider must not invent an element contract"
+        );
     }
 
     #[test]
@@ -1046,6 +1093,71 @@ mod tests {
         });
         sanitize_schema_for_gemini(&mut schema);
         assert_eq!(schema["items"]["type"], "integer");
+    }
+
+    #[test]
+    fn should_preserve_object_array_contract_when_sanitizing() {
+        let mut schema = serde_json::json!({
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "id": {"type": "string"},
+                    "label": {"type": "string"},
+                    "style": {"type": "string"}
+                },
+                "required": ["id", "label"]
+            }
+        });
+        let expected = schema["items"].clone();
+
+        sanitize_schema_for_gemini(&mut schema);
+
+        assert_eq!(schema["items"], expected);
+    }
+
+    #[test]
+    fn should_isolate_tool_when_array_element_contract_is_unknown() {
+        let tools = vec![
+            ToolSpec {
+                name: "unknown_array".into(),
+                description: "Malformed external tool schema".into(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "values": {"type": "array"}
+                    }
+                }),
+            },
+            ToolSpec {
+                name: "object_array".into(),
+                description: "Valid object-array contract".into(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "values": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "id": {"type": "string"}
+                                }
+                            }
+                        }
+                    }
+                }),
+            },
+        ];
+
+        let gemini_tools = build_gemini_tools(&tools).expect("one valid tool remains");
+        let declarations = &gemini_tools[0].function_declarations;
+
+        assert_eq!(declarations.len(), 1);
+        assert_eq!(declarations[0].name, "object_array");
+        assert_eq!(
+            declarations[0].parameters["properties"]["values"]["items"]["type"],
+            "object"
+        );
     }
 
     #[test]
@@ -1072,8 +1184,8 @@ mod tests {
                 .is_none()
         );
         assert_eq!(
-            schema["properties"]["nested"]["properties"]["list"]["items"]["type"],
-            "string"
+            schema["properties"]["nested"]["properties"]["list"]["items"],
+            serde_json::json!({})
         );
     }
 
@@ -1451,7 +1563,7 @@ mod tests {
             reasoning_effort: Some(ReasoningEffort::Low),
             ..Default::default()
         };
-        let gen_config = build_gemini_generation_config(&config);
+        let gen_config = build_gemini_generation_config(&config, "gemini/test").unwrap();
         let tc = gen_config.thinking_config.unwrap();
         assert_eq!(tc.thinking_budget, Some(1024));
     }
@@ -1463,7 +1575,7 @@ mod tests {
             reasoning_effort: Some(ReasoningEffort::High),
             ..Default::default()
         };
-        let gen_config = build_gemini_generation_config(&config);
+        let gen_config = build_gemini_generation_config(&config, "gemini/test").unwrap();
         let tc = gen_config.thinking_config.unwrap();
         assert!(tc.thinking_budget.is_none());
     }
@@ -1471,7 +1583,7 @@ mod tests {
     #[test]
     fn test_no_thinking_config_by_default() {
         let config = ChatConfig::default();
-        let gen_config = build_gemini_generation_config(&config);
+        let gen_config = build_gemini_generation_config(&config, "gemini/test").unwrap();
         assert!(gen_config.thinking_config.is_none());
     }
 
@@ -1482,7 +1594,7 @@ mod tests {
             response_format: Some(ResponseFormat::JsonObject),
             ..Default::default()
         };
-        let gen_config = build_gemini_generation_config(&config);
+        let gen_config = build_gemini_generation_config(&config, "gemini/test").unwrap();
         assert_eq!(
             gen_config.response_mime_type.as_deref(),
             Some("application/json")
@@ -1501,7 +1613,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        let gen_config = build_gemini_generation_config(&config);
+        let gen_config = build_gemini_generation_config(&config, "gemini/test").unwrap();
         assert_eq!(
             gen_config.response_mime_type.as_deref(),
             Some("application/json")
@@ -1509,6 +1621,62 @@ mod tests {
         // additionalProperties should be sanitized away
         let schema = gen_config.response_schema.unwrap();
         assert!(schema.get("additionalProperties").is_none());
+    }
+
+    #[test]
+    fn should_reject_response_schema_when_array_items_are_missing() {
+        use crate::config::ResponseFormat;
+        let config = ChatConfig {
+            response_format: Some(ResponseFormat::JsonSchema {
+                name: "test".into(),
+                schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "values": {"type": "array"}
+                    }
+                }),
+                strict: true,
+            }),
+            ..Default::default()
+        };
+
+        let error = build_gemini_generation_config(&config, "gemini/test")
+            .expect_err("missing array items must fail before the provider request");
+        let llm_error = error
+            .downcast_ref::<crate::error::LlmError>()
+            .expect("failure should remain a classified LLM error");
+        assert!(matches!(
+            llm_error.kind,
+            crate::error::LlmErrorKind::InvalidRequest { .. }
+        ));
+        assert!(llm_error.message.contains("missing or empty `items`"));
+        assert_eq!(llm_error.provider, "gemini/test");
+    }
+
+    #[test]
+    fn should_reject_response_schema_when_array_items_are_empty() {
+        use crate::config::ResponseFormat;
+        let config = ChatConfig {
+            response_format: Some(ResponseFormat::JsonSchema {
+                name: "test".into(),
+                schema: serde_json::json!({
+                    "type": "array",
+                    "items": {}
+                }),
+                strict: true,
+            }),
+            ..Default::default()
+        };
+
+        let error = build_gemini_generation_config(&config, "gemini/test")
+            .expect_err("empty array items must fail before the provider request");
+        let llm_error = error
+            .downcast_ref::<crate::error::LlmError>()
+            .expect("failure should remain a classified LLM error");
+        assert!(matches!(
+            llm_error.kind,
+            crate::error::LlmErrorKind::InvalidRequest { .. }
+        ));
     }
 
     #[test]
