@@ -120,7 +120,7 @@ fn rpc_error_to_status(err: &RpcError) -> StatusCode {
 /// here would mint an admin session instead of the documented first-run 404.
 /// `is_login_ready_email` rejects it (and any empty/placeholder email),
 /// leaving only genuine solo profiles created via `profile/local/create`.
-fn resolve_solo_user(state: &AppState) -> Option<User> {
+pub(crate) fn resolve_solo_user(state: &AppState) -> Option<User> {
     let store = state.user_store.as_ref()?;
     let mut users: Vec<User> = store.list().ok()?;
     users.retain(|u| is_top_level_profile_id(state, &u.id) && is_login_ready_email(&u.email));
@@ -144,10 +144,50 @@ async fn mint_solo_session(
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
 
+/// Derive `(username, email)` from a display name for name-only onboarding.
+///
+/// The username becomes both the user id and the profile id, so it must
+/// satisfy the same constraints as `normalize_local_username` (ASCII
+/// alnum + separators, 1-64 chars, not a reserved channel name). The email
+/// is a clearly-local placeholder on the `solo.local` domain: it passes
+/// `validate_local_email`, is `is_login_ready_email`-compatible (it can
+/// never equal the `admin@localhost` placeholder), and signals in the UI
+/// that no real address was ever collected.
+fn derive_solo_credentials(name: &str) -> (String, String) {
+    let mut username = String::new();
+    let mut last_was_dash = false;
+    for c in name.trim().chars() {
+        if c.is_ascii_alphanumeric() {
+            username.push(c.to_ascii_lowercase());
+            last_was_dash = false;
+        } else if !username.is_empty() && !last_was_dash {
+            username.push('-');
+            last_was_dash = true;
+        }
+    }
+    let mut username = username.trim_matches('-').to_owned();
+    // ASCII-only at this point, so byte truncation is char-boundary safe;
+    // re-trim a separator the cut may have exposed.
+    username.truncate(64);
+    let mut username = username.trim_end_matches('-').to_owned();
+    if username.is_empty() {
+        username = "user".to_owned();
+    }
+    if octos_core::is_reserved_channel_name(&username) {
+        username = format!("{username}-user");
+    }
+    let email = format!("{username}@solo.local");
+    (username, email)
+}
+
 /// `POST /api/auth/solo/create` — onboard a local profile AND log in.
 ///
 /// Public route (no auth middleware): the whole point is that no credential
 /// exists yet. Gated at request time by [`solo_login_allowed`].
+///
+/// `username` / `email` may be left blank: they are derived from `name`
+/// (see [`derive_solo_credentials`]) so the SPA's first-run form can ask
+/// for a display name and nothing else.
 pub async fn solo_create(
     State(state): State<Arc<AppState>>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
@@ -155,6 +195,16 @@ pub async fn solo_create(
     Json(params): Json<ProfileLocalCreateParams>,
 ) -> Result<Json<SoloCreateResponse>, StatusCode> {
     solo_login_allowed(&state, Some(addr.ip()), &headers)?;
+    let mut params = params;
+    if params.username.trim().is_empty() || params.email.trim().is_empty() {
+        let (derived_username, derived_email) = derive_solo_credentials(&params.name);
+        if params.username.trim().is_empty() {
+            params.username = derived_username;
+        }
+        if params.email.trim().is_empty() {
+            params.email = derived_email;
+        }
+    }
     let result = create_or_get_local_solo_profile(&state, params)
         .map_err(|err| rpc_error_to_status(&err))?;
     // The local solo owner is created with the Admin role
@@ -452,6 +502,114 @@ mod tests {
         .await
         .expect_err("an invalid username must surface as a 400");
         assert_eq!(err, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn solo_create_derives_credentials_from_name_only() {
+        // First-run UX: the SPA's solo onboarding asks ONLY for a display
+        // name. Empty username/email must be derived server-side, and the
+        // derived email must be login-ready so re-login resolves the user.
+        let dir = tempfile::tempdir().unwrap();
+        let state = solo_state(dir.path());
+
+        let Json(resp) = solo_create(
+            State(state.clone()),
+            loopback(),
+            no_headers(),
+            Json(ProfileLocalCreateParams {
+                requested_id: None,
+                name: "Ada Lovelace".into(),
+                username: String::new(),
+                email: String::new(),
+                make_default: None,
+            }),
+        )
+        .await
+        .expect("name-only create should derive credentials");
+
+        assert_eq!(resp.result.user_id, "ada-lovelace");
+
+        let Json(login) = solo_login(State(state), loopback(), no_headers())
+            .await
+            .expect("derived user must resolve on re-login");
+        assert_eq!(login.user.id, "ada-lovelace");
+        assert_eq!(login.user.email, "ada-lovelace@solo.local");
+    }
+
+    #[tokio::test]
+    async fn solo_create_derive_falls_back_for_non_ascii_name() {
+        // A name with no ASCII alphanumerics (e.g. CJK) cannot produce a
+        // username; fall back to a stable default rather than failing.
+        let dir = tempfile::tempdir().unwrap();
+        let state = solo_state(dir.path());
+
+        let Json(resp) = solo_create(
+            State(state.clone()),
+            loopback(),
+            no_headers(),
+            Json(ProfileLocalCreateParams {
+                requested_id: None,
+                name: "王伟".into(),
+                username: String::new(),
+                email: String::new(),
+                make_default: None,
+            }),
+        )
+        .await
+        .expect("non-ASCII name should still onboard");
+
+        assert_eq!(resp.result.user_id, "user");
+    }
+
+    #[tokio::test]
+    async fn solo_create_derived_email_never_matches_admin_placeholder() {
+        // `resolve_solo_user` excludes the `admin@localhost` placeholder.
+        // A solo owner named "admin" must still get a login-ready derived
+        // email, otherwise their re-login would 404 forever.
+        let dir = tempfile::tempdir().unwrap();
+        let state = solo_state(dir.path());
+
+        let Json(resp) = solo_create(
+            State(state.clone()),
+            loopback(),
+            no_headers(),
+            Json(ProfileLocalCreateParams {
+                requested_id: None,
+                name: "admin".into(),
+                username: String::new(),
+                email: String::new(),
+                make_default: None,
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.result.user_id, "admin");
+
+        let Json(login) = solo_login(State(state), loopback(), no_headers())
+            .await
+            .expect("admin-named solo owner must still resolve");
+        assert_eq!(login.user.id, "admin");
+        assert_ne!(login.user.email, "admin@localhost");
+    }
+
+    #[test]
+    fn derive_credentials_avoids_reserved_channel_names() {
+        // The username becomes the profile id, which rejects reserved
+        // channel names — derive must sidestep them up front.
+        let (username, _email) = derive_solo_credentials("api");
+        assert_eq!(username, "api-user");
+    }
+
+    #[test]
+    fn derive_credentials_slugifies_and_truncates() {
+        let (username, email) = derive_solo_credentials("  Ada   Lovelace  ");
+        assert_eq!(username, "ada-lovelace");
+        assert_eq!(email, "ada-lovelace@solo.local");
+
+        let long = "a".repeat(200);
+        let (username, _) = derive_solo_credentials(&long);
+        assert!(username.len() <= 64);
+        assert!(!username.is_empty());
     }
 
     #[tokio::test]
