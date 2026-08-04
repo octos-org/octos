@@ -394,11 +394,32 @@ impl AcpSharedStores {
         );
         let llm = bundle.llm.clone();
 
+        // Degraded rather than fatal when the redb lock is already held.
+        //
+        // The lock is exclusive and process-wide, so `octos acp` running
+        // alongside `octos serve` — or an embedder starting a second agent
+        // before the first has finished letting go — failed here outright,
+        // reporting "failed to open episode store" for a condition that has
+        // nothing to do with the turn the client asked for. Gateway already
+        // takes a degraded handle for exactly this reason (see the docs on
+        // `open_or_degraded`).
+        //
+        // Only `DatabaseAlreadyOpen` degrades; corruption, I/O and permission
+        // errors still bubble up. The cost of degrading is episodic memory:
+        // writes no-op and reads come back empty for the process's lifetime, so
+        // say so rather than losing recall silently.
         let memory = Arc::new(
-            EpisodeStore::open(&data_dir)
+            EpisodeStore::open_or_degraded(&data_dir)
                 .await
                 .wrap_err("failed to open episode store")?,
         );
+        if memory.is_degraded() {
+            tracing::warn!(
+                data_dir = %data_dir.display(),
+                "episode store already open elsewhere; continuing without episodic memory \
+                 (recall returns empty and new episodes are not saved)",
+            );
+        }
         let memory_store = Arc::new(
             MemoryStore::open(&data_dir)
                 .await
