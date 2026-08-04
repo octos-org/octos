@@ -970,6 +970,92 @@ fn should_restore_completed_and_failed_truth_after_restart() {
     assert!(failed_task.child_joined_at.is_none());
 }
 
+fn ledger_line_count(path: &std::path::Path) -> usize {
+    std::fs::read_to_string(path)
+        .unwrap_or_default()
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .count()
+}
+
+#[test]
+fn should_not_rewrite_ledger_when_reenabling_same_path() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let ledger_path = dir.path().join("tasks.jsonl");
+
+    let supervisor = TaskSupervisor::new();
+    supervisor.enable_persistence(&ledger_path).unwrap();
+    let task_id = supervisor.register_with_lineage("search", "call-1", Some("api:session"), None);
+    supervisor.mark_completed(&task_id, vec![]);
+
+    let lines_after_first_enable = ledger_line_count(&ledger_path);
+
+    // The skill-action job view/invoke paths re-enable persistence on the
+    // SHARED session supervisor on every request (#1906). With persistence
+    // already on for this ledger, everything since has been appended
+    // through the normal transition path — a repeat enable must be a
+    // no-op, not a full snapshot rewrite.
+    let restored = supervisor.enable_persistence(&ledger_path).unwrap();
+    assert_eq!(
+        restored, 1,
+        "repeat enable returns the live task total, same as a full enable"
+    );
+    assert_eq!(
+        ledger_line_count(&ledger_path),
+        lines_after_first_enable,
+        "same-path re-enable must not append snapshots"
+    );
+}
+
+#[test]
+fn should_not_reappend_restored_rows_when_fresh_supervisor_loads_ledger() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let ledger_path = dir.path().join("tasks.jsonl");
+
+    let supervisor = TaskSupervisor::new();
+    supervisor.enable_persistence(&ledger_path).unwrap();
+    let done = supervisor.register_with_lineage("fm_tts", "call-1", Some("api:session"), None);
+    supervisor.mark_completed(&done, vec![]);
+    let lines_before = ledger_line_count(&ledger_path);
+
+    // A fresh supervisor that only RESTORES an existing ledger (the
+    // skill-action list path builds one per request) must not re-append
+    // snapshots for rows it just read — they are already on disk.
+    let restored = TaskSupervisor::new();
+    let count = restored.enable_persistence(&ledger_path).unwrap();
+    assert_eq!(count, 1);
+    assert_eq!(restored.get_all_tasks().len(), 1);
+    assert_eq!(
+        ledger_line_count(&ledger_path),
+        lines_before,
+        "read-only restore must leave the ledger untouched"
+    );
+}
+
+#[test]
+fn should_persist_preexisting_in_memory_tasks_when_enabling_persistence() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let ledger_path = dir.path().join("tasks.jsonl");
+
+    // A task scheduled BEFORE persistence is enabled (the startup window
+    // the snapshot loop exists for) must still land on disk.
+    let supervisor = TaskSupervisor::new();
+    let task_id = supervisor.register_with_lineage("search", "call-1", Some("api:session"), None);
+    supervisor.mark_completed(&task_id, vec![]);
+    assert_eq!(ledger_line_count(&ledger_path), 0, "nothing persisted yet");
+
+    supervisor.enable_persistence(&ledger_path).unwrap();
+    assert!(
+        ledger_line_count(&ledger_path) > 0,
+        "pre-existing in-memory task must be persisted on enable"
+    );
+
+    let restored = TaskSupervisor::new();
+    restored.enable_persistence(&ledger_path).unwrap();
+    assert_eq!(restored.get_all_tasks().len(), 1);
+    assert_eq!(restored.get_all_tasks()[0].id, task_id);
+}
+
 #[test]
 fn should_pass_through_mark_completed_for_skill_reported_files() {
     // Supervisor no longer validates artifact content — it records the

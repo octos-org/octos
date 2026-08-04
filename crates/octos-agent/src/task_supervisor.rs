@@ -1291,6 +1291,14 @@ impl TaskSupervisor {
 
     /// Enable append-only persistence for task snapshots and restore existing state.
     ///
+    /// Re-enabling with the SAME ledger path is a transparent no-op: every
+    /// mutation since the first enable has been appended through the normal
+    /// transition path, so the reload/resnapshot/sweep below would add
+    /// nothing — yet the skill-action job view/invoke paths re-enable on
+    /// every request over the shared session supervisor, and each such call
+    /// used to rewrite the whole ledger (#1906). A repeat returns the live
+    /// task total, exactly what a full run would report.
+    ///
     /// At the end of replay, sweeps the in-memory map for any task whose
     /// `runtime_state` is non-terminal (anything other than `Completed`,
     /// `Failed`, or `Cancelled`). Those tasks are orphans — the worker
@@ -1309,18 +1317,38 @@ impl TaskSupervisor {
     /// a heartbeat-based reaper, which is a follow-up if observed.
     pub fn enable_persistence(&self, path: impl Into<PathBuf>) -> std::io::Result<usize> {
         let path = path.into();
+        // Idempotence guard (#1906): already persisting to THIS ledger —
+        // nothing new to restore and nothing stale to re-append.
+        {
+            let guard = self
+                .persistence_path
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if guard.as_ref() == Some(&path) {
+                return Ok(self.tasks.lock().unwrap_or_else(|e| e.into_inner()).len());
+            }
+        }
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
 
         let ledger_path = path.display().to_string();
         let restored = Self::load_persisted_tasks(&path)?;
+        // Rows whose DISK version won the merge (or that exist only on disk).
+        // They are already persisted verbatim, so the snapshot pass below
+        // must skip them — re-appending every restored row on each enable
+        // made a fresh supervisor's read-only restore grow the ledger by
+        // its full length per call (#1906). Tasks absent from this set
+        // (in-memory work scheduled before enable, or memory state newer
+        // than the ledger) are the only ones the snapshot pass writes.
+        let mut restored_won: HashSet<String> = HashSet::new();
         {
             let mut tasks = self.tasks.lock().unwrap_or_else(|e| e.into_inner());
             for (task_id, task) in restored {
                 match tasks.get(&task_id) {
                     Some(existing) if existing.updated_at >= task.updated_at => {}
                     _ => {
+                        restored_won.insert(task_id.clone());
                         tasks.insert(task_id, task);
                     }
                 }
@@ -1341,7 +1369,11 @@ impl TaskSupervisor {
 
         let snapshots: Vec<BackgroundTask> = {
             let tasks = self.tasks.lock().unwrap_or_else(|e| e.into_inner());
-            tasks.values().cloned().collect()
+            tasks
+                .values()
+                .filter(|task| !restored_won.contains(&task.id))
+                .cloned()
+                .collect()
         };
         for task in snapshots {
             self.persist_snapshot(&task);
