@@ -1232,9 +1232,15 @@ impl Tool for RunPipelineTool {
         // synthesize a payload so `files_to_send` is non-empty). Keep the
         // synthetic report under `working_dir` so the spawn_only send_file path
         // can deliver it; system temp is outside that allowlist.
-        let synthetic_dir = effective_working_dir
-            .join("skill-output")
-            .join("run_pipeline");
+        // SHARED dir, deliberately NOT the per-run dir. Per-run isolation exists
+        // to stop node workers reading each other's `findings-*.md`; the final
+        // REPORT is the opposite case — it must stay at a stable, predictable
+        // path. `send_file` only delivers paths under the tool working dir, so
+        // building this from the run dir put the deliverable outside the
+        // allowlist and broke delivery outright (caught by
+        // `text_only_ir_pipeline_synthesizes_report_under_working_dir`), and it
+        // also made the report unfindable for any later turn.
+        let synthetic_dir = shared_working_dir.join("skill-output").join("run_pipeline");
         let delivery = resolve_report_delivery(
             &result.output,
             &result.files_modified,
