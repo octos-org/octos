@@ -2201,9 +2201,19 @@ mod tests {
 
         let root = TempDir::new().unwrap();
         let runs_root = root.path().join("pipeline-runs");
-        // Create 25 run dirs (monotonic names so lexicographic == recency).
+        // Create 25 run dirs with EXPLICIT, monotonic mtimes.
+        //
+        // Retention sorts by mtime, not by name, so creating these in a tight
+        // loop and trusting the filesystem clock makes the test environment-
+        // dependent: on a coarse-granularity filesystem all 25 land on the same
+        // mtime, `sort_by_key` (stable) then falls back to `read_dir` order —
+        // which is arbitrary on Linux — and an arbitrary 5 get pruned. That is
+        // exactly how this test passed on APFS (nanosecond mtimes) and failed
+        // in CI. Same reason the age-vs-name test below sets mtimes by hand.
         for i in 0..25 {
-            std::fs::create_dir_all(runs_root.join(format!("run-{i:03}"))).unwrap();
+            let dir = runs_root.join(format!("run-{i:03}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            set_mtime(&dir, 1_000 + i as u64);
         }
         // A `latest` entry (as a plain file here) and an unrelated file must survive.
         std::fs::write(runs_root.join("latest"), "run-024").unwrap();
