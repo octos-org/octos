@@ -988,8 +988,51 @@ impl Tool for RunPipelineTool {
         // it. When no scope is present we fall back to the tool's
         // working dir — byte-for-byte identical to pre-Phase-2-A
         // behaviour.
-        let effective_working_dir =
+        let shared_working_dir =
             resolve_pipeline_working_dir(&self.working_dir, host_context.session_scope.as_deref());
+
+        // Per-run working-directory isolation: node workers (search fan-out,
+        // analyze, synthesize) follow a "read every findings-*.md" deliverable
+        // contract. When all runs share one flat working dir, findings files
+        // from UNRELATED runs accumulate (research A/B, judge probes, ad-hoc
+        // tests) and the convergence nodes try to read all of them — the
+        // observed 1800s synthesize timeouts (direct evidence: the shared dir
+        // held 27 findings files spanning multiple runs, and the analyze node's
+        // prompt instructs reading each one). Scope each run to its own
+        // subdirectory so a run's workers only ever see their own findings.
+        //
+        // `graph_id` is already computed above (IR id or `graph_id_from_dot`)
+        // and `run_started_at` was captured at entry, so the run-scoped dir is
+        // unique per invocation without re-deriving a timestamp. This is
+        // additive-only: nothing is deleted from the shared dir, and final
+        // report files written via write_file land in the run dir (callers
+        // that surface the report read it back from the same executor run, so
+        // delivery is unaffected).
+        let run_id = generate_run_id(&graph_id, run_started_at);
+        let runs_root = shared_working_dir.join("pipeline-runs");
+        let run_working_dir = runs_root.join(&run_id);
+        let effective_working_dir = if let Err(e) = std::fs::create_dir_all(&run_working_dir) {
+            // Fall back to the shared dir on mkdir failure rather than fail
+            // the run — isolation is a hygiene improvement, not a hard
+            // requirement for correctness.
+            tracing::warn!(
+                error = %e,
+                dir = %run_working_dir.display(),
+                "pipeline: failed to create per-run working dir; falling back to shared dir"
+            );
+            shared_working_dir.clone()
+        } else {
+            // Keep a stable `pipeline-runs/latest` entry pointing at the most
+            // recent run dir so follow-up `read_file findings-3.md` (relative
+            // to the session workspace) and human browsing still find the
+            // files at a predictable path. On Unix use a symlink; on platforms
+            // where symlinks need privilege (Windows), a plain text pointer
+            // file is the portable fallback.
+            update_latest_run_link(&runs_root, &run_id, &run_working_dir);
+            // Bound unbounded growth: retain only the most recent run dirs.
+            prune_old_run_dirs(&runs_root, MAX_RETAINED_RUN_DIRS);
+            run_working_dir
+        };
 
         // Build the workspace_context BEFORE moving `effective_working_dir`
         // into the struct literal — the policy lookup reads from the
@@ -1080,7 +1123,8 @@ impl Tool for RunPipelineTool {
         // missing audit-trail evidence — exactly the runs validators
         // most need to inspect.
         // graph_id computed at acquisition (works for both IR and DOT paths).
-        let run_id = generate_run_id(&graph_id, run_started_at);
+        // run_id already computed above for per-run working-dir isolation —
+        // reuse it so the audit marker and the run dir share one identity.
 
         let result = match result {
             Ok(inner) => inner?,
@@ -1188,9 +1232,15 @@ impl Tool for RunPipelineTool {
         // synthesize a payload so `files_to_send` is non-empty). Keep the
         // synthetic report under `working_dir` so the spawn_only send_file path
         // can deliver it; system temp is outside that allowlist.
-        let synthetic_dir = effective_working_dir
-            .join("skill-output")
-            .join("run_pipeline");
+        // SHARED dir, deliberately NOT the per-run dir. Per-run isolation exists
+        // to stop node workers reading each other's `findings-*.md`; the final
+        // REPORT is the opposite case — it must stay at a stable, predictable
+        // path. `send_file` only delivers paths under the tool working dir, so
+        // building this from the run dir put the deliverable outside the
+        // allowlist and broke delivery outright (caught by
+        // `text_only_ir_pipeline_synthesizes_report_under_working_dir`), and it
+        // also made the report unfindable for any later turn.
+        let synthetic_dir = shared_working_dir.join("skill-output").join("run_pipeline");
         let delivery = resolve_report_delivery(
             &result.output,
             &result.files_modified,
@@ -1626,6 +1676,81 @@ fn generate_run_id(graph_id: &str, started_at: std::time::SystemTime) -> String 
     }
 }
 
+/// How many per-run working directories to retain under `pipeline-runs/`.
+/// Each pipeline run creates its own subdirectory (see the isolation fix);
+/// without a bound, a frequently-run pipeline accumulates run dirs forever.
+/// Keep only the most recent this many and prune the rest.
+const MAX_RETAINED_RUN_DIRS: usize = 20;
+
+/// Point a stable `latest` entry inside `runs_root` at the most recent run
+/// dir. This preserves BOTH the isolation property (each run gets its own
+/// dir) AND a predictable path for follow-up `read_file findings-N.md` calls
+/// or human browsing, which would otherwise silently stop finding files once
+/// they moved under `pipeline-runs/<run_id>/`.
+///
+/// Best-effort: any failure (e.g. existing non-symlink path, unsupported
+/// platform) is logged and ignored — it must never fail the run.
+fn update_latest_run_link(runs_root: &std::path::Path, _run_id: &str, run_dir: &std::path::Path) {
+    let latest = runs_root.join("latest");
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::symlink;
+        // Remove a stale symlink/dir entry first (ignore "not found").
+        let _ = std::fs::remove_file(&latest);
+        if let Err(e) = symlink(run_dir, &latest) {
+            tracing::warn!(error = %e, "pipeline: failed to update pipeline-runs/latest symlink");
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        // Portable fallback: a text pointer file naming the current run dir.
+        if let Err(e) = std::fs::write(&latest, _run_id) {
+            tracing::warn!(error = %e, "pipeline: failed to write pipeline-runs/latest pointer");
+        }
+    }
+}
+
+/// Delete all but the most recent `keep` run directories under `runs_root`.
+/// "Most recent" is determined by directory **mtime**, not by name. Sorting
+/// by path would order by pipeline NAME first (run ids are
+/// `{graph}-{secs}-{nanos}-{pid}-{counter}`, graph name leading) and only by
+/// timestamp within a name — which would prune the NEWEST runs of an
+/// alphabetically-earlier pipeline while keeping older ones of a later one
+/// (review HIGH). mtime reflects actual creation order regardless of name,
+/// and does not re-couple pruning to the id format.
+///
+/// Best-effort: individual deletion failures are logged and skipped, and a
+/// directory that is not a run dir (e.g. the `latest` symlink, or a file) is
+/// never touched. Never fails the run.
+fn prune_old_run_dirs(runs_root: &std::path::Path, keep: usize) {
+    let Ok(entries) = std::fs::read_dir(runs_root) else {
+        return;
+    };
+    let mut run_dirs: Vec<std::path::PathBuf> = entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.is_dir() && p.file_name().is_some_and(|n| n != "latest"))
+        .collect();
+    if run_dirs.len() <= keep {
+        return;
+    }
+    // Sort oldest-first by mtime; fall back to the epoch on metadata error so
+    // unreadable dirs sort to the front (pruned first, the safe direction).
+    run_dirs.sort_by_key(|p| {
+        std::fs::metadata(p)
+            .and_then(|m| m.modified())
+            .unwrap_or(std::time::UNIX_EPOCH)
+    });
+    let to_remove = run_dirs.len() - keep;
+    for old in run_dirs.into_iter().take(to_remove) {
+        if let Err(e) = std::fs::remove_dir_all(&old) {
+            tracing::warn!(error = %e, dir = %old.display(), "pipeline: failed to prune old run dir");
+        }
+    }
+}
+
 /// Format a `SystemTime` as a coarse RFC3339 timestamp without pulling
 /// in `chrono`. Falls back to the unix epoch on clock skew.
 fn systemtime_to_rfc3339(t: std::time::SystemTime) -> String {
@@ -2053,6 +2178,164 @@ mod tests {
             id1, id2,
             "two run ids minted in the same second for the same graph must differ"
         );
+    }
+
+    /// Per-run working-dir isolation: two runs of the SAME graph must land in
+    /// DIFFERENT run directories, so findings files never mix across runs.
+    /// This pins the actual fix — a regression where `run_id` reuse made the
+    /// dirs collide is exactly the failure mode the isolation depends on
+    /// avoiding (review finding #4).
+    #[test]
+    fn per_run_working_dirs_differ_for_same_graph() {
+        let t = std::time::SystemTime::now();
+        let id1 = generate_run_id("deep_research", t);
+        let id2 = generate_run_id("deep_research", t);
+        let root = std::path::Path::new("/tmp/working");
+        let dir1 = root.join("pipeline-runs").join(&id1);
+        let dir2 = root.join("pipeline-runs").join(&id2);
+        assert_ne!(
+            dir1, dir2,
+            "two runs of the same graph must get distinct working dirs so findings never mix"
+        );
+    }
+
+    /// `prune_old_run_dirs` retains only the N most recent run dirs and never
+    /// touches the `latest` entry or non-directory files (review finding #2).
+    #[test]
+    fn prune_old_run_dirs_retains_most_recent_and_skips_latest() {
+        use tempfile::TempDir;
+
+        let root = TempDir::new().unwrap();
+        let runs_root = root.path().join("pipeline-runs");
+        // Create 25 run dirs with EXPLICIT, monotonic mtimes.
+        //
+        // Retention sorts by mtime, not by name, so creating these in a tight
+        // loop and trusting the filesystem clock makes the test environment-
+        // dependent: on a coarse-granularity filesystem all 25 land on the same
+        // mtime, `sort_by_key` (stable) then falls back to `read_dir` order —
+        // which is arbitrary on Linux — and an arbitrary 5 get pruned. That is
+        // exactly how this test passed on APFS (nanosecond mtimes) and failed
+        // in CI. Same reason the age-vs-name test below sets mtimes by hand.
+        for i in 0..25 {
+            let dir = runs_root.join(format!("run-{i:03}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            set_mtime(&dir, 1_000 + i as u64);
+        }
+        // A `latest` entry (as a plain file here) and an unrelated file must survive.
+        std::fs::write(runs_root.join("latest"), "run-024").unwrap();
+        std::fs::write(runs_root.join("notes.txt"), "keep me").unwrap();
+
+        prune_old_run_dirs(&runs_root, 20);
+
+        let remaining: Vec<_> = std::fs::read_dir(&runs_root)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().into_string().unwrap())
+            .collect();
+        let dir_count = remaining
+            .iter()
+            .filter(|n| runs_root.join(n).is_dir())
+            .count();
+        assert_eq!(dir_count, 20, "must retain exactly the 20 most recent dirs");
+        assert!(runs_root.join("run-024").is_dir(), "newest dir retained");
+        assert!(!runs_root.join("run-000").exists(), "oldest dir pruned");
+        assert!(
+            runs_root.join("latest").exists(),
+            "latest entry never pruned"
+        );
+        assert!(
+            runs_root.join("notes.txt").exists(),
+            "non-run file never pruned"
+        );
+    }
+
+    /// Review HIGH: retention must prune by AGE, not by pipeline NAME. Run ids
+    /// are `{graph}-{secs}-{nanos}-{pid}-{counter}` — graph name leads, so a
+    /// path sort orders by name first and would delete the NEWEST runs of an
+    /// alphabetically-earlier pipeline while keeping older ones of a later
+    /// one. This test uses two graph names with INTERLEAVED creation times so
+    /// name order and age order disagree — the case that fails under name sort.
+    #[test]
+    fn prune_old_run_dirs_prunes_by_age_not_pipeline_name() {
+        use tempfile::TempDir;
+
+        let root = TempDir::new().unwrap();
+        let runs_root = root.path().join("pipeline-runs");
+
+        // Interleave two pipelines whose names sort differently than their
+        // creation order: `aaa_old` (created FIRST, oldest) and `zzz_new`
+        // (created LAST, newest). A name sort would keep `aaa_*` (sorts first)
+        // and prune `zzz_*` (sorts last) even though `zzz_new` is the newest.
+        // We create many so the quota forces pruning.
+        //
+        // mtimes are bumped explicitly because same-second creation would make
+        // mtime ordering unreliable on coarse filesystems.
+        for i in 0..15 {
+            let d = runs_root.join(format!("aaa_old-{i:03}"));
+            std::fs::create_dir_all(&d).unwrap();
+            set_mtime(&d, 1_000 + i as u64); // oldest
+        }
+        for i in 0..15 {
+            let d = runs_root.join(format!("zzz_new-{i:03}"));
+            std::fs::create_dir_all(&d).unwrap();
+            set_mtime(&d, 2_000 + i as u64); // newest
+        }
+
+        prune_old_run_dirs(&runs_root, 15);
+
+        // The 15 NEWEST (zzz_new-*) must be retained; the 15 oldest (aaa_old-*)
+        // pruned — even though `aaa_*` sorts BEFORE `zzz_*` by name.
+        assert!(
+            runs_root.join("zzz_new-014").is_dir(),
+            "newest run (zzz_new) must be retained despite sorting last by name"
+        );
+        assert!(
+            runs_root.join("zzz_new-000").is_dir(),
+            "all zzz_new runs are within the 15 most recent"
+        );
+        assert!(
+            !runs_root.join("aaa_old-000").exists(),
+            "oldest run (aaa_old) must be pruned despite sorting first by name"
+        );
+        assert!(
+            !runs_root.join("aaa_old-014").exists(),
+            "all aaa_old runs are older than the quota cutoff"
+        );
+    }
+
+    /// Bump a directory's mtime to a fixed unix timestamp so mtime-ordered
+    /// pruning is deterministic in tests (creation within the same second is
+    /// otherwise too coarse to order). Uses `std::fs::File::set_modified`
+    /// (stable, cross-platform) so no external command or extra dep is needed.
+    fn set_mtime(path: &std::path::Path, secs: u64) {
+        let t = std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs);
+        let f = open_dir_for_times(path);
+        f.set_modified(t).expect("set_modified");
+    }
+
+    /// Open a DIRECTORY handle suitable for `set_modified`.
+    ///
+    /// Unix opens a directory read-only and that is enough. Windows refuses it
+    /// outright — `File::open` on a directory returns
+    /// `PermissionDenied: Access is denied` (os error 5) unless
+    /// `FILE_FLAG_BACKUP_SEMANTICS` is set, which is precisely what
+    /// `File::open` does not set. Both retention tests panicked there on
+    /// `check-windows` while passing on Unix.
+    #[cfg(not(windows))]
+    fn open_dir_for_times(path: &std::path::Path) -> std::fs::File {
+        std::fs::File::open(path).expect("open dir for set_modified")
+    }
+
+    #[cfg(windows)]
+    fn open_dir_for_times(path: &std::path::Path) -> std::fs::File {
+        use std::os::windows::fs::OpenOptionsExt;
+        // Required to obtain a handle to a DIRECTORY on Windows.
+        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(path)
+            .expect("open dir for set_modified")
     }
 
     /// #1126 codex P2 acceptance: when a pipeline run times out, a
