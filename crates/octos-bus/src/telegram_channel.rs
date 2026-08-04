@@ -267,7 +267,8 @@ impl Channel for TelegramChannel {
         // Register bot commands in Telegram's command menu
         self.set_commands().await;
 
-        let mut consecutive_failures: u32 = 0;
+        // Initialized at the top of every reconnect loop iteration below.
+        let mut consecutive_failures: u32;
         // Track the last processed update ID across reconnections to prevent
         // duplicate processing when `polling_default` resets its offset.
         let mut last_update_id: i32 = 0;

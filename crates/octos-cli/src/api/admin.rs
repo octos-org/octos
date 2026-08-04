@@ -2737,7 +2737,7 @@ pub async fn install_platform_skill(
     ))?;
     let octos_home = store.octos_home_dir();
 
-    if octos_agent::bootstrap::bootstrap_single_skill(&octos_home, &name) {
+    if octos_agent::bootstrap::bootstrap_single_skill(octos_home, &name) {
         Ok(Json(ActionResponse {
             ok: true,
             message: Some(format!("Platform skill '{name}' installed")),
@@ -3252,7 +3252,7 @@ pub async fn platform_models_enable(
         "admin not configured".into(),
     ))?;
     let octos_home = store.octos_home_dir();
-    let mut allowlist = octos_llm::ominix::PlatformModels::load_or_create(&octos_home);
+    let mut allowlist = octos_llm::ominix::PlatformModels::load_or_create(octos_home);
 
     if allowlist.find(model_id).is_some() {
         return Ok(Json(serde_json::json!({
@@ -3267,7 +3267,7 @@ pub async fn platform_models_enable(
             id: model_id.to_string(),
             role: role.to_string(),
         });
-    allowlist.save(&octos_home).map_err(|e| {
+    allowlist.save(octos_home).map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("Failed to save allowlist: {e}"),
@@ -3297,7 +3297,7 @@ pub async fn platform_models_disable(
         "admin not configured".into(),
     ))?;
     let octos_home = store.octos_home_dir();
-    let mut allowlist = octos_llm::ominix::PlatformModels::load_or_create(&octos_home);
+    let mut allowlist = octos_llm::ominix::PlatformModels::load_or_create(octos_home);
 
     let before = allowlist.platform_models.len();
     allowlist.platform_models.retain(|m| m.id != model_id);
@@ -3309,7 +3309,7 @@ pub async fn platform_models_disable(
         })));
     }
 
-    allowlist.save(&octos_home).map_err(|e| {
+    allowlist.save(octos_home).map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("Failed to save allowlist: {e}"),
@@ -5091,7 +5091,7 @@ mod register_flow_tests {
             .unwrap();
 
         // Alice registers "macmini"
-        register_tenant(
+        let _ = register_tenant(
             axum::extract::State(state.clone()),
             alice_identity(),
             Json(CreateTenantRequest {
@@ -5129,7 +5129,7 @@ mod register_flow_tests {
         let (state, user_store) = test_state(&dir, DeploymentMode::Cloud);
         save_alice(&user_store);
 
-        register_tenant(
+        let _ = register_tenant(
             axum::extract::State(state.clone()),
             alice_identity(),
             Json(CreateTenantRequest {
@@ -5268,7 +5268,7 @@ mod register_flow_tests {
         let (state, user_store) = test_state(&dir, DeploymentMode::Cloud);
         save_alice(&user_store);
 
-        register_tenant(
+        let _ = register_tenant(
             axum::extract::State(state.clone()),
             alice_identity(),
             Json(CreateTenantRequest {

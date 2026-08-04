@@ -450,8 +450,8 @@ impl ProcessManager {
                     crate::auth::keychain::resolve_env_vars(&parent.config.env_vars);
                 for (key, value) in &resolved_parent {
                     // Sub-account's own env_vars take priority
-                    if !profile.config.env_vars.contains_key(key) {
-                        if !BLOCKED_ENV_VARS
+                    if !profile.config.env_vars.contains_key(key)
+                        && !BLOCKED_ENV_VARS
                             .iter()
                             .any(|blocked| key.eq_ignore_ascii_case(blocked))
                         {
@@ -487,7 +487,6 @@ impl ProcessManager {
                             }
                             cmd.env(key, value);
                         }
-                    }
                 }
             }
         }
@@ -1422,7 +1421,6 @@ impl ProcessManager {
 
     /// Allocate the next available port pair for a bridge.
     /// Checks both the in-memory bridge map and actual port availability.
-
     fn allocate_wechat_port(&self, bridges: &HashMap<String, BridgeProcess>) -> u16 {
         let used: std::collections::HashSet<u16> = bridges.values().map(|b| b.ws_port).collect();
         let mut port = 3201u16;
@@ -2011,6 +2009,9 @@ mod tests {
     // ── No port collision across allocation types ─────────────────────
 
     #[test]
+    // Deliberately asserts the ordering of compile-time port constants —
+    // the values being constant is the point of the test.
+    #[allow(clippy::assertions_on_constants)]
     fn should_have_distinct_base_ports() {
         // Verify that the base port constants are all different.
         let ports = [BRIDGE_BASE_WS_PORT, WEBHOOK_BASE_PORT, API_BASE_PORT];

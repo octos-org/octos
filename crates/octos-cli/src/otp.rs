@@ -935,7 +935,7 @@ mod tests {
         assert_eq!(code.len(), 6);
         assert!(code.chars().all(|c| c.is_ascii_digit()));
         let n: u32 = code.parse().unwrap();
-        assert!(n >= 100_000 && n < 1_000_000);
+        assert!((100_000..1_000_000).contains(&n));
     }
 
     #[test]

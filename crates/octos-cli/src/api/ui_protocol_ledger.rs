@@ -140,6 +140,11 @@ impl LedgerConfig {
 /// keys (`record_kind` / `kind` / `session_id` / payload fields) still
 /// produce serde's `duplicate field …` error rather than being silently
 /// collapsed last-wins by a `serde_json::Value` round-trip.
+// Both variants hold their full wire payload by value so a ledger record
+// round-trips through serde without an extra indirection; records are
+// appended/replayed, never matched in a hot loop, so the size difference
+// is immaterial.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "record_kind", rename_all = "snake_case")]
 pub(crate) enum UiProtocolLedgerEvent {
@@ -1100,6 +1105,9 @@ impl UiProtocolLedger {
     }
 
     #[cfg(test)]
+    // Test-only counterpart to `append_notification`; some test builds never
+    // call it, but the pair keeps ledger tests symmetric.
+    #[allow(dead_code)]
     pub(crate) fn append_progress(&self, event: UiProgressEvent) -> LedgeredUiProtocolEvent {
         self.append(UiProtocolLedgerEvent::Progress(event), None)
     }
@@ -4418,7 +4426,7 @@ mod tests {
         // maps to a lower-or-equal ledger cursor.seq. The two seq
         // spaces share a monotonic relationship because both are
         // assigned inside the same critical section.
-        results.sort_by_key(|r| envelope_seq(r));
+        results.sort_by_key(envelope_seq);
         for window in results.windows(2) {
             assert!(
                 window[0].cursor.seq < window[1].cursor.seq,

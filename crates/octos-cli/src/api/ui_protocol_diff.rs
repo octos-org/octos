@@ -1519,13 +1519,10 @@ diff --git a/src/lib.rs b/src/lib.rs
         assert_eq!(m.sessions_evicted, 1);
 
         // s1's preview is gone from RAM…
-        assert!(matches!(
-            store.get(DiffPreviewGetParams {
+        assert!(store.get(DiffPreviewGetParams {
                 session_id: s1.clone(),
                 preview_id: p1.clone(),
-            }),
-            Err(_)
-        ));
+            }).is_err());
         // …but its disk file is retained for replay-after-restart.
         let s1_dir = temp
             .path()
