@@ -154,6 +154,35 @@ impl ValidationContext {
         self
     }
 
+    /// Restrict the known-model set to what the provider router can ACTUALLY
+    /// resolve (#1901, layer 5).
+    ///
+    /// `with_known_models` is fed from the model CATALOG, which lists every
+    /// model the profile could theoretically use — 93 of them — regardless of
+    /// what the router registered. So a graph naming a catalogued-but-
+    /// unregistered model PASSED validation and then failed at runtime: the
+    /// pre-flight check certified a graph that cannot run. Worse, the rejection
+    /// message points at `model_catalog.json`, which is precisely where the
+    /// model IS present — sending the reader to the wrong file.
+    ///
+    /// Anything the router registers is resolvable, including the lane keys
+    /// (`cheap`/`strong`), so router keys are the correct authority. Callers
+    /// without a router (or with an empty one) keep the catalog-based set
+    /// rather than rejecting everything — validation must not become stricter
+    /// than reality when it has no way to know.
+    pub fn with_resolvable_models<I, S>(mut self, registered: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        let registered: BTreeSet<String> = registered.into_iter().map(Into::into).collect();
+        if registered.is_empty() {
+            return self;
+        }
+        self.known_models = registered;
+        self
+    }
+
     pub fn with_known_models<I, S>(mut self, models: I) -> Self
     where
         I: IntoIterator<Item = S>,
@@ -1055,7 +1084,22 @@ fn validate_model_name(
         Severity::Error,
         location,
         format!("unknown pipeline model '{model}'"),
-        Some("choose a model present in model_catalog.json / pipeline_models.json".into()),
+        // Deliberately does NOT say "present in model_catalog.json": once the
+        // set is router-derived, the rejected model is very often IN the
+        // catalog and simply not registered — sending the reader there is the
+        // single most misleading thing this message could do (#1901 layer 4).
+        Some(format!(
+            "'{model}' is not resolvable by this profile's provider router. \
+             Use a registered lane (e.g. `strong`, `cheap`) or a model the \
+             profile actually registers; known: [{}]",
+            context
+                .known_models
+                .iter()
+                .take(12)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ")
+        )),
     );
 }
 
@@ -1950,5 +1994,74 @@ mod tests {
         let diags = diagnostics(&graph);
         assert!(!has_errors(&diags), "unexpected errors: {diags:?}");
         assert!(!diags.iter().any(|d| d.rule == 14));
+    }
+}
+
+#[cfg(test)]
+mod resolvable_models_tests {
+    use super::*;
+
+    /// The validator must certify RESOLVABILITY, not mere presence in the
+    /// catalog (#1901, layer 5).
+    ///
+    /// `known_models` was fed from the model catalog, which lists every model
+    /// the profile could theoretically use regardless of what the provider
+    /// router registered. So a graph naming a catalogued-but-unregistered model
+    /// PASSED pre-flight and then failed at runtime — the check certified a
+    /// graph that cannot run. After #1902 it stopped crashing and silently ran
+    /// on the default provider instead, which is worse: the validator said yes,
+    /// the run looked healthy, and the requested model was never used.
+    #[test]
+    fn catalogued_but_unregistered_models_are_rejected() {
+        // The catalog knows it; the router does not register it.
+        let ctx = ValidationContext::default()
+            .with_known_models(["qwen3-max".to_string(), "strong".to_string()])
+            .with_resolvable_models(["cheap".to_string(), "strong".to_string()]);
+
+        assert!(
+            !ctx.known_models.contains("qwen3-max"),
+            "a catalogued-but-unregistered model must NOT count as known once \
+             the router is the authority"
+        );
+        assert!(
+            ctx.known_models.contains("strong"),
+            "a registered lane key must stay known"
+        );
+    }
+
+    /// With no router (or an empty one) the catalog set is kept. Validation must
+    /// not become STRICTER than reality when it has no way to know what is
+    /// registered — that would reject working graphs.
+    #[test]
+    fn an_absent_router_leaves_the_catalog_set_intact() {
+        let ctx = ValidationContext::default()
+            .with_known_models(["qwen3-max".to_string()])
+            .with_resolvable_models(Vec::<String>::new());
+
+        assert!(
+            ctx.known_models.contains("qwen3-max"),
+            "with no router keys the catalog set must be preserved, not emptied"
+        );
+    }
+
+    /// The rejection must not send the reader to `model_catalog.json` — the
+    /// model is usually IN the catalog and merely unregistered, so that advice
+    /// points at the wrong file (#1901, layer 4).
+    #[test]
+    fn rejection_names_the_router_not_the_catalog() {
+        let ctx = ValidationContext::default().with_resolvable_models(["strong".to_string()]);
+        let mut diags = Vec::new();
+        validate_model_name("qwen3-max", &ctx, GraphLocation::Graph, &mut diags);
+
+        assert_eq!(diags.len(), 1, "an unresolvable model must be diagnosed");
+        let hint = diags[0].fix_hint.clone().unwrap_or_default();
+        assert!(
+            !hint.contains("model_catalog.json"),
+            "the hint must not point at the catalog, where the model IS present: {hint}"
+        );
+        assert!(
+            hint.contains("provider router") && hint.contains("strong"),
+            "the hint must name the router and list what IS resolvable: {hint}"
+        );
     }
 }
