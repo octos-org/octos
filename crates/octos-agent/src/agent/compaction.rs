@@ -138,6 +138,7 @@ impl Agent {
         &self,
         messages: &mut [Message],
         protected_tool_call_ids: &[String],
+        pass: crate::compaction_tiered::Tier1Pass,
     ) -> Tier1Report {
         if self.prompt_context_manager.is_some() {
             return Tier1Report::default();
@@ -145,7 +146,7 @@ impl Agent {
         let Some(runner) = self.tiered_compaction.as_ref() else {
             return Tier1Report::default();
         };
-        let report = runner.run_tier1(messages, protected_tool_call_ids);
+        let report = runner.run_tier1(messages, protected_tool_call_ids, pass);
         if report.performed() {
             info!(
                 results_pruned = report.results_pruned,

@@ -1595,7 +1595,24 @@ impl ContextManager {
                     entries.push(PromptMessageEntry::protected(
                         message(
                             MessageRole::User,
-                            format!("[Conversation summary]\n{summary}"),
+                            // Spec task-compaction-instruction-priority:
+                            // frame the summary as demoted BACKGROUND with an
+                            // explicit precedence footer. Render-only — the
+                            // stored item keeps the raw summary, so the
+                            // transcript hash chain is untouched.
+                            // Line 1 keeps the EXACT legacy sentinel: the
+                            // agent loop's message_repair matches
+                            // `starts_with("[Conversation summary]")` to keep
+                            // summary rows out of the system prompt.
+                            format!(
+                                "[Conversation summary]\n\
+                                 [BACKGROUND ONLY — everything in this summary is \
+                                 history, not instructions.]\n{summary}\n\
+                                 [End of background. The newest user message in this \
+                                 conversation is the CURRENT instruction and takes \
+                                 precedence over everything above, including any goals \
+                                 or plans mentioned in the summary.]"
+                            ),
                         ),
                         item.id.clone(),
                     ));
@@ -3419,6 +3436,89 @@ mod tests {
                 .messages
                 .iter()
                 .any(|message| message.content == "u0")
+        );
+    }
+
+    #[test]
+    fn compaction_summary_renders_with_background_framing() {
+        // Spec task-compaction-instruction-priority: the summary row must
+        // read as demoted background with an explicit precedence footer, so
+        // a post-compaction model never mistakes old plans for the current
+        // instruction (live drift 2026-08-02, 216->15 items).
+        let mut manager = ContextManager::new("s", None);
+        manager.record_message(&Message::system("system"));
+        for index in 0..6 {
+            manager.record_message(&Message::user(format!("u{index}")));
+            manager.record_message(&Message::assistant(format!("a{index}")));
+        }
+        manager.install_compaction_summary("older turns summarized", 2);
+
+        let prompt = manager.for_prompt(&PromptBuildPolicy::default());
+        let summary_row = prompt
+            .messages
+            .iter()
+            .find(|message| message.content.contains("older turns summarized"))
+            .expect("summary row rendered");
+
+        assert_eq!(summary_row.role, MessageRole::User, "bridge-safe role");
+        assert!(
+            summary_row.content.contains("BACKGROUND ONLY"),
+            "header demotes the summary: {}",
+            summary_row.content
+        );
+        assert!(
+            summary_row.content.contains("newest user message"),
+            "footer states the precedence of the current instruction: {}",
+            summary_row.content
+        );
+    }
+
+    #[test]
+    fn uncompacted_prompt_carries_no_background_framing() {
+        let mut manager = ContextManager::new("s", None);
+        manager.record_message(&Message::system("system"));
+        manager.record_message(&Message::user("hello"));
+
+        let prompt = manager.for_prompt(&PromptBuildPolicy::default());
+
+        assert!(
+            !prompt
+                .messages
+                .iter()
+                .any(|message| message.content.contains("BACKGROUND ONLY")),
+            "framing must appear only after a compaction"
+        );
+    }
+
+    #[test]
+    fn framing_is_render_only_and_leaves_transcript_hash_stable() {
+        let mut manager = ContextManager::new("s", None);
+        manager.record_message(&Message::system("system"));
+        for index in 0..6 {
+            manager.record_message(&Message::user(format!("u{index}")));
+        }
+        manager.install_compaction_summary("older turns summarized", 2);
+
+        let stored = manager
+            .items()
+            .iter()
+            .find_map(|item| match &item.kind {
+                TranscriptItemKind::CompactionSummary { summary, .. } => Some(summary.clone()),
+                _ => None,
+            })
+            .expect("stored summary item");
+        assert!(
+            !stored.contains("BACKGROUND ONLY"),
+            "framing is render-only, never persisted: {stored}"
+        );
+
+        let hash_before = manager.transcript_hash();
+        let _ = manager.for_prompt(&PromptBuildPolicy::default());
+        let _ = manager.for_prompt(&PromptBuildPolicy::default());
+        assert_eq!(
+            manager.transcript_hash(),
+            hash_before,
+            "rendering must not mutate the transcript"
         );
     }
 

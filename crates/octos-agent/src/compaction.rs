@@ -951,7 +951,10 @@ const LLM_COMPACTION_SYSTEM_PROMPT: &str = "You are compacting a long conversati
 context window. Produce a CONTEXT CHECKPOINT: a concise handoff summary another LLM can use to seamlessly \
 continue the task. Include the current goal, key decisions made, progress completed and what remains, and \
 any critical constraints, data, file paths, or references. Be structured and factual — no preamble, no \
-questions, no commentary.";
+questions, no commentary. Everything you write is BACKGROUND context, not instructions: never restate \
+historical goals or plans as the current task, and never phrase the summary as marching orders. The \
+current task is defined solely by the newest user message in the conversation, which takes precedence \
+over anything you summarize.";
 
 /// Default timeout for a single LLM compaction call. The provider's own
 /// default (~300s) is far too coarse for a per-turn operation — a slow or hung
@@ -1043,6 +1046,22 @@ pub fn llm_compaction_summary(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn llm_compaction_prompt_demotes_history_to_background() {
+        // Spec task-compaction-instruction-priority: the summarizer must be
+        // told its output is background, or it restates stale plans as the
+        // "current goal" and the post-compaction model follows them instead
+        // of the newest user instruction (live drift 2026-08-02).
+        assert!(
+            super::LLM_COMPACTION_SYSTEM_PROMPT.contains("BACKGROUND"),
+            "prompt must demote summarized history to background"
+        );
+        assert!(
+            super::LLM_COMPACTION_SYSTEM_PROMPT.contains("newest user message"),
+            "prompt must anchor the current task to the newest user message"
+        );
+    }
     use super::*;
     use octos_core::ToolCall;
     use std::time::Duration;

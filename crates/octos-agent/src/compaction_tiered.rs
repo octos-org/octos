@@ -42,6 +42,19 @@ pub const DEFAULT_TIER1_MAX_AGE_TURNS: u32 = 5;
 /// Default byte threshold for immediate content-clearing (regardless of age).
 pub const DEFAULT_TIER1_MAX_SIZE_BYTES_PER_RESULT: u32 = 8 * 1024;
 
+/// Which tier-1 conditions a pass may apply. Split for provider prefix-cache
+/// (KV) friendliness: oversized results just landed near the prefix tail —
+/// rewriting them is cheap for the cache — while stale results sit deep in
+/// history, so rewriting them invalidates the whole cached prefix and is
+/// consolidated to one turn-start pass (spec kv-cache-friendly-compaction).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Tier1Pass {
+    /// Per-iteration: clear only oversized results.
+    OversizedOnly,
+    /// Turn start: clear oversized AND stale results.
+    Full,
+}
+
 /// Per-iteration stale tool-result pruning policy (tier 1).
 ///
 /// Runs in-place over the conversation and replaces a tool result's content
@@ -94,6 +107,18 @@ impl MicroCompactionPolicy {
         &self,
         messages: &mut [Message],
         protected_tool_call_ids: &[String],
+    ) -> Tier1Report {
+        self.prune_with_pass(messages, protected_tool_call_ids, Tier1Pass::Full)
+    }
+
+    /// [`Self::prune`] with an explicit [`Tier1Pass`]: `OversizedOnly` skips
+    /// the age-based (stale) condition so per-iteration runs never rewrite
+    /// deep history (KV-cache friendliness); `Full` behaves like `prune`.
+    pub fn prune_with_pass(
+        &self,
+        messages: &mut [Message],
+        protected_tool_call_ids: &[String],
+        pass: Tier1Pass,
     ) -> Tier1Report {
         if self.max_age_turns == 0 && self.max_size_bytes_per_result == u32::MAX {
             return Tier1Report::default();
@@ -150,7 +175,7 @@ impl MicroCompactionPolicy {
             let age = current_turn.saturating_sub(turn_id);
             let content_len = msg.content.len();
             let oversized = size_threshold != usize::MAX && content_len > size_threshold;
-            let stale = age_threshold > 0 && age > age_threshold;
+            let stale = matches!(pass, Tier1Pass::Full) && age_threshold > 0 && age > age_threshold;
 
             let reason: Option<&'static str> = match (stale, oversized) {
                 (true, _) => Some("tier1_stale"),
@@ -415,8 +440,10 @@ impl TieredCompactionRunner {
         &self,
         messages: &mut [Message],
         protected_tool_call_ids: &[String],
+        pass: Tier1Pass,
     ) -> Tier1Report {
-        self.tier1.prune(messages, protected_tool_call_ids)
+        self.tier1
+            .prune_with_pass(messages, protected_tool_call_ids, pass)
     }
 
     /// Build the opaque tier 2 payload without considering provider gating.
@@ -759,6 +786,80 @@ mod tests {
         let mut messages = vec![user_msg("hi")];
         let out = runner.maybe_run_tier3(&mut messages, CompactionPhase::OnDemand);
         assert!(out.is_none(), "tier 3 should not fire for tiny convos");
+    }
+
+    #[test]
+    fn oversized_only_pass_never_touches_stale_results() {
+        // KV-cache rationale (spec kv-cache-friendly-compaction): age-based
+        // rewrites land DEEP in history and invalidate the provider prefix
+        // cache; a per-iteration pass may only clear oversized results that
+        // just arrived near the prefix tail.
+        let policy = MicroCompactionPolicy::default(); // age 5 turns, 8KB
+        let mut messages = vec![
+            user_msg("turn 1"),
+            assistant_tool_call("shell", "call_old"),
+            tool_result("call_old", "small old result"),
+        ];
+        for n in 2..=7 {
+            messages.push(user_msg(&format!("turn {n}")));
+        }
+        messages.push(assistant_tool_call("shell", "call_big"));
+        messages.push(tool_result("call_big", &"x".repeat(9 * 1024)));
+
+        let report = policy.prune_with_pass(&mut messages, &[], Tier1Pass::OversizedOnly);
+
+        assert_eq!(report.results_pruned, 1, "only the oversized result clears");
+        let old = messages
+            .iter()
+            .find(|m| m.tool_call_id.as_deref() == Some("call_old"))
+            .unwrap();
+        assert!(
+            old.content.contains("small old result"),
+            "stale-but-small result must survive an oversized-only pass"
+        );
+    }
+
+    #[test]
+    fn full_pass_still_prunes_stale_results() {
+        let policy = MicroCompactionPolicy::default();
+        let mut messages = vec![
+            user_msg("turn 1"),
+            assistant_tool_call("shell", "call_old"),
+            tool_result("call_old", "small old result"),
+        ];
+        for n in 2..=7 {
+            messages.push(user_msg(&format!("turn {n}")));
+        }
+
+        let report = policy.prune_with_pass(&mut messages, &[], Tier1Pass::Full);
+
+        assert_eq!(
+            report.results_pruned, 1,
+            "full pass prunes the stale result"
+        );
+    }
+
+    #[test]
+    fn protected_ids_survive_the_oversized_only_pass() {
+        let policy = MicroCompactionPolicy::default();
+        let mut messages = vec![
+            user_msg("turn 1"),
+            assistant_tool_call("shell", "call_guarded"),
+            tool_result("call_guarded", &"y".repeat(9 * 1024)),
+        ];
+
+        let report = policy.prune_with_pass(
+            &mut messages,
+            &["call_guarded".to_string()],
+            Tier1Pass::OversizedOnly,
+        );
+
+        assert_eq!(report.results_pruned, 0, "protected ids are untouchable");
+        let guarded = messages
+            .iter()
+            .find(|m| m.tool_call_id.as_deref() == Some("call_guarded"))
+            .unwrap();
+        assert!(guarded.content.starts_with('y'), "content intact");
     }
 
     #[test]

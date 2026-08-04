@@ -1188,7 +1188,7 @@ impl Agent {
                     // the first so large bootstrap payloads shrink before
                     // tier 3 considers whether to summarise).
                     let protected_ids = collect_protected_tool_call_ids(&messages);
-                    self.run_tier1_compaction(&mut messages, &protected_ids);
+                    self.run_tier1_compaction(&mut messages, &protected_ids, tier1_pass(iteration));
                     prepare_conversation_messages(self, &mut messages, &mut turn);
                     // Harness M6.3: post-prep compaction pass so the declarative
                     // runner sees the final shape of the conversation (after
@@ -2157,7 +2157,7 @@ impl Agent {
                 // M8.5 tier 1: also runs in task mode so background workers
                 // benefit from the same cheap shrinkage before their LLM call.
                 let protected_ids = collect_protected_tool_call_ids(&messages);
-                self.run_tier1_compaction(&mut messages, &protected_ids);
+                self.run_tier1_compaction(&mut messages, &protected_ids, tier1_pass(iteration));
                 prepare_task_messages(self, &mut messages, &mut turn);
                 self.prepare_prompt_with_context_manager(
                     &mut messages,
@@ -3211,14 +3211,117 @@ fn recover_shell_retry(
                 })
         })
         .or_else(|| {
-            (failed_shells >= min_shell_streak.saturating_sub(1))
-                .then(|| shell_results.first().copied())
-                .flatten()
-                .map(|content| ShellRetryRecovery {
-                    kind: ShellRetryRecoveryKind::RetryLimit,
-                    content: shell_retry_limit_message(content),
+            // A retry spiral means the model re-runs the SAME command against
+            // the same failure. Agentic models (kimi k3) legitimately fan out
+            // many DISTINCT commands per turn where several exit non-zero
+            // (grep with no match exits 1) — counting any N failures killed
+            // those turns mid-task, so the failures must also concentrate on
+            // one repeated command (or one repeated failure text) before the
+            // limit fires.
+            (failed_shells >= min_shell_streak.saturating_sub(1)
+                && max_identical_failed_shell_signature(messages, min_shell_streak * 3)
+                    >= min_shell_streak.saturating_sub(1))
+            .then(|| shell_results.first().copied())
+            .flatten()
+            .map(|content| ShellRetryRecovery {
+                kind: ShellRetryRecoveryKind::RetryLimit,
+                content: shell_retry_limit_message(content),
+            })
+        })
+}
+
+/// Strongest "not converging" repeat signal among FAILING shell calls in the
+/// most recent `limit` tool results: the max of
+///
+///  - identical commands (whitespace-normalized) — the model re-runs the same
+///    command against the same failure (timeout retries), and
+///  - identical non-empty failure texts (output minus the exit-code suffix) —
+///    the model shuffles flags but keeps hitting the same wall (`cargo test`
+///    → `cargo test --all` → … all "could not find Cargo.toml").
+///
+/// Distinct failing commands with distinct (or empty — a no-match grep) error
+/// texts each count 1 and never reach the spiral threshold.
+fn max_identical_failed_shell_signature(messages: &[Message], limit: usize) -> usize {
+    let mut command_counts: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
+    let mut failure_counts: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
+    let mut seen = 0usize;
+    for idx in (0..messages.len()).rev() {
+        let message = &messages[idx];
+        if message.role != MessageRole::Tool {
+            continue;
+        }
+        let Some(tool_name) = resolve_tool_name(messages, idx) else {
+            continue;
+        };
+        seen += 1;
+        if tool_name == "shell" && !is_successful_shell_output(&message.content) {
+            if let Some(key) = resolve_shell_command_key(messages, idx) {
+                *command_counts.entry(key).or_default() += 1;
+            }
+            let failure_text = strip_exit_code_suffix(&message.content);
+            if !failure_text.is_empty() {
+                *failure_counts.entry(failure_text).or_default() += 1;
+            }
+        }
+        if seen >= limit {
+            break;
+        }
+    }
+    command_counts
+        .values()
+        .chain(failure_counts.values())
+        .copied()
+        .max()
+        .unwrap_or(0)
+}
+
+/// Identity key for the shell command behind the Tool message at
+/// `tool_msg_index`: the `command` argument with whitespace collapsed, or the
+/// full arguments JSON for non-standard shapes (so identical repeats still
+/// match).
+fn resolve_shell_command_key(messages: &[Message], tool_msg_index: usize) -> Option<String> {
+    let tool_call_id = messages.get(tool_msg_index)?.tool_call_id.as_deref()?;
+    messages[..tool_msg_index].iter().rev().find_map(|message| {
+        if message.role != MessageRole::Assistant {
+            return None;
+        }
+        message.tool_calls.as_ref().and_then(|tool_calls| {
+            tool_calls
+                .iter()
+                .find(|tool_call| tool_call.id == tool_call_id)
+                .map(|tool_call| {
+                    tool_call
+                        .arguments
+                        .get("command")
+                        .and_then(|value| value.as_str())
+                        .map(|command| command.split_whitespace().collect::<Vec<_>>().join(" "))
+                        .unwrap_or_else(|| tool_call.arguments.to_string())
                 })
         })
+    })
+}
+
+/// Failure text of a shell output: the content with any trailing
+/// `Exit code: N` line removed and whitespace trimmed. Empty for outputs
+/// that carry nothing but the exit code — including the shell tool's
+/// "(no output)" sentinel (shell.rs renders empty stdout+stderr as
+/// literally "(no output)\n\nExit code: N"), so several DISTINCT no-match
+/// probes all sharing that sentinel count as no failure text at all and
+/// never concentrate into a spiral signature.
+fn strip_exit_code_suffix(content: &str) -> String {
+    let trimmed = content.trim_end();
+    let without_exit = match trimmed.rsplit_once("Exit code:") {
+        Some((head, tail)) if tail.trim().chars().all(|ch| ch.is_ascii_digit()) => head,
+        _ => trimmed,
+    };
+    let failure = without_exit.trim();
+    if failure == "(no output)" {
+        String::new()
+    } else {
+        failure.to_string()
+    }
 }
 
 fn recent_tool_results(messages: &[Message], limit: usize) -> Vec<(String, String)> {
@@ -3486,6 +3589,18 @@ fn is_useful_shell_output(content: &str) -> bool {
         && !trimmed.is_empty()
         && trimmed != "Exit code: 0"
         && !trimmed.starts_with("(no output)")
+}
+
+/// Tier-1 pass for this iteration (spec kv-cache-friendly-compaction): the
+/// turn's first call may rewrite deep history (stale pruning); later
+/// iterations only clear oversized results near the prefix tail, keeping the
+/// provider prefix cache (KV) valid across the turn's iterations.
+fn tier1_pass(iteration: u32) -> crate::compaction_tiered::Tier1Pass {
+    if iteration == 1 {
+        crate::compaction_tiered::Tier1Pass::Full
+    } else {
+        crate::compaction_tiered::Tier1Pass::OversizedOnly
+    }
 }
 
 fn is_successful_shell_output(content: &str) -> bool {
