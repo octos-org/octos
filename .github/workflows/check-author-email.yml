@@ -10,14 +10,19 @@ jobs:
     name: reject blocked author/committer emails
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
         with:
           fetch-depth: 0
       - name: scan commits for blocked emails
         shell: bash
         run: |
           set -euo pipefail
-          BLOCKED='yue\.chen@futurewei\.com|ychen@futurewei\.com|ymote@futurewei\.com|@futurewei\.com'
+          # Block the whole domain; naming individuals was redundant — the
+          # domain alternative already matches their addresses. The `@`
+          # prefix anchors the local-part boundary and `$` the end, so
+          # `user@futurewei.com.evil.tld` and `x@notfuturewei.com` are both
+          # handled correctly.
+          BLOCKED='@futurewei\.com$'
 
           if [ "${GITHUB_EVENT_NAME:-}" = "pull_request" ]; then
             BASE="origin/${GITHUB_BASE_REF}"

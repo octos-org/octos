@@ -20,8 +20,8 @@ use tracing::warn;
 
 use super::Executable;
 
-// Re-exports used by submodules (prompt, gateway_runtime)
-#[cfg(feature = "matrix")]
+// Imported for the test module (via `use super::*`); unused in non-test builds
+#[cfg(all(test, feature = "matrix"))]
 use matrix_integration::*;
 pub(crate) use prompt::build_system_prompt;
 
@@ -251,7 +251,6 @@ mod tests {
                 }),
                 ..Default::default()
             }],
-            ..Default::default()
         });
         parent.config.admin_mode = true;
         store.save(&parent).unwrap();
