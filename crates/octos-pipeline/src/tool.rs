@@ -1707,9 +1707,13 @@ fn update_latest_run_link(runs_root: &std::path::Path, _run_id: &str, run_dir: &
 }
 
 /// Delete all but the most recent `keep` run directories under `runs_root`.
-/// "Most recent" is determined by directory name order — run ids embed a
-/// nanosecond timestamp (`{graph}-{secs}-{nanos}-{pid}-{counter}`), so
-/// lexicographic sort approximates creation order well enough for pruning.
+/// "Most recent" is determined by directory **mtime**, not by name. Sorting
+/// by path would order by pipeline NAME first (run ids are
+/// `{graph}-{secs}-{nanos}-{pid}-{counter}`, graph name leading) and only by
+/// timestamp within a name — which would prune the NEWEST runs of an
+/// alphabetically-earlier pipeline while keeping older ones of a later one
+/// (review HIGH). mtime reflects actual creation order regardless of name,
+/// and does not re-couple pruning to the id format.
 ///
 /// Best-effort: individual deletion failures are logged and skipped, and a
 /// directory that is not a run dir (e.g. the `latest` symlink, or a file) is
@@ -1726,7 +1730,13 @@ fn prune_old_run_dirs(runs_root: &std::path::Path, keep: usize) {
     if run_dirs.len() <= keep {
         return;
     }
-    run_dirs.sort();
+    // Sort oldest-first by mtime; fall back to the epoch on metadata error so
+    // unreadable dirs sort to the front (pruned first, the safe direction).
+    run_dirs.sort_by_key(|p| {
+        std::fs::metadata(p)
+            .and_then(|m| m.modified())
+            .unwrap_or(std::time::UNIX_EPOCH)
+    });
     let to_remove = run_dirs.len() - keep;
     for old in run_dirs.into_iter().take(to_remove) {
         if let Err(e) = std::fs::remove_dir_all(&old) {
@@ -2215,6 +2225,72 @@ mod tests {
         assert!(!runs_root.join("run-000").exists(), "oldest dir pruned");
         assert!(runs_root.join("latest").exists(), "latest entry never pruned");
         assert!(runs_root.join("notes.txt").exists(), "non-run file never pruned");
+    }
+
+    /// Review HIGH: retention must prune by AGE, not by pipeline NAME. Run ids
+    /// are `{graph}-{secs}-{nanos}-{pid}-{counter}` — graph name leads, so a
+    /// path sort orders by name first and would delete the NEWEST runs of an
+    /// alphabetically-earlier pipeline while keeping older ones of a later
+    /// one. This test uses two graph names with INTERLEAVED creation times so
+    /// name order and age order disagree — the case that fails under name sort.
+    #[test]
+    fn prune_old_run_dirs_prunes_by_age_not_pipeline_name() {
+        use tempfile::TempDir;
+
+        let root = TempDir::new().unwrap();
+        let runs_root = root.path().join("pipeline-runs");
+
+        // Interleave two pipelines whose names sort differently than their
+        // creation order: `aaa_old` (created FIRST, oldest) and `zzz_new`
+        // (created LAST, newest). A name sort would keep `aaa_*` (sorts first)
+        // and prune `zzz_*` (sorts last) even though `zzz_new` is the newest.
+        // We create many so the quota forces pruning.
+        //
+        // mtimes are bumped explicitly because same-second creation would make
+        // mtime ordering unreliable on coarse filesystems.
+        for i in 0..15 {
+            let d = runs_root.join(format!("aaa_old-{i:03}"));
+            std::fs::create_dir_all(&d).unwrap();
+            set_mtime(&d, 1_000 + i as u64); // oldest
+        }
+        for i in 0..15 {
+            let d = runs_root.join(format!("zzz_new-{i:03}"));
+            std::fs::create_dir_all(&d).unwrap();
+            set_mtime(&d, 2_000 + i as u64); // newest
+        }
+
+        prune_old_run_dirs(&runs_root, 15);
+
+        // The 15 NEWEST (zzz_new-*) must be retained; the 15 oldest (aaa_old-*)
+        // pruned — even though `aaa_*` sorts BEFORE `zzz_*` by name.
+        assert!(
+            runs_root.join("zzz_new-014").is_dir(),
+            "newest run (zzz_new) must be retained despite sorting last by name"
+        );
+        assert!(
+            runs_root.join("zzz_new-000").is_dir(),
+            "all zzz_new runs are within the 15 most recent"
+        );
+        assert!(
+            !runs_root.join("aaa_old-000").exists(),
+            "oldest run (aaa_old) must be pruned despite sorting first by name"
+        );
+        assert!(
+            !runs_root.join("aaa_old-014").exists(),
+            "all aaa_old runs are older than the quota cutoff"
+        );
+    }
+
+    /// Bump a directory's mtime to a fixed unix timestamp so mtime-ordered
+    /// pruning is deterministic in tests (creation within the same second is
+    /// otherwise too coarse to order). Uses `std::fs::File::set_modified`
+    /// (stable, cross-platform) so no external command or extra dep is needed.
+    fn set_mtime(path: &std::path::Path, secs: u64) {
+        let t = std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs);
+        // Open the dir as a File to set its times. On Unix a dir can be opened
+        // read-only; set_modified updates its mtime.
+        let f = std::fs::File::open(path).expect("open dir for set_modified");
+        f.set_modified(t).expect("set_modified");
     }
 
     /// #1126 codex P2 acceptance: when a pipeline run times out, a
