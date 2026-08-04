@@ -2223,8 +2223,14 @@ mod tests {
         assert_eq!(dir_count, 20, "must retain exactly the 20 most recent dirs");
         assert!(runs_root.join("run-024").is_dir(), "newest dir retained");
         assert!(!runs_root.join("run-000").exists(), "oldest dir pruned");
-        assert!(runs_root.join("latest").exists(), "latest entry never pruned");
-        assert!(runs_root.join("notes.txt").exists(), "non-run file never pruned");
+        assert!(
+            runs_root.join("latest").exists(),
+            "latest entry never pruned"
+        );
+        assert!(
+            runs_root.join("notes.txt").exists(),
+            "non-run file never pruned"
+        );
     }
 
     /// Review HIGH: retention must prune by AGE, not by pipeline NAME. Run ids
