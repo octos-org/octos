@@ -991,6 +991,41 @@ impl Tool for RunPipelineTool {
         let effective_working_dir =
             resolve_pipeline_working_dir(&self.working_dir, host_context.session_scope.as_deref());
 
+        // Per-run working-directory isolation: node workers (search fan-out,
+        // analyze, synthesize) follow a "read every findings-*.md" deliverable
+        // contract. When all runs share one flat working dir, findings files
+        // from UNRELATED runs accumulate (research A/B, judge probes, ad-hoc
+        // tests) and the convergence nodes try to read all of them — the
+        // observed 1800s synthesize timeouts. Scope each run to its own
+        // subdirectory so a run's workers only ever see their own findings.
+        //
+        // `graph_id` is already computed above (IR id or `graph_id_from_dot`)
+        // and `run_started_at` was captured at entry, so the run-scoped dir is
+        // unique per invocation without re-deriving a timestamp. This is
+        // additive-only: nothing is deleted from the shared dir, and final
+        // report files written via write_file land in the run dir (callers
+        // that surface the report read it back from the same executor run, so
+        // delivery is unaffected).
+        let run_id = generate_run_id(&graph_id, run_started_at);
+        let effective_working_dir = effective_working_dir
+            .join("pipeline-runs")
+            .join(&run_id);
+        if let Err(e) = std::fs::create_dir_all(&effective_working_dir) {
+            // Fall back to the shared dir on mkdir failure rather than fail
+            // the run — isolation is a hygiene improvement, not a hard
+            // requirement for correctness.
+            tracing::warn!(
+                error = %e,
+                dir = %effective_working_dir.display(),
+                "pipeline: failed to create per-run working dir; falling back to shared dir"
+            );
+        }
+        let effective_working_dir = if effective_working_dir.is_dir() {
+            effective_working_dir
+        } else {
+            resolve_pipeline_working_dir(&self.working_dir, host_context.session_scope.as_deref())
+        };
+
         // Build the workspace_context BEFORE moving `effective_working_dir`
         // into the struct literal — the policy lookup reads from the
         // effective root (scope-aware) so scoped sessions pick up
@@ -1080,7 +1115,8 @@ impl Tool for RunPipelineTool {
         // missing audit-trail evidence — exactly the runs validators
         // most need to inspect.
         // graph_id computed at acquisition (works for both IR and DOT paths).
-        let run_id = generate_run_id(&graph_id, run_started_at);
+        // run_id already computed above for per-run working-dir isolation —
+        // reuse it so the audit marker and the run dir share one identity.
 
         let result = match result {
             Ok(inner) => inner?,
