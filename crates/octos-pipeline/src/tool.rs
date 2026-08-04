@@ -2309,10 +2309,33 @@ mod tests {
     /// (stable, cross-platform) so no external command or extra dep is needed.
     fn set_mtime(path: &std::path::Path, secs: u64) {
         let t = std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs);
-        // Open the dir as a File to set its times. On Unix a dir can be opened
-        // read-only; set_modified updates its mtime.
-        let f = std::fs::File::open(path).expect("open dir for set_modified");
+        let f = open_dir_for_times(path);
         f.set_modified(t).expect("set_modified");
+    }
+
+    /// Open a DIRECTORY handle suitable for `set_modified`.
+    ///
+    /// Unix opens a directory read-only and that is enough. Windows refuses it
+    /// outright — `File::open` on a directory returns
+    /// `PermissionDenied: Access is denied` (os error 5) unless
+    /// `FILE_FLAG_BACKUP_SEMANTICS` is set, which is precisely what
+    /// `File::open` does not set. Both retention tests panicked there on
+    /// `check-windows` while passing on Unix.
+    #[cfg(not(windows))]
+    fn open_dir_for_times(path: &std::path::Path) -> std::fs::File {
+        std::fs::File::open(path).expect("open dir for set_modified")
+    }
+
+    #[cfg(windows)]
+    fn open_dir_for_times(path: &std::path::Path) -> std::fs::File {
+        use std::os::windows::fs::OpenOptionsExt;
+        // Required to obtain a handle to a DIRECTORY on Windows.
+        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(path)
+            .expect("open dir for set_modified")
     }
 
     /// #1126 codex P2 acceptance: when a pipeline run times out, a
