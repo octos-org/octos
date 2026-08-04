@@ -4620,9 +4620,7 @@ mod tests {
         .await
         .unwrap();
 
-        let Json(status) = auth_status(State(state), HeaderMap::new())
-            .await
-            .unwrap();
+        let Json(status) = auth_status(State(state), HeaderMap::new()).await.unwrap();
         assert_eq!(status.solo_profile_exists, Some(true));
     }
 
