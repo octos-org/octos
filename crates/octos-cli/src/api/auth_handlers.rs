@@ -410,6 +410,12 @@ pub struct AuthStatusResponse {
     /// The flag does NOT mean auth is bypassed — the endpoints still
     /// enforce a loopback peer at request time.
     pub local_solo_enabled: bool,
+    /// When solo is advertised: whether a solo owner already exists. The
+    /// SPA uses this to pick the first-run (create form) vs returning
+    /// (one-click continue) experience WITHOUT a doomed solo-login round
+    /// trip. Absent when solo is not advertised at all.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub solo_profile_exists: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub scoped_profile: Option<ScopedAuthTarget>,
 }
@@ -622,6 +628,12 @@ pub async fn auth_status(
         // sets it), so the SPA never offers the no-password path there. See
         // `supports_local_solo_profile_create` / `crate::api::solo_auth`.
         local_solo_enabled: crate::api::ui_protocol::supports_local_solo_profile_create(&state),
+        solo_profile_exists: if crate::api::ui_protocol::supports_local_solo_profile_create(&state)
+        {
+            Some(crate::api::solo_auth::resolve_solo_user(&state).is_some())
+        } else {
+            None
+        },
         scoped_profile,
     }))
 }
@@ -4577,6 +4589,57 @@ mod tests {
             .await
             .unwrap();
         assert!(!status.local_solo_enabled);
+    }
+
+    #[tokio::test]
+    async fn auth_status_reports_solo_profile_exists_lifecycle() {
+        // The SPA's first-run flow keys off this flag: `Some(false)` means
+        // "solo is available but nobody has onboarded yet — show the create
+        // form directly instead of a doomed solo-login round trip".
+        let (_dir, state, _user_store, _profile_store) = temp_app_state();
+        let state = Arc::new(state);
+
+        let Json(status) = auth_status(State(state.clone()), HeaderMap::new())
+            .await
+            .unwrap();
+        assert!(status.local_solo_enabled);
+        assert_eq!(status.solo_profile_exists, Some(false));
+
+        crate::api::solo_auth::solo_create(
+            State(state.clone()),
+            axum::extract::ConnectInfo(std::net::SocketAddr::from(([127, 0, 0, 1], 40000))),
+            HeaderMap::new(),
+            Json(octos_core::ui_protocol::ProfileLocalCreateParams {
+                requested_id: None,
+                name: "Ada".into(),
+                username: "ada".into(),
+                email: "ada@example.com".into(),
+                make_default: None,
+            }),
+        )
+        .await
+        .unwrap();
+
+        let Json(status) = auth_status(State(state), HeaderMap::new())
+            .await
+            .unwrap();
+        assert_eq!(status.solo_profile_exists, Some(true));
+    }
+
+    #[tokio::test]
+    async fn auth_status_omits_solo_profile_exists_when_solo_not_advertised() {
+        // Tenant hosts never advertise solo, so the flag must be absent
+        // (the SPA treats "not offered" and "offered but empty" differently).
+        let (_dir, state, _user_store, _profile_store) = temp_app_state();
+        let state = AppState {
+            deployment_mode: crate::config::DeploymentMode::Tenant,
+            ..state
+        };
+        let Json(status) = auth_status(State(Arc::new(state)), HeaderMap::new())
+            .await
+            .unwrap();
+        assert!(!status.local_solo_enabled);
+        assert_eq!(status.solo_profile_exists, None);
     }
 
     fn scoped_host_headers(host: &str) -> HeaderMap {
