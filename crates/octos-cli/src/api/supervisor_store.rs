@@ -268,6 +268,10 @@ pub struct PendingContinuationRecord {
     pub metadata: SupervisorMetadata,
 }
 
+// Several variants carry their full record by value (group/child/artifact/
+// continuation) because events are persisted and replayed as self-contained
+// payloads; boxing would complicate serde round-trips for no hot-path win.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "payload", rename_all = "snake_case")]
 pub enum SupervisorEvent {

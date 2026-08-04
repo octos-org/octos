@@ -1500,26 +1500,22 @@ struct SessionPermissionProfileStore {
     selections: std::sync::Mutex<HashMap<SessionKey, StoredSessionPermissionProfile>>,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 struct StoredSessionPermissionProfile {
     selection: octos_core::ui_protocol::PermissionProfileSelection,
     approval_policy: Option<octos_agent::ApprovalPolicy>,
 }
 
-impl Default for StoredSessionPermissionProfile {
-    fn default() -> Self {
-        Self {
-            selection: octos_core::ui_protocol::PermissionProfileSelection::default(),
-            approval_policy: None,
-        }
-    }
-}
-
 impl SessionPermissionProfileStore {
+    // Read-side convenience pair kept for feature combinations that resolve
+    // the stored profile directly; this build only reads via
+    // `get_state_explicit`.
+    #[allow(dead_code)]
     fn get(&self, session_id: &SessionKey) -> octos_core::ui_protocol::PermissionProfileSelection {
         self.get_state(session_id).selection
     }
 
+    #[allow(dead_code)] // see `get` above
     fn get_state(&self, session_id: &SessionKey) -> StoredSessionPermissionProfile {
         self.get_state_explicit(session_id).unwrap_or_default()
     }
@@ -2196,7 +2192,7 @@ impl ConnectionUiFeatures {
             {
                 continue;
             }
-            if is_profile_skill_appui_method(*method) && state.profile_store.is_none() {
+            if is_profile_skill_appui_method(method) && state.profile_store.is_none() {
                 continue;
             }
             if matches!(
@@ -9884,11 +9880,7 @@ fn permission_selection_allowed(
     // as non-solo so the gate tightens. Only `None` (truly absent) and
     // a normalized `solo` keep the relaxed path on a Local server.
     let normalized_override = requested_runtime_mode.map(|raw| raw.trim().to_ascii_lowercase());
-    let request_relaxes_to_solo = match normalized_override.as_deref() {
-        None => true,
-        Some("solo") => true,
-        _ => false,
-    };
+    let request_relaxes_to_solo = matches!(normalized_override.as_deref(), None | Some("solo"));
     // SECURITY KEYSTONE (yolo GAP #1): the relax path requires the explicit
     // `--solo` opt-in, NOT bare Local mode. A Caddy-fronted fleet daemon runs
     // Local mode, so `deployment_mode == Local` alone is not a safe proxy for
@@ -12204,12 +12196,7 @@ async fn raw_profile_llm_select(
     let session_id = params
         .session_id
         .unwrap_or_else(|| SessionKey::with_profile_topic(&profile_id, "local", "tui", "coding"));
-    let refreshed = store
-        .get(&profile_id)
-        .ok()
-        .flatten()
-        .or(Some(profile))
-        .unwrap();
+    let refreshed = store.get(&profile_id).ok().flatten().unwrap_or(profile);
     let models = model_list_result(state, session_id.clone(), &profile_id, Some(&refreshed));
     let selected = models
         .get("models")
@@ -12409,7 +12396,7 @@ fn raw_profile_llm_delete(
         ));
     };
 
-    let mut applied = false;
+    let applied: bool;
     if llm
         .primary
         .as_ref()
@@ -16441,6 +16428,10 @@ fn raw_autonomy_rpc_with_orchestrator(
     }
 }
 
+// Raw-dispatch entry point: it threads the full per-request dispatch context
+// (connection, stores, negotiated features, profile scope, rpc id) through to
+// every raw method arm, so the wide flat parameter list is intentional.
+#[allow(clippy::too_many_arguments)]
 async fn handle_raw_appui_rpc(
     ws: &WsConnection,
     state: &Arc<AppState>,
@@ -17274,6 +17265,10 @@ fn is_auth_scope_violation(error: &RpcError) -> bool {
         .unwrap_or(false)
 }
 
+// The session/open pipeline needs the approval and question stores, live
+// forwarders, negotiated features, and the caller's profile scope as separate
+// pieces — a flat dependency list, not a missing struct.
+#[allow(clippy::too_many_arguments)]
 async fn handle_session_open(
     ws: &WsConnection,
     state: &Arc<AppState>,
@@ -17540,6 +17535,10 @@ fn stdio_session_open_candidate_profile(
 /// gating as the live-emit path. The task ends when the WS write channel
 /// closes (peer gone), the broadcast sender is dropped (rare), or the
 /// connection cleanup aborts the handle.
+// Each parameter is an independent piece of the forwarder's runtime state
+// (connection, ledger, replay baseline, negotiated features, broadcast
+// receiver); grouping them would only obscure the per-connection wiring.
+#[allow(clippy::too_many_arguments)]
 async fn spawn_live_forwarder(
     ws: WsConnection,
     ledger: Arc<UiProtocolLedger>,
@@ -17925,20 +17924,20 @@ fn live_event_passes_capability_filter(
     // Keep this branch before the historical capability gates below so a
     // replayed source event cannot leak beside its v2 projection.
     if features.projection_envelope_v2 {
-        if let UiProtocolLedgerEvent::Notification(notification) = event {
-            match notification {
-                UiNotification::Envelope(_)
-                | UiNotification::MessageDelta(_)
-                | UiNotification::ReasoningDelta(_)
-                | UiNotification::ToolStarted(_)
-                | UiNotification::ToolProgress(_)
-                | UiNotification::ToolCompleted(_)
-                | UiNotification::FileAttached(_)
-                | UiNotification::TurnCompleted(_)
-                | UiNotification::TurnError(_)
-                | UiNotification::TurnSpawnComplete(_) => return false,
-                _ => {}
-            }
+        if let UiProtocolLedgerEvent::Notification(
+            UiNotification::Envelope(_)
+            | UiNotification::MessageDelta(_)
+            | UiNotification::ReasoningDelta(_)
+            | UiNotification::ToolStarted(_)
+            | UiNotification::ToolProgress(_)
+            | UiNotification::ToolCompleted(_)
+            | UiNotification::FileAttached(_)
+            | UiNotification::TurnCompleted(_)
+            | UiNotification::TurnError(_)
+            | UiNotification::TurnSpawnComplete(_),
+        ) = event
+        {
+            return false;
         }
     }
     if !features.context_lifecycle_available() {
@@ -18699,9 +18698,7 @@ fn validate_session_workspace_path_safety(workspace_root: &Path) -> Result<(), R
 fn workspace_root_escape_under_system_path(path: &Path) -> Option<&'static str> {
     let mut components = path.components();
     let _root = components.next();
-    let Some(first) = components.next() else {
-        return None;
-    };
+    let first = components.next()?;
     let first = first.as_os_str();
     const BANNED: &[&str] = &[
         "etc", "sbin", "bin", "boot", "dev", "proc", "sys", "usr", "var", "root",
@@ -19358,7 +19355,7 @@ fn build_git_pane_snapshot(workspace_dirs: &[PathBuf]) -> UiGitPaneSnapshot {
     let Some(repo_root) = workspace_dirs
         .iter()
         .filter(|path| path.exists())
-        .find_map(git_repo_root)
+        .find_map(|path| git_repo_root(path))
     else {
         return UiGitPaneSnapshot {
             repo_root: None,
@@ -19403,7 +19400,7 @@ fn build_git_pane_snapshot(workspace_dirs: &[PathBuf]) -> UiGitPaneSnapshot {
     }
 }
 
-fn git_repo_root(path: &PathBuf) -> Option<PathBuf> {
+fn git_repo_root(path: &Path) -> Option<PathBuf> {
     git_output(path, ["rev-parse", "--show-toplevel"]).map(PathBuf::from)
 }
 
@@ -19588,7 +19585,7 @@ async fn handle_review_start(
     let accepted_agent_count =
         expected_review_agent_count_for_profile(state, Some(review_profile_runtime.as_ref()));
 
-    let turn_id = params.turn_id.clone().unwrap_or_else(TurnId::new);
+    let turn_id = params.turn_id.clone().unwrap_or_default();
     let session_id = params.session_id.clone();
     let turn_state = Arc::new(TokioMutex::new(TurnState::Active));
     let (interrupt_tx, interrupt_rx) = mpsc::channel::<()>(1);
@@ -19692,6 +19689,11 @@ async fn handle_review_start(
     let _ = start_tx.send(());
 }
 
+// Turn-start threads the full dispatch context (connection, stores, turn
+// registries, caller and routed profile scope, negotiated features) straight
+// through to `handle_turn_start_with_accept`; the wide signature is the
+// adapter boundary, not a missing struct.
+#[allow(clippy::too_many_arguments)]
 async fn handle_turn_start(
     ws: &WsConnection,
     state: &Arc<AppState>,
@@ -20547,6 +20549,10 @@ fn continuation_may_complete(is_peer_injection: bool, agent_dispatched: bool) ->
     !is_peer_injection || agent_dispatched
 }
 
+// The drain needs the dispatch stores, turn registries, this connection's
+// open-session set, and negotiated features as separate inputs — a flat
+// per-request dependency list, not a missing struct.
+#[allow(clippy::too_many_arguments)]
 async fn drain_appui_due_master_continuations(
     ws: &WsConnection,
     state: &Arc<AppState>,
@@ -21880,6 +21886,10 @@ async fn handle_task_restart_from_node(
 /// land an event with cursor ≤ result.cursor that the client did not also
 /// observe — so a follow-up `session/hydrate { after: result.cursor }`
 /// returns only events strictly after the snapshot, with no gap.
+// The handler threads the ledger, approval/question stores, turn registry,
+// and the caller's profile scope plus negotiated features as one flat
+// per-request dependency list.
+#[allow(clippy::too_many_arguments)]
 async fn handle_session_hydrate(
     ws: &WsConnection,
     state: &Arc<AppState>,
@@ -22564,6 +22574,9 @@ async fn handle_session_fork(
 }
 
 /// Per UPCR-2026-010: lift the in-memory thread partition onto the wire.
+// Connection state, ledger, turn registry, and the caller's profile scope
+// arrive as separate per-request pieces — a flat dependency list.
+#[allow(clippy::too_many_arguments)]
 async fn handle_thread_graph_get(
     ws: &WsConnection,
     state: &Arc<AppState>,
@@ -22653,6 +22666,10 @@ async fn handle_thread_graph_get(
 /// review asked for the durable backing so a turn the registry has already
 /// evicted (e.g. daemon restart, idle eviction) can still surface a
 /// non-`unknown` state.
+// The handler consults the ledger AND the active-turn registry under the
+// caller's profile scope and negotiated features — a flat per-request
+// dependency list, not a missing struct.
+#[allow(clippy::too_many_arguments)]
 async fn handle_turn_state_get(
     ws: &WsConnection,
     state: &Arc<AppState>,
@@ -23027,6 +23044,9 @@ fn btw_activity_line(notification: &UiNotification) -> Option<String> {
 /// soon as the aside is validated and snapshotted, so the connection's read
 /// loop keeps serving interrupts/approvals — and the busy gate actually
 /// gates — while the answer (up to 30s) is produced.
+// Connection, ledger, turn registry, and the caller's profile scope arrive
+// as separate per-request pieces — a flat dependency list.
+#[allow(clippy::too_many_arguments)]
 async fn handle_session_btw(
     ws: &WsConnection,
     state: &Arc<AppState>,
@@ -23522,11 +23542,10 @@ fn project_turn_from_ledger(
                 });
             }
             UiNotification::EnvelopeV2(envelope)
-                if envelope.envelope.turn_id == target.0.to_string() =>
+                if envelope.envelope.turn_id == target.0.to_string()
+                    && projection.thread_id.is_none() =>
             {
-                if projection.thread_id.is_none() {
-                    projection.thread_id = Some(envelope.envelope.thread_id.clone());
-                }
+                projection.thread_id = Some(envelope.envelope.thread_id.clone());
             }
             _ => {}
         }
@@ -23803,6 +23822,11 @@ fn axum_path(value: String) -> axum::extract::Path<String> {
     axum::extract::Path(value)
 }
 
+// This WS-to-REST adapter forwards the request headers and auth identity
+// alongside the connection state and negotiated features, pushing the
+// handler past clippy's 7-arg lint; the parameters are a flat dependency
+// list, not a missing struct.
+#[allow(clippy::too_many_arguments)]
 async fn handle_session_list(
     ws: &WsConnection,
     state: &Arc<AppState>,
@@ -24071,6 +24095,10 @@ fn resolve_launch_result(
     })
 }
 
+// This WS-to-REST adapter forwards the request headers and auth identity
+// alongside the connection state, routed profile scope, and negotiated
+// features — a flat dependency list, not a missing struct.
+#[allow(clippy::too_many_arguments)]
 async fn handle_session_status_get(
     ws: &WsConnection,
     state: &Arc<AppState>,
@@ -26065,9 +26093,13 @@ async fn m9_fixture_delay_or_interrupt(
 }
 
 fn m9_fixture_has_pending_interrupt(interrupt_rx: &mut mpsc::Receiver<()>) -> bool {
-    matches!(interrupt_rx.try_recv(), Ok(_))
+    interrupt_rx.try_recv().is_ok()
 }
 
+// The M9 fixture drives a full turn end-to-end, so it takes the connection,
+// stores, fixture definition, shared turn state, and interrupt channel as
+// separate pieces — a flat dependency list, not a missing struct.
+#[allow(clippy::too_many_arguments)]
 async fn run_m9_fixture_turn(
     ws: WsConnection,
     state: Arc<AppState>,
@@ -27764,6 +27796,10 @@ fn native_review_task(objective: &str, target: &str, spec: &NativeCodeReviewSpec
     )
 }
 
+// The specialist spawn needs the join set, connection/ledger handles, the
+// review's session/profile/workspace scope, and the dispatch policy as
+// separate pieces — a flat dependency list, not a missing struct.
+#[allow(clippy::too_many_arguments)]
 fn maybe_spawn_cli_review_specialist(
     joins: &mut tokio::task::JoinSet<NativeCodeReviewResult>,
     ws: &WsConnection,
@@ -28667,7 +28703,7 @@ async fn seed_m9_task_output_fixture(
 
 /// #1133 — context required to fold a finished AppUI goal turn back
 /// into the goal runtime. Carries the profile id so `record_goal_turn`
-/// + `maybe_complete_goal_from_model` can be invoked once the agent
+/// and `maybe_complete_goal_from_model` can be invoked once the agent
 /// task returns AND the assistant reply has been persisted into the
 /// per-session `SessionRuntime.sessions` manager.
 ///
@@ -28779,6 +28815,7 @@ fn reasoning_effort_from_wire(
 ///   forwarded), never via raw foreground tokens, so dropping these loses
 ///   nothing user-facing. Pairs with the octos-tui client guard that ignores
 ///   deltas for already-terminal turns (belt + suspenders).
+///
 /// Chars of a background REPORT result inlined into the parent conversation.
 /// At or below this, the full text is inlined; above it, a preview of this
 /// size is inlined plus a recovery pointer. The old behaviour (300-char
@@ -33265,6 +33302,9 @@ struct TurnCompletionDetails {
     tokens_in: Option<u32>,
     tokens_out: Option<u32>,
     session_result: Option<TurnSessionResult>,
+    // Populated on the standalone-turn `done` path; read only by feature
+    // combinations that project the terminal outcome into the lifecycle emit.
+    #[allow(dead_code)]
     outcome: Option<TurnTerminalOutcome>,
 }
 
@@ -35342,12 +35382,7 @@ fn merge_artifact_index(dir: &Path, agent_id: &Value, artifacts: &[Value]) {
     let mut merged: Vec<Value> = std::fs::read_to_string(&path)
         .ok()
         .and_then(|text| serde_json::from_str::<Value>(&text).ok())
-        .and_then(|value| {
-            value
-                .get("artifacts")
-                .and_then(Value::as_array)
-                .map(Clone::clone)
-        })
+        .and_then(|value| value.get("artifacts").and_then(Value::as_array).cloned())
         .unwrap_or_default();
     for artifact in new_artifacts {
         let already_present = merged.iter().any(|existing| {

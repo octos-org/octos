@@ -1,5 +1,14 @@
 name: Release (Manual)
 
+# Version bumper ONLY: bumps the workspace version with cargo-release, pushes
+# the bump commit + tag, then hands off to release.yml.
+#
+# This workflow previously ALSO built the macOS bundle and created the GitHub
+# release itself — duplicating release.yml, racing it for the same tag, and
+# shipping an asset set (macOS-only, with model_catalog.json) that differed
+# from what release.yml uploads moments later. release.yml is now the single
+# release publisher; this workflow just gets a tag created.
+
 on:
   workflow_dispatch:
     inputs:
@@ -13,14 +22,17 @@ on:
           - major
 
 permissions:
-  contents: write
+  contents: write   # cargo release pushes the bump commit + tag
+  actions: write    # dispatch release.yml after tagging
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
   release:
-    runs-on: macos-14
+    # No builds happen here anymore — ubuntu is plenty (this used macos-14 to
+    # compile the bundle that release.yml now builds).
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
         with:
@@ -29,72 +41,31 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
-      - uses: Swatinem/rust-cache@v2
-
       - name: Configure git
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-      - name: Install tools
-        run: |
-          cargo install cargo-release --locked
-          cargo install git-cliff --locked
+      - name: Install cargo-release
+        run: cargo install cargo-release --locked
 
-      - name: Set build metadata
-        run: |
-          echo "OCTOS_GIT_HASH=$(git rev-parse --short HEAD)" >> "$GITHUB_ENV"
-          echo "OCTOS_BUILD_DATE=$(date -u +%Y-%m-%d)" >> "$GITHUB_ENV"
-
-      - name: Run cargo release
+      # Bumps the version, commits, tags, and pushes BOTH the main commit and
+      # the tag. If main rejects the push (branch protection), either allow
+      # github-actions[bot] a bypass for version-bump commits or switch this
+      # step to open a PR and tag after merge.
+      - name: Bump version and tag
         run: cargo release ${{ inputs.bump }} --execute --no-confirm
 
-      - name: Build embedded SPAs (admin dashboard + octos-web)
-        # rust_embed bakes crates/octos-cli/static/{admin,web} into the binary at
-        # compile time, so both SPAs MUST be built before `cargo build`. Without
-        # this the published bundle serves a 503 at /admin and /app.
+      # A tag pushed with GITHUB_TOKEN does NOT trigger release.yml (GitHub
+      # suppresses events from the default token), so dispatch it explicitly.
+      # release.yml checks out inputs.tag, builds all four platforms, and
+      # creates the GitHub release with the full asset set.
+      - name: Trigger release build
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          # One command per line so `set -e` aborts on ANY failure (a chained
-          # `&&` can mask an early failure → a published binary missing /admin or /app).
-          cd dashboard
-          npm ci
-          npm run build
-          cd ..
-          git submodule update --init octos-web
-          bash scripts/build-web-app.sh
-
-      - name: Build octos CLI and sandbox helper
-        run: |
-          cargo build --release -p octos-cli --features "api,telegram,discord,whatsapp,feishu,twilio,wecom,wecom-bot,audio_mp3"
-          cargo build --release -p octos-sandbox
-
-      - name: Build app-skill binaries
-        run: cargo build --release -p news_fetch -p deep-search -p deep-crawl -p send-email -p account-manager -p voice -p clock -p weather -p smart-home
-
-      - name: Bundle release tarball
-        run: |
-          mkdir dist
-          for b in octos octos-sandbox news_fetch deep-search deep_crawl send_email account_manager voice clock weather smart_home; do
-            cp "target/release/$b" dist/ 2>/dev/null || true
-          done
-          # Canonical model catalog (model-provisioning SSOT) ships next to the binary.
-          cp model_catalog.json dist/ 2>/dev/null || true
-          cd dist && tar czf ../octos-bundle-aarch64-apple-darwin.tar.gz *
-
-      - name: Generate release notes
-        run: git-cliff --latest --strip header -o RELEASE_NOTES.md
-
-      - name: Get new version
-        id: version
-        run: |
+          set -euo pipefail
           VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
-          echo "tag=v${VERSION}" >> "$GITHUB_OUTPUT"
-
-      - uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ steps.version.outputs.tag }}
-          files: |
-            octos-bundle-aarch64-apple-darwin.tar.gz
-            scripts/install.sh
-            scripts/octos-doctor.sh
-          body_path: RELEASE_NOTES.md
+          echo "Dispatching release.yml for v${VERSION}"
+          gh workflow run release.yml --repo "${{ github.repository }}" \
+            -f platform=all -f tag="v${VERSION}"

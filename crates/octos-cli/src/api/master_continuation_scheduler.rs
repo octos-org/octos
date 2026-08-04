@@ -347,6 +347,10 @@ impl QueuedMasterContinuation {
     }
 }
 
+// `Queued` carries the full continuation record by value so enqueue returns
+// the stored item without a clone; the enum is matched once per enqueue
+// (cold path), so the size difference is immaterial.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum MasterContinuationEnqueueOutcome {
     Queued(QueuedMasterContinuation),

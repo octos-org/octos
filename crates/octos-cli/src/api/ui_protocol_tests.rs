@@ -2604,13 +2604,10 @@ fn in_loop_compaction_emits_lifecycle_notifications() {
     let history: Vec<Message> = (0..10)
         .flat_map(|idx| {
             vec![
-                test_message(
-                    MessageRole::User,
-                    &format!("req {idx}: {}", "x".repeat(400)),
-                ),
+                test_message(MessageRole::User, format!("req {idx}: {}", "x".repeat(400))),
                 test_message(
                     MessageRole::Assistant,
-                    &format!("ans {idx}: {}", "y".repeat(400)),
+                    format!("ans {idx}: {}", "y".repeat(400)),
                 ),
             ]
         })
@@ -7095,7 +7092,7 @@ async fn appui_skill_action_lists_and_invokes_canonical_profile_action() {
     let runtime = Arc::get_mut(&mut profile_runtime).unwrap();
     let load_result = octos_agent::PluginLoader::load_into(
         Arc::get_mut(&mut runtime.tool_specs).unwrap(),
-        &[skills_dir.clone()],
+        std::slice::from_ref(&skills_dir),
         &[],
     )
     .unwrap();
@@ -16143,7 +16140,7 @@ fn final_assistant_carrier_trimmed_equality_matches_synth_skip_helper() {
     // Sanity: the synth-skip helper recognises the SAME row
     // (this is the lockstep invariant — codex round-1 P2).
     assert!(
-        final_assistant_content_already_persisted(&[iter_n.clone()], final_content),
+        final_assistant_content_already_persisted(std::slice::from_ref(&iter_n), final_content),
         "synth-skip helper must recognise the same row as the carrier helper",
     );
 }
@@ -20822,6 +20819,9 @@ fn message_commit_observer_test_lock() -> &'static std::sync::Mutex<()> {
 }
 
 #[tokio::test(flavor = "current_thread")]
+// The guard serialises tests against the process-global commit observer;
+// it must stay held for the whole test, awaits included.
+#[allow(clippy::await_holding_lock)]
 async fn message_commit_observer_runs_after_each_commit_in_order() {
     // Wires the bus-level observer hook to a local sink and asserts
     // notifications fire in commit order, with strictly monotonic seqs.
@@ -20882,6 +20882,8 @@ async fn message_commit_observer_runs_after_each_commit_in_order() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+// See message_commit_observer_test_lock: guard intentionally outlives awaits.
+#[allow(clippy::await_holding_lock)]
 async fn message_commit_observer_is_not_retroactive_after_installation() {
     let _guard = message_commit_observer_test_lock()
         .lock()
@@ -21027,6 +21029,8 @@ fn is_metadata_only_assistant_row_truth_table() {
 /// Metadata-only assistant commits must not create projection rows; the
 /// final visible assistant commit produces one canonical v2 envelope.
 #[tokio::test(flavor = "current_thread")]
+// See message_commit_observer_test_lock: guard intentionally outlives awaits.
+#[allow(clippy::await_holding_lock)]
 async fn metadata_only_commits_emit_one_v2_assistant_persisted_row() {
     let _guard = message_commit_observer_test_lock()
         .lock()
@@ -23061,6 +23065,8 @@ async fn background_result_sender_persists_contract_verified_media_row() {
 ///      preamble — no child envelope appears because the persist that would have
 ///      triggered the observer never happens.
 #[tokio::test(flavor = "current_thread")]
+// See message_commit_observer_test_lock: guard intentionally outlives awaits.
+#[allow(clippy::await_holding_lock)]
 async fn synth_ack_not_persisted_to_jsonl_when_spawn_only() {
     let _guard = message_commit_observer_test_lock()
         .lock()
@@ -23277,6 +23283,8 @@ fn synth_ack_not_persisted_for_run_pipeline_or_podcast_voices() {
 ///      preamble — no child envelope appears because the persist that would have
 ///      triggered the observer never happens.
 #[tokio::test(flavor = "current_thread")]
+// See message_commit_observer_test_lock: guard intentionally outlives awaits.
+#[allow(clippy::await_holding_lock)]
 async fn synth_ack_skip_invariants_hold_for_each_spawn_only_tool_name() {
     // Cover every spawn_only tool name observed in the round-2 soak
     // (mini1 / mini3 / mini5 evidence in
@@ -26754,13 +26762,14 @@ fn structurally_huge_frame_does_not_emit_over_cap() {
         "fixture must exceed the cap (RED: original returned over-cap)"
     );
 
-    match frame_text_within_cap(frame) {
-        Some(body) => assert!(
+    if let Some(body) = frame_text_within_cap(frame) {
+        assert!(
             body.len() <= MAX_TEXT_FRAME_BYTES,
             "if a body is produced it must be under cap, got {}",
             body.len()
-        ),
-        None => {} // dropped, not enqueued — also acceptable
+        );
+    } else {
+        // dropped, not enqueued — also acceptable
     }
 }
 
@@ -29451,8 +29460,10 @@ fn compose_peer_list_text_annotates_and_flags_stale_model_lane() {
 /// uses it.
 #[test]
 fn lane_provider_config_clears_primary_api_key_env_when_lane_omits_it() {
-    let mut primary = crate::config::Config::default();
-    primary.api_key_env = Some("PRIMARY_PROVIDER_KEY".to_owned());
+    let primary = crate::config::Config {
+        api_key_env: Some("PRIMARY_PROVIDER_KEY".to_owned()),
+        ..Default::default()
+    };
 
     // A lane on a DIFFERENT provider with NO api_key_env of its own.
     let lane = crate::config::SubProviderConfig {

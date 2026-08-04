@@ -95,7 +95,7 @@ fn build_state(_dir: &TempDir, profiles: &[(&str, Option<&str>)]) -> Arc<AppStat
 }
 
 /// Build an `AppState` wired with a real `AuthManager` + `UserStore`
-/// + `ProfileStore`. Used by the trusted-hop tests that need a
+/// and `ProfileStore`. Used by the trusted-hop tests that need a
 /// non-admin authenticated identity. `users` describes
 /// `(user_id, email, role)`, and `profiles` describes
 /// `(profile_id, parent_id)` matching the `build_state` helper.

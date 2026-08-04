@@ -441,8 +441,10 @@ jobs:
   # job lean, but the Dockerfile and several release configurations enable it.
   # Without this job, feature-gated compile errors (e.g. an identifier referenced
   # only inside `#[cfg(feature = "matrix")]`) slip past PR CI and only surface
-  # during docker builds. Keep this job intentionally tiny: `cargo check` only,
-  # no tests, no clippy — its sole job is to catch the feature-gated compile.
+  # during docker builds. Keep this job intentionally tiny: no tests.
+  # It also carries the clippy gate for the feature-gated api/serve/ui_protocol
+  # modules: octos-cli has `default = []`, so the workspace clippy in `check`
+  # never lints them — and clippy subsumes `cargo check`.
   check-matrix:
     runs-on: ubuntu-latest
     env:
@@ -451,13 +453,15 @@ jobs:
       - uses: actions/checkout@v6
 
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
 
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: matrix-feature
 
-      - name: Check octos-cli with matrix feature
-        run: cargo check -p octos-cli --no-default-features --features api,telegram,discord,dingtalk,slack,whatsapp,feishu,email,matrix,audio_mp3
+      - name: Clippy octos-cli with matrix feature
+        run: cargo clippy -p octos-cli --all-targets --no-default-features --features api,telegram,discord,dingtalk,slack,whatsapp,feishu,email,matrix,audio_mp3 -- -D warnings
 
   check-arm:
     # Deliberately NOT on PRs, unlike check-windows: the workspace has ZERO
@@ -785,12 +789,10 @@ jobs:
           cargo build --release ${{ env.SKILL_CRATES }}
 
       - name: Bundle
-        run: |
-          mkdir dist
-          for b in octos octos-sandbox news_fetch deep-search deep_crawl send_email account_manager voice clock weather smart_home; do
-            cp "target/release/$b" dist/ 2>/dev/null || true
-          done
-          cd dist && tar czf ../octos-bundle-aarch64-apple-darwin.tar.gz *
+        shell: bash
+        # Single source of truth for the shipping set: scripts/bundle-release.sh
+        # (fails loudly on any missing binary; includes model_catalog.json).
+        run: ./scripts/bundle-release.sh octos-bundle-aarch64-apple-darwin.tar.gz
 
       - uses: actions/upload-artifact@v7
         with:
@@ -825,12 +827,10 @@ jobs:
           cargo build --release ${{ env.SKILL_CRATES }}
 
       - name: Bundle
-        run: |
-          mkdir dist
-          for b in octos octos-sandbox news_fetch deep-search deep_crawl send_email account_manager voice clock weather smart_home; do
-            cp "target/release/$b" dist/ 2>/dev/null || true
-          done
-          cd dist && tar czf ../octos-bundle-x86_64-unknown-linux-gnu.tar.gz *
+        shell: bash
+        # Single source of truth for the shipping set: scripts/bundle-release.sh
+        # (fails loudly on any missing binary; includes model_catalog.json).
+        run: ./scripts/bundle-release.sh octos-bundle-x86_64-unknown-linux-gnu.tar.gz
 
       - uses: actions/upload-artifact@v7
         with:
@@ -867,12 +867,10 @@ jobs:
           cargo build --release ${{ env.SKILL_CRATES }}
 
       - name: Bundle
-        run: |
-          mkdir dist
-          for b in octos octos-sandbox news_fetch deep-search deep_crawl send_email account_manager voice clock weather smart_home; do
-            cp "target/release/$b" dist/ 2>/dev/null || true
-          done
-          cd dist && tar czf ../octos-bundle-aarch64-unknown-linux-gnu.tar.gz *
+        shell: bash
+        # Single source of truth for the shipping set: scripts/bundle-release.sh
+        # (fails loudly on any missing binary; includes model_catalog.json).
+        run: ./scripts/bundle-release.sh octos-bundle-aarch64-unknown-linux-gnu.tar.gz
 
       - uses: actions/upload-artifact@v7
         with:
@@ -910,12 +908,7 @@ jobs:
 
       - name: Bundle
         shell: bash
-        run: |
-          mkdir dist
-          for b in octos octos-sandbox news_fetch deep-search deep_crawl send_email account_manager voice clock weather smart_home; do
-            cp "target/release/${b}.exe" dist/ 2>/dev/null || true
-          done
-          cd dist && 7z a ../octos-bundle-x86_64-pc-windows-msvc.zip *
+        run: ./scripts/bundle-release.sh octos-bundle-x86_64-pc-windows-msvc.zip
 
       - uses: actions/upload-artifact@v7
         with:
@@ -926,14 +919,18 @@ jobs:
   e2e-tool-regression:
     runs-on: macos-14
     needs: [check, test-octos-agent, test-octos-cli]
-    # Run on pushes to main or when tool/sandbox/agent files change
-    if: |
-      github.event_name == 'push' ||
-      contains(github.event.pull_request.title, 'tool') ||
-      contains(github.event.pull_request.title, 'sandbox') ||
-      contains(github.event.pull_request.title, 'activate')
+    # Run on pushes to main and on every PR. The file-level detection below is
+    # the only filter — PR-title keyword matching used to gate this job, so a
+    # PR that changed tools without saying so in the title skipped e2e entirely.
+    if: github.event_name != 'schedule'
     steps:
+      # fetch-depth: 0 is load-bearing: the diff below needs HEAD~1 (push) and
+      # the PR base sha (pull_request). The default depth-1 checkout has
+      # NEITHER, the old `|| echo ""` masked the resulting fatal error, and
+      # FILES came out empty — so this job silently never ran its tests.
       - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -946,11 +943,14 @@ jobs:
       - name: Check for relevant changes
         id: changes
         run: |
-          if [ "${{ github.event_name }}" = "push" ]; then
-            FILES=$(git diff --name-only HEAD~1 HEAD 2>/dev/null || echo "")
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            FILES=$(git diff --name-only "${{ github.event.pull_request.base.sha }}" HEAD)
           else
-            FILES=$(git diff --name-only ${{ github.event.pull_request.base.sha }} HEAD 2>/dev/null || echo "")
+            FILES=$(git diff --name-only HEAD~1 HEAD)
           fi
+          echo "Changed files:"
+          echo "$FILES"
           if echo "$FILES" | grep -qE '(activate_tools|sandbox|shell\.rs|tools/mod|session_actor|exec_env)'; then
             echo "run=true" >> "$GITHUB_OUTPUT"
           else
@@ -981,7 +981,7 @@ jobs:
       - name: Install e2e deps
         if: steps.changes.outputs.run == 'true'
         working-directory: e2e
-        run: npm install
+        run: npm ci
 
       - name: Run e2e tool regression tests
         if: steps.changes.outputs.run == 'true'
@@ -995,15 +995,17 @@ jobs:
   security:
     runs-on: macos-14
     needs: [check, test-octos-agent, test-octos-cli]
-    # Only run when security-related files change
-    if: |
-      github.event_name == 'push' ||
-      contains(github.event.pull_request.title, 'security') ||
-      contains(github.event.pull_request.title, 'sandbox')
+    # Run on pushes and on every PR — the file-level detection below is the
+    # only filter (title keyword matching used to let security-relevant PRs
+    # slip through when the title didn't say "security"/"sandbox").
+    if: github.event_name != 'schedule'
     steps:
+      # fetch-depth: 0 is load-bearing: with the old depth-2 checkout the PR
+      # base sha was absent, the masked git-diff failure produced FILES="",
+      # and the security suite silently never ran on PRs.
       - uses: actions/checkout@v6
         with:
-          fetch-depth: 2
+          fetch-depth: 0
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -1012,11 +1014,14 @@ jobs:
       - name: Check for security-related changes
         id: changes
         run: |
-          if [ "${{ github.event_name }}" = "push" ]; then
-            FILES=$(git diff --name-only HEAD~1 HEAD 2>/dev/null || echo "")
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            FILES=$(git diff --name-only "${{ github.event.pull_request.base.sha }}" HEAD)
           else
-            FILES=$(git diff --name-only ${{ github.event.pull_request.base.sha }} HEAD 2>/dev/null || echo "")
+            FILES=$(git diff --name-only HEAD~1 HEAD)
           fi
+          echo "Changed files:"
+          echo "$FILES"
           # `session_scope` is the path-containment boundary behind
           # `classify_canonical_path`; it is NOT covered by `session_actor`.
           if echo "$FILES" | grep -qE '(sandbox|ssrf|security|tools/mod|session_actor|session_scope|profiles)'; then

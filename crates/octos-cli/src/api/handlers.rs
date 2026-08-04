@@ -2399,6 +2399,10 @@ async fn resolve_profile_data_dir(
     Err((StatusCode::SERVICE_UNAVAILABLE, "no gateway").into_response())
 }
 
+// The `Err` variant is a fully-built axum `Response` (large by design);
+// handlers return it directly for `?`-propagation, so boxing would only
+// churn every call site on a cold error path.
+#[allow(clippy::result_large_err)]
 fn resolve_profile_data_dir_by_id(
     state: &AppState,
     profile_id: &str,
@@ -5305,7 +5309,7 @@ mod tests {
         .expect("admin identity is always authorized");
         let keys: Vec<&str> = candidates.iter().map(|k| k.0.as_str()).collect();
         assert!(
-            !keys.iter().any(|k| *k == "telegram:123"),
+            !keys.contains(&"telegram:123"),
             "raw-id candidate must be skipped for ids with `:` — got {keys:?}"
         );
     }
@@ -5358,9 +5362,9 @@ mod tests {
 
         // Tenant sees ONLY its own profile-prefixed key.
         assert_eq!(keys, vec!["dspfac:api:web-7c9e"]);
-        assert!(!keys.iter().any(|k| *k == "_main:api:web-7c9e"));
-        assert!(!keys.iter().any(|k| *k == "api:web-7c9e"));
-        assert!(!keys.iter().any(|k| *k == "web-7c9e"));
+        assert!(!keys.contains(&"_main:api:web-7c9e"));
+        assert!(!keys.contains(&"api:web-7c9e"));
+        assert!(!keys.contains(&"web-7c9e"));
     }
 
     /// Codex P2 round 5 regression: the canonical reload-mid-stream
@@ -5400,9 +5404,9 @@ mod tests {
         // works. This is no privilege escalation: admin already has
         // read-all access through other endpoints.
         assert_eq!(keys.first().copied(), Some("dspfac:api:web-7c9e"));
-        assert!(keys.iter().any(|k| *k == "_main:api:web-7c9e"));
-        assert!(keys.iter().any(|k| *k == "api:web-7c9e"));
-        assert!(keys.iter().any(|k| *k == "web-7c9e"));
+        assert!(keys.contains(&"_main:api:web-7c9e"));
+        assert!(keys.contains(&"api:web-7c9e"));
+        assert!(keys.contains(&"web-7c9e"));
     }
 
     #[test]
@@ -5435,13 +5439,13 @@ mod tests {
         // Bare-channel key must be present so REST returns WS-persisted rows
         // for `SessionKey::new("api", "web-…")`.
         assert!(
-            keys.iter().any(|k| *k == "api:web-7c9e"),
+            keys.contains(&"api:web-7c9e"),
             "bare-channel candidate missing from {keys:?}"
         );
         // Raw-id key must be present so REST returns rows when the SPA sent
         // a bare `SessionKey("web-…")` (no `api:` prefix). Codex P1.
         assert!(
-            keys.iter().any(|k| *k == "web-7c9e"),
+            keys.contains(&"web-7c9e"),
             "raw-id candidate missing from {keys:?}"
         );
     }
@@ -6176,7 +6180,7 @@ mod tests {
         assert_eq!(json["original_task_id"], task_id);
         assert_eq!(json["from_node"], "design");
         assert!(
-            json["new_task_id"].as_str().unwrap().len() > 0,
+            !json["new_task_id"].as_str().unwrap().is_empty(),
             "new_task_id should be a fresh UUID-ish string"
         );
 

@@ -531,6 +531,10 @@ pub(crate) fn strip_exit_marker(reply: &str) -> &str {
 /// used for sanitizing free-form text that may have folded a marker in at an
 /// arbitrary position, e.g. a pre-fix compaction summary. An unterminated
 /// `[[VISUAL:` drops the remainder.
+// Kept for sanitizing folded-in markers (e.g. legacy compaction summaries);
+// no caller on the current turn path, but the scrubber stays available for
+// the migration cleanups it was written for.
+#[allow(dead_code)]
 pub(crate) fn remove_all_visual_markers(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut rest = s;

@@ -7,6 +7,12 @@ use tokio::sync::Mutex;
 use super::{TaskCancelCb, TaskRelaunchCb};
 use crate::config::ChannelEntry;
 
+// Callback aliases mirroring `TaskCancelCb`/`TaskRelaunchCb` in
+// `adapters/mod.rs` — the bare `Arc<dyn Fn …>` types trip
+// `clippy::type_complexity` in the `register` signature.
+type TaskQueryCb = Arc<dyn Fn(&str) -> serde_json::Value + Send + Sync>;
+type SessionDeletedCb = Arc<dyn Fn(&str) + Send + Sync>;
+
 #[allow(clippy::too_many_arguments)]
 pub fn register(
     channel_mgr: &mut ChannelManager,
@@ -14,12 +20,12 @@ pub fn register(
     shutdown: &Arc<AtomicBool>,
     session_mgr: &Arc<Mutex<SessionManager>>,
     metrics_handle: Option<metrics_exporter_prometheus::PrometheusHandle>,
-    task_query: Option<Arc<dyn Fn(&str) -> serde_json::Value + Send + Sync>>,
+    task_query: Option<TaskQueryCb>,
     task_cancel: Option<TaskCancelCb>,
     task_relaunch: Option<TaskRelaunchCb>,
     gateway_profile_id: Option<&str>,
     api_port_override: Option<u16>,
-    on_session_deleted: Option<Arc<dyn Fn(&str) + Send + Sync>>,
+    on_session_deleted: Option<SessionDeletedCb>,
 ) -> eyre::Result<()> {
     let port: u16 = api_port_override.unwrap_or_else(|| {
         entry

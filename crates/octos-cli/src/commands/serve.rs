@@ -1719,6 +1719,9 @@ impl ServeCommand {
     /// [`octos_swarm::DispatchPolicy::from_agent_gates`] rustdoc for
     /// the boundary. Closes audit issue #713 (M7 req 7 production
     /// wiring).
+    // Each argument is a distinct `--swarm-*` CLI flag or shared handle;
+    // grouping them would just rename the same parameter list.
+    #[allow(clippy::too_many_arguments)]
     async fn build_swarm_state_from_flags(
         swarm_backend: Option<&str>,
         swarm_backend_cmd: Option<&str>,

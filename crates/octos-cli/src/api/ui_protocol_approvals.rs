@@ -327,7 +327,7 @@ pub(super) fn build_decided_event(
         .context
         .as_ref()
         .map(|ctx| ctx.turn_id.clone())
-        .unwrap_or_else(TurnId::new);
+        .unwrap_or_default();
     ApprovalDecidedEvent {
         session_id: params.session_id.clone(),
         topic: params.session_id.topic().map(ToOwned::to_owned),

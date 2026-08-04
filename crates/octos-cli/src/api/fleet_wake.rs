@@ -599,10 +599,9 @@ mod tests {
             })
             .expect("no-root continuation");
         assert!(
-            no_root
+            !no_root
                 .metadata
-                .get(FLEET_KEEPER_META_WORKSPACE_ROOT)
-                .is_none(),
+                .contains_key(FLEET_KEEPER_META_WORKSPACE_ROOT),
             "no persisted root → no workspace_root metadata (never fabricated)"
         );
     }

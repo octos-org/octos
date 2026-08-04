@@ -855,6 +855,11 @@ pub(crate) fn route_terminal_event_to_continuation_queue(
     }
 }
 
+// "Workspace is known in-memory" predicate accepted by
+// `due_loop_targets_with_filter` — aliased because the bare trait-object
+// type trips `clippy::type_complexity`.
+type LoopRunnableFilter<'a> = dyn Fn(&SessionKey, &str) -> bool + 'a;
+
 impl InProcessAgentOrchestrator {
     fn state(&self) -> std::sync::MutexGuard<'_, AutonomyRuntimeState> {
         self.state
@@ -1722,6 +1727,9 @@ impl InProcessAgentOrchestrator {
         Ok(payload)
     }
 
+    // The ping payload mirrors the wire contract field-for-field; bundling
+    // the optional fields into a struct would drift from the RPC surface.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn record_agent_ping(
         &self,
         agent_id: &str,
@@ -2038,7 +2046,7 @@ impl InProcessAgentOrchestrator {
         &self,
         profile_filter: Option<&str>,
         max_items: usize,
-        runnable: Option<&dyn Fn(&SessionKey, &str) -> bool>,
+        runnable: Option<&LoopRunnableFilter<'_>>,
     ) -> Vec<(SessionKey, String)> {
         if max_items == 0 {
             return Vec::new();
@@ -13224,7 +13232,6 @@ mod tests {
     /// Bullet 3: budget exhaustion → enqueue a wrap-up turn AND
     /// transition the goal to `budget_limited`. Subsequent calls must
     /// be idempotent (no duplicate wrap-up).
-    #[test]
     /// #1696 — the model-owned transition matrix: complete|blocked only,
     /// profile-scoped, refuses double-complete; the post-turn budget flip
     /// must not overwrite a mid-turn model transition.
@@ -15566,7 +15573,10 @@ mod tests {
         // due-now — that would race a client that also seeds fire_now).
         // Fixed loops keep now+interval.
         let orchestrator = InProcessAgentOrchestrator::default();
-        let cases: [(&str, Option<u64>, Option<&str>, Option<&str>); 3] = [
+        // (mode tag, create interval, prompt, expected mode) — aliased to
+        // keep the fixture type under clippy's type-complexity threshold.
+        type LoopCase<'a> = (&'a str, Option<u64>, Option<&'a str>, Option<&'a str>);
+        let cases: [LoopCase<'_>; 3] = [
             (
                 "fixed",
                 Some(120),
@@ -17156,7 +17166,7 @@ mod tests {
                 Some("objective-b"),
             );
             assert!(
-                state.goals.get(&key).is_none(),
+                !state.goals.contains_key(&key),
                 "the bare wire key must hold no goal — nothing to leak",
             );
         }

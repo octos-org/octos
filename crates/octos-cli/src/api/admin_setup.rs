@@ -756,9 +756,8 @@ pub async fn get_deployment_mode_detect(
         .as_deref()
         .map(|d| !d.is_empty())
         .unwrap_or(false)
+        || std::env::var("TUNNEL_DOMAIN").is_ok()
     {
-        "cloud"
-    } else if std::env::var("TUNNEL_DOMAIN").is_ok() {
         "cloud"
     } else {
         let frpc_exists = data_dir_from_state(&state)

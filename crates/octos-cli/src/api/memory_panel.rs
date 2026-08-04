@@ -289,12 +289,12 @@ mod imp {
         // #1611 r12 P2): a listing we could not start — or an entry we
         // could not read — must never let a partial result pass as
         // exact/complete.
-        let Ok(mut entries) = rustix::fs::Dir::read_from(dir) else {
+        let Ok(entries) = rustix::fs::Dir::read_from(dir) else {
             return (Vec::new(), true);
         };
         let mut names = Vec::new();
         let mut raw_seen = 0usize;
-        while let Some(next) = entries.next() {
+        for next in entries {
             let Ok(entry) = next else {
                 return (names, true);
             };
@@ -326,12 +326,12 @@ mod imp {
         // Enumeration failures are truncation — see list_md_stems
         // (codex #1611 r12 P2): a zero/partial count from a failed
         // scan must not read as exact.
-        let Ok(mut entries) = rustix::fs::Dir::read_from(dir) else {
+        let Ok(entries) = rustix::fs::Dir::read_from(dir) else {
             return (0, true);
         };
         let mut count = 0;
         let mut raw_seen = 0usize;
-        while let Some(next) = entries.next() {
+        for next in entries {
             let Ok(entry) = next else {
                 return (count, true);
             };
@@ -862,7 +862,7 @@ mod tests {
         // Host opts out of (default-on) refresh; a profile that says
         // nothing must inherit the opt-out — same merge the runtime
         // bootstrap applies.
-        let (_dir, state, ps) = temp_state();
+        let (_dir, _state, ps) = temp_state();
         let profile = make_user_profile("tenant2", "Tenant Two");
         ps.save(&profile).unwrap();
         let state = Arc::new(AppState {

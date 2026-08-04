@@ -167,8 +167,7 @@ impl ContentCatalog {
 
     /// Persist catalog to disk (atomic write via temp + rename).
     fn save(&self) -> io::Result<()> {
-        let json = serde_json::to_string_pretty(&self.entries)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        let json = serde_json::to_string_pretty(&self.entries).map_err(io::Error::other)?;
         let tmp = self.catalog_path.with_extension("json.tmp");
         std::fs::write(&tmp, &json)?;
         std::fs::rename(&tmp, &self.catalog_path)?;
@@ -357,12 +356,10 @@ impl ContentCatalog {
 
         // Sort.
         match q.sort.as_str() {
-            "oldest" => filtered.sort_by(|a, b| a.created_at.cmp(&b.created_at)),
-            "name" => {
-                filtered.sort_by(|a, b| a.filename.to_lowercase().cmp(&b.filename.to_lowercase()))
-            }
-            "size" => filtered.sort_by(|a, b| b.size_bytes.cmp(&a.size_bytes)),
-            _ => filtered.sort_by(|a, b| b.created_at.cmp(&a.created_at)), // newest
+            "oldest" => filtered.sort_by_key(|a| a.created_at),
+            "name" => filtered.sort_by_key(|a| a.filename.to_lowercase()),
+            "size" => filtered.sort_by_key(|a| std::cmp::Reverse(a.size_bytes)),
+            _ => filtered.sort_by_key(|a| std::cmp::Reverse(a.created_at)), // newest
         }
 
         // Paginate.
@@ -440,12 +437,11 @@ impl ContentCatalog {
         std::fs::create_dir_all(&self.thumbnail_dir)?;
         let thumb_path = self.thumbnail_dir.join(format!("{id}.jpg"));
 
-        let img = image::open(path)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("image open: {e}")))?;
+        let img = image::open(path).map_err(|e| io::Error::other(format!("image open: {e}")))?;
         let thumb = img.thumbnail(THUMBNAIL_MAX_WIDTH, THUMBNAIL_MAX_WIDTH);
         thumb
             .save(&thumb_path)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("thumbnail save: {e}")))?;
+            .map_err(|e| io::Error::other(format!("thumbnail save: {e}")))?;
 
         Ok(thumb_path.to_string_lossy().to_string())
     }
@@ -486,7 +482,7 @@ impl ContentCatalogManager {
         let profile = self
             .profile_store
             .get(profile_id)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?
+            .map_err(io::Error::other)?
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "profile not found"))?;
 
         let data_dir = self.profile_store.resolve_data_dir(&profile);
@@ -505,7 +501,7 @@ impl ContentCatalogManager {
         let profile = self
             .profile_store
             .get(profile_id)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?
+            .map_err(io::Error::other)?
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "profile not found"))?;
         let data_dir = self.profile_store.resolve_data_dir(&profile);
         let mut cat = catalog.write().await;
