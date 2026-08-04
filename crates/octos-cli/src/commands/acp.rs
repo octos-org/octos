@@ -86,6 +86,11 @@ use octos_core::SessionKey;
 use super::Executable;
 use crate::config::Config;
 
+/// Default for [`AcpCommand::max_iterations`]. Shared by the clap default and
+/// the `Default` impl so an embedder building the command by hand gets the same
+/// budget the CLI does.
+pub const DEFAULT_MAX_ITERATIONS: u32 = 20;
+
 /// Run octos as an ACP (Agent Client Protocol) agent over stdin/stdout.
 ///
 /// ACP clients (Zed and other editors) spawn this process and drive it via
@@ -120,7 +125,7 @@ pub struct AcpCommand {
     pub base_url: Option<String>,
 
     /// Maximum tool-call iterations per prompt turn.
-    #[arg(long, default_value = "20")]
+    #[arg(long, default_value_t = DEFAULT_MAX_ITERATIONS)]
     pub max_iterations: u32,
 
     /// Runtime profile to apply at startup (parity with `octos chat`).
@@ -130,6 +135,25 @@ pub struct AcpCommand {
     /// the unfiltered pre-lean tool set.
     #[arg(long)]
     pub profile: Option<String>,
+}
+
+impl Default for AcpCommand {
+    /// Every field unset, which means "resolve it from the config" — the same
+    /// thing the CLI does when the flag is absent. Hand-written rather than
+    /// derived because `max_iterations` has a real default and deriving would
+    /// silently make it 0.
+    fn default() -> Self {
+        Self {
+            cwd: None,
+            data_dir: None,
+            config: None,
+            provider: None,
+            model: None,
+            base_url: None,
+            max_iterations: DEFAULT_MAX_ITERATIONS,
+            profile: None,
+        }
+    }
 }
 
 impl Executable for AcpCommand {
@@ -168,7 +192,7 @@ struct AcpSession {
 /// `MockLlm`-backed agent without a real provider/config, while production uses
 /// [`ConfigAgentFactory`] which resolves an LLM exactly like `octos chat`.
 #[async_trait::async_trait]
-trait SessionAgentFactory: Send + Sync {
+pub trait SessionAgentFactory: Send + Sync {
     /// The cwd to fall back to when the client sends an empty `session/new` cwd.
     fn default_cwd(&self) -> &std::path::Path;
 
@@ -1039,7 +1063,29 @@ impl agent_client_protocol::ConnectTo<Client> for OctosAcpAgentTransport {
 }
 
 impl AcpCommand {
-    async fn run_async(self) -> Result<()> {
+    /// Build the agent factory `octos acp` serves — without serving it.
+    ///
+    /// The embedding seam. Everything `octos acp` does before it touches stdio
+    /// happens here: context/config resolution, provider and model selection,
+    /// and the lazily-built shared agent stack. What comes back is the same
+    /// [`SessionAgentFactory`] the stdio path drives, so an embedder that links
+    /// octos instead of spawning it gets provider fallbacks, the auth store,
+    /// `keychain:` markers, MCP, plugins, skills and memory identically — and
+    /// stays in step with the CLI, rather than reimplementing a subset that
+    /// drifts.
+    ///
+    /// `build(cwd)` on the result hands back a runnable [`Agent`] plus its
+    /// shutdown flag; drive it however you like.
+    ///
+    /// Callers embedding this need a tokio runtime, and should note the agent's
+    /// tools run with the host process's own privileges, rooted at `cwd`.
+    ///
+    /// ```ignore
+    /// let factory = AcpCommand { provider: Some("anthropic".into()), ..Default::default() }
+    ///     .factory()?;
+    /// let (agent, shutdown) = factory.build(workspace).await?;
+    /// ```
+    pub fn factory(&self) -> Result<Arc<dyn SessionAgentFactory>> {
         // Resolve config the same way `octos chat` does.
         let cwd = match &self.cwd {
             Some(c) => c.clone(),
@@ -1074,7 +1120,7 @@ impl AcpCommand {
         // The full shared agent stack (provider chain, memory, plugins, MCP,
         // hooks, system prompt, compaction) is assembled lazily on the first
         // `session/new` — see `ConfigAgentFactory`.
-        let factory: Arc<dyn SessionAgentFactory> = Arc::new(ConfigAgentFactory {
+        Ok(Arc::new(ConfigAgentFactory {
             config,
             provider_name,
             model,
@@ -1085,8 +1131,11 @@ impl AcpCommand {
             profile: self.profile.clone(),
             shared: tokio::sync::OnceCell::new(),
             cwd_cache: Mutex::new(HashMap::new()),
-        });
+        }))
+    }
 
+    async fn run_async(self) -> Result<()> {
+        let factory = self.factory()?;
         let sessions: SessionMap = Arc::new(Mutex::new(HashMap::new()));
 
         // Drive the ACP agent over stdio until the client disconnects.
