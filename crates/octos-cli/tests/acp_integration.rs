@@ -121,6 +121,17 @@ fn agent_message_text(update: &SessionUpdate) -> Option<String> {
     }
 }
 
+/// Pull the text out of a user-message `session/update`, if that's what it is.
+fn user_message_text(update: &SessionUpdate) -> Option<String> {
+    match update {
+        SessionUpdate::UserMessageChunk(chunk) => match &chunk.content {
+            ContentBlock::Text(t) => Some(t.text.clone()),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn should_stream_assistant_message_and_end_turn_when_driven_through_acp_initialize_new_session_prompt()
  {
@@ -566,6 +577,117 @@ async fn should_restore_a_conversation_through_session_load() {
     );
 }
 
+/// #1909: `session/load` must REPLAY the restored transcript as `session/update`
+/// notifications — the response carries no history, so without a replay a
+/// reconnecting client renders an empty conversation even though the agent
+/// restored it (the client then prompts from zero context and the agent
+/// answers as if it forgot everything).
+///
+/// Same two-transport shape as `should_restore_a_conversation_through_session_load`,
+/// but the second client RECORDS the updates and asserts the earlier turns were
+/// replayed by the time `session/load` responded.
+#[tokio::test]
+async fn should_replay_stored_history_as_session_updates_on_load() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let cwd = tmp.path().to_path_buf();
+    let memory_dir = tmp.path().join("memory");
+    let sessions_dir = tmp.path().join("sessions");
+    std::fs::create_dir_all(&memory_dir).unwrap();
+
+    // ---- first process: one persisted turn ----
+    let llm_one: Arc<dyn octos_llm::LlmProvider> = Arc::new(MockLlm {
+        reply: "REMEMBER_THIS".to_string(),
+    });
+    let factory_one = TestAgentFactory::new(llm_one, memory_dir.clone(), cwd.clone())
+        .with_session_store(&sessions_dir);
+
+    let cwd_one = cwd.clone();
+    let session_id = Client
+        .builder()
+        .name("octos-acp-replay-1")
+        .on_receive_notification(
+            async move |_n: SessionNotification,
+                        _cx: ConnectionTo<agent_client_protocol::Agent>| Ok(()),
+            agent_client_protocol::on_receive_notification!(),
+        )
+        .connect_with(
+            OctosAcpAgentTransport::new(factory_one),
+            |connection: ConnectionTo<agent_client_protocol::Agent>| async move {
+                connection
+                    .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                    .block_task()
+                    .await?;
+                let new_session = connection
+                    .send_request(NewSessionRequest::new(cwd_one.clone()))
+                    .block_task()
+                    .await?;
+                let id = new_session.session_id.clone();
+                connection
+                    .send_request(PromptRequest::new(
+                        id.clone(),
+                        vec![ContentBlock::from("FIRST_QUESTION")],
+                    ))
+                    .block_task()
+                    .await?;
+                Ok::<_, agent_client_protocol::Error>(id)
+            },
+        )
+        .await
+        .expect("first session");
+
+    // ---- second process: same store, load, recording every session/update ----
+    let llm_two: Arc<dyn octos_llm::LlmProvider> = Arc::new(MockLlm {
+        reply: "SECOND_REPLY".to_string(),
+    });
+    let factory_two =
+        TestAgentFactory::new(llm_two, memory_dir, cwd.clone()).with_session_store(&sessions_dir);
+
+    let updates: Arc<Mutex<Vec<SessionUpdate>>> = Arc::new(Mutex::new(Vec::new()));
+    let updates_for_handler = updates.clone();
+    let id_two = session_id.clone();
+    let cwd_two = cwd.clone();
+    Client
+        .builder()
+        .name("octos-acp-replay-2")
+        .on_receive_notification(
+            async move |n: SessionNotification, _cx: ConnectionTo<agent_client_protocol::Agent>| {
+                updates_for_handler.lock().await.push(n.update);
+                Ok(())
+            },
+            agent_client_protocol::on_receive_notification!(),
+        )
+        .connect_with(
+            OctosAcpAgentTransport::new(factory_two),
+            |connection: ConnectionTo<agent_client_protocol::Agent>| async move {
+                connection
+                    .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                    .block_task()
+                    .await?;
+                // By the time session/load RESPONDS, the replay must have
+                // landed — the frames precede the response on the connection.
+                connection
+                    .send_request(LoadSessionRequest::new(id_two.clone(), cwd_two.clone()))
+                    .block_task()
+                    .await?;
+                Ok::<_, agent_client_protocol::Error>(())
+            },
+        )
+        .await
+        .expect("second session");
+
+    let recorded = updates.lock().await;
+    let user_texts: Vec<String> = recorded.iter().filter_map(user_message_text).collect();
+    let agent_texts: Vec<String> = recorded.iter().filter_map(agent_message_text).collect();
+    assert!(
+        user_texts.iter().any(|t| t.contains("FIRST_QUESTION")),
+        "session/load must replay the user turn as a UserMessageChunk; recorded: {recorded:?}"
+    );
+    assert!(
+        agent_texts.iter().any(|t| t.contains("REMEMBER_THIS")),
+        "session/load must replay the assistant turn as an AgentMessageChunk; recorded: {recorded:?}"
+    );
+}
+
 /// `session/load` must not evict a session that is already live.
 ///
 /// A bare insert dropped the existing entry and with it the `shutdown` flag an
@@ -645,5 +767,153 @@ async fn should_not_evict_a_live_session_on_reload() {
     assert!(
         joined.contains("TURN_ONE"),
         "reloading a live session lost its history; saw: {joined}"
+    );
+}
+
+/// #1909: a stored transcript must be SANITIZED on load, before it touches the
+/// LLM or the client. The store is append-only JSONL, so a crash can leave an
+/// assistant tool_call whose result never landed — feeding that back to the
+/// provider is a 400 ("tool_use without tool_result"), and replaying it renders
+/// a tool card that never completes in the client. Every other resume path runs
+/// `ResumePolicy`; ACP's `session/load` must too.
+#[tokio::test]
+async fn should_sanitize_stored_history_when_loading_a_session() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let cwd = tmp.path().to_path_buf();
+    let memory_dir = tmp.path().join("memory");
+    let sessions_dir = tmp.path().join("sessions");
+    std::fs::create_dir_all(&memory_dir).unwrap();
+
+    let session_id = agent_client_protocol::schema::v1::SessionId::new("octos-seeded");
+    let key = octos_core::SessionKey::with_profile(
+        octos_core::MAIN_PROFILE_ID,
+        "acp",
+        session_id.0.as_ref(),
+    );
+
+    // Seed the store directly: one healthy user + assistant pair, one assistant
+    // tool_call with NO matching result (crash residue), one whitespace-only
+    // assistant row. All thread-stamped so the fail-closed write path accepts
+    // them.
+    {
+        let mut mgr = octos_bus::session::SessionManager::open(&sessions_dir).expect("open store");
+        let msg = |role: octos_core::MessageRole, content: &str| octos_core::Message {
+            role,
+            content: content.into(),
+            media: vec![],
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+            client_message_id: None,
+            thread_id: Some("t-seed".into()),
+            timestamp: chrono::Utc::now(),
+        };
+        mgr.add_message(&key, msg(octos_core::MessageRole::User, "SEED_USER"))
+            .await
+            .expect("user row");
+        let mut ghost = msg(octos_core::MessageRole::Assistant, "");
+        ghost.tool_calls = Some(vec![octos_core::ToolCall {
+            id: "ghost-call".into(),
+            name: "shell".into(),
+            arguments: serde_json::json!({}),
+            metadata: None,
+        }]);
+        mgr.add_message(&key, ghost)
+            .await
+            .expect("ghost tool-call row");
+        mgr.add_message(&key, msg(octos_core::MessageRole::Assistant, "   "))
+            .await
+            .expect("whitespace row");
+        mgr.add_message(
+            &key,
+            msg(octos_core::MessageRole::Assistant, "SEED_ASSISTANT"),
+        )
+        .await
+        .expect("assistant row");
+    }
+
+    let seen: Arc<Mutex<Vec<Vec<String>>>> = Arc::new(Mutex::new(Vec::new()));
+    let llm: Arc<dyn octos_llm::LlmProvider> = Arc::new(RecordingLlm {
+        seen: seen.clone(),
+        replies: vec!["AFTER_LOAD".to_string()],
+        calls: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let factory =
+        TestAgentFactory::new(llm, memory_dir, cwd.clone()).with_session_store(&sessions_dir);
+
+    let updates: Arc<Mutex<Vec<SessionUpdate>>> = Arc::new(Mutex::new(Vec::new()));
+    let updates_for_handler = updates.clone();
+    let id_for_client = session_id.clone();
+    let cwd_for_client = cwd.clone();
+    Client
+        .builder()
+        .name("octos-acp-sanitize-client")
+        .on_receive_notification(
+            async move |n: SessionNotification, _cx: ConnectionTo<agent_client_protocol::Agent>| {
+                updates_for_handler.lock().await.push(n.update);
+                Ok(())
+            },
+            agent_client_protocol::on_receive_notification!(),
+        )
+        .connect_with(
+            OctosAcpAgentTransport::new(factory),
+            |connection: ConnectionTo<agent_client_protocol::Agent>| async move {
+                connection
+                    .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                    .block_task()
+                    .await?;
+                connection
+                    .send_request(LoadSessionRequest::new(
+                        id_for_client.clone(),
+                        cwd_for_client.clone(),
+                    ))
+                    .block_task()
+                    .await?;
+                connection
+                    .send_request(PromptRequest::new(
+                        id_for_client.clone(),
+                        vec![ContentBlock::from("NEXT_QUESTION")],
+                    ))
+                    .block_task()
+                    .await?;
+                Ok::<_, agent_client_protocol::Error>(())
+            },
+        )
+        .await
+        .expect("load + prompt");
+
+    // The replay must not contain a ToolCall frame for the unresolved call —
+    // the client would render a tool card that never completes.
+    let recorded = updates.lock().await;
+    assert!(
+        !recorded
+            .iter()
+            .any(|u| matches!(u, SessionUpdate::ToolCall(_))),
+        "the unresolved tool call must be sanitized away before replay; recorded: {recorded:?}"
+    );
+    let user_texts: Vec<String> = recorded.iter().filter_map(user_message_text).collect();
+    let agent_texts: Vec<String> = recorded.iter().filter_map(agent_message_text).collect();
+    assert!(
+        user_texts.iter().any(|t| t.contains("SEED_USER")),
+        "healthy rows still replay; recorded: {recorded:?}"
+    );
+    assert!(
+        agent_texts.iter().any(|t| t.contains("SEED_ASSISTANT")),
+        "healthy rows still replay; recorded: {recorded:?}"
+    );
+
+    // And the LLM must never see the orphan rows on the next prompt: no
+    // empty/whitespace-only payloads in the handed-over transcript.
+    let calls = seen.lock().await;
+    let last = calls.last().expect("a turn ran after load");
+    assert!(
+        last.iter().any(|c| c.contains("SEED_USER"))
+            && last.iter().any(|c| c.contains("SEED_ASSISTANT")),
+        "healthy rows reach the LLM: {last:?}"
+    );
+    let blanks = last.iter().filter(|c| c.trim().is_empty()).count();
+    assert_eq!(
+        blanks, 0,
+        "sanitized history must not hand the LLM payload-free rows: {last:?}"
     );
 }
