@@ -119,16 +119,20 @@ impl Tool for PeerHandoffTool {
     }
 
     fn description(&self) -> &str {
-        "Promote work OUT of this conversation into a sovereign peer session with \
-         its own durable brief, workspace, and lifecycle. Give the peer a short, \
-         unique NAME — it is the peer's primary address (\"let Edison do X\"); you \
-         reach it later by name with peer_send_input / peer_close / peer_gather. \
-         Use when the work outlives this turn, needs its own workspace or safety \
-         envelope, or the user may steer it separately. You will NOT receive the \
-         result in this turn — the peer reports to the user's session strip and the \
-         shared blackboard. For work whose result THIS turn needs to continue \
-         reasoning, use spawn instead. The brief is a complete task contract: \
-         include all context the peer needs (it cannot see this conversation)."
+        "Hand a SELF-CONTAINED piece of work to a sovereign peer session with its \
+         own durable brief, workspace, and lifecycle, and keep working yourself. \
+         Give the peer a short, unique NAME — it is the peer's primary address \
+         (\"let Edison do X\"); you reach it later by name with peer_send_input / \
+         peer_close / peer_gather. Use when the work outlives this turn, needs its \
+         own workspace or safety envelope, or the user may steer it separately. \
+         You will NOT receive the result in this turn — the peer reports to the \
+         user's session strip and the shared blackboard. Handing work off does NOT \
+         end your turn: delegating is what lets you make progress on your own \
+         remaining work in parallel, so continue it immediately unless the peer \
+         took over everything you had left. For work whose result THIS turn needs \
+         to continue reasoning, use spawn instead. The brief is a complete task \
+         contract: include all context the peer needs (it cannot see this \
+         conversation)."
     }
 
     fn tags(&self) -> &[&str] {
@@ -227,7 +231,10 @@ impl Tool for PeerHandoffTool {
                     "Staged peer '{name}' (slug {slug}, brief at {brief_path}, cwd {cwd}). \
                      Address it later by name with peer_send_input / peer_close. The user's \
                      client opens it in the background; its result lands on the blackboard \
-                     at peers/{slug}/result.md. Do not wait for it.",
+                     at peers/{slug}/result.md. Do not wait for it — and do not \
+                     stop here: if you still have work of your own, continue it \
+                     now in this same turn. Only finish if the peer took over \
+                     everything that was left.",
                     slug = staged.slug,
                     brief_path = staged.brief_path,
                     cwd = staged.cwd,
@@ -437,7 +444,53 @@ mod tests {
         assert!(result.output.contains("/data/peers/ci-fix/brief.md"));
         assert!(result.output.contains("cwd /work/peers/ci-fix/wt"));
         assert!(result.output.contains("peers/ci-fix/result.md"));
-        assert!(result.output.contains("Do not wait for it."));
+        assert!(result.output.contains("Do not wait for it"));
+    }
+
+    /// #1918: the master stalled after every handoff — it read "promote work
+    /// OUT" + "you will NOT receive the result in this turn" + "Do not wait for
+    /// it" as "your work is finished", and only resumed when the user nudged it.
+    /// Every signal pointed at ending the turn and nothing pointed back.
+    ///
+    /// "Do not wait" answers whether to BLOCK; it never answered whether to
+    /// CONTINUE. Both surfaces must now say so explicitly, because they are the
+    /// only two the model sees — octos has no central role prompt to carry this.
+    /// The result matters most: it is in context at the exact moment the model
+    /// chooses between another tool call and ending the turn.
+    #[tokio::test]
+    async fn should_tell_the_caller_to_keep_working_after_a_handoff() {
+        let (tool, _seen) = tool_with_recorder();
+        let result = tool
+            .execute(&json!({
+                "name": "Edison",
+                "brief": "Investigate the flaky bus test.",
+            }))
+            .await
+            .expect("handoff stages");
+
+        assert!(result.success);
+        let output = &result.output;
+        assert!(
+            output.contains("do not stop here"),
+            "the handoff result must tell the caller to continue its own work, got: {output}"
+        );
+        assert!(
+            output.contains("Only finish if the peer took over"),
+            "the result must name the ONE case where ending the turn is right, \
+             else 'keep working' reads as 'never finish', got: {output}"
+        );
+
+        // The description is the other half: it primed the stall by framing a
+        // handoff as work leaving the caller.
+        let description = tool.description();
+        assert!(
+            description.contains("keep working yourself"),
+            "the description must not imply the caller's work ends here"
+        );
+        assert!(
+            description.contains("does NOT end your turn"),
+            "the description must state that a handoff does not end the turn"
+        );
     }
 
     #[tokio::test]
