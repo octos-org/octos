@@ -14,6 +14,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use metrics::counter;
@@ -338,11 +339,6 @@ pub struct BackgroundTask {
     /// AppUI `runtime_policy_stamp` schema.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime_policy_stamp: Option<Value>,
-    /// Opaque host projection metadata. The supervisor persists this value
-    /// without interpreting its schema, allowing API adapters to derive
-    /// domain-specific views from the canonical task lifecycle.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub projection_metadata: Option<Value>,
 }
 
 impl BackgroundTask {
@@ -369,7 +365,7 @@ impl BackgroundTask {
 }
 
 /// Callback invoked when a task's status changes.
-type OnChangeCallback = Arc<dyn Fn(&BackgroundTask) + Send + Sync>;
+type OnChangeCallback = Box<dyn Fn(&BackgroundTask) + Send + Sync>;
 
 /// Payload emitted when a `spawn_only` background task transitions to
 /// `Failed`. Consumers (e.g. the session actor) use this to schedule a
@@ -895,8 +891,6 @@ pub struct TaskSupervisor {
     /// loop cannot keep adding children.
     poisoned_parents: Arc<Mutex<HashSet<String>>>,
     on_change: Arc<Mutex<Option<OnChangeCallback>>>,
-    /// Named observers supplement (and never replace) the primary callback.
-    on_change_listeners: Arc<Mutex<HashMap<String, OnChangeCallback>>>,
     on_failure: Arc<Mutex<Option<OnFailureCallback>>>,
     /// Gap-1 unification: single terminal-transition sink. Fired from
     /// every terminal path alongside the legacy `on_change` / `on_failure`
@@ -942,7 +936,34 @@ pub struct TaskSupervisor {
     /// See [`AckAndPending`] for the field-level documentation that
     /// previously lived on the individual fields.
     ack_and_pending: Arc<Mutex<AckAndPending>>,
+    /// Interval between heartbeat-reaper sweeps — see
+    /// [`TaskSupervisor::start_reaper`]. Defaults to
+    /// [`DEFAULT_REAP_INTERVAL`].
+    reap_interval: Arc<std::sync::Mutex<Duration>>,
+    /// Silence window after which an ACTIVE task with a LIVE worker is
+    /// considered stuck — see [`TaskSupervisor::start_reaper`]. Defaults
+    /// to [`DEFAULT_STUCK_TIMEOUT`], which matches the agent loop's
+    /// per-tool wall-clock ceiling (`DEFAULT_REGISTRY_TOOL_TIMEOUT_SECS`
+    /// = 1800s) so the reaper never fires earlier than the timeout a
+    /// legitimate tool call is allowed to consume.
+    stuck_timeout: Arc<std::sync::Mutex<Duration>>,
+    /// Whether the background reaper tokio task has been spawned — makes
+    /// [`TaskSupervisor::start_reaper`] idempotent (the supervisor is
+    /// `Clone`, and every clone shares this flag).
+    reaper_started: Arc<AtomicBool>,
 }
+
+/// Default heartbeat-reaper sweep interval. One minute is far below any
+/// plausible `stuck_timeout`, so the extra lock traffic is negligible.
+pub const DEFAULT_REAP_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Default silence window before a live-but-silent task is reaped. 30 min
+/// matches the agent loop's per-tool timeout (1800s): a worker that has
+/// produced NO progress signal for this long would be killed by the
+/// wall-clock backstop anyway, so the reaper only ever fires on workers
+/// that are genuinely wedged (or on progress paths that forgot to stamp
+/// `updated_at` — see the audit note on [`TaskSupervisor::start_reaper`]).
+pub const DEFAULT_STUCK_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
 /// Combined state guarded by a single mutex (Codex round-2 BLOCKER):
 /// the synth-ack set, the deferred-failure stash, and the per-task
@@ -1212,7 +1233,6 @@ impl TaskSupervisor {
             tasks: Arc::new(Mutex::new(HashMap::new())),
             poisoned_parents: Arc::new(Mutex::new(HashSet::new())),
             on_change: Arc::new(Mutex::new(None)),
-            on_change_listeners: Arc::new(Mutex::new(HashMap::new())),
             on_failure: Arc::new(Mutex::new(None)),
             on_terminal: Arc::new(Mutex::new(None)),
             on_relaunch: Arc::new(Mutex::new(None)),
@@ -1220,6 +1240,9 @@ impl TaskSupervisor {
             progress_reporter: Arc::new(Mutex::new(None)),
             cancel_tokens: Arc::new(CancelTokenStore::default()),
             ack_and_pending: Arc::new(Mutex::new(AckAndPending::default())),
+            reap_interval: Arc::new(Mutex::new(DEFAULT_REAP_INTERVAL)),
+            stuck_timeout: Arc::new(Mutex::new(DEFAULT_STUCK_TIMEOUT)),
+            reaper_started: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -1291,14 +1314,6 @@ impl TaskSupervisor {
 
     /// Enable append-only persistence for task snapshots and restore existing state.
     ///
-    /// Re-enabling with the SAME ledger path is a transparent no-op: every
-    /// mutation since the first enable has been appended through the normal
-    /// transition path, so the reload/resnapshot/sweep below would add
-    /// nothing — yet the skill-action job view/invoke paths re-enable on
-    /// every request over the shared session supervisor, and each such call
-    /// used to rewrite the whole ledger (#1906). A repeat returns the live
-    /// task total, exactly what a full run would report.
-    ///
     /// At the end of replay, sweeps the in-memory map for any task whose
     /// `runtime_state` is non-terminal (anything other than `Completed`,
     /// `Failed`, or `Cancelled`). Those tasks are orphans — the worker
@@ -1312,43 +1327,24 @@ impl TaskSupervisor {
     /// This handles startup-time orphans only: at this point in startup no
     /// new work has been scheduled yet, so any non-terminal runtime_state
     /// definitionally has no live worker. In-flight orphans inside a
-    /// long-running supervisor (worker hangs / crashes silently while the
-    /// supervisor itself stays alive) are NOT addressed here — that needs
-    /// a heartbeat-based reaper, which is a follow-up if observed.
+    /// long-running supervisor (worker future alive but permanently stuck,
+    /// so neither this sweep nor [`TaskTerminalGuard`]'s `Drop` fires) are
+    /// covered by the heartbeat-based reaper — see [`Self::start_reaper`]
+    /// (issue #1920).
     pub fn enable_persistence(&self, path: impl Into<PathBuf>) -> std::io::Result<usize> {
         let path = path.into();
-        // Idempotence guard (#1906): already persisting to THIS ledger —
-        // nothing new to restore and nothing stale to re-append.
-        {
-            let guard = self
-                .persistence_path
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            if guard.as_ref() == Some(&path) {
-                return Ok(self.tasks.lock().unwrap_or_else(|e| e.into_inner()).len());
-            }
-        }
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
 
         let ledger_path = path.display().to_string();
         let restored = Self::load_persisted_tasks(&path)?;
-        // Rows whose DISK version won the merge (or that exist only on disk).
-        // They are already persisted verbatim, so the snapshot pass below
-        // must skip them — re-appending every restored row on each enable
-        // made a fresh supervisor's read-only restore grow the ledger by
-        // its full length per call (#1906). Tasks absent from this set
-        // (in-memory work scheduled before enable, or memory state newer
-        // than the ledger) are the only ones the snapshot pass writes.
-        let mut restored_won: HashSet<String> = HashSet::new();
         {
             let mut tasks = self.tasks.lock().unwrap_or_else(|e| e.into_inner());
             for (task_id, task) in restored {
                 match tasks.get(&task_id) {
                     Some(existing) if existing.updated_at >= task.updated_at => {}
                     _ => {
-                        restored_won.insert(task_id.clone());
                         tasks.insert(task_id, task);
                     }
                 }
@@ -1369,11 +1365,7 @@ impl TaskSupervisor {
 
         let snapshots: Vec<BackgroundTask> = {
             let tasks = self.tasks.lock().unwrap_or_else(|e| e.into_inner());
-            tasks
-                .values()
-                .filter(|task| !restored_won.contains(&task.id))
-                .cloned()
-                .collect()
+            tasks.values().cloned().collect()
         };
         for task in snapshots {
             self.persist_snapshot(&task);
@@ -1499,29 +1491,7 @@ impl TaskSupervisor {
     /// Set a callback that fires whenever a task's status changes.
     pub fn set_on_change(&self, cb: impl Fn(&BackgroundTask) + Send + Sync + 'static) {
         let mut guard = self.on_change.lock().unwrap_or_else(|e| e.into_inner());
-        *guard = Some(Arc::new(cb));
-    }
-
-    /// Add or replace a named observer without disturbing the primary
-    /// callback installed through [`Self::set_on_change`]. Stable keys make
-    /// repeated session wiring idempotent.
-    pub fn set_on_change_listener(
-        &self,
-        key: impl Into<String>,
-        cb: impl Fn(&BackgroundTask) + Send + Sync + 'static,
-    ) {
-        self.on_change_listeners
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(key.into(), Arc::new(cb));
-    }
-
-    /// Remove a named task-change observer.
-    pub fn remove_on_change_listener(&self, key: &str) {
-        self.on_change_listeners
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(key);
+        *guard = Some(Box::new(cb));
     }
 
     /// Set a callback that fires only when a `spawn_only` task transitions to
@@ -2219,7 +2189,6 @@ impl TaskSupervisor {
             summary: None,
             artifact_count: None,
             runtime_policy_stamp: None,
-            projection_metadata: None,
         };
         let mut tasks = self.tasks.lock().unwrap_or_else(|e| e.into_inner());
         // Codex P2 atomicity: when this is a child-task registration
@@ -2339,23 +2308,6 @@ impl TaskSupervisor {
         if let Some(task) = tasks.get_mut(task_id) {
             task.tool_input = Some(tool_input);
         }
-    }
-
-    /// Attach or replace opaque projection metadata for an existing task.
-    /// The update is persisted and emitted through the normal change stream,
-    /// so projections share the supervisor's ordering and durability.
-    pub fn set_projection_metadata(&self, task_id: &str, metadata: Value) {
-        let snapshot = {
-            let mut tasks = self.tasks.lock().unwrap_or_else(|e| e.into_inner());
-            let Some(task) = tasks.get_mut(task_id) else {
-                return;
-            };
-            task.projection_metadata = Some(metadata);
-            task.updated_at = Utc::now();
-            task.clone()
-        };
-        self.persist_snapshot(&snapshot);
-        self.notify_change(&snapshot);
     }
 
     /// Mark a task as running.
@@ -3311,26 +3263,10 @@ impl TaskSupervisor {
             .cloned())
     }
 
-    /// Fire the primary callback and every named observer. Clone callbacks
-    /// outside their mutexes before invocation so observers may safely update
-    /// their own registration.
+    /// Fire the on_change callback (if set) with a task snapshot.
     fn notify_change(&self, task: &BackgroundTask) {
-        let primary = self
-            .on_change
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone();
-        let listeners = self
-            .on_change_listeners
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .values()
-            .cloned()
-            .collect::<Vec<_>>();
-        if let Some(cb) = primary {
-            cb(task);
-        }
-        for cb in listeners {
+        let guard = self.on_change.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(ref cb) = *guard {
             cb(task);
         }
     }
@@ -3431,6 +3367,162 @@ impl TaskSupervisor {
     pub fn task_count(&self) -> usize {
         let tasks = self.tasks.lock().unwrap_or_else(|e| e.into_inner());
         tasks.values().filter(|t| t.status.is_active()).count()
+    }
+
+    /// Override the heartbeat-reaper sweep interval (default
+    /// [`DEFAULT_REAP_INTERVAL`]). Takes effect on the next tick.
+    pub fn set_reap_interval(&self, interval: Duration) {
+        *self.reap_interval.lock().unwrap_or_else(|e| e.into_inner()) = interval;
+    }
+
+    /// Override the silence window after which a live-but-silent task is
+    /// reaped (default [`DEFAULT_STUCK_TIMEOUT`]). Takes effect on the
+    /// next sweep.
+    pub fn set_stuck_timeout(&self, timeout: Duration) {
+        *self.stuck_timeout.lock().unwrap_or_else(|e| e.into_inner()) = timeout;
+    }
+
+    /// Start the heartbeat-based in-flight orphan reaper (issue #1920).
+    ///
+    /// The startup sweep in [`Self::enable_persistence`] only covers
+    /// orphans left behind by a process RESTART: at that point no work
+    /// has been scheduled, so a non-terminal row definitionally has no
+    /// live worker. A long-running supervisor has a second orphan shape:
+    /// the worker future is still ALIVE (so [`is_task_live`] is true and
+    /// neither the sweep nor [`TaskTerminalGuard`]'s `Drop` will ever
+    /// fire) but permanently STUCK — blocked on a resource that never
+    /// resolves, spinning without producing progress, etc. Such a task
+    /// shows `running` forever, never releases its slot, and is
+    /// indistinguishable from healthy slow work.
+    ///
+    /// This spawns a tokio task that every [`Self::reap_interval`]
+    /// collects candidates and reaps any ACTIVE task that:
+    ///
+    /// 1. has a LIVE worker in this process ([`is_task_live`]) — a
+    ///    non-live active task is the dropped-worker case
+    ///    [`TaskTerminalGuard`]'s `Drop` already handles, so reaping it
+    ///    here would double-fire failure callbacks; and
+    /// 2. has produced NO progress signal for longer than
+    ///    [`Self::stuck_timeout`], measured via `updated_at`.
+    ///
+    /// `updated_at` is the heartbeat: it is stamped by every progress
+    /// path a healthy worker drives — `mark_running` (worker start),
+    /// `mark_runtime_state` (harness/runtime progress events), the
+    /// projection-field updater, `mark_completed` / `mark_failed` /
+    /// `cancel` (terminal transitions), `record_final_output`, and
+    /// `mark_child_session_outcome`. A long-but-progressing task (e.g. a
+    /// `deep_research` pipeline streaming phase events) therefore keeps
+    /// its heartbeat fresh and is NEVER reaped; only genuinely silent
+    /// workers are. The default 30-min timeout additionally matches the
+    /// agent loop's per-tool wall-clock backstop (1800s), so the reaper
+    /// cannot fire earlier than the timeout a legitimate tool call is
+    /// allowed to consume.
+    ///
+    /// Reaping transitions the task through the standard `mark_failed`
+    /// path (terminal ledger entry, persistence, callbacks — idempotent
+    /// if a racing worker already finished) and then flips the task's
+    /// cancel token so a COOPERATIVE stuck worker wakes at its next safe
+    /// point and unwinds (which drops its guard and clears the live-set
+    /// entry). A truly wedged worker stays in the live-set, so the
+    /// reaper would re-log on subsequent sweeps were it not for the
+    /// terminal check — the task is already `Failed` and skipped.
+    ///
+    /// Idempotent: only the first call spawns the loop; later calls are
+    /// no-ops (the flag is shared across `Clone`s). The loop holds only
+    /// a weak liveness story — it keeps running as long as the process
+    /// does; dropping the supervisor's last clone does not stop the
+    /// spawned task until the runtime shuts down (acceptable: the
+    /// production supervisor lives for the process lifetime).
+    pub fn start_reaper(self: &Arc<Self>) {
+        if self.reaper_started.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let supervisor = Arc::clone(self);
+        tokio::spawn(async move {
+            loop {
+                let interval = *supervisor
+                    .reap_interval
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                tokio::time::sleep(interval).await;
+                let timeout = *supervisor
+                    .stuck_timeout
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                supervisor.reap_stuck_tasks(Utc::now(), timeout);
+            }
+        });
+    }
+
+    /// One reaper sweep, factored out of [`Self::start_reaper`]'s tokio
+    /// loop so unit tests can drive it synchronously (no sleeping).
+    /// `now` is the reference instant and `stuck_timeout` the silence
+    /// window; both are parameters so tests control the clock.
+    ///
+    /// Returns the ids of reaped tasks. See [`Self::start_reaper`] for
+    /// the full reaping contract.
+    pub fn reap_stuck_tasks(&self, now: DateTime<Utc>, stuck_timeout: Duration) -> Vec<String> {
+        let candidates: Vec<String> = {
+            let tasks = self.tasks.lock().unwrap_or_else(|e| e.into_inner());
+            tasks
+                .values()
+                .filter(|task| {
+                    // Terminal rows are already resolved — never touch.
+                    if !task.status.is_active() {
+                        return false;
+                    }
+                    // A NON-live active task is the dropped-worker case:
+                    // its TaskTerminalGuard::drop fires mark_failed
+                    // ("worker dropped before reaching terminal state")
+                    // on every exit path, so reaping here would
+                    // double-fire failure callbacks / ledger entries.
+                    // The startup sweep owns cross-process orphans.
+                    if !is_task_live(&task.id) {
+                        return false;
+                    }
+                    // The heartbeat gate: `now - updated_at > timeout`.
+                    // `signed_duration_since` (not `signed_duration_from`)
+                    // handles a clock-skewed FUTURE updated_at by yielding
+                    // a negative age, which never exceeds the timeout.
+                    now.signed_duration_since(task.updated_at)
+                        .to_std()
+                        .map(|age| age > stuck_timeout)
+                        .unwrap_or(false)
+                })
+                .map(|task| task.id.clone())
+                .collect()
+        };
+
+        let mut reaped = Vec::new();
+        for task_id in candidates {
+            // mark_failed re-checks the terminal guard internally, so a
+            // worker that transitioned between candidate collection and
+            // this call is a no-op (idempotent terminal path).
+            self.mark_failed(
+                &task_id,
+                format!("orphaned: no progress for {stuck_timeout:?} (heartbeat timeout)"),
+            );
+            // Flip the cancel token AFTER the terminal transition — a
+            // cooperative stuck worker wakes at its next safe point,
+            // re-reads the supervisor, sees the terminal state, and
+            // unwinds (dropping its guard, which clears the live-set).
+            // `ensure` mirrors `cancel()`'s ordering: allocate the token
+            // even if the worker never polled one so a late
+            // `cancel_token()` call still observes the cancelled state.
+            self.cancel_tokens.ensure(&task_id).cancel();
+            counter!(
+                "octos_orphaned_tasks_reaped_total",
+                "reason" => "heartbeat_timeout"
+            )
+            .increment(1);
+            tracing::warn!(
+                task_id = %task_id,
+                stuck_timeout = ?stuck_timeout,
+                "reaped stuck background task (heartbeat timeout)"
+            );
+            reaped.push(task_id);
+        }
+        reaped
     }
 }
 
