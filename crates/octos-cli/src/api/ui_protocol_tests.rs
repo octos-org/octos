@@ -22576,6 +22576,111 @@ fn v2_projects_errored_and_interrupted_terminals() {
     }
 }
 
+#[test]
+fn should_assign_unique_v2_seq_to_terminal_and_consecutive_attachments() {
+    let ledger = UiProtocolLedger::new(16);
+    let session_id = SessionKey("local:envelope-v2-voice-audio".into());
+    let turn_id = TurnId::new();
+    let thread_id = turn_id.0.to_string();
+
+    ledger.append_notification(UiNotification::EnvelopeV2(EnvelopeV2Notification {
+        session_id: session_id.clone(),
+        topic: None,
+        envelope: EnvelopeV2 {
+            thread_id: thread_id.clone(),
+            seq: 1,
+            cursor: None,
+            turn_id: thread_id.clone(),
+            client_message_id: None,
+            payload: PayloadV2::AssistantPersisted {
+                text: "第一句。第二句。".into(),
+                assistant_segment_id: format!("{thread_id}:assistant:1"),
+                meta: MessageMeta {
+                    message_id: "voice-reply".into(),
+                    persisted_at: Utc::now(),
+                    media: vec![],
+                },
+            },
+        },
+    }));
+
+    let terminal_source =
+        ledger.append_notification(UiNotification::TurnCompleted(TurnCompletedEvent {
+            session_id: session_id.clone(),
+            topic: None,
+            turn_id: turn_id.clone(),
+            cursor: None,
+            tokens_in: None,
+            tokens_out: None,
+            session_result: None,
+        }));
+    // Production dual-emission persists the v1 terminal companion after the
+    // legacy terminal source. It advances the durable base for later files,
+    // so that already-represented source must not be counted twice.
+    ledger.append_notification(UiNotification::Envelope(
+        octos_core::ui_protocol::EnvelopeNotification {
+            session_id: session_id.clone(),
+            topic: None,
+            envelope: octos_core::ui_protocol::Envelope {
+                thread_id: thread_id.clone(),
+                seq: 2,
+                client_message_id: None,
+                payload: Payload::TurnCompleted {
+                    token_usage: EnvelopeTokenUsage::default(),
+                },
+            },
+        },
+    ));
+
+    let file_sources = [
+        UiNotification::FileAttached(octos_core::ui_protocol::FileAttachedEvent {
+            session_id: session_id.clone(),
+            topic: None,
+            turn_id: turn_id.clone(),
+            path: "reply-first.mp3".into(),
+            tool_call_id: None,
+            mime: Some("audio/mpeg".into()),
+        }),
+        UiNotification::FileAttached(octos_core::ui_protocol::FileAttachedEvent {
+            session_id: session_id.clone(),
+            topic: None,
+            turn_id,
+            path: "reply-second.mp3".into(),
+            tool_call_id: None,
+            mime: Some("audio/mpeg".into()),
+        }),
+    ]
+    .map(|notification| ledger.append_notification(notification));
+    let sources = [
+        terminal_source,
+        file_sources[0].clone(),
+        file_sources[1].clone(),
+    ];
+
+    let projected_seqs = || {
+        sources
+            .iter()
+            .map(|source| {
+                let projected = project_v2_ledger_event(&ledger, &source.event, &source.cursor)
+                    .expect("legacy source has a v2 projection");
+                let UiProtocolLedgerEvent::Notification(UiNotification::EnvelopeV2(envelope)) =
+                    projected
+                else {
+                    panic!("legacy source must project to EnvelopeV2");
+                };
+                envelope.envelope.seq
+            })
+            .collect::<Vec<_>>()
+    };
+
+    assert_eq!(projected_seqs(), vec![2, 3, 4]);
+    assert_eq!(
+        projected_seqs(),
+        vec![2, 3, 4],
+        "replaying the same durable rows must assign the same sequence",
+    );
+}
+
 /// UPCR-2026-014 M9-γ per-payload dual-emit: every legacy
 /// notification surfaced by `forward_progress_event` triggers a
 /// parallel `projection/envelope` ledger append. The test exercises
