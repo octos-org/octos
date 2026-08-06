@@ -11,7 +11,7 @@ fn record_final_output_fires_on_change_with_the_output() {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     let supervisor = TaskSupervisor::new();
-    let id = supervisor.register("spawn", "call-fo", None);
+    let id = supervisor.register("spawn", "call-final-output", None);
     supervisor.mark_completed(&id, vec![]);
 
     // Only observe changes AFTER completion, so we isolate the
@@ -22,8 +22,8 @@ fn record_final_output_fires_on_change_with_the_output() {
     let calls_c = calls.clone();
     supervisor.set_on_change(move |task| {
         calls_c.fetch_add(1, Ordering::SeqCst);
-        if let Some(fo) = task.final_output.clone() {
-            *seen_c.lock().unwrap() = Some(fo);
+        if let Some(output) = task.final_output.clone() {
+            *seen_c.lock().unwrap() = Some(output);
         }
     });
 
@@ -58,6 +58,48 @@ fn should_register_task_with_spawned_status() {
     assert!(tasks[0].child_failure_action.is_none());
     assert!(tasks[0].completed_at.is_none());
     assert!(tasks[0].updated_at >= tasks[0].started_at);
+}
+
+#[test]
+fn named_change_listeners_fan_out_without_replacing_primary_callback() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let supervisor = TaskSupervisor::new();
+    let primary = Arc::new(AtomicUsize::new(0));
+    let projection_a = Arc::new(AtomicUsize::new(0));
+    let projection_b = Arc::new(AtomicUsize::new(0));
+
+    let count = Arc::clone(&primary);
+    supervisor.set_on_change(move |_| {
+        count.fetch_add(1, Ordering::SeqCst);
+    });
+    let count = Arc::clone(&projection_a);
+    supervisor.set_on_change_listener("projection-a", move |_| {
+        count.fetch_add(1, Ordering::SeqCst);
+    });
+    let count = Arc::clone(&projection_b);
+    supervisor.set_on_change_listener("projection-b", move |_| {
+        count.fetch_add(1, Ordering::SeqCst);
+    });
+
+    let id = supervisor.register("source_import", "call-fanout", None);
+    supervisor.mark_running(&id);
+    assert_eq!(primary.load(Ordering::SeqCst), 1);
+    assert_eq!(projection_a.load(Ordering::SeqCst), 1);
+    assert_eq!(projection_b.load(Ordering::SeqCst), 1);
+
+    // Replacing a named listener is idempotent and leaves both the primary
+    // callback and other projections installed.
+    let replacement = Arc::new(AtomicUsize::new(0));
+    let count = Arc::clone(&replacement);
+    supervisor.set_on_change_listener("projection-a", move |_| {
+        count.fetch_add(1, Ordering::SeqCst);
+    });
+    supervisor.mark_completed(&id, vec![]);
+    assert_eq!(primary.load(Ordering::SeqCst), 2);
+    assert_eq!(projection_a.load(Ordering::SeqCst), 1);
+    assert_eq!(replacement.load(Ordering::SeqCst), 1);
+    assert_eq!(projection_b.load(Ordering::SeqCst), 2);
 }
 
 /// #966 / M13-B — the projection setter populates the new
@@ -926,6 +968,92 @@ fn should_restore_completed_and_failed_truth_after_restart() {
         Some(ChildSessionFailureAction::Escalate)
     );
     assert!(failed_task.child_joined_at.is_none());
+}
+
+fn ledger_line_count(path: &std::path::Path) -> usize {
+    std::fs::read_to_string(path)
+        .unwrap_or_default()
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .count()
+}
+
+#[test]
+fn should_not_rewrite_ledger_when_reenabling_same_path() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let ledger_path = dir.path().join("tasks.jsonl");
+
+    let supervisor = TaskSupervisor::new();
+    supervisor.enable_persistence(&ledger_path).unwrap();
+    let task_id = supervisor.register_with_lineage("search", "call-1", Some("api:session"), None);
+    supervisor.mark_completed(&task_id, vec![]);
+
+    let lines_after_first_enable = ledger_line_count(&ledger_path);
+
+    // The skill-action job view/invoke paths re-enable persistence on the
+    // SHARED session supervisor on every request (#1906). With persistence
+    // already on for this ledger, everything since has been appended
+    // through the normal transition path — a repeat enable must be a
+    // no-op, not a full snapshot rewrite.
+    let restored = supervisor.enable_persistence(&ledger_path).unwrap();
+    assert_eq!(
+        restored, 1,
+        "repeat enable returns the live task total, same as a full enable"
+    );
+    assert_eq!(
+        ledger_line_count(&ledger_path),
+        lines_after_first_enable,
+        "same-path re-enable must not append snapshots"
+    );
+}
+
+#[test]
+fn should_not_reappend_restored_rows_when_fresh_supervisor_loads_ledger() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let ledger_path = dir.path().join("tasks.jsonl");
+
+    let supervisor = TaskSupervisor::new();
+    supervisor.enable_persistence(&ledger_path).unwrap();
+    let done = supervisor.register_with_lineage("fm_tts", "call-1", Some("api:session"), None);
+    supervisor.mark_completed(&done, vec![]);
+    let lines_before = ledger_line_count(&ledger_path);
+
+    // A fresh supervisor that only RESTORES an existing ledger (the
+    // skill-action list path builds one per request) must not re-append
+    // snapshots for rows it just read — they are already on disk.
+    let restored = TaskSupervisor::new();
+    let count = restored.enable_persistence(&ledger_path).unwrap();
+    assert_eq!(count, 1);
+    assert_eq!(restored.get_all_tasks().len(), 1);
+    assert_eq!(
+        ledger_line_count(&ledger_path),
+        lines_before,
+        "read-only restore must leave the ledger untouched"
+    );
+}
+
+#[test]
+fn should_persist_preexisting_in_memory_tasks_when_enabling_persistence() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let ledger_path = dir.path().join("tasks.jsonl");
+
+    // A task scheduled BEFORE persistence is enabled (the startup window
+    // the snapshot loop exists for) must still land on disk.
+    let supervisor = TaskSupervisor::new();
+    let task_id = supervisor.register_with_lineage("search", "call-1", Some("api:session"), None);
+    supervisor.mark_completed(&task_id, vec![]);
+    assert_eq!(ledger_line_count(&ledger_path), 0, "nothing persisted yet");
+
+    supervisor.enable_persistence(&ledger_path).unwrap();
+    assert!(
+        ledger_line_count(&ledger_path) > 0,
+        "pre-existing in-memory task must be persisted on enable"
+    );
+
+    let restored = TaskSupervisor::new();
+    restored.enable_persistence(&ledger_path).unwrap();
+    assert_eq!(restored.get_all_tasks().len(), 1);
+    assert_eq!(restored.get_all_tasks()[0].id, task_id);
 }
 
 #[test]
@@ -3833,6 +3961,7 @@ async fn foreground_armed_guard_survives_sweep_before_worker_polls() {
         "live-set cleared after the worker future drops"
     );
 }
+
 
 // ── issue #1920: heartbeat-based in-flight orphan reaper ──────────────
 
