@@ -43,6 +43,9 @@ impl ValidationProfile {
             HandlerKind::Noop,
             HandlerKind::Parallel,
             HandlerKind::DynamicParallel,
+            HandlerKind::ShellCheck,
+            HandlerKind::Notify,
+            HandlerKind::Wait,
         ]
         .into_iter()
         .collect();
@@ -111,20 +114,19 @@ pub fn validate_under_profile(
     }
 
     for node in graph.nodes.values() {
-        // IR-compiled shell_check nodes carry a fixed command string and are
-        // capability-locked by the palette contract — exempt from both the
-        // allowed_handlers and ban_shell checks (same exemption as validate.rs
-        // IR_COMPILED_LABELS).
-        let is_ir_shell_check = node.label.as_deref() == Some("shell_check");
-
-        if !profile.allowed_handlers.contains(&node.handler) && !is_ir_shell_check {
+        if !profile.allowed_handlers.contains(&node.handler) {
             violations.push(ProfileViolation::node(
                 &node.id,
                 format!("handler {:?} is not allowed at this level", node.handler),
             ));
         }
         if profile.ban_shell {
-            if node.handler == HandlerKind::Shell && !is_ir_shell_check {
+            // ShellCheck is a dedicated handler for IR palette `shell_check`
+            // nodes: it runs a fixed compile-time-locked command string, NOT
+            // arbitrary code execution. It is not `HandlerKind::Shell`, so it
+            // is not banned. The `handler == Shell` check below only catches
+            // free-form DOT `handler=shell` nodes.
+            if node.handler == HandlerKind::Shell {
                 violations.push(ProfileViolation::node(&node.id, "shell handler is banned"));
             }
             if let Some(tool) = node

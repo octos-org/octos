@@ -239,22 +239,13 @@ pub fn diagnostics_with_context(
 /// authoring surface is removed at the validation gate that every execution +
 /// pre-flight path runs through. Pipelines use the capability-locked handlers
 /// (codergen/gate/noop/parallel/dynamic_parallel) with explicit, non-shell tools.
-/// Labels that indicate a node was compiled from the typed-IR palette and is
-/// therefore exempt from the blanket shell ban. IR-compiled shell nodes carry a
-/// fixed command string (no LLM tool surface) and are capability-locked by the
-/// palette contract, unlike free-form DOT `handler=shell` which is arbitrary
-/// code execution.
-const IR_COMPILED_LABELS: &[&str] = &["shell_check"];
-
 fn rule_23_no_shell(graph: &PipelineGraph, diags: &mut Vec<PipelineDiagnostic>) {
     use crate::graph::HandlerKind;
     for node in graph.nodes.values() {
+        // ShellCheck is a dedicated handler for IR palette `shell_check` nodes:
+        // it runs a fixed compile-time-locked command string, NOT arbitrary
+        // code execution. It is not `HandlerKind::Shell`, so it is not banned.
         if node.handler == HandlerKind::Shell {
-            // Exempt IR-compiled shell_check nodes: the command is a fixed
-            // string from the palette kind, not an LLM-authored tool call.
-            if node.label.as_deref().is_some_and(|l| IR_COMPILED_LABELS.contains(&l)) {
-                continue;
-            }
             push_diag(
                 diags,
                 RuleId::NoShell,

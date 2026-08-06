@@ -30,7 +30,7 @@ use crate::graph::{
     PipelineGraph, PipelineNode,
 };
 use crate::guard::{GuardContext, GuardDecision, PipelineGuard};
-use crate::handler::{CodergenHandler, GateHandler, HandlerContext, HandlerRegistry, NoopHandler};
+use crate::handler::{CodergenHandler, GateHandler, HandlerContext, HandlerRegistry, NoopHandler, NotifyHandler, ShellCheckHandler, WaitHandler};
 use crate::parser::parse_dot;
 use crate::validate;
 
@@ -251,6 +251,9 @@ fn handler_kind_label(kind: &HandlerKind) -> &'static str {
         HandlerKind::Noop => "noop",
         HandlerKind::Parallel => "parallel",
         HandlerKind::DynamicParallel => "dynamic_parallel",
+        HandlerKind::ShellCheck => "shell_check",
+        HandlerKind::Notify => "notify",
+        HandlerKind::Wait => "wait",
     }
 }
 
@@ -2418,6 +2421,11 @@ impl PipelineExecutor {
         registry.register(HandlerKind::Noop, Arc::new(NoopHandler));
         // DynamicParallel is handled directly in execute_graph, but needs a registry entry
         registry.register(HandlerKind::DynamicParallel, Arc::new(NoopHandler));
+        // IR palette handlers — registered so the palette kinds dispatch to
+        // real implementations instead of falling through to Noop/Codergen.
+        registry.register(HandlerKind::ShellCheck, Arc::new(ShellCheckHandler));
+        registry.register(HandlerKind::Notify, Arc::new(NotifyHandler));
+        registry.register(HandlerKind::Wait, Arc::new(WaitHandler));
 
         registry
     }

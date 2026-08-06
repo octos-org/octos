@@ -1235,6 +1235,150 @@ impl Handler for NoopHandler {
     }
 }
 
+/// ShellCheck handler: runs a fixed shell command string and captures
+/// stdout/stderr as the node's outcome. The command comes from `node.prompt`
+/// (set by `compile_node` from `IrNodeKind::ShellCheck`), NOT from an LLM
+/// tool call — so this is safe to register even though free-form
+/// `handler=shell` is banned. The command runs in `ctx.working_dir` with
+/// `node.timeout_secs` (default 60s).
+pub struct ShellCheckHandler;
+
+#[async_trait]
+impl Handler for ShellCheckHandler {
+    async fn execute(&self, node: &PipelineNode, ctx: &HandlerContext) -> Result<NodeOutcome> {
+        let command = node
+            .prompt
+            .as_deref()
+            .ok_or_else(|| eyre::eyre!("shell_check node '{}' has no command", node.id))?;
+        let timeout = std::time::Duration::from_secs(node.timeout_secs.unwrap_or(60));
+
+        let output = tokio::time::timeout(
+            timeout,
+            tokio::process::Command::new("sh")
+                .arg("-c")
+                .arg(command)
+                .current_dir(&ctx.working_dir)
+                .output(),
+        )
+        .await
+        .map_err(|_| eyre::eyre!("shell_check '{}' timed out after {}s", node.id, timeout.as_secs()))?
+        .map_err(|e| eyre::eyre!("shell_check '{}' failed to spawn: {e}", node.id))?;
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let status = if output.status.success() {
+            OutcomeStatus::Pass
+        } else {
+            OutcomeStatus::Fail
+        };
+        let content = if stderr.is_empty() {
+            format!("$ {command}\n{stdout}")
+        } else {
+            format!("$ {command}\n{stdout}\n--- stderr ---\n{stderr}")
+        };
+
+        Ok(NodeOutcome {
+            node_id: node.id.clone(),
+            status,
+            content,
+            token_usage: TokenUsage::default(),
+            files_modified: vec![],
+        })
+    }
+}
+
+/// Notify handler: sends a notification message to the user. The message
+/// comes from `node.prompt` (set by `compile_node` from `IrNodeKind::Notify`).
+/// No LLM call — the message is the node's outcome content.
+pub struct NotifyHandler;
+
+#[async_trait]
+impl Handler for NotifyHandler {
+    async fn execute(&self, node: &PipelineNode, ctx: &HandlerContext) -> Result<NodeOutcome> {
+        let message = node
+            .prompt
+            .as_deref()
+            .unwrap_or("pipeline notification");
+        Ok(NodeOutcome {
+            node_id: node.id.clone(),
+            status: OutcomeStatus::Pass,
+            content: message.to_string(),
+            token_usage: TokenUsage::default(),
+            files_modified: vec![],
+        })
+    }
+}
+
+/// Wait handler: pauses execution for `node.timeout_secs` (fixed sleep) or
+/// polls for a condition file to exist. The wait spec comes from
+/// `node.prompt` (e.g. "wait 30s" or "wait until file_exists:done.txt"),
+/// parsed at compile time; the timeout is `node.timeout_secs`.
+pub struct WaitHandler;
+
+#[async_trait]
+impl Handler for WaitHandler {
+    async fn execute(&self, node: &PipelineNode, ctx: &HandlerContext) -> Result<NodeOutcome> {
+        let timeout = std::time::Duration::from_secs(node.timeout_secs.unwrap_or(300));
+        let prompt = node.prompt.as_deref().unwrap_or("");
+
+        // Fixed sleep: "wait Ns"
+        if let Some(secs_str) = prompt.strip_prefix("wait ").and_then(|s| s.strip_suffix("s")) {
+            if let Ok(secs) = secs_str.parse::<u64>() {
+                tokio::time::sleep(std::time::Duration::from_secs(secs)).await;
+                return Ok(NodeOutcome {
+                    node_id: node.id.clone(),
+                    status: OutcomeStatus::Pass,
+                    content: format!("waited {secs}s"),
+                    token_usage: TokenUsage::default(),
+                    files_modified: vec![],
+                });
+            }
+        }
+
+        // Condition poll: "wait until file_exists:<path>"
+        if let Some(cond) = prompt.strip_prefix("wait until ") {
+            if let Some(path) = cond.strip_prefix("file_exists:") {
+                let path = ctx.working_dir.join(path.trim());
+                let deadline = tokio::time::Instant::now() + timeout;
+                loop {
+                    if path.exists() {
+                        return Ok(NodeOutcome {
+                            node_id: node.id.clone(),
+                            status: OutcomeStatus::Pass,
+                            content: format!("condition met: {} exists", path.display()),
+                            token_usage: TokenUsage::default(),
+                            files_modified: vec![],
+                        });
+                    }
+                    if tokio::time::Instant::now() >= deadline {
+                        return Ok(NodeOutcome {
+                            node_id: node.id.clone(),
+                            status: OutcomeStatus::Fail,
+                            content: format!(
+                                "timed out after {}s waiting for {}",
+                                timeout.as_secs(),
+                                path.display()
+                            ),
+                            token_usage: TokenUsage::default(),
+                            files_modified: vec![],
+                        });
+                    }
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                }
+            }
+        }
+
+        // Unknown wait spec — pass through with a warning.
+        Ok(NodeOutcome {
+            node_id: node.id.clone(),
+            status: OutcomeStatus::Pass,
+            content: format!("unrecognized wait spec: {prompt}"),
+            token_usage: TokenUsage::default(),
+            files_modified: vec![],
+        })
+    }
+}
+
 fn compact_pipeline_instruction(
     input: &str,
     context_window: Option<u32>,

@@ -248,7 +248,7 @@ pub fn contract_for(kind: &IrNodeKind) -> PaletteContract {
             model: Some("strong"),
         },
         IrNodeKind::ShellCheck { .. } => PaletteContract {
-            handler: HandlerKind::Shell,
+            handler: HandlerKind::ShellCheck,
             allowed_tools: &[],
             model: None,
         },
@@ -260,14 +260,12 @@ pub fn contract_for(kind: &IrNodeKind) -> PaletteContract {
             model: Some("strong"),
         },
         IrNodeKind::Notify { .. } => PaletteContract {
-            handler: HandlerKind::Codergen,
-            // Notify is a terminal side-effect node. No LLM tools needed —
-            // the executor's notification layer handles delivery.
-            allowed_tools: &["read_file"],
-            model: Some("cheap"),
+            handler: HandlerKind::Notify,
+            allowed_tools: &[],
+            model: None,
         },
         IrNodeKind::Wait { .. } => PaletteContract {
-            handler: HandlerKind::Gate,
+            handler: HandlerKind::Wait,
             allowed_tools: &[],
             model: None,
         },
@@ -470,6 +468,7 @@ mod tests {
             r#"{"type":"sub_agent","task":"x"}"#,
             r#"{"type":"notify","message":"x"}"#,
             r#"{"type":"wait","seconds":5}"#,
+            r#"{"type":"shell_check","command":"true"}"#,
         ];
         for k in kinds {
             let json = format!(r#"{{"id":"p","nodes":[{{"id":"n","kind":{k}}}]}}"#);
@@ -602,9 +601,9 @@ mod tests {
         assert!(fix.tools.contains(&"edit_file".to_string()));
         assert!(fix.tools.contains(&"write_file".to_string()));
 
-        // shell_check: shell handler, labeled for validation exemption
+        // shell_check: dedicated ShellCheck handler (not Shell)
         let test = &g.nodes["test"];
-        assert_eq!(test.handler, HandlerKind::Shell);
+        assert_eq!(test.handler, HandlerKind::ShellCheck);
         assert_eq!(test.label.as_deref(), Some("shell_check"));
         assert_eq!(test.prompt.as_deref(), Some("cargo test -- auth"));
         assert_eq!(test.timeout_secs, Some(120));
@@ -613,9 +612,9 @@ mod tests {
         let deploy = &g.nodes["deploy_check"];
         assert_eq!(deploy.timeout_secs, Some(60));
 
-        // notify: codergen with minimal tools
+        // notify: dedicated Notify handler (no LLM)
         let notify = &g.nodes["notify"];
-        assert_eq!(notify.handler, HandlerKind::Codergen);
+        assert_eq!(notify.handler, HandlerKind::Notify);
         assert_eq!(notify.label.as_deref(), Some("notify"));
 
         // report: write_file for final artifact
@@ -646,12 +645,12 @@ mod tests {
         assert!(agent.label.as_deref().unwrap().contains("read_file"));
 
         let pause = &g.nodes["pause"];
-        assert_eq!(pause.handler, HandlerKind::Gate);
+        assert_eq!(pause.handler, HandlerKind::Wait);
         assert_eq!(pause.timeout_secs, Some(30));
         assert_eq!(pause.label.as_deref(), Some("wait"));
 
         let poll = &g.nodes["poll"];
-        assert_eq!(poll.handler, HandlerKind::Gate);
+        assert_eq!(poll.handler, HandlerKind::Wait);
         assert_eq!(poll.timeout_secs, Some(600));
     }
 
