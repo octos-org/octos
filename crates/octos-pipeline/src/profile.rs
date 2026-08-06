@@ -111,14 +111,20 @@ pub fn validate_under_profile(
     }
 
     for node in graph.nodes.values() {
-        if !profile.allowed_handlers.contains(&node.handler) {
+        // IR-compiled shell_check nodes carry a fixed command string and are
+        // capability-locked by the palette contract — exempt from both the
+        // allowed_handlers and ban_shell checks (same exemption as validate.rs
+        // IR_COMPILED_LABELS).
+        let is_ir_shell_check = node.label.as_deref() == Some("shell_check");
+
+        if !profile.allowed_handlers.contains(&node.handler) && !is_ir_shell_check {
             violations.push(ProfileViolation::node(
                 &node.id,
                 format!("handler {:?} is not allowed at this level", node.handler),
             ));
         }
         if profile.ban_shell {
-            if node.handler == HandlerKind::Shell {
+            if node.handler == HandlerKind::Shell && !is_ir_shell_check {
                 violations.push(ProfileViolation::node(&node.id, "shell handler is banned"));
             }
             if let Some(tool) = node

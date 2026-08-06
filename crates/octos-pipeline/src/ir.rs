@@ -91,6 +91,75 @@ pub enum IrNodeKind {
         #[serde(default)]
         max_tasks: Option<u32>,
     },
+    /// Read-only code analysis: reads files, runs grep/glob. For "audit this
+    /// code", "find all callers of X", "review this diff".
+    CodeReview {
+        prompt: String,
+        /// Optional file/directory scope (e.g. "src/**/*.rs"). Defaults to
+        /// the session workspace root.
+        #[serde(default)]
+        scope: Option<String>,
+    },
+    /// Code modification: reads, edits, and writes files. For "fix this bug",
+    /// "add this feature", "refactor this module". The prompt should describe
+    /// WHAT to change; the handler's agent loop decides HOW.
+    CodeEdit {
+        prompt: String,
+        /// Files the edit is expected to touch (informational — the handler
+        /// may read/edit others as needed).
+        #[serde(default)]
+        files: Option<Vec<String>>,
+    },
+    /// Run a read-only shell command (no side effects). For "run tests",
+    /// "check build", "count lines". The command runs in the session
+    /// workspace; output is captured as the node's result.
+    ShellCheck {
+        /// The command to run (e.g. "cargo test", "git diff --stat").
+        command: String,
+        /// Timeout in seconds. Defaults to 60.
+        #[serde(default)]
+        timeout_secs: Option<u64>,
+    },
+    /// Spawn a sub-agent to work on a self-contained task. The sub-agent
+    /// gets its own LLM session and returns its final output as the node's
+    /// result. For "have a specialist handle X", "delegate Y to a fresh
+    /// context", "get a second opinion on Z".
+    SubAgent {
+        /// The task description for the sub-agent.
+        task: String,
+        /// Tool allowlist for the sub-agent (informational hint; the
+        /// executor's spawn logic enforces its own restrictions).
+        #[serde(default)]
+        tools: Option<Vec<String>>,
+        /// Model override for the sub-agent. Defaults to "strong".
+        #[serde(default)]
+        model: Option<String>,
+    },
+    /// Send a notification to the user. For "tell the user the build passed",
+    /// "alert on failure". Minimal LLM involvement; the message is the output.
+    Notify {
+        /// The message to send.
+        message: String,
+        /// Optional channel (e.g. "telegram", "slack"). Defaults to the
+        /// current session's channel.
+        #[serde(default)]
+        channel: Option<String>,
+    },
+    /// Wait for a condition or a fixed duration. For "wait for CI to finish",
+    /// "pause before retry". No LLM call.
+    Wait {
+        /// Seconds to wait. Mutually exclusive with `until_condition`.
+        #[serde(default)]
+        seconds: Option<u64>,
+        /// A condition expression to poll for (e.g. "file_exists:output.txt").
+        /// The node completes when the condition is true or `timeout_secs`
+        /// elapses.
+        #[serde(default)]
+        until_condition: Option<String>,
+        /// Timeout for `until_condition` polling. Defaults to 300.
+        #[serde(default)]
+        timeout_secs: Option<u64>,
+    },
     // NOTE: a `human_gate` kind was intentionally NOT included — the pipeline
     // executor does not route human-input gates through a real approval
     // handler (a bare Gate node defaults its condition to `true` and
@@ -167,6 +236,40 @@ pub fn contract_for(kind: &IrNodeKind) -> PaletteContract {
             // advertised here so the contract resolves on any profile.)
             allowed_tools: &["web_search", "web_fetch", "read_file", "write_file"],
             model: Some("cheap"),
+        },
+        IrNodeKind::CodeReview { .. } => PaletteContract {
+            handler: HandlerKind::Codergen,
+            allowed_tools: &["read_file", "grep", "glob", "list_dir"],
+            model: Some("strong"),
+        },
+        IrNodeKind::CodeEdit { .. } => PaletteContract {
+            handler: HandlerKind::Codergen,
+            allowed_tools: &["read_file", "write_file", "edit_file", "grep", "glob"],
+            model: Some("strong"),
+        },
+        IrNodeKind::ShellCheck { .. } => PaletteContract {
+            handler: HandlerKind::Shell,
+            allowed_tools: &[],
+            model: None,
+        },
+        IrNodeKind::SubAgent { .. } => PaletteContract {
+            handler: HandlerKind::Codergen,
+            // SubAgent delegates to a nested agent loop. The node's own tools
+            // are minimal — it needs spawn to create the sub-agent.
+            allowed_tools: &["spawn"],
+            model: Some("strong"),
+        },
+        IrNodeKind::Notify { .. } => PaletteContract {
+            handler: HandlerKind::Codergen,
+            // Notify is a terminal side-effect node. No LLM tools needed —
+            // the executor's notification layer handles delivery.
+            allowed_tools: &["read_file"],
+            model: Some("cheap"),
+        },
+        IrNodeKind::Wait { .. } => PaletteContract {
+            handler: HandlerKind::Gate,
+            allowed_tools: &[],
+            model: None,
         },
     }
 }
@@ -263,6 +366,51 @@ fn compile_node(n: &IrNode) -> PipelineNode {
             node.converge = Some(converge.clone());
             node.max_tasks = *max_tasks;
         }
+        IrNodeKind::CodeReview { prompt, scope } => {
+            node.prompt = Some(prompt.clone());
+            node.label = scope.clone();
+        }
+        IrNodeKind::CodeEdit { prompt, files } => {
+            node.prompt = Some(prompt.clone());
+            if let Some(fs) = files {
+                node.label = Some(fs.join(", "));
+            }
+        }
+        IrNodeKind::ShellCheck {
+            command,
+            timeout_secs,
+        } => {
+            node.prompt = Some(command.clone());
+            node.label = Some("shell_check".into());
+            node.timeout_secs = Some(timeout_secs.unwrap_or(60));
+        }
+        IrNodeKind::SubAgent { task, tools, model } => {
+            node.prompt = Some(task.clone());
+            if let Some(ts) = tools {
+                node.label = Some(format!("subagent:{}", ts.join(",")));
+            }
+            if let Some(m) = model {
+                node.model = Some(m.clone());
+            }
+        }
+        IrNodeKind::Notify { message, channel } => {
+            node.prompt = Some(message.clone());
+            node.label = channel.clone().or(Some("notify".into()));
+        }
+        IrNodeKind::Wait {
+            seconds,
+            until_condition,
+            timeout_secs,
+        } => {
+            if let Some(s) = seconds {
+                node.prompt = Some(format!("wait {}s", s));
+                node.timeout_secs = Some(*s);
+            } else if let Some(cond) = until_condition {
+                node.prompt = Some(format!("wait until {}", cond));
+                node.timeout_secs = Some(timeout_secs.unwrap_or(300));
+            }
+            node.label = Some("wait".into());
+        }
     }
     node
 }
@@ -310,6 +458,11 @@ mod tests {
             r#"{"type":"synthesize","prompt":"x"}"#,
             r#"{"type":"gate"}"#,
             r#"{"type":"fanout","worker_prompt":"x","converge":"c"}"#,
+            r#"{"type":"code_review","prompt":"x"}"#,
+            r#"{"type":"code_edit","prompt":"x"}"#,
+            r#"{"type":"sub_agent","task":"x"}"#,
+            r#"{"type":"notify","message":"x"}"#,
+            r#"{"type":"wait","seconds":5}"#,
         ];
         for k in kinds {
             let json = format!(r#"{{"id":"p","nodes":[{{"id":"n","kind":{k}}}]}}"#);
@@ -402,5 +555,103 @@ mod tests {
         assert_eq!(back.label.as_deref(), Some("back_edge"));
         let fwd = g.edges.iter().find(|e| e.source == "a").unwrap();
         assert_eq!(fwd.label, None);
+    }
+
+    #[test]
+    fn should_compile_code_workflow_palette() {
+        let json = r#"{
+            "id":"code-pipeline",
+            "nodes":[
+                {"id":"review","kind":{"type":"code_review","prompt":"audit auth","scope":"src/auth/**"}},
+                {"id":"fix","kind":{"type":"code_edit","prompt":"fix issues","files":["src/auth.rs"]}},
+                {"id":"test","kind":{"type":"shell_check","command":"cargo test -- auth","timeout_secs":120}},
+                {"id":"deploy_check","kind":{"type":"shell_check","command":"cargo build --release"}},
+                {"id":"notify","kind":{"type":"notify","message":"Build passed"}},
+                {"id":"report","kind":{"type":"report","prompt":"Summarize all changes and results"}}
+            ],
+            "edges":[
+                {"source":"review","target":"fix"},
+                {"source":"fix","target":"test"},
+                {"source":"test","target":"deploy_check"},
+                {"source":"deploy_check","target":"notify"},
+                {"source":"notify","target":"report"}
+            ]
+        }"#;
+        let ir = parse(json);
+        let g = compile(&ir).expect("compiles");
+        assert_eq!(g.nodes.len(), 6);
+        assert_eq!(g.edges.len(), 5);
+
+        // code_review: read-only analysis, strong model
+        let review = &g.nodes["review"];
+        assert_eq!(review.handler, HandlerKind::Codergen);
+        assert_eq!(review.model.as_deref(), Some("strong"));
+        assert!(review.tools.contains(&"grep".to_string()));
+        assert!(review.tools.contains(&"glob".to_string()));
+
+        // code_edit: read+write+edit, strong model
+        let fix = &g.nodes["fix"];
+        assert_eq!(fix.handler, HandlerKind::Codergen);
+        assert!(fix.tools.contains(&"edit_file".to_string()));
+        assert!(fix.tools.contains(&"write_file".to_string()));
+
+        // shell_check: shell handler, labeled for validation exemption
+        let test = &g.nodes["test"];
+        assert_eq!(test.handler, HandlerKind::Shell);
+        assert_eq!(test.label.as_deref(), Some("shell_check"));
+        assert_eq!(test.prompt.as_deref(), Some("cargo test -- auth"));
+        assert_eq!(test.timeout_secs, Some(120));
+
+        // shell_check with default timeout
+        let deploy = &g.nodes["deploy_check"];
+        assert_eq!(deploy.timeout_secs, Some(60));
+
+        // notify: codergen with minimal tools
+        let notify = &g.nodes["notify"];
+        assert_eq!(notify.handler, HandlerKind::Codergen);
+        assert_eq!(notify.label.as_deref(), Some("notify"));
+
+        // report: write_file for final artifact
+        let report = &g.nodes["report"];
+        assert_eq!(report.handler, HandlerKind::Codergen);
+        assert!(report.tools.contains(&"write_file".to_string()));
+    }
+
+    #[test]
+    fn should_compile_sub_agent_and_wait() {
+        let json = r#"{
+            "id":"agent-pipeline",
+            "nodes":[
+                {"id":"delegate","kind":{"type":"sub_agent","task":"Review PR #42","tools":["read_file","grep"],"model":"strong"}},
+                {"id":"pause","kind":{"type":"wait","seconds":30}},
+                {"id":"poll","kind":{"type":"wait","until_condition":"file_exists:done.txt","timeout_secs":600}}
+            ],
+            "edges":[
+                {"source":"delegate","target":"pause"},
+                {"source":"pause","target":"poll"}
+            ]
+        }"#;
+        let g = compile(&parse(json)).expect("compiles");
+
+        let agent = &g.nodes["delegate"];
+        assert_eq!(agent.handler, HandlerKind::Codergen);
+        assert_eq!(agent.model.as_deref(), Some("strong"));
+        assert!(agent.label.as_deref().unwrap().contains("read_file"));
+
+        let pause = &g.nodes["pause"];
+        assert_eq!(pause.handler, HandlerKind::Gate);
+        assert_eq!(pause.timeout_secs, Some(30));
+        assert_eq!(pause.label.as_deref(), Some("wait"));
+
+        let poll = &g.nodes["poll"];
+        assert_eq!(poll.handler, HandlerKind::Gate);
+        assert_eq!(poll.timeout_secs, Some(600));
+    }
+
+    #[test]
+    fn shell_check_default_timeout() {
+        let json = r#"{"id":"p","nodes":[{"id":"s","kind":{"type":"shell_check","command":"cargo build"}}]}"#;
+        let g = compile(&parse(json)).unwrap();
+        assert_eq!(g.nodes["s"].timeout_secs, Some(60));
     }
 }

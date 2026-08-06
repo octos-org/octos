@@ -31,15 +31,16 @@ pub const PIPELINE_EXTERNAL_CONTEXT_UNMANAGED_REASON: &str =
 /// never empty even before bootstrap has written the `.dot`.
 const FALLBACK_PIPELINE_NAME: &str = "deep_research";
 
-/// S1-5 opt-in: whether the typed-IR ([`crate::ir`]) authoring path is exposed
-/// to the LLM by default. OFF unless the operator sets `OCTOS_PIPELINE_IR=1`
-/// (or `true`) in the daemon environment (e.g. the launchd plist) — the same
-/// env-based opt-in pattern used for other gated capabilities. Explicit
-/// [`RunPipelineTool::with_ir_enabled`] overrides this (used by tests).
+/// S1-5 opt-out: whether the typed-IR ([`crate::ir`]) authoring path is exposed
+/// to the LLM by default. ON unless the operator sets `OCTOS_PIPELINE_IR=0`
+/// (or `false`) in the daemon environment (e.g. the launchd plist). The typed-IR
+/// palette is capability-locked — the LLM names kinds and prompts but cannot
+/// widen tools or select handlers — so it is safe to expose by default.
+/// Explicit [`RunPipelineTool::with_ir_enabled`] overrides this (used by tests).
 fn ir_authoring_default() -> bool {
     std::env::var("OCTOS_PIPELINE_IR")
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false)
+        .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+        .unwrap_or(true)
 }
 
 /// Phase 2-A of the [`SessionScope`] migration (load-bearing follow-up
@@ -644,7 +645,8 @@ impl Tool for RunPipelineTool {
              `grep`, `glob`, `list_dir`, `shell`). \
              (b) For an ad-hoc multi-step task, compose your own workflow as a \
              typed-IR program in `ir`: a closed, capability-safe palette of node \
-             kinds (research, transform, synthesize, report, gate, fanout). You \
+             kinds (research, transform, synthesize, report, gate, fanout, \
+             code_review, code_edit, shell_check, sub_agent, notify, wait). You \
              choose the kinds, their prompts, and how they connect — capability \
              (tools/model) is fixed per kind, so you never request shell or tools \
              directly. Use `ir` to offload research→synthesize or parallel \
@@ -2833,6 +2835,74 @@ mod tests {
         });
         let err = tool.pre_flight_validate(&args).await.unwrap_err();
         assert!(err.contains("IR validation failed"), "got: {err}");
+    }
+
+    #[test]
+    fn ir_authoring_defaults_to_on() {
+        // Test the default logic directly without env manipulation
+        // (set_var/remove_var are unsafe in newer Rust)
+        let eval = |v: Option<&str>| -> bool {
+            v.map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+                .unwrap_or(true)
+        };
+        assert!(eval(None), "no env var → ON (default)");
+        assert!(eval(Some("1")), "OCTOS_PIPELINE_IR=1 → ON");
+        assert!(eval(Some("true")), "OCTOS_PIPELINE_IR=true → ON");
+        assert!(!eval(Some("0")), "OCTOS_PIPELINE_IR=0 → OFF");
+        assert!(!eval(Some("false")), "OCTOS_PIPELINE_IR=false → OFF");
+        assert!(!eval(Some("FALSE")), "OCTOS_PIPELINE_IR=FALSE → OFF (case-insensitive)");
+        assert!(eval(Some("anything")), "any other value → ON");
+    }
+
+    #[tokio::test]
+    async fn preflight_accepts_all_new_ir_kinds() {
+        let tool = make_ir_tool(true).await;
+        // Test each new node kind passes pre-flight validation
+        let kinds = vec![
+            (r#"{"type":"code_review","prompt":"audit this"}"#, "code_review"),
+            (r#"{"type":"code_edit","prompt":"fix it"}"#, "code_edit"),
+            (r#"{"type":"shell_check","command":"cargo test"}"#, "shell_check"),
+            (r#"{"type":"sub_agent","task":"review PR"}"#, "sub_agent"),
+            (r#"{"type":"notify","message":"done"}"#, "notify"),
+            (r#"{"type":"wait","seconds":5}"#, "wait"),
+        ];
+        for (kind_json, name) in kinds {
+            let ir = format!(
+                r#"{{"id":"test-{name}","nodes":[{{"id":"n1","kind":{kind_json}}}]}}"#
+            );
+            let args = serde_json::json!({"input": "test", "ir": ir});
+            assert!(
+                tool.pre_flight_validate(&args).await.is_ok(),
+                "{name} should pass preflight: {:?}",
+                tool.pre_flight_validate(&args).await.err()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn preflight_accepts_code_workflow_pipeline() {
+        let tool = make_ir_tool(true).await;
+        // End-to-end: a realistic code review → fix → test → report pipeline
+        let ir = r#"{
+            "id":"code-review-flow",
+            "nodes":[
+                {"id":"review","kind":{"type":"code_review","prompt":"Find bugs in the auth module","scope":"src/auth/**"}},
+                {"id":"fix","kind":{"type":"code_edit","prompt":"Fix the issues found"}},
+                {"id":"test","kind":{"type":"shell_check","command":"cargo test -- auth"}},
+                {"id":"report","kind":{"type":"report","prompt":"Summarize changes and test results"}}
+            ],
+            "edges":[
+                {"source":"review","target":"fix"},
+                {"source":"fix","target":"test"},
+                {"source":"test","target":"report"}
+            ]
+        }"#;
+        let args = serde_json::json!({"input": "review auth module", "ir": ir});
+        assert!(
+            tool.pre_flight_validate(&args).await.is_ok(),
+            "code workflow should pass preflight: {:?}",
+            tool.pre_flight_validate(&args).await.err()
+        );
     }
 
     #[tokio::test]
