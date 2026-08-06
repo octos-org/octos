@@ -3366,6 +3366,13 @@ impl ActorFactory {
                 "failed to enable task supervisor persistence"
             );
         }
+        // Issue #1920: start the heartbeat-based in-flight orphan reaper.
+        // The startup sweep above only reaps orphans left by a process
+        // restart; this periodic reaper covers the long-running-supervisor
+        // case where a worker future is alive but permanently stuck (never
+        // bumps `updated_at`, never reaches a terminal state). Idempotent,
+        // so a re-initialized session on a shared supervisor is safe.
+        supervisor.start_reaper();
         self.task_query_store
             .register(&session_key, &supervisor, &self.data_dir);
         tools.rebind_plugin_work_dirs(&user_workspace);

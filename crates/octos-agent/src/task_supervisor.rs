@@ -14,6 +14,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use metrics::counter;
@@ -942,7 +943,34 @@ pub struct TaskSupervisor {
     /// See [`AckAndPending`] for the field-level documentation that
     /// previously lived on the individual fields.
     ack_and_pending: Arc<Mutex<AckAndPending>>,
+    /// Interval between heartbeat-reaper sweeps — see
+    /// [`TaskSupervisor::start_reaper`]. Defaults to
+    /// [`DEFAULT_REAP_INTERVAL`].
+    reap_interval: Arc<Mutex<Duration>>,
+    /// Silence window after which an ACTIVE task with a LIVE worker is
+    /// considered stuck — see [`TaskSupervisor::start_reaper`]. Defaults
+    /// to [`DEFAULT_STUCK_TIMEOUT`], which matches the agent loop's
+    /// per-tool wall-clock ceiling (`DEFAULT_REGISTRY_TOOL_TIMEOUT_SECS`
+    /// = 1800s) so the reaper never fires earlier than the timeout a
+    /// legitimate tool call is allowed to consume.
+    stuck_timeout: Arc<Mutex<Duration>>,
+    /// Whether the background reaper tokio task has been spawned — makes
+    /// [`TaskSupervisor::start_reaper`] idempotent (the supervisor is
+    /// `Clone`, and every clone shares this flag).
+    reaper_started: Arc<AtomicBool>,
 }
+
+/// Default heartbeat-reaper sweep interval. One minute is far below any
+/// plausible `stuck_timeout`, so the extra lock traffic is negligible.
+pub const DEFAULT_REAP_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Default silence window before a live-but-silent task is reaped. 30 min
+/// matches the agent loop's per-tool timeout (1800s): a worker that has
+/// produced NO progress signal for this long would be killed by the
+/// wall-clock backstop anyway, so the reaper only ever fires on workers
+/// that are genuinely wedged (or on progress paths that forgot to stamp
+/// `updated_at` — see the audit note on [`TaskSupervisor::start_reaper`]).
+pub const DEFAULT_STUCK_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
 /// Combined state guarded by a single mutex (Codex round-2 BLOCKER):
 /// the synth-ack set, the deferred-failure stash, and the per-task
@@ -1220,6 +1248,9 @@ impl TaskSupervisor {
             progress_reporter: Arc::new(Mutex::new(None)),
             cancel_tokens: Arc::new(CancelTokenStore::default()),
             ack_and_pending: Arc::new(Mutex::new(AckAndPending::default())),
+            reap_interval: Arc::new(Mutex::new(DEFAULT_REAP_INTERVAL)),
+            stuck_timeout: Arc::new(Mutex::new(DEFAULT_STUCK_TIMEOUT)),
+            reaper_started: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -3431,6 +3462,162 @@ impl TaskSupervisor {
     pub fn task_count(&self) -> usize {
         let tasks = self.tasks.lock().unwrap_or_else(|e| e.into_inner());
         tasks.values().filter(|t| t.status.is_active()).count()
+    }
+
+    /// Override the heartbeat-reaper sweep interval (default
+    /// [`DEFAULT_REAP_INTERVAL`]). Takes effect on the next tick.
+    pub fn set_reap_interval(&self, interval: Duration) {
+        *self.reap_interval.lock().unwrap_or_else(|e| e.into_inner()) = interval;
+    }
+
+    /// Override the silence window after which a live-but-silent task is
+    /// reaped (default [`DEFAULT_STUCK_TIMEOUT`]). Takes effect on the
+    /// next sweep.
+    pub fn set_stuck_timeout(&self, timeout: Duration) {
+        *self.stuck_timeout.lock().unwrap_or_else(|e| e.into_inner()) = timeout;
+    }
+
+    /// Start the heartbeat-based in-flight orphan reaper (issue #1920).
+    ///
+    /// The startup sweep in [`Self::enable_persistence`] only covers
+    /// orphans left behind by a process RESTART: at that point no work
+    /// has been scheduled, so a non-terminal row definitionally has no
+    /// live worker. A long-running supervisor has a second orphan shape:
+    /// the worker future is still ALIVE (so [`is_task_live`] is true and
+    /// neither the sweep nor [`TaskTerminalGuard`]'s `Drop` will ever
+    /// fire) but permanently STUCK — blocked on a resource that never
+    /// resolves, spinning without producing progress, etc. Such a task
+    /// shows `running` forever, never releases its slot, and is
+    /// indistinguishable from healthy slow work.
+    ///
+    /// This spawns a tokio task that every [`Self::reap_interval`]
+    /// collects candidates and reaps any ACTIVE task that:
+    ///
+    /// 1. has a LIVE worker in this process ([`is_task_live`]) — a
+    ///    non-live active task is the dropped-worker case
+    ///    [`TaskTerminalGuard`]'s `Drop` already handles, so reaping it
+    ///    here would double-fire failure callbacks; and
+    /// 2. has produced NO progress signal for longer than
+    ///    [`Self::stuck_timeout`], measured via `updated_at`.
+    ///
+    /// `updated_at` is the heartbeat: it is stamped by every progress
+    /// path a healthy worker drives — `mark_running` (worker start),
+    /// `mark_runtime_state` (harness/runtime progress events), the
+    /// projection-field updater, `mark_completed` / `mark_failed` /
+    /// `cancel` (terminal transitions), `record_final_output`, and
+    /// `mark_child_session_outcome`. A long-but-progressing task (e.g. a
+    /// `deep_research` pipeline streaming phase events) therefore keeps
+    /// its heartbeat fresh and is NEVER reaped; only genuinely silent
+    /// workers are. The default 30-min timeout additionally matches the
+    /// agent loop's per-tool wall-clock backstop (1800s), so the reaper
+    /// cannot fire earlier than the timeout a legitimate tool call is
+    /// allowed to consume.
+    ///
+    /// Reaping transitions the task through the standard `mark_failed`
+    /// path (terminal ledger entry, persistence, callbacks — idempotent
+    /// if a racing worker already finished) and then flips the task's
+    /// cancel token so a COOPERATIVE stuck worker wakes at its next safe
+    /// point and unwinds (which drops its guard and clears the live-set
+    /// entry). A truly wedged worker stays in the live-set, so the
+    /// reaper would re-log on subsequent sweeps were it not for the
+    /// terminal check — the task is already `Failed` and skipped.
+    ///
+    /// Idempotent: only the first call spawns the loop; later calls are
+    /// no-ops (the flag is shared across `Clone`s). The loop holds only
+    /// a weak liveness story — it keeps running as long as the process
+    /// does; dropping the supervisor's last clone does not stop the
+    /// spawned task until the runtime shuts down (acceptable: the
+    /// production supervisor lives for the process lifetime).
+    pub fn start_reaper(self: &Arc<Self>) {
+        if self.reaper_started.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let supervisor = Arc::clone(self);
+        tokio::spawn(async move {
+            loop {
+                let interval = *supervisor
+                    .reap_interval
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                tokio::time::sleep(interval).await;
+                let timeout = *supervisor
+                    .stuck_timeout
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                supervisor.reap_stuck_tasks(Utc::now(), timeout);
+            }
+        });
+    }
+
+    /// One reaper sweep, factored out of [`Self::start_reaper`]'s tokio
+    /// loop so unit tests can drive it synchronously (no sleeping).
+    /// `now` is the reference instant and `stuck_timeout` the silence
+    /// window; both are parameters so tests control the clock.
+    ///
+    /// Returns the ids of reaped tasks. See [`Self::start_reaper`] for
+    /// the full reaping contract.
+    pub fn reap_stuck_tasks(&self, now: DateTime<Utc>, stuck_timeout: Duration) -> Vec<String> {
+        let candidates: Vec<String> = {
+            let tasks = self.tasks.lock().unwrap_or_else(|e| e.into_inner());
+            tasks
+                .values()
+                .filter(|task| {
+                    // Terminal rows are already resolved — never touch.
+                    if !task.status.is_active() {
+                        return false;
+                    }
+                    // A NON-live active task is the dropped-worker case:
+                    // its TaskTerminalGuard::drop fires mark_failed
+                    // ("worker dropped before reaching terminal state")
+                    // on every exit path, so reaping here would
+                    // double-fire failure callbacks / ledger entries.
+                    // The startup sweep owns cross-process orphans.
+                    if !is_task_live(&task.id) {
+                        return false;
+                    }
+                    // The heartbeat gate: `now - updated_at > timeout`.
+                    // `signed_duration_since` (not `signed_duration_from`)
+                    // handles a clock-skewed FUTURE updated_at by yielding
+                    // a negative age, which never exceeds the timeout.
+                    now.signed_duration_since(task.updated_at)
+                        .to_std()
+                        .map(|age| age > stuck_timeout)
+                        .unwrap_or(false)
+                })
+                .map(|task| task.id.clone())
+                .collect()
+        };
+
+        let mut reaped = Vec::new();
+        for task_id in candidates {
+            // mark_failed re-checks the terminal guard internally, so a
+            // worker that transitioned between candidate collection and
+            // this call is a no-op (idempotent terminal path).
+            self.mark_failed(
+                &task_id,
+                format!("orphaned: no progress for {stuck_timeout:?} (heartbeat timeout)"),
+            );
+            // Flip the cancel token AFTER the terminal transition — a
+            // cooperative stuck worker wakes at its next safe point,
+            // re-reads the supervisor, sees the terminal state, and
+            // unwinds (dropping its guard, which clears the live-set).
+            // `ensure` mirrors `cancel()`'s ordering: allocate the token
+            // even if the worker never polled one so a late
+            // `cancel_token()` call still observes the cancelled state.
+            self.cancel_tokens.ensure(&task_id).cancel();
+            counter!(
+                "octos_orphaned_tasks_reaped_total",
+                "reason" => "heartbeat_timeout"
+            )
+            .increment(1);
+            tracing::warn!(
+                task_id = %task_id,
+                stuck_timeout = ?stuck_timeout,
+                "reaped stuck background task (heartbeat timeout)"
+            );
+            reaped.push(task_id);
+        }
+        reaped
     }
 }
 

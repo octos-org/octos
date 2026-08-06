@@ -3961,3 +3961,176 @@ async fn foreground_armed_guard_survives_sweep_before_worker_polls() {
         "live-set cleared after the worker future drops"
     );
 }
+
+// ── issue #1920: heartbeat-based in-flight orphan reaper ──────────────
+
+/// A live worker whose heartbeat (`updated_at`) has been silent for longer
+/// than `stuck_timeout` is reaped: status transitions to `Failed` with the
+/// heartbeat message and its cancel token is flipped so a cooperative
+/// worker wakes and unwinds.
+#[tokio::test]
+async fn reaper_fails_stuck_live_task_and_cancels_token() {
+    let supervisor = Arc::new(TaskSupervisor::new());
+    let id = supervisor.register("run_pipeline", "call-stuck", Some("api:sess"));
+    supervisor.mark_running(&id);
+    // Arm the guard so the task is LIVE (the reaper only touches live
+    // workers — the dropped-worker case belongs to the guard's Drop).
+    let _guard = TaskTerminalGuard::new(Arc::clone(&supervisor), id.clone());
+    assert!(is_task_live(&id));
+
+    // Age the heartbeat well past the timeout by stamping updated_at in
+    // the past (register/mark_running set it to now).
+    let stale_at = Utc::now() - chrono::Duration::minutes(10);
+    {
+        let mut tasks = supervisor.tasks.lock().unwrap_or_else(|e| e.into_inner());
+        tasks.get_mut(&id).unwrap().updated_at = stale_at;
+    }
+    let token = supervisor.cancel_token(&id);
+    assert!(!token.is_cancelled());
+
+    let timeout = Duration::from_secs(60);
+    let reaped = supervisor.reap_stuck_tasks(Utc::now(), timeout);
+
+    assert_eq!(reaped, vec![id.clone()]);
+    let task = supervisor.get_task(&id).expect("task");
+    assert_eq!(task.status, TaskStatus::Failed);
+    assert_eq!(
+        task.error.as_deref(),
+        Some("orphaned: no progress for 60s (heartbeat timeout)"),
+    );
+    assert!(
+        token.is_cancelled(),
+        "the reaper flips the cancel token so a cooperative worker wakes"
+    );
+    assert!(
+        is_task_live(&id),
+        "live-set cleanup stays with the guard's Drop, not the reaper"
+    );
+
+    // A second sweep is a no-op: the task is terminal now.
+    let reaped_again = supervisor.reap_stuck_tasks(Utc::now(), timeout);
+    assert!(reaped_again.is_empty());
+}
+
+/// A live worker that keeps its heartbeat fresh (recent `updated_at`) is
+/// NOT reaped — this is the long-but-progressing case (deep_research
+/// streaming progress events).
+#[tokio::test]
+async fn reaper_spares_task_with_fresh_heartbeat() {
+    let supervisor = Arc::new(TaskSupervisor::new());
+    let id = supervisor.register("run_pipeline", "call-fresh", Some("api:sess"));
+    supervisor.mark_running(&id);
+    let _guard = TaskTerminalGuard::new(Arc::clone(&supervisor), id.clone());
+
+    let reaped = supervisor.reap_stuck_tasks(Utc::now(), Duration::from_secs(60));
+
+    assert!(reaped.is_empty());
+    assert_eq!(
+        supervisor.get_task(&id).expect("task").status,
+        TaskStatus::Running,
+    );
+    assert!(!supervisor.cancel_token(&id).is_cancelled());
+}
+
+/// Terminal tasks are never touched, even if their `updated_at` is ancient.
+#[tokio::test]
+async fn reaper_never_touches_terminal_tasks() {
+    let supervisor = Arc::new(TaskSupervisor::new());
+    let id = supervisor.register("spawn", "call-terminal", Some("api:sess"));
+    supervisor.mark_running(&id);
+    supervisor.mark_completed(&id, vec![]);
+
+    let stale_at = Utc::now() - chrono::Duration::minutes(30);
+    {
+        let mut tasks = supervisor.tasks.lock().unwrap_or_else(|e| e.into_inner());
+        tasks.get_mut(&id).unwrap().updated_at = stale_at;
+    }
+
+    let reaped = supervisor.reap_stuck_tasks(Utc::now(), Duration::from_secs(60));
+
+    assert!(reaped.is_empty());
+    let task = supervisor.get_task(&id).expect("task");
+    assert_eq!(task.status, TaskStatus::Completed);
+    assert!(task.error.is_none());
+}
+
+/// An ACTIVE task WITHOUT a live worker is the dropped-worker case the
+/// `TaskTerminalGuard` owns — the reaper must skip it (double-firing the
+/// failure callbacks would surface two recovery signals for one death).
+#[tokio::test]
+async fn reaper_skips_active_task_without_live_worker() {
+    let supervisor = Arc::new(TaskSupervisor::new());
+    let id = supervisor.register("spawn", "call-not-live", Some("api:sess"));
+    supervisor.mark_running(&id);
+    assert!(
+        !is_task_live(&id),
+        "no guard armed, so the id is not in the live-set"
+    );
+
+    let stale_at = Utc::now() - chrono::Duration::minutes(30);
+    {
+        let mut tasks = supervisor.tasks.lock().unwrap_or_else(|e| e.into_inner());
+        tasks.get_mut(&id).unwrap().updated_at = stale_at;
+    }
+
+    let reaped = supervisor.reap_stuck_tasks(Utc::now(), Duration::from_secs(60));
+
+    assert!(reaped.is_empty());
+    assert_eq!(
+        supervisor.get_task(&id).expect("task").status,
+        TaskStatus::Running,
+        "non-live active tasks are left for TaskTerminalGuard / the startup sweep",
+    );
+}
+
+/// A future `updated_at` (clock skew on a hydrated snapshot) yields a
+/// negative age and must never be reaped.
+#[tokio::test]
+async fn reaper_tolerates_future_updated_at_clock_skew() {
+    let supervisor = Arc::new(TaskSupervisor::new());
+    let id = supervisor.register("spawn", "call-skew", Some("api:sess"));
+    supervisor.mark_running(&id);
+    let _guard = TaskTerminalGuard::new(Arc::clone(&supervisor), id.clone());
+
+    let future_at = Utc::now() + chrono::Duration::minutes(5);
+    {
+        let mut tasks = supervisor.tasks.lock().unwrap_or_else(|e| e.into_inner());
+        tasks.get_mut(&id).unwrap().updated_at = future_at;
+    }
+
+    let reaped = supervisor.reap_stuck_tasks(Utc::now(), Duration::from_secs(60));
+
+    assert!(reaped.is_empty());
+    assert_eq!(
+        supervisor.get_task(&id).expect("task").status,
+        TaskStatus::Running,
+    );
+}
+
+/// `start_reaper` is idempotent and drives `reap_stuck_tasks` on its
+/// interval: with a tiny interval/timeout a silently-stuck live task is
+/// reaped by the background loop itself (no manual sweep call).
+#[tokio::test]
+async fn start_reaper_loop_reaps_stuck_task_on_interval() {
+    let supervisor = Arc::new(TaskSupervisor::new());
+    supervisor.set_reap_interval(Duration::from_millis(20));
+    supervisor.set_stuck_timeout(Duration::from_millis(50));
+    let id = supervisor.register("spawn", "call-loop", Some("api:sess"));
+    supervisor.mark_running(&id);
+    let _guard = TaskTerminalGuard::new(Arc::clone(&supervisor), id.clone());
+
+    supervisor.start_reaper();
+    supervisor.start_reaper(); // idempotent — must not panic or double-spawn
+
+    // The task makes NO progress: after a few intervals the loop reaps it.
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    let task = supervisor.get_task(&id).expect("task");
+    assert_eq!(task.status, TaskStatus::Failed);
+    assert!(
+        task.error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("heartbeat timeout")
+    );
+    assert!(supervisor.cancel_token(&id).is_cancelled());
+}
