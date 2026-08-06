@@ -126,7 +126,7 @@ The feature MUST always be included in the server's known feature registry once 
 
 ## Compatibility
 
-- All existing clients (octos-tui, octos-app, web SPA) continue to function unchanged. The method is opt-in via `X-Octos-Ui-Features`.
+- All existing clients (octoscode, octos-app, web SPA) continue to function unchanged. The method is opt-in via `X-Octos-Ui-Features`.
 - Legacy daemon versions that do not implement `turn/state/get` will not advertise the feature in `supported_features`, and clients will not invoke it.
 - The active-turn registry already exists and is populated for every turn started after `turn/start`. No daemon-side state migration is required.
 - Telegram, Discord, Email, Matrix, and other linear channels: unaffected. They do not expose UI Protocol; their state is observable only via REST and channel-native message ids.
@@ -150,7 +150,7 @@ The feature MUST always be included in the server's known feature registry once 
 
 ### Client-side
 
-- TUI fixture at `octos-tui/tests/...`: render activity pane after invoking `turn/state/get` against a paused turn. Assert "interrupting" surfaces.
+- TUI fixture at `octoscode/tests/...`: render activity pane after invoking `turn/state/get` against a paused turn. Assert "interrupting" surfaces.
 - Layer 1 SPA fixture (PR H): the `slow-then-fast-interleave.fixture.ts` and `m89-recovery-turn.fixture.ts` fixtures should call `turn/state/get` between events and assert the returned state matches the expected lifecycle.
 
 ### Wire contract
@@ -163,7 +163,7 @@ The feature MUST always be included in the server's known feature registry once 
 ## Rollout
 
 - **Day 1 (this UPCR)**: drafted, reviewed, accepted before any code lands.
-- **Day 2 (PR G in the structural plan)**: server handler implemented under capability gate. octos-tui adopts in the same PR. Web SPA does not adopt until PR J (Day 4).
+- **Day 2 (PR G in the structural plan)**: server handler implemented under capability gate. octoscode adopts in the same PR. Web SPA does not adopt until PR J (Day 4).
 - **Pre-release validation**: golden tests pass; `cargo test -p octos-core --features api` covers the capability-negotiation behavior.
 
 ## Risks

@@ -71,9 +71,9 @@ const KNOWN_CAPTURE_BUG_PATTERNS = [
     detail: 'tmux capture shows the real TUI pane was missing',
   },
   {
-    id: 'octos_tui_exited',
-    regex: /octos-tui exited with status/,
-    detail: 'tmux capture shows the real octos-tui process exited before validation',
+    id: 'octoscode_exited',
+    regex: /octoscode exited with status/,
+    detail: 'tmux capture shows the real octoscode process exited before validation',
   },
   {
     id: 'ui_protocol_connect_failed',
@@ -1385,8 +1385,8 @@ function checkTaskSubagentTreeScenario(artifactDir) {
   } else {
     for (const expected of [
       'OCTOS_M15_LIVE_SUBAGENT_FIXTURE=',
-      'OCTOS_TUI_M15_UX_OUTPUT_DIR=',
-      'OCTOS_TUI_M15_UX_WORKDIR=',
+      'OCTOSCODE_M15_UX_OUTPUT_DIR=',
+      'OCTOSCODE_M15_UX_WORKDIR=',
       'OCTOS_M15_LIVE_SUBAGENT_DELAY_SCALE=',
     ]) {
       if (!launchCommand.text.includes(expected)) {
@@ -1399,8 +1399,8 @@ function checkTaskSubagentTreeScenario(artifactDir) {
     problems.push('scenario fixture_env missing OCTOS_M15_LIVE_SUBAGENT_FIXTURE=1');
   }
   for (const expected of [
-    'OCTOS_TUI_M15_UX_OUTPUT_DIR',
-    'OCTOS_TUI_M15_UX_WORKDIR',
+    'OCTOSCODE_M15_UX_OUTPUT_DIR',
+    'OCTOSCODE_M15_UX_WORKDIR',
     'OCTOS_M15_LIVE_SUBAGENT_DELAY_SCALE',
   ]) {
     if (typeof fixtureEnv[expected] !== 'string' || fixtureEnv[expected].length === 0) {

@@ -3153,7 +3153,7 @@ pub enum LaunchDecisionKind {
     /// The folder holds conversation(s) for other profile(s) but not the
     /// resolved one — offer switch-and-resume or start-fresh.
     CrossProfile,
-    /// No profile exists on the machine — send the user to `octos-tui onboard`.
+    /// No profile exists on the machine — send the user to `octoscode onboard`.
     NoProfile,
 }
 

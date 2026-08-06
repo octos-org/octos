@@ -7,7 +7,7 @@
 # `state ◒ Working (...)` which the legacy `running|blocked` regex
 # missed) does not slip back in unnoticed.
 #
-# Runs entirely offline. No tmux, no octos-tui process. The script is
+# Runs entirely offline. No tmux, no octoscode process. The script is
 # sourced so the detector helpers are loaded as bash functions; the
 # soak `main` invocation is guarded by `BASH_SOURCE` so sourcing does
 # not start the long-running flow.

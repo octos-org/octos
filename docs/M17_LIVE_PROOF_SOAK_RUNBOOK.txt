@@ -18,7 +18,7 @@ Notes: Proves native specialists complete, but does not by itself prove direct s
 
 Requirement: TUI tmux captures
 Current script/evidence: e2e/scripts/m16-live-tui-tmux-soak.sh
-Notes: Requires tmux and octos-tui; output includes terminal captures and m16-ux-soak-validation.json.
+Notes: Requires tmux and octoscode; output includes terminal captures and m16-ux-soak-validation.json.
 
 Requirement: AppUI transcript
 Current script/evidence: client-observed-appui-transcript.jsonl or appui-transcript.jsonl

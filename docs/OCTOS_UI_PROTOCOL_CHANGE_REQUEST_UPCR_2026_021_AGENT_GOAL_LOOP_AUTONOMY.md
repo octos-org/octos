@@ -85,7 +85,7 @@ Central tracker: https://github.com/octos-org/octos/issues/992
 - **M15-F5: Production autonomy live tmux soak.** TUI/e2e proof for real master
   continuations, goal continuation, loop fires, restart hydration, and
   stdio/WebSocket parity. Tracking:
-  https://github.com/octos-org/octos-tui/issues/44
+  https://github.com/octos-org/octoscode/issues/44
 
 ## Capabilities
 

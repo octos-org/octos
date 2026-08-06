@@ -71,7 +71,7 @@ truth.
 | APP-033 | Persistence | P1 | Local app state persists sessions, cursor, selected profile, UI preferences, and safe drafts without persisting secrets in plaintext. | persistence tests |
 | APP-034 | Build and packaging | P0 | App builds on supported platforms, has reproducible release profile, and CI runs store/transport/app checks. | CI |
 | APP-035 | Observability | P1 | App records sanitized telemetry for connection failures, protocol errors, approval failures, task output failures, and panics. | telemetry tests |
-| APP-036 | Client parity | P0 | App behavior remains protocol-compatible with `octos-tui` for core flows: session, turns, approvals, diffs, tasks, replay, cwd, and errors. | shared fixture tests |
+| APP-036 | Client parity | P0 | App behavior remains protocol-compatible with `octoscode` for core flows: session, turns, approvals, diffs, tasks, replay, cwd, and errors. | shared fixture tests |
 | APP-037 | Structured user-question picker | P0 | `user_question/requested` renders a question picker (single/multi-select options plus a free-text "Other") for each of the 1–4 questions, with generic title/body fallback when the structured `questions` field is unknown. The picker sends `user_question/respond` with the correct `question_id` and per-question `answers` (selected labels + optional free text). Stale/expired questions render as decided/expired, not as pending. | UI snapshot and contract tests |
 
 ## Major Interaction Flows
@@ -191,7 +191,7 @@ Expected flow:
 
 - Connect to real `octos serve`.
 - Run a live coding turn with approval, diff preview, task output, and reconnect.
-- Compare core protocol behavior with `octos-tui` on the same fixture.
+- Compare core protocol behavior with `octoscode` on the same fixture.
 - Verify app remains responsive through a long-running coding session.
 
 ## Current Implementation Notes
@@ -222,7 +222,7 @@ Known gaps relative to this requirements document:
   only when doing so lowers test and maintenance risk.
 - True task stdout/stderr live-tail depends on the server feature; current app
   support must respect the server's snapshot-projection limitation.
-- Cross-client parity with `octos-tui` should be added as shared fixtures, not
+- Cross-client parity with `octoscode` should be added as shared fixtures, not
   hand-checked only.
 
 ## Release Gate

@@ -21,7 +21,7 @@ progress/fullness bar). The change is strictly additive.
 
 ## Motivation
 
-octos-tui wants Claude-Code-style compaction UX:
+octoscode wants Claude-Code-style compaction UX:
 
 ```
 ✶ Compacting conversation… (12s · 87.4k tokens)

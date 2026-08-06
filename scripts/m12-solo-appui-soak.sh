@@ -47,7 +47,7 @@ Environment:
                               because local solo live runs cannot change deployment mode.
 
 The live runner captures, per transport:
-  tui-capture.txt is owned by octos-tui's tmux runner; this backend runner captures
+  tui-capture.txt is owned by octoscode's tmux runner; this backend runner captures
   server.log, appui-transcript.jsonl, runtime-policy-stamp.json,
   tool-registry-snapshot.json, approval-events.jsonl, and filesystem-probe.json.
 USAGE

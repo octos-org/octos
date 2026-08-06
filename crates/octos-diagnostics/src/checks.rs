@@ -2,7 +2,7 @@
 //! directory writability, and the protocol-skew **adapter** over the pure
 //! `octos_core::ui_protocol` comparator.
 //!
-//! No network here (Stage 1). The terminal checks are ported from octos-tui's
+//! No network here (Stage 1). The terminal checks are ported from octoscode's
 //! `doctor.rs`; the writability checks take their directories as parameters so
 //! callers (octos-cli) resolve the real `~/.config/octos` + `~/.octos`.
 

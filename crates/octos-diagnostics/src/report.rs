@@ -1,5 +1,5 @@
 //! The product-agnostic diagnostic report model: [`CheckStatus`], [`Check`],
-//! and [`Report`]. Ported from octos-tui's `doctor.rs` but with the
+//! and [`Report`]. Ported from octoscode's `doctor.rs` but with the
 //! product-specific JSON keys (the binary's own version/schema) supplied by the
 //! caller via [`Report::to_json`] arguments rather than baked in from this
 //! crate's `CARGO_PKG_VERSION`.

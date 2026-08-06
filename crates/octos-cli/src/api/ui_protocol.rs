@@ -307,7 +307,7 @@ const MAX_ACTIVE_SKILL_ACTION_BATCHES: usize = 8;
 /// candidate path, reports existence/writability, surfaces
 /// `workspace_policy.toml` presence + parse errors, and rejects roots that
 /// escape under banned system paths. Backend-owned runtime truth so the TUI
-/// (a separate `octos-tui` repo) only stages user intent — the canonical
+/// (a separate `octoscode` repo) only stages user intent — the canonical
 /// answer is the server's.
 const APPUI_FEATURE_ONBOARDING_WORKSPACE_PROBE_V1: &str = "onboarding.workspace_probe.v1";
 const APPUI_EXTRA_METHODS: &[&str] = &[
@@ -793,7 +793,7 @@ impl WsConnection {
                             // held client->server requests, so soak verifiers that
                             // require backend `task/updated` / `agent/updated`
                             // notifications could never pass over WS. The append
-                            // is a no-op unless OCTOS_TUI_M15_UX_OUTPUT_DIR is set.
+                            // is a no-op unless OCTOSCODE_M15_UX_OUTPUT_DIR is set.
                             if let WsMessage::Text(text) = &msg {
                                 if let Ok(frame) = serde_json::from_str::<Value>(text.as_str()) {
                                     append_appui_transcript_frame("server_to_client", frame);
@@ -1977,7 +1977,7 @@ impl ConnectionUiFeatures {
             // Do NOT auto-enable `projection.envelope.v1` for stdio
             // connections. Legacy `turn/completed` is the turn-lifecycle
             // source for clients that do not consume `projection/envelope`
-            // (e.g. the octos TUI over stdio, which clears its turn-active
+            // (e.g. the octoscode over stdio, which clears its turn-active
             // state — `live_reply`, backing the send-gate — ONLY on legacy
             // `turn/completed`). The γ-cutover mutual-exclusion gate in
             // `live_event_passes_capability_filter` DROPS legacy
@@ -10412,13 +10412,13 @@ async fn raw_session_status_result(
         (None, None)
     };
     // Emit the `model` object only when the policy actually resolved a
-    // model AND provider. Clients (octos-tui) decode it into a struct whose
+    // model AND provider. Clients (octoscode) decode it into a struct whose
     // `model`/`provider` are non-optional strings, so
     // `{"model": null, "provider": null, "selected": true}` fails the whole
     // session/status/read decode and the composer footer degrades to a
     // placeholder. A missing key is handled fine by their
     // `Option<ModelStatus>` + `#[serde(default)]` — including in shipped
-    // octos-tui 0.1.5 binaries.
+    // octoscode 0.1.5 binaries.
     let resolved_model = policy.get("model").filter(|value| !value.is_null());
     let resolved_provider = policy.get("provider").filter(|value| !value.is_null());
     let model = match (resolved_model, resolved_provider) {
@@ -28142,13 +28142,13 @@ async fn run_m15_live_subagent_fixture_turn(
         .map(ToOwned::to_owned)
         .unwrap_or_else(|| MAIN_PROFILE_ID.to_owned());
     let task_id = TaskId::new();
-    let workdir = std::env::var_os("OCTOS_TUI_M15_UX_WORKDIR")
+    let workdir = std::env::var_os("OCTOSCODE_M15_UX_WORKDIR")
         .map(PathBuf::from)
         .or_else(|| appui_evidence_dir().map(|dir| dir.join("workspace")))
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
     // The supervised subagent processes are spawned with `cwd(workdir)`.
     // When the workdir is derived from the evidence dir (the default when
-    // OCTOS_TUI_M15_UX_WORKDIR is unset) it does not exist yet, so the
+    // OCTOSCODE_M15_UX_WORKDIR is unset) it does not exist yet, so the
     // process spawn fails with "No such file or directory (os error 2)"
     // and every review agent reports `m15subagentfailed`. Materialize it
     // up front so the fixture's child processes have a valid cwd.
@@ -28813,7 +28813,7 @@ fn reasoning_effort_from_wire(
 ///   after active turn" TUI/web wedge. The background `spawn_only` task reports
 ///   its real progress via `task_*` / `tool_*` / `file_*` events (all still
 ///   forwarded), never via raw foreground tokens, so dropping these loses
-///   nothing user-facing. Pairs with the octos-tui client guard that ignores
+///   nothing user-facing. Pairs with the octoscode client guard that ignores
 ///   deltas for already-terminal turns (belt + suspenders).
 ///
 /// Chars of a background REPORT result inlined into the parent conversation.
@@ -34870,7 +34870,7 @@ fn set_field_at_path(value: &mut Value, path: &[PathSeg], new_value: Value) -> b
 }
 
 fn appui_evidence_dir() -> Option<PathBuf> {
-    std::env::var_os("OCTOS_TUI_M15_UX_OUTPUT_DIR")
+    std::env::var_os("OCTOSCODE_M15_UX_OUTPUT_DIR")
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
 }
@@ -35578,7 +35578,7 @@ fn send_raw_notification_ephemeral(
     // M15-F5 (#44): mirror production child-agent lifecycle/output/artifact
     // notifications into `agent-ledger.jsonl` / `artifact-index.json` evidence
     // ledgers. NO-OP unless the live tmux soak set
-    // `OCTOS_TUI_M15_UX_OUTPUT_DIR`, so this is free in normal production.
+    // `OCTOSCODE_M15_UX_OUTPUT_DIR`, so this is free in normal production.
     record_agent_evidence(method, &params);
     let notification = octos_core::ui_protocol::RpcNotification::new(method, params);
     let frame = frame_for(&notification).ok_or(SendError::BackpressureDrop)?;
@@ -36024,7 +36024,7 @@ fn send_notification_durable(
 ) -> Result<(), SendError> {
     // M15-F5 (#44): mirror production supervised-task lifecycle updates into
     // the `task-ledger.jsonl` evidence ledger. NO-OP unless the live tmux soak
-    // set `OCTOS_TUI_M15_UX_OUTPUT_DIR`, so this is free in normal production.
+    // set `OCTOSCODE_M15_UX_OUTPUT_DIR`, so this is free in normal production.
     record_task_evidence(&notification);
     let event = ledger.append_notification_from(notification, ws.connection_id);
     let cursor = event.cursor.clone();

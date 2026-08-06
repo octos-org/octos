@@ -127,7 +127,7 @@ class Validator:
         self.add(
             "real_octos_serve_stdio_backend",
             ok,
-            "octos-tui launched against real octos serve --stdio with M9 protocol fixture enabled"
+            "octoscode launched against real octos serve --stdio with M9 protocol fixture enabled"
             if ok
             else "launch command does not prove real octos serve --stdio plus M9 fixture",
             ["launch-command.txt"],

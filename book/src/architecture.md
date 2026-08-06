@@ -9,7 +9,7 @@ octos is a 27-member Rust workspace (Edition 2024, rust-version 1.85.0) providin
 - **Agent-adjacent** (5): `octos-pipeline` (DOT-graph workflows), `octos-plugin` (plugin/skill SDK), `octos-swarm` (multi-agent contract authoring), `octos-sandbox`, `octos-dora-mcp`.
 - **Bundled skill crates** (15): each app skill under `crates/app-skills/` is its own crate — `news`, `deep-search`, `deep-crawl`, `send-email`, `account-manager`, `time`, `weather`, `smart-home`, `wechat-bridge`, `skill-evolve`, and the `harness-starter-{generic,report,audio,coding}` templates — plus `platform-skills/voice` (ASR/TTS).
 
-(The web SPA and terminal client live in the separate `octos-web` and `octos-tui` repositories and talk to `octos serve` over the UI Protocol.)
+(The web SPA and terminal client live in the separate `octos-web` and `octoscode` repositories and talk to `octos serve` over the UI Protocol.)
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
