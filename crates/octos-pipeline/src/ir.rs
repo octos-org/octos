@@ -385,7 +385,14 @@ fn compile_node(n: &IrNode) -> PipelineNode {
             node.timeout_secs = Some(timeout_secs.unwrap_or(60));
         }
         IrNodeKind::SubAgent { task, tools, model } => {
-            node.prompt = Some(task.clone());
+            // Prompt prefix tells the LLM it must delegate via `spawn` —
+            // the node's tools are locked to ["spawn"] by the contract,
+            // so it has no other way to accomplish the task.
+            node.prompt = Some(format!(
+                "You are a delegator. Your ONLY tool is `spawn`. \
+                 Use it to create a sub-agent that completes this task:\n\n{task}\n\n\
+                 Return the sub-agent's final output as your result."
+            ));
             if let Some(ts) = tools {
                 node.label = Some(format!("subagent:{}", ts.join(",")));
             }
