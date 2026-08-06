@@ -477,7 +477,7 @@ tui_style_escape_seen() {
 tui_capture_has_ready_state() {
   local capture="$1"
   printf '%s\n' "$capture" | grep -E -q -- \
-    'state[[:space:]]+[^[:space:]]+[[:space:]]+(done|idle|error)|>_ Octos TUI[[:space:]]+idle|status[[:space:]]+Turn completed|system[[:space:]]+Turn completed|Turn error|Ask Octos to change code'
+    'state[[:space:]]+[^[:space:]]+[[:space:]]+(done|idle|error)|status[[:space:]]+Turn completed|system[[:space:]]+Turn completed|Turn error|Ask Octos to change code'
 }
 
 tui_capture_has_active_state() {
@@ -488,7 +488,7 @@ tui_capture_has_active_state() {
   # legacy regex missed and caused inline-diff detection to stall).
   local capture="$1"
   printf '%s\n' "$capture" | grep -E -q -- \
-    '>_ Octos TUI[[:space:]]+.*(Thinking|Working|Progress|Streaming)|state[[:space:]]+[^[:space:]]+[[:space:]]+(running|blocked|working|progress|streaming|Working|Progress|Streaming)|status[[:space:]]+(Turn started|Tool started|Approval requested|Approval denied|Thinking|Working|Progress|Streaming)|model[[:space:]]+Waiting for model|Approval Requested|live assistant'
+    'state[[:space:]]+[^[:space:]]+[[:space:]]+(running|blocked|working|progress|streaming|Working|Progress|Streaming)|status[[:space:]]+(Turn started|Tool started|Approval requested|Approval denied|Thinking|Working|Progress|Streaming)|model[[:space:]]+Waiting for model|Approval Requested|live assistant'
 }
 
 tui_capture_has_blocking_approval() {
@@ -735,9 +735,9 @@ run_detector_self_test() {
   local progress_capture
   local idle_capture
 
-  working_capture=$'>_ Octos TUI  Working\nComposer\n'
+  working_capture=$'state \u25d2 Working (thinking)\nComposer\n'
   progress_capture=$'status Progress\nComposer\n'
-  idle_capture=$'>_ Octos TUI  idle\nAsk Octos to change code\nComposer\n'
+  idle_capture=$'state \u25d2 idle (ready)\nAsk Octos to change code\nComposer\n'
 
   tui_capture_has_active_state "$working_capture" \
     || { printf 'detector self-test failed: Working was not active\n' >&2; return 1; }
