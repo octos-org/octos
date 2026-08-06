@@ -339,6 +339,11 @@ pub struct BackgroundTask {
     /// AppUI `runtime_policy_stamp` schema.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime_policy_stamp: Option<Value>,
+    /// Opaque host projection metadata. The supervisor persists this value
+    /// without interpreting its schema, allowing API adapters to derive
+    /// domain-specific views from the canonical task lifecycle.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub projection_metadata: Option<Value>,
 }
 
 impl BackgroundTask {
@@ -365,7 +370,7 @@ impl BackgroundTask {
 }
 
 /// Callback invoked when a task's status changes.
-type OnChangeCallback = Box<dyn Fn(&BackgroundTask) + Send + Sync>;
+type OnChangeCallback = Arc<dyn Fn(&BackgroundTask) + Send + Sync>;
 
 /// Payload emitted when a `spawn_only` background task transitions to
 /// `Failed`. Consumers (e.g. the session actor) use this to schedule a
@@ -891,6 +896,8 @@ pub struct TaskSupervisor {
     /// loop cannot keep adding children.
     poisoned_parents: Arc<Mutex<HashSet<String>>>,
     on_change: Arc<Mutex<Option<OnChangeCallback>>>,
+    /// Named observers supplement (and never replace) the primary callback.
+    on_change_listeners: Arc<Mutex<HashMap<String, OnChangeCallback>>>,
     on_failure: Arc<Mutex<Option<OnFailureCallback>>>,
     /// Gap-1 unification: single terminal-transition sink. Fired from
     /// every terminal path alongside the legacy `on_change` / `on_failure`
@@ -939,14 +946,14 @@ pub struct TaskSupervisor {
     /// Interval between heartbeat-reaper sweeps — see
     /// [`TaskSupervisor::start_reaper`]. Defaults to
     /// [`DEFAULT_REAP_INTERVAL`].
-    reap_interval: Arc<std::sync::Mutex<Duration>>,
+    reap_interval: Arc<Mutex<Duration>>,
     /// Silence window after which an ACTIVE task with a LIVE worker is
     /// considered stuck — see [`TaskSupervisor::start_reaper`]. Defaults
     /// to [`DEFAULT_STUCK_TIMEOUT`], which matches the agent loop's
     /// per-tool wall-clock ceiling (`DEFAULT_REGISTRY_TOOL_TIMEOUT_SECS`
     /// = 1800s) so the reaper never fires earlier than the timeout a
     /// legitimate tool call is allowed to consume.
-    stuck_timeout: Arc<std::sync::Mutex<Duration>>,
+    stuck_timeout: Arc<Mutex<Duration>>,
     /// Whether the background reaper tokio task has been spawned — makes
     /// [`TaskSupervisor::start_reaper`] idempotent (the supervisor is
     /// `Clone`, and every clone shares this flag).
@@ -1233,6 +1240,7 @@ impl TaskSupervisor {
             tasks: Arc::new(Mutex::new(HashMap::new())),
             poisoned_parents: Arc::new(Mutex::new(HashSet::new())),
             on_change: Arc::new(Mutex::new(None)),
+            on_change_listeners: Arc::new(Mutex::new(HashMap::new())),
             on_failure: Arc::new(Mutex::new(None)),
             on_terminal: Arc::new(Mutex::new(None)),
             on_relaunch: Arc::new(Mutex::new(None)),
@@ -1314,6 +1322,14 @@ impl TaskSupervisor {
 
     /// Enable append-only persistence for task snapshots and restore existing state.
     ///
+    /// Re-enabling with the SAME ledger path is a transparent no-op: every
+    /// mutation since the first enable has been appended through the normal
+    /// transition path, so the reload/resnapshot/sweep below would add
+    /// nothing — yet the skill-action job view/invoke paths re-enable on
+    /// every request over the shared session supervisor, and each such call
+    /// used to rewrite the whole ledger (#1906). A repeat returns the live
+    /// task total, exactly what a full run would report.
+    ///
     /// At the end of replay, sweeps the in-memory map for any task whose
     /// `runtime_state` is non-terminal (anything other than `Completed`,
     /// `Failed`, or `Cancelled`). Those tasks are orphans — the worker
@@ -1327,24 +1343,43 @@ impl TaskSupervisor {
     /// This handles startup-time orphans only: at this point in startup no
     /// new work has been scheduled yet, so any non-terminal runtime_state
     /// definitionally has no live worker. In-flight orphans inside a
-    /// long-running supervisor (worker future alive but permanently stuck,
-    /// so neither this sweep nor [`TaskTerminalGuard`]'s `Drop` fires) are
-    /// covered by the heartbeat-based reaper — see [`Self::start_reaper`]
-    /// (issue #1920).
+    /// long-running supervisor (worker hangs / crashes silently while the
+    /// supervisor itself stays alive) are NOT addressed here — that needs
+    /// a heartbeat-based reaper, which is a follow-up if observed.
     pub fn enable_persistence(&self, path: impl Into<PathBuf>) -> std::io::Result<usize> {
         let path = path.into();
+        // Idempotence guard (#1906): already persisting to THIS ledger —
+        // nothing new to restore and nothing stale to re-append.
+        {
+            let guard = self
+                .persistence_path
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if guard.as_ref() == Some(&path) {
+                return Ok(self.tasks.lock().unwrap_or_else(|e| e.into_inner()).len());
+            }
+        }
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
 
         let ledger_path = path.display().to_string();
         let restored = Self::load_persisted_tasks(&path)?;
+        // Rows whose DISK version won the merge (or that exist only on disk).
+        // They are already persisted verbatim, so the snapshot pass below
+        // must skip them — re-appending every restored row on each enable
+        // made a fresh supervisor's read-only restore grow the ledger by
+        // its full length per call (#1906). Tasks absent from this set
+        // (in-memory work scheduled before enable, or memory state newer
+        // than the ledger) are the only ones the snapshot pass writes.
+        let mut restored_won: HashSet<String> = HashSet::new();
         {
             let mut tasks = self.tasks.lock().unwrap_or_else(|e| e.into_inner());
             for (task_id, task) in restored {
                 match tasks.get(&task_id) {
                     Some(existing) if existing.updated_at >= task.updated_at => {}
                     _ => {
+                        restored_won.insert(task_id.clone());
                         tasks.insert(task_id, task);
                     }
                 }
@@ -1365,7 +1400,11 @@ impl TaskSupervisor {
 
         let snapshots: Vec<BackgroundTask> = {
             let tasks = self.tasks.lock().unwrap_or_else(|e| e.into_inner());
-            tasks.values().cloned().collect()
+            tasks
+                .values()
+                .filter(|task| !restored_won.contains(&task.id))
+                .cloned()
+                .collect()
         };
         for task in snapshots {
             self.persist_snapshot(&task);
@@ -1491,7 +1530,29 @@ impl TaskSupervisor {
     /// Set a callback that fires whenever a task's status changes.
     pub fn set_on_change(&self, cb: impl Fn(&BackgroundTask) + Send + Sync + 'static) {
         let mut guard = self.on_change.lock().unwrap_or_else(|e| e.into_inner());
-        *guard = Some(Box::new(cb));
+        *guard = Some(Arc::new(cb));
+    }
+
+    /// Add or replace a named observer without disturbing the primary
+    /// callback installed through [`Self::set_on_change`]. Stable keys make
+    /// repeated session wiring idempotent.
+    pub fn set_on_change_listener(
+        &self,
+        key: impl Into<String>,
+        cb: impl Fn(&BackgroundTask) + Send + Sync + 'static,
+    ) {
+        self.on_change_listeners
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(key.into(), Arc::new(cb));
+    }
+
+    /// Remove a named task-change observer.
+    pub fn remove_on_change_listener(&self, key: &str) {
+        self.on_change_listeners
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(key);
     }
 
     /// Set a callback that fires only when a `spawn_only` task transitions to
@@ -2189,6 +2250,7 @@ impl TaskSupervisor {
             summary: None,
             artifact_count: None,
             runtime_policy_stamp: None,
+            projection_metadata: None,
         };
         let mut tasks = self.tasks.lock().unwrap_or_else(|e| e.into_inner());
         // Codex P2 atomicity: when this is a child-task registration
@@ -2308,6 +2370,23 @@ impl TaskSupervisor {
         if let Some(task) = tasks.get_mut(task_id) {
             task.tool_input = Some(tool_input);
         }
+    }
+
+    /// Attach or replace opaque projection metadata for an existing task.
+    /// The update is persisted and emitted through the normal change stream,
+    /// so projections share the supervisor's ordering and durability.
+    pub fn set_projection_metadata(&self, task_id: &str, metadata: Value) {
+        let snapshot = {
+            let mut tasks = self.tasks.lock().unwrap_or_else(|e| e.into_inner());
+            let Some(task) = tasks.get_mut(task_id) else {
+                return;
+            };
+            task.projection_metadata = Some(metadata);
+            task.updated_at = Utc::now();
+            task.clone()
+        };
+        self.persist_snapshot(&snapshot);
+        self.notify_change(&snapshot);
     }
 
     /// Mark a task as running.
@@ -3263,10 +3342,26 @@ impl TaskSupervisor {
             .cloned())
     }
 
-    /// Fire the on_change callback (if set) with a task snapshot.
+    /// Fire the primary callback and every named observer. Clone callbacks
+    /// outside their mutexes before invocation so observers may safely update
+    /// their own registration.
     fn notify_change(&self, task: &BackgroundTask) {
-        let guard = self.on_change.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(ref cb) = *guard {
+        let primary = self
+            .on_change
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let listeners = self
+            .on_change_listeners
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        if let Some(cb) = primary {
+            cb(task);
+        }
+        for cb in listeners {
             cb(task);
         }
     }
