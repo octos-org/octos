@@ -31,7 +31,9 @@ fn should_build_a_factory_from_outside_the_crate() {
         ..Default::default()
     };
 
-    let factory = cmd.factory().expect("factory should build from a provider name alone");
+    let factory = cmd
+        .factory()
+        .expect("factory should build from a provider name alone");
 
     // Reached through the trait object, which is what an embedder holds.
     let factory: &dyn SessionAgentFactory = factory.as_ref();

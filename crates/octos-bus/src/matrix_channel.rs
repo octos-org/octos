@@ -672,12 +672,12 @@ pub struct RoomBotComposition {
 ///
 /// The sources see different bots, so a plain `max` of totals undercounts:
 /// membership sees BotFather but may miss homeserver-hidden child users,
-/// while the room map sees bound child bots. A room of one human + BotFather
-/// + one hidden child would look like "1 bot" to each source individually,
-/// yet has two potential responders. Child bots are maxed across sources
-/// (same population, different visibility) and BotFather is added separately
-/// when either source saw it. `None` from either source means that source
-/// could not be determined — fail closed.
+/// while the room map sees bound child bots. A room of one human plus a
+/// BotFather and one hidden child would look like "1 bot" to each source
+/// individually, yet has two potential responders. Child bots are maxed
+/// across sources (same population, different visibility) and BotFather is
+/// added separately when either source saw it. `None` from either source
+/// means that source could not be determined — fail closed.
 fn merge_room_bot_sources(
     membership: Option<MembershipCounts>,
     mapped: Option<RoomBotComposition>,
