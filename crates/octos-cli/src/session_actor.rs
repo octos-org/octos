@@ -9847,3 +9847,6 @@ fn format_thinking_prefix(reasoning: Option<&str>) -> String {
 #[cfg(test)]
 #[path = "session_actor_tests.rs"]
 mod tests;
+
+// CI baseline probe: comment-only touch so the e2e path filter (which
+// matches `session_actor`) runs the e2e suite against unmodified main.
