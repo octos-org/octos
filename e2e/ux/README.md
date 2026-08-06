@@ -35,9 +35,9 @@ tier = "local"
 transport = "stdio"
 provider = "fixture"
 terminal = "100x30"
-tui_binary = "octos-tui"
+tui_binary = "octoscode"
 tmux_command = "ux-tui-stdio-happy"
-required_tools = ["tmux", "octos", "octos-tui"]
+required_tools = ["tmux", "octos", "octoscode"]
 required_capabilities = ["chat/send_prompt", "chat/receive_response"]
 expected_artifacts = [
   "scenario.json",

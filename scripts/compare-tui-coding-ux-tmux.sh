@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# Drive the real octos-tui protocol client and Codex through tmux on the same
+# Drive the real octoscode protocol client and Codex through tmux on the same
 # coding fixture. The Octos server is only the AppUi/UI Protocol backend; the
-# sole Octos product client under test is standalone octos-tui.
+# sole Octos product client under test is standalone octoscode.
 
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-RUN_ID="${OCTOS_TUI_UX_RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)-$$}"
+RUN_ID="${OCTOSCODE_UX_RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)-$$}"
 RUN_STARTED_AT_UTC="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 RUN_START_EPOCH="$(date +%s)"
 export OCTOS_TMUX_RUN_ID="${OCTOS_TMUX_RUN_ID:-$RUN_ID}"
@@ -14,56 +14,56 @@ export OCTOS_TMUX_RUN_ID="${OCTOS_TMUX_RUN_ID:-$RUN_ID}"
 # shellcheck source=tmux-cli-driver.sh
 source "$ROOT_DIR/scripts/tmux-cli-driver.sh"
 
-OCTOS_TUI_DIR="${OCTOS_TUI_DIR:-$ROOT_DIR/../octos-tui}"
-LONG_MODE="${OCTOS_TUI_UX_LONG:-0}"
-if [ "$LONG_MODE" = "1" ] && [ -z "${OCTOS_TUI_UX_FIXTURE_DIR+x}" ]; then
+OCTOSCODE_DIR="${OCTOSCODE_DIR:-$ROOT_DIR/../octoscode}"
+LONG_MODE="${OCTOSCODE_UX_LONG:-0}"
+if [ "$LONG_MODE" = "1" ] && [ -z "${OCTOSCODE_UX_FIXTURE_DIR+x}" ]; then
   FIXTURE_DIR="$ROOT_DIR/e2e/fixtures/coding-agent-long-workspace"
 else
-  FIXTURE_DIR="${OCTOS_TUI_UX_FIXTURE_DIR:-$ROOT_DIR/e2e/fixtures/coding-agent-compare-multifile}"
+  FIXTURE_DIR="${OCTOSCODE_UX_FIXTURE_DIR:-$ROOT_DIR/e2e/fixtures/coding-agent-compare-multifile}"
 fi
-OUT_DIR="${OCTOS_TUI_UX_OUT_DIR:-$ROOT_DIR/e2e/test-results-tui-coding-ux/$RUN_ID}"
-PROVIDER="${OCTOS_TUI_UX_PROVIDER:-deepseek}"
-MODEL="${OCTOS_TUI_UX_MODEL:-${DEEPSEEK_MODEL:-deepseek-v4-pro}}"
+OUT_DIR="${OCTOSCODE_UX_OUT_DIR:-$ROOT_DIR/e2e/test-results-tui-coding-ux/$RUN_ID}"
+PROVIDER="${OCTOSCODE_UX_PROVIDER:-deepseek}"
+MODEL="${OCTOSCODE_UX_MODEL:-${DEEPSEEK_MODEL:-deepseek-v4-pro}}"
 case "$PROVIDER" in
   openai)
-    API_KEY_ENV="${OCTOS_TUI_UX_API_KEY_ENV:-OPENAI_API_KEY}"
+    API_KEY_ENV="${OCTOSCODE_UX_API_KEY_ENV:-OPENAI_API_KEY}"
     ;;
   deepseek)
-    API_KEY_ENV="${OCTOS_TUI_UX_API_KEY_ENV:-DEEPSEEK_API_KEY}"
+    API_KEY_ENV="${OCTOSCODE_UX_API_KEY_ENV:-DEEPSEEK_API_KEY}"
     ;;
   *)
-    API_KEY_ENV="${OCTOS_TUI_UX_API_KEY_ENV:-$(printf '%s_API_KEY' "$PROVIDER" | tr '[:lower:]' '[:upper:]')}"
+    API_KEY_ENV="${OCTOSCODE_UX_API_KEY_ENV:-$(printf '%s_API_KEY' "$PROVIDER" | tr '[:lower:]' '[:upper:]')}"
     ;;
 esac
-SERVER_PROVIDER="${OCTOS_TUI_UX_SERVER_PROVIDER:-$PROVIDER}"
-SERVER_BASE_URL="${OCTOS_TUI_UX_SERVER_BASE_URL:-}"
-SERVER_API_TYPE="${OCTOS_TUI_UX_SERVER_API_TYPE:-openai}"
-PORT="${OCTOS_TUI_UX_PORT:-$((51000 + $$ % 10000))}"
-AUTH_TOKEN="${OCTOS_TUI_UX_AUTH_TOKEN:-octos-tui-ux-token-$RUN_ID}"
-SESSION_ID="${OCTOS_TUI_UX_SESSION_ID:-coding:local:prototype#tui-compare}"
-MAX_WAIT_SHORT="${OCTOS_TUI_UX_WAIT_SHORT:-90}"
-if [ "$LONG_MODE" = "1" ] && [ -z "${OCTOS_TUI_UX_WAIT_TURN+x}" ]; then
+SERVER_PROVIDER="${OCTOSCODE_UX_SERVER_PROVIDER:-$PROVIDER}"
+SERVER_BASE_URL="${OCTOSCODE_UX_SERVER_BASE_URL:-}"
+SERVER_API_TYPE="${OCTOSCODE_UX_SERVER_API_TYPE:-openai}"
+PORT="${OCTOSCODE_UX_PORT:-$((51000 + $$ % 10000))}"
+AUTH_TOKEN="${OCTOSCODE_UX_AUTH_TOKEN:-octoscode-ux-token-$RUN_ID}"
+SESSION_ID="${OCTOSCODE_UX_SESSION_ID:-coding:local:prototype#tui-compare}"
+MAX_WAIT_SHORT="${OCTOSCODE_UX_WAIT_SHORT:-90}"
+if [ "$LONG_MODE" = "1" ] && [ -z "${OCTOSCODE_UX_WAIT_TURN+x}" ]; then
   MAX_WAIT_TURN=1800
 else
-  MAX_WAIT_TURN="${OCTOS_TUI_UX_WAIT_TURN:-900}"
+  MAX_WAIT_TURN="${OCTOSCODE_UX_WAIT_TURN:-900}"
 fi
-MAX_WAIT_APPROVAL="${OCTOS_TUI_UX_WAIT_APPROVAL:-90}"
-if [ "$LONG_MODE" = "1" ] && [ -z "${OCTOS_TUI_UX_TUI_CODING_ROUNDS+x}" ]; then
+MAX_WAIT_APPROVAL="${OCTOSCODE_UX_WAIT_APPROVAL:-90}"
+if [ "$LONG_MODE" = "1" ] && [ -z "${OCTOSCODE_UX_TUI_CODING_ROUNDS+x}" ]; then
   MAX_TUI_CODING_ROUNDS=8
 else
-  MAX_TUI_CODING_ROUNDS="${OCTOS_TUI_UX_TUI_CODING_ROUNDS:-4}"
+  MAX_TUI_CODING_ROUNDS="${OCTOSCODE_UX_TUI_CODING_ROUNDS:-4}"
 fi
-COMPAT_PROXY_PORT="${OCTOS_TUI_UX_COMPAT_PROXY_PORT:-18081}"
-RUN_TUI="${OCTOS_TUI_UX_RUN_TUI:-1}"
-RUN_CODEX="${OCTOS_TUI_UX_RUN_CODEX:-1}"
-STRICT="${OCTOS_TUI_UX_STRICT:-1}"
-TUI_DENY_KEY="${OCTOS_TUI_UX_TUI_DENY_KEY:-n}"
-FRAME_SAMPLE_ENABLED="${OCTOS_TUI_UX_FRAME_SAMPLE:-$LONG_MODE}"
-FRAME_SAMPLE_INTERVAL="${OCTOS_TUI_UX_FRAME_SAMPLE_INTERVAL:-3}"
-SERVER_ERROR_BUDGET="${OCTOS_TUI_UX_SERVER_ERROR_BUDGET:-0}"
-QUESTION_REGEX="${OCTOS_TUI_UX_QUESTION_REGEX:-\\?|？}"
-COMPLETION_REGEX="${OCTOS_TUI_UX_COMPLETION_REGEX:-test result: ok|Finished .*test.* profile|All tests passed|all tests passed}"
-SERVER_SANDBOX_POLICY="${OCTOS_TUI_UX_SERVER_SANDBOX_POLICY:-auto}"
+COMPAT_PROXY_PORT="${OCTOSCODE_UX_COMPAT_PROXY_PORT:-18081}"
+RUN_TUI="${OCTOSCODE_UX_RUN_TUI:-1}"
+RUN_CODEX="${OCTOSCODE_UX_RUN_CODEX:-1}"
+STRICT="${OCTOSCODE_UX_STRICT:-1}"
+TUI_DENY_KEY="${OCTOSCODE_UX_TUI_DENY_KEY:-n}"
+FRAME_SAMPLE_ENABLED="${OCTOSCODE_UX_FRAME_SAMPLE:-$LONG_MODE}"
+FRAME_SAMPLE_INTERVAL="${OCTOSCODE_UX_FRAME_SAMPLE_INTERVAL:-3}"
+SERVER_ERROR_BUDGET="${OCTOSCODE_UX_SERVER_ERROR_BUDGET:-0}"
+QUESTION_REGEX="${OCTOSCODE_UX_QUESTION_REGEX:-\\?|？}"
+COMPLETION_REGEX="${OCTOSCODE_UX_COMPLETION_REGEX:-test result: ok|Finished .*test.* profile|All tests passed|all tests passed}"
+SERVER_SANDBOX_POLICY="${OCTOSCODE_UX_SERVER_SANDBOX_POLICY:-auto}"
 RESOLVED_SERVER_SANDBOX_MODE=""
 COMPAT_PROXY_PID=""
 declare -a FRAME_SAMPLER_PIDS=()
@@ -88,15 +88,15 @@ if [ "$LONG_MODE" = "1" ]; then
   DEFAULT_PROMPT_RECONNECT="After client restart, continue from the current worktree state. Inspect git diff, rerun cargo test --workspace, and summarize whether worktree state and task context are clear."
 fi
 
-PROMPT_QUESTION="${OCTOS_TUI_UX_PROMPT_QUESTION:-$DEFAULT_PROMPT_QUESTION}"
-PROMPT_APPROVAL="${OCTOS_TUI_UX_PROMPT_APPROVAL:-Before coding, invoke exactly one shell command now: sudo true. Do not inspect files, do not edit files, and do not explain first.}"
-PROMPT_CODING="${OCTOS_TUI_UX_PROMPT_CODING:-$DEFAULT_PROMPT_CODING}"
-PROMPT_CONTINUE="${OCTOS_TUI_UX_PROMPT_CONTINUE:-$DEFAULT_PROMPT_CONTINUE}"
-PROMPT_SUMMARY="${OCTOS_TUI_UX_PROMPT_SUMMARY:-$DEFAULT_PROMPT_SUMMARY}"
-PROMPT_STEERING="${OCTOS_TUI_UX_PROMPT_STEERING:-$DEFAULT_PROMPT_STEERING}"
-PROMPT_INTERRUPT="${OCTOS_TUI_UX_PROMPT_INTERRUPT:-$DEFAULT_PROMPT_INTERRUPT}"
-PROMPT_RECONNECT="${OCTOS_TUI_UX_PROMPT_RECONNECT:-$DEFAULT_PROMPT_RECONNECT}"
-PROMPT_FINAL_LONG="${OCTOS_TUI_UX_PROMPT_FINAL_LONG:-$DEFAULT_PROMPT_FINAL_LONG}"
+PROMPT_QUESTION="${OCTOSCODE_UX_PROMPT_QUESTION:-$DEFAULT_PROMPT_QUESTION}"
+PROMPT_APPROVAL="${OCTOSCODE_UX_PROMPT_APPROVAL:-Before coding, invoke exactly one shell command now: sudo true. Do not inspect files, do not edit files, and do not explain first.}"
+PROMPT_CODING="${OCTOSCODE_UX_PROMPT_CODING:-$DEFAULT_PROMPT_CODING}"
+PROMPT_CONTINUE="${OCTOSCODE_UX_PROMPT_CONTINUE:-$DEFAULT_PROMPT_CONTINUE}"
+PROMPT_SUMMARY="${OCTOSCODE_UX_PROMPT_SUMMARY:-$DEFAULT_PROMPT_SUMMARY}"
+PROMPT_STEERING="${OCTOSCODE_UX_PROMPT_STEERING:-$DEFAULT_PROMPT_STEERING}"
+PROMPT_INTERRUPT="${OCTOSCODE_UX_PROMPT_INTERRUPT:-$DEFAULT_PROMPT_INTERRUPT}"
+PROMPT_RECONNECT="${OCTOSCODE_UX_PROMPT_RECONNECT:-$DEFAULT_PROMPT_RECONNECT}"
+PROMPT_FINAL_LONG="${OCTOSCODE_UX_PROMPT_FINAL_LONG:-$DEFAULT_PROMPT_FINAL_LONG}"
 
 log() {
   printf '[tui-ux] %s\n' "$*"
@@ -159,7 +159,7 @@ resolve_server_sandbox_mode() {
       printf 'outer-sandbox-fallback'
       ;;
     *)
-      printf 'unknown OCTOS_TUI_UX_SERVER_SANDBOX_POLICY=%s\n' "$SERVER_SANDBOX_POLICY" >&2
+      printf 'unknown OCTOSCODE_UX_SERVER_SANDBOX_POLICY=%s\n' "$SERVER_SANDBOX_POLICY" >&2
       exit 2
       ;;
   esac
@@ -169,7 +169,7 @@ maybe_write_harness_server_config() {
   local name="$1"
   local dir="$2"
 
-  [ "$name" = "octos_tui" ] || return 0
+  [ "$name" = "octoscode" ] || return 0
   [ "$RESOLVED_SERVER_SANDBOX_MODE" = "outer-sandbox-fallback" ] || return 0
 
   mkdir -p "$dir/.octos"
@@ -184,7 +184,7 @@ maybe_write_harness_server_config() {
   }
 }
 JSON
-  printf '[tui-ux] server sandbox: inner sandbox disabled for throwaway octos-tui lane because outer macOS sandbox blocks sandbox-exec\n' >&2
+  printf '[tui-ux] server sandbox: inner sandbox disabled for throwaway octoscode lane because outer macOS sandbox blocks sandbox-exec\n' >&2
 }
 
 cleanup_proxy() {
@@ -225,15 +225,15 @@ resolve_octos_bin() {
 }
 
 resolve_tui_bin() {
-  if [ -n "${OCTOS_TUI_BIN:-}" ]; then
-    printf '%s\n' "$OCTOS_TUI_BIN"
+  if [ -n "${OCTOSCODE_BIN:-}" ]; then
+    printf '%s\n' "$OCTOSCODE_BIN"
     return 0
   fi
-  if [ ! -x "$OCTOS_TUI_DIR/target/debug/octos-tui" ]; then
-    log "building octos-tui client"
-    cargo build --manifest-path "$OCTOS_TUI_DIR/Cargo.toml" --bin octos-tui
+  if [ ! -x "$OCTOSCODE_DIR/target/debug/octoscode" ]; then
+    log "building octoscode client"
+    cargo build --manifest-path "$OCTOSCODE_DIR/Cargo.toml" --bin octoscode
   fi
-  printf '%s\n' "$OCTOS_TUI_DIR/target/debug/octos-tui"
+  printf '%s\n' "$OCTOSCODE_DIR/target/debug/octoscode"
 }
 
 start_compat_proxy_if_needed() {
@@ -277,7 +277,7 @@ prepare_candidate() {
     cd "$dir"
     git init -q
     git add .
-    git -c user.name=octos-tui-ux -c user.email=octos-tui-ux@example.invalid \
+    git -c user.name=octoscode-ux -c user.email=octoscode-ux@example.invalid \
       commit -q -m 'initial fixture'
   )
   printf '%s\n' "$dir"
@@ -477,7 +477,7 @@ tui_style_escape_seen() {
 tui_capture_has_ready_state() {
   local capture="$1"
   printf '%s\n' "$capture" | grep -E -q -- \
-    'state[[:space:]]+[^[:space:]]+[[:space:]]+(done|idle|error)|>_ Octos TUI[[:space:]]+idle|status[[:space:]]+Turn completed|system[[:space:]]+Turn completed|Turn error|Ask Octos to change code'
+    'state[[:space:]]+[^[:space:]]+[[:space:]]+(done|idle|error)|status[[:space:]]+Turn completed|system[[:space:]]+Turn completed|Turn error|Ask Octos to change code'
 }
 
 tui_capture_has_active_state() {
@@ -488,7 +488,7 @@ tui_capture_has_active_state() {
   # legacy regex missed and caused inline-diff detection to stall).
   local capture="$1"
   printf '%s\n' "$capture" | grep -E -q -- \
-    '>_ Octos TUI[[:space:]]+.*(Thinking|Working|Progress|Streaming)|state[[:space:]]+[^[:space:]]+[[:space:]]+(running|blocked|working|progress|streaming|Working|Progress|Streaming)|status[[:space:]]+(Turn started|Tool started|Approval requested|Approval denied|Thinking|Working|Progress|Streaming)|model[[:space:]]+Waiting for model|Approval Requested|live assistant'
+    'state[[:space:]]+[^[:space:]]+[[:space:]]+(running|blocked|working|progress|streaming|Working|Progress|Streaming)|status[[:space:]]+(Turn started|Tool started|Approval requested|Approval denied|Thinking|Working|Progress|Streaming)|model[[:space:]]+Waiting for model|Approval Requested|live assistant'
 }
 
 tui_capture_has_blocking_approval() {
@@ -735,9 +735,9 @@ run_detector_self_test() {
   local progress_capture
   local idle_capture
 
-  working_capture=$'>_ Octos TUI  Working\nComposer\n'
+  working_capture=$'state \u25d2 Working (thinking)\nComposer\n'
   progress_capture=$'status Progress\nComposer\n'
-  idle_capture=$'>_ Octos TUI  idle\nAsk Octos to change code\nComposer\n'
+  idle_capture=$'state \u25d2 idle (ready)\nAsk Octos to change code\nComposer\n'
 
   tui_capture_has_active_state "$working_capture" \
     || { printf 'detector self-test failed: Working was not active\n' >&2; return 1; }
@@ -790,7 +790,7 @@ wait_for_tui_approval_outcome() {
 
 record_tui_missing_approval_prompt() {
   local session="$1"
-  append_capture_clean_to_file "$session" "$transcript" "octos-tui approval prompt missing"
+  append_capture_clean_to_file "$session" "$transcript" "octoscode approval prompt missing"
 }
 
 candidate_has_diff() {
@@ -891,7 +891,7 @@ start_secret_session() {
 "$runner"
 rc=\$?
 printf '\\n[tmux-runner-exit=%s]\\n' "\$rc"
-sleep "${OCTOS_TUI_UX_EXIT_HOLD_SECS:-900}"
+sleep "${OCTOSCODE_UX_EXIT_HOLD_SECS:-900}"
 exit "\$rc"
 EOF
   chmod +x "$keepalive"
@@ -914,7 +914,7 @@ $command
 rc=\$?
 set -e
 printf '\\n[tmux-runner-exit=%s]\\n' "\$rc"
-sleep "${OCTOS_TUI_UX_EXIT_HOLD_SECS:-900}"
+sleep "${OCTOSCODE_UX_EXIT_HOLD_SECS:-900}"
 exit "\$rc"
 EOF
   chmod +x "$runner"
@@ -936,7 +936,7 @@ tmux_paste_line() {
   buffer="octos-tmux-paste-${session//[^a-zA-Z0-9_.-]/-}"
   tmux set-buffer -b "$buffer" "$text"
   tmux paste-buffer -d -t "$session" -b "$buffer"
-  sleep "${OCTOS_TUI_UX_PASTE_ENTER_GRACE_SECS:-0.2}"
+  sleep "${OCTOSCODE_UX_PASTE_ENTER_GRACE_SECS:-0.2}"
   tmux_key "$session" Enter
 }
 
@@ -944,8 +944,8 @@ send_tui_prompt() {
   local session="$1"
   local text="$2"
   local label="${3:-prompt}"
-  local ready_timeout="${OCTOS_TUI_UX_COMPOSER_READY_TIMEOUT:-60}"
-  local submit_timeout="${OCTOS_TUI_UX_SUBMIT_TIMEOUT:-45}"
+  local ready_timeout="${OCTOSCODE_UX_COMPOSER_READY_TIMEOUT:-60}"
+  local submit_timeout="${OCTOSCODE_UX_SUBMIT_TIMEOUT:-45}"
 
   if ! wait_for_tui_composer_ready "$session" "$ready_timeout"; then
     log "TUI composer was not ready before $label"
@@ -968,9 +968,9 @@ send_codex_prompt() {
   local session="$1"
   local text="$2"
   tmux_key "$session" C-u
-  sleep "${OCTOS_TUI_UX_CODEX_CLEAR_GRACE_SECS:-0.2}"
+  sleep "${OCTOSCODE_UX_CODEX_CLEAR_GRACE_SECS:-0.2}"
   tmux_paste_line "$session" "$text"
-  sleep "${OCTOS_TUI_UX_CODEX_SUBMIT_GRACE_SECS:-1}"
+  sleep "${OCTOSCODE_UX_CODEX_SUBMIT_GRACE_SECS:-1}"
 }
 
 latest_codex_command_prompt_block() {
@@ -1020,7 +1020,7 @@ codex_deny_sudo_approval() {
     return 1
   fi
   tmux_key "$session" Escape
-  sleep "${OCTOS_TUI_UX_CODEX_DENIAL_GRACE_SECS:-2}"
+  sleep "${OCTOSCODE_UX_CODEX_DENIAL_GRACE_SECS:-2}"
   send_codex_prompt "$session" "Denied. Continue without sudo and finish the task."
   return 0
 }
@@ -1068,7 +1068,7 @@ wait_for_codex_sudo_approval_denial() {
 
 finish_session() {
   local session="$1"
-  if [ "${OCTOS_TUI_UX_KEEP_SESSIONS:-0}" = "1" ]; then
+  if [ "${OCTOSCODE_UX_KEEP_SESSIONS:-0}" = "1" ]; then
     log "kept tmux session: $session"
   else
     tmux_kill "$session"
@@ -1107,15 +1107,15 @@ drive_tui() {
   local styled_output_seen=0
   local test_rc=0
 
-  server_session="$(tmux_session_name octos-tui-server)"
-  tui_session="$(tmux_session_name octos-tui-client)"
+  server_session="$(tmux_session_name octoscode-server)"
+  tui_session="$(tmux_session_name octoscode-client)"
   endpoint="ws://127.0.0.1:$PORT/api/ui-protocol/ws"
-  server_fifo="$OUT_DIR/octos-tui-server-key.fifo"
-  server_runner="$OUT_DIR/run-octos-tui-server.sh"
+  server_fifo="$OUT_DIR/octoscode-server-key.fifo"
+  server_runner="$OUT_DIR/run-octoscode-server.sh"
   server_config="$OUT_DIR/octos-server-config.json"
-  transcript="$OUT_DIR/octos-tui-transcript.log"
-  raw_transcript="$OUT_DIR/octos-tui-raw-transcript.log"
-  server_log="$OUT_DIR/octos-tui-server.log"
+  transcript="$OUT_DIR/octoscode-transcript.log"
+  raw_transcript="$OUT_DIR/octoscode-raw-transcript.log"
+  server_log="$OUT_DIR/octoscode-server.log"
   : >"$transcript"
   : >"$raw_transcript"
 
@@ -1148,15 +1148,15 @@ EOF
     return 1
   fi
 
-  tui_command="cd '$OCTOS_TUI_DIR' && RUST_LOG=off '$tui_bin' --mode protocol --endpoint '$endpoint' --session '$SESSION_ID' --profile-id coding --cwd '$dir' --auth-token '$AUTH_TOKEN'"
+  tui_command="cd '$OCTOSCODE_DIR' && RUST_LOG=off '$tui_bin' --mode protocol --endpoint '$endpoint' --session '$SESSION_ID' --profile-id coding --cwd '$dir' --auth-token '$AUTH_TOKEN'"
   start_plain_session "$tui_session" "$tui_command"
-  start_frame_sampler "$tui_session" octos_tui
+  start_frame_sampler "$tui_session" octoscode
   frame_sampler_pid="$LAST_FRAME_SAMPLER_PID"
 
   wait_for_regex_soft "$tui_session" 'Protocol backend connected|Opened .*coding:local|app-ui octos-app-ui|Sessions' "$MAX_WAIT_SHORT" || true
-  if [ "${OCTOS_TUI_UX_ATTACH_GRACE_SECS:-0}" -gt 0 ]; then
+  if [ "${OCTOSCODE_UX_ATTACH_GRACE_SECS:-0}" -gt 0 ]; then
     log "attach now: tmux attach -r -t $tui_session"
-    sleep "${OCTOS_TUI_UX_ATTACH_GRACE_SECS:-0}"
+    sleep "${OCTOSCODE_UX_ATTACH_GRACE_SECS:-0}"
   fi
   if wait_for_regex_soft "$tui_session" 'Ask Octos to change code|›' 10 \
     && wait_for_regex_soft "$tui_session" 'Composer' 1 \
@@ -1178,20 +1178,20 @@ EOF
   if tui_style_escape_seen "$tui_session"; then
     styled_output_seen=1
   fi
-  append_capture_clean_to_file "$tui_session" "$transcript" "octos-tui connected"
-  append_capture_raw_to_file "$tui_session" "$raw_transcript" "octos-tui connected"
+  append_capture_clean_to_file "$tui_session" "$transcript" "octoscode connected"
+  append_capture_raw_to_file "$tui_session" "$raw_transcript" "octoscode connected"
 
   if ! send_tui_prompt "$tui_session" "$PROMPT_QUESTION" "question turn"; then
-    append_capture_clean_to_file "$tui_session" "$transcript" "octos-tui question submit failure"
+    append_capture_clean_to_file "$tui_session" "$transcript" "octoscode question submit failure"
   fi
   if wait_for_tui_regex_or_idle "$tui_session" "$QUESTION_REGEX" "$MAX_WAIT_TURN"; then
     question_seen=1
   fi
   wait_for_tui_turn_cycle "$tui_session" 240 || wait_for_tui_first_turn_complete "$tui_session" 60 || true
-  append_capture_clean_to_file "$tui_session" "$transcript" "octos-tui question turn"
+  append_capture_clean_to_file "$tui_session" "$transcript" "octoscode question turn"
 
   if ! send_tui_prompt "$tui_session" "$PROMPT_APPROVAL" "approval probe turn"; then
-    append_capture_clean_to_file "$tui_session" "$transcript" "octos-tui approval submit failure"
+    append_capture_clean_to_file "$tui_session" "$transcript" "octoscode approval submit failure"
   fi
   local approval_outcome=1
   set +e
@@ -1200,7 +1200,7 @@ EOF
   set -e
   if [ "$approval_outcome" -eq 0 ]; then
     approval_seen=1
-    append_capture_clean_to_file "$tui_session" "$transcript" "octos-tui approval prompt"
+    append_capture_clean_to_file "$tui_session" "$transcript" "octoscode approval prompt"
     tmux_key "$tui_session" "$TUI_DENY_KEY"
   elif [ "$approval_outcome" -eq 2 ]; then
     record_tui_missing_approval_prompt "$tui_session"
@@ -1209,21 +1209,21 @@ EOF
     denial_seen=1
   fi
   wait_for_tui_turn_cycle "$tui_session" "$MAX_WAIT_TURN" || true
-  append_capture_clean_to_file "$tui_session" "$transcript" "octos-tui approval turn"
+  append_capture_clean_to_file "$tui_session" "$transcript" "octoscode approval turn"
 
   if ! send_tui_prompt "$tui_session" "$PROMPT_CODING" "coding turn"; then
-    append_capture_clean_to_file "$tui_session" "$transcript" "octos-tui coding submit failure"
+    append_capture_clean_to_file "$tui_session" "$transcript" "octoscode coding submit failure"
   fi
   wait_for_tui_turn_cycle "$tui_session" "$MAX_WAIT_TURN" || true
-  append_capture_clean_to_file "$tui_session" "$transcript" "octos-tui coding turn"
+  append_capture_clean_to_file "$tui_session" "$transcript" "octoscode coding turn"
 
   local round=1
   while [ "$round" -le "$MAX_TUI_CODING_ROUNDS" ]; do
-    append_capture_clean_to_file "$tui_session" "$transcript" "octos-tui round $round"
+    append_capture_clean_to_file "$tui_session" "$transcript" "octoscode round $round"
     if tui_session_has_error_state "$tui_session"; then
       break
     fi
-    if candidate_has_diff "$dir" && candidate_tests_pass_live octos_tui "$dir" "round-$round"; then
+    if candidate_has_diff "$dir" && candidate_tests_pass_live octoscode "$dir" "round-$round"; then
       completion_seen=1
       break
     fi
@@ -1233,10 +1233,10 @@ EOF
     fi
 
     if ! send_tui_prompt "$tui_session" "$PROMPT_CONTINUE" "continue round $round"; then
-      append_capture_clean_to_file "$tui_session" "$transcript" "octos-tui continue submit failure $round"
+      append_capture_clean_to_file "$tui_session" "$transcript" "octoscode continue submit failure $round"
     fi
     wait_for_tui_turn_cycle "$tui_session" "$MAX_WAIT_TURN" || true
-    append_capture_clean_to_file "$tui_session" "$transcript" "octos-tui continue round $round"
+    append_capture_clean_to_file "$tui_session" "$transcript" "octoscode continue round $round"
     if tui_session_has_error_state "$tui_session"; then
       break
     fi
@@ -1245,23 +1245,23 @@ EOF
 
   if [ "$LONG_MODE" = "1" ] && [ "$completion_seen" -eq 1 ]; then
     if ! send_tui_prompt "$tui_session" "$PROMPT_STEERING" "long steering turn"; then
-      append_capture_clean_to_file "$tui_session" "$transcript" "octos-tui long steering submit failure"
+      append_capture_clean_to_file "$tui_session" "$transcript" "octoscode long steering submit failure"
     fi
     wait_for_tui_turn_cycle "$tui_session" "$MAX_WAIT_TURN" || true
-    append_capture_clean_to_file "$tui_session" "$transcript" "octos-tui long steering turn"
-    if ! candidate_tests_pass_live octos_tui "$dir" "long-steering"; then
+    append_capture_clean_to_file "$tui_session" "$transcript" "octoscode long steering turn"
+    if ! candidate_tests_pass_live octoscode "$dir" "long-steering"; then
       completion_seen=0
     fi
 
     if ! send_tui_prompt "$tui_session" "$PROMPT_INTERRUPT" "long interrupt turn"; then
-      append_capture_clean_to_file "$tui_session" "$transcript" "octos-tui interrupt submit failure"
+      append_capture_clean_to_file "$tui_session" "$transcript" "octoscode interrupt submit failure"
     else
-      sleep "${OCTOS_TUI_UX_INTERRUPT_AFTER_SECS:-8}"
+      sleep "${OCTOSCODE_UX_INTERRUPT_AFTER_SECS:-8}"
       tmux_key "$tui_session" C-c
       if wait_for_tui_interrupt_ack "$tui_session" 180; then
         interrupt_seen=1
       fi
-      append_capture_clean_to_file "$tui_session" "$transcript" "octos-tui interrupt turn"
+      append_capture_clean_to_file "$tui_session" "$transcript" "octoscode interrupt turn"
       wait_for_tui_composer_ready "$tui_session" 60 || true
     fi
 
@@ -1270,20 +1270,20 @@ EOF
     tmux_kill "$tui_session"
     sleep 1
     start_plain_session "$tui_session" "$tui_command"
-    start_frame_sampler "$tui_session" octos_tui
+    start_frame_sampler "$tui_session" octoscode
     frame_sampler_pid="$LAST_FRAME_SAMPLER_PID"
     if wait_for_regex_soft "$tui_session" 'Protocol backend connected|Opened .*coding:local|app-ui octos-app-ui|Sessions|Composer|›' "$MAX_WAIT_SHORT"; then
       reconnect_seen=1
     fi
-    append_capture_clean_to_file "$tui_session" "$transcript" "octos-tui reconnect"
-    append_capture_raw_to_file "$tui_session" "$raw_transcript" "octos-tui reconnect"
+    append_capture_clean_to_file "$tui_session" "$transcript" "octoscode reconnect"
+    append_capture_raw_to_file "$tui_session" "$raw_transcript" "octoscode reconnect"
 
     if ! send_tui_prompt "$tui_session" "$PROMPT_RECONNECT" "long reconnect turn"; then
-      append_capture_clean_to_file "$tui_session" "$transcript" "octos-tui reconnect submit failure"
+      append_capture_clean_to_file "$tui_session" "$transcript" "octoscode reconnect submit failure"
     fi
     wait_for_tui_turn_cycle "$tui_session" "$MAX_WAIT_TURN" || true
-    append_capture_clean_to_file "$tui_session" "$transcript" "octos-tui reconnect turn"
-    if ! candidate_tests_pass_live octos_tui "$dir" "reconnect"; then
+    append_capture_clean_to_file "$tui_session" "$transcript" "octoscode reconnect turn"
+    if ! candidate_tests_pass_live octoscode "$dir" "reconnect"; then
       completion_seen=0
     fi
   fi
@@ -1297,16 +1297,16 @@ EOF
     fi
     if [ "$(summary_bool_from_grep_filtered "$transcript" 'Session Summary|Session summary|Files changed|Validation|All [0-9]+ tests pass|all .*tests pass')" != "1" ]; then
       if ! send_tui_prompt "$tui_session" "$summary_prompt" "$summary_label"; then
-        append_capture_clean_to_file "$tui_session" "$transcript" "octos-tui summary submit failure"
+        append_capture_clean_to_file "$tui_session" "$transcript" "octoscode summary submit failure"
       fi
       wait_for_tui_turn_cycle "$tui_session" "$MAX_WAIT_TURN" || true
-      append_capture_clean_to_file "$tui_session" "$transcript" "octos-tui $summary_label"
+      append_capture_clean_to_file "$tui_session" "$transcript" "octoscode $summary_label"
     fi
   fi
 
-  append_capture_clean_to_file "$tui_session" "$transcript" "octos-tui final"
-  append_capture_raw_to_file "$tui_session" "$raw_transcript" "octos-tui final"
-  frames_seen="$(frame_count_for_lane octos_tui)"
+  append_capture_clean_to_file "$tui_session" "$transcript" "octoscode final"
+  append_capture_raw_to_file "$tui_session" "$raw_transcript" "octoscode final"
+  frames_seen="$(frame_count_for_lane octoscode)"
   server_errors="$(server_error_count "$server_log")"
   if ! tmux_pane_alive "$tui_session"; then
     client_alive_seen=0
@@ -1315,7 +1315,7 @@ EOF
     fake_cursor_absent=0
   fi
   stop_frame_sampler "$frame_sampler_pid"
-  if lane_style_escape_seen octos_tui "$tui_session"; then
+  if lane_style_escape_seen octoscode "$tui_session"; then
     styled_output_seen=1
   fi
   tmux_key "$tui_session" C-q
@@ -1323,9 +1323,9 @@ EOF
   finish_session "$tui_session"
   finish_session "$server_session"
 
-  validate_candidate octos_tui "$dir" || test_rc=$?
-  write_candidate_artifacts octos_tui "$dir"
-  write_lane_summary octos_tui "$transcript" "$dir" "$question_seen" "$approval_seen" \
+  validate_candidate octoscode "$dir" || test_rc=$?
+  write_candidate_artifacts octoscode "$dir"
+  write_lane_summary octoscode "$transcript" "$dir" "$question_seen" "$approval_seen" \
     "$denial_seen" "$completion_seen" "$panes_seen" "$status_seen" "$test_rc" \
     "$client_alive_seen" "$fake_cursor_absent" "$native_cursor_composer_seen" "$styled_output_seen" \
     "$reconnect_seen" "$interrupt_seen" "$server_errors" "$frames_seen"
@@ -1451,7 +1451,7 @@ drive_codex() {
     fi
 
     send_codex_prompt "$session" "$PROMPT_INTERRUPT"
-    sleep "${OCTOS_TUI_UX_INTERRUPT_AFTER_SECS:-8}"
+    sleep "${OCTOSCODE_UX_INTERRUPT_AFTER_SECS:-8}"
     tmux_key "$session" C-c
     if wait_for_codex_signal "$session" 'interrupt|interrupted|cancelled|canceled|›|OpenAI Codex' 180; then
       interrupt_seen=1
@@ -1555,7 +1555,7 @@ plan_seen_for_lane() {
     return 0
   fi
 
-  if [ "$name" = "octos_tui" ] && lane_frame_grep octos_tui "$regex"; then
+  if [ "$name" = "octoscode" ] && lane_frame_grep octoscode "$regex"; then
     printf '1'
     return 0
   fi
@@ -1563,22 +1563,22 @@ plan_seen_for_lane() {
   printf '0'
 }
 
-octos_tui_inline_diff_seen() {
+octoscode_inline_diff_seen() {
   local transcript="$1"
   summary_bool_from_grep_filtered "$transcript" 'diff --git|(^|[[:space:]])@@|(^|[[:space:]])---[[:space:]]|(^|[[:space:]])\+\+\+[[:space:]]|Requested diff preview|Diff Preview|inline diff|diff_edit|apply_patch|^[[:space:]]*[-+][[:space:]]+[-+][[:space:]]+[0-9]+|^[[:space:]]*[-+][[:space:]]+-[[:space:]]+[0-9]+'
 }
 
-octos_tui_command_output_seen() {
+octoscode_command_output_seen() {
   local transcript="$1"
   summary_bool_from_grep_filtered "$transcript" 'Finished .*test.* profile|Running unittests|Running tests|test result:|stdout|stderr|exit status|command[[:space:]]+sudo true|kind[[:space:]]+command|Approval probe:|Sudo denied'
 }
 
-octos_tui_approval_card_seen() {
+octoscode_approval_card_seen() {
   local transcript="$1"
   summary_bool_from_grep_filtered "$transcript" 'Approval Requested|kind[[:space:]]+command|command[[:space:]]+sudo true|sudo true'
 }
 
-octos_tui_no_overlay_required() {
+octoscode_no_overlay_required() {
   local transcript="$1"
   local inline_diff_seen="$2"
 
@@ -1590,7 +1590,7 @@ octos_tui_no_overlay_required() {
   summary_bool_without_grep_filtered "$transcript" 'press[[:space:]]+d|d[[:space:]]+to[[:space:]]+(view|open)[[:space:]]+diff|open[[:space:]]+diff[[:space:]]+overlay|diff[[:space:]]+overlay|diff[[:space:]]+modal|modal[[:space:]]+diff'
 }
 
-octos_tui_chat_first_layout_seen() {
+octoscode_chat_first_layout_seen() {
   local transcript="$1"
 
   if ! grep -E -q -- 'Composer' "$transcript" 2>/dev/null \
@@ -1668,13 +1668,13 @@ write_lane_summary() {
   plan_seen="$(plan_seen_for_lane "$name" "$transcript")"
   summary_seen="$(summary_seen_for_lane "$transcript" "$test_rc" "$diff_bytes")"
 
-  if [ "$name" = "octos_tui" ]; then
+  if [ "$name" = "octoscode" ]; then
     trace_log_absent="$(summary_bool_without_grep_filtered "$transcript" 'INFO calling LLM|parallel_tools|result_sizes|tool_ids=')"
-    inline_diff_seen="$(octos_tui_inline_diff_seen "$transcript")"
-    command_output_seen="$(octos_tui_command_output_seen "$transcript")"
-    approval_card_seen="$(octos_tui_approval_card_seen "$transcript")"
-    no_overlay_required="$(octos_tui_no_overlay_required "$transcript" "$inline_diff_seen")"
-    chat_first_layout_seen="$(octos_tui_chat_first_layout_seen "$transcript")"
+    inline_diff_seen="$(octoscode_inline_diff_seen "$transcript")"
+    command_output_seen="$(octoscode_command_output_seen "$transcript")"
+    approval_card_seen="$(octoscode_approval_card_seen "$transcript")"
+    no_overlay_required="$(octoscode_no_overlay_required "$transcript" "$inline_diff_seen")"
+    chat_first_layout_seen="$(octoscode_chat_first_layout_seen "$transcript")"
   fi
 
   if [ "$diff_bytes" -le 0 ] \
@@ -1689,20 +1689,20 @@ write_lane_summary() {
     || [ "$status_seen" -ne 1 ]; then
     status="fail"
   fi
-  if [ "$name" = "octos_tui" ] && [ "$trace_log_absent" -ne 1 ]; then
+  if [ "$name" = "octoscode" ] && [ "$trace_log_absent" -ne 1 ]; then
     status="fail"
   fi
-  if [ "$name" = "octos_tui" ] && [ "$chat_first_layout_seen" -ne 1 ]; then
+  if [ "$name" = "octoscode" ] && [ "$chat_first_layout_seen" -ne 1 ]; then
     status="fail"
   fi
-  if [ "$name" = "octos_tui" ] \
+  if [ "$name" = "octoscode" ] \
     && { [ "$client_alive_seen" -ne 1 ] \
       || [ "$fake_cursor_absent" -ne 1 ] \
       || [ "$native_cursor_composer_seen" -ne 1 ] \
       || [ "$styled_output_seen" -ne 1 ]; }; then
     status="fail"
   fi
-  if [ "$LONG_MODE" = "1" ] && [ "$name" = "octos_tui" ] \
+  if [ "$LONG_MODE" = "1" ] && [ "$name" = "octoscode" ] \
     && { [ "$reconnect_seen" -ne 1 ] \
       || [ "$interrupt_seen" -ne 1 ] \
       || [ "$server_errors" -gt "$SERVER_ERROR_BUDGET" ]; }; then
@@ -1727,7 +1727,7 @@ write_lane_summary() {
     printf '%s.summary_seen=%s\n' "$name" "$summary_seen"
     printf '%s.panes_seen=%s\n' "$name" "$panes_seen"
     printf '%s.status_seen=%s\n' "$name" "$status_seen"
-    if [ "$name" = "octos_tui" ]; then
+    if [ "$name" = "octoscode" ]; then
       printf '%s.inline_diff_seen=%s\n' "$name" "$inline_diff_seen"
       printf '%s.command_output_seen=%s\n' "$name" "$command_output_seen"
       printf '%s.approval_card_seen=%s\n' "$name" "$approval_card_seen"
@@ -1754,35 +1754,35 @@ run_self_tests() {
   local transcript
   local frame_dir
 
-  test_root="$(mktemp -d "${TMPDIR:-/tmp}/octos-tui-ux-harness-test.XXXXXX")"
+  test_root="$(mktemp -d "${TMPDIR:-/tmp}/octoscode-ux-harness-test.XXXXXX")"
   OUT_DIR="$test_root"
   transcript="$OUT_DIR/transcript.log"
-  frame_dir="$OUT_DIR/frames/octos_tui"
+  frame_dir="$OUT_DIR/frames/octoscode"
   mkdir -p "$frame_dir"
 
   printf '  › State a short coding plan with checkbox steps.\n' >"$transcript"
-  if [ "$(plan_seen_for_lane octos_tui "$transcript")" != "0" ]; then
+  if [ "$(plan_seen_for_lane octoscode "$transcript")" != "0" ]; then
     printf 'self-test failed: prompt echo should not count as plan evidence\n' >&2
     rm -rf "$test_root"
     return 1
   fi
 
   printf '  Plan  live\n    [ ] 1. Run cargo test\n' >"$frame_dir/frame-00001.clean.log"
-  if [ "$(plan_seen_for_lane octos_tui "$transcript")" != "1" ]; then
+  if [ "$(plan_seen_for_lane octoscode "$transcript")" != "1" ]; then
     printf 'self-test failed: sampled frame plan evidence was not counted\n' >&2
     rm -rf "$test_root"
     return 1
   fi
 
   printf 'plain frame\n' >"$frame_dir/frame-00001.raw.log"
-  if lane_style_escape_seen octos_tui; then
+  if lane_style_escape_seen octoscode; then
     printf 'self-test failed: plain frame should not count as styled output\n' >&2
     rm -rf "$test_root"
     return 1
   fi
 
   printf '\033[38;2;110;188;255mstyled\033[0m\n' >"$frame_dir/frame-00002.raw.log"
-  if ! lane_style_escape_seen octos_tui; then
+  if ! lane_style_escape_seen octoscode; then
     printf 'self-test failed: raw frame ANSI style evidence was not counted\n' >&2
     rm -rf "$test_root"
     return 1
@@ -1790,7 +1790,7 @@ run_self_tests() {
 
   RESOLVED_SERVER_SANDBOX_MODE="outer-sandbox-fallback"
   mkdir -p "$OUT_DIR/candidate"
-  maybe_write_harness_server_config octos_tui "$OUT_DIR/candidate"
+  maybe_write_harness_server_config octoscode "$OUT_DIR/candidate"
   if ! grep -F -q '"permission_mode": "danger-full-access"' "$OUT_DIR/candidate/.octos/config.json"; then
     printf 'self-test failed: outer sandbox fallback config was not written\n' >&2
     rm -rf "$test_root"
@@ -1802,7 +1802,7 @@ run_self_tests() {
 }
 
 main() {
-  if [ "${OCTOS_TUI_UX_SELF_TEST:-0}" = "1" ]; then
+  if [ "${OCTOSCODE_UX_SELF_TEST:-0}" = "1" ]; then
     run_self_tests
     return $?
   fi
@@ -1813,7 +1813,7 @@ main() {
   require_fixture
 
   if [ -z "${!API_KEY_ENV:-}" ]; then
-    printf '%s is required for live octos-tui UX comparison runs with provider=%s model=%s.\n' \
+    printf '%s is required for live octoscode UX comparison runs with provider=%s model=%s.\n' \
       "$API_KEY_ENV" "$PROVIDER" "$MODEL" >&2
     exit 2
   fi
@@ -1842,7 +1842,7 @@ main() {
   log "fixture: $FIXTURE_DIR"
   log "long mode: $LONG_MODE"
   log "server sandbox mode: $RESOLVED_SERVER_SANDBOX_MODE"
-  log "octos-tui session: $(tmux_session_name octos-tui-client)"
+  log "octoscode session: $(tmux_session_name octoscode-client)"
   log "codex session: $(tmux_session_name codex-client)"
 
   local tui_rc=0
@@ -1853,7 +1853,7 @@ main() {
   if [ "$RUN_TUI" = "1" ]; then
     octos_bin="$(resolve_octos_bin)"
     tui_bin="$(resolve_tui_bin)"
-    drive_tui "$(prepare_candidate octos_tui)" "$octos_bin" "$tui_bin" || tui_rc=$?
+    drive_tui "$(prepare_candidate octoscode)" "$octos_bin" "$tui_bin" || tui_rc=$?
   fi
 
   if [ "$RUN_CODEX" = "1" ]; then
@@ -1890,7 +1890,7 @@ main() {
     printf 'max_tui_coding_rounds=%s\n' "$MAX_TUI_CODING_ROUNDS"
     printf 'model=%s\n' "$MODEL"
     printf 'port=%s\n' "$PORT"
-    printf 'octos_tui_rc=%s\n' "$tui_rc"
+    printf 'octoscode_rc=%s\n' "$tui_rc"
     printf 'codex_rc=%s\n' "$codex_rc"
   } >>"$OUT_DIR/summary.env"
 
@@ -1902,7 +1902,7 @@ main() {
   fi
 }
 
-if [ "${OCTOS_TUI_UX_DETECTOR_SELF_TEST:-0}" = "1" ]; then
+if [ "${OCTOSCODE_UX_DETECTOR_SELF_TEST:-0}" = "1" ]; then
   run_detector_self_test
   exit $?
 fi

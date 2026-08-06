@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-OCTOS_TUI_DIR="${OCTOS_TUI_DIR:-$ROOT_DIR/../octos-tui}"
+OCTOSCODE_DIR="${OCTOSCODE_DIR:-$ROOT_DIR/../octoscode}"
 
 # shellcheck source=../../scripts/tmux-cli-driver.sh
 if [ -f "$ROOT_DIR/scripts/tmux-cli-driver.sh" ]; then
@@ -364,23 +364,23 @@ else
   exit 2
 fi
 
-OCTOS_TUI_BIN_CMD=""
+OCTOSCODE_BIN_CMD=""
 
-resolve_octos_tui_bin_cmd() {
-  if [ -n "$OCTOS_TUI_BIN_CMD" ]; then
+resolve_octoscode_bin_cmd() {
+  if [ -n "$OCTOSCODE_BIN_CMD" ]; then
     return 0
   fi
 
-  if [ -n "${OCTOS_TUI_BIN:-}" ]; then
-    OCTOS_TUI_BIN_CMD="$OCTOS_TUI_BIN"
-  elif [ -f "$OCTOS_TUI_DIR/Cargo.toml" ]; then
-    OCTOS_TUI_BIN_CMD="cargo run --manifest-path $(printf '%q' "$OCTOS_TUI_DIR/Cargo.toml") --"
-  elif [ -x "$OCTOS_TUI_DIR/target/debug/octos-tui" ]; then
-    OCTOS_TUI_BIN_CMD="$OCTOS_TUI_DIR/target/debug/octos-tui"
-  elif [ -x "$ROOT_DIR/target/debug/octos-tui" ]; then
-    OCTOS_TUI_BIN_CMD="$ROOT_DIR/target/debug/octos-tui"
+  if [ -n "${OCTOSCODE_BIN:-}" ]; then
+    OCTOSCODE_BIN_CMD="$OCTOSCODE_BIN"
+  elif [ -f "$OCTOSCODE_DIR/Cargo.toml" ]; then
+    OCTOSCODE_BIN_CMD="cargo run --manifest-path $(printf '%q' "$OCTOSCODE_DIR/Cargo.toml") --"
+  elif [ -x "$OCTOSCODE_DIR/target/debug/octoscode" ]; then
+    OCTOSCODE_BIN_CMD="$OCTOSCODE_DIR/target/debug/octoscode"
+  elif [ -x "$ROOT_DIR/target/debug/octoscode" ]; then
+    OCTOSCODE_BIN_CMD="$ROOT_DIR/target/debug/octoscode"
   else
-    echo "Unable to locate standalone octos-tui. Set OCTOS_TUI_BIN or OCTOS_TUI_DIR." >&2
+    echo "Unable to locate standalone octoscode. Set OCTOSCODE_BIN or OCTOSCODE_DIR." >&2
     exit 2
   fi
 }
@@ -425,7 +425,7 @@ run_tui_mock() {
   local name="mock-tui"
   local session
   session="$(tmux_session_name "$name")"
-  tmux_new_default "$session" bash -lc "$OCTOS_TUI_BIN_CMD --mode mock"
+  tmux_new_default "$session" bash -lc "$OCTOSCODE_BIN_CMD --mode mock"
   tmux_wait_for "$session" "Opened coding:local:prototype#m9|Ask Octos to change code" 45
   tmux_assert_capture "$session" "Opened coding:local:prototype#m9|Ask Octos to change code"
   tmux_assert_capture "$session" "Composer"
@@ -456,7 +456,7 @@ run_tui_mock_approval_kind() {
   local session
   session="$(tmux_session_name "$name")"
   tmux_new_default "$session" bash -lc \
-    "OCTOS_TUI_MOCK_APPROVAL_KIND=$(shell_quote "$kind") $OCTOS_TUI_BIN_CMD --mode mock"
+    "OCTOSCODE_MOCK_APPROVAL_KIND=$(shell_quote "$kind") $OCTOSCODE_BIN_CMD --mode mock"
   tmux_wait_for "$session" "Opened coding:local:prototype#m9|Ask Octos to change code" 45
   tmux_send "$session" "approval ${kind}"
   tmux_key "$session" Enter
@@ -483,7 +483,7 @@ run_tui_protocol_readonly() {
   local capture
   session="$(tmux_session_name "$name")"
   tmux_new_default "$session" bash -lc \
-    "$OCTOS_TUI_BIN_CMD --mode protocol --endpoint ws://127.0.0.1:9/api/ui-protocol/ws --session 'coding:local:prototype#m9' --profile-id coding --auth-token '$OCTOS_TMUX_AUTH_TOKEN' --readonly"
+    "$OCTOSCODE_BIN_CMD --mode protocol --endpoint ws://127.0.0.1:9/api/ui-protocol/ws --session 'coding:local:prototype#m9' --profile-id coding --auth-token '$OCTOS_TMUX_AUTH_TOKEN' --readonly"
   tmux_wait_for "$session" "read-only|no network connection opened|Protocol backend read-only" 45
   tmux_assert_capture "$session" "Protocol backend read-only|no network connection ope"
   tmux_assert_capture "$session" "read-only"
@@ -613,15 +613,15 @@ NODE"
 
 run_default() {
   tmux_require
-  resolve_octos_tui_bin_cmd
+  resolve_octoscode_bin_cmd
   tmux_init_artifacts
   tmux_log "artifacts: $OCTOS_TMUX_ARTIFACT_DIR"
 
   run_line_capture "octos-help" "$OCTOS_BIN_CMD --help" "Usage: octos" "Commands:" "serve"
   run_line_capture \
-    "octos-tui-help" \
-    "$OCTOS_TUI_BIN_CMD --help" \
-    "Usage: octos-tui" \
+    "octoscode-help" \
+    "$OCTOSCODE_BIN_CMD --help" \
+    "Usage: octoscode" \
     "--mode" \
     "--endpoint" \
     "--session" \
@@ -637,8 +637,8 @@ run_default() {
   run_tui_mock_approval_kind "sandbox_escalation" "danger-full-access"
   run_tui_protocol_readonly
   run_line_expect_failure \
-    "octos-tui-bad-endpoint" \
-    "$OCTOS_TUI_BIN_CMD --mode protocol --endpoint https://example.test/ui-protocol --readonly" \
+    "octoscode-bad-endpoint" \
+    "$OCTOSCODE_BIN_CMD --mode protocol --endpoint https://example.test/ui-protocol --readonly" \
     "endpoint must be a WebSocket URL"
 
   tmux_assert_no_registered_sessions
@@ -648,7 +648,7 @@ run_default() {
 
 run_live() {
   tmux_require
-  resolve_octos_tui_bin_cmd
+  resolve_octoscode_bin_cmd
   if [ "${OCTOS_TMUX_LIVE:-0}" != "1" ]; then
     tmux_log "SKIP: live lane requires OCTOS_TMUX_LIVE=1"
     exit 0
@@ -672,7 +672,7 @@ run_live() {
   server_session="$(tmux_session_name "live-server")"
   tui_session="$(tmux_session_name "live-tui")"
   server_cmd="$OCTOS_BIN_CMD serve --host $(shell_quote "$host") --port $(shell_quote "$port") --data-dir $(shell_quote "$data_dir") --cwd $(shell_quote "$ROOT_DIR") --auth-token $(shell_quote "$OCTOS_TMUX_AUTH_TOKEN")"
-  tui_cmd="$OCTOS_TUI_BIN_CMD --mode protocol --endpoint $(shell_quote "$endpoint") --cwd $(shell_quote "$ROOT_DIR") --auth-token $(shell_quote "$OCTOS_TMUX_AUTH_TOKEN")"
+  tui_cmd="$OCTOSCODE_BIN_CMD --mode protocol --endpoint $(shell_quote "$endpoint") --cwd $(shell_quote "$ROOT_DIR") --auth-token $(shell_quote "$OCTOS_TMUX_AUTH_TOKEN")"
   if [ -n "$session_id" ]; then
     tui_cmd="$tui_cmd --session $(shell_quote "$session_id") --profile-id $(shell_quote "$profile_id")"
   fi

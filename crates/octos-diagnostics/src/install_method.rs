@@ -1,6 +1,6 @@
 //! Install-method detection, product-agnostic.
 //!
-//! Ported from octos-tui's `install_method.rs`, but every product-specific
+//! Ported from octoscode's `install_method.rs`, but every product-specific
 //! string (formula, package, repo, crate) now comes from the [`ProductSpec`]
 //! rather than being hardcoded. The path classifier ([`classify_path`]) stays
 //! pure/testable; [`detect`] wires it to the live host.
@@ -378,7 +378,7 @@ mod tests {
     #[test]
     fn should_classify_usr_local_as_unknown_when_no_brew_present() {
         // No brew present → `/usr/local` is NOT a brew prefix → Unknown (avoids
-        // printing a wrong `brew upgrade`). Mirrors octos-tui finding #1.
+        // printing a wrong `brew upgrade`). Mirrors octoscode finding #1.
         let i = input("/usr/local/bin/octos");
         assert_eq!(classify_path(&i), InstallMethod::Unknown);
     }

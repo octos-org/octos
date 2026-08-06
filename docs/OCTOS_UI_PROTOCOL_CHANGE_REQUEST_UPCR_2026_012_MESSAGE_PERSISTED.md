@@ -147,7 +147,7 @@ Capability feature: `event.message_persisted.v1`
 
 ### Client-side
 
-- TUI fixture at `octos-tui/tests/...`: subscribe to `message/persisted`, assert the message-list view stays consistent with `session/hydrate` after disconnect/reconnect.
+- TUI fixture at `octoscode/tests/...`: subscribe to `message/persisted`, assert the message-list view stays consistent with `session/hydrate` after disconnect/reconnect.
 - Layer 1 SPA fixture (PR H): every fixture asserts that `message/persisted` events arrive in the expected order with the expected `(turn_id, thread_id, seq)` tuples. The `rapid-fire-five-fast` fixture in particular asserts no row is mis-routed to a sibling thread.
 
 ### Wire contract

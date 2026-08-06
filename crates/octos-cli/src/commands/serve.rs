@@ -474,12 +474,12 @@ async fn bind_http_listener(
 }
 
 /// Stable, machine-greppable marker embedded in the "data directory is already
-/// owned by another serve" error. octos-tui (a separate repo) spawns
+/// owned by another serve" error. octoscode (a separate repo) spawns
 /// `octos serve --stdio` as a child and greps its stderr for this exact token
 /// on child-exit to recognize the single-writer conflict and STOP relaunching —
 /// instead of the silent ~5s crash-loop it used to hit when the second serve
 /// died mid-startup opening `admin_audit.redb`. MUST stay byte-stable: the
-/// client matches it verbatim (octos-tui `transport.rs` DATA_DIR_LOCKED_MARKER).
+/// client matches it verbatim (octoscode `transport.rs` DATA_DIR_LOCKED_MARKER).
 pub(crate) const DATA_DIR_LOCKED_MARKER: &str = "OCTOS_DATA_DIR_LOCKED";
 
 /// Held for the serve process's whole lifetime: an exclusive OS advisory lock
@@ -516,7 +516,7 @@ fn acquire_serve_data_dir_lock(data_dir: &std::path::Path) -> Result<ServeDataDi
         Err(error) if error.raw_os_error() == fs2::lock_contended_error().raw_os_error() => {
             Err(eyre::eyre!(
                 "{DATA_DIR_LOCKED_MARKER}: another octos server is already running for this data \
-                 directory ({}). Close the other octos-tui (or `octos serve`), or start this one \
+                 directory ({}). Close the other octoscode (or `octos serve`), or start this one \
                  against a different --data-dir.",
                 data_dir.display()
             ))
@@ -601,7 +601,7 @@ impl ServeCommand {
             Ok(guard) => guard,
             Err(error) => {
                 if error.to_string().contains(DATA_DIR_LOCKED_MARKER) {
-                    // A guaranteed clean, un-colored stderr line the octos-tui
+                    // A guaranteed clean, un-colored stderr line the octoscode
                     // client greps on child-exit (color-eyre's rendering of the
                     // returned error may interleave ANSI, so don't rely on it).
                     eprintln!(
@@ -1848,7 +1848,7 @@ mod tests {
         // `--stdio` runs session actors in-process with no gateway to
         // proxy `task/cancel` to, so the store must be present for the
         // per-turn supervisor to self-register into — otherwise AppUI
-        // task commands fail `runtime_unavailable` and octos-tui Esc/`x`
+        // task commands fail `runtime_unavailable` and octoscode Esc/`x`
         // cannot cancel a spawned background task (the reported bug).
         assert!(
             stdio_task_query_store(true).is_some(),

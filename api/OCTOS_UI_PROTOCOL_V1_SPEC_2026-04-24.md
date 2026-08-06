@@ -4,7 +4,7 @@ Status: draft spec for `M9.1`.
 
 Sprint: `coding-green`
 
-This is the first protocol document for the M9 control-plane layer. It is intentionally narrower than the eventual end-state. The goal is to define one client/runtime boundary that both `octos-tui` and future server work can target without baking unresolved M8 runtime defects into the contract.
+This is the first protocol document for the M9 control-plane layer. It is intentionally narrower than the eventual end-state. The goal is to define one client/runtime boundary that both `octoscode` and future server work can target without baking unresolved M8 runtime defects into the contract.
 
 Code sketch:
 
@@ -13,7 +13,7 @@ Code sketch:
 Related planning:
 
 - [OCTOS_M9_ISSUE_STACK_2026-04-24.md](../docs/OCTOS_M9_ISSUE_STACK_2026-04-24.md)
-- [OCTOS_TUI_ARCHITECTURE_2026-04-24.md](../docs/OCTOS_TUI_ARCHITECTURE_2026-04-24.md)
+- [OCTOSCODE_ARCHITECTURE_2026-04-24.md](../docs/OCTOSCODE_ARCHITECTURE_2026-04-24.md)
 - [OCTOS_M8_FIX_FIRST_CHECKLIST_2026-04-24.md](../docs/OCTOS_M8_FIX_FIRST_CHECKLIST_2026-04-24.md)
 
 ## 1. Goals
@@ -1100,7 +1100,7 @@ Clients must use that method list to enable or disable slash commands.
   ```json
   {
     "transport": "stdio",
-    "client": { "name": "octos-tui" },
+    "client": { "name": "octoscode" },
     "supported_features": [
       "approval.typed.v1",
       "session.workspace_cwd.v1",
@@ -1116,7 +1116,7 @@ Clients must use that method list to enable or disable slash commands.
     "type": "server_hello",
     "transport": "stdio",
     "client_transport": "stdio",
-    "client": { "name": "octos-tui" },
+    "client": { "name": "octoscode" },
     "capabilities": {
       "version": {
         "protocol": "octos-ui/v1alpha1",
@@ -2316,7 +2316,7 @@ See [OCTOS_M8_FIX_FIRST_CHECKLIST_2026-04-24.md](../docs/OCTOS_M8_FIX_FIRST_CHEC
 ## 13. Immediate Next Steps
 
 1. Keep the shared Rust types in `octos-core` aligned with this doc.
-2. Build the mock `octos-tui` scaffold against these draft types.
+2. Build the mock `octoscode` scaffold against these draft types.
 3. When M8 fixes land, start server-side `M9.1` transport wiring against the same shapes.
 
 ## 14. M9-γ Envelope

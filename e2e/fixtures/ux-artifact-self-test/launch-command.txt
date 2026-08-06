@@ -1,1 +1,1 @@
-octos-tui --mode protocol --stdio-command 'octos serve --stdio'
+octoscode --mode protocol --stdio-command 'octos serve --stdio'

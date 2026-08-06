@@ -5,7 +5,7 @@ script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd "$script_dir/../.." && pwd)"
 
 run_id="${OCTOS_M16_CONTEXT_TMUX_RUN_ID:-m16-context-reconnect-tmux-$(date -u +%Y%m%dT%H%M%SZ)}"
-tui_repo="${OCTOS_TUI_REPO:-/Users/yuechen/home/octos-tui}"
+tui_repo="${OCTOSCODE_REPO:-/Users/yuechen/home/octoscode}"
 tui_runner="${OCTOS_M16_CONTEXT_TUI_RUNNER:-$tui_repo/scripts/run-m15-live-tmux-ux-soak.sh}"
 out_root="${OCTOS_M16_CONTEXT_TMUX_OUT_ROOT:-$repo_root/e2e/test-results-m16-context-restart-tmux}"
 out_dir="${OCTOS_M16_CONTEXT_TMUX_OUT_DIR:-$out_root/$run_id}"
@@ -13,7 +13,7 @@ runtime_root="${OCTOS_M16_CONTEXT_TMUX_RUNTIME_ROOT:-/tmp/octos-m16-context-tmux
 bootstrap_dir="$out_dir/bootstrap-stdio"
 replay_file="$out_dir/context-reconnect-replay.txt"
 octos_bin="${OCTOS_BIN:-$repo_root/target/debug/octos}"
-tui_bin="${OCTOS_TUI_BIN:-$tui_repo/target/debug/octos-tui}"
+tui_bin="${OCTOSCODE_BIN:-$tui_repo/target/debug/octoscode}"
 session_name="${OCTOS_M16_CONTEXT_TMUX_SESSION:-octos-m16-context-$run_id}"
 
 usage() {
@@ -21,7 +21,7 @@ usage() {
 Usage: e2e/scripts/m16-context-restart-tmux-soak.sh <run|self-test|help>
 
 Creates a compacted ContextManager checkpoint with a direct stdio soak, then
-launches real octos-tui in tmux against a restarted octos serve --stdio backend
+launches real octoscode in tmux against a restarted octos serve --stdio backend
 and captures /status context visual evidence.
 USAGE
 }
@@ -46,11 +46,11 @@ ensure_binaries() {
     (cd "$repo_root" && cargo build -p octos-cli --bin octos --features api)
   fi
   if [[ "${OCTOS_M16_CONTEXT_BUILD_TUI:-0}" == "1" || ! -x "$tui_bin" ]]; then
-    (cd "$tui_repo" && cargo build --bin octos-tui)
+    (cd "$tui_repo" && cargo build --bin octoscode)
   fi
   [[ -x "$octos_bin" ]] || die "octos binary is not executable: $octos_bin"
-  [[ -x "$tui_bin" ]] || die "octos-tui binary is not executable: $tui_bin"
-  [[ -x "$tui_runner" ]] || die "octos-tui tmux runner is not executable: $tui_runner"
+  [[ -x "$tui_bin" ]] || die "octoscode binary is not executable: $tui_bin"
+  [[ -x "$tui_runner" ]] || die "octoscode tmux runner is not executable: $tui_runner"
 }
 
 write_replay() {
@@ -103,21 +103,21 @@ run_soak() {
   local backend_command
   backend_command="env OCTOS_CONTEXT_COMPACT_THRESHOLD_TOKENS=1 OCTOS_CONTEXT_COMPACT_KEEP_ITEMS=4 $(shell_quote "$octos_bin") serve --stdio --data-dir $(shell_quote "$data_dir") --cwd $(shell_quote "$workspace")"
 
-  export OCTOS_TUI_M15_UX_RUN_ID="$run_id"
-  export OCTOS_TUI_M15_UX_OUT_DIR="$out_dir"
-  export OCTOS_TUI_M15_UX_RUNTIME_ROOT="$runtime_root"
-  export OCTOS_TUI_M15_UX_WORKDIR="$workspace"
-  export OCTOS_TUI_M15_UX_CHILD_OUT_DIR="$runtime_root/artifacts"
-  export OCTOS_TUI_M15_UX_BIN="$tui_bin"
-  export OCTOS_TUI_M15_UX_BACKEND_COMMAND="$backend_command"
-  export OCTOS_TUI_M15_UX_TMUX_SESSION="$session_name"
-  export OCTOS_TUI_M15_UX_REPLAY="$replay_file"
-  export OCTOS_TUI_M15_UX_SCENARIO="context_restart_reconnect"
-  export OCTOS_TUI_M15_UX_SESSION_ID="$session_id"
-  export OCTOS_TUI_M15_UX_PROFILE="$profile_id"
-  export OCTOS_TUI_M15_UX_REPLACE_SESSION=1
-  export OCTOS_TUI_M15_UX_COLS="${OCTOS_M16_CONTEXT_TMUX_COLS:-120}"
-  export OCTOS_TUI_M15_UX_ROWS="${OCTOS_M16_CONTEXT_TMUX_ROWS:-40}"
+  export OCTOSCODE_M15_UX_RUN_ID="$run_id"
+  export OCTOSCODE_M15_UX_OUT_DIR="$out_dir"
+  export OCTOSCODE_M15_UX_RUNTIME_ROOT="$runtime_root"
+  export OCTOSCODE_M15_UX_WORKDIR="$workspace"
+  export OCTOSCODE_M15_UX_CHILD_OUT_DIR="$runtime_root/artifacts"
+  export OCTOSCODE_M15_UX_BIN="$tui_bin"
+  export OCTOSCODE_M15_UX_BACKEND_COMMAND="$backend_command"
+  export OCTOSCODE_M15_UX_TMUX_SESSION="$session_name"
+  export OCTOSCODE_M15_UX_REPLAY="$replay_file"
+  export OCTOSCODE_M15_UX_SCENARIO="context_restart_reconnect"
+  export OCTOSCODE_M15_UX_SESSION_ID="$session_id"
+  export OCTOSCODE_M15_UX_PROFILE="$profile_id"
+  export OCTOSCODE_M15_UX_REPLACE_SESSION=1
+  export OCTOSCODE_M15_UX_COLS="${OCTOS_M16_CONTEXT_TMUX_COLS:-120}"
+  export OCTOSCODE_M15_UX_ROWS="${OCTOS_M16_CONTEXT_TMUX_ROWS:-40}"
 
   {
     printf 'bootstrap_summary=%s\n' "$summary"

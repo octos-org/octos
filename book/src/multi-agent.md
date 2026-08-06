@@ -62,7 +62,7 @@ Gracefully closes a running peer you created.
 
 ## Creating and gathering from the client
 
-Humans drive peers through two server methods, surfaced as `/peer` and `/gather` in octos-tui:
+Humans drive peers through two server methods, surfaced as `/peer` and `/gather` in octoscode:
 
 - **`peer/prepare`** — stage 1–8 peers as a fleet (all-or-nothing). Pure resource reservation; the client then opens each session and starts its first turn.
 - **`peer/gather`** — the human-facing side of the blackboard; composes the peers' results into the caller's session.

@@ -159,7 +159,7 @@ function makeArtifactDir(overrides = {}) {
       ].join("\n"),
     "utf8",
   );
-  writeFileSync(join(dir, "launch-command.txt"), "octos-tui --mode protocol\n", "utf8");
+  writeFileSync(join(dir, "launch-command.txt"), "octoscode --mode protocol\n", "utf8");
   writeFileSync(join(dir, "input-replay.log"), "line validate\n", "utf8");
   writeFileSync(join(dir, "server.log"), overrides.serverLog || "server ready\n", "utf8");
   if (overrides.cursorSamples !== undefined) {

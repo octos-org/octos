@@ -57,7 +57,7 @@ curl -fsSL https://github.com/octos-org/octos/releases/latest/download/install.s
 
 - **octos** (this repo) — the **kernel**: the agent runtime, LLM providers, tools, sandbox, memory, channels, and the API everything else speaks. Install this first — then live in a client:
 - **[octos-web](https://github.com/octos-org/octos-web)** — the full app experience in the browser (chat, voice, projects, slides, admin, and the hosted multi-tenant signup). A build ships inside the server — open `/app/`.
-- **[octos-tui](https://github.com/octos-org/octos-tui)** — the terminal experience, in the spirit of Claude Code.
+- **[octoscode](https://github.com/octos-org/octoscode)** — the terminal experience, in the spirit of Claude Code.
 
 **Stuck?** [Documentation](https://octos-org.github.io/octos/) · [Issues](https://github.com/octos-org/octos/issues)
 
@@ -140,7 +140,7 @@ octos gateway
 # Web dashboard + REST API + UI Protocol
 octos serve
 octos serve --solo     # same, plus password-free local login for the web app
-octos serve --stdio    # UI Protocol over stdio (how octos-tui embeds a backend)
+octos serve --stdio    # UI Protocol over stdio (how octoscode embeds a backend)
 ```
 
 The full CLI surface (see `octos help`):
@@ -246,7 +246,7 @@ Each binding has its own README with the full API and examples: [octos-ffi](crat
 Interactive clients talk to `octos serve` over **UI Protocol v1** — a JSON-RPC contract carried on WebSocket (`/api/ui-protocol/ws`) or stdio (`octos serve --stdio`). It covers session open with cursor replay, streamed turns, durable persistence events, tool activity, approvals, background tasks, and rollback. The protocol spec is the contract: server and clients release independently against it.
 
 - **[octos-web](https://github.com/octos-org/octos-web)** — the browser client: chat, voice/video, studio, slides, and sites. A build is embedded in the server binary at `/app/`, so `octos serve` works with zero extra deploys. (The admin dashboard is a separate SPA, embedded at `/admin/`.)
-- **[octos-tui](https://github.com/octos-org/octos-tui)** — the terminal client. Connects to a running server over WebSocket, or spawns `octos serve --stdio` as its own private backend.
+- **[octoscode](https://github.com/octos-org/octoscode)** — the terminal client. Connects to a running server over WebSocket, or spawns `octos serve --stdio` as its own private backend.
 - **`octos mcp-serve`** — the inverse direction: octos as an MCP server, callable as a sub-agent from outer orchestrators.
 - **MCP client** — octos also *consumes* external MCP servers. Declare them in `config.json` under `mcp_servers` and any octos agent (`chat`, `serve`, `gateway`, `acp`) gains their tools in its own registry — stdio (`command` + `args`) or HTTP (`url`); run `octos mcp login <url>` for OAuth-gated servers.
 
@@ -382,7 +382,7 @@ Guardrails that stay on even under `danger-full-access`/`--yolo`:
 ### Reuse an existing profile (model + API key)
 
 `--profile <id>` reads a stored serve/onboarding profile
-(`~/.octos/profiles/<id>.json`, created by `octos serve` or octos-tui) and
+(`~/.octos/profiles/<id>.json`, created by `octos serve` or octoscode) and
 reuses its provider, model, route, and API key — so you don't re-enter them:
 
 ```bash
@@ -475,7 +475,7 @@ already carries one.
 
 Beyond a single turn, octos can keep working on its own — between your messages,
 or on a schedule. Both are driven by slash commands in any client (octos-web,
-octos-tui) or channel session, and run on `octos serve` / `octos gateway`.
+octoscode) or channel session, and run on `octos serve` / `octos gateway`.
 
 ### Goals — keep going until it's done
 

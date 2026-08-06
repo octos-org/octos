@@ -9,7 +9,7 @@ octos 是一个包含 27 个成员的 Rust 工作区（Edition 2024，rust-versi
 - **agent 周边**（5 个）：`octos-pipeline`（DOT 图工作流）、`octos-plugin`（插件/技能 SDK）、`octos-swarm`（多 agent 契约创作）、`octos-sandbox`、`octos-dora-mcp`。
 - **内置技能 crate**（15 个）：`crates/app-skills/` 下每个应用技能都是独立 crate——`news`、`deep-search`、`deep-crawl`、`send-email`、`account-manager`、`time`、`weather`、`smart-home`、`wechat-bridge`、`skill-evolve`，以及 `harness-starter-{generic,report,audio,coding}` 模板——再加上 `platform-skills/voice`（ASR/TTS）。
 
-（Web SPA 与终端客户端分别位于独立的 `octos-web` 和 `octos-tui` 仓库，通过 UI Protocol 与 `octos serve` 通信。）
+（Web SPA 与终端客户端分别位于独立的 `octos-web` 和 `octoscode` 仓库，通过 UI Protocol 与 `octos serve` 通信。）
 
 ```
 ┌─────────────────────────────────────────────────────────────┐

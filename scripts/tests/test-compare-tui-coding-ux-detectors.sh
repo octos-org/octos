@@ -7,7 +7,7 @@
 # `state ◒ Working (...)` which the legacy `running|blocked` regex
 # missed) does not slip back in unnoticed.
 #
-# Runs entirely offline. No tmux, no octos-tui process. The script is
+# Runs entirely offline. No tmux, no octoscode process. The script is
 # sourced so the detector helpers are loaded as bash functions; the
 # soak `main` invocation is guarded by `BASH_SOURCE` so sourcing does
 # not start the long-running flow.
@@ -73,7 +73,7 @@ source "$TARGET"
 assert_active "Working state (deepseek-v4-pro-live transcript)" "$(cat <<'EOF'
 some pane content
 state ◒ Working (foo bar)
-> _ Octos TUI
+Composer
 EOF
 )"
 
@@ -106,19 +106,19 @@ EOF
 # Idle/done snapshots must NOT be considered active.
 assert_not_active "done state" "$(cat <<'EOF'
 state ◒ done (turn completed)
->_ Octos TUI  idle
+Composer
 EOF
 )"
 
 assert_not_active "idle composer" "$(cat <<'EOF'
->_ Octos TUI  idle
+state ◒ idle (ready)
 Ask Octos to change code
 EOF
 )"
 
 # Ready-state detector recognizes the same idle/done capture.
 assert_ready "ready-state idle composer" "$(cat <<'EOF'
->_ Octos TUI  idle
+state ◒ idle (ready)
 Ask Octos to change code
 EOF
 )"

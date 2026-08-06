@@ -62,7 +62,7 @@ Agent 通过五个工具与对等 Agent 交互，覆盖完整生命周期 ——
 
 ## 从客户端创建与汇聚
 
-人类通过两个服务端方法驱动对等 Agent，在 octos-tui 中表现为 `/peer` 和 `/gather`：
+人类通过两个服务端方法驱动对等 Agent，在 octoscode 中表现为 `/peer` 和 `/gather`：
 
 - **`peer/prepare`** —— 以编队方式暂存 1–8 个对等 Agent（全有或全无）。纯资源预留；随后由客户端打开每个会话并启动其首轮。
 - **`peer/gather`** —— 黑板的面向人类的一侧；把各对等 Agent 的结果汇入调用方的会话。

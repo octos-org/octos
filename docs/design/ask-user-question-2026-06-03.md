@@ -4,7 +4,7 @@ Date: 2026-06-03
 
 Status: design draft (Phase 1: synchronous tool-block).
 
-Owner: octos-agent + octos-cli (AppUI/UI Protocol) + octos-tui.
+Owner: octos-agent + octos-cli (AppUI/UI Protocol) + octoscode.
 
 Related contract surfaces:
 
@@ -12,7 +12,7 @@ Related contract surfaces:
   (§7 `user_question/respond`, §8 `user_question/requested`, §4.1 UPCR-2026-023)
 - [api/OCTOS_SERVER_FEATURE_REQUIREMENTS.md](../../api/OCTOS_SERVER_FEATURE_REQUIREMENTS.md) (`SRV-041`)
 - [api/OCTOS_APP_FEATURE_REQUIREMENTS.md](../../api/OCTOS_APP_FEATURE_REQUIREMENTS.md) (`APP-037`)
-- [api/OCTOS_TUI_FEATURE_REQUIREMENTS.md](../../api/OCTOS_TUI_FEATURE_REQUIREMENTS.md) (`TUI-037`)
+- [api/OCTOSCODE_FEATURE_REQUIREMENTS.md](../../api/OCTOSCODE_FEATURE_REQUIREMENTS.md) (`TUI-037`)
 
 Existing machinery this design reuses (read these before implementing):
 
@@ -323,9 +323,9 @@ in this docs-only change.
   - Capability negotiation: advertise `user_question.v1` in
     `supported_features` when the client requests it.
 
-**octos-tui** (rendering):
+**octoscode** (rendering):
 
-- `crates/octos-tui/src/store.rs` + `src/app.rs` (mirror the approval-card
+- `crates/octoscode/src/store.rs` + `src/app.rs` (mirror the approval-card
   handling): render the question picker — one card per question, single-select
   vs multi-select, each option as a selectable line, plus an "Other" free-text
   entry. Send `user_question/respond` with the correct `question_id` and
@@ -370,7 +370,7 @@ Follow the project RED → GREEN → REFACTOR cycle. Tests by layer:
 - `should_replay_pending_user_question_on_hydrate` (reconnect path).
 - `should_degrade_to_generic_when_client_lacks_capability`.
 
-**octos-tui:**
+**octoscode:**
 
 - Render snapshot of single-select and multi-select cards + the "Other" entry.
 - Reducer test: `user_question/respond` carries the right `question_id` and

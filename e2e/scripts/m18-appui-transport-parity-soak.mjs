@@ -550,8 +550,8 @@ class StdioClient extends AppUiClient {
       env: {
         ...process.env,
         OCTOS_M9_PROTOCOL_FIXTURES: '1',
-        OCTOS_TUI_M15_UX_OUTPUT_DIR: runRoot,
-        OCTOS_TUI_M15_UX_WORKDIR: workspace,
+        OCTOSCODE_M15_UX_OUTPUT_DIR: runRoot,
+        OCTOSCODE_M15_UX_WORKDIR: workspace,
         RUST_BACKTRACE: process.env.RUST_BACKTRACE || '1',
       },
       stdio: ['pipe', 'pipe', 'pipe'],
@@ -665,8 +665,8 @@ async function startWsServer(port) {
     env: {
       ...process.env,
       OCTOS_M9_PROTOCOL_FIXTURES: '1',
-      OCTOS_TUI_M15_UX_OUTPUT_DIR: runRoot,
-      OCTOS_TUI_M15_UX_WORKDIR: workspace,
+      OCTOSCODE_M15_UX_OUTPUT_DIR: runRoot,
+      OCTOSCODE_M15_UX_WORKDIR: workspace,
       RUST_BACKTRACE: process.env.RUST_BACKTRACE || '1',
     },
     stdio: ['ignore', 'pipe', 'pipe'],
