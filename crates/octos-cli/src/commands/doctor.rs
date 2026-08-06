@@ -242,8 +242,8 @@ fn build_report(cmd: &DoctorCommand, with_network: bool) -> Result<Report> {
     ));
     report.push(shadow_check(&located, &method, &spec));
 
-    // --- Installations (every octos + octos-tui copy, with versions) --------
-    // Parity with `octos-tui doctor`'s Installations section: enumerate BOTH
+    // --- Installations (every octos + octoscode copy, with versions) --------
+    // Parity with `octoscode doctor`'s Installations section: enumerate BOTH
     // binaries across PATH + the known install dirs so duplicate / mismatched
     // installs are visible from either doctor.
     report.extend(installations_checks(&spec));
@@ -333,24 +333,47 @@ fn build_report(cmd: &DoctorCommand, with_network: bool) -> Result<Report> {
 }
 
 // ---------------------------------------------------------------------------
-// Installations — every octos + octos-tui on the machine, with versions
+// Installations — every octos + octoscode on the machine, with versions
 // ---------------------------------------------------------------------------
 
-/// Parity with `octos-tui doctor`'s Installations section: enumerate every
-/// octos AND octos-tui copy (across `$PATH`, Homebrew, cargo, the shell
-/// installer's `~/.local/bin`, and octos-tui's `~/.octos/bin` auto-install dir),
+/// Parity with `octoscode doctor`'s Installations section: enumerate every
+/// octos AND octoscode copy (across `$PATH`, Homebrew, cargo, the shell
+/// installer's `~/.local/bin`, and octoscode's `~/.octos/bin` auto-install dir),
 /// with each copy's `--version` + inferred install method — so duplicate /
 /// mismatched installs are visible from `octos doctor` too, not just the TUI's.
 fn installations_checks(octos: &ProductSpec) -> Vec<Check> {
-    vec![
+    let mut checks = vec![
         installs_check("octos", &locate_with_octos_bin(octos)),
-        installs_check("octos-tui", &locate(&octos_tui_spec())),
-    ]
+        installs_check("octoscode", &locate(&octoscode_spec())),
+    ];
+    // The client was renamed octos-tui -> octoscode. Enumerating only the new
+    // name would report "none found" to anyone who has not upgraded yet —
+    // wrong, and worst for exactly the user who needs `doctor` to explain
+    // things. Look for the old binary too, and surface it ONLY when a copy is
+    // actually present so the section does not grow a permanent empty row.
+    // Drop this once the rename has settled.
+    let legacy = locate(&octoscode_legacy_spec());
+    if !install_rows(&legacy).is_empty() {
+        checks.push(installs_check("octos-tui (legacy name)", &legacy));
+    }
+    checks
 }
 
-/// Minimal spec for LOCATING the octos-tui client binary — only `binary_name`
+/// Minimal spec for LOCATING the octoscode client binary — only `binary_name`
 /// matters for enumeration; the rest are placeholders.
-fn octos_tui_spec() -> ProductSpec {
+fn octoscode_spec() -> ProductSpec {
+    ProductSpec::new(
+        "octoscode",
+        "octoscode",
+        "0.0.0",
+        "octos-org/octoscode",
+        "octoscode",
+    )
+}
+
+/// Pre-rename spec, so a not-yet-upgraded `octos-tui` copy is still found.
+/// See the note in [`installations_checks`].
+fn octoscode_legacy_spec() -> ProductSpec {
     ProductSpec::new(
         "octos-tui",
         "octos-tui",
@@ -360,7 +383,7 @@ fn octos_tui_spec() -> ProductSpec {
     )
 }
 
-/// `locate()` scans PATH + Homebrew/cargo/`~/.local/bin`, but octos-tui's
+/// `locate()` scans PATH + Homebrew/cargo/`~/.local/bin`, but octoscode's
 /// auto-installer drops `octos` into `~/.octos/bin`, off both — add it (deduped
 /// by canonical path).
 fn locate_with_octos_bin(spec: &ProductSpec) -> LocatedBinaries {
@@ -394,7 +417,7 @@ fn install_method_for_path(path: &Path) -> &'static str {
     } else if p.contains("/homebrew/") || p.contains("/Cellar/") || p.starts_with("/usr/local/") {
         "brew"
     } else if p.contains("/.octos/bin/") {
-        "octos-tui auto-install"
+        "octoscode auto-install"
     } else if p.contains("/.local/bin/") {
         "shell installer"
     } else if p.starts_with("/usr/bin/") || p.starts_with("/bin/") {
@@ -930,7 +953,7 @@ fn profile_checks(profiles: &[DiscoveredProfile]) -> Vec<Check> {
         checks.push(Check::pass(
             CAT_PROFILES,
             "profiles",
-            "none yet — created by octos-tui onboarding (or `octos serve` solo mode)",
+            "none yet — created by octoscode onboarding (or `octos serve` solo mode)",
         ));
         return checks;
     }
@@ -1767,19 +1790,19 @@ mod tests {
             "brew"
         );
         assert_eq!(
-            install_method_for_path(Path::new("/home/u/.local/bin/octos-tui")),
+            install_method_for_path(Path::new("/home/u/.local/bin/octoscode")),
             "shell installer"
         );
         assert_eq!(
             install_method_for_path(Path::new("/home/u/.octos/bin/octos")),
-            "octos-tui auto-install"
+            "octoscode auto-install"
         );
         assert_eq!(
             install_method_for_path(Path::new("/usr/bin/octos")),
             "system"
         );
         assert_eq!(
-            install_method_for_path(Path::new("/x/node_modules/.bin/octos-tui")),
+            install_method_for_path(Path::new("/x/node_modules/.bin/octoscode")),
             "npm"
         );
     }
@@ -1811,10 +1834,10 @@ mod tests {
     }
 
     #[test]
-    fn installations_checks_cover_both_octos_and_octos_tui() {
+    fn installations_checks_cover_both_octos_and_octoscode() {
         let checks = installations_checks(&octos_server_spec());
         assert!(checks.iter().any(|c| c.name == "octos installs"));
-        assert!(checks.iter().any(|c| c.name == "octos-tui installs"));
+        assert!(checks.iter().any(|c| c.name == "octoscode installs"));
     }
 
     #[test]

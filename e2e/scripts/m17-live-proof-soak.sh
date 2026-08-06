@@ -28,7 +28,7 @@ Live key inputs:
   OCTOS_BIN                                       Default: target/debug/octos.
   OCTOS_M17_SPAWN_DIR                             Optional direct spawn_agent evidence dir.
   OCTOS_M17_BUDGET_GRACE_DIR                      Optional explicit budget grace evidence dir.
-  OCTOS_M17_SKIP_TUI=1                            Skip m16 tmux run when octos-tui/tmux are unavailable.
+  OCTOS_M17_SKIP_TUI=1                            Skip m16 tmux run when octoscode/tmux are unavailable.
 USAGE
 }
 

@@ -7,7 +7,7 @@ import { fileURLToPath } from 'node:url';
 const scriptDir = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(scriptDir, '..', '..');
 const defaultManifestPath = path.join(repoRoot, 'e2e', 'matrix', 'octos-ux.toml');
-const siblingOctosTuiRepo = path.resolve(repoRoot, '..', 'octos-tui');
+const siblingOctoscodeRepo = path.resolve(repoRoot, '..', 'octoscode');
 const statusClasses = ['runnable', 'skipped', 'blocked', 'quarantined'];
 const initialM19ScenarioIds = [
   'stdio-happy-path',
@@ -333,26 +333,26 @@ function resolveSpecialHostTool(tool) {
         process.env.OCTOS_BIN,
         path.join(repoRoot, 'target', 'debug', executableName('octos')),
       ]);
-    case 'octos-tui-bin':
+    case 'octoscode-bin':
       return firstExecutable([
-        process.env.OCTOS_TUI_BIN,
-        path.join(siblingOctosTuiRepo, 'target', 'debug', executableName('octos-tui')),
+        process.env.OCTOSCODE_BIN,
+        path.join(siblingOctoscodeRepo, 'target', 'debug', executableName('octoscode')),
       ]);
-    case 'octos-tui-onboarding-runner':
+    case 'octoscode-onboarding-runner':
       return firstExecutable([
-        process.env.OCTOS_TUI_ONBOARDING_RUNNER,
+        process.env.OCTOSCODE_ONBOARDING_RUNNER,
         process.env.OCTOS_M19_UX_TUI_RUNNER,
-        path.join(siblingOctosTuiRepo, 'scripts', 'run-onboarding-tmux-soak.sh'),
+        path.join(siblingOctoscodeRepo, 'scripts', 'run-onboarding-tmux-soak.sh'),
       ]);
-    case 'octos-tui-m15-runner':
+    case 'octoscode-m15-runner':
       return firstExecutable([
-        process.env.OCTOS_TUI_M15_RUNNER,
-        path.join(siblingOctosTuiRepo, 'scripts', 'run-m15-live-tmux-ux-soak.sh'),
+        process.env.OCTOSCODE_M15_RUNNER,
+        path.join(siblingOctoscodeRepo, 'scripts', 'run-m15-live-tmux-ux-soak.sh'),
       ]);
-    case 'octos-tui-m18-runner':
+    case 'octoscode-m18-runner':
       return firstExecutable([
-        process.env.OCTOS_TUI_M18_RUNNER,
-        path.join(siblingOctosTuiRepo, 'scripts', 'run-m18-stdio-live-tmux-soak.sh'),
+        process.env.OCTOSCODE_M18_RUNNER,
+        path.join(siblingOctoscodeRepo, 'scripts', 'run-m18-stdio-live-tmux-soak.sh'),
       ]);
     default:
       return undefined;

@@ -3,7 +3,7 @@
 
 This validator checks the production review/start path:
 
-- octos-tui sends review/start to octos serve --stdio.
+- octoscode sends review/start to octos serve --stdio.
 - octos emits AppUI agent lifecycle/output/artifact events.
 - native, CLI, and MCP specialists all participate.
 - tmux captures show user-visible orchestration traces.

@@ -128,7 +128,7 @@ fn build_sub_provider_router(config: &Config) -> Option<Arc<octos_llm::ProviderR
 ///
 /// One `ProfileRuntime` per `(host process, profile_id)`. The host
 /// process is `octos serve`, `octos gateway` (each subprocess), or
-/// `octos tui` — every entry point that today reads a [`UserProfile`]
+/// `octoscode` — every entry point that today reads a [`UserProfile`]
 /// off disk and turns it into a running agent ends up holding an
 /// `Arc<ProfileRuntime>`.
 ///

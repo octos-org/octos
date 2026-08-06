@@ -1,6 +1,6 @@
 //! Disk-backed per-session reasoning/thinking effort store.
 //!
-//! The octos-tui sets a per-session reasoning effort (`/thinking
+//! The octoscode sets a per-session reasoning effort (`/thinking
 //! low|medium|high|max`) and attaches it to every `turn/start` via
 //! [`TurnStartParams::reasoning_effort`]. The serve must persist that choice
 //! **server-side and on disk** so it survives a full serve/TUI restart: in

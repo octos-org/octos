@@ -1,7 +1,7 @@
 //! Minimal **blocking** GitHub Releases client for `update --check` and the
 //! `doctor` network category (Stage 2). Behind the `github` feature → `reqwest`.
 //!
-//! Ported, product-agnostic, from octos-tui's `cmd/github.rs`: a plain blocking
+//! Ported, product-agnostic, from octoscode's `cmd/github.rs`: a plain blocking
 //! `reqwest` GET against the public Releases API. No auth is required for public
 //! repos, but the product's token env var (`spec.github_token_env`) is honored
 //! when set to dodge the unauthenticated rate limit — optional, never a hard

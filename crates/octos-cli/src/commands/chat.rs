@@ -99,7 +99,7 @@ pub struct ChatCommand {
     /// JSON/TOML file.
     ///
     /// If the id names a stored serve/onboarding profile (one created by
-    /// `octos serve` or octos-tui, saved as `~/.octos/profiles/<id>.json`),
+    /// `octos serve` or octoscode, saved as `~/.octos/profiles/<id>.json`),
     /// its LLM provider/model, route, and API key (`env_vars`) are reused too —
     /// so you don't re-enter a model or key that a profile already holds.
     /// `--config`, `--provider`, and `--model` still override.
@@ -819,7 +819,7 @@ impl ChatCommand {
         // Load config. Precedence: an explicit `--config` wins; otherwise a
         // stored serve/onboarding profile named by `--profile <id>` supplies its
         // LLM provider/model + route + `env_vars` API key (so `octos chat
-        // --profile <id>` reuses an octos-tui / `serve` profile without a
+        // --profile <id>` reuses an octoscode / `serve` profile without a
         // separate flat config or a duplicated key); otherwise the ambient
         // config context.
         let serve_profile_config = load_serve_profile_config(self.profile.as_deref(), &data_dir)?;
@@ -1745,7 +1745,7 @@ pub(crate) fn resolve_profile(
 }
 
 /// Load the LLM config from a stored serve/onboarding profile so
-/// `octos chat --profile <id>` can reuse an octos-tui / `serve` profile's
+/// `octos chat --profile <id>` can reuse an octoscode / `serve` profile's
 /// provider, model, route (base URL + API type), API key (`config.env_vars`),
 /// and fallbacks — without a separate flat config or a duplicated key.
 ///

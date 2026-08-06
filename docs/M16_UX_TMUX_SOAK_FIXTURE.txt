@@ -11,7 +11,7 @@ multi-agent orchestration through the real AppUI stdio path.
 It launches:
 
 - octos serve --stdio from this repo.
-- octos-tui --mode protocol --stdio-command ... through the octos-tui tmux
+- octoscode --mode protocol --stdio-command ... through the octoscode tmux
   harness.
 - A typed AppUI review/start request that asks for supervised specialist
   agents. Native specialists are resolved from
@@ -33,13 +33,13 @@ From the octos repo:
 
 Useful overrides:
 
-  OCTOS_TUI_REPO=/Users/yuechen/home/octos-tui \
+  OCTOSCODE_REPO=/Users/yuechen/home/octoscode \
   OCTOS_M16_UX_RUN_ID=m16-local \
   bash e2e/scripts/m16-live-tui-tmux-soak.sh run
 
 Set OCTOS_M16_BUILD=0 to skip building octos with the api feature.
-Set OCTOS_M16_BUILD_TUI=1 to force rebuilding octos-tui; by default the script
-uses an existing octos-tui binary and only builds it when missing.
+Set OCTOS_M16_BUILD_TUI=1 to force rebuilding octoscode; by default the script
+uses an existing octoscode binary and only builds it when missing.
 Set OCTOS_M16_UX_KEEP_SESSION=1 to leave tmux open after the run.
 
 Evidence
@@ -50,7 +50,7 @@ The default output root is:
 
 Required evidence includes:
 
-- launch-command.txt: proves octos-tui launched with octos serve --stdio.
+- launch-command.txt: proves octoscode launched with octos serve --stdio.
 - input-replay.log: records the exact terminal replay and prompt.
 - tui-capture-child-start.txt
 - tui-capture-child-progress.txt

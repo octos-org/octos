@@ -223,9 +223,9 @@ Implementation note, 2026-05-16:
   Evidence:
   `/Users/yuechen/home/octos/e2e/test-results-m15-task-supervisor-mirror-stdio/20260516T224154Z`
 - Real tmux evidence now covers the same ordinary `TaskSupervisor` mirror path
-  through `octos-tui` against real `octos serve --stdio`:
+  through `octoscode` against real `octos serve --stdio`:
   `e2e/scripts/m15-task-supervisor-mirror-tmux-soak.sh run` passed after fixing
-  octos-tui to render the backend-provided agent summary/last-task detail in
+  octoscode to render the backend-provided agent summary/last-task detail in
   the visible activity row. Evidence:
   `/Users/yuechen/home/octos/e2e/test-results-m15-task-supervisor-mirror-tmux/m15-task-mirror-tmux-20260516T224202Z`
 
@@ -378,5 +378,5 @@ unchanged.
 - Plain `turn/start` review requests still allow backend-owned subagent
   scheduling.
 - WebSocket and stdio expose identical method/result/error/event shapes.
-- Octos-TUI hides inspection controls on old servers and renders task tree plus
+- Octoscode hides inspection controls on old servers and renders task tree plus
   artifact browser when capabilities are present.

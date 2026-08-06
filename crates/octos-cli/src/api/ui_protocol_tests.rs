@@ -5507,7 +5507,7 @@ async fn raw_session_status_read_omits_model_object_when_no_model_resolved() {
     assert_eq!(status["runtime_policy_stamp"]["provider"], Value::Null);
     // The contract under test: no resolved model => NO `model` key at
     // all. Emitting `{"model": null, "provider": null, "selected": true}`
-    // breaks shipped octos-tui decoders whose ModelStatus requires
+    // breaks shipped octoscode decoders whose ModelStatus requires
     // non-null `model`/`provider` strings — the whole
     // session/status/read result fails to decode and the composer
     // footer degrades to the `<server authenticated profile>`
@@ -13467,7 +13467,7 @@ fn projection_envelope_v1_off_in_stdio_defaults() {
     // connections. The γ-cutover mutual-exclusion gate
     // (`live_event_passes_capability_filter`) drops the legacy
     // `turn/completed` notification whenever `projection_envelope`
-    // is true. The octos TUI over stdio does NOT consume
+    // is true. The octoscode over stdio does NOT consume
     // `projection/envelope` and clears its turn-active state ONLY on
     // legacy `turn/completed`; auto-enabling envelopes here would
     // suppress that lifecycle signal and wedge the client (every

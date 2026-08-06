@@ -1,12 +1,12 @@
-# Octos TUI Feature Requirements
+# Octoscode Feature Requirements
 
 Status: proposed test contract.
-Owner: octos-tui.
+Owner: octoscode.
 Applies to: mock mode, protocol mode, live coding UX parity runs.
 
 ## Purpose
 
-This document defines the user-facing feature requirements that `octos-tui`
+This document defines the user-facing feature requirements that `octoscode`
 must satisfy before it can be treated as a production coding client for the
 Octos AppUI protocol. It is intended to be used by unit tests, snapshot tests,
 tmux harnesses, and human review.
@@ -204,7 +204,7 @@ The parent Octos tmux harness should keep the state matrix from
 
 ### Live Coding Parity Tests
 
-Run a real long coding task against the same fixture in Codex and `octos-tui`.
+Run a real long coding task against the same fixture in Codex and `octoscode`.
 The TUI passes when human review can confirm:
 
 - user intent and current model state are easier to locate than in raw logs
@@ -249,6 +249,6 @@ No TUI release should be considered UX-complete unless:
 - all P0 requirements have automated coverage or a documented manual harness
   assertion
 - no advertised interaction is unsupported
-- current `octos-core` AppUI protocol changes compile in `octos-tui`
+- current `octos-core` AppUI protocol changes compile in `octoscode`
 - live coding parity harness produces retained artifacts and a human-readable
   summary

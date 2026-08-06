@@ -1,6 +1,6 @@
 //! [`ProductSpec`] — the product-agnostic seam.
 //!
-//! Shared diagnostics code must never hardcode `octos-tui` vs `octos`. Callers
+//! Shared diagnostics code must never hardcode `octoscode` vs `octos`. Callers
 //! describe their product once via a `ProductSpec`; everything else
 //! (install-method labels/upgrade hints, PATH/shadow locating, asset selection)
 //! reads from it.
@@ -13,7 +13,7 @@
 /// How to build the per-OS release asset name for a product. Stage 1 only needs
 /// the *shape* (Stage 2 will consume it when the GitHub client lands); we model
 /// it as a template prefix joined to the platform triple, e.g.
-/// `octos-bundle-<triple>` or `octos-tui-<triple>`.
+/// `octos-bundle-<triple>` or `octoscode-<triple>`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AssetSelector {
     /// Prefix prepended to the target triple (no trailing dash), e.g.
@@ -37,11 +37,11 @@ impl AssetSelector {
 }
 
 /// Product description threaded into every shared diagnostic. Constructed by the
-/// binary (octos-cli / octos-tui), never inferred from this crate.
+/// binary (octos-cli / octoscode), never inferred from this crate.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProductSpec {
     /// Bare binary name as run on PATH (no extension; `.exe` is appended on
-    /// Windows by the locator), e.g. `octos` or `octos-tui`.
+    /// Windows by the locator), e.g. `octos` or `octoscode`.
     pub binary_name: String,
     /// Package / display name, e.g. `octos`.
     pub package_name: String,

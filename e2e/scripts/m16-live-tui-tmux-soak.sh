@@ -5,7 +5,7 @@ script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd "$script_dir/../.." && pwd)"
 
 run_id="${OCTOS_M16_UX_RUN_ID:-m16-ux-soak-$(date -u +%Y%m%dT%H%M%SZ)}"
-tui_repo="${OCTOS_TUI_REPO:-/Users/yuechen/home/octos-tui}"
+tui_repo="${OCTOSCODE_REPO:-/Users/yuechen/home/octoscode}"
 tui_runner="${OCTOS_M16_TUI_RUNNER:-$tui_repo/scripts/run-m15-live-tmux-ux-soak.sh}"
 out_root="${OCTOS_M16_UX_OUT_ROOT:-$repo_root/e2e/test-results-m16-tmux-ux}"
 out_dir="${OCTOS_M16_UX_OUT_DIR:-$out_root/$run_id}"
@@ -14,7 +14,7 @@ data_dir="${OCTOS_M16_UX_DATA_DIR:-$runtime_root/data}"
 workdir="${OCTOS_M16_UX_WORKDIR:-$runtime_root/workspace}"
 replay_file="${OCTOS_M16_UX_REPLAY:-$out_dir/m16-code-review-replay.txt}"
 octos_bin="${OCTOS_BIN:-$repo_root/target/debug/octos}"
-tui_bin="${OCTOS_TUI_BIN:-$tui_repo/target/debug/octos-tui}"
+tui_bin="${OCTOSCODE_BIN:-$tui_repo/target/debug/octoscode}"
 session_name="${OCTOS_M16_UX_TMUX_SESSION:-octos-m16-ux-$run_id}"
 profile_id="${OCTOS_M16_UX_PROFILE:-coding}"
 session_id="${OCTOS_M16_UX_SESSION_ID:-$profile_id:local:m16-ux:$run_id}"
@@ -35,15 +35,15 @@ usage() {
 Usage: e2e/scripts/m16-live-tui-tmux-soak.sh <run|self-test|help>
 
 Runs the M16 visual TUI tmux soak against a real octos serve --stdio backend.
-The script reuses the octos-tui tmux driver but writes all M16 evidence under
+The script reuses the octoscode tmux driver but writes all M16 evidence under
 octos/e2e/test-results-m16-tmux-ux/<run-id>.
 
 Key environment:
-  OCTOS_TUI_REPO              Path to octos-tui checkout. Default: /Users/yuechen/home/octos-tui.
+  OCTOSCODE_REPO              Path to octoscode checkout. Default: /Users/yuechen/home/octoscode.
   OCTOS_BIN                   octos binary. Default: octos/target/debug/octos.
-  OCTOS_TUI_BIN               octos-tui binary. Default: octos-tui/target/debug/octos-tui.
+  OCTOSCODE_BIN               octoscode binary. Default: octoscode/target/debug/octoscode.
   OCTOS_M16_BUILD             Set 0 to skip building octos with api. Default: 1.
-  OCTOS_M16_BUILD_TUI         Set 1 to rebuild octos-tui. Default: build only if missing.
+  OCTOS_M16_BUILD_TUI         Set 1 to rebuild octoscode. Default: build only if missing.
   OCTOS_M16_UX_KEEP_SESSION   Set 1 to keep tmux session after the run.
   OCTOS_M16_UX_OUT_DIR        Override evidence output directory.
 USAGE
@@ -63,10 +63,10 @@ ensure_binaries() {
     (cd "$repo_root" && cargo build -p octos-cli --bin octos --features api)
   fi
   if [[ "${OCTOS_M16_BUILD_TUI:-0}" == "1" || ! -x "$tui_bin" ]]; then
-    (cd "$tui_repo" && cargo build --bin octos-tui)
+    (cd "$tui_repo" && cargo build --bin octoscode)
   fi
   [[ -x "$octos_bin" ]] || die "octos binary is not executable: $octos_bin"
-  [[ -x "$tui_bin" ]] || die "octos-tui binary is not executable: $tui_bin"
+  [[ -x "$tui_bin" ]] || die "octoscode binary is not executable: $tui_bin"
 }
 
 write_replay() {
@@ -466,7 +466,7 @@ run_soak() {
   trap 'cleanup_on_signal 143' TERM
   if [[ "${OCTOS_M16_UX_INJECT_FAIL_AFTER_PROFILE_WRITE:-0}" != "1" ]]; then
     command -v tmux >/dev/null 2>&1 || die "tmux is required"
-    [[ -x "$tui_runner" ]] || die "octos-tui tmux runner not found or not executable: $tui_runner"
+    [[ -x "$tui_runner" ]] || die "octoscode tmux runner not found or not executable: $tui_runner"
     ensure_binaries
   fi
   write_review_workspace_fixture
@@ -488,22 +488,22 @@ run_soak() {
   local backend_command
   backend_command="env OCTOS_REVIEW_CLI_SPECIALIST_ARGV_JSON=$(shell_quote "[\"$cli_fixture\"]") OCTOS_REVIEW_MCP_TIMEOUT_SECS=30 $(shell_quote "$octos_bin") serve --stdio --data-dir $(shell_quote "$data_dir") --cwd $(shell_quote "$workdir") --swarm-backend stdio --swarm-backend-cmd $(shell_quote "$mcp_fixture")"
 
-  export OCTOS_TUI_M15_UX_RUN_ID="$run_id"
-  export OCTOS_TUI_M15_UX_OUT_DIR="$out_dir"
-  export OCTOS_TUI_M15_UX_RUNTIME_ROOT="$runtime_root"
-  export OCTOS_TUI_M15_UX_WORKDIR="$workdir"
-  export OCTOS_TUI_M15_UX_CHILD_OUT_DIR="$runtime_root/artifacts"
-  export OCTOS_TUI_M15_UX_BIN="$tui_bin"
-  export OCTOS_TUI_M15_UX_BACKEND_COMMAND="$backend_command"
-  export OCTOS_TUI_M15_UX_TMUX_SESSION="$session_name"
-  export OCTOS_TUI_M15_UX_REPLAY="$replay_file"
-  export OCTOS_TUI_M15_UX_SCENARIO="code_review_subagents"
-  export OCTOS_TUI_M15_UX_FINAL_MARKER="$final_marker"
-  export OCTOS_TUI_M15_UX_SESSION_ID="$session_id"
-  export OCTOS_TUI_M15_UX_PROFILE="$profile_id"
-  export OCTOS_TUI_M15_UX_REPLACE_SESSION=1
-  export OCTOS_TUI_M15_UX_COLS="${OCTOS_M16_UX_COLS:-120}"
-  export OCTOS_TUI_M15_UX_ROWS="${OCTOS_M16_UX_ROWS:-40}"
+  export OCTOSCODE_M15_UX_RUN_ID="$run_id"
+  export OCTOSCODE_M15_UX_OUT_DIR="$out_dir"
+  export OCTOSCODE_M15_UX_RUNTIME_ROOT="$runtime_root"
+  export OCTOSCODE_M15_UX_WORKDIR="$workdir"
+  export OCTOSCODE_M15_UX_CHILD_OUT_DIR="$runtime_root/artifacts"
+  export OCTOSCODE_M15_UX_BIN="$tui_bin"
+  export OCTOSCODE_M15_UX_BACKEND_COMMAND="$backend_command"
+  export OCTOSCODE_M15_UX_TMUX_SESSION="$session_name"
+  export OCTOSCODE_M15_UX_REPLAY="$replay_file"
+  export OCTOSCODE_M15_UX_SCENARIO="code_review_subagents"
+  export OCTOSCODE_M15_UX_FINAL_MARKER="$final_marker"
+  export OCTOSCODE_M15_UX_SESSION_ID="$session_id"
+  export OCTOSCODE_M15_UX_PROFILE="$profile_id"
+  export OCTOSCODE_M15_UX_REPLACE_SESSION=1
+  export OCTOSCODE_M15_UX_COLS="${OCTOS_M16_UX_COLS:-120}"
+  export OCTOSCODE_M15_UX_ROWS="${OCTOS_M16_UX_ROWS:-40}"
 
   "$tui_runner" start
   tmux_session_started=1

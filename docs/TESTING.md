@@ -240,14 +240,14 @@ OCTOS_M12_SOAK_TRANSPORT=both OCTOS_M12_SOAK_STRICT=1 \
   ./scripts/m12-solo-appui-soak.sh run
 ```
 
-Required TUI checks in `../octos-tui`:
+Required TUI checks in `../octoscode`:
 
 ```bash
 cargo test --all --workspace onboarding
 cargo test --all --workspace permissions
 scripts/run-onboarding-tmux-soak.sh solo-self-test
-OCTOS_TUI_SOAK_TRANSPORT=stdio scripts/run-onboarding-tmux-soak.sh drive-solo
-OCTOS_TUI_SOAK_TRANSPORT=stdio scripts/run-onboarding-tmux-soak.sh verify-solo
+OCTOSCODE_SOAK_TRANSPORT=stdio scripts/run-onboarding-tmux-soak.sh drive-solo
+OCTOSCODE_SOAK_TRANSPORT=stdio scripts/run-onboarding-tmux-soak.sh verify-solo
 ```
 
 The M22 release gate must fail on OTP calls in local solo onboarding, secret

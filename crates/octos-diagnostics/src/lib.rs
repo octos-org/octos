@@ -2,13 +2,13 @@
 //! *planning* for the octos binaries (`octos doctor`, and later `octos update
 //! --check`).
 //!
-//! This crate is the dependency-light seam factored out of octos-tui's
-//! `doctor`/`install_method` modules (octos-tui#182, ADR
+//! This crate is the dependency-light seam factored out of octoscode's
+//! `doctor`/`install_method` modules (octoscode#182, ADR
 //! `docs/adr/octos-diagnostics-extraction-scope.md`). Stage 1 ships:
 //!
 //! - the report model ([`CheckStatus`] / [`Check`] / [`Report`]) with the
 //!   `[✓]/[!]/[✗]` glyphs, JSON support-bundle output, and exit-code policy;
-//! - a [`ProductSpec`] seam so the same logic serves both octos-tui and the
+//! - a [`ProductSpec`] seam so the same logic serves both octoscode and the
 //!   octos server — **the current version is always passed IN** by the caller,
 //!   never read from this crate's `CARGO_PKG_VERSION`;
 //! - [`InstallMethod`] classification ([`classify_path`] pure + [`detect`]

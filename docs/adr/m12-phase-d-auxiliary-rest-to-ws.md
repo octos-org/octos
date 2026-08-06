@@ -230,7 +230,7 @@ small.
   detonates the session; it surfaces as a typed RPC error on a connected,
   authenticated WS socket.
 - Clients that historically used REST for the thirteen surfaces above MUST
-  negotiate `auxiliary.rest_to_ws.v1` to access the new wire. The `octos-tui`
+  negotiate `auxiliary.rest_to_ws.v1` to access the new wire. The `octoscode`
   client speaks UI Protocol v1 natively and consumes the new methods as soon
   as the gate is set in its capability handshake.
 - The capability is strictly opt-in: even with the header absent, the gate
@@ -328,7 +328,7 @@ were **not** retired and stay REST.
 - **Server-side session TTL, refresh, and rotation logic.** The existing
   auth manager keeps owning that. This ADR only moved what the data plane
   sends over.
-- **`octos-tui`.** The TUI already speaks UI Protocol v1 natively — no
+- **`octoscode`.** The TUI already speaks UI Protocol v1 natively — no
   auxiliary REST surface to migrate. It consumes the new methods
   opportunistically but was not a release gate.
 - **Slides / sites sub-apps.** `slides/api.ts`, `sites/api.ts` still call

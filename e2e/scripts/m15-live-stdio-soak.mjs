@@ -41,8 +41,8 @@ const child = spawn(octosBin, ['serve', '--stdio', '--data-dir', dataDir, '--cwd
   env: {
     ...process.env,
     OCTOS_M15_LIVE_SUBAGENT_FIXTURE: '1',
-    OCTOS_TUI_M15_UX_OUTPUT_DIR: evidenceDir,
-    OCTOS_TUI_M15_UX_WORKDIR: workspace,
+    OCTOSCODE_M15_UX_OUTPUT_DIR: evidenceDir,
+    OCTOSCODE_M15_UX_WORKDIR: workspace,
     RUST_BACKTRACE: process.env.RUST_BACKTRACE || '1',
   },
   stdio: ['pipe', 'pipe', 'pipe'],

@@ -1,6 +1,6 @@
 //! PATH resolution + shadow detection, product-agnostic.
 //!
-//! Ported from octos-tui's `doctor.rs` locate/on_path/shadow logic, with the
+//! Ported from octoscode's `doctor.rs` locate/on_path/shadow logic, with the
 //! binary name driven by [`ProductSpec`]. Carries the #189 npm fix: when the
 //! method is [`InstallMethod::Npm`] and nothing is located, both the on-PATH
 //! and shadow checks PASS (the real binary lives under `node_modules/.bin_real`

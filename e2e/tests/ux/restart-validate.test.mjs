@@ -164,7 +164,7 @@ function makeArtifactDir() {
     real_tmux_launched: true,
     artifacts: artifactSummary(dir, [...requiredArtifacts, ...restartArtifacts]),
   });
-  writeFileSync(join(dir, 'launch-command.txt'), 'octos-tui --mode protocol\n', 'utf8');
+  writeFileSync(join(dir, 'launch-command.txt'), 'octoscode --mode protocol\n', 'utf8');
   writeFileSync(join(dir, 'input-replay.log'), 'line before restart prompt\n', 'utf8');
   writeFileSync(join(dir, 'server.log'), 'serve listening; restart fixture\n', 'utf8');
   writeFileSync(join(dir, 'tui-capture.txt'), 'Chat ready\n› \nComposer\n state Idle\n', 'utf8');

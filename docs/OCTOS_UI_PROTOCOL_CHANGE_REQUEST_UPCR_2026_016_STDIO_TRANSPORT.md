@@ -50,6 +50,6 @@ wire contract without opening a network listener.
 
 - CLI parse/build check for `octos serve --stdio`.
 - Stdio request/response smoke for `config/capabilities/list`.
-- Stdio tmux soak with `octos-tui --stdio-command "octos serve --stdio ..."`
+- Stdio tmux soak with `octoscode --stdio-command "octos serve --stdio ..."`
   covering onboarding provider save, `session/open`, `turn/start`, model output,
   and terminal capture artifacts.

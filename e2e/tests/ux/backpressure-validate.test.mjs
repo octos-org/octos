@@ -114,7 +114,7 @@ function makeArtifactDir({ trueDropCoverage, terminal = 'legacy' }) {
       'websocket-transcript.jsonl',
     ]),
   });
-  writeFileSync(join(dir, 'launch-command.txt'), 'octos-tui --mode protocol\n', 'utf8');
+  writeFileSync(join(dir, 'launch-command.txt'), 'octoscode --mode protocol\n', 'utf8');
   writeFileSync(join(dir, 'input-replay.log'), 'line trigger backpressure\n', 'utf8');
   writeFileSync(
     join(dir, 'server.log'),

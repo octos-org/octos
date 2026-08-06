@@ -222,7 +222,7 @@ pub struct Config {
     #[serde(default)]
     pub content_routing: Option<octos_llm::RoutingConfig>,
 
-    /// AppUi (octos-app, octos-tui, etc.) session defaults applied by
+    /// AppUi (octos-app, octoscode, etc.) session defaults applied by
     /// `octos serve`. Operators can anchor every AppUi session that
     /// does not advertise the `session.workspace_cwd.v1` capability to
     /// a chosen folder via `appui.default_session_cwd` — the Tier-2

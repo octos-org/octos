@@ -113,7 +113,7 @@ API account + global config maps to `ProfileRuntime`.
 
 ### TUI — multiple terminals on one box
 
-Each `octos tui` is its own process. Two terminals get two isolated
+Each `octoscode` is its own process. Two terminals get two isolated
 state spaces by virtue of OS process separation. Inside one TUI
 process you can also have multiple sessions (split panes) sharing the
 one `ProfileRuntime`. Different OS users get extra isolation via
@@ -147,7 +147,7 @@ introduced go away — they always wanted to live somewhere else.
 ## What this is NOT
 
 - **Not a subprocess refactor.** Sessions run in-process within the
-  host (`serve` or `octos tui`). Sandbox isolation continues to live
+  host (`serve` or `octoscode`). Sandbox isolation continues to live
   at the shell-tool spawn boundary (`Bwrap`/`Macos sbpl`/`Docker`),
   not at the session level. If we ever need stronger session
   isolation (hostile multi-tenant compute), the abstraction supports a

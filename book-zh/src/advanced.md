@@ -496,7 +496,7 @@ Shell 命令在沙箱中运行以实现隔离。支持三种后端：
 
 ## 自主运行与会话控制
 
-除一次性对话外，图形客户端（octos-web、octos-tui）还通过 [UI Protocol](./architecture.md) 驱动一些更长时运行的行为。其中自主运行与任务产物组由协商的能力标志门控（见[能力协商](#能力协商)）；核心的轮次/会话控制（`turn/start`、`turn/interrupt`、`session/rollback`、`task/output/read`）始终可用。
+除一次性对话外，图形客户端（octos-web、octoscode）还通过 [UI Protocol](./architecture.md) 驱动一些更长时运行的行为。其中自主运行与任务产物组由协商的能力标志门控（见[能力协商](#能力协商)）；核心的轮次/会话控制（`turn/start`、`turn/interrupt`、`session/rollback`、`task/output/read`）始终可用。
 
 ### 目标（Goals）
 

@@ -53,7 +53,7 @@ pub enum LaunchDecision {
         existing_profiles: Vec<String>,
     },
     /// No profile exists on the machine at all — the client must send the
-    /// user to `octos-tui onboard`.
+    /// user to `octoscode onboard`.
     NoProfile,
 }
 

@@ -283,7 +283,7 @@ expect = { result_has = ["requested_path", "exists"] }
 name = "first-run-local-tmux"
 tier = "local"
 transport = "stdio"
-description = "Drive octos-tui through first-run wizard under live tmux (placeholder)."
+description = "Drive octoscode through first-run wizard under live tmux (placeholder)."
 validators = ["tui_first_run_capture"]
 artifacts = ["tui-capture.txt", "rpc-transcript.jsonl"]
 skip_reason = "tier-local scenarios land with the local tmux/provider follow-up."
