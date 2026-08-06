@@ -2424,7 +2424,10 @@ impl PipelineExecutor {
         // IR palette handlers — registered so the palette kinds dispatch to
         // real implementations instead of falling through to Noop/Codergen.
         registry.register(HandlerKind::ShellCheck, Arc::new(ShellCheckHandler));
-        registry.register(HandlerKind::Notify, Arc::new(NotifyHandler));
+        registry.register(
+            HandlerKind::Notify,
+            Arc::new(NotifyHandler::new().with_host_context(self.config.host_context.clone())),
+        );
         registry.register(HandlerKind::Wait, Arc::new(WaitHandler));
 
         registry

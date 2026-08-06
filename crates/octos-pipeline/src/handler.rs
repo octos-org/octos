@@ -1290,7 +1290,22 @@ impl Handler for ShellCheckHandler {
 /// Notify handler: sends a notification message to the user. The message
 /// comes from `node.prompt` (set by `compile_node` from `IrNodeKind::Notify`).
 /// No LLM call — the message is the node's outcome content.
-pub struct NotifyHandler;
+pub struct NotifyHandler {
+    host_context: crate::host_context::PipelineHostContext,
+}
+
+impl NotifyHandler {
+    pub fn new() -> Self {
+        Self {
+            host_context: crate::host_context::PipelineHostContext::default(),
+        }
+    }
+
+    pub fn with_host_context(mut self, host_context: crate::host_context::PipelineHostContext) -> Self {
+        self.host_context = host_context;
+        self
+    }
+}
 
 #[async_trait]
 impl Handler for NotifyHandler {
@@ -1299,6 +1314,21 @@ impl Handler for NotifyHandler {
             .prompt
             .as_deref()
             .unwrap_or("pipeline notification");
+
+        // If a subagent output router is available, write the notification
+        // into the session's output stream so the UI can display it.
+        // Otherwise fall back to returning it as the outcome content.
+        if let Some(router) = &self.host_context.subagent_output_router {
+            let session_id = self
+                .host_context
+                .parent_session_key
+                .as_deref()
+                .unwrap_or("pipeline");
+            let task_id = format!("notify-{}", node.id);
+            let _ = router.append(session_id, &task_id, message.as_bytes());
+            let _ = router.mark_terminal(&task_id);
+        }
+
         Ok(NodeOutcome {
             node_id: node.id.clone(),
             status: OutcomeStatus::Pass,
