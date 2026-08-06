@@ -1796,6 +1796,11 @@ impl ProfileStore {
                     &old_email.feishu_app_secret,
                 );
             }
+            if let (Some(new_smart_home), Some(old_smart_home)) =
+                (&mut profile.config.smart_home, &existing.config.smart_home)
+            {
+                restore_masked_optional_secret(&mut new_smart_home.token, &old_smart_home.token);
+            }
         }
         self.save(profile)
     }
@@ -4487,6 +4492,67 @@ mod tests {
             email.feishu_app_secret.as_deref(),
             Some("real-feishu-app-secret")
         );
+    }
+
+    /// Build a profile whose `config.smart_home` carries a literal token.
+    fn smart_home_secret_profile(id: &str) -> UserProfile {
+        UserProfile {
+            id: id.into(),
+            name: "Smart Home Secrets".into(),
+            enabled: false,
+            data_dir: None,
+            parent_id: None,
+            public_subdomain: None,
+            config: ProfileConfig {
+                smart_home: Some(SmartHomeConfig {
+                    bridge_url: Some("http://192.168.1.50:8787".into()),
+                    token: Some("real-bridge-token".into()),
+                    token_env: None,
+                }),
+                ..Default::default()
+            },
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn test_save_with_merge_preserves_masked_smart_home_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ProfileStore::open_unified(dir.path()).unwrap();
+        store.save(&smart_home_secret_profile("sh-merge")).unwrap();
+
+        // A client GETs the masked profile and PUTs it straight back — the
+        // settings page does exactly this for every unrelated config save.
+        let mut round_tripped = mask_secrets(&store.get("sh-merge").unwrap().unwrap());
+        store.save_with_merge(&mut round_tripped).unwrap();
+
+        let loaded = store.get("sh-merge").unwrap().unwrap();
+        let smart_home = loaded
+            .config
+            .smart_home
+            .expect("smart_home settings survive the merge");
+        assert_eq!(smart_home.token.as_deref(), Some("real-bridge-token"));
+        assert_eq!(
+            smart_home.bridge_url.as_deref(),
+            Some("http://192.168.1.50:8787")
+        );
+    }
+
+    #[test]
+    fn test_save_with_merge_allows_changing_smart_home_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ProfileStore::open_unified(dir.path()).unwrap();
+        store.save(&smart_home_secret_profile("sh-change")).unwrap();
+
+        // A genuinely new value is NOT a display artifact, so it must land.
+        let mut updated = smart_home_secret_profile("sh-change");
+        updated.config.smart_home.as_mut().unwrap().token = Some("rotated-bridge-token".into());
+        store.save_with_merge(&mut updated).unwrap();
+
+        let loaded = store.get("sh-change").unwrap().unwrap();
+        let smart_home = loaded.config.smart_home.unwrap();
+        assert_eq!(smart_home.token.as_deref(), Some("rotated-bridge-token"));
     }
 
     #[test]
