@@ -65,4 +65,4 @@ If you built with the `api` feature, start the web dashboard:
 octos serve
 ```
 
-Then open `http://localhost:50080` in your browser.
+Then open `http://localhost:50080` in your browser — it lands on the octos-web app (`/app/`). The admin dashboard stays available at `/admin/`.
