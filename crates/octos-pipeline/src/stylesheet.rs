@@ -131,6 +131,9 @@ fn handler_kind_str(kind: &HandlerKind) -> &'static str {
         HandlerKind::Noop => "noop",
         HandlerKind::Parallel => "parallel",
         HandlerKind::DynamicParallel => "dynamic_parallel",
+        HandlerKind::ShellCheck => "shell_check",
+        HandlerKind::Notify => "notify",
+        HandlerKind::Wait => "wait",
     }
 }
 

@@ -43,6 +43,9 @@ impl ValidationProfile {
             HandlerKind::Noop,
             HandlerKind::Parallel,
             HandlerKind::DynamicParallel,
+            HandlerKind::ShellCheck,
+            HandlerKind::Notify,
+            HandlerKind::Wait,
         ]
         .into_iter()
         .collect();
@@ -118,6 +121,11 @@ pub fn validate_under_profile(
             ));
         }
         if profile.ban_shell {
+            // ShellCheck is a dedicated handler for IR palette `shell_check`
+            // nodes: it runs a fixed compile-time-locked command string, NOT
+            // arbitrary code execution. It is not `HandlerKind::Shell`, so it
+            // is not banned. The `handler == Shell` check below only catches
+            // free-form DOT `handler=shell` nodes.
             if node.handler == HandlerKind::Shell {
                 violations.push(ProfileViolation::node(&node.id, "shell handler is banned"));
             }

@@ -245,6 +245,14 @@ pub enum HandlerKind {
     /// Dynamic fan-out: LLM plans N sub-tasks at runtime, executes them
     /// in parallel, merges results, then jumps to the `converge` node.
     DynamicParallel,
+    /// IR palette `shell_check`: run a fixed command string (no LLM tool
+    /// surface). Distinct from `Shell` which is arbitrary code execution
+    /// and banned — ShellCheck carries a compile-time-locked command.
+    ShellCheck,
+    /// IR palette `notify`: send a notification to the user. No LLM call.
+    Notify,
+    /// IR palette `wait`: pause or poll for a condition. No LLM call.
+    Wait,
 }
 
 impl HandlerKind {

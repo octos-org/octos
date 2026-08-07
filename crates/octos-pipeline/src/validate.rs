@@ -242,6 +242,9 @@ pub fn diagnostics_with_context(
 fn rule_23_no_shell(graph: &PipelineGraph, diags: &mut Vec<PipelineDiagnostic>) {
     use crate::graph::HandlerKind;
     for node in graph.nodes.values() {
+        // ShellCheck is a dedicated handler for IR palette `shell_check` nodes:
+        // it runs a fixed compile-time-locked command string, NOT arbitrary
+        // code execution. It is not `HandlerKind::Shell`, so it is not banned.
         if node.handler == HandlerKind::Shell {
             push_diag(
                 diags,
