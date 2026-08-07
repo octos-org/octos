@@ -30,7 +30,10 @@ use crate::graph::{
     PipelineGraph, PipelineNode,
 };
 use crate::guard::{GuardContext, GuardDecision, PipelineGuard};
-use crate::handler::{CodergenHandler, GateHandler, HandlerContext, HandlerRegistry, NoopHandler, NotifyHandler, ShellCheckHandler, WaitHandler};
+use crate::handler::{
+    CodergenHandler, GateHandler, HandlerContext, HandlerRegistry, NoopHandler, NotifyHandler,
+    ShellCheckHandler, WaitHandler,
+};
 use crate::parser::parse_dot;
 use crate::validate;
 

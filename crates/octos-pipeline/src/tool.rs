@@ -2850,7 +2850,10 @@ mod tests {
         assert!(eval(Some("true")), "OCTOS_PIPELINE_IR=true → ON");
         assert!(!eval(Some("0")), "OCTOS_PIPELINE_IR=0 → OFF");
         assert!(!eval(Some("false")), "OCTOS_PIPELINE_IR=false → OFF");
-        assert!(!eval(Some("FALSE")), "OCTOS_PIPELINE_IR=FALSE → OFF (case-insensitive)");
+        assert!(
+            !eval(Some("FALSE")),
+            "OCTOS_PIPELINE_IR=FALSE → OFF (case-insensitive)"
+        );
         assert!(eval(Some("anything")), "any other value → ON");
     }
 
@@ -2859,17 +2862,22 @@ mod tests {
         let tool = make_ir_tool(true).await;
         // Test each new node kind passes pre-flight validation
         let kinds = vec![
-            (r#"{"type":"code_review","prompt":"audit this"}"#, "code_review"),
+            (
+                r#"{"type":"code_review","prompt":"audit this"}"#,
+                "code_review",
+            ),
             (r#"{"type":"code_edit","prompt":"fix it"}"#, "code_edit"),
-            (r#"{"type":"shell_check","command":"cargo test"}"#, "shell_check"),
+            (
+                r#"{"type":"shell_check","command":"cargo test"}"#,
+                "shell_check",
+            ),
             (r#"{"type":"sub_agent","task":"review PR"}"#, "sub_agent"),
             (r#"{"type":"notify","message":"done"}"#, "notify"),
             (r#"{"type":"wait","seconds":5}"#, "wait"),
         ];
         for (kind_json, name) in kinds {
-            let ir = format!(
-                r#"{{"id":"test-{name}","nodes":[{{"id":"n1","kind":{kind_json}}}]}}"#
-            );
+            let ir =
+                format!(r#"{{"id":"test-{name}","nodes":[{{"id":"n1","kind":{kind_json}}}]}}"#);
             let args = serde_json::json!({"input": "test", "ir": ir});
             assert!(
                 tool.pre_flight_validate(&args).await.is_ok(),

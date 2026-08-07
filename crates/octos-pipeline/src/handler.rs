@@ -1261,7 +1261,13 @@ impl Handler for ShellCheckHandler {
                 .output(),
         )
         .await
-        .map_err(|_| eyre::eyre!("shell_check '{}' timed out after {}s", node.id, timeout.as_secs()))?
+        .map_err(|_| {
+            eyre::eyre!(
+                "shell_check '{}' timed out after {}s",
+                node.id,
+                timeout.as_secs()
+            )
+        })?
         .map_err(|e| eyre::eyre!("shell_check '{}' failed to spawn: {e}", node.id))?;
 
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -1294,6 +1300,12 @@ pub struct NotifyHandler {
     host_context: crate::host_context::PipelineHostContext,
 }
 
+impl Default for NotifyHandler {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl NotifyHandler {
     pub fn new() -> Self {
         Self {
@@ -1301,7 +1313,10 @@ impl NotifyHandler {
         }
     }
 
-    pub fn with_host_context(mut self, host_context: crate::host_context::PipelineHostContext) -> Self {
+    pub fn with_host_context(
+        mut self,
+        host_context: crate::host_context::PipelineHostContext,
+    ) -> Self {
         self.host_context = host_context;
         self
     }
@@ -1309,11 +1324,12 @@ impl NotifyHandler {
 
 #[async_trait]
 impl Handler for NotifyHandler {
-    async fn execute(&self, node: &PipelineNode, ctx: &HandlerContext) -> Result<NodeOutcome> {
-        let message = node
-            .prompt
-            .as_deref()
-            .unwrap_or("pipeline notification");
+    // `_ctx` unused on purpose: this handler routes through its OWN
+    // `host_context` (set via `with_host_context`) rather than the per-run
+    // HandlerContext, so it can reach the subagent output router. The
+    // parameter stays to satisfy the trait.
+    async fn execute(&self, node: &PipelineNode, _ctx: &HandlerContext) -> Result<NodeOutcome> {
+        let message = node.prompt.as_deref().unwrap_or("pipeline notification");
 
         // If a subagent output router is available, write the notification
         // into the session's output stream so the UI can display it.
@@ -1352,7 +1368,10 @@ impl Handler for WaitHandler {
         let prompt = node.prompt.as_deref().unwrap_or("");
 
         // Fixed sleep: "wait Ns"
-        if let Some(secs_str) = prompt.strip_prefix("wait ").and_then(|s| s.strip_suffix("s")) {
+        if let Some(secs_str) = prompt
+            .strip_prefix("wait ")
+            .and_then(|s| s.strip_suffix("s"))
+        {
             if let Ok(secs) = secs_str.parse::<u64>() {
                 tokio::time::sleep(std::time::Duration::from_secs(secs)).await;
                 return Ok(NodeOutcome {
