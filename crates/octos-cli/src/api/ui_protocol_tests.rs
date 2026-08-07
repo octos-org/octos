@@ -258,6 +258,131 @@ async fn compaction_started_precedes_completed_in_lifecycle_batch() {
     assert_eq!(started.trigger, "preflight");
 }
 
+/// Provider stub for the open-snapshot compaction tests. The window must be
+/// LARGE relative to the compaction floor (16 kept items + a ≤4096-token
+/// summary) so a successful pass actually lands under threshold — with a toy
+/// window the keep-floor dominates and the assertion would test nothing. 64K
+/// window → ~45K threshold; 60×4000-char messages ≈ 60K estimate. `chat` is
+/// unreachable because the deterministic summarizer never calls the model.
+struct OpenSnapshotTinyProvider;
+#[async_trait::async_trait]
+impl octos_llm::LlmProvider for OpenSnapshotTinyProvider {
+    async fn chat(
+        &self,
+        _messages: &[octos_core::Message],
+        _tools: &[octos_llm::ToolSpec],
+        _config: &octos_llm::ChatConfig,
+    ) -> eyre::Result<octos_llm::ChatResponse> {
+        unreachable!("open-snapshot compaction never calls the provider")
+    }
+    fn model_id(&self) -> &str {
+        "tiny"
+    }
+    fn provider_name(&self) -> &str {
+        "tiny"
+    }
+    fn context_window(&self) -> u32 {
+        65_536
+    }
+}
+
+fn open_snapshot_padding_history(messages: usize) -> Vec<octos_core::Message> {
+    (0..messages)
+        .map(|i| octos_core::Message {
+            role: octos_core::MessageRole::User,
+            content: format!("padding message {i}: {}", "x".repeat(4000)),
+            media: vec![],
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+            client_message_id: None,
+            thread_id: None,
+            timestamp: chrono::Utc::now(),
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn session_open_snapshot_compacts_oversized_context() {
+    // Field report 2026-08-07: a session whose ledger is REBUILT from a long
+    // raw history at `session/open` (legacy/stale/missing snapshot) published
+    // and persisted an over-window estimate — the TUI gauge sat at
+    // `ctx 1.2M/1M` from open until the next turn's pre-turn pass finally
+    // compacted. Open must run the SAME threshold compaction the pre-turn
+    // path would run, so the published state is never over the window the
+    // session's own provider reports.
+    let dir = tempfile::tempdir().unwrap();
+    let session: SessionKey = SessionKey("full:api:open-compact".to_string());
+    let history = open_snapshot_padding_history(60);
+    let provider: Arc<dyn octos_llm::LlmProvider> = Arc::new(OpenSnapshotTinyProvider);
+    let threshold = appui_context_compact_threshold_tokens(provider.as_ref());
+
+    let (_value, context_state) =
+        appui_context_open_snapshot(dir.path(), &session, &history, Some(&provider));
+
+    assert!(
+        context_state.token_estimate <= threshold,
+        "open snapshot must compact an over-threshold context before publishing \
+         (estimate {} > threshold {threshold})",
+        context_state.token_estimate,
+    );
+    assert!(
+        context_state.last_compaction_id.is_some(),
+        "the open-time pass must be recorded as a real compaction"
+    );
+
+    // The compacted manager — not the oversized rebuild — must be what
+    // persisted: a reload sees the small estimate and a LOADED ledger.
+    let (reloaded, status) = crate::context_manager::load_or_rebuild_context_manager(
+        dir.path(),
+        session.to_string(),
+        None,
+        &history,
+    );
+    assert_eq!(
+        status,
+        crate::context_manager::ContextLedgerLoadStatus::Loaded,
+        "the persisted open snapshot must cover the history it was built from"
+    );
+    assert!(reloaded.state().token_estimate <= threshold);
+}
+
+#[tokio::test]
+async fn session_open_snapshot_leaves_small_context_untouched() {
+    // Under-threshold sessions must open exactly as before: no compaction
+    // record, estimate untouched.
+    let dir = tempfile::tempdir().unwrap();
+    let session: SessionKey = SessionKey("full:api:open-small".to_string());
+    let history = open_snapshot_padding_history(1);
+    let provider: Arc<dyn octos_llm::LlmProvider> = Arc::new(OpenSnapshotTinyProvider);
+
+    let (_value, context_state) =
+        appui_context_open_snapshot(dir.path(), &session, &history, Some(&provider));
+
+    assert!(
+        context_state.last_compaction_id.is_none(),
+        "an under-threshold open must not compact"
+    );
+}
+
+#[tokio::test]
+async fn session_open_snapshot_without_provider_never_compacts() {
+    // No provider (no materialized session runtime — e.g. a profile-less
+    // open) means no window to derive a threshold from. Compacting against a
+    // guessed default could DESTRUCTIVELY over-compact a long-window session,
+    // so the open snapshot must fail open: publish as-is, like today.
+    let dir = tempfile::tempdir().unwrap();
+    let session: SessionKey = SessionKey("full:api:open-noprov".to_string());
+    let history = open_snapshot_padding_history(60);
+
+    let (_value, context_state) = appui_context_open_snapshot(dir.path(), &session, &history, None);
+
+    assert!(
+        context_state.last_compaction_id.is_none(),
+        "without a provider the open snapshot must not compact"
+    );
+}
+
 #[test]
 fn post_terminal_drain_skips_late_tokens_but_keeps_background_progress() {
     // Regression for the "queued N messages after active turn" wedge: the

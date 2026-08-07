@@ -4155,6 +4155,128 @@ fn appui_context_prompt_policy(llm_provider: &dyn octos_llm::LlmProvider) -> Pro
     }
 }
 
+/// Threshold-gated compaction body shared by the pre-turn prompt path and the
+/// session-open snapshot. Compacts `manager` IN PLACE when its estimate
+/// exceeds the provider-derived threshold and returns the lifecycle
+/// started/completed notifications describing the pass; empty when the
+/// estimate is already under threshold.
+fn appui_compact_context_if_over_threshold(
+    manager: &mut ContextManager,
+    session_id: &SessionKey,
+    llm_provider: &Arc<dyn octos_llm::LlmProvider>,
+    llm_compaction_enabled: bool,
+    trigger: &str,
+) -> Vec<UiNotification> {
+    let threshold = appui_context_compact_threshold_tokens(llm_provider.as_ref());
+    let policy = appui_context_prompt_policy(llm_provider.as_ref());
+    let state = manager.state();
+    if state.token_estimate <= threshold {
+        return Vec::new();
+    }
+    let mut lifecycle_notifications = Vec::new();
+    // UPCR-2026-026: the started event precedes the (synchronous) pass;
+    // clients render the in-progress state from it and must tolerate
+    // started/completed arriving in one delivery batch.
+    lifecycle_notifications.push(UiNotification::ContextCompactionStarted(
+        ContextCompactionStartedEvent {
+            session_id: session_id.clone(),
+            context_state: ui_context_state_for(session_id, manager),
+            trigger: trigger.to_owned(),
+            threshold_tokens: threshold,
+        },
+    ));
+    let before = manager.for_prompt(&policy);
+    let summary_budget = threshold.clamp(256, 4096) as u32;
+    let summary = if llm_compaction_enabled {
+        appui_compaction_summary(llm_provider, &before.messages, summary_budget)
+    } else {
+        octos_agent::compaction::compact_messages(&before.messages, summary_budget)
+    };
+    let record = manager.compact_context(
+        summary,
+        CompactContextPolicy {
+            trigger: trigger.to_owned(),
+            keep_recent_items: appui_context_compact_keep_items(),
+            ..CompactContextPolicy::default()
+        },
+    );
+    info!(
+        session = %session_id.0,
+        compaction_id = %record.compaction_id.as_str(),
+        checkpoint_id = %record.checkpoint_id.as_str(),
+        input_generation = record.input_generation,
+        output_generation = ?record.output_generation,
+        token_estimate_before = record.token_estimate_before,
+        token_estimate_after = ?record.token_estimate_after,
+        trigger,
+        "appui context manager compact_context installed before model prompt"
+    );
+    lifecycle_notifications.push(appui_context_compaction_notification(
+        session_id, manager, &record,
+    ));
+    lifecycle_notifications
+}
+
+/// Session-open flavor of [`appui_context_inspection_snapshot`]: same
+/// load → publish → persist, but first runs the SAME threshold compaction the
+/// pre-turn path would run on the next message. Without this, a session whose
+/// ledger was REBUILT from a long raw history (legacy/stale/invalid snapshot)
+/// publishes an over-window estimate that sits on the client's context gauge
+/// from open until the first turn — field report 2026-08-07: a freshly booted
+/// serve hydrated a 3k-message session to a 1.17M-token ledger and the TUI
+/// read `ctx 1.2M/1M` while idle.
+///
+/// `llm_provider` is the SAME provider the session's turns resolve (peer lane
+/// → profile primary); its `context_window()` derives the threshold. `None`
+/// (no materialized session runtime) fails OPEN — publish as-is — because
+/// compacting against a guessed default window could destructively
+/// over-compact a long-window session's context.
+///
+/// The compaction here is always the DETERMINISTIC summarizer
+/// (`llm_compaction_enabled=false`): `session/open` is an interactive RPC and
+/// must not spend an LLM call per session at boot. Lifecycle
+/// started/completed notifications are intentionally not delivered from this
+/// path — the open result carries (and `publish_appui_context_status`
+/// broadcasts) the post-compaction STATE, which is what drives the gauge; the
+/// progress events only narrate mid-turn passes.
+fn appui_context_open_snapshot(
+    data_dir: &Path,
+    session_id: &SessionKey,
+    history: &[Message],
+    llm_provider: Option<&Arc<dyn octos_llm::LlmProvider>>,
+) -> (Value, UiContextState) {
+    let (mut manager, ledger_status) =
+        load_or_rebuild_context_manager(data_dir, session_id.to_string(), None, history);
+    tracing::debug!(
+        session = %session_id.0,
+        ledger_status = ?ledger_status,
+        "appui context manager loaded for session open"
+    );
+    if let Some(provider) = llm_provider {
+        let _ = appui_compact_context_if_over_threshold(
+            &mut manager,
+            session_id,
+            provider,
+            false,
+            "appui_open",
+        );
+    }
+    publish_appui_context_status(session_id, &manager);
+    if let Err(error) =
+        persist_context_manager_snapshot(data_dir, &session_id.to_string(), &manager)
+    {
+        warn!(
+            session = %session_id.0,
+            error = %error,
+            "failed to persist appui context manager open snapshot"
+        );
+    }
+    (
+        appui_context_status_value(&manager),
+        ui_context_state_for(session_id, &manager),
+    )
+}
+
 fn appui_context_history_for_agent(
     data_dir: &Path,
     session_id: &SessionKey,
@@ -4169,57 +4291,19 @@ fn appui_context_history_for_agent(
 ) {
     let (mut manager, ledger_status) =
         load_or_rebuild_context_manager(data_dir, session_id.to_string(), None, history);
-    let mut lifecycle_notifications = Vec::new();
     tracing::debug!(
         session = %session_id.0,
         ledger_status = ?ledger_status,
         "appui context manager loaded for turn"
     );
-    let threshold = appui_context_compact_threshold_tokens(llm_provider.as_ref());
     let policy = appui_context_prompt_policy(llm_provider.as_ref());
-    let state = manager.state();
-    if state.token_estimate > threshold {
-        // UPCR-2026-026: the started event precedes the (synchronous) pass;
-        // clients render the in-progress state from it and must tolerate
-        // started/completed arriving in one delivery batch.
-        lifecycle_notifications.push(UiNotification::ContextCompactionStarted(
-            ContextCompactionStartedEvent {
-                session_id: session_id.clone(),
-                context_state: ui_context_state_for(session_id, &manager),
-                trigger: trigger.to_owned(),
-                threshold_tokens: threshold,
-            },
-        ));
-        let before = manager.for_prompt(&policy);
-        let summary_budget = threshold.clamp(256, 4096) as u32;
-        let summary = if llm_compaction_enabled {
-            appui_compaction_summary(llm_provider, &before.messages, summary_budget)
-        } else {
-            octos_agent::compaction::compact_messages(&before.messages, summary_budget)
-        };
-        let record = manager.compact_context(
-            summary,
-            CompactContextPolicy {
-                trigger: trigger.to_owned(),
-                keep_recent_items: appui_context_compact_keep_items(),
-                ..CompactContextPolicy::default()
-            },
-        );
-        info!(
-            session = %session_id.0,
-            compaction_id = %record.compaction_id.as_str(),
-            checkpoint_id = %record.checkpoint_id.as_str(),
-            input_generation = record.input_generation,
-            output_generation = ?record.output_generation,
-            token_estimate_before = record.token_estimate_before,
-            token_estimate_after = ?record.token_estimate_after,
-            trigger,
-            "appui context manager compact_context installed before model prompt"
-        );
-        lifecycle_notifications.push(appui_context_compaction_notification(
-            session_id, &manager, &record,
-        ));
-    }
+    let mut lifecycle_notifications = appui_compact_context_if_over_threshold(
+        &mut manager,
+        session_id,
+        llm_provider,
+        llm_compaction_enabled,
+        trigger,
+    );
     publish_appui_context_status(session_id, &manager);
     if let Err(error) =
         persist_context_manager_snapshot(data_dir, &session_id.to_string(), &manager)
@@ -18141,6 +18225,12 @@ async fn open_session_result(
     // UI without being mistaken for an explicit cwd on a later cache lookup.
     let mut effective_workspace_root: Option<PathBuf> = None;
     let mut effective_runtime_hint: Option<PathBuf> = None;
+    // The provider the open-time context snapshot derives its compaction
+    // threshold from — the SAME peer-lane→profile-primary resolution the
+    // session's turns use. Stays `None` when no session runtime
+    // materializes (profile-less open), which makes the snapshot fail open
+    // (publish without compacting) rather than guess a window.
+    let mut open_context_provider: Option<Arc<dyn octos_llm::LlmProvider>> = None;
     if let Some(profile_runtime) =
         resolve_session_profile_runtime(state, active_profile_id.as_deref())
     {
@@ -18175,6 +18265,10 @@ async fn open_session_result(
                 // this session's turns later append) under the per-cwd
                 // storage identity. No-op when the store wasn't relocated.
                 register_session_ledger_scope(ledger, &runtime);
+                open_context_provider = Some(
+                    peer_lane_provider_for(&params.session_id, &runtime)
+                        .unwrap_or_else(|| runtime.profile.llm.clone()),
+                );
                 effective_workspace_root = Some(runtime.workspace_root.clone());
                 effective_runtime_hint = effective_workspace_hint
                     .as_ref()
@@ -18316,8 +18410,12 @@ async fn open_session_result(
         let session = sessions.get_or_create(&params.session_id).await;
         (data_dir, session.messages.clone())
     };
-    let (context, context_state) =
-        appui_context_inspection_snapshot(&data_dir, &params.session_id, &history);
+    let (context, context_state) = appui_context_open_snapshot(
+        &data_dir,
+        &params.session_id,
+        &history,
+        open_context_provider.as_ref(),
+    );
     let (context, context_state) = if features.context_lifecycle_available() {
         (Some(context), Some(context_state))
     } else {
