@@ -142,24 +142,11 @@ pub struct Digest {
 
 impl Digest {
     /// Rendered size, against which [`DigestOptions::max_chars`] is enforced.
+    ///
+    /// Uses actual JSON serialization size (bytes), not a hand-rolled estimate.
+    /// This ensures the budget is real, not approximate.
     pub fn size(&self) -> usize {
-        let f = |s: &str| s.len();
-        self.new_findings
-            .iter()
-            .map(|x| f(&x.claim) + f(&x.component) + f(&x.id))
-            .chain(
-                self.overturns
-                    .iter()
-                    .map(|x| f(&x.old_claim) + f(&x.new_claim)),
-            )
-            .chain(self.stale.iter().map(|x| f(&x.claim) + f(&x.component)))
-            .chain(
-                self.cluster_hints
-                    .iter()
-                    .map(|x| f(&x.component) + x.paths.iter().map(|p| f(p)).sum::<usize>()),
-            )
-            .chain(self.cost_by_path.iter().map(|x| f(&x.path) + 24))
-            .sum()
+        serde_json::to_string(self).map(|s| s.len()).unwrap_or(0)
     }
 }
 
@@ -295,9 +282,25 @@ pub fn digest(findings: &[Finding], opts: &DigestOptions) -> Digest {
         cluster_hints,
         cost_by_path: costs.into_values().collect(),
         dropped: Vec::new(),
-        watermark,
+        watermark: 0, // Set after trim
     };
     enforce_budget(&mut out, opts.max_chars);
+    
+    // Set watermark to the highest seq actually included (after trim).
+    // This prevents permanent data loss: if findings were dropped, the
+    // watermark stays low so the controller can resume from the correct point.
+    out.watermark = out
+        .new_findings
+        .iter()
+        .map(|f| {
+            // Extract seq from finding id (format: "f-{seq}")
+            f.id.strip_prefix("f-")
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(0)
+        })
+        .max()
+        .unwrap_or(opts.since_seq);
+    
     out
 }
 
