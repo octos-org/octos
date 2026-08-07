@@ -5286,7 +5286,7 @@ async fn test_queue_mode_collect_batches() {
 
 /// Steer mode keeps only the newest queued message, discards older ones.
 #[tokio::test]
-async fn test_queue_mode_steer_keeps_newest() {
+async fn test_queue_mode_latest_keeps_newest() {
     let dir = tempfile::TempDir::new().unwrap();
 
     // Agent: 1st call slow (2s), 2nd call fast
@@ -5299,7 +5299,7 @@ async fn test_queue_mode_steer_keeps_newest() {
     ));
 
     let (tx, mut rx, handle, _session_mgr) =
-        setup_actor_with_mode(agent_llm, QueueMode::Steer, None, false, &dir).await;
+        setup_actor_with_mode(agent_llm, QueueMode::Latest, None, false, &dir).await;
 
     // Send first message → goes through 500ms coalescing delay, then starts 2s processing
     tx.send(make_inbound("first message")).await.unwrap();
