@@ -11,10 +11,15 @@ use octos_llm::ominix::OminixClient;
 
 use crate::config::CloudTtsConfig;
 
-/// 解析 OminiX 服务基址（平台级，env 优先）。与 `api/admin.rs` 的同名 helper 等价；
-/// 抽到此处避免跨模块可见性问题。
+/// 解析批量 ASR 服务基址。`ASR_API_URL` 指向独立 ASR 时优先；未设置时回退到
+/// OminiX，保留既有部署行为。
 // TODO(later-tasks): remove dead_code allow once callers are wired up.
 #[allow(dead_code)]
+fn asr_base_url() -> String {
+    crate::skills_scope::discover_asr_url().unwrap_or_else(|| "http://127.0.0.1:8081".to_string())
+}
+
+/// TTS remains on OminiX even when ASR is redirected to a separate service.
 fn ominix_base_url() -> String {
     crate::skills_scope::discover_ominix_url()
         .unwrap_or_else(|| "http://127.0.0.1:8081".to_string())
@@ -39,7 +44,7 @@ pub(crate) async fn transcribe_audio_media(
     media: &[String],
     language: Option<&str>,
 ) -> Vec<String> {
-    transcribe_audio_media_with_base_url(media, language, &ominix_base_url()).await
+    transcribe_audio_media_with_base_url(media, language, &asr_base_url()).await
 }
 
 async fn transcribe_audio_media_with_base_url(
@@ -1504,7 +1509,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn should_send_reloaded_profile_asr_language_to_ominix_request() {
+    async fn should_send_reloaded_profile_asr_language_to_asr_request() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

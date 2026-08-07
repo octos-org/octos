@@ -132,7 +132,7 @@ async fn next_gateway_loop_event(
 
 // `discover_ominix_url` and `push_runtime_plugin_env` live in
 // `crate::skills_scope` so the `serve` plugin loader can reuse them.
-use crate::skills_scope::{discover_ominix_url, push_runtime_plugin_env};
+use crate::skills_scope::{discover_asr_url, discover_ominix_url, push_runtime_plugin_env};
 
 async fn apply_profile_runtime_contracts(
     profile: &UserProfile,
@@ -594,8 +594,9 @@ impl GatewayRuntime {
             .join("voice")
             .join("main");
         let ominix_url = discover_ominix_url();
+        let asr_url = discover_asr_url();
         let asr_binary =
-            if let Some(url) = ominix_url.as_deref().filter(|_| voice_binary_path.exists()) {
+            if let Some(url) = asr_url.as_deref().filter(|_| voice_binary_path.exists()) {
                 println!("{}: voice platform skill ({})", "Transcriber".green(), url);
                 println!("{}: {} ({})", "Voice".green(), "enabled".green(), url);
                 Some(voice_binary_path)
@@ -1951,6 +1952,14 @@ impl GatewayRuntime {
                 &self.channel_mgr,
             )
             .await;
+            if media_result.rejected_audio_only {
+                info!(
+                    channel = %inbound.channel,
+                    chat_id = %inbound.chat_id,
+                    "ASR rejected audio-only inbound message; skipping agent dispatch"
+                );
+                continue;
+            }
             let image_media = media_result.image_media;
             let attachment_media = media_result.attachment_media;
             let attachment_prompt = media_result.attachment_prompt;

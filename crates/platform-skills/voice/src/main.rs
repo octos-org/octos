@@ -1,8 +1,10 @@
-//! Voice platform skill binary (ASR, preset-voice TTS, model management) via ominix-api.
+//! Voice platform skill binary (ASR, preset-voice TTS, model management).
 //!
 //! Protocol: `./main <tool_name>` with JSON on stdin, JSON on stdout.
-//! Auto-discovers ominix-api via OMINIX_API_URL, ~/.ominix/api_url, or by
-//! probing common default ports (9090, 8080, 8081).
+//! ASR may use an independent Octos/OMiniX-compatible JSON endpoint via
+//! ASR_API_URL.
+//! TTS and model management use OminiX via OMINIX_API_URL, ~/.ominix/api_url,
+//! or the default ports (9090, 8080, 8081).
 //!
 //! NOTE: Voice cloning and custom voice profiles are handled by mofa-fm.
 //! This skill only supports preset voices for TTS.
@@ -61,6 +63,22 @@ const DEFAULT_CANDIDATE_URLS: &[&str] = &[
     "http://localhost:8081",
 ];
 
+const QWEN3_ASR_PATH: &str = "/v1/audio/asr/qwen3";
+const STANDARD_TRANSCRIPTION_PATH: &str = "/v1/audio/transcriptions";
+
+/// ASR route and base URL. `ASR_API_URL` selects the standard transcription
+/// path with Octos' JSON + base64 request contract; omitting it preserves the
+/// existing Qwen3 route.
+#[derive(Debug, PartialEq, Eq)]
+struct AsrEndpoint {
+    base_url: String,
+    path: &'static str,
+    /// OMiniX keeps its existing preflight health check. A dedicated ASR is
+    /// validated by the transcription request itself because
+    /// `/health` is not part of the external-ASR contract.
+    requires_health_check: bool,
+}
+
 /// Normalize a base URL: trim trailing slash, reject empty.
 fn normalize_base_url(url: &str) -> Option<String> {
     let trimmed = url.trim().trim_end_matches('/');
@@ -76,6 +94,35 @@ fn env_base_url() -> Option<String> {
     std::env::var("OMINIX_API_URL")
         .ok()
         .and_then(|v| normalize_base_url(&v))
+}
+
+/// Read the optional dedicated ASR endpoint. It intentionally has no
+/// discovery-file fallback: the file identifies OminiX, whereas this URL may
+/// point to a separate batch ASR service such as local Whisper.
+fn env_asr_base_url() -> Option<String> {
+    std::env::var("ASR_API_URL")
+        .ok()
+        .and_then(|v| normalize_base_url(&v))
+}
+
+fn resolve_asr_endpoint<F>(asr_url: Option<String>, discover_ominix_url: F) -> Option<AsrEndpoint>
+where
+    F: FnOnce() -> Option<String>,
+{
+    if let Some(base_url) = asr_url.and_then(|url| normalize_base_url(&url)) {
+        return Some(AsrEndpoint {
+            base_url,
+            path: STANDARD_TRANSCRIPTION_PATH,
+            requires_health_check: false,
+        });
+    }
+    discover_ominix_url()
+        .and_then(|url| normalize_base_url(&url))
+        .map(|base_url| AsrEndpoint {
+            base_url,
+            path: QWEN3_ASR_PATH,
+            requires_health_check: true,
+        })
 }
 
 /// Read discovery file `~/.ominix/api_url`, normalized.
@@ -145,6 +192,12 @@ fn discover_api_base_url() -> Option<String> {
         DEFAULT_CANDIDATE_URLS,
         |url| probe_candidate(&client, url),
     )
+}
+
+/// Resolve ASR independently from OminiX. A dedicated service has priority;
+/// retaining the OminiX fallback leaves existing Qwen3 deployments unchanged.
+fn discover_asr_endpoint() -> Option<AsrEndpoint> {
+    resolve_asr_endpoint(env_asr_base_url(), discover_api_base_url)
 }
 
 /// Resolve the API base URL for tools that *require* ominix-api (list_models,
@@ -352,17 +405,19 @@ fn handle_transcribe(input_json: &str) {
         }
     }
 
-    let base_url = match discover_api_base_url() {
-        Some(url) => url,
+    let endpoint = match discover_asr_endpoint() {
+        Some(endpoint) => endpoint,
         None => fail(
-            "ominix-api not reachable at OMINIX_API_URL, ~/.ominix/api_url, or default \
-             ports (9090/8080/8081). Start it with: ominix-api --port 8080",
+            "ASR service not configured. Set ASR_API_URL for an Octos-compatible \
+             JSON transcription endpoint, or start ominix-api and configure OMINIX_API_URL.",
         ),
     };
     let client = http_client();
-    eprintln!("Checking ominix-api health at {base_url}...");
-    if let Err(e) = check_health(&client, &base_url) {
-        fail(&e);
+    if endpoint.requires_health_check {
+        eprintln!("Checking OminiX health at {}...", endpoint.base_url);
+        if let Err(e) = check_health(&client, &endpoint.base_url) {
+            fail(&e);
+        }
     }
 
     let language = input.language.unwrap_or_else(|| "Chinese".to_string());
@@ -385,9 +440,10 @@ fn handle_transcribe(input_json: &str) {
         "response_format": "verbose_json"
     });
 
-    // Use model-specific ASR endpoint (Qwen3-ASR)
+    // A dedicated ASR service uses the standard transcription path with the
+    // Octos JSON contract; otherwise retain OminiX's model-specific Qwen3 path.
     let resp = match client
-        .post(format!("{base_url}/v1/audio/asr/qwen3"))
+        .post(format!("{}{}", endpoint.base_url, endpoint.path))
         .json(&body)
         .send()
     {
@@ -412,7 +468,10 @@ fn handle_transcribe(input_json: &str) {
 
     let text = result["text"].as_str().unwrap_or("").trim();
     if text.is_empty() {
-        fail("ASR returned empty transcription (silence or unsupported format)");
+        // Empty text is a successful ASR rejection (for example Whisper's
+        // no-speech decision), not an invocation failure. Gateway and serve
+        // paths use the successful empty result to end an audio-only turn.
+        succeed("");
     }
 
     let mut output = text.to_string();
@@ -816,6 +875,28 @@ mod tests {
         );
         assert_eq!(normalize_base_url("").as_deref(), None);
         assert_eq!(normalize_base_url("   ").as_deref(), None);
+    }
+
+    #[test]
+    fn should_skip_ominix_discovery_when_dedicated_asr_url_is_set() {
+        let endpoint = resolve_asr_endpoint(Some(" http://127.0.0.1:8091/ ".to_string()), || {
+            panic!("OminiX discovery must be lazy when ASR_API_URL is set")
+        })
+        .expect("dedicated ASR URL resolves");
+
+        assert_eq!(endpoint.base_url, "http://127.0.0.1:8091");
+        assert_eq!(endpoint.path, "/v1/audio/transcriptions");
+        assert!(!endpoint.requires_health_check);
+    }
+
+    #[test]
+    fn should_keep_qwen_endpoint_when_dedicated_asr_url_is_unset() {
+        let endpoint = resolve_asr_endpoint(None, || Some("http://127.0.0.1:8090".to_string()))
+            .expect("OminiX fallback resolves");
+
+        assert_eq!(endpoint.base_url, "http://127.0.0.1:8090");
+        assert_eq!(endpoint.path, "/v1/audio/asr/qwen3");
+        assert!(endpoint.requires_health_check);
     }
 
     // ── validate_synthesized_audio ────────────────────────────────────

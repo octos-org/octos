@@ -144,6 +144,21 @@ pub(crate) fn discover_ominix_url() -> Option<String> {
         })
 }
 
+/// Resolve the ASR endpoint independently from OminiX. `ASR_API_URL` is an
+/// explicit Octos/OMiniX JSON batch-transcription override at
+/// `/v1/audio/transcriptions`; without it, ASR continues to use OminiX for
+/// backward compatibility.
+pub(crate) fn discover_asr_url() -> Option<String> {
+    resolve_asr_url(std::env::var("ASR_API_URL").ok(), discover_ominix_url())
+}
+
+fn resolve_asr_url(explicit: Option<String>, ominix_fallback: Option<String>) -> Option<String> {
+    explicit
+        .map(|s| s.trim().trim_end_matches('/').to_string())
+        .filter(|s| !s.is_empty())
+        .or(ominix_fallback)
+}
+
 /// Append the standard per-profile runtime env vars onto a plugin-env
 /// vector. Mirrors the gateway path's call site at
 /// `gateway_runtime.rs:435` so the `serve` plugin loader can spawn
@@ -342,6 +357,28 @@ mod tests {
 
         let dirs = build_account_plugin_dirs(&data_dir);
         assert_eq!(dirs, vec![skills_dir]);
+    }
+
+    #[test]
+    fn should_prefer_explicit_asr_url_over_ominix_fallback() {
+        assert_eq!(
+            resolve_asr_url(
+                Some(" http://127.0.0.1:8093/ ".to_string()),
+                Some("http://127.0.0.1:8081".to_string()),
+            )
+            .as_deref(),
+            Some("http://127.0.0.1:8093")
+        );
+    }
+
+    #[test]
+    fn should_fall_back_to_ominix_when_asr_url_is_blank_or_missing() {
+        let fallback = Some("http://127.0.0.1:8081".to_string());
+        assert_eq!(
+            resolve_asr_url(Some("  ".to_string()), fallback.clone()),
+            fallback
+        );
+        assert_eq!(resolve_asr_url(None, fallback.clone()), fallback);
     }
 
     #[test]

@@ -1,0 +1,79 @@
+Nemotron 3.5 ASR 本地服务
+========================
+
+这台 Apple M4 Mac 上部署的是 NVIDIA nemotron-3.5-asr-streaming-0.6b
+Q8 GGUF 模型，使用官方 NeMo-Speech.cpp 的 Metal 后端。外层 Python 服务把
+OMiniX 使用的 JSON/base64 请求转换为 NeMo-Speech.cpp 接受的 multipart 请求。
+
+地址与文件
+----------
+
+- 兼容 API：http://127.0.0.1:8093
+- 内部 NeMo-Speech.cpp：http://127.0.0.1:8092
+- 现有 Whisper 服务继续使用 http://127.0.0.1:8091
+- 模型：~/.OminiX/models/nemotron-3.5-asr-streaming-0.6b/nemotron-3.5-asr-streaming-0.6b.q8_0.gguf
+- 运行时：~/.local/bin/nemo-speech
+- 日志：~/.OminiX/logs/nemotron-asr.log
+
+接口
+----
+
+OMiniX JSON/base64 转写：
+
+    POST /v1/audio/transcriptions
+    Content-Type: application/json
+
+    {
+      "file": "<base64 audio>",
+      "language": "Chinese",
+      "response_format": "verbose_json"
+    }
+
+兼容别名 POST /v1/audio/asr/qwen3。健康检查和模型信息分别为
+GET /health、GET /ready、GET /v1/models。
+
+无语音时仍返回 HTTP 200：
+
+    {
+      "text": "",
+      "rejected": true,
+      "reject_reason": "no_speech"
+    }
+
+Octos 使用独立 ASR 地址时：
+
+    export ASR_API_URL=http://127.0.0.1:8093
+
+服务管理
+--------
+
+前台调试：
+
+    python3 scripts/nemotron_asr_server.py
+
+后台运行（路径按本机实际位置调整）：
+
+    nohup python3 scripts/nemotron_asr_server.py \
+      > ~/.OminiX/logs/nemotron-asr.log 2>&1 &
+
+停止后台服务：
+
+    pkill -f 'scripts/nemotron_asr_server.py'
+
+本机回归结果
+------------
+
+以下是 M4 Metal、Q8_0、zh-CN 的单次实测。处理时间不含首次加载模型。
+
+| 音频                     | 时长    | 结果                 | 处理时间 |
+|--------------------------|---------|----------------------|----------|
+| 完全静音                 | 2.0 s   | 空文本，拒绝         | 0.51 s   |
+| UI 音效                  | 0.94 s  | 空文本，拒绝         | 0.06 s   |
+| 键盘敲击和环境声         | 18.77 s | 空文本，拒绝         | 0.39 s   |
+| “你好，小章鱼”           | 1.20 s  | “你好, 小张”         | 0.10 s   |
+| 同一语音降低 30 dB       | 1.20 s  | “你好, 小张”         | 0.06 s   |
+| 中文长语音               | 18.71 s | 有效转写，有若干错字 | 0.53 s   |
+
+结论：当前样本上，Nemotron 对非人声的空转写明显好于此机器上 Whisper small
+的默认配置；后者曾把 UI 音效幻觉成文字。Nemotron 的中文语义可用，但专名和
+近音词准确率仍需用业务语料评估，不能只凭这组小样本判断总体 WER。
