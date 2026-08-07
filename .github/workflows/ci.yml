@@ -428,6 +428,13 @@ jobs:
       - name: gateway_runtime regression (octos-cli)
         run: cargo test -p octos-cli gateway_runtime::tests --features api -- --nocapture
 
+      # Session-open context hydration lives in the `api`-gated ui_protocol
+      # module (same reason as the §6 guard): the open-time snapshot must run
+      # the pre-turn threshold compaction so a rebuilt ledger never publishes
+      # an over-window gauge (`ctx 1.2M/1M` field report, 2026-08-07).
+      - name: Session-open context compaction (octos-cli)
+        run: cargo test -p octos-cli --features api session_open_snapshot -- --nocapture
+
       # Peer staging/fencing lives in the `api`-gated ui_protocol module, so the
       # unfeatured runs above never compile it — same reason as the §6 guard.
       # These cover slug reservation, worktree fencing, and the rollback
