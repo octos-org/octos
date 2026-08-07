@@ -317,7 +317,7 @@ async fn session_open_snapshot_compacts_oversized_context() {
     let provider: Arc<dyn octos_llm::LlmProvider> = Arc::new(OpenSnapshotTinyProvider);
     let threshold = appui_context_compact_threshold_tokens(provider.as_ref());
 
-    let (_value, context_state) =
+    let (_value, context_state, events) =
         appui_context_open_snapshot(dir.path(), &session, &history, Some(&provider));
 
     assert!(
@@ -330,6 +330,28 @@ async fn session_open_snapshot_compacts_oversized_context() {
         context_state.last_compaction_id.is_some(),
         "the open-time pass must be recorded as a real compaction"
     );
+
+    // The pass must return the lifecycle events for the caller to append to
+    // the ledger — a silent open-time rewrite of the session's context is
+    // exactly what the compaction UX exists to surface (field feedback on the
+    // first cut, which dropped these on the floor).
+    let started_pos = events
+        .iter()
+        .position(|n| matches!(n, UiNotification::ContextCompactionStarted(_)));
+    let completed_pos = events
+        .iter()
+        .position(|n| matches!(n, UiNotification::ContextCompactionCompleted(_)));
+    let (Some(started_pos), Some(completed_pos)) = (started_pos, completed_pos) else {
+        panic!("open-time compaction must emit started+completed events: {events:?}");
+    };
+    assert!(
+        started_pos < completed_pos,
+        "started must precede completed"
+    );
+    let UiNotification::ContextCompactionStarted(started) = &events[started_pos] else {
+        unreachable!()
+    };
+    assert_eq!(started.trigger, "appui_open");
 
     // The compacted manager — not the oversized rebuild — must be what
     // persisted: a reload sees the small estimate and a LOADED ledger.
@@ -356,13 +378,14 @@ async fn session_open_snapshot_leaves_small_context_untouched() {
     let history = open_snapshot_padding_history(1);
     let provider: Arc<dyn octos_llm::LlmProvider> = Arc::new(OpenSnapshotTinyProvider);
 
-    let (_value, context_state) =
+    let (_value, context_state, events) =
         appui_context_open_snapshot(dir.path(), &session, &history, Some(&provider));
 
     assert!(
         context_state.last_compaction_id.is_none(),
         "an under-threshold open must not compact"
     );
+    assert!(events.is_empty(), "no compaction => no lifecycle events");
 }
 
 #[tokio::test]
@@ -375,12 +398,14 @@ async fn session_open_snapshot_without_provider_never_compacts() {
     let session: SessionKey = SessionKey("full:api:open-noprov".to_string());
     let history = open_snapshot_padding_history(60);
 
-    let (_value, context_state) = appui_context_open_snapshot(dir.path(), &session, &history, None);
+    let (_value, context_state, events) =
+        appui_context_open_snapshot(dir.path(), &session, &history, None);
 
     assert!(
         context_state.last_compaction_id.is_none(),
         "without a provider the open snapshot must not compact"
     );
+    assert!(events.is_empty(), "no provider => no lifecycle events");
 }
 
 #[test]
