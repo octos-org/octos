@@ -1462,7 +1462,14 @@ pub enum QueueMode {
     #[default]
     Collect,
     /// Keep only the latest message, discard older queued messages.
-    Steer,
+    ///
+    /// Renamed from `steer`: that word means mid-turn INJECTION everywhere
+    /// else in this codebase (`turn/steer`, the agent's `SteerBuffer`),
+    /// where nothing is dropped — the opposite of this variant. The serde
+    /// alias keeps existing configs parsing; the `/queue` chat command
+    /// accepts both spellings.
+    #[serde(alias = "steer")]
+    Latest,
     /// Cancel the current run and process the new message immediately.
     Interrupt,
     /// If the current LLM call exceeds the patience threshold and a new message
@@ -1486,7 +1493,9 @@ pub struct GatewayConfig {
     #[serde(default)]
     pub system_prompt: Option<String>,
 
-    /// Message queue mode: "followup" (default) or "collect".
+    /// Message queue mode for messages arriving while a run is active:
+    /// "followup" | "collect" (default) | "latest" | "interrupt" |
+    /// "speculative". See [`QueueMode`].
     #[serde(default)]
     pub queue_mode: QueueMode,
 
@@ -2153,6 +2162,24 @@ pub fn detect_provider(model: &str) -> Option<&'static str> {
 
 #[cfg(test)]
 mod tests {
+    /// `QueueMode::Latest` was renamed from `steer` (the word collides with
+    /// `turn/steer`, which injects rather than discards). Existing configs
+    /// and `/queue steer` must keep working; new ones use `latest`.
+    #[test]
+    fn queue_mode_latest_parses_both_spellings_and_defaults_to_collect() {
+        use super::QueueMode;
+        let latest: QueueMode = serde_json::from_str("\"latest\"").expect("canonical name");
+        assert_eq!(latest, QueueMode::Latest);
+        let steer: QueueMode = serde_json::from_str("\"steer\"").expect("legacy alias");
+        assert_eq!(steer, QueueMode::Latest);
+        // Round-trip now WRITES the canonical spelling.
+        assert_eq!(
+            serde_json::to_string(&QueueMode::Latest).expect("serialize"),
+            "\"latest\""
+        );
+        assert_eq!(QueueMode::default(), QueueMode::Collect);
+    }
+
     use super::*;
 
     /// Crate-wide lock for EVERY test that pivots the global `HOME` /

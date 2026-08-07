@@ -6133,7 +6133,7 @@ impl SessionActor {
     ///
     /// Usage:
     ///   /queue                          — show current mode
-    ///   /queue followup|collect|steer|interrupt
+    ///   /queue followup|collect|latest|interrupt
     async fn handle_queue_command(&mut self, args: &[&str]) {
         if args.is_empty() {
             self.send_reply(&format!("Queue mode: {:?}", self.queue_mode))
@@ -6144,12 +6144,15 @@ impl SessionActor {
         let mode = match args[0] {
             "followup" => QueueMode::Followup,
             "collect" => QueueMode::Collect,
-            "steer" => QueueMode::Steer,
+            // "steer" stays accepted as the old spelling of `latest` — but the
+            // canonical name avoids colliding with `turn/steer`, which INJECTS
+            // into the running turn rather than discarding anything.
+            "latest" | "steer" => QueueMode::Latest,
             "interrupt" => QueueMode::Interrupt,
             "spec" | "speculative" => QueueMode::Speculative,
             other => {
                 self.send_reply(&format!(
-                    "Unknown mode: {other}. Use: followup, collect, steer, interrupt, spec"
+                    "Unknown mode: {other}. Use: followup, collect, latest, interrupt, spec"
                 ))
                 .await;
                 return;
@@ -6587,7 +6590,7 @@ impl SessionActor {
                     combined_attachment_prompt,
                 )
             }
-            QueueMode::Steer | QueueMode::Interrupt => {
+            QueueMode::Latest | QueueMode::Interrupt => {
                 // Coalescing delay: give rapid follow-up messages time to arrive
                 tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
