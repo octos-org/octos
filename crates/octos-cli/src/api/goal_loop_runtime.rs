@@ -269,6 +269,31 @@ pub enum GoalRuntimeState {
     Failed(String),
 }
 
+/// Outcome of the INDEPENDENT goal-completion verifier.
+///
+/// Loop-engineering (addyosmani.com/blog/loop-engineering): a `/goal` should run
+/// "until a verifiable stopping condition is met, with a separate model checking
+/// completion rather than the agent self-grading." This is the goal-level
+/// analogue of [`octos_agent`]'s `VerifierVerdict::ReadyToAnswer`: the agent's
+/// own `<goal:complete>` sentinel is only a *claim*; a separate cheap-lane
+/// verifier must independently return [`GoalCompletionVerdict::Done`] before the
+/// goal may transition to `Completed`. Any `NotDone` keeps the goal `Active`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GoalCompletionVerdict {
+    /// The separate verifier independently confirmed the objective is met.
+    Done,
+    /// The verifier judged the objective not yet met (or the check could not be
+    /// run); the goal stays `Active`. Carries a short reason for the ledger.
+    NotDone { reason: String },
+}
+
+impl GoalCompletionVerdict {
+    /// Whether the independent verifier confirmed completion.
+    pub fn is_done(&self) -> bool {
+        matches!(self, Self::Done)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GoalBudgetResolution {
     pub goal_id: GoalId,

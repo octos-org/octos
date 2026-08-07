@@ -52,7 +52,10 @@ use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
 #[cfg(feature = "api")]
-use crate::api::agent_orchestrator::{default_agent_orchestrator, upsert_background_task_agent};
+use crate::api::agent_orchestrator::{
+    default_agent_orchestrator, run_goal_completion_verifier, upsert_background_task_agent,
+};
+use crate::api::goal_loop_runtime::GoalCompletionVerdict;
 #[cfg(feature = "api")]
 use crate::api::master_continuation_scheduler::{
     MasterContinuationReason, MasterContinuationRuntimeState, QueuedMasterContinuation,
@@ -5103,10 +5106,28 @@ impl SessionActor {
                 .map(|msg| msg.content.clone())
                 .unwrap_or_default()
         };
+        // Loop-engineering completion gate: only spend the INDEPENDENT
+        // verifier LLM call when the agent actually CLAIMS completion.
+        let verdict = if orchestrator.goal_completion_claimed(&assistant_tail) {
+            let objective = orchestrator
+                .goal_objective_for_test(&self.session_key)
+                .unwrap_or_else(|| "unknown".to_string());
+            run_goal_completion_verifier(
+                self.agent.llm_provider(),
+                &objective,
+                &assistant_tail,
+            )
+            .await
+        } else {
+            GoalCompletionVerdict::NotDone {
+                reason: "no completion claimed".to_string(),
+            }
+        };
         if orchestrator.maybe_complete_goal_from_model(
             &self.session_key,
             profile_id,
             &assistant_tail,
+            &verdict,
         ) {
             return;
         }

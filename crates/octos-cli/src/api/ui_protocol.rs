@@ -89,8 +89,10 @@ use super::agent_orchestrator::{
     InProcessAgentOrchestrator, LoopControlKind, LoopControlRequest, LoopCreateRequest,
     LoopListRequest, NativeSpecialistAppUiEvent, NativeSpecialistLaunchRequest,
     default_agent_orchestrator, master_continuation_prompt, master_continuation_reason_name,
-    parse_agent_output_cursor, upsert_background_task_agent, wire_key_from_goal_key,
+    parse_agent_output_cursor, run_goal_completion_verifier, upsert_background_task_agent,
+    wire_key_from_goal_key,
 };
+use super::goal_loop_runtime::GoalCompletionVerdict;
 #[cfg(test)]
 use super::agent_orchestrator::{
     AgentArtifactRecord as AgentRuntimeArtifactRecord, clear_default_agent_orchestrator_for_test,
@@ -33091,13 +33093,33 @@ async fn run_standalone_turn(
             elapsed_seconds,
         );
         if let Some(reply) = assistant_reply {
+            // Loop-engineering completion gate: only spend the INDEPENDENT
+            // verifier LLM call when the agent actually CLAIMS completion.
+            // The verifier judges the objective against the reply evidence
+            // and returns Done/NotDone; maybe_complete_goal_from_model then
+            // requires both the sentinel AND a Done verdict.
+            let verdict = if orchestrator.goal_completion_claimed(&reply) {
+                let objective = orchestrator
+                    .goal_objective_for_test(goal_key)
+                    .unwrap_or_else(|| "unknown".to_string());
+                run_goal_completion_verifier(
+                    llm_provider.clone(),
+                    &objective,
+                    &reply,
+                )
+                .await
+            } else {
+                GoalCompletionVerdict::NotDone {
+                    reason: "no completion claimed".to_string(),
+                }
+            };
             // `maybe_complete_goal_from_model` is idempotent and only
             // flips when `detect_goal_complete_sentinel` matches the
-            // tail of the reply. The return value is intentionally
-            // unused — the goal is either complete now or stays active
-            // and the next scheduler tick decides whether to re-queue.
+            // tail of the reply AND the verdict is Done. The return value
+            // is intentionally unused — the goal is either complete now or
+            // stays active and the next scheduler tick decides whether to re-queue.
             let _ =
-                orchestrator.maybe_complete_goal_from_model(goal_key, &goal_ctx.profile_id, &reply);
+                orchestrator.maybe_complete_goal_from_model(goal_key, &goal_ctx.profile_id, &reply, &verdict);
         }
         // #1696/#1698 — push the post-turn goal snapshot to the OWNING
         // connection so autonomous transitions repaint the chip live:
