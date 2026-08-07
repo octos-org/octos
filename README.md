@@ -96,7 +96,7 @@ Most agentic systems are single-tenant chat assistants — one user, one model, 
 - **Autonomy — goals & loops**: `/goal <objective>` keeps the agent working across turns via checkpointed continuations (under a token budget); `/loop` runs a task on a fixed interval or self-paced. The agent keeps going between your messages — see [Autonomy: goals & loops](#autonomy-goals--loops).
 - **Session time-travel**: `session/rollback` RPC with resume/rewind checkpoint pickers in both clients; every session can be rolled back to any prior user turn.
 - **Live reasoning**: streams the model's thinking as it happens, with per-session `/thinking` effort control.
-- **Voice**: per-profile cloud TTS voices, rich HTML/image voice output, and an OMiniX runtime provider for local ASR/TTS.
+- **Voice**: per-profile cloud TTS voices, rich HTML/image voice output, dedicated batch-ASR routing via `ASR_API_URL`, and an OMiniX fallback for local ASR/TTS.
 - **Native office suite**: PPTX/DOCX/XLSX via pure Rust (zip + quick-xml).
 - **Sandbox isolation**: bwrap + Landlock/seccomp + sandbox-exec + Docker + Windows AppContainer. `deny(unsafe_code)` workspace-wide. 67 prompt injection tests.
 

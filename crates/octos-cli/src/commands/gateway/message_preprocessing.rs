@@ -26,6 +26,9 @@ pub struct MediaResult {
     /// Whether any audio attachment was detected (for auto-TTS downstream).
     #[allow(dead_code)]
     pub is_voice_message: bool,
+    /// All audio inputs returned a successful empty transcript, with no typed
+    /// prompt or non-audio attachment to process. This is a normal ASR reject.
+    pub rejected_audio_only: bool,
 }
 
 /// Transcribe audio, separate images, and tag voice metadata on an inbound message.
@@ -44,11 +47,14 @@ pub async fn process_media(
     let mut audio_filenames = Vec::new();
     let mut attachment_filenames = Vec::new();
     let mut attachment_notes = Vec::new();
+    let mut saw_audio = false;
+    let mut all_audio_transcripts_rejected = asr_binary.is_some();
 
     if let Some(asr_bin) = asr_binary {
         for path in &inbound.media {
             let resolved_path = resolve_media_reference(path);
             if octos_bus::media::is_audio(path) {
+                saw_audio = true;
                 is_voice_message = true;
                 attachment_media.push(resolved_path.clone());
                 audio_filenames.push(attachment_display_name(path));
@@ -61,7 +67,11 @@ pub async fn process_media(
                     input["language"] = serde_json::Value::String(lang.to_string());
                 }
                 match transcribe_via_skill(asr_bin, &input.to_string()).await {
+                    Ok(text) if text.trim().is_empty() => {
+                        tracing::info!(audio = %resolved_path, "ASR rejected audio without speech");
+                    }
                     Ok(text) => {
+                        all_audio_transcripts_rejected = false;
                         if let Some(obj) = inbound.metadata.as_object_mut() {
                             obj.insert(
                                 "voice_transcript".into(),
@@ -70,7 +80,10 @@ pub async fn process_media(
                         }
                         inbound.content = merge_transcript_into_content(&inbound.content, &text);
                     }
-                    Err(e) => warn!("transcription failed: {e}"),
+                    Err(e) => {
+                        all_audio_transcripts_rejected = false;
+                        warn!("transcription failed: {e}");
+                    }
                 }
             } else {
                 route_non_audio_attachment(
@@ -126,6 +139,12 @@ pub async fn process_media(
         }
     }
 
+    let rejected_audio_only = should_skip_rejected_audio_only_turn(
+        saw_audio && all_audio_transcripts_rejected,
+        &inbound.content,
+        !image_media.is_empty() || !attachment_filenames.is_empty(),
+    );
+
     MediaResult {
         image_media,
         attachment_media,
@@ -135,7 +154,18 @@ pub async fn process_media(
             Some(attachment_prompt)
         },
         is_voice_message,
+        rejected_audio_only,
     }
+}
+
+/// A successful empty ASR result is only terminal when this message contains
+/// no other user input. Mixed text/audio and attachment turns must proceed.
+fn should_skip_rejected_audio_only_turn(
+    all_audio_rejected: bool,
+    content: &str,
+    has_non_audio_media: bool,
+) -> bool {
+    all_audio_rejected && content.trim().is_empty() && !has_non_audio_media
 }
 
 async fn route_non_audio_attachment(
@@ -671,5 +701,17 @@ mod tests {
             merge_transcript_into_content("", "hello world"),
             "hello world"
         );
+    }
+
+    #[test]
+    fn should_skip_agent_when_audio_only_turn_is_rejected() {
+        assert!(should_skip_rejected_audio_only_turn(true, "", false));
+        assert!(!should_skip_rejected_audio_only_turn(false, "", false));
+        assert!(!should_skip_rejected_audio_only_turn(
+            true,
+            "typed prompt",
+            false
+        ));
+        assert!(!should_skip_rejected_audio_only_turn(true, "", true));
     }
 }
