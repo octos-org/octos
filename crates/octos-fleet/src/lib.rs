@@ -43,6 +43,7 @@
 
 mod fleet;
 mod grant;
+mod digest;
 mod records;
 mod store;
 
@@ -50,9 +51,11 @@ pub use fleet::{Fleet, FleetSummary, FleetView, PlanEdit, PlanGraphError, TaskSp
 pub use grant::{
     BASE_TOOLS, FsGrant, GRANTABLE_TOOLS, GrantError, NetworkGrant, WEB_TOOLS, WorkerGrant,
 };
+pub use digest::{digest, Digest, DigestFinding, DigestOptions};
 pub use records::{
     AcceptanceCriterion, AcceptanceVerdict, Attempt, AttemptStatus, ChildResultSnapshot,
-    ChildStatus, DecisionEntry, DecisionKind, DurablePlan, EscalationRequest, EvidenceRef,
+    ChildStatus, DecisionEntry, DecisionKind, DurablePlan, EscalationRequest, EvidenceRef, Finding,
+    FindingStatus,
     FleetBudget, FleetChildRecord, FleetEventKind, FleetRecord, FleetStatus, Lease, OutboxEvent,
     PlanTask, SCHEMA_VERSION, Verifier, WorkerKind,
 };
