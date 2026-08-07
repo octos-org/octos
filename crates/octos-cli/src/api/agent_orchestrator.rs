@@ -866,6 +866,11 @@ impl InProcessAgentOrchestrator {
     pub(crate) fn goal_objective_for_test(&self, session_id: &SessionKey) -> Option<String> {
         self.state().goals.get(session_id).map(|g| g.objective.clone())
     }
+
+    /// Get the goal ID for a session (used by goal completion verifier to prevent stale verdicts).
+    pub(crate) fn goal_id_for_session(&self, session_id: &SessionKey) -> Option<String> {
+        self.state().goals.get(session_id).map(|g| g.goal_id.clone())
+    }
     fn state(&self) -> std::sync::MutexGuard<'_, AutonomyRuntimeState> {
         self.state
             .lock()
@@ -3056,6 +3061,7 @@ impl InProcessAgentOrchestrator {
         profile_id: &str,
         assistant_content: &str,
         verdict: &GoalCompletionVerdict,
+        expected_goal_id: Option<&str>,
     ) -> bool {
         if !detect_goal_complete_sentinel(assistant_content) {
             return false;
@@ -3078,6 +3084,22 @@ impl InProcessAgentOrchestrator {
         }
         if goal.status == "complete" {
             return false;
+        }
+        // CRITICAL: Revalidate goal identity to prevent stale verifier verdicts.
+        // If the goal changed between fetching the objective (for the verifier)
+        // and completing it here, the Done verdict may be for the WRONG goal.
+        // The caller passes the goal_id that was snapshotted when the verifier
+        // was invoked; if it doesn't match the current goal, we must not complete.
+        if let Some(expected_id) = expected_goal_id {
+            if goal.goal_id != expected_id {
+                tracing::warn!(
+                    session_id = %session_id,
+                    expected_goal_id = %expected_id,
+                    actual_goal_id = %goal.goal_id,
+                    "stale verifier verdict: goal changed between verifier call and completion"
+                );
+                return false;
+            }
         }
         goal.status = "complete".to_owned();
         goal.updated_at_ms = now_ms();
@@ -15313,7 +15335,7 @@ mod tests {
             &session_id,
             "tenant-a",
             "still working on it",
-            &GoalCompletionVerdict::Done,
+            &GoalCompletionVerdict::Done, None,
         ));
         assert_eq!(
             orchestrator.goal_status_for_test(&session_id).as_deref(),
@@ -15325,7 +15347,7 @@ mod tests {
             &session_id,
             "tenant-a",
             "All done. <goal:complete>",
-            &GoalCompletionVerdict::Done,
+            &GoalCompletionVerdict::Done, None,
         ));
         assert_eq!(
             orchestrator.goal_status_for_test(&session_id).as_deref(),
@@ -17090,7 +17112,7 @@ mod tests {
             &session_id,
             "tenant-a",
             "I am about to write <goal:complete> shortly, but step 2 first.",
-            &GoalCompletionVerdict::Done,
+            &GoalCompletionVerdict::Done, None,
         ));
         assert_eq!(
             orchestrator.goal_status_for_test(&session_id).as_deref(),
@@ -17102,7 +17124,7 @@ mod tests {
             &session_id,
             "tenant-a",
             "All requested checks finished.\n\n<goal:complete>",
-            &GoalCompletionVerdict::Done,
+            &GoalCompletionVerdict::Done, None,
         ));
         assert_eq!(
             orchestrator.goal_status_for_test(&session_id).as_deref(),

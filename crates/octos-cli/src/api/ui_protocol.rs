@@ -33098,20 +33098,27 @@ async fn run_standalone_turn(
             // The verifier judges the objective against the reply evidence
             // and returns Done/NotDone; maybe_complete_goal_from_model then
             // requires both the sentinel AND a Done verdict.
-            let verdict = if orchestrator.goal_completion_claimed(&reply) {
+            let (verdict, expected_goal_id) = if orchestrator.goal_completion_claimed(&reply) {
                 let objective = orchestrator
                     .goal_objective_for_test(goal_key)
                     .unwrap_or_else(|| "unknown".to_string());
-                run_goal_completion_verifier(
+                // Snapshot goal_id BEFORE the async verifier call to prevent
+                // completing the wrong goal if it changes during the await.
+                let goal_id = orchestrator.goal_id_for_session(goal_key);
+                let verdict = run_goal_completion_verifier(
                     llm_provider.clone(),
                     &objective,
                     &reply,
                 )
-                .await
+                .await;
+                (verdict, goal_id)
             } else {
-                GoalCompletionVerdict::NotDone {
-                    reason: "no completion claimed".to_string(),
-                }
+                (
+                    GoalCompletionVerdict::NotDone {
+                        reason: "no completion claimed".to_string(),
+                    },
+                    None,
+                )
             };
             // `maybe_complete_goal_from_model` is idempotent and only
             // flips when `detect_goal_complete_sentinel` matches the
@@ -33119,7 +33126,7 @@ async fn run_standalone_turn(
             // is intentionally unused — the goal is either complete now or
             // stays active and the next scheduler tick decides whether to re-queue.
             let _ =
-                orchestrator.maybe_complete_goal_from_model(goal_key, &goal_ctx.profile_id, &reply, &verdict);
+                orchestrator.maybe_complete_goal_from_model(goal_key, &goal_ctx.profile_id, &reply, &verdict, expected_goal_id.as_deref());
         }
         // #1696/#1698 — push the post-turn goal snapshot to the OWNING
         // connection so autonomous transitions repaint the chip live:
