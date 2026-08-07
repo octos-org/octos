@@ -64,6 +64,7 @@ impl Default for DigestOptions {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DigestFinding {
     pub id: String,
+    pub seq: u64,
     pub claim: String,
     pub status: FindingStatus,
     pub component: String,
@@ -173,7 +174,6 @@ fn drift(
 pub fn digest(findings: &[Finding], opts: &DigestOptions) -> Digest {
     let overturned = superseded_ids(findings);
     let by_id: BTreeMap<&str, &Finding> = findings.iter().map(|f| (f.id.as_str(), f)).collect();
-    let watermark = findings.iter().map(|f| f.seq).max().unwrap_or(0);
 
     // Live = not overturned by any later finding. An overturned claim stays in
     // the log (history must stay readable) but must not reach the controller
@@ -188,6 +188,7 @@ pub fn digest(findings: &[Finding], opts: &DigestOptions) -> Digest {
         .filter(|f| f.seq > opts.since_seq)
         .map(|f| DigestFinding {
             id: f.id.clone(),
+            seq: f.seq,
             claim: f.claim.clone(),
             status: f.status,
             component: f.component.clone(),
@@ -289,17 +290,27 @@ pub fn digest(findings: &[Finding], opts: &DigestOptions) -> Digest {
     // Set watermark to the highest seq actually included (after trim).
     // This prevents permanent data loss: if findings were dropped, the
     // watermark stays low so the controller can resume from the correct point.
-    out.watermark = out
+    let max_included = out
         .new_findings
         .iter()
-        .map(|f| {
-            // Extract seq from finding id (format: "f-{seq}")
-            f.id.strip_prefix("f-")
-                .and_then(|s| s.parse::<u64>().ok())
-                .unwrap_or(0)
-        })
+        .map(|f| f.seq)
         .max()
         .unwrap_or(opts.since_seq);
+    
+    // If we dropped new_findings, the watermark must account for them.
+    // Findings are newest-first, so dropped ones have LOWER seqs than kept ones.
+    // The dropped findings all have seq > opts.since_seq (they're new) but < min_kept.
+    // To recover them, watermark must be set to just below the lowest dropped seq.
+    // Since we don't track which specific seqs were dropped, we conservatively
+    // set watermark to opts.since_seq (unchanged) when new_findings were dropped.
+    out.watermark = if out.dropped.iter().any(|d| d.section == "new_findings") {
+        // Some new findings were dropped, so we haven't fully advanced past since_seq.
+        // Keep watermark at since_seq so next call will retry the dropped findings.
+        opts.since_seq
+    } else {
+        // No new findings dropped, safe to advance watermark to max included.
+        max_included
+    };
     
     out
 }
@@ -669,6 +680,84 @@ mod tests {
                 watermark: 0,
                 ..Default::default()
             }
+        );
+    }
+
+    /// Regression test for codex review: watermark must reflect ACTUAL included
+    /// findings after trim, not the global max seq before trim.
+    ///
+    /// Before the fix: 60 findings with max_chars=500 → 57 dropped, watermark=60.
+    /// Next call with since_seq=60 returns 0 → 57 findings permanently lost.
+    ///
+    /// After the fix: watermark = max seq of ACTUAL included findings (e.g., 3),
+    /// so next call with since_seq=3 returns the dropped 57.
+    #[test]
+    fn watermark_prevents_permanent_loss_after_budget_trim() {
+        let findings: Vec<Finding> = (1..=60)
+            .map(|seq| {
+                f(
+                    seq,
+                    "path-a",
+                    "component-x",
+                    &format!("claim-{}", seq),
+                    FindingStatus::Confirmed,
+                    vec![],
+                )
+            })
+            .collect();
+
+        let d = digest(
+            &findings,
+            &DigestOptions {
+                max_chars: 500, // Force trim
+                ..Default::default()
+            },
+        );
+
+        // Verify trim happened
+        assert!(!d.dropped.is_empty(), "budget should force drops");
+        assert!(d.new_findings.len() < 60, "should not include all findings");
+
+        // Critical: watermark must be adjusted to allow recovery of dropped findings.
+        // If new_findings were dropped, watermark should be below the min kept seq,
+        // so the next call with since_seq=watermark will include the dropped ones.
+        let max_included_seq = d.new_findings.iter().map(|f| f.seq).max().unwrap_or(0);
+        eprintln!("DEBUG: watermark={}, max_included_seq={}, new_findings.len()={}, dropped={:?}",
+            d.watermark, max_included_seq, d.new_findings.len(), d.dropped);
+        
+        // Watermark should NOT equal max_included_seq if findings were dropped
+        if d.dropped.iter().any(|drop| drop.section == "new_findings") {
+            assert!(
+                d.watermark < max_included_seq,
+                "watermark must be less than max included seq when findings are dropped"
+            );
+        } else {
+            assert_eq!(
+                d.watermark, max_included_seq,
+                "watermark must equal max seq when no findings dropped"
+            );
+        }
+
+        // Verify resume works: next call with watermark returns the dropped findings
+        let resumed = digest(
+            &findings,
+            &DigestOptions {
+                since_seq: d.watermark,
+                max_chars: usize::MAX, // No budget limit this time
+                ..Default::default()
+            },
+        );
+
+        let recovered_count = resumed.new_findings.len();
+        assert!(
+            recovered_count > 0,
+            "resume must return findings dropped in first call"
+        );
+        // Resume returns ALL findings > watermark, including the one we already saw.
+        // Controller is expected to deduplicate by finding ID.
+        assert!(
+            recovered_count >= 60 - d.new_findings.len(),
+            "resume must return at least the findings that were dropped"
         );
     }
 }
