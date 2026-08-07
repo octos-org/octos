@@ -469,6 +469,7 @@ impl Agent {
                 .unwrap_or_default(),
             subagent_output_router: self.subagent_output_router.clone(),
             subagent_summary_generator: self.subagent_summary_generator.clone(),
+            llm_provider: self.llm.clone(),
             task_supervisor: Some(self.tools.supervisor()),
             cost_accountant: self.cost_accountant.clone(),
             parent_session_key: self.parent_session_key.clone(),

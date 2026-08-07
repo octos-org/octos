@@ -278,6 +278,9 @@ pub struct ToolContext {
     /// workers clone this so periodic LLM summaries fire for their
     /// background tasks just like top-level spawn children.
     pub subagent_summary_generator: Option<Arc<crate::subagent_summary::AgentSummaryGenerator>>,
+    /// LLM provider for tools that need to make independent model calls
+    /// (e.g., goal completion verifier). Populated by the session runtime.
+    pub llm_provider: Arc<dyn octos_llm::LlmProvider>,
     /// M8 parity (W1.A3): per-session task supervisor. Pipeline node
     /// workers register a child task in this supervisor so the admin
     /// dashboard sees the substructure under the parent run_pipeline
@@ -328,6 +331,26 @@ impl ToolContext {
     /// live executor wiring. Uses a [`crate::progress::SilentReporter`] and
     /// leaves every M8.x placeholder at its default.
     pub fn zero() -> Self {
+        // Noop provider for zero context (always fails, tools should not use it)
+        struct NoopProvider;
+        #[async_trait::async_trait]
+        impl octos_llm::LlmProvider for NoopProvider {
+            async fn chat(
+                &self,
+                _messages: &[octos_core::Message],
+                _tools: &[octos_llm::ToolSpec],
+                _config: &octos_llm::ChatConfig,
+            ) -> eyre::Result<octos_llm::ChatResponse> {
+                eyre::bail!("ToolContext::zero() has no real provider")
+            }
+            fn model_id(&self) -> &str {
+                "noop"
+            }
+            fn provider_name(&self) -> &str {
+                "noop"
+            }
+        }
+
         Self {
             tool_id: String::new(),
             reporter: Arc::new(crate::progress::SilentReporter),
@@ -342,6 +365,7 @@ impl ToolContext {
             app_state: AppStateHandle::new(),
             subagent_output_router: None,
             subagent_summary_generator: None,
+            llm_provider: Arc::new(NoopProvider),
             task_supervisor: None,
             cost_accountant: None,
             parent_session_key: None,

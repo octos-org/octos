@@ -92,11 +92,11 @@ use super::agent_orchestrator::{
     parse_agent_output_cursor, run_goal_completion_verifier, upsert_background_task_agent,
     wire_key_from_goal_key,
 };
-use super::goal_loop_runtime::GoalCompletionVerdict;
 #[cfg(test)]
 use super::agent_orchestrator::{
     AgentArtifactRecord as AgentRuntimeArtifactRecord, clear_default_agent_orchestrator_for_test,
 };
+use super::goal_loop_runtime::GoalCompletionVerdict;
 use super::master_continuation_scheduler::{
     MasterContinuationReason, MasterContinuationRuntimeState,
 };
@@ -33105,12 +33105,8 @@ async fn run_standalone_turn(
                 // Snapshot goal_id BEFORE the async verifier call to prevent
                 // completing the wrong goal if it changes during the await.
                 let goal_id = orchestrator.goal_id_for_session(goal_key);
-                let verdict = run_goal_completion_verifier(
-                    llm_provider.clone(),
-                    &objective,
-                    &reply,
-                )
-                .await;
+                let verdict =
+                    run_goal_completion_verifier(llm_provider.clone(), &objective, &reply).await;
                 (verdict, goal_id)
             } else {
                 (
@@ -33125,8 +33121,13 @@ async fn run_standalone_turn(
             // tail of the reply AND the verdict is Done. The return value
             // is intentionally unused — the goal is either complete now or
             // stays active and the next scheduler tick decides whether to re-queue.
-            let _ =
-                orchestrator.maybe_complete_goal_from_model(goal_key, &goal_ctx.profile_id, &reply, &verdict, expected_goal_id.as_deref());
+            let _ = orchestrator.maybe_complete_goal_from_model(
+                goal_key,
+                &goal_ctx.profile_id,
+                &reply,
+                &verdict,
+                expected_goal_id.as_deref(),
+            );
         }
         // #1696/#1698 — push the post-turn goal snapshot to the OWNING
         // connection so autonomous transitions repaint the chip live:
