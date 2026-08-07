@@ -4234,17 +4234,17 @@ fn appui_compact_context_if_over_threshold(
 ///
 /// The compaction here is always the DETERMINISTIC summarizer
 /// (`llm_compaction_enabled=false`): `session/open` is an interactive RPC and
-/// must not spend an LLM call per session at boot. Lifecycle
-/// started/completed notifications are intentionally not delivered from this
-/// path — the open result carries (and `publish_appui_context_status`
-/// broadcasts) the post-compaction STATE, which is what drives the gauge; the
-/// progress events only narrate mid-turn passes.
+/// must not spend an LLM call per session at boot. The returned lifecycle
+/// started/completed notifications (empty when nothing compacted) must be
+/// appended to the session's ledger BEFORE the open computes its replay head,
+/// so the open's own replay delivers them and the client renders the
+/// compaction UX — an open-time 1.17M→4K rewrite must not be silent.
 fn appui_context_open_snapshot(
     data_dir: &Path,
     session_id: &SessionKey,
     history: &[Message],
     llm_provider: Option<&Arc<dyn octos_llm::LlmProvider>>,
-) -> (Value, UiContextState) {
+) -> (Value, UiContextState, Vec<UiNotification>) {
     let (mut manager, ledger_status) =
         load_or_rebuild_context_manager(data_dir, session_id.to_string(), None, history);
     tracing::debug!(
@@ -4252,15 +4252,16 @@ fn appui_context_open_snapshot(
         ledger_status = ?ledger_status,
         "appui context manager loaded for session open"
     );
-    if let Some(provider) = llm_provider {
-        let _ = appui_compact_context_if_over_threshold(
+    let lifecycle_notifications = match llm_provider {
+        Some(provider) => appui_compact_context_if_over_threshold(
             &mut manager,
             session_id,
             provider,
             false,
             "appui_open",
-        );
-    }
+        ),
+        None => Vec::new(),
+    };
     publish_appui_context_status(session_id, &manager);
     if let Err(error) =
         persist_context_manager_snapshot(data_dir, &session_id.to_string(), &manager)
@@ -4274,6 +4275,7 @@ fn appui_context_open_snapshot(
     (
         appui_context_status_value(&manager),
         ui_context_state_for(session_id, &manager),
+        lifecycle_notifications,
     )
 }
 
@@ -18338,6 +18340,40 @@ async fn open_session_result(
     // wire id) can resolve the slug to the continuation-queue key it enqueues
     // an injected turn under. No-op for non-peer / unprofiled sessions.
     register_peer_wire_session(state, &params.session_id);
+    // Open-time context snapshot — deliberately BEFORE the replay head is
+    // taken: when the open-time threshold pass compacts an oversized rebuilt
+    // ledger, its started/completed lifecycle events are appended to the
+    // ledger HERE so this very open's replay delivers them in-band and the
+    // client renders the compaction UX (live block + sticky notice). A
+    // silent 1.17M→4K rewrite of the session's context is exactly the kind
+    // of event the UPCR-2026-026 surface exists for. Feature-gating is the
+    // replay filter's job (`ContextCompaction*` events are dropped for
+    // connections without `context_lifecycle`).
+    let Some(sessions) = resolve_sessions_for_lookup(
+        state,
+        connection_profile_id,
+        active_profile_id.as_deref(),
+        &params.session_id,
+    )
+    .await
+    else {
+        return Err(runtime_unavailable_error("Sessions not available"));
+    };
+    let (data_dir, history) = {
+        let mut sessions = sessions.lock().await;
+        let data_dir = sessions.data_dir();
+        let session = sessions.get_or_create(&params.session_id).await;
+        (data_dir, session.messages.clone())
+    };
+    let (context, context_state, open_compaction_events) = appui_context_open_snapshot(
+        &data_dir,
+        &params.session_id,
+        &history,
+        open_context_provider.as_ref(),
+    );
+    for notification in open_compaction_events {
+        let _ = ledger.append_notification_from(notification, connection_id);
+    }
     let (mut replay, replay_baseline_seq) =
         ledger.replay_after_with_head(&params.session_id, params.after.as_ref())?;
     replay.retain(|event| {
@@ -18393,29 +18429,6 @@ async fn open_session_result(
         .filter(|question| !replayed_question_ids.contains(&question.question_id))
         .collect::<Vec<_>>();
 
-    let Some(sessions) = resolve_sessions_for_lookup(
-        state,
-        connection_profile_id,
-        active_profile_id.as_deref(),
-        &params.session_id,
-    )
-    .await
-    else {
-        return Err(runtime_unavailable_error("Sessions not available"));
-    };
-
-    let (data_dir, history) = {
-        let mut sessions = sessions.lock().await;
-        let data_dir = sessions.data_dir();
-        let session = sessions.get_or_create(&params.session_id).await;
-        (data_dir, session.messages.clone())
-    };
-    let (context, context_state) = appui_context_open_snapshot(
-        &data_dir,
-        &params.session_id,
-        &history,
-        open_context_provider.as_ref(),
-    );
     let (context, context_state) = if features.context_lifecycle_available() {
         (Some(context), Some(context_state))
     } else {
