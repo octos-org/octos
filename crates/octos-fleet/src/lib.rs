@@ -44,6 +44,7 @@
 mod fleet;
 mod grant;
 mod records;
+mod sqlite_ledger;
 mod store;
 
 pub use fleet::{Fleet, FleetSummary, FleetView, PlanEdit, PlanGraphError, TaskSpec, TaskView};
@@ -56,6 +57,7 @@ pub use records::{
     FleetBudget, FleetChildRecord, FleetEventKind, FleetRecord, FleetStatus, Lease, OutboxEvent,
     PlanTask, SCHEMA_VERSION, Verifier, WorkerKind,
 };
+pub use sqlite_ledger::{Decision, Escalation, Finding, Goal, GoalLedger, Task};
 pub use store::{
     AckOutcome, CompleteOutcome, DenyEscalationOutcome, FleetKernelStore, FleetSnapshot,
     InterruptedAttempt, LaunchOutcome, MarkRunningOutcome, PlanMutateOutcome, ReconcileReport,
