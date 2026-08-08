@@ -228,6 +228,55 @@ impl GoalLedger {
         Ok(rows.next().transpose()?)
     }
 
+    /// Get a task by ID.
+    pub fn get_task(&self, task_id: &str) -> Result<Option<Task>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT task_id, goal_id, title, detail, status, assigned_peer, created_at_ms, updated_at_ms
+             FROM tasks WHERE task_id = ?1"
+        )?;
+        let mut rows = stmt.query_map(params![task_id], |row| {
+            Ok(Task {
+                task_id: row.get(0)?,
+                goal_id: row.get(1)?,
+                title: row.get(2)?,
+                detail: row.get(3)?,
+                status: row.get(4)?,
+                assigned_peer: row.get(5)?,
+                created_at_ms: row.get(6)?,
+                updated_at_ms: row.get(7)?,
+            })
+        })?;
+        Ok(rows.next().transpose()?)
+    }
+
+    /// List all decisions for a goal.
+    pub fn list_decisions(&self, goal_id: &str) -> Result<Vec<Decision>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT decision_id, goal_id, task_id, question, options_considered, choice, rationale, based_on_findings, based_on_rev, decided_at_ms, decided_by
+             FROM decisions WHERE goal_id = ?1 ORDER BY decided_at_ms ASC"
+        )?;
+        let decisions = stmt
+            .query_map(params![goal_id], |row| {
+                Ok(Decision {
+                    decision_id: row.get(0)?,
+                    goal_id: row.get(1)?,
+                    task_id: row.get(2)?,
+                    question: row.get(3)?,
+                    options_considered: row.get(4)?,
+                    choice: row.get(5)?,
+                    rationale: row.get(6)?,
+                    based_on_findings: row.get(7)?,
+                    based_on_rev: row.get(8)?,
+                    decided_at_ms: row.get(9)?,
+                    decided_by: row.get(10)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(decisions)
+    }
+
     /// Update goal status.
     pub fn update_goal_status(
         &self,
