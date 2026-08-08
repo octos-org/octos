@@ -323,18 +323,13 @@ impl GoalLedger {
         Ok(())
     }
 
-    /// Append a finding (with transaction for consistency).
-    /// Append a finding to the ledger (with seq assignment and supersedes validation).
+    /// Insert a finding with validation — the SINGLE validated write path,
+    /// shared by `append_finding` and `commit_state_with_audit` so the two can
+    /// never drift. All steps run in the caller-provided transaction `tx`:
     ///
-    /// This is a TRUE cross-table transaction:
-    /// 1. Read max seq for this goal (from findings table)
-    /// 2. Validate supersedes edges (from findings table)
-    /// 3. Insert new finding (into findings table)
-    /// All in one atomic transaction.
-    /// Insert a finding with validation (shared by append_finding and commit_state_with_audit).
-    ///
-    /// This is the SINGLE validated insert path — all finding writes go through here
-    /// to ensure cross-goal FK and supersedes validation are always enforced.
+    /// 1. cross-goal FK — the finding's `task_id` must belong to `goal_id`
+    /// 2. supersedes edges must reference existing findings in this goal
+    /// 3. seq assignment (max+1 for the goal) + insert
     fn insert_finding_validated(
         tx: &rusqlite::Transaction,
         finding: &Finding,
@@ -746,7 +741,7 @@ mod tests {
             let finding = Finding {
                 rowid: None,
                 finding_id: format!("f{}", i),
-                seq: i as u64, // Will be overwritten by store
+                seq: i, // Will be overwritten by store
                 task_id: None,
                 goal_id: "g1".to_string(),
                 kind: "observation".to_string(),
@@ -1269,7 +1264,7 @@ mod digest_integration_tests {
             let finding = Finding {
                 rowid: None,
                 finding_id: format!("f{}", i),
-                seq: i as u64,
+                seq: i,
                 task_id: Some(format!("task-{}", i)),
                 goal_id: "g1".to_string(),
                 kind: "observation".to_string(),
@@ -1281,7 +1276,7 @@ mod digest_integration_tests {
                 config_version: None,
                 derived_from: None,
                 supersedes: Vec::new(),
-                cost_tokens: 100 * i as u64,
+                cost_tokens: 100 * i,
                 created_at_ms: 1000 + i * 100,
                 created_by: "peer-a".to_string(),
             };

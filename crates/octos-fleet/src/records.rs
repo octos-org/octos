@@ -9,7 +9,7 @@
 
 use octos_core::SessionKey;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 use crate::grant::WorkerGrant;
 
@@ -574,6 +574,18 @@ pub(crate) fn decode_row<T: serde::de::DeserializeOwned>(json: &str) -> eyre::Re
     Ok(Some(serde_json::from_str(json)?))
 }
 
+/// Ids overturned by some later finding in `findings`.
+///
+/// Derived rather than stored: marking the old record would be a mutation,
+/// and mutation is the only thing that would force this table to carry the
+/// revision fencing the rest of the kernel needs.
+pub fn superseded_ids(findings: &[Finding]) -> std::collections::BTreeSet<String> {
+    findings
+        .iter()
+        .flat_map(|f| f.supersedes.iter().cloned())
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -791,16 +803,4 @@ mod tests {
             "derived-workspace provenance round-trips with the root"
         );
     }
-}
-
-/// Ids overturned by some later finding in `findings`.
-///
-/// Derived rather than stored: marking the old record would be a mutation,
-/// and mutation is the only thing that would force this table to carry the
-/// revision fencing the rest of the kernel needs.
-pub fn superseded_ids(findings: &[Finding]) -> std::collections::BTreeSet<String> {
-    findings
-        .iter()
-        .flat_map(|f| f.supersedes.iter().cloned())
-        .collect()
 }
