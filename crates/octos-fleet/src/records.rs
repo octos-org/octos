@@ -7,9 +7,9 @@
 //! data: this crate has **zero** LLM / `octos-agent` dependency; the
 //! executor, keeper, and outbox consumer live in later PRs.
 
-use std::collections::{BTreeMap, BTreeSet};
 use octos_core::SessionKey;
 use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::grant::WorkerGrant;
 

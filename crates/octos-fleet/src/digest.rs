@@ -76,6 +76,7 @@ pub struct DigestFinding {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Overturn {
     pub by: String,
+    pub by_seq: u64, // Sequence of the overturning finding
     pub overturned: String,
     pub old_claim: String,
     pub new_claim: String,
@@ -195,7 +196,10 @@ pub fn digest(findings: &[Finding], opts: &DigestOptions) -> Digest {
             task_id: f.task_id.clone(),
         })
         .collect();
-    new_findings.reverse();
+    // Sort oldest-first for streaming semantics: each call delivers the oldest
+    // budget-worth, watermark advances to max kept seq, next call continues from
+    // there. This guarantees progress and prevents both loss and re-delivery.
+    new_findings.sort_by_key(|f| f.seq);
 
     let mut overturns: Vec<Overturn> = findings
         .iter()
@@ -204,6 +208,7 @@ pub fn digest(findings: &[Finding], opts: &DigestOptions) -> Digest {
             let by_id = &by_id;
             f.supersedes.iter().map(move |old| Overturn {
                 by: f.id.clone(),
+                by_seq: f.seq,
                 overturned: old.clone(),
                 old_claim: by_id
                     .get(old.as_str())
@@ -212,7 +217,8 @@ pub fn digest(findings: &[Finding], opts: &DigestOptions) -> Digest {
             })
         })
         .collect();
-    overturns.reverse();
+    // Sort oldest-first for streaming semantics (same as new_findings).
+    overturns.sort_by_key(|o| o.by_seq);
 
     let mut stale: Vec<StaleFinding> = live
         .iter()
@@ -286,32 +292,29 @@ pub fn digest(findings: &[Finding], opts: &DigestOptions) -> Digest {
         watermark: 0, // Set after trim
     };
     enforce_budget(&mut out, opts.max_chars);
-    
-    // Set watermark to the highest seq actually included (after trim).
-    // This prevents permanent data loss: if findings were dropped, the
-    // watermark stays low so the controller can resume from the correct point.
-    let max_included = out
+
+    // Watermark semantics for streaming: set to the max seq actually delivered.
+    // Since we sorted oldest-first and cut from the end (keeping oldest), the
+    // max kept seq is the watermark. Next call with since_seq=watermark will
+    // deliver the NEXT batch of oldest items. This guarantees:
+    // - Progress: watermark always advances (when there are new items)
+    // - No loss: items are delivered in order, oldest first
+    // - No re-delivery: watermark excludes already-delivered items
+    let max_new_findings_seq = out
         .new_findings
         .iter()
         .map(|f| f.seq)
         .max()
         .unwrap_or(opts.since_seq);
-    
-    // If we dropped new_findings, the watermark must account for them.
-    // Findings are newest-first, so dropped ones have LOWER seqs than kept ones.
-    // The dropped findings all have seq > opts.since_seq (they're new) but < min_kept.
-    // To recover them, watermark must be set to just below the lowest dropped seq.
-    // Since we don't track which specific seqs were dropped, we conservatively
-    // set watermark to opts.since_seq (unchanged) when new_findings were dropped.
-    out.watermark = if out.dropped.iter().any(|d| d.section == "new_findings") {
-        // Some new findings were dropped, so we haven't fully advanced past since_seq.
-        // Keep watermark at since_seq so next call will retry the dropped findings.
-        opts.since_seq
-    } else {
-        // No new findings dropped, safe to advance watermark to max included.
-        max_included
-    };
-    
+    let max_overturns_seq = out
+        .overturns
+        .iter()
+        .map(|o| o.by_seq)
+        .max()
+        .unwrap_or(opts.since_seq);
+    // Watermark is the max of both streams (they're both seq-windowed).
+    out.watermark = max_new_findings_seq.max(max_overturns_seq);
+
     out
 }
 
@@ -326,8 +329,12 @@ fn enforce_budget(d: &mut Digest, max_chars: usize) {
         if v.is_empty() {
             return;
         }
+        // Keep the OLDEST half (for streaming semantics): each call delivers
+        // the oldest budget-worth, watermark advances, next call continues.
+        // This guarantees progress and prevents both loss and re-delivery.
         let keep = v.len() / 2;
         let omitted = v.len() - keep;
+        // Remove from the END (newest items), keep the front (oldest items).
         v.truncate(keep);
         match dropped.iter_mut().find(|x| x.section == section) {
             Some(existing) => existing.omitted += omitted,
@@ -683,16 +690,18 @@ mod tests {
         );
     }
 
-    /// Regression test for codex review: watermark must reflect ACTUAL included
-    /// findings after trim, not the global max seq before trim.
+    /// Regression test for codex review: watermark must advance monotonically
+    /// and eventually deliver ALL findings, even under a constant budget.
     ///
-    /// Before the fix: 60 findings with max_chars=500 → 57 dropped, watermark=60.
-    /// Next call with since_seq=60 returns 0 → 57 findings permanently lost.
+    /// Correct streaming semantics:
+    /// - Sort oldest-first
+    /// - Cut from the end (keep oldest)
+    /// - Set watermark = max kept seq
+    /// - Next call with since_seq=watermark delivers the NEXT batch
     ///
-    /// After the fix: watermark = max seq of ACTUAL included findings (e.g., 3),
-    /// so next call with since_seq=3 returns the dropped 57.
+    /// This guarantees progress, no loss, no re-delivery.
     #[test]
-    fn watermark_prevents_permanent_loss_after_budget_trim() {
+    fn watermark_streams_all_findings_under_constant_budget() {
         let findings: Vec<Finding> = (1..=60)
             .map(|seq| {
                 f(
@@ -706,58 +715,51 @@ mod tests {
             })
             .collect();
 
-        let d = digest(
-            &findings,
-            &DigestOptions {
-                max_chars: 500, // Force trim
-                ..Default::default()
-            },
-        );
+        let mut delivered_ids = std::collections::HashSet::new();
+        let mut watermark = 0;
+        let budget = 500; // Constant budget (forces multiple calls)
 
-        // Verify trim happened
-        assert!(!d.dropped.is_empty(), "budget should force drops");
-        assert!(d.new_findings.len() < 60, "should not include all findings");
+        // Loop until all findings are delivered (or max iterations reached).
+        for iteration in 0..100 {
+            let d = digest(
+                &findings,
+                &DigestOptions {
+                    since_seq: watermark,
+                    max_chars: budget,
+                    ..Default::default()
+                },
+            );
 
-        // Critical: watermark must be adjusted to allow recovery of dropped findings.
-        // If new_findings were dropped, watermark should be below the min kept seq,
-        // so the next call with since_seq=watermark will include the dropped ones.
-        let max_included_seq = d.new_findings.iter().map(|f| f.seq).max().unwrap_or(0);
-        eprintln!("DEBUG: watermark={}, max_included_seq={}, new_findings.len()={}, dropped={:?}",
-            d.watermark, max_included_seq, d.new_findings.len(), d.dropped);
-        
-        // Watermark should NOT equal max_included_seq if findings were dropped
-        if d.dropped.iter().any(|drop| drop.section == "new_findings") {
+            // Every delivered finding must be new (no re-delivery).
+            for f in &d.new_findings {
+                assert!(
+                    delivered_ids.insert(f.id.clone()),
+                    "iteration {}: finding {} delivered twice",
+                    iteration,
+                    f.id
+                );
+            }
+
+            // Watermark must advance (or we're done).
+            if d.watermark == watermark {
+                break;
+            }
             assert!(
-                d.watermark < max_included_seq,
-                "watermark must be less than max included seq when findings are dropped"
+                d.watermark > watermark,
+                "iteration {}: watermark must advance (was {}, now {})",
+                iteration,
+                watermark,
+                d.watermark
             );
-        } else {
-            assert_eq!(
-                d.watermark, max_included_seq,
-                "watermark must equal max seq when no findings dropped"
-            );
+            watermark = d.watermark;
         }
 
-        // Verify resume works: next call with watermark returns the dropped findings
-        let resumed = digest(
-            &findings,
-            &DigestOptions {
-                since_seq: d.watermark,
-                max_chars: usize::MAX, // No budget limit this time
-                ..Default::default()
-            },
-        );
-
-        let recovered_count = resumed.new_findings.len();
-        assert!(
-            recovered_count > 0,
-            "resume must return findings dropped in first call"
-        );
-        // Resume returns ALL findings > watermark, including the one we already saw.
-        // Controller is expected to deduplicate by finding ID.
-        assert!(
-            recovered_count >= 60 - d.new_findings.len(),
-            "resume must return at least the findings that were dropped"
+        // All 60 findings must be delivered exactly once.
+        assert_eq!(
+            delivered_ids.len(),
+            60,
+            "all findings must be delivered exactly once (delivered: {})",
+            delivered_ids.len()
         );
     }
 }
