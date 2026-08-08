@@ -416,11 +416,157 @@ impl GoalLedger {
         Ok(rowid)
     }
 
-    /// List findings for a goal (level-triggered: only changes since `since_ms`).
+    /// Append an escalation to the ledger.
+    pub fn append_escalation(&self, escalation: &Escalation) -> Result<i64> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+
+        tx.execute(
+            "INSERT INTO escalations (escalation_id, goal_id, task_id, peer_id, question, context, status, default_action, default_after_secs, created_at_ms, resolved_at_ms, resolved_by, resolution)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+            params![
+                escalation.escalation_id,
+                escalation.goal_id,
+                escalation.task_id,
+                escalation.peer_id,
+                escalation.question,
+                escalation.context,
+                escalation.status,
+                escalation.default_action,
+                escalation.default_after_secs,
+                escalation.created_at_ms,
+                escalation.resolved_at_ms,
+                escalation.resolved_by,
+                escalation.resolution,
+            ],
+        )?;
+
+        let rowid = tx.last_insert_rowid();
+        tx.commit()?;
+        Ok(rowid)
+    }
+
+    /// Append a decision to the ledger.
+    pub fn append_decision(&self, decision: &Decision) -> Result<i64> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+
+        tx.execute(
+            "INSERT INTO decisions (decision_id, goal_id, task_id, question, options_considered, choice, rationale, based_on_findings, based_on_rev, decided_at_ms, decided_by)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            params![
+                decision.decision_id,
+                decision.goal_id,
+                decision.task_id,
+                decision.question,
+                decision.options_considered,
+                decision.choice,
+                decision.rationale,
+                decision.based_on_findings,
+                decision.based_on_rev,
+                decision.decided_at_ms,
+                decision.decided_by,
+            ],
+        )?;
+
+        let rowid = tx.last_insert_rowid();
+        tx.commit()?;
+        Ok(rowid)
+    }
+
+    /// Atomically commit state change + audit record (finding + decision).
+    ///
+    /// This is the TRUE cross-table transaction: state transition and audit log
+    /// are committed together, or both roll back.
+    pub fn commit_state_with_audit(
+        &self,
+        goal_id: &str,
+        new_status: &str,
+        expected_revision: u64,
+        updated_at_ms: u64,
+        finding: Option<&Finding>,
+        decision: Option<&Decision>,
+    ) -> Result<()> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+
+        // Step 1: Update goal state (CAS)
+        let rows_affected = tx.execute(
+            "UPDATE goals SET status = ?1, revision = revision + 1, updated_at_ms = ?2 WHERE goal_id = ?3 AND revision = ?4",
+            params![new_status, updated_at_ms, goal_id, expected_revision],
+        )?;
+
+        if rows_affected == 0 {
+            return Err(eyre::eyre!(
+                "commit_state_with_audit failed: goal {} not found or revision mismatch",
+                goal_id
+            ));
+        }
+
+        // Step 2: Append finding (if provided)
+        if let Some(f) = finding {
+            let max_seq: Option<u64> = tx
+                .query_row(
+                    "SELECT MAX(seq) FROM findings WHERE goal_id = ?1",
+                    params![goal_id],
+                    |row| row.get(0),
+                )
+                .ok()
+                .flatten();
+            let next_seq = max_seq.unwrap_or(0) + 1;
+
+            let supersedes_json = serde_json::to_string(&f.supersedes)?;
+            tx.execute(
+                "INSERT INTO findings (finding_id, seq, task_id, goal_id, kind, lifecycle, confidence, review_state, assertion, evidence, config_version, derived_from, supersedes, created_at_ms, created_by)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+                params![
+                    f.finding_id,
+                    next_seq,
+                    f.task_id,
+                    goal_id,
+                    f.kind,
+                    f.lifecycle,
+                    f.confidence,
+                    f.review_state,
+                    f.assertion,
+                    f.evidence,
+                    f.config_version,
+                    f.derived_from,
+                    supersedes_json,
+                    f.created_at_ms,
+                    f.created_by,
+                ],
+            )?;
+        }
+
+        // Step 3: Append decision (if provided)
+        if let Some(d) = decision {
+            tx.execute(
+                "INSERT INTO decisions (decision_id, goal_id, task_id, question, options_considered, choice, rationale, based_on_findings, based_on_rev, decided_at_ms, decided_by)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                params![
+                    d.decision_id,
+                    goal_id,
+                    d.task_id,
+                    d.question,
+                    d.options_considered,
+                    d.choice,
+                    d.rationale,
+                    d.based_on_findings,
+                    d.based_on_rev,
+                    d.decided_at_ms,
+                    d.decided_by,
+                ],
+            )?;
+        }
+
+        tx.commit()?;
+        Ok(())
+    }
+
     /// List findings for a goal (level-triggered: only changes since `since_rowid`).
     ///
     /// Uses SQLite's rowid (monotonic per insert) as the cursor, NOT created_at_ms.
-    /// This avoids same-millisecond races and non-monotonic timestamps across processes.
     pub fn list_findings_since(&self, goal_id: &str, since_rowid: i64) -> Result<Vec<Finding>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
@@ -687,5 +833,117 @@ mod tests {
                 .to_string()
                 .contains("cross-goal FK violation")
         );
+    }
+
+    #[test]
+    fn commit_state_with_audit_is_atomic() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ledger.db");
+        let ledger = GoalLedger::open(&path).unwrap();
+
+        let goal = Goal {
+            goal_id: "g1".to_string(),
+            objective: "test".to_string(),
+            status: "active".to_string(),
+            tokens_used: 0,
+            token_budget: 10000,
+            continuations_used: 0,
+            revision: 0,
+            created_at_ms: 1000,
+            updated_at_ms: 1000,
+        };
+        ledger.create_goal(&goal).unwrap();
+
+        let finding = Finding {
+            rowid: None,
+            finding_id: "f1".to_string(),
+            seq: 1,
+            task_id: None,
+            goal_id: "g1".to_string(),
+            kind: "observation".to_string(),
+            lifecycle: "verified".to_string(),
+            confidence: "high".to_string(),
+            review_state: "peer_reviewed".to_string(),
+            assertion: "all tests pass".to_string(),
+            evidence: None,
+            config_version: None,
+            derived_from: None,
+            supersedes: Vec::new(),
+            created_at_ms: 2000,
+            created_by: "peer-a".to_string(),
+        };
+
+        // Atomically: complete goal + append finding
+        ledger
+            .commit_state_with_audit("g1", "complete", 0, 3000, Some(&finding), None)
+            .unwrap();
+
+        // Verify goal is complete
+        let goal = ledger.get_goal("g1").unwrap().unwrap();
+        assert_eq!(goal.status, "complete");
+        assert_eq!(goal.revision, 1);
+
+        // Verify finding was committed
+        let findings = ledger.list_findings_since("g1", 0).unwrap();
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].assertion, "all tests pass");
+    }
+
+    #[test]
+    fn commit_state_with_audit_rolls_back_on_cas_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ledger.db");
+        let ledger = GoalLedger::open(&path).unwrap();
+
+        let goal = Goal {
+            goal_id: "g1".to_string(),
+            objective: "test".to_string(),
+            status: "active".to_string(),
+            tokens_used: 0,
+            token_budget: 10000,
+            continuations_used: 0,
+            revision: 5, // Start at revision 5
+            created_at_ms: 1000,
+            updated_at_ms: 1000,
+        };
+        ledger.create_goal(&goal).unwrap();
+
+        let finding = Finding {
+            rowid: None,
+            finding_id: "f1".to_string(),
+            seq: 1,
+            task_id: None,
+            goal_id: "g1".to_string(),
+            kind: "observation".to_string(),
+            lifecycle: "verified".to_string(),
+            confidence: "high".to_string(),
+            review_state: "peer_reviewed".to_string(),
+            assertion: "test".to_string(),
+            evidence: None,
+            config_version: None,
+            derived_from: None,
+            supersedes: Vec::new(),
+            created_at_ms: 2000,
+            created_by: "peer-a".to_string(),
+        };
+
+        // CAS failure: expected revision 0 but actual is 5
+        let result = ledger.commit_state_with_audit(
+            "g1",
+            "complete",
+            0, // Wrong revision
+            3000,
+            Some(&finding),
+            None,
+        );
+        assert!(result.is_err());
+
+        // Verify NOTHING was committed (atomic rollback)
+        let goal = ledger.get_goal("g1").unwrap().unwrap();
+        assert_eq!(goal.status, "active"); // Not changed
+        assert_eq!(goal.revision, 5); // Not incremented
+
+        let findings = ledger.list_findings_since("g1", 0).unwrap();
+        assert_eq!(findings.len(), 0); // Finding not committed
     }
 }
