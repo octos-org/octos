@@ -41,11 +41,14 @@
 
 #![deny(unsafe_code)]
 
+mod digest;
 mod fleet;
 mod grant;
 mod records;
+mod sqlite_ledger;
 mod store;
 
+pub use digest::{Digest, DigestFinding, DigestOptions, digest};
 pub use fleet::{Fleet, FleetSummary, FleetView, PlanEdit, PlanGraphError, TaskSpec, TaskView};
 pub use grant::{
     BASE_TOOLS, FsGrant, GRANTABLE_TOOLS, GrantError, NetworkGrant, WEB_TOOLS, WorkerGrant,
@@ -55,6 +58,9 @@ pub use records::{
     ChildStatus, DecisionEntry, DecisionKind, DurablePlan, EscalationRequest, EvidenceRef,
     FleetBudget, FleetChildRecord, FleetEventKind, FleetRecord, FleetStatus, Lease, OutboxEvent,
     PlanTask, SCHEMA_VERSION, Verifier, WorkerKind,
+};
+pub use sqlite_ledger::{
+    Decision, Escalation, Finding, Goal, GoalLedger, Task, digest_from_ledger,
 };
 pub use store::{
     AckOutcome, CompleteOutcome, DenyEscalationOutcome, FleetKernelStore, FleetSnapshot,

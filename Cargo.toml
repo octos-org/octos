@@ -122,6 +122,7 @@ htmd = "0.5"
 
 # Database (pure Rust)
 redb = "2"
+rusqlite = { version = "0.32", features = ["bundled"] }
 bincode = "1"
 
 # Vector search
