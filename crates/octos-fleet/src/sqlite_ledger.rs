@@ -40,6 +40,11 @@ pub struct Task {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Finding {
+    /// Monotonic row ID (SQLite rowid, assigned on insert, never changes).
+    /// Use this as the cursor for level-triggered queries instead of created_at_ms,
+    /// which is not monotonic across processes and has same-millisecond races.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rowid: Option<i64>,
     pub finding_id: String,
     pub task_id: Option<String>,
     pub goal_id: String,
@@ -95,6 +100,14 @@ impl GoalLedger {
         // Enable WAL mode for multi-process access
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
+
+        // CRITICAL: Enable foreign key constraints (OFF by default per-connection)
+        conn.pragma_update(None, "foreign_keys", "ON")?;
+
+        // CRITICAL: Set busy timeout to handle SQLITE_BUSY under concurrent writes
+        // Without this, two processes writing simultaneously cause immediate errors
+        // instead of waiting for the lock to release.
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
 
         conn.execute_batch(
             "
@@ -293,7 +306,7 @@ impl GoalLedger {
     }
 
     /// Append a finding (with transaction for consistency).
-    pub fn append_finding(&self, finding: &Finding) -> Result<()> {
+    pub fn append_finding(&self, finding: &Finding) -> Result<i64> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
 
@@ -317,33 +330,39 @@ impl GoalLedger {
             ],
         )?;
 
+        let rowid = tx.last_insert_rowid();
         tx.commit()?;
-        Ok(())
+        Ok(rowid)
     }
 
     /// List findings for a goal (level-triggered: only changes since `since_ms`).
-    pub fn list_findings_since(&self, goal_id: &str, since_ms: u64) -> Result<Vec<Finding>> {
+    /// List findings for a goal (level-triggered: only changes since `since_rowid`).
+    ///
+    /// Uses SQLite's rowid (monotonic per insert) as the cursor, NOT created_at_ms.
+    /// This avoids same-millisecond races and non-monotonic timestamps across processes.
+    pub fn list_findings_since(&self, goal_id: &str, since_rowid: i64) -> Result<Vec<Finding>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT finding_id, task_id, goal_id, kind, lifecycle, confidence, review_state, assertion, evidence, config_version, derived_from, created_at_ms, created_by
-             FROM findings WHERE goal_id = ?1 AND created_at_ms > ?2 ORDER BY created_at_ms ASC"
+            "SELECT rowid, finding_id, task_id, goal_id, kind, lifecycle, confidence, review_state, assertion, evidence, config_version, derived_from, created_at_ms, created_by
+             FROM findings WHERE goal_id = ?1 AND rowid > ?2 ORDER BY rowid ASC"
         )?;
         let findings = stmt
-            .query_map(params![goal_id, since_ms], |row| {
+            .query_map(params![goal_id, since_rowid], |row| {
                 Ok(Finding {
-                    finding_id: row.get(0)?,
-                    task_id: row.get(1)?,
-                    goal_id: row.get(2)?,
-                    kind: row.get(3)?,
-                    lifecycle: row.get(4)?,
-                    confidence: row.get(5)?,
-                    review_state: row.get(6)?,
-                    assertion: row.get(7)?,
-                    evidence: row.get(8)?,
-                    config_version: row.get(9)?,
-                    derived_from: row.get(10)?,
-                    created_at_ms: row.get(11)?,
-                    created_by: row.get(12)?,
+                    rowid: Some(row.get(0)?),
+                    finding_id: row.get(1)?,
+                    task_id: row.get(2)?,
+                    goal_id: row.get(3)?,
+                    kind: row.get(4)?,
+                    lifecycle: row.get(5)?,
+                    confidence: row.get(6)?,
+                    review_state: row.get(7)?,
+                    assertion: row.get(8)?,
+                    evidence: row.get(9)?,
+                    config_version: row.get(10)?,
+                    derived_from: row.get(11)?,
+                    created_at_ms: row.get(12)?,
+                    created_by: row.get(13)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -400,6 +419,7 @@ mod tests {
         ledger.create_goal(&goal).unwrap();
 
         let finding = Finding {
+            rowid: None, // Assigned by SQLite on insert
             finding_id: "f1".to_string(),
             task_id: None,
             goal_id: "g1".to_string(),
@@ -442,6 +462,7 @@ mod tests {
         // Add findings at different times
         for i in 1..=5 {
             let finding = Finding {
+                rowid: None, // Assigned by SQLite on insert
                 finding_id: format!("f{}", i),
                 task_id: None,
                 goal_id: "g1".to_string(),
@@ -459,10 +480,13 @@ mod tests {
             ledger.append_finding(&finding).unwrap();
         }
 
-        // Level-triggered: only get findings since t=1300
-        let findings = ledger.list_findings_since("g1", 1300).unwrap();
+        // Level-triggered: only get findings since rowid=3 (f1-f3 have rowid 1-3)
+        let findings = ledger.list_findings_since("g1", 3).unwrap();
         assert_eq!(findings.len(), 2); // f4 and f5
         assert_eq!(findings[0].finding_id, "f4");
         assert_eq!(findings[1].finding_id, "f5");
+        // Verify rowid is monotonic
+        assert_eq!(findings[0].rowid, Some(4));
+        assert_eq!(findings[1].rowid, Some(5));
     }
 }
