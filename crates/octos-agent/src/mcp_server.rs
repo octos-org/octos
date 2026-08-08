@@ -11,6 +11,8 @@
 //! artifact) and returns the aggregate result to the caller. Internal
 //! tool calls, iteration events, and progress are **never** streamed to
 //! the outer MCP caller — the outer caller sees one request/response.
+//! Versioned ARC callers may provide a native `input.arc_task`; see
+//! `docs/ARC_AGENT_TASK_MCP.md`.
 //!
 //! # Transports
 //!
@@ -424,20 +426,7 @@ impl ServerHandler for OctosMcpHandler {
 
 /// The single MCP tool advertised by the server, as a typed rmcp [`Tool`].
 fn run_octos_session_tool() -> Tool {
-    let schema = json!({
-        "type": "object",
-        "properties": {
-            "contract": {
-                "type": "string",
-                "description": "Workspace contract name (e.g. 'slides_delivery', 'site_delivery', 'coding')."
-            },
-            "input": {
-                "type": "object",
-                "description": "Opaque input payload forwarded to the session. Shape is contract-specific."
-            }
-        },
-        "required": ["contract", "input"]
-    });
+    let schema = run_octos_session_schema();
     let input_schema = schema.as_object().cloned().unwrap_or_default();
     Tool::new(
         RUN_OCTOS_SESSION_TOOL,
@@ -447,6 +436,39 @@ fn run_octos_session_tool() -> Tool {
          events are not streamed to the caller.",
         input_schema,
     )
+}
+
+fn run_octos_session_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "contract": {
+                "type": "string",
+                "description": "Workspace contract name (e.g. 'slides_delivery', 'site_delivery', 'coding')."
+            },
+            "input": {
+                "type": "object",
+                "description": "Contract-specific session input. Native ARC callers may supply a versioned arc_task.",
+                "properties": {
+                    "prompt": {
+                        "type": "string",
+                        "description": "Legacy free-form session prompt. Ignored when arc_task is present."
+                    },
+                    "expected_artifact": {
+                        "type": "string",
+                        "description": "Expected workspace artifact path."
+                    },
+                    "artifact_name": {
+                        "type": "string",
+                        "description": "Workspace-contract artifact name."
+                    },
+                    "arc_task": crate::arc_task::arc_agent_task_v1_schema()
+                },
+                "additionalProperties": true
+            }
+        },
+        "required": ["contract", "input"]
+    })
 }
 
 /// Convert the shared dispatch result (`{content:[{text}], isError}`) into a
@@ -545,20 +567,7 @@ pub fn build_tools_list_response(_server: &McpServer) -> Value {
         "tools": [{
             "name": RUN_OCTOS_SESSION_TOOL,
             "description": "Run a complete octos session. The caller supplies a workspace contract name and an input payload; octos runs its normal loop to completion (including workspace-contract enforcement) and returns the resulting artifact. Internal tool calls and progress events are not streamed to the caller.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "contract": {
-                        "type": "string",
-                        "description": "Workspace contract name (e.g. 'slides_delivery', 'site_delivery', 'coding')."
-                    },
-                    "input": {
-                        "type": "object",
-                        "description": "Opaque input payload forwarded to the session. Shape is contract-specific."
-                    }
-                },
-                "required": ["contract", "input"]
-            }
+            "inputSchema": run_octos_session_schema()
         }]
     })
 }

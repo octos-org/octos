@@ -28,9 +28,9 @@ use octos_agent::task_supervisor::TaskLifecycleState;
 use octos_agent::validators::ValidatorStatus;
 use octos_agent::{SandboxConfig, SandboxMode};
 use octos_cli::commands::mcp_serve::{AgentLlmFactory, RealSessionDispatch, SessionDispatchConfig};
-use octos_core::{Message, ToolCall};
+use octos_core::{Message, MessageRole, ToolCall};
 use octos_llm::{ChatConfig, ChatResponse, LlmProvider, StopReason, TokenUsage, ToolSpec};
-use serde_json::json;
+use serde_json::{Value, json};
 use tempfile::TempDir;
 
 /// Recording observer used to verify lifecycle transitions propagate
@@ -62,13 +62,19 @@ impl SessionLifecycleObserver for RecordingObserver {
 /// ToolUse stop reason so the agent loop terminates deterministically.
 struct ScriptedLlmProvider {
     responses: Mutex<Vec<ChatResponse>>,
+    requests: Mutex<Vec<Vec<Message>>>,
 }
 
 impl ScriptedLlmProvider {
     fn new(responses: Vec<ChatResponse>) -> Arc<Self> {
         Arc::new(Self {
             responses: Mutex::new(responses),
+            requests: Mutex::new(Vec::new()),
         })
+    }
+
+    fn requests(&self) -> Vec<Vec<Message>> {
+        self.requests.lock().unwrap().clone()
     }
 }
 
@@ -76,10 +82,11 @@ impl ScriptedLlmProvider {
 impl LlmProvider for ScriptedLlmProvider {
     async fn chat(
         &self,
-        _messages: &[Message],
+        messages: &[Message],
         _tools: &[ToolSpec],
         _config: &ChatConfig,
     ) -> eyre::Result<ChatResponse> {
+        self.requests.lock().unwrap().push(messages.to_vec());
         let mut responses = self.responses.lock().unwrap();
         if responses.is_empty() {
             eyre::bail!("ScriptedLlmProvider: scripted responses exhausted");
@@ -160,13 +167,38 @@ impl DispatchHarness {
         workspace: TempDir,
         sandbox: SandboxConfig,
     ) -> Self {
+        Self::build_with_sandbox_and_max_iterations(provider, workspace, sandbox, 4)
+    }
+
+    fn build_with_max_iterations(
+        provider: Arc<dyn LlmProvider>,
+        workspace: TempDir,
+        max_iterations: u32,
+    ) -> Self {
+        Self::build_with_sandbox_and_max_iterations(
+            provider,
+            workspace,
+            SandboxConfig {
+                mode: SandboxMode::None,
+                ..SandboxConfig::default()
+            },
+            max_iterations,
+        )
+    }
+
+    fn build_with_sandbox_and_max_iterations(
+        provider: Arc<dyn LlmProvider>,
+        workspace: TempDir,
+        sandbox: SandboxConfig,
+        max_iterations: u32,
+    ) -> Self {
         let factory = AgentLlmFactory::scripted(provider);
         let data_dir = workspace.path().join(".octos-data");
         std::fs::create_dir_all(&data_dir).unwrap();
         let config = SessionDispatchConfig {
             cwd: workspace.path().to_path_buf(),
             data_dir,
-            max_iterations: 4,
+            max_iterations,
             sandbox,
             tool_policy: None,
             tool_policy_by_provider: Default::default(),
@@ -177,6 +209,42 @@ impl DispatchHarness {
             _workspace: workspace,
         }
     }
+}
+
+fn sample_arc_input(
+    workspace: &std::path::Path,
+    expected_artifact: &str,
+    response_schema: Option<Value>,
+) -> Value {
+    json!({
+        "prompt": "LEGACY_PROMPT_MUST_NOT_RUN",
+        "expected_artifact": expected_artifact,
+        "artifact_name": "arc-stage-result",
+        "arc_task": {
+            "schema": "arc.agent-task.v1",
+            "task_id": "REQ-1:DESIGN:InterfaceDesigner",
+            "stage": "InterfaceDesigner",
+            "backend_agent_name": "interface_designer",
+            "node_id": "REQ-1",
+            "phase": "DESIGN",
+            "app_type": "web",
+            "workspace_root": workspace.display().to_string(),
+            "requirement_path": workspace.join("requirements/requirements.yaml").display().to_string(),
+            "thread_id": "REQ-1:DESIGN:InterfaceDesigner",
+            "test_type": "",
+            "system_prompt": "ARC_NATIVE_SYSTEM_ROLE_SENTINEL",
+            "message": "Design the booking interface.",
+            "response_schema": response_schema,
+            "inputs": {
+                "requirement": {"id": "REQ-1", "title": "Book a ticket"}
+            },
+            "acceptance": {
+                "response_schema_required": true,
+                "artifact_kind": "interface_design"
+            },
+            "skills": ["/skills/leaf-full-design/"]
+        }
+    })
 }
 
 #[tokio::test]
@@ -230,6 +298,273 @@ async fn should_execute_real_agent_session_via_mcp_dispatch_and_return_artifact(
     // cost must be a real token bundle, never a placeholder zero struct.
     assert_eq!(outcome.cost.input_tokens, 42);
     assert_eq!(outcome.cost.output_tokens, 17);
+}
+
+#[tokio::test]
+async fn arc_agent_task_uses_native_system_prompt_and_structured_task() {
+    let workspace = TempDir::new().unwrap();
+    let artifact_rel = ".arc/delegated/interface-designer-REQ-1.json";
+    let artifact_path = workspace.path().join(artifact_rel);
+    std::fs::create_dir_all(artifact_path.parent().unwrap()).unwrap();
+    std::fs::write(&artifact_path, r#"{"summary":"ready"}"#).unwrap();
+
+    let provider = ScriptedLlmProvider::new(vec![end_turn("done")]);
+    let recording_provider = provider.clone();
+    let harness = DispatchHarness::build(provider, workspace);
+    let observer = RecordingObserver::new();
+
+    let outcome = harness
+        .dispatch
+        .run_session(
+            "coding",
+            &sample_arc_input(
+                harness._workspace.path(),
+                artifact_rel,
+                Some(json!({
+                    "type": "object",
+                    "required": ["summary"],
+                    "properties": {"summary": {"type": "string"}}
+                })),
+            ),
+            &observer,
+        )
+        .await
+        .expect("native ARC task dispatch");
+    assert_eq!(outcome.final_state, TaskLifecycleState::Ready);
+
+    let requests = recording_provider.requests();
+    let messages = requests.first().expect("one LLM request");
+    assert!(
+        messages.iter().any(|message| {
+            message.role == MessageRole::System
+                && message.content.contains("ARC_NATIVE_SYSTEM_ROLE_SENTINEL")
+        }),
+        "ARC role was not mapped to an Octos system message: {messages:?}"
+    );
+    assert!(
+        messages
+            .iter()
+            .filter(|message| message.role == MessageRole::User)
+            .all(|message| {
+                !message.content.contains("ARC_NATIVE_SYSTEM_ROLE_SENTINEL")
+                    && !message.content.contains("LEGACY_PROMPT_MUST_NOT_RUN")
+            }),
+        "native ARC execution leaked system or legacy prompt into user messages: {messages:?}"
+    );
+    let structured_task = messages
+        .iter()
+        .filter(|message| message.role == MessageRole::User)
+        .map(|message| message.content.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    for expected in [
+        "REQ-1:DESIGN:InterfaceDesigner",
+        "Design the booking interface.",
+        "requirement_path",
+        "requirements.yaml",
+        "inputs",
+        "acceptance",
+        artifact_rel,
+    ] {
+        assert!(
+            structured_task.contains(expected),
+            "structured ARC task omitted {expected:?}: {structured_task}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn arc_agent_task_rejects_stale_artifact_when_agent_reports_failure() {
+    let workspace = TempDir::new().unwrap();
+    let artifact_rel = ".arc/delegated/stale.json";
+    let artifact_path = workspace.path().join(artifact_rel);
+    std::fs::create_dir_all(artifact_path.parent().unwrap()).unwrap();
+    std::fs::write(&artifact_path, r#"{"summary":"from an older attempt"}"#).unwrap();
+
+    // One tool turn consumes the full iteration budget. `Agent::run_task`
+    // therefore returns `Ok(TaskResult { success: false, .. })` while the stale
+    // artifact still exists on disk.
+    let provider = ScriptedLlmProvider::new(vec![tool_use(ToolCall {
+        id: "consume-budget".to_string(),
+        name: "read_file".to_string(),
+        arguments: json!({"path": artifact_rel}),
+        metadata: None,
+    })]);
+    let harness = DispatchHarness::build_with_max_iterations(provider, workspace, 1);
+    let observer = RecordingObserver::new();
+    let outcome = harness
+        .dispatch
+        .run_session(
+            "coding",
+            &sample_arc_input(
+                harness._workspace.path(),
+                artifact_rel,
+                Some(json!({
+                    "type": "object",
+                    "required": ["summary"],
+                    "properties": {"summary": {"type": "string"}}
+                })),
+            ),
+            &observer,
+        )
+        .await
+        .expect("soft task failure is returned as a typed outcome");
+
+    assert_eq!(outcome.final_state, TaskLifecycleState::Failed);
+    assert!(outcome.artifact_path.is_none());
+    assert!(
+        outcome
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .starts_with("session_failed:"),
+        "unexpected error: {:?}",
+        outcome.error
+    );
+    assert!(
+        !observer.snapshot().contains(&TaskLifecycleState::Verifying),
+        "an unsuccessful task must not verify a stale artifact"
+    );
+}
+
+#[tokio::test]
+async fn arc_agent_task_accepts_artifact_matching_response_schema() {
+    let workspace = TempDir::new().unwrap();
+    let artifact_rel = ".arc/delegated/valid.json";
+    let artifact_path = workspace.path().join(artifact_rel);
+    std::fs::create_dir_all(artifact_path.parent().unwrap()).unwrap();
+    std::fs::write(
+        &artifact_path,
+        r#"{"summary":"ready","items":[{"id":"one"}]}"#,
+    )
+    .unwrap();
+
+    let provider = ScriptedLlmProvider::new(vec![end_turn("done")]);
+    let harness = DispatchHarness::build(provider, workspace);
+    let observer = RecordingObserver::new();
+    let outcome = harness
+        .dispatch
+        .run_session(
+            "coding",
+            &sample_arc_input(
+                harness._workspace.path(),
+                artifact_rel,
+                Some(json!({
+                    "type": "object",
+                    "required": ["summary", "items"],
+                    "$defs": {
+                        "Item": {
+                            "type": "object",
+                            "required": ["id"],
+                            "properties": {"id": {"type": "string"}}
+                        }
+                    },
+                    "properties": {
+                        "summary": {"type": "string"},
+                        "items": {
+                            "type": "array",
+                            "items": {"$ref": "#/$defs/Item"}
+                        }
+                    }
+                })),
+            ),
+            &observer,
+        )
+        .await
+        .expect("valid ARC artifact");
+
+    assert_eq!(outcome.final_state, TaskLifecycleState::Ready);
+    let content = outcome.artifact_content.expect("inline JSON artifact");
+    assert_eq!(
+        serde_json::from_str::<Value>(&content).unwrap()["summary"],
+        "ready"
+    );
+}
+
+#[tokio::test]
+async fn arc_agent_task_rejects_artifact_violating_response_schema() {
+    let workspace = TempDir::new().unwrap();
+    let artifact_rel = ".arc/delegated/invalid.json";
+    let artifact_path = workspace.path().join(artifact_rel);
+    std::fs::create_dir_all(artifact_path.parent().unwrap()).unwrap();
+    std::fs::write(&artifact_path, r#"{"items":[{"id":42}]}"#).unwrap();
+
+    let provider = ScriptedLlmProvider::new(vec![end_turn("done")]);
+    let harness = DispatchHarness::build(provider, workspace);
+    let observer = RecordingObserver::new();
+    let outcome = harness
+        .dispatch
+        .run_session(
+            "coding",
+            &sample_arc_input(
+                harness._workspace.path(),
+                artifact_rel,
+                Some(json!({
+                    "type": "object",
+                    "required": ["summary", "items"],
+                    "$defs": {
+                        "Item": {
+                            "type": "object",
+                            "required": ["id"],
+                            "properties": {"id": {"type": "string"}}
+                        }
+                    },
+                    "properties": {
+                        "summary": {"type": "string"},
+                        "items": {
+                            "type": "array",
+                            "items": {"$ref": "#/$defs/Item"}
+                        }
+                    }
+                })),
+            ),
+            &observer,
+        )
+        .await
+        .expect("schema mismatch is a typed task outcome");
+
+    assert_eq!(outcome.final_state, TaskLifecycleState::Failed);
+    assert!(
+        outcome
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .starts_with("artifact_schema_invalid:"),
+        "unexpected error: {:?}",
+        outcome.error
+    );
+}
+
+#[tokio::test]
+async fn legacy_prompt_session_remains_compatible_without_arc_task() {
+    let workspace = TempDir::new().unwrap();
+    let artifact_rel = "output/legacy.json";
+    let artifact_path = workspace.path().join(artifact_rel);
+    std::fs::create_dir_all(artifact_path.parent().unwrap()).unwrap();
+    std::fs::write(&artifact_path, r#"{"legacy":true}"#).unwrap();
+
+    let provider = ScriptedLlmProvider::new(vec![end_turn("done")]);
+    let recording_provider = provider.clone();
+    let harness = DispatchHarness::build(provider, workspace);
+    let observer = RecordingObserver::new();
+    let outcome = harness
+        .dispatch
+        .run_session(
+            "coding",
+            &json!({
+                "prompt": "LEGACY_PROMPT_REACHES_LLM",
+                "expected_artifact": artifact_rel
+            }),
+            &observer,
+        )
+        .await
+        .expect("legacy prompt dispatch");
+
+    assert_eq!(outcome.final_state, TaskLifecycleState::Ready);
+    let requests = recording_provider.requests();
+    assert!(requests.iter().flatten().any(|message| {
+        message.role == MessageRole::User && message.content.contains("LEGACY_PROMPT_REACHES_LLM")
+    }));
 }
 
 #[tokio::test]

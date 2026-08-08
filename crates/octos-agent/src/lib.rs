@@ -11,6 +11,7 @@ pub mod abi_schema;
 mod agent;
 pub mod agents;
 pub mod approval;
+pub mod arc_task;
 pub mod behaviour;
 pub mod bootstrap;
 pub mod bridge;

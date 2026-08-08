@@ -15,6 +15,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use octos_agent::arc_task::{ARC_AGENT_TASK_SCHEMA_V1, parse_arc_agent_task_input};
 use octos_agent::harness_events::HarnessEventPayload;
 use octos_agent::mcp_server::{
     McpServer, McpServerError, McpSessionCost, McpSessionDispatch, McpSessionOutcome,
@@ -25,6 +26,7 @@ use octos_agent::task_supervisor::{TaskLifecycleState, TaskSupervisor};
 use octos_agent::validators::{ValidatorOutcome, ValidatorPhase, ValidatorStatus};
 use octos_agent::{HarnessEvent, TASK_RESULT_SCHEMA_VERSION};
 use serde_json::{Value, json};
+use tempfile::TempDir;
 use tokio::sync::Mutex;
 
 /// A scripted session dispatch that a test can steer into Ready or Failed.
@@ -94,6 +96,39 @@ fn sample_failed_outcome() -> McpSessionOutcome {
     }
 }
 
+fn sample_arc_task(workspace: &std::path::Path) -> Value {
+    json!({
+        "schema": ARC_AGENT_TASK_SCHEMA_V1,
+        "task_id": "REQ-1:DESIGN:InterfaceDesigner",
+        "stage": "InterfaceDesigner",
+        "backend_agent_name": "interface_designer",
+        "node_id": "REQ-1",
+        "phase": "DESIGN",
+        "app_type": "web",
+        "workspace_root": workspace.display().to_string(),
+        "requirement_path": workspace.join("requirements/requirements.yaml").display().to_string(),
+        "thread_id": "REQ-1:DESIGN:InterfaceDesigner",
+        "test_type": "",
+        "system_prompt": "You are ARC's interface designer.",
+        "message": "Design the booking interface.",
+        "response_schema": {
+            "type": "object",
+            "required": ["summary"],
+            "properties": {
+                "summary": {"type": "string"}
+            }
+        },
+        "inputs": {
+            "requirement": {"id": "REQ-1", "title": "Book a ticket"}
+        },
+        "acceptance": {
+            "response_schema_required": true,
+            "artifact_kind": "interface_design"
+        },
+        "skills": ["/skills/leaf-full-design/"]
+    })
+}
+
 fn sample_validator_outcome(status: ValidatorStatus, reason: &str) -> ValidatorOutcome {
     ValidatorOutcome {
         schema_version: 1,
@@ -133,6 +168,144 @@ async fn should_expose_session_as_mcp_tool_via_stdio() {
     let required: Vec<&str> = required.iter().filter_map(Value::as_str).collect();
     assert!(required.contains(&"contract"));
     assert!(required.contains(&"input"));
+}
+
+#[test]
+fn run_octos_session_schema_advertises_arc_agent_task_v1() {
+    let dispatch = Arc::new(ScriptedDispatch::with_outcome(sample_ready_outcome()));
+    let supervisor = Arc::new(TaskSupervisor::new());
+    let server = McpServer::new(dispatch, supervisor);
+
+    let tools = build_tools_list_response(&server);
+    let tool = &tools["tools"][0];
+    let schema = &tool["inputSchema"];
+    let top_level_required: Vec<&str> = schema["required"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    assert_eq!(top_level_required, vec!["contract", "input"]);
+
+    let arc_task = &schema["properties"]["input"]["properties"]["arc_task"];
+    assert_eq!(arc_task["type"], "object", "input schema: {schema}");
+    assert_eq!(
+        arc_task["properties"]["schema"]["const"],
+        ARC_AGENT_TASK_SCHEMA_V1
+    );
+    let required: Vec<&str> = arc_task["required"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    for field in [
+        "schema",
+        "task_id",
+        "stage",
+        "node_id",
+        "phase",
+        "workspace_root",
+        "requirement_path",
+        "system_prompt",
+        "message",
+        "inputs",
+        "acceptance",
+    ] {
+        assert!(required.contains(&field), "missing required field {field}");
+    }
+}
+
+#[test]
+fn arc_agent_task_v1_parses_and_preserves_structured_fields() {
+    let workspace = TempDir::new().unwrap();
+    let input = json!({
+        "arc_task": sample_arc_task(workspace.path()),
+        "expected_artifact": ".arc/delegated/interface-designer-REQ-1.json",
+        "artifact_name": "arc-stage-result"
+    });
+
+    let request = parse_arc_agent_task_input(&input, workspace.path())
+        .expect("valid ARC task")
+        .expect("ARC task present");
+
+    assert_eq!(request.task.schema, ARC_AGENT_TASK_SCHEMA_V1);
+    assert_eq!(request.task.task_id, "REQ-1:DESIGN:InterfaceDesigner");
+    assert_eq!(request.task.inputs["requirement"]["id"], "REQ-1");
+    assert_eq!(request.task.acceptance["artifact_kind"], "interface_design");
+    assert_eq!(
+        request.task.response_schema.as_ref().unwrap()["type"],
+        "object"
+    );
+    assert_eq!(request.task.skills, vec!["/skills/leaf-full-design/"]);
+    assert_eq!(
+        request.execution_params()["requirement_path"],
+        workspace
+            .path()
+            .join("requirements/requirements.yaml")
+            .display()
+            .to_string()
+    );
+    assert_eq!(
+        request.expected_artifact,
+        std::path::PathBuf::from(".arc/delegated/interface-designer-REQ-1.json")
+    );
+}
+
+#[test]
+fn arc_agent_task_v1_rejects_invalid_schema_and_workspace_escape() {
+    let workspace = TempDir::new().unwrap();
+
+    let mut wrong_schema = sample_arc_task(workspace.path());
+    wrong_schema["schema"] = json!("arc.agent-task.v2");
+    let error = parse_arc_agent_task_input(
+        &json!({
+            "arc_task": wrong_schema,
+            "expected_artifact": ".arc/delegated/result.json"
+        }),
+        workspace.path(),
+    )
+    .unwrap_err();
+    assert!(error.to_string().starts_with("arc_task_invalid:"));
+
+    let other_workspace = TempDir::new().unwrap();
+    let mismatched_workspace = sample_arc_task(other_workspace.path());
+    let error = parse_arc_agent_task_input(
+        &json!({
+            "arc_task": mismatched_workspace,
+            "expected_artifact": ".arc/delegated/result.json"
+        }),
+        workspace.path(),
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("workspace_root"));
+
+    let escaping_artifact = sample_arc_task(workspace.path());
+    let error = parse_arc_agent_task_input(
+        &json!({
+            "arc_task": escaping_artifact,
+            "expected_artifact": "../outside.json"
+        }),
+        workspace.path(),
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("expected_artifact"));
+
+    let mut missing_required_response_schema = sample_arc_task(workspace.path());
+    missing_required_response_schema["response_schema"] = Value::Null;
+    let error = parse_arc_agent_task_input(
+        &json!({
+            "arc_task": missing_required_response_schema,
+            "expected_artifact": ".arc/delegated/result.json"
+        }),
+        workspace.path(),
+    )
+    .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("acceptance.response_schema_required")
+    );
 }
 
 #[test]

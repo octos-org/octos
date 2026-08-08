@@ -32,6 +32,8 @@
 //! Failures carry a typed prefix (`config_error:`, `llm_error:`,
 //! `contract_failed:`, `artifact_missing:`, `session_failed:`) so outer
 //! orchestrators can branch on category without scraping English text.
+//! Native ARC input additionally uses `arc_task_invalid:` and
+//! `artifact_schema_invalid:`; see `docs/ARC_AGENT_TASK_MCP.md`.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -41,6 +43,10 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use clap::{Args, ValueEnum};
 use eyre::{Result, WrapErr};
+use octos_agent::arc_task::{
+    ARC_AGENT_TASK_SCHEMA_V1, parse_arc_agent_task_input, validate_arc_artifact_location,
+    validate_arc_response,
+};
 use octos_agent::mcp_server::{
     McpServer, McpServerError, McpSessionCost, McpSessionDispatch, McpSessionOutcome,
     OCTOS_MCP_SERVER_TOKEN_ENV, SessionLifecycleObserver,
@@ -484,22 +490,34 @@ impl McpSessionDispatch for RealSessionDispatch {
     ) -> Result<McpSessionOutcome, McpServerError> {
         observer.mark_state(TaskLifecycleState::Running);
 
-        // Parse MCP input — prompt is required, `expected_artifact` and
-        // `artifact_name` are optional hints that override workspace-
-        // contract resolution. Everything else is ignored so callers can
-        // forward contract-specific payloads without tripping the parser.
+        // Native ARC input is parsed and workspace-validated before the LLM
+        // provider or agent loop is constructed. If `arc_task` is absent, the
+        // original free-form prompt path remains byte-for-byte compatible.
+        let arc_request = match parse_arc_agent_task_input(input, &self.config.cwd) {
+            Ok(request) => request,
+            Err(error) => {
+                observer.mark_state(TaskLifecycleState::Failed);
+                return Err(McpServerError::InvalidParams(error.to_string()));
+            }
+        };
         let prompt = input
             .get("prompt")
             .and_then(Value::as_str)
             .map(str::to_string)
             .unwrap_or_else(|| format!("Run the {contract} contract"));
-        let expected_artifact = input
-            .get("expected_artifact")
-            .and_then(Value::as_str)
-            .map(PathBuf::from);
-        let artifact_name = input
-            .get("artifact_name")
-            .and_then(Value::as_str)
+        let expected_artifact = arc_request
+            .as_ref()
+            .map(|request| request.expected_artifact.clone())
+            .or_else(|| {
+                input
+                    .get("expected_artifact")
+                    .and_then(Value::as_str)
+                    .map(PathBuf::from)
+            });
+        let artifact_name = arc_request
+            .as_ref()
+            .map(|request| request.artifact_name.as_str())
+            .or_else(|| input.get("artifact_name").and_then(Value::as_str))
             .unwrap_or("primary");
 
         // Build the LLM provider and the per-session agent.
@@ -576,6 +594,9 @@ impl McpSessionDispatch for RealSessionDispatch {
             memory,
         )
         .with_config(agent_config);
+        if let Some(request) = &arc_request {
+            agent = agent.with_system_prompt(request.task.system_prompt.clone());
+        }
 
         // Review A F-004: propagate the workspace policy's declarative
         // compaction contract onto the MCP-served child Agent. Parity with
@@ -603,27 +624,40 @@ impl McpSessionDispatch for RealSessionDispatch {
 
         // Run the task — this is the same code path the local chat command
         // uses. Any LLM/tool errors surface as `eyre::Report`.
-        let task = Task::new(
-            TaskKind::Custom {
-                name: contract.to_string(),
-                params: input.clone(),
-            },
-            TaskContext {
-                working_dir: self.config.cwd.clone(),
-                working_memory: vec![octos_core::Message {
-                    role: octos_core::MessageRole::User,
-                    content: prompt,
-                    media: vec![],
-                    tool_calls: None,
-                    tool_call_id: None,
-                    reasoning_content: None,
-                    client_message_id: None,
-                    thread_id: None,
-                    timestamp: chrono::Utc::now(),
-                }],
-                ..Default::default()
-            },
-        );
+        let task = if let Some(request) = &arc_request {
+            Task::new(
+                TaskKind::Custom {
+                    name: ARC_AGENT_TASK_SCHEMA_V1.to_string(),
+                    params: request.execution_params(),
+                },
+                TaskContext {
+                    working_dir: self.config.cwd.clone(),
+                    ..Default::default()
+                },
+            )
+        } else {
+            Task::new(
+                TaskKind::Custom {
+                    name: contract.to_string(),
+                    params: input.clone(),
+                },
+                TaskContext {
+                    working_dir: self.config.cwd.clone(),
+                    working_memory: vec![octos_core::Message {
+                        role: octos_core::MessageRole::User,
+                        content: prompt,
+                        media: vec![],
+                        tool_calls: None,
+                        tool_call_id: None,
+                        reasoning_content: None,
+                        client_message_id: None,
+                        thread_id: None,
+                        timestamp: chrono::Utc::now(),
+                    }],
+                    ..Default::default()
+                },
+            )
+        };
 
         let task_result = match agent.run_task(&task).await {
             Ok(result) => result,
@@ -639,6 +673,29 @@ impl McpSessionDispatch for RealSessionDispatch {
                 });
             }
         };
+
+        // `run_task` reports budget exhaustion and other soft terminal failures
+        // as `Ok(TaskResult { success: false, .. })`. Do not verify a pre-existing
+        // artifact in that case: accepting stale output would turn an
+        // unsuccessful ARC attempt into Ready.
+        if !task_result.success {
+            observer.mark_state(TaskLifecycleState::Failed);
+            let detail = task_result.output.trim();
+            let error = if detail.is_empty() {
+                "session_failed: agent task reported unsuccessful completion without an explanatory message"
+                    .to_string()
+            } else {
+                format!("session_failed: agent task reported unsuccessful completion: {detail}")
+            };
+            return Ok(McpSessionOutcome {
+                final_state: TaskLifecycleState::Failed,
+                artifact_path: None,
+                artifact_content: None,
+                validator_results: Vec::new(),
+                cost: McpSessionCost::from(&task_result.token_usage),
+                error: Some(error),
+            });
+        }
 
         observer.mark_state(TaskLifecycleState::Verifying);
 
@@ -691,7 +748,54 @@ impl McpSessionDispatch for RealSessionDispatch {
                 // Populate artifact_content only for small text-like files so
                 // we do not blow up the MCP response. Callers that need
                 // binary bytes should read `artifact_path` themselves.
+                if arc_request.is_some()
+                    && let Err(error) = validate_arc_artifact_location(&self.config.cwd, &path)
+                {
+                    observer.mark_state(TaskLifecycleState::Failed);
+                    return Ok(McpSessionOutcome {
+                        final_state: TaskLifecycleState::Failed,
+                        artifact_path: None,
+                        artifact_content: None,
+                        validator_results,
+                        cost,
+                        error: Some(error.to_string()),
+                    });
+                }
                 let artifact_content = read_small_text_artifact(&path);
+                if let Some(response_schema) = arc_request
+                    .as_ref()
+                    .and_then(|request| request.task.response_schema.as_ref())
+                {
+                    let validation = artifact_content
+                        .as_deref()
+                        .ok_or_else(|| {
+                            "artifact_schema_invalid: expected a UTF-8 JSON artifact no larger than 64 KiB"
+                                .to_string()
+                        })
+                        .and_then(|content| {
+                            serde_json::from_str::<Value>(content)
+                                .map_err(|error| {
+                                    format!(
+                                        "artifact_schema_invalid: artifact is not valid JSON: {error}"
+                                    )
+                                })
+                        })
+                        .and_then(|artifact| {
+                            validate_arc_response(response_schema, &artifact)
+                                .map_err(|error| error.to_string())
+                        });
+                    if let Err(error) = validation {
+                        observer.mark_state(TaskLifecycleState::Failed);
+                        return Ok(McpSessionOutcome {
+                            final_state: TaskLifecycleState::Failed,
+                            artifact_path: None,
+                            artifact_content: None,
+                            validator_results,
+                            cost,
+                            error: Some(error),
+                        });
+                    }
+                }
                 observer.mark_state(TaskLifecycleState::Ready);
                 Ok(McpSessionOutcome {
                     final_state: TaskLifecycleState::Ready,
