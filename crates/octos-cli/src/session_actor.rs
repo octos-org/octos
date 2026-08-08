@@ -52,7 +52,12 @@ use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
 #[cfg(feature = "api")]
-use crate::api::agent_orchestrator::{default_agent_orchestrator, upsert_background_task_agent};
+#[cfg(feature = "api")]
+use crate::api::agent_orchestrator::{
+    default_agent_orchestrator, run_goal_completion_verifier, upsert_background_task_agent,
+};
+#[cfg(feature = "api")]
+use crate::api::goal_loop_runtime::GoalCompletionVerdict;
 #[cfg(feature = "api")]
 use crate::api::master_continuation_scheduler::{
     MasterContinuationReason, MasterContinuationRuntimeState, QueuedMasterContinuation,
@@ -5103,10 +5108,36 @@ impl SessionActor {
                 .map(|msg| msg.content.clone())
                 .unwrap_or_default()
         };
+        // Loop-engineering completion gate: only spend the INDEPENDENT
+        // verifier LLM call when the agent actually CLAIMS completion.
+        let (verdict, expected_goal_id) = if orchestrator.goal_completion_claimed(&assistant_tail) {
+            let objective = orchestrator
+                .goal_objective_for_test(&self.session_key)
+                .unwrap_or_else(|| "unknown".to_string());
+            // Snapshot goal_id BEFORE the async verifier call to prevent
+            // completing the wrong goal if it changes during the await.
+            let goal_id = orchestrator.goal_id_for_session(&self.session_key);
+            let verdict = run_goal_completion_verifier(
+                self.agent.llm_provider(),
+                &objective,
+                &assistant_tail,
+            )
+            .await;
+            (verdict, goal_id)
+        } else {
+            (
+                GoalCompletionVerdict::NotDone {
+                    reason: "no completion claimed".to_string(),
+                },
+                None,
+            )
+        };
         if orchestrator.maybe_complete_goal_from_model(
             &self.session_key,
             profile_id,
             &assistant_tail,
+            &verdict,
+            expected_goal_id.as_deref(),
         ) {
             return;
         }

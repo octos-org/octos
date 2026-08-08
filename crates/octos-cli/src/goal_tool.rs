@@ -875,6 +875,62 @@ impl Tool for GoalUpdateTool {
             .get("reason")
             .and_then(Value::as_str)
             .unwrap_or_default();
+
+        // CRITICAL: Gate `complete` transitions on the INDEPENDENT verifier.
+        // The goal_update tool is the FIRST-CLASS path (replacing the <goal:complete>
+        // sentinel), so it must NOT bypass the verifier. When the model claims
+        // completion, we call run_goal_completion_verifier to independently check
+        // the objective against the model's evidence. Blocked transitions skip
+        // verification (they're failure declarations, not success claims).
+        if status == "complete" {
+            let orchestrator = default_agent_orchestrator();
+            let Some(objective) = orchestrator.goal_objective_for_test(&session_id) else {
+                return Ok(ToolResult {
+                    output: "goal_update: no goal objective found for verification".into(),
+                    success: false,
+                    ..Default::default()
+                });
+            };
+            // Snapshot goal_id BEFORE the async verifier call to prevent
+            // completing the wrong goal if it changes during the await.
+            let expected_goal_id = orchestrator.goal_id_for_session(&session_id);
+            // The evidence is the model's reason for claiming completion.
+            let verdict = crate::api::agent_orchestrator::run_goal_completion_verifier(
+                ctx.llm_provider.clone(),
+                &objective,
+                reason,
+            )
+            .await;
+            if !verdict.is_done() {
+                return Ok(ToolResult {
+                    output: format!(
+                        "goal_update: completion NOT verified — independent verifier returned: {}",
+                        match verdict {
+                            crate::api::goal_loop_runtime::GoalCompletionVerdict::NotDone {
+                                reason,
+                            } => reason,
+                            _ => "unknown".to_string(),
+                        }
+                    ),
+                    success: false,
+                    ..Default::default()
+                });
+            }
+            // Verifier confirmed Done, but we must still revalidate goal identity
+            // to prevent stale verdicts (goal changed during the await).
+            let current_goal_id = orchestrator.goal_id_for_session(&session_id);
+            if expected_goal_id != current_goal_id {
+                return Ok(ToolResult {
+                    output: format!(
+                        "goal_update: goal changed during verification (was {:?}, now {:?}) — stale verdict rejected",
+                        expected_goal_id, current_goal_id
+                    ),
+                    success: false,
+                    ..Default::default()
+                });
+            }
+        }
+
         match default_agent_orchestrator().model_transition_goal(
             &session_id,
             &self.profile_id,

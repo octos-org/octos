@@ -5,11 +5,11 @@ use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use super::goal_loop_runtime::{
-    BUILT_IN_MAINTENANCE_PROMPT, DenyReason, GoalPolicyDecision, GoalRuntime, GoalRuntimePolicy,
-    GoalRuntimeState, LoopFireContext, LoopFireDecision, LoopFireTrigger, LoopInvocation,
-    LoopRuntime, LoopRuntimePolicy, MaintenancePromptResolution, MaintenancePromptSource,
-    NextDueState, RuntimeIdleState as GoalRuntimeIdleState, SlashCommandAuthorization, WaitUntil,
-    resolve_maintenance_prompt,
+    BUILT_IN_MAINTENANCE_PROMPT, DenyReason, GoalCompletionVerdict, GoalPolicyDecision,
+    GoalRuntime, GoalRuntimePolicy, GoalRuntimeState, LoopFireContext, LoopFireDecision,
+    LoopFireTrigger, LoopInvocation, LoopRuntime, LoopRuntimePolicy, MaintenancePromptResolution,
+    MaintenancePromptSource, NextDueState, RuntimeIdleState as GoalRuntimeIdleState,
+    SlashCommandAuthorization, WaitUntil, resolve_maintenance_prompt,
 };
 use super::master_continuation_scheduler::{
     MAX_REDELIVERY_ATTEMPTS, MasterContinuationDedupeKey, MasterContinuationEnqueueOutcome,
@@ -861,6 +861,21 @@ pub(crate) fn route_terminal_event_to_continuation_queue(
 type LoopRunnableFilter<'a> = dyn Fn(&SessionKey, &str) -> bool + 'a;
 
 impl InProcessAgentOrchestrator {
+    /// Get the goal objective for a session (used by goal completion verifier).
+    pub(crate) fn goal_objective_for_test(&self, session_id: &SessionKey) -> Option<String> {
+        self.state()
+            .goals
+            .get(session_id)
+            .map(|g| g.objective.clone())
+    }
+
+    /// Get the goal ID for a session (used by goal completion verifier to prevent stale verdicts).
+    pub(crate) fn goal_id_for_session(&self, session_id: &SessionKey) -> Option<String> {
+        self.state()
+            .goals
+            .get(session_id)
+            .map(|g| g.goal_id.clone())
+    }
     fn state(&self) -> std::sync::MutexGuard<'_, AutonomyRuntimeState> {
         self.state
             .lock()
@@ -3050,8 +3065,19 @@ impl InProcessAgentOrchestrator {
         session_id: &SessionKey,
         profile_id: &str,
         assistant_content: &str,
+        verdict: &GoalCompletionVerdict,
+        expected_goal_id: Option<&str>,
     ) -> bool {
         if !detect_goal_complete_sentinel(assistant_content) {
+            return false;
+        }
+        // Loop-engineering completion gate: the model's `<goal:complete>`
+        // sentinel is the agent's CLAIM, not proof. An INDEPENDENT verifier
+        // (a separate cheap-lane pass — see `run_goal_completion_verifier`)
+        // must confirm the objective is actually met before we flip to
+        // `complete`; otherwise the goal stays Active and the scheduler
+        // re-queues. This is what stops the agent grading its own homework.
+        if !verdict.is_done() {
             return false;
         }
         let mut state = self.state();
@@ -3064,11 +3090,35 @@ impl InProcessAgentOrchestrator {
         if goal.status == "complete" {
             return false;
         }
+        // CRITICAL: Revalidate goal identity to prevent stale verifier verdicts.
+        // If the goal changed between fetching the objective (for the verifier)
+        // and completing it here, the Done verdict may be for the WRONG goal.
+        // The caller passes the goal_id that was snapshotted when the verifier
+        // was invoked; if it doesn't match the current goal, we must not complete.
+        if let Some(expected_id) = expected_goal_id {
+            if goal.goal_id != expected_id {
+                tracing::warn!(
+                    session_id = %session_id,
+                    expected_goal_id = %expected_id,
+                    actual_goal_id = %goal.goal_id,
+                    "stale verifier verdict: goal changed between verifier call and completion"
+                );
+                return false;
+            }
+        }
         goal.status = "complete".to_owned();
         goal.updated_at_ms = now_ms();
         let snapshot = goal.clone();
         persist_goal_state(&state, session_id, &snapshot, false);
         true
+    }
+
+    /// Whether `content` carries the agent's self-declared goal-completion
+    /// sentinel. Callers use this to decide whether to spend an INDEPENDENT
+    /// verifier LLM call (only when completion is actually claimed) before
+    /// passing the verdict to [`Self::maybe_complete_goal_from_model`].
+    pub(crate) fn goal_completion_claimed(&self, content: &str) -> bool {
+        detect_goal_complete_sentinel(content)
     }
 
     /// #1696/#1698 — `SessionGoalUpdated`-shaped snapshot of the session's
@@ -6590,6 +6640,67 @@ fn detect_goal_complete_sentinel(content: &str) -> bool {
     GOAL_COMPLETE_SENTINELS
         .iter()
         .any(|sentinel| last_line == *sentinel || last_line.ends_with(sentinel))
+}
+
+/// INDEPENDENT goal-completion verifier — a separate cheap-lane LLM pass that
+/// judges whether the objective is genuinely met by the agent's evidence.
+///
+/// Loop-engineering: the agent's `<goal:complete>` sentinel is only a CLAIM.
+/// This verifier independently checks the objective against the evidence and
+/// returns Done/NotDone. Fail-safe: any provider/parse error returns NotDone
+/// (never spuriously completes).
+///
+/// Mirrors the AgentVerifierConfig pattern: fresh judge prompt, no agent
+/// scratchpad, separate model lane.
+pub(crate) async fn run_goal_completion_verifier(
+    provider: Arc<dyn LlmProvider>,
+    objective: &str,
+    evidence: &str,
+) -> GoalCompletionVerdict {
+    let prompt = format!(
+        "You are an INDEPENDENT completion verifier. Do not assume the work is \
+done just because the agent said so.\n\nGOAL OBJECTIVE:\n{objective}\n\nThe \
+agent's final reply (which claims the goal is complete):\n{evidence}\n\nJudge \
+ONLY whether the objective is genuinely and fully satisfied by concrete \
+evidence in the reply. If anything required is missing, unverified, or merely \
+asserted, it is NOT done.\n\nAnswer with EXACTLY one line:\n`DONE` if the \
+objective is fully met, or `NOT_DONE: <short reason>` otherwise."
+    );
+    let config = octos_llm::ChatConfig {
+        max_tokens: Some(200),
+        temperature: Some(0.0),
+        tool_choice: Default::default(),
+        stop_sequences: Vec::new(),
+        reasoning_effort: None,
+        response_format: None,
+        context_management: None,
+    };
+    let messages = vec![octos_core::Message::user(prompt)];
+    let verdict_text = match provider.chat(&messages, &[], &config).await {
+        Ok(response) => response.content.unwrap_or_default(),
+        Err(error) => {
+            return GoalCompletionVerdict::NotDone {
+                reason: format!("verifier call failed: {error}"),
+            };
+        }
+    };
+    // "Done" only on an explicit affirmative that is NOT negated. Checking the
+    // trimmed first token keeps `NOT_DONE` from matching the `DONE` substring.
+    // Strip backticks first: the prompt says "`DONE`" (with backticks), so a
+    // literally-compliant model returns `DONE` → we must accept that.
+    let trimmed = verdict_text.trim().trim_matches('`');
+    let first_token = trimmed
+        .split(|c: char| c.is_whitespace() || c == ':')
+        .next()
+        .unwrap_or("")
+        .to_ascii_uppercase();
+    if first_token == "DONE" {
+        GoalCompletionVerdict::Done
+    } else {
+        GoalCompletionVerdict::NotDone {
+            reason: trimmed.chars().take(200).collect(),
+        }
+    }
 }
 
 fn enqueue_agent_terminal_continuations(
@@ -15231,17 +15342,21 @@ mod tests {
             &session_id,
             "tenant-a",
             "still working on it",
+            &GoalCompletionVerdict::Done,
+            None,
         ));
         assert_eq!(
             orchestrator.goal_status_for_test(&session_id).as_deref(),
             Some("active"),
         );
 
-        // Sentinel content → transition to `complete`.
+        // Sentinel content + Done verdict → transition to `complete`.
         assert!(orchestrator.maybe_complete_goal_from_model(
             &session_id,
             "tenant-a",
             "All done. <goal:complete>",
+            &GoalCompletionVerdict::Done,
+            None,
         ));
         assert_eq!(
             orchestrator.goal_status_for_test(&session_id).as_deref(),
@@ -15258,6 +15373,133 @@ mod tests {
             "tenant-a",
             GoalRuntimeIdleState::idle(),
         ));
+    }
+
+    /// CRITICAL: NotDone verdict must keep goal Active (not complete).
+    /// This is the core of the independent verifier gate — the agent's
+    /// self-declared completion is only a CLAIM; the verifier must confirm.
+    #[test]
+    fn maybe_complete_goal_from_model_rejects_notdone_verdict() {
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let session_id = SessionKey::with_profile("tenant-a", "api", "goal-notdone");
+        orchestrator
+            .set_goal(GoalSetRequest {
+                session_id: session_id.clone(),
+                profile_id: "tenant-a".into(),
+                objective: "verify independently".into(),
+                status: Some("active".into()),
+                token_budget: None,
+                transition_actor: None,
+            })
+            .expect("set active goal");
+
+        // Sentinel content + NotDone verdict → goal stays Active.
+        assert!(!orchestrator.maybe_complete_goal_from_model(
+            &session_id,
+            "tenant-a",
+            "I claim this is done. <goal:complete>",
+            &GoalCompletionVerdict::NotDone {
+                reason: "evidence insufficient".to_string(),
+            },
+            None,
+        ));
+        assert_eq!(
+            orchestrator.goal_status_for_test(&session_id).as_deref(),
+            Some("active"),
+            "NotDone verdict must keep goal Active, not complete it"
+        );
+    }
+
+    /// CRITICAL: Stale goal_id must reject completion (TOCTOU fix).
+    /// If the goal changes between the verifier call and completion,
+    /// a Done verdict for the OLD goal must NOT complete the NEW goal.
+    #[test]
+    fn maybe_complete_goal_from_model_rejects_stale_goal_id() {
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let session_id = SessionKey::with_profile("tenant-a", "api", "goal-stale");
+        orchestrator
+            .set_goal(GoalSetRequest {
+                session_id: session_id.clone(),
+                profile_id: "tenant-a".into(),
+                objective: "goal A".into(),
+                status: Some("active".into()),
+                token_budget: None,
+                transition_actor: None,
+            })
+            .expect("set active goal");
+        let goal_a_id = orchestrator.goal_id_for_session(&session_id);
+
+        // Done verdict with WRONG goal_id (stale) must NOT complete the goal.
+        assert!(!orchestrator.maybe_complete_goal_from_model(
+            &session_id,
+            "tenant-a",
+            "Done. <goal:complete>",
+            &GoalCompletionVerdict::Done,
+            Some("wrong-goal-id"), // Stale/incorrect ID
+        ));
+        assert_eq!(
+            orchestrator.goal_status_for_test(&session_id).as_deref(),
+            Some("active"),
+            "stale goal_id must reject completion (TOCTOU fix)"
+        );
+
+        // Done verdict with CORRECT goal_id DOES complete the goal.
+        assert!(orchestrator.maybe_complete_goal_from_model(
+            &session_id,
+            "tenant-a",
+            "Done. <goal:complete>",
+            &GoalCompletionVerdict::Done,
+            goal_a_id.as_deref(), // Correct ID
+        ));
+        assert_eq!(
+            orchestrator.goal_status_for_test(&session_id).as_deref(),
+            Some("complete"),
+            "correct goal_id allows completion"
+        );
+    }
+
+    /// Parser must accept the prompt's own example format: "`DONE`" (with backticks).
+    /// The prompt says "Answer with EXACTLY one line: `DONE`", so a literally-
+    /// compliant model returns `DONE` → we must accept that.
+    #[tokio::test]
+    async fn run_goal_completion_verifier_accepts_backticks() {
+        struct BacktickProvider;
+        #[async_trait::async_trait]
+        impl LlmProvider for BacktickProvider {
+            async fn chat(
+                &self,
+                _messages: &[octos_core::Message],
+                _tools: &[octos_llm::ToolSpec],
+                _config: &octos_llm::ChatConfig,
+            ) -> eyre::Result<octos_llm::ChatResponse> {
+                Ok(octos_llm::ChatResponse {
+                    content: Some("`DONE`".to_string()),
+                    reasoning_content: None,
+                    tool_calls: Vec::new(),
+                    stop_reason: octos_llm::StopReason::EndTurn,
+                    usage: octos_llm::TokenUsage::default(),
+                    provider_index: Some(0),
+                })
+            }
+            fn model_id(&self) -> &str {
+                "mock"
+            }
+            fn provider_name(&self) -> &str {
+                "mock"
+            }
+        }
+
+        let verdict = run_goal_completion_verifier(
+            Arc::new(BacktickProvider),
+            "test objective",
+            "test evidence",
+        )
+        .await;
+        assert_eq!(
+            verdict,
+            GoalCompletionVerdict::Done,
+            "parser must accept `DONE` (with backticks)"
+        );
     }
 
     /// `detect_goal_complete_sentinel` covers all canonical sentinels
@@ -17006,17 +17248,21 @@ mod tests {
             &session_id,
             "tenant-a",
             "I am about to write <goal:complete> shortly, but step 2 first.",
+            &GoalCompletionVerdict::Done,
+            None,
         ));
         assert_eq!(
             orchestrator.goal_status_for_test(&session_id).as_deref(),
             Some("active"),
         );
 
-        // Trailing sentinel (the canonical AppUI shape) flips it.
+        // Trailing sentinel (the canonical AppUI shape) + Done verdict flips it.
         assert!(orchestrator.maybe_complete_goal_from_model(
             &session_id,
             "tenant-a",
             "All requested checks finished.\n\n<goal:complete>",
+            &GoalCompletionVerdict::Done,
+            None,
         ));
         assert_eq!(
             orchestrator.goal_status_for_test(&session_id).as_deref(),
