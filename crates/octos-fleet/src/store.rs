@@ -31,7 +31,7 @@
 //! the decoded record's own ids against the requested ones (defense in
 //! depth).
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -48,6 +48,7 @@ const FLEET_CHILDREN: TableDefinition<&str, &str> = TableDefinition::new("fleet_
 const ATTEMPTS: TableDefinition<&str, &str> = TableDefinition::new("attempts");
 const PLANS: TableDefinition<&str, &str> = TableDefinition::new("plans");
 const DECISION_LOG: TableDefinition<&str, &str> = TableDefinition::new("decision_log");
+const FINDINGS: TableDefinition<&str, &str> = TableDefinition::new("findings");
 const OUTBOX: TableDefinition<&str, &str> = TableDefinition::new("outbox");
 
 const DB_FILENAME: &str = "fleet-kernel.redb";
@@ -205,6 +206,7 @@ impl FleetKernelStore {
                 wtx.open_table(ATTEMPTS)?;
                 wtx.open_table(PLANS)?;
                 wtx.open_table(DECISION_LOG)?;
+                wtx.open_table(FINDINGS)?;
                 wtx.open_table(OUTBOX)?;
             }
             wtx.commit().wrap_err("commit fleet-kernel init")?;
@@ -2470,6 +2472,126 @@ impl FleetKernelStore {
         .await
         .wrap_err("join list_decisions")?
     }
+
+    /// Append a finding to a fleet's durable learning log, assigning the next
+    /// per-fleet sequence. Validates that all `supersedes` edges reference
+    /// existing findings in this fleet.
+    pub async fn append_finding(
+        &self,
+        fleet_id: &str,
+        task_id: Option<&str>,
+        claim: &str,
+        status: FindingStatus,
+        component: &str,
+        evidence: Vec<EvidenceRef>,
+        config: BTreeMap<String, String>,
+        supersedes: Vec<String>,
+        cost_tokens: u64,
+        by: &str,
+        now_ms: u64,
+    ) -> Result<Finding> {
+        ensure_key_safe(&[fleet_id])?;
+        if let Some(t) = task_id {
+            ensure_key_safe(&[t])?;
+        }
+        if claim.trim().is_empty() {
+            bail!("a finding must carry a claim");
+        }
+        if component.trim().is_empty() {
+            // The clustering key is what makes cross-path root-cause hints
+            // computable rather than something a reader has to notice.
+            bail!("a finding must name the component it is about");
+        }
+
+        let db = self.db.clone();
+        let fleet_id = fleet_id.to_string();
+        let task_id = task_id.map(str::to_string);
+        let claim = claim.to_string();
+        let component = component.to_string();
+        let by = by.to_string();
+        let held = self.io_gate.clone().lock_owned().await;
+        tokio::task::spawn_blocking(move || -> Result<Finding> {
+            let _held = held;
+            let wtx = db.begin_write()?;
+            let stored = {
+                let mut table = wtx.open_table(FINDINGS)?;
+
+                // One pass: highest sequence for this fleet, and the id set the
+                // supersedes edges must resolve against.
+                let mut max = 0u64;
+                let mut known: BTreeSet<String> = BTreeSet::new();
+                for item in table.iter()? {
+                    let (k, v) = item?;
+                    if let Some(s) = fleet_seq(k.value(), &fleet_id) {
+                        max = max.max(s);
+                        if let Some(f) = decode_row::<Finding>(v.value())? {
+                            known.insert(f.id);
+                        }
+                    }
+                }
+                let dangling: Vec<&String> = supersedes
+                    .iter()
+                    .filter(|id| !known.contains(*id))
+                    .collect();
+                if !dangling.is_empty() {
+                    bail!("supersedes references unknown finding(s): {dangling:?}");
+                }
+
+                let next = max
+                    .checked_add(1)
+                    .ok_or_else(|| eyre::eyre!("finding sequence overflow for {fleet_id}"))?;
+                let finding = Finding {
+                    schema_version: SCHEMA_VERSION,
+                    id: format!("f-{next}"),
+                    seq: next,
+                    fleet_id: fleet_id.clone(),
+                    task_id,
+                    claim,
+                    status,
+                    component,
+                    evidence,
+                    config,
+                    supersedes,
+                    cost_tokens,
+                    by,
+                    at_ms: now_ms,
+                };
+                let key = fleet_seq_key(&fleet_id, next);
+                table.insert(key.as_str(), serde_json::to_string(&finding)?.as_str())?;
+                finding
+            };
+            wtx.commit()?;
+            Ok(stored)
+        })
+        .await
+        .wrap_err("join append_finding")?
+    }
+
+    /// List all findings for a fleet, sorted by sequence (oldest first).
+    pub async fn list_findings(&self, fleet_id: &str) -> Result<Vec<Finding>> {
+        ensure_key_safe(&[fleet_id])?;
+        let db = self.db.clone();
+        let fleet_id = fleet_id.to_string();
+        let held = self.io_gate.clone().lock_owned().await;
+        tokio::task::spawn_blocking(move || -> Result<Vec<Finding>> {
+            let _held = held;
+            let rtx = db.begin_read()?;
+            let table = rtx.open_table(FINDINGS)?;
+            let mut out = Vec::new();
+            for item in table.iter()? {
+                let (k, v) = item?;
+                if fleet_seq(k.value(), &fleet_id).is_some() {
+                    if let Some(f) = decode_row::<Finding>(v.value())? {
+                        out.push(f);
+                    }
+                }
+            }
+            out.sort_by_key(|f| f.seq);
+            Ok(out)
+        })
+        .await
+        .wrap_err("join list_findings")?
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2508,6 +2630,10 @@ fn decision_key(fleet_id: &str, seq: u64) -> String {
     format!("{fleet_id}\0{seq:020}")
 }
 
+fn fleet_seq_key(fleet_id: &str, seq: u64) -> String {
+    format!("{fleet_id}\0{seq:020}")
+}
+
 fn outbox_key(seq: u64) -> String {
     format!("{seq:020}")
 }
@@ -2515,6 +2641,13 @@ fn outbox_key(seq: u64) -> String {
 /// Parse the per-fleet sequence out of a `decision_log` key, if it
 /// belongs to `fleet_id`.
 fn decision_seq(key: &str, fleet_id: &str) -> Option<u64> {
+    let prefix = format!("{fleet_id}\0");
+    key.strip_prefix(&prefix)?.parse::<u64>().ok()
+}
+
+/// Parse the per-fleet sequence out of a `findings` key, if it belongs to
+/// `fleet_id`.
+fn fleet_seq(key: &str, fleet_id: &str) -> Option<u64> {
     let prefix = format!("{fleet_id}\0");
     key.strip_prefix(&prefix)?.parse::<u64>().ok()
 }

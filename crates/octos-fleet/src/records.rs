@@ -9,6 +9,7 @@
 
 use octos_core::SessionKey;
 use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::grant::WorkerGrant;
 
@@ -402,6 +403,103 @@ pub enum DecisionKind {
     Replan,
     Cancel,
     Note,
+}
+
+// ---------------------------------------------------------------------------
+// Findings
+// ---------------------------------------------------------------------------
+
+/// What a [`Finding`] asserts about its claim.
+///
+/// `RuledOut` is a first-class result, not an absence. A proven dead end and a
+/// failed attempt are different facts — the first is knowledge that stops a
+/// repeat, the second is noise — and [`ChildResultSnapshot`] cannot tell them
+/// apart, because `success: false` is both. That is why a finding is its own
+/// record rather than a field on an attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FindingStatus {
+    /// Demonstrated, with evidence, under the stated `config`.
+    Confirmed,
+    /// Asserted from analysis before confirmation. A legitimate starting
+    /// state, and one a dependency plan cannot express: a predicted wall can
+    /// dissolve without ever being worked.
+    Predicted,
+    /// Demonstrated NOT to hold. The expensive kind, and most of why the
+    /// record is worth keeping.
+    RuledOut,
+}
+
+/// A durable unit of learning: one falsifiable claim, its evidence, and the
+/// build state under which it holds.
+///
+/// Distinct from [`DecisionEntry`], which is a closed set of *kernel-emitted*
+/// lifecycle events. A finding is a claim about the **problem domain**, made
+/// by a worker, and the two must not share a table: "the kernel launched a
+/// child" and "the second `eglCreateWindowSurface` returns `EGL_NO_SURFACE`"
+/// are not the same kind of fact.
+///
+/// Findings are **append-only and never mutated**. Supersession is derived
+/// from the `supersedes` edges of *later* findings (see [`superseded_ids`]),
+/// so history stays reconstructable and no write ever contends with another —
+/// which is what lets this table skip the CAS machinery the child/attempt
+/// tables need.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Finding {
+    pub schema_version: u32,
+    /// `f-{seq}`. Assigned by the store; `supersedes` references it.
+    pub id: String,
+    pub seq: u64,
+    pub fleet_id: String,
+    /// The task whose exploration produced it, when there is one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<String>,
+
+    /// One falsifiable sentence. The test of a good claim: another worker can
+    /// attempt to disprove it without first asking anyone a question.
+    pub claim: String,
+    pub status: FindingStatus,
+    /// What the claim is *about* — the clustering key. Two paths whose recent
+    /// findings cite one component is a mechanically computable hint that they
+    /// share a root cause. That hint is most of what makes the synthesis
+    /// available to a controller who never reads a transcript.
+    pub component: String,
+
+    /// Reused unchanged from the acceptance path: content-addressed, so a
+    /// claim cannot drift from what was actually observed.
+    #[serde(default)]
+    pub evidence: Vec<EvidenceRef>,
+    /// Component → version under which the claim holds. A finding without
+    /// this is not a weaker finding, it is an untrustworthy one: the next
+    /// reader cannot tell whether it still applies. It is also the
+    /// invalidation rule — when a version moves, findings scoped to the old
+    /// one become STALE, which is a third state distinct from wrong.
+    #[serde(default)]
+    pub config: BTreeMap<String, String>,
+
+    /// Findings this one overturns, by `id`. Validated to exist at append
+    /// time: a dangling overturn edge is how a knowledge base rots into
+    /// contradictions its readers learn to distrust.
+    #[serde(default)]
+    pub supersedes: Vec<String>,
+    /// What it cost to learn. Feeds cost-against-yield per path, which is the
+    /// input to abandoning one.
+    #[serde(default)]
+    pub cost_tokens: u64,
+
+    pub by: String,
+    pub at_ms: u64,
+}
+
+/// Ids overturned by some later finding in `findings`.
+///
+/// Derived rather than stored: marking the old record would be a mutation,
+/// and mutation is the only thing that would force this table to carry the
+/// revision fencing the rest of the kernel needs.
+pub fn superseded_ids(findings: &[Finding]) -> BTreeSet<String> {
+    findings
+        .iter()
+        .flat_map(|f| f.supersedes.iter().cloned())
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
