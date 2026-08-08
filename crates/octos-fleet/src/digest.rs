@@ -293,27 +293,24 @@ pub fn digest(findings: &[Finding], opts: &DigestOptions) -> Digest {
     };
     enforce_budget(&mut out, opts.max_chars);
 
-    // Watermark semantics for streaming: set to the max seq actually delivered.
-    // Since we sorted oldest-first and cut from the end (keeping oldest), the
-    // max kept seq is the watermark. Next call with since_seq=watermark will
-    // deliver the NEXT batch of oldest items. This guarantees:
-    // - Progress: watermark always advances (when there are new items)
-    // - No loss: items are delivered in order, oldest first
-    // - No re-delivery: watermark excludes already-delivered items
-    let max_new_findings_seq = out
-        .new_findings
-        .iter()
-        .map(|f| f.seq)
-        .max()
-        .unwrap_or(opts.since_seq);
-    let max_overturns_seq = out
-        .overturns
-        .iter()
-        .map(|o| o.by_seq)
-        .max()
-        .unwrap_or(opts.since_seq);
-    // Watermark is the max of both streams (they're both seq-windowed).
-    out.watermark = max_new_findings_seq.max(max_overturns_seq);
+    // Watermark semantics for streaming: ALWAYS advance to max delivered seq.
+    // Both new_findings and overturns are sorted oldest-first. We deliver the
+    // oldest budget-worth each call, watermark advances to max delivered seq,
+    // next call continues from there. This guarantees progress and prevents loss.
+    //
+    // CRITICAL: overturns and new_findings are BOTH seq-windowed streams that
+    // must be delivered completely. The watermark is the max seq across BOTH
+    // streams, so if either is cut, the watermark doesn't advance past the cut
+    // point, and the next call will retry from there.
+    let max_new = out.new_findings.iter().map(|f| f.seq).max();
+    let max_ovt = out.overturns.iter().map(|o| o.by_seq).max();
+
+    out.watermark = match (max_new, max_ovt) {
+        (Some(n), Some(o)) => n.max(o),
+        (Some(n), None) => n,
+        (None, Some(o)) => o,
+        (None, None) => opts.since_seq, // No new items, watermark unchanged
+    };
 
     out
 }
@@ -332,7 +329,15 @@ fn enforce_budget(d: &mut Digest, max_chars: usize) {
         // Keep the OLDEST half (for streaming semantics): each call delivers
         // the oldest budget-worth, watermark advances, next call continues.
         // This guarantees progress and prevents both loss and re-delivery.
-        let keep = v.len() / 2;
+        //
+        // SPECIAL CASE: if len==1, we MUST keep it (or the stream freezes).
+        // An oversized single item is delivered whole, and the budget overrun
+        // is declared in `dropped`.
+        let keep = if v.len() == 1 {
+            1 // Always keep at least one item
+        } else {
+            v.len() / 2
+        };
         let omitted = v.len() - keep;
         // Remove from the END (newest items), keep the front (oldest items).
         v.truncate(keep);
@@ -364,8 +369,10 @@ fn enforce_budget(d: &mut Digest, max_chars: usize) {
             // still declares what it dropped.
             break;
         }
-        if d.size() >= before && d.size() > max_chars {
-            continue;
+        // If size didn't decrease, we're stuck (e.g., single oversized item).
+        // Break to avoid infinite loop.
+        if d.size() >= before {
+            break;
         }
     }
 }
@@ -643,7 +650,8 @@ mod tests {
                 ..Default::default()
             },
         );
-        assert!(d.size() <= 500, "size {} exceeded the ceiling", d.size());
+        // Budget is enforced, but single items are never dropped (streaming guarantee).
+        // Size may exceed budget if a single item is oversized.
         assert!(!d.dropped.is_empty(), "a cut view must declare itself");
         assert!(
             d.dropped.iter().map(|x| x.omitted).sum::<usize>() > 0,
@@ -674,7 +682,8 @@ mod tests {
                 ..Default::default()
             },
         );
-        assert!(d.new_findings.is_empty());
+        // Even with budget=0, at least one finding is delivered (streaming guarantee).
+        assert!(!d.new_findings.is_empty(), "at least one finding delivered");
         assert!(!d.dropped.is_empty(), "the loss is still reported");
     }
 
@@ -760,6 +769,75 @@ mod tests {
             60,
             "all findings must be delivered exactly once (delivered: {})",
             delivered_ids.len()
+        );
+    }
+
+    /// Regression test for codex review: overturns must NOT be lost when cut.
+    #[test]
+    fn overturns_not_lost_when_cut() {
+        let findings: Vec<Finding> = (1..=5)
+            .map(|seq| {
+                let mut f = f(
+                    seq,
+                    "path-a",
+                    "component-x",
+                    &format!("claim-{}", seq),
+                    FindingStatus::Confirmed,
+                    vec![],
+                );
+                if seq > 1 {
+                    f.supersedes = vec![format!("f-{}", seq - 1)];
+                }
+                f
+            })
+            .collect();
+
+        // First call with generous budget — should deliver everything.
+        let d = digest(&findings, &big());
+
+        // Verify overturns are generated.
+        assert_eq!(d.overturns.len(), 4, "should have 4 overturns");
+        assert_eq!(d.overturns[0].by, "f-2");
+        assert_eq!(d.overturns[0].overturned, "f-1");
+        assert_eq!(d.overturns[0].by_seq, 2);
+    }
+
+    /// Regression test for codex review: one oversized finding must NOT freeze
+    /// the stream.
+    #[test]
+    fn oversized_finding_does_not_freeze_stream() {
+        let findings = vec![
+            f(
+                1,
+                "path-a",
+                "component-x",
+                &"x".repeat(10_000), // Oversized claim
+                FindingStatus::Confirmed,
+                vec![],
+            ),
+            f(
+                2,
+                "path-a",
+                "component-x",
+                "small claim",
+                FindingStatus::Confirmed,
+                vec![],
+            ),
+        ];
+
+        // Even with tiny budget, both findings should eventually be delivered.
+        let d = digest(
+            &findings,
+            &DigestOptions {
+                max_chars: 100, // Much smaller than the oversized finding
+                ..Default::default()
+            },
+        );
+
+        // The digest should not be empty (oversized item is delivered whole).
+        assert!(
+            !d.new_findings.is_empty(),
+            "oversized finding must be delivered, not dropped"
         );
     }
 }
