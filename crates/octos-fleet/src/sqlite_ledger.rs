@@ -1169,22 +1169,50 @@ impl From<&Finding> for crate::records::Finding {
             task_id: f.task_id.clone(),
             claim: f.assertion.clone(),
             status: match f.lifecycle.as_str() {
+                // Verified states
                 "verified" => crate::records::FindingStatus::Confirmed,
+                "reproduced" => crate::records::FindingStatus::Confirmed, // Stronger than verified
+                // Predicted states
                 "proposed" | "observed" => crate::records::FindingStatus::Predicted,
+                // Ruled out states
                 "refuted" => crate::records::FindingStatus::RuledOut,
-                _ => crate::records::FindingStatus::Predicted,
+                "superseded" | "retracted" => crate::records::FindingStatus::RuledOut,
+                // Unknown lifecycle → Predicted (conservative default)
+                _ => {
+                    tracing::warn!(
+                        lifecycle = %f.lifecycle,
+                        "unknown lifecycle in From conversion, defaulting to Predicted"
+                    );
+                    crate::records::FindingStatus::Predicted
+                }
             },
             component: f.kind.clone(),
-            evidence: f
-                .evidence
-                .as_ref()
-                .and_then(|e| serde_json::from_str(e).ok())
-                .unwrap_or_default(),
-            config: f
-                .config_version
-                .as_ref()
-                .and_then(|c| serde_json::from_str(c).ok())
-                .unwrap_or_default(),
+            evidence: {
+                let parsed = f
+                    .evidence
+                    .as_ref()
+                    .and_then(|e| serde_json::from_str(e).ok());
+                if f.evidence.is_some() && parsed.is_none() {
+                    tracing::warn!(
+                        finding_id = %f.finding_id,
+                        "evidence JSON parse failed in From conversion, using empty vec"
+                    );
+                }
+                parsed.unwrap_or_default()
+            },
+            config: {
+                let parsed = f
+                    .config_version
+                    .as_ref()
+                    .and_then(|c| serde_json::from_str(c).ok());
+                if f.config_version.is_some() && parsed.is_none() {
+                    tracing::warn!(
+                        finding_id = %f.finding_id,
+                        "config_version JSON parse failed in From conversion, using empty map"
+                    );
+                }
+                parsed.unwrap_or_default()
+            },
             supersedes: f.supersedes.clone(),
             cost_tokens: f.cost_tokens,
             by: f.created_by.clone(),
@@ -1282,5 +1310,48 @@ mod digest_integration_tests {
             total_cost > 0,
             "cost_tokens must be tracked, not hardcoded to 0"
         );
+    }
+
+    #[test]
+    fn lifecycle_to_status_mapping_complete() {
+        let test_cases = vec![
+            ("verified", crate::records::FindingStatus::Confirmed),
+            ("reproduced", crate::records::FindingStatus::Confirmed),
+            ("proposed", crate::records::FindingStatus::Predicted),
+            ("observed", crate::records::FindingStatus::Predicted),
+            ("refuted", crate::records::FindingStatus::RuledOut),
+            ("superseded", crate::records::FindingStatus::RuledOut),
+            ("retracted", crate::records::FindingStatus::RuledOut),
+            ("unknown_state", crate::records::FindingStatus::Predicted), // Fallback
+        ];
+
+        for (lifecycle, expected_status) in test_cases {
+            let finding = Finding {
+                rowid: None,
+                finding_id: "f1".to_string(),
+                seq: 1,
+                task_id: None,
+                goal_id: "g1".to_string(),
+                kind: "observation".to_string(),
+                lifecycle: lifecycle.to_string(),
+                confidence: "high".to_string(),
+                review_state: "peer_reviewed".to_string(),
+                assertion: "test".to_string(),
+                evidence: None,
+                config_version: None,
+                derived_from: None,
+                supersedes: Vec::new(),
+                cost_tokens: 0,
+                created_at_ms: 1000,
+                created_by: "peer-a".to_string(),
+            };
+
+            let records_finding: crate::records::Finding = (&finding).into();
+            assert_eq!(
+                records_finding.status, expected_status,
+                "lifecycle '{}' should map to {:?}",
+                lifecycle, expected_status
+            );
+        }
     }
 }
