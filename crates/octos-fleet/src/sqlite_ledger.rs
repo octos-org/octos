@@ -64,6 +64,9 @@ pub struct Finding {
     /// Findings this one overturns (by finding_id).
     #[serde(default)]
     pub supersedes: Vec<String>,
+    /// What it cost to learn (tokens). Feeds cost-against-yield per path.
+    #[serde(default)]
+    pub cost_tokens: u64,
     pub created_at_ms: u64,
     pub created_by: String,
 }
@@ -149,6 +152,7 @@ impl GoalLedger {
                 config_version TEXT,
                 derived_from TEXT,
                 supersedes TEXT, -- JSON array
+                cost_tokens INTEGER NOT NULL DEFAULT 0,
                 created_at_ms INTEGER NOT NULL,
                 created_by TEXT NOT NULL,
                 FOREIGN KEY (goal_id) REFERENCES goals(goal_id),
@@ -395,8 +399,8 @@ impl GoalLedger {
         // Step 3: Insert new finding
         let supersedes_json = serde_json::to_string(&finding.supersedes)?;
         tx.execute(
-            "INSERT INTO findings (finding_id, seq, task_id, goal_id, kind, lifecycle, confidence, review_state, assertion, evidence, config_version, derived_from, supersedes, created_at_ms, created_by)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+            "INSERT INTO findings (finding_id, seq, task_id, goal_id, kind, lifecycle, confidence, review_state, assertion, evidence, config_version, derived_from, supersedes, cost_tokens, created_at_ms, created_by)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
             params![
                 finding.finding_id,
                 next_seq,
@@ -411,6 +415,7 @@ impl GoalLedger {
                 finding.config_version,
                 finding.derived_from,
                 supersedes_json,
+                finding.cost_tokens,
                 finding.created_at_ms,
                 finding.created_by,
             ],
@@ -605,7 +610,7 @@ impl GoalLedger {
     pub fn list_findings_since(&self, goal_id: &str, since_rowid: i64) -> Result<Vec<Finding>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT rowid, finding_id, seq, task_id, goal_id, kind, lifecycle, confidence, review_state, assertion, evidence, config_version, derived_from, supersedes, created_at_ms, created_by
+            "SELECT rowid, finding_id, seq, task_id, goal_id, kind, lifecycle, confidence, review_state, assertion, evidence, config_version, derived_from, supersedes, cost_tokens, created_at_ms, created_by
              FROM findings WHERE goal_id = ?1 AND rowid > ?2 ORDER BY rowid ASC"
         )?;
         let findings = stmt
@@ -631,8 +636,9 @@ impl GoalLedger {
                     config_version: row.get(11)?,
                     derived_from: row.get(12)?,
                     supersedes,
-                    created_at_ms: row.get(14)?,
-                    created_by: row.get(15)?,
+                    cost_tokens: row.get(14)?,
+                    created_at_ms: row.get(15)?,
+                    created_by: row.get(16)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -705,6 +711,7 @@ mod tests {
             config_version: None,
             derived_from: None,
             supersedes: Vec::new(),
+            cost_tokens: 0,
             created_at_ms: 2000,
             created_by: "peer-a".to_string(),
         };
@@ -751,6 +758,7 @@ mod tests {
                 config_version: None,
                 derived_from: None,
                 supersedes: Vec::new(),
+                cost_tokens: 0,
                 created_at_ms: 1000 + i * 100,
                 created_by: "peer-a".to_string(),
             };
@@ -857,6 +865,7 @@ mod tests {
             config_version: None,
             derived_from: None,
             supersedes: Vec::new(),
+            cost_tokens: 0,
             created_at_ms: 2000,
             created_by: "peer-a".to_string(),
         };
@@ -904,6 +913,7 @@ mod tests {
             config_version: None,
             derived_from: None,
             supersedes: Vec::new(),
+            cost_tokens: 0,
             created_at_ms: 2000,
             created_by: "peer-a".to_string(),
         };
@@ -958,6 +968,7 @@ mod tests {
             config_version: None,
             derived_from: None,
             supersedes: Vec::new(),
+            cost_tokens: 0,
             created_at_ms: 2000,
             created_by: "peer-a".to_string(),
         };
@@ -1043,6 +1054,7 @@ mod tests {
             config_version: None,
             derived_from: None,
             supersedes: Vec::new(),
+            cost_tokens: 0,
             created_at_ms: 2000,
             created_by: "peer-a".to_string(),
         };
@@ -1107,6 +1119,7 @@ mod tests {
             config_version: None,
             derived_from: None,
             supersedes: Vec::new(),
+            cost_tokens: 0,
             created_at_ms: 2000,
             created_by: "peer-a".to_string(),
         };
@@ -1126,6 +1139,22 @@ mod tests {
             crate::records::FindingStatus::Confirmed
         );
     }
+}
+
+/// Convenience helper: read findings from the ledger and compute a digest.
+///
+/// This wires the digest to the SQLite ledger end-to-end:
+/// 1. Read findings from ledger (sqlite_ledger::Finding)
+/// 2. Convert to records::Finding (the type digest consumes)
+/// 3. Compute digest
+pub fn digest_from_ledger(
+    ledger: &GoalLedger,
+    goal_id: &str,
+    opts: &crate::digest::DigestOptions,
+) -> Result<crate::digest::Digest> {
+    let findings = ledger.list_findings_since(goal_id, 0)?;
+    let records_findings: Vec<crate::records::Finding> = findings.iter().map(Into::into).collect();
+    Ok(crate::digest::digest(&records_findings, opts))
 }
 
 // Conversion from sqlite_ledger::Finding to records::Finding (the canonical type digest uses).
@@ -1157,7 +1186,7 @@ impl From<&Finding> for crate::records::Finding {
                 .and_then(|c| serde_json::from_str(c).ok())
                 .unwrap_or_default(),
             supersedes: f.supersedes.clone(),
-            cost_tokens: 0, // Not tracked in sqlite_ledger
+            cost_tokens: f.cost_tokens,
             by: f.created_by.clone(),
             at_ms: f.created_at_ms,
             kind: Some(f.kind.clone()),
@@ -1167,5 +1196,91 @@ impl From<&Finding> for crate::records::Finding {
             rowid: f.rowid,
             derived_from: f.derived_from.clone(),
         }
+    }
+}
+
+#[cfg(test)]
+mod digest_integration_tests {
+    use super::*;
+
+    #[test]
+    fn digest_from_ledger_end_to_end() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ledger.db");
+        let ledger = GoalLedger::open(&path).unwrap();
+
+        // Create goal
+        let goal = Goal {
+            goal_id: "g1".to_string(),
+            objective: "test digest".to_string(),
+            status: "active".to_string(),
+            tokens_used: 0,
+            token_budget: 10000,
+            continuations_used: 0,
+            revision: 0,
+            created_at_ms: 1000,
+            updated_at_ms: 1000,
+        };
+        ledger.create_goal(&goal).unwrap();
+
+        // Add findings
+        for i in 1..=5 {
+            // Create task first (required by FK validation)
+            let task = Task {
+                task_id: format!("task-{}", i),
+                goal_id: "g1".to_string(),
+                title: format!("task {}", i),
+                detail: "test".to_string(),
+                status: "pending".to_string(),
+                assigned_peer: None,
+                created_at_ms: 1000,
+                updated_at_ms: 1000,
+            };
+            ledger.create_task(&task).unwrap();
+
+            let finding = Finding {
+                rowid: None,
+                finding_id: format!("f{}", i),
+                seq: i as u64,
+                task_id: Some(format!("task-{}", i)),
+                goal_id: "g1".to_string(),
+                kind: "observation".to_string(),
+                lifecycle: "verified".to_string(),
+                confidence: "high".to_string(),
+                review_state: "peer_reviewed".to_string(),
+                assertion: format!("claim {}", i),
+                evidence: None,
+                config_version: None,
+                derived_from: None,
+                supersedes: Vec::new(),
+                cost_tokens: 100 * i as u64,
+                created_at_ms: 1000 + i * 100,
+                created_by: "peer-a".to_string(),
+            };
+            ledger.append_finding(&finding).unwrap();
+        }
+
+        // Compute digest from ledger (end-to-end test)
+        let digest = digest_from_ledger(
+            &ledger,
+            "g1",
+            &crate::digest::DigestOptions {
+                max_chars: usize::MAX,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        // Verify digest contains all findings
+        assert_eq!(digest.new_findings.len(), 5);
+        assert_eq!(digest.new_findings[0].seq, 1);
+        assert_eq!(digest.new_findings[4].seq, 5);
+
+        // Verify cost tracking works (cost_tokens is not zero)
+        let total_cost: u64 = digest.cost_by_path.iter().map(|p| p.tokens).sum();
+        assert!(
+            total_cost > 0,
+            "cost_tokens must be tracked, not hardcoded to 0"
+        );
     }
 }

@@ -417,6 +417,12 @@ mod tests {
             cost_tokens: 100,
             by: path.into(),
             at_ms: seq,
+            kind: None,
+            lifecycle: None,
+            confidence: None,
+            review_state: None,
+            rowid: None,
+            derived_from: None,
         }
     }
 

@@ -792,3 +792,15 @@ mod tests {
         );
     }
 }
+
+/// Ids overturned by some later finding in `findings`.
+///
+/// Derived rather than stored: marking the old record would be a mutation,
+/// and mutation is the only thing that would force this table to carry the
+/// revision fencing the rest of the kernel needs.
+pub fn superseded_ids(findings: &[Finding]) -> std::collections::BTreeSet<String> {
+    findings
+        .iter()
+        .flat_map(|f| f.supersedes.iter().cloned())
+        .collect()
+}
