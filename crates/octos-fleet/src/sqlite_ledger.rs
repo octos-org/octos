@@ -1072,4 +1072,100 @@ mod tests {
         let findings = ledger.list_findings_since("g1", 0).unwrap();
         assert_eq!(findings.len(), 0); // Finding NOT committed
     }
+
+    #[test]
+    fn finding_converts_to_records_finding() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ledger.db");
+        let ledger = GoalLedger::open(&path).unwrap();
+
+        let goal = Goal {
+            goal_id: "g1".to_string(),
+            objective: "test".to_string(),
+            status: "active".to_string(),
+            tokens_used: 0,
+            token_budget: 10000,
+            continuations_used: 0,
+            revision: 0,
+            created_at_ms: 1000,
+            updated_at_ms: 1000,
+        };
+        ledger.create_goal(&goal).unwrap();
+
+        let finding = Finding {
+            rowid: None,
+            finding_id: "f1".to_string(),
+            seq: 1,
+            task_id: None,
+            goal_id: "g1".to_string(),
+            kind: "observation".to_string(),
+            lifecycle: "verified".to_string(),
+            confidence: "high".to_string(),
+            review_state: "peer_reviewed".to_string(),
+            assertion: "test claim".to_string(),
+            evidence: None,
+            config_version: None,
+            derived_from: None,
+            supersedes: Vec::new(),
+            created_at_ms: 2000,
+            created_by: "peer-a".to_string(),
+        };
+        ledger.append_finding(&finding).unwrap();
+
+        let findings = ledger.list_findings_since("g1", 0).unwrap();
+        assert_eq!(findings.len(), 1);
+
+        // Convert to records::Finding (the type digest uses)
+        let records_finding: crate::records::Finding = (&findings[0]).into();
+        assert_eq!(records_finding.id, "f1");
+        assert_eq!(records_finding.claim, "test claim");
+        assert_eq!(records_finding.fleet_id, "g1");
+        assert_eq!(records_finding.seq, 1);
+        assert_eq!(
+            records_finding.status,
+            crate::records::FindingStatus::Confirmed
+        );
+    }
+}
+
+// Conversion from sqlite_ledger::Finding to records::Finding (the canonical type digest uses).
+// This allows digest() to consume findings from the SQLite ledger.
+impl From<&Finding> for crate::records::Finding {
+    fn from(f: &Finding) -> Self {
+        Self {
+            schema_version: crate::records::SCHEMA_VERSION,
+            id: f.finding_id.clone(),
+            seq: f.seq,
+            fleet_id: f.goal_id.clone(),
+            task_id: f.task_id.clone(),
+            claim: f.assertion.clone(),
+            status: match f.lifecycle.as_str() {
+                "verified" => crate::records::FindingStatus::Confirmed,
+                "proposed" | "observed" => crate::records::FindingStatus::Predicted,
+                "refuted" => crate::records::FindingStatus::RuledOut,
+                _ => crate::records::FindingStatus::Predicted,
+            },
+            component: f.kind.clone(),
+            evidence: f
+                .evidence
+                .as_ref()
+                .and_then(|e| serde_json::from_str(e).ok())
+                .unwrap_or_default(),
+            config: f
+                .config_version
+                .as_ref()
+                .and_then(|c| serde_json::from_str(c).ok())
+                .unwrap_or_default(),
+            supersedes: f.supersedes.clone(),
+            cost_tokens: 0, // Not tracked in sqlite_ledger
+            by: f.created_by.clone(),
+            at_ms: f.created_at_ms,
+            kind: Some(f.kind.clone()),
+            lifecycle: Some(f.lifecycle.clone()),
+            confidence: Some(f.confidence.clone()),
+            review_state: Some(f.review_state.clone()),
+            rowid: f.rowid,
+            derived_from: f.derived_from.clone(),
+        }
+    }
 }
