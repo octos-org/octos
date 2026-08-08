@@ -327,15 +327,20 @@ impl GoalLedger {
     /// 2. Validate supersedes edges (from findings table)
     /// 3. Insert new finding (into findings table)
     /// All in one atomic transaction.
-    pub fn append_finding(&self, finding: &Finding) -> Result<i64> {
-        let mut conn = self.conn.lock().unwrap();
-        let tx = conn.transaction()?;
-
+    /// Insert a finding with validation (shared by append_finding and commit_state_with_audit).
+    ///
+    /// This is the SINGLE validated insert path — all finding writes go through here
+    /// to ensure cross-goal FK and supersedes validation are always enforced.
+    fn insert_finding_validated(
+        tx: &rusqlite::Transaction,
+        finding: &Finding,
+        goal_id: &str,
+    ) -> Result<()> {
         // Step 1: Get next seq for this goal
         let max_seq: Option<u64> = tx
             .query_row(
                 "SELECT MAX(seq) FROM findings WHERE goal_id = ?1",
-                params![finding.goal_id],
+                params![goal_id],
                 |row| row.get(0),
             )
             .ok()
@@ -356,12 +361,12 @@ impl GoalLedger {
                 None => {
                     return Err(eyre::eyre!("task {} not found", task_id));
                 }
-                Some(tg) if tg != finding.goal_id => {
+                Some(tg) if tg != goal_id => {
                     return Err(eyre::eyre!(
                         "cross-goal FK violation: task {} belongs to goal {}, not goal {}",
                         task_id,
                         tg,
-                        finding.goal_id
+                        goal_id
                     ));
                 }
                 _ => {}
@@ -375,13 +380,13 @@ impl GoalLedger {
             )?;
             for superseded_id in &finding.supersedes {
                 let exists: Option<String> = stmt
-                    .query_row(params![finding.goal_id, superseded_id], |row| row.get(0))
+                    .query_row(params![goal_id, superseded_id], |row| row.get(0))
                     .ok();
                 if exists.is_none() {
                     return Err(eyre::eyre!(
                         "supersedes references unknown finding {} in goal {}",
                         superseded_id,
-                        finding.goal_id
+                        goal_id
                     ));
                 }
             }
@@ -396,7 +401,7 @@ impl GoalLedger {
                 finding.finding_id,
                 next_seq,
                 finding.task_id,
-                finding.goal_id,
+                goal_id,
                 finding.kind,
                 finding.lifecycle,
                 finding.confidence,
@@ -411,6 +416,15 @@ impl GoalLedger {
             ],
         )?;
 
+        Ok(())
+    }
+
+    pub fn append_finding(&self, finding: &Finding) -> Result<i64> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+
+        Self::insert_finding_validated(&tx, finding, &finding.goal_id)?;
+
         let rowid = tx.last_insert_rowid();
         tx.commit()?;
         Ok(rowid)
@@ -420,6 +434,32 @@ impl GoalLedger {
     pub fn append_escalation(&self, escalation: &Escalation) -> Result<i64> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
+
+        // Validate task belongs to this goal (prevent cross-goal FK confusion)
+        if let Some(ref task_id) = escalation.task_id {
+            let task_goal: Option<String> = tx
+                .query_row(
+                    "SELECT goal_id FROM tasks WHERE task_id = ?1",
+                    params![task_id],
+                    |row| row.get(0),
+                )
+                .ok();
+
+            match task_goal {
+                None => {
+                    return Err(eyre::eyre!("task {} not found", task_id));
+                }
+                Some(tg) if tg != escalation.goal_id => {
+                    return Err(eyre::eyre!(
+                        "cross-goal FK violation: task {} belongs to goal {}, not goal {}",
+                        task_id,
+                        tg,
+                        escalation.goal_id
+                    ));
+                }
+                _ => {}
+            }
+        }
 
         tx.execute(
             "INSERT INTO escalations (escalation_id, goal_id, task_id, peer_id, question, context, status, default_action, default_after_secs, created_at_ms, resolved_at_ms, resolved_by, resolution)
@@ -450,6 +490,32 @@ impl GoalLedger {
     pub fn append_decision(&self, decision: &Decision) -> Result<i64> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
+
+        // Validate task belongs to this goal (prevent cross-goal FK confusion)
+        if let Some(ref task_id) = decision.task_id {
+            let task_goal: Option<String> = tx
+                .query_row(
+                    "SELECT goal_id FROM tasks WHERE task_id = ?1",
+                    params![task_id],
+                    |row| row.get(0),
+                )
+                .ok();
+
+            match task_goal {
+                None => {
+                    return Err(eyre::eyre!("task {} not found", task_id));
+                }
+                Some(tg) if tg != decision.goal_id => {
+                    return Err(eyre::eyre!(
+                        "cross-goal FK violation: task {} belongs to goal {}, not goal {}",
+                        task_id,
+                        tg,
+                        decision.goal_id
+                    ));
+                }
+                _ => {}
+            }
+        }
 
         tx.execute(
             "INSERT INTO decisions (decision_id, goal_id, task_id, question, options_considered, choice, rationale, based_on_findings, based_on_rev, decided_at_ms, decided_by)
@@ -503,40 +569,9 @@ impl GoalLedger {
             ));
         }
 
-        // Step 2: Append finding (if provided)
+        // Step 2: Append finding (if provided) — uses SHARED validated insert
         if let Some(f) = finding {
-            let max_seq: Option<u64> = tx
-                .query_row(
-                    "SELECT MAX(seq) FROM findings WHERE goal_id = ?1",
-                    params![goal_id],
-                    |row| row.get(0),
-                )
-                .ok()
-                .flatten();
-            let next_seq = max_seq.unwrap_or(0) + 1;
-
-            let supersedes_json = serde_json::to_string(&f.supersedes)?;
-            tx.execute(
-                "INSERT INTO findings (finding_id, seq, task_id, goal_id, kind, lifecycle, confidence, review_state, assertion, evidence, config_version, derived_from, supersedes, created_at_ms, created_by)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
-                params![
-                    f.finding_id,
-                    next_seq,
-                    f.task_id,
-                    goal_id,
-                    f.kind,
-                    f.lifecycle,
-                    f.confidence,
-                    f.review_state,
-                    f.assertion,
-                    f.evidence,
-                    f.config_version,
-                    f.derived_from,
-                    supersedes_json,
-                    f.created_at_ms,
-                    f.created_by,
-                ],
-            )?;
+            Self::insert_finding_validated(&tx, f, goal_id)?;
         }
 
         // Step 3: Append decision (if provided)
@@ -945,5 +980,96 @@ mod tests {
 
         let findings = ledger.list_findings_since("g1", 0).unwrap();
         assert_eq!(findings.len(), 0); // Finding not committed
+    }
+
+    #[test]
+    fn commit_state_with_audit_rolls_back_on_mid_transaction_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ledger.db");
+        let ledger = GoalLedger::open(&path).unwrap();
+
+        let goal = Goal {
+            goal_id: "g1".to_string(),
+            objective: "test".to_string(),
+            status: "active".to_string(),
+            tokens_used: 0,
+            token_budget: 10000,
+            continuations_used: 0,
+            revision: 0,
+            created_at_ms: 1000,
+            updated_at_ms: 1000,
+        };
+        ledger.create_goal(&goal).unwrap();
+
+        // Create a task for a DIFFERENT goal (will cause cross-goal FK violation)
+        let other_goal = Goal {
+            goal_id: "g2".to_string(),
+            objective: "other".to_string(),
+            status: "active".to_string(),
+            tokens_used: 0,
+            token_budget: 10000,
+            continuations_used: 0,
+            revision: 0,
+            created_at_ms: 1000,
+            updated_at_ms: 1000,
+        };
+        ledger.create_goal(&other_goal).unwrap();
+
+        let task = Task {
+            task_id: "t1".to_string(),
+            goal_id: "g2".to_string(), // Task belongs to g2, not g1
+            title: "test".to_string(),
+            detail: "test".to_string(),
+            status: "pending".to_string(),
+            assigned_peer: None,
+            created_at_ms: 1000,
+            updated_at_ms: 1000,
+        };
+        ledger.create_task(&task).unwrap();
+
+        // Finding references g2's task, but we're committing to g1 (cross-goal FK violation)
+        let finding = Finding {
+            rowid: None,
+            finding_id: "f1".to_string(),
+            seq: 1,
+            task_id: Some("t1".to_string()), // t1 belongs to g2, not g1
+            goal_id: "g1".to_string(),
+            kind: "observation".to_string(),
+            lifecycle: "verified".to_string(),
+            confidence: "high".to_string(),
+            review_state: "peer_reviewed".to_string(),
+            assertion: "test".to_string(),
+            evidence: None,
+            config_version: None,
+            derived_from: None,
+            supersedes: Vec::new(),
+            created_at_ms: 2000,
+            created_by: "peer-a".to_string(),
+        };
+
+        // Goal update succeeds (CAS passes), but finding insert fails (cross-goal FK)
+        let result = ledger.commit_state_with_audit(
+            "g1",
+            "complete",
+            0, // Correct revision
+            3000,
+            Some(&finding),
+            None,
+        );
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("cross-goal FK violation")
+        );
+
+        // Verify atomic rollback: goal NOT updated, finding NOT committed
+        let goal = ledger.get_goal("g1").unwrap().unwrap();
+        assert_eq!(goal.status, "active"); // NOT changed to complete
+        assert_eq!(goal.revision, 0); // NOT incremented
+
+        let findings = ledger.list_findings_since("g1", 0).unwrap();
+        assert_eq!(findings.len(), 0); // Finding NOT committed
     }
 }
