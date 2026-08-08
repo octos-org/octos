@@ -55,9 +55,9 @@ pub use grant::{
 };
 pub use records::{
     AcceptanceCriterion, AcceptanceVerdict, Attempt, AttemptStatus, ChildResultSnapshot,
-    ChildStatus, DecisionEntry, DecisionKind, DurablePlan, EscalationRequest, EvidenceRef,
-    FleetBudget, FleetChildRecord, FleetEventKind, FleetRecord, FleetStatus, Lease, OutboxEvent,
-    PlanTask, SCHEMA_VERSION, Verifier, WorkerKind,
+    ChildStatus, DecisionEntry, DecisionKind, DurablePlan, EscalationRequest, EvidenceRef, Finding,
+    FindingStatus, FleetBudget, FleetChildRecord, FleetEventKind, FleetRecord, FleetStatus, Lease,
+    OutboxEvent, PlanTask, SCHEMA_VERSION, Verifier, WorkerKind,
 };
 pub use sqlite_ledger::{
     Decision, Escalation, Finding, Goal, GoalLedger, Task, digest_from_ledger,

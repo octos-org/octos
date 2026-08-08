@@ -173,18 +173,6 @@ fn drift(
 /// the tail: when something has to go, it should be the oldest, not whatever
 /// the map iterator happened to yield last.
 pub fn digest(findings: &[Finding], opts: &DigestOptions) -> Digest {
-    // CRITICAL: digest() must be called with findings from a SINGLE goal/fleet.
-    // The watermark (since_seq) is per-goal, not global. If findings span multiple
-    // goals, the watermark semantics break (a per-goal seq means different things
-    // in different goals).
-    if let Some(first) = findings.first() {
-        let expected_fleet = &first.fleet_id;
-        debug_assert!(
-            findings.iter().all(|f| &f.fleet_id == expected_fleet),
-            "digest() requires findings from a single goal/fleet, but found mixed fleet_ids"
-        );
-    }
-
     let overturned = superseded_ids(findings);
     let by_id: BTreeMap<&str, &Finding> = findings.iter().map(|f| (f.id.as_str(), f)).collect();
 
@@ -417,12 +405,6 @@ mod tests {
             cost_tokens: 100,
             by: path.into(),
             at_ms: seq,
-            kind: None,
-            lifecycle: None,
-            confidence: None,
-            review_state: None,
-            rowid: None,
-            derived_from: None,
         }
     }
 
