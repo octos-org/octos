@@ -442,6 +442,16 @@ pub struct Agent {
     /// pipeline workers, plugins, and shell to derive their CWD and
     /// path validation from this scope.
     pub(super) session_scope: Option<Arc<SessionScope>>,
+    /// Goal ID this agent runs under (peer-agent-based goal). Populated by
+    /// the peer session boot when the staged peer dir carries a `goal` file
+    /// (`peers/<slug>/goal`, written by `stage_peer` when the master passed
+    /// `goal_id`/`task_id` to `peer_handoff`). `None` for goal-less peers
+    /// and non-peer sessions. Read by `goal_*` tools via `ToolContext.goal_id`.
+    pub(super) goal_id: Option<String>,
+    /// Task ID within the goal (peer-agent-based goal). Sourced from line 2
+    /// of the peer's `goal` file; may be `None` even when `goal_id` is set
+    /// (the master scoped the peer to a goal but no specific sub-task).
+    pub(super) task_id: Option<String>,
     /// Optional inference-time verifier plus structured TurnLedger. Absent
     /// by default so legacy agent loops do not spend verifier calls or write
     /// verifier sidecars unless a caller opts in explicitly.
@@ -547,6 +557,8 @@ impl Agent {
             sandbox_config: None,
             prompt_context_manager: None,
             session_scope: None,
+            goal_id: None,
+            task_id: None,
             verifier_config: None,
             voice_failure_sink: None,
             snapshot_manager: None,
@@ -625,6 +637,8 @@ impl Agent {
             sandbox_config: None,
             prompt_context_manager: None,
             session_scope: None,
+            goal_id: None,
+            task_id: None,
             verifier_config: None,
             voice_failure_sink: None,
             snapshot_manager: None,
@@ -944,6 +958,33 @@ impl Agent {
     /// Access the configured session scope, if any.
     pub fn session_scope(&self) -> Option<&Arc<SessionScope>> {
         self.session_scope.as_ref()
+    }
+
+    /// Builder: set the goal id this agent runs under. Called by the peer
+    /// session boot when the staged peer dir carries a `goal` file. Read by
+    /// `goal_*` tools via `ToolContext.goal_id`.
+    pub fn with_goal_id(mut self, goal_id: String) -> Self {
+        self.goal_id = Some(goal_id);
+        self
+    }
+
+    /// Builder: set the task id this agent runs under (sub-task within the
+    /// goal). Called alongside [`Self::with_goal_id`] when the peer's `goal`
+    /// file carries a task id.
+    pub fn with_task_id(mut self, task_id: String) -> Self {
+        self.task_id = Some(task_id);
+        self
+    }
+
+    /// The goal id this agent runs under (peer-agent-based goal). `None`
+    /// for goal-less peers and non-peer sessions.
+    pub fn goal_id(&self) -> Option<&str> {
+        self.goal_id.as_deref()
+    }
+
+    /// The task id this agent runs under within its goal, if any.
+    pub fn task_id(&self) -> Option<&str> {
+        self.task_id.as_deref()
     }
 
     /// Guard C (issue #607): record this agent's spawn nesting depth so

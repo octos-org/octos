@@ -36,6 +36,21 @@ fn fleet_now_ms() -> u64 {
     chrono::Utc::now().timestamp_millis().max(0) as u64
 }
 
+/// Returns `true` when this tool call is running inside a peer session
+/// (topic starts with `peer-`). Used to fence keeper-only operations
+/// (`goal_create` / `goal_plan` / `goal_dispatch` / `goal_grant` /
+/// `goal_deny`) so NEITHER a goal-scoped peer NOR a goal-less peer can
+/// invoke them — both are peers, both must defer to the master. This is
+/// the broader check codex flagged: `ctx.goal_id.is_some()` only catches
+/// peers the master staged with a goal; a goal-less peer (peer/prepare
+/// path, or a missing/malformed `goal` file) would slip through.
+fn is_peer_session(session_id: &SessionKey) -> bool {
+    session_id
+        .topic()
+        .map(|t| t.starts_with("peer-"))
+        .unwrap_or(false)
+}
+
 /// PR 5a — parse the `goal_plan` `tasks` array into fleet [`TaskSpec`]s. Each
 /// task needs a `task_id` + `title`; `detail`/`deps` are optional. `acceptance`
 /// is an optional array of shell command strings, each mapped to a
@@ -250,13 +265,47 @@ fn session_from_ctx(ctx: &ToolContext) -> Option<SessionKey> {
 /// `goal_get` — read-only goal snapshot for the current session.
 pub struct GoalGetTool {
     profile_id: String,
+    /// Peer-agent-based goal: the profile's persistent `data_dir`. When set,
+    /// `goal_get` aggregates the latest `result.md` from every staged peer
+    /// whose `goal` file points at the queried goal (under
+    /// `<data_dir>/peers/<slug>/goal`), AND the durable findings from the
+    /// goal's sqlite ledger (under `<data_dir>/goal-ledgers/<goal_id>.db`),
+    /// surfacing them as `peer_findings` and `ledger_findings` in the
+    /// snapshot. `None` preserves pre-peer-goal behaviour (no aggregation).
+    data_dir: Option<std::path::PathBuf>,
 }
 
 impl GoalGetTool {
     pub fn new(profile_id: impl Into<String>) -> Self {
         Self {
             profile_id: profile_id.into(),
+            data_dir: None,
         }
+    }
+
+    /// Builder: set the profile's persistent data dir so the tool can
+    /// aggregate peer findings (live + ledger) into the goal snapshot.
+    pub fn with_data_dir(mut self, data_dir: std::path::PathBuf) -> Self {
+        self.data_dir = Some(data_dir);
+        self
+    }
+
+    /// Back-compat alias for callers that already computed the peers root.
+    /// Strips the trailing `peers` component ONLY when it is the final
+    /// component; otherwise treats the input as the data dir directly. This
+    /// avoids the bug where `with_peers_root("/x/data")` would silently
+    /// re-root to `/x`.
+    pub fn with_peers_root(mut self, peers_root: std::path::PathBuf) -> Self {
+        let data_dir = if peers_root.file_name().map(|n| n == "peers").unwrap_or(false) {
+            peers_root
+                .parent()
+                .map(|p| p.to_path_buf())
+                .unwrap_or(peers_root.clone())
+        } else {
+            peers_root
+        };
+        self.data_dir = Some(data_dir);
+        self
     }
 }
 
@@ -299,28 +348,92 @@ impl Tool for GoalGetTool {
             });
         };
         let orchestrator = default_agent_orchestrator();
-        // PR 5a — resolve the fleet plan view FIRST: it self-detects completion
-        // (`Fleet::is_complete` → mark the goal `complete`), which the budget
-        // snapshot below then reflects. `Ok(None)` when this goal drives no
-        // fleet, so a non-fleet goal_get is byte-for-byte the pre-5a shape.
-        // `Err` (H3) when `goal.fleet_id` doesn't belong to this goal — surface
-        // it instead of reading/completing a foreign fleet.
-        let fleet = match orchestrator
-            .model_fleet_snapshot(&session_id, &self.profile_id)
-            .await
-        {
-            Ok(fleet) => fleet,
-            Err(message) => {
+        // Peer-agent-based goal: when the Agent was populated with a goal_id
+        // (peer session whose staged dir carried a `goal` file), resolve by
+        // goal_id DIRECTLY — the peer's session key does not own the goal.
+        // We ALSO need the peer's originator session for the binding check
+        // (`model_goal_snapshot_by_id` enforces that the goal is OWNED by
+        // the session that staged the peer). Read it from
+        // `<data_dir>/peers/<slug>/originator`.
+        let mut snapshot = if let Some(goal_id) = ctx.goal_id.as_deref() {
+            let originator = self
+                .data_dir
+                .as_ref()
+                .and_then(|data_dir| {
+                    let slug = session_id.topic()?.strip_prefix("peer-")?;
+                    let originator_path = data_dir.join("peers").join(slug).join("originator");
+                    std::fs::read_to_string(originator_path).ok()
+                })
+                .map(|s| s.trim().to_owned())
+                .filter(|s| !s.is_empty());
+            let Some(originator) = originator else {
                 return Ok(ToolResult {
-                    output: format!("goal_get: {message}"),
+                    output: "goal_get: peer has goal context but no originator file; \
+                             cannot verify goal ownership"
+                        .into(),
                     success: false,
                     ..Default::default()
                 });
+            };
+            orchestrator.model_goal_snapshot_by_id(goal_id, &self.profile_id, &originator)
+        } else {
+            // PR 5a — resolve the fleet plan view FIRST: it self-detects completion
+            // (`Fleet::is_complete` → mark the goal `complete`), which the budget
+            // snapshot below then reflects. `Ok(None)` when this goal drives no
+            // fleet, so a non-fleet goal_get is byte-for-byte the pre-5a shape.
+            // `Err` (H3) when `goal.fleet_id` doesn't belong to this goal — surface
+            // it instead of reading/completing a foreign fleet.
+            let fleet = match orchestrator
+                .model_fleet_snapshot(&session_id, &self.profile_id)
+                .await
+            {
+                Ok(fleet) => fleet,
+                Err(message) => {
+                    return Ok(ToolResult {
+                        output: format!("goal_get: {message}"),
+                        success: false,
+                        ..Default::default()
+                    });
+                }
+            };
+            let mut snapshot = orchestrator.model_goal_snapshot(&session_id, &self.profile_id);
+            if let (Some(fleet), Value::Object(map)) = (fleet, &mut snapshot) {
+                map.insert("fleet".to_owned(), fleet);
             }
+            snapshot
         };
-        let mut snapshot = orchestrator.model_goal_snapshot(&session_id, &self.profile_id);
-        if let (Some(fleet), Value::Object(map)) = (fleet, &mut snapshot) {
-            map.insert("fleet".to_owned(), fleet);
+        // Peer-agent-based goal (ledger association): when the snapshot
+        // carries a goal_id AND this tool was constructed with a data_dir,
+        // fold in BOTH the live `result.md` findings (under `<data_dir>/peers`)
+        // AND the durable ledger findings (under `<data_dir>/goal-ledgers`).
+        // This is what makes peer results visible to the keeper on `goal_get`.
+        //
+        // The `goal_id` is extracted BEFORE the mutable borrow so we never
+        // hold `&snapshot` and `&mut snapshot` simultaneously.
+        let goal_id_for_findings = snapshot
+            .get("goal_id")
+            .and_then(|v| v.as_str())
+            .map(str::to_owned);
+        if let (Some(data_dir), Some(goal_id)) =
+            (self.data_dir.as_ref(), goal_id_for_findings)
+        {
+            let peers_root = data_dir.join("peers");
+            let live_findings =
+                orchestrator.model_goal_peer_findings(&peers_root, &goal_id, &self.profile_id);
+            if !live_findings.is_empty() {
+                if let Value::Object(map) = &mut snapshot {
+                    map.insert("peer_findings".to_owned(), Value::Array(live_findings));
+                }
+            }
+            // Also fold in the DURABLE ledger findings (persisted when each
+            // goal-scoped peer completed a turn). These survive restarts and
+            // result.md overwrites — the authoritative history.
+            let ledger_findings = orchestrator.model_goal_ledger_findings(data_dir, &goal_id);
+            if !ledger_findings.is_empty() {
+                if let Value::Object(map) = &mut snapshot {
+                    map.insert("ledger_findings".to_owned(), Value::Array(ledger_findings));
+                }
+            }
         }
         Ok(ToolResult {
             output: serde_json::to_string_pretty(&snapshot)
@@ -463,6 +576,22 @@ impl Tool for GoalPlanTool {
                 ..Default::default()
             });
         };
+        // Peer-agent-based goal: a peer MUST NOT decompose its assigned goal
+        // into a fleet — that is the keeper's job. A peer that wants to fan
+        // out sub-work should either do it directly in its own session, or
+        // escalate to the master asking for a sub-fleet. Refuse explicitly
+        // so the model knows why.
+        if is_peer_session(&session_id) {
+            return Ok(ToolResult {
+                output: "goal_plan: peers cannot create fleet plans — only the master \
+                         (keeper) can decompose a goal onto a fleet. Do the work \
+                         directly in this peer session, or escalate to the master \
+                         if you need a sub-fleet."
+                    .into(),
+                success: false,
+                ..Default::default()
+            });
+        }
         let tasks = match parse_task_specs(args) {
             Ok(tasks) => tasks,
             Err(message) => {
@@ -544,6 +673,20 @@ impl Tool for GoalDispatchTool {
                 ..Default::default()
             });
         };
+        // Peer-agent-based goal: a peer MUST NOT dispatch its goal's fleet —
+        // dispatching launches workers that drive the keeper's plan, and a
+        // peer doing so would race with (or double-launch) the keeper's own
+        // dispatch loop. Escalate to the master instead.
+        if is_peer_session(&session_id) {
+            return Ok(ToolResult {
+                output: "goal_dispatch: peers cannot dispatch fleets — only the master \
+                         (keeper) can launch a goal's tasks. Escalate to the master \
+                         if you believe work is stalled."
+                    .into(),
+                success: false,
+                ..Default::default()
+            });
+        }
         match default_agent_orchestrator()
             .model_dispatch_fleet(&session_id, &self.profile_id, fleet_now_ms())
             .await
@@ -639,6 +782,19 @@ impl Tool for GoalGrantTool {
                 ..Default::default()
             });
         };
+        // Peer-agent-based goal: only the master (keeper) can approve a
+        // worker's escalation — a peer approving its own escalation would
+        // defeat the point of the gate.
+        if is_peer_session(&session_id) {
+            return Ok(ToolResult {
+                output: "goal_grant: peers cannot approve escalations — only the master \
+                         (keeper) can widen a task's grant. Your escalation is already \
+                         visible to the master; wait for its decision."
+                    .into(),
+                success: false,
+                ..Default::default()
+            });
+        }
         let Some(task_id) = args
             .get("task_id")
             .and_then(Value::as_str)
@@ -751,6 +907,19 @@ impl Tool for GoalDenyTool {
                 ..Default::default()
             });
         };
+        // Peer-agent-based goal: only the master (keeper) can refuse a
+        // worker's escalation — a peer denying its own escalation would
+        // silently kill its own task without the keeper's knowledge.
+        if is_peer_session(&session_id) {
+            return Ok(ToolResult {
+                output: "goal_deny: peers cannot refuse escalations — only the master \
+                         (keeper) can terminate a blocked task. Your escalation is \
+                         already visible to the master; wait for its decision."
+                    .into(),
+                success: false,
+                ..Default::default()
+            });
+        }
         let Some(task_id) = args
             .get("task_id")
             .and_then(Value::as_str)
@@ -859,6 +1028,38 @@ impl Tool for GoalUpdateTool {
             });
         };
         let status = args.get("status").and_then(Value::as_str).unwrap_or("");
+        let reason = args
+            .get("reason")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+
+        // Peer-agent-based goal: when the Agent carries a `goal_id` (peer
+        // session boot populated it from `peers/<slug>/goal`), the peer is
+        // NOT allowed to transition the goal itself — a peer declaring its
+        // sub-task done is not the same as the goal being done, and a peer
+        // calling `goal_update(status="complete")` would prematurely close
+        // the goal out from under the keeper. Refuse the by-id dispatch
+        // outright and instruct the peer to record its contribution as a
+        // finding instead (the completion half of `goal_get` aggregation).
+        // NOTE: this checks ctx.goal_id (peer has goal context), NOT
+        // is_peer_session — a goal-less peer calling goal_update falls
+        // through to the session-key path and fails there with "no goal is
+        // set", which is the correct error for that case.
+        if ctx.goal_id.is_some() {
+            return Ok(ToolResult {
+                output: "goal_update: peers cannot transition the goal directly — \
+                         a peer's job is to advance its assigned sub-task and let \
+                         the master (keeper) judge overall completion. Record your \
+                         contribution by writing your result (your `result.md` is \
+                         automatically folded into the goal's ledger on turn \
+                         completion), or escalate to the master if the goal itself \
+                         needs a status change."
+                    .into(),
+                success: false,
+                ..Default::default()
+            });
+        }
+
         // Executor-enforced ownership: reject anything outside the model's
         // allowed matrix EVEN IF the schema was bypassed.
         if !MODEL_ALLOWED_TRANSITIONS.contains(&status) {
@@ -1013,6 +1214,22 @@ impl Tool for GoalCreateTool {
                 ..Default::default()
             });
         };
+        // Peer-agent-based goal: a peer (with `ctx.goal_id` set from its
+        // staged `goal` file) MUST NOT create new goals. A peer's job is to
+        // advance ITS assigned goal, not fork new ones — that would silently
+        // orphan the master's fleet plan. Refuse explicitly with a clear
+        // message so the model knows why (and what to do instead).
+        if is_peer_session(&session_id) {
+            return Ok(ToolResult {
+                output: "goal_create: peers cannot create new goals — only the master \
+                         session can. To contribute to your assigned goal, advance your \
+                         sub-task and let the master judge overall completion; to fork \
+                         work, escalate to the master instead."
+                    .into(),
+                success: false,
+                ..Default::default()
+            });
+        }
         let objective = args
             .get("objective")
             .and_then(Value::as_str)

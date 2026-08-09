@@ -13399,6 +13399,12 @@ async fn raw_peer_prepare(
                 member_originator.as_deref(),
                 &member_brief,
                 member_worktree,
+                // peer/prepare RPC does not (yet) carry a goal context; the
+                // peer_handoff tool path is the one that supports goal-scoped
+                // handoffs. A fleet staged here runs goal-less, matching
+                // today's behaviour.
+                None,
+                None,
             )
         })
         .await
@@ -13506,6 +13512,15 @@ fn stage_peer(
     originator: Option<&str>,
     brief: &str,
     worktree: bool,
+    // Goal context for this peer (peer-agent-based goal feature): when the
+    // master hands off under an active goal, it passes `goal_id` (required for
+    // goal-scoped work) and an optional `task_id` (sub-task within the goal).
+    // Persisted atomically to `peers/<slug>/goal` as two LF-separated lines
+    // (`goal_id\ntask_id-or-empty`) so the peer session can rehydrate them on
+    // boot and `goal_*` tools can scope their reads/writes to the goal. A peer
+    // without a goal file behaves exactly as today.
+    goal_id: Option<&str>,
+    task_id: Option<&str>,
 ) -> Result<StagedPeer, RpcError> {
     // A NAMED peer reserves its EXACT (name-derived) slug and rejects
     // collisions — a name is the primary address, so it must be unique and
@@ -13625,6 +13640,33 @@ fn stage_peer(
             cleanup_staged_peer(workspace_root, &slug, &peer_dir);
             return Err(RpcError::internal_error(format!(
                 "failed to record peer originator: {err}"
+            )));
+        }
+    }
+
+    // Peer-agent-based goal: persist the (goal_id, task_id) pair the master
+    // handed off with BEFORE `brief.md`. This ordering is the load-bearing
+    // publication invariant: `brief.md` is the visibility gate
+    // (`staged_peer_dir` refuses to surface a peer without it), so any peer
+    // that becomes visible to the blackboard scan or a peer-boot watcher is
+    // GUARANTEED to already carry its goal file. Writing it after brief.md
+    // would open a window where a peer boots on the brief and runs its first
+    // turn goal-less — a rollback cannot undo an already-started peer.
+    //
+    // Layout: line 1 = goal_id, line 2 = task_id (may be empty). The goal_id
+    // is MANDATORY for the file to exist (no point writing a task_id with no
+    // enclosing goal); when the master passes `goal_id = None` the file is
+    // omitted entirely and the peer runs goal-less.
+    //
+    // Failure rolls back the whole staging so the master gets a truthful
+    // "handoff failed" rather than a silently goal-less peer.
+    if let Some(goal_id_str) = goal_id.map(str::trim).filter(|s| !s.is_empty()) {
+        let task_id_str = task_id.map(str::trim).unwrap_or("");
+        let body = format!("{goal_id_str}\n{task_id_str}");
+        if let Err(err) = peer_io::write_peer_file_atomic(&peer_dir, "goal", &body) {
+            cleanup_staged_peer(workspace_root, &slug, &peer_dir);
+            return Err(RpcError::internal_error(format!(
+                "failed to write peer goal context: {err}"
             )));
         }
     }
@@ -13870,6 +13912,10 @@ fn build_peer_handoff_callback(
             Some(originator.as_str()),
             &request.brief,
             request.worktree,
+            // Peer-agent-based goal: forward the goal context the model
+            // attached to the handoff. Either may be None (goal-less peer).
+            request.goal_id.as_deref(),
+            request.task_id.as_deref(),
         )
         .map_err(|err| err.message)?;
         // #peer-model — optional model lane. Record a VALID lane symlink-safely
@@ -14937,6 +14983,256 @@ fn write_peer_result_if_peer_session(
     // it committed exists. Best-effort and idempotent: the fetch is a forced
     // refspec, so re-running it per turn simply fast-forwards.
     collect_peer_branch(&peer_dir, slug);
+
+    // Peer-agent-based goal: if this peer was staged under a goal context
+    // (the `goal` file the master wrote at handoff), persist this turn's
+    // outcome as a durable Finding row in the goal's ledger and surface a
+    // completion event the keeper can see on its next `goal_get`. This is
+    // the WRITE half of the peer-goal ledger association (the READ half is
+    // `model_goal_peer_findings`, which scans live `result.md` files — the
+    // ledger row survives across restarts even when result.md is later
+    // overwritten by a subsequent turn).
+    if let Some(goal_body) =
+        peer_io::read_peer_file(&peer_dir, "goal", peer_io::PEER_FILE_READ_CAP_SMALL)
+    {
+        let mut lines = goal_body.lines();
+        let goal_id = lines.next().map(str::trim).filter(|s| !s.is_empty());
+        let task_id = lines.next().map(str::trim).filter(|s| !s.is_empty());
+        if let Some(goal_id) = goal_id {
+            // Read the peer's originator session (written by `stage_peer`
+            // at handoff) so the ledger write can enforce the goal-binding
+            // check: the goal record must be OWNED by the same session that
+            // staged this peer. A peer without an originator file (legacy
+            // peer/prepare path) cannot bind to a goal — refuse the write.
+            let originator = peer_io::read_peer_file(
+                &peer_dir,
+                "originator",
+                peer_io::PEER_FILE_READ_CAP_SMALL,
+            )
+            .map(|s| s.trim().to_owned())
+            .filter(|s| !s.is_empty());
+            let Some(originator) = originator else {
+                tracing::warn!(
+                    slug,
+                    goal_id,
+                    "peer-goal: peer has goal context but no originator; \
+                     refusing to record finding (cannot verify goal binding)"
+                );
+                return;
+            };
+            // Best-effort: a ledger write failure must NOT fail the peer's
+            // turn (the result.md is already written above and is the
+            // authoritative output). We log and continue.
+            let content_summary: String = body.chars().take(400).collect();
+            if let Err(err) = default_agent_orchestrator().model_goal_record_peer_finding(
+                &runtime.data_dir,
+                goal_id,
+                profile_id,
+                &originator,
+                slug,
+                task_id,
+                &format!("[{outcome_str}] {content_summary}"),
+            ) {
+                tracing::warn!(
+                    ?err,
+                    slug,
+                    goal_id,
+                    "peer-goal: failed to record peer finding to goal ledger"
+                );
+            } else {
+                tracing::info!(
+                    slug,
+                    goal_id,
+                    task_id,
+                    outcome = outcome_str,
+                    "peer-goal: recorded finding to goal ledger"
+                );
+            }
+
+            // Peer-agent-based goal: wake the master session so it sees the
+            // new finding on its next turn WITHOUT having to poll `goal_get`.
+            // The wake is a peer-staged event the master's session loop
+            // consumes; it carries the goal_id + peer slug + outcome so the
+            // master can decide whether to `goal_get` for details, dispatch
+            // more tasks, or mark the goal complete.
+            //
+            // Best-effort: if the wake channel is unavailable (e.g. master
+            // session is offline), the ledger row above is still durable —
+            // the master will see the finding on its next `goal_get`.
+            let wake_message = format!(
+                "[peer-goal] peer `{slug}` completed turn {turn_count} with outcome `{outcome_str}` \
+                 for goal `{goal_id}`{}",
+                task_id
+                    .map(|t| format!(" (task `{t}`)"))
+                    .unwrap_or_default()
+            );
+            tracing::info!(
+                slug,
+                goal_id,
+                task_id,
+                originator,
+                outcome = outcome_str,
+                "peer-goal: waking master session"
+            );
+            // Enqueue the wake as an awaiting-input note on the master
+            // session. This is the same mechanism used for peer parking /
+            // approval wakes — it surfaces as a system message on the
+            // master's next turn.
+            if let Err(err) = enqueue_goal_progress_wake(
+                &runtime.data_dir,
+                &originator,
+                &wake_message,
+            ) {
+                tracing::warn!(
+                    ?err,
+                    slug,
+                    goal_id,
+                    originator,
+                    "peer-goal: failed to enqueue master wake (ledger row is still durable)"
+                );
+            }
+        }
+    }
+}
+
+/// Enqueue a wake note for the master session when a goal-scoped peer
+/// completes a turn. The note is appended to the master's session-scoped
+/// `inbox/` file so the next master turn sees it as a system message.
+/// Returns `Err` if the inbox directory cannot be created or the note
+/// cannot be appended (best-effort — the caller logs and continues).
+///
+/// The filename is a SHA-256 hash of the session id (first 32 hex chars)
+/// so two distinct sessions cannot collide on a sanitized name (the
+/// lossy-replacement bug codex flagged: `a:b`, `a/b`, `a.b` would all
+/// map to `a_b.notes`). Hashing is collision-resistant per the hash
+/// function's guarantees and stable across restarts.
+fn enqueue_goal_progress_wake(
+    data_dir: &std::path::Path,
+    originator_session: &str,
+    message: &str,
+) -> Result<(), String> {
+    let safe_session = hash_session_for_inbox(originator_session);
+    let inbox_dir = data_dir.join("inbox");
+    std::fs::create_dir_all(&inbox_dir)
+        .map_err(|e| format!("failed to create inbox dir {}: {e}", inbox_dir.display()))?;
+    let note_path = inbox_dir.join(format!("{safe_session}.notes"));
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let line = format!("{timestamp} {message}\n");
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&note_path)
+        .and_then(|mut f| std::io::Write::write_all(&mut f, line.as_bytes()))
+        .map_err(|e| format!("failed to append wake note {}: {e}", note_path.display()))
+}
+
+/// Read and CLEAR the pending goal-progress notes for `session_id`. Returns
+/// `Some(rendered)` if any notes were pending, else `None`.
+///
+/// # Atomicity
+///
+/// The file is consumed by RENAMING it to a unique archive name FIRST,
+/// then reading the archived copy. This avoids the read-then-truncate race
+/// where a peer appending between our read and our truncate would have its
+/// note silently erased. After the rename, the original path no longer
+/// exists, so any peer appending gets a fresh empty file (O_CREAT) and no
+/// note is lost.
+///
+/// # Durability
+///
+/// The rendered string is returned to the caller, which embeds it in the
+/// agent's system prompt. If the turn crashes after rename but before the
+/// model consumes the prompt, the notes ARE lost from this inbox path —
+/// but the underlying findings remain durably recorded in the goal ledger
+/// (visible on the next `goal_get`), so the wake is an optimization, not
+/// the source of truth. A stronger guarantee (atomic queue with
+/// acknowledge-after-delivery) is deferred.
+///
+/// # Size bound
+///
+/// The archived file is read with a 64 KiB cap. An archive larger than
+/// that is RENAMED ASIDE (not returned, not deleted) so it stops growing
+/// and a future operator can inspect it — the consumer is not permanently
+/// wedged, it just skips this batch.
+fn read_and_clear_goal_progress_notes(
+    data_dir: &std::path::Path,
+    session_id: &str,
+) -> Option<String> {
+    let safe_session = hash_session_for_inbox(session_id);
+    let note_path = data_dir.join("inbox").join(format!("{safe_session}.notes"));
+    // Step 1: refuse a symlinked leaf (a hostile staged dir could otherwise
+    // redirect the read outside the inbox dir).
+    let meta = std::fs::symlink_metadata(&note_path).ok()?;
+    if !meta.is_file() || meta.file_type().is_symlink() {
+        return None;
+    }
+    // Step 2: rename the live file to a unique archive name. From this
+    // point on, any peer appending to the original path creates a NEW
+    // empty file — our read below cannot race with concurrent appends.
+    let archive_path = data_dir.join("inbox").join(format!(
+        "{safe_session}.{}.archive",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    std::fs::rename(&note_path, &archive_path).ok()?;
+    // Step 3: read the archived copy with a 64 KiB cap. An oversized
+    // archive is RENAMED ASIDE (kept for operator inspection) and skipped
+    // — the consumer is not wedged, future batches still drain.
+    const CAP: u64 = 64 * 1024;
+    let archive_meta = std::fs::symlink_metadata(&archive_path).ok()?;
+    if archive_meta.len() > CAP {
+        let oversize_path = archive_path.with_extension("oversize");
+        let _ = std::fs::rename(&archive_path, &oversize_path);
+        return None;
+    }
+    let body = std::fs::read_to_string(&archive_path).ok()?;
+    // Step 4: best-effort delete the archive now that we have it in memory.
+    // Failure leaves a stale .archive file (operator cleanup), never a
+    // duplicate delivery (the original .notes path is gone).
+    let _ = std::fs::remove_file(&archive_path);
+    if body.trim().is_empty() {
+        return None;
+    }
+    // Render each `timestamp message` line as a markdown bullet.
+    let mut rendered = String::from("### Goal progress from peers\n\n");
+    for line in body.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let msg = line.splitn(2, ' ').nth(1).unwrap_or(line);
+        rendered.push_str(&format!("- {msg}\n"));
+    }
+    Some(rendered)
+}
+
+/// Stable, collision-resistant filename-safe hash of a session id.
+/// Renders as 16 hex chars (64 bits) from `DefaultHasher` (SipHash-1-3).
+///
+/// # Caveats
+///
+/// - NOT cryptographic. SipHash's collision resistance is adequate for a
+///   profile-private inbox dir under a single-process trust boundary, but
+///   an adversary who can choose session ids AND access the inbox dir
+///   could force collisions. If that threat model changes, swap to a
+///   cryptographic hash (sha2::Sha256) or a collision-free encoding
+///   (percent-encoding the raw session id).
+/// - `DefaultHasher`'s algorithm is NOT guaranteed stable across Rust
+///   releases. A pending `.notes` file written under release N may become
+///   orphaned (unfindable by release N+1). The wake is best-effort (the
+///   goal ledger is the source of truth), so this is acceptable — but do
+///   NOT rely on this filename for anything durable.
+fn hash_session_for_inbox(session_id: &str) -> String {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut hasher = DefaultHasher::new();
+    session_id.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
 }
 
 /// Count how many `result-<n>.md` version files exist in the peer directory,
@@ -30744,6 +31040,20 @@ async fn run_standalone_turn(
             prompt.push_str("\n\n");
             prompt.push_str(&note);
         }
+        // Peer-agent-based goal wake: read and CLEAR any pending goal-progress
+        // notes for THIS session (written by `enqueue_goal_progress_wake` when
+        // a goal-scoped peer completed a turn). Appended to the system prompt
+        // so the master sees peer progress WITHOUT having to poll `goal_get`.
+        // The file is truncated after read so each note is delivered exactly
+        // once — a peer whose wake fails to deliver still has its finding
+        // durably recorded in the goal ledger (visible on `goal_get`).
+        if let Some(notes) = read_and_clear_goal_progress_notes(
+            &session_runtime.profile.data_dir,
+            &session_id.to_string(),
+        ) {
+            prompt.push_str("\n\n");
+            prompt.push_str(&notes);
+        }
         prompt
     })
     .with_session_usage_base(session_usage_base.clone())
@@ -30754,6 +31064,31 @@ async fn run_standalone_turn(
     // the gateway actor path carried it fine.
     .with_parent_session_key(session_id.to_string())
     .with_reporter(reporter);
+    // Peer-agent-based goal: when THIS turn runs as a peer session (topic
+    // `peer-<slug>`) AND the staged peer dir carries a `goal` file (written
+    // by `stage_peer` from the master's `peer_handoff` request), rehydrate
+    // the (goal_id, task_id) pair into the agent. This is what makes the
+    // peer's `goal_*` tool calls resolve to the goal the master handed off
+    // under — without it the tools fall back to the peer's own (non-goal)
+    // session and read an empty state. A missing/malformed file is silently
+    // treated as goal-less (the peer still runs, just without goal context).
+    let mut request_agent = request_agent;
+    if let Some((_profile_id, slug)) = peer_slug_and_profile(&session_id) {
+        let peers_root = session_runtime.profile.data_dir.join("peers");
+        if let Some(peer_dir) = staged_peer_dir(&peers_root, slug) {
+            if let Some(body) = peer_io::read_peer_file(&peer_dir, "goal", peer_io::PEER_FILE_READ_CAP_SMALL) {
+                let mut lines = body.lines();
+                let goal_id = lines.next().map(str::trim).filter(|s| !s.is_empty());
+                let task_id = lines.next().map(str::trim).filter(|s| !s.is_empty());
+                if let Some(goal_id) = goal_id {
+                    request_agent = request_agent.with_goal_id(goal_id.to_owned());
+                    if let Some(task_id) = task_id {
+                        request_agent = request_agent.with_task_id(task_id.to_owned());
+                    }
+                }
+            }
+        }
+    }
     // #1697 — pin the ACTIVE goal into the context window as a named prompt
     // segment (the memory-segment pattern: re-set on every per-turn agent
     // rebuild, so it survives compaction and disappears the turn after the

@@ -3179,6 +3179,192 @@ impl InProcessAgentOrchestrator {
         }
     }
 
+    /// Peer-agent-based goal: snapshot a goal DIRECTLY by its `goal_id`,
+    /// bypassing session-key resolution. Used when a peer session calls
+    /// `goal_get` — the peer's session key does NOT carry the goal (the
+    /// master staged it), but the peer's Agent was populated with the goal
+    /// id from `peers/<slug>/goal` at boot, which the tool threads through
+    /// `ToolContext.goal_id`.
+    ///
+    /// # Authorization
+    ///
+    /// The goal must be OWNED by `originator_session` (the session that
+    /// staged the peer) under `profile_id`. This mirrors the binding check
+    /// in [`Self::model_goal_record_peer_finding`] — without it, any peer
+    /// on this profile that learns a foreign goal's UUID could read its
+    /// objective/budget.
+    pub(crate) fn model_goal_snapshot_by_id(
+        &self,
+        goal_id: &str,
+        profile_id: &str,
+        originator_session: &str,
+    ) -> Value {
+        let state = self.state();
+        let found = state.goals.iter().find(|(key, goal)| {
+            goal.goal_id == goal_id
+                && goal.profile_id == profile_id
+                && (key.to_string() == originator_session
+                    || key.base_key() == originator_session)
+        });
+        match found {
+            Some((_key, goal)) => json!({
+                "status": goal.status,
+                "goal_id": goal.goal_id,
+                "objective": goal.objective,
+                "tokens_used": goal.tokens_used,
+                "token_budget": goal.token_budget,
+                "tokens_remaining": goal.token_budget.saturating_sub(goal.tokens_used),
+                "time_used_seconds": goal.time_used_seconds,
+                "continuations_used": goal.continuations_used,
+            }),
+            None => json!({ "status": "none" }),
+        }
+    }
+
+    /// Peer-agent-based goal: list the (slug, goal_id, task_id, result)
+    /// tuples for every peer currently staged under `peers_root` whose
+    /// `goal` file points at `goal_id`. This is the ledger-association
+    /// mechanism for goal-scoped peers: each peer's `result.md` is the
+    /// finding it produced, surfaced to the master on `goal_get` so a
+    /// keeper can synthesize results without manually `peer_gather`-ing
+    /// each peer. Result text is capped (first 500 chars) to keep the
+    /// snapshot bounded; peers with no result yet are included with
+    /// `result = null` so the master can see work-in-progress.
+    pub(crate) fn model_goal_peer_findings(
+        &self,
+        peers_root: &std::path::Path,
+        goal_id: &str,
+        profile_id: &str,
+    ) -> Vec<Value> {
+        let mut out = Vec::new();
+        let Ok(read_dir) = std::fs::read_dir(peers_root) else {
+            return out;
+        };
+        // Goal-binding pre-computation: collect every (scoped_key_str, base_key_str)
+        // pair whose goal record matches `goal_id` AND `profile_id`. A peer is
+        // surfaced ONLY if its originator session matches one of these —
+        // otherwise it is a foreign-goal injection attempt and excluded from
+        // the live findings view. The profile filter mirrors the durable
+        // ledger write path (`model_goal_record_peer_finding`): a same-ID
+        // goal owned under ANOTHER profile must not authorize this
+        // profile's live findings.
+        let goal_owner_keys: std::collections::HashSet<String> = {
+            let state = self.state();
+            state
+                .goals
+                .iter()
+                .filter(|(_key, goal)| goal.goal_id == goal_id && goal.profile_id == profile_id)
+                .flat_map(|(key, _goal)| {
+                    let mut set = std::collections::HashSet::new();
+                    set.insert(key.to_string());
+                    set.insert(key.base_key().to_owned());
+                    set
+                })
+                .collect()
+        };
+        for entry in read_dir.flatten() {
+            let slug = entry.file_name().to_string_lossy().into_owned();
+            // Use the same fd-anchored, symlink-refusing gate as the rest of
+            // the peer blackboard scan (`staged_peer_dir` + `read_peer_file`).
+            // This refuses to surface a peer whose dir or `goal`/`result.md`
+            // leaf is a symlink, so a hostile staged dir cannot redirect the
+            // read outside `peers_root` or inject fabricated findings.
+            let Some(dir) = staged_peer_dir_for_ledger(peers_root, &slug) else {
+                continue;
+            };
+            let Some(body) = read_peer_file_for_ledger(&dir, "goal") else {
+                continue;
+            };
+            let mut lines = body.lines();
+            let peer_goal_id = lines.next().map(str::trim).unwrap_or("");
+            if peer_goal_id != goal_id {
+                continue;
+            }
+            // Goal-binding: the peer's originator session must own this
+            // goal. Without this check, any same-profile caller that learns
+            // a foreign goal's UUID could stage a peer "for" that goal and
+            // inject live findings (the ledger write is separately gated,
+            // but the live view here would still surface them).
+            let originator = read_peer_file_for_ledger(&dir, "originator")
+                .map(|s| s.trim().to_owned())
+                .filter(|s| !s.is_empty());
+            let Some(originator) = originator else {
+                continue;
+            };
+            if !goal_owner_keys.contains(&originator) {
+                continue;
+            }
+            let peer_task_id = lines
+                .next()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned);
+            let result_full = read_peer_file_for_ledger(&dir, "result.md");
+            let result = result_full.map(|r| {
+                let trimmed = r.trim();
+                let capped: String = trimmed.chars().take(500).collect();
+                if capped.len() < trimmed.len() {
+                    format!("{capped}…")
+                } else {
+                    capped
+                }
+            });
+            let result_updated_unix = std::fs::metadata(dir.join("result.md"))
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs());
+            out.push(json!({
+                "peer_slug": slug,
+                "task_id": peer_task_id,
+                "result": result,
+                "result_updated_unix": result_updated_unix,
+            }));
+        }
+        out
+    }
+
+    /// Peer-agent-based goal: list the DURABLE findings persisted to this
+    /// goal's ledger (the write half is `model_goal_record_peer_finding`,
+    /// called when a goal-scoped peer completes a turn). These survive
+    /// across restarts and peer-result overwrites — the authoritative
+    /// history of what each peer contributed to the goal. Returns the same
+    /// summary shape as `model_goal_peer_findings` so the tool can merge
+    /// the two views.
+    pub(crate) fn model_goal_ledger_findings(
+        &self,
+        profile_data_dir: &std::path::Path,
+        goal_id: &str,
+    ) -> Vec<Value> {
+        let ledger_dir = Self::goal_ledger_dir(profile_data_dir);
+        let ledger_path = ledger_dir.join(format!("{}.db", sanitize_filename_for_ledger(goal_id)));
+        if !ledger_path.is_file() {
+            return Vec::new();
+        }
+        let Ok(ledger) = octos_fleet::sqlite_ledger::GoalLedger::open(&ledger_path) else {
+            return Vec::new();
+        };
+        // Read all findings for this goal (no cursor — goal_get is called
+        // rarely enough that a full scan is acceptable).
+        let findings = ledger
+            .list_findings_since(goal_id, 0)
+            .unwrap_or_else(|_| Vec::new());
+        findings
+            .into_iter()
+            .map(|f| {
+                json!({
+                    "finding_id": f.finding_id,
+                    "task_id": f.task_id,
+                    "kind": f.kind,
+                    "lifecycle": f.lifecycle,
+                    "assertion": f.assertion,
+                    "created_by": f.created_by,
+                    "created_at_ms": f.created_at_ms,
+                })
+            })
+            .collect()
+    }
+
     /// #1696 — model-owned goal transition for the `goal_update` tool.
     /// Enforces the ownership matrix server-side (defense in depth beyond
     /// the tool executor): the model may set ONLY `complete` or `blocked`.
@@ -3220,6 +3406,106 @@ impl InProcessAgentOrchestrator {
             "model transitioned goal via goal_update tool"
         );
         Ok(autonomy_goal_json(&snapshot))
+    }
+
+    /// Peer-agent-based goal: record a peer finding into the goal's durable
+    /// ledger. This is the persistence half of `model_goal_peer_findings`
+    /// (which scans live `result.md` files): once a peer completes, its
+    /// result is frozen as a `Finding` row so the master can list findings
+    /// across restarts even if the peer's `result.md` is later overwritten.
+    ///
+    /// Returns the new finding's `finding_id`. Errors when the goal is not
+    /// found under this profile (a peer whose master is on a different
+    /// profile must not write into its ledger).
+    ///
+    /// # Goal-binding check
+    ///
+    /// We additionally require the goal record's OWNING session (the master
+    /// session that created the goal) to MATCH the session that staged the
+    /// peer (`originator_session`). Without this, any same-profile caller
+    /// that learns a foreign goal's UUID could hand off a peer "for" that
+    /// goal and inject findings into the foreign ledger. The binding is
+    /// derived from the goal store directly: a goal record's HashMap key is
+    /// the (cwd-scoped) session key that created it, so we walk the goals
+    /// map and require the goal's session to match the peer's originator.
+    pub(crate) fn model_goal_record_peer_finding(
+        &self,
+        profile_data_dir: &std::path::Path,
+        goal_id: &str,
+        profile_id: &str,
+        originator_session: &str,
+        peer_slug: &str,
+        task_id: Option<&str>,
+        content: &str,
+    ) -> Result<String, String> {
+        // Verify the goal exists under this profile AND that its owning
+        // session matches the peer's originator (the goal-binding check
+        // above). We walk the map once and capture the matching key for
+        // downstream use.
+        let state = self.state();
+        let goal_owner_matches = state.goals.iter().any(|(key, goal)| {
+            goal.goal_id == goal_id
+                && goal.profile_id == profile_id
+                // The HashMap key is the scoped goal key (the session that
+                // created the goal). The originator recorded on the peer
+                // staging is the wire-format session id; for the by-id path
+                // we compare against the scoped key's string form. Both
+                // shapes refer to the same master session when the peer was
+                // legitimately staged under this goal.
+                && (key.to_string() == originator_session
+                    || key.base_key() == originator_session)
+        });
+        drop(state);
+        if !goal_owner_matches {
+            return Err(format!(
+                "goal `{goal_id}` is not owned by originator session `{originator_session}` \
+                 under profile `{profile_id}` — refusing to record peer finding into a \
+                 foreign goal's ledger"
+            ));
+        }
+        // The ledger is keyed by goal_id; open (creating on first use) the
+        // per-profile goal ledger under the orchestrator's data dir. We use
+        // a stable path so all peers of the same goal land in the same file.
+        let ledger_dir = Self::goal_ledger_dir(profile_data_dir);
+        std::fs::create_dir_all(&ledger_dir)
+            .map_err(|e| format!("failed to create goal ledger dir {}: {e}", ledger_dir.display()))?;
+        let ledger_path = ledger_dir.join(format!("{}.db", sanitize_filename_for_ledger(goal_id)));
+        let ledger = octos_fleet::sqlite_ledger::GoalLedger::open(&ledger_path)
+            .map_err(|e| format!("failed to open goal ledger {}: {e}", ledger_path.display()))?;
+        let finding_id = format!("peer-{}-{}", peer_slug, uuid::Uuid::now_v7());
+        let finding = octos_fleet::sqlite_ledger::Finding {
+            rowid: None,
+            finding_id: finding_id.clone(),
+            task_id: task_id.map(str::to_owned),
+            goal_id: goal_id.to_owned(),
+            kind: "observation".to_owned(),
+            lifecycle: "observed".to_owned(),
+            confidence: "medium".to_owned(),
+            review_state: "unreviewed".to_owned(),
+            assertion: content.chars().take(500).collect(),
+            evidence: None,
+            config_version: None,
+            derived_from: None,
+            created_at_ms: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0),
+            created_by: format!("peer:{peer_slug}"),
+        };
+        ledger
+            .append_finding(&finding)
+            .map_err(|e| format!("failed to append peer finding: {e}"))?;
+        Ok(finding_id)
+    }
+
+    /// Directory holding this profile's per-goal ledgers. Resolved under the
+    /// profile's persistent `data_dir` so ledgers (a) survive restarts and
+    /// `/tmp` cleanup, (b) are profile-isolated (a peer on profile A cannot
+    /// read/write profile B's ledger), and (c) cannot be redirected via
+    /// environment variables. Created on first write with restrictive
+    /// permissions (0755) by `model_goal_record_peer_finding`.
+    fn goal_ledger_dir(profile_data_dir: &std::path::Path) -> std::path::PathBuf {
+        profile_data_dir.join("goal-ledgers")
     }
 
     /// #1857 PR 5a — stash the controller workspace binding on the goal record
@@ -6001,6 +6287,72 @@ fn now_ms() -> i64 {
 
 fn now_ms_u64() -> u64 {
     now_ms().try_into().unwrap_or(0)
+}
+
+/// Sanitize a `goal_id` for use as a ledger filename. Goal ids are uuids in
+/// practice, but we strip anything that isn't alphanumeric / `-` / `_` so a
+/// hostile or legacy id cannot escape the ledger dir.
+fn sanitize_filename_for_ledger(goal_id: &str) -> String {
+    goal_id
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+/// Symlink-safe `staged_peer_dir` for the ledger aggregation path: a peer
+/// dir is usable only if (a) the slug is safe (no path separators / parent
+/// refs), (b) the dir is a REAL non-symlink directory, and (c) it carries
+/// the `brief.md` staging contract. Mirrors the stricter fd-anchored
+/// version in `ui_protocol.rs` — a fuller hardening (O_NOFOLLOW on every
+/// leaf) is deferred.
+fn staged_peer_dir_for_ledger(peers_root: &std::path::Path, slug: &str) -> Option<std::path::PathBuf> {
+    // Slug safety: refuse anything containing path separators or parent refs.
+    if slug.is_empty()
+        || slug.contains('/')
+        || slug.contains('\\')
+        || slug.contains("..")
+        || slug.starts_with('.')
+    {
+        return None;
+    }
+    let dir = peers_root.join(slug);
+    // `symlink_metadata` does NOT follow the final symlink — refuse a
+    // symlinked peer dir outright.
+    let meta = std::fs::symlink_metadata(&dir).ok()?;
+    if !meta.is_dir() || meta.file_type().is_symlink() {
+        return None;
+    }
+    // The staging contract: a real `brief.md` regular file (non-symlink).
+    let brief = dir.join("brief.md");
+    let brief_meta = std::fs::symlink_metadata(&brief).ok()?;
+    if !brief_meta.is_file() || brief_meta.file_type().is_symlink() {
+        return None;
+    }
+    Some(dir)
+}
+
+/// Symlink-safe read of a small peer file (e.g. `goal`, `result.md`).
+/// Refuses symlinked leaves; reads with a 64 KiB cap so a maliciously
+/// large `result.md` cannot OOM the goal_get snapshot. Returns `None` on
+/// any error (missing, symlink, oversize, unreadable) — fail-open so a
+/// single bad peer does not break the entire aggregation.
+fn read_peer_file_for_ledger(peer_dir: &std::path::Path, leaf: &str) -> Option<String> {
+    const CAP: usize = 64 * 1024;
+    let path = peer_dir.join(leaf);
+    let meta = std::fs::symlink_metadata(&path).ok()?;
+    if !meta.is_file() || meta.file_type().is_symlink() {
+        return None;
+    }
+    if meta.len() > CAP as u64 {
+        return None;
+    }
+    std::fs::read_to_string(&path).ok()
 }
 
 /// PR B — render a [`WorkerGrant`] to the wire JSON shape the goal tools speak

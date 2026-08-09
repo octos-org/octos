@@ -475,6 +475,10 @@ impl Agent {
             parent_session_key: self.parent_session_key.clone(),
             spawn_depth: self.spawn_depth,
             session_scope: self.session_scope.clone(),
+            // Peer-agent-based goal: forward the agent's (optional) goal
+            // context so goal-aware tools can scope their reads/writes.
+            goal_id: self.goal_id.clone(),
+            task_id: self.task_id.clone(),
             // #1774: approval-gated edits still honor the post-edit
             // formatting opt-in.
             format_after_edit: self.config.format_after_edit,

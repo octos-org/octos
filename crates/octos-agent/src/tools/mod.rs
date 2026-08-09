@@ -317,6 +317,16 @@ pub struct ToolContext {
     /// [`SessionScope::workspace`]. See `octos_core::session_scope`
     /// for the contract and migration notes.
     pub session_scope: Option<Arc<SessionScope>>,
+    /// Goal ID this tool call is working under (peer-agent-based goal).
+    /// Populated from `Agent::goal_id` at tool dispatch when the agent runs
+    /// inside a peer staged with a `goal` file. Read by the `goal_*` tool
+    /// family to scope reads/writes to the goal without requiring the model
+    /// to repeat the id on every call.
+    pub goal_id: Option<String>,
+    /// Task ID within the goal (peer-agent-based goal). Populated from
+    /// `Agent::task_id`. May be `None` even when `goal_id` is set (the peer
+    /// is goal-scoped but not task-scoped).
+    pub task_id: Option<String>,
     /// Post-edit formatting (issue #1774): when true, a successful
     /// `edit_file` / `write_file` / `diff_edit` runs the language formatter
     /// for the file (rustfmt / prettier / black / gofmt — see
@@ -371,6 +381,8 @@ impl ToolContext {
             parent_session_key: None,
             spawn_depth: 0,
             session_scope: None,
+            goal_id: None,
+            task_id: None,
             format_after_edit: false,
         }
     }

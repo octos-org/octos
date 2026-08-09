@@ -335,6 +335,69 @@ impl GoalLedger {
         Ok(rowid)
     }
 
+    /// Append an escalation (peer-agent-based goal). Mirrors `append_finding`:
+    /// atomic single-row insert under a transaction, returning the rowid.
+    /// `escalation_id` must be unique (callers use a UUID).
+    pub fn append_escalation(&self, escalation: &Escalation) -> Result<i64> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+
+        tx.execute(
+            "INSERT INTO escalations (escalation_id, goal_id, task_id, peer_id, question, context, status, default_action, default_after_secs, created_at_ms, resolved_at_ms, resolved_by, resolution)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+            params![
+                escalation.escalation_id,
+                escalation.goal_id,
+                escalation.task_id,
+                escalation.peer_id,
+                escalation.question,
+                escalation.context,
+                escalation.status,
+                escalation.default_action,
+                escalation.default_after_secs,
+                escalation.created_at_ms,
+                escalation.resolved_at_ms,
+                escalation.resolved_by,
+                escalation.resolution,
+            ],
+        )?;
+
+        let rowid = tx.last_insert_rowid();
+        tx.commit()?;
+        Ok(rowid)
+    }
+
+    /// List escalations for a goal (level-triggered: only changes since `since_rowid`).
+    pub fn list_escalations_since(&self, goal_id: &str, since_rowid: i64) -> Result<Vec<Escalation>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT rowid, escalation_id, goal_id, task_id, peer_id, question, context, status, default_action, default_after_secs, created_at_ms, resolved_at_ms, resolved_by, resolution
+             FROM escalations WHERE goal_id = ?1 AND rowid > ?2 ORDER BY rowid ASC",
+        )?;
+        let rows = stmt.query_map(params![goal_id, since_rowid], |row| {
+            Ok(Escalation {
+                escalation_id: row.get(1)?,
+                goal_id: row.get(2)?,
+                task_id: row.get(3)?,
+                peer_id: row.get(4)?,
+                question: row.get(5)?,
+                context: row.get(6)?,
+                status: row.get(7)?,
+                default_action: row.get(8)?,
+                default_after_secs: row.get(9)?,
+                created_at_ms: row.get(10)?,
+                resolved_at_ms: row.get(11)?,
+                resolved_by: row.get(12)?,
+                resolution: row.get(13)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
     /// List findings for a goal (level-triggered: only changes since `since_ms`).
     /// List findings for a goal (level-triggered: only changes since `since_rowid`).
     ///
