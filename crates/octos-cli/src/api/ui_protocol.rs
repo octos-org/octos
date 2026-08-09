@@ -14380,13 +14380,11 @@ fn wake_master_on_peer_awaiting_input(
     let Some(goal_id) = goal_id else {
         return;
     };
-    let Some(originator) = peer_io::read_peer_file(
-        &peer_dir,
-        "originator",
-        peer_io::PEER_FILE_READ_CAP_SMALL,
-    )
-    .map(|s| s.trim().to_owned())
-    .filter(|s| !s.is_empty()) else {
+    let Some(originator) =
+        peer_io::read_peer_file(&peer_dir, "originator", peer_io::PEER_FILE_READ_CAP_SMALL)
+            .map(|s| s.trim().to_owned())
+            .filter(|s| !s.is_empty())
+    else {
         return;
     };
     let kind_str = match park_kind {
@@ -15069,13 +15067,10 @@ fn write_peer_result_if_peer_session(
             // check: the goal record must be OWNED by the same session that
             // staged this peer. A peer without an originator file (legacy
             // peer/prepare path) cannot bind to a goal — refuse the write.
-            let originator = peer_io::read_peer_file(
-                &peer_dir,
-                "originator",
-                peer_io::PEER_FILE_READ_CAP_SMALL,
-            )
-            .map(|s| s.trim().to_owned())
-            .filter(|s| !s.is_empty());
+            let originator =
+                peer_io::read_peer_file(&peer_dir, "originator", peer_io::PEER_FILE_READ_CAP_SMALL)
+                    .map(|s| s.trim().to_owned())
+                    .filter(|s| !s.is_empty());
             let Some(originator) = originator else {
                 tracing::warn!(
                     slug,
@@ -15206,7 +15201,6 @@ fn enqueue_goal_progress_wake(
     // the reader to finish its rename+read, then appends to the fresh
     // `.notes`. This is the complete fix codex v12 flagged — try_lock
     // ignoring failure is not full serialization.
-    use fs2::FileExt as _;
     let lock_path = data_dir.join("inbox").join(format!("{safe_session}.lock"));
     let lock_file = std::fs::OpenOptions::new()
         .create(true)
@@ -15352,10 +15346,9 @@ fn read_and_clear_goal_progress_notes(
     // Archive name uses UUIDv7 (time-ordered, 128-bit, no collision) so
     // two renames within the same nanosecond cannot collide (codex v11
     // issue #1944-4).
-    let archive_path = data_dir.join("inbox").join(format!(
-        "{safe_session}.{}.archive",
-        uuid::Uuid::now_v7()
-    ));
+    let archive_path = data_dir
+        .join("inbox")
+        .join(format!("{safe_session}.{}.archive", uuid::Uuid::now_v7()));
     std::fs::rename(&note_path, &archive_path).ok()?;
     // Step 3: read the archived copy with a 64 KiB cap. The metadata
     // precheck above only bounds the FILE SIZE AT RENAME TIME — a
@@ -31230,7 +31223,7 @@ async fn run_standalone_turn(
     // `Agent::new_shared` resets `hooks: None`. We thread it directly
     // off the SessionRuntime's parent profile so the runtime layer
     // remains the single source of truth.
-    let mut request_agent = Agent::new_shared(
+    let request_agent = Agent::new_shared(
         AgentId::new(format!("ui-protocol-{}", uuid::Uuid::now_v7())),
         llm_provider.clone(),
         tool_registry.clone(),
@@ -31288,7 +31281,9 @@ async fn run_standalone_turn(
     if let Some((_profile_id, slug)) = peer_slug_and_profile(&session_id) {
         let peers_root = session_runtime.profile.data_dir.join("peers");
         if let Some(peer_dir) = staged_peer_dir(&peers_root, slug) {
-            if let Some(body) = peer_io::read_peer_file(&peer_dir, "goal", peer_io::PEER_FILE_READ_CAP_SMALL) {
+            if let Some(body) =
+                peer_io::read_peer_file(&peer_dir, "goal", peer_io::PEER_FILE_READ_CAP_SMALL)
+            {
                 let mut lines = body.lines();
                 let goal_id = lines.next().map(str::trim).filter(|s| !s.is_empty());
                 let task_id = lines.next().map(str::trim).filter(|s| !s.is_empty());
@@ -31305,13 +31300,10 @@ async fn run_standalone_turn(
             // every call, which is a mutable, symlink-vulnerable read that
             // could rebind a known goal_id to a different session mid-turn.
             // Capturing it here pins the value for the whole turn.
-            if let Some(originator) = peer_io::read_peer_file(
-                &peer_dir,
-                "originator",
-                peer_io::PEER_FILE_READ_CAP_SMALL,
-            )
-            .map(|s| s.trim().to_owned())
-            .filter(|s| !s.is_empty())
+            if let Some(originator) =
+                peer_io::read_peer_file(&peer_dir, "originator", peer_io::PEER_FILE_READ_CAP_SMALL)
+                    .map(|s| s.trim().to_owned())
+                    .filter(|s| !s.is_empty())
             {
                 request_agent = request_agent.with_originator_session(originator);
             }

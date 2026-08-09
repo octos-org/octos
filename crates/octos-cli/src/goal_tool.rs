@@ -296,7 +296,11 @@ impl GoalGetTool {
     /// avoids the bug where `with_peers_root("/x/data")` would silently
     /// re-root to `/x`.
     pub fn with_peers_root(mut self, peers_root: std::path::PathBuf) -> Self {
-        let data_dir = if peers_root.file_name().map(|n| n == "peers").unwrap_or(false) {
+        let data_dir = if peers_root
+            .file_name()
+            .map(|n| n == "peers")
+            .unwrap_or(false)
+        {
             peers_root
                 .parent()
                 .map(|p| p.to_path_buf())
@@ -405,9 +409,7 @@ impl Tool for GoalGetTool {
             .get("goal_id")
             .and_then(|v| v.as_str())
             .map(str::to_owned);
-        if let (Some(data_dir), Some(goal_id)) =
-            (self.data_dir.as_ref(), goal_id_for_findings)
-        {
+        if let (Some(data_dir), Some(goal_id)) = (self.data_dir.as_ref(), goal_id_for_findings) {
             let peers_root = data_dir.join("peers");
             let live_findings =
                 orchestrator.model_goal_peer_findings(&peers_root, &goal_id, &self.profile_id);
@@ -1019,10 +1021,6 @@ impl Tool for GoalUpdateTool {
             });
         };
         let status = args.get("status").and_then(Value::as_str).unwrap_or("");
-        let reason = args
-            .get("reason")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
 
         // Peer-agent-based goal: when the Agent carries a `goal_id` (peer
         // session boot populated it from `peers/<slug>/goal`), the peer is

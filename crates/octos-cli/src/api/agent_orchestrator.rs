@@ -3249,8 +3249,7 @@ impl InProcessAgentOrchestrator {
         let found = state.goals.iter().find(|(key, goal)| {
             goal.goal_id == goal_id
                 && goal.profile_id == profile_id
-                && (key.to_string() == originator_session
-                    || key.base_key() == originator_session)
+                && (key.to_string() == originator_session || key.base_key() == originator_session)
         });
         match found {
             Some((_key, goal)) => json!({
@@ -3513,8 +3512,12 @@ impl InProcessAgentOrchestrator {
         // per-profile goal ledger under the orchestrator's data dir. We use
         // a stable path so all peers of the same goal land in the same file.
         let ledger_dir = Self::goal_ledger_dir(profile_data_dir);
-        std::fs::create_dir_all(&ledger_dir)
-            .map_err(|e| format!("failed to create goal ledger dir {}: {e}", ledger_dir.display()))?;
+        std::fs::create_dir_all(&ledger_dir).map_err(|e| {
+            format!(
+                "failed to create goal ledger dir {}: {e}",
+                ledger_dir.display()
+            )
+        })?;
         let ledger_path = ledger_dir.join(format!("{}.db", sanitize_filename_for_ledger(goal_id)));
         let ledger = octos_fleet::GoalLedger::open(&ledger_path)
             .map_err(|e| format!("failed to open goal ledger {}: {e}", ledger_path.display()))?;
@@ -3612,8 +3615,7 @@ impl InProcessAgentOrchestrator {
         let goal_owner_matches = state.goals.iter().any(|(key, goal)| {
             goal.goal_id == goal_id
                 && goal.profile_id == profile_id
-                && (key.to_string() == originator_session
-                    || key.base_key() == originator_session)
+                && (key.to_string() == originator_session || key.base_key() == originator_session)
         });
         drop(state);
         if !goal_owner_matches {
@@ -3625,7 +3627,10 @@ impl InProcessAgentOrchestrator {
         }
         let ledger_dir = Self::goal_ledger_dir(profile_data_dir);
         std::fs::create_dir_all(&ledger_dir).map_err(|e| {
-            format!("failed to create goal ledger dir {}: {e}", ledger_dir.display())
+            format!(
+                "failed to create goal ledger dir {}: {e}",
+                ledger_dir.display()
+            )
         })?;
         let ledger_path = ledger_dir.join(format!("{}.db", sanitize_filename_for_ledger(goal_id)));
         let ledger = octos_fleet::GoalLedger::open(&ledger_path)
@@ -6503,7 +6508,10 @@ fn sanitize_filename_for_ledger(goal_id: &str) -> String {
 /// the `brief.md` staging contract. Mirrors the stricter fd-anchored
 /// version in `ui_protocol.rs` — a fuller hardening (O_NOFOLLOW on every
 /// leaf) is deferred.
-fn staged_peer_dir_for_ledger(peers_root: &std::path::Path, slug: &str) -> Option<std::path::PathBuf> {
+fn staged_peer_dir_for_ledger(
+    peers_root: &std::path::Path,
+    slug: &str,
+) -> Option<std::path::PathBuf> {
     // Slug safety: refuse anything containing path separators or parent refs.
     if slug.is_empty()
         || slug.contains('/')
