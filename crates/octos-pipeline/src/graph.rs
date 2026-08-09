@@ -131,6 +131,13 @@ pub struct PipelineNode {
     /// Override max output tokens per LLM call. Default 4096 is too low for
     /// nodes that write long outputs (e.g. synthesize writing full reports).
     pub max_output_tokens: Option<u32>,
+    /// Override the agent-loop iteration budget for this node's worker.
+    /// The pipeline default (30) is too low for a synthesis node that reads
+    /// many findings files one at a time before producing its analysis —
+    /// such a node exhausts the budget navigating files and never emits the
+    /// result, failing the whole pipeline (deep_research `analyze` timeout).
+    /// `None` keeps the pipeline default.
+    pub max_iterations: Option<u32>,
     /// Allowed tool names for this node. Empty = all builtins.
     pub tools: Vec<String>,
     /// If true, a successful outcome means "pipeline goal achieved".
@@ -191,6 +198,7 @@ impl Default for PipelineNode {
             model: None,
             context_window: None,
             max_output_tokens: None,
+            max_iterations: None,
             tools: Vec::new(),
             goal_gate: false,
             max_retries: 0,

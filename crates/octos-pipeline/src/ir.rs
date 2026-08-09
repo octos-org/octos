@@ -60,6 +60,8 @@ pub enum IrNodeKind {
         prompt: String,
         #[serde(default)]
         max_output_tokens: Option<u32>,
+        #[serde(default)]
+        max_iterations: Option<u32>,
     },
     /// Pure transform over prior output, cheap model.
     Transform { prompt: String },
@@ -69,6 +71,8 @@ pub enum IrNodeKind {
         prompt: String,
         #[serde(default)]
         max_output_tokens: Option<u32>,
+        #[serde(default)]
+        max_iterations: Option<u32>,
     },
     /// Final report: synthesize AND save an artifact via `write_file`, strong
     /// model. The terminal "produce + persist a report/deck/file" step.
@@ -76,6 +80,8 @@ pub enum IrNodeKind {
         prompt: String,
         #[serde(default)]
         max_output_tokens: Option<u32>,
+        #[serde(default)]
+        max_iterations: Option<u32>,
     },
     /// Pure routing gate (no LLM); outgoing edge conditions decide the branch.
     Gate {},
@@ -335,17 +341,21 @@ fn compile_node(n: &IrNode) -> PipelineNode {
         IrNodeKind::Research {
             prompt,
             max_output_tokens,
+            max_iterations,
         }
         | IrNodeKind::Synthesize {
             prompt,
             max_output_tokens,
+            max_iterations,
         }
         | IrNodeKind::Report {
             prompt,
             max_output_tokens,
+            max_iterations,
         } => {
             node.prompt = Some(prompt.clone());
             node.max_output_tokens = *max_output_tokens;
+            node.max_iterations = *max_iterations;
         }
         IrNodeKind::Transform { prompt } => {
             node.prompt = Some(prompt.clone());
