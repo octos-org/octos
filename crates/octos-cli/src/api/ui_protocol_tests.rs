@@ -9787,8 +9787,7 @@ fn stage_peer_records_originator_for_ownership_scan() {
         Some("Curie"),
         Some(master),
         "Brief.",
-        false,
-    )
+        false, None, None)
     .expect("owned staging");
     let owned_dir = peers_root.join(&owned.slug);
     assert!(owned_dir.join("brief.md").is_file(), "brief.md written");
@@ -9806,8 +9805,7 @@ fn stage_peer_records_originator_for_ownership_scan() {
         Some("Bohr"),
         None,
         "Brief.",
-        false,
-    )
+        false, None, None)
     .expect("unowned staging");
     assert!(
         !peers_root.join(&unowned.slug).join("originator").exists(),
@@ -27460,8 +27458,7 @@ fn stage_peer_reserves_slug_writes_brief_and_releases_on_failure() {
         None,
         None,
         "Investigate the flaky test.",
-        false,
-    )
+        false, None, None)
     .expect("plain staging");
     assert_eq!(staged.slug, "ci-fix");
     assert_eq!(staged.topic, "peer-ci-fix");
@@ -27474,12 +27471,12 @@ fn stage_peer_reserves_slug_writes_brief_and_releases_on_failure() {
     );
 
     // Same seed again: the reserve claim suffixes, same as peer/prepare.
-    let second = stage_peer(&peers, &plain, "CI Fix", None, None, "Second lane.", false).unwrap();
+    let second = stage_peer(&peers, &plain, "CI Fix", None, None, "Second lane.", false, None, None).unwrap();
     assert_eq!(second.slug, "ci-fix-2");
 
     // Worktree against a NON-git workspace fails AND releases the slug —
     // the member cleans its own dir so a retry re-claims the same name.
-    let err = stage_peer(&peers, &plain, "No Repo", None, None, "Doomed.", true)
+    let err = stage_peer(&peers, &plain, "No Repo", None, None, "Doomed.", true, None, None)
         .expect_err("worktree without a git repo must fail");
     assert!(
         err.message.contains("git repo"),
@@ -27497,8 +27494,7 @@ fn stage_peer_reserves_slug_writes_brief_and_releases_on_failure() {
         None,
         None,
         "Fenceless retry.",
-        false,
-    )
+        false, None, None)
     .expect("failed staging must not burn the slug");
     assert_eq!(retry.slug, "no-repo");
 
@@ -27539,8 +27535,7 @@ fn stage_peer_reserves_slug_writes_brief_and_releases_on_failure() {
         None,
         None,
         "Own worktree.",
-        true,
-    )
+        true, None, None)
     .expect("worktree staging");
     assert_eq!(fenced.worktree_branch.as_deref(), Some("peer/fenced-lane"));
     assert!(fenced.cwd.ends_with("peers/fenced-lane/wt"));
@@ -27596,10 +27591,10 @@ fn cleanup_of_one_peer_must_not_destroy_a_sibling_fence() {
             .success()
     );
 
-    let keeper = stage_peer(&peers, &repo, "Keeper", None, None, "Stay.", true)
+    let keeper = stage_peer(&peers, &repo, "Keeper", None, None, "Stay.", true, None, None)
         .expect("sibling staging must succeed");
     let doomed =
-        stage_peer(&peers, &repo, "Doomed", None, None, "Rolled back.", true).expect("staging");
+        stage_peer(&peers, &repo, "Doomed", None, None, "Rolled back.", true, None, None).expect("staging");
 
     // Roll back ONLY the doomed peer.
     cleanup_staged_peer(&repo, &doomed.slug, &peers.join(&doomed.slug));
@@ -27678,7 +27673,9 @@ fn peer_handoff_callback_caps_at_four_and_emits_staged_events() {
             name: format!("Lane {n}"),
             worktree: false,
             model: None,
-        })
+        goal_id: None,
+        task_id: None,
+    })
         .unwrap_or_else(|err| panic!("handoff {n} within the cap must stage: {err}"));
         assert_eq!(staged.topic, format!("peer-{}", staged.slug));
         assert!(
@@ -27693,6 +27690,8 @@ fn peer_handoff_callback_caps_at_four_and_emits_staged_events() {
         name: "One too many".to_owned(),
         worktree: false,
         model: None,
+        goal_id: None,
+        task_id: None,
     })
     .expect_err("5th handoff must be rejected");
     assert_eq!(err, "peer handoff limit reached for this turn (4)");
@@ -28022,7 +28021,7 @@ fn stage_peer_named_rejects_duplicate_name_case_insensitive() {
     let ws = tmp.path().join("ws");
     std::fs::create_dir_all(&ws).unwrap();
 
-    let first = stage_peer(&peers, &ws, "seed", Some("Edison"), None, "Brief.", false)
+    let first = stage_peer(&peers, &ws, "seed", Some("Edison"), None, "Brief.", false, None, None)
         .expect("first named peer");
     assert_eq!(first.slug, "edison");
     assert_eq!(
@@ -28032,7 +28031,7 @@ fn stage_peer_named_rejects_duplicate_name_case_insensitive() {
     );
 
     // Same name (different case) → rejected, NOT auto-suffixed.
-    let dup = stage_peer(&peers, &ws, "seed", Some("EDISON"), None, "Brief.", false)
+    let dup = stage_peer(&peers, &ws, "seed", Some("EDISON"), None, "Brief.", false, None, None)
         .expect_err("duplicate name rejected");
     assert!(
         dup.message.contains("already exists"),
@@ -28040,7 +28039,7 @@ fn stage_peer_named_rejects_duplicate_name_case_insensitive() {
         dup.message
     );
     // A different name that derives the SAME slug is also rejected.
-    let dup2 = stage_peer(&peers, &ws, "seed", Some("edison"), None, "Brief.", false)
+    let dup2 = stage_peer(&peers, &ws, "seed", Some("edison"), None, "Brief.", false, None, None)
         .expect_err("duplicate slug rejected");
     assert!(
         dup2.message.contains("already exists"),
@@ -28049,7 +28048,7 @@ fn stage_peer_named_rejects_duplicate_name_case_insensitive() {
     );
 
     // A DISTINCT name stages fine.
-    let second = stage_peer(&peers, &ws, "seed", Some("Tesla"), None, "Brief.", false)
+    let second = stage_peer(&peers, &ws, "seed", Some("Tesla"), None, "Brief.", false, None, None)
         .expect("distinct name");
     assert_eq!(second.slug, "tesla");
 }
@@ -28063,7 +28062,7 @@ fn resolve_peer_name_to_slug_matches_name_and_slug() {
     let peers = tmp.path().join("peers");
     let ws = tmp.path().join("ws");
     std::fs::create_dir_all(&ws).unwrap();
-    stage_peer(&peers, &ws, "seed", Some("Edison"), None, "Brief.", false).unwrap();
+    stage_peer(&peers, &ws, "seed", Some("Edison"), None, "Brief.", false, None, None).unwrap();
 
     for ident in ["Edison", "edison", "EDISON", "  Edison  "] {
         assert_eq!(
@@ -28099,8 +28098,7 @@ fn peer_list_and_gather_surface_display_name() {
         Some("Edison"),
         None,
         "Wire the lab.",
-        false,
-    )
+        false, None, None)
     .unwrap();
 
     let list_cb = build_peer_list_callback(
@@ -28144,8 +28142,8 @@ fn peer_close_by_name_cancels_pending_injection_for_right_peer() {
     let ws = tmp.path().join("ws");
     std::fs::create_dir_all(&ws).unwrap();
 
-    let edison = stage_peer(&peers, &ws, "s", Some("Edison"), None, "b", false).unwrap();
-    let tesla = stage_peer(&peers, &ws, "s", Some("Tesla"), None, "b", false).unwrap();
+    let edison = stage_peer(&peers, &ws, "s", Some("Edison"), None, "b", false, None, None).unwrap();
+    let tesla = stage_peer(&peers, &ws, "s", Some("Tesla"), None, "b", false, None, None).unwrap();
     assert_eq!(edison.slug, "edison");
     assert_eq!(tesla.slug, "tesla");
     std::fs::write(peers.join("edison").join("originator"), owner).unwrap();
@@ -28325,7 +28323,7 @@ fn peer_fence_git_dir_is_inside_the_peer_workspace() {
     assert!(git(&repo, &["commit", "-q", "-m", "seed"]).status.success());
 
     let staged =
-        stage_peer(&peers, &repo, "Fenced", None, None, "Own fence.", true).expect("staging");
+        stage_peer(&peers, &repo, "Fenced", None, None, "Own fence.", true, None, None).expect("staging");
     let cwd = &staged.cwd;
 
     // THE fix: `.git` is a real directory in the peer's workspace, not a file
@@ -28436,7 +28434,7 @@ fn collecting_a_peer_fence_is_repeatable_and_tracks_new_commits() {
     );
 
     let staged =
-        stage_peer(&peers, &repo, "Turnwise", None, None, "Commit twice.", true).expect("staging");
+        stage_peer(&peers, &repo, "Turnwise", None, None, "Commit twice.", true, None, None).expect("staging");
     let dir = peers.join(&staged.slug);
 
     // Nothing committed yet: collecting must be a harmless no-op, not an error
@@ -28653,6 +28651,8 @@ fn peer_originator_recorded_by_handoff_callback() {
         name: "CI Fix".to_owned(),
         worktree: false,
         model: None,
+        goal_id: None,
+        task_id: None,
     })
     .expect("stage");
     let originator =
@@ -28750,6 +28750,8 @@ fn stage_and_open_peer(
         name: name.to_owned(),
         worktree: false,
         model: None,
+        goal_id: None,
+        task_id: None,
     })
     .expect("stage peer")
     .slug;
@@ -29278,6 +29280,8 @@ fn peer_respond_errors_when_peer_not_open() {
         name: "notopen".to_owned(),
         worktree: false,
         model: None,
+        goal_id: None,
+        task_id: None,
     })
     .unwrap()
     .slug;
@@ -29415,6 +29419,8 @@ fn peer_handoff_callback_records_valid_model_lane() {
         name: "Synth".to_owned(),
         worktree: false,
         model: Some("strong".to_owned()),
+        goal_id: None,
+        task_id: None,
     })
     .expect("a valid lane still stages the peer");
 
@@ -29455,6 +29461,8 @@ fn peer_handoff_callback_notes_unknown_model_lane_but_still_stages() {
         name: "Grunt".to_owned(),
         worktree: false,
         model: Some("gpt-mega".to_owned()),
+        goal_id: None,
+        task_id: None,
     })
     .expect("an unknown lane warns, it does not fail staging");
 

@@ -3341,7 +3341,7 @@ impl InProcessAgentOrchestrator {
         if !ledger_path.is_file() {
             return Vec::new();
         }
-        let Ok(ledger) = octos_fleet::sqlite_ledger::GoalLedger::open(&ledger_path) else {
+        let Ok(ledger) = octos_fleet::GoalLedger::open(&ledger_path) else {
             return Vec::new();
         };
         // Read all findings for this goal (no cursor — goal_get is called
@@ -3470,10 +3470,10 @@ impl InProcessAgentOrchestrator {
         std::fs::create_dir_all(&ledger_dir)
             .map_err(|e| format!("failed to create goal ledger dir {}: {e}", ledger_dir.display()))?;
         let ledger_path = ledger_dir.join(format!("{}.db", sanitize_filename_for_ledger(goal_id)));
-        let ledger = octos_fleet::sqlite_ledger::GoalLedger::open(&ledger_path)
+        let ledger = octos_fleet::GoalLedger::open(&ledger_path)
             .map_err(|e| format!("failed to open goal ledger {}: {e}", ledger_path.display()))?;
         let finding_id = format!("peer-{}-{}", peer_slug, uuid::Uuid::now_v7());
-        let finding = octos_fleet::sqlite_ledger::Finding {
+        let finding = octos_fleet::Finding {
             rowid: None,
             finding_id: finding_id.clone(),
             task_id: task_id.map(str::to_owned),
@@ -3540,10 +3540,10 @@ impl InProcessAgentOrchestrator {
             format!("failed to create goal ledger dir {}: {e}", ledger_dir.display())
         })?;
         let ledger_path = ledger_dir.join(format!("{}.db", sanitize_filename_for_ledger(goal_id)));
-        let ledger = octos_fleet::sqlite_ledger::GoalLedger::open(&ledger_path)
+        let ledger = octos_fleet::GoalLedger::open(&ledger_path)
             .map_err(|e| format!("failed to open goal ledger {}: {e}", ledger_path.display()))?;
         let escalation_id = format!("esc-{}-{}", peer_slug, uuid::Uuid::now_v7());
-        let escalation = octos_fleet::sqlite_ledger::Escalation {
+        let escalation = octos_fleet::Escalation {
             escalation_id: escalation_id.clone(),
             goal_id: goal_id.to_owned(),
             task_id: task_id.map(str::to_owned),

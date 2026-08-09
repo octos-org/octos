@@ -14392,7 +14392,6 @@ fn wake_master_on_peer_awaiting_input(
     let kind_str = match park_kind {
         PeerPendingKind::Approval => "approval",
         PeerPendingKind::Question => "question",
-        PeerPendingKind::Other => "other",
     };
     if let Err(err) = default_agent_orchestrator().model_goal_record_peer_escalation(
         &runtime.data_dir,
