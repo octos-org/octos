@@ -3535,6 +3535,7 @@ impl InProcessAgentOrchestrator {
             tokens_used: 0,
             token_budget: 0,
             continuations_used: 0,
+            revision: 0, // assigned by store on update
             created_at_ms: now_ms,
             updated_at_ms: now_ms,
         };
@@ -3560,6 +3561,7 @@ impl InProcessAgentOrchestrator {
         let finding = octos_fleet::Finding {
             rowid: None,
             finding_id: finding_id.clone(),
+            seq: 0, // assigned by store on insert
             task_id: task_id.map(str::to_owned),
             goal_id: goal_id.to_owned(),
             kind: "observation".to_owned(),
@@ -3570,6 +3572,8 @@ impl InProcessAgentOrchestrator {
             evidence: None,
             config_version: None,
             derived_from: None,
+            supersedes: Vec::new(),
+            cost_tokens: 0,
             created_at_ms: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_millis() as u64)
@@ -3640,6 +3644,7 @@ impl InProcessAgentOrchestrator {
             tokens_used: 0,
             token_budget: 0,
             continuations_used: 0,
+            revision: 0, // assigned by store on update
             created_at_ms: now_ms,
             updated_at_ms: now_ms,
         };

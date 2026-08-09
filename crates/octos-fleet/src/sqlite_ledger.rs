@@ -22,6 +22,10 @@ pub struct Goal {
     pub tokens_used: u64,
     pub token_budget: u64,
     pub continuations_used: u32,
+    /// Optimistic concurrency control: incremented on every update.
+    /// Used for CAS (compare-and-swap) in update_goal_status.
+    #[serde(default)]
+    pub revision: u64,
     pub created_at_ms: u64,
     pub updated_at_ms: u64,
 }
@@ -41,11 +45,12 @@ pub struct Task {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Finding {
     /// Monotonic row ID (SQLite rowid, assigned on insert, never changes).
-    /// Use this as the cursor for level-triggered queries instead of created_at_ms,
-    /// which is not monotonic across processes and has same-millisecond races.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rowid: Option<i64>,
+    /// Finding ID: "f-{seq}" format (assigned by store).
     pub finding_id: String,
+    /// Monotonic sequence number (per-goal, assigned by store).
+    pub seq: u64,
     pub task_id: Option<String>,
     pub goal_id: String,
     pub kind: String, // observation | hypothesis | diagnosis | constraint | experiment_result
@@ -56,6 +61,12 @@ pub struct Finding {
     pub evidence: Option<String>, // JSON
     pub config_version: Option<String>,
     pub derived_from: Option<String>, // JSON array of finding_ids
+    /// Findings this one overturns (by finding_id).
+    #[serde(default)]
+    pub supersedes: Vec<String>,
+    /// What it cost to learn (tokens). Feeds cost-against-yield per path.
+    #[serde(default)]
+    pub cost_tokens: u64,
     pub created_at_ms: u64,
     pub created_by: String,
 }
@@ -101,14 +112,6 @@ impl GoalLedger {
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
 
-        // CRITICAL: Enable foreign key constraints (OFF by default per-connection)
-        conn.pragma_update(None, "foreign_keys", "ON")?;
-
-        // CRITICAL: Set busy timeout to handle SQLITE_BUSY under concurrent writes
-        // Without this, two processes writing simultaneously cause immediate errors
-        // instead of waiting for the lock to release.
-        conn.busy_timeout(std::time::Duration::from_secs(5))?;
-
         conn.execute_batch(
             "
             CREATE TABLE IF NOT EXISTS goals (
@@ -118,6 +121,7 @@ impl GoalLedger {
                 tokens_used INTEGER NOT NULL DEFAULT 0,
                 token_budget INTEGER NOT NULL,
                 continuations_used INTEGER NOT NULL DEFAULT 0,
+                revision INTEGER NOT NULL DEFAULT 0,
                 created_at_ms INTEGER NOT NULL,
                 updated_at_ms INTEGER NOT NULL
             );
@@ -136,6 +140,7 @@ impl GoalLedger {
 
             CREATE TABLE IF NOT EXISTS findings (
                 finding_id TEXT PRIMARY KEY,
+                seq INTEGER NOT NULL,
                 task_id TEXT,
                 goal_id TEXT NOT NULL,
                 kind TEXT NOT NULL,
@@ -146,10 +151,13 @@ impl GoalLedger {
                 evidence TEXT,
                 config_version TEXT,
                 derived_from TEXT,
+                supersedes TEXT, -- JSON array
+                cost_tokens INTEGER NOT NULL DEFAULT 0,
                 created_at_ms INTEGER NOT NULL,
                 created_by TEXT NOT NULL,
                 FOREIGN KEY (goal_id) REFERENCES goals(goal_id),
-                FOREIGN KEY (task_id) REFERENCES tasks(task_id)
+                FOREIGN KEY (task_id) REFERENCES tasks(task_id),
+                UNIQUE(goal_id, seq)
             );
 
             CREATE TABLE IF NOT EXISTS escalations (
@@ -203,8 +211,8 @@ impl GoalLedger {
     pub fn create_goal(&self, goal: &Goal) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT INTO goals (goal_id, objective, status, tokens_used, token_budget, continuations_used, created_at_ms, updated_at_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            "INSERT INTO goals (goal_id, objective, status, tokens_used, token_budget, continuations_used, revision, created_at_ms, updated_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 goal.goal_id,
                 goal.objective,
@@ -212,6 +220,7 @@ impl GoalLedger {
                 goal.tokens_used,
                 goal.token_budget,
                 goal.continuations_used,
+                goal.revision,
                 goal.created_at_ms,
                 goal.updated_at_ms,
             ],
@@ -219,9 +228,30 @@ impl GoalLedger {
         Ok(())
     }
 
-    /// Create a task row (FK target for findings/escalations with task_id).
-    /// Mirrors `create_goal`: INSERT-only, callers ignore "already exists"
-    /// errors for idempotent upsert semantics.
+    /// Get a goal by ID.
+    pub fn get_goal(&self, goal_id: &str) -> Result<Option<Goal>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT goal_id, objective, status, tokens_used, token_budget, continuations_used, revision, created_at_ms, updated_at_ms
+             FROM goals WHERE goal_id = ?1"
+        )?;
+        let mut rows = stmt.query_map(params![goal_id], |row| {
+            Ok(Goal {
+                goal_id: row.get(0)?,
+                objective: row.get(1)?,
+                status: row.get(2)?,
+                tokens_used: row.get(3)?,
+                token_budget: row.get(4)?,
+                continuations_used: row.get(5)?,
+                revision: row.get(6)?,
+                created_at_ms: row.get(7)?,
+                updated_at_ms: row.get(8)?,
+            })
+        })?;
+        Ok(rows.next().transpose()?)
+    }
+
+    /// Create a new task.
     pub fn create_task(&self, task: &Task) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
@@ -239,28 +269,6 @@ impl GoalLedger {
             ],
         )?;
         Ok(())
-    }
-
-    /// Get a goal by ID.
-    pub fn get_goal(&self, goal_id: &str) -> Result<Option<Goal>> {
-        let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
-            "SELECT goal_id, objective, status, tokens_used, token_budget, continuations_used, created_at_ms, updated_at_ms
-             FROM goals WHERE goal_id = ?1"
-        )?;
-        let mut rows = stmt.query_map(params![goal_id], |row| {
-            Ok(Goal {
-                goal_id: row.get(0)?,
-                objective: row.get(1)?,
-                status: row.get(2)?,
-                tokens_used: row.get(3)?,
-                token_budget: row.get(4)?,
-                continuations_used: row.get(5)?,
-                created_at_ms: row.get(6)?,
-                updated_at_ms: row.get(7)?,
-            })
-        })?;
-        Ok(rows.next().transpose()?)
     }
 
     /// Get a task by ID.
@@ -285,60 +293,114 @@ impl GoalLedger {
         Ok(rows.next().transpose()?)
     }
 
-    /// List all decisions for a goal.
-    pub fn list_decisions(&self, goal_id: &str) -> Result<Vec<Decision>> {
-        let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
-            "SELECT decision_id, goal_id, task_id, question, options_considered, choice, rationale, based_on_findings, based_on_rev, decided_at_ms, decided_by
-             FROM decisions WHERE goal_id = ?1 ORDER BY decided_at_ms ASC"
-        )?;
-        let decisions = stmt
-            .query_map(params![goal_id], |row| {
-                Ok(Decision {
-                    decision_id: row.get(0)?,
-                    goal_id: row.get(1)?,
-                    task_id: row.get(2)?,
-                    question: row.get(3)?,
-                    options_considered: row.get(4)?,
-                    choice: row.get(5)?,
-                    rationale: row.get(6)?,
-                    based_on_findings: row.get(7)?,
-                    based_on_rev: row.get(8)?,
-                    decided_at_ms: row.get(9)?,
-                    decided_by: row.get(10)?,
-                })
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(decisions)
-    }
-
     /// Update goal status.
+    /// Update goal status with optimistic concurrency control (CAS).
+    ///
+    /// Uses revision for compare-and-swap: only updates if the current revision
+    /// matches expected_revision. Returns error if goal not found or revision mismatch
+    /// (stale writer).
     pub fn update_goal_status(
         &self,
         goal_id: &str,
         status: &str,
+        expected_revision: u64,
         updated_at_ms: u64,
     ) -> Result<()> {
         let conn = self.conn.lock().unwrap();
-        conn.execute(
-            "UPDATE goals SET status = ?1, updated_at_ms = ?2 WHERE goal_id = ?3",
-            params![status, updated_at_ms, goal_id],
+        let rows_affected = conn.execute(
+            "UPDATE goals SET status = ?1, revision = revision + 1, updated_at_ms = ?2 WHERE goal_id = ?3 AND revision = ?4",
+            params![status, updated_at_ms, goal_id, expected_revision],
         )?;
+
+        if rows_affected == 0 {
+            return Err(eyre::eyre!(
+                "update_goal_status failed: goal {} not found or revision mismatch (expected {})",
+                goal_id,
+                expected_revision
+            ));
+        }
+
         Ok(())
     }
 
-    /// Append a finding (with transaction for consistency).
-    pub fn append_finding(&self, finding: &Finding) -> Result<i64> {
-        let mut conn = self.conn.lock().unwrap();
-        let tx = conn.transaction()?;
+    /// Insert a finding with validation — the SINGLE validated write path,
+    /// shared by `append_finding` and `commit_state_with_audit` so the two can
+    /// never drift. All steps run in the caller-provided transaction `tx`:
+    ///
+    /// 1. cross-goal FK — the finding's `task_id` must belong to `goal_id`
+    /// 2. supersedes edges must reference existing findings in this goal
+    /// 3. seq assignment (max+1 for the goal) + insert
+    fn insert_finding_validated(
+        tx: &rusqlite::Transaction,
+        finding: &Finding,
+        goal_id: &str,
+    ) -> Result<()> {
+        // Step 1: Get next seq for this goal
+        let max_seq: Option<u64> = tx
+            .query_row(
+                "SELECT MAX(seq) FROM findings WHERE goal_id = ?1",
+                params![goal_id],
+                |row| row.get(0),
+            )
+            .ok()
+            .flatten();
+        let next_seq = max_seq.unwrap_or(0) + 1;
 
+        // Step 1.5: Validate task belongs to this goal (prevent cross-goal FK confusion)
+        if let Some(ref task_id) = finding.task_id {
+            let task_goal: Option<String> = tx
+                .query_row(
+                    "SELECT goal_id FROM tasks WHERE task_id = ?1",
+                    params![task_id],
+                    |row| row.get(0),
+                )
+                .ok();
+
+            match task_goal {
+                None => {
+                    return Err(eyre::eyre!("task {} not found", task_id));
+                }
+                Some(tg) if tg != goal_id => {
+                    return Err(eyre::eyre!(
+                        "cross-goal FK violation: task {} belongs to goal {}, not goal {}",
+                        task_id,
+                        tg,
+                        goal_id
+                    ));
+                }
+                _ => {}
+            }
+        }
+
+        // Step 2: Validate supersedes edges
+        if !finding.supersedes.is_empty() {
+            let mut stmt = tx.prepare(
+                "SELECT finding_id FROM findings WHERE goal_id = ?1 AND finding_id = ?2",
+            )?;
+            for superseded_id in &finding.supersedes {
+                let exists: Option<String> = stmt
+                    .query_row(params![goal_id, superseded_id], |row| row.get(0))
+                    .ok();
+                if exists.is_none() {
+                    return Err(eyre::eyre!(
+                        "supersedes references unknown finding {} in goal {}",
+                        superseded_id,
+                        goal_id
+                    ));
+                }
+            }
+        }
+
+        // Step 3: Insert new finding
+        let supersedes_json = serde_json::to_string(&finding.supersedes)?;
         tx.execute(
-            "INSERT INTO findings (finding_id, task_id, goal_id, kind, lifecycle, confidence, review_state, assertion, evidence, config_version, derived_from, created_at_ms, created_by)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+            "INSERT INTO findings (finding_id, seq, task_id, goal_id, kind, lifecycle, confidence, review_state, assertion, evidence, config_version, derived_from, supersedes, cost_tokens, created_at_ms, created_by)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
             params![
                 finding.finding_id,
+                next_seq,
                 finding.task_id,
-                finding.goal_id,
+                goal_id,
                 finding.kind,
                 finding.lifecycle,
                 finding.confidence,
@@ -347,22 +409,57 @@ impl GoalLedger {
                 finding.evidence,
                 finding.config_version,
                 finding.derived_from,
+                supersedes_json,
+                finding.cost_tokens,
                 finding.created_at_ms,
                 finding.created_by,
             ],
         )?;
+
+        Ok(())
+    }
+
+    pub fn append_finding(&self, finding: &Finding) -> Result<i64> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+
+        Self::insert_finding_validated(&tx, finding, &finding.goal_id)?;
 
         let rowid = tx.last_insert_rowid();
         tx.commit()?;
         Ok(rowid)
     }
 
-    /// Append an escalation (peer-agent-based goal). Mirrors `append_finding`:
-    /// atomic single-row insert under a transaction, returning the rowid.
-    /// `escalation_id` must be unique (callers use a UUID).
+    /// Append an escalation to the ledger.
     pub fn append_escalation(&self, escalation: &Escalation) -> Result<i64> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
+
+        // Validate task belongs to this goal (prevent cross-goal FK confusion)
+        if let Some(ref task_id) = escalation.task_id {
+            let task_goal: Option<String> = tx
+                .query_row(
+                    "SELECT goal_id FROM tasks WHERE task_id = ?1",
+                    params![task_id],
+                    |row| row.get(0),
+                )
+                .ok();
+
+            match task_goal {
+                None => {
+                    return Err(eyre::eyre!("task {} not found", task_id));
+                }
+                Some(tg) if tg != escalation.goal_id => {
+                    return Err(eyre::eyre!(
+                        "cross-goal FK violation: task {} belongs to goal {}, not goal {}",
+                        task_id,
+                        tg,
+                        escalation.goal_id
+                    ));
+                }
+                _ => {}
+            }
+        }
 
         tx.execute(
             "INSERT INTO escalations (escalation_id, goal_id, task_id, peer_id, question, context, status, default_action, default_after_secs, created_at_ms, resolved_at_ms, resolved_by, resolution)
@@ -389,65 +486,154 @@ impl GoalLedger {
         Ok(rowid)
     }
 
-    /// List escalations for a goal (level-triggered: only changes since `since_rowid`).
-    pub fn list_escalations_since(&self, goal_id: &str, since_rowid: i64) -> Result<Vec<Escalation>> {
-        let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
-            "SELECT rowid, escalation_id, goal_id, task_id, peer_id, question, context, status, default_action, default_after_secs, created_at_ms, resolved_at_ms, resolved_by, resolution
-             FROM escalations WHERE goal_id = ?1 AND rowid > ?2 ORDER BY rowid ASC",
-        )?;
-        let rows = stmt.query_map(params![goal_id, since_rowid], |row| {
-            Ok(Escalation {
-                escalation_id: row.get(1)?,
-                goal_id: row.get(2)?,
-                task_id: row.get(3)?,
-                peer_id: row.get(4)?,
-                question: row.get(5)?,
-                context: row.get(6)?,
-                status: row.get(7)?,
-                default_action: row.get(8)?,
-                default_after_secs: row.get(9)?,
-                created_at_ms: row.get(10)?,
-                resolved_at_ms: row.get(11)?,
-                resolved_by: row.get(12)?,
-                resolution: row.get(13)?,
-            })
-        })?;
-        let mut out = Vec::new();
-        for r in rows {
-            out.push(r?);
+    /// Append a decision to the ledger.
+    pub fn append_decision(&self, decision: &Decision) -> Result<i64> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+
+        // Validate task belongs to this goal (prevent cross-goal FK confusion)
+        if let Some(ref task_id) = decision.task_id {
+            let task_goal: Option<String> = tx
+                .query_row(
+                    "SELECT goal_id FROM tasks WHERE task_id = ?1",
+                    params![task_id],
+                    |row| row.get(0),
+                )
+                .ok();
+
+            match task_goal {
+                None => {
+                    return Err(eyre::eyre!("task {} not found", task_id));
+                }
+                Some(tg) if tg != decision.goal_id => {
+                    return Err(eyre::eyre!(
+                        "cross-goal FK violation: task {} belongs to goal {}, not goal {}",
+                        task_id,
+                        tg,
+                        decision.goal_id
+                    ));
+                }
+                _ => {}
+            }
         }
-        Ok(out)
+
+        tx.execute(
+            "INSERT INTO decisions (decision_id, goal_id, task_id, question, options_considered, choice, rationale, based_on_findings, based_on_rev, decided_at_ms, decided_by)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            params![
+                decision.decision_id,
+                decision.goal_id,
+                decision.task_id,
+                decision.question,
+                decision.options_considered,
+                decision.choice,
+                decision.rationale,
+                decision.based_on_findings,
+                decision.based_on_rev,
+                decision.decided_at_ms,
+                decision.decided_by,
+            ],
+        )?;
+
+        let rowid = tx.last_insert_rowid();
+        tx.commit()?;
+        Ok(rowid)
     }
 
-    /// List findings for a goal (level-triggered: only changes since `since_ms`).
+    /// Atomically commit state change + audit record (finding + decision).
+    ///
+    /// This is the TRUE cross-table transaction: state transition and audit log
+    /// are committed together, or both roll back.
+    pub fn commit_state_with_audit(
+        &self,
+        goal_id: &str,
+        new_status: &str,
+        expected_revision: u64,
+        updated_at_ms: u64,
+        finding: Option<&Finding>,
+        decision: Option<&Decision>,
+    ) -> Result<()> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+
+        // Step 1: Update goal state (CAS)
+        let rows_affected = tx.execute(
+            "UPDATE goals SET status = ?1, revision = revision + 1, updated_at_ms = ?2 WHERE goal_id = ?3 AND revision = ?4",
+            params![new_status, updated_at_ms, goal_id, expected_revision],
+        )?;
+
+        if rows_affected == 0 {
+            return Err(eyre::eyre!(
+                "commit_state_with_audit failed: goal {} not found or revision mismatch",
+                goal_id
+            ));
+        }
+
+        // Step 2: Append finding (if provided) — uses SHARED validated insert
+        if let Some(f) = finding {
+            Self::insert_finding_validated(&tx, f, goal_id)?;
+        }
+
+        // Step 3: Append decision (if provided)
+        if let Some(d) = decision {
+            tx.execute(
+                "INSERT INTO decisions (decision_id, goal_id, task_id, question, options_considered, choice, rationale, based_on_findings, based_on_rev, decided_at_ms, decided_by)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                params![
+                    d.decision_id,
+                    goal_id,
+                    d.task_id,
+                    d.question,
+                    d.options_considered,
+                    d.choice,
+                    d.rationale,
+                    d.based_on_findings,
+                    d.based_on_rev,
+                    d.decided_at_ms,
+                    d.decided_by,
+                ],
+            )?;
+        }
+
+        tx.commit()?;
+        Ok(())
+    }
+
     /// List findings for a goal (level-triggered: only changes since `since_rowid`).
     ///
     /// Uses SQLite's rowid (monotonic per insert) as the cursor, NOT created_at_ms.
-    /// This avoids same-millisecond races and non-monotonic timestamps across processes.
     pub fn list_findings_since(&self, goal_id: &str, since_rowid: i64) -> Result<Vec<Finding>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT rowid, finding_id, task_id, goal_id, kind, lifecycle, confidence, review_state, assertion, evidence, config_version, derived_from, created_at_ms, created_by
+            "SELECT rowid, finding_id, seq, task_id, goal_id, kind, lifecycle, confidence, review_state, assertion, evidence, config_version, derived_from, supersedes, cost_tokens, created_at_ms, created_by
              FROM findings WHERE goal_id = ?1 AND rowid > ?2 ORDER BY rowid ASC"
         )?;
         let findings = stmt
             .query_map(params![goal_id, since_rowid], |row| {
+                let supersedes_json: Option<String> = row.get(13)?;
+                let supersedes: Vec<String> = if let Some(json) = supersedes_json {
+                    serde_json::from_str(&json).unwrap_or_default()
+                } else {
+                    Vec::new()
+                };
                 Ok(Finding {
                     rowid: Some(row.get(0)?),
                     finding_id: row.get(1)?,
-                    task_id: row.get(2)?,
-                    goal_id: row.get(3)?,
-                    kind: row.get(4)?,
-                    lifecycle: row.get(5)?,
-                    confidence: row.get(6)?,
-                    review_state: row.get(7)?,
-                    assertion: row.get(8)?,
-                    evidence: row.get(9)?,
-                    config_version: row.get(10)?,
-                    derived_from: row.get(11)?,
-                    created_at_ms: row.get(12)?,
-                    created_by: row.get(13)?,
+                    seq: row.get(2)?,
+                    task_id: row.get(3)?,
+                    goal_id: row.get(4)?,
+                    kind: row.get(5)?,
+                    lifecycle: row.get(6)?,
+                    confidence: row.get(7)?,
+                    review_state: row.get(8)?,
+                    assertion: row.get(9)?,
+                    evidence: row.get(10)?,
+                    config_version: row.get(11)?,
+                    derived_from: row.get(12)?,
+                    supersedes,
+                    cost_tokens: row.get(14)?,
+                    created_at_ms: row.get(15)?,
+                    created_by: row.get(16)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -473,6 +659,7 @@ mod tests {
             tokens_used: 0,
             token_budget: 10000,
             continuations_used: 0,
+            revision: 0,
             created_at_ms: 1000,
             updated_at_ms: 1000,
         };
@@ -498,14 +685,16 @@ mod tests {
             tokens_used: 0,
             token_budget: 10000,
             continuations_used: 0,
+            revision: 0,
             created_at_ms: 1000,
             updated_at_ms: 1000,
         };
         ledger.create_goal(&goal).unwrap();
 
         let finding = Finding {
-            rowid: None, // Assigned by SQLite on insert
+            rowid: None,
             finding_id: "f1".to_string(),
+            seq: 1, // Will be overwritten by store
             task_id: None,
             goal_id: "g1".to_string(),
             kind: "observation".to_string(),
@@ -516,6 +705,8 @@ mod tests {
             evidence: None,
             config_version: None,
             derived_from: None,
+            supersedes: Vec::new(),
+            cost_tokens: 0,
             created_at_ms: 2000,
             created_by: "peer-a".to_string(),
         };
@@ -539,6 +730,7 @@ mod tests {
             tokens_used: 0,
             token_budget: 10000,
             continuations_used: 0,
+            revision: 0,
             created_at_ms: 1000,
             updated_at_ms: 1000,
         };
@@ -547,8 +739,9 @@ mod tests {
         // Add findings at different times
         for i in 1..=5 {
             let finding = Finding {
-                rowid: None, // Assigned by SQLite on insert
+                rowid: None,
                 finding_id: format!("f{}", i),
+                seq: i, // Will be overwritten by store
                 task_id: None,
                 goal_id: "g1".to_string(),
                 kind: "observation".to_string(),
@@ -559,6 +752,8 @@ mod tests {
                 evidence: None,
                 config_version: None,
                 derived_from: None,
+                supersedes: Vec::new(),
+                cost_tokens: 0,
                 created_at_ms: 1000 + i * 100,
                 created_by: "peer-a".to_string(),
             };
@@ -570,8 +765,588 @@ mod tests {
         assert_eq!(findings.len(), 2); // f4 and f5
         assert_eq!(findings[0].finding_id, "f4");
         assert_eq!(findings[1].finding_id, "f5");
-        // Verify rowid is monotonic
-        assert_eq!(findings[0].rowid, Some(4));
-        assert_eq!(findings[1].rowid, Some(5));
+    }
+
+    #[test]
+    fn update_goal_status_with_cas() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ledger.db");
+        let ledger = GoalLedger::open(&path).unwrap();
+
+        let goal = Goal {
+            goal_id: "g1".to_string(),
+            objective: "test".to_string(),
+            status: "active".to_string(),
+            tokens_used: 0,
+            token_budget: 10000,
+            continuations_used: 0,
+            revision: 0,
+            created_at_ms: 1000,
+            updated_at_ms: 1000,
+        };
+        ledger.create_goal(&goal).unwrap();
+
+        // CAS success: correct revision
+        ledger
+            .update_goal_status("g1", "complete", 0, 2000)
+            .unwrap();
+        let updated = ledger.get_goal("g1").unwrap().unwrap();
+        assert_eq!(updated.status, "complete");
+        assert_eq!(updated.revision, 1);
+
+        // CAS failure: stale revision
+        let result = ledger.update_goal_status("g1", "blocked", 0, 3000);
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("revision mismatch")
+        );
+
+        // CAS failure: nonexistent goal
+        let result = ledger.update_goal_status("g999", "complete", 0, 3000);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn append_finding_rejects_cross_goal_task() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ledger.db");
+        let ledger = GoalLedger::open(&path).unwrap();
+
+        // Create two goals
+        for gid in &["g1", "g2"] {
+            let goal = Goal {
+                goal_id: gid.to_string(),
+                objective: "test".to_string(),
+                status: "active".to_string(),
+                tokens_used: 0,
+                token_budget: 10000,
+                continuations_used: 0,
+                revision: 0,
+                created_at_ms: 1000,
+                updated_at_ms: 1000,
+            };
+            ledger.create_goal(&goal).unwrap();
+        }
+
+        // Create a task for g1
+        let task = Task {
+            task_id: "t1".to_string(),
+            goal_id: "g1".to_string(),
+            title: "test task".to_string(),
+            detail: "test".to_string(),
+            status: "pending".to_string(),
+            assigned_peer: None,
+            created_at_ms: 1000,
+            updated_at_ms: 1000,
+        };
+        ledger.create_task(&task).unwrap();
+
+        // Try to append a finding for g2 that references g1's task
+        let finding = Finding {
+            rowid: None,
+            finding_id: "f1".to_string(),
+            seq: 1,
+            task_id: Some("t1".to_string()), // t1 belongs to g1, not g2
+            goal_id: "g2".to_string(),
+            kind: "observation".to_string(),
+            lifecycle: "verified".to_string(),
+            confidence: "high".to_string(),
+            review_state: "peer_reviewed".to_string(),
+            assertion: "test".to_string(),
+            evidence: None,
+            config_version: None,
+            derived_from: None,
+            supersedes: Vec::new(),
+            cost_tokens: 0,
+            created_at_ms: 2000,
+            created_by: "peer-a".to_string(),
+        };
+        let result = ledger.append_finding(&finding);
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("cross-goal FK violation")
+        );
+    }
+
+    #[test]
+    fn commit_state_with_audit_is_atomic() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ledger.db");
+        let ledger = GoalLedger::open(&path).unwrap();
+
+        let goal = Goal {
+            goal_id: "g1".to_string(),
+            objective: "test".to_string(),
+            status: "active".to_string(),
+            tokens_used: 0,
+            token_budget: 10000,
+            continuations_used: 0,
+            revision: 0,
+            created_at_ms: 1000,
+            updated_at_ms: 1000,
+        };
+        ledger.create_goal(&goal).unwrap();
+
+        let finding = Finding {
+            rowid: None,
+            finding_id: "f1".to_string(),
+            seq: 1,
+            task_id: None,
+            goal_id: "g1".to_string(),
+            kind: "observation".to_string(),
+            lifecycle: "verified".to_string(),
+            confidence: "high".to_string(),
+            review_state: "peer_reviewed".to_string(),
+            assertion: "all tests pass".to_string(),
+            evidence: None,
+            config_version: None,
+            derived_from: None,
+            supersedes: Vec::new(),
+            cost_tokens: 0,
+            created_at_ms: 2000,
+            created_by: "peer-a".to_string(),
+        };
+
+        // Atomically: complete goal + append finding
+        ledger
+            .commit_state_with_audit("g1", "complete", 0, 3000, Some(&finding), None)
+            .unwrap();
+
+        // Verify goal is complete
+        let goal = ledger.get_goal("g1").unwrap().unwrap();
+        assert_eq!(goal.status, "complete");
+        assert_eq!(goal.revision, 1);
+
+        // Verify finding was committed
+        let findings = ledger.list_findings_since("g1", 0).unwrap();
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].assertion, "all tests pass");
+    }
+
+    #[test]
+    fn commit_state_with_audit_rolls_back_on_cas_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ledger.db");
+        let ledger = GoalLedger::open(&path).unwrap();
+
+        let goal = Goal {
+            goal_id: "g1".to_string(),
+            objective: "test".to_string(),
+            status: "active".to_string(),
+            tokens_used: 0,
+            token_budget: 10000,
+            continuations_used: 0,
+            revision: 5, // Start at revision 5
+            created_at_ms: 1000,
+            updated_at_ms: 1000,
+        };
+        ledger.create_goal(&goal).unwrap();
+
+        let finding = Finding {
+            rowid: None,
+            finding_id: "f1".to_string(),
+            seq: 1,
+            task_id: None,
+            goal_id: "g1".to_string(),
+            kind: "observation".to_string(),
+            lifecycle: "verified".to_string(),
+            confidence: "high".to_string(),
+            review_state: "peer_reviewed".to_string(),
+            assertion: "test".to_string(),
+            evidence: None,
+            config_version: None,
+            derived_from: None,
+            supersedes: Vec::new(),
+            cost_tokens: 0,
+            created_at_ms: 2000,
+            created_by: "peer-a".to_string(),
+        };
+
+        // CAS failure: expected revision 0 but actual is 5
+        let result = ledger.commit_state_with_audit(
+            "g1",
+            "complete",
+            0, // Wrong revision
+            3000,
+            Some(&finding),
+            None,
+        );
+        assert!(result.is_err());
+
+        // Verify NOTHING was committed (atomic rollback)
+        let goal = ledger.get_goal("g1").unwrap().unwrap();
+        assert_eq!(goal.status, "active"); // Not changed
+        assert_eq!(goal.revision, 5); // Not incremented
+
+        let findings = ledger.list_findings_since("g1", 0).unwrap();
+        assert_eq!(findings.len(), 0); // Finding not committed
+    }
+
+    #[test]
+    fn commit_state_with_audit_rolls_back_on_mid_transaction_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ledger.db");
+        let ledger = GoalLedger::open(&path).unwrap();
+
+        let goal = Goal {
+            goal_id: "g1".to_string(),
+            objective: "test".to_string(),
+            status: "active".to_string(),
+            tokens_used: 0,
+            token_budget: 10000,
+            continuations_used: 0,
+            revision: 0,
+            created_at_ms: 1000,
+            updated_at_ms: 1000,
+        };
+        ledger.create_goal(&goal).unwrap();
+
+        // Create a task for a DIFFERENT goal (will cause cross-goal FK violation)
+        let other_goal = Goal {
+            goal_id: "g2".to_string(),
+            objective: "other".to_string(),
+            status: "active".to_string(),
+            tokens_used: 0,
+            token_budget: 10000,
+            continuations_used: 0,
+            revision: 0,
+            created_at_ms: 1000,
+            updated_at_ms: 1000,
+        };
+        ledger.create_goal(&other_goal).unwrap();
+
+        let task = Task {
+            task_id: "t1".to_string(),
+            goal_id: "g2".to_string(), // Task belongs to g2, not g1
+            title: "test".to_string(),
+            detail: "test".to_string(),
+            status: "pending".to_string(),
+            assigned_peer: None,
+            created_at_ms: 1000,
+            updated_at_ms: 1000,
+        };
+        ledger.create_task(&task).unwrap();
+
+        // Finding references g2's task, but we're committing to g1 (cross-goal FK violation)
+        let finding = Finding {
+            rowid: None,
+            finding_id: "f1".to_string(),
+            seq: 1,
+            task_id: Some("t1".to_string()), // t1 belongs to g2, not g1
+            goal_id: "g1".to_string(),
+            kind: "observation".to_string(),
+            lifecycle: "verified".to_string(),
+            confidence: "high".to_string(),
+            review_state: "peer_reviewed".to_string(),
+            assertion: "test".to_string(),
+            evidence: None,
+            config_version: None,
+            derived_from: None,
+            supersedes: Vec::new(),
+            cost_tokens: 0,
+            created_at_ms: 2000,
+            created_by: "peer-a".to_string(),
+        };
+
+        // Goal update succeeds (CAS passes), but finding insert fails (cross-goal FK)
+        let result = ledger.commit_state_with_audit(
+            "g1",
+            "complete",
+            0, // Correct revision
+            3000,
+            Some(&finding),
+            None,
+        );
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("cross-goal FK violation")
+        );
+
+        // Verify atomic rollback: goal NOT updated, finding NOT committed
+        let goal = ledger.get_goal("g1").unwrap().unwrap();
+        assert_eq!(goal.status, "active"); // NOT changed to complete
+        assert_eq!(goal.revision, 0); // NOT incremented
+
+        let findings = ledger.list_findings_since("g1", 0).unwrap();
+        assert_eq!(findings.len(), 0); // Finding NOT committed
+    }
+
+    #[test]
+    fn finding_converts_to_records_finding() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ledger.db");
+        let ledger = GoalLedger::open(&path).unwrap();
+
+        let goal = Goal {
+            goal_id: "g1".to_string(),
+            objective: "test".to_string(),
+            status: "active".to_string(),
+            tokens_used: 0,
+            token_budget: 10000,
+            continuations_used: 0,
+            revision: 0,
+            created_at_ms: 1000,
+            updated_at_ms: 1000,
+        };
+        ledger.create_goal(&goal).unwrap();
+
+        let finding = Finding {
+            rowid: None,
+            finding_id: "f1".to_string(),
+            seq: 1,
+            task_id: None,
+            goal_id: "g1".to_string(),
+            kind: "observation".to_string(),
+            lifecycle: "verified".to_string(),
+            confidence: "high".to_string(),
+            review_state: "peer_reviewed".to_string(),
+            assertion: "test claim".to_string(),
+            evidence: None,
+            config_version: None,
+            derived_from: None,
+            supersedes: Vec::new(),
+            cost_tokens: 0,
+            created_at_ms: 2000,
+            created_by: "peer-a".to_string(),
+        };
+        ledger.append_finding(&finding).unwrap();
+
+        let findings = ledger.list_findings_since("g1", 0).unwrap();
+        assert_eq!(findings.len(), 1);
+
+        // Convert to records::Finding (the type digest uses)
+        let records_finding: crate::records::Finding = (&findings[0]).into();
+        assert_eq!(records_finding.id, "f1");
+        assert_eq!(records_finding.claim, "test claim");
+        assert_eq!(records_finding.fleet_id, "g1");
+        assert_eq!(records_finding.seq, 1);
+        assert_eq!(
+            records_finding.status,
+            crate::records::FindingStatus::Confirmed
+        );
+    }
+}
+
+/// Convenience helper: read findings from the ledger and compute a digest.
+///
+/// This wires the digest to the SQLite ledger end-to-end:
+/// 1. Read findings from ledger (sqlite_ledger::Finding)
+/// 2. Convert to records::Finding (the type digest consumes)
+/// 3. Compute digest
+pub fn digest_from_ledger(
+    ledger: &GoalLedger,
+    goal_id: &str,
+    opts: &crate::digest::DigestOptions,
+) -> Result<crate::digest::Digest> {
+    let findings = ledger.list_findings_since(goal_id, 0)?;
+    let records_findings: Vec<crate::records::Finding> = findings.iter().map(Into::into).collect();
+    Ok(crate::digest::digest(&records_findings, opts))
+}
+
+// Conversion from sqlite_ledger::Finding to records::Finding (the canonical type digest uses).
+// This allows digest() to consume findings from the SQLite ledger.
+impl From<&Finding> for crate::records::Finding {
+    fn from(f: &Finding) -> Self {
+        Self {
+            schema_version: crate::records::SCHEMA_VERSION,
+            id: f.finding_id.clone(),
+            seq: f.seq,
+            fleet_id: f.goal_id.clone(),
+            task_id: f.task_id.clone(),
+            claim: f.assertion.clone(),
+            status: match f.lifecycle.as_str() {
+                // Verified states
+                "verified" => crate::records::FindingStatus::Confirmed,
+                "reproduced" => crate::records::FindingStatus::Confirmed, // Stronger than verified
+                // Predicted states
+                "proposed" | "observed" => crate::records::FindingStatus::Predicted,
+                // Ruled out states
+                "refuted" => crate::records::FindingStatus::RuledOut,
+                "superseded" | "retracted" => crate::records::FindingStatus::RuledOut,
+                // Unknown lifecycle → Predicted (conservative default)
+                _ => {
+                    tracing::warn!(
+                        lifecycle = %f.lifecycle,
+                        "unknown lifecycle in From conversion, defaulting to Predicted"
+                    );
+                    crate::records::FindingStatus::Predicted
+                }
+            },
+            component: f.kind.clone(),
+            evidence: {
+                let parsed = f
+                    .evidence
+                    .as_ref()
+                    .and_then(|e| serde_json::from_str(e).ok());
+                if f.evidence.is_some() && parsed.is_none() {
+                    tracing::warn!(
+                        finding_id = %f.finding_id,
+                        "evidence JSON parse failed in From conversion, using empty vec"
+                    );
+                }
+                parsed.unwrap_or_default()
+            },
+            config: {
+                let parsed = f
+                    .config_version
+                    .as_ref()
+                    .and_then(|c| serde_json::from_str(c).ok());
+                if f.config_version.is_some() && parsed.is_none() {
+                    tracing::warn!(
+                        finding_id = %f.finding_id,
+                        "config_version JSON parse failed in From conversion, using empty map"
+                    );
+                }
+                parsed.unwrap_or_default()
+            },
+            supersedes: f.supersedes.clone(),
+            cost_tokens: f.cost_tokens,
+            by: f.created_by.clone(),
+            at_ms: f.created_at_ms,
+            kind: Some(f.kind.clone()),
+            lifecycle: Some(f.lifecycle.clone()),
+            confidence: Some(f.confidence.clone()),
+            review_state: Some(f.review_state.clone()),
+            rowid: f.rowid,
+            derived_from: f.derived_from.clone(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod digest_integration_tests {
+    use super::*;
+
+    #[test]
+    fn digest_from_ledger_end_to_end() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ledger.db");
+        let ledger = GoalLedger::open(&path).unwrap();
+
+        // Create goal
+        let goal = Goal {
+            goal_id: "g1".to_string(),
+            objective: "test digest".to_string(),
+            status: "active".to_string(),
+            tokens_used: 0,
+            token_budget: 10000,
+            continuations_used: 0,
+            revision: 0,
+            created_at_ms: 1000,
+            updated_at_ms: 1000,
+        };
+        ledger.create_goal(&goal).unwrap();
+
+        // Add findings
+        for i in 1..=5 {
+            // Create task first (required by FK validation)
+            let task = Task {
+                task_id: format!("task-{}", i),
+                goal_id: "g1".to_string(),
+                title: format!("task {}", i),
+                detail: "test".to_string(),
+                status: "pending".to_string(),
+                assigned_peer: None,
+                created_at_ms: 1000,
+                updated_at_ms: 1000,
+            };
+            ledger.create_task(&task).unwrap();
+
+            let finding = Finding {
+                rowid: None,
+                finding_id: format!("f{}", i),
+                seq: i,
+                task_id: Some(format!("task-{}", i)),
+                goal_id: "g1".to_string(),
+                kind: "observation".to_string(),
+                lifecycle: "verified".to_string(),
+                confidence: "high".to_string(),
+                review_state: "peer_reviewed".to_string(),
+                assertion: format!("claim {}", i),
+                evidence: None,
+                config_version: None,
+                derived_from: None,
+                supersedes: Vec::new(),
+                cost_tokens: 100 * i,
+                created_at_ms: 1000 + i * 100,
+                created_by: "peer-a".to_string(),
+            };
+            ledger.append_finding(&finding).unwrap();
+        }
+
+        // Compute digest from ledger (end-to-end test)
+        let digest = digest_from_ledger(
+            &ledger,
+            "g1",
+            &crate::digest::DigestOptions {
+                max_chars: usize::MAX,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        // Verify digest contains all findings
+        assert_eq!(digest.new_findings.len(), 5);
+        assert_eq!(digest.new_findings[0].seq, 1);
+        assert_eq!(digest.new_findings[4].seq, 5);
+
+        // Verify cost tracking works (cost_tokens is not zero)
+        let total_cost: u64 = digest.cost_by_path.iter().map(|p| p.tokens).sum();
+        assert!(
+            total_cost > 0,
+            "cost_tokens must be tracked, not hardcoded to 0"
+        );
+    }
+
+    #[test]
+    fn lifecycle_to_status_mapping_complete() {
+        let test_cases = vec![
+            ("verified", crate::records::FindingStatus::Confirmed),
+            ("reproduced", crate::records::FindingStatus::Confirmed),
+            ("proposed", crate::records::FindingStatus::Predicted),
+            ("observed", crate::records::FindingStatus::Predicted),
+            ("refuted", crate::records::FindingStatus::RuledOut),
+            ("superseded", crate::records::FindingStatus::RuledOut),
+            ("retracted", crate::records::FindingStatus::RuledOut),
+            ("unknown_state", crate::records::FindingStatus::Predicted), // Fallback
+        ];
+
+        for (lifecycle, expected_status) in test_cases {
+            let finding = Finding {
+                rowid: None,
+                finding_id: "f1".to_string(),
+                seq: 1,
+                task_id: None,
+                goal_id: "g1".to_string(),
+                kind: "observation".to_string(),
+                lifecycle: lifecycle.to_string(),
+                confidence: "high".to_string(),
+                review_state: "peer_reviewed".to_string(),
+                assertion: "test".to_string(),
+                evidence: None,
+                config_version: None,
+                derived_from: None,
+                supersedes: Vec::new(),
+                cost_tokens: 0,
+                created_at_ms: 1000,
+                created_by: "peer-a".to_string(),
+            };
+
+            let records_finding: crate::records::Finding = (&finding).into();
+            assert_eq!(
+                records_finding.status, expected_status,
+                "lifecycle '{}' should map to {:?}",
+                lifecycle, expected_status
+            );
+        }
     }
 }

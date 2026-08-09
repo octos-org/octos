@@ -9,7 +9,7 @@
 
 use octos_core::SessionKey;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 use crate::grant::WorkerGrant;
 
@@ -488,18 +488,28 @@ pub struct Finding {
 
     pub by: String,
     pub at_ms: u64,
-}
 
-/// Ids overturned by some later finding in `findings`.
-///
-/// Derived rather than stored: marking the old record would be a mutation,
-/// and mutation is the only thing that would force this table to carry the
-/// revision fencing the rest of the kernel needs.
-pub fn superseded_ids(findings: &[Finding]) -> BTreeSet<String> {
-    findings
-        .iter()
-        .flat_map(|f| f.supersedes.iter().cloned())
-        .collect()
+    // Additional fields from SQLite ledger schema (#1941)
+    /// Finding kind (observation | hypothesis | diagnosis | constraint | experiment_result).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    /// Lifecycle state (proposed | observed | reproduced | verified | refuted | superseded).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lifecycle: Option<String>,
+    /// Confidence level (high | medium | low).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confidence: Option<String>,
+    /// Review state (unreviewed | peer_reviewed | independently_reproduced).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review_state: Option<String>,
+
+    // SQLite ledger fields (#1941)
+    /// SQLite rowid (assigned on insert, never changes).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rowid: Option<i64>,
+    /// Derived from (JSON array of finding_ids).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub derived_from: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -562,6 +572,18 @@ pub(crate) fn decode_row<T: serde::de::DeserializeOwned>(json: &str) -> eyre::Re
         return Ok(None);
     }
     Ok(Some(serde_json::from_str(json)?))
+}
+
+/// Ids overturned by some later finding in `findings`.
+///
+/// Derived rather than stored: marking the old record would be a mutation,
+/// and mutation is the only thing that would force this table to carry the
+/// revision fencing the rest of the kernel needs.
+pub fn superseded_ids(findings: &[Finding]) -> std::collections::BTreeSet<String> {
+    findings
+        .iter()
+        .flat_map(|f| f.supersedes.iter().cloned())
+        .collect()
 }
 
 #[cfg(test)]

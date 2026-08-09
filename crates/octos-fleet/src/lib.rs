@@ -41,19 +41,15 @@
 
 #![deny(unsafe_code)]
 
-mod evidence_audit;
+mod digest;
 mod fleet;
-mod goal_roles;
 mod grant;
 mod records;
-mod rehydration;
 mod sqlite_ledger;
 mod store;
-mod typed_mailbox;
 
-pub use evidence_audit::{ReAuditResult, re_audit_evidence};
+pub use digest::{Digest, DigestFinding, DigestOptions, digest};
 pub use fleet::{Fleet, FleetSummary, FleetView, PlanEdit, PlanGraphError, TaskSpec, TaskView};
-pub use goal_roles::{GoalRole, PeerAgent};
 pub use grant::{
     BASE_TOOLS, FsGrant, GRANTABLE_TOOLS, GrantError, NetworkGrant, WEB_TOOLS, WorkerGrant,
 };
@@ -63,10 +59,10 @@ pub use records::{
     FleetBudget, FleetChildRecord, FleetEventKind, FleetRecord, FleetStatus, Lease, OutboxEvent,
     PlanTask, SCHEMA_VERSION, Verifier, WorkerKind,
 };
-pub use rehydration::{PeerMemory, rehydrate_peer};
-pub use sqlite_ledger::{Decision, Escalation, Finding, Goal, GoalLedger, Task};
+pub use sqlite_ledger::{
+    Decision, Escalation, Finding, Goal, GoalLedger, Task, digest_from_ledger,
+};
 pub use store::{
     AckOutcome, CompleteOutcome, DenyEscalationOutcome, FleetKernelStore, FleetSnapshot,
     InterruptedAttempt, LaunchOutcome, MarkRunningOutcome, PlanMutateOutcome, ReconcileReport,
 };
-pub use typed_mailbox::{MailboxMessage, TypedMailbox};

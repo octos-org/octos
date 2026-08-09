@@ -617,6 +617,7 @@ fn build_node(id: &str, attrs: &HashMap<String, String>) -> PipelineNode {
         model: attrs.get("model").cloned(),
         context_window: attrs.get("context_window").and_then(|s| s.parse().ok()),
         max_output_tokens: attrs.get("max_output_tokens").and_then(|s| s.parse().ok()),
+        max_iterations: attrs.get("max_iterations").and_then(|s| s.parse().ok()),
         tools,
         goal_gate: attrs
             .get("goal_gate")
@@ -853,6 +854,41 @@ mod tests {
         let graph = parse_dot(dot).unwrap();
         assert_eq!(graph.nodes.len(), 2);
         assert_eq!(graph.edges.len(), 1);
+    }
+
+    #[test]
+    fn test_parse_max_iterations_override() {
+        // Regression: a synthesis node that reads many files needs more than
+        // the pipeline's default 30-iteration budget (deep_research analyze
+        // timeout). The DOT attr must parse and reach PipelineNode.
+        let dot = r#"
+            digraph test {
+                analyze [prompt="synthesize", tools="read_file", max_iterations="80"]
+                plain [prompt="hi"]
+            }
+        "#;
+        let graph = parse_dot(dot).unwrap();
+        assert_eq!(graph.nodes["analyze"].max_iterations, Some(80));
+        // Unset stays None so the handler applies the pipeline default.
+        assert_eq!(graph.nodes["plain"].max_iterations, None);
+    }
+
+    #[test]
+    fn deep_research_analyze_has_raised_iteration_budget() {
+        // The bundled deep_research pipeline's analyze node must carry a
+        // raised iteration budget or it exhausts the default 30 navigating
+        // findings files and never reaches synthesize (no artifact).
+        let dot = include_str!("../../octos-agent/src/assets/pipelines/deep_research.dot");
+        let graph = parse_dot(dot).unwrap();
+        let analyze = graph
+            .nodes
+            .get("analyze")
+            .expect("deep_research has an analyze node");
+        assert!(
+            analyze.max_iterations.unwrap_or(0) >= 60,
+            "analyze must have a raised iteration budget, got {:?}",
+            analyze.max_iterations
+        );
     }
 
     #[test]
