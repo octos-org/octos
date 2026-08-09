@@ -15124,13 +15124,6 @@ fn write_peer_result_if_peer_session(
             // Best-effort: if the wake channel is unavailable (e.g. master
             // session is offline), the ledger row above is still durable —
             // the master will see the finding on its next `goal_get`.
-            let wake_message = format!(
-                "[peer-goal] peer `{slug}` completed turn {turn_count} with outcome `{outcome_str}` \
-                 for goal `{goal_id}`{}",
-                task_id
-                    .map(|t| format!(" (task `{t}`)"))
-                    .unwrap_or_default()
-            );
             tracing::info!(
                 slug,
                 goal_id,
@@ -15143,10 +15136,16 @@ fn write_peer_result_if_peer_session(
             // session. This is the same mechanism used for peer parking /
             // approval wakes — it surfaces as a system message on the
             // master's next turn.
+            let content_summary: String = body.chars().take(400).collect();
             if let Err(err) = enqueue_goal_progress_wake(
                 &runtime.data_dir,
                 &originator,
-                &wake_message,
+                goal_id,
+                slug,
+                turn_count,
+                outcome_str,
+                &content_summary,
+                profile_id,
             ) {
                 tracing::warn!(
                     ?err,
@@ -15174,7 +15173,12 @@ fn write_peer_result_if_peer_session(
 fn enqueue_goal_progress_wake(
     data_dir: &std::path::Path,
     originator_session: &str,
-    message: &str,
+    goal_id: &str,
+    peer_slug: &str,
+    turn_count: u32,
+    outcome: &str,
+    content_summary: &str,
+    profile_id: &str,
 ) -> Result<(), String> {
     let safe_session = hash_session_for_inbox(originator_session);
     let inbox_dir = data_dir.join("inbox");
@@ -15185,6 +15189,9 @@ fn enqueue_goal_progress_wake(
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
+    let message = format!(
+        "[peer-goal] peer `{peer_slug}` completed turn {turn_count} with outcome `{outcome}` for goal `{goal_id}`"
+    );
     let line = format!("{timestamp} {message}\n");
     // flock (shared) on a STABLE lockfile before appending: the reader takes
     // an exclusive lock on the SAME lockfile before renaming `.notes`, so
@@ -15221,6 +15228,21 @@ fn enqueue_goal_progress_wake(
             .map_err(|e| format!("failed to append wake note {}: {e}", note_path.display()))
     })();
     let _ = lock_file.unlock();
+    // Durable note is written; now ALSO enqueue a REAL master continuation
+    // so the master's actor loop fires immediately (codex PR review #2:
+    // previously this was only an append, not a true wake). Best-effort:
+    // if the continuation enqueue fails (e.g. master session offline), the
+    // durable note above is still readable on the master's next turn.
+    let master_key = SessionKey(originator_session.to_owned());
+    let _ = default_agent_orchestrator().enqueue_goal_progress_continuation(
+        &master_key,
+        profile_id,
+        goal_id,
+        peer_slug,
+        turn_count,
+        outcome,
+        content_summary,
+    );
     result
 }
 

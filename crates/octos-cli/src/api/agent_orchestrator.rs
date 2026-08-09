@@ -249,6 +249,11 @@ pub(crate) struct FleetKeeperSeed {
 /// master to `peer_list` → `peer_respond`. Sibling of the fleet-synthesis wake;
 /// flows through the same hardened `External` drain path.
 pub(crate) const PEER_AWAITING_INPUT_EXTERNAL_KIND: &str = "peer_awaiting_input";
+
+/// Peer-agent-based goal: external continuation kind for goal-progress wakes
+/// (a goal-scoped peer completed a turn → wake the master so it sees the
+/// finding WITHOUT waiting for the next scheduled goal turn).
+pub(crate) const GOAL_PROGRESS_EXTERNAL_KIND: &str = "goal_progress";
 /// Metadata key carrying the parked peer's slug (names the peer in the nudge).
 pub(crate) const PEER_AWAITING_INPUT_META_SLUG: &str = "peer_awaiting_input_slug";
 /// Metadata key carrying the park kind — `"approval"` or `"question"`.
@@ -2832,6 +2837,47 @@ impl InProcessAgentOrchestrator {
         state.continuations.enqueue(request)
     }
 
+    /// Peer-agent-based goal: enqueue a MASTER continuation when a goal-scoped
+    /// peer completes a turn. This is the "real wake" codex PR review #2
+    /// flagged — `enqueue_goal_progress_wake` previously only appended a
+    /// file, which the master reads on its NEXT turn (not a true wake). This
+    /// continuation fires the master's actor loop immediately (subject to
+    /// the scheduler's dedupe/rate-limit), so the master sees the finding
+    /// without waiting for its next scheduled goal turn.
+    ///
+    /// Dedupes on `(master_session, goal_id, peer_slug, turn_count)` so a
+    /// peer completing multiple turns in quick succession doesn't spam the
+    /// master (each turn gets its own wake, but a retry of the SAME turn
+    /// dedupes).
+    pub(crate) fn enqueue_goal_progress_continuation(
+        &self,
+        master_session: &SessionKey,
+        profile_id: &str,
+        goal_id: &str,
+        peer_slug: &str,
+        turn_count: u32,
+        outcome: &str,
+        content_summary: &str,
+    ) -> MasterContinuationEnqueueOutcome {
+        let request = MasterContinuationRequest::new(
+            PEER_AWAITING_INPUT_GROUP,
+            master_session.to_string(),
+            profile_id.to_owned(),
+            MasterContinuationReason::External(GOAL_PROGRESS_EXTERNAL_KIND.to_owned()),
+            SystemTime::now(),
+        )
+        .with_metadata("goal_id".to_owned(), goal_id.to_owned())
+        .with_metadata("peer_slug".to_owned(), peer_slug.to_owned())
+        .with_metadata("outcome".to_owned(), outcome.to_owned())
+        .with_metadata("content_summary".to_owned(), content_summary.to_owned())
+        .with_dedupe_key(format!(
+            "goal-progress:{}:{}:{}:{}",
+            master_session, goal_id, peer_slug, turn_count
+        ));
+        let mut state = self.state();
+        state.continuations.enqueue(request)
+    }
+
     /// codex #1 — true when peer `slug` (under `profile_id`) has a
     /// `peer_send_input` injection still QUEUED (a follow-up turn that has not
     /// run yet). Such a peer is NOT settled: the fleet-synthesis gate must not
@@ -3472,6 +3518,28 @@ impl InProcessAgentOrchestrator {
         let ledger_path = ledger_dir.join(format!("{}.db", sanitize_filename_for_ledger(goal_id)));
         let ledger = octos_fleet::GoalLedger::open(&ledger_path)
             .map_err(|e| format!("failed to open goal ledger {}: {e}", ledger_path.display()))?;
+        // FK constraint: findings reference goals(goal_id), so we must
+        // upsert the goal row BEFORE appending a finding. Without this,
+        // a fresh ledger would reject the append (codex PR review #3).
+        // We use a minimal goal stub (objective/status unknown at this
+        // layer; the master owns the authoritative record in the goal
+        // store). If the goal already exists, this is a no-op.
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let goal_stub = octos_fleet::Goal {
+            goal_id: goal_id.to_owned(),
+            objective: String::new(), // unknown at this layer; master owns it
+            status: "active".to_owned(),
+            tokens_used: 0,
+            token_budget: 0,
+            continuations_used: 0,
+            created_at_ms: now_ms,
+            updated_at_ms: now_ms,
+        };
+        // Ignore "already exists" errors (goal row already present).
+        let _ = ledger.create_goal(&goal_stub);
         let finding_id = format!("peer-{}-{}", peer_slug, uuid::Uuid::now_v7());
         let finding = octos_fleet::Finding {
             rowid: None,
@@ -3542,6 +3610,24 @@ impl InProcessAgentOrchestrator {
         let ledger_path = ledger_dir.join(format!("{}.db", sanitize_filename_for_ledger(goal_id)));
         let ledger = octos_fleet::GoalLedger::open(&ledger_path)
             .map_err(|e| format!("failed to open goal ledger {}: {e}", ledger_path.display()))?;
+        // FK constraint: escalations reference goals(goal_id), so we must
+        // upsert the goal row BEFORE appending an escalation (codex PR
+        // review #3). Same minimal-stub pattern as findings above.
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let goal_stub = octos_fleet::Goal {
+            goal_id: goal_id.to_owned(),
+            objective: String::new(),
+            status: "active".to_owned(),
+            tokens_used: 0,
+            token_budget: 0,
+            continuations_used: 0,
+            created_at_ms: now_ms,
+            updated_at_ms: now_ms,
+        };
+        let _ = ledger.create_goal(&goal_stub);
         let escalation_id = format!("esc-{}-{}", peer_slug, uuid::Uuid::now_v7());
         let escalation = octos_fleet::Escalation {
             escalation_id: escalation_id.clone(),
