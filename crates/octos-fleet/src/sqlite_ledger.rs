@@ -219,6 +219,28 @@ impl GoalLedger {
         Ok(())
     }
 
+    /// Create a task row (FK target for findings/escalations with task_id).
+    /// Mirrors `create_goal`: INSERT-only, callers ignore "already exists"
+    /// errors for idempotent upsert semantics.
+    pub fn create_task(&self, task: &Task) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO tasks (task_id, goal_id, title, detail, status, assigned_peer, created_at_ms, updated_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                task.task_id,
+                task.goal_id,
+                task.title,
+                task.detail,
+                task.status,
+                task.assigned_peer,
+                task.created_at_ms,
+                task.updated_at_ms,
+            ],
+        )?;
+        Ok(())
+    }
+
     /// Get a goal by ID.
     pub fn get_goal(&self, goal_id: &str) -> Result<Option<Goal>> {
         let conn = self.conn.lock().unwrap();

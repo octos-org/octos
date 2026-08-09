@@ -3540,6 +3540,22 @@ impl InProcessAgentOrchestrator {
         };
         // Ignore "already exists" errors (goal row already present).
         let _ = ledger.create_goal(&goal_stub);
+        // FK constraint: findings with task_id reference tasks(task_id), so
+        // we must ALSO upsert a task stub when task_id is Some (codex PR
+        // review merge blocker). Same minimal-stub pattern as goals above.
+        if let Some(task_id_str) = task_id {
+            let task_stub = octos_fleet::Task {
+                task_id: task_id_str.to_owned(),
+                goal_id: goal_id.to_owned(),
+                title: String::new(), // unknown at this layer
+                detail: String::new(),
+                status: "running".to_owned(),
+                assigned_peer: Some(peer_slug.to_owned()),
+                created_at_ms: now_ms,
+                updated_at_ms: now_ms,
+            };
+            let _ = ledger.create_task(&task_stub);
+        }
         let finding_id = format!("peer-{}-{}", peer_slug, uuid::Uuid::now_v7());
         let finding = octos_fleet::Finding {
             rowid: None,
@@ -3628,6 +3644,22 @@ impl InProcessAgentOrchestrator {
             updated_at_ms: now_ms,
         };
         let _ = ledger.create_goal(&goal_stub);
+        // FK constraint: escalations with task_id reference tasks(task_id),
+        // so we must ALSO upsert a task stub when task_id is Some (codex PR
+        // review merge blocker). Same minimal-stub pattern as findings above.
+        if let Some(task_id_str) = task_id {
+            let task_stub = octos_fleet::Task {
+                task_id: task_id_str.to_owned(),
+                goal_id: goal_id.to_owned(),
+                title: String::new(),
+                detail: String::new(),
+                status: "running".to_owned(),
+                assigned_peer: Some(peer_slug.to_owned()),
+                created_at_ms: now_ms,
+                updated_at_ms: now_ms,
+            };
+            let _ = ledger.create_task(&task_stub);
+        }
         let escalation_id = format!("esc-{}-{}", peer_slug, uuid::Uuid::now_v7());
         let escalation = octos_fleet::Escalation {
             escalation_id: escalation_id.clone(),
