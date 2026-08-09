@@ -452,6 +452,13 @@ pub struct Agent {
     /// of the peer's `goal` file; may be `None` even when `goal_id` is set
     /// (the master scoped the peer to a goal but no specific sub-task).
     pub(super) task_id: Option<String>,
+    /// The session that staged this peer (peer-agent-based goal). Captured
+    /// once at peer boot from `peers/<slug>/originator` and threaded into
+    /// `ToolContext::originator_session` so goal-aware tools can enforce
+    /// the goal-binding check WITHOUT re-reading the (mutable, symlink-
+    /// vulnerable) originator file on every call. `None` for non-peer
+    /// sessions.
+    pub(super) originator_session: Option<String>,
     /// Optional inference-time verifier plus structured TurnLedger. Absent
     /// by default so legacy agent loops do not spend verifier calls or write
     /// verifier sidecars unless a caller opts in explicitly.
@@ -559,6 +566,7 @@ impl Agent {
             session_scope: None,
             goal_id: None,
             task_id: None,
+            originator_session: None,
             verifier_config: None,
             voice_failure_sink: None,
             snapshot_manager: None,
@@ -639,6 +647,7 @@ impl Agent {
             session_scope: None,
             goal_id: None,
             task_id: None,
+            originator_session: None,
             verifier_config: None,
             voice_failure_sink: None,
             snapshot_manager: None,
@@ -985,6 +994,19 @@ impl Agent {
     /// The task id this agent runs under within its goal, if any.
     pub fn task_id(&self) -> Option<&str> {
         self.task_id.as_deref()
+    }
+
+    /// Builder: set the session that staged this peer. Called at peer boot
+    /// alongside [`Self::with_goal_id`] when the staged peer dir carries an
+    /// `originator` file.
+    pub fn with_originator_session(mut self, originator: String) -> Self {
+        self.originator_session = Some(originator);
+        self
+    }
+
+    /// The session that staged this peer, if any (peer sessions only).
+    pub fn originator_session(&self) -> Option<&str> {
+        self.originator_session.as_deref()
     }
 
     /// Guard C (issue #607): record this agent's spawn nesting depth so

@@ -327,6 +327,12 @@ pub struct ToolContext {
     /// `Agent::task_id`. May be `None` even when `goal_id` is set (the peer
     /// is goal-scoped but not task-scoped).
     pub task_id: Option<String>,
+    /// The session that staged this peer (peer-agent-based goal). Captured
+    /// at peer boot from `peers/<slug>/originator` and threaded through so
+    /// goal-aware tools (`goal_get` by-id, `model_goal_record_peer_finding`)
+    /// can enforce the goal-binding check WITHOUT re-reading the originator
+    /// file on every call. `None` for non-peer sessions.
+    pub originator_session: Option<String>,
     /// Post-edit formatting (issue #1774): when true, a successful
     /// `edit_file` / `write_file` / `diff_edit` runs the language formatter
     /// for the file (rustfmt / prettier / black / gofmt — see
@@ -383,6 +389,7 @@ impl ToolContext {
             session_scope: None,
             goal_id: None,
             task_id: None,
+            originator_session: None,
             format_after_edit: false,
         }
     }

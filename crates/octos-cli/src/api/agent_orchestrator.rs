@@ -3498,6 +3498,75 @@ impl InProcessAgentOrchestrator {
         Ok(finding_id)
     }
 
+    /// Peer-agent-based goal: record a peer escalation into the goal's
+    /// durable ledger. This is the WIRE for `append_escalation` — called
+    /// when a goal-scoped peer parks on `awaiting_input` (approval /
+    /// question / other). Mirrors the binding check in
+    /// [`Self::model_goal_record_peer_finding`]: the goal must be owned by
+    /// `originator_session` under `profile_id`, otherwise the write is
+    /// refused (a peer whose master is on a different goal must not inject
+    /// escalations into a foreign goal's ledger).
+    ///
+    /// Returns the new escalation's `escalation_id`.
+    pub(crate) fn model_goal_record_peer_escalation(
+        &self,
+        profile_data_dir: &std::path::Path,
+        goal_id: &str,
+        profile_id: &str,
+        originator_session: &str,
+        peer_slug: &str,
+        task_id: Option<&str>,
+        question: &str,
+    ) -> Result<String, String> {
+        // Same goal-binding check as `model_goal_record_peer_finding`: the
+        // goal record's owning session must match the peer's originator.
+        let state = self.state();
+        let goal_owner_matches = state.goals.iter().any(|(key, goal)| {
+            goal.goal_id == goal_id
+                && goal.profile_id == profile_id
+                && (key.to_string() == originator_session
+                    || key.base_key() == originator_session)
+        });
+        drop(state);
+        if !goal_owner_matches {
+            return Err(format!(
+                "goal `{goal_id}` is not owned by originator session `{originator_session}` \
+                 under profile `{profile_id}` — refusing to record peer escalation into a \
+                 foreign goal's ledger"
+            ));
+        }
+        let ledger_dir = Self::goal_ledger_dir(profile_data_dir);
+        std::fs::create_dir_all(&ledger_dir).map_err(|e| {
+            format!("failed to create goal ledger dir {}: {e}", ledger_dir.display())
+        })?;
+        let ledger_path = ledger_dir.join(format!("{}.db", sanitize_filename_for_ledger(goal_id)));
+        let ledger = octos_fleet::sqlite_ledger::GoalLedger::open(&ledger_path)
+            .map_err(|e| format!("failed to open goal ledger {}: {e}", ledger_path.display()))?;
+        let escalation_id = format!("esc-{}-{}", peer_slug, uuid::Uuid::now_v7());
+        let escalation = octos_fleet::sqlite_ledger::Escalation {
+            escalation_id: escalation_id.clone(),
+            goal_id: goal_id.to_owned(),
+            task_id: task_id.map(str::to_owned),
+            peer_id: peer_slug.to_owned(),
+            question: question.chars().take(500).collect(),
+            context: None,
+            status: "open".to_owned(),
+            default_action: None,
+            default_after_secs: None,
+            created_at_ms: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0),
+            resolved_at_ms: None,
+            resolved_by: None,
+            resolution: None,
+        };
+        ledger
+            .append_escalation(&escalation)
+            .map_err(|e| format!("failed to append peer escalation: {e}"))?;
+        Ok(escalation_id)
+    }
+
     /// Directory holding this profile's per-goal ledgers. Resolved under the
     /// profile's persistent `data_dir` so ledgers (a) survive restarts and
     /// `/tmp` cleanup, (b) are profile-isolated (a peer on profile A cannot

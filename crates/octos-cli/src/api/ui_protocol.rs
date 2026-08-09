@@ -14345,7 +14345,7 @@ fn wake_master_on_peer_awaiting_input(
     park_kind: PeerPendingKind,
     prompt: &str,
 ) {
-    let Some((profile_id, _slug)) = peer_slug_and_profile(peer_session) else {
+    let Some((profile_id, slug)) = peer_slug_and_profile(peer_session) else {
         return;
     };
     let Some(runtime) = state.profiles.get(profile_id) else {
@@ -14354,6 +14354,72 @@ fn wake_master_on_peer_awaiting_input(
     let peers_root = runtime.data_dir.join("peers");
     let _ =
         enqueue_peer_awaiting_input_wake(&peers_root, peer_session, pending_id, park_kind, prompt);
+
+    // Peer-agent-based goal: when the peer that is parking carries a goal
+    // context (its staged `goal` file), persist this escalation as a durable
+    // `Escalation` row in the goal's ledger. This is the WIRE for the
+    // `append_escalation` method added to `sqlite_ledger` — previously the
+    // code path existed but no caller invoked it, so a peer escalation never
+    // landed in the goal's durable history.
+    //
+    // Best-effort: a ledger write failure must NOT block the wake above
+    // (which is the primary mechanism the master uses to learn about the
+    // escalation). The ledger is the long-term history; the wake is the
+    // immediate signal.
+    let Some(peer_dir) = staged_peer_dir(&peers_root, slug) else {
+        return;
+    };
+    let Some(goal_body) =
+        peer_io::read_peer_file(&peer_dir, "goal", peer_io::PEER_FILE_READ_CAP_SMALL)
+    else {
+        return;
+    };
+    let mut lines = goal_body.lines();
+    let goal_id = lines.next().map(str::trim).filter(|s| !s.is_empty());
+    let task_id = lines.next().map(str::trim).filter(|s| !s.is_empty());
+    let Some(goal_id) = goal_id else {
+        return;
+    };
+    let Some(originator) = peer_io::read_peer_file(
+        &peer_dir,
+        "originator",
+        peer_io::PEER_FILE_READ_CAP_SMALL,
+    )
+    .map(|s| s.trim().to_owned())
+    .filter(|s| !s.is_empty()) else {
+        return;
+    };
+    let kind_str = match park_kind {
+        PeerPendingKind::Approval => "approval",
+        PeerPendingKind::Question => "question",
+        PeerPendingKind::Other => "other",
+    };
+    if let Err(err) = default_agent_orchestrator().model_goal_record_peer_escalation(
+        &runtime.data_dir,
+        goal_id,
+        profile_id,
+        &originator,
+        slug,
+        task_id,
+        &format!("[{kind_str}] {prompt}"),
+    ) {
+        tracing::warn!(
+            ?err,
+            slug,
+            goal_id,
+            originator,
+            kind = kind_str,
+            "peer-goal: failed to record escalation to goal ledger (wake already enqueued)"
+        );
+    } else {
+        tracing::info!(
+            slug,
+            goal_id,
+            originator,
+            kind = kind_str,
+            "peer-goal: recorded escalation to goal ledger"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -15121,12 +15187,27 @@ fn enqueue_goal_progress_wake(
         .map(|d| d.as_secs())
         .unwrap_or(0);
     let line = format!("{timestamp} {message}\n");
-    std::fs::OpenOptions::new()
+    let file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(&note_path)
-        .and_then(|mut f| std::io::Write::write_all(&mut f, line.as_bytes()))
-        .map_err(|e| format!("failed to append wake note {}: {e}", note_path.display()))
+        .map_err(|e| format!("failed to open wake note {}: {e}", note_path.display()))?;
+    // flock (shared) before appending: the reader takes an exclusive lock
+    // before renaming the file, so a shared lock here serializes us with
+    // the reader — our append lands BEFORE the reader's rename (so it is
+    // captured in this batch) or AFTER (so it lands in the fresh file the
+    // reader's rename made visible). Without this, an append through a
+    // pre-rename open fd could land in the deleted archive and be lost
+    // (codex v11 issue #1944-1). Best-effort: if flock is unavailable we
+    // still append (the reader's bounded take() still bounds the read).
+    use fs2::FileExt as _;
+    let _ = file.try_lock_shared();
+    use std::io::Write as _;
+    let mut file = file;
+    file.write_all(line.as_bytes())
+        .map_err(|e| format!("failed to append wake note {}: {e}", note_path.display()))?;
+    let _ = file.unlock();
+    Ok(())
 }
 
 /// Read and CLEAR the pending goal-progress notes for `session_id`. Returns
@@ -15163,26 +15244,62 @@ fn read_and_clear_goal_progress_notes(
 ) -> Option<String> {
     let safe_session = hash_session_for_inbox(session_id);
     let note_path = data_dir.join("inbox").join(format!("{safe_session}.notes"));
-    // Step 1: refuse a symlinked leaf (a hostile staged dir could otherwise
-    // redirect the read outside the inbox dir).
-    let meta = std::fs::symlink_metadata(&note_path).ok()?;
-    if !meta.is_file() || meta.file_type().is_symlink() {
+    // Step 1 (O_NOFOLLOW): open the `.notes` leaf directly, refusing a
+    // symlink. We then `fstat` the OPENED HANDLE (not the path) to confirm
+    // a regular file. This closes the TOCTOU window where a hostile actor
+    // swaps `.notes` to a symlink between our metadata check and our open
+    // (codex v11 issue #1944-3). On Unix we use O_NOFOLLOW; on other
+    // platforms we re-verify after open via `symlink_metadata` (best-effort).
+    #[cfg(unix)]
+    let file = {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(&note_path)
+            .ok()?
+    };
+    #[cfg(not(unix))]
+    let file = {
+        // Best-effort on non-Unix: refuse the path if it's a symlink, then
+        // open normally. Still TOCTOU-prone (the check and open are not
+        // atomic), but no worse than before.
+        let meta = std::fs::symlink_metadata(&note_path).ok()?;
+        if meta.file_type().is_symlink() {
+            return None;
+        }
+        std::fs::File::open(&note_path).ok()?
+    };
+    // fstat the OPEN handle — a regular file required. If the leaf was
+    // swapped to a symlink AFTER our open (impossible with O_NOFOLLOW, but
+    // possible on non-Unix), the fstat would still show the original
+    // regular file we opened (POSIX open-fd semantics).
+    let meta = file.metadata().ok()?;
+    if !meta.is_file() {
         return None;
     }
+    drop(file);
     // Step 2: rename the live file to a unique archive name. From this
     // point on, any peer appending to the original path creates a NEW
     // empty file — our read below cannot race with concurrent appends.
+    // Archive name uses UUIDv7 (time-ordered, 128-bit, no collision) so
+    // two renames within the same nanosecond cannot collide (codex v11
+    // issue #1944-4).
     let archive_path = data_dir.join("inbox").join(format!(
         "{safe_session}.{}.archive",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0)
+        uuid::Uuid::now_v7()
     ));
     std::fs::rename(&note_path, &archive_path).ok()?;
-    // Step 3: read the archived copy with a 64 KiB cap. An oversized
-    // archive is RENAMED ASIDE (kept for operator inspection) and skipped
-    // — the consumer is not wedged, future batches still drain.
+    // Step 3: read the archived copy with a 64 KiB cap. The metadata
+    // precheck above only bounds the FILE SIZE AT RENAME TIME — a
+    // pre-opened writer could still have enlarged the archive after our
+    // rename. We bound the ACTUAL read via `take(CAP + 1)`: if we read
+    // more than CAP bytes, the archive is oversized and we skip it (the
+    // consumer is not wedged, future batches still drain).
+    //
+    // O_NOFOLLOW on the archive open too: a hostile actor who could
+    // predict our UUID (they cannot — UUIDv7 is 122 bits of entropy)
+    // might have planted a symlink. Cheap defense-in-depth.
     const CAP: u64 = 64 * 1024;
     let archive_meta = std::fs::symlink_metadata(&archive_path).ok()?;
     if archive_meta.len() > CAP {
@@ -15190,7 +15307,40 @@ fn read_and_clear_goal_progress_notes(
         let _ = std::fs::rename(&archive_path, &oversize_path);
         return None;
     }
-    let body = std::fs::read_to_string(&archive_path).ok()?;
+    use std::io::Read as _;
+    #[cfg(unix)]
+    let file = {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(&archive_path)
+            .ok()?
+    };
+    #[cfg(not(unix))]
+    let file = std::fs::File::open(&archive_path).ok()?;
+    // flock the archive (exclusive) before reading: a writer that opened
+    // the archive BEFORE our rename still holds an fd and could append
+    // after our rename. Taking an exclusive flock here serializes us with
+    // any such writer — they complete their append BEFORE we read, so the
+    // bounded take() below sees the final size. Best-effort: if flock is
+    // unavailable (some network filesystems), we proceed without it (the
+    // bounded take() still bounds the read).
+    use fs2::FileExt as _;
+    let _ = file.try_lock_exclusive();
+    let mut bounded = (&file).take(CAP + 1);
+    let mut buf = Vec::new();
+    bounded.read_to_end(&mut buf).ok()?;
+    let _ = file.unlock();
+    if buf.len() as u64 > CAP {
+        // Archive grew past CAP between the metadata check and the read —
+        // skip it (rename aside, don't process). This is the OOM defense
+        // codex v11 flagged.
+        let oversize_path = archive_path.with_extension("oversize");
+        let _ = std::fs::rename(&archive_path, &oversize_path);
+        return None;
+    }
+    let body = String::from_utf8(buf).ok()?;
     // Step 4: best-effort delete the archive now that we have it in memory.
     // Failure leaves a stale .archive file (operator cleanup), never a
     // duplicate delivery (the original .notes path is gone).
@@ -31086,6 +31236,22 @@ async fn run_standalone_turn(
                         request_agent = request_agent.with_task_id(task_id.to_owned());
                     }
                 }
+            }
+            // Peer-agent-based goal: capture the originator session ONCE at
+            // boot and inject into the Agent. This is the (codex v9 High #2)
+            // fix: previously `goal_get` re-read the originator file on
+            // every call, which is a mutable, symlink-vulnerable read that
+            // could rebind a known goal_id to a different session mid-turn.
+            // Capturing it here pins the value for the whole turn.
+            if let Some(originator) = peer_io::read_peer_file(
+                &peer_dir,
+                "originator",
+                peer_io::PEER_FILE_READ_CAP_SMALL,
+            )
+            .map(|s| s.trim().to_owned())
+            .filter(|s| !s.is_empty())
+            {
+                request_agent = request_agent.with_originator_session(originator);
             }
         }
     }

@@ -351,31 +351,22 @@ impl Tool for GoalGetTool {
         // Peer-agent-based goal: when the Agent was populated with a goal_id
         // (peer session whose staged dir carried a `goal` file), resolve by
         // goal_id DIRECTLY — the peer's session key does not own the goal.
-        // We ALSO need the peer's originator session for the binding check
-        // (`model_goal_snapshot_by_id` enforces that the goal is OWNED by
-        // the session that staged the peer). Read it from
-        // `<data_dir>/peers/<slug>/originator`.
+        // The originator session is read from `ctx.originator_session`,
+        // which was captured ONCE at peer boot from `peers/<slug>/originator`
+        // (codex v9 High #2 fix: no per-call disk re-read, no symlink
+        // vulnerability, no mid-turn rebinding).
         let mut snapshot = if let Some(goal_id) = ctx.goal_id.as_deref() {
-            let originator = self
-                .data_dir
-                .as_ref()
-                .and_then(|data_dir| {
-                    let slug = session_id.topic()?.strip_prefix("peer-")?;
-                    let originator_path = data_dir.join("peers").join(slug).join("originator");
-                    std::fs::read_to_string(originator_path).ok()
-                })
-                .map(|s| s.trim().to_owned())
-                .filter(|s| !s.is_empty());
-            let Some(originator) = originator else {
+            let Some(originator) = ctx.originator_session.as_deref() else {
                 return Ok(ToolResult {
-                    output: "goal_get: peer has goal context but no originator file; \
-                             cannot verify goal ownership"
+                    output: "goal_get: peer has goal context but no originator in tool \
+                             context — the peer boot should have injected it; refusing \
+                             to fall back to a per-call disk read (codex v9 High #2)"
                         .into(),
                     success: false,
                     ..Default::default()
                 });
             };
-            orchestrator.model_goal_snapshot_by_id(goal_id, &self.profile_id, &originator)
+            orchestrator.model_goal_snapshot_by_id(goal_id, &self.profile_id, originator)
         } else {
             // PR 5a — resolve the fleet plan view FIRST: it self-detects completion
             // (`Fleet::is_complete` → mark the goal `complete`), which the budget
