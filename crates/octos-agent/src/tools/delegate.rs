@@ -371,6 +371,14 @@ impl DelegateTool {
     }
 
     pub fn with_agent_config(mut self, config: AgentConfig) -> Self {
+        // Pipeline workers (fanout/synthesize) need more iterations than interactive chat.
+        // Default 50 is tuned for snappy interactive turns, but research/analysis tasks
+        // need 100-150 iterations to read multiple findings files and cross-reference.
+        // See issue #1947: deep_research pipeline timeout.
+        let config = AgentConfig {
+            max_iterations: config.max_iterations.max(150),
+            ..config
+        };
         self.worker_config = Some(config);
         self
     }

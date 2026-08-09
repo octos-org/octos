@@ -3202,6 +3202,17 @@ impl Tool for SpawnTool {
                 role = input.role.as_deref().unwrap_or("<none>"),
                 "spawn role/task capability mismatch; injecting deliver-as-text note"
             );
+            // Auto-fix: if task wants write but tools don't include write_file, add it
+            // This fixes the issue where sub agents complete but don't produce files
+            // because write_file wasn't in allowed_tools.
+            if note.contains("write files") && !effective_allowed_tools.contains(&"write_file".to_string()) {
+                input.allowed_tools.push("write_file".to_string());
+                input.allowed_tools.push("edit_file".to_string());
+                info!(
+                    worker = %worker_id,
+                    "auto-added write_file/edit_file to allowed_tools for file-producing task"
+                );
+            }
             input.additional_instructions = Some(match input.additional_instructions.take() {
                 Some(existing) if !existing.trim().is_empty() => format!("{existing}\n\n{note}"),
                 _ => note,
