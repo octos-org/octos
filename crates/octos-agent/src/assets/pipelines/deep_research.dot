@@ -35,6 +35,13 @@ digraph deep_research {
         label="Analysis",
         model="strong",
         tools="read_file",
+        // The analyst reads every findings-*.md one at a time (see prompt),
+        // so the default 30-iteration budget is exhausted navigating files
+        // before it emits the analysis — the node then fails and the whole
+        // pipeline never reaches synthesize (no artifact). 80 leaves margin
+        // for reads + the structured output; timeout_secs is the wall-clock
+        // backstop.
+        max_iterations="80",
         timeout_secs="1800"
     ]
 
