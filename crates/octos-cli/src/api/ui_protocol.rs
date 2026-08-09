@@ -15187,27 +15187,42 @@ fn enqueue_goal_progress_wake(
         .map(|d| d.as_secs())
         .unwrap_or(0);
     let line = format!("{timestamp} {message}\n");
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&note_path)
-        .map_err(|e| format!("failed to open wake note {}: {e}", note_path.display()))?;
-    // flock (shared) before appending: the reader takes an exclusive lock
-    // before renaming the file, so a shared lock here serializes us with
-    // the reader — our append lands BEFORE the reader's rename (so it is
-    // captured in this batch) or AFTER (so it lands in the fresh file the
-    // reader's rename made visible). Without this, an append through a
-    // pre-rename open fd could land in the deleted archive and be lost
-    // (codex v11 issue #1944-1). Best-effort: if flock is unavailable we
-    // still append (the reader's bounded take() still bounds the read).
+    // flock (shared) on a STABLE lockfile before appending: the reader takes
+    // an exclusive lock on the SAME lockfile before renaming `.notes`, so
+    // this shared lock serializes us with the reader — our append lands
+    // BEFORE the reader's rename (captured in this batch) or AFTER (lands
+    // in the fresh file). Using a separate `.lock` file (not `.notes`
+    // itself) is the load-bearing choice: `.notes` is renamed away by the
+    // reader, but the lockfile persists across renames, so the lock always
+    // refers to a stable inode (codex v12 issue #1944-1).
+    //
+    // BLOCKING lock (not try_lock): a writer that loses the race waits for
+    // the reader to finish its rename+read, then appends to the fresh
+    // `.notes`. This is the complete fix codex v12 flagged — try_lock
+    // ignoring failure is not full serialization.
     use fs2::FileExt as _;
-    let _ = file.try_lock_shared();
-    use std::io::Write as _;
-    let mut file = file;
-    file.write_all(line.as_bytes())
-        .map_err(|e| format!("failed to append wake note {}: {e}", note_path.display()))?;
-    let _ = file.unlock();
-    Ok(())
+    let lock_path = data_dir.join("inbox").join(format!("{safe_session}.lock"));
+    let lock_file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .open(&lock_path)
+        .map_err(|e| format!("failed to open wake lock {}: {e}", lock_path.display()))?;
+    lock_file
+        .lock_shared()
+        .map_err(|e| format!("failed to lock wake note {}: {e}", lock_path.display()))?;
+    let result = (|| {
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&note_path)
+            .map_err(|e| format!("failed to open wake note {}: {e}", note_path.display()))?;
+        use std::io::Write as _;
+        let mut file = file;
+        file.write_all(line.as_bytes())
+            .map_err(|e| format!("failed to append wake note {}: {e}", note_path.display()))
+    })();
+    let _ = lock_file.unlock();
+    result
 }
 
 /// Read and CLEAR the pending goal-progress notes for `session_id`. Returns
@@ -15279,9 +15294,40 @@ fn read_and_clear_goal_progress_notes(
         return None;
     }
     drop(file);
+    // flock (exclusive) on a STABLE lockfile BEFORE renaming. This is the
+    // load-bearing serialization: any writer holding the shared lock on
+    // the same lockfile finishes their append BEFORE we proceed, so a
+    // writer that opened `.notes` before our rename cannot append through
+    // the stale fd after we've read+deleted the archive (codex v12 issue
+    // #1944-1). Using a separate `.lock` file (not `.notes` itself) means
+    // the lock refers to a stable inode across renames.
+    //
+    // BLOCKING lock: a reader that loses the race waits for the writer to
+    // finish their append, then proceeds with the rename. This is the
+    // complete fix codex v12 flagged — try_lock ignoring failure is not
+    // full serialization.
+    use fs2::FileExt as _;
+    let lock_path = data_dir.join("inbox").join(format!("{safe_session}.lock"));
+    let lock_file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .open(&lock_path)
+        .ok()?;
+    lock_file.lock_exclusive().ok()?;
+    // Hold the lock for the ENTIRE rename + read + delete sequence. We
+    // release it explicitly at the end (or on early return via the guard).
+    struct LockGuard<'a>(&'a std::fs::File);
+    impl Drop for LockGuard<'_> {
+        fn drop(&mut self) {
+            let _ = self.0.unlock();
+        }
+    }
+    let _guard = LockGuard(&lock_file);
     // Step 2: rename the live file to a unique archive name. From this
     // point on, any peer appending to the original path creates a NEW
-    // empty file — our read below cannot race with concurrent appends.
+    // empty file — our read below cannot race with concurrent appends
+    // (they are blocked on the shared lock until we release the exclusive
+    // one, at which point they append to the fresh `.notes`).
     // Archive name uses UUIDv7 (time-ordered, 128-bit, no collision) so
     // two renames within the same nanosecond cannot collide (codex v11
     // issue #1944-4).
@@ -15319,19 +15365,14 @@ fn read_and_clear_goal_progress_notes(
     };
     #[cfg(not(unix))]
     let file = std::fs::File::open(&archive_path).ok()?;
-    // flock the archive (exclusive) before reading: a writer that opened
-    // the archive BEFORE our rename still holds an fd and could append
-    // after our rename. Taking an exclusive flock here serializes us with
-    // any such writer — they complete their append BEFORE we read, so the
-    // bounded take() below sees the final size. Best-effort: if flock is
-    // unavailable (some network filesystems), we proceed without it (the
-    // bounded take() still bounds the read).
-    use fs2::FileExt as _;
-    let _ = file.try_lock_exclusive();
+    // NOTE: no flock needed here — the reader holds the exclusive lockfile
+    // from BEFORE the rename, so any writer that could have opened `.notes`
+    // before the rename is blocked on the shared lock and cannot append
+    // through the stale fd until we release. The archive's contents are
+    // frozen by the rename + our exclusive lock.
     let mut bounded = (&file).take(CAP + 1);
     let mut buf = Vec::new();
     bounded.read_to_end(&mut buf).ok()?;
-    let _ = file.unlock();
     if buf.len() as u64 > CAP {
         // Archive grew past CAP between the metadata check and the read —
         // skip it (rename aside, don't process). This is the OOM defense
