@@ -2048,6 +2048,27 @@
           "api_key_env": "ZAI_API_KEY"
         }
       ]
+    },
+    {
+      "provider": "atlascloud/deepseek-ai/deepseek-v4-pro",
+      "type": "strong",
+      "stability": 1.0,
+      "tool_avg_ms": 0,
+      "p95_ms": 0,
+      "score": 0.0,
+      "ds_output": 0,
+      "cost_in": 0.0,
+      "cost_out": 0.0,
+      "context_window": 1048576,
+      "max_output": 384000,
+      "endpoints": [
+        {
+          "id": "atlascloud",
+          "label": "Atlas Cloud",
+          "base_url": "https://api.atlascloud.ai/v1",
+          "api_key_env": "ATLASCLOUD_API_KEY"
+        }
+      ]
     }
   ]
 }

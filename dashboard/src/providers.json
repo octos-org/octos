@@ -128,20 +128,9 @@
   "atlascloud": {
     "env": "ATLASCLOUD_API_KEY",
     "models": [
-      {
-        "id": "deepseek-ai/deepseek-v4-pro",
-        "input": 0.0,
-        "output": 0.0,
-        "max_output": 384000,
-        "endpoints": [
-          {
-            "id": "atlascloud",
-            "label": "Atlas Cloud",
-            "base_url": "https://api.atlascloud.ai/v1",
-            "api_key_env": "ATLASCLOUD_API_KEY"
-          }
-        ]
-      }
+      { "id": "deepseek-ai/deepseek-v4-pro", "input": 0.0, "output": 0.0, "max_output": 384000, "endpoints": [
+        { "id": "atlascloud", "label": "Atlas Cloud", "base_url": "https://api.atlascloud.ai/v1", "api_key_env": "ATLASCLOUD_API_KEY" }
+      ] }
     ]
   },
   "groq": {
