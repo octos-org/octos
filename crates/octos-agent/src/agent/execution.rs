@@ -558,6 +558,10 @@ impl Agent {
     ) -> JoinHandle<ToolCallResult> {
         // Clone Arc-wrapped fields so the spawned task is 'static
         let tools = self.tools.clone();
+        // Peer-goal soak fix: pre-clone the real LLM provider so the spawned
+        // foreground ToolContext can carry it (see the `llm_provider` field
+        // below). Cannot borrow `self` inside the 'static spawned task.
+        let llm = self.llm.clone();
         let reporter = self.reporter();
         let hooks = self.hooks.clone();
         let hook_ctx = self.hook_ctx();
@@ -2067,6 +2071,19 @@ impl Agent {
                 session_scope: session_scope.clone(),
                 // #1774: post-edit formatting opt-in for file tools.
                 format_after_edit,
+                // Peer-goal soak fix: the foreground tool ctx must carry the
+                // real LLM provider, not the NoopProvider from
+                // `ToolContext::zero()`. Tools that make their own LLM
+                // sub-calls (notably `goal_update`'s completion verifier via
+                // `run_goal_completion_verifier`) run through this ctx; without
+                // the real provider the verifier fails with "no real provider"
+                // and `goal_update(complete)` can never succeed. Mirror the
+                // approval path (`execute_approved_tool`), which already sets
+                // this. NOTE: intentionally do NOT thread `goal_id` here — the
+                // master's `goal_update` relies on `ctx.goal_id == None` to
+                // fall through to the master-completion path instead of the
+                // peer-reject branch in `goal_tool`.
+                llm_provider: llm.clone(),
                 ..ToolContext::zero()
             };
             // Thread the typed context into execute_with_context. Legacy tools
