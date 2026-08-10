@@ -1724,6 +1724,7 @@ pub(crate) fn validate_channel_credentials(
 ) -> Result<(), String> {
     use crate::profiles::ChannelCredentials;
     for ch in channels {
+        #[allow(clippy::collapsible_match)]
         match ch {
             ChannelCredentials::Telegram { token_env, .. } => {
                 if token_env.is_empty() {

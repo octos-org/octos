@@ -2849,6 +2849,7 @@ impl InProcessAgentOrchestrator {
     /// peer completing multiple turns in quick succession doesn't spam the
     /// master (each turn gets its own wake, but a retry of the SAME turn
     /// dedupes).
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn enqueue_goal_progress_continuation(
         &self,
         master_session: &SessionKey,
@@ -3275,6 +3276,7 @@ impl InProcessAgentOrchestrator {
     /// each peer. Result text is capped (first 500 chars) to keep the
     /// snapshot bounded; peers with no result yet are included with
     /// `result = null` so the master can see work-in-progress.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn model_goal_peer_findings(
         &self,
         peers_root: &std::path::Path,
@@ -3473,6 +3475,7 @@ impl InProcessAgentOrchestrator {
     /// derived from the goal store directly: a goal record's HashMap key is
     /// the (cwd-scoped) session key that created it, so we walk the goals
     /// map and require the goal's session to match the peer's originator.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn model_goal_record_peer_finding(
         &self,
         profile_data_dir: &std::path::Path,
@@ -3599,6 +3602,7 @@ impl InProcessAgentOrchestrator {
     /// escalations into a foreign goal's ledger).
     ///
     /// Returns the new escalation's `escalation_id`.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn model_goal_record_peer_escalation(
         &self,
         profile_data_dir: &std::path::Path,

@@ -13497,6 +13497,7 @@ struct StagedPeer {
 /// burned. Synchronous by design (git via `std::process`): the RPC fleet
 /// loop keeps it off the reactor via `spawn_blocking`, while the tool
 /// callback — a sync `Fn` — runs it directly on the tool's worker.
+#[allow(clippy::too_many_arguments)]
 fn stage_peer(
     peers_root: &Path,
     workspace_root: &Path,
@@ -15165,6 +15166,7 @@ fn write_peer_result_if_peer_session(
 /// lossy-replacement bug codex flagged: `a:b`, `a/b`, `a.b` would all
 /// map to `a_b.notes`). Hashing is collision-resistant per the hash
 /// function's guarantees and stable across restarts.
+#[allow(clippy::too_many_arguments)]
 fn enqueue_goal_progress_wake(
     data_dir: &std::path::Path,
     originator_session: &str,
@@ -15201,12 +15203,21 @@ fn enqueue_goal_progress_wake(
     // the reader to finish its rename+read, then appends to the fresh
     // `.notes`. This is the complete fix codex v12 flagged — try_lock
     // ignoring failure is not full serialization.
+    // NOTE: std::fs::File::lock_shared/unlock are stable since Rust 1.89,
+    // but the workspace MSRV is 1.85. Use fs2::FileExt (supports 1.85).
+    // Clippy flags fs2::FileExt as unused because std has the same methods
+    // on the current toolchain, but we need the 1.85-compatible versions.
+    #[allow(unused_imports)]
+    use fs2::FileExt as _;
     let lock_path = data_dir.join("inbox").join(format!("{safe_session}.lock"));
     let lock_file = std::fs::OpenOptions::new()
         .create(true)
         .write(true)
+        .truncate(true)
         .open(&lock_path)
         .map_err(|e| format!("failed to open wake lock {}: {e}", lock_path.display()))?;
+    // fs2::FileExt::lock_shared (supports MSRV 1.85; std::fs::File::lock_shared is 1.89+)
+    #[allow(clippy::incompatible_msrv)]
     lock_file
         .lock_shared()
         .map_err(|e| format!("failed to lock wake note {}: {e}", lock_path.display()))?;
@@ -15221,6 +15232,8 @@ fn enqueue_goal_progress_wake(
         file.write_all(line.as_bytes())
             .map_err(|e| format!("failed to append wake note {}: {e}", note_path.display()))
     })();
+    // fs2::FileExt::unlock (supports MSRV 1.85; std::fs::File::unlock is 1.89+)
+    #[allow(clippy::incompatible_msrv)]
     let _ = lock_file.unlock();
     // Durable note is written; now ALSO enqueue a REAL master continuation
     // so the master's actor loop fires immediately (codex PR review #2:
@@ -15326,14 +15339,19 @@ fn read_and_clear_goal_progress_notes(
     let lock_file = std::fs::OpenOptions::new()
         .create(true)
         .write(true)
+        .truncate(true)
         .open(&lock_path)
         .ok()?;
+    // fs2::FileExt::lock_exclusive (supports MSRV 1.85; std::fs::File::lock_exclusive is 1.89+)
+    #[allow(clippy::incompatible_msrv)]
     lock_file.lock_exclusive().ok()?;
     // Hold the lock for the ENTIRE rename + read + delete sequence. We
     // release it explicitly at the end (or on early return via the guard).
     struct LockGuard<'a>(&'a std::fs::File);
     impl Drop for LockGuard<'_> {
         fn drop(&mut self) {
+            // fs2::FileExt::unlock (supports MSRV 1.85; std::fs::File::unlock is 1.89+)
+            #[allow(clippy::incompatible_msrv)]
             let _ = self.0.unlock();
         }
     }
@@ -15410,7 +15428,7 @@ fn read_and_clear_goal_progress_notes(
         if line.is_empty() {
             continue;
         }
-        let msg = line.splitn(2, ' ').nth(1).unwrap_or(line);
+        let msg = line.split_once(' ').map(|x| x.1).unwrap_or(line);
         rendered.push_str(&format!("- {msg}\n"));
     }
     Some(rendered)
