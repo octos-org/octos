@@ -469,11 +469,20 @@ impl Agent {
                 .unwrap_or_default(),
             subagent_output_router: self.subagent_output_router.clone(),
             subagent_summary_generator: self.subagent_summary_generator.clone(),
+            llm_provider: self.llm.clone(),
             task_supervisor: Some(self.tools.supervisor()),
             cost_accountant: self.cost_accountant.clone(),
             parent_session_key: self.parent_session_key.clone(),
             spawn_depth: self.spawn_depth,
             session_scope: self.session_scope.clone(),
+            // Peer-agent-based goal: forward the agent's (optional) goal
+            // context so goal-aware tools can scope their reads/writes.
+            goal_id: self.goal_id.clone(),
+            task_id: self.task_id.clone(),
+            // Peer-agent-based goal: forward the originator captured at peer
+            // boot so goal-aware tools can enforce binding without re-reading
+            // the mutable originator file on every call.
+            originator_session: self.originator_session.clone(),
             // #1774: approval-gated edits still honor the post-edit
             // formatting opt-in.
             format_after_edit: self.config.format_after_edit,

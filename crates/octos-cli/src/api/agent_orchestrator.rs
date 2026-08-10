@@ -5,11 +5,11 @@ use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use super::goal_loop_runtime::{
-    BUILT_IN_MAINTENANCE_PROMPT, DenyReason, GoalPolicyDecision, GoalRuntime, GoalRuntimePolicy,
-    GoalRuntimeState, LoopFireContext, LoopFireDecision, LoopFireTrigger, LoopInvocation,
-    LoopRuntime, LoopRuntimePolicy, MaintenancePromptResolution, MaintenancePromptSource,
-    NextDueState, RuntimeIdleState as GoalRuntimeIdleState, SlashCommandAuthorization, WaitUntil,
-    resolve_maintenance_prompt,
+    BUILT_IN_MAINTENANCE_PROMPT, DenyReason, GoalCompletionVerdict, GoalPolicyDecision,
+    GoalRuntime, GoalRuntimePolicy, GoalRuntimeState, LoopFireContext, LoopFireDecision,
+    LoopFireTrigger, LoopInvocation, LoopRuntime, LoopRuntimePolicy, MaintenancePromptResolution,
+    MaintenancePromptSource, NextDueState, RuntimeIdleState as GoalRuntimeIdleState,
+    SlashCommandAuthorization, WaitUntil, resolve_maintenance_prompt,
 };
 use super::master_continuation_scheduler::{
     MAX_REDELIVERY_ATTEMPTS, MasterContinuationDedupeKey, MasterContinuationEnqueueOutcome,
@@ -249,6 +249,11 @@ pub(crate) struct FleetKeeperSeed {
 /// master to `peer_list` → `peer_respond`. Sibling of the fleet-synthesis wake;
 /// flows through the same hardened `External` drain path.
 pub(crate) const PEER_AWAITING_INPUT_EXTERNAL_KIND: &str = "peer_awaiting_input";
+
+/// Peer-agent-based goal: external continuation kind for goal-progress wakes
+/// (a goal-scoped peer completed a turn → wake the master so it sees the
+/// finding WITHOUT waiting for the next scheduled goal turn).
+pub(crate) const GOAL_PROGRESS_EXTERNAL_KIND: &str = "goal_progress";
 /// Metadata key carrying the parked peer's slug (names the peer in the nudge).
 pub(crate) const PEER_AWAITING_INPUT_META_SLUG: &str = "peer_awaiting_input_slug";
 /// Metadata key carrying the park kind — `"approval"` or `"question"`.
@@ -861,6 +866,21 @@ pub(crate) fn route_terminal_event_to_continuation_queue(
 type LoopRunnableFilter<'a> = dyn Fn(&SessionKey, &str) -> bool + 'a;
 
 impl InProcessAgentOrchestrator {
+    /// Get the goal objective for a session (used by goal completion verifier).
+    pub(crate) fn goal_objective_for_test(&self, session_id: &SessionKey) -> Option<String> {
+        self.state()
+            .goals
+            .get(session_id)
+            .map(|g| g.objective.clone())
+    }
+
+    /// Get the goal ID for a session (used by goal completion verifier to prevent stale verdicts).
+    pub(crate) fn goal_id_for_session(&self, session_id: &SessionKey) -> Option<String> {
+        self.state()
+            .goals
+            .get(session_id)
+            .map(|g| g.goal_id.clone())
+    }
     fn state(&self) -> std::sync::MutexGuard<'_, AutonomyRuntimeState> {
         self.state
             .lock()
@@ -2817,6 +2837,48 @@ impl InProcessAgentOrchestrator {
         state.continuations.enqueue(request)
     }
 
+    /// Peer-agent-based goal: enqueue a MASTER continuation when a goal-scoped
+    /// peer completes a turn. This is the "real wake" codex PR review #2
+    /// flagged — `enqueue_goal_progress_wake` previously only appended a
+    /// file, which the master reads on its NEXT turn (not a true wake). This
+    /// continuation fires the master's actor loop immediately (subject to
+    /// the scheduler's dedupe/rate-limit), so the master sees the finding
+    /// without waiting for its next scheduled goal turn.
+    ///
+    /// Dedupes on `(master_session, goal_id, peer_slug, turn_count)` so a
+    /// peer completing multiple turns in quick succession doesn't spam the
+    /// master (each turn gets its own wake, but a retry of the SAME turn
+    /// dedupes).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn enqueue_goal_progress_continuation(
+        &self,
+        master_session: &SessionKey,
+        profile_id: &str,
+        goal_id: &str,
+        peer_slug: &str,
+        turn_count: u32,
+        outcome: &str,
+        content_summary: &str,
+    ) -> MasterContinuationEnqueueOutcome {
+        let request = MasterContinuationRequest::new(
+            PEER_AWAITING_INPUT_GROUP,
+            master_session.to_string(),
+            profile_id.to_owned(),
+            MasterContinuationReason::External(GOAL_PROGRESS_EXTERNAL_KIND.to_owned()),
+            SystemTime::now(),
+        )
+        .with_metadata("goal_id".to_owned(), goal_id.to_owned())
+        .with_metadata("peer_slug".to_owned(), peer_slug.to_owned())
+        .with_metadata("outcome".to_owned(), outcome.to_owned())
+        .with_metadata("content_summary".to_owned(), content_summary.to_owned())
+        .with_dedupe_key(format!(
+            "goal-progress:{}:{}:{}:{}",
+            master_session, goal_id, peer_slug, turn_count
+        ));
+        let mut state = self.state();
+        state.continuations.enqueue(request)
+    }
+
     /// codex #1 — true when peer `slug` (under `profile_id`) has a
     /// `peer_send_input` injection still QUEUED (a follow-up turn that has not
     /// run yet). Such a peer is NOT settled: the fleet-synthesis gate must not
@@ -3050,8 +3112,19 @@ impl InProcessAgentOrchestrator {
         session_id: &SessionKey,
         profile_id: &str,
         assistant_content: &str,
+        verdict: &GoalCompletionVerdict,
+        expected_goal_id: Option<&str>,
     ) -> bool {
         if !detect_goal_complete_sentinel(assistant_content) {
+            return false;
+        }
+        // Loop-engineering completion gate: the model's `<goal:complete>`
+        // sentinel is the agent's CLAIM, not proof. An INDEPENDENT verifier
+        // (a separate cheap-lane pass — see `run_goal_completion_verifier`)
+        // must confirm the objective is actually met before we flip to
+        // `complete`; otherwise the goal stays Active and the scheduler
+        // re-queues. This is what stops the agent grading its own homework.
+        if !verdict.is_done() {
             return false;
         }
         let mut state = self.state();
@@ -3064,11 +3137,35 @@ impl InProcessAgentOrchestrator {
         if goal.status == "complete" {
             return false;
         }
+        // CRITICAL: Revalidate goal identity to prevent stale verifier verdicts.
+        // If the goal changed between fetching the objective (for the verifier)
+        // and completing it here, the Done verdict may be for the WRONG goal.
+        // The caller passes the goal_id that was snapshotted when the verifier
+        // was invoked; if it doesn't match the current goal, we must not complete.
+        if let Some(expected_id) = expected_goal_id {
+            if goal.goal_id != expected_id {
+                tracing::warn!(
+                    session_id = %session_id,
+                    expected_goal_id = %expected_id,
+                    actual_goal_id = %goal.goal_id,
+                    "stale verifier verdict: goal changed between verifier call and completion"
+                );
+                return false;
+            }
+        }
         goal.status = "complete".to_owned();
         goal.updated_at_ms = now_ms();
         let snapshot = goal.clone();
         persist_goal_state(&state, session_id, &snapshot, false);
         true
+    }
+
+    /// Whether `content` carries the agent's self-declared goal-completion
+    /// sentinel. Callers use this to decide whether to spend an INDEPENDENT
+    /// verifier LLM call (only when completion is actually claimed) before
+    /// passing the verdict to [`Self::maybe_complete_goal_from_model`].
+    pub(crate) fn goal_completion_claimed(&self, content: &str) -> bool {
+        detect_goal_complete_sentinel(content)
     }
 
     /// #1696/#1698 — `SessionGoalUpdated`-shaped snapshot of the session's
@@ -3129,6 +3226,192 @@ impl InProcessAgentOrchestrator {
         }
     }
 
+    /// Peer-agent-based goal: snapshot a goal DIRECTLY by its `goal_id`,
+    /// bypassing session-key resolution. Used when a peer session calls
+    /// `goal_get` — the peer's session key does NOT carry the goal (the
+    /// master staged it), but the peer's Agent was populated with the goal
+    /// id from `peers/<slug>/goal` at boot, which the tool threads through
+    /// `ToolContext.goal_id`.
+    ///
+    /// # Authorization
+    ///
+    /// The goal must be OWNED by `originator_session` (the session that
+    /// staged the peer) under `profile_id`. This mirrors the binding check
+    /// in [`Self::model_goal_record_peer_finding`] — without it, any peer
+    /// on this profile that learns a foreign goal's UUID could read its
+    /// objective/budget.
+    pub(crate) fn model_goal_snapshot_by_id(
+        &self,
+        goal_id: &str,
+        profile_id: &str,
+        originator_session: &str,
+    ) -> Value {
+        let state = self.state();
+        let found = state.goals.iter().find(|(key, goal)| {
+            goal.goal_id == goal_id
+                && goal.profile_id == profile_id
+                && (key.to_string() == originator_session || key.base_key() == originator_session)
+        });
+        match found {
+            Some((_key, goal)) => json!({
+                "status": goal.status,
+                "goal_id": goal.goal_id,
+                "objective": goal.objective,
+                "tokens_used": goal.tokens_used,
+                "token_budget": goal.token_budget,
+                "tokens_remaining": goal.token_budget.saturating_sub(goal.tokens_used),
+                "time_used_seconds": goal.time_used_seconds,
+                "continuations_used": goal.continuations_used,
+            }),
+            None => json!({ "status": "none" }),
+        }
+    }
+
+    /// Peer-agent-based goal: list the (slug, goal_id, task_id, result)
+    /// tuples for every peer currently staged under `peers_root` whose
+    /// `goal` file points at `goal_id`. This is the ledger-association
+    /// mechanism for goal-scoped peers: each peer's `result.md` is the
+    /// finding it produced, surfaced to the master on `goal_get` so a
+    /// keeper can synthesize results without manually `peer_gather`-ing
+    /// each peer. Result text is capped (first 500 chars) to keep the
+    /// snapshot bounded; peers with no result yet are included with
+    /// `result = null` so the master can see work-in-progress.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn model_goal_peer_findings(
+        &self,
+        peers_root: &std::path::Path,
+        goal_id: &str,
+        profile_id: &str,
+    ) -> Vec<Value> {
+        let mut out = Vec::new();
+        let Ok(read_dir) = std::fs::read_dir(peers_root) else {
+            return out;
+        };
+        // Goal-binding pre-computation: collect every (scoped_key_str, base_key_str)
+        // pair whose goal record matches `goal_id` AND `profile_id`. A peer is
+        // surfaced ONLY if its originator session matches one of these —
+        // otherwise it is a foreign-goal injection attempt and excluded from
+        // the live findings view. The profile filter mirrors the durable
+        // ledger write path (`model_goal_record_peer_finding`): a same-ID
+        // goal owned under ANOTHER profile must not authorize this
+        // profile's live findings.
+        let goal_owner_keys: std::collections::HashSet<String> = {
+            let state = self.state();
+            state
+                .goals
+                .iter()
+                .filter(|(_key, goal)| goal.goal_id == goal_id && goal.profile_id == profile_id)
+                .flat_map(|(key, _goal)| {
+                    let mut set = std::collections::HashSet::new();
+                    set.insert(key.to_string());
+                    set.insert(key.base_key().to_owned());
+                    set
+                })
+                .collect()
+        };
+        for entry in read_dir.flatten() {
+            let slug = entry.file_name().to_string_lossy().into_owned();
+            // Use the same fd-anchored, symlink-refusing gate as the rest of
+            // the peer blackboard scan (`staged_peer_dir` + `read_peer_file`).
+            // This refuses to surface a peer whose dir or `goal`/`result.md`
+            // leaf is a symlink, so a hostile staged dir cannot redirect the
+            // read outside `peers_root` or inject fabricated findings.
+            let Some(dir) = staged_peer_dir_for_ledger(peers_root, &slug) else {
+                continue;
+            };
+            let Some(body) = read_peer_file_for_ledger(&dir, "goal") else {
+                continue;
+            };
+            let mut lines = body.lines();
+            let peer_goal_id = lines.next().map(str::trim).unwrap_or("");
+            if peer_goal_id != goal_id {
+                continue;
+            }
+            // Goal-binding: the peer's originator session must own this
+            // goal. Without this check, any same-profile caller that learns
+            // a foreign goal's UUID could stage a peer "for" that goal and
+            // inject live findings (the ledger write is separately gated,
+            // but the live view here would still surface them).
+            let originator = read_peer_file_for_ledger(&dir, "originator")
+                .map(|s| s.trim().to_owned())
+                .filter(|s| !s.is_empty());
+            let Some(originator) = originator else {
+                continue;
+            };
+            if !goal_owner_keys.contains(&originator) {
+                continue;
+            }
+            let peer_task_id = lines
+                .next()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned);
+            let result_full = read_peer_file_for_ledger(&dir, "result.md");
+            let result = result_full.map(|r| {
+                let trimmed = r.trim();
+                let capped: String = trimmed.chars().take(500).collect();
+                if capped.len() < trimmed.len() {
+                    format!("{capped}…")
+                } else {
+                    capped
+                }
+            });
+            let result_updated_unix = std::fs::metadata(dir.join("result.md"))
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs());
+            out.push(json!({
+                "peer_slug": slug,
+                "task_id": peer_task_id,
+                "result": result,
+                "result_updated_unix": result_updated_unix,
+            }));
+        }
+        out
+    }
+
+    /// Peer-agent-based goal: list the DURABLE findings persisted to this
+    /// goal's ledger (the write half is `model_goal_record_peer_finding`,
+    /// called when a goal-scoped peer completes a turn). These survive
+    /// across restarts and peer-result overwrites — the authoritative
+    /// history of what each peer contributed to the goal. Returns the same
+    /// summary shape as `model_goal_peer_findings` so the tool can merge
+    /// the two views.
+    pub(crate) fn model_goal_ledger_findings(
+        &self,
+        profile_data_dir: &std::path::Path,
+        goal_id: &str,
+    ) -> Vec<Value> {
+        let ledger_dir = Self::goal_ledger_dir(profile_data_dir);
+        let ledger_path = ledger_dir.join(format!("{}.db", sanitize_filename_for_ledger(goal_id)));
+        if !ledger_path.is_file() {
+            return Vec::new();
+        }
+        let Ok(ledger) = octos_fleet::GoalLedger::open(&ledger_path) else {
+            return Vec::new();
+        };
+        // Read all findings for this goal (no cursor — goal_get is called
+        // rarely enough that a full scan is acceptable).
+        let findings = ledger
+            .list_findings_since(goal_id, 0)
+            .unwrap_or_else(|_| Vec::new());
+        findings
+            .into_iter()
+            .map(|f| {
+                json!({
+                    "finding_id": f.finding_id,
+                    "task_id": f.task_id,
+                    "kind": f.kind,
+                    "lifecycle": f.lifecycle,
+                    "assertion": f.assertion,
+                    "created_by": f.created_by,
+                    "created_at_ms": f.created_at_ms,
+                })
+            })
+            .collect()
+    }
+
     /// #1696 — model-owned goal transition for the `goal_update` tool.
     /// Enforces the ownership matrix server-side (defense in depth beyond
     /// the tool executor): the model may set ONLY `complete` or `blocked`.
@@ -3170,6 +3453,260 @@ impl InProcessAgentOrchestrator {
             "model transitioned goal via goal_update tool"
         );
         Ok(autonomy_goal_json(&snapshot))
+    }
+
+    /// Peer-agent-based goal: record a peer finding into the goal's durable
+    /// ledger. This is the persistence half of `model_goal_peer_findings`
+    /// (which scans live `result.md` files): once a peer completes, its
+    /// result is frozen as a `Finding` row so the master can list findings
+    /// across restarts even if the peer's `result.md` is later overwritten.
+    ///
+    /// Returns the new finding's `finding_id`. Errors when the goal is not
+    /// found under this profile (a peer whose master is on a different
+    /// profile must not write into its ledger).
+    ///
+    /// # Goal-binding check
+    ///
+    /// We additionally require the goal record's OWNING session (the master
+    /// session that created the goal) to MATCH the session that staged the
+    /// peer (`originator_session`). Without this, any same-profile caller
+    /// that learns a foreign goal's UUID could hand off a peer "for" that
+    /// goal and inject findings into the foreign ledger. The binding is
+    /// derived from the goal store directly: a goal record's HashMap key is
+    /// the (cwd-scoped) session key that created it, so we walk the goals
+    /// map and require the goal's session to match the peer's originator.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn model_goal_record_peer_finding(
+        &self,
+        profile_data_dir: &std::path::Path,
+        goal_id: &str,
+        profile_id: &str,
+        originator_session: &str,
+        peer_slug: &str,
+        task_id: Option<&str>,
+        content: &str,
+    ) -> Result<String, String> {
+        // Verify the goal exists under this profile AND that its owning
+        // session matches the peer's originator (the goal-binding check
+        // above). We walk the map once and capture the matching key for
+        // downstream use.
+        let state = self.state();
+        let goal_owner_matches = state.goals.iter().any(|(key, goal)| {
+            goal.goal_id == goal_id
+                && goal.profile_id == profile_id
+                // The HashMap key is the scoped goal key (the session that
+                // created the goal). The originator recorded on the peer
+                // staging is the wire-format session id; for the by-id path
+                // we compare against the scoped key's string form. Both
+                // shapes refer to the same master session when the peer was
+                // legitimately staged under this goal.
+                && (key.to_string() == originator_session
+                    || key.base_key() == originator_session)
+        });
+        drop(state);
+        if !goal_owner_matches {
+            return Err(format!(
+                "goal `{goal_id}` is not owned by originator session `{originator_session}` \
+                 under profile `{profile_id}` — refusing to record peer finding into a \
+                 foreign goal's ledger"
+            ));
+        }
+        // The ledger is keyed by goal_id; open (creating on first use) the
+        // per-profile goal ledger under the orchestrator's data dir. We use
+        // a stable path so all peers of the same goal land in the same file.
+        let ledger_dir = Self::goal_ledger_dir(profile_data_dir);
+        std::fs::create_dir_all(&ledger_dir).map_err(|e| {
+            format!(
+                "failed to create goal ledger dir {}: {e}",
+                ledger_dir.display()
+            )
+        })?;
+        let ledger_path = ledger_dir.join(format!("{}.db", sanitize_filename_for_ledger(goal_id)));
+        let ledger = octos_fleet::GoalLedger::open(&ledger_path)
+            .map_err(|e| format!("failed to open goal ledger {}: {e}", ledger_path.display()))?;
+        // FK constraint: findings reference goals(goal_id), so we must
+        // upsert the goal row BEFORE appending a finding. Without this,
+        // a fresh ledger would reject the append (codex PR review #3).
+        // We use a minimal goal stub (objective/status unknown at this
+        // layer; the master owns the authoritative record in the goal
+        // store). If the goal already exists, this is a no-op.
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let goal_stub = octos_fleet::Goal {
+            goal_id: goal_id.to_owned(),
+            objective: String::new(), // unknown at this layer; master owns it
+            status: "active".to_owned(),
+            tokens_used: 0,
+            token_budget: 0,
+            continuations_used: 0,
+            revision: 0, // assigned by store on update
+            created_at_ms: now_ms,
+            updated_at_ms: now_ms,
+        };
+        // Ignore "already exists" errors (goal row already present).
+        let _ = ledger.create_goal(&goal_stub);
+        // FK constraint: findings with task_id reference tasks(task_id), so
+        // we must ALSO upsert a task stub when task_id is Some (codex PR
+        // review merge blocker). Same minimal-stub pattern as goals above.
+        if let Some(task_id_str) = task_id {
+            let task_stub = octos_fleet::Task {
+                task_id: task_id_str.to_owned(),
+                goal_id: goal_id.to_owned(),
+                title: String::new(), // unknown at this layer
+                detail: String::new(),
+                status: "running".to_owned(),
+                assigned_peer: Some(peer_slug.to_owned()),
+                created_at_ms: now_ms,
+                updated_at_ms: now_ms,
+            };
+            let _ = ledger.create_task(&task_stub);
+        }
+        let finding_id = format!("peer-{}-{}", peer_slug, uuid::Uuid::now_v7());
+        let finding = octos_fleet::Finding {
+            rowid: None,
+            finding_id: finding_id.clone(),
+            seq: 0, // assigned by store on insert
+            task_id: task_id.map(str::to_owned),
+            goal_id: goal_id.to_owned(),
+            kind: "observation".to_owned(),
+            lifecycle: "observed".to_owned(),
+            confidence: "medium".to_owned(),
+            review_state: "unreviewed".to_owned(),
+            assertion: content.chars().take(500).collect(),
+            evidence: None,
+            config_version: None,
+            derived_from: None,
+            supersedes: Vec::new(),
+            cost_tokens: 0,
+            created_at_ms: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0),
+            created_by: format!("peer:{peer_slug}"),
+        };
+        ledger
+            .append_finding(&finding)
+            .map_err(|e| format!("failed to append peer finding: {e}"))?;
+        Ok(finding_id)
+    }
+
+    /// Peer-agent-based goal: record a peer escalation into the goal's
+    /// durable ledger. This is the WIRE for `append_escalation` — called
+    /// when a goal-scoped peer parks on `awaiting_input` (approval /
+    /// question / other). Mirrors the binding check in
+    /// [`Self::model_goal_record_peer_finding`]: the goal must be owned by
+    /// `originator_session` under `profile_id`, otherwise the write is
+    /// refused (a peer whose master is on a different goal must not inject
+    /// escalations into a foreign goal's ledger).
+    ///
+    /// Returns the new escalation's `escalation_id`.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn model_goal_record_peer_escalation(
+        &self,
+        profile_data_dir: &std::path::Path,
+        goal_id: &str,
+        profile_id: &str,
+        originator_session: &str,
+        peer_slug: &str,
+        task_id: Option<&str>,
+        question: &str,
+    ) -> Result<String, String> {
+        // Same goal-binding check as `model_goal_record_peer_finding`: the
+        // goal record's owning session must match the peer's originator.
+        let state = self.state();
+        let goal_owner_matches = state.goals.iter().any(|(key, goal)| {
+            goal.goal_id == goal_id
+                && goal.profile_id == profile_id
+                && (key.to_string() == originator_session || key.base_key() == originator_session)
+        });
+        drop(state);
+        if !goal_owner_matches {
+            return Err(format!(
+                "goal `{goal_id}` is not owned by originator session `{originator_session}` \
+                 under profile `{profile_id}` — refusing to record peer escalation into a \
+                 foreign goal's ledger"
+            ));
+        }
+        let ledger_dir = Self::goal_ledger_dir(profile_data_dir);
+        std::fs::create_dir_all(&ledger_dir).map_err(|e| {
+            format!(
+                "failed to create goal ledger dir {}: {e}",
+                ledger_dir.display()
+            )
+        })?;
+        let ledger_path = ledger_dir.join(format!("{}.db", sanitize_filename_for_ledger(goal_id)));
+        let ledger = octos_fleet::GoalLedger::open(&ledger_path)
+            .map_err(|e| format!("failed to open goal ledger {}: {e}", ledger_path.display()))?;
+        // FK constraint: escalations reference goals(goal_id), so we must
+        // upsert the goal row BEFORE appending an escalation (codex PR
+        // review #3). Same minimal-stub pattern as findings above.
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let goal_stub = octos_fleet::Goal {
+            goal_id: goal_id.to_owned(),
+            objective: String::new(),
+            status: "active".to_owned(),
+            tokens_used: 0,
+            token_budget: 0,
+            continuations_used: 0,
+            revision: 0, // assigned by store on update
+            created_at_ms: now_ms,
+            updated_at_ms: now_ms,
+        };
+        let _ = ledger.create_goal(&goal_stub);
+        // FK constraint: escalations with task_id reference tasks(task_id),
+        // so we must ALSO upsert a task stub when task_id is Some (codex PR
+        // review merge blocker). Same minimal-stub pattern as findings above.
+        if let Some(task_id_str) = task_id {
+            let task_stub = octos_fleet::Task {
+                task_id: task_id_str.to_owned(),
+                goal_id: goal_id.to_owned(),
+                title: String::new(),
+                detail: String::new(),
+                status: "running".to_owned(),
+                assigned_peer: Some(peer_slug.to_owned()),
+                created_at_ms: now_ms,
+                updated_at_ms: now_ms,
+            };
+            let _ = ledger.create_task(&task_stub);
+        }
+        let escalation_id = format!("esc-{}-{}", peer_slug, uuid::Uuid::now_v7());
+        let escalation = octos_fleet::Escalation {
+            escalation_id: escalation_id.clone(),
+            goal_id: goal_id.to_owned(),
+            task_id: task_id.map(str::to_owned),
+            peer_id: peer_slug.to_owned(),
+            question: question.chars().take(500).collect(),
+            context: None,
+            status: "open".to_owned(),
+            default_action: None,
+            default_after_secs: None,
+            created_at_ms: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0),
+            resolved_at_ms: None,
+            resolved_by: None,
+            resolution: None,
+        };
+        ledger
+            .append_escalation(&escalation)
+            .map_err(|e| format!("failed to append peer escalation: {e}"))?;
+        Ok(escalation_id)
+    }
+
+    /// Directory holding this profile's per-goal ledgers. Resolved under the
+    /// profile's persistent `data_dir` so ledgers (a) survive restarts and
+    /// `/tmp` cleanup, (b) are profile-isolated (a peer on profile A cannot
+    /// read/write profile B's ledger), and (c) cannot be redirected via
+    /// environment variables. Created on first write with restrictive
+    /// permissions (0755) by `model_goal_record_peer_finding`.
+    fn goal_ledger_dir(profile_data_dir: &std::path::Path) -> std::path::PathBuf {
+        profile_data_dir.join("goal-ledgers")
     }
 
     /// #1857 PR 5a — stash the controller workspace binding on the goal record
@@ -5953,6 +6490,75 @@ fn now_ms_u64() -> u64 {
     now_ms().try_into().unwrap_or(0)
 }
 
+/// Sanitize a `goal_id` for use as a ledger filename. Goal ids are uuids in
+/// practice, but we strip anything that isn't alphanumeric / `-` / `_` so a
+/// hostile or legacy id cannot escape the ledger dir.
+fn sanitize_filename_for_ledger(goal_id: &str) -> String {
+    goal_id
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+/// Symlink-safe `staged_peer_dir` for the ledger aggregation path: a peer
+/// dir is usable only if (a) the slug is safe (no path separators / parent
+/// refs), (b) the dir is a REAL non-symlink directory, and (c) it carries
+/// the `brief.md` staging contract. Mirrors the stricter fd-anchored
+/// version in `ui_protocol.rs` — a fuller hardening (O_NOFOLLOW on every
+/// leaf) is deferred.
+fn staged_peer_dir_for_ledger(
+    peers_root: &std::path::Path,
+    slug: &str,
+) -> Option<std::path::PathBuf> {
+    // Slug safety: refuse anything containing path separators or parent refs.
+    if slug.is_empty()
+        || slug.contains('/')
+        || slug.contains('\\')
+        || slug.contains("..")
+        || slug.starts_with('.')
+    {
+        return None;
+    }
+    let dir = peers_root.join(slug);
+    // `symlink_metadata` does NOT follow the final symlink — refuse a
+    // symlinked peer dir outright.
+    let meta = std::fs::symlink_metadata(&dir).ok()?;
+    if !meta.is_dir() || meta.file_type().is_symlink() {
+        return None;
+    }
+    // The staging contract: a real `brief.md` regular file (non-symlink).
+    let brief = dir.join("brief.md");
+    let brief_meta = std::fs::symlink_metadata(&brief).ok()?;
+    if !brief_meta.is_file() || brief_meta.file_type().is_symlink() {
+        return None;
+    }
+    Some(dir)
+}
+
+/// Symlink-safe read of a small peer file (e.g. `goal`, `result.md`).
+/// Refuses symlinked leaves; reads with a 64 KiB cap so a maliciously
+/// large `result.md` cannot OOM the goal_get snapshot. Returns `None` on
+/// any error (missing, symlink, oversize, unreadable) — fail-open so a
+/// single bad peer does not break the entire aggregation.
+fn read_peer_file_for_ledger(peer_dir: &std::path::Path, leaf: &str) -> Option<String> {
+    const CAP: usize = 64 * 1024;
+    let path = peer_dir.join(leaf);
+    let meta = std::fs::symlink_metadata(&path).ok()?;
+    if !meta.is_file() || meta.file_type().is_symlink() {
+        return None;
+    }
+    if meta.len() > CAP as u64 {
+        return None;
+    }
+    std::fs::read_to_string(&path).ok()
+}
+
 /// PR B — render a [`WorkerGrant`] to the wire JSON shape the goal tools speak
 /// (`{ network: {mode, hosts}, tools: [...], fs: "workspace"|"host" }`), so a
 /// surfaced escalation's advisory requested grant reads back the same way the
@@ -6590,6 +7196,67 @@ fn detect_goal_complete_sentinel(content: &str) -> bool {
     GOAL_COMPLETE_SENTINELS
         .iter()
         .any(|sentinel| last_line == *sentinel || last_line.ends_with(sentinel))
+}
+
+/// INDEPENDENT goal-completion verifier — a separate cheap-lane LLM pass that
+/// judges whether the objective is genuinely met by the agent's evidence.
+///
+/// Loop-engineering: the agent's `<goal:complete>` sentinel is only a CLAIM.
+/// This verifier independently checks the objective against the evidence and
+/// returns Done/NotDone. Fail-safe: any provider/parse error returns NotDone
+/// (never spuriously completes).
+///
+/// Mirrors the AgentVerifierConfig pattern: fresh judge prompt, no agent
+/// scratchpad, separate model lane.
+pub(crate) async fn run_goal_completion_verifier(
+    provider: Arc<dyn LlmProvider>,
+    objective: &str,
+    evidence: &str,
+) -> GoalCompletionVerdict {
+    let prompt = format!(
+        "You are an INDEPENDENT completion verifier. Do not assume the work is \
+done just because the agent said so.\n\nGOAL OBJECTIVE:\n{objective}\n\nThe \
+agent's final reply (which claims the goal is complete):\n{evidence}\n\nJudge \
+ONLY whether the objective is genuinely and fully satisfied by concrete \
+evidence in the reply. If anything required is missing, unverified, or merely \
+asserted, it is NOT done.\n\nAnswer with EXACTLY one line:\n`DONE` if the \
+objective is fully met, or `NOT_DONE: <short reason>` otherwise."
+    );
+    let config = octos_llm::ChatConfig {
+        max_tokens: Some(200),
+        temperature: Some(0.0),
+        tool_choice: Default::default(),
+        stop_sequences: Vec::new(),
+        reasoning_effort: None,
+        response_format: None,
+        context_management: None,
+    };
+    let messages = vec![octos_core::Message::user(prompt)];
+    let verdict_text = match provider.chat(&messages, &[], &config).await {
+        Ok(response) => response.content.unwrap_or_default(),
+        Err(error) => {
+            return GoalCompletionVerdict::NotDone {
+                reason: format!("verifier call failed: {error}"),
+            };
+        }
+    };
+    // "Done" only on an explicit affirmative that is NOT negated. Checking the
+    // trimmed first token keeps `NOT_DONE` from matching the `DONE` substring.
+    // Strip backticks first: the prompt says "`DONE`" (with backticks), so a
+    // literally-compliant model returns `DONE` → we must accept that.
+    let trimmed = verdict_text.trim().trim_matches('`');
+    let first_token = trimmed
+        .split(|c: char| c.is_whitespace() || c == ':')
+        .next()
+        .unwrap_or("")
+        .to_ascii_uppercase();
+    if first_token == "DONE" {
+        GoalCompletionVerdict::Done
+    } else {
+        GoalCompletionVerdict::NotDone {
+            reason: trimmed.chars().take(200).collect(),
+        }
+    }
 }
 
 fn enqueue_agent_terminal_continuations(
@@ -15231,17 +15898,21 @@ mod tests {
             &session_id,
             "tenant-a",
             "still working on it",
+            &GoalCompletionVerdict::Done,
+            None,
         ));
         assert_eq!(
             orchestrator.goal_status_for_test(&session_id).as_deref(),
             Some("active"),
         );
 
-        // Sentinel content → transition to `complete`.
+        // Sentinel content + Done verdict → transition to `complete`.
         assert!(orchestrator.maybe_complete_goal_from_model(
             &session_id,
             "tenant-a",
             "All done. <goal:complete>",
+            &GoalCompletionVerdict::Done,
+            None,
         ));
         assert_eq!(
             orchestrator.goal_status_for_test(&session_id).as_deref(),
@@ -15258,6 +15929,133 @@ mod tests {
             "tenant-a",
             GoalRuntimeIdleState::idle(),
         ));
+    }
+
+    /// CRITICAL: NotDone verdict must keep goal Active (not complete).
+    /// This is the core of the independent verifier gate — the agent's
+    /// self-declared completion is only a CLAIM; the verifier must confirm.
+    #[test]
+    fn maybe_complete_goal_from_model_rejects_notdone_verdict() {
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let session_id = SessionKey::with_profile("tenant-a", "api", "goal-notdone");
+        orchestrator
+            .set_goal(GoalSetRequest {
+                session_id: session_id.clone(),
+                profile_id: "tenant-a".into(),
+                objective: "verify independently".into(),
+                status: Some("active".into()),
+                token_budget: None,
+                transition_actor: None,
+            })
+            .expect("set active goal");
+
+        // Sentinel content + NotDone verdict → goal stays Active.
+        assert!(!orchestrator.maybe_complete_goal_from_model(
+            &session_id,
+            "tenant-a",
+            "I claim this is done. <goal:complete>",
+            &GoalCompletionVerdict::NotDone {
+                reason: "evidence insufficient".to_string(),
+            },
+            None,
+        ));
+        assert_eq!(
+            orchestrator.goal_status_for_test(&session_id).as_deref(),
+            Some("active"),
+            "NotDone verdict must keep goal Active, not complete it"
+        );
+    }
+
+    /// CRITICAL: Stale goal_id must reject completion (TOCTOU fix).
+    /// If the goal changes between the verifier call and completion,
+    /// a Done verdict for the OLD goal must NOT complete the NEW goal.
+    #[test]
+    fn maybe_complete_goal_from_model_rejects_stale_goal_id() {
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let session_id = SessionKey::with_profile("tenant-a", "api", "goal-stale");
+        orchestrator
+            .set_goal(GoalSetRequest {
+                session_id: session_id.clone(),
+                profile_id: "tenant-a".into(),
+                objective: "goal A".into(),
+                status: Some("active".into()),
+                token_budget: None,
+                transition_actor: None,
+            })
+            .expect("set active goal");
+        let goal_a_id = orchestrator.goal_id_for_session(&session_id);
+
+        // Done verdict with WRONG goal_id (stale) must NOT complete the goal.
+        assert!(!orchestrator.maybe_complete_goal_from_model(
+            &session_id,
+            "tenant-a",
+            "Done. <goal:complete>",
+            &GoalCompletionVerdict::Done,
+            Some("wrong-goal-id"), // Stale/incorrect ID
+        ));
+        assert_eq!(
+            orchestrator.goal_status_for_test(&session_id).as_deref(),
+            Some("active"),
+            "stale goal_id must reject completion (TOCTOU fix)"
+        );
+
+        // Done verdict with CORRECT goal_id DOES complete the goal.
+        assert!(orchestrator.maybe_complete_goal_from_model(
+            &session_id,
+            "tenant-a",
+            "Done. <goal:complete>",
+            &GoalCompletionVerdict::Done,
+            goal_a_id.as_deref(), // Correct ID
+        ));
+        assert_eq!(
+            orchestrator.goal_status_for_test(&session_id).as_deref(),
+            Some("complete"),
+            "correct goal_id allows completion"
+        );
+    }
+
+    /// Parser must accept the prompt's own example format: "`DONE`" (with backticks).
+    /// The prompt says "Answer with EXACTLY one line: `DONE`", so a literally-
+    /// compliant model returns `DONE` → we must accept that.
+    #[tokio::test]
+    async fn run_goal_completion_verifier_accepts_backticks() {
+        struct BacktickProvider;
+        #[async_trait::async_trait]
+        impl LlmProvider for BacktickProvider {
+            async fn chat(
+                &self,
+                _messages: &[octos_core::Message],
+                _tools: &[octos_llm::ToolSpec],
+                _config: &octos_llm::ChatConfig,
+            ) -> eyre::Result<octos_llm::ChatResponse> {
+                Ok(octos_llm::ChatResponse {
+                    content: Some("`DONE`".to_string()),
+                    reasoning_content: None,
+                    tool_calls: Vec::new(),
+                    stop_reason: octos_llm::StopReason::EndTurn,
+                    usage: octos_llm::TokenUsage::default(),
+                    provider_index: Some(0),
+                })
+            }
+            fn model_id(&self) -> &str {
+                "mock"
+            }
+            fn provider_name(&self) -> &str {
+                "mock"
+            }
+        }
+
+        let verdict = run_goal_completion_verifier(
+            Arc::new(BacktickProvider),
+            "test objective",
+            "test evidence",
+        )
+        .await;
+        assert_eq!(
+            verdict,
+            GoalCompletionVerdict::Done,
+            "parser must accept `DONE` (with backticks)"
+        );
     }
 
     /// `detect_goal_complete_sentinel` covers all canonical sentinels
@@ -17006,17 +17804,21 @@ mod tests {
             &session_id,
             "tenant-a",
             "I am about to write <goal:complete> shortly, but step 2 first.",
+            &GoalCompletionVerdict::Done,
+            None,
         ));
         assert_eq!(
             orchestrator.goal_status_for_test(&session_id).as_deref(),
             Some("active"),
         );
 
-        // Trailing sentinel (the canonical AppUI shape) flips it.
+        // Trailing sentinel (the canonical AppUI shape) + Done verdict flips it.
         assert!(orchestrator.maybe_complete_goal_from_model(
             &session_id,
             "tenant-a",
             "All requested checks finished.\n\n<goal:complete>",
+            &GoalCompletionVerdict::Done,
+            None,
         ));
         assert_eq!(
             orchestrator.goal_status_for_test(&session_id).as_deref(),

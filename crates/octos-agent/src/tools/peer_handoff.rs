@@ -51,6 +51,12 @@ pub struct PeerHandoffRequest {
     /// lanes and, on a match, records it beside the brief so the peer's turns
     /// resolve that provider; an unknown key is a warning, not a failure.
     pub model: Option<String>,
+    /// Optional GOAL ID this peer is working on. When set, the peer's findings
+    /// and escalations are scoped to this goal in the ledger.
+    pub goal_id: Option<String>,
+    /// Optional TASK ID within the goal. When set, the peer's work is tracked
+    /// as part of this specific task.
+    pub task_id: Option<String>,
 }
 
 /// Staged-peer facts the host callback returns on success.
@@ -102,6 +108,10 @@ struct Input {
     worktree: bool,
     #[serde(default)]
     model: Option<String>,
+    #[serde(default)]
+    goal_id: Option<String>,
+    #[serde(default)]
+    task_id: Option<String>,
 }
 
 fn failure(output: impl Into<String>) -> ToolResult {
@@ -224,6 +234,8 @@ impl Tool for PeerHandoffTool {
             name: name.to_owned(),
             worktree: input.worktree,
             model,
+            goal_id: input.goal_id,
+            task_id: input.task_id,
         };
         match (self.stage)(request) {
             Ok(staged) => {
@@ -433,6 +445,8 @@ mod tests {
                 name: "CI Fix".to_owned(),
                 worktree: true,
                 model: None,
+                goal_id: None,
+                task_id: None,
             },
             "brief/name are trimmed, worktree passes through"
         );
@@ -511,6 +525,8 @@ mod tests {
                 name: "Solo".to_owned(),
                 worktree: false,
                 model: None,
+                goal_id: None,
+                task_id: None,
             }
         );
     }

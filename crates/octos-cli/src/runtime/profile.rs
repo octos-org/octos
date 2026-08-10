@@ -1187,7 +1187,14 @@ impl ProfileRuntime {
         // with the `api` feature (like the orchestrator itself).
         #[cfg(feature = "api")]
         {
-            tools.register(crate::goal_tool::GoalGetTool::new(profile.id.clone()));
+            // Peer-agent-based goal: pass the profile's data_dir so
+            // `goal_get` can aggregate BOTH live peer findings (under
+            // `<data_dir>/peers/<slug>/goal`) AND durable ledger findings
+            // (under `<data_dir>/goal-ledgers/<goal_id>.db`).
+            tools.register(
+                crate::goal_tool::GoalGetTool::new(profile.id.clone())
+                    .with_data_dir(data_dir.to_path_buf()),
+            );
             tools.register(crate::goal_tool::GoalCreateTool::new(profile.id.clone()));
             tools.register(crate::goal_tool::GoalUpdateTool::new(profile.id.clone()));
             // #1857 PR 5a — the goal keeper's fleet controls: decompose the
