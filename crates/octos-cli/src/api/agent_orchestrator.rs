@@ -3257,11 +3257,17 @@ impl InProcessAgentOrchestrator {
         profile_id: &str,
         originator_session: &str,
     ) -> Value {
+        // #1666 scoped-key match (see model_goal_record_peer_finding): compare
+        // the originator's scoped key too, else a cwd-scoped goal is unreadable
+        // by its own peer.
+        let originator_scoped = self.scoped_goal_key(&SessionKey(originator_session.to_owned()));
         let state = self.state();
         let found = state.goals.iter().find(|(key, goal)| {
             goal.goal_id == goal_id
                 && goal.profile_id == profile_id
-                && (key.to_string() == originator_session || key.base_key() == originator_session)
+                && (**key == originator_scoped
+                    || key.to_string() == originator_session
+                    || key.base_key() == originator_session)
         });
         match found {
             Some((_key, goal)) => json!({
@@ -3498,20 +3504,25 @@ impl InProcessAgentOrchestrator {
         content: &str,
     ) -> Result<String, String> {
         // Verify the goal exists under this profile AND that its owning
-        // session matches the peer's originator (the goal-binding check
-        // above). We walk the map once and capture the matching key for
-        // downstream use.
+        // session matches the peer's originator (the goal-binding check).
+        //
+        // The HashMap key is the SCOPED goal key (`scoped_goal_key`, #1666):
+        // for a cwd-scoped session it is `dev:local:tui#coding\0~cwd-<scope>`.
+        // The originator recorded on the peer is the plain wire id
+        // (`dev:local:tui#coding`). Neither `key.to_string()` (carries the
+        // scope suffix) nor `key.base_key()` (splits on `#` → `dev:local:tui`)
+        // can equal that plain id, so a scoped goal was rejected as "not
+        // owned" and the peer's finding never reached the ledger (soak
+        // #1953). Resolve the originator's OWN scoped key and compare directly
+        // — it equals the goal's stored key (the same resolution `active_goal_id`
+        // used to auto-bind the peer here in the first place).
+        let originator_scoped = self.scoped_goal_key(&SessionKey(originator_session.to_owned()));
         let state = self.state();
         let goal_owner_matches = state.goals.iter().any(|(key, goal)| {
             goal.goal_id == goal_id
                 && goal.profile_id == profile_id
-                // The HashMap key is the scoped goal key (the session that
-                // created the goal). The originator recorded on the peer
-                // staging is the wire-format session id; for the by-id path
-                // we compare against the scoped key's string form. Both
-                // shapes refer to the same master session when the peer was
-                // legitimately staged under this goal.
-                && (key.to_string() == originator_session
+                && (*key == originator_scoped
+                    || key.to_string() == originator_session
                     || key.base_key() == originator_session)
         });
         drop(state);
@@ -3624,13 +3635,17 @@ impl InProcessAgentOrchestrator {
         task_id: Option<&str>,
         question: &str,
     ) -> Result<String, String> {
-        // Same goal-binding check as `model_goal_record_peer_finding`: the
-        // goal record's owning session must match the peer's originator.
+        // Same goal-binding check as `model_goal_record_peer_finding` (incl.
+        // the #1666 scoped-key match): the goal record's owning session must
+        // match the peer's originator.
+        let originator_scoped = self.scoped_goal_key(&SessionKey(originator_session.to_owned()));
         let state = self.state();
         let goal_owner_matches = state.goals.iter().any(|(key, goal)| {
             goal.goal_id == goal_id
                 && goal.profile_id == profile_id
-                && (key.to_string() == originator_session || key.base_key() == originator_session)
+                && (*key == originator_scoped
+                    || key.to_string() == originator_session
+                    || key.base_key() == originator_session)
         });
         drop(state);
         if !goal_owner_matches {
