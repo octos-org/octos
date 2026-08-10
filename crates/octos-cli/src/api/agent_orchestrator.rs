@@ -868,17 +868,23 @@ type LoopRunnableFilter<'a> = dyn Fn(&SessionKey, &str) -> bool + 'a;
 impl InProcessAgentOrchestrator {
     /// Get the goal objective for a session (used by goal completion verifier).
     pub(crate) fn goal_objective_for_test(&self, session_id: &SessionKey) -> Option<String> {
-        self.state()
-            .goals
-            .get(session_id)
-            .map(|g| g.objective.clone())
+        // #1666 scoping (soak bug: goals stored under the cwd-scoped store
+        // identity via `model_create_goal`, but this looked up the RAW wire
+        // session id → miss → the completion verifier got "no goal objective
+        // found for verification" and goals stuck at `blocked`). Resolve the
+        // same scoped key `model_create_goal`/`model_goal_snapshot` use.
+        let key = self.scoped_goal_key(session_id);
+        self.state().goals.get(&key).map(|g| g.objective.clone())
     }
 
     /// Get the goal ID for a session (used by goal completion verifier to prevent stale verdicts).
     pub(crate) fn goal_id_for_session(&self, session_id: &SessionKey) -> Option<String> {
+        // Same #1666 scoping as `goal_objective_for_test` — resolve the scoped
+        // store key, not the raw wire session id.
+        let key = self.scoped_goal_key(session_id);
         self.state()
             .goals
-            .get(session_id)
+            .get(&key)
             .map(|g| g.goal_id.clone())
     }
     fn state(&self) -> std::sync::MutexGuard<'_, AutonomyRuntimeState> {
@@ -2463,8 +2469,13 @@ impl InProcessAgentOrchestrator {
         session_id: &SessionKey,
         profile_id: &str,
     ) -> Option<String> {
+        // #1666 scoping: resolve the same cwd-scoped store key
+        // `model_create_goal` writes under (identity when no scope is
+        // registered). Used by peer_handoff auto-bind — a raw lookup would
+        // miss a scoped goal and stage the peer goal-less.
+        let key = self.scoped_goal_key(session_id);
         let state = self.state();
-        let goal = state.goals.get(session_id)?;
+        let goal = state.goals.get(&key)?;
         if goal.profile_id == profile_id && goal.status == "active" {
             Some(goal.goal_id.clone())
         } else {

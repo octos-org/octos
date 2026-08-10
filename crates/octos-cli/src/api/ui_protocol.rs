@@ -13905,6 +13905,16 @@ fn build_peer_handoff_callback(
         // `stage_peer` writes it atomically BEFORE brief.md and rolls the
         // staging back on failure, so a peer is never visible-but-ownerless.
         let originator = originating_session.to_string();
+        // Peer-agent-based goal AUTO-BIND (#1953): if the master handed off
+        // WITHOUT an explicit goal_id but its session has an ACTIVE goal, bind
+        // the peer to that goal. The model (esp. k3) does not reliably thread
+        // goal_id — it parallelizes goal_create+peer_handoff (the id isn't
+        // available yet) or simply omits it — so relying on the LLM leaves
+        // every peer goal-less and the whole loop inert. The active goal is
+        // the correct default; an explicit goal_id still wins.
+        let resolved_goal_id: Option<String> = request.goal_id.clone().or_else(|| {
+            default_agent_orchestrator().active_goal_id(&originating_session, &profile_id)
+        });
         let staged = stage_peer(
             &peers_root,
             &workspace_root,
@@ -13913,9 +13923,8 @@ fn build_peer_handoff_callback(
             Some(originator.as_str()),
             &request.brief,
             request.worktree,
-            // Peer-agent-based goal: forward the goal context the model
-            // attached to the handoff. Either may be None (goal-less peer).
-            request.goal_id.as_deref(),
+            // Explicit goal_id wins; else the master's active goal (auto-bind).
+            resolved_goal_id.as_deref(),
             request.task_id.as_deref(),
         )
         .map_err(|err| err.message)?;
