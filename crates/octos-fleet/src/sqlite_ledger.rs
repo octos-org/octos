@@ -820,6 +820,78 @@ impl GoalLedger {
             .collect::<Result<Vec<_>, _>>()?;
         Ok(findings)
     }
+
+    /// #1945 — count this goal's tasks per status (pending/running/complete/
+    /// failed), sorted by status for a stable shape. The tasks half of the
+    /// `goal_get` `ledger_digest`: the re-orienting master reads counts, never
+    /// rows, so this stays fixed-size however large the plan grows. NOTE:
+    /// today's only production task writer is the FK stub in
+    /// `model_goal_record_peer_finding` (octos-cli), which inserts `running`
+    /// rows and never updates them — so production counts read
+    /// `{"running": N}` until a real task-status writer lands.
+    pub fn task_status_counts(&self, goal_id: &str) -> Result<Vec<(String, u64)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT status, COUNT(*) FROM tasks WHERE goal_id = ?1 GROUP BY status ORDER BY status",
+        )?;
+        let counts = stmt
+            .query_map(params![goal_id], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(counts)
+    }
+
+    /// #1945 codex round — count this goal's findings per raw `lifecycle`
+    /// (proposed/observed/…), sorted by lifecycle. A direct GROUP BY over ALL
+    /// findings — INCLUDING `task_id IS NULL` rows, which the digest's
+    /// per-path roll-up skips and which are exactly what ordinary peers write
+    /// (peer_handoff stages no fleet task).
+    pub fn findings_count_by_lifecycle(&self, goal_id: &str) -> Result<Vec<(String, u64)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT lifecycle, COUNT(*) FROM findings WHERE goal_id = ?1 \
+             GROUP BY lifecycle ORDER BY lifecycle",
+        )?;
+        let counts = stmt
+            .query_map(params![goal_id], |row| {
+                let n: i64 = row.get(1)?;
+                Ok((row.get(0)?, u64::try_from(n).unwrap_or(0)))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(counts)
+    }
+
+    /// #1945 codex round — count this goal's findings per `kind`
+    /// (observation/hypothesis/…), sorted by kind. Same ALL-rows semantics as
+    /// [`Self::findings_count_by_lifecycle`].
+    pub fn findings_count_by_kind(&self, goal_id: &str) -> Result<Vec<(String, u64)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT kind, COUNT(*) FROM findings WHERE goal_id = ?1 \
+             GROUP BY kind ORDER BY kind",
+        )?;
+        let counts = stmt
+            .query_map(params![goal_id], |row| {
+                let n: i64 = row.get(1)?;
+                Ok((row.get(0)?, u64::try_from(n).unwrap_or(0)))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(counts)
+    }
+
+    /// #1945 codex round — the goal's total learning cost:
+    /// `COALESCE(SUM(cost_tokens), 0)` over ALL findings, task-scoped or not
+    /// (the digest's `cost_by_path` drops `task_id IS NULL` rows — the ones
+    /// the #1965 cost lane populates). Saturating `i64 → u64`, no unchecked
+    /// casts; an empty goal sums to 0, not NULL.
+    pub fn total_cost_tokens(&self, goal_id: &str) -> Result<u64> {
+        let conn = self.conn.lock().unwrap();
+        let total: i64 = conn.query_row(
+            "SELECT COALESCE(SUM(cost_tokens), 0) FROM findings WHERE goal_id = ?1",
+            params![goal_id],
+            |row| row.get(0),
+        )?;
+        Ok(u64::try_from(total).unwrap_or(0))
+    }
 }
 
 #[cfg(test)]
@@ -1535,6 +1607,281 @@ mod digest_integration_tests {
                 lifecycle, expected_status
             );
         }
+    }
+
+    // #1945 — the goal_get `ledger_digest` read path reduces the digest to
+    // COUNTS; this proves the counts it derives are right over a ledger with
+    // mixed lifecycles, a supersession, and per-path cost. The lifecycle →
+    // FindingStatus mapping is the `From<&Finding>` conversion above:
+    // verified/reproduced → Confirmed, proposed/observed → Predicted,
+    // refuted/superseded/retracted → RuledOut.
+    #[test]
+    fn digest_from_ledger_counts_mixed_lifecycles_and_supersession() {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = GoalLedger::open(dir.path().join("ledger.db")).unwrap();
+        ledger
+            .create_goal(&Goal {
+                goal_id: "g1".to_string(),
+                objective: "count me".to_string(),
+                status: "active".to_string(),
+                tokens_used: 0,
+                token_budget: 10000,
+                continuations_used: 0,
+                revision: 0,
+                created_at_ms: 1000,
+                updated_at_ms: 1000,
+            })
+            .unwrap();
+        for (task_id, status) in [("t-run", "running"), ("t-done", "complete")] {
+            ledger
+                .create_task(&Task {
+                    task_id: task_id.to_string(),
+                    goal_id: "g1".to_string(),
+                    title: task_id.to_string(),
+                    detail: "test".to_string(),
+                    status: status.to_string(),
+                    assigned_peer: None,
+                    created_at_ms: 1000,
+                    updated_at_ms: 1000,
+                })
+                .unwrap();
+        }
+        // (finding_id, task, kind, lifecycle, cost, supersedes)
+        type SeedRow = (
+            &'static str,
+            &'static str,
+            &'static str,
+            &'static str,
+            u64,
+            Vec<&'static str>,
+        );
+        let rows: [SeedRow; 4] = [
+            ("f1", "t-run", "hypothesis", "observed", 100, vec![]),
+            ("f2", "t-run", "observation", "verified", 200, vec![]),
+            ("f3", "t-done", "observation", "refuted", 300, vec![]),
+            // f4 overturns f1: f1 leaves the live frontier, f4 joins it.
+            ("f4", "t-done", "diagnosis", "verified", 400, vec!["f1"]),
+        ];
+        for (finding_id, task_id, kind, lifecycle, cost, supersedes) in rows {
+            ledger
+                .append_finding(&Finding {
+                    rowid: None,
+                    finding_id: finding_id.to_string(),
+                    seq: 0, // assigned by store
+                    task_id: Some(task_id.to_string()),
+                    goal_id: "g1".to_string(),
+                    kind: kind.to_string(),
+                    lifecycle: lifecycle.to_string(),
+                    confidence: "medium".to_string(),
+                    review_state: "unreviewed".to_string(),
+                    assertion: format!("claim {finding_id}"),
+                    evidence: None,
+                    config_version: None,
+                    derived_from: None,
+                    supersedes: supersedes.into_iter().map(str::to_string).collect(),
+                    cost_tokens: cost,
+                    created_at_ms: 2000,
+                    created_by: "peer-a".to_string(),
+                })
+                .unwrap();
+        }
+
+        let digest = digest_from_ledger(
+            &ledger,
+            "g1",
+            &crate::digest::DigestOptions {
+                max_chars: usize::MAX,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        // f1 was overturned → 3 live findings, 1 overturn edge, watermark = 4.
+        assert_eq!(digest.new_findings.len(), 3, "superseded f1 is not live");
+        assert!(digest.new_findings.iter().all(|f| f.id != "f1"));
+        assert_eq!(digest.overturns.len(), 1);
+        assert_eq!(digest.overturns[0].overturned, "f1");
+        assert_eq!(digest.watermark, 4);
+        let confirmed = digest
+            .new_findings
+            .iter()
+            .filter(|f| f.status == crate::records::FindingStatus::Confirmed)
+            .count();
+        let ruled_out = digest
+            .new_findings
+            .iter()
+            .filter(|f| f.status == crate::records::FindingStatus::RuledOut)
+            .count();
+        assert_eq!((confirmed, ruled_out), (2, 1), "verified×2 + refuted×1");
+        // `component` carries the ledger `kind` (see `From<&Finding>`), so the
+        // read path can count findings per kind straight off the digest.
+        let observations = digest
+            .new_findings
+            .iter()
+            .filter(|f| f.component == "observation")
+            .count();
+        assert_eq!(observations, 2);
+        // Cost rolls up per path; the total is what `ledger_digest` reports.
+        let total: u64 = digest.cost_by_path.iter().map(|p| p.tokens).sum();
+        assert_eq!(total, 1000, "all four findings' cost, live or not");
+    }
+
+    // #1945 — task counts by status: the tasks half of the goal_get
+    // `ledger_digest`. A read this small must not require listing rows.
+    #[test]
+    fn task_status_counts_groups_this_goals_tasks_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = GoalLedger::open(dir.path().join("ledger.db")).unwrap();
+        for gid in ["g1", "g2"] {
+            ledger
+                .create_goal(&Goal {
+                    goal_id: gid.to_string(),
+                    objective: "test".to_string(),
+                    status: "active".to_string(),
+                    tokens_used: 0,
+                    token_budget: 10000,
+                    continuations_used: 0,
+                    revision: 0,
+                    created_at_ms: 1000,
+                    updated_at_ms: 1000,
+                })
+                .unwrap();
+        }
+        for (task_id, goal_id, status) in [
+            ("t1", "g1", "running"),
+            ("t2", "g1", "running"),
+            ("t3", "g1", "complete"),
+            ("t4", "g2", "failed"), // foreign goal — must not be counted
+        ] {
+            ledger
+                .create_task(&Task {
+                    task_id: task_id.to_string(),
+                    goal_id: goal_id.to_string(),
+                    title: task_id.to_string(),
+                    detail: "test".to_string(),
+                    status: status.to_string(),
+                    assigned_peer: None,
+                    created_at_ms: 1000,
+                    updated_at_ms: 1000,
+                })
+                .unwrap();
+        }
+        let counts = ledger.task_status_counts("g1").unwrap();
+        assert_eq!(
+            counts,
+            vec![("complete".to_string(), 1), ("running".to_string(), 2)]
+        );
+        assert!(
+            ledger.task_status_counts("g-none").unwrap().is_empty(),
+            "an unknown goal has no task rows"
+        );
+    }
+
+    // #1945 codex round — AGGREGATE UNIT TEST (direct-SQL seeding is fine
+    // here; the integration-shaped tests in octos-cli drive the production
+    // writer instead). The lifecycle/kind/cost aggregates must count EVERY
+    // finding of the goal, including `task_id = NULL` rows — exactly the rows
+    // ordinary peers write (peer_handoff stages no fleet task) and the rows
+    // the digest's per-path cost roll-up drops on the floor.
+    #[test]
+    fn finding_aggregates_count_task_less_rows_too() {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = GoalLedger::open(dir.path().join("ledger.db")).unwrap();
+        ledger
+            .create_goal(&Goal {
+                goal_id: "g1".to_string(),
+                objective: "aggregate me".to_string(),
+                status: "active".to_string(),
+                tokens_used: 0,
+                token_budget: 10000,
+                continuations_used: 0,
+                revision: 0,
+                created_at_ms: 1000,
+                updated_at_ms: 1000,
+            })
+            .unwrap();
+        ledger
+            .create_task(&Task {
+                task_id: "t1".to_string(),
+                goal_id: "g1".to_string(),
+                title: "t1".to_string(),
+                detail: "test".to_string(),
+                status: "running".to_string(),
+                assigned_peer: None,
+                created_at_ms: 1000,
+                updated_at_ms: 1000,
+            })
+            .unwrap();
+        // (id, task, kind, lifecycle, cost) — f2 and f3 have NO task_id.
+        let rows: [(&str, Option<&str>, &str, &str, u64); 3] = [
+            ("f1", Some("t1"), "observation", "observed", 100),
+            ("f2", None, "observation", "verified", 200),
+            ("f3", None, "hypothesis", "observed", 300),
+        ];
+        for (id, task, kind, lifecycle, cost) in rows {
+            ledger
+                .append_finding(&Finding {
+                    rowid: None,
+                    finding_id: id.to_string(),
+                    seq: 0, // assigned by store
+                    task_id: task.map(str::to_string),
+                    goal_id: "g1".to_string(),
+                    kind: kind.to_string(),
+                    lifecycle: lifecycle.to_string(),
+                    confidence: "medium".to_string(),
+                    review_state: "unreviewed".to_string(),
+                    assertion: format!("claim {id}"),
+                    evidence: None,
+                    config_version: None,
+                    derived_from: None,
+                    supersedes: Vec::new(),
+                    cost_tokens: cost,
+                    created_at_ms: 2000,
+                    created_by: "peer-a".to_string(),
+                })
+                .unwrap();
+        }
+
+        assert_eq!(
+            ledger.findings_count_by_lifecycle("g1").unwrap(),
+            vec![("observed".to_string(), 2), ("verified".to_string(), 1)]
+        );
+        assert_eq!(
+            ledger.findings_count_by_kind("g1").unwrap(),
+            vec![
+                ("hypothesis".to_string(), 1),
+                ("observation".to_string(), 2)
+            ]
+        );
+        assert_eq!(
+            ledger.total_cost_tokens("g1").unwrap(),
+            600,
+            "task-less findings' cost counts too"
+        );
+        assert_eq!(
+            ledger.total_cost_tokens("g-none").unwrap(),
+            0,
+            "no findings sums to 0, not NULL/error"
+        );
+        // The CONTRAST this fix exists for: the path digest's per-path cost
+        // roll-up skips `task_id = NULL` findings entirely (see digest.rs
+        // `cost_by_path`), so summing it loses f2+f3 — which is why the
+        // goal_get `ledger_digest` reads these direct aggregates instead.
+        let digest = digest_from_ledger(
+            &ledger,
+            "g1",
+            &crate::digest::DigestOptions {
+                max_chars: usize::MAX,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let per_path_total: u64 = digest.cost_by_path.iter().map(|p| p.tokens).sum();
+        assert_eq!(
+            per_path_total, 100,
+            "cost_by_path only sees the task-scoped finding — the documented \
+             reason ledger_digest must NOT be built from the path digest"
+        );
     }
 
     // #1961 — an answered escalation must become `resolved` in the ledger.

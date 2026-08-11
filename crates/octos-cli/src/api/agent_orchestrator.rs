@@ -3475,6 +3475,73 @@ impl InProcessAgentOrchestrator {
             .collect()
     }
 
+    /// #1945 — the ledger DIGEST read path, the bounded counterpart of
+    /// [`Self::model_goal_ledger_findings`]: reduce the goal's durable ledger
+    /// to a fixed-size compact summary — task counts by status, finding counts
+    /// by lifecycle and by kind, and the goal's total learning cost. `goal_get`
+    /// folds this in as `ledger_digest`, so a master re-orienting after a
+    /// restart reads counts, never a row dump that grows with the goal.
+    /// Returns `None` when this goal has no ledger file (or it cannot be
+    /// read): absent, not zeros, so a fresh goal adds nothing to the snapshot.
+    ///
+    /// codex round — computed from direct SQL aggregates (`GROUP BY` / `SUM`
+    /// in `GoalLedger`), NOT from `digest_from_ledger`, on two counts: the
+    /// path digest's `cost_by_path` SKIPS every finding with `task_id = NULL`
+    /// — exactly what ordinary peers write (peer_handoff stages no fleet
+    /// task) and exactly the rows the #1965 cost lane populates — and running
+    /// a second full findings scan inside this tool path (on top of the
+    /// `ledger_findings` dump above) is O(N) per `goal_get`. digest.rs stays
+    /// untouched for the future PM path-digest.
+    pub(crate) fn model_goal_ledger_digest(
+        &self,
+        profile_data_dir: &std::path::Path,
+        goal_id: &str,
+    ) -> Option<Value> {
+        let ledger_dir = Self::goal_ledger_dir(profile_data_dir);
+        let ledger_path = ledger_dir.join(format!("{}.db", sanitize_filename_for_ledger(goal_id)));
+        if !ledger_path.is_file() {
+            return None;
+        }
+        // NOTE: `GoalLedger::open` is read-write + `CREATE TABLE IF NOT
+        // EXISTS` DDL (WAL) — inherited from every existing reader, incl. the
+        // findings dump above; there is no read-only open variant yet.
+        let ledger = octos_fleet::GoalLedger::open(&ledger_path).ok()?;
+        // Tasks by status. HONEST-SEMANTICS caveat: production's only task
+        // writer today is the `running` FK stub in
+        // [`Self::model_goal_record_peer_finding`] and nothing ever updates a
+        // task row's status, so real ledgers read `{"running": N}` until a
+        // task-status writer lands.
+        let tasks: std::collections::BTreeMap<String, u64> = ledger
+            .task_status_counts(goal_id)
+            .ok()?
+            .into_iter()
+            .collect();
+        let by_lifecycle: std::collections::BTreeMap<String, u64> = ledger
+            .findings_count_by_lifecycle(goal_id)
+            .ok()?
+            .into_iter()
+            .collect();
+        let by_kind: std::collections::BTreeMap<String, u64> = ledger
+            .findings_count_by_kind(goal_id)
+            .ok()?
+            .into_iter()
+            .collect();
+        let total: u64 = by_lifecycle.values().sum();
+        // Total learning cost over ALL findings — including task-less ones.
+        // NOTE: reads 0 for production-written ledgers until #1965 lands (the
+        // finding writer hardcodes `cost_tokens: 0` today).
+        let cost_tokens = ledger.total_cost_tokens(goal_id).ok()?;
+        Some(json!({
+            "tasks": tasks,
+            "findings": {
+                "total": total,
+                "by_lifecycle": by_lifecycle,
+                "by_kind": by_kind,
+            },
+            "cost_tokens": cost_tokens,
+        }))
+    }
+
     /// #1696 — model-owned goal transition for the `goal_update` tool.
     /// Enforces the ownership matrix server-side (defense in depth beyond
     /// the tool executor): the model may set ONLY `complete` or `blocked`.
@@ -14870,6 +14937,103 @@ mod tests {
             foreign.list_open_escalations("g-foreign").unwrap().len(),
             1,
             "the link target's row must remain untouched"
+        );
+    }
+
+    /// #1945 — `model_goal_ledger_digest` reduces the durable ledger to a
+    /// fixed-size compact summary (task counts by status, finding counts by
+    /// lifecycle/kind, total cost) that `goal_get` folds in as
+    /// `ledger_digest`. No ledger file → `None` (absent, not zeros), so a
+    /// fresh goal adds nothing to the snapshot.
+    ///
+    /// codex round — this test drives the REAL production writer
+    /// ([`InProcessAgentOrchestrator::model_goal_record_peer_finding`]), not
+    /// hand-crafted SQL rows, and asserts what production actually produces:
+    /// `running` task stubs (nothing updates task status today) and
+    /// `observed`/`observation` findings whose `cost_tokens` carry the real
+    /// #1965 per-turn charges. The finding WITHOUT a task_id is the
+    /// load-bearing case twice over: the path digest's `cost_by_path`
+    /// dropped such rows, which is why the digest is computed from direct
+    /// SQL aggregates.
+    #[test]
+    fn model_goal_ledger_digest_reduces_the_ledger_to_compact_counts() {
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let data_dir = tempfile::TempDir::new().unwrap();
+        assert!(
+            orchestrator
+                .model_goal_ledger_digest(data_dir.path(), "g-digest")
+                .is_none(),
+            "no ledger file → None"
+        );
+
+        let wire = "tenant-a:api:goal-ledger-digest";
+        let session_id = SessionKey(wire.to_owned());
+        orchestrator
+            .set_goal(GoalSetRequest {
+                session_id: session_id.clone(),
+                profile_id: "tenant-a".into(),
+                objective: "digest me".into(),
+                status: Some("active".into()),
+                token_budget: Some(10_000),
+                transition_actor: None,
+            })
+            .expect("set active goal");
+        let goal_id = orchestrator
+            .goal_id_for_session(&session_id)
+            .expect("goal_id");
+
+        // Record two peer findings through the production path: one staged
+        // WITH a fleet task (creates the `running` FK stub row) charging 450
+        // tokens (#1965), one WITHOUT a task_id — the common peer_handoff
+        // case — charging 250. Both charges must land in the digest total.
+        orchestrator
+            .model_goal_record_peer_finding(
+                data_dir.path(),
+                &goal_id,
+                "tenant-a",
+                wire,
+                "peer-alpha",
+                Some("t1"),
+                "explored the API surface",
+                450,
+            )
+            .expect("task-scoped finding recorded");
+        orchestrator
+            .model_goal_record_peer_finding(
+                data_dir.path(),
+                &goal_id,
+                "tenant-a",
+                wire,
+                "peer-beta",
+                None,
+                "no fleet task, still counted",
+                250,
+            )
+            .expect("task-less finding recorded");
+
+        let digest = orchestrator
+            .model_goal_ledger_digest(data_dir.path(), &goal_id)
+            .expect("ledger exists → digest present");
+        // Only the `running` stub exists — production never updates task
+        // status today (honest semantics, see model_goal_ledger_digest).
+        assert_eq!(digest["tasks"], json!({"running": 1}));
+        assert_eq!(
+            digest["findings"]["total"],
+            json!(2),
+            "the task-less finding is counted too — the regression the SQL \
+             aggregates exist to prevent"
+        );
+        assert_eq!(digest["findings"]["by_lifecycle"], json!({"observed": 2}));
+        assert_eq!(digest["findings"]["by_kind"], json!({"observation": 2}));
+        // #1965 — the digest total sums BOTH charges, including the task-less
+        // row the old `cost_by_path` roll-up dropped (450 + 250).
+        assert_eq!(digest["cost_tokens"], json!(700));
+
+        // A DIFFERENT goal id under the same data dir has its own file → None.
+        assert!(
+            orchestrator
+                .model_goal_ledger_digest(data_dir.path(), "g-other")
+                .is_none()
         );
     }
 
