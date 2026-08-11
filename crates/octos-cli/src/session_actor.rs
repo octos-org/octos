@@ -5148,6 +5148,9 @@ impl SessionActor {
             &assistant_tail,
             &verdict,
             expected_goal_id.as_deref(),
+            // #1957 (codex #1) — this interactive-chat goal path carries the
+            // profile data dir, so a sentinel completion syncs to the ledger.
+            Some(self.data_dir.as_path()),
         ) {
             return;
         }

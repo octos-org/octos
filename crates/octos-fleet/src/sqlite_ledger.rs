@@ -228,6 +228,57 @@ impl GoalLedger {
         Ok(())
     }
 
+    /// #1957 — upsert the goal row with its REAL fields. `create_goal` was the
+    /// only writer and callers used a placeholder (objective empty, status
+    /// stale, tokens 0) purely to satisfy the findings/escalations FK, so an
+    /// audit of the ledger saw no real goal state. This writes the authoritative
+    /// objective/status/tokens/budget on first use AND keeps them fresh on every
+    /// later call. `created_at_ms` and `revision` are preserved on conflict.
+    ///
+    /// #1957 codex #2 — the UPDATE is GUARDED so a stale snapshot cannot undo a
+    /// newer one. Two clauses:
+    ///  1. `updated_at_ms >=`: only overwrite when the incoming snapshot is at
+    ///     least as new as the stored row. Both producers (the transition sync
+    ///     and the finding/escalation path) capture `status` and `updated_at_ms`
+    ///     together under the orchestrator state lock, so a stale status always
+    ///     carries a stale timestamp and this clause rejects it. `>=` (not `>`)
+    ///     keeps same-instant re-writes of the SAME state idempotent.
+    ///  2. never downgrade a `complete` row to a non-`complete` status. This is
+    ///     defence-in-depth against the millisecond-resolution tie the `>=`
+    ///     clause alone cannot break: `complete` is terminal for a given
+    ///     `goal_id` (re-activation mints a FRESH goal_id), so no legitimate
+    ///     writer ever moves an existing `complete` row back to active/blocked.
+    ///     `blocked` is deliberately NOT protected — a blocked goal is
+    ///     user-resumable to `active` under the same id.
+    pub fn upsert_goal(&self, goal: &Goal) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO goals (goal_id, objective, status, tokens_used, token_budget, continuations_used, revision, created_at_ms, updated_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+             ON CONFLICT(goal_id) DO UPDATE SET
+                 objective = excluded.objective,
+                 status = excluded.status,
+                 tokens_used = excluded.tokens_used,
+                 token_budget = excluded.token_budget,
+                 continuations_used = excluded.continuations_used,
+                 updated_at_ms = excluded.updated_at_ms
+             WHERE excluded.updated_at_ms >= goals.updated_at_ms
+               AND NOT (goals.status = 'complete' AND excluded.status <> 'complete')",
+            params![
+                goal.goal_id,
+                goal.objective,
+                goal.status,
+                goal.tokens_used,
+                goal.token_budget,
+                goal.continuations_used,
+                goal.revision,
+                goal.created_at_ms,
+                goal.updated_at_ms,
+            ],
+        )?;
+        Ok(())
+    }
+
     /// Get a goal by ID.
     pub fn get_goal(&self, goal_id: &str) -> Result<Option<Goal>> {
         let conn = self.conn.lock().unwrap();
@@ -1431,5 +1482,206 @@ mod digest_integration_tests {
         assert_eq!(status, "resolved");
         assert_eq!(resolution.as_deref(), Some("[answer] 7"));
         assert_eq!(resolved_by.as_deref(), Some("master-session"));
+    }
+
+    // #1957 — upsert_goal writes REAL fields on insert and refreshes the mutable
+    // ones on conflict, so the ledger goals-row is no longer a stale placeholder.
+    #[test]
+    fn upsert_goal_writes_real_fields_and_refreshes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ledger.db");
+        let ledger = GoalLedger::open(&path).unwrap();
+        ledger
+            .upsert_goal(&Goal {
+                goal_id: "g1".to_string(),
+                objective: "compute 6x7".to_string(),
+                status: "active".to_string(),
+                tokens_used: 100,
+                token_budget: 2000,
+                continuations_used: 0,
+                revision: 0,
+                created_at_ms: 1000,
+                updated_at_ms: 1000,
+            })
+            .unwrap();
+        let got = ledger.get_goal("g1").unwrap().unwrap();
+        assert_eq!(got.objective, "compute 6x7");
+        assert_eq!(got.tokens_used, 100);
+        // Second upsert refreshes status/tokens; created_at is preserved.
+        ledger
+            .upsert_goal(&Goal {
+                goal_id: "g1".to_string(),
+                objective: "compute 6x7".to_string(),
+                status: "complete".to_string(),
+                tokens_used: 550,
+                token_budget: 2000,
+                continuations_used: 3,
+                revision: 0,
+                created_at_ms: 9999, // must be IGNORED on conflict
+                updated_at_ms: 2000,
+            })
+            .unwrap();
+        let got = ledger.get_goal("g1").unwrap().unwrap();
+        assert_eq!(got.status, "complete", "status must refresh");
+        assert_eq!(got.tokens_used, 550, "tokens must refresh");
+        assert_eq!(got.continuations_used, 3);
+        assert_eq!(got.objective, "compute 6x7");
+        assert_eq!(
+            got.created_at_ms, 1000,
+            "created_at must be preserved on conflict"
+        );
+
+        // Guard (issue #1957 codex #2): a STALE upsert — one whose
+        // `updated_at_ms` is OLDER than the row's — must NOT clobber the newer
+        // state. This is the finding-path-after-completion race: a peer finding
+        // lands and re-upserts the goal row with the goal's pre-completion
+        // status; without the `updated_at_ms >=` guard it would flip a
+        // `complete` goal back to `active` in the durable ledger.
+        ledger
+            .upsert_goal(&Goal {
+                goal_id: "g1".to_string(),
+                objective: "compute 6x7".to_string(),
+                status: "active".to_string(), // stale pre-completion status
+                tokens_used: 120,             // stale, lower spend
+                token_budget: 2000,
+                continuations_used: 1,
+                revision: 0,
+                created_at_ms: 1000,
+                updated_at_ms: 1500, // OLDER than the row's 2000 → must be dropped
+            })
+            .unwrap();
+        let got = ledger.get_goal("g1").unwrap().unwrap();
+        assert_eq!(
+            got.status, "complete",
+            "a stale (older updated_at_ms) upsert must not downgrade the status"
+        );
+        assert_eq!(
+            got.tokens_used, 550,
+            "a stale upsert must not roll the token counter backwards"
+        );
+        assert_eq!(
+            got.continuations_used, 3,
+            "stale continuations rejected too"
+        );
+    }
+
+    #[test]
+    fn upsert_goal_never_downgrades_a_complete_goal() {
+        // Issue #1957 codex #2, defence-in-depth: the `updated_at_ms >=` guard
+        // alone cannot break a millisecond tie, and timestamps are only
+        // millisecond-resolution. A `complete` row is terminal for a goal_id
+        // (re-activation mints a fresh id), so a non-`complete` write must NEVER
+        // win against it — not even one carrying an equal or NEWER timestamp.
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = GoalLedger::open(dir.path().join("l.db")).unwrap();
+        ledger
+            .upsert_goal(&Goal {
+                goal_id: "g1".to_string(),
+                objective: "obj".to_string(),
+                status: "complete".to_string(),
+                tokens_used: 500,
+                token_budget: 2000,
+                continuations_used: 2,
+                revision: 0,
+                created_at_ms: 1000,
+                updated_at_ms: 2000,
+            })
+            .unwrap();
+
+        // EQUAL-ms stale `active` write (the tie the `>=` clause would admit):
+        // must be rejected by the complete-protection clause.
+        ledger
+            .upsert_goal(&Goal {
+                goal_id: "g1".to_string(),
+                objective: "obj".to_string(),
+                status: "active".to_string(),
+                tokens_used: 10,
+                token_budget: 2000,
+                continuations_used: 0,
+                revision: 0,
+                created_at_ms: 1000,
+                updated_at_ms: 2000, // EQUAL to the stored row
+            })
+            .unwrap();
+        assert_eq!(
+            ledger.get_goal("g1").unwrap().unwrap().status,
+            "complete",
+            "an equal-ms `active` write must not downgrade a `complete` goal"
+        );
+
+        // Even a strictly NEWER `active` write must not undo completion.
+        ledger
+            .upsert_goal(&Goal {
+                goal_id: "g1".to_string(),
+                objective: "obj".to_string(),
+                status: "active".to_string(),
+                tokens_used: 10,
+                token_budget: 2000,
+                continuations_used: 0,
+                revision: 0,
+                created_at_ms: 1000,
+                updated_at_ms: 9999, // strictly newer
+            })
+            .unwrap();
+        let g1 = ledger.get_goal("g1").unwrap().unwrap();
+        assert_eq!(
+            g1.status, "complete",
+            "even a newer `active` write must not downgrade a terminal `complete` goal"
+        );
+        assert_eq!(g1.tokens_used, 500, "counters stay at the completed values");
+
+        // A `complete → complete` refresh with a newer ts IS allowed.
+        ledger
+            .upsert_goal(&Goal {
+                goal_id: "g1".to_string(),
+                objective: "obj".to_string(),
+                status: "complete".to_string(),
+                tokens_used: 600,
+                token_budget: 2000,
+                continuations_used: 3,
+                revision: 0,
+                created_at_ms: 1000,
+                updated_at_ms: 10_000,
+            })
+            .unwrap();
+        assert_eq!(
+            ledger.get_goal("g1").unwrap().unwrap().tokens_used,
+            600,
+            "a complete→complete refresh with a newer ts still updates"
+        );
+
+        // `blocked` is NOT protected: a blocked goal is user-resumable to active
+        // under the same id, so a newer `active` write MUST win.
+        ledger
+            .upsert_goal(&Goal {
+                goal_id: "g2".to_string(),
+                objective: "obj2".to_string(),
+                status: "blocked".to_string(),
+                tokens_used: 100,
+                token_budget: 2000,
+                continuations_used: 1,
+                revision: 0,
+                created_at_ms: 1000,
+                updated_at_ms: 1000,
+            })
+            .unwrap();
+        ledger
+            .upsert_goal(&Goal {
+                goal_id: "g2".to_string(),
+                objective: "obj2".to_string(),
+                status: "active".to_string(),
+                tokens_used: 100,
+                token_budget: 2000,
+                continuations_used: 1,
+                revision: 0,
+                created_at_ms: 1000,
+                updated_at_ms: 2000, // newer → resume must win
+            })
+            .unwrap();
+        assert_eq!(
+            ledger.get_goal("g2").unwrap().unwrap().status,
+            "active",
+            "a newer resume of a `blocked` goal must be allowed"
+        );
     }
 }

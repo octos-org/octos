@@ -961,13 +961,24 @@ impl Tool for GoalDenyTool {
 /// `goal_update` — model-owned terminal transitions ONLY.
 pub struct GoalUpdateTool {
     profile_id: String,
+    /// #1957 — profile's persistent data dir, so a transition can sync the
+    /// goal-row status + a `decisions` row into `<data_dir>/goal-ledgers/`.
+    /// `None` on paths that never wired it (the sync is then skipped).
+    data_dir: Option<std::path::PathBuf>,
 }
 
 impl GoalUpdateTool {
     pub fn new(profile_id: impl Into<String>) -> Self {
         Self {
             profile_id: profile_id.into(),
+            data_dir: None,
         }
+    }
+
+    /// #1957 — set the profile data dir used to sync a transition to the ledger.
+    pub fn with_data_dir(mut self, data_dir: std::path::PathBuf) -> Self {
+        self.data_dir = Some(data_dir);
+        self
     }
 }
 
@@ -1138,11 +1149,16 @@ impl Tool for GoalUpdateTool {
             }
         }
 
+        // #1957 — pass the profile data dir so model_transition_goal syncs the
+        // transition into the ledger (goals-row status + a decision) using the
+        // snapshot it just transitioned. Done INSIDE model_transition_goal (not
+        // here) so it uses the correct goal without a racy re-fetch (codex #3).
         match default_agent_orchestrator().model_transition_goal(
             &session_id,
             &self.profile_id,
             status,
             reason,
+            self.data_dir.as_deref(),
         ) {
             Ok(goal) => Ok(ToolResult {
                 output: format!(

@@ -33827,6 +33827,14 @@ async fn run_standalone_turn(
                 .last()
                 .map(|(_, message)| message.content.clone())
         };
+        // #1957 (codex #1) — the goal ledger lives under the PROFILE data dir
+        // (`goal_get`, the peer-finding sync, and `GoalUpdateTool` all key off
+        // `profile.data_dir`), NOT the session store root. Under
+        // `appui.sessions_in_cwd` the two diverge (`sessions_root` relocates to
+        // `<cwd>/.octos`), so resolving the ledger dir from the sessions manager
+        // would write a sentinel completion into a SPLIT ledger the master
+        // never reads. Pin it to the profile data dir.
+        let goal_ledger_data_dir = session_runtime.profile.data_dir.clone();
         let elapsed_seconds = goal_turn_start
             .map(|start| start.elapsed().as_secs())
             .unwrap_or(0);
@@ -33883,6 +33891,8 @@ async fn run_standalone_turn(
                 &reply,
                 &verdict,
                 expected_goal_id.as_deref(),
+                // #1957 (codex #1) — sync a sentinel completion into the ledger.
+                Some(goal_ledger_data_dir.as_path()),
             );
         }
         // #1696/#1698 — push the post-turn goal snapshot to the OWNING
