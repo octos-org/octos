@@ -477,6 +477,22 @@ pub(crate) trait AgentOrchestrator: Send + Sync {
     fn get_goal(&self, request: GoalSessionRequest) -> Result<Value, RpcError>;
     fn set_goal(&self, request: GoalSetRequest) -> Result<Value, RpcError>;
     fn clear_goal(&self, request: GoalSessionRequest) -> Result<Value, RpcError>;
+
+    /// #1973 fix B — [`Self::clear_goal`] plus a best-effort sync of the
+    /// cleared status into the durable per-goal SQLite ledger under
+    /// `ledger_data_dir` (the PROFILE data dir), so the goals-row stops
+    /// claiming `active` after a user clear. The RPC dispatch resolves the
+    /// dir from the profile store and calls this; a `None` dir (or this
+    /// default impl, kept so test mocks stay untouched) is a plain clear.
+    fn clear_goal_with_ledger_sync(
+        &self,
+        request: GoalSessionRequest,
+        ledger_data_dir: Option<&Path>,
+    ) -> Result<Value, RpcError> {
+        let _ = ledger_data_dir;
+        self.clear_goal(request)
+    }
+
     fn create_loop(&self, request: LoopCreateRequest) -> Result<Value, RpcError>;
     fn list_loops(&self, request: LoopListRequest) -> Result<Value, RpcError>;
     fn control_loop(&self, request: LoopControlRequest) -> Result<Value, RpcError>;
@@ -589,6 +605,32 @@ struct OrchestratorShared {
     /// the legacy behavior and to the gateway/session-actor path (which never
     /// registers a scope).
     goal_scopes: StdMutex<HashMap<String, String>>,
+    /// #1973 fix A — where `goal_scopes` persists across restarts:
+    /// `<data_dir>/goal-scopes.json`, written atomically (write-tmp-then-
+    /// rename) on every scope mutation and loaded by
+    /// [`Self::configure_goal_scopes_sidecar`] BEFORE the supervisor store
+    /// restores goals. Unset (the default — unit tests, chat/gateway boots)
+    /// means the registry stays in-memory-only, byte-identical to the
+    /// pre-sidecar behavior. Same last-writer-wins single-scope-per-wire-key
+    /// semantics as the in-memory map (and as the ledger's documented
+    /// residual): the file records the MOST RECENTLY registered folder per
+    /// wire key, so a restart resumes the last-active folder's goals.
+    /// GC (#1973 fix-round 4b): mutation-driven saves prune FILE entries with
+    /// no goal under their scoped key and no live registration this process —
+    /// see [`Self::persist_goal_scopes_locked`] for the policy.
+    goal_scopes_sidecar: OnceLock<PathBuf>,
+    /// #1973 fix-round 4b — wires registered LIVE this process (by
+    /// `set_goal_scope(Some)` / `set_goal_scope_if_absent`), exempt from the
+    /// sidecar GC even before a goal exists under them. Only ever accessed
+    /// while the caller holds the `goal_scopes` lock (mutators + the persist
+    /// helper), which serializes it; it is never locked together with `state`.
+    live_goal_scope_wires: StdMutex<std::collections::HashSet<String>>,
+    /// #1973 fix D — fleet keeper wakes whose durable persist FAILED (and was
+    /// rolled back) during the boot-resume pass, awaiting their ONE bounded
+    /// retry. Stashed by `fleet_wake::enqueue_fleet_boot_resume_wakes` and
+    /// consumed — never re-queued — by [`Self::retry_stashed_fleet_wakes`] at
+    /// the start of the next fleet-outbox drain tick.
+    fleet_wake_retry: StdMutex<Vec<MasterContinuationRequest>>,
 }
 
 /// The plain WIRE session id underlying a (possibly cwd-scoped) goal-store
@@ -912,6 +954,12 @@ impl InProcessAgentOrchestrator {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clear();
+        // #1973 fix D — a stashed retry must not leak across singleton tests.
+        self.shared
+            .fleet_wake_retry
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
     }
 
     /// #1666 residue — register (or clear) the per-project goal-store scope
@@ -921,18 +969,29 @@ impl InProcessAgentOrchestrator {
     /// each session's cwd scope. Mirrors
     /// [`UiProtocolLedger::set_session_scope`].
     pub(crate) fn set_goal_scope(&self, session_id: &SessionKey, scope: Option<String>) {
+        // #1973 fix-round 4b — GC snapshot: the scoped-goal keys currently in
+        // the store, taken (and the state lock RELEASED) BEFORE the
+        // goal_scopes lock — the two locks must never nest in that order
+        // anywhere else, and this way they never nest at all.
+        let gc_live_goal_keys = self.goal_key_snapshot_for_scope_gc();
         let mut scopes = self
             .shared
             .goal_scopes
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        match scope {
+        let changed = match scope {
             Some(scope) => {
-                scopes.insert(session_id.0.clone(), scope);
+                self.mark_scope_wire_live(session_id);
+                scopes.insert(session_id.0.clone(), scope.clone()) != Some(scope)
             }
-            None => {
-                scopes.remove(session_id.0.as_str());
-            }
+            None => scopes.remove(session_id.0.as_str()).is_some(),
+        };
+        // #1973 fix A — persist the mutation so a restart still resolves the
+        // scope. Skipped when nothing changed: `session/open` re-registers the
+        // SAME scope on every open, and rewriting an identical file each time
+        // is pure churn.
+        if changed {
+            self.persist_goal_scopes_locked(&scopes, Some(&gc_live_goal_keys));
         }
     }
 
@@ -946,18 +1005,154 @@ impl InProcessAgentOrchestrator {
     /// `set_goal_scope` would race that authoritative live write).
     pub(crate) fn set_goal_scope_if_absent(&self, session_id: &SessionKey, scope: &str) -> bool {
         use std::collections::hash_map::Entry;
-        match self
+        // #1973 fix-round 4b — GC snapshot BEFORE the goal_scopes lock (see
+        // `set_goal_scope`).
+        let gc_live_goal_keys = self.goal_key_snapshot_for_scope_gc();
+        let mut scopes = self
             .shared
             .goal_scopes
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .entry(session_id.0.clone())
-        {
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let registered = match scopes.entry(session_id.0.clone()) {
             Entry::Occupied(_) => false,
             Entry::Vacant(slot) => {
                 slot.insert(scope.to_owned());
                 true
             }
+        };
+        // #1973 fix A — a genuine registration is a mutation; persist it.
+        if registered {
+            self.mark_scope_wire_live(session_id);
+            self.persist_goal_scopes_locked(&scopes, Some(&gc_live_goal_keys));
+        }
+        registered
+    }
+
+    /// #1973 fix-round 4b — record that `session_id`'s wire was registered
+    /// LIVE this process (by `session/open` or the Gate-D re-seed), so the
+    /// sidecar GC keeps its entry even before a goal exists under it. Only
+    /// ever called while the caller holds the `goal_scopes` lock, which is
+    /// what serializes access to this set (it is never locked together with
+    /// anything else).
+    fn mark_scope_wire_live(&self, session_id: &SessionKey) {
+        self.shared
+            .live_goal_scope_wires
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(session_id.0.clone());
+    }
+
+    /// #1973 fix-round 4b — the scoped-goal keys currently in the store, for
+    /// the sidecar GC's keep-if-goal-exists filter. Takes and RELEASES the
+    /// state lock; callers must invoke it BEFORE taking the `goal_scopes`
+    /// lock so the two never nest.
+    fn goal_key_snapshot_for_scope_gc(&self) -> std::collections::HashSet<String> {
+        self.state().goals.keys().map(|key| key.0.clone()).collect()
+    }
+
+    /// #1973 fix A — install the `goal-scopes.json` sidecar path (first call
+    /// wins) and load its persisted scopes into the registry. Called from
+    /// serve boot right BEFORE [`Self::configure_supervisor_store`], so
+    /// restored SCOPED goals (stored under `<wire>\u{0}~cwd-<scope>`) resolve
+    /// through [`Self::scoped_goal_key`] immediately — and their persisted
+    /// continuations pass [`Self::goal_target_is_dispatchable`] — without
+    /// waiting for a client to reopen the session.
+    ///
+    /// The load fills VACANT keys only: a live `session/open` registration
+    /// that raced boot is authoritative and must never be clobbered by the
+    /// file (same rule as `set_goal_scope_if_absent`). A missing file is a
+    /// clean first boot; an unreadable/unparsable file is an error the caller
+    /// logs — the registry then simply starts empty (the pre-fix behavior).
+    ///
+    /// #1973 fix-round 4a — the MERGED map is written back to the file under
+    /// the same lock. A registration that raced in BEFORE this configure had
+    /// no sidecar path to persist to, so without the write-back it survives
+    /// this boot (occupied entry beats the load) but is silently lost on the
+    /// NEXT restart. The write-back is verbatim — no GC: goals are restored
+    /// AFTER this call (`configure_supervisor_store`), so the
+    /// keep-if-goal-exists filter would wipe every loaded entry here.
+    pub(crate) fn configure_goal_scopes_sidecar(&self, path: PathBuf) -> std::io::Result<()> {
+        let path = self.shared.goal_scopes_sidecar.get_or_init(|| path);
+        // File read BEFORE the lock (I/O stays off the mutex where possible)…
+        let loaded: HashMap<String, String> = match std::fs::read(path) {
+            Ok(bytes) => serde_json::from_slice(&bytes)
+                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => HashMap::new(),
+            Err(error) => return Err(error),
+        };
+        // …merge + write-back UNDER it, so no registration can interleave
+        // between the merge and the flush.
+        let mut scopes = self
+            .shared
+            .goal_scopes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for (wire, scope) in loaded {
+            scopes.entry(wire).or_insert(scope);
+        }
+        self.persist_goal_scopes_locked(&scopes, None);
+        Ok(())
+    }
+
+    /// #1973 fix A — write the CURRENT scope map to the sidecar, atomically
+    /// (write `.tmp`, then rename), while the caller still holds the
+    /// `goal_scopes` lock — that lock is what serializes concurrent mutators
+    /// so a slow writer can never overwrite a newer map with a stale one. The
+    /// write is a few hundred bytes of JSON on the rare `session/open` scope
+    /// mutation path, so holding the (sync, never-awaited) mutex across it is
+    /// cheap. Best-effort: persistence failure must never break session open —
+    /// it is logged, and the in-memory registry stays correct for THIS boot.
+    ///
+    /// #1973 fix-round 4b — **GC policy**: when the caller supplies the
+    /// scoped-goal-key snapshot (`gc_live_goal_keys`, mutation-driven saves),
+    /// the FILE keeps only entries that are (a) backed by a goal under their
+    /// scoped key, or (b) registered live this process (`session/open` /
+    /// Gate-D re-seed — tracked in `live_goal_scope_wires`). Everything else
+    /// is a goalless leftover from a prior boot that nothing can resolve to
+    /// work at restart, so it is pruned — this is what bounds the sidecar's
+    /// growth. `None` (the boot write-back, before goals restore) writes the
+    /// map verbatim. The GC never touches the in-memory registry.
+    fn persist_goal_scopes_locked(
+        &self,
+        scopes: &HashMap<String, String>,
+        gc_live_goal_keys: Option<&std::collections::HashSet<String>>,
+    ) {
+        let Some(path) = self.shared.goal_scopes_sidecar.get() else {
+            return;
+        };
+        let to_write: HashMap<&String, &String> = match gc_live_goal_keys {
+            None => scopes.iter().collect(),
+            Some(goal_keys) => {
+                let live = self
+                    .shared
+                    .live_goal_scope_wires
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                scopes
+                    .iter()
+                    .filter(|(wire, scope)| {
+                        live.contains(wire.as_str())
+                            || goal_keys.contains(&format!("{wire}\u{0}~cwd-{scope}"))
+                    })
+                    .collect()
+            }
+        };
+        let payload = match serde_json::to_vec_pretty(&to_write) {
+            Ok(payload) => payload,
+            Err(error) => {
+                tracing::warn!(%error, "goal-scopes sidecar: failed to serialize scope map");
+                return;
+            }
+        };
+        let tmp = path.with_extension("json.tmp");
+        let written = std::fs::write(&tmp, &payload).and_then(|()| std::fs::rename(&tmp, path));
+        if let Err(error) = written {
+            tracing::warn!(
+                %error,
+                path = %path.display(),
+                "goal-scopes sidecar: failed to persist scope map; scoped goals may be \
+                 invisible after a restart until their session reopens"
+            );
         }
     }
 
@@ -1098,6 +1293,9 @@ impl InProcessAgentOrchestrator {
     /// redelivery rather than acking a wake that a crash could lose. Returns the
     /// number of outbox events acked.
     pub(crate) async fn drain_fleet_outbox(&self, store: &FleetKernelStore) -> eyre::Result<usize> {
+        // #1973 fix D — consume any boot-resume wakes whose durable persist
+        // failed: this tick IS their one bounded retry.
+        self.retry_stashed_fleet_wakes();
         super::fleet_wake::drain_fleet_outbox_once(
             store,
             now_ms_u64,
@@ -1105,6 +1303,63 @@ impl InProcessAgentOrchestrator {
             |req| self.commit_fleet_keeper_wake(req),
         )
         .await
+    }
+
+    /// #1973 fix D — stash a boot-resume keeper wake whose durable persist
+    /// failed (and was rolled back), for ONE bounded retry on the next
+    /// fleet-outbox drain tick. Before this, such a wake was dropped with no
+    /// retry at all: the fleet stayed `Ready` with no keeper wake for the
+    /// whole boot even when the persist failure was transient.
+    pub(crate) fn stash_fleet_wake_retry(&self, request: MasterContinuationRequest) {
+        self.shared
+            .fleet_wake_retry
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(request);
+    }
+
+    /// #1973 fix D — re-attempt every stashed boot-resume wake ONCE through
+    /// the same durable-commit gate ([`Self::commit_fleet_keeper_wake`]),
+    /// returning how many committed durably. The stash is drained up front and
+    /// a failed re-attempt is NEVER re-queued — one retry, bounded and honest:
+    /// a wake whose persist fails twice is lost for THIS boot (loud warn
+    /// below; the fleet stays Ready with no keeper wake until the next fleet
+    /// event or a restart re-runs the boot-resume pass, which re-derives the
+    /// wake from the store). The ~3s gap to the next drain tick is the
+    /// backoff — long enough for a transient I/O condition (fsync pressure,
+    /// disk-full-then-freed) to clear, with no sleep on the boot path.
+    pub(crate) fn retry_stashed_fleet_wakes(&self) -> usize {
+        let stashed: Vec<MasterContinuationRequest> = {
+            let mut retry = self
+                .shared
+                .fleet_wake_retry
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            std::mem::take(&mut *retry)
+        };
+        if stashed.is_empty() {
+            return 0;
+        }
+        let mut committed = 0usize;
+        for request in stashed {
+            let dedupe_key = request.dedupe_key.clone();
+            match self.commit_fleet_keeper_wake(request) {
+                super::fleet_wake::WakeCommit::Durable => {
+                    committed += 1;
+                    tracing::info!(
+                        dedupe_key = ?dedupe_key,
+                        "fleet boot-resume wake retry committed durably"
+                    );
+                }
+                super::fleet_wake::WakeCommit::NotDurable => tracing::warn!(
+                    dedupe_key = ?dedupe_key,
+                    "fleet boot-resume wake retry FAILED to persist; dropping it for this boot \
+                     — the fleet stays Ready with no keeper wake until the next fleet event or \
+                     a restart re-runs boot-resume"
+                ),
+            }
+        }
+        committed
     }
 
     /// The durable-commit half of [`Self::drain_fleet_outbox`]: enqueue the
@@ -1254,49 +1509,98 @@ impl InProcessAgentOrchestrator {
     /// the boot log. Wrap-ups are untouched: a `budget_limited` goal is
     /// not active, so it is never parked and its one-shot wrap-up still
     /// drains.
+    ///
+    /// #1973 fix C — production (serve boot) now always calls
+    /// [`Self::pause_restored_goals_for_solo_boot_with_ledger_sync`] with a
+    /// real profile-dir resolver; this no-resolver wrapper remains as the
+    /// test seam for the park mechanics alone.
+    #[cfg(test)]
     pub(crate) fn pause_restored_goals_for_solo_boot(&self) -> Vec<(String, SessionKey)> {
-        let mut state = self.state();
-        let state = &mut *state;
-        let supervisor_store = state.supervisor_store.as_ref();
-        let now = now_ms();
-        let mut paused = Vec::new();
-        for (session_id, goal) in state.goals.iter_mut() {
-            if goal.status != "active" {
-                continue;
+        self.pause_restored_goals_for_solo_boot_with_ledger_sync(&|_| None)
+    }
+
+    /// #1973 fix C — the full solo-boot goal park, plus a sync of each parked
+    /// goal's durable SQLite ledger row. The park used to flip the in-memory +
+    /// supervisor state to `paused` while the goals-row kept saying `active` —
+    /// a durable lie that outlived the boot (and every audit read of the
+    /// ledger). `profile_data_dir_for` maps a parked goal's `profile_id` to
+    /// its PROFILE data dir (serve boot resolves through the profile
+    /// registry); `None` for a profile skips its sync (no registry entry, or
+    /// the no-op resolver the plain [`Self::pause_restored_goals_for_solo_boot`]
+    /// passes). The sync reuses [`Self::sync_transition_to_ledger`] — a park is
+    /// a genuine `active → paused` status change, so it upserts the row AND
+    /// appends a decision — and runs strictly AFTER the state lock drops
+    /// (ledger writes are file I/O).
+    pub(crate) fn pause_restored_goals_for_solo_boot_with_ledger_sync(
+        &self,
+        profile_data_dir_for: &dyn Fn(&str) -> Option<PathBuf>,
+    ) -> Vec<(String, SessionKey)> {
+        let mut parked_snapshots: Vec<(AutonomyGoalRecord, SessionKey)> = Vec::new();
+        let paused = {
+            let mut state = self.state();
+            let state = &mut *state;
+            let supervisor_store = state.supervisor_store.as_ref();
+            let now = now_ms();
+            let mut paused = Vec::new();
+            for (session_id, goal) in state.goals.iter_mut() {
+                if goal.status != "active" {
+                    continue;
+                }
+                goal.status = "paused".to_owned();
+                goal.updated_at_ms = now;
+                persist_goal_state_with_store(supervisor_store, session_id, goal, false);
+                paused.push((goal.goal_id.clone(), session_id.clone()));
+                parked_snapshots.push((goal.clone(), session_id.clone()));
             }
-            goal.status = "paused".to_owned();
-            goal.updated_at_ms = now;
-            persist_goal_state_with_store(supervisor_store, session_id, goal, false);
-            paused.push((goal.goal_id.clone(), session_id.clone()));
-        }
-        let parked: std::collections::HashSet<&str> =
-            paused.iter().map(|(goal_id, _)| goal_id.as_str()).collect();
-        let orphaned: Vec<_> = state
-            .continuations
-            .pending_items()
-            .filter(|item| {
-                item.reason == MasterContinuationReason::GoalContinue
-                    && item
-                        .goal_id
-                        .as_ref()
-                        .is_some_and(|goal_id| parked.contains(goal_id.as_str()))
-            })
-            .map(|item| (item.group_id.clone(), item.dedupe_key.clone()))
-            .collect();
-        for (group_id, dedupe_key) in orphaned {
-            state.continuations.cancel(&dedupe_key);
-            if let Some(store) = supervisor_store {
-                let _ = store.record_continuation_completed(
-                    group_id.as_str(),
-                    dedupe_key.as_str(),
-                    now_ms_u64(),
-                    Some("discarded:solo_boot_parked_goal".into()),
+            let parked: std::collections::HashSet<&str> =
+                paused.iter().map(|(goal_id, _)| goal_id.as_str()).collect();
+            let orphaned: Vec<_> = state
+                .continuations
+                .pending_items()
+                .filter(|item| {
+                    item.reason == MasterContinuationReason::GoalContinue
+                        && item
+                            .goal_id
+                            .as_ref()
+                            .is_some_and(|goal_id| parked.contains(goal_id.as_str()))
+                })
+                .map(|item| (item.group_id.clone(), item.dedupe_key.clone()))
+                .collect();
+            for (group_id, dedupe_key) in orphaned {
+                state.continuations.cancel(&dedupe_key);
+                if let Some(store) = supervisor_store {
+                    let _ = store.record_continuation_completed(
+                        group_id.as_str(),
+                        dedupe_key.as_str(),
+                        now_ms_u64(),
+                        Some("discarded:solo_boot_parked_goal".into()),
+                    );
+                }
+                tracing::info!(
+                    dedupe_key = %dedupe_key.as_str(),
+                    "solo boot: retired queued goal continuation alongside its parked goal"
                 );
             }
-            tracing::info!(
-                dedupe_key = %dedupe_key.as_str(),
-                "solo boot: retired queued goal continuation alongside its parked goal"
-            );
+            paused
+        };
+        // #1973 fix C — ledger sync outside the state lock. Best-effort per
+        // goal (the sync helper swallows ledger I/O errors); a missing profile
+        // dir skips that goal's sync, matching the pre-fix behavior. This is a
+        // SYNC boot-time caller, so it uses the blocking core directly with
+        // the plain open profile (`retry_contended_open: false` — the bounded
+        // retry stays exclusive to the #1865 `spawn_blocking` facade); boot
+        // runs once before serving, so inline ledger I/O here is fine.
+        for (snapshot, session_id) in parked_snapshots {
+            if let Some(profile_dir) = profile_data_dir_for(&snapshot.profile_id) {
+                self.sync_transition_to_ledger_blocking(
+                    &profile_dir,
+                    &snapshot,
+                    "solo boot: goal parked paused (resume with /goal resume)",
+                    &session_id,
+                    true,
+                    false,
+                );
+            }
         }
         paused
     }
@@ -3765,6 +4069,25 @@ impl InProcessAgentOrchestrator {
     ///   default busy handling — the EXACT pre-#1865 blocking profile for
     ///   that path (call sites untouched; this restores the core's behavior
     ///   for them after this branch briefly routed them through the retry).
+    ///
+    /// #1973 fix-round — the #1970 monotonic-token clause used to silently
+    /// reject an ADMINISTRATIVE status sync (park/clear) whose snapshot
+    /// carries stale LOWER counters (a peer charge pushed the row ahead of
+    /// the in-memory record), while the decision was appended
+    /// unconditionally: row said `active`, decision said `cleared`. Now: when
+    /// the guarded upsert reports the write was NOT admitted and this is a
+    /// status transition, re-read the row and retry ONCE via a targeted
+    /// status-CAS ([`octos_fleet::GoalLedger::cas_goal_status`]) — the status
+    /// lands with the row's counters untouched (they are authoritative). The
+    /// retry is ORDERING-GATED: it runs only when the snapshot is at least as
+    /// new as the row (`snapshot.updated_at_ms >= row.updated_at_ms`), so an
+    /// OLDER transition's retry can never overwrite a newer status change
+    /// (the fix-round-2 max'd-timestamp re-upsert could: a late `blocked`
+    /// sync forged the row's own T2 and overwrote `cleared`). Complete stays
+    /// terminal on both layers (the gate skips a `complete` row; the CAS
+    /// refuses one). The decision is appended ONLY when the row's status now
+    /// reflects the transition, so the audit trail can never claim a status
+    /// the goals-row rejected.
     fn sync_transition_to_ledger_blocking(
         &self,
         profile_data_dir: &std::path::Path,
@@ -3795,7 +4118,8 @@ impl InProcessAgentOrchestrator {
                 return;
             }
         };
-        let _ = ledger.upsert_goal(&octos_fleet::Goal {
+        let snapshot_ts = snapshot.updated_at_ms.max(0) as u64;
+        let row = octos_fleet::Goal {
             goal_id: snapshot.goal_id.clone(),
             objective: snapshot.objective.clone(),
             status: snapshot.status.clone(),
@@ -3804,12 +4128,66 @@ impl InProcessAgentOrchestrator {
             continuations_used: snapshot.continuations_used,
             revision: 0,
             created_at_ms: snapshot.created_at_ms.max(0) as u64,
-            updated_at_ms: snapshot.updated_at_ms.max(0) as u64,
-        });
+            updated_at_ms: snapshot_ts,
+        };
+        let admitted = ledger.upsert_goal(&row).unwrap_or(false);
+        if !admitted && status_changed {
+            // Guarded rejection of a genuine status transition. Retry ONCE via
+            // the targeted status-CAS, but ONLY when the rejection was solely
+            // the monotonic-token clause — i.e. this transition is still at
+            // least as new as the row (ordering gate) and the row is not
+            // terminal (complete gate) and actually differs. An older
+            // transition, or one racing a terminal row, is dropped here and
+            // the decision gate below keeps the audit trail consistent.
+            if let Ok(Some(current)) = ledger.get_goal(&snapshot.goal_id) {
+                let retry_admissible = snapshot_ts >= current.updated_at_ms
+                    && current.status != "complete"
+                    && current.status != snapshot.status;
+                if retry_admissible {
+                    // True CAS on the exact (status, updated_at_ms) pair just
+                    // read: any interleaved write defeats it and the newer
+                    // state wins (one shot, never re-attempted). Combined
+                    // with the `snapshot_ts >= current.updated_at_ms` gate
+                    // above, the stamp written can never regress the row's
+                    // clock.
+                    let _ = ledger.cas_goal_status(
+                        &snapshot.goal_id,
+                        &snapshot.status,
+                        &current.status,
+                        current.updated_at_ms,
+                        snapshot_ts,
+                    );
+                }
+            }
+        }
         // codex #5 — no decision row for a no-op (e.g. `blocked → blocked`
         // retry after a lost response), so the audit trail can't fill with
         // indistinguishable duplicates.
         if !status_changed {
+            return;
+        }
+        // #1973 fix-round — append the decision ONLY when the row actually
+        // reflects the transition, so the audit trail can never claim a
+        // status the goals-row rejected.
+        //
+        // DOCUMENTED RESIDUAL (codex-acknowledged): this re-read and the
+        // append below are NOT atomic with the write above. A writer racing
+        // into the gap can flip the row after our status landed, suppressing
+        // a decision for a transition that DID happen — an UNDER-REPORT of
+        // the audit trail, never a contradiction (a decision is only ever
+        // appended while the row was observed carrying that very status).
+        let row_reflects_transition = ledger
+            .get_goal(&snapshot.goal_id)
+            .ok()
+            .flatten()
+            .is_some_and(|current| current.status == snapshot.status);
+        if !row_reflects_transition {
+            tracing::warn!(
+                goal_id = %snapshot.goal_id,
+                intended_status = %snapshot.status,
+                "goal ledger sync: the guarded goals-row did not admit this status \
+                 transition (terminal row wins); no decision appended"
+            );
             return;
         }
         let now_ms = std::time::SystemTime::now()
@@ -3830,6 +4208,127 @@ impl InProcessAgentOrchestrator {
             decided_by: decided_by.to_string(),
         };
         let _ = ledger.append_decision(&decision);
+    }
+
+    /// #1973 fix B — the shared body behind both `clear_goal` trait entry
+    /// points. On top of the original remove + `persist_goal_cleared`, a clear
+    /// now also:
+    ///
+    /// 1. **Terminalizes the bound fleet.** The cleared record's `fleet_id`
+    ///    (when set, with a fleet store installed) is cancelled in the kernel
+    ///    store via [`FleetKernelStore::cancel_fleet`] on a SPAWNED task —
+    ///    best-effort by contract: a store error (or a missing tokio runtime)
+    ///    must never block or fail the clear, so the in-memory/goal-store
+    ///    outcome is identical whether or not the cancel lands. Before this,
+    ///    the orphan stayed `Active` in redb forever and every boot-resume
+    ///    pass re-scanned it just to skip it as orphaned.
+    /// 2. **Syncs the durable ledger goals-row** (when the caller resolved a
+    ///    profile data dir): upsert the row as `cleared` + append a decision,
+    ///    via the same guarded [`Self::sync_transition_to_ledger`] the other
+    ///    transitions use — so the row stops claiming `active`. The guard's
+    ///    complete-is-terminal clause still wins: clearing an already-complete
+    ///    goal keeps the row `complete` (only the decision row records the
+    ///    clear), which is the honest audit shape.
+    ///
+    /// Lock discipline matches `model_transition_goal`: mutation + persist +
+    /// generation stamp under the state lock, fleet spawn + ledger file I/O
+    /// strictly after it drops.
+    fn clear_goal_impl(
+        &self,
+        request: GoalSessionRequest,
+        ledger_data_dir: Option<&Path>,
+    ) -> Result<Value, RpcError> {
+        // #1666 residue — clear the cwd-scoped goal for this wire session id so
+        // `goal_clear` in folder B never removes folder A's goal.
+        let key = self.scoped_goal_key(&request.session_id);
+        let (removed, generation, fleet_store) = {
+            let mut state = self.state();
+            let removed = match state.goals.get(&key) {
+                Some(goal) if goal.profile_id == request.profile_id => state.goals.remove(&key),
+                Some(_) => {
+                    return Err(autonomy_error(
+                        kinds::GOAL_UNAVAILABLE,
+                        "goal is outside the requested profile scope",
+                        Some(&request.session_id),
+                        Some(&request.profile_id),
+                        None,
+                        true,
+                    ));
+                }
+                None => None,
+            };
+            if removed.is_some() {
+                persist_goal_cleared(&state, &key, &request.profile_id);
+            }
+            // #1959 — stamp the same monotonic generation as
+            // `SessionGoalUpdated` so the client can order a clear against a
+            // racing stale update. A stale update always bumps before this
+            // clear (its goal read preceded the removal above), so
+            // `update.generation < clear.generation`.
+            let generation = next_goal_event_generation(&mut state);
+            let fleet_store = state.fleet_store.clone();
+            (removed, generation, fleet_store)
+        };
+        let cleared = removed.is_some();
+        if let Some(goal) = removed {
+            if let (Some(fleet_id), Some(store)) = (goal.fleet_id.clone(), fleet_store) {
+                match tokio::runtime::Handle::try_current() {
+                    Ok(handle) => {
+                        let goal_id = goal.goal_id.clone();
+                        handle.spawn(async move {
+                            match store.cancel_fleet(&fleet_id, now_ms_u64()).await {
+                                Ok(true) => tracing::info!(
+                                    fleet_id = %fleet_id,
+                                    goal_id = %goal_id,
+                                    "goal_clear: terminalized the cleared goal's fleet (Cancelled)"
+                                ),
+                                Ok(false) => {}
+                                Err(error) => tracing::warn!(
+                                    fleet_id = %fleet_id,
+                                    goal_id = %goal_id,
+                                    %error,
+                                    "goal_clear: failed to terminalize the cleared goal's fleet; \
+                                     it stays live in the kernel store (boot-resume will skip it \
+                                     as orphaned)"
+                                ),
+                            }
+                        });
+                    }
+                    // No async runtime (sync test/tool context): the clear
+                    // stands; the fleet stays live and boot-resume's orphan
+                    // guard keeps skipping it — exactly the pre-fix shape.
+                    Err(_) => tracing::warn!(
+                        fleet_id = %fleet_id,
+                        "goal_clear: no async runtime to terminalize the cleared goal's fleet"
+                    ),
+                }
+            }
+            if let Some(data_dir) = ledger_data_dir {
+                let mut snapshot = goal;
+                snapshot.status = "cleared".to_owned();
+                snapshot.updated_at_ms = now_ms();
+                // SYNC caller (the clear RPC arm): blocking core, plain open
+                // profile — same inline best-effort class as the pre-existing
+                // finding/escalation writers (#1865 keeps the bounded retry
+                // exclusive to the spawn_blocking facade).
+                self.sync_transition_to_ledger_blocking(
+                    data_dir,
+                    &snapshot,
+                    "goal cleared by user",
+                    &request.session_id,
+                    true,
+                    false,
+                );
+            }
+        }
+        Ok(json!({
+            "session_id": request.session_id,
+            "profile_id": request.profile_id,
+            "cleared": cleared,
+            "goal": Value::Null,
+            "generation": generation,
+            "transition_actor": "user"
+        }))
     }
 
     /// Peer-agent-based goal: record a peer finding into the goal's durable
@@ -6496,42 +6995,16 @@ impl AgentOrchestrator for InProcessAgentOrchestrator {
     }
 
     fn clear_goal(&self, request: GoalSessionRequest) -> Result<Value, RpcError> {
-        // #1666 residue — clear the cwd-scoped goal for this wire session id so
-        // `goal_clear` in folder B never removes folder A's goal.
-        let key = self.scoped_goal_key(&request.session_id);
-        let mut state = self.state();
-        let cleared = match state.goals.get(&key) {
-            Some(goal) if goal.profile_id == request.profile_id => {
-                state.goals.remove(&key).is_some()
-            }
-            Some(_) => {
-                return Err(autonomy_error(
-                    kinds::GOAL_UNAVAILABLE,
-                    "goal is outside the requested profile scope",
-                    Some(&request.session_id),
-                    Some(&request.profile_id),
-                    None,
-                    true,
-                ));
-            }
-            None => false,
-        };
-        if cleared {
-            persist_goal_cleared(&state, &key, &request.profile_id);
-        }
-        // #1959 — stamp the same monotonic generation as `SessionGoalUpdated`
-        // so the client can order a clear against a racing stale update. A
-        // stale update always bumps before this clear (its goal read preceded
-        // the removal above), so `update.generation < clear.generation`.
-        let generation = next_goal_event_generation(&mut state);
-        Ok(json!({
-            "session_id": request.session_id,
-            "profile_id": request.profile_id,
-            "cleared": cleared,
-            "goal": Value::Null,
-            "generation": generation,
-            "transition_actor": "user"
-        }))
+        // #1973 fix B — shared body; no ledger dir on this legacy entry point.
+        self.clear_goal_impl(request, None)
+    }
+
+    fn clear_goal_with_ledger_sync(
+        &self,
+        request: GoalSessionRequest,
+        ledger_data_dir: Option<&Path>,
+    ) -> Result<Value, RpcError> {
+        self.clear_goal_impl(request, ledger_data_dir)
     }
 
     fn create_loop(&self, request: LoopCreateRequest) -> Result<Value, RpcError> {
@@ -20257,6 +20730,666 @@ mod tests {
         assert_eq!(
             continuations_after, 1,
             "one recorded turn charges the scoped goal exactly once",
+        );
+    }
+
+    /// #1973 fix A — the cwd-scope registry survives a restart via the
+    /// `goal-scopes.json` sidecar. Without it a restored SCOPED goal (stored
+    /// under `<wire>\0~cwd-<scope>`) is invisible to every scoped lookup and
+    /// its restored continuation is NOT dispatchable until a client happens to
+    /// reopen the session. The restart seam: register scope + set goal on
+    /// orchestrator A; a FRESH orchestrator loading sidecar-then-store resolves
+    /// the scoped key immediately and the restored target is dispatchable.
+    #[test]
+    fn goal_scope_sidecar_restores_scoped_goals_dispatchable_after_restart() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let sidecar = dir.path().join("goal-scopes.json");
+        let wire = SessionKey::with_profile("tenant-a", "api", "scope-sidecar");
+
+        let orchestrator = InProcessAgentOrchestrator::default();
+        orchestrator
+            .configure_goal_scopes_sidecar(sidecar.clone())
+            .expect("configure sidecar");
+        orchestrator
+            .configure_supervisor_store(dir.path().join("supervisor"))
+            .expect("configure store");
+        orchestrator.set_goal_scope(&wire, Some("aaaa111122223333".into()));
+        let scoped = orchestrator.scoped_goal_key(&wire);
+        assert_ne!(scoped, wire);
+        seed_goal(&orchestrator, &wire, "tenant-a");
+        assert!(sidecar.is_file(), "the scope mutation writes the sidecar");
+
+        // The PRE-FIX gap, pinned: a restart that reloads only the supervisor
+        // store restores the goal under its scoped key but resolves the wire to
+        // ITSELF, so nothing scoped is visible or dispatchable.
+        let amnesiac = InProcessAgentOrchestrator::default();
+        amnesiac
+            .configure_supervisor_store(dir.path().join("supervisor"))
+            .expect("reload store");
+        assert!(amnesiac.state().goals.contains_key(&scoped));
+        assert_eq!(amnesiac.scoped_goal_key(&wire), wire);
+        assert!(!amnesiac.goal_target_is_dispatchable(&scoped));
+
+        // With the sidecar loaded BEFORE the goals restore, the scoped goal
+        // resolves immediately and its restored continuation target is
+        // dispatchable — no session/open required.
+        let restored = InProcessAgentOrchestrator::default();
+        restored
+            .configure_goal_scopes_sidecar(sidecar)
+            .expect("load sidecar");
+        restored
+            .configure_supervisor_store(dir.path().join("supervisor"))
+            .expect("reload store");
+        assert_eq!(
+            restored.scoped_goal_key(&wire),
+            scoped,
+            "the sidecar restores the wire's cwd scope",
+        );
+        assert!(
+            restored.state().goals.contains_key(&scoped),
+            "the goal restores under its scoped key",
+        );
+        assert!(
+            restored.goal_target_is_dispatchable(&scoped),
+            "the restored scoped continuation target must be dispatchable at boot",
+        );
+        assert_eq!(
+            restored.goal_objective_for_test(&wire).as_deref(),
+            Some("ship the thing"),
+            "scoped lookups through the wire key resolve the restored goal",
+        );
+    }
+
+    /// #1973 fix A — `set_goal_scope_if_absent` (the fleet-keeper Gate-D
+    /// re-seed) persists too, and clearing a scope (`set_goal_scope(None)`)
+    /// removes it from the sidecar rather than resurrecting it on reload.
+    #[test]
+    fn goal_scope_sidecar_persists_if_absent_and_clears_removed_scopes() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let sidecar = dir.path().join("goal-scopes.json");
+        let seeded = SessionKey::new("api", "scope-seeded");
+        let cleared = SessionKey::new("api", "scope-cleared");
+
+        let orchestrator = InProcessAgentOrchestrator::default();
+        orchestrator
+            .configure_goal_scopes_sidecar(sidecar.clone())
+            .expect("configure sidecar");
+        assert!(orchestrator.set_goal_scope_if_absent(&seeded, "1111222233334444"));
+        orchestrator.set_goal_scope(&cleared, Some("5555666677778888".into()));
+        orchestrator.set_goal_scope(&cleared, None);
+
+        let restored = InProcessAgentOrchestrator::default();
+        restored
+            .configure_goal_scopes_sidecar(sidecar)
+            .expect("load sidecar");
+        assert_eq!(
+            restored.goal_scope(&seeded).as_deref(),
+            Some("1111222233334444"),
+            "an if-absent registration persists",
+        );
+        assert_eq!(
+            restored.goal_scope(&cleared),
+            None,
+            "a cleared scope must not resurrect on reload",
+        );
+    }
+
+    /// #1973 fix A — last-writer-wins: the sidecar mirrors the in-memory
+    /// registry's single-scope-per-wire-key semantics (the most recently
+    /// opened folder owns the wire), same as the ledger's documented residual.
+    /// And a live registration always beats a later sidecar load (the load
+    /// only fills vacant keys — it can never clobber a `session/open` write);
+    /// with the 4a write-back, that surviving live registration ALSO becomes
+    /// the file's entry, staying last-writer-wins across the boot boundary.
+    #[test]
+    fn goal_scope_sidecar_is_last_writer_wins_and_never_clobbers_live_scopes() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let sidecar = dir.path().join("goal-scopes.json");
+        let wire = SessionKey::new("api", "scope-lww");
+
+        let writer = InProcessAgentOrchestrator::default();
+        writer
+            .configure_goal_scopes_sidecar(sidecar.clone())
+            .expect("configure sidecar");
+        writer.set_goal_scope(&wire, Some("aaaa111122223333".into()));
+        writer.set_goal_scope(&wire, Some("bbbb444455556666".into()));
+        // Within one boot: the file holds only the LAST registered scope.
+        let file: HashMap<String, String> =
+            serde_json::from_slice(&std::fs::read(&sidecar).unwrap()).unwrap();
+        assert_eq!(
+            file.get(wire.0.as_str()).map(String::as_str),
+            Some("bbbb444455556666"),
+            "the sidecar keeps the LAST registered scope per wire key",
+        );
+
+        let restored = InProcessAgentOrchestrator::default();
+        // A live registration lands BEFORE the sidecar load (a client raced
+        // boot): the load must leave it untouched.
+        restored.set_goal_scope(&wire, Some("cccc777788889999".into()));
+        restored
+            .configure_goal_scopes_sidecar(sidecar)
+            .expect("load sidecar");
+        assert_eq!(
+            restored.goal_scope(&wire).as_deref(),
+            Some("cccc777788889999"),
+            "a live scope must never be clobbered by the sidecar load",
+        );
+
+        // #1973 fix-round 4a — the boot write-back flushes the merged map, so
+        // the NEXT restart resumes the surviving (live) registration: LWW
+        // holds across boots too.
+        let fresh = InProcessAgentOrchestrator::default();
+        fresh
+            .configure_goal_scopes_sidecar(dir.path().join("goal-scopes.json"))
+            .expect("load sidecar");
+        assert_eq!(
+            fresh.goal_scope(&wire).as_deref(),
+            Some("cccc777788889999"),
+            "the write-back makes the surviving live registration the file's entry",
+        );
+    }
+
+    /// #1973 fix-round 4a — the configure-time load WRITES BACK the merged
+    /// map. A registration that raced in BEFORE the sidecar was configured
+    /// had no path to persist to; without the write-back it survives THIS
+    /// boot (occupied entry beats the load) but is lost on the NEXT restart.
+    #[test]
+    fn goal_scope_sidecar_boot_load_writes_back_pre_configure_registrations() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let sidecar = dir.path().join("goal-scopes.json");
+        // The file carries an entry from a prior boot.
+        std::fs::write(&sidecar, r#"{"api:scope-from-file":"1111222233334444"}"#).unwrap();
+
+        let orchestrator = InProcessAgentOrchestrator::default();
+        // A live registration landing BEFORE configure (nothing persists it —
+        // there is no sidecar path yet).
+        let early = SessionKey::new("api", "scope-early");
+        orchestrator.set_goal_scope(&early, Some("aaaa111122223333".into()));
+        orchestrator
+            .configure_goal_scopes_sidecar(sidecar.clone())
+            .expect("configure sidecar");
+
+        // NEXT restart: both the loaded entry and the pre-configure live
+        // registration must come back from the file.
+        let restored = InProcessAgentOrchestrator::default();
+        restored
+            .configure_goal_scopes_sidecar(sidecar)
+            .expect("reload sidecar");
+        assert_eq!(
+            restored.goal_scope(&early).as_deref(),
+            Some("aaaa111122223333"),
+            "a pre-configure registration must survive the next restart",
+        );
+        assert_eq!(
+            restored
+                .goal_scope(&SessionKey("api:scope-from-file".into()))
+                .as_deref(),
+            Some("1111222233334444"),
+            "the loaded entry is preserved by the write-back",
+        );
+    }
+
+    /// #1973 fix-round 4b — sidecar GC: a mutation-driven save prunes FILE
+    /// entries whose wire key has no goal under its scoped key AND was never
+    /// registered live this process (the keep-if-goal-exists policy), so the
+    /// file cannot grow unboundedly across restarts. The in-memory registry
+    /// keeps everything for this boot.
+    #[test]
+    fn goal_scope_sidecar_gc_prunes_goalless_unregistered_entries_on_save() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let sidecar = dir.path().join("goal-scopes.json");
+        let wired = SessionKey::new("api", "scope-gc-goal");
+        let stale = SessionKey::new("api", "scope-gc-stale");
+        let seeded: HashMap<String, String> = HashMap::from([
+            (wired.0.clone(), "aaaa111122223333".to_owned()),
+            (stale.0.clone(), "bbbb444455556666".to_owned()),
+        ]);
+        std::fs::write(&sidecar, serde_json::to_vec(&seeded).unwrap()).unwrap();
+
+        let orchestrator = InProcessAgentOrchestrator::default();
+        orchestrator
+            .configure_goal_scopes_sidecar(sidecar.clone())
+            .expect("configure sidecar");
+        // Restore-equivalent: a goal exists under `wired`'s SCOPED key
+        // (bind_goal_fleet_for_test inserts at scoped_goal_key(wired)).
+        orchestrator.bind_goal_fleet_for_test(&wired, "tenant-a", "fleet-gc");
+        // A live this-boot registration (kept even though no goal exists yet)
+        // — and the mutation that triggers the GC'd save.
+        let live = SessionKey::new("api", "scope-gc-live");
+        orchestrator.set_goal_scope(&live, Some("cccc777788889999".into()));
+
+        let file: HashMap<String, String> =
+            serde_json::from_slice(&std::fs::read(&sidecar).unwrap()).unwrap();
+        assert_eq!(
+            file.get(wired.0.as_str()).map(String::as_str),
+            Some("aaaa111122223333"),
+            "an entry backing a restored goal is kept",
+        );
+        assert_eq!(
+            file.get(live.0.as_str()).map(String::as_str),
+            Some("cccc777788889999"),
+            "a this-boot live registration is kept even before its goal exists",
+        );
+        assert!(
+            !file.contains_key(stale.0.as_str()),
+            "a goalless, never-registered leftover is pruned from the FILE",
+        );
+        // The in-memory registry still resolves the pruned entry this boot.
+        assert_eq!(
+            orchestrator.goal_scope(&stale).as_deref(),
+            Some("bbbb444455556666"),
+            "GC affects only the file, never the live registry",
+        );
+    }
+
+    /// #1973 fix B — `goal_clear` terminalizes the goal's bound fleet in the
+    /// kernel store (best-effort, spawned). Before this, the cleared goal's
+    /// fleet stayed `Active` in redb forever: boot-resume skipped it as
+    /// orphaned every boot, but nothing ever retired it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn clear_goal_terminalizes_the_bound_fleet_in_the_kernel_store() {
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let (_sd, store) = fleet_test_store().await;
+        orchestrator.set_fleet_store(store.clone());
+        let wire = SessionKey::new("api", "keeper-clear-fleet");
+        seed_goal(&orchestrator, &wire, "tenant-a");
+        orchestrator.set_goal_workspace_root(
+            &orchestrator.scoped_goal_key(&wire),
+            Some("/repos/app".into()),
+        );
+        let plan = orchestrator
+            .model_create_fleet_plan(&wire, "tenant-a", plan_tasks(), 1_000)
+            .await
+            .expect("plan");
+        let fleet_id = plan["fleet_id"].as_str().expect("fleet id").to_owned();
+        assert_eq!(
+            store.get_fleet(&fleet_id).await.unwrap().unwrap().status,
+            octos_fleet::FleetStatus::Active,
+        );
+
+        let cleared = orchestrator
+            .clear_goal(GoalSessionRequest {
+                session_id: wire.clone(),
+                profile_id: "tenant-a".into(),
+            })
+            .expect("clear goal");
+        assert_eq!(cleared["cleared"], json!(true));
+        assert_eq!(orchestrator.goal_fleet_id_for_test(&wire), None);
+
+        // The terminalization is spawned (best-effort, never blocks the
+        // clear), so poll briefly for it to land.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let status = store.get_fleet(&fleet_id).await.unwrap().unwrap().status;
+            if status == octos_fleet::FleetStatus::Cancelled {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "cleared goal's fleet must become Cancelled within 5s (last: {status:?})",
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+
+        // The boot-resume sweep no longer sees the fleet as resumable.
+        assert!(
+            store
+                .fleets_with_ready_children(2_000)
+                .await
+                .unwrap()
+                .is_empty(),
+            "a cancelled fleet must not be boot-resumable",
+        );
+    }
+
+    /// #1973 fix B — a goal with NO bound fleet clears exactly as before
+    /// (no spawn, no store interaction), and clearing with no fleet store
+    /// installed stays a plain clear. Guards the best-effort contract: fleet
+    /// terminalization must never block or fail the clear.
+    #[tokio::test]
+    async fn clear_goal_without_fleet_binding_or_store_still_clears() {
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let wire = SessionKey::new("api", "keeper-clear-nofleet");
+        seed_goal(&orchestrator, &wire, "tenant-a");
+        let cleared = orchestrator
+            .clear_goal(GoalSessionRequest {
+                session_id: wire.clone(),
+                profile_id: "tenant-a".into(),
+            })
+            .expect("clear goal");
+        assert_eq!(cleared["cleared"], json!(true));
+        assert!(orchestrator.goal_objective_for_test(&wire).is_none());
+    }
+
+    /// #1973 fix C — the solo-boot goal park syncs `paused` into the durable
+    /// per-goal SQLite ledger. Before this, `pause_restored_goals_for_solo_boot`
+    /// flipped the in-memory + supervisor state to `paused` but the goals-row
+    /// kept saying `active` — a durable lie that outlived the boot.
+    #[test]
+    fn solo_boot_park_syncs_paused_goal_status_into_the_ledger() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let orchestrator = InProcessAgentOrchestrator::default();
+        orchestrator
+            .configure_supervisor_store(dir.path().join("supervisor"))
+            .expect("configure store");
+        let wire = SessionKey::new("api", "solo-park-ledger");
+        seed_goal(&orchestrator, &wire, "tenant-a");
+        let goal_id = orchestrator.goal_id_for_test(&wire).expect("goal id");
+
+        // Seed the durable goals-row as `active` (what a live goal turn leaves).
+        let profile_dir = dir.path().join("profile-data");
+        let ledger_dir = InProcessAgentOrchestrator::goal_ledger_dir(&profile_dir);
+        std::fs::create_dir_all(&ledger_dir).unwrap();
+        let ledger_path = ledger_dir.join(format!("{}.db", sanitize_filename_for_ledger(&goal_id)));
+        let ledger = octos_fleet::GoalLedger::open(&ledger_path).expect("open ledger");
+        ledger
+            .upsert_goal(&octos_fleet::Goal {
+                goal_id: goal_id.clone(),
+                objective: "ship the thing".into(),
+                status: "active".into(),
+                tokens_used: 0,
+                token_budget: 1_000_000,
+                continuations_used: 0,
+                revision: 0,
+                created_at_ms: 1,
+                updated_at_ms: 1,
+            })
+            .expect("seed active row");
+
+        let parked =
+            orchestrator.pause_restored_goals_for_solo_boot_with_ledger_sync(&|profile_id| {
+                (profile_id == "tenant-a").then(|| profile_dir.clone())
+            });
+        assert_eq!(parked.len(), 1, "the active goal is parked");
+        assert_eq!(
+            orchestrator
+                .state()
+                .goals
+                .get(&orchestrator.scoped_goal_key(&wire))
+                .map(|goal| goal.status.clone())
+                .as_deref(),
+            Some("paused"),
+        );
+        let row = ledger
+            .get_goal(&goal_id)
+            .expect("read row")
+            .expect("row exists");
+        assert_eq!(
+            row.status, "paused",
+            "the durable goals-row must read `paused` after a solo-boot park",
+        );
+    }
+
+    /// #1973 fix C — a resolver that finds no profile dir (no registry entry,
+    /// gateway boot) parks exactly as before: in-memory + supervisor state
+    /// only, no ledger write, no error.
+    #[test]
+    fn solo_boot_park_without_a_profile_dir_still_parks_goals() {
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let wire = SessionKey::new("api", "solo-park-nodir");
+        seed_goal(&orchestrator, &wire, "tenant-a");
+        let parked = orchestrator.pause_restored_goals_for_solo_boot_with_ledger_sync(&|_| None);
+        assert_eq!(parked.len(), 1);
+        assert_eq!(
+            orchestrator
+                .state()
+                .goals
+                .get(&orchestrator.scoped_goal_key(&wire))
+                .map(|goal| goal.status.clone())
+                .as_deref(),
+            Some("paused"),
+        );
+    }
+
+    /// #1973 fix B — the RPC path syncs the cleared status into the durable
+    /// per-goal SQLite ledger when a profile data dir is in scope, so the
+    /// goals-row stops claiming `active` after a user clear.
+    #[test]
+    fn clear_goal_with_ledger_sync_marks_the_goals_row_cleared() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let wire = SessionKey::new("api", "keeper-clear-ledger");
+        seed_goal(&orchestrator, &wire, "tenant-a");
+        let goal_id = orchestrator.goal_id_for_test(&wire).expect("goal id");
+
+        // Seed the durable goals-row as `active` (what a live goal turn leaves).
+        let ledger_dir = InProcessAgentOrchestrator::goal_ledger_dir(dir.path());
+        std::fs::create_dir_all(&ledger_dir).unwrap();
+        let ledger_path = ledger_dir.join(format!("{}.db", sanitize_filename_for_ledger(&goal_id)));
+        let ledger = octos_fleet::GoalLedger::open(&ledger_path).expect("open ledger");
+        ledger
+            .upsert_goal(&octos_fleet::Goal {
+                goal_id: goal_id.clone(),
+                objective: "ship the thing".into(),
+                status: "active".into(),
+                tokens_used: 0,
+                token_budget: 1_000_000,
+                continuations_used: 0,
+                revision: 0,
+                created_at_ms: 1,
+                updated_at_ms: 1,
+            })
+            .expect("seed active row");
+
+        let cleared = orchestrator
+            .clear_goal_with_ledger_sync(
+                GoalSessionRequest {
+                    session_id: wire.clone(),
+                    profile_id: "tenant-a".into(),
+                },
+                Some(dir.path()),
+            )
+            .expect("clear goal");
+        assert_eq!(cleared["cleared"], json!(true));
+
+        let row = ledger
+            .get_goal(&goal_id)
+            .expect("read row")
+            .expect("row exists");
+        assert_eq!(
+            row.status, "cleared",
+            "the durable goals-row must stop claiming `active` after a clear",
+        );
+    }
+
+    /// #1973 fix-round — an ADMINISTRATIVE status sync (park/clear) whose
+    /// snapshot carries STALE lower token counters (a peer charge pushed the
+    /// ledger row ahead of the in-memory record) must still land the STATUS:
+    /// the #1970 monotonic guard rejects the first upsert, the sync detects
+    /// it and retries once with max'd counters, and the decision is appended
+    /// only once the row actually reflects the transition. Before, the row
+    /// silently stayed `active` while a decision claimed `cleared`.
+    #[test]
+    fn goal_status_sync_beats_stale_token_counter_guard() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let wire = SessionKey::new("api", "keeper-stale-sync");
+        seed_goal(&orchestrator, &wire, "tenant-a");
+        let goal_id = orchestrator.goal_id_for_test(&wire).expect("goal id");
+
+        // The ledger row is AHEAD on tokens (a peer finding charged 500) while
+        // the in-memory goal still says 0 — exactly the divergence the guard
+        // exists for.
+        let ledger_dir = InProcessAgentOrchestrator::goal_ledger_dir(dir.path());
+        std::fs::create_dir_all(&ledger_dir).unwrap();
+        let ledger_path = ledger_dir.join(format!("{}.db", sanitize_filename_for_ledger(&goal_id)));
+        let ledger = octos_fleet::GoalLedger::open(&ledger_path).expect("open ledger");
+        ledger
+            .upsert_goal(&octos_fleet::Goal {
+                goal_id: goal_id.clone(),
+                objective: "ship the thing".into(),
+                status: "active".into(),
+                tokens_used: 500,
+                token_budget: 1_000_000,
+                continuations_used: 0,
+                revision: 0,
+                created_at_ms: 1,
+                updated_at_ms: 1,
+            })
+            .expect("seed charged row");
+
+        orchestrator
+            .clear_goal_with_ledger_sync(
+                GoalSessionRequest {
+                    session_id: wire.clone(),
+                    profile_id: "tenant-a".into(),
+                },
+                Some(dir.path()),
+            )
+            .expect("clear goal");
+
+        let row = ledger
+            .get_goal(&goal_id)
+            .expect("read row")
+            .expect("row exists");
+        assert_eq!(
+            row.status, "cleared",
+            "the status transition must land despite the stale token counter",
+        );
+        assert_eq!(
+            row.tokens_used, 500,
+            "the retry must NOT roll the monotonic counter back",
+        );
+        assert_eq!(
+            ledger.count_decisions(&goal_id).expect("count decisions"),
+            1,
+            "exactly one decision, appended only once the row reflects it",
+        );
+    }
+
+    /// #1973 fix-round 3 — codex regression: an OLDER transition whose sync
+    /// retries against a row that already carries a NEWER status change must
+    /// NOT overwrite it. The previous retry forged `updated_at_ms` up to the
+    /// row's own timestamp, so a late `blocked` sync could overwrite
+    /// `cleared` (both syncs run post-lock; the interleaving is reachable).
+    /// The status-CAS retry is ordering-gated: `cleared` stays, the newer
+    /// timestamp stays, and zero `blocked` decisions are appended.
+    #[test]
+    fn goal_stale_transition_retry_must_not_overwrite_a_newer_status() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let wire = SessionKey::new("api", "keeper-stale-retry");
+
+        // Ledger row: `cleared` at T2=2_000 with tokens 500 (a later
+        // transition + a peer charge already landed).
+        let ledger_dir = InProcessAgentOrchestrator::goal_ledger_dir(dir.path());
+        std::fs::create_dir_all(&ledger_dir).unwrap();
+        let ledger_path =
+            ledger_dir.join(format!("{}.db", sanitize_filename_for_ledger("goal_stale")));
+        let ledger = octos_fleet::GoalLedger::open(&ledger_path).expect("open ledger");
+        ledger
+            .upsert_goal(&octos_fleet::Goal {
+                goal_id: "goal_stale".into(),
+                objective: "obj".into(),
+                status: "cleared".into(),
+                tokens_used: 500,
+                token_budget: 1_000_000,
+                continuations_used: 0,
+                revision: 0,
+                created_at_ms: 1,
+                updated_at_ms: 2_000,
+            })
+            .expect("seed cleared row");
+
+        // The OLDER `blocked` transition (T1=1_000 < T2) with stale-low
+        // tokens: its upsert is rejected, and the retry must not land either.
+        let snapshot = AutonomyGoalRecord {
+            profile_id: "tenant-a".into(),
+            goal_id: "goal_stale".into(),
+            objective: "obj".into(),
+            status: "blocked".into(),
+            token_budget: 1_000_000,
+            tokens_used: 0,
+            time_used_seconds: 0,
+            created_at_ms: 1,
+            updated_at_ms: 1_000,
+            continuations_used: 0,
+            last_continued_at_ms: 0,
+            rate_window_start_ms: 0,
+            rate_window_count: 0,
+            wrap_up_emitted: false,
+            consecutive_failed_turns: 0,
+            fleet_id: None,
+            controller_workspace_root: None,
+            controller_workspace_has_runtime_hint: None,
+        };
+        orchestrator.sync_transition_to_ledger_blocking(
+            dir.path(),
+            &snapshot,
+            "late blocked",
+            &wire,
+            true,
+            false,
+        );
+
+        let row = ledger
+            .get_goal("goal_stale")
+            .expect("read row")
+            .expect("row exists");
+        assert_eq!(
+            row.status, "cleared",
+            "an older transition's retry must never overwrite a newer status",
+        );
+        assert_eq!(
+            row.updated_at_ms, 2_000,
+            "the newer row's timestamp must not be forged over",
+        );
+        assert_eq!(
+            ledger.count_decisions("goal_stale").expect("count"),
+            0,
+            "zero blocked decisions against a row that stayed cleared",
+        );
+    }
+
+    /// #1973 fix-round — the complete-is-terminal guard still wins: clearing
+    /// a goal whose ledger row is already `complete` leaves the row complete
+    /// AND appends NO decision (a decision claiming `cleared` against a row
+    /// saying `complete` would be exactly the divergence this fix removes).
+    #[test]
+    fn goal_clear_sync_on_complete_row_appends_no_decision() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let wire = SessionKey::new("api", "keeper-complete-clear");
+        seed_goal(&orchestrator, &wire, "tenant-a");
+        let goal_id = orchestrator.goal_id_for_test(&wire).expect("goal id");
+
+        let ledger_dir = InProcessAgentOrchestrator::goal_ledger_dir(dir.path());
+        std::fs::create_dir_all(&ledger_dir).unwrap();
+        let ledger_path = ledger_dir.join(format!("{}.db", sanitize_filename_for_ledger(&goal_id)));
+        let ledger = octos_fleet::GoalLedger::open(&ledger_path).expect("open ledger");
+        ledger
+            .upsert_goal(&octos_fleet::Goal {
+                goal_id: goal_id.clone(),
+                objective: "ship the thing".into(),
+                status: "complete".into(),
+                tokens_used: 0,
+                token_budget: 1_000_000,
+                continuations_used: 0,
+                revision: 0,
+                created_at_ms: 1,
+                updated_at_ms: 1,
+            })
+            .expect("seed complete row");
+
+        orchestrator
+            .clear_goal_with_ledger_sync(
+                GoalSessionRequest {
+                    session_id: wire.clone(),
+                    profile_id: "tenant-a".into(),
+                },
+                Some(dir.path()),
+            )
+            .expect("clear goal");
+
+        let row = ledger
+            .get_goal(&goal_id)
+            .expect("read row")
+            .expect("row exists");
+        assert_eq!(row.status, "complete", "complete is terminal per goal_id");
+        assert_eq!(
+            ledger.count_decisions(&goal_id).expect("count decisions"),
+            0,
+            "no decision may claim a transition the row does not reflect",
         );
     }
 
