@@ -882,10 +882,7 @@ impl InProcessAgentOrchestrator {
         // Same #1666 scoping as `goal_objective_for_test` — resolve the scoped
         // store key, not the raw wire session id.
         let key = self.scoped_goal_key(session_id);
-        self.state()
-            .goals
-            .get(&key)
-            .map(|g| g.goal_id.clone())
+        self.state().goals.get(&key).map(|g| g.goal_id.clone())
     }
     fn state(&self) -> std::sync::MutexGuard<'_, AutonomyRuntimeState> {
         self.state
