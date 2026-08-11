@@ -109,15 +109,107 @@ pub struct Decision {
     pub decided_by: String,
 }
 
+/// #1865 review FIX 1 — whether an error from a ledger op is SQLITE_BUSY /
+/// SQLITE_LOCKED-class lock contention (worth a brief retry) as opposed to a
+/// structural failure (missing parent dir, corrupt file, permissions) that
+/// retrying can never fix. Lives here — not in callers — because only this
+/// crate sees `rusqlite` and can classify by the REAL error code instead of
+/// string-matching messages.
+pub fn error_is_lock_contention(err: &eyre::Report) -> bool {
+    let Some(sqlite_err) = err.downcast_ref::<rusqlite::Error>() else {
+        return false;
+    };
+    matches!(
+        sqlite_err.sqlite_error_code(),
+        Some(rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked)
+    )
+}
+
 impl GoalLedger {
     /// Open (or create) the SQLite ledger at `path`, creating all tables.
+    ///
+    /// DEFAULT (pre-#1865) profile — review round 3: NO explicit
+    /// `busy_timeout`, which means rusqlite's own default applies (rusqlite
+    /// installs `sqlite3_busy_timeout(db, 5000)` on every connection — see
+    /// rusqlite `inner_connection.rs`). That is BYTE-EQUIVALENT to what every
+    /// pre-existing inline caller (the finding / escalation writers and
+    /// `goal_get`'s serial ledger reads, all on tokio worker tasks) has
+    /// always run with: handler-covered contention waits up to ~5s, while the
+    /// fresh-db concurrent-init race fails instantly through a
+    /// handler-bypassing path (the historically observed `database is
+    /// locked`). Do NOT add an explicit timeout here in either direction —
+    /// shorter would newly skip best-effort writes that today wait and
+    /// succeed; the transition sync that must SURVIVE the init race uses
+    /// [`Self::open_with_busy_retry`] from a blocking thread instead.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+        Self::open_inner(path.as_ref(), None)
+    }
+
+    /// #1865 review FIX 1 — BOUNDED-RETRY profile of [`Self::open`], for the
+    /// goal-transition ledger sync ONLY (octos-cli runs it inside
+    /// `spawn_blocking`, never on an executor worker). Two connections
+    /// initializing the SAME fresh WAL db can fail `database is locked`
+    /// through a path the busy handler does NOT cover (observed empirically
+    /// on concurrent FIRST initialization — the wal-index/shm recovery lock;
+    /// the journal-mode switch itself IS handler-covered, see the contention
+    /// test), so a one-shot open can lose a millisecond init race outright —
+    /// and that loss silently drops the audit row.
+    ///
+    /// Retries at most 3 attempts, ONLY when [`error_is_lock_contention`]
+    /// classifies the failure as BUSY/LOCKED (structural errors return
+    /// immediately), with 50ms between attempts — and THIS profile's
+    /// connection overrides the busy_timeout DOWN to 1s. Honest bound math:
+    /// busy_timeout is PER lock acquisition, not per call — one attempt runs
+    /// a handful of locking ops (journal-mode pragma, schema batch), so a
+    /// pathological attempt can block a small multiple of 1s, and the 3-try
+    /// cap keeps the PRACTICAL worst case in single-digit seconds. That is a
+    /// blocking-pool budget, not a wall-clock guarantee.
+    pub fn open_with_busy_retry(path: impl AsRef<Path>) -> Result<Self> {
+        const ATTEMPTS: usize = 3;
+        let path = path.as_ref();
+        let mut last_err: Option<eyre::Report> = None;
+        for attempt in 0..ATTEMPTS {
+            if attempt > 0 {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            match Self::open_inner(path, Some(std::time::Duration::from_secs(1))) {
+                Ok(ledger) => return Ok(ledger),
+                Err(err) if error_is_lock_contention(&err) && attempt + 1 < ATTEMPTS => {
+                    last_err = Some(err);
+                }
+                Err(err) => return Err(err),
+            }
+        }
+        Err(last_err.unwrap_or_else(|| eyre::eyre!("ledger open retry exhausted")))
+    }
+
+    /// The shared open core: connection, optional busy_timeout OVERRIDE (the
+    /// ONLY difference between the two public profiles above; `None` keeps
+    /// rusqlite's 5s default), WAL + synchronous pragmas, schema. An override
+    /// persists for the connection's lifetime, so a retry-profile ledger caps
+    /// each later row-write wait at 1s too — fine, because that profile never
+    /// runs on an executor worker.
+    fn open_inner(path: &Path, busy_timeout: Option<std::time::Duration>) -> Result<Self> {
         let conn = Connection::open(path)?;
+
+        if let Some(timeout) = busy_timeout {
+            conn.busy_timeout(timeout)?;
+        }
 
         // Enable WAL mode for multi-process access
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
 
+        Self::create_tables(&conn)?;
+
+        Ok(Self {
+            conn: Arc::new(Mutex::new(conn)),
+        })
+    }
+
+    /// The shared `CREATE TABLE IF NOT EXISTS` schema batch (split out of
+    /// [`Self::open`] so the retry wrapper stays a thin loop over it).
+    fn create_tables(conn: &Connection) -> Result<()> {
         conn.execute_batch(
             "
             CREATE TABLE IF NOT EXISTS goals (
@@ -207,10 +299,7 @@ impl GoalLedger {
             CREATE INDEX IF NOT EXISTS idx_decisions_goal ON decisions(goal_id, decided_at_ms);
             ",
         )?;
-
-        Ok(Self {
-            conn: Arc::new(Mutex::new(conn)),
-        })
+        Ok(())
     }
 
     /// Create a new goal.
@@ -721,6 +810,38 @@ impl GoalLedger {
         Ok(rowid)
     }
 
+    /// #1964 — all decisions recorded for `goal_id`, ordered by
+    /// `decided_at_ms` (ties by insertion rowid). The read half of
+    /// [`Self::append_decision`]: fleet-driven goal terminals now append an
+    /// audit decision (#1865 eager convergence / deny), and their tests assert
+    /// exactly-one-per-transition through this.
+    pub fn list_decisions(&self, goal_id: &str) -> Result<Vec<Decision>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT decision_id, goal_id, task_id, question, options_considered, choice, \
+             rationale, based_on_findings, based_on_rev, decided_at_ms, decided_by \
+             FROM decisions WHERE goal_id = ?1 ORDER BY decided_at_ms ASC, rowid ASC",
+        )?;
+        let rows = stmt
+            .query_map(params![goal_id], |row| {
+                Ok(Decision {
+                    decision_id: row.get(0)?,
+                    goal_id: row.get(1)?,
+                    task_id: row.get(2)?,
+                    question: row.get(3)?,
+                    options_considered: row.get(4)?,
+                    choice: row.get(5)?,
+                    rationale: row.get(6)?,
+                    based_on_findings: row.get(7)?,
+                    based_on_rev: row.get(8)?,
+                    decided_at_ms: row.get(9)?,
+                    decided_by: row.get(10)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
     /// Atomically commit state change + audit record (finding + decision).
     ///
     /// This is the TRUE cross-table transaction: state transition and audit log
@@ -974,6 +1095,180 @@ mod tests {
             findings[0].cost_tokens, 4_321,
             "Finding row must persist the real cost_tokens (#1965)"
         );
+    }
+
+    /// #1865 review round 3 — the TWO open profiles under handler-covered
+    /// contention (a fresh, still-DELETE-mode db whose lock is held by a raw
+    /// connection, so `open`'s `journal_mode=WAL` switch must wait): plain
+    /// `open` keeps rusqlite's DEFAULT 5s busy handler — byte-equivalent to
+    /// what every pre-existing inline caller has always run with (NOT our 1s
+    /// override, NOT zero) — while `open_with_busy_retry` overrides each lock
+    /// acquisition DOWN to 1s and retries lock-class failures a bounded
+    /// number of times. NOTE an already-WAL, already-created ledger does not
+    /// contend on open at all (pragma + `CREATE TABLE IF NOT EXISTS` resolve
+    /// without the write lock), so the fresh-db path is the one pinned here.
+    /// Deliberately slow (~8s of real lock-waiting): this is the regression
+    /// pin for the blocker where an explicit timeout on `open` changed every
+    /// inline caller's blocking profile.
+    #[test]
+    fn open_keeps_rusqlite_default_busy_handling_while_retry_profile_bounds_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ledger.db");
+        let raw = rusqlite::Connection::open(&path).unwrap();
+        raw.execute_batch("BEGIN EXCLUSIVE;").unwrap();
+
+        // DEFAULT profile: waits rusqlite's built-in ~5s
+        // (`sqlite3_busy_timeout(db, 5000)` in rusqlite inner_connection.rs)
+        // and then surfaces a busy-class error. `>= 2s` pins that no explicit
+        // SHORTER override (like the retry profile's 1s — or a fail-fast 0)
+        // was reintroduced on this path.
+        let started = std::time::Instant::now();
+        let err = GoalLedger::open(&path)
+            .err()
+            .expect("write-locked db must fail a plain open once the default handler expires");
+        assert!(
+            error_is_lock_contention(&err),
+            "the default-profile failure must be busy-class: {err}",
+        );
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= std::time::Duration::from_secs(2)
+                && elapsed < std::time::Duration::from_secs(15),
+            "plain open must keep rusqlite's default (~5s) busy handling, \
+             byte-equivalent to pre-#1865 inline callers: took {elapsed:?}",
+        );
+
+        // BOUNDED-RETRY profile: the 1s per-acquisition override makes each
+        // attempt wait ~1s on the held journal-mode switch; 3 attempts + 50ms
+        // sleeps ≈ 3.1s here, then the same busy-class error surfaces.
+        let started = std::time::Instant::now();
+        let err = GoalLedger::open_with_busy_retry(&path)
+            .err()
+            .expect("still locked: retries must exhaust");
+        assert!(
+            error_is_lock_contention(&err),
+            "busy-class after retries: {err}",
+        );
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= std::time::Duration::from_secs(1)
+                && elapsed < std::time::Duration::from_secs(10),
+            "the retry profile must wait ~1s per acquisition, bounded by the \
+             3-attempt cap: took {elapsed:?}",
+        );
+    }
+
+    /// #1865 review FIX 1 — `open_with_busy_retry` (a) succeeds like `open` on
+    /// a healthy path, and (b) classifies ONLY SQLITE_BUSY/LOCKED-class errors
+    /// as retryable: a structural failure (opening a DIRECTORY) must return
+    /// its error immediately, with no retry sleeps burned on it.
+    #[test]
+    fn open_with_busy_retry_round_trips_and_refuses_non_busy_errors() {
+        // (a) healthy open behaves like `open` (WAL, tables created).
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = GoalLedger::open_with_busy_retry(dir.path().join("ledger.db")).unwrap();
+        ledger
+            .create_goal(&Goal {
+                goal_id: "g1".to_string(),
+                objective: "retry open".to_string(),
+                status: "active".to_string(),
+                tokens_used: 0,
+                token_budget: 1_000,
+                continuations_used: 0,
+                revision: 0,
+                created_at_ms: 1,
+                updated_at_ms: 1,
+            })
+            .unwrap();
+        assert!(ledger.get_goal("g1").unwrap().is_some());
+
+        // (b) a non-busy error is NOT retried: opening a directory fails
+        // structurally; with 2 inter-attempt sleeps it would take >=100ms, so
+        // a fast error proves the busy-only classification short-circuited.
+        let started = std::time::Instant::now();
+        assert!(GoalLedger::open_with_busy_retry(dir.path()).is_err());
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(100),
+            "a structural (non-busy) open error must fail fast, not retry: took {:?}",
+            started.elapsed(),
+        );
+
+        // Classifier unit coverage: busy/locked codes retry, others do not.
+        let busy = eyre::Report::new(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
+            Some("database is locked".into()),
+        ));
+        let locked = eyre::Report::new(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_LOCKED),
+            Some("database table is locked".into()),
+        ));
+        let structural = eyre::Report::new(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CANTOPEN),
+            Some("unable to open database file".into()),
+        ));
+        assert!(error_is_lock_contention(&busy));
+        assert!(error_is_lock_contention(&locked));
+        assert!(!error_is_lock_contention(&structural));
+    }
+
+    /// #1964 — `list_decisions` round-trips appended decisions for ONE goal in
+    /// decided_at order. The fleet-convergence tests (octos-cli) use it to
+    /// assert an eager fleet terminal appended exactly one audit decision.
+    #[test]
+    fn list_decisions_round_trips_per_goal_in_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = GoalLedger::open(dir.path().join("ledger.db")).unwrap();
+        for gid in ["g1", "g2"] {
+            ledger
+                .create_goal(&Goal {
+                    goal_id: gid.to_string(),
+                    objective: "test".to_string(),
+                    status: "active".to_string(),
+                    tokens_used: 0,
+                    token_budget: 10_000,
+                    continuations_used: 0,
+                    revision: 0,
+                    created_at_ms: 1_000,
+                    updated_at_ms: 1_000,
+                })
+                .unwrap();
+        }
+        let decision = |id: &str, goal: &str, at: u64| Decision {
+            decision_id: id.to_string(),
+            goal_id: goal.to_string(),
+            task_id: None,
+            question: format!("q-{id}"),
+            options_considered: None,
+            choice: "complete".to_string(),
+            rationale: "all fleet tasks accepted".to_string(),
+            based_on_findings: None,
+            based_on_rev: 0,
+            decided_at_ms: at,
+            decided_by: "keeper".to_string(),
+        };
+        // Append out of decided_at order + one row on ANOTHER goal.
+        ledger
+            .append_decision(&decision("d2", "g1", 2_000))
+            .unwrap();
+        ledger
+            .append_decision(&decision("d1", "g1", 1_500))
+            .unwrap();
+        ledger
+            .append_decision(&decision("dx", "g2", 1_700))
+            .unwrap();
+
+        let rows = ledger.list_decisions("g1").unwrap();
+        assert_eq!(
+            rows.iter()
+                .map(|d| d.decision_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["d1", "d2"],
+            "g1's decisions only, ordered by decided_at_ms",
+        );
+        assert_eq!(rows[0].choice, "complete");
+        assert_eq!(rows[0].rationale, "all fleet tasks accepted");
+        assert_eq!(rows[0].decided_by, "keeper");
+        assert!(ledger.list_decisions("missing").unwrap().is_empty());
     }
 
     #[test]
