@@ -2525,10 +2525,20 @@ impl InProcessAgentOrchestrator {
         if tokens_consumed == 0 && elapsed_seconds == 0 {
             return None;
         }
+        // #1966 (#1666 family) — resolve the cwd-SCOPED goal key. The caller
+        // passes the plain wire session id; under `appui.sessions_in_cwd` the
+        // goal record lives under `<wire>\0~cwd-<scope>`, so the previous raw
+        // lookup silently skipped the charge on the DEFAULT coding-session
+        // path: the turn BOUND to the goal (via the re-scoping
+        // `active_goal_id`) but never charged it — no tokens_used growth, no
+        // budget_limited flip, no chip event. `scoped_goal_key` is a no-op
+        // for an already-scoped key (the scope registry is keyed by wire ids
+        // only), so callers that pass a scoped key stay correct.
+        let key = self.scoped_goal_key(session_id);
         let now = now_ms();
         let now_system = SystemTime::now();
         let mut state = self.state();
-        let goal = state.goals.get_mut(session_id)?;
+        let goal = state.goals.get_mut(&key)?;
         // Profile isolation: never charge or leak a goal owned by a
         // different profile on the same (possibly unprofiled/shared)
         // session key. Mirrors `record_goal_turn`.
@@ -2580,11 +2590,14 @@ impl InProcessAgentOrchestrator {
         };
         let snapshot = goal.clone();
         let profile_for_event = snapshot.profile_id.clone();
-        persist_goal_state(&state, session_id, &snapshot, false);
+        // #1966 — persist and enqueue under the SCOPED key: the supervisor
+        // group id and any wrap-up continuation must address the same record
+        // the map holds, or restart/drain would resolve a different goal.
+        persist_goal_state(&state, &key, &snapshot, false);
         if let Some(prompt) = wrap_up_prompt {
             enqueue_goal_wrap_up(
                 &mut state,
-                session_id,
+                &key,
                 &profile_for_event,
                 &goal_id,
                 &objective,
@@ -2595,8 +2608,10 @@ impl InProcessAgentOrchestrator {
         // #1959 (codex #1) — stamp the generation like every other goal-event
         // producer so the send guard can order this token-charge update.
         let generation = next_goal_event_generation(&mut state);
+        // #1966 — the event carries the WIRE key: clients key goal chips by
+        // the wire session id, never the internal scoped storage form.
         Some(json!({
-            "session_id": session_id,
+            "session_id": wire_key_from_goal_key(&key),
             "profile_id": profile_for_event,
             "goal": autonomy_goal_json(&snapshot),
             "generation": generation,
@@ -15026,6 +15041,68 @@ mod tests {
             .goal_counters_for_test(&session_id)
             .expect("goal exists");
         assert_eq!(tokens_used, 2_000, "interactive charges accumulate");
+    }
+
+    /// #1966 — the interactive charge must resolve the cwd-SCOPED goal key
+    /// (#1666 family). `active_goal_id` (the turn-start binding) re-scopes,
+    /// so under `appui.sessions_in_cwd` the turn BINDS to the goal — but the
+    /// charge did a raw lookup with the wire key and silently missed,
+    /// leaving the default coding-session path uncharged: no tokens_used
+    /// growth, no budget_limited flip, no chip event.
+    #[test]
+    fn charge_active_goal_tokens_resolves_cwd_scoped_goal() {
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let wire = SessionKey::with_profile("tenant-a", "api", "goal-scoped-charge");
+        // Register a cwd scope BEFORE the goal is set, mirroring the
+        // session/open ordering: `set_goal` then stores the record under
+        // `<wire>\0~cwd-<scope>`.
+        orchestrator.set_goal_scope(&wire, Some("aaaa111122223333".into()));
+        orchestrator
+            .set_goal(GoalSetRequest {
+                session_id: wire.clone(),
+                profile_id: "tenant-a".into(),
+                objective: "scoped objective".into(),
+                status: Some("active".into()),
+                token_budget: Some(10_000),
+                transition_actor: None,
+            })
+            .expect("set active goal");
+        let scoped = orchestrator.scoped_goal_key(&wire);
+        assert_ne!(scoped, wire, "scope registration must be in effect");
+        // The turn-start binding resolves (it re-scopes) …
+        let goal_id = orchestrator
+            .active_goal_id(&wire, "tenant-a")
+            .expect("scoped goal binds at turn start");
+
+        // … so the charge, called with the SAME wire key the binding used,
+        // must land on that scoped goal rather than silently missing.
+        let event = orchestrator
+            .charge_active_goal_tokens(&wire, "tenant-a", &goal_id, 9_000, 5)
+            .expect("charge must resolve the scoped goal record");
+        // The chip event must carry the WIRE key — clients key goal chips
+        // by the wire session id, not the internal scoped storage form.
+        assert_eq!(
+            event["session_id"],
+            json!(wire.to_string()),
+            "event emits the wire key, not the scoped storage key"
+        );
+
+        let (tokens_used, continuations_used, _) = orchestrator
+            .goal_counters_for_test(&scoped)
+            .expect("goal exists under the scoped key");
+        assert_eq!(
+            tokens_used, 9_000,
+            "interactive charge lands on the scoped goal"
+        );
+        assert_eq!(continuations_used, 0, "still not a continuation");
+
+        // Crossing the budget on a later charge flips the SCOPED record.
+        let _ = orchestrator.charge_active_goal_tokens(&wire, "tenant-a", &goal_id, 2_000, 1);
+        assert_eq!(
+            orchestrator.goal_status_for_test(&scoped).as_deref(),
+            Some("budget_limited"),
+            "budget exhaustion must flip the scoped goal record"
+        );
     }
 
     /// A session with no active goal — the common interactive case —
