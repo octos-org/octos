@@ -445,6 +445,22 @@ impl Tool for GoalGetTool {
                     );
                 }
             }
+            // #1945 — and the bounded ledger DIGEST, what a master
+            // re-orienting after a restart reads: fixed-size however large
+            // the goal grew, absent when the goal has no ledger file. Keys:
+            // `tasks` = counts by status over the ledger's FK stub rows —
+            // production only ever writes `running` stubs today and nothing
+            // updates them, so real counts read {"running": N} until a task-
+            // status writer lands; `findings.total`/`by_lifecycle`/`by_kind`
+            // = SQL aggregates over ALL findings, task-less rows included;
+            // `cost_tokens` sums the real per-finding charges (#1965) —
+            // Completed peer turns carry real usage; errored/interrupted
+            // turns under-charge 0 until #1969 lands.
+            if let Some(ledger_digest) = orchestrator.model_goal_ledger_digest(data_dir, &goal_id) {
+                if let Value::Object(map) = &mut snapshot {
+                    map.insert("ledger_digest".to_owned(), ledger_digest);
+                }
+            }
         }
         Ok(ToolResult {
             output: serde_json::to_string_pretty(&snapshot)
@@ -1407,6 +1423,97 @@ mod tests {
         assert!(
             escalations[0]["age_seconds"].as_u64().is_some(),
             "age_seconds present"
+        );
+    }
+
+    /// #1945 — `goal_get` folds the compact `ledger_digest` (next to the
+    /// `ledger_findings` row dump) when constructed with a data dir, so a
+    /// master re-orienting after a restart reads bounded counts, never a
+    /// view that grows with the goal. codex round — the ledger is seeded
+    /// through the REAL production writer (`model_goal_record_peer_finding`),
+    /// so the assertions state what production actually produces: a `running`
+    /// task stub (nothing updates task status today) and — now that #1965
+    /// charges real tokens — a cost total that includes the task-less row
+    /// the old path-digest roll-up dropped.
+    #[tokio::test]
+    async fn goal_get_folds_ledger_digest_when_constructed_with_data_dir() {
+        use crate::api::agent_orchestrator::{AgentOrchestrator, GoalSetRequest};
+
+        let orchestrator = default_agent_orchestrator();
+        // Unique wire id: the default orchestrator is process-global.
+        let wire = "digest-prof:local:goal-digest-tool";
+        let session = SessionKey(wire.to_owned());
+        orchestrator
+            .set_goal(GoalSetRequest {
+                session_id: session.clone(),
+                profile_id: "digest-prof".into(),
+                objective: "prove the ledger_digest fold".into(),
+                status: Some("active".into()),
+                token_budget: Some(10_000),
+                transition_actor: None,
+            })
+            .expect("set goal");
+        let goal_id = orchestrator
+            .goal_id_for_session(&session)
+            .expect("goal id for session");
+
+        // Seed the ledger through the production write path: one finding
+        // staged with a fleet task (creates the `running` FK stub row) that
+        // charges 700 tokens (#1965), one WITHOUT a task_id (the common
+        // peer_handoff case — the row the old path-digest cost roll-up
+        // dropped) charging 0.
+        let data_dir = tempfile::TempDir::new().unwrap();
+        orchestrator
+            .model_goal_record_peer_finding(
+                data_dir.path(),
+                &goal_id,
+                "digest-prof",
+                wire,
+                "peer-alpha",
+                Some("t1"),
+                "it works",
+                700,
+            )
+            .expect("task-scoped finding recorded");
+        orchestrator
+            .model_goal_record_peer_finding(
+                data_dir.path(),
+                &goal_id,
+                "digest-prof",
+                wire,
+                "peer-beta",
+                None,
+                "task-less, still counted",
+                0,
+            )
+            .expect("task-less finding recorded");
+
+        let tool = GoalGetTool::new("digest-prof").with_data_dir(data_dir.path().to_path_buf());
+        let mut ctx = ToolContext::zero();
+        ctx.parent_session_key = Some(wire.to_owned());
+        let result = tool
+            .execute_with_context(&ctx, &json!({}))
+            .await
+            .expect("goal_get executes");
+        assert!(result.success, "goal_get failed: {}", result.output);
+        let snapshot: Value = serde_json::from_str(&result.output).expect("json snapshot");
+        let digest = snapshot
+            .get("ledger_digest")
+            .expect("ledger_digest folded into the goal snapshot");
+        assert_eq!(digest["tasks"], json!({"running": 1}));
+        assert_eq!(digest["findings"]["total"], json!(2));
+        assert_eq!(digest["findings"]["by_lifecycle"], json!({"observed": 2}));
+        assert_eq!(digest["findings"]["by_kind"], json!({"observation": 2}));
+        assert_eq!(
+            digest["cost_tokens"],
+            json!(700),
+            "digest sums the real #1965 per-finding charges"
+        );
+        // The row-dump sibling still rides along — digest summarizes, it does
+        // not replace.
+        assert!(
+            snapshot.get("ledger_findings").is_some(),
+            "ledger_findings must remain next to ledger_digest"
         );
     }
 
