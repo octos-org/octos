@@ -33814,23 +33814,27 @@ async fn run_standalone_turn(
         default_agent_orchestrator()
             .record_goal_dispatch_timestamp_only(goal_key, &goal_ctx.profile_id);
         let pre = pre_assistant_count_for_post_turn.unwrap_or(0);
-        // #1957 (codex #1) — capture the session's data dir under the same lock
-        // so a sentinel completion below can sync to the goal ledger.
-        let (assistant_reply, goal_ledger_data_dir): (Option<String>, std::path::PathBuf) = {
+        let assistant_reply: Option<String> = {
             let mut guard = sessions_for_reschedule.lock().await;
-            let data_dir = guard.data_dir();
             let session = guard.get_or_create(&session_id).await;
             let history = session.get_history(usize::MAX);
-            let reply = history
+            history
                 .iter()
                 .filter(|message| matches!(message.role, MessageRole::Assistant))
                 .enumerate()
                 .filter(|(idx, _)| *idx >= pre)
                 .filter(|(_, message)| !message.content.is_empty())
                 .last()
-                .map(|(_, message)| message.content.clone());
-            (reply, data_dir)
+                .map(|(_, message)| message.content.clone())
         };
+        // #1957 (codex #1) — the goal ledger lives under the PROFILE data dir
+        // (`goal_get`, the peer-finding sync, and `GoalUpdateTool` all key off
+        // `profile.data_dir`), NOT the session store root. Under
+        // `appui.sessions_in_cwd` the two diverge (`sessions_root` relocates to
+        // `<cwd>/.octos`), so resolving the ledger dir from the sessions manager
+        // would write a sentinel completion into a SPLIT ledger the master
+        // never reads. Pin it to the profile data dir.
+        let goal_ledger_data_dir = session_runtime.profile.data_dir.clone();
         let elapsed_seconds = goal_turn_start
             .map(|start| start.elapsed().as_secs())
             .unwrap_or(0);
