@@ -2592,10 +2592,14 @@ impl InProcessAgentOrchestrator {
                 now_system,
             );
         }
+        // #1959 (codex #1) — stamp the generation like every other goal-event
+        // producer so the send guard can order this token-charge update.
+        let generation = next_goal_event_generation(&mut state);
         Some(json!({
             "session_id": session_id,
             "profile_id": profile_for_event,
             "goal": autonomy_goal_json(&snapshot),
+            "generation": generation,
             "transition_actor": "backend",
         }))
     }
@@ -3205,8 +3209,7 @@ impl InProcessAgentOrchestrator {
         let wire_id = wire_key_from_goal_key(session_id);
         // #1959 — stamp a monotonic generation so a stale update can't
         // resurrect a cleared goal on the client (see the field's doc comment).
-        state.goal_event_generation += 1;
-        let generation = state.goal_event_generation;
+        let generation = next_goal_event_generation(&mut state);
         Some(json!({
             "session_id": wire_id,
             "profile_id": profile_id,
@@ -5648,10 +5651,15 @@ impl AgentOrchestrator for InProcessAgentOrchestrator {
             );
         }
         persist_goal_state(&state, &key, &goal, false);
+        // #1959 (codex #1) — stamp the generation so a user-set goal update
+        // participates in the send guard's ordering (it is durable, so an
+        // unstamped one could persist a clear->stale-update inversion).
+        let generation = next_goal_event_generation(&mut state);
         Ok(json!({
             "session_id": request.session_id,
             "profile_id": request.profile_id,
             "goal": autonomy_goal_json(&goal),
+            "generation": generation,
             "transition_actor": transition_actor
         }))
     }
@@ -5684,8 +5692,7 @@ impl AgentOrchestrator for InProcessAgentOrchestrator {
         // so the client can order a clear against a racing stale update. A
         // stale update always bumps before this clear (its goal read preceded
         // the removal above), so `update.generation < clear.generation`.
-        state.goal_event_generation += 1;
-        let generation = state.goal_event_generation;
+        let generation = next_goal_event_generation(&mut state);
         Ok(json!({
             "session_id": request.session_id,
             "profile_id": request.profile_id,
@@ -8074,6 +8081,17 @@ fn restored_agent_artifact(artifact: &SupervisorArtifactRecord) -> AgentArtifact
         path: Some(artifact.path.clone()),
         content: None,
     }
+}
+
+/// #1959 — bump and return the monotonic goal-event generation. EVERY producer
+/// of a `SessionGoalUpdated` / `SessionGoalCleared` event MUST stamp its event
+/// with this (under the state lock) so the per-session send guard can order it.
+/// An unstamped (`0`) event is always admitted by the guard and would reopen
+/// the stale-update-overtakes-clear race (codex #1 caught `set_goal` /
+/// `charge_active_goal_tokens` shipping unstamped).
+fn next_goal_event_generation(state: &mut AutonomyRuntimeState) -> u64 {
+    state.goal_event_generation += 1;
+    state.goal_event_generation
 }
 
 fn persist_goal_state(

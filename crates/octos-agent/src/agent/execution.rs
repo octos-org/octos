@@ -638,13 +638,19 @@ impl Agent {
         // a tool that makes its OWN `provider.chat()` sub-call (notably
         // `goal_update`'s completion verifier via `run_goal_completion_verifier`)
         // would otherwise run with the DEFAULT routing context — losing the
-        // turn's fail-fast policy, lane filter, and originating-session
-        // attribution (a verifier failover would then publish unattributed,
-        // and a hedging router could fire extra billable requests). Capture the
-        // three octos-llm routing task-locals here and re-establish them inside
-        // the spawned task around the tool future (below).
+        // turn's fail-fast policy and originating-session attribution (a
+        // verifier failover would then publish unattributed). Capture the call
+        // policy + router context here and re-establish them inside the spawned
+        // task around the tool future (below).
+        //
+        // Deliberately NOT the LANE context (codex #4): the wrap below applies
+        // to EVERY foreground tool, and a synchronous `spawn` child or an
+        // unresolved-model pipeline node that falls back to `self.llm` would
+        // otherwise be pinned to the parent turn's lane (e.g. a research child
+        // filtered to `CodeCapable`). The verifier is a simple completion check
+        // that routes fine on the default lane; attribution + policy are what
+        // matter, and neither regresses a lane-less child.
         let captured_call_policy = octos_llm::current_llm_call_policy();
-        let captured_lane_ctx = octos_llm::current_lane_context();
         let captured_router_ctx = octos_llm::current_router_context();
 
         tokio::spawn(async move {
@@ -2133,19 +2139,16 @@ impl Agent {
                     .execute_with_context(&ctx, &tc_name, &effective_args)
                     .await
             });
-            // #1958: re-establish the turn's routing task-locals (captured
-            // before the spawn) around the tool future, so a tool that makes
-            // its own provider.chat() call — the goal completion verifier —
-            // keeps the turn's fail-fast policy / lane / originating-session
-            // attribution instead of the post-spawn defaults. Independent of
-            // the approval/question bridges below; wrapped innermost so those
-            // still apply.
+            // #1958: re-establish the turn's fail-fast policy + originating-
+            // session attribution (captured before the spawn) around the tool
+            // future, so a tool that makes its own provider.chat() call — the
+            // goal completion verifier — keeps them instead of the post-spawn
+            // defaults. Lane is intentionally NOT restored here (codex #4 — see
+            // the capture comment above). Independent of the approval/question
+            // bridges below; wrapped innermost so those still apply.
             let exec_future = octos_llm::with_router_context(
                 captured_router_ctx,
-                octos_llm::with_lane_context(
-                    captured_lane_ctx,
-                    octos_llm::with_llm_call_policy(captured_call_policy, exec_future),
-                ),
+                octos_llm::with_llm_call_policy(captured_call_policy, exec_future),
             );
             let result = match (&captured_approval_ctx, &captured_user_question_ctx) {
                 (Some(approval), Some(question)) => {

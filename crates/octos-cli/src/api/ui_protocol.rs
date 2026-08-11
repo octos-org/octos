@@ -33808,8 +33808,19 @@ async fn run_standalone_turn(
                 // Snapshot goal_id BEFORE the async verifier call to prevent
                 // completing the wrong goal if it changes during the await.
                 let goal_id = orchestrator.goal_id_for_session(goal_key);
-                let verdict =
-                    run_goal_completion_verifier(llm_provider.clone(), &objective, &reply).await;
+                // #1958 (codex #3) — the sentinel verifier runs AFTER the turn's
+                // routing scopes ended, so restore originating-session
+                // attribution around it (a failover would otherwise publish
+                // unattributed / under another session). Autonomous turns are
+                // Normal policy, so only the router context needs restoring.
+                let verdict = octos_llm::with_router_context(
+                    octos_llm::RouterContext {
+                        session_id: Some(session_id.to_string()),
+                        ..Default::default()
+                    },
+                    run_goal_completion_verifier(llm_provider.clone(), &objective, &reply),
+                )
+                .await;
                 (verdict, goal_id)
             } else {
                 (
@@ -36829,6 +36840,15 @@ fn goal_event_generation_admits(
     let last = last_by_session.get(session).copied().unwrap_or(0);
     if generation <= last {
         return false;
+    }
+    // #1959 (codex #7) — bound the process-global watermark map. There is no
+    // session-close hook here, so cap growth: once the map is large, drop the
+    // watermarks. A reset only re-admits the NEXT event per session (each event
+    // has a fresh higher generation), so the worst case is losing stale-drop
+    // protection for one racy window after a reset — far rarer than the leak.
+    const MAX_TRACKED_SESSIONS: usize = 8192;
+    if last_by_session.len() >= MAX_TRACKED_SESSIONS && !last_by_session.contains_key(session) {
+        last_by_session.clear();
     }
     last_by_session.insert(session.to_string(), generation);
     true
